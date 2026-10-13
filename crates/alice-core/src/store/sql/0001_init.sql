@@ -44,6 +44,8 @@ CREATE TABLE memories (
   judge_state     TEXT NOT NULL DEFAULT 'pending'   -- pending | done | retry | skipped
 );
 CREATE INDEX memories_project_kind ON memories(project_id, kind, status, created_at);
+CREATE INDEX memories_project_importance ON memories(project_id, importance, updated_at) WHERE importance >= 4;
+CREATE INDEX memories_project_kind_importance ON memories(project_id, kind, importance, updated_at);
 CREATE UNIQUE INDEX memories_hash ON memories(project_id, content_hash) WHERE status <> 'trashed';
 CREATE UNIQUE INDEX memories_idem ON memories(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX memories_embed ON memories(embed_state) WHERE embed_state <> 'done';

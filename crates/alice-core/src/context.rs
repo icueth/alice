@@ -19,6 +19,31 @@ const HANDOFF_CHARS: usize = 600;
 /// Decisions created within this many days are recent.
 const RECENT_DAYS: i64 = 14;
 
+/// What a section selects and how it is ordered; see `section_sql`.
+type Select = (&'static str, &'static str);
+const BY_IMPORTANCE: &str = "importance DESC, updated_at DESC";
+const LAST_HANDOFF: Select = ("kind = 'handoff'", "created_at DESC");
+const WARNINGS: Select = ("kind = 'warning'", BY_IMPORTANCE);
+/// Keep `importance >= 4` literal: the partial index `memories_project_importance` applies only then.
+const KEY_MEMORIES: Select = (
+    "importance >= 4 AND kind NOT IN ('handoff','diary')",
+    BY_IMPORTANCE,
+);
+const RECENT_DECISIONS: Select = ("kind = 'decision' AND created_at >= ?2", "created_at DESC");
+const PREFERENCES: Select = ("kind = 'preference'", BY_IMPORTANCE);
+
+/// A section's query: `seq` of live memories in display order, `?1` the project, the row limit
+/// bound last. `seq DESC` breaks ties, so the newest of equals wins and the output is stable.
+fn section_sql((filter, order): Select) -> String {
+    format!(
+        "SELECT seq FROM memories WHERE project_id = ?1 AND {filter} AND {LIVE} ORDER BY {order}, seq DESC LIMIT ?"
+    )
+}
+
+fn any_live_sql() -> String {
+    format!("SELECT EXISTS(SELECT 1 FROM memories WHERE project_id = ?1 AND {LIVE})")
+}
+
 /// The body's first line and the text after it, both trimmed.
 fn split_first_line(body: &str) -> (&str, &str) {
     let body = body.trim();
@@ -80,11 +105,11 @@ struct Briefing<'c> {
 
 impl Briefing<'_> {
     /// Append a section with up to `cap` memories that are not shown yet, as many as fit.
-    /// `sql` selects `seq` in display order; the row limit is bound as its last parameter.
+    /// `args` bind the query's parameters before the row limit.
     fn section(
         &mut self,
         title: &str,
-        sql: &str,
+        select: Select,
         args: &[&dyn ToSql],
         cap: usize,
         render: fn(&Memory) -> String,
@@ -98,7 +123,7 @@ impl Briefing<'_> {
         let limit = i64::try_from(cap + self.shown.len()).unwrap_or(i64::MAX);
         let mut params = args.to_vec();
         params.push(&limit);
-        let mut stmt = self.conn.prepare_cached(&format!("{sql} LIMIT ?"))?;
+        let mut stmt = self.conn.prepare_cached(&section_sql(select))?;
         let found: Vec<i64> = stmt
             .query_map(params.as_slice(), |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?;
@@ -142,9 +167,7 @@ pub fn build(
     let mut out = format!("# Context · {}\n", project.slug);
     if !is_global {
         let any_live: bool = conn
-            .prepare_cached(&format!(
-                "SELECT EXISTS(SELECT 1 FROM memories WHERE project_id = ?1 AND {LIVE})"
-            ))?
+            .prepare_cached(&any_live_sql())?
             .query_row([pid], |r| r.get(0))?;
         if !any_live {
             out.push_str(&format!(
@@ -161,52 +184,18 @@ pub fn build(
         shown: Vec::new(),
     };
     let since = (now - Duration::days(RECENT_DAYS)).to_rfc3339_opts(SecondsFormat::Millis, true);
-    // `seq DESC` breaks ties, so the newest of equals wins and the output is stable.
-    let query = |filter: &str, order: &str| {
-        format!(
-            "SELECT seq FROM memories WHERE project_id = ?1 AND {filter} AND {LIVE} ORDER BY {order}, seq DESC"
-        )
-    };
-    let by_importance = "importance DESC, updated_at DESC";
-    b.section(
-        "Last handoff",
-        &query("kind = 'handoff'", "created_at DESC"),
-        &[&pid],
-        1,
-        handoff,
-    )?;
-    b.section(
-        "Warnings",
-        &query("kind = 'warning'", by_importance),
-        &[&pid],
-        5,
-        line,
-    )?;
-    b.section(
-        "Key memories",
-        &query(
-            "importance >= 4 AND kind NOT IN ('handoff','diary')",
-            by_importance,
-        ),
-        &[&pid],
-        8,
-        line,
-    )?;
+    b.section("Last handoff", LAST_HANDOFF, &[&pid], 1, handoff)?;
+    b.section("Warnings", WARNINGS, &[&pid], 5, line)?;
+    b.section("Key memories", KEY_MEMORIES, &[&pid], 8, line)?;
     b.section(
         "Recent decisions",
-        &query("kind = 'decision' AND created_at >= ?2", "created_at DESC"),
+        RECENT_DECISIONS,
         &[&pid, &since],
         5,
         line,
     )?;
     if !is_global {
-        b.section(
-            "Your preferences",
-            &query("kind = 'preference'", by_importance),
-            &[&GLOBAL_ID],
-            8,
-            line,
-        )?;
+        b.section("Your preferences", PREFERENCES, &[&GLOBAL_ID], 8, line)?;
     }
     Ok(b.out)
 }
@@ -654,5 +643,130 @@ mod tests {
         );
         assert!(!text.contains("Your preferences"), "{text}");
         assert!(!text.contains("Short answers"), "{text}");
+    }
+
+    fn query_plan(c: &rusqlite::Connection, sql: &str) -> String {
+        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let unbound = std::iter::repeat_n("x", st.parameter_count());
+        st.query_map(rusqlite::params_from_iter(unbound), |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .map(|step| step.unwrap())
+        .collect::<Vec<_>>()
+        .join("; ")
+    }
+
+    #[test]
+    fn context_queries_read_an_index_in_order() {
+        // Session-start latency must not grow with the project: each query walks an index and
+        // stops at its limit. Ordered by importance, the index order is the display order, so
+        // nothing is sorted. The handoff and recent-decision plans keep a sort step: `status IN
+        // (2 values)` gives two `created_at`-ordered index ranges, which SQLite merges and leaves
+        // once the limit is reached (see `context_query_work_does_not_grow_with_the_project`).
+        let (_d, c, _) = setup("app");
+        let mut wrong = Vec::new();
+        for (name, sql, index, merges) in [
+            ("any live", any_live_sql(), "memories_project_kind", false),
+            (
+                "last handoff",
+                section_sql(LAST_HANDOFF),
+                "memories_project_kind",
+                true,
+            ),
+            (
+                "warnings",
+                section_sql(WARNINGS),
+                "memories_project_kind_importance",
+                false,
+            ),
+            (
+                "key memories",
+                section_sql(KEY_MEMORIES),
+                "memories_project_importance",
+                false,
+            ),
+            (
+                "recent decisions",
+                section_sql(RECENT_DECISIONS),
+                "memories_project_kind",
+                true,
+            ),
+            (
+                "preferences",
+                section_sql(PREFERENCES),
+                "memories_project_kind_importance",
+                false,
+            ),
+        ] {
+            let plan = query_plan(&c, &sql);
+            if !plan.contains(&format!("INDEX {index} ("))
+                || (!merges && plan.contains("TEMP B-TREE"))
+            {
+                wrong.push(format!("{name}: {plan}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Virtual-machine steps for one run of `sql`, which must return rows.
+    fn vm_steps(c: &rusqlite::Connection, sql: &str, args: &[&dyn ToSql]) -> i32 {
+        let mut st = c.prepare(sql).unwrap();
+        let rows = st.query_map(args, |r| r.get::<_, i64>(0)).unwrap().count();
+        assert!(rows > 0, "no rows: {sql}");
+        st.get_status(rusqlite::StatementStatus::VmStep)
+    }
+
+    #[test]
+    fn context_query_work_does_not_grow_with_the_project() {
+        let (_d, c, small) = setup("small");
+        let large = project(&c, "large");
+        c.execute_batch("BEGIN").unwrap();
+        for (p, per_kind) in [(&small, 10), (&large, 300)] {
+            for i in 0..per_kind {
+                for kind in [
+                    Kind::Handoff,
+                    Kind::Warning,
+                    Kind::Decision,
+                    Kind::Preference,
+                    Kind::Note,
+                ] {
+                    // Every importance and both live statuses, in the same mix in both projects.
+                    let imp = u8::try_from(i % 5 + 1).unwrap();
+                    let (_, seq) = put(&c, p, input(kind, imp, &format!("{} {i}", kind.as_str())));
+                    if i % 2 == 0 {
+                        memories::set_status_by_seq(&c, seq, Status::Active).unwrap();
+                    }
+                }
+            }
+        }
+        c.execute_batch("COMMIT").unwrap();
+        let (since, limit) = ("2000-01-01T00:00:00.000Z", 10_i64);
+        let mut counts = Vec::new();
+        let mut grows = false;
+        for (name, sql) in [
+            ("any live", any_live_sql()),
+            ("last handoff", section_sql(LAST_HANDOFF)),
+            ("warnings", section_sql(WARNINGS)),
+            ("key memories", section_sql(KEY_MEMORIES)),
+            ("recent decisions", section_sql(RECENT_DECISIONS)),
+            ("preferences", section_sql(PREFERENCES)),
+        ] {
+            let steps = |p: &projects::ResolvedProject| {
+                let pid = p.id.as_str();
+                match (sql.contains("?2"), sql.contains("LIMIT")) {
+                    (true, _) => vm_steps(&c, &sql, &[&pid, &since, &limit]),
+                    (false, true) => vm_steps(&c, &sql, &[&pid, &limit]),
+                    (false, false) => vm_steps(&c, &sql, &[&pid]),
+                }
+            };
+            let (few, many) = (steps(&small), steps(&large));
+            // 30 times the rows: reading or sorting all of them would take about 30 times the steps.
+            grows |= many > 2 * few;
+            counts.push(format!(
+                "{name}: {few} steps for 50 memories, {many} for 1,500"
+            ));
+        }
+        assert!(!grows, "{}", counts.join("\n"));
     }
 }
