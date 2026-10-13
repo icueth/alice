@@ -370,17 +370,16 @@ pub fn memory_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
     )
 }
 
-/// Raw-tier lists bound their cost by term frequency. FTS5 computes BM25 for every row a query
-/// matches before it can return the best few: a word found in 40% of 1M chunks took ~300 ms per
-/// list. So each term's matches are first counted up to `RAW_WINDOW + 1` (FTS5 stops reading
-/// there). Terms with at most `RAW_WINDOW` matches ("rare") are ranked over all their matches in
-/// one query. Every more common term gets its own share of the window,
-/// max(k, `RAW_WINDOW` / number of common terms) rows, and is ranked among its newest matches
-/// up to that share: no term can crowd another out, and about `RAW_WINDOW` rows are scored in
-/// all. Matches of a common term beyond its share are not read (newest first, no exhaustive
-/// recall). A query whose every term has at most `RAW_WINDOW` matches is ranked exactly as with
-/// plain BM25. The ~16 ms cost of a share at 1M chunks holds for single words; a phrase term
-/// (`writer_lease` is the phrase "writer lease") reads each of its words' match lists.
+/// Raw-tier lists bound their cost per term. FTS5 computes BM25 for every row a query matches
+/// before it can return the best few: a word found in 40% of 1M chunks took ~300 ms per list.
+/// So every term that has a match gets its own share of the budget, max(k, `RAW_WINDOW` /
+/// number of such terms) rows, and is ranked by BM25 among its newest matches up to that share
+/// (FTS5 reads newest first and stops there): no term can crowd another out, and at most about
+/// `RAW_WINDOW` rows are scored in all. A term with at most its share of matches is ranked over
+/// all of them; matches beyond a term's share are not read (newest first: recall for very
+/// common terms is not exhaustive). A share of a single word costs ~16 ms at 1M chunks; a
+/// phrase term (`writer_lease` is the phrase "writer lease") also reads its words' match lists
+/// once for BM25's IDF.
 pub const RAW_WINDOW: usize = 5_000;
 
 /// Rows each of `n` terms may read: an equal share of `window`, at least `k`.
@@ -388,17 +387,16 @@ fn share(window: usize, n: usize, k: usize) -> usize {
     (window / n.max(1)).max(k)
 }
 
-/// How many rows of `table` the FTS query `fts` matches, counted up to `cap`. Never fails: an
-/// FTS error is logged and counts as no match.
-fn count_upto(conn: &Connection, table: &str, fts: &str, cap: usize) -> usize {
-    let sql =
-        format!("SELECT count(*) FROM (SELECT 1 FROM {table} WHERE {table} MATCH ?1 LIMIT ?2)");
-    let counted = conn.prepare_cached(&sql).and_then(|mut stmt| {
-        stmt.query_row(rusqlite::params![fts, cap as i64], |r| r.get::<_, i64>(0))
-    });
-    counted.map(|n| n as usize).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "fts count failed; treating as no lexical matches");
-        0
+/// Whether the FTS query `fts` matches any row of `table` (newest first, so FTS5 stops at the
+/// first). Never fails: an FTS error is logged and counts as no match.
+fn has_match(conn: &Connection, table: &str, fts: &str) -> bool {
+    let sql = format!("SELECT 1 FROM {table} WHERE {table} MATCH ?1 ORDER BY rowid DESC LIMIT 1");
+    let found = conn
+        .prepare_cached(&sql)
+        .and_then(|mut stmt| stmt.exists(rusqlite::params![fts]));
+    found.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "fts query failed; treating as no lexical matches");
+        false
     })
 }
 
@@ -418,10 +416,10 @@ fn scored(conn: &Connection, sql: &str, fts: &str, k: usize) -> Vec<(i64, f64)> 
     })
 }
 
-/// The best `k` raw chunks by BM25 for `terms` in `table`; `wrap` turns an OR of quoted terms
-/// into the FTS query (a column filter for identifiers). Terms are split and shared as
-/// [`RAW_WINDOW`] describes, with `window` in its place. BM25 is a sum over the query's terms,
-/// so a chunk found by several of the queries scores the sum of its parts.
+/// The best `k` raw chunks by BM25 for `terms` in `table`; `wrap` turns a quoted term into the
+/// FTS query (a column filter for identifiers). Each term is read up to its share as
+/// [`RAW_WINDOW`] describes, with `window` in its place; BM25 is a sum over the query's terms,
+/// so a chunk found for several terms scores the sum of its parts.
 fn raw_bm25(
     conn: &Connection,
     table: &str,
@@ -431,34 +429,21 @@ fn raw_bm25(
     k: usize,
     window: usize,
 ) -> Vec<i64> {
-    let (mut rare, mut common) = (Vec::new(), Vec::new());
-    for t in terms {
-        match count_upto(conn, table, &wrap(quote(t)), window + 1) {
-            0 => {}
-            n if n <= window => rare.push(t.clone()),
-            _ => common.push(t.clone()),
-        }
-    }
-    let all_matches = format!(
-        "SELECT rowid, bm25({table}{weights}) AS score FROM {table} \
-         WHERE {table} MATCH ?1 ORDER BY score LIMIT ?2"
-    );
+    let present: Vec<String> = terms
+        .iter()
+        .map(|t| wrap(quote(t)))
+        .filter(|fts| has_match(conn, table, fts))
+        .collect();
     let newest_matches = format!(
         "SELECT rowid, score FROM (SELECT rowid, bm25({table}{weights}) AS score FROM {table} \
          WHERE {table} MATCH ?1 ORDER BY rowid DESC LIMIT {}) ORDER BY score LIMIT ?2",
-        share(window, common.len(), k)
+        share(window, present.len(), k)
     );
     let mut total: HashMap<i64, f64> = HashMap::new();
-    let mut add = |rows: Vec<(i64, f64)>| {
-        for (id, score) in rows {
+    for fts in &present {
+        for (id, score) in scored(conn, &newest_matches, fts, k) {
             *total.entry(id).or_default() += score;
         }
-    };
-    if let Some(q) = or_query(&rare) {
-        add(scored(conn, &all_matches, &wrap(q), k));
-    }
-    for t in &common {
-        add(scored(conn, &newest_matches, &wrap(quote(t)), k));
     }
     best_first(total, k, |a, b| a.total_cmp(&b))
 }
@@ -494,23 +479,31 @@ pub fn chunk_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
     chunk_code_in(conn, q, k, RAW_WINDOW)
 }
 
-/// Raw chunks holding query substrings. Each term reads its newest matches up to its share of
-/// the window, max(k, `RAW_WINDOW` / number of terms), so its rarity is measured up to that
-/// share rather than up to k. A chunk scores the sum, over the terms that matched it, of
-/// 1 / that term's match count (capped at its share): a chunk with a substring found in fewer
-/// chunks ranks above one with a more common substring, and ties go to the newer chunk. Matches
-/// beyond a term's share are not read (newest first). Not BM25: its IDF needs every match of
-/// each phrase, and a trigram phrase (a Thai word, a made-up identifier) is an intersection of
-/// common trigrams, 60–400 ms per list at 1M chunks. `k` is 100, or 400 when filters apply.
+/// Raw chunks holding query substrings. A term in a script without spaces (Thai, CJK), for
+/// which this is the only lexical list, reads its newest matches up to its own share of the
+/// window, max(k, `RAW_WINDOW` / number of such terms), so its rarity is measured up to that
+/// share. An ASCII term reads its newest k only: it also has its own share in the word list, and
+/// reading the share of a rare ASCII phrase (`lease_token_frame`, a made-up word) means scanning
+/// the intersection of common trigrams, 15–45 ms per term at 1M chunks. A chunk scores the sum,
+/// over the terms that matched it, of 1 / that term's match count (capped at what it read): a
+/// chunk with a substring found in fewer chunks ranks above one with a more common substring,
+/// ties to the newer chunk. Matches beyond a term's limit are not read (newest first). Not
+/// BM25: its IDF needs every match of each phrase, 60–400 ms per list at 1M chunks. `k` is 100,
+/// or 400 when filters apply.
 pub fn chunk_trigram(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
     chunk_trigram_in(conn, q, k, RAW_WINDOW)
 }
 
 fn chunk_trigram_in(conn: &Connection, q: &str, k: usize, window: usize) -> Vec<i64> {
     let terms = trigram_terms(q);
-    let limit = share(window, terms.len(), k);
+    let unspaced = terms.iter().filter(|t| !t.is_ascii()).count();
     let mut total: HashMap<i64, f64> = HashMap::new();
     for t in terms {
+        let limit = if t.is_ascii() {
+            k
+        } else {
+            share(window, unspaced, k)
+        };
         let ids = run(
             conn,
             "SELECT rowid FROM chunks_tri WHERE chunks_tri MATCH ?1 ORDER BY rowid DESC LIMIT ?2",
@@ -907,6 +900,20 @@ mod tests {
         let (_d2, c2, seqs2) = chunks_db(&older);
         let found = chunk_words_in(&c2, "aaa bbb", 3, 10);
         assert!(!found.contains(&seqs2[5]), "{found:?}");
+    }
+
+    /// Terms without a match do not take a share: with four absent words beside two present
+    /// ones, each present term still reads window / 2 rows (the 4th newest bbb match is found).
+    #[test]
+    fn terms_without_a_match_take_no_share() {
+        let mut texts: Vec<String> = (0..11)
+            .map(|i| format!("bbb filler{i} filler filler filler"))
+            .collect();
+        texts[7] = "bbb bbb bbb".into();
+        texts.extend((0..15).map(|i| format!("aaa other{i}")));
+        let (_d, c, seqs) = chunks_db(&texts);
+        let found = chunk_words_in(&c, "aaa bbb nosuch1 nosuch2 nosuch3 nosuch4", 3, 10);
+        assert_eq!(found.first(), Some(&seqs[7]), "{found:?}");
     }
 
     /// Fix round 2: trigram rarity is measured up to each term's share of the window, not just
