@@ -4,8 +4,47 @@ use crate::model::{Kind, limits};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
+const NIKHAHIT: char = '\u{0E4D}';
+const SARA_AA: char = '\u{0E32}';
+const SARA_AM: char = '\u{0E33}';
+
+/// NFC plus the Thai sara am fold: "ํา" (U+0E4D U+0E32) becomes "ำ" (U+0E33), and a tone mark
+/// typed between the two moves before it. NFC alone keeps them apart (U+0E33 decomposes only
+/// under NFKC), but people type both spellings of the same word.
 pub fn nfc(s: &str) -> String {
-    s.nfc().collect()
+    let composed: String = s.nfc().collect();
+    if !composed.contains(NIKHAHIT) {
+        return composed;
+    }
+    // Moving a tone mark can leave it after another combining mark, so compose again.
+    fold_sara_am(&composed).nfc().collect()
+}
+
+fn fold_sara_am(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == NIKHAHIT {
+            match (chars.get(i + 1), chars.get(i + 2)) {
+                (Some(&SARA_AA), _) => {
+                    out.push(SARA_AM);
+                    i += 2;
+                    continue;
+                }
+                (Some(&tone @ '\u{0E48}'..='\u{0E4B}'), Some(&SARA_AA)) => {
+                    out.push(tone);
+                    out.push(SARA_AM);
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 fn is_separator(ch: char) -> bool {
@@ -118,9 +157,9 @@ mod tests {
 
     #[test]
     fn content_hash_ignores_whitespace_and_composition() {
-        // Whitespace runs and trailing newlines collapse; project and kind stay significant.
+        // "ำ" (U+0E33) vs "ํา" (U+0E4D U+0E32) normalise to the same text: `nfc` folds sara am.
         let a = content_hash("p", Kind::Note, "t", "จำ  ไว้\n");
-        let b = content_hash("p", Kind::Note, "t", "จำ ไว้");
+        let b = content_hash("p", Kind::Note, "t", "จ\u{0E4D}\u{0E32} ไว้");
         assert_eq!(a, b);
         assert_ne!(a, content_hash("p", Kind::Fact, "t", "จำ ไว้"));
         assert_ne!(a, content_hash("q", Kind::Note, "t", "จำ ไว้"));
@@ -130,6 +169,29 @@ mod tests {
             content_hash("p", Kind::Note, "t", "ก\u{0E38}\u{0E48}"),
             content_hash("p", Kind::Note, "t", "ก\u{0E48}\u{0E38}"),
         );
+    }
+
+    #[test]
+    fn nfc_folds_thai_sara_am() {
+        assert_eq!(nfc("จ\u{0E4D}\u{0E32}"), "จำ");
+        // A tone mark typed between nikhahit and sara aa moves before the folded sara am.
+        assert_eq!(nfc("น้ำ"), nfc("น\u{0E4D}\u{0E49}\u{0E32}"));
+        assert_eq!(nfc("น\u{0E4D}\u{0E49}\u{0E32}"), "น\u{0E49}\u{0E33}");
+        assert_eq!(nfc("น\u{0E49}\u{0E4D}\u{0E32}"), "น\u{0E49}\u{0E33}");
+        // Already-folded, plain and code text pass through; a lone nikhahit is kept.
+        for s in [
+            "ำ",
+            "น้ำ",
+            "plain ASCII",
+            "HostLinkReconnect internal/a_b.go",
+            "ก\u{0E4D}",
+        ] {
+            assert_eq!(nfc(s), s);
+        }
+        // The fold can put a tone mark after another combining mark; the result stays NFC.
+        let folded = nfc("ก\u{0301}\u{0E4D}\u{0E48}\u{0E32}");
+        assert!(unicode_normalization::is_nfc(&folded), "{folded:?}");
+        assert_eq!(nfc(&folded), folded);
     }
 
     #[test]
