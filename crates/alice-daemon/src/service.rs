@@ -223,18 +223,36 @@ fn unexpected(o: WriteOutcome) -> AliceError {
 }
 
 /// Rebuild the vector index from the stored vectors on a background thread; the slot stays
-/// `None` (lexical-only search, worker paused) until it is done.
+/// `None` (lexical-only search, worker paused) until it is done. With `loaded` (an index
+/// opened from its files after an unclean stop) only its chunk part is rebuilt, unless the
+/// counts still disagree afterwards: then the whole index is.
 fn spawn_rebuild(
     slot: Arc<IndexSlot>,
     db: std::path::PathBuf,
     model: String,
     dim: usize,
+    loaded: Option<VectorIndex>,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("alice-index-rebuild".into())
         .spawn(move || {
             let started = Instant::now();
-            match open_reader(&db).and_then(|c| VectorIndex::rebuild_from(&c, &model, dim)) {
+            let rebuilt = open_reader(&db).and_then(|c| {
+                if let Some(idx) = loaded {
+                    idx.rebuild_chunks_from(&c)?;
+                    let stored = embeddings::count(&c, &model)?;
+                    if idx.len() == stored {
+                        return Ok(idx);
+                    }
+                    tracing::info!(
+                        indexed = idx.len(),
+                        stored,
+                        "memory vectors are out of date too; rebuilding the whole index"
+                    );
+                }
+                VectorIndex::rebuild_from(&c, &model, dim)
+            });
+            match rebuilt {
                 Ok(idx) => {
                     tracing::info!(
                         n = idx.len(),
@@ -271,7 +289,15 @@ impl Service {
         let vector_path = home.vector_file(&model);
 
         let expected = embeddings::count(&conn, &model)?;
+        // A clean stop marks the files it saved last. Without the mark (a crash, say while
+        // embedding) the chunk file can miss chunks or hold stale ones even when the counts
+        // agree, and rebuilding the chunk part takes seconds.
+        let clean = VectorIndex::take_clean_mark(&vector_path);
         match VectorIndex::open(&vector_path, &model, dim) {
+            Ok(idx) if !clean => {
+                tracing::info!("the last stop was not clean; rebuilding the chunk vectors");
+                spawn_rebuild(index.clone(), home.db(), model.clone(), dim, Some(idx))?;
+            }
             Ok(idx) if idx.len() == expected => *index.write() = Some(Arc::new(idx)),
             Ok(idx) => {
                 tracing::info!(
@@ -279,11 +305,11 @@ impl Service {
                     stored = expected,
                     "vector index is out of date; rebuilding"
                 );
-                spawn_rebuild(index.clone(), home.db(), model.clone(), dim)?;
+                spawn_rebuild(index.clone(), home.db(), model.clone(), dim, None)?;
             }
             Err(e) => {
                 tracing::info!(error = %e, "no usable vector index; rebuilding");
-                spawn_rebuild(index.clone(), home.db(), model.clone(), dim)?;
+                spawn_rebuild(index.clone(), home.db(), model.clone(), dim, None)?;
             }
         }
 
@@ -337,9 +363,10 @@ impl Service {
     }
 
     /// Stop the embedding worker, let the writer commit everything queued before this call,
-    /// stop it, and save the vector index. Blocks until both threads have exited (normally well
-    /// under a second; an embedding batch in flight is finished first). Later writes fail with
-    /// "writer stopped"; reads keep working. Calling it again does nothing.
+    /// stop it, save the vector index and mark the saved files clean (the next start trusts
+    /// them without rebuilding). Blocks until both threads have exited (normally well under a
+    /// second; an embedding batch in flight is finished first). Later writes fail with "writer
+    /// stopped"; reads keep working. Calling it again does nothing.
     pub fn shutdown(&self) {
         let Some((worker, writer)) = self.threads.lock().take() else {
             return;
@@ -353,11 +380,18 @@ impl Service {
         if writer.join().is_err() {
             tracing::error!("the writer panicked");
         }
-        if let Some(idx) = self.index.read().clone()
-            && idx.is_dirty()
-            && let Err(e) = idx.save(&self.home.vector_file(self.embedder.model_id()))
-        {
-            tracing::warn!(error = %e, "saving the vector index failed");
+        // No index yet (still rebuilding): nothing is marked, so the next start rebuilds too.
+        let Some(idx) = self.index.read().clone() else {
+            return;
+        };
+        let path = self.home.vector_file(self.embedder.model_id());
+        let saved = if idx.is_dirty() {
+            idx.save(&path)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = saved.and_then(|()| VectorIndex::mark_clean(&path)) {
+            tracing::warn!(error = %e, "saving the vector index failed; the next start rebuilds it");
         }
     }
 
@@ -1048,6 +1082,104 @@ mod tests {
                 out.results
             );
         }
+    }
+
+    /// Fix round 1 (M9): a clean stop marks the files it saved and the next start uses them as
+    /// they are; a start without the mark (after a crash) rebuilds the chunk part from the
+    /// stored vectors even though the counts agree.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_chunk_part_is_rebuilt_after_an_unclean_stop_and_trusted_after_a_clean_one() {
+        use alice_core::bq::BinaryIndex;
+        use alice_core::store::embeddings::VecKey;
+        use alice_core::vector::KeyFilter;
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let mk = || Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>);
+        let s = Service::start(home.clone(), &mk, ServiceOptions::default()).unwrap();
+        s.ingest(IngestRequest {
+            source: SourceInput {
+                uri: "s".into(),
+                ..Default::default()
+            },
+            chunks: (0..3)
+                .map(|i| ChunkInput {
+                    ord: i,
+                    text: format!("chunk number {i} of the session"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_embedded(&s).await;
+        let stop = |s: Arc<Service>| tokio::task::spawn_blocking(move || s.shutdown());
+        stop(s.clone()).await.unwrap();
+        drop(s);
+        let base = home.vector_file("fake");
+        let mark = base.with_extension("clean");
+        assert!(mark.exists(), "a clean stop marks the files it saved");
+        let seqs: Vec<i64> = {
+            let c = open_reader(&home.db()).unwrap();
+            let mut stmt = c.prepare("SELECT seq FROM chunks ORDER BY seq").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        // A stale chunk file with the right count: the newest chunk missing, a gone one there.
+        let write_stale = || {
+            let e = FakeEmbedder::new(384);
+            let mut stale = BinaryIndex::new(384);
+            for seq in [seqs[0], seqs[1], 999] {
+                stale
+                    .upsert(seq, &e.embed_query(&format!("x{seq}")).unwrap())
+                    .unwrap();
+            }
+            let f = std::fs::File::create(base.with_extension("chunks.bq")).unwrap();
+            stale.write_to(std::io::BufWriter::new(f)).unwrap();
+        };
+        let chunk_seqs = |s: &Service| -> Vec<i64> {
+            let q = FakeEmbedder::new(384).embed_query("chunk").unwrap();
+            let idx = s.index.read().clone().expect("index ready");
+            let mut out: Vec<i64> = idx
+                .search(&q, 10, KeyFilter::Chunks)
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| match k {
+                    VecKey::Chunk(s) | VecKey::Memory(s) => s,
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let ready = |s: Arc<Service>| async move {
+            for _ in 0..200 {
+                if s.health().await.unwrap().index_ready {
+                    return s;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("the index never became ready");
+        };
+
+        write_stale();
+        let s = ready(Service::start(home.clone(), &mk, ServiceOptions::default()).unwrap()).await;
+        assert!(!mark.exists(), "the mark is taken at start");
+        assert_eq!(
+            chunk_seqs(&s),
+            vec![seqs[0], seqs[1], 999],
+            "after a clean stop the saved chunk file is used as it is"
+        );
+        stop(s.clone()).await.unwrap();
+        drop(s);
+
+        write_stale();
+        std::fs::remove_file(&mark).unwrap(); // as after a crash
+        let s = ready(Service::start(home.clone(), &mk, ServiceOptions::default()).unwrap()).await;
+        assert_eq!(chunk_seqs(&s), seqs, "rebuilt from the stored vectors");
+        stop(s.clone()).await.unwrap();
+        assert!(mark.exists());
     }
 
     /// An index saved by M1 has `chunks.usearch` (an int8 HNSW) and no `chunks.bq`: the chunk

@@ -4,13 +4,15 @@
 //! Two parts, each with its own locks and dirty flag:
 //! - **memories**: a usearch HNSW (cosine, int8), searched on every recall;
 //! - **chunks**: a flat sign-bit index (`crate::bq`, 48 bytes per 384-dimension vector instead
-//!   of ~510 in an int8 HNSW). Its candidates (`k × CHUNK_OVERSAMPLE`, at least `MIN_RESCORE`)
-//!   are rescored with the exact f16 vectors of this index's model from the `embeddings` table
-//!   (`search_chunks`); an index without a model (`VectorIndex::new`) returns no chunk results
-//!   there. `search(.., KeyFilter::Chunks)` returns the sign-bit estimates, for ordering only.
+//!   of ~510 in an int8 HNSW). `search_chunks` ranks in three steps: the
+//!   `chunk_shortlist(N)` nearest codes by Hamming distance (the shortlist grows with √N),
+//!   those re-scored in RAM against the float query, and the best `max(k, MIN_RESCORE)` of
+//!   them rescored with the exact f16 vectors of this index's model from the `embeddings`
+//!   table. An index without a model (`VectorIndex::new`) returns no chunk results there.
+//!   `search(.., KeyFilter::Chunks)` returns the in-RAM estimates, for ordering only.
 //!
-//! A memory search never walks the chunk part and never waits for chunk ingest.
-//! `KeyFilter::Any` searches both parts and merges the two top-k lists by similarity.
+//! A memory search never walks the chunk part and never waits for chunk ingest. No search
+//! covers both parts: their similarities are on different scales.
 //!
 //! usearch facts the memory part handles (verified in the spike and the usearch 2.26.4 source):
 //! - capacity never grows by itself: `reserve` before adding, also after `load`;
@@ -31,7 +33,7 @@
 //! mutex first, so a write that arrives during a long `save` waits on that mutex instead of on
 //! the `RwLock`, where it would hold back every new search for the rest of the save.
 
-use crate::bq::BinaryIndex;
+use crate::bq::{BOOTSTRAP, BinaryIndex, mean_of};
 use crate::error::{AliceError, Result};
 use crate::store::embeddings::{self, VecKey};
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -42,18 +44,29 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 const THREADS: usize = 64;
 const MIN_CAPACITY: usize = 1_024;
-/// Chunk candidates rescored per result wanted (and never fewer than `MIN_RESCORE`).
-pub const CHUNK_OVERSAMPLE: usize = 4;
-/// 400, not 200: with the real model on 6,000 passages, 200 candidates held 0.967–0.970 of
-/// the exact top 10 and 400 held 0.985 (`docs/benchmarks/m2.md`). Recall asks for k = 100,
-/// so it rescored 400 candidates either way.
+/// Chunk rows read from the `embeddings` table per search, at least (k when larger). Chosen
+/// by the plan's rule at scale (the smallest of 200, 400, 800, 1,600 that keeps recall@10 >=
+/// 0.97 at 96,000 real passages): 200 kept 0.963 there, 400 keeps 0.980 live and 0.984 rebuilt
+/// (`docs/benchmarks/m2.md`, `alice-embed/tests/binary_chunk_recall.rs`).
 pub const MIN_RESCORE: usize = 400;
+/// The Hamming shortlist re-ranked in RAM: `max(SHORTLIST_MIN, SHORTLIST_PER_ROOT · √N)` for N
+/// chunk codes (24k: 4,960; 96k: 9,920; 1M: 32,000). At 96,000 real passages recall stopped
+/// growing past ~8,000; at 1M a 32,000 shortlist costs ~9 ms in RAM.
+pub const SHORTLIST_MIN: usize = 4_000;
+pub const SHORTLIST_PER_ROOT: usize = 32;
 
+/// The Hamming shortlist `search_chunks` re-ranks for an index of `n` chunk codes.
+pub fn chunk_shortlist(n: usize) -> usize {
+    let root = (n as f64).sqrt().ceil() as usize;
+    SHORTLIST_MIN.max(SHORTLIST_PER_ROOT.saturating_mul(root))
+}
+
+/// Which part [`VectorIndex::search`] reads. There is no "both": memory similarities (int8
+/// cosine) and chunk estimates are on different scales and must not be merged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFilter {
     Memories,
     Chunks,
-    Any,
 }
 
 /// Memories use even keys, chunks odd keys.
@@ -132,6 +145,11 @@ fn part_paths(path: &Path) -> (PathBuf, PathBuf) {
 /// The M1 chunk HNSW, replaced by `chunks.bq`.
 fn legacy_chunk_path(path: &Path) -> PathBuf {
     path.with_extension("chunks.usearch")
+}
+
+/// Left by a clean stop next to the files it saved (`m.usearch` -> `m.clean`).
+fn clean_mark_path(path: &Path) -> PathBuf {
+    path.with_extension("clean")
 }
 
 /// Limits concurrent searches to the reserved thread slots.
@@ -409,8 +427,20 @@ impl ChunkPart {
         n
     }
 
-    fn candidates(&self, query: &[f32], n: usize) -> Vec<(i64, f32)> {
-        self.inner.read().candidates(query, n)
+    fn nearest(&self, query: &[f32], rows: usize) -> Vec<(i64, f32)> {
+        let i = self.inner.read();
+        i.nearest(query, chunk_shortlist(i.len()), rows)
+    }
+
+    fn nearest_with(&self, query: &[f32], shortlist: usize, rows: usize) -> Vec<(i64, f32)> {
+        self.inner.read().nearest(query, shortlist, rows)
+    }
+
+    /// Swap in a freshly built index (a rebuild).
+    fn replace(&self, idx: BinaryIndex) {
+        let _writer = self.writer.lock();
+        *self.inner.write() = idx;
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     fn len(&self) -> usize {
@@ -544,66 +574,60 @@ impl VectorIndex {
         Ok(self.chunks.remove_many(seqs))
     }
 
-    /// Best first. Memories: similarity = 1 - cosine distance in the int8 HNSW. Chunks: the
-    /// sign-bit estimate, good for ordering only (recall uses [`Self::search_chunks`]).
+    /// Best first, from one part. Memories: similarity = 1 - cosine distance in the int8 HNSW.
+    /// Chunks: the in-RAM estimate `search_chunks` ranks by before it reads the stored vectors,
+    /// for ordering only (recall uses [`Self::search_chunks`]).
     pub fn search(&self, query: &[f32], k: usize, filter: KeyFilter) -> Result<Vec<(VecKey, f32)>> {
         check_dim("query", query.len(), self.dim)?;
-        let memories = |k| -> Result<Vec<(VecKey, f32)>> {
-            Ok(self
+        Ok(match filter {
+            KeyFilter::Memories => self
                 .memories
                 .search(query, k)?
                 .into_iter()
                 .map(|(key, s)| (decode_key(key), s))
-                .collect())
-        };
-        let chunks = |k| -> Vec<(VecKey, f32)> {
-            self.chunks
-                .candidates(query, k)
+                .collect(),
+            KeyFilter::Chunks => self
+                .chunks
+                .nearest(query, k)
                 .into_iter()
                 .map(|(seq, s)| (VecKey::Chunk(seq), s))
-                .collect()
-        };
-        Ok(match filter {
-            KeyFilter::Memories => memories(k)?,
-            KeyFilter::Chunks => chunks(k),
-            KeyFilter::Any => {
-                let mut hits = memories(k)?;
-                hits.extend(chunks(k));
-                hits.sort_by(|a, b| b.1.total_cmp(&a.1));
-                hits.truncate(k);
-                hits
-            }
+                .collect(),
         })
     }
 
-    /// Nearest chunks by exact cosine: sign-bit candidates (`k × CHUNK_OVERSAMPLE`, at least
-    /// `MIN_RESCORE`) rescored with this model's f16 vectors from the `embeddings` table.
-    /// Empty for an index without a model.
+    /// Nearest chunks by exact cosine. The [`chunk_shortlist`] nearest codes by Hamming
+    /// distance are re-scored in RAM against the float query, and the best `max(k,
+    /// MIN_RESCORE)` of those are rescored with this model's f16 vectors from the `embeddings`
+    /// table (one primary-key read each). Empty for an index without a model.
     pub fn search_chunks(
         &self,
         conn: &Connection,
         query: &[f32],
         k: usize,
     ) -> Result<Vec<(VecKey, f32)>> {
-        self.search_chunks_with(conn, query, k, CHUNK_OVERSAMPLE)
+        self.search_chunks_with(conn, query, k, None, MIN_RESCORE)
     }
 
-    /// [`Self::search_chunks`] with another oversampling factor (recall measurements).
+    /// [`Self::search_chunks`] with another shortlist (`None`: [`chunk_shortlist`]) and another
+    /// floor for the rows read (`max(k, rows)` are read), for recall measurements.
     pub fn search_chunks_with(
         &self,
         conn: &Connection,
         query: &[f32],
         k: usize,
-        oversample: usize,
+        shortlist: Option<usize>,
+        rows: usize,
     ) -> Result<Vec<(VecKey, f32)>> {
         check_dim("query", query.len(), self.dim)?;
         if k == 0 || self.model.is_empty() {
             return Ok(Vec::new());
         }
-        let n = k.saturating_mul(oversample.max(1)).max(MIN_RESCORE);
-        let keys: Vec<VecKey> = self
-            .chunks
-            .candidates(query, n)
+        let rows = rows.max(k);
+        let ranked = match shortlist {
+            Some(s) => self.chunks.nearest_with(query, s, rows),
+            None => self.chunks.nearest(query, rows),
+        };
+        let keys: Vec<VecKey> = ranked
             .into_iter()
             .map(|(seq, _)| VecKey::Chunk(seq))
             .collect();
@@ -639,32 +663,103 @@ impl VectorIndex {
         let (memories, chunks) = part_paths(path);
         self.memories.save(&memories)?;
         self.chunks.save(&chunks)?;
-        let _ = std::fs::remove_file(legacy_chunk_path(path));
+        let legacy = legacy_chunk_path(path);
+        if let Err(e) = std::fs::remove_file(&legacy)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                error = %e,
+                file = %legacy.display(),
+                "could not delete the M1 chunk index; it is unused and can be deleted by hand"
+            );
+        }
         Ok(())
+    }
+
+    /// Record that the files at `path` hold the index as last saved. A clean stop calls this
+    /// after its final save; a start trusts the chunk file only when the mark is there.
+    pub fn mark_clean(path: &Path) -> Result<()> {
+        std::fs::write(clean_mark_path(path), b"")?;
+        Ok(())
+    }
+
+    /// Whether the last stop left the clean mark next to `path`. The mark is removed, so a
+    /// crash from now on leaves none; a mark that cannot be removed counts as absent.
+    pub fn take_clean_mark(path: &Path) -> bool {
+        let mark = clean_mark_path(path);
+        if !mark.exists() {
+            return false;
+        }
+        match std::fs::remove_file(&mark) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, file = %mark.display(), "could not remove the clean-stop mark");
+                false
+            }
+        }
     }
 
     /// A fresh index for `model` holding every stored vector of it. Vectors that cannot be
     /// added (wrong dimension, out-of-range key) are skipped and counted in a warning.
     pub fn rebuild_from(conn: &Connection, model: &str, dim: usize) -> Result<Self> {
         let idx = Self::for_model(model, dim)?;
-        let stored = embeddings::count(conn, model)?;
+        idx.fill_from(conn, true)?;
+        Ok(idx)
+    }
+
+    /// Rebuild the chunk part in place from the stored vectors of this index's model, keeping
+    /// the memory part: after an unclean stop the chunk file can miss chunks or hold stale ones
+    /// even when the counts agree.
+    pub fn rebuild_chunks_from(&self, conn: &Connection) -> Result<()> {
+        self.fill_from(conn, false)
+    }
+
+    /// Fill the chunk part (and the memory part with `memories`) from the table. With at least
+    /// `BOOTSTRAP` chunk vectors the chunk part is built in one go: its mean fitted on a sample
+    /// spread over all of them (not the first rows), codes sorted by seq once at the end.
+    fn fill_from(&self, conn: &Connection, memories: bool) -> Result<()> {
+        // Free the old codes first: nothing searches an index while it is rebuilt.
+        self.chunks.replace(BinaryIndex::new(self.dim));
+        let sample: Vec<Vec<f32>> =
+            if embeddings::count_chunks_up_to(conn, &self.model, BOOTSTRAP)? >= BOOTSTRAP {
+                embeddings::sample_chunks(conn, &self.model, BOOTSTRAP)?
+                    .into_iter()
+                    .filter(|v| v.len() == self.dim)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let mut bulk = match mean_of(self.dim, &sample) {
+            Some(mean) => Some(BinaryIndex::bulk(self.dim, mean)?),
+            None => None,
+        };
+        drop(sample);
         let mut failed = 0usize;
         let mut first_error = None;
-        embeddings::for_each(conn, model, |key, v| {
-            if let Err(e) = idx.upsert(key, &v) {
+        embeddings::for_each(conn, &self.model, |key, v| {
+            let added = match (key, bulk.as_mut()) {
+                (VecKey::Memory(_), _) if !memories => Ok(()),
+                (VecKey::Chunk(seq), Some(b)) => check_dim("vector", v.len(), self.dim)
+                    .and_then(|()| checked_key(key))
+                    .and_then(|_| b.push(seq, &v)),
+                _ => self.upsert(key, &v),
+            };
+            if let Err(e) = added {
                 failed += 1;
                 first_error.get_or_insert_with(|| format!("{key:?}: {e}"));
             }
         })?;
+        if let Some(b) = bulk {
+            self.chunks.replace(b.finish());
+        }
         if failed > 0 {
             tracing::warn!(
                 failed,
-                stored,
                 first_error = first_error.as_deref().unwrap_or_default(),
                 "some vectors could not be added during rebuild"
             );
         }
-        Ok(idx)
+        Ok(())
     }
 }
 
@@ -737,7 +832,7 @@ mod tests {
         back.upsert(VecKey::Memory(5_000), &v(&e, "after load"))
             .unwrap();
         assert_eq!(
-            back.search(&v(&e, "after load"), 1, KeyFilter::Any)
+            back.search(&v(&e, "after load"), 1, KeyFilter::Memories)
                 .unwrap()[0]
                 .0,
             VecKey::Memory(5_000)
@@ -761,7 +856,7 @@ mod tests {
                         )
                         .unwrap();
                     } else {
-                        idx.search(&e.embed_query("t1 i1").unwrap(), 5, KeyFilter::Any)
+                        idx.search(&e.embed_query("t1 i1").unwrap(), 5, KeyFilter::Chunks)
                             .unwrap();
                     }
                 }
@@ -808,40 +903,38 @@ mod tests {
         assert_send_sync::<VectorIndex>();
     }
 
+    /// Each filter reads its own part only (no search merges the two similarity scales).
     #[test]
-    fn empty_index_zero_k_wrong_query_dimension_and_any_filter() {
+    fn empty_index_zero_k_wrong_query_dimension_and_each_filter() {
         let e = FakeEmbedder::new(384);
         let idx = VectorIndex::new(384).unwrap();
         assert!(idx.is_empty());
-        assert!(
-            idx.search(&v(&e, "x"), 5, KeyFilter::Any)
-                .unwrap()
-                .is_empty()
-        );
+        for filter in [KeyFilter::Memories, KeyFilter::Chunks] {
+            assert!(idx.search(&v(&e, "x"), 5, filter).unwrap().is_empty());
+        }
         idx.upsert(VecKey::Memory(1), &v(&e, "sqlite writer lease"))
             .unwrap();
         idx.upsert(VecKey::Chunk(1), &v(&e, "sqlite writer lease"))
             .unwrap();
-        assert!(
-            idx.search(&v(&e, "sqlite"), 0, KeyFilter::Any)
+        for filter in [KeyFilter::Memories, KeyFilter::Chunks] {
+            assert!(idx.search(&v(&e, "sqlite"), 0, filter).unwrap().is_empty());
+            assert!(
+                matches!(
+                    idx.search(&[0.0; 10], 5, filter),
+                    Err(AliceError::Invalid(_))
+                ),
+                "a query of the wrong dimension is the caller's mistake"
+            );
+        }
+        let keys = |filter| -> Vec<VecKey> {
+            idx.search(&v(&e, "sqlite writer lease"), 5, filter)
                 .unwrap()
-                .is_empty()
-        );
-        assert!(
-            matches!(
-                idx.search(&[0.0; 10], 5, KeyFilter::Any),
-                Err(AliceError::Invalid(_))
-            ),
-            "a query of the wrong dimension is the caller's mistake"
-        );
-        let mut both: Vec<VecKey> = idx
-            .search(&v(&e, "sqlite writer lease"), 5, KeyFilter::Any)
-            .unwrap()
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
-        both.sort();
-        assert_eq!(both, vec![VecKey::Memory(1), VecKey::Chunk(1)]);
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        assert_eq!(keys(KeyFilter::Memories), vec![VecKey::Memory(1)]);
+        assert_eq!(keys(KeyFilter::Chunks), vec![VecKey::Chunk(1)]);
     }
 
     #[test]
@@ -863,7 +956,7 @@ mod tests {
         idx.upsert(VecKey::Memory(i64::MAX), &v(&e, "edge"))
             .unwrap();
         assert_eq!(
-            idx.search(&v(&e, "edge"), 1, KeyFilter::Any).unwrap()[0].0,
+            idx.search(&v(&e, "edge"), 1, KeyFilter::Memories).unwrap()[0].0,
             VecKey::Memory(i64::MAX)
         );
     }
@@ -937,7 +1030,7 @@ mod tests {
                     std::thread::spawn(move || {
                         ready.fetch_add(1, Ordering::SeqCst);
                         while !stop.load(Ordering::Relaxed) {
-                            idx.search(&q, 1, KeyFilter::Any).unwrap();
+                            idx.search(&q, 1, KeyFilter::Memories).unwrap();
                         }
                     })
                 })
@@ -982,7 +1075,7 @@ mod tests {
                             idx.search(
                                 &e.embed_query(&format!("note {i}")).unwrap(),
                                 5,
-                                KeyFilter::Any,
+                                KeyFilter::Memories,
                             )
                             .unwrap();
                         }
@@ -1020,7 +1113,7 @@ mod tests {
                     let q = e.embed_query(&format!("note {t}")).unwrap();
                     start.wait();
                     for _ in 0..20 {
-                        back.search(&q, 5, KeyFilter::Any).unwrap();
+                        back.search(&q, 5, KeyFilter::Memories).unwrap();
                     }
                 })
             })
@@ -1038,11 +1131,9 @@ mod tests {
         VectorIndex::new(384).unwrap().save(&path).unwrap();
         let back = VectorIndex::open(&path, "fake", 384).unwrap();
         assert!(back.is_empty());
-        assert!(
-            back.search(&v(&e, "x"), 3, KeyFilter::Any)
-                .unwrap()
-                .is_empty()
-        );
+        for filter in [KeyFilter::Memories, KeyFilter::Chunks] {
+            assert!(back.search(&v(&e, "x"), 3, filter).unwrap().is_empty());
+        }
         back.upsert(VecKey::Chunk(4), &v(&e, "x")).unwrap();
         assert_eq!(
             back.search(&v(&e, "x"), 3, KeyFilter::Chunks).unwrap()[0].0,
@@ -1073,13 +1164,17 @@ mod tests {
         let back = VectorIndex::open(&path, "fake", 384).unwrap();
         assert!(!back.is_dirty());
         assert_eq!(back.len(), 9);
-        let hits = back.search(&v(&e, "note 3"), 9, KeyFilter::Any).unwrap();
+        let hits = back
+            .search(&v(&e, "note 3"), 9, KeyFilter::Memories)
+            .unwrap();
         assert_eq!(hits.len(), 9);
         assert!(hits.iter().all(|(k, _)| *k != VecKey::Memory(3)));
         back.upsert(VecKey::Memory(3), &v(&e, "note 3")).unwrap();
         assert_eq!(back.len(), 10);
         assert_eq!(
-            back.search(&v(&e, "note 3"), 1, KeyFilter::Any).unwrap()[0].0,
+            back.search(&v(&e, "note 3"), 1, KeyFilter::Memories)
+                .unwrap()[0]
+                .0,
             VecKey::Memory(3)
         );
         assert!(
@@ -1125,52 +1220,16 @@ mod tests {
         assert_eq!(hits.len(), 50, "every memory and nothing else");
         assert!(hits.iter().all(|(k, _)| matches!(k, VecKey::Memory(_))));
         assert_eq!(hits[0].0, VecKey::Memory(7));
+        // Chunk results are estimates (ordering only; exact order needs the stored vectors).
         let chunk_hits = idx.search(&q, 5, KeyFilter::Chunks).unwrap();
-        assert_eq!(chunk_hits[0].0, VecKey::Chunk(7));
+        assert!(
+            chunk_hits.iter().any(|(k, _)| *k == VecKey::Chunk(7)),
+            "{chunk_hits:?}"
+        );
         assert!(
             chunk_hits
                 .iter()
                 .all(|(k, _)| matches!(k, VecKey::Chunk(_)))
-        );
-    }
-
-    #[test]
-    fn any_merges_both_sub_indexes_best_first() {
-        use crate::embed::cosine;
-        let e = FakeEmbedder::new(384);
-        let idx = VectorIndex::new(384).unwrap();
-        let texts = [
-            (VecKey::Memory(1), "sqlite writer lease timeout"),
-            (VecKey::Chunk(1), "sqlite writer lease"),
-            (VecKey::Memory(2), "rust borrow checker lifetimes"),
-            (VecKey::Chunk(2), "tom yum soup recipe"),
-            (VecKey::Memory(3), "sqlite writer"),
-            (VecKey::Chunk(3), "kubernetes pod scheduling"),
-        ];
-        let items: Vec<_> = texts.iter().map(|(k, t)| (*k, v(&e, t))).collect();
-        idx.upsert_batch(&items).unwrap();
-        let q = v(&e, "sqlite writer lease");
-        let mut expected: Vec<(VecKey, f32)> =
-            items.iter().map(|(k, x)| (*k, cosine(&q, x))).collect();
-        expected.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let all = idx.search(&q, 10, KeyFilter::Any).unwrap();
-        assert_eq!(
-            all.iter().map(|(k, _)| *k).collect::<Vec<_>>()[..3],
-            expected.iter().map(|(k, _)| *k).collect::<Vec<_>>()[..3],
-            "{all:?} vs {expected:?}"
-        );
-        assert_eq!(all.len(), 6);
-        assert!(
-            all.windows(2).all(|w| w[0].1 >= w[1].1),
-            "best first: {all:?}"
-        );
-        assert_eq!(
-            idx.search(&q, 3, KeyFilter::Any).unwrap(),
-            all[..3].to_vec()
-        );
-        assert_eq!(
-            idx.search(&q, 1, KeyFilter::Any).unwrap()[0].0,
-            VecKey::Chunk(1)
         );
     }
 
@@ -1236,7 +1295,7 @@ mod tests {
         let back = VectorIndex::open(&path, "m", 384).unwrap();
         assert_eq!((back.memories.len(), back.chunks.len()), (1, 2));
         assert_eq!(
-            back.search(&v(&e, "tom yum soup recipe"), 1, KeyFilter::Any)
+            back.search(&v(&e, "tom yum soup recipe"), 1, KeyFilter::Chunks)
                 .unwrap()[0]
                 .0,
             VecKey::Chunk(1)
@@ -1477,12 +1536,14 @@ mod tests {
         let q = v(&e, "chunk 1234 on subject 4 detail 70");
         let hits = idx.search_chunks(&c, &q, 10).unwrap();
         assert_eq!(hits[0].0, VecKey::Chunk(1234));
-        assert!(
-            hits[0].1 > 0.99,
-            "exact cosine after rescoring: {}",
-            hits[0].1
-        );
         assert!(hits.windows(2).all(|w| w[0].1 >= w[1].1));
+        // Every score is the exact cosine with the stored (f16) vector, not an estimate.
+        let stored =
+            crate::store::embeddings::get_many(&c, "fake", &[hits[0].0, hits[6].0]).unwrap();
+        for ((key, score), (stored_key, vector)) in [hits[0], hits[6]].iter().zip(&stored) {
+            assert_eq!(key, stored_key);
+            assert_eq!(*score, crate::embed::cosine(&q, vector), "{key:?}");
+        }
         assert_eq!(idx.len(), 5_000);
         // Without a model there are no stored vectors to rescore with.
         let anonymous = VectorIndex::new(384).unwrap();
@@ -1560,5 +1621,145 @@ mod tests {
             .collect();
         assert_eq!(left.len(), 7);
         assert!(![2, 4, 6].iter().any(|s| left.contains(&VecKey::Chunk(*s))));
+    }
+
+    // Fix round 1.
+
+    /// M7, M8: a rebuild fits the chunk mean on a sample spread over every chunk (not the
+    /// first rows read) and builds the chunk part in one go, sorting once, even when the table
+    /// returns the chunks out of seq order.
+    #[test]
+    fn a_rebuild_fits_the_mean_on_all_chunks_and_sorts_the_rows_once() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        let e = FakeEmbedder::new(384);
+        let n = 2 * BOOTSTRAP as i64;
+        // Written newest first, so rows come back in descending seq order; the older half is
+        // about one subject and the newer half about another.
+        let text = |i: i64| {
+            if i <= n / 2 {
+                format!("alpha subject number {i}")
+            } else {
+                format!("omega topic item {i}")
+            }
+        };
+        let mut read_order = Vec::new();
+        for i in (1..=n).rev() {
+            let x = v(&e, &text(i));
+            embeddings::put(&c, VecKey::Chunk(i), "fake", &x).unwrap();
+            read_order.push(embeddings::decode_f16(&embeddings::encode_f16(&x)));
+        }
+        let idx = VectorIndex::rebuild_from(&c, "fake", 384).unwrap();
+        assert_eq!(idx.len(), n as usize);
+        let fitted = idx.chunks.inner.read().mean().unwrap().to_vec();
+        let whole = mean_of(384, &read_order).unwrap();
+        let first_rows = mean_of(384, &read_order[..BOOTSTRAP]).unwrap();
+        let dist = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y) * (x - y))
+                .sum::<f32>()
+                .sqrt()
+        };
+        assert!(
+            dist(&fitted, &whole) < 0.2 * dist(&first_rows, &whole),
+            "fitted mean {} from the whole corpus, first rows {}",
+            dist(&fitted, &whole),
+            dist(&first_rows, &whole)
+        );
+        let q = v(&e, &text(1_234));
+        assert_eq!(
+            idx.search_chunks(&c, &q, 1).unwrap()[0].0,
+            VecKey::Chunk(1_234)
+        );
+        // Sorted by seq: the file reader rejects anything else.
+        let path = d.path().join("fake.usearch");
+        idx.save(&path).unwrap();
+        assert_eq!(
+            VectorIndex::open(&path, "fake", 384).unwrap().len(),
+            n as usize
+        );
+    }
+
+    /// M9: after an unclean stop the chunk part is rebuilt from the table; the memory part,
+    /// loaded from its file, stays as it is.
+    #[test]
+    fn rebuild_chunks_from_replaces_the_chunk_part_and_keeps_the_memories() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        let e = FakeEmbedder::new(384);
+        for s in 1..=3 {
+            embeddings::put(&c, VecKey::Chunk(s), "fake", &v(&e, &format!("chunk {s}"))).unwrap();
+        }
+        embeddings::put(&c, VecKey::Memory(1), "fake", &v(&e, "memory one")).unwrap();
+        let idx = VectorIndex::for_model("fake", 384).unwrap();
+        idx.upsert(VecKey::Memory(1), &v(&e, "memory one")).unwrap();
+        idx.upsert(VecKey::Memory(2), &v(&e, "memory two")).unwrap();
+        // A stale chunk part with the right count: chunk 3 missing, chunk 99 long gone.
+        for s in [1, 2, 99] {
+            idx.upsert(VecKey::Chunk(s), &v(&e, &format!("chunk {s}")))
+                .unwrap();
+        }
+        let path = d.path().join("fake.usearch");
+        idx.save(&path).unwrap();
+        idx.rebuild_chunks_from(&c).unwrap();
+        assert!(idx.is_dirty());
+        let mut chunks: Vec<VecKey> = idx
+            .search(&v(&e, "chunk"), 10, KeyFilter::Chunks)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        chunks.sort();
+        assert_eq!(
+            chunks,
+            vec![VecKey::Chunk(1), VecKey::Chunk(2), VecKey::Chunk(3)]
+        );
+        assert_eq!(idx.memories.len(), 2, "the memory part is kept as loaded");
+    }
+
+    /// M5: a leftover M1 file that cannot be deleted (here a directory in its place) is
+    /// logged, and the save still succeeds.
+    #[test]
+    fn an_undeletable_m1_chunk_file_does_not_fail_the_save() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("fake.usearch");
+        let legacy = base.with_extension("chunks.usearch");
+        std::fs::create_dir_all(legacy.join("inside")).unwrap();
+        let e = FakeEmbedder::new(384);
+        let idx = VectorIndex::for_model("fake", 384).unwrap();
+        idx.upsert(VecKey::Chunk(1), &v(&e, "c1")).unwrap();
+        idx.save(&base).unwrap();
+        assert!(legacy.exists());
+        assert_eq!(VectorIndex::open(&base, "fake", 384).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_clean_mark_is_taken_once() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("vectors").join("m.usearch");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(!VectorIndex::take_clean_mark(&path));
+        VectorIndex::mark_clean(&path).unwrap();
+        assert!(path.with_extension("clean").exists());
+        assert!(VectorIndex::take_clean_mark(&path));
+        assert!(
+            !VectorIndex::take_clean_mark(&path),
+            "taken at start: a crash from now on leaves none"
+        );
+    }
+
+    #[test]
+    fn the_shortlist_grows_with_the_root_of_the_chunk_count() {
+        assert_eq!(chunk_shortlist(0), SHORTLIST_MIN);
+        assert_eq!(
+            chunk_shortlist(10_000),
+            SHORTLIST_MIN.max(SHORTLIST_PER_ROOT * 100)
+        );
+        assert_eq!(
+            chunk_shortlist(1_000_000),
+            SHORTLIST_MIN.max(SHORTLIST_PER_ROOT * 1_000)
+        );
+        assert!(chunk_shortlist(4_000_000) >= chunk_shortlist(1_000_000));
     }
 }

@@ -1,27 +1,31 @@
 //! Flat sign-bit index for raw chunks.
 //!
-//! Each vector is kept as one bit per dimension: whether it lies above the mean of the first
-//! `BOOTSTRAP` vectors. Centring matters: e5 vectors share a large common direction (unrelated
-//! texts sit at cosine ~0.7), so uncentred sign bits would be nearly constant. A search ranks
-//! every code by Hamming distance (popcount of XOR) and returns the nearest candidates; the
-//! caller rescores them with the exact vectors kept in SQLite (`VectorIndex::search_chunks`).
-//! The vector's own coordinates are used, not signs of random projections: with the real
-//! model they kept more of the exact top 10 (`docs/benchmarks/m2.md`), though for sparse
-//! vectors (the test embedder's) they mostly count non-zero coordinates.
+//! Each vector is kept as one bit per dimension: whether it lies above a mean vector. Centring
+//! matters: e5 vectors share a large common direction (unrelated texts sit at cosine ~0.7),
+//! so uncentred sign bits would be nearly constant. The vector's own coordinates are used, not
+//! signs of random projections: with the real model they kept more of the exact top 10
+//! (`docs/benchmarks/m2.md`).
 //!
-//! Until `BOOTSTRAP` vectors have arrived there is no mean: those vectors are kept as f32 and
-//! searched exactly. At `BOOTSTRAP` the mean is computed once and kept for the life of this
-//! index; a rebuild computes a fresh one.
+//! A search ([`BinaryIndex::nearest`]) ranks in RAM in two steps: every code by Hamming
+//! distance (popcount of XOR) down to a shortlist, then the shortlist re-scored against the
+//! float query, which keeps the query's magnitudes that the Hamming distance throws away. The
+//! caller reads the best few of those from SQLite and rescores them exactly
+//! (`VectorIndex::search_chunks`).
+//!
+//! The mean: an index filled by inserts keeps its first `BOOTSTRAP` vectors as f32 (searched
+//! exactly) and then fixes the mean of those for the life of the index. A rebuild
+//! ([`BinaryIndex::bulk`]) is given a mean fitted on a sample spread over the whole corpus and
+//! sorts its codes by seq once.
 //!
 //! Memory: 48 bytes of code and 8 bytes of key per 384-dimension vector (~56 MB at 1M chunks),
-//! against ~560 MB for the int8 HNSW it replaces. Search is a linear scan (~48 MB at 1M).
+//! against ~560 MB for the int8 HNSW it replaces. Each search scans the codes twice (~48 MB
+//! each at 1M) and keeps only its shortlist.
 //!
 //! File format (little-endian): magic `ALICEBQ1`, dimension (u32), state (u32: 1 while
 //! bootstrapping), count (u64); then either `count` × (seq i64, `dim` × f32), or the mean
 //! (`dim` × f32), `count` sorted seqs (i64) and `count` codes (`dim / 64` rounded up × u64).
 
 use crate::error::{AliceError, Result};
-use std::collections::BinaryHeap;
 use std::io::{Read, Write};
 
 /// Vectors kept exactly before the mean is fixed.
@@ -78,6 +82,89 @@ fn read_values<const N: usize, T>(
         left -= n;
     }
     Ok(out)
+}
+
+/// The mean of `vectors` (all of dimension `dim`), or `None` when there are none.
+pub fn mean_of<V: AsRef<[f32]>>(dim: usize, vectors: &[V]) -> Option<Vec<f32>> {
+    if vectors.is_empty() {
+        return None;
+    }
+    let mut mean = vec![0f64; dim];
+    for v in vectors {
+        for (m, x) in mean.iter_mut().zip(v.as_ref()) {
+            *m += f64::from(*x);
+        }
+    }
+    let n = vectors.len() as f64;
+    Some(mean.into_iter().map(|m| (m / n) as f32).collect())
+}
+
+/// An index built in one go (see [`BinaryIndex::bulk`]): codes are appended in arrival order
+/// and sorted by seq once, in [`BulkBuild::finish`], instead of one insertion each.
+pub struct BulkBuild {
+    idx: BinaryIndex,
+    sorted: bool,
+}
+
+impl BulkBuild {
+    pub fn push(&mut self, seq: i64, v: &[f32]) -> Result<()> {
+        let idx = &mut self.idx;
+        if v.len() != idx.dim {
+            return Err(AliceError::invalid(format!(
+                "vector has {} dimensions; the index uses {}",
+                v.len(),
+                idx.dim
+            )));
+        }
+        if seq < 0 {
+            return Err(AliceError::invalid(format!("chunk seq {seq} is negative")));
+        }
+        let Some(mean) = idx.mean.as_deref() else {
+            return Err(AliceError::Other("a bulk build has a mean".into()));
+        };
+        let code = encode(mean, idx.words, v);
+        if idx.keys.last().is_some_and(|&last| last >= seq) {
+            self.sorted = false;
+        }
+        idx.keys.push(seq);
+        idx.codes.extend_from_slice(&code);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.idx.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Sort by seq (a seq pushed twice keeps its last vector) and hand over the index.
+    pub fn finish(self) -> BinaryIndex {
+        let mut idx = self.idx;
+        if self.sorted {
+            return idx;
+        }
+        let w = idx.words;
+        let mut order: Vec<usize> = (0..idx.keys.len()).collect();
+        // Stable: among equal seqs the later push stays later, and is the one kept.
+        order.sort_by_key(|&i| idx.keys[i]);
+        let mut keys = Vec::with_capacity(order.len());
+        let mut codes = Vec::with_capacity(order.len() * w);
+        for (j, &i) in order.iter().enumerate() {
+            if order
+                .get(j + 1)
+                .is_some_and(|&next| idx.keys[next] == idx.keys[i])
+            {
+                continue;
+            }
+            keys.push(idx.keys[i]);
+            codes.extend_from_slice(&idx.codes[i * w..(i + 1) * w]);
+        }
+        idx.keys = keys;
+        idx.codes = codes;
+        idx
+    }
 }
 
 fn strictly_increasing_from_zero(seqs: impl IntoIterator<Item = i64>) -> bool {
@@ -216,44 +303,138 @@ impl BinaryIndex {
         before - self.len()
     }
 
-    /// Up to `n` seqs nearest to `query`, best first, with an estimated cosine similarity
-    /// (`cos(π · hamming / dim)`, for ordering only; exact while bootstrapping). Ties go to
-    /// the older seq. A query of the wrong dimension finds nothing.
+    /// The mean the codes are centred on (`None` while bootstrapping).
+    pub fn mean(&self) -> Option<&[f32]> {
+        self.mean.as_deref()
+    }
+
+    /// While bootstrapping: the `n` nearest by exact cosine, ties to the older seq.
+    fn exact(&self, query: &[f32], n: usize) -> Vec<(i64, f32)> {
+        let mut all: Vec<(i64, f32)> = self
+            .boot
+            .iter()
+            .map(|(s, v)| (*s, crate::embed::cosine(query, v)))
+            .collect();
+        all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        all.truncate(n);
+        all
+    }
+
+    /// Positions of the `n` codes nearest to `q` by Hamming distance, with the distance,
+    /// nearest first; ties go to the older seq (the lower position). Two scans and no heap:
+    /// the first counts the codes at each distance, which fixes the cut; the second collects
+    /// every code under the cut and, in seq order, as many at the cut as are still wanted.
+    /// Linear in the number of codes whatever `n` is (a shortlist runs to tens of thousands).
+    fn hamming_top(&self, q: &[u64], n: usize) -> Vec<(u32, usize)> {
+        let distance =
+            |code: &[u64]| -> u32 { code.iter().zip(q).map(|(a, b)| (a ^ b).count_ones()).sum() };
+        let codes = self.codes.chunks_exact(self.words);
+        let mut at = vec![0usize; self.words * 64 + 1];
+        for code in codes.clone() {
+            at[distance(code) as usize] += 1;
+        }
+        let (mut cut, mut nearer) = (0usize, 0usize);
+        while cut + 1 < at.len() && nearer + at[cut] < n {
+            nearer += at[cut];
+            cut += 1;
+        }
+        let mut at_cut = n.saturating_sub(nearer);
+        let mut out = Vec::with_capacity(n.min(self.keys.len()));
+        for (i, code) in codes.enumerate() {
+            let d = distance(code);
+            if (d as usize) < cut {
+                out.push((d, i));
+            } else if d as usize == cut && at_cut > 0 {
+                out.push((d, i));
+                at_cut -= 1;
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Up to `n` seqs nearest to `query` by Hamming distance alone, best first, with an
+    /// estimated cosine similarity (`cos(π · hamming / dim)`, for ordering only; exact while
+    /// bootstrapping). Ties go to the older seq. A query of the wrong dimension finds nothing.
     pub fn candidates(&self, query: &[f32], n: usize) -> Vec<(i64, f32)> {
         if n == 0 || query.len() != self.dim {
             return Vec::new();
         }
         let Some(mean) = self.mean.as_deref() else {
-            let mut all: Vec<(i64, f32)> = self
-                .boot
-                .iter()
-                .map(|(s, v)| (*s, crate::embed::cosine(query, v)))
-                .collect();
-            all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-            all.truncate(n);
-            return all;
+            return self.exact(query, n);
         };
         let q = encode(mean, self.words, query);
-        let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(n + 1);
-        for (i, code) in self.codes.chunks_exact(self.words).enumerate() {
-            let d: u32 = code.iter().zip(&q).map(|(a, b)| (a ^ b).count_ones()).sum();
-            if heap.len() < n {
-                heap.push((d, i));
-            } else if let Some(&(worst, _)) = heap.peek()
-                && d < worst
-            {
-                heap.pop();
-                heap.push((d, i));
-            }
-        }
-        let mut out = heap.into_vec();
-        out.sort_unstable();
-        out.into_iter()
+        self.hamming_top(&q, n)
+            .into_iter()
             .map(|(d, i)| {
                 let est = (std::f32::consts::PI * d as f32 / self.dim as f32).cos();
                 (self.keys[i], est)
             })
             .collect()
+    }
+
+    /// Up to `n` seqs ranked in RAM, best first: the `shortlist` nearest codes by Hamming
+    /// distance, re-scored against the float query as `Σ (q_i − mean_i) · (bit_i ? 1 : −1)`
+    /// divided by `Σ |q_i − mean_i|` (1 when every bit lies on the query's side of the mean; an
+    /// estimate for ordering only). The query keeps its magnitudes, which the Hamming distance
+    /// throws away, so this order is much closer to the cosine order. Ties go to the older seq.
+    /// Exact cosine while bootstrapping; a query of the wrong dimension finds nothing.
+    pub fn nearest(&self, query: &[f32], shortlist: usize, n: usize) -> Vec<(i64, f32)> {
+        if n == 0 || query.len() != self.dim {
+            return Vec::new();
+        }
+        let Some(mean) = self.mean.as_deref() else {
+            return self.exact(query, n);
+        };
+        let q = encode(mean, self.words, query);
+        let short = self.hamming_top(&q, shortlist.max(n));
+        // Per code byte, the sum of the centred query over the bits set in that byte value.
+        let centred: Vec<f32> = query.iter().zip(mean).map(|(x, m)| x - m).collect();
+        let bytes = self.words * 8;
+        let mut table = vec![0f32; bytes * 256];
+        for b in 0..bytes {
+            for value in 1..256usize {
+                let low = b * 8 + value.trailing_zeros() as usize;
+                table[b * 256 + value] = table[b * 256 + (value & (value - 1))]
+                    + centred.get(low).copied().unwrap_or(0.0);
+            }
+        }
+        let total: f32 = centred.iter().sum();
+        let l1: f32 = centred
+            .iter()
+            .map(|x| x.abs())
+            .sum::<f32>()
+            .max(f32::MIN_POSITIVE);
+        let w = self.words;
+        let mut scored: Vec<(i64, f32)> = short
+            .into_iter()
+            .map(|(_, i)| {
+                let set: f32 = self.codes[i * w..(i + 1) * w]
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .enumerate()
+                    .map(|(b, byte)| table[b * 256 + byte as usize])
+                    .sum();
+                (self.keys[i], (2.0 * set - total) / l1)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.truncate(n);
+        scored
+    }
+
+    /// Start a bulk build (a rebuild) with a mean fitted beforehand, e.g. by [`mean_of`] on a
+    /// sample of the whole corpus. Fails for a mean of another dimension.
+    pub fn bulk(dim: usize, mean: Vec<f32>) -> Result<BulkBuild> {
+        if mean.len() != dim {
+            return Err(AliceError::invalid(format!(
+                "the mean has {} dimensions; the index uses {dim}",
+                mean.len()
+            )));
+        }
+        let mut idx = BinaryIndex::new(dim);
+        idx.mean = Some(mean);
+        Ok(BulkBuild { idx, sorted: true })
     }
 
     pub fn write_to(&self, mut w: impl Write) -> std::io::Result<()> {
@@ -342,26 +523,105 @@ impl BinaryIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embed::{Embedder, FakeEmbedder, cosine};
+    use crate::embed::cosine;
 
-    fn fake() -> FakeEmbedder {
-        FakeEmbedder::new(384)
+    const DIM: usize = 384;
+    const CLUSTERS: usize = 60;
+
+    /// Seeded dense vectors shaped like a sentence model's: every vector leans 0.9 towards one
+    /// shared all-positive direction (vectors of different clusters sit at cosine ~0.81, as
+    /// unrelated e5 texts do at ~0.7), then 60 clusters with noise. Uncentred sign bits are
+    /// nearly all 1 here; only centring makes them informative.
+    struct Fixture {
+        state: u64,
+        centres: Vec<Vec<f32>>,
     }
 
-    fn text(i: usize) -> String {
-        format!("chunk {i} about topic {} and detail {}", i % 37, i % 101)
+    fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= n);
+        v
     }
 
+    impl Fixture {
+        fn new(seed: u64) -> Self {
+            let mut f = Self {
+                state: seed,
+                centres: Vec::new(),
+            };
+            f.centres = (0..CLUSTERS).map(|_| normalize(f.gaussians())).collect();
+            f
+        }
+
+        fn uniform(&mut self) -> f64 {
+            self.state ^= self.state << 13;
+            self.state ^= self.state >> 7;
+            self.state ^= self.state << 17;
+            (self.state >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        fn gaussians(&mut self) -> Vec<f32> {
+            (0..DIM)
+                .map(|_| {
+                    let (a, b) = (self.uniform().max(1e-12), self.uniform());
+                    ((-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()) as f32
+                })
+                .collect()
+        }
+
+        /// A vector of `cluster`: normalize(0.9·shared + 0.44·normalize(centre + 0.7·noise)).
+        fn point(&mut self, cluster: usize) -> Vec<f32> {
+            let noise = self.gaussians();
+            let scale = 0.7 / (DIM as f32).sqrt();
+            let own = normalize(
+                self.centres[cluster % CLUSTERS]
+                    .iter()
+                    .zip(&noise)
+                    .map(|(c, z)| c + scale * z)
+                    .collect(),
+            );
+            let shared = 1.0 / (DIM as f32).sqrt();
+            let (a, b) = (0.9f32, (1.0f32 - 0.81).sqrt());
+            normalize(own.iter().map(|x| a * shared + b * x).collect())
+        }
+    }
+
+    /// `n` fixture vectors under seqs 1..=n (vector i in cluster i % 60).
     fn filled(n: usize) -> (BinaryIndex, Vec<Vec<f32>>) {
-        let e = fake();
-        let mut idx = BinaryIndex::new(384);
+        let mut f = Fixture::new(0x05ee_d0fa_11ce);
+        let mut idx = BinaryIndex::new(DIM);
         let mut vs = Vec::new();
         for i in 0..n {
-            let v = e.embed_query(&text(i)).unwrap();
+            let v = f.point(i);
             idx.upsert(i as i64 + 1, &v).unwrap();
             vs.push(v);
         }
         (idx, vs)
+    }
+
+    /// Share of each query's exact top 10 (by cosine) that `found` returns.
+    fn recall(vs: &[Vec<f32>], queries: &[Vec<f32>], found: impl Fn(&[f32]) -> Vec<i64>) -> f64 {
+        let mut hits = 0;
+        for q in queries {
+            let mut exact: Vec<(usize, f32)> = vs
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, cosine(q, v)))
+                .collect();
+            exact.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let got: std::collections::HashSet<i64> = found(q).into_iter().collect();
+            hits += exact[..10]
+                .iter()
+                .filter(|(i, _)| got.contains(&(*i as i64 + 1)))
+                .count();
+        }
+        hits as f64 / (queries.len() * 10) as f64
+    }
+
+    fn queries(n: usize) -> Vec<Vec<f32>> {
+        let mut f = Fixture::new(0x05ee_d0fa_11ce);
+        f.state ^= 0x9e37_79b9_7f4a_7c15; // same clusters, other noise
+        (0..n).map(|q| f.point(q * 7)).collect()
     }
 
     #[test]
@@ -384,50 +644,65 @@ mod tests {
         }
     }
 
-    /// The fake embedder's vectors are sparse (~43 of 384 coordinates set) and its exact top 10
-    /// beyond rank 3 is a near tie (rank 10 and rank 30 differ by ~0.015 cosine), which sign
-    /// bits cannot order: within 200 / 400 / 800 / 1,600 candidates they keep 0.73 / 0.86 /
-    /// 0.94 / 0.99 of it. This test therefore reads 1,600 candidates; the real model's gate is
-    /// `alice-embed/tests/binary_chunk_recall.rs` (0.985 within `MIN_RESCORE` = 400).
+    /// Without centring (bits against 0 instead of the mean) this fixture keeps 0.45 of the
+    /// exact top 10 within 200 candidates: the shared direction sets almost every bit.
     #[test]
     fn candidates_contain_the_exact_top_ten_for_most_queries() {
-        const CANDIDATES: usize = 1_600;
         let (idx, vs) = filled(6_000);
-        let e = fake();
-        let mut found = 0;
-        let queries = 50;
-        for q in 0..queries {
-            let qv = e
-                .embed_query(&format!("topic {} and detail {}", q % 37, q % 101))
-                .unwrap();
-            let mut exact: Vec<(usize, f32)> = vs
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (i, cosine(&qv, v)))
-                .collect();
-            exact.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let got: std::collections::HashSet<i64> = idx
-                .candidates(&qv, CANDIDATES)
+        let r = recall(&vs, &queries(50), |q| {
+            idx.candidates(q, 200).into_iter().map(|(s, _)| s).collect()
+        });
+        assert!(
+            r >= 0.95,
+            "recall of the exact top 10 within 200 candidates: {r:.3}"
+        );
+    }
+
+    /// The shortlist is re-ranked against the float query, so a list of a given length holds
+    /// more of the exact top 10 than the Hamming list of that length. Measured on this
+    /// fixture (whose clusters of 100 differ only by isotropic noise, the hard case): top 20 /
+    /// 30 / 50 / 80 hold 0.58 / 0.72 / 0.88 / 0.98 re-ranked against 0.47 / 0.62 / 0.82 / 0.96.
+    #[test]
+    fn the_float_query_reranks_the_hamming_shortlist() {
+        let (idx, vs) = filled(6_000);
+        let qs = queries(50);
+        let hamming = recall(&vs, &qs, |q| {
+            idx.candidates(q, 30).into_iter().map(|(s, _)| s).collect()
+        });
+        let reranked = recall(&vs, &qs, |q| {
+            idx.nearest(q, 1_000, 30)
                 .into_iter()
                 .map(|(s, _)| s)
-                .collect();
-            found += exact[..10]
-                .iter()
-                .filter(|(i, _)| got.contains(&(*i as i64 + 1)))
-                .count();
-        }
-        let recall = found as f64 / (queries * 10) as f64;
+                .collect()
+        });
         assert!(
-            recall >= 0.95,
-            "recall of the exact top 10 within {CANDIDATES} candidates: {recall:.3}"
+            reranked >= hamming + 0.05,
+            "top 30 by re-rank {reranked:.3}, by Hamming {hamming:.3}"
         );
+        let wide = recall(&vs, &qs, |q| {
+            idx.nearest(q, 1_000, 100)
+                .into_iter()
+                .map(|(s, _)| s)
+                .collect()
+        });
+        assert!(wide >= 0.95, "top 100 by re-rank {wide:.3}");
+        let best = idx.nearest(&vs[123], 1_000, 5);
+        assert_eq!(best[0].0, 124, "a stored vector ranks itself first");
+        assert!(best.windows(2).all(|w| w[0].1 >= w[1].1), "best first");
+        assert!(best[0].1 > 0.0 && best[0].1 <= 1.0);
+        assert!(idx.nearest(&vs[0], 1_000, 0).is_empty());
+        assert!(idx.nearest(&[0.0; 3], 1_000, 5).is_empty());
+        // While bootstrapping the ranking is exact cosine.
+        let (small, vs) = filled(500);
+        let exact = small.nearest(&vs[9], 1_000, 3);
+        assert_eq!(exact[0].0, 10);
+        assert!((exact[0].1 - 1.0).abs() < 1e-5);
     }
 
     #[test]
     fn upsert_replaces_inserts_out_of_order_and_remove_forgets() {
         let (mut idx, vs) = filled(BOOTSTRAP + 100);
-        let e = fake();
-        let other = e.embed_query("something completely different").unwrap();
+        let other = Fixture::new(42).point(3);
         idx.upsert(5, &other).unwrap();
         assert_eq!(idx.len(), BOOTSTRAP + 100, "replace, not add");
         assert_eq!(idx.candidates(&other, 1)[0].0, 5);
@@ -441,18 +716,59 @@ mod tests {
         assert!(idx.upsert(9, &[0.0; 10]).is_err(), "wrong dimension");
     }
 
+    /// A rebuild: the mean is given, vectors arrive in any order (with a seq repeated: the last
+    /// one wins) and are sorted once. The result equals a build from sorted input.
+    #[test]
+    fn a_bulk_build_sorts_once_and_matches_a_sorted_build() {
+        let (_, vs) = filled(BOOTSTRAP + 300);
+        let mean = mean_of(DIM, &vs[..1_000]).unwrap();
+        let mut order: Vec<usize> = (0..vs.len()).collect();
+        // A deterministic shuffle.
+        for i in (1..order.len()).rev() {
+            order.swap(i, (i * 7_919 + 13) % (i + 1));
+        }
+        let mut shuffled = BinaryIndex::bulk(DIM, mean.clone()).unwrap();
+        shuffled.push(17, &vs[0]).unwrap(); // replaced below by the real vector of seq 17
+        for &i in &order {
+            shuffled.push(i as i64 + 1, &vs[i]).unwrap();
+        }
+        assert!(shuffled.push(-3, &vs[0]).is_err(), "negative seq");
+        assert!(shuffled.push(3, &[0.0; 5]).is_err(), "wrong dimension");
+        let shuffled = shuffled.finish();
+        let mut sorted = BinaryIndex::bulk(DIM, mean.clone()).unwrap();
+        for (i, v) in vs.iter().enumerate() {
+            sorted.push(i as i64 + 1, v).unwrap();
+        }
+        let sorted = sorted.finish();
+        assert_eq!(shuffled.len(), vs.len());
+        assert!(!shuffled.is_bootstrapping());
+        assert_eq!(shuffled.mean(), Some(&mean[..]));
+        let bytes = |i: &BinaryIndex| {
+            let mut b = Vec::new();
+            i.write_to(&mut b).unwrap();
+            b
+        };
+        assert_eq!(bytes(&shuffled), bytes(&sorted));
+        assert_eq!(shuffled.candidates(&vs[16], 1)[0].0, 17);
+        assert!(
+            BinaryIndex::bulk(DIM, vec![0.0; 7]).is_err(),
+            "mean of another dimension"
+        );
+        assert!(mean_of(DIM, &[] as &[Vec<f32>]).is_none());
+    }
+
     #[test]
     fn save_and_load_round_trip_in_both_states_and_reject_damage() {
         for n in [100, BOOTSTRAP + 50] {
             let (idx, vs) = filled(n);
             let mut buf = Vec::new();
             idx.write_to(&mut buf).unwrap();
-            let back = BinaryIndex::read_from(&buf[..], 384).unwrap();
+            let back = BinaryIndex::read_from(&buf[..], DIM).unwrap();
             assert_eq!(back.len(), n);
             assert_eq!(back.is_bootstrapping(), idx.is_bootstrapping());
             assert_eq!(back.candidates(&vs[42], 3), idx.candidates(&vs[42], 3));
             assert!(
-                BinaryIndex::read_from(&buf[..buf.len() - 9], 384).is_err(),
+                BinaryIndex::read_from(&buf[..buf.len() - 9], DIM).is_err(),
                 "truncated"
             );
             assert!(
@@ -461,7 +777,7 @@ mod tests {
             );
             let mut bad = buf.clone();
             bad[0] = b'X';
-            assert!(BinaryIndex::read_from(&bad[..], 384).is_err(), "bad magic");
+            assert!(BinaryIndex::read_from(&bad[..], DIM).is_err(), "bad magic");
         }
     }
 
@@ -480,14 +796,14 @@ mod tests {
                 let mut bad = buf.clone();
                 bad[COUNT_AT..COUNT_AT + 8].copy_from_slice(&count.to_le_bytes());
                 assert!(
-                    BinaryIndex::read_from(&bad[..], 384).is_err(),
+                    BinaryIndex::read_from(&bad[..], DIM).is_err(),
                     "n {n}, count {count}"
                 );
             }
             let mut extra = buf.clone();
             extra.push(0);
             assert!(
-                BinaryIndex::read_from(&extra[..], 384).is_err(),
+                BinaryIndex::read_from(&extra[..], DIM).is_err(),
                 "trailing bytes"
             );
         }
@@ -495,34 +811,36 @@ mod tests {
         let (idx, _) = filled(BOOTSTRAP + 50);
         let mut buf = Vec::new();
         idx.write_to(&mut buf).unwrap();
-        let keys_at = COUNT_AT + 8 + 384 * 4;
+        let keys_at = COUNT_AT + 8 + DIM * 4;
         let mut bad = buf.clone();
         bad[keys_at..keys_at + 8].copy_from_slice(&buf[keys_at + 8..keys_at + 16]);
         bad[keys_at + 8..keys_at + 16].copy_from_slice(&buf[keys_at..keys_at + 8]);
         assert!(
-            BinaryIndex::read_from(&bad[..], 384).is_err(),
+            BinaryIndex::read_from(&bad[..], DIM).is_err(),
             "keys out of order"
         );
         // A bootstrapping file can never hold BOOTSTRAP vectors: the mean is fixed at that point.
         let mut boot = Vec::new();
         boot.extend_from_slice(b"ALICEBQ1");
-        boot.extend_from_slice(&384u32.to_le_bytes());
+        boot.extend_from_slice(&(DIM as u32).to_le_bytes());
         boot.extend_from_slice(&1u32.to_le_bytes());
         boot.extend_from_slice(&(BOOTSTRAP as u64).to_le_bytes());
-        assert!(BinaryIndex::read_from(&boot[..], 384).is_err());
+        assert!(BinaryIndex::read_from(&boot[..], DIM).is_err());
     }
 
     #[test]
     fn an_empty_index_saves_loads_and_finds_nothing() {
-        let idx = BinaryIndex::new(384);
+        let idx = BinaryIndex::new(DIM);
         assert!(idx.is_empty() && idx.is_bootstrapping());
-        assert_eq!(idx.dim(), 384);
+        assert_eq!(idx.dim(), DIM);
+        assert_eq!(idx.mean(), None);
         let mut buf = Vec::new();
         idx.write_to(&mut buf).unwrap();
-        let back = BinaryIndex::read_from(&buf[..], 384).unwrap();
+        let back = BinaryIndex::read_from(&buf[..], DIM).unwrap();
         assert!(back.is_empty());
-        let q = fake().embed_query("anything").unwrap();
+        let q = Fixture::new(7).point(0);
         assert!(back.candidates(&q, 5).is_empty());
+        assert!(back.nearest(&q, 100, 5).is_empty());
         let (full, vs) = filled(BOOTSTRAP + 1);
         assert!(full.candidates(&vs[0], 0).is_empty(), "n = 0");
         assert!(full.candidates(&[0.0; 3], 5).is_empty(), "wrong dimension");

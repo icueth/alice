@@ -1,25 +1,33 @@
-//! Recall of the sign-bit chunk index against exact cosine, with the real model, on text from
-//! this repository (Rust code, English and Thai docs). For each query (the first 60% of a
-//! passage) the ground truth is the exact cosine top 10 over every passage; recall@10 is the
-//! share of it that `search_chunks_with` returns. Prints recall per oversampling factor (with
-//! k = 10, `MIN_RESCORE` decides the candidate count up to a factor of 20, so the sweep goes
-//! on to 1,600 candidates), and the share of the exact top 10 in the list the raw tier uses
-//! (k = 100), and asserts recall@10 at `CHUNK_OVERSAMPLE`.
+//! Recall of the sign-bit chunk index against exact cosine, with the real model. Passages are
+//! lines of 40..400 characters from this repository (Rust code, English and Thai docs) and,
+//! with `ALICE_RECALL_EXTRA_DIR`, from the `.rs` and `.md` files under that directory. For each
+//! corpus size the queries are the first 60% of every (size / 300)th passage, the ground truth
+//! is the exact cosine top 10 over the corpus, and recall@10 is the share of it that
+//! `search_chunks(k = 10)` returns. Both states of a real index are measured: built by
+//! inserts (live: mean of the first 4,096 vectors) and rebuilt from the table (mean of a
+//! sample spread over all of them). Asserts recall@10 >= 0.97 at every size.
+//!
+//! Smoke run, 6,000 passages of this repository:
 //!
 //!   ALICE_MODELS_DIR=~/.alice/models cargo test -p alice-embed --release \
 //!     --test binary_chunk_recall -- --ignored --nocapture
 //!
-//! `ALICE_RECALL_PASSAGES=<n>` (default 6,000) and `ALICE_RECALL_EXTRA_DIR=<dir>` (more `.rs`
-//! and `.md` files, read after the repository's) measure how recall changes with the number
-//! of passages; the assertion is meant for the default.
+//! The gate at scale, 6,000 / 24,000 / 96,000 passages (`ALICE_RECALL_PASSAGES` raises the
+//! largest; it must be at least 96,000):
+//!
+//!   ALICE_RECALL_EXTRA_DIR=~/.cargo/registry/src ALICE_MODELS_DIR=~/.alice/models \
+//!     cargo test -p alice-embed --release --test binary_chunk_recall -- --ignored --nocapture
 #![cfg(feature = "local")]
 
 use alice_core::embed::{Embedder, cosine};
 use alice_core::store::embeddings::{self, VecKey};
-use alice_core::vector::{CHUNK_OVERSAMPLE, MIN_RESCORE, VectorIndex};
+use alice_core::vector::{MIN_RESCORE, VectorIndex, chunk_shortlist};
 use std::path::{Path, PathBuf};
 
 const K: usize = 10;
+const SMOKE: usize = 6_000;
+const AT_SCALE: usize = 96_000;
+const QUERIES: usize = 300;
 
 fn models_dir() -> PathBuf {
     std::env::var_os("ALICE_MODELS_DIR")
@@ -74,104 +82,120 @@ fn passages(root: &Path, extra: Option<&Path>, max: usize) -> Vec<String> {
     out
 }
 
+/// Share of each query's exact top 10 that `found` returns.
+fn recall(truth: &[Vec<i64>], queries: &[Vec<f32>], found: impl Fn(&[f32]) -> Vec<VecKey>) -> f64 {
+    let mut hits = 0usize;
+    for (q, want) in queries.iter().zip(truth) {
+        let got: std::collections::HashSet<VecKey> = found(q).into_iter().collect();
+        hits += want
+            .iter()
+            .filter(|s| got.contains(&VecKey::Chunk(**s)))
+            .count();
+    }
+    hits as f64 / (queries.len() * K) as f64
+}
+
 #[test]
 #[ignore = "needs the real model in ALICE_MODELS_DIR or ~/.alice/models"]
 fn sign_bit_chunk_index_keeps_the_exact_top_ten() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let max = std::env::var("ALICE_RECALL_PASSAGES")
-        .ok()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(6_000);
     let extra = std::env::var_os("ALICE_RECALL_EXTRA_DIR").map(PathBuf::from);
-    let texts = passages(&root, extra.as_deref(), max);
-    assert!(texts.len() >= 3_000, "only {} passages", texts.len());
+    let largest = match &extra {
+        None => SMOKE,
+        Some(_) => std::env::var("ALICE_RECALL_PASSAGES")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(AT_SCALE),
+    };
+    assert!(
+        extra.is_none() || largest >= AT_SCALE,
+        "the gate at scale needs at least {AT_SCALE} passages"
+    );
+    let texts = passages(&root, extra.as_deref(), largest);
+    let enough = if extra.is_some() { largest } else { 3_000 };
+    assert!(
+        texts.len() >= enough,
+        "only {} passages ({enough} needed)",
+        texts.len()
+    );
     let e = alice_embed::FastEmbedder::new(&models_dir()).unwrap();
     let model = e.model_id().to_string();
     let vectors: Vec<Vec<f32>> = texts
         .chunks(32)
         .flat_map(|b| e.embed_passages(b).unwrap())
         .collect();
-    let d = tempfile::tempdir().unwrap();
-    let c = alice_core::store::open_writer(&d.path().join("a.db")).unwrap();
-    let idx = VectorIndex::for_model(&model, e.dim()).unwrap();
-    for (i, v) in vectors.iter().enumerate() {
-        let key = VecKey::Chunk(i as i64 + 1);
-        embeddings::put(&c, key, &model, v).unwrap();
-        idx.upsert(key, v).unwrap();
-    }
-    let queries: Vec<(String, Vec<f32>)> = texts
-        .iter()
-        .step_by((texts.len() / 300).max(1))
-        .map(|t| {
-            let cut: String = t.chars().take(t.chars().count() * 6 / 10).collect();
-            let v = e.embed_query(&cut).unwrap();
-            (cut, v)
-        })
-        .collect();
-    // The exact top 10 of every query, once.
-    let truth: Vec<Vec<i64>> = queries
-        .iter()
-        .map(|(_, q)| {
-            let mut exact: Vec<(i64, f32)> = vectors
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (i as i64 + 1, cosine(q, v)))
-                .collect();
-            exact.sort_by(|a, b| b.1.total_cmp(&a.1));
-            exact[..K].iter().map(|(s, _)| *s).collect()
-        })
-        .collect();
+    let sizes: Vec<usize> = match extra {
+        None => vec![texts.len()],
+        Some(_) => vec![SMOKE, 24_000, texts.len()],
+    };
     let mut report = String::new();
-    let mut at_default = 0.0;
-    for oversample in [1usize, 2, 4, 8, 16, 40, 80, 160] {
-        let mut found = 0usize;
-        for ((_, q), want) in queries.iter().zip(&truth) {
-            let got: std::collections::HashSet<VecKey> = idx
-                .search_chunks_with(&c, q, K, oversample)
-                .unwrap()
-                .into_iter()
-                .map(|(k, _)| k)
-                .collect();
-            found += want
-                .iter()
-                .filter(|s| got.contains(&VecKey::Chunk(**s)))
-                .count();
+    let mut failures = Vec::new();
+    for n in sizes {
+        let corpus = &vectors[..n];
+        let d = tempfile::tempdir().unwrap();
+        let c = alice_core::store::open_writer(&d.path().join("a.db")).unwrap();
+        let live = VectorIndex::for_model(&model, e.dim()).unwrap();
+        for (i, v) in corpus.iter().enumerate() {
+            let key = VecKey::Chunk(i as i64 + 1);
+            embeddings::put(&c, key, &model, v).unwrap();
+            live.upsert(key, v).unwrap();
         }
-        let recall = found as f64 / (queries.len() * K) as f64;
-        let candidates = (K * oversample).max(MIN_RESCORE);
-        report.push_str(&format!(
-            "oversample {oversample:>3} ({candidates:>4} candidates): recall@10 {recall:.4}\n"
-        ));
-        if oversample == CHUNK_OVERSAMPLE {
-            at_default = recall;
-        }
-    }
-    // What recall uses: the raw tier asks `search_chunks` for its 100 best (400 candidates).
-    let mut found = 0usize;
-    for ((_, q), want) in queries.iter().zip(&truth) {
-        let got: std::collections::HashSet<VecKey> = idx
-            .search_chunks(&c, q, 100)
-            .unwrap()
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
-        found += want
+        let rebuilt = VectorIndex::rebuild_from(&c, &model, e.dim()).unwrap();
+        let queries: Vec<Vec<f32>> = texts[..n]
             .iter()
-            .filter(|s| got.contains(&VecKey::Chunk(**s)))
-            .count();
+            .step_by((n / QUERIES).max(1))
+            .map(|t| {
+                let cut: String = t.chars().take(t.chars().count() * 6 / 10).collect();
+                e.embed_query(&cut).unwrap()
+            })
+            .collect();
+        let truth: Vec<Vec<i64>> = queries
+            .iter()
+            .map(|q| {
+                let mut exact: Vec<(i64, f32)> = corpus
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i as i64 + 1, cosine(q, v)))
+                    .collect();
+                exact.sort_by(|a, b| b.1.total_cmp(&a.1));
+                exact[..K].iter().map(|(s, _)| *s).collect()
+            })
+            .collect();
+        let keys = |hits: Vec<(VecKey, f32)>| hits.into_iter().map(|(k, _)| k).collect();
+        report.push_str(&format!(
+            "{n} passages, {} queries, shortlist {}, {MIN_RESCORE} rows read\n",
+            queries.len(),
+            chunk_shortlist(n)
+        ));
+        for (state, idx) in [("live", &live), ("rebuilt", &rebuilt)] {
+            let at_default = recall(&truth, &queries, |q| {
+                keys(idx.search_chunks(&c, q, K).unwrap())
+            });
+            let mut line = format!("  {state:>7}: recall@10 {at_default:.4}");
+            for rows in [100usize, 200, 400, 800] {
+                let r = recall(&truth, &queries, |q| {
+                    keys(idx.search_chunks_with(&c, q, K, None, rows).unwrap())
+                });
+                line.push_str(&format!(" · {rows} rows {r:.4}"));
+            }
+            let hamming_only = recall(&truth, &queries, |q| {
+                keys(
+                    idx.search_chunks_with(&c, q, K, Some(MIN_RESCORE), MIN_RESCORE)
+                        .unwrap(),
+                )
+            });
+            line.push_str(&format!(" · no re-rank {hamming_only:.4}"));
+            // What recall uses: the raw tier asks `search_chunks` for its 100 best.
+            let raw_tier = recall(&truth, &queries, |q| {
+                keys(idx.search_chunks(&c, q, 100).unwrap())
+            });
+            line.push_str(&format!(" · raw tier list (k = 100) {raw_tier:.4}\n"));
+            report.push_str(&line);
+            if at_default < 0.97 {
+                failures.push(format!("{n} passages, {state}: {at_default:.4}"));
+            }
+        }
     }
-    report.push_str(&format!(
-        "raw tier list (k = 100, {} candidates): exact top 10 found {:.4}\n",
-        (100 * CHUNK_OVERSAMPLE).max(MIN_RESCORE),
-        found as f64 / (queries.len() * K) as f64
-    ));
-    println!(
-        "{} passages, {} queries\n{report}",
-        texts.len(),
-        queries.len()
-    );
-    assert!(
-        at_default >= 0.97,
-        "recall@10 {at_default:.4} at CHUNK_OVERSAMPLE {CHUNK_OVERSAMPLE}"
-    );
+    println!("{report}");
+    assert!(failures.is_empty(), "recall@10 below 0.97: {failures:?}");
 }

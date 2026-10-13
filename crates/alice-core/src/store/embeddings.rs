@@ -198,6 +198,60 @@ pub fn get_many(
     Ok(out)
 }
 
+/// How many chunk vectors of `model` are stored, counting no further than `limit`.
+pub fn count_chunks_up_to(conn: &Connection, model: &str, limit: usize) -> Result<usize> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM embeddings
+           WHERE owner_type = 'chunk' AND model = ?1 LIMIT ?2)",
+        params![model, limit as i64],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
+}
+
+/// Up to `n` stored chunk vectors of `model`, spread evenly over the chunk seqs from the
+/// oldest to the newest: one index seek each, so a mean can be fitted on the whole corpus
+/// without reading all of it.
+pub fn sample_chunks(conn: &Connection, model: &str, n: usize) -> Result<Vec<Vec<f32>>> {
+    let end = |order: &str| -> Result<Option<i64>> {
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT owner_seq FROM embeddings WHERE owner_type = 'chunk' AND model = ?1
+                     ORDER BY owner_seq {order} LIMIT 1"
+                ),
+                [model],
+                |r| r.get(0),
+            )
+            .optional()?)
+    };
+    let (Some(first), Some(last)) = (end("ASC")?, end("DESC")?) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT owner_seq, vector FROM embeddings
+         WHERE owner_type = 'chunk' AND owner_seq >= ?1 AND model = ?2
+         ORDER BY owner_seq LIMIT 1",
+    )?;
+    let span = i128::from(last - first);
+    let mut out = Vec::with_capacity(n);
+    let mut next = first;
+    for j in 0..n {
+        let target = (i128::from(first) + span * j as i128 / n as i128) as i64;
+        let Some((seq, blob)) = stmt
+            .query_row(params![target.max(next), model], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .optional()?
+        else {
+            break;
+        };
+        out.push(decode_f16(&blob));
+        next = seq + 1;
+    }
+    Ok(out)
+}
+
 pub fn backlog(conn: &Connection) -> Result<usize> {
     let n: i64 = conn.query_row(BACKLOG_SQL, [], |r| r.get(0))?;
     Ok(n as usize)
@@ -515,6 +569,43 @@ mod tests {
                 (VecKey::Chunk(7), vec![0.0, 0.5, 0.25])
             ]
         );
+    }
+
+    /// A rebuild fits the chunk index's mean on a sample spread over every chunk, not the
+    /// first rows, and asks only whether there are enough chunks for one.
+    #[test]
+    fn chunk_samples_spread_over_all_seqs_and_counts_stop_at_their_limit() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        for s in 1..=1_000i64 {
+            put(&c, VecKey::Chunk(s), "m", &[s as f32, 0.0]).unwrap();
+        }
+        put(&c, VecKey::Chunk(5_000), "other", &[1.0, 1.0]).unwrap();
+        put(&c, VecKey::Memory(3), "m", &[1.0, 1.0]).unwrap();
+        assert_eq!(count_chunks_up_to(&c, "m", 10).unwrap(), 10);
+        assert_eq!(count_chunks_up_to(&c, "m", 5_000).unwrap(), 1_000);
+        assert_eq!(count_chunks_up_to(&c, "none", 10).unwrap(), 0);
+        let seqs: Vec<f32> = sample_chunks(&c, "m", 10)
+            .unwrap()
+            .iter()
+            .map(|v| v[0])
+            .collect();
+        assert_eq!(seqs.len(), 10);
+        assert_eq!(seqs[0], 1.0);
+        assert!(
+            seqs[9] >= 900.0,
+            "the sample reaches the newest chunks: {seqs:?}"
+        );
+        assert!(
+            seqs.windows(2).all(|w| w[1] - w[0] >= 90.0),
+            "evenly spread: {seqs:?}"
+        );
+        assert_eq!(
+            sample_chunks(&c, "m", 5_000).unwrap().len(),
+            1_000,
+            "asking for more than there are takes each once"
+        );
+        assert!(sample_chunks(&c, "none", 10).unwrap().is_empty());
     }
 
     #[test]

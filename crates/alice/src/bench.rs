@@ -140,6 +140,9 @@ struct Corpus {
     rng: Rng,
     tail: Vec<String>,
     raw_only: Vec<String>,
+    /// Tells this run's writes apart from an earlier run's on reused data: the same text
+    /// would be a duplicate, which is acknowledged without being stored or embedded again.
+    run: u128,
 }
 
 impl Corpus {
@@ -148,6 +151,9 @@ impl Corpus {
             rng: Rng(0x9e37_79b9_7f4a_7c15),
             tail: (0..TAIL_WORDS).map(|i| made_up("", i)).collect(),
             raw_only: (0..RAW_WORDS).map(|i| made_up("zx", i)).collect(),
+            run: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
         }
     }
 
@@ -169,6 +175,14 @@ impl Corpus {
     /// The text of a memory: one sentence.
     fn memory_text(&mut self) -> String {
         self.sentence()
+    }
+
+    /// A memory of twelve sentences: past the model's 512-token window.
+    fn long_memory_text(&mut self) -> String {
+        (0..12)
+            .map(|_| self.sentence())
+            .collect::<Vec<_>>()
+            .join(". ")
     }
 
     /// A sentence with one raw-only word in it; one chunk in 50 also holds a rare Thai word,
@@ -285,8 +299,10 @@ struct DaemonRun {
     rss_after_start_mb: Option<f64>,
     footprint_after_start_mb: Option<f64>,
     /// Memories written through the daemon after it started (real model only), and how long
-    /// until the daemon had embedded all of them.
+    /// until the daemon had embedded all of them; `remembered_long` of them fill the model's
+    /// 512-token window.
     remembered: usize,
+    remembered_long: usize,
     embed_new_ms: f64,
     rss_after_embedding_mb: Option<f64>,
     footprint_after_embedding_mb: Option<f64>,
@@ -722,9 +738,10 @@ async fn latency(svc: &Arc<Service>, samples: usize, corpus: &mut Corpus) -> Res
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut rt, mut ri, mut rd, mut rfl) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut fallback_fired = 0;
+    let run = corpus.run;
     for i in 0..samples {
         let (res, d) = timed(svc.remember(RememberRequest {
-            content: format!("bench write {i} {}", corpus.sentence()),
+            content: format!("bench write {i} of run {run} {}", corpus.sentence()),
             ..Default::default()
         }))
         .await;
@@ -987,11 +1004,24 @@ fn daemon_run(
         run.footprint_after_start_mb = footprint_mb(pid).map(|f| f.0);
         if real {
             // The model's working memory only grows when it embeds: write new memories
-            // through the daemon and wait until its worker has embedded every one.
+            // through the daemon and wait until its worker has embedded every one. A few are
+            // long enough to fill the model's 512-token window, as transcript-sized text does,
+            // so ONNX Runtime's arena grows as it would in use.
             const NEW: usize = 256;
+            const LONG: usize = 8;
             let t = Instant::now();
             let mut set = tokio::task::JoinSet::new();
-            let texts: Vec<String> = (0..NEW).map(|_| corpus.memory_text()).collect();
+            // Each new to this data (the run number): a duplicate would not be embedded.
+            let texts: Vec<String> = (0..NEW)
+                .map(|i| {
+                    let text = if i % (NEW / LONG) == 0 {
+                        corpus.long_memory_text()
+                    } else {
+                        corpus.memory_text()
+                    };
+                    format!("daemon write {i} of run {}: {text}", corpus.run)
+                })
+                .collect();
             for chunk in texts.chunks(NEW / 8) {
                 let (c, chunk) = (client.clone(), chunk.to_vec());
                 set.spawn(async move {
@@ -1008,10 +1038,23 @@ fn daemon_run(
             while let Some(r) = set.join_next().await {
                 r??;
             }
-            while client.health().await?.embed_backlog > 0 {
+            let deadline = Instant::now() + DAEMON_WAIT;
+            loop {
+                let backlog = client.health().await?.embed_backlog;
+                if backlog == 0 {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    bail!(
+                        "the bench daemon still had {backlog} items to embed after {} s; see {}",
+                        DAEMON_WAIT.as_secs(),
+                        home.logs_dir().join("daemon.log").display()
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             run.remembered = NEW;
+            run.remembered_long = LONG;
             run.embed_new_ms = ms(t.elapsed());
             run.rss_after_embedding_mb = rss_mb(pid);
             run.footprint_after_embedding_mb = footprint_mb(pid).map(|f| f.0);
@@ -1151,8 +1194,9 @@ fn render(r: &Report) -> String {
         ));
         if d.remembered > 0 {
             out.push_str(&format!(
-                "daemon embedding {} new memories in {:.0} ms · after it RSS {} · footprint {}\n",
+                "daemon embedding {} new memories ({} of 512 tokens) in {:.0} ms · after it RSS {} · footprint {}\n",
                 d.remembered,
+                d.remembered_long,
                 d.embed_new_ms,
                 opt_mb(d.rss_after_embedding_mb),
                 opt_mb(d.footprint_after_embedding_mb),
