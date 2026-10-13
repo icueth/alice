@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod codetokens;
+pub mod context;
 pub mod embed;
 pub mod error;
 pub mod ids;
