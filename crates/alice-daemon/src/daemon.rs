@@ -4,15 +4,19 @@ use crate::discovery::{DaemonInfo, load_or_create_token, read_info, remove_info_
 use crate::paths::AliceHome;
 use crate::service::{Service, ServiceOptions};
 use crate::spool;
+use crate::startup;
 use alice_core::embed::{Embedder, FakeEmbedder};
+use alice_core::error::AliceError;
 use alice_core::ids::now_rfc3339;
 use anyhow::Context;
+use rusqlite::ErrorCode;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::future::IntoFuture;
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -23,6 +27,8 @@ const LOCK_WAIT: Duration = Duration::from_secs(5);
 const GRACE: Duration = Duration::from_secs(2);
 /// How often spooled writes are retried.
 const DRAIN_EVERY: Duration = Duration::from_secs(5);
+/// Download progress is written to daemon.starting at most this often.
+const ANNOUNCE_EVERY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Default)]
 pub struct DaemonOptions {
@@ -74,22 +80,107 @@ pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
     // Whatever daemon.json exists now is stale (its writer no longer holds the lock): drop it
     // before the slow part of starting, so no client pings a port that may be someone else's.
     let _ = std::fs::remove_file(home.daemon_json());
+    // A new attempt: the last failed start's reason no longer applies.
+    startup::clear_error(&home);
     // Always printed (not subject to ALICE_LOG): process tests count this line to prove a single instance.
     eprintln!(
         "alice daemon started pid={} home={}",
         std::process::id(),
         home.root().display()
     );
+    let published = AtomicBool::new(false);
+    let result = start_and_serve(&home, &opts, &published);
+    startup::clear_progress(&home);
+    if let Err(e) = &result
+        && !published.load(Ordering::SeqCst)
+    {
+        // Clients cannot read the log reliably: leave the reason where they look, before the
+        // lock is released (a client that finds the lock free then finds the reason too).
+        let reason = format!("{e:#}");
+        tracing::error!(error = %reason, "the daemon could not start");
+        if let Err(w) = startup::write_error(&home, &reason) {
+            tracing::warn!(error = %w, "cannot write daemon.error");
+        }
+    }
+    drop(lock);
+    result
+}
 
-    let token = load_or_create_token(&home)?;
+/// The start-up error for a service that cannot open the database or load the model, worded
+/// with the cause and what to do (the message clients show).
+fn start_error(home: &AliceHome, e: AliceError) -> anyhow::Error {
+    let db = home.db();
+    match &e {
+        AliceError::Db(err)
+            if matches!(
+                err.sqlite_error_code(),
+                Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt)
+            ) =>
+        {
+            anyhow::anyhow!(
+                "{} is not a usable database ({err}); restore it from a backup or move it aside (a new, empty one is then created), then retry",
+                db.display()
+            )
+        }
+        AliceError::Db(err) => anyhow::anyhow!(
+            "cannot open the database {}: {err}; check the file and its permissions, then retry",
+            db.display()
+        ),
+        // A schema from a newer build: the reason says to upgrade.
+        AliceError::ReadOnly(reason) => {
+            anyhow::anyhow!("cannot open the database {}: {reason}", db.display())
+        }
+        _ => anyhow::Error::new(e),
+    }
+}
+
+/// Download the model with progress announced in daemon.starting (at most once a second) and
+/// logged every 10%.
+fn fetch_model(home: &AliceHome, runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    const STEP: &str = "downloading the embedding model";
+    tracing::info!("{STEP} (first run, ~136 MB)");
+    let _ = startup::write_progress(home, &startup::StartProgress::step(STEP));
+    // (when last announced, file, percent)
+    let last: parking_lot::Mutex<(Option<Instant>, String, u64)> = Default::default();
+    let announce = |file: &str, done: u64, total: u64| {
+        let pct = done.saturating_mul(100) / total.max(1);
+        let mut l = last.lock();
+        let same_file = l.1 == file;
+        if same_file && pct / 10 == l.2 / 10 && l.0.is_some_and(|t| t.elapsed() < ANNOUNCE_EVERY) {
+            return;
+        }
+        if !same_file || pct / 10 != l.2 / 10 {
+            tracing::info!(file, pct, "{STEP}");
+        }
+        *l = (Some(Instant::now()), file.to_string(), pct);
+        let mut p = startup::StartProgress::step(STEP);
+        (p.file, p.done, p.total) = (Some(file.to_string()), Some(done), Some(total));
+        let _ = startup::write_progress(home, &p);
+    };
+    runtime
+        .block_on(alice_embed::fetch_model(&home.models_dir(), &announce))
+        .map_err(|e| anyhow::anyhow!("the embedding model could not be downloaded: {e}"))
+}
+
+/// Everything after the lock: the model, the service, then serving until stopped. Sets
+/// `published` once daemon.json is written (from then on a failure is not a start-up error).
+fn start_and_serve(
+    home: &AliceHome,
+    opts: &DaemonOptions,
+    published: &AtomicBool,
+) -> anyhow::Result<()> {
+    let token = load_or_create_token(home)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let models = home.models_dir();
     if !opts.fake_embedder && !alice_embed::is_model_present(&models) {
-        tracing::info!("downloading the embedding model (first run, ~136 MB)");
-        runtime.block_on(alice_embed::fetch_model(&models, &|_, _, _| {}))?;
+        fetch_model(home, &runtime)?;
     }
+    let _ = startup::write_progress(
+        home,
+        &startup::StartProgress::step("opening the database and loading the embedding model"),
+    );
     let fake = opts.fake_embedder;
     let make = move || -> alice_core::Result<Arc<dyn Embedder>> {
         if fake {
@@ -98,10 +189,11 @@ pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
             Ok(Arc::new(alice_embed::FastEmbedder::new(&models)?))
         }
     };
-    let svc = Service::start(home.clone(), &make, ServiceOptions::default())?;
+    let svc = Service::start(home.clone(), &make, ServiceOptions::default())
+        .map_err(|e| start_error(home, e))?;
 
     let ct = CancellationToken::new();
-    let served = runtime.block_on(serve(&home, &svc, token, opts.port, ct.clone()));
+    let served = runtime.block_on(serve(home, &svc, token, opts.port, ct.clone(), published));
     ct.cancel();
     // Drop whatever still runs (a request past the grace period, a drain in progress) so that
     // nothing reaches the writer after it stops; such a client sees a closed connection and
@@ -109,8 +201,7 @@ pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
     runtime.shutdown_timeout(GRACE);
     svc.shutdown();
     // Still holding the lock, so no newer daemon can have published in the meantime.
-    remove_info_if(&home, svc.instance());
-    drop(lock);
+    remove_info_if(home, svc.instance());
     tracing::info!("daemon stopped");
     served
 }
@@ -121,6 +212,7 @@ async fn serve(
     token: String,
     port: u16,
     ct: CancellationToken,
+    published: &AtomicBool,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
         .await
@@ -138,6 +230,9 @@ async fn serve(
             started_at: now_rfc3339(),
         },
     )?;
+    published.store(true, Ordering::SeqCst);
+    startup::clear_error(home);
+    startup::clear_progress(home);
     tokio::spawn(drain_spool(home.spool_dir(), svc.clone(), ct.clone()));
     tokio::spawn(stop_on_signal(ct.clone()));
     let app = crate::http::router(svc.clone(), token, port, ct.clone());

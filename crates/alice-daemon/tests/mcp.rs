@@ -401,7 +401,13 @@ async fn remote_backend_spools_when_no_daemon() {
         ))
         .await
         .unwrap();
-    assert!(first_text(&r).starts_with("Queued"), "{}", first_text(&r));
+    let queued = first_text(&r);
+    assert!(queued.starts_with("Queued"), "{queued}");
+    // Deferred item #93: it says why it was queued, and "starting" only when it is.
+    assert!(
+        queued.contains("not running") && !queued.contains("starting"),
+        "{queued}"
+    );
     assert_eq!(alice_daemon::spool::pending_count(&home.spool_dir()), 1);
     // Reads cannot be queued: they say what to do.
     let r = client

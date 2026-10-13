@@ -10,6 +10,7 @@ use crate::discovery::{read_info, read_token, verify_ping_proof};
 use crate::http::PingResponse;
 use crate::paths::AliceHome;
 use crate::spool::{self, SpoolEntry};
+use crate::startup;
 use alice_core::api::*;
 use alice_core::error::{AliceError, Result};
 use alice_core::store::kg::FactOutcome;
@@ -62,6 +63,65 @@ impl std::fmt::Debug for DaemonClient {
 
 fn unavailable(what: impl std::fmt::Display) -> AliceError {
     AliceError::Other(format!("{UNAVAILABLE}{what}"))
+}
+
+/// Why there is no daemon to call. Its text (an `AliceError::Other` starting with "memory
+/// daemon ", so writes are spooled on it) is what a read reports; `queued_note` is what a
+/// write queued for it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unavailable {
+    /// None runs and this client may not start one (`Launcher::None`).
+    NotRunning,
+    /// One was started (or is starting) and did not serve within the wait; what it is doing,
+    /// if it said (`startup::StartProgress::describe`).
+    Starting(Option<String>),
+    /// The last start failed; the daemon's own explanation (from daemon.error).
+    StartFailed(String),
+    /// The daemon program could not be run, or no HTTP client could be made.
+    CannotStart(String),
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(UNAVAILABLE)?;
+        match self {
+            Unavailable::NotRunning => {
+                f.write_str("is not running; start it with \"alice daemon start\"")
+            }
+            Unavailable::Starting(None) => f.write_str("is starting; retry in a few seconds"),
+            Unavailable::Starting(Some(doing)) => write!(
+                f,
+                "is starting ({doing}); retry when it is done, or run \"alice daemon start\" to wait for it"
+            ),
+            Unavailable::StartFailed(reason) => write!(f, "could not start: {reason}"),
+            Unavailable::CannotStart(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<Unavailable> for AliceError {
+    fn from(u: Unavailable) -> Self {
+        AliceError::Other(u.to_string())
+    }
+}
+
+impl Unavailable {
+    /// What a write queued because of this says: why, and when it is saved.
+    pub fn queued_note(&self) -> String {
+        match self {
+            Unavailable::NotRunning => "the memory daemon is not running; the memory is saved once it runs (\"alice daemon start\")".into(),
+            Unavailable::Starting(None) => {
+                "the memory daemon is starting; the memory is saved within seconds".into()
+            }
+            Unavailable::Starting(Some(doing)) => format!(
+                "the memory daemon is starting ({doing}); the memory is saved as soon as it is ready"
+            ),
+            Unavailable::StartFailed(reason) => format!(
+                "the memory daemon could not start: {reason}. The memory is saved once it starts"
+            ),
+            Unavailable::CannotStart(_) => format!("{self}. The memory is saved once a daemon runs"),
+        }
+    }
 }
 
 fn transport(e: reqwest::Error) -> AliceError {
@@ -240,24 +300,34 @@ impl DaemonClient {
         launcher: &Launcher,
         wait: Duration,
     ) -> Result<DaemonClient> {
-        let http = http_client()?;
+        Ok(Self::try_connect(home, launcher, wait).await?)
+    }
+
+    /// `connect`, with why there is no daemon. A daemon this client started that fails says
+    /// why in daemon.error, and that is reported at once; when the wait runs out, the reason a
+    /// start failed, or what a daemon still starting is doing (downloading the model, say).
+    pub async fn try_connect(
+        home: &AliceHome,
+        launcher: &Launcher,
+        wait: Duration,
+    ) -> std::result::Result<DaemonClient, Unavailable> {
+        let http = http_client().map_err(|e| Unavailable::CannotStart(e.to_string()))?;
         if let Some(c) = Self::verified(home, &http).await {
             return Ok(c);
         }
         let Launcher::Exe(exe) = launcher else {
-            return Err(unavailable(
-                "is not running; start it with \"alice daemon start\"",
-            ));
+            return Err(Unavailable::NotRunning);
         };
+        let since = startup::unix_ms();
         // The daemon reads its home from ALICE_HOME: make it serve the one we wait on.
-        spawn_detached_with_env(
+        let child = spawn_detached_with_env(
             exe,
             &["daemon", "run"],
             &home.logs_dir().join("daemon.log"),
             &[("ALICE_HOME", daemon_home(home).as_os_str())],
         )
         .map_err(|e| {
-            unavailable(format!(
+            Unavailable::CannotStart(format!(
                 "could not be started with {}: {e}. Run \"alice daemon run\" in a terminal to see why",
                 exe.display()
             ))
@@ -268,8 +338,22 @@ impl DaemonClient {
             if let Some(c) = Self::verified(home, &http).await {
                 return Ok(c);
             }
+            // A failure since this call started (by the daemon it started, or by one another
+            // client started meanwhile) is the answer; an older one may be about to be cleared
+            // by a daemon that is starting.
+            let failed = startup::read_error(home);
+            if let Some(e) = &failed
+                && (e.pid == child || e.unix_ms >= since)
+            {
+                return Err(Unavailable::StartFailed(e.error.clone()));
+            }
             if Instant::now() >= deadline {
-                return Err(unavailable("is starting; retry in a few seconds"));
+                return Err(match failed {
+                    Some(e) => Unavailable::StartFailed(e.error),
+                    None => {
+                        Unavailable::Starting(startup::read_progress(home).map(|p| p.describe()))
+                    }
+                });
             }
         }
     }
@@ -396,7 +480,7 @@ fn check_remember(req: &RememberRequest) -> Result<()> {
 }
 
 /// Queue a write for the daemon to apply when it is back; if even that fails, say both.
-async fn spool_entry(home: &AliceHome, entry: SpoolEntry, cause: &AliceError) -> Result<()> {
+async fn spool_entry(home: &AliceHome, entry: SpoolEntry, cause: &str) -> Result<()> {
     let dir = home.spool_dir();
     let queued = tokio::task::spawn_blocking(move || spool::append(&dir, &entry))
         .await
@@ -410,18 +494,35 @@ async fn spool_entry(home: &AliceHome, entry: SpoolEntry, cause: &AliceError) ->
     }
 }
 
-/// `remember` through `client` (or the reason there is none), spooled when the daemon is unavailable.
+/// Why a write went to the spool: the error (for when even the spool fails) and the note its
+/// reply carries. `None` when `e` is not a reason to spool.
+fn spool_cause(e: &AliceError) -> Option<(String, String)> {
+    match e {
+        AliceError::ReadOnly(reason) => Some((e.to_string(), spool::read_only_note(reason))),
+        e if is_unavailable(e) => Some((
+            e.to_string(),
+            "the memory daemon stopped answering; the memory is saved when it is back".into(),
+        )),
+        _ => None,
+    }
+}
+
+/// `remember` through `client` (or the reason there is none), spooled when the daemon is
+/// unavailable; a spooled reply says why.
 pub(crate) async fn remember_via(
     home: &AliceHome,
-    client: Result<DaemonClient>,
+    client: std::result::Result<DaemonClient, Unavailable>,
     req: RememberRequest,
 ) -> Result<RememberResponse> {
-    let cause = match client {
+    let (cause, note) = match client {
         Ok(c) => match c.remember(&req).await {
-            Err(e) if is_unavailable(&e) => e,
-            other => return other,
+            Err(e) => match spool_cause(&e) {
+                Some(cause) => cause,
+                None => return Err(e),
+            },
+            ok => return ok,
         },
-        Err(e) => e,
+        Err(u) => (u.to_string(), u.queued_note()),
     };
     check_remember(&req)?;
     spool_entry(home, SpoolEntry::Remember(req), &cause).await?;
@@ -429,7 +530,7 @@ pub(crate) async fn remember_via(
         id: None,
         status: RememberStatus::Spooled,
         project: String::new(),
-        reason: None,
+        reason: Some(note),
     })
 }
 
@@ -439,7 +540,7 @@ pub async fn remember_or_spool(
     launcher: &Launcher,
     req: RememberRequest,
 ) -> Result<RememberResponse> {
-    let client = DaemonClient::connect(home, launcher, WRITE_WAIT).await;
+    let client = DaemonClient::try_connect(home, launcher, WRITE_WAIT).await;
     remember_via(home, client, req).await
 }
 
@@ -450,12 +551,15 @@ pub async fn ingest_or_spool(
     req: IngestRequest,
 ) -> Result<IngestOutcome> {
     alice_core::store::sources::validate_chunks(&req.chunks)?;
-    let cause = match DaemonClient::connect(home, launcher, WRITE_WAIT).await {
+    let cause = match DaemonClient::try_connect(home, launcher, WRITE_WAIT).await {
         Ok(c) => match c.ingest(&req).await {
-            Err(e) if is_unavailable(&e) => e,
-            other => return other,
+            Err(e) => match spool_cause(&e) {
+                Some((cause, _)) => cause,
+                None => return Err(e),
+            },
+            ok => return ok,
         },
-        Err(e) => e,
+        Err(u) => u.to_string(),
     };
     spool_entry(home, SpoolEntry::Ingest(req), &cause).await?;
     Ok(IngestOutcome {
@@ -1018,6 +1122,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status, RememberStatus::Spooled);
+    }
+
+    /// A stand-in for `alice daemon run` that runs `body` (a shell snippet; `$$` is its pid).
+    #[cfg(unix)]
+    fn script_exe(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("scripted-alice");
+        std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        exe
+    }
+
+    /// Review finding I-1: the daemon this client started fails and leaves its reason in
+    /// daemon.error; `connect` reports that reason at once instead of waiting out the wait and
+    /// saying "starting". A write is still queued, and its reply says why.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_reports_why_the_started_daemon_failed() {
+        crate::install_tls();
+        let (_d, home) = home();
+        let tools = tempfile::tempdir().unwrap();
+        let reason = "alice.db is not a usable database; move it aside";
+        let exe = script_exe(
+            tools.path(),
+            &format!(
+                "printf '{{\"pid\": %s, \"at\": \"t\", \"unix_ms\": 1, \"error\": \"{reason}\"}}' $$ > '{}'",
+                home.root().join("daemon.error").display()
+            ),
+        );
+        let t = Instant::now();
+        let e = DaemonClient::connect(&home, &Launcher::Exe(exe.clone()), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "waited {:?}",
+            t.elapsed()
+        );
+        assert_eq!(
+            e.to_string(),
+            format!("memory daemon could not start: {reason}")
+        );
+        let r = remember_or_spool(&home, &Launcher::Exe(exe), remember_req("not lost"))
+            .await
+            .unwrap();
+        assert_eq!(r.status, RememberStatus::Spooled);
+        let why = r.reason.unwrap();
+        assert!(why.contains(reason) && !why.contains("starting"), "{why}");
+        assert_eq!(spool::pending_count(&home.spool_dir()), 1);
+    }
+
+    /// Review finding I-1: when the wait runs out while the daemon downloads the model, the
+    /// error (and a queued write's reason) says so.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_says_when_the_daemon_is_still_downloading_the_model() {
+        crate::install_tls();
+        let (_d, home) = home();
+        let tools = tempfile::tempdir().unwrap();
+        let exe = script_exe(
+            tools.path(),
+            &format!(
+                "printf '{{\"pid\": %s, \"unix_ms\": 1, \"step\": \"downloading the embedding model\", \"file\": \"model_quantized.onnx\", \"done\": 29577047, \"total\": 118308185}}' $$ > '{}'\nexec sleep 10",
+                home.root().join("daemon.starting").display()
+            ),
+        );
+        let announced = || {
+            let raw = std::fs::read_to_string(home.root().join("daemon.starting")).unwrap();
+            serde_json::from_str::<serde_json::Value>(&raw).unwrap()["pid"]
+                .as_i64()
+                .unwrap() as libc::pid_t
+        };
+        // The first run of a new executable can take a second on macOS (a one-off OS check).
+        let e = DaemonClient::connect(&home, &Launcher::Exe(exe.clone()), Duration::from_secs(3))
+            .await
+            .unwrap_err()
+            .to_string();
+        let first = announced();
+        assert!(
+            e.starts_with("memory daemon is starting")
+                && e.contains("downloading the embedding model")
+                && e.contains("25%"),
+            "{e}"
+        );
+        let r = remember_or_spool(&home, &Launcher::Exe(exe), remember_req("not lost"))
+            .await
+            .unwrap();
+        let why = r.reason.unwrap();
+        assert!(why.contains("downloading the embedding model"), "{why}");
+        for pid in [first, announced()] {
+            // SAFETY: ending the stand-ins this test started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
     }
 
     #[cfg(unix)]

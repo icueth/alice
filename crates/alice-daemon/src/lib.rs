@@ -8,6 +8,7 @@ pub mod mcp;
 pub mod paths;
 pub mod service;
 pub mod spool;
+pub mod startup;
 pub mod worker;
 pub mod writer;
 

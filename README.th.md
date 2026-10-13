@@ -69,10 +69,10 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
 
 ```bash
 cargo install --git https://github.com/icueth/alice alice-memory
-alice model fetch      # ดาวน์โหลดโมเดล embedding (~136MB) ไว้ที่ ~/.alice/models
+alice model fetch      # ครั้งเดียวก่อนเริ่มใช้: ดาวน์โหลดโมเดล embedding (~136MB) ไว้ที่ ~/.alice/models
 ```
 
-ถ้าเครื่องต่อเน็ตอยู่ จะข้าม `alice model fetch` ก็ได้ (daemon ดาวน์โหลดเองตอนเปิดครั้งแรก) แต่รันไว้ก่อนจะทำให้ `remember` ครั้งแรกเร็ว และใช้ได้แม้เครื่องจะออฟไลน์ภายหลัง ไฟล์โมเดลล็อกไว้ที่ revision เดียวและตรวจ SHA-256 ทุกครั้ง ตั้ง `HF_ENDPOINT` เพื่อใช้ mirror ของ Hugging Face ได้
+รัน `alice model fetch` หนึ่งครั้งก่อนเริ่มใช้งาน ถ้าไม่รัน daemon จะดาวน์โหลดโมเดลเองตอนเปิดครั้งแรก และระหว่างนั้นคำสั่งอ่านจะตอบว่า "memory daemon is starting (downloading the embedding model …)" ส่วนคำสั่งเขียนจะเข้าคิวไว้ก่อน `alice daemon start` จะรอจนดาวน์โหลดเสร็จและแสดงความคืบหน้า ไฟล์โมเดลล็อกไว้ที่ revision เดียวและตรวจ SHA-256 ทุกครั้ง ตั้ง `HF_ENDPOINT` เพื่อใช้ mirror ของ Hugging Face ได้ ถ้า daemon เปิดไม่ขึ้น (ไม่มีเน็ตให้ดาวน์โหลด หรือ `alice.db` เสียหาย) ทุกคำสั่งจะบอกสาเหตุ และ `alice status` แสดงความล้มเหลวครั้งล่าสุด
 
 ### แพลตฟอร์มที่รองรับ
 
@@ -105,6 +105,7 @@ cargo install alice-memory
 ## เริ่มใช้งาน
 
 ```bash
+alice model fetch              # ครั้งเดียว: โมเดล embedding (~136MB)
 alice remember --kind decision "ใช้ SQLite WAL กับ writer thread ตัวเดียว"   # เปิด daemon ให้เองถ้ายังไม่รัน
 alice recall "ทำไมใช้ writer ตัวเดียว"
 alice context                  # สรุปของโปรเจกต์ปัจจุบัน

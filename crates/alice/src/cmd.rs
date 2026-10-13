@@ -2,12 +2,14 @@
 
 use crate::Command;
 use alice_core::api::*;
+use alice_core::error::AliceError;
 use alice_core::model::{Author, Kind};
 use alice_core::store::kg::{AssertFact, FactAction, FactsQuery};
 use alice_core::store::memories::{MemoryUpdate, UpdateAction};
-use alice_daemon::client::{DaemonClient, Launcher, remember_or_spool};
+use alice_daemon::client::{DaemonClient, Launcher, Unavailable, remember_or_spool};
 use alice_daemon::daemon::{DaemonOptions, run};
 use alice_daemon::paths::AliceHome;
+use alice_daemon::startup::{self, lock_free, lock_pid, pid_alive};
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use std::io::{Read, Seek, SeekFrom};
@@ -18,6 +20,15 @@ use std::time::{Duration, Instant};
 /// before that, for a daemon that is still starting to answer).
 const STOP_WAIT: Duration = Duration::from_secs(30);
 const STOP_POLL: Duration = Duration::from_millis(100);
+/// How long `daemon start` first waits for the daemon it starts before it looks at who holds
+/// the lock and what that process is doing.
+const START_FIRST_WAIT: Duration = Duration::from_secs(2);
+/// How long `daemon start` waits for a lock holder that announces nothing new (a download in
+/// progress announces itself every second).
+const START_IDLE_WAIT: Duration = Duration::from_secs(60);
+const START_POLL: Duration = Duration::from_millis(200);
+/// Daemons `daemon start` starts at most, when one lets go of the lock without serving.
+const START_ATTEMPTS: usize = 3;
 /// Lines `daemon logs` prints.
 const LOG_LINES: usize = 100;
 /// Only the end of the daemon log is read: it is not rotated and may grow large.
@@ -323,9 +334,14 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
             };
             let r = remember_or_spool(&home, &launcher(), req).await?;
             print(json, &r, || match (&r.status, &r.id) {
-                (RememberStatus::Spooled, _) => {
-                    "Queued: the daemon is starting; the memory will be saved shortly.\n".into()
-                }
+                // Why it was queued and when it is saved (the daemon is starting, could not
+                // start, or the database is read-only).
+                (RememberStatus::Spooled, _) => format!(
+                    "Queued: {}.\n",
+                    r.reason
+                        .as_deref()
+                        .unwrap_or("the memory is saved when the daemon is available")
+                ),
                 (RememberStatus::Duplicate, Some(id)) => {
                     format!("Already remembered: {id} ({})\n", r.project)
                 }
@@ -444,11 +460,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
             })
         }
         Command::Status | Command::Daemon(DaemonCmd::Status) => status(&home, json).await,
-        Command::Daemon(DaemonCmd::Start) => {
-            let c = client(&home).await?;
-            let h = c.health().await?;
-            print(json, &h, || format!("running (pid {})\n", h.pid))
-        }
+        Command::Daemon(DaemonCmd::Start) => start(&home, json).await,
         Command::Daemon(DaemonCmd::Stop) => stop(&home, json).await,
         Command::Daemon(DaemonCmd::Logs) => {
             let path = home.logs_dir().join("daemon.log");
@@ -488,11 +500,26 @@ fn log_tail(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
         .collect())
 }
 
-/// Never starts a daemon.
+/// Never starts a daemon. Without one, says whether one is starting (and what it does) or why
+/// the last start failed.
 async fn status(home: &AliceHome, json: bool) -> Result<()> {
     let Some(c) = DaemonClient::try_existing(home).await else {
-        return print(json, &serde_json::json!({"running": false}), || {
-            "not running\n".into()
+        let starting = startup::lock_holder(home)
+            .map(|pid| (pid, startup::read_progress(home).map(|p| p.describe())));
+        let failed = startup::read_error(home).filter(|_| starting.is_none());
+        let value = serde_json::json!({
+            "running": false,
+            "starting": starting.as_ref().map(|(pid, doing)| serde_json::json!({"pid": pid, "doing": doing})),
+            "start_error": failed.as_ref().map(|e| &e.error),
+        });
+        return print(json, &value, || match (&starting, &failed) {
+            (Some((pid, Some(doing))), _) => format!("starting (pid {pid}): {doing}\n"),
+            (Some((pid, None)), _) => format!("starting (pid {pid})\n"),
+            (None, Some(e)) => format!(
+                "not running; the last start failed ({}): {}\n",
+                e.at, e.error
+            ),
+            (None, None) => "not running\n".into(),
         });
     };
     let h = c.health().await?;
@@ -518,49 +545,6 @@ async fn status(home: &AliceHome, json: bool) -> Result<()> {
     })
 }
 
-/// The pid the last daemon to take the lock wrote into it.
-fn lock_pid(home: &AliceHome) -> Option<u32> {
-    std::fs::read_to_string(home.lock_file())
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
-
-/// Whether no process holds the daemon lock, probed by taking it and letting go at once.
-fn lock_free(home: &AliceHome) -> bool {
-    match std::fs::File::open(home.lock_file()) {
-        Ok(f) => {
-            let free = f.try_lock().is_ok();
-            if free {
-                let _ = f.unlock();
-            }
-            free
-        }
-        // No lock file: no daemon ever ran for this home.
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-    }
-}
-
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: signal 0 sends nothing; it only asks whether the process exists.
-    let r = unsafe { libc::kill(pid, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Unknown here: the lock alone tells.
-#[cfg(not(unix))]
-fn pid_alive(_pid: u32) -> bool {
-    true
-}
-
 /// Gone once its process has exited or its lock is free (the daemon saves everything, then
 /// releases the lock, then exits).
 async fn wait_gone(home: &AliceHome, pid: Option<u32>) -> bool {
@@ -582,6 +566,66 @@ fn stopped(json: bool, pid: Option<u32>) -> Result<()> {
         &serde_json::json!({"stopped": true, "pid": pid}),
         || "stopped\n".into(),
     )
+}
+
+/// Start the daemon if it does not run, and wait until it serves. While a live process holds
+/// the lock (a daemon that is starting: downloading the model, say), keep waiting and say what
+/// it does; give up only when it announces nothing new for a minute. A failed start is
+/// reported with its reason.
+async fn start(home: &AliceHome, json: bool) -> Result<()> {
+    let launcher = launcher();
+    // What was last printed (step, file, percent in steps of 5) and the last announcement seen.
+    let mut said = None;
+    let mut seen = 0;
+    let mut attempts = 0;
+    let c = 'started: loop {
+        attempts += 1;
+        match DaemonClient::try_connect(home, &launcher, START_FIRST_WAIT).await {
+            Ok(c) => break c,
+            Err(Unavailable::Starting(_)) => {}
+            Err(u) => return Err(AliceError::from(u).into()),
+        }
+        let mut idle_since = Instant::now();
+        loop {
+            if let Some(c) = DaemonClient::try_existing(home).await {
+                break 'started c;
+            }
+            if let Some(e) = startup::read_error(home) {
+                bail!("{}", Unavailable::StartFailed(e.error));
+            }
+            let Some(pid) = startup::lock_holder(home) else {
+                // The holder let go without serving or saying why: start one again.
+                break;
+            };
+            if let Some(p) = startup::read_progress(home) {
+                if p.unix_ms != seen {
+                    seen = p.unix_ms;
+                    idle_since = Instant::now();
+                }
+                let pct = p.done.zip(p.total).map(|(d, t)| d * 100 / t.max(1) / 5);
+                let key = Some((p.step.clone(), p.file.clone(), pct));
+                if key != said {
+                    eprintln!("alice: the daemon (pid {pid}) is {}", p.describe());
+                    said = key;
+                }
+            }
+            if idle_since.elapsed() >= START_IDLE_WAIT {
+                bail!(
+                    "the daemon (pid {pid}) holds {} but has not answered for {} s; see \"alice daemon logs\", or end it with \"kill {pid}\" and retry",
+                    home.lock_file().display(),
+                    START_IDLE_WAIT.as_secs()
+                );
+            }
+            tokio::time::sleep(START_POLL).await;
+        }
+        if attempts >= START_ATTEMPTS {
+            bail!(
+                "the daemon exited {attempts} times without serving or saying why; see \"alice daemon logs\""
+            );
+        }
+    };
+    let h = c.health().await?;
+    print(json, &h, || format!("running (pid {})\n", h.pid))
 }
 
 /// Ask the daemon to stop and wait until it has saved and let go of its lock, so that a

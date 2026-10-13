@@ -54,6 +54,14 @@ impl AliceHome {
     pub fn lock_file(&self) -> PathBuf {
         self.root.join("daemon.lock")
     }
+    /// Why the last daemon start failed (see `startup`).
+    pub fn daemon_error(&self) -> PathBuf {
+        self.root.join("daemon.error")
+    }
+    /// What a starting daemon is doing (see `startup`).
+    pub fn daemon_starting(&self) -> PathBuf {
+        self.root.join("daemon.starting")
+    }
     pub fn token_file(&self) -> PathBuf {
         self.root.join("token")
     }
@@ -108,6 +116,8 @@ mod tests {
             home.daemon_json(),
             home.lock_file(),
             home.token_file(),
+            home.daemon_error(),
+            home.daemon_starting(),
         ] {
             assert_eq!(file.parent(), Some(home.root()));
         }

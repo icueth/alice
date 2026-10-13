@@ -312,3 +312,35 @@ async fn a_stale_discovery_file_is_cleared_as_soon_as_the_lock_is_taken() {
     assert!(r.is_err(), "the service cannot start on a directory");
     assert_eq!(read_info(&home), None, "the stale daemon.json was removed");
 }
+
+/// Review finding I-1: a start that fails leaves its reason in daemon.error (written before the
+/// lock is released, so a client that finds the lock free finds the reason too), worded with
+/// the cause and the next step; the next good start clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_start_leaves_its_reason_and_a_good_start_clears_it() {
+    let (_d, home) = home();
+    home.ensure_dirs().unwrap();
+    std::fs::write(home.db(), b"X".repeat(8192)).unwrap();
+    let r = finished(spawn(&home), Duration::from_secs(10)).await;
+    assert!(r.is_err(), "a damaged database cannot be opened");
+    let raw = std::fs::read_to_string(home.root().join("daemon.error"))
+        .expect("the reason is left in daemon.error");
+    let e: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let msg = e["error"].as_str().unwrap();
+    assert!(msg.contains(&home.db().display().to_string()), "{msg}");
+    assert!(msg.contains("not a usable database"), "{msg}");
+    assert!(msg.contains("move it aside"), "{msg}");
+    assert_eq!(e["pid"].as_u64(), Some(u64::from(std::process::id())));
+    assert!(e["unix_ms"].as_u64().is_some_and(|ms| ms > 0));
+
+    std::fs::remove_file(home.db()).unwrap();
+    let running = spawn(&home);
+    let daemon = Daemon::connect(&home).await;
+    assert!(
+        !home.root().join("daemon.error").exists(),
+        "a daemon that serves has cleared the last failure"
+    );
+    assert!(!home.root().join("daemon.starting").exists());
+    daemon.shutdown().await;
+    finished(running, Duration::from_secs(15)).await.unwrap();
+}

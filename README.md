@@ -69,10 +69,10 @@ You need Rust 1.99 or newer ([rustup](https://rustup.rs)) and a C/C++ compiler (
 
 ```bash
 cargo install --git https://github.com/icueth/alice alice-memory
-alice model fetch      # the embedding model (~136 MB) into ~/.alice/models
+alice model fetch      # once, before first use: the embedding model (~136 MB) into ~/.alice/models
 ```
 
-`alice model fetch` is optional on a connected machine (the daemon downloads the model on first start), but doing it up front keeps the first `remember` fast and works ahead of going offline. Files are pinned to one revision and checked by SHA-256; set `HF_ENDPOINT` to use a Hugging Face mirror.
+Run `alice model fetch` once before first use. Without it the first daemon start downloads the model itself, and until that is done reads answer "memory daemon is starting (downloading the embedding model …)" and writes are queued; `alice daemon start` waits for the download and shows its progress. Files are pinned to one revision and checked by SHA-256; set `HF_ENDPOINT` to use a Hugging Face mirror. If the daemon cannot start (no network for the download, a damaged `alice.db`), every command says why, and `alice status` shows the last failure.
 
 ### Platform support
 
@@ -105,6 +105,7 @@ cargo install alice-memory
 ## Quick start
 
 ```bash
+alice model fetch              # once: the embedding model (~136 MB)
 alice remember --kind decision "Use SQLite WAL with a single writer thread"   # starts the daemon if needed
 alice recall "why single writer"
 alice context                  # briefing for the current project

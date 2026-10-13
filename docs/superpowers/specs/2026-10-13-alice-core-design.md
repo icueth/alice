@@ -106,6 +106,8 @@ logs/               daemon logs (rotated, never contain secrets)
 config.toml         user configuration
 daemon.json         {pid, port, instance, version, started_at}
 daemon.lock
+daemon.starting     {pid, step, file, done, total} while a daemon starts (e.g. the model download)
+daemon.error        {pid, at, error}: why the last start failed; cleared when a daemon serves
 token               API token (0600)
 ```
 
@@ -349,11 +351,12 @@ The database file is never stored in git. Restore with `alice restore [backup]`,
 
 | Failure | Behaviour |
 |---|---|
-| Daemon unreachable | Writes go to the spool; reads return a short error telling the agent memory is starting and to retry in a few seconds. |
+| Daemon unreachable | Writes go to the spool; reads return a short error telling the agent memory is starting and to retry in a few seconds (with what it is doing, e.g. downloading the model). |
+| Daemon cannot start (model download or load fails, database damaged or from a newer schema, failed migration) | The daemon writes the reason to `daemon.error` and exits; every client reports that reason and the next step at once (`memory daemon could not start: <reason>`), writes go to the spool with that reason, and `alice status` shows it. A start that succeeds clears it. Serving such a database read-only arrives with `alice doctor` (M2). |
 | Embedding provider fails | Memory stays lexically searchable; `embed_state = retry` with exponential backoff; health shows the backlog. |
 | Judge fails / over budget | Heuristic fallback; `judge_state = retry`. |
 | Vector index missing or inconsistent | Rebuild on a background thread; lexical search only meanwhile (`health.index_ready = false`). |
-| Disk full, DB corruption, failed migration | Read-only mode. Writes go to the spool. Agents receive: `Memory is read-only: <reason>. Run "alice doctor".` |
+| Disk full, DB corruption while running | Read-only mode. Writes go to the spool, and the reply says why. Agents receive: `memory is read-only: <reason>. See "alice status" and the daemon log ("alice daemon logs") for the cause.` (`alice doctor` replaces that pointer in M2.) |
 | Client timeouts | `recall` 5 s, `context` 3 s; writes acknowledge immediately. No 120 s waits. |
 
 All MCP and CLI errors state what happened and what to do next, in one or two sentences.

@@ -3,7 +3,7 @@
 
 #![allow(deprecated)] // roots are deprecated by SEP-2577 but current clients still provide them
 
-use crate::client::{DaemonClient, Launcher, WRITE_WAIT, remember_via};
+use crate::client::{DaemonClient, Launcher, Unavailable, WRITE_WAIT, remember_via};
 use crate::paths::AliceHome;
 use crate::service::Service;
 use alice_core::api::*;
@@ -67,6 +67,11 @@ impl RemoteBackend {
     /// Connect lazily (keeps `alice mcp` start-up fast). A cached client is re-checked with
     /// the proof ping, which touches no database, so a restarted daemon is found again.
     async fn client(&self, wait: Duration) -> AliceResult<DaemonClient> {
+        Ok(self.try_client(wait).await?)
+    }
+
+    /// `client`, with why there is no daemon (a queued write's reply says it).
+    async fn try_client(&self, wait: Duration) -> Result<DaemonClient, Unavailable> {
         let mut slot = self.client.lock().await;
         if let Some(c) = slot.as_ref()
             && c.is_live().await
@@ -74,7 +79,7 @@ impl RemoteBackend {
             return Ok(c.clone());
         }
         *slot = None;
-        let c = DaemonClient::connect(&self.home, &self.launcher, wait).await?;
+        let c = DaemonClient::try_connect(&self.home, &self.launcher, wait).await?;
         *slot = Some(c.clone());
         Ok(c)
     }
@@ -103,7 +108,7 @@ impl Backend {
     async fn remember(&self, r: RememberRequest) -> AliceResult<RememberResponse> {
         match self {
             Backend::Local(s) => s.remember_or_spool(r).await,
-            Backend::Remote(b) => remember_via(&b.home, b.client(WRITE_WAIT).await, r).await,
+            Backend::Remote(b) => remember_via(&b.home, b.try_client(WRITE_WAIT).await, r).await,
         }
     }
     async fn context(&self, r: ContextRequest) -> AliceResult<ContextResponse> {

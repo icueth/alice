@@ -354,6 +354,9 @@ fn stop_waits_until_the_daemon_lets_go_so_a_restart_finds_the_data() {
 #[test]
 fn stop_waits_for_a_lock_holder_without_a_daemon_json() {
     let e = Env::new();
+    // On macOS the first process a test binary starts can take ~2 s to reach `main` (measured
+    // here); without this warm-up `stop` could first look after the lock is released below.
+    assert!(e.ok(&["--version"]).starts_with("alice "));
     let path = e.home.join("daemon.lock");
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -494,6 +497,171 @@ fn every_subcommand_round_trips() {
     assert_eq!(
         e.json(&["get", anon])["memories"][0]["memory"]["author"]["agent"],
         "cli"
+    );
+}
+
+/// The pending entries in the spool.
+fn spooled(e: &Env) -> usize {
+    std::fs::read_dir(e.home.join("spool"))
+        .map(|d| {
+            d.filter_map(|f| f.ok())
+                .filter(|f| f.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// Review finding I-1: a daemon that cannot start (here: alice.db is not a database) says why
+/// in daemon.error, and every client names that cause and the next step at once instead of
+/// "starting; retry" forever. Writes are still queued, with the reason. Once the cause is
+/// fixed, the next start serves the queued write and daemon.error is gone.
+#[test]
+fn a_damaged_database_is_named_instead_of_starting_forever() {
+    let e = Env::new();
+    std::fs::write(e.home.join("alice.db"), b"X".repeat(8192)).unwrap();
+
+    let t = Instant::now();
+    let o = e.run(&["recall", "damaged"]);
+    assert!(!o.status.success());
+    let err = stderr(&o);
+    assert!(
+        err.contains("could not start")
+            && err.contains("alice.db")
+            && err.contains("move it aside"),
+        "{err}"
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(8),
+        "took {:?}",
+        t.elapsed()
+    );
+
+    let out = e.ok(&["remember", "written while the database is damaged"]);
+    assert!(out.starts_with("Queued: "), "{out}");
+    assert!(
+        out.contains("could not start") && out.contains("alice.db") && !out.contains("starting"),
+        "the reply says why it was queued: {out}"
+    );
+    assert_eq!(spooled(&e), 1);
+
+    let o = e.run(&["daemon", "start"]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("alice.db"), "{}", stderr(&o));
+    assert!(
+        e.ok(&["status"]).contains("alice.db"),
+        "status shows the last failure"
+    );
+    let error = std::fs::read_to_string(e.home.join("daemon.error")).unwrap();
+    assert!(error.contains("alice.db"), "{error}");
+
+    // Fixed (moved aside): the next start serves, applies the queued write and clears the file.
+    std::fs::rename(e.home.join("alice.db"), e.home.join("alice.db.damaged")).unwrap();
+    assert!(e.ok(&["daemon", "start"]).starts_with("running (pid "));
+    assert!(!e.home.join("daemon.error").exists());
+    eventually(
+        || e.recall_count("database is damaged") == 1,
+        "the queued write",
+    );
+}
+
+/// Review finding I-1: an offline first run (the model cannot be downloaded) is named too.
+#[test]
+fn a_failed_model_download_is_named_with_the_next_step() {
+    let e = Env::new();
+    let real = |args: &[&str]| {
+        e.cmd(args)
+            .env_remove("ALICE_EMBEDDER")
+            // Nothing listens on port 9 (discard): the download fails at once.
+            .env("HF_ENDPOINT", "http://127.0.0.1:9")
+            .output()
+            .unwrap()
+    };
+    let t = Instant::now();
+    let o = real(&["daemon", "start"]);
+    assert!(!o.status.success());
+    let err = stderr(&o);
+    assert!(
+        err.contains("embedding model could not be downloaded")
+            && err.contains("alice model fetch"),
+        "{err}"
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(8),
+        "took {:?}",
+        t.elapsed()
+    );
+
+    let o = real(&["remember", "kept while offline"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.starts_with("Queued: ") && out.contains("could not be downloaded"),
+        "{out}"
+    );
+    assert_eq!(spooled(&e), 1);
+}
+
+/// Review finding I-1: `daemon start` keeps waiting while a live process holds the lock (a
+/// daemon downloading the model, say) instead of giving up after the usual wait, and says what
+/// that process is doing. Here the test holds the lock and announces a download for 6 s, longer
+/// than a started daemon waits for the lock, so `daemon start` must also start one again.
+#[test]
+fn daemon_start_waits_while_a_live_process_holds_the_lock() {
+    let e = Env::new();
+    let path = e.home.join("daemon.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap();
+    lock.try_lock().unwrap();
+    std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::fs::write(
+        e.home.join("daemon.starting"),
+        serde_json::json!({
+            "pid": std::process::id(),
+            "unix_ms": now_ms,
+            "step": "downloading the embedding model",
+            "file": "model_quantized.onnx",
+            "done": 59_154_093u64,
+            "total": 118_308_185u64,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    let child = e
+        .cmd(&["daemon", "start"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(6));
+    std::fs::remove_file(e.home.join("daemon.starting")).unwrap();
+    drop(lock);
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stdout).starts_with("running (pid "),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert!(started.elapsed() >= Duration::from_secs(6));
+    let err = stderr(&o);
+    assert!(
+        err.contains("downloading the embedding model") && err.contains("50%"),
+        "{err}"
     );
 }
 

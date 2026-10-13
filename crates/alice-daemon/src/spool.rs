@@ -19,7 +19,7 @@ pub enum SpoolEntry {
 /// What a reply says about a write queued because the database is read-only (`reason`).
 pub fn read_only_note(reason: &str) -> String {
     format!(
-        "memory is read-only ({reason}), so the memory is queued; it is saved once the database is repaired and the daemon restarted. See \"alice status\" and \"alice daemon logs\""
+        "memory is read-only ({reason}); the memory is saved once the database is repaired and the daemon restarted. See \"alice status\" and \"alice daemon logs\""
     )
 }
 
