@@ -2,7 +2,9 @@
 
 use crate::paths::AliceHome;
 use alice_core::ids::new_id;
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::io::Write;
 use std::path::Path;
 
@@ -63,6 +65,23 @@ fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// later start; an empty file found anyway is replaced.
 pub fn load_or_create_token(home: &AliceHome) -> std::io::Result<String> {
     if let Some(t) = read_token(home) {
+        // Someone may have loosened it; the token must stay readable by its owner only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = home.token_file();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "cannot make {} private: {e}; check who owns it",
+                            path.display()
+                        ),
+                    )
+                },
+            )?;
+        }
         return Ok(t);
     }
     let mut buf = [0u8; 32];
@@ -85,6 +104,25 @@ pub fn load_or_create_token(home: &AliceHome) -> std::io::Result<String> {
     };
     let _ = std::fs::remove_file(&tmp);
     placed
+}
+
+/// What `/api/v1/ping?nonce=<nonce>` answers: `hex(HMAC-SHA256(key = token, msg = nonce))`
+/// over the ASCII bytes of both. Only a process that knows the token can produce it, so a
+/// client checks it before it sends the token anywhere.
+pub fn ping_proof(token: &str, nonce: &str) -> String {
+    hex::encode(hmac_sha256(token.as_bytes(), nonce.as_bytes()))
+}
+
+/// Whether `proof` is `ping_proof(token, nonce)`, compared in constant time.
+pub fn verify_ping_proof(token: &str, nonce: &str, proof: &str) -> bool {
+    crate::http::ct_eq(ping_proof(token, nonce).as_bytes(), proof.as_bytes())
+}
+
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    mac.update(msg);
+    mac.finalize().into_bytes().into()
 }
 
 #[cfg(test)]
@@ -172,5 +210,61 @@ mod tests {
         let (_d, home) = home();
         std::fs::write(home.token_file(), b"  existing-token\n").unwrap();
         assert_eq!(load_or_create_token(&home).unwrap(), "existing-token");
+    }
+
+    /// RFC 4231 test cases 2 (short key) and 6 (key longer than the 64-byte block).
+    #[test]
+    fn ping_proof_is_hmac_sha256() {
+        assert_eq!(
+            ping_proof("Jefe", "what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert_eq!(
+            hex::encode(hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn verify_ping_proof_accepts_only_the_exact_proof() {
+        let token = "a".repeat(64);
+        let nonce = "0123456789abcdef";
+        let proof = ping_proof(&token, nonce);
+        assert_eq!(proof.len(), 64);
+        assert!(verify_ping_proof(&token, nonce, &proof));
+        assert!(
+            !verify_ping_proof(&"b".repeat(64), nonce, &proof),
+            "wrong token"
+        );
+        assert!(
+            !verify_ping_proof(&token, "0123456789abcdee", &proof),
+            "other nonce"
+        );
+        assert!(!verify_ping_proof(&token, nonce, &proof[..63]), "truncated");
+        assert!(
+            !verify_ping_proof(&token, nonce, &format!("{proof}0")),
+            "extended"
+        );
+        assert!(!verify_ping_proof(&token, nonce, ""), "empty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_token_file_is_made_private_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, home) = home();
+        std::fs::write(home.token_file(), b"existing-token").unwrap();
+        std::fs::set_permissions(home.token_file(), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert_eq!(load_or_create_token(&home).unwrap(), "existing-token");
+        let mode = std::fs::metadata(home.token_file())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

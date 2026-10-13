@@ -3,7 +3,7 @@
 
 use alice_core::api::*;
 use alice_daemon::daemon::{DaemonOptions, run};
-use alice_daemon::discovery::{DaemonInfo, read_info, read_token, write_info};
+use alice_daemon::discovery::{DaemonInfo, read_info, read_token, verify_ping_proof, write_info};
 use alice_daemon::http::PingResponse;
 use alice_daemon::paths::AliceHome;
 use alice_daemon::spool::{self, SpoolEntry};
@@ -54,14 +54,17 @@ impl Daemon {
         loop {
             if let (Some(info), Some(token)) = (read_info(home), read_token(home)) {
                 let base = format!("http://127.0.0.1:{}", info.port);
+                let nonce = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
                 let ping = http
-                    .get(format!("{base}/api/v1/ping"))
+                    .get(format!("{base}/api/v1/ping?nonce={nonce}"))
                     .timeout(Duration::from_millis(300))
                     .send()
                     .await;
                 if let Ok(r) = ping
                     && let Ok(p) = r.json::<PingResponse>().await
                     && p.instance == info.instance
+                    && p.proof
+                        .is_some_and(|proof| verify_ping_proof(&token, nonce, &proof))
                 {
                     return Daemon {
                         http,
@@ -282,4 +285,29 @@ async fn a_restart_during_a_stuck_request_ends_with_one_running_daemon() {
     again.shutdown().await;
     finished(new, Duration::from_secs(15)).await.unwrap();
     drop(stuck);
+}
+
+/// The lock holder knows any daemon.json it finds is stale, and drops it before starting the
+/// service, so clients never ping a port that may belong to someone else by now. Shown with a
+/// daemon whose start then fails: the stale file must already be gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_discovery_file_is_cleared_as_soon_as_the_lock_is_taken() {
+    let (_d, home) = home();
+    home.ensure_dirs().unwrap();
+    write_info(
+        &home,
+        &DaemonInfo {
+            pid: 1,
+            port: 9,
+            instance: "STALE".into(),
+            version: "0".into(),
+            started_at: "t".into(),
+        },
+    )
+    .unwrap();
+    // A directory where the database file should be: Service::start fails.
+    std::fs::create_dir(home.db()).unwrap();
+    let r = finished(spawn(&home), Duration::from_secs(10)).await;
+    assert!(r.is_err(), "the service cannot start on a directory");
+    assert_eq!(read_info(&home), None, "the stale daemon.json was removed");
 }

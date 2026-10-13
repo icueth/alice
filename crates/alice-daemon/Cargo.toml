@@ -13,6 +13,8 @@ alice-embed = { path = "../alice-embed" }
 axum.workspace = true
 tokio-util.workspace = true
 getrandom.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 anyhow.workspace = true
 hex.workspace = true
 reqwest.workspace = true

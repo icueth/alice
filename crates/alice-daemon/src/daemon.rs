@@ -71,6 +71,9 @@ pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
     };
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
+    // Whatever daemon.json exists now is stale (its writer no longer holds the lock): drop it
+    // before the slow part of starting, so no client pings a port that may be someone else's.
+    let _ = std::fs::remove_file(home.daemon_json());
     // Always printed (not subject to ALICE_LOG): process tests count this line to prove a single instance.
     eprintln!(
         "alice daemon started pid={} home={}",

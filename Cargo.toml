@@ -38,6 +38,7 @@ dirs = "7.0.0"
 axum = "0.8.9"
 tokio-util = "0.7.20"
 getrandom = "0.4.3"
+hmac = "0.13.0"
 
 [profile.release]
 lto = "thin"

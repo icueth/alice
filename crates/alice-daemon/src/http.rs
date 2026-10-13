@@ -3,8 +3,8 @@
 use crate::service::Service;
 use alice_core::api::*;
 use alice_core::error::AliceError;
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, FromRequest, Request, State};
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{DefaultBodyLimit, FromRequest, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -35,7 +35,8 @@ impl Guard {
     }
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time equality (the length is not secret).
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
@@ -178,6 +179,8 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 struct AppState {
     svc: Arc<Service>,
     shutdown: CancellationToken,
+    /// For the ping proof only; the guard keeps its own copy.
+    token: Arc<str>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -185,14 +188,47 @@ pub struct PingResponse {
     pub service: String,
     pub instance: String,
     pub version: String,
+    /// `discovery::ping_proof(token, nonce)` when the ping carried `?nonce=`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
 }
 
-async fn ping(State(st): State<AppState>) -> Json<PingResponse> {
-    Json(PingResponse {
+#[derive(Debug, serde::Deserialize)]
+struct PingQuery {
+    nonce: Option<String>,
+}
+
+fn valid_nonce(n: &str) -> bool {
+    (16..=64).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Public, but proves the token without revealing it: with `?nonce=<16–64 hex chars>` the
+/// answer carries `proof = discovery::ping_proof(token, nonce)`.
+async fn ping(
+    State(st): State<AppState>,
+    query: Result<Query<PingQuery>, QueryRejection>,
+) -> Result<Json<PingResponse>, ApiError> {
+    let Query(q) = query.map_err(|r| {
+        ApiError(AliceError::Invalid(format!(
+            "{}; send /api/v1/ping or /api/v1/ping?nonce=<16 to 64 hex characters>",
+            r.body_text()
+        )))
+    })?;
+    let proof = match q.nonce {
+        None => None,
+        Some(n) if valid_nonce(&n) => Some(crate::discovery::ping_proof(&st.token, &n)),
+        Some(_) => {
+            return Err(ApiError(AliceError::invalid(
+                "the nonce must be 16 to 64 hex characters; send a fresh random one",
+            )));
+        }
+    };
+    Ok(Json(PingResponse {
         service: "alice".into(),
         instance: st.svc.instance().to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
-    })
+        proof,
+    }))
 }
 async fn health(State(st): State<AppState>) -> ApiResult<Health> {
     Ok(Json(st.svc.health().await?))
@@ -287,8 +323,13 @@ async fn admin_shutdown(State(st): State<AppState>) -> StatusCode {
 
 /// Build the router. Task 12 adds the `/mcp` service inside the token-guarded part.
 pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: CancellationToken) -> Router {
-    let g = Guard::new(token, port);
-    let state = AppState { svc, shutdown };
+    let token: Arc<str> = token.into();
+    let g = Guard::new(token.clone(), port);
+    let state = AppState {
+        svc,
+        shutdown,
+        token,
+    };
     let public = Router::new()
         .route("/api/v1/ping", get(ping))
         .with_state(state.clone())

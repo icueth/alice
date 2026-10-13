@@ -375,3 +375,107 @@ async fn admin_shutdown_needs_the_token_and_cancels() {
     assert_eq!(r.status(), 202);
     assert!(s.shutdown.is_cancelled());
 }
+
+/// Review focus #3: the ping proves the daemon knows the token (HMAC over the caller's nonce)
+/// without revealing it, so a process replaying a recorded instance id cannot pass for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn ping_proves_knowledge_of_the_token() {
+    use alice_daemon::discovery::{ping_proof, verify_ping_proof};
+    use alice_daemon::http::PingResponse;
+    let s = Srv::start().await;
+    let nonce = "00112233445566778899aabbccddeeff";
+    let ping: PingResponse = s
+        .http
+        .get(s.url(&format!("/api/v1/ping?nonce={nonce}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let proof = ping.proof.expect("a nonce gets a proof");
+    assert_eq!(proof, ping_proof(&s.token, nonce));
+    assert!(verify_ping_proof(&s.token, nonce, &proof));
+    assert_ne!(proof, ping_proof("wrong-token", nonce));
+    assert!(!verify_ping_proof("wrong-token", nonce, &proof));
+    assert!(!proof.contains(&s.token));
+
+    let plain: serde_json::Value = s
+        .http
+        .get(s.url("/api/v1/ping"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(plain.get("proof").is_none(), "{plain}");
+
+    for bad in [
+        "0123456789abcde".to_string(), // 15 hex chars
+        "0".repeat(65),
+        "zz112233445566778899aabbccddeeff".to_string(),
+        String::new(),
+    ] {
+        let r = s
+            .http
+            .get(s.url(&format!("/api/v1/ping?nonce={bad}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "nonce {bad:?}");
+        let e: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(e["kind"], "invalid", "{e}");
+        assert!(e["error"].as_str().unwrap().contains("nonce"), "{e}");
+    }
+}
+
+/// DNS rebinding: a page on evil.example resolved to 127.0.0.1 sends its own Host and Origin.
+#[tokio::test(flavor = "multi_thread")]
+async fn dns_rebinding_shapes_are_refused() {
+    let s = Srv::start().await;
+    for path in ["/api/v1/ping", "/api/v1/health"] {
+        let r = s
+            .http
+            .get(s.url(path))
+            .bearer_auth(&s.token)
+            .header("Host", format!("evil.example:{}", s.port))
+            .header("Origin", format!("http://evil.example:{}", s.port))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "{path}");
+        let r = s
+            .http
+            .get(s.url(path))
+            .bearer_auth(&s.token)
+            .header("Origin", format!("http://localhost:{}", s.port))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            403,
+            "only http://127.0.0.1:<port> is an allowed origin ({path})"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_prefix_or_extension_is_refused() {
+    let s = Srv::start().await;
+    for wrong in [
+        s.token[..63].to_string(),
+        format!("{}t", s.token),
+        s.token[..1].to_string(),
+    ] {
+        let r = s
+            .http
+            .get(s.url("/api/v1/health"))
+            .bearer_auth(&wrong)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401, "token of length {}", wrong.len());
+    }
+}

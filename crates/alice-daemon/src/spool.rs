@@ -26,12 +26,23 @@ fn sync_dir(dir: &Path) {
     let _ = dir;
 }
 
+/// Spooled requests hold memory text: directories this creates are 0700 and files 0600 (Unix).
 pub fn append(dir: &Path, entry: &SpoolEntry) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
+    let mut mkdir = std::fs::DirBuilder::new();
+    mkdir.recursive(true);
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        mkdir.mode(0o700);
+        open.mode(0o600);
+    }
+    mkdir.create(dir)?;
     let id = new_id();
     let tmp = dir.join(format!("{id}.tmp"));
     let dest = dir.join(format!("{id}.json"));
-    let mut f = std::fs::File::create(&tmp)?;
+    let mut f = open.open(&tmp)?;
     f.write_all(&serde_json::to_vec(entry)?)?;
     f.sync_all()?;
     drop(f);
@@ -267,5 +278,24 @@ mod tests {
         assert_eq!(raw["op"], "remember");
         assert_eq!(raw["content"], "one");
         assert_eq!(pending_count(&d.path().join("missing")), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spool_files_and_a_new_spool_dir_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("fresh").join("spool");
+        let file = append(&dir, &remember("secret-ish")).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+        // An existing directory keeps its mode; files in it are still private.
+        let open = d.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = append(&open, &remember("two")).unwrap();
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&open), 0o755);
     }
 }
