@@ -13,7 +13,9 @@ use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRef {
-    /// Stable identity: normalized remote, `path:<root>`, or `global`.
+    /// Stable identity: the normalized remote; for a repository without a remote,
+    /// `path:<main checkout>` (or `path:<git dir>` when bare or not named `.git`); for a plain
+    /// directory, `path:<dir>`; or `global`.
     pub key: String,
     pub slug: String,
     pub name: String,
@@ -105,7 +107,7 @@ fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
 
 /// The checkout's top-level directory and the repository's common git directory, which a
 /// worktree shares with its main checkout. One git spawn.
-fn git_toplevel_and_common_dir(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+fn git_toplevel_and_common_dir(dir: &Path) -> Option<(PathBuf, Option<PathBuf>)> {
     let out = git_output(
         dir,
         &[
@@ -115,10 +117,21 @@ fn git_toplevel_and_common_dir(dir: &Path) -> Option<(PathBuf, PathBuf)> {
             "--git-common-dir",
         ],
     )?;
-    let mut lines = out.lines();
-    let top = PathBuf::from(lines.next()?);
-    let common_dir = PathBuf::from(lines.next()?);
-    Some((top, common_dir))
+    parse_toplevel_and_common_dir(&out)
+}
+
+/// The first line is the top-level directory. The common dir is trusted only when the output is
+/// exactly two lines and the second is absolute: `rev-parse` echoes options it does not know and
+/// still exits 0, so git older than 2.31 prints `--path-format=absolute` as a line of its own.
+/// The caller then falls back to the top-level directory.
+fn parse_toplevel_and_common_dir(stdout: &str) -> Option<(PathBuf, Option<PathBuf>)> {
+    let mut lines = stdout.lines();
+    let top = lines.next().filter(|l| !l.is_empty())?;
+    let common_dir = match (lines.next(), lines.next()) {
+        (Some(c), None) if !c.is_empty() && Path::new(c).is_absolute() => Some(PathBuf::from(c)),
+        _ => None,
+    };
+    Some((PathBuf::from(top), common_dir))
 }
 
 /// The main checkout every worktree belongs to: the parent of `<main>/.git`, or the
@@ -156,7 +169,9 @@ fn detect_with_home(cwd: &Path, home: Option<&Path>) -> ProjectRef {
         // `get-url` applies `url.<base>.insteadOf` rewrites; the raw config value does not.
         let remote_raw = git_output(&root, &["remote", "get-url", "origin"]);
         let remote = remote_raw.as_deref().and_then(normalize_remote);
-        let main = main_checkout(&common_dir);
+        let main = common_dir
+            .as_deref()
+            .map_or_else(|| root.clone(), main_checkout);
         let name = match &remote {
             Some(r) => r.rsplit('/').next().unwrap_or(r).to_string(),
             None => main
@@ -397,6 +412,42 @@ mod tests {
         assert!(p.key.ends_with("tool.git"), "{}", p.key);
         assert_eq!(p.slug, "tool");
         assert!(same_dir(p.root.as_deref().unwrap(), &wt), "{:?}", p.root);
+    }
+
+    #[test]
+    fn rev_parse_output_must_be_two_lines_with_an_absolute_common_dir() {
+        // Built from temp_dir so the paths are absolute on every OS.
+        let top = std::env::temp_dir().join("app");
+        let common = top.join(".git");
+        let (t, c) = (top.display(), common.display());
+        assert_eq!(
+            parse_toplevel_and_common_dir(&format!("{t}\n{c}\n")),
+            Some((top.clone(), Some(common.clone())))
+        );
+        assert_eq!(
+            parse_toplevel_and_common_dir(&format!("{t}\r\n{c}")),
+            Some((top.clone(), Some(common.clone())))
+        );
+        // Git older than 2.31 echoes the unknown `--path-format=absolute` and exits 0; using
+        // that line as the common dir would key every repository without a remote alike.
+        assert_eq!(
+            parse_toplevel_and_common_dir(&format!("{t}\n--path-format=absolute\n.git\n")),
+            Some((top.clone(), None))
+        );
+        assert_eq!(
+            parse_toplevel_and_common_dir(&format!("{t}\n--path-format=absolute\n{c}\n")),
+            Some((top.clone(), None))
+        );
+        // A relative common dir cannot be placed without knowing git's working directory.
+        assert_eq!(
+            parse_toplevel_and_common_dir(&format!("{t}\n.git\n")),
+            Some((top.clone(), None))
+        );
+        assert_eq!(
+            parse_toplevel_and_common_dir(&format!("{t}\n")),
+            Some((top.clone(), None))
+        );
+        assert_eq!(parse_toplevel_and_common_dir(""), None);
     }
 
     #[test]
