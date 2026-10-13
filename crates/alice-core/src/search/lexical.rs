@@ -377,9 +377,9 @@ pub fn memory_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
 /// (FTS5 reads newest first and stops there): no term can crowd another out, and at most about
 /// `RAW_WINDOW` rows are scored in all. A term with at most its share of matches is ranked over
 /// all of them; matches beyond a term's share are not read (newest first: recall for very
-/// common terms is not exhaustive). A share of a single word costs ~16 ms at 1M chunks; a
+/// common terms is not exhaustive). A share of a single word costs 5–16 ms at 1M chunks; a
 /// phrase term (`writer_lease` is the phrase "writer lease") also reads its words' match lists
-/// once for BM25's IDF.
+/// once for BM25's IDF (~25 ms for three common words).
 pub const RAW_WINDOW: usize = 5_000;
 
 /// Rows each of `n` terms may read: an equal share of `window`, at least `k`.
@@ -460,10 +460,27 @@ fn best_first(
     v.into_iter().map(|(id, _)| id).collect()
 }
 
-fn chunk_words_in(conn: &Connection, q: &str, k: usize, window: usize) -> Vec<i64> {
+/// The terms of the raw word list: content words and their variants, without identifiers
+/// that hold `_`. Such an identifier is a phrase of its words here ("writer lease"), and BM25's
+/// IDF for a phrase of common words reads every match of each word with its positions (36–50 ms
+/// per term at 1M chunks); the identifier list holds it as one token, and its words stay here.
+fn raw_word_terms(q: &str) -> Vec<String> {
     let mut terms = content_terms(q);
     terms.extend(variant_terms(q));
-    raw_bm25(conn, "chunks_fts", ", 1.0, 1.5", &terms, |o| o, k, window)
+    terms.retain(|t| !t.contains('_'));
+    terms
+}
+
+fn chunk_words_in(conn: &Connection, q: &str, k: usize, window: usize) -> Vec<i64> {
+    raw_bm25(
+        conn,
+        "chunks_fts",
+        ", 1.0, 1.5",
+        &raw_word_terms(q),
+        |o| o,
+        k,
+        window,
+    )
 }
 
 pub fn chunk_words(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
@@ -900,6 +917,30 @@ mod tests {
         let (_d2, c2, seqs2) = chunks_db(&older);
         let found = chunk_words_in(&c2, "aaa bbb", 3, 10);
         assert!(!found.contains(&seqs2[5]), "{found:?}");
+    }
+
+    /// An identifier with `_` would be a phrase in the word list ("writer lease"), and BM25's
+    /// IDF for a phrase of common words reads every match of each word with its positions:
+    /// 36–50 ms per term at 1M chunks. The raw word list leaves such identifiers to the
+    /// identifier list, which holds them as one token, and searches their words.
+    #[test]
+    fn raw_word_terms_leave_identifiers_to_the_identifier_list() {
+        let terms = raw_word_terms("writer_lease parse_hlc deploy");
+        assert!(terms.iter().all(|t| !t.contains('_')), "{terms:?}");
+        for word in ["writer", "lease", "parse", "hlc", "deploy"] {
+            assert!(terms.contains(&word.to_string()), "{word} in {terms:?}");
+        }
+        assert_eq!(
+            code_terms("writer_lease parse_hlc"),
+            vec!["writerlease".to_string(), "parsehlc".into()]
+        );
+        // The identifier list still finds a rare identifier made of common words in an old
+        // chunk, ahead of newer chunks holding the same words.
+        let mut texts = vec!["x lease_token_frame y".to_string()];
+        texts.extend((0..10).map(|i| format!("lease token frame filler{i}")));
+        let (_d, c, seqs) = chunks_db(&texts);
+        let code = chunk_code_in(&c, "lease_token_frame", 3, 3);
+        assert_eq!(code, vec![seqs[0]]);
     }
 
     /// Terms without a match do not take a share: with four absent words beside two present
