@@ -65,9 +65,8 @@ impl Kind {
     }
 
     pub fn parse(s: &str) -> Option<Kind> {
-        Kind::ALL
-            .into_iter()
-            .find(|k| k.as_str() == s.trim().to_ascii_lowercase())
+        let wanted = s.trim().to_ascii_lowercase();
+        Kind::ALL.into_iter().find(|k| k.as_str() == wanted)
     }
 
     /// Recency half-life used by ranking; `None` means the kind does not decay.
