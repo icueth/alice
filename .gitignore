@@ -1,0 +1,26 @@
+# AgentSpace — local notes/credentials, never commit
+CLAUDE.local.md
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / UI
+node_modules/
+dist/
+
+# Local data, never commit
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.alice/
+.env
+.env.*
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
