@@ -370,13 +370,13 @@ pub fn memory_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
     )
 }
 
-/// Raw-tier lists bound their cost per term, not per query. FTS5 computes BM25 for every row a
-/// query matches before it can return the best few: a word found in 40% of 1M chunks took
-/// ~300 ms per list. So each term's matches are first counted up to `RAW_WINDOW + 1` (FTS5 stops
-/// reading there): terms with at most `RAW_WINDOW` matches are ranked over all their matches in
-/// one query, and each more common term only among its own newest `RAW_WINDOW` matches (~16 ms
-/// at 1M). A rare term is therefore never pushed out by a common one in the same query, and a
-/// query whose every term matches at most `RAW_WINDOW` chunks is ranked exactly as before.
+/// Raw-tier lists bound their cost by term frequency. FTS5 computes BM25 for every row a query
+/// matches before it can return the best few: a word found in 40% of 1M chunks took ~300 ms per
+/// list. So each term's matches are first counted up to `RAW_WINDOW + 1` (FTS5 stops reading
+/// there): the terms with at most `RAW_WINDOW` matches are ranked over all their matches in one
+/// query, and the more common terms together only among their newest `RAW_WINDOW` matches
+/// (~16 ms at 1M). A rare term is therefore never pushed out by a common one, and a query whose
+/// every term matches at most `RAW_WINDOW` chunks is ranked exactly as with plain BM25.
 pub const RAW_WINDOW: usize = 5_000;
 
 /// How many rows of `table` the FTS query `fts` matches, counted up to `cap`. Never fails: an
@@ -412,7 +412,7 @@ fn scored(conn: &Connection, sql: &str, fts: &str, k: usize) -> Vec<(i64, f64)> 
 /// The best `k` raw chunks by BM25 for `terms` in `table`; `wrap` turns an OR of quoted terms
 /// into the FTS query (a column filter for identifiers). Terms are split as [`RAW_WINDOW`]
 /// describes, with `window` in its place. BM25 is a sum over the query's terms, so a chunk found
-/// by several of the queries scores the sum of its parts.
+/// by both queries scores the sum of its parts.
 fn raw_bm25(
     conn: &Connection,
     table: &str,
@@ -447,8 +447,8 @@ fn raw_bm25(
     if let Some(q) = or_query(&rare) {
         add(scored(conn, &all_matches, &wrap(q), k));
     }
-    for t in &common {
-        add(scored(conn, &newest_matches, &wrap(quote(t)), k));
+    if let Some(q) = or_query(&common) {
+        add(scored(conn, &newest_matches, &wrap(q), k));
     }
     best_first(total, k, |a, b| a.total_cmp(&b))
 }
