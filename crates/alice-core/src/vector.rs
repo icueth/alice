@@ -1,25 +1,35 @@
 //! HNSW vector index (usearch, cosine, int8). The `embeddings` table is the source of truth;
 //! this index is a disposable accelerator that can always be rebuilt.
 //!
+//! Memories and chunks live in two separate usearch indexes ("parts"), each with its own locks,
+//! thread slots and dirty flag. A memory search is an unfiltered search over the memory part
+//! only: it never walks the (much larger) chunk graph and never waits for chunk ingest.
+//! `KeyFilter::Any` searches both parts and merges the two top-k lists by similarity.
+//!
 //! usearch facts this wrapper handles (verified in the spike and the usearch 2.26.4 source):
 //! - capacity never grows by itself: `reserve` before adding, also after `load`;
 //! - concurrent searches are limited by "thread slots": a gate keeps callers <= THREADS;
 //! - updating a key means remove + add; duplicate keys are rejected;
 //! - `u64::MAX` marks a removed slot, so no stored key may encode to it;
-//! - an add counts its node before it publishes the node's vector and the entry point, and a
-//!   search reads the entry point without a lock: a search beside the first add dereferenced a
-//!   null vector (SIGSEGV). Adds and removes therefore take the write lock.
+//! - an add counts its node before it publishes the node's vector and the entry point, a later
+//!   add that raises the top level rewrites the entry point, and reusing a removed slot copies
+//!   the new vector in place; searches read all of these without a lock (a search beside the
+//!   first add dereferenced a null vector: SIGSEGV). Adds and removes therefore take the
+//!   part's write lock.
 //!
-//! Locking: searches, `len` and `save` take the read lock; `upsert`, `remove` and capacity
-//! growth take the write lock. `upsert`, `remove` and `save` also take the writer mutex first,
-//! so a write queued behind a long `save` waits on that mutex instead of on the `RwLock`, where
-//! a waiting writer would hold back every new search.
+//! Locking, per part: searches, `len` and `save` take the read lock; writes and capacity growth
+//! take the write lock. The lock is task-fair, so a write first waits for every in-flight search
+//! on that part, new searches on that part queue behind it, and they all wait until the whole
+//! batch is in: searches stall for (longest in-flight search + batch time). Only searches that
+//! include that part pay it. Writes and `save` also take the part's writer mutex first, so a
+//! write that arrives during a long `save` waits on that mutex instead of on the `RwLock`,
+//! where it would hold back every new search for the rest of the save.
 
 use crate::error::{AliceError, Result};
 use crate::store::embeddings::{self, VecKey};
 use parking_lot::{Condvar, Mutex, RwLock};
 use rusqlite::Connection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
@@ -88,6 +98,24 @@ fn check_dim(what: &str, got: usize, dim: usize) -> Result<()> {
     Ok(())
 }
 
+/// usearch takes paths as C strings; refuse what would not survive the conversion.
+fn utf8(path: &Path) -> Result<&str> {
+    path.to_str().ok_or_else(|| {
+        AliceError::invalid(format!(
+            "the vector index path {} is not valid UTF-8; use a data directory with a UTF-8 path",
+            path.display()
+        ))
+    })
+}
+
+/// The two files `save` writes for `path`: `m.usearch` -> `m.memories.usearch`, `m.chunks.usearch`.
+fn part_paths(path: &Path) -> (PathBuf, PathBuf) {
+    (
+        path.with_extension("memories.usearch"),
+        path.with_extension("chunks.usearch"),
+    )
+}
+
 /// Limits concurrent searches to the reserved thread slots.
 struct Gate {
     busy: Mutex<usize>,
@@ -115,24 +143,29 @@ impl Drop for GateGuard<'_> {
     }
 }
 
-pub struct VectorIndex {
+#[cfg(test)]
+type Hook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// One usearch index (all memories or all chunks) with its own locks, slots and dirty flag.
+struct Part {
     /// Searches, `len` and `save` read; adds, removes and capacity growth write.
     inner: RwLock<Index>,
-    /// Serialises `upsert`, `remove` and `save` (see the module docs).
+    /// Serialises writes and `save` (see the module docs).
     writer: Mutex<()>,
-    dim: usize,
     /// Thread slots reserved in usearch; also the gate's limit.
     threads: usize,
     dirty: AtomicBool,
     gate: Gate,
+    /// Runs inside `put` right after the write lock is taken, so tests can hold it.
+    #[cfg(test)]
+    after_write_lock: Mutex<Option<Hook>>,
 }
 
-impl VectorIndex {
-    fn wrap(index: Index, dim: usize, threads: usize) -> Self {
+impl Part {
+    fn wrap(index: Index, threads: usize) -> Self {
         Self {
             inner: RwLock::new(index),
             writer: Mutex::new(()),
-            dim,
             threads,
             dirty: AtomicBool::new(false),
             gate: Gate {
@@ -140,25 +173,23 @@ impl VectorIndex {
                 cv: Condvar::new(),
                 limit: threads,
             },
+            #[cfg(test)]
+            after_write_lock: Mutex::new(None),
         }
     }
 
-    pub fn new(dim: usize) -> Result<Self> {
-        Self::with_threads(dim, THREADS)
-    }
-
-    /// `threads` below THREADS lets tests overrun the slots with a handful of threads.
-    fn with_threads(dim: usize, threads: usize) -> Result<Self> {
+    fn new(dim: usize, threads: usize) -> Result<Self> {
         let index = Index::new(&options(dim)).map_err(err)?;
         index
             .reserve_capacity_and_threads(MIN_CAPACITY, threads)
             .map_err(err)?;
-        Ok(Self::wrap(index, dim, threads))
+        Ok(Self::wrap(index, threads))
     }
 
-    /// Load a saved index. Fails if the file is missing, unreadable or was built with
-    /// another dimension, metric or quantization.
-    pub fn open(path: &Path, dim: usize) -> Result<Self> {
+    /// Fails if the file is missing, unreadable or was built with another dimension, metric
+    /// or quantization.
+    fn open(path: &Path, dim: usize) -> Result<Self> {
+        let name = utf8(path)?;
         if !path.exists() {
             return Err(AliceError::NotFound(format!(
                 "vector index {}",
@@ -166,7 +197,7 @@ impl VectorIndex {
             )));
         }
         let index = Index::new(&options(dim)).map_err(err)?;
-        index.load(&path.to_string_lossy()).map_err(err)?;
+        index.load(name).map_err(err)?;
         if index.dimensions() != dim
             || index.metric_kind() != MetricKind::Cos
             || index.scalar_kind() != ScalarKind::I8
@@ -184,7 +215,7 @@ impl VectorIndex {
         index
             .reserve_capacity_and_threads(cap, THREADS)
             .map_err(err)?;
-        Ok(Self::wrap(index, dim, THREADS))
+        Ok(Self::wrap(index, THREADS))
     }
 
     /// Make room for `extra` more vectors. `i` is write-locked by the caller.
@@ -198,22 +229,32 @@ impl VectorIndex {
         Ok(())
     }
 
-    pub fn upsert(&self, key: VecKey, v: &[f32]) -> Result<()> {
-        check_dim("vector", v.len(), self.dim)?;
-        let k = checked_key(key)?;
+    /// Insert or replace every item under one write lock. Items are already validated.
+    fn put(&self, items: &[(u64, &[f32])]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
         let _writer = self.writer.lock();
         let i = self.inner.write();
-        self.ensure_capacity(&i, 1)?;
-        if i.remove(k).map_err(err)? > 0 {
+        #[cfg(test)]
+        {
+            let hook = self.after_write_lock.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        self.ensure_capacity(&i, items.len())?;
+        for &(k, v) in items {
+            if i.remove(k).map_err(err)? > 0 {
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+            i.add(k, v).map_err(err)?;
             self.dirty.store(true, Ordering::Relaxed);
         }
-        i.add(k, v).map_err(err)?;
-        self.dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
 
-    pub fn remove(&self, key: VecKey) -> Result<()> {
-        let k = checked_key(key)?;
+    fn remove(&self, k: u64) -> Result<()> {
         let _writer = self.writer.lock();
         if self.inner.write().remove(k).map_err(err)? > 0 {
             self.dirty.store(true, Ordering::Relaxed);
@@ -221,49 +262,38 @@ impl VectorIndex {
         Ok(())
     }
 
-    /// Best first; similarity = 1 - cosine distance.
-    pub fn search(&self, query: &[f32], k: usize, filter: KeyFilter) -> Result<Vec<(VecKey, f32)>> {
-        check_dim("query", query.len(), self.dim)?;
-        if k == 0 || self.is_empty() {
+    /// Unfiltered top-k as (key, similarity), best first.
+    fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u64, f32)>> {
+        if k == 0 || self.len() == 0 {
             return Ok(Vec::new());
         }
         let _slot = self.gate.enter();
-        let i = self.inner.read();
-        let m = match filter {
-            KeyFilter::Any => i.search(query, k),
-            KeyFilter::Memories => i.filtered_search(query, k, |key| key & 1 == 0),
-            KeyFilter::Chunks => i.filtered_search(query, k, |key| key & 1 == 1),
-        }
-        .map_err(err)?;
+        let m = self.inner.read().search(query, k).map_err(err)?;
         Ok(m.keys
             .iter()
             .zip(m.distances.iter())
-            .map(|(k, d)| (decode_key(*k), 1.0 - d))
+            .map(|(k, d)| (*k, 1.0 - d))
             .collect())
     }
 
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.inner.read().size()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// True when the index has changed since it was created, opened or last saved.
-    pub fn is_dirty(&self) -> bool {
+    fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed)
     }
 
     /// Atomic save: write and sync a temp file, then rename it over the old one.
-    pub fn save(&self, path: &Path) -> Result<()> {
+    fn save(&self, path: &Path) -> Result<()> {
+        let tmp = path.with_extension("usearch.tmp");
+        let tmp_name = utf8(&tmp)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("usearch.tmp");
         let _writer = self.writer.lock();
         // The read guard lives for this statement only: searches go on, writers wait above.
-        let snapshot = self.inner.read().save(&tmp.to_string_lossy()).map_err(err);
+        let snapshot = self.inner.read().save(tmp_name).map_err(err);
         let written = snapshot.and_then(|()| {
             // Write access: Windows cannot flush a read-only handle.
             std::fs::OpenOptions::new()
@@ -280,13 +310,124 @@ impl VectorIndex {
         self.dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
+}
+
+pub struct VectorIndex {
+    dim: usize,
+    /// Even keys only.
+    memories: Part,
+    /// Odd keys only.
+    chunks: Part,
+}
+
+impl VectorIndex {
+    pub fn new(dim: usize) -> Result<Self> {
+        Self::with_threads(dim, THREADS)
+    }
+
+    /// `threads` below THREADS lets tests overrun the slots with a handful of threads.
+    fn with_threads(dim: usize, threads: usize) -> Result<Self> {
+        Ok(Self {
+            dim,
+            memories: Part::new(dim, threads)?,
+            chunks: Part::new(dim, threads)?,
+        })
+    }
+
+    /// Load the two files written by `save(path)`. Fails if either is missing, unreadable or
+    /// was built with another dimension, metric or quantization; the caller then rebuilds.
+    pub fn open(path: &Path, dim: usize) -> Result<Self> {
+        utf8(path)?;
+        let (memories, chunks) = part_paths(path);
+        Ok(Self {
+            dim,
+            memories: Part::open(&memories, dim)?,
+            chunks: Part::open(&chunks, dim)?,
+        })
+    }
+
+    pub fn upsert(&self, key: VecKey, v: &[f32]) -> Result<()> {
+        self.put(&[(key, v)])
+    }
+
+    /// Insert or replace many vectors: every item is checked first (one bad item rejects the
+    /// batch and nothing is written), then each part takes its write lock once for its share
+    /// (memories first). A usearch failure part-way (out of memory) leaves the items before it
+    /// written; the index then disagrees with the `embeddings` table and the daemon rebuilds.
+    pub fn upsert_batch(&self, items: &[(VecKey, Vec<f32>)]) -> Result<()> {
+        let items: Vec<(VecKey, &[f32])> = items.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+        self.put(&items)
+    }
+
+    fn put(&self, items: &[(VecKey, &[f32])]) -> Result<()> {
+        let (mut memories, mut chunks) = (Vec::new(), Vec::new());
+        for &(key, v) in items {
+            check_dim("vector", v.len(), self.dim)?;
+            let k = checked_key(key)?;
+            match key {
+                VecKey::Memory(_) => memories.push((k, v)),
+                VecKey::Chunk(_) => chunks.push((k, v)),
+            }
+        }
+        self.memories.put(&memories)?;
+        self.chunks.put(&chunks)
+    }
+
+    pub fn remove(&self, key: VecKey) -> Result<()> {
+        let k = checked_key(key)?;
+        match key {
+            VecKey::Memory(_) => self.memories.remove(k),
+            VecKey::Chunk(_) => self.chunks.remove(k),
+        }
+    }
+
+    /// Best first; similarity = 1 - cosine distance.
+    pub fn search(&self, query: &[f32], k: usize, filter: KeyFilter) -> Result<Vec<(VecKey, f32)>> {
+        check_dim("query", query.len(), self.dim)?;
+        let hits = match filter {
+            KeyFilter::Memories => self.memories.search(query, k)?,
+            KeyFilter::Chunks => self.chunks.search(query, k)?,
+            KeyFilter::Any => {
+                let mut hits = self.memories.search(query, k)?;
+                hits.extend(self.chunks.search(query, k)?);
+                hits.sort_by(|a, b| b.1.total_cmp(&a.1));
+                hits.truncate(k);
+                hits
+            }
+        };
+        Ok(hits
+            .into_iter()
+            .map(|(key, s)| (decode_key(key), s))
+            .collect())
+    }
+
+    pub fn len(&self) -> usize {
+        self.memories.len() + self.chunks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// True when the index has changed since it was created, opened or last saved.
+    pub fn is_dirty(&self) -> bool {
+        self.memories.is_dirty() || self.chunks.is_dirty()
+    }
+
+    /// Write `path.with_extension("memories.usearch")` and `path.with_extension("chunks.usearch")`,
+    /// each atomically. Both are always written, so the pair on disk never mixes two indexes.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        utf8(path)?;
+        let (memories, chunks) = part_paths(path);
+        self.memories.save(&memories)?;
+        self.chunks.save(&chunks)
+    }
 
     /// A fresh index holding every stored vector of `model`. Vectors that cannot be added
     /// (wrong dimension, out-of-range key) are skipped and counted in a warning.
     pub fn rebuild_from(conn: &Connection, model: &str, dim: usize) -> Result<Self> {
         let idx = Self::new(dim)?;
         let stored = embeddings::count(conn, model)?;
-        idx.ensure_capacity(&idx.inner.write(), stored)?;
         let mut failed = 0usize;
         let mut first_error = None;
         embeddings::for_each(conn, model, |key, v| {
@@ -298,6 +439,7 @@ impl VectorIndex {
         if failed > 0 {
             tracing::warn!(
                 failed,
+                stored,
                 first_error = first_error.as_deref().unwrap_or_default(),
                 "some vectors could not be added during rebuild"
             );
@@ -707,10 +849,7 @@ mod tests {
         idx.remove(VecKey::Memory(3)).unwrap();
         assert!(idx.is_dirty());
         idx.save(&path).unwrap();
-        assert!(
-            !path.with_extension("usearch.tmp").exists(),
-            "no temp file left behind"
-        );
+        assert!(no_temp_files(d.path()), "no temp file left behind");
         let back = VectorIndex::open(&path, 384).unwrap();
         assert!(!back.is_dirty());
         assert_eq!(back.len(), 9);
@@ -724,5 +863,282 @@ mod tests {
             VecKey::Memory(3)
         );
         assert!(VectorIndex::open(&path, 128).is_err(), "dimension mismatch");
+    }
+
+    fn no_temp_files(dir: &Path) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .all(|f| !f.unwrap().file_name().to_string_lossy().ends_with(".tmp"))
+    }
+
+    // Fix round 1: memories and chunks live in separate sub-indexes.
+
+    #[test]
+    fn memory_search_ignores_a_large_chunk_set() {
+        // Chunks are built to resemble the memory queries; a memory search must not see them.
+        let e = FakeEmbedder::new(384);
+        let idx = VectorIndex::new(384).unwrap();
+        let mems: Vec<_> = (0..50)
+            .map(|i| {
+                (
+                    VecKey::Memory(i),
+                    v(&e, &format!("memory note {i} about topic {i}")),
+                )
+            })
+            .collect();
+        idx.upsert_batch(&mems).unwrap();
+        let chunks: Vec<_> = (0..20_000)
+            .map(|i| {
+                (
+                    VecKey::Chunk(i),
+                    v(&e, &format!("memory note {i} about topic {i} chunk")),
+                )
+            })
+            .collect();
+        idx.upsert_batch(&chunks).unwrap();
+        assert_eq!((idx.memories.len(), idx.chunks.len()), (50, 20_000));
+        let q = v(&e, "memory note 7 about topic 7");
+        let hits = idx.search(&q, 100, KeyFilter::Memories).unwrap();
+        assert_eq!(hits.len(), 50, "every memory and nothing else");
+        assert!(hits.iter().all(|(k, _)| matches!(k, VecKey::Memory(_))));
+        assert_eq!(hits[0].0, VecKey::Memory(7));
+        let chunk_hits = idx.search(&q, 5, KeyFilter::Chunks).unwrap();
+        assert_eq!(chunk_hits[0].0, VecKey::Chunk(7));
+        assert!(
+            chunk_hits
+                .iter()
+                .all(|(k, _)| matches!(k, VecKey::Chunk(_)))
+        );
+    }
+
+    #[test]
+    fn any_merges_both_sub_indexes_best_first() {
+        use crate::embed::cosine;
+        let e = FakeEmbedder::new(384);
+        let idx = VectorIndex::new(384).unwrap();
+        let texts = [
+            (VecKey::Memory(1), "sqlite writer lease timeout"),
+            (VecKey::Chunk(1), "sqlite writer lease"),
+            (VecKey::Memory(2), "rust borrow checker lifetimes"),
+            (VecKey::Chunk(2), "tom yum soup recipe"),
+            (VecKey::Memory(3), "sqlite writer"),
+            (VecKey::Chunk(3), "kubernetes pod scheduling"),
+        ];
+        let items: Vec<_> = texts.iter().map(|(k, t)| (*k, v(&e, t))).collect();
+        idx.upsert_batch(&items).unwrap();
+        let q = v(&e, "sqlite writer lease");
+        let mut expected: Vec<(VecKey, f32)> =
+            items.iter().map(|(k, x)| (*k, cosine(&q, x))).collect();
+        expected.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let all = idx.search(&q, 10, KeyFilter::Any).unwrap();
+        assert_eq!(
+            all.iter().map(|(k, _)| *k).collect::<Vec<_>>()[..3],
+            expected.iter().map(|(k, _)| *k).collect::<Vec<_>>()[..3],
+            "{all:?} vs {expected:?}"
+        );
+        assert_eq!(all.len(), 6);
+        assert!(
+            all.windows(2).all(|w| w[0].1 >= w[1].1),
+            "best first: {all:?}"
+        );
+        assert_eq!(
+            idx.search(&q, 3, KeyFilter::Any).unwrap(),
+            all[..3].to_vec()
+        );
+        assert_eq!(
+            idx.search(&q, 1, KeyFilter::Any).unwrap()[0].0,
+            VecKey::Chunk(1)
+        );
+    }
+
+    #[test]
+    fn upsert_batch_splits_by_kind_replaces_and_validates_first() {
+        let e = FakeEmbedder::new(384);
+        let idx = VectorIndex::new(384).unwrap();
+        idx.upsert_batch(&[]).unwrap();
+        assert!(!idx.is_dirty(), "an empty batch changes nothing");
+        idx.upsert_batch(&[
+            (VecKey::Memory(1), v(&e, "alpha")),
+            (VecKey::Chunk(1), v(&e, "alpha")),
+            (VecKey::Memory(2), v(&e, "beta")),
+            (VecKey::Chunk(2), v(&e, "gamma")),
+        ])
+        .unwrap();
+        assert_eq!((idx.memories.len(), idx.chunks.len()), (2, 2));
+        idx.upsert_batch(&[
+            (VecKey::Memory(1), v(&e, "delta")),
+            (VecKey::Chunk(3), v(&e, "epsilon")),
+        ])
+        .unwrap();
+        assert_eq!((idx.memories.len(), idx.chunks.len()), (2, 3));
+        let hit = idx.search(&v(&e, "delta"), 1, KeyFilter::Memories).unwrap()[0];
+        assert_eq!(hit.0, VecKey::Memory(1));
+        assert!(hit.1 > 0.99, "the new vector replaced the old one");
+        // One bad item rejects the whole batch before anything is written.
+        assert!(matches!(
+            idx.upsert_batch(&[
+                (VecKey::Memory(9), v(&e, "ok")),
+                (VecKey::Chunk(9), vec![0.0; 10])
+            ]),
+            Err(AliceError::Invalid(_))
+        ));
+        assert!(matches!(
+            idx.upsert_batch(&[
+                (VecKey::Chunk(10), v(&e, "ok")),
+                (VecKey::Memory(-1), v(&e, "ok"))
+            ]),
+            Err(AliceError::Invalid(_))
+        ));
+        assert_eq!(idx.len(), 5);
+    }
+
+    #[test]
+    fn save_writes_two_files_and_open_needs_both() {
+        let e = FakeEmbedder::new(384);
+        let idx = VectorIndex::new(384).unwrap();
+        idx.upsert_batch(&[
+            (VecKey::Memory(1), v(&e, "sqlite writer lease")),
+            (VecKey::Chunk(1), v(&e, "tom yum soup recipe")),
+            (VecKey::Chunk(2), v(&e, "kubernetes pod scheduling")),
+        ])
+        .unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("vectors");
+        let path = dir.join("m.usearch");
+        idx.save(&path).unwrap();
+        let (mem, chunks) = (dir.join("m.memories.usearch"), dir.join("m.chunks.usearch"));
+        assert!(mem.exists() && chunks.exists());
+        assert!(!path.exists(), "only the two derived files are written");
+        assert!(no_temp_files(&dir));
+        let back = VectorIndex::open(&path, 384).unwrap();
+        assert_eq!((back.memories.len(), back.chunks.len()), (1, 2));
+        assert_eq!(
+            back.search(&v(&e, "tom yum soup recipe"), 1, KeyFilter::Any)
+                .unwrap()[0]
+                .0,
+            VecKey::Chunk(1)
+        );
+        assert_eq!(
+            back.search(&v(&e, "sqlite writer lease"), 1, KeyFilter::Memories)
+                .unwrap()[0]
+                .0,
+            VecKey::Memory(1)
+        );
+        std::fs::remove_file(&chunks).unwrap();
+        assert!(
+            VectorIndex::open(&path, 384).is_err(),
+            "chunks file missing"
+        );
+        idx.save(&path).unwrap();
+        std::fs::remove_file(&mem).unwrap();
+        assert!(
+            VectorIndex::open(&path, 384).is_err(),
+            "memories file missing"
+        );
+    }
+
+    #[test]
+    fn rebuild_fills_both_sub_indexes() {
+        use crate::store::{embeddings, open_writer};
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let e = FakeEmbedder::new(384);
+        for s in 1..=3 {
+            embeddings::put(
+                &c,
+                VecKey::Memory(s),
+                "fake",
+                &v(&e, &format!("memory {s}")),
+            )
+            .unwrap();
+        }
+        for s in 1..=5 {
+            embeddings::put(&c, VecKey::Chunk(s), "fake", &v(&e, &format!("chunk {s}"))).unwrap();
+        }
+        embeddings::put(&c, VecKey::Chunk(6), "fake", &[0.5; 8]).unwrap();
+        let idx = VectorIndex::rebuild_from(&c, "fake", 384).unwrap();
+        assert_eq!(
+            (idx.memories.len(), idx.chunks.len()),
+            (3, 5),
+            "the 8-dimension vector is skipped"
+        );
+    }
+
+    #[test]
+    fn memory_search_proceeds_while_a_chunk_batch_holds_the_chunk_write_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let e = Arc::new(FakeEmbedder::new(384));
+        let idx = Arc::new(VectorIndex::new(384).unwrap());
+        idx.upsert_batch(&[
+            (VecKey::Memory(1), v(&e, "sqlite writer lease")),
+            (VecKey::Chunk(1), v(&e, "sqlite writer lease")),
+        ])
+        .unwrap();
+        // The hook runs inside the batch, right after it takes the chunk write lock.
+        // Every wait is bounded, so a regression fails instead of hanging the test run.
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (release_rx, armed) = (Mutex::new(release_rx), AtomicBool::new(true));
+        *idx.chunks.after_write_lock.lock() = Some(Arc::new(move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                let _ = locked_tx.send(());
+                let _ = release_rx.lock().recv_timeout(Duration::from_secs(30));
+            }
+        }));
+        let batch = {
+            let (idx, e) = (idx.clone(), e.clone());
+            std::thread::spawn(move || {
+                idx.upsert_batch(&[
+                    (VecKey::Chunk(2), e.embed_query("chunk two").unwrap()),
+                    (VecKey::Chunk(3), e.embed_query("chunk three").unwrap()),
+                ])
+            })
+        };
+        locked_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the chunk batch never took the chunk write lock");
+        let q = v(&e, "sqlite writer lease");
+        let search = |filter: KeyFilter| {
+            let (tx, rx) = mpsc::channel();
+            let (idx, q) = (idx.clone(), q.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(idx.search(&q, 5, filter).unwrap());
+            });
+            rx
+        };
+        let memories = search(KeyFilter::Memories)
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a memory search must not wait for the chunk batch");
+        assert_eq!(memories[0].0, VecKey::Memory(1));
+        let chunks = search(KeyFilter::Chunks);
+        assert!(
+            chunks.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a chunk search does wait: the hook really holds the lock"
+        );
+        release_tx.send(()).unwrap(); // let the batch finish
+        batch.join().unwrap().unwrap();
+        *idx.chunks.after_write_lock.lock() = None;
+        assert_eq!(
+            chunks.recv_timeout(Duration::from_secs(10)).unwrap().len(),
+            3
+        );
+        assert_eq!(idx.len(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_are_invalid() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tempfile::tempdir().unwrap();
+        let bad = d
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"bad\xff.usearch"));
+        let idx = VectorIndex::new(384).unwrap();
+        assert!(matches!(idx.save(&bad), Err(AliceError::Invalid(_))));
+        assert!(matches!(
+            VectorIndex::open(&bad, 384),
+            Err(AliceError::Invalid(_))
+        ));
     }
 }
