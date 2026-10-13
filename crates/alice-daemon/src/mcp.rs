@@ -16,7 +16,7 @@ use rmcp::model::{
     PromptMessage, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
     ResourceContents, Role, ServerCapabilities, ServerConfig,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -147,11 +147,33 @@ pub struct RecallPromptArgs {
     pub query: String,
 }
 
-#[derive(Clone)]
+/// The client's first root for one connection.
+#[derive(Default)]
+struct RootCache {
+    /// Bumped by `roots/list_changed`, so an answer to an older question is not kept.
+    generation: u64,
+    /// `Some(dir)` once the client answered; `dir` is `None` when it named no local directory.
+    first: Option<Option<String>>,
+}
+
 pub struct AliceMcp {
     backend: Backend,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
+    /// rmcp keeps one handler per connection (the HTTP service clones one per session).
+    roots: parking_lot::Mutex<RootCache>,
+}
+
+impl Clone for AliceMcp {
+    /// A clone serves another connection, so it starts without a cached root.
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            tool_router: self.tool_router.clone(),
+            prompt_router: self.prompt_router.clone(),
+            roots: Default::default(),
+        }
+    }
 }
 
 fn text(s: impl Into<String>) -> CallToolResult {
@@ -186,14 +208,23 @@ impl AliceMcp {
             backend,
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
+            roots: Default::default(),
         }
     }
 
-    /// Working directory for project detection: the shim's cwd, else the client's first root, else none.
+    /// Working directory for project detection (spec §8.1): the client's first root when it
+    /// offers roots, else the shim's cwd, else none. An explicit `project` is applied later by
+    /// the service and wins over both.
     async fn cwd(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
-        if let Some(c) = self.backend.default_cwd() {
-            return Some(c);
+        if let Some(root) = self.first_root(ctx).await {
+            return Some(root);
         }
+        self.backend.default_cwd()
+    }
+
+    /// The client's first root as a local directory, asked once per connection and again after
+    /// `roots/list_changed`. A timeout or error is not cached: the next request asks again.
+    async fn first_root(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
         let offers_roots = ctx
             .peer
             .peer_info()
@@ -201,16 +232,29 @@ impl AliceMcp {
         if per_request(ctx) || !offers_roots {
             return None;
         }
+        let generation = {
+            let cache = self.roots.lock();
+            if let Some(first) = &cache.first {
+                return first.clone();
+            }
+            cache.generation
+        };
         let roots = tokio::time::timeout(ROOTS_TIMEOUT, ctx.peer.list_roots())
             .await
             .ok()?
             .ok()?;
-        let first = roots.roots.first()?;
-        url::Url::parse(&first.uri)
-            .ok()?
-            .to_file_path()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
+        let first = roots.roots.first().and_then(|r| {
+            url::Url::parse(&r.uri)
+                .ok()?
+                .to_file_path()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        });
+        let mut cache = self.roots.lock();
+        if cache.generation == generation {
+            cache.first = Some(first.clone());
+        }
+        first
     }
 
     /// The client's name, recorded as the memory's author.
@@ -395,6 +439,12 @@ impl ServerHandler for AliceMcp {
             .with_description("Alice context for the current project")
             .with_mime_type("text/plain");
         Ok(ListResourcesResult::with_all_items(vec![r]))
+    }
+
+    async fn on_roots_list_changed(&self, _ctx: NotificationContext<RoleServer>) {
+        let mut cache = self.roots.lock();
+        cache.generation += 1;
+        cache.first = None;
     }
 
     async fn read_resource(
