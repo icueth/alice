@@ -2,7 +2,7 @@
 //! operators in the query are treated as literal words.
 
 use super::stopwords::is_stopword;
-use crate::codetokens::{expand_code_tokens, is_codeish};
+use crate::codetokens::{expand_code_tokens, is_codeish, joined_names};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 
@@ -256,7 +256,8 @@ pub fn variant_terms(query: &str) -> Vec<String> {
     out.terms
 }
 
-/// Joined identifiers (`HostLinkReconnect` -> `hostlinkreconnect`) for exact code matches.
+/// Joined identifiers (`HostLinkReconnect` -> `hostlinkreconnect`) for exact code matches,
+/// plus the joined form of each multi-word name in a qualified one.
 pub fn code_terms(query: &str) -> Vec<String> {
     let mut out = TermList::new(MAX_TERMS);
     for tok in query.split(|c: char| c.is_whitespace() || c.is_control()) {
@@ -272,6 +273,11 @@ pub fn code_terms(query: &str) -> Vec<String> {
                     .collect::<String>()
                     .to_lowercase(),
             );
+            // Each multi-word name in a qualified identifier, joined: the index holds it for
+            // every form (`self.writer_lease` -> `writerlease`).
+            for name in joined_names(tok) {
+                out.push(name);
+            }
         }
     }
     out.terms
@@ -373,13 +379,15 @@ pub fn memory_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
 /// Raw-tier lists bound their cost per term. FTS5 computes BM25 for every row a query matches
 /// before it can return the best few: a word found in 40% of 1M chunks took ~300 ms per list.
 /// So every term that has a match gets its own share of the budget, max(k, `RAW_WINDOW` /
-/// number of such terms) rows, and is ranked by BM25 among its newest matches up to that share
-/// (FTS5 reads newest first and stops there): no term can crowd another out, and at most about
-/// `RAW_WINDOW` rows are scored in all. A term with at most its share of matches is ranked over
-/// all of them; matches beyond a term's share are not read (newest first: recall for very
-/// common terms is not exhaustive). A share of a single word costs 5–16 ms at 1M chunks; a
-/// phrase term (`writer_lease` is the phrase "writer lease") also reads its words' match lists
-/// once for BM25's IDF (~25 ms for three common words).
+/// number of such terms) rows, and reads its newest matches up to that share (FTS5 reads newest
+/// first and stops there); a chunk scores the sum of the BM25 parts of every term that read it.
+/// No term can crowd another out. Rows read per list: at most max(`RAW_WINDOW`, terms × k), so
+/// 5,000 for a few terms and up to 6,400 for the word list's 64 terms (32 words, 32 variants)
+/// with k = 100, or 25,600 with filters (k = 400). A term with at most its share of matches is
+/// ranked over all of them; matches beyond a term's share are not read (newest first: recall
+/// for very common terms is not exhaustive). A share of a single word costs 5–16 ms at 1M
+/// chunks. Phrase terms remain where unicode61 splits a word itself, such as a Thai word at its
+/// combining vowel and tone marks; each reads its pieces' match lists for BM25's IDF.
 pub const RAW_WINDOW: usize = 5_000;
 
 /// Rows each of `n` terms may read: an equal share of `window`, at least `k`.
@@ -400,8 +408,7 @@ fn has_match(conn: &Connection, table: &str, fts: &str) -> bool {
     })
 }
 
-/// `(rowid, score)` of the best `k` rows for one candidate query, best (lowest) score first.
-/// Never fails, like [`run`].
+/// `(rowid, score)` rows of one candidate query, `?2` bound to `k`. Never fails, like [`run`].
 fn scored(conn: &Connection, sql: &str, fts: &str, k: usize) -> Vec<(i64, f64)> {
     let result = (|| -> rusqlite::Result<Vec<(i64, f64)>> {
         let mut stmt = conn.prepare_cached(sql)?;
@@ -434,14 +441,16 @@ fn raw_bm25(
         .map(|t| wrap(quote(t)))
         .filter(|fts| has_match(conn, table, fts))
         .collect();
+    // Every row a term reads counts towards the sum (not only that term's own top k): a chunk
+    // holding all the query's words can be below every word's own top k and still be best.
+    let limit = share(window, present.len(), k);
     let newest_matches = format!(
-        "SELECT rowid, score FROM (SELECT rowid, bm25({table}{weights}) AS score FROM {table} \
-         WHERE {table} MATCH ?1 ORDER BY rowid DESC LIMIT {}) ORDER BY score LIMIT ?2",
-        share(window, present.len(), k)
+        "SELECT rowid, bm25({table}{weights}) FROM {table} \
+         WHERE {table} MATCH ?1 ORDER BY rowid DESC LIMIT ?2"
     );
     let mut total: HashMap<i64, f64> = HashMap::new();
     for fts in &present {
-        for (id, score) in scored(conn, &newest_matches, fts, k) {
+        for (id, score) in scored(conn, &newest_matches, fts, limit) {
             *total.entry(id).or_default() += score;
         }
     }
@@ -463,7 +472,9 @@ fn best_first(
 /// The terms of the raw word list: content words and their variants, without identifiers
 /// that hold `_`. Such an identifier is a phrase of its words here ("writer lease"), and BM25's
 /// IDF for a phrase of common words reads every match of each word with its positions (36–50 ms
-/// per term at 1M chunks); the identifier list holds it as one token, and its words stay here.
+/// per term at 1M chunks). The identifier list holds it as one token in every form it is written
+/// in (`self.lease_token_frame`, `LEASE_TOKEN_FRAME_LIMIT`, `lease-token-frame`, ... all carry
+/// `leasetokenframe`), with its own share there, and its words stay here.
 fn raw_word_terms(q: &str) -> Vec<String> {
     let mut terms = content_terms(q);
     terms.extend(variant_terms(q));
@@ -496,43 +507,60 @@ pub fn chunk_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
     chunk_code_in(conn, q, k, RAW_WINDOW)
 }
 
-/// Raw chunks holding query substrings. A term in a script without spaces (Thai, CJK), for
-/// which this is the only lexical list, reads its newest matches up to its own share of the
-/// window, max(k, `RAW_WINDOW` / number of such terms), so its rarity is measured up to that
-/// share. An ASCII term reads its newest k only: it also has its own share in the word list, and
-/// reading the share of a rare ASCII phrase (`lease_token_frame`, a made-up word) means scanning
-/// the intersection of common trigrams, 15–45 ms per term at 1M chunks. A chunk scores the sum,
+/// Raw chunks holding query substrings. A non-ASCII term (Thai, CJK, ...), for which this is
+/// the main lexical list, reads its newest matches up to its own share of the window,
+/// max(k, `RAW_WINDOW` / number of non-ASCII terms), so its rarity is measured up to that share.
+/// An ASCII term reads its newest k substring matches only: as a whole word it has its own
+/// share in the word list, or as an identifier in the identifier list (every written form
+/// carries its joined token), and reading the share of a rare ASCII phrase (`lease_token_frame`,
+/// a made-up word) means scanning the intersection of common trigrams, 15–45 ms per term at 1M
+/// chunks; its substring-only matches beyond the newest k are not read. A chunk scores the sum,
 /// over the terms that matched it, of 1 / that term's match count (capped at what it read): a
-/// chunk with a substring found in fewer chunks ranks above one with a more common substring,
-/// ties to the newer chunk. Matches beyond a term's limit are not read (newest first). Not
-/// BM25: its IDF needs every match of each phrase, 60–400 ms per list at 1M chunks. `k` is 100,
-/// or 400 when filters apply.
+/// chunk with a substring found in fewer chunks ranks above one with a more common substring.
+/// Ties are taken term by term (each term's newest match first, then each term's next), so two
+/// terms past their shares share the list. Not BM25: its IDF needs every match of each phrase,
+/// 60–400 ms per list at 1M chunks. `k` is 100, or 400 when filters apply.
 pub fn chunk_trigram(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
     chunk_trigram_in(conn, q, k, RAW_WINDOW)
 }
 
+/// A trigram candidate: summed weight, then (best position in a term's list, that term).
+type Ranked = (f64, (usize, usize));
+
 fn chunk_trigram_in(conn: &Connection, q: &str, k: usize, window: usize) -> Vec<i64> {
     let terms = trigram_terms(q);
-    let unspaced = terms.iter().filter(|t| !t.is_ascii()).count();
-    let mut total: HashMap<i64, f64> = HashMap::new();
-    for t in terms {
+    let non_ascii = terms.iter().filter(|t| !t.is_ascii()).count();
+    // Per chunk: summed weight, then (its best position in any term's newest-first list, that
+    // term's index) so that ties are taken term by term, round-robin.
+    let mut found: HashMap<i64, Ranked> = HashMap::new();
+    for (term, t) in terms.iter().enumerate() {
         let limit = if t.is_ascii() {
             k
         } else {
-            share(window, unspaced, k)
+            share(window, non_ascii, k)
         };
         let ids = run(
             conn,
             "SELECT rowid FROM chunks_tri WHERE chunks_tri MATCH ?1 ORDER BY rowid DESC LIMIT ?2",
-            Some(quote(&t)),
+            Some(quote(t)),
             limit,
         );
         let weight = 1.0 / ids.len().max(1) as f64;
-        for id in ids {
-            *total.entry(id).or_default() += weight;
+        for (pos, id) in ids.into_iter().enumerate() {
+            let e = found.entry(id).or_insert((0.0, (pos, term)));
+            e.0 += weight;
+            e.1 = e.1.min((pos, term));
         }
     }
-    best_first(total, k, |a, b| b.total_cmp(&a))
+    let mut v: Vec<(i64, Ranked)> = found.into_iter().collect();
+    v.sort_by(|a, b| {
+        b.1.0
+            .total_cmp(&a.1.0)
+            .then(a.1.1.cmp(&b.1.1))
+            .then(b.0.cmp(&a.0))
+    });
+    v.truncate(k);
+    v.into_iter().map(|(id, _)| id).collect()
 }
 
 /// Non-ASCII terms of 1–2 code points (e.g. Thai "จำ" = จ + ำ) are below the trigram minimum.
@@ -941,6 +969,80 @@ mod tests {
         let (_d, c, seqs) = chunks_db(&texts);
         let code = chunk_code_in(&c, "lease_token_frame", 3, 3);
         assert_eq!(code, vec![seqs[0]]);
+    }
+
+    /// Fix round 3 (N1): every row a term read counts towards the sum, not only its own top k.
+    /// Three words each fill short chunks that beat a long chunk holding all three on any single
+    /// word; with k = 2 that chunk is outside every word's own top 2, yet its summed BM25 is the
+    /// highest, so it must come first.
+    #[test]
+    fn a_chunk_with_every_query_word_is_summed_across_terms() {
+        let mut texts: Vec<String> = (0..20)
+            .map(|i| format!("plain{i} filler a b c d"))
+            .collect();
+        for w in ["aaa", "bbb", "ccc"] {
+            texts.extend((0..4).map(|i| format!("{w} s{i}")));
+        }
+        texts.push("aaa bbb ccc y1 y2 y3 y4 y5 y6 y7 y8 y9 y10".into());
+        let (_d, c, seqs) = chunks_db(&texts);
+        let all_three = *seqs.last().unwrap();
+        let found = chunk_words_in(&c, "aaa bbb ccc", 2, 5_000);
+        assert_eq!(found.first(), Some(&all_three), "{found:?}");
+    }
+
+    /// Fix round 3 (T3): two non-ASCII terms that both have more matches than their share tie
+    /// (each counts as 1 / share); ties are interleaved term by term, so the term with older
+    /// matches is not crowded out by the one with newer matches.
+    #[test]
+    fn tied_trigram_terms_are_interleaved() {
+        let mut texts: Vec<String> = (0..8).map(|i| format!("สัญญาเช่าบ้าน b{i}")).collect();
+        texts.extend((0..8).map(|i| format!("ภาษาไทย a{i}")));
+        let (_d, c, seqs) = chunks_db(&texts);
+        // window 8 over two terms: a share of 4 each, below their 8 matches.
+        let found = chunk_trigram_in(&c, "ภาษาไทย สัญญาเช่าบ้าน", 4, 8);
+        let older = found.iter().filter(|s| seqs[..8].contains(s)).count();
+        assert_eq!((found.len(), older), (4, 2), "{found:?}");
+    }
+
+    /// Fix round 3 (N2): the identifier list finds every qualified or compound form of an
+    /// identifier, old as they are, while newer chunks fill the common words' shares.
+    #[test]
+    fn the_identifier_list_finds_qualified_and_compound_forms() {
+        let forms = [
+            "self.lease_token_frame = None",
+            "see store/lease_token_frame.rs for details",
+            "the LEASE_TOKEN_FRAME_LIMIT constant",
+            "crate::daemon::lease_token_frame()",
+            "a lease-token-frame mismatch",
+        ];
+        let mut texts: Vec<String> = forms.iter().map(|f| f.to_string()).collect();
+        texts.extend((0..30).map(|i| format!("bug fix lease token frame note{i}")));
+        let (_d, c, seqs) = chunks_db(&texts);
+        let found = chunk_code_in(&c, "lease_token_frame bug fix", 5, 10);
+        for (i, form) in forms.iter().enumerate() {
+            assert!(found.contains(&seqs[i]), "{form}: {found:?}");
+        }
+    }
+
+    /// Fix round 3 (N2): a qualified identifier in a query also searches the joined form of
+    /// each multi-word name in it, so `crate::daemon::lease_token_frame` finds a bare
+    /// `lease_token_frame`.
+    #[test]
+    fn qualified_query_identifiers_also_search_their_names() {
+        let terms = code_terms("crate::daemon::lease_token_frame() self.writer_lease");
+        for want in [
+            "cratedaemonleasetokenframe",
+            "leasetokenframe",
+            "selfwriterlease",
+            "writerlease",
+        ] {
+            assert!(terms.contains(&want.to_string()), "{want} in {terms:?}");
+        }
+        assert!(!terms.contains(&"crate".to_string()), "{terms:?}");
+        assert_eq!(
+            code_terms("lease-token-frame"),
+            vec!["leasetokenframe".to_string()]
+        );
     }
 
     /// Terms without a match do not take a share: with four absent words beside two present
