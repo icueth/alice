@@ -69,14 +69,12 @@ fn main() -> std::process::ExitCode {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
         .init();
-    #[cfg(unix)]
-    if !is_server {
-        // `alice recall … | head` must not panic on a closed pipe.
-        // SAFETY: restoring the default disposition before any output is written.
-        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
-    }
+    // SIGPIPE stays ignored (Rust's default): with the default action, a write to a daemon
+    // that died mid-request would kill a command before it could spool. A closed stdout
+    // (`alice recall … | head`) comes back as `StdoutClosed` instead and ends quietly.
     match cmd::dispatch(cli.command, cli.json) {
         Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) if e.chain().any(|c| c.is::<cmd::StdoutClosed>()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("alice: {e:#}");
             std::process::ExitCode::FAILURE

@@ -665,26 +665,132 @@ fn daemon_start_waits_while_a_live_process_holds_the_lock() {
     );
 }
 
-/// `alice recall … | head` must end quietly when the reader goes away.
+/// `alice recall … | head` must end quietly when the reader goes away: no panic, and no death
+/// by SIGPIPE either (review finding m-1). SIGPIPE stays ignored in every command, because
+/// with the default action a write to a daemon that died mid-request (a socket) would kill
+/// `alice remember` on Linux before it could spool; a closed stdout ends the command quietly.
 #[test]
 fn a_closed_stdout_ends_the_cli_quietly() {
     let e = Env::new();
     std::fs::create_dir_all(e.home.join("logs")).unwrap();
     std::fs::write(e.home.join("logs/daemon.log"), "a log line\n".repeat(500)).unwrap();
-    let mut child = e
-        .cmd(&["daemon", "logs"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    drop(child.stdout.take());
-    let o = child.wait_with_output().unwrap();
-    let err = String::from_utf8_lossy(&o.stderr);
+    for args in [&["daemon", "logs"][..], &["--json", "status"], &["status"]] {
+        let mut child = e
+            .cmd(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdout.take());
+        let o = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            !err.contains("panicked") && o.status.code() != Some(101),
+            "{args:?}: {}: {err}",
+            o.status
+        );
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{args:?}: ended by {} (a signal, if no code), not a quiet exit: {err}",
+            o.status
+        );
+        assert!(err.is_empty(), "{args:?}: {err}");
+    }
+}
+
+/// A stand-in daemon for `home` that proves the token on ping and resets every other request
+/// as soon as it has read its headers, as a daemon killed while reading a request would.
+/// Returns how many requests it reset.
+fn dying_daemon(home: &std::path::Path) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const INSTANCE: &str = "01K7DYINGDAEMON00000000000";
+    let token = "d".repeat(64);
+    std::fs::write(home.join("token"), &token).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::fs::write(
+        home.join("daemon.json"),
+        serde_json::json!({"pid": std::process::id(), "port": port, "instance": INSTANCE,
+            "version": "t", "started_at": "t"})
+        .to_string(),
+    )
+    .unwrap();
+    let resets = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = resets.clone();
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            if let Some(nonce) = head
+                .strip_prefix("GET /api/v1/ping?nonce=")
+                .and_then(|r| r.split_whitespace().next())
+            {
+                let proof = alice_daemon::discovery::ping_proof(&token, nonce, INSTANCE);
+                let body = serde_json::json!({"service": "alice", "instance": INSTANCE,
+                    "version": "t", "proof": proof})
+                .to_string();
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                continue;
+            }
+            // Linger 0: closing sends a reset, and the body still on its way hits a dead socket.
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // SAFETY: setting a socket option on a socket this thread owns.
+            unsafe {
+                libc::setsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&linger as *const libc::linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                );
+            }
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(s);
+        }
+    });
+    resets
+}
+
+/// Review finding m-1: a daemon that dies while it reads a `remember` (here: a reset while the
+/// body is still being sent) leaves the client a broken socket. The write is spooled and the
+/// reply says why; the command is not killed (on Linux SIGPIPE used to end it first).
+#[test]
+fn a_daemon_dying_mid_request_leaves_the_write_spooled() {
+    let e = Env::new();
+    let resets = dying_daemon(&e.home);
+    let content = format!("sent to a dying daemon {}", "x".repeat(60_000));
+    let o = e.run(&["remember", &content]);
     assert!(
-        !err.contains("panicked") && o.status.code() != Some(101),
-        "{}: {err}",
-        o.status
+        o.status.success(),
+        "{}: {}",
+        o.status,
+        String::from_utf8_lossy(&o.stderr)
     );
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.starts_with("Queued: ") && out.contains("stopped answering"),
+        "{out}"
+    );
+    assert!(resets.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    assert_eq!(spooled(&e), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

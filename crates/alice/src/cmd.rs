@@ -12,7 +12,7 @@ use alice_daemon::paths::AliceHome;
 use alice_daemon::startup::{self, lock_free, lock_pid, pid_alive};
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -228,13 +228,36 @@ fn kind(s: &Option<String>) -> Result<Option<Kind>> {
     s.as_deref().map(parse_kind).transpose()
 }
 
+/// Stdout was closed by its reader (`alice recall … | head`): the command ends quietly.
+#[derive(Debug)]
+pub struct StdoutClosed;
+
+impl std::fmt::Display for StdoutClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout was closed")
+    }
+}
+
+impl std::error::Error for StdoutClosed {}
+
+/// Write `text` to stdout; a closed stdout is `StdoutClosed`, not a panic (as `print!` would).
+pub(crate) fn out(text: &str) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Err(StdoutClosed.into()),
+        r => Ok(r?),
+    }
+}
+
 fn print<T: serde::Serialize>(json: bool, value: &T, text: impl FnOnce() -> String) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        out(&format!("{}\n", serde_json::to_string_pretty(value)?))
     } else {
-        print!("{}", text());
+        out(&text())
     }
-    Ok(())
 }
 
 async fn client(home: &AliceHome) -> Result<DaemonClient> {
@@ -466,10 +489,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
             let path = home.logs_dir().join("daemon.log");
             let lines = log_tail(&path, LOG_LINES)
                 .with_context(|| format!("cannot read the daemon log {}", path.display()))?;
-            for l in &lines {
-                println!("{l}");
-            }
-            Ok(())
+            out(&lines.iter().map(|l| format!("{l}\n")).collect::<String>())
         }
         Command::Daemon(DaemonCmd::Run) | Command::Mcp | Command::Model(_) | Command::Bench(_) => {
             unreachable!("handled in dispatch")

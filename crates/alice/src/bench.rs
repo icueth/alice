@@ -521,11 +521,10 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
             .with_context(|| format!("cannot write {}", path.display()))?;
     }
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        crate::cmd::out(&format!("{}\n", serde_json::to_string_pretty(&report)?))
     } else {
-        print!("{text}");
+        crate::cmd::out(&text)
     }
-    Ok(())
 }
 
 fn embed_throughput(e: &dyn Embedder, corpus: &mut Corpus) -> Result<f64> {
