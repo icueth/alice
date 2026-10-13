@@ -21,7 +21,7 @@ CREATE TABLE project_aliases (
 );
 
 CREATE TABLE memories (
-  seq             INTEGER PRIMARY KEY,   -- rowid; FTS and vector keys use it
+  seq             INTEGER PRIMARY KEY AUTOINCREMENT,   -- rowid; FTS and vector keys use it, so never reused
   id              TEXT NOT NULL UNIQUE,
   project_id      TEXT NOT NULL REFERENCES projects(id),
   kind            TEXT NOT NULL,
@@ -71,7 +71,7 @@ CREATE TABLE sources (
 );
 
 CREATE TABLE chunks (
-  seq          INTEGER PRIMARY KEY,
+  seq          INTEGER PRIMARY KEY AUTOINCREMENT,
   id           TEXT NOT NULL UNIQUE,
   source_id    TEXT NOT NULL REFERENCES sources(id),
   project_id   TEXT NOT NULL REFERENCES projects(id),

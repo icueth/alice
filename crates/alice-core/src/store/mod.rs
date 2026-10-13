@@ -234,4 +234,86 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
     }
+
+    #[test]
+    fn a_database_from_a_newer_build_is_refused_untouched() {
+        let (d, path) = temp_db();
+        drop(open_writer(&path).unwrap());
+        let newer = migrations::CURRENT_VERSION + 1;
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, '2027-01-01T00:00:00.000Z')",
+                [newer],
+            )
+            .unwrap();
+        let expected = format!(
+            "database schema v{newer} is newer than this build (v{}); upgrade Alice",
+            migrations::CURRENT_VERSION
+        );
+
+        match open_writer(&path) {
+            Err(AliceError::ReadOnly(msg)) => assert_eq!(msg, expected),
+            other => panic!("open_writer: expected ReadOnly, got {other:?}"),
+        }
+        let mut conn = Connection::open(&path).unwrap();
+        match migrations::migrate(&mut conn, &path) {
+            Err(AliceError::ReadOnly(msg)) => assert_eq!(msg, expected),
+            other => panic!("migrate: expected ReadOnly, got {other:?}"),
+        }
+
+        assert!(pre_migration_backups(d.path()).is_empty());
+        let versions: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(versions, vec![migrations::CURRENT_VERSION, newer]);
+    }
+
+    #[test]
+    fn purged_seqs_are_never_reused() {
+        let (_d, path) = temp_db();
+        let conn = open_writer(&path).unwrap();
+        let add_memory = |id: &str| -> i64 {
+            conn.execute(
+                "INSERT INTO memories (id, project_id, kind, title, body, status, content_hash, created_at, updated_at, hlc)
+                 VALUES (?1, '00000000000000000000GLOBAL', 'note', 't', 'b', 'active', ?1,
+                         '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z', 'h')",
+                [id],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        add_memory("m1");
+        let purged = add_memory("m2");
+        conn.execute("DELETE FROM memories WHERE seq = ?1", [purged])
+            .unwrap();
+        let next = add_memory("m3");
+        assert!(next > purged, "memories.seq {purged} was reused");
+
+        conn.execute(
+            "INSERT INTO sources (id, project_id, type, uri, created_at)
+             VALUES ('s1', '00000000000000000000GLOBAL', 'file', 'f', '2026-10-13T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        let add_chunk = |ord: i64| -> i64 {
+            conn.execute(
+                "INSERT INTO chunks (id, source_id, project_id, ord, text, content_hash, created_at)
+                 VALUES ('c' || ?1, 's1', '00000000000000000000GLOBAL', ?1, 't', 'h', '2026-10-13T00:00:00.000Z')",
+                [ord],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        add_chunk(1);
+        let purged = add_chunk(2);
+        conn.execute("DELETE FROM chunks WHERE seq = ?1", [purged])
+            .unwrap();
+        let next = add_chunk(3);
+        assert!(next > purged, "chunks.seq {purged} was reused");
+    }
 }

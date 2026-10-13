@@ -1,6 +1,6 @@
 //! Forward-only, numbered migrations. A backup is taken before migrating an existing database.
 
-use crate::error::Result;
+use crate::error::{AliceError, Result};
 use crate::ids::now_rfc3339;
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
@@ -22,6 +22,11 @@ pub fn migrate(conn: &mut Connection, db_path: &Path) -> Result<usize> {
         stmt.query_map([], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?
     };
+    if let Some(&newest) = applied.iter().filter(|&&v| v > CURRENT_VERSION).max() {
+        return Err(AliceError::ReadOnly(format!(
+            "database schema v{newest} is newer than this build (v{CURRENT_VERSION}); upgrade Alice"
+        )));
+    }
     let todo: Vec<&(i64, &str)> = MIGRATIONS
         .iter()
         .filter(|(v, _)| !applied.contains(v))
