@@ -3,6 +3,7 @@
 pub mod fusion;
 pub mod lexical;
 pub mod pack;
+pub mod stopwords;
 
 use crate::api::{Hit, MatchVia, RelatedRef, Tier};
 use crate::embed::Embedder;
@@ -26,6 +27,8 @@ const FILTERED_CANDIDATES: usize = 400;
 /// A word list shorter than this also brings in trigram candidates (spec §4.4 step 1).
 const SHORT_LIST: usize = 10;
 const SNIPPET_CHARS: usize = 240;
+/// Only the start of a longer query is searched and embedded (the e5 window is 512 tokens).
+const MAX_QUERY_CHARS: usize = 2_000;
 const MAX_RELATED: usize = 5;
 
 #[derive(Debug, Clone, Default)]
@@ -284,11 +287,14 @@ pub fn run(
     p: &SearchParams,
     now: DateTime<Utc>,
 ) -> Result<SearchOutput> {
-    let normalized = nfc(p.query.trim());
+    let mut normalized = nfc(p.query.trim());
     if normalized.is_empty() {
         return Err(AliceError::invalid(
             "query is empty; pass keywords or a question",
         ));
+    }
+    if let Some((cut, _)) = normalized.char_indices().nth(MAX_QUERY_CHARS) {
+        normalized.truncate(cut);
     }
     let limit = p.limit.clamp(1, limits::MAX_RECALL_LIMIT);
     let topics: Vec<String> = p.topics.iter().filter_map(|t| normalize_topic(t)).collect();
@@ -339,6 +345,8 @@ pub fn run(
         signals.extend(sig);
     }
     // Only relevant results are returned: a lexical match or vector similarity >= relevance_floor.
+    // The lexical lists search content terms only (English stopwords are left out whenever the
+    // query has other words), so a lexical match is a content-term match.
     let mut ranked: Vec<Scored> = filters
         .score(conn, &scores, &signals)?
         .into_iter()
@@ -359,7 +367,7 @@ pub fn run(
     }
     ranked.truncate(limit);
 
-    let mut terms = lexical::word_terms(&normalized);
+    let mut terms = lexical::content_terms(&normalized);
     terms.extend(lexical::variant_terms(&normalized));
     let mut memory_seqs = Vec::new();
     let mut memory_ids = Vec::new();
@@ -872,6 +880,49 @@ mod tests {
             ..f.params("frobnicator")
         });
         assert!(res.hits.is_empty());
+    }
+
+    #[test]
+    fn sharing_only_stopwords_is_not_relevant() {
+        let f = fx();
+        f.add(&f.app, Kind::Note, "what is the plan for the move");
+        let out = f.search(&f.params("what is the frobnicator"));
+        assert!(out.hits.is_empty(), "{:?}", out.hits);
+        let (text, _) = pack::pack_text(&out, Some("app"), 1500);
+        assert!(text.contains("No memories matched"), "{text}");
+        f.chunk(&f.app, "s1", "frobnicator calibration notes");
+        let out = f.search(&f.params("what is the frobnicator"));
+        assert!(out.raw_fallback, "the raw fallback fires");
+        assert!(!out.hits.is_empty() && out.hits.iter().all(|h| h.tier == Tier::Raw));
+        // A query made only of stopwords still finds a memory that contains them.
+        let out = f.search(&f.params("what is the"));
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].tier, Tier::Knowledge);
+    }
+
+    #[test]
+    fn huge_queries_use_their_first_2000_characters() {
+        let f = fx();
+        let (id, _) = f.add(&f.app, Kind::Fact, "frobnicator calibration");
+        let filler = "zz ".repeat(1_000);
+        assert!(
+            f.search(&f.params(&format!("{filler}frobnicator")))
+                .hits
+                .is_empty(),
+            "words after 2,000 characters are not searched"
+        );
+        assert_eq!(
+            f.search(&f.params(&format!("frobnicator {filler}"))).hits[0].id,
+            id
+        );
+        let wall: String = (0..20_000).map(|i| format!("w{i}x ")).collect();
+        let t = std::time::Instant::now();
+        f.search(&f.params(&wall));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     #[test]

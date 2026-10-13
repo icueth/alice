@@ -1,8 +1,10 @@
 //! FTS5 query construction and candidate retrieval. Every user term is quoted, so FTS5
 //! operators in the query are treated as literal words.
 
+use super::stopwords::is_stopword;
 use crate::codetokens::{expand_code_tokens, is_codeish};
 use rusqlite::Connection;
+use std::collections::HashSet;
 
 /// Most terms one query sends to an index; longer queries keep their first terms.
 const MAX_TERMS: usize = 32;
@@ -25,14 +27,43 @@ pub fn or_query(terms: &[String]) -> Option<String> {
     })
 }
 
-fn push_unique(out: &mut Vec<String>, w: String) {
-    if !w.is_empty()
-        && w.chars().count() <= MAX_TERM_CHARS
-        && w.chars().any(char::is_alphanumeric)
-        && !out.contains(&w)
-    {
-        out.push(w);
+/// Terms in first-seen order without duplicates. It stops accepting at `cap`, so builders can
+/// stop reading the query: building is linear in the part of the query actually used.
+struct TermList {
+    terms: Vec<String>,
+    seen: HashSet<String>,
+    cap: usize,
+}
+
+impl TermList {
+    fn new(cap: usize) -> Self {
+        Self {
+            terms: Vec::new(),
+            seen: HashSet::new(),
+            cap,
+        }
     }
+
+    fn is_full(&self) -> bool {
+        self.terms.len() >= self.cap
+    }
+
+    /// Keeps a non-empty term of at most `MAX_TERM_CHARS` with a letter or digit, once.
+    fn push(&mut self, w: String) {
+        if !self.is_full()
+            && !w.is_empty()
+            && w.chars().count() <= MAX_TERM_CHARS
+            && w.chars().any(char::is_alphanumeric)
+            && !self.seen.contains(&w)
+        {
+            self.seen.insert(w.clone());
+            self.terms.push(w);
+        }
+    }
+}
+
+fn longer_than(s: &str, chars: usize) -> bool {
+    s.chars().nth(chars).is_some()
 }
 
 /// Word separators for the unicode61 terms: whitespace, control characters and ASCII
@@ -49,17 +80,46 @@ fn pieces(query: &str) -> impl Iterator<Item = &str> {
         .filter(|w| !w.is_empty())
 }
 
-/// Lowercase words for the unicode61 index plus identifier parts. At most 32 terms.
-pub fn word_terms(query: &str) -> Vec<String> {
-    let mut out = Vec::new();
+/// Words, then identifier parts, that pass `keep`; at most 32.
+fn collect_words(query: &str, keep: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = TermList::new(MAX_TERMS);
     for w in query.split(is_word_separator) {
-        push_unique(&mut out, w.trim().to_lowercase());
+        if out.is_full() {
+            return out.terms;
+        }
+        let w = w.trim();
+        if !longer_than(w, MAX_TERM_CHARS) {
+            let w = w.to_lowercase();
+            if keep(&w) {
+                out.push(w);
+            }
+        }
     }
     for w in expand_code_tokens(query).split(' ') {
-        push_unique(&mut out, w.to_string());
+        if out.is_full() {
+            break;
+        }
+        if keep(w) {
+            out.push(w.to_string());
+        }
     }
-    out.truncate(MAX_TERMS);
-    out
+    out.terms
+}
+
+/// Lowercase words for the unicode61 index plus identifier parts. At most 32 terms.
+pub fn word_terms(query: &str) -> Vec<String> {
+    collect_words(query, |_| true)
+}
+
+/// The terms the unicode61 lists search: `word_terms` without English stopwords, or all of
+/// `word_terms` when the query has nothing but stopwords. At most 32 terms.
+pub fn content_terms(query: &str) -> Vec<String> {
+    let content = collect_words(query, |w| !is_stopword(w));
+    if content.is_empty() {
+        word_terms(query)
+    } else {
+        content
+    }
 }
 
 fn is_vowel(c: u8) -> bool {
@@ -162,46 +222,51 @@ fn english_forms(b: &str) -> Vec<String> {
     out
 }
 
-/// Other regular forms of the plain English words in the query (`replies` -> `reply`,
+/// Other regular forms of the plain English content words in the query (`replies` -> `reply`,
 /// `deploy` -> `deploys`, `deployed`, `deploying`), because the unicode61 index does not stem.
-/// Only lowercase or capitalised ASCII words of four or more letters are inflected;
-/// identifiers, acronyms, numbers and other scripts are left alone. Terms already returned by
-/// `word_terms` are not repeated. At most 32 terms.
+/// Only lowercase or capitalised ASCII words of four or more letters that are not stopwords are
+/// inflected; identifiers, acronyms, numbers and other scripts are left alone. Query words and
+/// stopwords are never returned. At most 32 terms.
 pub fn variant_terms(query: &str) -> Vec<String> {
-    let words = word_terms(query);
-    let mut out = Vec::new();
+    let words: HashSet<String> = word_terms(query).into_iter().collect();
+    let mut out = TermList::new(MAX_TERMS);
     for raw in query.split(is_word_separator) {
-        let plain = raw.len() >= 4
+        if out.is_full() {
+            break;
+        }
+        let plain = (4..=MAX_TERM_CHARS).contains(&raw.len())
             && raw.bytes().all(|c| c.is_ascii_alphabetic())
             && raw.bytes().skip(1).all(|c| c.is_ascii_lowercase());
         if !plain {
             continue;
         }
         let w = raw.to_ascii_lowercase();
-        let mut candidates = Vec::new();
-        for base in english_bases(&w) {
-            candidates.push(base.clone());
-            candidates.extend(english_forms(&base));
+        if is_stopword(&w) {
+            continue;
         }
-        for v in candidates {
-            if v.len() >= 3 && v != w && !words.contains(&v) {
-                push_unique(&mut out, v);
+        for base in english_bases(&w) {
+            let forms = english_forms(&base);
+            for v in std::iter::once(base).chain(forms) {
+                if v.len() >= 3 && v != w && !words.contains(&v) && !is_stopword(&v) {
+                    out.push(v);
+                }
             }
         }
     }
-    out.truncate(MAX_TERMS);
-    out
+    out.terms
 }
 
 /// Joined identifiers (`HostLinkReconnect` -> `hostlinkreconnect`) for exact code matches.
 pub fn code_terms(query: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out = TermList::new(MAX_TERMS);
     for tok in query.split(|c: char| c.is_whitespace() || c.is_control()) {
+        if out.is_full() {
+            break;
+        }
         let tok = tok
             .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '/' && c != '.');
         if tok.len() >= 3 && is_codeish(tok) {
-            push_unique(
-                &mut out,
+            out.push(
                 tok.chars()
                     .filter(char::is_ascii_alphanumeric)
                     .collect::<String>()
@@ -209,29 +274,42 @@ pub fn code_terms(query: &str) -> Vec<String> {
             );
         }
     }
-    out.truncate(MAX_TERMS);
-    out
+    out.terms
 }
 
 /// Substring terms for the trigram index: whitespace-separated pieces of at least 3 characters.
 /// Non-ASCII pieces always qualify; ASCII pieces only in queries of one or two words, so long
-/// English questions rely on the word index.
+/// English questions rely on the word index, and never English stopwords (`the` is a substring
+/// of nearly every text).
 pub fn trigram_terms(query: &str) -> Vec<String> {
-    let short_query = query.split_whitespace().count() <= 2;
-    let mut out = Vec::new();
+    let short_query = query.split_whitespace().nth(2).is_none();
+    let mut out = TermList::new(MAX_TERMS);
     for w in pieces(query) {
-        let w: String = w.to_lowercase().chars().take(MAX_TERM_CHARS).collect();
-        if w.chars().count() >= 3 && (!w.is_ascii() || short_query) {
-            push_unique(&mut out, w);
+        if out.is_full() {
+            break;
+        }
+        // Cut before and after lowercasing: lowercase can add characters (`İ`).
+        let lower = w
+            .chars()
+            .take(MAX_TERM_CHARS)
+            .collect::<String>()
+            .to_lowercase();
+        let w: String = lower.chars().take(MAX_TERM_CHARS).collect();
+        let usable = if w.is_ascii() {
+            short_query && !is_stopword(&w)
+        } else {
+            true
+        };
+        if usable && w.chars().count() >= 3 {
+            out.push(w);
         }
     }
-    out.truncate(MAX_TERMS);
-    out
+    out.terms
 }
 
 /// Trigram search helps scripts without spaces and very short queries.
 pub fn should_use_trigram(query: &str) -> bool {
-    !query.is_ascii() || query.split_whitespace().count() <= 2
+    !query.is_ascii() || query.split_whitespace().nth(2).is_none()
 }
 
 /// Run one candidate query. Never fails: an FTS error is logged and means no matches.
@@ -253,9 +331,10 @@ fn run(conn: &Connection, sql: &str, fts_query: Option<String>, k: usize) -> Vec
     }
 }
 
-/// Words of the query and their English variants, for the unicode61 indexes.
+/// Content words of the query and their English variants, for the unicode61 indexes. Because
+/// stopwords are left out whenever the query has other words, a hit here is a content match.
 fn words_query(q: &str) -> Option<String> {
-    let mut terms = word_terms(q);
+    let mut terms = content_terms(q);
     terms.extend(variant_terms(q));
     or_query(&terms)
 }
@@ -319,16 +398,18 @@ pub fn chunk_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
 }
 
 /// Non-ASCII terms of 1–2 code points (e.g. Thai "จำ" = จ + ำ) are below the trigram minimum.
+/// At most 8 terms.
 pub fn short_terms(query: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out = TermList::new(8);
     for w in pieces(query) {
-        let w = w.to_lowercase();
-        if !w.is_ascii() && (1..3).contains(&w.chars().count()) {
-            push_unique(&mut out, w);
+        if out.is_full() {
+            break;
+        }
+        if !w.is_ascii() && !longer_than(w, 2) {
+            out.push(w.to_lowercase());
         }
     }
-    out.truncate(8);
-    out
+    out.terms
 }
 
 fn like_pattern(term: &str) -> String {
@@ -450,6 +531,81 @@ mod tests {
         let many = "alpha bravo charlie delta echoes foxtrot golfing hotel india juliet kilos lima";
         assert!(word_terms(many).len() + variant_terms(many).len() <= 64);
         assert!(!variant_terms("added").contains(&"ad".to_string()));
+    }
+
+    #[test]
+    fn term_builders_stop_at_the_cap_on_huge_queries() {
+        // Thousands of distinct words: English-like, Thai and identifiers.
+        let latin = |mut i: usize| {
+            let mut w = String::new();
+            for _ in 0..5 {
+                w.push((b'a' + (i % 26) as u8) as char);
+                i /= 26;
+            }
+            w
+        };
+        let thai = |mut i: usize| {
+            let mut w = String::new();
+            for _ in 0..4 {
+                w.push(char::from_u32(0x0E01 + (i % 40) as u32).unwrap());
+                i /= 40;
+            }
+            w
+        };
+        let mut q = String::new();
+        for i in 0..5_000 {
+            q.push_str(&format!("{} {} v{i}Frame ", latin(i), thai(i)));
+        }
+        let t = std::time::Instant::now();
+        let sizes = [
+            word_terms(&q).len(),
+            variant_terms(&q).len(),
+            code_terms(&q).len(),
+            trigram_terms(&q).len(),
+            content_terms(&q).len(),
+            short_terms(&q).len(),
+        ];
+        let took = t.elapsed();
+        assert_eq!(sizes[..5], [MAX_TERMS; 5], "{sizes:?}");
+        assert!(sizes[5] <= MAX_TERMS);
+        assert!(took < std::time::Duration::from_millis(200), "{took:?}");
+    }
+
+    #[test]
+    fn stopwords_leave_the_lists_when_content_remains() {
+        assert_eq!(
+            content_terms("why do diary writes time out"),
+            vec!["diary".to_string(), "writes".into(), "time".into()]
+        );
+        assert_eq!(
+            word_terms("why do diary writes time out").len(),
+            6,
+            "word_terms keeps every word"
+        );
+        assert_eq!(
+            content_terms("what is this"),
+            word_terms("what is this"),
+            "only stopwords: all are kept"
+        );
+        let v = variant_terms("which replies does");
+        assert!(v.contains(&"reply".to_string()), "{v:?}");
+        assert!(
+            v.iter()
+                .all(|t| !t.starts_with("which") && t != "doing" && t != "do"),
+            "variants only for content words: {v:?}"
+        );
+        assert_eq!(trigram_terms("the api"), vec!["api".to_string()]);
+        assert!(trigram_terms("what is").is_empty());
+        assert_eq!(trigram_terms("ไทย the"), vec!["ไทย".to_string()]);
+        let (_d, c) = db_with(&["what is the plan for the move", "frobnicator calibration"]);
+        assert_eq!(memory_words(&c, "what is the frobnicator", 10).len(), 1);
+        assert_eq!(chunk_words(&c, "what is the frobnicator", 10).len(), 0);
+        assert_eq!(
+            memory_words(&c, "what is the", 10).len(),
+            1,
+            "only stopwords still match"
+        );
+        assert!(memory_trigram(&c, "the api", 10).is_empty());
     }
 
     #[test]

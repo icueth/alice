@@ -81,11 +81,14 @@ fn header(i: usize, h: &Hit) -> String {
 }
 
 /// One result: header, title, then the text without a leading copy of the title (a title
-/// derived from the first line would otherwise be shown twice).
+/// derived from the first line would otherwise be shown twice). The copy is removed only when
+/// it ends at a word boundary: a derived title is cut at 80 characters, possibly mid-word, and
+/// an explicit title may be a prefix of the first word ("Use" / "User sessions").
 fn block(i: usize, h: &Hit, text: &str) -> String {
-    let rest = text
-        .strip_prefix(h.title.as_str())
-        .map_or(text, str::trim_start);
+    let rest = match text.strip_prefix(h.title.as_str()) {
+        Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => r.trim_start(),
+        _ => text,
+    };
     if rest.is_empty() {
         format!("{}{}\n\n", header(i, h), h.title)
     } else {
@@ -357,6 +360,34 @@ mod tests {
             assert_eq!(text.matches("port is 9090").count(), 1, "{text}");
             assert_eq!(text.matches("Use WAL mode").count(), 1, "{text}");
             assert!(text.contains("because readers must not block"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_title_is_only_removed_at_a_word_boundary() {
+        // A derived title is the first 80 characters: it can end inside a word.
+        let long = "Hub writer lease held during transcript mining caused 120 s diary timeouts; mining now runs off the writer";
+        let mut derived = hit(0, long);
+        derived.title = crate::normalize::derive_title(long);
+        derived.snippet = long.into();
+        assert!(!derived.title.ends_with(' ') && long.len() > derived.title.len());
+        // An explicit title can be a prefix of the first word.
+        let mut prefix = hit(1, "User sessions expire after an hour");
+        prefix.title = "Use".into();
+        prefix.snippet = "User sessions expire after an hour".into();
+        let out = SearchOutput {
+            hits: vec![derived, prefix],
+            ..Default::default()
+        };
+        for budget in [200, 1500] {
+            let (text, _) = pack_text(&out, None, budget);
+            assert!(text.contains(long), "{budget}: {text}");
+            assert!(!text.contains("\nng now"), "{budget}: {text}");
+            assert!(
+                text.contains("User sessions expire after an hour"),
+                "{budget}: {text}"
+            );
+            assert!(!text.contains("\nr sessions"), "{budget}: {text}");
         }
     }
 
