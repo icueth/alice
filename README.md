@@ -16,7 +16,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Status: design phase.** Nothing is installable yet. This README describes the system as designed; install and usage sections show the *planned* interface and will be updated as each milestone ships. Follow the [roadmap](#roadmap) or watch the repo for releases.
+> **Status: M1 complete — alpha.** The store, hybrid search (Thai, English and code identifiers), the daemon, the seven MCP tools, the CLI and the HTTP API work, and CI tests them on macOS and Linux (the Windows build does not link yet). There are no packaged releases yet: [install from source](#install-from-source). Features marked *(planned)* arrive in later milestones; see the [roadmap](#roadmap). Expect breaking changes before 1.0.
 
 ---
 
@@ -28,19 +28,19 @@ Alice is built for that workload: many agents, many projects, one memory that st
 
 ## Highlights
 
-- **Never blocks your agent.** A single daemon owns the database. Writes are acknowledged in under 50 ms; embedding, judging and imports run in the background. If the daemon is down, hooks spool to disk and nothing is lost.
-- **Knowledge first, transcripts on demand.** Two tiers: short, distilled *memories* (decisions, fixes, facts, how-tos, preferences, warnings, handoffs) are searched by default; raw session transcripts are kept as evidence and searched when you ask or when knowledge runs thin.
+- **Never blocks your agent.** A single daemon owns the database. Writes are acknowledged in under 50 ms; embedding and indexing run in the background. If the daemon is down or still starting, writes spool to disk and nothing is lost.
+- **Knowledge first, transcripts on demand.** Two tiers: short, distilled *memories* (decisions, fixes, facts, how-tos, preferences, warnings, handoffs) are searched by default; raw session transcripts are kept as evidence and searched when you ask or when knowledge runs thin. *(Automatic transcript capture and distillation: planned, SP2.)*
 - **Search that understands code and Thai.** Hybrid retrieval: multilingual vectors, BM25, trigram matching for languages without spaces (Thai, CJK), and identifier-aware matching (`HostLinkReconnect`, `writer_lease`, file paths). Results respect the current project, recency, importance and status.
-- **Memory that corrects itself.** New memories are compared with similar existing ones: duplicates merge, updates supersede old facts, contradictions go to a review inbox. Every change is logged and can be undone.
-- **Optional AI judge.** Plug in [TypeSafe Jev](https://typesafe.ai) for calibrated decisions (deduplication, routing, re-ranking) with confidence thresholds, caching and a daily budget cap. Without it, Alice uses offline heuristics.
+- **Memory that corrects itself** *(planned, M2)*. New memories are compared with similar existing ones: duplicates merge, updates supersede old facts, contradictions go to a review inbox. Every change is logged and can be undone.
+- **Optional AI judge** *(planned, M2)*. Plug in [TypeSafe Jev](https://typesafe.ai) for calibrated decisions (deduplication, routing, re-ranking) with confidence thresholds, caching and a daily budget cap. Without it, Alice uses offline heuristics.
 - **Small, sharp MCP surface.** Seven core tools (`recall`, `remember`, `context`, `get_memory`, `update_memory`, `query_facts`, `assert_fact`) instead of dozens, compact token-budgeted output, built-in usage instructions, slash-command prompts and resources.
 - **A briefing instead of a dump.** `context` returns what matters for the current project within a token budget: key memories, recent decisions, warnings, the last handoff and your preferences.
 - **Knowledge graph with time.** Entities and relations with validity periods (`as_of` queries, timelines) and a predicate vocabulary that prevents `has_bug` / `had_bug` drift.
-- **Git sync as Markdown.** Push and pull memories to any git remote as one Markdown file per memory. Readable on GitHub, opens in Obsidian, syncs across machines with record-level merging. The database file never goes into git.
-- **One binary.** Daemon, CLI, MCP server and hooks in a single static Rust binary for macOS, Linux and Windows. No Python environments, no Docker.
-- **Private by default.** Local-first storage, secret redaction before anything is written or sent, API keys in the OS keychain, loopback-only server with token and origin checks.
+- **Git sync as Markdown** *(planned, M4)*. Push and pull memories to any git remote as one Markdown file per memory. Readable on GitHub, opens in Obsidian, syncs across machines with record-level merging. The database file never goes into git.
+- **One binary.** Daemon, CLI and MCP server (and, in SP2, hooks) in a single Rust binary with the embedding runtime built in. No Python environments, no Docker.
+- **Private by default.** Local-first storage and a loopback-only server with token and origin checks. *(Planned, M2: secret redaction before anything is written or sent; API keys in a private file, with the OS keychain as an option.)*
 - **Graph and management UI** *(planned, SP3)*. Explore the memory graph, edit memories, resolve reviews, change every setting and run git push/pull from the browser or a desktop app.
-- **Bring your MemPalace.** Import an existing MemPalace palace (drawers, diaries, knowledge graph) and keep using `mempalace_*` tool names through an optional compatibility layer.
+- **Bring your MemPalace** *(planned, M3)*. Import an existing MemPalace palace (drawers, diaries, knowledge graph) and keep using `mempalace_*` tool names through an optional compatibility layer.
 
 ## How it works
 
@@ -63,7 +63,27 @@ Alice is built for that workload: many agents, many projects, one memory that st
 | **Fact** | A knowledge-graph relation between entities, valid over a period of time. |
 | **Review** | A decision the system was not confident enough to make alone. |
 
-## Installation (planned)
+## Install from source
+
+You need Rust 1.99 or newer ([rustup](https://rustup.rs)) and a C/C++ compiler (Xcode Command Line Tools on macOS, `build-essential` on Debian/Ubuntu, the MSVC Build Tools on Windows).
+
+```bash
+cargo install --git https://github.com/icueth/alice alice-memory
+alice model fetch      # once, before first use: the embedding model (~136 MB) into ~/.alice/models
+```
+
+Run `alice model fetch` once before first use. Without it the first daemon start downloads the model itself, and until that is done reads answer "memory daemon is starting (downloading the embedding model …)" and writes are queued; `alice daemon start` waits for the download and shows its progress. Files are pinned to one revision and checked by SHA-256; set `HF_ENDPOINT` to use a Hugging Face mirror. If the daemon cannot start (no network for the download, a damaged `alice.db`), every command says why, and `alice status` shows the last failure.
+
+### Platform support
+
+| Platform | Status |
+|---|---|
+| macOS, Apple Silicon | Supported, local embeddings |
+| Linux (glibc) x86_64 and aarch64 | Supported, local embeddings |
+| Windows x86_64 | Not yet: compiles, but linking fails on the vector index library's SIMD kernels (usearch 2.26.4 with MSVC); to be fixed in M2 |
+| macOS Intel, Linux musl | Not yet: ONNX Runtime has no prebuilt library for them, so local embeddings are unavailable. They will work with an HTTP embedding provider (planned, M2). |
+
+### Packaged installers (planned)
 
 ```bash
 # Homebrew (macOS, Linux)
@@ -78,26 +98,25 @@ irm https://github.com/icueth/alice/releases/latest/download/alice-installer.ps1
 # npm (if you already have Node for your agents)
 npm install -g alice-memory
 
-# Cargo
+# Cargo (from crates.io)
 cargo install alice-memory
 ```
 
-The embedding model (~120 MB, multilingual) downloads on first use. On offline machines run `alice model fetch` beforehand.
-
-## Quick start (planned)
+## Quick start
 
 ```bash
-alice setup                    # detect installed agents and connect them (MCP + hooks)
-alice import mempalace         # optional: bring an existing MemPalace palace
-alice remember --kind decision "Use SQLite WAL with a single writer thread"
+alice model fetch              # once: the embedding model (~136 MB)
+alice remember --kind decision "Use SQLite WAL with a single writer thread"   # starts the daemon if needed
 alice recall "why single writer"
 alice context                  # briefing for the current project
-alice ui                       # open the web UI
+alice status                   # daemon, counts, embedding backlog
 ```
+
+The project is detected from the working directory (git remote, or the directory name); memories written outside any project go to `global`. Planned: `alice setup` to connect every installed agent (SP2), `alice import mempalace` (M3) and `alice ui` (SP3).
 
 ## Connecting agents
 
-`alice setup` configures everything automatically. To do it by hand, register `alice mcp` as a stdio MCP server:
+Register `alice mcp` as a stdio MCP server (`alice setup` will do this automatically in SP2). The shim starts the daemon when needed, and the client's workspace root, if it sends one, decides the project:
 
 <details>
 <summary><b>Claude Code</b></summary>
@@ -147,7 +166,7 @@ Agents that cannot use MCP can call the CLI (`alice recall`, `alice remember`, `
 
 | Tool | Purpose |
 |---|---|
-| `recall` | Search memories. Filters for project, topics, kinds and dates; `max_tokens` budget; `mode: precise` re-ranks with the judge. |
+| `recall` | Search memories. Filters for project, topics, kinds and dates; `include_raw` for transcripts; `max_tokens` budget. *(Planned, M2: `mode: precise` re-ranks with the judge.)* |
 | `remember` | Save a memory (`kind`, `title`, `topics`, `importance`, `supersedes`). Idempotent. |
 | `context` | Token-budgeted briefing for the current project. |
 | `get_memory` | Full memories with links and provenance. |
@@ -155,24 +174,41 @@ Agents that cannot use MCP can call the CLI (`alice recall`, `alice remember`, `
 | `query_facts` | Knowledge-graph lookups, `as_of` a date, or as a timeline. |
 | `assert_fact` | Add, supersede or end a fact, with predicate suggestions. |
 
-An admin toolset (`review_list`, `review_resolve`, `merge_memories`, `stats`) can be enabled in settings.
+The server also sends usage instructions, offers `recall` and `remember-session` prompts and the `memory://context` and `memory://m/{id}` resources. An admin toolset (`review_list`, `review_resolve`, `merge_memories`, `stats`) is planned for M2.
 
-## CLI (planned)
+## CLI
 
 ```
-alice recall <query> [--project p] [--kind k] [--raw] [--precise] [--json]
-alice remember [--kind k] [--title t] [--topic t]... (<text> | -)
-alice context | get <id> | facts <entity> [--as-of date] [--timeline]
-alice review [list | resolve <id> <choice>]      alice undo <event-id>
-alice sync [init <remote> | push | pull | status]
-alice import mempalace [--palace path] [--dry-run]
-alice config [get | set | list | edit | set-secret]
-alice doctor | bench | ui | daemon | service | mcp
+alice recall <query> [--project p] [--kind k]... [--topic t]... [--raw] [--limit n]
+             [--max-tokens n] [--since date] [--before date]
+alice remember [--kind k] [--title t] [--topic t]... [--project p] [--importance 1-5]
+               [--supersedes id]... (<text> | -)
+alice context [--project p] [--max-tokens n]
+alice get <id>... [--provenance]
+alice update <id> --action edit|supersede|archive|forget|restore [--title t] [--body b] [--by id]
+alice facts <entity> [--predicate p] [--as-of date] [--timeline]
+alice fact add|supersede|end <subject> <predicate> <object> [--from date]
+alice projects | status
+alice daemon start | stop | status | logs | run
+alice mcp                      # stdio MCP server for agents
+alice model fetch
+alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 ```
+
+Every command takes `--json`. Planned: `review`, `undo` (M2), `config`, `doctor`, `service`, `token rotate` (M2), `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3).
 
 ## Configuration
 
-Settings live in `~/.alice/config.toml`, can be overridden per repository with `.alice.toml`, and can all be changed from the UI. Changes apply without restarting.
+M1 has no settings file yet. It reads these environment variables:
+
+| Variable | Meaning |
+|---|---|
+| `ALICE_HOME` | Data directory (default `~/.alice`). |
+| `ALICE_LOG` | Log filter, e.g. `info` or `alice_daemon=debug` (the daemon logs to `$ALICE_HOME/logs/daemon.log`). |
+| `ALICE_AGENT` | Author name the CLI records on memories it writes (default `cli`). |
+| `HF_ENDPOINT` | Hugging Face mirror for `alice model fetch`. |
+
+*(Planned, M2)* Settings will live in `~/.alice/config.toml`, can be overridden per repository with `.alice.toml`, and can all be changed from the UI. Changes apply without restarting.
 
 ```toml
 [embedding]
@@ -202,9 +238,9 @@ daily = 7
 weekly = 4
 ```
 
-Secrets such as the Jev API key go to the OS keychain: `alice config set-secret judge.jev.api_key`.
+Secrets such as the Jev API key will be stored in `~/.alice/secrets.toml` (mode 0600) with `alice config set-secret judge.jev.api_key`; the OS keychain will be an opt-in alternative.
 
-## Git sync
+## Git sync *(planned, M4)*
 
 ```bash
 alice sync init git@github.com:you/alice-memory.git
@@ -214,9 +250,9 @@ alice sync pull
 
 Each memory becomes `<project>/<kind>/<year>/<id>-<slug>.md` with YAML frontmatter; the knowledge graph is stored as sorted JSONL. Alice merges per record, so two machines can edit different memories without conflicts; when both edit the same memory, the newer version wins and the other goes to the review inbox. Use a **private** repository: memories can contain sensitive project details, even after redaction.
 
-## Coming from MemPalace
+## Coming from MemPalace *(importer planned, M3)*
 
-Alice is inspired by [MemPalace](https://github.com/MemPalace/mempalace) and can import its palaces:
+Alice is inspired by [MemPalace](https://github.com/MemPalace/mempalace) and will import its palaces:
 
 ```bash
 alice import mempalace --dry-run   # preview the wing → project mapping
@@ -235,12 +271,27 @@ alice import mempalace
 
 Drawers mined from transcripts and files become raw sources, diaries and agent-written drawers become memories, wings map to projects (name variants merged), rooms become topics, and the knowledge graph carries over. Turn on `compat.mempalace` to keep calling `mempalace_*` tools.
 
+## Performance
+
+Measured for M1 on an Apple M4 Pro with `alice bench` ([full results](docs/benchmarks/m1.md)), p95:
+
+| | Budget | 100k chunks, local model | 1M chunks |
+|---|---|---|---|
+| `remember` acknowledgement | < 50 ms | 34 ms (busy machine) | 10.0 ms |
+| `recall` (knowledge) | < 200 ms | 31 ms | 9.7 ms |
+| `recall` with `include_raw` | < 200 ms | 49 ms | 139–177 ms |
+| `context` | < 150 ms | 3.4 ms | 0.8 ms |
+| Daemon memory: RSS steady / peak | < 800 MB RSS at 1M chunks | 0.58–0.76 / 0.91 GB | without the model 0.67–0.78 / 0.86 GB; with it ≈1.4 / ≈1.6–1.7 GB projected (not yet met) |
+| Physical footprint steady / peak | | 0.69–0.75 / 0.85 GB | without the model 0.77–0.86 / 0.86 GB; with it ≈1.4–1.5 / ≈1.55 GB projected |
+
+The 1M-chunk run uses a fake embedder; one loaded copy of the local model takes ~600 MB on its own.
+
 ## Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
-| **SP1 · M1** | Store, hybrid search, daemon, MCP, CLI, HTTP API | Designing |
-| **SP1 · M2** | Judge (heuristic + Jev), review inbox, undo, redaction, backups, live settings | Planned |
+| **SP1 · M1** | Store, hybrid search, daemon, MCP, CLI, HTTP API | Done (alpha) |
+| **SP1 · M2** | Judge (heuristic + Jev), review inbox, undo, redaction, backups, live settings, HTTP embedding providers | Next |
 | **SP1 · M3** | MemPalace importer and compatibility layer | Planned |
 | **SP1 · M4** | Git sync | Planned |
 | **SP2** | Automatic capture and distillation, `alice setup`, hooks/plugins for every supported agent | Planned |
@@ -250,7 +301,13 @@ Design details: [Alice Core design spec](docs/superpowers/specs/2026-10-13-alice
 
 ## Contributing
 
-The project is at the design stage. Issues and discussion on the spec are welcome. Code contributions open once M1 lands; the workspace layout and conventions will be documented in `CONTRIBUTING.md`.
+Issues, discussion of the spec and pull requests are welcome. The workspace has four crates: `alice-core` (model, storage, search), `alice-embed` (embedding providers), `alice-daemon` (writer, workers, HTTP API, MCP server, client) and `alice` (the binary, package `alice-memory`). Before opening a pull request run:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
 
 ## License
 

@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Windows does not link yet: usearch 2.26.4's NumKong kernels are referenced as dllimport
+    # symbols under MSVC (LNK2019). M2 Task 3 ("Windows build: usearch without NumKong") fixes
+    # it and removes this line, so a Windows failure does not turn main red meanwhile.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace

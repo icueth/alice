@@ -1,0 +1,39 @@
+[package]
+name = "alice-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Alice daemon: single-writer store, workers, HTTP API and MCP server"
+
+[dependencies]
+alice-core = { path = "../alice-core" }
+alice-embed = { path = "../alice-embed" }
+axum.workspace = true
+tokio-util.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+tokio.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+rmcp.workspace = true
+url.workspace = true
+schemars.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

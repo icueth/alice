@@ -1,0 +1,23 @@
+{"id":"wal","kind":"decision","m":"Use SQLite in WAL mode with a single writer thread so readers never block"}
+{"id":"lease","kind":"bugfix","m":"Hub writer lease held during transcript mining caused 120 s diary timeouts; mining now runs off the writer"}
+{"id":"thai-mem","kind":"fact","m":"ระบบความจำของเอเจนต์ต้องค้นหาภาษาไทยได้โดยไม่ต้องเว้นวรรค"}
+{"id":"reconnect","kind":"bugfix","m":"HostLinkReconnect looped forever after sleep; capped at five attempts with backoff"}
+{"id":"deploy","kind":"fact","m":"Production deploys go to Easypanel at 43.229.151.35 via the Coolify-compatible API"}
+{"id":"pref-thai","kind":"preference","m":"Always reply to the owner in Thai; code and commit messages stay in English"}
+{"id":"proto","kind":"decision","m":"v4 game frames must be framed protobuf; plain JSON fails with data read failed"}
+{"id":"socks","kind":"warning","m":"LINE proxy must be socks5; http proxies break HTTP/2 push"}
+{"id":"money","kind":"decision","m":"Money values are strings in the API to avoid float rounding"}
+{"id":"rtk","kind":"howto","m":"Use rtk proxy git -C when working in another worktree because rtk drops the -C flag"}
+{"q":"why do diary writes time out","want":"lease"}
+{"q":"writer_lease","want":"lease"}
+{"q":"ค้นหาภาษาไทย","want":"thai-mem"}
+{"q":"ความจำ เอเจนต์","want":"thai-mem"}
+{"q":"reconnect loop after sleep","want":"reconnect"}
+{"q":"HostLinkReconnect","want":"reconnect"}
+{"q":"where do we deploy production","want":"deploy"}
+{"q":"which language should replies use","want":"pref-thai"}
+{"q":"protobuf frames v4","want":"proto"}
+{"q":"proxy type for LINE","want":"socks"}
+{"q":"float rounding money","want":"money"}
+{"q":"git -C flag lost","want":"rtk"}
+{"q":"readers block writer sqlite","want":"wal"}

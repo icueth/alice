@@ -85,10 +85,10 @@ SP1 is built first and is usable on its own as a MemPalace replacement (agents c
 
 1. **One binary.** `alice` contains the daemon, CLI, MCP stdio shim and hook handler as subcommands.
 2. **The daemon is the only process that opens the database.** All clients go through it.
-3. **Heavy work never holds the writer.** Embedding, judging, importing, syncing and parsing run in worker threads and hand small batches to the writer thread. The writer only executes short transactions (target < 5 ms each, batched group commit).
-4. **Hooks never block and never lose data.** If the daemon is unreachable, the client appends the request to `~/.alice/spool/<pid>-<ts>.jsonl` (fsync), triggers a detached daemon start, and returns. The daemon drains the spool on start-up and on a 5 s timer.
+3. **Heavy work never holds the writer.** Embedding, judging, importing, syncing and parsing run in worker threads and hand small batches to the writer thread. The writer only executes short transactions (target < 5 ms each, batched group commit). A large ingest is written in byte-bounded slices (≤ 64 KB of text and ≤ 200 chunks per transaction), so a `remember` queued behind it waits for one slice at most.
+4. **Hooks never block and never lose data.** If the daemon is unreachable, the client writes the request to `~/.alice/spool/<ulid>.json` (one file per request, written to a temp file, fsynced and renamed into place), triggers a detached daemon start, and returns. The daemon drains the spool on start-up and on a 5 s timer.
 5. **Auto-start.** The first client that cannot reach the daemon starts it detached. A lock file (`~/.alice/daemon.lock`, OS advisory lock) guarantees a single instance. `alice service install` registers a launchd agent (macOS), systemd user unit (Linux) or scheduled task (Windows) for always-on operation.
-6. **Local security.** The daemon binds to 127.0.0.1 on a random free port, written with the pid to `~/.alice/daemon.json`. Every request carries a bearer token read from `~/.alice/token` (mode 0600, regenerated on `alice token rotate`). The server rejects a request if its `Host` is not `127.0.0.1:<port>` or `localhost:<port>`, or if it carries an `Origin` other than the daemon's own origin (prevents DNS rebinding and cross-site requests). The UI gets a session through a one-time URL printed or opened by `alice ui`.
+6. **Local security.** The daemon binds to 127.0.0.1 on a random free port, written with the pid and a per-start instance id to `~/.alice/daemon.json`. Every request carries a bearer token read from `~/.alice/token` (mode 0600, regenerated on `alice token rotate`). Before sending the token, a client proves it is talking to that daemon: `GET /api/v1/ping?nonce=<random>` must answer with the instance id from `daemon.json` and `HMAC-SHA256(token, "<nonce>:<instance>")`, so a stale `daemon.json` pointing at a port another process now uses never receives the token, and a proof relayed from another daemon does not vouch for a stale instance. The server rejects a request if its `Host` is not `127.0.0.1:<port>` or `localhost:<port>`, or if it carries an `Origin` other than the daemon's own origin (prevents DNS rebinding and cross-site requests). The UI gets a session through a one-time URL printed or opened by `alice ui`.
 7. **Two MCP transports.** Clients that support Streamable HTTP connect to `/mcp` directly (with the token header). Others launch `alice mcp`, a stdio shim that proxies to the daemon (auto-starting it); target shim start-up < 20 ms.
 
 ### 2.3 Filesystem layout
@@ -97,14 +97,17 @@ SP1 is built first and is usable on its own as a MemPalace replacement (agents c
 
 ```
 alice.db            SQLite database (source of truth)
-vectors/            HNSW index files, one per embedding model (rebuildable)
+vectors/            HNSW index, two files per embedding model: <model>.memories.usearch and
+                    <model>.chunks.usearch (rebuildable)
 models/             downloaded embedding models
-spool/              pending requests written while the daemon was down
+spool/              pending requests (<ulid>.json) written while the daemon was down or read-only
 backups/            rotated SQLite snapshots
 logs/               daemon logs (rotated, never contain secrets)
 config.toml         user configuration
-daemon.json         {pid, port, version, started_at}
+daemon.json         {pid, port, instance, version, started_at}
 daemon.lock
+daemon.starting     {pid, step, file, done, total} while a daemon starts (e.g. the model download)
+daemon.error        {pid, at, error}: why the last start failed; cleared when a daemon serves
 token               API token (0600)
 ```
 
@@ -118,7 +121,7 @@ crates/
   alice/          the `alice` binary: CLI, MCP stdio shim, hook handler, daemon entry
 ```
 
-Key dependencies (versions pinned in the implementation plan): `rusqlite` (bundled, FTS5), `usearch`, `fastembed` / `ort`, `rmcp` (official MCP Rust SDK), `axum` + `tokio`, `serde`, `schemars`, `keyring`, `ulid`, `clap`, `tracing`.
+Key dependencies (versions pinned in the implementation plan): `rusqlite` (bundled, FTS5), `usearch`, `fastembed` / `ort`, `rmcp` (official MCP Rust SDK), `axum` + `tokio`, `serde`, `schemars`, `ulid`, `clap`, `tracing`; `keyring` only for the opt-in keychain (§6).
 
 ---
 
@@ -149,7 +152,8 @@ projects(id TEXT PK, slug TEXT UNIQUE, name TEXT, git_remote TEXT, root_path TEX
 project_aliases(alias TEXT PK, project_id TEXT)
 
 memories(
-  id TEXT PK,                -- ULID
+  seq INTEGER PK AUTOINCREMENT,  -- rowid; FTS rows and vector keys use it, so it is never reused
+  id TEXT UNIQUE,            -- ULID
   project_id TEXT, kind TEXT, title TEXT, body TEXT,
   importance INTEGER,        -- 1..5, default 3
   status TEXT,               -- pending|active|superseded|archived|trashed
@@ -164,8 +168,9 @@ memory_topics(memory_id TEXT, topic TEXT, PRIMARY KEY(memory_id, topic))
 
 sources(id TEXT PK, project_id TEXT, type TEXT,  -- session|file|import
         agent TEXT, uri TEXT, session_id TEXT, started_at TEXT, ended_at TEXT, legacy_ref TEXT)
-chunks(id TEXT PK, source_id TEXT, seq INTEGER, text TEXT, content_hash TEXT,
-       authored_at TEXT, created_at TEXT, embed_state TEXT, legacy_id TEXT)
+chunks(seq INTEGER PK AUTOINCREMENT, id TEXT UNIQUE, source_id TEXT, project_id TEXT,
+       ord INTEGER, text TEXT, content_hash TEXT, authored_at TEXT, created_at TEXT,
+       embed_state TEXT, legacy_id TEXT, UNIQUE(source_id, ord))
 provenance(memory_id TEXT, chunk_id TEXT, PRIMARY KEY(memory_id, chunk_id))
 links(from_id TEXT, to_id TEXT, type TEXT, created_by TEXT, created_at TEXT,
       PRIMARY KEY(from_id, to_id, type))
@@ -178,8 +183,8 @@ relations(id TEXT PK, subject_id TEXT, predicate TEXT,
           valid_from TEXT, valid_to TEXT NULL, source_memory_id TEXT, created_at TEXT, hlc TEXT)
 mentions(memory_id TEXT, entity_id TEXT, PRIMARY KEY(memory_id, entity_id))
 
-embeddings(owner_type TEXT, owner_id TEXT, model TEXT, dim INTEGER, vector BLOB,  -- f16
-           PRIMARY KEY(owner_type, owner_id, model))
+embeddings(owner_type TEXT, owner_seq INTEGER, model TEXT, dim INTEGER, vector BLOB,  -- f16
+           PRIMARY KEY(owner_type, owner_seq, model))
 
 events(id TEXT PK, ts TEXT, hlc TEXT, actor TEXT, action TEXT,
        target_type TEXT, target_id TEXT, before_json TEXT, after_json TEXT)
@@ -191,9 +196,12 @@ cost_ledger(day TEXT, provider TEXT, calls INTEGER, input_tokens INTEGER, output
 sync_state(key TEXT PK, value TEXT)
 schema_migrations(version INTEGER PK, applied_at TEXT)
 
--- FTS5 (external content), each for memories and chunks:
---   *_fts      tokenize='unicode61 remove_diacritics 2'   columns: title, body, topics, code_tokens
---   *_fts_tri  tokenize='trigram'                         columns: title, body
+-- FTS5, contentless (content='', contentless_delete=1), rowid = memories.seq / chunks.seq;
+-- rows are written and deleted by the store together with the row they index:
+--   memories_fts  tokenize='unicode61 remove_diacritics 2'  columns: title, body, topics, code_tokens
+--   memories_tri  tokenize='trigram'                        columns: title, body
+--   chunks_fts    tokenize='unicode61 remove_diacritics 2'  columns: text, code_tokens
+--   chunks_tri    tokenize='trigram'                        columns: text
 ```
 
 Migrations are forward-only, numbered, and run at daemon start inside a transaction after an automatic pre-migration backup.
@@ -204,26 +212,28 @@ Migrations are forward-only, numbered, and run at daemon start inside a transact
 
 ### 4.1 Storage
 
-- SQLite in WAL mode; `synchronous=NORMAL`, `busy_timeout=5000`, `mmap_size` sized to the DB, `foreign_keys=ON`.
-- One writer connection (writer thread); a pool of read connections for concurrent queries.
-- The vector index (`usearch` HNSW, cosine, int8 quantization) lives in `vectors/<model>.usearch` and is fully rebuildable from the `embeddings` table. On start-up and daily, the index count is compared with the table; on mismatch or load failure the index is rebuilt in a worker while search falls back to lexical + brute-force over recent items.
+- SQLite in WAL mode; `synchronous=NORMAL`, `busy_timeout=5000`, `foreign_keys=ON`, no memory map (`mmap_size=0`: each connection's map counts towards RSS separately, and reads through the OS file cache measured the same speed), allocation statistics off (they serialise every allocation behind one mutex).
+- One writer connection (writer thread, 64 MiB page cache); a pool of at most 8 read connections (16 MiB page cache each) for concurrent queries. Reads beyond 8 wait for a free connection, which bounds memory however many requests arrive at once.
+- The vector index (`usearch` HNSW, cosine, int8 quantization) is two indexes per model, one for memories and one for chunks, saved as `vectors/<model>.memories.usearch` and `vectors/<model>.chunks.usearch` (each written atomically; an unchanged part is not rewritten). A memory search walks only the memory graph, so it never pays for the (much larger) chunk graph. Both are fully rebuildable from the `embeddings` table. On start-up (and daily, M2) the index count is compared with the table; on mismatch or load failure the index is rebuilt on a background thread while search uses the lexical lists only.
 
 ### 4.2 Embeddings
 
-- Default: `intfloat/multilingual-e5-small` (384-d) via ONNX Runtime, using `query: ` / `passage: ` prefixes. Good Thai and English quality, no API key.
+- Default: `multilingual-e5-small-q8`, the int8 ONNX build of `intfloat/multilingual-e5-small` (384-d) from `Xenova/multilingual-e5-small` at a pinned revision: `onnx/model_quantized.onnx` (118 MB) plus `tokenizer.json` (17 MB) and three small config files, run by ONNX Runtime (linked statically) with mean pooling and `query: ` / `passage: ` prefixes. Good Thai and English quality, no API key. One loaded instance costs about 600 MB (the tokenizer of the 250k-token vocabulary ~250 MB, the ONNX session ~265 MB), so the daemon keeps one, shared by the background worker and queries: passages are embedded in batches of at most 1,024 padded tokens, counted with the model's tokenizer (32 texts at most) and the model is handed to a waiting query after each batch, so a query waits for one batch at most (~115 ms for two 512-token texts on an M4 Pro). The cap also bounds ONNX Runtime's working memory, which keeps the size of its largest call (32 texts of 512 tokens: +1.4 GB).
 - Providers: `local` (ONNX), `ollama`, `openai` (any OpenAI-compatible endpoint), `voyage`.
 - Each vector records its model. Changing the model triggers a background re-embed into a new index; search keeps using the old index until the new one is complete, then switches atomically.
-- Model files are downloaded on first use to `models/` with SHA-256 verification; `alice model fetch` pre-downloads for offline machines.
+- Model files are downloaded on first use to `models/<model>/` with size and SHA-256 verification (`HF_ENDPOINT` selects a mirror); `alice model fetch` pre-downloads for offline machines.
+- Embedding completion is compare-and-set: the worker stores a vector only if the row's `content_hash` still equals the one it read with the text, so an edit that lands while the old text is being embedded is never marked done with the old vector.
+- Local embeddings need an ONNX Runtime prebuilt library: Apple Silicon macOS, glibc Linux (x86_64, aarch64) and Windows x64. Intel macOS and musl Linux have none; they need an HTTP embedding provider (M2). (M1 status: the Windows build compiles but does not link, because usearch 2.26.4 references its NumKong SIMD kernels through DLL-import names under MSVC.)
 
 ### 4.3 Lexical search
 
-- FTS5 `unicode61` for space-delimited languages.
+- FTS5 `unicode61` for space-delimited languages. English stopwords, including the fragments contractions split into at an apostrophe (`it's` → `it`, `s`; `don't` → `don`, `t`; straight or curly), are dropped from word queries whenever the query has other words (a query of stopwords only keeps them), so a lexical match is a content-word match; regular English inflections of query words are added (`replies` → `reply`, `deploy` → `deploys`, `deployed`), since `unicode61` does not stem. Every term is quoted, so FTS5 syntax in a query is searched as literal words.
 - FTS5 `trigram` for Thai, CJK and substring matches (Thai has no word spaces, so word tokenizers miss it).
-- `code_tokens` column: at index time, identifiers and paths are expanded (`HostLinkReconnect` → `host link reconnect`, `writer_lease` → `writer lease`, `internal/teacher/jev/client.go` → path segments and stem). Exact identifier/path queries also get a dedicated exact-match candidate list.
+- `code_tokens` column: at index time, identifiers and paths are expanded (`HostLinkReconnect` → `host link reconnect`, `writer_lease` → `writer lease`, `internal/teacher/jev/client.go` → path segments and stem). Each name in a token (split at `/ . :`) also yields the joined runs of its consecutive words (split at `_`, `-` and camel case; at most 12 words, runs of up to 6), so every written form of an identifier carries its joined token: `self.lease_token_frame`, `store/lease_token_frame.rs`, `crate::daemon::lease_token_frame()`, `LEASE_TOKEN_FRAME_LIMIT`, `lease-token-frame` and `LeaseTokenFrame` all hold `leasetokenframe`. Kebab-case counts as an identifier when every hyphen-separated part has a letter (`well-known`, `lease-token-frame`; not dates or ranges such as `2026-10-14` or `15-45`). Exact identifier/path queries also get a dedicated exact-match candidate list, searched by the whole joined identifier and by the joined form of each multi-word name in it (the runs of 2–6 words are index-side only). The word lists search an identifier's parts as typed and never its joined forms, so a long identifier cannot push a query's other words past the 32-term cap.
 
 ### 4.4 Ranking pipeline
 
-1. **Candidates:** vector top 100; `unicode61` BM25 top 100; trigram top 100 (always for non-space scripts or queries ≤ 2 words, otherwise when the other lists are short); exact identifier/path matches.
+1. **Candidates:** vector top 100; `unicode61` BM25 top 100; trigram top 100 (always for non-space scripts or queries of ≤ 2 pieces, otherwise when the other lists are short; ASCII pieces are searched by substring only in queries of ≤ 2 pieces, counted after splitting at punctuation, so a path, URL or dotted name of many pieces sends none); exact identifier/path matches; in the knowledge tier only, a `LIKE` scan for non-ASCII terms shorter than a trigram (1–2 code points, such as Thai `จำ`). In the raw tier such a word of a script written without spaces has no lexical list (only the vector list can find it). With filters (project, kind, topic, dates) each list takes 400. Only the first 2,000 characters of a query are searched and embedded. Raw-tier lists bound their cost per term (ranking every match of a word found in 40% of 1M chunks took ~300 ms). In the word and identifier lists, every term that has a match gets its **own share** of the budget, max(k, 5,000 / number of such terms) rows (k is 100, or 400 with filters), and reads its newest matches up to that share; a chunk scores the sum of the BM25 parts of every term that read it, and the best k are kept. Rows read per list are at most max(5,000, terms × k): 5,000 for a few terms, up to 6,400 for the word list's 64 terms (32 words and 32 variants), or 25,600 with filters. The raw word list does not search identifiers holding `_` as phrases of their words (BM25's IDF for a phrase of common words reads every match of each word with positions, 36–50 ms per identifier at 1M chunks); they are found as one token in the identifier list, in every written form, and their words stay in the word list. In the raw tier every word of a script written without spaces (Thai, Lao, Khmer, Myanmar, CJK, ...: any word holding a character of those Unicode ranges), with combining marks or without, is searched through the trigram list only: unicode61 splits Thai at combining marks (7 of the bench's 10 common Thai words: `ตัดสินใจ` becomes `ต`, `ดส`, `นใจ`, a phrase of common fragments whose IDF read 25–31 ms at 1M chunks), and a rare and a common word of one query must be ranked by the same list (with only marked words left to the trigram list, a rare marked word beside a common unmarked one lost its places in the fused ranking). Other non-ASCII words (accented Latin, Cyrillic, Greek, ...) stay in the word list; the knowledge tier's word list keeps every word. Every lexical list splits a query at the same separators: whitespace and ASCII and Unicode punctuation and symbols (`/ , : ; “ ” ‘ ’ … — –`), `_` excepted, so a word touching punctuation is still searched whole. In the trigram list, a non-ASCII term that has a match reads its newest max(k, 5,000 / number of non-ASCII terms that have a match) matches (a term without a match takes no share, as in the word and identifier lists), and an ASCII term its newest k substring matches (as a whole word it has its own share in the word list, as an identifier in the identifier list); a chunk scores Σ 1 / (each matching term's count, capped at what it read), and ties are taken term by term (BM25's IDF needs every match of each trigram phrase, 60–400 ms at 1M chunks). **Guarantee:** no term can crowd another out of the raw tier, because every term is read up to its own share; a term with at most its share of matches is ranked over all of them; matches beyond a term's share (and an ASCII term's substring-only matches beyond its newest k) are not read, newest first, so recall for very common terms is not exhaustive. A share costs ~5–16 ms at 1M chunks for a single word; with identifiers and the words of scripts written without spaces out of the raw word list, phrase terms are left only for words of other scripts that unicode61 splits at combining marks (Devanagari vowel signs, for example).
 2. **Fusion:** Reciprocal Rank Fusion, k = 60.
 3. **Boosts** (multiplicative, all configurable):
    - tier: knowledge 1.0, raw 0.6
@@ -233,7 +243,7 @@ Migrations are forward-only, numbered, and run at daemon start inside a transact
    - usage: up to +10 % by `log(1 + access_count)`
    - status: `superseded` 0.3, `archived` 0.5 (still retrievable)
 4. **Precise mode (optional):** the Judge scores the top 20 for relevance in one batched call and results are re-ordered by P(relevant).
-5. **Raw fallback:** a result is *relevant* if it has a lexical match (BM25, trigram or exact) or a cosine similarity ≥ `search.relevance_floor` (default 0.82 for multilingual-e5-small, re-tuned on the gold set during M1). If `include_raw` is false and fewer than `search.raw_fallback_min_results` (default 3) knowledge results are relevant, relevant raw results are appended and labelled `raw`.
+5. **Raw fallback:** a result is *relevant* if it has a lexical match (BM25, trigram or exact) or a cosine similarity ≥ `search.relevance_floor` (default 0.82 for `multilingual-e5-small-q8`, checked in M1 with the real model on the gold set: as the int8 index reports similarity, every gold query–memory pair scores ≥ 0.841 and every unrelated pair ≤ 0.771; `crates/alice-embed/tests/real_search_quality.rs`). If `include_raw` is false and fewer than `search.raw_fallback_min_results` (default 3) knowledge results are relevant, relevant raw results are appended and labelled `raw`.
 6. **Related:** up to 5 items one hop away from the top results through links and shared entities, returned separately.
 
 ### 4.5 Output for LLMs
@@ -252,6 +262,8 @@ Migrations are forward-only, numbered, and run at daemon start inside a transact
 | `context` briefing | < 150 ms |
 | `alice mcp` shim start-up | < 20 ms |
 | Daemon RSS at 1M chunks | < 800 MB |
+
+M1 measurements are in [docs/benchmarks/m1.md](../../benchmarks/m1.md): every latency budget is met at 1M chunks (`include_raw` recall p95 139 ms; 123 ms under a filter, 118 ms for a rare identifier, 22 ms for a rare Thai word, 70 ms for the raw fallback; 177 / 162 / 148 / 31 / 103 ms in a second run). Under heavy contention from other processes one run exceeded it (`include_raw` 267 ms, identifier 262 ms); an A/B against the previous code under the same load showed the current code as fast or faster, so the margin under load is thin rather than the code slower. The memory budget (RSS) is not: without the embedding model the daemon at 1M chunks held 666–784 MB RSS and peaked at 722–860 MB across runs (footprint up to 862 MB); with the local model it is projected at ≈1.4 GB RSS steady and ≈1.6–1.7 GB RSS at peak (physical footprint ≈1.4–1.5 GB steady, ≈1.55 GB peak); one model instance alone is ~600 MB. At 100k chunks with the model the peak RSS is 910–1,003 MB (footprint ~0.85 GB).
 
 ---
 
@@ -339,11 +351,12 @@ The database file is never stored in git. Restore with `alice restore [backup]`,
 
 | Failure | Behaviour |
 |---|---|
-| Daemon unreachable | Writes go to the spool; reads return a short error telling the agent memory is starting and to retry in a few seconds. |
+| Daemon unreachable | Writes go to the spool; reads return a short error telling the agent memory is starting and to retry in a few seconds (with what it is doing, e.g. downloading the model). |
+| Daemon cannot start (model download or load fails, database damaged or from a newer schema, failed migration) | The daemon writes the reason to `daemon.error` and exits; every client reports that reason and the next step at once (`memory daemon could not start: <reason>`), writes go to the spool with that reason, and `alice status` shows it. A start that succeeds clears it. Serving such a database read-only arrives with `alice doctor` (M2). |
 | Embedding provider fails | Memory stays lexically searchable; `embed_state = retry` with exponential backoff; health shows the backlog. |
 | Judge fails / over budget | Heuristic fallback; `judge_state = retry`. |
-| Vector index missing or inconsistent | Rebuild in a worker; lexical + recent-item fallback meanwhile. |
-| Disk full, DB corruption, failed migration | Read-only mode. Writes go to the spool. Agents receive: `Memory is read-only: <reason>. Run "alice doctor".` |
+| Vector index missing or inconsistent | Rebuild on a background thread; lexical search only meanwhile (`health.index_ready = false`). |
+| Disk full, DB corruption while running | Read-only mode. Writes go to the spool, and the reply says why. Agents receive: `memory is read-only: <reason>. See "alice status" and the daemon log ("alice daemon logs") for the cause.` (`alice doctor` replaces that pointer in M2.) |
 | Client timeouts | `recall` 5 s, `context` 3 s; writes acknowledge immediately. No 120 s waits. |
 
 All MCP and CLI errors state what happened and what to do next, in one or two sentences.
@@ -355,7 +368,7 @@ All MCP and CLI errors state what happened and what to do next, in one or two se
 - **One schema** defined as Rust structs (`serde` + `schemars`). The JSON Schema is served at `GET /api/v1/settings/schema`; the UI form (SP3), `alice config` and the reference docs are generated from it.
 - **Layers** (later wins): built-in defaults → `~/.alice/config.toml` → `<repo>/.alice.toml` (project scope) → environment variables (`ALICE_<SECTION>_<KEY>`).
 - **Live reload:** changes through the API or edits to the files (watched) apply without restarting the daemon. Invalid values are rejected with the schema error; the previous value stays in effect.
-- **Secrets** (Jev key, embedding API keys, git credentials if not using the system helper) are stored in the OS keychain via `keyring` (macOS Keychain, Windows Credential Manager, Secret Service on Linux). Fallback: `~/.alice/secrets.toml` with mode 0600 and a health warning. The API never returns secret values, only `{set: true, hint: "••••ab12"}`.
+- **Secrets** (Jev key, embedding API keys, git credentials if not using the system helper) are stored by default in `~/.alice/secrets.toml` with mode 0600. The OS keychain via `keyring` (macOS Keychain, Windows Credential Manager, Secret Service on Linux) is opt-in (`secrets.backend = "keychain"`): on macOS every rebuilt or updated binary is a new identity to the Keychain and blocks on a GUI permission prompt, which a background daemon cannot answer, and on Linux the Secret Service needs a D-Bus session that headless machines often lack. The API never returns secret values, only `{set: true, hint: "••••ab12"}`.
 - **API:** `GET /api/v1/settings`, `PATCH /api/v1/settings`, `PUT /api/v1/secrets/{name}`, `DELETE /api/v1/secrets/{name}`, `POST /api/v1/settings/test/{provider}` (connection test).
 - **CLI:** `alice config get|set|list|edit`, `alice config set-secret <name>` (reads from stdin, never from argv).
 
@@ -468,7 +481,8 @@ Names are verbs without the brand, so a rename never breaks prompts.
 **Other MCP features**
 
 - `instructions` in the initialize result (≈ 150 tokens): call `context` at session start if the host did not inject it; `recall` before answering about past work; `remember` decisions, fixes and lessons; write a `handoff` before ending long tasks. This replaces protocol blocks pasted into CLAUDE.md.
-- `roots`: when the client supports roots, the workspace determines the current project; otherwise the hook/shim working directory does.
+- **Project resolution:** an explicit `project` argument wins; otherwise the client's first workspace root (`roots/list`, asked once per session and again after `roots/list_changed`) decides; otherwise the stdio shim's working directory; otherwise `global`. Clients on the handshake-less protocol cannot be asked for roots and fall through to the shim's directory.
+- **Author:** the MCP client's name (`clientInfo.name`, e.g. `claude-code`) is recorded as `author.agent` on every memory the client writes.
 - Prompts: `recall` and `remember-session` (Claude Code exposes them as slash commands).
 - Resources: `memory://context` (current project briefing) and `memory://m/{id}`.
 
@@ -516,7 +530,7 @@ Human-readable tables by default, `--json` for scripts. The CLI supports every w
 
 ### 8.5 Contracts for SP2 and SP3
 
-- **SP2 hooks:** `alice hook <event>` reads the host's hook JSON on stdin, sends it to the daemon (or the spool) and prints host-specific output (for SessionStart, the `context` briefing as additional context). Must finish in < 100 ms. Transcript ingestion uses `POST /api/v1/sources` with chunk batches; distillation results use `remember` with provenance.
+- **SP2 hooks:** `alice hook <event>` reads the host's hook JSON on stdin, sends it to the daemon (or the spool) and prints host-specific output (for SessionStart, the `context` briefing as additional context). Must finish in < 100 ms. Transcript ingestion uses `POST /api/v1/ingest` with chunk batches (at most 1,000 chunks per request); distillation results use `remember` with provenance.
 - **SP3 UI:** consumes the HTTP API, SSE stream and settings schema only; the daemon serves the built UI assets from `/`.
 
 ---
@@ -546,8 +560,8 @@ Human-readable tables by default, `--json` for scripts. The CLI supports every w
 ## 10. Testing and benchmarks
 
 - **Unit tests** per module: store, migrations, normalization, redaction, ranking, Judge providers (Jev via recorded fixtures), HLC, sync merge rules, importer mapping.
-- **Concurrency regression (the MemPalace failure):** 20 clients writing and searching concurrently while an import of 100k records runs. Pass: `remember` p95 < 50 ms, `recall` p95 < 200 ms, zero lost or duplicated writes.
-- **Crash safety:** `kill -9` during writes, during import and during sync; on restart no acknowledged write is lost (spool + WAL); a deleted or corrupted vector index rebuilds automatically.
+- **Concurrency regression (the MemPalace failure):** 20 clients writing and searching concurrently while an import of 100k records runs. Pass: `remember` p95 < 50 ms, `recall` p95 < 200 ms, zero lost or duplicated writes. The test (`crates/alice-daemon/tests/service_concurrency.rs`) ingests 20k chunks by default, which CI runs; `ALICE_TEST_BULK=100000` runs the full 100k (best with `--release`, where the latency budgets are enforced).
+- **Crash safety:** `kill -9` during writes, during import and during sync; on restart no acknowledged write is lost (spool + WAL); a deleted or corrupted vector index rebuilds automatically. M1 tests: SIGKILL while three bulk ingests and forty `remember`s are in flight, then every acknowledged id is present, every queued write applied and the resent ingests complete (`crates/alice/tests/cli.rs`); a deleted, truncated or garbage-filled index is rebuilt at start (`service.rs` tests). Sync arrives in M4.
 - **Sync:** two simulated devices and a bare remote: concurrent edits, deletes on one side, edit-vs-delete, push races, KG merges; verify deterministic files and review items.
 - **Search quality:** gold query sets scored with nDCG@10 and Recall@10. A synthetic multilingual fixture (Thai, English, mixed, code identifiers) lives in the repo and runs in CI. A gold set built from the owner's palace runs locally only and is never committed. The Jev Judge can act as relevance grader when enabled.
 - **Interfaces:** MCP conformance with a reference client, CLI golden tests (snapshot), HTTP auth tests (missing token, wrong Host, foreign Origin).
@@ -560,7 +574,7 @@ CI: GitHub Actions on macOS, Linux and Windows (fmt, clippy `-D warnings`, tests
 
 ## 11. Distribution
 
-- `cargo-dist` builds release binaries for macOS (arm64, x64), Linux (x64, arm64, static musl) and Windows (x64), with checksums.
+- `cargo-dist` builds release binaries with checksums for the targets ONNX Runtime ships prebuilt libraries for: macOS arm64, Linux glibc x64 and arm64, Windows x64. There are no musl or Intel macOS builds with local embeddings (no prebuilt ONNX Runtime); those targets wait for the HTTP embedding providers (M2) and then ship without the local model.
 - Install paths: Homebrew tap (`brew install icueth/tap/alice`), shell/PowerShell installer scripts, npm wrapper (`npm i -g alice-memory`), `cargo install alice-memory`.
 - Binary name `alice`; package name `alice-memory` on crates.io and npm (`alice` is taken on both).
 - `alice self-update`; update checks are opt-in.
@@ -606,3 +620,11 @@ CI: GitHub Actions on macOS, Linux and Windows (fmt, clippy `-D warnings`, tests
 | MCP surface | 7 core tools + opt-in admin set + compat layer | Lower token cost and less tool confusion than 45 tools |
 | Name | Alice (Agent Long-term Intelligent Context Engine); packages `alice-memory` | `alice` taken on crates.io and npm; GitHub and Homebrew names free |
 | License | MIT | Matches MemPalace; widely accepted by developers |
+| Default embedding build (M1 spike) | int8 `multilingual-e5-small-q8` from `Xenova/multilingual-e5-small`, pinned revision, 118 MB model + 17 MB tokenizer, SHA-256 verified | A quarter of the f32 model's size (470 MB); fastembed batches it with `QuantizationMode::Static` |
+| Secrets storage (M1 spike) | 0600 file by default; OS keychain opt-in | `keyring` blocks on a macOS permission prompt after every binary rebuild and needs D-Bus on Linux; a daemon must never block on a prompt |
+| Release targets (M1 spike) | Follow the ONNX Runtime prebuilt matrix: macOS arm64, Linux glibc x64/arm64, Windows x64 | `ort` has no prebuilt library for musl or Intel macOS; local embeddings there wait for HTTP providers |
+| Vector index layout (M1) | One usearch index per tier (memories, chunks) per model | Memory searches never walk the much larger chunk graph or wait for chunk ingest |
+| Daemon discovery (M1) | Challenge-response ping (HMAC over a client nonce and the instance id) before any token is sent | A stale `daemon.json` must not hand the token to whatever process now owns the port |
+| Embedder instances (M1 benchmarks) | One local model shared by the worker and queries, token-bounded batches, fair hand-over | A second instance cost ~600 MB; a query waits for one short batch at most |
+| SQLite memory (M1 benchmarks) | No `mmap`; at most 8 readers with 16 MiB caches | 64 concurrent recalls opened 64 connections, each mapping 256 MB: the daemon reached 3.3 GB RSS at 1M chunks |
+| Raw-tier ranking (M1 benchmarks and review) | Every term with a match reads its newest max(k, 5,000 / terms) matches and every row read is summed; `_` identifiers searched as one token in the identifier list, which holds the joined form of every name; trigrams: non-ASCII terms with a match read the same share, ASCII terms their newest k; ties taken term by term; in the raw tier every word of a script written without spaces is searched by the trigram list only; every list splits queries at ASCII and Unicode punctuation; joined identifier forms searched by the identifier list only | Ranking every match of a common word cost 300–400 ms per list at 1M chunks (`include_raw` p95 947 ms). A window shared by all terms let a common term hide a rarer one (review finding I1); the controller ruled that every term gets its own share and that matches beyond it are taken newest-first. Keeping only each term's own top k before summing lost chunks holding every query word (review N1); dropping `_` identifiers from the word list needed every written form indexed with the joined token (review N2, controller ruling). Leaving only Thai words with combining marks to the trigram list split a rare marked word from a common unmarked one across two lists, and trigram pieces split only at whitespace lost marked words touching punctuation (fix round 4, controller rulings R1–R5) |
