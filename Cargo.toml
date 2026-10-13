@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/alice-core"]
+members = ["crates/alice-core", "crates/alice-embed"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +26,12 @@ parking_lot = "0.12.5"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 tracing = "0.1.44"
 tempfile = "3.27.0"
+half = "2.7.1"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "fs", "io-util"] }
+fastembed = { version = "7.1.1", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "stream", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+futures = "0.3.34"
 
 [profile.release]
 lto = "thin"

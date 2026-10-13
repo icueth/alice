@@ -1,5 +1,6 @@
 //! SQLite storage. Only the daemon opens the database.
 
+pub mod embeddings;
 pub mod fts;
 pub mod kg;
 pub mod memories;

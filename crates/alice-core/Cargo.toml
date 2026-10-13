@@ -21,6 +21,7 @@ regex.workspace = true
 parking_lot.workspace = true
 rusqlite.workspace = true
 tracing.workspace = true
+half.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
