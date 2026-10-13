@@ -5,6 +5,7 @@ use super::stopwords::is_stopword;
 use crate::codetokens::{expand_code_tokens, is_codeish, joined_names};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
+use unicode_normalization::char::is_combining_mark;
 
 /// Most terms one query sends to an index; longer queries keep their first terms.
 const MAX_TERMS: usize = 32;
@@ -386,8 +387,10 @@ pub fn memory_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
 /// with k = 100, or 25,600 with filters (k = 400). A term with at most its share of matches is
 /// ranked over all of them; matches beyond a term's share are not read (newest first: recall
 /// for very common terms is not exhaustive). A share of a single word costs 5–16 ms at 1M
-/// chunks. Phrase terms remain where unicode61 splits a word itself, such as a Thai word at its
-/// combining vowel and tone marks; each reads its pieces' match lists for BM25's IDF.
+/// chunks. The raw word list holds words unicode61 keeps whole; identifiers with `_` and words
+/// it would split at combining marks (Thai) are searched whole in the identifier and trigram
+/// lists instead (see [`raw_word_terms`]), so phrase terms (a phrase reads each piece's matches
+/// with positions for BM25's IDF) are left only for rare punctuation inside a word.
 pub const RAW_WINDOW: usize = 5_000;
 
 /// Rows each of `n` terms may read: an equal share of `window`, at least `k`.
@@ -474,11 +477,14 @@ fn best_first(
 /// IDF for a phrase of common words reads every match of each word with its positions (36–50 ms
 /// per term at 1M chunks). The identifier list holds it as one token in every form it is written
 /// in (`self.lease_token_frame`, `LEASE_TOKEN_FRAME_LIMIT`, `lease-token-frame`, ... all carry
-/// `leasetokenframe`), with its own share there, and its words stay here.
+/// `leasetokenframe`), with its own share there, and its words stay here. Words with combining
+/// marks are left out for the same reason: unicode61 splits them there (the Thai `ตัดสินใจ`
+/// becomes `ต`, `ดส`, `นใจ`), so here they would be phrases of common fragments (25–31 ms of IDF
+/// reading at 1M chunks); the trigram list searches them whole, with their own share.
 fn raw_word_terms(q: &str) -> Vec<String> {
     let mut terms = content_terms(q);
     terms.extend(variant_terms(q));
-    terms.retain(|t| !t.contains('_'));
+    terms.retain(|t| !t.contains('_') && !t.chars().any(is_combining_mark));
     terms
 }
 
@@ -1042,6 +1048,32 @@ mod tests {
         assert_eq!(
             code_terms("lease-token-frame"),
             vec!["leasetokenframe".to_string()]
+        );
+    }
+
+    /// A word unicode61 splits itself (a Thai word at its combining vowel and tone marks:
+    /// `ตัดสินใจ` becomes `ต`, `ดส`, `นใจ`) would be a phrase of common fragments in the word list,
+    /// 25–31 ms of IDF reading at 1M chunks; the trigram list searches it whole, with its own
+    /// share. Words unicode61 keeps whole (`ภาษาไทย`) stay in the word list.
+    #[test]
+    fn raw_word_terms_leave_words_unicode61_splits_to_the_trigram_list() {
+        let terms = raw_word_terms("ตัดสินใจ ภาษาไทย แก้บั๊ก deploy");
+        assert_eq!(
+            terms,
+            vec![
+                "ภาษาไทย".to_string(),
+                "deploy".into(),
+                "deploys".into(),
+                "deployed".into(),
+                "deploying".into()
+            ]
+        );
+        let mut texts = vec!["ตัดสินใจ x".to_string()];
+        texts.extend((0..6).map(|i| format!("ภาษาไทย y{i}")));
+        let (_d, c, seqs) = chunks_db(&texts);
+        assert_eq!(
+            chunk_trigram_in(&c, "ตัดสินใจ ภาษาไทย", 3, 6).first(),
+            Some(&seqs[0])
         );
     }
 
