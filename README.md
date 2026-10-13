@@ -276,10 +276,10 @@ Measured for M1 on an Apple M4 Pro with `alice bench` ([full results](docs/bench
 
 | | Budget | 100k chunks, local model | 1M chunks |
 |---|---|---|---|
-| `remember` acknowledgement | < 50 ms | 34 ms (busy machine) | 11.0 ms |
-| `recall` (knowledge) | < 200 ms | 31 ms | 14.9 ms |
-| `recall` with `include_raw` | < 200 ms | 49 ms | 166 ms |
-| `context` | < 150 ms | 3.4 ms | 2.8 ms |
+| `remember` acknowledgement | < 50 ms | 34 ms (busy machine) | 10.0 ms |
+| `recall` (knowledge) | < 200 ms | 31 ms | 9.7 ms |
+| `recall` with `include_raw` | < 200 ms | 49 ms | 139–177 ms |
+| `context` | < 150 ms | 3.4 ms | 0.8 ms |
 | Daemon memory: RSS steady / peak | < 800 MB RSS at 1M chunks | 0.58–0.76 / 0.91 GB | without the model 0.67–0.78 / 0.86 GB; with it ≈1.4 / ≈1.6–1.7 GB projected (not yet met) |
 | Physical footprint steady / peak | | 0.69–0.75 / 0.85 GB | without the model 0.77–0.86 / 0.86 GB; with it ≈1.4–1.5 / ≈1.55 GB projected |
 
