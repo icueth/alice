@@ -743,6 +743,71 @@ mod tests {
         assert!(exact.hits[0].snippet.contains("HostLinkReconnect"));
     }
 
+    /// Fix round 4 (R1): a rare Thai word (0.2% of chunks) next to a common one (40%) fills the
+    /// fused top 10 of the raw lexical lists, whether the rare word has combining marks
+    /// (`ตัดสินใจ`) or not (`ทะเลสาบ`): both Thai words are ranked by the trigram list only.
+    #[test]
+    fn a_rare_thai_word_fills_the_fused_raw_top_10_marked_or_not() {
+        let n = 6_000;
+        let mut rare_in_top = Vec::new();
+        for rare in ["ตัดสินใจ", "ทะเลสาบ"] {
+            let d = tempfile::tempdir().unwrap();
+            let c = open_writer(&d.path().join("a.db")).unwrap();
+            let chunks: Vec<sources::ChunkInput> = (0..n)
+                .map(|i| {
+                    let mut text = format!("note{i} filler{}", i % 97);
+                    if i % 5 < 2 {
+                        text.push_str(" ภาษาไทย");
+                    }
+                    if i % 500 == 250 {
+                        text.push(' ');
+                        text.push_str(rare);
+                    }
+                    sources::ChunkInput {
+                        ord: i as i64,
+                        text,
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let p = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
+            for (b, batch) in chunks.chunks(1_000).enumerate() {
+                sources::ingest(
+                    &c,
+                    &p,
+                    &sources::SourceInput {
+                        uri: format!("s{b}"),
+                        ..Default::default()
+                    },
+                    batch,
+                )
+                .unwrap();
+            }
+            let has_rare: HashSet<ItemRef> = c
+                .prepare("SELECT rowid FROM chunks_tri WHERE chunks_tri MATCH ?1")
+                .unwrap()
+                .query_map([lexical::quote(rare)], |r| r.get(0))
+                .unwrap()
+                .map(|s| ItemRef::Chunk(s.unwrap()))
+                .collect();
+            assert_eq!(has_rare.len(), n / 500);
+            let text = format!("ภาษาไทย {rare}");
+            let query = Query {
+                conn: &c,
+                index: None,
+                vector: None,
+                text: &text,
+                k: CANDIDATES,
+            };
+            let (scores, _) = query.raw();
+            let mut fused: Vec<(ItemRef, f64)> = scores.into_iter().collect();
+            fused.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
+            let top: Vec<ItemRef> = fused.iter().take(10).map(|(i, _)| *i).collect();
+            rare_in_top.push((rare, top.iter().filter(|i| has_rare.contains(i)).count()));
+        }
+        assert_eq!(rare_in_top, vec![("ตัดสินใจ", 10), ("ทะเลสาบ", 10)]);
+    }
+
     #[test]
     fn current_project_and_status_shape_the_ranking() {
         let f = fx();

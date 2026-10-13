@@ -2,7 +2,7 @@
 //! operators in the query are treated as literal words.
 
 use super::stopwords::is_stopword;
-use crate::codetokens::{expand_code_tokens, is_codeish, joined_names};
+use crate::codetokens::{is_codeish, joined_names, query_code_parts};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use unicode_normalization::char::is_combining_mark;
@@ -67,18 +67,50 @@ fn longer_than(s: &str, chars: usize) -> bool {
     s.chars().nth(chars).is_some()
 }
 
-/// Word separators for the unicode61 terms: whitespace, control characters and ASCII
-/// punctuation except `_` (identifiers stay whole and become a phrase in FTS5).
+/// Word separators of every lexical list: anything but a letter, a digit, a combining mark or
+/// `_`, so whitespace, control and format characters, and ASCII and Unicode punctuation and
+/// symbols (`/ , : ;` and `“ ” ‘ ’ … — –`). `_` keeps an identifier whole (a phrase in FTS5).
 fn is_word_separator(c: char) -> bool {
-    c.is_whitespace() || c.is_control() || (c.is_ascii_punctuation() && c != '_')
+    c != '_' && !c.is_alphanumeric() && !is_combining_mark(c)
 }
 
-/// Whitespace- or control-separated pieces with ASCII punctuation trimmed from both ends.
+/// Query pieces for the trigram and LIKE lists: split at the word separators, `_` trimmed from
+/// both ends (with the punctuation around a piece already split off).
 fn pieces(query: &str) -> impl Iterator<Item = &str> {
     query
-        .split(|c: char| c.is_whitespace() || c.is_control())
-        .map(|w| w.trim_matches(|c: char| c.is_ascii_punctuation()))
+        .split(is_word_separator)
+        .map(|w| w.trim_matches('_'))
         .filter(|w| !w.is_empty())
+}
+
+/// Whether `c` belongs to a script written without spaces between words: Thai, Lao, Tibetan,
+/// Myanmar, Khmer, the Tai scripts, Balinese, Javanese, Yi, and CJK ideographs and kana.
+/// Korean (Hangul) is written with spaces and is not one.
+fn in_unspaced_script(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0E00..=0x0FFF // Thai, Lao, Tibetan
+            | 0x1000..=0x109F // Myanmar
+            | 0x1780..=0x17FF // Khmer
+            | 0x1950..=0x1AAF // Tai Le, New Tai Lue, Khmer Symbols, Buginese, Tai Tham
+            | 0x1B00..=0x1B7F // Balinese
+            | 0x2E80..=0x2FDF // CJK and Kangxi radicals
+            | 0x3005..=0x3007 // ideographic iteration and closing marks, ideographic zero
+            | 0x3021..=0x3029 // Hangzhou numerals
+            | 0x3031..=0x3035 // kana repeat marks
+            | 0x303B..=0x303C
+            | 0x3040..=0x312F // Hiragana, Katakana, Bopomofo
+            | 0x31A0..=0x31FF // Bopomofo Extended, CJK Strokes, Katakana Phonetic Extensions
+            | 0x3400..=0x4DBF // CJK Extension A
+            | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0xA000..=0xA4CF // Yi
+            | 0xA980..=0xA9FF // Javanese, Myanmar Extended-B
+            | 0xAA60..=0xAADF // Myanmar Extended-A, Tai Viet
+            | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+            | 0xFF66..=0xFF9F // halfwidth Katakana
+            | 0x1AFF0..=0x1B16F // Kana Extended-B, Kana Supplement, Kana Extended-A, Small Kana
+            | 0x20000..=0x323AF // CJK Extensions B to H, Compatibility Ideographs Supplement
+    )
 }
 
 /// Words, then identifier parts, that pass `keep`; at most 32.
@@ -96,18 +128,19 @@ fn collect_words(query: &str, keep: impl Fn(&str) -> bool) -> Vec<String> {
             }
         }
     }
-    for w in expand_code_tokens(query).split(' ') {
+    for w in query_code_parts(query) {
         if out.is_full() {
             break;
         }
-        if keep(w) {
-            out.push(w.to_string());
+        if keep(&w) {
+            out.push(w);
         }
     }
     out.terms
 }
 
-/// Lowercase words for the unicode61 index plus identifier parts. At most 32 terms.
+/// Lowercase words for the unicode61 index plus the parts of identifiers as typed (never their
+/// joined forms, which only the identifier list searches). At most 32 terms.
 pub fn word_terms(query: &str) -> Vec<String> {
     collect_words(query, |_| true)
 }
@@ -284,10 +317,11 @@ pub fn code_terms(query: &str) -> Vec<String> {
     out.terms
 }
 
-/// Substring terms for the trigram index: whitespace-separated pieces of at least 3 characters.
-/// Non-ASCII pieces always qualify; ASCII pieces only in queries of one or two words, so long
-/// English questions rely on the word index, and never English stopwords (`the` is a substring
-/// of nearly every text).
+/// Substring terms for the trigram index: pieces of at least 3 characters, split at the same
+/// separators as the word terms (so `ตัดสินใจ/ภาษาไทย`, `“ตัดสินใจ”` and `ตัดสินใจ…` give whole
+/// words). Non-ASCII pieces always qualify; ASCII pieces only in queries of one or two words,
+/// so long English questions rely on the word index, and never English stopwords (`the` is a
+/// substring of nearly every text).
 pub fn trigram_terms(query: &str) -> Vec<String> {
     let short_query = query.split_whitespace().nth(2).is_none();
     let mut out = TermList::new(MAX_TERMS);
@@ -387,10 +421,11 @@ pub fn memory_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
 /// with k = 100, or 25,600 with filters (k = 400). A term with at most its share of matches is
 /// ranked over all of them; matches beyond a term's share are not read (newest first: recall
 /// for very common terms is not exhaustive). A share of a single word costs 5–16 ms at 1M
-/// chunks. The raw word list holds words unicode61 keeps whole; identifiers with `_` and words
-/// it would split at combining marks (Thai) are searched whole in the identifier and trigram
-/// lists instead (see [`raw_word_terms`]), so phrase terms (a phrase reads each piece's matches
-/// with positions for BM25's IDF) are left only for rare punctuation inside a word.
+/// chunks. The raw word list leaves identifiers with `_` to the identifier list and words of
+/// scripts written without spaces (Thai, CJK, ...) to the trigram list (see [`raw_word_terms`]),
+/// so phrase terms (a phrase reads each piece's matches with positions for BM25's IDF) are left
+/// only for words unicode61 splits in other scripts. The trigram list applies the same shares
+/// to its non-ASCII terms ([`chunk_trigram`]).
 pub const RAW_WINDOW: usize = 5_000;
 
 /// Rows each of `n` terms may read: an equal share of `window`, at least `k`.
@@ -473,18 +508,25 @@ fn best_first(
 }
 
 /// The terms of the raw word list: content words and their variants, without identifiers
-/// that hold `_`. Such an identifier is a phrase of its words here ("writer lease"), and BM25's
-/// IDF for a phrase of common words reads every match of each word with its positions (36–50 ms
-/// per term at 1M chunks). The identifier list holds it as one token in every form it is written
-/// in (`self.lease_token_frame`, `LEASE_TOKEN_FRAME_LIMIT`, `lease-token-frame`, ... all carry
-/// `leasetokenframe`), with its own share there, and its words stay here. Words with combining
-/// marks are left out for the same reason: unicode61 splits them there (the Thai `ตัดสินใจ`
-/// becomes `ต`, `ดส`, `นใจ`), so here they would be phrases of common fragments (25–31 ms of IDF
-/// reading at 1M chunks); the trigram list searches them whole, with their own share.
+/// that hold `_` and without words of scripts written without spaces.
+///
+/// An identifier with `_` is a phrase of its words here ("writer lease"), and BM25's IDF for a
+/// phrase of common words reads every match of each word with its positions (36–50 ms per term
+/// at 1M chunks). The identifier list holds it as one token in every form it is written in
+/// (`self.lease_token_frame`, `LEASE_TOKEN_FRAME_LIMIT`, `lease-token-frame`, ... all carry
+/// `leasetokenframe`), with its own share there, and its words stay here.
+///
+/// A word of a script written without spaces (Thai, Lao, Khmer, Myanmar, CJK, ...; any word
+/// holding such a character) is searched through the trigram list only, with combining marks
+/// (`ตัดสินใจ`, which unicode61 splits into `ต`, `ดส`, `นใจ`, a phrase of common fragments costing
+/// 25–31 ms of IDF reading at 1M chunks) or without (`ภาษาไทย`), so a rare and a common word of
+/// such a query are ranked by the same list. Such a word of 1–2 code points is below the
+/// trigram minimum and has no raw-tier list. Other non-ASCII words (accented Latin, Cyrillic,
+/// Greek, ...) stay here.
 fn raw_word_terms(q: &str) -> Vec<String> {
     let mut terms = content_terms(q);
     terms.extend(variant_terms(q));
-    terms.retain(|t| !t.contains('_') && !t.chars().any(is_combining_mark));
+    terms.retain(|t| !t.contains('_') && !t.chars().any(in_unspaced_script));
     terms
 }
 
@@ -513,9 +555,11 @@ pub fn chunk_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
     chunk_code_in(conn, q, k, RAW_WINDOW)
 }
 
-/// Raw chunks holding query substrings. A non-ASCII term (Thai, CJK, ...), for which this is
-/// the main lexical list, reads its newest matches up to its own share of the window,
-/// max(k, `RAW_WINDOW` / number of non-ASCII terms), so its rarity is measured up to that share.
+/// Raw chunks holding query substrings. A non-ASCII term reads its newest matches up to its own
+/// share of the window, max(k, `RAW_WINDOW` / number of non-ASCII terms that have a match), so
+/// its rarity is measured up to that share; a term without a match takes no share, as in the
+/// word and identifier lists. For a word of a script written without spaces (Thai, CJK, ...)
+/// this is the only raw lexical list; other non-ASCII words also have the word list.
 /// An ASCII term reads its newest k substring matches only: as a whole word it has its own
 /// share in the word list, or as an identifier in the identifier list (every written form
 /// carries its joined token), and reading the share of a rare ASCII phrase (`lease_token_frame`,
@@ -533,24 +577,54 @@ pub fn chunk_trigram(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
 /// A trigram candidate: summed weight, then (best position in a term's list, that term).
 type Ranked = (f64, (usize, usize));
 
+/// Newest chunks holding the substring `term`, older than `before` when given, at most `limit`.
+/// Never fails, like [`run`].
+fn newest_substrings(conn: &Connection, term: &str, before: Option<i64>, limit: usize) -> Vec<i64> {
+    let result = (|| -> rusqlite::Result<Vec<i64>> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT rowid FROM chunks_tri WHERE chunks_tri MATCH ?1 AND rowid < ?3 \
+             ORDER BY rowid DESC LIMIT ?2",
+        )?;
+        let params = rusqlite::params![quote(term), limit as i64, before.unwrap_or(i64::MAX)];
+        let rows = stmt.query_map(params, |r| r.get(0))?;
+        rows.collect()
+    })();
+    result.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "fts query failed; treating as no lexical matches");
+        Vec::new()
+    })
+}
+
 fn chunk_trigram_in(conn: &Connection, q: &str, k: usize, window: usize) -> Vec<i64> {
     let terms = trigram_terms(q);
-    let non_ascii = terms.iter().filter(|t| !t.is_ascii()).count();
+    // Each non-ASCII term first reads up to the share of all of them; the read tells which have
+    // a match (no separate probe). Terms without one take no share: when some have none, the
+    // others read on from their oldest row read so far, up to the share of those with a match.
+    let first = share(window, terms.iter().filter(|t| !t.is_ascii()).count(), k);
+    let mut lists: Vec<Vec<i64>> = terms
+        .iter()
+        .map(|t| newest_substrings(conn, t, None, if t.is_ascii() { k } else { first }))
+        .collect();
+    let matched = terms
+        .iter()
+        .zip(&lists)
+        .filter(|(t, ids)| !t.is_ascii() && !ids.is_empty())
+        .count();
+    let full = share(window, matched, k);
+    if full > first {
+        for (t, ids) in terms.iter().zip(lists.iter_mut()) {
+            if let Some(&oldest) = ids.last()
+                && !t.is_ascii()
+                && ids.len() == first
+            {
+                ids.extend(newest_substrings(conn, t, Some(oldest), full - first));
+            }
+        }
+    }
     // Per chunk: summed weight, then (its best position in any term's newest-first list, that
     // term's index) so that ties are taken term by term, round-robin.
     let mut found: HashMap<i64, Ranked> = HashMap::new();
-    for (term, t) in terms.iter().enumerate() {
-        let limit = if t.is_ascii() {
-            k
-        } else {
-            share(window, non_ascii, k)
-        };
-        let ids = run(
-            conn,
-            "SELECT rowid FROM chunks_tri WHERE chunks_tri MATCH ?1 ORDER BY rowid DESC LIMIT ?2",
-            Some(quote(t)),
-            limit,
-        );
+    for (term, ids) in lists.into_iter().enumerate() {
         let weight = 1.0 / ids.len().max(1) as f64;
         for (pos, id) in ids.into_iter().enumerate() {
             let e = found.entry(id).or_insert((0.0, (pos, term)));
@@ -570,7 +644,8 @@ fn chunk_trigram_in(conn: &Connection, q: &str, k: usize, window: usize) -> Vec<
 }
 
 /// Non-ASCII terms of 1–2 code points (e.g. Thai "จำ" = จ + ำ) are below the trigram minimum.
-/// At most 8 terms.
+/// At most 8 terms. Only the knowledge tier has a list for them ([`memory_like`]); in the raw
+/// tier such a word of a script written without spaces has no lexical list.
 pub fn short_terms(query: &str) -> Vec<String> {
     let mut out = TermList::new(8);
     for w in pieces(query) {
@@ -1051,18 +1126,17 @@ mod tests {
         );
     }
 
-    /// A word unicode61 splits itself (a Thai word at its combining vowel and tone marks:
-    /// `ตัดสินใจ` becomes `ต`, `ดส`, `นใจ`) would be a phrase of common fragments in the word list,
-    /// 25–31 ms of IDF reading at 1M chunks; the trigram list searches it whole, with its own
-    /// share. Words unicode61 keeps whole (`ภาษาไทย`) stay in the word list.
+    /// Fix round 4 (R1): in the raw tier every word of a script written without spaces (Thai,
+    /// Lao, Khmer, Myanmar, CJK), with combining marks (`ตัดสินใจ`) or without (`ภาษาไทย`), is
+    /// searched through the trigram list only, so a rare word and a common one are ranked by
+    /// the same list.
     #[test]
-    fn raw_word_terms_leave_words_unicode61_splits_to_the_trigram_list() {
-        let terms = raw_word_terms("ตัดสินใจ ภาษาไทย แก้บั๊ก deploy");
+    fn raw_word_terms_leave_every_unspaced_script_word_to_the_trigram_list() {
+        let terms = raw_word_terms("ตัดสินใจ ภาษาไทย แก้บั๊ก ລາວ ខ្មែរ မြန်မာ 記憶 メモリ deploy apiภาษา");
         assert_eq!(
             terms,
             vec![
-                "ภาษาไทย".to_string(),
-                "deploy".into(),
+                "deploy".to_string(),
                 "deploys".into(),
                 "deployed".into(),
                 "deploying".into()
@@ -1075,6 +1149,146 @@ mod tests {
             chunk_trigram_in(&c, "ตัดสินใจ ภาษาไทย", 3, 6).first(),
             Some(&seqs[0])
         );
+    }
+
+    /// Fix round 4 (R1): other non-ASCII words stay in the raw word list, including a word with
+    /// a combining accent unicode61 folds into the word (`па́мять`, Cyrillic а + U+0301, has no
+    /// precomposed form, so NFC keeps the mark).
+    #[test]
+    fn accented_latin_cyrillic_and_greek_words_stay_in_the_raw_word_list() {
+        let terms = raw_word_terms("café па\u{301}мять память λόγος");
+        for want in ["café", "па\u{301}мять", "память", "λόγος"] {
+            assert!(terms.contains(&want.to_string()), "{want} in {terms:?}");
+        }
+        let mut texts = vec!["память о проекте".to_string(), "le café du coin".into()];
+        texts.extend((0..5).map(|i| format!("filler{i}")));
+        let (_d, c, seqs) = chunks_db(&texts);
+        assert_eq!(chunk_words(&c, "па\u{301}мять", 10), vec![seqs[0]]);
+        assert_eq!(chunk_words(&c, "café", 10), vec![seqs[1]]);
+    }
+
+    /// Fix round 4 (R2): a Thai word touching punctuation (ASCII or Unicode) is still searched
+    /// by the raw tier: the trigram list's pieces split at the word list's separators.
+    #[test]
+    fn every_punctuated_thai_form_is_found_by_the_raw_tier() {
+        let mut texts = vec!["ตัดสินใจ x1".to_string(), "แก้บั๊ก y1".into()];
+        texts.extend((0..10).map(|i| format!("ภาษาไทย filler{i}")));
+        let (_d, c, seqs) = chunks_db(&texts);
+        let (decided, fixed) = (seqs[0], seqs[1]);
+        for (q, want) in [
+            ("ตัดสินใจ/ภาษาไทย", vec![decided]),
+            ("ตัดสินใจ,แก้บั๊ก", vec![decided, fixed]),
+            ("แก้บั๊ก:writer_lease", vec![fixed]),
+            ("“ตัดสินใจ”", vec![decided]),
+            ("‘แก้บั๊ก’", vec![fixed]),
+            ("ตัดสินใจ…", vec![decided]),
+            ("ตัดสินใจ—แก้บั๊ก", vec![decided, fixed]),
+            ("แก้บั๊ก–ตัดสินใจ;", vec![decided, fixed]),
+            ("(ตัดสินใจ)", vec![decided]),
+        ] {
+            let found: HashSet<i64> = chunk_words(&c, q, 10)
+                .into_iter()
+                .chain(chunk_code(&c, q, 10))
+                .chain(chunk_trigram(&c, q, 10))
+                .collect();
+            for id in want {
+                assert!(found.contains(&id), "{q}: {id} not in {found:?}");
+            }
+        }
+        assert_eq!(trigram_terms("“ตัดสินใจ”"), vec!["ตัดสินใจ".to_string()]);
+        assert_eq!(
+            trigram_terms("ตัดสินใจ/ภาษาไทย"),
+            vec!["ตัดสินใจ".to_string(), "ภาษาไทย".into()]
+        );
+    }
+
+    /// Fix round 4 (R4): a non-ASCII trigram term without a match takes no share. Four absent
+    /// Thai words beside a rare and a common one, window 12, k 3: the two present terms read 6
+    /// rows each, so the rare word's 5 chunks are all read and outrank the common word's.
+    #[test]
+    fn a_trigram_term_without_a_match_takes_no_share() {
+        let mut texts: Vec<String> = (0..5).map(|i| format!("สัญญาเช่าบ้าน r{i}")).collect();
+        texts.extend((0..20).map(|i| format!("ภาษาไทย c{i}")));
+        let (_d, c, seqs) = chunks_db(&texts);
+        let q = "ภาษาไทย สัญญาเช่าบ้าน ทะเลสาบ นกยูง ภูเขาไฟ ดาวเทียม";
+        let found = chunk_trigram_in(&c, q, 3, 12);
+        assert_eq!(found, vec![seqs[4], seqs[3], seqs[2]], "{found:?}");
+    }
+
+    /// Fix round 4 (R5): a long identifier does not push later words out of the word-list
+    /// terms: a query uses each name's parts as typed, not its 2–6 word runs.
+    #[test]
+    fn a_long_identifier_does_not_push_later_words_out() {
+        let q = "alpha_beta_gamma_delta_epsilon_zeta_eta_theta_iota_kappa_lambda_omicron \
+                 writer_lease deploy";
+        for (name, terms) in [
+            ("word_terms", word_terms(q)),
+            ("content_terms", content_terms(q)),
+            ("raw_word_terms", raw_word_terms(q)),
+        ] {
+            for want in ["alpha", "omicron", "writer", "lease", "deploy"] {
+                assert!(
+                    terms.contains(&want.to_string()),
+                    "{name}: {want} in {terms:?}"
+                );
+            }
+        }
+    }
+
+    /// Fix round 4 (R5): dates and number ranges make no identifier terms; kebab-case words do.
+    #[test]
+    fn hyphenated_numbers_make_no_code_terms() {
+        assert!(code_terms("2026-10-14 15-45").is_empty());
+        assert_eq!(code_terms("well-known"), vec!["wellknown".to_string()]);
+    }
+
+    /// Fix round 4 (R5): joined forms of identifiers are the identifier list's terms only; the
+    /// word lists (both tiers) get the parts as typed. The identifier list gets the joined form
+    /// of the whole token and of each name in it, not every run of its words.
+    #[test]
+    fn joined_runs_stay_out_of_word_list_terms() {
+        let q = "lease_token_frame_limit crate::daemon::writer_lease self.parse_hlc";
+        let joined = [
+            "leasetoken",
+            "tokenframe",
+            "framelimit",
+            "leasetokenframe",
+            "tokenframelimit",
+            "leasetokenframelimit",
+            "writerlease",
+            "daemonwriterlease",
+            "cratedaemonwriterlease",
+            "parsehlc",
+            "selfparsehlc",
+        ];
+        for (name, terms) in [
+            ("word_terms", word_terms(q)),
+            ("content_terms", content_terms(q)),
+            ("raw_word_terms", raw_word_terms(q)),
+        ] {
+            for j in joined {
+                assert!(!terms.contains(&j.to_string()), "{name}: {j} in {terms:?}");
+            }
+            for part in ["lease", "token", "frame", "limit", "writer", "parse", "hlc"] {
+                assert!(
+                    terms.contains(&part.to_string()),
+                    "{name}: {part} in {terms:?}"
+                );
+            }
+        }
+        let code = code_terms(q);
+        for want in [
+            "leasetokenframelimit",
+            "cratedaemonwriterlease",
+            "writerlease",
+            "selfparsehlc",
+            "parsehlc",
+        ] {
+            assert!(code.contains(&want.to_string()), "{want} in {code:?}");
+        }
+        for run in ["leasetoken", "tokenframe", "leasetokenframe"] {
+            assert!(!code.contains(&run.to_string()), "{run} in {code:?}");
+        }
     }
 
     /// Terms without a match do not take a share: with four absent words beside two present

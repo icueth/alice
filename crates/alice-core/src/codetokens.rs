@@ -15,9 +15,18 @@ fn has_case_change(tok: &str) -> bool {
         .any(|w| (w[0].is_lowercase() || w[0].is_ascii_digit()) && w[1].is_uppercase())
 }
 
-/// Looks like an identifier or a path rather than a plain word (kebab-case included).
+/// Looks like an identifier or a path rather than a plain word. A hyphen alone makes it
+/// kebab-case only when every hyphen-separated part has a letter (`well-known`,
+/// `lease-token-frame`), so dates and number ranges (`2026-10-14`, `15-45`) are not code.
 pub fn is_codeish(tok: &str) -> bool {
-    tok.contains(['_', '/', '.', ':', '-']) || has_case_change(tok)
+    tok.contains(['_', '/', '.', ':']) || has_case_change(tok) || is_kebab(tok)
+}
+
+fn is_kebab(tok: &str) -> bool {
+    tok.contains('-')
+        && tok
+            .split('-')
+            .all(|part| part.chars().any(char::is_alphabetic))
 }
 
 /// Words of one name in a token: `lease_token_frame` -> lease, token, frame;
@@ -31,7 +40,7 @@ fn name_words(name: &str) -> Vec<String> {
 }
 
 /// Most words of one name used for joined runs, and the longest run: bounds the tokens a long
-/// name adds (at most 12 words, runs of up to 6: 57 joins).
+/// name adds (at most 12 words, runs of 2 to 6: 11 + 10 + 9 + 8 + 7 = 45 joins).
 const MAX_RUN_WORDS: usize = 12;
 const MAX_RUN: usize = 6;
 
@@ -81,54 +90,87 @@ pub fn split_camel(s: &str) -> Vec<String> {
     parts
 }
 
-/// Lowercase words derived from code-like tokens in `text`, space separated, without duplicates.
-/// Plain prose yields an empty string.
-pub fn expand_code_tokens(text: &str) -> String {
-    let mut seen = HashSet::new();
-    let mut out: Vec<String> = Vec::new();
-    let mut push = |w: String, out: &mut Vec<String>| {
-        if w.chars().count() >= 2 && seen.insert(w.clone()) {
-            out.push(w);
+/// Code-like tokens in `text`: identifiers and paths of at least 3 characters.
+fn code_like(text: &str) -> impl Iterator<Item = &str> {
+    TOKEN
+        .find_iter(text)
+        .map(|m| m.as_str())
+        .filter(|tok| tok.len() >= 3 && is_codeish(tok))
+}
+
+/// Lowercase words of at least 2 characters, in first-seen order without duplicates.
+#[derive(Default)]
+struct Words {
+    seen: HashSet<String>,
+    out: Vec<String>,
+}
+
+impl Words {
+    fn push(&mut self, w: String) {
+        if w.chars().count() >= 2 && self.seen.insert(w.clone()) {
+            self.out.push(w);
         }
-    };
-    for m in TOKEN.find_iter(text) {
-        let tok = m.as_str();
-        if tok.len() < 3 || !is_codeish(tok) {
-            continue;
-        }
-        let whole: String = tok
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .collect::<String>()
-            .to_lowercase();
-        push(whole, &mut out);
+    }
+
+    /// The parts of `tok` as written: each segment between `_ / . : -`, and its camel-case
+    /// words when it has several (`HostLink_reconnect` -> `hostlink`, `host`, `link`,
+    /// `reconnect`).
+    fn push_parts(&mut self, tok: &str) {
         for segment in tok
             .split(['_', '/', '.', ':', '-'])
             .filter(|s| !s.is_empty())
         {
             let pieces = split_camel(segment);
             if pieces.len() > 1 {
-                push(segment.to_lowercase(), &mut out);
+                self.push(segment.to_lowercase());
             }
             for piece in pieces {
-                push(piece.to_lowercase(), &mut out);
+                self.push(piece.to_lowercase());
             }
         }
+    }
+}
+
+/// Lowercase words derived from code-like tokens in `text`, space separated, without duplicates,
+/// for the index. Plain prose yields an empty string.
+pub fn expand_code_tokens(text: &str) -> String {
+    let mut words = Words::default();
+    for tok in code_like(text) {
+        words.push(
+            tok.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_lowercase(),
+        );
+        words.push_parts(tok);
         // Joined runs of consecutive words within each name, so a qualified or compound form
         // (`self.lease_token_frame`, `store/lease_token_frame.rs`, `LEASE_TOKEN_FRAME_LIMIT`,
         // `lease-token-frame`) also carries `leasetokenframe`, the token a search for
-        // `lease_token_frame` looks for. Never across `/ . :`.
+        // `lease_token_frame` looks for. Never across `/ . :`. Index side only: a query
+        // searches the joined form of each name it contains ([`joined_names`]).
         for name in names(tok) {
-            let words = name_words(name);
-            let words = &words[..words.len().min(MAX_RUN_WORDS)];
-            for len in 2..=words.len().min(MAX_RUN) {
-                for run in words.windows(len) {
-                    push(joined(run), &mut out);
+            let name_words = name_words(name);
+            let name_words = &name_words[..name_words.len().min(MAX_RUN_WORDS)];
+            for len in 2..=name_words.len().min(MAX_RUN) {
+                for run in name_words.windows(len) {
+                    words.push(joined(run));
                 }
             }
         }
     }
-    out.join(" ")
+    words.out.join(" ")
+}
+
+/// The parts of the code-like tokens in a query, as typed (segments and their camel-case words),
+/// lowercase, without duplicates: what the word lists search for an identifier. No joined forms:
+/// those are the identifier list's terms, and the word lists never search them, so a long
+/// identifier adds one term per word it is made of, not every run of its words.
+pub fn query_code_parts(query: &str) -> Vec<String> {
+    let mut words = Words::default();
+    for tok in code_like(query) {
+        words.push_parts(tok);
+    }
+    words.out
 }
 
 #[cfg(test)]
@@ -186,6 +228,19 @@ mod tests {
         assert!(w.contains(&"writerlease".to_string()), "{w:?}");
         // Joins stay within one name: no join across the path separator.
         assert!(!w.contains(&"selfwriter".to_string()), "{w:?}");
+    }
+
+    /// Fix round 4 (R5): a hyphenated token is kebab-case code only when every hyphen-separated
+    /// part has a letter; dates and number ranges are not identifiers.
+    #[test]
+    fn hyphenated_numbers_are_not_code() {
+        assert_eq!(expand_code_tokens("on 2026-10-14 from 15-45"), "");
+        assert!(!is_codeish("2026-10-14"));
+        assert!(!is_codeish("15-45"));
+        let w = words("a well-known lease-token-frame");
+        for want in ["wellknown", "well", "known", "leasetokenframe"] {
+            assert!(w.contains(&want.to_string()), "{want} missing from {w:?}");
+        }
     }
 
     #[test]
