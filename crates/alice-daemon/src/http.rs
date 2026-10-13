@@ -325,7 +325,8 @@ async fn admin_shutdown(State(st): State<AppState>) -> StatusCode {
     StatusCode::ACCEPTED
 }
 
-/// Build the router. Task 12 adds the `/mcp` service inside the token-guarded part.
+/// Build the router: the public ping, and everything else (the JSON API and the MCP service
+/// at `/mcp`) behind the token, Host and Origin guard.
 pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: CancellationToken) -> Router {
     let token: Arc<str> = token.into();
     let g = Guard::new(token.clone(), port);
@@ -350,6 +351,11 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/facts/assert", post(assert_fact))
         .route("/api/v1/ingest", post(ingest))
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
+        // Before the guard layer, so `/mcp` is covered by it.
+        .nest_service(
+            "/mcp",
+            crate::mcp::http_service(state.svc.clone(), port, state.shutdown.clone()),
+        )
         .with_state(state)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn_with_state(g, guard));

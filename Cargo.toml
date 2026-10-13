@@ -39,6 +39,9 @@ axum = "0.8.9"
 tokio-util = "0.7.20"
 getrandom = "0.4.3"
 hmac = "0.13.0"
+rmcp = { version = "3.5.1", features = ["server", "macros", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
+url = "2.5.8"
+libc = "0.2.190"
 
 [profile.release]
 lto = "thin"

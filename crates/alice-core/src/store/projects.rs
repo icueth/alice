@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 pub const GLOBAL_ID: &str = "00000000000000000000GLOBAL";
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedProject {
     pub id: String,
     pub slug: String,
