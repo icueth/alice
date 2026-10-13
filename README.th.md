@@ -191,7 +191,7 @@ alice projects | status
 alice daemon start | stop | status | logs | run
 alice mcp                      # MCP server แบบ stdio สำหรับ agent
 alice model fetch
-alice bench [--chunks n] [--memories n] [--real] [--out file.json]
+alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 ```
 
 ทุกคำสั่งใส่ `--json` ได้ ที่วางแผนไว้: `review`, `undo` (M2), `config`, `doctor`, `service`, `token rotate` (M2), `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3)
@@ -276,11 +276,11 @@ drawer ที่ mine มาจาก transcript และไฟล์กลา�
 
 | | เป้าหมาย | 100k chunk, โมเดลในเครื่อง | 1M chunk |
 |---|---|---|---|
-| `remember` ตอบรับ | < 50ms | 4.3ms | 2.8ms |
-| `recall` (ชั้นความรู้) | < 200ms | 9.8ms | 10.5ms |
-| `recall` แบบ `include_raw` | < 200ms | 47ms | 172ms |
-| `context` | < 150ms | 0.3ms | 0.5ms |
-| หน่วยความจำของ daemon | < 800MB ที่ 1M chunk | ~0.7GB | ~0.7GB ถ้าไม่นับโมเดล ถ้ารวมโมเดลคาดว่า ~1.3GB (ยังไม่ผ่านเป้า) |
+| `remember` ตอบรับ | < 50ms | 6.6ms | 11.1ms |
+| `recall` (ชั้นความรู้) | < 200ms | 10.0ms | 11.8ms |
+| `recall` แบบ `include_raw` | < 200ms | 55ms | 185ms |
+| `context` | < 150ms | 0.5ms | 0.7ms |
+| หน่วยความจำของ daemon ปกติ / สูงสุด | < 800MB ที่ 1M chunk | ~0.7GB / 0.85GB | ไม่รวมโมเดล ~0.75GB / 0.85GB ถ้ารวมโมเดลคาดว่า ~1.3GB / ~1.6GB (ยังไม่ผ่านเป้า) |
 
 รอบ 1M chunk ใช้ embedder จำลอง ส่วนโมเดลในเครื่องที่โหลดแล้วหนึ่งชุดกินหน่วยความจำราว 600MB ด้วยตัวมันเอง
 

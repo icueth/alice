@@ -191,7 +191,7 @@ alice projects | status
 alice daemon start | stop | status | logs | run
 alice mcp                      # stdio MCP server for agents
 alice model fetch
-alice bench [--chunks n] [--memories n] [--real] [--out file.json]
+alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 ```
 
 Every command takes `--json`. Planned: `review`, `undo` (M2), `config`, `doctor`, `service`, `token rotate` (M2), `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3).
@@ -276,11 +276,11 @@ Measured for M1 on an Apple M4 Pro with `alice bench` ([full results](docs/bench
 
 | | Budget | 100k chunks, local model | 1M chunks |
 |---|---|---|---|
-| `remember` acknowledgement | < 50 ms | 4.3 ms | 2.8 ms |
-| `recall` (knowledge) | < 200 ms | 9.8 ms | 10.5 ms |
-| `recall` with `include_raw` | < 200 ms | 47 ms | 172 ms |
-| `context` | < 150 ms | 0.3 ms | 0.5 ms |
-| Daemon memory | < 800 MB at 1M chunks | ~0.7 GB | ~0.7 GB without the model; ~1.3 GB projected with it (not yet met) |
+| `remember` acknowledgement | < 50 ms | 6.6 ms | 11.1 ms |
+| `recall` (knowledge) | < 200 ms | 10.0 ms | 11.8 ms |
+| `recall` with `include_raw` | < 200 ms | 55 ms | 185 ms |
+| `context` | < 150 ms | 0.5 ms | 0.7 ms |
+| Daemon memory, steady / peak | < 800 MB at 1M chunks | ~0.7 GB / 0.85 GB | without the model ~0.75 GB / 0.85 GB; with it ~1.3 GB / ~1.6 GB projected (not yet met) |
 
 The 1M-chunk run uses a fake embedder; one loaded copy of the local model takes ~600 MB on its own.
 
