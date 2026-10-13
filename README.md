@@ -276,11 +276,11 @@ Measured for M1 on an Apple M4 Pro with `alice bench` ([full results](docs/bench
 
 | | Budget | 100k chunks, local model | 1M chunks |
 |---|---|---|---|
-| `remember` acknowledgement | < 50 ms | 6.6 ms | 11.1 ms |
-| `recall` (knowledge) | < 200 ms | 10.0 ms | 11.8 ms |
-| `recall` with `include_raw` | < 200 ms | 55 ms | 185 ms |
-| `context` | < 150 ms | 0.5 ms | 0.7 ms |
-| Daemon memory, steady / peak | < 800 MB at 1M chunks | ~0.7 GB / 0.85 GB | without the model ~0.75 GB / 0.85 GB; with it ~1.3 GB / ~1.6 GB projected (not yet met) |
+| `remember` acknowledgement | < 50 ms | 4.8 ms | 3.3 ms |
+| `recall` (knowledge) | < 200 ms | 7.7 ms | 10.6 ms |
+| `recall` with `include_raw` | < 200 ms | 27 ms | 156 ms |
+| `context` | < 150 ms | 0.3 ms | 0.8 ms |
+| Daemon memory: RSS steady / peak (physical footprint) | < 800 MB RSS at 1M chunks | 0.98 / 1.0 GB (0.7 / 0.84 GB) | without the model 0.78–0.85 / 0.85 GB (0.77–0.87 / 0.87 GB); with it ~1.4 GB steady and ~1.7 GB peak RSS projected (not yet met) |
 
 The 1M-chunk run uses a fake embedder; one loaded copy of the local model takes ~600 MB on its own.
 
