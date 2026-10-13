@@ -155,6 +155,9 @@ struct Part {
     /// Thread slots reserved in usearch; also the gate's limit.
     threads: usize,
     dirty: AtomicBool,
+    /// The file this part was last opened from or saved to. With `dirty` unset, that file holds
+    /// exactly this part, so saving to it again can be skipped.
+    synced: Mutex<Option<PathBuf>>,
     gate: Gate,
     /// Runs inside `put` right after the write lock is taken, so tests can hold it.
     #[cfg(test)]
@@ -168,6 +171,7 @@ impl Part {
             writer: Mutex::new(()),
             threads,
             dirty: AtomicBool::new(false),
+            synced: Mutex::new(None),
             gate: Gate {
                 busy: Mutex::new(0),
                 cv: Condvar::new(),
@@ -215,7 +219,9 @@ impl Part {
         index
             .reserve_capacity_and_threads(cap, THREADS)
             .map_err(err)?;
-        Ok(Self::wrap(index, THREADS))
+        let part = Self::wrap(index, THREADS);
+        *part.synced.lock() = Some(path.to_path_buf());
+        Ok(part)
     }
 
     /// Make room for `extra` more vectors. `i` is write-locked by the caller.
@@ -284,14 +290,20 @@ impl Part {
         self.dirty.load(Ordering::Relaxed)
     }
 
-    /// Atomic save: write and sync a temp file, then rename it over the old one.
+    /// Atomic save: write and sync a temp file, then rename it over the old one. Skipped when
+    /// nothing changed since this part was opened from or saved to `path` and the file is still
+    /// there (the chunk part can be hundreds of MB; one new memory must not rewrite it).
     fn save(&self, path: &Path) -> Result<()> {
         let tmp = path.with_extension("usearch.tmp");
         let tmp_name = utf8(&tmp)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Writes take this mutex too, so the dirty flag cannot change until the save is done.
         let _writer = self.writer.lock();
+        if !self.is_dirty() && self.synced.lock().as_deref() == Some(path) && path.exists() {
+            return Ok(());
+        }
         // The read guard lives for this statement only: searches go on, writers wait above.
         let snapshot = self.inner.read().save(tmp_name).map_err(err);
         let written = snapshot.and_then(|()| {
@@ -308,6 +320,7 @@ impl Part {
         }
         written?;
         self.dirty.store(false, Ordering::Relaxed);
+        *self.synced.lock() = Some(path.to_path_buf());
         Ok(())
     }
 }
@@ -415,7 +428,8 @@ impl VectorIndex {
     }
 
     /// Write `path.with_extension("memories.usearch")` and `path.with_extension("chunks.usearch")`,
-    /// each atomically. Both are always written, so the pair on disk never mixes two indexes.
+    /// each atomically. A part that has not changed since it was opened from or saved to that
+    /// same file (which still exists) is not rewritten; every other part is.
     pub fn save(&self, path: &Path) -> Result<()> {
         utf8(path)?;
         let (memories, chunks) = part_paths(path);
@@ -1034,6 +1048,98 @@ mod tests {
         assert!(
             VectorIndex::open(&path, 384).is_err(),
             "memories file missing"
+        );
+    }
+
+    /// (inode, mtime): a rewrite by temp file + rename changes the inode.
+    fn fingerprint(p: &Path) -> (u64, std::time::SystemTime) {
+        let m = std::fs::metadata(p).unwrap();
+        #[cfg(unix)]
+        let ino = std::os::unix::fs::MetadataExt::ino(&m);
+        #[cfg(not(unix))]
+        let ino = 0;
+        (ino, m.modified().unwrap())
+    }
+
+    /// A save after a single remember must not rewrite the (huge) clean chunk part.
+    #[test]
+    fn save_rewrites_only_the_parts_that_changed() {
+        let e = FakeEmbedder::new(384);
+        let idx = VectorIndex::new(384).unwrap();
+        idx.upsert_batch(&[
+            (VecKey::Memory(1), v(&e, "alpha")),
+            (VecKey::Chunk(1), v(&e, "beta")),
+        ])
+        .unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("m.usearch");
+        idx.save(&path).unwrap();
+        let (mem, chunks) = part_paths(&path);
+        let chunks_before = fingerprint(&chunks);
+        let mem_bytes = std::fs::read(&mem).unwrap();
+        // Long enough for a rewrite to show in the mtime on coarse filesystems too.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        idx.upsert(VecKey::Memory(2), &v(&e, "gamma")).unwrap();
+        assert!(idx.memories.is_dirty() && !idx.chunks.is_dirty());
+        idx.save(&path).unwrap();
+        assert_eq!(
+            fingerprint(&chunks),
+            chunks_before,
+            "the clean chunk part was rewritten"
+        );
+        assert_ne!(
+            std::fs::read(&mem).unwrap(),
+            mem_bytes,
+            "the memory part was saved"
+        );
+        assert!(!idx.is_dirty());
+        assert!(no_temp_files(d.path()));
+        let back = VectorIndex::open(&path, 384).unwrap();
+        assert_eq!((back.memories.len(), back.chunks.len()), (2, 1));
+
+        let both = (fingerprint(&mem), fingerprint(&chunks));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        idx.save(&path).unwrap();
+        assert_eq!(
+            (fingerprint(&mem), fingerprint(&chunks)),
+            both,
+            "nothing changed"
+        );
+    }
+
+    /// Skipping is only safe when the part's file is this index's own copy.
+    #[test]
+    fn clean_parts_are_written_where_this_index_has_no_file() {
+        let e = FakeEmbedder::new(384);
+        let d = tempfile::tempdir().unwrap();
+        let first = d.path().join("a.usearch");
+        let idx = VectorIndex::new(384).unwrap();
+        idx.upsert(VecKey::Memory(1), &v(&e, "alpha")).unwrap();
+        assert!(!idx.chunks.is_dirty(), "the empty chunk part never changed");
+        idx.save(&first).unwrap();
+        let (_, first_chunks) = part_paths(&first);
+        assert!(first_chunks.exists(), "a never-saved part is written");
+        assert_eq!(VectorIndex::open(&first, 384).unwrap().len(), 1);
+
+        let second = d.path().join("b.usearch");
+        idx.save(&second).unwrap();
+        assert_eq!(
+            VectorIndex::open(&second, 384).unwrap().len(),
+            1,
+            "another path gets both parts"
+        );
+
+        let opened = VectorIndex::open(&first, 384).unwrap();
+        let third = d.path().join("c.usearch");
+        opened.save(&third).unwrap();
+        assert_eq!(VectorIndex::open(&third, 384).unwrap().len(), 1);
+
+        std::fs::remove_file(&first_chunks).unwrap();
+        opened.save(&first).unwrap();
+        assert!(
+            first_chunks.exists(),
+            "a clean part whose file is gone is written again"
         );
     }
 

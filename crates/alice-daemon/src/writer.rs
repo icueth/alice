@@ -23,9 +23,11 @@ use tokio::sync::oneshot;
 
 const BATCH_WINDOW: Duration = Duration::from_millis(2);
 const BATCH_MAX: usize = 256;
-/// Raw chunks written per batch. A larger ingest continues in the following batches (each its
-/// own short transaction) and is acknowledged once all of it is committed.
+/// Raw chunks written per batch, at most. A larger ingest continues in the following batches
+/// (each its own short transaction) and is acknowledged once all of it is committed.
 const INGEST_SLICE: usize = 200;
+/// Chunk text written per batch, at most (FTS work grows with text, not with chunk count).
+const INGEST_SLICE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum ProjectChoice {
@@ -174,6 +176,8 @@ struct State {
     inserted: bool,
     /// Raw chunks this batch may still write.
     chunk_budget: usize,
+    /// Bytes of chunk text this batch may still write.
+    byte_budget: usize,
 }
 
 impl State {
@@ -183,6 +187,25 @@ impl State {
         }
         Ok(self.matcher.as_ref().expect("loaded above"))
     }
+}
+
+/// How many leading `chunks` fit in a slice with room for `max_chunks` chunks and `max_bytes` of
+/// text. A slice with all of its byte room takes at least one chunk, so a large chunk is never
+/// deferred forever (chunks are at most 32 KB, so this is a safety net).
+fn slice_len(chunks: &[ChunkInput], (max_chunks, max_bytes): (usize, usize)) -> usize {
+    let mut bytes = 0;
+    let mut n = 0;
+    for c in chunks.iter().take(max_chunks) {
+        bytes += c.text.len();
+        if bytes > max_bytes {
+            break;
+        }
+        n += 1;
+    }
+    if n == 0 && max_chunks > 0 && max_bytes >= INGEST_SLICE_BYTES {
+        n = chunks.len().min(1);
+    }
+    n
 }
 
 fn ingest_slice(
@@ -197,7 +220,7 @@ fn ingest_slice(
         // The whole request is checked before its first slice is written.
         sources::validate_chunks(&chunks)?;
     }
-    let take = st.chunk_budget.min(chunks.len());
+    let take = slice_len(&chunks, (st.chunk_budget, st.byte_budget));
     if take == 0 && !chunks.is_empty() {
         let op = WriteOp::Ingest {
             project,
@@ -210,6 +233,8 @@ fn ingest_slice(
     let p = resolve(conn, &project)?;
     let out = sources::ingest(conn, &p, &source, &chunks)?;
     st.chunk_budget -= take;
+    let bytes: usize = chunks.iter().map(|c| c.text.len()).sum();
+    st.byte_budget = st.byte_budget.saturating_sub(bytes);
     if out.inserted > 0 {
         st.inserted = true;
     }
@@ -439,6 +464,7 @@ pub fn spawn_writer(
                 matcher: None,
                 inserted: false,
                 chunk_budget: INGEST_SLICE,
+                byte_budget: INGEST_SLICE_BYTES,
             };
             let mut carry: VecDeque<Job> = VecDeque::new();
             let mut stopping = false;
@@ -473,6 +499,7 @@ pub fn spawn_writer(
                 }
                 st.inserted = false;
                 st.chunk_budget = INGEST_SLICE;
+                st.byte_budget = INGEST_SLICE_BYTES;
                 let out = run_batch(&mut conn, batch, &mut st, &ro);
                 match out.commit {
                     Ok(()) => {
@@ -975,6 +1002,64 @@ mod tests {
         let again = ingested(f.h.submit(ingest("bulk", 1_000, long_text)).await);
         assert_eq!((again.inserted, again.skipped), (0, 1_000));
         assert_eq!(again.source_id, out.source_id);
+    }
+
+    /// Slices are bounded by text size too: 100 chunks of 16 KB are far more work than 200
+    /// short lines, and a small write must still not wait for all of them.
+    #[tokio::test]
+    async fn small_writes_do_not_wait_for_a_bulk_ingest_of_large_chunks() {
+        let f = fixture();
+        let reader = alice_core::store::open_reader(&f.db()).unwrap();
+        let big = |i: usize| {
+            let mut t = long_text(i);
+            while t.len() < 16 * 1024 {
+                t.push(' ');
+                t.push_str(&long_text(i + t.len()));
+            }
+            t
+        };
+        let (bulk, chunks_at_ack) = tokio::join!(f.h.submit(ingest("big", 100, big)), async {
+            f.h.submit(remember("small and urgent")).await.unwrap();
+            reader
+                .query_row("SELECT count(*) FROM chunks", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        });
+        assert!(
+            chunks_at_ack < 100,
+            "the small write waited for the whole ingest ({chunks_at_ack} chunks were already in)"
+        );
+        assert_eq!(ingested(bulk).inserted, 100);
+    }
+
+    #[test]
+    fn a_slice_is_bounded_by_chunks_and_bytes_and_holds_at_least_one_chunk() {
+        let chunks = |n: usize, len: usize| -> Vec<ChunkInput> {
+            (0..n)
+                .map(|i| ChunkInput {
+                    ord: i as i64,
+                    text: "x".repeat(len),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let fresh = (INGEST_SLICE, INGEST_SLICE_BYTES);
+        assert_eq!(slice_len(&chunks(1_000, 60), fresh), INGEST_SLICE);
+        assert_eq!(slice_len(&chunks(1_000, 2_048), fresh), 32);
+        assert_eq!(slice_len(&chunks(10, 32_768), fresh), 2);
+        assert_eq!(
+            slice_len(&chunks(10, 100_000), fresh),
+            1,
+            "a fresh slice takes one chunk"
+        );
+        assert_eq!(slice_len(&chunks(3, 10), fresh), 3);
+        assert_eq!(slice_len(&chunks(10, 2_048), (4, INGEST_SLICE_BYTES)), 4);
+        assert_eq!(slice_len(&chunks(10, 2_048), (INGEST_SLICE, 5_000)), 2);
+        assert_eq!(
+            slice_len(&chunks(10, 32_768), (INGEST_SLICE, 1_000)),
+            0,
+            "a batch that already wrote chunks defers what does not fit"
+        );
+        assert_eq!(slice_len(&chunks(10, 10), (0, INGEST_SLICE_BYTES)), 0);
     }
 
     #[tokio::test]

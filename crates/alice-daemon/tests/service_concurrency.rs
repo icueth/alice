@@ -8,6 +8,20 @@ use alice_daemon::service::{Service, ServiceOptions};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Transcript-like chunk text: mostly about 2 KB, every 50th about 32 KB (the limit is 32,768
+/// bytes). FTS work grows with text, so short lines would hide a writer held up by big slices.
+fn chunk_text(batch: usize, i: usize) -> String {
+    let target = if i.is_multiple_of(50) { 32_000 } else { 2_000 };
+    let mut t = format!("transcript line {batch}-{i} about lease timeouts and sqlite");
+    let seed = batch * 1_000 + i;
+    let mut w = 0;
+    while t.len() < target {
+        t.push_str(&format!(" w{}", (seed * 31 + w * 17) % 5_003));
+        w += 1;
+    }
+    t
+}
+
 fn p95(mut v: Vec<Duration>) -> Duration {
     v.sort();
     v[(v.len() as f64 * 0.95) as usize - 1]
@@ -34,9 +48,7 @@ async fn writes_and_reads_stay_fast_during_bulk_ingest() {
                 let chunks = (0..1_000)
                     .map(|i| ChunkInput {
                         ord: (batch * 1_000 + i) as i64,
-                        text: format!(
-                            "transcript line {batch}-{i} about lease timeouts and sqlite"
-                        ),
+                        text: chunk_text(batch, i),
                         ..Default::default()
                     })
                     .collect();

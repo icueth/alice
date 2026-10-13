@@ -59,11 +59,31 @@ fn nap(stop: &AtomicBool, d: Duration) {
     }
 }
 
-/// One vector (or error) per item. A failing batch is retried text by text, so one text the
-/// model cannot handle does not fail the others.
+/// `embed_passages`, with a panic inside the embedder (tokenizer or runtime on an odd text)
+/// turned into an error instead of killing the worker thread.
+fn embed_guarded(
+    embedder: &dyn Embedder,
+    texts: &[String],
+) -> alice_core::error::Result<Vec<Vec<f32>>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        embedder.embed_passages(texts)
+    }))
+    .unwrap_or_else(|payload| {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        tracing::error!(panic = %msg, texts = texts.len(), "the embedder panicked");
+        Err(AliceError::Other(format!("the embedder panicked: {msg}")))
+    })
+}
+
+/// One vector (or error) per item. A failing (or panicking) batch is retried text by text, so
+/// one text the model cannot handle does not fail the others.
 fn embed_each(embedder: &dyn Embedder, items: &[PendingItem]) -> Vec<Result<Vec<f32>, String>> {
     let texts: Vec<String> = items.iter().map(|i| i.text.clone()).collect();
-    let whole = embedder.embed_passages(&texts).and_then(|v| {
+    let whole = embed_guarded(embedder, &texts).and_then(|v| {
         if v.len() == texts.len() {
             Ok(v)
         } else {
@@ -79,7 +99,7 @@ fn embed_each(embedder: &dyn Embedder, items: &[PendingItem]) -> Vec<Result<Vec<
         Err(e) if items.len() == 1 => vec![Err(e.to_string())],
         Err(_) => texts
             .iter()
-            .map(|t| match embedder.embed_passages(std::slice::from_ref(t)) {
+            .map(|t| match embed_guarded(embedder, std::slice::from_ref(t)) {
                 Ok(mut v) if v.len() == 1 => Ok(v.remove(0)),
                 Ok(v) => Err(format!(
                     "the embedder returned {} vectors for 1 text",
@@ -253,6 +273,7 @@ mod tests {
         calls: AtomicUsize,
         fail_first: usize,
         fail_if: Option<&'static str>,
+        panic_if: Option<&'static str>,
         on_first_call: Mutex<Option<Hook>>,
     }
 
@@ -263,6 +284,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 fail_first: 0,
                 fail_if: None,
+                panic_if: None,
                 on_first_call: Mutex::new(None),
             }
         }
@@ -284,6 +306,11 @@ mod tests {
             let poisoned = self
                 .fail_if
                 .is_some_and(|m| texts.iter().any(|t| t.contains(m)));
+            if let Some(m) = self.panic_if
+                && texts.iter().any(|t| t.contains(m))
+            {
+                panic!("scripted embedder panic on {m:?}");
+            }
             if n < self.fail_first || poisoned {
                 return Err(AliceError::Other("scripted embedding failure".into()));
             }
@@ -343,7 +370,8 @@ mod tests {
             self.stop.store(true, Ordering::SeqCst);
             let _ = self.wake.try_send(());
             if let Some(w) = self.worker.take() {
-                w.join().unwrap();
+                // Not unwrap: this also runs while a failed test unwinds.
+                let _ = w.join();
             }
         }
     }
@@ -492,6 +520,32 @@ mod tests {
         let state: String = r.read("SELECT embed_state FROM memories WHERE seq = ?1", [good]);
         assert_eq!(state, "done");
         wait_until("the index to hold the good item", || r.index_len() == 1);
+    }
+
+    /// A panic in the embedder (tokenizer or runtime on one odd text) must not kill the worker:
+    /// it counts as a failure of that text, the rest of the queue is embedded, and the text is
+    /// given up after MAX_ATTEMPTS instead of blocking the queue on every restart.
+    #[test]
+    fn an_embedder_panic_fails_only_its_text_and_the_worker_keeps_going() {
+        // No index yet: the worker waits, so both texts end up in the same batch.
+        let r = rig(None, |e, _, _| e.panic_if = Some("explosive"));
+        let (_, good) = r.remember("perfectly fine text");
+        let (_, bad) = r.remember("explosive text");
+        *r.index.write() = fresh_index().map(Arc::new);
+        wait_until("the panicking text to be given up", || {
+            r.read::<String>("SELECT embed_state FROM memories WHERE seq = ?1", [bad]) == "failed"
+        });
+        let state: String = r.read("SELECT embed_state FROM memories WHERE seq = ?1", [good]);
+        assert_eq!(state, "done");
+        let (_, later) = r.remember("written after the panics");
+        wait_until("the worker to embed a later text", || {
+            r.read::<String>("SELECT embed_state FROM memories WHERE seq = ?1", [later]) == "done"
+        });
+        wait_until("the index to hold both good texts", || r.index_len() == 2);
+        assert!(
+            !r.worker.as_ref().unwrap().is_finished(),
+            "the worker is alive"
+        );
     }
 
     /// Ruling: an edit that lands while a batch is embedded keeps its stale vector out of the
