@@ -613,7 +613,14 @@ fn bench_runs_on_throwaway_data_and_cleans_up() {
         r["latency"]["fallback_fired"], 4,
         "raw-only words take the fallback"
     );
-    assert!(r["latency"]["recall_p95_ms"].as_f64().unwrap() > 0.0);
+    for field in [
+        "recall_p95_ms",
+        "recall_raw_p95_ms",
+        "recall_raw_thai_p95_ms",
+        "recall_raw_ident_p95_ms",
+    ] {
+        assert!(r["latency"][field].as_f64().unwrap() > 0.0, "{field}");
+    }
     assert!(r["startup"]["indexed_vectors"].as_u64().unwrap() >= 1_620);
     let d = &r["daemon"];
     assert_eq!(

@@ -1,7 +1,8 @@
 //! `alice bench`: synthetic benchmark in a throw-away ALICE_HOME (never the user's data).
 //!
 //! 1. Load: ingest raw chunks, remember memories, wait until every item is embedded and indexed.
-//! 2. Latency, one call at a time: `remember`, `recall` (knowledge only, with `include_raw`, and
+//! 2. Latency, one call at a time: `remember`, `recall` (knowledge only; with `include_raw`;
+//!    with `include_raw` for a rare Thai word and for a rare identifier made of common words; and
 //!    a query only raw chunks answer, which takes the raw fallback) and `context`.
 //! 3. `memories::get_by_seqs` with as many seqs as one recall's candidate lists can produce.
 //! 4. Start-up parts, timed one by one on the saved data: open + migrate, newest HLC scan,
@@ -53,6 +54,34 @@ const CODE: &[&str] = &[
     "internal/teacher/jev/client.go",
     "VectorIndex::upsert",
     "parse_hlc",
+];
+/// Thai words found only in raw chunks, each in about 0.2% of them (2,000 chunks at 1M): rare,
+/// but in many more chunks than one list returns.
+const RARE_TH: &[&str] = &[
+    "สัญญาเช่าบ้าน",
+    "จองคิวร้าน",
+    "ใบแจ้งหนี้",
+    "ตารางเวรพยาบาล",
+    "งบประมาณรายปี",
+    "คลังสินค้า",
+    "บัญชีรายรับ",
+    "ประกันสุขภาพ",
+    "สมัครสมาชิก",
+    "ตรวจสอบสลิป",
+];
+/// Identifiers found only in raw chunks, each in about 0.2% of them, made of common words: as
+/// a query term each is a phrase whose words are all common.
+const RARE_IDENT: &[&str] = &[
+    "lease_token_frame",
+    "proxy_hook_index",
+    "daemon_session_fix",
+    "vector_agent_bug",
+    "timeout_memory_decision",
+    "writer_deploy_sqlite",
+    "protobuf_socks5_frame",
+    "index_token_hook",
+    "session_bug_lease",
+    "memory_proxy_daemon",
 ];
 const SYLLABLES: &[&str] = &[
     "ka", "lo", "mi", "ra", "ten", "vo", "shi", "pu", "ne", "dar", "gu", "fe", "zo", "bin", "hal",
@@ -131,15 +160,39 @@ impl Corpus {
         (0..n).map(|_| self.word()).collect::<Vec<_>>().join(" ")
     }
 
-    /// A sentence with one raw-only word in it.
+    /// A sentence with one raw-only word in it; one chunk in 50 also holds a rare Thai word,
+    /// one in 50 a rare identifier.
     fn chunk(&mut self) -> String {
         let raw = self.raw_only[self.rng.below(self.raw_only.len())].clone();
-        format!("{} {raw} {}", self.sentence(), self.sentence())
+        let mut text = format!("{} {raw} {}", self.sentence(), self.sentence());
+        if self.rng.below(50) == 0 {
+            text.push(' ');
+            text.push_str(RARE_TH[self.rng.below(RARE_TH.len())]);
+        }
+        if self.rng.below(50) == 0 {
+            text.push(' ');
+            text.push_str(RARE_IDENT[self.rng.below(RARE_IDENT.len())]);
+        }
+        text
     }
 
     /// Three words, as an agent would search.
     fn query(&mut self) -> String {
         (0..3).map(|_| self.word()).collect::<Vec<_>>().join(" ")
+    }
+
+    /// A rare Thai word (in ~0.2% of chunks) beside a common one.
+    fn thai_query(&mut self) -> String {
+        let rare = RARE_TH[self.rng.below(RARE_TH.len())];
+        let common = WORDS_TH[self.rng.below(WORDS_TH.len())];
+        format!("{common} {rare}")
+    }
+
+    /// A rare identifier made of common words (a phrase query) beside a common word.
+    fn ident_query(&mut self) -> String {
+        let rare = RARE_IDENT[self.rng.below(RARE_IDENT.len())];
+        let common = WORDS_EN[self.rng.below(WORDS_EN.len())];
+        format!("{rare} {common}")
     }
 
     /// Two raw-only words: no memory matches, so recall falls back to raw chunks.
@@ -159,6 +212,12 @@ struct Latency {
     recall_p95_ms: f64,
     recall_raw_p50_ms: f64,
     recall_raw_p95_ms: f64,
+    /// `include_raw` with a rare Thai word beside a common one (the trigram list's shares).
+    recall_raw_thai_p50_ms: f64,
+    recall_raw_thai_p95_ms: f64,
+    /// `include_raw` with a rare identifier made of common words (a phrase term).
+    recall_raw_ident_p50_ms: f64,
+    recall_raw_ident_p95_ms: f64,
     recall_fallback_p50_ms: f64,
     recall_fallback_p95_ms: f64,
     /// Fallback queries whose answer came from the raw fallback.
@@ -598,6 +657,7 @@ async fn timed<T>(f: impl std::future::Future<Output = T>) -> (T, Duration) {
 async fn latency(svc: &Arc<Service>, samples: usize, corpus: &mut Corpus) -> Result<Latency> {
     let (mut w, mut r, mut rr, mut rf, mut c) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut rt, mut ri) = (Vec::new(), Vec::new());
     let mut fallback_fired = 0;
     for i in 0..samples {
         let (res, d) = timed(svc.remember(RememberRequest {
@@ -626,6 +686,20 @@ async fn latency(svc: &Arc<Service>, samples: usize, corpus: &mut Corpus) -> Res
         res?;
         rr.push(d);
 
+        for (query, times) in [
+            (corpus.thai_query(), &mut rt),
+            (corpus.ident_query(), &mut ri),
+        ] {
+            let (res, d) = timed(svc.recall(RecallRequest {
+                query,
+                include_raw: true,
+                ..Default::default()
+            }))
+            .await;
+            res?;
+            times.push(d);
+        }
+
         let (res, d) = timed(svc.recall(RecallRequest {
             query: corpus.fallback_query(),
             ..Default::default()
@@ -648,6 +722,10 @@ async fn latency(svc: &Arc<Service>, samples: usize, corpus: &mut Corpus) -> Res
         recall_p95_ms: pct(&mut r, 0.95),
         recall_raw_p50_ms: pct(&mut rr, 0.50),
         recall_raw_p95_ms: pct(&mut rr, 0.95),
+        recall_raw_thai_p50_ms: pct(&mut rt, 0.50),
+        recall_raw_thai_p95_ms: pct(&mut rt, 0.95),
+        recall_raw_ident_p50_ms: pct(&mut ri, 0.50),
+        recall_raw_ident_p95_ms: pct(&mut ri, 0.95),
         recall_fallback_p50_ms: pct(&mut rf, 0.50),
         recall_fallback_p95_ms: pct(&mut rf, 0.95),
         fallback_fired,
@@ -888,6 +966,8 @@ fn render(r: &Report) -> String {
          remember        p50 {:.2} ms · p95 {:.2} ms (budget 50)\n\
          recall          p50 {:.2} ms · p95 {:.2} ms (budget 200)\n\
          recall raw      p50 {:.2} ms · p95 {:.2} ms (include_raw)\n\
+         raw, rare Thai  p50 {:.2} ms · p95 {:.2} ms (include_raw)\n\
+         raw, identifier p50 {:.2} ms · p95 {:.2} ms (include_raw)\n\
          recall fallback p50 {:.2} ms · p95 {:.2} ms ({} of {} fell back)\n\
          context         p50 {:.2} ms · p95 {:.2} ms (budget 150)\n\
          get_by_seqs     500: p50 {:.2} ms · 2000: p50 {:.2} ms ({} memories)\n\
@@ -913,6 +993,10 @@ fn render(r: &Report) -> String {
         l.recall_p95_ms,
         l.recall_raw_p50_ms,
         l.recall_raw_p95_ms,
+        l.recall_raw_thai_p50_ms,
+        l.recall_raw_thai_p95_ms,
+        l.recall_raw_ident_p50_ms,
+        l.recall_raw_ident_p95_ms,
         l.recall_fallback_p50_ms,
         l.recall_fallback_p95_ms,
         l.fallback_fired,
