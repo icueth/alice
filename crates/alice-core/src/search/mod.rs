@@ -998,6 +998,45 @@ mod tests {
         assert_eq!(out.hits[0].tier, Tier::Knowledge);
     }
 
+    /// Review finding I-2: an apostrophe splits a contraction (`what's` -> `what`, `s`), and the
+    /// fragment it leaves is no content word: "It's raining" shares only `s` with "what's the
+    /// deploy target". With straight and curly apostrophes alike, such memories are not
+    /// relevant and the raw fallback fires.
+    #[test]
+    fn contraction_fragments_are_not_a_content_match() {
+        let f = fx();
+        f.add(&f.app, Kind::Note, "It's raining in the garden today");
+        f.add(&f.app, Kind::Note, "The user’s cat sleeps on the sofa");
+        f.add(
+            &f.app,
+            Kind::Note,
+            "We'll ship it; don't wait, they've said they'd call. I'm sure it isn't late",
+        );
+        f.chunk(
+            &f.app,
+            "s1",
+            "notes: the deploy target is the staging cluster",
+        );
+        for q in [
+            "what's the deploy target",
+            "what’s the deploy target",
+            "who'll own the deploy target",
+            "where’d the deploy target go",
+            "they've moved the deploy target, haven't they",
+            "I'm told the deploy target isn't ready",
+            "don't touch the deploy target",
+        ] {
+            let out = f.search(&f.params(q));
+            assert!(
+                out.hits.iter().all(|h| h.tier == Tier::Raw),
+                "{q}: {:?}",
+                out.hits
+            );
+            assert!(out.raw_fallback, "{q}: the raw fallback fires");
+            assert!(!out.hits.is_empty(), "{q}");
+        }
+    }
+
     #[test]
     fn huge_queries_use_their_first_2000_characters() {
         let f = fx();

@@ -317,13 +317,19 @@ pub fn code_terms(query: &str) -> Vec<String> {
     out.terms
 }
 
+/// Whether the query has at most two pieces. Pieces, not whitespace tokens: a path, URL or
+/// dotted name is one token of many pieces, and each ASCII piece would be one more trigram read.
+fn has_few_pieces(query: &str) -> bool {
+    pieces(query).nth(2).is_none()
+}
+
 /// Substring terms for the trigram index: pieces of at least 3 characters, split at the same
 /// separators as the word terms (so `ตัดสินใจ/ภาษาไทย`, `“ตัดสินใจ”` and `ตัดสินใจ…` give whole
-/// words). Non-ASCII pieces always qualify; ASCII pieces only in queries of one or two words,
-/// so long English questions rely on the word index, and never English stopwords (`the` is a
-/// substring of nearly every text).
+/// words). Non-ASCII pieces always qualify; ASCII pieces only in queries of one or two pieces
+/// (so at most two), so long English questions and paths rely on the word and identifier
+/// indexes, and never English stopwords (`the` is a substring of nearly every text).
 pub fn trigram_terms(query: &str) -> Vec<String> {
-    let short_query = query.split_whitespace().nth(2).is_none();
+    let short_query = has_few_pieces(query);
     let mut out = TermList::new(MAX_TERMS);
     for w in pieces(query) {
         if out.is_full() {
@@ -348,9 +354,9 @@ pub fn trigram_terms(query: &str) -> Vec<String> {
     out.terms
 }
 
-/// Trigram search helps scripts without spaces and very short queries.
+/// Trigram search helps scripts without spaces and very short queries (one or two pieces).
 pub fn should_use_trigram(query: &str) -> bool {
-    !query.is_ascii() || query.split_whitespace().nth(2).is_none()
+    !query.is_ascii() || has_few_pieces(query)
 }
 
 /// Run one candidate query. Never fails: an FTS error is logged and means no matches.
@@ -736,6 +742,36 @@ mod tests {
         assert_eq!(trigram_terms("AI ความจำ go"), vec!["ความจำ".to_string()]);
     }
 
+    /// Review finding m-2: a path, URL or dotted name is one whitespace token but many pieces,
+    /// and every ASCII piece was one more trigram read (12 pieces took 224 ms at 1M chunks). A
+    /// query is short by its pieces, so at most two ASCII pieces are searched by substring.
+    #[test]
+    fn ascii_substrings_come_only_from_queries_of_one_or_two_pieces() {
+        let s = |v: &[&str]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            trigram_terms("HostLink.reconnect"),
+            s(&["hostlink", "reconnect"])
+        );
+        assert_eq!(
+            trigram_terms("self.writer_lease"),
+            s(&["self", "writer_lease"])
+        );
+        assert!(should_use_trigram("HostLink.reconnect"));
+        for q in [
+            "alpha.bravo.charlie.delta.echo.foxtrot.golf.hotel.india.juliet.kilo.lima",
+            "https://github.com/icueth/alice",
+            "crates/alice-core/src/search/lexical.rs",
+            "alice_core::search::lexical::trigram_terms",
+        ] {
+            assert!(trigram_terms(q).is_empty(), "{q}: {:?}", trigram_terms(q));
+            assert!(!should_use_trigram(q), "{q}");
+        }
+        // Pieces of other scripts are always searched by substring.
+        let mixed = "ตัดสินใจ/ภาษาไทย/config.toml";
+        assert_eq!(trigram_terms(mixed), s(&["ตัดสินใจ", "ภาษาไทย"]));
+        assert!(should_use_trigram(mixed));
+    }
+
     #[test]
     fn english_inflections_become_extra_terms() {
         let v = variant_terms("which replies");
@@ -840,6 +876,18 @@ mod tests {
             v.iter()
                 .all(|t| !t.starts_with("which") && t != "doing" && t != "do"),
             "variants only for content words: {v:?}"
+        );
+        // Contraction fragments, after a straight or a curly apostrophe (review finding I-2).
+        for q in ["what's the deploy target", "what’s the deploy target"] {
+            assert_eq!(
+                content_terms(q),
+                vec!["deploy".to_string(), "target".into()],
+                "{q}"
+            );
+        }
+        assert_eq!(
+            content_terms("we'll say they've done it, don't they"),
+            vec!["say".to_string()]
         );
         assert_eq!(trigram_terms("the api"), vec!["api".to_string()]);
         assert!(trigram_terms("what is").is_empty());

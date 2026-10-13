@@ -1,5 +1,5 @@
-//! English function words: articles, pronouns, auxiliaries, question words, prepositions and
-//! conjunctions. They are dropped from word queries when the query has other words, because they
+//! English function words: articles, pronouns, auxiliaries, question words, prepositions,
+//! conjunctions and the fragments contractions split into. They are dropped from word queries when the query has other words, because they
 //! match nearly every text (slow at scale, and a match on them says nothing about relevance).
 //! Thai needs no list in M1: Thai is searched by substring.
 
@@ -27,6 +27,12 @@ pub const ENGLISH: &[&str] = &[
     // Conjunctions and fillers.
     "and", "or", "but", "if", "then", "than", "so", "as", "because", "while", "not", "also",
     "there", "here", "just", "very", "too",
+    // Fragments of contractions: an apostrophe (straight or curly) separates words, so `it's`,
+    // `we'll`, `they've`, `I'm`, `she'd` and `don't` leave these behind. The negated forms are
+    // the standard (NLTK) set; `can` and `won` stand for `can't` and `won't`.
+    "s", "t", "d", "m", "ll", "re", "ve", "ain", "aren", "couldn", "didn", "doesn", "don",
+    "hadn", "hasn", "haven", "isn", "mightn", "mustn", "needn", "shan", "shouldn", "wasn",
+    "weren", "won", "wouldn",
 ];
 
 static SET: LazyLock<HashSet<&'static str>> = LazyLock::new(|| ENGLISH.iter().copied().collect());
@@ -54,6 +60,23 @@ mod tests {
         }
         // Content words that look common in technical text stay searchable.
         for w in ["use", "time", "line", "type", "data", "fix", "port", "The"] {
+            assert!(!is_stopword(w), "{w}");
+        }
+    }
+
+    /// Review finding I-2: word separators split `it's`, `we'll`, `don't` and `isn’t` at the
+    /// apostrophe; the fragments are no content words.
+    #[test]
+    fn contraction_fragments_are_stopwords() {
+        for w in [
+            "s", "t", "d", "m", "ll", "re", "ve", "don", "doesn", "didn", "isn", "aren", "wasn",
+            "weren", "hasn", "haven", "hadn", "won", "wouldn", "shouldn", "couldn", "can", "mustn",
+            "needn", "shan", "mightn", "ain",
+        ] {
+            assert!(is_stopword(w), "{w}");
+        }
+        // Single letters that are not contraction fragments stay searchable.
+        for w in ["x", "y", "o", "c", "v"] {
             assert!(!is_stopword(w), "{w}");
         }
     }
