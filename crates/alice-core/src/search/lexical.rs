@@ -6,6 +6,10 @@ use rusqlite::Connection;
 
 /// Most terms one query sends to an index; longer queries keep their first terms.
 const MAX_TERMS: usize = 32;
+/// Longest term sent to an index. Longer word terms cannot be real words and are dropped;
+/// longer trigram terms are cut (a prefix of a substring is still a substring), which bounds
+/// the work a pasted wall of text causes.
+const MAX_TERM_CHARS: usize = 64;
 
 pub fn quote(term: &str) -> String {
     format!("\"{}\"", term.replace('"', "\"\""))
@@ -22,7 +26,11 @@ pub fn or_query(terms: &[String]) -> Option<String> {
 }
 
 fn push_unique(out: &mut Vec<String>, w: String) {
-    if !w.is_empty() && w.chars().any(char::is_alphanumeric) && !out.contains(&w) {
+    if !w.is_empty()
+        && w.chars().count() <= MAX_TERM_CHARS
+        && w.chars().any(char::is_alphanumeric)
+        && !out.contains(&w)
+    {
         out.push(w);
     }
 }
@@ -58,10 +66,11 @@ fn is_vowel(c: u8) -> bool {
     matches!(c, b'a' | b'e' | b'i' | b'o' | b'u')
 }
 
-/// Ends in a doubled consonant that English adds before -ed/-ing (`capp`, `runn`), not `ll`/`ss`.
+/// Ends in a doubled consonant that English adds before -ed/-ing (`capp`, `runn`), not `ll`/`ss`
+/// and not in a three-letter stem (`add`).
 fn doubled_consonant(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() >= 3 && {
+    b.len() >= 4 && {
         let (x, y) = (b[b.len() - 2], b[b.len() - 1]);
         x == y && !is_vowel(y) && !matches!(y, b'l' | b's' | b'z' | b'f')
     }
@@ -125,6 +134,9 @@ fn english_bases(w: &str) -> Vec<String> {
 /// Regular inflections of an English base form.
 fn english_forms(b: &str) -> Vec<String> {
     let bytes = b.as_bytes();
+    if bytes.len() < 3 {
+        return Vec::new();
+    }
     let last = bytes[bytes.len() - 1];
     if last == b'e' {
         let stem = &b[..b.len() - 1];
@@ -208,7 +220,7 @@ pub fn trigram_terms(query: &str) -> Vec<String> {
     let short_query = query.split_whitespace().count() <= 2;
     let mut out = Vec::new();
     for w in pieces(query) {
-        let w = w.to_lowercase();
+        let w: String = w.to_lowercase().chars().take(MAX_TERM_CHARS).collect();
         if w.chars().count() >= 3 && (!w.is_ascii() || short_query) {
             push_unique(&mut out, w);
         }
@@ -413,6 +425,9 @@ mod tests {
             ("timing", "time"),
             ("saved", "save"),
             ("entry", "entries"),
+            ("added", "add"),
+            ("stopping", "stop"),
+            ("stop", "stopped"),
         ] {
             let v = variant_terms(word);
             assert!(
@@ -434,6 +449,23 @@ mod tests {
         }
         let many = "alpha bravo charlie delta echoes foxtrot golfing hotel india juliet kilos lima";
         assert!(word_terms(many).len() + variant_terms(many).len() <= 64);
+        assert!(!variant_terms("added").contains(&"ad".to_string()));
+    }
+
+    #[test]
+    fn walls_of_text_give_bounded_terms() {
+        let wall = "ก".repeat(20_000);
+        assert!(
+            word_terms(&wall).is_empty(),
+            "no word is 20,000 letters long"
+        );
+        assert_eq!(trigram_terms(&wall), vec!["ก".repeat(64)]);
+        let words =
+            "lorem ".repeat(5_000) + &(0..500).map(|i| format!("w{i} ")).collect::<String>();
+        assert!(word_terms(&words).len() <= 32);
+        assert!(variant_terms(&words).len() <= 32);
+        let idents: String = (0..1_000).map(|i| format!("a_{i} ")).collect();
+        assert_eq!(code_terms(&idents).len(), 32);
     }
 
     fn db_with(texts: &[&str]) -> (tempfile::TempDir, rusqlite::Connection) {

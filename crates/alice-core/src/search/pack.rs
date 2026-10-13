@@ -80,8 +80,17 @@ fn header(i: usize, h: &Hit) -> String {
     )
 }
 
+/// One result: header, title, then the text without a leading copy of the title (a title
+/// derived from the first line would otherwise be shown twice).
 fn block(i: usize, h: &Hit, text: &str) -> String {
-    format!("{}{}\n{}\n\n", header(i, h), h.title, text)
+    let rest = text
+        .strip_prefix(h.title.as_str())
+        .map_or(text, str::trim_start);
+    if rest.is_empty() {
+        format!("{}{}\n\n", header(i, h), h.title)
+    } else {
+        format!("{}{}\n{}\n\n", header(i, h), h.title, rest)
+    }
 }
 
 /// Snippet blocks that fit in `budget` tokens; the first result is always kept.
@@ -329,6 +338,26 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("[2] ID1 · raw · app · สองพันยี่ส"), "{text}");
+    }
+
+    #[test]
+    fn a_title_taken_from_the_first_line_is_not_repeated() {
+        let mut one_line = hit(0, "port is 9090");
+        one_line.title = "port is 9090".into();
+        one_line.snippet = "port is 9090".into();
+        let mut two_lines = hit(1, "Use WAL mode\nbecause readers must not block");
+        two_lines.title = "Use WAL mode".into();
+        two_lines.snippet = "Use WAL mode because readers must not block".into();
+        let out = SearchOutput {
+            hits: vec![one_line, two_lines],
+            ..Default::default()
+        };
+        for budget in [60, 1500] {
+            let (text, _) = pack_text(&out, None, budget);
+            assert_eq!(text.matches("port is 9090").count(), 1, "{text}");
+            assert_eq!(text.matches("Use WAL mode").count(), 1, "{text}");
+            assert!(text.contains("because readers must not block"), "{text}");
+        }
     }
 
     #[test]

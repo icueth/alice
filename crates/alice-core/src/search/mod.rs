@@ -329,8 +329,10 @@ pub fn run(
         weights,
     };
 
+    // Raw chunks have no kind or topics, so those filters leave the knowledge tier only.
+    let raw_allowed = p.kinds.is_empty() && topics.is_empty();
     let (mut scores, mut signals) = query.knowledge();
-    if p.include_raw {
+    if p.include_raw && raw_allowed {
         // Both tiers ranked together; the raw tier weight (0.6) keeps knowledge ahead on ties.
         let (s, sig) = query.raw();
         scores.extend(s);
@@ -344,7 +346,7 @@ pub fn run(
         .collect();
     let mut raw_fallback = false;
     let knowledge_relevant = ranked.iter().filter(|s| s.is_knowledge()).count();
-    if !p.include_raw && knowledge_relevant < p.raw_min_results {
+    if !p.include_raw && raw_allowed && knowledge_relevant < p.raw_min_results {
         let (s, sig) = query.raw();
         let extra: Vec<Scored> = filters
             .score(conn, &s, &sig)?
@@ -452,17 +454,12 @@ impl Filters<'_> {
             push(ItemRef::Memory(seq), Row::Memory { seq, memory: m }, input);
         }
         for c in sources::get_chunks_by_seqs(conn, &chunk_seqs)? {
-            // Chunks carry no kind or topics: such filters leave only knowledge results.
+            let when = c.authored_at.as_deref().unwrap_or(&c.created_at);
             if p.project_filter_id
                 .as_deref()
                 .is_some_and(|f| f != c.project_id)
-                || !p.kinds.is_empty()
-                || !self.topics.is_empty()
+                || !self.window.contains(when)
             {
-                continue;
-            }
-            let when = c.authored_at.as_deref().unwrap_or(&c.created_at);
-            if !self.window.contains(when) {
                 continue;
             }
             let input = BoostInput {
@@ -741,6 +738,24 @@ mod tests {
             ..f.params("alpha")
         });
         assert!(restricted.hits.is_empty());
+        // Raw chunks have no kind or topics: those filters keep them out, fallback included.
+        f.chunk(&f.app, "s1", "alpha chatter from a session");
+        assert!(f.search(&f.params("alpha")).raw_fallback);
+        for p in [
+            SearchParams {
+                kinds: vec![Kind::Decision],
+                ..f.params("alpha")
+            },
+            SearchParams {
+                topics: vec!["x".into()],
+                include_raw: true,
+                ..f.params("alpha")
+            },
+        ] {
+            let out = f.search(&p);
+            assert!(!out.raw_fallback);
+            assert!(out.hits.iter().all(|h| h.tier == Tier::Knowledge));
+        }
     }
 
     #[test]
