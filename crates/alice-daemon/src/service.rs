@@ -47,6 +47,8 @@ pub struct ServiceOptions {
     pub weights: Weights,
     /// Most read connections open at once (each has its own page cache); further reads wait.
     pub reader_pool: usize,
+    /// Maps a working directory to its project (runs git). Tests replace it.
+    pub detect_project: fn(&Path) -> ProjectRef,
 }
 
 impl Default for ServiceOptions {
@@ -56,6 +58,7 @@ impl Default for ServiceOptions {
             raw_min_results: 3,
             weights: Weights::default(),
             reader_pool: 8,
+            detect_project,
         }
     }
 }
@@ -78,9 +81,16 @@ impl ReadScope {
 }
 
 /// Maps (explicit project, working directory) to a project. Cheap to clone; caches git lookups for 60 s.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ProjectResolver {
     cache: Arc<Mutex<HashMap<String, (ProjectRef, Instant)>>>,
+    detect: fn(&Path) -> ProjectRef,
+}
+
+impl Default for ProjectResolver {
+    fn default() -> Self {
+        Self::new(detect_project)
+    }
 }
 
 fn explicit_slug(explicit: Option<&str>) -> Option<&str> {
@@ -88,6 +98,14 @@ fn explicit_slug(explicit: Option<&str>) -> Option<&str> {
 }
 
 impl ProjectResolver {
+    /// A resolver that maps working directories with `detect`.
+    pub fn new(detect: fn(&Path) -> ProjectRef) -> Self {
+        Self {
+            cache: Arc::default(),
+            detect,
+        }
+    }
+
     fn cached(&self, cwd: &str) -> Option<ProjectRef> {
         let cache = self.cache.lock();
         let (p, at) = cache.get(cwd)?;
@@ -99,7 +117,7 @@ impl ProjectResolver {
         if let Some(p) = self.cached(cwd) {
             return p;
         }
-        let p = detect_project(Path::new(cwd));
+        let p = (self.detect)(Path::new(cwd));
         self.cache
             .lock()
             .insert(cwd.to_string(), (p.clone(), Instant::now()));
@@ -127,15 +145,15 @@ impl ProjectResolver {
         }
     }
 
-    /// Read side. Never creates projects.
-    pub fn read_project(
-        &self,
+    /// Read side, for a `choice` made by `choose` (`explicit`: the caller named the project).
+    /// Never creates projects and never runs git: a read resolves its project before it takes a
+    /// connection.
+    pub fn read_scope(
         conn: &Connection,
-        explicit: Option<&str>,
-        cwd: Option<&str>,
+        choice: ProjectChoice,
+        explicit: bool,
     ) -> Result<ReadScope> {
-        let is_explicit = explicit_slug(explicit).is_some();
-        match self.choose(explicit, cwd) {
+        match choice {
             ProjectChoice::Slug(s) => {
                 let p = projects::resolve_slug(conn, &s)?.ok_or_else(|| {
                     AliceError::invalid(format!(
@@ -143,7 +161,7 @@ impl ProjectResolver {
                     ))
                 })?;
                 Ok(ReadScope {
-                    filter_id: is_explicit.then(|| p.id.clone()),
+                    filter_id: explicit.then(|| p.id.clone()),
                     project: p,
                 })
             }
@@ -282,6 +300,7 @@ impl Service {
             vector_path,
             batch: EMBED_BATCH,
         });
+        let resolver = ProjectResolver::new(opts.detect_project);
         Ok(Arc::new(Service {
             home,
             readers,
@@ -293,7 +312,7 @@ impl Service {
             stop,
             wake_worker: wake_tx,
             threads: Mutex::new(Some((worker_thread, writer_thread))),
-            resolver: ProjectResolver::default(),
+            resolver,
         }))
     }
 
@@ -421,10 +440,14 @@ impl Service {
             }
             None => None,
         };
-        let resolver = self.resolver.clone();
+        // Resolved before a reader connection is taken too: it may run git.
+        let explicit = explicit_slug(req.project.as_deref()).is_some();
+        let choice = self
+            .choose(req.project.as_deref(), req.cwd.as_deref())
+            .await?;
         let (out, slug) = self
             .read(move |c| {
-                let scope = resolver.read_project(c, req.project.as_deref(), req.cwd.as_deref())?;
+                let scope = ProjectResolver::read_scope(c, choice, explicit)?;
                 let params = SearchParams {
                     query: req.query,
                     project_filter_id: scope.filter_id.clone(),
@@ -453,30 +476,42 @@ impl Service {
                 Ok((out, scope.project.slug))
             })
             .await?;
-        if !out.memory_seqs.is_empty() {
-            self.writer
-                .send_nowait(WriteOp::TouchAccess(out.memory_seqs.clone()));
-        }
-        Ok(match format {
+        let (response, touched) = match format {
             OutputFormat::Text => {
                 let (text, omitted) = pack::pack_text(&out, Some(&slug), max_tokens);
-                RecallResponse {
+                let shown = &out.hits[..out.hits.len() - omitted];
+                let touched = returned_memories(out.memory_seqs.clone(), shown);
+                let response = RecallResponse {
                     project: Some(slug),
                     omitted,
                     raw_fallback: out.raw_fallback,
                     text: Some(text),
                     ..Default::default()
-                }
+                };
+                (response, touched)
             }
-            OutputFormat::Json => pack::pack_json(out, Some(slug), max_tokens),
-        })
+            OutputFormat::Json => {
+                let mut out = out;
+                let seqs = std::mem::take(&mut out.memory_seqs);
+                let response = pack::pack_json(out, Some(slug), max_tokens);
+                let touched = returned_memories(seqs, &response.results);
+                (response, touched)
+            }
+        };
+        if !touched.is_empty() {
+            self.writer.send_nowait(WriteOp::TouchAccess(touched));
+        }
+        Ok(response)
     }
 
     pub async fn context(&self, req: ContextRequest) -> Result<ContextResponse> {
         let max_tokens = req.max_tokens.unwrap_or(limits::DEFAULT_CONTEXT_TOKENS);
-        let resolver = self.resolver.clone();
+        let explicit = explicit_slug(req.project.as_deref()).is_some();
+        let choice = self
+            .choose(req.project.as_deref(), req.cwd.as_deref())
+            .await?;
         self.read(move |c| {
-            let scope = resolver.read_project(c, req.project.as_deref(), req.cwd.as_deref())?;
+            let scope = ProjectResolver::read_scope(c, choice, explicit)?;
             // A placeholder project (never written to) gets the hint and the global preferences.
             let text =
                 alice_core::context::build(c, &scope.project, max_tokens, chrono::Utc::now())?;
@@ -621,6 +656,19 @@ impl Drop for Service {
             self.writer.send_nowait(WriteOp::Shutdown);
         }
     }
+}
+
+/// The memories a response returns, out of `seqs` (one per knowledge hit, in hit order): those
+/// among `returned`, the hits it kept (packing keeps a prefix). Only they count an access
+/// (spec §4.5), not hits the token budget left out.
+fn returned_memories(mut seqs: Vec<i64>, returned: &[Hit]) -> Vec<i64> {
+    seqs.truncate(
+        returned
+            .iter()
+            .filter(|h| h.tier == Tier::Knowledge)
+            .count(),
+    );
+    seqs
 }
 
 fn full(
@@ -1030,6 +1078,128 @@ mod tests {
             t.elapsed()
         );
         recall.await.unwrap().unwrap();
+    }
+
+    /// Review finding m-10: a read resolves its project (git, for a working directory not seen
+    /// in the last minute) before it takes a reader connection, so a slow git never holds up
+    /// other reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn project_detection_holds_no_reader_connection() {
+        fn slow_detect(p: &Path) -> ProjectRef {
+            std::thread::sleep(Duration::from_millis(600));
+            detect_project(p)
+        }
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                reader_pool: 1,
+                detect_project: slow_detect,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let reads = [
+            ("recall", repo(&d, "slow-recall")),
+            ("context", repo(&d, "slow-context")),
+        ];
+        for (what, cwd) in reads {
+            let slow = {
+                let s = s.clone();
+                tokio::spawn(async move {
+                    if what == "recall" {
+                        s.recall(RecallRequest {
+                            query: "anything".into(),
+                            cwd,
+                            ..Default::default()
+                        })
+                        .await
+                        .map(|_| ())
+                    } else {
+                        s.context(ContextRequest {
+                            cwd,
+                            ..Default::default()
+                        })
+                        .await
+                        .map(|_| ())
+                    }
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let t = Instant::now();
+            s.projects().await.unwrap();
+            assert!(
+                t.elapsed() < Duration::from_millis(300),
+                "a read waited {:?} for the reader a {what} held while it ran git",
+                t.elapsed()
+            );
+            slow.await.unwrap().unwrap();
+        }
+    }
+
+    /// Review finding m-6 (spec §4.5): only memories a recall returns count an access; hits
+    /// the token budget left out do not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_returned_memories_count_an_access() {
+        let (_d, s) = svc().await;
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let content = format!("zebra crossing note {i}: {}", "padding words ".repeat(40));
+            let r = s
+                .remember(RememberRequest {
+                    content,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            ids.push(r.id.unwrap());
+        }
+        wait_embedded(&s).await;
+        let mut expected: HashMap<String, i64> = ids.iter().map(|id| (id.clone(), 0)).collect();
+        for format in [OutputFormat::Text, OutputFormat::Json] {
+            let r = s
+                .recall(RecallRequest {
+                    query: "zebra crossing".into(),
+                    max_tokens: Some(120),
+                    format,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(r.omitted > 0, "{format:?}: the budget leaves some out");
+            let shown: Vec<&String> = match format {
+                OutputFormat::Text => {
+                    let text = r.text.as_deref().unwrap();
+                    ids.iter().filter(|id| text.contains(id.as_str())).collect()
+                }
+                OutputFormat::Json => r.results.iter().map(|h| &h.id).collect(),
+            };
+            assert_eq!(shown.len(), 6 - r.omitted, "{format:?}");
+            for id in shown {
+                *expected.get_mut(id).unwrap() += 1;
+            }
+        }
+        // The counters go to the writer without a reply; a later write is committed after them.
+        s.remember(RememberRequest {
+            content: "barrier".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let got = s
+            .get(GetRequest {
+                ids: ids.clone(),
+                include_provenance: false,
+            })
+            .await
+            .unwrap();
+        let counted: HashMap<String, i64> = got
+            .memories
+            .iter()
+            .map(|m| (m.memory.id.clone(), m.memory.access_count))
+            .collect();
+        assert_eq!(counted, expected);
     }
 
     #[tokio::test(flavor = "multi_thread")]
