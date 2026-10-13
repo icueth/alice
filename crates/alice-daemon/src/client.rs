@@ -206,6 +206,12 @@ fn spawn_detached_with_env(
     Ok(pid)
 }
 
+/// `ALICE_HOME` for a daemon this client starts. The daemon runs from `/`, so a relative home
+/// (`ALICE_HOME=./mem`) is resolved against this process's directory first.
+fn daemon_home(home: &AliceHome) -> PathBuf {
+    std::path::absolute(home.root()).unwrap_or_else(|_| home.root().to_path_buf())
+}
+
 impl DaemonClient {
     /// The daemon daemon.json names, if it answers and proves the token.
     pub async fn try_existing(home: &AliceHome) -> Option<DaemonClient> {
@@ -247,7 +253,7 @@ impl DaemonClient {
             exe,
             &["daemon", "run"],
             &home.logs_dir().join("daemon.log"),
-            &[("ALICE_HOME", home.root().as_os_str())],
+            &[("ALICE_HOME", daemon_home(home).as_os_str())],
         )
         .map_err(|e| {
             unavailable(format!(
@@ -899,6 +905,20 @@ mod tests {
         let running = daemon(&home).await;
         let drained = spool::drain(&home.spool_dir(), &running.svc).await;
         assert_eq!((drained.processed, drained.rejected), (2, 0));
+    }
+
+    /// The daemon runs from `/`: a relative home must reach it as the same directory.
+    #[test]
+    fn the_started_daemon_gets_this_home_as_an_absolute_path() {
+        let rel = AliceHome::new(PathBuf::from("rel").join("home"));
+        let given = daemon_home(&rel);
+        assert!(given.is_absolute(), "{}", given.display());
+        assert_eq!(
+            given,
+            std::env::current_dir().unwrap().join("rel").join("home")
+        );
+        let abs = AliceHome::new(std::env::temp_dir().join("alice-abs"));
+        assert_eq!(daemon_home(&abs), abs.root());
     }
 
     /// A stand-in for the `alice` binary: records how it was started, then exits.
