@@ -301,6 +301,17 @@ impl Service {
         &self.home
     }
 
+    /// Why writes are refused (`None` = writable). No database access, so it is cheap to poll.
+    pub fn read_only(&self) -> Option<String> {
+        self.writer.read_only.reason()
+    }
+
+    /// Tests: refuse writes as a damaged database would.
+    #[cfg(test)]
+    pub(crate) fn force_read_only(&self, reason: &str) {
+        self.writer.read_only.set(reason.to_string());
+    }
+
     /// Stop the embedding worker, let the writer commit everything queued before this call,
     /// stop it, and save the vector index. Blocks until both threads have exited (normally well
     /// under a second; an embedding batch in flight is finished first). Later writes fail with

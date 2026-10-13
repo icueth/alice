@@ -1,7 +1,12 @@
-//! Alice daemon: the single writer, the embedding worker and the service layer that the HTTP
-//! API, the MCP server and the CLI all call.
+//! Alice daemon library: storage service, HTTP API, MCP server and client.
 
+pub mod daemon;
+pub mod discovery;
+pub mod http;
 pub mod paths;
 pub mod service;
+pub mod spool;
 pub mod worker;
 pub mod writer;
+
+pub use alice_embed::install_tls_provider as install_tls;

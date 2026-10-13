@@ -9,6 +9,14 @@ description = "Alice daemon: single-writer store, workers, HTTP API and MCP serv
 
 [dependencies]
 alice-core = { path = "../alice-core" }
+alice-embed = { path = "../alice-embed" }
+axum.workspace = true
+tokio-util.workspace = true
+getrandom.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+futures.workspace = true
 tokio.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true

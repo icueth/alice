@@ -35,6 +35,9 @@ futures = "0.3.34"
 usearch = "2.26.4"
 crossbeam-channel = "0.5.17"
 dirs = "7.0.0"
+axum = "0.8.9"
+tokio-util = "0.7.20"
+getrandom = "0.4.3"
 
 [profile.release]
 lto = "thin"

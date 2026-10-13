@@ -107,7 +107,7 @@ impl ReadOnlyState {
     pub fn reason(&self) -> Option<String> {
         self.0.lock().clone()
     }
-    fn set(&self, reason: String) {
+    pub(crate) fn set(&self, reason: String) {
         self.0.lock().get_or_insert(reason);
     }
 }
