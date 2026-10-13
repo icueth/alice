@@ -582,3 +582,77 @@ async fn stdio_mcp_shim_lists_tools_and_round_trips() {
     client.cancel().await.unwrap();
     assert_eq!(e.log().matches("daemon started").count(), 1);
 }
+
+/// `alice bench` works on throw-away data: the ALICE_HOME in use is never touched (nor accepted
+/// as `--dir`), the temporary home is removed, its daemon is gone, and `--dir` data is reused.
+#[test]
+fn bench_runs_on_throwaway_data_and_cleans_up() {
+    let env = Env::new();
+    let tmp = env.home.parent().unwrap().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let bench = |args: &[&str]| {
+        let mut all = vec!["--json", "bench", "--samples", "4"];
+        all.extend_from_slice(args);
+        env.cmd(&all).env("TMPDIR", &tmp).output().unwrap()
+    };
+    let out = bench(&["--chunks", "1500", "--memories", "120"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(r["embedder"], "fake");
+    assert_eq!(
+        (r["chunks"].as_u64(), r["memories"].as_u64()),
+        (Some(1500), Some(120))
+    );
+    assert_eq!(r["reused"], false);
+    assert_eq!(r["latency"]["samples"], 4);
+    assert_eq!(
+        r["latency"]["fallback_fired"], 4,
+        "raw-only words take the fallback"
+    );
+    assert!(r["latency"]["recall_p95_ms"].as_f64().unwrap() > 0.0);
+    assert!(r["startup"]["indexed_vectors"].as_u64().unwrap() >= 1_620);
+    let d = &r["daemon"];
+    assert_eq!(
+        (d["bursts"].as_u64(), d["burst_errors"].as_u64()),
+        (Some(4), Some(0))
+    );
+    assert!(d["ready_ms"].as_f64().unwrap() > 0.0);
+    let pid = d["pid"].as_i64().unwrap() as i32;
+    assert!(!alive(pid), "the bench daemon {pid} was left running");
+    assert_eq!(
+        std::fs::read_dir(&tmp).unwrap().count(),
+        0,
+        "temporary data left behind"
+    );
+    assert_eq!(
+        std::fs::read_dir(&env.home).unwrap().count(),
+        0,
+        "ALICE_HOME was touched"
+    );
+
+    let out = bench(&["--dir", env.home.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ALICE_HOME in use"));
+
+    let kept = env.home.parent().unwrap().join("kept");
+    let kept_arg = kept.to_str().unwrap();
+    let small = ["--chunks", "300", "--memories", "20", "--dir", kept_arg];
+    let first: serde_json::Value = serde_json::from_slice(&bench(&small).stdout).unwrap();
+    assert_eq!(first["reused"], false);
+    let again: serde_json::Value = serde_json::from_slice(&bench(&small).stdout).unwrap();
+    assert_eq!(again["reused"], true, "the data in --dir is reused");
+    assert!(kept.join("alice.db").exists(), "--dir data is kept");
+    let mut real = small.to_vec();
+    real.push("--real");
+    let out = bench(&real);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("for the fake embedder"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -83,12 +83,14 @@ name = "alice-embed"
 version = "0.1.0"
 dependencies = [
  "alice-core",
+ "chrono",
  "fastembed",
  "futures",
  "hex",
  "parking_lot",
  "reqwest",
  "rustls",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",

@@ -173,6 +173,13 @@ pub struct BenchArgs {
     /// Write results as JSON to this file.
     #[arg(long)]
     pub out: Option<std::path::PathBuf>,
+    /// Calls measured per operation.
+    #[arg(long, default_value_t = 200)]
+    pub samples: usize,
+    /// Keep the bench data in this directory (instead of a temporary one) and reuse it when it
+    /// already holds the requested data. Never point it at a real ALICE_HOME.
+    #[arg(long)]
+    pub dir: Option<std::path::PathBuf>,
 }
 
 fn rt() -> Result<tokio::runtime::Runtime> {
@@ -248,7 +255,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<()> {
             );
             Ok(())
         }),
-        Command::Bench(args) => bench(home, args, json),
+        Command::Bench(args) => crate::bench::bench(home, args, json),
         other => rt()?.block_on(client_command(home, other, json)),
     }
 }
@@ -629,11 +636,6 @@ async fn stop(home: &AliceHome, json: bool) -> Result<()> {
             }
         }
     }
-}
-
-/// Lands in Task 14.
-pub fn bench(_home: AliceHome, _args: BenchArgs, _json: bool) -> Result<()> {
-    bail!("bench lands in Task 14")
 }
 
 #[cfg(test)]

@@ -372,7 +372,8 @@ fn fatal_reason(e: &AliceError) -> Option<String> {
 /// The newest HLC stored (memories and relations), so the clock never starts behind it.
 /// HLC strings sort as text; values not in the `{millis:013}-…` form are skipped, since a
 /// malformed one (say from an import) would otherwise sort above every real HLC.
-fn newest_hlc(conn: &Connection) -> Result<Option<String>> {
+/// Public for `alice bench`, which times it as one part of start-up.
+pub fn newest_hlc(conn: &Connection) -> Result<Option<String>> {
     const WELL_FORMED: &str =
         "'[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-*'";
     let sql = format!(

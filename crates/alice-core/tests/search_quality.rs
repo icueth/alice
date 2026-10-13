@@ -1,5 +1,6 @@
 //! Synthetic multilingual gold set. Uses the fake embedder, so it measures the lexical
-//! side and the fusion logic; the real-model run lives in `alice bench --quality`.
+//! side and the fusion logic; the same set runs with the real model (and checks the relevance
+//! floor) in `crates/alice-embed/tests/real_search_quality.rs`.
 
 use alice_core::embed::{Embedder, FakeEmbedder, memory_embed_text};
 use alice_core::model::Kind;

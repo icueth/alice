@@ -1,5 +1,6 @@
 //! `alice`: long-term memory for AI coding agents.
 
+mod bench;
 mod cmd;
 
 use clap::{Parser, Subcommand};
