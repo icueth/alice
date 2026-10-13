@@ -4,6 +4,7 @@
 //! `spawn_blocking`, so neither ever waits for the other (spec §4.1).
 
 use crate::paths::AliceHome;
+use crate::spool;
 use crate::worker::{WorkerConfig, spawn_worker};
 use crate::writer::{ProjectChoice, WriteOp, WriteOutcome, WriterHandle, spawn_writer};
 use alice_core::api::*;
@@ -407,13 +408,44 @@ impl Service {
                 id: Some(id),
                 status: RememberStatus::New,
                 project: p.slug,
+                reason: None,
             }),
             WriteOutcome::Remembered(InsertOutcome::Duplicate { id }, p) => Ok(RememberResponse {
                 id: Some(id),
                 status: RememberStatus::Duplicate,
                 project: p.slug,
+                reason: None,
             }),
             other => Err(unexpected(other)),
+        }
+    }
+
+    /// `remember`, or, while the database is read-only, the request queued in the spool and
+    /// applied after a repair (spec §5.7), with a reply that says so. Every interface of the
+    /// daemon (the JSON API, MCP over HTTP) remembers through this. If even the spool cannot be
+    /// written (often the same cause, a full disk), the read-only error says what to do.
+    pub async fn remember_or_spool(&self, req: RememberRequest) -> Result<RememberResponse> {
+        let read_only = match self.remember(req.clone()).await {
+            Err(AliceError::ReadOnly(reason)) => reason,
+            other => return other,
+        };
+        let dir = self.home.spool_dir();
+        let entry = spool::SpoolEntry::Remember(req);
+        match tokio::task::spawn_blocking(move || spool::append(&dir, &entry)).await {
+            Ok(Ok(_)) => Ok(RememberResponse {
+                id: None,
+                status: RememberStatus::Spooled,
+                project: String::new(),
+                reason: Some(spool::read_only_note(&read_only)),
+            }),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "cannot spool a remember while read-only");
+                Err(AliceError::ReadOnly(read_only))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "spooling a remember failed");
+                Err(AliceError::ReadOnly(read_only))
+            }
         }
     }
 

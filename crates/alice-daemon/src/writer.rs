@@ -420,10 +420,16 @@ fn run_batch(
                 }
                 Err(e) => {
                     drop(sp); // rolls back this job only
-                    if let Some(reason) = fatal_reason(&e) {
-                        tracing::error!(%reason, error = %e, "writer entering read-only mode");
-                        ro.set(reason);
-                    }
+                    let e = match fatal_reason(&e) {
+                        Some(reason) => {
+                            tracing::error!(%reason, error = %e, "writer entering read-only mode");
+                            ro.set(reason.clone());
+                            // The job that found out is refused like every later one, so a
+                            // client spools it instead of seeing a raw database error.
+                            AliceError::ReadOnly(reason)
+                        }
+                        None => e,
+                    };
                     replies.push((job.reply, Err(e)));
                 }
             }
@@ -518,18 +524,22 @@ pub fn spawn_writer(
                         // A matcher loaded inside the rolled-back transaction may name entities
                         // that were never committed.
                         st.matcher = None;
-                        if let Some(reason) = is_fatal(&e) {
+                        let fatal = is_fatal(&e);
+                        if let Some(reason) = &fatal {
                             tracing::error!(%reason, error = %e, "writer entering read-only mode");
-                            ro.set(reason);
+                            ro.set(reason.clone());
                         }
                         let replies = out.replies.into_iter().map(|(reply, _)| reply);
                         for reply in replies
                             .chain(out.carry.into_iter().map(|j| j.reply))
                             .flatten()
                         {
-                            let _ = reply.send(Err(AliceError::Other(format!(
-                                "write failed: {e}; retry shortly"
-                            ))));
+                            let _ = reply.send(Err(match &fatal {
+                                Some(reason) => AliceError::ReadOnly(reason.clone()),
+                                None => {
+                                    AliceError::Other(format!("write failed: {e}; retry shortly"))
+                                }
+                            }));
                         }
                     }
                 }
@@ -1119,8 +1129,13 @@ mod tests {
         let conn = open(d.path());
         conn.execute_batch("PRAGMA query_only = ON").unwrap();
         let f = start(d, conn);
+        // Review finding m-4: the write that finds out gets the read-only error too (so a
+        // client spools it), not the raw database error.
         let first = f.h.submit_blocking(remember("refused")).unwrap_err();
-        assert!(!matches!(first, AliceError::Invalid(_)), "{first}");
+        assert!(
+            matches!(&first, AliceError::ReadOnly(r) if r.contains("cannot be written")),
+            "{first:?}"
+        );
         let reason = f.h.read_only.reason().expect("read-only reason");
         assert!(reason.contains("cannot be written"), "{reason}");
         let second = f.h.submit_blocking(remember("also refused")).unwrap_err();

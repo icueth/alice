@@ -138,7 +138,8 @@ fn error_from(status: reqwest::StatusCode, body: &serde_json::Value) -> AliceErr
             // The text is `AliceError::ReadOnly`'s display: keep only the reason.
             let reason = msg.strip_prefix("memory is read-only: ").unwrap_or(msg);
             let reason = reason
-                .strip_suffix(". Run \"alice doctor\".")
+                .strip_suffix(alice_core::error::READ_ONLY_HINT)
+                .and_then(|r| r.strip_suffix(". "))
                 .unwrap_or(reason);
             AliceError::ReadOnly(reason.to_string())
         }
@@ -428,6 +429,7 @@ pub(crate) async fn remember_via(
         id: None,
         status: RememberStatus::Spooled,
         project: String::new(),
+        reason: None,
     })
 }
 
@@ -793,7 +795,8 @@ mod tests {
             "{e:?}"
         );
         assert_eq!(e.to_string().matches("read-only").count(), 1, "{e}");
-        assert_eq!(e.to_string().matches("alice doctor").count(), 1, "{e}");
+        assert_eq!(e.to_string().matches("alice status").count(), 1, "{e}");
+        assert!(!e.to_string().contains("doctor"), "{e}");
     }
 
     #[test]

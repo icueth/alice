@@ -242,41 +242,17 @@ async fn projects(
 ) -> ApiResult<Vec<alice_core::store::projects::ResolvedProject>> {
     Ok(Json(st.svc.projects().await?))
 }
-/// A read-only database never loses a `remember`: it is spooled and applied after repair.
+/// A read-only database never loses a `remember`: it is spooled (202) and applied after repair.
 async fn remember(
     State(st): State<AppState>,
     ApiJson(req): ApiJson<RememberRequest>,
 ) -> Result<Response, ApiError> {
-    let read_only = match st.svc.remember(req.clone()).await {
-        Ok(r) => return Ok(Json(r).into_response()),
-        Err(e @ AliceError::ReadOnly(_)) => e,
-        Err(e) => return Err(e.into()),
+    let r = st.svc.remember_or_spool(req).await?;
+    let status = match r.status {
+        RememberStatus::Spooled => StatusCode::ACCEPTED,
+        _ => StatusCode::OK,
     };
-    let dir = st.svc.home().spool_dir();
-    let spooled = tokio::task::spawn_blocking(move || {
-        crate::spool::append(&dir, &crate::spool::SpoolEntry::Remember(req))
-    })
-    .await;
-    match spooled {
-        Ok(Ok(_)) => Ok((
-            StatusCode::ACCEPTED,
-            Json(RememberResponse {
-                id: None,
-                status: RememberStatus::Spooled,
-                project: String::new(),
-            }),
-        )
-            .into_response()),
-        // Often the same cause (a full disk): the read-only error says what to do about it.
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "cannot spool a remember while read-only");
-            Err(read_only.into())
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "spooling a remember failed");
-            Err(read_only.into())
-        }
-    }
+    Ok((status, Json(r)).into_response())
 }
 async fn recall(
     State(st): State<AppState>,
@@ -402,6 +378,11 @@ mod tests {
         assert_eq!(r.status(), 202);
         let body: RememberResponse = r.json().await.unwrap();
         assert_eq!(body.status, RememberStatus::Spooled);
+        let why = body.reason.unwrap_or_default();
+        assert!(
+            why.contains("read-only") && why.contains("the disk is full"),
+            "the reply says why it was queued: {why}"
+        );
         assert_eq!(crate::spool::pending_count(&home.spool_dir()), 1);
         let file = std::fs::read_dir(home.spool_dir())
             .unwrap()
@@ -435,7 +416,7 @@ mod tests {
         assert_eq!(r.status(), 503);
         let e: serde_json::Value = r.json().await.unwrap();
         assert_eq!(e["kind"], "read_only");
-        assert!(e["error"].as_str().unwrap().contains("alice doctor"), "{e}");
+        assert!(e["error"].as_str().unwrap().contains("alice status"), "{e}");
     }
 
     /// When the spool cannot be written either (the disk is full, say), the caller gets the

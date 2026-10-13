@@ -158,6 +158,9 @@ pub struct RememberResponse {
     pub id: Option<String>,
     pub status: RememberStatus,
     pub project: String,
+    /// Only for `spooled`: why the request was queued and when it will be saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Briefing for the current project: key memories, warnings, recent decisions, last handoff, preferences.

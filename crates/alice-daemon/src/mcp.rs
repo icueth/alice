@@ -99,10 +99,10 @@ impl Backend {
             Backend::Remote(b) => b.client(READ_WAIT).await?.recall(&r).await,
         }
     }
-    /// Never fails because the daemon is down: the shim spools the write instead.
+    /// Never fails because the daemon is down or read-only: the write is spooled instead.
     async fn remember(&self, r: RememberRequest) -> AliceResult<RememberResponse> {
         match self {
-            Backend::Local(s) => s.remember(r).await,
+            Backend::Local(s) => s.remember_or_spool(r).await,
             Backend::Remote(b) => remember_via(&b.home, b.client(WRITE_WAIT).await, r).await,
         }
     }
@@ -182,6 +182,16 @@ fn text(s: impl Into<String>) -> CallToolResult {
 
 fn tool_err(e: AliceError) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(e.to_string())])
+}
+
+/// The reply to a queued `remember`: why it was queued, and when it is saved.
+fn queued_text(reason: Option<&str>) -> String {
+    match reason {
+        Some(r) => format!("Queued: {r}."),
+        None => {
+            "Queued: the memory service was not available; this memory is saved when it is.".into()
+        }
+    }
 }
 
 fn json<T: serde::Serialize>(v: &T) -> CallToolResult {
@@ -303,9 +313,7 @@ impl AliceMcp {
         }
         Ok(match self.backend.remember(req).await {
             Ok(r) => match (r.status, r.id) {
-                (RememberStatus::Spooled, _) => text(
-                    "Queued: the memory service is starting; this memory will be saved within seconds.",
-                ),
+                (RememberStatus::Spooled, _) => text(queued_text(r.reason.as_deref())),
                 (RememberStatus::Duplicate, Some(id)) => {
                     text(format!("Already remembered as {id} in {}.", r.project))
                 }
@@ -519,4 +527,61 @@ pub async fn run_stdio(home: AliceHome, launcher: Launcher) -> anyhow::Result<()
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::ServiceOptions;
+    use alice_core::embed::{Embedder, FakeEmbedder};
+    use rmcp::model::CallToolRequestParams;
+    use rmcp::transport::streamable_http_client::{
+        StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+    };
+
+    /// Review finding m-3: over Streamable HTTP too, a read-only database queues `remember`
+    /// in the spool (as the JSON API and the stdio shim do), and the reply says why.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_mcp_remember_is_spooled_while_read_only() {
+        crate::install_tls();
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let svc = Service::start(
+            home.clone(),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions::default(),
+        )
+        .unwrap();
+        svc.force_read_only("the disk is full");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "k".repeat(64);
+        let app = crate::http::router(svc, token.clone(), port, CancellationToken::new());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg =
+            StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp"))
+                .auth_header(token);
+        let client = ().serve(StreamableHttpClientTransport::from_config(cfg)).await.unwrap();
+        let mut args = serde_json::Map::new();
+        args.insert("content".into(), "kept while read-only".into());
+        let r = client
+            .call_tool(CallToolRequestParams::new("remember").with_arguments(args))
+            .await
+            .unwrap();
+        let text = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        assert_ne!(r.is_error, Some(true), "{text}");
+        assert!(text.starts_with("Queued: "), "{text}");
+        assert!(
+            text.contains("read-only") && text.contains("the disk is full"),
+            "{text}"
+        );
+        assert!(!text.contains("starting"), "{text}");
+        assert_eq!(crate::spool::pending_count(&home.spool_dir()), 1);
+        client.cancel().await.unwrap();
+    }
 }
