@@ -112,15 +112,20 @@ async fn writes_and_reads_stay_fast_during_bulk_ingest() {
     eprintln!(
         "remember p95 {wp:?}, recall p95 {rp:?}, bulk ingest still running when the clients finished: {overlapped}"
     );
-    let factor = if cfg!(debug_assertions) { 6 } else { 1 };
+    // The budgets (remember 50 ms, recall 200 ms) hold in release builds, where this test and
+    // `alice bench` enforce them. An unoptimised build on a busy machine measured remember p95
+    // at 250 ms, so debug builds only catch stalls (a write waiting behind a whole bulk ingest
+    // takes seconds); the correctness checks below apply to both.
+    let (write_bound, read_bound) = if cfg!(debug_assertions) {
+        (Duration::from_secs(2), Duration::from_secs(4))
+    } else {
+        (Duration::from_millis(50), Duration::from_millis(200))
+    };
     assert!(
-        wp < Duration::from_millis(50 * factor),
-        "remember p95 {wp:?}"
+        wp < write_bound,
+        "remember p95 {wp:?} (bound {write_bound:?})"
     );
-    assert!(
-        rp < Duration::from_millis(200 * factor),
-        "recall p95 {rp:?}"
-    );
+    assert!(rp < read_bound, "recall p95 {rp:?} (bound {read_bound:?})");
     let got = svc
         .get(GetRequest {
             ids: all_ids.clone(),

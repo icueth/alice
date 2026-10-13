@@ -281,6 +281,37 @@ impl Scored {
     }
 }
 
+/// The text a query searches and embeds: NFC, trimmed, at most the first 2,000 characters.
+/// Fails for an empty query.
+pub fn query_text(query: &str) -> Result<String> {
+    let mut normalized = nfc(query.trim());
+    if normalized.is_empty() {
+        return Err(AliceError::invalid(
+            "query is empty; pass keywords or a question",
+        ));
+    }
+    if let Some((cut, _)) = normalized.char_indices().nth(MAX_QUERY_CHARS) {
+        normalized.truncate(cut);
+    }
+    Ok(normalized)
+}
+
+/// The query vector for `text` (from [`query_text`]), or `None` when there is no index (it is
+/// being rebuilt) or the embedder fails: the search then uses the word and code lists only.
+pub fn embed_query(
+    index: Option<&VectorIndex>,
+    embedder: &dyn Embedder,
+    text: &str,
+) -> Option<Vec<f32>> {
+    index?;
+    embedder
+        .embed_query(text)
+        .inspect_err(
+            |e| tracing::warn!(error = %e, "query embedding failed; using word matches only"),
+        )
+        .ok()
+}
+
 /// Run the recall pipeline. Fails only for an empty query or a database error; a missing
 /// index (`None` while it is rebuilt) or a failing embedder leaves the word and code lists.
 pub fn run(
@@ -291,15 +322,21 @@ pub fn run(
     p: &SearchParams,
     now: DateTime<Utc>,
 ) -> Result<SearchOutput> {
-    let mut normalized = nfc(p.query.trim());
-    if normalized.is_empty() {
-        return Err(AliceError::invalid(
-            "query is empty; pass keywords or a question",
-        ));
-    }
-    if let Some((cut, _)) = normalized.char_indices().nth(MAX_QUERY_CHARS) {
-        normalized.truncate(cut);
-    }
+    let vector = embed_query(index, embedder, &query_text(&p.query)?);
+    run_with_vector(conn, index, vector, weights, p, now)
+}
+
+/// [`run`] with the query already embedded ([`embed_query`]). The daemon embeds before it takes
+/// a pooled connection, so a recall waiting for the model holds no connection.
+pub fn run_with_vector(
+    conn: &Connection,
+    index: Option<&VectorIndex>,
+    vector: Option<Vec<f32>>,
+    weights: &Weights,
+    p: &SearchParams,
+    now: DateTime<Utc>,
+) -> Result<SearchOutput> {
+    let normalized = query_text(&p.query)?;
     let limit = p.limit.clamp(1, limits::MAX_RECALL_LIMIT);
     let topics: Vec<String> = p.topics.iter().filter_map(|t| normalize_topic(t)).collect();
     let window = Window {
@@ -311,15 +348,7 @@ pub fn run(
         || !topics.is_empty()
         || window.since.is_some()
         || window.before.is_some();
-    let vector = match index {
-        Some(_) => embedder
-            .embed_query(&normalized)
-            .inspect_err(
-                |e| tracing::warn!(error = %e, "query embedding failed; using word matches only"),
-            )
-            .ok(),
-        None => None,
-    };
+    let vector = index.and(vector);
     let query = Query {
         conn,
         index,

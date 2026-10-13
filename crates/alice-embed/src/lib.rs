@@ -263,38 +263,37 @@ mod local {
     /// its largest call: one batch of 32 texts of 512 tokens grew the process by 1.4 GB, batches
     /// of 1,024 tokens by about 100 MB (4,096: about 450 MB). It also bounds how long a query
     /// waits for the model behind the worker: one batch, ~115 ms for two 512-token texts on an
-    /// M4 Pro and less for short ones. Short texts are still batched up to 32.
+    /// M4 Pro and less for short ones. Short texts are still batched up to 32. Batches are
+    /// planned from the tokenizer's own counts: a characters/3 estimate undercounted identifiers,
+    /// JSON and hex ids by up to 2x.
     const BATCH_TOKENS: usize = 1_024;
 
-    /// A cheap upper estimate of a text's token count: multilingual-e5's tokenizer averages about
-    /// 4 characters per token in English and 2–3 in Thai, plus the prefix and special tokens.
-    pub(super) fn estimated_tokens(text: &str) -> usize {
-        (text.chars().count() / 3 + 4).min(MAX_TOKENS)
-    }
-
-    /// Consecutive ranges of `texts` such that each range holds at most `max_batch` texts and its
-    /// padded size (texts × longest estimate) stays within `budget` tokens; a single text always
-    /// forms a range of its own. Order is kept.
+    /// Consecutive ranges over texts with these token `counts` such that each range holds at
+    /// most `max_batch` texts and its padded size (texts × longest) stays within `budget` tokens;
+    /// a single text always forms a range of its own. Order is kept.
     pub(super) fn token_batches(
-        texts: &[String],
+        counts: &[usize],
         max_batch: usize,
         budget: usize,
     ) -> Vec<std::ops::Range<usize>> {
         let mut out = Vec::new();
         let (mut start, mut longest) = (0, 0);
-        for (i, t) in texts.iter().enumerate() {
-            let est = estimated_tokens(t);
+        for (i, &n_tokens) in counts.iter().enumerate() {
             let n = i - start;
-            if n > 0 && (n >= max_batch || (n + 1) * longest.max(est) > budget) {
+            if n > 0 && (n >= max_batch || (n + 1) * longest.max(n_tokens) > budget) {
                 out.push(start..i);
                 (start, longest) = (i, 0);
             }
-            longest = longest.max(est);
+            longest = longest.max(n_tokens);
         }
-        if start < texts.len() {
-            out.push(start..texts.len());
+        if start < counts.len() {
+            out.push(start..counts.len());
         }
         out
+    }
+
+    fn passage(text: &str) -> String {
+        format!("passage: {text}")
     }
 
     /// `TextEmbedding::embed` needs `&mut self`, so calls are serialised by a mutex. One instance
@@ -342,6 +341,33 @@ mod local {
         }
     }
 
+    impl FastEmbedder {
+        /// Tokens the model reads for each passage (prefix and special tokens included, at most
+        /// 512), counted with its own tokenizer. Takes the model lock while counting.
+        #[doc(hidden)]
+        pub fn token_counts(&self, texts: &[String]) -> Vec<usize> {
+            let model = self.model.lock();
+            let counts = texts
+                .iter()
+                .map(|t| {
+                    model
+                        .tokenizer
+                        .encode(passage(t), true)
+                        .map_or(MAX_TOKENS, |e| e.len())
+                        .min(MAX_TOKENS)
+                })
+                .collect();
+            MutexGuard::unlock_fair(model);
+            counts
+        }
+
+        /// How `embed_passages` splits `texts` into inference calls.
+        #[doc(hidden)]
+        pub fn passage_batches(&self, texts: &[String]) -> Vec<std::ops::Range<usize>> {
+            token_batches(&self.token_counts(texts), MAX_BATCH, BATCH_TOKENS)
+        }
+    }
+
     impl Embedder for FastEmbedder {
         fn model_id(&self) -> &str {
             MODEL_ID
@@ -351,11 +377,8 @@ mod local {
         }
         fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             let mut out = Vec::with_capacity(texts.len());
-            for range in token_batches(texts, MAX_BATCH, BATCH_TOKENS) {
-                let inputs: Vec<String> = texts[range]
-                    .iter()
-                    .map(|t| format!("passage: {t}"))
-                    .collect();
+            for range in self.passage_batches(texts) {
+                let inputs: Vec<String> = texts[range].iter().map(|t| passage(t)).collect();
                 let mut model = self.model.lock();
                 let vectors = model
                     .embed(inputs, None)
@@ -400,21 +423,19 @@ mod tests {
     #[cfg(feature = "local")]
     #[test]
     fn passages_are_batched_by_padded_tokens_in_order() {
-        use super::local::{estimated_tokens, token_batches};
-        let text = |chars: usize| "x".repeat(chars);
-        // Short texts (~14 tokens each): up to 32 per batch.
-        let short: Vec<String> = (0..70).map(|_| text(30)).collect();
+        use super::local::token_batches;
+        // Short texts (14 tokens each): up to 32 per batch.
+        let short = vec![14; 70];
         assert_eq!(
             token_batches(&short, 32, 1_024),
             vec![0..32, 32..64, 64..70]
         );
-        // Long texts are capped at 512 tokens: two per batch of 1,024.
-        let long: Vec<String> = (0..5).map(|_| text(20_000)).collect();
+        // Texts at the 512-token cap: two per batch of 1,024.
+        let long = vec![512; 5];
         assert_eq!(token_batches(&long, 32, 1_024), vec![0..2, 2..4, 4..5]);
         // One long text after short ones closes the batch: padding would exceed the budget.
-        let mut mixed: Vec<String> = (0..10).map(|_| text(60)).collect();
-        mixed.push(text(3_000));
-        mixed.push(text(60));
+        let mut mixed = vec![24; 10];
+        mixed.extend([512, 24]);
         assert_eq!(token_batches(&mixed, 32, 1_024), vec![0..10, 10..12]);
         // A text over the budget on its own still gets a batch; nothing is lost or reordered.
         assert_eq!(
@@ -422,17 +443,13 @@ mod tests {
             vec![0..1, 1..2, 2..3, 3..4, 4..5]
         );
         assert!(token_batches(&[], 32, 1_024).is_empty());
-        for texts in [&short, &long, &mixed] {
-            let ranges = token_batches(texts, 32, 1_024);
+        for counts in [&short, &long, &mixed] {
+            let ranges = token_batches(counts, 32, 1_024);
             assert_eq!(ranges.first().map(|r| r.start), Some(0));
-            assert_eq!(ranges.last().map(|r| r.end), Some(texts.len()));
+            assert_eq!(ranges.last().map(|r| r.end), Some(counts.len()));
             assert!(ranges.windows(2).all(|w| w[0].end == w[1].start));
             for r in &ranges {
-                let longest = texts[r.clone()]
-                    .iter()
-                    .map(|t| estimated_tokens(t))
-                    .max()
-                    .unwrap();
+                let longest = counts[r.clone()].iter().max().copied().unwrap();
                 assert!(r.len() == 1 || r.len() * longest <= 1_024, "{r:?}");
             }
         }

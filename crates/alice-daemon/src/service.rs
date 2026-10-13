@@ -407,7 +407,20 @@ impl Service {
         let format = req.format;
         let opts = self.opts.clone();
         let index = self.index.read().clone();
-        let embedder = self.embedder.clone();
+        // Embedded before a reader connection is taken: the model is shared with the
+        // embedding worker, and a recall waiting for it must not hold a connection.
+        let text = search::query_text(&req.query)?;
+        let vector = match &index {
+            Some(idx) => {
+                let (idx, embedder) = (idx.clone(), self.embedder.clone());
+                tokio::task::spawn_blocking(move || {
+                    search::embed_query(Some(&idx), embedder.as_ref(), &text)
+                })
+                .await
+                .map_err(join_err)?
+            }
+            None => None,
+        };
         let resolver = self.resolver.clone();
         let (out, slug) = self
             .read(move |c| {
@@ -429,10 +442,10 @@ impl Service {
                     relevance_floor: opts.relevance_floor,
                     raw_min_results: opts.raw_min_results,
                 };
-                let out = search::run(
+                let out = search::run_with_vector(
                     c,
                     index.as_deref(),
-                    embedder.as_ref(),
+                    vector,
                     &opts.weights,
                     &params,
                     chrono::Utc::now(),
@@ -959,6 +972,64 @@ mod tests {
         assert_eq!(found.results[0].tier, Tier::Raw);
         let h = s.health().await.unwrap();
         assert_eq!((h.chunks, h.projects, h.memories), (1, 2, 0));
+    }
+
+    /// Review finding M2: a recall embeds its query before it takes a reader connection, so a
+    /// recall waiting for the (shared, possibly busy) model never holds up other reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_waiting_for_the_model_holds_no_reader_connection() {
+        struct SlowQueries(FakeEmbedder);
+        impl Embedder for SlowQueries {
+            fn model_id(&self) -> &str {
+                self.0.model_id()
+            }
+            fn dim(&self) -> usize {
+                self.0.dim()
+            }
+            fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                self.0.embed_passages(texts)
+            }
+            fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+                std::thread::sleep(Duration::from_millis(600));
+                self.0.embed_query(text)
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(SlowQueries(FakeEmbedder::new(384))) as Arc<dyn Embedder>),
+            ServiceOptions {
+                reader_pool: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..200 {
+            if s.health().await.unwrap().index_ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(s.health().await.unwrap().index_ready);
+        let recall = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                s.recall(RecallRequest {
+                    query: "anything".into(),
+                    ..Default::default()
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let t = Instant::now();
+        s.context(ContextRequest::default()).await.unwrap();
+        assert!(
+            t.elapsed() < Duration::from_millis(300),
+            "context waited {:?} for the reader the recall held",
+            t.elapsed()
+        );
+        recall.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

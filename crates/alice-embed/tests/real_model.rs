@@ -25,3 +25,73 @@ async fn real_model_ranks_the_thai_match_first() {
     let scores: Vec<f32> = p.iter().map(|v| cosine(&q, v)).collect();
     assert!(scores[0] > scores[1] && scores[0] > scores[2], "{scores:?}");
 }
+
+/// Review finding M1: batches are planned from the model's own token counts, so text that
+/// tokenizes densely (identifiers, JSON, hex ids) never makes a batch above 1,024 padded
+/// tokens. A characters/3 estimate undercounted such text by up to 2x.
+#[test]
+#[ignore = "needs the real model in ALICE_MODELS_DIR or ~/.alice/models"]
+fn passage_batches_respect_the_token_budget_for_dense_text() {
+    let dir = std::env::var_os("ALICE_MODELS_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".alice/models")))
+        .unwrap();
+    let e = FastEmbedder::new(&dir).unwrap();
+    let hex = |i: usize, n: usize| -> String {
+        (0..n)
+            .map(|j| format!("{:032x}", (i * 7919 + j) as u128 * 0x9e37_79b9_7f4a_7c15))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut texts: Vec<String> = Vec::new();
+    for i in 0..40 {
+        texts.push(match i % 4 {
+            0 => hex(i, 1 + i % 9),
+            1 => format!(
+                "{{\"level\":\"warn\",\"ts\":\"2026-10-13T09:44:23.391Z\",\"id\":\"01K7EXAMPLE{i:015}\",\"msg\":\"retry {i}\"}} "
+            )
+            .repeat(1 + i % 6),
+            2 => "fn upsert_batch(&self, items: &[(VecKey, Vec<f32>)]) -> Result<()> { self.put(&items) } "
+                .repeat(1 + i % 7),
+            _ => "short plain sentence".to_string(),
+        });
+    }
+    let counts = e.token_counts(&texts);
+    let dense = counts
+        .iter()
+        .zip(&texts)
+        .filter(|(n, t)| **n > t.chars().count() / 3 + 4)
+        .count();
+    assert!(
+        dense > 0,
+        "the inputs should tokenize more densely than chars/3"
+    );
+    let batches = e.passage_batches(&texts);
+    assert_eq!(batches.first().map(|r| r.start), Some(0));
+    assert_eq!(batches.last().map(|r| r.end), Some(texts.len()));
+    assert!(batches.windows(2).all(|w| w[0].end == w[1].start));
+    for r in &batches {
+        let longest = counts[r.clone()].iter().max().copied().unwrap();
+        assert!(r.len() <= 32, "{r:?}");
+        assert!(
+            r.len() == 1 || r.len() * longest <= 1_024,
+            "{r:?}: {} texts x {longest} tokens",
+            r.len()
+        );
+    }
+    // The old plan, from a characters/3 estimate, overran the budget on the same texts.
+    let estimate = |t: &String| (t.chars().count() / 3 + 4).min(512);
+    let (mut start, mut longest, mut overran) = (0, 0, false);
+    for (i, t) in texts.iter().enumerate() {
+        let n = i - start;
+        if n > 0 && (n >= 32 || (n + 1) * longest.max(estimate(t)) > 1_024) {
+            let real = counts[start..i].iter().max().unwrap() * n;
+            overran |= real > 1_024;
+            (start, longest) = (i, 0);
+        }
+        longest = longest.max(estimate(t));
+    }
+    assert!(overran, "the estimate-based plan stayed within the budget");
+    let vectors = e.embed_passages(&texts).unwrap();
+    assert_eq!(vectors.len(), texts.len());
+}

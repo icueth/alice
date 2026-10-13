@@ -656,3 +656,86 @@ fn bench_runs_on_throwaway_data_and_cleans_up() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Every file under `dir` with its contents, to prove a refused run changed nothing.
+fn snapshot(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                out.push((p.clone(), Vec::new()));
+                stack.push(p);
+            } else {
+                out.push((p.clone(), std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Review finding I2: `bench --dir` only ever writes to bench data. A directory that holds
+/// anything without the bench marker (such as another Alice home) is refused before anything is
+/// written, and bench data whose lock is held (a daemon serves it) is refused too.
+#[test]
+fn bench_refuses_a_dir_that_is_not_bench_data_or_is_in_use() {
+    let env = Env::new();
+    let bench = |dir: &std::path::Path| {
+        env.cmd(&[
+            "bench",
+            "--samples",
+            "2",
+            "--chunks",
+            "200",
+            "--memories",
+            "10",
+            "--dir",
+            dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+    };
+    let root = env.home.parent().unwrap();
+
+    let other_home = root.join("other-home");
+    std::fs::create_dir_all(other_home.join("logs")).unwrap();
+    std::fs::write(other_home.join("alice.db"), b"not bench data").unwrap();
+    std::fs::write(other_home.join("token"), b"secret").unwrap();
+    let before = snapshot(&other_home);
+    let out = bench(&other_home);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not bench data"), "{err}");
+    assert_eq!(
+        snapshot(&other_home),
+        before,
+        "a refused --dir was modified"
+    );
+
+    let notes = root.join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("todo.txt"), b"keep me").unwrap();
+    let before = snapshot(&notes);
+    assert!(!bench(&notes).status.success());
+    assert_eq!(snapshot(&notes), before);
+
+    let kept = root.join("kept");
+    assert!(bench(&kept).status.success(), "a new directory is fine");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(kept.join("daemon.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let out = bench(&kept);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("in use"), "{err}");
+    lock.unlock().unwrap();
+    assert!(
+        bench(&kept).status.success(),
+        "free again once the lock is released"
+    );
+}

@@ -313,6 +313,28 @@ fn children_peak_rss_mb() -> Option<f64> {
     None
 }
 
+/// Names the embedder a bench directory was loaded with; its presence marks bench data.
+const MARKER: &str = "bench-embedder";
+
+/// The daemon lock of `home`, or an error when a daemon (or another bench) holds it.
+fn take_lock(home: &AliceHome) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.lock_file())?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "{} is in use by a running daemon or bench; stop it (ALICE_HOME={} alice daemon stop) and retry",
+            home.root().display(),
+            home.root().display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
 fn same_dir(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -343,6 +365,15 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
                     dir.display()
                 );
             }
+            // Only bench data is ever written to: anything else (another Alice home, say) is
+            // refused before a single file changes.
+            let has_files = std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_some());
+            if has_files && !dir.join(MARKER).exists() {
+                bail!(
+                    "--dir {} is not bench data (no {MARKER} file in it); choose a new or empty directory",
+                    dir.display()
+                );
+            }
             dir
         }
         None => tmp
@@ -351,9 +382,14 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
             .to_path_buf(),
     };
     let home = AliceHome::new(root);
+    std::fs::create_dir_all(home.root())?;
+    // The daemon's single-instance lock, held while this process writes the data itself: a
+    // daemon serving the directory would be a second writer. Released before the bench starts
+    // its own daemon there.
+    let lock = take_lock(&home)?;
     home.ensure_dirs()?;
     // Data loaded with one embedder is meaningless with another.
-    let marker = home.root().join("bench-embedder");
+    let marker = home.root().join(MARKER);
     let embedder = if args.real {
         alice_embed::MODEL_ID
     } else {
@@ -410,6 +446,7 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
     eprintln!("bench: timing the start-up parts");
     report.startup = startup_parts(&home, &model.0, model.1)?;
 
+    drop(lock);
     eprintln!("bench: starting a daemon on the data");
     report.daemon = daemon_run(&rt, &home, real, &user_models, &mut corpus)?;
 
