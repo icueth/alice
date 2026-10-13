@@ -956,6 +956,89 @@ mod tests {
         );
     }
 
+    /// Review finding m-8 (spec §10): a damaged vector index (cut short, or the right size full
+    /// of garbage) is rebuilt from the stored vectors at start, and vector search works again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_truncated_or_corrupted_index_is_rebuilt_at_start() {
+        type Damage = fn(&Path);
+        let truncate: Damage = |p| {
+            let head = std::fs::read(p).unwrap()[..100].to_vec();
+            std::fs::write(p, head).unwrap();
+        };
+        let garbage: Damage = |p| {
+            let len = std::fs::metadata(p).unwrap().len() as usize;
+            let junk: Vec<u8> = (0..len).map(|i| (i * 7 + 13) as u8).collect();
+            std::fs::write(p, junk).unwrap();
+        };
+        for (how, damage) in [("truncated", truncate), ("garbage", garbage)] {
+            let d = tempfile::tempdir().unwrap();
+            let home = AliceHome::new(d.path().to_path_buf());
+            let mk = || Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>);
+            let s = Service::start(home.clone(), &mk, ServiceOptions::default()).unwrap();
+            let id = s
+                .remember(RememberRequest {
+                    content: "vectors survive a damaged index file".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .id
+                .unwrap();
+            s.ingest(IngestRequest {
+                source: SourceInput {
+                    uri: "s".into(),
+                    ..Default::default()
+                },
+                chunks: vec![ChunkInput {
+                    ord: 0,
+                    text: "a raw chunk whose vector also survives".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            wait_embedded(&s).await;
+            tokio::task::spawn_blocking({
+                let s = s.clone();
+                move || s.shutdown()
+            })
+            .await
+            .unwrap();
+            drop(s);
+            let base = home.vector_file("fake");
+            for part in ["memories.usearch", "chunks.usearch"] {
+                damage(&base.with_extension(part));
+            }
+            let s = Service::start(home, &mk, ServiceOptions::default()).unwrap();
+            for _ in 0..200 {
+                if s.health().await.unwrap().index_ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(s.health().await.unwrap().index_ready, "{how}");
+            let out = s
+                .recall(RecallRequest {
+                    query: "vectors survive a damaged index file".into(),
+                    format: OutputFormat::Json,
+                    include_raw: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let hit = out.results.iter().find(|h| h.id == id).expect(how);
+            assert!(hit.matched.contains(&MatchVia::Vector), "{how}: {hit:?}");
+            assert!(
+                out.results
+                    .iter()
+                    .any(|h| h.tier == Tier::Raw && h.matched.contains(&MatchVia::Vector)),
+                "{how}: chunk vectors are back too: {:?}",
+                out.results
+            );
+        }
+    }
+
     /// Ruling: a project detected from the working directory but never written to still gets
     /// the global preferences, and reading it does not create it.
     #[tokio::test(flavor = "multi_thread")]

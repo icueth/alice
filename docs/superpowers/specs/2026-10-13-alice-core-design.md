@@ -86,7 +86,7 @@ SP1 is built first and is usable on its own as a MemPalace replacement (agents c
 1. **One binary.** `alice` contains the daemon, CLI, MCP stdio shim and hook handler as subcommands.
 2. **The daemon is the only process that opens the database.** All clients go through it.
 3. **Heavy work never holds the writer.** Embedding, judging, importing, syncing and parsing run in worker threads and hand small batches to the writer thread. The writer only executes short transactions (target < 5 ms each, batched group commit). A large ingest is written in byte-bounded slices (≤ 64 KB of text and ≤ 200 chunks per transaction), so a `remember` queued behind it waits for one slice at most.
-4. **Hooks never block and never lose data.** If the daemon is unreachable, the client appends the request to `~/.alice/spool/<pid>-<ts>.jsonl` (fsync), triggers a detached daemon start, and returns. The daemon drains the spool on start-up and on a 5 s timer.
+4. **Hooks never block and never lose data.** If the daemon is unreachable, the client writes the request to `~/.alice/spool/<ulid>.json` (one file per request, written to a temp file, fsynced and renamed into place), triggers a detached daemon start, and returns. The daemon drains the spool on start-up and on a 5 s timer.
 5. **Auto-start.** The first client that cannot reach the daemon starts it detached. A lock file (`~/.alice/daemon.lock`, OS advisory lock) guarantees a single instance. `alice service install` registers a launchd agent (macOS), systemd user unit (Linux) or scheduled task (Windows) for always-on operation.
 6. **Local security.** The daemon binds to 127.0.0.1 on a random free port, written with the pid and a per-start instance id to `~/.alice/daemon.json`. Every request carries a bearer token read from `~/.alice/token` (mode 0600, regenerated on `alice token rotate`). Before sending the token, a client proves it is talking to that daemon: `GET /api/v1/ping?nonce=<random>` must answer with the instance id from `daemon.json` and `HMAC-SHA256(token, "<nonce>:<instance>")`, so a stale `daemon.json` pointing at a port another process now uses never receives the token, and a proof relayed from another daemon does not vouch for a stale instance. The server rejects a request if its `Host` is not `127.0.0.1:<port>` or `localhost:<port>`, or if it carries an `Origin` other than the daemon's own origin (prevents DNS rebinding and cross-site requests). The UI gets a session through a one-time URL printed or opened by `alice ui`.
 7. **Two MCP transports.** Clients that support Streamable HTTP connect to `/mcp` directly (with the token header). Others launch `alice mcp`, a stdio shim that proxies to the daemon (auto-starting it); target shim start-up < 20 ms.
@@ -100,7 +100,7 @@ alice.db            SQLite database (source of truth)
 vectors/            HNSW index, two files per embedding model: <model>.memories.usearch and
                     <model>.chunks.usearch (rebuildable)
 models/             downloaded embedding models
-spool/              pending requests written while the daemon was down
+spool/              pending requests (<ulid>.json) written while the daemon was down or read-only
 backups/            rotated SQLite snapshots
 logs/               daemon logs (rotated, never contain secrets)
 config.toml         user configuration
@@ -530,7 +530,7 @@ Human-readable tables by default, `--json` for scripts. The CLI supports every w
 
 ### 8.5 Contracts for SP2 and SP3
 
-- **SP2 hooks:** `alice hook <event>` reads the host's hook JSON on stdin, sends it to the daemon (or the spool) and prints host-specific output (for SessionStart, the `context` briefing as additional context). Must finish in < 100 ms. Transcript ingestion uses `POST /api/v1/sources` with chunk batches; distillation results use `remember` with provenance.
+- **SP2 hooks:** `alice hook <event>` reads the host's hook JSON on stdin, sends it to the daemon (or the spool) and prints host-specific output (for SessionStart, the `context` briefing as additional context). Must finish in < 100 ms. Transcript ingestion uses `POST /api/v1/ingest` with chunk batches (at most 1,000 chunks per request); distillation results use `remember` with provenance.
 - **SP3 UI:** consumes the HTTP API, SSE stream and settings schema only; the daemon serves the built UI assets from `/`.
 
 ---
@@ -560,8 +560,8 @@ Human-readable tables by default, `--json` for scripts. The CLI supports every w
 ## 10. Testing and benchmarks
 
 - **Unit tests** per module: store, migrations, normalization, redaction, ranking, Judge providers (Jev via recorded fixtures), HLC, sync merge rules, importer mapping.
-- **Concurrency regression (the MemPalace failure):** 20 clients writing and searching concurrently while an import of 100k records runs. Pass: `remember` p95 < 50 ms, `recall` p95 < 200 ms, zero lost or duplicated writes.
-- **Crash safety:** `kill -9` during writes, during import and during sync; on restart no acknowledged write is lost (spool + WAL); a deleted or corrupted vector index rebuilds automatically.
+- **Concurrency regression (the MemPalace failure):** 20 clients writing and searching concurrently while an import of 100k records runs. Pass: `remember` p95 < 50 ms, `recall` p95 < 200 ms, zero lost or duplicated writes. The test (`crates/alice-daemon/tests/service_concurrency.rs`) ingests 20k chunks by default, which CI runs; `ALICE_TEST_BULK=100000` runs the full 100k (best with `--release`, where the latency budgets are enforced).
+- **Crash safety:** `kill -9` during writes, during import and during sync; on restart no acknowledged write is lost (spool + WAL); a deleted or corrupted vector index rebuilds automatically. M1 tests: SIGKILL while three bulk ingests and forty `remember`s are in flight, then every acknowledged id is present, every queued write applied and the resent ingests complete (`crates/alice/tests/cli.rs`); a deleted, truncated or garbage-filled index is rebuilt at start (`service.rs` tests). Sync arrives in M4.
 - **Sync:** two simulated devices and a bare remote: concurrent edits, deletes on one side, edit-vs-delete, push races, KG merges; verify deterministic files and review items.
 - **Search quality:** gold query sets scored with nDCG@10 and Recall@10. A synthetic multilingual fixture (Thai, English, mixed, code identifiers) lives in the repo and runs in CI. A gold set built from the owner's palace runs locally only and is never committed. The Jev Judge can act as relevance grader when enabled.
 - **Interfaces:** MCP conformance with a reference client, CLI golden tests (snapshot), HTTP auth tests (missing token, wrong Host, foreign Origin).

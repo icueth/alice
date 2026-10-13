@@ -236,6 +236,135 @@ fn kill_9_loses_no_acknowledged_write() {
     assert_eq!(e.log().matches("daemon started").count(), 2);
 }
 
+/// One HTTP/1.1 request to the daemon on `port`; the status code, or `None` when the
+/// connection broke first (the daemon was killed).
+fn post(port: u16, token: &str, path: &str, body: &str) -> Option<u16> {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(60))).ok()?;
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    s.write_all(head.as_bytes()).ok()?;
+    s.write_all(body.as_bytes()).ok()?;
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).ok()?;
+    resp.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Review finding m-8 (spec §10, crash safety): the daemon is killed (SIGKILL) while three bulk
+/// ingests and forty `remember`s are in flight. After a restart every acknowledged id is there,
+/// every queued write is applied, and the ingests, sent again as a capture hook would, complete
+/// (an ingest resumes by `ord`).
+#[test]
+fn kill_9_during_bulk_ingest_and_remembers_loses_nothing_acknowledged() {
+    let e = Env::new();
+    assert!(e.ok(&["daemon", "start"]).starts_with("running (pid "));
+    let info = e.daemon_json().unwrap();
+    let port = info["port"].as_u64().unwrap() as u16;
+    let pid = info["pid"].as_i64().unwrap() as i32;
+    let token = std::fs::read_to_string(e.home.join("token"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let words: String = (0..400).map(|i| format!(" w{i}")).collect();
+    let ingest = |b: usize| {
+        serde_json::json!({
+            "source": {"source_type": "session", "uri": format!("crash-bulk-{b}")},
+            "chunks": (0..1_000)
+                .map(|i| serde_json::json!({"ord": i, "text": format!("bulk {b} chunk {i}{words}")}))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+    };
+    let bodies: Vec<String> = (0..3).map(ingest).collect();
+    let ingests: Vec<_> = bodies
+        .iter()
+        .cloned()
+        .map(|body| {
+            let token = token.clone();
+            std::thread::spawn(move || post(port, &token, "/api/v1/ingest", &body))
+        })
+        .collect();
+    let remember = |i: usize| {
+        e.cmd(&["--json", "remember", &format!("crash survivor number {i}")])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    // Twenty while the ingests run, twenty more still on their way when the daemon dies.
+    let mut remembers: Vec<_> = (0..20).map(remember).collect();
+    std::thread::sleep(Duration::from_millis(300));
+    remembers.extend((20..40).map(remember));
+    std::thread::sleep(Duration::from_millis(30));
+    // SAFETY: killing the daemon this test started.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+
+    let mut acknowledged = Vec::new();
+    let mut queued = 0;
+    for c in remembers {
+        let o = c.wait_with_output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let r: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        match r["status"].as_str() {
+            Some("new" | "duplicate") => acknowledged.push(r["id"].as_str().unwrap().to_string()),
+            Some("spooled") => queued += 1,
+            other => panic!("unexpected reply {other:?}: {r}"),
+        }
+    }
+    let codes: Vec<Option<u16>> = ingests.into_iter().map(|h| h.join().unwrap()).collect();
+    eprintln!(
+        "killed {pid}: {} remembers acknowledged, {queued} queued; ingest answers {codes:?}",
+        acknowledged.len()
+    );
+    eventually(|| !alive(pid), "the killed daemon to go away");
+
+    // A remember that came after the kill may already have started a new daemon.
+    assert!(e.ok(&["daemon", "start"]).starts_with("running (pid "));
+    assert_ne!(e.daemon_pid(), Some(pid));
+    if !acknowledged.is_empty() {
+        let mut args = vec!["get"];
+        args.extend(acknowledged.iter().map(String::as_str));
+        let got = e.json(&args);
+        assert_eq!(
+            got["missing"],
+            serde_json::json!([]),
+            "acknowledged ids lost"
+        );
+        assert_eq!(
+            got["memories"].as_array().map(Vec::len),
+            Some(acknowledged.len())
+        );
+    }
+    for body in &bodies {
+        assert_eq!(
+            post(port_of(&e), &token, "/api/v1/ingest", body),
+            Some(200),
+            "an ingest sent again completes"
+        );
+    }
+    let survivors = || {
+        e.json(&[
+            "recall",
+            "crash survivor number",
+            "--limit",
+            "50",
+            "--max-tokens",
+            "100000",
+        ])["results"]
+            .as_array()
+            .map_or(0, Vec::len)
+    };
+    eventually(|| survivors() == 40, "every remember, queued or not");
+    assert_eq!(e.json(&["status"])["chunks"], 3_000);
+}
+
+fn port_of(e: &Env) -> u16 {
+    e.daemon_json().unwrap()["port"].as_u64().unwrap() as u16
+}
+
 /// A port that answers like a web server but cannot prove the token, read until the end of
 /// the request headers; everything it receives is recorded.
 fn stranger() -> (u16, std::sync::Arc<std::sync::Mutex<String>>) {

@@ -1,4 +1,9 @@
 //! The MemPalace failure as a regression test: many clients writing and reading while a bulk ingest runs.
+//!
+//! It ingests 20,000 chunks by default, which CI runs. The spec's full size (§10: an import of
+//! 100k records) runs with `ALICE_TEST_BULK=100000`, best in release where the latency budgets
+//! are enforced:
+//! `ALICE_TEST_BULK=100000 cargo test --release -p alice-daemon --test service_concurrency`.
 
 use alice_core::api::*;
 use alice_core::embed::{Embedder, FakeEmbedder};
