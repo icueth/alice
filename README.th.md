@@ -16,7 +16,7 @@
 </p>
 
 > [!IMPORTANT]
-> **สถานะ: M1 เสร็จแล้ว — รุ่น alpha** ที่เก็บข้อมูล, การค้นหาแบบผสม (ไทย อังกฤษ และชื่อในโค้ด), daemon, MCP tool ทั้ง 7 ตัว, CLI และ HTTP API ใช้งานได้แล้ว และมี CI ทดสอบบน macOS, Linux และ Windows ยังไม่มี release แบบแพ็กเกจ ให้[ติดตั้งจาก source](#ติดตั้งจาก-source) ความสามารถที่มีป้าย *(วางแผนไว้)* จะตามมาใน milestone ถัดไป ดูได้ที่ [roadmap](#roadmap) ก่อนถึง 1.0 อาจมีการเปลี่ยนที่ไม่เข้ากับของเดิม
+> **สถานะ: M1 เสร็จแล้ว — รุ่น alpha** ที่เก็บข้อมูล, การค้นหาแบบผสม (ไทย อังกฤษ และชื่อในโค้ด), daemon, MCP tool ทั้ง 7 ตัว, CLI และ HTTP API ใช้งานได้แล้ว และมี CI ทดสอบบน macOS และ Linux (บน Windows ยัง link ไม่ผ่าน) ยังไม่มี release แบบแพ็กเกจ ให้[ติดตั้งจาก source](#ติดตั้งจาก-source) ความสามารถที่มีป้าย *(วางแผนไว้)* จะตามมาใน milestone ถัดไป ดูได้ที่ [roadmap](#roadmap) ก่อนถึง 1.0 อาจมีการเปลี่ยนที่ไม่เข้ากับของเดิม
 
 ---
 
@@ -80,7 +80,7 @@ alice model fetch      # ดาวน์โหลดโมเดล embedding (~
 |---|---|
 | macOS ชิป Apple Silicon | รองรับ, embedding ในเครื่อง |
 | Linux (glibc) x86_64 และ aarch64 | รองรับ, embedding ในเครื่อง |
-| Windows x86_64 | build ได้และผ่าน CI แต่ยังไม่ได้ทดสอบใช้งานจริง |
+| Windows x86_64 | ยังไม่รองรับ: compile ผ่าน แต่ link ไม่ผ่านที่ SIMD kernel ของ library vector index (usearch 2.26.4 กับ MSVC) จะแก้ใน M2 |
 | macOS ชิป Intel, Linux musl | ยังไม่รองรับ: ONNX Runtime ไม่มี library สำเร็จรูปให้ จึงรัน embedding ในเครื่องไม่ได้ จะใช้ได้เมื่อมี embedding provider ผ่าน HTTP (วางแผนไว้ใน M2) |
 
 ### ตัวติดตั้งแบบแพ็กเกจ (วางแผนไว้)

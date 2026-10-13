@@ -221,7 +221,7 @@ Migrations are forward-only, numbered, and run at daemon start inside a transact
 - Each vector records its model. Changing the model triggers a background re-embed into a new index; search keeps using the old index until the new one is complete, then switches atomically.
 - Model files are downloaded on first use to `models/<model>/` with size and SHA-256 verification (`HF_ENDPOINT` selects a mirror); `alice model fetch` pre-downloads for offline machines.
 - Embedding completion is compare-and-set: the worker stores a vector only if the row's `content_hash` still equals the one it read with the text, so an edit that lands while the old text is being embedded is never marked done with the old vector.
-- Local embeddings need an ONNX Runtime prebuilt library: Apple Silicon macOS, glibc Linux (x86_64, aarch64) and Windows x64. Intel macOS and musl Linux have none; they need an HTTP embedding provider (M2).
+- Local embeddings need an ONNX Runtime prebuilt library: Apple Silicon macOS, glibc Linux (x86_64, aarch64) and Windows x64. Intel macOS and musl Linux have none; they need an HTTP embedding provider (M2). (M1 status: the Windows build compiles but does not link, because usearch 2.26.4 references its NumKong SIMD kernels through DLL-import names under MSVC.)
 
 ### 4.3 Lexical search
 
