@@ -195,6 +195,14 @@ fn ensure_predicate(conn: &Connection, p: &str) -> Result<String> {
     Ok(p.to_string())
 }
 
+/// `valid_to` for a relation closed at `?3`. A close time before the relation's start would
+/// make `valid_to < valid_from` (say, added at 09:44 today, then superseded with today's bare
+/// date, midnight). So the close time is clamped to at least 1 ms after the start: intervals are
+/// half-open (`valid_from <= t < valid_to`), and a zero-length one would vanish from every
+/// `as_of` query. Stored times are canonical RFC 3339 text, so text `MAX` is time order.
+const CLOSED_AT: &str =
+    "MAX(?3, COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', valid_from, '+0.001 seconds'), valid_from))";
+
 /// Add, supersede or end a fact. `hlc` stamps every relation this call creates or closes, so
 /// sync sees the change.
 pub fn assert_fact(conn: &Connection, f: &AssertFact, hlc: String) -> Result<FactOutcome> {
@@ -241,14 +249,19 @@ pub fn assert_fact(conn: &Connection, f: &AssertFact, hlc: String) -> Result<Fac
         .optional()?;
     // Supersede leaves one current value. If it is already current it stays as it is, so a
     // retried call does not cut its history in two.
-    let ended = if f.action == FactAction::Supersede {
-        conn.execute(
-            "UPDATE relations SET valid_to = ?3, hlc = ?4
-             WHERE subject_id = ?1 AND predicate = ?2 AND valid_to IS NULL AND id IS NOT ?5",
-            params![subject, predicate, at, hlc, current],
-        )?
+    let (ended, valid_from) = if f.action == FactAction::Supersede {
+        let mut close = conn.prepare(&format!(
+            "UPDATE relations SET valid_to = {CLOSED_AT}, hlc = ?4
+             WHERE subject_id = ?1 AND predicate = ?2 AND valid_to IS NULL AND id IS NOT ?5
+             RETURNING valid_to"
+        ))?;
+        let closed: Vec<String> = close
+            .query_map(params![subject, predicate, at, hlc, current], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        // The new value never starts before the values it replaces end.
+        (closed.len(), closed.into_iter().fold(at, std::cmp::max))
     } else {
-        0
+        (0, at)
     };
     if let Some(id) = current {
         return Ok(FactOutcome {
@@ -262,7 +275,7 @@ pub fn assert_fact(conn: &Connection, f: &AssertFact, hlc: String) -> Result<Fac
     conn.execute(
         "INSERT INTO relations (id, subject_id, predicate, object_entity_id, object_literal, valid_from, source_memory_id, created_at, hlc)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![id, subject, predicate, obj_entity, obj_literal, at, f.source_memory_id, now_rfc3339(), hlc],
+        params![id, subject, predicate, obj_entity, obj_literal, valid_from, f.source_memory_id, now_rfc3339(), hlc],
     )?;
     Ok(FactOutcome {
         relation_id: Some(id),
@@ -300,9 +313,11 @@ fn end_fact(
     };
     let obj_literal = (f.object_kind != ObjectKind::Entity).then_some(object);
     let ended = conn.execute(
-        "UPDATE relations SET valid_to = ?3, hlc = ?4
-         WHERE subject_id = ?1 AND predicate = ?2 AND valid_to IS NULL
-           AND (object_entity_id = ?5 OR object_literal = ?6)",
+        &format!(
+            "UPDATE relations SET valid_to = {CLOSED_AT}, hlc = ?4
+             WHERE subject_id = ?1 AND predicate = ?2 AND valid_to IS NULL
+               AND (object_entity_id = ?5 OR object_literal = ?6)"
+        ),
         params![subject, predicate, at, hlc, obj_entity, obj_literal],
     )?;
     Ok(outcome(predicate, ended))
@@ -944,6 +959,143 @@ mod tests {
         .unwrap();
         assert_eq!(out.ended, 1);
         assert!(current(&c, "svc").is_empty());
+    }
+
+    fn objects_as_of(c: &Connection, entity: &str, t: &str) -> Vec<String> {
+        query_facts(
+            c,
+            &FactsQuery {
+                entity: entity.into(),
+                as_of: Some(t.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|f| f.object)
+        .collect()
+    }
+
+    fn added_now(c: &Connection, s: &str, p: &str, o: &str) {
+        let f = AssertFact {
+            valid_from: None,
+            ..fact(s, p, o, FactAction::Add, T1)
+        };
+        assert_fact(c, &f, "h".into()).unwrap();
+    }
+
+    #[test]
+    fn same_day_supersede_with_a_bare_date_never_runs_backwards() {
+        // Added at "now" (say 09:44Z), superseded with today's date (midnight UTC).
+        let (_d, c) = conn();
+        added_now(&c, "api", "runs_on", "port 8080");
+        let today = &now_rfc3339()[..10];
+        let out = assert_fact(
+            &c,
+            &fact("api", "runs_on", "port 9090", FactAction::Supersede, today),
+            "h".into(),
+        )
+        .unwrap();
+        assert_eq!(out.ended, 1);
+        let all = timeline(&c, "api");
+        assert_eq!(all.len(), 2);
+        let (old, new) = (&all[0], &all[1]);
+        assert_eq!(
+            (old.object.as_str(), new.object.as_str()),
+            ("port 8080", "port 9090"),
+            "timeline must list the old value first"
+        );
+        let old_to = old.valid_to.as_deref().unwrap();
+        assert!(old_to >= old.valid_from.as_str(), "{old:?}");
+        assert!(
+            new.valid_from >= old.valid_from,
+            "{new:?} starts before {old:?}"
+        );
+        assert_eq!(
+            new.valid_from, old_to,
+            "successor starts when predecessor ends"
+        );
+        assert_eq!(objects_as_of(&c, "api", &old.valid_from), ["port 8080"]);
+        assert_eq!(objects_as_of(&c, "api", &new.valid_from), ["port 9090"]);
+    }
+
+    #[test]
+    fn same_day_end_with_a_bare_date_never_runs_backwards() {
+        let (_d, c) = conn();
+        added_now(&c, "svc", "has_bug", "leak");
+        let today = &now_rfc3339()[..10];
+        let out = assert_fact(
+            &c,
+            &fact("svc", "has_bug", "leak", FactAction::End, today),
+            "h".into(),
+        )
+        .unwrap();
+        assert_eq!(out.ended, 1);
+        assert!(current(&c, "svc").is_empty());
+        let f = &timeline(&c, "svc")[0];
+        assert!(
+            f.valid_to.as_deref().unwrap() >= f.valid_from.as_str(),
+            "{f:?}"
+        );
+        assert_eq!(objects_as_of(&c, "svc", &f.valid_from), ["leak"]);
+    }
+
+    #[test]
+    fn closing_before_a_start_keeps_each_row_visible_at_its_start() {
+        // Two current values, then a supersede dated before both: each closed row keeps a
+        // 1 ms interval and the successor starts where the latest of them ends.
+        let (_d, c) = conn();
+        add(&c, "api", "runs_on", "port 8080", T2);
+        add(&c, "api", "runs_on", "port 8081", T3);
+        let out = assert_fact(
+            &c,
+            &fact("api", "runs_on", "port 9090", FactAction::Supersede, T1),
+            "h".into(),
+        )
+        .unwrap();
+        assert_eq!(out.ended, 2);
+        let spans: Vec<_> = timeline(&c, "api")
+            .into_iter()
+            .map(|f| (f.object, f.valid_from, f.valid_to))
+            .collect();
+        let span = |o: &str, from: &str, to: Option<&str>| {
+            (o.to_string(), from.to_string(), to.map(str::to_string))
+        };
+        assert_eq!(
+            spans,
+            [
+                span("port 8080", T2, Some("2026-02-01T00:00:00.001Z")),
+                span("port 8081", T3, Some("2026-03-01T00:00:00.001Z")),
+                span("port 9090", "2026-03-01T00:00:00.001Z", None),
+            ]
+        );
+        assert_eq!(objects_as_of(&c, "api", T2), ["port 8080"]);
+        assert_eq!(objects_as_of(&c, "api", T3), ["port 8081"]);
+
+        // A value whose start is before `at` still closes exactly at `at`.
+        add(&c, "web", "runs_on", "port 80", T1);
+        assert_fact(
+            &c,
+            &fact("web", "runs_on", "port 443", FactAction::Supersede, T2),
+            "h".into(),
+        )
+        .unwrap();
+        let web = timeline(&c, "web");
+        assert_eq!(web[0].valid_to.as_deref(), Some(T2));
+        assert_eq!(web[1].valid_from, T2);
+
+        // End before the start: same 1 ms clamp.
+        add(&c, "svc", "has_bug", "leak", T3);
+        assert_fact(
+            &c,
+            &fact("svc", "has_bug", "leak", FactAction::End, T1),
+            "h".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            timeline(&c, "svc")[0].valid_to.as_deref(),
+            Some("2026-03-01T00:00:00.001Z")
+        );
     }
 
     #[test]
