@@ -1021,6 +1021,7 @@ fn bench_runs_on_throwaway_data_and_cleans_up() {
         "recall_raw_p95_ms",
         "recall_raw_thai_p95_ms",
         "recall_raw_ident_p95_ms",
+        "recall_raw_dotted_p95_ms",
         "recall_raw_filtered_p95_ms",
     ] {
         assert!(r["latency"][field].as_f64().unwrap() > 0.0, "{field}");

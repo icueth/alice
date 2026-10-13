@@ -2,9 +2,9 @@
 //!
 //! 1. Load: ingest raw chunks, remember memories, wait until every item is embedded and indexed.
 //! 2. Latency, one call at a time: `remember`, `recall` (knowledge only; with `include_raw`,
-//!    also under a date filter; with `include_raw` for a rare Thai word and for a rare identifier
-//!    made of common words; and a query only raw chunks answer, which takes the raw fallback)
-//!    and `context`.
+//!    also under a date filter; with `include_raw` for a rare Thai word, for a rare identifier
+//!    made of common words and for a dotted name of twelve common words; and a query only raw
+//!    chunks answer, which takes the raw fallback) and `context`.
 //! 3. `memories::get_by_seqs` with as many seqs as one recall's candidate lists can produce.
 //! 4. Start-up parts, timed one by one on the saved data: open + migrate, newest HLC scan,
 //!    embedding count, vector index open, vector index rebuild.
@@ -196,6 +196,16 @@ impl Corpus {
         format!("{rare} {common}")
     }
 
+    /// A dotted name of twelve common words (`writer.lease.timeout.…`): one whitespace token
+    /// but twelve pieces, each a word in a large share of the chunks.
+    fn dotted_query(&mut self) -> String {
+        let start = self.rng.below(WORDS_EN.len());
+        (0..12)
+            .map(|k| WORDS_EN[(start + k) % WORDS_EN.len()])
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
     /// Two raw-only words: no memory matches, so recall falls back to raw chunks.
     fn fallback_query(&mut self) -> String {
         let a = self.raw_only[self.rng.below(self.raw_only.len())].clone();
@@ -219,6 +229,9 @@ struct Latency {
     /// `include_raw` with a rare identifier made of common words.
     recall_raw_ident_p50_ms: f64,
     recall_raw_ident_p95_ms: f64,
+    /// `include_raw` with a dotted name of twelve common words (one token, twelve pieces).
+    recall_raw_dotted_p50_ms: f64,
+    recall_raw_dotted_p95_ms: f64,
     /// `include_raw` with a date filter that keeps every item: filtered lists read 400
     /// candidates instead of 100, so each term's share is at least 400 rows.
     recall_raw_filtered_p50_ms: f64,
@@ -661,7 +674,7 @@ async fn timed<T>(f: impl std::future::Future<Output = T>) -> (T, Duration) {
 async fn latency(svc: &Arc<Service>, samples: usize, corpus: &mut Corpus) -> Result<Latency> {
     let (mut w, mut r, mut rr, mut rf, mut c) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let (mut rt, mut ri, mut rfl) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut rt, mut ri, mut rd, mut rfl) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut fallback_fired = 0;
     for i in 0..samples {
         let (res, d) = timed(svc.remember(RememberRequest {
@@ -703,6 +716,7 @@ async fn latency(svc: &Arc<Service>, samples: usize, corpus: &mut Corpus) -> Res
         for (query, times) in [
             (corpus.thai_query(), &mut rt),
             (corpus.ident_query(), &mut ri),
+            (corpus.dotted_query(), &mut rd),
         ] {
             let (res, d) = timed(svc.recall(RecallRequest {
                 query,
@@ -740,6 +754,8 @@ async fn latency(svc: &Arc<Service>, samples: usize, corpus: &mut Corpus) -> Res
         recall_raw_thai_p95_ms: pct(&mut rt, 0.95),
         recall_raw_ident_p50_ms: pct(&mut ri, 0.50),
         recall_raw_ident_p95_ms: pct(&mut ri, 0.95),
+        recall_raw_dotted_p50_ms: pct(&mut rd, 0.50),
+        recall_raw_dotted_p95_ms: pct(&mut rd, 0.95),
         recall_raw_filtered_p50_ms: pct(&mut rfl, 0.50),
         recall_raw_filtered_p95_ms: pct(&mut rfl, 0.95),
         recall_fallback_p50_ms: pct(&mut rf, 0.50),
@@ -984,6 +1000,7 @@ fn render(r: &Report) -> String {
          recall raw      p50 {:.2} ms · p95 {:.2} ms (include_raw)\n\
          raw, rare Thai  p50 {:.2} ms · p95 {:.2} ms (include_raw)\n\
          raw, identifier p50 {:.2} ms · p95 {:.2} ms (include_raw)\n\
+         raw, dotted     p50 {:.2} ms · p95 {:.2} ms (include_raw, a.b.c… of 12 common words)\n\
          raw, filtered   p50 {:.2} ms · p95 {:.2} ms (include_raw, since 2000-01-01)\n\
          recall fallback p50 {:.2} ms · p95 {:.2} ms ({} of {} fell back)\n\
          context         p50 {:.2} ms · p95 {:.2} ms (budget 150)\n\
@@ -1014,6 +1031,8 @@ fn render(r: &Report) -> String {
         l.recall_raw_thai_p95_ms,
         l.recall_raw_ident_p50_ms,
         l.recall_raw_ident_p95_ms,
+        l.recall_raw_dotted_p50_ms,
+        l.recall_raw_dotted_p95_ms,
         l.recall_raw_filtered_p50_ms,
         l.recall_raw_filtered_p95_ms,
         l.recall_fallback_p50_ms,
