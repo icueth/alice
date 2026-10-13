@@ -6,6 +6,7 @@ use crate::service::{Service, ServiceOptions};
 use crate::spool;
 use alice_core::embed::{Embedder, FakeEmbedder};
 use alice_core::ids::now_rfc3339;
+use anyhow::Context;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::future::IntoFuture;
 use std::io::Write;
@@ -118,7 +119,11 @@ async fn serve(
     port: u16,
     ct: CancellationToken,
 ) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .with_context(|| {
+            format!("cannot listen on 127.0.0.1:{port}; choose another port or stop the program using it")
+        })?;
     let port = listener.local_addr()?.port();
     write_info(
         home,

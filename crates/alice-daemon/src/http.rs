@@ -207,25 +207,35 @@ async fn remember(
     State(st): State<AppState>,
     ApiJson(req): ApiJson<RememberRequest>,
 ) -> Result<Response, ApiError> {
-    match st.svc.remember(req.clone()).await {
-        Ok(r) => Ok(Json(r).into_response()),
-        Err(AliceError::ReadOnly(_)) => {
-            crate::spool::append(
-                &st.svc.home().spool_dir(),
-                &crate::spool::SpoolEntry::Remember(req),
-            )
-            .map_err(|e| ApiError(AliceError::Io(e)))?;
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(RememberResponse {
-                    id: None,
-                    status: RememberStatus::Spooled,
-                    project: String::new(),
-                }),
-            )
-                .into_response())
+    let read_only = match st.svc.remember(req.clone()).await {
+        Ok(r) => return Ok(Json(r).into_response()),
+        Err(e @ AliceError::ReadOnly(_)) => e,
+        Err(e) => return Err(e.into()),
+    };
+    let dir = st.svc.home().spool_dir();
+    let spooled = tokio::task::spawn_blocking(move || {
+        crate::spool::append(&dir, &crate::spool::SpoolEntry::Remember(req))
+    })
+    .await;
+    match spooled {
+        Ok(Ok(_)) => Ok((
+            StatusCode::ACCEPTED,
+            Json(RememberResponse {
+                id: None,
+                status: RememberStatus::Spooled,
+                project: String::new(),
+            }),
+        )
+            .into_response()),
+        // Often the same cause (a full disk): the read-only error says what to do about it.
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "cannot spool a remember while read-only");
+            Err(read_only.into())
         }
-        Err(e) => Err(e.into()),
+        Err(e) => {
+            tracing::warn!(error = %e, "spooling a remember failed");
+            Err(read_only.into())
+        }
     }
 }
 async fn recall(
@@ -375,5 +385,48 @@ mod tests {
         let e: serde_json::Value = r.json().await.unwrap();
         assert_eq!(e["kind"], "read_only");
         assert!(e["error"].as_str().unwrap().contains("alice doctor"), "{e}");
+    }
+
+    /// When the spool cannot be written either (the disk is full, say), the caller gets the
+    /// read-only error that says what to do, not an opaque I/O failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unwritable_spool_returns_the_read_only_error() {
+        crate::install_tls();
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let svc = Service::start(
+            home.clone(),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions::default(),
+        )
+        .unwrap();
+        svc.force_read_only("the disk is full");
+        std::fs::remove_dir_all(home.spool_dir()).unwrap();
+        std::fs::write(
+            home.spool_dir(),
+            b"a file where the spool directory should be",
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = router(svc, "k".repeat(64), port, CancellationToken::new());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let r = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/api/v1/remember"))
+            .bearer_auth("k".repeat(64))
+            .json(&RememberRequest {
+                content: "nowhere to keep this".into(),
+                ..Default::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 503);
+        let e: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(e["kind"], "read_only");
+        assert!(
+            e["error"].as_str().unwrap().contains("the disk is full"),
+            "{e}"
+        );
     }
 }
