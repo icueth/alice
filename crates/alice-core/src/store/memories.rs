@@ -9,6 +9,8 @@ use crate::store::projects::ResolvedProject;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 #[derive(Debug, Clone, Default)]
 pub struct NewMemoryInput {
@@ -345,22 +347,52 @@ pub fn get_many(conn: &Connection, ids: &[String]) -> Result<Vec<Memory>> {
     Ok(out)
 }
 
-/// Fetch by internal sequence numbers (search results). Order follows the input.
+/// Bound parameters per `IN (...)` query, well under SQLite's limit of 32,766.
+const IN_BATCH: usize = 4_096;
+
+/// Fetch by internal sequence numbers (search results). Order follows the input (first
+/// occurrence); unknown seqs are skipped. A recall passes up to ~2,000 seqs here, so the rows
+/// and their topics are read with one `IN` query each (per 4,096 seqs) and nothing is quadratic.
 pub fn get_by_seqs(conn: &Connection, seqs: &[i64]) -> Result<Vec<(i64, Memory)>> {
-    if seqs.is_empty() {
-        return Ok(Vec::new());
+    let mut first_pos: HashMap<i64, usize> = HashMap::with_capacity(seqs.len());
+    let mut unique: Vec<i64> = Vec::with_capacity(seqs.len());
+    for (i, &s) in seqs.iter().enumerate() {
+        if let Entry::Vacant(e) = first_pos.entry(s) {
+            e.insert(i);
+            unique.push(s);
+        }
     }
-    let placeholders = vec!["?"; seqs.len()].join(",");
-    let sql = format!("{SELECT_MEMORY} WHERE m.seq IN ({placeholders})");
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows: Vec<(i64, Memory)> = stmt
-        .query_map(params_from_iter(seqs.iter()), read_row)?
-        .collect::<std::result::Result<_, _>>()?;
+    let mut rows: Vec<(i64, Memory)> = Vec::with_capacity(unique.len());
+    for batch in unique.chunks(IN_BATCH) {
+        let sql = format!(
+            "{SELECT_MEMORY} WHERE m.seq IN ({})",
+            vec!["?"; batch.len()].join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        for row in stmt.query_map(params_from_iter(batch.iter()), read_row)? {
+            rows.push(row?);
+        }
+    }
+    rows.sort_by_key(|(s, _)| first_pos[s]);
+
+    let mut topics: HashMap<String, Vec<String>> = HashMap::new();
+    for batch in rows.chunks(IN_BATCH) {
+        let sql = format!(
+            "SELECT memory_id, topic FROM memory_topics WHERE memory_id IN ({}) ORDER BY memory_id, topic",
+            vec!["?"; batch.len()].join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let found = stmt.query_map(params_from_iter(batch.iter().map(|(_, m)| &m.id)), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in found {
+            let (id, topic) = row?;
+            topics.entry(id).or_default().push(topic);
+        }
+    }
     for (_, m) in rows.iter_mut() {
-        load_topics(conn, m)?;
+        m.topics = topics.remove(&m.id).unwrap_or_default();
     }
-    let pos = |s: i64| seqs.iter().position(|x| *x == s).unwrap_or(usize::MAX);
-    rows.sort_by_key(|(s, _)| pos(*s));
     Ok(rows)
 }
 
@@ -944,5 +976,46 @@ mod tests {
         assert_eq!(seq_of(&c, "drawer_42").unwrap(), Some(sb));
         touch_access(&c, &[sb, sb]).unwrap();
         assert_eq!(get_many(&c, &[b]).unwrap()[0].access_count, 2);
+    }
+
+    /// Search hands over thousands of seqs, repeated and unknown ones included: every known
+    /// memory comes back once, at its first position, with its own topics.
+    #[test]
+    fn get_by_seqs_keeps_first_order_and_topics_across_batches() {
+        let (_d, c, p) = setup();
+        let mut seqs = Vec::new();
+        for i in 0..(IN_BATCH + 50) {
+            let mut m = input(&format!("memory number {i}"));
+            if i % 3 == 0 {
+                m.topics = vec![format!("t{i}"), "shared".into()];
+            }
+            let InsertOutcome::New { seq, .. } =
+                insert(&c, &prepare(m, &p, "h".into()).unwrap()).unwrap()
+            else {
+                panic!()
+            };
+            seqs.push(seq);
+        }
+        // Newest first, every seq twice, plus seqs that do not exist.
+        let mut asked: Vec<i64> = seqs.iter().rev().copied().collect();
+        asked.extend(seqs.iter().copied());
+        asked.insert(7, 1_000_000);
+        asked.push(-5);
+        let got = get_by_seqs(&c, &asked).unwrap();
+        let want: Vec<i64> = seqs.iter().rev().copied().collect();
+        assert_eq!(got.iter().map(|(s, _)| *s).collect::<Vec<_>>(), want);
+        for (seq, m) in &got {
+            let i = seqs.iter().position(|s| s == seq).unwrap();
+            assert_eq!(m.body, format!("memory number {i}"));
+            if i % 3 == 0 {
+                let mut expected = vec![format!("t{i}"), "shared".to_string()];
+                expected.sort();
+                assert_eq!(m.topics, expected, "seq {seq}");
+            } else {
+                assert!(m.topics.is_empty(), "seq {seq}: {:?}", m.topics);
+            }
+        }
+        assert!(get_by_seqs(&c, &[]).unwrap().is_empty());
+        assert!(get_by_seqs(&c, &[1_000_000]).unwrap().is_empty());
     }
 }

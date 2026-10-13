@@ -30,6 +30,10 @@ const SNIPPET_CHARS: usize = 240;
 /// Only the start of a longer query is searched and embedded (the e5 window is 512 tokens).
 const MAX_QUERY_CHARS: usize = 2_000;
 const MAX_RELATED: usize = 5;
+/// Cosine similarity at which a vector-only match counts as relevant (spec §4.4 step 5), for
+/// multilingual-e5-small. Measured on the gold set with the real model:
+/// `crates/alice-embed/tests/real_search_quality.rs`.
+pub const DEFAULT_RELEVANCE_FLOOR: f32 = 0.82;
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchParams {

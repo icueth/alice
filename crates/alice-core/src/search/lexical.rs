@@ -370,31 +370,49 @@ pub fn memory_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
     )
 }
 
-pub fn chunk_words(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
-    run(
-        conn,
-        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts, 1.0, 1.5) LIMIT ?2",
-        words_query(q),
-        k,
+/// Raw chunks are ranked by BM25 among their newest `RAW_WINDOW` matches only. Ranking every
+/// match costs time in proportion to the matches: a word in 40% of 1M chunks took ~300 ms per
+/// list (16 ms within the window). FTS5 reads matches newest first and stops at the window, so a list now costs about
+/// the same whatever the word's frequency (BM25 still counts every match for the word's IDF).
+/// A query whose words match fewer chunks than the window is ranked exactly as before; older
+/// matches of very common words stay reachable through the vector list and rarer words.
+pub const RAW_WINDOW: usize = 5_000;
+
+/// `SELECT rowid` of the best `?2` matches of `?1` in `table` by `bm25(table{weights})`, among
+/// the newest `window` matches.
+fn windowed_sql(table: &str, weights: &str, window: usize) -> String {
+    format!(
+        "SELECT rowid FROM (SELECT rowid, bm25({table}{weights}) AS score FROM {table} \
+         WHERE {table} MATCH ?1 ORDER BY rowid DESC LIMIT {window}) ORDER BY score LIMIT ?2"
     )
 }
 
+fn chunk_words_in(conn: &Connection, q: &str, k: usize, window: usize) -> Vec<i64> {
+    let sql = windowed_sql("chunks_fts", ", 1.0, 1.5", window);
+    run(conn, &sql, words_query(q), k)
+}
+
+pub fn chunk_words(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
+    chunk_words_in(conn, q, k, RAW_WINDOW)
+}
+
+/// Raw chunks holding a query substring, newest first. Not BM25: its IDF needs every match of
+/// each phrase, and a trigram phrase (a Thai word, a made-up identifier) is the intersection of
+/// common trigrams: at 1M chunks 60–400 ms per list, still 75–90 ms within the window. Newest
+/// first stops after `k` matches (about 1 ms); raw results are weighted by recency anyway, and
+/// the vector and word lists rank by relevance.
 pub fn chunk_trigram(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
     run(
         conn,
-        "SELECT rowid FROM chunks_tri WHERE chunks_tri MATCH ?1 ORDER BY bm25(chunks_tri) LIMIT ?2",
+        "SELECT rowid FROM chunks_tri WHERE chunks_tri MATCH ?1 ORDER BY rowid DESC LIMIT ?2",
         or_query(&trigram_terms(q)),
         k,
     )
 }
 
 pub fn chunk_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
-    run(
-        conn,
-        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts) LIMIT ?2",
-        code_query(q),
-        k,
-    )
+    let sql = windowed_sql("chunks_fts", "", RAW_WINDOW);
+    run(conn, &sql, code_query(q), k)
 }
 
 /// Non-ASCII terms of 1–2 code points (e.g. Thai "จำ" = จ + ำ) are below the trigram minimum.
@@ -606,6 +624,75 @@ mod tests {
             "only stopwords still match"
         );
         assert!(memory_trigram(&c, "the api", 10).is_empty());
+    }
+
+    #[test]
+    fn raw_word_lists_rank_by_bm25_within_the_newest_matches() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let p = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
+        // The oldest chunk is the best BM25 match; the others score lower the longer they are.
+        let texts = [
+            "lease lease lease renewal",
+            "lease a1",
+            "lease b1 b2",
+            "lease c1 c2 c3",
+            "lease d1 d2 d3 d4",
+            "lease HostLinkReconnect e2 e3 e4 e5",
+        ];
+        let chunks: Vec<sources::ChunkInput> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| sources::ChunkInput {
+                ord: i as i64,
+                text: t.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        sources::ingest(
+            &c,
+            &p,
+            &sources::SourceInput {
+                uri: "s".into(),
+                ..Default::default()
+            },
+            &chunks,
+        )
+        .unwrap();
+        let seqs: Vec<i64> = c
+            .prepare("SELECT seq FROM chunks ORDER BY ord")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let full: Vec<i64> = c
+            .prepare("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH '\"lease\"' ORDER BY bm25(chunks_fts, 1.0, 1.5) LIMIT 10")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(full.len(), 6);
+        assert_eq!(full[0], seqs[0], "the oldest chunk is the best match");
+        // Fewer matches than the window: exactly the plain BM25 order.
+        assert_eq!(chunk_words_in(&c, "lease", 10, 6), full);
+        assert_eq!(chunk_words(&c, "lease", 10), full);
+        assert_eq!(chunk_words_in(&c, "lease", 2, 100), full[..2]);
+        // More matches than the window: only the three newest compete, still by BM25.
+        let newest: Vec<i64> = full
+            .iter()
+            .copied()
+            .filter(|s| seqs[3..].contains(s))
+            .collect();
+        assert_eq!(chunk_words_in(&c, "lease", 10, 3), newest);
+        // The code list uses the same window.
+        assert_eq!(chunk_code(&c, "HostLinkReconnect", 10), vec![seqs[5]]);
+        // The trigram list returns the newest substring matches first.
+        let newest_first: Vec<i64> = seqs.iter().rev().copied().collect();
+        assert_eq!(chunk_trigram(&c, "lease", 10), newest_first);
+        assert_eq!(chunk_trigram(&c, "lease", 2), newest_first[..2]);
+        assert_eq!(chunk_trigram(&c, "renewal", 10), vec![seqs[0]]);
     }
 
     #[test]

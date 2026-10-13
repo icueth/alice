@@ -40,16 +40,19 @@ const DETECT_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct ServiceOptions {
+    /// Cosine similarity at which a vector-only match counts as relevant.
     pub relevance_floor: f32,
+    /// Fewer relevant knowledge results than this bring in raw chunks (the raw fallback).
     pub raw_min_results: usize,
     pub weights: Weights,
+    /// Most read connections open at once (each has its own page cache); further reads wait.
     pub reader_pool: usize,
 }
 
 impl Default for ServiceOptions {
     fn default() -> Self {
         Self {
-            relevance_floor: 0.82,
+            relevance_floor: search::DEFAULT_RELEVANCE_FLOOR,
             raw_min_results: 3,
             weights: Weights::default(),
             reader_pool: 8,
@@ -164,7 +167,8 @@ pub struct Service {
     readers: Arc<ReaderPool>,
     writer: WriterHandle,
     index: Arc<IndexSlot>,
-    query_embedder: Arc<dyn Embedder>,
+    /// Shared by the embedding worker and query embedding.
+    embedder: Arc<dyn Embedder>,
     opts: ServiceOptions,
     instance: String,
     stop: Arc<AtomicBool>,
@@ -239,11 +243,11 @@ impl Service {
         let conn = open_writer(&home.db())?;
         let device = device_id(&conn)?;
         let readers = Arc::new(ReaderPool::new(home.db(), opts.reader_pool));
-        // Two instances: batch embedding in the worker must never delay a query embedding.
-        let worker_embedder = make_embedder()?;
-        let query_embedder = make_embedder()?;
-        let model = worker_embedder.model_id().to_string();
-        let dim = worker_embedder.dim();
+        // One instance for the worker and for queries: the local model costs ~600 MB each. It
+        // embeds passages in short batches and lets a waiting query go next after each one.
+        let embedder = make_embedder()?;
+        let model = embedder.model_id().to_string();
+        let dim = embedder.dim();
         let index: Arc<IndexSlot> = Arc::new(RwLock::new(None));
         let vector_path = home.vector_file(&model);
 
@@ -272,7 +276,7 @@ impl Service {
             readers: readers.clone(),
             writer: writer.clone(),
             index: index.clone(),
-            embedder: worker_embedder,
+            embedder: embedder.clone(),
             wake: wake_rx,
             stop: stop.clone(),
             vector_path,
@@ -283,7 +287,7 @@ impl Service {
             readers,
             writer,
             index,
-            query_embedder,
+            embedder,
             opts,
             instance: new_id(),
             stop,
@@ -331,7 +335,7 @@ impl Service {
         }
         if let Some(idx) = self.index.read().clone()
             && idx.is_dirty()
-            && let Err(e) = idx.save(&self.home.vector_file(self.query_embedder.model_id()))
+            && let Err(e) = idx.save(&self.home.vector_file(self.embedder.model_id()))
         {
             tracing::warn!(error = %e, "saving the vector index failed");
         }
@@ -403,7 +407,7 @@ impl Service {
         let format = req.format;
         let opts = self.opts.clone();
         let index = self.index.read().clone();
-        let embedder = self.query_embedder.clone();
+        let embedder = self.embedder.clone();
         let resolver = self.resolver.clone();
         let (out, slug) = self
             .read(move |c| {

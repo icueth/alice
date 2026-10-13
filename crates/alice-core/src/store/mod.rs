@@ -9,7 +9,7 @@ pub mod projects;
 pub mod sources;
 
 use crate::error::Result;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -45,14 +45,24 @@ fn configure_sqlite_once() {
     });
 }
 
-fn configure_common(conn: &Connection) -> Result<()> {
+/// Page cache of the writer connection, in KiB.
+const WRITER_CACHE_KIB: i64 = 64 * 1024;
+/// Page cache of each reader connection, in KiB. Readers are pooled (8 in the daemon), so
+/// this times the pool size bounds their memory; the OS file cache serves the rest.
+const READER_CACHE_KIB: i64 = 16 * 1024;
+
+/// No memory map: every connection would map the database separately and each map's touched
+/// pages count towards the daemon's RSS (with a 2.7 GB database at 1M chunks, eight readers
+/// mapping 256 MB each reached gigabytes). Reads through the OS file cache measured the same
+/// speed for Alice's queries.
+fn configure_common(conn: &Connection, cache_kib: i64) -> Result<()> {
     conn.busy_timeout(Duration::from_millis(5_000))?;
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA foreign_keys = ON;
          PRAGMA temp_store = MEMORY;
-         PRAGMA mmap_size = 268435456;
-         PRAGMA cache_size = -65536;",
-    )?;
+         PRAGMA mmap_size = 0;
+         PRAGMA cache_size = -{cache_kib};"
+    ))?;
     Ok(())
 }
 
@@ -65,7 +75,7 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(path)?;
     let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
     conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
-    configure_common(&conn)?;
+    configure_common(&conn, WRITER_CACHE_KIB)?;
     migrations::migrate(&mut conn, path)?;
     Ok(conn)
 }
@@ -79,7 +89,7 @@ pub fn open_reader(path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI,
     )?;
-    configure_common(&conn)?;
+    configure_common(&conn, READER_CACHE_KIB)?;
     Ok(conn)
 }
 
@@ -92,34 +102,90 @@ pub fn backup_into(conn: &Connection, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Small pool of read-only connections. Connections are opened lazily and reused.
+/// Pool of read-only connections, opened lazily and reused. At most `max` exist at once; a
+/// caller beyond that waits until one is handed back. Every connection has its own page cache,
+/// so the cap bounds the daemon's memory however many requests arrive together (64 concurrent
+/// recalls used to open 64 connections). `f` must not take a second connection from the same
+/// pool: with every connection lent out it would wait for itself.
 pub struct ReaderPool {
     path: PathBuf,
-    max_idle: usize,
-    idle: Mutex<Vec<Connection>>,
+    max: usize,
+    state: Mutex<PoolState>,
+    returned: Condvar,
+}
+
+struct PoolState {
+    idle: Vec<Connection>,
+    /// Connections that exist: idle ones plus those lent out.
+    open: usize,
+}
+
+/// A lent connection; dropping it hands the connection back (or, after a panic, closes it).
+struct Lease<'a> {
+    pool: &'a ReaderPool,
+    conn: Option<Connection>,
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        let conn = self.conn.take();
+        let mut st = self.pool.state.lock();
+        match conn {
+            // A panic may have left a statement or transaction open: do not reuse that one.
+            Some(c) if !std::thread::panicking() => st.idle.push(c),
+            _ => st.open -= 1,
+        }
+        drop(st);
+        self.pool.returned.notify_one();
+    }
 }
 
 impl ReaderPool {
-    pub fn new(path: PathBuf, max_idle: usize) -> Self {
+    pub fn new(path: PathBuf, max: usize) -> Self {
         Self {
             path,
-            max_idle,
-            idle: Mutex::new(Vec::new()),
+            max: max.max(1),
+            state: Mutex::new(PoolState {
+                idle: Vec::new(),
+                open: 0,
+            }),
+            returned: Condvar::new(),
         }
     }
 
+    /// Run `f` on a pooled connection, waiting for one if all `max` are in use.
     pub fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let pooled = self.idle.lock().pop();
-        let conn = match pooled {
-            Some(c) => c,
-            None => open_reader(&self.path)?,
-        };
-        let out = f(&conn);
-        let mut idle = self.idle.lock();
-        if idle.len() < self.max_idle {
-            idle.push(conn);
+        let lease = self.lease()?;
+        f(lease.conn.as_ref().expect("a lease holds its connection"))
+    }
+
+    fn lease(&self) -> Result<Lease<'_>> {
+        let mut st = self.state.lock();
+        loop {
+            if let Some(conn) = st.idle.pop() {
+                return Ok(Lease {
+                    pool: self,
+                    conn: Some(conn),
+                });
+            }
+            if st.open < self.max {
+                st.open += 1;
+                break;
+            }
+            self.returned.wait(&mut st);
         }
-        out
+        drop(st);
+        match open_reader(&self.path) {
+            Ok(conn) => Ok(Lease {
+                pool: self,
+                conn: Some(conn),
+            }),
+            Err(e) => {
+                self.state.lock().open -= 1;
+                self.returned.notify_one();
+                Err(e)
+            }
+        }
     }
 }
 
@@ -197,6 +263,96 @@ mod tests {
             matches!(&err, Err(AliceError::Db(rusqlite::Error::SqliteFailure(e, _))) if e.code == rusqlite::ErrorCode::ReadOnly),
             "expected a read-only error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn connections_do_not_map_the_file_and_readers_have_a_small_cache() {
+        let (_d, path) = temp_db();
+        let w = open_writer(&path).unwrap();
+        let r = open_reader(&path).unwrap();
+        let pragma = |c: &Connection, name: &str| -> i64 {
+            c.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(pragma(&w, "mmap_size"), 0);
+        assert_eq!(pragma(&r, "mmap_size"), 0);
+        assert_eq!(pragma(&w, "cache_size"), -WRITER_CACHE_KIB);
+        assert_eq!(pragma(&r, "cache_size"), -READER_CACHE_KIB);
+    }
+
+    #[test]
+    fn reader_pool_never_opens_more_than_max_and_waiters_are_served() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_d, path) = temp_db();
+        drop(open_writer(&path).unwrap());
+        let pool = Arc::new(ReaderPool::new(path, 3));
+        let (busy, peak, served) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let (pool, busy, peak, served) =
+                    (pool.clone(), busy.clone(), peak.clone(), served.clone());
+                std::thread::spawn(move || {
+                    pool.with(|c| {
+                        let now = busy.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        let n: i64 =
+                            c.query_row("SELECT count(*) FROM projects", [], |r| r.get(0))?;
+                        std::thread::sleep(Duration::from_millis(20));
+                        busy.fetch_sub(1, Ordering::SeqCst);
+                        served.fetch_add(n as usize, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(served.load(Ordering::SeqCst), 16, "every caller was served");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            3,
+            "at most max connections at once"
+        );
+        assert_eq!(pool.state.lock().open, 3);
+        assert_eq!(pool.state.lock().idle.len(), 3);
+    }
+
+    #[test]
+    fn reader_pool_recovers_the_slot_of_a_panicking_caller_and_a_failed_open() {
+        use std::sync::Arc;
+        let (d, path) = temp_db();
+        drop(open_writer(&path).unwrap());
+        let pool = Arc::new(ReaderPool::new(path, 1));
+        let p = pool.clone();
+        let panicked = std::thread::spawn(move || {
+            p.with(|_| -> Result<()> { panic!("boom") }).unwrap();
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert_eq!(
+            pool.state.lock().open,
+            0,
+            "the panicking caller's connection was closed"
+        );
+        let n: i64 = pool
+            .with(|c| Ok(c.query_row("SELECT count(*) FROM projects", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 1, "the only slot is usable again");
+
+        let missing = ReaderPool::new(d.path().join("nope/missing.db"), 1);
+        assert!(missing.with(|_| Ok(())).is_err());
+        assert!(
+            missing.with(|_| Ok(())).is_err(),
+            "a failed open gives its slot back"
+        );
+        assert_eq!(missing.state.lock().open, 0);
     }
 
     fn pre_migration_backups(dir: &Path) -> Vec<PathBuf> {
