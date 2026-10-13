@@ -1,6 +1,7 @@
 //! SQLite storage. Only the daemon opens the database.
 
 pub mod migrations;
+pub mod projects;
 
 use crate::error::Result;
 use parking_lot::Mutex;
