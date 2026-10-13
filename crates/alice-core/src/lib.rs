@@ -8,5 +8,6 @@ pub mod model;
 pub mod normalize;
 pub mod project;
 pub mod store;
+pub mod vector;
 
 pub use error::{AliceError, Result};
