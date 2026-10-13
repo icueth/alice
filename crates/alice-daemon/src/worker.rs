@@ -610,7 +610,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "the idle worker stops promptly"
         );
-        let reopened = VectorIndex::open(&r.vector_path(), 16).unwrap();
+        let reopened = VectorIndex::open(&r.vector_path(), "fake", 16).unwrap();
         assert_eq!(reopened.len(), 1);
     }
 }

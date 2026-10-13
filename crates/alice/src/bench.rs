@@ -9,7 +9,12 @@
 //! 4. Start-up parts, timed one by one on the saved data: open + migrate, newest HLC scan,
 //!    embedding count, vector index open, vector index rebuild.
 //! 5. A real `alice daemon run` child on that data: time until it answers, RSS after start,
-//!    bursts of 64 concurrent recalls over HTTP, RSS after them and peak RSS.
+//!    (with `--real`) 256 new memories embedded by its model and RSS after them, bursts of 64
+//!    concurrent recalls over HTTP, RSS after them and peak RSS.
+//!
+//! `--real --prefill-vectors` loads the data with a fake embedder relabelled as the real model,
+//! so a 1M-chunk index for the real model exists in minutes; the daemon child still loads and
+//! uses the real model.
 //!
 //! The corpus mixes a small, dense vocabulary (every common word is in a large share of chunks,
 //! the worst case for ranked full-text search) with a long tail of made-up words, Thai words and
@@ -161,6 +166,11 @@ impl Corpus {
         (0..n).map(|_| self.word()).collect::<Vec<_>>().join(" ")
     }
 
+    /// The text of a memory: one sentence.
+    fn memory_text(&mut self) -> String {
+        self.sentence()
+    }
+
     /// A sentence with one raw-only word in it; one chunk in 50 also holds a rare Thai word,
     /// one in 50 a rare identifier.
     fn chunk(&mut self) -> String {
@@ -274,6 +284,12 @@ struct DaemonRun {
     index_ready_ms: f64,
     rss_after_start_mb: Option<f64>,
     footprint_after_start_mb: Option<f64>,
+    /// Memories written through the daemon after it started (real model only), and how long
+    /// until the daemon had embedded all of them.
+    remembered: usize,
+    embed_new_ms: f64,
+    rss_after_embedding_mb: Option<f64>,
+    footprint_after_embedding_mb: Option<f64>,
     bursts: usize,
     burst_p50_ms: f64,
     burst_p95_ms: f64,
@@ -390,6 +406,28 @@ fn children_peak_rss_mb() -> Option<f64> {
     None
 }
 
+/// A fake embedder that answers to another model's id: vectors cost the same in the index
+/// whatever their values, so a large index for the real model can be filled quickly.
+struct Relabeled {
+    inner: FakeEmbedder,
+    id: &'static str,
+}
+
+impl Embedder for Relabeled {
+    fn model_id(&self) -> &str {
+        self.id
+    }
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+    fn embed_passages(&self, texts: &[String]) -> alice_core::Result<Vec<Vec<f32>>> {
+        self.inner.embed_passages(texts)
+    }
+    fn embed_query(&self, text: &str) -> alice_core::Result<Vec<f32>> {
+        self.inner.embed_query(text)
+    }
+}
+
 /// Names the embedder a bench directory was loaded with; its presence marks bench data.
 const MARKER: &str = "bench-embedder";
 
@@ -467,10 +505,10 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
     home.ensure_dirs()?;
     // Data loaded with one embedder is meaningless with another.
     let marker = home.root().join(MARKER);
-    let embedder = if args.real {
-        alice_embed::MODEL_ID
-    } else {
-        "fake"
+    let embedder: String = match (args.real, args.prefill_vectors) {
+        (true, true) => format!("{}+prefill", alice_embed::MODEL_ID),
+        (true, false) => alice_embed::MODEL_ID.into(),
+        _ => "fake".into(),
     };
     match std::fs::read_to_string(&marker) {
         Ok(m) if m.trim() != embedder => bail!(
@@ -479,20 +517,23 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
             m.trim()
         ),
         Ok(_) => {}
-        Err(_) => std::fs::write(&marker, embedder)?,
+        Err(_) => std::fs::write(&marker, &embedder)?,
     }
-    let real = args.real;
+    let (real, prefill) = (args.real, args.prefill_vectors);
     let models = user_models.clone();
     let make = move || -> alice_core::Result<Arc<dyn Embedder>> {
-        if real {
-            Ok(Arc::new(alice_embed::FastEmbedder::new(&models)?))
-        } else {
-            Ok(Arc::new(FakeEmbedder::new(384)))
+        match (real, prefill) {
+            (true, true) => Ok(Arc::new(Relabeled {
+                inner: FakeEmbedder::new(alice_embed::DIM),
+                id: alice_embed::MODEL_ID,
+            })),
+            (true, false) => Ok(Arc::new(alice_embed::FastEmbedder::new(&models)?)),
+            _ => Ok(Arc::new(FakeEmbedder::new(384))),
         }
     };
     let mut report = Report {
         version: env!("CARGO_PKG_VERSION").into(),
-        embedder: embedder.into(),
+        embedder: embedder.clone(),
         memories: args.memories,
         chunks: args.chunks,
         ..Default::default()
@@ -500,7 +541,12 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
     let mut corpus = Corpus::new();
 
     eprintln!("bench: measuring the embedder alone");
-    let probe = make()?;
+    // Both real modes measure the real model here; --prefill-vectors only fills the index fast.
+    let probe: Arc<dyn Embedder> = if real {
+        Arc::new(alice_embed::FastEmbedder::new(&user_models)?)
+    } else {
+        make()?
+    };
     let model = (probe.model_id().to_string(), probe.dim());
     report.embed_per_sec = embed_throughput(probe.as_ref(), &mut corpus)?;
     drop(probe);
@@ -518,7 +564,7 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
     report.db_mb = file_mb(&home.db());
     let base = home.vector_file(&model.0);
     report.index_mb = file_mb(&base.with_extension("memories.usearch"))
-        + file_mb(&base.with_extension("chunks.usearch"));
+        + file_mb(&base.with_extension("chunks.bq"));
 
     eprintln!("bench: timing the start-up parts");
     report.startup = startup_parts(&home, &model.0, model.1)?;
@@ -620,7 +666,7 @@ async fn load(
         for j in i..(i + REMEMBER_PARALLEL).min(args.memories) {
             let svc = svc.clone();
             let req = RememberRequest {
-                content: format!("{} #{j}", corpus.sentence()),
+                content: format!("{} #{j}", corpus.memory_text()),
                 kind: Some(Kind::ALL[j % Kind::ALL.len()]),
                 importance: Some((1 + j % 5) as u8),
                 ..Default::default()
@@ -813,7 +859,7 @@ fn startup_parts(home: &AliceHome, model: &str, dim: usize) -> Result<Startup> {
     s.embeddings_count_ms = ms(t.elapsed());
     drop(conn);
     let t = Instant::now();
-    let idx = VectorIndex::open(&home.vector_file(model), dim)?;
+    let idx = VectorIndex::open(&home.vector_file(model), model, dim)?;
     s.index_open_ms = ms(t.elapsed());
     s.indexed_vectors = idx.len();
     if idx.len() != stored {
@@ -939,6 +985,37 @@ fn daemon_run(
         run.index_ready_ms = ms(started.elapsed());
         run.rss_after_start_mb = rss_mb(pid);
         run.footprint_after_start_mb = footprint_mb(pid).map(|f| f.0);
+        if real {
+            // The model's working memory only grows when it embeds: write new memories
+            // through the daemon and wait until its worker has embedded every one.
+            const NEW: usize = 256;
+            let t = Instant::now();
+            let mut set = tokio::task::JoinSet::new();
+            let texts: Vec<String> = (0..NEW).map(|_| corpus.memory_text()).collect();
+            for chunk in texts.chunks(NEW / 8) {
+                let (c, chunk) = (client.clone(), chunk.to_vec());
+                set.spawn(async move {
+                    for content in chunk {
+                        c.remember(&RememberRequest {
+                            content,
+                            ..Default::default()
+                        })
+                        .await?;
+                    }
+                    anyhow::Ok(())
+                });
+            }
+            while let Some(r) = set.join_next().await {
+                r??;
+            }
+            while client.health().await?.embed_backlog > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            run.remembered = NEW;
+            run.embed_new_ms = ms(t.elapsed());
+            run.rss_after_embedding_mb = rss_mb(pid);
+            run.footprint_after_embedding_mb = footprint_mb(pid).map(|f| f.0);
+        }
         let mut times = Vec::new();
         for _ in 0..4 {
             let mut set = tokio::task::JoinSet::new();
@@ -1072,6 +1149,15 @@ fn render(r: &Report) -> String {
             opt_mb(d.peak_rss_mb),
             opt_mb(d.peak_footprint_mb),
         ));
+        if d.remembered > 0 {
+            out.push_str(&format!(
+                "daemon embedding {} new memories in {:.0} ms · after it RSS {} · footprint {}\n",
+                d.remembered,
+                d.embed_new_ms,
+                opt_mb(d.rss_after_embedding_mb),
+                opt_mb(d.footprint_after_embedding_mb),
+            ));
+        }
     }
     out
 }

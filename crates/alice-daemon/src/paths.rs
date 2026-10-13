@@ -29,7 +29,7 @@ impl AliceHome {
         self.root.join("alice.db")
     }
     /// Base path of the vector index for `model`; the index itself is two files next to it
-    /// (`<model>.memories.usearch`, `<model>.chunks.usearch`).
+    /// (`<model>.memories.usearch`, an int8 HNSW, and `<model>.chunks.bq`, sign bits).
     pub fn vector_file(&self, model: &str) -> PathBuf {
         self.root.join("vectors").join(format!("{model}.usearch"))
     }

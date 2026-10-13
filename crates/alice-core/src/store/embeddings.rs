@@ -3,7 +3,7 @@
 use crate::embed::memory_embed_text;
 use crate::error::Result;
 use half::f16;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum VecKey {
@@ -173,6 +173,29 @@ pub fn count(conn: &Connection, model: &str) -> Result<usize> {
         |r| r.get(0),
     )?;
     Ok(n as usize)
+}
+
+/// Stored vectors of `model` for `keys`, in the order given; keys without one are left out.
+/// One primary-key lookup per key (a recall rescores a few hundred chunk candidates).
+pub fn get_many(
+    conn: &Connection,
+    model: &str,
+    keys: &[VecKey],
+) -> Result<Vec<(VecKey, Vec<f32>)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT vector FROM embeddings WHERE owner_type = ?1 AND owner_seq = ?2 AND model = ?3",
+    )?;
+    let mut out = Vec::with_capacity(keys.len());
+    for &key in keys {
+        let (t, s) = key.parts();
+        if let Some(blob) = stmt
+            .query_row(params![t, s, model], |r| r.get::<_, Vec<u8>>(0))
+            .optional()?
+        {
+            out.push((key, decode_f16(&blob)));
+        }
+    }
+    Ok(out)
 }
 
 pub fn backlog(conn: &Connection) -> Result<usize> {
@@ -492,6 +515,24 @@ mod tests {
                 (VecKey::Chunk(7), vec![0.0, 0.5, 0.25])
             ]
         );
+    }
+
+    #[test]
+    fn get_many_returns_stored_vectors_of_one_model_and_skips_missing() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        put(&c, VecKey::Chunk(1), "m", &[1.0, 0.0]).unwrap();
+        put(&c, VecKey::Chunk(2), "m", &[0.0, 1.0]).unwrap();
+        put(&c, VecKey::Chunk(2), "other", &[0.5, 0.5]).unwrap();
+        let got = get_many(
+            &c,
+            "m",
+            &[VecKey::Chunk(2), VecKey::Chunk(3), VecKey::Chunk(1)],
+        )
+        .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], (VecKey::Chunk(2), vec![0.0, 1.0]));
+        assert_eq!(got[1].0, VecKey::Chunk(1));
     }
 
     /// The queue queries must use the partial indexes `memories_embed` / `chunks_embed`

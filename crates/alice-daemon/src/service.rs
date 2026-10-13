@@ -245,7 +245,7 @@ fn spawn_rebuild(
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "vector index rebuild failed; starting with an empty index");
-                    *slot.write() = VectorIndex::new(dim).ok().map(Arc::new);
+                    *slot.write() = VectorIndex::for_model(&model, dim).ok().map(Arc::new);
                 }
             }
         })?;
@@ -271,7 +271,7 @@ impl Service {
         let vector_path = home.vector_file(&model);
 
         let expected = embeddings::count(&conn, &model)?;
-        match VectorIndex::open(&vector_path, dim) {
+        match VectorIndex::open(&vector_path, &model, dim) {
             Ok(idx) if idx.len() == expected => *index.write() = Some(Arc::new(idx)),
             Ok(idx) => {
                 tracing::info!(
@@ -929,7 +929,7 @@ mod tests {
         drop(s);
         // The index is two files next to the base path (memories and chunks).
         let base = home.vector_file("fake");
-        for part in ["memories.usearch", "chunks.usearch"] {
+        for part in ["memories.usearch", "chunks.bq"] {
             std::fs::remove_file(base.with_extension(part)).unwrap();
         }
         let s2 = Service::start(home, &mk, ServiceOptions::default()).unwrap();
@@ -958,6 +958,7 @@ mod tests {
 
     /// Review finding m-8 (spec §10): a damaged vector index (cut short, or the right size full
     /// of garbage) is rebuilt from the stored vectors at start, and vector search works again.
+    /// Both parts damaged, or only the sign-bit chunk file.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_truncated_or_corrupted_index_is_rebuilt_at_start() {
         type Damage = fn(&Path);
@@ -970,7 +971,17 @@ mod tests {
             let junk: Vec<u8> = (0..len).map(|i| (i * 7 + 13) as u8).collect();
             std::fs::write(p, junk).unwrap();
         };
-        for (how, damage) in [("truncated", truncate), ("garbage", garbage)] {
+        let cases = [
+            (
+                "truncated",
+                truncate,
+                &["memories.usearch", "chunks.bq"][..],
+            ),
+            ("garbage", garbage, &["memories.usearch", "chunks.bq"][..]),
+            ("truncated chunk file", truncate, &["chunks.bq"][..]),
+            ("garbage chunk file", garbage, &["chunks.bq"][..]),
+        ];
+        for (how, damage, parts) in cases {
             let d = tempfile::tempdir().unwrap();
             let home = AliceHome::new(d.path().to_path_buf());
             let mk = || Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>);
@@ -1007,7 +1018,7 @@ mod tests {
             .unwrap();
             drop(s);
             let base = home.vector_file("fake");
-            for part in ["memories.usearch", "chunks.usearch"] {
+            for part in parts {
                 damage(&base.with_extension(part));
             }
             let s = Service::start(home, &mk, ServiceOptions::default()).unwrap();
@@ -1037,6 +1048,79 @@ mod tests {
                 out.results
             );
         }
+    }
+
+    /// An index saved by M1 has `chunks.usearch` (an int8 HNSW) and no `chunks.bq`: the chunk
+    /// part is rebuilt from the stored vectors at start, chunk vectors are found again, and the
+    /// first save writes `chunks.bq` and deletes the M1 file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_m1_chunk_index_is_replaced_by_a_rebuilt_sign_bit_index() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let mk = || Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>);
+        let s = Service::start(home.clone(), &mk, ServiceOptions::default()).unwrap();
+        s.ingest(IngestRequest {
+            source: SourceInput {
+                uri: "s".into(),
+                ..Default::default()
+            },
+            chunks: vec![ChunkInput {
+                ord: 0,
+                text: "a raw chunk written before the upgrade".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_embedded(&s).await;
+        tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || s.shutdown()
+        })
+        .await
+        .unwrap();
+        drop(s);
+        let base = home.vector_file("fake");
+        let (bq, legacy) = (
+            base.with_extension("chunks.bq"),
+            base.with_extension("chunks.usearch"),
+        );
+        std::fs::remove_file(&bq).unwrap();
+        std::fs::write(&legacy, b"an M1 int8 HNSW of the chunks").unwrap();
+
+        let s = Service::start(home, &mk, ServiceOptions::default()).unwrap();
+        for _ in 0..200 {
+            if s.health().await.unwrap().index_ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(s.health().await.unwrap().index_ready);
+        let out = s
+            .recall(RecallRequest {
+                query: "a raw chunk written before the upgrade".into(),
+                format: OutputFormat::Json,
+                include_raw: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            out.results
+                .iter()
+                .any(|h| h.tier == Tier::Raw && h.matched.contains(&MatchVia::Vector)),
+            "{:?}",
+            out.results
+        );
+        tokio::task::spawn_blocking({
+            let s = s.clone();
+            move || s.shutdown()
+        })
+        .await
+        .unwrap();
+        assert!(bq.exists(), "the rebuilt chunk part is saved");
+        assert!(!legacy.exists(), "the M1 chunk file is deleted");
     }
 
     /// Ruling: a project detected from the working directory but never written to still gets

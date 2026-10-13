@@ -181,6 +181,12 @@ pub struct BenchArgs {
     /// Use the real embedding model instead of the fake one.
     #[arg(long)]
     pub real: bool,
+    /// With --real: write the chunk and memory vectors with a fast fake embedder that reports
+    /// the real model's id and dimension, so a 1M-chunk index exists in minutes; the daemon run
+    /// then loads the real model, embeds new memories with it and serves the bursts. Measures
+    /// the daemon's memory at scale; in-process latency figures then use fake query vectors.
+    #[arg(long, requires = "real")]
+    pub prefill_vectors: bool,
     /// Write results as JSON to this file.
     #[arg(long)]
     pub out: Option<std::path::PathBuf>,

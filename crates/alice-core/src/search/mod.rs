@@ -80,15 +80,17 @@ struct Query<'a> {
 }
 
 impl Query<'_> {
-    /// Nearest neighbours in one sub-index. A failure is logged and means no vector candidates.
-    fn vector_hits(&self, filter: KeyFilter) -> Vec<(VecKey, f32)> {
+    /// Nearest memories. A failure is logged and means no vector candidates.
+    fn memory_vector_hits(&self) -> Vec<(VecKey, f32)> {
         let (Some(index), Some(v)) = (self.index, self.vector.as_deref()) else {
             return Vec::new();
         };
-        index.search(v, self.k, filter).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "vector search failed; using word matches only");
-            Vec::new()
-        })
+        index
+            .search(v, self.k, KeyFilter::Memories)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "vector search failed; using word matches only");
+                Vec::new()
+            })
     }
 
     fn knowledge(&self) -> Candidates {
@@ -113,7 +115,7 @@ impl Query<'_> {
             lists.push((MatchVia::Words, refs(like, ItemRef::Memory)));
         }
         let vector = self
-            .vector_hits(KeyFilter::Memories)
+            .memory_vector_hits()
             .into_iter()
             .filter_map(|(key, sim)| match key {
                 VecKey::Memory(s) => Some((ItemRef::Memory(s), sim)),
@@ -140,14 +142,22 @@ impl Query<'_> {
                 refs(lexical::chunk_trigram(c, q, k), ItemRef::Chunk),
             ));
         }
-        let vector = self
-            .vector_hits(KeyFilter::Chunks)
-            .into_iter()
-            .filter_map(|(key, sim)| match key {
-                VecKey::Chunk(s) => Some((ItemRef::Chunk(s), sim)),
-                VecKey::Memory(_) => None,
-            })
-            .collect();
+        // Sign-bit candidates rescored with the stored vectors: exact cosine similarities.
+        let vector = match (self.index, self.vector.as_deref()) {
+            (Some(index), Some(v)) => index
+                .search_chunks(self.conn, v, self.k)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "chunk vector search failed; using word matches only");
+                    Vec::new()
+                }),
+            _ => Vec::new(),
+        }
+        .into_iter()
+        .filter_map(|(key, sim)| match key {
+            VecKey::Chunk(s) => Some((ItemRef::Chunk(s), sim)),
+            VecKey::Memory(_) => None,
+        })
+        .collect();
         collect(lists, vector)
     }
 }
@@ -1145,6 +1155,46 @@ mod tests {
         assert_eq!(out.hits.len(), 2);
         assert!(out.hits.iter().all(|h| h.matched == vec![MatchVia::Vector]));
         assert!(f.search(&f.params("😀")).hits.is_empty());
+    }
+
+    /// M2 Task 1: the raw tier's vector list is the sign-bit chunk index rescored with the
+    /// vectors stored for the index's model, so a chunk without a stored vector is no vector
+    /// match even though the chunk index still holds it.
+    #[test]
+    fn raw_vector_matches_are_rescored_from_the_stored_vectors() {
+        let mut f = fx();
+        f.idx = VectorIndex::for_model("fake", 384).unwrap();
+        let texts = [
+            "the frobnicator calibration happens every tuesday",
+            "the frobnicator calibration happened last tuesday",
+        ];
+        let mut seqs = Vec::new();
+        for (i, text) in texts.iter().enumerate() {
+            f.chunk(&f.app, &format!("s{i}"), text);
+            let seq: i64 =
+                f.c.query_row("SELECT seq FROM chunks WHERE text = ?1", [text], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let v = f.e.embed_passages(&[text.to_string()]).unwrap().remove(0);
+            f.idx.upsert(VecKey::Chunk(seq), &v).unwrap();
+            seqs.push((seq, v));
+        }
+        // Only the first chunk's vector is stored (the second row was deleted meanwhile).
+        crate::store::embeddings::put(&f.c, VecKey::Chunk(seqs[0].0), "fake", &seqs[0].1).unwrap();
+        let out = f.search(&SearchParams {
+            include_raw: true,
+            ..f.params("frobnicator calibration tuesday")
+        });
+        let raw: Vec<&Hit> = out.hits.iter().filter(|h| h.tier == Tier::Raw).collect();
+        assert_eq!(raw.len(), 2, "{:?}", out.hits);
+        let stored = raw.iter().find(|h| h.snippet.contains("every")).unwrap();
+        assert!(stored.matched.contains(&MatchVia::Vector), "{stored:?}");
+        let unstored = raw.iter().find(|h| h.snippet.contains("last")).unwrap();
+        assert!(
+            !unstored.matched.contains(&MatchVia::Vector),
+            "{unstored:?}"
+        );
     }
 
     #[test]

@@ -1067,6 +1067,24 @@ fn bench_runs_on_throwaway_data_and_cleans_up() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // --prefill-vectors only makes sense with the real model, and its data is its own kind.
+    let mut prefill = small.to_vec();
+    prefill.push("--prefill-vectors");
+    let out = bench(&prefill);
+    assert!(!out.status.success(), "--prefill-vectors needs --real");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--real"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    prefill.push("--real");
+    let out = bench(&prefill);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("for the fake embedder"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Every file under `dir` with its contents, to prove a refused run changed nothing.
