@@ -394,11 +394,54 @@ async fn ping_proves_knowledge_of_the_token() {
         .await
         .unwrap();
     let proof = ping.proof.expect("a nonce gets a proof");
-    assert_eq!(proof, ping_proof(&s.token, nonce));
-    assert!(verify_ping_proof(&s.token, nonce, &proof));
-    assert_ne!(proof, ping_proof("wrong-token", nonce));
-    assert!(!verify_ping_proof("wrong-token", nonce, &proof));
+    assert_eq!(proof, ping_proof(&s.token, nonce, &ping.instance));
+    assert!(verify_ping_proof(&s.token, nonce, &ping.instance, &proof));
+    assert_ne!(proof, ping_proof("wrong-token", nonce, &ping.instance));
+    assert!(!verify_ping_proof(
+        "wrong-token",
+        nonce,
+        &ping.instance,
+        &proof
+    ));
     assert!(!proof.contains(&s.token));
+    // Relay: an impostor on a stale port forwards the client's nonce here and answers with
+    // the stale instance id from daemon.json plus this daemon's proof. It must not verify.
+    assert!(!verify_ping_proof(
+        &s.token,
+        nonce,
+        "01K7STALESTALESTALESTALEST",
+        &proof
+    ));
+
+    // Nonce length boundaries: 16 and 64 hex characters are accepted.
+    for n in ["0123456789abcdef".to_string(), "ab".repeat(32)] {
+        let p: PingResponse = s
+            .http
+            .get(s.url(&format!("/api/v1/ping?nonce={n}")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            verify_ping_proof(&s.token, &n, &p.instance, &p.proof.unwrap()),
+            "nonce of {} chars",
+            n.len()
+        );
+    }
+    // Two nonces are ambiguous: refused.
+    let r = s
+        .http
+        .get(s.url(
+            "/api/v1/ping?nonce=00112233445566778899aabbccddeeff&nonce=ffeeddccbbaa99887766554433221100",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "duplicate nonce");
+    let e: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(e["kind"], "invalid", "{e}");
 
     let plain: serde_json::Value = s
         .http

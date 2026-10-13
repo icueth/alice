@@ -63,8 +63,9 @@ impl Daemon {
                 if let Ok(r) = ping
                     && let Ok(p) = r.json::<PingResponse>().await
                     && p.instance == info.instance
-                    && p.proof
-                        .is_some_and(|proof| verify_ping_proof(&token, nonce, &proof))
+                    && p.proof.is_some_and(|proof| {
+                        verify_ping_proof(&token, nonce, &info.instance, &proof)
+                    })
                 {
                     return Daemon {
                         http,

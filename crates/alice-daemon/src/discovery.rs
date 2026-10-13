@@ -106,16 +106,24 @@ pub fn load_or_create_token(home: &AliceHome) -> std::io::Result<String> {
     placed
 }
 
-/// What `/api/v1/ping?nonce=<nonce>` answers: `hex(HMAC-SHA256(key = token, msg = nonce))`
-/// over the ASCII bytes of both. Only a process that knows the token can produce it, so a
-/// client checks it before it sends the token anywhere.
-pub fn ping_proof(token: &str, nonce: &str) -> String {
-    hex::encode(hmac_sha256(token.as_bytes(), nonce.as_bytes()))
+/// What `/api/v1/ping?nonce=<nonce>` answers:
+/// `hex(HMAC-SHA256(key = token, msg = "<nonce>:<instance>"))` over ASCII bytes, where
+/// `instance` is the answering daemon's own instance id. Only a process that knows the token
+/// can produce it, and it vouches for that one instance: an impostor on a stale port that
+/// relays the client's nonce to the real daemon gets a proof for the real instance, which
+/// fails against the stale id the client read from daemon.json. A client checks it (with
+/// `verify_ping_proof`) before it sends the token anywhere.
+pub fn ping_proof(token: &str, nonce: &str, instance: &str) -> String {
+    let msg = format!("{nonce}:{instance}");
+    hex::encode(hmac_sha256(token.as_bytes(), msg.as_bytes()))
 }
 
-/// Whether `proof` is `ping_proof(token, nonce)`, compared in constant time.
-pub fn verify_ping_proof(token: &str, nonce: &str, proof: &str) -> bool {
-    crate::http::ct_eq(ping_proof(token, nonce).as_bytes(), proof.as_bytes())
+/// Whether `proof` is `ping_proof(token, nonce, instance)`, compared in constant time.
+pub fn verify_ping_proof(token: &str, nonce: &str, instance: &str, proof: &str) -> bool {
+    crate::http::ct_eq(
+        ping_proof(token, nonce, instance).as_bytes(),
+        proof.as_bytes(),
+    )
 }
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
@@ -214,9 +222,9 @@ mod tests {
 
     /// RFC 4231 test cases 2 (short key) and 6 (key longer than the 64-byte block).
     #[test]
-    fn ping_proof_is_hmac_sha256() {
+    fn hmac_matches_rfc_4231() {
         assert_eq!(
-            ping_proof("Jefe", "what do ya want for nothing?"),
+            hex::encode(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
         assert_eq!(
@@ -228,27 +236,60 @@ mod tests {
         );
     }
 
+    /// The message is `<nonce>:<instance>`; Task 12's client relies on the exact form.
+    #[test]
+    fn ping_proof_signs_the_nonce_and_the_instance() {
+        let token = "a".repeat(64);
+        let nonce = "0123456789abcdef";
+        let instance = "01K7EXAMPLEINSTANCE0000000";
+        assert_eq!(
+            ping_proof(&token, nonce, instance),
+            hex::encode(hmac_sha256(
+                token.as_bytes(),
+                format!("{nonce}:{instance}").as_bytes()
+            ))
+        );
+    }
+
     #[test]
     fn verify_ping_proof_accepts_only_the_exact_proof() {
         let token = "a".repeat(64);
         let nonce = "0123456789abcdef";
-        let proof = ping_proof(&token, nonce);
+        let instance = "01K7AAAAAAAAAAAAAAAAAAAAAA";
+        let proof = ping_proof(&token, nonce, instance);
         assert_eq!(proof.len(), 64);
-        assert!(verify_ping_proof(&token, nonce, &proof));
+        assert!(verify_ping_proof(&token, nonce, instance, &proof));
         assert!(
-            !verify_ping_proof(&"b".repeat(64), nonce, &proof),
+            !verify_ping_proof(&"b".repeat(64), nonce, instance, &proof),
             "wrong token"
         );
         assert!(
-            !verify_ping_proof(&token, "0123456789abcdee", &proof),
+            !verify_ping_proof(&token, "0123456789abcdee", instance, &proof),
             "other nonce"
         );
-        assert!(!verify_ping_proof(&token, nonce, &proof[..63]), "truncated");
         assert!(
-            !verify_ping_proof(&token, nonce, &format!("{proof}0")),
+            !verify_ping_proof(&token, nonce, instance, &proof[..63]),
+            "truncated"
+        );
+        assert!(
+            !verify_ping_proof(&token, nonce, instance, &format!("{proof}0")),
             "extended"
         );
-        assert!(!verify_ping_proof(&token, nonce, ""), "empty");
+        assert!(!verify_ping_proof(&token, nonce, instance, ""), "empty");
+    }
+
+    /// A proof made by the daemon with instance A (relayed by an impostor) does not vouch
+    /// for the stale instance B that daemon.json names.
+    #[test]
+    fn a_proof_for_one_instance_does_not_verify_for_another() {
+        let token = "a".repeat(64);
+        let nonce = "0123456789abcdef";
+        let a = "01K7AAAAAAAAAAAAAAAAAAAAAA";
+        let b = "01K7BBBBBBBBBBBBBBBBBBBBBB";
+        let proof_a = ping_proof(&token, nonce, a);
+        assert_ne!(proof_a, ping_proof(&token, nonce, b));
+        assert!(verify_ping_proof(&token, nonce, a, &proof_a));
+        assert!(!verify_ping_proof(&token, nonce, b, &proof_a));
     }
 
     #[cfg(unix)]

@@ -188,7 +188,7 @@ pub struct PingResponse {
     pub service: String,
     pub instance: String,
     pub version: String,
-    /// `discovery::ping_proof(token, nonce)` when the ping carried `?nonce=`.
+    /// `discovery::ping_proof(token, nonce, instance)` when the ping carried `?nonce=`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<String>,
 }
@@ -203,7 +203,7 @@ fn valid_nonce(n: &str) -> bool {
 }
 
 /// Public, but proves the token without revealing it: with `?nonce=<16–64 hex chars>` the
-/// answer carries `proof = discovery::ping_proof(token, nonce)`.
+/// answer carries `proof = discovery::ping_proof(token, nonce, instance)`.
 async fn ping(
     State(st): State<AppState>,
     query: Result<Query<PingQuery>, QueryRejection>,
@@ -216,7 +216,11 @@ async fn ping(
     })?;
     let proof = match q.nonce {
         None => None,
-        Some(n) if valid_nonce(&n) => Some(crate::discovery::ping_proof(&st.token, &n)),
+        Some(n) if valid_nonce(&n) => Some(crate::discovery::ping_proof(
+            &st.token,
+            &n,
+            st.svc.instance(),
+        )),
         Some(_) => {
             return Err(ApiError(AliceError::invalid(
                 "the nonce must be 16 to 64 hex characters; send a fresh random one",
