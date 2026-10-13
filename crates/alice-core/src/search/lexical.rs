@@ -1,0 +1,598 @@
+//! FTS5 query construction and candidate retrieval. Every user term is quoted, so FTS5
+//! operators in the query are treated as literal words.
+
+use crate::codetokens::{expand_code_tokens, is_codeish};
+use rusqlite::Connection;
+
+/// Most terms one query sends to an index; longer queries keep their first terms.
+const MAX_TERMS: usize = 32;
+
+pub fn quote(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
+}
+
+pub fn or_query(terms: &[String]) -> Option<String> {
+    (!terms.is_empty()).then(|| {
+        terms
+            .iter()
+            .map(|t| quote(t))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    })
+}
+
+fn push_unique(out: &mut Vec<String>, w: String) {
+    if !w.is_empty() && w.chars().any(char::is_alphanumeric) && !out.contains(&w) {
+        out.push(w);
+    }
+}
+
+/// Word separators for the unicode61 terms: whitespace, control characters and ASCII
+/// punctuation except `_` (identifiers stay whole and become a phrase in FTS5).
+fn is_word_separator(c: char) -> bool {
+    c.is_whitespace() || c.is_control() || (c.is_ascii_punctuation() && c != '_')
+}
+
+/// Whitespace- or control-separated pieces with ASCII punctuation trimmed from both ends.
+fn pieces(query: &str) -> impl Iterator<Item = &str> {
+    query
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .map(|w| w.trim_matches(|c: char| c.is_ascii_punctuation()))
+        .filter(|w| !w.is_empty())
+}
+
+/// Lowercase words for the unicode61 index plus identifier parts. At most 32 terms.
+pub fn word_terms(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in query.split(is_word_separator) {
+        push_unique(&mut out, w.trim().to_lowercase());
+    }
+    for w in expand_code_tokens(query).split(' ') {
+        push_unique(&mut out, w.to_string());
+    }
+    out.truncate(MAX_TERMS);
+    out
+}
+
+fn is_vowel(c: u8) -> bool {
+    matches!(c, b'a' | b'e' | b'i' | b'o' | b'u')
+}
+
+/// Ends in a doubled consonant that English adds before -ed/-ing (`capp`, `runn`), not `ll`/`ss`.
+fn doubled_consonant(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && {
+        let (x, y) = (b[b.len() - 2], b[b.len() - 1]);
+        x == y && !is_vowel(y) && !matches!(y, b'l' | b's' | b'z' | b'f')
+    }
+}
+
+/// Consonant-vowel-consonant ending that doubles before -ed/-ing (`stop` -> `stopped`).
+fn doubles_before_suffix(s: &str) -> bool {
+    let b = s.as_bytes();
+    s.len() <= 6
+        && b.len() >= 3
+        && !is_vowel(b[b.len() - 3])
+        && is_vowel(b[b.len() - 2])
+        && !is_vowel(b[b.len() - 1])
+        && !matches!(b[b.len() - 1], b'w' | b'x' | b'y')
+}
+
+/// Likely base forms of an English word with one inflection removed. The word itself
+/// when no rule applies.
+fn english_bases(w: &str) -> Vec<String> {
+    let stem_ok = |s: &str| s.len() >= 3 && s.bytes().any(|c| is_vowel(c) || c == b'y');
+    if let Some(s) = w.strip_suffix("ies").or_else(|| w.strip_suffix("ied"))
+        && s.len() >= 2
+    {
+        return vec![format!("{s}y")];
+    }
+    if let Some(s) = w.strip_suffix("es")
+        && stem_ok(s)
+    {
+        // `fixes` -> `fix`, `frames` -> `frame`; after ch/sh/s both are plausible (`caches`, `matches`).
+        let sibilant = ["s", "x", "z", "ch", "sh"].iter().any(|e| s.ends_with(e));
+        let after_e = format!("{s}e");
+        return match (
+            sibilant,
+            s.ends_with("ch") || s.ends_with("sh") || s.ends_with('s'),
+        ) {
+            (true, true) => vec![s.to_string(), after_e],
+            (true, false) => vec![s.to_string()],
+            _ => vec![after_e],
+        };
+    }
+    if let Some(s) = w.strip_suffix('s')
+        && !["ss", "us", "is"].iter().any(|e| w.ends_with(e))
+        && stem_ok(s)
+    {
+        return vec![s.to_string()];
+    }
+    for suffix in ["ing", "ed"] {
+        if let Some(s) = w.strip_suffix(suffix)
+            && stem_ok(s)
+        {
+            return if doubled_consonant(s) {
+                vec![s[..s.len() - 1].to_string()]
+            } else {
+                vec![s.to_string(), format!("{s}e")]
+            };
+        }
+    }
+    vec![w.to_string()]
+}
+
+/// Regular inflections of an English base form.
+fn english_forms(b: &str) -> Vec<String> {
+    let bytes = b.as_bytes();
+    let last = bytes[bytes.len() - 1];
+    if last == b'e' {
+        let stem = &b[..b.len() - 1];
+        return vec![format!("{b}s"), format!("{b}d"), format!("{stem}ing")];
+    }
+    if last == b'y' && !is_vowel(bytes[bytes.len() - 2]) {
+        let stem = &b[..b.len() - 1];
+        return vec![
+            format!("{stem}ies"),
+            format!("{stem}ied"),
+            format!("{b}ing"),
+        ];
+    }
+    if ["s", "x", "z", "ch", "sh"].iter().any(|e| b.ends_with(e)) {
+        return vec![format!("{b}es"), format!("{b}ed"), format!("{b}ing")];
+    }
+    let mut out = vec![format!("{b}s"), format!("{b}ed"), format!("{b}ing")];
+    if doubles_before_suffix(b) {
+        let c = last as char;
+        out.push(format!("{b}{c}ed"));
+        out.push(format!("{b}{c}ing"));
+    }
+    out
+}
+
+/// Other regular forms of the plain English words in the query (`replies` -> `reply`,
+/// `deploy` -> `deploys`, `deployed`, `deploying`), because the unicode61 index does not stem.
+/// Only lowercase or capitalised ASCII words of four or more letters are inflected;
+/// identifiers, acronyms, numbers and other scripts are left alone. Terms already returned by
+/// `word_terms` are not repeated. At most 32 terms.
+pub fn variant_terms(query: &str) -> Vec<String> {
+    let words = word_terms(query);
+    let mut out = Vec::new();
+    for raw in query.split(is_word_separator) {
+        let plain = raw.len() >= 4
+            && raw.bytes().all(|c| c.is_ascii_alphabetic())
+            && raw.bytes().skip(1).all(|c| c.is_ascii_lowercase());
+        if !plain {
+            continue;
+        }
+        let w = raw.to_ascii_lowercase();
+        let mut candidates = Vec::new();
+        for base in english_bases(&w) {
+            candidates.push(base.clone());
+            candidates.extend(english_forms(&base));
+        }
+        for v in candidates {
+            if v.len() >= 3 && v != w && !words.contains(&v) {
+                push_unique(&mut out, v);
+            }
+        }
+    }
+    out.truncate(MAX_TERMS);
+    out
+}
+
+/// Joined identifiers (`HostLinkReconnect` -> `hostlinkreconnect`) for exact code matches.
+pub fn code_terms(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for tok in query.split(|c: char| c.is_whitespace() || c.is_control()) {
+        let tok = tok
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '/' && c != '.');
+        if tok.len() >= 3 && is_codeish(tok) {
+            push_unique(
+                &mut out,
+                tok.chars()
+                    .filter(char::is_ascii_alphanumeric)
+                    .collect::<String>()
+                    .to_lowercase(),
+            );
+        }
+    }
+    out.truncate(MAX_TERMS);
+    out
+}
+
+/// Substring terms for the trigram index: whitespace-separated pieces of at least 3 characters.
+/// Non-ASCII pieces always qualify; ASCII pieces only in queries of one or two words, so long
+/// English questions rely on the word index.
+pub fn trigram_terms(query: &str) -> Vec<String> {
+    let short_query = query.split_whitespace().count() <= 2;
+    let mut out = Vec::new();
+    for w in pieces(query) {
+        let w = w.to_lowercase();
+        if w.chars().count() >= 3 && (!w.is_ascii() || short_query) {
+            push_unique(&mut out, w);
+        }
+    }
+    out.truncate(MAX_TERMS);
+    out
+}
+
+/// Trigram search helps scripts without spaces and very short queries.
+pub fn should_use_trigram(query: &str) -> bool {
+    !query.is_ascii() || query.split_whitespace().count() <= 2
+}
+
+/// Run one candidate query. Never fails: an FTS error is logged and means no matches.
+fn run(conn: &Connection, sql: &str, fts_query: Option<String>, k: usize) -> Vec<i64> {
+    let Some(q) = fts_query else {
+        return Vec::new();
+    };
+    let result = (|| -> rusqlite::Result<Vec<i64>> {
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows = stmt.query_map(rusqlite::params![q, k as i64], |r| r.get(0))?;
+        rows.collect()
+    })();
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "fts query failed; treating as no lexical matches");
+            Vec::new()
+        }
+    }
+}
+
+/// Words of the query and their English variants, for the unicode61 indexes.
+fn words_query(q: &str) -> Option<String> {
+    let mut terms = word_terms(q);
+    terms.extend(variant_terms(q));
+    or_query(&terms)
+}
+
+fn code_query(q: &str) -> Option<String> {
+    or_query(&code_terms(q)).map(|o| format!("code_tokens : ({o})"))
+}
+
+pub fn memory_words(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
+    run(
+        conn,
+        "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1 ORDER BY bm25(memories_fts, 2.0, 1.0, 1.5, 1.5) LIMIT ?2",
+        words_query(q),
+        k,
+    )
+}
+
+pub fn memory_trigram(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
+    run(
+        conn,
+        "SELECT rowid FROM memories_tri WHERE memories_tri MATCH ?1 ORDER BY bm25(memories_tri, 2.0, 1.0) LIMIT ?2",
+        or_query(&trigram_terms(q)),
+        k,
+    )
+}
+
+pub fn memory_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
+    run(
+        conn,
+        "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1 ORDER BY bm25(memories_fts) LIMIT ?2",
+        code_query(q),
+        k,
+    )
+}
+
+pub fn chunk_words(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
+    run(
+        conn,
+        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts, 1.0, 1.5) LIMIT ?2",
+        words_query(q),
+        k,
+    )
+}
+
+pub fn chunk_trigram(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
+    run(
+        conn,
+        "SELECT rowid FROM chunks_tri WHERE chunks_tri MATCH ?1 ORDER BY bm25(chunks_tri) LIMIT ?2",
+        or_query(&trigram_terms(q)),
+        k,
+    )
+}
+
+pub fn chunk_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
+    run(
+        conn,
+        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts) LIMIT ?2",
+        code_query(q),
+        k,
+    )
+}
+
+/// Non-ASCII terms of 1–2 code points (e.g. Thai "จำ" = จ + ำ) are below the trigram minimum.
+pub fn short_terms(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in pieces(query) {
+        let w = w.to_lowercase();
+        if !w.is_ascii() && (1..3).contains(&w.chars().count()) {
+            push_unique(&mut out, w);
+        }
+    }
+    out.truncate(8);
+    out
+}
+
+fn like_pattern(term: &str) -> String {
+    let escaped = term
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+/// LIKE scan of the knowledge tier for short non-ASCII terms (newest first). Never fails.
+pub fn memory_like(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
+    let terms = short_terms(q);
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let clause =
+        vec!["(title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')"; terms.len()].join(" OR ");
+    let sql = format!(
+        "SELECT seq FROM memories WHERE status <> 'trashed' AND ({clause}) ORDER BY seq DESC LIMIT {k}"
+    );
+    let params: Vec<String> = terms
+        .iter()
+        .flat_map(|t| {
+            let p = like_pattern(t);
+            [p.clone(), p]
+        })
+        .collect();
+    let result = (|| -> rusqlite::Result<Vec<i64>> {
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| r.get(0))?;
+        rows.collect()
+    })();
+    result.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "like scan failed; treating as no matches");
+        Vec::new()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::ProjectRef;
+    use crate::store::{memories, open_writer, projects, sources};
+
+    #[test]
+    fn terms_are_quoted_and_operators_are_inert() {
+        assert_eq!(quote("a\"b"), "\"a\"\"b\"");
+        let q = or_query(&word_terms("NEAR(foo AND -bar*) \"")).unwrap();
+        assert_eq!(q, "\"near\" OR \"foo\" OR \"and\" OR \"bar\"");
+        assert!(word_terms("😀 !!").is_empty());
+        assert_eq!(or_query(&[]), None);
+        // Control characters separate words instead of reaching the FTS parser.
+        assert_eq!(
+            word_terms("a\u{0}b"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn code_terms_come_from_identifiers() {
+        assert!(word_terms("why HostLinkReconnect").contains(&"reconnect".to_string()));
+        assert_eq!(
+            code_terms("fix writer_lease now"),
+            vec!["writerlease".to_string()]
+        );
+        assert!(code_terms("plain words").is_empty());
+    }
+
+    #[test]
+    fn trigram_rules() {
+        assert!(should_use_trigram("ความจำ"));
+        assert!(should_use_trigram("lease timeout"));
+        assert!(!should_use_trigram(
+            "why does the writer lease time out so often"
+        ));
+        assert_eq!(trigram_terms("AI ความจำ go"), vec!["ความจำ".to_string()]);
+    }
+
+    #[test]
+    fn english_inflections_become_extra_terms() {
+        let v = variant_terms("which replies");
+        assert!(v.contains(&"reply".to_string()), "{v:?}");
+        assert!(
+            !v.contains(&"replies".to_string()),
+            "word terms are not repeated: {v:?}"
+        );
+        for (word, want) in [
+            ("deploy", "deploys"),
+            ("loop", "looped"),
+            ("frames", "frame"),
+            ("fixes", "fix"),
+            ("capped", "cap"),
+            ("timing", "time"),
+            ("saved", "save"),
+            ("entry", "entries"),
+        ] {
+            let v = variant_terms(word);
+            assert!(
+                v.contains(&want.to_string()),
+                "{word} -> {want} missing: {v:?}"
+            );
+        }
+        // Short words, identifiers, digits and non-English text get no guesses.
+        for q in [
+            "use",
+            "AI",
+            "v4",
+            "writer_lease",
+            "HostLinkReconnect",
+            "ความจำ",
+            "x86s",
+        ] {
+            assert!(variant_terms(q).is_empty(), "{q}: {:?}", variant_terms(q));
+        }
+        let many = "alpha bravo charlie delta echoes foxtrot golfing hotel india juliet kilos lima";
+        assert!(word_terms(many).len() + variant_terms(many).len() <= 64);
+    }
+
+    fn db_with(texts: &[&str]) -> (tempfile::TempDir, rusqlite::Connection) {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let p = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
+        for t in texts {
+            let m = memories::prepare(
+                memories::NewMemoryInput {
+                    content: (*t).into(),
+                    ..Default::default()
+                },
+                &p,
+                "h".into(),
+            )
+            .unwrap();
+            memories::insert(&c, &m).unwrap();
+        }
+        (d, c)
+    }
+
+    /// Every FTS5 operator and quoting mistake from Review Focus #1, plus short and Thai input.
+    const HOSTILE: [&str; 22] = [
+        "\"",
+        "*",
+        "-",
+        ":",
+        "(",
+        ")",
+        "NEAR",
+        "NEAR(a b)",
+        "AND",
+        "AND OR NOT",
+        "a:b",
+        "x\"y",
+        "\"unclosed",
+        "foo*",
+        "^start",
+        "col:term",
+        "AI",
+        "ไทย",
+        "😀",
+        "''",
+        "\u{0}",
+        "\u{0E31}",
+    ];
+
+    #[test]
+    fn hostile_queries_never_error() {
+        let (_d, c) = db_with(&["writer lease timeout", "ระบบความจำสำหรับเอเจนต์"]);
+        for q in HOSTILE {
+            let _ = memory_words(&c, q, 10);
+            let _ = memory_trigram(&c, q, 10);
+            let _ = memory_code(&c, q, 10);
+            let _ = memory_like(&c, q, 10);
+            for fq in [
+                or_query(&word_terms(q)),
+                or_query(&variant_terms(q)),
+                or_query(&trigram_terms(q)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for table in ["memories_fts", "memories_tri"] {
+                    let sql = format!("SELECT count(*) FROM {table} WHERE {table} MATCH ?1");
+                    let r: rusqlite::Result<i64> = c.query_row(&sql, [&fq], |r| r.get(0));
+                    assert!(r.is_ok(), "{q:?} built an invalid FTS query {fq:?}: {r:?}");
+                }
+            }
+        }
+        assert_eq!(memory_trigram(&c, "ความจำ", 10).len(), 1);
+        assert_eq!(memory_words(&c, "lease", 10).len(), 1);
+        assert_eq!(
+            memory_trigram(&c, "จำ", 10).len(),
+            0,
+            "2 code points: below trigram minimum"
+        );
+        assert_eq!(memory_like(&c, "จำ", 10).len(), 1, "LIKE fallback finds it");
+        assert!(
+            memory_like(&c, "%", 10).is_empty(),
+            "ASCII and wildcards are not LIKE-scanned"
+        );
+    }
+
+    #[test]
+    fn operators_are_searched_as_literal_words() {
+        let (_d, c) = db_with(&["NEAR the AND gate", "unrelated text"]);
+        for q in [
+            "NEAR",
+            "AND",
+            "-gate",
+            "gate*",
+            "NEAR(gate)",
+            "\"gate",
+            "the:gate",
+            "AND OR NOT",
+        ] {
+            assert_eq!(memory_words(&c, q, 10).len(), 1, "{q}");
+        }
+        // "-" is not NOT: a query for the other memory still finds it.
+        assert_eq!(memory_words(&c, "unrelated -gate", 10).len(), 2);
+    }
+
+    #[test]
+    fn inflected_queries_find_base_forms_and_back() {
+        let (_d, c) = db_with(&[
+            "Always reply to the owner in Thai",
+            "Production deploys go to Easypanel",
+        ]);
+        assert_eq!(memory_words(&c, "which replies", 10).len(), 1);
+        assert_eq!(memory_words(&c, "deploy", 10).len(), 1);
+    }
+
+    #[test]
+    fn code_queries_match_identifier_tokens() {
+        let (_d, c) = db_with(&[
+            "HostLinkReconnect looped",
+            "fix in writer_lease.rs",
+            "plain",
+        ]);
+        assert_eq!(memory_code(&c, "HostLinkReconnect", 10).len(), 1);
+        assert_eq!(memory_code(&c, "writer_lease.rs", 10).len(), 1);
+        assert!(memory_code(&c, "plain", 10).is_empty());
+    }
+
+    #[test]
+    fn chunk_lists_search_the_raw_tier() {
+        let (_d, c) = db_with(&[]);
+        let p = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
+        sources::ingest(
+            &c,
+            &p,
+            &sources::SourceInput {
+                uri: "s".into(),
+                ..Default::default()
+            },
+            &[
+                sources::ChunkInput {
+                    ord: 0,
+                    text: "HostLinkReconnect frobnicator ความจำระยะยาว".into(),
+                    ..Default::default()
+                },
+                sources::ChunkInput {
+                    ord: 1,
+                    text: "nothing to see".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(chunk_words(&c, "frobnicator", 10).len(), 1);
+        assert_eq!(chunk_trigram(&c, "ความจำ", 10).len(), 1);
+        assert_eq!(chunk_code(&c, "HostLinkReconnect", 10).len(), 1);
+        for q in HOSTILE {
+            let _ = (
+                chunk_words(&c, q, 10),
+                chunk_trigram(&c, q, 10),
+                chunk_code(&c, q, 10),
+            );
+        }
+    }
+}
