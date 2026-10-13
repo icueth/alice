@@ -38,14 +38,18 @@ pub fn decode_f16(b: &[u8]) -> Vec<f32> {
 pub struct PendingItem {
     pub key: VecKey,
     pub text: String,
+    /// The row's `content_hash`, read together with `text`. Completion is compare-and-set on it
+    /// ([`put_if_current`], [`mark_failed_if_current`]), so an edit that lands while the old text
+    /// is being embedded is never marked done with the old vector.
+    pub stamp: String,
 }
 
 // `embed_state <> 'done'` repeats the WHERE term of the partial indexes `memories_embed` and
 // `chunks_embed`; SQLite uses a partial index only when the query contains that term literally.
-const PENDING_MEMORIES_SQL: &str = "SELECT seq, title, body FROM memories
+const PENDING_MEMORIES_SQL: &str = "SELECT seq, title, body, content_hash FROM memories
      WHERE embed_state <> 'done' AND embed_state IN ('pending','retry') AND status <> 'trashed'
      ORDER BY seq LIMIT ?1";
-const PENDING_CHUNKS_SQL: &str = "SELECT seq, text FROM chunks
+const PENDING_CHUNKS_SQL: &str = "SELECT seq, text, content_hash FROM chunks
      WHERE embed_state <> 'done' AND embed_state IN ('pending','retry')
      ORDER BY seq LIMIT ?1";
 const BACKLOG_SQL: &str = "SELECT
@@ -61,6 +65,7 @@ pub fn pending(conn: &Connection, limit: usize) -> Result<Vec<PendingItem>> {
         Ok(PendingItem {
             key: VecKey::Memory(r.get(0)?),
             text: memory_embed_text(&r.get::<_, String>(1)?, &r.get::<_, String>(2)?),
+            stamp: r.get(3)?,
         })
     })?;
     for r in rows {
@@ -72,6 +77,7 @@ pub fn pending(conn: &Connection, limit: usize) -> Result<Vec<PendingItem>> {
             Ok(PendingItem {
                 key: VecKey::Chunk(r.get(0)?),
                 text: r.get(1)?,
+                stamp: r.get(2)?,
             })
         })?;
         for r in rows {
@@ -111,6 +117,53 @@ pub fn mark_done(conn: &Connection, key: VecKey) -> Result<()> {
 
 pub fn mark_failed(conn: &Connection, key: VecKey, retry: bool) -> Result<()> {
     set_state(conn, key, if retry { "retry" } else { "failed" })
+}
+
+/// Set `embed_state` only while the row exists and its `content_hash` still equals `stamp`.
+/// Returns whether the row was updated.
+fn set_state_if_current(conn: &Connection, key: VecKey, stamp: &str, state: &str) -> Result<bool> {
+    let sql = match key {
+        VecKey::Memory(_) => {
+            "UPDATE memories SET embed_state = ?1 WHERE seq = ?2 AND content_hash = ?3"
+        }
+        VecKey::Chunk(_) => {
+            "UPDATE chunks SET embed_state = ?1 WHERE seq = ?2 AND content_hash = ?3"
+        }
+    };
+    let (VecKey::Memory(seq) | VecKey::Chunk(seq)) = key;
+    let changed = conn
+        .prepare_cached(sql)?
+        .execute(params![state, seq, stamp])?;
+    Ok(changed > 0)
+}
+
+/// Store the vector of the text stamped `stamp` and mark the row done, but only if the row still
+/// exists and still holds that text (its `content_hash` equals `stamp`). Returns whether it
+/// applied. When it does not, nothing is written: the edit that changed the text already put the
+/// row back to `pending`, so the new text is embedded on the next round.
+pub fn put_if_current(
+    conn: &Connection,
+    key: VecKey,
+    stamp: &str,
+    model: &str,
+    v: &[f32],
+) -> Result<bool> {
+    if !set_state_if_current(conn, key, stamp, "done")? {
+        return Ok(false);
+    }
+    put(conn, key, model, v)?;
+    Ok(true)
+}
+
+/// `mark_failed` for the text stamped `stamp` only; returns whether it applied. A row whose text
+/// changed since it was read stays as the edit left it (`pending`).
+pub fn mark_failed_if_current(
+    conn: &Connection,
+    key: VecKey,
+    stamp: &str,
+    retry: bool,
+) -> Result<bool> {
+    set_state_if_current(conn, key, stamp, if retry { "retry" } else { "failed" })
 }
 
 pub fn count(conn: &Connection, model: &str) -> Result<usize> {
@@ -280,6 +333,144 @@ mod tests {
             "trashed is not embedded"
         );
         assert_eq!(backlog(&c).unwrap(), 2);
+    }
+
+    fn embedding_rows(c: &Connection) -> i64 {
+        c.query_row("SELECT count(*) FROM embeddings", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn embed_state(c: &Connection, key: VecKey) -> String {
+        let sql = match key {
+            VecKey::Memory(_) => "SELECT embed_state FROM memories WHERE seq = ?1",
+            VecKey::Chunk(_) => "SELECT embed_state FROM chunks WHERE seq = ?1",
+        };
+        let (VecKey::Memory(s) | VecKey::Chunk(s)) = key;
+        c.query_row(sql, [s], |r| r.get(0)).unwrap()
+    }
+
+    /// An edit can land while the worker embeds the old text: the stale vector must not be
+    /// stored and the row must stay queued, so the new text is embedded next.
+    #[test]
+    fn a_stale_stamp_neither_stores_the_vector_nor_marks_the_row_done() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let p = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
+        let m = memories::prepare(
+            memories::NewMemoryInput {
+                content: "port is 8080".into(),
+                ..Default::default()
+            },
+            &p,
+            "h".into(),
+        )
+        .unwrap();
+        let memories::InsertOutcome::New { id, seq } = memories::insert(&c, &m).unwrap() else {
+            panic!()
+        };
+        let old = pending(&c, 10).unwrap().remove(0);
+        assert_eq!(old.key, VecKey::Memory(seq));
+        assert_eq!(
+            old.stamp, m.content_hash,
+            "the stamp is the row's content hash"
+        );
+
+        memories::apply_update(
+            &c,
+            &id,
+            &memories::MemoryUpdate {
+                body: Some("port is 9090".into()),
+                ..Default::default()
+            },
+            "h2".into(),
+        )
+        .unwrap();
+        assert!(!put_if_current(&c, old.key, &old.stamp, "m", &[1.0, 0.0]).unwrap());
+        assert_eq!(embed_state(&c, old.key), "pending");
+        assert_eq!(embedding_rows(&c), 0, "the stale vector is not stored");
+
+        let new = pending(&c, 10).unwrap().remove(0);
+        assert!(new.text.contains("9090"), "{}", new.text);
+        assert_ne!(new.stamp, old.stamp);
+        assert!(put_if_current(&c, new.key, &new.stamp, "m", &[0.0, 1.0]).unwrap());
+        assert_eq!(embed_state(&c, new.key), "done");
+        let mut seen = Vec::new();
+        for_each(&c, "m", |k, v| seen.push((k, v))).unwrap();
+        assert_eq!(seen, vec![(VecKey::Memory(seq), vec![0.0, 1.0])]);
+        assert!(pending(&c, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn chunk_stamps_are_their_hash_and_a_missing_row_never_applies() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let p = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
+        sources::ingest(
+            &c,
+            &p,
+            &sources::SourceInput {
+                uri: "u".into(),
+                ..Default::default()
+            },
+            &[sources::ChunkInput {
+                ord: 0,
+                text: "delta".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let item = pending(&c, 10).unwrap().remove(0);
+        assert_eq!(item.stamp, crate::normalize::sha256_hex(b"delta"));
+        assert!(!put_if_current(&c, item.key, "other", "m", &[1.0]).unwrap());
+        assert_eq!(embed_state(&c, item.key), "pending");
+        assert!(!put_if_current(&c, VecKey::Chunk(9_999), &item.stamp, "m", &[1.0]).unwrap());
+        assert!(!put_if_current(&c, VecKey::Memory(9_999), &item.stamp, "m", &[1.0]).unwrap());
+        assert_eq!(embedding_rows(&c), 0);
+        assert!(put_if_current(&c, item.key, &item.stamp, "m", &[1.0]).unwrap());
+        assert_eq!(embed_state(&c, item.key), "done");
+        assert_eq!(embedding_rows(&c), 1);
+    }
+
+    /// Giving up on an item must not bury text that an edit put in its place meanwhile.
+    #[test]
+    fn failure_marks_apply_only_to_the_text_that_failed() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let p = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
+        let m = memories::prepare(
+            memories::NewMemoryInput {
+                content: "flaky text".into(),
+                ..Default::default()
+            },
+            &p,
+            "h".into(),
+        )
+        .unwrap();
+        let memories::InsertOutcome::New { id, .. } = memories::insert(&c, &m).unwrap() else {
+            panic!()
+        };
+        let item = pending(&c, 10).unwrap().remove(0);
+        assert!(mark_failed_if_current(&c, item.key, &item.stamp, true).unwrap());
+        assert_eq!(embed_state(&c, item.key), "retry");
+        memories::apply_update(
+            &c,
+            &id,
+            &memories::MemoryUpdate {
+                body: Some("fixed text".into()),
+                ..Default::default()
+            },
+            "h2".into(),
+        )
+        .unwrap();
+        assert!(!mark_failed_if_current(&c, item.key, &item.stamp, false).unwrap());
+        assert_eq!(
+            embed_state(&c, item.key),
+            "pending",
+            "the edit stays queued"
+        );
+        let again = pending(&c, 10).unwrap().remove(0);
+        assert!(mark_failed_if_current(&c, again.key, &again.stamp, false).unwrap());
+        assert_eq!(embed_state(&c, again.key), "failed");
     }
 
     #[test]
