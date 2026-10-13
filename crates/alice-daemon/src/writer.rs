@@ -345,12 +345,16 @@ fn fatal_reason(e: &AliceError) -> Option<String> {
 }
 
 /// The newest HLC stored (memories and relations), so the clock never starts behind it.
+/// HLC strings sort as text; values not in the `{millis:013}-…` form are skipped, since a
+/// malformed one (say from an import) would otherwise sort above every real HLC.
 fn newest_hlc(conn: &Connection) -> Result<Option<String>> {
-    Ok(conn.query_row(
-        "SELECT max(h) FROM (SELECT max(hlc) AS h FROM memories UNION ALL SELECT max(hlc) FROM relations)",
-        [],
-        |r| r.get(0),
-    )?)
+    const WELL_FORMED: &str =
+        "'[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-*'";
+    let sql = format!(
+        "SELECT max(h) FROM (SELECT max(hlc) AS h FROM memories WHERE hlc GLOB {WELL_FORMED}
+                         UNION ALL SELECT max(hlc) FROM relations WHERE hlc GLOB {WELL_FORMED})"
+    );
+    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
 }
 
 struct BatchResult {
@@ -736,6 +740,24 @@ mod tests {
             .unwrap();
         });
         assert!(hlc > seeded_relation, "{hlc} <= {seeded_relation}");
+
+        // A malformed stored value sorts above every real HLC as text; it must not hide them.
+        let seeded = future_hlc(0, "zz");
+        let hlc = hlc_of_new_memory_after(|c| {
+            for (content, hlc) in [("well formed", seeded.clone()), ("malformed", "h".into())] {
+                let m = memories::prepare(
+                    NewMemoryInput {
+                        content: content.into(),
+                        ..Default::default()
+                    },
+                    &global,
+                    hlc,
+                )
+                .unwrap();
+                memories::insert(c, &m).unwrap();
+            }
+        });
+        assert!(hlc > seeded, "{hlc} <= {seeded}");
     }
 
     fn pending_items(f: &Fixture) -> Vec<embeddings::PendingItem> {

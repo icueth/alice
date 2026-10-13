@@ -481,9 +481,11 @@ mod tests {
     /// One bad text must not fail the rest of its batch.
     #[test]
     fn a_failing_text_does_not_fail_its_batch() {
-        let r = rig(fresh_index(), |e, _, _| e.fail_if = Some("poison"));
+        // No index yet: the worker waits, so both texts end up in the same batch.
+        let r = rig(None, |e, _, _| e.fail_if = Some("poison"));
         let (_, good) = r.remember("perfectly fine text");
         let (_, bad) = r.remember("poison pill");
+        *r.index.write() = fresh_index().map(Arc::new);
         wait_until("the bad item to be given up", || {
             r.read::<String>("SELECT embed_state FROM memories WHERE seq = ?1", [bad]) == "failed"
         });
