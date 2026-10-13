@@ -1,9 +1,11 @@
 //! Detect which project a working directory belongs to.
 //!
-//! A git checkout is keyed by its normalized `origin` remote, so a worktree and its main checkout
-//! are one project. A repository without a remote, or a plain directory, is keyed by its path
-//! (`path:<root>`); a worktree of a repository without a remote therefore gets its own key.
-//! `$HOME`, the filesystem root and directories that no longer exist map to `global`.
+//! A git checkout is keyed by its normalized `origin` remote (after `insteadOf` rewrites), so a
+//! worktree and its main checkout are one project. A repository without a remote is keyed by
+//! the path of its main checkout (`path:<main>`, or the repository directory when it is bare),
+//! which its worktrees share too; `root` is still the checkout actually in use. A plain
+//! directory is keyed by its own path. `$HOME`, the filesystem root and directories that no
+//! longer exist map to `global`.
 
 use crate::normalize::slugify;
 use std::path::{Path, PathBuf};
@@ -101,6 +103,33 @@ fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// The checkout's top-level directory and the repository's common git directory, which a
+/// worktree shares with its main checkout. One git spawn.
+fn git_toplevel_and_common_dir(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let out = git_output(
+        dir,
+        &[
+            "rev-parse",
+            "--show-toplevel",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+    )?;
+    let mut lines = out.lines();
+    let top = PathBuf::from(lines.next()?);
+    let common_dir = PathBuf::from(lines.next()?);
+    Some((top, common_dir))
+}
+
+/// The main checkout every worktree belongs to: the parent of `<main>/.git`, or the
+/// repository directory itself when it is bare.
+fn main_checkout(common_dir: &Path) -> PathBuf {
+    match (common_dir.file_name(), common_dir.parent()) {
+        (Some(name), Some(parent)) if name == ".git" => parent.to_path_buf(),
+        _ => common_dir.to_path_buf(),
+    }
+}
+
 /// Both paths must be canonical (on Windows, `canonicalize` adds a `\\?\` prefix).
 fn is_home_or_root(dir: &Path, home: Option<&Path>) -> bool {
     dir.parent().is_none() || home == Some(dir)
@@ -120,22 +149,25 @@ fn detect_with_home(cwd: &Path, home: Option<&Path>) -> ProjectRef {
     if is_home_or_root(&dir, home) {
         return ProjectRef::global();
     }
-    if let Some(root) = git_output(&dir, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+    if let Some((root, common_dir)) = git_toplevel_and_common_dir(&dir)
         // A repository rooted at $HOME (dotfiles) does not claim every directory below it.
         && !is_home_or_root(&root.canonicalize().unwrap_or_else(|_| root.clone()), home)
     {
-        let remote_raw = git_output(&root, &["config", "--get", "remote.origin.url"]);
+        // `get-url` applies `url.<base>.insteadOf` rewrites; the raw config value does not.
+        let remote_raw = git_output(&root, &["remote", "get-url", "origin"]);
         let remote = remote_raw.as_deref().and_then(normalize_remote);
+        let main = main_checkout(&common_dir);
         let name = match &remote {
             Some(r) => r.rsplit('/').next().unwrap_or(r).to_string(),
-            None => root
+            None => main
                 .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
+                .map(|n| n.to_string_lossy())
+                .map(|n| n.strip_suffix(".git").unwrap_or(&n).to_string())
                 .unwrap_or_default(),
         };
         let key = remote
             .clone()
-            .unwrap_or_else(|| format!("path:{}", root.display()));
+            .unwrap_or_else(|| format!("path:{}", main.display()));
         let slug = slugify(&name);
         if slug.is_empty() {
             return ProjectRef::global();
@@ -280,6 +312,105 @@ mod tests {
         assert!(p.key.starts_with("path:"), "{}", p.key);
         assert_eq!(p.slug, "local-tool");
         assert!(p.remote.is_none());
+    }
+
+    fn commit_empty(dir: &Path) {
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        );
+    }
+
+    fn same_dir(a: &Path, b: &Path) -> bool {
+        a.canonicalize().unwrap() == b.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn worktree_of_repo_without_remote_shares_the_main_checkout_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("Local Tool");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        commit_empty(&main);
+        let wt = tmp.path().join(".worktrees").join("feature-x");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature-x",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let p = detect_project(&main);
+        let w = detect_project(&wt.join("."));
+        assert!(p.key.starts_with("path:"), "{}", p.key);
+        assert_eq!(w.key, p.key);
+        assert_eq!(w.slug, "local-tool");
+        assert_eq!(w.name, p.name);
+        assert!(w.remote.is_none());
+        // `root` stays the checkout actually in use.
+        assert!(same_dir(w.root.as_deref().unwrap(), &wt), "{:?}", w.root);
+        assert!(same_dir(p.root.as_deref().unwrap(), &main), "{:?}", p.root);
+    }
+
+    #[test]
+    fn worktree_of_bare_repo_is_keyed_by_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir(&seed).unwrap();
+        git(&seed, &["init", "-q", "-b", "main"]);
+        commit_empty(&seed);
+        let bare = tmp.path().join("tool.git");
+        let bare_s = bare.to_str().unwrap();
+        git(tmp.path(), &["init", "-q", "--bare", bare_s]);
+        git(&seed, &["push", "-q", bare_s, "main"]);
+        let wt = tmp.path().join("tool-wt");
+        git(
+            &bare,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "b",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        let p = detect_project(&wt);
+        assert!(p.key.starts_with("path:"), "{}", p.key);
+        assert!(p.key.ends_with("tool.git"), "{}", p.key);
+        assert_eq!(p.slug, "tool");
+        assert!(same_dir(p.root.as_deref().unwrap(), &wt), "{:?}", p.root);
+    }
+
+    #[test]
+    fn remote_insteadof_rewrites_are_expanded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("short");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "url.git@github.com:.insteadOf", "gh:"]);
+        git(&repo, &["remote", "add", "origin", "gh:me/Repo.git"]);
+        let p = detect_project(&repo);
+        assert_eq!(p.key, "github.com/me/repo");
+        assert_eq!(p.remote.as_deref(), Some("github.com/me/repo"));
+        assert_eq!(p.slug, "repo");
     }
 
     #[test]
