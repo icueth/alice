@@ -40,12 +40,23 @@ pub struct PendingItem {
     pub text: String,
 }
 
+// `embed_state <> 'done'` repeats the WHERE term of the partial indexes `memories_embed` and
+// `chunks_embed`; SQLite uses a partial index only when the query contains that term literally.
+const PENDING_MEMORIES_SQL: &str = "SELECT seq, title, body FROM memories
+     WHERE embed_state <> 'done' AND embed_state IN ('pending','retry') AND status <> 'trashed'
+     ORDER BY seq LIMIT ?1";
+const PENDING_CHUNKS_SQL: &str = "SELECT seq, text FROM chunks
+     WHERE embed_state <> 'done' AND embed_state IN ('pending','retry')
+     ORDER BY seq LIMIT ?1";
+const BACKLOG_SQL: &str = "SELECT
+       (SELECT count(*) FROM memories
+         WHERE embed_state <> 'done' AND embed_state IN ('pending','retry') AND status <> 'trashed')
+     + (SELECT count(*) FROM chunks WHERE embed_state <> 'done' AND embed_state IN ('pending','retry'))";
+
 /// Up to `limit` items waiting for embeddings: memories first (they are what agents search), then chunks.
 pub fn pending(conn: &Connection, limit: usize) -> Result<Vec<PendingItem>> {
     let mut out = Vec::new();
-    let mut stmt = conn.prepare_cached(
-        "SELECT seq, title, body FROM memories WHERE embed_state IN ('pending','retry') AND status <> 'trashed' ORDER BY seq LIMIT ?1",
-    )?;
+    let mut stmt = conn.prepare_cached(PENDING_MEMORIES_SQL)?;
     let rows = stmt.query_map([limit as i64], |r| {
         Ok(PendingItem {
             key: VecKey::Memory(r.get(0)?),
@@ -56,9 +67,7 @@ pub fn pending(conn: &Connection, limit: usize) -> Result<Vec<PendingItem>> {
         out.push(r?);
     }
     if out.len() < limit {
-        let mut stmt = conn.prepare_cached(
-            "SELECT seq, text FROM chunks WHERE embed_state IN ('pending','retry') ORDER BY seq LIMIT ?1",
-        )?;
+        let mut stmt = conn.prepare_cached(PENDING_CHUNKS_SQL)?;
         let rows = stmt.query_map([(limit - out.len()) as i64], |r| {
             Ok(PendingItem {
                 key: VecKey::Chunk(r.get(0)?),
@@ -114,12 +123,7 @@ pub fn count(conn: &Connection, model: &str) -> Result<usize> {
 }
 
 pub fn backlog(conn: &Connection) -> Result<usize> {
-    let n: i64 = conn.query_row(
-        "SELECT (SELECT count(*) FROM memories WHERE embed_state IN ('pending','retry') AND status <> 'trashed')
-              + (SELECT count(*) FROM chunks WHERE embed_state IN ('pending','retry'))",
-        [],
-        |r| r.get(0),
-    )?;
+    let n: i64 = conn.query_row(BACKLOG_SQL, [], |r| r.get(0))?;
     Ok(n as usize)
 }
 
@@ -296,6 +300,35 @@ mod tests {
                 (VecKey::Memory(7), vec![1.0]),
                 (VecKey::Chunk(7), vec![0.0, 0.5, 0.25])
             ]
+        );
+    }
+
+    /// The queue queries must use the partial indexes `memories_embed` / `chunks_embed`
+    /// (`WHERE embed_state <> 'done'`); SQLite only does so when the query repeats that term.
+    #[test]
+    fn queue_queries_use_the_partial_embed_indexes() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let plan = |sql: &str| -> String {
+            let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let n = stmt.parameter_count();
+            let params: Vec<i64> = vec![10; n];
+            stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ")
+        };
+        let m = plan(PENDING_MEMORIES_SQL);
+        assert!(m.contains("USING INDEX memories_embed"), "{m}");
+        let ch = plan(PENDING_CHUNKS_SQL);
+        assert!(ch.contains("USING INDEX chunks_embed"), "{ch}");
+        let b = plan(BACKLOG_SQL);
+        assert!(
+            b.contains("memories_embed") && b.contains("chunks_embed"),
+            "{b}"
         );
     }
 }

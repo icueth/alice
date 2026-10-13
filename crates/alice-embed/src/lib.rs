@@ -6,6 +6,7 @@ use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const MODEL_ID: &str = "multilingual-e5-small-q8";
 pub const DIM: usize = 384;
@@ -88,6 +89,18 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
+/// Network limits for model downloads, so a stalled connection fails instead of hanging start-up.
+#[derive(Debug, Clone, Copy)]
+struct Timeouts {
+    connect: Duration,
+    read: Duration,
+}
+
+const TIMEOUTS: Timeouts = Timeouts {
+    connect: Duration::from_secs(30),
+    read: Duration::from_secs(60),
+};
+
 /// Download missing or damaged model files. `progress(file, bytes_done, bytes_total)` is called while downloading.
 /// `HF_ENDPOINT`, if set, replaces `https://huggingface.co` (a mirror serving the same pinned revision).
 pub async fn fetch_model(
@@ -96,20 +109,61 @@ pub async fn fetch_model(
 ) -> Result<()> {
     install_tls_provider();
     let endpoint = std::env::var("HF_ENDPOINT").ok();
-    fetch_files(&model_dir(models_dir), endpoint.as_deref(), FILES, progress).await
+    fetch_files(
+        &model_dir(models_dir),
+        endpoint.as_deref(),
+        FILES,
+        TIMEOUTS,
+        progress,
+    )
+    .await
 }
 
-/// Fetches each file that is missing or fails its checksum into `dir`. A download goes to `<name>.part`
-/// and is renamed into place only after its size and SHA-256 match; a failed download leaves nothing behind.
+/// Lock file in the model directory, held for a whole fetch so concurrent fetches run one after another.
+const LOCK_FILE: &str = ".fetch.lock";
+
+/// Waits for the exclusive fetch lock on `dir` without blocking the async runtime.
+/// The lock is released when the returned file is dropped.
+async fn lock_dir(dir: &Path) -> Result<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK_FILE))?;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
+}
+
+/// Fetches each file that is missing or fails its checksum into `dir`. Holds the directory's fetch lock
+/// throughout, so a second fetch waits and then finds the files valid. Each download goes to a temp file
+/// unique to this call and is renamed into place only after its size and SHA-256 match; a failed download
+/// leaves nothing behind.
 async fn fetch_files(
     dir: &Path,
     endpoint: Option<&str>,
     files: &[(&str, &str, u64, &str)],
+    timeouts: Timeouts,
     progress: &(dyn Fn(&str, u64, u64) + Sync),
 ) -> Result<()> {
     std::fs::create_dir_all(dir)?;
+    let _lock = lock_dir(dir).await?;
+    // Under the lock no other fetch is writing, so any temp file is left over from a crashed run.
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".part") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
     let client = reqwest::Client::builder()
         .user_agent(concat!("alice/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
         .build()
         .map_err(|e| AliceError::Other(format!("http client: {e}")))?;
     for (remote, name, size, sha) in files {
@@ -117,7 +171,11 @@ async fn fetch_files(
         if dest.exists() && sha256_file(&dest)? == *sha {
             continue;
         }
-        let part = dir.join(format!("{name}.part"));
+        let part = dir.join(format!(
+            "{name}.{}-{}.part",
+            std::process::id(),
+            alice_core::ids::new_id()
+        ));
         let url = file_url(endpoint, remote);
         if let Err(e) = download(&client, &url, &part, name, *size, sha, progress).await {
             let _ = std::fs::remove_file(&part);
@@ -126,6 +184,24 @@ async fn fetch_files(
         std::fs::rename(&part, &dest)?;
     }
     Ok(())
+}
+
+/// Error for a failed request or body read, with the whole cause chain (reqwest's own text omits it,
+/// e.g. "operation timed out") and what to do next.
+fn network_error(name: &str, e: &reqwest::Error) -> AliceError {
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !msg.contains(&text) {
+            msg.push_str(": ");
+            msg.push_str(&text);
+        }
+        source = cause.source();
+    }
+    AliceError::Other(format!(
+        "downloading {name} failed: {msg}. Check the network or set HF_ENDPOINT to a mirror, then run \"alice model fetch\" again"
+    ))
 }
 
 async fn download(
@@ -142,18 +218,13 @@ async fn download(
         .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| {
-            AliceError::Other(format!(
-                "downloading {name} failed: {e}. Check the network or set HF_ENDPOINT to a mirror"
-            ))
-        })?;
+        .map_err(|e| network_error(name, &e))?;
     let mut file = std::fs::File::create(part)?;
     let mut hasher = Sha256::new();
     let mut done = 0u64;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| AliceError::Other(format!("downloading {name} failed: {e}")))?;
+        let chunk = chunk.map_err(|e| network_error(name, &e))?;
         done += chunk.len() as u64;
         if done > size {
             return Err(AliceError::Other(format!(
@@ -310,95 +381,173 @@ mod tests {
         assert!(file_url(Some("  "), "config.json").starts_with("https://huggingface.co/"));
     }
 
-    /// Minimal HTTP/1.1 server: answers each request whose path ends with a route's suffix with its body,
-    /// anything else with 404. Returns the base URL and a request counter.
-    async fn serve(
-        routes: Vec<(&'static str, &'static [u8])>,
-    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    const TEST_TIMEOUTS: Timeouts = Timeouts {
+        connect: Duration::from_secs(2),
+        read: Duration::from_millis(300),
+    };
+
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// The whole body at once.
+        Body(&'static [u8]),
+        /// The body in four pieces, 50 ms apart.
+        Slow(&'static [u8]),
+        /// Headers announcing the whole body, half of it, then silence.
+        StallBody(&'static [u8]),
+        /// Reads the request and never answers.
+        StallHead,
+    }
+
+    struct Server {
+        base: String,
+        paths: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Server {
+        fn hits(&self, suffix: &str) -> usize {
+            let paths = self.paths.lock().unwrap();
+            paths.iter().filter(|p| p.ends_with(suffix)).count()
+        }
+        fn total(&self) -> usize {
+            self.paths.lock().unwrap().len()
+        }
+    }
+
+    /// Minimal HTTP/1.1 server: answers a request whose path ends with a route's suffix as that route says,
+    /// anything else with 404. Records every requested path.
+    async fn serve(routes: Vec<(&'static str, Reply)>) -> Server {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let hits = std::sync::Arc::new(AtomicUsize::new(0));
-        let counter = hits.clone();
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = paths.clone();
+        let routes = std::sync::Arc::new(routes);
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                counter.fetch_add(1, Ordering::SeqCst);
-                let mut head = Vec::new();
-                let mut buf = [0u8; 1024];
-                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                let (log, routes) = (log.clone(), routes.clone());
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
                     }
-                }
-                let head = String::from_utf8_lossy(&head);
-                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
-                let reply = match routes.iter().find(|(p, _)| path.ends_with(p)) {
-                    Some((_, body)) => {
-                        let mut r = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
+                    let head = String::from_utf8_lossy(&head);
+                    let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                    log.lock().unwrap().push(path.clone());
+                    let ok = |len: usize| {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
                         )
-                        .into_bytes();
-                        r.extend_from_slice(body);
-                        r
+                        .into_bytes()
+                    };
+                    let stall = Duration::from_secs(60);
+                    match routes
+                        .iter()
+                        .find(|(p, _)| path.ends_with(p))
+                        .map(|(_, r)| *r)
+                    {
+                        Some(Reply::Body(b)) => {
+                            let _ = sock.write_all(&[ok(b.len()), b.to_vec()].concat()).await;
+                        }
+                        Some(Reply::Slow(b)) => {
+                            let _ = sock.write_all(&ok(b.len())).await;
+                            for piece in b.chunks(b.len().div_ceil(4).max(1)) {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                let _ = sock.write_all(piece).await;
+                            }
+                        }
+                        Some(Reply::StallBody(b)) => {
+                            let _ = sock
+                                .write_all(&[ok(b.len()), b[..b.len() / 2].to_vec()].concat())
+                                .await;
+                            tokio::time::sleep(stall).await;
+                        }
+                        Some(Reply::StallHead) => tokio::time::sleep(stall).await,
+                        None => {
+                            let _ = sock
+                                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await;
+                        }
                     }
-                    None => {
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                            .to_vec()
-                    }
-                };
-                let _ = sock.write_all(&reply).await;
-                let _ = sock.shutdown().await;
+                    let _ = sock.shutdown().await;
+                });
             }
         });
-        (base, hits)
+        Server { base, paths }
     }
 
     fn sha_hex(b: &[u8]) -> String {
         hex::encode(Sha256::digest(b))
     }
 
+    /// Files a fetch left in `dir`, other than installed ones and the lock file.
+    fn leftovers(dir: &Path, installed: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != ".fetch.lock" && !installed.contains(&n.as_str()))
+            .collect();
+        names.sort();
+        names
+    }
+
     #[tokio::test]
     async fn fetch_verifies_each_file_and_skips_files_already_valid() {
         install_tls_provider();
-        let (base, hits) = serve(vec![("/a.json", b"hello"), ("/b.json", b"world!")]).await;
+        let s = serve(vec![
+            ("/a.json", Reply::Body(b"hello")),
+            ("/b.json", Reply::Body(b"world!")),
+        ])
+        .await;
         let d = tempfile::tempdir().unwrap();
         let (sa, sb) = (sha_hex(b"hello"), sha_hex(b"world!"));
         let files = [
             ("a.json", "a.json", 5, sa.as_str()),
             ("sub/b.json", "b.json", 6, sb.as_str()),
         ];
+        std::fs::write(d.path().join("a.json.1-CRASHED.part"), b"he").unwrap();
         let seen = std::sync::Mutex::new(Vec::new());
         let progress = |f: &str, done: u64, total: u64| {
             seen.lock().unwrap().push((f.to_string(), done, total));
         };
-        fetch_files(d.path(), Some(&base), &files, &progress)
+        fetch_files(d.path(), Some(&s.base), &files, TEST_TIMEOUTS, &progress)
             .await
             .unwrap();
         assert_eq!(std::fs::read(d.path().join("a.json")).unwrap(), b"hello");
         assert_eq!(std::fs::read(d.path().join("b.json")).unwrap(), b"world!");
-        assert!(!d.path().join("a.json.part").exists());
+        assert_eq!(
+            leftovers(d.path(), &["a.json", "b.json"]),
+            Vec::<String>::new(),
+            "a temp file left by a crashed fetch is removed"
+        );
         let seen = seen.into_inner().unwrap();
         assert_eq!(seen.last(), Some(&("b.json".to_string(), 6, 6)));
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(s.total(), 2);
 
         // A damaged file is fetched again; a valid one is not.
         std::fs::write(d.path().join("b.json"), b"worle!").unwrap();
-        fetch_files(d.path(), Some(&base), &files, &|_, _, _| {})
-            .await
-            .unwrap();
+        fetch_files(
+            d.path(),
+            Some(&s.base),
+            &files,
+            TEST_TIMEOUTS,
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read(d.path().join("b.json")).unwrap(), b"world!");
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(s.total(), 3);
     }
 
     #[tokio::test]
     async fn fetch_rejects_wrong_or_oversized_files_and_leaves_nothing_behind() {
         install_tls_provider();
-        let (base, _) = serve(vec![
-            ("/wrong.json", b"hellx"),
-            ("/big.json", b"hello world"),
+        let s = serve(vec![
+            ("/wrong.json", Reply::Body(b"hellx")),
+            ("/big.json", Reply::Body(b"hello world")),
         ])
         .await;
         let sha = sha_hex(b"hello");
@@ -410,13 +559,81 @@ mod tests {
         for (name, want) in cases {
             let d = tempfile::tempdir().unwrap();
             let files = [(name, name, 5, sha.as_str())];
-            let err = fetch_files(d.path(), Some(&base), &files, &|_, _, _| {})
+            let err = fetch_files(
+                d.path(),
+                Some(&s.base),
+                &files,
+                TEST_TIMEOUTS,
+                &|_, _, _| {},
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(want), "{name}: {err}");
+            assert_eq!(leftovers(d.path(), &[]), Vec::<String>::new(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_fetches_download_each_file_once_and_install_it_intact() {
+        install_tls_provider();
+        let (a, b): (&[u8], &[u8]) = (b"alpha alpha alpha alpha", b"beta beta beta beta beta");
+        let s = serve(vec![("/a.bin", Reply::Slow(a)), ("/b.bin", Reply::Slow(b))]).await;
+        let d = tempfile::tempdir().unwrap();
+        let (sa, sb) = (sha_hex(a), sha_hex(b));
+        let files = [
+            ("a.bin", "a.bin", a.len() as u64, sa.as_str()),
+            ("b.bin", "b.bin", b.len() as u64, sb.as_str()),
+        ];
+        let none = |_: &str, _: u64, _: u64| {};
+        let (r1, r2) = tokio::join!(
+            fetch_files(d.path(), Some(&s.base), &files, TEST_TIMEOUTS, &none),
+            fetch_files(d.path(), Some(&s.base), &files, TEST_TIMEOUTS, &none),
+        );
+        r1.unwrap();
+        r2.unwrap();
+        assert_eq!(sha_hex(&std::fs::read(d.path().join("a.bin")).unwrap()), sa);
+        assert_eq!(sha_hex(&std::fs::read(d.path().join("b.bin")).unwrap()), sb);
+        assert_eq!(
+            (s.hits("/a.bin"), s.hits("/b.bin")),
+            (1, 1),
+            "the second fetch waits, then skips"
+        );
+        assert_eq!(
+            leftovers(d.path(), &["a.bin", "b.bin"]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_download_times_out_with_a_next_step_and_leaves_nothing_behind() {
+        install_tls_provider();
+        let body: &[u8] = b"0123456789";
+        let s = serve(vec![
+            ("/stall-body.json", Reply::StallBody(body)),
+            ("/stall-head.json", Reply::StallHead),
+        ])
+        .await;
+        let sha = sha_hex(body);
+        for name in ["stall-body.json", "stall-head.json"] {
+            let d = tempfile::tempdir().unwrap();
+            let files = [(name, name, body.len() as u64, sha.as_str())];
+            let fetch = fetch_files(
+                d.path(),
+                Some(&s.base),
+                &files,
+                TEST_TIMEOUTS,
+                &|_, _, _| {},
+            );
+            let err = tokio::time::timeout(Duration::from_secs(10), fetch)
                 .await
+                .unwrap_or_else(|_| panic!("{name}: the fetch hung on a stalled connection"))
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains(want), "{name}: {err}");
-            let left: Vec<_> = std::fs::read_dir(d.path()).unwrap().collect();
-            assert!(left.is_empty(), "{name} left files behind: {left:?}");
+            assert!(err.contains(name), "{err}");
+            assert!(err.contains("timed out"), "{err}");
+            assert!(err.contains("Check the network"), "{err}");
+            assert_eq!(leftovers(d.path(), &[]), Vec::<String>::new(), "{name}");
         }
     }
 
