@@ -1,5 +1,6 @@
 //! `alice daemon run`: single instance, token, discovery file, HTTP server, spool drain, clean shutdown.
 
+use crate::config::SettingsHandle;
 use crate::discovery::{DaemonInfo, load_or_create_token, read_info, remove_info_if, write_info};
 use crate::paths::AliceHome;
 use crate::service::{Service, ServiceOptions};
@@ -29,13 +30,9 @@ const GRACE: Duration = Duration::from_secs(2);
 const DRAIN_EVERY: Duration = Duration::from_secs(5);
 /// Download progress is written to daemon.starting at most this often.
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(1);
-/// The local model is unloaded after this long unused (queries meanwhile use word matches
-/// while it reloads; the embedding worker waits for it).
-const MODEL_IDLE_UNLOAD: Duration = Duration::from_secs(600);
-
 #[derive(Debug, Clone, Default)]
 pub struct DaemonOptions {
-    /// 0 = pick a free port.
+    /// 0 = the `server.port` setting (itself 0 = pick a free port).
     pub port: u16,
     /// Tests and CI: deterministic embeddings, no model download (`ALICE_EMBEDDER=fake`).
     pub fake_embedder: bool,
@@ -184,6 +181,17 @@ fn start_and_serve(
         home,
         &startup::StartProgress::step("opening the database and loading the embedding model"),
     );
+    // The settings come first: the model's idle unload and the port are read from them.
+    let settings = SettingsHandle::load(home);
+    let started = settings.get();
+    // Queries meanwhile use word matches while the model reloads; the embedding worker waits.
+    // `embedding.idle_unload = 0` keeps the model loaded.
+    let idle_unload = Some(started.embedding.idle_unload.0).filter(|d| !d.is_zero());
+    let port = if opts.port != 0 {
+        opts.port
+    } else {
+        started.server.port
+    };
     let fake = opts.fake_embedder;
     let make = move || -> alice_core::Result<Arc<dyn Embedder>> {
         if fake {
@@ -192,18 +200,24 @@ fn start_and_serve(
             Ok(Arc::new(alice_embed::OnnxEmbedder::new(
                 &models,
                 alice_embed::OnnxOptions {
-                    // Task 6 reads this from `embedding.idle_unload`.
-                    idle_unload: Some(MODEL_IDLE_UNLOAD),
+                    idle_unload,
                     intra_threads: None,
                 },
             )?))
         }
     };
-    let svc = Service::start(home.clone(), &make, ServiceOptions::default())
-        .map_err(|e| start_error(home, e))?;
+    let svc = Service::start(
+        home.clone(),
+        &make,
+        ServiceOptions {
+            settings: Some(settings),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| start_error(home, e))?;
 
     let ct = CancellationToken::new();
-    let served = runtime.block_on(serve(home, &svc, token, opts.port, ct.clone(), published));
+    let served = runtime.block_on(serve(home, &svc, token, port, ct.clone(), published));
     ct.cancel();
     // Drop whatever still runs (a request past the grace period, a drain in progress) so that
     // nothing reaches the writer after it stops; such a client sees a closed connection and

@@ -46,15 +46,7 @@ pub const SETTINGS_POLL: Duration = Duration::from_secs(2);
 /// moment.
 const SETTLE: Duration = Duration::from_millis(30);
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
-pub struct PatchOutcome {
-    /// Keys whose effective value changed.
-    pub changed: Vec<String>,
-    /// Keys written that apply only after a daemon restart.
-    pub restart_required: Vec<String>,
-    /// Keys written to config.toml but overridden by an environment variable.
-    pub overridden_by_env: Vec<String>,
-}
+pub use alice_core::api::PatchOutcome;
 
 fn err(key: &str, message: String) -> SettingError {
     SettingError {
@@ -260,7 +252,7 @@ fn effective(file: &Path, env: &[(String, String)]) -> Effective {
     }
 }
 
-fn changed_keys(a: &Settings, b: &Settings) -> Vec<String> {
+pub(crate) fn changed_keys(a: &Settings, b: &Settings) -> Vec<String> {
     let a = settings::leaves(&serde_json::to_value(a).expect("settings serialise"));
     let b: std::collections::BTreeMap<_, _> =
         settings::leaves(&serde_json::to_value(b).expect("settings serialise"))
@@ -270,6 +262,36 @@ fn changed_keys(a: &Settings, b: &Settings) -> Vec<String> {
         .filter(|(k, v)| b.get(k) != Some(v))
         .map(|(k, _)| k)
         .collect()
+}
+
+/// The settings-change loop: `on_change(changed keys)` for every change that took effect.
+/// After missed notifications (`Lagged`) it diffs the current settings against the last ones it
+/// saw: it never stops on a lag, only when the channel closes.
+pub(crate) fn follow_settings(
+    mut rx: tokio::sync::broadcast::Receiver<Vec<String>>,
+    start: Arc<Settings>,
+    current: impl Fn() -> Arc<Settings>,
+    mut on_change: impl FnMut(Vec<String>),
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    let mut last = start;
+    loop {
+        let changed = match rx.blocking_recv() {
+            Ok(changed) => changed,
+            Err(RecvError::Lagged(missed)) => {
+                tracing::warn!(
+                    missed,
+                    "settings notifications lagged; re-reading the current settings"
+                );
+                changed_keys(&last, &current())
+            }
+            Err(RecvError::Closed) => break,
+        };
+        last = current();
+        if !changed.is_empty() {
+            on_change(changed);
+        }
+    }
 }
 
 /// Where a write of `path` goes: through a symlink to its target (a config file kept in a
@@ -440,8 +462,9 @@ impl SettingsHandle {
     }
 
     /// [`cloud_allowed`](Self::cloud_allowed) over a project cache of the caller's (tests with
-    /// a clock of their own).
-    pub fn cloud_allowed_with(
+    /// a clock of their own). Not public: a caller with a cache of its own would have a gate of
+    /// its own, and a repository would be looked at twice.
+    pub(crate) fn cloud_allowed_with(
         &self,
         project_slug: &str,
         project_root: Option<&Path>,
@@ -453,6 +476,12 @@ impl SettingsHandle {
         let project = project_root.map(|root| projects.get(root).settings);
         let effective = project.unwrap_or_default().apply_to(&self.get().privacy);
         !effective.is_cloud_denied(project_slug)
+    }
+
+    /// A loosening in `config.toml` (a protection switched off, say) was read and is waiting to
+    /// be read the same on three polls in a row before it applies; the settings view says so.
+    pub fn loosening_waiting(&self) -> bool {
+        self.gate.lock().is_pending()
     }
 
     /// Ignored `ALICE_*` variables (reported in health and `alice config list`).
@@ -599,7 +628,8 @@ impl SettingsHandle {
         })
     }
 
-    /// Poll `config.toml` every `every` until `stop` is set.
+    /// Poll `config.toml` every `every` (the first look is one interval after the start) until
+    /// `stop` is set.
     pub fn spawn_watcher(
         self: &Arc<Self>,
         every: Duration,
@@ -609,13 +639,17 @@ impl SettingsHandle {
         std::thread::Builder::new()
             .name("alice-config".into())
             .spawn(move || {
+                // Wait first: the file was read when the handle loaded.
                 while !stop.load(Ordering::Relaxed) {
-                    if let Some(changed) = me.reload_if_changed() {
-                        tracing::info!(?changed, "settings reloaded from config.toml");
-                    }
                     let until = std::time::Instant::now() + every;
                     while std::time::Instant::now() < until && !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(every.min(Duration::from_millis(50)));
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(changed) = me.reload_if_changed() {
+                        tracing::info!(?changed, "settings reloaded from config.toml");
                     }
                 }
             })
@@ -1301,5 +1335,76 @@ mod tests {
         for _ in 0..50 {
             assert!(!s.cloud_allowed("p", Some(repo.path())));
         }
+    }
+
+    // ------------------------------------------------------------ Task 6
+
+    /// A slug with stray whitespace is still the project the denylist names.
+    #[test]
+    fn cloud_allowed_trims_the_slug() {
+        let (_d, h) = home();
+        write(&h, "[privacy]\ncloud_denied_projects = [\"client-x\"]\n");
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert!(!s.cloud_allowed("client-x", None));
+        assert!(!s.cloud_allowed(" client-x\n", None));
+        assert!(s.cloud_allowed("client-y", None));
+    }
+
+    /// The settings loop re-reads after a lag and ends only when the channel closes.
+    #[test]
+    fn the_settings_loop_rereads_after_a_lag_and_ends_only_on_close() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<Vec<String>>(1);
+        let mut now = Settings::default();
+        now.judge.review_threshold = 0.6;
+        let now = Arc::new(now);
+        for k in ["a", "b", "c"] {
+            tx.send(vec![k.to_string()]).unwrap(); // capacity 1: the loop starts lagged
+        }
+        drop(tx);
+        let mut seen = Vec::new();
+        follow_settings(
+            rx,
+            Arc::new(Settings::default()),
+            || now.clone(),
+            |c| seen.push(c),
+        );
+        assert_eq!(
+            seen,
+            vec![
+                vec!["judge.review_threshold".to_string()],
+                vec!["c".to_string()]
+            ]
+        );
+    }
+
+    /// A loosening in config.toml waits for three polls; until then the handle says so.
+    #[test]
+    fn a_waiting_loosening_is_visible_until_it_applies() {
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert!(!s.loosening_waiting());
+        write(&h, "[privacy]\nredact = false\n");
+        assert!(s.reload_if_changed().is_none());
+        assert!(s.loosening_waiting());
+        assert!(s.reload_if_changed().is_none());
+        assert!(s.loosening_waiting());
+        assert!(s.get().privacy.redact, "still on");
+        assert!(s.reload_if_changed().is_some(), "the third poll applies it");
+        assert!(!s.loosening_waiting());
+        assert!(!s.get().privacy.redact);
+        // A second loosening that goes back to what is in force before its third poll is gone.
+        write(&h, "[privacy]\nredact = true\n");
+        assert!(
+            s.reload_if_changed().is_some(),
+            "a tightening applies at once"
+        );
+        write(&h, "[privacy]\nredact = false\n");
+        assert!(s.reload_if_changed().is_none() && s.loosening_waiting());
+        write(&h, "[privacy]\nredact = true\n");
+        assert!(
+            s.reload_if_changed().is_none(),
+            "back to what is in force: nothing to apply"
+        );
+        assert!(!s.loosening_waiting());
     }
 }

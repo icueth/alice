@@ -45,26 +45,7 @@ impl SecretName {
     }
 }
 
-/// What the API shows about a secret: whether it is set, a hint, and where it comes from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SecretStatus {
-    pub set: bool,
-    /// The last four characters, e.g. `••••ab12`, for a value of 16 characters or more; `set`
-    /// for a shorter one (four characters are too much of it).
-    pub hint: Option<String>,
-    /// `file`, `keychain` or `env`.
-    pub source: Option<String>,
-}
-
-impl SecretStatus {
-    fn unset() -> Self {
-        Self {
-            set: false,
-            hint: None,
-            source: None,
-        }
-    }
-}
+pub use alice_core::api::SecretStatus;
 
 pub trait SecretStore: Send + Sync {
     fn get(&self, name: SecretName) -> Result<Option<SecretValue>>;

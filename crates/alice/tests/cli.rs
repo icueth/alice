@@ -41,7 +41,10 @@ impl Env {
             .env("ALICE_HOME", &self.home)
             .env("ALICE_EMBEDDER", "fake")
             .env("ALICE_LOG", "warn")
-            .env_remove("ALICE_AGENT");
+            .env_remove("ALICE_AGENT")
+            // A developer's own keys must not change what a test sees (or reach its daemon).
+            .env_remove("TYPESAFE_API_KEY")
+            .env_remove("ALICE_EMBEDDING_API_KEY");
         c
     }
 
@@ -1202,5 +1205,154 @@ fn bench_refuses_a_dir_that_is_not_bench_data_or_is_in_use() {
     assert!(
         bench(&kept).status.success(),
         "free again once the lock is released"
+    );
+}
+
+// ------------------------------------------------------------------ Task 6: alice config
+
+#[test]
+fn config_set_get_secret_and_live_reload() {
+    let env = Env::new();
+    env.ok(&["remember", "seed"]);
+    env.ok(&["config", "set", "judge.review_threshold", "0.6"]);
+    assert_eq!(
+        env.json(&["config", "get", "judge.review_threshold"]),
+        serde_json::json!(0.6)
+    );
+    let bad = env.run(&["config", "set", "judge.review_threshold", "0.99"]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("judge.review_threshold"));
+    let key = concat!("sk-cli-", "secret-98765");
+    let out = env.run_with_stdin(
+        &["config", "set-secret", "embedding_api_key"],
+        &format!("{key}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let list = env.ok(&["config", "list"]);
+    assert!(
+        list.contains("embedding_api_key: set ••••8765") && !list.contains("sk-cli-secret"),
+        "{list}"
+    );
+    // A direct edit of config.toml applies without a restart.
+    std::fs::write(env.home.join("config.toml"), "[mcp]\nadmin_tools = true\n").unwrap();
+    eventually(
+        || env.json(&["config", "get", "mcp.admin_tools"]) == serde_json::json!(true),
+        "live reload",
+    );
+    let log = env.log();
+    assert!(
+        !log.contains("sk-cli-secret"),
+        "the secret never reaches the log"
+    );
+}
+
+/// `list` shows every key with its source, the problems, what waits for a restart and the
+/// secrets; `unset` takes a key out of config.toml; the secret is deleted on request.
+#[test]
+fn config_list_unset_delete_secret_and_the_problems_shown() {
+    let env = Env::new();
+    env.ok(&["remember", "seed"]);
+    env.ok(&["config", "set", "search.relevance_floor", "0.7"]);
+    env.ok(&["config", "set", "embedding.idle_unload", "5m"]);
+    let list = env.ok(&["config", "list"]);
+    assert!(
+        list.contains("search.relevance_floor = 0.7 (config.toml)"),
+        "{list}"
+    );
+    assert!(
+        list.contains("judge.provider = \"heuristic\"")
+            || list.contains("judge.provider = heuristic"),
+        "{list}"
+    );
+    assert!(list.contains("RESTART embedding.idle_unload"), "{list}");
+    assert!(list.contains("secret jev_api_key: not set"), "{list}");
+    // Unset: back to the default, and gone from the file.
+    let out = env.ok(&["config", "unset", "search.relevance_floor"]);
+    assert!(out.contains("applied"), "{out}");
+    assert!(
+        !std::fs::read_to_string(env.home.join("config.toml"))
+            .unwrap()
+            .contains("relevance_floor")
+    );
+    assert_eq!(
+        env.json(&["config", "get", "search.relevance_floor"]),
+        serde_json::json!(0.82)
+    );
+    let missing = env.run(&["config", "get", "no.such.key"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("alice config list"));
+    // A broken edit: the previous value stays, and `list` shows the problem.
+    std::fs::write(
+        env.home.join("config.toml"),
+        "[judge]\nreview_threshold = 0.9\nauto_apply_threshold = 0.6\n",
+    )
+    .unwrap();
+    eventually(
+        || {
+            env.ok(&["config", "list"])
+                .contains("PROBLEM judge.review_threshold")
+        },
+        "the problem in the list",
+    );
+    assert_eq!(
+        env.json(&["config", "get", "judge.review_threshold"]),
+        serde_json::json!(0.5)
+    );
+    // Secrets: set from stdin, deleted on request.
+    let key = concat!("tp_cli-", "secret-abcdefgh1234");
+    let out = env.run_with_stdin(
+        &["config", "set-secret", "jev_api_key"],
+        &format!("{key}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("cli-secret"));
+    let del = env.ok(&["config", "delete-secret", "jev_api_key"]);
+    assert!(del.contains("deleted"), "{del}");
+    let again = env.ok(&["config", "delete-secret", "jev_api_key"]);
+    assert!(again.contains("was not set"), "{again}");
+    assert!(
+        !env.run(&["config", "set-secret", "github"])
+            .status
+            .success()
+    );
+    assert!(!env.run(&["config", "test", "dropbox"]).status.success());
+    assert!(env.ok(&["config", "test", "embedding"]).starts_with("OK"));
+}
+
+/// A variable that is not a setting is ignored with a warning in `alice status` and
+/// `alice config list`; it never sends the other settings back to their defaults.
+#[test]
+fn an_ignored_variable_is_a_warning_and_changes_nothing_else() {
+    let env = Env::new();
+    std::fs::write(
+        env.home.join("config.toml"),
+        "[judge]\nreview_threshold = 0.6\n",
+    )
+    .unwrap();
+    let out = env
+        .cmd(&["remember", "seed"])
+        .env("ALICE_JUDGE_REVIEW_TRESHOLD", "0.7")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let status = env.ok(&["status"]);
+    assert!(
+        status.contains("warning:") && status.contains("ALICE_JUDGE_REVIEW_TRESHOLD"),
+        "{status}"
+    );
+    let list = env.ok(&["config", "list"]);
+    assert!(list.contains("ALICE_JUDGE_REVIEW_TRESHOLD"), "{list}");
+    assert_eq!(
+        env.json(&["config", "get", "judge.review_threshold"]),
+        serde_json::json!(0.6),
+        "the file still applies"
     );
 }

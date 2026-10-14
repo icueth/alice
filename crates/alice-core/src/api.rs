@@ -2,10 +2,12 @@
 
 use crate::kg_types::*;
 use crate::model::{Author, Kind, Memory, Status};
+use crate::settings::{KeyInfo, SettingError, Source};
 use crate::store::memories::MemoryUpdate;
 use crate::store::sources::{ChunkInput, SourceInput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub use crate::store::events::{EventQuery as EventsRequest, EventRow};
 
@@ -289,6 +291,115 @@ pub struct Health {
     pub read_only: Option<String>,
     /// False while the vector index is being rebuilt (search is lexical-only meanwhile).
     pub index_ready: bool,
+    /// `ALICE_*` variables that are not settings (a typo, say) and were ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings_warnings: Vec<String>,
+    /// Settings that are not in effect because they are invalid: a bad edit of `config.toml`
+    /// (the previous settings stay), a bad value in a variable (the file still applies). The
+    /// same list as `/api/v1/settings` (`errors`) and `alice config list`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings_errors: Vec<SettingError>,
+    /// No valid `config.toml` has loaded since the daemon started, so the settings in force may
+    /// be missing a privacy setting; cloud providers are off meanwhile.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub config_degraded: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// What the API shows about a secret: whether it is set, a hint, and where it comes from. The
+/// value itself is never part of an answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretStatus {
+    pub set: bool,
+    /// The last four characters, e.g. `••••ab12`, for a value of 16 characters or more; `set`
+    /// for a shorter one (four characters are too much of it).
+    pub hint: Option<String>,
+    /// `file`, `keychain` or `env`.
+    pub source: Option<String>,
+}
+
+impl SecretStatus {
+    /// A secret that is not set.
+    pub fn unset() -> Self {
+        Self {
+            set: false,
+            hint: None,
+            source: None,
+        }
+    }
+}
+
+/// What a settings change did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PatchOutcome {
+    /// Keys whose effective value changed.
+    pub changed: Vec<String>,
+    /// Keys written that apply only after a daemon restart.
+    pub restart_required: Vec<String>,
+    /// Keys written to config.toml but overridden by an environment variable.
+    pub overridden_by_env: Vec<String>,
+}
+
+/// Every setting with its source, the problems with them, and the secrets' status: what the
+/// web UI and `alice config list` show (`GET /api/v1/settings`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SettingsView {
+    /// The settings in effect, as nested JSON (the shape of `config.toml`).
+    pub settings: serde_json::Value,
+    /// Where each leaf key's value comes from.
+    pub sources: BTreeMap<String, Source>,
+    /// Every key with its environment variable and whether it is read-only or needs a restart.
+    pub keys: Vec<KeyInfo>,
+    /// Why a setting is not in effect (an invalid edit of `config.toml`, a bad variable). The
+    /// previous settings stay in force.
+    pub errors: Vec<SettingError>,
+    /// Ignored `ALICE_*` variables.
+    pub warnings: Vec<String>,
+    /// No valid `config.toml` has loaded since the daemon started (see `Health`).
+    #[serde(default)]
+    pub config_degraded: bool,
+    /// Things worth knowing about the current state that are not errors: a change waiting to
+    /// hold still, secrets that did not move with a backend, a keychain that did not answer.
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// Each secret (`jev_api_key`, `embedding_api_key`): set or not, never the value.
+    pub secrets: BTreeMap<String, SecretStatus>,
+    /// Keys whose configured value differs from the one the running daemon started with.
+    pub restart_pending: Vec<String>,
+}
+
+/// The answer to `PATCH /api/v1/settings`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PatchResponse {
+    pub changed: Vec<String>,
+    pub restart_required: Vec<String>,
+    pub overridden_by_env: Vec<String>,
+    /// The settings after the change.
+    pub view: SettingsView,
+}
+
+/// Body of `PUT /api/v1/secrets/{name}`.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SecretRequest {
+    pub value: String,
+}
+
+/// The value is a secret: it is never printed.
+impl std::fmt::Debug for SecretRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretRequest { value: <hidden> }")
+    }
+}
+
+/// The answer to `POST /api/v1/settings/test/{provider}`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderTest {
+    pub ok: bool,
+    pub message: String,
+    pub latency_ms: u64,
 }
 
 /// Facts about an entity: current, as of a date, or the full timeline.

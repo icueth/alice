@@ -1,15 +1,17 @@
 //! JSON API over loopback HTTP. The guard (token + Host + Origin) is the code verified in the spike.
 
+use crate::secrets::SecretName;
 use crate::service::Service;
 use alice_core::api::*;
 use alice_core::error::AliceError;
+use alice_core::settings::SettingError;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, FromRequest, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -325,6 +327,94 @@ async fn undo(
     Ok(Json(st.svc.undo(req).await?))
 }
 
+/// A refused settings change: the first problem as `error` (like every refusal), and all of
+/// them as `errors`, each with the key it is about.
+#[derive(Serialize)]
+struct SettingsErrors {
+    error: String,
+    kind: &'static str,
+    errors: Vec<SettingError>,
+}
+
+async fn get_settings(State(st): State<AppState>) -> Json<SettingsView> {
+    Json(st.svc.settings_view_async().await)
+}
+
+async fn patch_settings(
+    State(st): State<AppState>,
+    ApiJson(body): ApiJson<serde_json::Map<String, serde_json::Value>>,
+) -> Response {
+    match st.svc.patch_settings_async(body).await {
+        Ok(r) => Json(r).into_response(),
+        Err(errors) => (
+            StatusCode::BAD_REQUEST,
+            Json(SettingsErrors {
+                error: errors
+                    .first()
+                    .map(|e| format!("{}: {}", e.key, e.message))
+                    .unwrap_or_default(),
+                kind: "invalid",
+                errors,
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// The JSON Schema of the settings: the web UI renders its forms and help from it.
+async fn settings_schema() -> Json<serde_json::Value> {
+    Json(
+        serde_json::to_value(schemars::schema_for!(alice_core::settings::Settings))
+            .unwrap_or_default(),
+    )
+}
+
+fn secret_name(name: &str) -> Result<SecretName, ApiError> {
+    SecretName::parse(name).ok_or_else(|| {
+        ApiError(AliceError::invalid(format!(
+            "unknown secret \"{name}\"; use one of: {}",
+            SecretName::ALL
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    })
+}
+
+/// The body is read as plain JSON, not as a typed request: a type error from serde would quote
+/// the value it found, and the value is a secret.
+async fn put_secret(
+    State(st): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    ApiJson(body): ApiJson<serde_json::Value>,
+) -> ApiResult<SecretStatus> {
+    let name = secret_name(&name)?;
+    let Some(value) = body.get("value").and_then(|v| v.as_str()) else {
+        return Err(ApiError(AliceError::invalid(
+            "send a JSON body like {\"value\": \"<the secret>\"} with the secret as text",
+        )));
+    };
+    Ok(Json(
+        st.svc.set_secret_async(name, value.to_string()).await?,
+    ))
+}
+
+async fn delete_secret(
+    State(st): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let deleted = st.svc.delete_secret_async(secret_name(&name)?).await?;
+    Ok(Json(serde_json::json!({ "deleted": deleted })))
+}
+
+async fn test_provider(
+    State(st): State<AppState>,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+) -> ApiResult<ProviderTest> {
+    Ok(Json(st.svc.test_provider(&provider).await?))
+}
+
 /// What the event stream reads between messages.
 struct Feed {
     rx: tokio::sync::broadcast::Receiver<StreamItem>,
@@ -442,6 +532,13 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/events", get(events))
         .route("/api/v1/undo", post(undo))
         .route("/api/v1/events/stream", get(stream))
+        .route("/api/v1/settings", get(get_settings).patch(patch_settings))
+        .route("/api/v1/settings/schema", get(settings_schema))
+        .route("/api/v1/settings/test/{provider}", post(test_provider))
+        .route(
+            "/api/v1/secrets/{name}",
+            put(put_secret).delete(delete_secret),
+        )
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         // Before the guard layer, so `/mcp` is covered by it.
         .nest_service(

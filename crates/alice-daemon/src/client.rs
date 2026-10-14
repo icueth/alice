@@ -210,6 +210,21 @@ fn error_from(status: reqwest::StatusCode, body: &serde_json::Value) -> AliceErr
     }
 }
 
+/// A name that goes into a URL path (a secret, a provider): letters, digits, `_` and `-` only.
+fn path_word(word: &str) -> Result<&str> {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        Ok(word)
+    } else {
+        Err(AliceError::invalid(format!(
+            "\"{word}\" is not a name; use letters, digits, _ and - only (see `alice config list`)"
+        )))
+    }
+}
+
 /// Detach so the daemon survives the caller (agent hooks, shims, terminals).
 pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> std::io::Result<u32> {
     spawn_detached_with_env(exe, args, log, &[])
@@ -466,6 +481,89 @@ impl DaemonClient {
     }
     pub async fn undo(&self, r: &UndoRequest) -> Result<UndoResponse> {
         self.call("/api/v1/undo", r, Duration::from_secs(10)).await
+    }
+    /// Every setting with its source, the problems, the secrets' status (never a value).
+    pub async fn settings(&self) -> Result<SettingsView> {
+        self.get_json("/api/v1/settings").await
+    }
+    /// The JSON Schema of the settings.
+    pub async fn settings_schema(&self) -> Result<serde_json::Value> {
+        self.get_json("/api/v1/settings/schema").await
+    }
+    /// Change settings (`null` removes a key). Validation failures come back as
+    /// `AliceError::Invalid` with every `key: message` on its own line.
+    pub async fn patch_settings(
+        &self,
+        changes: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<PatchResponse> {
+        let resp = self
+            .http
+            .patch(format!("{}/api/v1/settings", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(10))
+            .json(changes)
+            .send()
+            .await
+            .map_err(transport)?;
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let lines: Vec<String> = body["errors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|e| {
+                    format!(
+                        "{}: {}",
+                        e["key"].as_str().unwrap_or("?"),
+                        e["message"].as_str().unwrap_or("")
+                    )
+                })
+                .collect();
+            return Err(AliceError::Invalid(if lines.is_empty() {
+                body["error"].as_str().unwrap_or("invalid settings").into()
+            } else {
+                lines.join("\n")
+            }));
+        }
+        Self::decode(resp).await
+    }
+    pub async fn set_secret(&self, name: &str, value: &str) -> Result<SecretStatus> {
+        let name = path_word(name)?;
+        let resp = self
+            .http
+            .put(format!("{}/api/v1/secrets/{name}", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(15))
+            .json(&SecretRequest {
+                value: value.into(),
+            })
+            .send()
+            .await
+            .map_err(transport)?;
+        Self::decode(resp).await
+    }
+    /// `true` when there was a secret to delete.
+    pub async fn delete_secret(&self, name: &str) -> Result<bool> {
+        let name = path_word(name)?;
+        let resp = self
+            .http
+            .delete(format!("{}/api/v1/secrets/{name}", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(transport)?;
+        let v: serde_json::Value = Self::decode(resp).await?;
+        Ok(v["deleted"].as_bool().unwrap_or(false))
+    }
+    pub async fn test_provider(&self, which: &str) -> Result<ProviderTest> {
+        let which = path_word(which)?;
+        self.call(
+            &format!("/api/v1/settings/test/{which}"),
+            &serde_json::json!({}),
+            Duration::from_secs(30),
+        )
+        .await
     }
     pub async fn shutdown(&self) -> Result<()> {
         let resp = self

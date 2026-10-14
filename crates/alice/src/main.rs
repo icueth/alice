@@ -54,6 +54,9 @@ enum Command {
     Daemon(cmd::DaemonCmd),
     /// Run the MCP server on stdio (configure agents to launch `alice mcp`).
     Mcp,
+    /// Read and change settings (config.toml, applied live) and secrets.
+    #[command(subcommand)]
+    Config(cmd::ConfigCmd),
     /// Embedding model management.
     #[command(subcommand)]
     Model(cmd::ModelCmd),

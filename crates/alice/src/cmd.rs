@@ -185,6 +185,27 @@ pub enum DaemonCmd {
 }
 
 #[derive(Subcommand)]
+pub enum ConfigCmd {
+    /// Every setting with its value and where it comes from, then problems and secrets.
+    List,
+    /// One setting's value (or a whole group, such as `judge`).
+    Get { key: String },
+    /// Change a setting (written to config.toml, applied at once unless it says otherwise).
+    /// Values are TOML (`0.7`, `true`, `["a", "b"]`) or plain text (`heuristic`, `90d`).
+    Set { key: String, value: String },
+    /// Remove a setting from config.toml (back to its default).
+    Unset { key: String },
+    /// Open config.toml in $EDITOR; problems are shown afterwards.
+    Edit,
+    /// Store a secret read from stdin (never from the command line).
+    SetSecret { name: String },
+    /// Remove a stored secret.
+    DeleteSecret { name: String },
+    /// Check that a provider answers (judge or embedding).
+    Test { provider: String },
+}
+
+#[derive(Subcommand)]
 pub enum ModelCmd {
     /// Download the embedding model (~136 MB) for offline use.
     Fetch,
@@ -570,10 +591,227 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                 .with_context(|| format!("cannot read the daemon log {}", path.display()))?;
             out(&lines.iter().map(|l| format!("{l}\n")).collect::<String>())
         }
+        Command::Config(c) => config(&home, c, json).await,
         Command::Daemon(DaemonCmd::Run) | Command::Mcp | Command::Model(_) | Command::Bench(_) => {
             unreachable!("handled in dispatch")
         }
     }
+}
+
+/// How long `config edit` waits after the editor closes: one poll of the daemon's watcher.
+const EDIT_SETTLE: Duration = Duration::from_millis(2_500);
+
+/// The text of `value` for a person: text without quotes, anything else as JSON.
+fn plain(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// What is wrong or worth knowing about the settings, one line each.
+fn settings_notes(v: &SettingsView) -> String {
+    let mut out = String::new();
+    if v.config_degraded {
+        out.push_str("WARNING no valid config.toml has loaded since the daemon started; cloud providers stay off until one does\n");
+    }
+    for e in &v.errors {
+        out.push_str(&format!(
+            "PROBLEM {}: {} (the previous settings stay in effect)\n",
+            e.key, e.message
+        ));
+    }
+    for w in &v.warnings {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    for n in &v.notes {
+        out.push_str(&format!("note: {n}\n"));
+    }
+    out
+}
+
+async fn config(home: &AliceHome, c: ConfigCmd, json: bool) -> Result<()> {
+    use alice_core::settings::{Source, leaves, parse_cli_value};
+    let client = client(home).await?;
+    match c {
+        ConfigCmd::List => {
+            let v = client.settings().await?;
+            print(json, &v, || {
+                let mut out = String::new();
+                for (key, value) in leaves(&v.settings) {
+                    let src = match v.sources.get(&key) {
+                        Some(Source::File) => " (config.toml)".to_string(),
+                        Some(Source::Env { var }) => format!(" (${var})"),
+                        _ => String::new(),
+                    };
+                    out.push_str(&format!("{key} = {value}{src}\n"));
+                }
+                out.push_str(&settings_notes(&v));
+                for k in &v.restart_pending {
+                    out.push_str(&format!(
+                        "RESTART {k} changes after `alice daemon stop` and the next start\n"
+                    ));
+                }
+                for (name, s) in &v.secrets {
+                    out.push_str(&format!(
+                        "secret {name}: {}\n",
+                        if s.set {
+                            format!(
+                                "set {} ({})",
+                                s.hint.clone().unwrap_or_default(),
+                                s.source.clone().unwrap_or_default()
+                            )
+                        } else {
+                            "not set".into()
+                        }
+                    ));
+                }
+                out
+            })
+        }
+        ConfigCmd::Get { key } => {
+            let v = client.settings().await?;
+            let value = key
+                .split('.')
+                .try_fold(&v.settings, |v, p| v.get(p))
+                .cloned()
+                .with_context(|| format!("no setting {key}; see `alice config list`"))?;
+            print(json, &value, || match &value {
+                serde_json::Value::Object(_) => {
+                    format!(
+                        "{}\n",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    )
+                }
+                other => format!("{}\n", plain(other)),
+            })
+        }
+        ConfigCmd::Set { key, value } => patch(&client, key, parse_cli_value(&value), json).await,
+        ConfigCmd::Unset { key } => patch(&client, key, serde_json::Value::Null, json).await,
+        ConfigCmd::Edit => {
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .context(
+                    "set $EDITOR (or $VISUAL) to edit config.toml, or use `alice config set`",
+                )?;
+            home.ensure_dirs()?;
+            // "code -w" is a program and its arguments.
+            let mut words = editor.split_whitespace();
+            let program = words.next().context("$EDITOR is empty")?;
+            let status = std::process::Command::new(program)
+                .args(words)
+                .arg(home.config_file())
+                .status()
+                .with_context(|| format!("cannot run the editor {program}"))?;
+            anyhow::ensure!(status.success(), "the editor exited with {status}");
+            tokio::time::sleep(EDIT_SETTLE).await;
+            let v = client.settings().await?;
+            eprint!("{}", settings_notes(&v));
+            Ok(())
+        }
+        ConfigCmd::SetSecret { name } => {
+            let value = read_secret(&format!("Paste {name} and press Enter: "))?;
+            let s = client.set_secret(&name, &value).await?;
+            print(json, &s, || {
+                format!("{name} set ({})\n", s.hint.clone().unwrap_or_default())
+            })
+        }
+        ConfigCmd::DeleteSecret { name } => {
+            let had = client.delete_secret(&name).await?;
+            print(json, &serde_json::json!({ "deleted": had }), || {
+                if had {
+                    format!("{name} deleted\n")
+                } else {
+                    format!("{name} was not set\n")
+                }
+            })
+        }
+        ConfigCmd::Test { provider } => {
+            let r = client.test_provider(&provider).await?;
+            print(json, &r, || {
+                format!(
+                    "{} {} ({} ms)\n",
+                    if r.ok { "OK" } else { "FAILED" },
+                    r.message,
+                    r.latency_ms
+                )
+            })?;
+            anyhow::ensure!(r.ok, "the {provider} provider test failed");
+            Ok(())
+        }
+    }
+}
+
+async fn patch(
+    client: &DaemonClient,
+    key: String,
+    value: serde_json::Value,
+    json: bool,
+) -> Result<()> {
+    let mut m = serde_json::Map::new();
+    m.insert(key.clone(), value);
+    let r = client.patch_settings(&m).await?;
+    print(json, &r, || {
+        let mut out = if r.changed.is_empty() {
+            format!("{key}: no change\n")
+        } else {
+            format!("{key}: applied\n")
+        };
+        if !r.restart_required.is_empty() {
+            out.push_str("takes effect after `alice daemon stop` and the next start\n");
+        }
+        if !r.overridden_by_env.is_empty() {
+            out.push_str(&format!(
+                "note: ${} overrides it\n",
+                alice_core::settings::env_var(&key)
+            ));
+        }
+        for n in &r.view.notes {
+            out.push_str(&format!("note: {n}\n"));
+        }
+        out
+    })
+}
+
+/// One line from stdin; on a Unix terminal the input is not echoed.
+fn read_secret(prompt: &str) -> Result<String> {
+    use std::io::{BufRead, IsTerminal};
+    let stdin = std::io::stdin();
+    let tty = stdin.is_terminal();
+    if tty {
+        eprint!("{prompt}");
+        std::io::stderr().flush()?;
+    }
+    #[cfg(unix)]
+    let restore = if tty {
+        // SAFETY: tcgetattr/tcsetattr on our own stdin with a zeroed termios they fill; the
+        // attributes are changed only when tcgetattr succeeded.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) == 0 {
+                let old = t;
+                t.c_lflag &= !libc::ECHO;
+                libc::tcsetattr(0, libc::TCSANOW, &t);
+                Some(old)
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut line = String::new();
+    let read = stdin.lock().read_line(&mut line);
+    #[cfg(unix)]
+    if let Some(old) = restore {
+        // SAFETY: restores the attributes saved above.
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &old) };
+        eprintln!();
+    }
+    read.context("cannot read the secret from stdin")?;
+    let v = line.trim().to_string();
+    anyhow::ensure!(!v.is_empty(), "no secret was given; paste it on stdin");
+    Ok(v)
 }
 
 /// The last `n` lines of the log at `path` (invalid UTF-8 replaced); none if there is no log yet.
@@ -640,8 +878,28 @@ async fn status(home: &AliceHome, json: bool) -> Result<()> {
                 .as_deref()
                 .map(|r| format!("\nREAD-ONLY: {r}"))
                 .unwrap_or_default()
-        )
+        ) + &health_notes(&h)
     })
+}
+
+/// Settings problems in a health reading, one line each, after the status.
+fn health_notes(h: &Health) -> String {
+    let mut out = String::new();
+    if h.config_degraded {
+        out.push_str(
+            "WARNING: no valid config.toml has loaded; cloud providers stay off until one does\n",
+        );
+    }
+    for e in &h.settings_errors {
+        out.push_str(&format!(
+            "PROBLEM {}: {} (see `alice config list`)\n",
+            e.key, e.message
+        ));
+    }
+    for w in &h.settings_warnings {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    out
 }
 
 /// Gone once its process has exited or its lock is free (the daemon saves everything, then

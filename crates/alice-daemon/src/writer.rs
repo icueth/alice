@@ -85,6 +85,17 @@ pub enum WriteOp {
         retry: bool,
     },
     TouchAccess(Vec<i64>),
+    /// A change that is not to a memory or a fact (settings, secrets): one history row, and for
+    /// `settings.change` a `settings` stream item with the keys in `after.changed`. Never carries
+    /// a value of a secret.
+    RecordEvent {
+        actor: Actor,
+        action: String,
+        target_type: String,
+        target_id: String,
+        before: Option<serde_json::Value>,
+        after: Option<serde_json::Value>,
+    },
     Shutdown,
 }
 
@@ -226,6 +237,19 @@ pub(crate) fn record(conn: &Connection, st: &mut State, e: EventInput<'_>) -> Re
         st.stream.push(StreamItem::Event { event });
     }
     Ok(id)
+}
+
+/// The action of the event a settings change records.
+pub(crate) const SETTINGS_CHANGE: &str = "settings.change";
+
+/// The keys a `settings.change` event names (`after.changed`).
+fn settings_changed(after: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    let keys = after?.get("changed")?.as_array()?;
+    Some(
+        keys.iter()
+            .filter_map(|k| k.as_str().map(String::from))
+            .collect(),
+    )
 }
 
 /// A memory as events record it (`None`: no such row).
@@ -636,6 +660,35 @@ fn apply(
         }
         WriteOp::TouchAccess(seqs) => {
             memories::touch_access(conn, &seqs)?;
+            WriteOutcome::Done
+        }
+        WriteOp::RecordEvent {
+            actor,
+            action,
+            target_type,
+            target_id,
+            before,
+            after,
+        } => {
+            let changed = (action == SETTINGS_CHANGE)
+                .then(|| settings_changed(after.as_ref()))
+                .flatten();
+            record(
+                conn,
+                st,
+                EventInput {
+                    actor: &actor,
+                    action: &action,
+                    target_type: &target_type,
+                    target_id: &target_id,
+                    before,
+                    after,
+                    group: None,
+                },
+            )?;
+            if let Some(changed) = changed {
+                st.stream.push(StreamItem::Settings { changed });
+            }
             WriteOutcome::Done
         }
         WriteOp::Shutdown => WriteOutcome::Done,

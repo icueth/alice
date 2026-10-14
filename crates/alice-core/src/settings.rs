@@ -20,8 +20,18 @@ use std::time::Duration;
 
 /// Keys the API and `alice config set` refuse to change.
 pub const READ_ONLY_KEYS: &[&str] = &["storage.data_dir"];
-/// Keys that take effect only after `alice daemon stop` and a new start.
-pub const RESTART_KEYS: &[&str] = &["server.port", "secrets.backend"];
+/// Keys that take effect only after `alice daemon stop` and a new start. The embedding keys
+/// are here until the re-embed of Task 16 makes provider, model and endpoint apply live.
+pub const RESTART_KEYS: &[&str] = &[
+    "server.port",
+    "secrets.backend",
+    "embedding.idle_unload",
+    "embedding.batch_size",
+    // Task 16 makes these three apply live, through a re-embed.
+    "embedding.provider",
+    "embedding.model",
+    "embedding.endpoint",
+];
 
 /// `ALICE_*` variables read elsewhere that are not settings (never warned about). Secrets are
 /// recognised here by name; `resolve` never reads their values.
@@ -781,13 +791,28 @@ fn kind_name(v: &serde_json::Value) -> &'static str {
     }
 }
 
-/// An environment value: TOML syntax if it parses (`0.7`, `true`, `["a"]`), else a string.
-fn env_value(raw: &str) -> serde_json::Value {
+/// A value typed on a command line or in an environment variable: TOML syntax if it parses
+/// (`0.7`, `true`, `["a"]`, `"quoted"`), else a string (`90d`, `heuristic`). The one rule for
+/// `alice config set` and for `ALICE_*` variables.
+///
+/// ```
+/// use alice_core::settings::parse_cli_value;
+/// assert_eq!(parse_cli_value("0.6"), serde_json::json!(0.6));
+/// assert_eq!(parse_cli_value("true"), serde_json::json!(true));
+/// assert_eq!(parse_cli_value("90d"), serde_json::json!("90d"));
+/// assert_eq!(parse_cli_value("[\"a\", \"b\"]"), serde_json::json!(["a", "b"]));
+/// ```
+pub fn parse_cli_value(raw: &str) -> serde_json::Value {
     toml::from_str::<toml::Table>(&format!("v = {raw}"))
         .ok()
         .and_then(|t| t.get("v").cloned())
         .and_then(|v| serde_json::to_value(v).ok())
         .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
+}
+
+/// An environment value: the same rule as [`parse_cli_value`].
+fn env_value(raw: &str) -> serde_json::Value {
+    parse_cli_value(raw)
 }
 
 /// The 1-based line of byte `offset` in `text` (past the end: the last line). Error messages
@@ -1605,6 +1630,15 @@ impl LooseningGate {
     pub fn reset(&mut self) {
         self.pending = None;
     }
+
+    /// A look that does not count as a poll saw `fingerprint`: content other than the one being
+    /// counted breaks its run of identical polls (A counted, B not counted, A counted is not two
+    /// in a row).
+    pub fn saw_other(&mut self, fingerprint: u64) {
+        if self.pending.is_some_and(|(f, _)| f != fingerprint) {
+            self.pending = None;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- project scope
@@ -1643,12 +1677,14 @@ impl EffectivePrivacy {
     /// `true` when memories of `project_slug` must never leave this machine for a cloud judge
     /// or embedding provider: the project's file says so, or the global list names it.
     pub fn is_cloud_denied(&self, project_slug: &str) -> bool {
+        // Both sides trimmed: a slug with stray whitespace is the project the list names.
+        let slug = project_slug.trim();
         self.cloud_denied
             || self
                 .privacy
                 .cloud_denied_projects
                 .iter()
-                .any(|p| p.trim() == project_slug)
+                .any(|p| p.trim() == slug)
     }
 }
 
@@ -1813,6 +1849,8 @@ impl ProjectSettingsCache {
     }
 
     pub fn get(&self, root: &Path) -> ProjectLoad {
+        // Two spellings of one repository (a symlink, `..`) share one entry and one gate.
+        let root = &std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let path = root.join(".alice.toml");
         let name = path.display().to_string();
         let now = (self.clock)();
@@ -1869,6 +1907,7 @@ impl ProjectSettingsCache {
             entry.last_counted = Some(now);
             entry.gate.admit(fingerprint, true)
         } else {
+            entry.gate.saw_other(fingerprint);
             false
         };
         if admitted {
@@ -2454,6 +2493,16 @@ mod tests {
                 && k.env_var == "ALICE_JUDGE_JEV_RATE_PER_SEC")
         );
         assert!(keys.iter().any(|k| k.key == "server.port" && k.restart));
+        // Until the re-embed of Task 16, the embedding settings are read at start.
+        for k in [
+            "embedding.idle_unload",
+            "embedding.batch_size",
+            "embedding.provider",
+            "embedding.model",
+            "embedding.endpoint",
+        ] {
+            assert!(keys.iter().any(|i| i.key == k && i.restart), "{k}");
+        }
         assert!(
             keys.iter()
                 .any(|k| k.key == "storage.data_dir" && k.read_only)
@@ -2845,6 +2894,89 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         write_project(other.path(), STRICT);
         assert!(cache.get(other.path()).settings.privacy.cloud_denied);
+    }
+
+    #[test]
+    fn a_slug_with_stray_whitespace_is_still_the_denied_project() {
+        let global = PrivacySettings {
+            cloud_denied_projects: vec!["client-x".into()],
+            ..Default::default()
+        };
+        let eff = ProjectSettings::default().apply_to(&global);
+        for slug in ["client-x", " client-x ", "\tclient-x\n"] {
+            assert!(eff.is_cloud_denied(slug), "{slug:?}");
+        }
+        assert!(!eff.is_cloud_denied("client-y"));
+    }
+
+    /// Carried from Task 5's review: A counted, B not counted, A counted is not two polls in a row.
+    #[test]
+    fn a_different_uncounted_look_breaks_the_run_of_identical_polls() {
+        let d = tempfile::tempdir().unwrap();
+        let (cache, now) = clocked();
+        write_project(d.path(), STRICT);
+        assert!(cache.get(d.path()).settings.privacy.cloud_denied);
+        write_project(d.path(), ""); // A
+        assert!(cache.get(d.path()).loosening_pending, "A counted: 1");
+        write_project(d.path(), "[privacy]\nblock_secrets = true\n"); // B, looked at at once
+        assert!(cache.get(d.path()).settings.privacy.cloud_denied);
+        write_project(d.path(), ""); // A again
+        tick(&now);
+        assert!(
+            cache.get(d.path()).settings.privacy.cloud_denied,
+            "A counted: 1 again"
+        );
+        tick(&now);
+        assert!(
+            cache.get(d.path()).settings.privacy.cloud_denied,
+            "A counted: 2, so far from three"
+        );
+        tick(&now);
+        assert!(
+            !cache.get(d.path()).settings.privacy.cloud_denied,
+            "A counted: 3"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_spellings_of_one_repository_share_one_gate() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("repo");
+        std::fs::create_dir(&real).unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (cache, now) = clocked();
+        write_project(&real, STRICT);
+        assert!(cache.get(&real).settings.privacy.cloud_denied);
+        write_project(&real, "");
+        assert!(cache.get(&real).settings.privacy.cloud_denied, "poll 1");
+        tick(&now);
+        assert!(
+            cache.get(&link).settings.privacy.cloud_denied,
+            "poll 2, by the other spelling"
+        );
+        tick(&now);
+        assert!(
+            !cache.get(&real).settings.privacy.cloud_denied,
+            "poll 3 completes the run: one entry, one gate"
+        );
+    }
+
+    #[test]
+    fn cli_values_follow_the_toml_rule_and_fall_back_to_text() {
+        for (raw, want) in [
+            ("0.6", serde_json::json!(0.6)),
+            ("10", serde_json::json!(10)),
+            ("true", serde_json::json!(true)),
+            ("\"quoted\"", serde_json::json!("quoted")),
+            ("[\"a\", \"b\"]", serde_json::json!(["a", "b"])),
+            ("90d", serde_json::json!("90d")),
+            ("heuristic", serde_json::json!("heuristic")),
+            ("", serde_json::json!("")),
+        ] {
+            assert_eq!(parse_cli_value(raw), want, "{raw:?}");
+        }
     }
 
     /// N3: the first look at a blank file is not "no protections".

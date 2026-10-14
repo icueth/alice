@@ -845,3 +845,353 @@ async fn a_token_prefix_or_extension_is_refused() {
         assert_eq!(r.status(), 401, "token of length {}", wrong.len());
     }
 }
+
+// ------------------------------------------------------------------ Task 6: the settings API
+
+/// Options whose secret status ignores the machine's environment (a developer's own
+/// `TYPESAFE_API_KEY` must not change what a test sees).
+fn quiet() -> ServiceOptions {
+    ServiceOptions {
+        secret_env: Some(Arc::new(|_| None)),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_api_round_trip_validation_schema_and_secrets() {
+    let s = Srv::start_with(quiet()).await;
+    let view: serde_json::Value = s.get_json("/api/v1/settings").await;
+    assert_eq!(view["settings"]["judge"]["provider"], "heuristic");
+    assert!(view["keys"].as_array().unwrap().len() >= 50);
+    let schema: serde_json::Value = s.get_json("/api/v1/settings/schema").await;
+    assert!(schema["properties"]["judge"].is_object());
+    let ok: serde_json::Value = ok_json(
+        s.patch(
+            "/api/v1/settings",
+            &serde_json::json!({"judge.review_threshold": 0.6}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(ok["view"]["settings"]["judge"]["review_threshold"], 0.6);
+    assert_eq!(ok["changed"], serde_json::json!(["judge.review_threshold"]));
+    let bad = s
+        .patch(
+            "/api/v1/settings",
+            &serde_json::json!({"judge.review_threshold": 0.95}),
+        )
+        .await;
+    assert_eq!(bad.status(), 400);
+    let body: serde_json::Value = bad.json().await.unwrap();
+    assert_eq!(body["kind"], "invalid");
+    assert_eq!(body["errors"][0]["key"], "judge.review_threshold");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("judge.review_threshold"),
+        "{body}"
+    );
+    let put: serde_json::Value = ok_json(
+        s.put(
+            "/api/v1/secrets/jev_api_key",
+            &serde_json::json!({"value": "ts_secret_value_1234"}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(put["hint"], "••••1234");
+    let view = s.get("/api/v1/settings").await.text().await.unwrap();
+    assert!(
+        !view.contains("ts_secret_value"),
+        "the API never returns a secret"
+    );
+    assert!(view.contains("jev_api_key"), "its status is there");
+    let unknown = s
+        .put("/api/v1/secrets/github", &serde_json::json!({"value": "x"}))
+        .await;
+    assert_eq!(unknown.status(), 400);
+    let gone = s.delete("/api/v1/secrets/jev_api_key").await;
+    assert!(gone.status().is_success(), "{}", gone.status());
+    let gone: serde_json::Value = gone.json().await.unwrap();
+    assert_eq!(gone["deleted"], true);
+    let view: serde_json::Value = s.get_json("/api/v1/settings").await;
+    assert_eq!(view["secrets"]["jev_api_key"]["set"], false);
+}
+
+/// Every key is writable through the API with validation: an unknown key, a wrong type, a
+/// read-only key and a body that is not an object are each a 400 that names the problem; a
+/// `null` removes the key from config.toml.
+#[tokio::test(flavor = "multi_thread")]
+async fn patch_validates_every_shape_and_null_removes_a_key() {
+    let s = Srv::start_with(quiet()).await;
+    for (body, key) in [
+        (serde_json::json!({"judge.nope": 1}), "judge.nope"),
+        (
+            serde_json::json!({"judge.review_threshold": "high"}),
+            "judge.review_threshold",
+        ),
+        (
+            serde_json::json!({"storage.data_dir": "/tmp"}),
+            "storage.data_dir",
+        ),
+        (
+            serde_json::json!({"search.relevance_floor": 7}),
+            "search.relevance_floor",
+        ),
+    ] {
+        let r = s.patch("/api/v1/settings", &body).await;
+        assert_eq!(r.status(), 400, "{body}");
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["kind"], "invalid", "{v}");
+        assert_eq!(v["errors"][0]["key"], key, "{v}");
+    }
+    // Not an object: the API's own error shape.
+    let r = s
+        .patch("/api/v1/settings", &serde_json::json!([1, 2]))
+        .await;
+    assert_eq!(r.status(), 400);
+    assert_eq!(
+        r.json::<serde_json::Value>().await.unwrap()["kind"],
+        "invalid"
+    );
+    // Nothing above touched the settings or the file.
+    assert!(!s.home.config_file().exists());
+    // Set, then remove: back to the default, out of config.toml.
+    let r: serde_json::Value = ok_json(
+        s.patch(
+            "/api/v1/settings",
+            &serde_json::json!({"mcp.admin_tools": true}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(r["view"]["settings"]["mcp"]["admin_tools"], true);
+    assert_eq!(r["view"]["sources"]["mcp.admin_tools"]["kind"], "file");
+    assert!(
+        std::fs::read_to_string(s.home.config_file())
+            .unwrap()
+            .contains("admin_tools = true")
+    );
+    let r: serde_json::Value = ok_json(
+        s.patch(
+            "/api/v1/settings",
+            &serde_json::json!({"mcp.admin_tools": null}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(r["view"]["settings"]["mcp"]["admin_tools"], false);
+    assert_eq!(r["view"]["sources"]["mcp.admin_tools"]["kind"], "default");
+    assert!(
+        !std::fs::read_to_string(s.home.config_file())
+            .unwrap()
+            .contains("admin_tools")
+    );
+    // Keys that need a restart say so.
+    let r: serde_json::Value = ok_json(
+        s.patch(
+            "/api/v1/settings",
+            &serde_json::json!({"server.port": 4545}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(r["restart_required"], serde_json::json!(["server.port"]));
+    assert_eq!(
+        r["view"]["restart_pending"],
+        serde_json::json!(["server.port"])
+    );
+}
+
+/// An invalid edit of config.toml leaves the previous settings in force; the error shows in
+/// the settings view and in health, and a good edit clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_edit_shows_in_the_view_and_in_health() {
+    let s = Srv::start_with(ServiceOptions {
+        settings_poll: std::time::Duration::from_millis(50),
+        ..quiet()
+    })
+    .await;
+    let _: serde_json::Value = ok_json(
+        s.patch(
+            "/api/v1/settings",
+            &serde_json::json!({"judge.review_threshold": 0.6}),
+        )
+        .await,
+    )
+    .await;
+    std::fs::write(
+        s.home.config_file(),
+        "[judge]\nreview_threshold = 0.9\nauto_apply_threshold = 0.6\n",
+    )
+    .unwrap();
+    let view = loop {
+        let v: serde_json::Value = s.get_json("/api/v1/settings").await;
+        if !v["errors"].as_array().unwrap().is_empty() {
+            break v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(view["errors"][0]["key"], "judge.review_threshold");
+    assert_eq!(
+        view["settings"]["judge"]["review_threshold"], 0.6,
+        "the previous settings stay in force"
+    );
+    let health: serde_json::Value = s.get_json("/api/v1/health").await;
+    assert_eq!(
+        health["settings_errors"][0]["key"],
+        "judge.review_threshold"
+    );
+    assert!(health.get("config_degraded").is_none(), "{health}");
+    std::fs::write(s.home.config_file(), "[judge]\nreview_threshold = 0.7\n").unwrap();
+    loop {
+        let v: serde_json::Value = s.get_json("/api/v1/settings").await;
+        if v["errors"].as_array().unwrap().is_empty() {
+            assert_eq!(v["settings"]["judge"]["review_threshold"], 0.7);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let health: serde_json::Value = s.get_json("/api/v1/health").await;
+    assert!(health.get("settings_errors").is_none(), "{health}");
+}
+
+/// A change pushes a `settings` item on the event stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_settings_change_is_pushed_on_the_stream() {
+    let s = Srv::start_with(quiet()).await;
+    let mut stream = s.get("/api/v1/events/stream").await;
+    let mut buf = String::new();
+    assert_eq!(next_item(&mut stream, &mut buf).await["type"], "health");
+    let _: serde_json::Value = ok_json(
+        s.patch(
+            "/api/v1/settings",
+            &serde_json::json!({"search.relevance_floor": 0.75}),
+        )
+        .await,
+    )
+    .await;
+    let item = loop {
+        let v = next_item(&mut stream, &mut buf).await;
+        if v["type"] == "settings" {
+            break v;
+        }
+    };
+    assert_eq!(
+        item["changed"],
+        serde_json::json!(["search.relevance_floor"])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_provider_test_and_secret_errors_speak_plainly() {
+    let s = Srv::start_with(quiet()).await;
+    let r: serde_json::Value = ok_json(
+        s.post("/api/v1/settings/test/embedding", &serde_json::json!({}))
+            .await,
+    )
+    .await;
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(r["latency_ms"].is_u64());
+    let r: serde_json::Value = ok_json(
+        s.post("/api/v1/settings/test/judge", &serde_json::json!({}))
+            .await,
+    )
+    .await;
+    assert_eq!(r["ok"], true, "{r}");
+    let r = s
+        .post("/api/v1/settings/test/dropbox", &serde_json::json!({}))
+        .await;
+    assert_eq!(r.status(), 400);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert!(
+        v["error"].as_str().unwrap().contains("judge or embedding"),
+        "{v}"
+    );
+    // A secret that is not one line is refused, and the refusal never repeats it.
+    let marker = "ZQXMARKER-line-one\nline-two";
+    let r = s
+        .put(
+            "/api/v1/secrets/embedding_api_key",
+            &serde_json::json!({"value": marker}),
+        )
+        .await;
+    assert_eq!(r.status(), 400);
+    let text = r.text().await.unwrap();
+    assert!(!text.contains("ZQXMARKER"), "{text}");
+    // A value of the wrong type is refused without quoting it either.
+    let r = s
+        .put(
+            "/api/v1/secrets/embedding_api_key",
+            &serde_json::json!({"value": 9_876_543_210_u64}),
+        )
+        .await;
+    assert_eq!(r.status(), 400);
+    assert!(!r.text().await.unwrap().contains("9876543210"));
+    // Wrong body shape: the API's error body.
+    let r = s
+        .put(
+            "/api/v1/secrets/embedding_api_key",
+            &serde_json::json!({"key": "x"}),
+        )
+        .await;
+    assert_eq!(r.status(), 400);
+    assert_eq!(
+        r.json::<serde_json::Value>().await.unwrap()["kind"],
+        "invalid"
+    );
+}
+
+/// The new routes sit behind the same token, Host and Origin guard as the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_settings_routes_are_guarded() {
+    let s = Srv::start_with(quiet()).await;
+    let routes: [(reqwest::Method, &str); 7] = [
+        (reqwest::Method::GET, "/api/v1/settings"),
+        (reqwest::Method::PATCH, "/api/v1/settings"),
+        (reqwest::Method::GET, "/api/v1/settings/schema"),
+        (reqwest::Method::POST, "/api/v1/settings/test/judge"),
+        (reqwest::Method::PUT, "/api/v1/secrets/jev_api_key"),
+        (reqwest::Method::DELETE, "/api/v1/secrets/jev_api_key"),
+        (reqwest::Method::POST, "/api/v1/settings/test/embedding"),
+    ];
+    for (method, path) in routes {
+        let anon = s
+            .http
+            .request(method.clone(), s.url(path))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anon.status(), 401, "{method} {path} without a token");
+        let wrong_host = s
+            .req(method.clone(), path)
+            .header("Host", "evil.example:80")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong_host.status(),
+            403,
+            "{method} {path} with a foreign Host"
+        );
+        let wrong_origin = s
+            .req(method.clone(), path)
+            .header("Origin", "https://evil.example")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong_origin.status(),
+            403,
+            "{method} {path} from a web page"
+        );
+    }
+    assert!(
+        !s.home.config_file().exists(),
+        "no refused request changed anything"
+    );
+}

@@ -3,7 +3,9 @@
 //! Writes go to the single writer thread; reads run on pooled read-only connections in
 //! `spawn_blocking`, so neither ever waits for the other (spec §4.1).
 
+use crate::config::SettingsHandle;
 use crate::paths::AliceHome;
+use crate::secrets::{self, SecretName, SecretStore};
 use crate::spool;
 use crate::worker::{WorkerConfig, spawn_worker};
 use crate::writer::{ProjectChoice, WriteOp, WriteOutcome, WriterHandle, spawn_writer};
@@ -14,7 +16,8 @@ use alice_core::ids::new_id;
 use alice_core::model::limits;
 use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
-use alice_core::search::{self, SearchParams, fusion::Weights, pack};
+use alice_core::search::{self, SearchParams, pack};
+use alice_core::settings::{self, SettingError, Settings};
 use alice_core::store::embeddings;
 use alice_core::store::events::Actor;
 use alice_core::store::history::UndoOutcome;
@@ -26,7 +29,7 @@ use alice_core::store::{ReaderPool, VECTOR_READER_CACHE_KIB, open_reader, open_w
 use alice_core::vector::VectorIndex;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,18 +39,14 @@ use std::time::{Duration, Instant};
 /// `None` while the index is being rebuilt; searches then use lexical candidates only.
 pub type IndexSlot = RwLock<Option<Arc<VectorIndex>>>;
 
-/// Texts per embedding batch in the worker.
-const EMBED_BATCH: usize = 32;
 /// How long a working directory's detected project is reused before git is asked again.
 const DETECT_TTL: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone)]
+/// Reads one environment variable for the secrets' status (tests replace the process's).
+pub type SecretEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct ServiceOptions {
-    /// Cosine similarity at which a vector-only match counts as relevant.
-    pub relevance_floor: f32,
-    /// Fewer relevant knowledge results than this bring in raw chunks (the raw fallback).
-    pub raw_min_results: usize,
-    pub weights: Weights,
     /// Most read connections open at once (each has its own page cache); further reads wait.
     pub reader_pool: usize,
     /// Connections (4 MiB page cache each) that read the stored chunk vectors a raw-tier
@@ -57,21 +56,47 @@ pub struct ServiceOptions {
     pub vector_reader_pool: usize,
     /// Maps a working directory to its project (runs git). Tests replace it.
     pub detect_project: fn(&Path) -> ProjectRef,
+    /// Settings to use; `None` loads `config.toml` and `ALICE_*` from the home.
+    pub settings: Option<Arc<SettingsHandle>>,
+    /// How often `config.toml` is checked for edits.
+    pub settings_poll: Duration,
     /// How often the event stream checks whether the health changed (tests shorten it).
     pub health_tick: Duration,
+    /// The secrets store; `None` opens the one `secrets.backend` names. Tests pass a fake, so
+    /// none of them touches the OS keychain.
+    pub secrets: Option<Arc<dyn SecretStore>>,
+    /// The environment the secrets' status is read from; `None`: the process's.
+    pub secret_env: Option<SecretEnv>,
+    /// How long a request waits for the secrets store (an OS keychain may wait for a prompt
+    /// nobody answers) before it says so and carries on.
+    pub secrets_timeout: Duration,
 }
 
 impl Default for ServiceOptions {
     fn default() -> Self {
         Self {
-            relevance_floor: search::DEFAULT_RELEVANCE_FLOOR,
-            raw_min_results: 3,
-            weights: Weights::default(),
             reader_pool: 8,
             vector_reader_pool: 4,
             detect_project,
+            settings: None,
+            settings_poll: crate::config::SETTINGS_POLL,
             health_tick: Duration::from_secs(5),
+            secrets: None,
+            secret_env: None,
+            secrets_timeout: Duration::from_secs(5),
         }
+    }
+}
+
+impl std::fmt::Debug for ServiceOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceOptions")
+            .field("reader_pool", &self.reader_pool)
+            .field("vector_reader_pool", &self.vector_reader_pool)
+            .field("settings_poll", &self.settings_poll)
+            .field("health_tick", &self.health_tick)
+            .field("secrets_timeout", &self.secrets_timeout)
+            .finish_non_exhaustive()
     }
 }
 
@@ -192,6 +217,9 @@ impl ProjectResolver {
     }
 }
 
+/// The threads `shutdown` joins: the embedding worker, the writer and the config watcher.
+type Threads = (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>);
+
 pub struct Service {
     home: AliceHome,
     readers: Arc<ReaderPool>,
@@ -205,11 +233,23 @@ pub struct Service {
     instance: String,
     stop: Arc<AtomicBool>,
     wake_worker: crossbeam_channel::Sender<()>,
-    /// (embedding worker, writer); taken by `shutdown`.
-    threads: Mutex<Option<(JoinHandle<()>, JoinHandle<()>)>>,
+    /// (embedding worker, writer, config watcher); taken by `shutdown`.
+    threads: Mutex<Option<Threads>>,
     resolver: ProjectResolver,
     /// The health every event-stream client sends: read at most once per `health_tick`.
     stream_health: tokio::sync::Mutex<Option<(Instant, Health)>>,
+    /// Live settings: read per request, never copied into the service.
+    settings: Arc<SettingsHandle>,
+    /// The settings the daemon started with, for the keys that apply only after a restart.
+    started_with: Arc<Settings>,
+    secrets: Arc<dyn SecretStore>,
+    secret_env: SecretEnv,
+    /// A read of the secrets' status is in flight (it may be stuck on a keychain prompt): no
+    /// second one starts until it ends.
+    secrets_busy: Arc<AtomicBool>,
+    /// Readings of the health (tests count them).
+    #[cfg(test)]
+    health_reads: std::sync::atomic::AtomicUsize,
 }
 
 fn device_id(conn: &Connection) -> Result<String> {
@@ -285,6 +325,45 @@ fn spawn_rebuild(
     Ok(())
 }
 
+/// Records every settings change that takes effect: a `settings.change` event naming the keys
+/// (never a value) and a `settings` item on the stream. Ends when the handle is dropped.
+fn spawn_config_events(settings: &Arc<SettingsHandle>, writer: &WriterHandle) -> Result<()> {
+    let rx = settings.subscribe();
+    let start = settings.get();
+    // Weak: the loop must not keep the handle (and so the channel) alive after shutdown.
+    let weak = Arc::downgrade(settings);
+    let writer = writer.clone();
+    std::thread::Builder::new()
+        .name("alice-config-events".into())
+        .spawn(move || {
+            crate::config::follow_settings(
+                rx,
+                start,
+                move || weak.upgrade().map(|h| h.get()).unwrap_or_default(),
+                move |changed| {
+                    writer.send_nowait(WriteOp::RecordEvent {
+                        actor: Actor::User,
+                        action: crate::writer::SETTINGS_CHANGE.into(),
+                        target_type: "settings".into(),
+                        target_id: "config".into(),
+                        before: None,
+                        after: Some(serde_json::json!({ "changed": changed })),
+                    });
+                },
+            )
+        })?;
+    Ok(())
+}
+
+/// Clears the "secrets read in flight" flag when the read ends, however it ends.
+struct BusyGuard(Arc<AtomicBool>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 impl Service {
     pub fn start(
         home: AliceHome,
@@ -292,6 +371,21 @@ impl Service {
         opts: ServiceOptions,
     ) -> Result<Arc<Service>> {
         home.ensure_dirs()?;
+        // Settings first: everything below reads them (the model's idle unload and the port are
+        // read by the daemon from the same handle).
+        let settings = opts
+            .settings
+            .clone()
+            .unwrap_or_else(|| SettingsHandle::load(&home));
+        let started_with = settings.get();
+        let secrets = opts
+            .secrets
+            .clone()
+            .unwrap_or_else(|| secrets::open_store(&home, started_with.secrets.backend));
+        let secret_env: SecretEnv = opts
+            .secret_env
+            .clone()
+            .unwrap_or_else(|| Arc::new(|var: &str| std::env::var(var).ok()));
         let conn = open_writer(&home.db())?;
         let device = device_id(&conn)?;
         let readers = Arc::new(ReaderPool::new(home.db(), opts.reader_pool));
@@ -345,8 +439,11 @@ impl Service {
             wake: wake_rx,
             stop: stop.clone(),
             vector_path,
-            batch: EMBED_BATCH,
+            // `embedding.batch_size` (a restart key: the worker is built once).
+            batch: started_with.embedding.batch_size,
         });
+        let watcher = settings.spawn_watcher(opts.settings_poll, stop.clone());
+        spawn_config_events(&settings, &writer)?;
         let resolver = ProjectResolver::new(opts.detect_project);
         Ok(Arc::new(Service {
             home,
@@ -359,9 +456,16 @@ impl Service {
             instance: new_id(),
             stop,
             wake_worker: wake_tx,
-            threads: Mutex::new(Some((worker_thread, writer_thread))),
+            threads: Mutex::new(Some((worker_thread, writer_thread, watcher))),
             resolver,
             stream_health: tokio::sync::Mutex::new(None),
+            settings,
+            started_with,
+            secrets,
+            secret_env,
+            secrets_busy: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            health_reads: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
 
@@ -390,11 +494,14 @@ impl Service {
     /// second; an embedding batch in flight is finished first). Later writes fail with "writer
     /// stopped"; reads keep working. Calling it again does nothing.
     pub fn shutdown(&self) {
-        let Some((worker, writer)) = self.threads.lock().take() else {
+        let Some((worker, writer, watcher)) = self.threads.lock().take() else {
             return;
         };
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.wake_worker.try_send(());
+        if watcher.join().is_err() {
+            tracing::error!("the config watcher panicked");
+        }
         if worker.join().is_err() {
             tracing::error!("the embedding worker panicked");
         }
@@ -511,9 +618,10 @@ impl Service {
             .limit
             .unwrap_or(limits::DEFAULT_RECALL_LIMIT)
             .min(limits::MAX_RECALL_LIMIT);
-        let max_tokens = req.max_tokens.unwrap_or(limits::DEFAULT_RECALL_TOKENS);
+        // The settings of this request: a change applies to the next one.
+        let cfg = self.settings();
+        let max_tokens = req.max_tokens.unwrap_or(cfg.search.default_max_tokens);
         let format = req.format;
-        let opts = self.opts.clone();
         let index = self.index.read().clone();
         // Embedded before a reader connection is taken: the model is shared with the
         // embedding worker, and a recall waiting for it must not hold a connection.
@@ -554,17 +662,17 @@ impl Service {
                     before: req.before,
                     include_raw: req.include_raw,
                     limit,
-                    relevance_floor: opts.relevance_floor,
-                    raw_min_results: opts.raw_min_results,
-                    // Task 6 passes `search.half_life` from the settings.
-                    half_lives: Default::default(),
+                    // The one place the f64 setting becomes the f32 the search compares with.
+                    relevance_floor: cfg.search.relevance_floor as f32,
+                    raw_min_results: cfg.search.raw_fallback_min_results,
+                    half_lives: cfg.search.half_life.clone(),
                 };
                 let out = search::run_with_chunk_reads(
                     c,
                     index.as_deref(),
                     vector,
                     search::ChunkReads::Pool(&vector_readers),
-                    &opts.weights,
+                    &cfg.search.weights,
                     &params,
                     chrono::Utc::now(),
                 )?;
@@ -769,14 +877,310 @@ impl Service {
     /// them (the counts scan tables), so it is at most one tick old.
     pub async fn stream_health(&self) -> Result<Health> {
         let mut cached = self.stream_health.lock().await;
+        // Fresh for half a tick: a client's tick can land just before this one's reading is a
+        // tick old, and must not then wait a whole tick for the next one.
         if let Some((at, h)) = cached.as_ref()
-            && at.elapsed() < self.opts.health_tick
+            && at.elapsed() < self.opts.health_tick / 2
         {
             return Ok(h.clone());
         }
         let h = self.health().await?;
         *cached = Some((Instant::now(), h.clone()));
         Ok(h)
+    }
+
+    // ------------------------------------------------------------------ settings
+
+    /// The settings in effect: a shared pointer to a snapshot. Read them once per request; a
+    /// change applies to the next request.
+    pub fn settings(&self) -> Arc<Settings> {
+        self.settings.get()
+    }
+
+    pub fn settings_handle(&self) -> &Arc<SettingsHandle> {
+        &self.settings
+    }
+
+    pub fn secrets(&self) -> &Arc<dyn SecretStore> {
+        &self.secrets
+    }
+
+    /// What the store's backend is called to a person.
+    fn secrets_store_name(&self) -> &'static str {
+        match self.secrets.backend() {
+            "keychain" => "OS keychain",
+            _ => "secrets file",
+        }
+    }
+
+    /// The status of every secret. **Blocks** when the store does (an OS keychain may wait for
+    /// a permission prompt): request handlers use `settings_view_async`.
+    fn secret_statuses(&self) -> BTreeMap<String, SecretStatus> {
+        SecretName::ALL
+            .iter()
+            .map(|n| {
+                (
+                    n.as_str().to_string(),
+                    secrets::status_with(self.secrets.as_ref(), *n, self.secret_env.as_ref()),
+                )
+            })
+            .collect()
+    }
+
+    fn unknown_secrets() -> BTreeMap<String, SecretStatus> {
+        SecretName::ALL
+            .iter()
+            .map(|n| (n.as_str().to_string(), SecretStatus::unset()))
+            .collect()
+    }
+
+    fn secrets_silent_note(&self) -> String {
+        format!(
+            "the {} did not answer within {} ms; its secrets show as not set until it does (unlock it or approve its prompt)",
+            self.secrets_store_name(),
+            self.opts.secrets_timeout.as_millis()
+        )
+    }
+
+    /// The view without the secrets' status (which may wait on the store), plus notes.
+    fn view_with(
+        &self,
+        secrets: BTreeMap<String, SecretStatus>,
+        mut notes: Vec<String>,
+    ) -> SettingsView {
+        let r = self.settings.resolved();
+        let running = &self.started_with;
+        let restart_pending: Vec<String> = settings::RESTART_KEYS
+            .iter()
+            .filter(|k| settings::get_key(&r.settings, k) != settings::get_key(running, k))
+            .map(|k| k.to_string())
+            .collect();
+        if restart_pending.iter().any(|k| k == "secrets.backend") {
+            let name = |s: &Settings| {
+                settings::get_key(s, "secrets.backend")
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default()
+            };
+            let (now, was) = (name(&r.settings), name(running));
+            notes.push(format!(
+                "secrets.backend is {now} but this daemon started with {was}; the change applies after `alice daemon stop` and the next start, and the secrets are not copied: under {now} they show as not set until you set them again with `alice config set-secret <name>`"
+            ));
+        }
+        if self.settings.loosening_waiting() {
+            notes.push(format!(
+                "config.toml loosens a protection (redaction, a cloud denylist or a budget); it applies once it reads the same on {} polls in a row (about {} s), so a half-written save never switches protections off. The settings in force are unchanged until then",
+                settings::LOOSEN_POLLS,
+                self.opts.settings_poll.as_secs().max(1) * u64::from(settings::LOOSEN_POLLS)
+            ));
+        }
+        SettingsView {
+            settings: serde_json::to_value(&r.settings).expect("settings serialise"),
+            sources: r.sources.clone(),
+            keys: settings::key_infos(),
+            errors: self.settings.errors(),
+            warnings: self.settings.warnings(),
+            config_degraded: self.settings.config_degraded(),
+            notes,
+            secrets,
+            restart_pending,
+        }
+    }
+
+    /// Every setting with its source, the problems with them and the secrets' status. May
+    /// block on the secrets store: a request handler uses `settings_view_async`.
+    pub fn settings_view(&self) -> SettingsView {
+        self.view_with(self.secret_statuses(), Vec::new())
+    }
+
+    /// `settings_view` for a request handler: the secrets are read off the runtime's threads
+    /// and given `secrets_timeout`; a store that does not answer (a keychain waiting for a
+    /// prompt) leaves them as not set, with a note, and no second read starts while one is
+    /// still stuck.
+    pub async fn settings_view_async(self: &Arc<Self>) -> SettingsView {
+        if self.secrets_busy.swap(true, Ordering::SeqCst) {
+            return self.view_with(Self::unknown_secrets(), vec![self.secrets_silent_note()]);
+        }
+        let guard = BusyGuard(self.secrets_busy.clone());
+        let me = self.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            me.secret_statuses()
+        });
+        match tokio::time::timeout(self.opts.secrets_timeout, read).await {
+            Ok(Ok(secrets)) => self.view_with(secrets, Vec::new()),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "reading the secrets' status failed");
+                self.view_with(Self::unknown_secrets(), Vec::new())
+            }
+            Err(_) => self.view_with(Self::unknown_secrets(), vec![self.secrets_silent_note()]),
+        }
+    }
+
+    /// Apply dotted-key changes (`null` removes a key from config.toml); all or nothing.
+    /// Blocking: a request handler uses `patch_settings_async`.
+    pub fn patch_settings(
+        &self,
+        changes: serde_json::Map<String, serde_json::Value>,
+    ) -> std::result::Result<PatchResponse, Vec<SettingError>> {
+        let out = self.settings.patch(&changes)?;
+        Ok(self.patch_response(out, self.settings_view()))
+    }
+
+    fn patch_response(&self, out: PatchOutcome, view: SettingsView) -> PatchResponse {
+        PatchResponse {
+            changed: out.changed,
+            restart_required: out.restart_required,
+            overridden_by_env: out.overridden_by_env,
+            view,
+        }
+    }
+
+    /// `patch_settings` for a request handler: the file work and the secrets' status stay off
+    /// the runtime's threads.
+    pub async fn patch_settings_async(
+        self: &Arc<Self>,
+        changes: serde_json::Map<String, serde_json::Value>,
+    ) -> std::result::Result<PatchResponse, Vec<SettingError>> {
+        let me = self.clone();
+        let out = tokio::task::spawn_blocking(move || me.settings.patch(&changes))
+            .await
+            .map_err(|e| {
+                vec![SettingError {
+                    key: "config.toml".into(),
+                    message: format!("internal task failed: {e}"),
+                }]
+            })??;
+        let view = self.settings_view_async().await;
+        Ok(self.patch_response(out, view))
+    }
+
+    /// Store a secret. Blocking when the store is (see `set_secret_async`). The event records
+    /// that it was set, never the value.
+    pub fn set_secret(&self, name: SecretName, value: String) -> Result<SecretStatus> {
+        self.secrets.set(name, &value)?;
+        self.writer.send_nowait(WriteOp::RecordEvent {
+            actor: Actor::User,
+            action: "secret.set".into(),
+            target_type: "secret".into(),
+            target_id: name.as_str().into(),
+            before: None,
+            after: None,
+        });
+        Ok(secrets::status_with(
+            self.secrets.as_ref(),
+            name,
+            self.secret_env.as_ref(),
+        ))
+    }
+
+    /// `true` when there was a value to delete.
+    pub fn delete_secret(&self, name: SecretName) -> Result<bool> {
+        let had = self.secrets.delete(name)?;
+        if had {
+            self.writer.send_nowait(WriteOp::RecordEvent {
+                actor: Actor::User,
+                action: "secret.delete".into(),
+                target_type: "secret".into(),
+                target_id: name.as_str().into(),
+                before: None,
+                after: None,
+            });
+        }
+        Ok(had)
+    }
+
+    /// Runs `f` (a call into the secrets store) off the runtime's threads, for at most
+    /// `secrets_timeout`.
+    async fn secrets_call<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        match tokio::time::timeout(self.opts.secrets_timeout, tokio::task::spawn_blocking(f)).await
+        {
+            Ok(done) => done.map_err(join_err)?,
+            Err(_) => Err(AliceError::Other(format!(
+                "the {} did not answer within {} ms; unlock it or approve its prompt, then try again (a change that was asked for may still land: see `alice config list`)",
+                self.secrets_store_name(),
+                self.opts.secrets_timeout.as_millis()
+            ))),
+        }
+    }
+
+    /// `set_secret` for a request handler.
+    pub async fn set_secret_async(
+        self: &Arc<Self>,
+        name: SecretName,
+        value: String,
+    ) -> Result<SecretStatus> {
+        let me = self.clone();
+        self.secrets_call(move || me.set_secret(name, value)).await
+    }
+
+    /// `delete_secret` for a request handler.
+    pub async fn delete_secret_async(self: &Arc<Self>, name: SecretName) -> Result<bool> {
+        let me = self.clone();
+        self.secrets_call(move || me.delete_secret(name)).await
+    }
+
+    /// Connection test for a provider. Task 9 adds `judge` with Jev; Task 16 HTTP embeddings.
+    pub async fn test_provider(&self, which: &str) -> Result<ProviderTest> {
+        let started = Instant::now();
+        let took = || started.elapsed().as_millis() as u64;
+        match which {
+            "embedding" => {
+                let e = self.embedder.clone();
+                let r = tokio::task::spawn_blocking(move || {
+                    e.embed_passages(&["connection test".to_string()])
+                })
+                .await
+                .map_err(join_err)?;
+                Ok(match r {
+                    Ok(v) if v.len() == 1 => ProviderTest {
+                        ok: true,
+                        message: format!(
+                            "{} answered with {} dimensions",
+                            self.embedder.model_id(),
+                            v[0].len()
+                        ),
+                        latency_ms: took(),
+                    },
+                    Ok(_) => ProviderTest {
+                        ok: false,
+                        message: "the embedder returned no vector".into(),
+                        latency_ms: took(),
+                    },
+                    Err(e) => ProviderTest {
+                        ok: false,
+                        message: e.to_string(),
+                        latency_ms: took(),
+                    },
+                })
+            }
+            "judge" => Ok(ProviderTest {
+                ok: true,
+                message: "the heuristic judge needs no connection".into(),
+                latency_ms: took(),
+            }),
+            other => Err(AliceError::invalid(format!(
+                "unknown provider \"{other}\"; test judge or embedding"
+            ))),
+        }
+    }
+
+    /// Tests: how many times the health was read.
+    #[cfg(test)]
+    pub(crate) fn health_reads(&self) -> usize {
+        self.health_reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Tests: make the shared health reading `by` older.
+    #[cfg(test)]
+    pub(crate) async fn age_stream_health(&self, by: Duration) {
+        if let Some((at, _)) = self.stream_health.lock().await.as_mut() {
+            *at = at
+                .checked_sub(by)
+                .expect("the machine has been up longer than the test ages a reading");
+        }
     }
 
     pub async fn ingest(&self, req: IngestRequest) -> Result<IngestOutcome> {
@@ -804,6 +1208,12 @@ impl Service {
     }
 
     pub async fn health(&self) -> Result<Health> {
+        #[cfg(test)]
+        self.health_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let settings_warnings = self.settings.warnings();
+        let settings_errors = self.settings.errors();
+        let config_degraded = self.settings.config_degraded();
         let instance = self.instance.clone();
         let read_only = self.writer.read_only.reason();
         let index_ready = self.index.read().is_some();
@@ -822,6 +1232,9 @@ impl Service {
                 embed_backlog: embeddings::backlog(c)? as u64,
                 read_only,
                 index_ready,
+                settings_warnings,
+                settings_errors,
+                config_degraded,
             })
         })
         .await
@@ -893,12 +1306,21 @@ mod tests {
     use alice_core::store::memories::{MemoryUpdate, UpdateAction};
     use alice_core::store::sources::{ChunkInput, SourceInput};
 
+    /// Options whose secret status ignores the machine's environment (a developer's own
+    /// `TYPESAFE_API_KEY` must not change what a test sees).
+    fn quiet() -> ServiceOptions {
+        ServiceOptions {
+            secret_env: Some(Arc::new(|_| None)),
+            ..Default::default()
+        }
+    }
+
     async fn svc() -> (tempfile::TempDir, Arc<Service>) {
         let d = tempfile::tempdir().unwrap();
         let s = Service::start(
             AliceHome::new(d.path().to_path_buf()),
             &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
-            ServiceOptions::default(),
+            quiet(),
         )
         .unwrap();
         (d, s)
@@ -995,7 +1417,8 @@ mod tests {
     }
 
     /// Every event-stream client shares one health reading per tick: the counts are read once,
-    /// not once per connected client.
+    /// not once per connected client. A reading counts as fresh for half a tick. No sleeping:
+    /// the tick is long and the cached reading is aged by hand.
     #[tokio::test(flavor = "multi_thread")]
     async fn stream_health_is_read_once_per_tick_for_all_clients() {
         let d = tempfile::tempdir().unwrap();
@@ -1003,16 +1426,15 @@ mod tests {
             AliceHome::new(d.path().to_path_buf()),
             &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
             ServiceOptions {
-                // Longer than a slow CI machine's remember below.
-                health_tick: Duration::from_secs(3),
-                ..Default::default()
+                health_tick: Duration::from_secs(600),
+                ..quiet()
             },
         )
         .unwrap();
-        let first_read = tokio::time::Instant::now();
         let (a, b) = tokio::join!(s.stream_health(), s.stream_health());
         assert_eq!(a.unwrap().memories, 0);
         assert_eq!(b.unwrap().memories, 0);
+        assert_eq!(s.health_reads(), 1, "two clients, one reading");
         s.remember(RememberRequest {
             content: "counted on the next tick".into(),
             ..Default::default()
@@ -1024,8 +1446,21 @@ mod tests {
             0,
             "the reading of this tick is shared"
         );
-        tokio::time::sleep_until(first_read + Duration::from_millis(3_100)).await;
-        assert_eq!(s.stream_health().await.unwrap().memories, 1);
+        assert_eq!(s.health_reads(), 1);
+        // Younger than half a tick: still fresh. Older: read again.
+        s.age_stream_health(Duration::from_secs(290)).await;
+        assert_eq!(
+            s.stream_health().await.unwrap().memories,
+            0,
+            "290 s < 300 s"
+        );
+        s.age_stream_health(Duration::from_secs(20)).await;
+        assert_eq!(
+            s.stream_health().await.unwrap().memories,
+            1,
+            "310 s > 300 s"
+        );
+        assert_eq!(s.health_reads(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1970,5 +2405,552 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("writer stopped"), "{err}");
         assert_eq!(s.health().await.unwrap().memories, 1, "reads still work");
+    }
+
+    // ------------------------------------------------------------------ Task 6: live settings
+
+    use crate::config::SettingsHandle;
+    use crate::secrets::{SecretName, SecretStore};
+    use alice_core::settings::SecretValue;
+
+    /// Events for `target`, polled until `ok` holds (at most 5 s): writes queued with
+    /// `send_nowait` land a moment after the call that caused them returns.
+    async fn wait_events(
+        s: &Service,
+        target: &str,
+        ok: impl Fn(&[EventRow]) -> bool,
+    ) -> Vec<EventRow> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let ev = s
+                .events(EventsRequest {
+                    target_id: Some(target.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            if ok(&ev) {
+                return ev;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no matching event for {target}: {ev:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    fn patch_one(
+        key: &str,
+        value: serde_json::Value,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(key.into(), value);
+        m
+    }
+
+    /// A secret store in memory. `delay_ms` makes every call slow, as a keychain that waits
+    /// for a permission prompt is (and can be set back to 0 when the prompt is answered).
+    struct MemSecrets {
+        map: Mutex<HashMap<SecretName, String>>,
+        delay_ms: std::sync::atomic::AtomicU64,
+    }
+
+    impl MemSecrets {
+        fn new(delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                map: Mutex::default(),
+                delay_ms: std::sync::atomic::AtomicU64::new(delay.as_millis() as u64),
+            })
+        }
+        fn wait(&self) {
+            let ms = self.delay_ms.load(Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
+
+    impl SecretStore for MemSecrets {
+        fn get(&self, name: SecretName) -> Result<Option<SecretValue>> {
+            self.wait();
+            Ok(self.map.lock().get(&name).map(SecretValue::new))
+        }
+        fn set(&self, name: SecretName, value: &str) -> Result<()> {
+            self.wait();
+            self.map.lock().insert(name, value.trim().to_string());
+            Ok(())
+        }
+        fn delete(&self, name: SecretName) -> Result<bool> {
+            self.wait();
+            Ok(self.map.lock().remove(&name).is_some())
+        }
+        fn backend(&self) -> &'static str {
+            "keychain"
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_settings_apply_to_the_next_recall_without_a_restart() {
+        let (d, s) = svc().await;
+        let cwd = repo(&d, "proj");
+        s.remember(RememberRequest {
+            content: "lease timeouts in the hub writer".into(),
+            cwd: cwd.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_embedded(&s).await;
+        let q = || RecallRequest {
+            query: "writer hub lease timeout problem".into(),
+            cwd: cwd.clone(),
+            format: OutputFormat::Json,
+            ..Default::default()
+        };
+        let before = s.recall(q()).await.unwrap().results;
+        assert!(
+            !before.is_empty() && before.iter().all(|h| h.score > 0.0),
+            "found, with a score, before the change: {before:?}"
+        );
+        let before = before.len();
+        let out = s
+            .patch_settings(patch_one(
+                "search.weights.knowledge",
+                serde_json::json!(0.0),
+            ))
+            .unwrap();
+        assert_eq!(out.changed, vec!["search.weights.knowledge".to_string()]);
+        let after = s.recall(q()).await.unwrap();
+        assert!(
+            !after.results.is_empty(),
+            "the memory is still returned (weights scale scores; they do not filter)"
+        );
+        assert!(
+            after.results.iter().all(|h| h.score == 0.0),
+            "knowledge weight 0 zeroes knowledge scores: {before} → {:?}",
+            after.results
+        );
+        // The settings event is written fire-and-forget by the config-events thread: wait for it.
+        let ev = wait_events(&s, "config", |ev| {
+            ev.iter().any(|e| e.action == "settings.change")
+        })
+        .await;
+        assert!(
+            ev[0]
+                .after
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("search.weights.knowledge")
+        );
+    }
+
+    /// The token budget of a recall and the half-lives come from the settings too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_default_token_budget_is_a_setting() {
+        let (d, s) = svc().await;
+        let cwd = repo(&d, "proj");
+        for i in 0..5 {
+            s.remember(RememberRequest {
+                content: format!("budget memory {i}: {}", "lease timeout ".repeat(30)),
+                cwd: cwd.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        wait_embedded(&s).await;
+        let q = || RecallRequest {
+            query: "lease timeout".into(),
+            cwd: cwd.clone(),
+            format: OutputFormat::Json,
+            ..Default::default()
+        };
+        let roomy = s.recall(q()).await.unwrap();
+        assert_eq!(roomy.omitted, 0, "{roomy:?}");
+        s.patch_settings(patch_one(
+            "search.default_max_tokens",
+            serde_json::json!(100),
+        ))
+        .unwrap();
+        let tight = s.recall(q()).await.unwrap();
+        assert!(
+            tight.omitted > 0,
+            "100 tokens hold fewer results: {tight:?}"
+        );
+        // A request that names its own budget is not changed by the setting.
+        let own = s
+            .recall(RecallRequest {
+                max_tokens: Some(1500),
+                ..q()
+            })
+            .await
+            .unwrap();
+        assert_eq!(own.omitted, 0);
+    }
+
+    /// An edit of config.toml applies to the running service by itself (the watcher), and the
+    /// stop joins the watcher.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_edit_of_config_toml_applies_live_and_shutdown_stops_the_watcher() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let s = Service::start(
+            home.clone(),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                settings_poll: Duration::from_millis(50),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        std::fs::write(home.config_file(), "[search]\nrelevance_floor = 0.9\n").unwrap();
+        for _ in 0..200 {
+            if s.settings().search.relevance_floor == 0.9 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(s.settings().search.relevance_floor, 0.9);
+        assert_eq!(
+            s.settings_view().sources["search.relevance_floor"],
+            alice_core::settings::Source::File
+        );
+        let started = Instant::now();
+        s.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secrets_are_write_only_and_their_events_carry_no_value() {
+        let (_d, s) = svc().await;
+        let st = s
+            .set_secret(SecretName::EmbeddingApiKey, "sk-test-0123456789abcd".into())
+            .unwrap();
+        assert_eq!((st.set, st.hint.as_deref()), (true, Some("••••abcd")));
+        let view = s.settings_view();
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("0123456789"), "{json}");
+        assert!(view.secrets["embedding_api_key"].set);
+        let ev = wait_events(&s, "embedding_api_key", |ev| {
+            ev.iter().any(|e| e.action == "secret.set")
+        })
+        .await;
+        assert_eq!(ev[0].action, "secret.set");
+        assert_eq!(ev[0].actor, "user");
+        assert!(!serde_json::to_string(&ev).unwrap().contains("0123456789"));
+        assert!(s.delete_secret(SecretName::EmbeddingApiKey).unwrap());
+        assert!(!s.settings_view().secrets["embedding_api_key"].set);
+        let ev = wait_events(&s, "embedding_api_key", |ev| {
+            ev.iter().any(|e| e.action == "secret.delete")
+        })
+        .await;
+        assert!(ev.iter().all(|e| e.after.is_none() && e.before.is_none()));
+        // Deleting what is not there records nothing and says so.
+        assert!(!s.delete_secret(SecretName::EmbeddingApiKey).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invalid_config_edit_keeps_the_running_settings_and_shows_the_error() {
+        let (d, s) = svc().await;
+        let home = AliceHome::new(d.path().to_path_buf());
+        std::fs::write(
+            home.config_file(),
+            "[judge]\nreview_threshold = 0.9\nauto_apply_threshold = 0.6\n",
+        )
+        .unwrap();
+        assert!(s.settings_handle().reload_if_changed().is_none());
+        assert_eq!(s.settings().judge.review_threshold, 0.5);
+        let view = s.settings_view();
+        assert!(
+            view.errors
+                .iter()
+                .any(|e| e.key == "judge.review_threshold"),
+            "{:?}",
+            view.errors
+        );
+        // The daemon's health carries the same errors.
+        let h = s.health().await.unwrap();
+        assert!(
+            h.settings_errors
+                .iter()
+                .any(|e| e.key == "judge.review_threshold"),
+            "{:?}",
+            h.settings_errors
+        );
+        assert!(
+            !h.config_degraded,
+            "a good config loaded before; the last one stays"
+        );
+        // A good edit clears them.
+        std::fs::write(home.config_file(), "[judge]\nreview_threshold = 0.6\n").unwrap();
+        assert!(s.settings_handle().reload_if_changed().is_some());
+        assert!(s.settings_view().errors.is_empty());
+        assert!(s.health().await.unwrap().settings_errors.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_config_that_never_parsed_is_flagged_in_health_and_the_view() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        home.ensure_dirs().unwrap();
+        std::fs::write(home.config_file(), "[judge\n").unwrap();
+        let s = Service::start(
+            home,
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            quiet(),
+        )
+        .unwrap();
+        let h = s.health().await.unwrap();
+        assert!(h.config_degraded);
+        assert!(h.settings_errors.iter().any(|e| e.key == "config.toml"));
+        let v = s.settings_view();
+        assert!(v.config_degraded);
+        assert!(v.errors.iter().any(|e| e.key == "config.toml"));
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ignored_variables_show_in_health_and_the_settings_view() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        home.ensure_dirs().unwrap();
+        let handle = SettingsHandle::load_with_env(&home, vec![("ALICE_NOPE".into(), "1".into())]);
+        let s = Service::start(
+            home,
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                settings: Some(handle),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        assert!(
+            s.health()
+                .await
+                .unwrap()
+                .settings_warnings
+                .iter()
+                .any(|w| w.contains("ALICE_NOPE"))
+        );
+        assert!(
+            s.settings_view()
+                .warnings
+                .iter()
+                .any(|w| w.contains("ALICE_NOPE"))
+        );
+        s.shutdown();
+    }
+
+    /// A settings change is one `settings.change` event by the user, naming the keys and no
+    /// value, and one `settings` stream item.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_settings_change_is_an_event_with_keys_only_and_a_stream_item() {
+        let (_d, s) = svc().await;
+        let mut rx = s.subscribe();
+        s.patch_settings(patch_one("judge.review_threshold", serde_json::json!(0.65)))
+            .unwrap();
+        let changed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(StreamItem::Settings { changed }) => break changed,
+                    Ok(_) => continue,
+                    Err(e) => panic!("stream ended: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("a settings item within 5 s");
+        assert_eq!(changed, vec!["judge.review_threshold".to_string()]);
+        let ev = wait_events(&s, "config", |ev| !ev.is_empty()).await;
+        assert_eq!(
+            (
+                ev[0].action.as_str(),
+                ev[0].actor.as_str(),
+                ev[0].target_type.as_str()
+            ),
+            ("settings.change", "user", "settings")
+        );
+        assert_eq!(
+            ev[0].after,
+            Some(serde_json::json!({"changed": ["judge.review_threshold"]}))
+        );
+        assert_eq!(ev[0].before, None);
+        // Settings are not memories: the history refuses to undo them, and says why.
+        let err = s
+            .undo(UndoRequest {
+                event_id: ev[0].id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be undone"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_keys_show_as_pending_until_the_value_is_back() {
+        let (_d, s) = svc().await;
+        let out = s
+            .patch_settings(patch_one("embedding.idle_unload", serde_json::json!("5m")))
+            .unwrap();
+        assert_eq!(
+            out.restart_required,
+            vec!["embedding.idle_unload".to_string()]
+        );
+        assert_eq!(
+            out.view.restart_pending,
+            vec!["embedding.idle_unload".to_string()]
+        );
+        // Live keys never wait for a restart.
+        let out = s
+            .patch_settings(patch_one("judge.review_threshold", serde_json::json!(0.6)))
+            .unwrap();
+        assert_eq!(
+            out.view.restart_pending,
+            vec!["embedding.idle_unload".to_string()]
+        );
+        assert!(out.restart_required.is_empty());
+        let out = s
+            .patch_settings(patch_one("embedding.idle_unload", serde_json::json!("10m")))
+            .unwrap();
+        assert!(
+            out.view.restart_pending.is_empty(),
+            "{:?}",
+            out.view.restart_pending
+        );
+    }
+
+    /// Secrets do not move with the backend: say so wherever the change shows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_the_secrets_backend_says_that_secrets_are_not_copied() {
+        let (_d, s) = svc().await;
+        assert!(
+            s.settings_view().notes.is_empty(),
+            "{:?}",
+            s.settings_view().notes
+        );
+        let out = s
+            .patch_settings(patch_one("secrets.backend", serde_json::json!("keychain")))
+            .unwrap();
+        assert_eq!(out.restart_required, vec!["secrets.backend".to_string()]);
+        let note = out
+            .view
+            .notes
+            .iter()
+            .find(|n| n.contains("secrets.backend"))
+            .unwrap_or_else(|| panic!("{:?}", out.view.notes));
+        assert!(
+            note.contains("not copied") && note.contains("set-secret"),
+            "{note}"
+        );
+        let out = s
+            .patch_settings(patch_one("secrets.backend", serde_json::json!("file")))
+            .unwrap();
+        assert!(
+            out.view.notes.is_empty(),
+            "back to the running backend: {:?}",
+            out.view.notes
+        );
+    }
+
+    /// A loosening typed into config.toml waits for three polls; the view says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_loosening_in_the_file_is_announced_while_it_waits() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let s = Service::start(
+            home.clone(),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                // The test polls by hand; the watcher must not count polls of its own.
+                settings_poll: Duration::from_secs(3_600),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        std::fs::write(home.config_file(), "[privacy]\nredact = false\n").unwrap();
+        assert!(s.settings_handle().reload_if_changed().is_none());
+        let notes = s.settings_view().notes;
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("3 polls") && n.contains("config.toml")),
+            "{notes:?}"
+        );
+        assert!(s.settings().privacy.redact);
+        s.settings_handle().reload_if_changed();
+        assert!(s.settings_handle().reload_if_changed().is_some());
+        assert!(s.settings_view().notes.is_empty());
+    }
+
+    /// A keychain that waits for a prompt must not hold up a request or pile up threads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_keychain_that_does_not_answer_never_blocks_a_request() {
+        let d = tempfile::tempdir().unwrap();
+        let store = MemSecrets::new(Duration::from_millis(400));
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                secrets: Some(store.clone()),
+                secrets_timeout: Duration::from_millis(100),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        let started = Instant::now();
+        let view = s.settings_view_async().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(view.secrets.values().all(|x| !x.set));
+        assert!(
+            view.notes
+                .iter()
+                .any(|n| n.contains("keychain") && n.contains("did not answer")),
+            "{:?}",
+            view.notes
+        );
+        // The first read is still stuck: a second request does not start another one.
+        let started = Instant::now();
+        let again = s.settings_view_async().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(again.notes.iter().any(|n| n.contains("keychain")));
+        // Writes give up with an error that says what to do.
+        let err = s
+            .set_secret_async(SecretName::JevApiKey, "ts_secret_value_1234".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("did not answer"), "{err}");
+        // Once the prompt is answered and the stuck read has ended, the view is back to normal.
+        store.delay_ms.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let view = s.settings_view_async().await;
+        assert!(
+            view.notes.iter().all(|n| !n.contains("did not answer")),
+            "{:?}",
+            view.notes
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_provider_test_answers_for_embedding_and_judge_and_refuses_others() {
+        let (_d, s) = svc().await;
+        let e = s.test_provider("embedding").await.unwrap();
+        assert!(e.ok && e.message.contains("384"), "{e:?}");
+        let j = s.test_provider("judge").await.unwrap();
+        assert!(j.ok, "{j:?}");
+        let err = s.test_provider("jev2").await.unwrap_err();
+        assert!(matches!(err, AliceError::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("judge or embedding"));
     }
 }
