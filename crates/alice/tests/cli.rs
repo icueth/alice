@@ -2251,7 +2251,7 @@ fn service_commands(root: &std::path::Path) -> Vec<String> {
         .lines()
         // The questions asked of the manager (is it loaded?) are not actions.
         .filter(|l| {
-            !["launchctl print", "is-active", "/Query"]
+            !["launchctl print", "show -p", "/Query"]
                 .iter()
                 .any(|p| l.contains(p))
         })
@@ -2305,13 +2305,16 @@ fn restore_stops_the_installed_service_unit_and_starts_it_again() {
     assert_eq!(env.recall_count("backup"), 1, "the restore itself worked");
 }
 
-/// The words of the probe that asks the manager whether the unit is loaded.
-fn probe_word() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "launchctl print"
-    } else {
-        "is-active"
-    }
+/// Scripted answers of the sandbox's service manager (`service-responses`): the probe says the
+/// unit is stopped (launchd: not found, 113; systemd: `inactive`), or cannot be asked.
+fn script_probe(svc: &std::path::Path, answer: &str) {
+    let line = match (cfg!(target_os = "macos"), answer) {
+        (true, "stopped") => "launchctl print\t113\t",
+        (true, _) => "launchctl print\t5\t",
+        (false, "stopped") => "show -p\t0\tinactive\\ndead\\n",
+        (false, _) => "show -p\t1\t",
+    };
+    std::fs::write(svc.join("service-responses"), format!("{line}\n")).unwrap();
 }
 
 /// The service command words that stop and start the unit on this platform.
@@ -2420,7 +2423,7 @@ fn restore_is_refused_when_the_unit_cannot_be_stopped_and_a_daemon_runs() {
     // to stop, whether a daemon runs or not; the restore goes on and starts nothing afterwards.
     let before = service_commands(&env.svc).len();
     let mut c = env.cmd(&["restore", &name, "--yes"]);
-    c.env("ALICE_SERVICE_FAIL", probe_word());
+    script_probe(&env.svc, "stopped");
     let o = c.output().unwrap();
     assert!(o.status.success(), "{}", stderr(&o));
     assert_eq!(
@@ -2569,7 +2572,7 @@ fn the_service_sandbox_says_so_on_stderr() {
         "service commands are recorded in {}, not run (ALICE_SERVICE_ROOT is set)",
         env.svc.display()
     );
-    assert!(stderr(&o).contains(&want), "{}", stderr(&o));
+    assert_eq!(stderr(&o).matches(&want).count(), 1, "{}", stderr(&o));
     env.ok(&["remember", "x"]);
     let name = env.json(&["backup", "now"])["name"]
         .as_str()
@@ -2622,4 +2625,49 @@ fn service_install_with_a_target_dir_creates_the_homes_logs_not_the_targets() {
     ]);
     assert!(env.home.join("logs").is_dir());
     assert!(!target.join("logs").exists());
+}
+
+/// A manager that cannot be asked (no user bus, no gui domain) refuses the restore with nothing
+/// changed and no command but the probe; a stopped unit is neither stopped nor started.
+#[test]
+fn restore_refuses_when_the_manager_cannot_be_asked_and_never_starts_a_stopped_unit() {
+    let env = Env::new();
+    env.ok(&["service", "install"]);
+    env.ok(&["remember", "alpha before the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["remember", "beta after the backup"]);
+    let before = service_commands(&env.svc).len();
+    script_probe(&env.svc, "unknown");
+    let o = env.run(&["restore", &name, "--yes"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("by hand") && stderr(&o).contains("nothing was changed"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        service_commands(&env.svc).len(),
+        before,
+        "no command but the probe"
+    );
+    assert_eq!(env.recall_count("beta"), 1, "nothing was restored");
+    // Stopped: the restore goes ahead, with no service command at all.
+    script_probe(&env.svc, "stopped");
+    let o = env.run(&["restore", &name, "--yes"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(service_commands(&env.svc).len(), before);
+    // Uninstall with a manager that cannot be asked: refused, the unit file stays.
+    script_probe(&env.svc, "unknown");
+    let o = env.run(&["service", "uninstall"]);
+    assert!(!o.status.success());
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("Service removed"));
+    assert!(
+        env.run(&["service", "status"])
+            .stdout
+            .starts_with(b"installed"),
+        "the unit is still installed"
+    );
 }
