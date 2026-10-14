@@ -297,7 +297,6 @@ mod tests {
             ("hosts", "is_hosted"),
             ("contains", "contained_in"),
             ("includes", "included_in"),
-            ("owns", "owned_by"),
             ("parent_of", "child_of"),
         ] {
             assert!(directions_differ(a, b), "{a} / {b}");

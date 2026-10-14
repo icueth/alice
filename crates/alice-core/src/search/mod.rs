@@ -2018,7 +2018,7 @@ mod tests {
     #[test]
     fn a_chunk_is_judged_by_the_chunk_floor_only() {
         let t = Cos::new();
-        for (i, c) in [0.84f32, 0.80].into_iter().enumerate() {
+        for (i, c) in [0.90f32, 0.84, 0.80].into_iter().enumerate() {
             sources::ingest(
                 &t.c,
                 &t.app,
@@ -2067,11 +2067,13 @@ mod tests {
             .hits
             .len()
         };
+        // 0.84 is 0.06 below the best chunk, beyond the margin of 0.05 that memories get:
+        // chunks have no margin, so it is admitted; 0.80 is below the chunk floor.
         assert_eq!(
             run_raw(Some(CHUNK_RELEVANCE_FLOOR)),
-            1,
-            "0.80 is not admitted, 0.84 is"
+            2,
+            "0.90 and 0.84 are admitted, 0.80 is not"
         );
-        assert_eq!(run_raw(Some(0.79)), 2);
+        assert_eq!(run_raw(Some(0.79)), 3);
     }
 }

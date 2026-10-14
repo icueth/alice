@@ -499,6 +499,37 @@ fn real_model_gold_set_and_relevance_floor() {
             below.push(format!("{sim:.3} {}: {}", v.what, v.query));
         }
     }
+    // The three rows the policy decides (exact scale), pinned by name: the sure floor 0.825 and
+    // the rescue floor 0.805 are what separate them, so a change of either shows here.
+    let decided = [
+        ("เก็บจำนวนเงินเป็นสตริงเพื่อไม่ให้ปัดเศษผิด", 0.819, true),
+        ("ทำไมบันทึกไดอารี่ถึงหมดเวลา", 0.804, false),
+        (
+            "binary envelopes are mandatory; a text payload cannot be decoded",
+            0.831,
+            true,
+        ),
+    ];
+    for (query, expected_sim, admitted) in decided {
+        let i = VECTOR_ONLY.iter().position(|v| v.query == query).unwrap();
+        let sim = vector_only_exact[i];
+        assert!(
+            (sim - expected_sim).abs() < 0.005,
+            "{query:?} scores {sim:.3}, not about {expected_sim}: update the pins and m2.md"
+        );
+        assert_eq!(
+            vector_only[i].is_some_and(|r| r <= 3),
+            admitted,
+            "{query:?} ({sim:.3}) with the rescue floor {DEFAULT_RELEVANCE_FLOOR} and the sure floor {DEFAULT_RELEVANCE_SURE}"
+        );
+    }
+    // Headroom: the rescue floor clears the highest unrelated similarity by the cross-CPU drift
+    // it was chosen to allow for.
+    let unrelated_max = unrelated_exact.iter().cloned().fold(f32::MIN, f32::max);
+    assert!(
+        unrelated_max <= DEFAULT_RELEVANCE_FLOOR - 0.015 + 1e-6,
+        "an unrelated pair at {unrelated_max:.3} leaves less than 0.015 below the rescue floor"
+    );
     println!(
         "  vector-only pairs not returned at the floor {floor}: {} of {}",
         below.len(),

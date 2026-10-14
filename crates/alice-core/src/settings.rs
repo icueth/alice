@@ -350,9 +350,13 @@ pub struct SearchSettings {
     pub default_max_tokens: usize,
     /// Rescue floor for memories found only by meaning (cosine, 0 to 1): below the sure floor
     /// such a match counts as relevant at or above this and within the margin of the best one.
+    /// This used to be the single floor; for that behaviour set `relevance_sure` to the same
+    /// value. A floor above the default sure floor, with no `relevance_sure` of its own, raises
+    /// the sure floor with it (a single floor).
     pub relevance_floor: f64,
     /// Sure floor for memories found only by meaning (cosine, 0 to 1, not below the rescue
-    /// floor): at or above it a match is always relevant.
+    /// floor): at or above it a match is always relevant. Unset, it is 0.825 or the rescue
+    /// floor if that is higher.
     pub relevance_sure: f64,
     /// A memory found only by meaning below the sure floor is dropped when it is more than this
     /// below the best such match of the query (0 to 1; 0 turns the relative cut off). Word
@@ -1047,6 +1051,18 @@ fn resolve_leaves(
             .map(|e| env_safe(e, &sources, env))
             .collect()
     };
+    // A sure floor nobody set follows the rescue floor up: `relevance_floor = 0.85` alone means
+    // a single floor of 0.85, not an error about a key the owner never wrote.
+    if sources.get("search.relevance_sure") == Some(&Source::Default)
+        && let Some(floor) = merged["search"]["relevance_floor"].as_f64()
+        && floor > SearchSettings::default().relevance_sure
+    {
+        set_path(
+            &mut merged,
+            "search.relevance_sure",
+            serde_json::json!(floor),
+        );
+    }
     let settings: Settings = match serde_json::from_value(merged.clone()) {
         Ok(s) => s,
         Err(first) => {
@@ -2117,7 +2133,7 @@ mod tests {
                 "search.relevance_floor",
             ),
             (
-                "[search]\nrelevance_floor = 0.9\n",
+                "[search]\nrelevance_floor = 0.9\nrelevance_sure = 0.8\n",
                 &[],
                 "search.relevance_sure",
             ),
@@ -3158,5 +3174,54 @@ mod tests {
         assert_eq!(toml_line("a = 1\nb = 2\nc", 6), 2);
         assert_eq!(toml_line("a = 1\nb = 2\nc", 12), 3);
         assert_eq!(toml_line("a", 99), 1, "past the end is the last line");
+    }
+
+    /// N1: a floor above the default sure floor, with no sure floor of the owner's own, is a
+    /// single floor, not an error about a key nobody wrote; an explicit sure floor below the
+    /// floor is reported on that key and costs only itself.
+    #[test]
+    fn a_high_floor_raises_an_unset_sure_floor_and_an_explicit_one_is_checked() {
+        let r = resolve(Some("[search]\nrelevance_floor = 0.85\n"), &[]).unwrap();
+        assert_eq!(
+            (
+                r.settings.search.relevance_floor,
+                r.settings.search.relevance_sure
+            ),
+            (0.85, 0.85)
+        );
+        assert_eq!(
+            r.sources.get("search.relevance_sure"),
+            Some(&Source::Default),
+            "still a default"
+        );
+        let r = resolve(None, &env(&[("ALICE_SEARCH_RELEVANCE_FLOOR", "0.9")])).unwrap();
+        assert_eq!(r.settings.search.relevance_sure, 0.9);
+        // A floor at or below the default sure floor leaves it alone.
+        let r = resolve(Some("[search]\nrelevance_floor = 0.81\n"), &[]).unwrap();
+        assert_eq!(r.settings.search.relevance_sure, 0.825);
+        // Both set, the sure floor lower: the error names the sure floor.
+        let file = "[search]\nrelevance_floor = 0.85\nrelevance_sure = 0.81\n[judge]\nreview_threshold = 0.6\n";
+        let errs = resolve(Some(file), &[]).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.key == "search.relevance_sure"),
+            "{errs:?}"
+        );
+        // Salvaging drops that leaf only; the floor and the rest of the file apply.
+        let (r, left_out) = resolve_salvaging(Some(file), &[]);
+        assert_eq!(left_out.len(), 1, "{left_out:?}");
+        assert_eq!(left_out[0].key, "search.relevance_sure");
+        assert_eq!(r.settings.judge.review_threshold, 0.6);
+        assert_eq!(r.settings.search.relevance_floor, 0.85);
+        assert_eq!(r.settings.search.relevance_sure, 0.85);
+        // The same through the environment.
+        let errs = resolve(
+            Some("[search]\nrelevance_floor = 0.85\n"),
+            &env(&[("ALICE_SEARCH_RELEVANCE_SURE", "0.8")]),
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.key == "search.relevance_sure"),
+            "{errs:?}"
+        );
     }
 }

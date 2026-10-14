@@ -248,7 +248,7 @@ that pass the filters. A lexical match passes at any similarity. Transcript chun
 floor of 0.82 with no margin: the evidence above covers memories only.
 
 *Rescue floor, fixed by a bound, not tuned:* the highest similarity of an unrelated query to a gold
-memory with the real model is 0.786 (exact, M4 Pro), plus 0.015 for the drift between CPU families
+memory with the real model is 0.786 (exact, M4 Pro; the maximum of 60 measured unrelated pairs), plus 0.015 for the drift between CPU families
 (m2.md, Windows), rounded up to 0.005: **0.805**. Nothing a real unrelated query reaches can be
 rescued on this scale.
 
@@ -271,8 +271,7 @@ margin 0.015 in 19 folds, 0.825 with 0.005 in 1; on all 20 queries 0.825 and 0.0
 | 50 same-language queries (retrieved only): answering kept | 96.4% (108/112) | 89.3% (100/112) | 95.5% (107/112) |
 | same: other graded results admitted | 62.1% (630/1015) | 42.7% (433/1015) | 57.1% (580/1015) |
 
-*What this says.* Held out, the three-part policy keeps the answering memories floor 0.82 keeps and
-admits a fifth fewer of the others (5.0% against 6.3%); it does not find more answers. The round-1
+*What this says.* Held out, the three-part policy keeps as many answering memories as floor 0.82 (51 of 70 pooled both) and admits a fifth fewer of the others (5.0% against 6.3%); among the same-language answers it keeps 107 of 112 against 108 of 112. It does not find more answers. The round-1
 choice lost recall on both samples. More recall costs admission: the settings move the trade
 without a release.
 
