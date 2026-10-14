@@ -1,11 +1,14 @@
 //! SQLite storage. Only the daemon opens the database.
 
 pub mod embeddings;
+pub mod events;
 pub mod fts;
+pub mod history;
 pub mod kg;
 pub mod memories;
 pub mod migrations;
 pub mod projects;
+pub mod reviews;
 pub mod sources;
 
 use crate::error::Result;
@@ -452,6 +455,109 @@ mod tests {
     }
 
     #[test]
+    fn a_v1_database_migrates_to_v2_after_a_backup() {
+        let (d, path) = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)").unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(include_str!("sql/0001_init.sql")).unwrap();
+            tx.execute("INSERT INTO schema_migrations VALUES (1, 'x')", [])
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let conn = open_writer(&path).unwrap();
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('events')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(cols.contains(&"group_id".to_string()));
+        let backups = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("pre-migration")
+            })
+            .count();
+        assert_eq!(backups, 1, "a backup was taken before migrating");
+    }
+
+    /// An M1 database with data keeps every row through migration 2, gains the new columns
+    /// and indexes, and the dedupe index allows one open review item per key.
+    #[test]
+    fn migration_2_keeps_m1_rows_and_adds_the_indexes() {
+        let (_d, path) = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)").unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(include_str!("sql/0001_init.sql")).unwrap();
+            tx.execute("INSERT INTO schema_migrations VALUES (1, 'x')", [])
+                .unwrap();
+            tx.execute(
+                "INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id)
+                 VALUES ('E1', '2026-10-13T00:00:00.000Z', 'h', 'user', 'memory.edit', 'memory', 'M1')",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO review_items (id, type, payload_json, status, created_at)
+                 VALUES ('R1', 'merge', '{}', 'open', '2026-10-13T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let conn = open_writer(&path).unwrap();
+        let (events, reviews): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM events WHERE group_id IS NULL),
+                        (SELECT count(*) FROM review_items WHERE dedupe_key IS NULL)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (events, reviews),
+            (1, 1),
+            "M1 rows survive with NULL in the new columns"
+        );
+        let indexes: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('events_target', 'events_ts', 'events_group', 'review_open_dedupe', 'review_status') ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            indexes,
+            [
+                "events_group",
+                "events_target",
+                "events_ts",
+                "review_open_dedupe",
+                "review_status"
+            ]
+        );
+        let add = |id: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO review_items (id, type, payload_json, status, created_at, dedupe_key)
+                 VALUES (?1, 'undo', '{}', ?2, '2026-10-13T00:00:00.000Z', 'undo:E1')",
+                [id, status],
+            )
+        };
+        add("R2", "open").unwrap();
+        assert!(add("R3", "open").is_err(), "one open item per dedupe key");
+        add("R4", "resolved").unwrap();
+    }
+
+    #[test]
     fn backup_into_produces_a_readable_copy() {
         let (d, path) = temp_db();
         let conn = open_writer(&path).unwrap();
@@ -499,7 +605,9 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<_, _>>()
             .unwrap();
-        assert_eq!(versions, vec![migrations::CURRENT_VERSION, newer]);
+        let mut expected: Vec<i64> = (1..=migrations::CURRENT_VERSION).collect();
+        expected.push(newer);
+        assert_eq!(versions, expected);
     }
 
     #[test]

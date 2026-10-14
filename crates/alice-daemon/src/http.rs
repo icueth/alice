@@ -7,16 +7,22 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, FromRequest, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 
 /// Largest request body. An ingest at its limits (1,000 chunks of 32 KB) is about 32 MB of JSON.
 const BODY_LIMIT: usize = 40 * 1024 * 1024;
+/// A comment line on an idle event stream, so proxies and clients keep it open.
+const SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct Guard {
@@ -300,6 +306,85 @@ async fn admin_shutdown(State(st): State<AppState>) -> StatusCode {
     st.shutdown.cancel();
     StatusCode::ACCEPTED
 }
+async fn events(
+    State(st): State<AppState>,
+    query: Result<Query<EventsRequest>, QueryRejection>,
+) -> ApiResult<Vec<EventRow>> {
+    let Query(q) = query.map_err(|r| {
+        ApiError(AliceError::Invalid(format!(
+            "{}; use /api/v1/events?target_id=<id>&actor=<actor>&before=<event id>&limit=<1-500>",
+            r.body_text()
+        )))
+    })?;
+    Ok(Json(st.svc.events(q).await?))
+}
+async fn undo(
+    State(st): State<AppState>,
+    ApiJson(req): ApiJson<UndoRequest>,
+) -> ApiResult<UndoResponse> {
+    Ok(Json(st.svc.undo(req).await?))
+}
+
+/// What the event stream reads between messages.
+struct Feed {
+    rx: tokio::sync::broadcast::Receiver<StreamItem>,
+    svc: Arc<Service>,
+    tick: tokio::time::Interval,
+    /// The health last sent, without the fields that change on every reading.
+    last: Option<serde_json::Value>,
+    shutdown: CancellationToken,
+}
+
+fn sse_event(item: &StreamItem) -> Event {
+    Event::default().data(serde_json::to_string(item).unwrap_or_default())
+}
+
+/// Server-sent events: every committed change as JSON `StreamItem`s, plus the health on
+/// connect and whenever it changes (checked every `health_tick`). The stream ends when the
+/// daemon stops, so a graceful shutdown never waits for a client that stays connected.
+async fn stream(
+    State(st): State<AppState>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let mut tick = tokio::time::interval(st.svc.health_tick());
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick fires at once: the stream opens with the current health.
+    let feed = Feed {
+        rx: st.svc.subscribe(),
+        svc: st.svc.clone(),
+        tick,
+        last: None,
+        shutdown: st.shutdown.clone(),
+    };
+    let s = futures::stream::unfold(feed, |mut f| async move {
+        loop {
+            tokio::select! {
+                _ = f.shutdown.cancelled() => return None,
+                item = f.rx.recv() => match item {
+                    Ok(item) => return Some((Ok(sse_event(&item)), f)),
+                    // A slow client missed items; it can list /api/v1/events again.
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::debug!(missed = n, "event stream client fell behind");
+                        continue;
+                    }
+                    Err(RecvError::Closed) => return None,
+                },
+                _ = f.tick.tick() => {
+                    let Ok(health) = f.svc.health().await else { continue };
+                    // Memory use changes on every reading; it alone is not a change.
+                    let mut key = serde_json::to_value(&health).unwrap_or_default();
+                    if let Some(o) = key.as_object_mut() {
+                        o.remove("memory_bytes");
+                    }
+                    if f.last.as_ref() != Some(&key) {
+                        f.last = Some(key);
+                        return Some((Ok(sse_event(&StreamItem::Health { health })), f));
+                    }
+                }
+            }
+        }
+    });
+    Sse::new(s).keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE))
+}
 
 /// Build the router: the public ping, and everything else (the JSON API and the MCP service
 /// at `/mcp`) behind the token, Host and Origin guard.
@@ -326,6 +411,9 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/facts/query", post(facts))
         .route("/api/v1/facts/assert", post(assert_fact))
         .route("/api/v1/ingest", post(ingest))
+        .route("/api/v1/events", get(events))
+        .route("/api/v1/undo", post(undo))
+        .route("/api/v1/events/stream", get(stream))
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         // Before the guard layer, so `/mcp` is covered by it.
         .nest_service(

@@ -563,9 +563,11 @@ fn every_subcommand_round_trips() {
             .contains("not found: ")
     );
 
-    assert_eq!(
-        e.ok(&["update", &id, "--action", "archive"]),
-        format!("{id} is now archived\n")
+    let archived = e.ok(&["update", &id, "--action", "archive"]);
+    assert!(
+        archived.starts_with(&format!("{id} is now archived (event "))
+            && archived.contains("undo with `alice undo "),
+        "{archived}"
     );
     assert_eq!(
         e.json(&["update", &id, "--action", "restore"])["memory"]["status"],
@@ -630,6 +632,36 @@ fn every_subcommand_round_trips() {
         e.json(&["get", anon])["memories"][0]["memory"]["author"]["agent"],
         "cli"
     );
+
+    // History: who changed what, with the event ids undo takes.
+    let history = e.json(&["history", other]);
+    let created = &history[0];
+    assert_eq!(created["action"], "memory.create", "{history}");
+    assert_eq!(created["target_id"], other);
+    assert_eq!(created["actor"], "agent:codex");
+    let event = created["id"].as_str().unwrap().to_string();
+    let listed = e.ok(&["history", "--actor", "agent:codex", "--limit", "1"]);
+    assert!(
+        listed.contains(&event) && listed.contains("memory.create") && listed.lines().count() == 1,
+        "{listed}"
+    );
+    assert_eq!(e.ok(&["undo", &event]), "Undone: 1 change(s) reverted.\n");
+    let found = e.json(&["recall", "a note by another agent", "--limit", "20"]);
+    assert!(
+        found["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["id"] != other),
+        "the undone memory is in the trash: {found}"
+    );
+    let undone_by = &e.json(&["history", other])[0];
+    assert_eq!(undone_by["action"], "undo:memory.create");
+    assert_eq!(undone_by["actor"], "user", "the CLI acts for the user");
+    let twice = e.run(&["undo", &event]);
+    assert!(!twice.status.success());
+    let err = String::from_utf8_lossy(&twice.stderr);
+    assert!(err.contains("already undone"), "{err}");
 }
 
 /// The pending entries in the spool.

@@ -7,6 +7,8 @@ use crate::store::sources::{ChunkInput, SourceInput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub use crate::store::events::{EventQuery as EventsRequest, EventRow};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RecallMode {
@@ -203,6 +205,9 @@ pub struct MemoryFull {
     pub memory: Memory,
     pub links: Vec<LinkRef>,
     pub provenance: Vec<String>,
+    /// Set on `update` answers: the event that recorded the change (pass it to `undo`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -217,6 +222,43 @@ pub struct UpdateRequest {
     pub id: String,
     #[serde(flatten)]
     pub update: MemoryUpdate,
+    /// Who makes the change (filled by the daemon: the MCP client, or the CLI).
+    #[serde(default)]
+    #[schemars(skip)]
+    pub author: Author,
+}
+
+/// Reverse a change: the event id comes from `alice history` or `/api/v1/events`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct UndoRequest {
+    pub event_id: String,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub author: Author,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UndoResponse {
+    pub undone: bool,
+    /// Events reverted (the whole group of the one asked for).
+    pub reverted: Vec<String>,
+    /// Set when the target changed since: a review item asks what to do.
+    pub review_id: Option<String>,
+    pub message: String,
+}
+
+/// What `/api/v1/events/stream` pushes (one JSON object per SSE message).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamItem {
+    /// A committed change.
+    Event { event: EventRow },
+    /// A review item was added.
+    Review { id: String, review_type: String },
+    /// Settings changed (their keys).
+    Settings { changed: Vec<String> },
+    /// The daemon's health: on connect, then whenever it changes.
+    Health { health: Health },
 }
 
 /// Raw evidence ingest (used by capture hooks and importers).
@@ -297,6 +339,91 @@ mod tests {
         let update = schemars::schema_for!(UpdateRequest);
         let props = &update.as_value()["properties"];
         assert!(props.get("id").is_some() && props.get("action").is_some());
+        // Who changed something is the daemon's to fill (the MCP client's name, or the CLI).
+        for (name, schema) in [
+            ("update", update.clone()),
+            ("assert_fact", schemars::schema_for!(AssertFactRequest)),
+            ("undo", schemars::schema_for!(UndoRequest)),
+        ] {
+            let props = schema.as_value()["properties"].clone();
+            assert!(props.is_object(), "{name}");
+            assert!(props.get("author").is_none(), "{name} exposes author");
+        }
+        let u: UpdateRequest =
+            serde_json::from_str(r#"{"id":"01J","action":"archive","author":{"agent":"codex"}}"#)
+                .unwrap();
+        assert_eq!(u.author.agent.as_deref(), Some("codex"));
+        let f: AssertFactRequest =
+            serde_json::from_str(r#"{"subject":"a","predicate":"uses","object":"b"}"#).unwrap();
+        assert_eq!(f.author, Author::default());
+        let undo: UndoRequest = serde_json::from_str(r#"{"event_id":"01E"}"#).unwrap();
+        assert_eq!((undo.event_id.as_str(), undo.author.agent), ("01E", None));
+    }
+
+    /// Only `update` answers carry the event id (`undo` takes it); elsewhere it is left out.
+    #[test]
+    fn memory_full_omits_an_absent_event_id() {
+        let m: Memory = serde_json::from_value(serde_json::json!({
+            "id": "M", "project": "global", "kind": "fact", "title": "t", "body": "b",
+            "topics": [], "importance": 3, "status": "active", "author": {},
+            "created_at": "2026-10-14T00:00:00.000Z", "updated_at": "2026-10-14T00:00:00.000Z",
+            "access_count": 0
+        }))
+        .unwrap();
+        let mut full = MemoryFull {
+            memory: m,
+            links: Vec::new(),
+            provenance: Vec::new(),
+            event_id: None,
+        };
+        assert!(
+            serde_json::to_value(&full)
+                .unwrap()
+                .get("event_id")
+                .is_none()
+        );
+        full.event_id = Some("E".into());
+        assert_eq!(serde_json::to_value(&full).unwrap()["event_id"], "E");
+    }
+
+    #[test]
+    fn stream_items_are_tagged_by_type() {
+        let event = EventRow {
+            id: "E".into(),
+            ts: "2026-10-14T00:00:00.000Z".into(),
+            hlc: "h".into(),
+            actor: "user".into(),
+            action: "memory.edit".into(),
+            target_type: "memory".into(),
+            target_id: "M".into(),
+            before: None,
+            after: Some(serde_json::json!({"body": "b"})),
+            group_id: None,
+        };
+        let v = serde_json::to_value(StreamItem::Event { event }).unwrap();
+        assert_eq!(
+            (v["type"].as_str(), v["event"]["target_id"].as_str()),
+            (Some("event"), Some("M"))
+        );
+        let v = serde_json::to_value(StreamItem::Review {
+            id: "R".into(),
+            review_type: "undo".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"type": "review", "id": "R", "review_type": "undo"})
+        );
+        let v = serde_json::to_value(StreamItem::Settings {
+            changed: vec!["judge.provider".into()],
+        })
+        .unwrap();
+        assert_eq!(v["type"], "settings");
+        let q: EventsRequest = serde_json::from_str(r#"{"target_id":"M","limit":5}"#).unwrap();
+        assert_eq!(
+            (q.target_id.as_deref(), q.limit, q.actor),
+            (Some("M"), Some(5), None)
+        );
     }
 
     #[test]

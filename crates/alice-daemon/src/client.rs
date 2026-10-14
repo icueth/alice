@@ -444,6 +444,29 @@ impl DaemonClient {
         self.call("/api/v1/ingest", r, Duration::from_secs(30))
             .await
     }
+    /// Recorded changes, newest first.
+    pub async fn events(&self, q: &EventsRequest) -> Result<Vec<EventRow>> {
+        let mut qs = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in [
+            ("target_id", q.target_id.clone()),
+            ("actor", q.actor.clone()),
+            ("before", q.before.clone()),
+            ("limit", q.limit.map(|l| l.to_string())),
+        ] {
+            if let Some(v) = value {
+                qs.append_pair(key, &v);
+            }
+        }
+        let qs = qs.finish();
+        if qs.is_empty() {
+            self.get_json("/api/v1/events").await
+        } else {
+            self.get_json(&format!("/api/v1/events?{qs}")).await
+        }
+    }
+    pub async fn undo(&self, r: &UndoRequest) -> Result<UndoResponse> {
+        self.call("/api/v1/undo", r, Duration::from_secs(10)).await
+    }
     pub async fn shutdown(&self) -> Result<()> {
         let resp = self
             .http
@@ -835,9 +858,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.memories.len(), 1);
-        let update: UpdateRequest =
+        let mut update: UpdateRequest =
             serde_json::from_value(serde_json::json!({"id": id, "action": "archive"})).unwrap();
-        assert_eq!(c.update(&update).await.unwrap().memory.id, id);
+        update.author.agent = Some("my agent/2".into());
+        let updated = c.update(&update).await.unwrap();
+        assert_eq!(updated.memory.id, id);
+        let event = updated.event_id.expect("the update's event");
+        // Filters that need escaping in a query string arrive intact.
+        let mine = c
+            .events(&EventsRequest {
+                target_id: Some(id.clone()),
+                actor: Some("agent:my agent/2".into()),
+                before: None,
+                limit: Some(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            mine.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            [event.as_str()]
+        );
+        let all = c.events(&EventsRequest::default()).await.unwrap();
+        assert_eq!(all[0].id, event, "newest first");
+        let undone = c
+            .undo(&UndoRequest {
+                event_id: event.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            undone.undone && undone.reverted == [event.clone()],
+            "{undone:?}"
+        );
+        let again = c
+            .undo(&UndoRequest {
+                event_id: event,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&again, AliceError::Invalid(m) if m.contains("already undone")),
+            "{again}"
+        );
         let fact: AssertFactRequest = serde_json::from_value(
             serde_json::json!({"subject": "alice", "predicate": "written in", "object": "rust"}),
         )

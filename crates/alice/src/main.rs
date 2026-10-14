@@ -36,6 +36,15 @@ enum Command {
     Facts(cmd::FactsArgs),
     /// Add, supersede or end a fact.
     Fact(cmd::FactArgs),
+    /// Recent changes (all, or to one memory or fact): who changed what, with event ids for undo.
+    History(cmd::HistoryArgs),
+    /// Reverse a change by its event id (from `alice history`).
+    Undo {
+        event_id: String,
+        /// Who undoes it (default: $ALICE_AGENT or "cli", as for `remember`).
+        #[arg(long, env = "ALICE_AGENT", default_value = "cli")]
+        agent: String,
+    },
     /// List projects.
     Projects,
     /// Daemon status and counts.

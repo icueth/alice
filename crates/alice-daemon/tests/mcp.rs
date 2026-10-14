@@ -258,6 +258,45 @@ async fn http_mcp_exposes_exactly_seven_tools_and_works() {
         .unwrap();
     assert_eq!(missing.is_error, Some(true));
 
+    // Spec §8.1: update_memory answers with the event id; changes are the client's (actor).
+    let updated = client
+        .call_tool(call(
+            "update_memory",
+            serde_json::json!({"id": id, "action": "edit", "importance": 5}),
+        ))
+        .await
+        .unwrap();
+    let updated: serde_json::Value = serde_json::from_str(&first_text(&updated)).unwrap();
+    let event = updated["event_id"].as_str().expect("event_id").to_string();
+    let asserted = client
+        .call_tool(call(
+            "assert_fact",
+            serde_json::json!({"subject": "alice", "predicate": "speaks", "object": "MCP"}),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(asserted.is_error, Some(true), "{}", first_text(&asserted));
+    let history = d
+        .svc
+        .events(alice_core::api::EventsRequest::default())
+        .await
+        .unwrap();
+    let actor_of = |action: &str| {
+        history
+            .iter()
+            .find(|e| e.action == action)
+            .map(|e| e.actor.clone())
+            .unwrap_or_else(|| panic!("no {action} event in {history:?}"))
+    };
+    assert_eq!(actor_of("memory.create"), "agent:test-agent");
+    assert_eq!(actor_of("memory.edit"), "agent:test-agent");
+    assert_eq!(actor_of("relation.add"), "agent:test-agent");
+    assert!(
+        history
+            .iter()
+            .any(|e| e.id == event && e.action == "memory.edit")
+    );
+
     let mut prompts: Vec<String> = client
         .list_all_prompts()
         .await

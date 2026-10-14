@@ -364,8 +364,13 @@ impl AliceMcp {
     )]
     async fn update_memory(
         &self,
-        Parameters(req): Parameters<UpdateRequest>,
+        Parameters(mut req): Parameters<UpdateRequest>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // The change is the client's: history records it as `agent:<client name>`.
+        if req.author.agent.is_none() {
+            req.author.agent = Self::agent(&ctx);
+        }
         Ok(match self.backend.update(req).await {
             Ok(r) => json(&r),
             Err(e) => tool_err(e),
@@ -391,8 +396,12 @@ impl AliceMcp {
     )]
     async fn assert_fact(
         &self,
-        Parameters(req): Parameters<AssertFactRequest>,
+        Parameters(mut req): Parameters<AssertFactRequest>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        if req.author.agent.is_none() {
+            req.author.agent = Self::agent(&ctx);
+        }
         Ok(match self.backend.assert_fact(req).await {
             Ok(r) => json(&r),
             Err(e) => tool_err(e),

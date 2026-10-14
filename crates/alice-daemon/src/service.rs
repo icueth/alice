@@ -16,6 +16,8 @@ use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
 use alice_core::search::{self, SearchParams, fusion::Weights, pack};
 use alice_core::store::embeddings;
+use alice_core::store::events::Actor;
+use alice_core::store::history::UndoOutcome;
 use alice_core::store::kg::{self, FactOutcome};
 use alice_core::store::memories::{self, InsertOutcome, NewMemoryInput};
 use alice_core::store::projects::{self, ResolvedProject};
@@ -55,6 +57,8 @@ pub struct ServiceOptions {
     pub vector_reader_pool: usize,
     /// Maps a working directory to its project (runs git). Tests replace it.
     pub detect_project: fn(&Path) -> ProjectRef,
+    /// How often the event stream checks whether the health changed (tests shorten it).
+    pub health_tick: Duration,
 }
 
 impl Default for ServiceOptions {
@@ -66,6 +70,7 @@ impl Default for ServiceOptions {
             reader_pool: 8,
             vector_reader_pool: 4,
             detect_project,
+            health_tick: Duration::from_secs(5),
         }
     }
 }
@@ -628,19 +633,24 @@ impl Service {
         .await
     }
 
+    /// The memory after the change, with the event that recorded it (`undo` takes its id).
     pub async fn update(&self, req: UpdateRequest) -> Result<MemoryFull> {
-        let m = match self
+        let actor = Actor::from_author(&req.author);
+        let (m, event_id) = match self
             .writer
             .submit(WriteOp::Update {
                 id: req.id,
                 update: req.update,
+                actor,
             })
             .await?
         {
-            WriteOutcome::Updated(m) => m,
+            WriteOutcome::Updated(m, event_id) => (m, event_id),
             other => return Err(unexpected(other)),
         };
-        self.read(move |c| full(c, m, false)).await
+        let mut out = self.read(move |c| full(c, m, false)).await?;
+        out.event_id = event_id;
+        Ok(out)
     }
 
     pub async fn facts(&self, req: FactsRequest) -> Result<FactsResponse> {
@@ -677,10 +687,61 @@ impl Service {
     }
 
     pub async fn assert_fact(&self, req: AssertFactRequest) -> Result<FactOutcome> {
-        match self.writer.submit(WriteOp::AssertFact(req)).await? {
+        let actor = Actor::from_author(&req.author);
+        match self
+            .writer
+            .submit(WriteOp::AssertFact { fact: req, actor })
+            .await?
+        {
             WriteOutcome::Fact(f) => Ok(f),
             other => Err(unexpected(other)),
         }
+    }
+
+    /// Recorded changes, newest first (spec §5.5).
+    pub async fn events(&self, req: EventsRequest) -> Result<Vec<EventRow>> {
+        self.read(move |c| alice_core::store::events::list(c, &req))
+            .await
+    }
+
+    /// Reverse a change by its event id. A target that changed since is never overwritten:
+    /// the answer names the review item that asks what to do instead.
+    pub async fn undo(&self, req: UndoRequest) -> Result<UndoResponse> {
+        let actor = Actor::from_author(&req.author);
+        match self
+            .writer
+            .submit(WriteOp::Undo {
+                event_id: req.event_id,
+                actor,
+            })
+            .await?
+        {
+            WriteOutcome::Undo(UndoOutcome::Undone { reverted, .. }) => Ok(UndoResponse {
+                undone: true,
+                message: format!("Undone: {} change(s) reverted.", reverted.len()),
+                reverted,
+                review_id: None,
+            }),
+            WriteOutcome::Undo(UndoOutcome::Conflict { review_id, reason }) => Ok(UndoResponse {
+                undone: false,
+                reverted: Vec::new(),
+                message: format!(
+                    "Not undone: {reason}. Review item {review_id} asks what to do (alice review)."
+                ),
+                review_id: Some(review_id),
+            }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Changes committed from now on (the SSE stream); a slow receiver misses old items.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<StreamItem> {
+        self.writer.subscribe()
+    }
+
+    /// How often the SSE stream checks whether health changed.
+    pub fn health_tick(&self) -> Duration {
+        self.opts.health_tick
     }
 
     pub async fn ingest(&self, req: IngestRequest) -> Result<IngestOutcome> {
@@ -785,6 +846,7 @@ fn full(
         memory: m,
         links,
         provenance,
+        event_id: None,
     })
 }
 
@@ -900,6 +962,7 @@ mod tests {
                     body: Some("Use WAL so readers never block the lone writer".into()),
                     ..Default::default()
                 },
+                ..Default::default()
             })
             .await
             .unwrap();

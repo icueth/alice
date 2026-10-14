@@ -570,6 +570,7 @@ mod tests {
                             body: Some("poison: edited while embedding".into()),
                             ..Default::default()
                         },
+                        actor: alice_core::store::events::Actor::User,
                     })
                     .unwrap();
             }));

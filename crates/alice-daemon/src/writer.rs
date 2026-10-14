@@ -3,13 +3,18 @@
 //! Only this thread writes to the database (spec §4.1), and every transaction is short: a bulk
 //! ingest is written a slice at a time, so small writes queued behind it never wait for all of it.
 
+use alice_core::api::StreamItem;
 use alice_core::error::{AliceError, Result};
-use alice_core::ids::Hlc;
+use alice_core::ids::{Hlc, new_id};
 use alice_core::model::{Memory, Status};
 use alice_core::project::ProjectRef;
 use alice_core::store::embeddings::{self, VecKey};
+use alice_core::store::events::{self, Actor, EventInput};
+use alice_core::store::history::{self, UndoOutcome};
 use alice_core::store::kg::{self, AssertFact, EntityMatcher, FactOutcome};
-use alice_core::store::memories::{self, InsertOutcome, MemoryUpdate, NewMemoryInput};
+use alice_core::store::memories::{
+    self, InsertOutcome, MemoryUpdate, NewMemoryInput, UpdateAction,
+};
 use alice_core::store::projects::{self, ResolvedProject};
 use alice_core::store::sources::{self, ChunkInput, IngestOutcome, SourceInput};
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -19,10 +24,13 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 
 const BATCH_WINDOW: Duration = Duration::from_millis(2);
 const BATCH_MAX: usize = 256;
+/// Committed changes a stream subscriber may fall behind by; a slower one misses the oldest
+/// (`/api/v1/events` still lists every change).
+const STREAM_CAPACITY: usize = 256;
 /// Raw chunks written per batch, at most. A larger ingest continues in the following batches
 /// (each its own short transaction) and is acknowledged once all of it is committed.
 const INGEST_SLICE: usize = 200;
@@ -54,8 +62,17 @@ pub enum WriteOp {
     Update {
         id: String,
         update: MemoryUpdate,
+        actor: Actor,
     },
-    AssertFact(AssertFact),
+    AssertFact {
+        fact: AssertFact,
+        actor: Actor,
+    },
+    /// Reverse an event (and its group); a changed target yields a review item instead.
+    Undo {
+        event_id: String,
+        actor: Actor,
+    },
     /// `(key, stamp, vector)`: the vector of the text whose `content_hash` was `stamp`. It is
     /// stored (and the row marked done) only if the row still holds that text.
     StoreEmbeddings {
@@ -75,8 +92,10 @@ pub enum WriteOp {
 pub enum WriteOutcome {
     Remembered(InsertOutcome, ResolvedProject),
     Ingested(IngestOutcome),
-    Updated(Memory),
+    /// The memory after the change, and the event that recorded it (spec §8.1).
+    Updated(Memory, Option<String>),
     Fact(FactOutcome),
+    Undo(UndoOutcome),
     /// The `StoreEmbeddings` items that were stored; the others changed while being embedded.
     Embedded(Vec<(VecKey, Vec<f32>)>),
     Done,
@@ -116,9 +135,16 @@ impl ReadOnlyState {
 pub struct WriterHandle {
     tx: Sender<Job>,
     pub read_only: Arc<ReadOnlyState>,
+    /// Items the writer broadcasts after each commit (events, review items).
+    stream: broadcast::Sender<StreamItem>,
 }
 
 impl WriterHandle {
+    /// Changes committed from now on (events, reviews); slow receivers miss old items.
+    pub fn subscribe(&self) -> broadcast::Receiver<StreamItem> {
+        self.stream.subscribe()
+    }
+
     fn send(&self, op: WriteOp) -> Result<oneshot::Receiver<Result<WriteOutcome>>> {
         if let Some(r) = self.read_only.reason() {
             return Err(AliceError::ReadOnly(r));
@@ -168,7 +194,7 @@ fn resolve(conn: &Connection, choice: &ProjectChoice) -> Result<ResolvedProject>
     }
 }
 
-struct State {
+pub(crate) struct State {
     hlc: Hlc,
     /// Entity names for mention links; dropped whenever facts (and so entities) may have changed.
     matcher: Option<EntityMatcher>,
@@ -178,6 +204,247 @@ struct State {
     chunk_budget: usize,
     /// Bytes of chunk text this batch may still write.
     byte_budget: usize,
+    /// Items this batch broadcasts once it commits (events; later reviews and settings). A job
+    /// that fails takes its own items back; a batch that fails to commit sends none.
+    stream: Vec<StreamItem>,
+}
+
+/// Record an event in the current transaction; it is broadcast after the batch commits.
+/// Returns the event id.
+pub(crate) fn record(conn: &Connection, st: &mut State, e: EventInput<'_>) -> Result<String> {
+    let hlc = st.hlc.tick();
+    let id = events::record(conn, &e, &hlc)?;
+    if let Some(event) = events::get(conn, &id)? {
+        st.stream.push(StreamItem::Event { event });
+    }
+    Ok(id)
+}
+
+/// A memory as events record it (`None`: no such row).
+fn snap(conn: &Connection, id: &str) -> Result<Option<serde_json::Value>> {
+    history::snapshot_memory(conn, id)?
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| AliceError::Other(format!("memory snapshot: {e}")))
+}
+
+/// A relation as events record it (`None`: no such row).
+fn snap_relation(conn: &Connection, id: &str) -> Result<Option<serde_json::Value>> {
+    history::snapshot_relation(conn, id)?
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| AliceError::Other(format!("relation snapshot: {e}")))
+}
+
+fn update_action(a: UpdateAction) -> &'static str {
+    match a {
+        UpdateAction::Edit => "memory.edit",
+        UpdateAction::Supersede => "memory.supersede",
+        UpdateAction::Archive => "memory.archive",
+        UpdateAction::Forget => "memory.forget",
+        UpdateAction::Restore => "memory.restore",
+    }
+}
+
+/// `remember`: the insert, a `memory.create` event, and for each memory it supersedes that
+/// changed, a `memory.supersede` event, all in one group.
+fn remember(
+    conn: &Connection,
+    input: NewMemoryInput,
+    project: &ProjectChoice,
+    st: &mut State,
+) -> Result<WriteOutcome> {
+    let p = resolve(conn, project)?;
+    let prepared = memories::prepare(input, &p, st.hlc.tick())?;
+    // Snapshots of the memories this one supersedes, before the insert changes them.
+    let mut superseded: Vec<(String, Option<serde_json::Value>)> = Vec::new();
+    for old in &prepared.supersedes {
+        if let Some(id) = memories::id_of(conn, old)?
+            && !superseded.iter().any(|(s, _)| *s == id)
+        {
+            let before = snap(conn, &id)?;
+            superseded.push((id, before));
+        }
+    }
+    let out = memories::insert(conn, &prepared)?;
+    if let InsertOutcome::New { id, .. } = &out {
+        st.inserted = true;
+        let actor = Actor::from_author(&prepared.author);
+        let group = (!prepared.supersedes.is_empty()).then(new_id);
+        let after = snap(conn, id)?;
+        record(
+            conn,
+            st,
+            EventInput {
+                actor: &actor,
+                action: "memory.create",
+                target_type: "memory",
+                target_id: id,
+                before: None,
+                after,
+                group: group.as_deref(),
+            },
+        )?;
+        for (old, before) in superseded {
+            let after = snap(conn, &old)?;
+            if after != before {
+                record(
+                    conn,
+                    st,
+                    EventInput {
+                        actor: &actor,
+                        action: "memory.supersede",
+                        target_type: "memory",
+                        target_id: &old,
+                        before,
+                        after,
+                        group: group.as_deref(),
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(WriteOutcome::Remembered(out, p))
+}
+
+/// `update`: the change and its `memory.<action>` event, whose id it returns. A supersede also
+/// links the newer memory to this one: a `memory.link` event in the same group.
+fn update(
+    conn: &Connection,
+    id: &str,
+    update: &MemoryUpdate,
+    actor: &Actor,
+    st: &mut State,
+) -> Result<WriteOutcome> {
+    // Snapshots by the memory's own id (the caller may have named it by a legacy id).
+    let before = match memories::id_of(conn, id)? {
+        Some(own) => snap(conn, &own)?,
+        None => None,
+    };
+    let by = match (update.action, update.superseded_by.as_deref()) {
+        (UpdateAction::Supersede, Some(b)) => memories::id_of(conn, b)?,
+        _ => None,
+    };
+    let before_by = match &by {
+        Some(b) => snap(conn, b)?,
+        None => None,
+    };
+    let m = memories::apply_update(conn, id, update, st.hlc.tick())?;
+    st.inserted = true; // edits may need re-embedding
+    let group = by.is_some().then(new_id);
+    let after = snap(conn, &m.id)?;
+    let event = record(
+        conn,
+        st,
+        EventInput {
+            actor,
+            action: update_action(update.action),
+            target_type: "memory",
+            target_id: &m.id,
+            before,
+            after,
+            group: group.as_deref(),
+        },
+    )?;
+    if let Some(by) = &by {
+        let after_by = snap(conn, by)?;
+        if after_by != before_by {
+            record(
+                conn,
+                st,
+                EventInput {
+                    actor,
+                    action: "memory.link",
+                    target_type: "memory",
+                    target_id: by,
+                    before: before_by,
+                    after: after_by,
+                    group: group.as_deref(),
+                },
+            )?;
+        }
+    }
+    Ok(WriteOutcome::Updated(m, Some(event)))
+}
+
+/// `assert_fact`: the change, a `relation.close` event for each open relation of the subject
+/// and predicate that it closed, and `relation.add` for a new relation, all in one group.
+/// Asserting what is already current changes nothing and records nothing.
+fn assert_fact(
+    conn: &Connection,
+    fact: &AssertFact,
+    actor: &Actor,
+    st: &mut State,
+) -> Result<WriteOutcome> {
+    st.matcher = None; // the entity list may change
+    let open = kg::open_relation_ids(conn, &fact.subject, &fact.predicate)?;
+    let mut befores = Vec::with_capacity(open.len());
+    for id in &open {
+        befores.push((id.as_str(), snap_relation(conn, id)?));
+    }
+    let out = kg::assert_fact(conn, fact, st.hlc.tick())?;
+    let group = new_id();
+    for (id, before) in befores {
+        let after = snap_relation(conn, id)?;
+        if after != before {
+            record(
+                conn,
+                st,
+                EventInput {
+                    actor,
+                    action: "relation.close",
+                    target_type: "relation",
+                    target_id: id,
+                    before,
+                    after,
+                    group: Some(&group),
+                },
+            )?;
+        }
+    }
+    if let Some(new) = out
+        .relation_id
+        .as_deref()
+        .filter(|r| !open.iter().any(|o| o == r))
+    {
+        let after = snap_relation(conn, new)?;
+        record(
+            conn,
+            st,
+            EventInput {
+                actor,
+                action: "relation.add",
+                target_type: "relation",
+                target_id: new,
+                before: None,
+                after,
+                group: Some(&group),
+            },
+        )?;
+    }
+    Ok(WriteOutcome::Fact(out))
+}
+
+/// `undo`: reverse an event (and its group), or, when a target changed since, a review item.
+fn undo(conn: &Connection, event_id: &str, actor: &Actor, st: &mut State) -> Result<WriteOutcome> {
+    let out = {
+        let hlc = &mut st.hlc;
+        let mut tick = || hlc.tick();
+        history::undo(conn, event_id, actor, &mut tick)?
+    };
+    match &out {
+        UndoOutcome::Undone { group, .. } => {
+            for event in events::group(conn, group)? {
+                st.stream.push(StreamItem::Event { event });
+            }
+            st.inserted = true; // restored text is embedded again
+        }
+        UndoOutcome::Conflict { review_id, .. } => st.stream.push(StreamItem::Review {
+            id: review_id.clone(),
+            review_type: "undo".into(),
+        }),
+    }
+    Ok(WriteOutcome::Undo(out))
 }
 
 impl State {
@@ -264,29 +531,19 @@ fn apply(
     st: &mut State,
 ) -> Result<Applied> {
     let outcome = match op {
-        WriteOp::Remember { input, project } => {
-            let p = resolve(conn, &project)?;
-            let prepared = memories::prepare(input, &p, st.hlc.tick())?;
-            let out = memories::insert(conn, &prepared)?;
-            if matches!(out, InsertOutcome::New { .. }) {
-                st.inserted = true;
-            }
-            WriteOutcome::Remembered(out, p)
-        }
+        WriteOp::Remember { input, project } => remember(conn, input, &project, st)?,
         WriteOp::Ingest {
             project,
             source,
             chunks,
         } => return ingest_slice(conn, project, source, chunks, progress, st),
-        WriteOp::Update { id, update } => {
-            let m = memories::apply_update(conn, &id, &update, st.hlc.tick())?;
-            st.inserted = true; // edits may need re-embedding
-            WriteOutcome::Updated(m)
-        }
-        WriteOp::AssertFact(f) => {
-            st.matcher = None; // the entity list may change
-            WriteOutcome::Fact(kg::assert_fact(conn, &f, st.hlc.tick())?)
-        }
+        WriteOp::Update {
+            id,
+            update: u,
+            actor,
+        } => update(conn, &id, &u, &actor, st)?,
+        WriteOp::AssertFact { fact, actor } => assert_fact(conn, &fact, &actor, st)?,
+        WriteOp::Undo { event_id, actor } => undo(conn, &event_id, &actor, st)?,
         WriteOp::StoreEmbeddings { model, items } => {
             let mut applied = Vec::with_capacity(items.len());
             for (key, stamp, v) in items {
@@ -405,6 +662,7 @@ fn run_batch(
         let mut tx = conn.transaction()?;
         for job in batch {
             let sp = tx.savepoint()?;
+            let streamed = st.stream.len();
             match apply(&sp, job.op, job.progress, st) {
                 Ok(Applied::Done(outcome)) => {
                     sp.commit()?;
@@ -420,6 +678,7 @@ fn run_batch(
                 }
                 Err(e) => {
                     drop(sp); // rolls back this job only
+                    st.stream.truncate(streamed); // and its items
                     let e = match fatal_reason(&e) {
                         Some(reason) => {
                             tracing::error!(%reason, error = %e, "writer entering read-only mode");
@@ -457,6 +716,8 @@ pub fn spawn_writer(
     let (tx, rx): (Sender<Job>, Receiver<Job>) = unbounded();
     let read_only = Arc::new(ReadOnlyState::default());
     let ro = read_only.clone();
+    let (stream, _) = broadcast::channel::<StreamItem>(STREAM_CAPACITY);
+    let broadcaster = stream.clone();
     let handle = std::thread::Builder::new()
         .name("alice-writer".into())
         .spawn(move || {
@@ -472,6 +733,7 @@ pub fn spawn_writer(
                 inserted: false,
                 chunk_budget: INGEST_SLICE,
                 byte_budget: INGEST_SLICE_BYTES,
+                stream: Vec::new(),
             };
             let mut carry: VecDeque<Job> = VecDeque::new();
             let mut stopping = false;
@@ -515,6 +777,11 @@ pub fn spawn_writer(
                         if st.inserted {
                             let _ = wake_worker.try_send(());
                         }
+                        // Broadcast before replying too, so a caller that has its reply finds
+                        // the change already sent to every subscriber. No subscriber is fine.
+                        for item in st.stream.drain(..) {
+                            let _ = broadcaster.send(item);
+                        }
                         for (reply, r) in out.replies {
                             if let Some(reply) = reply {
                                 let _ = reply.send(r);
@@ -524,8 +791,9 @@ pub fn spawn_writer(
                     }
                     Err(e) => {
                         // A matcher loaded inside the rolled-back transaction may name entities
-                        // that were never committed.
+                        // that were never committed; nothing it recorded happened.
                         st.matcher = None;
+                        st.stream.clear();
                         let fatal = is_fatal(&e);
                         if let Some(reason) = &fatal {
                             tracing::error!(%reason, error = %e, "writer entering read-only mode");
@@ -548,7 +816,14 @@ pub fn spawn_writer(
             }
         })
         .expect("spawn writer thread");
-    (WriterHandle { tx, read_only }, handle)
+    (
+        WriterHandle {
+            tx,
+            read_only,
+            stream,
+        },
+        handle,
+    )
 }
 
 #[cfg(test)]
@@ -556,8 +831,8 @@ mod tests {
     use super::*;
     use alice_core::model::Kind;
     use alice_core::store::embeddings::{self, VecKey};
-    use alice_core::store::kg::AssertFact;
-    use alice_core::store::memories::{MemoryUpdate, NewMemoryInput};
+    use alice_core::store::kg::{AssertFact, FactAction};
+    use alice_core::store::memories::{MemoryUpdate, NewMemoryInput, UpdateAction};
     use alice_core::store::sources::{ChunkInput, IngestOutcome, SourceInput};
     use std::path::Path;
 
@@ -817,6 +1092,7 @@ mod tests {
                 body: Some("port is 9090".into()),
                 ..Default::default()
             },
+            actor: Actor::User,
         })
         .unwrap();
         let out =
@@ -869,6 +1145,7 @@ mod tests {
                 body: Some("edited meanwhile".into()),
                 ..Default::default()
             },
+            actor: Actor::User,
         })
         .unwrap();
         f.h.submit_blocking(WriteOp::EmbedFailed {
@@ -918,12 +1195,15 @@ mod tests {
             seq
         };
         store("nothing to link yet");
-        f.h.submit_blocking(WriteOp::AssertFact(AssertFact {
-            subject: "Hostlink".into(),
-            predicate: "written in".into(),
-            object: "Swift".into(),
-            ..Default::default()
-        }))
+        f.h.submit_blocking(WriteOp::AssertFact {
+            fact: AssertFact {
+                subject: "Hostlink".into(),
+                predicate: "written in".into(),
+                object: "Swift".into(),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
         .unwrap();
         let seq = store("Hostlink reconnects after sleep");
         let id: String = f.read("SELECT id FROM memories WHERE seq = ?1", [seq]);
@@ -1122,6 +1402,340 @@ mod tests {
         );
         assert_eq!(ingested(out).inserted, 1_000);
         f.thread.join().unwrap();
+    }
+
+    #[test]
+    fn writes_record_events_with_their_actor_and_are_broadcast_after_commit() {
+        let f = fixture();
+        let mut rx = f.h.subscribe();
+        let id = match f
+            .h
+            .submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "event me".into(),
+                    author: alice_core::model::Author {
+                        agent: Some("claude-code".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                project: ProjectChoice::Slug("global".into()),
+            })
+            .unwrap()
+        {
+            WriteOutcome::Remembered(InsertOutcome::New { id, .. }, _) => id,
+            o => panic!("{o:?}"),
+        };
+        let actor: String = f.read(
+            "SELECT actor FROM events WHERE target_id = ?1 AND action = 'memory.create'",
+            [&id],
+        );
+        assert_eq!(actor, "agent:claude-code");
+        match rx.try_recv().unwrap() {
+            StreamItem::Event { event } => assert_eq!(event.target_id, id),
+            other => panic!("{other:?}"),
+        }
+        f.h.submit_blocking(WriteOp::Update {
+            id: id.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Archive,
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        let n: i64 = f.read(
+            "SELECT count(*) FROM events WHERE target_id = ?1 AND action = 'memory.archive' AND actor = 'user'",
+            [&id],
+        );
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn a_fact_supersede_records_the_closed_and_the_new_relation_in_one_group() {
+        let f = fixture();
+        for (object, action) in [
+            ("SQLite", FactAction::Add),
+            ("Postgres", FactAction::Supersede),
+        ] {
+            f.h.submit_blocking(WriteOp::AssertFact {
+                fact: AssertFact {
+                    subject: "alice".into(),
+                    predicate: "uses".into(),
+                    object: object.into(),
+                    action,
+                    ..Default::default()
+                },
+                actor: Actor::User,
+            })
+            .unwrap();
+        }
+        let groups: i64 = f.read("SELECT count(DISTINCT group_id) FROM events WHERE action IN ('relation.close','relation.add') AND group_id IS NOT NULL", []);
+        let closes: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'relation.close'",
+            [],
+        );
+        assert_eq!((groups, closes), (2, 1));
+        // Asserting what is already current changes nothing, so it records nothing.
+        f.h.submit_blocking(WriteOp::AssertFact {
+            fact: AssertFact {
+                subject: "Alice".into(),
+                predicate: "uses".into(),
+                object: "Postgres".into(),
+                ..Default::default()
+            },
+            actor: Actor::Agent("codex".into()),
+        })
+        .unwrap();
+        let n: i64 = f.read("SELECT count(*) FROM events", []);
+        assert_eq!(n, 3);
+        let ended = f.h.submit_blocking(WriteOp::AssertFact {
+            fact: AssertFact {
+                subject: "alice".into(),
+                predicate: "uses".into(),
+                object: "Postgres".into(),
+                action: FactAction::End,
+                ..Default::default()
+            },
+            actor: Actor::Agent("codex".into()),
+        });
+        assert!(
+            matches!(ended, Ok(WriteOutcome::Fact(ref o)) if o.ended == 1),
+            "{ended:?}"
+        );
+        let actor: String = f.read(
+            "SELECT actor FROM events WHERE action = 'relation.close' ORDER BY rowid DESC LIMIT 1",
+            [],
+        );
+        assert_eq!(actor, "agent:codex");
+    }
+
+    fn update(id: &str, action: UpdateAction) -> WriteOp {
+        WriteOp::Update {
+            id: id.into(),
+            update: MemoryUpdate {
+                action,
+                ..Default::default()
+            },
+            actor: Actor::User,
+        }
+    }
+
+    /// Spec §8.1: `update_memory` answers with the event id, recorded under the memory's own
+    /// id even when the caller named it by its legacy id.
+    #[test]
+    fn an_update_returns_its_event_recorded_under_the_memory_id() {
+        let f = fixture();
+        let (id, _) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "imported from the palace".into(),
+                    legacy_id: Some("drawer_7".into()),
+                    ..Default::default()
+                },
+                project: ProjectChoice::Slug("global".into()),
+            })
+            .unwrap(),
+        );
+        let event = match f
+            .h
+            .submit_blocking(update("drawer_7", UpdateAction::Archive))
+            .unwrap()
+        {
+            WriteOutcome::Updated(m, Some(event)) => {
+                assert_eq!(m.id, id);
+                event
+            }
+            o => panic!("{o:?}"),
+        };
+        let (target, action, before, after): (String, String, String, String) = {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.query_row(
+                "SELECT target_id, action, before_json, after_json FROM events WHERE id = ?1",
+                [&event],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            (target.as_str(), action.as_str()),
+            (id.as_str(), "memory.archive")
+        );
+        let status =
+            |j: &str| serde_json::from_str::<serde_json::Value>(j).unwrap()["status"].clone();
+        assert_eq!(
+            (status(&before), status(&after)),
+            ("pending".into(), "archived".into())
+        );
+    }
+
+    /// A supersede through `update` changes two memories: one group, undone together.
+    #[test]
+    fn supersede_by_update_and_by_remember_are_one_group_each_and_undo_whole() {
+        let f = fixture();
+        let (old, _) = new_id(f.h.submit_blocking(remember("port is 8080")).unwrap());
+        let (newer, _) = new_id(f.h.submit_blocking(remember("port is 9090")).unwrap());
+        let event = match f
+            .h
+            .submit_blocking(WriteOp::Update {
+                id: old.clone(),
+                update: MemoryUpdate {
+                    action: UpdateAction::Supersede,
+                    superseded_by: Some(newer.clone()),
+                    ..Default::default()
+                },
+                actor: Actor::User,
+            })
+            .unwrap()
+        {
+            WriteOutcome::Updated(_, Some(e)) => e,
+            o => panic!("{o:?}"),
+        };
+        let actions: String = f.read(
+            "SELECT group_concat(action, ',') FROM (SELECT action FROM events WHERE group_id = (SELECT group_id FROM events WHERE id = ?1) ORDER BY rowid)",
+            [&event],
+        );
+        assert_eq!(actions, "memory.supersede,memory.link");
+        match f
+            .h
+            .submit_blocking(WriteOp::Undo {
+                event_id: event,
+                actor: Actor::User,
+            })
+            .unwrap()
+        {
+            WriteOutcome::Undo(UndoOutcome::Undone { reverted, .. }) => {
+                assert_eq!(reverted.len(), 2)
+            }
+            o => panic!("{o:?}"),
+        }
+        let links: i64 = f.read("SELECT count(*) FROM links", []);
+        let status: String = f.read("SELECT status FROM memories WHERE id = ?1", [&old]);
+        assert_eq!((links, status.as_str()), (0, "active"));
+
+        // At write time: the create and the superseded memory share a group.
+        let id = match f
+            .h
+            .submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "port is 7070".into(),
+                    supersedes: vec![old.clone(), old.clone(), "NOSUCHID".into()],
+                    ..Default::default()
+                },
+                project: ProjectChoice::Slug("global".into()),
+            })
+            .unwrap()
+        {
+            WriteOutcome::Remembered(InsertOutcome::New { id, .. }, _) => id,
+            o => panic!("{o:?}"),
+        };
+        let actions: String = f.read(
+            "SELECT group_concat(action || ':' || (target_id = ?1), ',') FROM (SELECT action, target_id FROM events WHERE group_id = (SELECT group_id FROM events WHERE target_id = ?1 AND action = 'memory.create') ORDER BY rowid)",
+            [&id],
+        );
+        assert_eq!(actions, "memory.create:1,memory.supersede:0");
+    }
+
+    #[test]
+    fn undo_through_the_writer_is_broadcast_and_wakes_the_worker_for_restored_text() {
+        let f = fixture();
+        let (id, seq) = new_id(f.h.submit_blocking(remember("Use WAL mode")).unwrap());
+        let event = match f
+            .h
+            .submit_blocking(WriteOp::Update {
+                id: id.clone(),
+                update: MemoryUpdate {
+                    body: Some("Use rollback journal".into()),
+                    ..Default::default()
+                },
+                actor: Actor::Agent("codex".into()),
+            })
+            .unwrap()
+        {
+            WriteOutcome::Updated(_, Some(e)) => e,
+            o => panic!("{o:?}"),
+        };
+        while f.wake.try_recv().is_ok() {}
+        let mut rx = f.h.subscribe();
+        let out =
+            f.h.submit_blocking(WriteOp::Undo {
+                event_id: event.clone(),
+                actor: Actor::User,
+            })
+            .unwrap();
+        assert!(
+            matches!(&out, WriteOutcome::Undo(UndoOutcome::Undone { reverted, .. }) if reverted == &vec![event.clone()]),
+            "{out:?}"
+        );
+        let body: String = f.read("SELECT body FROM memories WHERE seq = ?1", [seq]);
+        assert_eq!(body, "Use WAL mode");
+        assert!(
+            f.wake.try_recv().is_ok(),
+            "the restored text is embedded again"
+        );
+        let mut actions = Vec::new();
+        while let Ok(StreamItem::Event { event }) = rx.try_recv() {
+            actions.push(event.action);
+        }
+        assert_eq!(actions, ["undo:memory.edit", "undo"]);
+
+        // Twice: refused, nothing broadcast. A later change: a review item, broadcast.
+        let again = f.h.submit_blocking(WriteOp::Undo {
+            event_id: event.clone(),
+            actor: Actor::User,
+        });
+        assert!(
+            matches!(&again, Err(AliceError::Invalid(m)) if m.contains("already undone")),
+            "{again:?}"
+        );
+        assert!(rx.try_recv().is_err());
+        let archive = match f
+            .h
+            .submit_blocking(update(&id, UpdateAction::Archive))
+            .unwrap()
+        {
+            WriteOutcome::Updated(_, Some(e)) => e,
+            o => panic!("{o:?}"),
+        };
+        f.h.submit_blocking(update(&id, UpdateAction::Restore))
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+        let out =
+            f.h.submit_blocking(WriteOp::Undo {
+                event_id: archive,
+                actor: Actor::User,
+            })
+            .unwrap();
+        let WriteOutcome::Undo(UndoOutcome::Conflict { review_id, .. }) = out else {
+            panic!("{out:?}")
+        };
+        match rx.try_recv().unwrap() {
+            StreamItem::Review { id, review_type } => {
+                assert_eq!(
+                    (id.as_str(), review_type.as_str()),
+                    (review_id.as_str(), "undo")
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Only committed work is broadcast: a job that fails sends nothing, its neighbours do.
+    #[tokio::test]
+    async fn a_failed_job_broadcasts_nothing() {
+        let f = fixture();
+        let mut rx = f.h.subscribe();
+        let (ok, bad) = tokio::join!(
+            f.h.submit(remember("committed")),
+            f.h.submit(update("01K7NOSUCHMEMORY0000000000", UpdateAction::Archive)),
+        );
+        let (id, _) = new_id(ok.unwrap());
+        assert!(matches!(bad, Err(AliceError::NotFound(_))), "{bad:?}");
+        match rx.try_recv().unwrap() {
+            StreamItem::Event { event } => assert_eq!(event.target_id, id),
+            other => panic!("{other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "nothing from the failed job");
     }
 
     /// A database that refuses writes switches the writer to read-only mode with a reason.

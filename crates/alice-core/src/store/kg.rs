@@ -4,6 +4,7 @@
 
 use crate::error::{AliceError, Result};
 use crate::ids::{new_id, now_rfc3339};
+use crate::model::Author;
 use crate::normalize::{nfc, truncate_chars};
 use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -45,6 +46,10 @@ pub struct AssertFact {
     pub action: FactAction,
     #[serde(default)]
     pub source_memory_id: Option<String>,
+    /// Who asserts it (filled by the daemon: the MCP client, or the CLI); history only.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub author: Author,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -285,6 +290,27 @@ pub fn assert_fact(conn: &Connection, f: &AssertFact, hlc: String) -> Result<Fac
     })
 }
 
+/// Ids of the open relations of `subject` and `predicate` (resolved as `assert_fact` resolves
+/// them), sorted: every relation an `assert_fact` for them can close. Empty when the subject
+/// or the predicate is unknown; names are looked up, never created.
+pub fn open_relation_ids(conn: &Connection, subject: &str, predicate: &str) -> Result<Vec<String>> {
+    let p = normalize_predicate(predicate);
+    if p.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (Some((subject_id, _)), Some(p)) =
+        (find_entity(conn, subject)?, canonical_predicate(conn, &p)?)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM relations WHERE subject_id = ?1 AND predicate = ?2 AND valid_to IS NULL ORDER BY id",
+    )?;
+    Ok(stmt
+        .query_map(params![subject_id, p], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
 /// Close the current relations for subject, predicate and object. Names are looked up, never
 /// created, and the object matches whether it was stored as an entity or as text.
 fn end_fact(
@@ -443,7 +469,8 @@ mod tests {
             object_kind: ObjectKind::Auto,
             valid_from: Some(from.into()),
             action,
-            source_memory_id: None,
+            // Later fields keep their defaults, so adding one does not touch this helper.
+            ..Default::default()
         }
     }
 
@@ -1195,6 +1222,53 @@ mod tests {
         assert_eq!(link_mentions(&c, "m1", &[a.clone(), b.clone()]).unwrap(), 2);
         assert_eq!(link_mentions(&c, "m1", &[a, b]).unwrap(), 0);
         assert_eq!(count(&c, "mentions"), 2);
+    }
+
+    /// What history snapshots before a fact is asserted: the subject's open relations for the
+    /// predicate, found the way `assert_fact` finds them (aliases, predicate synonyms), and
+    /// nothing created by looking.
+    #[test]
+    fn open_relation_ids_are_the_relations_an_assert_can_close() {
+        let (_d, c) = conn();
+        assert!(open_relation_ids(&c, "api", "uses").unwrap().is_empty());
+        let n_entities = |c: &Connection| -> i64 {
+            c.query_row("SELECT count(*) FROM entities", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(n_entities(&c), 0, "looking up creates nothing");
+        let a = assert_fact(
+            &c,
+            &fact("api", "uses", "SQLite", FactAction::Add, T1),
+            "h".into(),
+        )
+        .unwrap()
+        .relation_id
+        .unwrap();
+        let b = assert_fact(
+            &c,
+            &fact("api", "uses", "Redis", FactAction::Add, T1),
+            "h".into(),
+        )
+        .unwrap()
+        .relation_id
+        .unwrap();
+        assert_fact(
+            &c,
+            &fact("api", "runs_on", "port 8080", FactAction::Add, T1),
+            "h".into(),
+        )
+        .unwrap();
+        let mut want = vec![a.clone(), b];
+        want.sort();
+        assert_eq!(open_relation_ids(&c, " API ", "Uses").unwrap(), want);
+        assert_fact(
+            &c,
+            &fact("api", "uses", "SQLite", FactAction::End, T2),
+            "h".into(),
+        )
+        .unwrap();
+        assert!(!open_relation_ids(&c, "api", "uses").unwrap().contains(&a));
+        assert!(open_relation_ids(&c, "api", "  ").unwrap().is_empty());
     }
 
     #[test]

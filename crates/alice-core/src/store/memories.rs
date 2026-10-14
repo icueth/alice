@@ -176,6 +176,17 @@ pub fn seq_of(conn: &Connection, id: &str) -> Result<Option<i64>> {
         .optional()?)
 }
 
+/// The id of the memory `id` names (its id or a legacy id, as `seq_of` resolves it).
+pub fn id_of(conn: &Connection, id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM memories WHERE id = ?1 OR legacy_id = ?1 ORDER BY seq LIMIT 1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 pub fn set_status_by_seq(conn: &Connection, seq: i64, status: Status) -> Result<()> {
     set_status(conn, seq, status, None)
 }
@@ -972,8 +983,11 @@ mod tests {
             .into_iter()
             .map(|m| m.id)
             .collect();
-        assert_eq!(ids, vec![b.clone(), a]);
+        assert_eq!(ids, vec![b.clone(), a.clone()]);
         assert_eq!(seq_of(&c, "drawer_42").unwrap(), Some(sb));
+        assert_eq!(id_of(&c, "drawer_42").unwrap(), Some(b.clone()));
+        assert_eq!(id_of(&c, &a).unwrap(), Some(a));
+        assert_eq!(id_of(&c, "missing").unwrap(), None);
         touch_access(&c, &[sb, sb]).unwrap();
         assert_eq!(get_many(&c, &[b]).unwrap()[0].access_count, 2);
     }

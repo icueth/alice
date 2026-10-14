@@ -120,6 +120,9 @@ pub struct UpdateArgs {
     /// For supersede: the id of the replacing memory.
     #[arg(long)]
     pub by: Option<String>,
+    /// Who makes the change, in the history (default: $ALICE_AGENT or "cli").
+    #[arg(long, env = "ALICE_AGENT", default_value = "cli")]
+    pub agent: String,
 }
 
 #[derive(Args)]
@@ -150,6 +153,20 @@ pub struct FactArgs {
     /// When it became (or, for end, stopped being) true.
     #[arg(long)]
     pub from: Option<String>,
+    /// Who asserts it, in the history (default: $ALICE_AGENT or "cli").
+    #[arg(long, env = "ALICE_AGENT", default_value = "cli")]
+    pub agent: String,
+}
+
+#[derive(Args)]
+pub struct HistoryArgs {
+    /// A memory or relation id; omit for all recent changes.
+    pub target: Option<String>,
+    /// Only changes by this actor: user, agent:<name>, judge:<provider>, sync, import, system.
+    #[arg(long)]
+    pub actor: Option<String>,
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
 }
 
 #[derive(Subcommand)]
@@ -232,6 +249,18 @@ fn parse_kind(k: &str) -> Result<Kind> {
 
 fn kind(s: &Option<String>) -> Result<Option<Kind>> {
     s.as_deref().map(parse_kind).transpose()
+}
+
+/// The author of a CLI write: `--agent` / `$ALICE_AGENT`, where set but empty means the
+/// default `cli` (which history records as the user).
+fn author(agent: &str) -> Author {
+    Author {
+        agent: Some(match agent.trim() {
+            "" => "cli".to_string(),
+            a => a.to_string(),
+        }),
+        ..Default::default()
+    }
 }
 
 /// Stdout was closed by its reader (`alice recall … | head`): the command ends quietly.
@@ -351,14 +380,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                 importance: a.importance,
                 supersedes: a.supersedes,
                 cwd: cwd(),
-                author: Author {
-                    // `ALICE_AGENT=` (set but empty) means the default.
-                    agent: Some(match a.agent.trim() {
-                        "" => "cli".to_string(),
-                        agent => agent.to_string(),
-                    }),
-                    ..Default::default()
-                },
+                author: author(&a.agent),
                 ..Default::default()
             };
             let r = remember_or_spool(&home, &launcher(), req).await?;
@@ -437,10 +459,23 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
             };
             let r = client(&home)
                 .await?
-                .update(&UpdateRequest { id: a.id, update })
+                .update(&UpdateRequest {
+                    id: a.id,
+                    update,
+                    author: author(&a.agent),
+                })
                 .await?;
             print(json, &r, || {
-                format!("{} is now {}\n", r.memory.id, r.memory.status.as_str())
+                let undo = r
+                    .event_id
+                    .as_deref()
+                    .map(|e| format!(" (event {e}; undo with `alice undo {e}`)"))
+                    .unwrap_or_default();
+                format!(
+                    "{} is now {}{undo}\n",
+                    r.memory.id,
+                    r.memory.status.as_str()
+                )
             })
         }
         Command::Facts(a) => {
@@ -469,6 +504,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                     object: a.object,
                     valid_from: a.from,
                     action,
+                    author: author(&a.agent),
                     ..Default::default()
                 })
                 .await?;
@@ -479,6 +515,42 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                     r.ended
                 )
             })
+        }
+        Command::History(a) => {
+            let r = client(&home)
+                .await?
+                .events(&EventsRequest {
+                    target_id: a.target,
+                    actor: a.actor,
+                    before: None,
+                    limit: Some(a.limit),
+                })
+                .await?;
+            print(json, &r, || {
+                r.iter()
+                    .map(|e| {
+                        format!(
+                            "{}  {}  {:<16} {:<18} {} {}\n",
+                            e.id,
+                            &e.ts[..19.min(e.ts.len())],
+                            e.actor,
+                            e.action,
+                            e.target_type,
+                            e.target_id
+                        )
+                    })
+                    .collect()
+            })
+        }
+        Command::Undo { event_id, agent } => {
+            let r = client(&home)
+                .await?
+                .undo(&UndoRequest {
+                    event_id,
+                    author: author(&agent),
+                })
+                .await?;
+            print(json, &r, || format!("{}\n", r.message))
         }
         Command::Projects => {
             let r = client(&home).await?.projects().await?;
