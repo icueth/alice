@@ -6868,7 +6868,17 @@ mod tests {
         assert_eq!(out.predicate, "deployed_on", "the heuristic decided");
         s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(0.0)))
             .unwrap();
-        let before = t.sent();
+        // The failed calls above may still be retrying in the background: count from when the
+        // transport has been quiet for a while, so only a request of the next call is counted.
+        let mut before = t.sent();
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let now = t.sent();
+            if now == before {
+                break;
+            }
+            before = now;
+        }
         let out = s
             .assert_fact(fact_req("api", "deploying_on", "Railway"))
             .await
