@@ -99,6 +99,9 @@ impl Embedder for ForceRemote {
     fn embed_query(&self, q: &str) -> alice_core::Result<Vec<f32>> {
         self.0.embed_query(q)
     }
+    fn max_batch(&self) -> usize {
+        self.0.max_batch()
+    }
     fn is_remote(&self) -> bool {
         true
     }
@@ -333,4 +336,45 @@ pub fn gate_factory(up: Arc<AtomicBool>, seen: Arc<Mutex<Vec<String>>>) -> Embed
             seen: seen.clone(),
         }) as Arc<dyn Embedder>)
     })
+}
+
+/// A remote fake with a request size (like Voyage's 128): it refuses a call of more texts, notes
+/// every text it is handed, and runs `after_first` once after its first call.
+pub struct Capped {
+    pub inner: FakeEmbedder,
+    pub cap: usize,
+    pub seen: Arc<Mutex<Vec<String>>>,
+    pub after_first: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Embedder for Capped {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+    fn embed_passages(&self, t: &[String]) -> alice_core::Result<Vec<Vec<f32>>> {
+        assert!(
+            t.len() <= self.cap,
+            "a call of {} texts for a cap of {}",
+            t.len(),
+            self.cap
+        );
+        self.seen.lock().extend(t.iter().cloned());
+        let r = self.inner.embed_passages(t);
+        if let Some(f) = self.after_first.lock().take() {
+            f();
+        }
+        r
+    }
+    fn embed_query(&self, q: &str) -> alice_core::Result<Vec<f32>> {
+        self.inner.embed_query(q)
+    }
+    fn max_batch(&self) -> usize {
+        self.cap
+    }
+    fn is_remote(&self) -> bool {
+        true
+    }
 }

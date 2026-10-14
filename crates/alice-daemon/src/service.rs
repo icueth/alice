@@ -1017,7 +1017,7 @@ impl Service {
         }
         // No index yet (still rebuilding): nothing is marked, so the next start rebuilds too.
         let (active, idx) = snapshot(&self.active, &self.index);
-        let Some(idx) = idx else {
+        let Some(idx) = idx.filter(|_| active.model != embedding::PLACEHOLDER_MODEL) else {
             return;
         };
         let path = active.vector_path.clone();

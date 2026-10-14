@@ -306,6 +306,8 @@ fn pass(
     };
     let fail = |what: &str, e: alice_core::AliceError| Halt::Failed(format!("{what} ({e})"));
     let mut last_batch = Instant::now();
+    // One request's worth at most: the policy is asked once per call of the embedder.
+    let batch = cfg.batch.min(cfg.target.max_batch()).max(1);
     while !cfg.stop.load(Ordering::Relaxed) {
         // The final pass runs with the main worker parked and must not wait for a busy hour.
         if first && !wait_for_quiet(cfg, &mut last_batch) {
@@ -313,7 +315,7 @@ fn pass(
         }
         let items = cfg
             .readers
-            .with(|c| embeddings::missing(c, owner, model, cursor, cfg.batch))
+            .with(|c| embeddings::missing(c, owner, model, cursor, batch))
             .map_err(|e| fail("reading the rows to embed", e))?;
         let Some(last) = items.last().map(|i| seq_of(i.key)) else {
             return Ok(());
@@ -410,6 +412,20 @@ fn unqueue_purge(cfg: &ReembedConfig, model: &str) {
     if list.iter().any(|m| m == model) {
         let rest: Vec<String> = list.into_iter().filter(|m| m != model).collect();
         let _ = set_meta(&cfg.writer, PURGE_KEY, &rest.join("\n"));
+    }
+}
+
+/// Deletes the files of an index saved at `base`.
+fn remove_index_files(base: &std::path::Path) {
+    for ext in [
+        "memories.usearch",
+        "chunks.bq",
+        "chunks.usearch",
+        "clean",
+        "usearch.tmp",
+        "bq.tmp",
+    ] {
+        let _ = std::fs::remove_file(base.with_extension(ext));
     }
 }
 
@@ -549,7 +565,11 @@ fn run(cfg: ReembedConfig) {
     cfg.main_paused.store(false, Ordering::SeqCst);
     cfg.recheck_skipped.store(true, Ordering::SeqCst);
     *cfg.error.write() = None;
-    if old != model {
+    if old == crate::embedding::PLACEHOLDER_MODEL {
+        // The stand-in of a new database held no vectors; nothing is left to purge.
+        remove_index_files(&active_now.vector_path);
+    }
+    if old != model && old != crate::embedding::PLACEHOLDER_MODEL {
         let mut list = purge_list(&cfg.readers);
         if !list.contains(&old) {
             list.push(old.clone());

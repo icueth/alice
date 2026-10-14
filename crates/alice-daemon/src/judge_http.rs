@@ -39,7 +39,8 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self {
-            http: BlockingHttp::new(USER_AGENT)?,
+            // A redirect would post the judge request (and the key) elsewhere.
+            http: BlockingHttp::no_redirect(USER_AGENT)?,
         })
     }
 }
@@ -972,5 +973,39 @@ mod tests {
         );
         assert_eq!(store.spent("2026-10-13").unwrap(), 0.0);
         assert_eq!(judge.stats().retries, 0);
+    }
+
+    /// A redirect would post the judge request, and the key, to wherever a server points.
+    #[test]
+    fn the_jev_client_does_not_follow_a_redirect() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        let t = ReqwestTransport::new().unwrap();
+        let r = t
+            .post(
+                &format!("{base}/v1/systemone"),
+                "k",
+                b"{}",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(r.status, 307);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "not posted again"
+        );
     }
 }

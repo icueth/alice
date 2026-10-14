@@ -784,6 +784,11 @@ async fn a_new_database_starts_at_once_with_the_provider_down_and_heals() {
     .await;
     assert_eq!(state_of(&s, "otter").await, "done");
     s.shutdown();
+    // The placeholder of the new database left no index files behind.
+    let base = AliceHome::new(d.path().to_path_buf()).vector_file(PLACEHOLDER_MODEL);
+    for ext in ["memories.usearch", "chunks.bq"] {
+        assert!(!base.with_extension(ext).exists(), "{ext}");
+    }
 }
 
 /// I5: a memory in the trash when the model switched, and restored afterwards, has a vector
@@ -976,4 +981,75 @@ mod plan_tests {
         assert_eq!(p.active.model_id(), PLACEHOLDER_MODEL);
         assert!(p.error.as_deref().is_some_and(|e| e.contains("no model")));
     }
+}
+
+/// N1: one call of the embedder is one request, so callers cut their batches to its size and ask
+/// the cloud policy before each. A project denied after the first request is not sent in the
+/// second, even though the settings' batch size (8) is larger than the request (3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_larger_than_a_request_is_cut_and_the_policy_asked_before_each_piece() {
+    let d = tempfile::tempdir().unwrap();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let service: Arc<std::sync::OnceLock<Arc<Service>>> = Arc::default();
+    let factory: alice_embed::EmbedderFactory = {
+        let (seen, service) = (seen.clone(), service.clone());
+        Arc::new(move |s: &EmbeddingSettings, _| {
+            let id = expected_model_id(s);
+            if id == MODEL_ID {
+                return Ok(Arc::new(FakeEmbedder::named(id, 384)) as Arc<dyn Embedder>);
+            }
+            let service = service.clone();
+            // After the first request: the project is denied.
+            let deny: Box<dyn FnOnce() + Send> = Box::new(move || {
+                if let Some(s) = service.get() {
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        "privacy.cloud_denied_projects".into(),
+                        serde_json::json!(["secret-proj"]),
+                    );
+                    s.patch_settings(m).unwrap();
+                }
+            });
+            Ok(Arc::new(Capped {
+                inner: FakeEmbedder::named(id, 64),
+                cap: 3,
+                seen: seen.clone(),
+                after_first: Mutex::new(Some(deny)),
+            }) as Arc<dyn Embedder>)
+        })
+    };
+    let s = start(d.path(), options(factory), "[embedding]\nbatch_size = 8\n");
+    service.set(s.clone()).ok();
+    let (open, secret) = (repo(&d, "open-proj"), repo(&d, "secret-proj"));
+    for i in 0..3 {
+        s.remember(RememberRequest {
+            content: format!("open memory {i}"),
+            cwd: open.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    for i in 0..3 {
+        s.remember(RememberRequest {
+            content: format!("secret memory {i}"),
+            cwd: secret.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    settled(&s).await;
+    let mut m = serde_json::Map::new();
+    m.insert("embedding.provider".into(), serde_json::json!("openai"));
+    m.insert("embedding.model".into(), serde_json::json!("m"));
+    s.patch_settings(m).unwrap();
+    until("the switch", 30, || async { s.model() == "openai:m" }).await;
+    let seen = seen.lock().clone();
+    assert!(seen.iter().any(|t| t.contains("open memory")), "{seen:?}");
+    assert!(
+        !seen.iter().any(|t| t.contains("secret memory")),
+        "a project denied after the first request was sent in the second: {seen:?}"
+    );
+    s.shutdown();
 }

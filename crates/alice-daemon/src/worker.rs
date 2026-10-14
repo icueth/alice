@@ -379,7 +379,10 @@ fn run(cfg: WorkerConfig) {
         };
         let model = active.model.clone();
         let remote = active.embedder.is_remote();
-        let items = match cfg.readers.with(|c| embeddings::pending(c, cur_batch)) {
+        let items = match cfg
+            .readers
+            .with(|c| embeddings::pending(c, cur_batch.min(active.embedder.max_batch()).max(1)))
+        {
             Ok(i) => i,
             Err(e) => {
                 tracing::warn!(error = %e, "reading the embedding queue failed");

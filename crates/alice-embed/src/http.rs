@@ -344,11 +344,21 @@ impl Embedder for HttpEmbedder {
     }
 
     fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let mut out = Vec::with_capacity(texts.len());
-        for b in texts.chunks(self.batch) {
-            out.extend(self.call(b, "document", TIMEOUT, 0)?);
+        // One call, one request: the caller asked the cloud policy once, just before this call,
+        // so a second request a minute later would send what that answer no longer covers.
+        if texts.len() > self.batch {
+            return Err(AliceError::Other(format!(
+                "{} was given {} texts for a request of at most {}; cut the batch to Embedder::max_batch",
+                self.id,
+                texts.len(),
+                self.batch
+            )));
         }
-        Ok(out)
+        self.call(texts, "document", TIMEOUT, 0)
+    }
+
+    fn max_batch(&self) -> usize {
+        self.batch
     }
 
     fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
@@ -496,9 +506,10 @@ mod tests {
     fn embeds_in_order_normalised_with_a_probed_dimension() {
         let (base, seen) = mock(true);
         let e = quick(HttpProvider::Voyage, "voyage-3-lite", &base, Some("k"), 2).unwrap();
-        let v = e
-            .embed_passages(&["a".into(), "bbb".into(), "cc".into()])
-            .unwrap();
+        // Callers cut to `max_batch` (2): one request each.
+        let mut v = e.embed_passages(&["a".into(), "bbb".into()]).unwrap();
+        v.extend(e.embed_passages(&["cc".into()]).unwrap());
+        let v = vec![v[0].clone(), v[1].clone(), v[2].clone()];
         let q = e.embed_query("dddd").unwrap();
         assert_eq!((e.model_id(), e.dim()), ("voyage:voyage-3-lite", 3));
         let norm = |x: f32, y: f32| x / (x * x + y * y).sqrt();
@@ -749,6 +760,20 @@ mod tests {
         let e = quick(HttpProvider::OpenAi, "m", &base, Some("k"), 8).unwrap();
         let err = e.embed_passages(&["x".into()]).unwrap_err().to_string();
         assert!(err.contains("another size"), "{err}");
+    }
+
+    /// N1: a call of more texts than one request holds is refused before anything is sent.
+    #[test]
+    fn a_call_is_one_request_and_a_bigger_batch_is_refused_unsent() {
+        let (base, seen) = mock(false);
+        let e = quick(HttpProvider::Voyage, "v", &base, Some("k"), 200).unwrap();
+        assert_eq!(e.max_batch(), 128, "Voyage takes 128 texts a request");
+        let before = seen.lock().unwrap().len();
+        let texts: Vec<String> = (0..129).map(|i| format!("t{i}")).collect();
+        assert!(e.embed_passages(&texts).is_err());
+        assert_eq!(seen.lock().unwrap().len(), before, "nothing was sent");
+        assert_eq!(e.embed_passages(&texts[..128]).unwrap().len(), 128);
+        assert_eq!(seen.lock().unwrap().len(), before + 1, "one request");
     }
 
     #[test]

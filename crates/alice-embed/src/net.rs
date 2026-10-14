@@ -32,17 +32,24 @@ impl BlockingHttp {
     /// `user_agent` is sent as it is: pass `alice/<version>` and nothing that names a person or
     /// a machine.
     pub fn new(user_agent: &str) -> std::io::Result<Self> {
-        Self::build(user_agent, false)
+        Self::build(user_agent, false, false)
     }
 
     /// For a request to an endpoint the person named (an embedding provider): redirects are not
     /// followed (the body and the key would be posted to wherever a server points) and no
     /// proxy from the environment reroutes the request.
     pub fn direct(user_agent: &str) -> std::io::Result<Self> {
-        Self::build(user_agent, true)
+        Self::build(user_agent, true, true)
     }
 
-    fn build(user_agent: &str, direct: bool) -> std::io::Result<Self> {
+    /// Like [`new`](Self::new) but redirects are not followed (a redirect would post the
+    /// body, and the key, to wherever a server points); the environment's proxy is kept, for
+    /// a remote API a corporate network may require one for.
+    pub fn no_redirect(user_agent: &str) -> std::io::Result<Self> {
+        Self::build(user_agent, true, false)
+    }
+
+    fn build(user_agent: &str, no_redirect: bool, no_proxy: bool) -> std::io::Result<Self> {
         crate::install_tls_provider();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -52,10 +59,11 @@ impl BlockingHttp {
         let mut builder = reqwest::Client::builder()
             .user_agent(user_agent)
             .connect_timeout(Duration::from_secs(10));
-        if direct {
-            builder = builder
-                .redirect(reqwest::redirect::Policy::none())
-                .no_proxy();
+        if no_redirect {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        if no_proxy {
+            builder = builder.no_proxy();
         }
         let client = builder
             .build()
@@ -310,6 +318,16 @@ mod tests {
             .unwrap();
         assert_eq!(r.status, 307, "the redirect is the answer, not followed");
         assert_eq!(heads.lock().unwrap().len(), 1, "nothing was posted again");
+        let nr = BlockingHttp::no_redirect("alice/0.0.0-test").unwrap();
+        let r = nr
+            .post_json(
+                &format!("{base}/moved"),
+                None,
+                body(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(r.status, 307, "the Jev client does not follow it either");
         // The ordinary client follows it (this is why the embedding one must not).
         let plain = BlockingHttp::new("alice/0.0.0-test").unwrap();
         let r = plain

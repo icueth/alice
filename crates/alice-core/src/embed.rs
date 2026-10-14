@@ -18,6 +18,12 @@ pub trait Embedder: Send + Sync {
     fn is_loaded(&self) -> bool {
         true
     }
+    /// Most texts one `embed_passages` call may be given. A remote embedder sends one request
+    /// per call, and the caller asks the cloud policy once before each call, so every caller
+    /// cuts its batches to this.
+    fn max_batch(&self) -> usize {
+        usize::MAX
+    }
     /// True when texts leave this machine to be embedded (an HTTP provider whose endpoint is
     /// not the local host). The daemon then sends a text only if the cloud policy allows its
     /// project (`SettingsHandle::cloud_allowed`); a local embedder never asks.
