@@ -15,7 +15,8 @@
 use super::verbal::{kind_state, memory_block};
 use super::{
     Choice, Distribution, Judge, JudgeError, JudgeMemory, JudgeResult, ProjectOption, Relation,
-    Rubric, Score, kind_choices, relation_choices, relevance_choices, reverse_relation_choices,
+    Rubric, Score, kind_choices, predicate_question, relation_choices, relevance_choices,
+    reverse_relation_choices,
 };
 use crate::normalize::sha256_hex;
 use crate::redact::Redactor;
@@ -931,10 +932,24 @@ impl Judge for JevJudge {
         Err(JudgeError::Denied)
     }
 
-    /// Refused for the same reason as `classify`.
+    /// Refused for the same reason as `classify`; see [`Judge::match_predicate_in`].
     fn match_predicate(&self, _new: &str, _existing: &[String]) -> JudgeResult<Distribution> {
         self.stats.lock().denied += 1;
         Err(JudgeError::Denied)
+    }
+
+    /// Predicate names are the knowledge graph's vocabulary, which belongs to no project, so
+    /// the call covers `global` and the `projects` given (the project of a memory a fact
+    /// cites): every one must be allowed to the cloud.
+    fn match_predicate_in(
+        &self,
+        projects: &[&str],
+        new: &str,
+        existing: &[String],
+    ) -> JudgeResult<Distribution> {
+        let covered = distinct(projects.iter().copied().chain(std::iter::once(UNSCOPED)));
+        let (state, options) = predicate_question(new, existing);
+        self.classify_in(&covered, &state, &options)
     }
 
     fn compare(&self, new: &JudgeMemory, existing: &[JudgeMemory]) -> JudgeResult<Vec<Relation>> {
@@ -1808,6 +1823,36 @@ mod tests {
         let sent = s.calls.lock()[0].to_string();
         assert!(
             sent.contains("[REDACTED:github_token]") && !sent.contains("ghp_"),
+            "{sent}"
+        );
+    }
+
+    /// Predicate names go out only through the scoped override, covering `global` and the
+    /// projects given; the unscoped entry point is refused.
+    #[test]
+    fn predicate_matching_is_scoped_and_the_unscoped_entry_is_refused() {
+        let s = Scripted::ok();
+        let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
+        let existing = vec!["runs_on".to_string()];
+        assert_eq!(
+            j.match_predicate("is_hosted_on", &existing),
+            Err(JudgeError::Denied)
+        );
+        assert_eq!(
+            j.match_predicate_in(&["secret-proj"], "is_hosted_on", &existing),
+            Err(JudgeError::Denied)
+        );
+        assert!(
+            s.calls.lock().is_empty(),
+            "nothing was sent for a denied call"
+        );
+        // Allowed projects: one request, covering the names and nothing else.
+        let _ = j.match_predicate_in(&["alice"], "is_hosted_on", &existing);
+        let calls = s.calls.lock();
+        assert_eq!(calls.len(), 1);
+        let sent = calls[0].to_string();
+        assert!(
+            sent.contains("is hosted on") && sent.contains("runs on"),
             "{sent}"
         );
     }

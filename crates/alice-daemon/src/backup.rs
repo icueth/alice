@@ -51,6 +51,8 @@ pub struct BackupInfo {
 }
 
 const KEEP_SPECIAL_DAYS: i64 = 30;
+/// Manual backups kept, newest first, whatever the day: the daily/weekly policy never thins them.
+pub const KEEP_MANUAL: usize = 5;
 
 /// Where backups go: `backup.dir`, or `<home>/backups`.
 pub fn backup_dir(home: &AliceHome, s: &BackupSettings) -> PathBuf {
@@ -66,8 +68,8 @@ fn stamp(now: DateTime<Utc>) -> String {
 
 fn name_for(kind: BackupKind, now: DateTime<Utc>, version: i64) -> String {
     match kind {
-        // Manual backups share the scheduled ones' name and rotation.
-        BackupKind::Scheduled | BackupKind::Manual => format!("alice-{}.db", stamp(now)),
+        BackupKind::Scheduled => format!("alice-{}.db", stamp(now)),
+        BackupKind::Manual => format!("alice-manual-{}.db", stamp(now)),
         BackupKind::PreMigration => format!("alice-pre-migration-v{version}-{}.db", stamp(now)),
         BackupKind::BeforeRestore => format!("alice-before-restore-{}.db", stamp(now)),
     }
@@ -80,6 +82,8 @@ fn parse_name(name: &str) -> Option<(BackupKind, DateTime<Utc>)> {
         (BackupKind::PreMigration, r.split_once('-')?.1)
     } else if let Some(r) = rest.strip_prefix("before-restore-") {
         (BackupKind::BeforeRestore, r)
+    } else if let Some(r) = rest.strip_prefix("manual-") {
+        (BackupKind::Manual, r)
     } else {
         (BackupKind::Scheduled, rest)
     };
@@ -289,8 +293,8 @@ pub fn list(dir: &Path) -> Result<Vec<BackupInfo>> {
     Ok(out)
 }
 
-/// Delete what the policy does not keep; returns the deleted paths. Of the regular
-/// (scheduled and manual) backups it keeps the newest of each of the last `daily` days that
+/// Delete what the policy does not keep; returns the deleted paths. Of the scheduled backups it
+/// keeps the newest of each of the last `daily` days that
 /// have one, and the newest of each of the `weekly` most recent ISO weeks that the daily ones
 /// do not touch: with enough history exactly `daily + weekly` files (spec §5.6: 7 daily + 4
 /// weekly). The newest backup of each kind is always kept, so a policy (or a bug) can never
@@ -299,10 +303,19 @@ pub fn rotate(dir: &Path, now: DateTime<Utc>, daily: u32, weekly: u32) -> Result
     sweep_temp(dir);
     let all = list(dir)?;
     let mut keep = std::collections::HashSet::new();
+    // Scheduled backups follow the daily/weekly policy; manual ones are kept apart, the newest
+    // `KEEP_MANUAL` of them, whatever the day.
     let regular: Vec<&BackupInfo> = all
         .iter()
-        .filter(|b| matches!(b.kind, BackupKind::Scheduled | BackupKind::Manual))
+        .filter(|b| b.kind == BackupKind::Scheduled)
         .collect();
+    for b in all
+        .iter()
+        .filter(|b| b.kind == BackupKind::Manual)
+        .take(KEEP_MANUAL)
+    {
+        keep.insert(b.path.clone());
+    }
     if let Some(newest) = regular.first() {
         keep.insert(newest.path.clone());
     }
@@ -356,6 +369,16 @@ pub fn rotate(dir: &Path, now: DateTime<Utc>, daily: u32, weekly: u32) -> Result
 /// them into `dir`. Only regular files directly in the home are taken: a link (which might point
 /// anywhere) is left alone, and an existing backup is never overwritten.
 pub fn adopt_legacy(home: &AliceHome, dir: &Path) -> Result<usize> {
+    adopt_legacy_with(home, dir, &|from, to| std::fs::rename(from, to))
+}
+
+/// [`adopt_legacy`] with the rename step injected (a test makes it fail as it does across
+/// volumes); when it fails the file is copied and then removed.
+pub fn adopt_legacy_with(
+    home: &AliceHome,
+    dir: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<usize> {
     let mut n = 0;
     for e in std::fs::read_dir(home.root())?.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
@@ -380,7 +403,7 @@ pub fn adopt_legacy(home: &AliceHome, dir: &Path) -> Result<usize> {
             }
             t += chrono::Duration::seconds(1);
         };
-        move_file(&e.path(), &dest)?;
+        move_file(&e.path(), &dest, rename)?;
         alice_core::store::make_private(&dest)?;
         n += 1;
     }
@@ -389,8 +412,12 @@ pub fn adopt_legacy(home: &AliceHome, dir: &Path) -> Result<usize> {
 
 /// Rename `from` to `to`; across volumes (the backup directory may be elsewhere) copy it and
 /// then remove the original.
-fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::rename(from, to).or_else(|_| copy_then_remove(from, to))
+fn move_file(
+    from: &Path,
+    to: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    rename(from, to).or_else(|_| copy_then_remove(from, to))
 }
 
 fn copy_then_remove(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -743,6 +770,128 @@ mod tests {
             let free = free_space(&d.path().join("not/yet/there")).expect("a volume");
             assert!(free > 1_000_000, "{free}");
         }
+    }
+
+    /// Manual backups are kept apart from the daily/weekly policy: the newest five, whatever
+    /// the day (two on one day included), and they never count as a scheduled day or week.
+    #[test]
+    fn manual_backups_rotate_apart_keeping_the_newest_five() {
+        let d = tempfile::tempdir().unwrap();
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 13, 12, 0, 0)
+            .unwrap();
+        let manual = |t: DateTime<Utc>| {
+            std::fs::write(
+                d.path()
+                    .join(format!("alice-manual-{}.db", t.format("%Y%m%dT%H%M%SZ"))),
+                b"x",
+            )
+            .unwrap();
+        };
+        // Three on the same day, then one a day for nine more days.
+        for h in 0..3 {
+            manual(now - chrono::Duration::hours(h));
+        }
+        for day in 1..10 {
+            manual(now - chrono::Duration::days(day));
+        }
+        // And scheduled ones for 20 days.
+        for day in 0..20 {
+            put_backup(d.path(), now - chrono::Duration::days(day));
+        }
+        rotate(d.path(), now, 7, 4).unwrap();
+        let all = list(d.path()).unwrap();
+        let manual_kept: Vec<_> = all
+            .iter()
+            .filter(|b| b.kind == BackupKind::Manual)
+            .collect();
+        assert_eq!(manual_kept.len(), KEEP_MANUAL);
+        // The newest five: the three of today and the two before.
+        let newest: Vec<_> = (0..3)
+            .map(|h| now - chrono::Duration::hours(h))
+            .chain((1..3).map(|day| now - chrono::Duration::days(day)))
+            .collect();
+        for t in newest {
+            assert!(manual_kept.iter().any(|b| b.created_at == t), "{t}");
+        }
+        // The scheduled ones follow their own policy, untouched by the manual ones.
+        let scheduled = all
+            .iter()
+            .filter(|b| b.kind == BackupKind::Scheduled)
+            .count();
+        assert_eq!(
+            scheduled,
+            7 + 2,
+            "7 daily + the weeks of days 7..20 they do not touch"
+        );
+        // Fewer than five: all stay.
+        let e = tempfile::tempdir().unwrap();
+        std::fs::write(e.path().join("alice-manual-20250101T000000Z.db"), b"x").unwrap();
+        rotate(e.path(), now, 7, 4).unwrap();
+        assert_eq!(list(e.path()).unwrap().len(), 1);
+    }
+
+    /// A manual backup has its own name, so it never replaces (or is replaced by) a scheduled
+    /// one made in the same second.
+    #[test]
+    fn a_manual_backup_and_a_scheduled_one_in_the_same_second_both_stay() {
+        let d = tempfile::tempdir().unwrap();
+        let db = db_with_rows(d.path());
+        let dir = d.path().join("backups");
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 13, 3, 0, 0).unwrap();
+        let a = create(&db, &dir, BackupKind::Scheduled, now).unwrap();
+        let b = create(&db, &dir, BackupKind::Manual, now).unwrap();
+        assert_ne!(a.name, b.name);
+        assert_eq!(b.name, "alice-manual-20261013T030000Z.db");
+        let kinds: Vec<_> = list(&dir).unwrap().into_iter().map(|b| b.kind).collect();
+        assert_eq!(kinds.len(), 2);
+        assert!(kinds.contains(&BackupKind::Scheduled) && kinds.contains(&BackupKind::Manual));
+    }
+
+    /// An `EXDEV`-style failure of the rename (the backup directory is on another volume) falls
+    /// back to copy + remove: the file arrives whole, the original is gone, no partial file or
+    /// temporary stays. When the copy fails too, the original stays and nothing partial is left.
+    #[test]
+    fn a_legacy_file_is_adopted_across_volumes_by_copy_and_remove() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let legacy = d
+            .path()
+            .join("alice.pre-migration-2026-10-13T09-44-23-391Z.db");
+        std::fs::write(&legacy, b"the old database").unwrap();
+        let dir = d.path().join("backups");
+        let exdev = |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(18));
+        assert_eq!(adopt_legacy_with(&home, &dir, &exdev).unwrap(), 1);
+        assert!(!legacy.exists(), "the original is removed");
+        let b = list(&dir).unwrap();
+        assert_eq!((b.len(), b[0].kind), (1, BackupKind::PreMigration));
+        assert_eq!(std::fs::read(&b[0].path).unwrap(), b"the old database");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![b[0].name.clone()],
+            "no temporary file is left: {names:?}"
+        );
+        // Both steps fail (the source cannot be read): an error, the file stays, nothing partial.
+        let d2 = tempfile::tempdir().unwrap();
+        let home2 = AliceHome::new(d2.path().to_path_buf());
+        let legacy2 = d2
+            .path()
+            .join("alice.pre-migration-2026-10-13T09-44-23-391Z.db");
+        std::fs::write(&legacy2, b"kept").unwrap();
+        let dir2 = d2.path().join("backups");
+        let gone_then_fail = |from: &Path, _: &Path| {
+            std::fs::remove_file(from).ok(); // the copy then has nothing to read
+            Err(std::io::Error::from_raw_os_error(18))
+        };
+        assert!(adopt_legacy_with(&home2, &dir2, &gone_then_fail).is_err());
+        let left: Vec<_> = std::fs::read_dir(&dir2)
+            .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "no partial file: {left:?}");
     }
 
     #[test]

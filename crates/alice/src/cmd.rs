@@ -57,6 +57,9 @@ pub struct RecallArgs {
     pub since: Option<String>,
     #[arg(long)]
     pub before: Option<String>,
+    /// Let the judge re-rank the top results (slower; uses Jev when it is configured).
+    #[arg(long)]
+    pub precise: bool,
 }
 
 #[derive(Args)]
@@ -352,6 +355,18 @@ pub(crate) fn out(text: &str) -> Result<()> {
     }
 }
 
+/// The text of a recall answer; a precise one that the judge re-ordered says so.
+fn recall_text(r: &RecallResponse) -> String {
+    let mut text = r.text.clone().unwrap_or_default();
+    if r.reranked {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("(re-ranked by the judge)\n");
+    }
+    text
+}
+
 fn print<T: serde::Serialize>(json: bool, value: &T, text: impl FnOnce() -> String) -> Result<()> {
     if json {
         out(&format!("{}\n", serde_json::to_string_pretty(value)?))
@@ -411,6 +426,11 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                 since: a.since,
                 before: a.before,
                 include_raw: a.raw,
+                mode: if a.precise {
+                    RecallMode::Precise
+                } else {
+                    RecallMode::Fast
+                },
                 limit: a.limit,
                 max_tokens: a.max_tokens,
                 format: if json {
@@ -419,10 +439,9 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                     OutputFormat::Text
                 },
                 cwd: cwd(),
-                ..Default::default()
             };
             let r = client(&home).await?.recall(&req).await?;
-            print(json, &r, || r.text.clone().unwrap_or_default())
+            print(json, &r, || recall_text(&r))
         }
         Command::Remember(a) => {
             let content = if a.text.len() == 1 && a.text[0] == "-" {
@@ -1446,5 +1465,21 @@ mod tests {
         std::fs::write(&path, "a\nb\nc\n").unwrap();
         assert_eq!(log_tail(&path, 100).unwrap(), ["a", "b", "c"]);
         assert_eq!(log_tail(&path, 2).unwrap(), ["b", "c"]);
+    }
+
+    #[test]
+    fn a_reranked_recall_says_so_and_a_plain_one_does_not() {
+        let mut r = RecallResponse {
+            text: Some("1. one\n2. two\n".into()),
+            ..Default::default()
+        };
+        assert_eq!(recall_text(&r), "1. one\n2. two\n");
+        r.reranked = true;
+        assert_eq!(
+            recall_text(&r),
+            "1. one\n2. two\n(re-ranked by the judge)\n"
+        );
+        r.text = Some("no newline".into());
+        assert_eq!(recall_text(&r), "no newline\n(re-ranked by the judge)\n");
     }
 }

@@ -20,13 +20,13 @@ use alice_core::api::*;
 use alice_core::embed::Embedder;
 use alice_core::error::{AliceError, Result};
 use alice_core::ids::new_id;
-use alice_core::judge::Judge;
 use alice_core::judge::jev::JevTransport;
-use alice_core::model::limits;
+use alice_core::judge::{Judge, JudgeMemory, RELEVANCE_ANSWERS, RELEVANCE_PARTIAL};
+use alice_core::model::{Kind, limits};
 use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
 use alice_core::redact::Redactor;
-use alice_core::search::{self, SearchParams, pack};
+use alice_core::search::{self, SearchOutput, SearchParams, pack};
 use alice_core::settings::{self, SettingError, Settings};
 use alice_core::store::embeddings;
 use alice_core::store::events::Actor;
@@ -34,7 +34,7 @@ use alice_core::store::history::UndoOutcome;
 use alice_core::store::kg::{self, FactOutcome};
 use alice_core::store::memories::{self, InsertOutcome, NewMemoryInput};
 use alice_core::store::projects::{self, ResolvedProject};
-use alice_core::store::reviews::{self, ReviewItem, ReviewQuery};
+use alice_core::store::reviews::{self, NewReview, ReviewItem, ReviewQuery, ReviewType};
 use alice_core::store::sources::{self, IngestOutcome};
 use alice_core::store::{ReaderPool, VECTOR_READER_CACHE_KIB, open_reader, open_writer};
 use alice_core::vector::VectorIndex;
@@ -62,6 +62,26 @@ const MAINTENANCE_STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a working directory's detected project is reused before git is asked again.
 const DETECT_TTL: Duration = Duration::from_secs(60);
+/// How long `assert_fact` waits for the judge to match a new predicate before the heuristic
+/// decides.
+const PREDICATE_WAIT: Duration = Duration::from_secs(3);
+/// Most similar existing predicates offered to the judge.
+const PREDICATE_CANDIDATES: usize = 10;
+/// Predicate names read to find the similar ones (most used first).
+const PREDICATE_VOCABULARY: usize = 500;
+
+/// Results the judge grades in precise mode (spec §4.4 step 4).
+const PRECISE_TOP: usize = 20;
+
+/// What the judge decided for a predicate that is new to the vocabulary.
+#[derive(Default)]
+struct PredicateVerdict {
+    /// `(new, canonical)`: sure enough to map.
+    alias: Option<(String, String)>,
+    /// Similar but not sure: stored as given, and asked in the review inbox.
+    review: Option<NewReview>,
+    suggestion: Option<String>,
+}
 
 /// Reads one environment variable for the secrets' status (tests replace the process's).
 pub type SecretEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -976,6 +996,14 @@ impl Service {
         // Embedded before a reader connection is taken: the model is shared with the
         // embedding worker, and a recall waiting for it must not hold a connection.
         let text = search::query_text(&req.query)?;
+        let (precise, judged_query) = (req.mode == RecallMode::Precise, text.clone());
+        // Precise mode grades PRECISE_TOP results and keeps `limit` of them, so it searches
+        // for at least that many.
+        let search_limit = if precise {
+            limit.max(PRECISE_TOP)
+        } else {
+            limit
+        };
         let vector = match &index {
             Some(idx) => {
                 let (idx, embedder) = (idx.clone(), self.embedder.clone());
@@ -1011,9 +1039,12 @@ impl Service {
                     since: req.since,
                     before: req.before,
                     include_raw: req.include_raw,
-                    limit,
+                    limit: search_limit,
                     // The one place the f64 setting becomes the f32 the search compares with.
                     relevance_floor: cfg.search.relevance_floor as f32,
+                    relevance_sure: Some(cfg.search.relevance_sure as f32),
+                    relevance_margin: cfg.search.relevance_margin as f32,
+                    chunk_floor: Some(search::CHUNK_RELEVANCE_FLOOR),
                     raw_min_results: cfg.search.raw_fallback_min_results,
                     half_lives: cfg.search.half_life.clone(),
                     lists: search::Lists::Hybrid,
@@ -1030,6 +1061,11 @@ impl Service {
                 Ok((out, scope.project.slug))
             })
             .await?;
+        let mut out = out;
+        let mut reranked = false;
+        if precise {
+            (out, reranked) = self.rerank(out, &slug, &judged_query, limit).await;
+        }
         let (response, touched) = match format {
             OutputFormat::Text => {
                 let (text, omitted) = pack::pack_text(&out, Some(&slug), max_tokens);
@@ -1039,15 +1075,16 @@ impl Service {
                     project: Some(slug),
                     omitted,
                     raw_fallback: out.raw_fallback,
+                    reranked,
                     text: Some(text),
                     ..Default::default()
                 };
                 (response, touched)
             }
             OutputFormat::Json => {
-                let mut out = out;
                 let seqs = std::mem::take(&mut out.memory_seqs);
-                let response = pack::pack_json(out, Some(slug), max_tokens);
+                let mut response = pack::pack_json(out, Some(slug), max_tokens);
+                response.reranked = reranked;
                 let touched = returned_memories(seqs, &response.results);
                 (response, touched)
             }
@@ -1056,6 +1093,134 @@ impl Service {
             self.writer.send_nowait(WriteOp::TouchAccess(touched));
         }
         Ok(response)
+    }
+
+    /// Precise mode (spec §4.4 step 4): the judge grades the top `PRECISE_TOP` results in one
+    /// batched call and the memories among them are re-ordered by P(relevant), in the places
+    /// those memories held (raw chunks, and memories of a project the cloud may not see, keep
+    /// theirs). Then `limit` results are kept. Without a model judge, or when it answers
+    /// `Denied`, `Budget` or an error, or too slowly, the order is the search's and the
+    /// answer says so (`false`). The call is scoped to the project the query was asked from.
+    async fn rerank(
+        &self,
+        mut out: SearchOutput,
+        query_project: &str,
+        query: &str,
+        limit: usize,
+    ) -> (SearchOutput, bool) {
+        let judge = self.judge();
+        let mut reranked = false;
+        // The cloud policy is asked once per distinct project, off the runtime's threads (each
+        // answer reads the store).
+        let allowed: std::collections::HashSet<String> = if judge.provider() == "heuristic" {
+            Default::default()
+        } else {
+            let mut projects = vec![query_project.to_string()];
+            for h in out.hits.iter().take(PRECISE_TOP) {
+                if h.tier == Tier::Knowledge && !projects.contains(&h.project) {
+                    projects.push(h.project.clone());
+                }
+            }
+            let hub = self.judge.clone();
+            tokio::task::spawn_blocking(move || {
+                projects
+                    .into_iter()
+                    .filter(|p| hub.cloud_allowed(p))
+                    .collect()
+            })
+            .await
+            .unwrap_or_default()
+        };
+        if allowed.contains(query_project) {
+            // Knowledge hits among the top, with their place in the hit list.
+            let graded: Vec<(usize, JudgeMemory)> = out
+                .hits
+                .iter()
+                .take(PRECISE_TOP)
+                .enumerate()
+                .filter(|(_, h)| h.tier == Tier::Knowledge && allowed.contains(&h.project))
+                .map(|(i, h)| {
+                    let ordinal = out.hits[..i]
+                        .iter()
+                        .filter(|p| p.tier == Tier::Knowledge)
+                        .count();
+                    (
+                        i,
+                        JudgeMemory {
+                            id: h.id.clone(),
+                            project: h.project.clone(),
+                            kind: h.kind.unwrap_or(Kind::Note),
+                            title: h.title.clone(),
+                            body: h.body.clone().unwrap_or_else(|| h.snippet.clone()),
+                            importance: out.memory_importance.get(ordinal).copied().unwrap_or(3),
+                            created_at: h.created_at.clone(),
+                            similarity: None,
+                        },
+                    )
+                })
+                .collect();
+            if graded.len() > 1 {
+                let wait = Duration::from_millis(self.settings().judge.timeout_ms) * 2;
+                let (q, p) = (query.to_string(), query_project.to_string());
+                let ms: Vec<JudgeMemory> = graded.iter().map(|(_, m)| m.clone()).collect();
+                let asked = tokio::time::timeout(
+                    wait,
+                    tokio::task::spawn_blocking(move || judge.grade_relevance(&p, &q, &ms)),
+                )
+                .await;
+                match asked {
+                    Ok(Ok(Ok(grades))) if grades.len() == graded.len() => {
+                        let mut scored: Vec<(usize, f64)> = graded
+                            .iter()
+                            .zip(&grades)
+                            .filter(|(_, d)| !d.0.is_empty())
+                            .map(|((i, _), d)| {
+                                (*i, d.p(RELEVANCE_ANSWERS) + 0.5 * d.p(RELEVANCE_PARTIAL))
+                            })
+                            .collect();
+                        let slots: Vec<usize> = scored.iter().map(|(i, _)| *i).collect();
+                        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                        let mut order: Vec<usize> = (0..out.hits.len()).collect();
+                        for (slot, (from, _)) in slots.iter().zip(&scored) {
+                            order[*slot] = *from;
+                        }
+                        reranked = !scored.is_empty();
+                        out = reorder(out, &order);
+                    }
+                    Ok(Ok(Ok(_))) => tracing::warn!("the judge graded another number of results"),
+                    Ok(Ok(Err(e))) => {
+                        tracing::debug!(error = %e, "precise recall: the judge did not grade; the search order stands")
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "precise recall: the grading task failed")
+                    }
+                    Err(_) => tracing::debug!("precise recall: the judge was too slow"),
+                }
+            }
+        }
+        // Back to what was asked for; the related memories follow the final top results.
+        out.hits.truncate(limit);
+        let shown = out
+            .hits
+            .iter()
+            .filter(|h| h.tier == Tier::Knowledge)
+            .count();
+        out.memory_seqs.truncate(shown);
+        out.memory_importance.truncate(shown);
+        // `related` followed the unlimited search; it is recomputed for the results kept, which
+        // also puts back memories that only the cut-off results shadowed.
+        {
+            let ids: Vec<String> = out
+                .hits
+                .iter()
+                .filter(|h| h.tier == Tier::Knowledge)
+                .map(|h| h.id.clone())
+                .collect();
+            if let Ok(related) = self.read(move |c| search::related_for(c, &ids)).await {
+                out.related = related;
+            }
+        }
+        (out, reranked)
     }
 
     pub async fn context(&self, req: ContextRequest) -> Result<ContextResponse> {
@@ -1221,14 +1386,131 @@ impl Service {
         req.subject = redact_field(&r, "subject", &req.subject)?;
         req.predicate = redact_field(&r, "predicate", &req.predicate)?;
         req.object = redact_field(&r, "object", &req.object)?;
+        let verdict = self.match_new_predicate(&req).await;
         match self
             .writer
-            .submit(WriteOp::AssertFact { fact: req, actor })
+            .submit(WriteOp::AssertFact {
+                fact: req,
+                actor,
+                alias: verdict.alias,
+                review: verdict.review,
+            })
             .await?
         {
-            WriteOutcome::Fact(f) => Ok(f),
+            WriteOutcome::Fact(mut f) => {
+                f.suggestion = f.suggestion.or(verdict.suggestion);
+                Ok(f)
+            }
             other => Err(unexpected(other)),
         }
+    }
+
+    /// What the judge makes of a predicate the vocabulary has not seen (spec §5.2): the same
+    /// as an existing one (mapped when sure), or only similar (suggested, and asked in the
+    /// review inbox). Never fails: without an answer the fact is stored as given.
+    async fn match_new_predicate(&self, req: &AssertFactRequest) -> PredicateVerdict {
+        let none = PredicateVerdict::default();
+        let name = kg::normalize_predicate(&req.predicate);
+        if name.is_empty() || req.action == kg::FactAction::End {
+            return none;
+        }
+        let (n, source) = (name.clone(), req.source_memory_id.clone());
+        let looked = self
+            .read(move |c| {
+                if kg::predicate_exists(c, &n)? {
+                    return Ok(None);
+                }
+                let names = kg::predicate_names(c, PREDICATE_VOCABULARY)?;
+                // The project of the memory the fact cites: a cloud judge sees the names only
+                // if that project may go to the cloud.
+                let project: Option<String> = match source {
+                    Some(id) => c
+                        .query_row(
+                            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id
+                             WHERE m.id = ?1 OR m.legacy_id = ?1 ORDER BY m.seq LIMIT 1",
+                            [id],
+                            |r| r.get(0),
+                        )
+                        .optional()?,
+                    None => None,
+                };
+                Ok(Some((names, project)))
+            })
+            .await;
+        let Ok(Some((names, project))) = looked else {
+            return none;
+        };
+        // The most similar names go to the judge; the heuristic only acts on close ones anyway.
+        let mut close: Vec<(String, f64)> = names
+            .into_iter()
+            .map(|p| {
+                let sim = alice_core::judge::text::predicate_similarity(&name, &p);
+                (p, sim)
+            })
+            .collect();
+        close.sort_by(|a, b| b.1.total_cmp(&a.1));
+        close.truncate(PREDICATE_CANDIDATES);
+        let candidates: Vec<String> = close.into_iter().map(|(p, _)| p).collect();
+        if candidates.is_empty() {
+            return none;
+        }
+        let settings = self.settings();
+        let judge = self.judge();
+        let (n, c) = (name.clone(), candidates.clone());
+        let asked = tokio::time::timeout(
+            PREDICATE_WAIT,
+            tokio::task::spawn_blocking(move || {
+                let scope: Vec<&str> = project.as_deref().into_iter().collect();
+                let d = judge.match_predicate_in(&scope, &n, &c);
+                (judge.provider().to_string(), d)
+            }),
+        )
+        .await;
+        let (provider, decision) = match asked {
+            Ok(Ok((provider, Ok(d)))) => (provider, d),
+            // Denied, over budget, failing, slow: the heuristic decides, locally.
+            _ => (
+                "heuristic".to_string(),
+                alice_core::judge::heuristic::HeuristicJudge::default()
+                    .match_predicate(&name, &candidates)
+                    .unwrap_or_default(),
+            ),
+        };
+        let Some((canonical, p)) = decision.best().filter(|(c, _)| c != "none") else {
+            return none;
+        };
+        if !candidates.contains(&canonical) {
+            return none;
+        }
+        let j = &settings.judge;
+        // The same words the other way round (`depends_on`, `depended_on_by`) are a different
+        // predicate: never mapped without a person looking.
+        let reversed = alice_core::judge::text::directions_differ(&name, &canonical);
+        if p >= j.auto_apply_threshold && !reversed {
+            return PredicateVerdict {
+                alias: Some((name, canonical)),
+                ..none
+            };
+        }
+        if p >= j.review_threshold {
+            return PredicateVerdict {
+                suggestion: Some(canonical.clone()),
+                review: Some(NewReview {
+                    kind: ReviewType::Predicate,
+                    payload: serde_json::json!({
+                        "predicate": name,
+                        "canonical": canonical,
+                        "p": p,
+                        "provider": provider,
+                        "reversed": reversed,
+                    }),
+                    confidence: Some(p),
+                    dedupe_key: Some(format!("predicate:{name}")),
+                }),
+                ..none
+            };
+        }
+        none
     }
 
     /// Recorded changes, newest first (spec §5.5). The actor may be a bare agent name
@@ -2073,6 +2355,36 @@ impl Drop for Service {
             self.writer.send_nowait(WriteOp::Shutdown);
         }
     }
+}
+
+/// `out` with its hits in the order `order` says (`order[i]` is the old index of the hit now at
+/// `i`; a permutation), the knowledge hits' `memory_seqs` and importances following their hits.
+fn reorder(mut out: SearchOutput, order: &[usize]) -> SearchOutput {
+    let ordinals: Vec<Option<usize>> = {
+        let mut n = 0;
+        out.hits
+            .iter()
+            .map(|h| {
+                (h.tier == Tier::Knowledge).then(|| {
+                    n += 1;
+                    n - 1
+                })
+            })
+            .collect()
+    };
+    let hits = std::mem::take(&mut out.hits);
+    let (seqs, importance) = (
+        std::mem::take(&mut out.memory_seqs),
+        std::mem::take(&mut out.memory_importance),
+    );
+    for &from in order {
+        out.hits.push(hits[from].clone());
+        if let Some(k) = ordinals[from] {
+            out.memory_seqs.push(seqs[k]);
+            out.memory_importance.push(importance[k]);
+        }
+    }
+    out
 }
 
 /// The memories a response returns, out of `seqs` (one per knowledge hit, in hit order): those
@@ -2946,9 +3258,10 @@ mod tests {
         // The on-demand backup job rotates and keeps the manual one.
         let report = s.run_job(Job::Backup).await.unwrap();
         assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
-        // (A backup made in the same second as the manual one replaces it: same name.)
+        // The manual backup has its own name: both stay.
         let kept = s.backups().await.unwrap();
-        assert!(!kept.is_empty() && kept.iter().all(|b| b.path.exists()));
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|b| b.path.exists()));
         tokio::task::spawn_blocking(move || s.shutdown())
             .await
             .unwrap();
@@ -3936,14 +4249,14 @@ mod tests {
             },
         )
         .unwrap();
-        std::fs::write(home.config_file(), "[search]\nrelevance_floor = 0.9\n").unwrap();
+        std::fs::write(home.config_file(), "[search]\nrelevance_floor = 0.81\n").unwrap();
         for _ in 0..200 {
-            if s.settings().search.relevance_floor == 0.9 {
+            if s.settings().search.relevance_floor == 0.81 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(s.settings().search.relevance_floor, 0.9);
+        assert_eq!(s.settings().search.relevance_floor, 0.81);
         assert_eq!(
             s.settings_view().sources["search.relevance_floor"],
             alice_core::settings::Source::File
@@ -5764,5 +6077,471 @@ mod tests {
             "no model update"
         );
         s.shutdown();
+    }
+
+    // ------------------------------------------------------------------ predicates
+
+    fn fact_req(subject: &str, predicate: &str, object: &str) -> AssertFactRequest {
+        AssertFactRequest {
+            subject: subject.into(),
+            predicate: predicate.into(),
+            object: object.into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_predicate_maps_to_an_identical_stem_or_is_suggested() {
+        let (_d, s) = svc().await;
+        let f = |p: &str, o: &str| fact_req("alice", p, o);
+        s.assert_fact(f("uses", "SQLite")).await.unwrap();
+        s.assert_fact(f("deployed_on", "Coolify")).await.unwrap();
+        // Same stem: the heuristic maps it (an identical predicate is a duplicate).
+        let out = s.assert_fact(f("use", "Rust")).await.unwrap();
+        assert_eq!(
+            (out.predicate.as_str(), out.suggestion.as_deref()),
+            ("uses", None)
+        );
+        // Similar but not the same: stored as given, suggested, and asked in the review inbox.
+        let out = s.assert_fact(f("deployed_to", "Railway")).await.unwrap();
+        assert_eq!(
+            (out.predicate.as_str(), out.suggestion.as_deref()),
+            ("deployed_to", Some("deployed_on"))
+        );
+        let open = s.reviews(ReviewQuery::default()).await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].review_type.as_str(), "predicate");
+        assert_eq!(open[0].payload["canonical"], "deployed_on");
+        // Asking again opens no second item.
+        s.assert_fact(f("deployed_to", "Fly")).await.unwrap();
+        assert_eq!(s.reviews(ReviewQuery::default()).await.unwrap().len(), 1);
+        // An unrelated new predicate: nothing to say.
+        let out = s.assert_fact(f("owns", "a cat")).await.unwrap();
+        assert_eq!(out.suggestion, None);
+        // The mapping is a recorded, undoable event with the fact.
+        let events = s
+            .events(EventsRequest {
+                limit: Some(50),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(events.iter().any(|e| e.action == "predicate.map"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jev_maps_a_paraphrased_predicate_when_sure() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            predicate: Some(("runs_on", 0.93)),
+            ..Default::default()
+        });
+        let (_d, s) = svc_with_jev(t.clone()).await;
+        let f = |p: &str, o: &str| fact_req("api", p, o);
+        s.assert_fact(f("runs_on", "k8s")).await.unwrap();
+        assert_eq!(t.sent(), 0, "a known predicate is not asked about");
+        let out = s.assert_fact(f("is_hosted_on", "fly.io")).await.unwrap();
+        assert_eq!(out.predicate, "runs_on");
+        assert_eq!(t.sent(), 1);
+        let facts = s
+            .facts(FactsRequest {
+                entity: "api".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(facts.facts.iter().all(|f| f.predicate == "runs_on"));
+        assert_eq!(facts.facts.len(), 2);
+        // Later uses of the new name resolve without asking again.
+        s.assert_fact(f("is_hosted_on", "aws")).await.unwrap();
+        assert_eq!(t.sent(), 1);
+    }
+
+    /// F3: the same words the other way round are a different predicate: even a sure judge
+    /// only gets a review item, and the heuristic never reaches the auto-apply threshold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_predicate_that_reads_the_other_way_round_is_never_mapped_without_a_person() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            predicate: Some(("depends_on", 0.97)),
+            ..Default::default()
+        });
+        let (_d, s) = svc_with_jev(t.clone()).await;
+        s.assert_fact(fact_req("api", "depends_on", "postgres"))
+            .await
+            .unwrap();
+        let out = s
+            .assert_fact(fact_req("postgres", "depended_on_by", "api"))
+            .await
+            .unwrap();
+        assert_eq!(t.sent(), 1, "the judge was asked");
+        assert_eq!(out.predicate, "depended_on_by", "stored as given");
+        assert_eq!(out.suggestion.as_deref(), Some("depends_on"));
+        let open = s.reviews(ReviewQuery::default()).await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].review_type.as_str(), "predicate");
+        assert_eq!(open[0].payload["reversed"], true);
+        // The offline heuristic gets the same answer.
+        let (_d2, h) = svc().await;
+        h.assert_fact(fact_req("api", "depends_on", "postgres"))
+            .await
+            .unwrap();
+        let out = h
+            .assert_fact(fact_req("postgres", "depended_on_by", "api"))
+            .await
+            .unwrap();
+        assert_eq!(out.predicate, "depended_on_by");
+        assert_eq!(out.suggestion.as_deref(), Some("depends_on"));
+    }
+
+    /// A fact that cites a memory of a project the cloud may not see keeps its predicate names
+    /// away from the cloud judge; the heuristic decides instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn predicate_names_of_a_denied_project_stay_local() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            predicate: Some(("runs_on", 0.93)),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        let cwd = repo(&d, "filed");
+        std::fs::write(
+            std::path::Path::new(cwd.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        let cited = remember_id(&s, "Client X runs its API on Fly", Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        s.assert_fact(fact_req("api", "runs_on", "k8s"))
+            .await
+            .unwrap();
+        let before = t.sent();
+        let mut req = fact_req("api", "is_hosted_on", "fly.io");
+        req.source_memory_id = Some(cited);
+        let out = s.assert_fact(req).await.unwrap();
+        assert_eq!(t.sent(), before, "nothing from a denied project is sent");
+        assert_eq!(
+            out.predicate, "is_hosted_on",
+            "the heuristic did not match it"
+        );
+        // Without such a source the judge is asked.
+        let out = s
+            .assert_fact(fact_req("api", "is_run_on", "aws"))
+            .await
+            .unwrap();
+        assert_eq!(t.sent(), before + 1);
+        assert_eq!(out.predicate, "runs_on");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_judge_that_fails_or_is_denied_never_fails_the_fact() {
+        let t = crate::judge_http::ScriptedJev::failing(503);
+        let (_d, s) = svc_with_jev(t.clone()).await;
+        s.assert_fact(fact_req("api", "deployed_on", "Coolify"))
+            .await
+            .unwrap();
+        let out = s
+            .assert_fact(fact_req("api", "deploys_on", "Fly"))
+            .await
+            .unwrap();
+        assert_eq!(out.predicate, "deployed_on", "the heuristic decided");
+        s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(0.0)))
+            .unwrap();
+        let before = t.sent();
+        let out = s
+            .assert_fact(fact_req("api", "deploying_on", "Railway"))
+            .await
+            .unwrap();
+        assert_eq!(out.predicate, "deployed_on");
+        assert_eq!(t.sent(), before, "no request against a budget of zero");
+    }
+
+    // ------------------------------------------------------------------ precise recall
+
+    /// Grades results that contain `keyword` as answering the query, the rest as unrelated;
+    /// every other question (the judge worker's) is answered `unrelated`. Counts requests.
+    struct KeywordGrader {
+        keyword: &'static str,
+        grading_calls: std::sync::atomic::AtomicUsize,
+        fail_grading: AtomicBool,
+        /// The states of the grading requests.
+        graded_states: Mutex<Vec<String>>,
+    }
+
+    impl KeywordGrader {
+        fn new(keyword: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                keyword,
+                grading_calls: Default::default(),
+                fail_grading: AtomicBool::new(false),
+                graded_states: Default::default(),
+            })
+        }
+
+        fn graded(&self) -> usize {
+            self.grading_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl alice_core::judge::jev::JevTransport for KeywordGrader {
+        fn post(
+            &self,
+            _endpoint: &str,
+            _key: &str,
+            body: &[u8],
+            _timeout: Duration,
+        ) -> std::result::Result<
+            alice_core::judge::jev::HttpReply,
+            alice_core::judge::jev::TransportError,
+        > {
+            let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let state = req["state"].as_str().unwrap();
+            let mut answers = serde_json::Map::new();
+            let mut grading = false;
+            for (qid, q) in req["questions"].as_object().unwrap() {
+                let options: Vec<String> =
+                    q["criteria"].as_object().unwrap().keys().cloned().collect();
+                let (choice, other) = if let Some(k) = qid.strip_prefix("r_") {
+                    grading = true;
+                    let k: usize = k.parse().unwrap();
+                    let block = state
+                        .split(&format!("Result {k} ("))
+                        .nth(1)
+                        .unwrap_or("")
+                        .split("\nResult ")
+                        .next()
+                        .unwrap_or("");
+                    if block.contains(self.keyword) {
+                        ("answers", "unrelated")
+                    } else {
+                        ("unrelated", "answers")
+                    }
+                } else {
+                    ("unrelated", "duplicate")
+                };
+                let probs: serde_json::Map<String, serde_json::Value> = options
+                    .iter()
+                    .map(|o| {
+                        let p = if o == choice {
+                            0.9
+                        } else if o == other {
+                            0.05
+                        } else {
+                            0.05 / (options.len().max(3) - 2) as f64
+                        };
+                        (o.clone(), serde_json::json!(p))
+                    })
+                    .collect();
+                answers.insert(
+                    qid.clone(),
+                    serde_json::json!({"type": "choice", "choice": choice, "confidence": 0.9, "probabilities": probs}),
+                );
+            }
+            if grading {
+                self.graded_states.lock().push(state.to_string());
+                self.grading_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_grading.load(Ordering::SeqCst) {
+                    return Ok(alice_core::judge::jev::HttpReply {
+                        status: 503,
+                        body: b"{}".to_vec(),
+                        retry_after: Some(Duration::ZERO),
+                    });
+                }
+            }
+            let resp = serde_json::json!({"model": "jev-1.13.0", "answers": answers,
+                "usage": {"input_tokens": 800, "output_tokens": 0}});
+            Ok(alice_core::judge::jev::HttpReply {
+                status: 200,
+                body: serde_json::to_vec(&resp).unwrap(),
+                retry_after: None,
+            })
+        }
+    }
+
+    async fn svc_with_grader(t: Arc<KeywordGrader>) -> (tempfile::TempDir, Arc<Service>) {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                jev_transport: Some(t),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        (d, s)
+    }
+
+    const DEPLOY_NOTES: [&str; 3] = [
+        "deploy notes: staging deploy runs make deploy",
+        "deploy notes: the ZEBRA cluster deploy uses blue green",
+        "deploy notes: deploy freeze on Fridays",
+    ];
+
+    fn recall_req(query: &str, mode: RecallMode, cwd: &Option<String>) -> RecallRequest {
+        RecallRequest {
+            query: query.into(),
+            mode,
+            cwd: cwd.clone(),
+            format: OutputFormat::Json,
+            ..Default::default()
+        }
+    }
+
+    async fn remember_deploy_notes(s: &Service, cwd: &Option<String>) {
+        for text in DEPLOY_NOTES {
+            remember_id(s, text, Some(Kind::Howto), cwd).await;
+        }
+        wait_settled(s).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_mode_reorders_by_the_judges_relevance_and_fast_mode_does_not() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let fast = s
+            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        assert!(!fast.reranked);
+        assert_eq!(t.graded(), 0, "fast mode never asks the judge to grade");
+        let order = |r: &RecallResponse| {
+            r.results
+                .iter()
+                .map(|h| h.title.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            fast.results[0].title,
+            DEPLOY_NOTES[1],
+            "the test needs the judge to change the order: {:?}",
+            order(&fast)
+        );
+        let precise = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(precise.reranked);
+        assert_eq!(t.graded(), 1, "one batched call");
+        assert!(
+            precise.results[0].title.contains("ZEBRA"),
+            "{:?}",
+            order(&precise)
+        );
+        assert_eq!(precise.results.len(), fast.results.len());
+        let mut a = order(&fast);
+        let mut b = order(&precise);
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "the same results, in another order");
+        // Text format carries the flag too.
+        let text = s
+            .recall(RecallRequest {
+                format: OutputFormat::Text,
+                ..recall_req("deploy notes", RecallMode::Precise, &cwd)
+            })
+            .await
+            .unwrap();
+        assert!(text.reranked && text.text.unwrap().contains("ZEBRA"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_mode_keeps_the_search_order_when_the_judge_cannot_grade() {
+        // The offline judge does not grade: precise is fast.
+        let (d, s) = svc().await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let fast = s
+            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        let precise = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(!precise.reranked);
+        let ids = |r: &RecallResponse| r.results.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&fast), ids(&precise));
+
+        // An outage, a used-up budget and a denied project leave the order alone too.
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let fast = s
+            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        t.fail_grading.store(true, Ordering::SeqCst);
+        let broken = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(!broken.reranked, "a failing judge does not fail recall");
+        assert_eq!(ids(&fast), ids(&broken));
+        t.fail_grading.store(false, Ordering::SeqCst);
+        let before = t.graded();
+        s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(0.0)))
+            .unwrap();
+        let broke = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(!broke.reranked);
+        assert_eq!(ids(&fast), ids(&broke));
+        assert_eq!(
+            t.graded(),
+            before,
+            "nothing is sent against a budget of zero"
+        );
+    }
+
+    /// Precise mode sends the query and results of allowed projects only, scoped to the
+    /// project the query was asked from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_mode_sends_nothing_from_a_denied_project() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "filed");
+        std::fs::write(
+            std::path::Path::new(cwd.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        remember_deploy_notes(&s, &cwd).await;
+        let r = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(!r.reranked);
+        assert_eq!(t.graded(), 0, "the query of a denied project is not sent");
+        // Asked from an open project, a denied project's memories are left in place, not sent.
+        let open = repo(&d, "open");
+        remember_deploy_notes(&s, &open).await;
+        let r = s
+            .recall(RecallRequest {
+                project: None,
+                ..recall_req("deploy notes", RecallMode::Precise, &open)
+            })
+            .await
+            .unwrap();
+        assert!(r.reranked);
+        assert_eq!(t.graded(), 1);
+        let state = t.graded_states.lock()[0].clone();
+        assert!(state.contains("project open"), "{state}");
+        assert!(
+            !state.contains("project filed"),
+            "a denied project's memories stay out of the request: {state}"
+        );
+        assert!(
+            r.results.iter().any(|h| h.project == "filed"),
+            "but they are still results, in their places"
+        );
     }
 }

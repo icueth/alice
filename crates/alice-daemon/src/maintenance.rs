@@ -1302,6 +1302,59 @@ mod tests {
         assert_eq!(r.count("SELECT count(*) FROM embeddings"), 2);
     }
 
+    /// A purge run touches trashed memories only: pending, active and imported (`skipped`)
+    /// memories stay, however old, and so does a trashed one younger than the cutoff.
+    #[test]
+    fn a_purge_leaves_pending_active_and_skipped_memories_in_place() {
+        let r = rig();
+        let c = r.sql();
+        let old = "2020-01-01T00:00:00.000Z";
+        let pending = r.raw_memory(&c, 1, "pending", old, "pending");
+        let active = r.raw_memory(&c, 2, "active", old, "done");
+        let skipped = r.raw_memory(&c, 3, "active", old, "skipped");
+        let skipped_pending = r.raw_memory(&c, 4, "pending", old, "skipped");
+        let archived = r.raw_memory(&c, 5, "archived", old, "done");
+        let superseded = r.raw_memory(&c, 6, "superseded", old, "done");
+        let recent = r.raw_memory(
+            &c,
+            7,
+            "trashed",
+            &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "done",
+        );
+        let trashed = r.raw_memory(&c, 8, "trashed", old, "done");
+        let report = r.sched.run_job(Job::TrashPurge, chrono::Utc::now(), true);
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        assert_eq!(report.detail, "1 purged");
+        let alive = |seq: i64| -> bool {
+            c.query_row("SELECT count(*) FROM memories WHERE seq = ?1", [seq], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+                == 1
+        };
+        for (what, seq) in [
+            ("pending", pending),
+            ("active", active),
+            ("skipped", skipped),
+            ("skipped pending", skipped_pending),
+            ("archived", archived),
+            ("superseded", superseded),
+            ("recently trashed", recent),
+        ] {
+            assert!(alive(seq), "{what} stays");
+        }
+        assert!(!alive(trashed), "the old trashed one goes");
+        let state: String = c
+            .query_row(
+                "SELECT judge_state FROM memories WHERE seq = ?1",
+                [skipped],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "skipped");
+    }
+
     /// B1 through the scheduler: no event row holds the purged text afterwards.
     #[test]
     fn a_purge_leaves_no_trace_of_the_text_in_the_history() {

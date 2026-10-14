@@ -114,6 +114,11 @@ pub struct RecallResponse {
     pub related: Vec<RelatedRef>,
     pub omitted: usize,
     pub raw_fallback: bool,
+    /// True when precise mode re-ordered the results with the judge's grades (their `score`
+    /// is still the fusion score). False for fast mode, and for precise mode when no judge
+    /// could grade (the heuristic provider, a denied project, an exhausted budget, an outage).
+    #[serde(default)]
+    pub reranked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 }
