@@ -1135,7 +1135,8 @@ mod tests {
                  ALTER TABLE memories DROP COLUMN judge_attempts;
                  ALTER TABLE memories DROP COLUMN judge_unavailable;
                  ALTER TABLE memories DROP COLUMN judge_next_try_at;
-                 DELETE FROM schema_migrations WHERE version = 3;",
+                 DROP TABLE IF EXISTS legacy_ids;
+                 DELETE FROM schema_migrations WHERE version >= 3;",
             )
             .unwrap();
         }
