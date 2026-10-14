@@ -254,28 +254,47 @@ pub(crate) fn local_checks_with(
         }
         None => out.push(not_running(home)),
     }
-    // On Windows the task lives in the Task Scheduler, not in a file this can look at: `alice
-    // service status` asks `schtasks`.
-    if let Some(p) = crate::service_install::Platform::current()
-        && p != crate::service_install::Platform::Windows
-        && let Some(root) = dirs::home_dir()
-    {
-        match crate::service_install::installed(p, &root) {
-            Some(f) => out.push(check(
-                "service",
-                Ok,
-                format!("installed ({})", f.display()),
-                None,
-            )),
-            None => out.push(check(
-                "service",
-                Ok,
-                "not installed (optional: the daemon starts on first use)",
-                Some("`alice service install` keeps it running"),
-            )),
-        }
+    if let Some(root) = dirs::home_dir() {
+        out.extend(service_check(home, &root));
     }
     out
+}
+
+/// Whether a service unit is installed in `root` (the user's home directory) and for which data
+/// directory. On Windows the task lives in the Task Scheduler, not in a file this can look at:
+/// `alice service status` asks `schtasks`.
+pub(crate) fn service_check(home: &AliceHome, root: &Path) -> Option<Check> {
+    use crate::service_install as si;
+    let p = si::Platform::current().filter(|p| *p != si::Platform::Windows)?;
+    Some(match si::installed(p, root) {
+        Some(f) if si::unit_serves(p, root, home.root()) => check(
+            "service",
+            CheckStatus::Ok,
+            format!("installed ({})", f.display()),
+            None,
+        ),
+        Some(f) => {
+            let other = si::unit_home(p, root)
+                .map(|h| h.display().to_string())
+                .unwrap_or_else(|| "another data directory".into());
+            check(
+                "service",
+                CheckStatus::Ok,
+                format!(
+                    "not installed for this data directory ({}); the unit {} serves {other}",
+                    home.root().display(),
+                    f.display()
+                ),
+                Some("`alice service install` keeps this one running (it replaces that unit)"),
+            )
+        }
+        None => check(
+            "service",
+            CheckStatus::Ok,
+            "not installed (optional: the daemon starts on first use)",
+            Some("`alice service install` keeps it running"),
+        ),
+    })
 }
 
 /// The `daemon` check when none answers: whether one is starting, why the last start failed,
@@ -300,7 +319,7 @@ fn not_running(home: &AliceHome) -> Check {
             Some("fix what it says, then `alice daemon start`"),
         );
     }
-    let tail = std::fs::read_to_string(home.logs_dir().join("daemon.log")).unwrap_or_default();
+    let tail = log_tail(&home.logs_dir().join("daemon.log"), LOG_TAIL_BYTES);
     let last: Vec<&str> = tail.lines().rev().take(3).collect();
     let detail = if last.is_empty() {
         "not running".to_string()
@@ -316,6 +335,32 @@ fn not_running(home: &AliceHome) -> Check {
         detail,
         Some("start it with `alice daemon start`; if it exits at once, read `alice daemon logs`"),
     )
+}
+
+/// How much of the end of `daemon.log` doctor reads (the log is never rotated).
+const LOG_TAIL_BYTES: u64 = 16 * 1024;
+
+/// The last `max` bytes of the file as text (lossy; a cut first line is dropped); empty when it
+/// cannot be read.
+fn log_tail(path: &Path, max: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(max);
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(start)).is_err() || f.take(max).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if start > 0 {
+        text.split_once('\n')
+            .map(|(_, rest)| rest.to_string())
+            .unwrap_or_default()
+    } else {
+        text
+    }
 }
 
 /// Time at the start of a `maint.<job>.last_error` value (`<stamp> <detail>`).
@@ -497,7 +542,7 @@ pub fn settings_checks(view: &SettingsView, loosening_waiting: bool) -> Vec<Chec
     }
     if view.config_degraded {
         out.push(check(
-            "config",
+            "config loaded",
             Warn,
             "no valid config.toml has loaded since the daemon started; cloud providers stay off until one does",
             Some("fix config.toml (`alice config edit`); the daemon notices the fix by itself"),
@@ -513,7 +558,7 @@ pub fn settings_checks(view: &SettingsView, loosening_waiting: bool) -> Vec<Chec
     }
     if !view.warnings.is_empty() {
         out.push(check(
-            "environment",
+            "daemon environment",
             Warn,
             view.warnings.join("; "),
             Some("unset or rename the variables named; `alice config list` shows the valid ones"),
@@ -619,6 +664,11 @@ mod tests {
                 .unwrap();
         }
         let checks = local_checks_with(&home, None, false);
+        // Every check has its own name (a report line is told apart by it).
+        let mut names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), checks.len(), "{checks:?}");
         let get = |n: &str| {
             checks
                 .iter()
@@ -659,6 +709,54 @@ mod tests {
         assert_eq!(c.status, CheckStatus::Warn);
         assert!(c.detail.contains("not a usable database"), "{c:?}");
         assert!(c.fix.as_deref().unwrap().contains("alice daemon start"));
+    }
+
+    /// Doctor reads the end of a large log, not the whole file.
+    #[test]
+    fn the_log_tail_is_bounded_and_starts_on_a_whole_line() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("daemon.log");
+        assert_eq!(log_tail(&path, 100), "", "no log");
+        let log: String = (0..5_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, &log).unwrap();
+        let tail = log_tail(&path, 200);
+        assert!(
+            tail.len() <= 200 && tail.ends_with("line 4999\n"),
+            "{tail:?}"
+        );
+        assert!(tail.starts_with("line "), "a cut line is dropped: {tail:?}");
+        std::fs::write(&path, "short\n").unwrap();
+        assert_eq!(log_tail(&path, 100), "short\n");
+    }
+
+    /// The service check says whose unit it found.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_service_check_tells_a_unit_for_this_home_from_one_for_another() {
+        use crate::service_install as si;
+        let d = tempfile::tempdir().unwrap();
+        let (mine, theirs) = (d.path().join("mine"), d.path().join("theirs"));
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        let (mine, theirs) = (AliceHome::new(mine), AliceHome::new(theirs));
+        let none = service_check(&mine, d.path()).unwrap();
+        assert!(none.detail.starts_with("not installed"), "{none:?}");
+        let p = si::Platform::current().unwrap();
+        si::apply(
+            &si::plan_install(p, d.path(), Path::new("/x/alice"), &theirs, 1),
+            None,
+        )
+        .unwrap();
+        let other = service_check(&mine, d.path()).unwrap();
+        assert!(
+            other
+                .detail
+                .contains("not installed for this data directory")
+                && other.detail.contains(&theirs.root().display().to_string()),
+            "{other:?}"
+        );
+        let same = service_check(&theirs, d.path()).unwrap();
+        assert!(same.detail.starts_with("installed ("), "{same:?}");
     }
 
     #[test]
@@ -828,9 +926,13 @@ mod tests {
         assert_eq!(settings.status, CheckStatus::Fail);
         assert!(settings.detail.contains("judge.review_threshold"));
         assert!(settings.detail.contains("keeps the previous settings"));
-        assert_eq!(find(&checks, "config").status, CheckStatus::Warn);
+        assert_eq!(find(&checks, "config loaded").status, CheckStatus::Warn);
         assert!(find(&checks, "settings change").fix.is_some());
-        assert!(find(&checks, "environment").detail.contains("PROVIDR"));
+        assert!(
+            find(&checks, "daemon environment")
+                .detail
+                .contains("PROVIDR")
+        );
         assert!(find(&checks, "restart").detail.contains("server.port"));
     }
 

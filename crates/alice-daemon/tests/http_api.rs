@@ -2029,3 +2029,133 @@ async fn the_flags_endpoint_answers_without_asking_the_secrets_store() {
         "the store was not asked"
     );
 }
+
+/// An event stream opened with the old token ends when the token is rotated; one opened with the
+/// new token keeps running.
+#[tokio::test(flavor = "multi_thread")]
+async fn rotating_the_token_ends_the_streams_opened_with_the_old_one() {
+    let s = Srv::start_with(quiet()).await;
+    let mut old_stream = s.get("/api/v1/events/stream").await;
+    assert_eq!(old_stream.status(), 200);
+    // The stream is up: its first message (the health) arrives.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), old_stream.chunk())
+        .await
+        .expect("the stream opens with the health")
+        .unwrap();
+    assert!(first.is_some());
+    let r = s
+        .post("/api/v1/admin/token/rotate", &serde_json::json!({}))
+        .await;
+    assert_eq!(r.status(), 200);
+    // It ends (the body finishes) soon after.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), old_stream.chunk()).await {
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Ok(Ok(Some(_))) | Err(_) => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old stream never ended"
+        );
+    }
+    let new = std::fs::read_to_string(s.home.token_file())
+        .unwrap()
+        .trim()
+        .to_string();
+    let mut fresh = s
+        .http
+        .get(s.url("/api/v1/events/stream"))
+        .bearer_auth(&new)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), 200);
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), fresh.chunk())
+        .await
+        .expect("the new stream opens")
+        .unwrap();
+    assert!(first.is_some(), "a stream opened with the new token runs");
+}
+
+/// Rotation also ends an MCP session's open event stream (`GET /mcp` with the session id) that
+/// was opened with the old token.
+#[tokio::test(flavor = "multi_thread")]
+async fn rotating_the_token_ends_an_open_mcp_stream() {
+    let s = Srv::start_with(quiet()).await;
+    let post = |token: &str, session: Option<&str>, body: serde_json::Value| {
+        let mut r = s
+            .http
+            .post(s.url("/mcp"))
+            .bearer_auth(token)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&body);
+        if let Some(id) = session {
+            r = r.header("Mcp-Session-Id", id);
+        }
+        r
+    };
+    let init = post(
+        &s.token,
+        None,
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}}}),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(init.status(), 200);
+    let session = init
+        .headers()
+        .get("mcp-session-id")
+        .expect("a session id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _ = init.text().await;
+    let ok = post(
+        &s.token,
+        Some(&session),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(ok.status().is_success(), "{}", ok.status());
+    // The session's standing event stream.
+    let mut stream = s
+        .http
+        .get(s.url("/mcp"))
+        .bearer_auth(&s.token)
+        .header("Accept", "text/event-stream")
+        .header("Mcp-Session-Id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), 200);
+    // It stays open (nothing to say, nothing that ends it) until the rotation.
+    assert!(
+        !matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), stream.chunk()).await,
+            Ok(Ok(None)) | Ok(Err(_))
+        ),
+        "the stream ended before the rotation"
+    );
+    let r = s
+        .post("/api/v1/admin/token/rotate", &serde_json::json!({}))
+        .await;
+    assert_eq!(r.status(), 200);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(3), stream.chunk()).await {
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Ok(Ok(Some(_))) | Err(_) => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the MCP stream never ended"
+        );
+    }
+}

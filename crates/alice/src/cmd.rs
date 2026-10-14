@@ -1641,7 +1641,8 @@ async fn status(home: &AliceHome, json: bool) -> Result<()> {
         });
         return print(json, &value, || match (&starting, silent, &failed) {
             (_, Some(pid), _) => format!(
-                "running (pid {pid}, not answering); see \"alice daemon logs\", or end it with \"kill {pid}\" and start again\n"
+                "running (pid {pid}, not answering); see \"alice daemon logs\", or end it with \"{}\" and start again\n",
+                end_hint(pid)
             ),
             (Some((pid, Some(doing))), _, _) => format!("starting (pid {pid}): {doing}\n"),
             (Some((pid, None)), _, _) => format!("starting (pid {pid})\n"),
@@ -1741,6 +1742,15 @@ fn health_notes(h: &Health) -> String {
     out
 }
 
+/// The command that ends process `pid` on this platform (`kill` does not exist on Windows).
+fn end_hint(pid: u32) -> String {
+    if cfg!(windows) {
+        format!("taskkill /PID {pid}")
+    } else {
+        format!("kill {pid}")
+    }
+}
+
 /// Gone once its process has exited or its lock is free (the daemon saves everything, then
 /// releases the lock, then exits).
 async fn wait_gone(home: &AliceHome, pid: Option<u32>) -> bool {
@@ -1814,9 +1824,10 @@ async fn start(home: &AliceHome, json: bool) -> Result<()> {
             }
             if idle_since.elapsed() >= START_IDLE_WAIT {
                 bail!(
-                    "the daemon (pid {pid}) holds {} but has not answered for {} s; see \"alice daemon logs\", or end it with \"kill {pid}\" and retry",
+                    "the daemon (pid {pid}) holds {} but has not answered for {} s; see \"alice daemon logs\", or end it with \"{}\" and retry",
                     home.lock_file().display(),
-                    START_IDLE_WAIT.as_secs()
+                    START_IDLE_WAIT.as_secs(),
+                    end_hint(pid)
                 );
             }
             tokio::time::sleep(START_POLL).await;
@@ -1868,8 +1879,9 @@ pub(crate) async fn stop_daemon(home: &AliceHome) -> Result<StopOutcome> {
             Some(pid) if !lock_free(home) => {
                 if Instant::now() >= deadline {
                     bail!(
-                        "the daemon (pid {pid}) holds {} but does not answer; it may still be starting (the first start downloads the embedding model). Retry \"alice daemon stop\" in a moment, or end it with \"kill {pid}\"",
-                        home.lock_file().display()
+                        "the daemon (pid {pid}) holds {} but does not answer; it may still be starting (the first start downloads the embedding model). Retry \"alice daemon stop\" in a moment, or end it with \"{}\"",
+                        home.lock_file().display(),
+                        end_hint(pid)
                     );
                 }
                 waited_for = Some(pid);
@@ -1973,15 +1985,25 @@ async fn restore(home: &AliceHome, backup: Option<String>, yes: bool, json: bool
     let guard = r::RestoreGuard::acquire(home)?;
     // An installed service unit would start a daemon in the middle of the swap (launchd and
     // systemd restart what exits): stop it first, and start it again afterwards.
-    let suspended = suspend_service()?;
+    let suspended = suspend_service(home)?;
     let swapped = swap_stopping_the_daemon(home, &dir, &verified).await;
     drop(guard);
     let resumed = suspended.map(Suspended::resume);
-    let mut report = swapped?;
-    if let Some(Err(e)) = resumed {
-        report.warnings.push(format!(
-            "the service unit could not be started again ({e}); start it with `alice service install`"
-        ));
+    let resume_failed = |e: &alice_core::error::AliceError| {
+        format!(
+            "the service unit could not be started again ({e}); the service is down: start it with `alice service install`"
+        )
+    };
+    let mut report = match swapped {
+        Ok(r) => r,
+        // The swap failed; if the unit also did not come back, say both.
+        Err(e) => match resumed {
+            Some(Err(re)) => bail!("{e:#}; also {}", resume_failed(&re)),
+            _ => return Err(e),
+        },
+    };
+    if let Some(Err(e)) = &resumed {
+        report.warnings.push(resume_failed(e));
     }
     // Starts the daemon on the restored database (it migrates an older one, rebuilds the index
     // and drains the spool).
@@ -2134,6 +2156,10 @@ fn service_root(target_dir: Option<std::path::PathBuf>) -> Result<ServiceRoot> {
         });
     }
     if let Some(path) = std::env::var_os("ALICE_SERVICE_ROOT").filter(|v| !v.is_empty()) {
+        eprintln!(
+            "service commands are recorded in {}, not run (ALICE_SERVICE_ROOT is set)",
+            Path::new(&path).display()
+        );
         return Ok(ServiceRoot {
             path: path.into(),
             mode: ServiceMode::Sandbox,
@@ -2163,11 +2189,22 @@ struct LogRunner(std::path::PathBuf);
 
 impl Runner for LogRunner {
     fn run(&self, cmd: &[String]) -> alice_core::Result<()> {
+        let line = cmd.join(" ");
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.0)?;
-        writeln!(f, "{}", cmd.join(" "))?;
+        writeln!(f, "{line}")?;
+        // `ALICE_SERVICE_FAIL=<word>` (tests): a recorded command that contains the word fails.
+        if let Some(word) = std::env::var("ALICE_SERVICE_FAIL")
+            .ok()
+            .filter(|w| !w.is_empty())
+            && line.contains(&word)
+        {
+            return Err(alice_core::error::AliceError::Other(format!(
+                "`{line}` failed (injected by ALICE_SERVICE_FAIL)"
+            )));
+        }
         Ok(())
     }
 }
@@ -2201,7 +2238,7 @@ impl Suspended {
 
 /// Stop the installed service unit's daemon. `None`: there is no unit (nothing to restart).
 /// A unit that cannot be stopped refuses the restore, before anything is changed.
-fn suspend_service() -> Result<Option<Suspended>> {
+fn suspend_service(home: &AliceHome) -> Result<Option<Suspended>> {
     let Some(platform) = Platform::current() else {
         return Ok(None);
     };
@@ -2211,13 +2248,24 @@ fn suspend_service() -> Result<Option<Suspended>> {
     let Some(runner) = runner_for(&root) else {
         return Ok(None);
     };
-    match svcinst::suspend(platform, &root.path, user_id(), runner.as_ref()) {
-        Ok(true) => Ok(Some(Suspended {
-            platform,
-            root,
-            runner,
-        })),
-        Ok(false) => Ok(None),
+    // Only a unit that serves the home being restored, and only one the manager has loaded.
+    match svcinst::suspend(
+        platform,
+        &root.path,
+        user_id(),
+        home.root(),
+        runner.as_ref(),
+    ) {
+        Ok(sus) => {
+            if let Some(n) = &sus.notice {
+                eprintln!("{n}");
+            }
+            Ok(sus.ended.then_some(Suspended {
+                platform,
+                root,
+                runner,
+            }))
+        }
         Err(e) => bail!(
             "the installed service could not be stopped ({e}); nothing was changed. It would start a daemon in the middle of the restore: stop it yourself (`alice service uninstall`), retry, and `alice service install` again afterwards"
         ),
@@ -2242,6 +2290,12 @@ fn service_command(home: &AliceHome, c: ServiceCmd, json: bool) -> Result<()> {
                 std::path::absolute(home.root()).unwrap_or_else(|_| home.root().to_path_buf()),
             );
             let plan = svcinst::plan_install(platform, &root.path, &exe, &home, user_id());
+            if !dry_run {
+                // The unit names `<home>/logs/daemon.log`: launchd and systemd fail a job whose
+                // log directory is missing, whatever their install commands report.
+                home.ensure_dirs()
+                    .with_context(|| format!("cannot create {}", home.root().display()))?;
+            }
             if dry_run {
                 return print(
                     json,
@@ -2308,28 +2362,45 @@ fn service_command(home: &AliceHome, c: ServiceCmd, json: bool) -> Result<()> {
             })
         }
         ServiceCmd::Status => {
+            use svcinst::UnitOwner;
             let root = service_root(None)?;
+            // Windows keeps the task in the Task Scheduler, not in a file: only the real one is asked.
+            let owner = if platform == Platform::Windows && root.mode != ServiceMode::Real {
+                UnitOwner::None
+            } else {
+                svcinst::unit_owner(platform, &root.path, home.root(), &SystemRunner)
+            };
             let unit = svcinst::installed(platform, &root.path);
-            // Windows keeps the task in the Task Scheduler, not in a file.
-            let task =
-                (platform == Platform::Windows && root.mode == ServiceMode::Real).then(|| {
-                    SystemRunner
-                        .run(&[
-                            "schtasks".into(),
-                            "/Query".into(),
-                            "/TN".into(),
-                            svcinst::TASK.into(),
-                        ])
-                        .is_ok()
-                });
-            let installed = unit.is_some() || task == Some(true);
+            let place = unit
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| format!("scheduled task {}", svcinst::TASK));
+            let serves = match &owner {
+                UnitOwner::Other(h) => Some(h.clone()),
+                UnitOwner::This => Some(home.root().to_path_buf()),
+                _ => None,
+            };
             print(
                 json,
-                &serde_json::json!({ "installed": installed, "path": unit }),
-                || match (&unit, task) {
-                    (Some(p), _) => format!("installed ({})\n", p.display()),
-                    (None, Some(true)) => format!("installed (scheduled task {})\n", svcinst::TASK),
-                    _ => "not installed\n".into(),
+                &serde_json::json!({
+                    "installed": owner != UnitOwner::None,
+                    "path": unit,
+                    "serves": serves,
+                    "serves_this_home": owner == UnitOwner::This,
+                }),
+                || match &owner {
+                    UnitOwner::None => "not installed\n".into(),
+                    UnitOwner::This => {
+                        format!("installed ({place}) for {}\n", home.root().display())
+                    }
+                    UnitOwner::Other(h) => format!(
+                        "installed ({place}), but it serves {}, not this data directory ({})\n",
+                        h.display(),
+                        home.root().display()
+                    ),
+                    UnitOwner::Unreadable => format!(
+                        "installed ({place}), but the data directory it serves could not be read\n"
+                    ),
                 },
             )
         }

@@ -199,6 +199,9 @@ struct AppState {
     token: SharedToken,
     /// One rotation at a time, so the file and the token in memory end up the same.
     rotating: Arc<tokio::sync::Mutex<()>>,
+    /// Ends every event stream opened under the current token: cancelled on a rotation (and a
+    /// child of `shutdown`, so a stopping daemon ends them too).
+    streams: Arc<parking_lot::Mutex<CancellationToken>>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -342,6 +345,9 @@ async fn rotate_token(State(st): State<AppState>) -> ApiResult<serde_json::Value
             ))
         })?;
     *st.token.write() = Arc::from(new);
+    // A stream opened with the old token must not outlive it.
+    let fresh = st.shutdown.child_token();
+    std::mem::replace(&mut *st.streams.lock(), fresh).cancel();
     st.svc.record_token_rotation();
     Ok(Json(serde_json::json!({ "rotated": true })))
 }
@@ -660,8 +666,20 @@ async fn stream(
     State(st): State<AppState>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     use futures::StreamExt;
-    let s = feed(st.svc.clone(), st.shutdown.clone()).map(|item| Ok(sse_event(&item)));
+    let ends = st.streams.lock().clone();
+    let s = feed(st.svc.clone(), ends).map(|item| Ok(sse_event(&item)));
     Sse::new(s).keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE))
+}
+
+/// Ends a response body (an MCP session's event stream) when the token it was opened with is
+/// rotated. A request is checked against the token before it gets here; this cuts the ones that
+/// were already open.
+async fn end_on_rotation(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    use futures::StreamExt;
+    let ends = st.streams.lock().clone();
+    let (parts, body) = next.run(req).await.into_parts();
+    let stream = body.into_data_stream().take_until(ends.cancelled_owned());
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
 /// Build the router: the public ping, and everything else (the JSON API and the MCP service
@@ -671,6 +689,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
     let g = Guard::new(token.clone(), port);
     let state = AppState {
         svc,
+        streams: Arc::new(parking_lot::Mutex::new(shutdown.child_token())),
         shutdown,
         token,
         rotating: Arc::new(tokio::sync::Mutex::new(())),
@@ -715,12 +734,16 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/compat/call", post(compat_call))
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         .route("/api/v1/admin/token/rotate", post(rotate_token))
-        // Before the guard layer, so `/mcp` is covered by it.
-        .nest_service(
-            "/mcp",
-            crate::mcp::http_service(state.svc.clone(), port, state.shutdown.clone()),
+        .with_state(state.clone())
+        // Before the guard layer, so `/mcp` is covered by it. Its streams end on a rotation too.
+        .merge(
+            Router::new()
+                .nest_service(
+                    "/mcp",
+                    crate::mcp::http_service(state.svc.clone(), port, state.shutdown.clone()),
+                )
+                .layer(middleware::from_fn_with_state(state, end_on_rotation)),
         )
-        .with_state(state)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn_with_state(g, guard));
     public.merge(private)

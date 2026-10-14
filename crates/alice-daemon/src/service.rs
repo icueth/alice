@@ -5274,9 +5274,20 @@ mod tests {
             let s = s.clone();
             tokio::spawn(async move { s.settings_view_async().await })
         };
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // The second view must finish on its own read while the first is still held (it may
+        // not join the held one). If it does not, release the hold after a bounded wait so the
+        // assertions below fail instead of hanging.
+        let until = Instant::now() + Duration::from_secs(5);
+        while !second.is_finished() && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let finished_while_held = second.is_finished();
         store.hold.store(false, Ordering::SeqCst);
         let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert!(
+            finished_while_held,
+            "the second view waited for the held read"
+        );
         assert!(
             !first.secrets["jev_api_key"].set,
             "the first read began before the write"
@@ -7025,7 +7036,22 @@ mod tests {
         assert_eq!(out.predicate, "deployed_on", "the heuristic decided");
         s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(0.0)))
             .unwrap();
-        let before = t.sent();
+        // The failed calls above may still be retrying in the background: count from when the
+        // transport has been quiet for a while, so only a request of the next call is counted.
+        let mut before = t.sent();
+        let quiet_by = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(
+                Instant::now() < quiet_by,
+                "the failing transport never went quiet"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let now = t.sent();
+            if now == before {
+                break;
+            }
+            before = now;
+        }
         let out = s
             .assert_fact(fact_req("api", "deploying_on", "Railway"))
             .await

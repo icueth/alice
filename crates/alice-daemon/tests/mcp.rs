@@ -1145,31 +1145,45 @@ async fn the_stdio_server_asks_the_daemon_for_the_admin_tools_and_fails_closed()
     client.cancel().await.ok();
 }
 
-/// `alice mcp` trusts the daemon's last answer about the admin tools for its TTL (so a busy
-/// session does not ask on every request) and asks again once the TTL has passed.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_stdio_server_trusts_the_daemons_answer_for_its_ttl_and_asks_again_after_it() {
-    let (_dir, home, d) = daemon().await;
-    let ttl = Duration::from_secs(4);
+/// A stdio server over `home` whose answer about the admin tools is trusted for `ttl`.
+async fn stdio_with_ttl(
+    home: &AliceHome,
+    ttl: Duration,
+) -> rmcp::service::RunningService<rmcp::RoleClient, TestClient> {
     let server = AliceMcp::new(Backend::Remote(Arc::new(
         RemoteBackend::new(home.clone(), Launcher::None, None).with_admin_ttl(ttl),
     )));
     let (a, b) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move { server.serve(a).await.unwrap().waiting().await });
-    let client = TestClient.serve(b).await.unwrap();
+    TestClient.serve(b).await.unwrap()
+}
+
+/// Inside its TTL `alice mcp` uses the daemon's last answer (a busy session does not ask on
+/// every request). The TTL is an hour, so the hit cannot be skipped by a slow machine.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stdio_server_uses_the_daemons_last_answer_inside_its_ttl() {
+    let (_dir, home, d) = daemon().await;
+    let client = stdio_with_ttl(&home, Duration::from_secs(3_600)).await;
+    assert_eq!(tool_names(&client).await.len(), 7, "asked: off");
+    set_admin(&d, true);
+    for _ in 0..3 {
+        assert_eq!(tool_names(&client).await.len(), 7, "a hit inside the TTL");
+    }
+    client.cancel().await.ok();
+    d.stop().await;
+}
+
+/// After its TTL the daemon is asked again. Polled to a deadline, not a fixed sleep.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stdio_server_asks_the_daemon_again_after_its_ttl() {
+    let (_dir, home, d) = daemon().await;
+    let ttl = Duration::from_secs(2);
+    let client = stdio_with_ttl(&home, ttl).await;
     let asked = std::time::Instant::now();
     assert_eq!(tool_names(&client).await.len(), 7, "asked: off");
     set_admin(&d, true);
-    // Within the TTL the answer from before is used, so the change is not seen yet.
-    if asked.elapsed() < ttl / 2 {
-        assert_eq!(tool_names(&client).await.len(), 7, "a hit inside the TTL");
-    }
-    // After it the daemon is asked again. Polled to a deadline, not a fixed sleep.
     let deadline = std::time::Instant::now() + Duration::from_secs(40);
-    loop {
-        if tool_names(&client).await.len() == 11 {
-            break;
-        }
+    while tool_names(&client).await.len() != 11 {
         assert!(
             std::time::Instant::now() < deadline,
             "the daemon was never asked again"

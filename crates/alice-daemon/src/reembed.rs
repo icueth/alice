@@ -892,15 +892,15 @@ mod tests {
             s.health().await.unwrap().reembed.is_none()
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The target is forgotten by a write that follows the status clearing: wait for it.
+        until("the target to be forgotten", 15, || async {
+            let target: Option<String> = s.read(|c| get_meta(c, TARGET_KEY)).await.unwrap();
+            target.is_none_or(|t| t.is_empty())
+        })
+        .await;
         let h = s.health().await.unwrap();
         assert_eq!(h.embedding_model, MODEL_ID);
         assert!(h.reembed.is_none() && h.embedding_error.is_none(), "{h:?}");
-        let target: Option<String> = s.read(|c| get_meta(c, TARGET_KEY)).await.unwrap();
-        assert!(
-            target.is_none_or(|t| t.is_empty()),
-            "the target is forgotten"
-        );
         // The main worker runs again (a new memory is embedded).
         s.remember(RememberRequest {
             content: "after the cancel".into(),

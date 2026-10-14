@@ -262,6 +262,11 @@ pub struct Scheduler {
     running: parking_lot::Mutex<()>,
     /// The connection of the integrity check in progress, so a stopping daemon can interrupt it.
     interrupt: parking_lot::Mutex<Option<rusqlite::InterruptHandle>>,
+    /// An interrupt was sent to the check in progress. SQLite reports it as `SQLITE_INTERRUPT`
+    /// inside the check, but as a plain "vtable constructor failed" when it lands while the
+    /// check is still setting up the full-text tables: either way the check was stopped, not
+    /// failed.
+    interrupted: std::sync::atomic::AtomicBool,
 }
 
 /// Rows per write in purges and retention.
@@ -295,6 +300,7 @@ impl Scheduler {
             ctx,
             running: parking_lot::Mutex::new(()),
             interrupt: parking_lot::Mutex::new(None),
+            interrupted: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -302,6 +308,7 @@ impl Scheduler {
     /// interrupt inside `PRAGMA quick_check`: the check returns `SQLITE_INTERRUPT` at once.
     pub fn interrupt_running(&self) {
         if let Some(h) = self.interrupt.lock().as_ref() {
+            self.interrupted.store(true, Ordering::SeqCst);
             h.interrupt();
         }
     }
@@ -633,41 +640,49 @@ impl Scheduler {
                     self.ctx.home.db(),
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 )?;
+                self.interrupted.store(false, Ordering::SeqCst);
                 *self.interrupt.lock() = Some(c.get_interrupt_handle());
                 let checked = m::quick_check(&c);
                 *self.interrupt.lock() = None;
-                match checked {
-                    Ok(problems) if problems.is_empty() => {
-                        Ok(Step::Finished("quick_check ok".into()))
-                    }
-                    Ok(problems) => Err(self.damaged(&format!(
-                        "PRAGMA quick_check found damage ({})",
-                        problems.first().cloned().unwrap_or_default()
-                    ))),
-                    Err(AliceError::Db(rusqlite::Error::SqliteFailure(e, _)))
-                        if e.code == rusqlite::ErrorCode::OperationInterrupted =>
-                    {
-                        Ok(Step::Stopped("paused: the daemon is stopping".into()))
-                    }
-                    Err(AliceError::Db(rusqlite::Error::SqliteFailure(e, msg)))
-                        if matches!(
-                            e.code,
-                            rusqlite::ErrorCode::DatabaseCorrupt
-                                | rusqlite::ErrorCode::NotADatabase
-                        ) =>
-                    {
-                        Err(self.damaged(&format!(
-                            "PRAGMA quick_check could not read the database ({})",
-                            msg.unwrap_or_else(|| e.to_string())
-                        )))
-                    }
-                    Err(e) => Err(e),
-                }
+                self.quick_check_step(checked, self.interrupted.load(Ordering::SeqCst))
             }
             Job::IndexCheck => self.index_check(),
             Job::ModelPurge => self.model_purge(sc),
             Job::Backup => self.backup(now),
             Job::MergeSuggestions => self.merge_suggestions(s.judge.cluster_similarity),
+        }
+    }
+
+    /// What the result of `PRAGMA quick_check` means. An interrupt (`interrupted`: the daemon is
+    /// stopping) ends the check as paused, whether SQLite reports `SQLITE_INTERRUPT` or, when it
+    /// lands while the full-text tables are still being set up, "vtable constructor failed". A
+    /// corruption result is never turned into "paused", interrupted or not.
+    fn quick_check_step(&self, checked: Result<Vec<String>>, interrupted: bool) -> Result<Step> {
+        use rusqlite::ErrorCode;
+        let paused = || Ok(Step::Stopped("paused: the daemon is stopping".into()));
+        match checked {
+            Ok(problems) if problems.is_empty() => Ok(Step::Finished("quick_check ok".into())),
+            Ok(problems) => Err(self.damaged(&format!(
+                "PRAGMA quick_check found damage ({})",
+                problems.first().cloned().unwrap_or_default()
+            ))),
+            Err(AliceError::Db(rusqlite::Error::SqliteFailure(e, _)))
+                if e.code == ErrorCode::OperationInterrupted =>
+            {
+                paused()
+            }
+            Err(AliceError::Db(rusqlite::Error::SqliteFailure(e, msg)))
+                if matches!(e.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) =>
+            {
+                Err(self.damaged(&format!(
+                    "PRAGMA quick_check could not read the database ({})",
+                    msg.unwrap_or_else(|| e.to_string())
+                )))
+            }
+            Err(e) if interrupted && e.to_string().contains("vtable constructor failed") => {
+                paused()
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1067,6 +1082,9 @@ fn lower_priority() {
 
 #[cfg(test)]
 mod tests {
+    /// Trashed memories the purge-latency test purges.
+    const PURGE_TEST_MEMORIES: usize = 6_000;
+
     use super::*;
     use crate::writer::{ProjectChoice, spawn_writer};
     use alice_core::store::memories::{InsertOutcome, NewMemoryInput};
@@ -2076,6 +2094,44 @@ mod tests {
         );
     }
 
+    /// An interrupted check is paused only for an interrupt or the setup failure; a corruption
+    /// result stays damage even while the interrupt flag is set.
+    #[test]
+    fn a_corruption_result_is_damage_even_when_the_check_was_interrupted() {
+        let corrupt = || {
+            AliceError::Db(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                Some("database disk image is malformed".into()),
+            ))
+        };
+        let setup = || {
+            AliceError::Db(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some("vtable constructor failed: chunks_fts".into()),
+            ))
+        };
+        let r = rig();
+        let e = r
+            .sched
+            .quick_check_step(Err(corrupt()), true)
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("writes are stopped"), "{e}");
+        assert!(
+            r.writer.read_only.reason().is_some(),
+            "the writer went read-only"
+        );
+        assert!(r.sched.meta("maint.quick_check.last_error").is_some());
+        // The setup failure is paused while interrupted, and a failure otherwise.
+        let r = rig();
+        assert!(matches!(
+            r.sched.quick_check_step(Err(setup()), true),
+            Ok(Step::Stopped(_))
+        ));
+        assert!(r.sched.quick_check_step(Err(setup()), false).is_err());
+        assert!(r.writer.read_only.reason().is_none());
+    }
+
     /// M-6: the backups being behind is a health warning, and shortens the quiet jobs wait for.
     #[test]
     fn an_overdue_backup_warns_and_shortens_the_quiet_period() {
@@ -2128,17 +2184,25 @@ mod tests {
         assert_eq!(r.sched.quiet_secs(&s), 600);
     }
 
-    /// I-8: a purge of thousands of memories does not make a `remember` wait for the lot.
+    /// I-8: a purge of thousands of memories does not make a `remember` wait for the lot. The
+    /// bound does not depend on how fast the machine is: the worst wait is compared with the
+    /// purge's own duration (one slice is a small part of it; without slicing the one big write
+    /// takes about all of it), plus a hang guard.
     #[test]
     fn a_remember_during_a_big_purge_waits_for_a_slice_not_for_the_purge() {
         let r = rig();
-        r.insert_trashed_memories(6_000, "2020-01-01T00:00:00.000Z");
+        r.insert_trashed_memories(PURGE_TEST_MEMORIES, "2020-01-01T00:00:00.000Z");
         let sched = r.sched.clone();
-        let t =
-            std::thread::spawn(move || sched.run_job(Job::TrashPurge, chrono::Utc::now(), true));
+        let t = std::thread::spawn(move || {
+            let started = Instant::now();
+            let report = sched.run_job(Job::TrashPurge, chrono::Utc::now(), true);
+            (report, started.elapsed())
+        });
         let mut worst = Duration::ZERO;
         let mut n = 0;
-        while !t.is_finished() && n < 200 {
+        let hang_guard = Instant::now() + Duration::from_secs(300);
+        while !t.is_finished() {
+            assert!(Instant::now() < hang_guard, "the purge never finished");
             let started = Instant::now();
             r.writer
                 .submit_blocking(WriteOp::Remember {
@@ -2153,13 +2217,12 @@ mod tests {
             n += 1;
             std::thread::sleep(Duration::from_millis(2));
         }
-        let report = t.join().unwrap();
+        let (report, purge) = t.join().unwrap();
         assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
-        assert!(n > 0);
-        // Generous: a slice is ~25 ms; this machine may be busy.
+        assert!(n > 3, "only {n} writes got in during a purge of {purge:?}");
         assert!(
-            worst < Duration::from_secs(2),
-            "worst remember {worst:?} over {n}"
+            worst < purge / 3,
+            "worst remember {worst:?} over {n} writes, during a purge of {purge:?}"
         );
         assert_eq!(
             r.count("SELECT count(*) FROM memories WHERE status = 'trashed'"),

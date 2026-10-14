@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 pub const LABEL: &str = "dev.alice.daemon";
 /// The systemd user unit's name.
 pub const UNIT: &str = "alice.service";
-/// The scheduled task's name on Windows.
-pub const TASK: &str = "Alice";
+/// The scheduled task's name on Windows: the launchd label, which no unrelated task is likely to
+/// carry (`/F` replaces a task of the same name).
+pub const TASK: &str = LABEL;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -46,20 +47,23 @@ pub struct InstallPlan {
 }
 
 pub trait Runner {
+    /// Run a command; `Ok` is exit status 0. Nothing reads the error text (it is localised).
     fn run(&self, cmd: &[String]) -> Result<()>;
+    /// Run a command and return what it printed on stdout (`Err`: it failed).
+    fn output(&self, cmd: &[String]) -> Result<String> {
+        self.run(cmd).map(|()| String::new())
+    }
 }
 
 pub struct SystemRunner;
 
-impl Runner for SystemRunner {
-    fn run(&self, cmd: &[String]) -> Result<()> {
+impl SystemRunner {
+    fn exec(cmd: &[String]) -> Result<std::process::Output> {
         let Some((program, args)) = cmd.split_first() else {
-            return Ok(());
+            return Err(AliceError::Other("an empty command".into()));
         };
         let out = std::process::Command::new(program).args(args).output()?;
         if !out.status.success() {
-            // stderr carries the reason ("No such process", "Unit … not loaded", …); `uninstall`
-            // tells "not installed" from real failures by it.
             let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
             return Err(AliceError::Other(format!(
                 "`{}` exited with {}: {why}",
@@ -67,23 +71,17 @@ impl Runner for SystemRunner {
                 out.status
             )));
         }
-        Ok(())
+        Ok(out)
     }
 }
 
-/// Whether a failed stop/unregister command only means the service was not loaded.
-fn not_installed(e: &AliceError) -> bool {
-    let m = e.to_string().to_ascii_lowercase();
-    [
-        "no such process",
-        "does not exist",
-        "cannot find",
-        "not loaded",
-        "not found",
-        "could not find",
-    ]
-    .iter()
-    .any(|p| m.contains(p))
+impl Runner for SystemRunner {
+    fn run(&self, cmd: &[String]) -> Result<()> {
+        Self::exec(cmd).map(|_| ())
+    }
+    fn output(&self, cmd: &[String]) -> Result<String> {
+        Self::exec(cmd).map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    }
 }
 
 /// The user's home directory, where the unit files live.
@@ -97,8 +95,24 @@ fn unit_path(p: Platform, root: &Path) -> Option<PathBuf> {
             root.join("Library/LaunchAgents")
                 .join(format!("{LABEL}.plist")),
         ),
-        Platform::Linux => Some(root.join(".config/systemd/user").join(UNIT)),
+        Platform::Linux => Some(
+            linux_unit_dir(
+                root,
+                std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+                dirs::home_dir().as_deref(),
+            )
+            .join(UNIT),
+        ),
         Platform::Windows => None,
+    }
+}
+
+/// Where systemd reads user units: `$XDG_CONFIG_HOME/systemd/user` when that is set and `root`
+/// is the user's real home (a test or `--target-dir` root never follows the real environment).
+fn linux_unit_dir(root: &Path, xdg: Option<&std::ffi::OsStr>, real_home: Option<&Path>) -> PathBuf {
+    match xdg.filter(|x| !x.is_empty()) {
+        Some(x) if real_home == Some(root) => PathBuf::from(x).join("systemd/user"),
+        _ => root.join(".config/systemd/user"),
     }
 }
 
@@ -150,7 +164,7 @@ pub fn plan_install(
   <dict><key>ALICE_HOME</key><string>{}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key><string>{}</string>
   <key>StandardErrorPath</key><string>{}</string>
 </dict>
@@ -177,7 +191,7 @@ pub fn plan_install(
         Platform::Linux => {
             let path = unit_path(p, root).expect("Linux has a unit");
             let unit = format!(
-                "[Unit]\nDescription=Alice memory daemon\n\n[Service]\nExecStart={} daemon run\nEnvironment={}\nStandardOutput=append:{}\nStandardError=append:{}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+                "[Unit]\nDescription=Alice memory daemon\nStartLimitIntervalSec=600\nStartLimitBurst=5\n\n[Service]\nExecStart={} daemon run\nEnvironment={}\nStandardOutput=append:{}\nStandardError=append:{}\nRestart=on-failure\nRestartSec=30\n\n[Install]\nWantedBy=default.target\n",
                 systemd_word(&exe_s),
                 systemd_word(&format!("ALICE_HOME={home_s}")),
                 systemd_word(&log),
@@ -330,28 +344,46 @@ pub fn apply(plan: &InstallPlan, runner: Option<&dyn Runner>) -> Result<()> {
     Ok(())
 }
 
-/// Run `commands`, treating a service that is not loaded as done. Returns whether every command
-/// ran (`false`: the service was not there, and nothing more was run).
-fn run_tolerant(commands: &[Vec<String>], r: &dyn Runner) -> Result<bool> {
-    for c in commands {
-        match r.run(c) {
-            Ok(()) => {}
-            Err(e) if not_installed(&e) => {
-                tracing::info!(error = %e, "service was not loaded");
-                return Ok(false);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(true)
+/// Whether the service manager has the unit loaded (launchd: `print`; systemd: `is-active`;
+/// Windows: the task exists). By exit status only.
+fn is_loaded(p: Platform, uid: u32, r: &dyn Runner) -> bool {
+    let probe: Vec<String> = match p {
+        Platform::MacOs => vec![
+            "launchctl".into(),
+            "print".into(),
+            format!("gui/{uid}/{LABEL}"),
+        ],
+        Platform::Linux => vec![
+            "systemctl".into(),
+            "--user".into(),
+            "is-active".into(),
+            UNIT.into(),
+        ],
+        Platform::Windows => vec![
+            "schtasks".into(),
+            "/Query".into(),
+            "/TN".into(),
+            TASK.into(),
+        ],
+    };
+    r.run(&probe).is_ok()
 }
 
-/// Uninstall: stop and unregister (when a runner is given), then remove the unit file. A
-/// service that is not loaded is not an error; any other command failure is returned (the unit
-/// file stays, so `alice service status` still shows it and a retry can finish the job).
+/// Uninstall: stop and unregister what the manager has (when a runner is given), then remove the
+/// unit file. What is there is found by exit status (a unit file, a loaded job, an existing
+/// task), never by error text; a command that fails on something that is there is returned (the
+/// unit file stays, so `alice service status` still shows it and a retry can finish the job).
 pub fn uninstall(p: Platform, root: &Path, uid: u32, runner: Option<&dyn Runner>) -> Result<()> {
     if let Some(r) = runner {
-        run_tolerant(&plan_uninstall(p, root, uid).commands, r)?;
+        let present = match p {
+            Platform::Linux => installed(p, root).is_some(),
+            _ => is_loaded(p, uid, r),
+        };
+        if present {
+            for c in &plan_uninstall(p, root, uid).commands {
+                r.run(c)?;
+            }
+        }
     }
     if let Some(f) = installed(p, root) {
         std::fs::remove_file(f)?;
@@ -359,27 +391,171 @@ pub fn uninstall(p: Platform, root: &Path, uid: u32, runner: Option<&dyn Runner>
     Ok(())
 }
 
-/// Unload a unit that is already registered, so installing again replaces it (launchd refuses
-/// to bootstrap a job that is loaded). A unit that is not loaded is fine.
+/// Unload a unit that is already loaded, so installing again replaces it (launchd refuses to
+/// bootstrap a job that is loaded). Not loaded is fine.
 pub fn unload(p: Platform, root: &Path, uid: u32, runner: &dyn Runner) -> Result<()> {
     // Only launchd needs this: systemd's `enable --now` and the task's `/F` replace the old one.
-    if p == Platform::MacOs {
-        run_tolerant(&plan_uninstall(p, root, uid).commands, runner)?;
+    if p == Platform::MacOs && is_loaded(p, uid, runner) {
+        for c in &plan_uninstall(p, root, uid).commands {
+            runner.run(c)?;
+        }
     }
     Ok(())
 }
 
-/// Stop the installed unit's daemon for the duration of a restore. `Ok(true)`: it was running
-/// and [`resume`] should start it again; `Ok(false)`: no unit (or not loaded), nothing to
-/// resume. A command that fails for another reason is an error: the restore must not go on
-/// with a unit that may start a daemon in the middle of the swap.
-pub fn suspend(p: Platform, root: &Path, uid: u32, runner: &dyn Runner) -> Result<bool> {
-    // Where a unit is a file, its absence means there is nothing to stop; on Windows the task
-    // lives in the Task Scheduler, and `/End` says whether it exists.
-    if unit_path(p, root).is_some() && installed(p, root).is_none() {
-        return Ok(false);
+/// The `ALICE_HOME` the installed unit file sets (`None`: no unit file, or none that names one).
+pub fn unit_home(p: Platform, root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(installed(p, root)?).ok()?;
+    match p {
+        Platform::MacOs => {
+            let key = "<key>ALICE_HOME</key><string>";
+            let rest = &text[text.find(key)? + key.len()..];
+            let value = &rest[..rest.find("</string>")?];
+            Some(PathBuf::from(
+                value
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&"),
+            ))
+        }
+        Platform::Linux => {
+            let line = text.lines().find(|l| l.starts_with("Environment="))?;
+            let mut v = line.trim_start_matches("Environment=").to_string();
+            if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+                v = v[1..v.len() - 1]
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\");
+            }
+            let v = v.replace("%%", "%");
+            v.strip_prefix("ALICE_HOME=").map(PathBuf::from)
+        }
+        Platform::Windows => None,
     }
-    run_tolerant(&plan_suspend(p, uid).commands, runner)
+}
+
+/// Whose unit this is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitOwner {
+    /// No unit is installed.
+    None,
+    /// The unit serves the data directory asked about.
+    This,
+    /// The unit serves another data directory.
+    Other(PathBuf),
+    /// A unit exists but its data directory cannot be read.
+    Unreadable,
+}
+
+fn canon(x: &Path) -> PathBuf {
+    std::fs::canonicalize(x).unwrap_or_else(|_| x.to_path_buf())
+}
+
+fn owner_of(found: Option<PathBuf>, home: &Path) -> UnitOwner {
+    match found {
+        Some(h) if canon(&h) == canon(home) => UnitOwner::This,
+        Some(h) => UnitOwner::Other(h),
+        None => UnitOwner::Unreadable,
+    }
+}
+
+/// The data directory the Windows task runs for, from its definition (`schtasks /Query /XML`;
+/// the element names are not localised): the `ALICE_HOME=` Alice wrote into the action.
+pub fn task_home(xml_text: &str) -> Option<PathBuf> {
+    let args = xml_text
+        .split("<Arguments>")
+        .nth(1)?
+        .split("</Arguments>")
+        .next()?;
+    let args = args
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    let rest = &args[args.find("ALICE_HOME=")? + "ALICE_HOME=".len()..];
+    Some(PathBuf::from(&rest[..rest.find('"')?]))
+}
+
+/// Whose unit is installed on this machine, for `home`.
+pub fn unit_owner(p: Platform, root: &Path, home: &Path, runner: &dyn Runner) -> UnitOwner {
+    if p == Platform::Windows {
+        let query = ["schtasks", "/Query", "/TN", TASK, "/XML"].map(String::from);
+        return match runner.output(&query) {
+            Err(_) => UnitOwner::None,
+            Ok(xml_text) => owner_of(task_home(&xml_text), home),
+        };
+    }
+    if installed(p, root).is_none() {
+        return UnitOwner::None;
+    }
+    owner_of(unit_home(p, root), home)
+}
+
+/// Whether the installed unit file serves `home` (compared after canonicalisation). `false` when
+/// there is no unit file, or it serves another data directory.
+pub fn unit_serves(p: Platform, root: &Path, home: &Path) -> bool {
+    unit_home(p, root).is_some_and(|h| canon(&h) == canon(home))
+}
+
+/// What [`suspend`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Suspension {
+    /// The unit's daemon was stopped; [`resume`] should start it again.
+    pub ended: bool,
+    /// A line for the person: a unit that was left alone, and why.
+    pub notice: Option<String>,
+}
+
+/// Stop the daemon of the service unit that serves `home`, for the duration of a restore. One
+/// rule on every OS, by exit status and never by error text (it is localised):
+///
+/// 1. Find the unit. One that serves another data directory, or whose data directory cannot be
+///    read, is left alone, with a notice.
+/// 2. Ask the manager whether it is loaded (launchd `print`, systemd `is-active`; Windows: the
+///    task exists). Not loaded: nothing to suspend.
+/// 3. Loaded under launchd or systemd, which restart what exits: stop it. If the stop fails the
+///    restore must not go on (it could restart the daemon in the middle of the swap): `Err`.
+/// 4. A Windows task has no restart policy: `/End` is best effort, a failure never refuses (the
+///    restore stops the daemon process itself), and `/Run` follows only after a successful `/End`.
+pub fn suspend(
+    p: Platform,
+    root: &Path,
+    uid: u32,
+    home: &Path,
+    runner: &dyn Runner,
+) -> Result<Suspension> {
+    let left_alone = |why: String| {
+        Ok(Suspension {
+            ended: false,
+            notice: Some(format!(
+                "a service unit is installed but {why}; it was left alone"
+            )),
+        })
+    };
+    match unit_owner(p, root, home, runner) {
+        UnitOwner::None => return Ok(Suspension::default()),
+        UnitOwner::Other(h) => return left_alone(format!("serves {}", h.display())),
+        UnitOwner::Unreadable => {
+            return left_alone("the data directory it serves could not be read".into());
+        }
+        UnitOwner::This => {}
+    }
+    if !is_loaded(p, uid, runner) {
+        return Ok(Suspension::default());
+    }
+    for c in &plan_suspend(p, uid).commands {
+        if let Err(e) = runner.run(c) {
+            if p == Platform::Windows {
+                tracing::info!(error = %e, "the scheduled task could not be ended");
+                return Ok(Suspension::default());
+            }
+            return Err(e);
+        }
+    }
+    Ok(Suspension {
+        ended: true,
+        notice: None,
+    })
 }
 
 /// Start the unit's daemon again after [`suspend`].
@@ -555,18 +731,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn uninstall_ignores_not_loaded_but_returns_other_failures() {
-        struct Fails(&'static str);
-        impl Runner for Fails {
-            fn run(&self, cmd: &[String]) -> alice_core::Result<()> {
-                Err(AliceError::Other(format!(
-                    "`{}` exited with exit status: 1: {}",
-                    cmd.join(" "),
-                    self.0
-                )))
+    /// A runner that records what it is given and fails the commands whose text contains one of
+    /// `fail`. Failures are in Thai on purpose: nothing may depend on the words. `xml` is what
+    /// `schtasks /Query /XML` prints.
+    struct Script {
+        seen: parking_lot::Mutex<Vec<Vec<String>>>,
+        fail: Vec<&'static str>,
+        xml: String,
+    }
+
+    impl Script {
+        fn new(fail: &[&'static str]) -> Self {
+            Script {
+                seen: Default::default(),
+                fail: fail.to_vec(),
+                xml: String::new(),
             }
         }
+        fn with_xml(mut self, xml: &str) -> Self {
+            self.xml = xml.into();
+            self
+        }
+        /// The commands run, without the probes that only ask a question.
+        fn actions(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .iter()
+                .map(|c| c.join(" "))
+                .filter(|l| {
+                    !["launchctl print", "is-active", "/Query"]
+                        .iter()
+                        .any(|p| l.contains(p))
+                })
+                .collect()
+        }
+    }
+
+    impl Runner for Script {
+        fn run(&self, cmd: &[String]) -> alice_core::Result<()> {
+            self.seen.lock().push(cmd.to_vec());
+            let line = cmd.join(" ");
+            if self.fail.iter().any(|f| line.contains(f)) {
+                return Err(AliceError::Other(format!("`{line}` ล้มเหลว")));
+            }
+            Ok(())
+        }
+        fn output(&self, cmd: &[String]) -> alice_core::Result<String> {
+            self.run(cmd).map(|()| self.xml.clone())
+        }
+    }
+
+    fn task_xml(home: &str) -> String {
+        format!(
+            "<Task><Actions><Exec><Command>cmd</Command><Arguments>/c set &quot;ALICE_HOME={home}&quot;&amp;&amp; &quot;C:\\alice.exe&quot; daemon run</Arguments></Exec></Actions></Task>"
+        )
+    }
+
+    #[test]
+    fn uninstall_returns_failures_of_what_is_there_and_skips_what_is_not() {
         let d = tempfile::tempdir().unwrap();
         let p = plan_install(
             Platform::Linux,
@@ -580,38 +802,29 @@ mod tests {
             Platform::Linux,
             d.path(),
             1000,
-            Some(&Fails("Failed to connect to bus: Permission denied")),
+            Some(&Script::new(&["disable"])),
         )
         .unwrap_err();
-        assert!(e.to_string().contains("Permission denied"), "{e}");
+        assert!(e.to_string().contains("ล้มเหลว"), "{e}");
         assert!(
             installed(Platform::Linux, d.path()).is_some(),
-            "the unit file stays after a real failure"
+            "the unit file stays after a failure"
         );
-        uninstall(
-            Platform::Linux,
-            d.path(),
-            1000,
-            Some(&Fails("Unit alice.service not loaded.")),
-        )
-        .unwrap();
-        assert!(
-            installed(Platform::Linux, d.path()).is_none(),
-            "not loaded is fine: the file goes"
-        );
+        uninstall(Platform::Linux, d.path(), 1000, Some(&Script::new(&[]))).unwrap();
+        assert!(installed(Platform::Linux, d.path()).is_none());
+        // Nothing installed and a manager whose every command fails (in Thai): succeeds, runs nothing.
+        let none = Script::new(&["systemctl", "launchctl", "schtasks"]);
+        for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
+            uninstall(platform, d.path(), 1000, Some(&none)).unwrap();
+            unload(platform, d.path(), 1000, &none).unwrap();
+        }
+        assert!(none.actions().is_empty(), "{:?}", none.actions());
     }
 
-    /// `alice restore` stops the unit before the swap and starts it afterwards, with the
-    /// commands of each platform; no unit, no commands.
+    /// `alice restore` stops the unit before the swap and starts it afterwards, with the commands
+    /// of each platform; no unit, no commands.
     #[test]
     fn suspend_and_resume_stop_and_start_the_installed_unit_only() {
-        struct Rec(parking_lot::Mutex<Vec<Vec<String>>>);
-        impl Runner for Rec {
-            fn run(&self, cmd: &[String]) -> alice_core::Result<()> {
-                self.0.lock().push(cmd.to_vec());
-                Ok(())
-            }
-        }
         let words = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for (platform, stop, start) in [
             (
@@ -626,44 +839,219 @@ mod tests {
             ),
         ] {
             let d = tempfile::tempdir().unwrap();
-            let rec = Rec(Default::default());
-            assert!(
-                !suspend(platform, d.path(), 501, &rec).unwrap(),
+            let rec = Script::new(&[]);
+            assert_eq!(
+                suspend(platform, d.path(), 501, home().root(), &rec).unwrap(),
+                Suspension::default(),
                 "no unit file, nothing to stop"
             );
-            assert!(rec.0.lock().is_empty(), "{platform:?}");
+            assert!(rec.actions().is_empty(), "{platform:?}");
             apply(
                 &plan_install(platform, d.path(), Path::new("/x/alice"), &home(), 501),
                 None,
             )
             .unwrap();
-            assert!(suspend(platform, d.path(), 501, &rec).unwrap());
+            let s = suspend(platform, d.path(), 501, home().root(), &rec).unwrap();
+            assert!(s.ended && s.notice.is_none());
             resume(platform, d.path(), 501, &rec).unwrap();
-            let seen = rec.0.lock().clone();
-            assert_eq!(seen[0], stop, "{platform:?}");
-            assert!(seen[1].contains(&start.to_string()), "{seen:?}");
+            let seen = rec.seen.lock().clone();
+            let acts: Vec<_> = seen
+                .iter()
+                .filter(|c| !c.join(" ").contains("print") && !c.join(" ").contains("is-active"))
+                .cloned()
+                .collect();
+            assert_eq!(acts[0], stop, "{platform:?}");
+            assert!(acts[1].contains(&start.to_string()), "{acts:?}");
             assert!(
                 installed(platform, d.path()).is_some(),
                 "the unit stays installed"
             );
         }
-        // Windows: the task is not a file; `/End` on a task that does not exist is "nothing to do".
-        struct NoTask;
-        impl Runner for NoTask {
-            fn run(&self, _: &[String]) -> alice_core::Result<()> {
-                Err(AliceError::Other(
-                    "`schtasks /End /TN Alice` exited with exit code: 1: ERROR: The system cannot find the file specified.".into(),
-                ))
+    }
+
+    /// A unit for another home, or one whose home cannot be read, is left alone with a notice.
+    #[test]
+    fn a_unit_for_another_home_or_an_unreadable_one_is_left_alone_with_a_notice() {
+        for platform in [Platform::MacOs, Platform::Linux] {
+            let d = tempfile::tempdir().unwrap();
+            let (a, b) = (d.path().join("home-a"), d.path().join("home-b"));
+            std::fs::create_dir_all(&a).unwrap();
+            std::fs::create_dir_all(&b).unwrap();
+            apply(
+                &plan_install(
+                    platform,
+                    d.path(),
+                    Path::new("/x/alice"),
+                    &AliceHome::new(a.clone()),
+                    501,
+                ),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                unit_home(platform, d.path()),
+                Some(a.clone()),
+                "{platform:?}"
+            );
+            let rec = Script::new(&[]);
+            let s = suspend(platform, d.path(), 501, &b, &rec).unwrap();
+            assert!(!s.ended);
+            let n = s.notice.unwrap();
+            assert!(
+                n.contains("serves") && n.contains("left alone") && n.contains("home-a"),
+                "{n}"
+            );
+            assert!(rec.actions().is_empty(), "{platform:?}: nothing stopped");
+            // The same home spelled through a link still matches.
+            #[cfg(unix)]
+            {
+                let link = d.path().join("link-a");
+                std::os::unix::fs::symlink(&a, &link).unwrap();
+                assert!(unit_serves(platform, d.path(), &link));
             }
+            assert!(suspend(platform, d.path(), 501, &a, &rec).unwrap().ended);
+            // A unit file that names no data directory.
+            let path = installed(platform, d.path()).unwrap();
+            std::fs::write(&path, "hand edited\n").unwrap();
+            let rec = Script::new(&[]);
+            let s = suspend(platform, d.path(), 501, &a, &rec).unwrap();
+            assert!(!s.ended && s.notice.unwrap().contains("could not be read"));
+            assert!(rec.actions().is_empty());
         }
-        assert!(!suspend(Platform::Windows, Path::new("/x"), 0, &NoTask).unwrap());
-        // A stop that fails for another reason refuses: the restore must not go on.
-        struct Denied;
-        impl Runner for Denied {
-            fn run(&self, _: &[String]) -> alice_core::Result<()> {
-                Err(AliceError::Other("Access is denied".into()))
-            }
+        // A path with a space, a `%` and a `&` survives the unit file (quoting and escaping).
+        let d = tempfile::tempdir().unwrap();
+        let odd = PathBuf::from("/tmp/a b%c&d");
+        for platform in [Platform::MacOs, Platform::Linux] {
+            apply(
+                &plan_install(
+                    platform,
+                    d.path(),
+                    Path::new("/x/alice"),
+                    &AliceHome::new(odd.clone()),
+                    1,
+                ),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                unit_home(platform, d.path()),
+                Some(odd.clone()),
+                "{platform:?}"
+            );
         }
-        assert!(suspend(Platform::Windows, Path::new("/x"), 0, &Denied).is_err());
+    }
+
+    /// One rule on macOS and Linux: not loaded proceeds without a stop; loaded and a stop that
+    /// fails (in Thai) refuses.
+    #[test]
+    fn a_loaded_unit_that_cannot_be_stopped_refuses_and_an_unloaded_one_proceeds() {
+        for (platform, probe, stop) in [
+            (Platform::MacOs, "launchctl print", "bootout"),
+            (Platform::Linux, "is-active", "--user stop"),
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            apply(
+                &plan_install(platform, d.path(), Path::new("/x/alice"), &home(), 501),
+                None,
+            )
+            .unwrap();
+            let not_loaded = Script::new(&[probe]);
+            assert_eq!(
+                suspend(platform, d.path(), 501, home().root(), &not_loaded).unwrap(),
+                Suspension::default()
+            );
+            assert!(
+                not_loaded.actions().is_empty(),
+                "no stop for an unloaded unit"
+            );
+            let stuck = Script::new(&[stop]);
+            let e = suspend(platform, d.path(), 501, home().root(), &stuck).unwrap_err();
+            assert!(e.to_string().contains("ล้มเหลว"), "{e}");
+        }
+    }
+
+    /// Windows: the home is read from the task definition; another home's task is left alone; a
+    /// task that cannot be read is left alone; `/End` is best effort and never refuses.
+    #[test]
+    fn the_windows_task_is_found_by_its_definition_and_ended_on_a_best_effort() {
+        let root = Path::new("/x");
+        let mine = "C:\\Users\\u\\.alice";
+        let h = Path::new(mine);
+        assert_eq!(task_home(&task_xml(mine)), Some(PathBuf::from(mine)));
+        // Absent: `/Query` fails, nothing else runs.
+        let rec = Script::new(&["/Query"]);
+        assert_eq!(
+            suspend(Platform::Windows, root, 0, h, &rec).unwrap(),
+            Suspension::default()
+        );
+        assert!(rec.actions().is_empty());
+        // Another home's task: nothing ended, a notice.
+        let rec = Script::new(&[]).with_xml(&task_xml("D:\\other"));
+        let s = suspend(Platform::Windows, root, 0, h, &rec).unwrap();
+        assert!(!s.ended && s.notice.unwrap().contains("D:\\other"));
+        assert!(rec.actions().is_empty());
+        // A definition that names no home: left alone, with a notice.
+        let rec = Script::new(&[]).with_xml("<Task/>");
+        let s = suspend(Platform::Windows, root, 0, h, &rec).unwrap();
+        assert!(!s.ended && s.notice.unwrap().contains("could not be read"));
+        // This home's task: ended.
+        let rec = Script::new(&[]).with_xml(&task_xml(mine));
+        let s = suspend(Platform::Windows, root, 0, h, &rec).unwrap();
+        assert!(s.ended);
+        assert!(rec.actions()[0].contains("/End"));
+        // `/End` fails (not running, any language): proceeds, nothing to resume.
+        let rec = Script::new(&["/End"]).with_xml(&task_xml(mine));
+        assert_eq!(
+            suspend(Platform::Windows, root, 0, h, &rec).unwrap(),
+            Suspension::default()
+        );
+        assert_eq!(TASK, "dev.alice.daemon");
+    }
+
+    /// Where systemd reads user units: `$XDG_CONFIG_HOME`, only for the user's real home.
+    #[test]
+    fn linux_units_follow_xdg_config_home_for_the_real_home_only() {
+        let home = Path::new("/home/u");
+        let xdg = std::ffi::OsString::from("/home/u/cfg");
+        assert_eq!(
+            linux_unit_dir(home, Some(&xdg), Some(home)),
+            PathBuf::from("/home/u/cfg/systemd/user")
+        );
+        assert_eq!(
+            linux_unit_dir(home, None, Some(home)),
+            PathBuf::from("/home/u/.config/systemd/user")
+        );
+        let empty = std::ffi::OsString::new();
+        assert_eq!(
+            linux_unit_dir(home, Some(&empty), Some(home)),
+            PathBuf::from("/home/u/.config/systemd/user")
+        );
+        // A sandbox or `--target-dir` root never follows the real environment.
+        assert_eq!(
+            linux_unit_dir(Path::new("/tmp/t"), Some(&xdg), Some(home)),
+            PathBuf::from("/tmp/t/.config/systemd/user")
+        );
+    }
+
+    /// The unit options that keep a daemon that cannot start from looping every few seconds,
+    /// and keep launchd from throttling it.
+    #[test]
+    fn the_units_restart_slowly_and_launchd_does_not_throttle_the_daemon() {
+        let root = PathBuf::from("/tmp/root");
+        let mac = plan_install(Platform::MacOs, &root, Path::new("/x/alice"), &home(), 1);
+        let plist = &mac.files[0].1;
+        assert!(!plist.contains("ProcessType"), "{plist}");
+        assert!(plist.contains("<key>ThrottleInterval</key><integer>30</integer>"));
+        assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
+        let linux = plan_install(Platform::Linux, &root, Path::new("/x/alice"), &home(), 1);
+        let unit = &linux.files[0].1;
+        for want in [
+            "Restart=on-failure",
+            "RestartSec=30",
+            "StartLimitIntervalSec=600",
+            "StartLimitBurst=5",
+        ] {
+            assert!(unit.contains(want), "{want}\n{unit}");
+        }
     }
 }

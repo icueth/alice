@@ -84,10 +84,29 @@ pub fn try_lock_home(home: &AliceHome) -> std::io::Result<Option<File>> {
     }
 }
 
+/// Take the lock and announce it at once: the pid into the lock file and `daemon.pid` (replacing
+/// a stale one), before any slow step of starting. Where a held lock file cannot be read
+/// (Windows) a client finds a starting daemon through `daemon.pid`, so it must not wait for the
+/// sweep or the model.
+fn take_and_announce(home: &AliceHome) -> anyhow::Result<Option<File>> {
+    let Some(mut lock) = acquire_lock(home)? else {
+        return Ok(None);
+    };
+    lock.set_len(0)?;
+    writeln!(lock, "{}", std::process::id())?;
+    // Whatever daemon.json exists now is stale (its writer no longer holds the lock): drop it
+    // before the slow part of starting, so no client pings a port that may be someone else's.
+    let _ = std::fs::remove_file(home.daemon_json());
+    if let Err(e) = startup::write_pid_file(home) {
+        tracing::warn!(error = %e, "cannot write daemon.pid; clients may not see this daemon while it starts");
+    }
+    Ok(Some(lock))
+}
+
 pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
     crate::install_tls();
     home.ensure_dirs()?;
-    let Some(mut lock) = acquire_lock(&home)? else {
+    let Some(lock) = take_and_announce(&home)? else {
         eprintln!(
             "alice daemon is already running for {}",
             home.root().display()
@@ -96,15 +115,6 @@ pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
     };
     // A killed `alice restore` may have left its staged files; none runs while we hold the lock.
     crate::restore::sweep_staged(&home);
-    lock.set_len(0)?;
-    writeln!(lock, "{}", std::process::id())?;
-    // Where a held lock file cannot be read (Windows), clients find this daemon here.
-    if let Err(e) = startup::write_pid_file(&home) {
-        tracing::warn!(error = %e, "cannot write daemon.pid; clients may not see this daemon while it starts");
-    }
-    // Whatever daemon.json exists now is stale (its writer no longer holds the lock): drop it
-    // before the slow part of starting, so no client pings a port that may be someone else's.
-    let _ = std::fs::remove_file(home.daemon_json());
     // A new attempt: the last failed start's reason no longer applies.
     startup::clear_error(&home);
     // Always printed (not subject to ALICE_LOG): process tests count this line to prove a single instance.
@@ -369,4 +379,40 @@ async fn stop_on_signal(ct: CancellationToken) {
     #[cfg(not(unix))]
     interrupted().await;
     ct.cancel();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A starting daemon is visible through `daemon.pid` as soon as it holds the lock, before the
+    /// sweep of a killed restore's files (the first slow step of starting) has run.
+    #[test]
+    fn a_daemon_announces_itself_before_its_first_slow_step() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        home.ensure_dirs().unwrap();
+        // A pid file left by a daemon that was killed, and a file a killed restore left.
+        std::fs::write(
+            home.daemon_pid(),
+            serde_json::json!({"pid": 999_999, "unix_ms": 1}).to_string(),
+        )
+        .unwrap();
+        let staged = home.root().join(".alice-restore.tmp");
+        std::fs::write(&staged, b"x").unwrap();
+        std::fs::write(home.daemon_json(), b"{\"stale\": true}").unwrap();
+        let lock = take_and_announce(&home).unwrap().expect("the lock is free");
+        assert!(
+            !home.daemon_json().exists(),
+            "a stale daemon.json is dropped first"
+        );
+        let rec = startup::read_pid_file(&home).unwrap();
+        assert_eq!(rec.pid, std::process::id(), "the stale record is replaced");
+        assert!(rec.unix_ms > 1);
+        assert_eq!(startup::lock_pid(&home), Some(std::process::id()));
+        assert!(staged.exists(), "announced before the sweep ran");
+        // A second daemon does not take it, and leaves the record alone.
+        assert!(try_lock_home(&home).unwrap().is_none());
+        drop(lock);
+    }
 }

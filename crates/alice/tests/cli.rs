@@ -18,6 +18,10 @@ struct Env {
     _dir: tempfile::TempDir,
     home: PathBuf,
     work: PathBuf,
+    /// The user's home directory as the commands see it (`HOME`), where a service unit would be
+    /// looked for; and the sandbox that records service commands instead of running them.
+    user_home: PathBuf,
+    svc: PathBuf,
 }
 
 impl Env {
@@ -27,10 +31,16 @@ impl Env {
         let work = dir.path().join("work");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&work).unwrap();
+        let user_home = dir.path().join("user-home");
+        let svc = dir.path().join("service-root");
+        std::fs::create_dir_all(&user_home).unwrap();
+        std::fs::create_dir_all(&svc).unwrap();
         Env {
             _dir: dir,
             home,
             work,
+            user_home,
+            svc,
         }
     }
 
@@ -46,6 +56,12 @@ impl Env {
         c.args(args)
             .current_dir(&self.work)
             .env("ALICE_HOME", &self.home)
+            // No command of any test can reach the owner's launchd, systemd or Task Scheduler,
+            // or read the owner's `~/Library/LaunchAgents`: the user's home is a temporary
+            // directory and service commands are only recorded in `ALICE_SERVICE_ROOT`.
+            .env("HOME", &self.user_home)
+            .env("XDG_CONFIG_HOME", self.user_home.join(".config"))
+            .env("ALICE_SERVICE_ROOT", &self.svc)
             .env("ALICE_EMBEDDER", "fake")
             .env("ALICE_LOG", "warn")
             .env_remove("TYPESAFE_API_KEY");
@@ -2798,12 +2814,10 @@ fn service_install_writes_only_under_the_target_dir_and_dry_run_writes_nothing()
         !target.join("service-commands.log").exists(),
         "--target-dir runs nothing"
     );
+    let dry = env.ok(&["service", "uninstall", "--dry-run", "--target-dir", t]);
     assert!(
-        env.ok(&["service", "uninstall", "--dry-run", "--target-dir", t])
-            .contains("would remove")
-            || env
-                .ok(&["service", "uninstall", "--dry-run", "--target-dir", t])
-                .contains("Would remove")
+        dry.contains(&format!("Would remove {}", installed.display())),
+        "{dry}"
     );
     assert!(installed.exists(), "a dry run removes nothing");
     env.ok(&["service", "uninstall", "--target-dir", t]);
@@ -2816,7 +2830,7 @@ fn service_install_writes_only_under_the_target_dir_and_dry_run_writes_nothing()
             .as_array()
             .is_some_and(|f| f.len() <= 1)
     );
-    assert!(!target.exists() || !installed.exists());
+    assert!(!installed.exists(), "the JSON dry run wrote nothing either");
 }
 
 /// `alice doctor` reports the checks, and exits non-zero when one fails.
@@ -3065,6 +3079,12 @@ fn service_commands(root: &std::path::Path) -> Vec<String> {
     std::fs::read_to_string(root.join("service-commands.log"))
         .unwrap_or_default()
         .lines()
+        // The questions asked of the manager (is it loaded?) are not actions.
+        .filter(|l| {
+            !["launchctl print", "is-active", "/Query"]
+                .iter()
+                .any(|p| l.contains(p))
+        })
         .map(String::from)
         .collect()
 }
@@ -3075,13 +3095,8 @@ fn service_commands(root: &std::path::Path) -> Vec<String> {
 #[test]
 fn restore_stops_the_installed_service_unit_and_starts_it_again() {
     let env = Env::new();
-    let root = env.home.parent().unwrap().join("service-root");
-    std::fs::create_dir_all(&root).unwrap();
-    let with_root = |args: &[&str]| {
-        let mut c = env.cmd(args);
-        c.env("ALICE_SERVICE_ROOT", &root);
-        c.output().unwrap()
-    };
+    let root = env.svc.clone();
+    let with_root = |args: &[&str]| env.run(args);
     env.ok(&["remember", "kept in the backup"]);
     let name = env.json(&["backup", "now"])["name"]
         .as_str()
@@ -3118,6 +3133,172 @@ fn restore_stops_the_installed_service_unit_and_starts_it_again() {
     assert!(during[0].starts_with(stop), "{during:?}");
     assert!(during[1].starts_with(start), "{during:?}");
     assert_eq!(env.recall_count("backup"), 1, "the restore itself worked");
+}
+
+/// The words of the probe that asks the manager whether the unit is loaded.
+fn probe_word() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "launchctl print"
+    } else {
+        "is-active"
+    }
+}
+
+/// The service command words that stop and start the unit on this platform.
+fn stop_start_words() -> (&'static str, &'static str) {
+    if cfg!(target_os = "macos") {
+        ("bootout", "bootstrap")
+    } else {
+        ("--user stop", "--user start")
+    }
+}
+
+/// A restore of one data directory never touches a unit that serves another (the owner's
+/// production daemon, say): no service command is run for it.
+#[test]
+fn restore_leaves_a_unit_for_another_home_alone() {
+    let env = Env::new();
+    // A unit for `env.home` is installed (recorded, not run).
+    env.ok(&["service", "install"]);
+    let installed = service_commands(&env.svc);
+    assert!(!installed.is_empty());
+    // Restore a different data directory with the same user home and service root.
+    let other = env.home.parent().unwrap().join("other-home");
+    std::fs::create_dir_all(&other).unwrap();
+    let run = |args: &[&str]| {
+        let mut c = env.cmd(args);
+        c.env("ALICE_HOME", &other);
+        c.output().unwrap()
+    };
+    assert!(
+        run(&["remember", "kept in the other home"])
+            .status
+            .success()
+    );
+    let b = run(&["--json", "backup", "now"]);
+    let name = serde_json::from_slice::<serde_json::Value>(&b.stdout).unwrap()["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let o = run(&["restore", &name, "--yes"]);
+    run(&["daemon", "stop"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        service_commands(&env.svc),
+        installed,
+        "no service command was run for another home's restore"
+    );
+}
+
+/// `alice service install` creates the home and its log directory, which the unit's output
+/// goes to; without it launchd and systemd fail the job at start.
+#[test]
+fn service_install_creates_the_log_directory_of_the_home() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    assert!(!env.home.join("logs").exists());
+    env.ok(&["service", "install"]);
+    assert!(env.home.join("logs").is_dir());
+    assert_eq!(
+        std::fs::metadata(&env.home).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let logs = std::fs::metadata(env.home.join("logs"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        logs & 0o700,
+        0o700,
+        "the owner can write the log directory: {logs:o}"
+    );
+    // A dry run creates nothing.
+    let fresh = Env::new();
+    fresh.ok(&["service", "install", "--dry-run"]);
+    assert!(!fresh.home.join("logs").exists());
+}
+
+/// A loaded unit that cannot be stopped refuses the restore with nothing changed; one that is not
+/// loaded is left alone and the restore goes ahead.
+#[test]
+fn restore_is_refused_when_the_unit_cannot_be_stopped_and_a_daemon_runs() {
+    let env = Env::new();
+    let (stop, start) = stop_start_words();
+    env.ok(&["service", "install"]);
+    env.ok(&["remember", "alpha before the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["remember", "beta after the backup"]);
+    let before = service_commands(&env.svc).len();
+    let mut c = env.cmd(&["restore", &name, "--yes"]);
+    c.env("ALICE_SERVICE_FAIL", stop);
+    let o = c.output().unwrap();
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("could not be stopped") && stderr(&o).contains("nothing was changed"),
+        "{}",
+        stderr(&o)
+    );
+    let log = service_commands(&env.svc);
+    assert_eq!(log.len(), before + 1, "only the failed stop: {log:?}");
+    assert!(!log[before..].iter().any(|l| l.contains(start)), "{log:?}");
+    assert_eq!(env.recall_count("beta"), 1, "nothing was restored");
+    // A unit the manager does not have loaded (the probe fails, whatever the language): nothing
+    // to stop, whether a daemon runs or not; the restore goes on and starts nothing afterwards.
+    let before = service_commands(&env.svc).len();
+    let mut c = env.cmd(&["restore", &name, "--yes"]);
+    c.env("ALICE_SERVICE_FAIL", probe_word());
+    let o = c.output().unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        service_commands(&env.svc).len(),
+        before,
+        "an unloaded unit is neither stopped nor started"
+    );
+}
+
+/// A restore whose swap fails still starts the unit again, and when that fails too both errors
+/// are shown with the command to start the service.
+#[test]
+fn a_failed_swap_still_resumes_the_unit_and_a_failed_resume_is_reported() {
+    let env = Env::new();
+    let (_, start) = stop_start_words();
+    env.ok(&["service", "install"]);
+    env.ok(&["remember", "alpha"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["daemon", "stop"]);
+    // The staged file's name is taken by a directory: the swap cannot stage the backup.
+    let staged = env.home.join(".alice-restore.tmp");
+    std::fs::create_dir(&staged).unwrap();
+    std::fs::write(staged.join("keep"), b"x").unwrap();
+    let before = service_commands(&env.svc).len();
+    let o = env.run(&["restore", &name, "--yes"]);
+    assert!(
+        !o.status.success(),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    let log = service_commands(&env.svc);
+    assert!(
+        log[before..].iter().any(|l| l.contains(start)),
+        "the unit was started again after the failed swap: {log:?}"
+    );
+    // And when the start fails too, the error says both.
+    let mut c = env.cmd(&["restore", &name, "--yes"]);
+    c.env("ALICE_SERVICE_FAIL", start);
+    let o = c.output().unwrap();
+    assert!(!o.status.success());
+    let err = stderr(&o);
+    assert!(
+        err.contains("could not be started again") && err.contains("alice service install"),
+        "{err}"
+    );
 }
 
 /// The terminal's echo is back on after `config set-secret` is killed in the middle of the
@@ -3206,4 +3387,69 @@ fn a_killed_secret_prompt_puts_the_terminal_echo_back() {
     assert_eq!(wrote as usize, answer.len());
     assert!(child.wait().unwrap().success());
     assert!(echo_on(&slave), "echo is back after the answer");
+}
+
+/// In sandbox mode (`ALICE_SERVICE_ROOT`) `service` and `restore` say that nothing is run.
+#[test]
+fn the_service_sandbox_says_so_on_stderr() {
+    let env = Env::new();
+    let o = env.run(&["service", "install"]);
+    assert!(o.status.success());
+    let want = format!(
+        "service commands are recorded in {}, not run (ALICE_SERVICE_ROOT is set)",
+        env.svc.display()
+    );
+    assert!(stderr(&o).contains(&want), "{}", stderr(&o));
+    env.ok(&["remember", "x"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let o = env.run(&["restore", &name, "--yes"]);
+    assert!(o.status.success());
+    assert!(stderr(&o).contains(&want), "{}", stderr(&o));
+    // And an autostarted daemon does not call the variable a typo.
+    let log = std::fs::read_to_string(env.home.join("logs/daemon.log")).unwrap_or_default();
+    assert!(!log.contains("ALICE_SERVICE_ROOT"), "{log}");
+}
+
+/// `alice service status` names the home the unit serves, and says when it is another one.
+#[test]
+fn service_status_names_the_home_the_unit_serves() {
+    let env = Env::new();
+    assert_eq!(env.ok(&["service", "status"]).trim(), "not installed");
+    env.ok(&["service", "install"]);
+    let text = env.ok(&["service", "status"]);
+    assert!(
+        text.starts_with("installed (") && text.contains(&format!("for {}", env.home.display())),
+        "{text}"
+    );
+    let other = env.home.parent().unwrap().join("elsewhere");
+    let o = env
+        .cmd(&["service", "status"])
+        .env("ALICE_HOME", &other)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        text.contains("serves") && text.contains("not this data directory"),
+        "{text}"
+    );
+    let j = env.json(&["service", "status"]);
+    assert_eq!(j["serves_this_home"], true);
+}
+
+/// `--target-dir` still prepares the home's own directories, not the target's.
+#[test]
+fn service_install_with_a_target_dir_creates_the_homes_logs_not_the_targets() {
+    let env = Env::new();
+    let target = env.home.parent().unwrap().join("elsewhere-root");
+    env.ok(&[
+        "service",
+        "install",
+        "--target-dir",
+        target.to_str().unwrap(),
+    ]);
+    assert!(env.home.join("logs").is_dir());
+    assert!(!target.join("logs").exists());
 }
