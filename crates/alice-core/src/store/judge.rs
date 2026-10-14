@@ -132,11 +132,13 @@ pub struct PendingJudgement {
 // Only `pending` rows are ever judged: `skipped` (imported memories) and `retry` (waiting for
 // `requeue_retries`) are left alone. `judge_state <> 'done'` repeats the partial index's term so
 // SQLite uses `memories_judge`.
+// `skipped_cloud` (held back from a remote embedder by the cloud policy) counts as over: the
+// memory is judged without a vector, like a `failed` one.
 // A memory waits for older ones that are still being embedded: it is compared only with older
 // memories, so those must be in the index (and judged) first.
 const PENDING_SQL: &str = "SELECT m.seq, m.id, m.content_hash, m.updated_at, m.project_id, p.slug, m.kind_explicit, m.project_defaulted, m.judge_attempts, m.judge_unavailable
      FROM memories m JOIN projects p ON p.id = m.project_id
-     WHERE m.judge_state <> 'done' AND m.judge_state = 'pending' AND m.embed_state IN ('done', 'failed') AND m.status <> 'trashed'
+     WHERE m.judge_state <> 'done' AND m.judge_state = 'pending' AND m.embed_state IN ('done', 'failed', 'skipped_cloud') AND m.status <> 'trashed'
        AND NOT EXISTS (SELECT 1 FROM memories o WHERE o.seq < m.seq AND o.judge_state <> 'done' AND o.judge_state = 'pending'
                        AND o.embed_state IN ('pending', 'retry') AND o.status <> 'trashed')
      ORDER BY m.seq LIMIT ?1";
@@ -430,6 +432,18 @@ mod tests {
         .unwrap();
         let ids: Vec<String> = pending(&c, 10).unwrap().into_iter().map(|p| p.id).collect();
         assert_eq!(ids, ["A-OLD", "B-NEW"], "oldest first");
+    }
+
+    /// A memory held back from a remote embedder by the cloud policy is past its embedding step:
+    /// the judge takes it (it is judged without a vector), and it does not make newer ones wait.
+    #[test]
+    fn a_memory_held_back_from_the_embedder_is_judged_and_does_not_block_others() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        memory_with(&c, "A-OLD", "pending", "skipped_cloud", "pending", 0);
+        memory_with(&c, "B-NEW", "pending", "done", "pending", 0);
+        let ids: Vec<String> = pending(&c, 10).unwrap().into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, ["A-OLD", "B-NEW"]);
     }
 
     #[test]

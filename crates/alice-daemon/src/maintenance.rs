@@ -22,7 +22,7 @@
 use crate::backup::{self, BackupKind};
 use crate::config::SettingsHandle;
 use crate::paths::AliceHome;
-use crate::service::IndexSlot;
+use crate::service::{ActiveSlot, IndexSlot, snapshot};
 use crate::writer::{WriteOp, WriteOutcome, WriterHandle};
 use alice_core::error::{AliceError, Result};
 use alice_core::settings::{MaintenanceSettings, Retention};
@@ -116,10 +116,13 @@ pub enum Job {
     JudgeRetry,
     MergeSuggestions,
     EventsPrune,
+    /// Delete the vectors and index files of embedding models that were switched away from.
+    ModelPurge,
 }
 
 impl Job {
-    pub const ALL: [Job; 9] = [
+    pub const ALL: [Job; 10] = [
+        Job::ModelPurge,
         Job::JudgeRetry,
         Job::TrashPurge,
         Job::RawRetention,
@@ -142,6 +145,7 @@ impl Job {
             Job::JudgeRetry => "judge_retry",
             Job::MergeSuggestions => "merge_suggestions",
             Job::EventsPrune => "events_prune",
+            Job::ModelPurge => "model_purge",
         }
     }
 
@@ -217,11 +221,11 @@ pub struct MaintenanceCtx {
     pub readers: Arc<ReaderPool>,
     pub writer: WriterHandle,
     pub index: Arc<IndexSlot>,
+    /// The embedding model in force (the index holds its vectors) and its embedder; follows a
+    /// model switch.
+    pub active: Arc<ActiveSlot>,
     pub settings: Arc<SettingsHandle>,
     pub activity: Arc<Activity>,
-    /// The embedding model whose vectors the index holds.
-    pub model: Arc<dyn Fn() -> String + Send + Sync>,
-    pub dim: usize,
     pub judge_wake: crossbeam_channel::Sender<()>,
     /// Set when the daemon is stopping: a job ends at its next slice.
     pub stop: Arc<AtomicBool>,
@@ -638,6 +642,7 @@ impl Scheduler {
                 }
             }
             Job::IndexCheck => self.index_check(),
+            Job::ModelPurge => self.model_purge(sc),
             Job::Backup => self.backup(now),
             Job::MergeSuggestions => self.merge_suggestions(s.judge.cluster_similarity),
         }
@@ -712,8 +717,9 @@ impl Scheduler {
         /// Repairs tried before the difference counts as lasting: the embedding worker and a
         /// purge move the stored vectors while the check reads them.
         const ATTEMPTS: usize = 3;
-        let model = (self.ctx.model)();
-        let Some(idx) = self.ctx.index.read().clone() else {
+        let (active, idx) = snapshot(&self.ctx.active, &self.ctx.index);
+        let (model, dim) = (active.model.clone(), active.embedder.dim());
+        let Some(idx) = idx.filter(|i| i.model() == model) else {
             return Ok(Step::Skipped("index is being rebuilt".into()));
         };
         let (mut added, mut removed) = (0, 0);
@@ -744,12 +750,23 @@ impl Scheduler {
                 Err(e) => why = format!("catching up failed ({e})"),
             }
         }
-        *self.ctx.index.write() = None;
+        // Only while the model checked is still the one in force: a switch that happened
+        // meanwhile put the new model's index in the slot, and that one is not to be dropped.
+        {
+            let a = self.ctx.active.read();
+            if a.model != model {
+                return Ok(Step::Skipped(
+                    "the embedding model changed meanwhile".into(),
+                ));
+            }
+            *self.ctx.index.write() = None;
+        }
         crate::service::spawn_rebuild(
             self.ctx.index.clone(),
+            self.ctx.active.clone(),
             self.ctx.home.db(),
             model,
-            self.ctx.dim,
+            dim,
             None,
         )?;
         Ok(Step::Finished(format!(
@@ -757,13 +774,77 @@ impl Scheduler {
         )))
     }
 
+    /// Daily: the vectors and index files of models the daemon switched away from (listed in
+    /// `meta.purge_model`) go, 500 rows per step. The model in force and the target of a
+    /// re-embed in progress are never purged, whatever the list says.
+    fn model_purge(&self, sc: &mut Scratch) -> Result<Step> {
+        let list = crate::reembed::purge_list(&self.ctx.readers);
+        if list.is_empty() {
+            return Ok(Step::Finished("no model to purge".into()));
+        }
+        let keep_active = self.ctx.active.read().model.clone();
+        let keep_target = self
+            .meta(crate::reembed::TARGET_KEY)
+            .filter(|t| !t.is_empty())
+            .and_then(|t| serde_json::from_str::<alice_core::settings::EmbeddingSettings>(&t).ok())
+            .map(|s| alice_embed::expected_model_id(&s));
+        let (due, wanted): (Vec<String>, Vec<String>) = list
+            .into_iter()
+            .partition(|m| *m != keep_active && Some(m) != keep_target.as_ref());
+        let Some(model) = due.first().cloned() else {
+            return Ok(Step::Finished("the models listed are in use again".into()));
+        };
+        let WriteOutcome::Count(n) =
+            self.ctx
+                .writer
+                .submit_blocking(WriteOp::DeleteModelVectors {
+                    model: model.clone(),
+                    limit: SLICE,
+                })?
+        else {
+            return Err(AliceError::Other("unexpected writer outcome".into()));
+        };
+        if n > 0 {
+            sc.deleted += n;
+            return Ok(Step::More);
+        }
+        let base = self.ctx.home.vector_file(&model);
+        for ext in [
+            "memories.usearch",
+            "chunks.bq",
+            "chunks.usearch",
+            "clean",
+            "usearch.tmp",
+            "bq.tmp",
+        ] {
+            let _ = std::fs::remove_file(base.with_extension(ext));
+        }
+        let rest: Vec<String> = due.into_iter().skip(1).chain(wanted).collect();
+        self.ctx.writer.submit_blocking(WriteOp::SetMeta {
+            key: crate::reembed::PURGE_KEY.into(),
+            value: rest.join("\n"),
+        })?;
+        sc.deleted_other += 1;
+        if rest
+            .iter()
+            .any(|m| *m != keep_active && Some(m) != keep_target.as_ref())
+        {
+            return Ok(Step::More);
+        }
+        Ok(Step::Finished(format!(
+            "purged {} stored vectors and the index files of {} model(s)",
+            sc.deleted, sc.deleted_other
+        )))
+    }
+
     /// Weekly: groups of live memories in one project whose vectors are at least
     /// `judge.cluster_similarity` alike become one `merge` review item (asked once).
     fn merge_suggestions(&self, threshold: f64) -> Result<Step> {
-        let Some(idx) = self.ctx.index.read().clone() else {
+        let (active, idx) = snapshot(&self.ctx.active, &self.ctx.index);
+        let Some(idx) = idx.filter(|i| i.model() == active.model) else {
             return Ok(Step::Skipped("index not ready".into()));
         };
-        let model = (self.ctx.model)();
+        let model = active.model.clone();
         let cursor: i64 = self
             .meta("maint.merge.cursor")
             .and_then(|v| v.parse().ok())
@@ -1025,10 +1106,13 @@ mod tests {
             readers,
             writer: writer.clone(),
             index: index.clone(),
+            active: Arc::new(RwLock::new(Arc::new(crate::service::Active {
+                embedder: Arc::new(alice_core::embed::FakeEmbedder::named("fake", DIM)),
+                model: "fake".into(),
+                vector_path: home.vector_file("fake"),
+            }))),
             settings: settings.clone(),
             activity: activity.clone(),
-            model: Arc::new(|| "fake".to_string()),
-            dim: DIM,
             judge_wake: judge_tx,
             stop: stop.clone(),
             free_space: Arc::new(|_| None),
@@ -1873,7 +1957,29 @@ mod tests {
     /// M-4: a panic in a job is that run's failure.
     #[test]
     fn a_panicking_job_is_a_failed_run_not_a_dead_scheduler() {
-        let r = rig_custom("", |ctx| ctx.model = Arc::new(|| panic!("boom")));
+        /// An embedder whose dimension cannot be read.
+        struct Broken;
+        impl alice_core::embed::Embedder for Broken {
+            fn model_id(&self) -> &str {
+                "fake"
+            }
+            fn dim(&self) -> usize {
+                panic!("boom")
+            }
+            fn embed_passages(&self, _: &[String]) -> Result<Vec<Vec<f32>>> {
+                unreachable!()
+            }
+            fn embed_query(&self, _: &str) -> Result<Vec<f32>> {
+                unreachable!()
+            }
+        }
+        let r = rig_custom("", |ctx| {
+            ctx.active = Arc::new(RwLock::new(Arc::new(crate::service::Active {
+                embedder: Arc::new(Broken),
+                model: "fake".into(),
+                vector_path: ctx.home.vector_file("fake"),
+            })))
+        });
         let report = r.sched.run_job(Job::IndexCheck, chrono::Utc::now(), true);
         assert_eq!(report.outcome, JobOutcome::Failed, "{report:?}");
         assert!(

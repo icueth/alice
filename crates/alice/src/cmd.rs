@@ -1277,6 +1277,25 @@ fn health_notes(h: &Health) -> String {
             e.key, e.message
         ));
     }
+    if !h.embedding_model.is_empty() {
+        out.push_str(&format!("embedding model: {}", h.embedding_model));
+        if let Some(r) = &h.reembed {
+            out.push_str(&format!(
+                " (re-embedding into {}: {} of {})",
+                r.model, r.done, r.total
+            ));
+        }
+        if h.embed_skipped_cloud > 0 {
+            out.push_str(&format!(
+                " · {} rows held back by the cloud policy (searched by words only)",
+                h.embed_skipped_cloud
+            ));
+        }
+        out.push('\n');
+    }
+    if let Some(e) = &h.embedding_error {
+        out.push_str(&format!("WARNING: {e}\n"));
+    }
     if let Some(w) = &h.maintenance_warning {
         out.push_str(&format!("WARNING: {w}\n"));
     }

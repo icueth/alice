@@ -1,0 +1,711 @@
+//! HTTP embedding providers (spec §4.2): OpenAI-compatible `/embeddings` (OpenAI, Ollama's
+//! `/v1`, and other compatible servers) and Voyage (the same shape plus `input_type`). Vectors
+//! are L2-normalised; the dimension is probed once at start.
+//!
+//! What goes over the wire, and what does not:
+//! - The request carries the model, the texts and (Voyage) `input_type`; the key goes only in an
+//!   `Authorization` header that is marked sensitive, built when a request is made. The
+//!   `User-Agent` is `alice/<version>` and nothing else names this machine or its owner.
+//! - An error says which provider, the status and a fixed reason. It never repeats what the
+//!   server sent back (a body may echo a key or a text) and never names the key.
+//! - Passages are retried only on 429, 5xx and timeouts, at most [`RETRIES`] times. A search
+//!   query is tried once, quickly, and after a failure further queries are not sent for a
+//!   while ([`QUERY_COOLDOWN`]), so a provider that is down never makes `recall` wait: it
+//!   answers from word matches.
+//! - Whether texts may be sent at all is the daemon's decision (`Embedder::is_remote` and the
+//!   cloud policy); this module sends what it is given.
+
+use crate::net::{BlockingHttp, HttpError};
+use alice_core::embed::{Embedder, PROVIDER_UNAVAILABLE};
+use alice_core::error::{AliceError, Result};
+use alice_core::normalize::truncate_chars;
+use alice_core::settings::{EmbeddingProvider, endpoint_is_remote};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpProvider {
+    OpenAi,
+    Ollama,
+    Voyage,
+}
+
+impl HttpProvider {
+    pub fn name(self) -> &'static str {
+        match self {
+            HttpProvider::OpenAi => "openai",
+            HttpProvider::Ollama => "ollama",
+            HttpProvider::Voyage => "voyage",
+        }
+    }
+
+    fn default_endpoint(self) -> &'static str {
+        match self {
+            HttpProvider::OpenAi => "https://api.openai.com/v1",
+            HttpProvider::Ollama => "http://127.0.0.1:11434/v1",
+            HttpProvider::Voyage => "https://api.voyageai.com/v1",
+        }
+    }
+
+    fn needs_key(self) -> bool {
+        !matches!(self, HttpProvider::Ollama)
+    }
+
+    /// Most texts one request may carry.
+    fn max_batch(self) -> usize {
+        match self {
+            HttpProvider::Voyage => 128,
+            HttpProvider::OpenAi | HttpProvider::Ollama => 2048,
+        }
+    }
+
+    fn setting(self) -> EmbeddingProvider {
+        match self {
+            HttpProvider::OpenAi => EmbeddingProvider::Openai,
+            HttpProvider::Ollama => EmbeddingProvider::Ollama,
+            HttpProvider::Voyage => EmbeddingProvider::Voyage,
+        }
+    }
+}
+
+pub struct HttpEmbedder {
+    provider: HttpProvider,
+    model: String,
+    id: String,
+    url: String,
+    key: Option<String>,
+    dim: usize,
+    batch: usize,
+    remote: bool,
+    http: BlockingHttp,
+    /// Wait before the first retry (it doubles with each); tests shorten it.
+    backoff: Duration,
+    /// Milliseconds after `epoch` until which queries are not sent (0: none), set by a failed
+    /// query.
+    query_blocked_until: AtomicU64,
+    epoch: Instant,
+}
+
+/// A request for passages gives up after this long.
+const TIMEOUT: Duration = Duration::from_secs(60);
+/// The first request, which only finds the dimension, is shorter: it runs when a model is chosen.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// A search query waits this long for its vector, once.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// After a failed query no query is sent for this long.
+const QUERY_COOLDOWN: Duration = Duration::from_secs(30);
+/// Retries of a request that was answered 429 or 5xx, or timed out.
+const RETRIES: u32 = 3;
+/// The probe is tried once more at most.
+const PROBE_RETRIES: u32 = 1;
+/// A `Retry-After` longer than this is not waited for.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
+/// A text longer than this many characters is cut before it is sent (a provider's own limit is
+/// in tokens and a refused text would fail the whole batch).
+const MAX_TEXT_CHARS: usize = 6_000;
+
+impl HttpEmbedder {
+    /// `endpoint` is the base URL (without `/embeddings`); the provider's own when `None`.
+    /// Asks the provider for one vector to learn the dimension, so a wrong key, model or
+    /// endpoint fails here and not on the first memory.
+    pub fn new(
+        provider: HttpProvider,
+        model: &str,
+        endpoint: Option<&str>,
+        key: Option<String>,
+        batch: usize,
+    ) -> Result<Self> {
+        if provider.needs_key() && key.as_deref().is_none_or(|k| k.trim().is_empty()) {
+            return Err(AliceError::invalid(format!(
+                "the {} embedding provider needs an API key; set it with `alice config set-secret embedding_api_key`",
+                provider.name()
+            )));
+        }
+        let mut base = endpoint
+            .unwrap_or(provider.default_endpoint())
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        // Ollama serves the OpenAI shape under /v1: `http://localhost:11434` means that.
+        if provider == HttpProvider::Ollama
+            && base
+                .split_once("://")
+                .is_some_and(|(_, rest)| !rest.contains('/'))
+        {
+            base.push_str("/v1");
+        }
+        let mut e = Self {
+            provider,
+            model: model.into(),
+            id: format!("{}:{model}", provider.name()),
+            url: format!("{base}/embeddings"),
+            key,
+            dim: 0,
+            batch: batch.clamp(1, provider.max_batch()),
+            remote: endpoint_is_remote(provider.setting(), endpoint),
+            http: BlockingHttp::new(concat!("alice/", env!("CARGO_PKG_VERSION")))
+                .map_err(AliceError::Io)?,
+            backoff: Duration::from_millis(500),
+            query_blocked_until: AtomicU64::new(0),
+            epoch: Instant::now(),
+        };
+        e.dim = e
+            .call(
+                &["dimension probe".to_string()],
+                "query",
+                PROBE_TIMEOUT,
+                PROBE_RETRIES,
+            )?
+            .pop()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if e.dim == 0 {
+            return Err(AliceError::Other(format!(
+                "{} returned an empty vector; check embedding.model",
+                e.id
+            )));
+        }
+        Ok(e)
+    }
+
+    /// The wait before the first retry (it doubles with each). For tests.
+    #[must_use]
+    pub fn with_backoff(mut self, first: Duration) -> Self {
+        self.backoff = first;
+        self
+    }
+
+    /// `texts` (cut to a size providers accept) as the request's `input`.
+    fn inputs(texts: &[String]) -> Vec<String> {
+        texts
+            .iter()
+            .map(|t| {
+                if t.trim().is_empty() {
+                    // Providers refuse an empty string.
+                    "(empty)".to_string()
+                } else {
+                    truncate_chars(t, MAX_TEXT_CHARS)
+                }
+            })
+            .collect()
+    }
+
+    fn call(
+        &self,
+        texts: &[String],
+        input_type: &str,
+        timeout: Duration,
+        retries: u32,
+    ) -> Result<Vec<Vec<f32>>> {
+        let mut body = serde_json::json!({"model": self.model, "input": Self::inputs(texts)});
+        if self.provider == HttpProvider::Voyage {
+            body["input_type"] = serde_json::Value::String(input_type.into());
+        }
+        let bytes = serde_json::to_vec(&body).expect("json");
+        let mut last = String::new();
+        for attempt in 0..=retries {
+            let mut wait = self.backoff.saturating_mul(2u32.saturating_pow(attempt));
+            match self
+                .http
+                .post_json(&self.url, self.key.as_deref(), bytes.clone(), timeout)
+            {
+                Ok(r) if r.status == 200 => return self.parse(&r.body, texts.len()),
+                Ok(r) if r.status == 401 || r.status == 403 => {
+                    return Err(AliceError::Other(format!(
+                        "{PROVIDER_UNAVAILABLE}{} refused the API key ({}); set it with `alice config set-secret embedding_api_key`",
+                        self.id, r.status
+                    )));
+                }
+                Ok(r) if r.status == 429 || r.status >= 500 => {
+                    last = format!("{} answered {}", self.id, r.status);
+                    if let Some(after) = retry_after(&r.headers) {
+                        wait = after.min(MAX_RETRY_AFTER);
+                    }
+                }
+                Ok(r) => {
+                    // Nothing the server said is repeated: a body may echo a key or a text.
+                    return Err(AliceError::Other(format!(
+                        "{} answered {}; check embedding.model and embedding.endpoint",
+                        self.id, r.status
+                    )));
+                }
+                Err(HttpError::Timeout) => last = format!("{} did not answer in time", self.id),
+                Err(HttpError::Connect(_)) => {
+                    last = format!("cannot reach {}", self.id);
+                }
+                Err(HttpError::Build(_)) => {
+                    return Err(AliceError::Other(format!(
+                        "cannot send the request to {}; check embedding.endpoint and the API key",
+                        self.id
+                    )));
+                }
+                Err(HttpError::Other(_)) => {
+                    last = format!("the connection to {} failed", self.id);
+                }
+            }
+            if attempt < retries {
+                std::thread::sleep(wait);
+            }
+        }
+        Err(AliceError::Other(format!(
+            "{PROVIDER_UNAVAILABLE}{last}; memories stay searchable by words and are embedded later"
+        )))
+    }
+
+    fn parse(&self, body: &[u8], expected: usize) -> Result<Vec<Vec<f32>>> {
+        #[derive(serde::Deserialize)]
+        struct Item {
+            index: usize,
+            embedding: Vec<f32>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            data: Vec<Item>,
+        }
+        let mut r: Resp = serde_json::from_slice(body).map_err(|_| {
+            AliceError::Other(format!(
+                "{} sent an answer that could not be read; check embedding.endpoint",
+                self.id
+            ))
+        })?;
+        if r.data.len() != expected {
+            return Err(AliceError::Other(format!(
+                "{} returned {} vectors for {expected} texts",
+                self.id,
+                r.data.len()
+            )));
+        }
+        r.data.sort_by_key(|i| i.index);
+        let mut out = Vec::with_capacity(expected);
+        for (i, item) in r.data.into_iter().enumerate() {
+            if item.index != i {
+                return Err(AliceError::Other(format!(
+                    "{} numbered its vectors wrongly",
+                    self.id
+                )));
+            }
+            if (self.dim != 0 && item.embedding.len() != self.dim)
+                || item.embedding.iter().any(|x| !x.is_finite())
+            {
+                return Err(AliceError::Other(format!(
+                    "{} returned a vector of another size or with invalid numbers; check embedding.model",
+                    self.id
+                )));
+            }
+            let n = item
+                .embedding
+                .iter()
+                .map(|x| x * x)
+                .sum::<f32>()
+                .sqrt()
+                .max(1e-12);
+            out.push(item.embedding.into_iter().map(|x| x / n).collect());
+        }
+        Ok(out)
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64 + 1
+    }
+}
+
+/// `Retry-After` in seconds (the date form is not honoured).
+fn retry_after(headers: &[(String, String)]) -> Option<Duration> {
+    headers
+        .iter()
+        .find(|(k, _)| k == "retry-after")
+        .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+impl Embedder for HttpEmbedder {
+    fn model_id(&self) -> &str {
+        &self.id
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(texts.len());
+        for b in texts.chunks(self.batch) {
+            out.extend(self.call(b, "document", TIMEOUT, RETRIES)?);
+        }
+        Ok(out)
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        if self.query_blocked_until.load(Ordering::Relaxed) > self.now_ms() {
+            return Err(AliceError::Other(format!(
+                "{PROVIDER_UNAVAILABLE}{} did not answer a moment ago; this search used word matches only",
+                self.id
+            )));
+        }
+        let r = self
+            .call(&[text.to_string()], "query", QUERY_TIMEOUT, 0)
+            .and_then(|mut v| v.pop().ok_or_else(|| AliceError::Other("no vector".into())));
+        if r.is_err() {
+            self.query_blocked_until.store(
+                self.now_ms() + QUERY_COOLDOWN.as_millis() as u64,
+                Ordering::Relaxed,
+            );
+        }
+        r
+    }
+
+    fn is_remote(&self) -> bool {
+        self.remote
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    /// One request the mock saw.
+    #[derive(Clone)]
+    struct Seen {
+        head: String,
+        body: serde_json::Value,
+    }
+
+    type Log = Arc<Mutex<Vec<Seen>>>;
+
+    /// A mock OpenAI-compatible server on a thread of its own. `reply(call_index, head, request)`
+    /// answers `(status, body)`; the default one (`mock`) answers 3-dimension vectors
+    /// `[len(text), 1, 0]`, out of order (to check `index` is honoured).
+    fn mock_with(
+        reply: impl Fn(usize, &str, &serde_json::Value) -> (u16, String) + Send + Sync + 'static,
+    ) -> (String, Log) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", l.local_addr().unwrap());
+        let seen: Log = Arc::default();
+        let log = seen.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reply = Arc::new(reply);
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let (log, calls, reply) = (log.clone(), calls.clone(), reply.clone());
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head, body) = loop {
+                        let n = s.read(&mut chunk).unwrap_or(0);
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some(i) = text.find("\r\n\r\n") {
+                            let len: usize = text
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length: ")
+                                        .map(|v| v.trim().parse().unwrap())
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= i + 4 + len {
+                                break (text[..i].to_string(), text[i + 4..].to_string());
+                            }
+                        }
+                        if n == 0 {
+                            return;
+                        }
+                    };
+                    let req: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    log.lock().unwrap().push(Seen {
+                        head: head.clone(),
+                        body: req.clone(),
+                    });
+                    let (status, body) = reply(n, &head, &req);
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 0\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    fn vectors(req: &serde_json::Value) -> String {
+        let inputs = req["input"].as_array().unwrap();
+        let data: Vec<serde_json::Value> = inputs
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, t)| {
+                serde_json::json!({"index": i, "embedding": [t.as_str().unwrap().len() as f32, 1.0, 0.0]})
+            })
+            .collect();
+        serde_json::json!({"data": data}).to_string()
+    }
+
+    /// 401 for the key "bad"; 429 for the first call when asked to.
+    fn mock(first_429: bool) -> (String, Log) {
+        mock_with(move |n, head, req| {
+            if head.to_ascii_lowercase().contains("bearer bad") {
+                (401, "{\"error\":\"bad key\"}".to_string())
+            } else if first_429 && n == 0 {
+                (429, "{}".to_string())
+            } else {
+                (200, vectors(req))
+            }
+        })
+    }
+
+    fn quick(
+        provider: HttpProvider,
+        model: &str,
+        base: &str,
+        key: Option<&str>,
+        batch: usize,
+    ) -> Result<HttpEmbedder> {
+        HttpEmbedder::new(provider, model, Some(base), key.map(String::from), batch)
+            .map(|e| e.with_backoff(Duration::from_millis(5)))
+    }
+
+    #[test]
+    fn embeds_in_order_normalised_with_a_probed_dimension() {
+        let (base, seen) = mock(true);
+        let e = quick(HttpProvider::Voyage, "voyage-3-lite", &base, Some("k"), 2).unwrap();
+        let v = e
+            .embed_passages(&["a".into(), "bbb".into(), "cc".into()])
+            .unwrap();
+        let q = e.embed_query("dddd").unwrap();
+        assert_eq!((e.model_id(), e.dim()), ("voyage:voyage-3-lite", 3));
+        let norm = |x: f32, y: f32| x / (x * x + y * y).sqrt();
+        assert!(
+            (v[1][0] - norm(3.0, 1.0)).abs() < 1e-6,
+            "order follows `index`: {v:?}"
+        );
+        assert!((q[0] - norm(4.0, 1.0)).abs() < 1e-6);
+        let reqs = seen.lock().unwrap();
+        assert!(reqs.iter().any(|r| r.body["input_type"] == "document"));
+        assert!(reqs.iter().any(|r| r.body["input_type"] == "query"));
+        assert!(
+            reqs.iter()
+                .all(|r| r.body["input"].as_array().unwrap().len() <= 2),
+            "batches of batch_size"
+        );
+    }
+
+    #[test]
+    fn a_rejected_key_says_which_secret_to_set_and_ollama_needs_none() {
+        let (base, _) = mock(false);
+        let err = quick(HttpProvider::OpenAi, "m", &base, Some("bad"), 8)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("embedding_api_key"), "{err}");
+        assert!(
+            !err.contains("bad key"),
+            "the server's words are not repeated: {err}"
+        );
+        let ok = quick(HttpProvider::Ollama, "nomic-embed-text", &base, None, 8)
+            .map(|e| e.model_id().to_string())
+            .unwrap();
+        assert_eq!(ok, "ollama:nomic-embed-text");
+        assert!(
+            HttpEmbedder::new(
+                HttpProvider::OpenAi,
+                "m",
+                Some("http://127.0.0.1:9"),
+                None,
+                8
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("embedding_api_key"),
+            "openai needs a key"
+        );
+    }
+
+    #[test]
+    fn the_key_goes_in_a_bearer_header_with_our_user_agent_and_nowhere_else() {
+        let key = concat!("sk-", "emb-header-check-0123456789");
+        let (base, seen) = mock(false);
+        let e = quick(HttpProvider::OpenAi, "m", &base, Some(key), 8).unwrap();
+        e.embed_passages(&["hello".into()]).unwrap();
+        for r in seen.lock().unwrap().iter() {
+            let head = r.head.to_ascii_lowercase();
+            assert!(
+                head.contains(&format!(
+                    "authorization: bearer {}",
+                    key.to_ascii_lowercase()
+                )),
+                "{head}"
+            );
+            assert!(
+                head.contains(&format!("user-agent: alice/{}", env!("CARGO_PKG_VERSION"))),
+                "{head}"
+            );
+            assert!(
+                !r.body.to_string().contains(key),
+                "the key is not in the body"
+            );
+            assert!(
+                !head.starts_with("post /v1/embeddings?"),
+                "no key in the URL: {head}"
+            );
+        }
+    }
+
+    #[test]
+    fn errors_carry_a_status_and_a_fixed_reason_never_the_servers_words() {
+        // A 400 whose body echoes a key and a text.
+        let echo = concat!("sk-", "echoed-by-the-server-9876543210");
+        let (base, _) = mock_with(move |n, _, req| {
+            if n == 0 {
+                (200, vectors(req))
+            } else {
+                (
+                    400,
+                    format!("{{\"error\":\"bad input {echo} secret text\"}}"),
+                )
+            }
+        });
+        let e = quick(HttpProvider::OpenAi, "m", &base, Some("k"), 8).unwrap();
+        let err = e.embed_passages(&["x".into()]).unwrap_err().to_string();
+        assert!(
+            err.contains("400") && err.contains("embedding.model"),
+            "{err}"
+        );
+        assert!(!err.contains(echo) && !err.contains("secret text"), "{err}");
+        // An answer that is not JSON: fixed text, not the parser's.
+        let (base, _) = mock_with(|n, _, req| {
+            if n == 0 {
+                (200, vectors(req))
+            } else {
+                (200, "<html>nope</html>".into())
+            }
+        });
+        let e = quick(HttpProvider::OpenAi, "m", &base, Some("k"), 8).unwrap();
+        let err = e.embed_passages(&["x".into()]).unwrap_err().to_string();
+        assert!(
+            err.contains("could not be read") && !err.contains("html"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_429_5xx_and_timeouts_are_retried_and_only_so_often() {
+        // Always 500: the probe tries twice (one retry) and fails.
+        let (base, seen) = mock_with(|_, _, _| (500, "{}".into()));
+        let err = quick(HttpProvider::Ollama, "m", &base, None, 8)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("500") && err.contains("searchable by words"),
+            "{err}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1 + PROBE_RETRIES as usize);
+        // A 400 is not retried; 500s are retried RETRIES times then given up.
+        let (base, seen) = mock_with(|n, _, req| match n {
+            0 => (200, vectors(req)),
+            _ => (500, "{}".into()),
+        });
+        let e = quick(HttpProvider::Ollama, "m", &base, None, 8).unwrap();
+        assert!(e.embed_passages(&["x".into()]).is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1 + 1 + RETRIES as usize);
+        let (base, seen) = mock_with(|n, _, req| match n {
+            0 => (200, vectors(req)),
+            _ => (404, "{}".into()),
+        });
+        let e = quick(HttpProvider::Ollama, "m", &base, None, 8).unwrap();
+        assert!(e.embed_passages(&["x".into()]).is_err());
+        assert_eq!(seen.lock().unwrap().len(), 2, "a 404 is asked once");
+        // A rejected key is asked once too.
+        let (base, seen) = mock_with(|n, _, req| match n {
+            0 => (200, vectors(req)),
+            _ => (401, "{}".into()),
+        });
+        let e = quick(HttpProvider::OpenAi, "m", &base, Some("k"), 8).unwrap();
+        assert!(e.embed_passages(&["x".into()]).is_err());
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_query_is_not_retried_and_blocks_queries_for_a_while() {
+        let (base, seen) = mock_with(|n, _, req| match n {
+            0 => (200, vectors(req)),
+            _ => (503, "{}".into()),
+        });
+        let e = quick(HttpProvider::Ollama, "m", &base, None, 8).unwrap();
+        let started = Instant::now();
+        assert!(e.embed_query("one").is_err());
+        assert_eq!(seen.lock().unwrap().len(), 2, "one try, no retries");
+        let err = e.embed_query("two").unwrap_err().to_string();
+        assert!(err.contains("word matches"), "{err}");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "nothing was sent during the cool-down"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        // Passages are not held back by it.
+        assert!(e.embed_passages(&["x".into()]).is_err());
+        assert!(seen.lock().unwrap().len() > 2);
+    }
+
+    #[test]
+    fn long_and_empty_texts_are_made_acceptable_and_a_changed_dimension_is_refused() {
+        let (base, seen) = mock(false);
+        let e = quick(HttpProvider::OpenAi, "m", &base, Some("k"), 8).unwrap();
+        e.embed_passages(&["x".repeat(20_000), "  ".into()])
+            .unwrap();
+        let last = seen.lock().unwrap().last().unwrap().body.clone();
+        let inputs = last["input"].as_array().unwrap();
+        assert!(inputs[0].as_str().unwrap().chars().count() <= MAX_TEXT_CHARS + 1);
+        assert_eq!(inputs[1], "(empty)");
+        // The server starts answering 2 numbers where it answered 3.
+        let (base, _) = mock_with(|n, _, req| {
+            if n == 0 {
+                (200, vectors(req))
+            } else {
+                (
+                    200,
+                    serde_json::json!({"data": [{"index": 0, "embedding": [1.0, 2.0]}]})
+                        .to_string(),
+                )
+            }
+        });
+        let e = quick(HttpProvider::OpenAi, "m", &base, Some("k"), 8).unwrap();
+        let err = e.embed_passages(&["x".into()]).unwrap_err().to_string();
+        assert!(err.contains("another size"), "{err}");
+    }
+
+    #[test]
+    fn a_loopback_endpoint_is_local_and_the_providers_own_hosts_are_remote() {
+        let (base, _) = mock(false);
+        let local = quick(HttpProvider::OpenAi, "m", &base, Some("k"), 8).unwrap();
+        assert!(!local.is_remote(), "a server on this machine is local");
+        assert!(endpoint_is_remote(EmbeddingProvider::Openai, None));
+        assert!(endpoint_is_remote(EmbeddingProvider::Voyage, None));
+        assert!(!endpoint_is_remote(EmbeddingProvider::Ollama, None));
+        assert!(endpoint_is_remote(
+            EmbeddingProvider::Ollama,
+            Some("http://192.168.1.20:11434")
+        ));
+    }
+
+    #[test]
+    fn ollama_without_v1_in_its_endpoint_still_reaches_the_embeddings_route() {
+        let (base, seen) = mock(false);
+        let root = base.trim_end_matches("/v1").to_string();
+        let e = quick(HttpProvider::Ollama, "m", &root, None, 8).unwrap();
+        assert!(e.url.ends_with("/v1/embeddings"), "{}", e.url);
+        assert!(
+            seen.lock().unwrap()[0]
+                .head
+                .starts_with("POST /v1/embeddings")
+        );
+    }
+}

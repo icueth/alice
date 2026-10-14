@@ -483,6 +483,13 @@ pub fn embed_query(
 fn embed_failure_level(e: &AliceError) -> tracing::Level {
     match e {
         AliceError::Other(m) if m.starts_with(crate::embed::MODEL_LOADING) => tracing::Level::DEBUG,
+        // A provider that did not answer a moment ago is not asked again for a while; each
+        // search that skips it is not a new event.
+        AliceError::Other(m)
+            if m.starts_with(crate::embed::PROVIDER_UNAVAILABLE) && m.contains("a moment ago") =>
+        {
+            tracing::Level::DEBUG
+        }
         _ => tracing::Level::WARN,
     }
 }

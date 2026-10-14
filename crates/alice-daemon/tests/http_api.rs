@@ -1256,10 +1256,8 @@ async fn the_patch_answer_discloses_a_loosening_and_unused_keys() {
         .await,
     )
     .await;
-    assert!(
-        r["notes"][0].as_str().unwrap().contains("not used yet"),
-        "{r}"
-    );
+    assert_eq!(r["notes"], serde_json::json!([]), "{r}");
+    assert_eq!(r["restart_required"], serde_json::json!([]), "{r}");
     let view: serde_json::Value = s.get_json("/api/v1/settings").await;
     let flag = |k: &str| {
         view["keys"]
@@ -1270,7 +1268,11 @@ async fn the_patch_answer_discloses_a_loosening_and_unused_keys() {
             .unwrap()["not_used_yet"]
             .clone()
     };
-    assert_eq!(flag("embedding.provider"), true);
+    assert_eq!(
+        flag("embedding.provider"),
+        false,
+        "the embedding keys are used now"
+    );
     assert_eq!(flag("embedding.batch_size"), false);
 }
 

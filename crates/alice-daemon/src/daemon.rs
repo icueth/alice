@@ -177,9 +177,6 @@ fn start_and_serve(
         .enable_all()
         .build()?;
     let models = home.models_dir();
-    if !opts.fake_embedder && !alice_embed::is_model_present(&models) {
-        fetch_model(home, &runtime)?;
-    }
     let _ = startup::write_progress(
         home,
         &startup::StartProgress::step("opening the database and loading the embedding model"),
@@ -190,26 +187,40 @@ fn start_and_serve(
         None => SettingsHandle::load(home),
     };
     let started = settings.get();
-    // Queries meanwhile use word matches while the model reloads; the embedding worker waits.
-    // `embedding.idle_unload = 0` keeps the model loaded.
-    let idle_unload = Some(started.embedding.idle_unload.0).filter(|d| !d.is_zero());
+    // The local model is downloaded when it is the one asked for (a remote provider needs none).
+    if !opts.fake_embedder
+        && started.embedding.provider == alice_core::settings::EmbeddingProvider::Local
+        && !alice_embed::is_model_present(&models)
+    {
+        fetch_model(home, &runtime)?;
+    }
+    // `embedding.idle_unload` (0 keeps the local model loaded) reaches the model through the
+    // factory; queries use word matches while a model unloaded for being idle reloads.
     let port = if opts.port != 0 {
         opts.port
     } else {
         started.server.port
     };
     let fake = opts.fake_embedder;
-    let make = move || -> alice_core::Result<Arc<dyn Embedder>> {
-        if fake {
-            Ok(Arc::new(FakeEmbedder::new(384)))
-        } else {
-            Ok(Arc::new(alice_embed::OnnxEmbedder::new(
-                &models,
-                alice_embed::OnnxOptions {
-                    idle_unload,
-                    intra_threads: None,
-                },
-            )?))
+    // The factory builds embedders from `[embedding]`: the local model or an HTTP provider.
+    // Without it (the fake embedder) nothing switches.
+    let factory = (!fake).then(|| alice_embed::factory(models.clone()));
+    // What `Service::start` falls back to when the model in force cannot be built: the
+    // built-in model (or the fake one).
+    let make = {
+        let factory = factory.clone();
+        let embedding = started.embedding.clone();
+        move || -> alice_core::Result<Arc<dyn Embedder>> {
+            match &factory {
+                None => Ok(Arc::new(FakeEmbedder::new(384))),
+                Some(f) => {
+                    let mut s = embedding.clone();
+                    s.provider = alice_core::settings::EmbeddingProvider::Local;
+                    s.model = alice_embed::MODEL_ID.to_string();
+                    s.endpoint = None;
+                    f(&s, None)
+                }
+            }
         }
     };
     let svc = Service::start(
@@ -217,6 +228,7 @@ fn start_and_serve(
         &make,
         ServiceOptions {
             settings: Some(settings),
+            embedder_factory: factory,
             // The daemon reads the real environment (the secrets' status shows a variable).
             ..ServiceOptions::process_env()
         },
