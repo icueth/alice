@@ -12,6 +12,19 @@ The text of every drawer is hand-written below so the relevance grades can be
 reasoned about. Queries name their graded drawers by *key*; keys are resolved to
 the final ids at the end. `audit()` re-checks the grades mechanically (word
 overlap, identifier grep, paraphrase/cross-lingual leak checks).
+
+Grading policy (frozen before any system ran on the corpus):
+- Grade 2 = the drawer fully answers the query (exact/near duplicates of the
+  answer are 2 too; so are transcript chunks that state the whole answer).
+  Grade 1 = partial. For identifier queries grade 1 goes ONLY to chunks that
+  literally contain the token; semantically related chunks stay ungraded.
+- q39 is a deliberate decoy: its query says "Mac", and the cross-compile note
+  (key h02) also contains the literal word "Mac" without answering it.
+- lexical_ok for Thai queries means "the unsegmented text shares character
+  n-grams (>= 4) with a grade-2 drawer", not that a whitespace tokenizer would
+  match; for English it means shared content words.
+- created_at is random except where the drawer carries its own date (diary
+  entries, transcript file names), where it follows that date.
 """
 import json
 import random
@@ -872,7 +885,7 @@ def q(qid, text, category, lexical_ok, relevant):
     Q.append({"id": qid, "q": text, "category": category, "lexical_ok": lexical_ok, "relevant": relevant})
 
 
-q("q01", "Why did we choose zstd instead of xz for backup compression?", "fact", True, {"e02": 2, "c1": 1})
+q("q01", "Why did we choose zstd instead of xz for backup compression?", "fact", True, {"e02": 2, "c1": 2})
 q("q02", "What is the rate limit per API token?", "fact", True, {"e04": 2, "e04_dup": 2})
 q("q03", "How many monthly snapshots does the harbor retention policy keep?", "fact", True, {"e09": 2, "e09_dup": 2})
 q("q04", "How do I rotate API tokens with a grace period?", "fact", True, {"h04": 2})
@@ -880,9 +893,9 @@ q("q05", "What caused the goroutine leak in the websocket hub?", "fact", True, {
 q("q06", "Why did dates show up one day early for users in UTC-8?", "fact", True, {"b06": 2})
 q("q07", "How do I cross-compile harbor for Linux ARM from macOS?", "fact", True, {"h02": 2})
 q("q08", "Which exit code means another backup holds the lock?", "fact", True, {"e12": 2})
-q("q09", "How much did moving to Vite cut the build time?", "fact", True, {"e10": 2, "e1": 1})
+q("q09", "How much did moving to Vite cut the build time?", "fact", True, {"e10": 2, "e1": 2})
 q("q10", "How do I run the k6 load test and with how many virtual users?", "fact", True, {"h11": 2})
-q("q11", "What was the deadlock in the snapshot writer?", "fact", True, {"b10": 2, "a3": 1})
+q("q11", "What was the deadlock in the snapshot writer?", "fact", True, {"b10": 2, "a3": 2})
 q("q12", "Which library replaced Moment.js in the dashboard?", "fact", True, {"e06": 2})
 q("q13", "How do I profile CPU usage in pg_ai with pprof?", "fact", True, {"h07": 2, "h07_dup": 2})
 q("q14", "Why did the chart flicker when the window was resized?", "fact", True, {"b03": 2})
@@ -891,10 +904,10 @@ q("q15", "เหตุผลที่ย้ายที่เก็บเซส�
 q("q16", "ปีขึ้นเป็นปฏิทินพุทธทั้งที่ต้องการ ค.ศ. แก้ยังไง", "thai", True, {"t08": 2})
 q("q17", "ดิสก์เต็มตอนระบบล่มคืนวันเสาร์เพราะอะไร", "thai", True, {"t14": 2})
 q("q18", "อัปโหลดไฟล์ได้สูงสุดกี่เมกะไบต์", "thai", True, {"t12": 2})
-q("q19", "ตัวหนังสือไทยแสดงผลผิดรูปในเอกสารที่ส่งออกเป็นไฟล์พิมพ์", "thai", False, {"t06": 2})
+q("q19", "ตัวหนังสือแสดงผลผิดปกติในเอกสารพร้อมพิมพ์ที่ระบบทำออกมา", "thai", False, {"t06": 2})
 q("q20", "งบคลาวด์รายเดือนตั้งเพดานไว้เท่าไร", "thai", True, {"t25": 2})
 q("q21", "ผู้ใช้กดปุ่มบันทึกซ้ำแล้วเกิดข้อมูลซ้ำ แก้ยังไง", "thai", True, {"t03": 2})
-q("q22", "ถอนงานที่เผลอส่งขึ้นเซิร์ฟเวอร์ โดยที่ไม่ทำลายของเก่า", "thai", False, {"t13": 2})
+q("q22", "ย้อนสิ่งที่เผลอพุชไปแล้วโดยไม่ลบประวัติ", "thai", True, {"t13": 2})
 
 q("q23", "composite index ของ user_id กับ created_at ช่วยให้ query เร็วขึ้นกี่เท่า", "mixed", True, {"m04": 2})
 q("q24", "JWT access token หมดอายุกี่นาที", "mixed", True, {"m06": 2})
@@ -917,9 +930,9 @@ q("q38", "The preferences screen locked up repainting itself non-stop; what was 
 q("q39", "Why was reinstating data onto my Mac rejected?", "paraphrase", False, {"b05": 2})
 q("q40", "Did we ever consider breaking up the codebase into several version-control projects?", "paraphrase", False, {"e07": 2})
 q("q41", "Why did our network connections to a failing dependency never give up?", "paraphrase", False, {"b04": 2})
-q("q42", "What is the procedure for putting a fresh edition in the hands of end users?", "paraphrase", False, {"h09": 2})
+q("q42", "What does it take to get a new edition of the backup tool out to end users?", "paraphrase", False, {"h09": 2})
 
-q("q43", "ทำไมถึงเลือกเครื่องมือเข้ารหัสสำรองข้อมูลตัวใหม่แทนเครื่องมือเก่า", "cross_lingual", False, {"e05": 2})
+q("q43", "ทำไมถึงเลือกเครื่องมือเข้ารหัสสำหรับสำรองข้อมูลตัวใหม่แทนเครื่องมือเก่า", "cross_lingual", False, {"e05": 2})
 q("q44", "ทำไมไม่ใช้ตัวจัดการสถานะส่วนกลางแบบเดิมสำหรับข้อมูลที่ดึงมาจากเซิร์ฟเวอร์", "cross_lingual", False, {"e03": 2})
 q("q45", "ดีบักการทดสอบเบราว์เซอร์โดยดูหน้าจอจริงทีละขั้น", "cross_lingual", False, {"h03": 2})
 
@@ -949,9 +962,13 @@ def build():
         key2id[key] = did
         added_by = "claude" if kind in ("diary", "transcript") else rng.choice(["claude", "user", "user"])
         day = rng.randint(0, 80)
-        created = f"2026-01-{(day % 28) + 1:02d}T{rng.randint(7, 22):02d}:{rng.randint(0, 59):02d}:00Z" if day < 28 else (
-            f"2026-02-{(day % 28) + 1:02d}T{rng.randint(7, 22):02d}:{rng.randint(0, 59):02d}:00Z" if day < 56 else
-            f"2026-03-{(day % 28) + 1:02d}T{rng.randint(7, 22):02d}:{rng.randint(0, 59):02d}:00Z")
+        hh, mm = rng.randint(7, 22), rng.randint(0, 59)
+        own = re.search(r"\d{4}-\d{2}-\d{2}", text if kind == "diary" else (src or "") if kind == "transcript" else "")
+        if own:
+            date = own.group(0)
+        else:
+            date = f"2026-{day // 28 + 1:02d}-{day % 28 + 1:02d}"
+        created = f"{date}T{hh:02d}:{mm:02d}:00Z"
         meta = {"wing": wing, "room": room, "added_by": added_by, "source_file": src, "kind": kind, "created_at": created}
         if chunk is not None:
             meta["chunk_index"] = chunk
@@ -1026,6 +1043,10 @@ def audit(corpus, key2id):
                     problems.append(f"{qq['id']}: shares Thai grams with {id2key[d]}")
             if cat == "cross_lingual" and re.search(r"[A-Za-z]", qq["q"]):
                 problems.append(f"{qq['id']}: Latin letters in a cross-lingual query")
+        elif cat == "thai":
+            shared = any(qt & thai_grams(docs[d]) for d, g in graded.items() if g == 2)
+            if shared != qq["lexical_ok"]:
+                problems.append(f"{qq['id']}: Thai lexical_ok={qq['lexical_ok']} but n-gram share={shared}")
         elif qq["lexical_ok"]:
             if not any(a >= 1 or b >= 1 for a, b in shared_g2) or (cat == "fact" and not any(a >= 2 for a, _ in shared_g2)):
                 problems.append(f"{qq['id']}: lexical_ok but too little overlap {shared_g2}")

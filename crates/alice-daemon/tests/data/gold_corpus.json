@@ -71,7 +71,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-02-25-d8.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-25T13:23:00Z",
+    "created_at": "2026-02-25T13:23:00Z",
     "chunk_index": 4
    }
   },
@@ -339,7 +339,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-02-11-a1.jsonl",
     "kind": "transcript",
-    "created_at": "2026-02-15T17:42:00Z",
+    "created_at": "2026-02-11T17:42:00Z",
     "chunk_index": 4
    }
   },
@@ -376,7 +376,7 @@
     "added_by": "claude",
     "source_file": "sessions/lumen/2026-03-09-f2.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-03T21:18:00Z",
+    "created_at": "2026-03-09T21:18:00Z",
     "chunk_index": 4
    }
   },
@@ -425,7 +425,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-03-02-b7.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-14T14:11:00Z",
+    "created_at": "2026-03-02T14:11:00Z",
     "chunk_index": 0
    }
   },
@@ -450,7 +450,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-01-20-c3.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-09T08:58:00Z",
+    "created_at": "2026-01-20T08:58:00Z",
     "chunk_index": 5
    }
   },
@@ -500,7 +500,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-02-25-d8.jsonl",
     "kind": "transcript",
-    "created_at": "2026-02-08T15:21:00Z",
+    "created_at": "2026-02-25T15:21:00Z",
     "chunk_index": 2
    }
   },
@@ -549,7 +549,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-03-02-b7.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-06T17:17:00Z",
+    "created_at": "2026-03-02T17:17:00Z",
     "chunk_index": 4
    }
   },
@@ -586,7 +586,7 @@
     "added_by": "claude",
     "source_file": "sessions/lumen/2026-02-03-e5.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-11T07:46:00Z",
+    "created_at": "2026-02-03T07:46:00Z",
     "chunk_index": 4
    }
   },
@@ -672,7 +672,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-02-25-d8.jsonl",
     "kind": "transcript",
-    "created_at": "2026-02-20T09:28:00Z",
+    "created_at": "2026-02-25T09:28:00Z",
     "chunk_index": 5
    }
   },
@@ -685,7 +685,7 @@
     "added_by": "claude",
     "source_file": "sessions/lumen/2026-02-03-e5.jsonl",
     "kind": "transcript",
-    "created_at": "2026-02-14T09:07:00Z",
+    "created_at": "2026-02-03T09:07:00Z",
     "chunk_index": 5
    }
   },
@@ -698,7 +698,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-02-11-a1.jsonl",
     "kind": "transcript",
-    "created_at": "2026-02-16T11:52:00Z",
+    "created_at": "2026-02-11T11:52:00Z",
     "chunk_index": 5
    }
   },
@@ -711,7 +711,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-02-11-a1.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-26T19:54:00Z",
+    "created_at": "2026-02-11T19:54:00Z",
     "chunk_index": 0
    }
   },
@@ -724,7 +724,7 @@
     "added_by": "claude",
     "source_file": "sessions/lumen/2026-02-03-e5.jsonl",
     "kind": "transcript",
-    "created_at": "2026-02-18T14:03:00Z",
+    "created_at": "2026-02-03T14:03:00Z",
     "chunk_index": 2
    }
   },
@@ -797,7 +797,7 @@
     "added_by": "claude",
     "source_file": "sessions/lumen/2026-02-03-e5.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-27T10:24:00Z",
+    "created_at": "2026-02-03T10:24:00Z",
     "chunk_index": 1
    }
   },
@@ -835,7 +835,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-02-11-a1.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-13T19:27:00Z",
+    "created_at": "2026-02-11T19:27:00Z",
     "chunk_index": 3
    }
   },
@@ -848,7 +848,7 @@
     "added_by": "claude",
     "source_file": null,
     "kind": "diary",
-    "created_at": "2026-01-16T11:43:00Z"
+    "created_at": "2026-02-25T11:43:00Z"
    }
   },
   {
@@ -872,7 +872,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-01-20-c3.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-06T11:54:00Z",
+    "created_at": "2026-01-20T11:54:00Z",
     "chunk_index": 2
    }
   },
@@ -897,7 +897,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-02-11-a1.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-03T20:53:00Z",
+    "created_at": "2026-02-11T20:53:00Z",
     "chunk_index": 2
    }
   },
@@ -910,7 +910,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-03-02-b7.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-14T15:40:00Z",
+    "created_at": "2026-03-02T15:40:00Z",
     "chunk_index": 3
    }
   },
@@ -960,7 +960,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-02-11-a1.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-15T07:32:00Z",
+    "created_at": "2026-02-11T07:32:00Z",
     "chunk_index": 1
    }
   },
@@ -997,7 +997,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-01-20-c3.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-22T20:01:00Z",
+    "created_at": "2026-01-20T20:01:00Z",
     "chunk_index": 4
    }
   },
@@ -1156,7 +1156,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-02-25-d8.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-02T10:04:00Z",
+    "created_at": "2026-02-25T10:04:00Z",
     "chunk_index": 0
    }
   },
@@ -1207,7 +1207,7 @@
     "added_by": "claude",
     "source_file": "sessions/lumen/2026-03-09-f2.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-28T13:16:00Z",
+    "created_at": "2026-03-09T13:16:00Z",
     "chunk_index": 1
    }
   },
@@ -1220,7 +1220,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-03-02-b7.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-13T15:11:00Z",
+    "created_at": "2026-03-02T15:11:00Z",
     "chunk_index": 5
    }
   },
@@ -1233,7 +1233,7 @@
     "added_by": "claude",
     "source_file": "sessions/lumen/2026-03-09-f2.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-11T07:39:00Z",
+    "created_at": "2026-03-09T07:39:00Z",
     "chunk_index": 3
    }
   },
@@ -1246,7 +1246,7 @@
     "added_by": "claude",
     "source_file": null,
     "kind": "diary",
-    "created_at": "2026-02-26T14:13:00Z"
+    "created_at": "2026-02-11T14:13:00Z"
    }
   },
   {
@@ -1366,7 +1366,7 @@
     "added_by": "claude",
     "source_file": "sessions/lumen/2026-02-03-e5.jsonl",
     "kind": "transcript",
-    "created_at": "2026-02-05T10:51:00Z",
+    "created_at": "2026-02-03T10:51:00Z",
     "chunk_index": 3
    }
   },
@@ -1427,7 +1427,7 @@
     "added_by": "claude",
     "source_file": null,
     "kind": "diary",
-    "created_at": "2026-02-15T12:27:00Z"
+    "created_at": "2026-03-09T12:27:00Z"
    }
   },
   {
@@ -1439,7 +1439,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-01-20-c3.jsonl",
     "kind": "transcript",
-    "created_at": "2026-02-08T20:59:00Z",
+    "created_at": "2026-01-20T20:59:00Z",
     "chunk_index": 0
    }
   },
@@ -1489,7 +1489,7 @@
     "added_by": "claude",
     "source_file": "sessions/lumen/2026-03-09-f2.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-01T13:17:00Z",
+    "created_at": "2026-03-09T13:17:00Z",
     "chunk_index": 0
    }
   },
@@ -1539,7 +1539,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-03-02-b7.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-04T14:56:00Z",
+    "created_at": "2026-03-02T14:56:00Z",
     "chunk_index": 1
    }
   },
@@ -1576,7 +1576,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-02-25-d8.jsonl",
     "kind": "transcript",
-    "created_at": "2026-02-23T15:34:00Z",
+    "created_at": "2026-02-25T15:34:00Z",
     "chunk_index": 3
    }
   },
@@ -1614,7 +1614,7 @@
     "added_by": "claude",
     "source_file": null,
     "kind": "diary",
-    "created_at": "2026-02-28T14:18:00Z"
+    "created_at": "2026-01-20T14:18:00Z"
    }
   },
   {
@@ -1782,7 +1782,7 @@
     "added_by": "claude",
     "source_file": "sessions/lumen/2026-03-09-f2.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-08T22:10:00Z",
+    "created_at": "2026-03-09T22:10:00Z",
     "chunk_index": 2
    }
   },
@@ -1795,7 +1795,7 @@
     "added_by": "claude",
     "source_file": null,
     "kind": "diary",
-    "created_at": "2026-01-26T17:56:00Z"
+    "created_at": "2026-03-02T17:56:00Z"
    }
   },
   {
@@ -1807,7 +1807,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-01-20-c3.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-15T10:51:00Z",
+    "created_at": "2026-01-20T10:51:00Z",
     "chunk_index": 1
    }
   },
@@ -1966,7 +1966,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-02-25-d8.jsonl",
     "kind": "transcript",
-    "created_at": "2026-01-18T20:20:00Z",
+    "created_at": "2026-02-25T20:20:00Z",
     "chunk_index": 1
    }
   },
@@ -2028,7 +2028,7 @@
     "added_by": "claude",
     "source_file": "sessions/harbor/2026-01-20-c3.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-09T10:26:00Z",
+    "created_at": "2026-01-20T10:26:00Z",
     "chunk_index": 3
    }
   },
@@ -2054,7 +2054,7 @@
     "added_by": "claude",
     "source_file": "sessions/pg_ai/2026-03-02-b7.jsonl",
     "kind": "transcript",
-    "created_at": "2026-02-02T16:48:00Z",
+    "created_at": "2026-03-02T16:48:00Z",
     "chunk_index": 2
    }
   },
@@ -2091,7 +2091,7 @@
     "added_by": "claude",
     "source_file": "sessions/lumen/2026-02-03-e5.jsonl",
     "kind": "transcript",
-    "created_at": "2026-03-08T08:15:00Z",
+    "created_at": "2026-02-03T08:15:00Z",
     "chunk_index": 0
    }
   }
@@ -2104,7 +2104,7 @@
    "lexical_ok": true,
    "relevant": {
     "g106": 2,
-    "g117": 1
+    "g117": 2
    }
   },
   {
@@ -2180,7 +2180,7 @@
    "lexical_ok": true,
    "relevant": {
     "g063": 2,
-    "g170": 1
+    "g170": 2
    }
   },
   {
@@ -2199,7 +2199,7 @@
    "lexical_ok": true,
    "relevant": {
     "g039": 2,
-    "g073": 1
+    "g073": 2
    }
   },
   {
@@ -2268,7 +2268,7 @@
   },
   {
    "id": "q19",
-   "q": "ตัวหนังสือไทยแสดงผลผิดรูปในเอกสารที่ส่งออกเป็นไฟล์พิมพ์",
+   "q": "ตัวหนังสือแสดงผลผิดปกติในเอกสารพร้อมพิมพ์ที่ระบบทำออกมา",
    "category": "thai",
    "lexical_ok": false,
    "relevant": {
@@ -2295,9 +2295,9 @@
   },
   {
    "id": "q22",
-   "q": "ถอนงานที่เผลอส่งขึ้นเซิร์ฟเวอร์ โดยที่ไม่ทำลายของเก่า",
+   "q": "ย้อนสิ่งที่เผลอพุชไปแล้วโดยไม่ลบประวัติ",
    "category": "thai",
-   "lexical_ok": false,
+   "lexical_ok": true,
    "relevant": {
     "g047": 2
    }
@@ -2479,7 +2479,7 @@
   },
   {
    "id": "q42",
-   "q": "What is the procedure for putting a fresh edition in the hands of end users?",
+   "q": "What does it take to get a new edition of the backup tool out to end users?",
    "category": "paraphrase",
    "lexical_ok": false,
    "relevant": {
@@ -2488,7 +2488,7 @@
   },
   {
    "id": "q43",
-   "q": "ทำไมถึงเลือกเครื่องมือเข้ารหัสสำรองข้อมูลตัวใหม่แทนเครื่องมือเก่า",
+   "q": "ทำไมถึงเลือกเครื่องมือเข้ารหัสสำหรับสำรองข้อมูลตัวใหม่แทนเครื่องมือเก่า",
    "category": "cross_lingual",
    "lexical_ok": false,
    "relevant": {
