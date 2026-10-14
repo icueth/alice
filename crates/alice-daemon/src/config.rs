@@ -25,7 +25,8 @@
 
 use crate::paths::AliceHome;
 use alice_core::settings::{
-    self, LooseningGate, Resolved, SettingError, Settings, Source, loosened_protections,
+    self, LooseningGate, ProjectSettingsCache, Resolved, SettingError, Settings, Source,
+    loosened_protections,
 };
 use parking_lot::{Mutex, RwLock};
 use std::hash::{Hash, Hasher};
@@ -34,6 +35,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// How often the daemon polls `config.toml`; a look at a project's `.alice.toml` counts as a
+/// poll at most this often.
+pub const SETTINGS_POLL: Duration = Duration::from_secs(2);
 
 /// How long a changed `config.toml` must hold still before it is read as the new settings. An
 /// editor that truncates the file and then writes it is not caught half-way: an empty file is
@@ -332,6 +337,8 @@ pub struct SettingsHandle {
     gate: Mutex<LooseningGate>,
     /// A `config.toml` without errors (or none) has loaded in this process.
     ever_valid: AtomicBool,
+    /// Per-repository `.alice.toml`, failing closed.
+    projects: ProjectSettingsCache,
     /// Serialises reloads and patches.
     write: Mutex<()>,
     changes: tokio::sync::broadcast::Sender<Vec<String>>,
@@ -374,6 +381,7 @@ impl SettingsHandle {
             seen: Mutex::new(Seen::of(&read)),
             gate: Mutex::new(LooseningGate::default()),
             ever_valid: AtomicBool::new(file_errors.is_empty()),
+            projects: ProjectSettingsCache::new(SETTINGS_POLL),
             file,
             env,
             snapshot: RwLock::new(Snapshot::new(resolved)),
@@ -415,6 +423,36 @@ impl SettingsHandle {
     /// all, so the last valid settings (denylist included) remain in force.
     pub fn config_degraded(&self) -> bool {
         !self.ever_valid.load(Ordering::SeqCst)
+    }
+
+    /// May content of `project_slug` go to a cloud provider (the Jev judge, an HTTP embedder)?
+    /// `project_root` is the repository's root when the project has one.
+    ///
+    /// **Tasks 9 and 16 must use only this helper** to decide, once per call that would leave
+    /// the machine; no consumer checks `privacy.cloud_denied_projects`, `.alice.toml` or
+    /// [`config_degraded`](Self::config_degraded) itself. It answers `false` (fail closed) when
+    /// the configuration is degraded, the slug is empty, the global list names the project, the
+    /// project's `.alice.toml` sets `cloud_denied`, or that file is broken, unreadable or blank
+    /// on its first look. A project file that would loosen waits for three spaced looks
+    /// ([`ProjectSettingsCache`]).
+    pub fn cloud_allowed(&self, project_slug: &str, project_root: Option<&Path>) -> bool {
+        self.cloud_allowed_with(project_slug, project_root, &self.projects)
+    }
+
+    /// [`cloud_allowed`](Self::cloud_allowed) over a project cache of the caller's (tests with
+    /// a clock of their own).
+    pub fn cloud_allowed_with(
+        &self,
+        project_slug: &str,
+        project_root: Option<&Path>,
+        projects: &ProjectSettingsCache,
+    ) -> bool {
+        if self.config_degraded() || project_slug.trim().is_empty() {
+            return false;
+        }
+        let project = project_root.map(|root| projects.get(root).settings);
+        let effective = project.unwrap_or_default().apply_to(&self.get().privacy);
+        !effective.is_cloud_denied(project_slug)
     }
 
     /// Ignored `ALICE_*` variables (reported in health and `alice config list`).
@@ -1217,5 +1255,51 @@ mod tests {
             .patch(&one("server.port", serde_json::json!(4545)))
             .unwrap();
         assert!(out.restart_required.is_empty(), "{out:?}");
+    }
+
+    // ------------------------------------------------------------ fix round 2
+
+    /// N4: the one answer Tasks 9 and 16 use.
+    #[test]
+    fn cloud_allowed_combines_degraded_the_global_list_and_the_project_file() {
+        let (_d, h) = home();
+        let repo = tempfile::tempdir().unwrap();
+        write(&h, "[privacy]\ncloud_denied_projects = [\"listed\"]\n");
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert!(s.cloud_allowed("open", None));
+        assert!(!s.cloud_allowed("listed", None), "the global list");
+        assert!(!s.cloud_allowed("", None), "no project, no cloud");
+        // The project's own file.
+        assert!(s.cloud_allowed("open", Some(repo.path())), "no .alice.toml");
+        let alice_toml = repo.path().join(".alice.toml");
+        std::fs::write(&alice_toml, "[privacy]\ncloud_denied = true\n").unwrap();
+        assert!(!s.cloud_allowed("open", Some(repo.path())));
+        // A project file that is broken, or blank on the first look: closed.
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join(".alice.toml"), "[privacy\n").unwrap();
+        assert!(!s.cloud_allowed("open", Some(broken.path())));
+        let blank = tempfile::tempdir().unwrap();
+        std::fs::write(blank.path().join(".alice.toml"), "").unwrap();
+        assert!(!s.cloud_allowed("open", Some(blank.path())));
+        // A degraded configuration allows nothing, whatever the project.
+        write(&h, "[privacy]\ncloud_denied_projects = \"listed\"\n");
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert!(s.config_degraded());
+        assert!(!s.cloud_allowed("open", None));
+        assert!(!s.cloud_allowed("open", Some(tempfile::tempdir().unwrap().path())));
+    }
+
+    #[test]
+    fn cloud_allowed_does_not_open_for_an_emptied_project_file_after_rapid_calls() {
+        let (_d, h) = home();
+        let repo = tempfile::tempdir().unwrap();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        let alice_toml = repo.path().join(".alice.toml");
+        std::fs::write(&alice_toml, "[privacy]\ncloud_denied = true\n").unwrap();
+        assert!(!s.cloud_allowed("p", Some(repo.path())));
+        std::fs::write(&alice_toml, "").unwrap(); // truncated, the writer is not done
+        for _ in 0..50 {
+            assert!(!s.cloud_allowed("p", Some(repo.path())));
+        }
     }
 }

@@ -1106,7 +1106,6 @@ pub fn resolve_salvaging(
         Ok(l) => l,
         Err(e) => return (env_only(), vec![e]),
     };
-    let original = given.clone();
     let mut left_out = Vec::new();
     loop {
         let errs = match resolve_leaves(Ok(given.clone()), env) {
@@ -1134,7 +1133,8 @@ pub fn resolve_salvaging(
         if !progressed {
             // Not about a leaf of the file: keep what privacy needs and is valid.
             left_out.extend(errs);
-            let privacy: Vec<_> = original
+            // `given` holds the leaves as pruned so far: a list keeps its valid entries.
+            let privacy: Vec<_> = given
                 .into_iter()
                 .filter(|(k, _)| k.starts_with("privacy."))
                 .filter(|l| resolve_leaves(Ok(vec![l.clone()]), env).is_ok())
@@ -1750,7 +1750,7 @@ pub struct ProjectLoad {
     pub loosening_pending: bool,
 }
 
-/// Per-repository `.alice.toml` settings that fail closed. Every [`get`](Self::get) is a poll:
+/// Per-repository `.alice.toml` settings that fail closed.
 ///
 /// - a file that is invalid or cannot be read gives `block_secrets` and `cloud_denied` on (and
 ///   the last good custom patterns), plus the error, until it is valid again;
@@ -1758,36 +1758,82 @@ pub struct ProjectLoad {
 ///   deleted file) applies only when the same content is read on [`LOOSEN_POLLS`] polls in a
 ///   row, so a half-written save never switches protections off; until then the last good
 ///   settings stay;
+/// - a look counts as a poll only when at least the cache's interval has passed since the last
+///   counted look at that repository, so many calls inside one truncate-then-write window are
+///   one poll (the interval is the settings poll interval, 2 s in the daemon);
 /// - a file that tightens, or changes nothing protective, applies at once;
-/// - the first look at a repository has nothing to compare with and applies as read.
-#[derive(Debug, Default)]
+/// - the first look at a repository has nothing to compare with and applies as read, except a
+///   blank file: that is not yet "no protections" but a possible half-written save, and it
+///   fails closed until it has been seen on the poll rule. A repository with no file at all
+///   has no project settings, and that applies at once.
 pub struct ProjectSettingsCache {
+    every: Duration,
+    clock: Clock,
     entries: parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, ProjectEntry>>,
 }
 
-#[derive(Debug, Default)]
+type Clock = std::sync::Arc<dyn Fn() -> std::time::Instant + Send + Sync>;
+
+impl std::fmt::Debug for ProjectSettingsCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectSettingsCache")
+            .field("every", &self.every)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ProjectSettingsCache {
+    /// The daemon's 2 s settings poll interval.
+    fn default() -> Self {
+        Self::new(Duration::from_secs(2))
+    }
+}
+
 struct ProjectEntry {
     /// The settings in force and whether their file had content.
     good: Option<(ProjectSettings, bool)>,
     gate: LooseningGate,
+    /// When the last look that counted as a poll was made.
+    last_counted: Option<std::time::Instant>,
 }
 
 impl ProjectSettingsCache {
+    /// A look counts as a poll when `every` has passed since the last one that did.
+    pub fn new(every: Duration) -> Self {
+        Self::with_clock(every, std::sync::Arc::new(std::time::Instant::now))
+    }
+
+    /// [`new`](Self::new) on a clock of the caller's (tests move it by hand).
+    pub fn with_clock(every: Duration, clock: Clock) -> Self {
+        Self {
+            every,
+            clock,
+            entries: Default::default(),
+        }
+    }
+
     pub fn get(&self, root: &Path) -> ProjectLoad {
         let path = root.join(".alice.toml");
         let name = path.display().to_string();
+        let now = (self.clock)();
         let read = read_project_text(&path).and_then(|text| match text {
-            None => Ok((ProjectSettings::default(), false, 0)),
+            None => Ok((ProjectSettings::default(), false, false, 0)),
             Some(t) => {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 t.hash(&mut h);
-                parse_project(&name, &t).map(|p| (p, !t.trim().is_empty(), h.finish()))
+                parse_project(&name, &t).map(|p| (p, true, !t.trim().is_empty(), h.finish()))
             }
         });
         let mut entries = self.entries.lock();
-        let entry = entries.entry(root.to_path_buf()).or_default();
-        let (new, nonempty, fingerprint) = match read {
+        let entry = entries
+            .entry(root.to_path_buf())
+            .or_insert_with(|| ProjectEntry {
+                good: None,
+                gate: LooseningGate::default(),
+                last_counted: None,
+            });
+        let (new, exists, nonempty, fingerprint) = match read {
             Ok(r) => r,
             Err(error) => {
                 entry.gate.reset();
@@ -1799,16 +1845,33 @@ impl ProjectSettingsCache {
                 };
             }
         };
-        let Some((good, good_nonempty)) = &entry.good else {
-            entry.good = Some((new.clone(), nonempty));
-            return ProjectLoad {
-                settings: new,
-                error: None,
-                loosening_pending: false,
-            };
+        if entry.good.is_none() {
+            if exists && !nonempty {
+                // A blank file on the first look: wait for it, closed.
+                entry.good = Some((ProjectSettings::fail_closed(), true));
+            } else {
+                entry.good = Some((new.clone(), nonempty));
+                return ProjectLoad {
+                    settings: new,
+                    error: None,
+                    loosening_pending: false,
+                };
+            }
+        }
+        let (good, good_nonempty) = entry.good.clone().expect("set above");
+        let loosens = good.loosened_by(&new) || (good_nonempty && !nonempty);
+        let counts = entry
+            .last_counted
+            .is_none_or(|t| now.saturating_duration_since(t) >= self.every);
+        let admitted = if !loosens {
+            entry.gate.admit(fingerprint, false)
+        } else if counts {
+            entry.last_counted = Some(now);
+            entry.gate.admit(fingerprint, true)
+        } else {
+            false
         };
-        let loosens = good.loosened_by(&new) || (*good_nonempty && !nonempty);
-        if entry.gate.admit(fingerprint, loosens) {
+        if admitted {
             entry.good = Some((new.clone(), nonempty));
             return ProjectLoad {
                 settings: new,
@@ -1817,7 +1880,7 @@ impl ProjectSettingsCache {
             };
         }
         ProjectLoad {
-            settings: good.clone(),
+            settings: good,
             error: None,
             loosening_pending: true,
         }
@@ -2700,39 +2763,123 @@ mod tests {
         );
     }
 
+    const EVERY: Duration = Duration::from_secs(2);
+
+    /// A cache on a clock the test moves by hand.
+    fn clocked() -> (
+        ProjectSettingsCache,
+        std::sync::Arc<parking_lot::Mutex<std::time::Instant>>,
+    ) {
+        let now = std::sync::Arc::new(parking_lot::Mutex::new(std::time::Instant::now()));
+        let n = now.clone();
+        let cache = ProjectSettingsCache::with_clock(EVERY, std::sync::Arc::new(move || *n.lock()));
+        (cache, now)
+    }
+
+    fn tick(now: &parking_lot::Mutex<std::time::Instant>) {
+        *now.lock() += EVERY;
+    }
+
     #[test]
-    fn a_project_file_that_loosens_must_hold_for_three_polls() {
+    fn a_project_file_that_loosens_must_hold_for_three_spaced_polls() {
         let d = tempfile::tempdir().unwrap();
-        let cache = ProjectSettingsCache::default();
+        let (cache, now) = clocked();
         write_project(d.path(), STRICT);
         assert!(cache.get(d.path()).settings.privacy.cloud_denied);
         // Emptied (a half-written save): the last good one stays for two polls.
         write_project(d.path(), "");
         for _ in 0..2 {
+            tick(&now);
             let l = cache.get(d.path());
             assert!(l.settings.privacy.cloud_denied && l.loosening_pending);
         }
         // Back to the strict content: nothing was applied, and the count is gone.
         write_project(d.path(), STRICT);
+        tick(&now);
         assert!(!cache.get(d.path()).loosening_pending);
         write_project(d.path(), "");
         for _ in 0..2 {
+            tick(&now);
             assert!(cache.get(d.path()).settings.privacy.cloud_denied);
         }
+        tick(&now);
         let l = cache.get(d.path());
         assert!(
             !l.settings.privacy.cloud_denied && !l.loosening_pending,
-            "applied on the third poll in a row"
+            "applied on the third spaced poll in a row"
         );
-        // Tightening applies at once.
+        // Tightening applies at once, with no waiting.
         write_project(d.path(), STRICT);
         assert!(cache.get(d.path()).settings.privacy.cloud_denied);
-        // So does removing a pattern only after three polls; deleting the file counts as emptying.
+        // Deleting the file counts as emptying.
         std::fs::remove_file(d.path().join(".alice.toml")).unwrap();
         for _ in 0..2 {
+            tick(&now);
             assert!(cache.get(d.path()).settings.privacy.block_secrets);
         }
+        tick(&now);
         assert!(!cache.get(d.path()).settings.privacy.block_secrets);
+    }
+
+    /// N1: three looks inside one truncate-then-write window are one poll, not three.
+    #[test]
+    fn rapid_looks_are_one_poll() {
+        let d = tempfile::tempdir().unwrap();
+        let (cache, now) = clocked();
+        write_project(d.path(), STRICT);
+        assert!(cache.get(d.path()).settings.privacy.cloud_denied);
+        write_project(d.path(), "");
+        for i in 0..10 {
+            let l = cache.get(d.path());
+            assert!(
+                l.settings.privacy.cloud_denied && l.loosening_pending,
+                "look {i} applied an emptied file"
+            );
+        }
+        // Spaced looks count: this one was the first (above), two more complete it.
+        tick(&now);
+        assert!(cache.get(d.path()).settings.privacy.cloud_denied);
+        tick(&now);
+        assert!(!cache.get(d.path()).settings.privacy.cloud_denied);
+        // Looks at different repositories do not share a count.
+        let other = tempfile::tempdir().unwrap();
+        write_project(other.path(), STRICT);
+        assert!(cache.get(other.path()).settings.privacy.cloud_denied);
+    }
+
+    /// N3: the first look at a blank file is not "no protections".
+    #[test]
+    fn a_blank_project_file_on_the_first_look_is_not_settled() {
+        let d = tempfile::tempdir().unwrap();
+        let (cache, now) = clocked();
+        write_project(d.path(), "");
+        let l = cache.get(d.path());
+        assert!(l.error.is_none() && l.loosening_pending);
+        assert!(l.settings.privacy.block_secrets && l.settings.privacy.cloud_denied);
+        tick(&now);
+        assert!(cache.get(d.path()).settings.privacy.cloud_denied);
+        tick(&now);
+        let l = cache.get(d.path());
+        assert!(
+            !l.settings.privacy.cloud_denied && !l.loosening_pending,
+            "settled after three spaced looks"
+        );
+        // No file at all is the normal state of most repositories: nothing to wait for.
+        let none = tempfile::tempdir().unwrap();
+        let l = cache.get(none.path());
+        assert_eq!(l.settings, ProjectSettings::default());
+        assert!(!l.loosening_pending);
+    }
+
+    /// N2: the privacy leaves kept after a conflict are the pruned ones.
+    #[test]
+    fn a_conflict_keeps_the_valid_entries_of_a_privacy_list() {
+        let file = "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]+\" }, { name = \"bad\", regex = \"(\" }]\n[judge]\nauto_apply_threshold = 0.4\n";
+        let (r, _) =
+            resolve_salvaging(Some(file), &env(&[("ALICE_JUDGE_REVIEW_THRESHOLD", "0.7")]));
+        assert_eq!(r.settings.privacy.custom_patterns.len(), 1);
+        assert_eq!(r.settings.privacy.custom_patterns[0].name, "ticket");
+        assert_eq!(r.settings.judge.review_threshold, 0.7);
     }
 
     #[test]
