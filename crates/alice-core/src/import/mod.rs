@@ -1,6 +1,7 @@
 //! Importing from other memory systems (MemPalace first).
 
 pub mod chroma;
+pub mod kg;
 pub mod palace;
 pub mod plan;
 pub mod wings;

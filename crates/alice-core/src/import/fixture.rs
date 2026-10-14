@@ -266,3 +266,79 @@ pub fn build_chroma_in(dir: &Path, collection: &str, drawers: &[DrawerSpec]) -> 
     tx.commit().unwrap();
     path
 }
+
+/// One triple row for [`build_kg`]; `None` columns are stored as NULL.
+#[derive(Debug, Clone, Default)]
+pub struct TripleSpec {
+    pub id: String,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
+    pub source_drawer_id: Option<String>,
+    pub extracted_at: Option<String>,
+}
+
+/// A MemPalace `knowledge_graph.sqlite3` with entities `(id, name)` and triples, using the
+/// schema `mempalace/knowledge_graph.py` creates. `legacy_schema` omits `source_drawer_id`,
+/// `adapter_name` and `extracted_at`.
+pub fn build_kg(
+    dir: &Path,
+    entities: &[(&str, &str)],
+    triples: &[TripleSpec],
+    legacy_schema: bool,
+) -> PathBuf {
+    let path = dir.join("knowledge_graph.sqlite3");
+    let conn = Connection::open(&path).unwrap();
+    let tail = if legacy_schema {
+        ""
+    } else {
+        ", source_drawer_id TEXT, adapter_name TEXT, extracted_at TEXT DEFAULT CURRENT_TIMESTAMP"
+    };
+    conn.execute_batch(&format!(
+        "CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT DEFAULT 'unknown',
+             properties TEXT DEFAULT '{{}}', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+         CREATE TABLE triples (id TEXT PRIMARY KEY, subject TEXT NOT NULL, predicate TEXT NOT NULL,
+             object TEXT NOT NULL, valid_from TEXT, valid_to TEXT, confidence REAL DEFAULT 1.0,
+             source_closet TEXT, source_file TEXT{tail});"
+    ))
+    .unwrap();
+    for (id, name) in entities {
+        conn.execute(
+            "INSERT INTO entities (id, name) VALUES (?1, ?2)",
+            params![id, name],
+        )
+        .unwrap();
+    }
+    for t in triples {
+        conn.execute(
+            "INSERT INTO triples (id, subject, predicate, object, valid_from, valid_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                t.id,
+                t.subject,
+                t.predicate,
+                t.object,
+                t.valid_from,
+                t.valid_to
+            ],
+        )
+        .unwrap();
+        if !legacy_schema {
+            conn.execute(
+                "UPDATE triples SET source_drawer_id = ?2, extracted_at = ?3 WHERE id = ?1",
+                params![t.id, t.source_drawer_id, t.extracted_at],
+            )
+            .unwrap();
+        }
+    }
+    path
+}
+
+/// Writes `json` verbatim to `dir/tunnels.json` (tests pass real, flat, or corrupt content).
+pub fn build_tunnels(dir: &Path, json: &str) -> PathBuf {
+    let path = dir.join("tunnels.json");
+    std::fs::write(&path, json).unwrap();
+    path
+}
