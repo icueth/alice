@@ -122,6 +122,13 @@ pub enum WriteOp {
     AssertFact {
         fact: AssertFact,
         actor: Actor,
+        /// `(new, canonical)`: the judge matched the fact's new predicate to an existing one, so
+        /// `new` is mapped to `canonical` (one undoable group with the fact). Skipped if `new`
+        /// has become known since.
+        alias: Option<(String, String)>,
+        /// Created with the fact: the judge saw a similar predicate but was not sure enough to
+        /// map it.
+        review: Option<NewReview>,
     },
     /// Reverse an event (and its group); a changed target yields a review item instead.
     Undo {
@@ -536,16 +543,49 @@ fn assert_fact(
     conn: &Connection,
     fact: &AssertFact,
     actor: &Actor,
+    alias: Option<(String, String)>,
+    review: Option<NewReview>,
     st: &mut State,
 ) -> Result<WriteOutcome> {
     st.matcher = None; // the entity list may change
+    let group = new_id();
+    // The mapping comes first, so the fact below resolves to the canonical predicate. A name
+    // that became known since the judge looked is left alone, and a mapping that no longer
+    // applies never fails the fact.
+    if let Some((new, canonical)) = alias
+        && !fact.predicate.trim().is_empty()
+        && !kg::predicate_exists(conn, &new)?
+    {
+        let h = st.hlc.tick();
+        match kg::map_predicate_recorded(conn, &new, &canonical, &h) {
+            Ok((before, after)) => {
+                let json = |v: &kg::PredicateSnapshot| {
+                    serde_json::to_value(v)
+                        .map_err(|e| AliceError::Other(format!("predicate snapshot: {e}")))
+                };
+                record(
+                    conn,
+                    st,
+                    EventInput {
+                        actor,
+                        action: "predicate.map",
+                        target_type: "predicate",
+                        target_id: &new,
+                        before: Some(json(&before)?),
+                        after: Some(json(&after)?),
+                        group: Some(&group),
+                    },
+                )?;
+            }
+            Err(e) => tracing::warn!(error = %e, "the judge's predicate mapping no longer applies"),
+        }
+    }
     let open = kg::open_relation_ids(conn, &fact.subject, &fact.predicate)?;
     let mut befores = Vec::with_capacity(open.len());
     for id in &open {
         befores.push((id.as_str(), snap_relation(conn, id)?));
     }
     let out = kg::assert_fact(conn, fact, st.hlc.tick())?;
-    let group = new_id();
     for (id, before) in befores {
         let after = snap_relation(conn, id)?;
         if after != before {
@@ -583,6 +623,14 @@ fn assert_fact(
                 group: Some(&group),
             },
         )?;
+    }
+    if let Some(r) = review
+        && let Some(id) = reviews::create(conn, &r)?
+    {
+        st.stream.push(StreamItem::Review {
+            id,
+            review_type: r.kind.as_str().into(),
+        });
     }
     Ok(WriteOutcome::Fact(out))
 }
@@ -1146,7 +1194,12 @@ fn apply(
             update: u,
             actor,
         } => update(conn, &id, &u, &actor, st)?,
-        WriteOp::AssertFact { fact, actor } => assert_fact(conn, &fact, &actor, st)?,
+        WriteOp::AssertFact {
+            fact,
+            actor,
+            alias,
+            review,
+        } => assert_fact(conn, &fact, &actor, alias, review, st)?,
         WriteOp::Undo { event_id, actor } => undo(conn, &event_id, &actor, st)?,
         WriteOp::ResolveReview {
             id,
@@ -2160,6 +2213,8 @@ mod tests {
                 ..Default::default()
             },
             actor: Actor::User,
+            alias: None,
+            review: None,
         })
         .unwrap();
         let seq = store("Hostlink reconnects after sleep");
@@ -2424,6 +2479,8 @@ mod tests {
                     ..Default::default()
                 },
                 actor: Actor::User,
+                alias: None,
+                review: None,
             })
             .unwrap();
         }
@@ -2442,6 +2499,8 @@ mod tests {
                 ..Default::default()
             },
             actor: Actor::Agent("codex".into()),
+            alias: None,
+            review: None,
         })
         .unwrap();
         let n: i64 = f.read("SELECT count(*) FROM events", []);
@@ -2455,6 +2514,8 @@ mod tests {
                 ..Default::default()
             },
             actor: Actor::Agent("codex".into()),
+            alias: None,
+            review: None,
         });
         assert!(
             matches!(ended, Ok(WriteOutcome::Fact(ref o)) if o.ended == 1),
@@ -2999,6 +3060,8 @@ mod tests {
                     ..Default::default()
                 },
                 actor: Actor::User,
+                alias: None,
+                review: None,
             })
             .unwrap();
         }
@@ -3403,6 +3466,8 @@ mod tests {
                     ..Default::default()
                 },
                 actor: Actor::User,
+                alias: None,
+                review: None,
             })
             .unwrap();
         }

@@ -131,6 +131,49 @@ pub fn same_predicate(a: &str, b: &str) -> bool {
     predicate_candidates(a).iter().any(|x| bs.contains(x))
 }
 
+/// The content words of a predicate (stemmed, without `by` and a leading copula) and whether
+/// it is passive: it has a `by`, or starts with a copula and a participle (`is_used`,
+/// `was_deployed_on`; `is_run_on` is not passive, `run` could be anything).
+fn direction_parts(p: &str) -> (Vec<String>, bool) {
+    let key = normalize_predicate(p);
+    let mut words: Vec<&str> = key.split('_').filter(|w| !w.is_empty()).collect();
+    let mut passive = false;
+    if words.len() > 1
+        && matches!(
+            words[0],
+            "is" | "are" | "was" | "were" | "be" | "been" | "get" | "gets"
+        )
+        && ["ed", "en", "wn"].iter().any(|e| words[1].ends_with(e))
+    {
+        words.remove(0);
+        passive = true;
+    }
+    if words.contains(&"by") {
+        words.retain(|w| *w != "by");
+        passive = true;
+    }
+    (words.into_iter().map(stem_word).collect(), passive)
+}
+
+/// Whether two predicates use the same words but read in opposite directions: `depends_on` and
+/// `depended_on_by`, `uses` and `is_used_by`. A name that only differs in direction from an
+/// existing predicate is not the same predicate and is never mapped to it without a person
+/// looking (`is_hosted_on` against `runs_on` uses other words and is not affected).
+pub fn directions_differ(a: &str, b: &str) -> bool {
+    let (wa, pa) = direction_parts(a);
+    let (wb, pb) = direction_parts(b);
+    pa != pb
+        && !wa.is_empty()
+        && wa.len() == wb.len()
+        && wa.iter().zip(&wb).all(|(x, y)| same_word(x, y))
+}
+
+/// Stems that are one word: equal, or one is the other with a `d` (`used` stays `used` because
+/// the stemmer leaves four-letter words alone).
+fn same_word(a: &str, b: &str) -> bool {
+    a == b || a.strip_suffix('d') == Some(b) || b.strip_suffix('d') == Some(a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +251,34 @@ mod tests {
             assert_eq!(s, normalize_predicate(w), "{w}");
         }
         assert_eq!(stem_predicate("uses_ใช้งาน"), "use_ใช้งาน");
+    }
+
+    #[test]
+    fn the_same_words_in_opposite_directions_differ() {
+        for (a, b) in [
+            ("depends_on", "depended_on_by"),
+            ("uses", "is_used_by"),
+            ("uses", "used_by"),
+            ("owns", "owned_by"),
+            ("deploys", "was_deployed_by"),
+            ("uses", "is_used"),
+            ("hosts", "is_hosted"),
+        ] {
+            assert!(directions_differ(a, b), "{a} / {b}");
+            assert!(directions_differ(b, a), "{b} / {a}");
+        }
+        for (a, b) in [
+            ("uses", "use"),
+            ("is_used_by", "used_by"),
+            ("depends_on", "depended_on"),
+            ("is_hosted_on", "runs_on"),
+            ("owns", "deployed_on"),
+            ("contains", "contained_in"),
+            ("runs_on", "is_run_on"),
+            ("is", "was"),
+            ("by", "by"),
+        ] {
+            assert!(!directions_differ(a, b), "{a} / {b}");
+        }
     }
 }

@@ -15,7 +15,8 @@
 use super::verbal::{kind_state, memory_block};
 use super::{
     Choice, Distribution, Judge, JudgeError, JudgeMemory, JudgeResult, ProjectOption, Relation,
-    Rubric, Score, kind_choices, relation_choices, relevance_choices, reverse_relation_choices,
+    Rubric, Score, kind_choices, predicate_question, relation_choices, relevance_choices,
+    reverse_relation_choices,
 };
 use crate::normalize::sha256_hex;
 use crate::redact::Redactor;
@@ -931,10 +932,24 @@ impl Judge for JevJudge {
         Err(JudgeError::Denied)
     }
 
-    /// Refused for the same reason as `classify`.
+    /// Refused for the same reason as `classify`; see [`Judge::match_predicate_in`].
     fn match_predicate(&self, _new: &str, _existing: &[String]) -> JudgeResult<Distribution> {
         self.stats.lock().denied += 1;
         Err(JudgeError::Denied)
+    }
+
+    /// Predicate names are the knowledge graph's vocabulary, which belongs to no project, so
+    /// the call covers `global` and the `projects` given (the project of a memory a fact
+    /// cites): every one must be allowed to the cloud.
+    fn match_predicate_in(
+        &self,
+        projects: &[&str],
+        new: &str,
+        existing: &[String],
+    ) -> JudgeResult<Distribution> {
+        let covered = distinct(projects.iter().copied().chain(std::iter::once(UNSCOPED)));
+        let (state, options) = predicate_question(new, existing);
+        self.classify_in(&covered, &state, &options)
     }
 
     fn compare(&self, new: &JudgeMemory, existing: &[JudgeMemory]) -> JudgeResult<Vec<Relation>> {

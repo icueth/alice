@@ -155,7 +155,10 @@ fn given(field: &Option<String>) -> Option<&str> {
 }
 
 /// A caller's time in the stored form (RFC 3339, UTC, milliseconds). A bare date is midnight UTC.
+/// The year must have four digits (1 to 9999): text order is time order only then. A leap
+/// second (`:60`) is kept as the last millisecond of the minute, so intervals stay ordered.
 fn stored_time(field: &str, raw: &str) -> Result<String> {
+    use chrono::{Datelike, Timelike};
     let s = raw.trim();
     let utc = if let Ok(t) = DateTime::parse_from_rfc3339(s) {
         t.with_timezone(&Utc)
@@ -163,9 +166,20 @@ fn stored_time(field: &str, raw: &str) -> Result<String> {
         day.and_time(NaiveTime::MIN).and_utc()
     } else {
         return Err(AliceError::invalid(format!(
-            "{field} \"{}\" is not a time; use RFC 3339 such as 2026-10-13T09:44:23.391Z or a date such as 2026-10-13",
+            "{field} \"{}\" is not a time; use RFC 3339 with a four-digit year such as 2026-10-13T09:44:23.391Z, or a date such as 2026-10-13",
             truncate_chars(s, 40)
         )));
+    };
+    if !(1..=9999).contains(&utc.year()) {
+        return Err(AliceError::invalid(format!(
+            "{field} \"{}\" has a year outside 1 to 9999; use a four-digit year such as 2026-10-13",
+            truncate_chars(s, 40)
+        )));
+    }
+    let utc = if utc.nanosecond() >= 1_000_000_000 {
+        utc.with_nanosecond(999_000_000).unwrap_or(utc)
+    } else {
+        utc
     };
     Ok(utc.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
@@ -198,6 +212,22 @@ fn ensure_predicate(conn: &Connection, p: &str) -> Result<String> {
     }
     conn.execute("INSERT INTO predicates (name) VALUES (?1)", [p])?;
     Ok(p.to_string())
+}
+
+/// Whether `name` is a predicate of the vocabulary, as written or as an alias of one.
+pub fn predicate_exists(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(canonical_predicate(conn, &normalize_predicate(name))?.is_some())
+}
+
+/// Canonical predicate names, most used first (ties by name).
+pub fn predicate_names(conn: &Connection, limit: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT p.name FROM predicates p LEFT JOIN relations r ON r.predicate = p.name
+         WHERE p.canonical IS NULL GROUP BY p.name ORDER BY count(r.id) DESC, p.name LIMIT ?1",
+    )?;
+    Ok(stmt
+        .query_map([limit as i64], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?)
 }
 
 /// `valid_to` for a relation closed at `?3`. A close time before the relation's start would
@@ -1476,5 +1506,94 @@ mod tests {
             map_predicate(&c, "uses", "unknown_verb", "h5"),
             Err(AliceError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn fact_times_outside_four_digit_years_are_refused_and_leap_seconds_are_clamped() {
+        let (_d, c) = conn();
+        let put = |from: &str| {
+            assert_fact(
+                &c,
+                &AssertFact {
+                    subject: "a".into(),
+                    predicate: "p".into(),
+                    object: "o".into(),
+                    valid_from: Some(from.into()),
+                    ..Default::default()
+                },
+                "h".into(),
+            )
+        };
+        // "10000-01-01T00:00:00Z" fails RFC 3339 parsing (five-digit year) and reaches the
+        // "not a time" branch; the others parse and hit the year guard. Both messages name the fix.
+        for bad in [
+            "+10000-01-01",
+            "10000-01-01T00:00:00Z",
+            "-0001-06-01",
+            "0000-01-01",
+        ] {
+            let e = put(bad).unwrap_err();
+            assert!(e.to_string().contains("four-digit year"), "{bad}: {e}");
+        }
+        assert_eq!(count(&c, "relations"), 0, "nothing was written");
+        let out = put("2026-06-30T23:59:60Z").unwrap();
+        let from: String = c
+            .query_row(
+                "SELECT valid_from FROM relations WHERE id = ?1",
+                [out.relation_id.unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(from, "2026-06-30T23:59:59.999Z");
+    }
+
+    #[test]
+    fn a_leap_second_close_keeps_the_interval_visible() {
+        let (_d, c) = conn();
+        add(&c, "api", "runs_on", "k8s", "2026-06-30T23:59:60Z");
+        let ended = assert_fact(
+            &c,
+            &fact(
+                "api",
+                "runs_on",
+                "k8s",
+                FactAction::End,
+                "2026-06-30T23:59:60Z",
+            ),
+            "h2".into(),
+        )
+        .unwrap();
+        assert_eq!(ended.ended, 1);
+        let t = timeline(&c, "api");
+        assert!(
+            t[0].valid_to.as_deref() > Some(t[0].valid_from.as_str()),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn predicate_names_are_canonical_and_most_used_first() {
+        let (_d, c) = conn();
+        for (p, o) in [
+            ("uses", "SQLite"),
+            ("uses", "Rust"),
+            ("deployed_on", "Coolify"),
+        ] {
+            add(&c, "alice", p, o, "2026-01-01");
+        }
+        assert!(predicate_exists(&c, "Uses").unwrap());
+        assert!(predicate_exists(&c, "deployed on").unwrap());
+        assert!(!predicate_exists(&c, "owns").unwrap());
+        map_predicate(&c, "hosted_on", "deployed_on", "h").unwrap();
+        assert!(
+            predicate_exists(&c, "hosted_on").unwrap(),
+            "an alias counts as known"
+        );
+        assert_eq!(
+            predicate_names(&c, 10).unwrap(),
+            ["uses", "deployed_on"],
+            "aliases are not listed; most used first"
+        );
+        assert_eq!(predicate_names(&c, 1).unwrap(), ["uses"]);
     }
 }

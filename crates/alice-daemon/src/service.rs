@@ -32,7 +32,7 @@ use alice_core::store::history::UndoOutcome;
 use alice_core::store::kg::{self, FactOutcome};
 use alice_core::store::memories::{self, InsertOutcome, NewMemoryInput};
 use alice_core::store::projects::{self, ResolvedProject};
-use alice_core::store::reviews::{self, ReviewItem, ReviewQuery};
+use alice_core::store::reviews::{self, NewReview, ReviewItem, ReviewQuery, ReviewType};
 use alice_core::store::sources::{self, IngestOutcome};
 use alice_core::store::{ReaderPool, VECTOR_READER_CACHE_KIB, open_reader, open_writer};
 use alice_core::vector::VectorIndex;
@@ -53,6 +53,23 @@ const JUDGE_STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a working directory's detected project is reused before git is asked again.
 const DETECT_TTL: Duration = Duration::from_secs(60);
+/// How long `assert_fact` waits for the judge to match a new predicate before the heuristic
+/// decides.
+const PREDICATE_WAIT: Duration = Duration::from_secs(3);
+/// Most similar existing predicates offered to the judge.
+const PREDICATE_CANDIDATES: usize = 10;
+/// Predicate names read to find the similar ones (most used first).
+const PREDICATE_VOCABULARY: usize = 500;
+
+/// What the judge decided for a predicate that is new to the vocabulary.
+#[derive(Default)]
+struct PredicateVerdict {
+    /// `(new, canonical)`: sure enough to map.
+    alias: Option<(String, String)>,
+    /// Similar but not sure: stored as given, and asked in the review inbox.
+    review: Option<NewReview>,
+    suggestion: Option<String>,
+}
 
 /// Reads one environment variable for the secrets' status (tests replace the process's).
 pub type SecretEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -1137,14 +1154,131 @@ impl Service {
         req.subject = redact_field(&r, "subject", &req.subject)?;
         req.predicate = redact_field(&r, "predicate", &req.predicate)?;
         req.object = redact_field(&r, "object", &req.object)?;
+        let verdict = self.match_new_predicate(&req).await;
         match self
             .writer
-            .submit(WriteOp::AssertFact { fact: req, actor })
+            .submit(WriteOp::AssertFact {
+                fact: req,
+                actor,
+                alias: verdict.alias,
+                review: verdict.review,
+            })
             .await?
         {
-            WriteOutcome::Fact(f) => Ok(f),
+            WriteOutcome::Fact(mut f) => {
+                f.suggestion = f.suggestion.or(verdict.suggestion);
+                Ok(f)
+            }
             other => Err(unexpected(other)),
         }
+    }
+
+    /// What the judge makes of a predicate the vocabulary has not seen (spec §5.2): the same
+    /// as an existing one (mapped when sure), or only similar (suggested, and asked in the
+    /// review inbox). Never fails: without an answer the fact is stored as given.
+    async fn match_new_predicate(&self, req: &AssertFactRequest) -> PredicateVerdict {
+        let none = PredicateVerdict::default();
+        let name = kg::normalize_predicate(&req.predicate);
+        if name.is_empty() || req.action == kg::FactAction::End {
+            return none;
+        }
+        let (n, source) = (name.clone(), req.source_memory_id.clone());
+        let looked = self
+            .read(move |c| {
+                if kg::predicate_exists(c, &n)? {
+                    return Ok(None);
+                }
+                let names = kg::predicate_names(c, PREDICATE_VOCABULARY)?;
+                // The project of the memory the fact cites: a cloud judge sees the names only
+                // if that project may go to the cloud.
+                let project: Option<String> = match source {
+                    Some(id) => c
+                        .query_row(
+                            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id
+                             WHERE m.id = ?1 OR m.legacy_id = ?1 ORDER BY m.seq LIMIT 1",
+                            [id],
+                            |r| r.get(0),
+                        )
+                        .optional()?,
+                    None => None,
+                };
+                Ok(Some((names, project)))
+            })
+            .await;
+        let Ok(Some((names, project))) = looked else {
+            return none;
+        };
+        // The most similar names go to the judge; the heuristic only acts on close ones anyway.
+        let mut close: Vec<(String, f64)> = names
+            .into_iter()
+            .map(|p| {
+                let sim = alice_core::judge::text::predicate_similarity(&name, &p);
+                (p, sim)
+            })
+            .collect();
+        close.sort_by(|a, b| b.1.total_cmp(&a.1));
+        close.truncate(PREDICATE_CANDIDATES);
+        let candidates: Vec<String> = close.into_iter().map(|(p, _)| p).collect();
+        if candidates.is_empty() {
+            return none;
+        }
+        let settings = self.settings();
+        let judge = self.judge();
+        let (n, c) = (name.clone(), candidates.clone());
+        let asked = tokio::time::timeout(
+            PREDICATE_WAIT,
+            tokio::task::spawn_blocking(move || {
+                let scope: Vec<&str> = project.as_deref().into_iter().collect();
+                let d = judge.match_predicate_in(&scope, &n, &c);
+                (judge.provider().to_string(), d)
+            }),
+        )
+        .await;
+        let (provider, decision) = match asked {
+            Ok(Ok((provider, Ok(d)))) => (provider, d),
+            // Denied, over budget, failing, slow: the heuristic decides, locally.
+            _ => (
+                "heuristic".to_string(),
+                alice_core::judge::heuristic::HeuristicJudge::default()
+                    .match_predicate(&name, &candidates)
+                    .unwrap_or_default(),
+            ),
+        };
+        let Some((canonical, p)) = decision.best().filter(|(c, _)| c != "none") else {
+            return none;
+        };
+        if !candidates.contains(&canonical) {
+            return none;
+        }
+        let j = &settings.judge;
+        // The same words the other way round (`depends_on`, `depended_on_by`) are a different
+        // predicate: never mapped without a person looking.
+        let reversed = alice_core::judge::text::directions_differ(&name, &canonical);
+        if p >= j.auto_apply_threshold && !reversed {
+            return PredicateVerdict {
+                alias: Some((name, canonical)),
+                ..none
+            };
+        }
+        if p >= j.review_threshold {
+            return PredicateVerdict {
+                suggestion: Some(canonical.clone()),
+                review: Some(NewReview {
+                    kind: ReviewType::Predicate,
+                    payload: serde_json::json!({
+                        "predicate": name,
+                        "canonical": canonical,
+                        "p": p,
+                        "provider": provider,
+                        "reversed": reversed,
+                    }),
+                    confidence: Some(p),
+                    dedupe_key: Some(format!("predicate:{name}")),
+                }),
+                ..none
+            };
+        }
+        none
     }
 
     /// Recorded changes, newest first (spec §5.5). The actor may be a bare agent name
@@ -5084,5 +5218,182 @@ mod tests {
         );
         assert!(!t.mentioned(token), "the token reached the model");
         s.shutdown();
+    }
+
+    // ------------------------------------------------------------------ predicates
+
+    fn fact_req(subject: &str, predicate: &str, object: &str) -> AssertFactRequest {
+        AssertFactRequest {
+            subject: subject.into(),
+            predicate: predicate.into(),
+            object: object.into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_predicate_maps_to_an_identical_stem_or_is_suggested() {
+        let (_d, s) = svc().await;
+        let f = |p: &str, o: &str| fact_req("alice", p, o);
+        s.assert_fact(f("uses", "SQLite")).await.unwrap();
+        s.assert_fact(f("deployed_on", "Coolify")).await.unwrap();
+        // Same stem: the heuristic maps it (an identical predicate is a duplicate).
+        let out = s.assert_fact(f("use", "Rust")).await.unwrap();
+        assert_eq!(
+            (out.predicate.as_str(), out.suggestion.as_deref()),
+            ("uses", None)
+        );
+        // Similar but not the same: stored as given, suggested, and asked in the review inbox.
+        let out = s.assert_fact(f("deployed_to", "Railway")).await.unwrap();
+        assert_eq!(
+            (out.predicate.as_str(), out.suggestion.as_deref()),
+            ("deployed_to", Some("deployed_on"))
+        );
+        let open = s.reviews(ReviewQuery::default()).await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].review_type.as_str(), "predicate");
+        assert_eq!(open[0].payload["canonical"], "deployed_on");
+        // Asking again opens no second item.
+        s.assert_fact(f("deployed_to", "Fly")).await.unwrap();
+        assert_eq!(s.reviews(ReviewQuery::default()).await.unwrap().len(), 1);
+        // An unrelated new predicate: nothing to say.
+        let out = s.assert_fact(f("owns", "a cat")).await.unwrap();
+        assert_eq!(out.suggestion, None);
+        // The mapping is a recorded, undoable event with the fact.
+        let events = s
+            .events(EventsRequest {
+                limit: Some(50),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(events.iter().any(|e| e.action == "predicate.map"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jev_maps_a_paraphrased_predicate_when_sure() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            predicate: Some(("runs_on", 0.93)),
+            ..Default::default()
+        });
+        let (_d, s) = svc_with_jev(t.clone()).await;
+        let f = |p: &str, o: &str| fact_req("api", p, o);
+        s.assert_fact(f("runs_on", "k8s")).await.unwrap();
+        assert_eq!(t.sent(), 0, "a known predicate is not asked about");
+        let out = s.assert_fact(f("is_hosted_on", "fly.io")).await.unwrap();
+        assert_eq!(out.predicate, "runs_on");
+        assert_eq!(t.sent(), 1);
+        let facts = s
+            .facts(FactsRequest {
+                entity: "api".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(facts.facts.iter().all(|f| f.predicate == "runs_on"));
+        assert_eq!(facts.facts.len(), 2);
+        // Later uses of the new name resolve without asking again.
+        s.assert_fact(f("is_hosted_on", "aws")).await.unwrap();
+        assert_eq!(t.sent(), 1);
+    }
+
+    /// F3: the same words the other way round are a different predicate: even a sure judge
+    /// only gets a review item, and the heuristic never reaches the auto-apply threshold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_predicate_that_reads_the_other_way_round_is_never_mapped_without_a_person() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            predicate: Some(("depends_on", 0.97)),
+            ..Default::default()
+        });
+        let (_d, s) = svc_with_jev(t.clone()).await;
+        s.assert_fact(fact_req("api", "depends_on", "postgres"))
+            .await
+            .unwrap();
+        let out = s
+            .assert_fact(fact_req("postgres", "depended_on_by", "api"))
+            .await
+            .unwrap();
+        assert_eq!(t.sent(), 1, "the judge was asked");
+        assert_eq!(out.predicate, "depended_on_by", "stored as given");
+        assert_eq!(out.suggestion.as_deref(), Some("depends_on"));
+        let open = s.reviews(ReviewQuery::default()).await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].review_type.as_str(), "predicate");
+        assert_eq!(open[0].payload["reversed"], true);
+        // The offline heuristic gets the same answer.
+        let (_d2, h) = svc().await;
+        h.assert_fact(fact_req("api", "depends_on", "postgres"))
+            .await
+            .unwrap();
+        let out = h
+            .assert_fact(fact_req("postgres", "depended_on_by", "api"))
+            .await
+            .unwrap();
+        assert_eq!(out.predicate, "depended_on_by");
+        assert_eq!(out.suggestion.as_deref(), Some("depends_on"));
+    }
+
+    /// A fact that cites a memory of a project the cloud may not see keeps its predicate names
+    /// away from the cloud judge; the heuristic decides instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn predicate_names_of_a_denied_project_stay_local() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            predicate: Some(("runs_on", 0.93)),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        let cwd = repo(&d, "filed");
+        std::fs::write(
+            std::path::Path::new(cwd.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        let cited = remember_id(&s, "Client X runs its API on Fly", Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        s.assert_fact(fact_req("api", "runs_on", "k8s"))
+            .await
+            .unwrap();
+        let before = t.sent();
+        let mut req = fact_req("api", "is_hosted_on", "fly.io");
+        req.source_memory_id = Some(cited);
+        let out = s.assert_fact(req).await.unwrap();
+        assert_eq!(t.sent(), before, "nothing from a denied project is sent");
+        assert_eq!(
+            out.predicate, "is_hosted_on",
+            "the heuristic did not match it"
+        );
+        // Without such a source the judge is asked.
+        let out = s
+            .assert_fact(fact_req("api", "is_run_on", "aws"))
+            .await
+            .unwrap();
+        assert_eq!(t.sent(), before + 1);
+        assert_eq!(out.predicate, "runs_on");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_judge_that_fails_or_is_denied_never_fails_the_fact() {
+        let t = crate::judge_http::ScriptedJev::failing(503);
+        let (_d, s) = svc_with_jev(t.clone()).await;
+        s.assert_fact(fact_req("api", "deployed_on", "Coolify"))
+            .await
+            .unwrap();
+        let out = s
+            .assert_fact(fact_req("api", "deploys_on", "Fly"))
+            .await
+            .unwrap();
+        assert_eq!(out.predicate, "deployed_on", "the heuristic decided");
+        s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(0.0)))
+            .unwrap();
+        let before = t.sent();
+        let out = s
+            .assert_fact(fact_req("api", "deploying_on", "Railway"))
+            .await
+            .unwrap();
+        assert_eq!(out.predicate, "deployed_on");
+        assert_eq!(t.sent(), before, "no request against a budget of zero");
     }
 }

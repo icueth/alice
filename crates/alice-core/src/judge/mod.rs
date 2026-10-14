@@ -264,6 +264,23 @@ pub fn kind_choices() -> Vec<Choice> {
     ]
 }
 
+/// The question "which existing predicate means the same?": the state and the options (the
+/// existing names, and `none`).
+pub fn predicate_question(new: &str, existing: &[String]) -> (String, Vec<Choice>) {
+    let options: Vec<Choice> = existing
+        .iter()
+        .map(|p| Choice::new(p, &p.replace('_', " ")))
+        .chain([Choice::new("none", "none of these means the same")])
+        .collect();
+    (
+        format!(
+            "A knowledge-graph relation is named \"{}\". Which existing relation name means the same?",
+            new.replace('_', " ")
+        ),
+        options,
+    )
+}
+
 pub fn relevance_choices() -> Vec<Choice> {
     vec![
         Choice::new(RELEVANCE_ANSWERS, "the result answers the query"),
@@ -332,18 +349,20 @@ pub trait Judge: Send + Sync {
     }
 
     fn match_predicate(&self, new: &str, existing: &[String]) -> JudgeResult<Distribution> {
-        let options: Vec<Choice> = existing
-            .iter()
-            .map(|p| Choice::new(p, &p.replace('_', " ")))
-            .chain([Choice::new("none", "none of these means the same")])
-            .collect();
-        self.classify(
-            &format!(
-                "A knowledge-graph relation is named \"{}\". Which existing relation name means the same?",
-                new.replace('_', " ")
-            ),
-            &options,
-        )
+        let (state, options) = predicate_question(new, existing);
+        self.classify(&state, &options)
+    }
+
+    /// [`match_predicate`](Self::match_predicate) for names that belong to the knowledge graph
+    /// and to `projects` (the projects of the memory a fact cites, if any). A provider that
+    /// sends text away (Jev) needs the scope; the others ignore it.
+    fn match_predicate_in(
+        &self,
+        _projects: &[&str],
+        new: &str,
+        existing: &[String],
+    ) -> JudgeResult<Distribution> {
+        self.match_predicate(new, existing)
     }
 
     /// `query_project` is the project the query was asked from: a provider that sends text
