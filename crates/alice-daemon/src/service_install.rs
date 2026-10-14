@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 pub const LABEL: &str = "dev.alice.daemon";
 /// The systemd user unit's name.
 pub const UNIT: &str = "alice.service";
-/// The scheduled task's name on Windows.
-pub const TASK: &str = "Alice";
+/// The scheduled task's name on Windows: the launchd label, which no unrelated task is likely to
+/// carry (`/F` replaces a task of the same name).
+pub const TASK: &str = LABEL;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -150,7 +151,7 @@ pub fn plan_install(
   <dict><key>ALICE_HOME</key><string>{}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key><string>{}</string>
   <key>StandardErrorPath</key><string>{}</string>
 </dict>
@@ -177,7 +178,7 @@ pub fn plan_install(
         Platform::Linux => {
             let path = unit_path(p, root).expect("Linux has a unit");
             let unit = format!(
-                "[Unit]\nDescription=Alice memory daemon\n\n[Service]\nExecStart={} daemon run\nEnvironment={}\nStandardOutput=append:{}\nStandardError=append:{}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+                "[Unit]\nDescription=Alice memory daemon\nStartLimitIntervalSec=600\nStartLimitBurst=5\n\n[Service]\nExecStart={} daemon run\nEnvironment={}\nStandardOutput=append:{}\nStandardError=append:{}\nRestart=on-failure\nRestartSec=30\n\n[Install]\nWantedBy=default.target\n",
                 systemd_word(&exe_s),
                 systemd_word(&format!("ALICE_HOME={home_s}")),
                 systemd_word(&log),
@@ -369,17 +370,86 @@ pub fn unload(p: Platform, root: &Path, uid: u32, runner: &dyn Runner) -> Result
     Ok(())
 }
 
-/// Stop the installed unit's daemon for the duration of a restore. `Ok(true)`: it was running
-/// and [`resume`] should start it again; `Ok(false)`: no unit (or not loaded), nothing to
-/// resume. A command that fails for another reason is an error: the restore must not go on
-/// with a unit that may start a daemon in the middle of the swap.
-pub fn suspend(p: Platform, root: &Path, uid: u32, runner: &dyn Runner) -> Result<bool> {
-    // Where a unit is a file, its absence means there is nothing to stop; on Windows the task
-    // lives in the Task Scheduler, and `/End` says whether it exists.
-    if unit_path(p, root).is_some() && installed(p, root).is_none() {
+/// The `ALICE_HOME` the installed unit file sets (`None`: no unit file, or none that names one).
+pub fn unit_home(p: Platform, root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(installed(p, root)?).ok()?;
+    match p {
+        Platform::MacOs => {
+            let key = "<key>ALICE_HOME</key><string>";
+            let rest = &text[text.find(key)? + key.len()..];
+            let value = &rest[..rest.find("</string>")?];
+            Some(PathBuf::from(
+                value
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&"),
+            ))
+        }
+        Platform::Linux => {
+            let line = text.lines().find(|l| l.starts_with("Environment="))?;
+            let mut v = line.trim_start_matches("Environment=").to_string();
+            if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+                v = v[1..v.len() - 1]
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\");
+            }
+            let v = v.replace("%%", "%");
+            v.strip_prefix("ALICE_HOME=").map(PathBuf::from)
+        }
+        Platform::Windows => None,
+    }
+}
+
+/// Whether the installed unit file serves `home` (compared after canonicalisation). `false` when
+/// there is no unit file, or it serves another data directory.
+pub fn unit_serves(p: Platform, root: &Path, home: &Path) -> bool {
+    let canon = |x: &Path| std::fs::canonicalize(x).unwrap_or_else(|_| x.to_path_buf());
+    unit_home(p, root).is_some_and(|h| canon(&h) == canon(home))
+}
+
+/// Stop the daemon of the service unit that serves `home`, for the duration of a restore.
+///
+/// - `Ok(true)`: it was stopped; [`resume`] should start it again.
+/// - `Ok(false)`: nothing to stop and nothing to resume: no unit for this home (a unit that
+///   serves another data directory is none of this restore's business), the Windows task does
+///   not exist, or the stop failed but no daemon of this home is alive.
+/// - `Err`: the stop failed and a daemon of this home is alive, so it could be restarted in the
+///   middle of the swap: the restore must not go on.
+///
+/// Nothing here reads the service manager's error text (it is localised): existence is a file
+/// (macOS, Linux) or the exit status of `schtasks /Query` (Windows), and a failed stop is judged
+/// by whether a daemon is alive (`alive`, Alice's own liveness check).
+pub fn suspend(
+    p: Platform,
+    root: &Path,
+    uid: u32,
+    home: &Path,
+    runner: &dyn Runner,
+    alive: &dyn Fn() -> bool,
+) -> Result<bool> {
+    if p == Platform::Windows {
+        let query = vec![
+            "schtasks".to_string(),
+            "/Query".into(),
+            "/TN".into(),
+            TASK.into(),
+        ];
+        if runner.run(&query).is_err() {
+            return Ok(false);
+        }
+    } else if !unit_serves(p, root, home) {
         return Ok(false);
     }
-    run_tolerant(&plan_suspend(p, uid).commands, runner)
+    for c in &plan_suspend(p, uid).commands {
+        if let Err(e) = runner.run(c) {
+            if alive() {
+                return Err(e);
+            }
+            tracing::info!(error = %e, "the service was not running");
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Start the unit's daemon again after [`suspend`].
@@ -601,17 +671,40 @@ mod tests {
         );
     }
 
-    /// `alice restore` stops the unit before the swap and starts it afterwards, with the
-    /// commands of each platform; no unit, no commands.
-    #[test]
-    fn suspend_and_resume_stop_and_start_the_installed_unit_only() {
-        struct Rec(parking_lot::Mutex<Vec<Vec<String>>>);
-        impl Runner for Rec {
-            fn run(&self, cmd: &[String]) -> alice_core::Result<()> {
-                self.0.lock().push(cmd.to_vec());
-                Ok(())
+    /// A runner that records what it is given and fails the commands whose first words match.
+    struct Script {
+        seen: parking_lot::Mutex<Vec<Vec<String>>>,
+        fail: Vec<&'static str>,
+    }
+
+    impl Script {
+        fn new(fail: &[&'static str]) -> Self {
+            Script {
+                seen: Default::default(),
+                fail: fail.to_vec(),
             }
         }
+        fn lines(&self) -> Vec<String> {
+            self.seen.lock().iter().map(|c| c.join(" ")).collect()
+        }
+    }
+
+    impl Runner for Script {
+        fn run(&self, cmd: &[String]) -> alice_core::Result<()> {
+            self.seen.lock().push(cmd.to_vec());
+            let line = cmd.join(" ");
+            if self.fail.iter().any(|f| line.contains(f)) {
+                // Deliberately not English: nothing may depend on the words.
+                return Err(AliceError::Other(format!("`{line}` ล้มเหลว")));
+            }
+            Ok(())
+        }
+    }
+
+    /// `alice restore` stops the unit before the swap and starts it afterwards, with the commands
+    /// of each platform; no unit, no commands.
+    #[test]
+    fn suspend_and_resume_stop_and_start_the_installed_unit_only() {
         let words = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for (platform, stop, start) in [
             (
@@ -626,20 +719,21 @@ mod tests {
             ),
         ] {
             let d = tempfile::tempdir().unwrap();
-            let rec = Rec(Default::default());
+            let rec = Script::new(&[]);
+            let nobody = || false;
             assert!(
-                !suspend(platform, d.path(), 501, &rec).unwrap(),
+                !suspend(platform, d.path(), 501, home().root(), &rec, &nobody).unwrap(),
                 "no unit file, nothing to stop"
             );
-            assert!(rec.0.lock().is_empty(), "{platform:?}");
+            assert!(rec.lines().is_empty(), "{platform:?}");
             apply(
                 &plan_install(platform, d.path(), Path::new("/x/alice"), &home(), 501),
                 None,
             )
             .unwrap();
-            assert!(suspend(platform, d.path(), 501, &rec).unwrap());
+            assert!(suspend(platform, d.path(), 501, home().root(), &rec, &nobody).unwrap());
             resume(platform, d.path(), 501, &rec).unwrap();
-            let seen = rec.0.lock().clone();
+            let seen = rec.seen.lock().clone();
             assert_eq!(seen[0], stop, "{platform:?}");
             assert!(seen[1].contains(&start.to_string()), "{seen:?}");
             assert!(
@@ -647,23 +741,111 @@ mod tests {
                 "the unit stays installed"
             );
         }
-        // Windows: the task is not a file; `/End` on a task that does not exist is "nothing to do".
-        struct NoTask;
-        impl Runner for NoTask {
-            fn run(&self, _: &[String]) -> alice_core::Result<()> {
-                Err(AliceError::Other(
-                    "`schtasks /End /TN Alice` exited with exit code: 1: ERROR: The system cannot find the file specified.".into(),
-                ))
+    }
+
+    /// A unit that serves another data directory is none of this restore's business.
+    #[test]
+    fn a_unit_for_another_home_is_never_stopped() {
+        for platform in [Platform::MacOs, Platform::Linux] {
+            let d = tempfile::tempdir().unwrap();
+            let (a, b) = (d.path().join("home-a"), d.path().join("home-b"));
+            std::fs::create_dir_all(&a).unwrap();
+            std::fs::create_dir_all(&b).unwrap();
+            apply(
+                &plan_install(
+                    platform,
+                    d.path(),
+                    Path::new("/x/alice"),
+                    &AliceHome::new(a.clone()),
+                    501,
+                ),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                unit_home(platform, d.path()),
+                Some(a.clone()),
+                "{platform:?}"
+            );
+            let rec = Script::new(&[]);
+            assert!(!suspend(platform, d.path(), 501, &b, &rec, &|| true).unwrap());
+            assert!(rec.lines().is_empty(), "{platform:?}: nothing stopped");
+            // The same home spelled through a link still matches.
+            #[cfg(unix)]
+            {
+                let link = d.path().join("link-a");
+                std::os::unix::fs::symlink(&a, &link).unwrap();
+                assert!(unit_serves(platform, d.path(), &link));
             }
+            assert!(suspend(platform, d.path(), 501, &a, &rec, &|| false).unwrap());
         }
-        assert!(!suspend(Platform::Windows, Path::new("/x"), 0, &NoTask).unwrap());
-        // A stop that fails for another reason refuses: the restore must not go on.
-        struct Denied;
-        impl Runner for Denied {
-            fn run(&self, _: &[String]) -> alice_core::Result<()> {
-                Err(AliceError::Other("Access is denied".into()))
-            }
+        // A path with a space, a `%` and a `&` survives the unit file (quoting and escaping).
+        let d = tempfile::tempdir().unwrap();
+        let odd = PathBuf::from("/tmp/a b%c&d");
+        for platform in [Platform::MacOs, Platform::Linux] {
+            apply(
+                &plan_install(
+                    platform,
+                    d.path(),
+                    Path::new("/x/alice"),
+                    &AliceHome::new(odd.clone()),
+                    1,
+                ),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                unit_home(platform, d.path()),
+                Some(odd.clone()),
+                "{platform:?}"
+            );
         }
-        assert!(suspend(Platform::Windows, Path::new("/x"), 0, &Denied).is_err());
+    }
+
+    /// Windows: existence is the exit status of `/Query`, a failed `/End` is judged by whether a
+    /// daemon is alive. The failures here carry non-English text on purpose.
+    #[test]
+    fn windows_suspend_keys_on_exit_status_and_liveness_not_on_error_text() {
+        let root = Path::new("/x");
+        let h = Path::new("/h");
+        // Absent: `/Query` fails, nothing else runs (a live daemon of its own is not ours to stop).
+        let rec = Script::new(&["/Query"]);
+        assert!(!suspend(Platform::Windows, root, 0, h, &rec, &|| true).unwrap());
+        assert_eq!(rec.lines().len(), 1);
+        // Present and running: `/End` succeeds; resume would run it again.
+        let rec = Script::new(&[]);
+        assert!(suspend(Platform::Windows, root, 0, h, &rec, &|| true).unwrap());
+        assert_eq!(rec.lines().len(), 2);
+        assert!(rec.lines()[1].contains("/End"));
+        // Present, not running: `/End` fails and no daemon is alive: nothing to stop, nothing to resume.
+        let rec = Script::new(&["/End"]);
+        assert!(!suspend(Platform::Windows, root, 0, h, &rec, &|| false).unwrap());
+        // Present, `/End` fails and a daemon is alive: refuse.
+        let rec = Script::new(&["/End"]);
+        let e = suspend(Platform::Windows, root, 0, h, &rec, &|| true).unwrap_err();
+        assert!(e.to_string().contains("/End"), "{e}");
+        assert_eq!(TASK, "dev.alice.daemon");
+    }
+
+    /// The unit options that keep a daemon that cannot start from looping every few seconds,
+    /// and keep launchd from throttling it.
+    #[test]
+    fn the_units_restart_slowly_and_launchd_does_not_throttle_the_daemon() {
+        let root = PathBuf::from("/tmp/root");
+        let mac = plan_install(Platform::MacOs, &root, Path::new("/x/alice"), &home(), 1);
+        let plist = &mac.files[0].1;
+        assert!(!plist.contains("ProcessType"), "{plist}");
+        assert!(plist.contains("<key>ThrottleInterval</key><integer>30</integer>"));
+        assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
+        let linux = plan_install(Platform::Linux, &root, Path::new("/x/alice"), &home(), 1);
+        let unit = &linux.files[0].1;
+        for want in [
+            "Restart=on-failure",
+            "RestartSec=30",
+            "StartLimitIntervalSec=600",
+            "StartLimitBurst=5",
+        ] {
+            assert!(unit.contains(want), "{want}\n{unit}");
+        }
     }
 }

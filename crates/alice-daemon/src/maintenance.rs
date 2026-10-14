@@ -621,42 +621,45 @@ impl Scheduler {
                 *self.interrupt.lock() = Some(c.get_interrupt_handle());
                 let checked = m::quick_check(&c);
                 *self.interrupt.lock() = None;
-                match checked {
-                    // Stopped by `interrupt_running`, whichever way SQLite reported it.
-                    Err(_) if self.interrupted.load(Ordering::SeqCst) => {
-                        Ok(Step::Stopped("paused: the daemon is stopping".into()))
-                    }
-                    Ok(problems) if problems.is_empty() => {
-                        Ok(Step::Finished("quick_check ok".into()))
-                    }
-                    Ok(problems) => Err(self.damaged(&format!(
-                        "PRAGMA quick_check found damage ({})",
-                        problems.first().cloned().unwrap_or_default()
-                    ))),
-                    Err(AliceError::Db(rusqlite::Error::SqliteFailure(e, _)))
-                        if e.code == rusqlite::ErrorCode::OperationInterrupted =>
-                    {
-                        Ok(Step::Stopped("paused: the daemon is stopping".into()))
-                    }
-                    Err(AliceError::Db(rusqlite::Error::SqliteFailure(e, msg)))
-                        if matches!(
-                            e.code,
-                            rusqlite::ErrorCode::DatabaseCorrupt
-                                | rusqlite::ErrorCode::NotADatabase
-                        ) =>
-                    {
-                        Err(self.damaged(&format!(
-                            "PRAGMA quick_check could not read the database ({})",
-                            msg.unwrap_or_else(|| e.to_string())
-                        )))
-                    }
-                    Err(e) => Err(e),
-                }
+                self.quick_check_step(checked, self.interrupted.load(Ordering::SeqCst))
             }
             Job::IndexCheck => self.index_check(),
             Job::ModelPurge => self.model_purge(sc),
             Job::Backup => self.backup(now),
             Job::MergeSuggestions => self.merge_suggestions(s.judge.cluster_similarity),
+        }
+    }
+
+    /// What the result of `PRAGMA quick_check` means. An interrupt (`interrupted`: the daemon is
+    /// stopping) ends the check as paused, whether SQLite reports `SQLITE_INTERRUPT` or, when it
+    /// lands while the full-text tables are still being set up, "vtable constructor failed". A
+    /// corruption result is never turned into "paused", interrupted or not.
+    fn quick_check_step(&self, checked: Result<Vec<String>>, interrupted: bool) -> Result<Step> {
+        use rusqlite::ErrorCode;
+        let paused = || Ok(Step::Stopped("paused: the daemon is stopping".into()));
+        match checked {
+            Ok(problems) if problems.is_empty() => Ok(Step::Finished("quick_check ok".into())),
+            Ok(problems) => Err(self.damaged(&format!(
+                "PRAGMA quick_check found damage ({})",
+                problems.first().cloned().unwrap_or_default()
+            ))),
+            Err(AliceError::Db(rusqlite::Error::SqliteFailure(e, _)))
+                if e.code == ErrorCode::OperationInterrupted =>
+            {
+                paused()
+            }
+            Err(AliceError::Db(rusqlite::Error::SqliteFailure(e, msg)))
+                if matches!(e.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) =>
+            {
+                Err(self.damaged(&format!(
+                    "PRAGMA quick_check could not read the database ({})",
+                    msg.unwrap_or_else(|| e.to_string())
+                )))
+            }
+            Err(e) if interrupted && e.to_string().contains("vtable constructor failed") => {
+                paused()
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -2063,6 +2066,44 @@ mod tests {
             r.sched.meta("maint.quick_check.last_run").is_none(),
             "an interrupted check is not a run"
         );
+    }
+
+    /// An interrupted check is paused only for an interrupt or the setup failure; a corruption
+    /// result stays damage even while the interrupt flag is set.
+    #[test]
+    fn a_corruption_result_is_damage_even_when_the_check_was_interrupted() {
+        let corrupt = || {
+            AliceError::Db(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                Some("database disk image is malformed".into()),
+            ))
+        };
+        let setup = || {
+            AliceError::Db(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some("vtable constructor failed: chunks_fts".into()),
+            ))
+        };
+        let r = rig();
+        let e = r
+            .sched
+            .quick_check_step(Err(corrupt()), true)
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("writes are stopped"), "{e}");
+        assert!(
+            r.writer.read_only.reason().is_some(),
+            "the writer went read-only"
+        );
+        assert!(r.sched.meta("maint.quick_check.last_error").is_some());
+        // The setup failure is paused while interrupted, and a failure otherwise.
+        let r = rig();
+        assert!(matches!(
+            r.sched.quick_check_step(Err(setup()), true),
+            Ok(Step::Stopped(_))
+        ));
+        assert!(r.sched.quick_check_step(Err(setup()), false).is_err());
+        assert!(r.writer.read_only.reason().is_none());
     }
 
     /// M-6: the backups being behind is a health warning, and shortens the quiet jobs wait for.

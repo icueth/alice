@@ -5106,9 +5106,20 @@ mod tests {
             let s = s.clone();
             tokio::spawn(async move { s.settings_view_async().await })
         };
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // The second view must finish on its own read while the first is still held (it may
+        // not join the held one). If it does not, release the hold after a bounded wait so the
+        // assertions below fail instead of hanging.
+        let until = Instant::now() + Duration::from_secs(5);
+        while !second.is_finished() && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let finished_while_held = second.is_finished();
         store.hold.store(false, Ordering::SeqCst);
         let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert!(
+            finished_while_held,
+            "the second view waited for the held read"
+        );
         assert!(
             !first.secrets["jev_api_key"].set,
             "the first read began before the write"

@@ -112,12 +112,21 @@ pub fn load_or_create_token(home: &AliceHome) -> std::io::Result<String> {
 /// token in place. A running daemon must be told (`POST /api/v1/admin/token/rotate` does both);
 /// rotating under a daemon that does not know would lock every client out.
 pub fn rotate_token(home: &AliceHome) -> std::io::Result<String> {
+    rotate_token_with(home, &write_private)
+}
+
+/// `rotate_token` with the file write passed in (a test makes it fail half-way).
+fn rotate_token_with(
+    home: &AliceHome,
+    write: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<String> {
     let mut buf = [0u8; 32];
     getrandom::fill(&mut buf).map_err(|e| std::io::Error::other(e.to_string()))?;
     let token = hex::encode(buf);
     let tmp = home.root().join(format!("token.{}.tmp", new_id()));
-    write_private(&tmp, token.as_bytes())?;
-    std::fs::rename(&tmp, home.token_file())
+    // Whatever fails (the write, the flush, the rename), the temporary file goes.
+    write(&tmp, token.as_bytes())
+        .and_then(|()| std::fs::rename(&tmp, home.token_file()))
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })
@@ -267,6 +276,26 @@ mod tests {
             .filter(|n| n.starts_with("token.") && n.ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    }
+
+    /// A write that fails half-way (a full disk) leaves the old token and no temporary file.
+    #[test]
+    fn a_failed_write_leaves_no_temporary_token_file() {
+        let (_d, home) = home();
+        let old = load_or_create_token(&home).unwrap();
+        let failing = |path: &Path, bytes: &[u8]| -> std::io::Result<()> {
+            std::fs::write(path, &bytes[..8])?;
+            Err(std::io::Error::other("no space left on device"))
+        };
+        let e = rotate_token_with(&home, &failing).unwrap_err();
+        assert!(e.to_string().contains("no space"), "{e}");
+        assert_eq!(read_token(&home), Some(old));
+        let left = std::fs::read_dir(home.root())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("token."))
+            .count();
+        assert_eq!(left, 0, "no token.*.tmp is left");
     }
 
     /// A rotation that cannot replace the file leaves the old token (and no temporary file).

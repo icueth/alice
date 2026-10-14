@@ -199,6 +199,9 @@ struct AppState {
     token: SharedToken,
     /// One rotation at a time, so the file and the token in memory end up the same.
     rotating: Arc<tokio::sync::Mutex<()>>,
+    /// Ends every event stream opened under the current token: cancelled on a rotation (and a
+    /// child of `shutdown`, so a stopping daemon ends them too).
+    streams: Arc<parking_lot::Mutex<CancellationToken>>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -342,6 +345,9 @@ async fn rotate_token(State(st): State<AppState>) -> ApiResult<serde_json::Value
             ))
         })?;
     *st.token.write() = Arc::from(new);
+    // A stream opened with the old token must not outlive it.
+    let fresh = st.shutdown.child_token();
+    std::mem::replace(&mut *st.streams.lock(), fresh).cancel();
     st.svc.record_token_rotation();
     Ok(Json(serde_json::json!({ "rotated": true })))
 }
@@ -620,7 +626,8 @@ async fn stream(
     State(st): State<AppState>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     use futures::StreamExt;
-    let s = feed(st.svc.clone(), st.shutdown.clone()).map(|item| Ok(sse_event(&item)));
+    let ends = st.streams.lock().clone();
+    let s = feed(st.svc.clone(), ends).map(|item| Ok(sse_event(&item)));
     Sse::new(s).keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE))
 }
 
@@ -631,6 +638,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
     let g = Guard::new(token.clone(), port);
     let state = AppState {
         svc,
+        streams: Arc::new(parking_lot::Mutex::new(shutdown.child_token())),
         shutdown,
         token,
         rotating: Arc::new(tokio::sync::Mutex::new(())),
