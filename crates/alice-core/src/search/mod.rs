@@ -10,7 +10,7 @@ use crate::embed::Embedder;
 use crate::error::{AliceError, Result};
 use crate::model::{Kind, Memory, Status, limits};
 use crate::normalize::{nfc, normalize_topic};
-use crate::store::embeddings::VecKey;
+use crate::store::embeddings::{self, VecKey};
 use crate::store::projects::GLOBAL_ID;
 use crate::store::sources::ChunkRow;
 use crate::store::{ReaderPool, memories, sources};
@@ -30,10 +30,21 @@ const SNIPPET_CHARS: usize = 240;
 /// Only the start of a longer query is searched and embedded (the e5 window is 512 tokens).
 const MAX_QUERY_CHARS: usize = 2_000;
 const MAX_RELATED: usize = 5;
-/// Cosine similarity at which a vector-only match counts as relevant (spec §4.4 step 5), for
-/// multilingual-e5-small. Measured on the gold set with the real model:
+/// The knowledge tier's vector-only policy (spec §4.4 step 5), for multilingual-e5-small, on
+/// the exact cosine of the stored vectors: a candidate at or above [`DEFAULT_RELEVANCE_SURE`]
+/// is relevant; below it, one at or above the rescue floor [`DEFAULT_RELEVANCE_FLOOR`] is
+/// relevant only if it is within [`DEFAULT_RELEVANCE_MARGIN`] of the query's best vector match.
+/// The rescue floor is the highest unrelated similarity of the real-model gold set (0.786) plus
+/// 0.015 of cross-CPU drift, rounded up; sure floor and margin were chosen by leave-one-query-out
+/// on Jev's grades of a synthetic corpus (`docs/benchmarks/m2-jev.md`, "Floor policy chosen in
+/// Task 13"). The gold set with the real model asserts them:
 /// `crates/alice-embed/tests/real_search_quality.rs`.
-pub const DEFAULT_RELEVANCE_FLOOR: f32 = 0.82;
+pub const DEFAULT_RELEVANCE_FLOOR: f32 = 0.805;
+pub const DEFAULT_RELEVANCE_SURE: f32 = 0.825;
+pub const DEFAULT_RELEVANCE_MARGIN: f32 = 0.015;
+/// The raw tier's vector floor (no sure floor, no margin): chunks have not been measured like
+/// memories, so they keep the M1 value.
+pub const CHUNK_RELEVANCE_FLOOR: f32 = 0.82;
 
 /// Which candidate lists recall uses (evaluation only; agents always get `Hybrid`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -57,7 +68,18 @@ pub struct SearchParams {
     pub before: Option<String>,
     pub include_raw: bool,
     pub limit: usize,
+    /// Knowledge tier: the rescue floor, below the sure floor a vector-only candidate needs it
+    /// and the margin.
     pub relevance_floor: f32,
+    /// Knowledge tier: at or above this a vector-only candidate is always relevant (`None`:
+    /// no sure floor).
+    pub relevance_sure: Option<f32>,
+    /// Knowledge tier: below the sure floor a vector-only candidate more than this below the
+    /// best vector similarity among the candidates that pass the filters is dropped (0 = no
+    /// relative cut). A lexical match passes at any similarity.
+    pub relevance_margin: f32,
+    /// Raw tier: its vector floor, nothing else (`None`: `relevance_floor`, as before).
+    pub chunk_floor: Option<f32>,
     pub raw_min_results: usize,
     /// Recency half-lives per kind and for raw chunks (`search.half_life`).
     pub half_lives: HalfLives,
@@ -70,8 +92,11 @@ pub struct SearchOutput {
     pub hits: Vec<Hit>,
     pub related: Vec<RelatedRef>,
     pub raw_fallback: bool,
-    /// Sequence numbers of returned memories (for access counting).
+    /// Sequence numbers of returned memories (for access counting), in hit order.
     pub memory_seqs: Vec<i64>,
+    /// Importance (1 to 5) of each returned memory, parallel to `memory_seqs`: precise mode
+    /// hands it to the judge with the memory.
+    pub memory_importance: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -172,7 +197,10 @@ impl Query<'_> {
         }
     }
 
-    /// Nearest memories. A failure is logged and means no vector candidates.
+    /// Nearest memories, rescored with their stored f16 vectors. The int8 HNSW similarity can
+    /// sit a little low, and the relevance floor compares the exact cosine (as it does for
+    /// chunks). A failure is logged and means no vector candidates; a failed rescoring keeps
+    /// the index's own similarities.
     fn memory_vector_hits(&self) -> Vec<(VecKey, f32)> {
         let (Some(index), Some(v)) = (self.index, self.vector.as_deref()) else {
             return Vec::new();
@@ -180,12 +208,35 @@ impl Query<'_> {
         if self.lists == Lists::LexicalOnly {
             return Vec::new();
         }
-        index
+        let mut hits = index
             .search(v, self.k, KeyFilter::Memories)
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "vector search failed; using word matches only");
                 Vec::new()
-            })
+            });
+        if index.model().is_empty() || hits.is_empty() {
+            return hits;
+        }
+        let keys: Vec<VecKey> = hits.iter().map(|(k, _)| *k).collect();
+        match embeddings::get_many(self.conn, index.model(), &keys) {
+            Ok(stored) => {
+                let exact: HashMap<VecKey, f32> = stored
+                    .into_iter()
+                    .map(|(k, stored)| (k, crate::embed::cosine(v, &stored)))
+                    .collect();
+                for (key, sim) in &mut hits {
+                    if let Some(e) = exact.get(key) {
+                        *sim = *e;
+                    }
+                }
+                // Best first; ties go to the newer memory, as for chunks.
+                hits.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "rescoring memory vectors failed; using the index similarities")
+            }
+        }
+        hits
     }
 
     fn knowledge(&self) -> Candidates {
@@ -337,6 +388,10 @@ struct Scored {
     score: f64,
     relevant: bool,
     matched: Vec<MatchVia>,
+    /// Found by a word, code or trigram list.
+    lexical: bool,
+    /// Cosine similarity of the vector match (negative infinity: none).
+    similarity: f32,
 }
 
 impl Scored {
@@ -552,12 +607,14 @@ pub fn run_with_chunk_reads(
     let mut terms = lexical::content_terms(&normalized);
     terms.extend(lexical::variant_terms(&normalized));
     let mut memory_seqs = Vec::new();
+    let mut memory_importance = Vec::new();
     let mut memory_ids = Vec::new();
     let hits: Vec<Hit> = ranked
         .into_iter()
         .map(|s| {
             if let Row::Memory { seq, memory } = &s.row {
                 memory_seqs.push(*seq);
+                memory_importance.push(memory.importance);
                 memory_ids.push(memory.id.clone());
             }
             s.into_hit(&terms)
@@ -569,6 +626,7 @@ pub fn run_with_chunk_reads(
         related,
         raw_fallback,
         memory_seqs,
+        memory_importance,
     })
 }
 
@@ -613,8 +671,10 @@ impl Filters<'_> {
             out.push(Scored {
                 row,
                 score,
-                relevant: s.lexical || s.similarity >= p.relevance_floor,
+                relevant: false,
                 matched: ordered_via(s),
+                lexical: s.lexical,
+                similarity: s.similarity,
             });
         };
         for (seq, m) in memories::get_by_seqs(conn, &mem_seqs)? {
@@ -669,6 +729,25 @@ impl Filters<'_> {
                 input,
             );
         }
+        // Relevant: a lexical match; for a memory a vector match at the sure floor, or at the
+        // rescue floor and within the margin of the best vector match among what passed the
+        // filters; for a chunk a vector match at the chunk floor.
+        let best_memory = out
+            .iter()
+            .filter(|s| s.is_knowledge())
+            .map(|s| s.similarity)
+            .fold(f32::NEG_INFINITY, f32::max);
+        for s in &mut out {
+            let vector = if s.is_knowledge() {
+                let near_top =
+                    p.relevance_margin <= 0.0 || s.similarity >= best_memory - p.relevance_margin;
+                p.relevance_sure.is_some_and(|sure| s.similarity >= sure)
+                    || (s.similarity >= p.relevance_floor && near_top)
+            } else {
+                s.similarity >= p.chunk_floor.unwrap_or(p.relevance_floor)
+            };
+            s.relevant = s.lexical || vector;
+        }
         out.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
@@ -690,7 +769,7 @@ fn related_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, Strin
 
 /// Up to five memories one hop from the top three results, through links or shared entities.
 /// Results themselves and trashed memories are left out.
-fn related_for(conn: &Connection, ids: &[String]) -> Result<Vec<RelatedRef>> {
+pub fn related_for(conn: &Connection, ids: &[String]) -> Result<Vec<RelatedRef>> {
     let exclude: HashSet<&String> = ids.iter().collect();
     let mut out: Vec<RelatedRef> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -1695,5 +1774,306 @@ mod tests {
             .expect("shared entity");
         assert_eq!(rel.via, "entity:Easypanel");
         assert_eq!(rel.kind, Kind::Warning);
+    }
+
+    // ------------------------------------------------------------------ relevance policy
+
+    /// A unit vector of 8 dimensions whose cosine with `[1, 0, ...]` is `c`.
+    fn at(c: f32) -> Vec<f32> {
+        let mut v = vec![0.0; 8];
+        v[0] = c;
+        v[1] = (1.0 - c * c).sqrt();
+        v
+    }
+
+    /// A store of memories with chosen vectors: `(text, vector in the index, vector stored)`.
+    /// The query `[1, 0, ...]` shares no word with any text, so only the vector list finds them.
+    struct Cos {
+        _d: tempfile::TempDir,
+        c: rusqlite::Connection,
+        idx: VectorIndex,
+        app: projects::ResolvedProject,
+        other: projects::ResolvedProject,
+    }
+
+    impl Cos {
+        fn new() -> Self {
+            let f = fx();
+            Cos {
+                _d: f._d,
+                c: f.c,
+                idx: VectorIndex::for_model("test-model", 8).unwrap(),
+                app: f.app,
+                other: f.other,
+            }
+        }
+
+        fn add(
+            &self,
+            p: &projects::ResolvedProject,
+            text: &str,
+            indexed: f32,
+            stored: f32,
+        ) -> String {
+            let m = memories::prepare(
+                memories::NewMemoryInput {
+                    content: text.into(),
+                    kind: Some(Kind::Fact),
+                    ..Default::default()
+                },
+                p,
+                "h".into(),
+            )
+            .unwrap();
+            let memories::InsertOutcome::New { id, seq } = memories::insert(&self.c, &m).unwrap()
+            else {
+                panic!()
+            };
+            self.idx.upsert(VecKey::Memory(seq), &at(indexed)).unwrap();
+            embeddings::put(&self.c, VecKey::Memory(seq), "test-model", &at(stored)).unwrap();
+            id
+        }
+
+        fn ids(&self, query: &str, floor: f32, margin: f32, project: Option<&str>) -> Vec<String> {
+            self.ids_sure(query, floor, None, margin, project)
+        }
+
+        fn ids_sure(
+            &self,
+            query: &str,
+            floor: f32,
+            sure: Option<f32>,
+            margin: f32,
+            project: Option<&str>,
+        ) -> Vec<String> {
+            let p = SearchParams {
+                query: query.into(),
+                project_filter_id: project.map(String::from),
+                limit: 20,
+                relevance_floor: floor,
+                relevance_margin: margin,
+                relevance_sure: sure,
+                raw_min_results: 0,
+                ..Default::default()
+            };
+            run_with_vector(
+                &self.c,
+                Some(&self.idx),
+                Some(at(1.0)),
+                &Weights::default(),
+                &p,
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .hits
+            .into_iter()
+            .map(|h| h.id)
+            .collect()
+        }
+    }
+
+    /// F1 step 1: the floor compares the exact cosine of the stored f16 vector, not what the
+    /// int8 index reports.
+    #[test]
+    fn the_floor_compares_the_exact_stored_cosine_not_the_index_estimate() {
+        let t = Cos::new();
+        let low_in_index = t.add(&t.app, "alpha one", 0.70, 0.85);
+        let high_in_index = t.add(&t.app, "beta two", 0.95, 0.60);
+        let found = t.ids("qzxv", 0.80, 0.0, None);
+        assert_eq!(found, [low_in_index], "{found:?} (not {high_in_index})");
+    }
+
+    /// F1 step 2: a vector-only match far below the best one is dropped, a word match is not,
+    /// and `0` turns the relative cut off.
+    #[test]
+    fn a_vector_match_far_below_the_best_is_not_relevant_but_a_word_match_stays() {
+        let t = Cos::new();
+        let best = t.add(&t.app, "alpha one", 0.90, 0.90);
+        let near = t.add(&t.app, "beta two", 0.88, 0.88);
+        let far = t.add(&t.app, "gamma three", 0.82, 0.82);
+        let below_floor = t.add(&t.app, "delta four", 0.70, 0.70);
+        assert_eq!(
+            t.ids("qzxv", 0.79, 0.03, None),
+            [best.clone(), near.clone()]
+        );
+        assert_eq!(
+            t.ids("qzxv", 0.79, 0.0, None),
+            [best.clone(), near.clone(), far.clone()],
+            "no relative cut: only the floor decides"
+        );
+        assert!(!t.ids("qzxv", 0.79, 0.0, None).contains(&below_floor));
+        // The same memories found by a word pass at any similarity, and still count towards the
+        // best similarity of the query.
+        let t = Cos::new();
+        let best = t.add(&t.app, "needle alpha", 0.90, 0.90);
+        let far_word = t.add(&t.app, "needle beta", 0.60, 0.60);
+        let far = t.add(&t.app, "gamma three", 0.82, 0.82);
+        let found = t.ids("needle", 0.79, 0.03, None);
+        assert!(
+            found.contains(&best) && found.contains(&far_word),
+            "{found:?}"
+        );
+        assert!(!found.contains(&far), "{found:?}");
+    }
+
+    /// The best similarity is taken among the candidates that pass the filters: the best
+    /// match of another project does not cut this project's matches.
+    #[test]
+    fn the_relative_cut_looks_at_the_best_match_that_passes_the_filters() {
+        let t = Cos::new();
+        let elsewhere = t.add(&t.other, "alpha elsewhere", 0.95, 0.95);
+        let here = t.add(&t.app, "beta here", 0.84, 0.84);
+        assert_eq!(
+            t.ids("qzxv", 0.79, 0.03, None),
+            [elsewhere],
+            "everywhere, 0.84 is more than 0.03 below 0.95"
+        );
+        assert_eq!(t.ids("qzxv", 0.79, 0.03, Some(&t.app.id)), [here]);
+    }
+
+    /// F2: with the vector list out of the way, a date, a version, an IP address and a phone
+    /// number written whole find the text that has them in both tiers, ahead of texts that
+    /// hold the same numbers apart.
+    #[test]
+    fn exact_numbers_are_found_by_the_lexical_lists_alone() {
+        let f = fx();
+        let cases = [
+            (
+                "2026-10-14",
+                "Rotate the signing key on 2026-10-14 after the incident review",
+                "The 2026 plan lists 10 milestones owned by 14 people",
+            ),
+            (
+                "081-234-5678",
+                "The on-call phone for outages is 081-234-5678 and rings the duty engineer",
+                "Ticket 081 has 234 comments and 5678 views",
+            ),
+            (
+                "1.13.0",
+                "The broker must be upgraded to 1.13.0 before the release freeze",
+                "Broker 1 has 13 queues and 0 consumers",
+            ),
+            (
+                "10.20.30.40",
+                "The staging admin box answers only on 10.20.30.40 over the VPN",
+                "Subnet 10 uses 20 hosts, 30 racks and 40 disks",
+            ),
+        ];
+        let mut want = Vec::new();
+        for (i, (query, exact, split)) in cases.iter().enumerate() {
+            let (id, _) = f.add(&f.app, Kind::Fact, exact);
+            f.add(&f.app, Kind::Note, split);
+            f.chunk(&f.app, &format!("raw-exact-{i}"), exact);
+            f.chunk(&f.app, &format!("raw-split-{i}"), split);
+            want.push((query, id, exact));
+        }
+        for (query, id, exact) in want {
+            for include_raw in [false, true] {
+                let out = f.search(&SearchParams {
+                    lists: Lists::LexicalOnly,
+                    include_raw,
+                    ..f.params(query)
+                });
+                assert_eq!(out.hits[0].id, id, "{query} (raw {include_raw})");
+                if include_raw {
+                    assert!(
+                        out.hits
+                            .iter()
+                            .take(2)
+                            .any(|h| h.tier == Tier::Raw && h.body.as_deref() == Some(exact)),
+                        "{query}: the raw chunk with the whole number is in the top two: {:?}",
+                        out.hits.iter().map(|h| &h.title).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The sure floor admits whatever the margin says; below it the rescue floor and the margin
+    /// both apply.
+    #[test]
+    fn a_sure_match_needs_no_margin_and_a_rescued_one_needs_both() {
+        let t = Cos::new();
+        let best = t.add(&t.app, "alpha one", 0.95, 0.95);
+        let sure = t.add(&t.app, "beta two", 0.86, 0.86);
+        let rescued = t.add(&t.app, "gamma three", 0.82, 0.82);
+        let too_far = t.add(&t.app, "delta four", 0.81, 0.81);
+        let below_rescue = t.add(&t.app, "epsilon five", 0.79, 0.79);
+        // Margin 0.15 from the best 0.95 reaches 0.80; the rescue floor is 0.805.
+        let found = t.ids_sure("qzxv", 0.805, Some(0.85), 0.15, None);
+        assert_eq!(
+            found,
+            [best.clone(), sure.clone(), rescued.clone(), too_far.clone()]
+        );
+        assert!(!found.contains(&below_rescue));
+        // A margin of 0.12 drops the 0.81 (0.95 - 0.12 = 0.83) but the 0.86 is sure.
+        let found = t.ids_sure("qzxv", 0.805, Some(0.85), 0.12, None);
+        assert_eq!(found, [best.clone(), sure.clone()]);
+        // Without a sure floor the margin cuts the 0.86 too.
+        let found = t.ids_sure("qzxv", 0.805, None, 0.05, None);
+        assert_eq!(found, [best]);
+    }
+
+    /// I2: the raw tier keeps its own floor; the knowledge policy does not reach chunks.
+    #[test]
+    fn a_chunk_is_judged_by_the_chunk_floor_only() {
+        let t = Cos::new();
+        for (i, c) in [0.90f32, 0.84, 0.80].into_iter().enumerate() {
+            sources::ingest(
+                &t.c,
+                &t.app,
+                &sources::SourceInput {
+                    uri: format!("s{i}"),
+                    ..Default::default()
+                },
+                &[sources::ChunkInput {
+                    ord: 0,
+                    text: format!("zzz{i} filler"),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+            let seq: i64 =
+                t.c.query_row(
+                    "SELECT seq FROM chunks WHERE text = ?1",
+                    [format!("zzz{i} filler")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            t.idx.upsert(VecKey::Chunk(seq), &at(c)).unwrap();
+            embeddings::put(&t.c, VecKey::Chunk(seq), "test-model", &at(c)).unwrap();
+        }
+        let run_raw = |chunk_floor: Option<f32>| {
+            let p = SearchParams {
+                query: "qzxv".into(),
+                limit: 20,
+                include_raw: true,
+                relevance_floor: 0.805,
+                relevance_sure: Some(0.825),
+                relevance_margin: 0.05,
+                chunk_floor,
+                raw_min_results: 0,
+                ..Default::default()
+            };
+            run_with_vector(
+                &t.c,
+                Some(&t.idx),
+                Some(at(1.0)),
+                &Weights::default(),
+                &p,
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .hits
+            .len()
+        };
+        // 0.84 is 0.06 below the best chunk, beyond the margin of 0.05 that memories get:
+        // chunks have no margin, so it is admitted; 0.80 is below the chunk floor.
+        assert_eq!(
+            run_raw(Some(CHUNK_RELEVANCE_FLOOR)),
+            2,
+            "0.90 and 0.84 are admitted, 0.80 is not"
+        );
+        assert_eq!(run_raw(Some(0.79)), 3);
     }
 }

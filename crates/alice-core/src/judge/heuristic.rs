@@ -3,7 +3,9 @@
 //! name mentions, predicates by string similarity. It never claims more certainty than the
 //! rules justify: only duplicates (and identical predicates) reach the auto-apply threshold.
 
-use super::text::{predicate_similarity, same_predicate, stem_predicate, title_similarity};
+use super::text::{
+    directions_differ, predicate_similarity, same_predicate, stem_predicate, title_similarity,
+};
 use super::{
     Choice, Distribution, Judge, JudgeMemory, JudgeResult, ProjectOption, Relation, Rubric, Score,
 };
@@ -275,7 +277,9 @@ impl Judge for HeuristicJudge {
                 .then(a.0.cmp(b.0))
         });
         Ok(match ranked.first() {
-            Some((p, _, _, _)) if same_predicate(new, p) => {
+            // The same words read the other way round (`depends_on`, `depended_on_by`) are a
+            // question for a person, never a sure match.
+            Some((p, _, _, _)) if same_predicate(new, p) && !directions_differ(new, p) => {
                 Distribution::from_pairs([((*p).clone(), 0.95), ("none".to_string(), 0.05)])
             }
             Some((p, s, _, _)) if *s >= self.title_similarity => {
@@ -546,5 +550,12 @@ mod tests {
         assert_eq!(us.best().unwrap().0, "use");
         let none = j.match_predicate("owns", &["deployed_on".into()]).unwrap();
         assert_eq!(none.best().unwrap().0, "none");
+        // Opposite directions are similar, never sure (F3): at most a review item.
+        for (new, old) in [("depended_on_by", "depends_on"), ("used_by", "uses")] {
+            assert!(directions_differ(new, old));
+            let d = j.match_predicate(new, &[old.to_string()]).unwrap();
+            let p = d.p(old);
+            assert!(p < 0.85, "{new} -> {old} is at most a suggestion, got {p}");
+        }
     }
 }

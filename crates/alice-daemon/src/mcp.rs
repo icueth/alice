@@ -379,7 +379,7 @@ impl AliceMcp {
 #[tool_router]
 impl AliceMcp {
     #[tool(
-        description = "Search long-term memory: decisions, bug fixes, facts, how-tos, preferences and past work. Use before answering about anything done before.",
+        description = "Search long-term memory: decisions, bug fixes, facts, how-tos, preferences and past work. Use before answering about anything done before. Pass mode \"precise\" to have the judge re-rank the top results (slower; needs judge.provider = jev).",
         annotations(read_only_hint = true)
     )]
     async fn recall(

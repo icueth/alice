@@ -235,6 +235,46 @@ Only the candidates the four recall modes returned plus the vector top 20 withou
 | 0.80 | 94% (90–96%, 204/217) | 99% (96–100%, 214/217) | 80% (77–82%, 725/910) | 86% (84–88%, 784/910) |
 | 0.82 | 74% (68–80%, 161/217) | 92% (87–95%, 199/217) | 46% (43–50%, 421/910) | 59% (56–62%, 539/910) |
 
+### Floor policy chosen in Task 13
+
+**Tuned on 19 synthetic queries (one author's labels, one domain); not evidence about any other
+corpus.** For memories the search compares the exact cosine of the stored f16 vector (it rescores
+the index's int8 candidates with it first; the rows above already hold exact cosines, so that step
+cannot show in the numbers below) with a three-part policy. A memory found only by meaning is
+relevant if its similarity is at or above the **sure floor** (`search.relevance_sure`), or at or
+above the **rescue floor** (`search.relevance_floor`) and within the **margin**
+(`search.relevance_margin`, 0 = off) of the best such match of the query among the candidates
+that pass the filters. A lexical match passes at any similarity. Transcript chunks keep a fixed
+floor of 0.82 with no margin: the evidence above covers memories only.
+
+*Rescue floor, fixed by a bound, not tuned:* the highest similarity of an unrelated query to a gold
+memory with the real model is 0.786 (exact, M4 Pro; the maximum of 60 measured unrelated pairs), plus 0.015 for the drift between CPU families
+(m2.md, Windows), rounded up to 0.005: **0.805**. Nothing a real unrelated query reaches can be
+rescued on this scale.
+
+*Sure floor and margin by leave-one-query-out.* The 20 cross-lingual and paraphrase queries (Jev
+graded every memory for them; 70 memories answer, P(answers) >= 0.5; one query has no answer, so
+19 enter the recall averages). Grid: sure floor 0.805 to 0.925 in steps of 0.005, margin 0.005 to
+0.20 in steps of 0.005, and none. Objective: the mean over queries of the share of answering
+memories kept (cosine or lexical top 50). Constraint: the share of the other memories admitted,
+pooled over the queries used for choosing, is at most what a single floor of 0.82 admits on the
+same queries. Choose on 19 queries, score the held-out one, 20 folds. Picks: sure 0.825 with
+margin 0.015 in 19 folds, 0.825 with 0.005 in 1; on all 20 queries 0.825 and 0.015 (the defaults).
+
+| | floor 0.82 alone (M1) | round 1: 0.79 + margin 0.03 | chosen: rescue 0.805, sure 0.825, margin 0.015 |
+|---|---|---|---|
+| held-out recall, mean over 19 queries | 74.4% | 74.1% | 74.4% |
+| held-out recall, pooled (70 answering memories) | 72.9% (51/70) | 65.7% (46/70) | 72.9% (51/70) |
+| held-out other memories admitted, mean | 6.3% | 5.8% | 5.0% |
+| all 20 queries, rule fitted on them: recall mean / pooled | 74.4% / 72.9% | 78.1% / 68.6% | 75.7% / 74.3% (52/70) |
+| all 20 queries: other memories admitted | 6.3% (541/8570) | 6.2% (535/8570) | 5.0% (429/8570) |
+| 50 same-language queries (retrieved only): answering kept | 96.4% (108/112) | 89.3% (100/112) | 95.5% (107/112) |
+| same: other graded results admitted | 62.1% (630/1015) | 42.7% (433/1015) | 57.1% (580/1015) |
+
+*What this says.* Held out, the three-part policy keeps as many answering memories as floor 0.82 (51 of 70 pooled both) and admits a fifth fewer of the others (5.0% against 6.3%); among the same-language answers it keeps 107 of 112 against 108 of 112. It does not find more answers. The round-1
+choice lost recall on both samples. More recall costs admission: the settings move the trade
+without a release.
+
 ### Cost and latency
 
 Jev requests 1447 (answered 1447, cache hits 0, retries 0, failures 0); input tokens 2734033; latency p50 335 ms, p95 664 ms; ledger total $0.1148; $0.0113 per 1,000 decisions (10199 decisions: 216 relation pairs, 216 kinds, 9767 graded pairs).

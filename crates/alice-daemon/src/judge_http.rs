@@ -489,7 +489,8 @@ impl JudgeHub {
 
 /// Test transport for the service tests: answers every question of a request from fixed
 /// choices (relation questions `fwd_*` and `rev_*` with `relation`, the kind question with
-/// `kind`, the project question with `project`) or fails with `status` when set. Keeps every
+/// `kind`, the predicate question (the one whose options include `none`) with `predicate`, the
+/// project question with `project`) or fails with `status` when set. Keeps every
 /// request body it was sent, so a test can look for what must not have left.
 #[cfg(test)]
 #[derive(Default)]
@@ -497,6 +498,7 @@ pub(crate) struct ScriptedJev {
     pub relation: (&'static str, f64),
     pub kind: Option<(&'static str, f64)>,
     pub project: Option<(&'static str, f64)>,
+    pub predicate: Option<(&'static str, f64)>,
     pub status: Mutex<Option<u16>>,
     /// Every request takes this long to answer.
     pub delay: Duration,
@@ -575,6 +577,8 @@ impl JevTransport for ScriptedJev {
                     },
                     self.relation.1,
                 )
+            } else if options.iter().any(|o| o == "none") {
+                self.predicate.unwrap_or(("none", 1.0))
             } else if options.iter().any(|o| o == "bugfix") {
                 self.kind.unwrap_or(("note", 1.0))
             } else {

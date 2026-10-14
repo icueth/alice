@@ -348,8 +348,20 @@ impl Default for EmbeddingSettings {
 pub struct SearchSettings {
     /// Token budget of a recall answer when the agent does not ask for one (100 to 50000).
     pub default_max_tokens: usize,
-    /// Cosine similarity at which a match found only by meaning counts as relevant (0 to 1).
+    /// Rescue floor for memories found only by meaning (cosine, 0 to 1): below the sure floor
+    /// such a match counts as relevant at or above this and within the margin of the best one.
+    /// This used to be the single floor; for that behaviour set `relevance_sure` to the same
+    /// value. A floor above the default sure floor, with no `relevance_sure` of its own, raises
+    /// the sure floor with it (a single floor).
     pub relevance_floor: f64,
+    /// Sure floor for memories found only by meaning (cosine, 0 to 1, not below the rescue
+    /// floor): at or above it a match is always relevant. Unset, it is 0.825 or the rescue
+    /// floor if that is higher.
+    pub relevance_sure: f64,
+    /// A memory found only by meaning below the sure floor is dropped when it is more than this
+    /// below the best such match of the query (0 to 1; 0 turns the relative cut off). Word
+    /// matches always stay. Transcript chunks use a fixed floor of 0.82.
+    pub relevance_margin: f64,
     /// Fewer relevant memories than this bring in raw transcript chunks (0 to 50).
     pub raw_fallback_min_results: usize,
     /// Ranking multipliers.
@@ -362,9 +374,11 @@ impl Default for SearchSettings {
     fn default() -> Self {
         Self {
             default_max_tokens: crate::model::limits::DEFAULT_RECALL_TOKENS,
-            // `search::DEFAULT_RELEVANCE_FLOOR` as written (the f32 widened would show as
-            // 0.8199999928474426); a test keeps the two equal.
-            relevance_floor: 0.82,
+            // `search::DEFAULT_RELEVANCE_FLOOR` and `DEFAULT_RELEVANCE_MARGIN` as written (the
+            // f32 widened would show as 0.8199999928474426); a test keeps them equal.
+            relevance_floor: 0.805,
+            relevance_sure: 0.825,
+            relevance_margin: 0.015,
             raw_fallback_min_results: 3,
             weights: Weights::default(),
             half_life: HalfLives::default(),
@@ -1037,6 +1051,18 @@ fn resolve_leaves(
             .map(|e| env_safe(e, &sources, env))
             .collect()
     };
+    // A sure floor nobody set follows the rescue floor up: `relevance_floor = 0.85` alone means
+    // a single floor of 0.85, not an error about a key the owner never wrote.
+    if sources.get("search.relevance_sure") == Some(&Source::Default)
+        && let Some(floor) = merged["search"]["relevance_floor"].as_f64()
+        && floor > SearchSettings::default().relevance_sure
+    {
+        set_path(
+            &mut merged,
+            "search.relevance_sure",
+            serde_json::json!(floor),
+        );
+    }
     let settings: Settings = match serde_json::from_value(merged.clone()) {
         Ok(s) => s,
         Err(first) => {
@@ -1324,6 +1350,17 @@ impl Settings {
 
         let s = &self.search;
         unit(&mut e, "search.relevance_floor", s.relevance_floor);
+        unit(&mut e, "search.relevance_sure", s.relevance_sure);
+        unit(&mut e, "search.relevance_margin", s.relevance_margin);
+        if s.relevance_sure < s.relevance_floor {
+            e.push(err(
+                "search.relevance_sure",
+                format!(
+                    "{} is below search.relevance_floor ({}); the sure floor must not be lower",
+                    s.relevance_sure, s.relevance_floor
+                ),
+            ));
+        }
         if !(100..=50_000).contains(&s.default_max_tokens) {
             e.push(err(
                 "search.default_max_tokens",
@@ -1987,7 +2024,9 @@ mod tests {
             (0.85, 0.5)
         );
         assert_eq!(s.judge.jev.model, "jev-1.13.0");
-        assert_eq!(s.search.relevance_floor, 0.82);
+        assert_eq!(s.search.relevance_floor, 0.805);
+        assert_eq!(s.search.relevance_sure, 0.825);
+        assert_eq!(s.search.relevance_margin, 0.015);
         assert_eq!(s.storage.raw_retention, Retention::Forever);
         assert_eq!((s.backup.daily, s.backup.weekly), (7, 4));
         assert_eq!(s.secrets.backend, SecretsBackend::File);
@@ -2003,6 +2042,14 @@ mod tests {
             crate::search::DEFAULT_RELEVANCE_FLOOR
         );
         assert_eq!(
+            s.search.relevance_margin as f32,
+            crate::search::DEFAULT_RELEVANCE_MARGIN
+        );
+        assert_eq!(
+            s.search.relevance_sure as f32,
+            crate::search::DEFAULT_RELEVANCE_SURE
+        );
+        assert_eq!(
             s.search.default_max_tokens,
             crate::model::limits::DEFAULT_RECALL_TOKENS
         );
@@ -2013,7 +2060,11 @@ mod tests {
         // Shown as written, not as an f32 widened to f64 (0.8199999928474426).
         assert_eq!(
             get_key(&s, "search.relevance_floor"),
-            Some(serde_json::json!(0.82))
+            Some(serde_json::json!(0.805))
+        );
+        assert_eq!(
+            get_key(&s, "search.relevance_margin"),
+            Some(serde_json::json!(0.015))
         );
         assert_eq!(
             get_key(&s, "judge.cluster_similarity"),
@@ -2080,6 +2131,21 @@ mod tests {
                 "",
                 &[("ALICE_SEARCH_RELEVANCE_FLOOR", "very")],
                 "search.relevance_floor",
+            ),
+            (
+                "[search]\nrelevance_floor = 0.9\nrelevance_sure = 0.8\n",
+                &[],
+                "search.relevance_sure",
+            ),
+            (
+                "[search]\nrelevance_margin = 1.5\n",
+                &[],
+                "search.relevance_margin",
+            ),
+            (
+                "",
+                &[("ALICE_SEARCH_RELEVANCE_MARGIN", "-0.1")],
+                "search.relevance_margin",
             ),
             (
                 "[storage]\nraw_retention = \"soon\"\n",
@@ -2359,6 +2425,11 @@ mod tests {
             r.settings.storage.raw_retention,
             Retention::Age(std::time::Duration::from_secs(90 * 86_400))
         );
+        // 0 turns the relative cut off; a bare 0 and a number from the environment both parse.
+        let r = resolve(Some("[search]\nrelevance_margin = 0\n"), &[]).unwrap();
+        assert_eq!(r.settings.search.relevance_margin, 0.0);
+        let r = resolve(None, &env(&[("ALICE_SEARCH_RELEVANCE_MARGIN", "0.05")])).unwrap();
+        assert_eq!(r.settings.search.relevance_margin, 0.05);
         let r = resolve(None, &env(&[("ALICE_JUDGE_JEV_MODEL", "1.13")])).unwrap();
         assert_eq!(
             r.settings.judge.jev.model, "1.13",
@@ -3103,5 +3174,54 @@ mod tests {
         assert_eq!(toml_line("a = 1\nb = 2\nc", 6), 2);
         assert_eq!(toml_line("a = 1\nb = 2\nc", 12), 3);
         assert_eq!(toml_line("a", 99), 1, "past the end is the last line");
+    }
+
+    /// N1: a floor above the default sure floor, with no sure floor of the owner's own, is a
+    /// single floor, not an error about a key nobody wrote; an explicit sure floor below the
+    /// floor is reported on that key and costs only itself.
+    #[test]
+    fn a_high_floor_raises_an_unset_sure_floor_and_an_explicit_one_is_checked() {
+        let r = resolve(Some("[search]\nrelevance_floor = 0.85\n"), &[]).unwrap();
+        assert_eq!(
+            (
+                r.settings.search.relevance_floor,
+                r.settings.search.relevance_sure
+            ),
+            (0.85, 0.85)
+        );
+        assert_eq!(
+            r.sources.get("search.relevance_sure"),
+            Some(&Source::Default),
+            "still a default"
+        );
+        let r = resolve(None, &env(&[("ALICE_SEARCH_RELEVANCE_FLOOR", "0.9")])).unwrap();
+        assert_eq!(r.settings.search.relevance_sure, 0.9);
+        // A floor at or below the default sure floor leaves it alone.
+        let r = resolve(Some("[search]\nrelevance_floor = 0.81\n"), &[]).unwrap();
+        assert_eq!(r.settings.search.relevance_sure, 0.825);
+        // Both set, the sure floor lower: the error names the sure floor.
+        let file = "[search]\nrelevance_floor = 0.85\nrelevance_sure = 0.81\n[judge]\nreview_threshold = 0.6\n";
+        let errs = resolve(Some(file), &[]).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.key == "search.relevance_sure"),
+            "{errs:?}"
+        );
+        // Salvaging drops that leaf only; the floor and the rest of the file apply.
+        let (r, left_out) = resolve_salvaging(Some(file), &[]);
+        assert_eq!(left_out.len(), 1, "{left_out:?}");
+        assert_eq!(left_out[0].key, "search.relevance_sure");
+        assert_eq!(r.settings.judge.review_threshold, 0.6);
+        assert_eq!(r.settings.search.relevance_floor, 0.85);
+        assert_eq!(r.settings.search.relevance_sure, 0.85);
+        // The same through the environment.
+        let errs = resolve(
+            Some("[search]\nrelevance_floor = 0.85\n"),
+            &env(&[("ALICE_SEARCH_RELEVANCE_SURE", "0.8")]),
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.key == "search.relevance_sure"),
+            "{errs:?}"
+        );
     }
 }

@@ -1,0 +1,16 @@
+{"id":"date","kind":"decision","m":"Rotate the signing key on 2026-10-14 after the incident review"}
+{"id":"date-near","kind":"decision","m":"Rotate the signing key on 2026-10-15 after the audit"}
+{"id":"date-split","kind":"note","m":"The 2026 plan lists 10 milestones owned by 14 people"}
+{"id":"ver","kind":"fact","m":"The broker must be upgraded to 1.13.0 before the release freeze"}
+{"id":"ver-near","kind":"fact","m":"The broker stays on 1.13.1 until the release freeze ends"}
+{"id":"ver-split","kind":"note","m":"Broker 1 has 13 queues and 0 consumers"}
+{"id":"ip","kind":"fact","m":"The staging admin box answers only on 10.20.30.40 over the VPN"}
+{"id":"ip-near","kind":"fact","m":"The staging admin box answers only on 10.20.30.41 over the VPN"}
+{"id":"ip-split","kind":"note","m":"Subnet 10 uses 20 hosts, 30 racks and 40 disks"}
+{"id":"phone","kind":"fact","m":"The on-call phone for outages is 081-234-5678 and rings the duty engineer"}
+{"id":"phone-near","kind":"fact","m":"The sales phone line is 081-234-5679 and rings the front desk"}
+{"id":"phone-split","kind":"note","m":"Ticket 081 has 234 comments and 5678 views"}
+{"q":"2026-10-14","want":"date"}
+{"q":"1.13.0","want":"ver"}
+{"q":"10.20.30.40","want":"ip"}
+{"q":"081-234-5678","want":"phone"}

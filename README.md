@@ -166,7 +166,7 @@ Agents that cannot use MCP can call the CLI (`alice recall`, `alice remember`, `
 
 | Tool | Purpose |
 |---|---|
-| `recall` | Search memories. Filters for project, topics, kinds and dates; `include_raw` for transcripts; `max_tokens` budget. *(Planned, M2: `mode: precise` re-ranks with the judge.)* |
+| `recall` | Search memories. Filters for project, topics, kinds and dates; `include_raw` for transcripts; `max_tokens` budget. `mode: precise` has the judge re-rank the top results (slower; needs `judge.provider = jev`). |
 | `remember` | Save a memory (`kind`, `title`, `topics`, `importance`, `supersedes`). Idempotent. |
 | `context` | Token-budgeted briefing for the current project. |
 | `get_memory` | Full memories with links and provenance. |
@@ -179,7 +179,7 @@ The server also sends usage instructions, offers `recall` and `remember-session`
 ## CLI
 
 ```
-alice recall <query> [--project p] [--kind k]... [--topic t]... [--raw] [--limit n]
+alice recall <query> [--project p] [--kind k]... [--topic t]... [--raw] [--precise] [--limit n]
              [--max-tokens n] [--since date] [--before date]
 alice remember [--kind k] [--title t] [--topic t]... [--project p] [--importance 1-5]
                [--supersedes id]... (<text> | -)
