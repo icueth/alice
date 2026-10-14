@@ -50,6 +50,9 @@ const WRITER_CACHE_KIB: i64 = 64 * 1024;
 /// Page cache of each reader connection, in KiB. Readers are pooled (8 in the daemon), so
 /// this times the pool size bounds their memory; the OS file cache serves the rest.
 const READER_CACHE_KIB: i64 = 16 * 1024;
+/// Page cache of each connection in the small pool that reads chunk vectors for rescoring
+/// (a few hundred primary-key reads per raw-tier recall), in KiB.
+pub const VECTOR_READER_CACHE_KIB: i64 = 4 * 1024;
 
 /// No memory map: every connection would map the database separately and each map's touched
 /// pages count towards the daemon's RSS (with a 2.7 GB database at 1M chunks, eight readers
@@ -82,6 +85,10 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
 
 /// Open a read-only connection for queries.
 pub fn open_reader(path: &Path) -> Result<Connection> {
+    open_reader_with_cache(path, READER_CACHE_KIB)
+}
+
+fn open_reader_with_cache(path: &Path, cache_kib: i64) -> Result<Connection> {
     configure_sqlite_once();
     let conn = Connection::open_with_flags(
         path,
@@ -89,7 +96,7 @@ pub fn open_reader(path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI,
     )?;
-    configure_common(&conn, READER_CACHE_KIB)?;
+    configure_common(&conn, cache_kib)?;
     Ok(conn)
 }
 
@@ -110,6 +117,8 @@ pub fn backup_into(conn: &Connection, dest: &Path) -> Result<()> {
 pub struct ReaderPool {
     path: PathBuf,
     max: usize,
+    /// Page cache of each connection, in KiB.
+    cache_kib: i64,
     state: Mutex<PoolState>,
     returned: Condvar,
 }
@@ -142,9 +151,15 @@ impl Drop for Lease<'_> {
 
 impl ReaderPool {
     pub fn new(path: PathBuf, max: usize) -> Self {
+        Self::with_cache(path, max, READER_CACHE_KIB)
+    }
+
+    /// A pool whose connections have a page cache of `cache_kib` KiB each.
+    pub fn with_cache(path: PathBuf, max: usize, cache_kib: i64) -> Self {
         Self {
             path,
             max: max.max(1),
+            cache_kib,
             state: Mutex::new(PoolState {
                 idle: Vec::new(),
                 open: 0,
@@ -175,7 +190,7 @@ impl ReaderPool {
             self.returned.wait(&mut st);
         }
         drop(st);
-        match open_reader(&self.path) {
+        match open_reader_with_cache(&self.path, self.cache_kib) {
             Ok(conn) => Ok(Lease {
                 pool: self,
                 conn: Some(conn),
@@ -278,6 +293,25 @@ mod tests {
         assert_eq!(pragma(&r, "mmap_size"), 0);
         assert_eq!(pragma(&w, "cache_size"), -WRITER_CACHE_KIB);
         assert_eq!(pragma(&r, "cache_size"), -READER_CACHE_KIB);
+    }
+
+    /// The chunk vector list reads on its own small pool: same read-only connections, a 4 MiB
+    /// page cache each.
+    #[test]
+    fn a_reader_pool_can_give_its_connections_a_smaller_cache() {
+        let (_d, path) = temp_db();
+        drop(open_writer(&path).unwrap());
+        let pool = ReaderPool::with_cache(path, 2, VECTOR_READER_CACHE_KIB);
+        let cache: i64 = pool
+            .with(|c| Ok(c.query_row("PRAGMA cache_size", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(cache, -VECTOR_READER_CACHE_KIB);
+        assert_eq!(VECTOR_READER_CACHE_KIB, 4 * 1024);
+        assert!(
+            pool.with(|c| Ok(c.execute("INSERT INTO meta(key, value) VALUES ('x','y')", [])?))
+                .is_err(),
+            "read-only like every reader"
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use alice_core::store::kg::{self, FactOutcome};
 use alice_core::store::memories::{self, InsertOutcome, NewMemoryInput};
 use alice_core::store::projects::{self, ResolvedProject};
 use alice_core::store::sources::{self, IngestOutcome};
-use alice_core::store::{ReaderPool, open_reader, open_writer};
+use alice_core::store::{ReaderPool, VECTOR_READER_CACHE_KIB, open_reader, open_writer};
 use alice_core::vector::VectorIndex;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, OptionalExtension};
@@ -48,6 +48,11 @@ pub struct ServiceOptions {
     pub weights: Weights,
     /// Most read connections open at once (each has its own page cache); further reads wait.
     pub reader_pool: usize,
+    /// Connections (4 MiB page cache each) that read the stored chunk vectors a raw-tier
+    /// recall rescores, while its main reader runs the word lists. A recall takes one main
+    /// reader and then at most one of these, never two of either, so the pools cannot
+    /// deadlock; with all of these in use a recall waits for one of them only.
+    pub vector_reader_pool: usize,
     /// Maps a working directory to its project (runs git). Tests replace it.
     pub detect_project: fn(&Path) -> ProjectRef,
 }
@@ -59,6 +64,7 @@ impl Default for ServiceOptions {
             raw_min_results: 3,
             weights: Weights::default(),
             reader_pool: 8,
+            vector_reader_pool: 4,
             detect_project,
         }
     }
@@ -184,6 +190,8 @@ impl ProjectResolver {
 pub struct Service {
     home: AliceHome,
     readers: Arc<ReaderPool>,
+    /// Reads the stored chunk vectors for raw-tier rescoring (see `ServiceOptions`).
+    vector_readers: Arc<ReaderPool>,
     writer: WriterHandle,
     index: Arc<IndexSlot>,
     /// Shared by the embedding worker and query embedding.
@@ -280,6 +288,11 @@ impl Service {
         let conn = open_writer(&home.db())?;
         let device = device_id(&conn)?;
         let readers = Arc::new(ReaderPool::new(home.db(), opts.reader_pool));
+        let vector_readers = Arc::new(ReaderPool::with_cache(
+            home.db(),
+            opts.vector_reader_pool,
+            VECTOR_READER_CACHE_KIB,
+        ));
         // One instance for the worker and for queries: the local model costs ~600 MB each. It
         // embeds passages in short batches and lets a waiting query go next after each one.
         let embedder = make_embedder()?;
@@ -331,6 +344,7 @@ impl Service {
         Ok(Arc::new(Service {
             home,
             readers,
+            vector_readers,
             writer,
             index,
             embedder,
@@ -511,6 +525,9 @@ impl Service {
         let choice = self
             .choose(req.project.as_deref(), req.cwd.as_deref())
             .await?;
+        // The raw tier's chunk vector list reads on this pool, beside the main reader's word
+        // lists: one connection of each, main first (`ServiceOptions::vector_reader_pool`).
+        let vector_readers = self.vector_readers.clone();
         let (out, slug) = self
             .read(move |c| {
                 let scope = ProjectResolver::read_scope(c, choice, explicit)?;
@@ -531,10 +548,11 @@ impl Service {
                     relevance_floor: opts.relevance_floor,
                     raw_min_results: opts.raw_min_results,
                 };
-                let out = search::run_with_vector(
+                let out = search::run_with_chunk_reads(
                     c,
                     index.as_deref(),
                     vector,
+                    search::ChunkReads::Pool(&vector_readers),
                     &opts.weights,
                     &params,
                     chrono::Utc::now(),
@@ -1082,6 +1100,93 @@ mod tests {
                 out.results
             );
         }
+    }
+
+    /// Fix round 2: a raw-tier recall holds one main-pool reader and reads the chunk vectors on
+    /// a connection of the separate vector pool. With every main reader held by such recalls
+    /// and more waiting, none waits for a second main reader, so they all finish.
+    #[test]
+    fn raw_tier_recalls_never_deadlock_on_the_reader_pools() {
+        // Its own runtime: a deadlocked recall never returns, and dropping a runtime waits for
+        // its blocking threads, so a regression must abandon them to fail instead of hanging.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let finished = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                sixteen_raw_recalls_on_two_readers(),
+            )
+            .await
+        });
+        rt.shutdown_background();
+        assert_eq!(
+            finished.expect("raw-tier recalls deadlocked on the reader pools"),
+            16
+        );
+    }
+
+    async fn sixteen_raw_recalls_on_two_readers() -> usize {
+        let d = tempfile::tempdir().unwrap();
+        let mk = || Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>);
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &mk,
+            ServiceOptions {
+                reader_pool: 2,
+                vector_reader_pool: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.ingest(IngestRequest {
+            source: SourceInput {
+                uri: "s".into(),
+                ..Default::default()
+            },
+            chunks: (0..40)
+                .map(|i| ChunkInput {
+                    ord: i,
+                    text: format!("session chunk {i} about the frobnicator calibration"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_embedded(&s).await;
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..(2 + 14) {
+            let s = s.clone();
+            set.spawn(async move {
+                s.recall(RecallRequest {
+                    query: format!("frobnicator calibration {i}"),
+                    include_raw: true,
+                    format: OutputFormat::Json,
+                    ..Default::default()
+                })
+                .await
+            });
+        }
+        let mut done = 0;
+        while let Some(r) = set.join_next().await {
+            let out = r.unwrap().unwrap();
+            assert!(
+                out.results
+                    .iter()
+                    .any(|h| h.tier == Tier::Raw && h.matched.contains(&MatchVia::Vector)),
+                "the chunk vector list ran: {:?}",
+                out.results
+            );
+            done += 1;
+        }
+        tokio::task::spawn_blocking(move || s.shutdown())
+            .await
+            .unwrap();
+        done
     }
 
     /// Fix round 1 (M9): a clean stop marks the files it saved and the next start uses them as

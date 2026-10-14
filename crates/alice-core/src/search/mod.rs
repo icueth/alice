@@ -13,7 +13,7 @@ use crate::normalize::{nfc, normalize_topic};
 use crate::store::embeddings::VecKey;
 use crate::store::projects::GLOBAL_ID;
 use crate::store::sources::ChunkRow;
-use crate::store::{memories, sources};
+use crate::store::{ReaderPool, memories, sources};
 use crate::vector::{KeyFilter, VectorIndex};
 use chrono::{DateTime, SecondsFormat, Utc};
 use fusion::{BoostInput, ItemRef, Weights, boost, rrf};
@@ -70,6 +70,51 @@ struct Signals {
 
 type Candidates = (HashMap<ItemRef, f64>, HashMap<ItemRef, Signals>);
 
+/// Where the raw tier's chunk vector list reads the stored vectors it rescores with.
+#[derive(Clone, Copy)]
+pub enum ChunkReads<'a> {
+    /// On the query's own connection, after the lexical lists.
+    Inline,
+    /// On a connection of this pool, on a thread of its own, while the lexical lists run on
+    /// the query's connection: the raw tier then takes as long as the slower of the two
+    /// instead of their sum. A query takes one connection of this pool at most, after its
+    /// own; it never asks the pool its own connection came from for a second one, so queries
+    /// cannot wait for each other in a cycle. Use a pool other than the query's.
+    Pool(&'a ReaderPool),
+}
+
+/// The raw tier's chunk vector list, maybe still being computed.
+enum ChunkVectors<'scope> {
+    /// No index or no query vector.
+    Nothing,
+    /// To be computed on the query's connection.
+    Inline,
+    Running(std::thread::ScopedJoinHandle<'scope, Vec<(ItemRef, f32)>>),
+}
+
+/// The chunk vector list: the sign-bit shortlist, re-ranked in RAM and rescored with the stored
+/// vectors (`VectorIndex::search_chunks`). A failure is logged and means no chunk vector
+/// candidates: the raw tier keeps its word and code matches.
+fn chunk_vector_list(
+    index: &VectorIndex,
+    conn: &Connection,
+    v: &[f32],
+    k: usize,
+) -> Vec<(ItemRef, f32)> {
+    index
+        .search_chunks(conn, v, k)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "chunk vector search failed; using word matches only");
+            Vec::new()
+        })
+        .into_iter()
+        .filter_map(|(key, sim)| match key {
+            VecKey::Chunk(s) => Some((ItemRef::Chunk(s), sim)),
+            VecKey::Memory(_) => None,
+        })
+        .collect()
+}
+
 /// What every candidate list needs.
 struct Query<'a> {
     conn: &'a Connection,
@@ -77,9 +122,39 @@ struct Query<'a> {
     vector: Option<Vec<f32>>,
     text: &'a str,
     k: usize,
+    reads: ChunkReads<'a>,
 }
 
 impl Query<'_> {
+    /// Start the raw tier's chunk vector list: on a thread of `scope` with a connection of its
+    /// own pool, or (inline) when the raw lists are collected.
+    fn chunk_vectors<'s>(&'s self, scope: &'s std::thread::Scope<'s, '_>) -> ChunkVectors<'s> {
+        let (Some(index), Some(v)) = (self.index, self.vector.as_deref()) else {
+            return ChunkVectors::Nothing;
+        };
+        let ChunkReads::Pool(pool) = self.reads else {
+            return ChunkVectors::Inline;
+        };
+        let k = self.k;
+        let job = move || {
+            pool.with(|c| Ok(chunk_vector_list(index, c, v, k)))
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "no connection for the chunk vector search; using word matches only");
+                    Vec::new()
+                })
+        };
+        match std::thread::Builder::new()
+            .name("alice-chunk-vectors".into())
+            .spawn_scoped(scope, job)
+        {
+            Ok(handle) => ChunkVectors::Running(handle),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot start a thread for the chunk vector search; running it after the word lists");
+                ChunkVectors::Inline
+            }
+        }
+    }
+
     /// Nearest memories. A failure is logged and means no vector candidates.
     fn memory_vector_hits(&self) -> Vec<(VecKey, f32)> {
         let (Some(index), Some(v)) = (self.index, self.vector.as_deref()) else {
@@ -125,7 +200,9 @@ impl Query<'_> {
         collect(lists, vector)
     }
 
-    fn raw(&self) -> Candidates {
+    /// The raw tier's lists: word, code and trigram lists here, and the chunk vector list
+    /// started by [`Self::chunk_vectors`] (joined last, so the two overlap).
+    fn raw(&self, chunks: ChunkVectors<'_>) -> Candidates {
         let (c, q, k) = (self.conn, self.text, self.k);
         let words = lexical::chunk_words(c, q, k);
         let use_trigram = lexical::should_use_trigram(q) || words.len() < SHORT_LIST;
@@ -143,21 +220,17 @@ impl Query<'_> {
             ));
         }
         // Sign-bit candidates rescored with the stored vectors: exact cosine similarities.
-        let vector = match (self.index, self.vector.as_deref()) {
-            (Some(index), Some(v)) => index
-                .search_chunks(self.conn, v, self.k)
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "chunk vector search failed; using word matches only");
-                    Vec::new()
-                }),
-            _ => Vec::new(),
-        }
-        .into_iter()
-        .filter_map(|(key, sim)| match key {
-            VecKey::Chunk(s) => Some((ItemRef::Chunk(s), sim)),
-            VecKey::Memory(_) => None,
-        })
-        .collect();
+        let vector = match chunks {
+            ChunkVectors::Nothing => Vec::new(),
+            ChunkVectors::Inline => match (self.index, self.vector.as_deref()) {
+                (Some(index), Some(v)) => chunk_vector_list(index, c, v, k),
+                _ => Vec::new(),
+            },
+            ChunkVectors::Running(handle) => handle.join().unwrap_or_else(|_| {
+                tracing::error!("the chunk vector search panicked; using word matches only");
+                Vec::new()
+            }),
+        };
         collect(lists, vector)
     }
 }
@@ -346,6 +419,22 @@ pub fn run_with_vector(
     p: &SearchParams,
     now: DateTime<Utc>,
 ) -> Result<SearchOutput> {
+    run_with_chunk_reads(conn, index, vector, ChunkReads::Inline, weights, p, now)
+}
+
+/// [`run_with_vector`] with the raw tier's chunk vector list reading where `reads` says: with
+/// [`ChunkReads::Pool`] it runs on a thread of its own, started as soon as the raw tier is
+/// known to be needed (at once for `include_raw`, after the knowledge tier for the raw
+/// fallback), while this connection runs the lexical lists.
+pub fn run_with_chunk_reads(
+    conn: &Connection,
+    index: Option<&VectorIndex>,
+    vector: Option<Vec<f32>>,
+    reads: ChunkReads<'_>,
+    weights: &Weights,
+    p: &SearchParams,
+    now: DateTime<Utc>,
+) -> Result<SearchOutput> {
     let normalized = query_text(&p.query)?;
     let limit = p.limit.clamp(1, limits::MAX_RECALL_LIMIT);
     let topics: Vec<String> = p.topics.iter().filter_map(|t| normalize_topic(t)).collect();
@@ -369,6 +458,7 @@ pub fn run_with_vector(
         } else {
             CANDIDATES
         },
+        reads,
     };
     let filters = Filters {
         p,
@@ -380,34 +470,45 @@ pub fn run_with_vector(
 
     // Raw chunks have no kind or topics, so those filters leave the knowledge tier only.
     let raw_allowed = p.kinds.is_empty() && topics.is_empty();
-    let (mut scores, mut signals) = query.knowledge();
-    if p.include_raw && raw_allowed {
-        // Both tiers ranked together; the raw tier weight (0.6) keeps knowledge ahead on ties.
-        let (s, sig) = query.raw();
-        scores.extend(s);
-        signals.extend(sig);
-    }
-    // Only relevant results are returned: a lexical match or vector similarity >= relevance_floor.
-    // The lexical lists search content terms only (English stopwords are left out whenever the
-    // query has other words), so a lexical match is a content-term match.
-    let mut ranked: Vec<Scored> = filters
-        .score(conn, &scores, &signals)?
-        .into_iter()
-        .filter(|s| s.relevant)
-        .collect();
-    let mut raw_fallback = false;
-    let knowledge_relevant = ranked.iter().filter(|s| s.is_knowledge()).count();
-    if !p.include_raw && raw_allowed && knowledge_relevant < p.raw_min_results {
-        let (s, sig) = query.raw();
-        let extra: Vec<Scored> = filters
-            .score(conn, &s, &sig)?
+    let (mut ranked, raw_fallback) = std::thread::scope(|scope| -> Result<_> {
+        let with_raw = p.include_raw && raw_allowed;
+        // Started first, so it also overlaps the knowledge tier.
+        let chunks = if with_raw {
+            query.chunk_vectors(scope)
+        } else {
+            ChunkVectors::Nothing
+        };
+        let (mut scores, mut signals) = query.knowledge();
+        if with_raw {
+            // Both tiers ranked together; the raw tier weight (0.6) keeps knowledge ahead on ties.
+            let (s, sig) = query.raw(chunks);
+            scores.extend(s);
+            signals.extend(sig);
+        }
+        // Only relevant results are returned: a lexical match or vector similarity >=
+        // relevance_floor. The lexical lists search content terms only (English stopwords are
+        // left out whenever the query has other words), so a lexical match is a content-term
+        // match.
+        let mut ranked: Vec<Scored> = filters
+            .score(conn, &scores, &signals)?
             .into_iter()
             .filter(|s| s.relevant)
             .collect();
-        raw_fallback = !extra.is_empty();
-        // Spec §4.4 step 5: appended after the knowledge results.
-        ranked.extend(extra);
-    }
+        let mut raw_fallback = false;
+        let knowledge_relevant = ranked.iter().filter(|s| s.is_knowledge()).count();
+        if !p.include_raw && raw_allowed && knowledge_relevant < p.raw_min_results {
+            let (s, sig) = query.raw(query.chunk_vectors(scope));
+            let extra: Vec<Scored> = filters
+                .score(conn, &s, &sig)?
+                .into_iter()
+                .filter(|s| s.relevant)
+                .collect();
+            raw_fallback = !extra.is_empty();
+            // Spec §4.4 step 5: appended after the knowledge results.
+            ranked.extend(extra);
+        }
+        Ok((ranked, raw_fallback))
+    })?;
     ranked.truncate(limit);
 
     let mut terms = lexical::content_terms(&normalized);
@@ -808,8 +909,9 @@ mod tests {
                 vector: None,
                 text: &text,
                 k: CANDIDATES,
+                reads: ChunkReads::Inline,
             };
-            let (scores, _) = query.raw();
+            let (scores, _) = query.raw(ChunkVectors::Nothing);
             let mut fused: Vec<(ItemRef, f64)> = scores.into_iter().collect();
             fused.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
             let top: Vec<ItemRef> = fused.iter().take(10).map(|(i, _)| *i).collect();
@@ -1195,6 +1297,114 @@ mod tests {
             !unstored.matched.contains(&MatchVia::Vector),
             "{unstored:?}"
         );
+    }
+
+    /// Fix round 2: chunks with stored vectors, a memory, and the parameters of an
+    /// `include_raw` recall and of one that takes the raw fallback.
+    fn chunk_fixture() -> (Fx, Vec<SearchParams>) {
+        let mut f = fx();
+        f.idx = VectorIndex::for_model("fake", 384).unwrap();
+        let texts = [
+            "the frobnicator calibration happens every tuesday",
+            "frobnicator calibration notes from the lab",
+            "weekly lab sync about the tuesday frobnicator",
+            "an unrelated tom yum soup recipe",
+        ];
+        for (i, text) in texts.iter().enumerate() {
+            f.chunk(&f.app, &format!("s{i}"), text);
+            let seq: i64 =
+                f.c.query_row("SELECT seq FROM chunks WHERE text = ?1", [text], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let v = f.e.embed_passages(&[text.to_string()]).unwrap().remove(0);
+            crate::store::embeddings::put(&f.c, VecKey::Chunk(seq), "fake", &v).unwrap();
+            f.idx.upsert(VecKey::Chunk(seq), &v).unwrap();
+        }
+        f.add(&f.app, Kind::Fact, "frobnicator calibration value is 7");
+        let params = vec![
+            SearchParams {
+                include_raw: true,
+                ..f.params("frobnicator calibration tuesday")
+            },
+            f.params("weekly lab sync tuesday"),
+        ];
+        (f, params)
+    }
+
+    fn summary(out: &SearchOutput) -> Vec<(String, Vec<MatchVia>, u64)> {
+        out.hits
+            .iter()
+            .map(|h| (h.id.clone(), h.matched.clone(), h.score.to_bits()))
+            .collect()
+    }
+
+    /// The chunk vector list can read on a pool of its own, at the same time as the lexical
+    /// lists: the results are exactly those of the search on one connection.
+    #[test]
+    fn a_separate_chunk_read_pool_gives_the_same_results() {
+        let (f, params) = chunk_fixture();
+        let pool = crate::store::ReaderPool::new(f._d.path().join("a.db"), 1);
+        let now = chrono::Utc::now();
+        for p in &params {
+            let v = embed_query(Some(&f.idx), &f.e, &query_text(&p.query).unwrap());
+            let inline =
+                run_with_vector(&f.c, Some(&f.idx), v.clone(), &Weights::default(), p, now)
+                    .unwrap();
+            let pooled = run_with_chunk_reads(
+                &f.c,
+                Some(&f.idx),
+                v,
+                ChunkReads::Pool(&pool),
+                &Weights::default(),
+                p,
+                now,
+            )
+            .unwrap();
+            assert_eq!(summary(&pooled), summary(&inline), "{}", p.query);
+            assert_eq!(
+                pooled.raw_fallback, !p.include_raw,
+                "{}: include_raw, or the raw fallback",
+                p.query
+            );
+            assert!(
+                pooled
+                    .hits
+                    .iter()
+                    .any(|h| h.tier == Tier::Raw && h.matched.contains(&MatchVia::Vector)),
+                "{}: {:?}",
+                p.query,
+                pooled.hits
+            );
+        }
+    }
+
+    /// A chunk vector list that fails (here its pool cannot open the database) leaves the
+    /// lexical lists: the raw tier is found by words, as without an index.
+    #[test]
+    fn a_failing_chunk_read_pool_leaves_the_word_matches() {
+        let (f, params) = chunk_fixture();
+        let broken = crate::store::ReaderPool::new(f._d.path().join("gone").join("a.db"), 1);
+        for p in &params {
+            let v = embed_query(Some(&f.idx), &f.e, &query_text(&p.query).unwrap());
+            let out = run_with_chunk_reads(
+                &f.c,
+                Some(&f.idx),
+                v,
+                ChunkReads::Pool(&broken),
+                &Weights::default(),
+                p,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            let raw: Vec<&Hit> = out.hits.iter().filter(|h| h.tier == Tier::Raw).collect();
+            assert!(!raw.is_empty(), "{}: {:?}", p.query, out.hits);
+            assert!(
+                raw.iter().all(|h| h.matched == vec![MatchVia::Words]),
+                "{}: {raw:?}",
+                p.query
+            );
+        }
     }
 
     #[test]
