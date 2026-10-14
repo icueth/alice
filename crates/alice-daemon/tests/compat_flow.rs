@@ -1553,14 +1553,16 @@ async fn an_unusable_room_is_noted_and_big_graph_and_diary_answers_are_capped() 
     let q = f.call("mempalace_kg_query", json!({"entity": "hub"})).await;
     assert_eq!(
         (
-            q["truncated"].as_bool(),
+            q["truncated"].clone(),
             q["total"].as_u64(),
             q["count"].as_u64()
         ),
-        (Some(true), Some(230), Some(200)),
+        (json!(["active_facts"]), Some(230), Some(200)),
         "{}",
         q["note"]
     );
+    assert_eq!(q["facts_omitted"], true);
+    assert_eq!(q["facts"].as_array().unwrap().len(), 0);
     let long = "x".repeat(20_000);
     f.call(
         "mempalace_diary_write",
@@ -1617,5 +1619,106 @@ async fn while_read_only_new_memories_are_queued_and_other_writes_say_so_plainly
             e.contains("read-only") && e.contains("not saved") && !e.contains("disk is full"),
             "{tool}: {r}"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capped_kg_query_keeps_current_facts_and_drops_the_oldest_ended_ones() {
+    let f = Flow::imported().await;
+    // 215 ended facts (n000 oldest), then 3 active and 1 future
+    for i in 0..215 {
+        f.call(
+            "mempalace_kg_add",
+            json!({"subject": "hub", "predicate": "saw", "object": format!("n{i:03}"),
+                   "valid_from": format!("2020-01-{:02}T00:{:02}:00Z", 1 + i / 60, i % 60),
+                   "valid_to": "2021-01-01"}),
+        )
+        .await;
+    }
+    for o in ["live1", "live2", "live3"] {
+        f.call(
+            "mempalace_kg_add",
+            json!({"subject": "hub", "predicate": "is", "object": o, "valid_from": "2024-01-01"}),
+        )
+        .await;
+    }
+    f.call("mempalace_kg_add", json!({"subject": "hub", "predicate": "will", "object": "soon", "valid_from": "2999-01-01"})).await;
+    let q = f.call("mempalace_kg_query", json!({"entity": "hub"})).await;
+    assert_eq!(q["total"], 219, "{}", q["note"]);
+    assert_eq!(q["count"], 200);
+    assert_eq!(q["truncated"], json!(["historical_facts"]));
+    assert_eq!(q["active_facts"].as_array().unwrap().len(), 3);
+    assert_eq!(q["future_facts"][0]["object"], "soon");
+    let hist: Vec<&str> = q["historical_facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["object"].as_str().unwrap())
+        .collect();
+    assert_eq!(hist.len(), 196);
+    assert_eq!(
+        (hist[0], *hist.last().unwrap()),
+        ("n019", "n214"),
+        "oldest dropped, newest kept"
+    );
+    assert!(q["facts"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secret_shaped_agent_name_is_stored_and_shown_redacted_and_diary_titles_are_one_clean_line()
+ {
+    let f = Flow::imported().await;
+    let sec = secret();
+    let agent = format!("agent-{sec}");
+    let w = f
+        .call("mempalace_diary_write", json!({"agent_name": agent, "entry": "hello", "topic": format!("line one\nline\u{7}two {sec}")}))
+        .await;
+    assert_eq!(w["success"], true, "{w}");
+    let a = f
+        .call(
+            "mempalace_add_drawer",
+            json!({"wing": "pg-ai", "room": "notes", "content": "x", "added_by": agent}),
+        )
+        .await;
+    let r = f
+        .call("mempalace_diary_read", json!({"agent_name": agent}))
+        .await;
+    assert_eq!(r["total"], 1, "{r}");
+    let u = f
+        .call_as(
+            &agent,
+            "mempalace_update_drawer",
+            json!({"drawer_id": a["drawer_id"], "content": "y"}),
+        )
+        .await;
+    for v in [&w, &a, &r, &u] {
+        assert!(!v.to_string().contains(sec), "{v}");
+    }
+    assert!(w["agent"].as_str().unwrap().contains("redacted"), "{w}");
+    let m = f.memory(w["entry_id"].as_str().unwrap()).await;
+    assert!(
+        !m.title.contains(sec) && !m.title.contains('\n') && !m.title.chars().any(char::is_control),
+        "{:?}",
+        m.title
+    );
+    assert!(!m.title.contains("ghp_"), "{}", m.title);
+    // nothing in the database or the event log holds it
+    let c = rusqlite::Connection::open(f.svc.home().db()).unwrap();
+    for sql in [
+        "SELECT count(*) FROM memories WHERE instr(coalesce(author_agent,'') || title || body, ?1) > 0",
+        "SELECT count(*) FROM events WHERE instr(actor || coalesce(before_json,'') || coalesce(after_json,''), ?1) > 0",
+    ] {
+        let n: i64 = c.query_row(sql, [sec], |r| r.get(0)).unwrap();
+        if n != 0 {
+            let rows: Vec<String> = c
+                .prepare("SELECT action || ' ' || actor || ' ' || coalesce(before_json,'') || ' ' || coalesce(after_json,'') FROM events")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .filter(|t: &String| t.contains(sec))
+                .collect();
+            panic!("{sql}: {rows:?}");
+        }
     }
 }

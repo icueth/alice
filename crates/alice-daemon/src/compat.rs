@@ -126,6 +126,8 @@ const DIARY_ENTRY_CHARS: usize = 4_000;
 const DIARY_READ_BYTES: usize = 64_000;
 /// `kg_query` shows at most this many facts (a hub entity must not make a huge answer).
 const KG_QUERY_MAX_FACTS: usize = 200;
+/// Up to this many facts `kg_query` also repeats in the flat `facts` list.
+const KG_QUERY_ALL_ROWS: usize = 50;
 const TRASHED_REFUSAL: &str =
     "this memory was already forgotten (it is in the trash); `alice undo` brings it back";
 const TIMELINE_DEFAULT_LIMIT: u64 = 100;
@@ -755,15 +757,19 @@ impl Service {
         })
     }
 
-    fn author(call: &CompatCall, name: Option<String>) -> Author {
+    /// The author of a write. A name is a caller's text like any other, so it is redacted
+    /// before it is stored (`author_agent`, the event's actor) or shown.
+    fn author(&self, call: &CompatCall, name: Option<String>) -> Author {
         Author {
-            agent: name.or_else(|| {
-                call.agent
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|a| !a.is_empty())
-                    .map(String::from)
-            }),
+            agent: name
+                .or_else(|| {
+                    call.agent
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|a| !a.is_empty())
+                        .map(String::from)
+                })
+                .map(|a| self.redact_echo(&a)),
             ..Default::default()
         }
     }
@@ -791,7 +797,7 @@ impl Service {
                 project: target.project.clone(),
                 topics: topic.iter().cloned().collect(),
                 cwd: call.cwd.clone(),
-                author: Self::author(call, added_by),
+                author: self.author(call, added_by),
                 ..Default::default()
             })
             .await
@@ -897,7 +903,7 @@ impl Service {
                     topics,
                     ..Default::default()
                 },
-                author: Self::author(call, None),
+                author: self.author(call, None),
             })
             .await
             .map_err(write_error)?;
@@ -933,7 +939,7 @@ impl Service {
                     action: UpdateAction::Forget,
                     ..Default::default()
                 },
-                author: Self::author(call, None),
+                author: self.author(call, None),
             })
             .await
             .map_err(write_error)?;
@@ -956,7 +962,10 @@ impl Service {
         call: &CompatCall,
         args: &Args,
     ) -> std::result::Result<Value, String> {
-        let agent = args.required_str("agent_name")?.trim().to_lowercase();
+        let agent = self
+            .redact_echo(&args.required_str("agent_name")?)
+            .trim()
+            .to_lowercase();
         let entry = match args.opt_str("entry")? {
             Some(e) => e,
             None => args
@@ -966,7 +975,14 @@ impl Service {
         let topic = args.opt_str("topic")?;
         let wing = args.opt_str("wing")?;
         let target = self.compat_target(wing.as_deref()).await?;
-        let shown = topic.clone().unwrap_or_else(|| "general".into());
+        // Redacted, then flattened to one line, and only then shortened: a cut made first could
+        // leave half a secret that no detector recognises.
+        let shown = self
+            .redact_echo(&topic.clone().unwrap_or_else(|| "general".into()))
+            .split_whitespace()
+            .map(|w| w.chars().filter(|c| !c.is_control()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ");
         // A diary entry is an event, not a fact: the same words from another agent, or from the
         // same agent later, are a new entry. The time and the agent are in the title, which the
         // store's duplicate check reads, so only a retry in the same millisecond collides.
@@ -993,7 +1009,6 @@ impl Service {
             })
             .await
             .map_err(write_error)?;
-        let shown = self.redact_echo(&shown);
         let mut notes: Vec<String> = Vec::new();
         let mut out = match (r.status, r.id) {
             (RememberStatus::Spooled, _) | (_, None) => {
@@ -1021,7 +1036,10 @@ impl Service {
     }
 
     async fn compat_diary_read(&self, args: &Args) -> std::result::Result<Value, String> {
-        let agent = args.required_str("agent_name")?.trim().to_lowercase();
+        let agent = self
+            .redact_echo(&args.required_str("agent_name")?)
+            .trim()
+            .to_lowercase();
         let last_n = args
             .opt_u64("last_n")?
             .unwrap_or(DIARY_DEFAULT_ENTRIES)
@@ -1105,9 +1123,7 @@ impl Service {
             .map_err(safe_error)?;
         let me = kg::alias_key(&entity);
         let now = now_millis();
-        let (mut active, mut historical, mut future, mut all) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let mut matched = 0usize;
+        let (mut active, mut historical, mut future) = (Vec::new(), Vec::new(), Vec::new());
         for f in &r.facts {
             let dir = if kg::alias_key(&f.subject) == me {
                 "outgoing"
@@ -1117,12 +1133,7 @@ impl Service {
             if direction != "both" && direction != dir {
                 continue;
             }
-            matched += 1;
-            if matched > KG_QUERY_MAX_FACTS {
-                continue;
-            }
             let row = fact_json(f, Some(dir));
-            all.push(row.clone());
             if as_of.is_some() {
                 active.push(row);
             } else if f.valid_from > now {
@@ -1133,20 +1144,56 @@ impl Service {
                 active.push(row);
             }
         }
+        let matched = active.len() + future.len() + historical.len();
+        // A hub entity must not make a huge answer: what is true now (active, then future)
+        // is kept first, then the newest ended facts; the oldest ended ones are dropped.
+        let mut cut: Vec<&str> = Vec::new();
+        let mut room = KG_QUERY_MAX_FACTS;
+        for (name, rows, newest_first) in [
+            ("active_facts", &mut active, false),
+            ("future_facts", &mut future, false),
+            ("historical_facts", &mut historical, true),
+        ] {
+            if rows.len() > room {
+                cut.push(name);
+                if newest_first {
+                    rows.drain(..rows.len() - room);
+                } else {
+                    rows.truncate(room);
+                }
+            }
+            room -= rows.len();
+        }
+        let shown = active.len() + future.len() + historical.len();
+        // `facts` repeats the buckets for old clients; above a handful it is left out.
+        let facts: Vec<Value> = if shown <= KG_QUERY_ALL_ROWS {
+            active
+                .iter()
+                .chain(&future)
+                .chain(&historical)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut out = json!({
             "entity": entity,
             "as_of": as_of,
             "active_facts": active,
             "historical_facts": historical,
             "future_facts": future,
-            "facts": all,
-            "count": all.len(),
+            "facts": facts,
+            "count": shown,
         });
-        if matched > KG_QUERY_MAX_FACTS {
-            out["truncated"] = json!(true);
+        if shown > KG_QUERY_ALL_ROWS {
+            out["facts_omitted"] = json!(true);
+        }
+        if matched > shown {
+            out["truncated"] = json!(cut);
             out["total"] = json!(matched);
             out["note"] = json!(format!(
-                "only the first {KG_QUERY_MAX_FACTS} facts (oldest first) are shown; use as_of or mempalace_kg_timeline with offset for the rest"
+                "only {shown} of {matched} facts are shown: current and future facts first, then the newest ended ones; {} were cut. Use as_of or mempalace_kg_timeline with offset for the rest",
+                cut.join(", ")
             ));
         }
         Ok(out)
@@ -1178,7 +1225,7 @@ impl Service {
             Some(d) => self.compat_memory(&d).await.ok().map(|m| m.id),
             None => None,
         };
-        let author = Self::author(call, None);
+        let author = self.author(call, None);
         let added = self
             .assert_fact(AssertFact {
                 subject: subject.clone(),
@@ -1257,7 +1304,7 @@ impl Service {
                 object: object.clone(),
                 valid_from: ended,
                 action: FactAction::End,
-                author: Self::author(call, None),
+                author: self.author(call, None),
                 ..Default::default()
             })
             .await
@@ -1321,7 +1368,7 @@ impl Service {
                 object: new_object.clone(),
                 valid_from: at,
                 action: FactAction::Supersede,
-                author: Self::author(call, None),
+                author: self.author(call, None),
                 ..Default::default()
             })
             .await
