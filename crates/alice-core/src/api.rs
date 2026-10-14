@@ -259,6 +259,8 @@ pub enum StreamItem {
     Settings { changed: Vec<String> },
     /// The daemon's health: on connect, then whenever it changes.
     Health { health: Health },
+    /// This client fell behind and `missed` items were dropped; list `/api/v1/events` for them.
+    Lagged { missed: u64 },
 }
 
 /// Raw evidence ingest (used by capture hooks and importers).
@@ -419,6 +421,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v["type"], "settings");
+        let v = serde_json::to_value(StreamItem::Lagged { missed: 3 }).unwrap();
+        assert_eq!(v, serde_json::json!({"type": "lagged", "missed": 3}));
         let q: EventsRequest = serde_json::from_str(r#"{"target_id":"M","limit":5}"#).unwrap();
         assert_eq!(
             (q.target_id.as_deref(), q.limit, q.actor),

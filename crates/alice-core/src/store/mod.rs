@@ -529,7 +529,7 @@ mod tests {
             "M1 rows survive with NULL in the new columns"
         );
         let indexes: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('events_target', 'events_ts', 'events_group', 'review_open_dedupe', 'review_status') ORDER BY name")
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('events_actor', 'events_target', 'events_ts', 'events_group', 'review_open_dedupe', 'review_status') ORDER BY name")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -538,6 +538,7 @@ mod tests {
         assert_eq!(
             indexes,
             [
+                "events_actor",
                 "events_group",
                 "events_target",
                 "events_ts",

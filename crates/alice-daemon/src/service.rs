@@ -208,6 +208,8 @@ pub struct Service {
     /// (embedding worker, writer); taken by `shutdown`.
     threads: Mutex<Option<(JoinHandle<()>, JoinHandle<()>)>>,
     resolver: ProjectResolver,
+    /// The health every event-stream client sends: read at most once per `health_tick`.
+    stream_health: tokio::sync::Mutex<Option<(Instant, Health)>>,
 }
 
 fn device_id(conn: &Connection) -> Result<String> {
@@ -359,6 +361,7 @@ impl Service {
             wake_worker: wake_tx,
             threads: Mutex::new(Some((worker_thread, writer_thread))),
             resolver,
+            stream_health: tokio::sync::Mutex::new(None),
         }))
     }
 
@@ -698,10 +701,24 @@ impl Service {
         }
     }
 
-    /// Recorded changes, newest first (spec §5.5).
-    pub async fn events(&self, req: EventsRequest) -> Result<Vec<EventRow>> {
-        self.read(move |c| alice_core::store::events::list(c, &req))
-            .await
+    /// Recorded changes, newest first (spec §5.5). The actor may be a bare agent name
+    /// (`codex` means `agent:codex`), and a memory may be named by its legacy id.
+    pub async fn events(&self, mut req: EventsRequest) -> Result<Vec<EventRow>> {
+        req.actor = req
+            .actor
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(|a| Actor::parse(a).as_string());
+        self.read(move |c| {
+            if let Some(target) = req.target_id.as_deref()
+                && let Some(own) = memories::id_of(c, target)?
+            {
+                req.target_id = Some(own);
+            }
+            alice_core::store::events::list(c, &req)
+        })
+        .await
     }
 
     /// Reverse a change by its event id. A target that changed since is never overwritten:
@@ -722,7 +739,9 @@ impl Service {
                 reverted,
                 review_id: None,
             }),
-            WriteOutcome::Undo(UndoOutcome::Conflict { review_id, reason }) => Ok(UndoResponse {
+            WriteOutcome::Undo(UndoOutcome::Conflict {
+                review_id, reason, ..
+            }) => Ok(UndoResponse {
                 undone: false,
                 reverted: Vec::new(),
                 message: format!(
@@ -742,6 +761,20 @@ impl Service {
     /// How often the SSE stream checks whether health changed.
     pub fn health_tick(&self) -> Duration {
         self.opts.health_tick
+    }
+
+    /// The health for event-stream clients: one reading per `health_tick` shared by all of
+    /// them (the counts scan tables), so it is at most one tick old.
+    pub async fn stream_health(&self) -> Result<Health> {
+        let mut cached = self.stream_health.lock().await;
+        if let Some((at, h)) = cached.as_ref()
+            && at.elapsed() < self.opts.health_tick
+        {
+            return Ok(h.clone());
+        }
+        let h = self.health().await?;
+        *cached = Some((Instant::now(), h.clone()));
+        Ok(h)
     }
 
     pub async fn ingest(&self, req: IngestRequest) -> Result<IngestOutcome> {
@@ -883,6 +916,114 @@ mod tests {
         let repo = d.path().join(name);
         std::fs::create_dir(&repo).unwrap();
         Some(repo.to_string_lossy().into_owned())
+    }
+
+    /// `alice history --actor codex` and `alice history drawer_7` mean what they say: a bare
+    /// agent name is that agent, and a legacy id finds the memory it names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn history_takes_bare_agent_names_and_legacy_ids() {
+        let (_d, s) = svc().await;
+        let id = match s
+            .writer
+            .submit(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "imported from the palace".into(),
+                    legacy_id: Some("drawer_7".into()),
+                    author: alice_core::model::Author {
+                        agent: Some("codex".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                project: ProjectChoice::Slug("global".into()),
+            })
+            .await
+            .unwrap()
+        {
+            WriteOutcome::Remembered(InsertOutcome::New { id, .. }, _) => id,
+            o => panic!("{o:?}"),
+        };
+        let q = |target: Option<&str>, actor: Option<&str>| EventsRequest {
+            target_id: target.map(Into::into),
+            actor: actor.map(Into::into),
+            ..Default::default()
+        };
+        let by_legacy = s.events(q(Some("drawer_7"), None)).await.unwrap();
+        assert_eq!(by_legacy.len(), 1);
+        assert_eq!(by_legacy[0].target_id, id);
+        for actor in ["codex", "agent:codex", " codex "] {
+            assert_eq!(
+                s.events(q(None, Some(actor))).await.unwrap().len(),
+                1,
+                "{actor:?}"
+            );
+        }
+        assert!(s.events(q(None, Some("user"))).await.unwrap().is_empty());
+        assert_eq!(
+            s.events(q(None, Some(""))).await.unwrap().len(),
+            1,
+            "blank is no filter"
+        );
+    }
+
+    /// A remember queued while the daemon was away is recorded as its writer's, not the
+    /// daemon's, when the spool is replayed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_spooled_remember_is_recorded_as_its_original_agent() {
+        let (_d, s) = svc().await;
+        spool::append(
+            &s.home.spool_dir(),
+            &spool::SpoolEntry::Remember(RememberRequest {
+                content: "written while the daemon was down".into(),
+                author: alice_core::model::Author {
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let r = spool::drain(&s.home.spool_dir(), &s).await;
+        assert_eq!(r.processed, 1);
+        let evs = s.events(EventsRequest::default()).await.unwrap();
+        assert_eq!(
+            (evs[0].action.as_str(), evs[0].actor.as_str()),
+            ("memory.create", "agent:codex")
+        );
+    }
+
+    /// Every event-stream client shares one health reading per tick: the counts are read once,
+    /// not once per connected client.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_health_is_read_once_per_tick_for_all_clients() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                // Longer than a slow CI machine's remember below.
+                health_tick: Duration::from_secs(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let first_read = tokio::time::Instant::now();
+        let (a, b) = tokio::join!(s.stream_health(), s.stream_health());
+        assert_eq!(a.unwrap().memories, 0);
+        assert_eq!(b.unwrap().memories, 0);
+        s.remember(RememberRequest {
+            content: "counted on the next tick".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.stream_health().await.unwrap().memories,
+            0,
+            "the reading of this tick is shared"
+        );
+        tokio::time::sleep_until(first_read + Duration::from_millis(3_100)).await;
+        assert_eq!(s.stream_health().await.unwrap().memories, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

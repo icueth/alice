@@ -202,7 +202,12 @@ fn set_status(conn: &Connection, seq: i64, status: Status, hlc: Option<&str>) ->
 
 /// The dedup index (`project_id`, `content_hash`) skips trashed rows, so a row that edits its
 /// text or leaves the trash must not take the content of another live memory.
-fn ensure_unique_content(conn: &Connection, seq: i64, project_id: &str, hash: &str) -> Result<()> {
+pub(crate) fn ensure_unique_content(
+    conn: &Connection,
+    seq: i64,
+    project_id: &str,
+    hash: &str,
+) -> Result<()> {
     let other: Option<String> = conn
         .query_row(
             "SELECT id FROM memories WHERE project_id = ?1 AND content_hash = ?2 AND status <> 'trashed' AND seq <> ?3",

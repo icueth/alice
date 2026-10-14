@@ -5,6 +5,7 @@ ALTER TABLE events ADD COLUMN group_id TEXT;
 CREATE INDEX events_target ON events(target_type, target_id, ts);
 CREATE INDEX events_ts ON events(ts);
 CREATE INDEX events_group ON events(group_id) WHERE group_id IS NOT NULL;
+CREATE INDEX events_actor ON events(actor);
 
 -- One open review item per question: the judge or a weekly job asking again finds it.
 ALTER TABLE review_items ADD COLUMN dedupe_key TEXT;

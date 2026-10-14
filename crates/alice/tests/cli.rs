@@ -640,7 +640,7 @@ fn every_subcommand_round_trips() {
     assert_eq!(created["target_id"], other);
     assert_eq!(created["actor"], "agent:codex");
     let event = created["id"].as_str().unwrap().to_string();
-    let listed = e.ok(&["history", "--actor", "agent:codex", "--limit", "1"]);
+    let listed = e.ok(&["history", "--actor", "codex", "--limit", "1"]);
     assert!(
         listed.contains(&event) && listed.contains("memory.create") && listed.lines().count() == 1,
         "{listed}"

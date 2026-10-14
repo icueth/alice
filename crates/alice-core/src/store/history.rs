@@ -46,8 +46,13 @@ pub enum UndoOutcome {
         group: String,
         reverted: Vec<String>,
     },
-    /// Nothing was changed: the target changed since, and review item `review_id` asks.
-    Conflict { review_id: String, reason: String },
+    /// Nothing was changed: the target changed since, and review item `review_id` asks
+    /// (`created`: the item is new; otherwise it was already open, asking the same).
+    Conflict {
+        review_id: String,
+        reason: String,
+        created: bool,
+    },
 }
 
 pub fn snapshot_memory(conn: &Connection, id: &str) -> Result<Option<MemorySnapshot>> {
@@ -113,13 +118,41 @@ fn to_json<T: Serialize>(v: T) -> Result<serde_json::Value> {
     serde_json::to_value(v).map_err(|e| AliceError::Other(format!("snapshot: {e}")))
 }
 
-/// The target as it is now, in the form events record.
+/// The target as it is now, in the form events record (`None`: the row does not exist). Undo
+/// knows memories and relations; any other target type is refused as such.
 fn current(conn: &Connection, target_type: &str, id: &str) -> Result<Option<serde_json::Value>> {
-    Ok(match target_type {
-        "memory" => snapshot_memory(conn, id)?.map(to_json).transpose()?,
-        "relation" => snapshot_relation(conn, id)?.map(to_json).transpose()?,
-        _ => None,
-    })
+    match target_type {
+        "memory" => snapshot_memory(conn, id)?.map(to_json).transpose(),
+        "relation" => snapshot_relation(conn, id)?.map(to_json).transpose(),
+        other => Err(AliceError::invalid(format!(
+            "changes to a {other} cannot be undone; only memory and fact changes can"
+        ))),
+    }
+}
+
+/// An event's recorded before and after states, read strictly: an unreadable one is an error,
+/// never mistaken for "did not exist" (which undo would answer by trashing or deleting).
+fn states(
+    conn: &Connection,
+    e: &EventRow,
+) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
+    let (before, after): (Option<String>, Option<String>) = conn.query_row(
+        "SELECT before_json, after_json FROM events WHERE id = ?1",
+        [&e.id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let parse = |which: &str, raw: Option<String>| -> Result<Option<serde_json::Value>> {
+        raw.map(|s| {
+            serde_json::from_str(&s).map_err(|err| {
+                AliceError::invalid(format!(
+                    "event {}: its recorded {which}-state is unreadable ({err}); it cannot be undone",
+                    e.id
+                ))
+            })
+        })
+        .transpose()
+    };
+    Ok((parse("before", before)?, parse("after", after)?))
 }
 
 /// Activation (`pending` → `active` once background work is done) is not a change anyone
@@ -143,18 +176,10 @@ fn restore_memory(conn: &Connection, id: &str, s: &MemorySnapshot, hlc: &str) ->
     )?;
     let hash = content_hash(&slug, s.kind, &s.title, &s.body);
     if s.status != Status::Trashed {
-        let other: Option<String> = conn
-            .query_row(
-                "SELECT id FROM memories WHERE project_id = ?1 AND content_hash = ?2 AND status <> 'trashed' AND seq <> ?3",
-                params![s.project_id, hash, seq],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(other) = other {
-            return Err(AliceError::invalid(format!(
-                "memory {other} now holds the text this undo would restore; forget or edit it first"
-            )));
-        }
+        memories::ensure_unique_content(conn, seq, &s.project_id, &hash).map_err(|e| match e {
+            AliceError::Invalid(m) => AliceError::invalid(format!("cannot undo: {m}")),
+            e => e,
+        })?;
     }
     let (old_title, old_body): (String, String) = conn.query_row(
         "SELECT title, body FROM memories WHERE seq = ?1",
@@ -251,6 +276,7 @@ fn undoable(action: &str) -> bool {
     !matches!(
         action,
         "undo"
+            | "source.ingest"
             | "memory.purge"
             | "raw.retention"
             | "settings.change"
@@ -343,19 +369,20 @@ pub fn undo(
             continue;
         }
         let now = current(conn, &e.target_type, &e.target_id)?;
-        if now.is_none() && e.after.is_some() {
+        let (_, after) = states(conn, e)?;
+        if now.is_none() && after.is_some() {
             return Err(AliceError::invalid(format!(
                 "{} {} was purged from the trash; it cannot be restored",
                 e.target_type, e.target_id
             )));
         }
-        if comparable(now) != comparable(e.after.clone()) {
+        if comparable(now) != comparable(after) {
             let reason = format!(
                 "{} {} changed after event {}",
                 e.target_type, e.target_id, e.id
             );
             let key = format!("undo:{}", ev.group_id.as_deref().unwrap_or(&ev.id));
-            let created = reviews::create(
+            let (review_id, created) = reviews::open_or_create(
                 conn,
                 &NewReview {
                     kind: ReviewType::Undo,
@@ -366,14 +393,14 @@ pub fn undo(
                         "reason": reason,
                     }),
                     confidence: None,
-                    dedupe_key: Some(key.clone()),
+                    dedupe_key: Some(key),
                 },
             )?;
-            let review_id = match created {
-                Some(id) => id,
-                None => reviews::find_open(conn, &key)?.unwrap_or_default(),
-            };
-            return Ok(UndoOutcome::Conflict { review_id, reason });
+            return Ok(UndoOutcome::Conflict {
+                review_id,
+                reason,
+                created,
+            });
         }
     }
     let group = new_id();
@@ -381,25 +408,35 @@ pub fn undo(
     for e in &todo {
         let h = hlc();
         let before_now = current(conn, &e.target_type, &e.target_id)?;
-        let bad = |err: serde_json::Error| AliceError::Other(format!("event {}: {err}", e.id));
-        match (e.target_type.as_str(), &e.before) {
+        let (before, after) = states(conn, e)?;
+        let bad = |err: serde_json::Error| {
+            AliceError::invalid(format!(
+                "event {}: its recorded state is unreadable ({err}); it cannot be undone",
+                e.id
+            ))
+        };
+        match (e.target_type.as_str(), before) {
             ("memory", Some(b)) => {
-                let s: MemorySnapshot = serde_json::from_value(b.clone()).map_err(bad)?;
+                let s: MemorySnapshot = serde_json::from_value(b).map_err(bad)?;
                 restore_memory(conn, &e.target_id, &s, &h)?;
             }
-            ("memory", None) => {
-                // Undoing a create forgets the memory (it stays in the trash for 30 days).
+            // Only a create has no memory before it: undoing it forgets the memory (it stays
+            // in the trash for 30 days).
+            ("memory", None) if e.action == "memory.create" => {
                 let mut s: MemorySnapshot =
-                    serde_json::from_value(e.after.clone().unwrap_or_default()).map_err(bad)?;
+                    serde_json::from_value(after.unwrap_or_default()).map_err(bad)?;
                 s.status = Status::Trashed;
                 restore_memory(conn, &e.target_id, &s, &h)?;
             }
+            ("memory", None) => {
+                return Err(AliceError::invalid(format!(
+                    "event {} ({}) records no before-state for memory {}; it cannot be undone",
+                    e.id, e.action, e.target_id
+                )));
+            }
             ("relation", b) => {
-                let s: Option<RelationSnapshot> = b
-                    .clone()
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(bad)?;
+                let s: Option<RelationSnapshot> =
+                    b.map(serde_json::from_value).transpose().map_err(bad)?;
                 restore_relation(conn, &e.target_id, s.as_ref(), &h)?;
             }
             (other, _) => {
@@ -724,7 +761,9 @@ mod tests {
         let ev = t.edit(&id, "second text");
         t.edit(&id, "third text");
         match t.undo(&ev).unwrap() {
-            UndoOutcome::Conflict { review_id, reason } => {
+            UndoOutcome::Conflict {
+                review_id, reason, ..
+            } => {
                 assert!(reason.contains(&id), "{reason}");
                 let kind: String =
                     t.c.query_row(
@@ -752,11 +791,21 @@ mod tests {
         let ev = t.edit(&id, "second text");
         t.edit(&id, "third text");
         let first = match t.undo(&ev).unwrap() {
-            UndoOutcome::Conflict { review_id, .. } => review_id,
+            UndoOutcome::Conflict {
+                review_id, created, ..
+            } => {
+                assert!(created, "the first ask adds the item");
+                review_id
+            }
             other => panic!("{other:?}"),
         };
         let second = match t.undo(&ev).unwrap() {
-            UndoOutcome::Conflict { review_id, .. } => review_id,
+            UndoOutcome::Conflict {
+                review_id, created, ..
+            } => {
+                assert!(!created, "asking again reuses the open item");
+                review_id
+            }
             other => panic!("{other:?}"),
         };
         assert_eq!(first, second);
@@ -851,6 +900,71 @@ mod tests {
         let err = t.undo(&ev2).unwrap_err().to_string();
         assert!(err.contains("purged"), "{err}");
         let _ = Author::default();
+    }
+
+    /// A corrupt record must never read as "the memory did not exist", which undo answers by
+    /// trashing it: an unreadable snapshot, or an edit without one, is refused and nothing
+    /// changes.
+    #[test]
+    fn an_unreadable_or_missing_snapshot_is_refused_not_read_as_a_create() {
+        let mut t = T::new();
+        let id = t.remember("keep me");
+        let ev = t.edit(&id, "keep me, edited");
+        t.c.execute(
+            "UPDATE events SET before_json = '{not json' WHERE id = ?1",
+            [&ev],
+        )
+        .unwrap();
+        let err = t.undo(&ev).unwrap_err();
+        assert!(
+            matches!(&err, AliceError::Invalid(m) if m.contains(&ev) && m.contains("unreadable")),
+            "{err}"
+        );
+        assert_eq!(
+            (t.status(&id).as_str(), t.body(&id).as_str()),
+            ("pending", "keep me, edited")
+        );
+        t.c.execute("UPDATE events SET before_json = NULL WHERE id = ?1", [&ev])
+            .unwrap();
+        let err = t.undo(&ev).unwrap_err();
+        assert!(
+            matches!(&err, AliceError::Invalid(m) if m.contains(&ev) && m.contains("before")),
+            "{err}"
+        );
+        assert_eq!(t.status(&id), "pending", "not trashed");
+        // An unreadable after-state is refused too, not taken for a change.
+        let ev2 = t.edit(&id, "edited again");
+        t.c.execute("UPDATE events SET after_json = '[' WHERE id = ?1", [&ev2])
+            .unwrap();
+        let err = t.undo(&ev2).unwrap_err().to_string();
+        assert!(err.contains("unreadable"), "{err}");
+        assert_eq!(reviews::count_open(&t.c).unwrap(), 0);
+    }
+
+    /// Undo knows memories and relations. A change to anything else is refused as such, never
+    /// reported as purged.
+    #[test]
+    fn events_on_other_targets_are_refused_as_such() {
+        let mut t = T::new();
+        for (action, target_type) in [("widget.change", "widget"), ("source.ingest", "source")] {
+            let ev = t.record(
+                EventInput {
+                    actor: &Actor::User,
+                    action,
+                    target_type,
+                    target_id: "X1",
+                    before: Some(serde_json::json!({"a": 1})),
+                    after: Some(serde_json::json!({"a": 2})),
+                    group: None,
+                },
+                "h",
+            );
+            let err = t.undo(&ev).unwrap_err().to_string();
+            assert!(
+                err.contains("cannot be undone") && !err.contains("purged"),
+                "{action}: {err}"
+            );
+        }
     }
 
     #[test]

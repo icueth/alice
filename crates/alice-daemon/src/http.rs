@@ -332,44 +332,59 @@ struct Feed {
     tick: tokio::time::Interval,
     /// The health last sent, without the fields that change on every reading.
     last: Option<serde_json::Value>,
+    /// The last health reading failed (logged once until it works again).
+    health_failing: bool,
     shutdown: CancellationToken,
 }
 
-fn sse_event(item: &StreamItem) -> Event {
-    Event::default().data(serde_json::to_string(item).unwrap_or_default())
-}
-
-/// Server-sent events: every committed change as JSON `StreamItem`s, plus the health on
-/// connect and whenever it changes (checked every `health_tick`). The stream ends when the
-/// daemon stops, so a graceful shutdown never waits for a client that stays connected.
-async fn stream(
-    State(st): State<AppState>,
-) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let mut tick = tokio::time::interval(st.svc.health_tick());
+/// The items of one event-stream client: committed changes as they are broadcast, `Lagged`
+/// when it fell too far behind to get them all, and the health on connect and whenever it
+/// changes (checked every `health_tick`, one reading shared by every client). It ends when
+/// `shutdown` is cancelled.
+pub(crate) fn feed(
+    svc: Arc<Service>,
+    shutdown: CancellationToken,
+) -> impl futures::Stream<Item = StreamItem> {
+    let mut tick = tokio::time::interval(svc.health_tick());
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick fires at once: the stream opens with the current health.
     let feed = Feed {
-        rx: st.svc.subscribe(),
-        svc: st.svc.clone(),
+        rx: svc.subscribe(),
+        svc,
         tick,
         last: None,
-        shutdown: st.shutdown.clone(),
+        health_failing: false,
+        shutdown,
     };
-    let s = futures::stream::unfold(feed, |mut f| async move {
+    futures::stream::unfold(feed, |mut f| async move {
         loop {
             tokio::select! {
                 _ = f.shutdown.cancelled() => return None,
                 item = f.rx.recv() => match item {
-                    Ok(item) => return Some((Ok(sse_event(&item)), f)),
-                    // A slow client missed items; it can list /api/v1/events again.
-                    Err(RecvError::Lagged(n)) => {
-                        tracing::debug!(missed = n, "event stream client fell behind");
-                        continue;
+                    Ok(item) => return Some((item, f)),
+                    // The oldest items were dropped for this client; it can list them again.
+                    Err(RecvError::Lagged(missed)) => {
+                        return Some((StreamItem::Lagged { missed }, f));
                     }
                     Err(RecvError::Closed) => return None,
                 },
                 _ = f.tick.tick() => {
-                    let Ok(health) = f.svc.health().await else { continue };
+                    let health = match f.svc.stream_health().await {
+                        Ok(h) => {
+                            if f.health_failing {
+                                tracing::info!("the event stream reads the health again");
+                                f.health_failing = false;
+                            }
+                            h
+                        }
+                        Err(e) => {
+                            if !f.health_failing {
+                                tracing::warn!(error = %e, "the event stream cannot read the health; it is sent again once it can be read");
+                                f.health_failing = true;
+                            }
+                            continue;
+                        }
+                    };
                     // Memory use changes on every reading; it alone is not a change.
                     let mut key = serde_json::to_value(&health).unwrap_or_default();
                     if let Some(o) = key.as_object_mut() {
@@ -377,12 +392,25 @@ async fn stream(
                     }
                     if f.last.as_ref() != Some(&key) {
                         f.last = Some(key);
-                        return Some((Ok(sse_event(&StreamItem::Health { health })), f));
+                        return Some((StreamItem::Health { health }, f));
                     }
                 }
             }
         }
-    });
+    })
+}
+
+fn sse_event(item: &StreamItem) -> Event {
+    Event::default().data(serde_json::to_string(item).unwrap_or_default())
+}
+
+/// Server-sent events: `feed`, one JSON `StreamItem` per message. The stream ends when the
+/// daemon stops, so a graceful shutdown never waits for a client that stays connected.
+async fn stream(
+    State(st): State<AppState>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    use futures::StreamExt;
+    let s = feed(st.svc.clone(), st.shutdown.clone()).map(|item| Ok(sse_event(&item)));
     Sse::new(s).keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE))
 }
 
@@ -432,6 +460,42 @@ mod tests {
     use crate::paths::AliceHome;
     use crate::service::ServiceOptions;
     use alice_core::embed::{Embedder, FakeEmbedder};
+
+    /// A client that falls more than the stream's capacity behind is told how many items it
+    /// missed (it can list `/api/v1/events` again), instead of a silent gap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lagging_client_is_told_how_many_items_it_missed() {
+        use futures::StreamExt;
+        let d = tempfile::tempdir().unwrap();
+        let svc = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                health_tick: std::time::Duration::from_secs(3_600),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut items = Box::pin(feed(svc.clone(), CancellationToken::new()));
+        assert!(matches!(
+            items.next().await,
+            Some(StreamItem::Health { .. })
+        ));
+        let writes = (0..300).map(|i| {
+            svc.remember(RememberRequest {
+                content: format!("burst {i}"),
+                ..Default::default()
+            })
+        });
+        for r in futures::future::join_all(writes).await {
+            r.unwrap();
+        }
+        match items.next().await {
+            Some(StreamItem::Lagged { missed }) => assert_eq!(missed, 300 - 256),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(items.next().await, Some(StreamItem::Event { .. })));
+    }
 
     /// Review focus #3 (lose no writes): a read-only database spools `remember` and says so.
     #[tokio::test(flavor = "multi_thread")]

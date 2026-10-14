@@ -107,7 +107,15 @@ struct Job {
     op: WriteOp,
     reply: Reply,
     /// For an ingest continued from an earlier batch: what its committed slices did.
-    progress: Option<IngestOutcome>,
+    progress: Option<IngestProgress>,
+}
+
+/// An ingest request part-way through: what its committed slices did, and the text bytes of
+/// the whole request (for its summary event).
+#[derive(Debug)]
+struct IngestProgress {
+    done: IngestOutcome,
+    request_bytes: usize,
 }
 
 /// What applying a job did.
@@ -115,7 +123,7 @@ enum Applied {
     Done(WriteOutcome),
     /// Part of an ingest is written (or none, when this batch had no room left); the rest
     /// continues in the next batch.
-    More(WriteOp, Option<IngestOutcome>),
+    More(WriteOp, Option<IngestProgress>),
 }
 
 /// Set when the database refuses writes (disk full, corruption); cleared only by restart after repair.
@@ -439,10 +447,16 @@ fn undo(conn: &Connection, event_id: &str, actor: &Actor, st: &mut State) -> Res
             }
             st.inserted = true; // restored text is embedded again
         }
-        UndoOutcome::Conflict { review_id, .. } => st.stream.push(StreamItem::Review {
+        // Announced once, when it is added; asking again reuses the open item.
+        UndoOutcome::Conflict {
+            review_id,
+            created: true,
+            ..
+        } => st.stream.push(StreamItem::Review {
             id: review_id.clone(),
             review_type: "undo".into(),
         }),
+        UndoOutcome::Conflict { created: false, .. } => {}
     }
     Ok(WriteOutcome::Undo(out))
 }
@@ -480,13 +494,17 @@ fn ingest_slice(
     project: ProjectChoice,
     source: SourceInput,
     mut chunks: Vec<ChunkInput>,
-    progress: Option<IngestOutcome>,
+    progress: Option<IngestProgress>,
     st: &mut State,
 ) -> Result<Applied> {
-    if progress.is_none() {
-        // The whole request is checked before its first slice is written.
-        sources::validate_chunks(&chunks)?;
-    }
+    let request_bytes = match &progress {
+        Some(p) => p.request_bytes,
+        None => {
+            // The whole request is checked before its first slice is written.
+            sources::validate_chunks(&chunks)?;
+            chunks.iter().map(|c| c.text.len()).sum()
+        }
+    };
     let take = slice_len(&chunks, (st.chunk_budget, st.byte_budget));
     if take == 0 && !chunks.is_empty() {
         let op = WriteOp::Ingest {
@@ -506,14 +524,15 @@ fn ingest_slice(
         st.inserted = true;
     }
     let total = match progress {
-        Some(before) => IngestOutcome {
+        Some(p) => IngestOutcome {
             source_id: out.source_id,
-            inserted: before.inserted + out.inserted,
-            skipped: before.skipped + out.skipped,
+            inserted: p.done.inserted + out.inserted,
+            skipped: p.done.skipped + out.skipped,
         },
         None => out,
     };
     if rest.is_empty() {
+        record_ingest(conn, st, &source, &total, request_bytes)?;
         return Ok(Applied::Done(WriteOutcome::Ingested(total)));
     }
     let op = WriteOp::Ingest {
@@ -521,13 +540,61 @@ fn ingest_slice(
         source,
         chunks: rest,
     };
-    Ok(Applied::More(op, Some(total)))
+    Ok(Applied::More(
+        op,
+        Some(IngestProgress {
+            done: total,
+            request_bytes,
+        }),
+    ))
+}
+
+/// One summary event per ingest request (spec §5.5), never one per chunk: recorded with its
+/// last slice, by the source's agent, when the request wrote any chunk. Raw chunks are
+/// evidence, not memories: the event is history only and cannot be undone. A request whose
+/// later slice fails keeps the slices already written, without an event; retrying it writes
+/// the rest and records it.
+fn record_ingest(
+    conn: &Connection,
+    st: &mut State,
+    source: &SourceInput,
+    total: &IngestOutcome,
+    request_bytes: usize,
+) -> Result<()> {
+    if total.inserted == 0 {
+        return Ok(());
+    }
+    let actor = Actor::from_author(&alice_core::model::Author {
+        agent: source.agent.clone(),
+        ..Default::default()
+    });
+    record(
+        conn,
+        st,
+        EventInput {
+            actor: &actor,
+            action: "source.ingest",
+            target_type: "source",
+            target_id: &total.source_id,
+            before: None,
+            after: Some(serde_json::json!({
+                "source_id": total.source_id,
+                "source_type": source.source_type,
+                "uri": source.uri,
+                "inserted": total.inserted,
+                "skipped": total.skipped,
+                "bytes": request_bytes,
+            })),
+            group: None,
+        },
+    )?;
+    Ok(())
 }
 
 fn apply(
     conn: &Connection,
     op: WriteOp,
-    progress: Option<IngestOutcome>,
+    progress: Option<IngestProgress>,
     st: &mut State,
 ) -> Result<Applied> {
     let outcome = match op {
@@ -1702,7 +1769,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
         let out =
             f.h.submit_blocking(WriteOp::Undo {
-                event_id: archive,
+                event_id: archive.clone(),
                 actor: Actor::User,
             })
             .unwrap();
@@ -1718,6 +1785,73 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        // Asking again reuses the open item: nothing new to announce.
+        let out =
+            f.h.submit_blocking(WriteOp::Undo {
+                event_id: archive,
+                actor: Actor::User,
+            })
+            .unwrap();
+        assert!(
+            matches!(&out, WriteOutcome::Undo(UndoOutcome::Conflict { review_id: again, created: false, .. }) if *again == review_id),
+            "{out:?}"
+        );
+        assert!(rx.try_recv().is_err(), "no review item was added");
+    }
+
+    /// Spec §5.5: every change is recorded. An ingest request is one summary event (never one
+    /// per chunk), recorded with its last slice, by the source's agent.
+    #[test]
+    fn an_ingest_request_records_one_summary_event() {
+        let f = fixture();
+        let text = |i: usize| format!("transcript line {i}");
+        let mut op = ingest("session-a", 450, text);
+        if let WriteOp::Ingest { source, .. } = &mut op {
+            source.agent = Some("claude-code".into());
+        }
+        let out = ingested(f.h.submit_blocking(op));
+        assert_eq!(out.inserted, 450);
+        let (n, action, target_type, target, actor, after): (
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.query_row(
+                "SELECT (SELECT count(*) FROM events), action, target_type, target_id, actor, after_json FROM events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(n, 1, "one event for a request written in three slices");
+        assert_eq!(
+            (
+                action.as_str(),
+                target_type.as_str(),
+                target.as_str(),
+                actor.as_str()
+            ),
+            (
+                "source.ingest",
+                "source",
+                out.source_id.as_str(),
+                "agent:claude-code"
+            )
+        );
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        let bytes: usize = (0..450).map(|i| text(i).len()).sum();
+        assert_eq!(after["inserted"], 450);
+        assert_eq!(after["skipped"], 0);
+        assert_eq!(after["bytes"], bytes);
+        assert_eq!(after["uri"], "session-a");
+        // A repeat writes no chunk, so it records nothing.
+        ingested(f.h.submit_blocking(ingest("session-a", 450, text)));
+        let n: i64 = f.read("SELECT count(*) FROM events", []);
+        assert_eq!(n, 1);
     }
 
     /// Only committed work is broadcast: a job that fails sends nothing, its neighbours do.

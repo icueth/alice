@@ -101,7 +101,8 @@ pub struct EventQuery {
     /// Only changes to this memory, relation or event.
     #[serde(default)]
     pub target_id: Option<String>,
-    /// Only changes by this actor, written as in the history (`user`, `agent:claude-code`).
+    /// Only changes by this actor, written as in the history (`user`, `agent:claude-code`); the
+    /// daemon also takes a bare agent name (`claude-code`).
     #[serde(default)]
     pub actor: Option<String>,
     #[serde(default)]
@@ -185,7 +186,7 @@ pub fn list(conn: &Connection, q: &EventQuery) -> Result<Vec<EventRow>> {
         ),
         None => None,
     };
-    let mut stmt = conn.prepare_cached(&list_sql(q.target_id.is_some()))?;
+    let mut stmt = conn.prepare_cached(&list_sql(q.target_id.is_some(), q.actor.is_some()))?;
     Ok(stmt
         .query_map(params![q.target_id, q.actor, before_rowid, limit], row)?
         .collect::<std::result::Result<_, _>>()?)
@@ -199,17 +200,24 @@ const TARGET_TYPES: &str = "WITH RECURSIVE tt(x) AS (
         SELECT (SELECT min(target_type) FROM events WHERE target_type > tt.x) FROM tt WHERE tt.x IS NOT NULL
     ) SELECT x FROM tt WHERE x IS NOT NULL";
 
-/// `list`'s query; parameters: target id, actor, rowid bound, limit. With a target it reads
-/// that target's rows through the `events_target` index; without one it walks the newest rows.
-fn list_sql(by_target: bool) -> String {
+/// `list`'s query; parameters: target id, actor, rowid bound, limit. A target is read through
+/// `events_target`, an actor alone through `events_actor`, and a page bound seeks by rowid, so
+/// no filter or page reads the whole table.
+fn list_sql(by_target: bool, by_actor: bool) -> String {
     let target = if by_target {
         format!("target_type IN ({TARGET_TYPES}) AND target_id = ?1")
     } else {
         "?1 IS NULL".to_string()
     };
+    let actor = match (by_target, by_actor) {
+        // The target's few rows are filtered; `+` keeps the planner on the target index.
+        (true, true) => "+actor = ?2",
+        (false, true) => "actor = ?2",
+        (_, false) => "?2 IS NULL",
+    };
     format!(
         "SELECT {COLUMNS} FROM events
-         WHERE {target} AND (?2 IS NULL OR actor = ?2) AND (?3 IS NULL OR rowid < ?3)
+         WHERE {target} AND {actor} AND rowid < coalesce(?3, 9223372036854775807)
          ORDER BY rowid DESC LIMIT ?4"
     )
 }
@@ -426,7 +434,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
         let plan: String = c
-            .prepare(&format!("EXPLAIN QUERY PLAN {}", list_sql(true)))
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", list_sql(true, false)))
             .unwrap()
             .query_map(params!["M", None::<String>, None::<i64>, 50], |r| {
                 r.get::<_, String>(3)
@@ -466,6 +474,90 @@ mod tests {
             assert_eq!(got.len(), 1, "{id}");
             assert_eq!(got[0].target_id, id);
         }
+    }
+
+    fn plan(c: &Connection, sql: &str, p: impl rusqlite::Params) -> String {
+        c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(p, |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// Deep pages (`before=`) seek by rowid instead of walking down from the newest row, and
+    /// the actor filter reads the `events_actor` index; a target still uses its own index.
+    #[test]
+    fn paging_and_the_actor_filter_use_indexes() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        let none = None::<String>;
+        let page = plan(
+            &c,
+            &list_sql(false, false),
+            params![none, none, 10i64, 50i64],
+        );
+        assert!(
+            page.contains("USING INTEGER PRIMARY KEY (rowid<?)"),
+            "{page}"
+        );
+        let actor = plan(
+            &c,
+            &list_sql(false, true),
+            params![none, "user", 10i64, 50i64],
+        );
+        assert!(
+            actor.contains("USING INDEX events_actor (actor=? AND rowid<?)"),
+            "{actor}"
+        );
+        let both = plan(
+            &c,
+            &list_sql(true, true),
+            params!["M", "user", 10i64, 50i64],
+        );
+        assert!(both.contains("USING INDEX events_target"), "{both}");
+        // The same answers as before.
+        let mut ids = Vec::new();
+        for (i, who) in [Actor::User, Actor::Agent("codex".into()), Actor::User]
+            .iter()
+            .enumerate()
+        {
+            ids.push(
+                record(
+                    &c,
+                    &EventInput {
+                        actor: who,
+                        ..input(if i == 1 { "B" } else { "A" }, serde_json::json!(i))
+                    },
+                    "h",
+                )
+                .unwrap(),
+            );
+        }
+        let users = list(
+            &c,
+            &EventQuery {
+                actor: Some("user".into()),
+                before: Some(ids[2].clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            users.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            [ids[0].clone()]
+        );
+        let both = list(
+            &c,
+            &EventQuery {
+                target_id: Some("B".into()),
+                actor: Some("agent:codex".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(both.len(), 1);
     }
 
     /// A page cursor that names no event is refused: silently starting again from the newest

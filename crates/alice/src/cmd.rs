@@ -162,7 +162,8 @@ pub struct FactArgs {
 pub struct HistoryArgs {
     /// A memory or relation id; omit for all recent changes.
     pub target: Option<String>,
-    /// Only changes by this actor: user, agent:<name>, judge:<provider>, sync, import, system.
+    /// Only changes by this actor: user, an agent (codex or agent:codex), judge:<provider>,
+    /// sync, import or system.
     #[arg(long)]
     pub actor: Option<String>,
     #[arg(long, default_value_t = 20)]
