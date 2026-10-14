@@ -234,9 +234,10 @@ mod tests {
 
     #[test]
     fn the_lock_holder_is_the_live_process_that_holds_the_lock() {
+        use std::io::Write;
         let (_d, home) = home();
         assert!(lock_free(&home) && lock_holder(&home).is_none());
-        let f = std::fs::OpenOptions::new()
+        let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -244,12 +245,20 @@ mod tests {
             .open(home.lock_file())
             .unwrap();
         f.try_lock().unwrap();
-        std::fs::write(home.lock_file(), format!("{}\n", std::process::id())).unwrap();
-        assert_eq!(lock_pid(&home), Some(std::process::id()));
+        // Through the locked handle, as the daemon writes it.
+        f.set_len(0).unwrap();
+        writeln!(f, "{}", std::process::id()).unwrap();
         assert!(!lock_free(&home));
-        assert_eq!(lock_holder(&home), Some(std::process::id()));
+        // Unix locks are advisory, so another handle reads the pid of a held lock; Windows
+        // locks are mandatory and keep a held lock file unreadable (lock_pid gives None).
+        #[cfg(unix)]
+        {
+            assert_eq!(lock_pid(&home), Some(std::process::id()));
+            assert_eq!(lock_holder(&home), Some(std::process::id()));
+        }
         drop(f);
         assert!(lock_free(&home));
+        assert_eq!(lock_pid(&home), Some(std::process::id()));
         assert_eq!(lock_holder(&home), None, "the pid in a free lock is stale");
     }
 }

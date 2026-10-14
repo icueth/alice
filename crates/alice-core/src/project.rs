@@ -143,7 +143,41 @@ fn main_checkout(common_dir: &Path) -> PathBuf {
     }
 }
 
-/// Both paths must be canonical (on Windows, `canonicalize` adds a `\\?\` prefix).
+/// `canonicalize` on Windows returns `\\?\C:\…` (and `\\?\UNC\server\share\…`), which git and
+/// people do not use; strip it so keys and `git -C` see the ordinary form. Identity elsewhere.
+/// Only the drive (`\\?\C:\`) and UNC forms are rewritten: a volume GUID path
+/// (`\\?\Volume{…}\`) has no ordinary form and stays as it is.
+pub fn strip_verbatim(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let kind = match p.components().next() {
+            Some(Component::Prefix(prefix)) => Some(prefix.kind()),
+            _ => None,
+        };
+        match (kind, p.to_str()) {
+            (Some(Prefix::VerbatimDisk(_)), Some(s)) => {
+                if let Some(rest) = s.strip_prefix(r"\\?\") {
+                    return PathBuf::from(rest);
+                }
+            }
+            (Some(Prefix::VerbatimUNC(..)), Some(s)) => {
+                if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                    return PathBuf::from(format!(r"\\{rest}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    p
+}
+
+/// `canonicalize` without the Windows verbatim prefix (see [`strip_verbatim`]).
+fn canonical(p: &Path) -> std::io::Result<PathBuf> {
+    p.canonicalize().map(strip_verbatim)
+}
+
+/// Both paths must come from [`canonical`].
 fn is_home_or_root(dir: &Path, home: Option<&Path>) -> bool {
     dir.parent().is_none() || home == Some(dir)
 }
@@ -154,17 +188,17 @@ pub fn detect_project(cwd: &Path) -> ProjectRef {
 }
 
 fn detect_with_home(cwd: &Path, home: Option<&Path>) -> ProjectRef {
-    let Ok(dir) = cwd.canonicalize() else {
+    let Ok(dir) = canonical(cwd) else {
         return ProjectRef::global();
     };
-    let home = home.map(|h| h.canonicalize().unwrap_or_else(|_| h.to_path_buf()));
+    let home = home.map(|h| canonical(h).unwrap_or_else(|_| h.to_path_buf()));
     let home = home.as_deref();
     if is_home_or_root(&dir, home) {
         return ProjectRef::global();
     }
     if let Some((root, common_dir)) = git_toplevel_and_common_dir(&dir)
         // A repository rooted at $HOME (dotfiles) does not claim every directory below it.
-        && !is_home_or_root(&root.canonicalize().unwrap_or_else(|_| root.clone()), home)
+        && !is_home_or_root(&canonical(&root).unwrap_or_else(|_| root.clone()), home)
     {
         // `get-url` applies `url.<base>.insteadOf` rewrites; the raw config value does not.
         let remote_raw = git_output(&root, &["remote", "get-url", "origin"]);
@@ -504,6 +538,32 @@ mod tests {
         assert!(p.key.ends_with("Documents"), "{}", p.key);
         // Without the home rule the same directory is part of the repository.
         assert_eq!(detect_with_home(&docs, None).slug, "home");
+    }
+
+    #[test]
+    fn strip_verbatim_keeps_ordinary_paths() {
+        let p = PathBuf::from("/tmp/x");
+        assert_eq!(strip_verbatim(p.clone()), p);
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                strip_verbatim(PathBuf::from(r"\\?\C:\work\repo")),
+                PathBuf::from(r"C:\work\repo")
+            );
+            assert_eq!(
+                strip_verbatim(PathBuf::from(r"\\?\UNC\srv\share\r")),
+                PathBuf::from(r"\\srv\share\r")
+            );
+            let volume = PathBuf::from(r"\\?\Volume{b75e2c83-0000-0000-0000-602f00000000}\r");
+            assert_eq!(strip_verbatim(volume.clone()), volume);
+            // What detection sees: the ordinary form of the current directory.
+            let cwd = canonical(Path::new(".")).unwrap();
+            assert!(
+                !cwd.to_string_lossy().starts_with(r"\\?\"),
+                "{}",
+                cwd.display()
+            );
+        }
     }
 
     #[test]

@@ -23,7 +23,12 @@
 //!   add that raises the top level rewrites the entry point, and reusing a removed slot copies
 //!   the new vector in place; searches read all of these without a lock (a search beside the
 //!   first add dereferenced a null vector: SIGSEGV). Adds and removes therefore take the
-//!   part's write lock.
+//!   part's write lock;
+//! - it opens files through C paths, which fail for names that are not ASCII on Windows and
+//!   not UTF-8 on Unix: the part is serialized in memory and its file read and written by Rust
+//!   (`load_from_buffer` / `save_to_buffer`);
+//! - it is built without NumKong (`default-features = false`), whose SIMD kernels do not link
+//!   under MSVC; its own portable distance code is used on every OS.
 //!
 //! Locking, per part: searches, `len` and `save` take the read lock; writes (and capacity
 //! growth) take the write lock. The lock is task-fair, so a write first waits for every
@@ -124,16 +129,6 @@ fn check_dim(what: &str, got: usize, dim: usize) -> Result<()> {
     Ok(())
 }
 
-/// usearch takes paths as C strings; refuse what would not survive the conversion.
-fn utf8(path: &Path) -> Result<&str> {
-    path.to_str().ok_or_else(|| {
-        AliceError::invalid(format!(
-            "the vector index path {} is not valid UTF-8; use a data directory with a UTF-8 path",
-            path.display()
-        ))
-    })
-}
-
 /// The two files `save` writes for `path`: `m.usearch` -> `m.memories.usearch`, `m.chunks.bq`.
 fn part_paths(path: &Path) -> (PathBuf, PathBuf) {
     (
@@ -229,15 +224,18 @@ impl Part {
     /// Fails if the file is missing, unreadable or was built with another dimension, metric
     /// or quantization.
     fn open(path: &Path, dim: usize) -> Result<Self> {
-        let name = utf8(path)?;
-        if !path.exists() {
-            return Err(AliceError::NotFound(format!(
-                "vector index {}",
-                path.display()
-            )));
-        }
+        // Read by Rust, not by usearch: its C paths fail for names that are not ASCII on
+        // Windows (a Thai user name in ALICE_HOME) and for names that are not UTF-8 on Unix.
+        let bytes = std::fs::read(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                AliceError::NotFound(format!("vector index {}", path.display()))
+            }
+            _ => AliceError::Io(e),
+        })?;
         let index = Index::new(&options(dim)).map_err(err)?;
-        index.load(name).map_err(err)?;
+        // `load_from_buffer` copies (unlike `view_from_buffer`), so the bytes can go.
+        index.load_from_buffer(&bytes).map_err(err)?;
+        drop(bytes);
         if index.dimensions() != dim
             || index.metric_kind() != MetricKind::Cos
             || index.scalar_kind() != ScalarKind::I8
@@ -331,7 +329,6 @@ impl Part {
     /// there (the chunk part can be hundreds of MB; one new memory must not rewrite it).
     fn save(&self, path: &Path) -> Result<()> {
         let tmp = path.with_extension("usearch.tmp");
-        let tmp_name = utf8(&tmp)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -340,14 +337,18 @@ impl Part {
         if !self.is_dirty() && self.synced.lock().as_deref() == Some(path) && path.exists() {
             return Ok(());
         }
-        // The read guard lives for this statement only: searches go on, writers wait above.
-        let snapshot = self.inner.read().save(tmp_name).map_err(err);
-        let written = snapshot.and_then(|()| {
-            // Write access: Windows cannot flush a read-only handle.
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&tmp)?
-                .sync_all()?;
+        // Serialized in memory and written by Rust (see `open`). The read guard lives for this
+        // block only: searches go on, writers wait above.
+        let snapshot: Result<Vec<u8>> = {
+            let i = self.inner.read();
+            let mut buf = vec![0u8; i.serialized_length()];
+            i.save_to_buffer(&mut buf).map_err(err).map(|()| buf)
+        };
+        let written = snapshot.and_then(|buf| {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, &buf)?;
+            f.sync_all()?;
+            drop(f);
             std::fs::rename(&tmp, path)?;
             Ok(())
         });
@@ -519,9 +520,9 @@ impl VectorIndex {
 
     /// Load the two files written by `save(path)`. Fails if either is missing, unreadable or
     /// was built with another dimension (or, for memories, metric or quantization); the caller
-    /// then rebuilds. An M1 `chunks.usearch` next to them is ignored.
+    /// then rebuilds. An M1 `chunks.usearch` next to them is ignored. Any path the OS accepts
+    /// works (not ASCII, not UTF-8): both parts are read by Rust.
     pub fn open(path: &Path, model: &str, dim: usize) -> Result<Self> {
-        utf8(path)?;
         let (memories, chunks) = part_paths(path);
         Ok(Self {
             dim,
@@ -657,9 +658,8 @@ impl VectorIndex {
     /// Write `path.with_extension("memories.usearch")` and `path.with_extension("chunks.bq")`,
     /// each atomically. A part that has not changed since it was opened from or saved to that
     /// same file (which still exists) is not rewritten; every other part is. Then the M1 chunk
-    /// file (`chunks.usearch`), if any, is deleted.
+    /// file (`chunks.usearch`), if any, is deleted. Any path the OS accepts works.
     pub fn save(&self, path: &Path) -> Result<()> {
-        utf8(path)?;
         let (memories, chunks) = part_paths(path);
         self.memories.save(&memories)?;
         self.chunks.save(&chunks)?;
@@ -1500,20 +1500,41 @@ mod tests {
         assert_eq!(idx.len(), 4);
     }
 
-    #[cfg(unix)]
+    /// usearch opens files through C paths; the parts are read and written by Rust instead,
+    /// so a data directory with a Thai name (or, on Unix, non-UTF-8 bytes) works.
     #[test]
-    fn non_utf8_paths_are_invalid() {
-        use std::os::unix::ffi::OsStrExt;
+    fn index_files_save_and_open_under_unusual_directory_names() {
+        let e = FakeEmbedder::new(384);
         let d = tempfile::tempdir().unwrap();
-        let bad = d
-            .path()
-            .join(std::ffi::OsStr::from_bytes(b"bad\xff.usearch"));
-        let idx = VectorIndex::new(384).unwrap();
-        assert!(matches!(idx.save(&bad), Err(AliceError::Invalid(_))));
-        assert!(matches!(
-            VectorIndex::open(&bad, "fake", 384),
-            Err(AliceError::Invalid(_))
-        ));
+        let mut dirs = vec![d.path().join("ข้อมูล ทดสอบ").join("vectors")];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            dirs.push(d.path().join(std::ffi::OsStr::from_bytes(b"bad\xffdir")));
+        }
+        for dir in dirs {
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {}
+                // APFS refuses names that are not UTF-8 (EILSEQ); Linux filesystems take any
+                // bytes, so CI on Linux covers that directory.
+                Err(_) if cfg!(target_os = "macos") && dir.to_str().is_none() => continue,
+                Err(e) => panic!("{}: {e}", dir.display()),
+            }
+            let base = dir.join("fake.usearch");
+            let idx = VectorIndex::for_model("fake", 384).unwrap();
+            idx.upsert(VecKey::Memory(1), &v(&e, "unicode path"))
+                .unwrap();
+            idx.upsert(VecKey::Chunk(1), &v(&e, "chunk")).unwrap();
+            idx.save(&base).unwrap();
+            let back = VectorIndex::open(&base, "fake", 384).unwrap();
+            assert_eq!(back.len(), 2, "{}", dir.display());
+            assert_eq!(
+                back.search(&v(&e, "unicode path"), 1, KeyFilter::Memories)
+                    .unwrap()[0]
+                    .0,
+                VecKey::Memory(1)
+            );
+        }
     }
 
     // M2 Task 1: the chunk part is a sign-bit index rescored from the `embeddings` table.

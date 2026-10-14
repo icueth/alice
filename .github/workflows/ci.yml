@@ -10,10 +10,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Windows does not link yet: usearch 2.26.4's NumKong kernels are referenced as dllimport
-    # symbols under MSVC (LNK2019). M2 Task 3 ("Windows build: usearch without NumKong") fixes
-    # it and removes this line, so a Windows failure does not turn main red meanwhile.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
