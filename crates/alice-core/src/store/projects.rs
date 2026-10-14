@@ -159,6 +159,45 @@ pub fn find_by_key(conn: &Connection, key: &str) -> Result<Option<ResolvedProjec
         .optional()?)
 }
 
+/// The working-tree root a project was detected from, if it has one. `project_id_or_slug` is
+/// an id, a slug or an alias.
+pub fn root_of(conn: &Connection, project_id_or_slug: &str) -> Result<Option<String>> {
+    let by_id: Option<Option<String>> = conn
+        .query_row(
+            "SELECT root_path FROM projects WHERE id = ?1",
+            [project_id_or_slug],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(root) = by_id {
+        return Ok(root);
+    }
+    let Some(p) = resolve_slug(conn, project_id_or_slug)? else {
+        return Ok(None);
+    };
+    Ok(conn
+        .query_row(
+            "SELECT root_path FROM projects WHERE id = ?1",
+            [&p.id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// The root of the project a memory (named by its id or legacy id) belongs to.
+pub fn root_of_memory(conn: &Connection, memory_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT p.root_path FROM memories m JOIN projects p ON p.id = m.project_id
+             WHERE m.id = ?1 OR m.legacy_id = ?1 ORDER BY m.seq LIMIT 1",
+            [memory_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 pub fn list_projects(conn: &Connection) -> Result<Vec<ResolvedProject>> {
     let mut stmt = conn.prepare("SELECT id, slug, name FROM projects ORDER BY slug")?;
     let rows = stmt
@@ -326,5 +365,20 @@ mod tests {
             .map(|p| p.slug)
             .collect();
         assert_eq!(slugs, ["app", "global", "zeta"]);
+    }
+
+    #[test]
+    fn root_of_finds_a_root_by_id_slug_or_alias() {
+        let (_d, c) = conn();
+        let mut with_root = pref("k/one", "one");
+        with_root.root = Some(PathBuf::from("/work/one"));
+        let one = upsert_project(&c, &with_root).unwrap();
+        let none = upsert_project(&c, &pref("k/two", "two")).unwrap();
+        add_alias(&c, "uno", &one.id).unwrap();
+        for name in [one.id.as_str(), "one", "uno", "UNO"] {
+            assert_eq!(root_of(&c, name).unwrap().as_deref(), Some("/work/one"));
+        }
+        assert_eq!(root_of(&c, &none.slug).unwrap(), None);
+        assert_eq!(root_of(&c, "missing").unwrap(), None);
     }
 }

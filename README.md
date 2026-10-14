@@ -206,6 +206,7 @@ M1 has no settings file yet. It reads these environment variables:
 | `ALICE_HOME` | Data directory (default `~/.alice`). |
 | `ALICE_LOG` | Log filter, e.g. `info` or `alice_daemon=debug` (the daemon logs to `$ALICE_HOME/logs/daemon.log`). |
 | `ALICE_AGENT` | Author name the CLI records on memories it writes (default `cli`). |
+| `ALICE_NO_AUTOSTART` | When set (and not `0`), commands never start the daemon; a write while none runs is queued in `$ALICE_HOME/spool` (secrets redacted first) and applied when one starts. |
 | `HF_ENDPOINT` | Hugging Face mirror for `alice model fetch`. |
 
 *(Planned, M2)* Settings will live in `~/.alice/config.toml`, can be overridden per repository with `.alice.toml`, and can all be changed from the UI. Changes apply without restarting.

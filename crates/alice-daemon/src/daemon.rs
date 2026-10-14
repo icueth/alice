@@ -217,7 +217,8 @@ fn start_and_serve(
         &make,
         ServiceOptions {
             settings: Some(settings),
-            ..Default::default()
+            // The daemon reads the real environment (the secrets' status shows a variable).
+            ..ServiceOptions::process_env()
         },
     )
     .map_err(|e| start_error(home, e))?;

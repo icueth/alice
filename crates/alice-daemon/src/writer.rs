@@ -3,11 +3,13 @@
 //! Only this thread writes to the database (spec §4.1), and every transaction is short: a bulk
 //! ingest is written a slice at a time, so small writes queued behind it never wait for all of it.
 
+use crate::redaction::Redactors;
 use alice_core::api::StreamItem;
 use alice_core::error::{AliceError, Result};
 use alice_core::ids::{Hlc, new_id};
 use alice_core::model::{Memory, Status};
 use alice_core::project::ProjectRef;
+use alice_core::redact::Redactor;
 use alice_core::store::embeddings::{self, VecKey};
 use alice_core::store::events::{self, Actor, EventInput};
 use alice_core::store::history::{self, UndoOutcome};
@@ -21,6 +23,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 use rusqlite::{Connection, ErrorCode, OptionalExtension};
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -110,6 +113,22 @@ pub enum WriteOutcome {
     /// The `StoreEmbeddings` items that were stored; the others changed while being embedded.
     Embedded(Vec<(VecKey, Vec<f32>)>),
     Done,
+}
+
+impl WriteOutcome {
+    /// The variant's name. Logs and error messages use this instead of `Debug`, which would
+    /// print the memory text an outcome carries.
+    pub fn name(&self) -> &'static str {
+        match self {
+            WriteOutcome::Remembered(..) => "Remembered",
+            WriteOutcome::Ingested(_) => "Ingested",
+            WriteOutcome::Updated(..) => "Updated",
+            WriteOutcome::Fact(_) => "Fact",
+            WriteOutcome::Undo(_) => "Undo",
+            WriteOutcome::Embedded(_) => "Embedded",
+            WriteOutcome::Done => "Done",
+        }
+    }
 }
 
 type Reply = Option<oneshot::Sender<Result<WriteOutcome>>>;
@@ -226,11 +245,37 @@ pub(crate) struct State {
     /// Items this batch broadcasts once it commits (events; later reviews and settings). A job
     /// that fails takes its own items back; a batch that fails to commit sends none.
     stream: Vec<StreamItem>,
+    /// The privacy rules of every project, for what the writer itself derives from stored rows.
+    redactors: Arc<Redactors>,
+}
+
+/// The redactor for the project with id `project_id` (`None`: no project), looked up with the
+/// writer's own connection. A project that was never rooted (no working tree) has only the
+/// global rules.
+fn rules_for(conn: &Connection, redactors: &Redactors, project_id: Option<&str>) -> Arc<Redactor> {
+    let root = project_id.and_then(|p| projects::root_of(conn, p).ok().flatten());
+    redactors.for_root(root.as_deref().map(Path::new))
+}
+
+/// A snapshot as events record it with its strings redacted by the rules of the project it
+/// names (`project_id`) or the global ones. History is never refused, only cleaned: it holds
+/// what was stored, and what was stored is redacted already, so this matters for rows written
+/// before a rule existed and for any text a later writer path forgets.
+fn scrub(conn: &Connection, st: &State, snapshot: &mut Option<serde_json::Value>) {
+    let Some(v) = snapshot else { return };
+    let project = v
+        .get("project_id")
+        .and_then(|p| p.as_str())
+        .map(String::from);
+    rules_for(conn, &st.redactors, project.as_deref()).apply_json(v);
 }
 
 /// Record an event in the current transaction; it is broadcast after the batch commits.
-/// Returns the event id.
-pub(crate) fn record(conn: &Connection, st: &mut State, e: EventInput<'_>) -> Result<String> {
+/// Returns the event id. The before and after snapshots are redacted first, so neither the
+/// `events` table nor the stream ever carries a secret.
+pub(crate) fn record(conn: &Connection, st: &mut State, mut e: EventInput<'_>) -> Result<String> {
+    scrub(conn, st, &mut e.before);
+    scrub(conn, st, &mut e.after);
     let hlc = st.hlc.tick();
     let id = events::record(conn, &e, &hlc)?;
     if let Some(event) = events::get(conn, &id)? {
@@ -460,9 +505,11 @@ fn assert_fact(
 /// `undo`: reverse an event (and its group), or, when a target changed since, a review item.
 fn undo(conn: &Connection, event_id: &str, actor: &Actor, st: &mut State) -> Result<WriteOutcome> {
     let out = {
+        let redactors = st.redactors.clone();
+        let rules = |c: &Connection, project: Option<&str>| rules_for(c, &redactors, project);
         let hlc = &mut st.hlc;
         let mut tick = || hlc.tick();
-        history::undo(conn, event_id, actor, &mut tick)?
+        history::undo(conn, event_id, actor, &mut tick, &rules)?
     };
     match &out {
         UndoOutcome::Undone { group, .. } => {
@@ -829,9 +876,21 @@ fn ends_batch(batch: &[Job]) -> bool {
 }
 
 pub fn spawn_writer(
+    conn: Connection,
+    device: String,
+    wake_worker: Sender<()>,
+) -> (WriterHandle, JoinHandle<()>) {
+    let redactors = Redactors::fixed(alice_core::settings::PrivacySettings::default());
+    spawn_writer_with(conn, device, wake_worker, redactors)
+}
+
+/// [`spawn_writer`] with the privacy rules the writer applies to the history it records and to
+/// the text an undo restores.
+pub fn spawn_writer_with(
     mut conn: Connection,
     device: String,
     wake_worker: Sender<()>,
+    redactors: Arc<Redactors>,
 ) -> (WriterHandle, JoinHandle<()>) {
     let (tx, rx): (Sender<Job>, Receiver<Job>) = unbounded();
     let read_only = Arc::new(ReadOnlyState::default());
@@ -854,6 +913,7 @@ pub fn spawn_writer(
                 chunk_budget: INGEST_SLICE,
                 byte_budget: INGEST_SLICE_BYTES,
                 stream: Vec::new(),
+                redactors,
             };
             let mut carry: VecDeque<Job> = VecDeque::new();
             let mut stopping = false;
@@ -1944,5 +2004,28 @@ mod tests {
         let second = f.h.submit_blocking(remember("also refused")).unwrap_err();
         assert!(matches!(second, AliceError::ReadOnly(_)), "{second}");
         let _ = Kind::Note;
+    }
+
+    /// Whatever a caller hands `RecordEvent`, the history and the stream get it redacted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recorded_events_and_their_stream_items_are_redacted() {
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let (_d, h, _wake) = writer();
+        let mut rx = h.subscribe();
+        h.submit(WriteOp::RecordEvent {
+            actor: Actor::User,
+            action: "test.event".into(),
+            target_type: "thing".into(),
+            target_id: "t1".into(),
+            before: Some(serde_json::json!({ "note": format!("old {token}") })),
+            after: Some(serde_json::json!({ "nested": { "list": [format!("new {token}")] } })),
+        })
+        .await
+        .unwrap();
+        let item = serde_json::to_string(&rx.recv().await.unwrap()).unwrap();
+        assert!(
+            !item.contains(token) && item.contains("[REDACTED:github_token]"),
+            "{item}"
+        );
     }
 }

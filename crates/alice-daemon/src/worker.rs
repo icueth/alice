@@ -208,7 +208,10 @@ fn run(cfg: WorkerConfig) {
                     }
                 }
                 Ok(other) => {
-                    tracing::error!(?other, "unexpected writer outcome for stored embeddings");
+                    tracing::error!(
+                        outcome = other.name(),
+                        "unexpected writer outcome for stored embeddings"
+                    );
                     healthy = false;
                 }
                 Err(e) => {

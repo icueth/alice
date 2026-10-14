@@ -5,10 +5,11 @@
 
 use crate::config::SettingsHandle;
 use crate::paths::AliceHome;
+use crate::redaction::Redactors;
 use crate::secrets::{self, SecretName, SecretStore};
 use crate::spool;
 use crate::worker::{WorkerConfig, spawn_worker};
-use crate::writer::{ProjectChoice, WriteOp, WriteOutcome, WriterHandle, spawn_writer};
+use crate::writer::{ProjectChoice, WriteOp, WriteOutcome, WriterHandle, spawn_writer_with};
 use alice_core::api::*;
 use alice_core::embed::Embedder;
 use alice_core::error::{AliceError, Result};
@@ -16,6 +17,7 @@ use alice_core::ids::new_id;
 use alice_core::model::limits;
 use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
+use alice_core::redact::Redactor;
 use alice_core::search::{self, SearchParams, pack};
 use alice_core::settings::{self, SettingError, Settings};
 use alice_core::store::embeddings;
@@ -30,7 +32,7 @@ use alice_core::vector::VectorIndex;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -59,7 +61,8 @@ pub struct ServiceOptions {
     /// Settings to use; `None` loads `config.toml` and `ALICE_*` from the home.
     pub settings: Option<Arc<SettingsHandle>>,
     /// The `ALICE_*` variables the settings see when `settings` is `None`; `None`: the
-    /// process's. Tests pass an empty list so a developer's shell cannot change them.
+    /// process's. The default is an empty list, so a developer's shell cannot change a test;
+    /// [`ServiceOptions::process_env`] is the one that reads the process's.
     pub settings_env: Option<Vec<(String, String)>>,
     /// How often `config.toml` is checked for edits.
     pub settings_poll: Duration,
@@ -68,7 +71,8 @@ pub struct ServiceOptions {
     /// The secrets store; `None` opens the one `secrets.backend` names. Tests pass a fake, so
     /// none of them touches the OS keychain.
     pub secrets: Option<Arc<dyn SecretStore>>,
-    /// The environment the secrets' status is read from; `None`: the process's.
+    /// The environment the secrets' status is read from; `None`: the process's. The default
+    /// sees no variable at all (a shell's `TYPESAFE_API_KEY` never reaches a test).
     pub secret_env: Option<SecretEnv>,
     /// How long a request waits for the secrets store (an OS keychain may wait for a prompt
     /// nobody answers) before it says so and carries on.
@@ -76,18 +80,34 @@ pub struct ServiceOptions {
 }
 
 impl Default for ServiceOptions {
+    /// Isolated from the process's environment: no `ALICE_*` variable reaches the settings and no
+    /// secret variable (`TYPESAFE_API_KEY`) reaches the secrets' status. Only the daemon's own
+    /// entry point (and tools that run a service for real, such as `alice bench`) asks for the
+    /// process's environment, with [`ServiceOptions::process_env`].
     fn default() -> Self {
         Self {
             reader_pool: 8,
             vector_reader_pool: 4,
             detect_project,
             settings: None,
-            settings_env: None,
+            settings_env: Some(Vec::new()),
             settings_poll: crate::config::SETTINGS_POLL,
             health_tick: Duration::from_secs(5),
             secrets: None,
-            secret_env: None,
+            secret_env: Some(Arc::new(|_: &str| None)),
             secrets_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+impl ServiceOptions {
+    /// The defaults, reading the process's `ALICE_*` variables and secret variables. For code
+    /// that runs a service for real; tests use [`Default`].
+    pub fn process_env() -> Self {
+        Self {
+            settings_env: None,
+            secret_env: None,
+            ..Self::default()
         }
     }
 }
@@ -244,6 +264,8 @@ pub struct Service {
     stream_health: tokio::sync::Mutex<Option<(Instant, Health)>>,
     /// Live settings: read per request, never copied into the service.
     settings: Arc<SettingsHandle>,
+    /// Compiled secret redactors, global and per project (rebuilt when the rules change).
+    redactors: Arc<Redactors>,
     /// The settings the daemon started with, for the keys that apply only after a restart.
     started_with: Arc<Settings>,
     secrets: Arc<dyn SecretStore>,
@@ -283,8 +305,30 @@ fn join_err(e: tokio::task::JoinError) -> AliceError {
     AliceError::Other(format!("internal task failed: {e}"))
 }
 
+/// `text` for `field` through `r`: redacted, or refused in `block` mode. Logs the field and
+/// that something was redacted, never the text.
+fn redact_field(r: &Redactor, field: &str, text: &str) -> Result<String> {
+    let out = r.check(field, text)?;
+    if out != text {
+        tracing::info!(field, "redacted a secret before storing it");
+    }
+    Ok(out)
+}
+
+/// The working-tree root of the project `choice` names.
+fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<PathBuf> {
+    match choice {
+        ProjectChoice::Detected(r) => r.root.clone(),
+        ProjectChoice::Slug(s) => readers
+            .with(|c| projects::root_of(c, s))
+            .ok()
+            .flatten()
+            .map(PathBuf::from),
+    }
+}
+
 fn unexpected(o: WriteOutcome) -> AliceError {
-    AliceError::Other(format!("unexpected writer outcome {o:?}"))
+    AliceError::Other(format!("unexpected writer outcome {}", o.name()))
 }
 
 /// Rebuild the vector index from the stored vectors on a background thread; the slot stays
@@ -463,7 +507,9 @@ impl Service {
 
         // bounded(1): repeated wake-ups coalesce.
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
-        let (writer, writer_thread) = spawn_writer(conn, device, wake_tx.clone());
+        let redactors = Redactors::new(settings.clone());
+        let (writer, writer_thread) =
+            spawn_writer_with(conn, device, wake_tx.clone(), redactors.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let worker_thread = spawn_worker(WorkerConfig {
             readers: readers.clone(),
@@ -500,6 +546,7 @@ impl Service {
             resolver,
             stream_health: tokio::sync::Mutex::new(None),
             settings,
+            redactors,
             started_with,
             secrets,
             secret_env,
@@ -595,6 +642,9 @@ impl Service {
         let project = self
             .choose(req.project.as_deref(), req.cwd.as_deref())
             .await?;
+        // Before anything else touches the text: the writer, the spool and the logs only ever
+        // see the redacted request (spec §5.1 step 2).
+        let req = self.redact_remember_in(&project, req).await?;
         let input = NewMemoryInput {
             content: req.content,
             kind: req.kind,
@@ -627,6 +677,69 @@ impl Service {
         }
     }
 
+    /// The working-tree root of the project a write goes to, if it has one. A named project is
+    /// looked up in the database, so call this off the async runtime.
+    pub fn project_root(&self, choice: &ProjectChoice) -> Option<PathBuf> {
+        project_root_in(&self.readers, choice)
+    }
+
+    /// The compiled redactor for a write to `choice`: the global rules with the project's
+    /// `.alice.toml` on top. Looks at the database and the file system, so it runs on the
+    /// blocking pool.
+    async fn redactor(&self, choice: &ProjectChoice) -> Result<Arc<Redactor>> {
+        let (readers, redactors, choice) =
+            (self.readers.clone(), self.redactors.clone(), choice.clone());
+        tokio::task::spawn_blocking(move || {
+            let root = project_root_in(&readers, &choice);
+            redactors.for_root(root.as_deref())
+        })
+        .await
+        .map_err(join_err)
+    }
+
+    /// The redactor for the project a memory (an id or legacy id) belongs to; the global rules
+    /// for one that is not there (the writer then reports it as unknown).
+    async fn redactor_for_memory(&self, id: String) -> Result<Arc<Redactor>> {
+        let (readers, redactors) = (self.readers.clone(), self.redactors.clone());
+        tokio::task::spawn_blocking(move || {
+            let root = readers
+                .with(|c| projects::root_of_memory(c, &id))
+                .ok()
+                .flatten()
+                .map(PathBuf::from);
+            redactors.for_root(root.as_deref())
+        })
+        .await
+        .map_err(join_err)
+    }
+
+    async fn redact_remember_in(
+        &self,
+        choice: &ProjectChoice,
+        mut req: RememberRequest,
+    ) -> Result<RememberRequest> {
+        let r = self.redactor(choice).await?;
+        req.content = redact_field(&r, "content", &req.content)?;
+        if let Some(t) = &req.title {
+            req.title = Some(redact_field(&r, "title", t)?);
+        }
+        req.topics = req
+            .topics
+            .iter()
+            .map(|t| redact_field(&r, "topic", t))
+            .collect::<Result<_>>()?;
+        Ok(req)
+    }
+
+    /// `req` with secrets redacted, or an error naming the detector in `block` mode. Idempotent:
+    /// text that is redacted already comes back as it is. What a request is spooled as.
+    pub async fn redact_remember(&self, req: RememberRequest) -> Result<RememberRequest> {
+        let choice = self
+            .choose(req.project.as_deref(), req.cwd.as_deref())
+            .await?;
+        self.redact_remember_in(&choice, req).await
+    }
+
     /// `remember`, or, while the database is read-only, the request queued in the spool and
     /// applied after a repair (spec §5.7), with a reply that says so. Every interface of the
     /// daemon (the JSON API, MCP over HTTP) remembers through this. If even the spool cannot be
@@ -637,7 +750,9 @@ impl Service {
             other => return other,
         };
         let dir = self.home.spool_dir();
-        let entry = spool::SpoolEntry::Remember(req);
+        // The spool holds only redacted text; in `block` mode a request with a secret is
+        // refused (the error names the detector) rather than queued.
+        let entry = spool::SpoolEntry::Remember(self.redact_remember(req).await?);
         match tokio::task::spawn_blocking(move || spool::append(&dir, &entry)).await {
             Ok(Ok(_)) => Ok(RememberResponse {
                 id: None,
@@ -790,8 +905,26 @@ impl Service {
     }
 
     /// The memory after the change, with the event that recorded it (`undo` takes its id).
-    pub async fn update(&self, req: UpdateRequest) -> Result<MemoryFull> {
+    pub async fn update(&self, mut req: UpdateRequest) -> Result<MemoryFull> {
         let actor = Actor::from_author(&req.author);
+        if req.update.title.is_some() || req.update.body.is_some() || req.update.topics.is_some() {
+            let r = self.redactor_for_memory(req.id.clone()).await?;
+            let u = &mut req.update;
+            if let Some(t) = &u.title {
+                u.title = Some(redact_field(&r, "title", t)?);
+            }
+            if let Some(b) = &u.body {
+                u.body = Some(redact_field(&r, "body", b)?);
+            }
+            if let Some(topics) = &u.topics {
+                u.topics = Some(
+                    topics
+                        .iter()
+                        .map(|t| redact_field(&r, "topic", t))
+                        .collect::<Result<_>>()?,
+                );
+            }
+        }
         let (m, event_id) = match self
             .writer
             .submit(WriteOp::Update {
@@ -842,8 +975,16 @@ impl Service {
         .await
     }
 
-    pub async fn assert_fact(&self, req: AssertFactRequest) -> Result<FactOutcome> {
+    pub async fn assert_fact(&self, mut req: AssertFactRequest) -> Result<FactOutcome> {
         let actor = Actor::from_author(&req.author);
+        // Facts belong to no project; the one a fact cites as its source (if any) sets the rules.
+        let r = match req.source_memory_id.clone() {
+            Some(id) => self.redactor_for_memory(id).await?,
+            None => self.redactors.for_root(None),
+        };
+        req.subject = redact_field(&r, "subject", &req.subject)?;
+        req.predicate = redact_field(&r, "predicate", &req.predicate)?;
+        req.object = redact_field(&r, "object", &req.object)?;
         match self
             .writer
             .submit(WriteOp::AssertFact { fact: req, actor })
@@ -1309,12 +1450,36 @@ impl Service {
         }
     }
 
-    pub async fn ingest(&self, req: IngestRequest) -> Result<IngestOutcome> {
+    pub async fn ingest(&self, mut req: IngestRequest) -> Result<IngestOutcome> {
         // Checked here so an oversized request never reaches (or delays) the writer.
         sources::validate_chunks(&req.chunks)?;
         let project = self
             .choose(req.project.as_deref(), req.cwd.as_deref())
             .await?;
+        // The whole request is redacted (or refused) before its first slice is written, off the
+        // runtime's threads: a request can hold 32 MB of text.
+        let r = self.redactor(&project).await?;
+        req = tokio::task::spawn_blocking(move || -> Result<IngestRequest> {
+            req.source.uri = redact_field(&r, "source uri", &req.source.uri)?;
+            let mut redacted = 0usize;
+            for c in &mut req.chunks {
+                let text = r.check("chunk text", &c.text)?;
+                if text != c.text {
+                    redacted += 1;
+                    c.text = text;
+                }
+            }
+            if redacted > 0 {
+                // One line per request, not per chunk.
+                tracing::info!(
+                    chunks = redacted,
+                    "redacted secrets in raw chunks before storing them"
+                );
+            }
+            Ok(req)
+        })
+        .await
+        .map_err(join_err)??;
         match self
             .writer
             .submit(WriteOp::Ingest {
@@ -1468,6 +1633,106 @@ mod tests {
         let repo = d.path().join(name);
         std::fs::create_dir(&repo).unwrap();
         Some(repo.to_string_lossy().into_owned())
+    }
+
+    /// A `remember` queued because the database is read-only holds no secret, and in `block`
+    /// mode a request with one is refused rather than queued.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_only_spool_holds_the_redacted_request_and_block_mode_refuses() {
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let (d, s) = svc().await;
+        let cwd = repo(&d, "proj");
+        s.force_read_only("disk full");
+        let req = |content: String| RememberRequest {
+            content,
+            cwd: cwd.clone(),
+            ..Default::default()
+        };
+        let r = s
+            .remember_or_spool(req(format!("deploy with {token}")))
+            .await
+            .unwrap();
+        assert_eq!(r.status, RememberStatus::Spooled);
+        let spooled = |s: &Service| -> String {
+            std::fs::read_dir(s.home().spool_dir())
+                .unwrap()
+                .flatten()
+                .map(|e| std::fs::read_to_string(e.path()).unwrap())
+                .collect()
+        };
+        let text = spooled(&s);
+        assert!(
+            text.contains("[REDACTED:github_token]") && !text.contains(token),
+            "{text}"
+        );
+        std::fs::write(
+            std::path::Path::new(cwd.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\nblock_secrets = true\n",
+        )
+        .unwrap();
+        let err = s
+            .remember_or_spool(req(format!("again {token}")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("github_token") && !err.contains(token),
+            "{err}"
+        );
+        assert_eq!(
+            spooled(&s).matches("deploy with").count(),
+            1,
+            "only the first is queued"
+        );
+    }
+
+    /// `ServiceOptions::default()` sees nothing of the process: not an `ALICE_*` setting, not a
+    /// secret variable. Checked in a child process that has the variable (set here, it would
+    /// race the other tests' reads of the environment).
+    #[test]
+    fn a_default_service_ignores_the_environment_of_its_process() {
+        const CHILD: &str = "ALICE_TEST_ENV_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let d = tempfile::tempdir().unwrap();
+            let s = Service::start(
+                AliceHome::new(d.path().to_path_buf()),
+                &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+                ServiceOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                s.settings().search.default_max_tokens,
+                Settings::default().search.default_max_tokens,
+                "ALICE_SEARCH_DEFAULT_MAX_TOKENS must not reach a default-built service"
+            );
+            assert!(s.settings_handle().warnings().is_empty());
+            let see = ServiceOptions::default().secret_env.unwrap();
+            assert_eq!(see("TYPESAFE_API_KEY"), None);
+            assert_eq!(see("PATH"), None);
+            // The real entry points ask for the process's.
+            assert!(ServiceOptions::process_env().settings_env.is_none());
+            assert!(ServiceOptions::process_env().secret_env.is_none());
+            s.shutdown();
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "service::tests::a_default_service_ignores_the_environment_of_its_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("ALICE_SEARCH_DEFAULT_MAX_TOKENS", "777")
+            .env("ALICE_NOT_A_SETTING_AT_ALL", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// `alice history --actor codex` and `alice history drawer_7` mean what they say: a bare

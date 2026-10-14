@@ -1360,3 +1360,92 @@ fn an_ignored_variable_is_a_warning_and_changes_nothing_else() {
         "the file still applies"
     );
 }
+
+/// Every file under `dir` (database and WAL, spool, logs, vector files) whose bytes hold any of
+/// `needles`.
+fn files_holding(dir: &std::path::Path, needles: &[&str]) -> Vec<String> {
+    let mut bad = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let bytes = std::fs::read(&p).unwrap_or_default();
+            if needles
+                .iter()
+                .any(|n| bytes.windows(n.len()).any(|w| w == n.as_bytes()))
+            {
+                bad.push(p.display().to_string());
+            }
+        }
+    }
+    bad
+}
+
+/// A secret passed to `alice remember` reaches neither the database (nor its WAL), the spool,
+/// nor `daemon.log`, with the daemon running, with it away, and after the spool is applied.
+/// The daemon logs at debug level here, so a line that echoed a request would show.
+#[test]
+fn a_planted_secret_reaches_neither_the_database_the_spool_nor_the_log() {
+    let e = Env::new();
+    let token = concat!("gh", "p_PlantedSecretToken0123456789abcdefABCD");
+    // The part without the provider prefix: a scan for the whole token alone would miss a
+    // log line that cut it.
+    let core = "PlantedSecretToken0123456789abcdefABCD";
+    let needles = [token, core];
+    let verbose = |args: &[&str]| e.cmd(args).env("ALICE_LOG", "debug").output().unwrap();
+
+    let o = verbose(&["remember", &format!("ci uses {token} for releases")]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    e.ok(&["daemon", "stop"]);
+    assert!(
+        files_holding(&e.home, &needles).is_empty(),
+        "running: {:?}",
+        files_holding(&e.home, &needles)
+    );
+
+    // While the daemon is down (and may not be started) the CLI queues; the spool is clean too.
+    let o = e
+        .cmd(&["remember", &format!("second one with {token}")])
+        .env("ALICE_NO_AUTOSTART", "1")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stdout).starts_with("Queued: "),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(spooled(&e), 1);
+    assert!(
+        files_holding(&e.home, &needles).is_empty(),
+        "spooled: {:?}",
+        files_holding(&e.home, &needles)
+    );
+
+    // The daemon applies the spool; the second memory is stored redacted.
+    let o = verbose(&["daemon", "start"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    eventually(
+        || e.recall_count("second one with") == 1,
+        "the queued write",
+    );
+    let found = e.json(&["recall", "second one with"]);
+    assert!(
+        found.to_string().contains("[REDACTED:github_token]"),
+        "{found}"
+    );
+    e.ok(&["daemon", "stop"]);
+    assert!(
+        files_holding(&e.home, &needles).is_empty(),
+        "after the drain: {:?}",
+        files_holding(&e.home, &needles)
+    );
+    assert!(
+        e.log().contains("listening"),
+        "the log was written and scanned"
+    );
+}

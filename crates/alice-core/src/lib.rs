@@ -10,6 +10,7 @@ pub mod ids;
 pub mod model;
 pub mod normalize;
 pub mod project;
+pub mod redact;
 pub mod search;
 pub mod settings;
 pub mod store;

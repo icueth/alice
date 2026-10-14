@@ -13,6 +13,8 @@ use crate::spool::{self, SpoolEntry};
 use crate::startup;
 use alice_core::api::*;
 use alice_core::error::{AliceError, Result};
+use alice_core::redact::Redactor;
+use alice_core::settings::{ProjectSettings, load_project};
 use alice_core::store::kg::FactOutcome;
 use alice_core::store::memories::{self, NewMemoryInput};
 use alice_core::store::projects::ResolvedProject;
@@ -601,6 +603,72 @@ fn check_remember(req: &RememberRequest) -> Result<()> {
     memories::prepare(input, &somewhere, String::new()).map(|_| ())
 }
 
+/// The redactor for a write that is spooled because the daemon is away (so its settings and
+/// project rules are not at hand): `config.toml` and the `ALICE_*` variables through the same
+/// rule the daemon loads them by, and, when the project root can be found the way the daemon
+/// finds it (from `cwd`, unless the caller named a project), that project's `.alice.toml`. A
+/// project file that is invalid or unreadable counts as `block_secrets` on, as in the daemon.
+/// A named project has no root to find without the database, so only the global rules apply
+/// to it here; the daemon applies the project's own rules again when it drains the spool.
+///
+/// Runs git and reads files: call it on the blocking pool.
+fn spool_redactor(home: &AliceHome, project: Option<&str>, cwd: Option<&str>) -> Redactor {
+    let global = crate::config::load_effective(home)
+        .resolved
+        .settings
+        .privacy;
+    let named = project.is_some_and(|p| !p.trim().is_empty());
+    let root = cwd
+        .filter(|_| !named)
+        .and_then(|c| alice_core::project::detect_project(Path::new(c)).root);
+    let privacy = match root {
+        Some(root) => match load_project(&root) {
+            Ok(p) => p.apply_to(&global).privacy,
+            Err(_) => ProjectSettings::fail_closed().apply_to(&global).privacy,
+        },
+        None => global,
+    };
+    Redactor::new(&privacy).unwrap_or_else(|_| Redactor::fallback(&privacy))
+}
+
+/// `req` ready for the spool: secrets redacted, or an error naming the detector in `block` mode.
+async fn redacted_for_spool(home: &AliceHome, mut req: RememberRequest) -> Result<RememberRequest> {
+    let home = home.clone();
+    tokio::task::spawn_blocking(move || {
+        let r = spool_redactor(&home, req.project.as_deref(), req.cwd.as_deref());
+        req.content = r.check("content", &req.content)?;
+        if let Some(t) = &req.title {
+            req.title = Some(r.check("title", t)?);
+        }
+        req.topics = req
+            .topics
+            .iter()
+            .map(|t| r.check("topic", t))
+            .collect::<Result<_>>()?;
+        Ok(req)
+    })
+    .await
+    .map_err(|e| AliceError::Other(format!("redaction stopped: {e}")))?
+}
+
+/// The same for an ingest: the source uri and every chunk.
+async fn redacted_ingest_for_spool(
+    home: &AliceHome,
+    mut req: IngestRequest,
+) -> Result<IngestRequest> {
+    let home = home.clone();
+    tokio::task::spawn_blocking(move || {
+        let r = spool_redactor(&home, req.project.as_deref(), req.cwd.as_deref());
+        req.source.uri = r.check("source uri", &req.source.uri)?;
+        for c in &mut req.chunks {
+            c.text = r.check("chunk text", &c.text)?;
+        }
+        Ok(req)
+    })
+    .await
+    .map_err(|e| AliceError::Other(format!("redaction stopped: {e}")))?
+}
+
 /// Queue a write for the daemon to apply when it is back; if even that fails, say both.
 async fn spool_entry(home: &AliceHome, entry: SpoolEntry, cause: &str) -> Result<()> {
     let dir = home.spool_dir();
@@ -647,6 +715,7 @@ pub(crate) async fn remember_via(
         Err(u) => (u.to_string(), u.queued_note()),
     };
     check_remember(&req)?;
+    let req = redacted_for_spool(home, req).await?;
     spool_entry(home, SpoolEntry::Remember(req), &cause).await?;
     Ok(RememberResponse {
         id: None,
@@ -683,6 +752,7 @@ pub async fn ingest_or_spool(
         },
         Err(u) => u.to_string(),
     };
+    let req = redacted_ingest_for_spool(home, req).await?;
     spool_entry(home, SpoolEntry::Ingest(req), &cause).await?;
     Ok(IngestOutcome {
         source_id: String::new(),
@@ -1175,6 +1245,100 @@ mod tests {
         let running = daemon(&home).await;
         let drained = spool::drain(&home.spool_dir(), &running.svc).await;
         assert_eq!((drained.processed, drained.rejected), (2, 0));
+    }
+
+    /// All the bytes of the files in a directory, as one string (lossy).
+    fn spool_text(home: &AliceHome) -> String {
+        std::fs::read_dir(home.spool_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| String::from_utf8_lossy(&std::fs::read(e.path()).unwrap()).into_owned())
+            .collect()
+    }
+
+    const GITHUB: &str = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+
+    /// The daemon is away: what is queued holds no secret (redacted with the settings read from
+    /// the home), `block` mode refuses instead of queueing, and so does a project file, found
+    /// from the working directory, that is broken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_spooled_without_a_daemon_is_redacted_or_refused_in_block_mode() {
+        crate::install_tls();
+        let (d, home) = home();
+        let r = remember_or_spool(
+            &home,
+            &Launcher::None,
+            RememberRequest {
+                title: Some(format!("key {GITHUB}")),
+                topics: vec![GITHUB.into()],
+                ..remember_req(&format!("deploy with {GITHUB}"))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.status, RememberStatus::Spooled);
+        let o = ingest_or_spool(
+            &home,
+            &Launcher::None,
+            ingest_req(format!("export TOKEN={GITHUB}")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(o.inserted, 0);
+        let text = spool_text(&home);
+        assert!(!text.contains(GITHUB) && !text.contains("aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"));
+        assert!(text.contains("[REDACTED:github_token]"), "{text}");
+        assert_eq!(spool::pending_count(&home.spool_dir()), 2);
+
+        // The project file of the working directory applies to a write without a named project.
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join(".alice.toml"), "[privacy\nblock_secrets = tru").unwrap();
+        let cwd = Some(work.to_string_lossy().into_owned());
+        let e = remember_or_spool(
+            &home,
+            &Launcher::None,
+            RememberRequest {
+                cwd: cwd.clone(),
+                ..remember_req(&format!("again {GITHUB}"))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&e, AliceError::Invalid(m) if m.contains("github_token") && !m.contains(GITHUB)),
+            "{e:?}"
+        );
+        let e = ingest_or_spool(
+            &home,
+            &Launcher::None,
+            IngestRequest {
+                cwd,
+                ..ingest_req(format!("again {GITHUB}"))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&e, AliceError::Invalid(m) if m.contains("github_token")),
+            "{e:?}"
+        );
+        assert_eq!(
+            spool::pending_count(&home.spool_dir()),
+            2,
+            "nothing more was queued"
+        );
+
+        // `block` in config.toml refuses everywhere.
+        std::fs::write(home.config_file(), "[privacy]\nredact_mode = \"block\"\n").unwrap();
+        let e = remember_or_spool(&home, &Launcher::None, remember_req(&format!("x {GITHUB}")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, AliceError::Invalid(m) if m.contains("github_token")),
+            "{e:?}"
+        );
+        assert!(!spool_text(&home).contains(GITHUB));
     }
 
     /// The daemon runs from `/`: a relative home must reach it as the same directory.

@@ -573,7 +573,7 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
     report.embed_per_sec = embed_throughput(probe.as_ref(), &mut corpus)?;
     drop(probe);
 
-    let svc = Service::start(home.clone(), &make, ServiceOptions::default())?;
+    let svc = Service::start(home.clone(), &make, ServiceOptions::process_env())?;
     rt.block_on(load(&svc, &args, &mut corpus, &mut report))?;
     eprintln!("bench: measuring latency");
     report.latency = rt.block_on(latency(&svc, args.samples, &mut corpus))?;

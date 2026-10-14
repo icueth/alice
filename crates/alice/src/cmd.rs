@@ -244,7 +244,14 @@ fn rt() -> Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
+/// How a command starts the daemon when none runs: this program, unless `ALICE_NO_AUTOSTART`
+/// is set (to anything but `0` or empty), in which case writes are queued in the spool.
 fn launcher() -> Launcher {
+    let no_autostart =
+        std::env::var_os("ALICE_NO_AUTOSTART").is_some_and(|v| !v.is_empty() && v != "0");
+    if no_autostart {
+        return Launcher::None;
+    }
     std::env::current_exe()
         .map(Launcher::Exe)
         .unwrap_or(Launcher::None)

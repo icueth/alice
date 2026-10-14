@@ -92,6 +92,20 @@ fn reject(dir: &Path, file: &Path, why: &str) {
     }
 }
 
+/// Drop an entry that `block` mode refuses and keep the reason next to the rejected ones. The
+/// entry itself is not kept: its text holds what the rules forbid on disk.
+fn withhold(dir: &Path, file: &Path, why: &str) {
+    let rejected = dir.join("rejected");
+    let _ = std::fs::create_dir_all(&rejected);
+    if let Some(name) = file.file_name() {
+        let note = format!(
+            "{why}\nThe request was removed instead of kept, because its text holds a secret."
+        );
+        let _ = std::fs::write(rejected.join(name).with_extension("err"), note);
+        let _ = std::fs::remove_file(file);
+    }
+}
+
 /// Apply spooled requests oldest first. Invalid requests move to `spool/rejected/`;
 /// a transient failure stops the drain so the order is kept for the next attempt.
 ///
@@ -121,6 +135,11 @@ pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
             Ok(()) => {
                 let _ = std::fs::remove_file(file);
                 report.processed += 1;
+            }
+            // A request that block mode refuses held a secret: only the reason is kept.
+            Err(e) if alice_core::redact::is_refusal(&e) => {
+                withhold(dir, file, &e.to_string());
+                report.rejected += 1;
             }
             Err(e @ (AliceError::Invalid(_) | AliceError::NotFound(_))) => {
                 reject(dir, file, &e.to_string());
@@ -305,5 +324,53 @@ mod tests {
         let file = append(&open, &remember("two")).unwrap();
         assert_eq!(mode(&file), 0o600);
         assert_eq!(mode(&open), 0o755);
+    }
+
+    const GITHUB: &str = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+
+    /// An entry queued by an older Alice (secret and all) is stored redacted when drained, and one
+    /// that block mode refuses is not kept in `rejected/`: only the reason is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drain_redacts_old_entries_and_keeps_no_text_that_block_mode_refuses() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let svc = start(&home);
+        let dir = home.spool_dir();
+        append(&dir, &remember(&format!("old entry with {GITHUB}"))).unwrap();
+        let blocked = d.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(
+            blocked.join(".alice.toml"),
+            "[privacy]\nblock_secrets = true\n",
+        )
+        .unwrap();
+        append(
+            &dir,
+            &SpoolEntry::Remember(RememberRequest {
+                content: format!("refused with {GITHUB}"),
+                cwd: Some(blocked.to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let r = drain(&dir, &svc).await;
+        assert_eq!((r.processed, r.rejected, r.remaining), (1, 1, 0));
+        assert_eq!(bodies(&home), ["old entry with [REDACTED:github_token]"]);
+        assert_eq!(pending_count(&dir), 0);
+        let mut all = String::new();
+        for e in std::fs::read_dir(dir.join("rejected")).unwrap().flatten() {
+            all.push_str(&std::fs::read_to_string(e.path()).unwrap());
+        }
+        assert!(
+            all.contains("github_token") && !all.contains(GITHUB),
+            "{all}"
+        );
+        assert!(
+            !std::fs::read_dir(dir.join("rejected"))
+                .unwrap()
+                .flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "json")),
+            "the refused request itself is gone"
+        );
     }
 }

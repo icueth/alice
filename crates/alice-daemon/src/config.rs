@@ -481,6 +481,21 @@ impl SettingsHandle {
         !effective.is_cloud_denied(project_slug)
     }
 
+    /// The privacy rules for writes to a project: the global ones with the project's
+    /// `.alice.toml` on top (`root`: its working-tree root; `None`: the global ones alone).
+    ///
+    /// Read from the one [`ProjectSettingsCache`] this handle owns, so an invalid or unreadable
+    /// project file fails closed (`block_secrets` on, the last good custom patterns kept) and a
+    /// loosening applies only after three spaced polls, exactly as for
+    /// [`cloud_allowed`](Self::cloud_allowed). The daemon never reads `.alice.toml` any other way.
+    pub fn project_privacy(&self, root: Option<&Path>) -> alice_core::settings::PrivacySettings {
+        let global = self.get().privacy.clone();
+        match root {
+            Some(root) => self.projects.get(root).settings.apply_to(&global).privacy,
+            None => global,
+        }
+    }
+
     /// A loosening in `config.toml` (a protection switched off, say) was read and is waiting to
     /// be read the same on three polls in a row before it applies; the settings view says so.
     pub fn loosening_waiting(&self) -> bool {

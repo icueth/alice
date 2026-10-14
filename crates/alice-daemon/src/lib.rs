@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod http;
 pub mod mcp;
 pub mod paths;
+pub mod redaction;
 pub mod secrets;
 pub mod service;
 pub mod spool;

@@ -206,6 +206,7 @@ M1 ยังไม่มีไฟล์ตั้งค่า อ่านค่�
 | `ALICE_HOME` | directory เก็บข้อมูล (ค่าเริ่มต้น `~/.alice`) |
 | `ALICE_LOG` | ตัวกรอง log เช่น `info` หรือ `alice_daemon=debug` (daemon เขียน log ที่ `$ALICE_HOME/logs/daemon.log`) |
 | `ALICE_AGENT` | ชื่อผู้เขียนที่ CLI บันทึกไว้กับ memory (ค่าเริ่มต้น `cli`) |
+| `ALICE_NO_AUTOSTART` | ถ้าตั้งค่า (และไม่ใช่ `0`) คำสั่งต่างๆ จะไม่เริ่ม daemon เอง การเขียนตอนที่ไม่มี daemon จะเข้าคิวใน `$ALICE_HOME/spool` (ลบความลับก่อน) แล้วถูกบันทึกเมื่อ daemon เริ่มทำงาน |
 | `HF_ENDPOINT` | mirror ของ Hugging Face สำหรับ `alice model fetch` |
 
 *(วางแผนไว้ใน M2)* ค่าต่างๆ จะอยู่ใน `~/.alice/config.toml` แต่ละ repo เขียนทับได้ด้วย `.alice.toml` และทุกค่าแก้ผ่าน UI ได้ เปลี่ยนแล้วมีผลทันทีโดยไม่ต้อง restart

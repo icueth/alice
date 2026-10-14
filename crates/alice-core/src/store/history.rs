@@ -5,12 +5,18 @@ use crate::error::{AliceError, Result};
 use crate::ids::{new_id, now_rfc3339};
 use crate::model::{Kind, Status};
 use crate::normalize::content_hash;
+use crate::redact::Redactor;
 use crate::store::events::{self, Actor, EventInput, EventRow};
 use crate::store::reviews::{self, NewReview, ReviewType};
 use crate::store::{fts, memories};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::Arc;
+
+/// The redactor in force for a project (by id; `None`: no project), looked up with the
+/// connection of the transaction that undoes. Whatever undo restores or records goes through it.
+pub type RedactorFor<'a> = &'a dyn Fn(&Connection, Option<&str>) -> Arc<Redactor>;
 
 /// What undo restores for a memory: content, status, topics and outgoing links.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -164,6 +170,44 @@ fn comparable(v: Option<serde_json::Value>) -> Option<serde_json::Value> {
         }
         v
     })
+}
+
+/// `s` as it may be restored today: its text through the project's current redaction rules. A
+/// secret that the rules would redact never comes back with an undo, and in `block` mode the
+/// undo is refused (the message names the detector, not the text).
+fn restorable(
+    conn: &Connection,
+    s: &MemorySnapshot,
+    redact: RedactorFor<'_>,
+) -> Result<MemorySnapshot> {
+    let r = redact(conn, Some(&s.project_id));
+    let refused = |e: AliceError| match e {
+        AliceError::Invalid(m) => AliceError::invalid(format!(
+            "cannot undo: {m}. The earlier text holds a secret; edit the memory by hand instead"
+        )),
+        e => e,
+    };
+    let mut out = s.clone();
+    out.title = r.check("title", &s.title).map_err(refused)?;
+    out.body = r.check("body", &s.body).map_err(refused)?;
+    out.topics = s
+        .topics
+        .iter()
+        .map(|t| r.check("topic", t).map_err(refused))
+        .collect::<Result<_>>()?;
+    Ok(out)
+}
+
+/// `v`, a snapshot as events record it, with its strings redacted by the rules of the project
+/// it names (`project_id`), or of no project.
+fn scrub(conn: &Connection, redact: RedactorFor<'_>, v: &mut Option<serde_json::Value>) {
+    if let Some(v) = v {
+        let project = v
+            .get("project_id")
+            .and_then(|p| p.as_str())
+            .map(String::from);
+        redact(conn, project.as_deref()).apply_json(v);
+    }
 }
 
 fn restore_memory(conn: &Connection, id: &str, s: &MemorySnapshot, hlc: &str) -> Result<()> {
@@ -322,6 +366,7 @@ pub fn undo(
     event_id: &str,
     actor: &Actor,
     hlc: &mut dyn FnMut() -> String,
+    redact: RedactorFor<'_>,
 ) -> Result<UndoOutcome> {
     if event_id.trim().is_empty() {
         return Err(AliceError::invalid(
@@ -418,7 +463,7 @@ pub fn undo(
         match (e.target_type.as_str(), before) {
             ("memory", Some(b)) => {
                 let s: MemorySnapshot = serde_json::from_value(b).map_err(bad)?;
-                restore_memory(conn, &e.target_id, &s, &h)?;
+                restore_memory(conn, &e.target_id, &restorable(conn, &s, redact)?, &h)?;
             }
             // Only a create has no memory before it: undoing it forgets the memory (it stays
             // in the trash for 30 days).
@@ -426,7 +471,7 @@ pub fn undo(
                 let mut s: MemorySnapshot =
                     serde_json::from_value(after.unwrap_or_default()).map_err(bad)?;
                 s.status = Status::Trashed;
-                restore_memory(conn, &e.target_id, &s, &h)?;
+                restore_memory(conn, &e.target_id, &restorable(conn, &s, redact)?, &h)?;
             }
             ("memory", None) => {
                 return Err(AliceError::invalid(format!(
@@ -445,7 +490,10 @@ pub fn undo(
                 )));
             }
         }
-        let after_now = current(conn, &e.target_type, &e.target_id)?;
+        let mut after_now = current(conn, &e.target_type, &e.target_id)?;
+        let mut before_now = before_now;
+        scrub(conn, redact, &mut before_now);
+        scrub(conn, redact, &mut after_now);
         events::record(
             conn,
             &EventInput {
@@ -702,12 +750,17 @@ mod tests {
                 .collect()
         }
         fn undo(&mut self, event: &str) -> Result<UndoOutcome> {
+            self.undo_with(event, Redactor::builtin())
+        }
+        fn undo_with(&mut self, event: &str, redactor: Redactor) -> Result<UndoOutcome> {
             let mut n = self.n;
             let mut tick = || {
                 n += 1;
                 format!("{:013}-0000-dev", 1_000 + n)
             };
-            let out = undo(&self.c, event, &Actor::User, &mut tick);
+            let redactor = Arc::new(redactor);
+            let rules = |_: &Connection, _: Option<&str>| redactor.clone();
+            let out = undo(&self.c, event, &Actor::User, &mut tick, &rules);
             self.n = n;
             out
         }
@@ -1080,5 +1133,42 @@ mod tests {
             t.undo(&end[0]).unwrap(),
             UndoOutcome::Conflict { .. }
         ));
+    }
+
+    /// Text recorded before the rules existed comes back redacted, or not at all in block mode.
+    #[test]
+    fn undo_never_restores_a_secret_the_rules_would_redact() {
+        use crate::settings::{PrivacySettings, RedactMode};
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let mut t = T::new();
+        let id = t.remember(&format!("deploy with {token}"));
+        let ev = t.edit(&id, "deploy by hand");
+        // Block mode: refused, naming the detector and not the token; nothing changed.
+        let block = Redactor::new(&PrivacySettings {
+            redact_mode: RedactMode::Block,
+            ..Default::default()
+        })
+        .unwrap();
+        let err = t.undo_with(&ev, block).unwrap_err().to_string();
+        assert!(
+            err.contains("github_token") && !err.contains(token),
+            "{err}"
+        );
+        assert_eq!(t.body(&id), "deploy by hand");
+        // Redact mode: restored with the token replaced, and the undo's own events carry no token.
+        t.undo(&ev).unwrap();
+        assert_eq!(t.body(&id), "deploy with [REDACTED:github_token]");
+        let rows: Vec<String> = t
+            .c
+            .prepare("SELECT COALESCE(before_json, '') || COALESCE(after_json, '') FROM events WHERE action LIKE 'undo:%'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            !rows.is_empty() && rows.iter().all(|r| !r.contains(token)),
+            "{rows:?}"
+        );
     }
 }
