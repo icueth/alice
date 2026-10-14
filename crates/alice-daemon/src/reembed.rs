@@ -22,7 +22,8 @@ use crate::service::{Active, ActiveSlot, IndexSlot, snapshot};
 use crate::worker::{embed_guarded, nap, split_by_policy};
 use crate::writer::{WriteOp, WriteOutcome, WriterHandle};
 pub use alice_core::api::ReembedStatus;
-use alice_core::embed::{Embedder, is_unavailable};
+use alice_core::embed::Embedder;
+use alice_core::error::AliceError;
 use alice_core::judge::jev::JevPolicy;
 use alice_core::store::ReaderPool;
 use alice_core::store::embeddings::{self, Owner, PendingItem, VecKey};
@@ -167,10 +168,20 @@ enum Halt {
     Failed(String),
 }
 
-/// Waits until requests have been over for [`QUIET`]; false when asked to stop meanwhile.
-fn wait_for_quiet(cfg: &ReembedConfig) -> bool {
+/// Requests must have been over for [`QUIET`] before a batch is sent, but a daemon that is
+/// never quiet still gets one batch every `FORCE_AFTER`, so the re-embed always finishes.
+const FORCE_AFTER: Duration = if cfg!(test) {
+    Duration::from_millis(1500)
+} else {
+    Duration::from_secs(600)
+};
+
+/// Waits until requests have been over for [`QUIET`] (or `FORCE_AFTER` has passed since the
+/// last batch); false when asked to stop meanwhile.
+fn wait_for_quiet(cfg: &ReembedConfig, last_batch: &mut Instant) -> bool {
     while !cfg.stop.load(Ordering::Relaxed) {
-        if cfg.activity.idle_for() >= QUIET {
+        if cfg.activity.idle_for() >= QUIET || last_batch.elapsed() >= FORCE_AFTER {
+            *last_batch = Instant::now();
             return true;
         }
         nap(&cfg.stop, Duration::from_millis(50));
@@ -178,31 +189,52 @@ fn wait_for_quiet(cfg: &ReembedConfig) -> bool {
     false
 }
 
-/// What asking the target for vectors came to.
-enum Embedded {
-    Vectors(Vec<Vec<f32>>),
-    /// The provider answered, but not with vectors for these texts (a 400, a wrong count): the
-    /// texts are the problem, not the provider.
-    Refused,
+/// What became of a batch: vectors, texts the provider refused, texts the cloud policy keeps
+/// at home.
+#[derive(Default)]
+struct Gated {
+    vectors: Vec<(PendingItem, Vec<f32>)>,
+    refused: Vec<PendingItem>,
+    denied: Vec<PendingItem>,
 }
 
-/// One request for `texts`, tried again while the provider is unavailable (up to
-/// [`OUTAGE_TRIES`], with a growing wait) and not at all for a refusal.
-fn ask(cfg: &ReembedConfig, texts: &[String]) -> Result<Embedded, Halt> {
+impl Gated {
+    fn merge(&mut self, other: Gated) {
+        self.vectors.extend(other.vectors);
+        self.refused.extend(other.refused);
+        self.denied.extend(other.denied);
+    }
+}
+
+/// Vectors for `items` from the target. **The cloud policy is asked again before every
+/// attempt** (not once per batch): while the provider is down the batch is tried again for
+/// minutes, and a project denied meanwhile must not be sent when it comes back. A batch the
+/// provider refuses is asked text by text (each gated afresh); a text refused on its own is
+/// `refused`. An outage is waited for (up to [`OUTAGE_TRIES`] tries, a growing wait).
+fn gated_embed(cfg: &ReembedConfig, items: Vec<PendingItem>) -> Result<Gated, Halt> {
+    let remote = cfg.target.is_remote();
+    let mut out = Gated::default();
+    let mut remaining = items;
     let mut failures = 0u32;
     loop {
         if cfg.stop.load(Ordering::Relaxed) {
             return Err(Halt::Stopped);
         }
-        match embed_guarded(cfg.target.as_ref(), texts) {
+        let (allowed, denied) =
+            split_by_policy(&cfg.readers, cfg.policy.as_ref(), remote, remaining);
+        out.denied.extend(denied);
+        if allowed.is_empty() {
+            return Ok(out);
+        }
+        let texts: Vec<String> = allowed.iter().map(|i| i.text.clone()).collect();
+        match embed_guarded(cfg.target.as_ref(), &texts) {
             Ok(v) if v.len() == texts.len() => {
                 *cfg.error.write() = None;
-                return Ok(Embedded::Vectors(v));
+                out.vectors.extend(allowed.into_iter().zip(v));
+                return Ok(out);
             }
-            Ok(_) => return Ok(Embedded::Refused),
-            Err(e) if is_unavailable(&e.to_string()) => {
+            Err(AliceError::Unavailable(msg)) => {
                 failures += 1;
-                let msg = e.to_string();
                 if failures >= OUTAGE_TRIES {
                     return Err(Halt::Failed(format!(
                         "re-embedding with {} keeps failing: {msg}",
@@ -218,29 +250,20 @@ fn ask(cfg: &ReembedConfig, texts: &[String]) -> Result<Embedded, Halt> {
                     .saturating_mul(2u32.saturating_pow(failures.min(6)))
                     .min(MAX_WAIT);
                 nap(&cfg.stop, wait);
+                remaining = allowed;
             }
-            Err(e) => {
-                tracing::debug!(error = %e, "the target model refused a batch");
-                return Ok(Embedded::Refused);
+            // The provider answered, but not with vectors for these texts.
+            Ok(_) | Err(_) => {
+                if allowed.len() == 1 {
+                    out.refused.extend(allowed);
+                } else {
+                    for item in allowed {
+                        out.merge(gated_embed(cfg, vec![item])?);
+                    }
+                }
+                return Ok(out);
             }
         }
-    }
-}
-
-/// Vectors for `items`: the batch at once, or text by text when the provider refused the batch.
-/// A text that is refused on its own is left out (`None`).
-fn embed_items(cfg: &ReembedConfig, items: &[PendingItem]) -> Result<Vec<Option<Vec<f32>>>, Halt> {
-    let texts: Vec<String> = items.iter().map(|i| i.text.clone()).collect();
-    match ask(cfg, &texts)? {
-        Embedded::Vectors(v) => Ok(v.into_iter().map(Some).collect()),
-        Embedded::Refused if items.len() == 1 => Ok(vec![None]),
-        Embedded::Refused => items
-            .iter()
-            .map(|i| match ask(cfg, std::slice::from_ref(&i.text))? {
-                Embedded::Vectors(mut v) if v.len() == 1 => Ok(v.pop()),
-                _ => Ok(None),
-            })
-            .collect(),
     }
 }
 
@@ -281,11 +304,11 @@ fn pass(
     } else {
         0
     };
-    let remote = cfg.target.is_remote();
     let fail = |what: &str, e: alice_core::AliceError| Halt::Failed(format!("{what} ({e})"));
+    let mut last_batch = Instant::now();
     while !cfg.stop.load(Ordering::Relaxed) {
         // The final pass runs with the main worker parked and must not wait for a busy hour.
-        if first && !wait_for_quiet(cfg) {
+        if first && !wait_for_quiet(cfg, &mut last_batch) {
             return Err(Halt::Stopped);
         }
         let items = cfg
@@ -296,30 +319,29 @@ fn pass(
             return Ok(());
         };
         let n = items.len() as u64;
-        let (allowed, denied) = split_by_policy(&cfg.readers, cfg.policy.as_ref(), remote, items);
-        let mut refused: Vec<(VecKey, String)> = Vec::new();
-        if !allowed.is_empty() {
-            let vectors = embed_items(cfg, &allowed)?;
-            let mut batch = Vec::with_capacity(allowed.len());
-            for (item, v) in allowed.into_iter().zip(vectors) {
-                match v {
-                    Some(v) => batch.push((item.key, item.stamp, v)),
-                    None => refused.push((item.key, item.stamp)),
-                }
-            }
-            if !batch.is_empty() {
-                let stored = cfg
-                    .writer
-                    .submit_blocking(WriteOp::StoreModelVectors {
-                        model: model.into(),
-                        items: batch,
-                    })
-                    .map_err(|e| fail("storing vectors", e))?;
-                if let WriteOutcome::Embedded(applied) = stored {
-                    index
-                        .upsert_batch(&applied)
-                        .map_err(|e| fail("updating the new index", e))?;
-                }
+        let Gated {
+            vectors,
+            refused,
+            denied,
+        } = gated_embed(cfg, items)?;
+        let batch: Vec<(VecKey, String, Vec<f32>)> = vectors
+            .into_iter()
+            .map(|(i, v)| (i.key, i.stamp, v))
+            .collect();
+        let refused: Vec<(VecKey, String)> =
+            refused.into_iter().map(|i| (i.key, i.stamp)).collect();
+        if !batch.is_empty() {
+            let stored = cfg
+                .writer
+                .submit_blocking(WriteOp::StoreModelVectors {
+                    model: model.into(),
+                    items: batch,
+                })
+                .map_err(|e| fail("storing vectors", e))?;
+            if let WriteOutcome::Embedded(applied) = stored {
+                index
+                    .upsert_batch(&applied)
+                    .map_err(|e| fail("updating the new index", e))?;
             }
         }
         if !first {

@@ -8,18 +8,23 @@
 //!   `User-Agent` is `alice/<version>` and nothing else names this machine or its owner.
 //! - An error says which provider, the status and a fixed reason. It never repeats what the
 //!   server sent back (a body may echo a key or a text) and never names the key.
-//! - Passages are retried only on 429, 5xx and timeouts, at most [`RETRIES`] times. A search
-//!   query is tried once, quickly, and after a failure further queries are not sent for a
-//!   while ([`QUERY_COOLDOWN`]), so a provider that is down never makes `recall` wait: it
-//!   answers from word matches.
+//! - A request is made once. Only the start-up probe (which carries no user text) is tried
+//!   again, and only on 429, 5xx and timeouts. Whoever asks for passages again after a failure
+//!   (the embedding worker, the re-embed) first decides again whether the texts may still be
+//!   sent: a project denied while the provider was down is never sent after it is back.
+//! - A search query is tried once, quickly ([`QUERY_TIMEOUT`]), and after a failure further
+//!   queries are not sent for a while ([`QUERY_COOLDOWN`]), so a provider that is down never
+//!   makes `recall` wait: it answers from word matches.
+//! - Redirects are not followed and no proxy of the environment is used (`BlockingHttp::direct`).
+//! - The key is held as a [`SecretValue`] and read only to build a request's header.
 //! - Whether texts may be sent at all is the daemon's decision (`Embedder::is_remote` and the
 //!   cloud policy); this module sends what it is given.
 
 use crate::net::{BlockingHttp, HttpError};
-use alice_core::embed::{Embedder, PROVIDER_UNAVAILABLE};
+use alice_core::embed::Embedder;
 use alice_core::error::{AliceError, Result};
 use alice_core::normalize::truncate_chars;
-use alice_core::settings::{EmbeddingProvider, endpoint_is_remote};
+use alice_core::settings::{EmbeddingProvider, SecretValue, endpoint_is_remote};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -73,7 +78,7 @@ pub struct HttpEmbedder {
     model: String,
     id: String,
     url: String,
-    key: Option<String>,
+    key: Option<SecretValue>,
     dim: usize,
     batch: usize,
     remote: bool,
@@ -90,12 +95,11 @@ pub struct HttpEmbedder {
 const TIMEOUT: Duration = Duration::from_secs(60);
 /// The first request, which only finds the dimension, is shorter: it runs when a model is chosen.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
-/// A search query waits this long for its vector, once.
-const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// A search query waits this long for its vector, once. Below every client's recall deadline
+/// (5 s), so a provider that does not answer costs a recall this and not its answer.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// After a failed query no query is sent for this long.
 const QUERY_COOLDOWN: Duration = Duration::from_secs(30);
-/// Retries of a request that was answered 429 or 5xx, or timed out.
-const RETRIES: u32 = 3;
 /// The probe is tried once more at most.
 const PROBE_RETRIES: u32 = 1;
 /// A `Retry-After` longer than this is not waited for.
@@ -112,10 +116,10 @@ impl HttpEmbedder {
         provider: HttpProvider,
         model: &str,
         endpoint: Option<&str>,
-        key: Option<String>,
+        key: Option<SecretValue>,
         batch: usize,
     ) -> Result<Self> {
-        if provider.needs_key() && key.as_deref().is_none_or(|k| k.trim().is_empty()) {
+        if provider.needs_key() && key.as_ref().is_none_or(|k| k.expose().trim().is_empty()) {
             return Err(AliceError::invalid(format!(
                 "the {} embedding provider needs an API key; set it with `alice config set-secret embedding_api_key`",
                 provider.name()
@@ -143,7 +147,7 @@ impl HttpEmbedder {
             dim: 0,
             batch: batch.clamp(1, provider.max_batch()),
             remote: endpoint_is_remote(provider.setting(), endpoint),
-            http: BlockingHttp::new(concat!("alice/", env!("CARGO_PKG_VERSION")))
+            http: BlockingHttp::direct(concat!("alice/", env!("CARGO_PKG_VERSION")))
                 .map_err(AliceError::Io)?,
             backoff: Duration::from_millis(500),
             query_blocked_until: AtomicU64::new(0),
@@ -190,6 +194,9 @@ impl HttpEmbedder {
             .collect()
     }
 
+    /// One request. `retries` (429, 5xx and timeouts only) is for the probe: texts are asked
+    /// once per call, and whoever asks again (the embedding worker, the re-embed) decides first,
+    /// every time, whether the text may still be sent.
     fn call(
         &self,
         texts: &[String],
@@ -205,14 +212,16 @@ impl HttpEmbedder {
         let mut last = String::new();
         for attempt in 0..=retries {
             let mut wait = self.backoff.saturating_mul(2u32.saturating_pow(attempt));
+            // The key is read only to make this request's header.
+            let bearer = self.key.as_ref().map(|k| k.expose());
             match self
                 .http
-                .post_json(&self.url, self.key.as_deref(), bytes.clone(), timeout)
+                .post_json(&self.url, bearer, bytes.clone(), timeout)
             {
                 Ok(r) if r.status == 200 => return self.parse(&r.body, texts.len()),
                 Ok(r) if r.status == 401 || r.status == 403 => {
-                    return Err(AliceError::Other(format!(
-                        "{PROVIDER_UNAVAILABLE}{} refused the API key ({}); set it with `alice config set-secret embedding_api_key`",
+                    return Err(AliceError::Unavailable(format!(
+                        "{} refused the API key ({}); set it with `alice config set-secret embedding_api_key`",
                         self.id, r.status
                     )));
                 }
@@ -230,8 +239,12 @@ impl HttpEmbedder {
                     )));
                 }
                 Err(HttpError::Timeout) => last = format!("{} did not answer in time", self.id),
+                // Not retried: a refused connection will not change in a moment.
                 Err(HttpError::Connect(_)) => {
-                    last = format!("cannot reach {}", self.id);
+                    return Err(AliceError::Unavailable(format!(
+                        "cannot reach {}; memories stay searchable by words and are embedded later",
+                        self.id
+                    )));
                 }
                 Err(HttpError::Build(_)) => {
                     return Err(AliceError::Other(format!(
@@ -240,15 +253,18 @@ impl HttpEmbedder {
                     )));
                 }
                 Err(HttpError::Other(_)) => {
-                    last = format!("the connection to {} failed", self.id);
+                    return Err(AliceError::Unavailable(format!(
+                        "the connection to {} failed; memories stay searchable by words and are embedded later",
+                        self.id
+                    )));
                 }
             }
             if attempt < retries {
                 std::thread::sleep(wait);
             }
         }
-        Err(AliceError::Other(format!(
-            "{PROVIDER_UNAVAILABLE}{last}; memories stay searchable by words and are embedded later"
+        Err(AliceError::Unavailable(format!(
+            "{last}; memories stay searchable by words and are embedded later"
         )))
     }
 
@@ -330,15 +346,15 @@ impl Embedder for HttpEmbedder {
     fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for b in texts.chunks(self.batch) {
-            out.extend(self.call(b, "document", TIMEOUT, RETRIES)?);
+            out.extend(self.call(b, "document", TIMEOUT, 0)?);
         }
         Ok(out)
     }
 
     fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         if self.query_blocked_until.load(Ordering::Relaxed) > self.now_ms() {
-            return Err(AliceError::Other(format!(
-                "{PROVIDER_UNAVAILABLE}{} did not answer a moment ago; this search used word matches only",
+            return Err(AliceError::Unavailable(format!(
+                "{} did not answer a moment ago; this search used word matches only",
                 self.id
             )));
         }
@@ -466,8 +482,14 @@ mod tests {
         key: Option<&str>,
         batch: usize,
     ) -> Result<HttpEmbedder> {
-        HttpEmbedder::new(provider, model, Some(base), key.map(String::from), batch)
-            .map(|e| e.with_backoff(Duration::from_millis(5)))
+        HttpEmbedder::new(
+            provider,
+            model,
+            Some(base),
+            key.map(SecretValue::new),
+            batch,
+        )
+        .map(|e| e.with_backoff(Duration::from_millis(5)))
     }
 
     #[test]
@@ -595,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn only_429_5xx_and_timeouts_are_retried_and_only_so_often() {
+    fn a_text_is_asked_once_and_only_the_probe_is_tried_again() {
         // Always 500: the probe tries twice (one retry) and fails.
         let (base, seen) = mock_with(|_, _, _| (500, "{}".into()));
         let err = quick(HttpProvider::Ollama, "m", &base, None, 8)
@@ -607,29 +629,76 @@ mod tests {
             "{err}"
         );
         assert_eq!(seen.lock().unwrap().len(), 1 + PROBE_RETRIES as usize);
-        // A 400 is not retried; 500s are retried RETRIES times then given up.
-        let (base, seen) = mock_with(|n, _, req| match n {
-            0 => (200, vectors(req)),
-            _ => (500, "{}".into()),
+        // Passages: 429, 5xx, 404 and a refused key are each asked once and say whether the
+        // provider is unavailable (the text stays queued) or the request is wrong.
+        for (status, unavailable) in [(500, true), (429, true), (401, true), (404, false)] {
+            let (base, seen) = mock_with(move |n, _, req| match n {
+                0 => (200, vectors(req)),
+                _ => (status, "{}".into()),
+            });
+            let e = quick(HttpProvider::OpenAi, "m", &base, Some("k"), 8).unwrap();
+            let err = e.embed_passages(&["x".into()]).unwrap_err();
+            assert_eq!(
+                matches!(err, AliceError::Unavailable(_)),
+                unavailable,
+                "{status}: {err}"
+            );
+            assert_eq!(seen.lock().unwrap().len(), 2, "{status} is asked once");
+        }
+        // A refused connection is unavailable at once, without a retry.
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = quick(
+            HttpProvider::Ollama,
+            "m",
+            &format!("http://127.0.0.1:{port}/v1"),
+            None,
+            8,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, AliceError::Unavailable(_)), "{err}");
+    }
+
+    /// A provider that takes the connection and never answers costs a search the query
+    /// timeout, below the clients' recall deadline of 5 s, and then nothing at all.
+    #[test]
+    fn a_black_holed_endpoint_falls_back_to_words_within_the_client_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", l.local_addr().unwrap());
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let first = first.swap(false, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    if first && n > 0 {
+                        let body = r#"{"data":[{"index":0,"embedding":[1.0,0.0]}]}"#;
+                        let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+                    } else {
+                        std::thread::sleep(Duration::from_secs(30));
+                    }
+                });
+            }
         });
         let e = quick(HttpProvider::Ollama, "m", &base, None, 8).unwrap();
-        assert!(e.embed_passages(&["x".into()]).is_err());
-        assert_eq!(seen.lock().unwrap().len(), 1 + 1 + RETRIES as usize);
-        let (base, seen) = mock_with(|n, _, req| match n {
-            0 => (200, vectors(req)),
-            _ => (404, "{}".into()),
-        });
-        let e = quick(HttpProvider::Ollama, "m", &base, None, 8).unwrap();
-        assert!(e.embed_passages(&["x".into()]).is_err());
-        assert_eq!(seen.lock().unwrap().len(), 2, "a 404 is asked once");
-        // A rejected key is asked once too.
-        let (base, seen) = mock_with(|n, _, req| match n {
-            0 => (200, vectors(req)),
-            _ => (401, "{}".into()),
-        });
-        let e = quick(HttpProvider::OpenAi, "m", &base, Some("k"), 8).unwrap();
-        assert!(e.embed_passages(&["x".into()]).is_err());
-        assert_eq!(seen.lock().unwrap().len(), 2);
+        let started = Instant::now();
+        assert!(e.embed_query("anything").is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        let again = Instant::now();
+        assert!(e.embed_query("anything").is_err());
+        assert!(
+            again.elapsed() < Duration::from_millis(100),
+            "the cool-down answers at once"
+        );
     }
 
     #[test]

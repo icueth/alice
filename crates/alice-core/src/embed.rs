@@ -8,17 +8,6 @@ use crate::normalize::{nfc, truncate_chars};
 pub const MODEL_LOADING: &str =
     "the embedding model is loading after an idle period; this search used word matches only";
 
-/// Embedders put this at the start of an error that says the provider could not be reached or
-/// would not serve (a timeout, a refused connection, 429, 5xx, a refused key): it tells nothing
-/// about the text, so the embedding worker keeps the text queued and backs off instead of
-/// counting the failure toward giving the text up.
-pub const PROVIDER_UNAVAILABLE: &str = "the embedding provider is unavailable: ";
-
-/// Whether an error text starts with [`PROVIDER_UNAVAILABLE`].
-pub fn is_unavailable(message: &str) -> bool {
-    message.starts_with(PROVIDER_UNAVAILABLE)
-}
-
 pub trait Embedder: Send + Sync {
     /// Identifier stored with each vector, e.g. `multilingual-e5-small`.
     fn model_id(&self) -> &str;
@@ -72,14 +61,11 @@ impl Embedder for UnavailableEmbedder {
         self.dim
     }
     fn embed_passages(&self, _: &[String]) -> Result<Vec<Vec<f32>>> {
-        Err(crate::error::AliceError::Other(format!(
-            "{PROVIDER_UNAVAILABLE}{}",
-            self.reason
-        )))
+        Err(crate::error::AliceError::Unavailable(self.reason.clone()))
     }
     fn embed_query(&self, _: &str) -> Result<Vec<f32>> {
-        Err(crate::error::AliceError::Other(format!(
-            "{PROVIDER_UNAVAILABLE}{}; this search used word matches only",
+        Err(crate::error::AliceError::Unavailable(format!(
+            "{}; this search used word matches only",
             self.reason
         )))
     }
@@ -225,16 +211,10 @@ mod tests {
             ("openai:m", 3, true)
         );
         assert_eq!(e.problem().as_deref(), Some("cannot reach the provider"));
-        let err = e.embed_passages(&["x".into()]).unwrap_err().to_string();
-        assert!(
-            is_unavailable(&err) && err.contains("cannot reach"),
-            "{err}"
-        );
-        let err = e.embed_query("x").unwrap_err().to_string();
-        assert!(
-            is_unavailable(&err) && err.contains("word matches only"),
-            "{err}"
-        );
-        assert!(!is_unavailable("scripted embedding failure"));
+        use crate::error::AliceError;
+        let err = e.embed_passages(&["x".into()]).unwrap_err();
+        assert!(matches!(&err, AliceError::Unavailable(m) if m.contains("cannot reach")));
+        let err = e.embed_query("x").unwrap_err();
+        assert!(matches!(&err, AliceError::Unavailable(m) if m.contains("word matches only")));
     }
 }

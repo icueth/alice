@@ -29,10 +29,6 @@ pub const RESTART_KEYS: &[&str] = &[
     "embedding.idle_unload",
     "embedding.batch_size",
 ];
-/// Keys that are saved and validated but read by nothing yet; the views say "not used yet"
-/// instead of promising an effect. None at the moment: the embedding keys that used to be here
-/// are read since the HTTP providers landed.
-pub const NOT_USED_YET_KEYS: &[&str] = &[];
 
 /// `ALICE_*` variables read elsewhere that are not settings (never warned about). Secrets are
 /// recognised here by name; `resolve` never reads their values.
@@ -348,13 +344,15 @@ impl EmbeddingSettings {
             EmbeddingProvider::Ollama => "127.0.0.1",
             EmbeddingProvider::Voyage => "api.voyageai.com",
         };
-        let host = self
-            .endpoint
-            .as_deref()
-            .and_then(url_parts)
-            .map(|u| u.host.to_ascii_lowercase())
-            .filter(|h| !h.is_empty())
-            .unwrap_or_else(|| default_host.to_string());
+        let host = match self.endpoint.as_deref() {
+            None => default_host.to_string(),
+            // An endpoint that cannot be read is not assumed to be the provider's own, nor this
+            // machine: it counts as remote (fail closed).
+            Some(e) => match url_parts(e).map(|u| u.host.to_ascii_lowercase()) {
+                Some(h) if !h.is_empty() => h,
+                _ => return Some((self.provider, "(unreadable endpoint)".to_string())),
+            },
+        };
         (!host_is_local(&host)).then_some((self.provider, host))
     }
 
@@ -757,7 +755,7 @@ pub struct KeyInfo {
     pub env_var: String,
     pub read_only: bool,
     pub restart: bool,
-    /// Saved, but nothing reads it yet (see [`NOT_USED_YET_KEYS`]).
+    /// Saved, but nothing reads it yet. No key is at the moment; the field stays for clients.
     #[serde(default)]
     pub not_used_yet: bool,
 }
@@ -813,7 +811,7 @@ pub fn key_infos() -> Vec<KeyInfo> {
             env_var: env_var(key),
             read_only: READ_ONLY_KEYS.contains(&key.as_str()),
             restart: RESTART_KEYS.contains(&key.as_str()),
-            not_used_yet: NOT_USED_YET_KEYS.contains(&key.as_str()),
+            not_used_yet: false,
         })
         .collect()
 }
@@ -2967,6 +2965,15 @@ mod tests {
         }
         assert!(endpoint_is_remote(Voyage, None));
         assert!(!endpoint_is_remote(Ollama, Some("http://localhost:1/v1")));
+    }
+
+    #[test]
+    fn an_endpoint_that_cannot_be_read_is_remote_never_the_providers_default_or_local() {
+        use EmbeddingProvider::*;
+        for e in ["", "not a url", "http://", "ftp:///x"] {
+            assert!(embedding(Ollama, Some(e)).embedding.is_remote(), "{e:?}");
+            assert!(embedding(Openai, Some(e)).embedding.is_remote(), "{e:?}");
+        }
     }
 
     #[test]

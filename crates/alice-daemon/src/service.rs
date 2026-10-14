@@ -625,11 +625,6 @@ fn spawn_config_events(
     Ok(())
 }
 
-/// What to tell about a key that is saved but read by nothing yet.
-fn not_used_yet_note(key: &str) -> String {
-    format!("{key} is saved but not used yet; a restart changes nothing")
-}
-
 type SecretStatuses = BTreeMap<String, SecretStatus>;
 
 /// A read of the secrets' status that is running: when it began, and where its answer arrives.
@@ -692,7 +687,7 @@ impl Service {
         });
         let (embedder, embedding_error) = match &builder {
             Some(b) => {
-                let plan = embedding::plan(b, &conn, &started_with.embedding, make_embedder)?;
+                let plan = embedding::plan(b, &conn, &started_with.embedding)?;
                 if let Some(rec) = &plan.record {
                     conn.execute(
                         "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -779,6 +774,7 @@ impl Service {
             redactors.clone(),
         ));
         let policy: Arc<dyn JevPolicy> = cloud.clone();
+        let embedding_error: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(embedding_error));
         let (main_paused, parked, recheck_skipped) = (
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
@@ -799,6 +795,7 @@ impl Service {
             parked: parked.clone(),
             policy: Some(policy.clone()),
             recheck_skipped: recheck_skipped.clone(),
+            error: embedding_error.clone(),
         });
         let judge = JudgeHub::new(
             settings.clone(),
@@ -811,6 +808,7 @@ impl Service {
             opts.secrets_timeout,
         );
         let judge_active = active.clone();
+        let judge_index = index.clone();
         let judge_thread = spawn_judge_worker(JudgeWorkerConfig {
             readers: readers.clone(),
             writer: writer.clone(),
@@ -818,7 +816,10 @@ impl Service {
             judge: judge.clone(),
             settings: settings.clone(),
             redactors: redactors.clone(),
-            model: Arc::new(move || judge_active.read().model.clone()),
+            model: Arc::new(move || {
+                let (a, i) = snapshot(&judge_active, &judge_index);
+                (a.model.clone(), i)
+            }),
             wake: judge_wake_rx,
             stop: stop.clone(),
             retry_every: opts.judge_retry_every,
@@ -2098,12 +2099,6 @@ impl Service {
                 "secrets.backend is {now} but this daemon started with {was}; the change applies after `alice daemon stop` and the next start, and the secrets are not copied: under {now} they show as not set until you set them again with `alice config set-secret <name>`"
             ));
         }
-        for k in restart_pending
-            .iter()
-            .filter(|k| settings::NOT_USED_YET_KEYS.contains(&k.as_str()))
-        {
-            notes.push(not_used_yet_note(k));
-        }
         for entry in self.unmatched_cloud_denied() {
             notes.push(format!(
                 "privacy.cloud_denied_projects lists \"{entry}\", which matches no project (by slug, alias or name); it is kept and denies any project later called that, but check it for a typo"
@@ -2209,13 +2204,6 @@ impl Service {
                 loosened.join(", "),
                 settings::LOOSEN_POLLS
             ));
-        }
-        for k in out
-            .changed
-            .iter()
-            .filter(|k| settings::NOT_USED_YET_KEYS.contains(&k.as_str()))
-        {
-            notes.push(not_used_yet_note(k));
         }
         if out.changed.iter().any(|k| {
             matches!(
@@ -2413,6 +2401,13 @@ impl Service {
             "embedding" => {
                 let e = self.embedder();
                 let id = e.model_id().to_string();
+                if e.is_remote() && self.settings.config_degraded() {
+                    return Ok(ProviderTest {
+                        ok: false,
+                        message: "config.toml has not loaded as a valid file since the daemon started, so no text is sent to a cloud provider; fix it first (alice config list)".into(),
+                        latency_ms: took(),
+                    });
+                }
                 let r = tokio::task::spawn_blocking(move || {
                     e.embed_passages(&["connection test".to_string()])
                 })

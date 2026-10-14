@@ -264,7 +264,7 @@ pub use onnx::{OnnxEmbedder, OnnxOptions};
 pub type EmbedderFactory = std::sync::Arc<
     dyn Fn(
             &alice_core::settings::EmbeddingSettings,
-            Option<String>,
+            Option<alice_core::settings::SecretValue>,
         ) -> alice_core::Result<std::sync::Arc<dyn alice_core::embed::Embedder>>
         + Send
         + Sync,

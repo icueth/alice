@@ -1626,4 +1626,38 @@ mod tests {
         r.text = Some("no newline".into());
         assert_eq!(recall_text(&r), "no newline\n(re-ranked by the judge)\n");
     }
+
+    /// `alice status` names the embedding model, the progress of a re-embed, the rows the cloud
+    /// policy holds back and the reason the model asked for is not in force.
+    #[test]
+    fn status_notes_name_the_embedding_model_its_re_embed_and_its_problems() {
+        let mut h: Health = serde_json::from_value(serde_json::json!({
+            "service": "alice", "instance": "i", "version": "0", "pid": 1, "memories": 0,
+            "chunks": 0, "projects": 0, "embed_backlog": 0, "index_ready": true
+        }))
+        .unwrap();
+        assert!(
+            !health_notes(&h).contains("embedding model"),
+            "old daemons say nothing"
+        );
+        h.embedding_model = "multilingual-e5-small-q8".into();
+        assert_eq!(
+            health_notes(&h),
+            "embedding model: multilingual-e5-small-q8\n"
+        );
+        h.reembed = Some(alice_core::api::ReembedStatus {
+            model: "openai:m".into(),
+            done: 40,
+            total: 100,
+        });
+        h.embed_skipped_cloud = 7;
+        h.embedding_error = Some("openai:m is unreachable".into());
+        let notes = health_notes(&h);
+        assert!(
+            notes.contains("(re-embedding into openai:m: 40 of 100)")
+                && notes.contains("7 rows held back by the cloud policy")
+                && notes.contains("WARNING: openai:m is unreachable"),
+            "{notes}"
+        );
+    }
 }

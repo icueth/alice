@@ -10,7 +10,7 @@
 
 use crate::service::{ActiveSlot, IndexSlot, snapshot};
 use crate::writer::{WriteOp, WriteOutcome, WriterHandle};
-use alice_core::embed::{Embedder, is_unavailable};
+use alice_core::embed::Embedder;
 use alice_core::error::AliceError;
 use alice_core::judge::jev::JevPolicy;
 use alice_core::store::ReaderPool;
@@ -71,6 +71,20 @@ pub struct WorkerConfig {
     /// Set when the policy or the provider may have changed: rows held back are looked at
     /// again now rather than at the next periodic look.
     pub recheck_skipped: Arc<AtomicBool>,
+    /// Health's `embedding_error`: the worker says there that the provider is unavailable (and
+    /// takes it back when a batch goes through), so health names the cause of a backlog.
+    pub error: Arc<parking_lot::RwLock<Option<String>>>,
+}
+
+/// What the worker puts in `embedding_error` while the provider is unavailable.
+pub const UNAVAILABLE_NOTE: &str =
+    "the embedding provider is unavailable, texts wait in the queue: ";
+
+/// Why one text was not embedded, and whether that says anything about the text.
+struct Failure {
+    message: String,
+    /// The provider could not be reached or would not serve: the text stays queued.
+    unavailable: bool,
 }
 
 pub fn spawn_worker(cfg: WorkerConfig) -> JoinHandle<()> {
@@ -165,7 +179,7 @@ fn embed_each(
     embedder: &dyn Embedder,
     items: &[PendingItem],
     isolate: bool,
-) -> Vec<Result<Vec<f32>, String>> {
+) -> Vec<Result<Vec<f32>, Failure>> {
     let texts: Vec<String> = items.iter().map(|i| i.text.clone()).collect();
     let whole = embed_guarded(embedder, &texts).and_then(|v| {
         if v.len() == texts.len() {
@@ -180,19 +194,33 @@ fn embed_each(
     });
     match whole {
         Ok(vectors) => vectors.into_iter().map(Ok).collect(),
-        Err(e) if items.len() == 1 || !isolate || is_unavailable(&e.to_string()) => {
-            let msg = e.to_string();
-            items.iter().map(|_| Err(msg.clone())).collect()
+        Err(e) if items.len() == 1 || !isolate || matches!(e, AliceError::Unavailable(_)) => {
+            let f = Failure {
+                message: e.to_string(),
+                unavailable: matches!(e, AliceError::Unavailable(_)),
+            };
+            items
+                .iter()
+                .map(|_| {
+                    Err(Failure {
+                        message: f.message.clone(),
+                        unavailable: f.unavailable,
+                    })
+                })
+                .collect()
         }
         Err(_) => texts
             .iter()
             .map(|t| match embed_guarded(embedder, std::slice::from_ref(t)) {
                 Ok(mut v) if v.len() == 1 => Ok(v.remove(0)),
-                Ok(v) => Err(format!(
-                    "the embedder returned {} vectors for 1 text",
-                    v.len()
-                )),
-                Err(e) => Err(e.to_string()),
+                Ok(v) => Err(Failure {
+                    message: format!("the embedder returned {} vectors for 1 text", v.len()),
+                    unavailable: false,
+                }),
+                Err(e) => Err(Failure {
+                    unavailable: matches!(e, AliceError::Unavailable(_)),
+                    message: e.to_string(),
+                }),
             })
             .collect(),
     }
@@ -393,13 +421,15 @@ fn run(cfg: WorkerConfig) {
         let mut done = Vec::new();
         let (mut retry, mut give_up) = (Vec::new(), Vec::new());
         let mut first_error = None;
+        let mut saw_unavailable = false;
         for (item, r) in items.into_iter().zip(results) {
             match r {
                 Ok(v) => done.push((item.key, item.stamp, v)),
                 Err(e) => {
                     // A provider that is down says nothing about the text: it stays queued.
-                    let unavailable = is_unavailable(&e);
-                    first_error.get_or_insert(e);
+                    let unavailable = e.unavailable;
+                    saw_unavailable |= unavailable;
+                    first_error.get_or_insert(e.message);
                     // A remote batch that failed says nothing about one text in it: the next
                     // round asks for less. Only a text that failed on its own counts.
                     let blame = !remote || n_items == 1;
@@ -413,6 +443,19 @@ fn run(cfg: WorkerConfig) {
         }
 
         let mut healthy = first_error.is_none();
+        if saw_unavailable {
+            if let Some(e) = &first_error {
+                *cfg.error.write() = Some(format!("{UNAVAILABLE_NOTE}{e}"));
+            }
+        } else if !done.is_empty() {
+            let mut note = cfg.error.write();
+            if note
+                .as_deref()
+                .is_some_and(|n| n.starts_with(UNAVAILABLE_NOTE))
+            {
+                *note = None;
+            }
+        }
         if !done.is_empty() {
             let keys: Vec<VecKey> = done.iter().map(|(k, _, _)| *k).collect();
             match cfg.writer.submit_blocking(WriteOp::StoreEmbeddings {
@@ -566,10 +609,7 @@ mod tests {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             self.seen.lock().extend(texts.iter().cloned());
             if n < self.unavailable_first {
-                return Err(AliceError::Other(format!(
-                    "{}scripted outage",
-                    alice_core::embed::PROVIDER_UNAVAILABLE
-                )));
+                return Err(AliceError::Unavailable("scripted outage".into()));
             }
             if texts.len() > self.max_batch {
                 return Err(AliceError::Other("scripted refusal of a big batch".into()));
@@ -618,6 +658,7 @@ mod tests {
         paused: Arc<AtomicBool>,
         parked: Arc<AtomicBool>,
         recheck: Arc<AtomicBool>,
+        error: Arc<RwLock<Option<String>>>,
     }
 
     impl Rig {
@@ -716,6 +757,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
+        let error: Arc<RwLock<Option<String>>> = Arc::default();
         let worker = spawn_worker(WorkerConfig {
             readers: Arc::new(ReaderPool::new(db, 2)),
             writer: writer.clone(),
@@ -730,8 +772,10 @@ mod tests {
             parked: parked.clone(),
             policy,
             recheck_skipped: recheck.clone(),
+            error: error.clone(),
         });
         Rig {
+            error,
             active,
             paused,
             parked,
@@ -1183,9 +1227,60 @@ mod tests {
             r.embedder.calls.load(Ordering::SeqCst) > MAX_ATTEMPTS as usize + 1
         });
         assert_eq!(state(&r, seq), "retry", "still queued, not failed");
+        assert!(
+            r.error
+                .read()
+                .as_deref()
+                .is_some_and(|e| e.starts_with(UNAVAILABLE_NOTE) && e.contains("scripted outage")),
+            "health names the cause: {:?}",
+            r.error.read()
+        );
         wait_until(
             "the provider to come back and the text to be embedded",
             || state(&r, seq) == "done",
+        );
+        wait_until("the note to be taken back", || r.error.read().is_none());
+    }
+
+    /// C1: a project denied while the provider is down is not sent when the provider is back:
+    /// the policy is asked again before every attempt.
+    #[test]
+    fn a_project_denied_during_an_outage_is_not_sent_after_it() {
+        let denied: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        struct Live(Arc<Mutex<Vec<&'static str>>>);
+        impl JevPolicy for Live {
+            fn cloud_allowed(&self, p: &str) -> bool {
+                !self.0.lock().contains(&p)
+            }
+            fn redactor(&self, _: &str) -> Arc<Redactor> {
+                Arc::new(Redactor::builtin())
+            }
+        }
+        let r = rig_full(
+            fresh_index(),
+            SAVE_EVERY,
+            32,
+            Some(Arc::new(Live(denied.clone()))),
+            |e, _, _| {
+                e.remote = true;
+                e.unavailable_first = 4;
+            },
+        );
+        let seq = remember_in(&r, "a-proj", "the narwhal tusk is in the vault");
+        wait_until("the first failed attempt", || {
+            r.embedder.calls.load(Ordering::SeqCst) >= 1
+        });
+        // Denied during the outage; the provider then comes back.
+        denied.lock().push("a-proj");
+        let sent_before = r.embedder.seen.lock().len();
+        wait_until("the row to be held back", || {
+            state(&r, seq) == "skipped_cloud"
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let seen = r.embedder.seen.lock().clone();
+        assert!(
+            !seen[sent_before..].iter().any(|t| t.contains("narwhal")),
+            "text of a project denied meanwhile was sent: {seen:?}"
         );
     }
 

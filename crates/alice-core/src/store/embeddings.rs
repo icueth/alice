@@ -102,7 +102,9 @@ pub enum Owner {
     Chunk,
 }
 
-/// Rows after `after_seq` with no vector for `model`, in seq order (live memories / chunks).
+/// Rows after `after_seq` with no vector for `model`, in seq order (memories, trashed ones
+/// included: one restored after a model switch must have a vector for the new model; they
+/// are few and purged after `maintenance.trash_days`).
 /// What a model change has still to embed.
 pub fn missing(
     conn: &Connection,
@@ -114,7 +116,7 @@ pub fn missing(
     let sql = match owner {
         Owner::Memory => {
             "SELECT m.seq, m.title, m.body, m.content_hash, m.project_id FROM memories m
-             WHERE m.seq > ?1 AND m.status <> 'trashed'
+             WHERE m.seq > ?1
                AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.owner_type = 'memory' AND e.owner_seq = m.seq AND e.model = ?2)
              ORDER BY m.seq LIMIT ?3"
         }
@@ -196,13 +198,37 @@ pub fn mark_skipped_cloud_if_current(conn: &Connection, key: VecKey, stamp: &str
     set_state_if_current(conn, key, stamp, SKIPPED_CLOUD)
 }
 
+// The queries on `skipped_cloud` rows repeat `embed_state <> 'done'`, the term of the partial
+// indexes `memories_embed` / `chunks_embed`; without it SQLite scans the whole table (a health
+// reading asks every few seconds).
+fn skipped_projects_sql(table: &str) -> String {
+    format!(
+        "SELECT project_id FROM {table} WHERE embed_state <> 'done' AND embed_state = ?1 GROUP BY project_id"
+    )
+}
+
+fn requeue_sql(table: &str, with_projects: usize) -> String {
+    let mut sql = format!(
+        "UPDATE {table} SET embed_state = 'pending' WHERE seq IN
+           (SELECT seq FROM {table} WHERE embed_state <> 'done' AND embed_state = ?1"
+    );
+    if with_projects > 0 {
+        let marks: Vec<String> = (0..with_projects).map(|i| format!("?{}", i + 3)).collect();
+        sql.push_str(&format!(" AND project_id IN ({})", marks.join(",")));
+    }
+    sql.push_str(" LIMIT ?2)");
+    sql
+}
+
+const SKIPPED_COUNT_SQL: &str = "SELECT
+       (SELECT count(*) FROM memories WHERE embed_state <> 'done' AND embed_state = ?1 AND status <> 'trashed')
+     + (SELECT count(*) FROM chunks WHERE embed_state <> 'done' AND embed_state = ?1)";
+
 /// Ids of the projects that have rows held back by the cloud policy.
 pub fn skipped_projects(conn: &Connection) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     for table in ["memories", "chunks"] {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT project_id FROM {table} WHERE embed_state = ?1 GROUP BY project_id"
-        ))?;
+        let mut stmt = conn.prepare(&skipped_projects_sql(table))?;
         for id in stmt.query_map([SKIPPED_CLOUD], |r| r.get::<_, String>(0))? {
             let id = id?;
             if !out.contains(&id) {
@@ -227,23 +253,16 @@ pub fn requeue_skipped_cloud(
         if left == 0 {
             break;
         }
-        let mut sql = format!(
-            "UPDATE {table} SET embed_state = 'pending' WHERE seq IN
-               (SELECT seq FROM {table} WHERE embed_state = ?1"
-        );
-        let mut args: Vec<rusqlite::types::Value> = vec![SKIPPED_CLOUD.to_string().into()];
-        if let Some(ids) = projects {
-            if ids.is_empty() {
-                continue;
+        let mut args: Vec<rusqlite::types::Value> =
+            vec![SKIPPED_CLOUD.to_string().into(), (left as i64).into()];
+        let sql = match projects {
+            Some([]) => continue,
+            Some(ids) => {
+                args.extend(ids.iter().map(|i| rusqlite::types::Value::from(i.clone())));
+                requeue_sql(table, ids.len())
             }
-            let marks: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 3)).collect();
-            sql.push_str(&format!(" AND project_id IN ({})", marks.join(",")));
-            args.splice(1..1, [(left as i64).into()]);
-            args.extend(ids.iter().map(|i| rusqlite::types::Value::from(i.clone())));
-        } else {
-            args.push((left as i64).into());
-        }
-        sql.push_str(" LIMIT ?2)");
+            None => requeue_sql(table, 0),
+        };
         n += conn.execute(&sql, rusqlite::params_from_iter(args))?;
     }
     Ok(n)
@@ -251,21 +270,14 @@ pub fn requeue_skipped_cloud(
 
 /// Rows held back by the cloud policy (memories, chunks).
 pub fn skipped_cloud_count(conn: &Connection) -> Result<usize> {
-    let n: i64 = conn.query_row(
-        "SELECT (SELECT count(*) FROM memories WHERE embed_state = ?1 AND status <> 'trashed')
-              + (SELECT count(*) FROM chunks WHERE embed_state = ?1)",
-        [SKIPPED_CLOUD],
-        |r| r.get(0),
-    )?;
+    let n: i64 = conn.query_row(SKIPPED_COUNT_SQL, [SKIPPED_CLOUD], |r| r.get(0))?;
     Ok(n as usize)
 }
 
 /// What a model change would embed, per project: `(project_id, memories, chunks)`.
 pub fn embeddable_by_project(conn: &Connection) -> Result<Vec<(String, usize, usize)>> {
     let mut by: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
-    let mut stmt = conn.prepare(
-        "SELECT project_id, count(*) FROM memories WHERE status <> 'trashed' GROUP BY project_id",
-    )?;
+    let mut stmt = conn.prepare("SELECT project_id, count(*) FROM memories GROUP BY project_id")?;
     for r in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
         let (p, n) = r?;
         by.entry(p).or_default().0 = n as usize;
@@ -278,13 +290,10 @@ pub fn embeddable_by_project(conn: &Connection) -> Result<Vec<(String, usize, us
     Ok(by.into_iter().map(|(p, (m, c))| (p, m, c)).collect())
 }
 
-/// Rows a model change would send to a remote provider: live memories and all chunks.
+/// Rows a model change would send to a remote provider: all memories (trashed ones too) and
+/// all chunks.
 pub fn embeddable_count(conn: &Connection) -> Result<(usize, usize)> {
-    let m: i64 = conn.query_row(
-        "SELECT count(*) FROM memories WHERE status <> 'trashed'",
-        [],
-        |r| r.get(0),
-    )?;
+    let m: i64 = conn.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))?;
     let c: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?;
     Ok((m as usize, c as usize))
 }
@@ -928,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_skips_trashed_memories_and_lists_chunks_with_their_project() {
+    fn missing_lists_trashed_memories_and_chunks_with_their_project() {
         let d = tempfile::tempdir().unwrap();
         let c = open_writer(&d.path().join("a.db")).unwrap();
         let seqs = three_memories(&c);
@@ -949,7 +958,11 @@ mod tests {
         )
         .unwrap();
         let mem = missing(&c, Owner::Memory, "m", 0, 10).unwrap();
-        assert_eq!(mem.len(), 2, "the trashed memory is left out");
+        assert_eq!(
+            mem.len(),
+            3,
+            "a trashed memory may be restored: it is listed"
+        );
         assert!(mem.iter().all(|i| i.project_id == p.id));
         let chunks = missing(&c, Owner::Chunk, "m", 0, 10).unwrap();
         assert_eq!(chunks.len(), 1);
@@ -957,7 +970,7 @@ mod tests {
             (chunks[0].text.as_str(), chunks[0].project_id.as_str()),
             ("a chunk", p.id.as_str())
         );
-        assert_eq!(embeddable_count(&c).unwrap(), (2, 1));
+        assert_eq!(embeddable_count(&c).unwrap(), (3, 1));
     }
 
     #[test]
@@ -1027,5 +1040,37 @@ mod tests {
         assert_eq!(skipped_cloud_count(&c).unwrap(), 1);
         assert_eq!(requeue_skipped_cloud(&c, None, 10).unwrap(), 1);
         assert!(skipped_projects(&c).unwrap().is_empty());
+    }
+
+    /// The queries on held-back rows must use the partial indexes, or a health reading scans
+    /// the whole table.
+    #[test]
+    fn held_back_row_queries_use_the_partial_embed_indexes() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let plan = |sql: &str, n: usize| -> String {
+            let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let params: Vec<i64> = vec![1; n];
+            stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ")
+        };
+        for (table, index) in [("memories", "memories_embed"), ("chunks", "chunks_embed")] {
+            let p = plan(&skipped_projects_sql(table), 1);
+            assert!(p.contains(&format!("USING INDEX {index}")), "{p}");
+            for projects in [0, 2] {
+                let p = plan(&requeue_sql(table, projects), 2 + projects);
+                assert!(p.contains(&format!("INDEX {index}")), "{p}");
+            }
+        }
+        let p = plan(SKIPPED_COUNT_SQL, 1);
+        assert!(
+            p.contains("memories_embed") && p.contains("chunks_embed"),
+            "{p}"
+        );
     }
 }
