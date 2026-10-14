@@ -399,12 +399,13 @@ impl Service {
             return;
         };
         let path = self.home.vector_file(self.embedder.model_id());
-        let saved = if idx.is_dirty() {
-            idx.save(&path)
-        } else {
-            Ok(())
-        };
-        if let Err(e) = saved.and_then(|()| VectorIndex::mark_clean(&path)) {
+        // Saved even when nothing changed since start: an index that never came from these
+        // files (an empty one after a failed rebuild, say) must replace them before the mark
+        // vouches for them. Each part skips the write when its file already holds it.
+        if let Err(e) = idx
+            .save(&path)
+            .and_then(|()| VectorIndex::mark_clean(&path))
+        {
             tracing::warn!(error = %e, "saving the vector index failed; the next start rebuilds it");
         }
     }
@@ -1285,6 +1286,111 @@ mod tests {
         assert_eq!(chunk_seqs(&s), seqs, "rebuilt from the stored vectors");
         stop(s.clone()).await.unwrap();
         assert!(mark.exists());
+    }
+
+    /// A stale index file is opened after an unclean stop, its rebuild fails, and the daemon
+    /// runs on an empty index that was never written. A clean stop must then save that index
+    /// before it marks the files clean: otherwise the mark vouches for the stale files, and the
+    /// next start trusts them whenever their count happens to match the table.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_rebuild_never_leaves_stale_files_marked_clean() {
+        use alice_core::bq::BinaryIndex;
+        use alice_core::store::embeddings::VecKey;
+        use alice_core::vector::KeyFilter;
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let mk = || Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>);
+        let stop = |s: Arc<Service>| tokio::task::spawn_blocking(move || s.shutdown());
+        let ready = |s: Arc<Service>| async move {
+            for _ in 0..200 {
+                if s.health().await.unwrap().index_ready {
+                    return s;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("the index never became ready");
+        };
+        let s = Service::start(home.clone(), &mk, ServiceOptions::default()).unwrap();
+        s.ingest(IngestRequest {
+            source: SourceInput {
+                uri: "s".into(),
+                ..Default::default()
+            },
+            chunks: (0..3)
+                .map(|i| ChunkInput {
+                    ord: i,
+                    text: format!("chunk number {i} of the session"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_embedded(&s).await;
+        stop(s.clone()).await.unwrap();
+        drop(s);
+        let base = home.vector_file("fake");
+        let mark = base.with_extension("clean");
+        let seqs: Vec<i64> = {
+            let c = open_reader(&home.db()).unwrap();
+            let mut stmt = c.prepare("SELECT seq FROM chunks ORDER BY seq").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        // A stale chunk file with the right count, left by a crash (no mark)...
+        let e = FakeEmbedder::new(384);
+        let mut stale = BinaryIndex::new(384);
+        for seq in [seqs[0], seqs[1], 999] {
+            stale
+                .upsert(seq, &e.embed_query(&format!("x{seq}")).unwrap())
+                .unwrap();
+        }
+        let f = std::fs::File::create(base.with_extension("chunks.bq")).unwrap();
+        stale.write_to(std::io::BufWriter::new(f)).unwrap();
+        std::fs::remove_file(&mark).unwrap();
+        // ...and a stored vector the rebuild cannot read, so the rebuild fails.
+        let bad = "INSERT INTO embeddings (owner_type, owner_seq, model, dim, vector) \
+                   VALUES ('chunk', 424242, 'fake', 384, 'not a vector')";
+        open_writer(&home.db()).unwrap().execute(bad, []).unwrap();
+
+        let s = ready(Service::start(home.clone(), &mk, ServiceOptions::default()).unwrap()).await;
+        let in_memory = s.index.read().clone().unwrap().len();
+        assert_eq!(in_memory, 0, "the failed rebuild left an empty index");
+        stop(s.clone()).await.unwrap();
+        drop(s);
+        assert!(mark.exists(), "the stop was clean");
+        let on_disk = VectorIndex::open(&base, "fake", 384).unwrap().len();
+        assert_eq!(
+            on_disk, in_memory,
+            "the files marked clean hold the index that was in memory"
+        );
+
+        // With the unreadable row gone the counts agree with the stale file: only the saved
+        // (empty) index makes the next start rebuild instead of trusting it.
+        open_writer(&home.db())
+            .unwrap()
+            .execute("DELETE FROM embeddings WHERE owner_seq = 424242", [])
+            .unwrap();
+        let s = ready(Service::start(home.clone(), &mk, ServiceOptions::default()).unwrap()).await;
+        let q = FakeEmbedder::new(384).embed_query("chunk").unwrap();
+        let idx = s.index.read().clone().unwrap();
+        let mut found: Vec<i64> = idx
+            .search(&q, 10, KeyFilter::Chunks)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| match k {
+                VecKey::Chunk(s) | VecKey::Memory(s) => s,
+            })
+            .collect();
+        found.sort();
+        assert_eq!(
+            found, seqs,
+            "rebuilt from the stored vectors, not the stale file"
+        );
+        stop(s.clone()).await.unwrap();
     }
 
     /// An index saved by M1 has `chunks.usearch` (an int8 HNSW) and no `chunks.bq`: the chunk

@@ -118,7 +118,8 @@ fn sign_bit_chunk_index_keeps_the_exact_top_ten() {
         "only {} passages ({enough} needed)",
         texts.len()
     );
-    let e = alice_embed::FastEmbedder::new(&models_dir()).unwrap();
+    let e =
+        alice_embed::OnnxEmbedder::new(&models_dir(), alice_embed::OnnxOptions::default()).unwrap();
     let model = e.model_id().to_string();
     let vectors: Vec<Vec<f32>> = texts
         .chunks(32)

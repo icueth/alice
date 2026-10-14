@@ -1,4 +1,5 @@
-//! Embedding providers. The local provider runs multilingual-e5-small (int8, 118 MB) through ONNX Runtime.
+//! Embedding providers. The local provider runs multilingual-e5-small (int8, 118 MB) through ONNX Runtime
+//! directly (`onnx`), with a compact Unigram tokenizer (`tokenizer`).
 //! Model files are pinned to one Hugging Face revision and verified by SHA-256.
 
 use alice_core::error::{AliceError, Result};
@@ -245,164 +246,15 @@ async fn download(
     Ok(())
 }
 
+// The tokenizer needs `spm_precompiled`, an optional dependency of feature `local`.
 #[cfg(feature = "local")]
-mod local {
-    use super::*;
-    use alice_core::embed::Embedder;
-    use fastembed::{
-        InitOptionsUserDefined, Pooling, QuantizationMode, TextEmbedding, TokenizerFiles,
-        UserDefinedEmbeddingModel,
-    };
-    use parking_lot::{Mutex, MutexGuard};
-
-    /// Longest input the model reads, in tokens; longer texts are truncated.
-    const MAX_TOKENS: usize = 512;
-    /// Most texts per inference call.
-    const MAX_BATCH: usize = 32;
-    /// Padded tokens (texts × longest text) per inference call. ONNX Runtime keeps the memory of
-    /// its largest call: one batch of 32 texts of 512 tokens grew the process by 1.4 GB, batches
-    /// of 1,024 tokens by about 100 MB (4,096: about 450 MB). It also bounds how long a query
-    /// waits for the model behind the worker: one batch, ~115 ms for two 512-token texts on an
-    /// M4 Pro and less for short ones. Short texts are still batched up to 32. Batches are
-    /// planned from the tokenizer's own counts: a characters/3 estimate undercounted identifiers,
-    /// JSON and hex ids by up to 2x.
-    const BATCH_TOKENS: usize = 1_024;
-
-    /// Consecutive ranges over texts with these token `counts` such that each range holds at
-    /// most `max_batch` texts and its padded size (texts × longest) stays within `budget` tokens;
-    /// a single text always forms a range of its own. Order is kept.
-    pub(super) fn token_batches(
-        counts: &[usize],
-        max_batch: usize,
-        budget: usize,
-    ) -> Vec<std::ops::Range<usize>> {
-        let mut out = Vec::new();
-        let (mut start, mut longest) = (0, 0);
-        for (i, &n_tokens) in counts.iter().enumerate() {
-            let n = i - start;
-            if n > 0 && (n >= max_batch || (n + 1) * longest.max(n_tokens) > budget) {
-                out.push(start..i);
-                (start, longest) = (i, 0);
-            }
-            longest = longest.max(n_tokens);
-        }
-        if start < counts.len() {
-            out.push(start..counts.len());
-        }
-        out
-    }
-
-    fn passage(text: &str) -> String {
-        format!("passage: {text}")
-    }
-
-    /// `TextEmbedding::embed` needs `&mut self`, so calls are serialised by a mutex. One instance
-    /// costs about 600 MB (the tokenizer of the 250k-token multilingual vocabulary ~250 MB, the
-    /// ONNX session ~265 MB), so the daemon shares one between the embedding worker and queries.
-    /// Passages are embedded in token-bounded batches and the lock is handed over fairly after
-    /// each, so a query waits for one batch at most, never for a whole worker run.
-    pub struct FastEmbedder {
-        model: Mutex<TextEmbedding>,
-    }
-
-    impl FastEmbedder {
-        pub fn new(models_dir: &Path) -> Result<Self> {
-            if !is_model_present(models_dir) {
-                return Err(AliceError::Other(
-                    "the embedding model is not downloaded; run \"alice model fetch\"".into(),
-                ));
-            }
-            let dir = model_dir(models_dir);
-            let rd = |f: &str| std::fs::read(dir.join(f));
-            let model = UserDefinedEmbeddingModel::new(
-                rd("model_quantized.onnx")?,
-                TokenizerFiles {
-                    tokenizer_file: rd("tokenizer.json")?,
-                    config_file: rd("config.json")?,
-                    special_tokens_map_file: rd("special_tokens_map.json")?,
-                    tokenizer_config_file: rd("tokenizer_config.json")?,
-                },
-            )
-            .with_pooling(Pooling::Mean)
-            // Static: dynamic quantization forbids batching.
-            .with_quantization(QuantizationMode::Static);
-            let te = TextEmbedding::try_new_from_user_defined(
-                model,
-                InitOptionsUserDefined::new().with_max_length(MAX_TOKENS),
-            )
-            .map_err(|e| {
-                AliceError::Other(format!(
-                    "loading the embedding model failed: {e}. Run \"alice model fetch\" to repair the model files"
-                ))
-            })?;
-            Ok(Self {
-                model: Mutex::new(te),
-            })
-        }
-    }
-
-    impl FastEmbedder {
-        /// Tokens the model reads for each passage (prefix and special tokens included, at most
-        /// 512), counted with its own tokenizer. Takes the model lock while counting.
-        #[doc(hidden)]
-        pub fn token_counts(&self, texts: &[String]) -> Vec<usize> {
-            let model = self.model.lock();
-            let counts = texts
-                .iter()
-                .map(|t| {
-                    model
-                        .tokenizer
-                        .encode(passage(t), true)
-                        .map_or(MAX_TOKENS, |e| e.len())
-                        .min(MAX_TOKENS)
-                })
-                .collect();
-            MutexGuard::unlock_fair(model);
-            counts
-        }
-
-        /// How `embed_passages` splits `texts` into inference calls.
-        #[doc(hidden)]
-        pub fn passage_batches(&self, texts: &[String]) -> Vec<std::ops::Range<usize>> {
-            token_batches(&self.token_counts(texts), MAX_BATCH, BATCH_TOKENS)
-        }
-    }
-
-    impl Embedder for FastEmbedder {
-        fn model_id(&self) -> &str {
-            MODEL_ID
-        }
-        fn dim(&self) -> usize {
-            DIM
-        }
-        fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            let mut out = Vec::with_capacity(texts.len());
-            for range in self.passage_batches(texts) {
-                let inputs: Vec<String> = texts[range].iter().map(|t| passage(t)).collect();
-                let mut model = self.model.lock();
-                let vectors = model
-                    .embed(inputs, None)
-                    .map_err(|e| AliceError::Other(format!("embedding failed: {e}")));
-                // A waiting query goes next, before this loop takes the lock again.
-                MutexGuard::unlock_fair(model);
-                out.extend(vectors?);
-            }
-            Ok(out)
-        }
-        fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-            let mut v = self
-                .model
-                .lock()
-                .embed(vec![format!("query: {text}")], None)
-                .map_err(|e| AliceError::Other(format!("embedding failed: {e}")))?;
-            v.pop()
-                .ok_or_else(|| AliceError::Other("embedding returned nothing".into()))
-        }
-    }
-}
-
+mod lazy;
 #[cfg(feature = "local")]
-pub use local::FastEmbedder;
+pub mod onnx;
+#[cfg(feature = "local")]
+pub mod tokenizer;
+#[cfg(feature = "local")]
+pub use onnx::{OnnxEmbedder, OnnxOptions};
 
 #[cfg(test)]
 mod tests {
@@ -417,41 +269,6 @@ mod tests {
                 .unwrap()
                 .set_len(*size)
                 .unwrap();
-        }
-    }
-
-    #[cfg(feature = "local")]
-    #[test]
-    fn passages_are_batched_by_padded_tokens_in_order() {
-        use super::local::token_batches;
-        // Short texts (14 tokens each): up to 32 per batch.
-        let short = vec![14; 70];
-        assert_eq!(
-            token_batches(&short, 32, 1_024),
-            vec![0..32, 32..64, 64..70]
-        );
-        // Texts at the 512-token cap: two per batch of 1,024.
-        let long = vec![512; 5];
-        assert_eq!(token_batches(&long, 32, 1_024), vec![0..2, 2..4, 4..5]);
-        // One long text after short ones closes the batch: padding would exceed the budget.
-        let mut mixed = vec![24; 10];
-        mixed.extend([512, 24]);
-        assert_eq!(token_batches(&mixed, 32, 1_024), vec![0..10, 10..12]);
-        // A text over the budget on its own still gets a batch; nothing is lost or reordered.
-        assert_eq!(
-            token_batches(&long, 32, 100),
-            vec![0..1, 1..2, 2..3, 3..4, 4..5]
-        );
-        assert!(token_batches(&[], 32, 1_024).is_empty());
-        for counts in [&short, &long, &mixed] {
-            let ranges = token_batches(counts, 32, 1_024);
-            assert_eq!(ranges.first().map(|r| r.start), Some(0));
-            assert_eq!(ranges.last().map(|r| r.end), Some(counts.len()));
-            assert!(ranges.windows(2).all(|w| w[0].end == w[1].start));
-            for r in &ranges {
-                let longest = counts[r.clone()].iter().max().copied().unwrap();
-                assert!(r.len() == 1 || r.len() * longest <= 1_024, "{r:?}");
-            }
         }
     }
 
@@ -748,15 +565,5 @@ mod tests {
             assert!(err.contains("Check the network"), "{err}");
             assert_eq!(leftovers(d.path(), &[]), Vec::<String>::new(), "{name}");
         }
-    }
-
-    #[cfg(feature = "local")]
-    #[test]
-    fn loading_without_the_model_says_how_to_fetch_it() {
-        let d = tempfile::tempdir().unwrap();
-        let Err(e) = FastEmbedder::new(d.path()) else {
-            panic!("loaded a model that is not there")
-        };
-        assert!(e.to_string().contains("alice model fetch"), "{e}");
     }
 }

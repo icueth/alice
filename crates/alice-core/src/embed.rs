@@ -9,6 +9,10 @@ pub trait Embedder: Send + Sync {
     fn dim(&self) -> usize;
     fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     fn embed_query(&self, text: &str) -> Result<Vec<f32>>;
+    /// False while a model that was unloaded after an idle period is being loaded again.
+    fn is_loaded(&self) -> bool {
+        true
+    }
 }
 
 /// Text embedded for a memory: title and body, bounded so the model's 512-token window is not exceeded badly.

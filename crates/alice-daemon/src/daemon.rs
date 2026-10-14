@@ -29,6 +29,9 @@ const GRACE: Duration = Duration::from_secs(2);
 const DRAIN_EVERY: Duration = Duration::from_secs(5);
 /// Download progress is written to daemon.starting at most this often.
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(1);
+/// The local model is unloaded after this long unused (queries meanwhile use word matches
+/// while it reloads; the embedding worker waits for it).
+const MODEL_IDLE_UNLOAD: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Default)]
 pub struct DaemonOptions {
@@ -186,7 +189,14 @@ fn start_and_serve(
         if fake {
             Ok(Arc::new(FakeEmbedder::new(384)))
         } else {
-            Ok(Arc::new(alice_embed::FastEmbedder::new(&models)?))
+            Ok(Arc::new(alice_embed::OnnxEmbedder::new(
+                &models,
+                alice_embed::OnnxOptions {
+                    // Task 6 reads this from `embedding.idle_unload`.
+                    idle_unload: Some(MODEL_IDLE_UNLOAD),
+                    intra_threads: None,
+                },
+            )?))
         }
     };
     let svc = Service::start(home.clone(), &make, ServiceOptions::default())

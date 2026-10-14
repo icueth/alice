@@ -543,7 +543,10 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
                 inner: FakeEmbedder::new(alice_embed::DIM),
                 id: alice_embed::MODEL_ID,
             })),
-            (true, false) => Ok(Arc::new(alice_embed::FastEmbedder::new(&models)?)),
+            (true, false) => Ok(Arc::new(alice_embed::OnnxEmbedder::new(
+                &models,
+                alice_embed::OnnxOptions::default(),
+            )?)),
             _ => Ok(Arc::new(FakeEmbedder::new(384))),
         }
     };
@@ -559,7 +562,10 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
     eprintln!("bench: measuring the embedder alone");
     // Both real modes measure the real model here; --prefill-vectors only fills the index fast.
     let probe: Arc<dyn Embedder> = if real {
-        Arc::new(alice_embed::FastEmbedder::new(&user_models)?)
+        Arc::new(alice_embed::OnnxEmbedder::new(
+            &user_models,
+            alice_embed::OnnxOptions::default(),
+        )?)
     } else {
         make()?
     };
