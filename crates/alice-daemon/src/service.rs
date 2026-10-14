@@ -135,6 +135,8 @@ pub struct ServiceOptions {
     /// machine (the default, so tests and embedded services touch nothing outside their home);
     /// [`ServiceOptions::process_env`] sets it from `$HOME`.
     pub mempalace_home: Option<PathBuf>,
+    /// Tests only: pause or panic an import job.
+    pub import_hook: Option<Arc<importer::ImportHook>>,
 }
 
 impl Default for ServiceOptions {
@@ -159,6 +161,7 @@ impl Default for ServiceOptions {
             judge_retry_base: alice_core::store::judge::RETRY_BASE,
             judge_applies: true,
             mempalace_home: None,
+            import_hook: None,
         }
     }
 }
@@ -776,6 +779,12 @@ impl Service {
             }
             if !h.is_finished() {
                 tracing::warn!("the import is inside a long step; stopping without it");
+                let slot = self.import.lock();
+                let mut st = slot.status.lock();
+                if st.state == alice_core::import::ImportState::Running {
+                    st.state = alice_core::import::ImportState::Failed;
+                    st.error = Some(importer::STOPPED.to_string());
+                }
             } else if h.join().is_err() {
                 tracing::error!("the import thread panicked");
             }
@@ -2298,26 +2307,38 @@ impl Service {
         req: alice_core::import::ImportRequest,
     ) -> Result<alice_core::import::ImportStatus> {
         use alice_core::import::{ImportState, ImportStatus};
+        let stopping =
+            || AliceError::invalid("the daemon is stopping; start it again and rerun the import");
         if self.stop.load(Ordering::SeqCst) {
-            return Err(AliceError::invalid(
-                "the daemon is stopping; start it again and rerun the import",
-            ));
+            return Err(stopping());
         }
-        let mut slot = self.import.lock();
-        {
+        let running = |slot: &ImportSlot| {
             let st = slot.status.lock();
-            if st.state == ImportState::Running {
-                return Err(AliceError::invalid(format!(
+            (st.state == ImportState::Running).then(|| {
+                AliceError::invalid(format!(
                     "an import is already running (phase {}, {} of {} drawers); wait for it, or follow it with `alice import status`",
                     st.phase, st.done, st.total
-                )));
-            }
+                ))
+            })
+        };
+        if let Some(e) = running(&self.import.lock()) {
+            return Err(e);
         }
+        // Disk checks run without the slot lock, so a status read never waits for them.
         let palace = importer::preflight(
             &req,
             self.opts.mempalace_home.as_deref(),
             &self.settings.get(),
         )?;
+        let mut slot = self.import.lock();
+        // Under the lock: shutdown takes the handle under it too, so a job started here is
+        // always one shutdown can see and join.
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(stopping());
+        }
+        if let Some(e) = running(&slot) {
+            return Err(e);
+        }
         // The last job has finished (its status is no longer `Running`).
         if let Some(old) = slot.handle.take() {
             let _ = old.join();
@@ -2343,6 +2364,7 @@ impl Service {
             mempalace_home: self.opts.mempalace_home.clone(),
             guard: self.activity.enter_owned(),
             status: slot.status.clone(),
+            hook: self.opts.import_hook.clone(),
         };
         match importer::spawn(env, req, palace, job_id) {
             Ok(handle) => {

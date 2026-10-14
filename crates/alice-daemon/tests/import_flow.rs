@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use alice_core::embed::{Embedder, FakeEmbedder};
@@ -12,6 +13,7 @@ use alice_core::import::fixture::{
 };
 use alice_core::import::palace::DrawerMeta;
 use alice_core::import::{ImportRequest, ImportState, ImportStatus};
+use alice_daemon::importer::ImportHook;
 use alice_daemon::paths::AliceHome;
 use alice_daemon::service::{Service, ServiceOptions};
 use sha2::{Digest, Sha256};
@@ -235,10 +237,14 @@ impl Req for ImportRequest {
 }
 
 fn start_service(home: &AliceHome) -> Arc<Service> {
+    start_service_with(home, ServiceOptions::default())
+}
+
+fn start_service_with(home: &AliceHome, opts: ServiceOptions) -> Arc<Service> {
     Service::start(
         home.clone(),
         &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
-        ServiceOptions::default(),
+        opts,
     )
     .unwrap()
 }
@@ -250,11 +256,19 @@ impl Flow {
     }
 
     async fn with_specs(specs: &[DrawerSpec]) -> Flow {
+        Self::with_options(specs, |_| ServiceOptions::default()).await
+    }
+
+    /// `options` gets the folder that holds `palace/` (a stand-in for `~/.mempalace`).
+    async fn with_options(
+        specs: &[DrawerSpec],
+        options: impl FnOnce(&Path) -> ServiceOptions,
+    ) -> Flow {
         let root = tempfile::tempdir().unwrap();
         let palace_root = tempfile::tempdir().unwrap();
         let palace = build_fixture(palace_root.path(), specs);
         let home = AliceHome::new(root.path().join("alice"));
-        let svc = start_service(&home);
+        let svc = start_service_with(&home, options(palace_root.path()));
         Flow {
             _root: root,
             _palace_root: palace_root,
@@ -514,8 +528,16 @@ async fn the_source_palace_is_byte_identical_afterwards_and_a_wal_palace_works()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_start_while_one_runs_is_refused_with_the_progress() {
-    let f = Flow::with_specs(&big_specs(20_000)).await;
+    let hook = Arc::new(ImportHook::default());
+    hook.hold.store(true, Ordering::SeqCst);
+    let h = hook.clone();
+    let f = Flow::with_options(&fixture_specs(), move |_| ServiceOptions {
+        import_hook: Some(h),
+        ..Default::default()
+    })
+    .await;
     f.svc.start_import(f.request().dry_run(true)).unwrap();
+    // The job is parked after its snapshot, so this cannot race with its end.
     let e = f
         .svc
         .start_import(f.request().dry_run(true))
@@ -528,18 +550,156 @@ async fn a_second_start_while_one_runs_is_refused_with_the_progress() {
             .any(|p| e.contains(p)),
         "names the phase: {e}"
     );
+    hook.hold.store(false, Ordering::SeqCst);
     let st = f.wait().await;
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
-    assert_eq!(
-        st.report.unwrap().drawers_seen,
-        20_001,
-        "20,000 chunks and the unreadable drawer"
-    );
+    assert_eq!(st.report.unwrap().drawers_seen, 117);
     // Done: the next one may start.
     assert_eq!(
         f.run_import(f.request().dry_run(true)).await.state,
         ImportState::Done
     );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_snapshot_folder_is_private_to_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let hook = Arc::new(ImportHook::default());
+    hook.hold.store(true, Ordering::SeqCst);
+    let h = hook.clone();
+    let f = Flow::with_options(&fixture_specs(), move |_| ServiceOptions {
+        import_hook: Some(h),
+        ..Default::default()
+    })
+    .await;
+    let job = f
+        .svc
+        .start_import(f.request().dry_run(true))
+        .unwrap()
+        .job_id
+        .unwrap();
+    // Parked after the snapshot: the copy of the owner's history is on disk right now.
+    let tmp = f.home().join("import-tmp");
+    let t = Instant::now();
+    while !tmp.join(&job).join("sqlite_exact.sqlite3").is_file() {
+        assert!(
+            t.elapsed() < Duration::from_secs(30),
+            "no snapshot appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&tmp), 0o700);
+    assert_eq!(mode(&tmp.join(&job)), 0o700);
+    assert!(tmp.join(&job).join("sqlite_exact.sqlite3").is_file());
+    hook.hold.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait().await.state, ImportState::Done);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panic_in_the_job_fails_it_and_releases_everything() {
+    let hook = Arc::new(ImportHook::default());
+    hook.panic.store(true, Ordering::SeqCst);
+    let h = hook.clone();
+    let f = Flow::with_options(&fixture_specs(), move |_| ServiceOptions {
+        import_hook: Some(h),
+        ..Default::default()
+    })
+    .await;
+    let st = f.run_import(f.request().dry_run(true)).await;
+    assert_eq!(st.state, ImportState::Failed);
+    assert!(st.error.unwrap().contains("unexpectedly"));
+    assert!(!f.svc.activity().is_busy(), "the guard was released");
+    assert_eq!(f.import_tmp_entries(), 0, "the snapshot folder was removed");
+    // The slot is usable again.
+    hook.panic.store(false, Ordering::SeqCst);
+    assert_eq!(
+        f.run_import(f.request().dry_run(true)).await.state,
+        ImportState::Done
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_palace_the_default_under_mempalace_home_is_read() {
+    let f = Flow::with_options(&fixture_specs(), |home| ServiceOptions {
+        mempalace_home: Some(home.to_path_buf()),
+        ..Default::default()
+    })
+    .await;
+    let st = f
+        .run_import(ImportRequest {
+            dry_run: true,
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert_eq!(r.tiers.knowledge, 5);
+    assert!(r.palace.path.ends_with("/palace"), "{}", r.palace.path);
+    assert_eq!(f.import_tmp_entries(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_palace_that_is_missing_names_the_fix_and_an_empty_palace_is_refused() {
+    let none = tempfile::tempdir().unwrap();
+    let dir = none.path().to_path_buf();
+    let f = Flow::with_options(&fixture_specs(), move |_| ServiceOptions {
+        mempalace_home: Some(dir),
+        ..Default::default()
+    })
+    .await;
+    let e = f
+        .svc
+        .start_import(ImportRequest::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("does not exist") && e.contains("--palace"),
+        "{e}"
+    );
+    for blank in ["", "   "] {
+        let e = f
+            .svc
+            .start_import(ImportRequest {
+                palace: Some(blank.into()),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--palace is empty"), "{e}");
+    }
+    assert_eq!(f.import_tmp_entries(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn names_that_look_like_secrets_never_reach_the_status_or_the_text() {
+    // Lower-case and hyphenated, so slugify leaves them as they are.
+    let plain = concat!("s", "k-", "abcdefghijklmnopqrstuvwx1234");
+    let agent = concat!("s", "k-", "zyxwvutsrqponmlkjihgfedc9876");
+    let mut specs = fixture_specs();
+    specs.push(knowledge("k_p", "a note", plain, "knowledge"));
+    specs.push(knowledge(
+        "k_a",
+        "another note",
+        &format!("wing_{agent}"),
+        "knowledge",
+    ));
+    let f = Flow::with_specs(&specs).await;
+    let st = f.run_import(f.request().dry_run(true)).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let json = serde_json::to_string(&st).unwrap();
+    let text = st.report.as_ref().unwrap().render_text();
+    for secret in [plain, agent] {
+        assert!(
+            !json.contains(secret),
+            "status JSON holds a name that looks like a key"
+        );
+        assert!(
+            !text.contains(secret),
+            "text report holds a name that looks like a key"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

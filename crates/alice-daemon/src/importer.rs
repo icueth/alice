@@ -94,6 +94,26 @@ pub struct ImportEnv {
     /// Held for the whole job, so maintenance stays off the writer.
     pub guard: OwnedActivityGuard,
     pub status: Arc<Mutex<ImportStatus>>,
+    /// Tests only: a pause and a panic inside the job.
+    pub hook: Option<Arc<ImportHook>>,
+}
+
+/// Test hook: makes the job wait (`hold`) or panic (`panic`) right after its snapshot is taken.
+#[derive(Default)]
+pub struct ImportHook {
+    pub hold: AtomicBool,
+    pub panic: AtomicBool,
+}
+
+impl ImportHook {
+    fn run(&self, stop: &AtomicBool) {
+        while self.hold.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if self.panic.load(Ordering::SeqCst) {
+            panic!("import test hook");
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------------- preflight
@@ -118,8 +138,13 @@ pub fn preflight(
     if let Some(s) = req.since.as_deref() {
         check_since(s)?;
     }
+    if req.palace.as_deref().is_some_and(|p| p.trim().is_empty()) {
+        return Err(AliceError::invalid(
+            "--palace is empty; pass the palace folder, or leave --palace out to use the default palace under ~/.mempalace",
+        ));
+    }
     let palace = match (req.palace.as_deref(), mempalace_home) {
-        (Some(p), _) if !p.trim().is_empty() => {
+        (Some(p), _) => {
             let p = PathBuf::from(p);
             if !p.is_absolute() {
                 return Err(AliceError::invalid(format!(
@@ -172,8 +197,18 @@ impl RedactFilter {
 
     /// `text` with secrets replaced, for names shown in the report and lookups; not counted and
     /// never refused (a held-back drawer is counted where it is planned).
+    ///
+    /// A second pass reads `_` as a separator: the detectors need a word boundary before a key
+    /// prefix, and `wing_sk-...` has none.
     pub fn quiet(&self, text: &str) -> String {
-        self.redactor.apply(text).text
+        let first = self.redactor.apply(text).text;
+        if !first.contains('_') {
+            return first;
+        }
+        self.redactor
+            .apply(&first.replace('_', "\u{1}"))
+            .text
+            .replace('\u{1}', "_")
     }
 }
 
@@ -292,7 +327,7 @@ fn set_progress(status: &Mutex<ImportStatus>, done: u64, total: Option<u64>) {
     }
 }
 
-fn wing_entry(wings: &WingMap, wing: &str, drawers: u64) -> WingMapEntry {
+fn wing_entry(wings: &WingMap, filter: &RedactFilter, wing: &str, drawers: u64) -> WingMapEntry {
     let (to, via, agent) = match wings.target(wing) {
         WingTarget::Project { slug } => {
             let via = match wings.via(wing) {
@@ -306,10 +341,11 @@ fn wing_entry(wings: &WingMap, wing: &str, drawers: u64) -> WingMapEntry {
         WingTarget::Sessions => ("the transcript folder".to_string(), "transcript", None),
         WingTarget::Unnamed => ("global".to_string(), "global", None),
     };
+    // Names come from the owner's wings and folders: as clean as every other name in the report.
     WingMapEntry {
-        to,
+        to: filter.quiet(&to),
         via: via.to_string(),
-        agent,
+        agent: agent.map(|a| filter.quiet(&a)),
         drawers,
     }
 }
@@ -325,6 +361,16 @@ fn memory_identity(slug: &str, input: &alice_core::store::memories::NewMemoryInp
 }
 
 // ---------------------------------------------------------------------------------------- the job
+
+// Notes for the phases that store records (Task 10):
+// - A drawer's legacy id is checked here (`legacy_existing`) and stored by the writer. Both must
+//   use the same id: filtered through the `TextFilter` (or hashed), never one raw and one not.
+// - `memory_identity` uses the planner's project slug; the store will use the filtered project
+//   name. Filter the slug before it is used for either.
+// - The dry run only dedupes knowledge drawers against each other: a memory already stored in
+//   Alice that an incoming drawer duplicates is reported by the real run (`memories_duplicate`).
+// - When `ImportProject.aliases` is built from `WingMap::aliases()`, skip the junk
+//   `transcript:` spellings.
 
 /// What the planning passes count.
 #[derive(Default)]
@@ -498,8 +544,20 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     let t = Instant::now();
     let dir = env.home.import_tmp().join(job_id);
     std::fs::create_dir_all(&dir)?;
+    // The folder holds a raw, unredacted copy of the owner's history: private to its owner
+    // (`snapshot` only sets the mode of a folder it creates itself).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for d in [dir.parent().unwrap_or(&dir), &dir] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
     let _cleanup = SnapshotDir { dir: dir.clone() };
     let snap: Snapshot = snapshot(palace, &dir, env.mempalace_home.as_deref())?;
+    if let Some(hook) = &env.hook {
+        hook.run(&env.stop);
+    }
     warnings.extend(snap.notes.iter().cloned());
     let closets = count_closets(&snap);
     lap(&mut phases, "snapshot", t);
@@ -574,7 +632,7 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     let wing_map: BTreeMap<String, WingMapEntry> = surveyed
         .wing_counts
         .iter()
-        .map(|(w, n)| (filter.quiet(w), wing_entry(&wings, w, *n)))
+        .map(|(w, n)| (filter.quiet(w), wing_entry(&wings, &filter, w, *n)))
         .collect();
     let mut report = ImportReport {
         job_id: job_id.to_string(),
@@ -596,10 +654,16 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
         },
         assumed_utc_offset: assume.to_string(),
         tiers: alice_core::import::report::TierReport {
-            knowledge: surveyed.tiers.knowledge - tally.already_knowledge,
-            raw_session_chunks: surveyed.tiers.raw_session - tally.already_session,
+            knowledge: surveyed
+                .tiers
+                .knowledge
+                .saturating_sub(tally.already_knowledge),
+            raw_session_chunks: surveyed
+                .tiers
+                .raw_session
+                .saturating_sub(tally.already_session),
             raw_session_transcripts: tally.transcripts.len() as u64,
-            raw_file_chunks: surveyed.tiers.raw_file - tally.already_file,
+            raw_file_chunks: surveyed.tiers.raw_file.saturating_sub(tally.already_file),
         },
         projects: tally.projects,
         wing_map,
@@ -661,12 +725,7 @@ fn thread_main(env: ImportEnv, req: ImportRequest, palace: PathBuf, job_id: Stri
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(&env, &req, &palace, &job_id)
     }));
-    let ImportEnv {
-        stop,
-        status,
-        guard,
-        ..
-    } = env;
+    let ImportEnv { status, guard, .. } = env;
     // The snapshot folder went with `run`'s frame; the guard goes now, before the status says
     // the job is over, so a caller that sees `done` also sees maintenance allowed again.
     drop(guard);
@@ -682,11 +741,8 @@ fn thread_main(env: ImportEnv, req: ImportRequest, palace: PathBuf, job_id: Stri
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "the import failed");
             s.state = ImportState::Failed;
-            s.error = Some(if stop.load(Ordering::SeqCst) {
-                STOPPED.to_string()
-            } else {
-                e.to_string()
-            });
+            // `STOPPED` is the stop signal's own message; any other failure keeps its own.
+            s.error = Some(e.to_string());
         }
         Err(_) => {
             tracing::error!("the import thread panicked");
