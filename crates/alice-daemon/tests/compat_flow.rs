@@ -69,6 +69,17 @@ impl Flow {
             assert!(t.elapsed() < Duration::from_secs(120), "import did not end");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // Raw chunks are searchable by meaning only once the embedding worker has done them; a
+        // search made before that sees the chunks embedded so far (a loaded machine showed s2's
+        // and not s1's).
+        let t = Instant::now();
+        while svc.health().await.unwrap().embed_backlog > 0 {
+            assert!(
+                t.elapsed() < Duration::from_secs(120),
+                "embedding did not drain"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         Flow {
             _root: root,
             _palace_root: palace_root,
