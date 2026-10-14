@@ -1559,6 +1559,51 @@ async fn a_repeat_of_a_chunk_that_block_mode_held_back_is_left_for_the_next_run(
     assert!(f.legacy_target("blk_b").await.is_none());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_numbers_new_chunks_below_the_pieces_an_earlier_oversize_chunk_took() {
+    const SRC: &str = "/h/Code/devspace/over.go";
+    let long = |id: &str, index: Option<i64>| {
+        let mut d = chunk(
+            id,
+            &format!("{id} long words. ").repeat(2_500),
+            "devspace",
+            SRC,
+            0,
+        );
+        d.meta.chunk_index = index;
+        d.meta.convos_off();
+        d
+    };
+    let f = Flow::with_specs(&[long("ov1", Some(5))]).await;
+    let first = f.run_import(f.request()).await.report.unwrap();
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    assert_eq!(first.split.chunks, 1);
+
+    // Run 2: an unnumbered chunk, and a second oversize chunk asking for the next position.
+    let mut n1 = chunk("n1", "a chunk with no position", "devspace", SRC, 0);
+    n1.meta.chunk_index = None;
+    n1.meta.convos_off();
+    add_drawers(&f.palace, &[n1, long("ov2", Some(6))]);
+    let second = f.run_import(f.request()).await.report.unwrap();
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
+    let ord = |id: &str| -> i64 {
+        f.db()
+            .query_row("SELECT ord FROM chunks WHERE legacy_id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(ord("ov1"), 5);
+    assert_eq!(ord("ov1#2"), 10_000_005);
+    assert_eq!(ord("ov2"), 6);
+    assert_eq!(ord("ov2#2"), 10_000_006);
+    assert_eq!(
+        ord("n1"),
+        8,
+        "numbered below the pieces (7 went to the already stored ov1, whose position 5 was taken)"
+    );
+}
+
 trait ConvosOff {
     fn convos_off(&mut self);
 }

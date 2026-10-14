@@ -684,16 +684,23 @@ fn survey_paged(
                  nothing was imported. Re-import into a fresh database or report this palace."
             ))
         };
-        let mut next = claimed
-            .last()
+        // Numbered after the highest position below the piece space: the pieces of an oversize
+        // chunk (stored by this run or an earlier one) live at ord + k * PIECE_ORD_STEP, and a
+        // number taken from there would be a piece's neighbour for the next oversize chunk.
+        let next = claimed
+            .range(..PIECE_ORD_STEP)
+            .next_back()
             .copied()
             .unwrap_or(-1)
             .max(highest)
             .checked_add(1)
             .ok_or_else(overflow)?;
-        for i in deferred {
-            out.ords.insert(rows[i].id.clone(), next);
-            next = next.checked_add(1).ok_or_else(overflow)?;
+        for (n, i) in deferred.into_iter().enumerate() {
+            let ord = next
+                .checked_add(n as i64)
+                .filter(|o| *o < PIECE_ORD_STEP)
+                .ok_or_else(overflow)?;
+            out.ords.insert(rows[i].id.clone(), ord);
         }
     }
     Ok(out)
@@ -1602,28 +1609,37 @@ mod tests {
             "sorted order: -5 < 0 < MAX gives a2 then a0"
         );
         assert!(sv.ords.values().all(|o| *o >= 0));
-        // A reserved ord at i64::MAX cannot be numbered after: a clear error, no panic.
+        // Reserved positions in piece space (an earlier run's oversize chunk, or junk) are not
+        // numbered after: new chunks continue below the piece step.
         let (_a, _b, r) = open_fixture(&specs, |_| {});
-        let res = survey(r.as_ref(), None, &mut wm, utc(), &|_| Set::from([i64::MAX]));
-        let err = res.unwrap_err().to_string();
-        assert!(err.contains("too large"), "{err}");
-        // Many deferred rows running into the end of the range: error, not wrap.
+        let sv = survey(r.as_ref(), None, &mut wm, utc(), &|_| {
+            Set::from([i64::MAX, 10_000_005])
+        })
+        .unwrap();
+        assert!(
+            sv.ords.values().all(|o| (0..3).contains(o)),
+            "{:?}",
+            sv.ords
+        );
+        // Running into the piece step is a clear error, not a number in piece space.
         let many: Vec<_> = (0..5)
             .map(|i| chunk_spec(&format!("m{i}"), None, &format!("t{i}")))
             .collect();
         let (_a, _b, r) = open_fixture(&many, |_| {});
         let res = survey(r.as_ref(), None, &mut wm, utc(), &|_| {
-            Set::from([i64::MAX - 3])
+            Set::from([PIECE_ORD_STEP - 3])
         });
-        assert!(res.is_err());
-        // A high but sane reserved ord is fine: numbering continues after it.
+        assert!(res.unwrap_err().to_string().contains("too large"));
         let sv = survey(r.as_ref(), None, &mut wm, utc(), &|_| {
-            Set::from([1_999_999_999])
+            Set::from([PIECE_ORD_STEP - 6])
         })
         .unwrap();
         let mut got: Vec<i64> = sv.ords.values().copied().collect();
         got.sort();
-        assert_eq!(got, (2_000_000_000..2_000_000_005).collect::<Vec<_>>());
+        assert_eq!(
+            got,
+            (PIECE_ORD_STEP - 5..PIECE_ORD_STEP).collect::<Vec<_>>()
+        );
     }
 
     #[test]

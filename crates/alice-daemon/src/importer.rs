@@ -815,6 +815,14 @@ impl Ctx<'_> {
                     self.tally.knowledge_duplicates -= 1;
                     self.tally.duplicate_parts_sent -= n;
                 } else {
+                    // Nothing was stored, so a later identical drawer is not a duplicate of it.
+                    // (One already planned into the same batch was counted as one and is
+                    // stored as new by the store; the totals still add up.)
+                    if let Some(first) = items.first() {
+                        self.tally
+                            .seen_identities
+                            .remove(&memory_identity(slug, first));
+                    }
                     self.tally.memory_drawers -= 1;
                     if n > 1 {
                         self.tally.split_memories -= 1;
@@ -838,7 +846,7 @@ impl Ctx<'_> {
             }
         };
         self.tally.rejected += 1;
-        let why: String = why.chars().take(300).collect();
+        let why: String = self.filter.quiet(why).chars().take(300).collect();
         self.tally.store_errors.push(format!(
             "drawer {} ({parts} rows) was not stored: {why}",
             id.unwrap_or_default()
