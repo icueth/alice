@@ -832,6 +832,27 @@ impl Service {
             .map_err(join_err)
     }
 
+    /// One import batch, written by the writer in a commit of its own (the importer's only way
+    /// in; no logic here).
+    #[allow(dead_code)] // the importer (a later task) is the caller
+    pub(crate) async fn submit_import(
+        &self,
+        batch: alice_core::store::import::ImportBatch,
+    ) -> Result<alice_core::store::import::BatchOutcome> {
+        let _busy = self.activity.enter();
+        match self
+            .writer
+            .submit(WriteOp::ImportBatch(Box::new(batch)))
+            .await?
+        {
+            WriteOutcome::Imported(out) => Ok(out),
+            other => Err(AliceError::Other(format!(
+                "import batch answered {}",
+                other.name()
+            ))),
+        }
+    }
+
     pub async fn remember(&self, req: RememberRequest) -> Result<RememberResponse> {
         let _busy = self.activity.enter();
         let project = self

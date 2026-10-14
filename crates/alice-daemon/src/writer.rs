@@ -14,6 +14,7 @@ use alice_core::redact::Redactor;
 use alice_core::store::embeddings::{self, VecKey};
 use alice_core::store::events::{self, Actor, EventInput};
 use alice_core::store::history::{self, UndoOutcome};
+use alice_core::store::import::{self, BatchOutcome, ImportBatch};
 use alice_core::store::judge as judge_store;
 use alice_core::store::kg::{self, AssertFact, EntityMatcher, FactOutcome};
 use alice_core::store::maintenance;
@@ -237,6 +238,11 @@ pub enum WriteOp {
     /// Add a review item (the weekly merge suggestions); announced on the stream. Answers
     /// `Count` of 1, or 0 when an open item asks the same question already.
     CreateReview(NewReview),
+    /// One bounded, atomic, idempotent batch of imported records (the importer and nothing
+    /// else). It takes a group commit of its own: it runs only when no ingest slice or import
+    /// batch has written in the commit yet, and nothing of that kind joins it. Records one
+    /// `import.batch` event; answers `Imported`.
+    ImportBatch(Box<ImportBatch>),
     Shutdown,
 }
 
@@ -260,6 +266,7 @@ pub enum WriteOutcome {
     Count(usize),
     /// Whether a maintenance step still had work to do.
     Flag(bool),
+    Imported(BatchOutcome),
     Done,
 }
 
@@ -279,6 +286,7 @@ impl WriteOutcome {
             WriteOutcome::Purged(_) => "Purged",
             WriteOutcome::Count(_) => "Count",
             WriteOutcome::Flag(_) => "Flag",
+            WriteOutcome::Imported(_) => "Imported",
             WriteOutcome::Done => "Done",
         }
     }
@@ -409,7 +417,15 @@ pub(crate) struct State {
     stream: Vec<StreamItem>,
     /// The privacy rules of every project, for what the writer itself derives from stored rows.
     redactors: Arc<Redactors>,
+    /// Tests: bulk work written in the current commit, and where each commit's list goes.
+    #[cfg(test)]
+    applied: Vec<&'static str>,
+    #[cfg(test)]
+    commit_log: Option<CommitLog>,
 }
+
+#[cfg(test)]
+pub(crate) type CommitLog = Arc<Mutex<Vec<Vec<&'static str>>>>;
 
 /// The redactor for the project with id `project_id` (`None`: no project), looked up with the
 /// writer's own connection. A project that was never rooted (no working tree) has only the
@@ -1169,6 +1185,8 @@ fn ingest_slice(
         return Ok(Applied::More(op, progress));
     }
     let rest = chunks.split_off(take);
+    #[cfg(test)]
+    st.applied.push("Ingest");
     let p = resolve(conn, &project)?;
     let out = sources::ingest(conn, &p, &source, &chunks)?;
     st.chunk_budget -= take;
@@ -1243,6 +1261,60 @@ fn record_ingest(
         },
     )?;
     Ok(())
+}
+
+/// `WriteOp::ImportBatch`. The batch takes the commit to itself: with any bulk work already
+/// written in this commit (budget touched) it waits for the next one, and it spends the whole
+/// budget so no ingest slice joins it. Alone in a fresh commit it always runs, however heavy.
+fn import_batch(conn: &Connection, batch: Box<ImportBatch>, st: &mut State) -> Result<Applied> {
+    let fresh = st.chunk_budget == INGEST_SLICE && st.byte_budget == INGEST_SLICE_BYTES;
+    if !fresh {
+        return Ok(Applied::More(WriteOp::ImportBatch(batch), None));
+    }
+    // Charged in full, whatever the batch weighs (`ImportBatch::weight` is at most what a
+    // fresh commit holds for the importer's batch sizes): nothing else of its kind joins it.
+    st.chunk_budget = 0;
+    st.byte_budget = 0;
+    #[cfg(test)]
+    st.applied.push("ImportBatch");
+    let hlc = &mut st.hlc;
+    let out = import::apply_batch(conn, &batch, &mut || hlc.tick())?;
+    // Entities and mentions may have changed.
+    st.matcher = None;
+    if out.memories_new > 0 || out.chunks_inserted > 0 {
+        st.inserted = true;
+    }
+    record(
+        conn,
+        st,
+        EventInput {
+            actor: &Actor::Import,
+            action: "import.batch",
+            target_type: "import",
+            target_id: &batch.job_id,
+            before: None,
+            after: Some(serde_json::json!({
+                "memories_new": out.memories_new,
+                "memories_duplicate": out.memories_duplicate,
+                "chunks_inserted": out.chunks_inserted,
+                "chunks_skipped": out.chunks_skipped,
+                "sources": out.sources,
+                "facts_added": out.facts_added,
+                "facts_ended": out.facts_ended,
+                "facts_skipped": out.facts_skipped,
+                "links_made": out.links_made,
+                "links_dropped": out.links_dropped,
+                "reviews_created": out.reviews_created,
+                "reviews_skipped": out.reviews_skipped,
+                "collapsed_recorded": out.collapsed_recorded,
+                "projects_created": out.projects_created,
+                "mentions_linked": out.mentions_linked,
+                "errors": out.errors.len(),
+            })),
+            group: None,
+        },
+    )?;
+    Ok(Applied::Done(WriteOutcome::Imported(out)))
 }
 
 fn apply(
@@ -1392,6 +1464,7 @@ fn apply(
             }
             None => WriteOutcome::Count(0),
         },
+        WriteOp::ImportBatch(batch) => return import_batch(conn, batch, st),
         WriteOp::Shutdown => WriteOutcome::Done,
     };
     Ok(Applied::Done(outcome))
@@ -1857,16 +1930,44 @@ pub(crate) fn spawn_writer(
     wake_worker: Sender<()>,
 ) -> (WriterHandle, JoinHandle<()>) {
     let redactors = Redactors::fixed(alice_core::settings::PrivacySettings::default());
-    spawn_writer_with(conn, device, wake_worker, redactors)
+    spawn_writer_inner(conn, device, wake_worker, redactors, None)
+}
+
+/// [`spawn_writer`] that also lists, per commit, the bulk work (ingest slices, import batches)
+/// it wrote.
+#[cfg(test)]
+pub(crate) fn spawn_writer_logged(
+    conn: Connection,
+    device: String,
+    wake_worker: Sender<()>,
+    log: CommitLog,
+) -> (WriterHandle, JoinHandle<()>) {
+    let redactors = Redactors::fixed(alice_core::settings::PrivacySettings::default());
+    spawn_writer_inner(conn, device, wake_worker, redactors, Some(log))
 }
 
 /// [`spawn_writer`] with the privacy rules the writer applies to the history it records and to
 /// the text an undo restores.
 pub fn spawn_writer_with(
+    conn: Connection,
+    device: String,
+    wake_worker: Sender<()>,
+    redactors: Arc<Redactors>,
+) -> (WriterHandle, JoinHandle<()>) {
+    spawn_writer_inner(conn, device, wake_worker, redactors, None)
+}
+
+#[cfg(test)]
+type LogArg = Option<CommitLog>;
+#[cfg(not(test))]
+type LogArg = Option<()>;
+
+fn spawn_writer_inner(
     mut conn: Connection,
     device: String,
     wake_worker: Sender<()>,
     redactors: Arc<Redactors>,
+    #[cfg_attr(not(test), allow(unused_variables))] log: LogArg,
 ) -> (WriterHandle, JoinHandle<()>) {
     let (tx, rx): (Sender<Job>, Receiver<Job>) = unbounded();
     let read_only = Arc::new(ReadOnlyState::default());
@@ -1890,6 +1991,10 @@ pub fn spawn_writer_with(
                 byte_budget: INGEST_SLICE_BYTES,
                 stream: Vec::new(),
                 redactors,
+                #[cfg(test)]
+                applied: Vec::new(),
+                #[cfg(test)]
+                commit_log: log,
             };
             let mut carry: VecDeque<Job> = VecDeque::new();
             let mut stopping = false;
@@ -1926,6 +2031,16 @@ pub fn spawn_writer_with(
                 st.chunk_budget = INGEST_SLICE;
                 st.byte_budget = INGEST_SLICE_BYTES;
                 let out = run_batch(&mut conn, batch, &mut st, &ro);
+                #[cfg(test)]
+                {
+                    let applied = std::mem::take(&mut st.applied);
+                    if out.commit.is_ok()
+                        && !applied.is_empty()
+                        && let Some(log) = &st.commit_log
+                    {
+                        log.lock().push(applied);
+                    }
+                }
                 match out.commit {
                     Ok(()) => {
                         // Wake before replying: once a caller has its reply, the wake for its
@@ -2117,6 +2232,95 @@ mod tests {
     fn blocking_submit_works_outside_the_runtime() {
         let (_d, h, _w) = writer();
         assert!(h.submit_blocking(remember("from a plain thread")).is_ok());
+    }
+
+    fn import_memory(i: usize) -> alice_core::store::import::ImportMemory {
+        alice_core::store::import::ImportMemory {
+            project_slug: "pg-ai".into(),
+            input: NewMemoryInput {
+                content: format!("imported body number {i}"),
+                legacy_id: Some(format!("d{i}")),
+                created_at: Some("2025-01-02T03:04:05.000Z".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn sample_import(memories: usize) -> ImportBatch {
+        ImportBatch {
+            projects: vec![alice_core::store::import::ImportProject {
+                slug: "pg-ai".into(),
+                aliases: vec![],
+            }],
+            memories: (0..memories).map(import_memory).collect(),
+            job_id: "job-1".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_import_op_goes_through_the_writer_records_one_event_and_wakes_embedding() {
+        let f = fixture();
+        let out =
+            f.h.submit_blocking(WriteOp::ImportBatch(Box::new(sample_import(2))));
+        let Ok(WriteOutcome::Imported(out)) = out else {
+            panic!("expected an import outcome, got {out:?}")
+        };
+        assert_eq!(out.memories_new, 2);
+        let n: i64 = f.read("SELECT count(*) FROM events", []);
+        assert_eq!(n, 1, "one event for the whole batch");
+        let (action, actor, target, after): (String, String, String, String) = {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.query_row(
+                "SELECT action, actor, target_id, after_json FROM events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            (action.as_str(), actor.as_str(), target.as_str()),
+            ("import.batch", "import", "job-1")
+        );
+        assert!(!after.contains("imported body"), "{after}");
+        assert!(f.wake.try_recv().is_ok(), "embedding is woken");
+        let live: i64 = f.read(
+            "SELECT count(*) FROM memories WHERE status = 'active' AND judge_state = 'skipped'",
+            [],
+        );
+        assert_eq!(live, 2);
+    }
+
+    #[tokio::test]
+    async fn an_import_batch_and_an_ingest_slice_never_share_one_group_commit() {
+        let d = tempfile::tempdir().unwrap();
+        let conn = open(d.path());
+        let (wake_tx, _wake_rx) = crossbeam_channel::unbounded();
+        let log: CommitLog = Arc::new(Mutex::new(Vec::new()));
+        let (h, _t) = spawn_writer_logged(conn, "dev".into(), wake_tx, log.clone());
+        let (a, b) = tokio::join!(
+            h.submit(ingest("many", 200, |i| format!("short {i}"))),
+            h.submit(WriteOp::ImportBatch(Box::new(sample_import(200)))),
+        );
+        assert_eq!(ingested(a).inserted, 200);
+        assert!(matches!(b, Ok(WriteOutcome::Imported(ref o)) if o.memories_new == 200));
+        let log = log.lock();
+        assert!(log.iter().any(|c| c.contains(&"ImportBatch")), "{log:?}");
+        assert!(log.iter().any(|c| c.contains(&"Ingest")), "{log:?}");
+        assert!(
+            log.iter()
+                .all(|c| !(c.contains(&"Ingest") && c.contains(&"ImportBatch"))),
+            "shared a commit: {log:?}"
+        );
+    }
+
+    #[test]
+    fn an_import_batch_is_refused_while_the_database_is_read_only() {
+        let f = fixture();
+        f.h.read_only.set("disk full".into());
+        let err =
+            f.h.submit_blocking(WriteOp::ImportBatch(Box::new(sample_import(1))));
+        assert!(matches!(err, Err(AliceError::ReadOnly(_))), "{err:?}");
     }
 
     /// A failing job rolls back everything it wrote, including a project it created on the way.

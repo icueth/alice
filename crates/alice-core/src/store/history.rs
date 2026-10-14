@@ -386,6 +386,8 @@ fn undoable(action: &str) -> bool {
         action,
         "undo"
             | "source.ingest"
+            | "import.batch"
+            | "import.compat_enabled"
             | "memory.purge"
             | "raw.retention"
             | "settings.change"
@@ -1139,6 +1141,30 @@ mod tests {
                 "{action}: {err}"
             );
         }
+    }
+
+    /// An import is bulk evidence with legacy ids behind it: nothing in it is undone, and a
+    /// refusal opens no review item.
+    #[test]
+    fn import_events_are_never_undoable() {
+        let mut t = T::new();
+        for action in ["import.batch", "import.compat_enabled"] {
+            let ev = t.record(
+                EventInput {
+                    actor: &Actor::Import,
+                    action,
+                    target_type: "import",
+                    target_id: "J1",
+                    before: None,
+                    after: Some(serde_json::json!({"memories_new": 2})),
+                    group: None,
+                },
+                "h",
+            );
+            let err = t.undo(&ev).unwrap_err().to_string();
+            assert!(err.contains("cannot be undone"), "{action}: {err}");
+        }
+        assert_eq!(reviews::count_open(&t.c).unwrap(), 0);
     }
 
     #[test]
