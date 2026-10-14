@@ -207,7 +207,10 @@ pub fn sweep_temp(dir: &Path) {
     };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if !(name.starts_with(".alice-") && name.contains(".tmp")) {
+        // A copy of a backup, or the move of a legacy file across volumes, that was killed.
+        let leftover = (name.starts_with(".alice-") && name.contains(".tmp"))
+            || (name.starts_with("alice-") && name.ends_with(".db.moving"));
+        if !leftover {
             continue;
         }
         let old = e.metadata().ok().filter(|m| m.is_file()).is_some_and(|m| {
@@ -219,6 +222,40 @@ pub fn sweep_temp(dir: &Path) {
         if old {
             let _ = std::fs::remove_file(e.path());
         }
+    }
+}
+
+/// What the error of a backup that has no room starts with (the scheduler retries such a job
+/// after 12 hours, not 1).
+pub const DISK_SPACE: &str = "disk space:";
+
+/// Make sure a backup of `db` fits in `dir`: when the volume is short, the rotation policy runs
+/// first (its failure is a warning pushed to `warnings`), and if there is still no room the
+/// error says how much is free and what to do. Where the free space is unknown the copy goes
+/// ahead.
+pub fn ensure_room(
+    db: &Path,
+    dir: &Path,
+    now: DateTime<Utc>,
+    (daily, weekly): (u32, u32),
+    free: &dyn Fn(&Path) -> Option<u64>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let need = space_needed(db);
+    if !free(dir).is_some_and(|f| f < need) {
+        return Ok(());
+    }
+    if let Err(e) = rotate(dir, now, daily, weekly) {
+        warnings.push(format!("rotation failed: {e}"));
+    }
+    match free(dir).filter(|f| *f < need) {
+        None => Ok(()),
+        Some(f) => Err(AliceError::Other(format!(
+            "{DISK_SPACE} {} MB free in {}, a backup needs {} MB; free some space or point backup.dir at another volume",
+            f / 1_000_000,
+            dir.display(),
+            need / 1_000_000
+        ))),
     }
 }
 
@@ -422,7 +459,10 @@ fn move_file(
 
 fn copy_then_remove(from: &Path, to: &Path) -> std::io::Result<()> {
     let tmp = to.with_extension("db.moving");
-    let copied = std::fs::copy(from, &tmp).and_then(|_| std::fs::rename(&tmp, to));
+    // The copy is on disk before the original goes: a crash between the two leaves both.
+    let copied = std::fs::copy(from, &tmp)
+        .and_then(|_| std::fs::File::open(&tmp)?.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, to));
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -727,6 +767,51 @@ mod tests {
         assert!(fresh.exists() && other.exists());
     }
 
+    /// N-3: a killed cross-volume move leaves `….db.moving`; an hour later it is swept.
+    #[test]
+    fn a_stale_moving_file_is_swept() {
+        let d = tempfile::tempdir().unwrap();
+        let stale = d
+            .path()
+            .join("alice-pre-migration-v1-20260101T000000Z.db.moving");
+        let fresh = d
+            .path()
+            .join("alice-pre-migration-v1-20261013T000000Z.db.moving");
+        std::fs::write(&stale, b"x").unwrap();
+        std::fs::write(&fresh, b"x").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7_200))
+            .unwrap();
+        sweep_temp(d.path());
+        assert!(!stale.exists() && fresh.exists());
+    }
+
+    /// N-4: the guard `backup now` shares with the scheduled job.
+    #[test]
+    fn ensure_room_fails_plainly_when_the_volume_is_short() {
+        let d = tempfile::tempdir().unwrap();
+        let db = db_with_rows(d.path());
+        let dir = d.path().join("backups");
+        let now = chrono::Utc::now();
+        let mut warnings = Vec::new();
+        let short = |_: &Path| Some(10u64);
+        let err = ensure_room(&db, &dir, now, (7, 4), &short, &mut warnings)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(DISK_SPACE) && err.contains("free some space"),
+            "{err}"
+        );
+        let plenty = |_: &Path| Some(u64::MAX / 2);
+        ensure_room(&db, &dir, now, (7, 4), &plenty, &mut warnings).unwrap();
+        let unknown = |_: &Path| None;
+        ensure_room(&db, &dir, now, (7, 4), &unknown, &mut warnings).unwrap();
+        assert!(warnings.is_empty());
+    }
+
     /// I-4: a backup that is asked to stop leaves no file, however far it got.
     #[test]
     fn a_backup_can_be_stopped_and_leaves_nothing() {
@@ -884,7 +969,7 @@ mod tests {
         std::fs::write(&legacy2, b"kept").unwrap();
         let dir2 = d2.path().join("backups");
         let gone_then_fail = |from: &Path, _: &Path| {
-            std::fs::remove_file(from).ok(); // the copy then has nothing to read
+            std::fs::remove_file(from).ok(); // rename fails, and the copy finds no source
             Err(std::io::Error::from_raw_os_error(18))
         };
         assert!(adopt_legacy_with(&home2, &dir2, &gone_then_fail).is_err());

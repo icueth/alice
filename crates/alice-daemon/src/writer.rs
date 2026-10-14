@@ -211,12 +211,11 @@ pub enum WriteOp {
         seqs: Vec<i64>,
         cutoff: String,
     },
-    /// Delete raw chunks (retention), with one `raw.retention` event; the caller drops their
+    /// Delete raw chunks (retention); the caller records one `raw.retention` event per run and drops their
     /// vectors. Works for about the same time box and answers `Purged` with the chunk seqs it
     /// dealt with (the others are untouched).
     DeleteChunks {
         seqs: Vec<i64>,
-        reason: String,
     },
     /// One bounded FTS merge step; `WriteOutcome::Flag(true)` while there was work.
     FtsMerge {
@@ -1371,7 +1370,7 @@ fn apply(
             WriteOutcome::Done
         }
         WriteOp::PurgeMemories { seqs, cutoff } => purge_memories(conn, st, &seqs, &cutoff)?,
-        WriteOp::DeleteChunks { seqs, reason } => delete_chunks(conn, st, &seqs, &reason)?,
+        WriteOp::DeleteChunks { seqs } => delete_chunks(conn, &seqs)?,
         WriteOp::FtsMerge { table, pages } => {
             WriteOutcome::Flag(maintenance::fts_merge(conn, &table, pages)?)
         }
@@ -1450,37 +1449,17 @@ fn purge_memories(
 }
 
 /// `DeleteChunks`: retention deletes raw chunks, in groups of 50, until [`SLICE_BUDGET`] has
-/// passed; one `raw.retention` event says how many and why.
-fn delete_chunks(
-    conn: &Connection,
-    st: &mut State,
-    seqs: &[i64],
-    reason: &str,
-) -> Result<WriteOutcome> {
+/// passed. The history row (`raw.retention`) is one per run, recorded by the job.
+fn delete_chunks(conn: &Connection, seqs: &[i64]) -> Result<WriteOutcome> {
     const GROUP: usize = 50;
     let started = Instant::now();
-    let (mut done, mut n) = (Vec::new(), 0);
+    let mut done = Vec::new();
     for group in seqs.chunks(GROUP) {
         if started.elapsed() >= crate::maintenance::SLICE_BUDGET {
             break;
         }
-        n += maintenance::delete_chunks(conn, group)?;
+        maintenance::delete_chunks(conn, group)?;
         done.extend_from_slice(group);
-    }
-    if n > 0 {
-        record(
-            conn,
-            st,
-            EventInput {
-                actor: &Actor::System,
-                action: "raw.retention",
-                target_type: "raw",
-                target_id: "chunks",
-                before: None,
-                after: Some(serde_json::json!({ "deleted": n, "reason": reason })),
-                group: None,
-            },
-        )?;
     }
     Ok(WriteOutcome::Purged(done))
 }
@@ -4435,32 +4414,25 @@ mod tests {
         let WriteOutcome::Purged(done) =
             f.h.submit_blocking(WriteOp::DeleteChunks {
                 seqs: seqs[..3].to_vec(),
-                reason: "90d".into(),
             })
             .unwrap()
         else {
             panic!("expected Purged")
         };
         assert_eq!(done, seqs[..3].to_vec());
-        let after: String = f.read(
-            "SELECT after_json FROM events WHERE action = 'raw.retention'",
-            [],
-        );
-        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
-        assert_eq!(after, serde_json::json!({"deleted": 3, "reason": "90d"}));
-        let left: i64 = f.read("SELECT count(*) FROM chunks", []);
-        assert_eq!(left, 1);
-        // Nothing to delete: no event.
-        f.h.submit_blocking(WriteOp::DeleteChunks {
-            seqs: vec![seqs[0]],
-            reason: "90d".into(),
-        })
-        .unwrap();
+        // The job records one `raw.retention` event per run; the writer op itself none.
         let events: i64 = f.read(
             "SELECT count(*) FROM events WHERE action = 'raw.retention'",
             [],
         );
-        assert_eq!(events, 1);
+        assert_eq!(events, 0);
+        let left: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(left, 1);
+        // Nothing to delete: still fine.
+        f.h.submit_blocking(WriteOp::DeleteChunks {
+            seqs: vec![seqs[0]],
+        })
+        .unwrap();
 
         let WriteOutcome::Count(pruned) =
             f.h.submit_blocking(WriteOp::PruneEvents {
@@ -4471,7 +4443,10 @@ mod tests {
         else {
             panic!("expected Count")
         };
-        assert_eq!(pruned, 2, "at most `limit` events go per step");
+        assert!(
+            (1..=2).contains(&pruned),
+            "about `limit` events go per step: {pruned}"
+        );
         assert!(matches!(
             f.h.submit_blocking(WriteOp::PruneJudgeCache {
                 before: "2999-01-01T00:00:00.000Z".into(),

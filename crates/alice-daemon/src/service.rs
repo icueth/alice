@@ -2260,8 +2260,16 @@ impl Service {
             self.home.db(),
             backup::backup_dir(&self.home, &self.settings().backup),
         );
+        let policy = {
+            let b = &self.settings().backup;
+            (b.daily, b.weekly)
+        };
         let made = tokio::task::spawn_blocking(move || {
-            let info = backup::create(&db, &dir, BackupKind::Manual, chrono::Utc::now())?;
+            let now = chrono::Utc::now();
+            // The same guard as the scheduled job: no room fails with a clear message.
+            let mut warnings = Vec::new();
+            backup::ensure_room(&db, &dir, now, policy, &backup::free_space, &mut warnings)?;
+            let info = backup::create(&db, &dir, BackupKind::Manual, now)?;
             Ok::<_, AliceError>(info)
         })
         .await
@@ -2299,11 +2307,6 @@ impl Service {
         .await
     }
 
-    /// Why the backups are behind, if they are (see `maintenance::backup_warning`).
-    fn backup_warning(&self) -> Option<String> {
-        self.scheduler.backup_warning(chrono::Utc::now())
-    }
-
     pub async fn health(&self) -> Result<Health> {
         #[cfg(test)]
         self.health_reads
@@ -2316,7 +2319,12 @@ impl Service {
         let index_ready = self.index.read().is_some();
         let judge_provider = self.judge().provider().to_string();
         let judge_warning = self.judge_warning();
-        let maintenance_warning = self.backup_warning();
+        // Reads the backup directory and the database: off the runtime's threads.
+        let scheduler = self.scheduler.clone();
+        let maintenance_warning =
+            tokio::task::spawn_blocking(move || scheduler.backup_warning(chrono::Utc::now()))
+                .await
+                .map_err(join_err)?;
         self.read(move |c| {
             let count = |sql: &str| -> Result<u64> {
                 Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)

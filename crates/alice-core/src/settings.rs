@@ -193,6 +193,9 @@ pub enum Retention {
     Size(u64),
 }
 
+/// The longest age a retention may name (100 years): beyond it `forever` says the same.
+const MAX_RETENTION_AGE: Duration = Duration::from_secs(100 * 365 * 86_400);
+
 impl Retention {
     pub fn parse(s: &str) -> Result<Self, String> {
         let t = s.trim();
@@ -202,6 +205,11 @@ impl Retention {
         if let Ok(d) = HumanDuration::parse(t)
             && !d.0.is_zero()
         {
+            if d.0 > MAX_RETENTION_AGE {
+                return Err(format!(
+                    "\"{s}\" is longer than 100 years; use forever to keep everything"
+                ));
+            }
             return Ok(Self::Age(d.0));
         }
         match ByteSize::parse(t) {
@@ -2001,6 +2009,33 @@ impl ProjectSettingsCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// N-1: an absurd age is refused (it once overflowed into "zero" and deleted everything).
+    #[test]
+    fn a_retention_longer_than_a_hundred_years_is_refused() {
+        for bad in ["999999999999d", "40000d", "99999999999h"] {
+            let e = Retention::parse(bad).unwrap_err();
+            assert!(
+                e.contains("100 years") && e.contains("forever"),
+                "{bad}: {e}"
+            );
+        }
+        assert_eq!(
+            Retention::parse("36000d").unwrap(),
+            Retention::Age(Duration::from_secs(36_000 * 86_400))
+        );
+        // Through the settings: the key is named and the rest of the file still applies.
+        let file = "[storage]\nraw_retention = \"999999999999d\"\n[maintenance]\ntrash_days = 12\n";
+        assert_eq!(
+            error_keys(file, &[]),
+            vec!["storage.raw_retention".to_string()]
+        );
+        let (kept, left_out) = resolve_salvaging(Some(file), &[]);
+        assert_eq!(left_out.len(), 1);
+        assert_eq!(left_out[0].key, "storage.raw_retention");
+        assert_eq!(kept.settings.storage.raw_retention, Retention::Forever);
+        assert_eq!(kept.settings.maintenance.trash_days, 12);
+    }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

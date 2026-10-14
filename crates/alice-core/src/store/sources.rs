@@ -96,8 +96,9 @@ const MILLIS_FROM: i64 = 100_000_000_000;
 
 /// The time a chunk says it was written, as the store keeps it: an ISO 8601 / RFC 3339 time (or
 /// a date) is kept as given; a bare Unix time in seconds or milliseconds becomes an RFC 3339
-/// UTC time; anything else (empty, `10/13/2026`, words) is dropped with a warning. A value that
-/// is kept always sorts as time, so nothing downstream compares garbage as text.
+/// UTC time; anything else (empty, `10/13/2026`, words) is dropped (`ingest` logs one warning
+/// per request with the count). A value that is kept always sorts as time, so nothing
+/// downstream compares garbage as text.
 pub fn normalise_authored(raw: Option<&str>) -> Option<String> {
     let raw = raw?.trim();
     if raw.is_empty() {
@@ -121,9 +122,6 @@ pub fn normalise_authored(raw: Option<&str>) -> Option<String> {
             return Some(t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
         }
     }
-    tracing::warn!(
-        "a chunk's authored_at is not an ISO 8601 time or a Unix time; it is stored without one"
-    );
     None
 }
 
@@ -179,9 +177,17 @@ pub fn ingest(
     let mut inserted = 0;
     let mut skipped = 0;
     let now = now_rfc3339();
+    let mut dropped_times = 0usize;
     for c in chunks {
         let text = nfc(&c.text);
         let authored_at = normalise_authored(c.authored_at.as_deref());
+        if authored_at.is_none()
+            && c.authored_at
+                .as_deref()
+                .is_some_and(|a| !a.trim().is_empty())
+        {
+            dropped_times += 1;
+        }
         let changed = conn.execute(
             "INSERT OR IGNORE INTO chunks (id, source_id, project_id, ord, text, content_hash, authored_at, created_at, legacy_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -203,6 +209,12 @@ pub fn ingest(
         } else {
             skipped += 1;
         }
+    }
+    if dropped_times > 0 {
+        tracing::warn!(
+            chunks = dropped_times,
+            "chunks whose authored_at is not an ISO 8601 or Unix time were stored without one"
+        );
     }
     Ok(IngestOutcome {
         source_id,

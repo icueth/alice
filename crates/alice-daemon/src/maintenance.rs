@@ -179,8 +179,7 @@ impl Job {
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(3_600);
 /// A job that failed for want of disk space waits longer: an hour later there is no more room.
 const RETRY_AFTER_NO_SPACE: Duration = Duration::from_secs(12 * 3_600);
-/// What a job's `last_error` starts with (after its time) when the disk was too full.
-pub const DISK_SPACE: &str = "disk space:";
+pub use crate::backup::DISK_SPACE;
 /// Once the newest backup is older than this many backup periods, the daemon warns (health,
 /// `alice status`) and starts jobs after `OVERDUE_IDLE_SECS` of quiet instead of `idle_secs`.
 const OVERDUE_PERIODS: u32 = 2;
@@ -259,6 +258,8 @@ struct Scratch {
     over_bytes: Option<u64>,
     deleted: usize,
     deleted_other: usize,
+    /// Raw retention: the setting that applied, for the run's event.
+    reason: String,
 }
 
 impl Scheduler {
@@ -411,6 +412,22 @@ impl Scheduler {
                 }
             }
         }
+        // One history row per run with the totals (not one per slice: a run is hundreds).
+        if job == Job::RawRetention && scratch.deleted > 0 {
+            let recorded = self.ctx.writer.submit_blocking(WriteOp::RecordEvent {
+                actor: alice_core::store::events::Actor::System,
+                action: "raw.retention".into(),
+                target_type: "raw".into(),
+                target_id: "chunks".into(),
+                before: None,
+                after: Some(
+                    serde_json::json!({ "deleted": scratch.deleted, "reason": scratch.reason }),
+                ),
+            });
+            if let Err(e) = recorded {
+                tracing::warn!(error = %e, "recording the raw retention run failed");
+            }
+        }
         let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         if !matches!(outcome, JobOutcome::Paused | JobOutcome::Skipped) {
             self.set_meta(&format!("maint.{}.last_run", job.name()), &stamp);
@@ -468,7 +485,14 @@ impl Scheduler {
                     // Age is the time a chunk was stored in Alice (`created_at`), never the
                     // time it says it was written.
                     Retention::Age(age) => {
-                        let cutoff = ts(now - chrono::Duration::from_std(age).unwrap_or_default());
+                        // An age that does not convert (the settings refuse anything over 100
+                        // years, but a stale value must never turn into zero): delete nothing.
+                        let Some(since) = age_cutoff(now, age) else {
+                            return Ok(Step::Finished(
+                                "raw_retention is too large to apply; nothing deleted".into(),
+                            ));
+                        };
+                        let cutoff = ts(since);
                         self.ctx
                             .readers
                             .with(|c| m::chunks_older_than(c, &cutoff, SLICE))?
@@ -508,11 +532,10 @@ impl Scheduler {
                         sc.deleted
                     )));
                 }
+                sc.reason = s.storage.raw_retention.to_string();
                 let seqs: Vec<i64> = take.iter().map(|(seq, _)| *seq).collect();
-                let WriteOutcome::Purged(done) = w.submit_blocking(WriteOp::DeleteChunks {
-                    seqs,
-                    reason: s.storage.raw_retention.to_string(),
-                })?
+                let WriteOutcome::Purged(done) =
+                    w.submit_blocking(WriteOp::DeleteChunks { seqs })?
                 else {
                     return Ok(Step::More);
                 };
@@ -642,22 +665,15 @@ impl Scheduler {
         let s = self.ctx.settings.get();
         let dir = backup::backup_dir(&self.ctx.home, &s.backup);
         let db = self.ctx.home.db();
-        let need = backup::space_needed(&db);
-        let free = || (self.ctx.free_space)(&dir);
         let mut warnings = Vec::new();
-        if free().is_some_and(|f| f < need) {
-            if let Err(e) = backup::rotate(&dir, now, s.backup.daily, s.backup.weekly) {
-                warnings.push(format!("rotation failed: {e}"));
-            }
-            if let Some(f) = free().filter(|f| *f < need) {
-                return Err(AliceError::Other(format!(
-                    "{DISK_SPACE} {} MB free in {}, a backup needs {} MB; free some space or point backup.dir at another volume",
-                    f / 1_000_000,
-                    dir.display(),
-                    need / 1_000_000
-                )));
-            }
-        }
+        backup::ensure_room(
+            &db,
+            &dir,
+            now,
+            (s.backup.daily, s.backup.weekly),
+            &*self.ctx.free_space,
+            &mut warnings,
+        )?;
         let stop = &self.ctx.stop;
         let Some(b) = backup::create_stoppable(&db, &dir, BackupKind::Scheduled, now, &|| {
             stop.load(Ordering::Relaxed)
@@ -921,6 +937,14 @@ pub fn backup_warning(readers: &ReaderPool, dir: &Path, now: DateTime<Utc>) -> O
             })
         }
     }
+}
+
+/// `now` minus `age`; `None` when that is not a time (an age too large for the clock). The
+/// caller then deletes nothing: an overflow must never read as "zero", which is every chunk.
+fn age_cutoff(now: DateTime<Utc>, age: Duration) -> Option<DateTime<Utc>> {
+    chrono::Duration::from_std(age)
+        .ok()
+        .and_then(|d| now.checked_sub_signed(d))
 }
 
 /// Best effort: below normal priority so maintenance never competes with requests.
@@ -2040,6 +2064,50 @@ mod tests {
         };
         assert_eq!(done, vec![3]);
         assert_eq!(r.count("SELECT count(*) FROM memories"), 2);
+    }
+
+    /// N-1 at run time: an age that does not convert deletes nothing (it once became zero).
+    #[test]
+    fn an_age_too_large_for_the_clock_gives_no_cutoff_and_deletes_nothing() {
+        let now = chrono::Utc::now();
+        assert!(age_cutoff(now, Duration::from_secs(u64::MAX)).is_none());
+        assert!(age_cutoff(now, Duration::from_secs(1 << 60)).is_none());
+        let ok = age_cutoff(now, Duration::from_secs(90 * 86_400)).unwrap();
+        assert_eq!((now - ok).num_days(), 90);
+    }
+
+    /// N-5: a run of raw retention leaves one history row with the totals, not one per slice.
+    #[test]
+    fn a_retention_run_records_one_event_with_its_totals() {
+        let r = rig_with("[storage]\nraw_retention = \"1MB\"\n");
+        let c = r.sql();
+        c.execute("INSERT INTO sources (id, project_id, type, uri, created_at) VALUES ('S1', ?1, 'file', 'u', '2026-01-01T00:00:00.000Z')", [r.global()]).unwrap();
+        // 60 chunks of 100 kB (6 MB): more than one 25 ms slice, or one fast one.
+        for i in 0..60 {
+            c.execute(
+                "INSERT INTO chunks (id, source_id, project_id, ord, text, content_hash, created_at, embed_state) VALUES (?1, 'S1', ?2, ?3, ?4, ?5, '2026-01-01T00:00:00.000Z', 'done')",
+                params![format!("C{i}"), r.global(), i as i64, "x".repeat(100_000), format!("ch{i}")],
+            )
+            .unwrap();
+        }
+        let report = r.sched.run_job(Job::RawRetention, chrono::Utc::now(), true);
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        let left = r.count("SELECT count(*) FROM chunks");
+        assert!(left <= 10, "{left}");
+        assert_eq!(
+            r.count("SELECT count(*) FROM events WHERE action = 'raw.retention'"),
+            1
+        );
+        let after: String = c
+            .query_row(
+                "SELECT after_json FROM events WHERE action = 'raw.retention'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(after["deleted"], 60 - left);
+        assert_eq!(after["reason"], "1MB");
     }
 
     #[test]

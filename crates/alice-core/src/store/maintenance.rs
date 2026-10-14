@@ -176,19 +176,37 @@ pub fn fts_merge(conn: &Connection, table: &str, pages: i64) -> Result<bool> {
     Ok(conn.total_changes() - before > 1)
 }
 
-/// Delete up to `limit` events older than `before_ts`, a whole group or none of it: an event
-/// whose group has a member at or after `before_ts` stays, so the history never keeps half of a
-/// change (undo reverts a whole group).
+/// Delete events older than `before_ts`: up to `limit` eligible events, and, for every group
+/// among them, the rest of that group too (a group may be larger than `limit`: it goes whole,
+/// never split across slices). Eligible: an ungrouped event, or one whose group has no member at
+/// or after `before_ts` (so the history never keeps half of a change; undo reverts a whole
+/// group). Returns the events deleted.
 pub fn prune_events(conn: &Connection, before_ts: &str, limit: usize) -> Result<usize> {
-    Ok(conn.execute(
-        "DELETE FROM events WHERE rowid IN (
-           SELECT e.rowid FROM events e
-           WHERE e.ts < ?1
-             AND (e.group_id IS NULL
-                  OR NOT EXISTS (SELECT 1 FROM events g WHERE g.group_id = e.group_id AND g.ts >= ?1))
-           ORDER BY e.rowid LIMIT ?2)",
-        params![before_ts, limit as i64],
-    )?)
+    let picked: Vec<(i64, Option<String>)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT e.rowid, e.group_id FROM events e
+             WHERE e.ts < ?1
+               AND (e.group_id IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM events g WHERE g.group_id = e.group_id AND g.ts >= ?1))
+             ORDER BY e.rowid LIMIT ?2",
+        )?;
+        stmt.query_map(params![before_ts, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?
+    };
+    let mut deleted = 0;
+    let mut groups = std::collections::BTreeSet::new();
+    for (rowid, group) in &picked {
+        deleted += conn.execute("DELETE FROM events WHERE rowid = ?1", [rowid])?;
+        if let Some(g) = group {
+            groups.insert(g.clone());
+        }
+    }
+    for g in groups {
+        deleted += conn.execute("DELETE FROM events WHERE group_id = ?1", [g])?;
+    }
+    Ok(deleted)
 }
 
 /// Delete up to `limit` judge-cache entries older than `before_ts`, or, when none is, entries
@@ -505,6 +523,64 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(left, vec!["B1", "B2"]);
+    }
+
+    /// N-2: a wholly old group larger than the slice goes in one piece, never split.
+    #[test]
+    fn a_group_larger_than_the_slice_is_pruned_whole() {
+        let (_d, c, _p) = setup();
+        for i in 0..1_500 {
+            c.execute(
+                "INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id, group_id) VALUES (?1, '2020-01-01T00:00:00.000Z', 'h', 'user', 'memory.edit', 'memory', 'X', 'BIG')",
+                [format!("big{i:05}")],
+            )
+            .unwrap();
+        }
+        for i in 0..3 {
+            c.execute(
+                "INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id) VALUES (?1, '2020-01-02T00:00:00.000Z', 'h', 'user', 'memory.edit', 'memory', 'Y')",
+                [format!("solo{i}")],
+            )
+            .unwrap();
+        }
+        // A straddling group, bigger than the slice too: it stays whole.
+        for i in 0..600 {
+            let ts = if i == 599 {
+                "2026-06-01T00:00:00.000Z"
+            } else {
+                "2020-01-03T00:00:00.000Z"
+            };
+            c.execute(
+                "INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id, group_id) VALUES (?1, ?2, 'h', 'user', 'memory.edit', 'memory', 'Z', 'MIXED')",
+                params![format!("mix{i:05}"), ts],
+            )
+            .unwrap();
+        }
+        // The slice is 500; the first old rows are BIG's, so all 1,500 go with them at once.
+        let n = prune_events(&c, "2025-01-01T00:00:00.000Z", 500).unwrap();
+        assert_eq!(n, 1_500, "the whole group in one call");
+        let big: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE group_id = 'BIG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(big, 0);
+        let n = prune_events(&c, "2025-01-01T00:00:00.000Z", 500).unwrap();
+        assert_eq!(n, 3, "the three ungrouped events; MIXED is never touched");
+        let mixed: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE group_id = 'MIXED'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mixed, 600);
+        assert_eq!(
+            prune_events(&c, "2025-01-01T00:00:00.000Z", 500).unwrap(),
+            0
+        );
     }
 
     #[test]
