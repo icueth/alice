@@ -136,6 +136,14 @@ fn spread(winner: &str, p: f64) -> Distribution {
     }))
 }
 
+/// Whether two memories state the same text: equal title and body under the identity of an
+/// idempotent write (`normalize::same_text`: NFC and collapsed whitespace; case and punctuation
+/// count, so `retry > 3` and `retry < 3` differ). Only this is sure enough for the heuristic to
+/// act on without asking (a vector rates "port 5432" and "port 5433" as near twins).
+fn same_text(a: &JudgeMemory, b: &JudgeMemory) -> bool {
+    crate::normalize::same_text(&a.title, &a.body, &b.title, &b.body)
+}
+
 /// Whether `name` appears in `text` as a word. Boundaries are ASCII-aware: a Thai letter next
 /// to an ASCII name (`ใช้pg-aiกับ`) does not hide it, but `pg-aid` does not match `pg-ai`.
 fn mentions(text: &str, name: &str) -> bool {
@@ -190,8 +198,12 @@ impl Judge for HeuristicJudge {
             .map(|e| {
                 let same_project = e.project == new.project;
                 let sim = e.similarity.unwrap_or(0.0);
+                let mut exact = None;
                 let probs = if same_project && sim >= self.duplicate_similarity {
                     let p = f64::from(sim).min(0.99);
+                    // `agreement` marks the duplicates that are the same text: the only
+                    // heuristic result `pipeline::decide` applies without asking.
+                    exact = Some(same_text(new, e));
                     Distribution::from_pairs([
                         ("duplicate".to_string(), p),
                         ("unrelated".to_string(), 1.0 - p),
@@ -211,7 +223,7 @@ impl Judge for HeuristicJudge {
                 Relation {
                     existing_id: e.id.clone(),
                     probs,
-                    agreement: None,
+                    agreement: exact,
                 }
             })
             .collect())
@@ -364,6 +376,49 @@ mod tests {
             "a heuristic update is only ever a suggestion"
         );
         assert_eq!(by("Z").probs.best().unwrap().0, "unrelated");
+    }
+
+    #[test]
+    fn only_text_identical_under_an_idempotent_write_is_marked_as_exact() {
+        let j = HeuristicJudge::default();
+        let at = "2026-10-13T00:00:00.000Z";
+        let one = |title: &str, kind: Kind| mem("N", "app", kind, title, at, None);
+        let twin = |title: &str, kind: Kind| mem("T", "app", kind, title, at, Some(0.999));
+        let exact = |new: &str, old: &str, kind: Kind| {
+            j.compare(&one(new, Kind::Note), &[twin(old, kind)])
+                .unwrap()[0]
+                .agreement
+        };
+        for (a, b) in [
+            ("if retry > 3 then stop", "if retry < 3 then stop"),
+            ("offset -5", "offset 5"),
+            ("uses C++", "uses C"),
+            ("if !enabled", "if enabled"),
+            ("ratio 1.5", "ratio 1,5"),
+            (
+                "Postgres listens on port 5433",
+                "Postgres listens on port 5432",
+            ),
+            ("Use WAL", "use wal"),
+            ("Use WAL.", "Use WAL"),
+        ] {
+            assert_eq!(exact(a, b, Kind::Note), Some(false), "{a:?} vs {b:?}");
+        }
+        assert_eq!(
+            exact("Use  WAL\n mode", "Use WAL mode", Kind::Note),
+            Some(true),
+            "whitespace only"
+        );
+        assert_eq!(
+            exact("Use WAL mode", "Use WAL mode", Kind::Decision),
+            Some(true),
+            "the same text under another kind"
+        );
+        let far = mem("F", "app", Kind::Note, "Tom yum", at, Some(0.3));
+        assert_eq!(
+            j.compare(&one("Use WAL", Kind::Note), &[far]).unwrap()[0].agreement,
+            None
+        );
     }
 
     #[test]

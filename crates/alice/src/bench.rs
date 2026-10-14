@@ -574,18 +574,18 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
     drop(probe);
 
     // Maintenance (backups, checks) would start whenever the bench waits for the embedding
-    // queue and spoil what it measures: it is off here, as in the daemon below.
+    // queue and spoil what it measures: it is off here, as in the daemon below. The judge
+    // still reads every memory (its cost is part of what is measured) but changes none: the
+    // generated corpus must stay as it was written, whatever it happens to resemble.
     let mut env = alice_daemon::config::process_env();
     env.retain(|(k, _)| k != "ALICE_MAINTENANCE_ENABLED");
     env.push(("ALICE_MAINTENANCE_ENABLED".into(), "false".into()));
-    let svc = Service::start(
-        home.clone(),
-        &make,
-        ServiceOptions {
-            settings_env: Some(env),
-            ..ServiceOptions::process_env()
-        },
-    )?;
+    let opts = ServiceOptions {
+        judge_applies: false,
+        settings_env: Some(env),
+        ..ServiceOptions::process_env()
+    };
+    let svc = Service::start(home.clone(), &make, opts)?;
     rt.block_on(load(&svc, &args, &mut corpus, &mut report))?;
     eprintln!("bench: measuring latency");
     report.latency = rt.block_on(latency(&svc, args.samples, &mut corpus))?;

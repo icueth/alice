@@ -455,6 +455,7 @@ impl Scheduler {
                 // Only memories in `retry` come back; imports (`skipped`) are never judged.
                 w.submit_blocking(WriteOp::RequeueJudgeRetries {
                     max_attempts: crate::judge_worker::MAX_ATTEMPTS,
+                    now: ts(now),
                 })?;
                 let _ = self.ctx.judge_wake.try_send(());
                 Ok(Step::Finished("judge retries queued".into()))
