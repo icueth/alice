@@ -4,12 +4,13 @@
 //! Safety order inside `Mapper::map`: clean the text, redact the WHOLE text, only then split by
 //! size, and re-check byte sizes after redaction (a marker can be longer than the secret).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use chrono::{FixedOffset, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone};
+use sha2::{Digest, Sha256};
 
-use super::palace::{Drawer, DrawerMeta};
+use super::palace::{Drawer, DrawerMeta, PalaceReader};
 use super::wings::{ProjectDecision, WingMap};
 use crate::model::{Author, Kind, SourceType, limits};
 use crate::normalize::{derive_title, nfc, normalize_topic, slugify};
@@ -259,6 +260,15 @@ fn agent_from_path(path: &str) -> Option<&'static str> {
     }
 }
 
+/// The source uri a raw drawer's chunks are filed under (before redaction).
+fn source_uri(m: &DrawerMeta) -> String {
+    match m.source_file.as_deref() {
+        Some(f) if f.starts_with('/') => format!("file://{f}"),
+        Some(f) => f.to_string(),
+        None => format!("mempalace-wing:{}", m.wing),
+    }
+}
+
 pub struct Mapper<'a> {
     pub wings: &'a WingMap,
     pub assume: FixedOffset,
@@ -403,11 +413,7 @@ impl Mapper<'_> {
     ) -> Planned {
         let m = &d.meta;
         let session = *tier == Tier::RawSession;
-        let uri = match m.source_file.as_deref() {
-            Some(f) if f.starts_with('/') => format!("file://{f}"),
-            Some(f) => f.to_string(),
-            None => format!("mempalace-wing:{}", m.wing),
-        };
+        let uri = source_uri(m);
         let uri = g.apply("source.uri", &uri);
         let path = m.source_file.as_deref().unwrap_or("");
         let agent = g.opt("source.agent", agent_from_path(path).map(str::to_string));
@@ -460,6 +466,213 @@ impl Mapper<'_> {
                 })
                 .collect(),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Survey: one pass over the whole palace (ids, metadata, a hash per raw text) so exact duplicates
+// collapse and every raw chunk gets a position (`ord`) that no earlier run has used.
+// ---------------------------------------------------------------------------------------------
+
+const SURVEY_PAGE: usize = 5_000;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TierCounts {
+    pub knowledge: u64,
+    pub raw_session: u64,
+    pub raw_file: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct Survey {
+    pub total: u64,
+    pub wing_counts: Vec<(String, u64)>,
+    /// Knowledge drawer ids, earliest filed first (ties by id).
+    pub knowledge_order: Vec<String>,
+    /// Raw drawer id -> ord inside its source.
+    pub ords: HashMap<String, i64>,
+    /// Raw drawer id -> keeper drawer id.
+    pub collapsed: HashMap<String, String>,
+    /// Source uri -> (first, last authored_at).
+    pub source_spans: HashMap<String, (Option<String>, Option<String>)>,
+    pub skipped: BTreeMap<&'static str, u64>,
+    pub tiers: TierCounts,
+    /// Raw drawer id -> source uri.
+    pub raw_source_of: HashMap<String, String>,
+}
+
+/// What the survey keeps per raw drawer: no text.
+struct RawRow {
+    id: String,
+    chunk_index: Option<i64>,
+    /// Normalised `filed_at` ("" when absent) so sorting compares like with like.
+    filed: String,
+    hash: [u8; 16],
+}
+
+impl RawRow {
+    fn sort_key(&self) -> (i64, &str, &str) {
+        (self.chunk_index.unwrap_or(i64::MAX), &self.filed, &self.id)
+    }
+}
+
+fn text_hash(text: &str) -> [u8; 16] {
+    let digest = Sha256::digest(nfc(&text.replace('\0', "")).as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+fn norm_time(t: &str, assume: FixedOffset) -> String {
+    parse_time(t, assume).unwrap_or_else(|| t.to_string())
+}
+
+/// `reserved(uri)`: the ords an earlier run already stored for that source (a lazy database lookup
+/// supplied by the caller). It is called once per source that has new rows, never for others.
+pub fn survey(
+    reader: &dyn PalaceReader,
+    since: Option<&str>,
+    wings: &mut WingMap,
+    assume: FixedOffset,
+    reserved: &dyn Fn(&str) -> BTreeSet<i64>,
+) -> crate::error::Result<Survey> {
+    let mut out = Survey::default();
+    let mut by_wing: BTreeMap<String, u64> = BTreeMap::new();
+    let mut knowledge: Vec<(String, String)> = Vec::new();
+    let mut sources: HashMap<String, Vec<RawRow>> = HashMap::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = reader.page(after.as_deref(), SURVEY_PAGE, since)?;
+        let Some(last) = page.last() else { break };
+        after = Some(last.id.clone());
+        for d in page {
+            out.total += 1;
+            *by_wing.entry(d.meta.wing.clone()).or_default() += 1;
+            match classify(&d.id, &d.meta) {
+                Tier::Skip(reason) => *out.skipped.entry(reason).or_default() += 1,
+                Tier::Knowledge => {
+                    out.tiers.knowledge += 1;
+                    let filed = d
+                        .meta
+                        .filed_at
+                        .as_deref()
+                        .map(|t| norm_time(t, assume))
+                        .unwrap_or_default();
+                    knowledge.push((filed, d.id));
+                }
+                tier => {
+                    if tier == Tier::RawSession {
+                        out.tiers.raw_session += 1;
+                    } else {
+                        out.tiers.raw_file += 1;
+                    }
+                    let uri = source_uri(&d.meta);
+                    if tier == Tier::RawSession
+                        && !sources.contains_key(&uri)
+                        && let Some(f) = d.meta.source_file.as_deref()
+                    {
+                        wings.note_transcript_dir(f);
+                    }
+                    let stamp = d
+                        .meta
+                        .authored_at
+                        .as_deref()
+                        .and_then(|t| parse_time(t, assume));
+                    if let Some(t) = stamp {
+                        let span = out.source_spans.entry(uri.clone()).or_default();
+                        if span.0.as_ref().is_none_or(|f| t < *f) {
+                            span.0 = Some(t.clone());
+                        }
+                        if span.1.as_ref().is_none_or(|l| t > *l) {
+                            span.1 = Some(t);
+                        }
+                    }
+                    let row = RawRow {
+                        hash: text_hash(&d.text),
+                        chunk_index: d.meta.chunk_index,
+                        filed: d
+                            .meta
+                            .filed_at
+                            .as_deref()
+                            .map(|t| norm_time(t, assume))
+                            .unwrap_or_default(),
+                        id: d.id,
+                    };
+                    out.raw_source_of.insert(row.id.clone(), uri.clone());
+                    sources.entry(uri).or_default().push(row);
+                }
+            }
+        }
+    }
+    let mut counts: Vec<(String, u64)> = by_wing.into_iter().collect();
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out.wing_counts = counts;
+
+    knowledge.sort_by(|a, b| (a.0.is_empty(), &a.0, &a.1).cmp(&(b.0.is_empty(), &b.0, &b.1)));
+    out.knowledge_order = knowledge.into_iter().map(|(_, id)| id).collect();
+
+    for (uri, mut rows) in sources {
+        rows.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        // Rule 2: the earliest of identical texts is the keeper.
+        let mut keeper_of: HashMap<[u8; 16], usize> = HashMap::new();
+        let mut kept: Vec<usize> = Vec::new();
+        let mut highest = -1i64; // the highest valid chunk_index of any row, collapsed or not
+        for (i, r) in rows.iter().enumerate() {
+            if let Some(ci) = r.chunk_index.filter(|c| *c >= 0) {
+                highest = highest.max(ci);
+            }
+            match keeper_of.get(&r.hash) {
+                Some(&k) => {
+                    out.collapsed.insert(r.id.clone(), rows[k].id.clone());
+                }
+                None => {
+                    keeper_of.insert(r.hash, i);
+                    kept.push(i);
+                }
+            }
+        }
+        // Rule 3: take the wanted index when free, defer the rest after the highest used one.
+        let mut claimed = reserved(&uri);
+        let mut deferred: Vec<usize> = Vec::new();
+        for &i in &kept {
+            match rows[i].chunk_index.filter(|c| *c >= 0) {
+                Some(ci) if !claimed.contains(&ci) => {
+                    claimed.insert(ci);
+                    out.ords.insert(rows[i].id.clone(), ci);
+                }
+                _ => deferred.push(i),
+            }
+        }
+        let first_free = claimed.last().copied().unwrap_or(-1).max(highest) + 1;
+        for (ord, i) in (first_free..).zip(deferred) {
+            out.ords.insert(rows[i].id.clone(), ord);
+        }
+    }
+    Ok(out)
+}
+
+pub struct Planner<'a> {
+    pub mapper: Mapper<'a>,
+    pub survey: &'a Survey,
+}
+
+impl Planner<'_> {
+    /// `Collapsed` when the survey folded this drawer into a keeper, else `Mapper::map` with the
+    /// survey's ord and the source's time span.
+    pub fn plan(&self, d: &Drawer) -> Planned {
+        if let Some(keeper) = self.survey.collapsed.get(&d.id) {
+            return Planned::Collapsed {
+                keeper: keeper.clone(),
+            };
+        }
+        let ord = self.survey.ords.get(&d.id).copied().unwrap_or(0);
+        let span = self
+            .survey
+            .source_spans
+            .get(&source_uri(&d.meta))
+            .cloned()
+            .unwrap_or((None, None));
+        self.mapper.map(d, ord, span)
     }
 }
 
@@ -977,5 +1190,297 @@ mod tests {
         );
         assert_eq!(split_utf8("short", 100, &["\n"]), vec!["short"]);
         assert!(split_utf8("", 10, &["\n"]).is_empty());
+    }
+
+    // ---- Task 6: survey and planner ----
+
+    use std::collections::BTreeSet as Set;
+
+    use crate::import::fixture::{DrawerSpec, build_sqlite_exact};
+    use crate::import::palace::{PalaceReader, open_snapshot, snapshot};
+
+    const SRC_A: &str = "/h/.claude/projects/-Users-me-Code-pg-ai/a.jsonl";
+
+    fn spec(id: &str, text: &str, meta: DrawerMeta) -> DrawerSpec {
+        DrawerSpec {
+            id: id.to_string(),
+            text: text.to_string(),
+            meta,
+        }
+    }
+    fn chunk_spec(id: &str, ci: Option<i64>, text: &str) -> DrawerSpec {
+        spec(
+            id,
+            text,
+            DrawerMeta {
+                wing: "sessions".into(),
+                room: "technical".into(),
+                source_file: s(SRC_A),
+                ingest_mode: s("convos"),
+                chunk_index: ci,
+                filed_at: s("2026-02-01T00:00:00"),
+                authored_at: s("2026-02-01T00:00:05"),
+                ..Default::default()
+            },
+        )
+    }
+    fn open_fixture(
+        specs: &[DrawerSpec],
+        tweak: impl FnOnce(&std::path::Path),
+    ) -> (tempfile::TempDir, tempfile::TempDir, Box<dyn PalaceReader>) {
+        let src = tempfile::tempdir().unwrap();
+        let path = build_sqlite_exact(src.path(), specs);
+        tweak(&path);
+        let dst = tempfile::tempdir().unwrap();
+        let snap = snapshot(src.path(), dst.path(), None).unwrap();
+        let r = open_snapshot(&snap, None).unwrap();
+        (src, dst, r)
+    }
+    fn run(
+        specs: &[DrawerSpec],
+        since: Option<&str>,
+        wm: &mut WingMap,
+        reserved: &dyn Fn(&str) -> Set<i64>,
+    ) -> Survey {
+        let (_a, _b, r) = open_fixture(specs, |_| {});
+        survey(r.as_ref(), since, wm, utc(), reserved).unwrap()
+    }
+    fn no_reserved(_: &str) -> Set<i64> {
+        Set::new()
+    }
+
+    #[test]
+    fn survey_assigns_unique_ords_and_collapses_identical_chunks_in_one_source() {
+        let specs = vec![
+            chunk_spec("a0", Some(0), "a"),
+            chunk_spec("a1", Some(1), "b"),
+            chunk_spec("a2", Some(1), "c"),
+            chunk_spec("a3", Some(2), "a"),
+            chunk_spec("a4", None, "d"),
+        ];
+        let mut wm = wings();
+        let sv = run(&specs, None, &mut wm, &no_reserved);
+        let want: std::collections::HashMap<String, i64> =
+            [("a0", 0), ("a1", 1), ("a2", 3), ("a4", 4)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+        assert_eq!(sv.ords, want);
+        assert_eq!(sv.collapsed.len(), 1);
+        assert_eq!(sv.collapsed.get("a3").map(String::as_str), Some("a0"));
+        let uniq: Set<i64> = sv.ords.values().copied().collect();
+        assert_eq!(uniq.len(), sv.ords.len());
+        assert_eq!(sv.total, 5);
+        assert_eq!(sv.tiers.raw_session, 5);
+        assert_eq!(
+            sv.raw_source_of.get("a2").map(String::as_str),
+            Some(format!("file://{SRC_A}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_second_run_never_reuses_an_ord_an_earlier_run_stored() {
+        // Run 1.
+        let first = vec![
+            chunk_spec("a0", Some(0), "zero"),
+            chunk_spec("a1", None, "one"),
+        ];
+        let mut wm = wings();
+        let s1 = run(&first, None, &mut wm, &no_reserved);
+        assert_eq!(s1.ords["a0"], 0);
+        assert_eq!(s1.ords["a1"], 1);
+        // Run 2 sees only the new drawers (--since) and the ords run 1 stored.
+        let mut a2 = chunk_spec("a2", Some(1), "new");
+        a2.meta.filed_at = s("2026-03-05T00:00:00");
+        let mut a3 = chunk_spec("a3", None, "newer");
+        a3.meta.filed_at = s("2026-03-05T00:00:00");
+        let both = vec![chunk_spec("a0", Some(0), "zero"), a2, a3];
+        let calls = std::cell::RefCell::new(Vec::new());
+        let reserved = |u: &str| {
+            calls.borrow_mut().push(u.to_string());
+            Set::from([0, 1])
+        };
+        let s2 = run(&both, Some("2026-03-01"), &mut wm, &reserved);
+        assert_eq!(s2.ords.len(), 2);
+        assert_eq!(
+            s2.ords["a2"], 2,
+            "wanted index 1 is claimed, so it is deferred"
+        );
+        assert_eq!(s2.ords["a3"], 3);
+        assert!(s2.ords.values().all(|o| *o != 0 && *o != 1));
+        assert_eq!(
+            calls.borrow().len(),
+            1,
+            "one lookup for the one source with new rows"
+        );
+    }
+
+    #[test]
+    fn reserved_is_never_called_for_a_source_without_new_rows() {
+        let calls = std::cell::Cell::new(0);
+        let reserved = |_: &str| {
+            calls.set(calls.get() + 1);
+            Set::new()
+        };
+        let mut wm = wings();
+        let sv = run(&[], None, &mut wm, &reserved);
+        assert_eq!((calls.get(), sv.total), (0, 0));
+        let know = spec("k", "x", knowledge_meta("alice", "decisions"));
+        run(&[know], None, &mut wm, &reserved);
+        assert_eq!(calls.get(), 0, "knowledge drawers have no source");
+    }
+
+    #[test]
+    fn knowledge_order_is_earliest_filed_first_and_ties_break_by_id() {
+        let mk = |id: &str, filed: &str| {
+            let mut m = knowledge_meta("alice", "decisions");
+            m.filed_at = s(filed);
+            spec(id, "text", m)
+        };
+        let specs = vec![
+            mk("first-feb", "2026-02-01T00:00:00"),
+            mk("b", "2026-01-01T00:00:00"),
+            mk("a", "2026-01-01T00:00:00"),
+        ];
+        let mut wm = wings();
+        let sv = run(&specs, None, &mut wm, &no_reserved);
+        assert_eq!(sv.knowledge_order, vec!["a", "b", "first-feb"]);
+        assert_eq!(sv.tiers.knowledge, 3);
+    }
+
+    #[test]
+    fn counts_tiers_skips_and_unknown_transcript_folders() {
+        let reg = spec(
+            "r1",
+            "reg",
+            DrawerMeta {
+                wing: "alice".into(),
+                room: "technical".into(),
+                ingest_mode: s("registry"),
+                ..Default::default()
+            },
+        );
+        let diary = |id: &str| {
+            spec(
+                id,
+                "diary text",
+                DrawerMeta {
+                    wing: "wing_claude_code".into(),
+                    room: "diary".into(),
+                    ..Default::default()
+                },
+            )
+        };
+        let jsonl = |id: &str, n: i64| {
+            spec(
+                id,
+                &format!("chunk {n}"),
+                DrawerMeta {
+                    wing: "sessions".into(),
+                    room: "technical".into(),
+                    source_file: s("/h/.claude/projects/-Users-me-Code-AI-gsb-app-verify/s.jsonl"),
+                    ingest_mode: s("convos"),
+                    chunk_index: Some(n),
+                    ..Default::default()
+                },
+            )
+        };
+        let file = spec(
+            "f1",
+            "fn main() {}",
+            DrawerMeta {
+                wing: "alice".into(),
+                room: "technical".into(),
+                source_file: s("/h/alice/src/main.rs"),
+                ..Default::default()
+            },
+        );
+        let bad = spec("zz-bad", "x", knowledge_meta("alice", "decisions"));
+        let specs = vec![
+            reg,
+            diary("d1"),
+            diary("d2"),
+            jsonl("j1", 0),
+            jsonl("j2", 1),
+            jsonl("j3", 2),
+            file,
+            bad,
+        ];
+        let (_a, _b, r) = open_fixture(&specs, |p| {
+            let c = rusqlite::Connection::open(p).unwrap();
+            c.execute(
+                "UPDATE documents SET metadata_json = 'not json' WHERE id = 'zz-bad'",
+                [],
+            )
+            .unwrap();
+        });
+        let mut wm = wings();
+        assert!(!wm.projects().contains_key("gsb-app-verify"));
+        let sv = survey(r.as_ref(), None, &mut wm, utc(), &no_reserved).unwrap();
+        assert_eq!(sv.total, 8);
+        assert_eq!(
+            (sv.tiers.knowledge, sv.tiers.raw_session, sv.tiers.raw_file),
+            (2, 3, 1)
+        );
+        let want: BTreeMap<&'static str, u64> =
+            [("MemPalace registry entry", 1), ("unreadable metadata", 1)]
+                .into_iter()
+                .collect();
+        assert_eq!(sv.skipped, want);
+        assert!(wm.projects().contains_key("gsb-app-verify"));
+        assert!(!sv.ords.contains_key("r1") && !sv.ords.contains_key("zz-bad"));
+        assert_eq!(sv.ords.len(), 4);
+    }
+
+    #[test]
+    fn since_limits_the_survey() {
+        let mut old = chunk_spec("o1", Some(0), "old");
+        old.meta.filed_at = s("2026-02-01T00:00:00");
+        let mut new = chunk_spec("n1", Some(1), "new");
+        new.meta.filed_at = s("2026-03-10T00:00:00");
+        let mut wm = wings();
+        let sv = run(&[old, new], Some("2026-03-01"), &mut wm, &no_reserved);
+        assert_eq!(sv.total, 1);
+        assert_eq!(sv.tiers.raw_session, 1);
+        assert!(sv.ords.contains_key("n1") && !sv.ords.contains_key("o1"));
+        assert_eq!(sv.wing_counts, vec![("sessions".to_string(), 1)]);
+    }
+
+    #[test]
+    fn the_planner_returns_collapsed_for_collapsed_drawers_and_maps_the_rest() {
+        let specs = vec![
+            chunk_spec("a0", Some(0), "a"),
+            chunk_spec("a1", Some(1), "b"),
+            chunk_spec("a3", Some(2), "a"),
+        ];
+        let mut wm = wings();
+        let sv = run(&specs, None, &mut wm, &no_reserved);
+        let f = NoFilter;
+        let planner = Planner {
+            mapper: Mapper {
+                wings: &wm,
+                assume: utc(),
+                filter: &f,
+            },
+            survey: &sv,
+        };
+        let drawer = |sp: &DrawerSpec| d(&sp.id, &sp.text, sp.meta.clone());
+        match planner.plan(&drawer(&specs[2])) {
+            Planned::Collapsed { keeper } => assert_eq!(keeper, "a0"),
+            other => panic!("expected Collapsed, got {other:?}"),
+        }
+        let Planned::Chunks(c) = planner.plan(&drawer(&specs[0])) else {
+            panic!("expected chunks")
+        };
+        assert_eq!(c[0].chunk.ord, 0);
+        let span = sv.source_spans[&format!("file://{SRC_A}")].clone();
+        assert_eq!(span.0.as_deref(), Some("2026-02-01T00:00:05.000Z"));
+        assert_eq!(span.0, span.1);
+        assert_eq!(c[0].source.started_at, span.0);
+        assert_eq!(c[0].source.ended_at, span.1);
+        let Planned::Chunks(c1) = planner.plan(&drawer(&specs[1])) else {
+            panic!("expected chunks")
+        };
+        assert_eq!(c1[0].chunk.ord, 1);
     }
 }
