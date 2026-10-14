@@ -167,6 +167,9 @@ fn run(cfg: JudgeWorkerConfig) {
             if cfg.stop.load(Ordering::Relaxed) {
                 break;
             }
+            // AssertUnwindSafe: after a panic nothing the closure borrowed is read again. `cfg`
+            // is only read (its locks are parking_lot ones, which do not poison) and `item` is
+            // plain data.
             let judged =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| judge_one(&cfg, &item)));
             let outcome = match judged {
@@ -479,6 +482,23 @@ pub fn judge_one(cfg: &JudgeWorkerConfig, item: &PendingJudgement) -> Result<Opt
         return Ok(None);
     };
     let existing: Vec<JudgeMemory> = found.iter().map(|n| n.memory.clone()).collect();
+    // A memory that fell back to `global` is routed; one that was moved (by anyone) or given a
+    // project is where its writer wanted it. The local router looks first: if it points at a
+    // project the cloud policy keeps from a model, nothing about this memory (its comparison,
+    // its kind, its routing) is sent to one.
+    let options = if item.project_defaulted && item.project_slug == "global" {
+        cfg.readers.with(route_candidates)?
+    } else {
+        Vec::new()
+    };
+    let local_route = (!options.is_empty())
+        .then(|| heuristic.route_project(&me, &options).ok())
+        .flatten();
+    let keep_local = local_route
+        .as_ref()
+        .and_then(|d| d.best())
+        .is_some_and(|(s, p)| s != "global" && p >= t.review && !cfg.judge.cloud_allowed(&s));
+    let model = model && !keep_local;
     let mut outcome = Outcome {
         // A heuristic standing in for the judge that was asked for is a fallback like an outage.
         retry: stand_in,
@@ -505,23 +525,18 @@ pub fn judge_one(cfg: &JudgeWorkerConfig, item: &PendingJudgement) -> Result<Opt
 
     let mut project_to = None;
     let mut project_provider = None;
-    // Only a memory that fell back to `global` is routed; one that was moved (by anyone) or
-    // given a project is where its writer wanted it.
-    let routed = if item.project_defaulted && item.project_slug == "global" {
-        route_memory(
-            cfg,
-            &judge,
-            &heuristic,
-            &memory,
-            &me,
-            &t,
-            model,
-            &mut outcome,
-            &item.id,
-        )?
-    } else {
-        None
-    };
+    let routed = route_memory(
+        cfg,
+        &judge,
+        &memory,
+        &me,
+        &options,
+        local_route,
+        &t,
+        model,
+        &mut outcome,
+        &item.id,
+    )?;
     if let Some((slug, p, by, review)) = routed {
         if review {
             decided.reviews.push(project_review(&me.id, &slug, p, &by));
@@ -615,24 +630,25 @@ fn project_review(memory_id: &str, to: &str, p: f64, provider: &str) -> NewRevie
 
 /// Where a memory that fell back to `global` belongs: `(project, p, who decided, ask)`. `ask`
 /// is true when a person should say (not sure enough, a heuristic's guess, or a destination
-/// whose rules would change the text).
+/// whose rules would change the text). `options` are the candidate projects (empty: not a
+/// memory to route) and `local` the heuristic's answer over them.
 #[allow(clippy::too_many_arguments)]
 fn route_memory(
     cfg: &JudgeWorkerConfig,
     judge: &Arc<dyn Judge>,
-    heuristic: &HeuristicJudge,
     memory: &Memory,
     me: &JudgeMemory,
+    options: &[ProjectOption],
+    local: Option<Distribution>,
     t: &Thresholds,
     model: bool,
     outcome: &mut Outcome,
     id: &str,
 ) -> Result<Option<(String, f64, String, bool)>> {
-    let options = cfg.readers.with(route_candidates)?;
     if options.is_empty() {
         return Ok(None);
     }
-    let (routed, by) = route(cfg, judge, heuristic, me, &options, t, model, outcome, id);
+    let (routed, by) = route(cfg, judge, me, options, local, model, outcome, id);
     let Some((slug, p)) = routed
         .and_then(|d| d.best())
         .filter(|(s, _)| s != "global" && options.iter().any(|o| o.slug == *s))
@@ -659,30 +675,22 @@ fn route_memory(
     }
 }
 
-/// Which project a memory that fell back to `global` belongs to, and who decided. The local
-/// heuristic looks first: if it points at a project the cloud policy keeps from a model, the
-/// memory stays on this machine (a model asked "which project?" would be told what the text
-/// is about, and which projects exist). Otherwise a model is offered only the projects the
-/// policy lets it be told about (a denied project's name and recent titles are never sent)
-/// when one is in force and not down; the heuristic chooses among all of them.
+/// Which project a memory that fell back to `global` belongs to, and who decided. A model
+/// (`model`: one is in force, not down, and the memory may be sent to it) is offered only the
+/// projects the cloud policy lets it be told about (a denied project's name and recent titles
+/// are never sent); otherwise `local`, the heuristic's choice among all of them, stands.
 #[allow(clippy::too_many_arguments)]
 fn route(
     cfg: &JudgeWorkerConfig,
     judge: &Arc<dyn Judge>,
-    heuristic: &HeuristicJudge,
     me: &JudgeMemory,
     options: &[ProjectOption],
-    t: &Thresholds,
+    local: Option<Distribution>,
     model: bool,
     outcome: &mut Outcome,
     id: &str,
 ) -> (Option<Distribution>, String) {
-    let local = heuristic.route_project(me, options).ok();
-    let points_at_denied = local
-        .as_ref()
-        .and_then(|d| d.best())
-        .is_some_and(|(s, p)| s != "global" && p >= t.review && !cfg.judge.cloud_allowed(&s));
-    if model && !outcome.model_down && !points_at_denied {
+    if model && !outcome.model_down {
         let offered: Vec<ProjectOption> = options
             .iter()
             .filter(|o| cfg.judge.cloud_allowed(&o.slug))

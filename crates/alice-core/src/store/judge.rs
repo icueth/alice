@@ -137,7 +137,7 @@ pub struct PendingJudgement {
 const PENDING_SQL: &str = "SELECT m.seq, m.id, m.content_hash, m.updated_at, m.project_id, p.slug, m.kind_explicit, m.project_defaulted, m.judge_attempts, m.judge_unavailable
      FROM memories m JOIN projects p ON p.id = m.project_id
      WHERE m.judge_state <> 'done' AND m.judge_state = 'pending' AND m.embed_state IN ('done', 'failed') AND m.status <> 'trashed'
-       AND NOT EXISTS (SELECT 1 FROM memories o WHERE o.seq < m.seq AND o.judge_state = 'pending'
+       AND NOT EXISTS (SELECT 1 FROM memories o WHERE o.seq < m.seq AND o.judge_state <> 'done' AND o.judge_state = 'pending'
                        AND o.embed_state IN ('pending', 'retry') AND o.status <> 'trashed')
      ORDER BY m.seq LIMIT ?1";
 
@@ -396,6 +396,21 @@ mod tests {
             secs.iter().all(|s| *s <= 6 * 3600) && secs[13] == 6 * 3600,
             "{secs:?}"
         );
+    }
+
+    #[test]
+    fn the_queue_query_uses_the_partial_index_for_both_the_rows_and_the_older_check() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {PENDING_SQL}"))
+            .unwrap()
+            .query_map([10], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan.join("\n");
+        assert!(plan.matches("memories_judge").count() >= 2, "{plan}");
     }
 
     #[test]

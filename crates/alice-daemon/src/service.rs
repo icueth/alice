@@ -5335,4 +5335,57 @@ mod tests {
         );
         assert!(s.read_only().is_none(), "a clean stop, not a failure");
     }
+
+    // ------------------------------------------------------------------ fix round 2
+
+    /// N3: when the local router says a memory is about a project the cloud may not see, its
+    /// comparison and its kind question stay local too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_about_a_denied_project_stays_local_for_comparison_and_kind() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("updates", 0.95),
+            kind: Some(("bugfix", 0.95)),
+            project: Some(("allowedproj", 0.95)),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        let denied = repo(&d, "deniedproj");
+        std::fs::write(
+            std::path::Path::new(denied.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        remember_id(&s, "deniedproj keeps notes", Some(Kind::Note), &denied).await;
+        remember_id(
+            &s,
+            "allowedproj keeps a wiki",
+            Some(Kind::Note),
+            &repo(&d, "allowedproj"),
+        )
+        .await;
+        wait_settled(&s).await;
+        let old = remember_id(
+            &s,
+            "release notes about deniedproj",
+            Some(Kind::Note),
+            &None,
+        )
+        .await;
+        wait_settled(&s).await;
+        let new = remember_id(&s, "release notes about deniedproj again", None, &None).await;
+        wait_settled(&s).await;
+        assert_eq!(
+            t.sent(),
+            0,
+            "nothing about it was sent: no comparison, kind or route"
+        );
+        assert!(!t.mentioned("deniedproj"));
+        assert_eq!(memory_of(&s, &new).await.memory.kind, Kind::Note);
+        assert_eq!(
+            memory_of(&s, &old).await.memory.status.as_str(),
+            "active",
+            "no model update"
+        );
+        s.shutdown();
+    }
 }
