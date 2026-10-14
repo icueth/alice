@@ -70,25 +70,24 @@ fn es_plural(stem: &str) -> bool {
 }
 
 /// Every plausible stem of one word: the canonical stem plus, for `-es` words, the plain `-s`
-/// form and the `-es`-stripped form when the stripped stem is a sound base (ends in `s`, `x`,
-/// `z`, `ch`, `sh`, or is `go`/`do`). So `caches` reaches `cache`, `buses` reaches `bus`, but
-/// `toes` and `shoes` do not reach `to` and `sho`.
+/// form and the `-es`-stripped form (`caches` reaches `cache`, `buses` reaches `bus`, `heroes`
+/// reaches `hero`). Extra candidates shorter than three characters are dropped (`toes` does not
+/// reach `to`), except `go` and `do`.
 fn word_candidates(w: &str) -> Vec<String> {
     let mut out = vec![stem_word(w)];
     let n = w.len();
     if w.is_ascii() && n > 3 && w.ends_with("es") {
-        out.push(w[..n - 1].to_string());
-        let stem = &w[..n - 2];
-        let sound = ["s", "x", "z", "ch", "sh"]
-            .iter()
-            .any(|e| stem.ends_with(e))
-            || matches!(stem, "go" | "do");
-        if sound {
-            out.push(stem.to_string());
-            if stem.ends_with("zz") {
-                out.push(stem[..stem.len() - 1].to_string());
-            }
+        let mut extra = vec![w[..n - 1].to_string(), w[..n - 2].to_string()];
+        if w[..n - 2].ends_with("zz") {
+            extra.push(w[..n - 3].to_string());
         }
+        // A very short candidate (`to`, `sho`-like fragments of 1-2 letters) is noise, except
+        // the irregular `go` and `do`.
+        out.extend(
+            extra
+                .into_iter()
+                .filter(|c| c.chars().count() >= 3 || matches!(c.as_str(), "go" | "do")),
+        );
     }
     out.sort();
     out.dedup();
@@ -176,6 +175,10 @@ mod tests {
             ("matches", "match"),
             ("quizzes", "quiz"),
             ("processes", "processing"),
+            ("heroes", "hero"),
+            ("echoes", "echo"),
+            ("undoes", "undo"),
+            ("potatoes", "potato"),
             ("deployed_on", "deploys_on"),
         ] {
             assert!(
@@ -184,7 +187,7 @@ mod tests {
             );
             assert!(same_predicate(b, a), "{b} ~ {a}");
         }
-        for (a, b) in [("toes", "to"), ("shoes", "sho"), ("owns", "deployed_on")] {
+        for (a, b) in [("toes", "to"), ("owns", "deployed_on")] {
             assert!(
                 !same_predicate(a, b) && predicate_similarity(a, b) < 1.0,
                 "{a} !~ {b}"

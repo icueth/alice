@@ -3,7 +3,7 @@
 //! name mentions, predicates by string similarity. It never claims more certainty than the
 //! rules justify: only duplicates (and identical predicates) reach the auto-apply threshold.
 
-use super::text::{predicate_similarity, same_predicate, title_similarity};
+use super::text::{predicate_similarity, same_predicate, stem_predicate, title_similarity};
 use super::{
     Choice, Distribution, Judge, JudgeMemory, JudgeResult, ProjectOption, Relation, Rubric, Score,
 };
@@ -241,29 +241,32 @@ impl Judge for HeuristicJudge {
 
     fn match_predicate(&self, new: &str, existing: &[String]) -> JudgeResult<Distribution> {
         let key = normalize_predicate(new);
-        // Best candidate: exact normalised match, then higher similarity, then the shorter
+        let canonical = stem_predicate(new);
+        // Best candidate: exact normalised match, then higher similarity, then a matching canonical stem, then the shorter
         // predicate, then lexicographic order, so the answer does not depend on input order.
-        let mut ranked: Vec<(&String, f64, bool)> = existing
+        let mut ranked: Vec<(&String, f64, bool, bool)> = existing
             .iter()
             .map(|p| {
                 (
                     p,
                     predicate_similarity(new, p),
                     normalize_predicate(p) == key,
+                    stem_predicate(p) == canonical,
                 )
             })
             .collect();
         ranked.sort_by(|a, b| {
             b.2.cmp(&a.2)
                 .then(b.1.total_cmp(&a.1))
+                .then(b.3.cmp(&a.3))
                 .then(a.0.chars().count().cmp(&b.0.chars().count()))
                 .then(a.0.cmp(b.0))
         });
         Ok(match ranked.first() {
-            Some((p, _, _)) if same_predicate(new, p) => {
+            Some((p, _, _, _)) if same_predicate(new, p) => {
                 Distribution::from_pairs([((*p).clone(), 0.95), ("none".to_string(), 0.05)])
             }
-            Some((p, s, _)) if *s >= self.title_similarity => {
+            Some((p, s, _, _)) if *s >= self.title_similarity => {
                 Distribution::from_pairs([((*p).clone(), 0.7), ("none".to_string(), 0.3)])
             }
             _ => Distribution::certain("none"),
@@ -482,6 +485,10 @@ mod tests {
             let d = j.match_predicate("uses", &set.map(String::from)).unwrap();
             assert_eq!(d.best().unwrap(), ("uses".to_string(), 0.95), "{set:?}");
         }
+        let us = j
+            .match_predicate("uses", &["us".into(), "use".into()])
+            .unwrap();
+        assert_eq!(us.best().unwrap().0, "use");
         let none = j.match_predicate("owns", &["deployed_on".into()]).unwrap();
         assert_eq!(none.best().unwrap().0, "none");
     }

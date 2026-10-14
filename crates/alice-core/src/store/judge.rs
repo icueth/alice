@@ -133,6 +133,68 @@ pub fn cost_since(conn: &Connection, day: &str) -> Result<Vec<CostRow>> {
 mod tests {
     use super::*;
 
+    fn row(c: &Connection) -> (i64, i64, i64, f64) {
+        c.query_row(
+            "SELECT calls, input_tokens, output_tokens, usd FROM cost_ledger WHERE day = '2026-10-20' AND provider = 'jev'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    fn delta(calls: u64, input: u64, usd: f64) -> CostDelta {
+        CostDelta {
+            day: "2026-10-20".into(),
+            provider: "jev".into(),
+            calls,
+            input_tokens: input,
+            output_tokens: 0,
+            usd,
+        }
+    }
+
+    #[test]
+    fn add_cost_overflow_on_calls_is_refused_and_leaves_the_row() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        add_cost(&c, &delta(5, 10, 0.5)).unwrap();
+        assert!(matches!(
+            add_cost(&c, &delta(i64::MAX as u64, 0, 0.0)),
+            Err(AliceError::Invalid(_))
+        ));
+        assert_eq!(row(&c), (5, 10, 0, 0.5));
+        add_cost(&c, &delta(1, 1, 0.25)).unwrap();
+        assert_eq!(row(&c), (6, 11, 0, 0.75), "usable after a refusal");
+    }
+
+    #[test]
+    fn add_cost_overflow_on_input_tokens_is_refused_and_leaves_the_row() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        add_cost(&c, &delta(1, 10, 0.5)).unwrap();
+        assert!(matches!(
+            add_cost(&c, &delta(1, i64::MAX as u64, 0.0)),
+            Err(AliceError::Invalid(_))
+        ));
+        assert_eq!(row(&c), (1, 10, 0, 0.5));
+        add_cost(&c, &delta(1, 1, 0.0)).unwrap();
+        assert_eq!(row(&c), (2, 11, 0, 0.5));
+    }
+
+    #[test]
+    fn add_cost_usd_sum_that_is_not_finite_is_refused_and_leaves_the_row() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        add_cost(&c, &delta(1, 1, 1e308)).unwrap();
+        assert!(matches!(
+            add_cost(&c, &delta(1, 1, 1e308)),
+            Err(AliceError::Invalid(_))
+        ));
+        assert_eq!(row(&c), (1, 1, 0, 1e308));
+        add_cost(&c, &delta(1, 1, 0.0)).unwrap();
+        assert_eq!(row(&c), (2, 2, 0, 1e308));
+    }
+
     #[test]
     fn cache_and_costs() {
         let d = tempfile::tempdir().unwrap();
