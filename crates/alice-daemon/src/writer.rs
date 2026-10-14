@@ -50,6 +50,19 @@ pub enum ProjectChoice {
     Detected(ProjectRef),
 }
 
+/// Text a review resolution writes, as the privacy rules left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveText {
+    /// A predicate mapping: `(predicate, canonical)`.
+    Predicate(String, String),
+    /// A move into a project whose rules changed the memory's text: the text to store with it.
+    Moved {
+        title: String,
+        body: String,
+        topics: Vec<String>,
+    },
+}
+
 #[derive(Debug)]
 pub enum WriteOp {
     Remember {
@@ -78,14 +91,14 @@ pub enum WriteOp {
         event_id: String,
         actor: Actor,
     },
-    /// Apply a review decision and record it. `map_to` is the item's `(predicate, canonical)`
-    /// after the privacy rules (the service redacts what the item holds before it is written
-    /// as vocabulary); `None` uses the item's own.
+    /// Apply a review decision and record it. `text` is what the item holds after the privacy
+    /// rules (the service screens it before the writer, which does not scan content); `None`
+    /// uses the item's own.
     ResolveReview {
         id: String,
         choice: String,
         actor: Actor,
-        map_to: Option<(String, String)>,
+        text: Option<ResolveText>,
     },
     /// `others` become duplicates of `survivor` (admin tool, review `merge`).
     Merge {
@@ -593,6 +606,12 @@ fn supersede(
                     "the {what} memory {id} is in the trash; reject this item instead"
                 )));
             }
+            Some(s) if s["status"] == "superseded" || s["status"] == "archived" => {
+                return Err(AliceError::invalid(format!(
+                    "the {what} memory {id} is already {} since this item was raised; reject it instead",
+                    s["status"].as_str().unwrap_or("changed")
+                )));
+            }
             Some(_) => {}
         }
     }
@@ -717,7 +736,7 @@ fn resolve_review(
     id: &str,
     choice: &str,
     actor: &Actor,
-    map_to: Option<(String, String)>,
+    text: Option<ResolveText>,
 ) -> Result<WriteOutcome> {
     let item = reviews::get(conn, id)?.ok_or_else(|| {
         AliceError::NotFound(format!("review item {id}; list them with `alice review`"))
@@ -750,13 +769,25 @@ fn resolve_review(
                 .flatten()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
-            merge(conn, st, &s("survivor"), &others, actor, Some(&group))?;
+            let merged = merge(conn, st, &s("survivor"), &others, actor, Some(&group))?;
+            if merged.is_empty() {
+                return Err(AliceError::invalid(
+                    "nothing is left to merge (the duplicates are gone or already in the trash); reject this item instead",
+                ));
+            }
         }
         (ReviewType::Predicate, "map") => {
-            let (name, canonical) = map_to.unwrap_or_else(|| (s("predicate"), s("canonical")));
+            let (name, canonical) = match text {
+                Some(ResolveText::Predicate(n, c)) => (n, c),
+                _ => (s("predicate"), s("canonical")),
+            };
             let h = st.hlc.tick();
-            let n = kg::map_predicate(conn, &name, &canonical, &h)?;
+            let (before, after) = kg::map_predicate_recorded(conn, &name, &canonical, &h)?;
             st.matcher = None;
+            let json = |v: &kg::PredicateSnapshot| {
+                serde_json::to_value(v)
+                    .map_err(|e| AliceError::Other(format!("predicate snapshot: {e}")))
+            };
             record(
                 conn,
                 st,
@@ -765,8 +796,8 @@ fn resolve_review(
                     action: "predicate.map",
                     target_type: "predicate",
                     target_id: &name,
-                    before: None,
-                    after: Some(serde_json::json!({"canonical": canonical, "relations": n})),
+                    before: Some(json(&before)?),
+                    after: Some(json(&after)?),
                     group: Some(&group),
                 },
             )?;
@@ -779,7 +810,31 @@ fn resolve_review(
                     s("to")
                 ))
             })?;
-            let before = snap(conn, &memory)?;
+            let Some(before) = snap(conn, &memory)? else {
+                return Err(AliceError::NotFound(format!("memory {memory}")));
+            };
+            if before["status"] == "trashed" {
+                return Err(AliceError::invalid(format!(
+                    "memory {memory} is in the trash; keep it where it is"
+                )));
+            }
+            // The memory must still be where the item saw it.
+            let current = before["project_id"].as_str().unwrap_or_default();
+            if current == target.id {
+                return Err(AliceError::invalid(format!(
+                    "memory {memory} is already in project {}; keep it where it is",
+                    target.slug
+                )));
+            }
+            if let Some(from) = projects::resolve_slug(conn, &s("from"))?
+                && from.id != current
+            {
+                return Err(AliceError::invalid(format!(
+                    "memory {memory} is no longer in project {}; keep it where it is",
+                    from.slug
+                )));
+            }
+            let before = Some(before);
             let h = st.hlc.tick();
             match memories::move_to_project(conn, &memory, &target.id, &h)? {
                 memories::MoveOutcome::Moved => {
@@ -797,6 +852,43 @@ fn resolve_review(
                             group: Some(&group),
                         },
                     )?;
+                    // Under redact mode the destination's rules may clean the text: stored as
+                    // an edit in the same group.
+                    if let Some(ResolveText::Moved {
+                        title,
+                        body,
+                        topics,
+                    }) = text
+                    {
+                        let before = snap(conn, &own)?;
+                        let h = st.hlc.tick();
+                        memories::apply_update(
+                            conn,
+                            &own,
+                            &MemoryUpdate {
+                                action: UpdateAction::Edit,
+                                title: Some(title),
+                                body: Some(body),
+                                topics: Some(topics),
+                                ..Default::default()
+                            },
+                            h,
+                        )?;
+                        st.inserted = true;
+                        record(
+                            conn,
+                            st,
+                            EventInput {
+                                actor,
+                                action: "memory.edit",
+                                target_type: "memory",
+                                target_id: &own,
+                                before,
+                                after: snap(conn, &own)?,
+                                group: Some(&group),
+                            },
+                        )?;
+                    }
                 }
                 memories::MoveOutcome::DuplicateOf(other) => {
                     merge(conn, st, &other, &[memory], actor, Some(&group))?;
@@ -988,8 +1080,8 @@ fn apply(
             id,
             choice,
             actor,
-            map_to,
-        } => resolve_review(conn, st, &id, &choice, &actor, map_to)?,
+            text,
+        } => resolve_review(conn, st, &id, &choice, &actor, text)?,
         WriteOp::Merge {
             survivor,
             others,
@@ -2382,7 +2474,7 @@ mod tests {
             id: id.into(),
             choice: choice.into(),
             actor: Actor::User,
-            map_to: None,
+            text: None,
         })
     }
 
@@ -2569,8 +2661,8 @@ mod tests {
             "SELECT after_json FROM events WHERE action = 'predicate.map'",
             [],
         );
-        assert!(after.contains("\"relations\":1"), "{after}");
-        // `map_to` (the service's redacted names) wins over the item's own.
+        assert!(after.contains("\"relations\":[["), "{after}");
+        // `text` (the service's redacted names) wins over the item's own.
         let item2 = add_review(
             &f,
             ReviewType::Predicate,
@@ -2581,7 +2673,7 @@ mod tests {
             id: item2,
             choice: "map".into(),
             actor: Actor::User,
-            map_to: Some(("employs".into(), "use".into())),
+            text: Some(ResolveText::Predicate("employs".into(), "use".into())),
         })
         .unwrap();
         let canonical: String = f.read(
@@ -2724,5 +2816,258 @@ mod tests {
         assert!(err.contains("coming"), "{err}");
         let st: String = f.read("SELECT status FROM review_items WHERE id = ?1", [&item]);
         assert_eq!(st, "open");
+    }
+
+    // ---- stale items and undo of resolutions ----
+
+    fn event_of(f: &Fixture, action: &str, target: &str) -> String {
+        f.read(
+            "SELECT id FROM events WHERE action = ?1 AND target_id = ?2 ORDER BY rowid DESC LIMIT 1",
+            [action, target],
+        )
+    }
+
+    fn undo(f: &Fixture, event: &str) -> Result<WriteOutcome> {
+        f.h.submit_blocking(WriteOp::Undo {
+            event_id: event.into(),
+            actor: Actor::User,
+        })
+    }
+
+    fn open_state(f: &Fixture, item: &str) -> String {
+        f.read("SELECT status FROM review_items WHERE id = ?1", [item])
+    }
+
+    #[test]
+    fn stale_items_are_refused_and_stay_open() {
+        let f = fixture();
+        let ids: Vec<String> = ["survivor", "dup one", "dup two", "mover"]
+            .iter()
+            .map(|t| new_id(f.h.submit_blocking(remember(t)).unwrap()).0)
+            .collect();
+        // A merge whose others are all in the trash.
+        for d in &ids[1..3] {
+            f.h.submit_blocking(update(d, UpdateAction::Forget))
+                .unwrap();
+        }
+        let merge_item = add_review(
+            &f,
+            ReviewType::Merge,
+            serde_json::json!({"survivor": ids[0], "others": [ids[1], ids[2]]}),
+            "m",
+        );
+        let err = resolve(&f, &merge_item, "merge").unwrap_err().to_string();
+        assert!(err.contains("nothing is left to merge"), "{err}");
+        assert_eq!(open_state(&f, &merge_item), "open");
+        let n: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action LIKE 'memory.merge%'",
+            [],
+        );
+        assert_eq!(n, 0);
+
+        // A move of a memory in the trash, of one that left `from`, and of one already there.
+        {
+            let c = open(f.dir.path());
+            alice_core::store::projects::upsert_project(
+                &c,
+                &ProjectRef {
+                    key: "k2".into(),
+                    slug: "other".into(),
+                    name: "other".into(),
+                    root: None,
+                    remote: None,
+                },
+            )
+            .unwrap();
+        }
+        let mv = |memory: &str, from: &str, key: &str| {
+            add_review(
+                &f,
+                ReviewType::Project,
+                serde_json::json!({"memory_id": memory, "from": from, "to": "other"}),
+                key,
+            )
+        };
+        let trashed = mv(&ids[1], "global", "t");
+        let err = resolve(&f, &trashed, "move").unwrap_err().to_string();
+        assert!(err.contains("in the trash"), "{err}");
+        let wrong_from = mv(&ids[3], "other", "w");
+        let err = resolve(&f, &wrong_from, "move").unwrap_err().to_string();
+        assert!(err.contains("no longer in project other"), "{err}");
+        let ok = mv(&ids[3], "global", "ok");
+        resolve(&f, &ok, "move").unwrap();
+        let there = mv(&ids[3], "global", "there");
+        let err = resolve(&f, &there, "move").unwrap_err().to_string();
+        assert!(err.contains("already in project other"), "{err}");
+        for i in [&trashed, &wrong_from, &there] {
+            assert_eq!(open_state(&f, i), "open");
+        }
+        let moves: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'memory.move'",
+            [],
+        );
+        assert_eq!(moves, 1, "no no-op move event");
+    }
+
+    #[test]
+    fn an_already_superseded_or_archived_memory_is_not_superseded_again() {
+        let f = fixture();
+        let (old, _) = new_id(f.h.submit_blocking(remember("v1")).unwrap());
+        let (v2, _) = new_id(f.h.submit_blocking(remember("v2")).unwrap());
+        let (v3, _) = new_id(f.h.submit_blocking(remember("v3")).unwrap());
+        let item = |new: &str, key: &str| {
+            add_review(
+                &f,
+                ReviewType::Supersede,
+                serde_json::json!({"new_id": new, "old_id": old}),
+                key,
+            )
+        };
+        let (a, b) = (item(&v2, "a"), item(&v3, "b"));
+        resolve(&f, &a, "accept").unwrap();
+        let err = resolve(&f, &b, "accept").unwrap_err().to_string();
+        assert!(err.contains("already superseded"), "{err}");
+        assert_eq!(open_state(&f, &b), "open");
+        f.h.submit_blocking(update(&v3, UpdateAction::Archive))
+            .unwrap();
+        let c = add_review(
+            &f,
+            ReviewType::Contradiction,
+            serde_json::json!({"new_id": v3, "old_id": v2}),
+            "c",
+        );
+        let err = resolve(&f, &c, "keep_new").unwrap_err().to_string();
+        assert!(err.contains("already archived"), "{err}");
+    }
+
+    #[test]
+    fn undoing_an_accepted_supersede_restores_status_and_links_and_the_item_stays_resolved() {
+        let f = fixture();
+        let (old, _) = new_id(f.h.submit_blocking(remember("port is 8080")).unwrap());
+        let (new, _) = new_id(f.h.submit_blocking(remember("port is 9090")).unwrap());
+        let before_links: i64 = f.read("SELECT count(*) FROM links", []);
+        let item = add_review(
+            &f,
+            ReviewType::Supersede,
+            serde_json::json!({"new_id": new, "old_id": old}),
+            "s",
+        );
+        resolve(&f, &item, "accept").unwrap();
+        assert_eq!(status_of(&f, &old), "superseded");
+        let ev = event_of(&f, "memory.supersede", &old);
+        undo(&f, &ev).unwrap();
+        assert_eq!(status_of(&f, &old), "active");
+        let links: i64 = f.read("SELECT count(*) FROM links", []);
+        assert_eq!(links, before_links, "the supersedes link went with it");
+        assert_eq!(open_state(&f, &item), "resolved");
+    }
+
+    #[test]
+    fn undoing_a_move_restores_the_project_and_the_content_hash() {
+        let f = fixture();
+        {
+            let c = open(f.dir.path());
+            alice_core::store::projects::upsert_project(
+                &c,
+                &ProjectRef {
+                    key: "k2".into(),
+                    slug: "other".into(),
+                    name: "other".into(),
+                    root: None,
+                    remote: None,
+                },
+            )
+            .unwrap();
+        }
+        let (m, _) = new_id(f.h.submit_blocking(remember("move and come back")).unwrap());
+        let snapshot = |f: &Fixture| -> (String, String) {
+            (
+                f.read("SELECT project_id FROM memories WHERE id = ?1", [&m]),
+                f.read("SELECT content_hash FROM memories WHERE id = ?1", [&m]),
+            )
+        };
+        let before = snapshot(&f);
+        let item = add_review(
+            &f,
+            ReviewType::Project,
+            serde_json::json!({"memory_id": m, "from": "global", "to": "other"}),
+            "mv",
+        );
+        resolve(&f, &item, "move").unwrap();
+        let moved = snapshot(&f);
+        assert_ne!(moved, before);
+        undo(&f, &event_of(&f, "memory.move", &m)).unwrap();
+        assert_eq!(snapshot(&f), before);
+        let slug: String = f.read(
+            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
+            [&m],
+        );
+        assert_eq!(slug, "global");
+    }
+
+    #[test]
+    fn undoing_a_merge_by_review_reverts_the_duplicates_and_the_survivor_event() {
+        let f = fixture();
+        let ids: Vec<String> = ["survivor", "dup one", "dup two"]
+            .iter()
+            .map(|t| new_id(f.h.submit_blocking(remember(t)).unwrap()).0)
+            .collect();
+        let links_before: i64 = f.read("SELECT count(*) FROM links", []);
+        let item = add_review(
+            &f,
+            ReviewType::Merge,
+            serde_json::json!({"survivor": ids[0], "others": [ids[1], ids[2]]}),
+            "m",
+        );
+        resolve(&f, &item, "merge").unwrap();
+        let ev = event_of(&f, "memory.merge", &ids[1]);
+        let WriteOutcome::Undo(UndoOutcome::Undone { reverted, .. }) = undo(&f, &ev).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            reverted.len(),
+            3,
+            "two duplicates and the survivor: {reverted:?}"
+        );
+        for d in &ids[1..] {
+            assert_ne!(status_of(&f, d), "trashed");
+        }
+        let links: i64 = f.read("SELECT count(*) FROM links", []);
+        assert_eq!(links, links_before, "no duplicate_of link is left");
+    }
+
+    #[test]
+    fn a_predicate_mapping_by_review_is_undone_to_the_letter() {
+        let f = fixture();
+        for (p, o) in [("uses", "SQLite"), ("use", "Rust")] {
+            f.h.submit_blocking(WriteOp::AssertFact {
+                fact: AssertFact {
+                    subject: "alice".into(),
+                    predicate: p.into(),
+                    object: o.into(),
+                    ..Default::default()
+                },
+                actor: Actor::User,
+            })
+            .unwrap();
+        }
+        let rels = |f: &Fixture| -> String {
+            f.read("SELECT group_concat(id || predicate, ',') FROM (SELECT * FROM relations ORDER BY id)", [])
+        };
+        let preds = |f: &Fixture| -> String {
+            f.read("SELECT group_concat(name || ':' || COALESCE(canonical, '-'), ',') FROM (SELECT * FROM predicates ORDER BY name)", [])
+        };
+        let (r0, p0) = (rels(&f), preds(&f));
+        let item = add_review(
+            &f,
+            ReviewType::Predicate,
+            serde_json::json!({"predicate": "uses", "canonical": "use"}),
+            "p",
+        );
+        resolve(&f, &item, "map").unwrap();
+        assert_ne!(rels(&f), r0);
+        undo(&f, &event_of(&f, "predicate.map", "uses")).unwrap();
+        assert_eq!((rels(&f), preds(&f)), (r0, p0));
     }
 }

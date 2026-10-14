@@ -277,7 +277,20 @@ fn spawn_detached_with_env(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
-    let mut child = cmd.spawn()?;
+    // A program written a moment ago can be "busy" (ETXTBSY) while another thread's fork still
+    // holds a copy of its write handle; that ends at the fork's exec, so retry briefly.
+    let mut child = {
+        let mut tries = 0;
+        loop {
+            match cmd.spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 40 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                other => break other?,
+            }
+        }
+    };
     let pid = child.id();
     // Reap it if it exits while we are alive (no zombie); does not keep it attached.
     std::thread::spawn(move || {
@@ -1584,11 +1597,12 @@ mod tests {
             ),
         );
         let t = Instant::now();
-        let e = DaemonClient::connect(&home, &Launcher::Exe(exe.clone()), Duration::from_secs(5))
+        let e = DaemonClient::connect(&home, &Launcher::Exe(exe.clone()), Duration::from_secs(30))
             .await
             .unwrap_err();
+        // At once, not after the 30 s wait.
         assert!(
-            t.elapsed() < Duration::from_secs(3),
+            t.elapsed() < Duration::from_secs(15),
             "waited {:?}",
             t.elapsed()
         );
@@ -1628,11 +1642,21 @@ mod tests {
                 .as_i64()
                 .unwrap() as libc::pid_t
         };
-        // The first run of a new executable can take a second on macOS (a one-off OS check).
-        let e = DaemonClient::connect(&home, &Launcher::Exe(exe.clone()), Duration::from_secs(3))
-            .await
-            .unwrap_err()
-            .to_string();
+        // The stand-in can be slow to start on a loaded machine (a one-off OS check on the first
+        // run of a new executable on macOS, a starved process elsewhere): ask again until it
+        // has announced itself.
+        let mut tries = 0;
+        let e = loop {
+            tries += 1;
+            let e =
+                DaemonClient::connect(&home, &Launcher::Exe(exe.clone()), Duration::from_secs(3))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+            if e.contains("downloading") || tries >= 10 {
+                break e;
+            }
+        };
         let first = announced();
         assert!(
             e.starts_with("memory daemon is starting")

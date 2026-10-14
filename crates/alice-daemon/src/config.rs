@@ -239,7 +239,7 @@ pub fn load_effective(home: &AliceHome) -> Effective {
     effective(&home.config_file(), &process_env())
 }
 
-pub(crate) fn effective(file: &Path, env: &[(String, String)]) -> Effective {
+fn effective(file: &Path, env: &[(String, String)]) -> Effective {
     let env = EnvLayer::new(env);
     let (resolved, mut errors) = resolve_layers(&read_config(file), &env);
     let degraded = !errors.is_empty();

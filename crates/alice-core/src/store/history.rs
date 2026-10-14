@@ -8,7 +8,7 @@ use crate::normalize::content_hash;
 use crate::redact::Redactor;
 use crate::store::events::{self, Actor, EventInput, EventRow};
 use crate::store::reviews::{self, NewReview, ReviewType};
-use crate::store::{fts, memories};
+use crate::store::{fts, kg, memories};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -129,6 +129,8 @@ fn to_json<T: Serialize>(v: T) -> Result<serde_json::Value> {
 enum Target {
     Memory,
     Relation,
+    /// A predicate mapping: the vocabulary rows and relations it touched.
+    Predicate,
 }
 
 /// Undo knows memories and relations; any other target type is refused as such.
@@ -136,17 +138,34 @@ fn target_kind(target_type: &str) -> Result<Target> {
     match target_type {
         "memory" => Ok(Target::Memory),
         "relation" => Ok(Target::Relation),
+        "predicate" => Ok(Target::Predicate),
         other => Err(AliceError::invalid(format!(
-            "changes to a {other} cannot be undone; only memory and fact changes can"
+            "changes to a {other} cannot be undone; only memory, fact and predicate changes can"
         ))),
     }
 }
 
 /// The target as it is now, in the form events record (`None`: the row does not exist).
-fn current(conn: &Connection, target_type: &str, id: &str) -> Result<Option<serde_json::Value>> {
+/// `spec` is a recorded state of the same target: a predicate mapping names the vocabulary
+/// entries and relations it touched there.
+fn current(
+    conn: &Connection,
+    target_type: &str,
+    id: &str,
+    spec: Option<&serde_json::Value>,
+) -> Result<Option<serde_json::Value>> {
     match target_kind(target_type)? {
         Target::Memory => snapshot_memory(conn, id)?.map(to_json).transpose(),
         Target::Relation => snapshot_relation(conn, id)?.map(to_json).transpose(),
+        Target::Predicate => {
+            let Some(spec) = spec else { return Ok(None) };
+            let spec: kg::PredicateSnapshot =
+                serde_json::from_value(spec.clone()).map_err(|e| {
+                    AliceError::invalid(format!("the recorded mapping is unreadable ({e})"))
+                })?;
+            let ids: Vec<String> = spec.relations.iter().map(|(i, _)| i.clone()).collect();
+            to_json(kg::snapshot_predicates(conn, &spec.names, &ids)?).map(Some)
+        }
     }
 }
 
@@ -484,8 +503,8 @@ fn undo_with(
         if !checked.insert((e.target_type.as_str(), e.target_id.as_str())) {
             continue;
         }
-        let now = current(conn, &e.target_type, &e.target_id)?;
         let (_, after) = states(conn, e)?;
+        let now = current(conn, &e.target_type, &e.target_id, after.as_ref())?;
         if now.is_none() && after.is_some() {
             return Err(AliceError::invalid(format!(
                 "{} {} was purged from the trash; it cannot be restored",
@@ -523,8 +542,8 @@ fn undo_with(
     let mut reverted = Vec::new();
     for e in &todo {
         let h = hlc();
-        let before_now = current(conn, &e.target_type, &e.target_id)?;
         let (before, after) = states(conn, e)?;
+        let before_now = current(conn, &e.target_type, &e.target_id, after.as_ref())?;
         let bad = |err: serde_json::Error| {
             AliceError::invalid(format!(
                 "event {}: its recorded state is unreadable ({err}); it cannot be undone",
@@ -540,7 +559,7 @@ fn undo_with(
             // in the trash for 30 days).
             (Target::Memory, None) if e.action == "memory.create" => {
                 let mut s: MemorySnapshot =
-                    serde_json::from_value(after.unwrap_or_default()).map_err(bad)?;
+                    serde_json::from_value(after.clone().unwrap_or_default()).map_err(bad)?;
                 s.status = Status::Trashed;
                 // It only goes to the trash: redact what it holds, never refuse.
                 restore_memory(
@@ -560,6 +579,16 @@ fn undo_with(
                 let s: RelationSnapshot = serde_json::from_value(b).map_err(bad)?;
                 restore_relation(conn, &e.target_id, Some(&s), &h, redact)?;
             }
+            (Target::Predicate, Some(b)) => {
+                let s: kg::PredicateSnapshot = serde_json::from_value(b).map_err(bad)?;
+                kg::restore_predicates(conn, &s, &h)?;
+            }
+            (Target::Predicate, None) => {
+                return Err(AliceError::invalid(format!(
+                    "event {} ({}) records no before-state for predicate {}; it cannot be undone",
+                    e.id, e.action, e.target_id
+                )));
+            }
             // Only an add has no relation before it: undoing it deletes the relation.
             (Target::Relation, None) if e.action == "relation.add" => {
                 restore_relation(conn, &e.target_id, None, &h, redact)?;
@@ -571,7 +600,7 @@ fn undo_with(
                 )));
             }
         }
-        let mut after_now = current(conn, &e.target_type, &e.target_id)?;
+        let mut after_now = current(conn, &e.target_type, &e.target_id, after.as_ref())?;
         let mut before_now = before_now;
         scrub_snapshots(conn, redact, &mut before_now, &mut after_now);
         events::record(
@@ -1457,5 +1486,114 @@ mod tests {
             !rows.is_empty() && rows.iter().all(|r| !r.contains(token)),
             "{rows:?}"
         );
+    }
+
+    /// A predicate mapping is recorded with everything it touched, and undone to the letter.
+    #[test]
+    fn undo_of_a_predicate_mapping_restores_the_vocabulary_and_every_relation() {
+        let mut t = T::new();
+        for (p, o) in [("uses", "SQLite"), ("uses", "Rust"), ("use", "Tokio")] {
+            let h = t.hlc();
+            kg::assert_fact(
+                &t.c,
+                &AssertFact {
+                    subject: "alice".into(),
+                    predicate: p.into(),
+                    object: o.into(),
+                    action: FactAction::Add,
+                    ..Default::default()
+                },
+                h,
+            )
+            .unwrap();
+        }
+        t.c.execute(
+            "INSERT INTO predicates (name, canonical) VALUES ('employs', 'uses')",
+            [],
+        )
+        .unwrap();
+        type Vocabulary = (Vec<(String, Option<String>)>, Vec<(String, String)>);
+        let state = |t: &T| -> Vocabulary {
+            let rows =
+                t.c.prepare("SELECT name, canonical FROM predicates ORDER BY name")
+                    .unwrap()
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+            let rels =
+                t.c.prepare("SELECT id, predicate FROM relations ORDER BY id")
+                    .unwrap()
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+            (rows, rels)
+        };
+        let before = state(&t);
+        let h = t.hlc();
+        let (b, a) = kg::map_predicate_recorded(&t.c, "uses", "use", &h).unwrap();
+        assert_ne!(state(&t), before);
+        let ev = t.record(
+            EventInput {
+                actor: &Actor::User,
+                action: "predicate.map",
+                target_type: "predicate",
+                target_id: "uses",
+                before: Some(serde_json::to_value(&b).unwrap()),
+                after: Some(serde_json::to_value(&a).unwrap()),
+                group: None,
+            },
+            &h,
+        );
+        t.undo(&ev).unwrap();
+        assert_eq!(
+            state(&t),
+            before,
+            "relations and alias rows are as they were"
+        );
+        let err = t.undo(&ev).unwrap_err().to_string();
+        assert!(err.contains("already undone"), "{err}");
+        // Redo (undo of the undo) maps again; a later change to a touched relation stops an undo.
+        let marker = t.reverting(&ev, "undo:predicate.map");
+        t.undo(&marker.id).unwrap();
+        assert_ne!(state(&t), before);
+        t.c.execute("UPDATE relations SET predicate = 'other' WHERE predicate = 'use' AND id = (SELECT min(id) FROM relations)", [])
+            .unwrap();
+        let ev2 = t.reverting(&marker.id, "undo:undo:predicate.map").id;
+        assert!(matches!(
+            t.undo(&ev2).unwrap(),
+            UndoOutcome::Conflict { .. }
+        ));
+    }
+
+    #[test]
+    fn restoring_a_merged_duplicate_by_hand_drops_its_duplicate_link() {
+        let mut t = T::new();
+        let a = t.remember("survivor");
+        let b = t.remember("duplicate");
+        let h = t.hlc();
+        memories::merge_into(&t.c, &a, std::slice::from_ref(&b), &h).unwrap();
+        let links = |t: &T| -> i64 {
+            t.c.query_row(
+                "SELECT count(*) FROM links WHERE from_id = ?1 AND type = 'duplicate_of'",
+                [&b],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(links(&t), 1);
+        let h = t.hlc();
+        memories::apply_update(
+            &t.c,
+            &b,
+            &MemoryUpdate {
+                action: UpdateAction::Restore,
+                ..Default::default()
+            },
+            h,
+        )
+        .unwrap();
+        assert_eq!((links(&t), t.status(&b).as_str()), (0, "active"));
     }
 }

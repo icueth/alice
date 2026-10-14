@@ -221,6 +221,9 @@ pub struct GetResponse {
     /// asked for, `to` the survivor, which is in `memories`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redirects: Vec<Redirect>,
+    /// Things worth knowing about the answer (a merge chain that was cut short).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// A merged duplicate and the memory that replaced it.

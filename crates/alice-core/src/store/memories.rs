@@ -619,7 +619,14 @@ pub fn apply_update(conn: &Connection, id: &str, u: &MemoryUpdate, hlc: String) 
         }
         UpdateAction::Archive => status_change(Status::Archived)?,
         UpdateAction::Forget => status_change(Status::Trashed)?,
-        UpdateAction::Restore => status_change(Status::Active)?,
+        UpdateAction::Restore => {
+            status_change(Status::Active)?;
+            // Restored by hand, it is no longer a merged duplicate: `get` stops redirecting.
+            conn.execute(
+                "DELETE FROM links WHERE from_id = ?1 AND type = 'duplicate_of'",
+                [&current.id],
+            )?;
+        }
     }
     let (_, updated) = get_by_seqs(conn, &[seq])?
         .pop()

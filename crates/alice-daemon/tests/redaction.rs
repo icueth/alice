@@ -883,6 +883,10 @@ async fn resolutions_never_write_text_the_privacy_rules_would_change() {
         serde_json::json!({"memory_id": m.id.clone().unwrap(), "from": "loose", "to": strict, "p": 0.8, "provider": "heuristic"}),
         "mv",
     );
+    // Block mode: refused naming the detector, and the memory stays where it was.
+    let mut block = serde_json::Map::new();
+    block.insert("privacy.redact_mode".into(), serde_json::json!("block"));
+    s.settings_handle().patch(&block).unwrap();
     let err = resolve(&s, &mv, "move").unwrap_err().to_string();
     assert!(
         err.contains("custom:ticket") && err.contains("cannot move") && !err.contains("TCK-12345"),
@@ -890,21 +894,55 @@ async fn resolutions_never_write_text_the_privacy_rules_would_change() {
     );
     let item = s.review(mv.clone()).await.unwrap();
     assert_eq!(item.status, alice_core::store::reviews::ReviewStatus::Open);
-    let project: String = {
+    let where_is = |s: &Service| -> (String, String) {
         let c = alice_core::store::open_reader(&s.home().db()).unwrap();
         c.query_row(
-            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
+            "SELECT p.slug, m.body FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
             [m.id.as_ref().unwrap()],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap()
     };
-    assert_ne!(project, strict, "the memory stayed where it was");
+    assert_ne!(where_is(&s).0, strict, "the memory stayed where it was");
+    // Redact mode: moved, and re-redacted with the destination's rules in the same group.
+    s.settings_handle().patch(&redact).unwrap();
+    resolve(&s, &mv, "move").unwrap();
+    let (slug, body) = where_is(&s);
+    assert_eq!(slug, strict);
+    assert_eq!(body, "see [REDACTED:custom:ticket] for details");
+    let c = alice_core::store::open_reader(&s.home().db()).unwrap();
+    let actions: String = c
+        .query_row(
+            "SELECT group_concat(action, ',') FROM (SELECT action FROM events WHERE group_id = (SELECT group_id FROM events WHERE action = 'memory.move') ORDER BY rowid)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(actions, "memory.move,memory.edit");
+    // Undo of the move restores the original text and the project.
+    let ev: String = c
+        .query_row(
+            "SELECT id FROM events WHERE action = 'memory.move'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let u = s
+        .undo(UndoRequest {
+            event_id: ev,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(u.undone, "{}", u.message);
+    let (slug, body) = where_is(&s);
+    assert_ne!(slug, strict);
+    assert_eq!(body, "see TCK-12345 for details");
     // A move into a project with no such rule goes through.
     let other = add_review(
         &s,
         ReviewType::Project,
-        serde_json::json!({"memory_id": m.id.unwrap(), "from": "loose", "to": "global", "p": 0.8, "provider": "heuristic"}),
+        serde_json::json!({"memory_id": m.id.clone().unwrap(), "from": &where_is(&s).0, "to": "global", "p": 0.8, "provider": "heuristic"}),
         "mv2",
     );
     resolve(&s, &other, "move").unwrap();

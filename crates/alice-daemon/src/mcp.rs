@@ -48,7 +48,7 @@ pub const INSTRUCTIONS: &str = "Alice is your long-term memory, shared with the 
 const READ_WAIT: Duration = Duration::from_secs(5);
 /// The tools that are offered only while `mcp.admin_tools` is on.
 const ADMIN_TOOLS: [&str; 4] = ["review_list", "review_resolve", "merge_memories", "stats"];
-/// How long `alice mcp` trusts its last read of `config.toml` for the admin-tools switch.
+/// How long `alice mcp` trusts the daemon's last answer about the admin-tools switch.
 const ADMIN_SWITCH_TTL: Duration = Duration::from_secs(1);
 /// How long the client gets to answer `roots/list`.
 const ROOTS_TIMEOUT: Duration = Duration::from_millis(300);
@@ -58,10 +58,10 @@ pub struct RemoteBackend {
     launcher: Launcher,
     cwd: Option<String>,
     client: tokio::sync::Mutex<Option<DaemonClient>>,
-    /// The last reading of `mcp.admin_tools` from the configuration, and when.
+    /// The daemon's last answer about `mcp.admin_tools`, and when it came.
     admin_switch: parking_lot::Mutex<Option<(std::time::Instant, bool)>>,
-    /// Tests: the `ALICE_*` variables to read instead of the process's own.
-    settings_env: Option<Vec<(String, String)>>,
+    /// How long that answer is trusted.
+    admin_ttl: Duration,
 }
 
 impl RemoteBackend {
@@ -72,32 +72,40 @@ impl RemoteBackend {
             cwd,
             client: tokio::sync::Mutex::new(None),
             admin_switch: parking_lot::Mutex::new(None),
-            settings_env: None,
+            admin_ttl: ADMIN_SWITCH_TTL,
         }
     }
 
-    /// Read `ALICE_*` settings from `env` instead of this process's environment (tests).
-    pub fn with_settings_env(mut self, env: Vec<(String, String)>) -> Self {
-        self.settings_env = Some(env);
+    /// Trust the daemon's answer about the admin tools for `ttl` (tests use zero).
+    pub fn with_admin_ttl(mut self, ttl: Duration) -> Self {
+        self.admin_ttl = ttl;
         self
     }
 
-    /// `mcp.admin_tools` as `config.toml` and the `ALICE_*` variables say now (no daemon round
-    /// trip, so `alice mcp` stays quick to start). Read again after `ADMIN_SWITCH_TTL`.
-    fn admin_tools(&self) -> bool {
-        let mut last = self.admin_switch.lock();
-        if let Some((at, on)) = *last
-            && at.elapsed() < ADMIN_SWITCH_TTL
+    /// `mcp.admin_tools` as the running daemon has it (its ratchet and its audit apply), asked
+    /// at most once per `admin_ttl`. No daemon, or one that does not answer: off. This never
+    /// starts a daemon.
+    async fn admin_tools(&self) -> bool {
+        if let Some((at, on)) = *self.admin_switch.lock()
+            && at.elapsed() < self.admin_ttl
         {
             return on;
         }
-        let effective = match &self.settings_env {
-            Some(env) => crate::config::effective(&self.home.config_file(), env),
-            None => crate::config::load_effective(&self.home),
+        let on = match DaemonClient::try_existing(&self.home).await {
+            Some(c) => c
+                .settings()
+                .await
+                .map(|v| v.settings["mcp"]["admin_tools"].as_bool() == Some(true))
+                .unwrap_or(false),
+            None => false,
         };
-        let on = effective.resolved.settings.mcp.admin_tools;
-        *last = Some((std::time::Instant::now(), on));
+        *self.admin_switch.lock() = Some((std::time::Instant::now(), on));
         on
+    }
+
+    /// The last answer, without asking again (off before the first).
+    fn admin_tools_cached(&self) -> bool {
+        self.admin_switch.lock().is_some_and(|(_, on)| on)
     }
 
     /// Connect lazily (keeps `alice mcp` start-up fast). A cached client is re-checked with
@@ -134,12 +142,19 @@ impl Backend {
             Backend::Remote(r) => r.cwd.clone(),
         }
     }
-    /// Whether the admin tools are on right now: the daemon's live setting, or for `alice mcp`
-    /// the configuration. Asked per request, never remembered by the server.
-    fn admin_tools(&self) -> bool {
+    /// Whether the admin tools are on right now: the daemon's live setting, which `alice mcp`
+    /// asks the daemon for (off when none answers). Asked per request.
+    async fn admin_tools(&self) -> bool {
         match self {
             Backend::Local(s) => s.settings().mcp.admin_tools,
-            Backend::Remote(b) => b.admin_tools(),
+            Backend::Remote(b) => b.admin_tools().await,
+        }
+    }
+    /// [`admin_tools`](Self::admin_tools) without waiting for an answer (`get_tool` is not async).
+    fn admin_tools_cached(&self) -> bool {
+        match self {
+            Backend::Local(s) => s.settings().mcp.admin_tools,
+            Backend::Remote(b) => b.admin_tools_cached(),
         }
     }
     async fn reviews(&self, q: ReviewQuery) -> AliceResult<Vec<ReviewItem>> {
@@ -297,11 +312,11 @@ impl AliceMcp {
         }
     }
 
-    /// Whether `tool` may be listed or called now: every tool but the admin ones always; those
-    /// only while `mcp.admin_tools` is on, read at each request so a change applies to
-    /// connections that are already open.
-    fn tool_allowed(&self, tool: &str) -> bool {
-        !ADMIN_TOOLS.contains(&tool) || self.backend.admin_tools()
+    /// Whether `tool` may be called now: every tool but the admin ones always; those only while
+    /// `mcp.admin_tools` is on, read at each request so a change applies to connections that
+    /// are already open.
+    async fn tool_allowed(&self, tool: &str) -> bool {
+        !ADMIN_TOOLS.contains(&tool) || self.backend.admin_tools().await
     }
 
     /// Working directory for project detection (spec §8.1): the client's first root when it
@@ -508,7 +523,7 @@ pub struct NoArgs {}
 #[tool_router(router = admin_tool_router)]
 impl AliceMcp {
     #[tool(
-        description = "List review items Alice could not decide alone (duplicates, updates, contradictions), with their choices.",
+        description = "List review items Alice could not decide alone (duplicates, updates, contradictions), with their choices. Items span all projects.",
         annotations(read_only_hint = true)
     )]
     async fn review_list(
@@ -636,7 +651,7 @@ impl ServerHandler for AliceMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         // Off: an admin tool answers as a tool that does not exist.
-        if !self.tool_allowed(&request.name) {
+        if !self.tool_allowed(&request.name).await {
             return Err(McpError::invalid_params("tool not found", None));
         }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
@@ -651,7 +666,7 @@ impl ServerHandler for AliceMcp {
         let cache_hints = context
             .protocol_version()
             .is_some_and(|v| v >= ProtocolVersion::V_2026_07_28);
-        let admin = self.backend.admin_tools();
+        let admin = self.backend.admin_tools().await;
         let tools = self
             .tool_router
             .list_all()
@@ -669,7 +684,7 @@ impl ServerHandler for AliceMcp {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        if !self.tool_allowed(name) {
+        if ADMIN_TOOLS.contains(&name) && !self.backend.admin_tools_cached() {
             return None;
         }
         self.tool_router.get(name).cloned()

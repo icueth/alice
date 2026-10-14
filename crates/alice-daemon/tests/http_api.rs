@@ -1481,3 +1481,94 @@ async fn merged_duplicates_answer_with_their_survivor() {
         .await;
     assert!(got.redirects.is_empty() && got.memories[0].memory.id == ids[1]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redirects_follow_chains_stop_at_eight_and_a_hand_restore_ends_them() {
+    let s = Srv::start().await;
+    let mut ids = Vec::new();
+    for i in 0..11 {
+        let r: RememberResponse = s
+            .post_json(
+                "/api/v1/remember",
+                &serde_json::json!({"content": format!("version {i}")}),
+            )
+            .await;
+        ids.push(r.id.unwrap());
+    }
+    // A -> B -> C.
+    for w in ids[..3].windows(2) {
+        let _: MergeResponse = s
+            .post_json(
+                "/api/v1/memories/merge",
+                &serde_json::json!({"survivor": w[1], "others": [w[0]]}),
+            )
+            .await;
+    }
+    let got: GetResponse = s
+        .post_json("/api/v1/get", &serde_json::json!({"ids": [ids[0]]}))
+        .await;
+    assert_eq!(got.memories.len(), 1);
+    assert_eq!(got.memories[0].memory.id, ids[2], "the end of the chain");
+    assert_eq!(
+        got.redirects,
+        vec![
+            Redirect {
+                from: ids[0].clone(),
+                to: ids[1].clone()
+            },
+            Redirect {
+                from: ids[1].clone(),
+                to: ids[2].clone()
+            },
+        ]
+    );
+    assert!(got.notes.is_empty());
+    // A chain of ten steps is cut at eight, and says so.
+    for w in ids[2..].windows(2) {
+        let _: MergeResponse = s
+            .post_json(
+                "/api/v1/memories/merge",
+                &serde_json::json!({"survivor": w[1], "others": [w[0]]}),
+            )
+            .await;
+    }
+    let got: GetResponse = s
+        .post_json("/api/v1/get", &serde_json::json!({"ids": [ids[0]]}))
+        .await;
+    assert_eq!(got.redirects.len(), 8, "{:?}", got.redirects);
+    assert_eq!(got.memories[0].memory.id, ids[8]);
+    assert!(got.notes[0].contains("longer than 8"), "{:?}", got.notes);
+    // Restoring a duplicate by hand makes it itself again: no link, no redirect.
+    let restored: MemoryFull = s
+        .post_json(
+            "/api/v1/update",
+            &serde_json::json!({"id": ids[0], "action": "restore"}),
+        )
+        .await;
+    assert_eq!(restored.memory.id, ids[0]);
+    let got: GetResponse = s
+        .post_json("/api/v1/get", &serde_json::json!({"ids": [ids[0]]}))
+        .await;
+    assert!(got.redirects.is_empty() && got.memories[0].memory.id == ids[0]);
+    // It can be forgotten and fetched again without being sent to its old survivor.
+    let _: MemoryFull = s
+        .post_json(
+            "/api/v1/update",
+            &serde_json::json!({"id": ids[0], "action": "forget"}),
+        )
+        .await;
+    let got: GetResponse = s
+        .post_json("/api/v1/get", &serde_json::json!({"ids": [ids[0]]}))
+        .await;
+    assert!(got.redirects.is_empty() && got.memories[0].memory.id == ids[0]);
+    // The merge request is capped.
+    let many: Vec<String> = (0..51).map(|i| format!("X{i}")).collect();
+    let r = s
+        .post(
+            "/api/v1/memories/merge",
+            &serde_json::json!({"survivor": ids[10], "others": many}),
+        )
+        .await;
+    assert_eq!(r.status(), 400);
+    assert!(r.text().await.unwrap().contains("limit of 50"));
+}

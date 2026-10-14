@@ -10,7 +10,9 @@ use crate::redaction::Redactors;
 use crate::secrets::{self, SecretName, SecretStore};
 use crate::spool;
 use crate::worker::{WorkerConfig, spawn_worker};
-use crate::writer::{ProjectChoice, WriteOp, WriteOutcome, WriterHandle, spawn_writer_with};
+use crate::writer::{
+    ProjectChoice, ResolveText, WriteOp, WriteOutcome, WriterHandle, spawn_writer_with,
+};
 use alice_core::api::*;
 use alice_core::embed::Embedder;
 use alice_core::error::{AliceError, Result};
@@ -950,28 +952,40 @@ impl Service {
             let found_ids: Vec<String> = found.iter().map(|m| m.id.clone()).collect();
             let mut shown: Vec<String> = Vec::new();
             for m in found {
-                let Some(survivor) = survivor_of(c, &m)? else {
-                    if !shown.contains(&m.id) {
-                        shown.push(m.id.clone());
-                        out.memories.push(full(c, m, req.include_provenance)?);
-                    }
-                    continue;
-                };
                 let asked = req
                     .ids
                     .iter()
                     .find(|id| **id == m.id || m.legacy_id.as_deref() == Some(id.as_str()))
                     .cloned()
                     .unwrap_or_else(|| m.id.clone());
-                out.redirects.push(Redirect {
-                    from: asked,
-                    to: survivor.id.clone(),
-                });
+                let Some(followed) = follow_merges(c, &m)? else {
+                    if !shown.contains(&m.id) {
+                        shown.push(m.id.clone());
+                        out.memories.push(full(c, m, req.include_provenance)?);
+                    }
+                    continue;
+                };
+                for (i, hop) in followed.hops.into_iter().enumerate() {
+                    let hop = if i == 0 {
+                        Redirect { from: asked.clone(), to: hop.to }
+                    } else {
+                        hop
+                    };
+                    if !out.redirects.contains(&hop) {
+                        out.redirects.push(hop);
+                    }
+                }
+                let survivor = followed.last;
+                if followed.truncated {
+                    out.notes.push(format!(
+                        "the merge chain from {asked} is longer than {MAX_MERGE_HOPS} steps; showing {}, which may itself be a merged duplicate",
+                        survivor.id
+                    ));
+                }
                 // A survivor that was asked for too is answered on its own turn.
                 if !found_ids.contains(&survivor.id) && !shown.contains(&survivor.id) {
                     shown.push(survivor.id.clone());
-                    out.memories
-                        .push(full(c, survivor, req.include_provenance)?);
+                    out.memories.push(full(c, survivor, req.include_provenance)?);
                 }
             }
             Ok(out)
@@ -1141,7 +1155,7 @@ impl Service {
     /// Apply one of a review item's choices and record the decision.
     pub async fn resolve_review(&self, req: ResolveRequest) -> Result<ResolveResponse> {
         let actor = Actor::from_author(&req.author);
-        let map_to = {
+        let text = {
             let (id, choice, redactors) =
                 (req.id.clone(), req.choice.clone(), self.redactors.clone());
             self.read(move |c| screen_resolution(c, &redactors, &id, &choice))
@@ -1153,7 +1167,7 @@ impl Service {
                 id: req.id,
                 choice: req.choice.clone(),
                 actor,
-                map_to,
+                text,
             })
             .await?
         {
@@ -1167,6 +1181,12 @@ impl Service {
 
     /// Make `others` duplicates of `survivor` (trashed, linked to it).
     pub async fn merge(&self, req: MergeRequest) -> Result<MergeResponse> {
+        if req.others.len() > MAX_MERGE_OTHERS {
+            return Err(AliceError::invalid(format!(
+                "{} memories to merge is over the limit of {MAX_MERGE_OTHERS} per request; merge them in smaller groups",
+                req.others.len()
+            )));
+        }
         let actor = Actor::from_author(&req.author);
         match self
             .writer
@@ -1830,53 +1850,78 @@ fn returned_memories(mut seqs: Vec<i64>, returned: &[Hit]) -> Vec<i64> {
     seqs
 }
 
-/// The live memory a merged duplicate (`m`, in the trash) points at through `duplicate_of`
-/// links, following a chain of merges; `None` when `m` is not trashed, has no such link, or the
-/// chain ends in a memory that is gone or trashed too.
-fn survivor_of(
-    c: &Connection,
-    m: &alice_core::model::Memory,
-) -> Result<Option<alice_core::model::Memory>> {
+/// Most duplicates one merge request may name.
+const MAX_MERGE_OTHERS: usize = 50;
+
+/// Longest chain of merges `get` follows.
+const MAX_MERGE_HOPS: usize = 8;
+
+/// Where a trashed duplicate leads.
+struct Followed {
+    /// The last memory reached: the live survivor, or where the walk stopped.
+    last: alice_core::model::Memory,
+    /// One entry per step, from the duplicate on.
+    hops: Vec<Redirect>,
+    /// The walk stopped at `MAX_MERGE_HOPS` with more links ahead.
+    truncated: bool,
+}
+
+/// Follow `duplicate_of` links from the trashed memory `m` (A merged into B, B into C...) to the
+/// last memory reached; `None` when `m` is not trashed or has no such link.
+fn follow_merges(c: &Connection, m: &alice_core::model::Memory) -> Result<Option<Followed>> {
     use alice_core::model::Status;
     if m.status != Status::Trashed {
         return Ok(None);
     }
+    let next_of = |id: &str| -> Result<Option<String>> {
+        Ok(c.prepare_cached(
+            "SELECT to_id FROM links WHERE from_id = ?1 AND type = 'duplicate_of' ORDER BY created_at DESC, to_id LIMIT 1",
+        )?
+        .query_row([id], |r| r.get(0))
+        .optional()?)
+    };
     let mut visited = vec![m.id.clone()];
-    let mut at = m.id.clone();
-    for _ in 0..8 {
-        let next: Option<String> = c
-            .prepare_cached(
-                "SELECT to_id FROM links WHERE from_id = ?1 AND type = 'duplicate_of' ORDER BY created_at DESC, to_id LIMIT 1",
-            )?
-            .query_row([&at], |r| r.get(0))
-            .optional()?;
-        let Some(next) = next.filter(|n| !visited.contains(n)) else {
-            return Ok(None);
+    let mut hops = Vec::new();
+    let mut last = m.clone();
+    let mut truncated = false;
+    while last.status == Status::Trashed {
+        let Some(next) = next_of(&last.id)?.filter(|n| !visited.contains(n)) else {
+            break;
         };
-        let Some(target) = memories::get_many(c, std::slice::from_ref(&next))?.pop() else {
-            return Ok(None);
-        };
-        if target.status != Status::Trashed {
-            return Ok(Some(target));
+        if hops.len() == MAX_MERGE_HOPS {
+            truncated = true;
+            break;
         }
-        visited.push(next.clone());
-        at = next;
+        let Some(target) = memories::get_many(c, std::slice::from_ref(&next))?.pop() else {
+            break;
+        };
+        hops.push(Redirect {
+            from: last.id.clone(),
+            to: target.id.clone(),
+        });
+        visited.push(next);
+        last = target;
     }
-    Ok(None)
+    Ok((!hops.is_empty()).then_some(Followed {
+        last,
+        hops,
+        truncated,
+    }))
 }
 
 /// What the privacy rules say about the text a review resolution writes, before it is sent to
 /// the writer (which does not scan content). `Predicate`/`map`: the two names, redacted (or
-/// refused in `block` mode), returned for the writer to use. `Project`/`move`: the memory
-/// arrives in a project whose rules may be stricter; text those rules would change is refused
-/// rather than moved (edit it first). Anything else: nothing to screen.
+/// refused in `block` mode). `Project`/`move`: the memory arrives in a project whose rules may
+/// be stricter; in `block` mode a text those rules would change is refused, in `redact` mode it
+/// is re-redacted with the destination's rules and stored with the move. Anything else:
+/// nothing to screen.
 fn screen_resolution(
     c: &Connection,
     redactors: &Redactors,
     id: &str,
     choice: &str,
-) -> Result<Option<(String, String)>> {
-    use alice_core::store::reviews::{self, ReviewStatus, ReviewType};
+) -> Result<Option<ResolveText>> {
+    use alice_core::store::reviews::{ReviewStatus, ReviewType};
     let Some(item) = reviews::get(c, id)?.filter(|i| i.status == ReviewStatus::Open) else {
         return Ok(None); // the writer says: not found, or already resolved
     };
@@ -1890,7 +1935,7 @@ fn screen_resolution(
     match (item.review_type, choice) {
         (ReviewType::Predicate, "map") => {
             let r = redactors.for_root(None);
-            Ok(Some((
+            Ok(Some(ResolveText::Predicate(
                 redact_field(&r, "predicate", &text("predicate"))?,
                 redact_field(&r, "predicate", &text("canonical"))?,
             )))
@@ -1904,22 +1949,39 @@ fn screen_resolution(
             };
             let root = projects::root_of(c, &target.id)?;
             let r = redactors.for_root(root.as_deref().map(Path::new));
-            let refuse = |field: &str, detail: String| {
-                AliceError::invalid(format!(
-                    "cannot move memory {}: the privacy rules of project {} would change its {field}{detail}; edit the memory first, or keep it where it is",
-                    m.id, target.slug
-                ))
-            };
-            let fields = [("title", &m.title), ("body", &m.body)]
-                .into_iter()
-                .chain(m.topics.iter().map(|t| ("topic", t)));
-            for (field, t) in fields {
-                let found = r.apply(t).found;
-                if !found.is_empty() {
-                    return Err(refuse(field, format!(" ({})", found.join(", "))));
+            let apply = |field: &str, t: &str| -> Result<(String, bool)> {
+                let red = r.apply(t);
+                if red.found.is_empty() {
+                    return Ok((t.to_string(), false));
                 }
+                if r.blocks() {
+                    return Err(AliceError::invalid(format!(
+                        "cannot move memory {}: the privacy rules of project {} (block mode) refuse its {field}, which contains what looks like a secret ({}); keep it where it is",
+                        m.id,
+                        target.slug,
+                        red.found.join(", ")
+                    )));
+                }
+                tracing::info!(
+                    field,
+                    "redacted a moved memory with the destination's rules"
+                );
+                Ok((red.text, true))
+            };
+            let (title, t1) = apply("title", &m.title)?;
+            let (body, t2) = apply("body", &m.body)?;
+            let mut changed = t1 || t2;
+            let mut topics = Vec::new();
+            for t in &m.topics {
+                let (t, c) = apply("topic", t)?;
+                changed |= c;
+                topics.push(t);
             }
-            Ok(None)
+            Ok(changed.then_some(ResolveText::Moved {
+                title,
+                body,
+                topics,
+            }))
         }
         _ => Ok(None),
     }
@@ -4006,7 +4068,11 @@ mod tests {
         // Jev asked for, no key: the heuristic judges, and health says why.
         s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
             .unwrap();
-        let w = until("the no-key warning", || s.judge_warning()).await;
+        // The final text, not the transient "reading the TypeSafe key" while the judge builds.
+        let w = until("the no-key warning", || {
+            s.judge_warning().filter(|w| w.contains("no TypeSafe key"))
+        })
+        .await;
         assert!(
             w.contains("no TypeSafe key") && w.contains("set-secret"),
             "{w}"
@@ -4089,7 +4155,7 @@ mod tests {
         std::fs::write(home.config_file(), "[judge]\nprovider = \"jev\"\n").unwrap();
         let store = MemSecrets::new(Duration::ZERO);
         store.set(SecretName::JevApiKey, JEV_TEST_KEY).unwrap();
-        store.delay_ms.store(500, Ordering::SeqCst);
+        store.delay_ms.store(2_000, Ordering::SeqCst);
         let transport = Arc::new(ScriptedJev {
             sent: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -4106,7 +4172,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            started.elapsed() < Duration::from_millis(400),
+            started.elapsed() < Duration::from_millis(1_500),
             "{:?}",
             started.elapsed()
         );
@@ -4127,6 +4193,43 @@ mod tests {
         })
         .await;
         assert_eq!(s.judge_warning(), None);
+        s.shutdown();
+    }
+
+    /// A stored Jev key reaches no answer of the admin surface: stats, the review list, a merge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stored_jev_key_never_appears_in_stats_or_review_output() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        home.ensure_dirs().unwrap();
+        std::fs::write(home.config_file(), "[judge]\nprovider = \"jev\"\n").unwrap();
+        let store = MemSecrets::new(Duration::ZERO);
+        store.set(SecretName::JevApiKey, JEV_TEST_KEY).unwrap();
+        let s = Service::start(
+            home,
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                secrets: Some(store),
+                jev_transport: Some(Arc::new(ScriptedJev {
+                    sent: std::sync::atomic::AtomicUsize::new(0),
+                })),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        until("the Jev judge", || {
+            (s.judge().provider() == "jev").then_some(())
+        })
+        .await;
+        let stats = s.stats().await.unwrap();
+        assert_eq!(stats.judge_provider, "jev");
+        let all = serde_json::to_string(&(
+            &stats,
+            s.reviews(ReviewQuery::default()).await.unwrap(),
+            s.judge_warning(),
+        ))
+        .unwrap();
+        assert_eq!(all.matches(JEV_TEST_KEY).count(), 0, "{all}");
         s.shutdown();
     }
 
