@@ -119,39 +119,67 @@ impl DaemonJevPolicy {
         }
     }
 
-    /// The stored project `slug_or_alias` names and its working-tree root. `None` for a project
-    /// that is not stored or cannot be read.
-    fn lookup(&self, slug_or_alias: &str) -> Option<(String, Option<String>)> {
+    /// The stored project `slug_or_alias` names: its canonical slug, working-tree root and every
+    /// name it is known by (slug, each alias, display name, and the name as asked). `None` for
+    /// a project that is not stored or cannot be read.
+    fn lookup(&self, slug_or_alias: &str) -> Option<Identity> {
         self.readers
             .with(|c| {
                 let Some(p) = projects::resolve_slug(c, slug_or_alias)? else {
                     return Ok(None);
                 };
                 let root = projects::root_of(c, &p.id)?;
-                Ok(Some((p.slug, root)))
+                let mut names = vec![
+                    slug_or_alias.trim().to_string(),
+                    p.slug.clone(),
+                    p.name.clone(),
+                ];
+                let mut stmt =
+                    c.prepare("SELECT alias FROM project_aliases WHERE project_id = ?1")?;
+                let aliases = stmt.query_map([&p.id], |r| r.get::<_, String>(0))?;
+                for a in aliases {
+                    names.push(a?);
+                }
+                Ok(Some(Identity {
+                    slug: p.slug,
+                    root,
+                    names,
+                }))
             })
             .ok()
             .flatten()
     }
 }
 
+/// A stored project as the policy sees it.
+struct Identity {
+    slug: String,
+    root: Option<String>,
+    names: Vec<String>,
+}
+
 impl JevPolicy for DaemonJevPolicy {
     /// Fails closed: an empty slug, a project the store does not know, a store that cannot be
-    /// read, and everything `SettingsHandle::cloud_allowed` refuses all answer `false`. The
-    /// canonical slug is asked about, so an alias cannot get around the denylist.
+    /// read, and everything `SettingsHandle::cloud_allowed` refuses all answer `false`. That
+    /// one decision is asked about every name the project has (canonical slug, aliases, display
+    /// name, the name as given), so a denylist entry written as any of them denies it.
     fn cloud_allowed(&self, project: &str) -> bool {
         if project.trim().is_empty() {
             return false;
         }
-        let Some((slug, root)) = self.lookup(project) else {
+        let Some(id) = self.lookup(project) else {
             return false;
         };
-        self.settings
-            .cloud_allowed(&slug, root.as_deref().map(Path::new))
+        let root = id.root.as_deref().map(Path::new);
+        id.names
+            .iter()
+            .filter(|n| !n.trim().is_empty())
+            .all(|n| self.settings.cloud_allowed(n, root))
+            && self.settings.cloud_allowed(&id.slug, root)
     }
 
     fn redactor(&self, project: &str) -> Arc<Redactor> {
-        let root = self.lookup(project).and_then(|(_, root)| root);
+        let root = self.lookup(project).and_then(|id| id.root);
         self.redactors
             .for_root_always_on(root.as_deref().map(Path::new))
     }
@@ -502,6 +530,61 @@ mod tests {
         );
         assert!(f.transport.bodies.lock().is_empty());
         let _ = &f.readers;
+    }
+
+    #[test]
+    fn a_denylist_entry_that_is_an_alias_a_display_name_or_another_case_still_denies() {
+        for entry in ["nickname", "Plain Display", "PLAIN", "Plain"] {
+            let f = fixture(
+                &format!("[privacy]\ncloud_denied_projects = [\"{entry}\"]\n"),
+                None,
+            );
+            {
+                let conn = open_writer(&f.home.db()).unwrap();
+                let plain = store_projects::resolve_slug(&conn, "plain")
+                    .unwrap()
+                    .unwrap();
+                store_projects::add_alias(&conn, "nickname", &plain.id).unwrap();
+                conn.execute(
+                    "UPDATE projects SET name = 'Plain Display' WHERE slug = 'plain'",
+                    [],
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                f.judge.classify_in(&["plain"], "text", &yes_no()),
+                Err(JudgeError::Denied),
+                "entry {entry:?}"
+            );
+            // Asked by its alias as well.
+            assert_eq!(
+                f.judge.classify_in(&["nickname"], "text", &yes_no()),
+                Err(JudgeError::Denied),
+                "entry {entry:?} by alias"
+            );
+            f.judge.classify_in(&["client"], "text", &yes_no()).unwrap();
+            assert_eq!(f.transport.bodies.lock().len(), 1);
+        }
+        let f = fixture("[privacy]\ncloud_denied_projects = [\"Client X\"]\n", None);
+        {
+            let conn = open_writer(&f.home.db()).unwrap();
+            store_projects::upsert_project(
+                &conn,
+                &ProjectRef {
+                    key: "k/cx".into(),
+                    slug: "client-x".into(),
+                    name: "Client X Ltd".into(),
+                    root: None,
+                    remote: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            f.judge.classify_in(&["client-x"], "text", &yes_no()),
+            Err(JudgeError::Denied),
+            "`Client X` denies the slug client-x"
+        );
     }
 
     #[test]

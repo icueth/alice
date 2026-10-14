@@ -1699,15 +1699,20 @@ pub struct EffectivePrivacy {
 impl EffectivePrivacy {
     /// `true` when memories of `project_slug` must never leave this machine for a cloud judge
     /// or embedding provider: the project's file says so, or the global list names it.
+    ///
+    /// Names are compared in the form Alice gives project slugs (trimmed, lower case, separators
+    /// collapsed to `-`) on both sides, so an entry written `Client X` denies `client-x`. An
+    /// entry that names an alias or the display name denies a project only when the caller asks
+    /// about that name too (the daemon asks about every identity of a project).
     pub fn is_cloud_denied(&self, project_slug: &str) -> bool {
-        // Both sides trimmed: a slug with stray whitespace is the project the list names.
-        let slug = project_slug.trim();
+        let slug = crate::normalize::slugify(project_slug.trim());
         self.cloud_denied
-            || self
-                .privacy
-                .cloud_denied_projects
-                .iter()
-                .any(|p| p.trim() == slug)
+            || (!slug.is_empty()
+                && self
+                    .privacy
+                    .cloud_denied_projects
+                    .iter()
+                    .any(|p| crate::normalize::slugify(p.trim()) == slug))
     }
 }
 
@@ -2930,6 +2935,31 @@ mod tests {
             assert!(eff.is_cloud_denied(slug), "{slug:?}");
         }
         assert!(!eff.is_cloud_denied("client-y"));
+    }
+
+    #[test]
+    fn a_list_entry_in_another_spelling_still_denies_the_slug() {
+        let list = |e: &str| {
+            ProjectSettings::default().apply_to(&PrivacySettings {
+                cloud_denied_projects: vec![e.into()],
+                ..Default::default()
+            })
+        };
+        for entry in [
+            "Client X",
+            "CLIENT-X",
+            " client_x ",
+            "client   x",
+            "Client-X",
+        ] {
+            assert!(list(entry).is_cloud_denied("client-x"), "{entry:?}");
+            assert!(list("client-x").is_cloud_denied(entry), "{entry:?} asked");
+        }
+        assert!(!list("Client X").is_cloud_denied("client-y"));
+        assert!(
+            !list("---").is_cloud_denied(""),
+            "an empty name matches nothing"
+        );
     }
 
     /// Carried from Task 5's review: A counted, B not counted, A counted is not two polls in a row.

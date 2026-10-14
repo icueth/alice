@@ -1177,6 +1177,43 @@ impl Service {
     }
 
     /// The view without the secrets' status (which may wait on the store), plus notes.
+    /// Entries of `privacy.cloud_denied_projects` that name no stored project by slug, alias or
+    /// display name. Only a hint for typos: the entries are never changed or dropped.
+    fn unmatched_cloud_denied(&self) -> Vec<String> {
+        let list = self.settings.get().privacy.cloud_denied_projects.clone();
+        if list.is_empty() {
+            return Vec::new();
+        }
+        let known: std::collections::HashSet<String> = self
+            .readers
+            .with(|c| {
+                let mut names = Vec::new();
+                let mut stmt = c.prepare("SELECT slug, name FROM projects")?;
+                for r in
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                {
+                    let (slug, name) = r?;
+                    names.push(slug);
+                    names.push(name);
+                }
+                let mut stmt = c.prepare("SELECT alias FROM project_aliases")?;
+                for a in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                    names.push(a?);
+                }
+                Ok(names)
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| alice_core::normalize::slugify(&n))
+            .collect();
+        if known.is_empty() {
+            return Vec::new();
+        }
+        list.into_iter()
+            .filter(|e| !known.contains(&alice_core::normalize::slugify(e.trim())))
+            .collect()
+    }
+
     fn view_with(
         &self,
         secrets: BTreeMap<String, SecretStatus>,
@@ -1205,6 +1242,11 @@ impl Service {
             .filter(|k| settings::NOT_USED_YET_KEYS.contains(&k.as_str()))
         {
             notes.push(not_used_yet_note(k));
+        }
+        for entry in self.unmatched_cloud_denied() {
+            notes.push(format!(
+                "privacy.cloud_denied_projects lists \"{entry}\", which matches no project (by slug, alias or name); it is kept and denies any project later called that, but check it for a typo"
+            ));
         }
         if self.settings.loosening_waiting() {
             notes.push(format!(
@@ -3744,6 +3786,32 @@ mod tests {
         assert_eq!(s.judge().provider(), "heuristic");
         assert!(s.judge_warning().unwrap().contains("no TypeSafe key"));
         s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denylist_entry_that_matches_no_project_is_flagged_but_kept() {
+        let (_d, s) = svc().await;
+        s.patch_settings(patch_one(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["Global", "clinet-x"]),
+        ))
+        .unwrap();
+        let v = s.settings_view();
+        let notes: Vec<_> = v
+            .notes
+            .iter()
+            .filter(|n| n.contains("matches no project"))
+            .collect();
+        assert_eq!(notes.len(), 1, "{:?}", v.notes);
+        assert!(
+            notes[0].contains("clinet-x") && !notes[0].contains("Global"),
+            "{notes:?}"
+        );
+        assert_eq!(
+            s.settings().privacy.cloud_denied_projects,
+            ["Global", "clinet-x"],
+            "what the user typed is kept"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
