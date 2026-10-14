@@ -372,6 +372,7 @@ fn plan_predicate_reviews(plan: &mut KgPlan, existing: &[(String, u64)], max_pai
                 "canonical": canonical,
                 "p": sim,
                 "provider": "mempalace-import",
+                "reversed": crate::judge::text::directions_differ(&other, &canonical),
             }),
             confidence: Some(sim),
             dedupe_key: Some(format!("predicate:{other}")),
