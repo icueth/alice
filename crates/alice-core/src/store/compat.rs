@@ -1,9 +1,11 @@
 //! Read-only queries for the MemPalace compatibility layer: the overview an old `status` tool
 //! shows, drawer ids of every era resolved to what they name now, and the details a search hit
-//! does not carry. Every query is bounded; nothing here writes.
+//! does not carry, and an agent's diary entries. Every query is bounded; nothing here writes.
 
 use crate::error::Result;
+use crate::model::Memory;
 use crate::store::import::legacy_get;
+use crate::store::memories::get_many;
 use rusqlite::{Connection, OptionalExtension, params_from_iter};
 use std::collections::{BTreeMap, HashMap};
 
@@ -221,4 +223,37 @@ pub fn hit_details(
         }
     }
     Ok(out)
+}
+
+/// An agent's live diary memories, newest first (`project` is a slug; `None` is every project).
+/// At most `limit` rows.
+pub fn recent_diaries(
+    conn: &Connection,
+    agent: &str,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.id FROM memories m JOIN projects p ON p.id = m.project_id
+         WHERE m.kind = 'diary' AND m.status <> 'trashed' AND m.author_agent = ?1
+           AND (?2 IS NULL OR p.slug = ?2)
+         ORDER BY m.created_at DESC, m.seq DESC LIMIT ?3",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(rusqlite::params![agent, project, limit as i64], |r| {
+            r.get(0)
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    get_many(conn, &ids)
+}
+
+/// How many live diary memories [`recent_diaries`] could return for the same agent and project.
+pub fn count_diaries(conn: &Connection, agent: &str, project: Option<&str>) -> Result<u64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM memories m JOIN projects p ON p.id = m.project_id
+         WHERE m.kind = 'diary' AND m.status <> 'trashed' AND m.author_agent = ?1
+           AND (?2 IS NULL OR p.slug = ?2)",
+        rusqlite::params![agent, project],
+        |r| r.get::<_, i64>(0),
+    )? as u64)
 }

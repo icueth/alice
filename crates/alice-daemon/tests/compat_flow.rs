@@ -6,9 +6,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alice_core::api::GetRequest;
 use alice_core::embed::{Embedder, FakeEmbedder};
 use alice_core::import::fixture::build_sqlite_exact;
 use alice_core::import::{ImportRequest, ImportState};
+use alice_core::model::{Kind, Memory, Status};
 use alice_daemon::compat::CompatCall;
 use alice_daemon::paths::AliceHome;
 use alice_daemon::service::{Service, ServiceOptions};
@@ -63,6 +65,34 @@ impl Flow {
             _palace: palace,
             svc,
         }
+    }
+
+    async fn memory(&self, id: &str) -> Memory {
+        self.svc
+            .get(GetRequest {
+                ids: vec![id.to_string()],
+                include_provenance: false,
+            })
+            .await
+            .unwrap()
+            .memories
+            .remove(0)
+            .memory
+    }
+
+    async fn is_forgotten(&self, id: &str) -> bool {
+        self.memory(id).await.status == Status::Trashed
+    }
+
+    /// The actor of the newest event of an action.
+    fn last_actor(&self, action: &str) -> String {
+        let c = rusqlite::Connection::open(self.svc.home().db()).unwrap();
+        c.query_row(
+            "SELECT actor FROM events WHERE action = ?1 ORDER BY ts DESC, rowid DESC LIMIT 1",
+            [action],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     async fn call(&self, tool: &str, arguments: Value) -> Value {
@@ -686,13 +716,572 @@ async fn the_read_tools_write_nothing_but_the_access_counts_of_what_search_retur
         ("mempalace_get_drawer", json!({"drawer_id": "k_dec"})),
         ("mempalace_get_drawer", json!({"drawer_id": "s1_001"})),
         ("mempalace_search", json!({"query": "frame"})),
-        (
-            "mempalace_add_drawer",
-            json!({"wing": "pg_ai", "room": "x", "content": "y"}),
-        ),
         ("mempalace_mine", json!({})),
     ] {
         f.call(tool, args).await;
     }
     assert_eq!(counts(), before);
+}
+
+// ------------------------------------------------------------------------------- write tools
+
+#[tokio::test(flavor = "multi_thread")]
+async fn add_get_update_delete_round_trip_with_old_style_arguments() {
+    let f = Flow::imported().await;
+    let a = f
+        .call(
+            "mempalace_add_drawer",
+            json!({"wing": "pg_ai", "room": "decisions", "content": "We chose X because Y", "added_by": "codex"}),
+        )
+        .await;
+    assert_eq!(a["success"], true, "{a}");
+    assert_eq!(
+        (a["wing"].as_str(), a["room"].as_str()),
+        (Some("pg-ai"), Some("decisions"))
+    );
+    let id = a["drawer_id"].as_str().unwrap().to_string();
+    let m = f.memory(&id).await;
+    assert_eq!(
+        (m.kind, m.topics.clone(), m.author.agent.as_deref()),
+        (Kind::Decision, vec!["decisions".to_string()], Some("codex"))
+    );
+    assert_eq!(m.project, "pg-ai");
+    assert!(
+        f.call("mempalace_get_drawer", json!({"drawer_id": id}))
+            .await["content"]
+            .as_str()
+            .unwrap()
+            .contains("We chose X")
+    );
+    let again = f
+        .call(
+            "mempalace_add_drawer",
+            json!({"wing": "pg_ai", "room": "decisions", "content": "We chose X because Y"}),
+        )
+        .await;
+    assert_eq!(
+        (again["reason"].as_str(), again["drawer_id"].as_str()),
+        (Some("already_exists"), Some(id.as_str())),
+        "{again}"
+    );
+    let u = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": id, "content": "We chose Z"}),
+        )
+        .await;
+    assert_eq!(u["success"], true, "{u}");
+    assert!(
+        f.call("mempalace_get_drawer", json!({"drawer_id": id}))
+            .await["content"]
+            .as_str()
+            .unwrap()
+            .contains("We chose Z")
+    );
+    let u = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": id, "room": "Bug Classes"}),
+        )
+        .await;
+    assert_eq!(u["success"], true, "{u}");
+    assert_eq!(f.memory(&id).await.topics, vec!["bug-classes".to_string()]);
+    let d = f
+        .call("mempalace_delete_drawer", json!({"drawer_id": id}))
+        .await;
+    assert_eq!(
+        (d["success"].as_bool(), d["drawer_id"].as_str()),
+        (Some(true), Some(id.as_str())),
+        "{d}"
+    );
+    let got = f
+        .call("mempalace_get_drawer", json!({"drawer_id": id}))
+        .await;
+    assert!(
+        got.get("error").is_some() || f.is_forgotten(&id).await,
+        "{got}"
+    );
+    assert!(f.is_forgotten(&id).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn add_drawer_appends_the_source_file_and_updates_with_no_change_are_noops() {
+    let f = Flow::imported().await;
+    let a = f
+        .call(
+            "mempalace_add_drawer",
+            json!({"wing": "pg-ai", "room": "notes", "content": "a note", "source_file": "docs/a.md"}),
+        )
+        .await;
+    let id = a["drawer_id"].as_str().unwrap().to_string();
+    let m = f.memory(&id).await;
+    assert!(
+        m.body.ends_with("\nSource: docs/a.md"),
+        "{:?}",
+        m.body.len()
+    );
+    let n = f
+        .call("mempalace_update_drawer", json!({"drawer_id": id}))
+        .await;
+    assert_eq!(
+        (n["success"].as_bool(), n["noop"].as_bool()),
+        (Some(true), Some(true)),
+        "{n}"
+    );
+    let missing = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": "nope", "content": "x"}),
+        )
+        .await;
+    assert!(
+        missing["error"].as_str().unwrap().contains("not found"),
+        "{missing}"
+    );
+    let missing = f
+        .call("mempalace_delete_drawer", json!({"drawer_id": "nope"}))
+        .await;
+    assert!(
+        missing["error"].as_str().unwrap().contains("not found"),
+        "{missing}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_wing_on_a_write_files_into_the_current_project_with_a_note() {
+    let f = Flow::imported().await;
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd_s = cwd.path().display().to_string();
+    let a = f
+        .call_with(
+            "mempalace_add_drawer",
+            json!({"wing": "nope", "room": "Ideas", "content": "an idea"}),
+            Some(&cwd_s),
+        )
+        .await;
+    assert_eq!(a["success"], true, "{a}");
+    let wing = a["wing"].as_str().unwrap().to_string();
+    assert_ne!(wing, "nope");
+    let note = a["note"].as_str().unwrap();
+    assert!(
+        note.contains("wing nope is not an Alice project")
+            && note.contains(&format!("saved in {wing}")),
+        "{note}"
+    );
+    let m = f.memory(a["drawer_id"].as_str().unwrap()).await;
+    assert_eq!((m.project, m.topics), (wing, vec!["ideas".to_string()]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn updates_and_deletes_of_raw_chunks_and_moves_between_wings_are_refused_with_a_sentence() {
+    let f = Flow::imported().await;
+    for (tool, args) in [
+        (
+            "mempalace_update_drawer",
+            json!({"drawer_id": "s1_001", "content": "x"}),
+        ),
+        ("mempalace_delete_drawer", json!({"drawer_id": "s1_001"})),
+    ] {
+        let r = f.call(tool, args).await;
+        assert!(r["error"].as_str().unwrap().contains("raw"), "{tool}: {r}");
+        assert_eq!(r["success"], false, "{r}");
+    }
+    let r = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": "k_dec", "wing": "devspace"}),
+        )
+        .await;
+    assert!(
+        r["error"].as_str().unwrap().contains("not supported"),
+        "{r}"
+    );
+    assert_eq!(f.memory("k_dec").await.project, "pg-ai");
+    // naming the wing the memory is already in is not a move
+    let same = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": "k_dec", "wing": "wing_pg_ai", "content": "decision, reworded"}),
+        )
+        .await;
+    assert_eq!(same["success"], true, "{same}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_are_redacted_and_carry_the_calling_agent() {
+    let f = Flow::imported().await;
+    let secret = concat!("gh", "p_", "abcdefghijklmnopqrstuvwxyz0123456789");
+    let a = f
+        .call(
+            "mempalace_add_drawer",
+            json!({"wing": "pg-ai", "room": "notes", "content": format!("token {secret} in a note")}),
+        )
+        .await;
+    let id = a["drawer_id"].as_str().unwrap().to_string();
+    let m = f.memory(&id).await;
+    assert!(!m.body.contains(secret), "{}", m.body);
+    let r = f
+        .svc
+        .compat_call(CompatCall {
+            tool: "mempalace_update_drawer".into(),
+            arguments: json!({"drawer_id": id, "content": format!("again {secret}")}),
+            cwd: None,
+            agent: Some("codex".into()),
+        })
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(r["success"], true, "{r}");
+    assert!(!f.memory(&id).await.body.contains(secret));
+    assert_eq!(f.last_actor("memory.edit"), "agent:codex");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diary_write_and_read_round_trip_for_an_agent() {
+    let f = Flow::imported().await;
+    let w = f
+        .call(
+            "mempalace_diary_write",
+            json!({"agent_name": "Claude-Code", "entry": "did X", "topic": "setup"}),
+        )
+        .await;
+    assert_eq!(w["success"], true, "{w}");
+    assert_eq!(
+        (w["agent"].as_str(), w["topic"].as_str()),
+        (Some("claude-code"), Some("setup"))
+    );
+    let m = f.memory(w["entry_id"].as_str().unwrap()).await;
+    assert_eq!(
+        (
+            m.kind,
+            m.title.as_str(),
+            m.topics.clone(),
+            m.author.agent.as_deref()
+        ),
+        (
+            Kind::Diary,
+            "Diary: setup",
+            vec!["setup".to_string()],
+            Some("claude-code")
+        )
+    );
+    let r = f
+        .call(
+            "mempalace_diary_read",
+            json!({"agent_name": "claude-code", "last_n": "3"}),
+        )
+        .await;
+    let entries = r["entries"].as_array().unwrap();
+    assert!(r["total"].as_u64().unwrap() >= 2, "{r}");
+    assert_eq!(r["showing"].as_u64(), Some(entries.len() as u64));
+    assert_eq!(entries[0]["content"], "did X", "newest first: {r}");
+    assert_eq!(entries[0]["topic"], "setup");
+    assert!(
+        entries[0]["timestamp"]
+            .as_str()
+            .unwrap()
+            .starts_with(entries[0]["date"].as_str().unwrap())
+    );
+    // the imported diary entry is the older one
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["content"].as_str().unwrap().contains("Set up the import"))
+    );
+    let other = f
+        .call("mempalace_diary_read", json!({"agent_name": "other"}))
+        .await;
+    assert_eq!(other["entries"].as_array().unwrap().len(), 0, "{other}");
+    let nowing = f
+        .call(
+            "mempalace_diary_read",
+            json!({"agent_name": "claude-code", "wing": "nope"}),
+        )
+        .await;
+    assert_eq!(nowing["entries"].as_array().unwrap().len(), 0);
+    assert!(
+        nowing["note"].as_str().unwrap().contains("nope"),
+        "{nowing}"
+    );
+    let dup = f
+        .call(
+            "mempalace_diary_write",
+            json!({"agent_name": "claude-code", "entry": "did X", "topic": "setup"}),
+        )
+        .await;
+    assert_eq!(dup["reason"], "already_exists", "{dup}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diary_write_to_an_unknown_wing_files_into_the_current_project() {
+    let f = Flow::imported().await;
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd_s = cwd.path().display().to_string();
+    let w = f
+        .call_with(
+            "mempalace_diary_write",
+            json!({"agent_name": "sub-agent", "entry": "journal", "wing": "wing_sub_agent"}),
+            Some(&cwd_s),
+        )
+        .await;
+    assert_eq!(w["success"], true, "{w}");
+    assert!(
+        w["note"]
+            .as_str()
+            .unwrap()
+            .contains("wing wing_sub_agent is not an Alice project"),
+        "{w}"
+    );
+    let m = f.memory(w["entry_id"].as_str().unwrap()).await;
+    assert_eq!(m.title, "Diary: general");
+    let r = f
+        .call("mempalace_diary_read", json!({"agent_name": "sub-agent"}))
+        .await;
+    assert_eq!(r["entries"][0]["topic"], "general", "{r}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kg_add_and_query_show_an_active_fact() {
+    let f = Flow::imported().await;
+    let a = f
+        .call(
+            "mempalace_kg_add",
+            json!({"subject": "alice", "predicate": "uses", "object": "sqlite", "valid_from": "2026-01-01"}),
+        )
+        .await;
+    assert_eq!(a["success"], true, "{a}");
+    assert_eq!(a["fact"], "alice → uses → sqlite");
+    assert!(a["triple_id"].as_str().is_some());
+    let q = f
+        .call("mempalace_kg_query", json!({"entity": "alice"}))
+        .await;
+    let active = q["active_facts"].as_array().unwrap();
+    assert_eq!(active.len(), 1, "{q}");
+    assert_eq!(
+        (
+            active[0]["predicate"].as_str(),
+            active[0]["object"].as_str(),
+            active[0]["direction"].as_str(),
+            active[0]["current"].as_bool()
+        ),
+        (Some("uses"), Some("sqlite"), Some("outgoing"), Some(true))
+    );
+    assert_eq!(
+        (
+            q["historical_facts"].as_array().unwrap().len(),
+            q["count"].as_u64()
+        ),
+        (0, Some(1))
+    );
+    // direction
+    let inc = f
+        .call(
+            "mempalace_kg_query",
+            json!({"entity": "sqlite", "direction": "incoming"}),
+        )
+        .await;
+    assert_eq!(inc["active_facts"][0]["subject"], "alice", "{inc}");
+    let out = f
+        .call(
+            "mempalace_kg_query",
+            json!({"entity": "sqlite", "direction": "outgoing"}),
+        )
+        .await;
+    assert_eq!(out["count"], 0, "{out}");
+    let bad = f
+        .call(
+            "mempalace_kg_query",
+            json!({"entity": "sqlite", "direction": "sideways"}),
+        )
+        .await;
+    assert!(
+        bad["error"].as_str().unwrap().contains("direction"),
+        "{bad}"
+    );
+    // as_of before the start sees nothing
+    let early = f
+        .call(
+            "mempalace_kg_query",
+            json!({"entity": "alice", "as_of": "2025-06-01"}),
+        )
+        .await;
+    assert_eq!(early["count"], 0, "{early}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kg_supersede_closes_the_old_value() {
+    let f = Flow::imported().await;
+    f.call(
+        "mempalace_kg_add",
+        json!({"subject": "alice", "predicate": "uses", "object": "sqlite", "valid_from": "2026-01-01"}),
+    )
+    .await;
+    let s = f
+        .call(
+            "mempalace_kg_supersede",
+            json!({"subject": "alice", "predicate": "uses", "old_object": "sqlite", "new_object": "postgres", "at": "2026-06-01"}),
+        )
+        .await;
+    assert_eq!(
+        (s["success"].as_bool(), s["superseded"].as_str()),
+        (Some(true), Some("sqlite")),
+        "{s}"
+    );
+    assert!(s.get("note").is_none(), "{s}");
+    let q = f
+        .call("mempalace_kg_query", json!({"entity": "alice"}))
+        .await;
+    assert_eq!(q["active_facts"][0]["object"], "postgres", "{q}");
+    assert_eq!(q["historical_facts"][0]["object"], "sqlite", "{q}");
+    // a mismatch is reported, not refused
+    let m = f
+        .call(
+            "mempalace_kg_supersede",
+            json!({"subject": "alice", "predicate": "uses", "old_object": "mysql", "new_object": "cockroach", "at": "2026-07-01"}),
+        )
+        .await;
+    assert_eq!(m["success"], true, "{m}");
+    assert!(m["note"].as_str().unwrap().contains("mysql"), "{m}");
+    let q = f
+        .call("mempalace_kg_query", json!({"entity": "alice"}))
+        .await;
+    assert_eq!(q["active_facts"][0]["object"], "cockroach", "{q}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kg_invalidate_ends_the_fact() {
+    let f = Flow::imported().await;
+    f.call(
+        "mempalace_kg_add",
+        json!({"subject": "alice", "predicate": "uses", "object": "sqlite", "valid_from": "2026-01-01"}),
+    )
+    .await;
+    let i = f
+        .call(
+            "mempalace_kg_invalidate",
+            json!({"subject": "alice", "predicate": "uses", "object": "sqlite", "ended": "2026-07-01"}),
+        )
+        .await;
+    assert_eq!(
+        (i["success"].as_bool(), i["ended"].as_str()),
+        (Some(true), Some("2026-07-01")),
+        "{i}"
+    );
+    let q = f
+        .call("mempalace_kg_query", json!({"entity": "alice"}))
+        .await;
+    assert_eq!(q["active_facts"].as_array().unwrap().len(), 0, "{q}");
+    assert_eq!(q["historical_facts"].as_array().unwrap().len(), 1, "{q}");
+    // nothing left to end: said, not an error
+    let again = f
+        .call(
+            "mempalace_kg_invalidate",
+            json!({"subject": "alice", "predicate": "uses", "object": "sqlite"}),
+        )
+        .await;
+    assert!(
+        again.get("error").is_none() && again["note"].as_str().is_some(),
+        "{again}"
+    );
+    assert!(again["ended"].as_str().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kg_timeline_lists_entries_in_time_order_with_limit_and_offset() {
+    let f = Flow::imported().await;
+    f.call(
+        "mempalace_kg_add",
+        json!({"subject": "alice", "predicate": "uses", "object": "sqlite", "valid_from": "2026-01-01"}),
+    )
+    .await;
+    f.call(
+        "mempalace_kg_supersede",
+        json!({"subject": "alice", "predicate": "uses", "old_object": "sqlite", "new_object": "postgres", "at": "2026-06-01"}),
+    )
+    .await;
+    let t = f
+        .call("mempalace_kg_timeline", json!({"entity": "alice"}))
+        .await;
+    let objs: Vec<&str> = t["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["object"].as_str().unwrap())
+        .collect();
+    assert_eq!(objs, ["sqlite", "postgres"], "{t}");
+    assert_eq!(
+        (
+            t["count"].as_u64(),
+            t["total"].as_u64(),
+            t["entity"].as_str()
+        ),
+        (Some(2), Some(2), Some("alice"))
+    );
+    let p = f
+        .call(
+            "mempalace_kg_timeline",
+            json!({"entity": "alice", "limit": "1", "offset": "1"}),
+        )
+        .await;
+    assert_eq!(p["timeline"][0]["object"], "postgres", "{p}");
+    assert_eq!(
+        (
+            p["count"].as_u64(),
+            p["total"].as_u64(),
+            p["offset"].as_u64()
+        ),
+        (Some(1), Some(2), Some(1))
+    );
+    let none = f.call("mempalace_kg_timeline", json!({})).await;
+    assert!(none["error"].as_str().unwrap().contains("entity"), "{none}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kg_add_with_valid_to_creates_an_ended_fact() {
+    let f = Flow::imported().await;
+    let a = f
+        .call(
+            "mempalace_kg_add",
+            json!({"subject": "alice", "predicate": "used", "object": "csv", "valid_from": "2026-01-01", "valid_to": "2026-03-01"}),
+        )
+        .await;
+    assert_eq!(a["success"], true, "{a}");
+    let q = f
+        .call("mempalace_kg_query", json!({"entity": "alice"}))
+        .await;
+    assert_eq!(q["active_facts"].as_array().unwrap().len(), 0, "{q}");
+    assert_eq!(q["historical_facts"][0]["object"], "csv", "{q}");
+    let bad = f
+        .call(
+            "mempalace_kg_add",
+            json!({"subject": "alice", "predicate": "p", "object": "o", "valid_from": "yesterday"}),
+        )
+        .await;
+    assert_eq!(bad["success"], false, "{bad}");
+    assert!(
+        bad["error"].as_str().unwrap().contains("valid_from"),
+        "{bad}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compat_delete_can_be_undone_through_its_event() {
+    let f = Flow::imported().await;
+    let d = f
+        .call("mempalace_delete_drawer", json!({"drawer_id": "k_dec"}))
+        .await;
+    assert!(f.is_forgotten("k_dec").await);
+    let undone = f
+        .svc
+        .undo(alice_core::api::UndoRequest {
+            event_id: d["event_id"]
+                .as_str()
+                .expect("the answer names the event")
+                .into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(undone.undone);
+    assert!(!f.is_forgotten("k_dec").await);
 }
