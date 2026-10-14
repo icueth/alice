@@ -25,6 +25,7 @@ half.workspace = true
 usearch.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
+strsim.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -49,6 +49,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 toml = "1.1.8"
 toml_edit = "0.25.17"
 keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
+strsim = "0.11.1"
 
 [profile.release]
 lto = "thin"
