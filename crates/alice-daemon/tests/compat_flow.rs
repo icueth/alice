@@ -1437,9 +1437,20 @@ async fn events_are_attributed_and_agent_writes_wait_for_the_judge() {
         .await;
     let id = a["drawer_id"].as_str().unwrap().to_string();
     assert_eq!(f.last_actor("memory.create"), "agent:codex");
+    // An agent's write is stored pending (only the judge activates it): read from the create
+    // event, which records the state at insert. The row itself may already be judged by now.
+    let created: String = f.scalar(
+        "SELECT json_extract(after_json, '$.status') FROM events WHERE action = 'memory.create' AND target_id = ?1",
+        &id,
+    );
     assert_eq!(
-        f.scalar("SELECT judge_state FROM memories WHERE id = ?1", &id),
-        "pending"
+        created, "pending",
+        "the compat layer never activates an agent's write"
+    );
+    let judge = f.scalar("SELECT judge_state FROM memories WHERE id = ?1", &id);
+    assert!(
+        ["pending", "done", "retry", "skipped"].contains(&judge.as_str()),
+        "judge_state {judge}"
     );
     // added_by names the author of the creation
     f.call_as(
