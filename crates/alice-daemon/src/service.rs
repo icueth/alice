@@ -29,6 +29,7 @@ use alice_core::store::history::UndoOutcome;
 use alice_core::store::kg::{self, FactOutcome};
 use alice_core::store::memories::{self, InsertOutcome, NewMemoryInput};
 use alice_core::store::projects::{self, ResolvedProject};
+use alice_core::store::reviews::{self, ReviewItem, ReviewQuery};
 use alice_core::store::sources::{self, IngestOutcome};
 use alice_core::store::{ReaderPool, VECTOR_READER_CACHE_KIB, open_reader, open_writer};
 use alice_core::vector::VectorIndex;
@@ -932,6 +933,8 @@ impl Service {
         .await
     }
 
+    /// Memories by id. A duplicate that was merged into another memory is answered with the
+    /// survivor, and `redirects` says so (spec §5.2).
     pub async fn get(&self, req: GetRequest) -> Result<GetResponse> {
         self.read(move |c| {
             let found = memories::get_many(c, &req.ids)?;
@@ -944,8 +947,32 @@ impl Service {
                     out.missing.push(id.clone());
                 }
             }
+            let found_ids: Vec<String> = found.iter().map(|m| m.id.clone()).collect();
+            let mut shown: Vec<String> = Vec::new();
             for m in found {
-                out.memories.push(full(c, m, req.include_provenance)?);
+                let Some(survivor) = survivor_of(c, &m)? else {
+                    if !shown.contains(&m.id) {
+                        shown.push(m.id.clone());
+                        out.memories.push(full(c, m, req.include_provenance)?);
+                    }
+                    continue;
+                };
+                let asked = req
+                    .ids
+                    .iter()
+                    .find(|id| **id == m.id || m.legacy_id.as_deref() == Some(id.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| m.id.clone());
+                out.redirects.push(Redirect {
+                    from: asked,
+                    to: survivor.id.clone(),
+                });
+                // A survivor that was asked for too is answered on its own turn.
+                if !found_ids.contains(&survivor.id) && !shown.contains(&survivor.id) {
+                    shown.push(survivor.id.clone());
+                    out.memories
+                        .push(full(c, survivor, req.include_provenance)?);
+                }
             }
             Ok(out)
         })
@@ -1093,6 +1120,113 @@ impl Service {
             }),
             other => Err(unexpected(other)),
         }
+    }
+
+    // ------------------------------------------------------------------ review inbox
+
+    /// Review items, newest first (open ones unless the query says otherwise).
+    pub async fn reviews(&self, q: ReviewQuery) -> Result<Vec<ReviewItem>> {
+        self.read(move |c| reviews::list(c, &q)).await
+    }
+
+    pub async fn review(&self, id: String) -> Result<ReviewItem> {
+        self.read(move |c| {
+            reviews::get(c, &id)?.ok_or_else(|| {
+                AliceError::NotFound(format!("review item {id}; list them with `alice review`"))
+            })
+        })
+        .await
+    }
+
+    /// Apply one of a review item's choices and record the decision.
+    pub async fn resolve_review(&self, req: ResolveRequest) -> Result<ResolveResponse> {
+        let actor = Actor::from_author(&req.author);
+        let map_to = {
+            let (id, choice, redactors) =
+                (req.id.clone(), req.choice.clone(), self.redactors.clone());
+            self.read(move |c| screen_resolution(c, &redactors, &id, &choice))
+                .await?
+        };
+        match self
+            .writer
+            .submit(WriteOp::ResolveReview {
+                id: req.id,
+                choice: req.choice.clone(),
+                actor,
+                map_to,
+            })
+            .await?
+        {
+            WriteOutcome::Resolved(review) => Ok(ResolveResponse {
+                message: format!("Resolved: {}.", req.choice),
+                review: *review,
+            }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Make `others` duplicates of `survivor` (trashed, linked to it).
+    pub async fn merge(&self, req: MergeRequest) -> Result<MergeResponse> {
+        let actor = Actor::from_author(&req.author);
+        match self
+            .writer
+            .submit(WriteOp::Merge {
+                survivor: req.survivor,
+                others: req.others,
+                actor,
+            })
+            .await?
+        {
+            WriteOutcome::Merged(merged) => Ok(MergeResponse { merged }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Counts, review and judge backlogs, and the judge's cost (UTC days).
+    pub async fn stats(&self) -> Result<Stats> {
+        let provider = self.judge().provider().to_string();
+        let judge_warning = self.judge_warning();
+        self.read(move |c| {
+            let group = |sql: &str| -> Result<BTreeMap<String, u64>> {
+                let mut stmt = c.prepare(sql)?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+                })?;
+                Ok(rows.collect::<std::result::Result<_, _>>()?)
+            };
+            let count =
+                |sql: &str| -> Result<u64> { Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64) };
+            let now = chrono::Utc::now();
+            let today = now.format("%Y-%m-%d").to_string();
+            let week = (now - chrono::Duration::days(6)).format("%Y-%m-%d").to_string();
+            let costs = alice_core::store::judge::cost_since(c, &week)?;
+            let mut top = c.prepare(
+                "SELECT p.slug, count(*) FROM memories m JOIN projects p ON p.id = m.project_id
+                 WHERE m.status <> 'trashed' GROUP BY p.slug ORDER BY 2 DESC, p.slug LIMIT 20",
+            )?;
+            let top_projects = top
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(Stats {
+                memories_by_status: group("SELECT status, count(*) FROM memories GROUP BY status")?,
+                memories_by_kind: group(
+                    "SELECT kind, count(*) FROM memories WHERE status <> 'trashed' GROUP BY kind",
+                )?,
+                top_projects,
+                chunks: count("SELECT count(*) FROM chunks")?,
+                reviews_open: reviews::count_open(c)?,
+                judge_provider: provider,
+                judge_warning,
+                judge_backlog: count(
+                    "SELECT count(*) FROM memories WHERE judge_state = 'pending' AND status <> 'trashed'",
+                )?,
+                judge_retry: count("SELECT count(*) FROM memories WHERE judge_state = 'retry'")?,
+                embed_backlog: embeddings::backlog(c)? as u64,
+                cost_today_usd: costs.iter().filter(|r| r.day == today).map(|r| r.usd).sum(),
+                cost_7d_usd: costs.iter().map(|r| r.usd).sum(),
+            })
+        })
+        .await
     }
 
     /// Changes committed from now on (the SSE stream); a slow receiver misses old items.
@@ -1694,6 +1828,101 @@ fn returned_memories(mut seqs: Vec<i64>, returned: &[Hit]) -> Vec<i64> {
             .count(),
     );
     seqs
+}
+
+/// The live memory a merged duplicate (`m`, in the trash) points at through `duplicate_of`
+/// links, following a chain of merges; `None` when `m` is not trashed, has no such link, or the
+/// chain ends in a memory that is gone or trashed too.
+fn survivor_of(
+    c: &Connection,
+    m: &alice_core::model::Memory,
+) -> Result<Option<alice_core::model::Memory>> {
+    use alice_core::model::Status;
+    if m.status != Status::Trashed {
+        return Ok(None);
+    }
+    let mut visited = vec![m.id.clone()];
+    let mut at = m.id.clone();
+    for _ in 0..8 {
+        let next: Option<String> = c
+            .prepare_cached(
+                "SELECT to_id FROM links WHERE from_id = ?1 AND type = 'duplicate_of' ORDER BY created_at DESC, to_id LIMIT 1",
+            )?
+            .query_row([&at], |r| r.get(0))
+            .optional()?;
+        let Some(next) = next.filter(|n| !visited.contains(n)) else {
+            return Ok(None);
+        };
+        let Some(target) = memories::get_many(c, std::slice::from_ref(&next))?.pop() else {
+            return Ok(None);
+        };
+        if target.status != Status::Trashed {
+            return Ok(Some(target));
+        }
+        visited.push(next.clone());
+        at = next;
+    }
+    Ok(None)
+}
+
+/// What the privacy rules say about the text a review resolution writes, before it is sent to
+/// the writer (which does not scan content). `Predicate`/`map`: the two names, redacted (or
+/// refused in `block` mode), returned for the writer to use. `Project`/`move`: the memory
+/// arrives in a project whose rules may be stricter; text those rules would change is refused
+/// rather than moved (edit it first). Anything else: nothing to screen.
+fn screen_resolution(
+    c: &Connection,
+    redactors: &Redactors,
+    id: &str,
+    choice: &str,
+) -> Result<Option<(String, String)>> {
+    use alice_core::store::reviews::{self, ReviewStatus, ReviewType};
+    let Some(item) = reviews::get(c, id)?.filter(|i| i.status == ReviewStatus::Open) else {
+        return Ok(None); // the writer says: not found, or already resolved
+    };
+    let text = |k: &str| {
+        item.payload
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    match (item.review_type, choice) {
+        (ReviewType::Predicate, "map") => {
+            let r = redactors.for_root(None);
+            Ok(Some((
+                redact_field(&r, "predicate", &text("predicate"))?,
+                redact_field(&r, "predicate", &text("canonical"))?,
+            )))
+        }
+        (ReviewType::Project, "move") => {
+            let Some(target) = projects::resolve_slug(c, &text("to"))? else {
+                return Ok(None); // the writer says the project is gone
+            };
+            let Some(m) = memories::get_many(c, &[text("memory_id")])?.pop() else {
+                return Ok(None);
+            };
+            let root = projects::root_of(c, &target.id)?;
+            let r = redactors.for_root(root.as_deref().map(Path::new));
+            let refuse = |field: &str, detail: String| {
+                AliceError::invalid(format!(
+                    "cannot move memory {}: the privacy rules of project {} would change its {field}{detail}; edit the memory first, or keep it where it is",
+                    m.id, target.slug
+                ))
+            };
+            let fields = [("title", &m.title), ("body", &m.body)]
+                .into_iter()
+                .chain(m.topics.iter().map(|t| ("topic", t)));
+            for (field, t) in fields {
+                let found = r.apply(t).found;
+                if !found.is_empty() {
+                    return Err(refuse(field, format!(" ({})", found.join(", "))));
+                }
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
 }
 
 fn full(
@@ -3635,6 +3864,42 @@ mod tests {
         assert!(out.notes.is_empty(), "{:?}", out.notes);
         let out = s
             .patch_settings_async(patch_one("judge.review_threshold", serde_json::json!(0.6)))
+            .await
+            .unwrap();
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+    }
+
+    /// R3: turning the admin MCP tools on is a loosening, announced like the privacy ones; turning
+    /// them off is not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_the_admin_tools_on_is_announced_as_a_loosening() {
+        let (_d, s) = svc().await;
+        let out = s
+            .patch_settings_async(patch_one("mcp.admin_tools", serde_json::json!(true)))
+            .await
+            .unwrap();
+        assert!(s.settings().mcp.admin_tools, "applied at once");
+        let note = out
+            .notes
+            .iter()
+            .find(|n| n.contains("mcp.admin_tools"))
+            .unwrap_or_else(|| panic!("{:?}", out.notes));
+        assert!(
+            note.contains("loosened") && note.contains("3 polls"),
+            "{note}"
+        );
+        let ev = wait_events(&s, "config", |ev| {
+            ev.iter().any(|e| e.action == "settings.change")
+        })
+        .await;
+        assert_eq!(
+            ev[0].after,
+            Some(
+                serde_json::json!({"changed": ["mcp.admin_tools"], "loosened": ["mcp.admin_tools"]})
+            )
+        );
+        let out = s
+            .patch_settings_async(patch_one("mcp.admin_tools", serde_json::json!(false)))
             .await
             .unwrap();
         assert!(out.notes.is_empty(), "{:?}", out.notes);

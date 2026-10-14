@@ -239,7 +239,7 @@ pub fn load_effective(home: &AliceHome) -> Effective {
     effective(&home.config_file(), &process_env())
 }
 
-fn effective(file: &Path, env: &[(String, String)]) -> Effective {
+pub(crate) fn effective(file: &Path, env: &[(String, String)]) -> Effective {
     let env = EnvLayer::new(env);
     let (resolved, mut errors) = resolve_layers(&read_config(file), &env);
     let degraded = !errors.is_empty();
@@ -1123,6 +1123,7 @@ mod tests {
                 "judge.daily_budget_usd",
             ),
             ("", "[judge]\nprovider = \"jev\"\n", "judge.provider"),
+            ("", "[mcp]\nadmin_tools = true\n", "mcp.admin_tools"),
         ];
         for (before, after, key) in loosenings {
             let (_d, h) = home();

@@ -150,12 +150,23 @@ impl Briefing<'_> {
         }
         Ok(())
     }
+
+    /// Append a section of plain text, if it fits the budget.
+    fn text_section(&mut self, title: &str, text: &str) {
+        let section = format!("\n## {title}\n{text}\n");
+        let cost = estimate_tokens(&section);
+        if self.used + cost <= self.max_tokens {
+            self.out.push_str(&section);
+            self.used += cost;
+        }
+    }
 }
 
 /// Briefing for `project`: the last handoff in full, then warnings, key memories (importance 4
 /// and up), decisions from the last 14 days and the global preferences, one line each, no
 /// memory twice. The whole text stays within `max_tokens` (as `estimate_tokens` counts), except
 /// that the heading line, and for a project without live memories a hint, are always included.
+/// When review items wait for a decision, a last section says how many.
 pub fn build(
     conn: &Connection,
     project: &ResolvedProject,
@@ -196,6 +207,15 @@ pub fn build(
     )?;
     if !is_global {
         b.section("Your preferences", PREFERENCES, &[&GLOBAL_ID], 8, line)?;
+    }
+    let open = crate::store::reviews::count_open(conn)?;
+    if open > 0 {
+        b.text_section(
+            "Review",
+            &format!(
+                "{open} item(s) wait for a decision (duplicates, updates or contradictions Alice was not sure about). Run `alice review`, or ask the user."
+            ),
+        );
     }
     Ok(b.out)
 }
@@ -768,5 +788,39 @@ mod tests {
             ));
         }
         assert!(!grows, "{}", counts.join("\n"));
+    }
+
+    #[test]
+    fn open_review_items_add_a_last_section_and_none_adds_nothing() {
+        let (_d, c, app) = setup("app");
+        put(&c, &app, input(Kind::Decision, 5, "Rust single binary"));
+        let none = build(&c, &app, 1_200, at(NOW)).unwrap();
+        assert!(!none.contains("## Review"), "{none}");
+        for key in ["a", "b"] {
+            crate::store::reviews::create(
+                &c,
+                &crate::store::reviews::NewReview {
+                    kind: crate::store::reviews::ReviewType::Merge,
+                    payload: serde_json::json!({}),
+                    confidence: None,
+                    dedupe_key: Some(key.into()),
+                },
+            )
+            .unwrap();
+        }
+        let text = build(&c, &app, 1_200, at(NOW)).unwrap();
+        assert!(text.contains("2 item(s) wait for a decision"), "{text}");
+        assert!(
+            text.trim_end()
+                .lines()
+                .rev()
+                .nth(1)
+                .unwrap()
+                .starts_with("## Review"),
+            "the Review section comes last:\n{text}"
+        );
+        // A budget too small for it leaves it out rather than overrun.
+        let tiny = build(&c, &app, 30, at(NOW)).unwrap();
+        assert!(!tiny.contains("## Review"), "{tiny}");
     }
 }

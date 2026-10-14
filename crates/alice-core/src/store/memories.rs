@@ -423,6 +423,105 @@ pub fn touch_access(conn: &Connection, seqs: &[i64]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveOutcome {
+    Moved,
+    /// The target project already holds this text in a live memory (its id).
+    DuplicateOf(String),
+}
+
+/// `others` become trashed duplicates of `survivor`: each gets a `duplicate_of` link to it and
+/// the survivor gains their provenance. The survivor itself and unknown ids are skipped, and so
+/// is an id already trashed. Returns the ids that were merged. (Provenance is not part of an
+/// event's snapshot: undoing a merge restores status and links, and the provenance rows copied
+/// to the survivor stay there, which is harmless.)
+pub fn merge_into(
+    conn: &Connection,
+    survivor_id: &str,
+    others: &[String],
+    hlc: &str,
+) -> Result<Vec<String>> {
+    let survivor_seq = seq_of(conn, survivor_id)?.ok_or_else(|| {
+        AliceError::NotFound(format!("memory {survivor_id} (survivor); check the id"))
+    })?;
+    let (survivor, survivor_status): (String, String) = conn.query_row(
+        "SELECT id, status FROM memories WHERE seq = ?1",
+        [survivor_seq],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if survivor_status == Status::Trashed.as_str() {
+        return Err(AliceError::invalid(format!(
+            "memory {survivor} is in the trash and cannot be the survivor of a merge; restore it first or pick another"
+        )));
+    }
+    let mut merged = Vec::new();
+    for o in others {
+        let Some(seq) = seq_of(conn, o)?.filter(|s| *s != survivor_seq) else {
+            continue;
+        };
+        let (id, status): (String, String) = conn.query_row(
+            "SELECT id, status FROM memories WHERE seq = ?1",
+            [seq],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if status == Status::Trashed.as_str() || merged.contains(&id) {
+            continue;
+        }
+        set_status(conn, seq, Status::Trashed, Some(hlc))?;
+        add_link(conn, &id, &survivor, "duplicate_of", "merge")?;
+        conn.execute(
+            "INSERT OR IGNORE INTO provenance (memory_id, chunk_id) SELECT ?1, chunk_id FROM provenance WHERE memory_id = ?2",
+            params![survivor, id],
+        )?;
+        merged.push(id);
+    }
+    Ok(merged)
+}
+
+/// Move a memory to another project, unless that project already holds the same text.
+pub fn move_to_project(
+    conn: &Connection,
+    id: &str,
+    project_id: &str,
+    hlc: &str,
+) -> Result<MoveOutcome> {
+    let seq = seq_of(conn, id)?.ok_or_else(|| AliceError::NotFound(format!("memory {id}")))?;
+    let (kind, title, body): (String, String, String) = conn.query_row(
+        "SELECT kind, title, body FROM memories WHERE seq = ?1",
+        [seq],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let slug: String = conn
+        .query_row(
+            "SELECT slug FROM projects WHERE id = ?1",
+            [project_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| AliceError::NotFound(format!("project {project_id}")))?;
+    let hash = content_hash(
+        &slug,
+        Kind::parse(&kind).unwrap_or(Kind::Note),
+        &title,
+        &body,
+    );
+    if let Some(other) = conn
+        .query_row(
+            "SELECT id FROM memories WHERE project_id = ?1 AND content_hash = ?2 AND status <> 'trashed' AND seq <> ?3",
+            params![project_id, hash, seq],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(MoveOutcome::DuplicateOf(other));
+    }
+    conn.execute(
+        "UPDATE memories SET project_id = ?1, content_hash = ?2, updated_at = ?3, hlc = ?4 WHERE seq = ?5",
+        params![project_id, hash, now_rfc3339(), hlc, seq],
+    )?;
+    Ok(MoveOutcome::Moved)
+}
+
 /// Apply an edit or status change and return the updated memory.
 /// Everything is validated before the first write.
 pub fn apply_update(conn: &Connection, id: &str, u: &MemoryUpdate, hlc: String) -> Result<Memory> {
@@ -1036,5 +1135,96 @@ mod tests {
         }
         assert!(get_by_seqs(&c, &[]).unwrap().is_empty());
         assert!(get_by_seqs(&c, &[1_000_000]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_trashes_the_others_with_links_and_moves_provenance() {
+        let (_d, c, p) = setup();
+        let ins = |t: &str| match insert(&c, &prepare(input(t), &p, "h".into()).unwrap()).unwrap() {
+            InsertOutcome::New { id, .. } => id,
+            o => panic!("{o:?}"),
+        };
+        let (s, a, b) = (ins("survivor text"), ins("dup one"), ins("dup two"));
+        c.execute(
+            "INSERT INTO provenance (memory_id, chunk_id) VALUES (?1, 'CH1')",
+            [&a],
+        )
+        .unwrap();
+        let merged = merge_into(&c, &s, &[a.clone(), b.clone(), s.clone()], "h2").unwrap();
+        assert_eq!(
+            merged,
+            vec![a.clone(), b.clone()],
+            "the survivor is never merged into itself"
+        );
+        for id in [&a, &b] {
+            let st: String = c
+                .query_row("SELECT status FROM memories WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(st, "trashed");
+            let n: i64 = c.query_row("SELECT count(*) FROM links WHERE from_id = ?1 AND to_id = ?2 AND type = 'duplicate_of'", [id, &s], |r| r.get(0)).unwrap();
+            assert_eq!(n, 1);
+        }
+        let prov: i64 = c
+            .query_row(
+                "SELECT count(*) FROM provenance WHERE memory_id = ?1 AND chunk_id = 'CH1'",
+                [&s],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prov, 1);
+        // Merging again changes nothing; a trashed survivor is refused.
+        assert!(
+            merge_into(&c, &s, std::slice::from_ref(&a), "h3")
+                .unwrap()
+                .is_empty()
+        );
+        let err = merge_into(&c, &a, std::slice::from_ref(&s), "h4")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("trash"), "{err}");
+        assert!(matches!(
+            merge_into(&c, "nope", &[s], "h5"),
+            Err(AliceError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn moving_to_a_project_that_holds_the_same_text_reports_the_duplicate() {
+        let (_d, c, p) = setup();
+        let other = crate::store::projects::upsert_project(
+            &c,
+            &crate::project::ProjectRef {
+                key: "k2".into(),
+                slug: "other".into(),
+                name: "other".into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        let m1 = prepare(input("same text"), &p, "h".into()).unwrap();
+        let InsertOutcome::New { id: a, .. } = insert(&c, &m1).unwrap() else {
+            panic!()
+        };
+        let m2 = prepare(input("same text"), &other, "h".into()).unwrap();
+        let InsertOutcome::New { id: b, .. } = insert(&c, &m2).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            move_to_project(&c, &a, &other.id, "h3").unwrap(),
+            MoveOutcome::DuplicateOf(b)
+        );
+        let m3 = prepare(input("unique text"), &p, "h".into()).unwrap();
+        let InsertOutcome::New { id: u, .. } = insert(&c, &m3).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            move_to_project(&c, &u, &other.id, "h4").unwrap(),
+            MoveOutcome::Moved
+        );
+        let slug: String = c.query_row("SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1", [&u], |r| r.get(0)).unwrap();
+        assert_eq!(slug, "other");
     }
 }

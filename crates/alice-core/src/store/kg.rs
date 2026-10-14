@@ -290,6 +290,33 @@ pub fn assert_fact(conn: &Connection, f: &AssertFact, hlc: String) -> Result<Fac
     })
 }
 
+/// From now on `name` means `canonical`: existing relations are renamed and later asserts with
+/// `name` use `canonical`. Returns how many relations were renamed.
+pub fn map_predicate(conn: &Connection, name: &str, canonical: &str, hlc: &str) -> Result<usize> {
+    let name = predicate_key(name)?;
+    let wanted = predicate_key(canonical)?;
+    let target = canonical_predicate(conn, &wanted)?
+        .ok_or_else(|| AliceError::NotFound(format!("predicate {canonical}")))?;
+    if name == target || name == wanted {
+        return Err(AliceError::invalid(format!(
+            "{name} cannot map to itself; pick a different predicate"
+        )));
+    }
+    conn.execute(
+        "INSERT INTO predicates (name, canonical) VALUES (?1, ?2) ON CONFLICT(name) DO UPDATE SET canonical = excluded.canonical",
+        params![name, target],
+    )?;
+    // Names that pointed at `name` follow it.
+    conn.execute(
+        "UPDATE predicates SET canonical = ?1 WHERE canonical = ?2",
+        params![target, name],
+    )?;
+    Ok(conn.execute(
+        "UPDATE relations SET predicate = ?1, hlc = ?2 WHERE predicate = ?3",
+        params![target, hlc, name],
+    )?)
+}
+
 /// Ids of the open relations of `subject` and `predicate` (resolved as `assert_fact` resolves
 /// them), sorted: every relation an `assert_fact` for them can close. Empty when the subject
 /// or the predicate is unknown; names are looked up, never created.
@@ -1299,5 +1326,53 @@ mod tests {
         assert_eq!(f.object_kind, ObjectKind::Literal);
         let q: FactsQuery = serde_json::from_str(r#"{"entity":"a"}"#).unwrap();
         assert!(!q.timeline && q.as_of.is_none() && q.predicate.is_none());
+    }
+
+    #[test]
+    fn mapping_a_predicate_renames_its_relations_and_future_asserts() {
+        let (_d, c) = conn();
+        for (p, o) in [("uses", "SQLite"), ("use", "Rust")] {
+            assert_fact(
+                &c,
+                &AssertFact {
+                    subject: "alice".into(),
+                    predicate: p.into(),
+                    object: o.into(),
+                    ..Default::default()
+                },
+                "h".into(),
+            )
+            .unwrap();
+        }
+        assert_eq!(map_predicate(&c, "uses", "use", "h2").unwrap(), 1);
+        let facts = query_facts(
+            &c,
+            &FactsQuery {
+                entity: "alice".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(facts.iter().all(|f| f.predicate == "use"), "{facts:?}");
+        let out = assert_fact(
+            &c,
+            &AssertFact {
+                subject: "alice".into(),
+                predicate: "uses".into(),
+                object: "Tokio".into(),
+                ..Default::default()
+            },
+            "h3".into(),
+        )
+        .unwrap();
+        assert_eq!(out.predicate, "use");
+        assert!(
+            map_predicate(&c, "uses", "uses", "h4").is_err(),
+            "a predicate cannot map to itself"
+        );
+        assert!(matches!(
+            map_predicate(&c, "uses", "unknown_verb", "h5"),
+            Err(AliceError::NotFound(_))
+        ));
     }
 }

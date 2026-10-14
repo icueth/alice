@@ -18,6 +18,7 @@ use alice_core::settings::{ProjectSettings, load_project};
 use alice_core::store::kg::FactOutcome;
 use alice_core::store::memories::{self, NewMemoryInput};
 use alice_core::store::projects::ResolvedProject;
+use alice_core::store::reviews::ReviewStatus;
 use alice_core::store::sources::IngestOutcome;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -285,6 +286,37 @@ fn spawn_detached_with_env(
     Ok(pid)
 }
 
+/// The query string of `GET /api/v1/reviews` for `q` (empty when `q` sets nothing).
+fn review_query_string(q: &ReviewQuery) -> String {
+    let mut qs = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(s) = q.status {
+        qs.append_pair(
+            "status",
+            match s {
+                ReviewStatus::Open => "open",
+                ReviewStatus::Resolved => "resolved",
+            },
+        );
+    }
+    if let Some(t) = q.review_type {
+        qs.append_pair("review_type", t.as_str());
+    }
+    if let Some(b) = &q.before {
+        qs.append_pair("before", b);
+    }
+    if let Some(l) = q.limit {
+        qs.append_pair("limit", &l.to_string());
+    }
+    qs.finish()
+}
+
+/// `id` as one URL path segment.
+fn path_segment(id: &str) -> String {
+    url::form_urlencoded::byte_serialize(id.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20")
+}
+
 /// `ALICE_HOME` for a daemon this client starts. The daemon runs from `/`, so a relative home
 /// (`ALICE_HOME=./mem`) is resolved against this process's directory first.
 fn daemon_home(home: &AliceHome) -> PathBuf {
@@ -484,6 +516,34 @@ impl DaemonClient {
     }
     pub async fn undo(&self, r: &UndoRequest) -> Result<UndoResponse> {
         self.call("/api/v1/undo", r, Duration::from_secs(10)).await
+    }
+    /// Review items, newest first (open ones unless the query says otherwise).
+    pub async fn reviews(&self, q: &ReviewQuery) -> Result<Vec<ReviewItem>> {
+        let qs = review_query_string(q);
+        if qs.is_empty() {
+            self.get_json("/api/v1/reviews").await
+        } else {
+            self.get_json(&format!("/api/v1/reviews?{qs}")).await
+        }
+    }
+    pub async fn review(&self, id: &str) -> Result<ReviewItem> {
+        self.get_json(&format!("/api/v1/reviews/{}", path_segment(id)))
+            .await
+    }
+    pub async fn resolve_review(&self, r: &ResolveRequest) -> Result<ResolveResponse> {
+        self.call(
+            &format!("/api/v1/reviews/{}/resolve", path_segment(&r.id)),
+            &serde_json::json!({"choice": r.choice, "author": r.author}),
+            Duration::from_secs(10),
+        )
+        .await
+    }
+    pub async fn merge(&self, r: &MergeRequest) -> Result<MergeResponse> {
+        self.call("/api/v1/memories/merge", r, Duration::from_secs(10))
+            .await
+    }
+    pub async fn stats(&self) -> Result<Stats> {
+        self.get_json("/api/v1/stats").await
     }
     /// Every setting with its source, the problems, the secrets' status (never a value).
     pub async fn settings(&self) -> Result<SettingsView> {

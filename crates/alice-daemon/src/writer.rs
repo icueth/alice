@@ -19,6 +19,7 @@ use alice_core::store::memories::{
     self, InsertOutcome, MemoryUpdate, NewMemoryInput, UpdateAction,
 };
 use alice_core::store::projects::{self, ResolvedProject};
+use alice_core::store::reviews::{self, ReviewItem, ReviewType};
 use alice_core::store::sources::{self, ChunkInput, IngestOutcome, SourceInput};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
@@ -77,6 +78,21 @@ pub enum WriteOp {
         event_id: String,
         actor: Actor,
     },
+    /// Apply a review decision and record it. `map_to` is the item's `(predicate, canonical)`
+    /// after the privacy rules (the service redacts what the item holds before it is written
+    /// as vocabulary); `None` uses the item's own.
+    ResolveReview {
+        id: String,
+        choice: String,
+        actor: Actor,
+        map_to: Option<(String, String)>,
+    },
+    /// `others` become duplicates of `survivor` (admin tool, review `merge`).
+    Merge {
+        survivor: String,
+        others: Vec<String>,
+        actor: Actor,
+    },
     /// `(key, stamp, vector)`: the vector of the text whose `content_hash` was `stamp`. It is
     /// stored (and the row marked done) only if the row still holds that text.
     StoreEmbeddings {
@@ -114,6 +130,10 @@ pub enum WriteOutcome {
     Updated(Memory, Option<String>),
     Fact(FactOutcome),
     Undo(UndoOutcome),
+    /// The review item after its resolution.
+    Resolved(Box<ReviewItem>),
+    /// The ids that became duplicates.
+    Merged(Vec<String>),
     /// The `StoreEmbeddings` items that were stored; the others changed while being embedded.
     Embedded(Vec<(VecKey, Vec<f32>)>),
     Done,
@@ -129,6 +149,8 @@ impl WriteOutcome {
             WriteOutcome::Updated(..) => "Updated",
             WriteOutcome::Fact(_) => "Fact",
             WriteOutcome::Undo(_) => "Undo",
+            WriteOutcome::Resolved(_) => "Resolved",
+            WriteOutcome::Merged(_) => "Merged",
             WriteOutcome::Embedded(_) => "Embedded",
             WriteOutcome::Done => "Done",
         }
@@ -505,12 +527,28 @@ fn assert_fact(
 
 /// `undo`: reverse an event (and its group), or, when a target changed since, a review item.
 fn undo(conn: &Connection, event_id: &str, actor: &Actor, st: &mut State) -> Result<WriteOutcome> {
+    undo_with(conn, event_id, actor, st, false)
+}
+
+/// `undo`, or with `force` an undo that does not look at whether the target changed since (the
+/// answer "undo anyway" to a review item). Privacy rules apply either way.
+fn undo_with(
+    conn: &Connection,
+    event_id: &str,
+    actor: &Actor,
+    st: &mut State,
+    force: bool,
+) -> Result<WriteOutcome> {
     let out = {
         let redactors = st.redactors.clone();
         let rules = |c: &Connection, project: Option<&str>| rules_for(c, &redactors, project);
         let hlc = &mut st.hlc;
         let mut tick = || hlc.tick();
-        history::undo(conn, event_id, actor, &mut tick, &rules)?
+        if force {
+            history::force_undo(conn, event_id, actor, &mut tick, &rules)?
+        } else {
+            history::undo(conn, event_id, actor, &mut tick, &rules)?
+        }
     };
     match &out {
         UndoOutcome::Undone { group, .. } => {
@@ -531,6 +569,269 @@ fn undo(conn: &Connection, event_id: &str, actor: &Actor, st: &mut State) -> Res
         UndoOutcome::Conflict { created: false, .. } => {}
     }
     Ok(WriteOutcome::Undo(out))
+}
+
+/// `old` becomes superseded by `new` (status and a `supersedes` link), with events in one
+/// group: `group`, or a new one. A memory that is gone or in the trash cannot take part.
+fn supersede(
+    conn: &Connection,
+    st: &mut State,
+    old: &str,
+    new: &str,
+    actor: &Actor,
+    group: Option<&str>,
+) -> Result<()> {
+    for (what, id) in [("older", old), ("newer", new)] {
+        match snap(conn, id)? {
+            None => {
+                return Err(AliceError::invalid(format!(
+                    "the {what} memory {id} no longer exists; reject this item instead"
+                )));
+            }
+            Some(s) if s["status"] == "trashed" => {
+                return Err(AliceError::invalid(format!(
+                    "the {what} memory {id} is in the trash; reject this item instead"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    let group = group.map(str::to_owned).unwrap_or_else(new_id);
+    let (b_old, b_new) = (snap(conn, old)?, snap(conn, new)?);
+    let h = st.hlc.tick();
+    memories::apply_update(
+        conn,
+        old,
+        &MemoryUpdate {
+            action: UpdateAction::Supersede,
+            superseded_by: Some(new.into()),
+            ..Default::default()
+        },
+        h,
+    )?;
+    let (old_id, new_own) = (
+        memories::id_of(conn, old)?.unwrap_or_else(|| old.to_string()),
+        memories::id_of(conn, new)?.unwrap_or_else(|| new.to_string()),
+    );
+    record(
+        conn,
+        st,
+        EventInput {
+            actor,
+            action: "memory.supersede",
+            target_type: "memory",
+            target_id: &old_id,
+            before: b_old,
+            after: snap(conn, &old_id)?,
+            group: Some(&group),
+        },
+    )?;
+    record(
+        conn,
+        st,
+        EventInput {
+            actor,
+            action: "memory.link",
+            target_type: "memory",
+            target_id: &new_own,
+            before: b_new,
+            after: snap(conn, &new_own)?,
+            group: Some(&group),
+        },
+    )?;
+    Ok(())
+}
+
+/// `others` become trashed duplicates of `survivor`, with events in one group: `group`, or a
+/// new one. Returns the ids merged. (Provenance moved by a merge is not part of a snapshot:
+/// undoing a merge restores status and links, and the provenance copied to the survivor stays,
+/// which is harmless.)
+fn merge(
+    conn: &Connection,
+    st: &mut State,
+    survivor: &str,
+    others: &[String],
+    actor: &Actor,
+    group: Option<&str>,
+) -> Result<Vec<String>> {
+    let group = group.map(str::to_owned).unwrap_or_else(new_id);
+    // By their own ids (a caller may name a memory by a legacy id); unknown ones are skipped.
+    let survivor = memories::id_of(conn, survivor)?.ok_or_else(|| {
+        AliceError::NotFound(format!("memory {survivor} (survivor); check the id"))
+    })?;
+    let survivor = survivor.as_str();
+    let mut own: Vec<String> = Vec::new();
+    for o in others {
+        if let Some(id) = memories::id_of(conn, o)?
+            && !own.contains(&id)
+        {
+            own.push(id);
+        }
+    }
+    let others = own.as_slice();
+    let befores: Vec<(String, Option<serde_json::Value>)> = others
+        .iter()
+        .map(|o| Ok((o.clone(), snap(conn, o)?)))
+        .collect::<Result<_>>()?;
+    let b_survivor = snap(conn, survivor)?;
+    let h = st.hlc.tick();
+    let merged = memories::merge_into(conn, survivor, others, &h)?;
+    for (id, before) in befores.into_iter().filter(|(id, _)| merged.contains(id)) {
+        record(
+            conn,
+            st,
+            EventInput {
+                actor,
+                action: "memory.merge",
+                target_type: "memory",
+                target_id: &id,
+                before,
+                after: snap(conn, &id)?,
+                group: Some(&group),
+            },
+        )?;
+    }
+    if !merged.is_empty() {
+        record(
+            conn,
+            st,
+            EventInput {
+                actor,
+                action: "memory.merge_into",
+                target_type: "memory",
+                target_id: survivor,
+                before: b_survivor,
+                after: snap(conn, survivor)?,
+                group: Some(&group),
+            },
+        )?;
+    }
+    Ok(merged)
+}
+
+/// Apply the decision `choice` on review item `id` and record it. Everything happens in the
+/// job's savepoint: a decision that fails changes nothing and leaves the item open.
+fn resolve_review(
+    conn: &Connection,
+    st: &mut State,
+    id: &str,
+    choice: &str,
+    actor: &Actor,
+    map_to: Option<(String, String)>,
+) -> Result<WriteOutcome> {
+    let item = reviews::get(conn, id)?.ok_or_else(|| {
+        AliceError::NotFound(format!("review item {id}; list them with `alice review`"))
+    })?;
+    // Not open, or not a choice of its type: the same errors as recording the resolution, before
+    // anything is applied.
+    if item.status != reviews::ReviewStatus::Open || !item.choices.iter().any(|c| c.id == choice) {
+        reviews::mark_resolved(conn, id, choice, actor)?;
+    }
+    let p = &item.payload;
+    let s = |k: &str| {
+        p.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    // One decision is one undoable group, whatever it touches.
+    let group = new_id();
+    match (item.review_type, choice) {
+        (ReviewType::Supersede, "accept") | (ReviewType::Contradiction, "keep_new") => {
+            supersede(conn, st, &s("old_id"), &s("new_id"), actor, Some(&group))?;
+        }
+        (ReviewType::Contradiction, "keep_old") => {
+            supersede(conn, st, &s("new_id"), &s("old_id"), actor, Some(&group))?;
+        }
+        (ReviewType::Merge, "merge") => {
+            let others: Vec<String> = p["others"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            merge(conn, st, &s("survivor"), &others, actor, Some(&group))?;
+        }
+        (ReviewType::Predicate, "map") => {
+            let (name, canonical) = map_to.unwrap_or_else(|| (s("predicate"), s("canonical")));
+            let h = st.hlc.tick();
+            let n = kg::map_predicate(conn, &name, &canonical, &h)?;
+            st.matcher = None;
+            record(
+                conn,
+                st,
+                EventInput {
+                    actor,
+                    action: "predicate.map",
+                    target_type: "predicate",
+                    target_id: &name,
+                    before: None,
+                    after: Some(serde_json::json!({"canonical": canonical, "relations": n})),
+                    group: Some(&group),
+                },
+            )?;
+        }
+        (ReviewType::Project, "move") => {
+            let memory = s("memory_id");
+            let target = projects::resolve_slug(conn, &s("to"))?.ok_or_else(|| {
+                AliceError::invalid(format!(
+                    "project {} no longer exists; keep the memory where it is",
+                    s("to")
+                ))
+            })?;
+            let before = snap(conn, &memory)?;
+            let h = st.hlc.tick();
+            match memories::move_to_project(conn, &memory, &target.id, &h)? {
+                memories::MoveOutcome::Moved => {
+                    let own = memories::id_of(conn, &memory)?.unwrap_or(memory);
+                    record(
+                        conn,
+                        st,
+                        EventInput {
+                            actor,
+                            action: "memory.move",
+                            target_type: "memory",
+                            target_id: &own,
+                            before,
+                            after: snap(conn, &own)?,
+                            group: Some(&group),
+                        },
+                    )?;
+                }
+                memories::MoveOutcome::DuplicateOf(other) => {
+                    merge(conn, st, &other, &[memory], actor, Some(&group))?;
+                }
+            }
+        }
+        (ReviewType::Undo, "apply") => match undo_with(conn, &s("event_id"), actor, st, true)? {
+            WriteOutcome::Undo(UndoOutcome::Undone { .. }) => {}
+            _ => return Err(AliceError::Other("forced undo did not apply".into())),
+        },
+        (ReviewType::SyncConflict, _) => {
+            return Err(AliceError::invalid(
+                "sync conflicts are resolved by `alice sync` (coming in a later release); nothing was changed",
+            ));
+        }
+        // reject / keep / keep_both / dismiss: nothing changes.
+        _ => {}
+    }
+    reviews::mark_resolved(conn, id, choice, actor)?;
+    record(
+        conn,
+        st,
+        EventInput {
+            actor,
+            action: "review.resolve",
+            target_type: "review",
+            target_id: id,
+            before: None,
+            after: Some(serde_json::json!({"choice": choice})),
+            group: None,
+        },
+    )?;
+    Ok(WriteOutcome::Resolved(Box::new(
+        reviews::get(conn, id)?.ok_or_else(|| AliceError::Other("review item vanished".into()))?,
+    )))
 }
 
 impl State {
@@ -683,6 +984,17 @@ fn apply(
         } => update(conn, &id, &u, &actor, st)?,
         WriteOp::AssertFact { fact, actor } => assert_fact(conn, &fact, &actor, st)?,
         WriteOp::Undo { event_id, actor } => undo(conn, &event_id, &actor, st)?,
+        WriteOp::ResolveReview {
+            id,
+            choice,
+            actor,
+            map_to,
+        } => resolve_review(conn, st, &id, &choice, &actor, map_to)?,
+        WriteOp::Merge {
+            survivor,
+            others,
+            actor,
+        } => WriteOutcome::Merged(merge(conn, st, &survivor, &others, &actor, None)?),
         WriteOp::StoreEmbeddings { model, items } => {
             let mut applied = Vec::with_capacity(items.len());
             for (key, stamp, v) in items {
@@ -2046,5 +2358,371 @@ mod tests {
             !item.contains(token) && item.contains("[REDACTED:github_token]"),
             "{item}"
         );
+    }
+
+    // ---- review resolutions ----
+
+    fn add_review(f: &Fixture, kind: ReviewType, payload: serde_json::Value, key: &str) -> String {
+        let c = open(f.dir.path());
+        reviews::create(
+            &c,
+            &reviews::NewReview {
+                kind,
+                payload,
+                confidence: Some(0.7),
+                dedupe_key: Some(key.into()),
+            },
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn resolve(f: &Fixture, id: &str, choice: &str) -> Result<WriteOutcome> {
+        f.h.submit_blocking(WriteOp::ResolveReview {
+            id: id.into(),
+            choice: choice.into(),
+            actor: Actor::User,
+            map_to: None,
+        })
+    }
+
+    fn status_of(f: &Fixture, id: &str) -> String {
+        f.read("SELECT status FROM memories WHERE id = ?1", [id])
+    }
+
+    #[test]
+    fn accepting_a_supersede_item_supersedes_in_one_group_and_rejecting_changes_nothing() {
+        let f = fixture();
+        let (old, _) = new_id(f.h.submit_blocking(remember("port is 8080")).unwrap());
+        let (new, _) = new_id(f.h.submit_blocking(remember("port is 9090")).unwrap());
+        let item = |key: &str| {
+            add_review(
+                &f,
+                ReviewType::Supersede,
+                serde_json::json!({"new_id": new, "old_id": old, "p": 0.7, "provider": "heuristic"}),
+                key,
+            )
+        };
+        let (a, b) = (item("a"), item("b"));
+        let out = resolve(&f, &b, "reject").unwrap();
+        assert!(
+            matches!(&out, WriteOutcome::Resolved(r) if r.resolution.as_deref() == Some("reject"))
+        );
+        assert_ne!(status_of(&f, &old), "superseded");
+        let mut rx = f.h.subscribe();
+        let WriteOutcome::Resolved(done) = resolve(&f, &a, "accept").unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            (done.status, done.resolved_by.as_deref()),
+            (reviews::ReviewStatus::Resolved, Some("user"))
+        );
+        assert_eq!(status_of(&f, &old), "superseded");
+        let links: i64 = f.read(
+            "SELECT count(*) FROM links WHERE from_id = ?1 AND to_id = ?2 AND type = 'supersedes'",
+            [&new, &old],
+        );
+        assert_eq!(links, 1);
+        let mut actions = Vec::new();
+        while let Ok(StreamItem::Event { event }) = rx.try_recv() {
+            actions.push((event.action, event.group_id.is_some()));
+        }
+        assert_eq!(
+            actions,
+            [
+                ("memory.supersede".to_string(), true),
+                ("memory.link".to_string(), true),
+                ("review.resolve".to_string(), false)
+            ]
+        );
+        // Once resolved, the item is closed.
+        let err = resolve(&f, &a, "accept").unwrap_err().to_string();
+        assert!(err.contains("already resolved"), "{err}");
+        let err = resolve(&f, "NOSUCH", "accept").unwrap_err();
+        assert!(matches!(err, AliceError::NotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn a_decision_that_cannot_be_applied_leaves_the_item_open() {
+        let f = fixture();
+        let (old, _) = new_id(f.h.submit_blocking(remember("port is 8080")).unwrap());
+        let (new, _) = new_id(f.h.submit_blocking(remember("port is 9090")).unwrap());
+        f.h.submit_blocking(update(&old, UpdateAction::Forget))
+            .unwrap();
+        let item = add_review(
+            &f,
+            ReviewType::Contradiction,
+            serde_json::json!({"new_id": new, "old_id": old, "p": 0.7, "provider": "heuristic"}),
+            "c",
+        );
+        let err = resolve(&f, &item, "keep_new").unwrap_err().to_string();
+        assert!(err.contains("trash"), "{err}");
+        let err = resolve(&f, &item, "maybe").unwrap_err().to_string();
+        assert!(err.contains("keep_new, keep_old, keep_both"), "{err}");
+        let st: String = f.read("SELECT status FROM review_items WHERE id = ?1", [&item]);
+        assert_eq!(st, "open");
+        // keep_both is nothing but a record.
+        resolve(&f, &item, "keep_both").unwrap();
+        assert_eq!(status_of(&f, &new), "pending");
+    }
+
+    #[test]
+    fn contradiction_keep_old_supersedes_the_new_memory() {
+        let f = fixture();
+        let (old, _) = new_id(f.h.submit_blocking(remember("uses tabs")).unwrap());
+        let (new, _) = new_id(f.h.submit_blocking(remember("uses spaces")).unwrap());
+        let item = add_review(
+            &f,
+            ReviewType::Contradiction,
+            serde_json::json!({"new_id": new, "old_id": old, "p": 0.8, "provider": "heuristic"}),
+            "c",
+        );
+        resolve(&f, &item, "keep_old").unwrap();
+        assert_eq!(status_of(&f, &new), "superseded");
+        assert_ne!(status_of(&f, &old), "superseded");
+    }
+
+    #[test]
+    fn merge_by_review_or_directly_trashes_the_others_with_events() {
+        let f = fixture();
+        let ids: Vec<String> = ["survivor", "dup one", "dup two", "dup three"]
+            .iter()
+            .map(|t| new_id(f.h.submit_blocking(remember(t)).unwrap()).0)
+            .collect();
+        let item = add_review(
+            &f,
+            ReviewType::Merge,
+            serde_json::json!({"survivor": ids[0], "others": [ids[1], ids[2]], "p": 0.9, "provider": "heuristic"}),
+            "m",
+        );
+        resolve(&f, &item, "merge").unwrap();
+        assert_eq!(
+            (
+                status_of(&f, &ids[1]).as_str(),
+                status_of(&f, &ids[2]).as_str()
+            ),
+            ("trashed", "trashed")
+        );
+        let WriteOutcome::Merged(merged) =
+            f.h.submit_blocking(WriteOp::Merge {
+                survivor: ids[0].clone(),
+                others: vec![
+                    ids[3].clone(),
+                    ids[0].clone(),
+                    "NOSUCH".into(),
+                    ids[1].clone(),
+                ],
+                actor: Actor::Agent("codex".into()),
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            merged,
+            [ids[3].clone()],
+            "the survivor, unknown and already merged ids are skipped"
+        );
+        let n: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action IN ('memory.merge','memory.merge_into') AND actor = 'agent:codex'",
+            [],
+        );
+        assert_eq!(n, 2, "one event for the duplicate, one for the survivor");
+        // A merge can be undone: the duplicate is back.
+        let ev: String = f.read(
+            "SELECT id FROM events WHERE action = 'memory.merge' AND target_id = ?1",
+            [&ids[3]],
+        );
+        f.h.submit_blocking(WriteOp::Undo {
+            event_id: ev,
+            actor: Actor::User,
+        })
+        .unwrap();
+        assert_ne!(status_of(&f, &ids[3]), "trashed");
+    }
+
+    #[test]
+    fn mapping_a_predicate_renames_relations_and_records_an_event() {
+        let f = fixture();
+        for (p, o) in [("uses", "SQLite"), ("use", "Rust")] {
+            f.h.submit_blocking(WriteOp::AssertFact {
+                fact: AssertFact {
+                    subject: "alice".into(),
+                    predicate: p.into(),
+                    object: o.into(),
+                    ..Default::default()
+                },
+                actor: Actor::User,
+            })
+            .unwrap();
+        }
+        let item = add_review(
+            &f,
+            ReviewType::Predicate,
+            serde_json::json!({"predicate": "uses", "canonical": "use", "p": 0.9, "provider": "heuristic"}),
+            "p",
+        );
+        resolve(&f, &item, "map").unwrap();
+        let n: i64 = f.read("SELECT count(*) FROM relations WHERE predicate = 'use'", []);
+        assert_eq!(n, 2);
+        let after: String = f.read(
+            "SELECT after_json FROM events WHERE action = 'predicate.map'",
+            [],
+        );
+        assert!(after.contains("\"relations\":1"), "{after}");
+        // `map_to` (the service's redacted names) wins over the item's own.
+        let item2 = add_review(
+            &f,
+            ReviewType::Predicate,
+            serde_json::json!({"predicate": "x", "canonical": "y", "p": 0.9, "provider": "heuristic"}),
+            "p2",
+        );
+        f.h.submit_blocking(WriteOp::ResolveReview {
+            id: item2,
+            choice: "map".into(),
+            actor: Actor::User,
+            map_to: Some(("employs".into(), "use".into())),
+        })
+        .unwrap();
+        let canonical: String = f.read(
+            "SELECT canonical FROM predicates WHERE name = 'employs'",
+            [],
+        );
+        assert_eq!(canonical, "use");
+    }
+
+    #[test]
+    fn moving_a_memory_changes_its_project_and_a_duplicate_there_becomes_a_merge() {
+        let f = fixture();
+        {
+            let c = open(f.dir.path());
+            alice_core::store::projects::upsert_project(
+                &c,
+                &ProjectRef {
+                    key: "k2".into(),
+                    slug: "other".into(),
+                    name: "other".into(),
+                    root: None,
+                    remote: None,
+                },
+            )
+            .unwrap();
+        }
+        let (m, _) = new_id(f.h.submit_blocking(remember("move me")).unwrap());
+        let (dup, _) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "twin".into(),
+                    ..Default::default()
+                },
+                project: ProjectChoice::Slug("other".into()),
+            })
+            .unwrap(),
+        );
+        let item = add_review(
+            &f,
+            ReviewType::Project,
+            serde_json::json!({"memory_id": m, "from": "global", "to": "other", "p": 0.8, "provider": "heuristic"}),
+            "mv",
+        );
+        resolve(&f, &item, "move").unwrap();
+        let slug: String = f.read(
+            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
+            [&m],
+        );
+        assert_eq!(slug, "other");
+        let n: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'memory.move'",
+            [],
+        );
+        assert_eq!(n, 1);
+        // The same text already lives in the target: the moved memory is merged into it.
+        let (twin, _) = new_id(f.h.submit_blocking(remember("twin")).unwrap());
+        let item2 = add_review(
+            &f,
+            ReviewType::Project,
+            serde_json::json!({"memory_id": twin, "from": "global", "to": "other", "p": 0.8, "provider": "heuristic"}),
+            "mv2",
+        );
+        resolve(&f, &item2, "move").unwrap();
+        assert_eq!(status_of(&f, &twin), "trashed");
+        assert_ne!(status_of(&f, &dup), "trashed");
+        // A project that is gone: refused, the item stays open.
+        let item3 = add_review(
+            &f,
+            ReviewType::Project,
+            serde_json::json!({"memory_id": dup, "from": "other", "to": "vanished"}),
+            "mv3",
+        );
+        let err = resolve(&f, &item3, "move").unwrap_err().to_string();
+        assert!(err.contains("no longer exists"), "{err}");
+    }
+
+    #[test]
+    fn applying_an_undo_item_restores_over_the_later_change_and_dismissing_does_not() {
+        let f = fixture();
+        let (id, _) = new_id(f.h.submit_blocking(remember("first text")).unwrap());
+        let edit = |body: &str| match f
+            .h
+            .submit_blocking(WriteOp::Update {
+                id: id.clone(),
+                update: MemoryUpdate {
+                    body: Some(body.into()),
+                    ..Default::default()
+                },
+                actor: Actor::User,
+            })
+            .unwrap()
+        {
+            WriteOutcome::Updated(_, Some(e)) => e,
+            o => panic!("{o:?}"),
+        };
+        let ev = edit("second text");
+        edit("third text");
+        let WriteOutcome::Undo(UndoOutcome::Conflict { review_id, .. }) =
+            f.h.submit_blocking(WriteOp::Undo {
+                event_id: ev.clone(),
+                actor: Actor::User,
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        let body =
+            |f: &Fixture| -> String { f.read("SELECT body FROM memories WHERE id = ?1", [&id]) };
+        let mut rx = f.h.subscribe();
+        while f.wake.try_recv().is_ok() {}
+        resolve(&f, &review_id, "apply").unwrap();
+        assert_eq!(body(&f), "first text");
+        assert!(f.wake.try_recv().is_ok(), "restored text is embedded again");
+        let mut actions = Vec::new();
+        while let Ok(StreamItem::Event { event }) = rx.try_recv() {
+            actions.push(event.action);
+        }
+        assert_eq!(actions, ["undo:memory.edit", "undo", "review.resolve"]);
+        // Dismissing another conflict leaves the text alone.
+        let ev2 = edit("fourth text");
+        edit("fifth text");
+        let WriteOutcome::Undo(UndoOutcome::Conflict { review_id: r2, .. }) =
+            f.h.submit_blocking(WriteOp::Undo {
+                event_id: ev2,
+                actor: Actor::User,
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        resolve(&f, &r2, "dismiss").unwrap();
+        assert_eq!(body(&f), "fifth text");
+    }
+
+    #[test]
+    fn sync_conflicts_cannot_be_resolved_yet() {
+        let f = fixture();
+        let item = add_review(&f, ReviewType::SyncConflict, serde_json::json!({}), "s");
+        let err = resolve(&f, &item, "keep_local").unwrap_err().to_string();
+        assert!(err.contains("coming"), "{err}");
+        let st: String = f.read("SELECT status FROM review_items WHERE id = ?1", [&item]);
+        assert_eq!(st, "open");
     }
 }
