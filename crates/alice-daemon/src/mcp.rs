@@ -91,15 +91,16 @@ impl RemoteBackend {
         {
             return on;
         }
+        // The answer is as old as the moment the question was asked, not the moment it came
+        // back: a slow answer must not look fresh for a whole `admin_ttl` more.
+        let asked = std::time::Instant::now();
+        // The small flags endpoint (no read of the secrets' status, a short timeout), not the
+        // whole settings view.
         let on = match DaemonClient::try_existing(&self.home).await {
-            Some(c) => c
-                .settings()
-                .await
-                .map(|v| v.settings["mcp"]["admin_tools"].as_bool() == Some(true))
-                .unwrap_or(false),
+            Some(c) => c.admin_tools_flag().await.unwrap_or(false),
             None => false,
         };
-        *self.admin_switch.lock() = Some((std::time::Instant::now(), on));
+        *self.admin_switch.lock() = Some((asked, on));
         on
     }
 

@@ -1144,3 +1144,43 @@ async fn the_stdio_server_asks_the_daemon_for_the_admin_tools_and_fails_closed()
     assert!(err.contains("tool not found"), "{err}");
     client.cancel().await.ok();
 }
+
+/// `alice mcp` trusts the daemon's last answer about the admin tools for its TTL (so a busy
+/// session does not ask on every request) and asks again once the TTL has passed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stdio_server_trusts_the_daemons_answer_for_its_ttl_and_asks_again_after_it() {
+    let (_dir, home, d) = daemon().await;
+    let ttl = Duration::from_secs(4);
+    let server = AliceMcp::new(Backend::Remote(Arc::new(
+        RemoteBackend::new(home.clone(), Launcher::None, None).with_admin_ttl(ttl),
+    )));
+    let (a, b) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move { server.serve(a).await.unwrap().waiting().await });
+    let client = TestClient.serve(b).await.unwrap();
+    let asked = std::time::Instant::now();
+    assert_eq!(tool_names(&client).await.len(), 7, "asked: off");
+    set_admin(&d, true);
+    // Within the TTL the answer from before is used, so the change is not seen yet.
+    if asked.elapsed() < ttl / 2 {
+        assert_eq!(tool_names(&client).await.len(), 7, "a hit inside the TTL");
+    }
+    // After it the daemon is asked again. Polled to a deadline, not a fixed sleep.
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        if tool_names(&client).await.len() == 11 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon was never asked again"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        asked.elapsed() >= ttl,
+        "seen before the TTL ran out: {:?}",
+        asked.elapsed()
+    );
+    client.cancel().await.ok();
+    d.stop().await;
+}

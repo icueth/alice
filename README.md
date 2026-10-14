@@ -80,7 +80,7 @@ Run `alice model fetch` once before first use. Without it the first daemon start
 |---|---|
 | macOS, Apple Silicon | Supported, local embeddings |
 | Linux (glibc) x86_64 and aarch64 | Supported, local embeddings |
-| Windows x86_64 | Builds in CI, which runs the in-process test suite; the CLI and daemon process tests run on Unix only. Local embeddings verified on Windows by the `windows-real-model` CI workflow (the real model, with the data directory under a non-ASCII path). Known gap: `alice daemon start` and `alice status` cannot see a daemon that is still starting *(fix planned)*. `alice service install` (a scheduled task) *(planned)*. |
+| Windows x86_64 | Builds in CI, which runs the in-process test suite; the CLI and daemon process tests run on Unix only. Local embeddings verified on Windows by the `windows-real-model` CI workflow (the real model, with the data directory under a non-ASCII path). `alice daemon start`, `status` and `stop` find a daemon that is starting or running through `daemon.pid` (its pid and start time, next to the lock: a held lock file cannot be read on Windows) and a Win32 process check; that is covered by unit tests on Windows CI, not yet by process tests. `alice service install` registers a scheduled task that starts the daemon at logon; its plan is tested, but it has not been tried on a real Windows machine. |
 | macOS Intel, Linux musl | Not yet: ONNX Runtime has no prebuilt library for them, so local embeddings are unavailable. They will work with an HTTP embedding provider (planned, M2). |
 
 ### Packaged installers (planned)
@@ -189,13 +189,16 @@ alice update <id> --action edit|supersede|archive|forget|restore [--title t] [--
 alice facts <entity> [--predicate p] [--as-of date] [--timeline]
 alice fact add|supersede|end <subject> <predicate> <object> [--from date]
 alice projects | status
+alice doctor                   # checks with what to do next; exit 1 when one fails
 alice daemon start | stop | status | logs | run
+alice token rotate [--show]
+alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # stdio MCP server for agents
 alice model fetch
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 ```
 
-Every command takes `--json`. Planned: `review`, `undo` (M2), `config`, `doctor`, `service`, `token rotate` (M2), `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3).
+Every command takes `--json`. Planned: `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3).
 
 ## Configuration
 
@@ -254,6 +257,21 @@ alice restore             # the newest backup; or: alice restore <name or path> 
 **Memories written after the backup leave the active database.** They stay in the before-restore copy, which is kept at least 30 days (the newest one is always kept). To undo a restore, run `alice restore alice-before-restore-<time>.db`. Two more things a restore does not undo: memories you purged after the backup was taken come back with it, and text stored under older redaction rules is not scanned again.
 
 On a large database the daemon stays stopped for the length of two copies and a check (minutes at 2.8 GB). Agents' writes are spooled at once meanwhile, and applied afterwards.
+
+## Health, token and service
+
+```bash
+alice status                  # the daemon, counts, judge, open reviews, last backup, memory in use
+alice doctor                  # every check, with what to do next; --json for scripts; exit 1 when one fails
+alice token rotate [--show]   # a new API token; a running daemon switches at once
+alice service install         # run the daemon at login
+```
+
+`alice doctor` works with no daemon running (and starts none). Without one it checks `config.toml` and the `ALICE_*` variables, the permissions of the data directory, the token and `secrets.toml`, the embedding model on disk, and whether a daemon or a service unit exists. With one it adds what only the daemon can see: the database (read-only after a full disk), the maintenance jobs and backups, the vector index, embeddings that failed or that the cloud policy holds back, a re-embed in progress, the judge (a missing Jev key, the day's budget), open reviews, writes waiting in the spool, settings the daemon refused or that wait for a restart, memory and free disk. Every line that is not fine says what to do next. It reports keys as set or not, never their value.
+
+`alice token rotate` writes a new random token to `~/.alice/token` (mode 0600, replaced atomically). A running daemon switches to it at once and refuses the old one from the next request on; `alice mcp` and the CLI find the new token on their next call. With no daemon the file is replaced while the command holds the daemon lock. The token is printed only with `--show`.
+
+`alice service install` registers a launchd agent (macOS, `~/Library/LaunchAgents/dev.alice.daemon.plist`), a systemd user unit (Linux, `~/.config/systemd/user/alice.service`) or a scheduled task at logon (Windows). The unit runs `alice daemon run` with the data directory the command was run with, and holds no secret. `--dry-run` prints the files and commands and changes nothing; `--target-dir d` writes the files under `d` and runs no command. On Linux, user services stop at logout unless `loginctl enable-linger $USER` is set. `alice daemon stop` ends the daemon cleanly, so the unit does not restart it until the next login. `alice restore` stops the unit before it swaps the database and starts it again afterwards, so a unit that restarts its daemon cannot start one in the middle of a restore. `alice service uninstall` removes it.
 
 ## Git sync *(planned, M4)*
 

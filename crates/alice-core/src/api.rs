@@ -411,6 +411,22 @@ pub struct Health {
     pub maintenance_warning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<String>,
+    /// Review items waiting for a decision (`alice review`).
+    #[serde(default)]
+    pub reviews_open: u64,
+    /// False while the local embedding model is unloaded (idle) or being loaded again.
+    #[serde(default)]
+    pub model_loaded: bool,
+    /// Writes waiting in the spool (made while the daemon could not take them).
+    #[serde(default)]
+    pub spool_pending: u64,
+    /// When the newest scheduled or manual backup was made (RFC 3339), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_backup: Option<String>,
+    /// The daemon's own memory: physical footprint on macOS, resident set on Linux; `None`
+    /// where it cannot be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
     /// False while the vector index is being rebuilt (search is lexical-only meanwhile).
     pub index_ready: bool,
     /// `ALICE_*` variables that are not settings (a typo, say) and were ignored.

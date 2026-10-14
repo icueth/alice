@@ -98,6 +98,10 @@ pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
     crate::restore::sweep_staged(&home);
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
+    // Where a held lock file cannot be read (Windows), clients find this daemon here.
+    if let Err(e) = startup::write_pid_file(&home) {
+        tracing::warn!(error = %e, "cannot write daemon.pid; clients may not see this daemon while it starts");
+    }
     // Whatever daemon.json exists now is stale (its writer no longer holds the lock): drop it
     // before the slow part of starting, so no client pings a port that may be someone else's.
     let _ = std::fs::remove_file(home.daemon_json());
@@ -123,6 +127,7 @@ pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
             tracing::warn!(error = %w, "cannot write daemon.error");
         }
     }
+    startup::clear_pid_file(&home);
     drop(lock);
     result
 }

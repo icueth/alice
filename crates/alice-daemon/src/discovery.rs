@@ -106,6 +106,24 @@ pub fn load_or_create_token(home: &AliceHome) -> std::io::Result<String> {
     placed
 }
 
+/// Replace the token with a new random one and return it. The new file is written privately
+/// (mode 0600 from its first byte) under a temporary name and renamed over the old one, so a
+/// reader sees the old token or the new one, never a partial file, and a failure leaves the old
+/// token in place. A running daemon must be told (`POST /api/v1/admin/token/rotate` does both);
+/// rotating under a daemon that does not know would lock every client out.
+pub fn rotate_token(home: &AliceHome) -> std::io::Result<String> {
+    let mut buf = [0u8; 32];
+    getrandom::fill(&mut buf).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let token = hex::encode(buf);
+    let tmp = home.root().join(format!("token.{}.tmp", new_id()));
+    write_private(&tmp, token.as_bytes())?;
+    std::fs::rename(&tmp, home.token_file())
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+        .map(|()| token)
+}
+
 /// What `/api/v1/ping?nonce=<nonce>` answers:
 /// `hex(HMAC-SHA256(key = token, msg = "<nonce>:<instance>"))` over ASCII bytes, where
 /// `instance` is the answering daemon's own instance id. Only a process that knows the token
@@ -219,6 +237,52 @@ mod tests {
         let (_d, home) = home();
         std::fs::write(home.token_file(), b"  existing-token\n").unwrap();
         assert_eq!(load_or_create_token(&home).unwrap(), "existing-token");
+    }
+
+    #[test]
+    fn a_rotated_token_is_new_private_and_leaves_no_temporary_file() {
+        let (_d, home) = home();
+        let old = load_or_create_token(&home).unwrap();
+        let new = rotate_token(&home).unwrap();
+        assert_ne!(new, old);
+        assert_eq!(new.len(), 64);
+        assert!(new.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(read_token(&home), Some(new.clone()));
+        // Unix file modes (0600); Windows has no mode bits.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(home.token_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert_ne!(rotate_token(&home).unwrap(), new, "every rotation is new");
+        let leftovers: Vec<_> = std::fs::read_dir(home.root())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("token.") && n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    }
+
+    /// A rotation that cannot replace the file leaves the old token (and no temporary file).
+    #[test]
+    fn a_failed_rotation_keeps_the_old_token() {
+        let (_d, home) = home();
+        // A directory where the token file should be: the rename cannot replace it.
+        std::fs::create_dir(home.token_file()).unwrap();
+        assert!(rotate_token(&home).is_err());
+        assert!(home.token_file().is_dir());
+        let leftovers = std::fs::read_dir(home.root())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("token."))
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     /// RFC 4231 test cases 2 (short key) and 6 (key longer than the 64-byte block).

@@ -26,17 +26,21 @@ const BODY_LIMIT: usize = 40 * 1024 * 1024;
 /// A comment line on an idle event stream, so proxies and clients keep it open.
 const SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
 
+/// The API token, switchable while the daemon runs (`alice token rotate`): the guard and the
+/// ping proof both read the current value for every request.
+pub type SharedToken = Arc<parking_lot::RwLock<Arc<str>>>;
+
 #[derive(Clone)]
 pub struct Guard {
-    token: Arc<str>,
+    token: SharedToken,
     allowed_hosts: Arc<[String; 2]>,
     allowed_origin: Arc<str>,
 }
 
 impl Guard {
-    pub fn new(token: impl Into<Arc<str>>, port: u16) -> Self {
+    pub fn new(token: SharedToken, port: u16) -> Self {
         Self {
-            token: token.into(),
+            token,
             allowed_hosts: Arc::new([format!("127.0.0.1:{port}"), format!("localhost:{port}")]),
             allowed_origin: format!("http://127.0.0.1:{port}").into(),
         }
@@ -102,8 +106,10 @@ pub async fn guard(State(g): State<Guard>, req: Request, next: Next) -> Response
     if let Some(r) = host_or_origin_refusal(&g, &req) {
         return r;
     }
+    // The current token, copied out so the lock is not held across the handler.
+    let current = g.token.read().clone();
     match bearer(req.headers()) {
-        Some(t) if ct_eq(t.as_bytes(), g.token.as_bytes()) => next.run(req).await,
+        Some(t) if ct_eq(t.as_bytes(), current.as_bytes()) => next.run(req).await,
         _ => {
             let mut r = refuse(
                 StatusCode::UNAUTHORIZED,
@@ -189,8 +195,10 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 struct AppState {
     svc: Arc<Service>,
     shutdown: CancellationToken,
-    /// For the ping proof only; the guard keeps its own copy.
-    token: Arc<str>,
+    /// The same token the guard checks (the ping proof signs with it).
+    token: SharedToken,
+    /// One rotation at a time, so the file and the token in memory end up the same.
+    rotating: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -226,11 +234,10 @@ async fn ping(
     })?;
     let proof = match q.nonce {
         None => None,
-        Some(n) if valid_nonce(&n) => Some(crate::discovery::ping_proof(
-            &st.token,
-            &n,
-            st.svc.instance(),
-        )),
+        Some(n) if valid_nonce(&n) => {
+            let token = st.token.read().clone();
+            Some(crate::discovery::ping_proof(&token, &n, st.svc.instance()))
+        }
         Some(_) => {
             return Err(ApiError(AliceError::invalid(
                 "the nonce must be 16 to 64 hex characters; send a fresh random one",
@@ -246,6 +253,12 @@ async fn ping(
 }
 async fn health(State(st): State<AppState>) -> ApiResult<Health> {
     Ok(Json(st.svc.health().await?))
+}
+/// What `alice doctor` asks the daemon: the checks only it can make.
+async fn doctor(State(st): State<AppState>) -> ApiResult<crate::doctor::DoctorReport> {
+    Ok(Json(crate::doctor::DoctorReport {
+        checks: crate::doctor::daemon_checks(&st.svc).await?,
+    }))
 }
 async fn projects(
     State(st): State<AppState>,
@@ -309,6 +322,28 @@ async fn ingest(
 async fn admin_shutdown(State(st): State<AppState>) -> StatusCode {
     st.shutdown.cancel();
     StatusCode::ACCEPTED
+}
+
+/// Replace the API token: the new one goes to the token file (privately, atomically) and takes
+/// effect at once, so the old one is refused from the next request on. The new token is never
+/// returned; clients read it from `token` (they find out through the ping proof, which the old
+/// token can no longer make).
+async fn rotate_token(State(st): State<AppState>) -> ApiResult<serde_json::Value> {
+    let _one_at_a_time = st.rotating.lock().await;
+    let home = st.svc.home().clone();
+    let file = home.token_file();
+    let new = tokio::task::spawn_blocking(move || crate::discovery::rotate_token(&home))
+        .await
+        .map_err(|e| AliceError::Other(format!("the token rotation task failed: {e}")))?
+        .map_err(|e| {
+            AliceError::Other(format!(
+                "cannot write the new token to {}: {e}; the old token stays in force. Check the permissions of the Alice home directory",
+                file.display()
+            ))
+        })?;
+    *st.token.write() = Arc::from(new);
+    st.svc.record_token_rotation();
+    Ok(Json(serde_json::json!({ "rotated": true })))
 }
 async fn events(
     State(st): State<AppState>,
@@ -437,6 +472,12 @@ async fn patch_settings(
         )
             .into_response(),
     }
+}
+
+/// The switches other processes read often (`alice mcp` asks before each tool listing): small,
+/// and without the secrets' status, which may wait on a keychain prompt.
+async fn settings_flags(State(st): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "mcp.admin_tools": st.svc.settings().mcp.admin_tools }))
 }
 
 /// The JSON Schema of the settings: the web UI renders its forms and help from it.
@@ -586,12 +627,13 @@ async fn stream(
 /// Build the router: the public ping, and everything else (the JSON API and the MCP service
 /// at `/mcp`) behind the token, Host and Origin guard.
 pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: CancellationToken) -> Router {
-    let token: Arc<str> = token.into();
+    let token: SharedToken = Arc::new(parking_lot::RwLock::new(Arc::from(token)));
     let g = Guard::new(token.clone(), port);
     let state = AppState {
         svc,
         shutdown,
         token,
+        rotating: Arc::new(tokio::sync::Mutex::new(())),
     };
     let public = Router::new()
         .route("/api/v1/ping", get(ping))
@@ -599,6 +641,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .layer(middleware::from_fn_with_state(g.clone(), host_guard));
     let private = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/doctor", get(doctor))
         .route("/api/v1/projects", get(projects))
         .route("/api/v1/remember", post(remember))
         .route("/api/v1/recall", post(recall))
@@ -621,12 +664,14 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/events/stream", get(stream))
         .route("/api/v1/settings", get(get_settings).patch(patch_settings))
         .route("/api/v1/settings/schema", get(settings_schema))
+        .route("/api/v1/settings/flags", get(settings_flags))
         .route("/api/v1/settings/test/{provider}", post(test_provider))
         .route(
             "/api/v1/secrets/{name}",
             put(put_secret).delete(delete_secret),
         )
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
+        .route("/api/v1/admin/token/rotate", post(rotate_token))
         // Before the guard layer, so `/mcp` is covered by it.
         .nest_service(
             "/mcp",
