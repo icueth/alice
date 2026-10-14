@@ -6,6 +6,9 @@ use crate::normalize::{sha256_hex, slugify};
 use crate::project::ProjectRef;
 use rusqlite::{Connection, OptionalExtension, params};
 
+/// Keys starting with this belong to projects created by an import before any checkout existed.
+pub const PLACEHOLDER_KEY_PREFIX: &str = "import:";
+
 pub const GLOBAL_ID: &str = "00000000000000000000GLOBAL";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -75,6 +78,35 @@ pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProje
             "project slug {:?} is empty after normalisation; use letters or digits",
             p.slug
         )));
+    }
+    if !p.key.starts_with(PLACEHOLDER_KEY_PREFIX) {
+        // A real project adopts the placeholder of the same slug (or an alias equal to it).
+        let placeholder: Option<ResolvedProject> = conn
+            .query_row(
+                "SELECT id, slug, name FROM projects WHERE slug = ?1 AND key LIKE 'import:%'
+                 UNION ALL
+                 SELECT p.id, p.slug, p.name FROM project_aliases a JOIN projects p ON p.id = a.project_id
+                  WHERE a.alias = ?1 AND p.key LIKE 'import:%'
+                 LIMIT 1",
+                [&base],
+                row,
+            )
+            .optional()?;
+        if let Some(found) = placeholder {
+            let root = p
+                .root
+                .as_ref()
+                .filter(|r| r.exists())
+                .map(|r| r.to_string_lossy().into_owned());
+            conn.execute(
+                "UPDATE projects SET key = ?1, name = ?2, git_remote = ?3, root_path = COALESCE(?4, root_path) WHERE id = ?5",
+                params![p.key, p.name, p.remote, root, found.id],
+            )?;
+            return Ok(ResolvedProject {
+                name: p.name.clone(),
+                ..found
+            });
+        }
     }
     let slug = if slug_taken(conn, &base)? {
         let hash = sha256_hex(p.key.as_bytes());
@@ -236,6 +268,64 @@ mod tests {
             root: None,
             remote: None,
         }
+    }
+
+    #[test]
+    fn a_real_project_adopts_the_import_placeholder_of_the_same_slug() {
+        let (_d, conn) = conn();
+        let placeholder = ProjectRef {
+            key: "import:pg-ai".into(),
+            slug: "pg-ai".into(),
+            name: "pg-ai".into(),
+            root: None,
+            remote: None,
+        };
+        let imported = upsert_project(&conn, &placeholder).unwrap();
+        let real = ProjectRef {
+            key: "github.com/icueth/pg-ai".into(),
+            slug: "pg-ai".into(),
+            name: "PG AI".into(),
+            root: None,
+            remote: Some("github.com/icueth/pg-ai".into()),
+        };
+        let adopted = upsert_project(&conn, &real).unwrap();
+        assert_eq!(
+            adopted.id, imported.id,
+            "same project, no pg-ai-<hash> twin"
+        );
+        assert_eq!(adopted.slug, "pg-ai");
+        assert_eq!(
+            adopted.name, "PG AI",
+            "the real project's name replaces the placeholder's"
+        );
+        assert_eq!(
+            find_by_key(&conn, "github.com/icueth/pg-ai")
+                .unwrap()
+                .unwrap()
+                .id,
+            imported.id
+        );
+        assert!(find_by_key(&conn, "import:pg-ai").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_placeholder_is_not_adopted_by_another_placeholder_or_a_different_slug() {
+        let (_d, conn) = conn();
+        let a = upsert_project(&conn, &pref("import:alpha", "alpha")).unwrap();
+        let other = upsert_project(&conn, &pref("path:/x/beta", "beta")).unwrap();
+        assert_ne!(a.id, other.id);
+        let again = upsert_project(&conn, &pref("import:alpha", "alpha")).unwrap();
+        assert_eq!(again.id, a.id);
+    }
+
+    #[test]
+    fn a_placeholder_is_also_adopted_through_an_alias_equal_to_the_real_slug() {
+        let (_d, conn) = conn();
+        let imported = upsert_project(&conn, &pref("import:alice", "alice")).unwrap();
+        add_alias(&conn, "project-alice", &imported.id).unwrap();
+        let adopted =
+            upsert_project(&conn, &pref("github.com/icueth/alice", "project-alice")).unwrap();
+        assert_eq!(adopted.id, imported.id, "no project-alice-<hash> twin");
     }
 
     #[test]
