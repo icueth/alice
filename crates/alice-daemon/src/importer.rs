@@ -1667,6 +1667,8 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
             if let Some(hook) = &env.hook {
                 hook.park_before_mentions(&env.stop);
             }
+            // The hold ends when the daemon stops as well as when the test lets go.
+            check_stop(&env.stop)?;
             ctx.mentions_pass()
         });
     }

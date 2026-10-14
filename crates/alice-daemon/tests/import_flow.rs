@@ -1797,10 +1797,17 @@ async fn a_read_only_database_mid_import_fails_with_the_resume_sentence() {
 async fn a_run_that_stops_before_the_mentions_is_completed_by_the_next_one() {
     let f = Flow::with_hook(&fixture_specs()).await;
     park_before_mentions(&f).await;
+    let batches_at_the_stop = f.svc.import_status().batches;
     f.svc.shutdown();
     let st = f.svc.import_status();
     assert_eq!(st.state, ImportState::Failed, "{st:?}");
-    assert_eq!(f.count("mentions").await, 0);
+    // The job sent no mention batch after the stop. (`mentions` rows themselves cannot be the
+    // check: the judge worker, which runs beside the job, links the mentions of a memory it
+    // activates, and did so in about 1 of 25 runs on a loaded machine.)
+    assert_eq!(
+        st.batches, batches_at_the_stop,
+        "a batch went out after the stop"
+    );
     assert_eq!(f.count("memories").await, 4);
 
     let svc = start_service(&f.home);
