@@ -211,6 +211,7 @@ pub fn pack_json(out: SearchOutput, project: Option<String>, max_tokens: usize) 
         results,
         related: out.related,
         raw_fallback: out.raw_fallback,
+        reranked: false,
         text: None,
     }
 }

@@ -30,8 +30,11 @@ fn gold_queries_rank_the_expected_memory_high() {
     let idx = VectorIndex::new(384).unwrap();
     let mut ids: HashMap<String, String> = HashMap::new();
     let mut queries = Vec::new();
+    // The shared gold set (the real-model test runs it too), then the exact-number cases:
+    // dates, versions, IP addresses and phone numbers, each with near and split-up decoys.
     for line in include_str!("fixtures/search_gold.jsonl")
         .lines()
+        .chain(include_str!("fixtures/search_gold_numbers.jsonl").lines())
         .filter(|l| !l.trim().is_empty())
     {
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -64,7 +67,7 @@ fn gold_queries_rank_the_expected_memory_high() {
             ));
         }
     }
-    assert!(queries.len() >= 13);
+    assert!(queries.len() >= 17);
     let mut reciprocal_ranks = Vec::new();
     let mut report = String::new();
     for (q, want) in &queries {

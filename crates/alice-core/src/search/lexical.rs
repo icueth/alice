@@ -323,14 +323,42 @@ fn has_few_pieces(query: &str) -> bool {
     pieces(query).nth(2).is_none()
 }
 
+/// Whole ASCII tokens that hold a digit and a `-`, `.`, `:` or `/` between letters or digits:
+/// dates (`2026-10-14`, `14/10/2026`), phone numbers (`081-234-5678`), versions (`1.13.0`),
+/// IP addresses (`43.229.151.35`) and ranges (`10-20`). Split into pieces they are fragments of
+/// one or two characters that every text holds; kept whole they find the text that has them.
+fn numeric_tokens(query: &str) -> impl Iterator<Item = &str> {
+    query
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .map(|t| t.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        .filter(|t| {
+            t.len() >= 3
+                && t.is_ascii()
+                && t.bytes().any(|b| b.is_ascii_digit())
+                && t.bytes().any(|b| matches!(b, b'-' | b'.' | b':' | b'/'))
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':' | b'/'))
+        })
+}
+
 /// Substring terms for the trigram index: pieces of at least 3 characters, split at the same
 /// separators as the word terms (so `ตัดสินใจ/ภาษาไทย`, `“ตัดสินใจ”` and `ตัดสินใจ…` give whole
 /// words). Non-ASCII pieces always qualify; ASCII pieces only in queries of one or two pieces
 /// (so at most two), so long English questions and paths rely on the word and identifier
-/// indexes, and never English stopwords (`the` is a substring of nearly every text).
+/// indexes, and never English stopwords (`the` is a substring of nearly every text). Besides the
+/// pieces, each whole numeric token ([`numeric_tokens`]) is one more term, first, whatever the
+/// query's length: an ASCII term, so the raw tier reads at most its newest k matches (bounded).
 pub fn trigram_terms(query: &str) -> Vec<String> {
     let short_query = has_few_pieces(query);
     let mut out = TermList::new(MAX_TERMS);
+    for t in numeric_tokens(query) {
+        out.push(
+            t.chars()
+                .take(MAX_TERM_CHARS)
+                .collect::<String>()
+                .to_lowercase(),
+        );
+    }
     for w in pieces(query) {
         if out.is_full() {
             break;
@@ -354,9 +382,10 @@ pub fn trigram_terms(query: &str) -> Vec<String> {
     out.terms
 }
 
-/// Trigram search helps scripts without spaces and very short queries (one or two pieces).
+/// Trigram search helps scripts without spaces, very short queries (one or two pieces) and
+/// queries that hold a numeric token (a date, a version, a phone number).
 pub fn should_use_trigram(query: &str) -> bool {
-    !query.is_ascii() || has_few_pieces(query)
+    !query.is_ascii() || has_few_pieces(query) || numeric_tokens(query).next().is_some()
 }
 
 /// Run one candidate query. Never fails: an FTS error is logged and means no matches.
@@ -1539,6 +1568,103 @@ mod tests {
                 chunk_trigram(&c, q, 10),
                 chunk_code(&c, q, 10),
             );
+        }
+    }
+
+    /// F2 (M1 carry): dates, phone numbers, versions, IP addresses and ranges are one bounded
+    /// trigram term as well as their parts, whatever the length of the query.
+    #[test]
+    fn numeric_tokens_are_whole_trigram_terms() {
+        for tok in [
+            "2026-10-14",
+            "081-234-5678",
+            "1.13.0",
+            "43.229.151.35",
+            "10-20",
+            "14/10/2026",
+            "09:30",
+        ] {
+            assert!(trigram_terms(tok).contains(&tok.to_string()), "{tok}");
+            assert!(should_use_trigram(tok), "{tok}");
+        }
+        // In a long question the pieces are not searched by substring, the token is.
+        let q = "what changed in the deploy on 2026-10-14 for the whole team please";
+        assert_eq!(trigram_terms(q), vec!["2026-10-14".to_string()]);
+        assert!(should_use_trigram(q));
+        // Sentence punctuation is not part of it; upper case is folded; each token once.
+        assert_eq!(
+            trigram_terms("Released v1.13.0, then 1.13.1. (v1.13.0)"),
+            vec!["v1.13.0".to_string(), "1.13.1".to_string()]
+        );
+        // No digit, no separator, or something that is not a number-like token: nothing new.
+        for q in [
+            "self.writer_lease",
+            "crates/alice-core/src",
+            "well-known",
+            "v2",
+            "1234",
+        ] {
+            assert_eq!(numeric_tokens(q).count(), 0, "{q}");
+        }
+        // A token is bounded like any term.
+        let long = format!("{}-1", "9".repeat(200));
+        assert!(
+            trigram_terms(&long)
+                .iter()
+                .all(|t| t.chars().count() <= MAX_TERM_CHARS)
+        );
+    }
+
+    #[test]
+    fn an_exact_date_version_ip_or_phone_finds_only_the_text_that_has_it() {
+        let texts = [
+            "Rotate the signing key on 2026-10-14 after the incident",
+            "Rotate the signing key on 2026-10-15 after the incident",
+            "Rotate the signing key on 2025-10-14 after the incident",
+            "Upgrade the broker to 1.13.0 before the freeze",
+            "Upgrade the broker to 1.13.1 before the freeze",
+            "Upgrade the broker to 11.3.0 before the freeze",
+            "The admin box answers on 43.229.151.35 only",
+            "The admin box answers on 43.229.151.36 only",
+            "Call the on-call phone 081-234-5678 for outages",
+            "Call the on-call phone 081-234-5679 for outages",
+            "Allow 10-20 retries per minute",
+            "Allow 10-25 retries per minute",
+        ];
+        let (_d, c) = db_with(&texts);
+        let seqs: Vec<i64> = texts
+            .iter()
+            .map(|t| {
+                c.query_row("SELECT seq FROM memories WHERE body = ?1", [t], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+            })
+            .collect();
+        for (exact, query) in [
+            (0, "2026-10-14"),
+            (3, "1.13.0"),
+            (6, "43.229.151.35"),
+            (8, "081-234-5678"),
+            (10, "10-20"),
+        ] {
+            assert_eq!(
+                memory_trigram(&c, query, 10),
+                vec![seqs[exact]],
+                "{query}: the substring list holds the exact text only"
+            );
+        }
+        // The raw tier too (an ASCII term reads its newest matches, bounded).
+        let owned: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
+        let (_d2, rc, rseqs) = chunks_db(&owned);
+        for (exact, query) in [
+            (0, "when was the key rotated 2026-10-14 exactly"),
+            (3, "1.13.0"),
+            (6, "43.229.151.35"),
+            (8, "081-234-5678"),
+            (10, "10-20"),
+        ] {
+            assert_eq!(chunk_trigram(&rc, query, 10), vec![rseqs[exact]], "{query}");
         }
     }
 }

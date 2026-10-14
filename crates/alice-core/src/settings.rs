@@ -350,6 +350,9 @@ pub struct SearchSettings {
     pub default_max_tokens: usize,
     /// Cosine similarity at which a match found only by meaning counts as relevant (0 to 1).
     pub relevance_floor: f64,
+    /// A match found only by meaning is dropped when it is more than this below the best such
+    /// match of the query (0 to 1; 0 turns the relative cut off). Word matches always stay.
+    pub relevance_margin: f64,
     /// Fewer relevant memories than this bring in raw transcript chunks (0 to 50).
     pub raw_fallback_min_results: usize,
     /// Ranking multipliers.
@@ -362,9 +365,10 @@ impl Default for SearchSettings {
     fn default() -> Self {
         Self {
             default_max_tokens: crate::model::limits::DEFAULT_RECALL_TOKENS,
-            // `search::DEFAULT_RELEVANCE_FLOOR` as written (the f32 widened would show as
-            // 0.8199999928474426); a test keeps the two equal.
-            relevance_floor: 0.82,
+            // `search::DEFAULT_RELEVANCE_FLOOR` and `DEFAULT_RELEVANCE_MARGIN` as written (the
+            // f32 widened would show as 0.8199999928474426); a test keeps them equal.
+            relevance_floor: 0.79,
+            relevance_margin: 0.03,
             raw_fallback_min_results: 3,
             weights: Weights::default(),
             half_life: HalfLives::default(),
@@ -1324,6 +1328,7 @@ impl Settings {
 
         let s = &self.search;
         unit(&mut e, "search.relevance_floor", s.relevance_floor);
+        unit(&mut e, "search.relevance_margin", s.relevance_margin);
         if !(100..=50_000).contains(&s.default_max_tokens) {
             e.push(err(
                 "search.default_max_tokens",
@@ -1987,7 +1992,8 @@ mod tests {
             (0.85, 0.5)
         );
         assert_eq!(s.judge.jev.model, "jev-1.13.0");
-        assert_eq!(s.search.relevance_floor, 0.82);
+        assert_eq!(s.search.relevance_floor, 0.79);
+        assert_eq!(s.search.relevance_margin, 0.03);
         assert_eq!(s.storage.raw_retention, Retention::Forever);
         assert_eq!((s.backup.daily, s.backup.weekly), (7, 4));
         assert_eq!(s.secrets.backend, SecretsBackend::File);
@@ -2003,6 +2009,10 @@ mod tests {
             crate::search::DEFAULT_RELEVANCE_FLOOR
         );
         assert_eq!(
+            s.search.relevance_margin as f32,
+            crate::search::DEFAULT_RELEVANCE_MARGIN
+        );
+        assert_eq!(
             s.search.default_max_tokens,
             crate::model::limits::DEFAULT_RECALL_TOKENS
         );
@@ -2013,7 +2023,11 @@ mod tests {
         // Shown as written, not as an f32 widened to f64 (0.8199999928474426).
         assert_eq!(
             get_key(&s, "search.relevance_floor"),
-            Some(serde_json::json!(0.82))
+            Some(serde_json::json!(0.79))
+        );
+        assert_eq!(
+            get_key(&s, "search.relevance_margin"),
+            Some(serde_json::json!(0.03))
         );
         assert_eq!(
             get_key(&s, "judge.cluster_similarity"),
@@ -2080,6 +2094,16 @@ mod tests {
                 "",
                 &[("ALICE_SEARCH_RELEVANCE_FLOOR", "very")],
                 "search.relevance_floor",
+            ),
+            (
+                "[search]\nrelevance_margin = 1.5\n",
+                &[],
+                "search.relevance_margin",
+            ),
+            (
+                "",
+                &[("ALICE_SEARCH_RELEVANCE_MARGIN", "-0.1")],
+                "search.relevance_margin",
             ),
             (
                 "[storage]\nraw_retention = \"soon\"\n",
@@ -2359,6 +2383,11 @@ mod tests {
             r.settings.storage.raw_retention,
             Retention::Age(std::time::Duration::from_secs(90 * 86_400))
         );
+        // 0 turns the relative cut off; a bare 0 and a number from the environment both parse.
+        let r = resolve(Some("[search]\nrelevance_margin = 0\n"), &[]).unwrap();
+        assert_eq!(r.settings.search.relevance_margin, 0.0);
+        let r = resolve(None, &env(&[("ALICE_SEARCH_RELEVANCE_MARGIN", "0.05")])).unwrap();
+        assert_eq!(r.settings.search.relevance_margin, 0.05);
         let r = resolve(None, &env(&[("ALICE_JUDGE_JEV_MODEL", "1.13")])).unwrap();
         assert_eq!(
             r.settings.judge.jev.model, "1.13",

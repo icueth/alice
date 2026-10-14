@@ -166,7 +166,7 @@ agent ที่ใช้ MCP ไม่ได้ เรียกผ่าน CLI 
 
 | Tool | หน้าที่ |
 |---|---|
-| `recall` | ค้นหา memory กรองตามโปรเจกต์, topic, kind และช่วงวันได้ ใส่ `include_raw` เพื่อค้น transcript ด้วย กำหนดงบ `max_tokens` ได้ *(วางแผนไว้ใน M2: `mode: precise` ให้ Judge เรียงผลใหม่)* |
+| `recall` | ค้นหา memory กรองตามโปรเจกต์, topic, kind และช่วงวันได้ ใส่ `include_raw` เพื่อค้น transcript ด้วย กำหนดงบ `max_tokens` ได้ `mode: precise` ให้ Judge เรียงผลอันดับต้น ๆ ใหม่ (ช้ากว่า ต้องตั้ง `judge.provider = jev`) |
 | `remember` | บันทึก memory (`kind`, `title`, `topics`, `importance`, `supersedes`) เรียกซ้ำได้ปลอดภัย |
 | `context` | สรุปของโปรเจกต์ปัจจุบันภายในงบ token |
 | `get_memory` | ดู memory ฉบับเต็ม พร้อม link และแหล่งที่มา |
@@ -179,7 +179,7 @@ server ส่งคำแนะนำการใช้งานให้ agent 
 ## CLI
 
 ```
-alice recall <query> [--project p] [--kind k]... [--topic t]... [--raw] [--limit n]
+alice recall <query> [--project p] [--kind k]... [--topic t]... [--raw] [--precise] [--limit n]
              [--max-tokens n] [--since date] [--before date]
 alice remember [--kind k] [--title t] [--topic t]... [--project p] [--importance 1-5]
                [--supersedes id]... (<text> | -)

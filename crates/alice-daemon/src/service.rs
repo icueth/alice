@@ -18,13 +18,13 @@ use alice_core::api::*;
 use alice_core::embed::Embedder;
 use alice_core::error::{AliceError, Result};
 use alice_core::ids::new_id;
-use alice_core::judge::Judge;
 use alice_core::judge::jev::JevTransport;
-use alice_core::model::limits;
+use alice_core::judge::{Judge, JudgeMemory, RELEVANCE_ANSWERS, RELEVANCE_PARTIAL};
+use alice_core::model::{Kind, limits};
 use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
 use alice_core::redact::Redactor;
-use alice_core::search::{self, SearchParams, pack};
+use alice_core::search::{self, SearchOutput, SearchParams, pack};
 use alice_core::settings::{self, SettingError, Settings};
 use alice_core::store::embeddings;
 use alice_core::store::events::Actor;
@@ -60,6 +60,9 @@ const PREDICATE_WAIT: Duration = Duration::from_secs(3);
 const PREDICATE_CANDIDATES: usize = 10;
 /// Predicate names read to find the similar ones (most used first).
 const PREDICATE_VOCABULARY: usize = 500;
+
+/// Results the judge grades in precise mode (spec §4.4 step 4).
+const PRECISE_TOP: usize = 20;
 
 /// What the judge decided for a predicate that is new to the vocabulary.
 #[derive(Default)]
@@ -914,6 +917,14 @@ impl Service {
         // Embedded before a reader connection is taken: the model is shared with the
         // embedding worker, and a recall waiting for it must not hold a connection.
         let text = search::query_text(&req.query)?;
+        let (precise, judged_query) = (req.mode == RecallMode::Precise, text.clone());
+        // Precise mode grades PRECISE_TOP results and keeps `limit` of them, so it searches
+        // for at least that many.
+        let search_limit = if precise {
+            limit.max(PRECISE_TOP)
+        } else {
+            limit
+        };
         let vector = match &index {
             Some(idx) => {
                 let (idx, embedder) = (idx.clone(), self.embedder.clone());
@@ -949,9 +960,10 @@ impl Service {
                     since: req.since,
                     before: req.before,
                     include_raw: req.include_raw,
-                    limit,
+                    limit: search_limit,
                     // The one place the f64 setting becomes the f32 the search compares with.
                     relevance_floor: cfg.search.relevance_floor as f32,
+                    relevance_margin: cfg.search.relevance_margin as f32,
                     raw_min_results: cfg.search.raw_fallback_min_results,
                     half_lives: cfg.search.half_life.clone(),
                     lists: search::Lists::Hybrid,
@@ -968,6 +980,11 @@ impl Service {
                 Ok((out, scope.project.slug))
             })
             .await?;
+        let mut out = out;
+        let mut reranked = false;
+        if precise {
+            (out, reranked) = self.rerank(out, &slug, &judged_query, limit).await;
+        }
         let (response, touched) = match format {
             OutputFormat::Text => {
                 let (text, omitted) = pack::pack_text(&out, Some(&slug), max_tokens);
@@ -977,15 +994,16 @@ impl Service {
                     project: Some(slug),
                     omitted,
                     raw_fallback: out.raw_fallback,
+                    reranked,
                     text: Some(text),
                     ..Default::default()
                 };
                 (response, touched)
             }
             OutputFormat::Json => {
-                let mut out = out;
                 let seqs = std::mem::take(&mut out.memory_seqs);
-                let response = pack::pack_json(out, Some(slug), max_tokens);
+                let mut response = pack::pack_json(out, Some(slug), max_tokens);
+                response.reranked = reranked;
                 let touched = returned_memories(seqs, &response.results);
                 (response, touched)
             }
@@ -994,6 +1012,112 @@ impl Service {
             self.writer.send_nowait(WriteOp::TouchAccess(touched));
         }
         Ok(response)
+    }
+
+    /// Precise mode (spec §4.4 step 4): the judge grades the top `PRECISE_TOP` results in one
+    /// batched call and the memories among them are re-ordered by P(relevant), in the places
+    /// those memories held (raw chunks, and memories of a project the cloud may not see, keep
+    /// theirs). Then `limit` results are kept. Without a model judge, or when it answers
+    /// `Denied`, `Budget` or an error, or too slowly, the order is the search's and the
+    /// answer says so (`false`). The call is scoped to the project the query was asked from.
+    async fn rerank(
+        &self,
+        mut out: SearchOutput,
+        query_project: &str,
+        query: &str,
+        limit: usize,
+    ) -> (SearchOutput, bool) {
+        let judge = self.judge();
+        let mut reranked = false;
+        let model = judge.provider() != "heuristic" && self.judge.cloud_allowed(query_project);
+        if model {
+            // Knowledge hits among the top, with their place in the hit list.
+            let graded: Vec<(usize, JudgeMemory)> = out
+                .hits
+                .iter()
+                .take(PRECISE_TOP)
+                .enumerate()
+                .filter(|(_, h)| h.tier == Tier::Knowledge && self.judge.cloud_allowed(&h.project))
+                .map(|(i, h)| {
+                    let ordinal = out.hits[..i]
+                        .iter()
+                        .filter(|p| p.tier == Tier::Knowledge)
+                        .count();
+                    (
+                        i,
+                        JudgeMemory {
+                            id: h.id.clone(),
+                            project: h.project.clone(),
+                            kind: h.kind.unwrap_or(Kind::Note),
+                            title: h.title.clone(),
+                            body: h.body.clone().unwrap_or_else(|| h.snippet.clone()),
+                            importance: out.memory_importance.get(ordinal).copied().unwrap_or(3),
+                            created_at: h.created_at.clone(),
+                            similarity: None,
+                        },
+                    )
+                })
+                .collect();
+            if graded.len() > 1 {
+                let wait = Duration::from_millis(self.settings().judge.timeout_ms) * 2;
+                let (q, p) = (query.to_string(), query_project.to_string());
+                let ms: Vec<JudgeMemory> = graded.iter().map(|(_, m)| m.clone()).collect();
+                let asked = tokio::time::timeout(
+                    wait,
+                    tokio::task::spawn_blocking(move || judge.grade_relevance(&p, &q, &ms)),
+                )
+                .await;
+                match asked {
+                    Ok(Ok(Ok(grades))) if grades.len() == graded.len() => {
+                        let mut scored: Vec<(usize, f64)> = graded
+                            .iter()
+                            .zip(&grades)
+                            .filter(|(_, d)| !d.0.is_empty())
+                            .map(|((i, _), d)| {
+                                (*i, d.p(RELEVANCE_ANSWERS) + 0.5 * d.p(RELEVANCE_PARTIAL))
+                            })
+                            .collect();
+                        let slots: Vec<usize> = scored.iter().map(|(i, _)| *i).collect();
+                        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                        let mut order: Vec<usize> = (0..out.hits.len()).collect();
+                        for (slot, (from, _)) in slots.iter().zip(&scored) {
+                            order[*slot] = *from;
+                        }
+                        reranked = !scored.is_empty();
+                        out = reorder(out, &order);
+                    }
+                    Ok(Ok(Ok(_))) => tracing::warn!("the judge graded another number of results"),
+                    Ok(Ok(Err(e))) => {
+                        tracing::debug!(error = %e, "precise recall: the judge did not grade; the search order stands")
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "precise recall: the grading task failed")
+                    }
+                    Err(_) => tracing::debug!("precise recall: the judge was too slow"),
+                }
+            }
+        }
+        // Back to what was asked for; the related memories follow the final top results.
+        out.hits.truncate(limit);
+        let shown = out
+            .hits
+            .iter()
+            .filter(|h| h.tier == Tier::Knowledge)
+            .count();
+        out.memory_seqs.truncate(shown);
+        out.memory_importance.truncate(shown);
+        if reranked {
+            let ids: Vec<String> = out
+                .hits
+                .iter()
+                .filter(|h| h.tier == Tier::Knowledge)
+                .map(|h| h.id.clone())
+                .collect();
+            if let Ok(related) = self.read(move |c| search::related_for(c, &ids)).await {
+                out.related = related;
+            }
+        }
+        (out, reranked)
     }
 
     pub async fn context(&self, req: ContextRequest) -> Result<ContextResponse> {
@@ -2044,6 +2168,36 @@ impl Drop for Service {
             self.writer.send_nowait(WriteOp::Shutdown);
         }
     }
+}
+
+/// `out` with its hits in the order `order` says (`order[i]` is the old index of the hit now at
+/// `i`; a permutation), the knowledge hits' `memory_seqs` and importances following their hits.
+fn reorder(mut out: SearchOutput, order: &[usize]) -> SearchOutput {
+    let ordinals: Vec<Option<usize>> = {
+        let mut n = 0;
+        out.hits
+            .iter()
+            .map(|h| {
+                (h.tier == Tier::Knowledge).then(|| {
+                    n += 1;
+                    n - 1
+                })
+            })
+            .collect()
+    };
+    let hits = std::mem::take(&mut out.hits);
+    let (seqs, importance) = (
+        std::mem::take(&mut out.memory_seqs),
+        std::mem::take(&mut out.memory_importance),
+    );
+    for &from in order {
+        out.hits.push(hits[from].clone());
+        if let Some(k) = ordinals[from] {
+            out.memory_seqs.push(seqs[k]);
+            out.memory_importance.push(importance[k]);
+        }
+    }
+    out
 }
 
 /// The memories a response returns, out of `seqs` (one per knowledge hit, in hit order): those
@@ -5395,5 +5549,294 @@ mod tests {
             .unwrap();
         assert_eq!(out.predicate, "deployed_on");
         assert_eq!(t.sent(), before, "no request against a budget of zero");
+    }
+
+    // ------------------------------------------------------------------ precise recall
+
+    /// Grades results that contain `keyword` as answering the query, the rest as unrelated;
+    /// every other question (the judge worker's) is answered `unrelated`. Counts requests.
+    struct KeywordGrader {
+        keyword: &'static str,
+        grading_calls: std::sync::atomic::AtomicUsize,
+        fail_grading: AtomicBool,
+        /// The states of the grading requests.
+        graded_states: Mutex<Vec<String>>,
+    }
+
+    impl KeywordGrader {
+        fn new(keyword: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                keyword,
+                grading_calls: Default::default(),
+                fail_grading: AtomicBool::new(false),
+                graded_states: Default::default(),
+            })
+        }
+
+        fn graded(&self) -> usize {
+            self.grading_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl alice_core::judge::jev::JevTransport for KeywordGrader {
+        fn post(
+            &self,
+            _endpoint: &str,
+            _key: &str,
+            body: &[u8],
+            _timeout: Duration,
+        ) -> std::result::Result<
+            alice_core::judge::jev::HttpReply,
+            alice_core::judge::jev::TransportError,
+        > {
+            let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let state = req["state"].as_str().unwrap();
+            let mut answers = serde_json::Map::new();
+            let mut grading = false;
+            for (qid, q) in req["questions"].as_object().unwrap() {
+                let options: Vec<String> =
+                    q["criteria"].as_object().unwrap().keys().cloned().collect();
+                let (choice, other) = if let Some(k) = qid.strip_prefix("r_") {
+                    grading = true;
+                    let k: usize = k.parse().unwrap();
+                    let block = state
+                        .split(&format!("Result {k} ("))
+                        .nth(1)
+                        .unwrap_or("")
+                        .split("\nResult ")
+                        .next()
+                        .unwrap_or("");
+                    if block.contains(self.keyword) {
+                        ("answers", "unrelated")
+                    } else {
+                        ("unrelated", "answers")
+                    }
+                } else {
+                    ("unrelated", "duplicate")
+                };
+                let probs: serde_json::Map<String, serde_json::Value> = options
+                    .iter()
+                    .map(|o| {
+                        let p = if o == choice {
+                            0.9
+                        } else if o == other {
+                            0.05
+                        } else {
+                            0.05 / (options.len().max(3) - 2) as f64
+                        };
+                        (o.clone(), serde_json::json!(p))
+                    })
+                    .collect();
+                answers.insert(
+                    qid.clone(),
+                    serde_json::json!({"type": "choice", "choice": choice, "confidence": 0.9, "probabilities": probs}),
+                );
+            }
+            if grading {
+                self.graded_states.lock().push(state.to_string());
+                self.grading_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_grading.load(Ordering::SeqCst) {
+                    return Ok(alice_core::judge::jev::HttpReply {
+                        status: 503,
+                        body: b"{}".to_vec(),
+                        retry_after: Some(Duration::ZERO),
+                    });
+                }
+            }
+            let resp = serde_json::json!({"model": "jev-1.13.0", "answers": answers,
+                "usage": {"input_tokens": 800, "output_tokens": 0}});
+            Ok(alice_core::judge::jev::HttpReply {
+                status: 200,
+                body: serde_json::to_vec(&resp).unwrap(),
+                retry_after: None,
+            })
+        }
+    }
+
+    async fn svc_with_grader(t: Arc<KeywordGrader>) -> (tempfile::TempDir, Arc<Service>) {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                jev_transport: Some(t),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        (d, s)
+    }
+
+    const DEPLOY_NOTES: [&str; 3] = [
+        "deploy notes: staging deploy runs make deploy",
+        "deploy notes: the ZEBRA cluster deploy uses blue green",
+        "deploy notes: deploy freeze on Fridays",
+    ];
+
+    fn recall_req(query: &str, mode: RecallMode, cwd: &Option<String>) -> RecallRequest {
+        RecallRequest {
+            query: query.into(),
+            mode,
+            cwd: cwd.clone(),
+            format: OutputFormat::Json,
+            ..Default::default()
+        }
+    }
+
+    async fn remember_deploy_notes(s: &Service, cwd: &Option<String>) {
+        for text in DEPLOY_NOTES {
+            remember_id(s, text, Some(Kind::Howto), cwd).await;
+        }
+        wait_settled(s).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_mode_reorders_by_the_judges_relevance_and_fast_mode_does_not() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let fast = s
+            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        assert!(!fast.reranked);
+        assert_eq!(t.graded(), 0, "fast mode never asks the judge to grade");
+        let order = |r: &RecallResponse| {
+            r.results
+                .iter()
+                .map(|h| h.title.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            fast.results[0].title,
+            DEPLOY_NOTES[1],
+            "the test needs the judge to change the order: {:?}",
+            order(&fast)
+        );
+        let precise = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(precise.reranked);
+        assert_eq!(t.graded(), 1, "one batched call");
+        assert!(
+            precise.results[0].title.contains("ZEBRA"),
+            "{:?}",
+            order(&precise)
+        );
+        assert_eq!(precise.results.len(), fast.results.len());
+        let mut a = order(&fast);
+        let mut b = order(&precise);
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "the same results, in another order");
+        // Text format carries the flag too.
+        let text = s
+            .recall(RecallRequest {
+                format: OutputFormat::Text,
+                ..recall_req("deploy notes", RecallMode::Precise, &cwd)
+            })
+            .await
+            .unwrap();
+        assert!(text.reranked && text.text.unwrap().contains("ZEBRA"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_mode_keeps_the_search_order_when_the_judge_cannot_grade() {
+        // The offline judge does not grade: precise is fast.
+        let (d, s) = svc().await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let fast = s
+            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        let precise = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(!precise.reranked);
+        let ids = |r: &RecallResponse| r.results.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&fast), ids(&precise));
+
+        // An outage, a used-up budget and a denied project leave the order alone too.
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let fast = s
+            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        t.fail_grading.store(true, Ordering::SeqCst);
+        let broken = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(!broken.reranked, "a failing judge does not fail recall");
+        assert_eq!(ids(&fast), ids(&broken));
+        t.fail_grading.store(false, Ordering::SeqCst);
+        let before = t.graded();
+        s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(0.0)))
+            .unwrap();
+        let broke = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(!broke.reranked);
+        assert_eq!(ids(&fast), ids(&broke));
+        assert_eq!(
+            t.graded(),
+            before,
+            "nothing is sent against a budget of zero"
+        );
+    }
+
+    /// Precise mode sends the query and results of allowed projects only, scoped to the
+    /// project the query was asked from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_mode_sends_nothing_from_a_denied_project() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "filed");
+        std::fs::write(
+            std::path::Path::new(cwd.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        remember_deploy_notes(&s, &cwd).await;
+        let r = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(!r.reranked);
+        assert_eq!(t.graded(), 0, "the query of a denied project is not sent");
+        // Asked from an open project, a denied project's memories are left in place, not sent.
+        let open = repo(&d, "open");
+        remember_deploy_notes(&s, &open).await;
+        let r = s
+            .recall(RecallRequest {
+                project: None,
+                ..recall_req("deploy notes", RecallMode::Precise, &open)
+            })
+            .await
+            .unwrap();
+        assert!(r.reranked);
+        assert_eq!(t.graded(), 1);
+        let state = t.graded_states.lock()[0].clone();
+        assert!(state.contains("project open"), "{state}");
+        assert!(
+            !state.contains("project filed"),
+            "a denied project's memories stay out of the request: {state}"
+        );
+        assert!(
+            r.results.iter().any(|h| h.project == "filed"),
+            "but they are still results, in their places"
+        );
     }
 }

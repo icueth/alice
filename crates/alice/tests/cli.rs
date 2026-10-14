@@ -1284,7 +1284,7 @@ fn config_list_unset_delete_secret_and_the_problems_shown() {
     );
     assert_eq!(
         env.json(&["config", "get", "search.relevance_floor"]),
-        serde_json::json!(0.82)
+        serde_json::json!(0.79)
     );
     let missing = env.run(&["config", "get", "no.such.key"]);
     assert!(!missing.status.success());
@@ -1555,4 +1555,28 @@ fn review_inbox_and_stats_through_the_cli() {
         .to_string();
     e.ok(&["review", "resolve", &second_item, "apply"]);
     assert!(e.ok(&["get", &id]).contains("third text"));
+}
+
+#[test]
+fn recall_precise_reaches_the_daemon() {
+    let e = Env::new();
+    e.ok(&["remember", "precise flag check about lease timeouts"]);
+    eventually(
+        || e.recall_count("lease timeouts") > 0,
+        "the memory to be found",
+    );
+    let fast = e.json(&["recall", "lease timeouts"]);
+    assert_eq!(fast["reranked"], false, "fast mode never re-ranks");
+    // The offline judge cannot grade: precise mode answers as fast mode does, and says so.
+    let precise = e.json(&["recall", "lease timeouts", "--precise"]);
+    assert_eq!(precise["reranked"], false, "{precise}");
+    assert_eq!(
+        precise["results"].as_array().unwrap().len(),
+        fast["results"].as_array().unwrap().len()
+    );
+    let text = e.ok(&["recall", "lease timeouts", "--precise"]);
+    assert!(text.contains("lease timeouts"), "{text}");
+    assert!(!text.contains("re-ranked by the judge"), "{text}");
+    let help = e.run(&["recall", "--help"]);
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--precise"));
 }

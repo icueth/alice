@@ -235,6 +235,52 @@ Only the candidates the four recall modes returned plus the vector top 20 withou
 | 0.80 | 94% (90–96%, 204/217) | 99% (96–100%, 214/217) | 80% (77–82%, 725/910) | 86% (84–88%, 784/910) |
 | 0.82 | 74% (68–80%, 161/217) | 92% (87–95%, 199/217) | 46% (43–50%, 421/910) | 59% (56–62%, 539/910) |
 
+### Floor policy chosen in Task 13
+
+**Tuned on the synthetic set above; not evidence about any other corpus.** The shipped search
+now (1) rescores each memory candidate with its exact stored f16 vector before the floor is
+applied (the int8 HNSW similarity can sit a little low; the rows above already hold exact
+cosines, so this step cannot show up in the numbers below), (2) applies an absolute floor
+`search.relevance_floor` and (3) drops a vector-only candidate more than `search.relevance_margin`
+below the best vector similarity of its tier among the candidates that pass the filters. A
+lexical match passes at any similarity, as before.
+
+*Protocol.* The 20 cross-lingual and paraphrase queries (Jev graded every memory for them; 70
+memories answer, P(answers) >= 0.5, and one query has no answer, so 19 queries enter the recall
+averages). Grid: floor 0.76 to 0.80 in steps of 0.005, margin 0.01 to 0.20 in steps of 0.005, and
+no margin. Objective: the mean over queries of the share of answering memories kept (cosine or
+lexical top 50). Constraint: the share of the other memories admitted, pooled over the queries
+used for choosing, is at most what floor 0.82 admits on the same queries (6.3% over all 20).
+Leave-one-query-out: choose on 19 queries, score the held-out one, 20 folds.
+
+*Choices.* Floor 0.79 with margin 0.03 in 11 folds, 0.79 with 0.02 in 8, 0.795 with 0.03 in 1;
+on all 20 queries 0.79 and 0.03 (the defaults).
+
+| | before: floor 0.82, no margin | chosen: floor 0.79, margin 0.03 |
+|---|---|---|
+| held-out (leave-one-query-out), recall of answering memories, mean over 19 queries | 74.4% | 74.1% |
+| held-out, recall pooled over the 70 answering memories | 72.9% (51/70) | 65.7% (46/70) |
+| held-out, other memories admitted (mean over 20 queries) | 6.3% | 5.8% |
+| all 20 queries, same rule fitted on them: recall, mean over queries | 74.4% | 78.1% |
+| all 20 queries, recall pooled | 72.9% (51/70) | 68.6% (48/70) |
+| all 20 queries, other memories admitted | 6.3% (541/8570) | 6.2% (535/8570) |
+| 50 same-language queries, among retrieved results: answering kept | 96.4% (108/112) | 89.3% (100/112) |
+| same, other graded results admitted | 62.1% (630/1015) | 42.7% (433/1015) |
+
+*What this says.* Under the rule "admit no more of the other memories than 0.82 does", **no
+floor/margin pair in the grid keeps more answering memories than floor 0.82 alone**: the held-out
+mean recall is the same to within 0.3 points, pooled recall is lower, and admission is about 0.5
+points lower. The margin is worth having for what it does to the same-language queries (a
+third fewer other results admitted, at a cost of 7 points of recall among retrieved results,
+whose lexical matches pass either way). The recall the two-part rule can add is only available
+with more admission: for example floor 0.79 with margin 0.04 keeps 75.7% (53/70, mean 85.9%) and
+admits 10.3%; floor 0.79 without a margin keeps 91.4% and admits 27.9%. The two settings are
+`config set search.relevance_floor` and `search.relevance_margin` (0 turns the margin off), so
+the trade can be moved without a release. Real model, shared gold set (`real_search_quality`):
+every gold pair is at or above 0.79, no unrelated pair is, the raw fallback fires for 6 of 6
+unrelated queries, and 6 of the 10 queries that share no word with their memory are returned
+(4 of 10 at floor 0.82), all in the top 3.
+
 ### Cost and latency
 
 Jev requests 1447 (answered 1447, cache hits 0, retries 0, failures 0); input tokens 2734033; latency p50 335 ms, p95 664 ms; ledger total $0.1148; $0.0113 per 1,000 decisions (10199 decisions: 216 relation pairs, 216 kinds, 9767 graded pairs).

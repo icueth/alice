@@ -15,7 +15,9 @@
 use alice_core::embed::{Embedder, cosine, memory_embed_text};
 use alice_core::model::Kind;
 use alice_core::project::ProjectRef;
-use alice_core::search::{DEFAULT_RELEVANCE_FLOOR, SearchParams, fusion::Weights, run};
+use alice_core::search::{
+    DEFAULT_RELEVANCE_FLOOR, DEFAULT_RELEVANCE_MARGIN, SearchParams, fusion::Weights, run,
+};
 use alice_core::store::embeddings::VecKey;
 use alice_core::store::{memories, open_writer, projects, sources};
 use alice_core::vector::{KeyFilter, VectorIndex};
@@ -52,7 +54,7 @@ struct VectorOnly {
     query: &'static str,
     /// Memory id from the gold file.
     want: &'static str,
-    /// Measured with the default floor (0.82) and the int8 memory index on Apple Silicon: in the
+    /// Measured with the default policy (floor 0.79, margin 0.03) and the int8 memory index on Apple Silicon: in the
     /// top 3 (true) or not returned at all (false: no lexical match, similarity below the floor).
     /// A change to the floor policy or to the model changes this column, and
     /// docs/benchmarks/m2.md with it. Rows within `PIN_MARGIN` of the floor are not pinned.
@@ -76,7 +78,7 @@ const VECTOR_ONLY: &[VectorOnly] = &[
         what: "Thai for English",
         query: "เก็บจำนวนเงินเป็นสตริงเพื่อไม่ให้ปัดเศษผิด",
         want: "money",
-        returned_at_default_floor: false,
+        returned_at_default_floor: true,
     },
     VectorOnly {
         what: "Thai for English",
@@ -112,7 +114,7 @@ const VECTOR_ONLY: &[VectorOnly] = &[
         what: "paraphrase",
         query: "binary envelopes are mandatory; a text payload cannot be decoded",
         want: "proto",
-        returned_at_default_floor: false,
+        returned_at_default_floor: true,
     },
     VectorOnly {
         what: "paraphrase",
@@ -337,6 +339,13 @@ fn real_model_gold_set_and_relevance_floor() {
         current_project_id: Some(p.id.clone()),
         limit: 10,
         relevance_floor: floor,
+        // The shipped policy is the floor and the margin; "no floor" (a negative one) lets
+        // every candidate through, the margin included.
+        relevance_margin: if floor < 0.0 {
+            0.0
+        } else {
+            DEFAULT_RELEVANCE_MARGIN
+        },
         raw_min_results: 3,
         ..Default::default()
     };
