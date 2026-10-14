@@ -498,10 +498,11 @@ impl SettingsHandle {
 
     /// Whether the privacy rules for `root` are in a fail-closed state right now rather than
     /// the ones a person configured: `config.toml` is degraded, or the project's `.alice.toml`
-    /// is invalid or unreadable, or blank on its first look, or a loosening of it is waiting for
-    /// its polls. A write refused under such rules may be accepted a moment later.
+    /// is invalid or unreadable, or blank on its first look, or a loosening of it (or of `config.toml`) is
+    /// waiting for its polls. A write refused under such rules may be accepted a moment later.
     pub fn project_fail_closed(&self, root: Option<&Path>) -> bool {
         self.config_degraded()
+            || self.loosening_waiting()
             || root.is_some_and(|r| {
                 let l = self.projects.get(r);
                 l.error.is_some() || l.loosening_pending
@@ -1436,5 +1437,19 @@ mod tests {
             "back to what is in force: nothing to apply"
         );
         assert!(!s.loosening_waiting());
+    }
+
+    /// A loosening of `config.toml` that is still waiting for its polls counts as a fail-closed
+    /// state: a write refused meanwhile may be accepted once it applies.
+    #[test]
+    fn a_waiting_config_loosening_is_a_fail_closed_state() {
+        let (_d, h) = home();
+        write(&h, "[privacy]\nredact_mode = \"block\"\n");
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert!(!s.project_fail_closed(None));
+        write(&h, "");
+        assert!(s.reload_if_changed().is_none());
+        assert!(s.loosening_waiting());
+        assert!(s.project_fail_closed(None), "pending loosening");
     }
 }

@@ -172,11 +172,13 @@ fn comparable(v: Option<serde_json::Value>) -> Option<serde_json::Value> {
     })
 }
 
-/// An undo that the rules refuse says so as an undo, and what to do instead.
+/// An undo that the rules refuse says so as an undo: block mode refused the restore, which
+/// field and which detector (never the text), and that the change stays as it is.
 fn refused_undo(e: AliceError) -> AliceError {
     match e {
-        e @ AliceError::Refused { .. } => AliceError::invalid(format!(
-            "cannot undo: {e}. The earlier text holds a secret; edit the memory by hand instead"
+        AliceError::Refused { field, detectors } => AliceError::invalid(format!(
+            "cannot undo: the privacy rules (block mode) refused to restore the earlier {field}, which contains what looks like a secret ({}); nothing was changed",
+            detectors.join(", ")
         )),
         e => e,
     }

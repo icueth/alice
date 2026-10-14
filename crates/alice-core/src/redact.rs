@@ -79,49 +79,105 @@ fn any(_: &str) -> bool {
     true
 }
 
-/// `snake_case_name`, `module.name` or `name_v2`: every segment lowercase letters with at most
-/// two trailing digits, and at least one `_` or `.`. A value like that is code, not a password.
-fn identifier_like(v: &str) -> bool {
-    let segments: Vec<&str> = v.split(['_', '.']).collect();
-    segments.len() > 1
-        && segments.iter().all(|seg| {
-            let letters = seg.trim_end_matches(|c: char| c.is_ascii_digit());
-            let digits = seg.len() - letters.len();
-            !letters.is_empty() && digits <= 2 && letters.chars().all(|c| c.is_ascii_lowercase())
-        })
+/// Prefixes of function names that read a value from somewhere: `token = get_token_from_cache`
+/// names code that fetches a secret, it is not one.
+const ACCESSOR_PREFIXES: &[&str] = &[
+    "get_",
+    "load_",
+    "read_",
+    "fetch_",
+    "parse_",
+    "make_",
+    "build_",
+    "create_",
+    "new_",
+    "resolve_",
+    "lookup_",
+    "generate_",
+    "compute_",
+];
+
+/// A value that is code and not a secret: a call or an index, a dotted attribute access
+/// (`config.secret_value`, `process.env.X`), or a call to an accessor by name. A plain
+/// `snake_case` word is not evidence of code: passphrases look like that, so redaction errs
+/// toward redacting it.
+fn code_like(v: &str) -> bool {
+    let attribute = v.contains('.')
+        && v.split('.').all(|p| {
+            p.chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
+                && p.chars().all(|c| c.is_alphanumeric() || c == '_')
+        });
+    v.contains(['(', '[']) || attribute || ACCESSOR_PREFIXES.iter().any(|a| v.starts_with(a))
 }
 
+/// A path segment that reads as a word: path characters only, and no run of case changes
+/// (`4AAQSkZJRgAB` is base64, `Users`, `AI` and `project-alice` are not).
+fn path_word(seg: &str) -> bool {
+    let ok = seg
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    let chars: Vec<char> = seg.chars().collect();
+    let rises = chars
+        .windows(2)
+        .filter(|w| w[0].is_lowercase() && w[1].is_uppercase())
+        .count();
+    ok && rises < 2
+}
+
+/// A file path rather than a secret: it starts with `/`, `~/`, `./` or `../`, has at least two
+/// segments that read as words, and is not random-looking. Base64 such as `/9j/4AAQ...` has the
+/// same outline and must still be redacted. (The entropy bound is higher than the detectors' own,
+/// because real paths such as `/Users/icue/Code/AI/project-alice` reach 4 bits per character;
+/// the word test does the separating.)
+fn path_like(v: &str) -> bool {
+    let rest = ["~/", "./", "../", "/"]
+        .iter()
+        .find_map(|p| v.strip_prefix(p));
+    let Some(rest) = rest else { return false };
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    segments.len() >= 2 && segments.iter().all(|s| path_word(s)) && entropy(v) < PATH_ENTROPY
+}
+
+/// Bits per character from which a path-shaped value counts as random.
+const PATH_ENTROPY: f64 = 4.5;
+
+/// Bits per character from which a long token-shaped value counts as random.
+const HIGH_ENTROPY: f64 = 3.5;
+
 /// A value after `password =` etc. that is a secret, not code or prose: no call, index,
-/// template, path or identifier; not an ENV_NAME; and either letters with digits or long and
-/// varied.
+/// template or path; not an ENV_NAME; and either letters with digits or long and varied.
 fn secret_value(v: &str) -> bool {
     if v.starts_with("[REDACTED")
         || v.contains(['(', ')', '[', ']', '{', '}', '<', '>', '$'])
-        || v.starts_with(['/', '~'])
-        || v.starts_with("./")
-        || v.starts_with("../")
+        || code_like(v)
+        || path_like(v)
     {
         return false;
     }
-    let dotted = v.contains('.')
-        && v.split('.')
-            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || c == '_'));
     let env_name = v
         .chars()
         .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    if dotted || env_name || identifier_like(v) {
+    if env_name {
         return false;
     }
     let letters = v.chars().any(|c| c.is_alphabetic());
     let digits = v.chars().any(|c| c.is_ascii_digit());
-    (letters && digits) || (v.chars().count() >= 16 && entropy(v) >= 3.0)
+    // A separator inside a word (`hunter_two`) is how people write passphrases; plain prose
+    // (`required`) has none.
+    let separator = v.contains(['_', '-']);
+    (letters && digits) || separator || (v.chars().count() >= 16 && entropy(v) >= 3.0)
+}
+
+/// The value after a command-line flag such as `--password`: anything that is not another
+/// flag, a variable or code.
+fn flag_value(v: &str) -> bool {
+    !v.starts_with(['-', '$']) && !v.starts_with("[REDACTED") && !v.contains(['(', ')', '{', '}'])
 }
 
 fn high_entropy(v: &str) -> bool {
-    !v.starts_with("[REDACTED")
-        && !v.starts_with(['/', '~'])
-        && !identifier_like(v)
-        && entropy(v) >= 3.5
+    !v.starts_with("[REDACTED") && !code_like(v) && !path_like(v) && entropy(v) >= HIGH_ENTROPY
 }
 
 fn builtin_detectors() -> Vec<Detector> {
@@ -152,7 +208,7 @@ fn builtin_detectors() -> Vec<Detector> {
         ),
         d(
             "aws_secret_key",
-            r#"(?i)\baws_?secret_?(?:access_?)?key\b\s*[:=]\s*["']?([A-Za-z0-9/+=]{40})"#,
+            r#"(?i)(?-u:\b)aws_?secret_?(?:access_?)?key(?-u:\b)\s*[:=]\s*["']?([A-Za-z0-9/+=]{40})"#,
             1,
             any,
         ),
@@ -195,7 +251,7 @@ fn builtin_detectors() -> Vec<Detector> {
         ),
         d(
             "url_credentials",
-            r"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@\[\]]+:([^\s/@\[\]]+)@",
+            r"(?-u:\b)[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@\[\]]+:([^\s/@\[\]]+)@",
             1,
             any,
         ),
@@ -204,6 +260,12 @@ fn builtin_detectors() -> Vec<Detector> {
             r#"(?i)(?:[A-Za-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|auth[_-]?token|client[_-]?secret)|รหัสผ่าน)["']?\s*[:=]\s*["']?([^\s"',;]{6,})"#,
             1,
             secret_value,
+        ),
+        d(
+            "password_assignment",
+            r#"(?i)(?:^|[\s"'])--(?:password|passwd|token|secret|api-key|client-secret)(?:\s+|=)["']?([^\s"',;]{6,})"#,
+            1,
+            flag_value,
         ),
         d(
             "high_entropy",
@@ -544,9 +606,12 @@ mod tests {
         "PWD=/Users/icue/Code/AI/project-alice",
         "token = get_token_from_cache_or_refresh",
         "api_key = get_api_key_from_environment_variable",
-        "password = my_password_field_name_v2",
         "secret = ~/.config/alice/secret-file",
         "token = ./relative/token_path",
+        "password = /Users/me/project",
+        "secret = ~/.ssh/config",
+        "token = ./build/out",
+        "run --password-file ./secrets/pw --token-file ~/.t",
     ];
 
     #[test]

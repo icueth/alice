@@ -878,3 +878,29 @@ async fn a_root_answer_that_predates_list_changed_is_not_kept() {
     assert_eq!(agent.asked(), 2);
     client.cancel().await.unwrap();
 }
+
+/// A secret that `block` mode refuses reaches an MCP client as a tool error naming the detector.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_secret_is_a_tool_error_naming_the_detector() {
+    let (_d, _home, d) = daemon().await;
+    let mut change = serde_json::Map::new();
+    change.insert("privacy.redact_mode".into(), serde_json::json!("block"));
+    d.svc.settings_handle().patch(&change).unwrap();
+    let client = TestClient.serve(http_transport(&d)).await.unwrap();
+    let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let r = client
+        .call_tool(call(
+            "remember",
+            serde_json::json!({"content": format!("key {token}")}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.is_error, Some(true));
+    let text = first_text(&r);
+    assert!(
+        text.contains("github_token") && !text.contains(token),
+        "{text}"
+    );
+    client.cancel().await.ok();
+    d.stop().await;
+}

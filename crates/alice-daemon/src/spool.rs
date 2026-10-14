@@ -92,6 +92,11 @@ fn reject(dir: &Path, file: &Path, why: &str) {
     }
 }
 
+/// Entries already reported as kept because of a fail-closed state: the drain runs every few
+/// seconds and a state can last for hours, so each entry is reported once, not on every drain.
+static REPORTED: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
 /// Drop an entry that `block` mode refuses and keep the reason next to the rejected ones. The
 /// entry itself is not kept: its text holds what the rules forbid on disk. Failures are logged,
 /// not swallowed.
@@ -120,6 +125,10 @@ fn withhold(dir: &Path, file: &Path, why: &str) {
 pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
     let mut report = DrainReport::default();
     let files = entries(dir);
+    // Forget entries that are gone, so a new one with the same name would be reported again.
+    REPORTED
+        .lock()
+        .retain(|p| p.parent() != Some(dir) || files.contains(p));
     for (i, file) in files.iter().enumerate() {
         let parsed: Result<SpoolEntry, String> = std::fs::read(file)
             .map_err(|e| e.to_string())
@@ -153,10 +162,12 @@ pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
                     .rules_fail_closed(scope.0.as_deref(), scope.1.as_deref())
                     .await
                 {
-                    tracing::warn!(
-                        entry = %file.display(),
-                        "a spooled request stays queued: the privacy rules of its project are in a fail-closed state (check .alice.toml and config.toml)"
-                    );
+                    if REPORTED.lock().insert(file.clone()) {
+                        tracing::warn!(
+                            entry = %file.display(),
+                            "a spooled request stays queued: the privacy rules of its project are in a fail-closed state (check .alice.toml and config.toml)"
+                        );
+                    }
                     report.remaining += 1;
                     continue;
                 }
@@ -419,6 +430,18 @@ mod tests {
         let r = drain(&dir, &svc).await;
         assert_eq!((r.processed, r.rejected, r.remaining), (0, 0, 1));
         assert_eq!(pending_count(&dir), 1, "still queued");
+        // A second drain keeps it too, and reports it only once.
+        let again = drain(&dir, &svc).await;
+        assert_eq!(again.remaining, 1);
+        assert!(
+            REPORTED
+                .lock()
+                .iter()
+                .filter(|p| p.starts_with(&dir))
+                .count()
+                == 1,
+            "one report per entry"
+        );
         assert!(!dir.join("rejected").exists());
         std::fs::write(
             work.join(".alice.toml"),
