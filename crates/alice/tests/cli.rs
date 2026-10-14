@@ -2249,6 +2249,12 @@ fn service_commands(root: &std::path::Path) -> Vec<String> {
     std::fs::read_to_string(root.join("service-commands.log"))
         .unwrap_or_default()
         .lines()
+        // The questions asked of the manager (is it loaded?) are not actions.
+        .filter(|l| {
+            !["launchctl print", "is-active", "/Query"]
+                .iter()
+                .any(|p| l.contains(p))
+        })
         .map(String::from)
         .collect()
 }
@@ -2297,6 +2303,15 @@ fn restore_stops_the_installed_service_unit_and_starts_it_again() {
     assert!(during[0].starts_with(stop), "{during:?}");
     assert!(during[1].starts_with(start), "{during:?}");
     assert_eq!(env.recall_count("backup"), 1, "the restore itself worked");
+}
+
+/// The words of the probe that asks the manager whether the unit is loaded.
+fn probe_word() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "launchctl print"
+    } else {
+        "is-active"
+    }
 }
 
 /// The service command words that stop and start the unit on this platform.
@@ -2358,14 +2373,24 @@ fn service_install_creates_the_log_directory_of_the_home() {
         std::fs::metadata(&env.home).unwrap().permissions().mode() & 0o777,
         0o700
     );
+    let logs = std::fs::metadata(env.home.join("logs"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        logs & 0o700,
+        0o700,
+        "the owner can write the log directory: {logs:o}"
+    );
     // A dry run creates nothing.
     let fresh = Env::new();
     fresh.ok(&["service", "install", "--dry-run"]);
     assert!(!fresh.home.join("logs").exists());
 }
 
-/// A unit that cannot be stopped while its daemon runs refuses the restore with nothing changed.
-/// With no daemon alive a failed stop is "it was not running": the restore goes ahead.
+/// A loaded unit that cannot be stopped refuses the restore with nothing changed; one that is not
+/// loaded is left alone and the restore goes ahead.
 #[test]
 fn restore_is_refused_when_the_unit_cannot_be_stopped_and_a_daemon_runs() {
     let env = Env::new();
@@ -2391,17 +2416,17 @@ fn restore_is_refused_when_the_unit_cannot_be_stopped_and_a_daemon_runs() {
     assert_eq!(log.len(), before + 1, "only the failed stop: {log:?}");
     assert!(!log[before..].iter().any(|l| l.contains(start)), "{log:?}");
     assert_eq!(env.recall_count("beta"), 1, "nothing was restored");
-    // No daemon alive: the same failure means the unit was not running; the restore goes on.
-    env.ok(&["daemon", "stop"]);
+    // A unit the manager does not have loaded (the probe fails, whatever the language): nothing
+    // to stop, whether a daemon runs or not; the restore goes on and starts nothing afterwards.
+    let before = service_commands(&env.svc).len();
     let mut c = env.cmd(&["restore", &name, "--yes"]);
-    c.env("ALICE_SERVICE_FAIL", stop);
+    c.env("ALICE_SERVICE_FAIL", probe_word());
     let o = c.output().unwrap();
     assert!(o.status.success(), "{}", stderr(&o));
-    assert!(
-        !service_commands(&env.svc)[before + 1..]
-            .iter()
-            .any(|l| l.contains(start)),
-        "nothing was stopped, so nothing is started"
+    assert_eq!(
+        service_commands(&env.svc).len(),
+        before,
+        "an unloaded unit is neither stopped nor started"
     );
 }
 
@@ -2532,4 +2557,69 @@ fn a_killed_secret_prompt_puts_the_terminal_echo_back() {
     assert_eq!(wrote as usize, answer.len());
     assert!(child.wait().unwrap().success());
     assert!(echo_on(&slave), "echo is back after the answer");
+}
+
+/// In sandbox mode (`ALICE_SERVICE_ROOT`) `service` and `restore` say that nothing is run.
+#[test]
+fn the_service_sandbox_says_so_on_stderr() {
+    let env = Env::new();
+    let o = env.run(&["service", "install"]);
+    assert!(o.status.success());
+    let want = format!(
+        "service commands are recorded in {}, not run (ALICE_SERVICE_ROOT is set)",
+        env.svc.display()
+    );
+    assert!(stderr(&o).contains(&want), "{}", stderr(&o));
+    env.ok(&["remember", "x"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let o = env.run(&["restore", &name, "--yes"]);
+    assert!(o.status.success());
+    assert!(stderr(&o).contains(&want), "{}", stderr(&o));
+    // And an autostarted daemon does not call the variable a typo.
+    let log = std::fs::read_to_string(env.home.join("logs/daemon.log")).unwrap_or_default();
+    assert!(!log.contains("ALICE_SERVICE_ROOT"), "{log}");
+}
+
+/// `alice service status` names the home the unit serves, and says when it is another one.
+#[test]
+fn service_status_names_the_home_the_unit_serves() {
+    let env = Env::new();
+    assert_eq!(env.ok(&["service", "status"]).trim(), "not installed");
+    env.ok(&["service", "install"]);
+    let text = env.ok(&["service", "status"]);
+    assert!(
+        text.starts_with("installed (") && text.contains(&format!("for {}", env.home.display())),
+        "{text}"
+    );
+    let other = env.home.parent().unwrap().join("elsewhere");
+    let o = env
+        .cmd(&["service", "status"])
+        .env("ALICE_HOME", &other)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        text.contains("serves") && text.contains("not this data directory"),
+        "{text}"
+    );
+    let j = env.json(&["service", "status"]);
+    assert_eq!(j["serves_this_home"], true);
+}
+
+/// `--target-dir` still prepares the home's own directories, not the target's.
+#[test]
+fn service_install_with_a_target_dir_creates_the_homes_logs_not_the_targets() {
+    let env = Env::new();
+    let target = env.home.parent().unwrap().join("elsewhere-root");
+    env.ok(&[
+        "service",
+        "install",
+        "--target-dir",
+        target.to_str().unwrap(),
+    ]);
+    assert!(env.home.join("logs").is_dir());
+    assert!(!target.join("logs").exists());
 }

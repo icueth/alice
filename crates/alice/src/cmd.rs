@@ -1872,6 +1872,10 @@ fn service_root(target_dir: Option<std::path::PathBuf>) -> Result<ServiceRoot> {
         });
     }
     if let Some(path) = std::env::var_os("ALICE_SERVICE_ROOT").filter(|v| !v.is_empty()) {
+        eprintln!(
+            "service commands are recorded in {}, not run (ALICE_SERVICE_ROOT is set)",
+            Path::new(&path).display()
+        );
         return Ok(ServiceRoot {
             path: path.into(),
             mode: ServiceMode::Sandbox,
@@ -1960,23 +1964,24 @@ fn suspend_service(home: &AliceHome) -> Result<Option<Suspended>> {
     let Some(runner) = runner_for(&root) else {
         return Ok(None);
     };
-    // Only a unit that serves the home being restored; and a stop that fails is judged by
-    // whether a daemon of this home is alive.
-    let alive = || startup::lock_holder(home).is_some();
+    // Only a unit that serves the home being restored, and only one the manager has loaded.
     match svcinst::suspend(
         platform,
         &root.path,
         user_id(),
         home.root(),
         runner.as_ref(),
-        &alive,
     ) {
-        Ok(true) => Ok(Some(Suspended {
-            platform,
-            root,
-            runner,
-        })),
-        Ok(false) => Ok(None),
+        Ok(sus) => {
+            if let Some(n) = &sus.notice {
+                eprintln!("{n}");
+            }
+            Ok(sus.ended.then_some(Suspended {
+                platform,
+                root,
+                runner,
+            }))
+        }
         Err(e) => bail!(
             "the installed service could not be stopped ({e}); nothing was changed. It would start a daemon in the middle of the restore: stop it yourself (`alice service uninstall`), retry, and `alice service install` again afterwards"
         ),
@@ -2073,28 +2078,45 @@ fn service_command(home: &AliceHome, c: ServiceCmd, json: bool) -> Result<()> {
             })
         }
         ServiceCmd::Status => {
+            use svcinst::UnitOwner;
             let root = service_root(None)?;
+            // Windows keeps the task in the Task Scheduler, not in a file: only the real one is asked.
+            let owner = if platform == Platform::Windows && root.mode != ServiceMode::Real {
+                UnitOwner::None
+            } else {
+                svcinst::unit_owner(platform, &root.path, home.root(), &SystemRunner)
+            };
             let unit = svcinst::installed(platform, &root.path);
-            // Windows keeps the task in the Task Scheduler, not in a file.
-            let task =
-                (platform == Platform::Windows && root.mode == ServiceMode::Real).then(|| {
-                    SystemRunner
-                        .run(&[
-                            "schtasks".into(),
-                            "/Query".into(),
-                            "/TN".into(),
-                            svcinst::TASK.into(),
-                        ])
-                        .is_ok()
-                });
-            let installed = unit.is_some() || task == Some(true);
+            let place = unit
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| format!("scheduled task {}", svcinst::TASK));
+            let serves = match &owner {
+                UnitOwner::Other(h) => Some(h.clone()),
+                UnitOwner::This => Some(home.root().to_path_buf()),
+                _ => None,
+            };
             print(
                 json,
-                &serde_json::json!({ "installed": installed, "path": unit }),
-                || match (&unit, task) {
-                    (Some(p), _) => format!("installed ({})\n", p.display()),
-                    (None, Some(true)) => format!("installed (scheduled task {})\n", svcinst::TASK),
-                    _ => "not installed\n".into(),
+                &serde_json::json!({
+                    "installed": owner != UnitOwner::None,
+                    "path": unit,
+                    "serves": serves,
+                    "serves_this_home": owner == UnitOwner::This,
+                }),
+                || match &owner {
+                    UnitOwner::None => "not installed\n".into(),
+                    UnitOwner::This => {
+                        format!("installed ({place}) for {}\n", home.root().display())
+                    }
+                    UnitOwner::Other(h) => format!(
+                        "installed ({place}), but it serves {}, not this data directory ({})\n",
+                        h.display(),
+                        home.root().display()
+                    ),
+                    UnitOwner::Unreadable => format!(
+                        "installed ({place}), but the data directory it serves could not be read\n"
+                    ),
                 },
             )
         }

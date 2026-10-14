@@ -43,6 +43,10 @@ pub const NON_SETTING_ENV: &[&str] = &[
     "ALICE_TEST_BULK",
     "ALICE_RECALL_EXTRA_DIR",
     "ALICE_RECALL_PASSAGES",
+    // Test hooks of `alice service` and `alice restore`: a directory that records service
+    // commands instead of running them, and a word that makes a recorded command fail.
+    "ALICE_SERVICE_ROOT",
+    "ALICE_SERVICE_FAIL",
     "ALICE_EMBEDDING_API_KEY",
 ];
 
@@ -2150,6 +2154,26 @@ mod tests {
         assert_eq!(
             get_key(&s, "judge.cluster_similarity"),
             Some(serde_json::json!(0.92))
+        );
+    }
+
+    /// The variables the service commands read are known, not typos: no warning.
+    #[test]
+    fn the_service_test_hooks_are_not_unknown_variables() {
+        let r = resolve(
+            None,
+            &env(&[
+                ("ALICE_SERVICE_ROOT", "/tmp/x"),
+                ("ALICE_SERVICE_FAIL", "stop"),
+                ("ALICE_SERVICE_ROOTT", "typo"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(
+            r.warnings[0].contains("ALICE_SERVICE_ROOTT"),
+            "{:?}",
+            r.warnings
         );
     }
 

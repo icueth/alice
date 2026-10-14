@@ -1059,6 +1059,9 @@ fn lower_priority() {
 
 #[cfg(test)]
 mod tests {
+    /// Trashed memories the purge-latency test purges.
+    const PURGE_TEST_MEMORIES: usize = 6_000;
+
     use super::*;
     use crate::writer::{ProjectChoice, spawn_writer};
     use alice_core::store::memories::{InsertOutcome, NewMemoryInput};
@@ -2158,17 +2161,25 @@ mod tests {
         assert_eq!(r.sched.quiet_secs(&s), 600);
     }
 
-    /// I-8: a purge of thousands of memories does not make a `remember` wait for the lot.
+    /// I-8: a purge of thousands of memories does not make a `remember` wait for the lot. The
+    /// bound does not depend on how fast the machine is: the worst wait is compared with the
+    /// purge's own duration (one slice is a small part of it; without slicing the one big write
+    /// takes about all of it), plus a hang guard.
     #[test]
     fn a_remember_during_a_big_purge_waits_for_a_slice_not_for_the_purge() {
         let r = rig();
-        r.insert_trashed_memories(6_000, "2020-01-01T00:00:00.000Z");
+        r.insert_trashed_memories(PURGE_TEST_MEMORIES, "2020-01-01T00:00:00.000Z");
         let sched = r.sched.clone();
-        let t =
-            std::thread::spawn(move || sched.run_job(Job::TrashPurge, chrono::Utc::now(), true));
+        let t = std::thread::spawn(move || {
+            let started = Instant::now();
+            let report = sched.run_job(Job::TrashPurge, chrono::Utc::now(), true);
+            (report, started.elapsed())
+        });
         let mut worst = Duration::ZERO;
         let mut n = 0;
-        while !t.is_finished() && n < 200 {
+        let hang_guard = Instant::now() + Duration::from_secs(300);
+        while !t.is_finished() {
+            assert!(Instant::now() < hang_guard, "the purge never finished");
             let started = Instant::now();
             r.writer
                 .submit_blocking(WriteOp::Remember {
@@ -2183,14 +2194,12 @@ mod tests {
             n += 1;
             std::thread::sleep(Duration::from_millis(2));
         }
-        let report = t.join().unwrap();
+        let (report, purge) = t.join().unwrap();
         assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
-        assert!(n > 0);
-        // Generous: a slice is ~25 ms, and a loaded Windows runner has been seen at 2.7 s for a
-        // write; waiting for the whole purge would be many times that.
+        assert!(n > 3, "only {n} writes got in during a purge of {purge:?}");
         assert!(
-            worst < Duration::from_secs(10),
-            "worst remember {worst:?} over {n}"
+            worst < purge / 3,
+            "worst remember {worst:?} over {n} writes, during a purge of {purge:?}"
         );
         assert_eq!(
             r.count("SELECT count(*) FROM memories WHERE status = 'trashed'"),

@@ -631,6 +631,17 @@ async fn stream(
     Sse::new(s).keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE))
 }
 
+/// Ends a response body (an MCP session's event stream) when the token it was opened with is
+/// rotated. A request is checked against the token before it gets here; this cuts the ones that
+/// were already open.
+async fn end_on_rotation(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    use futures::StreamExt;
+    let ends = st.streams.lock().clone();
+    let (parts, body) = next.run(req).await.into_parts();
+    let stream = body.into_data_stream().take_until(ends.cancelled_owned());
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
+}
+
 /// Build the router: the public ping, and everything else (the JSON API and the MCP service
 /// at `/mcp`) behind the token, Host and Origin guard.
 pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: CancellationToken) -> Router {
@@ -680,12 +691,16 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         )
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         .route("/api/v1/admin/token/rotate", post(rotate_token))
-        // Before the guard layer, so `/mcp` is covered by it.
-        .nest_service(
-            "/mcp",
-            crate::mcp::http_service(state.svc.clone(), port, state.shutdown.clone()),
+        .with_state(state.clone())
+        // Before the guard layer, so `/mcp` is covered by it. Its streams end on a rotation too.
+        .merge(
+            Router::new()
+                .nest_service(
+                    "/mcp",
+                    crate::mcp::http_service(state.svc.clone(), port, state.shutdown.clone()),
+                )
+                .layer(middleware::from_fn_with_state(state, end_on_rotation)),
         )
-        .with_state(state)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn_with_state(g, guard));
     public.merge(private)

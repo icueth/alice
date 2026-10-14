@@ -94,6 +94,9 @@ fn take_and_announce(home: &AliceHome) -> anyhow::Result<Option<File>> {
     };
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
+    // Whatever daemon.json exists now is stale (its writer no longer holds the lock): drop it
+    // before the slow part of starting, so no client pings a port that may be someone else's.
+    let _ = std::fs::remove_file(home.daemon_json());
     if let Err(e) = startup::write_pid_file(home) {
         tracing::warn!(error = %e, "cannot write daemon.pid; clients may not see this daemon while it starts");
     }
@@ -112,9 +115,6 @@ pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
     };
     // A killed `alice restore` may have left its staged files; none runs while we hold the lock.
     crate::restore::sweep_staged(&home);
-    // Whatever daemon.json exists now is stale (its writer no longer holds the lock): drop it
-    // before the slow part of starting, so no client pings a port that may be someone else's.
-    let _ = std::fs::remove_file(home.daemon_json());
     // A new attempt: the last failed start's reason no longer applies.
     startup::clear_error(&home);
     // Always printed (not subject to ALICE_LOG): process tests count this line to prove a single instance.
@@ -400,7 +400,12 @@ mod tests {
         .unwrap();
         let staged = home.root().join(".alice-restore.tmp");
         std::fs::write(&staged, b"x").unwrap();
+        std::fs::write(home.daemon_json(), b"{\"stale\": true}").unwrap();
         let lock = take_and_announce(&home).unwrap().expect("the lock is free");
+        assert!(
+            !home.daemon_json().exists(),
+            "a stale daemon.json is dropped first"
+        );
         let rec = startup::read_pid_file(&home).unwrap();
         assert_eq!(rec.pid, std::process::id(), "the stale record is replaced");
         assert!(rec.unix_ms > 1);

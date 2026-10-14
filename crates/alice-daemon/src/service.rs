@@ -6871,7 +6871,12 @@ mod tests {
         // The failed calls above may still be retrying in the background: count from when the
         // transport has been quiet for a while, so only a request of the next call is counted.
         let mut before = t.sent();
+        let quiet_by = Instant::now() + Duration::from_secs(60);
         loop {
+            assert!(
+                Instant::now() < quiet_by,
+                "the failing transport never went quiet"
+            );
             tokio::time::sleep(Duration::from_millis(500)).await;
             let now = t.sent();
             if now == before {
