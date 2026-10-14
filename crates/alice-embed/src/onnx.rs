@@ -43,9 +43,16 @@ pub use alice_core::embed::MODEL_LOADING;
 pub struct OnnxOptions {
     /// Unload the model after this long without use (`None` or zero: never).
     pub idle_unload: Option<Duration>,
-    /// ONNX Runtime intra-op threads (`None`: all cores).
+    /// ONNX Runtime intra-op threads (`None`: [`DEFAULT_INTRA_THREADS`], or fewer cores).
     pub intra_threads: Option<usize>,
 }
+
+/// Threads ONNX Runtime uses for one call when nothing asks for more. The daemon runs in the
+/// background beside the person's own work, and measured on 14 cores (10 performance, 4
+/// efficiency; see docs/benchmarks/m2.md, Task 6) four threads answer a query ~25% faster than
+/// all of them (the efficiency cores slow every call down), use ~35% less CPU to embed the same
+/// texts, and still embed ~110 passages/s against ~135.
+pub const DEFAULT_INTRA_THREADS: usize = 4;
 
 struct Model {
     session: Session,
@@ -65,10 +72,17 @@ fn ort_err(e: impl std::fmt::Display) -> AliceError {
     ))
 }
 
+/// The intra-op threads to use: the one asked for, else [`DEFAULT_INTRA_THREADS`] or the number
+/// of cores when there are fewer (2 when that cannot be told).
+fn threads_for(requested: Option<usize>, cores: Option<usize>) -> usize {
+    requested.unwrap_or_else(|| cores.map_or(2, |n| n.min(DEFAULT_INTRA_THREADS)))
+}
+
 fn load(onnx: &Path, threads: Option<usize>) -> Result<Model> {
-    let threads = threads
-        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
-        .unwrap_or(4);
+    let threads = threads_for(
+        threads,
+        std::thread::available_parallelism().ok().map(|n| n.get()),
+    );
     let session = Session::builder()
         .map_err(ort_err)?
         .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
@@ -276,6 +290,18 @@ impl Embedder for OnnxEmbedder {
 mod tests {
     use super::token_batches;
     use super::*;
+
+    /// The daemon runs in the background: at most four threads unless asked for more.
+    #[test]
+    fn the_default_thread_count_is_capped_for_a_background_daemon() {
+        assert_eq!(threads_for(None, Some(14)), DEFAULT_INTRA_THREADS);
+        assert_eq!(threads_for(None, Some(8)), 4);
+        assert_eq!(threads_for(None, Some(2)), 2, "never more than the cores");
+        assert_eq!(threads_for(None, Some(1)), 1);
+        assert_eq!(threads_for(None, None), 2, "cores unknown");
+        assert_eq!(threads_for(Some(8), Some(14)), 8, "an explicit count wins");
+        assert_eq!(threads_for(Some(1), Some(2)), 1);
+    }
 
     #[test]
     fn passages_are_batched_by_padded_tokens_in_order() {

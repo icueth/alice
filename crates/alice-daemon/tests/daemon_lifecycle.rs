@@ -344,3 +344,20 @@ async fn a_failed_start_leaves_its_reason_and_a_good_start_clears_it() {
     daemon.shutdown().await;
     finished(running, Duration::from_secs(15)).await.unwrap();
 }
+
+/// With no port asked for, the daemon listens on the `server.port` setting.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_port_setting_picks_the_port() {
+    let (_d, home) = home();
+    home.ensure_dirs().unwrap();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    std::fs::write(home.config_file(), format!("[server]\nport = {port}\n")).unwrap();
+    let running = spawn(&home);
+    let daemon = Daemon::connect(&home).await;
+    assert_eq!(daemon.info.port, port);
+    daemon.shutdown().await;
+    finished(running, Duration::from_secs(20)).await.unwrap();
+}
