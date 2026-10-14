@@ -1299,31 +1299,30 @@ mod tests {
     /// Where systemd reads user units: `$XDG_CONFIG_HOME`, only for the user's real home.
     #[test]
     fn linux_units_follow_xdg_config_home_for_the_real_home_only() {
-        let home = Path::new("/home/u");
-        let xdg = std::ffi::OsString::from("/home/u/cfg");
+        // Absolute on every OS (a path with no drive is relative on Windows).
+        let base = std::env::temp_dir();
+        let home = base.join("u");
+        let cfg = home.join("cfg");
+        let xdg = cfg.clone().into_os_string();
+        let dot = home.join(".config/systemd/user");
         assert_eq!(
-            linux_unit_dir(home, Some(&xdg), Some(home)),
-            PathBuf::from("/home/u/cfg/systemd/user")
+            linux_unit_dir(&home, Some(&xdg), Some(&home)),
+            cfg.join("systemd/user")
         );
-        assert_eq!(
-            linux_unit_dir(home, None, Some(home)),
-            PathBuf::from("/home/u/.config/systemd/user")
-        );
+        assert_eq!(linux_unit_dir(&home, None, Some(&home)), dot);
         let relative = std::ffi::OsString::from("cfg");
         assert_eq!(
-            linux_unit_dir(home, Some(&relative), Some(home)),
-            PathBuf::from("/home/u/.config/systemd/user"),
+            linux_unit_dir(&home, Some(&relative), Some(&home)),
+            dot,
             "a relative XDG_CONFIG_HOME is ignored"
         );
         let empty = std::ffi::OsString::new();
-        assert_eq!(
-            linux_unit_dir(home, Some(&empty), Some(home)),
-            PathBuf::from("/home/u/.config/systemd/user")
-        );
+        assert_eq!(linux_unit_dir(&home, Some(&empty), Some(&home)), dot);
         // A sandbox or `--target-dir` root never follows the real environment.
+        let sandbox = base.join("t");
         assert_eq!(
-            linux_unit_dir(Path::new("/tmp/t"), Some(&xdg), Some(home)),
-            PathBuf::from("/tmp/t/.config/systemd/user")
+            linux_unit_dir(&sandbox, Some(&xdg), Some(&home)),
+            sandbox.join(".config/systemd/user")
         );
     }
 
