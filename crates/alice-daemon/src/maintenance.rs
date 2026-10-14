@@ -2186,9 +2186,10 @@ mod tests {
         let report = t.join().unwrap();
         assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
         assert!(n > 0);
-        // Generous: a slice is ~25 ms; this machine may be busy.
+        // Generous: a slice is ~25 ms, and a loaded Windows runner has been seen at 2.7 s for a
+        // write; waiting for the whole purge would be many times that.
         assert!(
-            worst < Duration::from_secs(2),
+            worst < Duration::from_secs(10),
             "worst remember {worst:?} over {n}"
         );
         assert_eq!(
