@@ -57,7 +57,7 @@ pub enum ReviewStatus {
     Resolved,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewReview {
     pub kind: ReviewType,
     pub payload: serde_json::Value,
@@ -244,15 +244,14 @@ fn subject_ids(t: ReviewType, p: &serde_json::Value) -> Vec<String> {
 const COLS: &str =
     "id, type, payload_json, confidence, status, created_at, resolved_at, resolved_by, resolution";
 
-fn read(conn: &Connection, r: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewItem> {
+/// One row as an item; `None` for a type this build does not know (a row written by a newer
+/// Alice is skipped with a warning, never a failed list).
+fn read(conn: &Connection, r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ReviewItem>> {
     let t: String = r.get(1)?;
-    let review_type = ReviewType::parse(&t).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            1,
-            rusqlite::types::Type::Text,
-            format!("unknown review type \"{t}\"").into(),
-        )
-    })?;
+    let Some(review_type) = ReviewType::parse(&t) else {
+        tracing::warn!(id = %r.get::<_, String>(0)?, review_type = %t, "skipping a review item of an unknown type");
+        return Ok(None);
+    };
     let payload: serde_json::Value =
         serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default();
     let status: String = r.get(4)?;
@@ -275,7 +274,7 @@ fn read(conn: &Connection, r: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewItem
             .flatten()
         })
         .collect();
-    Ok(ReviewItem {
+    Ok(Some(ReviewItem {
         id: r.get(0)?,
         review_type,
         payload,
@@ -291,7 +290,7 @@ fn read(conn: &Connection, r: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewItem
         resolution: r.get(8)?,
         subjects,
         choices: choices(review_type),
-    })
+    }))
 }
 
 pub fn get(conn: &Connection, id: &str) -> Result<Option<ReviewItem>> {
@@ -301,7 +300,8 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<ReviewItem>> {
             [id],
             |r| read(conn, r),
         )
-        .optional()?)
+        .optional()?
+        .flatten())
 }
 
 pub fn list(conn: &Connection, q: &ReviewQuery) -> Result<Vec<ReviewItem>> {
@@ -310,11 +310,17 @@ pub fn list(conn: &Connection, q: &ReviewQuery) -> Result<Vec<ReviewItem>> {
         ReviewStatus::Resolved => "resolved",
     };
     let before: Option<i64> = match &q.before {
-        Some(id) => conn
-            .query_row("SELECT rowid FROM review_items WHERE id = ?1", [id], |r| {
+        Some(id) => Some(
+            conn.query_row("SELECT rowid FROM review_items WHERE id = ?1", [id], |r| {
                 r.get(0)
             })
-            .optional()?,
+            .optional()?
+            .ok_or_else(|| {
+                AliceError::invalid(format!(
+                    "before \"{id}\" is not a review item id; pass the id of the last item you saw, or omit before"
+                ))
+            })?,
+        ),
         None => None,
     };
     let mut stmt = conn.prepare(&format!(
@@ -331,7 +337,11 @@ pub fn list(conn: &Connection, q: &ReviewQuery) -> Result<Vec<ReviewItem>> {
         ],
         |r| read(conn, r),
     )?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    Ok(rows
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// Record a resolution. Fails for an unknown or closed item, or a choice the type does not offer.
@@ -547,5 +557,34 @@ mod tests {
             }),
             vec![cc]
         );
+    }
+
+    #[test]
+    fn an_unknown_type_is_skipped_and_an_unknown_cursor_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        let a = create(&c, &undo_item("k1")).unwrap().unwrap();
+        // A row written by a newer Alice.
+        c.execute(
+            "INSERT INTO review_items (id, type, payload_json, status, created_at) VALUES ('ZNEWER', 'from_the_future', '{}', 'open', '2099-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        let listed = list(&c, &ReviewQuery::default()).unwrap();
+        assert_eq!(
+            listed.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            [a.as_str()]
+        );
+        assert!(get(&c, "ZNEWER").unwrap().is_none());
+        let err = list(
+            &c,
+            &ReviewQuery {
+                before: Some("NOSUCH".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a review item id"), "{err}");
     }
 }

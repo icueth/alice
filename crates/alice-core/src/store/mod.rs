@@ -559,6 +559,82 @@ mod tests {
         add("R4", "resolved").unwrap();
     }
 
+    /// A v2 database migrates to v3: live memories that were never judged are marked done
+    /// (they are not judged after the fact), a memory still waiting for its embedding stays
+    /// pending, and imported (`skipped`) and `retry` rows keep their state.
+    #[test]
+    fn migration_3_marks_live_unjudged_memories_done_and_leaves_the_rest() {
+        let (_d, path) = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)").unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(include_str!("sql/0001_init.sql")).unwrap();
+            tx.execute_batch(include_str!("sql/0002_events_reviews.sql"))
+                .unwrap();
+            tx.execute("INSERT INTO schema_migrations VALUES (1, 'x')", [])
+                .unwrap();
+            tx.execute("INSERT INTO schema_migrations VALUES (2, 'x')", [])
+                .unwrap();
+            for (id, status, judge) in [
+                ("M-ACTIVE", "active", "pending"),
+                ("M-PENDING", "pending", "pending"),
+                ("M-SKIPPED", "active", "skipped"),
+                ("M-RETRY", "active", "retry"),
+            ] {
+                tx.execute(
+                    "INSERT INTO memories (id, project_id, kind, title, body, status, content_hash, created_at, updated_at, hlc, judge_state)
+                     VALUES (?1, '00000000000000000000GLOBAL', 'note', 't', 'b', ?2, ?1,
+                             '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z', 'h', ?3)",
+                    [id, status, judge],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let conn = open_writer(&path).unwrap();
+        let state = |id: &str| -> String {
+            conn.query_row(
+                "SELECT judge_state FROM memories WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            state("M-ACTIVE"),
+            "done",
+            "an M1-era live memory is not judged after the fact"
+        );
+        assert_eq!(
+            state("M-PENDING"),
+            "pending",
+            "a memory still waiting is judged"
+        );
+        assert_eq!(state("M-SKIPPED"), "skipped", "imports are never judged");
+        assert_eq!(state("M-RETRY"), "retry");
+        let (explicit, defaulted, attempts): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT kind_explicit, project_defaulted, judge_attempts FROM memories WHERE id = 'M-ACTIVE'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (explicit, defaulted, attempts),
+            (1, 0, 0),
+            "old rows count as explicit"
+        );
+        let index: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'memories_judge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+    }
+
     #[test]
     fn backup_into_produces_a_readable_copy() {
         let (d, path) = temp_db();

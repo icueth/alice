@@ -5,12 +5,15 @@
 
 use crate::config::SettingsHandle;
 use crate::judge_http::JudgeHub;
+use crate::judge_worker::{JudgeWorkerConfig, spawn_judge_worker};
 use crate::paths::AliceHome;
 use crate::redaction::Redactors;
 use crate::secrets::{self, SecretName, SecretStore};
 use crate::spool;
 use crate::worker::{WorkerConfig, spawn_worker};
-use crate::writer::{ProjectChoice, WriteOp, WriteOutcome, WriterHandle, spawn_writer_with};
+use crate::writer::{
+    ProjectChoice, ResolveText, WriteOp, WriteOutcome, WriterHandle, spawn_writer_with,
+};
 use alice_core::api::*;
 use alice_core::embed::Embedder;
 use alice_core::error::{AliceError, Result};
@@ -44,6 +47,9 @@ use std::time::{Duration, Instant};
 
 /// `None` while the index is being rebuilt; searches then use lexical candidates only.
 pub type IndexSlot = RwLock<Option<Arc<VectorIndex>>>;
+
+/// How long `shutdown` waits for the judge worker to leave a request to the judge.
+const JUDGE_STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a working directory's detected project is reused before git is asked again.
 const DETECT_TTL: Duration = Duration::from_secs(60);
@@ -84,6 +90,8 @@ pub struct ServiceOptions {
     /// The transport the Jev judge posts through; `None` makes the real HTTP client on first
     /// use. Tests pass a scripted one, so none of them reaches the network.
     pub jev_transport: Option<Arc<dyn JevTransport>>,
+    /// How often memories whose judgement failed (the judge was down) are judged again.
+    pub judge_retry_every: Duration,
 }
 
 impl Default for ServiceOptions {
@@ -104,6 +112,7 @@ impl Default for ServiceOptions {
             secret_env: Some(Arc::new(|_: &str| None)),
             secrets_timeout: Duration::from_secs(5),
             jev_transport: None,
+            judge_retry_every: JudgeWorkerConfig::RETRY_EVERY,
         }
     }
 }
@@ -198,7 +207,7 @@ impl ProjectResolver {
         match (explicit_slug(explicit), cwd) {
             (Some(s), _) => ProjectChoice::Slug(s.to_string()),
             (None, Some(c)) => ProjectChoice::Detected(self.detect(c)),
-            (None, None) => ProjectChoice::Slug("global".into()),
+            (None, None) => ProjectChoice::Fallback,
         }
     }
 
@@ -222,6 +231,11 @@ impl ProjectResolver {
         choice: ProjectChoice,
         explicit: bool,
     ) -> Result<ReadScope> {
+        // Nothing named a project: reads see `global` as the current one, like a write does.
+        let (choice, explicit) = match choice {
+            ProjectChoice::Fallback => (ProjectChoice::Slug("global".into()), false),
+            other => (other, explicit),
+        };
         match choice {
             ProjectChoice::Slug(s) => {
                 let p = projects::resolve_slug(conn, &s)?.ok_or_else(|| {
@@ -245,12 +259,19 @@ impl ProjectResolver {
                     project,
                 })
             }
+            ProjectChoice::Fallback => unreachable!("mapped to the global slug above"),
         }
     }
 }
 
-/// The threads `shutdown` joins: the embedding worker, the writer and the config watcher.
-type Threads = (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>);
+/// The threads `shutdown` joins: the embedding worker, the judge worker, the writer and the
+/// config watcher.
+struct Threads {
+    embed: JoinHandle<()>,
+    judge: JoinHandle<()>,
+    writer: JoinHandle<()>,
+    watcher: JoinHandle<()>,
+}
 
 pub struct Service {
     home: AliceHome,
@@ -265,7 +286,8 @@ pub struct Service {
     instance: String,
     stop: Arc<AtomicBool>,
     wake_worker: crossbeam_channel::Sender<()>,
-    /// (embedding worker, writer, config watcher); taken by `shutdown`.
+    wake_judge: crossbeam_channel::Sender<()>,
+    /// Taken by `shutdown`.
     threads: Mutex<Option<Threads>>,
     resolver: ProjectResolver,
     /// The health every event-stream client sends: read at most once per `health_tick`.
@@ -330,6 +352,8 @@ fn redact_field(r: &Redactor, field: &str, text: &str) -> Result<String> {
 fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<PathBuf> {
     match choice {
         ProjectChoice::Detected(r) => r.root.clone(),
+        // `global` has no working tree: the global privacy settings apply.
+        ProjectChoice::Fallback => None,
         ProjectChoice::Slug(s) => readers
             .with(|c| projects::root_of(c, s))
             .ok()
@@ -532,6 +556,8 @@ impl Service {
         let (writer, writer_thread) =
             spawn_writer_with(conn, device, wake_tx.clone(), redactors.clone());
         let stop = Arc::new(AtomicBool::new(false));
+        // bounded(1): the embedding worker wakes the judge worker after each batch it stores.
+        let (judge_wake_tx, judge_wake_rx) = crossbeam_channel::bounded(1);
         let worker_thread = spawn_worker(WorkerConfig {
             readers: readers.clone(),
             writer: writer.clone(),
@@ -542,6 +568,7 @@ impl Service {
             vector_path,
             // `embedding.batch_size` (a restart key: the worker is built once).
             batch: started_with.embedding.batch_size,
+            judge_wake: Some(judge_wake_tx.clone()),
         });
         let judge = JudgeHub::new(
             settings.clone(),
@@ -553,10 +580,24 @@ impl Service {
             opts.jev_transport.clone(),
             opts.secrets_timeout,
         );
+        let judge_model = model.clone();
+        let judge_thread = spawn_judge_worker(JudgeWorkerConfig {
+            readers: readers.clone(),
+            writer: writer.clone(),
+            index: index.clone(),
+            judge: judge.clone(),
+            settings: settings.clone(),
+            redactors: redactors.clone(),
+            model: Arc::new(move || judge_model.clone()),
+            wake: judge_wake_rx,
+            stop: stop.clone(),
+            retry_every: opts.judge_retry_every,
+        });
         if let Err(e) = spawn_config_events(&settings, &writer, &judge) {
-            // The worker and the writer are running already: stop them, do not leak them.
+            // The workers and the writer are running already: stop them, do not leak them.
             stop.store(true, Ordering::SeqCst);
             let _ = wake_tx.try_send(());
+            let _ = judge_wake_tx.try_send(());
             writer.send_nowait(WriteOp::Shutdown);
             return Err(e);
         }
@@ -573,7 +614,13 @@ impl Service {
             instance: new_id(),
             stop,
             wake_worker: wake_tx,
-            threads: Mutex::new(Some((worker_thread, writer_thread, watcher))),
+            wake_judge: judge_wake_tx,
+            threads: Mutex::new(Some(Threads {
+                embed: worker_thread,
+                judge: judge_thread,
+                writer: writer_thread,
+                watcher,
+            })),
             resolver,
             stream_health: tokio::sync::Mutex::new(None),
             settings,
@@ -616,16 +663,34 @@ impl Service {
     /// second; an embedding batch in flight is finished first). Later writes fail with "writer
     /// stopped"; reads keep working. Calling it again does nothing.
     pub fn shutdown(&self) {
-        let Some((worker, writer, watcher)) = self.threads.lock().take() else {
+        let Some(Threads {
+            embed: worker,
+            judge,
+            writer,
+            watcher,
+        }) = self.threads.lock().take()
+        else {
             return;
         };
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.wake_worker.try_send(());
+        let _ = self.wake_judge.try_send(());
         if watcher.join().is_err() {
             tracing::error!("the config watcher panicked");
         }
         if worker.join().is_err() {
             tracing::error!("the embedding worker panicked");
+        }
+        // It may be inside a request to a judge that is slow to answer: wait a moment, then
+        // leave it. Its writes fail once the writer has stopped.
+        let waited = Instant::now();
+        while !judge.is_finished() && waited.elapsed() < JUDGE_STOP_WAIT {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !judge.is_finished() {
+            tracing::warn!("the judge worker is waiting for an answer; stopping without it");
+        } else if judge.join().is_err() {
+            tracing::error!("the judge worker panicked");
         }
         self.writer.send_nowait(WriteOp::Shutdown);
         if writer.join().is_err() {
@@ -647,7 +712,7 @@ impl Service {
         }
     }
 
-    async fn read<T: Send + 'static>(
+    pub(crate) async fn read<T: Send + 'static>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
@@ -950,28 +1015,40 @@ impl Service {
             let found_ids: Vec<String> = found.iter().map(|m| m.id.clone()).collect();
             let mut shown: Vec<String> = Vec::new();
             for m in found {
-                let Some(survivor) = survivor_of(c, &m)? else {
-                    if !shown.contains(&m.id) {
-                        shown.push(m.id.clone());
-                        out.memories.push(full(c, m, req.include_provenance)?);
-                    }
-                    continue;
-                };
                 let asked = req
                     .ids
                     .iter()
                     .find(|id| **id == m.id || m.legacy_id.as_deref() == Some(id.as_str()))
                     .cloned()
                     .unwrap_or_else(|| m.id.clone());
-                out.redirects.push(Redirect {
-                    from: asked,
-                    to: survivor.id.clone(),
-                });
+                let Some(followed) = follow_merges(c, &m)? else {
+                    if !shown.contains(&m.id) {
+                        shown.push(m.id.clone());
+                        out.memories.push(full(c, m, req.include_provenance)?);
+                    }
+                    continue;
+                };
+                for (i, hop) in followed.hops.into_iter().enumerate() {
+                    let hop = if i == 0 {
+                        Redirect { from: asked.clone(), to: hop.to }
+                    } else {
+                        hop
+                    };
+                    if !out.redirects.contains(&hop) {
+                        out.redirects.push(hop);
+                    }
+                }
+                let survivor = followed.last;
+                if followed.truncated {
+                    out.notes.push(format!(
+                        "the merge chain from {asked} is longer than {MAX_MERGE_HOPS} steps; showing {}, which may itself be a merged duplicate",
+                        survivor.id
+                    ));
+                }
                 // A survivor that was asked for too is answered on its own turn.
                 if !found_ids.contains(&survivor.id) && !shown.contains(&survivor.id) {
                     shown.push(survivor.id.clone());
-                    out.memories
-                        .push(full(c, survivor, req.include_provenance)?);
+                    out.memories.push(full(c, survivor, req.include_provenance)?);
                 }
             }
             Ok(out)
@@ -1141,7 +1218,7 @@ impl Service {
     /// Apply one of a review item's choices and record the decision.
     pub async fn resolve_review(&self, req: ResolveRequest) -> Result<ResolveResponse> {
         let actor = Actor::from_author(&req.author);
-        let map_to = {
+        let text = {
             let (id, choice, redactors) =
                 (req.id.clone(), req.choice.clone(), self.redactors.clone());
             self.read(move |c| screen_resolution(c, &redactors, &id, &choice))
@@ -1153,7 +1230,7 @@ impl Service {
                 id: req.id,
                 choice: req.choice.clone(),
                 actor,
-                map_to,
+                text,
             })
             .await?
         {
@@ -1167,6 +1244,12 @@ impl Service {
 
     /// Make `others` duplicates of `survivor` (trashed, linked to it).
     pub async fn merge(&self, req: MergeRequest) -> Result<MergeResponse> {
+        if req.others.len() > MAX_MERGE_OTHERS {
+            return Err(AliceError::invalid(format!(
+                "{} memories to merge is over the limit of {MAX_MERGE_OTHERS} per request; merge them in smaller groups",
+                req.others.len()
+            )));
+        }
         let actor = Actor::from_author(&req.author);
         match self
             .writer
@@ -1194,18 +1277,23 @@ impl Service {
                 })?;
                 Ok(rows.collect::<std::result::Result<_, _>>()?)
             };
-            let count =
-                |sql: &str| -> Result<u64> { Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64) };
+            let count = |sql: &str| -> Result<u64> {
+                Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)
+            };
             let now = chrono::Utc::now();
             let today = now.format("%Y-%m-%d").to_string();
-            let week = (now - chrono::Duration::days(6)).format("%Y-%m-%d").to_string();
+            let week = (now - chrono::Duration::days(6))
+                .format("%Y-%m-%d")
+                .to_string();
             let costs = alice_core::store::judge::cost_since(c, &week)?;
             let mut top = c.prepare(
                 "SELECT p.slug, count(*) FROM memories m JOIN projects p ON p.id = m.project_id
                  WHERE m.status <> 'trashed' GROUP BY p.slug ORDER BY 2 DESC, p.slug LIMIT 20",
             )?;
             let top_projects = top
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+                })?
                 .collect::<std::result::Result<_, _>>()?;
             Ok(Stats {
                 memories_by_status: group("SELECT status, count(*) FROM memories GROUP BY status")?,
@@ -1217,9 +1305,7 @@ impl Service {
                 reviews_open: reviews::count_open(c)?,
                 judge_provider: provider,
                 judge_warning,
-                judge_backlog: count(
-                    "SELECT count(*) FROM memories WHERE judge_state = 'pending' AND status <> 'trashed'",
-                )?,
+                judge_backlog: alice_core::store::judge::judge_backlog(c)?,
                 judge_retry: count("SELECT count(*) FROM memories WHERE judge_state = 'retry'")?,
                 embed_backlog: embeddings::backlog(c)? as u64,
                 cost_today_usd: costs.iter().filter(|r| r.day == today).map(|r| r.usd).sum(),
@@ -1355,6 +1441,9 @@ impl Service {
         secrets: BTreeMap<String, SecretStatus>,
         mut notes: Vec<String>,
     ) -> SettingsView {
+        // The errors before the settings: a reload swaps the settings first and clears the
+        // errors second, so an empty list read here is followed by settings that are new.
+        let errors = self.settings.errors();
         let r = self.settings.resolved();
         let running = &self.started_with;
         let restart_pending: Vec<String> = settings::RESTART_KEYS
@@ -1395,7 +1484,7 @@ impl Service {
             settings: serde_json::to_value(&r.settings).expect("settings serialise"),
             sources: r.sources.clone(),
             keys: settings::key_infos(),
-            errors: self.settings.errors(),
+            errors,
             warnings: self.settings.warnings(),
             config_degraded: self.settings.config_degraded(),
             notes,
@@ -1782,6 +1871,8 @@ impl Service {
         let instance = self.instance.clone();
         let read_only = self.writer.read_only.reason();
         let index_ready = self.index.read().is_some();
+        let judge_provider = self.judge().provider().to_string();
+        let judge_warning = self.judge_warning();
         self.read(move |c| {
             let count = |sql: &str| -> Result<u64> {
                 Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)
@@ -1795,6 +1886,9 @@ impl Service {
                 chunks: count("SELECT count(*) FROM chunks")?,
                 projects: count("SELECT count(*) FROM projects")?,
                 embed_backlog: embeddings::backlog(c)? as u64,
+                judge_backlog: alice_core::store::judge::judge_backlog(c)?,
+                judge_provider,
+                judge_warning,
                 read_only,
                 index_ready,
                 settings_warnings,
@@ -1812,6 +1906,7 @@ impl Drop for Service {
         if self.threads.get_mut().is_some() {
             self.stop.store(true, Ordering::SeqCst);
             let _ = self.wake_worker.try_send(());
+            let _ = self.wake_judge.try_send(());
             self.writer.send_nowait(WriteOp::Shutdown);
         }
     }
@@ -1830,53 +1925,78 @@ fn returned_memories(mut seqs: Vec<i64>, returned: &[Hit]) -> Vec<i64> {
     seqs
 }
 
-/// The live memory a merged duplicate (`m`, in the trash) points at through `duplicate_of`
-/// links, following a chain of merges; `None` when `m` is not trashed, has no such link, or the
-/// chain ends in a memory that is gone or trashed too.
-fn survivor_of(
-    c: &Connection,
-    m: &alice_core::model::Memory,
-) -> Result<Option<alice_core::model::Memory>> {
+/// Most duplicates one merge request may name.
+const MAX_MERGE_OTHERS: usize = 50;
+
+/// Longest chain of merges `get` follows.
+const MAX_MERGE_HOPS: usize = 8;
+
+/// Where a trashed duplicate leads.
+struct Followed {
+    /// The last memory reached: the live survivor, or where the walk stopped.
+    last: alice_core::model::Memory,
+    /// One entry per step, from the duplicate on.
+    hops: Vec<Redirect>,
+    /// The walk stopped at `MAX_MERGE_HOPS` with more links ahead.
+    truncated: bool,
+}
+
+/// Follow `duplicate_of` links from the trashed memory `m` (A merged into B, B into C...) to the
+/// last memory reached; `None` when `m` is not trashed or has no such link.
+fn follow_merges(c: &Connection, m: &alice_core::model::Memory) -> Result<Option<Followed>> {
     use alice_core::model::Status;
     if m.status != Status::Trashed {
         return Ok(None);
     }
+    let next_of = |id: &str| -> Result<Option<String>> {
+        Ok(c.prepare_cached(
+            "SELECT to_id FROM links WHERE from_id = ?1 AND type = 'duplicate_of' ORDER BY created_at DESC, to_id LIMIT 1",
+        )?
+        .query_row([id], |r| r.get(0))
+        .optional()?)
+    };
     let mut visited = vec![m.id.clone()];
-    let mut at = m.id.clone();
-    for _ in 0..8 {
-        let next: Option<String> = c
-            .prepare_cached(
-                "SELECT to_id FROM links WHERE from_id = ?1 AND type = 'duplicate_of' ORDER BY created_at DESC, to_id LIMIT 1",
-            )?
-            .query_row([&at], |r| r.get(0))
-            .optional()?;
-        let Some(next) = next.filter(|n| !visited.contains(n)) else {
-            return Ok(None);
+    let mut hops = Vec::new();
+    let mut last = m.clone();
+    let mut truncated = false;
+    while last.status == Status::Trashed {
+        let Some(next) = next_of(&last.id)?.filter(|n| !visited.contains(n)) else {
+            break;
         };
-        let Some(target) = memories::get_many(c, std::slice::from_ref(&next))?.pop() else {
-            return Ok(None);
-        };
-        if target.status != Status::Trashed {
-            return Ok(Some(target));
+        if hops.len() == MAX_MERGE_HOPS {
+            truncated = true;
+            break;
         }
-        visited.push(next.clone());
-        at = next;
+        let Some(target) = memories::get_many(c, std::slice::from_ref(&next))?.pop() else {
+            break;
+        };
+        hops.push(Redirect {
+            from: last.id.clone(),
+            to: target.id.clone(),
+        });
+        visited.push(next);
+        last = target;
     }
-    Ok(None)
+    Ok((!hops.is_empty()).then_some(Followed {
+        last,
+        hops,
+        truncated,
+    }))
 }
 
 /// What the privacy rules say about the text a review resolution writes, before it is sent to
 /// the writer (which does not scan content). `Predicate`/`map`: the two names, redacted (or
-/// refused in `block` mode), returned for the writer to use. `Project`/`move`: the memory
-/// arrives in a project whose rules may be stricter; text those rules would change is refused
-/// rather than moved (edit it first). Anything else: nothing to screen.
+/// refused in `block` mode). `Project`/`move`: the memory arrives in a project whose rules may
+/// be stricter; in `block` mode a text those rules would change is refused, in `redact` mode it
+/// is re-redacted with the destination's rules and stored with the move. Anything else:
+/// nothing to screen.
 fn screen_resolution(
     c: &Connection,
     redactors: &Redactors,
     id: &str,
     choice: &str,
-) -> Result<Option<(String, String)>> {
-    use alice_core::store::reviews::{self, ReviewStatus, ReviewType};
+) -> Result<Option<ResolveText>> {
+    use alice_core::store::reviews::{ReviewStatus, ReviewType};
     let Some(item) = reviews::get(c, id)?.filter(|i| i.status == ReviewStatus::Open) else {
         return Ok(None); // the writer says: not found, or already resolved
     };
@@ -1890,7 +2010,7 @@ fn screen_resolution(
     match (item.review_type, choice) {
         (ReviewType::Predicate, "map") => {
             let r = redactors.for_root(None);
-            Ok(Some((
+            Ok(Some(ResolveText::Predicate(
                 redact_field(&r, "predicate", &text("predicate"))?,
                 redact_field(&r, "predicate", &text("canonical"))?,
             )))
@@ -1902,24 +2022,48 @@ fn screen_resolution(
             let Some(m) = memories::get_many(c, &[text("memory_id")])?.pop() else {
                 return Ok(None);
             };
+            // The hash of the text screened below: the writer refuses the move if it changed.
+            let content_hash: String = c.query_row(
+                "SELECT content_hash FROM memories WHERE id = ?1",
+                [&m.id],
+                |r| r.get(0),
+            )?;
             let root = projects::root_of(c, &target.id)?;
             let r = redactors.for_root(root.as_deref().map(Path::new));
-            let refuse = |field: &str, detail: String| {
-                AliceError::invalid(format!(
-                    "cannot move memory {}: the privacy rules of project {} would change its {field}{detail}; edit the memory first, or keep it where it is",
-                    m.id, target.slug
-                ))
-            };
-            let fields = [("title", &m.title), ("body", &m.body)]
-                .into_iter()
-                .chain(m.topics.iter().map(|t| ("topic", t)));
-            for (field, t) in fields {
-                let found = r.apply(t).found;
-                if !found.is_empty() {
-                    return Err(refuse(field, format!(" ({})", found.join(", "))));
+            let apply = |field: &str, t: &str| -> Result<(String, bool)> {
+                let red = r.apply(t);
+                if red.found.is_empty() {
+                    return Ok((t.to_string(), false));
                 }
+                if r.blocks() {
+                    return Err(AliceError::invalid(format!(
+                        "cannot move memory {}: the privacy rules of project {} (block mode) refuse its {field}, which contains what looks like a secret ({}); keep it where it is",
+                        m.id,
+                        target.slug,
+                        red.found.join(", ")
+                    )));
+                }
+                tracing::info!(
+                    field,
+                    "redacted a moved memory with the destination's rules"
+                );
+                Ok((red.text, true))
+            };
+            let (title, _) = apply("title", &m.title)?;
+            let (body, _) = apply("body", &m.body)?;
+            let mut topics = Vec::new();
+            for t in &m.topics {
+                let (t, _) = apply("topic", t)?;
+                topics.push(t);
             }
-            Ok(None)
+            // Always sent, changed or not: it carries the hash that makes the move refuse a
+            // memory edited after it was screened.
+            Ok(Some(ResolveText::Moved {
+                content_hash,
+                title,
+                body,
+                topics,
+            }))
         }
         _ => Ok(None),
     }
@@ -1988,14 +2132,16 @@ mod tests {
         (d, s)
     }
 
-    async fn wait_embedded(s: &Service) {
-        for _ in 0..200 {
-            if s.health().await.unwrap().embed_backlog == 0 {
+    /// Until the embedding and judge stages have finished every memory.
+    async fn wait_settled(s: &Service) {
+        for _ in 0..400 {
+            let h = s.health().await.unwrap();
+            if h.embed_backlog == 0 && h.judge_backlog == 0 {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        panic!("embedding backlog did not drain");
+        panic!("background work did not settle");
     }
 
     fn repo(d: &tempfile::TempDir, name: &str) -> Option<String> {
@@ -2250,7 +2396,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dup.status, RememberStatus::Duplicate);
-        wait_embedded(&s).await;
+        wait_settled(&s).await;
         let found = s
             .recall(RecallRequest {
                 query: "writer thread".into(),
@@ -2307,7 +2453,7 @@ mod tests {
             .await
             .unwrap();
         assert!(edited.memory.body.contains("readers never block"));
-        wait_embedded(&s).await;
+        wait_settled(&s).await;
         let found = s
             .recall(RecallRequest {
                 query: "readers never block".into(),
@@ -2380,7 +2526,7 @@ mod tests {
             .unwrap()
             .id
             .unwrap();
-        wait_embedded(&s).await;
+        wait_settled(&s).await;
         s.shutdown();
         drop(s);
         // The index is two files next to the base path (memories and chunks).
@@ -2465,7 +2611,7 @@ mod tests {
             })
             .await
             .unwrap();
-            wait_embedded(&s).await;
+            wait_settled(&s).await;
             tokio::task::spawn_blocking({
                 let s = s.clone();
                 move || s.shutdown()
@@ -2561,7 +2707,7 @@ mod tests {
         })
         .await
         .unwrap();
-        wait_embedded(&s).await;
+        wait_settled(&s).await;
         let mut set = tokio::task::JoinSet::new();
         for i in 0..(2 + 14) {
             let s = s.clone();
@@ -2621,7 +2767,7 @@ mod tests {
         })
         .await
         .unwrap();
-        wait_embedded(&s).await;
+        wait_settled(&s).await;
         let stop = |s: Arc<Service>| tokio::task::spawn_blocking(move || s.shutdown());
         stop(s.clone()).await.unwrap();
         drop(s);
@@ -2730,7 +2876,7 @@ mod tests {
         })
         .await
         .unwrap();
-        wait_embedded(&s).await;
+        wait_settled(&s).await;
         stop(s.clone()).await.unwrap();
         drop(s);
         let base = home.vector_file("fake");
@@ -2819,7 +2965,7 @@ mod tests {
         })
         .await
         .unwrap();
-        wait_embedded(&s).await;
+        wait_settled(&s).await;
         tokio::task::spawn_blocking({
             let s = s.clone();
             move || s.shutdown()
@@ -2951,7 +3097,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.inserted, 1);
-        wait_embedded(&s).await;
+        wait_settled(&s).await;
         let found = s
             .recall(RecallRequest {
                 query: "lease expired".into(),
@@ -3089,8 +3235,13 @@ mod tests {
     async fn only_returned_memories_count_an_access() {
         let (_d, s) = svc().await;
         let mut ids = Vec::new();
-        for i in 0..6 {
-            let content = format!("zebra crossing note {i}: {}", "padding words ".repeat(40));
+        // Different enough that the judge keeps all six (near-identical text is merged).
+        const WORDS: [&str; 6] = ["amber", "basil", "cedar", "dune", "ember", "fjord"];
+        for w in WORDS {
+            let content = format!(
+                "zebra crossing note {w}: {}",
+                format!("{w} padding ").repeat(40)
+            );
             let r = s
                 .remember(RememberRequest {
                     content,
@@ -3100,7 +3251,7 @@ mod tests {
                 .unwrap();
             ids.push(r.id.unwrap());
         }
-        wait_embedded(&s).await;
+        wait_settled(&s).await;
         let mut expected: HashMap<String, i64> = ids.iter().map(|id| (id.clone(), 0)).collect();
         for format in [OutputFormat::Text, OutputFormat::Json] {
             let r = s
@@ -3294,7 +3445,7 @@ mod tests {
         })
         .await
         .unwrap();
-        wait_embedded(&s).await;
+        wait_settled(&s).await;
         let q = || RecallRequest {
             query: "writer hub lease timeout problem".into(),
             cwd: cwd.clone(),
@@ -3344,16 +3495,20 @@ mod tests {
     async fn the_default_token_budget_is_a_setting() {
         let (d, s) = svc().await;
         let cwd = repo(&d, "proj");
-        for i in 0..5 {
+        // Different enough that the judge keeps all five (near-identical text is merged).
+        for w in ["amber", "basil", "cedar", "dune", "ember"] {
             s.remember(RememberRequest {
-                content: format!("budget memory {i}: {}", "lease timeout ".repeat(30)),
+                content: format!(
+                    "budget memory {w}: lease timeout {}",
+                    format!("{w} filler ").repeat(30)
+                ),
                 cwd: cwd.clone(),
                 ..Default::default()
             })
             .await
             .unwrap();
         }
-        wait_embedded(&s).await;
+        wait_settled(&s).await;
         let q = || RecallRequest {
             query: "lease timeout".into(),
             cwd: cwd.clone(),
@@ -4006,7 +4161,11 @@ mod tests {
         // Jev asked for, no key: the heuristic judges, and health says why.
         s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
             .unwrap();
-        let w = until("the no-key warning", || s.judge_warning()).await;
+        // The final text, not the transient "reading the TypeSafe key" while the judge builds.
+        let w = until("the no-key warning", || {
+            s.judge_warning().filter(|w| w.contains("no TypeSafe key"))
+        })
+        .await;
         assert!(
             w.contains("no TypeSafe key") && w.contains("set-secret"),
             "{w}"
@@ -4089,7 +4248,7 @@ mod tests {
         std::fs::write(home.config_file(), "[judge]\nprovider = \"jev\"\n").unwrap();
         let store = MemSecrets::new(Duration::ZERO);
         store.set(SecretName::JevApiKey, JEV_TEST_KEY).unwrap();
-        store.delay_ms.store(500, Ordering::SeqCst);
+        store.delay_ms.store(2_000, Ordering::SeqCst);
         let transport = Arc::new(ScriptedJev {
             sent: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -4106,7 +4265,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            started.elapsed() < Duration::from_millis(400),
+            started.elapsed() < Duration::from_millis(1_500),
             "{:?}",
             started.elapsed()
         );
@@ -4127,6 +4286,43 @@ mod tests {
         })
         .await;
         assert_eq!(s.judge_warning(), None);
+        s.shutdown();
+    }
+
+    /// A stored Jev key reaches no answer of the admin surface: stats, the review list, a merge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stored_jev_key_never_appears_in_stats_or_review_output() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        home.ensure_dirs().unwrap();
+        std::fs::write(home.config_file(), "[judge]\nprovider = \"jev\"\n").unwrap();
+        let store = MemSecrets::new(Duration::ZERO);
+        store.set(SecretName::JevApiKey, JEV_TEST_KEY).unwrap();
+        let s = Service::start(
+            home,
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                secrets: Some(store),
+                jev_transport: Some(Arc::new(ScriptedJev {
+                    sent: std::sync::atomic::AtomicUsize::new(0),
+                })),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        until("the Jev judge", || {
+            (s.judge().provider() == "jev").then_some(())
+        })
+        .await;
+        let stats = s.stats().await.unwrap();
+        assert_eq!(stats.judge_provider, "jev");
+        let all = serde_json::to_string(&(
+            &stats,
+            s.reviews(ReviewQuery::default()).await.unwrap(),
+            s.judge_warning(),
+        ))
+        .unwrap();
+        assert_eq!(all.matches(JEV_TEST_KEY).count(), 0, "{all}");
         s.shutdown();
     }
 
@@ -4264,5 +4460,629 @@ mod tests {
         let err = s.test_provider("jev2").await.unwrap_err();
         assert!(matches!(err, AliceError::Invalid(_)), "{err}");
         assert!(err.to_string().contains("judge or embedding"));
+    }
+
+    // ------------------------------------------------------------------ the judge pipeline
+
+    async fn svc_with_jev_opts(
+        t: Arc<crate::judge_http::ScriptedJev>,
+        opts: ServiceOptions,
+    ) -> (tempfile::TempDir, Arc<Service>) {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                jev_transport: Some(t),
+                ..opts
+            },
+        )
+        .unwrap();
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        (d, s)
+    }
+
+    async fn svc_with_jev(
+        t: Arc<crate::judge_http::ScriptedJev>,
+    ) -> (tempfile::TempDir, Arc<Service>) {
+        svc_with_jev_opts(t, quiet()).await
+    }
+
+    fn remember_req(content: &str, kind: Option<Kind>, cwd: &Option<String>) -> RememberRequest {
+        RememberRequest {
+            content: content.into(),
+            kind,
+            cwd: cwd.clone(),
+            ..Default::default()
+        }
+    }
+
+    async fn remember_id(
+        s: &Service,
+        content: &str,
+        kind: Option<Kind>,
+        cwd: &Option<String>,
+    ) -> String {
+        s.remember(remember_req(content, kind, cwd))
+            .await
+            .unwrap()
+            .id
+            .unwrap()
+    }
+
+    /// `(judge_state, status)` of a memory.
+    async fn state_of(s: &Service, id: &str) -> (String, String) {
+        let id = id.to_string();
+        s.read(move |c| {
+            Ok(c.query_row(
+                "SELECT judge_state, status FROM memories WHERE id = ?1",
+                [&id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn memory_of(s: &Service, id: &str) -> alice_core::api::MemoryFull {
+        s.get(GetRequest {
+            ids: vec![id.to_string()],
+            include_provenance: false,
+        })
+        .await
+        .unwrap()
+        .memories
+        .remove(0)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_heuristic_trashes_a_near_identical_memory_and_get_returns_the_survivor() {
+        let (d, s) = svc().await;
+        let cwd = repo(&d, "proj");
+        let text = "Use WAL mode so readers never block the writer";
+        let a = remember_id(&s, text, Some(Kind::Decision), &cwd).await;
+        wait_settled(&s).await;
+        // Same text under another kind: a new row (the content hash includes the kind) with an
+        // identical vector, so cosine 1.0 is over 0.97.
+        let b = remember_id(&s, text, Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        let got = s
+            .get(GetRequest {
+                ids: vec![b.clone()],
+                include_provenance: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            got.memories[0].memory.id, a,
+            "the survivor answers for the duplicate"
+        );
+        assert_eq!(got.redirects[0].from, b);
+        let ev = s
+            .events(EventsRequest {
+                target_id: Some(b.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| e.action == "memory.merge" && e.actor == "judge:heuristic"),
+            "{ev:?}"
+        );
+        let h = s.health().await.unwrap();
+        assert_eq!(
+            (h.judge_provider.as_str(), h.judge_backlog),
+            ("heuristic", 0)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jev_updates_supersede_contradictions_link_and_ask() {
+        for (rel, expect_status, expect_review) in [
+            (("updates", 0.95), "superseded", None),
+            (("contradicts", 0.9), "active", Some("contradiction")),
+        ] {
+            let (d, s) = svc_with_jev(crate::judge_http::ScriptedJev::new(rel)).await;
+            let cwd = repo(&d, "proj");
+            let old = remember_id(
+                &s,
+                "Staging Postgres listens on port 5432",
+                Some(Kind::Fact),
+                &cwd,
+            )
+            .await;
+            wait_settled(&s).await;
+            let new = remember_id(
+                &s,
+                "Staging Postgres listens on port 5433 now",
+                Some(Kind::Fact),
+                &cwd,
+            )
+            .await;
+            wait_settled(&s).await;
+            assert_eq!(
+                memory_of(&s, &old).await.memory.status.as_str(),
+                expect_status,
+                "{rel:?}"
+            );
+            let open = s.reviews(ReviewQuery::default()).await.unwrap();
+            assert_eq!(
+                open.first().map(|r| r.review_type.as_str()),
+                expect_review,
+                "{rel:?}"
+            );
+            // The new memory is live, and what the judge did is its work, in one group.
+            assert_eq!(
+                state_of(&s, &new).await,
+                ("done".to_string(), "active".to_string())
+            );
+            let ev = s
+                .events(EventsRequest {
+                    target_id: Some(old.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let by_judge = ev.iter().filter(|e| e.actor == "judge:jev").count();
+            assert_eq!(by_judge, usize::from(rel.0 == "updates"), "{ev:?}");
+            s.shutdown();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_jev_falls_back_to_the_heuristic_and_retries_later_without_failing_the_write()
+    {
+        let t = crate::judge_http::ScriptedJev::failing(503);
+        let (d, s) = svc_with_jev(t.clone()).await;
+        // A: an explicit kind and no neighbour: nothing to ask, so no request at all.
+        let a = s
+            .remember(remember_req(
+                "anything at all",
+                Some(Kind::Note),
+                &repo(&d, "proj"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            a.status,
+            RememberStatus::New,
+            "a failing judge never fails the write"
+        );
+        wait_settled(&s).await;
+        assert_eq!(
+            state_of(&s, &a.id.unwrap()).await,
+            ("done".to_string(), "active".to_string())
+        );
+        assert_eq!(t.sent(), 0);
+        // B: an explicit kind and a neighbour: the comparison's 503s exhaust the retries.
+        let cwd = repo(&d, "proj3");
+        remember_id(&s, "deploy notes for staging", Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        assert_eq!(t.sent(), 0, "the first memory of proj3 has no neighbour");
+        let b = remember_id(
+            &s,
+            "deploy notes for staging servers",
+            Some(Kind::Note),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        assert_eq!(t.sent(), 4, "one try and three retries for the comparison");
+        assert_eq!(
+            state_of(&s, &b).await,
+            ("retry".to_string(), "active".to_string()),
+            "the heuristic decides meanwhile"
+        );
+        // C: no kind and no neighbour: the kind question fails; that is retried later too.
+        let c = remember_id(&s, "something else entirely", None, &repo(&d, "proj2")).await;
+        wait_settled(&s).await;
+        assert_eq!(
+            t.sent(),
+            8,
+            "one try and three retries for the kind question"
+        );
+        assert_eq!(
+            state_of(&s, &c).await,
+            ("retry".to_string(), "active".to_string()),
+            "a failed kind classification is asked again (spec 5.2)"
+        );
+        // Nothing asked again by itself: the retry interval is long here.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(t.sent(), 8);
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_judged_during_an_outage_is_judged_again_when_the_judge_is_back() {
+        let t = crate::judge_http::ScriptedJev::new(("updates", 0.95));
+        let (d, s) = svc_with_jev_opts(
+            t.clone(),
+            ServiceOptions {
+                judge_retry_every: Duration::from_millis(100),
+                ..quiet()
+            },
+        )
+        .await;
+        let cwd = repo(&d, "proj");
+        let old = remember_id(
+            &s,
+            "Staging Postgres listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        t.set_status(Some(503));
+        let new = remember_id(
+            &s,
+            "Staging Postgres listens on port 5433 now",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        // Judged, failed, and queued again by itself (4 calls per try).
+        until("a second try during the outage", || {
+            (t.sent() >= 8).then_some(())
+        })
+        .await;
+        assert_ne!(
+            memory_of(&s, &old).await.memory.status.as_str(),
+            "superseded"
+        );
+        // The judge comes back: the memory is judged again and now supersedes.
+        t.set_status(None);
+        until("the supersede", || {
+            (futures::executor::block_on(memory_of(&s, &old))
+                .memory
+                .status
+                .as_str()
+                == "superseded")
+                .then_some(())
+        })
+        .await;
+        assert_eq!(
+            state_of(&s, &new).await,
+            ("done".to_string(), "active".to_string())
+        );
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kind_is_set_only_when_the_writer_gave_none() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            kind: Some(("bugfix", 0.95)),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        let a = remember_id(
+            &s,
+            "Fixed: the lease expired; mining now runs off the writer",
+            None,
+            &cwd,
+        )
+        .await;
+        let b = remember_id(&s, "We chose WAL", Some(Kind::Decision), &cwd).await;
+        wait_settled(&s).await;
+        assert_eq!(memory_of(&s, &a).await.memory.kind, Kind::Bugfix);
+        assert_eq!(
+            memory_of(&s, &b).await.memory.kind,
+            Kind::Decision,
+            "an explicit kind is never changed"
+        );
+        let ev = s
+            .events(EventsRequest {
+                target_id: Some(a),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| e.action == "memory.edit" && e.actor == "judge:jev"),
+            "{ev:?}"
+        );
+        s.shutdown();
+    }
+
+    /// P1: the cloud decision is the judge's own. A project denied by its `.alice.toml`, one
+    /// denied through an alias, and a used-up budget all leave the heuristic to decide, send
+    /// nothing, and do not ask again later.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn denied_projects_and_a_used_up_budget_are_judged_locally_and_not_retried() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("updates", 0.95),
+            kind: Some(("bugfix", 0.95)),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        // Denied by the project's own file.
+        let cwd = repo(&d, "filed");
+        std::fs::write(
+            std::path::Path::new(cwd.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        let first = remember_id(&s, "Staging Postgres listens on port 5432", None, &cwd).await;
+        let second = remember_id(&s, "Staging Postgres listens on port 5433 now", None, &cwd).await;
+        wait_settled(&s).await;
+        assert_eq!(
+            t.sent(),
+            0,
+            "nothing from a project its file denies is sent"
+        );
+        for id in [&first, &second] {
+            assert_eq!(
+                state_of(&s, id).await,
+                ("done".to_string(), "active".to_string()),
+                "judged locally, not retried"
+            );
+        }
+        assert_eq!(
+            memory_of(&s, &first).await.memory.kind,
+            Kind::Note,
+            "the heuristic does not reclassify"
+        );
+        // Denied through an alias of the project, by the global list.
+        let cwd = repo(&d, "aliased");
+        remember_id(&s, "Alias project first note", Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        let home = AliceHome::new(d.path().to_path_buf());
+        alice_core::store::open_writer(&home.db())
+            .unwrap()
+            .execute(
+                "INSERT INTO project_aliases (alias, project_id) SELECT 'client-x', id FROM projects WHERE slug = 'aliased'",
+                [],
+            )
+            .unwrap();
+        s.patch_settings(patch_one(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["client-x"]),
+        ))
+        .unwrap();
+        let aliased = remember_id(&s, "Alias project second note", None, &cwd).await;
+        wait_settled(&s).await;
+        assert_eq!(t.sent(), 0, "an alias cannot get around the denylist");
+        assert_eq!(
+            state_of(&s, &aliased).await,
+            ("done".to_string(), "active".to_string())
+        );
+        // A used-up budget is a decision too: the heuristic decides and nothing is retried.
+        s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(0.0)))
+            .unwrap();
+        let cwd = repo(&d, "open");
+        remember_id(&s, "Open project first note", Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        let broke = remember_id(&s, "Open project second note", None, &cwd).await;
+        wait_settled(&s).await;
+        assert_eq!(t.sent(), 0, "no request goes out against a budget of zero");
+        assert_eq!(
+            state_of(&s, &broke).await,
+            ("done".to_string(), "active".to_string())
+        );
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_with_no_project_is_routed_by_the_judge() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            project: Some(("proj", 0.95)),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t).await;
+        remember_id(&s, "proj uses WAL", Some(Kind::Note), &repo(&d, "proj")).await;
+        wait_settled(&s).await;
+        // Neither project nor cwd: global for now, and the judge may route it.
+        let id = remember_id(
+            &s,
+            "the proj deploy runs on Fridays",
+            Some(Kind::Note),
+            &None,
+        )
+        .await;
+        wait_settled(&s).await;
+        assert_eq!(memory_of(&s, &id).await.memory.project, "proj");
+        let ev = s
+            .events(EventsRequest {
+                target_id: Some(id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| e.action == "memory.move" && e.actor == "judge:jev"),
+            "{ev:?}"
+        );
+        s.shutdown();
+    }
+
+    /// P2: a model is never told about a project it may not see: not its slug, its name, nor
+    /// the titles that describe it. The heuristic, which runs here, may still route to it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn routing_never_offers_a_denied_project_to_the_model() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            project: Some(("allowedproj", 0.95)),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        let denied = repo(&d, "deniedproj");
+        std::fs::write(
+            std::path::Path::new(denied.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        remember_id(
+            &s,
+            "Zebracorn roadmap for the denied project",
+            Some(Kind::Note),
+            &denied,
+        )
+        .await;
+        remember_id(
+            &s,
+            "allowedproj keeps its schedule in a wiki",
+            Some(Kind::Note),
+            &repo(&d, "allowedproj"),
+        )
+        .await;
+        wait_settled(&s).await;
+        assert_eq!(
+            t.sent(),
+            0,
+            "so far only local judging: no neighbours, explicit kinds"
+        );
+        let id = remember_id(
+            &s,
+            "the allowedproj deploy runs on Fridays",
+            Some(Kind::Note),
+            &None,
+        )
+        .await;
+        wait_settled(&s).await;
+        assert_eq!(memory_of(&s, &id).await.memory.project, "allowedproj");
+        assert!(t.sent() >= 1, "the router asked");
+        for needle in ["deniedproj", "Zebracorn", "denied project"] {
+            assert!(!t.mentioned(needle), "{needle} reached the model");
+        }
+        assert!(
+            t.mentioned("allowedproj"),
+            "the allowed project was offered"
+        );
+        assert!(t.mentioned("wiki"), "with its recent titles");
+        // Every candidate denied: the model is not asked to route at all; the heuristic is, and
+        // a project named in the text is only suggested.
+        s.patch_settings(patch_one(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["allowedproj"]),
+        ))
+        .unwrap();
+        let before = t.sent();
+        let id2 = remember_id(&s, "notes about deniedproj", Some(Kind::Note), &None).await;
+        wait_settled(&s).await;
+        assert_eq!(
+            t.sent(),
+            before,
+            "no project left to offer a model: it is not asked"
+        );
+        assert!(!t.mentioned("deniedproj"));
+        let open = s.reviews(ReviewQuery::default()).await.unwrap();
+        let suggested = open.iter().find(|r| {
+            r.review_type.as_str() == "project" && r.payload["memory_id"] == id2.as_str()
+        });
+        assert!(suggested.is_some(), "{open:?}");
+        assert_eq!(suggested.unwrap().payload["provider"], "heuristic");
+        s.shutdown();
+    }
+
+    /// P4: the judge's own move is not allowed to write text the destination's rules would
+    /// change; it asks instead, and the person's answer goes through the usual screening.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn routing_into_a_stricter_project_is_left_to_a_person() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            project: Some(("strictproj", 0.95)),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        let strict = repo(&d, "strictproj");
+        std::fs::write(
+            std::path::Path::new(strict.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
+        )
+        .unwrap();
+        remember_id(
+            &s,
+            "strictproj tracks its work in a board",
+            Some(Kind::Note),
+            &strict,
+        )
+        .await;
+        wait_settled(&s).await;
+        let id = remember_id(
+            &s,
+            "the strictproj ticket TCK-12345 is still open",
+            Some(Kind::Note),
+            &None,
+        )
+        .await;
+        wait_settled(&s).await;
+        assert_eq!(
+            memory_of(&s, &id).await.memory.project,
+            "global",
+            "not moved on its own"
+        );
+        let open = s.reviews(ReviewQuery::default()).await.unwrap();
+        let item = open
+            .iter()
+            .find(|r| r.review_type.as_str() == "project" && r.payload["memory_id"] == id.as_str())
+            .unwrap_or_else(|| panic!("{open:?}"));
+        assert_eq!(item.payload["to"], "strictproj");
+        assert_eq!(item.payload["provider"], "jev");
+        // A person says yes: the move re-redacts the text with the destination's rules.
+        s.resolve_review(ResolveRequest {
+            id: item.id.clone(),
+            choice: "move".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let moved = memory_of(&s, &id).await.memory;
+        assert_eq!(moved.project, "strictproj");
+        assert!(!moved.body.contains("TCK-12345"), "{}", moved.body);
+        s.shutdown();
+    }
+
+    /// The titles that describe a project to a model are redacted like every other request
+    /// text, even when the person stores raw text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_hints_are_redacted_before_they_reach_the_model() {
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            project: Some(("hintproj", 0.95)),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        s.patch_settings(patch_one("privacy.redact", serde_json::json!(false)))
+            .unwrap();
+        let title = format!("hintproj deploy token {token}");
+        remember_id(&s, &title, Some(Kind::Note), &repo(&d, "hintproj")).await;
+        wait_settled(&s).await;
+        let stored = s
+            .read({
+                let title = title.clone();
+                move |c| {
+                    Ok(c.query_row(
+                        "SELECT count(*) FROM memories WHERE title = ?1",
+                        [&title],
+                        |r| r.get::<_, i64>(0),
+                    )?)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored, 1, "stored raw, as the person asked");
+        remember_id(
+            &s,
+            "the hintproj release is on Friday",
+            Some(Kind::Note),
+            &None,
+        )
+        .await;
+        wait_settled(&s).await;
+        assert!(
+            t.mentioned("hintproj"),
+            "the project and its title were offered"
+        );
+        assert!(!t.mentioned(token), "the token reached the model");
+        s.shutdown();
     }
 }

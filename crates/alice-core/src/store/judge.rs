@@ -111,6 +111,71 @@ pub fn add_cost(conn: &Connection, d: &CostDelta) -> Result<()> {
     result
 }
 
+/// A memory that waits for the judge (spec §5.1 step 5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingJudgement {
+    pub seq: i64,
+    pub id: String,
+    /// `content_hash` when read: the judgement applies only if the text is unchanged.
+    pub stamp: String,
+    pub project_id: String,
+    pub project_slug: String,
+    pub kind_explicit: bool,
+    pub project_defaulted: bool,
+    pub attempts: u32,
+}
+
+// Only `pending` rows are ever judged: `skipped` (imported memories) and `retry` (waiting for
+// `requeue_retries`) are left alone. `judge_state <> 'done'` repeats the partial index's term so
+// SQLite uses `memories_judge`.
+const PENDING_SQL: &str = "SELECT m.seq, m.id, m.content_hash, m.project_id, p.slug, m.kind_explicit, m.project_defaulted, m.judge_attempts
+     FROM memories m JOIN projects p ON p.id = m.project_id
+     WHERE m.judge_state <> 'done' AND m.judge_state = 'pending' AND m.embed_state IN ('done', 'failed') AND m.status <> 'trashed'
+     ORDER BY m.seq LIMIT ?1";
+
+/// Memories whose embedding step is over and that wait for the judge, oldest first.
+pub fn pending(conn: &Connection, limit: usize) -> Result<Vec<PendingJudgement>> {
+    let mut stmt = conn.prepare_cached(PENDING_SQL)?;
+    Ok(stmt
+        .query_map([limit as i64], |r| {
+            Ok(PendingJudgement {
+                seq: r.get(0)?,
+                id: r.get(1)?,
+                stamp: r.get(2)?,
+                project_id: r.get(3)?,
+                project_slug: r.get(4)?,
+                kind_explicit: r.get::<_, i64>(5)? != 0,
+                project_defaulted: r.get::<_, i64>(6)? != 0,
+                attempts: r.get::<_, i64>(7)?.max(0) as u32,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+/// Memories still waiting for the judge (embedding finished or not).
+pub fn judge_backlog(conn: &Connection) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM memories WHERE judge_state <> 'done' AND judge_state = 'pending' AND status <> 'trashed'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n as u64)
+}
+
+/// `retry` becomes `pending` for another try; after `max_attempts` they stop (`done`). Only
+/// `retry` rows change. Returns (requeued, given up).
+pub fn requeue_retries(conn: &Connection, max_attempts: u32) -> Result<(usize, usize)> {
+    let given_up = conn.execute(
+        "UPDATE memories SET judge_state = 'done' WHERE judge_state <> 'done' AND judge_state = 'retry' AND judge_attempts >= ?1",
+        [max_attempts],
+    )?;
+    let requeued = conn.execute(
+        "UPDATE memories SET judge_state = 'pending' WHERE judge_state <> 'done' AND judge_state = 'retry' AND judge_attempts < ?1",
+        [max_attempts],
+    )?;
+    Ok((requeued, given_up))
+}
+
 pub fn cost_since(conn: &Connection, day: &str) -> Result<Vec<CostRow>> {
     let mut stmt = conn.prepare_cached(
         "SELECT day, provider, calls, input_tokens, output_tokens, usd FROM cost_ledger WHERE day >= ?1 ORDER BY day DESC, provider",
@@ -193,6 +258,82 @@ mod tests {
         assert_eq!(row(&c), (1, 1, 0, 1e308));
         add_cost(&c, &delta(1, 1, 0.0)).unwrap();
         assert_eq!(row(&c), (2, 2, 0, 1e308));
+    }
+
+    fn memory_with(
+        c: &Connection,
+        id: &str,
+        judge: &str,
+        embed: &str,
+        status: &str,
+        attempts: i64,
+    ) {
+        c.execute(
+            "INSERT INTO memories (id, project_id, kind, title, body, status, content_hash, created_at, updated_at, hlc, judge_state, embed_state, judge_attempts)
+             VALUES (?1, '00000000000000000000GLOBAL', 'note', 't', 'b', ?2, ?1,
+                     '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z', 'h', ?3, ?4, ?5)",
+            params![id, status, judge, embed, attempts],
+        )
+        .unwrap();
+    }
+
+    fn state_of(c: &Connection, id: &str) -> String {
+        c.query_row(
+            "SELECT judge_state FROM memories WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_pending_memories_whose_embedding_is_over_are_judged_and_imports_never() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        memory_with(&c, "A-READY", "pending", "done", "pending", 0);
+        memory_with(&c, "B-FAILED-EMBED", "pending", "failed", "pending", 0);
+        memory_with(&c, "C-EMBEDDING", "pending", "pending", "pending", 0);
+        memory_with(&c, "D-IMPORTED", "skipped", "done", "active", 0);
+        memory_with(&c, "E-DONE", "done", "done", "active", 0);
+        memory_with(&c, "F-RETRY", "retry", "done", "active", 1);
+        memory_with(&c, "G-TRASHED", "pending", "done", "trashed", 0);
+        let ids: Vec<String> = pending(&c, 10).unwrap().into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, ["A-READY", "B-FAILED-EMBED"]);
+        let first = &pending(&c, 1).unwrap()[0];
+        assert_eq!(
+            (
+                first.stamp.as_str(),
+                first.project_slug.as_str(),
+                first.kind_explicit,
+                first.project_defaulted,
+                first.attempts
+            ),
+            ("A-READY", "global", true, false, 0)
+        );
+        // The backlog counts what the judge will do (the embedding step may still run).
+        assert_eq!(
+            judge_backlog(&c).unwrap(),
+            3,
+            "A, B and C wait; imports, retries and the trashed do not"
+        );
+    }
+
+    #[test]
+    fn retries_are_requeued_until_the_attempts_run_out_and_other_states_are_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        memory_with(&c, "R1", "retry", "done", "active", 1);
+        memory_with(&c, "R3", "retry", "done", "active", 3);
+        memory_with(&c, "SKIP", "skipped", "done", "active", 9);
+        memory_with(&c, "DONE", "done", "done", "active", 0);
+        memory_with(&c, "PEND", "pending", "done", "pending", 0);
+        assert_eq!(requeue_retries(&c, 3).unwrap(), (1, 1));
+        assert_eq!(state_of(&c, "R1"), "pending");
+        assert_eq!(state_of(&c, "R3"), "done", "given up after three attempts");
+        assert_eq!(state_of(&c, "SKIP"), "skipped", "imports keep their state");
+        assert_eq!(state_of(&c, "DONE"), "done");
+        assert_eq!(state_of(&c, "PEND"), "pending");
+        assert_eq!(requeue_retries(&c, 3).unwrap(), (0, 0));
     }
 
     #[test]

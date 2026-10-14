@@ -1095,17 +1095,22 @@ async fn the_admin_tools_list_resolve_merge_and_report() {
     d.stop().await;
 }
 
-/// `alice mcp` has no settings handle: it reads `config.toml` (and the environment given) and
-/// follows a change within about a second, in both directions.
+/// `alice mcp` asks the daemon for the switch (its ratchet and audit apply), follows a change in
+/// both directions, and fails closed when no daemon answers.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_stdio_server_follows_config_toml_for_the_admin_tools() {
-    let (dir, home, _d) = daemon().await;
-    let server = AliceMcp::new(Backend::Remote(Arc::new(
-        RemoteBackend::new(home.clone(), Launcher::None, None).with_settings_env(Vec::new()),
-    )));
-    let (a, b) = tokio::io::duplex(1 << 16);
-    tokio::spawn(async move { server.serve(a).await.unwrap().waiting().await });
-    let client = TestClient.serve(b).await.unwrap();
+async fn the_stdio_server_asks_the_daemon_for_the_admin_tools_and_fails_closed() {
+    let (_dir, home, d) = daemon().await;
+    let stdio = |home: AliceHome| {
+        let server = AliceMcp::new(Backend::Remote(Arc::new(
+            RemoteBackend::new(home, Launcher::None, None).with_admin_ttl(Duration::ZERO),
+        )));
+        async move {
+            let (a, b) = tokio::io::duplex(1 << 16);
+            tokio::spawn(async move { server.serve(a).await.unwrap().waiting().await });
+            TestClient.serve(b).await.unwrap()
+        }
+    };
+    let client = stdio(home.clone()).await;
     assert_eq!(tool_names(&client).await.len(), 7);
     let err = client
         .call_tool(call("stats", serde_json::json!({})))
@@ -1114,8 +1119,7 @@ async fn the_stdio_server_follows_config_toml_for_the_admin_tools() {
         .to_string();
     assert!(err.contains("tool not found"), "{err}");
 
-    std::fs::write(home.config_file(), "[mcp]\nadmin_tools = true\n").unwrap();
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    set_admin(&d, true);
     assert_eq!(tool_names(&client).await.len(), 11);
     let stats = client
         .call_tool(call("stats", serde_json::json!({})))
@@ -1124,9 +1128,19 @@ async fn the_stdio_server_follows_config_toml_for_the_admin_tools() {
     assert_ne!(stats.is_error, Some(true), "{}", first_text(&stats));
     assert!(first_text(&stats).contains("reviews_open"));
 
-    std::fs::write(home.config_file(), "[mcp]\nadmin_tools = false\n").unwrap();
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    set_admin(&d, false);
     assert_eq!(tool_names(&client).await.len(), 7);
-    drop(dir);
+
+    // On, then the daemon goes away: the tools disappear with it.
+    set_admin(&d, true);
+    assert_eq!(tool_names(&client).await.len(), 11);
+    d.stop().await;
+    assert_eq!(tool_names(&client).await.len(), 7, "no daemon answers: off");
+    let err = client
+        .call_tool(call("review_list", serde_json::json!({})))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tool not found"), "{err}");
     client.cancel().await.ok();
 }

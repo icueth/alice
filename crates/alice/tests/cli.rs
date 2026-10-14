@@ -1485,7 +1485,9 @@ fn review_inbox_and_stats_through_the_cli() {
         "{list}"
     );
     let typed = e.ok(&["review", "list", "--type", "undo"]);
-    assert_eq!(typed, list);
+    // The memory may be activated between the two calls: compare without its status.
+    let unstatus = |t: &str| t.replace("(pending)", "(active)");
+    assert_eq!(unstatus(&typed), unstatus(&list));
     assert!(
         e.ok(&["review", "list", "--type", "merge"])
             .starts_with("Nothing waits")

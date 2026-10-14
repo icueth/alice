@@ -8,7 +8,7 @@ use alice_core::embed::Embedder;
 use alice_core::error::AliceError;
 use alice_core::store::ReaderPool;
 use alice_core::store::embeddings::{self, PendingItem, VecKey};
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +38,9 @@ pub struct WorkerConfig {
     pub stop: Arc<AtomicBool>,
     pub vector_path: PathBuf,
     pub batch: usize,
+    /// Told after each batch that reached the writer: memories whose embedding step is over wait
+    /// for the judge (`bounded(1)`, so wake-ups coalesce).
+    pub judge_wake: Option<Sender<()>>,
 }
 
 pub fn spawn_worker(cfg: WorkerConfig) -> JoinHandle<()> {
@@ -45,6 +48,13 @@ pub fn spawn_worker(cfg: WorkerConfig) -> JoinHandle<()> {
         .name("alice-embed".into())
         .spawn(move || run(cfg))
         .expect("spawn worker thread")
+}
+
+/// Tell the judge worker that memories may be ready for it.
+fn wake_judge(cfg: &WorkerConfig) {
+    if let Some(tx) = &cfg.judge_wake {
+        let _ = tx.try_send(());
+    }
 }
 
 /// Sleep for `d`, waking early when `stop` is set.
@@ -206,6 +216,8 @@ fn run(cfg: WorkerConfig) {
                     if let Err(e) = index.upsert_batch(&applied) {
                         tracing::warn!(error = %e, "vector index upsert failed; the next start rebuilds it");
                     }
+                    // After the index has them: the judge looks for neighbours there.
+                    wake_judge(&cfg);
                 }
                 Ok(other) => {
                     tracing::error!(
@@ -231,11 +243,14 @@ fn run(cfg: WorkerConfig) {
                 if keys.is_empty() {
                     continue;
                 }
-                if let Err(e) = cfg
+                match cfg
                     .writer
                     .submit_blocking(WriteOp::EmbedFailed { keys, retry })
                 {
-                    tracing::warn!(error = %e, "recording embedding failures failed");
+                    // Given up on: the memory is searchable by words and the judge may have it.
+                    Ok(_) if !retry => wake_judge(&cfg),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "recording embedding failures failed"),
                 }
             }
         }
@@ -331,6 +346,8 @@ mod tests {
         embedder: Arc<Scripted>,
         stop: Arc<AtomicBool>,
         wake: crossbeam_channel::Sender<()>,
+        /// What the worker tells the judge worker.
+        judge_woken: Receiver<()>,
         worker: Option<JoinHandle<()>>,
     }
 
@@ -394,6 +411,7 @@ mod tests {
         let db = dir.path().join("a.db");
         let conn = alice_core::store::open_writer(&db).unwrap();
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+        let (judge_wake_tx, judge_wake_rx) = crossbeam_channel::bounded(1);
         let (writer, _writer_thread) = spawn_writer(conn, "dev".into(), wake_tx.clone());
         let mut embedder = Scripted::new();
         script(&mut embedder, &writer, db.clone());
@@ -409,6 +427,7 @@ mod tests {
             stop: stop.clone(),
             vector_path: dir.path().join("vectors").join("fake.usearch"),
             batch: 32,
+            judge_wake: Some(judge_wake_tx),
         });
         Rig {
             dir,
@@ -417,6 +436,7 @@ mod tests {
             embedder,
             stop,
             wake: wake_tx,
+            judge_woken: judge_wake_rx,
             worker: Some(worker),
         }
     }
@@ -439,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_memories_and_chunks_are_embedded_activated_and_indexed() {
+    fn pending_memories_and_chunks_are_embedded_and_indexed() {
         let r = rig(fresh_index(), |_, _, _| {});
         let (_, a) = r.remember("sqlite writer lease timeout");
         let (_, b) = r.remember("thai trigram search");
@@ -461,9 +481,25 @@ mod tests {
             .unwrap();
         wait_until("the backlog to drain", || backlog(&r) == 0);
         wait_until("the index to hold every vector", || r.index_len() == 5);
+        // Activation moved to the judge, which does not run in this rig.
         for seq in [a, b] {
-            let status: String = r.read("SELECT status FROM memories WHERE seq = ?1", [seq]);
-            assert_eq!(status, "active");
+            let row: (String, String, String) = {
+                let c = alice_core::store::open_reader(&r.db()).unwrap();
+                c.query_row(
+                    "SELECT status, judge_state, embed_state FROM memories WHERE seq = ?1",
+                    [seq],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                row,
+                (
+                    "pending".to_string(),
+                    "pending".to_string(),
+                    "done".to_string()
+                )
+            );
         }
         let stored: i64 = r.read("SELECT count(*) FROM embeddings WHERE model = 'fake'", []);
         assert_eq!(stored, 5);
@@ -494,8 +530,38 @@ mod tests {
             MAX_ATTEMPTS as usize
         );
         let status: String = r.read("SELECT status FROM memories WHERE seq = ?1", [seq]);
-        assert_eq!(status, "active", "still searchable by words");
+        assert_eq!(
+            status, "pending",
+            "still live (pending memories are searched by words); the judge activates it"
+        );
         assert_eq!(r.index_len(), 0);
+    }
+
+    /// The judge waits for the embedding step: it is told after vectors are stored (and indexed)
+    /// and after an embedding is given up, but not after a failure that will be retried.
+    #[test]
+    fn the_judge_is_woken_after_vectors_are_stored_and_after_a_give_up() {
+        let r = rig(fresh_index(), |_, _, _| {});
+        r.remember("woken after storing");
+        r.judge_woken
+            .recv_timeout(Duration::from_secs(20))
+            .expect("woken after the vector was stored");
+        assert_eq!(
+            r.index_len(),
+            1,
+            "told only once the index holds the vector"
+        );
+
+        let r = rig(fresh_index(), |e, _, _| e.fail_first = usize::MAX);
+        r.remember("never embeddable");
+        r.judge_woken
+            .recv_timeout(Duration::from_secs(20))
+            .expect("woken after the give-up");
+        assert_eq!(
+            r.embedder.calls.load(Ordering::SeqCst),
+            MAX_ATTEMPTS as usize,
+            "not woken by the retries before it"
+        );
     }
 
     #[test]

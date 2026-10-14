@@ -7,7 +7,8 @@ use crate::redaction::Redactors;
 use alice_core::api::StreamItem;
 use alice_core::error::{AliceError, Result};
 use alice_core::ids::{Hlc, new_id};
-use alice_core::model::{Memory, Status};
+use alice_core::judge::pipeline::JudgeAction;
+use alice_core::model::{Kind, Memory, Status};
 use alice_core::project::ProjectRef;
 use alice_core::redact::Redactor;
 use alice_core::store::embeddings::{self, VecKey};
@@ -19,7 +20,7 @@ use alice_core::store::memories::{
     self, InsertOutcome, MemoryUpdate, NewMemoryInput, UpdateAction,
 };
 use alice_core::store::projects::{self, ResolvedProject};
-use alice_core::store::reviews::{self, ReviewItem, ReviewType};
+use alice_core::store::reviews::{self, NewReview, ReviewItem, ReviewType};
 use alice_core::store::sources::{self, ChunkInput, IngestOutcome, SourceInput};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
@@ -48,6 +49,55 @@ pub enum ProjectChoice {
     Slug(String),
     /// Detected from a working directory; created on first write.
     Detected(ProjectRef),
+    /// Nothing named a project and there is no working directory: `global`, and the judge may
+    /// route the memory to a project later.
+    Fallback,
+}
+
+/// Text a review resolution writes, as the privacy rules left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveText {
+    /// A predicate mapping: `(predicate, canonical)`.
+    Predicate(String, String),
+    /// A move into another project, screened with that project's rules: the text to store with
+    /// it (the memory's own when the rules change nothing). `content_hash` is the hash of the
+    /// text that was screened: the move is refused if the memory changed since, so text edited
+    /// in between is never stored unscreened.
+    Moved {
+        content_hash: String,
+        title: String,
+        body: String,
+        topics: Vec<String>,
+    },
+}
+
+/// What the judge decided about one memory (spec §5.1 step 5, §5.2). The writer applies it in
+/// one transaction and one event group, then activates the memory.
+#[derive(Debug, Clone, Default)]
+pub struct Judgement {
+    pub seq: i64,
+    pub id: String,
+    /// `content_hash` of the text that was judged: nothing is applied if the memory changed.
+    pub stamp: String,
+    /// The provider that compared the memory with its neighbours (the actor `judge:<provider>`
+    /// of the actions); `heuristic` when the model could not answer.
+    pub provider: String,
+    pub actions: Vec<JudgeAction>,
+    pub reviews: Vec<NewReview>,
+    /// Set the kind (the writer gave none and the judge is sure).
+    pub kind: Option<Kind>,
+    /// The provider that chose `kind` (defaults to `provider`).
+    pub kind_provider: Option<String>,
+    /// Move to this project slug (routing, auto-applied).
+    pub project_to: Option<String>,
+    /// The provider that chose `project_to` (defaults to `provider`).
+    pub project_provider: Option<String>,
+    /// The judge failed or ran out of time: the heuristic decided; try again later.
+    pub retry: bool,
+    /// `(id, content_hash)` of every existing memory the judge saw, read together with its
+    /// text. An action on one that has changed since becomes a review item instead (nothing is
+    /// applied on stale information).
+    pub seen: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -78,14 +128,14 @@ pub enum WriteOp {
         event_id: String,
         actor: Actor,
     },
-    /// Apply a review decision and record it. `map_to` is the item's `(predicate, canonical)`
-    /// after the privacy rules (the service redacts what the item holds before it is written
-    /// as vocabulary); `None` uses the item's own.
+    /// Apply a review decision and record it. `text` is what the item holds after the privacy
+    /// rules (the service screens it before the writer, which does not scan content); `None`
+    /// uses the item's own.
     ResolveReview {
         id: String,
         choice: String,
         actor: Actor,
-        map_to: Option<(String, String)>,
+        text: Option<ResolveText>,
     },
     /// `others` become duplicates of `survivor` (admin tool, review `merge`).
     Merge {
@@ -103,6 +153,14 @@ pub enum WriteOp {
     EmbedFailed {
         keys: Vec<(VecKey, String)>,
         retry: bool,
+    },
+    /// A judgement for one memory: its actions, review items, kind and project, applied in one
+    /// group, after which the memory is active. Ignored if the memory's text changed since it
+    /// was judged, or if it is not waiting for the judge.
+    ApplyJudgement(Judgement),
+    /// `retry` memories go back to `pending` (up to `max_attempts` in all); the rest give up.
+    RequeueJudgeRetries {
+        max_attempts: u32,
     },
     TouchAccess(Vec<i64>),
     /// A change that is not to a memory or a fact (settings, secrets): one history row, and for
@@ -262,6 +320,8 @@ fn resolve(conn: &Connection, choice: &ProjectChoice) -> Result<ResolvedProject>
             ))
         }),
         ProjectChoice::Detected(p) => projects::upsert_project(conn, p),
+        ProjectChoice::Fallback => projects::resolve_slug(conn, "global")?
+            .ok_or_else(|| AliceError::Other("the global project is missing".into())),
     }
 }
 
@@ -355,6 +415,8 @@ fn remember(
     st: &mut State,
 ) -> Result<WriteOutcome> {
     let p = resolve(conn, project)?;
+    let mut input = input;
+    input.project_defaulted = matches!(project, ProjectChoice::Fallback);
     let prepared = memories::prepare(input, &p, st.hlc.tick())?;
     // Snapshots of the memories this one supersedes, before the insert changes them.
     let mut superseded: Vec<(String, Option<serde_json::Value>)> = Vec::new();
@@ -593,6 +655,12 @@ fn supersede(
                     "the {what} memory {id} is in the trash; reject this item instead"
                 )));
             }
+            Some(s) if s["status"] == "superseded" || s["status"] == "archived" => {
+                return Err(AliceError::invalid(format!(
+                    "the {what} memory {id} is already {} since this item was raised; reject it instead",
+                    s["status"].as_str().unwrap_or("changed")
+                )));
+            }
             Some(_) => {}
         }
     }
@@ -717,7 +785,7 @@ fn resolve_review(
     id: &str,
     choice: &str,
     actor: &Actor,
-    map_to: Option<(String, String)>,
+    text: Option<ResolveText>,
 ) -> Result<WriteOutcome> {
     let item = reviews::get(conn, id)?.ok_or_else(|| {
         AliceError::NotFound(format!("review item {id}; list them with `alice review`"))
@@ -750,13 +818,25 @@ fn resolve_review(
                 .flatten()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
-            merge(conn, st, &s("survivor"), &others, actor, Some(&group))?;
+            let merged = merge(conn, st, &s("survivor"), &others, actor, Some(&group))?;
+            if merged.is_empty() {
+                return Err(AliceError::invalid(
+                    "nothing is left to merge (the duplicates are gone or already in the trash); reject this item instead",
+                ));
+            }
         }
         (ReviewType::Predicate, "map") => {
-            let (name, canonical) = map_to.unwrap_or_else(|| (s("predicate"), s("canonical")));
+            let (name, canonical) = match text {
+                Some(ResolveText::Predicate(n, c)) => (n, c),
+                _ => (s("predicate"), s("canonical")),
+            };
             let h = st.hlc.tick();
-            let n = kg::map_predicate(conn, &name, &canonical, &h)?;
+            let (before, after) = kg::map_predicate_recorded(conn, &name, &canonical, &h)?;
             st.matcher = None;
+            let json = |v: &kg::PredicateSnapshot| {
+                serde_json::to_value(v)
+                    .map_err(|e| AliceError::Other(format!("predicate snapshot: {e}")))
+            };
             record(
                 conn,
                 st,
@@ -765,8 +845,8 @@ fn resolve_review(
                     action: "predicate.map",
                     target_type: "predicate",
                     target_id: &name,
-                    before: None,
-                    after: Some(serde_json::json!({"canonical": canonical, "relations": n})),
+                    before: Some(json(&before)?),
+                    after: Some(json(&after)?),
                     group: Some(&group),
                 },
             )?;
@@ -779,7 +859,48 @@ fn resolve_review(
                     s("to")
                 ))
             })?;
-            let before = snap(conn, &memory)?;
+            let Some(before) = snap(conn, &memory)? else {
+                return Err(AliceError::NotFound(format!("memory {memory}")));
+            };
+            if before["status"] == "trashed" {
+                return Err(AliceError::invalid(format!(
+                    "memory {memory} is in the trash; keep it where it is"
+                )));
+            }
+            // The memory must still be where the item saw it.
+            let current = before["project_id"].as_str().unwrap_or_default();
+            if current == target.id {
+                return Err(AliceError::invalid(format!(
+                    "memory {memory} is already in project {}; keep it where it is",
+                    target.slug
+                )));
+            }
+            if let Some(from) = projects::resolve_slug(conn, &s("from"))?
+                && from.id != current
+            {
+                return Err(AliceError::invalid(format!(
+                    "memory {memory} is no longer in project {}; keep it where it is",
+                    from.slug
+                )));
+            }
+            // The text that was screened with the destination's rules must be the text that
+            // moves: an edit that landed since is refused, never stored unscreened.
+            if let Some(ResolveText::Moved { content_hash, .. }) = &text {
+                let now: Option<String> = conn
+                    .query_row(
+                        "SELECT content_hash FROM memories WHERE id = ?1",
+                        [before["id"].as_str().unwrap_or(&memory)],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if now.as_deref() != Some(content_hash.as_str()) {
+                    return Err(AliceError::invalid(format!(
+                        "memory {memory} was edited while its move was being checked against the privacy rules of project {}; nothing was changed, try again",
+                        target.slug
+                    )));
+                }
+            }
+            let before = Some(before);
             let h = st.hlc.tick();
             match memories::move_to_project(conn, &memory, &target.id, &h)? {
                 memories::MoveOutcome::Moved => {
@@ -797,6 +918,49 @@ fn resolve_review(
                             group: Some(&group),
                         },
                     )?;
+                    // Under redact mode the destination's rules may clean the text: stored as
+                    // an edit in the same group.
+                    if let Some(ResolveText::Moved {
+                        title,
+                        body,
+                        topics,
+                        ..
+                    }) = text
+                        && memories::get_many(conn, std::slice::from_ref(&own))?
+                            .first()
+                            .is_some_and(|m| {
+                                m.title != title || m.body != body || m.topics != topics
+                            })
+                    {
+                        let before = snap(conn, &own)?;
+                        let h = st.hlc.tick();
+                        memories::apply_update(
+                            conn,
+                            &own,
+                            &MemoryUpdate {
+                                action: UpdateAction::Edit,
+                                title: Some(title),
+                                body: Some(body),
+                                topics: Some(topics),
+                                ..Default::default()
+                            },
+                            h,
+                        )?;
+                        st.inserted = true;
+                        record(
+                            conn,
+                            st,
+                            EventInput {
+                                actor,
+                                action: "memory.edit",
+                                target_type: "memory",
+                                target_id: &own,
+                                before,
+                                after: snap(conn, &own)?,
+                                group: Some(&group),
+                            },
+                        )?;
+                    }
                 }
                 memories::MoveOutcome::DuplicateOf(other) => {
                     merge(conn, st, &other, &[memory], actor, Some(&group))?;
@@ -988,8 +1152,8 @@ fn apply(
             id,
             choice,
             actor,
-            map_to,
-        } => resolve_review(conn, st, &id, &choice, &actor, map_to)?,
+            text,
+        } => resolve_review(conn, st, &id, &choice, &actor, text)?,
         WriteOp::Merge {
             survivor,
             others,
@@ -1002,7 +1166,7 @@ fn apply(
                     continue;
                 }
                 if let VecKey::Memory(seq) = key {
-                    activate(conn, seq, st.matcher(conn)?)?;
+                    activate_if_unjudged(conn, seq, st)?;
                 }
                 applied.push((key, v));
             }
@@ -1012,9 +1176,16 @@ fn apply(
             for (key, stamp) in keys {
                 let marked = embeddings::mark_failed_if_current(conn, key, &stamp, retry)?;
                 if let (VecKey::Memory(seq), true, false) = (key, marked, retry) {
-                    // Searchable by words even without a vector.
-                    activate(conn, seq, st.matcher(conn)?)?;
+                    activate_if_unjudged(conn, seq, st)?;
                 }
+            }
+            WriteOutcome::Done
+        }
+        WriteOp::ApplyJudgement(j) => apply_judgement(conn, st, j)?,
+        WriteOp::RequeueJudgeRetries { max_attempts } => {
+            let (requeued, given_up) = judge_store::requeue_retries(conn, max_attempts)?;
+            if requeued + given_up > 0 {
+                tracing::info!(requeued, given_up, "memories with a failed judgement");
             }
             WriteOutcome::Done
         }
@@ -1071,6 +1242,225 @@ fn apply(
         WriteOp::Shutdown => WriteOutcome::Done,
     };
     Ok(Applied::Done(outcome))
+}
+
+/// A memory the judge never sees (`judge_state = 'skipped'`, an import) becomes active when its
+/// embedding step is over; every other memory is activated by its judgement.
+fn activate_if_unjudged(conn: &Connection, seq: i64, st: &mut State) -> Result<()> {
+    let skipped: bool = conn
+        .query_row(
+            "SELECT judge_state = 'skipped' FROM memories WHERE seq = ?1",
+            [seq],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if skipped {
+        activate(conn, seq, st.matcher(conn)?)?;
+    }
+    Ok(())
+}
+
+/// What became of an existing memory a judgement wanted to act on.
+enum Target {
+    /// Still live and the same text the judge read.
+    Unchanged,
+    /// Live, but its text changed since the judge read it.
+    Edited,
+    /// Gone, trashed, superseded or archived: there is nothing left to ask about.
+    Gone,
+}
+
+fn target_state(conn: &Connection, seen: &[(String, String)], id: &str) -> Result<Target> {
+    let now: Option<(String, String)> = conn
+        .query_row(
+            "SELECT content_hash, status FROM memories WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let live =
+        |status: &str| status == Status::Active.as_str() || status == Status::Pending.as_str();
+    Ok(match now {
+        None => Target::Gone,
+        Some((_, status)) if !live(&status) => Target::Gone,
+        Some((hash, _)) if seen.iter().any(|(i, h)| i == id && *h == hash) => Target::Unchanged,
+        Some(_) => Target::Edited,
+    })
+}
+
+/// Apply a judgement (spec §5.1 step 5): the project move, the kind, the actions and the review
+/// items of one memory in one event group, then activate it. Nothing is applied on stale
+/// information: a memory whose text changed since it was judged is left for the next judgement,
+/// and an action on an existing memory that changed since becomes a review item.
+fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<WriteOutcome> {
+    let row: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT content_hash, status, judge_state FROM memories WHERE seq = ?1",
+            [j.seq],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((hash, status, judge_state)) = row else {
+        return Ok(WriteOutcome::Done);
+    };
+    // Edited while being judged: it stays pending and the new text is judged. Imports
+    // (`skipped`) are never judged, and a memory already judged is not judged twice.
+    if hash != j.stamp || !matches!(judge_state.as_str(), "pending" | "retry") {
+        return Ok(WriteOutcome::Done);
+    }
+    let live = status == Status::Pending.as_str() || status == Status::Active.as_str();
+    let provider = |own: &Option<String>| own.clone().unwrap_or_else(|| j.provider.clone());
+    let actor = Actor::Judge(j.provider.clone());
+    let group = new_id();
+    // Active before anything else changes: the events below record this as the memory's state
+    // before, so undoing one of them never leaves a memory `pending` for good.
+    if live {
+        activate(conn, j.seq, st.matcher(conn)?)?;
+    }
+    let mut trashed = !live;
+    if live
+        && let Some(slug) = &j.project_to
+        && let Some(target) = projects::resolve_slug(conn, slug)?
+    {
+        let actor = Actor::Judge(provider(&j.project_provider));
+        let before = snap(conn, &j.id)?;
+        let h = st.hlc.tick();
+        match memories::move_to_project(conn, &j.id, &target.id, &h)? {
+            memories::MoveOutcome::Moved => {
+                conn.execute(
+                    "UPDATE memories SET project_defaulted = 0 WHERE seq = ?1",
+                    [j.seq],
+                )?;
+                record(
+                    conn,
+                    st,
+                    EventInput {
+                        actor: &actor,
+                        action: "memory.move",
+                        target_type: "memory",
+                        target_id: &j.id,
+                        before,
+                        after: snap(conn, &j.id)?,
+                        group: Some(&group),
+                    },
+                )?;
+            }
+            memories::MoveOutcome::DuplicateOf(other) => {
+                merge(
+                    conn,
+                    st,
+                    &other,
+                    std::slice::from_ref(&j.id),
+                    &actor,
+                    Some(&group),
+                )?;
+                trashed = true;
+            }
+        }
+    }
+    let mut reviews = j.reviews.clone();
+    for a in &j.actions {
+        if trashed {
+            break;
+        }
+        let target = match a {
+            JudgeAction::DuplicateOf { survivor, .. } => survivor,
+            JudgeAction::Supersedes { old, .. } => old,
+            JudgeAction::Contradicts { other, .. } => other,
+        };
+        match target_state(conn, &j.seen, target)? {
+            Target::Unchanged => {}
+            Target::Edited => {
+                // Edited since it was judged: ask instead of acting.
+                if let Some(r) = alice_core::judge::pipeline::as_review(&j.id, a, &j.provider) {
+                    reviews.push(r);
+                }
+                continue;
+            }
+            Target::Gone => continue,
+        }
+        match a {
+            JudgeAction::DuplicateOf { survivor, .. } => {
+                match merge(
+                    conn,
+                    st,
+                    survivor,
+                    std::slice::from_ref(&j.id),
+                    &actor,
+                    Some(&group),
+                ) {
+                    Ok(merged) => trashed = !merged.is_empty(),
+                    Err(AliceError::Invalid(_) | AliceError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            JudgeAction::Supersedes { old, .. } => {
+                match supersede(conn, st, old, &j.id, &actor, Some(&group)) {
+                    Ok(()) | Err(AliceError::Invalid(_) | AliceError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            JudgeAction::Contradicts { other, .. } => {
+                let before = snap(conn, &j.id)?;
+                memories::link(conn, &j.id, other, "contradicts", &actor.as_string())?;
+                record(
+                    conn,
+                    st,
+                    EventInput {
+                        actor: &actor,
+                        action: "memory.link",
+                        target_type: "memory",
+                        target_id: &j.id,
+                        before,
+                        after: snap(conn, &j.id)?,
+                        group: Some(&group),
+                    },
+                )?;
+            }
+        }
+    }
+    // After the actions: a memory that went to the trash is not reclassified.
+    if !trashed && let Some(kind) = j.kind {
+        let actor = Actor::Judge(provider(&j.kind_provider));
+        let before = snap(conn, &j.id)?;
+        let h = st.hlc.tick();
+        let edit = MemoryUpdate {
+            action: UpdateAction::Edit,
+            kind: Some(kind),
+            ..Default::default()
+        };
+        // Refused (not applied, nothing written) when the project already holds this text
+        // under that kind: the memory keeps the kind it has.
+        if memories::apply_update(conn, &j.id, &edit, h).is_ok() {
+            record(
+                conn,
+                st,
+                EventInput {
+                    actor: &actor,
+                    action: "memory.edit",
+                    target_type: "memory",
+                    target_id: &j.id,
+                    before,
+                    after: snap(conn, &j.id)?,
+                    group: Some(&group),
+                },
+            )?;
+        }
+    }
+    for r in reviews.iter().filter(|_| live) {
+        if let Some(id) = reviews::create(conn, r)? {
+            st.stream.push(StreamItem::Review {
+                id,
+                review_type: r.kind.as_str().into(),
+            });
+        }
+    }
+    conn.execute(
+        "UPDATE memories SET judge_state = ?1, judge_attempts = judge_attempts + 1 WHERE seq = ?2",
+        rusqlite::params![if j.retry { "retry" } else { "done" }, j.seq],
+    )?;
+    Ok(WriteOutcome::Done)
 }
 
 /// Pending -> active, and record entity mentions.
@@ -1417,6 +1807,19 @@ mod tests {
         }
     }
 
+    /// A heuristic judgement that decides nothing: the memory is activated as it stands.
+    fn judged(f: &Fixture, id: &str, seq: i64) {
+        let stamp: String = f.read("SELECT content_hash FROM memories WHERE seq = ?1", [seq]);
+        f.h.submit_blocking(WriteOp::ApplyJudgement(Judgement {
+            seq,
+            id: id.into(),
+            stamp,
+            provider: "heuristic".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn one_bad_op_does_not_poison_its_batch() {
         let (_d, h, wake) = writer();
@@ -1634,12 +2037,40 @@ mod tests {
             panic!("{out:?}")
         };
         assert_eq!(applied, vec![(VecKey::Memory(seq), vec![0.0, 1.0])]);
-        let status: String = f.read("SELECT status FROM memories WHERE seq = ?1", [seq]);
-        assert_eq!(status, "active");
+        // Stored, but not active: the judge activates it.
+        let row: (String, String, String) = {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.query_row(
+                "SELECT status, embed_state, judge_state FROM memories WHERE seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            row,
+            (
+                "pending".to_string(),
+                "done".to_string(),
+                "pending".to_string()
+            )
+        );
+        let id: String = f.read("SELECT id FROM memories WHERE seq = ?1", [seq]);
+        judged(&f, &id, seq);
+        let row: (String, String) = {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.query_row(
+                "SELECT status, judge_state FROM memories WHERE seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(row, ("active".to_string(), "done".to_string()));
     }
 
     #[test]
-    fn giving_up_on_an_embedding_activates_the_memory_but_not_after_an_edit() {
+    fn giving_up_on_an_embedding_leaves_the_memory_for_the_judge_but_not_after_an_edit() {
         let f = fixture();
         let (id, seq) = new_id(f.h.submit_blocking(remember("cannot be embedded")).unwrap());
         let item = pending_items(&f).remove(0);
@@ -1681,11 +2112,23 @@ mod tests {
             retry: false,
         })
         .unwrap();
-        let status: String = f.read("SELECT status FROM memories WHERE seq = ?1", [seq]);
+        let (state, status): (String, String) = {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.query_row(
+                "SELECT embed_state, status FROM memories WHERE seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
         assert_eq!(
-            status, "active",
-            "searchable by words even without a vector"
+            (state.as_str(), status.as_str()),
+            ("failed", "pending"),
+            "given up on, and still live (searched by words) until the judge has it"
         );
+        let id: String = f.read("SELECT id FROM memories WHERE seq = ?1", [seq]);
+        judged(&f, &id, seq);
+        assert_eq!(status_of(&f, &id), "active");
     }
 
     /// The entity matcher is cached between batches and must be reloaded after a new fact.
@@ -1703,6 +2146,9 @@ mod tests {
                 items: vec![(item.key, item.stamp, vec![1.0])],
             })
             .unwrap();
+            // Mentions are recorded when the judgement activates the memory.
+            let id: String = f.read("SELECT id FROM memories WHERE seq = ?1", [seq]);
+            judged(&f, &id, seq);
             seq
         };
         store("nothing to link yet");
@@ -2382,7 +2828,7 @@ mod tests {
             id: id.into(),
             choice: choice.into(),
             actor: Actor::User,
-            map_to: None,
+            text: None,
         })
     }
 
@@ -2569,8 +3015,8 @@ mod tests {
             "SELECT after_json FROM events WHERE action = 'predicate.map'",
             [],
         );
-        assert!(after.contains("\"relations\":1"), "{after}");
-        // `map_to` (the service's redacted names) wins over the item's own.
+        assert!(after.contains("\"relations\":[["), "{after}");
+        // `text` (the service's redacted names) wins over the item's own.
         let item2 = add_review(
             &f,
             ReviewType::Predicate,
@@ -2581,7 +3027,7 @@ mod tests {
             id: item2,
             choice: "map".into(),
             actor: Actor::User,
-            map_to: Some(("employs".into(), "use".into())),
+            text: Some(ResolveText::Predicate("employs".into(), "use".into())),
         })
         .unwrap();
         let canonical: String = f.read(
@@ -2724,5 +3170,866 @@ mod tests {
         assert!(err.contains("coming"), "{err}");
         let st: String = f.read("SELECT status FROM review_items WHERE id = ?1", [&item]);
         assert_eq!(st, "open");
+    }
+
+    // ---- stale items and undo of resolutions ----
+
+    fn event_of(f: &Fixture, action: &str, target: &str) -> String {
+        f.read(
+            "SELECT id FROM events WHERE action = ?1 AND target_id = ?2 ORDER BY rowid DESC LIMIT 1",
+            [action, target],
+        )
+    }
+
+    fn undo(f: &Fixture, event: &str) -> Result<WriteOutcome> {
+        f.h.submit_blocking(WriteOp::Undo {
+            event_id: event.into(),
+            actor: Actor::User,
+        })
+    }
+
+    fn open_state(f: &Fixture, item: &str) -> String {
+        f.read("SELECT status FROM review_items WHERE id = ?1", [item])
+    }
+
+    #[test]
+    fn stale_items_are_refused_and_stay_open() {
+        let f = fixture();
+        let ids: Vec<String> = ["survivor", "dup one", "dup two", "mover"]
+            .iter()
+            .map(|t| new_id(f.h.submit_blocking(remember(t)).unwrap()).0)
+            .collect();
+        // A merge whose others are all in the trash.
+        for d in &ids[1..3] {
+            f.h.submit_blocking(update(d, UpdateAction::Forget))
+                .unwrap();
+        }
+        let merge_item = add_review(
+            &f,
+            ReviewType::Merge,
+            serde_json::json!({"survivor": ids[0], "others": [ids[1], ids[2]]}),
+            "m",
+        );
+        let err = resolve(&f, &merge_item, "merge").unwrap_err().to_string();
+        assert!(err.contains("nothing is left to merge"), "{err}");
+        assert_eq!(open_state(&f, &merge_item), "open");
+        let n: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action LIKE 'memory.merge%'",
+            [],
+        );
+        assert_eq!(n, 0);
+
+        // A move of a memory in the trash, of one that left `from`, and of one already there.
+        {
+            let c = open(f.dir.path());
+            alice_core::store::projects::upsert_project(
+                &c,
+                &ProjectRef {
+                    key: "k2".into(),
+                    slug: "other".into(),
+                    name: "other".into(),
+                    root: None,
+                    remote: None,
+                },
+            )
+            .unwrap();
+        }
+        let mv = |memory: &str, from: &str, key: &str| {
+            add_review(
+                &f,
+                ReviewType::Project,
+                serde_json::json!({"memory_id": memory, "from": from, "to": "other"}),
+                key,
+            )
+        };
+        let trashed = mv(&ids[1], "global", "t");
+        let err = resolve(&f, &trashed, "move").unwrap_err().to_string();
+        assert!(err.contains("in the trash"), "{err}");
+        let wrong_from = mv(&ids[3], "other", "w");
+        let err = resolve(&f, &wrong_from, "move").unwrap_err().to_string();
+        assert!(err.contains("no longer in project other"), "{err}");
+        let ok = mv(&ids[3], "global", "ok");
+        resolve(&f, &ok, "move").unwrap();
+        let there = mv(&ids[3], "global", "there");
+        let err = resolve(&f, &there, "move").unwrap_err().to_string();
+        assert!(err.contains("already in project other"), "{err}");
+        for i in [&trashed, &wrong_from, &there] {
+            assert_eq!(open_state(&f, i), "open");
+        }
+        let moves: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'memory.move'",
+            [],
+        );
+        assert_eq!(moves, 1, "no no-op move event");
+    }
+
+    #[test]
+    fn an_already_superseded_or_archived_memory_is_not_superseded_again() {
+        let f = fixture();
+        let (old, _) = new_id(f.h.submit_blocking(remember("v1")).unwrap());
+        let (v2, _) = new_id(f.h.submit_blocking(remember("v2")).unwrap());
+        let (v3, _) = new_id(f.h.submit_blocking(remember("v3")).unwrap());
+        let item = |new: &str, key: &str| {
+            add_review(
+                &f,
+                ReviewType::Supersede,
+                serde_json::json!({"new_id": new, "old_id": old}),
+                key,
+            )
+        };
+        let (a, b) = (item(&v2, "a"), item(&v3, "b"));
+        resolve(&f, &a, "accept").unwrap();
+        let err = resolve(&f, &b, "accept").unwrap_err().to_string();
+        assert!(err.contains("already superseded"), "{err}");
+        assert_eq!(open_state(&f, &b), "open");
+        f.h.submit_blocking(update(&v3, UpdateAction::Archive))
+            .unwrap();
+        let c = add_review(
+            &f,
+            ReviewType::Contradiction,
+            serde_json::json!({"new_id": v3, "old_id": v2}),
+            "c",
+        );
+        let err = resolve(&f, &c, "keep_new").unwrap_err().to_string();
+        assert!(err.contains("already archived"), "{err}");
+    }
+
+    #[test]
+    fn undoing_an_accepted_supersede_restores_status_and_links_and_the_item_stays_resolved() {
+        let f = fixture();
+        let (old, _) = new_id(f.h.submit_blocking(remember("port is 8080")).unwrap());
+        let (new, _) = new_id(f.h.submit_blocking(remember("port is 9090")).unwrap());
+        let before_links: i64 = f.read("SELECT count(*) FROM links", []);
+        let item = add_review(
+            &f,
+            ReviewType::Supersede,
+            serde_json::json!({"new_id": new, "old_id": old}),
+            "s",
+        );
+        resolve(&f, &item, "accept").unwrap();
+        assert_eq!(status_of(&f, &old), "superseded");
+        let ev = event_of(&f, "memory.supersede", &old);
+        undo(&f, &ev).unwrap();
+        assert_eq!(status_of(&f, &old), "active");
+        let links: i64 = f.read("SELECT count(*) FROM links", []);
+        assert_eq!(links, before_links, "the supersedes link went with it");
+        assert_eq!(open_state(&f, &item), "resolved");
+    }
+
+    #[test]
+    fn undoing_a_move_restores_the_project_and_the_content_hash() {
+        let f = fixture();
+        {
+            let c = open(f.dir.path());
+            alice_core::store::projects::upsert_project(
+                &c,
+                &ProjectRef {
+                    key: "k2".into(),
+                    slug: "other".into(),
+                    name: "other".into(),
+                    root: None,
+                    remote: None,
+                },
+            )
+            .unwrap();
+        }
+        let (m, _) = new_id(f.h.submit_blocking(remember("move and come back")).unwrap());
+        let snapshot = |f: &Fixture| -> (String, String) {
+            (
+                f.read("SELECT project_id FROM memories WHERE id = ?1", [&m]),
+                f.read("SELECT content_hash FROM memories WHERE id = ?1", [&m]),
+            )
+        };
+        let before = snapshot(&f);
+        let item = add_review(
+            &f,
+            ReviewType::Project,
+            serde_json::json!({"memory_id": m, "from": "global", "to": "other"}),
+            "mv",
+        );
+        resolve(&f, &item, "move").unwrap();
+        let moved = snapshot(&f);
+        assert_ne!(moved, before);
+        undo(&f, &event_of(&f, "memory.move", &m)).unwrap();
+        assert_eq!(snapshot(&f), before);
+        let slug: String = f.read(
+            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
+            [&m],
+        );
+        assert_eq!(slug, "global");
+    }
+
+    #[test]
+    fn undoing_a_merge_by_review_reverts_the_duplicates_and_the_survivor_event() {
+        let f = fixture();
+        let ids: Vec<String> = ["survivor", "dup one", "dup two"]
+            .iter()
+            .map(|t| new_id(f.h.submit_blocking(remember(t)).unwrap()).0)
+            .collect();
+        let links_before: i64 = f.read("SELECT count(*) FROM links", []);
+        let item = add_review(
+            &f,
+            ReviewType::Merge,
+            serde_json::json!({"survivor": ids[0], "others": [ids[1], ids[2]]}),
+            "m",
+        );
+        resolve(&f, &item, "merge").unwrap();
+        let ev = event_of(&f, "memory.merge", &ids[1]);
+        let WriteOutcome::Undo(UndoOutcome::Undone { reverted, .. }) = undo(&f, &ev).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            reverted.len(),
+            3,
+            "two duplicates and the survivor: {reverted:?}"
+        );
+        for d in &ids[1..] {
+            assert_ne!(status_of(&f, d), "trashed");
+        }
+        let links: i64 = f.read("SELECT count(*) FROM links", []);
+        assert_eq!(links, links_before, "no duplicate_of link is left");
+    }
+
+    #[test]
+    fn a_predicate_mapping_by_review_is_undone_to_the_letter() {
+        let f = fixture();
+        for (p, o) in [("uses", "SQLite"), ("use", "Rust")] {
+            f.h.submit_blocking(WriteOp::AssertFact {
+                fact: AssertFact {
+                    subject: "alice".into(),
+                    predicate: p.into(),
+                    object: o.into(),
+                    ..Default::default()
+                },
+                actor: Actor::User,
+            })
+            .unwrap();
+        }
+        let rels = |f: &Fixture| -> String {
+            f.read("SELECT group_concat(id || predicate, ',') FROM (SELECT * FROM relations ORDER BY id)", [])
+        };
+        let preds = |f: &Fixture| -> String {
+            f.read("SELECT group_concat(name || ':' || COALESCE(canonical, '-'), ',') FROM (SELECT * FROM predicates ORDER BY name)", [])
+        };
+        let (r0, p0) = (rels(&f), preds(&f));
+        let item = add_review(
+            &f,
+            ReviewType::Predicate,
+            serde_json::json!({"predicate": "uses", "canonical": "use"}),
+            "p",
+        );
+        resolve(&f, &item, "map").unwrap();
+        assert_ne!(rels(&f), r0);
+        undo(&f, &event_of(&f, "predicate.map", "uses")).unwrap();
+        assert_eq!((rels(&f), preds(&f)), (r0, p0));
+    }
+
+    // ------------------------------------------------------------------ the judge's writes
+
+    fn hash_of(f: &Fixture, id: &str) -> String {
+        f.read("SELECT content_hash FROM memories WHERE id = ?1", [id])
+    }
+
+    fn seq_of(f: &Fixture, id: &str) -> i64 {
+        f.read("SELECT seq FROM memories WHERE id = ?1", [id])
+    }
+
+    /// `(actor, group)` of every event of `action`, oldest first.
+    fn events_of(f: &Fixture, action: &str) -> Vec<(String, Option<String>)> {
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        let mut stmt = c
+            .prepare("SELECT actor, group_id FROM events WHERE action = ?1 ORDER BY ts, id")
+            .unwrap();
+        stmt.query_map([action], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn judgement(f: &Fixture, id: &str, provider: &str) -> Judgement {
+        Judgement {
+            seq: seq_of(f, id),
+            id: id.into(),
+            stamp: hash_of(f, id),
+            provider: provider.into(),
+            ..Default::default()
+        }
+    }
+
+    fn apply_j(f: &Fixture, j: Judgement) {
+        f.h.submit_blocking(WriteOp::ApplyJudgement(j)).unwrap();
+    }
+
+    fn judge_state_of(f: &Fixture, id: &str) -> (String, i64) {
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        c.query_row(
+            "SELECT judge_state, judge_attempts FROM memories WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn add_project(f: &Fixture, slug: &str) {
+        let c = open(f.dir.path());
+        alice_core::store::projects::upsert_project(
+            &c,
+            &ProjectRef {
+                key: format!("k-{slug}"),
+                slug: slug.into(),
+                name: slug.into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_judgement_on_an_old_memory_edited_meanwhile_becomes_a_review_item() {
+        let f = fixture();
+        let (old, _) = new_id(
+            f.h.submit_blocking(remember("Staging Postgres listens on port 5432"))
+                .unwrap(),
+        );
+        let (new, _) = new_id(
+            f.h.submit_blocking(remember("Staging Postgres now listens on 5433"))
+                .unwrap(),
+        );
+        let old_hash = hash_of(&f, &old);
+        // The old memory is edited after the judge read it.
+        f.h.submit_blocking(WriteOp::Update {
+            id: old.clone(),
+            update: MemoryUpdate {
+                body: Some("Staging Postgres listens on 6543".into()),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        apply_j(
+            &f,
+            Judgement {
+                actions: vec![JudgeAction::Supersedes {
+                    old: old.clone(),
+                    p: 0.95,
+                }],
+                seen: vec![(old.clone(), old_hash)],
+                ..judgement(&f, &new, "jev")
+            },
+        );
+        assert_ne!(
+            status_of(&f, &old),
+            "superseded",
+            "not applied on stale information"
+        );
+        let n: i64 = f.read(
+            "SELECT count(*) FROM review_items WHERE type = 'supersede' AND status = 'open'",
+            [],
+        );
+        assert_eq!(n, 1);
+        assert_eq!(
+            status_of(&f, &new),
+            "active",
+            "the new memory is judged all the same"
+        );
+    }
+
+    #[test]
+    fn a_judgement_is_one_group_of_events_by_the_judge_and_activates_the_memory() {
+        let f = fixture();
+        let (old, _) = new_id(f.h.submit_blocking(remember("port is 8080")).unwrap());
+        let (new, _) = new_id(f.h.submit_blocking(remember("port is now 9090")).unwrap());
+        apply_j(
+            &f,
+            Judgement {
+                actions: vec![JudgeAction::Supersedes {
+                    old: old.clone(),
+                    p: 0.95,
+                }],
+                kind: Some(Kind::Fact),
+                kind_provider: Some("jev".into()),
+                seen: vec![(old.clone(), hash_of(&f, &old))],
+                ..judgement(&f, &new, "jev")
+            },
+        );
+        assert_eq!(status_of(&f, &old), "superseded");
+        assert_eq!(status_of(&f, &new), "active");
+        let kind: String = f.read("SELECT kind FROM memories WHERE id = ?1", [&new]);
+        assert_eq!(kind, "fact");
+        assert_eq!(judge_state_of(&f, &new), ("done".to_string(), 1));
+        let all: Vec<(String, Option<String>)> = ["memory.supersede", "memory.link", "memory.edit"]
+            .iter()
+            .flat_map(|a| events_of(&f, a))
+            .filter(|(actor, _)| actor == "judge:jev")
+            .collect();
+        assert_eq!(all.len(), 3, "{all:?}");
+        let groups: std::collections::HashSet<_> = all.iter().map(|(_, g)| g.clone()).collect();
+        assert_eq!(groups.len(), 1, "one judgement is one undoable group");
+        assert!(groups.iter().all(|g| g.is_some()));
+    }
+
+    #[test]
+    fn a_confident_duplicate_trashes_the_new_memory_and_skips_the_rest() {
+        let f = fixture();
+        let (survivor, survivor_seq) =
+            new_id(f.h.submit_blocking(remember("use WAL mode")).unwrap());
+        judged(&f, &survivor, survivor_seq);
+        let (dup, dup_seq) = new_id(
+            f.h.submit_blocking(remember("use  WAL  mode please"))
+                .unwrap(),
+        );
+        apply_j(
+            &f,
+            Judgement {
+                actions: vec![JudgeAction::DuplicateOf {
+                    survivor: survivor.clone(),
+                    p: 0.99,
+                }],
+                kind: Some(Kind::Decision),
+                seen: vec![(survivor.clone(), hash_of(&f, &survivor))],
+                ..judgement(&f, &dup, "heuristic")
+            },
+        );
+        assert_eq!(status_of(&f, &dup), "trashed");
+        assert_eq!(status_of(&f, &survivor), "active");
+        let link: i64 = f.read(
+            "SELECT count(*) FROM links WHERE from_id = ?1 AND to_id = ?2 AND type = 'duplicate_of'",
+            [&dup, &survivor],
+        );
+        assert_eq!(link, 1);
+        let kind: String = f.read("SELECT kind FROM memories WHERE seq = ?1", [dup_seq]);
+        assert_eq!(
+            kind, "note",
+            "a memory that goes to the trash is not reclassified"
+        );
+        assert_eq!(events_of(&f, "memory.merge")[0].0, "judge:heuristic");
+        assert_eq!(judge_state_of(&f, &dup).0, "done");
+    }
+
+    /// Undoing a judge's change restores a live memory, never one stuck in `pending`.
+    #[test]
+    fn undoing_a_judgement_restores_an_active_memory() {
+        let f = fixture();
+        let (survivor, survivor_seq) =
+            new_id(f.h.submit_blocking(remember("cache layer")).unwrap());
+        judged(&f, &survivor, survivor_seq);
+        let (dup, _) = new_id(f.h.submit_blocking(remember("the cache layer")).unwrap());
+        apply_j(
+            &f,
+            Judgement {
+                actions: vec![JudgeAction::DuplicateOf {
+                    survivor: survivor.clone(),
+                    p: 0.99,
+                }],
+                seen: vec![(survivor.clone(), hash_of(&f, &survivor))],
+                ..judgement(&f, &dup, "heuristic")
+            },
+        );
+        assert_eq!(status_of(&f, &dup), "trashed");
+        undo(&f, &event_of(&f, "memory.merge", &dup)).unwrap();
+        assert_eq!(status_of(&f, &dup), "active", "restored as a live memory");
+        let link: i64 = f.read(
+            "SELECT count(*) FROM links WHERE from_id = ?1 AND type = 'duplicate_of'",
+            [&dup],
+        );
+        assert_eq!(link, 0);
+    }
+
+    #[test]
+    fn a_contradiction_is_linked_and_asked_about_and_both_stay_live() {
+        let f = fixture();
+        let (a, a_seq) = new_id(
+            f.h.submit_blocking(remember("the cache is write-through"))
+                .unwrap(),
+        );
+        judged(&f, &a, a_seq);
+        let (b, _) = new_id(
+            f.h.submit_blocking(remember("the cache is write-back"))
+                .unwrap(),
+        );
+        let ask = alice_core::judge::pipeline::decide(
+            &alice_core::judge::JudgeMemory {
+                id: b.clone(),
+                project: "global".into(),
+                kind: Kind::Note,
+                title: "t".into(),
+                body: "b".into(),
+                importance: 3,
+                created_at: "2026-10-13T00:00:00.000Z".into(),
+                similarity: None,
+            },
+            &[alice_core::judge::Relation {
+                existing_id: a.clone(),
+                probs: alice_core::judge::Distribution::from_pairs([
+                    ("contradicts".to_string(), 0.9),
+                    ("unrelated".to_string(), 0.1),
+                ]),
+                agreement: None,
+            }],
+            &alice_core::judge::pipeline::Thresholds {
+                auto: 0.85,
+                review: 0.5,
+            },
+            "jev",
+        );
+        apply_j(
+            &f,
+            Judgement {
+                actions: ask.actions,
+                reviews: ask.reviews,
+                seen: vec![(a.clone(), hash_of(&f, &a))],
+                ..judgement(&f, &b, "jev")
+            },
+        );
+        let link: i64 = f.read(
+            "SELECT count(*) FROM links WHERE from_id = ?1 AND to_id = ?2 AND type = 'contradicts' AND created_by = 'judge:jev'",
+            [&b, &a],
+        );
+        assert_eq!(link, 1);
+        let open: i64 = f.read(
+            "SELECT count(*) FROM review_items WHERE type = 'contradiction' AND status = 'open'",
+            [],
+        );
+        assert_eq!(open, 1);
+        assert_eq!(
+            (status_of(&f, &a).as_str(), status_of(&f, &b).as_str()),
+            ("active", "active")
+        );
+        assert_eq!(events_of(&f, "memory.link")[0].0, "judge:jev");
+    }
+
+    #[test]
+    fn an_action_on_a_memory_that_is_gone_is_dropped_without_a_review_item() {
+        let f = fixture();
+        let (old, _) = new_id(f.h.submit_blocking(remember("old fact")).unwrap());
+        let (new, _) = new_id(f.h.submit_blocking(remember("new fact")).unwrap());
+        let seen = vec![(old.clone(), hash_of(&f, &old))];
+        f.h.submit_blocking(WriteOp::Update {
+            id: old.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Forget,
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        apply_j(
+            &f,
+            Judgement {
+                actions: vec![JudgeAction::Supersedes {
+                    old: old.clone(),
+                    p: 0.95,
+                }],
+                seen,
+                ..judgement(&f, &new, "jev")
+            },
+        );
+        assert_eq!(
+            status_of(&f, &old),
+            "trashed",
+            "a trashed memory is not touched"
+        );
+        let n: i64 = f.read("SELECT count(*) FROM review_items", []);
+        assert_eq!(n, 0, "nothing is left to ask about");
+        assert_eq!(status_of(&f, &new), "active");
+    }
+
+    /// P7: imported memories (`skipped`) are never judged; a changed text or a judged memory is
+    /// left alone too.
+    #[test]
+    fn a_judgement_is_ignored_for_imports_changed_text_and_memories_already_judged() {
+        let f = fixture();
+        let (imported, seq) = new_id(f.h.submit_blocking(remember("imported memory")).unwrap());
+        open(f.dir.path())
+            .execute(
+                "UPDATE memories SET judge_state = 'skipped' WHERE seq = ?1",
+                [seq],
+            )
+            .unwrap();
+        apply_j(&f, judgement(&f, &imported, "jev"));
+        assert_eq!(judge_state_of(&f, &imported), ("skipped".to_string(), 0));
+        assert_eq!(
+            status_of(&f, &imported),
+            "pending",
+            "not activated by a judgement"
+        );
+        // Its embedding is its last step: that activates it (nobody else will).
+        let item = embeddings::pending(&open(f.dir.path()), 10)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.key == VecKey::Memory(seq))
+            .unwrap();
+        f.h.submit_blocking(WriteOp::StoreEmbeddings {
+            model: "m".into(),
+            items: vec![(item.key, item.stamp, vec![1.0])],
+        })
+        .unwrap();
+        assert_eq!(status_of(&f, &imported), "active");
+        assert_eq!(judge_state_of(&f, &imported).0, "skipped");
+
+        // Text changed since it was judged: nothing happens, the new text is judged next.
+        let (edited, _) = new_id(f.h.submit_blocking(remember("before the edit")).unwrap());
+        let stale = judgement(&f, &edited, "jev");
+        f.h.submit_blocking(WriteOp::Update {
+            id: edited.clone(),
+            update: MemoryUpdate {
+                body: Some("after the edit".into()),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        apply_j(&f, stale);
+        assert_eq!(
+            (
+                status_of(&f, &edited).as_str(),
+                judge_state_of(&f, &edited).0.as_str()
+            ),
+            ("pending", "pending")
+        );
+
+        // Judged once; a second judgement of the same text does nothing.
+        let (once, _) = new_id(f.h.submit_blocking(remember("judged once")).unwrap());
+        apply_j(&f, judgement(&f, &once, "jev"));
+        apply_j(&f, judgement(&f, &once, "jev"));
+        assert_eq!(judge_state_of(&f, &once), ("done".to_string(), 1));
+    }
+
+    #[test]
+    fn a_failed_judgement_is_tried_again_until_the_attempts_run_out() {
+        let f = fixture();
+        let (id, _) = new_id(f.h.submit_blocking(remember("flaky judge")).unwrap());
+        apply_j(
+            &f,
+            Judgement {
+                retry: true,
+                ..judgement(&f, &id, "heuristic")
+            },
+        );
+        assert_eq!(judge_state_of(&f, &id), ("retry".to_string(), 1));
+        assert_eq!(
+            status_of(&f, &id),
+            "active",
+            "the heuristic's answer is live meanwhile"
+        );
+        f.h.submit_blocking(WriteOp::RequeueJudgeRetries { max_attempts: 2 })
+            .unwrap();
+        assert_eq!(judge_state_of(&f, &id), ("pending".to_string(), 1));
+        apply_j(
+            &f,
+            Judgement {
+                retry: true,
+                ..judgement(&f, &id, "heuristic")
+            },
+        );
+        assert_eq!(judge_state_of(&f, &id), ("retry".to_string(), 2));
+        f.h.submit_blocking(WriteOp::RequeueJudgeRetries { max_attempts: 2 })
+            .unwrap();
+        assert_eq!(
+            judge_state_of(&f, &id),
+            ("done".to_string(), 2),
+            "given up after two attempts"
+        );
+    }
+
+    #[test]
+    fn a_fallback_project_is_global_and_remembered_as_defaulted_and_the_judge_can_route_it() {
+        let f = fixture();
+        add_project(&f, "proj");
+        let remember_in = |text: &str, project: ProjectChoice| {
+            new_id(
+                f.h.submit_blocking(WriteOp::Remember {
+                    input: NewMemoryInput {
+                        content: text.into(),
+                        ..Default::default()
+                    },
+                    project,
+                })
+                .unwrap(),
+            )
+        };
+        let (id, seq) = remember_in("the proj deploy runs on Fridays", ProjectChoice::Fallback);
+        let (named, _) = remember_in("named global", ProjectChoice::Slug("global".into()));
+        let flags = |id: &str| -> (i64, i64, String) {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.query_row(
+                "SELECT m.kind_explicit, m.project_defaulted, p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(flags(&id), (0, 1, "global".to_string()));
+        assert_eq!(
+            flags(&named),
+            (0, 0, "global".to_string()),
+            "a named project is not defaulted"
+        );
+        apply_j(
+            &f,
+            Judgement {
+                project_to: Some("proj".into()),
+                project_provider: Some("jev".into()),
+                ..judgement(&f, &id, "heuristic")
+            },
+        );
+        assert_eq!(flags(&id), (0, 0, "proj".to_string()));
+        assert_eq!(status_of(&f, &id), "active");
+        let moves = events_of(&f, "memory.move");
+        assert_eq!(moves.len(), 1);
+        assert_eq!(
+            moves[0].0, "judge:jev",
+            "the router, not the comparison, is named"
+        );
+        let _ = seq;
+    }
+
+    /// A routed memory whose text already lives in the target project is merged into it.
+    #[test]
+    fn a_routed_duplicate_is_merged_into_the_twin_in_the_target_project() {
+        let f = fixture();
+        add_project(&f, "proj");
+        let (twin, _) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "same words".into(),
+                    ..Default::default()
+                },
+                project: ProjectChoice::Slug("proj".into()),
+            })
+            .unwrap(),
+        );
+        let (id, _) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "same words".into(),
+                    ..Default::default()
+                },
+                project: ProjectChoice::Fallback,
+            })
+            .unwrap(),
+        );
+        apply_j(
+            &f,
+            Judgement {
+                project_to: Some("proj".into()),
+                ..judgement(&f, &id, "jev")
+            },
+        );
+        assert_eq!(status_of(&f, &id), "trashed");
+        assert_ne!(status_of(&f, &twin), "trashed");
+    }
+
+    /// P8: the text a move was screened with must be the text that moves.
+    #[test]
+    fn a_move_screened_for_one_text_is_refused_once_the_memory_changed() {
+        let f = fixture();
+        add_project(&f, "other");
+        let (m, _) = new_id(f.h.submit_blocking(remember("screened text")).unwrap());
+        let screened = hash_of(&f, &m);
+        let item = add_review(
+            &f,
+            ReviewType::Project,
+            serde_json::json!({"memory_id": m, "from": "global", "to": "other", "p": 0.8, "provider": "heuristic"}),
+            "mv",
+        );
+        // Edited after it was screened (say, with a secret the destination's rules would catch).
+        f.h.submit_blocking(WriteOp::Update {
+            id: m.clone(),
+            update: MemoryUpdate {
+                body: Some("edited after screening".into()),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        let moved = |hash: &str, body: &str| ResolveText::Moved {
+            content_hash: hash.into(),
+            title: "screened text".into(),
+            body: body.into(),
+            topics: Vec::new(),
+        };
+        let err =
+            f.h.submit_blocking(WriteOp::ResolveReview {
+                id: item.clone(),
+                choice: "move".into(),
+                actor: Actor::User,
+                text: Some(moved(&screened, "screened text")),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("edited while its move was being checked"),
+            "{err}"
+        );
+        let slug: String = f.read(
+            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
+            [&m],
+        );
+        assert_eq!(slug, "global", "nothing moved");
+        let open: i64 = f.read(
+            "SELECT count(*) FROM review_items WHERE status = 'open'",
+            [],
+        );
+        assert_eq!(open, 1, "the item stays open");
+        // Screened again with the current text, the move goes through; text the rules left as
+        // it is records no edit, text they changed is stored in the same group.
+        let now = hash_of(&f, &m);
+        let cur: (String, String) = {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.query_row(
+                "SELECT title, body FROM memories WHERE id = ?1",
+                [&m],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        f.h.submit_blocking(WriteOp::ResolveReview {
+            id: item,
+            choice: "move".into(),
+            actor: Actor::User,
+            text: Some(ResolveText::Moved {
+                content_hash: now,
+                title: cur.0,
+                body: cur.1,
+                topics: Vec::new(),
+            }),
+        })
+        .unwrap();
+        let slug: String = f.read(
+            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
+            [&m],
+        );
+        assert_eq!(slug, "other");
+        let n: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'memory.edit'",
+            [],
+        );
+        assert_eq!(
+            n, 1,
+            "no edit event for text the rules left alone (the one is the user's)"
+        );
+
+        let (m2, _) = new_id(f.h.submit_blocking(remember("second one")).unwrap());
+        let item2 = add_review(
+            &f,
+            ReviewType::Project,
+            serde_json::json!({"memory_id": m2, "from": "global", "to": "other", "p": 0.8, "provider": "heuristic"}),
+            "mv2",
+        );
+        f.h.submit_blocking(WriteOp::ResolveReview {
+            id: item2,
+            choice: "move".into(),
+            actor: Actor::User,
+            text: Some(moved(&hash_of(&f, &m2), "second [REDACTED:x]")),
+        })
+        .unwrap();
+        let body: String = f.read("SELECT body FROM memories WHERE id = ?1", [&m2]);
+        assert_eq!(
+            body, "second [REDACTED:x]",
+            "the destination's cleaned text is stored with the move"
+        );
     }
 }

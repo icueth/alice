@@ -342,6 +342,13 @@ impl JudgeHub {
         self.slot.read().0.clone()
     }
 
+    /// Whether the cloud policy lets text of `project` be sent to a model: the one decision
+    /// the Jev judge itself asks before every call. A caller uses it to leave a project out of
+    /// what it *mentions* to a model (the names and recent titles of candidate projects).
+    pub fn cloud_allowed(&self, project: &str) -> bool {
+        self.policy.cloud_allowed(project)
+    }
+
     /// Why the judge is not the one the settings ask for, else what the judge itself reports
     /// (Jev paused for lack of a readable spend or a used-up budget).
     pub fn warning(&self) -> Option<String> {
@@ -477,6 +484,126 @@ impl JudgeHub {
         if changed.iter().any(|k| k.starts_with("judge.")) {
             self.rebuild();
         }
+    }
+}
+
+/// Test transport for the service tests: answers every question of a request from fixed
+/// choices (relation questions `fwd_*` and `rev_*` with `relation`, the kind question with
+/// `kind`, the project question with `project`) or fails with `status` when set. Keeps every
+/// request body it was sent, so a test can look for what must not have left.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ScriptedJev {
+    pub relation: (&'static str, f64),
+    pub kind: Option<(&'static str, f64)>,
+    pub project: Option<(&'static str, f64)>,
+    pub status: Mutex<Option<u16>>,
+    pub calls: Mutex<usize>,
+    pub bodies: Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl ScriptedJev {
+    pub(crate) fn new(relation: (&'static str, f64)) -> Arc<Self> {
+        Arc::new(Self {
+            relation,
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn failing(status: u16) -> Arc<Self> {
+        Arc::new(Self {
+            relation: ("unrelated", 1.0),
+            status: Mutex::new(Some(status)),
+            ..Default::default()
+        })
+    }
+
+    /// The outage is over (`None`) or starts (`Some(status)`).
+    pub(crate) fn set_status(&self, status: Option<u16>) {
+        *self.status.lock() = status;
+    }
+
+    pub(crate) fn sent(&self) -> usize {
+        *self.calls.lock()
+    }
+
+    /// Whether any request body sent so far contains `needle`.
+    pub(crate) fn mentioned(&self, needle: &str) -> bool {
+        self.bodies.lock().iter().any(|b| b.contains(needle))
+    }
+}
+
+#[cfg(test)]
+impl JevTransport for ScriptedJev {
+    fn post(
+        &self,
+        _endpoint: &str,
+        _key: &str,
+        body: &[u8],
+        _timeout: Duration,
+    ) -> Result<HttpReply, TransportError> {
+        *self.calls.lock() += 1;
+        self.bodies
+            .lock()
+            .push(String::from_utf8_lossy(body).into_owned());
+        let failing = *self.status.lock();
+        if let Some(status) = failing {
+            return Ok(HttpReply {
+                status,
+                body: b"{}".to_vec(),
+                retry_after: Some(Duration::ZERO),
+            });
+        }
+        let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let mut answers = serde_json::Map::new();
+        for (qid, q) in req["questions"].as_object().unwrap() {
+            let options: Vec<String> = q["criteria"].as_object().unwrap().keys().cloned().collect();
+            let (want, p) = if qid.starts_with("fwd_") {
+                self.relation
+            } else if qid.starts_with("rev_") {
+                (
+                    if self.relation.0 == "updates" {
+                        "outdated_by"
+                    } else {
+                        self.relation.0
+                    },
+                    self.relation.1,
+                )
+            } else if options.iter().any(|o| o == "bugfix") {
+                self.kind.unwrap_or(("note", 1.0))
+            } else {
+                self.project.unwrap_or(("global", 1.0))
+            };
+            // A choice the question does not offer (a project left out of it) becomes `global`.
+            let choice = if options.iter().any(|o| o == want) {
+                want
+            } else if options.iter().any(|o| o == "global") {
+                "global"
+            } else {
+                options[0].as_str()
+            };
+            let rest = (1.0 - p) / (options.len() - 1) as f64;
+            let probs: serde_json::Map<String, serde_json::Value> = options
+                .iter()
+                .map(|o| {
+                    (
+                        o.clone(),
+                        serde_json::json!(if o == choice { p } else { rest }),
+                    )
+                })
+                .collect();
+            answers.insert(
+                qid.clone(),
+                serde_json::json!({"type": "choice", "choice": choice, "confidence": p, "probabilities": probs}),
+            );
+        }
+        let resp = serde_json::json!({"model": "jev-1.13.0", "answers": answers, "usage": {"input_tokens": 500, "output_tokens": 2}});
+        Ok(HttpReply {
+            status: 200,
+            body: serde_json::to_vec(&resp).unwrap(),
+            retry_after: None,
+        })
     }
 }
 

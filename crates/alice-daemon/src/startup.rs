@@ -259,6 +259,12 @@ mod tests {
             assert_eq!(lock_holder(&home), Some(std::process::id()));
         }
         drop(f);
+        // Files are opened close-on-exec, but a sibling test's fork keeps a copy of the open file
+        // (and so the lock) until its child execs: wait that out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !lock_free(&home) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(lock_free(&home));
         assert_eq!(lock_pid(&home), Some(std::process::id()));
         assert_eq!(lock_holder(&home), None, "the pid in a free lock is stale");

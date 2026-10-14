@@ -290,9 +290,95 @@ pub fn assert_fact(conn: &Connection, f: &AssertFact, hlc: String) -> Result<Fac
     })
 }
 
+/// The part of the vocabulary a predicate mapping touches, as events record it so a mapping
+/// can be undone: the names involved, their `predicates` rows (a name without a row did not
+/// exist), and the predicate each affected relation carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredicateSnapshot {
+    pub names: Vec<String>,
+    /// `(name, canonical)` of the names that have a row, sorted by name.
+    pub rows: Vec<(String, Option<String>)>,
+    /// `(relation id, predicate)`, sorted by id.
+    pub relations: Vec<(String, String)>,
+}
+
+/// The snapshot of `names` and the relations `ids` as they are now.
+pub fn snapshot_predicates(
+    conn: &Connection,
+    names: &[String],
+    ids: &[String],
+) -> Result<PredicateSnapshot> {
+    let mut rows = Vec::new();
+    for n in names {
+        if let Some(c) = conn
+            .query_row(
+                "SELECT canonical FROM predicates WHERE name = ?1",
+                [n],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+        {
+            rows.push((n.clone(), c));
+        }
+    }
+    rows.sort();
+    let mut relations = Vec::new();
+    for id in ids {
+        if let Some(p) = conn
+            .query_row("SELECT predicate FROM relations WHERE id = ?1", [id], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+        {
+            relations.push((id.clone(), p));
+        }
+    }
+    relations.sort();
+    Ok(PredicateSnapshot {
+        names: names.to_vec(),
+        rows,
+        relations,
+    })
+}
+
+/// Put the vocabulary and the relations back as `s` says: the rows of its names are replaced
+/// by its rows, and each relation it lists gets its predicate back.
+pub fn restore_predicates(conn: &Connection, s: &PredicateSnapshot, hlc: &str) -> Result<()> {
+    for n in &s.names {
+        conn.execute("DELETE FROM predicates WHERE name = ?1", [n])?;
+    }
+    for (n, c) in &s.rows {
+        conn.execute(
+            "INSERT INTO predicates (name, canonical) VALUES (?1, ?2)",
+            params![n, c],
+        )?;
+    }
+    for (id, p) in &s.relations {
+        conn.execute(
+            "UPDATE relations SET predicate = ?1, hlc = ?2 WHERE id = ?3",
+            params![p, hlc, id],
+        )?;
+    }
+    Ok(())
+}
+
 /// From now on `name` means `canonical`: existing relations are renamed and later asserts with
 /// `name` use `canonical`. Returns how many relations were renamed.
 pub fn map_predicate(conn: &Connection, name: &str, canonical: &str, hlc: &str) -> Result<usize> {
+    Ok(map_predicate_recorded(conn, name, canonical, hlc)?
+        .0
+        .relations
+        .len())
+}
+
+/// [`map_predicate`], also returning the snapshots (before, after) of everything it touched,
+/// for the event that makes the mapping undoable.
+pub fn map_predicate_recorded(
+    conn: &Connection,
+    name: &str,
+    canonical: &str,
+    hlc: &str,
+) -> Result<(PredicateSnapshot, PredicateSnapshot)> {
     let name = predicate_key(name)?;
     let wanted = predicate_key(canonical)?;
     let target = canonical_predicate(conn, &wanted)?
@@ -302,6 +388,20 @@ pub fn map_predicate(conn: &Connection, name: &str, canonical: &str, hlc: &str) 
             "{name} cannot map to itself; pick a different predicate"
         )));
     }
+    let mut names = vec![name.clone()];
+    {
+        let mut stmt =
+            conn.prepare("SELECT name FROM predicates WHERE canonical = ?1 ORDER BY name")?;
+        for n in stmt.query_map([&name], |r| r.get::<_, String>(0))? {
+            names.push(n?);
+        }
+    }
+    let ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM relations WHERE predicate = ?1 ORDER BY id")?;
+        stmt.query_map([&name], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    let before = snapshot_predicates(conn, &names, &ids)?;
     conn.execute(
         "INSERT INTO predicates (name, canonical) VALUES (?1, ?2) ON CONFLICT(name) DO UPDATE SET canonical = excluded.canonical",
         params![name, target],
@@ -311,10 +411,12 @@ pub fn map_predicate(conn: &Connection, name: &str, canonical: &str, hlc: &str) 
         "UPDATE predicates SET canonical = ?1 WHERE canonical = ?2",
         params![target, name],
     )?;
-    Ok(conn.execute(
+    conn.execute(
         "UPDATE relations SET predicate = ?1, hlc = ?2 WHERE predicate = ?3",
         params![target, hlc, name],
-    )?)
+    )?;
+    let after = snapshot_predicates(conn, &names, &ids)?;
+    Ok((before, after))
 }
 
 /// Ids of the open relations of `subject` and `predicate` (resolved as `assert_fact` resolves
