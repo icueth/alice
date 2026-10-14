@@ -1,6 +1,6 @@
 //! Jev vs the heuristic on the labelled set, and Jev-graded nDCG@10 of recall, with the real
 //! embedding model. Network, real model, hard budget $2 for the whole run (enforced by the
-//! judge's budget, which counts only this run's spend). The set is synthetic
+//! judge's budget, which counts only this run's spend, across UTC days). The set is synthetic
 //! (`fixtures/judge_eval_pairs.jsonl`).
 //!
 //! Estimate first (no key, no network: the requests are built and counted, never sent):
@@ -120,14 +120,10 @@ impl JevStore for LoggedStore {
     fn cached(&self, hash: &str) -> Option<String> {
         self.inner.cached(hash)
     }
-    fn spent(&self, day: &str) -> Result<f64, String> {
-        Ok(self
-            .fresh
-            .lock()
-            .iter()
-            .filter(|c| c.day == day)
-            .map(|c| c.usd)
-            .sum())
+    /// The whole run's fresh spend, whatever the UTC day: the $2 cap is per run, so a run that
+    /// crosses midnight does not get a second budget.
+    fn spent(&self, _day: &str) -> Result<f64, String> {
+        Ok(self.fresh.lock().iter().map(|c| c.usd).sum())
     }
     fn record(&self, call: &JevCall) {
         self.inner.record(call);

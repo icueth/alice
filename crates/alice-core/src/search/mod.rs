@@ -1461,8 +1461,8 @@ mod tests {
         let (f, params) = chunk_fixture();
         for p in &params {
             for (lists, banned) in [
-                (Lists::LexicalOnly, MatchVia::Vector),
-                (Lists::VectorOnly, MatchVia::Words),
+                (Lists::LexicalOnly, &[MatchVia::Vector][..]),
+                (Lists::VectorOnly, &[MatchVia::Words, MatchVia::Code][..]),
             ] {
                 let out = f.search(&SearchParams {
                     lists,
@@ -1474,7 +1474,8 @@ mod tests {
                 let raw: Vec<&Hit> = out.hits.iter().filter(|h| h.tier == Tier::Raw).collect();
                 assert!(!raw.is_empty(), "{lists:?}: {:?}", out.hits);
                 assert!(
-                    raw.iter().all(|h| !h.matched.contains(&banned)),
+                    raw.iter()
+                        .all(|h| banned.iter().all(|b| !h.matched.contains(b))),
                     "{lists:?}: {raw:?}"
                 );
             }
