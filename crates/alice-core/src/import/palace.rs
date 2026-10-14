@@ -3,7 +3,6 @@
 //! `snapshot()` copies the palace's SQLite files with SQLite's backup API (the source is opened
 //! read-only and is never modified); everything after that reads the copy.
 
-use std::fmt::Display;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -114,9 +113,13 @@ pub fn detect_backend(palace: &Path) -> Result<Backend> {
 }
 
 /// Copies the palace (and its knowledge graph and tunnels, when present) into `dest_dir`.
-/// On any error the files written so far are removed.
+///
+/// Never overwrites or deletes an existing file: `dest_dir` must not be the palace folder (or
+/// `mempalace_home`, also through symlinks) and every file written is created new. On any error
+/// the files this call created are removed.
 pub fn snapshot(palace: &Path, dest_dir: &Path, mempalace_home: Option<&Path>) -> Result<Snapshot> {
     let backend = detect_backend(palace)?;
+    refuse_shared_destination(palace, dest_dir, mempalace_home)?;
     let mut written: Vec<PathBuf> = Vec::new();
     let r = snapshot_inner(palace, dest_dir, mempalace_home, backend, &mut written);
     if r.is_err() {
@@ -125,6 +128,27 @@ pub fn snapshot(palace: &Path, dest_dir: &Path, mempalace_home: Option<&Path>) -
         }
     }
     r
+}
+
+/// The destination must be a different folder from the palace and from `mempalace_home`.
+fn refuse_shared_destination(palace: &Path, dest_dir: &Path, home: Option<&Path>) -> Result<()> {
+    let Ok(dest) = dest_dir.canonicalize() else {
+        return Ok(()); // does not exist yet, so it cannot be one of the source folders
+    };
+    for (what, dir) in [
+        ("the palace folder", Some(palace)),
+        ("the MemPalace home", home),
+    ] {
+        if let Some(d) = dir
+            && d.canonicalize().is_ok_and(|c| c == dest)
+        {
+            return Err(AliceError::invalid(format!(
+                "{} is {what}; the snapshot must go to a different, empty folder. Nothing was copied.",
+                dest_dir.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn remove_db_files(p: &Path) {
@@ -143,13 +167,14 @@ fn snapshot_inner(
     backend: Backend,
     written: &mut Vec<PathBuf>,
 ) -> Result<Snapshot> {
+    let created = !dest_dir.exists();
     std::fs::create_dir_all(dest_dir)?;
     #[cfg(unix)]
-    {
+    if created {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dest_dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let deadline = Instant::now() + SNAPSHOT_TIMEBOX;
+    let limits = Limits::production();
     let mut notes = Vec::new();
 
     let main_name = match backend {
@@ -158,12 +183,14 @@ fn snapshot_inner(
     };
     let source = palace.join(main_name);
     let dst = dest_dir.join(main_name);
+    // copy_db removes its own partial output on error and refuses to touch an existing file,
+    // so a path joins `written` only once this call has fully created it.
+    let stats = copy_db(&source, &dst, &limits, &mut || {})?;
     written.push(dst.clone());
-    let stats = copy_db(&source, &dst, deadline)?;
     note_stats(&mut notes, main_name, &stats);
 
     // The knowledge graph: the palace folder first, then ~/.mempalace. A failure here must not
-    // lose the drawers, so it becomes a note.
+    // lose the drawers, so it becomes a note (and does not fall through to the next candidate).
     let mut kg = None;
     let kg_candidates = [Some(palace.to_path_buf()), home.map(Path::to_path_buf)];
     if let Some(src) = kg_candidates
@@ -173,17 +200,13 @@ fn snapshot_inner(
         .find(|p| p.is_file())
     {
         let dst = dest_dir.join(KG_FILE);
-        written.push(dst.clone());
-        match copy_db(&src, &dst, deadline) {
+        match copy_db(&src, &dst, &limits, &mut || {}) {
             Ok(st) => {
                 note_stats(&mut notes, KG_FILE, &st);
+                written.push(dst.clone());
                 kg = Some(dst);
             }
-            Err(e) => {
-                remove_db_files(&dst);
-                written.pop();
-                notes.push(format!("the knowledge graph was not copied: {e}"));
-            }
+            Err(e) => notes.push(format!("the knowledge graph was not copied: {e}")),
         }
     }
 
@@ -225,36 +248,79 @@ fn note_stats(notes: &mut Vec<String>, name: &str, st: &CopyStats) {
             "{name}: palace is in WAL mode; snapshot read through SQLite's WAL"
         ));
     }
-    if st.wal || st.restarts > 0 {
+    if st.restarts > 0 {
         notes.push(format!("{name}: copy restarted {} times", st.restarts));
     }
 }
 
+/// Creates `dst` new (never overwrites). A failed copy leaves nothing behind.
 fn copy_small_file(src: &Path, dst: &Path) -> Result<()> {
-    let len = std::fs::metadata(src)?.len();
-    if len > TUNNELS_MAX_BYTES {
-        return Err(AliceError::invalid(format!(
-            "{} is larger than 16 MB",
-            src.display()
-        )));
+    let too_big = || AliceError::invalid(format!("{} is larger than 16 MB", src.display()));
+    if std::fs::metadata(src)?.len() > TUNNELS_MAX_BYTES {
+        return Err(too_big());
     }
     let mut buf = Vec::new();
     std::fs::File::open(src)?
         .take(TUNNELS_MAX_BYTES + 1)
         .read_to_end(&mut buf)?;
     if buf.len() as u64 > TUNNELS_MAX_BYTES {
-        return Err(AliceError::invalid(format!(
-            "{} is larger than 16 MB",
-            src.display()
-        )));
+        return Err(too_big());
     }
-    std::fs::write(dst, buf)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+        .map_err(|e| exists_error(dst, e))?;
+    if let Err(e) = std::io::Write::write_all(&mut f, &buf) {
+        drop(f);
+        let _ = std::fs::remove_file(dst);
+        return Err(e.into());
+    }
     Ok(())
 }
 
+fn exists_error(dst: &Path, e: std::io::Error) -> AliceError {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        AliceError::invalid(format!(
+            "{} already exists; the snapshot never overwrites a file. Use an empty folder.",
+            dst.display()
+        ))
+    } else {
+        e.into()
+    }
+}
+
+#[derive(Debug)]
 struct CopyStats {
     wal: bool,
     restarts: u32,
+}
+
+/// Knobs of the copy loop; tests shrink them.
+struct Limits {
+    deadline: Instant,
+    /// Pages per normal step.
+    step_pages: i32,
+    /// After this many restarts the copy switches to one single step.
+    single_step_after: u32,
+    /// A non-WAL source that restarts more often than this is being written to.
+    max_restarts_non_wal: u32,
+    /// Consecutive Busy/Locked answers tolerated (non-WAL) before giving up.
+    busy_retries: u32,
+    busy_sleep: Duration,
+}
+
+impl Limits {
+    fn production() -> Self {
+        Self {
+            deadline: Instant::now() + SNAPSHOT_TIMEBOX,
+            step_pages: STEP_PAGES,
+            single_step_after: RESTARTS_BEFORE_SINGLE_STEP,
+            max_restarts_non_wal: RESTARTS_BEFORE_SINGLE_STEP,
+            busy_retries: 100,
+            busy_sleep: Duration::from_millis(50),
+        }
+    }
 }
 
 /// Header bytes 18 and 19 are 2 when the database is in WAL mode.
@@ -266,63 +332,107 @@ fn is_wal(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn copy_db(src: &Path, dst: &Path, deadline: Instant) -> Result<CopyStats> {
-    let damaged = |e: &dyn Display| {
+/// The "cannot be read as a database" sentence for corruption, a plain sentence for anything else.
+fn copy_error(src: &Path, e: rusqlite::Error) -> AliceError {
+    use rusqlite::ErrorCode;
+    if matches!(
+        e.sqlite_error_code(),
+        Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt)
+    ) {
         AliceError::invalid(format!(
             "{} cannot be read as a SQLite database ({e}); the palace may be damaged. Nothing was copied.",
             src.display()
         ))
-    };
+    } else {
+        AliceError::invalid(format!(
+            "copying {} failed ({e}); nothing was copied. Retry, and check free disk space.",
+            src.display()
+        ))
+    }
+}
+
+/// Copies `src` to the NEW file `dst` with the backup API. Refuses to touch an existing `dst`;
+/// removes its own partial output on any error. `between` runs after every non-final step (tests
+/// use it to play the part of a writer).
+fn copy_db(
+    src: &Path,
+    dst: &Path,
+    limits: &Limits,
+    between: &mut dyn FnMut(),
+) -> Result<CopyStats> {
     let wal = is_wal(src);
     let source = Connection::open_with_flags(
         src,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|e| damaged(&e))?;
-    if dst.exists() {
-        std::fs::remove_file(dst)?;
+    .map_err(|e| copy_error(src, e))?;
+    // Reserve the destination atomically; an existing file is never replaced.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+        .map_err(|e| exists_error(dst, e))?;
+    let r = run_copy(&source, src, dst, wal, limits, between);
+    if r.is_err() {
+        remove_db_files(dst);
     }
+    r
+}
+
+fn run_copy(
+    source: &Connection,
+    src: &Path,
+    dst: &Path,
+    wal: bool,
+    limits: &Limits,
+    between: &mut dyn FnMut(),
+) -> Result<CopyStats> {
     let mut dest = Connection::open(dst)?;
     let mut restarts = 0u32;
     {
-        let backup = Backup::new(&source, &mut dest).map_err(|e| damaged(&e))?;
+        let backup = Backup::new(source, &mut dest).map_err(|e| copy_error(src, e))?;
+        // (pagecount, remaining) after the previous step.
         let mut prev: Option<(i32, i32)> = None;
+        let mut busy = 0u32;
         loop {
-            if Instant::now() > deadline {
+            if Instant::now() > limits.deadline {
                 return Err(AliceError::invalid(format!(
                     "the snapshot did not finish in 10 minutes; MemPalace may be busy writing {}. Stop it (or retry later) and run the import again.",
                     src.display()
                 )));
             }
-            let pages = if restarts >= RESTARTS_BEFORE_SINGLE_STEP {
+            let pages = if restarts >= limits.single_step_after {
                 -1
             } else {
-                STEP_PAGES
+                limits.step_pages
             };
-            match backup.step(pages).map_err(|e| damaged(&e))? {
+            match backup.step(pages).map_err(|e| copy_error(src, e))? {
                 StepResult::Done => break,
                 StepResult::More => {
+                    busy = 0;
                     let p = backup.progress();
+                    // A step that did not advance by the pages just copied means SQLite restarted
+                    // the copy because a writer changed the source (even an in-place update that
+                    // does not grow the file); a grown file is a restart too.
                     if let Some((pc, rem)) = prev
-                        && (p.pagecount > pc || p.remaining > rem)
+                        && (p.pagecount > pc || p.remaining > rem - pages)
                     {
                         restarts += 1;
-                    }
-                    prev = Some((p.pagecount, p.remaining));
-                }
-                // Busy: a writer holds the source; Locked: contention inside the copy.
-                _ => {
-                    if !wal {
-                        restarts += 1;
-                        if restarts > RESTARTS_BEFORE_SINGLE_STEP {
+                        if !wal && restarts > limits.max_restarts_non_wal {
                             return Err(writing_error(src));
                         }
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    prev = Some((p.pagecount, p.remaining));
+                    between();
                 }
-            }
-            if !wal && restarts > RESTARTS_BEFORE_SINGLE_STEP {
-                return Err(writing_error(src));
+                // Busy: a writer holds the source; Locked: contention inside the copy.
+                _ => {
+                    busy += 1;
+                    if !wal && busy > limits.busy_retries {
+                        return Err(writing_error(src));
+                    }
+                    std::thread::sleep(limits.busy_sleep);
+                }
             }
         }
     }
@@ -658,6 +768,8 @@ mod tests {
 
     #[test]
     fn a_writer_that_keeps_committing_cannot_stall_the_snapshot() {
+        // Smoke test with a bounded duration: no hang, a consistent copy. Restart behaviour is
+        // proven deterministically by the copy_db tests below.
         let src = tempfile::tempdir().unwrap();
         let mut wal = build_sqlite_exact_wal(src.path(), &sample(200));
         wal.release_writer();
@@ -685,52 +797,179 @@ mod tests {
         let snap = snap.unwrap();
         assert!(started.elapsed() < Duration::from_secs(60));
         assert!(commits > 0, "the background writer never ran");
-        assert!(
-            snap.notes.iter().any(|n| n.contains("restarted")),
-            "{:?}",
-            snap.notes
-        );
         let c = Connection::open(snap.dir.join("sqlite_exact.sqlite3")).unwrap();
         let q: String = c.query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap();
         assert_eq!(q, "ok");
         assert_eq!(open_snapshot(&snap, None).unwrap().info().drawers, 200);
     }
 
-    #[test]
-    fn a_delete_mode_palace_that_is_being_written_fails_with_a_clear_sentence() {
-        let src = tempfile::tempdir().unwrap();
-        let path = build_sqlite_exact(src.path(), &sample(300));
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = stop.clone();
-        let p2 = path.clone();
-        let t = std::thread::spawn(move || {
-            let c = Connection::open(&p2).unwrap();
-            c.busy_timeout(Duration::from_millis(200)).unwrap();
-            let end = Instant::now() + Duration::from_secs(20);
-            while !flag.load(Ordering::Relaxed) && Instant::now() < end {
-                if c.execute_batch(
-                    "BEGIN IMMEDIATE; INSERT INTO alice_fixture_scratch VALUES (1); COMMIT;",
-                )
-                .is_err()
-                {
-                    let _ = c.execute_batch("ROLLBACK");
-                }
-            }
-        });
-        let dst = tempfile::tempdir().unwrap();
-        let r = snapshot(src.path(), dst.path(), None);
-        stop.store(true, Ordering::Relaxed);
-        t.join().unwrap();
-        match r {
-            Ok(s) => assert!(s.dir.join("sqlite_exact.sqlite3").is_file()),
-            Err(e) => {
-                assert!(e.to_string().contains("MemPalace is writing"), "{e}");
-                assert!(
-                    std::fs::read_dir(dst.path()).unwrap().next().is_none(),
-                    "no partial file may stay"
-                );
-            }
+    fn big_source(
+        wal: bool,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Option<crate::import::fixture::WalPalace>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let specs: Vec<DrawerSpec> = (0..300)
+            .map(|i| spec(&format!("d{i:04}"), &"y".repeat(2000), "w", None))
+            .collect();
+        if wal {
+            let mut w = build_sqlite_exact_wal(dir.path(), &specs);
+            w.release_writer();
+            let p = w.path.clone();
+            (dir, p, Some(w))
+        } else {
+            let p = build_sqlite_exact(dir.path(), &specs);
+            (dir, p, None)
         }
+    }
+
+    fn small_steps() -> Limits {
+        Limits {
+            step_pages: 10,
+            // A broken detector must fail the test, not hang it.
+            deadline: Instant::now() + Duration::from_secs(20),
+            ..Limits::production()
+        }
+    }
+
+    fn page_count(p: &Path) -> i64 {
+        Connection::open(p)
+            .unwrap()
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn in_place_updates_between_steps_are_counted_as_restarts_then_the_copy_finishes() {
+        for wal in [false, true] {
+            let (dir, path, _keep) = big_source(wal);
+            assert!(page_count(&path) > 30, "fixture must span many steps");
+            let writer = Connection::open(&path).unwrap();
+            let mut n = 0i64;
+            let dst_dir = tempfile::tempdir().unwrap();
+            let dst = dst_dir.path().join("copy.sqlite3");
+            let st = copy_db(&path, &dst, &small_steps(), &mut || {
+                n += 1;
+                writer
+                    .execute(
+                        "UPDATE documents SET updated_at = ?1 WHERE id = 'd0000' AND collection_id = 1",
+                        [format!("v{n}")],
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+            assert!(st.restarts >= 3, "wal={wal} restarts={}", st.restarts);
+            assert_eq!(st.wal, wal);
+            let got: String = Connection::open(&dst)
+                .unwrap()
+                .query_row(
+                    "SELECT updated_at FROM documents WHERE id = 'd0000' AND collection_id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(got, format!("v{n}"), "the copy holds the latest value");
+            let mut notes = Vec::new();
+            note_stats(&mut notes, "x", &st);
+            assert!(
+                notes
+                    .iter()
+                    .any(|m| m.contains(&format!("restarted {} times", st.restarts)))
+            );
+            drop(dir);
+        }
+    }
+
+    #[test]
+    fn a_delete_mode_source_that_keeps_changing_fails_with_a_clear_sentence_and_leaves_nothing() {
+        let (_dir, path, _) = big_source(false);
+        let writer = Connection::open(&path).unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst = dst_dir.path().join("copy.sqlite3");
+        let mut n = 0;
+        let lim = Limits {
+            single_step_after: u32::MAX, // the one-shot step is not available
+            ..small_steps()
+        };
+        let e = copy_db(&path, &dst, &lim, &mut || {
+            n += 1;
+            writer
+                .execute(
+                    "UPDATE documents SET updated_at = ?1 WHERE id = 'd0000'",
+                    [n],
+                )
+                .unwrap();
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("MemPalace is writing"), "{e}");
+        assert!(std::fs::read_dir(dst_dir.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_source_locked_by_a_writer_gives_up_with_the_writing_sentence() {
+        let (_dir, path, _) = big_source(false);
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst = dst_dir.path().join("copy.sqlite3");
+        let lim = Limits {
+            busy_retries: 3,
+            busy_sleep: Duration::from_millis(1),
+            ..Limits::production()
+        };
+        let e = copy_db(&path, &dst, &lim, &mut || {})
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("MemPalace is writing"), "{e}");
+        assert!(std::fs::read_dir(dst_dir.path()).unwrap().next().is_none());
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn snapshot_never_overwrites_or_deletes_an_existing_file() {
+        let src = tempfile::tempdir().unwrap();
+        build_sqlite_exact(src.path(), &sample(20));
+        let main = src.path().join("sqlite_exact.sqlite3");
+        let before = hash_dir(src.path());
+        // Destination is the palace folder itself.
+        let e = snapshot(src.path(), src.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("palace folder"), "{e}");
+        assert_eq!(hash_dir(src.path()), before);
+        // ... through a symlink.
+        #[cfg(unix)]
+        {
+            let links = tempfile::tempdir().unwrap();
+            let l = links.path().join("l");
+            std::os::unix::fs::symlink(src.path(), &l).unwrap();
+            assert!(snapshot(src.path(), &l, None).is_err());
+            assert!(snapshot(&l, src.path(), None).is_err());
+            assert_eq!(hash_dir(src.path()), before);
+        }
+        // ... or mempalace_home.
+        let home = tempfile::tempdir().unwrap();
+        let dst = home.path().to_path_buf();
+        let e = snapshot(src.path(), &dst, Some(home.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("MemPalace home"), "{e}");
+        // A destination that already holds the file: refused, file untouched, nothing else added.
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(dst.path().join("sqlite_exact.sqlite3"), b"precious").unwrap();
+        let e = snapshot(src.path(), dst.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(
+            std::fs::read(dst.path().join("sqlite_exact.sqlite3")).unwrap(),
+            b"precious"
+        );
+        assert_eq!(list_names(dst.path()), ["sqlite_exact.sqlite3"]);
+        assert_eq!(sha256_file(&main), before[0].1);
     }
 
     #[test]
