@@ -1173,8 +1173,8 @@ async fn secrets_in_imported_history_never_reach_the_database_the_report_or_the_
     f.wait_embedded().await;
     let mut before = f.table_counts().await;
     let again = f.run_import(f.request()).await.report.unwrap();
-    // The one thing a rerun writes is its closing batch: an event, and the marker's new value.
-    *before.get_mut("events").unwrap() += 1;
+    // What a rerun writes: the tunnel links' batch and the marker's batch (an event each).
+    *before.get_mut("events").unwrap() += 2;
     assert_eq!(f.table_counts().await, before);
     assert_eq!(again.redacted_fields, 0);
     assert_eq!(again.tiers.knowledge, 0);
@@ -1777,6 +1777,13 @@ async fn compat_turns_on_by_itself_once_and_respects_an_explicit_off() {
     let st = f.run_import(f.request()).await;
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
     assert!(f.setting_bool("compat.mempalace").await);
+    let report = st.report.as_ref().unwrap();
+    assert!(
+        report.compat_enabled
+            && report
+                .render_text()
+                .contains("compatibility layer turned on")
+    );
     let changed = f.wait_event("settings.change").await;
     assert!(
         changed.iter().any(|e| e.contains("compat.mempalace")),
@@ -1799,6 +1806,7 @@ async fn compat_turns_on_by_itself_once_and_respects_an_explicit_off() {
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
     assert!(!g.setting_bool("compat.mempalace").await);
     assert!(g.events_of("import.compat_enabled").await.is_empty());
+    assert!(!st.report.unwrap().compat_enabled);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1861,16 +1869,28 @@ async fn a_secret_in_a_kg_object_or_a_transcript_path_never_reaches_the_database
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_read_only_database_mid_import_fails_with_the_resume_sentence() {
-    let f = Flow::with_specs(&big_specs(6_000)).await;
+/// Parks the job right before its mentions phase (everything else is stored by then).
+async fn park_before_mentions(f: &Flow) -> Arc<ImportHook> {
+    let hook = f.hook.clone().unwrap();
+    hook.hold_mentions.store(true, Ordering::SeqCst);
     f.svc.start_import(f.request()).unwrap();
     let t = Instant::now();
-    while f.count("chunks").await == 0 {
-        assert!(t.elapsed() < Duration::from_secs(60), "nothing was stored");
+    while !hook.parked_mentions.load(Ordering::SeqCst) {
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "the job never got there"
+        );
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
+    hook
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_database_mid_import_fails_with_the_resume_sentence() {
+    let f = Flow::with_hook(&fixture_specs()).await;
+    let hook = park_before_mentions(&f).await;
     f.svc.force_read_only("the disk is full");
+    hook.hold_mentions.store(false, Ordering::SeqCst);
     let st = f.wait().await;
     assert_eq!(st.state, ImportState::Failed, "{st:?}");
     let e = st.error.unwrap();
@@ -1879,18 +1899,146 @@ async fn a_read_only_database_mid_import_fails_with_the_resume_sentence() {
         "{e}"
     );
     assert_eq!(f.import_tmp_entries(), 0);
-    let stored = f.count("chunks").await;
-    assert!(stored > 0 && stored < 6_000, "{stored}");
-    assert_eq!(
-        stored,
-        f.count("legacy_ids").await,
-        "what was stored is whole batches"
-    );
+    assert_eq!(f.count("chunks").await, 109);
+    assert_eq!(f.count("memories").await, 4);
+    assert_eq!(f.count("relations").await, 4, "the graph stays");
     assert!(f.meta("import.mempalace.last").await.is_none());
     assert!(
         !f.setting_bool("compat.mempalace").await,
         "a failed run does not opt in"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_that_stops_before_the_mentions_is_completed_by_the_next_one() {
+    let f = Flow::with_hook(&fixture_specs()).await;
+    park_before_mentions(&f).await;
+    f.svc.shutdown();
+    let st = f.svc.import_status();
+    assert_eq!(st.state, ImportState::Failed, "{st:?}");
+    assert_eq!(f.count("mentions").await, 0);
+    assert_eq!(f.count("memories").await, 4);
+
+    let svc = start_service(&f.home);
+    svc.start_import(f.request()).unwrap();
+    let t = Instant::now();
+    let st = loop {
+        let st = svc.import_status();
+        if st.state != ImportState::Running {
+            break st;
+        }
+        assert!(t.elapsed() < Duration::from_secs(120));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert_eq!(r.already_imported, 5 + 80 + 30, "nothing was planned again");
+    assert!(f.entity_mentions_exist().await, "the rerun linked them");
+    assert!(
+        f.meta("import.mempalace.last")
+            .await
+            .unwrap()
+            .contains("\"ok\":true")
+    );
+    // Once linked, a further run sends no mention batch.
+    let events = f.events_of("import.batch").await.len();
+    svc.start_import(f.request()).unwrap();
+    let t = Instant::now();
+    while svc.import_status().state == ImportState::Running {
+        assert!(t.elapsed() < Duration::from_secs(120));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(f.events_of("import.batch").await.len(), events + 2);
+    svc.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_makes_the_same_predicate_review_keys_as_the_first_run() {
+    // Alice has `uses` twice, the graph has `use` twice: a tie that Alice's own predicate wins.
+    // Counting the imported facts again on the rerun would make `use` (4) the canonical one.
+    let extra = |id: &str, o: &str| TripleSpec {
+        id: id.into(),
+        subject: "alice".into(),
+        predicate: "use".into(),
+        object: o.into(),
+        valid_from: s("2026-01-03"),
+        ..Default::default()
+    };
+    let f = Flow::with_graph(
+        &fixture_specs(),
+        &[extra("t_u1", "u1"), extra("t_u2", "u2")],
+        |_| ServiceOptions::default(),
+    )
+    .await;
+    for o in ["x1", "x2"] {
+        f.svc
+            .assert_fact(alice_core::api::AssertFactRequest {
+                subject: "alice".into(),
+                predicate: "uses".into(),
+                object: o.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let keys = |f: &Flow| -> Vec<String> {
+        let conn = f.db();
+        let mut st = conn
+            .prepare("SELECT dedupe_key FROM review_items ORDER BY 1")
+            .unwrap();
+        st.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let first = f.run_import(f.request()).await.report.unwrap();
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let before = keys(&f);
+    assert!(before.contains(&"predicate:use".to_string()), "{before:?}");
+    f.wait_embedded().await;
+    let again = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(again.review_items, 0);
+    assert_eq!(keys(&f), before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secret_in_a_subject_or_a_predicate_never_reaches_reviews_warnings_or_events() {
+    let secret = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let t = |id: &str, s_: &str, p: &str| TripleSpec {
+        id: id.into(),
+        subject: s_.into(),
+        predicate: p.into(),
+        object: "sqlite".into(),
+        valid_from: s("2026-01-01"),
+        ..Default::default()
+    };
+    let extra = [
+        t("t_s", &format!("bob {secret}"), "knows"),
+        t("t_p", "alice", &format!("has_bugs {secret}")),
+    ];
+    for block in [false, true] {
+        let f = Flow::with_graph(&fixture_specs(), &extra, |_| ServiceOptions::default()).await;
+        if block {
+            f.patch("privacy.redact_mode", serde_json::json!("block"))
+                .await;
+        }
+        let st = f.run_import(f.request()).await;
+        assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+        let r = st.report.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        if block {
+            assert_eq!(r.blocked_by_redaction["github_token"], 2);
+            assert_eq!(r.facts.added, 4);
+        } else {
+            assert_eq!(r.facts.added, 6);
+        }
+        let json = serde_json::to_string(&r).unwrap();
+        for needle in [secret, &secret[..14]] {
+            assert!(!json.contains(needle) && !r.render_text().contains(needle));
+            assert_eq!(f.tables_holding(needle).await, Vec::<String>::new());
+        }
+        f.wait_event("import.batch").await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

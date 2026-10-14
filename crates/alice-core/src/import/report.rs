@@ -103,6 +103,9 @@ pub struct ImportReport {
     pub blocked_by_redaction: BTreeMap<String, u64>,
     pub redacted_fields: u64,
     pub redaction_note: Option<String>,
+    /// This run turned `compat.mempalace` on (it was at its default).
+    #[serde(default)]
+    pub compat_enabled: bool,
     pub phases: Vec<PhaseTiming>,
     pub peak_rss_mb: Option<u64>,
     pub warnings: Vec<String>,
@@ -307,6 +310,9 @@ impl ImportReport {
             "  Times assumed in UTC{}. Embeddings are computed in the background; search works now.\n",
             self.assumed_utc_offset
         ));
+        if self.compat_enabled {
+            o.push_str("  MemPalace compatibility layer turned on (compat.mempalace = true).\n");
+        }
         if self.warnings.is_empty() {
             o.push_str("  Warnings: none\n");
         } else {

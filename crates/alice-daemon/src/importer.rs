@@ -130,17 +130,29 @@ pub struct ImportHook {
     pub hold_planning: AtomicBool,
     /// True while the job is parked by `hold_planning`.
     pub parked: AtomicBool,
+    /// Parks the job after the graph and the duplicates, right before the mentions.
+    pub hold_mentions: AtomicBool,
+    /// True while the job is parked by `hold_mentions`.
+    pub parked_mentions: AtomicBool,
     /// Drawers the planner was run on (a rerun that stores nothing new plans none).
     pub planned: std::sync::atomic::AtomicU64,
 }
 
 impl ImportHook {
     fn park_before_planning(&self, stop: &AtomicBool) {
-        self.parked.store(true, Ordering::SeqCst);
-        while self.hold_planning.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+        Self::park(&self.hold_planning, &self.parked, stop);
+    }
+
+    fn park_before_mentions(&self, stop: &AtomicBool) {
+        Self::park(&self.hold_mentions, &self.parked_mentions, stop);
+    }
+
+    fn park(hold: &AtomicBool, parked: &AtomicBool, stop: &AtomicBool) {
+        parked.store(true, Ordering::SeqCst);
+        while hold.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        self.parked.store(false, Ordering::SeqCst);
+        parked.store(false, Ordering::SeqCst);
     }
 
     fn run(&self, stop: &AtomicBool) {
@@ -618,8 +630,6 @@ struct Ctx<'a> {
     collapsed: Vec<(String, String)>,
     /// Batches the writer has taken (nothing was written while this is 0).
     submitted: u64,
-    /// Keys of the memories handed to the store in this run (their mentions are linked last).
-    fresh_memories: Vec<String>,
     /// Tunnel links and review items wait for the closing batch.
     pending_links: Vec<(String, String)>,
     pending_reviews: Vec<NewReview>,
@@ -739,10 +749,6 @@ impl Ctx<'_> {
 
     /// Adds a drawer's rows to the open batch; a batch that closes is written.
     fn push(&mut self, unit: Unit) -> Result<()> {
-        if let Unit::Memories { items, .. } = &unit {
-            self.fresh_memories
-                .extend(items.iter().filter_map(|m| m.legacy_id.clone()));
-        }
         let (records, bytes) = unit.weight();
         if let Some(closed) = self.batcher.push(unit, records, bytes) {
             self.write(closed)?;
@@ -1063,12 +1069,16 @@ impl Ctx<'_> {
         };
         self.tally.isolated = kg.isolated_entities;
         let existing: Vec<(String, u64)> = self.env.readers.with(|c| {
-            let mut st = c.prepare("SELECT predicate, count(*) FROM relations GROUP BY 1")?;
+            let mut st = c.prepare("SELECT predicate, count(*) FROM relations r
+                 WHERE NOT EXISTS (SELECT 1 FROM legacy_ids l WHERE l.target_type = 'relation' AND l.target_id = r.id)
+                 GROUP BY 1")?;
             let rows = st.query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })?;
+        // Only what Alice had of its own: the graph's own triples are counted by the planner, and
+        // counting them again on a rerun would change which predicate is canonical.
         let plan = plan_kg(&kg, &existing, assume, self.filter);
         drop(kg);
         for detectors in &plan.blocked {
@@ -1167,10 +1177,11 @@ impl Ctx<'_> {
         }
     }
 
-    /// The `mentions` phase: the memories this run stored are matched against the entities that
-    /// exist now (the graph made them).
+    /// The `mentions` phase: every imported knowledge memory (whichever run stored it) whose
+    /// text names an entity it is not linked to yet. An interrupted run's rerun completes them;
+    /// a finished palace sends nothing.
     fn mentions_pass(&mut self) -> Result<()> {
-        if self.dry || self.fresh_memories.is_empty() {
+        if self.dry {
             return Ok(());
         }
         let entities: i64 = self
@@ -1180,8 +1191,45 @@ impl Ctx<'_> {
         if entities == 0 {
             return Ok(());
         }
-        let keys = std::mem::take(&mut self.fresh_memories);
+        let matcher = self
+            .env
+            .readers
+            .with(alice_core::store::kg::EntityMatcher::load)?;
+        let mut todo: Vec<String> = Vec::new();
+        let keys: Vec<String> = self
+            .survey
+            .knowledge_order
+            .iter()
+            .map(|id| self.filter.legacy_key(id))
+            .collect();
         for group in keys.chunks(MENTIONS_PER_BATCH) {
+            check_stop(&self.env.stop)?;
+            // Part 0 of every drawer, then part 2, 3 ... of those that have them.
+            let mut round: Vec<String> = group.to_vec();
+            let mut part = 0usize;
+            while !round.is_empty() {
+                let ids: Vec<String> = round.iter().map(|k| part_id(k, part)).collect();
+                let found = self
+                    .env
+                    .readers
+                    .with(|c| unlinked_memories(c, &ids, &matcher))?;
+                let present: HashSet<&String> = found.iter().map(|(id, _)| id).collect();
+                todo.extend(
+                    found
+                        .iter()
+                        .filter(|(_, miss)| *miss)
+                        .map(|(id, _)| id.clone()),
+                );
+                round = round
+                    .into_iter()
+                    .zip(&ids)
+                    .filter(|(_, id)| present.contains(id))
+                    .map(|(k, _)| k)
+                    .collect();
+                part += 1;
+            }
+        }
+        for group in todo.chunks(MENTIONS_PER_BATCH) {
             let mut batch = self.batch();
             batch.link_mentions = group.to_vec();
             self.submit(batch)?;
@@ -1189,8 +1237,8 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    /// The closing batch(es): tunnel links, review items and (real runs) the marker of this run.
-    fn closing_pass(&mut self, meta: Option<(String, String)>) -> Result<()> {
+    /// The closing batch(es): tunnel links and review items.
+    fn closing_pass(&mut self) -> Result<()> {
         let links = std::mem::take(&mut self.pending_links);
         let reviews = std::mem::take(&mut self.pending_reviews);
         let seen_keys: Vec<String> = reviews
@@ -1207,7 +1255,20 @@ impl Ctx<'_> {
             })
             .collect();
         if self.dry {
-            self.tally.reviews_created += reviews.len() as u64;
+            let mut open = 0u64;
+            for r in &reviews {
+                let rejected = match r.dedupe_key.as_deref() {
+                    Some(k) => self
+                        .env
+                        .readers
+                        .with(|c| alice_core::store::reviews::was_rejected(c, k))?,
+                    None => false,
+                };
+                if !rejected {
+                    open += 1;
+                }
+            }
+            self.tally.reviews_created += open;
             // A link needs both ends among the memories this run would make or an earlier run made.
             let known: HashSet<String> = self
                 .survey
@@ -1246,15 +1307,57 @@ impl Ctx<'_> {
                 n += 1;
             }
             let last = links.is_empty() && reviews.is_empty();
-            if last && let Some(m) = meta.clone() {
-                batch.meta.push(m);
+            if n > 0 {
+                self.submit(batch)?;
             }
-            self.submit(batch)?;
             if last {
                 return Ok(());
             }
         }
     }
+
+    /// The marker of this run, written last so its verdict is the final one.
+    fn marker_pass(&mut self, marker: (String, String)) -> Result<()> {
+        let mut batch = self.batch();
+        batch.meta.push(marker);
+        self.submit(batch)?;
+        Ok(())
+    }
+}
+
+/// Of `ids` (legacy ids), the ones that name a stored memory, each with whether its text names an
+/// entity it has no mention link to.
+fn unlinked_memories(
+    conn: &rusqlite::Connection,
+    ids: &[String],
+    matcher: &alice_core::store::kg::EntityMatcher,
+) -> Result<Vec<(String, bool)>> {
+    let marks = vec!["?"; ids.len()].join(",");
+    let mut st = conn.prepare(&format!(
+        "SELECT l.legacy_id, m.id, m.title, m.body FROM legacy_ids l
+         JOIN memories m ON m.id = l.target_id
+         WHERE l.target_type = 'memory' AND l.legacy_id IN ({marks})"
+    ))?;
+    let rows = st.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (legacy, id, title, body) = row?;
+        let wanted = matcher.find_in(&format!("{title}\n{body}"));
+        let mut linked =
+            conn.prepare_cached("SELECT entity_id FROM mentions WHERE memory_id = ?1")?;
+        let have: HashSet<String> = linked
+            .query_map([&id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        out.push((legacy, wanted.iter().any(|e| !have.contains(e))));
+    }
+    Ok(out)
 }
 
 /// A triple the store would refuse: an empty part (after redaction and normalising).
@@ -1328,12 +1431,19 @@ fn failure(e: AliceError, ctx: &Ctx<'_>) -> AliceError {
     AliceError::Other(msg)
 }
 
+enum Compat {
+    /// Already set by the owner (or by an earlier run).
+    Left,
+    Enabled,
+    Warning(String),
+}
+
 /// A real run that found `compat.mempalace` at its default turns it on (a value the owner wrote,
-/// even `false`, is left alone). Returns a warning for the report when it could not.
-fn enable_compat(env: &ImportEnv, job_id: &str) -> Option<String> {
+/// even `false`, is left alone). Says what happened.
+fn enable_compat(env: &ImportEnv, job_id: &str) -> Compat {
     const KEY: &str = "compat.mempalace";
     if env.settings.resolved().sources.get(KEY) != Some(&Source::Default) {
-        return None;
+        return Compat::Left;
     }
     let mut change = serde_json::Map::new();
     change.insert(KEY.to_string(), serde_json::Value::Bool(true));
@@ -1342,7 +1452,7 @@ fn enable_compat(env: &ImportEnv, job_id: &str) -> Option<String> {
             .first()
             .map(|e| e.message.clone())
             .unwrap_or_default();
-        return Some(format!(
+        return Compat::Warning(format!(
             "the MemPalace compatibility layer could not be turned on ({why}); run `alice config set compat.mempalace true`"
         ));
     }
@@ -1355,8 +1465,8 @@ fn enable_compat(env: &ImportEnv, job_id: &str) -> Option<String> {
         before: None,
         after: Some(serde_json::json!({ "job_id": job_id })),
     }) {
-        Ok(_) => None,
-        Err(e) => Some(format!(
+        Ok(_) => Compat::Enabled,
+        Err(e) => Compat::Warning(format!(
             "the MemPalace compatibility layer is on, but the import could not record that: {e}"
         )),
     }
@@ -1474,7 +1584,6 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
         sent_projects: HashSet::new(),
         collapsed: Vec::new(),
         submitted: 0,
-        fresh_memories: Vec::new(),
         pending_links: Vec::new(),
         pending_reviews: Vec::new(),
     };
@@ -1500,16 +1609,26 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
         });
     }
     if outcome.is_ok() {
-        outcome = run_phase(&env.status, &mut phases, "mentions", || ctx.mentions_pass());
+        outcome = run_phase(&env.status, &mut phases, "mentions", || {
+            if let Some(hook) = &env.hook {
+                hook.park_before_mentions(&env.stop);
+            }
+            ctx.mentions_pass()
+        });
     }
-    // The accounting law is known before the closing batch, which carries its verdict.
-    let skipped_total: u64 =
-        surveyed.skipped.values().sum::<u64>() + ctx.tally.skipped.values().sum::<u64>();
-    let accounted = accounted(&ctx.tally, skipped_total);
-    let ok = ctx.tally.store_errors.is_empty() && accounted == surveyed.total;
+    let skipped_of = |ctx: &Ctx<'_>| {
+        surveyed.skipped.values().sum::<u64>() + ctx.tally.skipped.values().sum::<u64>()
+    };
     let finished_at = now_rfc3339();
     if outcome.is_ok() {
-        let marker = (!req.dry_run).then(|| {
+        outcome = run_phase(&env.status, &mut phases, "done", || {
+            ctx.closing_pass()?;
+            if req.dry_run {
+                return Ok(());
+            }
+            // The marker is the last thing written, so its verdict covers every batch.
+            let ok = ctx.tally.store_errors.is_empty()
+                && accounted(&ctx.tally, skipped_of(&ctx)) == surveyed.total;
             let marker = serde_json::json!({
                 "job_id": job_id,
                 "palace": filter.quiet(&palace.display().to_string()),
@@ -1517,12 +1636,10 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
                 "drawers_seen": surveyed.total,
                 "ok": ok,
             });
-            ("import.mempalace.last".to_string(), marker.to_string())
-        });
-        outcome = run_phase(&env.status, &mut phases, "done", || {
-            ctx.closing_pass(marker)
+            ctx.marker_pass(("import.mempalace.last".to_string(), marker.to_string()))
         });
     }
+    let accounted_total = accounted(&ctx.tally, skipped_of(&ctx));
     if let Err(e) = outcome {
         return Err(failure(e, &ctx));
     }
@@ -1606,7 +1723,7 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
             raw: tally.raw_collapsed,
         },
         drawers_seen: surveyed.total,
-        drawers_accounted: accounted,
+        drawers_accounted: accounted_total,
         facts: FactCounts {
             added: tally.facts_added,
             ended: tally.facts_ended,
@@ -1643,10 +1760,12 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     report.phases = phases;
     report.peak_rss_mb = peak_rss_mb();
     report.finished_at = Some(finished_at);
-    if !req.dry_run
-        && let Some(w) = enable_compat(env, job_id)
-    {
-        report.warnings.push(w);
+    if !req.dry_run {
+        match enable_compat(env, job_id) {
+            Compat::Enabled => report.compat_enabled = true,
+            Compat::Warning(w) => report.warnings.push(w),
+            Compat::Left => {}
+        }
     }
     Ok(report)
 }
