@@ -80,6 +80,9 @@ enum Command {
     /// Read and change settings (config.toml, applied live) and secrets.
     #[command(subcommand)]
     Config(cmd::ConfigCmd),
+    /// Bring memories in from another system (MemPalace).
+    #[command(subcommand)]
+    Import(cmd::ImportCmd),
     /// Embedding model management.
     #[command(subcommand)]
     Model(cmd::ModelCmd),

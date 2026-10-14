@@ -1897,3 +1897,319 @@ fn restore_says_where_the_lost_memories_went_and_undo_brings_them_back() {
     env.ok(&["restore", &kept, "--yes"]);
     assert_eq!(env.recall_count("lima"), 1, "undone");
 }
+
+// ---------------------------------------------------------------------------------------------
+// `alice import` (M3 Task 12). Palaces are synthetic (alice_core::import::fixture); the real
+// ~/.mempalace is never read: HOME points at an empty temp folder.
+
+mod import {
+    use super::*;
+    use alice_core::import::ImportReport;
+    use alice_core::import::fixture::{DrawerSpec, build_sqlite_exact, build_sqlite_exact_wal};
+    use alice_core::import::palace::DrawerMeta;
+
+    pub struct Out {
+        pub status: std::process::ExitStatus,
+        pub stdout: String,
+        pub stderr: String,
+    }
+
+    fn meta(wing: &str, room: &str) -> DrawerMeta {
+        DrawerMeta {
+            wing: wing.into(),
+            room: room.into(),
+            added_by: Some("claude-code".into()),
+            filed_at: Some("2026-04-10T10:00:00".into()),
+            ..Default::default()
+        }
+    }
+
+    fn specs() -> Vec<DrawerSpec> {
+        let k = |id: &str, text: &str, wing: &str, room: &str| DrawerSpec {
+            id: id.into(),
+            text: text.into(),
+            meta: meta(wing, room),
+        };
+        vec![
+            k(
+                "k_dec",
+                "decision about the v4 frame",
+                "wing_project_alice",
+                "decisions",
+            ),
+            k(
+                "k_two",
+                "the importer reads a snapshot, never the live palace",
+                "wing_project_alice",
+                "design",
+            ),
+            k(
+                "k_three",
+                "pg-ai keeps its offline stalls in the snapshot proxy",
+                "pg-ai",
+                "notes",
+            ),
+        ]
+    }
+
+    impl Env {
+        /// `<tmp>/palace` with a few knowledge drawers.
+        pub fn fixture_palace(&self) -> PathBuf {
+            let palace = self._dir.path().join("palace");
+            std::fs::create_dir_all(&palace).unwrap();
+            build_sqlite_exact(&palace, &specs());
+            palace
+        }
+
+        /// `alice …` with an empty HOME and no palace environment variables.
+        pub fn alice(&self, args: &[&str]) -> Out {
+            let fake_home = self._dir.path().join("fake-home");
+            std::fs::create_dir_all(&fake_home).unwrap();
+            let o = self
+                .cmd(args)
+                .env("HOME", &fake_home)
+                .env_remove("MEMPALACE_PALACE_PATH")
+                .env_remove("MEMPAL_PALACE_PATH")
+                .env("ALICE_JUDGE_PROVIDER", "heuristic")
+                .output()
+                .unwrap();
+            Out {
+                status: o.status,
+                stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+            }
+        }
+    }
+
+    fn p(path: &std::path::Path) -> &str {
+        path.to_str().unwrap()
+    }
+
+    #[test]
+    fn import_dry_run_prints_the_report_and_changes_nothing() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let out = e.alice(&["import", "mempalace", "--dry-run", "--palace", p(&palace)]);
+        assert!(out.status.success(), "{}", out.stderr);
+        for needle in [
+            "MemPalace import",
+            "[dry run]",
+            "Knowledge memories",
+            "Wing \u{2192} project map",
+        ] {
+            assert!(out.stdout.contains(needle), "{needle}\n{}", out.stdout);
+        }
+        assert_eq!(
+            e.alice(&["recall", "decision about the v4 frame"])
+                .stdout
+                .matches("v4 frame")
+                .count(),
+            0,
+            "nothing was imported"
+        );
+    }
+
+    #[test]
+    fn import_then_recall_finds_the_old_memory_and_json_is_valid() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let out = e.alice(&["--json", "import", "mempalace", "--palace", p(&palace)]);
+        assert!(out.status.success(), "{}\n{}", out.stderr, out.stdout);
+        let report: ImportReport = serde_json::from_str(&out.stdout)
+            .unwrap_or_else(|er| panic!("not an ImportReport ({er}): {}", out.stdout));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.tiers.knowledge, 3);
+        assert!(
+            e.alice(&["recall", "decision about the v4 frame"])
+                .stdout
+                .contains("v4 frame"),
+            "the old memory is found"
+        );
+        let st = e.alice(&["--json", "import", "status"]);
+        assert!(st.status.success(), "{}", st.stderr);
+        let v: serde_json::Value = serde_json::from_str(&st.stdout).unwrap();
+        assert_eq!(v["state"], "done", "{v}");
+        // Again: nothing is new.
+        let again = e.alice(&["--json", "import", "mempalace", "--palace", p(&palace)]);
+        assert!(again.status.success(), "{}\n{}", again.stderr, again.stdout);
+        let r2: ImportReport = serde_json::from_str(&again.stdout).unwrap();
+        assert_eq!(r2.tiers.knowledge, 0);
+        assert_eq!(r2.tiers.raw_session_chunks, 0);
+        assert_eq!(r2.tiers.raw_file_chunks, 0);
+        // The text form of `status` prints the finished report.
+        let text = e.alice(&["import", "status"]);
+        assert!(text.stdout.contains("MemPalace import"), "{}", text.stdout);
+    }
+
+    #[test]
+    fn bad_inputs_exit_nonzero_with_one_sentence_on_stderr() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let o = e.alice(&["import", "mempalace", "--palace", "/nonexistent/palace"]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(o.stderr.contains("does not exist"), "{}", o.stderr);
+
+        let o = e.alice(&[
+            "import",
+            "mempalace",
+            "--palace",
+            p(&palace),
+            "--since",
+            "nope",
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(o.stderr.contains("--since"), "{}", o.stderr);
+
+        let o = e.alice(&[
+            "import",
+            "mempalace",
+            "--palace",
+            p(&palace),
+            "--map-wing",
+            "nope",
+        ]);
+        assert_eq!(o.status.code(), Some(2), "{}", o.stderr);
+
+        let fresh = Env::new();
+        let o = fresh.alice(&["import", "mempalace"]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(o.stderr.contains("--palace"), "{}", o.stderr);
+        assert!(
+            fresh.daemon_json().is_none() && fresh.lock_free(),
+            "no daemon was started for a palace that cannot be found"
+        );
+    }
+
+    #[test]
+    fn map_wing_overrides_reach_the_daemon() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let out = e.alice(&[
+            "--json",
+            "import",
+            "mempalace",
+            "--dry-run",
+            "--palace",
+            p(&palace),
+            "--map-wing",
+            "wing_project_alice=alice",
+        ]);
+        assert!(out.status.success(), "{}", out.stderr);
+        let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(v["wing_map"]["wing_project_alice"]["to"], "alice", "{v}");
+    }
+
+    #[test]
+    fn a_remote_embedding_provider_needs_the_explicit_flag() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let set = e.alice(&["config", "set", "embedding.provider", "ollama"]);
+        assert!(set.status.success(), "{}", set.stderr);
+        let o = e.alice(&["import", "mempalace", "--dry-run", "--palace", p(&palace)]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(
+            o.stderr.contains("--allow-remote-embedding"),
+            "{}",
+            o.stderr
+        );
+        let o = e.alice(&[
+            "import",
+            "mempalace",
+            "--dry-run",
+            "--allow-remote-embedding",
+            "--palace",
+            p(&palace),
+        ]);
+        assert!(o.status.success(), "{}", o.stderr);
+    }
+
+    #[test]
+    fn the_palace_defaults_come_from_the_environment_then_the_config() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        // MEMPALACE_PALACE_PATH
+        let o = e
+            .cmd(&["import", "mempalace", "--dry-run"])
+            .env("HOME", e._dir.path().join("fake-home"))
+            .env("MEMPALACE_PALACE_PATH", &palace)
+            .env_remove("MEMPAL_PALACE_PATH")
+            .env("ALICE_JUDGE_PROVIDER", "heuristic")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        // ~/.mempalace/config.json
+        let h = e._dir.path().join("cfg-home");
+        std::fs::create_dir_all(h.join(".mempalace")).unwrap();
+        std::fs::write(
+            h.join(".mempalace/config.json"),
+            serde_json::json!({"palace_path": palace}).to_string(),
+        )
+        .unwrap();
+        let o = e
+            .cmd(&["import", "mempalace", "--dry-run"])
+            .env("HOME", &h)
+            .env_remove("MEMPALACE_PALACE_PATH")
+            .env_remove("MEMPAL_PALACE_PATH")
+            .env("ALICE_JUDGE_PROVIDER", "heuristic")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    #[test]
+    fn the_hidden_snapshot_command_copies_through_the_audited_path_and_leaves_the_source_alone() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let e = Env::new();
+        let src = e._dir.path().join("wal-palace");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut wal = build_sqlite_exact_wal(&src, &specs());
+        wal.release_writer();
+        let main = src.join("sqlite_exact.sqlite3");
+        let hash = |f: &std::path::Path| {
+            let mut h = DefaultHasher::new();
+            std::fs::read(f).unwrap().hash(&mut h);
+            h.finish()
+        };
+        let before = hash(&main);
+        let out_dir = e._dir.path().join("snap");
+        let o = e.alice(&[
+            "import",
+            "snapshot",
+            "--palace",
+            p(&src),
+            "--out",
+            p(&out_dir),
+        ]);
+        assert!(o.status.success(), "{}", o.stderr);
+        assert!(o.stdout.contains("sqlite_exact.sqlite3"), "{}", o.stdout);
+        let copy = rusqlite::Connection::open_with_flags(
+            out_dir.join("sqlite_exact.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let n: i64 = copy
+            .query_row(
+                "SELECT count(*) FROM documents WHERE collection_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(hash(&main), before, "the source's main file is untouched");
+        assert!(e.daemon_json().is_none(), "snapshot needs no daemon");
+        // Hidden from --help and the README.
+        let help = e.alice(&["import", "--help"]);
+        assert!(
+            !help
+                .stdout
+                .lines()
+                .any(|l| l.trim_start().starts_with("snapshot")),
+            "{}",
+            help.stdout
+        );
+        let readme =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
+                .unwrap_or_default();
+        assert!(!readme.contains("import snapshot"));
+    }
+}
