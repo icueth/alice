@@ -308,7 +308,8 @@ pub struct ImportMempalaceArgs {
     /// The collection that holds the drawers (default mempalace_drawers).
     #[arg(long)]
     pub collection: Option<String>,
-    /// Allow sending every chunk to a remote embedding provider.
+    /// Let the configured remote embedding provider receive every chunk of your MemPalace
+    /// history (without it, an import refuses when the provider is not the local model).
     #[arg(long)]
     pub allow_remote_embedding: bool,
 }
@@ -372,6 +373,7 @@ fn resolve_palace(
             .ok_or_else(not_found)?;
         match path.strip_prefix("~/") {
             Some(rest) => home.join(rest),
+            None if path == "~" => home.to_path_buf(),
             None => std::path::PathBuf::from(path),
         }
     };
@@ -401,11 +403,23 @@ async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) 
         user_home().as_deref(),
         &cwd,
     )?;
+    let mut map_wing = std::collections::BTreeMap::new();
+    for (wing, project) in a.map_wing {
+        if let Some(old) = map_wing.insert(wing.clone(), project.clone()) {
+            bail!(
+                "--map-wing names the wing {wing} twice ({old} and {project}); give each wing one project"
+            );
+        }
+    }
+    // Registered before the daemon starts or the job begins, so a Ctrl-C at any point ends
+    // only this command.
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("cannot listen for Ctrl-C")?;
     let req = ImportRequest {
         palace: Some(palace.to_string_lossy().into_owned()),
         dry_run: a.dry_run,
         since: a.since,
-        map_wing: a.map_wing.into_iter().collect(),
+        map_wing,
         collection: a.collection,
         allow_remote_embedding: a.allow_remote_embedding,
     };
@@ -416,17 +430,20 @@ async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) 
     let mut drew = false;
     let mut status = first;
     // Ctrl-C ends the wait, never the job: the daemon keeps importing and the next run resumes.
-    let interrupted = tokio::signal::ctrl_c();
-    tokio::pin!(interrupted);
+    const CONTINUES: &str = "the import continues in the background (`alice import status` shows it, and the next `alice import mempalace` resumes)";
+    let progress = |s: &alice_core::import::ImportStatus| {
+        if s.total == 0 {
+            format!("{}\u{2026}", s.phase)
+        } else {
+            format!("{}: {} of {}", s.phase, s.done, s.total)
+        }
+    };
     loop {
         if status.state != ImportState::Running {
             break;
         }
         if tty {
-            eprint!(
-                "\r\x1b[2K{}: {} of {} drawers",
-                status.phase, status.done, status.total
-            );
+            eprint!("\r\x1b[2K{}", progress(&status));
             drew = true;
         } else if status.phase != last_phase {
             eprintln!(
@@ -436,13 +453,21 @@ async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) 
         }
         last_phase.clone_from(&status.phase);
         tokio::select! {
-            _ = &mut interrupted => {
+            _ = sigint.recv() => {
                 if drew { eprintln!(); }
-                bail!("stopped waiting; the import continues in the background (`alice import status` shows it, and the next `alice import mempalace` resumes)");
+                bail!("stopped waiting; {CONTINUES}");
             }
             () = tokio::time::sleep(IMPORT_POLL) => {}
         }
-        status = c.import_status().await?;
+        status = match c.import_status().await {
+            Ok(s) => s,
+            Err(e) => {
+                if drew {
+                    eprintln!();
+                }
+                bail!("lost contact with the daemon ({e}); {CONTINUES}")
+            }
+        };
     }
     if drew {
         eprint!("\r\x1b[2K");

@@ -130,23 +130,88 @@ pub fn snapshot(palace: &Path, dest_dir: &Path, mempalace_home: Option<&Path>) -
     r
 }
 
-/// The destination must be a different folder from the palace and from `mempalace_home`.
-fn refuse_shared_destination(palace: &Path, dest_dir: &Path, home: Option<&Path>) -> Result<()> {
-    let Ok(dest) = dest_dir.canonicalize() else {
-        return Ok(()); // does not exist yet, so it cannot be one of the source folders
+/// `path` made absolute and symlink-free as far as it exists: the nearest existing ancestor is
+/// canonicalized and the part that does not exist yet is appended. Nothing is created.
+fn resolve_lenient(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let start = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_default()
     };
-    for (what, dir) in [
-        ("the palace folder", Some(palace)),
-        ("the MemPalace home", home),
-    ] {
-        if let Some(d) = dir
-            && d.canonicalize().is_ok_and(|c| c == dest)
-        {
+    // `..` is applied to the real folder when there is one (so `link/..` follows the link),
+    // else lexically.
+    let mut abs = start;
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Ok(real) = abs.canonicalize() {
+                    abs = real;
+                }
+                abs.pop();
+            }
+            other => abs.push(other.as_os_str()),
+        }
+    }
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(c) = abs.canonicalize() {
+            abs = c;
+            break;
+        }
+        match (abs.file_name().map(|n| n.to_os_string()), abs.parent()) {
+            (Some(n), Some(parent)) => {
+                if n != "." {
+                    rest.push(n);
+                }
+                abs = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+    for n in rest.into_iter().rev() {
+        abs.push(n);
+    }
+    abs
+}
+
+/// The destination must be none of: the palace folder, the MemPalace home (given, or the palace's
+/// parent when that is a `.mempalace` folder), a folder inside any of them, or a folder that holds
+/// the palace. Symlinks are followed, and a destination that does not exist yet is judged by
+/// its nearest existing ancestor.
+fn refuse_shared_destination(palace: &Path, dest_dir: &Path, home: Option<&Path>) -> Result<()> {
+    let dest = resolve_lenient(dest_dir);
+    let palace_r = resolve_lenient(palace);
+    let mut protected = vec![("the palace folder", palace_r.clone())];
+    if let Some(h) = home {
+        protected.push(("the MemPalace home", resolve_lenient(h)));
+    }
+    if let Some(parent) = palace_r.parent()
+        && parent.file_name().is_some_and(|n| n == ".mempalace")
+    {
+        protected.push(("the MemPalace home", parent.to_path_buf()));
+    }
+    for (what, dir) in &protected {
+        if dest == *dir {
             return Err(AliceError::invalid(format!(
                 "{} is {what}; the snapshot must go to a different, empty folder. Nothing was copied.",
                 dest_dir.display()
             )));
         }
+        if dest.starts_with(dir) {
+            return Err(AliceError::invalid(format!(
+                "{} is inside {what} ({}); the snapshot must go outside it. Nothing was copied.",
+                dest_dir.display(),
+                dir.display()
+            )));
+        }
+    }
+    if palace_r.starts_with(&dest) {
+        return Err(AliceError::invalid(format!(
+            "{} holds the palace folder; the snapshot must go to a folder of its own. Nothing was copied.",
+            dest_dir.display()
+        )));
     }
     Ok(())
 }
@@ -716,6 +781,34 @@ mod tests {
 
     use super::*;
     use crate::import::fixture::{DrawerSpec, build_sqlite_exact, build_sqlite_exact_wal};
+
+    #[test]
+    fn a_snapshot_destination_in_or_around_the_palace_or_home_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let palace = home.join("palace");
+        std::fs::create_dir_all(&palace).unwrap();
+        build_sqlite_exact(&palace, &[spec("a", "text", "w", None)]);
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&palace, &link).unwrap();
+        for dest in [
+            palace.clone(),
+            palace.join("new/deeper"),
+            link.join("via"),
+            home.clone(),
+            home.join("snap"),
+            root.path().join("home/palace/x/../snap"),
+            root.path().to_path_buf(),
+        ] {
+            let e = snapshot(&palace, &dest, Some(&home))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("Nothing was copied"), "{}: {e}", dest.display());
+        }
+        assert!(!palace.join("new").exists() && !home.join("snap").exists());
+        let ok = root.path().join("elsewhere/snap");
+        assert!(snapshot(&palace, &ok, Some(&home)).is_ok());
+    }
 
     fn spec(id: &str, text: &str, wing: &str, filed_at: Option<&str>) -> DrawerSpec {
         DrawerSpec {

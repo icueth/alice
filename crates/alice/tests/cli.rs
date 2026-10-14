@@ -2137,6 +2137,12 @@ mod import {
             .output()
             .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let used = |o: &std::process::Output| {
+            let text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.contains(palace.canonicalize().unwrap().to_str().unwrap())
+                || text.contains(palace.to_str().unwrap())
+        };
+        assert!(used(&o), "the report names the palace from the variable");
         // ~/.mempalace/config.json
         let h = e._dir.path().join("cfg-home");
         std::fs::create_dir_all(h.join(".mempalace")).unwrap();
@@ -2154,6 +2160,152 @@ mod import {
             .output()
             .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(used(&o), "the report names the palace from config.json");
+    }
+
+    #[test]
+    fn the_same_wing_mapped_twice_is_refused() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let o = e.alice(&[
+            "import",
+            "mempalace",
+            "--dry-run",
+            "--palace",
+            p(&palace),
+            "--map-wing",
+            "w=a",
+            "--map-wing",
+            "w=b",
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(
+            o.stderr.contains("--map-wing") && o.stderr.contains("twice"),
+            "{}",
+            o.stderr
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_destinations_in_or_around_the_palace_and_the_mempalace_home() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let fake_home = e._dir.path().join("fake-home");
+        let mp = fake_home.join(".mempalace");
+        std::fs::create_dir_all(&mp).unwrap();
+        let link = e._dir.path().join("link-to-palace");
+        std::os::unix::fs::symlink(&palace, &link).unwrap();
+        let entries = |d: &std::path::Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|x| x.unwrap().file_name())
+                .collect();
+            v.sort();
+            v
+        };
+        let (pal_before, mp_before) = (entries(&palace), entries(&mp));
+        let cases: Vec<PathBuf> = vec![
+            palace.clone(),
+            palace.join("snap"),
+            palace.join("a/b/c"),
+            link.join("via-link"),
+            link.clone(),
+            mp.clone(),
+            mp.join("snap"),
+            mp.join("deep/er"),
+            palace.join("x/../snap"),
+        ];
+        for out in cases {
+            let o = e.alice(&[
+                "import",
+                "snapshot",
+                "--palace",
+                p(&palace),
+                "--out",
+                p(&out),
+            ]);
+            assert_eq!(o.status.code(), Some(1), "{}: {}", out.display(), o.stdout);
+            assert!(
+                o.stderr.contains("palace folder") || o.stderr.contains("MemPalace home"),
+                "{}: {}",
+                out.display(),
+                o.stderr
+            );
+        }
+        assert_eq!(
+            entries(&palace),
+            pal_before,
+            "nothing was created in the palace"
+        );
+        assert_eq!(
+            entries(&mp),
+            mp_before,
+            "nothing was created in ~/.mempalace"
+        );
+        assert!(!palace.join("snap").exists() && !mp.join("snap").exists());
+        // A palace under ~/.mempalace protects the whole home, too.
+        let inner = mp.join("palace");
+        std::fs::create_dir_all(&inner).unwrap();
+        build_sqlite_exact(&inner, &specs());
+        let o = e.alice(&[
+            "import",
+            "snapshot",
+            "--palace",
+            p(&inner),
+            "--out",
+            p(&mp.join("other")),
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(!mp.join("other").exists());
+    }
+
+    #[test]
+    fn snapshot_never_overwrites_a_file_in_the_destination() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let out_dir = e._dir.path().join("snap");
+        let first = e.alice(&[
+            "import",
+            "snapshot",
+            "--palace",
+            p(&palace),
+            "--out",
+            p(&out_dir),
+        ]);
+        assert!(first.status.success(), "{}", first.stderr);
+        let copy = out_dir.join("sqlite_exact.sqlite3");
+        let before = std::fs::read(&copy).unwrap();
+        let again = e.alice(&[
+            "import",
+            "snapshot",
+            "--palace",
+            p(&palace),
+            "--out",
+            p(&out_dir),
+        ]);
+        assert_eq!(again.status.code(), Some(1), "{}", again.stdout);
+        assert_eq!(
+            std::fs::read(&copy).unwrap(),
+            before,
+            "the first copy is intact"
+        );
+        // A foreign file already at the target name is left alone too.
+        let other = e._dir.path().join("snap2");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("sqlite_exact.sqlite3"), b"mine").unwrap();
+        let o = e.alice(&[
+            "import",
+            "snapshot",
+            "--palace",
+            p(&palace),
+            "--out",
+            p(&other),
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stdout);
+        assert_eq!(
+            std::fs::read(other.join("sqlite_exact.sqlite3")).unwrap(),
+            b"mine"
+        );
     }
 
     #[test]
