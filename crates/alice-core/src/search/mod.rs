@@ -1453,6 +1453,41 @@ mod tests {
             .collect()
     }
 
+    /// The raw tier honours `lists` too (word/code/trigram lists vs the chunk vector list), for
+    /// both the `include_raw` recall and the raw fallback, and agents get `Hybrid` by default.
+    #[test]
+    fn lists_switch_applies_to_the_raw_tier_and_defaults_to_hybrid() {
+        assert_eq!(SearchParams::default().lists, Lists::Hybrid);
+        let (f, params) = chunk_fixture();
+        for p in &params {
+            for (lists, banned) in [
+                (Lists::LexicalOnly, MatchVia::Vector),
+                (Lists::VectorOnly, MatchVia::Words),
+            ] {
+                let out = f.search(&SearchParams {
+                    lists,
+                    relevance_floor: 0.0,
+                    raw_min_results: 5,
+                    include_raw: true,
+                    ..p.clone()
+                });
+                let raw: Vec<&Hit> = out.hits.iter().filter(|h| h.tier == Tier::Raw).collect();
+                assert!(!raw.is_empty(), "{lists:?}: {:?}", out.hits);
+                assert!(
+                    raw.iter().all(|h| !h.matched.contains(&banned)),
+                    "{lists:?}: {raw:?}"
+                );
+            }
+        }
+        // The fallback path (no include_raw): thin knowledge results take the raw tier.
+        let out = f.search(&SearchParams {
+            lists: Lists::LexicalOnly,
+            raw_min_results: 5,
+            ..f.params("weekly lab sync tuesday")
+        });
+        assert!(out.raw_fallback, "{:?}", out.hits);
+    }
+
     /// The chunk vector list can read on a pool of its own, at the same time as the lexical
     /// lists: the results are exactly those of the search on one connection.
     #[test]

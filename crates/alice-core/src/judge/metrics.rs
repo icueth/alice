@@ -1,8 +1,15 @@
 //! Evaluation metrics for judges and search.
+//!
+//! Every metric over `gold` and `pred`/`probs` returns `NaN` when their lengths differ (a
+//! mismatch is a bug in the caller, and a number that looks fine would hide it) and 0 for empty
+//! input.
 
 use super::Distribution;
 
 pub fn accuracy(gold: &[String], pred: &[String]) -> f64 {
+    if gold.len() != pred.len() {
+        return f64::NAN;
+    }
     if gold.is_empty() {
         return 0.0;
     }
@@ -11,6 +18,9 @@ pub fn accuracy(gold: &[String], pred: &[String]) -> f64 {
 
 /// Mean of per-label F1 (a label never predicted nor present is skipped).
 pub fn macro_f1(gold: &[String], pred: &[String], labels: &[&str]) -> f64 {
+    if gold.len() != pred.len() {
+        return f64::NAN;
+    }
     let mut f1s = Vec::new();
     for l in labels {
         let count = |g_is: bool, p_is: bool| {
@@ -39,6 +49,9 @@ pub fn macro_f1(gold: &[String], pred: &[String], labels: &[&str]) -> f64 {
 /// Multi-class Brier score: mean over items of Σ_label (p − 1[label = gold])². 0 is perfect, 2
 /// the worst.
 pub fn brier(gold: &[String], probs: &[Distribution], labels: &[&str]) -> f64 {
+    if gold.len() != probs.len() {
+        return f64::NAN;
+    }
     if gold.is_empty() {
         return 0.0;
     }
@@ -59,6 +72,9 @@ pub fn brier(gold: &[String], probs: &[Distribution], labels: &[&str]) -> f64 {
 
 /// Expected calibration error over `bins` equal-width bins of the top probability.
 pub fn ece(gold: &[String], probs: &[Distribution], bins: usize) -> f64 {
+    if gold.len() != probs.len() {
+        return f64::NAN;
+    }
     let n = gold.len() as f64;
     if n == 0.0 || bins == 0 {
         return 0.0;
@@ -79,6 +95,8 @@ pub fn ece(gold: &[String], probs: &[Distribution], bins: usize) -> f64 {
         .sum()
 }
 
+/// DCG with the gain `2^g - 1`. `g` may be fractional (an expected grade), which keeps the
+/// gain smooth between the integer grades.
 pub fn dcg(grades: &[f64], k: usize) -> f64 {
     grades
         .iter()
@@ -100,10 +118,12 @@ pub fn ndcg_at(grades_in_rank_order: &[f64], pool: &[f64], k: usize) -> f64 {
     }
 }
 
+/// Nearest-rank percentile (`p` is clamped to 0..=1; sorts `v`).
 pub fn percentile(v: &mut [f64], p: f64) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
+    let p = if p.is_nan() { 0.0 } else { p.clamp(0.0, 1.0) };
     v.sort_by(f64::total_cmp);
     v[(((v.len() - 1) as f64) * p).round() as usize]
 }
@@ -143,5 +163,34 @@ mod tests {
         assert!(ndcg_at(&[0.0, 1.0, 2.0], &pool, 10) < 0.8);
         assert_eq!(ndcg_at(&[0.0], &[0.0], 10), 0.0);
         assert_eq!(percentile(&mut [3.0, 1.0, 2.0], 0.5), 2.0);
+    }
+
+    #[test]
+    fn edge_cases() {
+        let none: Vec<String> = vec![];
+        assert_eq!(accuracy(&none, &none), 0.0);
+        assert_eq!(brier(&none, &[], &["a"]), 0.0);
+        assert_eq!(ece(&none, &[], 10), 0.0);
+        assert_eq!(macro_f1(&none, &none, &["a"]), 0.0);
+        // A length mismatch is NaN, never a number.
+        assert!(accuracy(&s(&["a"]), &s(&["a", "b"])).is_nan());
+        assert!(macro_f1(&s(&["a"]), &s(&[]), &["a"]).is_nan());
+        assert!(brier(&s(&["a"]), &[], &["a"]).is_nan());
+        assert!(ece(&s(&["a"]), &[], 10).is_nan());
+        // One bin: ECE is |accuracy - mean confidence|.
+        let gold = s(&["a", "a"]);
+        let probs = vec![Distribution::certain("a"), Distribution::certain("b")];
+        assert!((ece(&gold, &probs, 1) - 0.5).abs() < 1e-9);
+        assert_eq!(ece(&gold, &probs, 0), 0.0);
+        // k = 0 and a zero ideal give 0, also for a ranking that has gain.
+        assert_eq!(dcg(&[3.0], 0), 0.0);
+        assert_eq!(ndcg_at(&[2.0], &[2.0], 0), 0.0);
+        assert_eq!(ndcg_at(&[2.0, 1.0], &[0.0, 0.0], 10), 0.0);
+        // Percentile clamps.
+        assert_eq!(percentile(&mut [3.0, 1.0, 2.0], 7.0), 3.0);
+        assert_eq!(percentile(&mut [3.0, 1.0, 2.0], -1.0), 1.0);
+        assert_eq!(percentile(&mut [], 0.5), 0.0);
+        // The gain is 2^g - 1: a fractional grade lies between the integer ones.
+        assert!((dcg(&[0.5], 1) - (2f64.sqrt() - 1.0)).abs() < 1e-9);
     }
 }

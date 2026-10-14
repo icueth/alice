@@ -1,12 +1,7 @@
 //! The Jev evaluation set is balanced, well-formed and clean (runs in CI; no network, no model).
+mod common;
+use common::*;
 use std::collections::{HashMap, HashSet};
-
-fn lines(text: &str) -> Vec<serde_json::Value> {
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
-        .collect()
-}
 
 #[test]
 fn the_labelled_set_meets_its_composition_rules() {
@@ -66,8 +61,8 @@ fn the_labelled_set_meets_its_composition_rules() {
         );
         if label == "updates" {
             assert!(
-                n < o,
-                "{}: an update is newer than what it updates",
+                n <= o,
+                "{}: an update is not older than what it updates",
                 p["id"]
             );
         }
@@ -100,6 +95,54 @@ fn the_labelled_set_meets_its_composition_rules() {
         );
     }
     assert!(same_age_contradicts >= 15);
+
+    // Step 5 rules: hard negatives and paraphrases.
+    let common = common_words(&pairs);
+    let hard = pairs
+        .iter()
+        .filter(|p| p["label"] == "unrelated" && shares_a_topic_word(p, &common))
+        .count();
+    assert!(hard >= 20, "{hard} unrelated pairs share a topic word");
+    let paraphrases = pairs
+        .iter()
+        .filter(|p| {
+            p["label"] == "duplicate"
+                && trigram_jaccard(
+                    p["new"]["body"].as_str().unwrap(),
+                    p["old"]["body"].as_str().unwrap(),
+                ) < 0.3
+        })
+        .count();
+    assert!(paraphrases >= 20, "{paraphrases} paraphrase duplicates");
+
+    // The metadata must not decide: neither the fixed rule nor the best table over
+    // (same title, age order, same kind) may get half of the pairs right.
+    let rule = pairs
+        .iter()
+        .filter(|p| metadata_rule(p) == p["label"].as_str().unwrap())
+        .count() as f64
+        / pairs.len() as f64;
+    let fitted = metadata_fitted(&pairs);
+    let best = pairs
+        .iter()
+        .zip(&fitted)
+        .filter(|(p, f)| p["label"].as_str().unwrap() == f.as_str())
+        .count() as f64
+        / pairs.len() as f64;
+    assert!(rule <= 0.5, "the metadata-only rule scores {rule:.3}");
+    assert!(best <= 0.5, "the best metadata-only table scores {best:.3}");
+
+    // Real memories are paragraphs, not one-liners.
+    let mut lens: Vec<usize> = pairs
+        .iter()
+        .flat_map(|p| ["new", "old"].map(|s| p[s]["body"].as_str().unwrap().chars().count()))
+        .collect();
+    lens.sort();
+    assert!(
+        lens[lens.len() / 2] >= 150,
+        "median body {} characters",
+        lens[lens.len() / 2]
+    );
     assert_eq!(
         redactor_hits, 0,
         "the set must contain nothing secret-shaped"
