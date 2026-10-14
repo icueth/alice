@@ -287,6 +287,7 @@ mod tests {
         assert_eq!(pending_count(&d.path().join("missing")), 0);
     }
 
+    // Unix file modes (0600 / 0700); Windows has no mode bits.
     #[cfg(unix)]
     #[test]
     fn spool_files_and_a_new_spool_dir_are_private() {

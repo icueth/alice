@@ -222,6 +222,8 @@ mod tests {
             StartProgress::step("opening the database").describe(),
             "opening the database"
         );
+        // `pid_alive` cannot tell on Windows (it answers true), so a dead announcer is only
+        // recognised on Unix.
         #[cfg(unix)]
         {
             p.pid = 0;

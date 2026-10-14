@@ -1506,12 +1506,18 @@ mod tests {
     fn index_files_save_and_open_under_unusual_directory_names() {
         let e = FakeEmbedder::new(384);
         let d = tempfile::tempdir().unwrap();
-        let mut dirs = vec![d.path().join("ข้อมูล ทดสอบ").join("vectors")];
+        let thai = d.path().join("ข้อมูล ทดสอบ").join("vectors");
+        // A Windows path is UTF-16 and cannot hold bytes that are not UTF-8.
         #[cfg(unix)]
-        {
+        let dirs = {
             use std::os::unix::ffi::OsStrExt;
-            dirs.push(d.path().join(std::ffi::OsStr::from_bytes(b"bad\xffdir")));
-        }
+            vec![
+                thai,
+                d.path().join(std::ffi::OsStr::from_bytes(b"bad\xffdir")),
+            ]
+        };
+        #[cfg(not(unix))]
+        let dirs = vec![thai];
         for dir in dirs {
             match std::fs::create_dir_all(&dir) {
                 Ok(()) => {}

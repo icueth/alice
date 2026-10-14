@@ -183,6 +183,7 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(read_token(&home), Some(a));
+        // Unix file modes (0600); Windows has no mode bits.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -292,6 +293,7 @@ mod tests {
         assert!(!verify_ping_proof(&token, nonce, b, &proof_a));
     }
 
+    // Unix file modes (0600); Windows has no mode bits.
     #[cfg(unix)]
     #[test]
     fn an_existing_token_file_is_made_private_again() {

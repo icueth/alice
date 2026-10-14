@@ -121,6 +121,7 @@ mod tests {
         ] {
             assert_eq!(file.parent(), Some(home.root()));
         }
+        // Unix file modes (0700); Windows has no mode bits.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

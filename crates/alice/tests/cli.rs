@@ -1,5 +1,7 @@
 //! Real processes: auto-start, start races, kill -9, stale discovery files, stop then start,
 //! every subcommand, and the stdio MCP shim (review focus #3).
+// Unix only (M1 ruling R3): the daemons these tests start are checked, stopped and killed with
+// signals (`libc::kill`); detached start and kill on Windows need a real Windows machine.
 #![cfg(unix)]
 
 use std::io::{Read, Write};

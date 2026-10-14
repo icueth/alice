@@ -1059,6 +1059,8 @@ mod tests {
         }
     }
 
+    // Unix only (M1 ruling R3): the stand-in for the `alice` binary is a `#!/bin/sh` script,
+    // which Windows cannot run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_starts_a_daemon_for_this_home_and_waits_until_it_serves() {
@@ -1089,6 +1091,8 @@ mod tests {
         assert!(home.logs_dir().join("daemon.log").exists());
     }
 
+    // Unix only (M1 ruling R3): the stand-in for the `alice` binary is a `#!/bin/sh` script,
+    // which Windows cannot run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_gives_up_after_the_wait_and_says_what_to_do() {
@@ -1137,6 +1141,8 @@ mod tests {
     /// Review finding I-1: the daemon this client started fails and leaves its reason in
     /// daemon.error; `connect` reports that reason at once instead of waiting out the wait and
     /// saying "starting". A write is still queued, and its reply says why.
+    // Unix only (M1 ruling R3): the stand-in for the `alice` binary is a `#!/bin/sh` script,
+    // which Windows cannot run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_reports_why_the_started_daemon_failed() {
@@ -1175,6 +1181,8 @@ mod tests {
 
     /// Review finding I-1: when the wait runs out while the daemon downloads the model, the
     /// error (and a queued write's reason) says so.
+    // Unix only (M1 ruling R3): the stand-in for the `alice` binary is a `#!/bin/sh` script,
+    // which Windows cannot run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_says_when_the_daemon_is_still_downloading_the_model() {
@@ -1217,6 +1225,7 @@ mod tests {
         }
     }
 
+    // Unix only: checks the setsid session (a Windows process has none) and kills with signals.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn spawn_detached_runs_in_its_own_session_with_output_in_the_log() {
