@@ -50,11 +50,25 @@ fn ago(n: i64, one: &str, unit: &str) -> String {
     }
 }
 
+/// RFC 3339, or a space-separated `YYYY-MM-DD HH:MM:SS` read as UTC.
+pub(crate) fn parse_time(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+        return Some(t.with_timezone(&Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .map(|n| n.and_utc())
+}
+
 pub fn age(created_at: &str, now: DateTime<Utc>) -> String {
-    let Ok(t) = DateTime::parse_from_rfc3339(created_at) else {
+    let Some(t) = parse_time(created_at) else {
         return "at an unknown time".into();
     };
-    let days = (now - t.with_timezone(&Utc)).num_days();
+    let delta = now - t;
+    if delta < chrono::Duration::zero() {
+        return "in the future".into();
+    }
+    let days = delta.num_days();
     match days {
         ..=0 => "today".into(),
         1 => "yesterday".into(),
@@ -62,7 +76,8 @@ pub fn age(created_at: &str, now: DateTime<Utc>) -> String {
         7..=13 => "a week ago".into(),
         14..=29 => ago(days / 7, "a", "week"),
         30..=59 => "a month ago".into(),
-        60..=364 => ago(days / 30, "a", "month"),
+        60..=359 => ago(days / 30, "a", "month"),
+        360..=364 => "about a year ago".into(),
         365..=729 => "a year ago".into(),
         _ => ago(days / 365, "a", "year"),
     }
@@ -117,6 +132,11 @@ mod tests {
         assert_eq!(age(&at(400), now), "a year ago");
         assert_eq!(age(&at(1_100), now), "three years ago");
         assert_eq!(age("not a date", now), "at an unknown time");
+        assert_eq!(age(&at(-2), now), "in the future");
+        assert_eq!(age(&at(361), now), "about a year ago");
+        assert_eq!(age(&at(359), now), "eleven months ago");
+        assert_eq!(age("2026-09-29 12:00:00", now), "two weeks ago");
+        assert_eq!(age("2026-10-13 11:59:59.250", now), "today");
         assert_eq!(number(12), "twelve");
         assert_eq!(number(40), "forty");
         assert_eq!(number(137), "137");
@@ -124,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_blocks_have_no_digits_from_metadata_and_bound_the_body() {
+    fn memory_blocks_have_no_digits_in_the_header_and_bound_the_body() {
         let now = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
         let m = JudgeMemory {
             id: "01X".into(),
@@ -141,6 +161,33 @@ mod tests {
             b.starts_with("Existing memory 1 (written two weeks ago, kind decision, importance critical, project app):"),
             "{b}"
         );
-        assert!(b.chars().count() < BODY_CHARS + 200);
+        // The label is the caller's; the metadata after it is words.
+        let header = b.lines().next().unwrap().split_once('(').unwrap().1;
+        assert!(!header.chars().any(|c| c.is_ascii_digit()), "{header}");
+        let body = b.lines().nth(2).unwrap();
+        assert_eq!(
+            body.chars().count(),
+            BODY_CHARS + 1,
+            "700 chars and the ellipsis"
+        );
+    }
+
+    #[test]
+    fn thai_bodies_truncate_on_character_boundaries() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        let m = JudgeMemory {
+            id: "01X".into(),
+            project: "app".into(),
+            kind: crate::model::Kind::Note,
+            title: "สวัสดี".into(),
+            body: "สวัสดีครับ".repeat(500),
+            importance: 3,
+            created_at: now.to_rfc3339(),
+            similarity: None,
+        };
+        let b = memory_block("Memory", &m, now);
+        let body = b.lines().nth(2).unwrap();
+        assert!(body.ends_with('…'));
+        assert_eq!(body.chars().count(), BODY_CHARS + 1);
     }
 }

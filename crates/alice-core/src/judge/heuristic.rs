@@ -7,6 +7,7 @@ use super::text::{predicate_similarity, stem_predicate, title_similarity};
 use super::{
     Choice, Distribution, Judge, JudgeMemory, JudgeResult, ProjectOption, Relation, Rubric, Score,
 };
+use crate::store::kg::normalize_predicate;
 
 pub struct HeuristicJudge {
     pub duplicate_similarity: f32,
@@ -135,19 +136,33 @@ fn spread(winner: &str, p: f64) -> Distribution {
     }))
 }
 
+/// Whether `name` appears in `text` as a word. Boundaries are ASCII-aware: a Thai letter next
+/// to an ASCII name (`ใช้pg-aiกับ`) does not hide it, but `pg-aid` does not match `pg-ai`.
 fn mentions(text: &str, name: &str) -> bool {
+    if name.trim().is_empty() {
+        return false;
+    }
     let text = text.to_lowercase();
     let name = name.to_lowercase();
+    let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
     [name.clone(), name.replace('-', " "), name.replace('-', "_")]
         .iter()
         .any(|n| {
             text.match_indices(n.as_str()).any(|(i, _)| {
-                let before = text[..i].chars().next_back();
-                let after = text[i + n.len()..].chars().next();
-                before.is_none_or(|c| !c.is_alphanumeric())
-                    && after.is_none_or(|c| !c.is_alphanumeric())
+                boundary(text[..i].chars().next_back())
+                    && boundary(text[i + n.len()..].chars().next())
             })
         })
+}
+
+/// Whether `a` was created strictly after `b`: by parsed time, string order only when neither
+/// parses.
+fn newer(a: &str, b: &str) -> bool {
+    match (super::verbal::parse_time(a), super::verbal::parse_time(b)) {
+        (Some(x), Some(y)) => x > y,
+        (None, None) => a > b,
+        _ => false,
+    }
 }
 
 impl Judge for HeuristicJudge {
@@ -183,7 +198,7 @@ impl Judge for HeuristicJudge {
                     ])
                 } else if same_project
                     && e.kind == new.kind
-                    && new.created_at > e.created_at
+                    && newer(&new.created_at, &e.created_at)
                     && title_similarity(&new.title, &e.title) >= self.title_similarity
                 {
                     Distribution::from_pairs([
@@ -226,16 +241,31 @@ impl Judge for HeuristicJudge {
 
     fn match_predicate(&self, new: &str, existing: &[String]) -> JudgeResult<Distribution> {
         let stem = stem_predicate(new);
-        let best = existing
+        let key = normalize_predicate(new);
+        // Best candidate: exact normalised match, then higher similarity, then the shorter
+        // predicate, then lexicographic order, so the answer does not depend on input order.
+        let mut ranked: Vec<(&String, f64, bool)> = existing
             .iter()
-            .map(|p| (p, predicate_similarity(new, p)))
-            .max_by(|a, b| a.1.total_cmp(&b.1));
-        Ok(match best {
-            Some((p, _)) if stem_predicate(p) == stem => {
-                Distribution::from_pairs([(p.clone(), 0.95), ("none".to_string(), 0.05)])
+            .map(|p| {
+                (
+                    p,
+                    predicate_similarity(new, p),
+                    normalize_predicate(p) == key,
+                )
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then(b.1.total_cmp(&a.1))
+                .then(a.0.chars().count().cmp(&b.0.chars().count()))
+                .then(a.0.cmp(b.0))
+        });
+        Ok(match ranked.first() {
+            Some((p, _, _)) if stem_predicate(p) == stem => {
+                Distribution::from_pairs([((*p).clone(), 0.95), ("none".to_string(), 0.05)])
             }
-            Some((p, s)) if s >= self.title_similarity => {
-                Distribution::from_pairs([(p.clone(), 0.7), ("none".to_string(), 0.3)])
+            Some((p, s, _)) if *s >= self.title_similarity => {
+                Distribution::from_pairs([((*p).clone(), 0.7), ("none".to_string(), 0.3)])
             }
             _ => Distribution::certain("none"),
         })
@@ -368,6 +398,58 @@ mod tests {
     }
 
     #[test]
+    fn thai_glued_names_route_and_timestamps_compare_as_times() {
+        let j = HeuristicJudge::default();
+        let m = mem(
+            "N",
+            "global",
+            Kind::Note,
+            "ใช้pg-aiกับเซิร์ฟเวอร์",
+            "2026-10-13T00:00:00.000Z",
+            None,
+        );
+        let projects = vec![
+            ProjectOption {
+                slug: "pg-ai".into(),
+                name: "pg-ai".into(),
+                hint: String::new(),
+            },
+            ProjectOption {
+                slug: String::new(),
+                name: String::new(),
+                hint: String::new(),
+            },
+        ];
+        assert_eq!(
+            j.route_project(&m, &projects).unwrap().best().unwrap().0,
+            "pg-ai"
+        );
+        let m2 = mem(
+            "N",
+            "global",
+            Kind::Note,
+            "pg-aid is different",
+            "2026-10-13T00:00:00.000Z",
+            None,
+        );
+        assert_eq!(
+            j.route_project(&m2, &projects).unwrap().best().unwrap().0,
+            "global"
+        );
+        // +07:00 offset: 2026-10-13T05:00+07:00 is earlier than 2026-10-13T00:00Z? No, it is
+        // 2026-10-12T22:00Z, so it is older although it sorts later as a string.
+        assert!(newer(
+            "2026-10-13T00:00:00.000Z",
+            "2026-10-13T05:00:00+07:00"
+        ));
+        assert!(!newer(
+            "2026-10-13T05:00:00+07:00",
+            "2026-10-13T00:00:00.000Z"
+        ));
+        assert!(!newer("bad", "2026-10-13T00:00:00.000Z"));
+    }
+
+    #[test]
     fn routing_and_predicates() {
         let j = HeuristicJudge::default();
         let m = mem(
@@ -397,6 +479,10 @@ mod tests {
             .match_predicate("uses", &["use".into(), "deployed_on".into()])
             .unwrap();
         assert_eq!(p.best().unwrap(), ("use".to_string(), 0.95));
+        for set in [["uses", "use"], ["use", "uses"]] {
+            let d = j.match_predicate("uses", &set.map(String::from)).unwrap();
+            assert_eq!(d.best().unwrap(), ("uses".to_string(), 0.95), "{set:?}");
+        }
         let none = j.match_predicate("owns", &["deployed_on".into()]).unwrap();
         assert_eq!(none.best().unwrap().0, "none");
     }

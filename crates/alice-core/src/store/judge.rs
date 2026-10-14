@@ -3,7 +3,7 @@
 //! The cache keeps only the request hash and the provider's response JSON, never the request
 //! text; the ledger keeps only counts and spend.
 
-use crate::error::Result;
+use crate::error::{AliceError, Result};
 use crate::ids::now_rfc3339;
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
@@ -41,7 +41,8 @@ pub fn cache_put(
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO judge_cache (request_hash, provider, model, response_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(request_hash) DO UPDATE SET response_json = excluded.response_json, created_at = excluded.created_at",
+         ON CONFLICT(request_hash) DO UPDATE SET provider = excluded.provider, model = excluded.model,
+           response_json = excluded.response_json, created_at = excluded.created_at",
         params![hash, provider, model, response_json, now_rfc3339()],
     )?;
     Ok(())
@@ -59,6 +60,20 @@ pub fn spent(conn: &Connection, day: &str, provider: &str) -> Result<f64> {
 }
 
 pub fn add_cost(conn: &Connection, d: &CostDelta) -> Result<()> {
+    if !d.usd.is_finite() || d.usd < 0.0 {
+        return Err(AliceError::invalid(
+            "a cost must be a finite amount of at least zero",
+        ));
+    }
+    let to_i64 = |n: u64| {
+        i64::try_from(n)
+            .map_err(|_| AliceError::invalid("a call or token count is too large to record"))
+    };
+    let (calls, input, output) = (
+        to_i64(d.calls)?,
+        to_i64(d.input_tokens)?,
+        to_i64(d.output_tokens)?,
+    );
     conn.execute(
         "INSERT INTO cost_ledger (day, provider, calls, input_tokens, output_tokens, usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(day, provider) DO UPDATE SET calls = calls + excluded.calls,
@@ -67,9 +82,9 @@ pub fn add_cost(conn: &Connection, d: &CostDelta) -> Result<()> {
         params![
             d.day,
             d.provider,
-            d.calls as i64,
-            d.input_tokens as i64,
-            d.output_tokens as i64,
+            calls,
+            input,
+            output,
             d.usd
         ],
     )?;
@@ -126,6 +141,39 @@ mod tests {
         assert!((spent(&c, "2026-10-13", "jev").unwrap() - 0.0000504).abs() < 1e-12);
         assert_eq!(spent(&c, "2026-10-14", "jev").unwrap(), 0.0);
         let rows = cost_since(&c, "2026-10-01").unwrap();
+        let bad = |usd: f64, calls: u64| CostDelta {
+            day: "2026-10-13".into(),
+            provider: "jev".into(),
+            calls,
+            input_tokens: 0,
+            output_tokens: 0,
+            usd,
+        };
+        for d in [
+            bad(-1.0, 1),
+            bad(f64::NAN, 1),
+            bad(f64::INFINITY, 1),
+            bad(0.0, u64::MAX),
+        ] {
+            assert!(
+                matches!(add_cost(&c, &d), Err(AliceError::Invalid(_))),
+                "{d:?}"
+            );
+        }
+        assert_eq!(
+            cost_since(&c, "2026-10-01").unwrap()[0].calls,
+            3,
+            "nothing was written"
+        );
+        cache_put(&c, "h", "heuristic", "m2", "{}").unwrap();
+        let (p, m): (String, String) = c
+            .query_row(
+                "SELECT provider, model FROM judge_cache WHERE request_hash = 'h'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((p.as_str(), m.as_str()), ("heuristic", "m2"));
         assert_eq!(
             (rows.len(), rows[0].calls, rows[0].input_tokens),
             (1, 3, 1_200)

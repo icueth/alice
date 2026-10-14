@@ -58,20 +58,42 @@ impl Choice {
 }
 
 /// Probabilities over choice ids, normalised to sum to 1 (empty when nothing had mass).
+/// Zero-mass ids are dropped. Deserialising normalises too, so a stored or foreign map is
+/// always a valid distribution.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "BTreeMap<String, f64>")]
 pub struct Distribution(pub BTreeMap<String, f64>);
+
+impl From<BTreeMap<String, f64>> for Distribution {
+    fn from(m: BTreeMap<String, f64>) -> Self {
+        Self::from_pairs(m)
+    }
+}
 
 impl Distribution {
     pub fn from_pairs(pairs: impl IntoIterator<Item = (String, f64)>) -> Self {
-        let mut m: BTreeMap<String, f64> = BTreeMap::new();
-        for (k, v) in pairs {
-            *m.entry(k).or_default() += if v.is_finite() { v.max(0.0) } else { 0.0 };
-        }
-        let total: f64 = m.values().sum();
-        if total > 0.0 {
-            m.values_mut().for_each(|v| *v /= total);
+        let items: Vec<(String, f64)> = pairs
+            .into_iter()
+            .map(|(k, v)| (k, if v.is_finite() { v.max(0.0) } else { 0.0 }))
+            .collect();
+        let mut total: f64 = items.iter().map(|(_, v)| v).sum();
+        // Huge weights would overflow the sum: scale by the largest first.
+        let scale = if total.is_finite() {
+            1.0
         } else {
-            m.clear();
+            items.iter().map(|(_, v)| *v).fold(0.0, f64::max)
+        };
+        let mut m: BTreeMap<String, f64> = BTreeMap::new();
+        if scale != 1.0 {
+            total = items.iter().map(|(_, v)| v / scale).sum();
+        }
+        if total > 0.0 {
+            for (k, v) in items {
+                let p = v / scale / total;
+                if p > 0.0 {
+                    *m.entry(k).or_default() += p;
+                }
+            }
         }
         Self(m)
     }
@@ -88,10 +110,12 @@ impl Distribution {
         self.0.get(id).copied().unwrap_or(0.0)
     }
 
-    /// The most likely id; ties go to the first id in order, so the result is deterministic.
+    /// The most likely id with positive mass; ties go to the first id in order, so the result
+    /// is deterministic. `None` when no id has mass.
     pub fn best(&self) -> Option<(String, f64)> {
         self.0
             .iter()
+            .filter(|(_, v)| **v > 0.0)
             .fold(None, |acc: Option<(&String, f64)>, (k, &v)| match acc {
                 Some((_, b)) if b >= v => acc,
                 _ => Some((k, v)),
@@ -99,6 +123,8 @@ impl Distribution {
             .map(|(k, v)| (k.clone(), v))
     }
 
+    /// The mean of two distributions. When one side is empty the result is the other side
+    /// unchanged (an empty side carries no information, so it does not dilute the answer).
     pub fn average(a: &Self, b: &Self) -> Self {
         Self::from_pairs(
             a.0.iter()
