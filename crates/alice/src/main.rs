@@ -58,6 +58,16 @@ enum Command {
     /// Maintenance jobs: when they last ran, or run one now.
     #[command(subcommand)]
     Maintenance(cmd::MaintenanceCmd),
+    /// Replace the memory database with a backup (default: the newest). The current database is
+    /// kept in backups/; the daemon restarts and rebuilds its index. Memories purged after the
+    /// backup come back, and text stored under older redaction rules is not scanned again.
+    Restore {
+        /// A backup file name from `alice backup list`, or a path.
+        backup: Option<String>,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// List projects.
     Projects,
     /// Daemon status and counts.

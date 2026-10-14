@@ -50,7 +50,8 @@ pub struct BackupInfo {
     pub bytes: u64,
 }
 
-const KEEP_SPECIAL_DAYS: i64 = 30;
+/// Days pre-migration and before-restore copies are kept (the newest of each kind for ever).
+pub const KEEP_SPECIAL_DAYS: i64 = 30;
 /// Manual backups kept, newest first, whatever the day: the daily/weekly policy never thins them.
 pub const KEEP_MANUAL: usize = 5;
 
@@ -66,7 +67,7 @@ fn stamp(now: DateTime<Utc>) -> String {
     now.format("%Y%m%dT%H%M%SZ").to_string()
 }
 
-fn name_for(kind: BackupKind, now: DateTime<Utc>, version: i64) -> String {
+pub(crate) fn name_for(kind: BackupKind, now: DateTime<Utc>, version: i64) -> String {
     match kind {
         BackupKind::Scheduled => format!("alice-{}.db", stamp(now)),
         BackupKind::Manual => format!("alice-manual-{}.db", stamp(now)),
@@ -295,7 +296,7 @@ pub fn free_space(path: &Path) -> Option<u64> {
 }
 
 /// Make the rename durable (Unix; best effort).
-fn sync_dir(dir: &Path) {
+pub(crate) fn sync_dir(dir: &Path) {
     #[cfg(unix)]
     if let Ok(d) = std::fs::File::open(dir) {
         let _ = d.sync_all();

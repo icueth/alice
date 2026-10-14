@@ -406,6 +406,8 @@ pub fn dispatch(command: Command, json: bool) -> Result<()> {
             Ok(())
         }),
         Command::Bench(args) => crate::bench::bench(home, args, json),
+        // Not through `client_command`: that would start a daemon, and `restore` must have none.
+        Command::Restore { backup, yes } => rt()?.block_on(restore(&home, backup, yes, json)),
         other => rt()?.block_on(client_command(home, other, json)),
     }
 }
@@ -668,7 +670,11 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
             out(&lines.iter().map(|l| format!("{l}\n")).collect::<String>())
         }
         Command::Config(c) => config(&home, c, json).await,
-        Command::Daemon(DaemonCmd::Run) | Command::Mcp | Command::Model(_) | Command::Bench(_) => {
+        Command::Daemon(DaemonCmd::Run)
+        | Command::Mcp
+        | Command::Model(_)
+        | Command::Bench(_)
+        | Command::Restore { .. } => {
             unreachable!("handled in dispatch")
         }
     }
@@ -1388,9 +1394,18 @@ async fn start(home: &AliceHome, json: bool) -> Result<()> {
     print(json, &h, || format!("running (pid {})\n", h.pid))
 }
 
+/// What stopping found; `stop` prints it, `restore` only acts on it.
+pub(crate) enum StopOutcome {
+    /// The daemon that ran (pid if known) has saved and let go of its lock.
+    Stopped(Option<u32>),
+    /// Asked to stop, still shutting down when the wait ended.
+    Stopping(Option<u32>),
+    NotRunning,
+}
+
 /// Ask the daemon to stop and wait until it has saved and let go of its lock, so that a
-/// command run right after starts a fresh daemon on the saved data.
-async fn stop(home: &AliceHome, json: bool) -> Result<()> {
+/// command run right after starts a fresh daemon on the saved data. Prints nothing.
+pub(crate) async fn stop_daemon(home: &AliceHome) -> Result<StopOutcome> {
     let deadline = Instant::now() + STOP_WAIT;
     let mut waited_for = None;
     loop {
@@ -1404,17 +1419,10 @@ async fn stop(home: &AliceHome, json: bool) -> Result<()> {
             let requested = c.shutdown().await;
             // A daemon already on its way out may drop the request: what counts is that it goes.
             if wait_gone(home, pid).await {
-                return stopped(json, pid);
+                return Ok(StopOutcome::Stopped(pid));
             }
             requested?;
-            return print(
-                json,
-                &serde_json::json!({"stopped": false, "stopping": true, "pid": pid}),
-                || match pid {
-                    Some(p) => format!("stop requested; still shutting down (pid {p})\n"),
-                    None => "stop requested; still shutting down\n".into(),
-                },
-            );
+            return Ok(StopOutcome::Stopping(pid));
         }
         // Nothing answers. A daemon that is starting (no daemon.json yet) or stopping (it
         // withdrew daemon.json) still holds the lock: wait for it to serve or to finish.
@@ -1430,16 +1438,133 @@ async fn stop(home: &AliceHome, json: bool) -> Result<()> {
                 waited_for = Some(pid);
                 tokio::time::sleep(STOP_POLL).await;
             }
-            _ if waited_for.is_some() => return stopped(json, waited_for),
-            _ => {
-                return print(
-                    json,
-                    &serde_json::json!({"stopped": false, "running": false}),
-                    || "not running\n".into(),
-                );
-            }
+            _ if waited_for.is_some() => return Ok(StopOutcome::Stopped(waited_for)),
+            _ => return Ok(StopOutcome::NotRunning),
         }
     }
+}
+
+async fn stop(home: &AliceHome, json: bool) -> Result<()> {
+    match stop_daemon(home).await? {
+        StopOutcome::Stopped(pid) => stopped(json, pid),
+        StopOutcome::Stopping(pid) => print(
+            json,
+            &serde_json::json!({"stopped": false, "stopping": true, "pid": pid}),
+            || match pid {
+                Some(p) => format!("stop requested; still shutting down (pid {p})\n"),
+                None => "stop requested; still shutting down\n".into(),
+            },
+        ),
+        StopOutcome::NotRunning => print(
+            json,
+            &serde_json::json!({"stopped": false, "running": false}),
+            || "not running\n".into(),
+        ),
+    }
+}
+
+/// How many times `restore` stops a daemon that an agent's write started in the gap before the swap.
+const RESTORE_ATTEMPTS: usize = 5;
+
+/// Replace the database by a backup (spec §5.6). Verifies first and changes nothing when the
+/// backup is damaged or from a newer Alice. The daemon is stopped for the swap only; writes
+/// agents make meanwhile wait in the spool and are applied when the daemon is back.
+async fn restore(home: &AliceHome, backup: Option<String>, yes: bool, json: bool) -> Result<()> {
+    use alice_daemon::restore as r;
+    use std::io::{BufRead, IsTerminal};
+    let settings = alice_daemon::config::load_effective(home).resolved.settings;
+    let dir = alice_daemon::backup::backup_dir(home, &settings.backup);
+    let path = r::find_backup(home, &dir, backup.as_deref())?;
+    let verified = r::verify(&path)?;
+    // Everything that can be refused is refused before the daemon is touched.
+    r::check_room(home, &dir, &path)?;
+    if !yes {
+        anyhow::ensure!(
+            std::io::stdin().is_terminal(),
+            "restoring replaces the memory database; pass --yes to confirm"
+        );
+        eprint!(
+            "Restore {} ({} memories, {} chunks)? Memories written after that backup leave the active database; they stay in a before-restore copy in {} (kept at least {} days), and `alice restore <that copy>` undoes this. {} [y/N] ",
+            path.display(),
+            verified.memories,
+            verified.chunks,
+            dir.display(),
+            r::KEEP_DAYS,
+            r::CAVEATS
+        );
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer)?;
+        anyhow::ensure!(
+            matches!(answer.trim(), "y" | "Y" | "yes"),
+            "restore cancelled"
+        );
+    }
+    // One restore at a time; while it is held, clients spool writes at once.
+    let guard = r::RestoreGuard::acquire(home)?;
+    let mut report = None;
+    for attempt in 0..RESTORE_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        // Quiet: `restore` prints one document, its report, never stop's output too. Waits until
+        // the daemon has let go of its lock (writes spool meanwhile).
+        if let StopOutcome::Stopping(pid) = stop_daemon(home).await? {
+            bail!(
+                "the daemon{} is still shutting down (an import or a long job may be ending); nothing was changed, retry `alice restore` in a moment",
+                pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+            );
+        }
+        let (h, d, v) = (home.clone(), dir.clone(), verified.clone());
+        let done = tokio::task::spawn_blocking(move || r::swap_now(&h, &d, &v)).await?;
+        match done {
+            Ok(rep) => {
+                report = Some(rep);
+                break;
+            }
+            // Something else holds the daemon lock (a daemon started in the gap): stop it again.
+            Err(e) if e.to_string().contains(r::DAEMON_RUNNING) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    drop(guard);
+    let mut report = report.with_context(|| {
+        "something keeps holding the daemon lock during the restore; nothing was changed, retry `alice restore`"
+    })?;
+    // Starts the daemon on the restored database (it migrates an older one, rebuilds the index
+    // and drains the spool).
+    match client(home).await {
+        Ok(c) => {
+            for _ in 0..600 {
+                if c.health().await.map(|h| h.index_ready).unwrap_or(false) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Err(e) => report.warnings.push(format!(
+            "restored, but the daemon did not answer yet ({e}); \"alice daemon start\" waits for it"
+        )),
+    }
+    print(json, &report, || {
+        let mut t = format!(
+            "Restored {}: {} memories, {} chunks.\n",
+            report.restored_from, report.memories, report.chunks
+        );
+        if let (Some(saved), Some(undo)) = (&report.saved_current_as, &report.undo) {
+            t.push_str(&format!(
+                "Memories written after that backup are no longer in the active database. They stay in {} (kept at least {} days).\nTo undo: {undo} --yes\n",
+                dir.join(saved).display(),
+                r::KEEP_DAYS
+            ));
+        }
+        for w in &report.warnings {
+            t.push_str(&format!("warning: {w}\n"));
+        }
+        t.push_str(report.caveats);
+        t.push('\n');
+        t
+    })
 }
 
 #[cfg(test)]

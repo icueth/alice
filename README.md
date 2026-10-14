@@ -241,6 +241,20 @@ weekly = 4
 
 Secrets such as the Jev API key will be stored in `~/.alice/secrets.toml` (mode 0600) with `alice config set-secret judge.jev.api_key`; the OS keychain will be an opt-in alternative.
 
+## Backup and restore
+
+```bash
+alice backup now          # a checked, private copy of alice.db in ~/.alice/backups
+alice backup list
+alice restore             # the newest backup; or: alice restore <name or path> [--yes]
+```
+
+`alice restore` checks the backup first (a SQLite file that passes `quick_check`, with an Alice schema this build can read; a newer one is refused before anything is stopped), stops the daemon, keeps the current database as `backups/alice-before-restore-<time>.db`, puts the backup in its place with one atomic rename, and starts the daemon, which rebuilds the vector index and applies the writes agents spooled meanwhile. `alice.db` is always either the complete old database or the complete restored one: if anything fails, the old one stays. An older backup is migrated at that start (with its own pre-migration backup). `secrets.toml`, `config.toml` and the spool are never touched. It needs free space for the kept copy and the restored file, and refuses without changing anything when there is not enough.
+
+**Memories written after the backup leave the active database.** They stay in the before-restore copy, which is kept at least 30 days (the newest one is always kept). To undo a restore, run `alice restore alice-before-restore-<time>.db`. Two more things a restore does not undo: memories you purged after the backup was taken come back with it, and text stored under older redaction rules is not scanned again.
+
+On a large database the daemon stays stopped for the length of two copies and a check (minutes at 2.8 GB). Agents' writes are spooled at once meanwhile, and applied afterwards.
+
 ## Git sync *(planned, M4)*
 
 ```bash
