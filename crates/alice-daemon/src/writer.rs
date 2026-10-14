@@ -510,15 +510,17 @@ pub fn spawn_writer(
                 let out = run_batch(&mut conn, batch, &mut st, &ro);
                 match out.commit {
                     Ok(()) => {
+                        // Wake before replying: once a caller has its reply, the wake for its
+                        // text has been sent (tests on Windows saw it arrive after the reply).
+                        if st.inserted {
+                            let _ = wake_worker.try_send(());
+                        }
                         for (reply, r) in out.replies {
                             if let Some(reply) = reply {
                                 let _ = reply.send(r);
                             }
                         }
                         carry.extend(out.carry);
-                        if st.inserted {
-                            let _ = wake_worker.try_send(());
-                        }
                     }
                     Err(e) => {
                         // A matcher loaded inside the rolled-back transaction may name entities
