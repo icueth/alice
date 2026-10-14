@@ -22,6 +22,9 @@ pub struct HttpResponse {
 pub enum HttpError {
     Timeout,
     Connect(String),
+    /// The request could not be made (a bad header value or URL): nothing was sent.
+    Build(String),
+    /// Something failed after the request was sent.
     Other(String),
 }
 
@@ -96,6 +99,7 @@ impl BlockingHttp {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(e)) if e.is_timeout() => Err(HttpError::Timeout),
             Ok(Err(e)) if e.is_connect() => Err(HttpError::Connect(without_url(e))),
+            Ok(Err(e)) if e.is_builder() => Err(HttpError::Build(without_url(e))),
             Ok(Err(e)) => Err(HttpError::Other(without_url(e))),
             Err(_) => Err(HttpError::Timeout),
         }
@@ -107,7 +111,7 @@ impl BlockingHttp {
 fn bearer_header(k: &str) -> Result<reqwest::header::HeaderValue, HttpError> {
     let mut value =
         reqwest::header::HeaderValue::from_str(&format!("Bearer {k}")).map_err(|_| {
-            HttpError::Other("the API key holds characters a header cannot carry".into())
+            HttpError::Build("the API key holds characters a header cannot carry".into())
         })?;
     value.set_sensitive(true);
     Ok(value)
@@ -261,7 +265,7 @@ mod tests {
             )
             .unwrap_err();
         match e {
-            HttpError::Other(m) => assert!(!m.contains("live_bad"), "{m}"),
+            HttpError::Build(m) => assert!(!m.contains("live_bad"), "{m}"),
             other => panic!("{other:?}"),
         }
     }

@@ -70,7 +70,9 @@ impl JevTransport for ReqwestTransport {
                 })
             }
             Err(HttpError::Timeout) => Err(TransportError::Timeout),
-            Err(HttpError::Connect(e)) => Err(TransportError::Connect(e)),
+            // Nothing was written to the network: not billed.
+            Err(HttpError::Connect(e) | HttpError::Build(e)) => Err(TransportError::Connect(e)),
+            // The request went out and the reply did not come back whole.
             Err(HttpError::Other(e)) => Err(TransportError::Lost(e)),
         }
     }
@@ -267,12 +269,22 @@ pub fn build_judge(
 /// Reading the key may wait on an OS keychain prompt, so a rebuild for Jev runs on a worker
 /// thread: the heuristic (or the previous judge) answers meanwhile and `warning` says what is
 /// going on, and says so louder after `build_timeout`.
+#[derive(Default)]
+struct Worker {
+    running: bool,
+    again: bool,
+}
+
 pub struct JudgeHub {
     slot: RwLock<(Arc<dyn Judge>, Option<String>)>,
     /// Counts builds; a build installs its judge only if it is still the newest.
     generation: AtomicU64,
     /// When the newest build, if it has not finished, began.
     pending: Mutex<Option<Instant>>,
+    /// The build worker: whether one is running, and whether a newer build was asked for while
+    /// it ran (it then builds again). At most one worker exists, so a stuck secrets store holds
+    /// one thread, not one per settings change.
+    worker: Mutex<Worker>,
     build_timeout: Duration,
     /// Shared by every judge this hub builds: the budget reservations, the token ratio and the
     /// request rate survive a rebuild.
@@ -310,6 +322,7 @@ impl JudgeHub {
             slot: RwLock::new((heuristic(), None)),
             generation: AtomicU64::new(0),
             pending: Mutex::new(None),
+            worker: Mutex::new(Worker::default()),
             build_timeout,
             limits: Arc::new(JevLimits::default()),
             settings,
@@ -399,25 +412,63 @@ impl JudgeHub {
     }
 
     /// Builds the judge without waiting for it: at once when the heuristic is wanted (nothing
-    /// to read), otherwise on a worker thread.
+    /// to read), otherwise on the build worker. A build that finishes after a newer one was
+    /// asked for is dropped, and the worker builds again with the newest settings.
     pub fn rebuild(self: &Arc<Self>) {
         if self.settings.get().judge.provider == JudgeProvider::Heuristic {
             return self.rebuild_now();
         }
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.generation.fetch_add(1, Ordering::SeqCst);
         *self.pending.lock() = Some(Instant::now());
+        {
+            let mut w = self.worker.lock();
+            if w.running {
+                w.again = true;
+                return;
+            }
+            w.running = true;
+        }
         let hub = self.clone();
         let spawned = std::thread::Builder::new()
             .name("alice-judge-build".into())
-            .spawn(move || {
-                let built = hub.build();
-                hub.install(generation, built);
-            });
+            .spawn(move || hub.work());
         if let Err(e) = spawned {
-            tracing::error!(error = %e, "cannot start the judge build thread; building inline");
+            tracing::error!(error = %e, "cannot start the judge build thread");
+            self.worker.lock().running = false;
             *self.pending.lock() = None;
-            let built = self.build();
+            *self.slot.write() = (
+                heuristic(),
+                Some(
+                    "cannot start the thread that builds the Jev judge; using the heuristic judge"
+                        .into(),
+                ),
+            );
+        }
+    }
+
+    /// The build worker's loop.
+    fn work(self: Arc<Self>) {
+        loop {
+            let generation = self.generation.load(Ordering::SeqCst);
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.build()))
+                .unwrap_or_else(|_| {
+                    tracing::error!("building the Jev judge panicked");
+                    (
+                        heuristic(),
+                        Some(
+                            "building the Jev judge failed unexpectedly; using the heuristic judge"
+                                .into(),
+                        ),
+                    )
+                });
             self.install(generation, built);
+            let mut w = self.worker.lock();
+            if w.again {
+                w.again = false;
+                continue;
+            }
+            w.running = false;
+            return;
         }
     }
 
@@ -678,7 +729,7 @@ mod tests {
         }
         assert_eq!(f.judge.classify("text", &yes_no()), Err(JudgeError::Denied));
         assert_eq!(
-            f.judge.classify_constant("text", &yes_no()),
+            f.judge.classify_constant("text", &[("yes", "it is")]),
             Err(JudgeError::Denied)
         );
         assert!(f.transport.bodies.lock().is_empty());
@@ -744,5 +795,46 @@ mod tests {
             !sent.contains("ghp_") && sent.contains("[REDACTED:github_token]"),
             "{sent}"
         );
+    }
+
+    #[test]
+    fn a_key_the_client_cannot_send_is_not_billed_and_not_echoed() {
+        let f = fixture("", None);
+        let key = concat!("ts_", "live_new\nline_key_0001");
+        let policy = Arc::new(DaemonJevPolicy::new(
+            f.settings.clone(),
+            f.readers.clone(),
+            Redactors::new(f.settings.clone()),
+        ));
+        let store = Arc::new(alice_core::judge::jev::MemoryJevStore::default());
+        let cfg = JevConfig {
+            endpoint: "http://127.0.0.1:1/never".into(),
+            model: "jev-1.13.0".into(),
+            api_key: alice_core::settings::SecretValue::new(key),
+            rate_per_sec: 10.0,
+            timeout: Duration::from_secs(2),
+            daily_budget_usd: 1.0,
+            max_retries: 3,
+        };
+        let judge = alice_core::judge::jev::JevJudge::new(
+            cfg,
+            Arc::new(ReqwestTransport::new().unwrap()),
+            store.clone(),
+            policy,
+        );
+        let e = judge
+            .classify_in(&["plain"], "text", &yes_no())
+            .unwrap_err();
+        assert!(matches!(e, JudgeError::Unavailable(_)), "{e}");
+        assert!(
+            !e.to_string().contains("line_key")
+                && !format!("{:?}", judge.stats()).contains("line_key")
+        );
+        assert!(
+            store.calls().is_empty(),
+            "nothing was sent, so nothing is billed"
+        );
+        assert_eq!(store.spent("2026-10-13").unwrap(), 0.0);
+        assert_eq!(judge.stats().retries, 0);
     }
 }

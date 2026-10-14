@@ -289,14 +289,15 @@ pub trait Judge: Send + Sync {
     fn classify(&self, state: &str, options: &[Choice]) -> JudgeResult<Distribution>;
 
     /// [`classify`](Self::classify) for a text that is a constant of the program and so holds
-    /// no project content (a connection test). `'static` is the proof: a text built at run time
-    /// does not fit.
+    /// no project content (a connection test). `'static` is the proof, for the text and for the
+    /// options (id, description): nothing built at run time fits.
     fn classify_constant(
         &self,
         state: &'static str,
-        options: &[Choice],
+        options: &'static [(&'static str, &'static str)],
     ) -> JudgeResult<Distribution> {
-        self.classify(state, options)
+        let options: Vec<Choice> = options.iter().map(|(id, d)| Choice::new(id, d)).collect();
+        self.classify(state, &options)
     }
 
     /// The expected level of `rubric` (0 = worst, 1 = best) and how sure the judge is.

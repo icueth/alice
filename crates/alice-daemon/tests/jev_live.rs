@@ -88,7 +88,7 @@ fn record_fixtures() {
     );
     requests.push(("relevance", j.last_request().unwrap()));
     let yes = j
-        .classify_constant(scenarios::CLASSIFY_STATE, &scenarios::classify_choices())
+        .classify_constant(scenarios::CLASSIFY_STATE, scenarios::CLASSIFY_OPTIONS)
         .unwrap();
     println!("classify: {:?}", yes.best());
     requests.push(("classify", j.last_request().unwrap()));

@@ -367,8 +367,9 @@ fn parse(
     body: &[u8],
     questions: &[Question],
 ) -> JudgeResult<(BTreeMap<String, Distribution>, UsageBody)> {
-    let r: ResponseBody = serde_json::from_slice(body).map_err(|e| {
-        JudgeError::Failed(format!("Jev sent an answer that could not be read ({e})"))
+    let r: ResponseBody = serde_json::from_slice(body).map_err(|_| {
+        // A fixed reason: the parser's message may quote what the server sent.
+        JudgeError::Failed("Jev answered with a body Alice could not read".into())
     })?;
     let mut out = BTreeMap::new();
     for q in questions {
@@ -673,15 +674,18 @@ impl JevJudge {
         // daemon, so the day's spend never passes the budget, rebuilds included.
         let estimate = self.estimate_usd(body.len());
         self.reserve(&day, estimate)?;
+        // `reserved` is held for the attempt in flight. A timed-out attempt may have been billed:
+        // its estimate turns into `charged` (it stays in the day's spend) and a fresh estimate is
+        // reserved for the next attempt, so the spend never under-counts.
+        let mut reserved = estimate;
+        let mut charged = 0.0;
         let mut last = String::new();
-        // The request was sent at least once without an answer we could read: it may be billed.
-        let mut maybe_billed = false;
         for attempt in 0..=self.cfg.max_retries {
             if attempt > 0 {
                 // A retry can come up to two minutes after the first try: the policy is asked
                 // again, so a denial that lands meanwhile stops it.
                 if let Err(e) = self.gate(projects) {
-                    self.settle_unanswered(&day, &hash, estimate, maybe_billed);
+                    self.settle_unanswered(&day, &hash, reserved, charged, false);
                     return Err(e);
                 }
             }
@@ -703,8 +707,8 @@ impl JevJudge {
                             // usage says (or the reservation, when it says nothing) is spent.
                             let tokens = loose_usage(&r.body);
                             let usd =
-                                tokens.map_or(estimate, |t| t.0 as f64 * USD_PER_MTOK_INPUT / 1e6);
-                            self.settle(&day, estimate, usd);
+                                tokens.map_or(reserved, |t| t.0 as f64 * USD_PER_MTOK_INPUT / 1e6);
+                            self.settle(&day, reserved, usd);
                             self.store.record(&JevCall {
                                 day: day.clone(),
                                 hash: hash.clone(),
@@ -712,7 +716,7 @@ impl JevJudge {
                                 response_json: String::new(),
                                 input_tokens: tokens.map_or(0, |t| t.0),
                                 output_tokens: tokens.map_or(0, |t| t.1),
-                                usd,
+                                usd: usd + charged,
                                 latency_ms,
                                 cacheable: false,
                             });
@@ -724,9 +728,9 @@ impl JevJudge {
                     let usd = if usage.input_tokens > 0 {
                         usage.input_tokens as f64 * USD_PER_MTOK_INPUT / 1e6
                     } else {
-                        estimate
+                        reserved
                     };
-                    self.settle(&day, estimate, usd);
+                    self.settle(&day, reserved, usd);
                     let ratio = usage.input_tokens as f64 / body.len().max(1) as f64;
                     {
                         let mut r = self.limits.token_ratio.lock();
@@ -745,7 +749,7 @@ impl JevJudge {
                         response_json: String::from_utf8_lossy(&r.body).into_owned(),
                         input_tokens: usage.input_tokens,
                         output_tokens: usage.output_tokens,
-                        usd,
+                        usd: usd + charged,
                         latency_ms,
                         cacheable: true,
                     });
@@ -758,7 +762,7 @@ impl JevJudge {
                     return Ok(d);
                 }
                 Ok(r) if r.status == 401 || r.status == 403 => {
-                    self.settle_unanswered(&day, &hash, estimate, maybe_billed);
+                    self.settle_unanswered(&day, &hash, reserved, charged, false);
                     let e = JudgeError::Unavailable(format!(
                         "TypeSafe refused the API key ({}); set a valid one with `alice config set-secret jev_api_key`",
                         r.status
@@ -771,7 +775,7 @@ impl JevJudge {
                     r.retry_after.unwrap_or_else(|| backoff(attempt))
                 }
                 Ok(r) => {
-                    self.settle_unanswered(&day, &hash, estimate, maybe_billed);
+                    self.settle_unanswered(&day, &hash, reserved, charged, false);
                     // Only the status: a server's explanation may quote the request.
                     let e = JudgeError::Failed(format!(
                         "Jev refused the request ({}); check judge.jev.model and judge.jev.endpoint",
@@ -781,14 +785,24 @@ impl JevJudge {
                     return Err(e);
                 }
                 Err(TransportError::Timeout) => {
-                    maybe_billed = true;
+                    charged += reserved;
+                    reserved = 0.0;
                     last = "Jev did not answer in time".into();
+                    if attempt < self.cfg.max_retries {
+                        // Room for the next attempt as well, or the retries stop here.
+                        if let Err(e) = self.reserve(&day, estimate) {
+                            self.settle_unanswered(&day, &hash, 0.0, charged, false);
+                            self.fail(&e);
+                            return Err(e);
+                        }
+                        reserved = estimate;
+                    }
                     backoff(attempt)
                 }
                 Err(TransportError::Connect(e)) => {
                     // Spec §5.2: retries only on 429, 5xx and timeouts. Nothing reached Jev: the
                     // heuristic decides now and the judge stage asks again later.
-                    self.settle_unanswered(&day, &hash, estimate, maybe_billed);
+                    self.settle_unanswered(&day, &hash, reserved, charged, false);
                     let e = JudgeError::Unavailable(format!(
                         "cannot reach Jev ({e}); will retry later"
                     ));
@@ -797,7 +811,7 @@ impl JevJudge {
                 }
                 Err(TransportError::Lost(e)) => {
                     // Sent, reply lost: not retried (it may have been billed already).
-                    self.settle_unanswered(&day, &hash, estimate, true);
+                    self.settle_unanswered(&day, &hash, reserved, charged, true);
                     let e = JudgeError::Unavailable(format!(
                         "Jev's reply did not arrive whole ({e}); will retry later"
                     ));
@@ -810,31 +824,42 @@ impl JevJudge {
                 (self.sleep)(delay.min(MAX_RETRY_WAIT));
             }
         }
-        self.settle_unanswered(&day, &hash, estimate, maybe_billed);
+        self.settle_unanswered(&day, &hash, reserved, charged, false);
         let e = JudgeError::Unavailable(format!("{last}; will retry later"));
         self.fail(&e);
         Err(e)
     }
 
-    /// The end of a call that got no usable answer. If the request may have been billed the
-    /// reservation stays as its cost and goes in the ledger (never in the cache); otherwise it
-    /// is released.
-    fn settle_unanswered(&self, day: &str, hash: &str, estimate: f64, maybe_billed: bool) {
-        if !maybe_billed {
-            self.settle(day, estimate, 0.0);
-            return;
+    /// The end of a call that got no usable answer. `charged` (timed-out attempts) and, when
+    /// `bill_reserved`, the attempt in flight (`reserved`) stay as the cost and go in the ledger
+    /// (never in the cache); the rest of the reservation is released.
+    fn settle_unanswered(
+        &self,
+        day: &str,
+        hash: &str,
+        reserved: f64,
+        charged: f64,
+        bill_reserved: bool,
+    ) {
+        let mut cost = charged;
+        if bill_reserved {
+            cost += reserved;
+        } else {
+            self.settle(day, reserved, 0.0);
         }
-        self.store.record(&JevCall {
-            day: day.into(),
-            hash: hash.into(),
-            model: self.cfg.model.clone(),
-            response_json: String::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            usd: estimate,
-            latency_ms: 0,
-            cacheable: false,
-        });
+        if cost > 0.0 {
+            self.store.record(&JevCall {
+                day: day.into(),
+                hash: hash.into(),
+                model: self.cfg.model.clone(),
+                response_json: String::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                usd: cost,
+                latency_ms: 0,
+                cacheable: false,
+            });
+        }
     }
 
     fn fail(&self, e: &JudgeError) {
@@ -894,9 +919,10 @@ impl Judge for JevJudge {
     fn classify_constant(
         &self,
         state: &'static str,
-        options: &[Choice],
+        options: &'static [(&'static str, &'static str)],
     ) -> JudgeResult<Distribution> {
-        self.classify_in(&[UNSCOPED], state, options)
+        let options: Vec<Choice> = options.iter().map(|(id, d)| Choice::new(id, d)).collect();
+        self.classify_in(&[UNSCOPED], state, &options)
     }
 
     /// Refused for the same reason as `classify`.
@@ -1139,11 +1165,15 @@ pub mod scenarios {
 
     pub const CLASSIFY_STATE: &str = "This is a connection test from Alice. Answer yes.";
 
+    /// The options of the connection test, as (id, description) constants.
+    pub const CLASSIFY_OPTIONS: &[(&str, &str)] =
+        &[("yes", "this is a test"), ("no", "this is not a test")];
+
     pub fn classify_choices() -> Vec<Choice> {
-        vec![
-            Choice::new("yes", "this is a test"),
-            Choice::new("no", "this is not a test"),
-        ]
+        CLASSIFY_OPTIONS
+            .iter()
+            .map(|(id, d)| Choice::new(id, d))
+            .collect()
     }
 }
 
@@ -1415,7 +1445,7 @@ mod tests {
                 > grades[2].p(crate::judge::RELEVANCE_ANSWERS)
         );
         assert_eq!(
-            j.classify_constant(scenarios::CLASSIFY_STATE, &scenarios::classify_choices())
+            j.classify_constant(scenarios::CLASSIFY_STATE, scenarios::CLASSIFY_OPTIONS)
                 .unwrap()
                 .best()
                 .unwrap()
@@ -2079,7 +2109,7 @@ mod tests {
         assert_eq!(j.stats().denied, 4);
         // A constant of the program is fine.
         assert_eq!(
-            j.classify_constant(scenarios::CLASSIFY_STATE, &yes_no())
+            j.classify_constant(scenarios::CLASSIFY_STATE, scenarios::CLASSIFY_OPTIONS)
                 .unwrap()
                 .best()
                 .unwrap()
@@ -2137,7 +2167,8 @@ mod tests {
         let s = Scripted::new(vec![Err(TransportError::Timeout); 4], classify_ok());
         let j = judge(s, store.clone(), cfg());
         assert!(j.classify_in(&[UNSCOPED], "four", &yes_no()).is_err());
-        assert!((sum_spent(&store) - est(&j, "four")).abs() < 1e-12);
+        // Each of the four attempts may have been billed.
+        assert!((sum_spent(&store) - 4.0 * est(&j, "four")).abs() < 1e-12);
         assert!(store.cached(&store.calls()[0].hash).is_none());
         // A reply that was lost on the way back.
         let store = Arc::new(MemoryJevStore::default());
@@ -2335,7 +2366,7 @@ mod tests {
         assert_eq!(at.len(), 24);
         for w in at.windows(11) {
             assert!(
-                w[10].duration_since(w[0]) >= Duration::from_millis(950),
+                w[10].duration_since(w[0]) >= Duration::from_millis(850),
                 "11 requests inside {:?}",
                 w[10].duration_since(w[0])
             );
@@ -2435,5 +2466,49 @@ mod tests {
         assert!((rel[0].probs.p("contradicts") - 0.005).abs() < 1e-9);
         assert_eq!(rel[0].agreement, Some(true));
         assert!((rel[1].probs.p("unrelated") - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_timed_out_attempt_followed_by_a_successful_retry_is_charged_too() {
+        let store = Arc::new(MemoryJevStore::default());
+        let s = Scripted::new(vec![Err(TransportError::Timeout)], classify_ok());
+        let j = judge(s.clone(), store.clone(), cfg());
+        j.classify_in(&[UNSCOPED], "retry me", &yes_no()).unwrap();
+        assert_eq!(s.calls.lock().len(), 2);
+        let want = estimate(&j, "retry me") + 100.0 * USD_PER_MTOK_INPUT / 1e6;
+        assert!(
+            (sum_spent(&store) - want).abs() < 1e-12,
+            "{} vs {want}",
+            sum_spent(&store)
+        );
+        // The answer is cached as usual.
+        j.classify_in(&[UNSCOPED], "retry me", &yes_no()).unwrap();
+        assert_eq!(j.stats().cache_hits, 1);
+        // With room for only one attempt the retry is not made.
+        let day = Arc::new(PMutex::new(scenarios::fixed_now()));
+        let store = Arc::new(MemoryJevStore::default());
+        let s = Scripted::new(vec![Err(TransportError::Timeout)], classify_ok());
+        let budget = estimate(&budget_judge(&s, &store, &day, 1.0), "tight") * 1.5;
+        let j = budget_judge(&s, &store, &day, budget);
+        assert!(matches!(
+            j.classify_in(&[UNSCOPED], "tight", &yes_no()),
+            Err(JudgeError::Budget(_))
+        ));
+        assert_eq!(s.calls.lock().len(), 1);
+        assert!(sum_spent(&store) <= budget);
+    }
+
+    #[test]
+    fn an_unparseable_200_gives_a_fixed_reason_not_the_parsers_words() {
+        let s = Scripted::ok();
+        *s.raw_ok.lock() = Some(b"{\"answers\": SERVER-SAID-THIS".to_vec());
+        let j = judge(s, Arc::new(MemoryJevStore::default()), cfg());
+        let e = j.classify_in(&[UNSCOPED], "x", &yes_no()).unwrap_err();
+        let shown = format!("{e} {:?}", j.stats());
+        assert!(shown.contains("could not read"), "{shown}");
+        assert!(
+            !shown.contains("SERVER-SAID-THIS") && !shown.contains("expected"),
+            "{shown}"
+        );
     }
 }

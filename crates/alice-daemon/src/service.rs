@@ -1537,7 +1537,7 @@ impl Service {
                 }
                 use alice_core::judge::jev::scenarios;
                 let r = tokio::task::spawn_blocking(move || {
-                    j.classify_constant(scenarios::CLASSIFY_STATE, &scenarios::classify_choices())
+                    j.classify_constant(scenarios::CLASSIFY_STATE, scenarios::CLASSIFY_OPTIONS)
                 })
                 .await
                 .map_err(join_err)?;
@@ -2991,6 +2991,11 @@ mod tests {
         sets: std::sync::atomic::AtomicUsize,
         /// Reads fail as a locked keychain's would.
         fail_get: AtomicBool,
+        /// The first read answers this instead of the stored value (a stale read).
+        first_get: Mutex<Option<String>>,
+        /// Reads by the judge build worker running now, and the most that ever ran at once.
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
     }
 
     impl MemSecrets {
@@ -3001,6 +3006,9 @@ mod tests {
                 gets: Default::default(),
                 sets: Default::default(),
                 fail_get: AtomicBool::new(false),
+                first_get: Mutex::new(None),
+                active: Default::default(),
+                max_active: Default::default(),
             })
         }
         fn wait(&self) {
@@ -3011,8 +3019,20 @@ mod tests {
 
     impl SecretStore for MemSecrets {
         fn get(&self, name: SecretName) -> Result<Option<SecretValue>> {
-            self.gets.fetch_add(1, Ordering::SeqCst);
+            let first = self.gets.fetch_add(1, Ordering::SeqCst) == 0;
+            // Only reads by the judge build worker count (status reads come from requests).
+            let building = std::thread::current().name() == Some("alice-judge-build");
+            if building {
+                let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(now, Ordering::SeqCst);
+            }
             self.wait();
+            if building {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+            if first && let Some(stale) = self.first_get.lock().take() {
+                return Ok(Some(SecretValue::new(stale)));
+            }
             if self.fail_get.load(Ordering::SeqCst) {
                 return Err(AliceError::Other("the keychain is locked".into()));
             }
@@ -3841,6 +3861,54 @@ mod tests {
         })
         .await;
         assert_eq!(s.judge_warning(), None);
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_older_slow_build_never_replaces_a_newer_one_and_builds_never_pile_up() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        home.ensure_dirs().unwrap();
+        std::fs::write(home.config_file(), "[judge]\nprovider = \"jev\"\n").unwrap();
+        let store = MemSecrets::new(Duration::ZERO);
+        store.set(SecretName::JevApiKey, JEV_TEST_KEY).unwrap();
+        // The first read (the start-up build) is slow and returns an out-of-date key.
+        *store.first_get.lock() = Some(concat!("ts_", "live_stale_key_0001").into());
+        store.delay_ms.store(300, Ordering::SeqCst);
+        let transport = Arc::new(ScriptedJev {
+            sent: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let s = Service::start(
+            home,
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                secrets: Some(store.clone()),
+                jev_transport: Some(transport.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        // Three more builds are asked for while the first one is still reading.
+        for budget in [2.0, 3.0, 4.0] {
+            s.patch_settings(patch_one(
+                "judge.daily_budget_usd",
+                serde_json::json!(budget),
+            ))
+            .unwrap();
+        }
+        until("the judge", || {
+            (s.judge().provider() == "jev" && s.judge_warning().is_none()).then_some(())
+        })
+        .await;
+        assert_eq!(
+            store.max_active.load(Ordering::SeqCst),
+            1,
+            "one build at a time"
+        );
+        // The installed judge holds the current key: the transport asserts it on every request.
+        let t = s.test_provider("judge").await.unwrap();
+        assert!(t.ok, "{t:?}");
+        assert_eq!(transport.sent.load(Ordering::SeqCst), 1);
         s.shutdown();
     }
 
