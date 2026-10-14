@@ -683,6 +683,22 @@ impl Service {
         project_root_in(&self.readers, choice)
     }
 
+    /// Whether a write to this project (named, or detected from `cwd`) would be judged under
+    /// fail-closed rules at the moment (see [`SettingsHandle::project_fail_closed`]). The spool
+    /// asks before it discards a request that block mode refused.
+    pub async fn rules_fail_closed(&self, project: Option<&str>, cwd: Option<&str>) -> bool {
+        let Ok(choice) = self.choose(project, cwd).await else {
+            return false;
+        };
+        let (readers, settings) = (self.readers.clone(), self.settings.clone());
+        tokio::task::spawn_blocking(move || {
+            let root = project_root_in(&readers, &choice);
+            settings.project_fail_closed(root.as_deref())
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// The compiled redactor for a write to `choice`: the global rules with the project's
     /// `.alice.toml` on top. Looks at the database and the file system, so it runs on the
     /// blocking pool.

@@ -93,16 +93,21 @@ fn reject(dir: &Path, file: &Path, why: &str) {
 }
 
 /// Drop an entry that `block` mode refuses and keep the reason next to the rejected ones. The
-/// entry itself is not kept: its text holds what the rules forbid on disk.
+/// entry itself is not kept: its text holds what the rules forbid on disk. Failures are logged,
+/// not swallowed.
 fn withhold(dir: &Path, file: &Path, why: &str) {
     let rejected = dir.join("rejected");
-    let _ = std::fs::create_dir_all(&rejected);
-    if let Some(name) = file.file_name() {
-        let note = format!(
-            "{why}\nThe request was removed instead of kept, because its text holds a secret."
-        );
-        let _ = std::fs::write(rejected.join(name).with_extension("err"), note);
-        let _ = std::fs::remove_file(file);
+    if let Err(e) = std::fs::create_dir_all(&rejected) {
+        tracing::warn!(error = %e, "cannot create the spool's rejected directory");
+    }
+    let Some(name) = file.file_name() else { return };
+    let note =
+        format!("{why}\nThe request was removed instead of kept, because its text holds a secret.");
+    if let Err(e) = std::fs::write(rejected.join(name).with_extension("err"), note) {
+        tracing::warn!(error = %e, "cannot write the reason a spooled request was removed");
+    }
+    if let Err(e) = std::fs::remove_file(file) {
+        tracing::warn!(error = %e, "cannot remove a refused spooled request");
     }
 }
 
@@ -127,6 +132,10 @@ pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
                 continue;
             }
         };
+        let scope = match &entry {
+            SpoolEntry::Remember(r) => (r.project.clone(), r.cwd.clone()),
+            SpoolEntry::Ingest(r) => (r.project.clone(), r.cwd.clone()),
+        };
         let result = match entry {
             SpoolEntry::Remember(r) => svc.remember(r).await.map(|_| ()),
             SpoolEntry::Ingest(r) => svc.ingest(r).await.map(|_| ()),
@@ -138,6 +147,19 @@ pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
             }
             // A request that block mode refuses held a secret: only the reason is kept.
             Err(e) if alice_core::redact::is_refusal(&e) => {
+                // Refused only because the project's rules are in a fail-closed state (a
+                // half-written `.alice.toml`, say): keep the entry for the next drain.
+                if svc
+                    .rules_fail_closed(scope.0.as_deref(), scope.1.as_deref())
+                    .await
+                {
+                    tracing::warn!(
+                        entry = %file.display(),
+                        "a spooled request stays queued: the privacy rules of its project are in a fail-closed state (check .alice.toml and config.toml)"
+                    );
+                    report.remaining += 1;
+                    continue;
+                }
                 withhold(dir, file, &e.to_string());
                 report.rejected += 1;
             }
@@ -372,5 +394,40 @@ mod tests {
                 .any(|e| e.path().extension().is_some_and(|x| x == "json")),
             "the refused request itself is gone"
         );
+    }
+
+    /// A refusal that comes from a fail-closed state (a half-written `.alice.toml`) keeps the
+    /// entry for the next drain; once the file is fixed the entry is stored.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_under_a_broken_project_file_keeps_the_entry_for_the_next_drain() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let svc = start(&home);
+        let dir = home.spool_dir();
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join(".alice.toml"), "[privacy\nblock_secrets = tru").unwrap();
+        append(
+            &dir,
+            &SpoolEntry::Remember(RememberRequest {
+                content: format!("kept with {GITHUB}"),
+                cwd: Some(work.to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let r = drain(&dir, &svc).await;
+        assert_eq!((r.processed, r.rejected, r.remaining), (0, 0, 1));
+        assert_eq!(pending_count(&dir), 1, "still queued");
+        assert!(!dir.join("rejected").exists());
+        std::fs::write(
+            work.join(".alice.toml"),
+            "[privacy]\nblock_secrets = false\n",
+        )
+        .unwrap();
+        // Tightening or equal applies at once; this file is valid and does not block.
+        let r = drain(&dir, &svc).await;
+        assert_eq!((r.processed, r.rejected), (1, 0), "{r:?}");
+        assert_eq!(bodies(&home), ["kept with [REDACTED:github_token]"]);
     }
 }

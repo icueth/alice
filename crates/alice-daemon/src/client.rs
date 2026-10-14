@@ -607,16 +607,21 @@ fn check_remember(req: &RememberRequest) -> Result<()> {
 /// project rules are not at hand): `config.toml` and the `ALICE_*` variables through the same
 /// rule the daemon loads them by, and, when the project root can be found the way the daemon
 /// finds it (from `cwd`, unless the caller named a project), that project's `.alice.toml`. A
-/// project file that is invalid or unreadable counts as `block_secrets` on, as in the daemon.
+/// project file that is invalid or unreadable counts as `block_secrets` on, as in the daemon, and
+/// so does a `config.toml` that is degraded.
 /// A named project has no root to find without the database, so only the global rules apply
 /// to it here; the daemon applies the project's own rules again when it drains the spool.
 ///
 /// Runs git and reads files: call it on the blocking pool.
 fn spool_redactor(home: &AliceHome, project: Option<&str>, cwd: Option<&str>) -> Redactor {
-    let global = crate::config::load_effective(home)
-        .resolved
-        .settings
-        .privacy;
+    let effective = crate::config::load_effective(home);
+    let mut global = effective.resolved.settings.privacy;
+    if effective.degraded {
+        // A leaf of config.toml was left out and may have been a privacy one: fail closed, as
+        // the daemon does, rather than spool with rules that may be weaker than the person's.
+        global.redact = true;
+        global.redact_mode = alice_core::settings::RedactMode::Block;
+    }
     let named = project.is_some_and(|p| !p.trim().is_empty());
     let root = cwd
         .filter(|_| !named)
@@ -714,8 +719,9 @@ pub(crate) async fn remember_via(
         },
         Err(u) => (u.to_string(), u.queued_note()),
     };
-    check_remember(&req)?;
+    // Redacted first: the daemon checks the length of the redacted text, and so does this.
     let req = redacted_for_spool(home, req).await?;
+    check_remember(&req)?;
     spool_entry(home, SpoolEntry::Remember(req), &cause).await?;
     Ok(RememberResponse {
         id: None,
@@ -753,6 +759,7 @@ pub async fn ingest_or_spool(
         Err(u) => u.to_string(),
     };
     let req = redacted_ingest_for_spool(home, req).await?;
+    alice_core::store::sources::validate_chunks(&req.chunks)?;
     spool_entry(home, SpoolEntry::Ingest(req), &cause).await?;
     Ok(IngestOutcome {
         source_id: String::new(),
@@ -1306,7 +1313,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(&e, AliceError::Invalid(m) if m.contains("github_token") && !m.contains(GITHUB)),
+            matches!(&e, AliceError::Refused { detectors, .. } if detectors == &["github_token"])
+                && !e.to_string().contains(GITHUB),
             "{e:?}"
         );
         let e = ingest_or_spool(
@@ -1319,10 +1327,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            matches!(&e, AliceError::Invalid(m) if m.contains("github_token")),
-            "{e:?}"
-        );
+        assert!(matches!(&e, AliceError::Refused { .. }), "{e:?}");
         assert_eq!(
             spool::pending_count(&home.spool_dir()),
             2,
@@ -1334,11 +1339,45 @@ mod tests {
         let e = remember_or_spool(&home, &Launcher::None, remember_req(&format!("x {GITHUB}")))
             .await
             .unwrap_err();
-        assert!(
-            matches!(&e, AliceError::Invalid(m) if m.contains("github_token")),
-            "{e:?}"
-        );
+        assert!(matches!(&e, AliceError::Refused { .. }), "{e:?}");
         assert!(!spool_text(&home).contains(GITHUB));
+    }
+
+    /// The length is checked on the redacted text (as the daemon does): a request that redaction
+    /// makes too long is refused now, not queued and rejected at the drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_spool_checks_the_length_after_redaction() {
+        crate::install_tls();
+        let (_d, home) = home();
+        let key = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let content = vec![key; 3_000].join(" ");
+        assert!(content.len() < 65_536);
+        let e = remember_or_spool(&home, &Launcher::None, remember_req(&content))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, AliceError::Invalid(_)), "{e:?}");
+        assert_eq!(spool::pending_count(&home.spool_dir()), 0);
+    }
+
+    /// A `config.toml` with a bad leaf may have lost a privacy setting: the client then blocks
+    /// secrets instead of spooling with rules that may be weaker than the person's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_degraded_config_blocks_secrets_in_the_spool() {
+        crate::install_tls();
+        let (_d, home) = home();
+        std::fs::write(
+            home.config_file(),
+            "[privacy]\nredact = true\n[search]\nrelevance_floor = \"x\"\n",
+        )
+        .unwrap();
+        let e = remember_or_spool(&home, &Launcher::None, remember_req(&format!("k {GITHUB}")))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, AliceError::Refused { .. }), "{e:?}");
+        let ok = remember_or_spool(&home, &Launcher::None, remember_req("no secret"))
+            .await
+            .unwrap();
+        assert_eq!(ok.status, RememberStatus::Spooled);
     }
 
     /// The daemon runs from `/`: a relative home must reach it as the same directory.

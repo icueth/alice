@@ -564,3 +564,106 @@ async fn snapshots_of_an_old_row_are_redacted_in_the_history_and_the_stream() {
         "{bad:?}"
     );
 }
+
+/// A fact that cites a memory of a blocking project is judged by that project's rules.
+#[tokio::test(flavor = "multi_thread")]
+async fn assert_fact_follows_the_rules_of_the_project_of_its_source_memory() {
+    let (d, s) = start().await;
+    let cwd = repo(&d, "proj");
+    let root = Path::new(cwd.as_deref().unwrap()).to_path_buf();
+    let m = s
+        .remember(RememberRequest {
+            content: "the ci setup".into(),
+            cwd: cwd.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    std::fs::write(
+        root.join(".alice.toml"),
+        "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\nblock_secrets = true\n",
+    )
+    .unwrap();
+    let fact = |object: &str, source: Option<String>| AssertFact {
+        subject: "ci".into(),
+        predicate: "tracks".into(),
+        object: object.into(),
+        source_memory_id: source,
+        ..Default::default()
+    };
+    let err = s
+        .assert_fact(fact("TCK-12345", m.id.clone()))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("custom:ticket") && err.contains("object"),
+        "{err}"
+    );
+    // Without a source memory the global rules apply (redact mode): the fact is stored cleaned.
+    let ok = s.assert_fact(fact("TCK-12345", None)).await;
+    assert!(ok.is_ok(), "{ok:?}");
+    s.shutdown();
+}
+
+/// The live project's `.alice.toml` applies after the working tree moved: a re-clone keeps the
+/// project (same remote) but has another root.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_moved_working_tree_brings_its_project_rules_to_update_and_undo() {
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git {args:?}");
+    }
+    let (d, s) = start().await;
+    let (a, b) = (d.path().join("clone-a"), d.path().join("clone-b"));
+    for dir in [&a, &b] {
+        std::fs::create_dir(dir).unwrap();
+        git(dir, &["init", "-q"]);
+        git(
+            dir,
+            &["remote", "add", "origin", "https://example.com/me/app.git"],
+        );
+    }
+    let remember = |dir: &Path, content: &str| {
+        let (s, cwd) = (s.clone(), dir.to_string_lossy().into_owned());
+        let content = content.to_string();
+        async move {
+            s.remember(RememberRequest {
+                content,
+                cwd: Some(cwd),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let first = remember(&a, "first, from the old clone").await;
+    std::fs::write(
+        b.join(".alice.toml"),
+        "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
+    )
+    .unwrap();
+    let second = remember(&b, "second, from the new clone").await;
+    assert_eq!(first.project, second.project, "one project, two roots");
+    let edited = s
+        .update(UpdateRequest {
+            id: first.id.unwrap(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                body: Some("see TCK-12345".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(edited.memory.body, "see [REDACTED:custom:ticket]");
+    s.shutdown();
+}

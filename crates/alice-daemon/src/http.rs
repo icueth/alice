@@ -156,7 +156,9 @@ impl From<JsonRejection> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, kind) = match &self.0 {
-            AliceError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid"),
+            AliceError::Invalid(_) | AliceError::Refused { .. } => {
+                (StatusCode::BAD_REQUEST, "invalid")
+            }
             AliceError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             AliceError::ReadOnly(_) => (StatusCode::SERVICE_UNAVAILABLE, "read_only"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),

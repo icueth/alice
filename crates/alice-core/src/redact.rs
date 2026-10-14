@@ -46,13 +46,10 @@ impl std::fmt::Debug for Redactor {
     }
 }
 
-/// What a `block`-mode refusal says after the field's name.
-const REFUSAL: &str = "contains what looks like a secret";
-
 /// Whether `e` is a `block`-mode refusal from [`Redactor::check`]: the write held a secret and
 /// was not made. A caller that keeps refused requests (the spool) must not keep this one's text.
 pub fn is_refusal(e: &AliceError) -> bool {
-    matches!(e, AliceError::Invalid(m) if m.contains(REFUSAL))
+    matches!(e, AliceError::Refused { .. })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,10 +79,28 @@ fn any(_: &str) -> bool {
     true
 }
 
+/// `snake_case_name`, `module.name` or `name_v2`: every segment lowercase letters with at most
+/// two trailing digits, and at least one `_` or `.`. A value like that is code, not a password.
+fn identifier_like(v: &str) -> bool {
+    let segments: Vec<&str> = v.split(['_', '.']).collect();
+    segments.len() > 1
+        && segments.iter().all(|seg| {
+            let letters = seg.trim_end_matches(|c: char| c.is_ascii_digit());
+            let digits = seg.len() - letters.len();
+            !letters.is_empty() && digits <= 2 && letters.chars().all(|c| c.is_ascii_lowercase())
+        })
+}
+
 /// A value after `password =` etc. that is a secret, not code or prose: no call, index,
-/// template or dotted path; not an ENV_NAME; and either letters with digits or long and varied.
+/// template, path or identifier; not an ENV_NAME; and either letters with digits or long and
+/// varied.
 fn secret_value(v: &str) -> bool {
-    if v.starts_with("[REDACTED") || v.contains(['(', ')', '[', ']', '{', '}', '<', '>', '$']) {
+    if v.starts_with("[REDACTED")
+        || v.contains(['(', ')', '[', ']', '{', '}', '<', '>', '$'])
+        || v.starts_with(['/', '~'])
+        || v.starts_with("./")
+        || v.starts_with("../")
+    {
         return false;
     }
     let dotted = v.contains('.')
@@ -94,7 +109,7 @@ fn secret_value(v: &str) -> bool {
     let env_name = v
         .chars()
         .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    if dotted || env_name {
+    if dotted || env_name || identifier_like(v) {
         return false;
     }
     let letters = v.chars().any(|c| c.is_alphabetic());
@@ -103,7 +118,10 @@ fn secret_value(v: &str) -> bool {
 }
 
 fn high_entropy(v: &str) -> bool {
-    !v.starts_with("[REDACTED") && entropy(v) >= 3.5
+    !v.starts_with("[REDACTED")
+        && !v.starts_with(['/', '~'])
+        && !identifier_like(v)
+        && entropy(v) >= 3.5
 }
 
 fn builtin_detectors() -> Vec<Detector> {
@@ -122,11 +140,16 @@ fn builtin_detectors() -> Vec<Detector> {
         ),
         d(
             "jwt",
-            r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+            r"(?-u:\b)eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
             0,
             any,
         ),
-        d("aws_access_key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", 0, any),
+        d(
+            "aws_access_key",
+            r"(?-u:\b)(?:AKIA|ASIA)[0-9A-Z]{16}(?-u:\b)",
+            0,
+            any,
+        ),
         d(
             "aws_secret_key",
             r#"(?i)\baws_?secret_?(?:access_?)?key\b\s*[:=]\s*["']?([A-Za-z0-9/+=]{40})"#,
@@ -141,17 +164,32 @@ fn builtin_detectors() -> Vec<Detector> {
         ),
         d(
             "github_token",
-            r"\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})\b",
+            r"(?-u:\b)(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})(?-u:\b)",
             0,
             any,
         ),
-        d("gitlab_token", r"\bglpat-[A-Za-z0-9_\-]{20,}", 0, any),
-        d("slack_token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}", 0, any),
-        d("stripe_key", r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}", 0, any),
-        d("anthropic_key", r"\bsk-ant-[A-Za-z0-9_\-]{20,}", 0, any),
+        d("gitlab_token", r"(?-u:\b)glpat-[A-Za-z0-9_\-]{20,}", 0, any),
+        d(
+            "slack_token",
+            r"(?-u:\b)xox[abprs]-[A-Za-z0-9-]{10,}",
+            0,
+            any,
+        ),
+        d(
+            "stripe_key",
+            r"(?-u:\b)(?:sk|rk)_live_[A-Za-z0-9]{16,}",
+            0,
+            any,
+        ),
+        d(
+            "anthropic_key",
+            r"(?-u:\b)sk-ant-[A-Za-z0-9_\-]{20,}",
+            0,
+            any,
+        ),
         d(
             "openai_key",
-            r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_\-]{20,}",
+            r"(?-u:\b)sk-(?:proj-|svcacct-)?[A-Za-z0-9_\-]{20,}",
             0,
             any,
         ),
@@ -163,7 +201,7 @@ fn builtin_detectors() -> Vec<Detector> {
         ),
         d(
             "password_assignment",
-            r#"(?i)(?:\b(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|auth[_-]?token|client[_-]?secret)\b|รหัสผ่าน)\s*[:=]\s*["']?([^\s"',;]{6,})"#,
+            r#"(?i)(?:[A-Za-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|auth[_-]?token|client[_-]?secret)|รหัสผ่าน)["']?\s*[:=]\s*["']?([^\s"',;]{6,})"#,
             1,
             secret_value,
         ),
@@ -194,40 +232,46 @@ impl Redactor {
         }
     }
 
-    /// The detectors for `p`: the built-in ones, then its custom patterns. An error names the
-    /// setting that is wrong, never the pattern.
+    /// The detectors for `p`: the built-in ones, then its custom patterns. A custom pattern
+    /// that does not compile or that matches empty text is skipped (with a warning that names
+    /// it, never its expression) and the others stay: one bad pattern must not switch off the
+    /// rest. A bad allowlist entry is skipped too, which keeps fewer matches (the safe side).
+    /// Settings validation refuses both before they get here; this is the second line.
     pub fn new(p: &PrivacySettings) -> Result<Self> {
         let mut detectors = builtin_detectors();
         for c in &p.custom_patterns {
-            let re = Regex::new(&c.regex).map_err(|_| {
-                AliceError::invalid(format!(
-                    "privacy.custom_patterns \"{}\" is not a valid regular expression; fix it in config.toml or .alice.toml",
-                    c.name
-                ))
-            })?;
-            if re.is_match("") {
-                return Err(AliceError::invalid(format!(
-                    "privacy.custom_patterns \"{}\" matches empty text; make it match something",
-                    c.name
-                )));
+            match Regex::new(&c.regex) {
+                Ok(re) if !re.is_match("") => detectors.push(Detector {
+                    name: format!("custom:{}", c.name),
+                    re,
+                    group: 0,
+                    check: any,
+                }),
+                Ok(_) => tracing::warn!(
+                    pattern = %c.name,
+                    "privacy.custom_patterns matches empty text and is skipped"
+                ),
+                Err(_) => tracing::warn!(
+                    pattern = %c.name,
+                    "privacy.custom_patterns is not a valid regular expression and is skipped"
+                ),
             }
-            detectors.push(Detector {
-                name: format!("custom:{}", c.name),
-                re,
-                group: 0,
-                check: any,
-            });
         }
         let allow = p
             .allowlist
             .iter()
-            .map(|a| Regex::new(&format!("^(?:{a})$")))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|_| {
-                AliceError::invalid(
-                    "privacy.allowlist holds an invalid regular expression; fix it in config.toml",
-                )
-            })?;
+            .enumerate()
+            .filter_map(|(i, a)| match Regex::new(&format!("^(?:{a})$")) {
+                Ok(re) => Some(re),
+                Err(_) => {
+                    tracing::warn!(
+                        index = i,
+                        "privacy.allowlist entry is invalid and is skipped"
+                    );
+                    None
+                }
+            })
+            .collect();
         Ok(Self {
             enabled: p.redact,
             mode: p.redact_mode,
@@ -243,16 +287,19 @@ impl Redactor {
 
     /// `text` with every secret replaced, and the detectors that found one.
     pub fn apply(&self, text: &str) -> Redaction {
-        let mut out = text.to_string();
+        let mut out: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(text);
         let mut found: Vec<String> = Vec::new();
         if !self.enabled {
-            return Redaction { text: out, found };
+            return Redaction {
+                text: text.to_string(),
+                found,
+            };
         }
         for d in &self.detectors {
             let tag = format!("[REDACTED:{}]", d.name);
-            let mut result = String::with_capacity(out.len());
+            // Allocated on the first hit only: most text matches no detector.
+            let mut result: Option<String> = None;
             let mut last = 0;
-            let mut hit = false;
             for caps in d.re.captures_iter(&out) {
                 let Some(m) = caps.get(d.group) else { continue };
                 let value = m.as_str();
@@ -262,20 +309,23 @@ impl Redactor {
                 {
                     continue;
                 }
-                result.push_str(&out[last..m.start()]);
-                result.push_str(&tag);
+                let r = result.get_or_insert_with(|| String::with_capacity(out.len()));
+                r.push_str(&out[last..m.start()]);
+                r.push_str(&tag);
                 last = m.end();
-                hit = true;
             }
-            if hit {
-                result.push_str(&out[last..]);
-                out = result;
+            if let Some(mut r) = result {
+                r.push_str(&out[last..]);
+                out = std::borrow::Cow::Owned(r);
                 if !found.contains(&d.name) {
                     found.push(d.name.clone());
                 }
             }
         }
-        Redaction { text: out, found }
+        Redaction {
+            text: out.into_owned(),
+            found,
+        }
     }
 
     /// Every string inside `value` redacted (keys are left alone); the detectors that fired.
@@ -323,10 +373,10 @@ impl Redactor {
     pub fn check(&self, field: &str, text: &str) -> Result<String> {
         let r = self.apply(text);
         if self.mode == RedactMode::Block && !r.found.is_empty() {
-            return Err(AliceError::invalid(format!(
-                "the {field} {REFUSAL} ({}); remove it and send again, or add an exception to privacy.allowlist",
-                r.found.join(", ")
-            )));
+            return Err(AliceError::Refused {
+                field: field.to_string(),
+                detectors: r.found,
+            });
         }
         Ok(r.text)
     }
@@ -428,6 +478,51 @@ mod tests {
             "abc12345",
         ),
         (
+            "DB_PASSWORD=hunter2hunter2",
+            "password_assignment",
+            "hunter2hunter2",
+        ),
+        (
+            "MY_API_KEY=abc123def456",
+            "password_assignment",
+            "abc123def456",
+        ),
+        (
+            "SLACK_SIGNING_SECRET=abcdef0123456789",
+            "password_assignment",
+            "abcdef0123456789",
+        ),
+        (
+            "export GITHUB_TOKEN=notaprefixedtoken12345",
+            "password_assignment",
+            "notaprefixedtoken12345",
+        ),
+        (
+            "{\"password\": \"hunter2xyz\"}",
+            "password_assignment",
+            "hunter2xyz",
+        ),
+        (
+            "\"client_secret\": \"Zm9vYmFyYmF6cXV4MTIzNDU2\"",
+            "password_assignment",
+            "Zm9vYmFyYmF6cXV4MTIzNDU2",
+        ),
+        (
+            concat!("คีย์AKIA", "IOSFODNN7EXAMPLE"),
+            "aws_access_key",
+            concat!("AKIA", "IOSFODNN7EXAMPLE"),
+        ),
+        (
+            concat!("ใช้sk-", "ant-api03-abcdefghijklmnopqrstuvwxyz012345"),
+            "anthropic_key",
+            concat!("sk-", "ant-api03-abcdef"),
+        ),
+        (
+            concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789ใช้ได้"),
+            "github_token",
+            concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"),
+        ),
+        (
             "STRIPE_SIGNING_KEY=whsec_9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a",
             "high_entropy",
             "whsec_9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a",
@@ -446,6 +541,12 @@ mod tests {
         "http://example.com/path@section",
         "ใช้ WAL mode เพื่อให้ reader ไม่บล็อก writer",
         "already [REDACTED:github_token] here",
+        "PWD=/Users/icue/Code/AI/project-alice",
+        "token = get_token_from_cache_or_refresh",
+        "api_key = get_api_key_from_environment_variable",
+        "password = my_password_field_name_v2",
+        "secret = ~/.config/alice/secret-file",
+        "token = ./relative/token_path",
     ];
 
     #[test]
@@ -534,34 +635,46 @@ mod tests {
         assert_eq!(out.found, vec!["custom:ticket".to_string()]);
     }
 
+    /// One bad custom pattern (invalid, or matching empty text) is skipped; the good ones and the
+    /// mode stay in force.
     #[test]
-    fn a_bad_pattern_is_refused_without_echoing_it_and_the_fallback_still_redacts() {
-        let secret_looking = "(unclosed-TCK";
+    fn a_bad_pattern_is_skipped_alone_and_the_fallback_still_redacts() {
         let p = PrivacySettings {
             custom_patterns: vec![
                 CustomPattern {
                     name: "broken".into(),
-                    regex: secret_looking.into(),
+                    regex: "(unclosed-TCK".into(),
                 },
                 CustomPattern {
                     name: "empty".into(),
-                    regex: "x*".into(),
+                    regex: ".*".into(),
+                },
+                CustomPattern {
+                    name: "digits".into(),
+                    regex: r"\d*".into(),
+                },
+                CustomPattern {
+                    name: "ticket".into(),
+                    regex: "TCK-[0-9]{4,}".into(),
                 },
             ],
+            allowlist: vec!["(".into()],
             redact_mode: RedactMode::Block,
             ..Default::default()
         };
-        let e = Redactor::new(&p).unwrap_err().to_string();
-        assert!(e.contains("broken") && !e.contains(secret_looking), "{e}");
-        let only_empty = PrivacySettings {
-            custom_patterns: vec![p.custom_patterns[1].clone()],
-            ..Default::default()
-        };
+        let r = Redactor::new(&p).unwrap();
+        assert!(r.blocks());
+        let e = r.check("content", "see TCK-12345").unwrap_err();
         assert!(
-            Redactor::new(&only_empty)
-                .unwrap_err()
-                .to_string()
-                .contains("empty")
+            matches!(&e, AliceError::Refused { field, detectors }
+                if field == "content" && detectors == &["custom:ticket"]),
+            "{e:?}"
+        );
+        assert!(is_refusal(&e) && !is_refusal(&AliceError::invalid("x")));
+        assert_eq!(
+            r.apply("nothing 123 here").found.len(),
+            0,
+            "empty patterns do not fire"
         );
         let f = Redactor::fallback(&p);
         assert!(f.blocks());
@@ -573,6 +686,16 @@ mod tests {
         assert_eq!(off.apply("password = hunter2").found.len(), 0);
         let debug = format!("{:?}", Redactor::new(&PrivacySettings::default()).unwrap());
         assert!(debug.contains("pem_private_key") && !debug.contains("BEGIN"));
+    }
+
+    #[test]
+    fn text_without_a_secret_comes_back_identical() {
+        let r = Redactor::builtin();
+        let out = r.apply("plain prose, nothing to see");
+        assert_eq!(
+            (out.text.as_str(), out.found.len()),
+            ("plain prose, nothing to see", 0)
+        );
     }
 
     #[test]

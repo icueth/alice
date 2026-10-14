@@ -172,41 +172,62 @@ fn comparable(v: Option<serde_json::Value>) -> Option<serde_json::Value> {
     })
 }
 
+/// An undo that the rules refuse says so as an undo, and what to do instead.
+fn refused_undo(e: AliceError) -> AliceError {
+    match e {
+        e @ AliceError::Refused { .. } => AliceError::invalid(format!(
+            "cannot undo: {e}. The earlier text holds a secret; edit the memory by hand instead"
+        )),
+        e => e,
+    }
+}
+
 /// `s` as it may be restored today: its text through the project's current redaction rules. A
 /// secret that the rules would redact never comes back with an undo, and in `block` mode the
-/// undo is refused (the message names the detector, not the text).
+/// undo is refused (the message names the detector, not the text). With `refuse` false (an undo
+/// that only trashes the memory) the text is redacted but never refused.
 fn restorable(
     conn: &Connection,
     s: &MemorySnapshot,
     redact: RedactorFor<'_>,
+    refuse: bool,
 ) -> Result<MemorySnapshot> {
     let r = redact(conn, Some(&s.project_id));
-    let refused = |e: AliceError| match e {
-        AliceError::Invalid(m) => AliceError::invalid(format!(
-            "cannot undo: {m}. The earlier text holds a secret; edit the memory by hand instead"
-        )),
-        e => e,
+    let text = |field: &str, t: &str| -> Result<String> {
+        if refuse {
+            r.check(field, t).map_err(refused_undo)
+        } else {
+            Ok(r.apply(t).text)
+        }
     };
     let mut out = s.clone();
-    out.title = r.check("title", &s.title).map_err(refused)?;
-    out.body = r.check("body", &s.body).map_err(refused)?;
+    out.title = text("title", &s.title)?;
+    out.body = text("body", &s.body)?;
     out.topics = s
         .topics
         .iter()
-        .map(|t| r.check("topic", t).map_err(refused))
+        .map(|t| text("topic", t))
         .collect::<Result<_>>()?;
     Ok(out)
 }
 
-/// `v`, a snapshot as events record it, with its strings redacted by the rules of the project
-/// it names (`project_id`), or of no project.
-fn scrub(conn: &Connection, redact: RedactorFor<'_>, v: &mut Option<serde_json::Value>) {
-    if let Some(v) = v {
-        let project = v
-            .get("project_id")
-            .and_then(|p| p.as_str())
-            .map(String::from);
-        redact(conn, project.as_deref()).apply_json(v);
+/// The snapshots of one event, redacted by the rules of the project they name (`project_id`),
+/// or the global rules: one lookup per event. History is never refused, only cleaned. The
+/// writer records its events through this too.
+pub fn scrub_snapshots(
+    conn: &Connection,
+    redact: RedactorFor<'_>,
+    before: &mut Option<serde_json::Value>,
+    after: &mut Option<serde_json::Value>,
+) {
+    let project = [&*before, &*after]
+        .into_iter()
+        .flatten()
+        .find_map(|v| v.get("project_id").and_then(|p| p.as_str()))
+        .map(String::from);
+    let r = redact(conn, project.as_deref());
+    for v in [before, after].into_iter().flatten() {
+        r.apply_json(v);
     }
 }
 
@@ -280,6 +301,7 @@ fn restore_relation(
     id: &str,
     s: Option<&RelationSnapshot>,
     hlc: &str,
+    redact: RedactorFor<'_>,
 ) -> Result<()> {
     match s {
         // The relation did not exist before the event (an add): remove it.
@@ -292,6 +314,14 @@ fn restore_relation(
                 params![s.valid_from, s.valid_to, hlc, id],
             )?;
             if n == 0 {
+                // Re-created from the recorded state: its text through today's rules.
+                let r = redact(conn, None);
+                let predicate = r.check("predicate", &s.predicate).map_err(refused_undo)?;
+                let literal = s
+                    .object_literal
+                    .as_deref()
+                    .map(|l| r.check("object", l).map_err(refused_undo))
+                    .transpose()?;
                 conn.execute(
                     "INSERT INTO relations (id, subject_id, predicate, object_entity_id, object_literal, valid_from, valid_to,
                         source_memory_id, created_at, hlc)
@@ -299,9 +329,9 @@ fn restore_relation(
                     params![
                         id,
                         s.subject_id,
-                        s.predicate,
+                        predicate,
                         s.object_entity_id,
-                        s.object_literal,
+                        literal,
                         s.valid_from,
                         s.valid_to,
                         s.source_memory_id,
@@ -463,7 +493,7 @@ pub fn undo(
         match (e.target_type.as_str(), before) {
             ("memory", Some(b)) => {
                 let s: MemorySnapshot = serde_json::from_value(b).map_err(bad)?;
-                restore_memory(conn, &e.target_id, &restorable(conn, &s, redact)?, &h)?;
+                restore_memory(conn, &e.target_id, &restorable(conn, &s, redact, true)?, &h)?;
             }
             // Only a create has no memory before it: undoing it forgets the memory (it stays
             // in the trash for 30 days).
@@ -471,7 +501,13 @@ pub fn undo(
                 let mut s: MemorySnapshot =
                     serde_json::from_value(after.unwrap_or_default()).map_err(bad)?;
                 s.status = Status::Trashed;
-                restore_memory(conn, &e.target_id, &restorable(conn, &s, redact)?, &h)?;
+                // It only goes to the trash: redact what it holds, never refuse.
+                restore_memory(
+                    conn,
+                    &e.target_id,
+                    &restorable(conn, &s, redact, false)?,
+                    &h,
+                )?;
             }
             ("memory", None) => {
                 return Err(AliceError::invalid(format!(
@@ -482,7 +518,7 @@ pub fn undo(
             ("relation", b) => {
                 let s: Option<RelationSnapshot> =
                     b.map(serde_json::from_value).transpose().map_err(bad)?;
-                restore_relation(conn, &e.target_id, s.as_ref(), &h)?;
+                restore_relation(conn, &e.target_id, s.as_ref(), &h, redact)?;
             }
             (other, _) => {
                 return Err(AliceError::invalid(format!(
@@ -492,8 +528,7 @@ pub fn undo(
         }
         let mut after_now = current(conn, &e.target_type, &e.target_id)?;
         let mut before_now = before_now;
-        scrub(conn, redact, &mut before_now);
-        scrub(conn, redact, &mut after_now);
+        scrub_snapshots(conn, redact, &mut before_now, &mut after_now);
         events::record(
             conn,
             &EventInput {
@@ -1170,5 +1205,69 @@ mod tests {
             !rows.is_empty() && rows.iter().all(|r| !r.contains(token)),
             "{rows:?}"
         );
+    }
+
+    /// A relation re-created by an undo gets its text through the rules too (block mode refuses).
+    #[test]
+    fn undo_never_restores_relation_text_the_rules_would_redact() {
+        use crate::settings::{PrivacySettings, RedactMode};
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let mut t = T::new();
+        t.fact("seed", FactAction::Add);
+        let subject: String =
+            t.c.query_row("SELECT id FROM entities WHERE name = 'alice'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let state = |predicate: &str| {
+            Some(serde_json::json!({
+                "subject_id": subject,
+                "predicate": predicate,
+                "object_entity_id": null,
+                "object_literal": format!("value {token}"),
+                "valid_from": "2026-01-01T00:00:00.000Z",
+                "valid_to": null,
+                "source_memory_id": null,
+            }))
+        };
+        // Events recorded by an older Alice: the relation row is gone, its text held a secret.
+        let mut ev = |id: &str, predicate: &str| {
+            let h = t.hlc();
+            t.record(
+                EventInput {
+                    actor: &Actor::User,
+                    action: "relation.close",
+                    target_type: "relation",
+                    target_id: id,
+                    before: state(predicate),
+                    after: None,
+                    group: None,
+                },
+                &h,
+            )
+        };
+        let (a, b) = (
+            ev("01RELATIONGONE00000000A000", "uses"),
+            ev("01RELATIONGONE00000000B000", "uses"),
+        );
+        let block = Redactor::new(&PrivacySettings {
+            redact_mode: RedactMode::Block,
+            ..Default::default()
+        })
+        .unwrap();
+        let err = t.undo_with(&a, block).unwrap_err().to_string();
+        assert!(
+            err.contains("github_token") && !err.contains(token),
+            "{err}"
+        );
+        t.undo(&b).unwrap();
+        let literal: String =
+            t.c.query_row(
+                "SELECT object_literal FROM relations WHERE id = '01RELATIONGONE00000000B000'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(literal, "value [REDACTED:github_token]");
     }
 }

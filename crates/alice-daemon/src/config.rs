@@ -496,6 +496,18 @@ impl SettingsHandle {
         }
     }
 
+    /// Whether the privacy rules for `root` are in a fail-closed state right now rather than
+    /// the ones a person configured: `config.toml` is degraded, or the project's `.alice.toml`
+    /// is invalid or unreadable, or blank on its first look, or a loosening of it is waiting for
+    /// its polls. A write refused under such rules may be accepted a moment later.
+    pub fn project_fail_closed(&self, root: Option<&Path>) -> bool {
+        self.config_degraded()
+            || root.is_some_and(|r| {
+                let l = self.projects.get(r);
+                l.error.is_some() || l.loosening_pending
+            })
+    }
+
     /// A loosening in `config.toml` (a protection switched off, say) was read and is waiting to
     /// be read the same on three polls in a row before it applies; the settings view says so.
     pub fn loosening_waiting(&self) -> bool {

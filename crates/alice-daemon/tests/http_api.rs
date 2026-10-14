@@ -1264,3 +1264,25 @@ async fn the_patch_answer_discloses_a_loosening_and_unused_keys() {
     assert_eq!(flag("embedding.provider"), true);
     assert_eq!(flag("embedding.batch_size"), false);
 }
+
+/// A write that `block` mode refuses is a 400 naming the detector, not a server error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_secret_is_a_400_that_names_the_detector() {
+    let s = Srv::start().await;
+    let mut change = serde_json::Map::new();
+    change.insert("privacy.redact_mode".into(), serde_json::json!("block"));
+    s.svc.settings_handle().patch(&change).unwrap();
+    let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let resp = s
+        .post(
+            "/api/v1/remember",
+            &serde_json::json!({"content": format!("key {token}")}),
+        )
+        .await;
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("github_token") && !body.contains(token),
+        "{body}"
+    );
+}

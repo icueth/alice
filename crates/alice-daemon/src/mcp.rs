@@ -206,6 +206,7 @@ fn json<T: serde::Serialize>(v: &T) -> CallToolResult {
 fn resource_err(e: AliceError) -> McpError {
     match e {
         AliceError::Invalid(m) => McpError::invalid_params(m, None),
+        e @ AliceError::Refused { .. } => McpError::invalid_params(e.to_string(), None),
         e @ AliceError::NotFound(_) => McpError::resource_not_found(e.to_string(), None),
         e => McpError::internal_error(e.to_string(), None),
     }

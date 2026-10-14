@@ -257,25 +257,15 @@ fn rules_for(conn: &Connection, redactors: &Redactors, project_id: Option<&str>)
     redactors.for_root(root.as_deref().map(Path::new))
 }
 
-/// A snapshot as events record it with its strings redacted by the rules of the project it
-/// names (`project_id`) or the global ones. History is never refused, only cleaned: it holds
-/// what was stored, and what was stored is redacted already, so this matters for rows written
-/// before a rule existed and for any text a later writer path forgets.
-fn scrub(conn: &Connection, st: &State, snapshot: &mut Option<serde_json::Value>) {
-    let Some(v) = snapshot else { return };
-    let project = v
-        .get("project_id")
-        .and_then(|p| p.as_str())
-        .map(String::from);
-    rules_for(conn, &st.redactors, project.as_deref()).apply_json(v);
-}
-
 /// Record an event in the current transaction; it is broadcast after the batch commits.
 /// Returns the event id. The before and after snapshots are redacted first, so neither the
 /// `events` table nor the stream ever carries a secret.
 pub(crate) fn record(conn: &Connection, st: &mut State, mut e: EventInput<'_>) -> Result<String> {
-    scrub(conn, st, &mut e.before);
-    scrub(conn, st, &mut e.after);
+    {
+        let redactors = st.redactors.clone();
+        let rules = |c: &Connection, project: Option<&str>| rules_for(c, &redactors, project);
+        history::scrub_snapshots(conn, &rules, &mut e.before, &mut e.after);
+    }
     let hlc = st.hlc.tick();
     let id = events::record(conn, &e, &hlc)?;
     if let Some(event) = events::get(conn, &id)? {
@@ -875,7 +865,8 @@ fn ends_batch(batch: &[Job]) -> bool {
         .is_some_and(|j| matches!(j.op, WriteOp::Shutdown))
 }
 
-pub fn spawn_writer(
+#[cfg(test)]
+pub(crate) fn spawn_writer(
     conn: Connection,
     device: String,
     wake_worker: Sender<()>,

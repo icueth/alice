@@ -11,6 +11,16 @@ pub enum AliceError {
     /// The caller sent something invalid; the message says how to fix it.
     #[error("{0}")]
     Invalid(String),
+    /// A write refused because its text holds a secret and `block` mode is on (spec §5.3). Names
+    /// the field and the detectors, never the text.
+    #[error(
+        "the {field} contains what looks like a secret ({}); remove it and send again, or add an exception to privacy.allowlist",
+        .detectors.join(", ")
+    )]
+    Refused {
+        field: String,
+        detectors: Vec<String>,
+    },
     #[error("not found: {0}")]
     NotFound(String),
     /// Writes are refused until the cause is fixed.

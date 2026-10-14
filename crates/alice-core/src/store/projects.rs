@@ -58,6 +58,15 @@ fn slug_taken(conn: &Connection, s: &str) -> Result<bool> {
 /// A slug already in use gets a suffix from the key's hash, lengthened until it is free.
 pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProject> {
     if let Some(found) = find_by_key(conn, &p.key)? {
+        // The working tree may have moved (a re-clone, a new worktree): the rules of its
+        // `.alice.toml` are read from the live root, so a root that exists replaces the stored one.
+        if let Some(root) = p.root.as_ref().filter(|r| r.exists()) {
+            let root = root.to_string_lossy();
+            conn.execute(
+                "UPDATE projects SET root_path = ?1 WHERE id = ?2 AND root_path IS NOT ?1",
+                params![root, found.id],
+            )?;
+        }
         return Ok(found);
     }
     let base = slugify(&p.slug);
@@ -380,5 +389,25 @@ mod tests {
         }
         assert_eq!(root_of(&c, &none.slug).unwrap(), None);
         assert_eq!(root_of(&c, "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn a_moved_root_replaces_the_stored_one_when_it_exists() {
+        let (d, c) = conn();
+        let old = d.path().join("old");
+        let new = d.path().join("new");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&new).unwrap();
+        let mut r = pref("k/app", "app");
+        r.root = Some(old.clone());
+        let p = upsert_project(&c, &r).unwrap();
+        assert_eq!(root_of(&c, &p.id).unwrap().as_deref(), old.to_str());
+        r.root = Some(new.clone());
+        upsert_project(&c, &r).unwrap();
+        assert_eq!(root_of(&c, &p.id).unwrap().as_deref(), new.to_str());
+        // A root that is not there does not replace a good one.
+        r.root = Some(d.path().join("gone"));
+        upsert_project(&c, &r).unwrap();
+        assert_eq!(root_of(&c, &p.id).unwrap().as_deref(), new.to_str());
     }
 }

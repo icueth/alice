@@ -1379,11 +1379,20 @@ impl Settings {
                     ),
                 ));
             }
-            if let Err(x) = regex::Regex::new(&c.regex) {
-                e.push(err(
+            match regex::Regex::new(&c.regex) {
+                Err(x) => e.push(err(
                     "privacy.custom_patterns",
                     format!("pattern {}: {x}", c.name),
-                ));
+                )),
+                // Such a pattern would "match" between every two characters.
+                Ok(re) if re.is_match("") => e.push(err(
+                    "privacy.custom_patterns",
+                    format!(
+                        "pattern {}: the regular expression matches empty text; make it match something (for example \\d+ instead of \\d*)",
+                        c.name
+                    ),
+                )),
+                Ok(_) => {}
             }
         }
         for a in &p.allowlist {
@@ -3026,6 +3035,26 @@ mod tests {
         assert_eq!(r.settings.privacy.custom_patterns.len(), 1);
         assert_eq!(r.settings.privacy.custom_patterns[0].name, "ticket");
         assert_eq!(r.settings.judge.review_threshold, 0.7);
+    }
+
+    /// A pattern that matches empty text is refused by validation (it would fire between every
+    /// two characters), in the global file and in a project file.
+    #[test]
+    fn an_empty_matching_custom_pattern_is_refused() {
+        let file = "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]+\" }, { name = \"all\", regex = \".*\" }, { name = \"digits\", regex = \"\\\\d*\" }]\n";
+        let (_r, errors) = resolve_salvaging(Some(file), &[]);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("matches empty text") && e.message.contains("all")),
+            "{errors:?}"
+        );
+        let e = parse_project(
+            "f",
+            "[privacy]\ncustom_patterns = [{ name = \"all\", regex = \".*\" }]\n",
+        )
+        .unwrap_err();
+        assert!(e.message.contains("matches empty text"), "{}", e.message);
     }
 
     #[test]
