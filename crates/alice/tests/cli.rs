@@ -1657,3 +1657,243 @@ fn recall_precise_reaches_the_daemon() {
     let help = e.run(&["recall", "--help"]);
     assert!(String::from_utf8_lossy(&help.stdout).contains("--precise"));
 }
+
+/// Task 15: `alice restore` through real processes. The backup comes back, a write made while
+/// the daemon was down is applied afterwards, the replaced database is kept, and a bad file is
+/// refused before the daemon is touched.
+#[test]
+fn restore_round_trip_brings_back_the_backup_and_keeps_writes_made_meanwhile() {
+    let env = Env::new();
+    env.ok(&["remember", "alpha before the backup"]);
+    let b = env.json(&["backup", "now"]);
+    let name = b["name"].as_str().unwrap().to_string();
+    env.ok(&["remember", "bravo after the backup"]);
+    // Keys and settings are not part of a restore.
+    let secrets = "[keys]\nsomething = \"kept\"\n";
+    std::fs::write(env.home.join("secrets.toml"), secrets).unwrap();
+    env.ok(&["daemon", "stop"]);
+    // Written while the daemon is down (as during a restore): spooled, applied after it.
+    let out = env
+        .cmd(&["remember", "charlie during the restore"])
+        .env("ALICE_NO_AUTOSTART", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(spooled(&env), 1);
+    // `env.json` parses the whole stdout as one JSON value: stop's own output would break it.
+    let r = env.json(&["restore", &name, "--yes"]);
+    assert_eq!(r["restored_from"], name);
+    assert!(
+        r["caveats"].as_str().unwrap().contains("purged"),
+        "the report says what a restore does not undo: {r}"
+    );
+    eventually(
+        || env.recall_count("charlie") == 1,
+        "the spooled write drained into the restored database",
+    );
+    assert_eq!(env.recall_count("alpha"), 1);
+    assert_eq!(
+        env.recall_count("bravo"),
+        0,
+        "written after the backup: gone with the restore"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.home.join("secrets.toml")).unwrap(),
+        secrets
+    );
+    let list = env.json(&["backup", "list"]);
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["kind"] == "before_restore")
+    );
+    let status = env.json(&["status"]);
+    assert_eq!(status["index_ready"], true);
+    // A bad file is refused before anything changes, and before the daemon is stopped.
+    let pid = env.daemon_pid().expect("the restored daemon runs");
+    std::fs::write(
+        env.home.join("backups/alice-20200101T000000Z.db"),
+        b"garbage",
+    )
+    .unwrap();
+    let bad = env.run(&["restore", "alice-20200101T000000Z.db", "--yes"]);
+    assert!(!bad.status.success());
+    assert!(
+        stderr(&bad).contains("not an Alice backup"),
+        "{}",
+        stderr(&bad)
+    );
+    assert_eq!(env.recall_count("alpha"), 1, "nothing was swapped");
+    assert_eq!(env.daemon_pid(), Some(pid), "the daemon was left running");
+}
+
+/// Task 15: restore needs a yes on a pipe, says what it does not undo in words, and works with
+/// no daemon (and no database) at all.
+#[test]
+fn restore_asks_for_a_yes_and_prints_what_it_does_not_undo() {
+    let env = Env::new();
+    env.ok(&["remember", "delta kept in the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let no = env.run(&["restore", &name]);
+    assert!(!no.status.success());
+    assert!(stderr(&no).contains("--yes"), "{}", stderr(&no));
+    let none = env.run(&["restore", "nope.db", "--yes"]);
+    assert!(!none.status.success());
+    assert!(
+        stderr(&none).contains("alice backup list"),
+        "{}",
+        stderr(&none)
+    );
+
+    env.ok(&["daemon", "stop"]);
+    std::fs::remove_file(env.home.join("alice.db")).unwrap();
+    // The default is the newest backup.
+    let text = env.ok(&["restore", "--yes"]);
+    assert!(text.starts_with("Restored alice-manual-"), "{text}");
+    assert!(
+        text.contains("purged after the backup") && text.contains("redaction"),
+        "{text}"
+    );
+    assert_eq!(env.recall_count("delta"), 1);
+}
+
+fn lock_file(path: &std::path::Path) -> std::fs::File {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    f.try_lock().expect("free");
+    f
+}
+
+/// Task 15 (R4): while a restore holds the daemon lock and its marker, a write with autostart ON
+/// is spooled at once (no daemon is started, no 10 s wait) and applied after the restore.
+#[test]
+fn a_write_during_a_restore_is_spooled_at_once_and_applied_afterwards() {
+    let env = Env::new();
+    env.ok(&["remember", "echo before the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["daemon", "stop"]);
+    let (daemon_lock, marker) = (
+        lock_file(&env.home.join("daemon.lock")),
+        lock_file(&env.home.join("restore.lock")),
+    );
+    let t = Instant::now();
+    let out = env.ok(&["remember", "foxtrot during the swap"]);
+    assert!(out.starts_with("Queued: "), "{out}");
+    assert!(
+        t.elapsed() < Duration::from_secs(6),
+        "spooled at once, took {:?}",
+        t.elapsed()
+    );
+    assert_eq!(spooled(&env), 1);
+    assert!(env.daemon_json().is_none(), "no daemon was started");
+    drop((daemon_lock, marker));
+    env.ok(&["restore", &name, "--yes"]);
+    eventually(
+        || env.recall_count("foxtrot") == 1,
+        "the spooled write drained after the restore",
+    );
+}
+
+/// Without the marker (the daemon lock alone) a write still ends up in the spool.
+#[test]
+fn a_write_while_the_daemon_lock_is_held_is_spooled_not_lost() {
+    let env = Env::new();
+    env.ok(&["remember", "golf before"]);
+    env.ok(&["daemon", "stop"]);
+    let held = lock_file(&env.home.join("daemon.lock"));
+    let out = env.ok(&["remember", "hotel while the lock is held"]);
+    assert!(out.starts_with("Queued: "), "{out}");
+    assert_eq!(spooled(&env), 1);
+    drop(held);
+    eventually(
+        || env.recall_count("hotel") == 1,
+        "the spooled write drained",
+    );
+}
+
+/// Task 15: a second `alice restore` is refused at once and leaves the daemon alone.
+#[test]
+fn a_second_restore_is_refused_at_once() {
+    let env = Env::new();
+    env.ok(&["remember", "india"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid = env.daemon_pid().unwrap();
+    let marker = lock_file(&env.home.join("restore.lock"));
+    let t = Instant::now();
+    let o = env.run(&["restore", &name, "--yes"]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("already running"), "{}", stderr(&o));
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert_eq!(env.daemon_pid(), Some(pid));
+    drop(marker);
+}
+
+/// Task 15 (R3): a backup from a newer schema is refused through the CLI, with the daemon left
+/// running and the data untouched.
+#[test]
+fn a_backup_from_a_newer_schema_is_refused_before_the_daemon_is_stopped() {
+    let env = Env::new();
+    env.ok(&["remember", "juliet kept"]);
+    let b = env.json(&["backup", "now"]);
+    let newer = env.work.join("newer.db");
+    std::fs::copy(b["path"].as_str().unwrap(), &newer).unwrap();
+    rusqlite::Connection::open(&newer)
+        .unwrap()
+        .execute("INSERT INTO schema_migrations VALUES (99, 'x')", [])
+        .unwrap();
+    let pid = env.daemon_pid().unwrap();
+    let o = env.run(&["restore", newer.to_str().unwrap(), "--yes"]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("newer"), "{}", stderr(&o));
+    assert_eq!(env.daemon_pid(), Some(pid), "the daemon was not stopped");
+    assert_eq!(env.recall_count("juliet"), 1);
+}
+
+/// Task 15: the output says what leaves the active database and how to undo it, and undoing
+/// works.
+#[test]
+fn restore_says_where_the_lost_memories_went_and_undo_brings_them_back() {
+    let env = Env::new();
+    env.ok(&["remember", "kilo in the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["remember", "lima after the backup"]);
+    let text = env.ok(&["restore", &name, "--yes"]);
+    assert!(
+        text.contains("no longer in the active database")
+            && text.contains("alice-before-restore-")
+            && text.contains("To undo: alice restore alice-before-restore-")
+            && text.contains("at least 30 days"),
+        "{text}"
+    );
+    assert_eq!(env.recall_count("lima"), 0);
+    let kept = env
+        .json(&["backup", "list"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["kind"] == "before_restore")
+        .unwrap()["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["restore", &kept, "--yes"]);
+    assert_eq!(env.recall_count("lima"), 1, "undone");
+}

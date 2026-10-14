@@ -241,6 +241,20 @@ weekly = 4
 
 secret อย่าง API key ของ Jev จะเก็บใน `~/.alice/secrets.toml` (สิทธิ์ 0600) ด้วยคำสั่ง `alice config set-secret judge.jev.api_key` และเลือกใช้ Keychain ของ OS แทนได้
 
+## Backup และ restore
+
+```bash
+alice backup now          # สำเนา alice.db ที่ตรวจแล้ว เป็นส่วนตัว ใน ~/.alice/backups
+alice backup list
+alice restore             # backup ล่าสุด หรือ: alice restore <ชื่อหรือ path> [--yes]
+```
+
+`alice restore` ตรวจ backup ก่อน (ไฟล์ SQLite ที่ผ่าน `quick_check` และ schema ที่ build นี้อ่านได้ ถ้าใหม่กว่าจะปฏิเสธก่อนหยุดอะไรทั้งนั้น) แล้วหยุด daemon เก็บฐานข้อมูลปัจจุบันไว้เป็น `backups/alice-before-restore-<เวลา>.db` สลับ backup เข้าที่ด้วย rename ครั้งเดียว แล้วเริ่ม daemon ใหม่ ซึ่งสร้าง vector index ใหม่และนำงานเขียนที่ agent พักไว้ใน spool มาใช้ `alice.db` เป็นฐานข้อมูลเก่าที่สมบูรณ์หรือฐานข้อมูลที่กู้แล้วที่สมบูรณ์เสมอ ถ้าขั้นใดล้มเหลว ฐานข้อมูลเก่ายังอยู่ backup ที่ schema เก่ากว่าจะถูก migrate ตอนเริ่ม (พร้อม backup ก่อน migrate ของมันเอง) `secrets.toml`, `config.toml` และ spool ไม่ถูกแตะ ต้องมีที่ว่างพอสำหรับสำเนาที่เก็บไว้และไฟล์ที่กู้ ถ้าไม่พอจะปฏิเสธโดยไม่เปลี่ยนอะไร
+
+**ความจำที่เขียนหลังเวลาที่ backup จะออกจากฐานข้อมูลที่ใช้งานอยู่** ความจำเหล่านั้นอยู่ในสำเนา before-restore ซึ่งเก็บอย่างน้อย 30 วัน (อันล่าสุดเก็บไว้เสมอ) ถ้าจะยกเลิกการ restore ให้รัน `alice restore alice-before-restore-<เวลา>.db` อีกสองอย่างที่ restore ไม่ย้อนให้: ความจำที่คุณ purge หลังทำ backup จะกลับมาพร้อม backup และข้อความที่เก็บไว้ภายใต้กฎ redaction รุ่นเก่าจะไม่ถูกสแกนใหม่
+
+กับฐานข้อมูลใหญ่ daemon จะหยุดนานเท่ากับการคัดลอกสองครั้งและการตรวจ (หลายนาทีที่ 2.8 GB) ระหว่างนั้นงานเขียนของ agent ถูกพักใน spool ทันทีและนำมาใช้ภายหลัง
+
 ## Git sync *(วางแผนไว้ใน M4)*
 
 ```bash

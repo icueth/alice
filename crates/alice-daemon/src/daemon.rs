@@ -68,6 +68,22 @@ fn acquire_lock(home: &AliceHome) -> std::io::Result<Option<File>> {
     }
 }
 
+/// The single-instance lock if it is free right now (no waiting); `None` when a daemon holds
+/// it. `alice restore` holds it while it swaps `alice.db`, so no daemon can start meanwhile.
+pub fn try_lock_home(home: &AliceHome) -> std::io::Result<Option<File>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.lock_file())?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
+
 pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
     crate::install_tls();
     home.ensure_dirs()?;
@@ -78,6 +94,8 @@ pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
         );
         return Ok(());
     };
+    // A killed `alice restore` may have left its staged files; none runs while we hold the lock.
+    crate::restore::sweep_staged(&home);
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
     // Whatever daemon.json exists now is stale (its writer no longer holds the lock): drop it

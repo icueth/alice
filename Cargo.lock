@@ -127,6 +127,7 @@ dependencies = [
  "clap",
  "libc",
  "rmcp",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

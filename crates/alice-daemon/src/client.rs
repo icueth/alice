@@ -383,6 +383,13 @@ impl DaemonClient {
         let Launcher::Exe(exe) = launcher else {
             return Err(Unavailable::NotRunning);
         };
+        // `alice restore` holds the daemon lock for the swap: a daemon started now would only
+        // wait for it. Writes spool at once instead of waiting for one.
+        if crate::restore::in_progress(home) {
+            return Err(Unavailable::Starting(Some(
+                "being replaced by `alice restore`".into(),
+            )));
+        }
         let since = startup::unix_ms();
         // The daemon reads its home from ALICE_HOME: make it serve the one we wait on.
         let child = spawn_detached_with_env(

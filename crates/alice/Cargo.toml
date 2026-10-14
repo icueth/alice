@@ -33,5 +33,6 @@ libc.workspace = true
 [dev-dependencies]
 alice-core = { path = "../alice-core", features = ["fixtures"] }
 tempfile.workspace = true
+rusqlite.workspace = true
 rmcp.workspace = true
 serde_json.workspace = true
