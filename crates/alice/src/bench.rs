@@ -573,7 +573,13 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
     report.embed_per_sec = embed_throughput(probe.as_ref(), &mut corpus)?;
     drop(probe);
 
-    let svc = Service::start(home.clone(), &make, ServiceOptions::process_env())?;
+    // The judge still reads every memory (its cost is part of what is measured) but changes
+    // none: the generated corpus must stay as it was written, whatever it happens to resemble.
+    let opts = ServiceOptions {
+        judge_applies: false,
+        ..ServiceOptions::process_env()
+    };
+    let svc = Service::start(home.clone(), &make, opts)?;
     rt.block_on(load(&svc, &args, &mut corpus, &mut report))?;
     eprintln!("bench: measuring latency");
     report.latency = rt.block_on(latency(&svc, args.samples, &mut corpus))?;

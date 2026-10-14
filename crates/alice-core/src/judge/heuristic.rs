@@ -3,7 +3,9 @@
 //! name mentions, predicates by string similarity. It never claims more certainty than the
 //! rules justify: only duplicates (and identical predicates) reach the auto-apply threshold.
 
-use super::text::{predicate_similarity, same_predicate, stem_predicate, title_similarity};
+use super::text::{
+    normalize_title, predicate_similarity, same_predicate, stem_predicate, title_similarity,
+};
 use super::{
     Choice, Distribution, Judge, JudgeMemory, JudgeResult, ProjectOption, Relation, Rubric, Score,
 };
@@ -136,6 +138,33 @@ fn spread(winner: &str, p: f64) -> Distribution {
     }))
 }
 
+/// Every run of digits in `text`, in order (the numbers a text states).
+fn numbers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Whether two memories state the same text: equal title and body once case, spacing and
+/// punctuation are normalised, and the same numbers. Only this is sure enough for the heuristic
+/// to act on without asking (a vector can rate "port 5432" and "port 5433" as near twins).
+fn same_text(a: &JudgeMemory, b: &JudgeMemory) -> bool {
+    normalize_title(&a.title) == normalize_title(&b.title)
+        && normalize_title(&a.body) == normalize_title(&b.body)
+        && numbers(&a.title) == numbers(&b.title)
+        && numbers(&a.body) == numbers(&b.body)
+}
+
 /// Whether `name` appears in `text` as a word. Boundaries are ASCII-aware: a Thai letter next
 /// to an ASCII name (`ใช้pg-aiกับ`) does not hide it, but `pg-aid` does not match `pg-ai`.
 fn mentions(text: &str, name: &str) -> bool {
@@ -190,8 +219,12 @@ impl Judge for HeuristicJudge {
             .map(|e| {
                 let same_project = e.project == new.project;
                 let sim = e.similarity.unwrap_or(0.0);
+                let mut exact = None;
                 let probs = if same_project && sim >= self.duplicate_similarity {
                     let p = f64::from(sim).min(0.99);
+                    // `agreement` marks the duplicates that are the same text: the only
+                    // heuristic result `pipeline::decide` applies without asking.
+                    exact = Some(same_text(new, e));
                     Distribution::from_pairs([
                         ("duplicate".to_string(), p),
                         ("unrelated".to_string(), 1.0 - p),
@@ -211,7 +244,7 @@ impl Judge for HeuristicJudge {
                 Relation {
                     existing_id: e.id.clone(),
                     probs,
-                    agreement: None,
+                    agreement: exact,
                 }
             })
             .collect())
@@ -364,6 +397,39 @@ mod tests {
             "a heuristic update is only ever a suggestion"
         );
         assert_eq!(by("Z").probs.best().unwrap().0, "unrelated");
+    }
+
+    #[test]
+    fn only_the_same_text_with_the_same_numbers_is_marked_as_exact() {
+        let j = HeuristicJudge::default();
+        let at = "2026-10-13T00:00:00.000Z";
+        let new = mem(
+            "N",
+            "app",
+            Kind::Note,
+            "Postgres listens on port 5433",
+            at,
+            None,
+        );
+        let twin = |title: &str, kind: Kind| mem("T", "app", kind, title, at, Some(0.999));
+        let agreement =
+            |e: &JudgeMemory| j.compare(&new, std::slice::from_ref(e)).unwrap()[0].agreement;
+        assert_eq!(
+            agreement(&twin("postgres  listens on PORT 5433!", Kind::Decision)),
+            Some(true),
+            "same words under another kind, spacing and case"
+        );
+        assert_eq!(
+            agreement(&twin("Postgres listens on port 5432", Kind::Note)),
+            Some(false),
+            "a different number is a near miss, however close the vectors"
+        );
+        assert_eq!(
+            agreement(&twin("Postgres listens on a different port", Kind::Note)),
+            Some(false)
+        );
+        let far = mem("F", "app", Kind::Note, "Tom yum", at, Some(0.3));
+        assert_eq!(j.compare(&new, &[far]).unwrap()[0].agreement, None);
     }
 
     #[test]
