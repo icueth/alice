@@ -342,3 +342,134 @@ pub fn build_tunnels(dir: &Path, json: &str) -> PathBuf {
     std::fs::write(&path, json).unwrap();
     path
 }
+
+/// What [`synthetic_palace`] built, for counting what an import must store.
+#[derive(Debug, Clone)]
+pub struct SyntheticPalace {
+    /// The palace folder (holds `sqlite_exact.sqlite3`).
+    pub dir: PathBuf,
+    /// Drawers written (the closet row is not one).
+    pub drawers: usize,
+    /// Knowledge drawers: each becomes one memory.
+    pub knowledge: usize,
+    /// Transcript chunk drawers that repeat an earlier chunk of their transcript: each collapses.
+    pub repeats: usize,
+    /// Every transcript chunk drawer, repeats included (`chunks + collapsed` rows after an import).
+    pub chunk_drawers: usize,
+}
+
+/// Words of mixed Thai, English and code for the text of a synthetic transcript chunk.
+const SYNTH_WORDS: &[&str] = &[
+    "สวัสดี",
+    "ครับ",
+    "ตรวจสอบ",
+    "ฐานข้อมูล",
+    "ความจำ",
+    "lease",
+    "timeout",
+    "sqlite",
+    "writer",
+    "decision",
+    "refactor",
+    "migration",
+    "fn main()",
+    "let x = 42;",
+    "SELECT * FROM t",
+    "cargo test",
+    "ทดสอบ",
+    "ปัญหา",
+    "แก้ไข",
+    "embedding",
+    "queue",
+    "import_batch",
+    "git commit -m",
+    "ผู้ใช้",
+];
+
+/// Distinct rare tokens (`w0` .. `w20010`) a synthetic chunk draws from.
+pub const SYNTH_RARE: u64 = 20_011;
+
+/// A deterministic 600-900 character chunk of mixed Thai/English/code words. `seed` makes it
+/// unique; the first words carry `seed` so no two chunks are identical.
+fn synthetic_text(seed: u64) -> String {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let target = 600 + (next() % 301) as usize;
+    let mut t = format!("chunk-{seed:08}");
+    while t.chars().count() < target {
+        t.push(' ');
+        t.push_str(SYNTH_WORDS[(next() % SYNTH_WORDS.len() as u64) as usize]);
+        // Rare tokens, so a search for one is selective like a search in real history; the
+        // common words above match nearly every chunk.
+        if next() % 3 == 0 {
+            t.push_str(&format!(" w{}", next() % SYNTH_RARE));
+        }
+    }
+    t
+}
+
+/// A `sqlite_exact` palace of `drawers` drawers in `dir`: transcript chunks of 600-900 characters
+/// (a transcript per 100 drawers), 3% knowledge drawers and 5% repeats (a chunk that repeats the
+/// one before it in its transcript). Deterministic; no real data.
+pub fn synthetic_palace(dir: &Path, drawers: usize) -> SyntheticPalace {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut specs = Vec::with_capacity(drawers);
+    let (mut knowledge, mut repeats) = (0, 0);
+    let mut prev_text = String::new();
+    for i in 0..drawers {
+        let (t, j) = (i / 100, i % 100);
+        let text = synthetic_text(i as u64 + 1);
+        if matches!(j, 10 | 40 | 70) {
+            knowledge += 1;
+            specs.push(DrawerSpec {
+                id: format!("syn_k_{i:07}"),
+                text,
+                meta: DrawerMeta {
+                    wing: "pg-ai".into(),
+                    room: "decisions".into(),
+                    added_by: Some("claude-code".into()),
+                    filed_at: Some("2026-04-10T10:00:00".into()),
+                    ..Default::default()
+                },
+            });
+            continue;
+        }
+        let text = if j % 20 == 5 {
+            repeats += 1;
+            prev_text.clone()
+        } else {
+            text
+        };
+        prev_text = text.clone();
+        specs.push(DrawerSpec {
+            id: format!("syn_c_{i:07}"),
+            text,
+            meta: DrawerMeta {
+                wing: "sessions".into(),
+                room: "technical".into(),
+                source_file: Some(format!(
+                    "/h/.claude/projects/-Users-me-Code-p{}/s{t}.jsonl",
+                    t % 7
+                )),
+                ingest_mode: Some("convos".into()),
+                chunk_index: Some(j as i64),
+                authored_at: Some(format!("2026-04-16T11:{:02}:00", j % 60)),
+                filed_at: Some("2026-04-16T12:00:00".into()),
+                ..Default::default()
+            },
+        });
+    }
+    build_sqlite_exact(dir, &specs);
+    SyntheticPalace {
+        dir: dir.to_path_buf(),
+        drawers,
+        knowledge,
+        repeats,
+        chunk_drawers: drawers - knowledge,
+    }
+}

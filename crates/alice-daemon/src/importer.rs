@@ -4,8 +4,8 @@
 //! Phases: `snapshot` (copy the palace read-only into `ALICE_HOME/import-tmp/<job>/`), `survey`
 //! (one pass over every drawer: duplicates, chunk positions), then the planning passes
 //! (`knowledge`, `raw`) that turn drawers into what Alice would store. Without `dry_run` the
-//! planning passes hand their batches to the writer (one transaction each, closing at 200
-//! records or 64 KB of text and only between two drawers); a dry run does the same work and
+//! planning passes hand their batches to the writer (one transaction each, closing at 50
+//! records or 16 KB of text and only between two drawers); a dry run does the same work and
 //! only counts.
 //!
 //! Redaction is this module's contract: the writer stores what it is given. Everything that is
@@ -65,10 +65,12 @@ pub const STOPPED: &str = "daemon stopped; run the import again to continue";
 const KNOWLEDGE_GROUP: usize = 100;
 /// Drawers per page of the raw pass.
 const RAW_PAGE: usize = 2_000;
+/// Pause after each committed batch (spec §10: 20 clients stay under 50 ms while an import runs).
+const BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(2);
 /// A batch closes at this many records ...
-const BATCH_RECORDS: usize = 200;
+const BATCH_RECORDS: usize = 50;
 /// ... or this many bytes of text, whichever comes first, and only between two drawers.
-const BATCH_BYTES: usize = 64 * 1024;
+const BATCH_BYTES: usize = 16 * 1024;
 /// Collapsed pairs per batch (they carry no text): one writer slice.
 const COLLAPSED_PER_BATCH: usize = 200;
 /// Why a repeated chunk is not recorded: its keeper is not stored.
@@ -122,6 +124,7 @@ pub struct ImportEnv {
 }
 
 /// Test hook: makes the job wait (`hold`) or panic (`panic`) right after its snapshot is taken.
+#[doc(hidden)]
 #[derive(Default)]
 pub struct ImportHook {
     pub hold: AtomicBool,
@@ -901,6 +904,7 @@ impl Ctx<'_> {
     /// collapsed pairs the store could not record yet.
     fn submit(&mut self, batch: ImportBatch) -> Result<usize> {
         check_stop(&self.env.stop)?;
+        let (records, bytes) = batch.weight();
         match self
             .env
             .writer
@@ -908,6 +912,15 @@ impl Ctx<'_> {
         {
             WriteOutcome::Imported(out) => {
                 self.submitted += 1;
+                // A breath between batches: remembers that queued behind this one are served
+                // before the next one is built, so the import never keeps the writer busy back to back.
+                std::thread::sleep(BATCH_PAUSE);
+                {
+                    let mut st = self.env.status.lock();
+                    st.batches += 1;
+                    st.max_batch_records = st.max_batch_records.max(records as u64);
+                    st.max_batch_bytes = st.max_batch_bytes.max(bytes as u64);
+                }
                 Ok(self.absorb(out))
             }
             other => Err(AliceError::Other(format!(
@@ -1490,16 +1503,25 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     set_phase(&env.status, "snapshot");
     let t = Instant::now();
     let dir = env.home.import_tmp().join(job_id);
-    std::fs::create_dir_all(&dir)?;
     // The folder holds a raw, unredacted copy of the owner's history: private to its owner
     // (`snapshot` only sets the mode of a folder it creates itself).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for d in [dir.parent().unwrap_or(&dir), &dir] {
-            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
+    let prepare = || -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for d in [dir.parent().unwrap_or(&dir), &dir] {
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
+            }
         }
-    }
+        Ok(())
+    };
+    prepare().map_err(|e| {
+        AliceError::Other(format!(
+            "cannot write the import's working folder {} ({e}); make it writable and check free disk space, then run the import again to continue",
+            dir.parent().unwrap_or(&dir).display()
+        ))
+    })?;
     let _cleanup = SnapshotDir { dir: dir.clone() };
     let snap: Snapshot = snapshot(palace, &dir, env.mempalace_home.as_deref())?;
     if let Some(hook) = &env.hook {
@@ -1871,31 +1893,35 @@ mod tests {
 
     #[test]
     fn a_batch_closes_on_a_drawer_boundary_and_never_inside_one() {
-        // 100 + 150 would cross 200 records: the second drawer opens a new batch, whole.
+        let (r, by) = (BATCH_RECORDS, BATCH_BYTES);
+        // r/2 + 3r/4 would cross the record limit: the second drawer opens a new batch, whole.
         let got = drain(
             &mut Batcher::new(),
-            &[("d0", 100, 10), ("d1", 150, 10), ("d2", 1, 10)],
+            &[("d0", r / 2, 10), ("d1", r * 3 / 4, 10), ("d2", 1, 10)],
         );
         assert_eq!(got, vec![vec!["d0"], vec!["d1", "d2"]]);
         // A drawer over the whole budget is a batch of its own.
         let got = drain(
             &mut Batcher::new(),
-            &[("a", 1, 10), ("huge", 250, 10), ("b", 1, 10)],
+            &[("a", 1, 10), ("huge", r * 5, 10), ("b", 1, 10)],
         );
         assert_eq!(got, vec![vec!["a"], vec!["huge"], vec!["b"]]);
         // Bytes close a batch too.
         let got = drain(
             &mut Batcher::new(),
             &[
-                ("a", 1, 40_000),
-                ("b", 1, 30_000),
-                ("c", 1, 100_000),
+                ("a", 1, by * 5 / 8),
+                ("b", 1, by / 2),
+                ("c", 1, by * 2),
                 ("d", 1, 1),
             ],
         );
         assert_eq!(got, vec![vec!["a"], vec!["b"], vec!["c"], vec!["d"]]);
         // Exactly the limit still fits.
-        let got = drain(&mut Batcher::new(), &[("a", 100, 10), ("b", 100, 10)]);
+        let got = drain(
+            &mut Batcher::new(),
+            &[("a", r / 2, 10), ("b", r - r / 2, 10)],
+        );
         assert_eq!(got, vec![vec!["a", "b"]]);
         assert!(Batcher::<u8>::new().finish().is_none());
     }

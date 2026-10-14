@@ -66,6 +66,15 @@ pub struct ImportStatus {
     pub total: u64,
     pub report: Option<ImportReport>,
     pub error: Option<String>,
+    /// Writer batches the job has had committed so far.
+    #[serde(default)]
+    pub batches: u64,
+    /// The largest batch so far, in records and in bytes of text (a batch closes at 200 records
+    /// or 64 KB, so a short writer slice is visible here).
+    #[serde(default)]
+    pub max_batch_records: u64,
+    #[serde(default)]
+    pub max_batch_bytes: u64,
 }
 
 impl ImportStatus {
@@ -78,6 +87,9 @@ impl ImportStatus {
             total: 0,
             report: None,
             error: None,
+            batches: 0,
+            max_batch_records: 0,
+            max_batch_bytes: 0,
         }
     }
 }

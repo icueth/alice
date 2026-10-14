@@ -2106,6 +2106,183 @@ mod import {
         path.to_str().unwrap()
     }
 
+    // ---- Task 16: concurrency and crash safety
+
+    /// Hash of every file under `dir` (names and bytes), to prove a palace was never written.
+    fn tree_hash(dir: &std::path::Path) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        names.sort();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for n in names {
+            n.file_name().hash(&mut h);
+            std::fs::read(&n).unwrap().hash(&mut h);
+        }
+        h.finish()
+    }
+
+    impl Env {
+        /// `alice …` as `alice()` runs it, but as a child left running.
+        fn alice_child(&self, args: &[&str]) -> std::process::Child {
+            let fake_home = self._dir.path().join("fake-home");
+            std::fs::create_dir_all(&fake_home).unwrap();
+            self.cmd(args)
+                .env("HOME", &fake_home)
+                .env_remove("MEMPALACE_PALACE_PATH")
+                .env_remove("MEMPAL_PALACE_PATH")
+                .env("ALICE_JUDGE_PROVIDER", "heuristic")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn kill_minus_nine_during_an_import_loses_nothing_and_the_rerun_finishes_exactly() {
+        let e = Env::new();
+        let palace_dir = e._dir.path().join("palace");
+        let n = std::env::var("ALICE_TEST_BULK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000usize);
+        let fx = alice_core::import::fixture::synthetic_palace(&palace_dir, n);
+        let before = tree_hash(&palace_dir);
+
+        // 1. the import runs in the background; wait until 3,000 drawers are done
+        let importer =
+            e.alice_child(&["--json", "import", "mempalace", "--palace", p(&palace_dir)]);
+        let started = Instant::now();
+        loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(600),
+                "import never got going"
+            );
+            let st = e.alice(&["--json", "import", "status"]);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&st.stdout)
+                && v["state"] == "running"
+                && v["done"].as_u64().unwrap_or(0) >= 3_000
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+
+        // 2. twenty acknowledged remembers, then SIGKILL
+        let mut acked = Vec::new();
+        for i in 0..20 {
+            let out = e.alice(&["--json", "remember", &format!("acked before kill {i}")]);
+            assert!(out.status.success(), "{}", out.stderr);
+            let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+            assert_eq!(v["status"], "new", "{v}");
+            acked.push(v["id"].as_str().unwrap().to_string());
+        }
+        let pid = e.daemon_pid().unwrap();
+        // SAFETY: killing the daemon this test started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        eventually(|| !alive(pid), "the killed daemon to go away");
+        let out = importer.wait_with_output().unwrap();
+        assert!(
+            !out.status.success(),
+            "the client of a killed daemon cannot succeed"
+        );
+
+        // 3. any call restarts the daemon, which sweeps import-tmp; the rerun finishes
+        let r = e.alice(&["--json", "recall", "acked before kill"]);
+        assert!(r.status.success(), "{}", r.stderr);
+        let tmp = e.home.join("import-tmp");
+        let left = std::fs::read_dir(&tmp).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0, "import-tmp was swept at daemon start");
+        let run = |label: &str| -> ImportReport {
+            let o = e.alice(&["--json", "import", "mempalace", "--palace", p(&palace_dir)]);
+            assert!(o.status.success(), "{label}: {}\n{}", o.stderr, o.stdout);
+            let r: ImportReport = serde_json::from_str(&o.stdout).unwrap();
+            assert!(r.errors.is_empty(), "{label}: {:?}", r.errors);
+            r
+        };
+        let second = run("rerun");
+        assert_eq!(second.drawers_seen as usize, n);
+        // 4. the third run finds everything stored
+        let third = run("third");
+        assert_eq!(third.tiers.knowledge, 0);
+        assert_eq!(third.tiers.raw_session_chunks, 0);
+        assert_eq!(third.tiers.raw_file_chunks, 0);
+        assert_eq!(third.already_imported, third.drawers_seen);
+        assert_eq!(third.already_imported as usize, n);
+
+        // stop the daemon, then look at the database on its own
+        e.ok(&["daemon", "stop"]);
+        let db = rusqlite::Connection::open_with_flags(
+            alice_daemon::paths::AliceHome::new(e.home.clone()).db(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let check: String = db
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        let count = |sql: &str| -> usize {
+            db.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap() as usize
+        };
+        for id in &acked {
+            let k = db
+                .query_row("SELECT count(*) FROM memories WHERE id = ?1", [id], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
+            assert_eq!(k, 1, "acknowledged {id} is lost");
+        }
+        assert_eq!(
+            count("SELECT count(*) FROM memories WHERE legacy_id IS NOT NULL"),
+            fx.knowledge
+        );
+        let chunks = count("SELECT count(*) FROM chunks");
+        let collapsed =
+            count("SELECT count(*) FROM legacy_ids WHERE target_type = 'chunk'") - chunks;
+        assert_eq!(chunks + collapsed, fx.chunk_drawers);
+        assert_eq!(collapsed, fx.repeats);
+        assert_eq!(tree_hash(&palace_dir), before, "the palace was not touched");
+    }
+
+    #[test]
+    fn a_target_that_cannot_be_written_fails_cleanly_and_resumes() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        // The daemon is up first (it sweeps import-tmp at start), then the folder is made unwritable.
+        e.ok(&["daemon", "start"]);
+        let tmp = e.home.join("import-tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = std::fs::File::create(tmp.join("probe")).is_ok();
+        if writable {
+            // Running as root: permissions do not bind; nothing to prove.
+            let _ = std::fs::remove_file(tmp.join("probe"));
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let o = e.alice(&["import", "mempalace", "--palace", p(&palace)]);
+        assert_eq!(o.status.code(), Some(1), "{}\n{}", o.stderr, o.stdout);
+        assert!(
+            o.stderr.contains("import failed") && o.stderr.contains("import-tmp"),
+            "the sentence names the folder: {}",
+            o.stderr
+        );
+        let st = e.alice(&["--json", "import", "status"]);
+        let v: serde_json::Value = serde_json::from_str(&st.stdout).unwrap();
+        assert_eq!(v["state"], "failed", "{v}");
+        // Permissions back: the rerun succeeds.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let o = e.alice(&["--json", "import", "mempalace", "--palace", p(&palace)]);
+        assert!(o.status.success(), "{}\n{}", o.stderr, o.stdout);
+        let r: ImportReport = serde_json::from_str(&o.stdout).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.tiers.knowledge, 3);
+    }
+
     #[test]
     fn import_dry_run_prints_the_report_and_changes_nothing() {
         let e = Env::new();
