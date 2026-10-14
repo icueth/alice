@@ -264,14 +264,15 @@ pub(crate) fn changed_keys(a: &Settings, b: &Settings) -> Vec<String> {
         .collect()
 }
 
-/// The settings-change loop: `on_change(changed keys)` for every change that took effect.
+/// The settings-change loop: `on_change(changed keys, protective keys that got weaker)` for
+/// every change that took effect.
 /// After missed notifications (`Lagged`) it diffs the current settings against the last ones it
 /// saw: it never stops on a lag, only when the channel closes.
 pub(crate) fn follow_settings(
     mut rx: tokio::sync::broadcast::Receiver<Vec<String>>,
     start: Arc<Settings>,
     current: impl Fn() -> Arc<Settings>,
-    mut on_change: impl FnMut(Vec<String>),
+    mut on_change: impl FnMut(Vec<String>, Vec<String>),
 ) {
     use tokio::sync::broadcast::error::RecvError;
     let mut last = start;
@@ -287,9 +288,11 @@ pub(crate) fn follow_settings(
             }
             Err(RecvError::Closed) => break,
         };
-        last = current();
+        let now = current();
+        let loosened = loosened_protections(&last, &now);
+        last = now;
         if !changed.is_empty() {
-            on_change(changed);
+            on_change(changed, loosened);
         }
     }
 }
@@ -1366,7 +1369,7 @@ mod tests {
             rx,
             Arc::new(Settings::default()),
             || now.clone(),
-            |c| seen.push(c),
+            |c, _| seen.push(c),
         );
         assert_eq!(
             seen,

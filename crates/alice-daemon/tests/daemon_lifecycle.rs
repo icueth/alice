@@ -21,6 +21,7 @@ fn spawn(home: &AliceHome) -> Running {
             DaemonOptions {
                 port: 0,
                 fake_embedder: true,
+                settings_env: Some(Vec::new()),
             },
         )
     })

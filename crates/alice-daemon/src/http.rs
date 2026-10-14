@@ -371,8 +371,9 @@ async fn settings_schema() -> Json<serde_json::Value> {
 
 fn secret_name(name: &str) -> Result<SecretName, ApiError> {
     SecretName::parse(name).ok_or_else(|| {
+        // The name is not echoed: a secret pasted by mistake where the name goes would be.
         ApiError(AliceError::invalid(format!(
-            "unknown secret \"{name}\"; use one of: {}",
+            "unknown secret name; use one of: {}",
             SecretName::ALL
                 .iter()
                 .map(|n| n.as_str())

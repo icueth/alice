@@ -36,15 +36,19 @@ impl Env {
 
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(BIN);
+        // Nothing of the developer's shell reaches the daemon: no `ALICE_*` setting or key
+        // (a `TYPESAFE_API_KEY` too); only what a test sets.
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("ALICE_") {
+                c.env_remove(&k);
+            }
+        }
         c.args(args)
             .current_dir(&self.work)
             .env("ALICE_HOME", &self.home)
             .env("ALICE_EMBEDDER", "fake")
             .env("ALICE_LOG", "warn")
-            .env_remove("ALICE_AGENT")
-            // A developer's own keys must not change what a test sees (or reach its daemon).
-            .env_remove("TYPESAFE_API_KEY")
-            .env_remove("ALICE_EMBEDDING_API_KEY");
+            .env_remove("TYPESAFE_API_KEY");
         c
     }
 

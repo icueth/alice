@@ -377,6 +377,11 @@ pub struct PatchResponse {
     pub changed: Vec<String>,
     pub restart_required: Vec<String>,
     pub overridden_by_env: Vec<String>,
+    /// What the change did that is worth knowing: a protective setting that was loosened (a
+    /// change through the API applies at once, where the same edit of config.toml waits for
+    /// three polls), keys saved but not used yet.
+    #[serde(default)]
+    pub notes: Vec<String>,
     /// The settings after the change.
     pub view: SettingsView,
 }

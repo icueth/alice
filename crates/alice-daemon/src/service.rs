@@ -58,6 +58,9 @@ pub struct ServiceOptions {
     pub detect_project: fn(&Path) -> ProjectRef,
     /// Settings to use; `None` loads `config.toml` and `ALICE_*` from the home.
     pub settings: Option<Arc<SettingsHandle>>,
+    /// The `ALICE_*` variables the settings see when `settings` is `None`; `None`: the
+    /// process's. Tests pass an empty list so a developer's shell cannot change them.
+    pub settings_env: Option<Vec<(String, String)>>,
     /// How often `config.toml` is checked for edits.
     pub settings_poll: Duration,
     /// How often the event stream checks whether the health changed (tests shorten it).
@@ -79,6 +82,7 @@ impl Default for ServiceOptions {
             vector_reader_pool: 4,
             detect_project,
             settings: None,
+            settings_env: None,
             settings_poll: crate::config::SETTINGS_POLL,
             health_tick: Duration::from_secs(5),
             secrets: None,
@@ -244,9 +248,15 @@ pub struct Service {
     started_with: Arc<Settings>,
     secrets: Arc<dyn SecretStore>,
     secret_env: SecretEnv,
-    /// A read of the secrets' status is in flight (it may be stuck on a keychain prompt): no
-    /// second one starts until it ends.
-    secrets_busy: Arc<AtomicBool>,
+    /// The read of the secrets' status in flight (it may be stuck on a keychain prompt):
+    /// requests that overlap it wait for it instead of starting another.
+    secrets_read: Arc<Mutex<Option<SecretsRead>>>,
+    /// One write to the secrets store at a time; a second waits (up to the timeout) rather than
+    /// parking another thread behind a stuck store.
+    secrets_write: Arc<tokio::sync::Mutex<()>>,
+    /// Tests: time added to the age of the shared health reading.
+    #[cfg(test)]
+    health_aged: Mutex<Duration>,
     /// Readings of the health (tests count them).
     #[cfg(test)]
     health_reads: std::sync::atomic::AtomicUsize,
@@ -340,14 +350,20 @@ fn spawn_config_events(settings: &Arc<SettingsHandle>, writer: &WriterHandle) ->
                 rx,
                 start,
                 move || weak.upgrade().map(|h| h.get()).unwrap_or_default(),
-                move |changed| {
+                move |changed, loosened| {
+                    // Keys only, never a value. `loosened` names the protective keys that got
+                    // weaker, so the history shows a loosening whoever typed it.
+                    let mut after = serde_json::json!({ "changed": changed });
+                    if !loosened.is_empty() {
+                        after["loosened"] = serde_json::json!(loosened);
+                    }
                     writer.send_nowait(WriteOp::RecordEvent {
                         actor: Actor::User,
                         action: crate::writer::SETTINGS_CHANGE.into(),
                         target_type: "settings".into(),
                         target_id: "config".into(),
                         before: None,
-                        after: Some(serde_json::json!({ "changed": changed })),
+                        after: Some(after),
                     });
                 },
             )
@@ -355,12 +371,27 @@ fn spawn_config_events(settings: &Arc<SettingsHandle>, writer: &WriterHandle) ->
     Ok(())
 }
 
-/// Clears the "secrets read in flight" flag when the read ends, however it ends.
-struct BusyGuard(Arc<AtomicBool>);
+/// What to tell about a key that is saved but read by nothing yet.
+fn not_used_yet_note(key: &str) -> String {
+    format!(
+        "{key} is saved but not used yet: other embedding providers are not wired in, so the local model is always used and a restart changes nothing"
+    )
+}
 
-impl Drop for BusyGuard {
+type SecretStatuses = BTreeMap<String, SecretStatus>;
+
+/// A read of the secrets' status that is running: when it began, and where its answer arrives.
+struct SecretsRead {
+    started: Instant,
+    answer: tokio::sync::watch::Receiver<Option<SecretStatuses>>,
+}
+
+/// Ends the "read in flight" record when the read ends, however it ends.
+struct ReadDone(Arc<Mutex<Option<SecretsRead>>>);
+
+impl Drop for ReadDone {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        *self.0.lock() = None;
     }
 }
 
@@ -376,7 +407,10 @@ impl Service {
         let settings = opts
             .settings
             .clone()
-            .unwrap_or_else(|| SettingsHandle::load(&home));
+            .unwrap_or_else(|| match &opts.settings_env {
+                Some(env) => SettingsHandle::load_with_env(&home, env.clone()),
+                None => SettingsHandle::load(&home),
+            });
         let started_with = settings.get();
         let secrets = opts
             .secrets
@@ -442,8 +476,14 @@ impl Service {
             // `embedding.batch_size` (a restart key: the worker is built once).
             batch: started_with.embedding.batch_size,
         });
+        if let Err(e) = spawn_config_events(&settings, &writer) {
+            // The worker and the writer are running already: stop them, do not leak them.
+            stop.store(true, Ordering::SeqCst);
+            let _ = wake_tx.try_send(());
+            writer.send_nowait(WriteOp::Shutdown);
+            return Err(e);
+        }
         let watcher = settings.spawn_watcher(opts.settings_poll, stop.clone());
-        spawn_config_events(&settings, &writer)?;
         let resolver = ProjectResolver::new(opts.detect_project);
         Ok(Arc::new(Service {
             home,
@@ -463,7 +503,10 @@ impl Service {
             started_with,
             secrets,
             secret_env,
-            secrets_busy: Arc::new(AtomicBool::new(false)),
+            secrets_read: Arc::new(Mutex::new(None)),
+            secrets_write: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            health_aged: Mutex::new(Duration::ZERO),
             #[cfg(test)]
             health_reads: std::sync::atomic::AtomicUsize::new(0),
         }))
@@ -880,12 +923,16 @@ impl Service {
         // Fresh for half a tick: a client's tick can land just before this one's reading is a
         // tick old, and must not then wait a whole tick for the next one.
         if let Some((at, h)) = cached.as_ref()
-            && at.elapsed() < self.opts.health_tick / 2
+            && self.age_of(*at) < self.opts.health_tick / 2
         {
             return Ok(h.clone());
         }
         let h = self.health().await?;
         *cached = Some((Instant::now(), h.clone()));
+        #[cfg(test)]
+        {
+            *self.health_aged.lock() = Duration::ZERO;
+        }
         Ok(h)
     }
 
@@ -966,6 +1013,12 @@ impl Service {
                 "secrets.backend is {now} but this daemon started with {was}; the change applies after `alice daemon stop` and the next start, and the secrets are not copied: under {now} they show as not set until you set them again with `alice config set-secret <name>`"
             ));
         }
+        for k in restart_pending
+            .iter()
+            .filter(|k| settings::NOT_USED_YET_KEYS.contains(&k.as_str()))
+        {
+            notes.push(not_used_yet_note(k));
+        }
         if self.settings.loosening_waiting() {
             notes.push(format!(
                 "config.toml loosens a protection (redaction, a cloud denylist or a budget); it applies once it reads the same on {} polls in a row (about {} s), so a half-written save never switches protections off. The settings in force are unchanged until then",
@@ -992,27 +1045,50 @@ impl Service {
         self.view_with(self.secret_statuses(), Vec::new())
     }
 
+    /// The secrets' status for a request handler, read off the runtime's threads. Requests that
+    /// overlap share one read. A read that has been running longer than `secrets_timeout` (a
+    /// keychain waiting for a prompt) is not waited for: `None`, with the answer unknown.
+    async fn secret_statuses_shared(self: &Arc<Self>) -> Option<SecretStatuses> {
+        let (started, mut answer) = {
+            let mut running = self.secrets_read.lock();
+            match running.as_ref() {
+                Some(r) => (r.started, r.answer.clone()),
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    let started = Instant::now();
+                    *running = Some(SecretsRead {
+                        started,
+                        answer: rx.clone(),
+                    });
+                    let me = self.clone();
+                    let done = ReadDone(self.secrets_read.clone());
+                    tokio::task::spawn_blocking(move || {
+                        let _done = done;
+                        let statuses = me.secret_statuses();
+                        let _ = tx.send(Some(statuses));
+                    });
+                    (started, rx)
+                }
+            }
+        };
+        let wait = self.opts.secrets_timeout.saturating_sub(started.elapsed());
+        match tokio::time::timeout(wait, answer.wait_for(|a| a.is_some())).await {
+            Ok(Ok(statuses)) => statuses.clone(),
+            Ok(Err(_)) => {
+                tracing::warn!("reading the secrets' status failed");
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
     /// `settings_view` for a request handler: the secrets are read off the runtime's threads
     /// and given `secrets_timeout`; a store that does not answer (a keychain waiting for a
-    /// prompt) leaves them as not set, with a note, and no second read starts while one is
-    /// still stuck.
+    /// prompt) leaves them as not set, with a note, and overlapping requests share one read.
     pub async fn settings_view_async(self: &Arc<Self>) -> SettingsView {
-        if self.secrets_busy.swap(true, Ordering::SeqCst) {
-            return self.view_with(Self::unknown_secrets(), vec![self.secrets_silent_note()]);
-        }
-        let guard = BusyGuard(self.secrets_busy.clone());
-        let me = self.clone();
-        let read = tokio::task::spawn_blocking(move || {
-            let _guard = guard;
-            me.secret_statuses()
-        });
-        match tokio::time::timeout(self.opts.secrets_timeout, read).await {
-            Ok(Ok(secrets)) => self.view_with(secrets, Vec::new()),
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "reading the secrets' status failed");
-                self.view_with(Self::unknown_secrets(), Vec::new())
-            }
-            Err(_) => self.view_with(Self::unknown_secrets(), vec![self.secrets_silent_note()]),
+        match self.secret_statuses_shared().await {
+            Some(secrets) => self.view_with(secrets, Vec::new()),
+            None => self.view_with(Self::unknown_secrets(), vec![self.secrets_silent_note()]),
         }
     }
 
@@ -1022,15 +1098,40 @@ impl Service {
         &self,
         changes: serde_json::Map<String, serde_json::Value>,
     ) -> std::result::Result<PatchResponse, Vec<SettingError>> {
+        let before = self.settings.get();
         let out = self.settings.patch(&changes)?;
-        Ok(self.patch_response(out, self.settings_view()))
+        Ok(self.patch_response(&before, out, self.settings_view()))
     }
 
-    fn patch_response(&self, out: PatchOutcome, view: SettingsView) -> PatchResponse {
+    /// The answer to a change, with the notes it earns: a protective setting loosened (applied at
+    /// once, where the same edit of config.toml waits), keys saved but not used yet.
+    fn patch_response(
+        &self,
+        before: &Settings,
+        out: PatchOutcome,
+        view: SettingsView,
+    ) -> PatchResponse {
+        let mut notes = Vec::new();
+        let loosened = settings::loosened_protections(before, &self.settings.get());
+        if !loosened.is_empty() {
+            notes.push(format!(
+                "{} loosened and applied at once: a change through the API or `alice config set` is a complete, deliberate write, where the same edit typed into config.toml waits to be read the same on {} polls in a row",
+                loosened.join(", "),
+                settings::LOOSEN_POLLS
+            ));
+        }
+        for k in out
+            .changed
+            .iter()
+            .filter(|k| settings::NOT_USED_YET_KEYS.contains(&k.as_str()))
+        {
+            notes.push(not_used_yet_note(k));
+        }
         PatchResponse {
             changed: out.changed,
             restart_required: out.restart_required,
             overridden_by_env: out.overridden_by_env,
+            notes,
             view,
         }
     }
@@ -1042,6 +1143,7 @@ impl Service {
         changes: serde_json::Map<String, serde_json::Value>,
     ) -> std::result::Result<PatchResponse, Vec<SettingError>> {
         let me = self.clone();
+        let before = self.settings.get();
         let out = tokio::task::spawn_blocking(move || me.settings.patch(&changes))
             .await
             .map_err(|e| {
@@ -1051,7 +1153,7 @@ impl Service {
                 }]
             })??;
         let view = self.settings_view_async().await;
-        Ok(self.patch_response(out, view))
+        Ok(self.patch_response(&before, out, view))
     }
 
     /// Store a secret. Blocking when the store is (see `set_secret_async`). The event records
@@ -1090,19 +1192,34 @@ impl Service {
     }
 
     /// Runs `f` (a call into the secrets store) off the runtime's threads, for at most
-    /// `secrets_timeout`.
+    /// `secrets_timeout` in all. One call at a time: a second waits for the first, and gives up
+    /// with the same error when the store stays stuck, without parking a thread of its own.
     async fn secrets_call<T: Send + 'static>(
         &self,
         f: impl FnOnce() -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        match tokio::time::timeout(self.opts.secrets_timeout, tokio::task::spawn_blocking(f)).await
-        {
-            Ok(done) => done.map_err(join_err)?,
-            Err(_) => Err(AliceError::Other(format!(
+        let silent = || {
+            AliceError::Other(format!(
                 "the {} did not answer within {} ms; unlock it or approve its prompt, then try again (a change that was asked for may still land: see `alice config list`)",
                 self.secrets_store_name(),
                 self.opts.secrets_timeout.as_millis()
-            ))),
+            ))
+        };
+        let started = Instant::now();
+        let turn = tokio::time::timeout(
+            self.opts.secrets_timeout,
+            self.secrets_write.clone().lock_owned(),
+        )
+        .await
+        .map_err(|_| silent())?;
+        let wait = self.opts.secrets_timeout.saturating_sub(started.elapsed());
+        let task = tokio::task::spawn_blocking(move || {
+            let _turn = turn;
+            f()
+        });
+        match tokio::time::timeout(wait, task).await {
+            Ok(done) => done.map_err(join_err)?,
+            Err(_) => Err(silent()),
         }
     }
 
@@ -1173,13 +1290,22 @@ impl Service {
         self.health_reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Tests: make the shared health reading `by` older.
+    /// Tests: make the shared health reading `by` older (a clock offset: it works however
+    /// long the machine has been up).
     #[cfg(test)]
     pub(crate) async fn age_stream_health(&self, by: Duration) {
-        if let Some((at, _)) = self.stream_health.lock().await.as_mut() {
-            *at = at
-                .checked_sub(by)
-                .expect("the machine has been up longer than the test ages a reading");
+        *self.health_aged.lock() += by;
+    }
+
+    /// How old a reading taken at `at` is.
+    fn age_of(&self, at: Instant) -> Duration {
+        #[cfg(test)]
+        {
+            at.elapsed() + *self.health_aged.lock()
+        }
+        #[cfg(not(test))]
+        {
+            at.elapsed()
         }
     }
 
@@ -1311,6 +1437,8 @@ mod tests {
     fn quiet() -> ServiceOptions {
         ServiceOptions {
             secret_env: Some(Arc::new(|_| None)),
+            // No `ALICE_*` variable of the developer's shell reaches the settings.
+            settings_env: Some(Vec::new()),
             ..Default::default()
         }
     }
@@ -2454,6 +2582,9 @@ mod tests {
     struct MemSecrets {
         map: Mutex<HashMap<SecretName, String>>,
         delay_ms: std::sync::atomic::AtomicU64,
+        /// Calls that reached the store.
+        gets: std::sync::atomic::AtomicUsize,
+        sets: std::sync::atomic::AtomicUsize,
     }
 
     impl MemSecrets {
@@ -2461,6 +2592,8 @@ mod tests {
             Arc::new(Self {
                 map: Mutex::default(),
                 delay_ms: std::sync::atomic::AtomicU64::new(delay.as_millis() as u64),
+                gets: Default::default(),
+                sets: Default::default(),
             })
         }
         fn wait(&self) {
@@ -2471,10 +2604,12 @@ mod tests {
 
     impl SecretStore for MemSecrets {
         fn get(&self, name: SecretName) -> Result<Option<SecretValue>> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
             self.wait();
             Ok(self.map.lock().get(&name).map(SecretValue::new))
         }
         fn set(&self, name: SecretName, value: &str) -> Result<()> {
+            self.sets.fetch_add(1, Ordering::SeqCst);
             self.wait();
             self.map.lock().insert(name, value.trim().to_string());
             Ok(())
@@ -2628,7 +2763,10 @@ mod tests {
     async fn secrets_are_write_only_and_their_events_carry_no_value() {
         let (_d, s) = svc().await;
         let st = s
-            .set_secret(SecretName::EmbeddingApiKey, "sk-test-0123456789abcd".into())
+            .set_secret(
+                SecretName::EmbeddingApiKey,
+                concat!("sk-", "test-0123456789abcd").into(),
+            )
             .unwrap();
         assert_eq!((st.set, st.hint.as_deref()), (true, Some("••••abcd")));
         let view = s.settings_view();
@@ -2920,26 +3058,196 @@ mod tests {
         let started = Instant::now();
         let again = s.settings_view_async().await;
         assert!(
-            started.elapsed() < Duration::from_millis(50),
+            started.elapsed() < Duration::from_millis(300),
             "{:?}",
             started.elapsed()
         );
         assert!(again.notes.iter().any(|n| n.contains("keychain")));
         // Writes give up with an error that says what to do.
         let err = s
-            .set_secret_async(SecretName::JevApiKey, "ts_secret_value_1234".into())
+            .set_secret_async(
+                SecretName::JevApiKey,
+                concat!("ts_", "secret_value_1234").into(),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("did not answer"), "{err}");
         // Once the prompt is answered and the stuck read has ended, the view is back to normal.
         store.delay_ms.store(0, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(1_500)).await;
-        let view = s.settings_view_async().await;
-        assert!(
-            view.notes.iter().all(|n| !n.contains("did not answer")),
-            "{:?}",
-            view.notes
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let view = s.settings_view_async().await;
+            if view.notes.iter().all(|n| !n.contains("did not answer")) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the view never recovered: {:?}",
+                view.notes
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Two requests that overlap share one read of the store: both see the stored key, and
+    /// neither is told the store did not answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overlapping_reads_share_one_read_of_the_store() {
+        let d = tempfile::tempdir().unwrap();
+        let store = MemSecrets::new(Duration::ZERO);
+        store
+            .set(SecretName::JevApiKey, concat!("ts_", "secret_value_1234"))
+            .unwrap();
+        store.delay_ms.store(300, Ordering::SeqCst);
+        store.gets.store(0, Ordering::SeqCst);
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                secrets: Some(store.clone()),
+                secrets_timeout: Duration::from_secs(20),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        let (a, b) = tokio::join!(s.settings_view_async(), s.settings_view_async());
+        for v in [&a, &b] {
+            assert!(v.secrets["jev_api_key"].set, "{:?}", v.secrets);
+            assert!(
+                v.notes.iter().all(|n| !n.contains("did not answer")),
+                "{:?}",
+                v.notes
+            );
+        }
+        assert_eq!(
+            store.gets.load(Ordering::SeqCst),
+            SecretName::ALL.len(),
+            "one read for both requests"
         );
+        // A PATCH answer next to a GET is the same case.
+        let (p, g) = tokio::join!(
+            s.patch_settings_async(patch_one("judge.review_threshold", serde_json::json!(0.6))),
+            s.settings_view_async()
+        );
+        assert!(p.unwrap().view.secrets["jev_api_key"].set);
+        assert!(g.secrets["jev_api_key"].set);
+    }
+
+    /// Writes against a stuck store wait for the one in flight (up to the timeout) instead of
+    /// parking a thread each.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writes_against_a_stuck_store_do_not_pile_up() {
+        let d = tempfile::tempdir().unwrap();
+        let store = MemSecrets::new(Duration::from_millis(600));
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                secrets: Some(store.clone()),
+                secrets_timeout: Duration::from_millis(100),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let err = s
+                .set_secret_async(
+                    SecretName::JevApiKey,
+                    concat!("ts_", "secret_value_1234").into(),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("did not answer"), "{err}");
+        }
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(
+            store.sets.load(Ordering::SeqCst),
+            1,
+            "only the first write reached the store"
+        );
+    }
+
+    /// A change through the API applies at once, where the same edit of config.toml waits for
+    /// three polls: the answer says so for a loosening, and not for a tightening.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loosening_through_the_api_is_announced_and_a_tightening_is_not() {
+        let (_d, s) = svc().await;
+        let out = s
+            .patch_settings_async(patch_one("privacy.redact", serde_json::json!(false)))
+            .await
+            .unwrap();
+        assert!(!s.settings().privacy.redact, "applied at once");
+        let note = out
+            .notes
+            .iter()
+            .find(|n| n.contains("privacy.redact"))
+            .unwrap_or_else(|| panic!("{:?}", out.notes));
+        assert!(
+            note.contains("at once") && note.contains("3 polls"),
+            "{note}"
+        );
+        let ev = wait_events(&s, "config", |ev| {
+            ev.iter().any(|e| e.action == "settings.change")
+        })
+        .await;
+        assert_eq!(ev[0].actor, "user");
+        assert_eq!(
+            ev[0].after,
+            Some(
+                serde_json::json!({"changed": ["privacy.redact"], "loosened": ["privacy.redact"]})
+            )
+        );
+        let out = s
+            .patch_settings_async(patch_one("privacy.redact", serde_json::json!(true)))
+            .await
+            .unwrap();
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        let out = s
+            .patch_settings_async(patch_one("judge.review_threshold", serde_json::json!(0.6)))
+            .await
+            .unwrap();
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+    }
+
+    /// Until Task 16 nothing reads the embedding provider, model or endpoint: say so instead
+    /// of promising an effect after a restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embedding_keys_that_nothing_reads_yet_say_so() {
+        let (_d, s) = svc().await;
+        let view = s.settings_view();
+        for k in [
+            "embedding.provider",
+            "embedding.model",
+            "embedding.endpoint",
+        ] {
+            assert!(
+                view.keys.iter().any(|i| i.key == k && i.not_used_yet),
+                "{k}"
+            );
+        }
+        assert!(
+            view.keys
+                .iter()
+                .any(|i| i.key == "embedding.batch_size" && !i.not_used_yet)
+        );
+        let out = s
+            .patch_settings_async(patch_one(
+                "embedding.endpoint",
+                serde_json::json!("http://127.0.0.1:11434"),
+            ))
+            .await
+            .unwrap();
+        let note = out
+            .notes
+            .iter()
+            .find(|n| n.contains("embedding.endpoint"))
+            .unwrap_or_else(|| panic!("{:?}", out.notes));
+        assert!(note.contains("not used yet"), "{note}");
+        let out = s
+            .patch_settings_async(patch_one("embedding.batch_size", serde_json::json!(16)))
+            .await
+            .unwrap();
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
     }
 
     #[tokio::test(flavor = "multi_thread")]

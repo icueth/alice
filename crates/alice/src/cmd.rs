@@ -329,6 +329,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<()> {
             DaemonOptions {
                 port: 0,
                 fake_embedder: std::env::var("ALICE_EMBEDDER").is_ok_and(|v| v == "fake"),
+                settings_env: None,
             },
         ),
         Command::Mcp => rt()?.block_on(alice_daemon::mcp::run_stdio(home, launcher())),
@@ -598,8 +599,10 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
     }
 }
 
-/// How long `config edit` waits after the editor closes: one poll of the daemon's watcher.
-const EDIT_SETTLE: Duration = Duration::from_millis(2_500);
+/// How long `config edit` waits, at most, for the daemon to show what an edit did (the daemon
+/// looks at the file every 2 s), and how often it asks.
+const EDIT_WAIT: Duration = Duration::from_secs(5);
+const EDIT_POLL: Duration = Duration::from_millis(200);
 
 /// The text of `value` for a person: text without quotes, anything else as JSON.
 fn plain(value: &serde_json::Value) -> String {
@@ -644,10 +647,19 @@ async fn config(home: &AliceHome, c: ConfigCmd, json: bool) -> Result<()> {
                         Some(Source::Env { var }) => format!(" (${var})"),
                         _ => String::new(),
                     };
-                    out.push_str(&format!("{key} = {value}{src}\n"));
+                    let unused = if v.keys.iter().any(|i| i.key == key && i.not_used_yet) {
+                        " (not used yet)"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!("{key} = {value}{src}{unused}\n"));
                 }
                 out.push_str(&settings_notes(&v));
-                for k in &v.restart_pending {
+                for k in v
+                    .restart_pending
+                    .iter()
+                    .filter(|k| !v.keys.iter().any(|i| &i.key == *k && i.not_used_yet))
+                {
                     out.push_str(&format!(
                         "RESTART {k} changes after `alice daemon stop` and the next start\n"
                     ));
@@ -695,6 +707,8 @@ async fn config(home: &AliceHome, c: ConfigCmd, json: bool) -> Result<()> {
                     "set $EDITOR (or $VISUAL) to edit config.toml, or use `alice config set`",
                 )?;
             home.ensure_dirs()?;
+            let before = client.settings().await?;
+            let text_before = std::fs::read(home.config_file()).ok();
             // "code -w" is a program and its arguments.
             let mut words = editor.split_whitespace();
             let program = words.next().context("$EDITOR is empty")?;
@@ -704,12 +718,36 @@ async fn config(home: &AliceHome, c: ConfigCmd, json: bool) -> Result<()> {
                 .status()
                 .with_context(|| format!("cannot run the editor {program}"))?;
             anyhow::ensure!(status.success(), "the editor exited with {status}");
-            tokio::time::sleep(EDIT_SETTLE).await;
-            let v = client.settings().await?;
+            // Wait for the daemon to show what the edit did (it looks at the file every 2 s),
+            // not for a fixed time; an edit that changes nothing it shows (a comment) is given
+            // EDIT_WAIT and then reported as it is.
+            let edited = std::fs::read(home.config_file()).ok() != text_before;
+            let deadline = Instant::now() + EDIT_WAIT;
+            let v = loop {
+                let v = client.settings().await?;
+                let moved = v.settings != before.settings
+                    || v.errors != before.errors
+                    || v.notes != before.notes;
+                if !edited || moved || Instant::now() >= deadline {
+                    break v;
+                }
+                tokio::time::sleep(EDIT_POLL).await;
+            };
             eprint!("{}", settings_notes(&v));
             Ok(())
         }
         ConfigCmd::SetSecret { name } => {
+            // Before anything is read: a wrong name must not cost a pasted secret. The name is
+            // not echoed in the error (it may be the secret itself, typed in the wrong place).
+            anyhow::ensure!(
+                alice_daemon::secrets::SecretName::parse(&name).is_some(),
+                "unknown secret name; use one of: {}",
+                alice_daemon::secrets::SecretName::ALL
+                    .iter()
+                    .map(|n| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             let value = read_secret(&format!("Paste {name} and press Enter: "))?;
             let s = client.set_secret(&name, &value).await?;
             print(json, &s, || {
@@ -757,7 +795,11 @@ async fn patch(
         } else {
             format!("{key}: applied\n")
         };
-        if !r.restart_required.is_empty() {
+        let needs_restart = r
+            .restart_required
+            .iter()
+            .any(|k| !r.view.keys.iter().any(|i| &i.key == k && i.not_used_yet));
+        if needs_restart {
             out.push_str("takes effect after `alice daemon stop` and the next start\n");
         }
         if !r.overridden_by_env.is_empty() {
@@ -766,7 +808,11 @@ async fn patch(
                 alice_core::settings::env_var(&key)
             ));
         }
-        for n in &r.view.notes {
+        for n in r
+            .notes
+            .iter()
+            .chain(r.view.notes.iter().filter(|n| !r.notes.contains(n)))
+        {
             out.push_str(&format!("note: {n}\n"));
         }
         out

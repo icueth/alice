@@ -27,8 +27,10 @@ impl Srv {
         Self::start_with(ServiceOptions::default()).await
     }
     /// `start()` with chosen service options (settings, transports, a short health tick).
-    async fn start_with(opts: ServiceOptions) -> Srv {
+    async fn start_with(mut opts: ServiceOptions) -> Srv {
         alice_daemon::install_tls();
+        // No `ALICE_*` variable of the developer's shell reaches the settings under test.
+        opts.settings_env.get_or_insert_with(Vec::new);
         let d = tempfile::tempdir().unwrap();
         let home = AliceHome::new(d.path().to_path_buf());
         let svc = Service::start(
@@ -895,7 +897,7 @@ async fn settings_api_round_trip_validation_schema_and_secrets() {
     let put: serde_json::Value = ok_json(
         s.put(
             "/api/v1/secrets/jev_api_key",
-            &serde_json::json!({"value": "ts_secret_value_1234"}),
+            &serde_json::json!({"value": concat!("ts_", "secret_value_1234")}),
         )
         .await,
     )
@@ -1026,11 +1028,16 @@ async fn an_invalid_edit_shows_in_the_view_and_in_health() {
         "[judge]\nreview_threshold = 0.9\nauto_apply_threshold = 0.6\n",
     )
     .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let view = loop {
         let v: serde_json::Value = s.get_json("/api/v1/settings").await;
         if !v["errors"].as_array().unwrap().is_empty() {
             break v;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher never showed the invalid edit: {v}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     };
     assert_eq!(view["errors"][0]["key"], "judge.review_threshold");
@@ -1045,12 +1052,17 @@ async fn an_invalid_edit_shows_in_the_view_and_in_health() {
     );
     assert!(health.get("config_degraded").is_none(), "{health}");
     std::fs::write(s.home.config_file(), "[judge]\nreview_threshold = 0.7\n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let v: serde_json::Value = s.get_json("/api/v1/settings").await;
         if v["errors"].as_array().unwrap().is_empty() {
             assert_eq!(v["settings"]["judge"]["review_threshold"], 0.7);
             break;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher never cleared the error after the good edit: {v}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     let health: serde_json::Value = s.get_json("/api/v1/health").await;
@@ -1194,4 +1206,61 @@ async fn the_settings_routes_are_guarded() {
         !s.home.config_file().exists(),
         "no refused request changed anything"
     );
+}
+
+/// Over HTTP: a loosening applies at once and the answer says so; a tightening and an
+/// unrelated change do not; keys nothing reads yet are marked.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_patch_answer_discloses_a_loosening_and_unused_keys() {
+    let s = Srv::start_with(quiet()).await;
+    let r: serde_json::Value = ok_json(
+        s.patch(
+            "/api/v1/settings",
+            &serde_json::json!({"privacy.redact": false}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(r["view"]["settings"]["privacy"]["redact"], false);
+    let notes = r["notes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("privacy.redact")
+                && n.as_str().unwrap().contains("at once")),
+        "{notes:?}"
+    );
+    let r: serde_json::Value = ok_json(
+        s.patch(
+            "/api/v1/settings",
+            &serde_json::json!({"privacy.redact": true}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(r["notes"], serde_json::json!([]));
+    let r: serde_json::Value = ok_json(
+        s.patch(
+            "/api/v1/settings",
+            &serde_json::json!({"embedding.endpoint": "http://127.0.0.1:11434"}),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        r["notes"][0].as_str().unwrap().contains("not used yet"),
+        "{r}"
+    );
+    let view: serde_json::Value = s.get_json("/api/v1/settings").await;
+    let flag = |k: &str| {
+        view["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["key"] == k)
+            .unwrap()["not_used_yet"]
+            .clone()
+    };
+    assert_eq!(flag("embedding.provider"), true);
+    assert_eq!(flag("embedding.batch_size"), false);
 }

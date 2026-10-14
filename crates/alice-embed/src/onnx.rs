@@ -49,9 +49,10 @@ pub struct OnnxOptions {
 
 /// Threads ONNX Runtime uses for one call when nothing asks for more. The daemon runs in the
 /// background beside the person's own work, and measured on 14 cores (10 performance, 4
-/// efficiency; see docs/benchmarks/m2.md, Task 6) four threads answer a query ~25% faster than
-/// all of them (the efficiency cores slow every call down), use ~35% less CPU to embed the same
-/// texts, and still embed ~110 passages/s against ~135.
+/// efficiency; see docs/benchmarks/m2.md, Task 6) four threads answered a query ~25% faster than
+/// all of them (probably the efficiency cores slowing every call down: not measured), used ~35%
+/// less CPU to embed the same texts, and still embedded ~110 passages/s against ~135. Measured
+/// on that one Apple machine only.
 pub const DEFAULT_INTRA_THREADS: usize = 4;
 
 struct Model {

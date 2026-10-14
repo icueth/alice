@@ -219,9 +219,10 @@ fn path_word(word: &str) -> Result<&str> {
     {
         Ok(word)
     } else {
-        Err(AliceError::invalid(format!(
-            "\"{word}\" is not a name; use letters, digits, _ and - only (see `alice config list`)"
-        )))
+        // Not echoed: it may be a secret typed where the name goes.
+        Err(AliceError::invalid(
+            "that is not a name; use letters, digits, _ and - only (see `alice config list`)",
+        ))
     }
 }
 

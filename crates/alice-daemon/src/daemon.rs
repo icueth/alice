@@ -36,6 +36,9 @@ pub struct DaemonOptions {
     pub port: u16,
     /// Tests and CI: deterministic embeddings, no model download (`ALICE_EMBEDDER=fake`).
     pub fake_embedder: bool,
+    /// The `ALICE_*` variables the settings see; `None`: the process's. Tests pass an empty
+    /// list so a developer's shell cannot change them.
+    pub settings_env: Option<Vec<(String, String)>>,
 }
 
 /// The single-instance lock, or `None` when another daemon holds it.
@@ -182,7 +185,10 @@ fn start_and_serve(
         &startup::StartProgress::step("opening the database and loading the embedding model"),
     );
     // The settings come first: the model's idle unload and the port are read from them.
-    let settings = SettingsHandle::load(home);
+    let settings = match &opts.settings_env {
+        Some(env) => SettingsHandle::load_with_env(home, env.clone()),
+        None => SettingsHandle::load(home),
+    };
     let started = settings.get();
     // Queries meanwhile use word matches while the model reloads; the embedding worker waits.
     // `embedding.idle_unload = 0` keeps the model loaded.

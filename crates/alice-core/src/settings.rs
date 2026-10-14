@@ -27,7 +27,17 @@ pub const RESTART_KEYS: &[&str] = &[
     "secrets.backend",
     "embedding.idle_unload",
     "embedding.batch_size",
-    // Task 16 makes these three apply live, through a re-embed.
+    // Task 16 makes these three apply live, through a re-embed. Until then nothing reads
+    // them at all (see `NOT_USED_YET_KEYS`): a restart changes nothing.
+    "embedding.provider",
+    "embedding.model",
+    "embedding.endpoint",
+];
+/// Keys that are saved and validated but read by nothing yet: the daemon always embeds with the
+/// local model until Task 16 wires the other providers. They are also in [`RESTART_KEYS`], but a
+/// restart changes nothing for them, so the views say "not used yet" instead of promising an
+/// effect.
+pub const NOT_USED_YET_KEYS: &[&str] = &[
     "embedding.provider",
     "embedding.model",
     "embedding.endpoint",
@@ -680,6 +690,9 @@ pub struct KeyInfo {
     pub env_var: String,
     pub read_only: bool,
     pub restart: bool,
+    /// Saved, but nothing reads it yet (see [`NOT_USED_YET_KEYS`]).
+    #[serde(default)]
+    pub not_used_yet: bool,
 }
 
 /// The environment variable that sets `key`: `judge.jev.rate_per_sec` →
@@ -733,6 +746,7 @@ pub fn key_infos() -> Vec<KeyInfo> {
             env_var: env_var(key),
             read_only: READ_ONLY_KEYS.contains(&key.as_str()),
             restart: RESTART_KEYS.contains(&key.as_str()),
+            not_used_yet: NOT_USED_YET_KEYS.contains(&key.as_str()),
         })
         .collect()
 }
