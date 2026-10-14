@@ -8,6 +8,7 @@ use alice_core::embed::Embedder;
 use alice_core::error::AliceError;
 use alice_core::store::ReaderPool;
 use alice_core::store::embeddings::{self, PendingItem, VecKey};
+use alice_core::vector::VectorIndex;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,7 +19,9 @@ use std::time::{Duration, Instant};
 
 /// Embedding attempts per text before it is given up (it stays searchable by words).
 const MAX_ATTEMPTS: u32 = 5;
-const SAVE_EVERY: Duration = Duration::from_secs(30);
+/// How often a changed index is saved to its files, busy or idle: a crash then loses at most
+/// this much work, which the next start catches up by content.
+pub const SAVE_EVERY: Duration = Duration::from_secs(30);
 const FIRST_BACKOFF: Duration = if cfg!(test) {
     Duration::from_millis(5)
 } else {
@@ -41,6 +44,8 @@ pub struct WorkerConfig {
     /// Told after each batch that reached the writer: memories whose embedding step is over wait
     /// for the judge (`bounded(1)`, so wake-ups coalesce).
     pub judge_wake: Option<Sender<()>>,
+    /// How often a changed index is saved while the worker runs (`SAVE_EVERY`).
+    pub save_every: Duration,
 }
 
 pub fn spawn_worker(cfg: WorkerConfig) -> JoinHandle<()> {
@@ -54,6 +59,16 @@ pub fn spawn_worker(cfg: WorkerConfig) -> JoinHandle<()> {
 fn wake_judge(cfg: &WorkerConfig) {
     if let Some(tx) = &cfg.judge_wake {
         let _ = tx.try_send(());
+    }
+}
+
+/// Save the index when it changed and `save_every` has passed since the last save.
+fn save_if_due(cfg: &WorkerConfig, index: &VectorIndex, last_save: &mut Instant) {
+    if index.is_dirty() && last_save.elapsed() >= cfg.save_every {
+        if let Err(e) = index.save(&cfg.vector_path) {
+            tracing::warn!(error = %e, "saving the vector index failed");
+        }
+        *last_save = Instant::now();
     }
 }
 
@@ -175,12 +190,7 @@ fn run(cfg: WorkerConfig) {
             }
         };
         if items.is_empty() {
-            if index.is_dirty() && last_save.elapsed() >= SAVE_EVERY {
-                if let Err(e) = index.save(&cfg.vector_path) {
-                    tracing::warn!(error = %e, "saving the vector index failed");
-                }
-                last_save = Instant::now();
-            }
+            save_if_due(&cfg, &index, &mut last_save);
             let _ = cfg.wake.recv_timeout(IDLE_WAIT);
             continue;
         }
@@ -254,6 +264,8 @@ fn run(cfg: WorkerConfig) {
                 }
             }
         }
+        // Also while there is more to do: a long run of embedding must not be one unsaved stretch.
+        save_if_due(&cfg, &index, &mut last_save);
         if healthy {
             backoff = FIRST_BACKOFF;
         } else {
@@ -293,6 +305,8 @@ mod tests {
         fail_if: Option<&'static str>,
         panic_if: Option<&'static str>,
         on_first_call: Mutex<Option<Hook>>,
+        /// A call whose texts contain the marker waits until the sender is used or dropped.
+        gate: Mutex<Option<(&'static str, std::sync::mpsc::Receiver<()>)>>,
     }
 
     impl Scripted {
@@ -304,6 +318,7 @@ mod tests {
                 fail_if: None,
                 panic_if: None,
                 on_first_call: Mutex::new(None),
+                gate: Mutex::new(None),
             }
         }
     }
@@ -320,6 +335,11 @@ mod tests {
             let hook = self.on_first_call.lock().take();
             if let Some(hook) = hook {
                 hook();
+            }
+            if let Some((marker, rx)) = self.gate.lock().as_ref()
+                && texts.iter().any(|t| t.contains(marker))
+            {
+                let _ = rx.recv();
             }
             let poisoned = self
                 .fail_if
@@ -407,6 +427,15 @@ mod tests {
         index: Option<VectorIndex>,
         script: impl FnOnce(&mut Scripted, &WriterHandle, PathBuf),
     ) -> Rig {
+        rig_with(index, SAVE_EVERY, 32, script)
+    }
+
+    fn rig_with(
+        index: Option<VectorIndex>,
+        save_every: Duration,
+        batch: usize,
+        script: impl FnOnce(&mut Scripted, &WriterHandle, PathBuf),
+    ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("a.db");
         let conn = alice_core::store::open_writer(&db).unwrap();
@@ -426,8 +455,9 @@ mod tests {
             wake: wake_rx,
             stop: stop.clone(),
             vector_path: dir.path().join("vectors").join("fake.usearch"),
-            batch: 32,
+            batch,
             judge_wake: Some(judge_wake_tx),
+            save_every,
         });
         Rig {
             dir,
@@ -456,6 +486,31 @@ mod tests {
     fn backlog(r: &Rig) -> usize {
         let c = alice_core::store::open_reader(&r.db()).unwrap();
         embeddings::backlog(&c).unwrap()
+    }
+
+    /// B4: a long run of embedding is saved as it goes, not only when the queue is empty: the
+    /// first batch is on disk while the second is still being embedded.
+    #[test]
+    fn the_index_is_saved_while_the_worker_is_still_busy() {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let r = rig_with(fresh_index(), Duration::ZERO, 1, |e, _, _| {
+            *e.gate.get_mut() = Some(("stuck", gate));
+        });
+        r.remember("first memory is embedded at once");
+        r.remember("stuck memory waits in the embedder");
+        // Both parts are written one after the other: wait until the files open.
+        wait_until("a save during the run", || {
+            VectorIndex::open(&r.vector_path(), "fake", 16).is_ok()
+        });
+        assert_eq!(
+            backlog(&r),
+            1,
+            "the worker is still busy with the second memory"
+        );
+        let saved = VectorIndex::open(&r.vector_path(), "fake", 16).unwrap();
+        assert_eq!(saved.len(), 1, "the file holds the first batch");
+        drop(release);
+        wait_until("the queue to empty", || backlog(&r) == 0);
     }
 
     #[test]

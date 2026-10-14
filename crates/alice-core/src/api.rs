@@ -323,6 +323,21 @@ pub struct Stats {
     pub cost_7d_usd: f64,
 }
 
+/// When a maintenance job last ran (`alice maintenance status`). Times are RFC 3339 UTC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct JobStatus {
+    /// `backup`, `trash_purge`, ...
+    pub job: String,
+    /// How often the job is due, in seconds.
+    pub every_secs: u64,
+    /// The last time the job ran to its end or failed (a run a request interrupted does not count).
+    pub last_run: Option<String>,
+    /// The last time it finished without an error.
+    pub last_ok: Option<String>,
+    /// The last failure: its time, then what went wrong.
+    pub last_error: Option<String>,
+}
+
 /// What `/api/v1/events/stream` pushes (one JSON object per SSE message).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -370,6 +385,10 @@ pub struct Health {
     /// Why the judge in force is not the one asked for (or out of budget), if it is not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_warning: Option<String>,
+    /// The backups are behind: the newest is older than two backup periods (or none was made in
+    /// a data directory that old).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_warning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<String>,
     /// False while the vector index is being rebuilt (search is lexical-only meanwhile).

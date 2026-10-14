@@ -484,6 +484,20 @@ impl ChunkPart {
     }
 }
 
+/// What [`VectorIndex::catch_up`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatchUp {
+    /// Stored vectors compared.
+    pub checked: usize,
+    /// Vectors added because the index lacked them.
+    pub added: usize,
+    /// Keys removed because nothing stored backs them.
+    pub removed: usize,
+}
+
+/// Vectors read and added per step of a catch-up.
+const CATCH_UP_BATCH: usize = 256;
+
 pub struct VectorIndex {
     dim: usize,
     /// The model whose stored vectors rescore chunk candidates ("" = none: no chunk results
@@ -648,6 +662,154 @@ impl VectorIndex {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Whether a vector is held under `key`.
+    pub fn contains(&self, key: VecKey) -> bool {
+        match key {
+            VecKey::Memory(_) => checked_key(key)
+                .map(|k| self.memories.inner.read().contains(k))
+                .unwrap_or(false),
+            VecKey::Chunk(seq) => self.chunks.inner.read().contains(seq),
+        }
+    }
+
+    /// Memory vectors held.
+    pub fn memory_len(&self) -> usize {
+        self.memories.len()
+    }
+
+    /// Chunk vectors held.
+    pub fn chunk_len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Bring the index in line with the stored vectors of its model by content, touching only
+    /// what differs: a stored vector the index lacks is added (a crash can lose the work of the
+    /// last minutes), and a held key with no stored vector is removed (a purge or retention
+    /// that the saved files predate). The keys are compared, not just the counts, so a missing
+    /// key and a stale one that happen to balance are both found. Safe next to a running
+    /// embedding worker: vectors are read when they are added, and a key is removed only after
+    /// a fresh lookup finds no stored vector for it.
+    ///
+    /// Not covered: a vector that was replaced under the same key (an edited memory whose new
+    /// embedding the crash lost) still matches by key. Fails (and the caller should rebuild)
+    /// when a stored vector cannot be read or added.
+    pub fn catch_up(&self, conn: &Connection) -> Result<CatchUp> {
+        let mut report = CatchUp::default();
+        if self.model.is_empty() {
+            return Ok(report);
+        }
+        let (mut stored_memories, mut stored_chunks) = (Vec::new(), Vec::new());
+        {
+            let mut stmt = conn.prepare(
+                "SELECT owner_type, owner_seq FROM embeddings WHERE model = ?1 ORDER BY owner_type, owner_seq",
+            )?;
+            let mut rows = stmt.query([&self.model])?;
+            while let Some(r) = rows.next()? {
+                let seq: i64 = r.get(1)?;
+                if r.get::<_, String>(0)? == "memory" {
+                    stored_memories.push(seq);
+                } else {
+                    stored_chunks.push(seq);
+                }
+            }
+        }
+        report.checked = stored_memories.len() + stored_chunks.len();
+
+        // Memories: what is stored and not held; extras only when the counts say there are some
+        // (the HNSW cannot list its keys, so they are looked for among the seqs ever used).
+        let missing_memories: Vec<i64> = stored_memories
+            .iter()
+            .copied()
+            .filter(|&s| !self.contains(VecKey::Memory(s)))
+            .collect();
+        let extra_memories = {
+            let held = self.memory_len() + missing_memories.len();
+            let surplus = held.saturating_sub(stored_memories.len());
+            let mut found = Vec::new();
+            if surplus > 0 {
+                let newest: i64 = conn
+                    .query_row(
+                        "SELECT coalesce(max(seq), 0) FROM sqlite_sequence WHERE name = 'memories'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0)
+                    .max(stored_memories.last().copied().unwrap_or(0));
+                let mut stored = stored_memories.iter().copied().peekable();
+                for seq in 1..=newest {
+                    while stored.next_if(|&s| s < seq).is_some() {}
+                    let is_stored = stored.peek() == Some(&seq);
+                    if !is_stored && self.contains(VecKey::Memory(seq)) {
+                        found.push(seq);
+                        if found.len() == surplus {
+                            break;
+                        }
+                    }
+                }
+            }
+            found
+        };
+
+        // Chunks: both lists are sorted, so one walk finds both kinds of difference.
+        let held_chunks = self.chunks.inner.read().seqs();
+        let (mut missing_chunks, mut extra_chunks) = (Vec::new(), Vec::new());
+        let (mut a, mut b) = (
+            stored_chunks.iter().peekable(),
+            held_chunks.iter().peekable(),
+        );
+        loop {
+            match (a.peek(), b.peek()) {
+                (None, None) => break,
+                (Some(&&s), None) => {
+                    missing_chunks.push(s);
+                    a.next();
+                }
+                (None, Some(&&h)) => {
+                    extra_chunks.push(h);
+                    b.next();
+                }
+                (Some(&&s), Some(&&h)) if s == h => {
+                    a.next();
+                    b.next();
+                }
+                (Some(&&s), Some(&&h)) if s < h => {
+                    missing_chunks.push(s);
+                    a.next();
+                }
+                (Some(_), Some(&&h)) => {
+                    extra_chunks.push(h);
+                    b.next();
+                }
+            }
+        }
+        drop((stored_memories, stored_chunks, held_chunks));
+
+        // Add what is missing, a batch at a time, reading each vector now.
+        let missing: Vec<VecKey> = missing_memories
+            .into_iter()
+            .map(VecKey::Memory)
+            .chain(missing_chunks.into_iter().map(VecKey::Chunk))
+            .collect();
+        for batch in missing.chunks(CATCH_UP_BATCH) {
+            let found = embeddings::get_many(conn, &self.model, batch)?;
+            report.added += found.len();
+            self.upsert_batch(&found)?;
+        }
+
+        // Drop what is held without a stored vector, after looking again.
+        for key in extra_memories
+            .into_iter()
+            .map(VecKey::Memory)
+            .chain(extra_chunks.into_iter().map(VecKey::Chunk))
+        {
+            if embeddings::get_many(conn, &self.model, &[key])?.is_empty() {
+                self.remove(key)?;
+                report.removed += 1;
+            }
+        }
+        Ok(report)
     }
 
     /// True when the index has changed since it was created, opened or last saved.
@@ -893,6 +1055,133 @@ mod tests {
         }
         let idx = VectorIndex::rebuild_from(&c, "fake", 384).unwrap();
         assert_eq!(idx.len(), 3);
+    }
+
+    /// B4: after a crash the index catches up by content, touching only what differs, and the
+    /// counts balancing (one key missing, one stale) does not hide either.
+    #[test]
+    fn catch_up_adds_what_is_missing_and_drops_what_nothing_backs() {
+        use crate::project::ProjectRef;
+        use crate::store::{embeddings, memories, open_writer, projects, sources};
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let p = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
+        let e = FakeEmbedder::new(384);
+        let mut seqs = Vec::new();
+        for t in ["one", "two", "three", "four", "five"] {
+            let m = memories::prepare(
+                memories::NewMemoryInput {
+                    content: t.into(),
+                    ..Default::default()
+                },
+                &p,
+                "h".into(),
+            )
+            .unwrap();
+            let memories::InsertOutcome::New { seq, .. } = memories::insert(&c, &m).unwrap() else {
+                panic!()
+            };
+            embeddings::put(&c, VecKey::Memory(seq), "fake", &v(&e, t)).unwrap();
+            seqs.push(seq);
+        }
+        let chunks: Vec<sources::ChunkInput> = (0..6)
+            .map(|i| sources::ChunkInput {
+                ord: i,
+                text: format!("chunk {i}"),
+                ..Default::default()
+            })
+            .collect();
+        sources::ingest(
+            &c,
+            &p,
+            &sources::SourceInput {
+                uri: "s".into(),
+                ..Default::default()
+            },
+            &chunks,
+        )
+        .unwrap();
+        let chunk_seqs: Vec<i64> = c
+            .prepare("SELECT seq FROM chunks ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for &s in &chunk_seqs {
+            embeddings::put(&c, VecKey::Chunk(s), "fake", &v(&e, &format!("chunk {s}"))).unwrap();
+        }
+        // The fifth memory is purged later: its seq was used, and nothing backs it any more.
+        let purged = seqs[4];
+        let full = VectorIndex::rebuild_from(&c, "fake", 384).unwrap();
+        c.execute(
+            "DELETE FROM embeddings WHERE owner_type = 'memory' AND owner_seq = ?1",
+            [purged],
+        )
+        .unwrap();
+        c.execute("DELETE FROM memories WHERE seq = ?1", [purged])
+            .unwrap();
+        assert_eq!(full.len(), 11);
+        assert_eq!(
+            full.catch_up(&c).unwrap(),
+            CatchUp {
+                checked: 10,
+                added: 0,
+                removed: 1
+            }
+        );
+        assert_eq!(full.len(), 10);
+
+        // The saved files predate a memory (seqs[3]) and a chunk (the last), and still hold the
+        // purged memory and a chunk (888) that was purged: as many keys extra as missing.
+        let stale = VectorIndex::for_model("fake", 384).unwrap();
+        for &s in &seqs[..3] {
+            stale.upsert(VecKey::Memory(s), &v(&e, "x")).unwrap();
+        }
+        stale
+            .upsert(VecKey::Memory(purged), &v(&e, "gone"))
+            .unwrap();
+        for &s in &chunk_seqs[..5] {
+            stale.upsert(VecKey::Chunk(s), &v(&e, "x")).unwrap();
+        }
+        stale.upsert(VecKey::Chunk(888), &v(&e, "gone")).unwrap();
+        assert_eq!(stale.len(), 3 + 1 + 5 + 1);
+        let report = stale.catch_up(&c).unwrap();
+        assert_eq!(
+            report,
+            CatchUp {
+                checked: 10,
+                added: 2,
+                removed: 2
+            }
+        );
+        assert!(stale.contains(VecKey::Memory(seqs[3])) && !stale.contains(VecKey::Memory(purged)));
+        assert!(
+            stale.contains(VecKey::Chunk(chunk_seqs[5])) && !stale.contains(VecKey::Chunk(888))
+        );
+        assert_eq!((stale.memory_len(), stale.chunk_len()), (4, 6));
+        // Done: a second pass finds nothing.
+        assert_eq!(
+            stale.catch_up(&c).unwrap(),
+            CatchUp {
+                checked: 10,
+                added: 0,
+                removed: 0
+            }
+        );
+
+        // A stored vector that cannot be read is an error (the caller rebuilds instead).
+        c.execute(
+            "INSERT INTO embeddings (owner_type, owner_seq, model, dim, vector) VALUES ('chunk', 777, 'fake', 384, 'not a vector')",
+            [],
+        )
+        .unwrap();
+        assert!(stale.catch_up(&c).is_err());
+        // An index without a model has nothing to compare with.
+        assert_eq!(
+            VectorIndex::new(384).unwrap().catch_up(&c).unwrap(),
+            CatchUp::default()
+        );
     }
 
     // Tests below go beyond the brief: they pin the behaviour consumers rely on.

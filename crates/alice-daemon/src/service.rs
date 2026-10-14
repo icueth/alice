@@ -3,14 +3,16 @@
 //! Writes go to the single writer thread; reads run on pooled read-only connections in
 //! `spawn_blocking`, so neither ever waits for the other (spec §4.1).
 
+use crate::backup::{self, BackupInfo, BackupKind};
 use crate::config::SettingsHandle;
 use crate::judge_http::JudgeHub;
 use crate::judge_worker::{JudgeWorkerConfig, spawn_judge_worker};
+use crate::maintenance::{Activity, Job, JobReport, MaintenanceCtx, Scheduler};
 use crate::paths::AliceHome;
 use crate::redaction::Redactors;
 use crate::secrets::{self, SecretName, SecretStore};
 use crate::spool;
-use crate::worker::{WorkerConfig, spawn_worker};
+use crate::worker::{SAVE_EVERY, WorkerConfig, spawn_worker};
 use crate::writer::{
     ProjectChoice, ResolveText, WriteOp, WriteOutcome, WriterHandle, spawn_writer_with,
 };
@@ -54,6 +56,9 @@ const JUDGE_STOP_WAIT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(3)
 };
+
+/// How long `shutdown` waits for a maintenance job to reach the end of its slice.
+const MAINTENANCE_STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a working directory's detected project is reused before git is asked again.
 const DETECT_TTL: Duration = Duration::from_secs(60);
@@ -296,9 +301,10 @@ impl ProjectResolver {
     }
 }
 
-/// The threads `shutdown` joins: the embedding worker, the judge worker, the writer and the
-/// config watcher.
+/// The threads `shutdown` joins: the maintenance scheduler, the embedding worker, the judge
+/// worker, the writer and the config watcher.
 struct Threads {
+    maintenance: JoinHandle<()>,
     embed: JoinHandle<()>,
     judge: JoinHandle<()>,
     writer: JoinHandle<()>,
@@ -341,6 +347,10 @@ pub struct Service {
     /// One write to the secrets store at a time; a second waits (up to the timeout) rather than
     /// parking another thread behind a stuck store.
     secrets_write: Arc<tokio::sync::Mutex<()>>,
+    /// When requests last came (maintenance runs only while the daemon is idle).
+    activity: Arc<Activity>,
+    /// The maintenance jobs, shared with the scheduler thread so `run_job` can run one on demand.
+    scheduler: Arc<Scheduler>,
     /// Tests: time added to the age of the shared health reading.
     #[cfg(test)]
     health_aged: Mutex<Duration>,
@@ -400,9 +410,10 @@ fn unexpected(o: WriteOutcome) -> AliceError {
 
 /// Rebuild the vector index from the stored vectors on a background thread; the slot stays
 /// `None` (lexical-only search, worker paused) until it is done. With `loaded` (an index
-/// opened from its files after an unclean stop) only its chunk part is rebuilt, unless the
-/// counts still disagree afterwards: then the whole index is.
-fn spawn_rebuild(
+/// opened from its files after an unclean stop) the index is only caught up by content (what the
+/// crash lost is added, what a purge removed is dropped), unless that fails or the counts
+/// still disagree afterwards: then the whole index is rebuilt.
+pub(crate) fn spawn_rebuild(
     slot: Arc<IndexSlot>,
     db: std::path::PathBuf,
     model: String,
@@ -415,16 +426,27 @@ fn spawn_rebuild(
             let started = Instant::now();
             let rebuilt = open_reader(&db).and_then(|c| {
                 if let Some(idx) = loaded {
-                    idx.rebuild_chunks_from(&c)?;
-                    let stored = embeddings::count(&c, &model)?;
-                    if idx.len() == stored {
-                        return Ok(idx);
+                    match idx.catch_up(&c) {
+                        Ok(done) => {
+                            let stored = embeddings::count(&c, &model)?;
+                            if idx.len() == stored {
+                                tracing::info!(
+                                    added = done.added,
+                                    removed = done.removed,
+                                    "vector index caught up with the stored vectors"
+                                );
+                                return Ok(idx);
+                            }
+                            tracing::info!(
+                                indexed = idx.len(),
+                                stored,
+                                "vector index still differs after catching up; rebuilding the whole index"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::info!(error = %e, "catching the vector index up failed; rebuilding the whole index");
+                        }
                     }
-                    tracing::info!(
-                        indexed = idx.len(),
-                        stored,
-                        "memory vectors are out of date too; rebuilding the whole index"
-                    );
                 }
                 VectorIndex::rebuild_from(&c, &model, dim)
             });
@@ -601,6 +623,7 @@ impl Service {
             // `embedding.batch_size` (a restart key: the worker is built once).
             batch: started_with.embedding.batch_size,
             judge_wake: Some(judge_wake_tx.clone()),
+            save_every: SAVE_EVERY,
         });
         let judge = JudgeHub::new(
             settings.clone(),
@@ -627,6 +650,22 @@ impl Service {
             retry_base: opts.judge_retry_base,
             applies: opts.judge_applies,
         });
+        let activity = Activity::new();
+        let maintenance_model = model.clone();
+        let scheduler = Arc::new(Scheduler::new(MaintenanceCtx {
+            home: home.clone(),
+            readers: readers.clone(),
+            writer: writer.clone(),
+            index: index.clone(),
+            settings: settings.clone(),
+            activity: activity.clone(),
+            model: Arc::new(move || maintenance_model.clone()),
+            dim,
+            judge_wake: judge_wake_tx.clone(),
+            stop: stop.clone(),
+            free_space: Arc::new(|p: &Path| backup::free_space(p)),
+        }));
+        let maintenance_thread = scheduler.clone().spawn(stop.clone());
         if let Err(e) = spawn_config_events(&settings, &writer, &judge) {
             // The workers and the writer are running already: stop them, do not leak them.
             stop.store(true, Ordering::SeqCst);
@@ -650,6 +689,7 @@ impl Service {
             wake_worker: wake_tx,
             wake_judge: judge_wake_tx,
             threads: Mutex::new(Some(Threads {
+                maintenance: maintenance_thread,
                 embed: worker_thread,
                 judge: judge_thread,
                 writer: writer_thread,
@@ -665,6 +705,8 @@ impl Service {
             judge,
             secrets_read: Arc::new(Mutex::new(None)),
             secrets_write: Arc::new(tokio::sync::Mutex::new(())),
+            activity,
+            scheduler,
             #[cfg(test)]
             health_aged: Mutex::new(Duration::ZERO),
             #[cfg(test)]
@@ -698,6 +740,7 @@ impl Service {
     /// stopped"; reads keep working. Calling it again does nothing.
     pub fn shutdown(&self) {
         let Some(Threads {
+            maintenance,
             embed: worker,
             judge,
             writer,
@@ -709,6 +752,21 @@ impl Service {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.wake_worker.try_send(());
         let _ = self.wake_judge.try_send(());
+        // An integrity check in progress is interrupted; a backup stops at its next step.
+        self.scheduler.interrupt_running();
+        // A job ends at its next slice. One inside a long single step (a backup, a check of the
+        // whole database) is left to finish on its own, as with the judge below; its writes
+        // fail once the writer has stopped.
+        let waited = Instant::now();
+        while !maintenance.is_finished() && waited.elapsed() < MAINTENANCE_STOP_WAIT {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let scheduler_stopped = maintenance.is_finished();
+        if !scheduler_stopped {
+            tracing::warn!("a maintenance job is still running; stopping without it");
+        } else if maintenance.join().is_err() {
+            tracing::error!("the maintenance scheduler panicked");
+        }
         if watcher.join().is_err() {
             tracing::error!("the config watcher panicked");
         }
@@ -738,10 +796,15 @@ impl Service {
         // Saved even when nothing changed since start: an index that never came from these
         // files (an empty one after a failed rebuild, say) must replace them before the mark
         // vouches for them. Each part skips the write when its file already holds it.
-        if let Err(e) = idx
-            .save(&path)
-            .and_then(|()| VectorIndex::mark_clean(&path))
-        {
+        // A maintenance job that did not stop in time may still change the index (a purge
+        // drops vectors): the files are saved but not marked, and the next start catches up.
+        let saved = idx.save(&path);
+        let marked = if scheduler_stopped {
+            saved.and_then(|()| VectorIndex::mark_clean(&path))
+        } else {
+            saved
+        };
+        if let Err(e) = marked {
             tracing::warn!(error = %e, "saving the vector index failed; the next start rebuilds it");
         }
     }
@@ -770,6 +833,7 @@ impl Service {
     }
 
     pub async fn remember(&self, req: RememberRequest) -> Result<RememberResponse> {
+        let _busy = self.activity.enter();
         let project = self
             .choose(req.project.as_deref(), req.cwd.as_deref())
             .await?;
@@ -919,6 +983,7 @@ impl Service {
     }
 
     pub async fn recall(&self, req: RecallRequest) -> Result<RecallResponse> {
+        let _busy = self.activity.enter();
         let limit = req
             .limit
             .unwrap_or(limits::DEFAULT_RECALL_LIMIT)
@@ -1159,6 +1224,7 @@ impl Service {
     }
 
     pub async fn context(&self, req: ContextRequest) -> Result<ContextResponse> {
+        let _busy = self.activity.enter();
         let max_tokens = req.max_tokens.unwrap_or(limits::DEFAULT_CONTEXT_TOKENS);
         let explicit = explicit_slug(req.project.as_deref()).is_some();
         let choice = self
@@ -1180,6 +1246,7 @@ impl Service {
     /// Memories by id. A duplicate that was merged into another memory is answered with the
     /// survivor, and `redirects` says so (spec §5.2).
     pub async fn get(&self, req: GetRequest) -> Result<GetResponse> {
+        let _busy = self.activity.enter();
         self.read(move |c| {
             let found = memories::get_many(c, &req.ids)?;
             let mut out = GetResponse::default();
@@ -1237,6 +1304,7 @@ impl Service {
 
     /// The memory after the change, with the event that recorded it (`undo` takes its id).
     pub async fn update(&self, mut req: UpdateRequest) -> Result<MemoryFull> {
+        let _busy = self.activity.enter();
         let actor = Actor::from_author(&req.author);
         if req.update.title.is_some() || req.update.body.is_some() || req.update.topics.is_some() {
             let r = self.redactor_for_memory(req.id.clone()).await?;
@@ -1274,6 +1342,7 @@ impl Service {
     }
 
     pub async fn facts(&self, req: FactsRequest) -> Result<FactsResponse> {
+        let _busy = self.activity.enter();
         self.read(move |c| {
             let facts = kg::query_facts(c, &req)?;
             let mut text = String::new();
@@ -1307,6 +1376,7 @@ impl Service {
     }
 
     pub async fn assert_fact(&self, mut req: AssertFactRequest) -> Result<FactOutcome> {
+        let _busy = self.activity.enter();
         let actor = Actor::from_author(&req.author);
         // Facts belong to no project; the one a fact cites as its source (if any) sets the rules.
         let r = match req.source_memory_id.clone() {
@@ -1446,6 +1516,7 @@ impl Service {
     /// Recorded changes, newest first (spec §5.5). The actor may be a bare agent name
     /// (`codex` means `agent:codex`), and a memory may be named by its legacy id.
     pub async fn events(&self, mut req: EventsRequest) -> Result<Vec<EventRow>> {
+        let _busy = self.activity.enter();
         req.actor = req
             .actor
             .as_deref()
@@ -1466,6 +1537,7 @@ impl Service {
     /// Reverse a change by its event id. A target that changed since is never overwritten:
     /// the answer names the review item that asks what to do instead.
     pub async fn undo(&self, req: UndoRequest) -> Result<UndoResponse> {
+        let _busy = self.activity.enter();
         let actor = Actor::from_author(&req.author);
         match self
             .writer
@@ -1499,10 +1571,12 @@ impl Service {
 
     /// Review items, newest first (open ones unless the query says otherwise).
     pub async fn reviews(&self, q: ReviewQuery) -> Result<Vec<ReviewItem>> {
+        let _busy = self.activity.enter();
         self.read(move |c| reviews::list(c, &q)).await
     }
 
     pub async fn review(&self, id: String) -> Result<ReviewItem> {
+        let _busy = self.activity.enter();
         self.read(move |c| {
             reviews::get(c, &id)?.ok_or_else(|| {
                 AliceError::NotFound(format!("review item {id}; list them with `alice review`"))
@@ -1513,6 +1587,7 @@ impl Service {
 
     /// Apply one of a review item's choices and record the decision.
     pub async fn resolve_review(&self, req: ResolveRequest) -> Result<ResolveResponse> {
+        let _busy = self.activity.enter();
         let actor = Actor::from_author(&req.author);
         let text = {
             let (id, choice, redactors) =
@@ -1540,6 +1615,7 @@ impl Service {
 
     /// Make `others` duplicates of `survivor` (trashed, linked to it).
     pub async fn merge(&self, req: MergeRequest) -> Result<MergeResponse> {
+        let _busy = self.activity.enter();
         if req.others.len() > MAX_MERGE_OTHERS {
             return Err(AliceError::invalid(format!(
                 "{} memories to merge is over the limit of {MAX_MERGE_OTHERS} per request; merge them in smaller groups",
@@ -1563,6 +1639,7 @@ impl Service {
 
     /// Counts, review and judge backlogs, and the judge's cost (UTC days).
     pub async fn stats(&self) -> Result<Stats> {
+        let _busy = self.activity.enter();
         let provider = self.judge().provider().to_string();
         let judge_warning = self.judge_warning();
         self.read(move |c| {
@@ -2110,6 +2187,7 @@ impl Service {
     }
 
     pub async fn ingest(&self, mut req: IngestRequest) -> Result<IngestOutcome> {
+        let _busy = self.activity.enter();
         // Checked here so an oversized request never reaches (or delays) the writer.
         sources::validate_chunks(&req.chunks)?;
         let project = self
@@ -2154,7 +2232,79 @@ impl Service {
     }
 
     pub async fn projects(&self) -> Result<Vec<ResolvedProject>> {
+        let _busy = self.activity.enter();
         self.read(projects::list_projects).await
+    }
+
+    // ------------------------------------------------------------------ maintenance
+
+    /// When requests last came. A long task (an import) holds `activity().enter()` for its whole
+    /// length, so maintenance does not start under it.
+    pub fn activity(&self) -> &Arc<Activity> {
+        &self.activity
+    }
+
+    /// Run one maintenance job now, to its end, whether or not the daemon is idle.
+    pub async fn run_job(&self, job: Job) -> Result<JobReport> {
+        let _busy = self.activity.enter();
+        let sched = self.scheduler.clone();
+        tokio::task::spawn_blocking(move || sched.run_job(job, chrono::Utc::now(), true))
+            .await
+            .map_err(join_err)
+    }
+
+    /// Copy the database into the backup directory now (`alice backup now`).
+    pub async fn backup_now(&self) -> Result<BackupInfo> {
+        let _busy = self.activity.enter();
+        let (db, dir) = (
+            self.home.db(),
+            backup::backup_dir(&self.home, &self.settings().backup),
+        );
+        let policy = {
+            let b = &self.settings().backup;
+            (b.daily, b.weekly)
+        };
+        let made = tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now();
+            // The same guard as the scheduled job: no room fails with a clear message.
+            let mut warnings = Vec::new();
+            backup::ensure_room(&db, &dir, now, policy, &backup::free_space, &mut warnings)?;
+            let info = backup::create(&db, &dir, BackupKind::Manual, now)?;
+            Ok::<_, AliceError>(info)
+        })
+        .await
+        .map_err(join_err)??;
+        Ok(made)
+    }
+
+    /// The backups in the backup directory, newest first.
+    pub async fn backups(&self) -> Result<Vec<BackupInfo>> {
+        let dir = backup::backup_dir(&self.home, &self.settings().backup);
+        tokio::task::spawn_blocking(move || backup::list(&dir))
+            .await
+            .map_err(join_err)?
+    }
+
+    /// When each maintenance job last ran.
+    pub async fn maintenance_status(&self) -> Result<Vec<JobStatus>> {
+        self.read(|c| {
+            let meta = |job: Job, what: &str| {
+                alice_core::store::maintenance::get_meta(c, &format!("maint.{}.{what}", job.name()))
+            };
+            Job::ALL
+                .iter()
+                .map(|&j| {
+                    Ok(JobStatus {
+                        job: j.name().into(),
+                        every_secs: j.every().as_secs(),
+                        last_run: meta(j, "last_run")?,
+                        last_ok: meta(j, "last_ok")?,
+                        last_error: meta(j, "last_error")?,
+                    })
+                })
+                .collect()
+        })
+        .await
     }
 
     pub async fn health(&self) -> Result<Health> {
@@ -2169,6 +2319,12 @@ impl Service {
         let index_ready = self.index.read().is_some();
         let judge_provider = self.judge().provider().to_string();
         let judge_warning = self.judge_warning();
+        // Reads the backup directory and the database: off the runtime's threads.
+        let scheduler = self.scheduler.clone();
+        let maintenance_warning =
+            tokio::task::spawn_blocking(move || scheduler.backup_warning(chrono::Utc::now()))
+                .await
+                .map_err(join_err)?;
         self.read(move |c| {
             let count = |sql: &str| -> Result<u64> {
                 Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)
@@ -2185,6 +2341,7 @@ impl Service {
                 judge_backlog: alice_core::store::judge::judge_backlog(c)?,
                 judge_provider,
                 judge_warning,
+                maintenance_warning,
                 read_only,
                 index_ready,
                 settings_warnings,
@@ -3066,8 +3223,237 @@ mod tests {
         done
     }
 
+    /// Task 14: backups, the job list and an on-demand job through the service.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backups_and_maintenance_jobs_run_through_the_service() {
+        use crate::maintenance::JobOutcome;
+        let (d, s) = svc().await;
+        s.remember(RememberRequest {
+            content: "a memory the backup must hold".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(s.backups().await.unwrap().is_empty());
+        let made = s.backup_now().await.unwrap();
+        assert_eq!(made.kind, BackupKind::Manual);
+        assert!(made.path.starts_with(d.path().join("backups")) && made.path.exists());
+        let listed = s.backups().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, made.name);
+
+        let status = s.maintenance_status().await.unwrap();
+        assert_eq!(
+            status.iter().map(|j| j.job.as_str()).collect::<Vec<_>>(),
+            Job::names()
+        );
+        assert!(
+            status
+                .iter()
+                .all(|j| j.last_run.is_none() && j.last_error.is_none())
+        );
+        let report = s.run_job(Job::TrashPurge).await.unwrap();
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        let purge = s
+            .maintenance_status()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job == "trash_purge")
+            .unwrap();
+        assert!(purge.last_run.is_some() && purge.last_ok.is_some());
+        assert_eq!(purge.every_secs, 86_400);
+        // The on-demand backup job rotates and keeps the manual one.
+        let report = s.run_job(Job::Backup).await.unwrap();
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        // The manual backup has its own name: both stay.
+        let kept = s.backups().await.unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|b| b.path.exists()));
+        tokio::task::spawn_blocking(move || s.shutdown())
+            .await
+            .unwrap();
+    }
+
+    /// The timer: with the shortest quiet period (5 s), nothing runs while something holds the
+    /// daemon busy, and once it is quiet the due jobs run on their own (a backup among them).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn due_jobs_run_by_themselves_once_the_daemon_is_quiet() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        std::fs::write(home.config_file(), "[maintenance]\nidle_secs = 5\n").unwrap();
+        let mk = || Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>);
+        let s = Service::start(home.clone(), &mk, quiet()).unwrap();
+        let ran = |s: &Arc<Service>| {
+            let s = s.clone();
+            async move {
+                s.maintenance_status()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|j| j.last_run.is_some())
+                    .count()
+            }
+        };
+        {
+            let _busy = s.activity().enter();
+            tokio::time::sleep(Duration::from_millis(6_500)).await;
+            assert_eq!(ran(&s).await, 0, "nothing runs under a held guard");
+        }
+        let mut waited = 0;
+        while ran(&s).await < Job::ALL.len() && waited < 400 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            waited += 1;
+        }
+        let status = s.maintenance_status().await.unwrap();
+        assert!(
+            status.iter().all(|j| j.last_run.is_some()),
+            "every due job ran: {status:?}"
+        );
+        assert!(status.iter().all(|j| j.last_error.is_none()), "{status:?}");
+        assert_eq!(s.backups().await.unwrap().len(), 1, "the scheduled backup");
+        tokio::task::spawn_blocking(move || s.shutdown())
+            .await
+            .unwrap();
+    }
+
+    /// M-6: backups that are behind show in the health (and so in `alice status`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overdue_backups_are_a_health_warning() {
+        let (d, s) = svc().await;
+        assert!(s.health().await.unwrap().maintenance_warning.is_none());
+        std::fs::create_dir_all(d.path().join("backups")).unwrap();
+        let old = chrono::Utc::now() - chrono::Duration::days(5);
+        std::fs::write(
+            d.path()
+                .join("backups")
+                .join(format!("alice-{}.db", old.format("%Y%m%dT%H%M%SZ"))),
+            b"x",
+        )
+        .unwrap();
+        let w = s
+            .health()
+            .await
+            .unwrap()
+            .maintenance_warning
+            .expect("warning");
+        assert!(w.contains("5 days old"), "{w}");
+        s.backup_now().await.unwrap();
+        assert!(s.health().await.unwrap().maintenance_warning.is_none());
+        tokio::task::spawn_blocking(move || s.shutdown())
+            .await
+            .unwrap();
+    }
+
+    /// Requests are what maintenance yields to: each public request restarts the quiet period,
+    /// and a held guard (a long import) keeps the daemon busy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requests_and_held_guards_keep_the_daemon_busy() {
+        let (_d, s) = svc().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(s.activity().idle_for() >= Duration::from_millis(300));
+        s.projects().await.unwrap();
+        assert!(
+            s.activity().idle_for() < Duration::from_millis(300),
+            "a request restarts the quiet period: {:?}",
+            s.activity().idle_for()
+        );
+        {
+            let _import = s.activity().enter();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(s.activity().idle_for(), Duration::ZERO);
+        }
+        assert!(s.activity().idle_for() < Duration::from_millis(300));
+        // Polling the health (the UI's stream does, every few seconds) is not activity.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        s.health().await.unwrap();
+        assert!(s.activity().idle_for() >= Duration::from_millis(300));
+        tokio::task::spawn_blocking(move || s.shutdown())
+            .await
+            .unwrap();
+    }
+
+    /// B4: after a crash the saved index files lack the vectors stored since; the next start
+    /// adds exactly those (and drops what a purge removed) instead of rebuilding.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_after_a_crash_catches_the_index_up_by_content() {
+        use alice_core::store::embeddings::VecKey;
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let mk = || Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>);
+        let stop = |s: Arc<Service>| tokio::task::spawn_blocking(move || s.shutdown());
+        let s = Service::start(home.clone(), &mk, ServiceOptions::default()).unwrap();
+        let mut ids = Vec::new();
+        for t in [
+            "first kept memory",
+            "second kept memory",
+            "third purged memory",
+        ] {
+            ids.push(
+                s.remember(RememberRequest {
+                    content: t.into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .id
+                .unwrap(),
+            );
+        }
+        wait_settled(&s).await;
+        stop(s.clone()).await.unwrap();
+        drop(s);
+        // What happened after the last save, and a crash: one more vector was stored, one
+        // memory was purged. The files still hold the purged one and lack the new one.
+        let (late, purged) = {
+            let c = open_writer(&home.db()).unwrap();
+            let seq = |id: &str| memories::seq_of(&c, id).unwrap().unwrap();
+            let purged = seq(&ids[2]);
+            c.execute(
+                "DELETE FROM embeddings WHERE owner_type = 'memory' AND owner_seq = ?1",
+                [purged],
+            )
+            .unwrap();
+            c.execute("DELETE FROM memories WHERE seq = ?1", [purged])
+                .unwrap();
+            c.execute(
+                "INSERT INTO memories (id, project_id, kind, title, body, status, content_hash, created_at, updated_at, hlc, embed_state, judge_state)
+                 VALUES ('LATE', '00000000000000000000GLOBAL', 'note', 'late', 'late', 'active', 'late', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z', 'h', 'done', 'done')",
+                [],
+            )
+            .unwrap();
+            let late = c.last_insert_rowid();
+            let v = FakeEmbedder::new(384)
+                .embed_passages(&["late".to_string()])
+                .unwrap()
+                .remove(0);
+            embeddings::put(&c, VecKey::Memory(late), "fake", &v).unwrap();
+            (late, purged)
+        };
+        let mark = home.vector_file("fake").with_extension("clean");
+        std::fs::remove_file(&mark).unwrap();
+        let s = Service::start(home.clone(), &mk, ServiceOptions::default()).unwrap();
+        for _ in 0..200 {
+            if s.health().await.unwrap().index_ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let idx = s.index.read().clone().expect("index ready");
+        assert!(
+            idx.contains(VecKey::Memory(late)),
+            "the late vector was added"
+        );
+        assert!(
+            !idx.contains(VecKey::Memory(purged)),
+            "the purged one was dropped"
+        );
+        assert_eq!(idx.len(), 3, "two kept and the late one");
+        stop(s.clone()).await.unwrap();
+    }
+
     /// Fix round 1 (M9): a clean stop marks the files it saved and the next start uses them as
-    /// they are; a start without the mark (after a crash) rebuilds the chunk part from the
+    /// they are; a start without the mark (after a crash) catches the chunk part up from the
     /// stored vectors even though the counts agree.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_chunk_part_is_rebuilt_after_an_unclean_stop_and_trusted_after_a_clean_one() {

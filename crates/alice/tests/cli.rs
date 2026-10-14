@@ -1557,6 +1557,83 @@ fn review_inbox_and_stats_through_the_cli() {
     assert!(e.ok(&["get", &id]).contains("third text"));
 }
 
+/// Task 14: `alice backup now|list` and `alice maintenance status|run <job>` through real
+/// processes.
+#[test]
+fn backups_and_maintenance_jobs_through_the_cli() {
+    use alice_daemon::maintenance::Job;
+    let e = Env::new();
+    e.ok(&["remember", "a memory worth a backup"]);
+    assert!(
+        e.ok(&["backup", "list"]).starts_with("No backups yet"),
+        "an empty list says so"
+    );
+    let made = e.ok(&["backup", "now"]);
+    assert!(made.starts_with("Backed up to "), "{made}");
+    let list = e.json(&["backup", "list"]);
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 1, "{list:?}");
+    let kind = list[0]["kind"].as_str().unwrap();
+    assert!(kind == "manual" || kind == "scheduled", "{kind}");
+    let file = PathBuf::from(list[0]["path"].as_str().unwrap());
+    assert!(file.exists(), "{}", file.display());
+    assert!(file.starts_with(e.home.join("backups")));
+    // The copy is a SQLite database that holds the memory's text, and is private to its owner.
+    let bytes = std::fs::read(&file).unwrap();
+    assert!(bytes.starts_with(b"SQLite format 3\0"));
+    assert!(
+        bytes.windows(23).any(|w| w == b"a memory worth a backup"),
+        "the backup holds the memory"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&e.home.join("backups")), 0o700);
+    }
+    assert!(e.ok(&["backup", "list"]).contains("bytes"));
+
+    let ran = e.ok(&["maintenance", "run", "trash_purge"]);
+    assert!(ran.starts_with("done"), "{ran}");
+    let report = e.json(&["maintenance", "run", "judge_retry"]);
+    assert_eq!(report["outcome"], "done", "{report}");
+    let bad = e.run(&["maintenance", "run", "nope"]);
+    assert!(!bad.status.success());
+    let err = stderr(&bad);
+    assert!(
+        err.contains("unknown maintenance job \"nope\"")
+            && Job::names().iter().all(|j| err.contains(j)),
+        "{err}"
+    );
+
+    let status = e.json(&["maintenance", "status"]);
+    let jobs: Vec<&str> = status
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["job"].as_str().unwrap())
+        .collect();
+    assert_eq!(jobs, Job::names(), "every job is listed");
+    let purge = status
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["job"] == "trash_purge")
+        .unwrap();
+    assert!(purge["last_run"].is_string() && purge["last_ok"].is_string());
+    assert_eq!(purge["every_secs"], 86_400);
+    let text = e.ok(&["maintenance", "status"]);
+    assert!(
+        text.contains("trash_purge") && text.contains("every 1d"),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("backup") && l.ends_with("never")),
+        "{text}"
+    );
+}
+
 #[test]
 fn recall_precise_reaches_the_daemon() {
     let e = Env::new();

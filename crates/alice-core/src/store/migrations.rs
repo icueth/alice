@@ -40,8 +40,12 @@ pub fn migrate(conn: &mut Connection, db_path: &Path) -> Result<usize> {
         return Ok(0);
     }
     if !applied.is_empty() {
-        let stamp = now_rfc3339().replace([':', '.'], "-");
-        let dest = db_path.with_file_name(format!("alice.pre-migration-{stamp}.db"));
+        // Next to the other backups (`<home>/backups`), where rotation finds them.
+        let from = applied.iter().max().copied().unwrap_or(0);
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let dir = db_path.parent().unwrap_or(Path::new(".")).join("backups");
+        super::create_private_dir(&dir)?;
+        let dest = dir.join(format!("alice-pre-migration-v{from}-{stamp}.db"));
         super::backup_into(conn, &dest)?;
     }
     for (version, sql) in &todo {

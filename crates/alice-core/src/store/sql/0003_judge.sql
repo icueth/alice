@@ -8,3 +8,7 @@ CREATE INDEX memories_judge ON memories(judge_state) WHERE judge_state <> 'done'
 -- Memories written before the judge existed are not judged after the fact. Only 'pending' rows
 -- that are already live change; 'skipped' (imports) and 'retry' rows keep their state.
 UPDATE memories SET judge_state = 'done' WHERE judge_state = 'pending' AND status <> 'pending';
+-- Maintenance (spec §5.6) walks these by time: raw retention by the time a chunk was stored,
+-- and the judge-cache pruning by age.
+CREATE INDEX chunks_created ON chunks(created_at);
+CREATE INDEX judge_cache_created ON judge_cache(created_at);

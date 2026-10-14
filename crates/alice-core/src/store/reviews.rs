@@ -100,6 +100,15 @@ pub fn open_or_create(conn: &Connection, r: &NewReview) -> Result<(String, bool)
     }
 }
 
+/// The same question was asked before and the answer was "reject" (do not suggest it again).
+pub fn was_rejected(conn: &Connection, dedupe_key: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM review_items WHERE dedupe_key = ?1 AND resolution IN ('reject', 'keep', 'keep_both'))",
+        [dedupe_key],
+        |r| r.get(0),
+    )?)
+}
+
 /// The open item asking the question `dedupe_key` names, if there is one.
 pub fn find_open(conn: &Connection, dedupe_key: &str) -> Result<Option<String>> {
     Ok(conn
