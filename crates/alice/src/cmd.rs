@@ -2156,10 +2156,13 @@ fn service_root(target_dir: Option<std::path::PathBuf>) -> Result<ServiceRoot> {
         });
     }
     if let Some(path) = std::env::var_os("ALICE_SERVICE_ROOT").filter(|v| !v.is_empty()) {
-        eprintln!(
-            "service commands are recorded in {}, not run (ALICE_SERVICE_ROOT is set)",
-            Path::new(&path).display()
-        );
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        NOTICE.call_once(|| {
+            eprintln!(
+                "service commands are recorded in {}, not run (ALICE_SERVICE_ROOT is set)",
+                Path::new(&path).display()
+            );
+        });
         return Ok(ServiceRoot {
             path: path.into(),
             mode: ServiceMode::Sandbox,
@@ -2185,15 +2188,93 @@ fn user_id() -> u32 {
 
 /// A sandbox "runs" a command by appending it to `service-commands.log` in the sandbox, so a test
 /// can see what would have run without ever calling `launchctl`, `systemctl` or `schtasks`.
-struct LogRunner(std::path::PathBuf);
+struct LogRunner {
+    root: std::path::PathBuf,
+    platform: Platform,
+}
+
+impl LogRunner {
+    /// What the sandbox's "service manager" says. Scripted answers come first: lines of
+    /// `service-responses` in the sandbox, `<text in the command>\t<exit code>\t<stdout>` (`\n`
+    /// in the stdout is a newline), first match wins. Otherwise a unit file in the sandbox is a
+    /// running unit and none is a stopped one (launchd: exit 0 / 113; systemd: `active` /
+    /// `inactive`; Windows: the task is `windows-task.xml`, written by `/Create`, removed by
+    /// `/Delete`).
+    fn answer(&self, cmd: &[String]) -> svcinst::Exec {
+        use svcinst::Exec;
+        let line = cmd.join(" ");
+        if let Ok(text) = std::fs::read_to_string(self.root.join("service-responses")) {
+            for l in text.lines() {
+                let mut f = l.splitn(3, '\t');
+                if let (Some(want), Some(code), out) = (f.next(), f.next(), f.next())
+                    && !want.is_empty()
+                    && line.contains(want)
+                    && let Ok(code) = code.parse::<i32>()
+                {
+                    return Exec {
+                        code: Some(code),
+                        stdout: out.unwrap_or_default().replace("\\n", "\n").into_bytes(),
+                    };
+                }
+            }
+        }
+        let present = svcinst::installed(self.platform, &self.root).is_some();
+        let task = self.root.join("windows-task.xml");
+        match (self.platform, line.as_str()) {
+            (Platform::MacOs, l) if l.starts_with("launchctl print") => {
+                Exec::code(if present { 0 } else { 113 })
+            }
+            (Platform::Linux, l) if l.contains("show -p") => Exec::ok(if present {
+                "active\nrunning\n"
+            } else {
+                "inactive\ndead\n"
+            }),
+            (Platform::Windows, l) if l.contains("/Query") && l.contains("/XML") => {
+                match std::fs::read(&task) {
+                    Ok(bytes) => Exec {
+                        code: Some(0),
+                        stdout: bytes,
+                    },
+                    Err(_) => Exec::code(1),
+                }
+            }
+            (Platform::Windows, l) if l.contains("/Query") => {
+                Exec::code(if task.exists() { 0 } else { 1 })
+            }
+            (Platform::Windows, l) if l.contains("/Create") => {
+                let action = cmd
+                    .iter()
+                    .skip_while(|a| *a != "/TR")
+                    .nth(1)
+                    .cloned()
+                    .unwrap_or_default();
+                let xml = format!(
+                    "<Task><Actions><Exec><Command>cmd</Command><Arguments>{}</Arguments></Exec></Actions></Task>",
+                    action
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                        .replace('"', "&quot;")
+                );
+                let _ = std::fs::write(&task, xml);
+                Exec::code(0)
+            }
+            (Platform::Windows, l) if l.contains("/Delete") => {
+                let _ = std::fs::remove_file(&task);
+                Exec::code(0)
+            }
+            _ => Exec::code(0),
+        }
+    }
+}
 
 impl Runner for LogRunner {
-    fn run(&self, cmd: &[String]) -> alice_core::Result<()> {
+    fn exec(&self, cmd: &[String]) -> alice_core::Result<svcinst::Exec> {
         let line = cmd.join(" ");
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.0)?;
+            .open(self.root.join("service-commands.log"))?;
         writeln!(f, "{line}")?;
         // `ALICE_SERVICE_FAIL=<word>` (tests): a recorded command that contains the word fails.
         if let Some(word) = std::env::var("ALICE_SERVICE_FAIL")
@@ -2201,19 +2282,20 @@ impl Runner for LogRunner {
             .filter(|w| !w.is_empty())
             && line.contains(&word)
         {
-            return Err(alice_core::error::AliceError::Other(format!(
-                "`{line}` failed (injected by ALICE_SERVICE_FAIL)"
-            )));
+            return Ok(svcinst::Exec::code(1));
         }
-        Ok(())
+        Ok(self.answer(cmd))
     }
 }
 
 /// The runner for a root, or `None` where no command may run (`--target-dir`).
-fn runner_for(root: &ServiceRoot) -> Option<Box<dyn Runner>> {
+fn runner_for(root: &ServiceRoot, platform: Platform) -> Option<Box<dyn Runner>> {
     match root.mode {
         ServiceMode::Real => Some(Box::new(SystemRunner)),
-        ServiceMode::Sandbox => Some(Box::new(LogRunner(root.path.join("service-commands.log")))),
+        ServiceMode::Sandbox => Some(Box::new(LogRunner {
+            root: root.path.clone(),
+            platform,
+        })),
         ServiceMode::TargetDir => None,
     }
 }
@@ -2245,7 +2327,7 @@ fn suspend_service(home: &AliceHome) -> Result<Option<Suspended>> {
     let Ok(root) = service_root(None) else {
         return Ok(None);
     };
-    let Some(runner) = runner_for(&root) else {
+    let Some(runner) = runner_for(&root, platform) else {
         return Ok(None);
     };
     // Only a unit that serves the home being restored, and only one the manager has loaded.
@@ -2267,7 +2349,7 @@ fn suspend_service(home: &AliceHome) -> Result<Option<Suspended>> {
             }))
         }
         Err(e) => bail!(
-            "the installed service could not be stopped ({e}); nothing was changed. It would start a daemon in the middle of the restore: stop it yourself (`alice service uninstall`), retry, and `alice service install` again afterwards"
+            "the installed service could not be stopped or checked ({e}); nothing was changed. It would start a daemon in the middle of the restore: stop it with the service manager (macOS: `launchctl bootout gui/$(id -u)/dev.alice.daemon`; Linux: `systemctl --user stop alice.service`), retry, and start it again afterwards (or `alice service install`)"
         ),
     }
 }
@@ -2303,7 +2385,7 @@ fn service_command(home: &AliceHome, c: ServiceCmd, json: bool) -> Result<()> {
                     || plan_text(&plan, "Would write", "Would run"),
                 );
             }
-            let runner = runner_for(&root);
+            let runner = runner_for(&root, platform);
             // A unit that is already loaded is unloaded first (launchd refuses to load it twice).
             if let Some(r) = &runner
                 && svcinst::installed(platform, &root.path).is_some()
@@ -2355,7 +2437,7 @@ fn service_command(home: &AliceHome, c: ServiceCmd, json: bool) -> Result<()> {
                     },
                 );
             }
-            let runner = runner_for(&root);
+            let runner = runner_for(&root, platform);
             svcinst::uninstall(platform, &root.path, user_id(), runner.as_deref())?;
             print(json, &serde_json::json!({ "installed": false }), || {
                 "Service removed.\n".into()
@@ -2364,12 +2446,9 @@ fn service_command(home: &AliceHome, c: ServiceCmd, json: bool) -> Result<()> {
         ServiceCmd::Status => {
             use svcinst::UnitOwner;
             let root = service_root(None)?;
-            // Windows keeps the task in the Task Scheduler, not in a file: only the real one is asked.
-            let owner = if platform == Platform::Windows && root.mode != ServiceMode::Real {
-                UnitOwner::None
-            } else {
-                svcinst::unit_owner(platform, &root.path, home.root(), &SystemRunner)
-            };
+            let runner =
+                runner_for(&root, platform).expect("a root with no --target-dir has a runner");
+            let owner = svcinst::unit_owner(platform, &root.path, home.root(), runner.as_ref());
             let unit = svcinst::installed(platform, &root.path);
             let place = unit
                 .as_ref()

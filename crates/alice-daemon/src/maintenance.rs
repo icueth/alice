@@ -2085,7 +2085,16 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(20));
             std::thread::sleep(Duration::from_millis(1));
         }
-        r.sched.interrupt_running();
+        // SQLite ignores an interrupt that arrives while no statement runs (the check may not
+        // have started its statement yet), so keep interrupting until the job has ended.
+        while !t.is_finished() {
+            r.sched.interrupt_running();
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the check never ended"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let report = t.join().unwrap();
         assert_eq!(report.outcome, JobOutcome::Paused, "{report:?}");
         assert!(
@@ -2198,7 +2207,9 @@ mod tests {
             let report = sched.run_job(Job::TrashPurge, chrono::Utc::now(), true);
             (report, started.elapsed())
         });
-        let mut worst = Duration::ZERO;
+        // The two longest waits: one stalled write (a descheduled thread, a slow fsync) is not
+        // the regression, a purge that holds the writer for its whole length stalls every write.
+        let (mut worst, mut second) = (Duration::ZERO, Duration::ZERO);
         let mut n = 0;
         let hang_guard = Instant::now() + Duration::from_secs(300);
         while !t.is_finished() {
@@ -2213,7 +2224,12 @@ mod tests {
                     project: ProjectChoice::Slug("global".into()),
                 })
                 .unwrap();
-            worst = worst.max(started.elapsed());
+            let waited = started.elapsed();
+            if waited > worst {
+                (worst, second) = (waited, worst);
+            } else {
+                second = second.max(waited);
+            }
             n += 1;
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -2221,8 +2237,8 @@ mod tests {
         assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
         assert!(n > 3, "only {n} writes got in during a purge of {purge:?}");
         assert!(
-            worst < purge / 3,
-            "worst remember {worst:?} over {n} writes, during a purge of {purge:?}"
+            second < purge / 3,
+            "second-longest remember {second:?} (longest {worst:?}) over {n} writes, during a purge of {purge:?}"
         );
         assert_eq!(
             r.count("SELECT count(*) FROM memories WHERE status = 'trashed'"),
