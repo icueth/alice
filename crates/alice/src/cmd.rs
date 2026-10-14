@@ -6,6 +6,7 @@ use alice_core::error::AliceError;
 use alice_core::model::{Author, Kind};
 use alice_core::store::kg::{AssertFact, FactAction, FactsQuery};
 use alice_core::store::memories::{MemoryUpdate, UpdateAction};
+use alice_core::store::reviews::{ReviewItem, ReviewType};
 use alice_daemon::client::{DaemonClient, Launcher, Unavailable, remember_or_spool};
 use alice_daemon::daemon::{DaemonOptions, run};
 use alice_daemon::paths::AliceHome;
@@ -168,6 +169,24 @@ pub struct HistoryArgs {
     pub actor: Option<String>,
     #[arg(long, default_value_t = 20)]
     pub limit: usize,
+}
+
+#[derive(Subcommand)]
+pub enum ReviewCmd {
+    /// Open items (or all with --all). The default for `alice review`.
+    List {
+        /// Only this type: supersede, contradiction, merge, predicate, project, sync_conflict
+        /// or undo.
+        #[arg(long = "type")]
+        review_type: Option<String>,
+        /// Resolved items too.
+        #[arg(long)]
+        all: bool,
+    },
+    /// One item in full.
+    Show { id: String },
+    /// Apply one of the item's choices (see `alice review show <id>`).
+    Resolve { id: String, choice: String },
 }
 
 #[derive(Subcommand)]
@@ -467,6 +486,12 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                 for id in &r.missing {
                     s.push_str(&format!("not found: {id}\n"));
                 }
+                for d in &r.redirects {
+                    s.push_str(&format!(
+                        "{} was merged into {} (shown above)\n",
+                        d.from, d.to
+                    ));
+                }
                 s
             })
         }
@@ -582,6 +607,11 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                 .await?;
             print(json, &r, || format!("{}\n", r.message))
         }
+        Command::Review { cmd } => review(&home, cmd, json).await,
+        Command::Stats => {
+            let r = client(&home).await?.stats().await?;
+            print(json, &r, || stats_text(&r))
+        }
         Command::Projects => {
             let r = client(&home).await?.projects().await?;
             print(json, &r, || {
@@ -604,6 +634,185 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
             unreachable!("handled in dispatch")
         }
     }
+}
+
+fn review_type_arg(t: &Option<String>) -> Result<Option<ReviewType>> {
+    match t.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(None),
+        Some(t) => ReviewType::parse(t).map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown review type \"{t}\"; use one of: {}",
+                ReviewType::ALL
+                    .iter()
+                    .map(|t| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }),
+    }
+}
+
+/// One line about what the item asks, for kinds whose subjects are not memories.
+fn review_detail(i: &ReviewItem) -> Option<String> {
+    let s = |k: &str| i.payload.get(k).and_then(|v| v.as_str());
+    match i.review_type {
+        ReviewType::Predicate => Some(format!(
+            "predicate \"{}\" may mean \"{}\"",
+            s("predicate")?,
+            s("canonical")?
+        )),
+        ReviewType::Project => Some(format!("move to project {}", s("to")?)),
+        ReviewType::Undo => Some(format!("undo blocked: {}", s("reason")?)),
+        _ => None,
+    }
+}
+
+fn review_block(i: &ReviewItem) -> String {
+    let p = i
+        .confidence
+        .map(|p| format!("{p:.2}"))
+        .unwrap_or_else(|| "-".into());
+    let mut s = format!("{}  {}  p={p}\n", i.id, i.review_type.as_str());
+    if let Some(d) = review_detail(i) {
+        s.push_str(&format!("  {d}\n"));
+    }
+    for m in &i.subjects {
+        s.push_str(&format!("  - {} [{}] ({})\n", m.title, m.id, m.status));
+    }
+    match (&i.resolution, &i.resolved_by) {
+        (Some(r), by) => s.push_str(&format!(
+            "  resolved: {r} by {}\n",
+            by.as_deref().unwrap_or("?")
+        )),
+        _ => s.push_str(&format!(
+            "  choices: {}\n",
+            i.choices
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        )),
+    }
+    s
+}
+
+fn review_full(i: &ReviewItem) -> String {
+    let mut s = review_block(i);
+    s.push_str(&format!(
+        "  status: {}  created: {}\n",
+        match i.status {
+            alice_core::store::reviews::ReviewStatus::Open => "open",
+            alice_core::store::reviews::ReviewStatus::Resolved => "resolved",
+        },
+        i.created_at
+    ));
+    for c in &i.choices {
+        s.push_str(&format!("  {} - {}\n", c.id, c.description));
+    }
+    s.push_str(&format!(
+        "  payload: {}\n",
+        serde_json::to_string(&i.payload).unwrap_or_default()
+    ));
+    s
+}
+
+async fn review(home: &AliceHome, c: Option<ReviewCmd>, json: bool) -> Result<()> {
+    match c.unwrap_or(ReviewCmd::List {
+        review_type: None,
+        all: false,
+    }) {
+        ReviewCmd::List { review_type, all } => {
+            let review_type = review_type_arg(&review_type)?;
+            let client = client(home).await?;
+            let mut items = client
+                .reviews(&ReviewQuery {
+                    review_type,
+                    ..Default::default()
+                })
+                .await?;
+            if all {
+                items.extend(
+                    client
+                        .reviews(&ReviewQuery {
+                            status: Some(alice_core::store::reviews::ReviewStatus::Resolved),
+                            review_type,
+                            ..Default::default()
+                        })
+                        .await?,
+                );
+            }
+            print(json, &items, || {
+                if items.is_empty() {
+                    "Nothing waits for a decision.\n".to_string()
+                } else {
+                    items
+                        .iter()
+                        .map(review_block)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            })
+        }
+        ReviewCmd::Show { id } => {
+            let r = client(home).await?.review(&id).await?;
+            print(json, &r, || review_full(&r))
+        }
+        ReviewCmd::Resolve { id, choice } => {
+            let r = client(home)
+                .await?
+                .resolve_review(&ResolveRequest {
+                    id,
+                    choice,
+                    author: author("cli"),
+                })
+                .await?;
+            print(json, &r, || format!("{}\n", r.message))
+        }
+    }
+}
+
+fn stats_text(s: &Stats) -> String {
+    let map = |m: &std::collections::BTreeMap<String, u64>| {
+        if m.is_empty() {
+            "none".to_string()
+        } else {
+            m.iter()
+                .map(|(k, v)| format!("{k} {v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let mut t = format!(
+        "memories by status: {}\nmemories by kind: {}\nraw chunks: {}\n",
+        map(&s.memories_by_status),
+        map(&s.memories_by_kind),
+        s.chunks
+    );
+    if !s.top_projects.is_empty() {
+        t.push_str(&format!(
+            "top projects: {}\n",
+            s.top_projects
+                .iter()
+                .take(5)
+                .map(|(p, n)| format!("{p} {n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    t.push_str(&format!(
+        "reviews waiting: {}\njudge: {} (waiting {}, to retry {})\nembedding backlog: {}\njudge cost: ${:.4} today, ${:.4} in 7 days\n",
+        s.reviews_open,
+        s.judge_provider,
+        s.judge_backlog,
+        s.judge_retry,
+        s.embed_backlog,
+        s.cost_today_usd,
+        s.cost_7d_usd
+    ));
+    if let Some(w) = &s.judge_warning {
+        t.push_str(&format!("judge warning: {w}\n"));
+    }
+    t
 }
 
 /// How long `config edit` waits, at most, for the daemon to show what an edit did (the daemon

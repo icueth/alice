@@ -667,3 +667,245 @@ async fn a_moved_working_tree_brings_its_project_rules_to_update_and_undo() {
     assert_eq!(edited.memory.body, "see [REDACTED:custom:ticket]");
     s.shutdown();
 }
+
+/// A review item the way the judge will leave it (Task 12): written straight into the inbox.
+fn add_review(
+    s: &Service,
+    kind: alice_core::store::reviews::ReviewType,
+    payload: serde_json::Value,
+    key: &str,
+) -> String {
+    let c = alice_core::store::open_writer(&s.home().db()).unwrap();
+    alice_core::store::reviews::create(
+        &c,
+        &alice_core::store::reviews::NewReview {
+            kind,
+            payload,
+            confidence: Some(0.8),
+            dedupe_key: Some(key.into()),
+        },
+    )
+    .unwrap()
+    .unwrap()
+}
+
+fn resolve(s: &Service, id: &str, choice: &str) -> alice_core::error::Result<ResolveResponse> {
+    let rt = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(|| {
+        rt.block_on(s.resolve_review(ResolveRequest {
+            id: id.into(),
+            choice: choice.into(),
+            ..Default::default()
+        }))
+    })
+}
+
+/// R2: "undo anyway" is a restore path like any other: it skips the conflict check, never the
+/// privacy rules. Redact mode restores the redacted form; block mode refuses and names the
+/// detector, and the item stays open.
+#[tokio::test(flavor = "multi_thread")]
+async fn applying_an_undo_item_goes_through_the_privacy_rules() {
+    let (_d, s) = start().await;
+    let r = s
+        .remember(RememberRequest {
+            content: "deploy with PLANTED-HERE".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let id = r.id.unwrap();
+    let edit = |body: &str| UpdateRequest {
+        id: id.clone(),
+        update: MemoryUpdate {
+            action: UpdateAction::Edit,
+            body: Some(body.into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let first = s.update(edit("deploy by hand")).await.unwrap();
+    let first_event = first.event_id.unwrap();
+    // As if an older Alice had recorded the event: the secret sits in its before-state.
+    {
+        let c = alice_core::store::open_writer(&s.home().db()).unwrap();
+        let n = c
+            .execute(
+                "UPDATE events SET before_json = replace(before_json, 'PLANTED-HERE', ?1) WHERE id = ?2",
+                rusqlite::params![GITHUB, first_event],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+    s.update(edit("deploy by pipeline")).await.unwrap();
+    let u = s
+        .undo(UndoRequest {
+            event_id: first_event,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let review_id = u.review_id.expect("the target changed since: an item asks");
+
+    let mut block = serde_json::Map::new();
+    block.insert("privacy.redact_mode".into(), serde_json::json!("block"));
+    s.settings_handle().patch(&block).unwrap();
+    let err = resolve(&s, &review_id, "apply").unwrap_err().to_string();
+    assert!(
+        err.contains("github_token") && err.contains("cannot undo") && !err.contains(GITHUB),
+        "{err}"
+    );
+    let item = s.review(review_id.clone()).await.unwrap();
+    assert_eq!(item.status, alice_core::store::reviews::ReviewStatus::Open);
+    let body = |s: &Service| {
+        let c = alice_core::store::open_reader(&s.home().db()).unwrap();
+        c.query_row("SELECT body FROM memories WHERE id = ?1", [&id], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(body(&s), "deploy by pipeline", "nothing was restored");
+
+    let mut redact = serde_json::Map::new();
+    redact.insert("privacy.redact_mode".into(), serde_json::json!("redact"));
+    s.settings_handle().patch(&redact).unwrap();
+    resolve(&s, &review_id, "apply").unwrap();
+    assert_eq!(body(&s), "deploy with [REDACTED:github_token]");
+    // The planted row is the only one that holds the secret: what the resolution recorded is clean.
+    let c = alice_core::store::open_reader(&s.home().db()).unwrap();
+    let recorded: Vec<String> = c
+        .prepare("SELECT COALESCE(before_json, '') || COALESCE(after_json, '') FROM events WHERE action LIKE 'undo%' OR action = 'review.resolve'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(recorded.len() >= 3, "{recorded:?}");
+    assert!(
+        recorded.iter().all(|r| leaks(r).is_empty()),
+        "no secret reaches the history the resolution wrote"
+    );
+}
+
+/// R2: the names a mapped predicate writes go through the privacy rules before the writer; a
+/// memory moved into a project whose rules would change its text is refused, not moved.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolutions_never_write_text_the_privacy_rules_would_change() {
+    use alice_core::store::reviews::ReviewType;
+    let (d, s) = start().await;
+    s.assert_fact(AssertFact {
+        subject: "alice".into(),
+        predicate: "use".into(),
+        object: "Rust".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let item = add_review(
+        &s,
+        ReviewType::Predicate,
+        serde_json::json!({"predicate": format!("uses {GITHUB}"), "canonical": "use", "p": 0.9, "provider": "heuristic"}),
+        "p1",
+    );
+    let predicates = |s: &Service| -> String {
+        let c = alice_core::store::open_reader(&s.home().db()).unwrap();
+        let mut stmt = c
+            .prepare("SELECT name || ' ' || COALESCE(canonical, '') FROM predicates UNION ALL SELECT COALESCE(before_json, '') || COALESCE(after_json, '') || target_id FROM events")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase()
+    };
+    // Block mode: refused naming the detector; the item stays open and nothing is stored.
+    let mut block = serde_json::Map::new();
+    block.insert("privacy.redact_mode".into(), serde_json::json!("block"));
+    s.settings_handle().patch(&block).unwrap();
+    let err = resolve(&s, &item, "map").unwrap_err().to_string();
+    assert!(
+        err.contains("github_token") && !err.contains(GITHUB),
+        "{err}"
+    );
+    assert!(!predicates(&s).contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+    // Redact mode: the redacted name is what becomes vocabulary.
+    let mut redact = serde_json::Map::new();
+    redact.insert("privacy.redact_mode".into(), serde_json::json!("redact"));
+    s.settings_handle().patch(&redact).unwrap();
+    resolve(&s, &item, "map").unwrap();
+    let stored = predicates(&s);
+    assert!(
+        !stored.contains("abcdefghijklmnopqrstuvwxyz0123456789") && stored.contains("redacted"),
+        "{stored}"
+    );
+
+    // A move into a project with a stricter rule.
+    let loose = repo(&d, "loose");
+    let strict_dir = d.path().join("strict");
+    std::fs::create_dir(&strict_dir).unwrap();
+    std::fs::write(
+        strict_dir.join(".alice.toml"),
+        "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
+    )
+    .unwrap();
+    // Written before the rule existed: see TCK-12345.
+    let m = s
+        .remember(RememberRequest {
+            content: "see TCK-12345 for details".into(),
+            cwd: loose,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let _ = s
+        .remember(RememberRequest {
+            content: "something in the strict project".into(),
+            cwd: Some(strict_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let slugs: Vec<String> = s
+        .projects()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.slug)
+        .collect();
+    let strict = slugs
+        .iter()
+        .find(|p| p.starts_with("strict"))
+        .expect("a strict project")
+        .clone();
+    let mv = add_review(
+        &s,
+        ReviewType::Project,
+        serde_json::json!({"memory_id": m.id.clone().unwrap(), "from": "loose", "to": strict, "p": 0.8, "provider": "heuristic"}),
+        "mv",
+    );
+    let err = resolve(&s, &mv, "move").unwrap_err().to_string();
+    assert!(
+        err.contains("custom:ticket") && err.contains("cannot move") && !err.contains("TCK-12345"),
+        "{err}"
+    );
+    let item = s.review(mv.clone()).await.unwrap();
+    assert_eq!(item.status, alice_core::store::reviews::ReviewStatus::Open);
+    let project: String = {
+        let c = alice_core::store::open_reader(&s.home().db()).unwrap();
+        c.query_row(
+            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
+            [m.id.as_ref().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_ne!(project, strict, "the memory stayed where it was");
+    // A move into a project with no such rule goes through.
+    let other = add_review(
+        &s,
+        ReviewType::Project,
+        serde_json::json!({"memory_id": m.id.unwrap(), "from": "loose", "to": "global", "p": 0.8, "provider": "heuristic"}),
+        "mv2",
+    );
+    resolve(&s, &other, "move").unwrap();
+}

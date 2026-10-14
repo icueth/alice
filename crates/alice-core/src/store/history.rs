@@ -124,15 +124,29 @@ fn to_json<T: Serialize>(v: T) -> Result<serde_json::Value> {
     serde_json::to_value(v).map_err(|e| AliceError::Other(format!("snapshot: {e}")))
 }
 
-/// The target as it is now, in the form events record (`None`: the row does not exist). Undo
-/// knows memories and relations; any other target type is refused as such.
-fn current(conn: &Connection, target_type: &str, id: &str) -> Result<Option<serde_json::Value>> {
+/// The two kinds of target undo can restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Memory,
+    Relation,
+}
+
+/// Undo knows memories and relations; any other target type is refused as such.
+fn target_kind(target_type: &str) -> Result<Target> {
     match target_type {
-        "memory" => snapshot_memory(conn, id)?.map(to_json).transpose(),
-        "relation" => snapshot_relation(conn, id)?.map(to_json).transpose(),
+        "memory" => Ok(Target::Memory),
+        "relation" => Ok(Target::Relation),
         other => Err(AliceError::invalid(format!(
             "changes to a {other} cannot be undone; only memory and fact changes can"
         ))),
+    }
+}
+
+/// The target as it is now, in the form events record (`None`: the row does not exist).
+fn current(conn: &Connection, target_type: &str, id: &str) -> Result<Option<serde_json::Value>> {
+    match target_kind(target_type)? {
+        Target::Memory => snapshot_memory(conn, id)?.map(to_json).transpose(),
+        Target::Relation => snapshot_relation(conn, id)?.map(to_json).transpose(),
     }
 }
 
@@ -400,6 +414,31 @@ pub fn undo(
     hlc: &mut dyn FnMut() -> String,
     redact: RedactorFor<'_>,
 ) -> Result<UndoOutcome> {
+    undo_with(conn, event_id, actor, hlc, redact, true)
+}
+
+/// Like [`undo`], without the "changed since" comparison: what a person decided when they
+/// answered a review item with "undo anyway". Only that check is skipped. A purged target, an
+/// event that cannot be undone, one already undone, and the privacy rules (block mode refuses a
+/// restore that holds a secret, redact mode cleans it) apply as for `undo`.
+pub fn force_undo(
+    conn: &Connection,
+    event_id: &str,
+    actor: &Actor,
+    hlc: &mut dyn FnMut() -> String,
+    redact: RedactorFor<'_>,
+) -> Result<UndoOutcome> {
+    undo_with(conn, event_id, actor, hlc, redact, false)
+}
+
+fn undo_with(
+    conn: &Connection,
+    event_id: &str,
+    actor: &Actor,
+    hlc: &mut dyn FnMut() -> String,
+    redact: RedactorFor<'_>,
+    check_changed: bool,
+) -> Result<UndoOutcome> {
     if event_id.trim().is_empty() {
         return Err(AliceError::invalid(
             "event_id is empty; pass the id of an event listed by \"alice history\"",
@@ -453,7 +492,7 @@ pub fn undo(
                 e.target_type, e.target_id
             )));
         }
-        if comparable(now) != comparable(after) {
+        if check_changed && comparable(now) != comparable(after) {
             let reason = format!(
                 "{} {} changed after event {}",
                 e.target_type, e.target_id, e.id
@@ -492,14 +531,14 @@ pub fn undo(
                 e.id
             ))
         };
-        match (e.target_type.as_str(), before) {
-            ("memory", Some(b)) => {
+        match (target_kind(&e.target_type)?, before) {
+            (Target::Memory, Some(b)) => {
                 let s: MemorySnapshot = serde_json::from_value(b).map_err(bad)?;
                 restore_memory(conn, &e.target_id, &restorable(conn, &s, redact, true)?, &h)?;
             }
             // Only a create has no memory before it: undoing it forgets the memory (it stays
             // in the trash for 30 days).
-            ("memory", None) if e.action == "memory.create" => {
+            (Target::Memory, None) if e.action == "memory.create" => {
                 let mut s: MemorySnapshot =
                     serde_json::from_value(after.unwrap_or_default()).map_err(bad)?;
                 s.status = Status::Trashed;
@@ -511,20 +550,24 @@ pub fn undo(
                     &h,
                 )?;
             }
-            ("memory", None) => {
+            (Target::Memory, None) => {
                 return Err(AliceError::invalid(format!(
                     "event {} ({}) records no before-state for memory {}; it cannot be undone",
                     e.id, e.action, e.target_id
                 )));
             }
-            ("relation", b) => {
-                let s: Option<RelationSnapshot> =
-                    b.map(serde_json::from_value).transpose().map_err(bad)?;
-                restore_relation(conn, &e.target_id, s.as_ref(), &h, redact)?;
+            (Target::Relation, Some(b)) => {
+                let s: RelationSnapshot = serde_json::from_value(b).map_err(bad)?;
+                restore_relation(conn, &e.target_id, Some(&s), &h, redact)?;
             }
-            (other, _) => {
+            // Only an add has no relation before it: undoing it deletes the relation.
+            (Target::Relation, None) if e.action == "relation.add" => {
+                restore_relation(conn, &e.target_id, None, &h, redact)?;
+            }
+            (Target::Relation, None) => {
                 return Err(AliceError::invalid(format!(
-                    "events on {other} cannot be undone"
+                    "event {} ({}) records no before-state for fact {}; it cannot be undone",
+                    e.id, e.action, e.target_id
                 )));
             }
         }
@@ -798,6 +841,18 @@ mod tests {
             let redactor = Arc::new(redactor);
             let rules = |_: &Connection, _: Option<&str>| redactor.clone();
             let out = undo(&self.c, event, &Actor::User, &mut tick, &rules);
+            self.n = n;
+            out
+        }
+        fn force_undo_with(&mut self, event: &str, redactor: Redactor) -> Result<UndoOutcome> {
+            let mut n = self.n;
+            let mut tick = || {
+                n += 1;
+                format!("{:013}-0000-dev", 1_000 + n)
+            };
+            let redactor = Arc::new(redactor);
+            let rules = |_: &Connection, _: Option<&str>| redactor.clone();
+            let out = force_undo(&self.c, event, &Actor::User, &mut tick, &rules);
             self.n = n;
             out
         }
@@ -1286,5 +1341,121 @@ mod tests {
             )
             .unwrap();
         assert_eq!(literal, "value [REDACTED:github_token]");
+    }
+
+    /// R1: a relation event without a before-state is an add (undo deletes the relation); any
+    /// other action with a NULL before is refused, never read as an add.
+    #[test]
+    fn a_relation_event_without_a_before_state_is_undone_only_when_it_is_an_add() {
+        let mut t = T::new();
+        let evs = t.fact("SQLite", FactAction::Add);
+        let add = evs.last().unwrap().clone();
+        let rid: String =
+            t.c.query_row("SELECT target_id FROM events WHERE id = ?1", [&add], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // A close whose before-state is missing (damaged history) must not delete the relation.
+        let h = t.hlc();
+        let bad = t.record(
+            EventInput {
+                actor: &Actor::User,
+                action: "relation.close",
+                target_type: "relation",
+                target_id: &rid,
+                before: None,
+                after: rel(&t.c, &rid),
+                group: None,
+            },
+            &h,
+        );
+        let err = t.undo(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("relation.close") && err.contains("no before-state"),
+            "{err}"
+        );
+        assert_eq!(t.relations().len(), 1, "the relation was not deleted");
+        // The add is undone by deleting the relation.
+        let h = t.hlc();
+        let add2 = t.record(
+            EventInput {
+                actor: &Actor::User,
+                action: "relation.add",
+                target_type: "relation",
+                target_id: &rid,
+                before: None,
+                after: rel(&t.c, &rid),
+                group: None,
+            },
+            &h,
+        );
+        t.undo(&add2).unwrap();
+        assert!(t.relations().is_empty());
+    }
+
+    /// "Force" skips the changed-since comparison and nothing else.
+    #[test]
+    fn force_undo_restores_over_a_later_change_but_not_twice_and_not_purged() {
+        let mut t = T::new();
+        let id = t.remember("first text");
+        let ev = t.edit(&id, "second text");
+        t.edit(&id, "third text");
+        assert!(matches!(t.undo(&ev).unwrap(), UndoOutcome::Conflict { .. }));
+        let out = t.force_undo_with(&ev, Redactor::builtin()).unwrap();
+        assert!(
+            matches!(out, UndoOutcome::Undone { ref reverted, .. } if reverted == &vec![ev.clone()])
+        );
+        assert_eq!(t.body(&id), "first text");
+        let err = t
+            .force_undo_with(&ev, Redactor::builtin())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already undone"), "{err}");
+        // Purged targets stay refused.
+        let id2 = t.remember("to be purged");
+        let ev2 = t.edit(&id2, "to be purged, edited");
+        t.c.execute("DELETE FROM memories WHERE id = ?1", [&id2])
+            .unwrap();
+        let err = t
+            .force_undo_with(&ev2, Redactor::builtin())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("purged"), "{err}");
+    }
+
+    /// R2: force skips the conflict check only, never the privacy rules.
+    #[test]
+    fn force_undo_never_restores_a_secret_the_rules_would_redact() {
+        use crate::settings::{PrivacySettings, RedactMode};
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let mut t = T::new();
+        let id = t.remember(&format!("deploy with {token}"));
+        let ev = t.edit(&id, "deploy by hand");
+        t.edit(&id, "deploy by pipeline"); // the target changed since: only force restores
+        let block = Redactor::new(&PrivacySettings {
+            redact_mode: RedactMode::Block,
+            ..Default::default()
+        })
+        .unwrap();
+        let err = t.force_undo_with(&ev, block).unwrap_err().to_string();
+        assert!(
+            err.contains("github_token") && err.contains("cannot undo") && !err.contains(token),
+            "{err}"
+        );
+        assert_eq!(t.body(&id), "deploy by pipeline", "nothing was restored");
+        t.force_undo_with(&ev, Redactor::builtin()).unwrap();
+        assert_eq!(t.body(&id), "deploy with [REDACTED:github_token]");
+        let rows: Vec<String> = t
+            .c
+            .prepare("SELECT COALESCE(before_json, '') || COALESCE(after_json, '') FROM events WHERE action LIKE 'undo:%'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            !rows.is_empty() && rows.iter().all(|r| !r.contains(token)),
+            "{rows:?}"
+        );
     }
 }

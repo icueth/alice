@@ -1159,7 +1159,12 @@ async fn the_provider_test_and_secret_errors_speak_plainly() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_settings_routes_are_guarded() {
     let s = Srv::start_with(quiet()).await;
-    let routes: [(reqwest::Method, &str); 7] = [
+    let routes: [(reqwest::Method, &str); 12] = [
+        (reqwest::Method::GET, "/api/v1/reviews"),
+        (reqwest::Method::GET, "/api/v1/reviews/X"),
+        (reqwest::Method::POST, "/api/v1/reviews/X/resolve"),
+        (reqwest::Method::POST, "/api/v1/memories/merge"),
+        (reqwest::Method::GET, "/api/v1/stats"),
         (reqwest::Method::GET, "/api/v1/settings"),
         (reqwest::Method::PATCH, "/api/v1/settings"),
         (reqwest::Method::GET, "/api/v1/settings/schema"),
@@ -1285,4 +1290,194 @@ async fn a_refused_secret_is_a_400_that_names_the_detector() {
         body.contains("github_token") && !body.contains(token),
         "{body}"
     );
+}
+
+/// Task 11: the review inbox over HTTP. An undo that finds the target changed asks; the item
+/// lists its choices; "apply" restores the first text; a second answer is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_review_inbox_lists_resolves_once_and_stats_follow() {
+    let s = Srv::start().await;
+    let r: RememberResponse = s
+        .post_json(
+            "/api/v1/remember",
+            &serde_json::json!({"content": "first text"}),
+        )
+        .await;
+    let id = r.id.unwrap();
+    let edit = |body: &'static str| serde_json::json!({"id": id, "action": "edit", "body": body});
+    let first: MemoryFull = s.post_json("/api/v1/update", &edit("second text")).await;
+    let _: MemoryFull = s.post_json("/api/v1/update", &edit("third text")).await;
+    let u: UndoResponse = s
+        .post_json(
+            "/api/v1/undo",
+            &serde_json::json!({"event_id": first.event_id.unwrap()}),
+        )
+        .await;
+    assert!(!u.undone);
+    let review = u.review_id.unwrap();
+
+    let stats: Stats = s.get_json("/api/v1/stats").await;
+    assert_eq!(stats.reviews_open, 1);
+    let ctx: ContextResponse = s.post_json("/api/v1/context", &serde_json::json!({})).await;
+    assert!(
+        ctx.text.contains("1 item(s) wait for a decision"),
+        "{}",
+        ctx.text
+    );
+
+    let list: Vec<ReviewItem> = s.get_json("/api/v1/reviews").await;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, review);
+    assert_eq!(
+        list[0]
+            .choices
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        ["apply", "dismiss"]
+    );
+    assert_eq!(list[0].subjects[0].id, id, "the memory the item is about");
+    let one: ReviewItem = s.get_json(&format!("/api/v1/reviews/{review}")).await;
+    assert_eq!(one, list[0]);
+    assert_eq!(s.get("/api/v1/reviews/NOSUCHITEM").await.status(), 404);
+    let bad = s.get("/api/v1/reviews?limit=lots").await;
+    assert_eq!(bad.status(), 400);
+    assert!(
+        bad.text()
+            .await
+            .unwrap()
+            .contains("/api/v1/reviews?status=")
+    );
+
+    // A choice the type does not offer is refused and the item stays open.
+    let wrong = s
+        .post(
+            &format!("/api/v1/reviews/{review}/resolve"),
+            &serde_json::json!({"choice": "merge"}),
+        )
+        .await;
+    assert_eq!(wrong.status(), 400);
+    assert!(wrong.text().await.unwrap().contains("apply, dismiss"));
+
+    let done: ResolveResponse = s
+        .post_json(
+            &format!("/api/v1/reviews/{review}/resolve"),
+            &serde_json::json!({"choice": "apply"}),
+        )
+        .await;
+    assert_eq!(done.review.resolution.as_deref(), Some("apply"));
+    let got: GetResponse = s
+        .post_json("/api/v1/get", &serde_json::json!({"ids": [id]}))
+        .await;
+    assert_eq!(got.memories[0].memory.body, "first text");
+    let again = s
+        .post(
+            &format!("/api/v1/reviews/{review}/resolve"),
+            &serde_json::json!({"choice": "apply"}),
+        )
+        .await;
+    assert_eq!(again.status(), 400);
+    let again: serde_json::Value = again.json().await.unwrap();
+    assert!(
+        again["error"]
+            .as_str()
+            .unwrap()
+            .contains("already resolved"),
+        "{again}"
+    );
+
+    assert!(
+        s.get_json::<Vec<ReviewItem>>("/api/v1/reviews")
+            .await
+            .is_empty()
+    );
+    let resolved: Vec<ReviewItem> = s
+        .get_json("/api/v1/reviews?status=resolved&review_type=undo")
+        .await;
+    assert_eq!(resolved.len(), 1);
+    let stats: Stats = s.get_json("/api/v1/stats").await;
+    assert_eq!(stats.reviews_open, 0);
+    let ctx: ContextResponse = s.post_json("/api/v1/context", &serde_json::json!({})).await;
+    assert!(!ctx.text.contains("wait for a decision"), "{}", ctx.text);
+    // The decision is in the history.
+    let evs: Vec<EventRow> = s.get_json("/api/v1/events?limit=50").await;
+    assert!(
+        evs.iter()
+            .any(|e| e.action == "review.resolve" && e.target_id == review)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merged_duplicates_answer_with_their_survivor() {
+    let s = Srv::start().await;
+    let mut ids = Vec::new();
+    for t in ["survivor text", "dup one", "dup two"] {
+        let r: RememberResponse = s
+            .post_json("/api/v1/remember", &serde_json::json!({"content": t}))
+            .await;
+        ids.push(r.id.unwrap());
+    }
+    let m: MergeResponse = s
+        .post_json(
+            "/api/v1/memories/merge",
+            &serde_json::json!({"survivor": ids[0], "others": [ids[1], ids[2], ids[0]]}),
+        )
+        .await;
+    assert_eq!(m.merged, vec![ids[1].clone(), ids[2].clone()]);
+    let got: GetResponse = s
+        .post_json("/api/v1/get", &serde_json::json!({"ids": [ids[1]]}))
+        .await;
+    assert_eq!(got.memories.len(), 1);
+    assert_eq!(
+        got.memories[0].memory.id, ids[0],
+        "the survivor is returned instead"
+    );
+    assert_eq!(
+        got.redirects,
+        vec![Redirect {
+            from: ids[1].clone(),
+            to: ids[0].clone()
+        }]
+    );
+    assert!(got.missing.is_empty());
+    // Asking for both shows the survivor once.
+    let got: GetResponse = s
+        .post_json(
+            "/api/v1/get",
+            &serde_json::json!({"ids": [ids[0], ids[2], "NOSUCH"]}),
+        )
+        .await;
+    assert_eq!(got.memories.len(), 1);
+    assert_eq!(got.redirects.len(), 1);
+    assert_eq!(got.missing, vec!["NOSUCH".to_string()]);
+    // A response without a merge has no `redirects` field at all.
+    let plain: serde_json::Value = s
+        .post_json("/api/v1/get", &serde_json::json!({"ids": [ids[0]]}))
+        .await;
+    assert!(plain.get("redirects").is_none(), "{plain}");
+    // Bad ids and a trashed survivor.
+    let bad = s
+        .post(
+            "/api/v1/memories/merge",
+            &serde_json::json!({"survivor": "NOSUCH", "others": []}),
+        )
+        .await;
+    assert_eq!(bad.status(), 404);
+    let stats: Stats = s.get_json("/api/v1/stats").await;
+    assert_eq!(stats.memories_by_status.get("trashed"), Some(&2));
+    assert_eq!(stats.reviews_open, 0);
+    assert_eq!(stats.judge_provider, "heuristic");
+    // The merge is one undoable group.
+    let evs: Vec<EventRow> = s
+        .get_json(&format!("/api/v1/events?target_id={}", ids[1]))
+        .await;
+    assert_eq!(evs[0].action, "memory.merge");
+    let u: UndoResponse = s
+        .post_json("/api/v1/undo", &serde_json::json!({"event_id": evs[0].id}))
+        .await;
+    assert!(u.undone, "{}", u.message);
+    let got: GetResponse = s
+        .post_json("/api/v1/get", &serde_json::json!({"ids": [ids[1]]}))
+        .await;
+    assert!(got.redirects.is_empty() && got.memories[0].memory.id == ids[1]);
 }

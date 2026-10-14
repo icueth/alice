@@ -904,3 +904,229 @@ async fn a_refused_secret_is_a_tool_error_naming_the_detector() {
     client.cancel().await.ok();
     d.stop().await;
 }
+
+const ADMIN: [&str; 4] = ["merge_memories", "review_list", "review_resolve", "stats"];
+
+async fn tool_names<C: ClientHandler>(
+    client: &rmcp::service::RunningService<RoleClient, C>,
+) -> Vec<String> {
+    let mut names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+fn set_admin(d: &Daemon, on: bool) {
+    let mut change = serde_json::Map::new();
+    change.insert("mcp.admin_tools".into(), serde_json::json!(on));
+    d.svc.settings_handle().patch(&change).unwrap();
+}
+
+/// R3: the switch is read at every request. Off: the four tools are neither listed nor
+/// callable (a call answers as for a tool that does not exist); on or off again takes effect
+/// in a session that is already open, without a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_tools_follow_the_setting_live_in_both_directions() {
+    let (_d, _home, d) = daemon().await;
+    let client = TestClient.serve(http_transport(&d)).await.unwrap();
+    assert_eq!(tool_names(&client).await.len(), 7, "off by default");
+    for name in ADMIN {
+        let err = client
+            .call_tool(call(name, serde_json::json!({})))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tool not found"), "{name}: {err}");
+    }
+
+    set_admin(&d, true);
+    let mut names = tool_names(&client).await;
+    assert_eq!(names.len(), 11, "{names:?}");
+    names.retain(|n| ADMIN.contains(&n.as_str()));
+    assert_eq!(names, ADMIN);
+    let stats = client
+        .call_tool(call("stats", serde_json::json!({})))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first_text(&stats)).unwrap();
+    assert_eq!(v["reviews_open"], 0, "{v}");
+    assert_eq!(v["judge_provider"], "heuristic");
+    // A new session sees them too.
+    let second = TestClient.serve(http_transport(&d)).await.unwrap();
+    assert_eq!(tool_names(&second).await.len(), 11);
+
+    set_admin(&d, false);
+    assert_eq!(
+        tool_names(&client).await.len(),
+        7,
+        "the open session loses them"
+    );
+    assert_eq!(tool_names(&second).await.len(), 7);
+    let err = client
+        .call_tool(call("stats", serde_json::json!({})))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tool not found"), "{err}");
+    // The seven core tools keep working throughout.
+    let r = client
+        .call_tool(call("context", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_ne!(r.is_error, Some(true));
+    client.cancel().await.ok();
+    second.cancel().await.ok();
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_admin_tools_list_resolve_merge_and_report() {
+    let (_d, _home, d) = daemon().await;
+    set_admin(&d, true);
+    let client = TestClient.serve(http_transport(&d)).await.unwrap();
+    // A conflicting undo puts an item in the inbox.
+    let r = d
+        .svc
+        .remember(alice_core::api::RememberRequest {
+            content: "first text".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let id = r.id.unwrap();
+    let edit = |body: &str| alice_core::api::UpdateRequest {
+        id: id.clone(),
+        update: alice_core::store::memories::MemoryUpdate {
+            body: Some(body.into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let first = d.svc.update(edit("second text")).await.unwrap();
+    d.svc.update(edit("third text")).await.unwrap();
+    let u = d
+        .svc
+        .undo(alice_core::api::UndoRequest {
+            event_id: first.event_id.unwrap(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let review = u.review_id.unwrap();
+
+    let listed = client
+        .call_tool(call("review_list", serde_json::json!({})))
+        .await
+        .unwrap();
+    let items: serde_json::Value = serde_json::from_str(&first_text(&listed)).unwrap();
+    assert_eq!(items[0]["id"], review.as_str(), "{items}");
+    assert_eq!(items[0]["choices"][0]["id"], "apply");
+    let bad = client
+        .call_tool(call(
+            "review_resolve",
+            serde_json::json!({"id": review, "choice": "merge"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad.is_error, Some(true));
+    assert!(
+        first_text(&bad).contains("apply, dismiss"),
+        "{}",
+        first_text(&bad)
+    );
+    let ok = client
+        .call_tool(call(
+            "review_resolve",
+            serde_json::json!({"id": review, "choice": "dismiss"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_text(&ok), "Resolved: dismiss.");
+    let evs = d
+        .svc
+        .events(alice_core::api::EventsRequest {
+            target_id: Some(review.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(evs[0].actor, "agent:test-agent", "the client is the author");
+
+    let mut ids = Vec::new();
+    for t in ["keep this", "duplicate of it"] {
+        let r = d
+            .svc
+            .remember(alice_core::api::RememberRequest {
+                content: t.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        ids.push(r.id.unwrap());
+    }
+    let merged = client
+        .call_tool(call(
+            "merge_memories",
+            serde_json::json!({"survivor": ids[0], "others": [ids[1]]}),
+        ))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first_text(&merged)).unwrap();
+    assert_eq!(v["merged"][0], ids[1].as_str(), "{v}");
+    let stats = client
+        .call_tool(call("stats", serde_json::json!({})))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first_text(&stats)).unwrap();
+    assert_eq!(
+        (
+            v["reviews_open"].as_u64(),
+            v["memories_by_status"]["trashed"].as_u64()
+        ),
+        (Some(0), Some(1)),
+        "{v}"
+    );
+    client.cancel().await.ok();
+    d.stop().await;
+}
+
+/// `alice mcp` has no settings handle: it reads `config.toml` (and the environment given) and
+/// follows a change within about a second, in both directions.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stdio_server_follows_config_toml_for_the_admin_tools() {
+    let (dir, home, _d) = daemon().await;
+    let server = AliceMcp::new(Backend::Remote(Arc::new(
+        RemoteBackend::new(home.clone(), Launcher::None, None).with_settings_env(Vec::new()),
+    )));
+    let (a, b) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move { server.serve(a).await.unwrap().waiting().await });
+    let client = TestClient.serve(b).await.unwrap();
+    assert_eq!(tool_names(&client).await.len(), 7);
+    let err = client
+        .call_tool(call("stats", serde_json::json!({})))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tool not found"), "{err}");
+
+    std::fs::write(home.config_file(), "[mcp]\nadmin_tools = true\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(tool_names(&client).await.len(), 11);
+    let stats = client
+        .call_tool(call("stats", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_ne!(stats.is_error, Some(true), "{}", first_text(&stats));
+    assert!(first_text(&stats).contains("reviews_open"));
+
+    std::fs::write(home.config_file(), "[mcp]\nadmin_tools = false\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(tool_names(&client).await.len(), 7);
+    drop(dir);
+    client.cancel().await.ok();
+}

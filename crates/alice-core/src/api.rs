@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use crate::store::events::{EventQuery as EventsRequest, EventRow};
+pub use crate::store::reviews::{ReviewItem, ReviewQuery};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -216,6 +217,17 @@ pub struct MemoryFull {
 pub struct GetResponse {
     pub memories: Vec<MemoryFull>,
     pub missing: Vec<String>,
+    /// Ids that were asked for but are duplicates merged into another memory: `from` is the id
+    /// asked for, `to` the survivor, which is in `memories`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redirects: Vec<Redirect>,
+}
+
+/// A merged duplicate and the memory that replaced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Redirect {
+    pub from: String,
+    pub to: String,
 }
 
 /// Edit, supersede, archive, forget (soft delete) or restore a memory.
@@ -247,6 +259,60 @@ pub struct UndoResponse {
     /// Set when the target changed since: a review item asks what to do.
     pub review_id: Option<String>,
     pub message: String,
+}
+
+/// Apply one of a review item's choices.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ResolveRequest {
+    pub id: String,
+    pub choice: String,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub author: Author,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResolveResponse {
+    pub review: ReviewItem,
+    pub message: String,
+}
+
+/// Merge duplicates: the others are trashed and point at the survivor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct MergeRequest {
+    pub survivor: String,
+    pub others: Vec<String>,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub author: Author,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MergeResponse {
+    /// The ids that became duplicates of the survivor.
+    pub merged: Vec<String>,
+}
+
+/// Counts, review backlog, judge backlog and costs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct Stats {
+    pub memories_by_status: BTreeMap<String, u64>,
+    pub memories_by_kind: BTreeMap<String, u64>,
+    /// (project slug, live memories), most first.
+    pub top_projects: Vec<(String, u64)>,
+    pub chunks: u64,
+    pub reviews_open: u64,
+    pub judge_provider: String,
+    /// Why the judge in force is not the one asked for (or out of budget), if it is not.
+    #[serde(default)]
+    pub judge_warning: Option<String>,
+    pub judge_backlog: u64,
+    pub judge_retry: u64,
+    pub embed_backlog: u64,
+    /// Judge spend of the current UTC day.
+    pub cost_today_usd: f64,
+    /// Judge spend of the last 7 UTC days, today included.
+    pub cost_7d_usd: f64,
 }
 
 /// What `/api/v1/events/stream` pushes (one JSON object per SSE message).

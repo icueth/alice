@@ -6,7 +6,7 @@ use alice_core::api::*;
 use alice_core::error::AliceError;
 use alice_core::settings::SettingError;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, FromRequest, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -329,6 +329,58 @@ async fn undo(
     Ok(Json(st.svc.undo(req).await?))
 }
 
+async fn list_reviews(
+    State(st): State<AppState>,
+    query: Result<Query<alice_core::store::reviews::ReviewQuery>, QueryRejection>,
+) -> ApiResult<Vec<alice_core::store::reviews::ReviewItem>> {
+    let Query(q) = query.map_err(|r| {
+        ApiError(AliceError::Invalid(format!(
+            "{}; use /api/v1/reviews?status=<open|resolved>&review_type=<type>&before=<review id>&limit=<1-500>",
+            r.body_text()
+        )))
+    })?;
+    Ok(Json(st.svc.reviews(q).await?))
+}
+async fn get_review(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<alice_core::store::reviews::ReviewItem> {
+    Ok(Json(st.svc.review(id).await?))
+}
+
+/// The body of `POST /api/v1/reviews/{id}/resolve`; the id comes from the path.
+#[derive(serde::Deserialize)]
+struct ResolveBody {
+    choice: String,
+    #[serde(default)]
+    author: alice_core::model::Author,
+}
+
+async fn resolve_review(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<ResolveBody>,
+) -> ApiResult<ResolveResponse> {
+    Ok(Json(
+        st.svc
+            .resolve_review(ResolveRequest {
+                id,
+                choice: body.choice,
+                author: body.author,
+            })
+            .await?,
+    ))
+}
+async fn merge(
+    State(st): State<AppState>,
+    ApiJson(req): ApiJson<MergeRequest>,
+) -> ApiResult<MergeResponse> {
+    Ok(Json(st.svc.merge(req).await?))
+}
+async fn stats(State(st): State<AppState>) -> ApiResult<Stats> {
+    Ok(Json(st.svc.stats().await?))
+}
+
 /// A refused settings change: the first problem as `error` (like every refusal), and all of
 /// them as `errors`, each with the key it is about.
 #[derive(Serialize)]
@@ -534,6 +586,11 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/ingest", post(ingest))
         .route("/api/v1/events", get(events))
         .route("/api/v1/undo", post(undo))
+        .route("/api/v1/reviews", get(list_reviews))
+        .route("/api/v1/reviews/{id}", get(get_review))
+        .route("/api/v1/reviews/{id}/resolve", post(resolve_review))
+        .route("/api/v1/memories/merge", post(merge))
+        .route("/api/v1/stats", get(stats))
         .route("/api/v1/events/stream", get(stream))
         .route("/api/v1/settings", get(get_settings).patch(patch_settings))
         .route("/api/v1/settings/schema", get(settings_schema))

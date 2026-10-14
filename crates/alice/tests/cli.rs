@@ -1449,3 +1449,108 @@ fn a_planted_secret_reaches_neither_the_database_the_spool_nor_the_log() {
         "the log was written and scanned"
     );
 }
+
+/// Task 11: the same conflict as over HTTP, through the CLI: `alice undo` answers with a review
+/// item, `alice review` shows it, `alice review resolve` settles it, `alice stats` counts.
+#[test]
+fn review_inbox_and_stats_through_the_cli() {
+    let e = Env::new();
+    let r = e.json(&["remember", "first text"]);
+    let id = r["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        e.ok(&["review"]),
+        "Nothing waits for a decision.\n",
+        "an empty inbox says so"
+    );
+    let edit = |body: &str| {
+        e.json(&["update", &id, "--action", "edit", "--body", body])["event_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let first = edit("second text");
+    edit("third text");
+    let undo = e.ok(&["undo", &first]);
+    assert!(undo.starts_with("Not undone: "), "{undo}");
+    // `alice history` shows the edits the undo ran into.
+    assert!(e.ok(&["history", &id]).contains("memory.edit"));
+
+    let list = e.ok(&["review", "list"]);
+    let item_id = list.split_whitespace().next().unwrap().to_string();
+    assert!(
+        list.contains("undo  p=-")
+            && list.contains(&format!("[{id}]"))
+            && list.contains("choices: apply | dismiss")
+            && list.contains("undo blocked: "),
+        "{list}"
+    );
+    let typed = e.ok(&["review", "list", "--type", "undo"]);
+    assert_eq!(typed, list);
+    assert!(
+        e.ok(&["review", "list", "--type", "merge"])
+            .starts_with("Nothing waits")
+    );
+    let bad = e.run(&["review", "list", "--type", "nonsense"]);
+    assert!(!bad.status.success());
+    let err = stderr(&bad);
+    assert!(
+        err.contains("unknown review type") && err.contains("sync_conflict"),
+        "{err}"
+    );
+    let shown = e.ok(&["review", "show", &item_id]);
+    assert!(
+        shown.contains("apply - undo anyway") && shown.contains("dismiss - keep the current state"),
+        "{shown}"
+    );
+    let js = e.json(&["review", "show", &item_id]);
+    assert_eq!(js["review_type"], "undo");
+
+    let stats = e.json(&["stats"]);
+    assert_eq!(stats["reviews_open"], 1, "{stats}");
+    assert_eq!(stats["judge_provider"], "heuristic");
+    let text = e.ok(&["stats"]);
+    assert!(
+        text.contains("reviews waiting: 1") && text.contains("judge: heuristic"),
+        "{text}"
+    );
+    let ctx = e.ok(&["context"]);
+    assert!(ctx.contains("1 item(s) wait for a decision"), "{ctx}");
+
+    let wrong = e.run(&["review", "resolve", &item_id, "maybe"]);
+    assert!(!wrong.status.success());
+    assert!(
+        stderr(&wrong).contains("apply, dismiss"),
+        "{}",
+        stderr(&wrong)
+    );
+    assert_eq!(
+        e.ok(&["review", "resolve", &item_id, "dismiss"]),
+        "Resolved: dismiss.\n"
+    );
+    let twice = e.run(&["review", "resolve", &item_id, "dismiss"]);
+    assert!(!twice.status.success());
+    assert!(
+        stderr(&twice).contains("already resolved"),
+        "{}",
+        stderr(&twice)
+    );
+    assert!(e.ok(&["review"]).starts_with("Nothing waits"));
+    let all = e.ok(&["review", "list", "--all"]);
+    assert!(all.contains("resolved: dismiss by user"), "{all}");
+    // Dismissing changed nothing.
+    assert!(e.ok(&["get", &id]).contains("third text"));
+    assert_eq!(e.json(&["stats"])["reviews_open"], 0);
+
+    // The same again, this time applying the undo over the later change.
+    let fourth = edit("fourth text");
+    edit("fifth text");
+    e.ok(&["undo", &fourth]);
+    let second_item = e
+        .ok(&["review"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    e.ok(&["review", "resolve", &second_item, "apply"]);
+    assert!(e.ok(&["get", &id]).contains("third text"));
+}

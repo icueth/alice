@@ -45,6 +45,13 @@ enum Command {
         #[arg(long, env = "ALICE_AGENT", default_value = "cli")]
         agent: String,
     },
+    /// Decisions Alice left to you: duplicates, updates, contradictions.
+    Review {
+        #[command(subcommand)]
+        cmd: Option<cmd::ReviewCmd>,
+    },
+    /// Counts, review backlog and judge costs.
+    Stats,
     /// List projects.
     Projects,
     /// Daemon status and counts.

@@ -1560,7 +1560,7 @@ pub const LOOSEN_POLLS: u32 = 3;
 /// The protective keys that `new` makes weaker than `old` (empty when nothing got weaker):
 /// redaction off, `block` mode back to `redact`, an entry gone from the cloud denylist or the
 /// custom patterns, a longer allowlist, a higher daily judge budget, or a switch to a cloud
-/// judge or embedding provider.
+/// judge or embedding provider, or the admin MCP tools switched on.
 ///
 /// A half-written `config.toml` (an editor truncating then writing) reads as a file that
 /// loosens everything; see [`LooseningGate`].
@@ -1600,6 +1600,11 @@ pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
             "embedding.provider",
             !is_cloud_embedding(old.embedding.provider)
                 && is_cloud_embedding(new.embedding.provider),
+        ),
+        // The admin tools let an agent resolve reviews and merge memories.
+        (
+            "mcp.admin_tools",
+            !old.mcp.admin_tools && new.mcp.admin_tools,
         ),
     ];
     checks
@@ -2749,6 +2754,7 @@ mod tests {
                 "embedding.provider",
                 Box::new(|s| s.embedding.provider = EmbeddingProvider::Voyage),
             ),
+            ("mcp.admin_tools", Box::new(|s| s.mcp.admin_tools = true)),
         ];
         for (key, change) in cases {
             let mut looser = base.clone();
@@ -2763,6 +2769,10 @@ mod tests {
         let mut cloud = base.clone();
         cloud.judge.provider = JudgeProvider::Jev;
         assert!(loosened_protections(&cloud, &base).is_empty());
+        // Turning the admin tools off tightens.
+        let mut admin = base.clone();
+        admin.mcp.admin_tools = true;
+        assert!(loosened_protections(&admin, &base).is_empty());
     }
 
     #[test]
