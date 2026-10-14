@@ -241,6 +241,18 @@ weekly = 4
 
 Secrets such as the Jev API key will be stored in `~/.alice/secrets.toml` (mode 0600) with `alice config set-secret judge.jev.api_key`; the OS keychain will be an opt-in alternative.
 
+## Backup and restore
+
+```bash
+alice backup now          # a checked, private copy of alice.db in ~/.alice/backups
+alice backup list
+alice restore             # the newest backup; or: alice restore <name or path> [--yes]
+```
+
+`alice restore` checks the backup first (a SQLite file that passes `quick_check`, with an Alice schema this build can read; a newer one is refused before anything is stopped), stops the daemon, keeps the current database as `backups/alice-before-restore-<time>.db`, puts the backup in its place and starts the daemon, which rebuilds the vector index and applies the writes agents spooled meanwhile. An older backup is migrated at that start (with its own pre-migration backup). `secrets.toml`, `config.toml` and the spool are never touched. It needs free space for the kept copy and the restored file, and refuses without changing anything when there is not enough.
+
+Two things a restore does not undo: memories you purged after the backup was taken come back with it, and text stored under older redaction rules is not scanned again.
+
 ## Git sync *(planned, M4)*
 
 ```bash

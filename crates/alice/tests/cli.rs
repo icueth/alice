@@ -1657,3 +1657,106 @@ fn recall_precise_reaches_the_daemon() {
     let help = e.run(&["recall", "--help"]);
     assert!(String::from_utf8_lossy(&help.stdout).contains("--precise"));
 }
+
+/// Task 15: `alice restore` through real processes. The backup comes back, a write made while
+/// the daemon was down is applied afterwards, the replaced database is kept, and a bad file is
+/// refused before the daemon is touched.
+#[test]
+fn restore_round_trip_brings_back_the_backup_and_keeps_writes_made_meanwhile() {
+    let env = Env::new();
+    env.ok(&["remember", "alpha before the backup"]);
+    let b = env.json(&["backup", "now"]);
+    let name = b["name"].as_str().unwrap().to_string();
+    env.ok(&["remember", "bravo after the backup"]);
+    // Keys and settings are not part of a restore.
+    let secrets = "[keys]\nsomething = \"kept\"\n";
+    std::fs::write(env.home.join("secrets.toml"), secrets).unwrap();
+    env.ok(&["daemon", "stop"]);
+    // Written while the daemon is down (as during a restore): spooled, applied after it.
+    let out = env
+        .cmd(&["remember", "charlie during the restore"])
+        .env("ALICE_NO_AUTOSTART", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(spooled(&env), 1);
+    // `env.json` parses the whole stdout as one JSON value: stop's own output would break it.
+    let r = env.json(&["restore", &name, "--yes"]);
+    assert_eq!(r["restored_from"], name);
+    assert!(
+        r["caveats"].as_str().unwrap().contains("purged"),
+        "the report says what a restore does not undo: {r}"
+    );
+    eventually(
+        || env.recall_count("charlie") == 1,
+        "the spooled write drained into the restored database",
+    );
+    assert_eq!(env.recall_count("alpha"), 1);
+    assert_eq!(
+        env.recall_count("bravo"),
+        0,
+        "written after the backup: gone with the restore"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.home.join("secrets.toml")).unwrap(),
+        secrets
+    );
+    let list = env.json(&["backup", "list"]);
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["kind"] == "before_restore")
+    );
+    let status = env.json(&["status"]);
+    assert_eq!(status["index_ready"], true);
+    // A bad file is refused before anything changes, and before the daemon is stopped.
+    let pid = env.daemon_pid().expect("the restored daemon runs");
+    std::fs::write(
+        env.home.join("backups/alice-20200101T000000Z.db"),
+        b"garbage",
+    )
+    .unwrap();
+    let bad = env.run(&["restore", "alice-20200101T000000Z.db", "--yes"]);
+    assert!(!bad.status.success());
+    assert!(
+        stderr(&bad).contains("not an Alice backup"),
+        "{}",
+        stderr(&bad)
+    );
+    assert_eq!(env.recall_count("alpha"), 1, "nothing was swapped");
+    assert_eq!(env.daemon_pid(), Some(pid), "the daemon was left running");
+}
+
+/// Task 15: restore needs a yes on a pipe, says what it does not undo in words, and works with
+/// no daemon (and no database) at all.
+#[test]
+fn restore_asks_for_a_yes_and_prints_what_it_does_not_undo() {
+    let env = Env::new();
+    env.ok(&["remember", "delta kept in the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let no = env.run(&["restore", &name]);
+    assert!(!no.status.success());
+    assert!(stderr(&no).contains("--yes"), "{}", stderr(&no));
+    let none = env.run(&["restore", "nope.db", "--yes"]);
+    assert!(!none.status.success());
+    assert!(
+        stderr(&none).contains("alice backup list"),
+        "{}",
+        stderr(&none)
+    );
+
+    env.ok(&["daemon", "stop"]);
+    std::fs::remove_file(env.home.join("alice.db")).unwrap();
+    // The default is the newest backup.
+    let text = env.ok(&["restore", "--yes"]);
+    assert!(text.starts_with("Restored alice-manual-"), "{text}");
+    assert!(
+        text.contains("purged after the backup") && text.contains("redaction"),
+        "{text}"
+    );
+    assert_eq!(env.recall_count("delta"), 1);
+}

@@ -12,6 +12,7 @@ pub mod maintenance;
 pub mod mcp;
 pub mod paths;
 pub mod redaction;
+pub mod restore;
 pub mod secrets;
 pub mod service;
 pub mod spool;
