@@ -152,3 +152,117 @@ pub fn build_sqlite_exact_wal(dir: &Path, drawers: &[DrawerSpec]) -> WalPalace {
         writer: Some(writer),
     }
 }
+
+/// File name Chroma uses for its SQLite store.
+pub const CHROMA_FILE: &str = "chroma.sqlite3";
+
+/// A Chroma-backend palace (only the SQLite store; the HNSW folders hold vectors and are ignored)
+/// with one collection called `mempalace_drawers`. Returns the path of `chroma.sqlite3`.
+pub fn build_chroma(dir: &Path, drawers: &[DrawerSpec]) -> PathBuf {
+    build_chroma_in(dir, "mempalace_drawers", drawers)
+}
+
+/// Like [`build_chroma`] with a chosen collection name.
+pub fn build_chroma_in(dir: &Path, collection: &str, drawers: &[DrawerSpec]) -> PathBuf {
+    let path = dir.join(CHROMA_FILE);
+    let conn = Connection::open(&path).unwrap();
+    conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE databases (id TEXT PRIMARY KEY, name TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT 'default_tenant');
+         CREATE TABLE collections (
+             id TEXT PRIMARY KEY,
+             name TEXT NOT NULL,
+             dimension INTEGER,
+             database_id TEXT NOT NULL REFERENCES databases(id) ON DELETE CASCADE,
+             config_json_str TEXT,
+             schema_str TEXT,
+             UNIQUE (name, database_id));
+         CREATE TABLE segments (
+             id TEXT PRIMARY KEY,
+             type TEXT NOT NULL,
+             scope TEXT NOT NULL,
+             collection TEXT REFERENCES collections(id));
+         CREATE TABLE embeddings (
+             id INTEGER PRIMARY KEY,
+             segment_id TEXT NOT NULL,
+             embedding_id TEXT NOT NULL,
+             seq_id BLOB NOT NULL,
+             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             UNIQUE (segment_id, embedding_id));
+         CREATE TABLE embedding_metadata (
+             id INTEGER REFERENCES embeddings(id),
+             key TEXT NOT NULL,
+             string_value TEXT,
+             int_value INTEGER,
+             float_value REAL,
+             bool_value INTEGER,
+             PRIMARY KEY (id, key));
+         INSERT INTO databases (id, name) VALUES ('db1', 'default_database');",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO collections (id, name, dimension, database_id) VALUES ('c1', ?1, 4, 'db1')",
+        [collection],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO segments (id, type, scope, collection) VALUES
+             ('seg-vec', 'urn:chroma:segment/vector/hnsw-local-persisted', 'VECTOR', 'c1'),
+             ('seg-meta', 'urn:chroma:segment/metadata/sqlite', 'METADATA', 'c1');",
+    )
+    .unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    for (i, d) in drawers.iter().enumerate() {
+        let rowid = i as i64 + 1;
+        for seg in ["seg-vec", "seg-meta"] {
+            // Chroma keeps an embeddings row per segment; only the metadata segment has metadata rows.
+            let id = if seg == "seg-meta" {
+                rowid
+            } else {
+                rowid + 1_000_000
+            };
+            tx.execute(
+                "INSERT INTO embeddings (id, segment_id, embedding_id, seq_id) VALUES (?1, ?2, ?3, zeroblob(8))",
+                params![id, seg, d.id],
+            )
+            .unwrap();
+        }
+        let put_s = |k: &str, v: &str| {
+            tx.execute(
+                "INSERT INTO embedding_metadata (id, key, string_value) VALUES (?1, ?2, ?3)",
+                params![rowid, k, v],
+            )
+            .unwrap();
+        };
+        put_s("chroma:document", &d.text);
+        let m = &d.meta;
+        put_s("wing", &m.wing);
+        put_s("room", &m.room);
+        for (k, v) in [
+            ("hall", &m.hall),
+            ("source_file", &m.source_file),
+            ("added_by", &m.added_by),
+            ("ingest_mode", &m.ingest_mode),
+            ("filed_at", &m.filed_at),
+            ("authored_at", &m.authored_at),
+            ("agent", &m.agent),
+            ("date", &m.date),
+            ("topic", &m.topic),
+            ("entry_type", &m.entry_type),
+            ("parent_drawer_id", &m.parent_drawer_id),
+        ] {
+            if let Some(v) = v {
+                put_s(k, v);
+            }
+        }
+        if let Some(n) = m.chunk_index {
+            tx.execute(
+                "INSERT INTO embedding_metadata (id, key, int_value) VALUES (?1, 'chunk_index', ?2)",
+                params![rowid, n],
+            )
+            .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    path
+}

@@ -459,10 +459,10 @@ pub fn open_snapshot(s: &Snapshot, collection: Option<&str>) -> Result<Box<dyn P
                 collection.unwrap_or(DEFAULT_COLLECTION),
             )?))
         }
-        Backend::Chroma => Err(AliceError::invalid(
-            "this palace uses the chroma backend, which this build cannot read yet; \
-             run `mempalace migrate` to switch it to sqlite_exact, or export it first",
-        )),
+        Backend::Chroma => Ok(Box::new(super::chroma::ChromaReader::open(
+            &s.dir.join(CHROMA_FILE),
+            collection.unwrap_or(DEFAULT_COLLECTION),
+        )?)),
     }
 }
 
@@ -525,34 +525,85 @@ fn drawer_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Drawer> {
     })
 }
 
-fn scalar(v: Option<&serde_json::Value>) -> Option<String> {
-    match v? {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::Bool(b) => Some(b.to_string()),
-        _ => None,
-    }
+/// One metadata value as a backend stores it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum MetaValue {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
 }
 
-fn int(v: Option<&serde_json::Value>) -> Option<i64> {
-    match v? {
-        serde_json::Value::Number(n) => n
-            .as_i64()
-            .or_else(|| n.as_f64().filter(|f| f.is_finite()).map(|f| f as i64)),
-        serde_json::Value::String(s) => {
-            let t = s.trim();
-            t.parse::<i64>().ok().or_else(|| {
-                t.parse::<f64>()
-                    .ok()
-                    .filter(|f| f.is_finite())
-                    .map(|f| f as i64)
-            })
+impl MetaValue {
+    fn scalar(&self) -> String {
+        match self {
+            MetaValue::Str(s) => s.clone(),
+            MetaValue::Int(n) => n.to_string(),
+            MetaValue::Float(f) => {
+                serde_json::Number::from_f64(*f).map_or_else(|| f.to_string(), |n| n.to_string())
+            }
+            MetaValue::Bool(b) => b.to_string(),
         }
+    }
+
+    fn int(&self) -> Option<i64> {
+        let from_f = |f: f64| f.is_finite().then_some(f as i64);
+        match self {
+            MetaValue::Int(n) => Some(*n),
+            MetaValue::Float(f) => from_f(*f),
+            MetaValue::Str(s) => {
+                let t = s.trim();
+                t.parse::<i64>()
+                    .ok()
+                    .or_else(|| t.parse::<f64>().ok().and_then(from_f))
+            }
+            MetaValue::Bool(_) => None,
+        }
+    }
+}
+
+fn from_json(v: &serde_json::Value) -> Option<MetaValue> {
+    match v {
+        serde_json::Value::String(s) => Some(MetaValue::Str(s.clone())),
+        serde_json::Value::Bool(b) => Some(MetaValue::Bool(*b)),
+        serde_json::Value::Number(n) => Some(match n.as_i64() {
+            Some(i) => MetaValue::Int(i),
+            // Integers beyond i64 keep their digits; `int()` parses them like a string.
+            None if n.is_u64() => MetaValue::Str(n.to_string()),
+            None => MetaValue::Float(n.as_f64()?),
+        }),
         _ => None,
     }
 }
 
-/// Tolerant: missing keys give `None`/empty, wrong scalar types are stringified, bad JSON sets `unreadable`.
+/// The one place metadata is typed, shared by every reader so they cannot drift: missing keys give
+/// `None`/empty, wrong scalar types are stringified, unknown keys are ignored.
+pub(crate) fn meta_from_pairs(pairs: impl Iterator<Item = (String, MetaValue)>) -> DrawerMeta {
+    let mut m = DrawerMeta::default();
+    for (k, v) in pairs {
+        let s = v.scalar();
+        match k.as_str() {
+            "wing" => m.wing = s,
+            "room" => m.room = s,
+            "hall" => m.hall = Some(s),
+            "source_file" => m.source_file = Some(s),
+            "added_by" => m.added_by = Some(s),
+            "ingest_mode" => m.ingest_mode = Some(s),
+            "filed_at" => m.filed_at = Some(s),
+            "authored_at" => m.authored_at = Some(s),
+            "chunk_index" => m.chunk_index = v.int(),
+            "agent" => m.agent = Some(s),
+            "date" => m.date = Some(s),
+            "topic" => m.topic = Some(s),
+            "entry_type" => m.entry_type = Some(s),
+            "parent_drawer_id" => m.parent_drawer_id = Some(s),
+            _ => {}
+        }
+    }
+    m
+}
+
+/// Bad JSON sets `unreadable`; otherwise see [`meta_from_pairs`].
 fn parse_meta(json: &str) -> DrawerMeta {
     let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(json) else {
         return DrawerMeta {
@@ -560,24 +611,10 @@ fn parse_meta(json: &str) -> DrawerMeta {
             ..Default::default()
         };
     };
-    let s = |k: &str| scalar(o.get(k));
-    DrawerMeta {
-        wing: s("wing").unwrap_or_default(),
-        room: s("room").unwrap_or_default(),
-        hall: s("hall"),
-        source_file: s("source_file"),
-        added_by: s("added_by"),
-        ingest_mode: s("ingest_mode"),
-        filed_at: s("filed_at"),
-        authored_at: s("authored_at"),
-        chunk_index: int(o.get("chunk_index")),
-        agent: s("agent"),
-        date: s("date"),
-        topic: s("topic"),
-        entry_type: s("entry_type"),
-        parent_drawer_id: s("parent_drawer_id"),
-        unreadable: false,
-    }
+    meta_from_pairs(
+        o.iter()
+            .filter_map(|(k, v)| from_json(v).map(|m| (k.clone(), m))),
+    )
 }
 
 impl PalaceReader for SqliteExactReader {
