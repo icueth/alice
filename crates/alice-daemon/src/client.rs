@@ -604,6 +604,14 @@ impl DaemonClient {
         self.call("/api/v1/import/mempalace", r, Duration::from_secs(30))
             .await
     }
+    /// One `mempalace_*` tool call (HTTP 409 while `compat.mempalace` is off).
+    pub async fn compat_call(
+        &self,
+        r: &crate::compat::CompatCall,
+    ) -> Result<crate::compat::CompatResult> {
+        self.call("/api/v1/compat/call", r, Duration::from_secs(10))
+            .await
+    }
     /// The running import's progress, or the last one's outcome.
     pub async fn import_status(&self) -> Result<alice_core::import::ImportStatus> {
         self.get_json("/api/v1/import/status").await

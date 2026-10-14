@@ -720,6 +720,67 @@ async fn import_routes_need_the_token_host_and_origin_guards() {
     );
 }
 
+/// The compatibility route answers 409 with the way to turn it on while `compat.mempalace` is
+/// off, serves once it is on, and sits behind the same guard as every other route.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_compat_route_refuses_while_compat_is_off_and_is_guarded() {
+    let s = Srv::start().await;
+    let call = serde_json::json!({"tool": "mempalace_list_wings", "arguments": {}});
+    let off = s.post("/api/v1/compat/call", &call).await;
+    assert_eq!(off.status(), 409);
+    let e: serde_json::Value = off.json().await.unwrap();
+    assert!(
+        e["error"].as_str().unwrap().contains("compat.mempalace"),
+        "{e}"
+    );
+
+    let mut changes = serde_json::Map::new();
+    changes.insert("compat.mempalace".into(), serde_json::json!(true));
+    s.svc.patch_settings(changes).unwrap();
+    let on = s.post("/api/v1/compat/call", &call).await;
+    assert_eq!(on.status(), 200);
+    let v: serde_json::Value = on.json().await.unwrap();
+    assert!(v["value"]["wings"].is_object(), "{v}");
+    // An unsupported tool and a bad argument are normal answers, not HTTP errors.
+    let r: serde_json::Value = s
+        .post_json(
+            "/api/v1/compat/call",
+            &serde_json::json!({"tool": "mempalace_search", "arguments": {}}),
+        )
+        .await;
+    assert_eq!(r["value"]["error"], "missing required argument: query");
+
+    let path = "/api/v1/compat/call";
+    let send = |token: Option<&str>, host: Option<&str>, origin: Option<&str>| {
+        let mut r = s.http.post(s.url(path)).json(&call);
+        if let Some(t) = token {
+            r = r.bearer_auth(t);
+        }
+        if let Some(h) = host {
+            r = r.header("Host", h);
+        }
+        if let Some(o) = origin {
+            r = r.header("Origin", o);
+        }
+        r.send()
+    };
+    assert_eq!(send(None, None, None).await.unwrap().status(), 401);
+    assert_eq!(
+        send(Some(&s.token), Some("evil.example:80"), None)
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        send(Some(&s.token), None, Some("https://evil.example"))
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+}
+
 /// Bodies the API cannot parse get the same JSON error shape as every other error.
 #[tokio::test(flavor = "multi_thread")]
 async fn unparseable_bodies_get_actionable_json_errors() {

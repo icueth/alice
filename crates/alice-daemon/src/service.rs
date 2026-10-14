@@ -440,6 +440,8 @@ pub struct Service {
     scheduler: Arc<Scheduler>,
     /// The one import job (a running one, or the last one's outcome).
     import: Mutex<ImportSlot>,
+    /// The compatibility layer's short-lived overview cache.
+    pub(crate) compat: crate::compat::CompatState,
     /// Tests: time added to the age of the shared health reading.
     #[cfg(test)]
     health_aged: Mutex<Duration>,
@@ -924,6 +926,7 @@ impl Service {
             activity,
             scheduler,
             import: Mutex::new(ImportSlot::new()),
+            compat: crate::compat::CompatState::default(),
             #[cfg(test)]
             health_aged: Mutex::new(Duration::ZERO),
             #[cfg(test)]

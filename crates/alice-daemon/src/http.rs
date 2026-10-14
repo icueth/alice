@@ -418,6 +418,25 @@ async fn start_import(
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
+/// A `mempalace_*` tool call. While `compat.mempalace` is off the answer is 409 with the way
+/// to turn it on (the MCP adapter says the same).
+async fn compat_call(
+    State(st): State<AppState>,
+    ApiJson(call): ApiJson<crate::compat::CompatCall>,
+) -> Response {
+    if !st.svc.settings().compat.mempalace {
+        return refuse(
+            StatusCode::CONFLICT,
+            "conflict",
+            crate::compat::OFF_MESSAGE.to_string(),
+        );
+    }
+    match st.svc.compat_call(call).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
 async fn import_status(State(st): State<AppState>) -> Json<alice_core::import::ImportStatus> {
     Json(st.svc.import_status())
 }
@@ -645,6 +664,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         )
         .route("/api/v1/import/mempalace", post(start_import))
         .route("/api/v1/import/status", get(import_status))
+        .route("/api/v1/compat/call", post(compat_call))
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         // Before the guard layer, so `/mcp` is covered by it.
         .nest_service(
