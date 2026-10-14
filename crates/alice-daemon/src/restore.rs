@@ -301,6 +301,9 @@ enum Step {
     Index,
     Sidecars,
     Rename,
+    /// Keeping a damaged current database: the file, and its WAL or shm.
+    KeepFile,
+    KeepSidecar,
 }
 
 /// What a swap asks of the world: free space, and a hook called before each step that a test
@@ -350,7 +353,10 @@ fn swap_with(
     let staged_ok = (|| -> Result<()> {
         (env.fault)(Step::Stage)?;
         copy_private(source, &staged)?;
-        let v = verify(&staged)?;
+        let v = verify(&staged);
+        // Opening a WAL-mode file can leave sidecars named after the staged file.
+        remove_staged_sidecars(&staged);
+        let v = v?;
         if (v.schema_version, v.memories, v.chunks)
             != (verified.schema_version, verified.memories, verified.chunks)
         {
@@ -362,7 +368,7 @@ fn swap_with(
         Ok(())
     })();
     if let Err(e) = staged_ok {
-        let _ = std::fs::remove_file(&staged);
+        remove_staged(&staged);
         return Err(AliceError::Other(format!(
             "cannot stage the backup ({e}); nothing was changed"
         )));
@@ -373,7 +379,7 @@ fn swap_with(
         match save_current(&db, dir, now, env, &mut warnings) {
             Ok(k) => Some(k),
             Err(e) => {
-                let _ = std::fs::remove_file(&staged);
+                remove_staged(&staged);
                 return Err(e);
             }
         }
@@ -381,7 +387,7 @@ fn swap_with(
         None
     };
     let abort = |e: AliceError| -> AliceError {
-        let _ = std::fs::remove_file(&staged);
+        remove_staged(&staged);
         if let Some(k) = &kept {
             for suffix in ["", "-wal", "-shm"] {
                 let _ =
@@ -391,16 +397,21 @@ fn swap_with(
         AliceError::Other(format!("{e}; the current database is unchanged"))
     };
 
-    // 3. The vector index belongs to the replaced database. Gone before the swap (a stale
+    // 3. Fold the WAL in, completely. An unreadable database has nothing to fold; a busy one
+    // stops the restore with its sidecars where they were.
+    if kept.as_ref().is_some_and(|k| !k.moved_aside)
+        && let Err(e) = checkpoint(&db)
+    {
+        return Err(abort(e));
+    }
+
+    // 4. The vector index belongs to the replaced database. Gone before the swap (a stale
     // index would be trusted by key), and a file that cannot be removed stops the restore.
     if let Err(e) = remove_index(home, env) {
         return Err(abort(e));
     }
 
-    // 4. Fold the WAL into the database where it can be read, then put the sidecars aside.
-    if kept.as_ref().is_some_and(|k| !k.moved_aside) {
-        checkpoint(&db);
-    }
+    // 5. Put the sidecars aside.
     let mut aside = Vec::new();
     if let Err(e) = (|| -> Result<()> {
         (env.fault)(Step::Sidecars)?;
@@ -418,11 +429,13 @@ fn swap_with(
         return Err(abort(e));
     }
 
-    // 5. One atomic rename: alice.db is the old database until this call, the restored one after.
+    // 6. One atomic rename: alice.db is the old database until this call, the restored one after.
     if let Err(e) = (env.fault)(Step::Rename).and_then(|_| std::fs::rename(&staged, &db)) {
         put_back(&aside);
         return Err(abort(e.into()));
     }
+    // Whatever opening the staged file left beside it is now orphaned.
+    remove_staged_sidecars(&staged);
     backup::sync_dir(home.root());
     for (_, bak) in &aside {
         let _ = std::fs::remove_file(bak);
@@ -444,17 +457,50 @@ fn swap_with(
     })
 }
 
+fn remove_staged_sidecars(staged: &Path) {
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", staged.display())));
+    }
+}
+
+/// The staged file and the `-wal`/`-shm` that opening a WAL-mode backup beside it can leave.
+fn remove_staged(staged: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", staged.display())));
+    }
+}
+
 fn put_back(aside: &[(PathBuf, PathBuf)]) {
     for (side, bak) in aside {
         let _ = std::fs::rename(bak, side);
     }
 }
 
-/// Fold a WAL into its database (best effort; a busy or damaged database is left as it is).
-fn checkpoint(db: &Path) {
-    if let Ok(c) = Connection::open(db) {
-        let _ = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+/// Fold the WAL of the current database into it, completely: the sidecars are put aside next,
+/// and a WAL that is not fully folded in would lose what it holds from the active database.
+/// `wal_checkpoint(TRUNCATE)` answers (busy, log frames, checkpointed frames); anything but
+/// "not busy, all frames checkpointed" (a reader holds the old snapshot, say) is an error. A
+/// database not in WAL mode answers (0, -1, -1) and passes.
+fn checkpoint(db: &Path) -> Result<()> {
+    let refuse = |why: String| {
+        AliceError::Other(format!(
+            "cannot fold the current database's WAL into it first ({why})"
+        ))
+    };
+    let c = Connection::open(db).map_err(|e| refuse(e.to_string()))?;
+    c.busy_timeout(std::time::Duration::from_millis(250))
+        .map_err(|e| refuse(e.to_string()))?;
+    let (busy, log, done): (i64, i64, i64) = c
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| refuse(e.to_string()))?;
+    if busy != 0 || (log != done && log != -1) {
+        return Err(refuse(format!(
+            "another process is using it: busy {busy}, {done} of {log} frames checkpointed"
+        )));
     }
+    Ok(())
 }
 
 fn remove_index(home: &AliceHome, env: &Env) -> Result<()> {
@@ -553,20 +599,80 @@ struct Kept {
     moved_aside: bool,
 }
 
-/// Whether `db` cannot be read as a database at all (open or `quick_check` fails).
-fn unreadable(db: &Path) -> bool {
-    match open_ro(db) {
-        Err(_) => true,
-        Ok(c) => alice_core::store::maintenance::quick_check(&c).map_or(true, |p| !p.is_empty()),
+/// What the current database looks like to a read-only open.
+#[derive(Debug, PartialEq, Eq)]
+enum Health {
+    Healthy,
+    /// Another process has it open in a way that blocks a read (busy or locked).
+    Busy,
+    /// Not a database, or it fails `quick_check`.
+    Damaged,
+}
+
+fn classify(e: &rusqlite::Error) -> Health {
+    match e.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+            Health::Busy
+        }
+        _ => Health::Damaged,
     }
 }
 
-/// Hard link, or copy where a link is not possible (another volume).
+/// A read-only open that does not wait for another process for long.
+fn open_quick(db: &Path) -> std::result::Result<Connection, rusqlite::Error> {
+    let c = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    c.busy_timeout(std::time::Duration::from_millis(250))?;
+    c.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })?;
+    Ok(c)
+}
+
+/// Whether another process holds `db` so that a read is refused (busy or locked). Cheap.
+fn is_busy(db: &Path) -> bool {
+    open_quick(db).is_err_and(|e| classify(&e) == Health::Busy)
+}
+
+fn health(db: &Path) -> Health {
+    let c = match open_quick(db) {
+        Ok(c) => c,
+        Err(e) => return classify(&e),
+    };
+    match alice_core::store::maintenance::quick_check(&c) {
+        Ok(problems) if problems.is_empty() => Health::Healthy,
+        Err(AliceError::Db(e)) => classify(&e),
+        _ => Health::Damaged,
+    }
+}
+
+/// Hard link, or copy where a link is not possible (another volume). A copy goes to a
+/// temporary name (`.alice-…tmp`, which Task 14's sweep knows) and is renamed into place, so a
+/// copy that fails midway leaves nothing under the real name.
 fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
-    if std::fs::hard_link(from, to).is_ok() {
+    link_or_copy_with(from, to, &|a, b| std::fs::hard_link(a, b), &|a, b| {
+        std::fs::copy(a, b)
+    })
+}
+
+fn link_or_copy_with(
+    from: &Path,
+    to: &Path,
+    link: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    copy: &dyn Fn(&Path, &Path) -> std::io::Result<u64>,
+) -> std::io::Result<()> {
+    if link(from, to).is_ok() {
         return Ok(());
     }
-    std::fs::copy(from, to).map(|_| ())
+    let name = to.file_name().map(|n| n.to_string_lossy().into_owned());
+    let tmp = to.with_file_name(format!(".{}.tmp", name.unwrap_or_default()));
+    let _ = std::fs::remove_file(&tmp);
+    match copy(from, &tmp).and_then(|_| std::fs::rename(&tmp, to)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Keep the database about to be replaced as a before-restore backup: a checked, private copy
@@ -574,7 +680,7 @@ fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
 /// rotation keeps it for `KEEP_DAYS` (the newest one for ever). Only a database that cannot be read
 /// at all (damaged, which is a common reason to restore) is kept as it is, as a link to the
 /// file (`alice.db` itself stays in place until the swap). Any other failure (no space, an I/O
-/// error) stops the restore with nothing changed.
+/// error, a database another process holds busy) stops the restore with nothing changed.
 fn save_current(
     db: &Path,
     dir: &Path,
@@ -593,6 +699,12 @@ fn save_current(
         }
         stamp += chrono::Duration::seconds(1);
     }
+    // The online copy waits for ever on a database another process holds locked: say so first.
+    if is_busy(db) {
+        return Err(AliceError::Other(
+            "the current database is busy or locked by another process; stop whatever has it open and retry. Nothing was changed".into(),
+        ));
+    }
     let attempt = (env.fault)(Step::Save)
         .map_err(AliceError::from)
         .and_then(|_| backup::create(db, dir, BackupKind::BeforeRestore, stamp));
@@ -603,29 +715,44 @@ fn save_current(
             moved_aside: false,
         }),
         Err(copy_error) => {
-            if !unreadable(db) {
-                return Err(AliceError::Other(format!(
-                    "cannot keep a copy of the current database first ({copy_error}); nothing was changed"
-                )));
+            match health(db) {
+                Health::Healthy => {
+                    return Err(AliceError::Other(format!(
+                        "cannot keep a copy of the current database first ({copy_error}); nothing was changed"
+                    )));
+                }
+                Health::Busy => {
+                    return Err(AliceError::Other(format!(
+                        "the current database is busy or locked by another process ({copy_error}); stop whatever has it open and retry. Nothing was changed"
+                    )));
+                }
+                Health::Damaged => {}
             }
             let name = backup::name_for(BackupKind::BeforeRestore, stamp, 0);
             let dest = dir.join(&name);
-            link_or_copy(db, &dest).map_err(|e| {
-                AliceError::Other(format!(
-                    "cannot keep the unreadable current database ({e}); nothing was changed"
-                ))
-            })?;
-            for suffix in ["-wal", "-shm"] {
-                let side = PathBuf::from(format!("{}{suffix}", db.display()));
-                if side.exists()
-                    && let Err(e) =
-                        link_or_copy(&side, &PathBuf::from(format!("{}{suffix}", dest.display())))
-                {
-                    warnings.push(format!("could not keep {}: {e}", side.display()));
+            let keep = || -> std::io::Result<()> {
+                (env.fault)(Step::KeepFile)?;
+                link_or_copy(db, &dest)?;
+                for suffix in ["-wal", "-shm"] {
+                    let side = PathBuf::from(format!("{}{suffix}", db.display()));
+                    if side.exists() {
+                        (env.fault)(Step::KeepSidecar)?;
+                        link_or_copy(&side, &PathBuf::from(format!("{}{suffix}", dest.display())))?;
+                    }
                 }
+                Ok(())
+            };
+            if let Err(e) = keep() {
+                // A kept copy without its WAL would lose what the WAL holds: all or nothing.
+                for suffix in ["", "-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", dest.display()));
+                }
+                return Err(AliceError::Other(format!(
+                    "cannot keep the damaged current database ({e}); nothing was changed"
+                )));
             }
             warnings.push(format!(
-                "the current database could not be read ({copy_error}); it was kept as it was"
+                "the current database is damaged or not a database ({copy_error}); it was kept as it was"
             ));
             Ok(Kept {
                 name,
@@ -1315,5 +1442,161 @@ mod tests {
         let v = verify(&copy);
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
         v.unwrap();
+    }
+
+    #[test]
+    fn a_reader_on_the_current_database_stops_the_restore_with_its_wal_intact() {
+        let (_d, h) = home_with_db();
+        let dir = h.backups_dir();
+        let b = manual(&h, Utc::now());
+        live_wal(&h.db());
+        // A reader whose snapshot predates a later commit: the checkpoint cannot finish.
+        let reader = Connection::open(h.db()).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM meta;")
+            .unwrap();
+        let writer = Connection::open(h.db()).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint = 0; INSERT INTO meta (key, value) VALUES ('after', 'reader');",
+            )
+            .unwrap();
+        let wal = PathBuf::from(format!("{}-wal", h.db().display()));
+        let wal_len = std::fs::metadata(&wal).unwrap().len();
+        assert!(wal_len > 0);
+        let err = swap(&h, &dir, &b.path, Utc::now()).unwrap_err().to_string();
+        assert!(err.contains("WAL") && err.contains("unchanged"), "{err}");
+        assert!(wal.exists(), "the WAL is where it was");
+        assert!(std::fs::metadata(&wal).unwrap().len() >= wal_len);
+        assert_eq!(walrow(&h.db()).as_deref(), Some("in the wal"));
+        assert_eq!(leftovers(&h), Vec::<String>::new());
+        assert!(
+            backup::list(&dir)
+                .unwrap()
+                .iter()
+                .all(|i| i.kind != BackupKind::BeforeRestore)
+        );
+        // With the reader gone the same restore goes through.
+        drop(reader);
+        drop(writer);
+        swap(&h, &dir, &b.path, Utc::now()).unwrap();
+        assert_eq!(which(&h.db()), "current");
+    }
+
+    #[test]
+    fn a_busy_current_database_has_its_own_message_and_is_not_called_unreadable() {
+        let (_d, h) = home_with_db();
+        let dir = h.backups_dir();
+        let b = manual(&h, Utc::now());
+        // A rollback-journal database with an exclusive lock held by another connection.
+        Connection::open(h.db())
+            .unwrap()
+            .query_row("PRAGMA journal_mode = DELETE", [], |_| Ok(()))
+            .unwrap();
+        let holder = Connection::open(h.db()).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let err = swap(&h, &dir, &b.path, Utc::now()).unwrap_err().to_string();
+        assert!(err.contains("busy or locked"), "{err}");
+        assert!(
+            !err.contains("unreadable") && !err.contains("damaged"),
+            "{err}"
+        );
+        assert!(err.contains("Nothing was changed"), "{err}");
+        drop(holder);
+        assert_eq!(which(&h.db()), "current");
+        assert_eq!(
+            classify(&rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+                None
+            )),
+            Health::Damaged
+        );
+    }
+
+    #[test]
+    fn a_copy_that_fails_midway_leaves_no_partial_file() {
+        let d = tempfile::tempdir().unwrap();
+        let (from, to) = (
+            d.path().join("src"),
+            d.path().join("alice-before-restore-x.db-wal"),
+        );
+        std::fs::write(&from, b"wal bytes").unwrap();
+        let no_link = |_: &Path, _: &Path| Err(std::io::Error::other("cross-device"));
+        let partial = |_: &Path, t: &Path| {
+            std::fs::write(t, b"wal")?;
+            Err(std::io::Error::other("disk full"))
+        };
+        assert!(link_or_copy_with(&from, &to, &no_link, &partial).is_err());
+        assert!(!to.exists(), "nothing under the real name");
+        assert_eq!(
+            std::fs::read_dir(d.path()).unwrap().count(),
+            1,
+            "no temporary left"
+        );
+        let whole = |a: &Path, b: &Path| std::fs::copy(a, b);
+        link_or_copy_with(&from, &to, &no_link, &whole).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"wal bytes");
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn a_failed_wal_link_of_a_damaged_database_aborts_instead_of_dropping_the_wal() {
+        let (_d, h) = home_with_db();
+        let dir = h.backups_dir();
+        let b = manual(&h, Utc::now());
+        std::fs::write(h.db(), b"X".repeat(8192)).unwrap();
+        let wal = PathBuf::from(format!("{}-wal", h.db().display()));
+        std::fs::write(&wal, b"precious wal").unwrap();
+        let v = verify(&b.path).unwrap();
+        let fail = |s: Step| {
+            if s == Step::KeepSidecar {
+                Err(std::io::Error::other("injected"))
+            } else {
+                Ok(())
+            }
+        };
+        let err = swap_with(
+            &h,
+            &dir,
+            &v,
+            Utc::now(),
+            &Env {
+                free: &|_| None,
+                fault: &fail,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nothing was changed"), "{err}");
+        assert_eq!(std::fs::read(h.db()).unwrap(), b"X".repeat(8192));
+        assert_eq!(
+            std::fs::read(&wal).unwrap(),
+            b"precious wal",
+            "the WAL stays"
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("before-restore"))
+            .collect();
+        assert!(names.is_empty(), "no half-kept copy: {names:?}");
+    }
+
+    #[test]
+    fn a_wal_mode_backup_leaves_nothing_beside_the_staged_file() {
+        let (_d, h) = home_with_db();
+        let dir = h.backups_dir();
+        let b = manual(&h, Utc::now());
+        Connection::open(&b.path)
+            .unwrap()
+            .query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
+            .unwrap();
+        // What opening a WAL-mode file beside the staged name can leave behind.
+        std::fs::write(h.root().join(".alice-restore.tmp-wal"), b"x").unwrap();
+        std::fs::write(h.root().join(".alice-restore.tmp-shm"), b"x").unwrap();
+        swap(&h, &dir, &b.path, Utc::now()).unwrap();
+        assert_eq!(leftovers(&h), Vec::<String>::new());
+        assert_eq!(which(&h.db()), "current");
     }
 }
