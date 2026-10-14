@@ -871,6 +871,7 @@ impl Service {
                     relevance_floor: cfg.search.relevance_floor as f32,
                     raw_min_results: cfg.search.raw_fallback_min_results,
                     half_lives: cfg.search.half_life.clone(),
+                    lists: search::Lists::Hybrid,
                 };
                 let out = search::run_with_chunk_reads(
                     c,

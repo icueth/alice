@@ -35,6 +35,15 @@ const MAX_RELATED: usize = 5;
 /// `crates/alice-embed/tests/real_search_quality.rs`.
 pub const DEFAULT_RELEVANCE_FLOOR: f32 = 0.82;
 
+/// Which candidate lists recall uses (evaluation only; agents always get `Hybrid`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Lists {
+    #[default]
+    Hybrid,
+    LexicalOnly,
+    VectorOnly,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchParams {
     pub query: String,
@@ -52,6 +61,8 @@ pub struct SearchParams {
     pub raw_min_results: usize,
     /// Recency half-lives per kind and for raw chunks (`search.half_life`).
     pub half_lives: HalfLives,
+    /// Which candidate lists to use (evaluation only).
+    pub lists: Lists,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -125,6 +136,7 @@ struct Query<'a> {
     text: &'a str,
     k: usize,
     reads: ChunkReads<'a>,
+    lists: Lists,
 }
 
 impl Query<'_> {
@@ -134,6 +146,9 @@ impl Query<'_> {
         let (Some(index), Some(v)) = (self.index, self.vector.as_deref()) else {
             return ChunkVectors::Nothing;
         };
+        if self.lists == Lists::LexicalOnly {
+            return ChunkVectors::Nothing;
+        }
         let ChunkReads::Pool(pool) = self.reads else {
             return ChunkVectors::Inline;
         };
@@ -162,6 +177,9 @@ impl Query<'_> {
         let (Some(index), Some(v)) = (self.index, self.vector.as_deref()) else {
             return Vec::new();
         };
+        if self.lists == Lists::LexicalOnly {
+            return Vec::new();
+        }
         index
             .search(v, self.k, KeyFilter::Memories)
             .unwrap_or_else(|e| {
@@ -172,24 +190,25 @@ impl Query<'_> {
 
     fn knowledge(&self) -> Candidates {
         let (c, q, k) = (self.conn, self.text, self.k);
-        let words = lexical::memory_words(c, q, k);
-        let use_trigram = lexical::should_use_trigram(q) || words.len() < SHORT_LIST;
-        let mut lists = vec![
-            (MatchVia::Words, refs(words, ItemRef::Memory)),
-            (
+        let mut lists = Vec::new();
+        if self.lists != Lists::VectorOnly {
+            let words = lexical::memory_words(c, q, k);
+            let use_trigram = lexical::should_use_trigram(q) || words.len() < SHORT_LIST;
+            lists.push((MatchVia::Words, refs(words, ItemRef::Memory)));
+            lists.push((
                 MatchVia::Code,
                 refs(lexical::memory_code(c, q, k), ItemRef::Memory),
-            ),
-        ];
-        if use_trigram {
-            lists.push((
-                MatchVia::Words,
-                refs(lexical::memory_trigram(c, q, k), ItemRef::Memory),
             ));
-        }
-        let like = lexical::memory_like(c, q, k);
-        if !like.is_empty() {
-            lists.push((MatchVia::Words, refs(like, ItemRef::Memory)));
+            if use_trigram {
+                lists.push((
+                    MatchVia::Words,
+                    refs(lexical::memory_trigram(c, q, k), ItemRef::Memory),
+                ));
+            }
+            let like = lexical::memory_like(c, q, k);
+            if !like.is_empty() {
+                lists.push((MatchVia::Words, refs(like, ItemRef::Memory)));
+            }
         }
         let vector = self
             .memory_vector_hits()
@@ -206,26 +225,29 @@ impl Query<'_> {
     /// started by [`Self::chunk_vectors`] (joined last, so the two overlap).
     fn raw(&self, chunks: ChunkVectors<'_>) -> Candidates {
         let (c, q, k) = (self.conn, self.text, self.k);
-        let words = lexical::chunk_words(c, q, k);
-        let use_trigram = lexical::should_use_trigram(q) || words.len() < SHORT_LIST;
-        let mut lists = vec![
-            (MatchVia::Words, refs(words, ItemRef::Chunk)),
-            (
+        let mut lists = Vec::new();
+        if self.lists != Lists::VectorOnly {
+            let words = lexical::chunk_words(c, q, k);
+            let use_trigram = lexical::should_use_trigram(q) || words.len() < SHORT_LIST;
+            lists.push((MatchVia::Words, refs(words, ItemRef::Chunk)));
+            lists.push((
                 MatchVia::Code,
                 refs(lexical::chunk_code(c, q, k), ItemRef::Chunk),
-            ),
-        ];
-        if use_trigram {
-            lists.push((
-                MatchVia::Words,
-                refs(lexical::chunk_trigram(c, q, k), ItemRef::Chunk),
             ));
+            if use_trigram {
+                lists.push((
+                    MatchVia::Words,
+                    refs(lexical::chunk_trigram(c, q, k), ItemRef::Chunk),
+                ));
+            }
         }
         // Sign-bit candidates rescored with the stored vectors: exact cosine similarities.
         let vector = match chunks {
             ChunkVectors::Nothing => Vec::new(),
             ChunkVectors::Inline => match (self.index, self.vector.as_deref()) {
-                (Some(index), Some(v)) => chunk_vector_list(index, c, v, k),
+                (Some(index), Some(v)) if self.lists != Lists::LexicalOnly => {
+                    chunk_vector_list(index, c, v, k)
+                }
                 _ => Vec::new(),
             },
             ChunkVectors::Running(handle) => handle.join().unwrap_or_else(|_| {
@@ -474,6 +496,7 @@ pub fn run_with_chunk_reads(
             CANDIDATES
         },
         reads,
+        lists: p.lists,
     };
     let filters = Filters {
         p,
@@ -852,6 +875,36 @@ mod tests {
     }
 
     #[test]
+    fn lexical_only_and_vector_only_use_only_their_lists() {
+        let f = fx();
+        f.add(&f.app, Kind::Fact, "the writer lease timeout is 30 seconds");
+        f.add(&f.app, Kind::Fact, "writer lease renewed every ten seconds");
+        f.add(&f.app, Kind::Fact, "unrelated note about gardening");
+        for (lists, banned) in [
+            (Lists::LexicalOnly, MatchVia::Vector),
+            (Lists::VectorOnly, MatchVia::Words),
+        ] {
+            let p = SearchParams {
+                lists,
+                relevance_floor: 0.0,
+                ..f.params("writer lease timeout")
+            };
+            let out = f.search(&p);
+            assert!(!out.hits.is_empty(), "{lists:?}");
+            assert!(
+                out.hits.iter().all(|h| !h.matched.contains(&banned)),
+                "{lists:?}: {:?}",
+                out.hits
+            );
+        }
+        let hybrid = f.search(&SearchParams {
+            relevance_floor: 0.0,
+            ..f.params("writer lease timeout")
+        });
+        assert!(hybrid.hits.len() >= 2);
+    }
+
+    #[test]
     fn finds_thai_english_and_code_identifiers() {
         let f = fx();
         f.add(
@@ -941,6 +994,7 @@ mod tests {
                 text: &text,
                 k: CANDIDATES,
                 reads: ChunkReads::Inline,
+                lists: Lists::Hybrid,
             };
             let (scores, _) = query.raw(ChunkVectors::Nothing);
             let mut fused: Vec<(ItemRef, f64)> = scores.into_iter().collect();

@@ -1,0 +1,70 @@
+{"q":"ทำไม reader ไม่ต้องรอ writer","lang":"th","kind":"same"}
+{"q":"รัน test ทั้งโปรเจกต์ยังไง","lang":"th","kind":"same"}
+{"q":"ขนาดไฟล์อัปโหลดสูงสุดเท่าไหร่","lang":"th","kind":"same"}
+{"q":"ใครดูแลเซิร์ฟเวอร์","lang":"th","kind":"same"}
+{"q":"ราคาแพ็กเกจ Pro เท่าไหร่","lang":"th","kind":"same"}
+{"q":"ล้าง cache ทำยังไง","lang":"th","kind":"same"}
+{"q":"backup ฐานข้อมูลบ่อยแค่ไหน","lang":"th","kind":"same"}
+{"q":"หน้าชำระเงินเสร็จหรือยัง","lang":"th","kind":"same"}
+{"q":"เลือก Postgres เพราะอะไร","lang":"th","kind":"same"}
+{"q":"ห้ามลบโฟลเดอร์อะไร","lang":"th","kind":"same"}
+{"q":"ใบรับรอง SSL หมดอายุเมื่อไหร่","lang":"th","kind":"same"}
+{"q":"backend เขียนด้วยภาษาอะไร","lang":"th","kind":"same"}
+{"q":"วิธีตั้งค่า Kubernetes cluster","lang":"th","kind":"same","answerable":false}
+{"q":"สูตรทำต้มยำกุ้ง","lang":"th","kind":"same","answerable":false}
+{"q":"how do I deploy the API to production","lang":"en","kind":"same"}
+{"q":"what is the staging Postgres port","lang":"en","kind":"same"}
+{"q":"what is the max upload size","lang":"en","kind":"same"}
+{"q":"how do I reset the dev database","lang":"en","kind":"same"}
+{"q":"which python version does the project use","lang":"en","kind":"same"}
+{"q":"why did the checkout crash","lang":"en","kind":"same"}
+{"q":"how long does CI take","lang":"en","kind":"same"}
+{"q":"how are passwords hashed","lang":"en","kind":"same"}
+{"q":"who is the release manager","lang":"en","kind":"same"}
+{"q":"when does the TLS certificate expire","lang":"en","kind":"same"}
+{"q":"how to configure Kubernetes autoscaling","lang":"en","kind":"same","answerable":false}
+{"q":"best pizza recipe","lang":"en","kind":"same","answerable":false}
+{"q":"what is the weather in Paris","lang":"en","kind":"same","answerable":false}
+{"q":"staging postgres port เปลี่ยนเป็นอะไร","lang":"mixed","kind":"same"}
+{"q":"deploy staging ทำยังไง","lang":"mixed","kind":"same"}
+{"q":"pnpm กับ npm เลือกอะไร","lang":"mixed","kind":"same"}
+{"q":"Redis ใช้ทำอะไรในระบบ","lang":"mixed","kind":"same"}
+{"q":"embedding batch size เท่าไหร่","lang":"mixed","kind":"same"}
+{"q":"Docker image ขนาดเท่าไหร่","lang":"mixed","kind":"same"}
+{"q":"CI ใช้ Node เวอร์ชันไหน","lang":"mixed","kind":"same"}
+{"q":"ฐานข้อมูลอยู่ region ไหน","lang":"mixed","kind":"same"}
+{"q":"monitoring ใช้อะไร","lang":"mixed","kind":"same"}
+{"q":"วิธีทำ Kubernetes autoscaling","lang":"mixed","kind":"same","answerable":false}
+{"q":"ราคา Bitcoin วันนี้","lang":"mixed","kind":"same","answerable":false}
+{"q":"HostLinkReconnect backoff limit","lang":"code","kind":"same"}
+{"q":"MAX_RETRIES value","lang":"code","kind":"same"}
+{"q":"paginate last page bug","lang":"code","kind":"same"}
+{"q":"run a single test with cargo","lang":"code","kind":"same"}
+{"q":"LOG_LEVEL debug","lang":"code","kind":"same"}
+{"q":"Cache::get return type","lang":"code","kind":"same"}
+{"q":"alembic upgrade head","lang":"code","kind":"same"}
+{"q":"pool.max_connections","lang":"code","kind":"same"}
+{"q":"users.email unique index","lang":"code","kind":"same"}
+{"q":"MSRV","lang":"code","kind":"same"}
+{"q":"tokio::select! cancellation safety","lang":"code","kind":"same","answerable":false}
+{"q":"BTreeMap range query","lang":"code","kind":"same","answerable":false}
+{"q":"ขีดจำกัดขนาดไฟล์ที่อัปโหลด","lang":"th","kind":"cross"}
+{"q":"ฐานข้อมูล production ใช้พื้นที่เท่าไหร่","lang":"th","kind":"cross"}
+{"q":"ผู้จัดการ release คือใคร","lang":"th","kind":"cross"}
+{"q":"วิธีติดตั้ง CLI","lang":"th","kind":"cross"}
+{"q":"ใบรับรอง TLS หมดอายุเมื่อไหร่","lang":"th","kind":"cross"}
+{"q":"ควรใช้ force push เข้า main ไหม","lang":"th","kind":"cross"}
+{"q":"ฝ่ายสนับสนุนทำงานกี่โมง","lang":"th","kind":"cross"}
+{"q":"region เริ่มต้นของ environment ใหม่","lang":"th","kind":"cross"}
+{"q":"who maintains the servers","lang":"en","kind":"cross"}
+{"q":"how often is the database backed up","lang":"en","kind":"cross"}
+{"q":"what is the price of the Pro plan","lang":"en","kind":"cross"}
+{"q":"which CI tool does the team use","lang":"en","kind":"cross"}
+{"q":"largest attachment accepted","lang":"en","kind":"para"}
+{"q":"who is in charge of shipping versions","lang":"en","kind":"para"}
+{"q":"time for the automated build to finish","lang":"en","kind":"para"}
+{"q":"protect the shared branch from history rewrites","lang":"en","kind":"para"}
+{"q":"ขนาดสูงสุดของสิ่งที่ผู้ใช้ส่งขึ้นมา","lang":"th","kind":"para"}
+{"q":"ใครรับผิดชอบเครื่องแม่ข่าย","lang":"th","kind":"para"}
+{"q":"ข้อมูลสำรองถ่ายบ่อยแค่ไหน","lang":"th","kind":"para"}
+{"q":"limit on simultaneous database links","lang":"code","kind":"para"}
