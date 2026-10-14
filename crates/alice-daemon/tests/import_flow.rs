@@ -1811,6 +1811,7 @@ async fn a_run_that_stops_before_the_mentions_is_completed_by_the_next_one() {
     assert_eq!(f.count("memories").await, 4);
 
     let svc = start_service(&f.home);
+    let events_before = f.events_of("import.batch").await.len();
     svc.start_import(f.request()).unwrap();
     let t = Instant::now();
     let st = loop {
@@ -1824,7 +1825,24 @@ async fn a_run_that_stops_before_the_mentions_is_completed_by_the_next_one() {
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
     let r = st.report.unwrap();
     assert_eq!(r.already_imported, 5 + 80 + 30, "nothing was planned again");
-    assert!(f.entity_mentions_exist().await, "the rerun linked them");
+    // The rerun's batches: the closing one and the marker (as in a finished palace) plus at most
+    // one mention batch (the embed/judge workers, which run beside the job, may have linked the
+    // last memory first, so the batch cannot be required). What the rerun guarantees is that
+    // nothing imported is left unlinked.
+    let sent = f.events_of("import.batch").await.len() - events_before;
+    assert!((2..=3).contains(&sent), "the rerun sent {sent} batches");
+    let unlinked: i64 = f
+        .db()
+        .query_row(
+            "SELECT count(*) FROM memories m WHERE m.legacy_id IS NOT NULL AND EXISTS (
+                 SELECT 1 FROM entities e WHERE instr(lower(m.title || char(10) || m.body), lower(e.name)) > 0
+                   AND NOT EXISTS (SELECT 1 FROM mentions x WHERE x.memory_id = m.id AND x.entity_id = e.id))",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unlinked, 0, "memories left unlinked after the rerun");
+    assert!(f.entity_mentions_exist().await);
     assert!(
         f.meta("import.mempalace.last")
             .await

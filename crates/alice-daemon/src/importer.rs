@@ -125,28 +125,13 @@ pub struct ImportEnv {
     pub hook: Option<Arc<ImportHook>>,
 }
 
-/// Live bytes of the write-ahead log after a `PASSIVE` checkpoint (which never takes the write
-/// lock and never waits), on a short-lived connection of its own. The file itself never shrinks
-/// when the log restarts, so the frames in use are what counts. 0 when the log cannot be read.
-fn passive_checkpoint(db: &Path) -> u64 {
-    let Ok(conn) = rusqlite::Connection::open(db) else {
-        return 0;
-    };
-    let _ = conn.busy_timeout(std::time::Duration::ZERO);
-    let page: u64 = conn
-        .query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
-        .map_or(4096, |p| p as u64);
-    conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get::<_, i64>(1))
-        .map_or(0, |frames| frames.max(0) as u64 * page)
-}
-
-/// Constant readers can keep SQLite from ever restarting the log, so it grows without bound
-/// (a 100,000-drawer import under 20 clients reached 4 GB). The job copies it back with
-/// `PASSIVE` checkpoints, which never wait and never touch the write lock. A blocking checkpoint
-/// (`RESTART`) would restart the log, but it made the writer's own transactions fail with
-/// "database is locked" under load, so it is not used. Returns the live size seen.
-fn relieve_wal(db: &Path) -> u64 {
-    passive_checkpoint(db)
+/// Size of the write-ahead log file at this moment (0 when there is none). A diagnostic for the
+/// status: checkpointing it from here was tried and gave no measurable benefit (see
+/// `docs/benchmarks/m3.md`), so the job only looks.
+fn wal_size(db: &Path) -> u64 {
+    let mut name = db.as_os_str().to_owned();
+    name.push("-wal");
+    std::fs::metadata(PathBuf::from(name)).map_or(0, |m| m.len())
 }
 
 /// Test hook: makes the job wait (`hold`) or panic (`panic`) right after its snapshot is taken.
@@ -949,7 +934,7 @@ impl Ctx<'_> {
                     st.batches
                 };
                 if batches.is_multiple_of(WAL_CHECK_EVERY) {
-                    let live = relieve_wal(&self.env.home.db());
+                    let live = wal_size(&self.env.home.db());
                     let mut st = self.env.status.lock();
                     st.max_wal_bytes = st.max_wal_bytes.max(live);
                 }

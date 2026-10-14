@@ -1449,7 +1449,7 @@ async fn events_are_attributed_and_agent_writes_wait_for_the_judge() {
     );
     let judge = f.scalar("SELECT judge_state FROM memories WHERE id = ?1", &id);
     assert!(
-        ["pending", "done", "retry", "skipped"].contains(&judge.as_str()),
+        ["pending", "done", "retry"].contains(&judge.as_str()),
         "judge_state {judge}"
     );
     // added_by names the author of the creation

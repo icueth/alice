@@ -280,7 +280,7 @@ async fn twenty_clients_keep_working_while_a_palace_imports() {
     let wal = std::fs::metadata(format!("{}-wal", f.home.db().display())).map_or(0, |m| m.len());
     let peak = f.svc.import_status().max_wal_bytes;
     eprintln!(
-        "write-ahead log: live peak at the import's checks {} MB, file at the end {} MB",
+        "write-ahead log: largest size at the import's checks {} MB, file at the end {} MB",
         peak / 1_000_000,
         wal / 1_000_000
     );

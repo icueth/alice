@@ -2203,8 +2203,14 @@ mod import {
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )
             .unwrap();
-            db.query_row("SELECT count(*) FROM legacy_ids", [], |r| r.get(0))
-                .unwrap()
+            // Drawer rows only (a graph triple has one too). The synthetic palace stores one row
+            // per drawer, which the exact counts at the end of the test check.
+            db.query_row(
+                "SELECT count(*) FROM legacy_ids WHERE target_type IN ('memory', 'chunk')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
         };
         assert!(
             kept_before_kill > 0,

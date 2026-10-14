@@ -75,7 +75,7 @@ pub struct ImportStatus {
     pub max_batch_records: u64,
     #[serde(default)]
     pub max_batch_bytes: u64,
-    /// The most write-ahead log (bytes of live frames) seen at the job's checks.
+    /// The largest size of the write-ahead log file seen at the job's checks (every 20 batches).
     #[serde(default)]
     pub max_wal_bytes: u64,
 }
