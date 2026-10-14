@@ -635,7 +635,7 @@ async fn load(
         // A rebuilt index, or memories the last run left unembedded.
         loop {
             let h = svc.health().await?;
-            if h.embed_backlog == 0 && h.index_ready {
+            if h.embed_backlog == 0 && h.judge_backlog == 0 && h.index_ready {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -708,7 +708,9 @@ async fn load(
     let mut during = Vec::new();
     loop {
         let h = svc.health().await?;
-        if h.embed_backlog == 0 && h.index_ready {
+        // The judge compares every new memory with its neighbours once it is embedded: measure
+        // the latencies below on a daemon that has finished that work too.
+        if h.embed_backlog == 0 && h.judge_backlog == 0 && h.index_ready {
             break;
         }
         let (res, d) = timed(svc.recall(RecallRequest {
@@ -1062,6 +1064,18 @@ fn daemon_run(
             run.remembered = NEW;
             run.remembered_long = LONG;
             run.embed_new_ms = ms(t.elapsed());
+            // The judge compares each embedded memory with its neighbours; the measurements
+            // below are of a daemon that has finished that too (not part of `embed_new_ms`).
+            while client.health().await?.judge_backlog > 0 {
+                if Instant::now() > deadline {
+                    bail!(
+                        "the bench daemon still had memories to judge after {} s; see {}",
+                        DAEMON_WAIT.as_secs(),
+                        home.logs_dir().join("daemon.log").display()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             run.rss_after_embedding_mb = rss_mb(pid);
             run.footprint_after_embedding_mb = footprint_mb(pid).map(|f| f.0);
         }

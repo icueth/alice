@@ -25,6 +25,9 @@ pub struct NewMemoryInput {
     pub legacy_id: Option<String>,
     /// Import only: keep the original creation time.
     pub created_at: Option<String>,
+    /// The project is `global` only because nothing named one (no project, no working
+    /// directory): the judge may route the memory to a project later.
+    pub project_defaulted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +47,10 @@ pub struct PreparedMemory {
     pub created_at: String,
     pub hlc: String,
     pub legacy_id: Option<String>,
+    /// The writer gave a kind (0 in the database when `kind` defaulted to `note`: the judge may
+    /// classify it).
+    pub kind_explicit: bool,
+    pub project_defaulted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +170,8 @@ pub fn prepare(
         created_at: input.created_at.unwrap_or_else(now_rfc3339),
         hlc,
         legacy_id: input.legacy_id,
+        kind_explicit: input.kind.is_some(),
+        project_defaulted: input.project_defaulted,
     })
 }
 
@@ -223,7 +232,9 @@ pub(crate) fn ensure_unique_content(
     }
 }
 
-fn add_link(conn: &Connection, from: &str, to: &str, kind: &str, by: &str) -> Result<()> {
+/// Add a link `from` → `to` of type `kind` (`supersedes`, `duplicate_of`, `contradicts`, ...),
+/// made by `by`. An existing identical link is left as it is.
+pub fn link(conn: &Connection, from: &str, to: &str, kind: &str, by: &str) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO links (from_id, to_id, type, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![from, to, kind, by, now_rfc3339()],
@@ -260,8 +271,9 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
     let now = now_rfc3339();
     conn.execute(
         "INSERT INTO memories (id, project_id, kind, title, body, importance, status, content_hash,
-            author_agent, author_model, author_session, idempotency_key, created_at, updated_at, hlc, legacy_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            author_agent, author_model, author_session, idempotency_key, created_at, updated_at, hlc, legacy_id,
+            kind_explicit, project_defaulted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             m.id,
             m.project_id,
@@ -277,7 +289,9 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
             m.created_at,
             now,
             m.hlc,
-            m.legacy_id
+            m.legacy_id,
+            m.kind_explicit,
+            m.project_defaulted
         ],
     )?;
     let seq = conn.last_insert_rowid();
@@ -302,7 +316,7 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
         if old_status != Status::Trashed.as_str() {
             set_status(conn, old_seq, Status::Superseded, Some(&m.hlc))?;
         }
-        add_link(conn, &m.id, &old_id, "supersedes", &by)?;
+        link(conn, &m.id, &old_id, "supersedes", &by)?;
     }
     Ok(InsertOutcome::New {
         id: m.id.clone(),
@@ -468,7 +482,7 @@ pub fn merge_into(
             continue;
         }
         set_status(conn, seq, Status::Trashed, Some(hlc))?;
-        add_link(conn, &id, &survivor, "duplicate_of", "merge")?;
+        link(conn, &id, &survivor, "duplicate_of", "merge")?;
         conn.execute(
             "INSERT OR IGNORE INTO provenance (memory_id, chunk_id) SELECT ?1, chunk_id FROM provenance WHERE memory_id = ?2",
             params![survivor, id],
@@ -615,7 +629,7 @@ pub fn apply_update(conn: &Connection, id: &str, u: &MemoryUpdate, hlc: String) 
                     r.get(0)
                 })?;
             status_change(Status::Superseded)?;
-            add_link(conn, &by_id, &current.id, "supersedes", "user")?;
+            link(conn, &by_id, &current.id, "supersedes", "user")?;
         }
         UpdateAction::Archive => status_change(Status::Archived)?,
         UpdateAction::Forget => status_change(Status::Trashed)?,
@@ -693,6 +707,42 @@ mod tests {
         );
         assert_eq!(got.project, "app");
         assert_eq!(got.author.agent.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn the_judge_flags_record_whether_the_kind_and_the_project_were_given() {
+        let (_d, c, p) = setup();
+        let flags = |c: &rusqlite::Connection, id: &str| -> (i64, i64) {
+            c.query_row(
+                "SELECT kind_explicit, project_defaulted FROM memories WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let mut given = input("a decision with a kind");
+        given.kind = Some(Kind::Decision);
+        let mut defaulted = input("a note without a kind");
+        defaulted.project_defaulted = true;
+        let ids: Vec<String> = [given, defaulted]
+            .into_iter()
+            .map(
+                |i| match insert(&c, &prepare(i, &p, "h".into()).unwrap()).unwrap() {
+                    InsertOutcome::New { id, .. } => id,
+                    other => panic!("{other:?}"),
+                },
+            )
+            .collect();
+        assert_eq!(
+            flags(&c, &ids[0]),
+            (1, 0),
+            "an explicit kind, a known project"
+        );
+        assert_eq!(
+            flags(&c, &ids[1]),
+            (0, 1),
+            "no kind given, no project known"
+        );
     }
 
     #[test]

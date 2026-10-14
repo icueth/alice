@@ -9,9 +9,10 @@ use std::path::Path;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("sql/0001_init.sql")),
     (2, include_str!("sql/0002_events_reviews.sql")),
+    (3, include_str!("sql/0003_judge.sql")),
 ];
 
-pub const CURRENT_VERSION: i64 = 2;
+pub const CURRENT_VERSION: i64 = 3;
 
 // CURRENT_VERSION must name the newest migration.
 const _: () = assert!(MIGRATIONS[MIGRATIONS.len() - 1].0 == CURRENT_VERSION);

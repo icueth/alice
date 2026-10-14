@@ -57,7 +57,7 @@ pub enum ReviewStatus {
     Resolved,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewReview {
     pub kind: ReviewType,
     pub payload: serde_json::Value,

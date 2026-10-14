@@ -356,6 +356,15 @@ pub struct Health {
     pub chunks: u64,
     pub projects: u64,
     pub embed_backlog: u64,
+    /// Memories waiting for the judge (embedded or not yet).
+    #[serde(default)]
+    pub judge_backlog: u64,
+    /// The judge in force (`heuristic` or `jev`).
+    #[serde(default)]
+    pub judge_provider: String,
+    /// Why the judge in force is not the one asked for (or out of budget), if it is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_warning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<String>,
     /// False while the vector index is being rebuilt (search is lexical-only meanwhile).
