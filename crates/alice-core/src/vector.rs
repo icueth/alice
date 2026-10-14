@@ -1322,6 +1322,8 @@ mod tests {
     /// (inode, mtime): a rewrite by temp file + rename changes the inode.
     fn fingerprint(p: &Path) -> (u64, std::time::SystemTime) {
         let m = std::fs::metadata(p).unwrap();
+        // Inode numbers are Unix (std has no stable file index on Windows); there the mtime
+        // alone shows a rewrite (the test waits 50 ms before saving again).
         #[cfg(unix)]
         let ino = std::os::unix::fs::MetadataExt::ino(&m);
         #[cfg(not(unix))]

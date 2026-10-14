@@ -144,32 +144,72 @@ fn main_checkout(common_dir: &Path) -> PathBuf {
 }
 
 /// `canonicalize` on Windows returns `\\?\C:\…` (and `\\?\UNC\server\share\…`), which git and
-/// people do not use; strip it so keys and `git -C` see the ordinary form. Identity elsewhere.
-/// Only the drive (`\\?\C:\`) and UNC forms are rewritten: a volume GUID path
-/// (`\\?\Volume{…}\`) has no ordinary form and stays as it is.
+/// people do not use; strip it so keys and `git -C` see the ordinary form. Identity elsewhere,
+/// and on Windows whenever the ordinary form would not name the same file (see
+/// [`ordinary_form`]).
 pub fn strip_verbatim(p: PathBuf) -> PathBuf {
     #[cfg(windows)]
-    {
-        use std::path::{Component, Prefix};
-        let kind = match p.components().next() {
-            Some(Component::Prefix(prefix)) => Some(prefix.kind()),
-            _ => None,
-        };
-        match (kind, p.to_str()) {
-            (Some(Prefix::VerbatimDisk(_)), Some(s)) => {
-                if let Some(rest) = s.strip_prefix(r"\\?\") {
-                    return PathBuf::from(rest);
-                }
-            }
-            (Some(Prefix::VerbatimUNC(..)), Some(s)) => {
-                if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-                    return PathBuf::from(format!(r"\\{rest}"));
-                }
-            }
-            _ => {}
-        }
+    if let Some(ordinary) = p.to_str().and_then(ordinary_form) {
+        return PathBuf::from(ordinary);
     }
     p
+}
+
+/// Win32 device names: in the ordinary (non-verbatim) form, a component named like these
+/// (with or without an extension) means the device, not a file.
+#[cfg_attr(not(windows), allow(dead_code))]
+const RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// The ordinary form of a Windows verbatim path (`\\?\C:\a` -> `C:\a`, `\\?\UNC\srv\share\a` ->
+/// `\\srv\share\a`), or `None` when there is none that names the same file: another verbatim
+/// kind (`\\?\Volume{…}\`), a component that ends in `.` or a space (the ordinary form trims
+/// them), a reserved device name (`CON`, `nul.txt`, `LPT1`…), or 260 UTF-16 units or more
+/// (`MAX_PATH`). Pure string work, so it is tested on every OS.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ordinary_form(verbatim: &str) -> Option<String> {
+    let (ordinary, names) = if let Some(rest) = verbatim.strip_prefix(r"\\?\UNC\") {
+        // A server and a share at least.
+        if rest.split('\\').filter(|n| !n.is_empty()).count() < 2 {
+            return None;
+        }
+        (format!(r"\\{rest}"), rest)
+    } else {
+        // `X:\` exactly: `\\?\X:` alone would become the drive-relative `X:`.
+        let rest = verbatim.strip_prefix(r"\\?\")?;
+        let b = rest.as_bytes();
+        if !(b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\') {
+            return None;
+        }
+        (rest.to_string(), &rest[3..])
+    };
+    let safe = |name: &str| {
+        let stem = name.split('.').next().unwrap_or_default().trim_end();
+        !name.ends_with(['.', ' ']) && !RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(stem))
+    };
+    let fits = ordinary.encode_utf16().count() < 260;
+    (fits && names.split('\\').filter(|n| !n.is_empty()).all(safe)).then_some(ordinary)
+}
+
+/// `path:<dir>`. On Windows with `/` separators and an upper-case drive letter, the form git
+/// prints, so a directory keeps its key when it becomes a repository without a remote.
+fn path_key(p: &Path) -> String {
+    let shown = p.display().to_string();
+    #[cfg(windows)]
+    let shown = windows_key_form(&shown);
+    format!("path:{shown}")
+}
+
+/// `c:\work\repo` and `C:/work/repo` -> `C:/work/repo`; `\\srv\share` -> `//srv/share`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_key_form(path: &str) -> String {
+    let mut s = path.replace('\\', "/");
+    if s.as_bytes().get(1) == Some(&b':') {
+        s[..1].make_ascii_uppercase();
+    }
+    s
 }
 
 /// `canonicalize` without the Windows verbatim prefix (see [`strip_verbatim`]).
@@ -214,9 +254,7 @@ fn detect_with_home(cwd: &Path, home: Option<&Path>) -> ProjectRef {
                 .map(|n| n.strip_suffix(".git").unwrap_or(&n).to_string())
                 .unwrap_or_default(),
         };
-        let key = remote
-            .clone()
-            .unwrap_or_else(|| format!("path:{}", main.display()));
+        let key = remote.clone().unwrap_or_else(|| path_key(&main));
         let slug = slugify(&name);
         if slug.is_empty() {
             return ProjectRef::global();
@@ -238,7 +276,7 @@ fn detect_with_home(cwd: &Path, home: Option<&Path>) -> ProjectRef {
         return ProjectRef::global();
     }
     ProjectRef {
-        key: format!("path:{}", dir.display()),
+        key: path_key(&dir),
         slug,
         name,
         root: Some(dir),
@@ -564,6 +602,76 @@ mod tests {
                 cwd.display()
             );
         }
+    }
+
+    /// Pure string checks, so every OS runs them.
+    #[test]
+    fn the_verbatim_prefix_is_kept_where_the_ordinary_form_names_another_file() {
+        let o = |s: &str| ordinary_form(s);
+        assert_eq!(o(r"\\?\C:\work\repo").as_deref(), Some(r"C:\work\repo"));
+        assert_eq!(o(r"\\?\d:\").as_deref(), Some(r"d:\"));
+        assert_eq!(
+            o(r"\\?\C:\ข้อมูล ทดสอบ\x").as_deref(),
+            Some(r"C:\ข้อมูล ทดสอบ\x")
+        );
+        assert_eq!(o(r"\\?\UNC\srv\share\r").as_deref(), Some(r"\\srv\share\r"));
+        // Names that merely contain a device name, or a dot inside, are ordinary.
+        assert!(o(r"\\?\C:\CONSOLE\con-tools\COM10\lpt\a.b").is_some());
+        for kept in [
+            // Not a drive or UNC path.
+            r"\\?\Volume{b75e2c83-0000-0000-0000-602f00000000}\r",
+            r"\\?\C:",
+            r"\\?\UNC\srv",
+            r"C:\work",
+            r"/tmp/x",
+            // The ordinary form trims a trailing dot or space.
+            r"\\?\C:\work.\repo",
+            r"\\?\C:\work\repo ",
+            r"\\?\UNC\srv\share.\r",
+            // Device names, any case, with or without an extension.
+            r"\\?\C:\work\CON",
+            r"\\?\C:\work\nul.txt",
+            r"\\?\C:\Aux\x",
+            r"\\?\C:\work\prn .log",
+            r"\\?\C:\work\com1",
+            r"\\?\C:\work\LPT9.tar.gz",
+        ] {
+            assert_eq!(o(kept), None, "{kept}");
+        }
+        // MAX_PATH: 259 UTF-16 units still fit, 260 do not; a Thai letter is one unit.
+        let long = |n: usize| format!(r"\\?\C:\{}", "ก".repeat(n - 3));
+        assert_eq!(o(&long(259)).map(|s| s.encode_utf16().count()), Some(259));
+        assert_eq!(o(&long(260)), None);
+    }
+
+    #[test]
+    fn path_keys_use_the_form_git_prints() {
+        assert_eq!(windows_key_form(r"c:\work\repo"), "C:/work/repo");
+        assert_eq!(windows_key_form("C:/work/repo"), "C:/work/repo");
+        assert_eq!(windows_key_form(r"\\srv\share\r"), "//srv/share/r");
+        // Only Windows rewrites: a backslash is an ordinary character in a Unix name.
+        let odd = Path::new("/tmp/a\\b");
+        #[cfg(not(windows))]
+        assert_eq!(path_key(odd), "path:/tmp/a\\b");
+        #[cfg(windows)]
+        assert_eq!(path_key(odd), "path:/tmp/a/b");
+    }
+
+    /// The key of a plain directory comes from its canonical path, that of a repository
+    /// without a remote from git's output (`C:/…` on Windows): both name it the same way.
+    #[test]
+    fn a_directory_keeps_its_key_when_it_becomes_a_repository_without_a_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Plain Tool");
+        std::fs::create_dir(&dir).unwrap();
+        let plain = detect_project(&dir);
+        git(&dir, &["init", "-q"]);
+        let repo = detect_project(&dir);
+        assert!(plain.key.starts_with("path:"), "{}", plain.key);
+        assert_eq!(repo.key, plain.key);
+        assert_eq!(repo.slug, "plain-tool");
+        #[cfg(windows)]
+        assert!(!plain.key.contains('\\'), "{}", plain.key);
     }
 
     #[test]

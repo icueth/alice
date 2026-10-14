@@ -97,6 +97,7 @@ fn passage_batches_respect_the_token_budget_for_dense_text() {
 }
 
 /// Resident memory of this process in MB, as `ps` reports it.
+#[cfg(unix)]
 fn rss_mb() -> f64 {
     let out = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
@@ -107,6 +108,12 @@ fn rss_mb() -> f64 {
         .parse::<f64>()
         .unwrap_or(0.0)
         / 1024.0
+}
+
+/// No `ps` on Windows: the figures print as NaN there (they are only printed).
+#[cfg(not(unix))]
+fn rss_mb() -> f64 {
+    f64::NAN
 }
 
 /// Idle unload with the real model: the session is dropped after the idle time, a query

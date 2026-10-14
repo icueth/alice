@@ -10,6 +10,7 @@ use alice_core::embed::{Embedder, FakeEmbedder};
 use alice_core::store::sources::{ChunkInput, SourceInput};
 use alice_daemon::paths::AliceHome;
 use alice_daemon::service::{Service, ServiceOptions};
+use std::io::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -114,8 +115,11 @@ async fn writes_and_reads_stay_fast_during_bulk_ingest() {
     bulk.await.unwrap();
 
     let (wp, rp) = (p95(writes), p95(reads));
-    eprintln!(
-        "remember p95 {wp:?}, recall p95 {rp:?}, bulk ingest still running when the clients finished: {overlapped}"
+    // Straight to stderr, not `eprintln!`: the test harness captures the macro's output of a
+    // passing test, and the margins should show in every CI log (Windows runners are slower).
+    let _ = writeln!(
+        std::io::stderr(),
+        "service_concurrency: remember p95 {wp:?}, recall p95 {rp:?}, bulk ingest still running when the clients finished: {overlapped}"
     );
     // The budgets (remember 50 ms, recall 200 ms) hold in release builds, where this test and
     // `alice bench` enforce them. An unoptimised build on a busy machine measured remember p95
