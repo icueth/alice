@@ -179,7 +179,7 @@ pub fn create_stoppable(
             )));
         }
         drop(dst);
-        std::fs::File::open(&tmp)?.sync_all()?;
+        sync_file(&tmp)?;
         std::fs::rename(&tmp, &path)?;
         sync_dir(dir);
         Ok(true)
@@ -293,6 +293,15 @@ pub fn free_space(path: &Path) -> Option<u64> {
         let _ = path;
         None
     }
+}
+
+/// Flush a finished file to disk. Opened for writing: Windows refuses `FlushFileBuffers` on a
+/// handle opened read-only ("Access is denied"), where Unix does not mind.
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()
 }
 
 /// Make the rename durable (Unix; best effort).
@@ -462,7 +471,7 @@ fn copy_then_remove(from: &Path, to: &Path) -> std::io::Result<()> {
     let tmp = to.with_extension("db.moving");
     // The copy is on disk before the original goes: a crash between the two leaves both.
     let copied = std::fs::copy(from, &tmp)
-        .and_then(|_| std::fs::File::open(&tmp)?.sync_all())
+        .and_then(|_| sync_file(&tmp))
         .and_then(|()| std::fs::rename(&tmp, to));
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&tmp);

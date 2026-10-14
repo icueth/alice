@@ -584,7 +584,9 @@ async fn a_key_set_later_switches_to_the_provider_and_a_rotated_key_is_used_with
 async fn editing_the_file_to_a_remote_provider_waits_for_the_loosening_ratchet() {
     let d = tempfile::tempdir().unwrap();
     let mut opts = options(fake_factory());
-    opts.settings_poll = Duration::from_millis(100);
+    // Slow enough that the wait for the first read cannot overshoot the two reads before the
+    // switch (a loaded runner may stall a thread for a few hundred milliseconds).
+    opts.settings_poll = Duration::from_millis(500);
     let s = start(d.path(), opts, "");
     let home = AliceHome::new(d.path().to_path_buf());
     std::fs::write(
@@ -592,10 +594,12 @@ async fn editing_the_file_to_a_remote_provider_waits_for_the_loosening_ratchet()
         "[embedding]\nprovider = \"voyage\"\nmodel = \"voyage-3-lite\"\n",
     )
     .unwrap();
-    // Read once or twice: not in force yet, and the settings view says why.
-    tokio::time::sleep(Duration::from_millis(180)).await;
+    // Read once: not in force yet, and the settings view says why. Waited for, not slept for.
+    until("the first read of the edit", 15, || async {
+        s.settings_handle().loosening_waiting()
+    })
+    .await;
     assert_eq!(s.settings().embedding.provider, EmbeddingProvider::Local);
-    assert!(s.settings_handle().loosening_waiting());
     assert_eq!(s.model(), MODEL_ID);
     until("the third identical poll", 10, || async {
         s.settings().embedding.provider == EmbeddingProvider::Voyage
