@@ -2062,7 +2062,16 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(20));
             std::thread::sleep(Duration::from_millis(1));
         }
-        r.sched.interrupt_running();
+        // SQLite ignores an interrupt that arrives while no statement runs (the check may not
+        // have started its statement yet), so keep interrupting until the job has ended.
+        while !t.is_finished() {
+            r.sched.interrupt_running();
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the check never ended"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let report = t.join().unwrap();
         assert_eq!(report.outcome, JobOutcome::Paused, "{report:?}");
         assert!(
