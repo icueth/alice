@@ -64,8 +64,10 @@ const RAW_PAGE: usize = 2_000;
 const BATCH_RECORDS: usize = 200;
 /// ... or this many bytes of text, whichever comes first, and only between two drawers.
 const BATCH_BYTES: usize = 64 * 1024;
-/// Collapsed pairs per batch (they carry no text).
-const COLLAPSED_PER_BATCH: usize = 500;
+/// Collapsed pairs per batch (they carry no text): one writer slice.
+const COLLAPSED_PER_BATCH: usize = 200;
+/// Why a repeated chunk is not recorded: its keeper is not stored.
+const REPEAT_OF_UNSTORED: &str = "repeat of a chunk that was not stored";
 /// The report keeps this many store errors and warnings; the rest are counted.
 const REPORT_LIST_CAP: usize = 100;
 
@@ -113,9 +115,23 @@ pub struct ImportEnv {
 pub struct ImportHook {
     pub hold: AtomicBool,
     pub panic: AtomicBool,
+    /// Parks the job after the survey, right before the first record is planned.
+    pub hold_planning: AtomicBool,
+    /// True while the job is parked by `hold_planning`.
+    pub parked: AtomicBool,
+    /// Drawers the planner was run on (a rerun that stores nothing new plans none).
+    pub planned: std::sync::atomic::AtomicU64,
 }
 
 impl ImportHook {
+    fn park_before_planning(&self, stop: &AtomicBool) {
+        self.parked.store(true, Ordering::SeqCst);
+        while self.hold_planning.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        self.parked.store(false, Ordering::SeqCst);
+    }
+
     fn run(&self, stop: &AtomicBool) {
         while self.hold.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -292,26 +308,55 @@ fn check_stop(stop: &AtomicBool) -> Result<()> {
 }
 
 /// A palace reader that stops asking for pages once the daemon is stopping, so the survey (one
-/// call into the planner) can end early.
-struct StopReader {
+/// call into the planner) can end early. It also hands out every wing name already redacted:
+/// project slugs are made from wing names, and a slug made from a raw `ghp_...` wing would be
+/// lower-cased before any detector saw it.
+struct StopReader<'a> {
     inner: Box<dyn PalaceReader>,
     stop: Arc<AtomicBool>,
+    filter: &'a RedactFilter,
+    wings: Mutex<HashMap<String, String>>,
 }
 
-impl PalaceReader for StopReader {
+impl StopReader<'_> {
+    fn clean_wing(&self, wing: &str) -> String {
+        let mut cache = self.wings.lock();
+        if let Some(c) = cache.get(wing) {
+            return c.clone();
+        }
+        let c = self.filter.quiet(wing);
+        cache.insert(wing.to_string(), c.clone());
+        c
+    }
+
+    fn clean(&self, mut drawers: Vec<Drawer>) -> Vec<Drawer> {
+        for d in &mut drawers {
+            d.meta.wing = self.clean_wing(&d.meta.wing);
+        }
+        drawers
+    }
+}
+
+impl PalaceReader for StopReader<'_> {
     fn info(&self) -> &PalaceInfo {
         self.inner.info()
     }
     fn page(&self, after: Option<&str>, limit: usize, since: Option<&str>) -> Result<Vec<Drawer>> {
         check_stop(&self.stop)?;
-        self.inner.page(after, limit, since)
+        Ok(self.clean(self.inner.page(after, limit, since)?))
     }
     fn get(&self, ids: &[String]) -> Result<Vec<Drawer>> {
         check_stop(&self.stop)?;
-        self.inner.get(ids)
+        Ok(self.clean(self.inner.get(ids)?))
     }
     fn wing_counts(&self) -> Result<Vec<(String, u64)>> {
-        self.inner.wing_counts()
+        let mut merged: BTreeMap<String, u64> = BTreeMap::new();
+        for (w, n) in self.inner.wing_counts()? {
+            *merged.entry(self.clean_wing(&w)).or_default() += n;
+        }
+        let mut out: Vec<(String, u64)> = merged.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
     }
 }
 
@@ -462,10 +507,13 @@ impl<T> Batcher<T> {
 }
 
 /// All the stored rows of one drawer (its parts), already redacted and keyed.
+#[derive(Clone)]
 enum Unit {
     Memories {
         slug: String,
         items: Vec<NewMemoryInput>,
+        /// The drawer repeats one already planned in this run (counted as a duplicate).
+        dup: bool,
     },
     Chunks {
         slug: String,
@@ -521,13 +569,15 @@ struct Tally {
     store_errors: Vec<String>,
     store_warnings: BTreeSet<String>,
     store_duplicate_memories: u64,
+    /// Drawers the store refused (listed in the errors; they are accounted for there).
+    rejected: u64,
 }
 
 struct Ctx<'a> {
     env: &'a ImportEnv,
     filter: &'a RedactFilter,
     survey: &'a Survey,
-    reader: &'a StopReader,
+    reader: &'a StopReader<'a>,
     planner: Planner<'a>,
     tally: Tally,
     done: u64,
@@ -548,6 +598,9 @@ impl Ctx<'_> {
 
     /// Counts what `d` would add; in a real run also returns the rows to store.
     fn take(&mut self, d: &Drawer) -> Option<Unit> {
+        if let Some(h) = &self.env.hook {
+            h.planned.fetch_add(1, Ordering::Relaxed);
+        }
         let planned = self.planner.plan(d);
         let key = self.filter.legacy_key(&d.id);
         match planned {
@@ -584,7 +637,11 @@ impl Ctx<'_> {
                         input
                     })
                     .collect();
-                Some(Unit::Memories { slug, items })
+                Some(Unit::Memories {
+                    slug,
+                    items,
+                    dup: duplicate,
+                })
             }
             Planned::Chunks(parts) => {
                 let first = parts.first()?;
@@ -669,13 +726,35 @@ impl Ctx<'_> {
         }
     }
 
+    /// Writes a batch. A batch the store refuses as invalid is retried drawer by drawer, and a
+    /// drawer that is still refused goes to the report's errors: one odd record never fails
+    /// the whole import (and so never fails every rerun).
     fn write(&mut self, units: Vec<Unit>) -> Result<()> {
+        match self.try_write(&units) {
+            Err(AliceError::Invalid(why)) => {
+                if units.len() == 1 {
+                    self.reject(&units[0], &why);
+                    return Ok(());
+                }
+                for unit in units {
+                    match self.try_write(std::slice::from_ref(&unit)) {
+                        Err(AliceError::Invalid(why)) => self.reject(&unit, &why),
+                        other => other?,
+                    }
+                }
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    fn try_write(&mut self, units: &[Unit]) -> Result<()> {
         let mut batch = self.batch();
         let mut slugs: BTreeSet<String> = BTreeSet::new();
         let mut at: HashMap<(String, &'static str, String), usize> = HashMap::new();
-        for unit in units {
+        for unit in units.iter().cloned() {
             match unit {
-                Unit::Memories { slug, items } => {
+                Unit::Memories { slug, items, .. } => {
                     slugs.insert(slug.clone());
                     batch
                         .memories
@@ -709,29 +788,73 @@ impl Ctx<'_> {
                 }
             }
         }
-        for slug in slugs {
-            let aliases = if self.sent_projects.insert(slug.clone()) {
-                self.aliases.get(&slug).cloned().unwrap_or_default()
-            } else {
+        // Aliases go with the first batch that names a project, once it is stored.
+        for slug in &slugs {
+            let aliases = if self.sent_projects.contains(slug) {
                 Vec::new()
+            } else {
+                self.aliases.get(slug).cloned().unwrap_or_default()
             };
-            batch.projects.push(ImportProject { slug, aliases });
+            batch.projects.push(ImportProject {
+                slug: slug.clone(),
+                aliases,
+            });
         }
-        self.submit(batch)
+        self.submit(batch)?;
+        self.sent_projects.extend(slugs);
+        Ok(())
     }
 
-    /// One writer transaction. The batch holds nothing the filter has not seen.
-    fn submit(&mut self, batch: ImportBatch) -> Result<()> {
+    /// The store refused this drawer: it is listed in the errors, and counted there instead of
+    /// among the drawers that were stored.
+    fn reject(&mut self, unit: &Unit, why: &str) {
+        let (id, parts) = match unit {
+            Unit::Memories { items, dup, slug } => {
+                let n = items.len() as u64;
+                if *dup {
+                    self.tally.knowledge_duplicates -= 1;
+                    self.tally.duplicate_parts_sent -= n;
+                } else {
+                    self.tally.memory_drawers -= 1;
+                    if n > 1 {
+                        self.tally.split_memories -= 1;
+                    }
+                    if let Some(c) = self.tally.projects.get_mut(slug) {
+                        c.memories = c.memories.saturating_sub(n);
+                    }
+                }
+                (items.first().and_then(|m| m.legacy_id.clone()), n)
+            }
+            Unit::Chunks { slug, chunks, .. } => {
+                let n = chunks.len() as u64;
+                self.tally.chunk_drawers -= 1;
+                if n > 1 {
+                    self.tally.split_chunks -= 1;
+                }
+                if let Some(c) = self.tally.projects.get_mut(slug) {
+                    c.chunks = c.chunks.saturating_sub(n);
+                }
+                (chunks.first().and_then(|c| c.legacy_id.clone()), n)
+            }
+        };
+        self.tally.rejected += 1;
+        let why: String = why.chars().take(300).collect();
+        self.tally.store_errors.push(format!(
+            "drawer {} ({parts} rows) was not stored: {why}",
+            id.unwrap_or_default()
+        ));
+    }
+
+    /// One writer transaction. The batch holds nothing the filter has not seen. Returns how many
+    /// collapsed pairs the store could not record yet.
+    fn submit(&mut self, batch: ImportBatch) -> Result<usize> {
         check_stop(&self.env.stop)?;
         match self
             .env
             .writer
             .submit_blocking(WriteOp::ImportBatch(Box::new(batch)))?
         {
-            WriteOutcome::Imported(out) => {
-                self.absorb(out);
-                Ok(())
-            }
+            WriteOutcome::Imported(out) => Ok(self.absorb(out)),
             other => Err(AliceError::Other(format!(
                 "the writer answered an import batch with {}",
                 other.name()
@@ -739,10 +862,11 @@ impl Ctx<'_> {
         }
     }
 
-    fn absorb(&mut self, out: BatchOutcome) {
+    fn absorb(&mut self, out: BatchOutcome) -> usize {
         self.tally.store_errors.extend(out.errors);
         self.tally.store_warnings.extend(out.warnings);
         self.tally.store_duplicate_memories += out.memories_duplicate as u64;
+        out.deferred_collapsed.len()
     }
 
     fn knowledge_pass(&mut self) -> Result<()> {
@@ -825,13 +949,27 @@ impl Ctx<'_> {
         self.record_collapsed()
     }
 
-    /// Collapsed drawers point where their keeper went; their keepers are stored by now.
+    /// Collapsed drawers point where their keeper went; their keepers are stored by now. A
+    /// repeat whose keeper was not stored (held back by block mode, or its insert failed) is left
+    /// for the next run: it is accounted as skipped, not as a duplicate.
     fn record_collapsed(&mut self) -> Result<()> {
         let pairs = std::mem::take(&mut self.collapsed);
+        let mut deferred = 0usize;
         for part in pairs.chunks(COLLAPSED_PER_BATCH) {
             let mut batch = self.batch();
             batch.collapsed = part.to_vec();
-            self.submit(batch)?;
+            deferred += self.submit(batch)?;
+        }
+        if deferred > 0 {
+            self.tally.raw_collapsed -= deferred as u64;
+            *self
+                .tally
+                .skipped
+                .entry(REPEAT_OF_UNSTORED.to_string())
+                .or_default() += deferred as u64;
+            self.tally.store_warnings.insert(format!(
+                "{deferred} repeated chunks were left for the next run because the chunk they repeat was not stored"
+            ));
         }
         Ok(())
     }
@@ -889,10 +1027,18 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     let reader = StopReader {
         inner: open_snapshot(&snap, req.collection.as_deref())?,
         stop: env.stop.clone(),
+        filter: &filter,
+        wings: Mutex::new(HashMap::new()),
     };
     let info = reader.info().clone();
     set_progress(&env.status, 0, Some(info.drawers));
-    let mut wings = WingMap::build(&reader.wing_counts()?, &req.map_wing);
+    // Wing names reach the map redacted (see `StopReader`), so the override keys and values do too.
+    let overrides: BTreeMap<String, String> = req
+        .map_wing
+        .iter()
+        .map(|(k, v)| (filter.quiet(k), filter.quiet(v)))
+        .collect();
+    let mut wings = WingMap::build(&reader.wing_counts()?, &overrides);
     let lookup_error: Mutex<Option<AliceError>> = Mutex::new(None);
     let reserved = |uri: &str| -> BTreeSet<i64> {
         match reserved_ords(&env.readers, &filter, uri) {
@@ -949,14 +1095,35 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
         sent_projects: HashSet::new(),
         collapsed: Vec::new(),
     };
+    if let Some(hook) = &env.hook {
+        hook.park_before_planning(&env.stop);
+    }
     set_phase(&env.status, "knowledge");
     let t = Instant::now();
-    ctx.knowledge_pass()?;
+    let mut outcome = ctx.knowledge_pass();
     lap(&mut phases, "knowledge", t);
-    set_phase(&env.status, "raw");
-    let t = Instant::now();
-    ctx.raw_pass(since)?;
-    lap(&mut phases, "raw", t);
+    if outcome.is_ok() {
+        set_phase(&env.status, "raw");
+        let t = Instant::now();
+        outcome = ctx.raw_pass(since);
+        lap(&mut phases, "raw", t);
+    }
+    if let Err(e) = outcome {
+        // What was stored stays stored (whole batches only); the message says how far it got.
+        let t = &ctx.tally;
+        let mut msg = format!(
+            "{e}; {} drawers were stored before it ended",
+            t.memory_drawers + t.chunk_drawers + t.knowledge_duplicates
+        );
+        if !t.store_errors.is_empty() {
+            msg.push_str(&format!(
+                ", {} could not be stored (first: {})",
+                t.store_errors.len(),
+                t.store_errors[0]
+            ));
+        }
+        return Err(AliceError::Other(msg));
+    }
     let mut tally = ctx.tally;
     let mut store_errors = std::mem::take(&mut tally.store_errors);
     if store_errors.len() > REPORT_LIST_CAP {
@@ -1037,7 +1204,8 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
             + tally.raw_collapsed
             + tally.memory_drawers
             + tally.chunk_drawers
-            + tally.blocked_drawers,
+            + tally.blocked_drawers
+            + tally.rejected,
         closets_dropped: closets,
         already_imported: tally.already,
         skipped,

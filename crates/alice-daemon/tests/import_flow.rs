@@ -223,6 +223,7 @@ struct Flow {
     palace: PathBuf,
     home: AliceHome,
     svc: Arc<Service>,
+    hook: Option<Arc<ImportHook>>,
 }
 
 trait Req {
@@ -275,7 +276,21 @@ impl Flow {
             palace,
             home,
             svc,
+            hook: None,
         }
+    }
+
+    /// A flow whose import hook is kept, to count what the planner did.
+    async fn with_hook(specs: &[DrawerSpec]) -> Flow {
+        let hook = Arc::new(ImportHook::default());
+        let h = hook.clone();
+        let mut f = Self::with_options(specs, move |_| ServiceOptions {
+            import_hook: Some(h),
+            ..Default::default()
+        })
+        .await;
+        f.hook = Some(hook);
+        f
     }
 
     fn home(&self) -> &Path {
@@ -1090,7 +1105,10 @@ async fn secrets_in_imported_history_never_reach_the_database_the_report_or_the_
     assert!(marked >= 3, "{marked}");
     assert!(r.redacted_fields >= 4, "{}", r.redacted_fields);
     // A second run recognises the drawers whose ids held the key (the stored id is the hashed one).
+    f.wait_embedded().await;
+    let before = f.table_counts().await;
     let again = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(f.table_counts().await, before);
     assert_eq!(again.redacted_fields, 0);
     assert_eq!(again.tiers.knowledge, 0);
     assert_eq!(again.tiers.raw_session_chunks, 0);
@@ -1166,9 +1184,12 @@ fn unindexed(id: &str, text: &str) -> DrawerSpec {
 async fn running_again_imports_nothing_does_no_planning_work_and_new_drawers_are_picked_up() {
     let mut specs = fixture_specs();
     specs.push(unindexed("auto_1", "an unnumbered chunk"));
-    let f = Flow::with_specs(&specs).await;
+    let f = Flow::with_hook(&specs).await;
     let first = f.run_import(f.request()).await.report.unwrap();
     assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let hook = f.hook.clone().unwrap();
+    assert!(hook.planned.load(Ordering::SeqCst) > 100);
+    hook.planned.store(0, Ordering::SeqCst);
     let counts = f.table_counts().await;
     let (memories, chunks) = (counts["memories"], counts["chunks"]);
 
@@ -1188,14 +1209,12 @@ async fn running_again_imports_nothing_does_no_planning_work_and_new_drawers_are
         "every stored drawer, the repeat and the duplicate included"
     );
     assert_eq!(second.redacted_fields, 0);
+    assert_eq!(
+        hook.planned.load(Ordering::SeqCst),
+        0,
+        "stored drawers are not planned again"
+    );
     assert_eq!(second.drawers_seen, second.drawers_accounted);
-    let work: f64 = second
-        .phases
-        .iter()
-        .filter(|p| p.phase == "knowledge" || p.phase == "raw")
-        .map(|p| p.seconds)
-        .sum();
-    assert!(work < 1.0, "{work}");
     let counts = f.table_counts().await;
     assert_eq!((counts["memories"], counts["chunks"]), (memories, chunks));
 
@@ -1246,7 +1265,7 @@ async fn an_oversize_knowledge_drawer_becomes_parts_that_are_stored_together() {
     }
     assert!(f.legacy_target("big_k#4").await.is_none());
     assert_eq!(r.split.memories, 1);
-    let events: i64 = f
+    let parts: i64 = f
         .db()
         .query_row(
             "SELECT count(*) FROM memories WHERE legacy_id LIKE 'big_k%'",
@@ -1254,7 +1273,7 @@ async fn an_oversize_knowledge_drawer_becomes_parts_that_are_stored_together() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(events, 3);
+    assert_eq!(parts, 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1310,8 +1329,60 @@ async fn odd_drawers_are_counted_not_fatal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_ignored_chunk_insert_is_an_error_entry_never_silent() {
-    // The second piece of an oversize chunk takes position 10,000,000 + its ord; another drawer
-    // of the same source asks for exactly that.
+    // The survey hands out positions that are free when it looks; a chunk stored by someone else
+    // in between (parked here, right after the survey) takes one of them.
+    let hook = Arc::new(ImportHook::default());
+    hook.hold_planning.store(true, Ordering::SeqCst);
+    let h = hook.clone();
+    let mut specs = fixture_specs();
+    let mut a = chunk(
+        "coll_a",
+        "a chunk to be turned away",
+        "devspace",
+        "/h/Code/devspace/collide.go",
+        5,
+    );
+    a.meta.convos_off();
+    specs.push(a);
+    let f = Flow::with_options(&specs, move |_| ServiceOptions {
+        import_hook: Some(h),
+        ..Default::default()
+    })
+    .await;
+    f.svc.start_import(f.request()).unwrap();
+    let t = Instant::now();
+    while !hook.parked.load(Ordering::SeqCst) {
+        assert!(t.elapsed() < Duration::from_secs(30), "never parked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    f.svc
+        .ingest(alice_core::api::IngestRequest {
+            source: alice_core::store::sources::SourceInput {
+                uri: "file:///h/Code/devspace/collide.go".into(),
+                source_type: alice_core::model::SourceType::File,
+                ..Default::default()
+            },
+            chunks: vec![alice_core::store::sources::ChunkInput {
+                ord: 5,
+                text: "someone else's chunk".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    hook.hold_planning.store(false, Ordering::SeqCst);
+    let st = f.wait().await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+    assert!(r.errors[0].contains("coll_a"), "{:?}", r.errors);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_drawer_can_ask_for_the_position_a_piece_of_another_takes() {
+    // Piece k of an oversize chunk sits at ord + k * 10,000,000: a drawer asking for that
+    // position is numbered after the others instead.
     let mut specs = fixture_specs();
     let mut a = chunk(
         "coll_a",
@@ -1320,11 +1391,10 @@ async fn an_ignored_chunk_insert_is_an_error_entry_never_silent() {
         "/h/Code/devspace/collide.go",
         5,
     );
-    a.meta.ingest_mode = s("projects");
     a.meta.convos_off();
     let mut b = chunk(
         "coll_b",
-        "asks for the position a piece took",
+        "asks for the position a piece takes",
         "devspace",
         "/h/Code/devspace/collide.go",
         10_000_005,
@@ -1333,11 +1403,160 @@ async fn an_ignored_chunk_insert_is_an_error_entry_never_silent() {
     specs.push(a);
     specs.push(b);
     let f = Flow::with_specs(&specs).await;
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    for id in ["coll_a", "coll_a#2", "coll_b"] {
+        assert!(f.legacy_target(id).await.is_some(), "{id}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drawer_the_store_refuses_is_an_error_entry_and_the_import_goes_on() {
+    let mut specs = fixture_specs();
+    // A source that is only blanks has no uri the store accepts.
+    let mut bad = chunk(
+        "bad_uri",
+        "text of a chunk with no source",
+        "devspace",
+        "   ",
+        0,
+    );
+    bad.meta.convos_off();
+    specs.push(bad);
+    let f = Flow::with_specs(&specs).await;
     let st = f.run_import(f.request()).await;
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
     let r = st.report.unwrap();
     assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
-    assert!(r.errors[0].contains("coll_b"), "{:?}", r.errors);
+    assert!(r.errors[0].contains("bad_uri"), "{:?}", r.errors);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert_eq!(f.count("chunks").await, 79 + 30, "the others are stored");
+    assert!(f.legacy_target("bad_uri").await.is_none());
+}
+
+fn assert_clean(tables: Vec<String>, what: &str) {
+    assert!(tables.is_empty(), "{what} found in {tables:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn key_shaped_wing_names_never_become_project_names() {
+    let ghp = SECRET;
+    let akia = concat!("AKIA", "IOSFODNN7EXAMPLE");
+    let mut specs = fixture_specs();
+    specs.push(knowledge(
+        "k_ghp",
+        "a note under a key-named wing",
+        ghp,
+        "knowledge",
+    ));
+    specs.push(knowledge(
+        "k_akia",
+        "a note under another",
+        akia,
+        "knowledge",
+    ));
+    // A chunk under a key-named wing too.
+    let mut c = chunk(
+        "c_akia",
+        "chunk under a key-named wing",
+        akia,
+        "/h/Code/x/a.go",
+        0,
+    );
+    c.meta.convos_off();
+    specs.push(c);
+    let f = Flow::with_specs(&specs).await;
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.clone().unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let status = serde_json::to_string(&st).unwrap() + &r.render_text();
+    for needle in [
+        ghp.to_string(),
+        ghp.to_lowercase().replace('_', "-"),
+        ghp.to_lowercase(),
+        akia.to_string(),
+        akia.to_lowercase(),
+    ] {
+        assert_clean(f.tables_holding(&needle).await, &needle);
+        assert!(!status.contains(&needle), "{needle} in the report");
+    }
+    assert!(
+        f.project_slugs()
+            .await
+            .iter()
+            .any(|s| s.starts_with("redacted"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_import_leaves_whole_batches_and_a_rerun_finishes_it() {
+    let f = Flow::with_specs(&big_specs(6_000)).await;
+    f.svc.start_import(f.request()).unwrap();
+    let t = Instant::now();
+    while f.count("chunks").await == 0 {
+        assert!(t.elapsed() < Duration::from_secs(60), "nothing was stored");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    f.svc.shutdown();
+    let st = f.svc.import_status();
+    assert_eq!(st.state, ImportState::Failed, "{st:?}");
+    let e = st.error.unwrap();
+    assert!(
+        e.contains("daemon stopped") && e.contains("stored before it ended"),
+        "{e}"
+    );
+    let stored = f.count("chunks").await;
+    assert!(stored > 0 && stored < 6_000, "{stored}");
+    assert_eq!(
+        stored,
+        f.db()
+            .query_row("SELECT count(*) FROM legacy_ids", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        "every stored chunk has its old id: only whole batches were written"
+    );
+    assert_eq!(f.import_tmp_entries(), 0);
+
+    let svc = start_service(&f.home);
+    svc.start_import(f.request()).unwrap();
+    let t = Instant::now();
+    let st = loop {
+        let st = svc.import_status();
+        if st.state != ImportState::Running {
+            break st;
+        }
+        assert!(t.elapsed() < Duration::from_secs(120));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert_eq!(r.already_imported as i64, stored);
+    assert_eq!(f.count("chunks").await, 6_000);
+    svc.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeat_of_a_chunk_that_block_mode_held_back_is_left_for_the_next_run() {
+    let mut specs = fixture_specs();
+    let text = format!("a chunk that holds {SECRET}");
+    specs.push(chunk("blk_a", &text, "sessions", S2, 50));
+    specs.push(chunk("blk_b", &text, "sessions", S2, 51));
+    let f = Flow::with_specs(&specs).await;
+    f.patch("privacy.redact_mode", serde_json::json!("block"))
+        .await;
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.blocked_by_redaction["github_token"], 1);
+    assert_eq!(r.skipped["repeat of a chunk that was not stored"], 1);
+    assert_eq!(r.duplicates.raw, 1, "only the fixture's own repeat");
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("next run")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(f.legacy_target("blk_b").await.is_none());
 }
 
 trait ConvosOff {

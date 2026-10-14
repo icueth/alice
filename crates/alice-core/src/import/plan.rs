@@ -352,9 +352,11 @@ impl Mapper<'_> {
         let agent = g.opt("author.agent", agent);
         let base_title = match (diary, &m.date, &m.topic) {
             (true, Some(date), Some(topic)) => {
-                let t = format!("Diary {date}: {topic}");
-                let t: String = nfc(&t).chars().take(limits::MAX_TITLE_CHARS).collect();
-                Some(g.apply("title", &t))
+                // Redact the whole title, then shorten it: a marker can be longer than the
+                // secret, and a cut made first could leave half a key the detectors miss.
+                let t = g.apply("title", &nfc(&format!("Diary {date}: {topic}")));
+                let t: String = t.chars().take(limits::MAX_TITLE_CHARS).collect();
+                Some(t.trim_end().to_string())
             }
             _ => None,
         };
@@ -480,7 +482,9 @@ impl Mapper<'_> {
 const SURVEY_PAGE: usize = 5_000;
 /// Largest chunk_index a row may claim; real transcripts have a few thousand chunks at most. A
 /// larger value is junk and is numbered like a missing index (so ord arithmetic stays far from i64::MAX).
-const MAX_WANTED_ORD: i64 = 2_000_000_000;
+/// It also stays below `PIECE_ORD_STEP`: the pieces of an oversize chunk sit at `ord + k * step`,
+/// and no drawer may ask for a position a piece of another takes.
+const MAX_WANTED_ORD: i64 = PIECE_ORD_STEP - 1;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TierCounts {
@@ -972,6 +976,31 @@ mod tests {
         assert_eq!(i.created_at.as_deref(), Some("2026-04-16T04:34:59.427Z"));
         assert_eq!(i.legacy_id.as_deref(), Some(id));
         assert_eq!(p[0].legacy_id, id);
+    }
+
+    #[test]
+    fn a_diary_title_is_redacted_whole_and_then_shortened() {
+        // The topic is 190 characters; the filter turns each "XX" into 40 bytes.
+        let meta = DrawerMeta {
+            wing: "wing_claude_code".into(),
+            room: "diary".into(),
+            agent: s("claude-code"),
+            topic: s(&"XX".repeat(95)),
+            date: s("2026-04-16"),
+            ..Default::default()
+        };
+        let f = MarkerFilter;
+        let m = Mapper {
+            wings: &wings(),
+            assume: utc(),
+            filter: &f,
+        };
+        let Planned::Memories(p) = m.map(&d("diary_x_1", "Text.", meta), 0, (None, None)) else {
+            panic!("expected memories")
+        };
+        let t = p[0].input.title.as_deref().unwrap();
+        assert!(t.chars().count() <= limits::MAX_TITLE_CHARS, "{}", t.len());
+        assert!(t.starts_with("Diary 2026-04-16: MMMM"));
     }
 
     #[test]
