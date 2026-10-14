@@ -790,19 +790,22 @@ fn env_value(raw: &str) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
 }
 
+/// The 1-based line of byte `offset` in `text` (past the end: the last line). Error messages
+/// name a line and never quote it, because the line may hold a secret.
+pub fn toml_line(text: &str, offset: usize) -> usize {
+    let at = offset.min(text.len());
+    text.as_bytes()[..at]
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count()
+        + 1
+}
+
 /// "line N: <what is wrong>", without quoting the line (it may hold a secret).
 fn toml_error(text: &str, message: &str, span: Option<std::ops::Range<usize>>) -> String {
     let message = message.trim().trim_end_matches('.');
     match span {
-        Some(s) => {
-            let at = s.start.min(text.len());
-            let line = text.as_bytes()[..at]
-                .iter()
-                .filter(|b| **b == b'\n')
-                .count()
-                + 1;
-            format!("line {line}: {message}")
-        }
+        Some(s) => format!("line {}: {message}", toml_line(text, s.start)),
         None => message.to_string(),
     }
 }
@@ -875,6 +878,11 @@ fn unknown_var_warning(var: &str) -> String {
 /// names are looked at, and only setting variables' values are read). Variables that are not
 /// settings are ignored with a warning, never an error.
 ///
+/// This is the strict, all-or-nothing rule: one bad leaf fails the whole call. Code that must
+/// always end up with settings goes through [`resolve_salvaging`], and the daemon and the CLI
+/// through `alice_daemon::config` (`SettingsHandle`, `load_effective`), which also check the
+/// variables one by one first so that one bad variable cannot take the others down with it.
+///
 /// ```
 /// use alice_core::settings::{JudgeProvider, Source, resolve};
 /// let file = "[judge]\nprovider = \"jev\"\n";
@@ -889,6 +897,32 @@ pub fn resolve(
     file: Option<&str>,
     env: &[(String, String)],
 ) -> Result<Resolved, Vec<SettingError>> {
+    resolve_leaves(parse_file(file), env)
+}
+
+type FileLeaves = Result<Vec<(String, serde_json::Value)>, SettingError>;
+
+/// The leaves of `config.toml`'s text; no leaves for a missing or blank file.
+fn parse_file(file: Option<&str>) -> FileLeaves {
+    let Some(text) = file.filter(|t| !t.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    match toml::from_str::<toml::Table>(text) {
+        Err(e) => Err(err(
+            "config.toml",
+            format!(
+                "{}; fix the file and save it again",
+                toml_error(text, e.message(), e.span())
+            ),
+        )),
+        Ok(table) => Ok(leaves(&serde_json::to_value(table).unwrap_or_default())),
+    }
+}
+
+fn resolve_leaves(
+    file: FileLeaves,
+    env: &[(String, String)],
+) -> Result<Resolved, Vec<SettingError>> {
     let mut merged = DEFAULTS.clone();
     let mut sources: BTreeMap<String, Source> = DEFAULT_LEAVES
         .iter()
@@ -896,40 +930,31 @@ pub fn resolve(
         .collect();
     let mut errors = Vec::new();
 
-    if let Some(text) = file.filter(|t| !t.trim().is_empty()) {
-        match toml::from_str::<toml::Table>(text) {
-            Err(e) => errors.push(err(
-                "config.toml",
-                format!(
-                    "{}; fix the file and save it again",
-                    toml_error(text, e.message(), e.span())
-                ),
-            )),
-            Ok(table) => {
-                let given = serde_json::to_value(table).unwrap_or_default();
-                for (key, value) in leaves(&given) {
-                    match DEFAULT_MAP.get(&key) {
-                        None => {
-                            let message = unknown_key_message(&key);
-                            errors.push(err(key, message));
-                        }
-                        Some(_) if READ_ONLY_KEYS.contains(&key.as_str()) => errors.push(err(
-                            key,
-                            "cannot be set in config.toml; set the ALICE_HOME environment variable instead",
-                        )),
-                        Some(d) if value.is_null() => errors.push(err(
-                            key,
-                            format!("must be {}, not nan or inf", kind_name(d)),
-                        )),
-                        Some(d) if !same_kind(d, &value) => {
-                            let message =
-                                format!("must be {}, not {}", kind_name(d), kind_name(&value));
-                            errors.push(err(key, message));
-                        }
-                        Some(_) => {
-                            set_path(&mut merged, &key, value);
-                            sources.insert(key, Source::File);
-                        }
+    match file {
+        Err(e) => errors.push(e),
+        Ok(given) => {
+            for (key, value) in given {
+                match DEFAULT_MAP.get(&key) {
+                    None => {
+                        let message = unknown_key_message(&key);
+                        errors.push(err(key, message));
+                    }
+                    Some(_) if READ_ONLY_KEYS.contains(&key.as_str()) => errors.push(err(
+                        key,
+                        "cannot be set in config.toml; set the ALICE_HOME environment variable instead",
+                    )),
+                    Some(d) if value.is_null() => errors.push(err(
+                        key,
+                        format!("must be {}, not nan or inf", kind_name(d)),
+                    )),
+                    Some(d) if !same_kind(d, &value) => {
+                        let message =
+                            format!("must be {}, not {}", kind_name(d), kind_name(&value));
+                        errors.push(err(key, message));
+                    }
+                    Some(_) => {
+                        set_path(&mut merged, &key, value);
+                        sources.insert(key, Source::File);
                     }
                 }
             }
@@ -968,6 +993,11 @@ pub fn resolve(
     if !errors.is_empty() {
         return Err(errors);
     }
+    let safe = |errs: Vec<SettingError>| -> Vec<SettingError> {
+        errs.into_iter()
+            .map(|e| env_safe(e, &sources, env))
+            .collect()
+    };
     let settings: Settings = match serde_json::from_value(merged.clone()) {
         Ok(s) => s,
         Err(first) => {
@@ -987,19 +1017,154 @@ pub fn resolve(
             return Err(if errs.is_empty() {
                 vec![err("config.toml", first.to_string())]
             } else {
-                errs
+                safe(errs)
             });
         }
     };
     let invalid = settings.validate();
     if !invalid.is_empty() {
-        return Err(invalid);
+        return Err(safe(invalid));
     }
     Ok(Resolved {
         settings,
         sources,
         warnings,
     })
+}
+
+/// An error about a key that an environment variable set, without the variable's value: it may
+/// be anything (a pasted API key), and an error reaches logs, the API and the terminal. Text
+/// settings get a fixed message; numbers and booleans are not secrets and keep theirs.
+fn env_safe(
+    mut e: SettingError,
+    sources: &BTreeMap<String, Source>,
+    env: &[(String, String)],
+) -> SettingError {
+    let Some(Source::Env { var }) = sources.get(&e.key) else {
+        return e;
+    };
+    if DEFAULT_MAP
+        .get(&e.key)
+        .is_some_and(|d| d.is_boolean() || d.is_number())
+    {
+        return e;
+    }
+    let raw = env
+        .iter()
+        .find(|(v, _)| v == var)
+        .map_or("", |(_, r)| r.trim());
+    let unquoted = raw.trim_matches(['"', '\'']);
+    let echoes = |m: &str| {
+        (!raw.is_empty() && m.contains(raw)) || (!unquoted.is_empty() && m.contains(unquoted))
+    };
+    e.message = match e.key.as_str() {
+        "privacy.custom_patterns" | "privacy.allowlist" => format!(
+            "{var} holds an invalid pattern (a name or a regular expression); the value is not shown"
+        ),
+        "embedding.idle_unload" => {
+            format!("{var} must be a duration such as 90d, 12h, 15m or 30s")
+        }
+        "storage.raw_retention" => format!(
+            "{var} must be forever, an age of at least 1d such as 90d, or a size of at least 1MB such as 10GB"
+        ),
+        _ => match e.message.split_once(", expected ") {
+            // serde's "unknown variant `x`, expected `a` or `b`": keep what is accepted.
+            Some((_, accepted)) => format!("{var} must be {}", accepted.replace('`', "")),
+            None if echoes(&e.message) => format!(
+                "{var} is not valid for this setting; see `alice config list` for what it accepts"
+            ),
+            None => return e,
+        },
+    };
+    e
+}
+
+/// Like [`resolve`], but a bad leaf of `config.toml` costs only itself: the leaves the errors
+/// name are dropped (a bad entry of a privacy list costs only that entry) and the rest applies,
+/// so one typo cannot switch off `privacy.cloud_denied_projects` or `privacy.custom_patterns`.
+/// Returns the settings and the errors for what was left out. When the file does not parse,
+/// nothing can be salvaged and the environment over the defaults applies. When an error is not
+/// about a leaf of the file (a conflict with a variable), the valid `privacy.*` leaves still
+/// apply.
+///
+/// ```
+/// use alice_core::settings::resolve_salvaging;
+/// let file = "[privacy]\ncloud_denied_projects = [\"client\"]\n[judge]\nreview_treshold = 0.7\n";
+/// let (r, left_out) = resolve_salvaging(Some(file), &[]);
+/// assert_eq!(r.settings.privacy.cloud_denied_projects, vec!["client"]);
+/// assert_eq!(left_out[0].key, "judge.review_treshold");
+/// ```
+pub fn resolve_salvaging(
+    file: Option<&str>,
+    env: &[(String, String)],
+) -> (Resolved, Vec<SettingError>) {
+    let env_only = || {
+        resolve_leaves(Ok(Vec::new()), env)
+            .unwrap_or_else(|_| resolve_leaves(Ok(Vec::new()), &[]).expect("defaults are valid"))
+    };
+    let mut given = match parse_file(file) {
+        Ok(l) => l,
+        Err(e) => return (env_only(), vec![e]),
+    };
+    let original = given.clone();
+    let mut left_out = Vec::new();
+    loop {
+        let errs = match resolve_leaves(Ok(given.clone()), env) {
+            Ok(r) => return (r, left_out),
+            Err(errs) => errs,
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut progressed = false;
+        for e in &errs {
+            if !seen.insert(e.key.clone()) {
+                continue;
+            }
+            let Some(at) = given.iter().position(|(k, _)| *k == e.key) else {
+                continue;
+            };
+            progressed = true;
+            left_out.push(e.clone());
+            match prune_invalid_entries(&e.key, &given[at].1) {
+                Some(kept) => given[at].1 = kept,
+                None => {
+                    given.remove(at);
+                }
+            }
+        }
+        if !progressed {
+            // Not about a leaf of the file: keep what privacy needs and is valid.
+            left_out.extend(errs);
+            let privacy: Vec<_> = original
+                .into_iter()
+                .filter(|(k, _)| k.starts_with("privacy."))
+                .filter(|l| resolve_leaves(Ok(vec![l.clone()]), env).is_ok())
+                .collect();
+            let r = resolve_leaves(Ok(privacy), env).unwrap_or_else(|_| env_only());
+            return (r, left_out);
+        }
+    }
+}
+
+/// A privacy list without its invalid entries; `None` when no entry is invalid (or the key is
+/// not such a list).
+fn prune_invalid_entries(key: &str, value: &serde_json::Value) -> Option<serde_json::Value> {
+    let items = value.as_array()?;
+    let ok = |v: &serde_json::Value| match key {
+        "privacy.custom_patterns" => serde_json::from_value::<CustomPattern>(v.clone())
+            .is_ok_and(|c| pattern_name_ok(&c.name) && regex::Regex::new(&c.regex).is_ok()),
+        "privacy.allowlist" => v.as_str().is_some_and(|a| regex::Regex::new(a).is_ok()),
+        "privacy.cloud_denied_projects" => v.as_str().is_some_and(|s| !s.trim().is_empty()),
+        _ => true,
+    };
+    let kept: Vec<_> = items.iter().filter(|v| ok(v)).cloned().collect();
+    (kept.len() < items.len()).then_some(serde_json::Value::Array(kept))
+}
+
+fn pattern_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 // ---------------------------------------------------------------- validation
@@ -1166,12 +1331,7 @@ impl Settings {
 
         let p = &self.privacy;
         for (i, c) in p.custom_patterns.iter().enumerate() {
-            if c.name.is_empty()
-                || !c
-                    .name
-                    .chars()
-                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-            {
+            if !pattern_name_ok(&c.name) {
                 e.push(err(
                     "privacy.custom_patterns",
                     format!(
@@ -1344,6 +1504,109 @@ pub fn edit_toml(text: &str, key: &str, value: &serde_json::Value) -> Result<Str
     Ok(doc.to_string())
 }
 
+// ---------------------------------------------------------------- loosening
+
+/// How many polls in a row must see the same loosening before it applies.
+pub const LOOSEN_POLLS: u32 = 3;
+
+/// The protective keys that `new` makes weaker than `old` (empty when nothing got weaker):
+/// redaction off, `block` mode back to `redact`, an entry gone from the cloud denylist or the
+/// custom patterns, a longer allowlist, a higher daily judge budget, or a switch to a cloud
+/// judge or embedding provider.
+///
+/// A half-written `config.toml` (an editor truncating then writing) reads as a file that
+/// loosens everything; see [`LooseningGate`].
+pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
+    let (o, n) = (&old.privacy, &new.privacy);
+    let checks = [
+        ("privacy.redact", o.redact && !n.redact),
+        (
+            "privacy.redact_mode",
+            o.redact_mode == RedactMode::Block && n.redact_mode != RedactMode::Block,
+        ),
+        (
+            "privacy.cloud_denied_projects",
+            o.cloud_denied_projects
+                .iter()
+                .any(|p| !n.cloud_denied_projects.contains(p)),
+        ),
+        (
+            "privacy.custom_patterns",
+            o.custom_patterns
+                .iter()
+                .any(|p| !n.custom_patterns.contains(p)),
+        ),
+        (
+            "privacy.allowlist",
+            n.allowlist.iter().any(|a| !o.allowlist.contains(a)),
+        ),
+        (
+            "judge.daily_budget_usd",
+            new.judge.daily_budget_usd > old.judge.daily_budget_usd,
+        ),
+        (
+            "judge.provider",
+            old.judge.provider != JudgeProvider::Jev && new.judge.provider == JudgeProvider::Jev,
+        ),
+        (
+            "embedding.provider",
+            !is_cloud_embedding(old.embedding.provider)
+                && is_cloud_embedding(new.embedding.provider),
+        ),
+    ];
+    checks
+        .into_iter()
+        .filter(|(_, loosened)| *loosened)
+        .map(|(k, _)| k.to_string())
+        .collect()
+}
+
+fn is_cloud_embedding(p: EmbeddingProvider) -> bool {
+    matches!(p, EmbeddingProvider::Openai | EmbeddingProvider::Voyage)
+}
+
+/// Fail-closed change control. Each poll of a source (the file, a project file) says whether
+/// what it read would loosen a protection and fingerprints what it read. A change that does
+/// not loosen is admitted at once; one that does is admitted only when the same fingerprint was
+/// seen on [`LOOSEN_POLLS`] polls in a row. An editor that truncates the file and then writes
+/// it, a sync tool that swaps the file, or a half-saved copy therefore never switches
+/// protections off for a moment, while a deliberate edit takes effect a few polls later.
+#[derive(Debug, Default)]
+pub struct LooseningGate {
+    pending: Option<(u64, u32)>,
+}
+
+impl LooseningGate {
+    /// `true` when this read may be applied.
+    pub fn admit(&mut self, fingerprint: u64, loosens: bool) -> bool {
+        if !loosens {
+            self.pending = None;
+            return true;
+        }
+        let n = match self.pending {
+            Some((f, n)) if f == fingerprint => n + 1,
+            _ => 1,
+        };
+        if n >= LOOSEN_POLLS {
+            self.pending = None;
+            true
+        } else {
+            self.pending = Some((fingerprint, n));
+            false
+        }
+    }
+
+    /// A loosening was waiting and is waiting still.
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The source is back to what is in force (or could not be read): the count restarts.
+    pub fn reset(&mut self) {
+        self.pending = None;
+    }
+}
+
 // ---------------------------------------------------------------- project scope
 
 /// `<repo>/.alice.toml`. Only settings that make Alice more careful are accepted.
@@ -1365,9 +1628,33 @@ pub struct ProjectPrivacy {
     pub cloud_denied: bool,
 }
 
+/// The privacy in force for one project: the global settings with the project's file on top,
+/// and whether the project's own file keeps it away from cloud providers. Ask
+/// [`EffectivePrivacy::is_cloud_denied`]; the flag and the global list are two halves of one
+/// answer, and a caller that checked only the list would send a denied project to the cloud.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectivePrivacy {
+    pub privacy: PrivacySettings,
+    /// `cloud_denied` from the project's `.alice.toml`.
+    pub cloud_denied: bool,
+}
+
+impl EffectivePrivacy {
+    /// `true` when memories of `project_slug` must never leave this machine for a cloud judge
+    /// or embedding provider: the project's file says so, or the global list names it.
+    pub fn is_cloud_denied(&self, project_slug: &str) -> bool {
+        self.cloud_denied
+            || self
+                .privacy
+                .cloud_denied_projects
+                .iter()
+                .any(|p| p.trim() == project_slug)
+    }
+}
+
 impl ProjectSettings {
     /// The project's privacy on top of the global one: never weaker.
-    pub fn apply_to(&self, global: &PrivacySettings) -> PrivacySettings {
+    pub fn apply_to(&self, global: &PrivacySettings) -> EffectivePrivacy {
         let mut p = global.clone();
         let touched = self.privacy.block_secrets || !self.privacy.custom_patterns.is_empty();
         p.redact = p.redact || touched;
@@ -1376,32 +1663,59 @@ impl ProjectSettings {
         }
         p.custom_patterns
             .extend(self.privacy.custom_patterns.iter().cloned());
-        p
+        EffectivePrivacy {
+            privacy: p,
+            cloud_denied: self.privacy.cloud_denied,
+        }
+    }
+
+    /// What a project whose file cannot be read gets: secrets blocked and no cloud.
+    pub fn fail_closed() -> Self {
+        Self::default().closed()
+    }
+
+    /// These settings with the two flags forced on (the custom patterns stay).
+    fn closed(mut self) -> Self {
+        self.privacy.block_secrets = true;
+        self.privacy.cloud_denied = true;
+        self
+    }
+
+    /// Whether `new` protects this project less than `self` does.
+    pub fn loosened_by(&self, new: &Self) -> bool {
+        let (o, n) = (&self.privacy, &new.privacy);
+        (o.block_secrets && !n.block_secrets)
+            || (o.cloud_denied && !n.cloud_denied)
+            || o.custom_patterns
+                .iter()
+                .any(|p| !n.custom_patterns.contains(p))
     }
 }
 
-/// A missing file is no project settings; an invalid one is an error naming the file.
-pub fn load_project(root: &Path) -> Result<ProjectSettings, SettingError> {
-    let path = root.join(".alice.toml");
-    let name = path.display().to_string();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ProjectSettings::default());
-        }
-        Err(e) => return Err(err(name, format!("cannot read it: {e}"))),
-    };
-    let p: ProjectSettings = toml::from_str(&text).map_err(|e| {
+/// `<repo>/.alice.toml` read as text; `None` when there is none.
+fn read_project_text(path: &Path) -> Result<Option<String>, SettingError> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(err(
+            path.display().to_string(),
+            format!("cannot read it: {e}"),
+        )),
+    }
+}
+
+fn parse_project(name: &str, text: &str) -> Result<ProjectSettings, SettingError> {
+    let p: ProjectSettings = toml::from_str(text).map_err(|e| {
         err(
-            &name,
+            name,
             format!(
                 "{}; a project file accepts only [privacy] block_secrets, custom_patterns and cloud_denied",
-                toml_error(&text, e.message(), e.span())
+                toml_error(text, e.message(), e.span())
             ),
         )
     })?;
     let check = Settings {
-        privacy: p.apply_to(&PrivacySettings::default()),
+        privacy: p.apply_to(&PrivacySettings::default()).privacy,
         ..Default::default()
     };
     let problems: Vec<String> = check.validate().into_iter().map(|e| e.message).collect();
@@ -1409,6 +1723,104 @@ pub fn load_project(root: &Path) -> Result<ProjectSettings, SettingError> {
         Ok(p)
     } else {
         Err(err(name, problems.join("; ")))
+    }
+}
+
+/// A missing file is no project settings; an invalid one is an error naming the file.
+///
+/// An `Err` is not "no settings": a caller that falls back to the defaults on it sends a denied
+/// project to the cloud. Use [`ProjectSettingsCache::get`], which fails closed.
+pub fn load_project(root: &Path) -> Result<ProjectSettings, SettingError> {
+    let path = root.join(".alice.toml");
+    match read_project_text(&path)? {
+        None => Ok(ProjectSettings::default()),
+        Some(text) => parse_project(&path.display().to_string(), &text),
+    }
+}
+
+/// What [`ProjectSettingsCache::get`] decided for one repository.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectLoad {
+    /// The settings to apply: never weaker than the last good ones unless a loosening has held
+    /// for [`LOOSEN_POLLS`] polls.
+    pub settings: ProjectSettings,
+    /// Why `.alice.toml` is not in effect (invalid or unreadable); `settings` is then closed.
+    pub error: Option<SettingError>,
+    /// The file now loosens something and has not yet held long enough to apply.
+    pub loosening_pending: bool,
+}
+
+/// Per-repository `.alice.toml` settings that fail closed. Every [`get`](Self::get) is a poll:
+///
+/// - a file that is invalid or cannot be read gives `block_secrets` and `cloud_denied` on (and
+///   the last good custom patterns), plus the error, until it is valid again;
+/// - a file that loosens the last good settings (a flag off, a pattern removed, an emptied or
+///   deleted file) applies only when the same content is read on [`LOOSEN_POLLS`] polls in a
+///   row, so a half-written save never switches protections off; until then the last good
+///   settings stay;
+/// - a file that tightens, or changes nothing protective, applies at once;
+/// - the first look at a repository has nothing to compare with and applies as read.
+#[derive(Debug, Default)]
+pub struct ProjectSettingsCache {
+    entries: parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, ProjectEntry>>,
+}
+
+#[derive(Debug, Default)]
+struct ProjectEntry {
+    /// The settings in force and whether their file had content.
+    good: Option<(ProjectSettings, bool)>,
+    gate: LooseningGate,
+}
+
+impl ProjectSettingsCache {
+    pub fn get(&self, root: &Path) -> ProjectLoad {
+        let path = root.join(".alice.toml");
+        let name = path.display().to_string();
+        let read = read_project_text(&path).and_then(|text| match text {
+            None => Ok((ProjectSettings::default(), false, 0)),
+            Some(t) => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                t.hash(&mut h);
+                parse_project(&name, &t).map(|p| (p, !t.trim().is_empty(), h.finish()))
+            }
+        });
+        let mut entries = self.entries.lock();
+        let entry = entries.entry(root.to_path_buf()).or_default();
+        let (new, nonempty, fingerprint) = match read {
+            Ok(r) => r,
+            Err(error) => {
+                entry.gate.reset();
+                let last = entry.good.as_ref().map(|(g, _)| g.clone());
+                return ProjectLoad {
+                    settings: last.unwrap_or_default().closed(),
+                    error: Some(error),
+                    loosening_pending: false,
+                };
+            }
+        };
+        let Some((good, good_nonempty)) = &entry.good else {
+            entry.good = Some((new.clone(), nonempty));
+            return ProjectLoad {
+                settings: new,
+                error: None,
+                loosening_pending: false,
+            };
+        };
+        let loosens = good.loosened_by(&new) || (*good_nonempty && !nonempty);
+        if entry.gate.admit(fingerprint, loosens) {
+            entry.good = Some((new.clone(), nonempty));
+            return ProjectLoad {
+                settings: new,
+                error: None,
+                loosening_pending: false,
+            };
+        }
+        ProjectLoad {
+            settings: good.clone(),
+            error: None,
+            loosening_pending: true,
+        }
     }
 }
 
@@ -1946,9 +2358,9 @@ mod tests {
             ..Default::default()
         };
         let eff = p.apply_to(&global);
-        assert!(eff.redact, "a project file turns redaction on");
-        assert_eq!(eff.redact_mode, RedactMode::Block);
-        assert_eq!(eff.custom_patterns.len(), 1);
+        assert!(eff.privacy.redact, "a project file turns redaction on");
+        assert_eq!(eff.privacy.redact_mode, RedactMode::Block);
+        assert_eq!(eff.privacy.custom_patterns.len(), 1);
         assert!(p.privacy.cloud_denied);
         std::fs::write(d.path().join(".alice.toml"), "[privacy]\nredact = false\n").unwrap();
         assert!(
@@ -2031,5 +2443,303 @@ mod tests {
             missing.is_empty(),
             "keys without a description: {missing:?}"
         );
+    }
+
+    // ------------------------------------------------------------ fix round 1
+
+    #[test]
+    fn a_typo_in_an_unrelated_key_keeps_the_privacy_settings() {
+        let file = "[privacy]\ncloud_denied_projects = [\"client-x\"]\nredact_mode = \"block\"\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]+\" }]\n\n[judge]\nreview_treshold = 0.7\nprovider = \"jev\"\n";
+        let (r, dropped) = resolve_salvaging(Some(file), &env(&[]));
+        assert_eq!(r.settings.privacy.cloud_denied_projects, vec!["client-x"]);
+        assert_eq!(r.settings.privacy.redact_mode, RedactMode::Block);
+        assert_eq!(r.settings.privacy.custom_patterns.len(), 1);
+        assert_eq!(
+            r.settings.judge.provider,
+            JudgeProvider::Jev,
+            "valid leaves outside privacy still apply"
+        );
+        assert_eq!(r.sources["privacy.redact_mode"], Source::File);
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert_eq!(dropped[0].key, "judge.review_treshold");
+    }
+
+    #[test]
+    fn a_bad_entry_in_a_privacy_list_costs_only_that_entry() {
+        let file = "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]+\" }, { name = \"bad\", regex = \"(\" }]\nallowlist = [\"^ok$\", \"(\"]\ncloud_denied_projects = [\"a\", \"\"]\n";
+        let (r, dropped) = resolve_salvaging(Some(file), &env(&[]));
+        let p = &r.settings.privacy;
+        assert_eq!(p.custom_patterns.len(), 1);
+        assert_eq!(p.custom_patterns[0].name, "ticket");
+        assert_eq!(p.allowlist, vec!["^ok$"]);
+        assert_eq!(p.cloud_denied_projects, vec!["a"]);
+        let mut keys: Vec<_> = dropped.iter().map(|e| e.key.as_str()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "privacy.allowlist",
+                "privacy.cloud_denied_projects",
+                "privacy.custom_patterns"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_has_nothing_to_salvage() {
+        let (r, dropped) = resolve_salvaging(
+            Some("[judge\n"),
+            &env(&[("ALICE_JUDGE_REVIEW_THRESHOLD", "0.7")]),
+        );
+        assert_eq!(
+            r.settings.judge.review_threshold, 0.7,
+            "the environment applies"
+        );
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].key, "config.toml");
+    }
+
+    #[test]
+    fn a_conflict_with_the_environment_still_keeps_the_privacy_leaves() {
+        // The error names judge.review_threshold, which is the variable's, not a file leaf.
+        let file =
+            "[privacy]\ncloud_denied_projects = [\"p\"]\n[judge]\nauto_apply_threshold = 0.4\n";
+        let (r, dropped) =
+            resolve_salvaging(Some(file), &env(&[("ALICE_JUDGE_REVIEW_THRESHOLD", "0.7")]));
+        assert_eq!(r.settings.privacy.cloud_denied_projects, vec!["p"]);
+        assert_eq!(r.settings.judge.review_threshold, 0.7);
+        assert!(!dropped.is_empty());
+    }
+
+    /// An environment value may be anything (a pasted key); no error repeats it.
+    #[test]
+    fn an_environment_value_is_never_echoed_in_an_error() {
+        const MARK: &str = "ZQXSECRETMARKER";
+        for info in key_infos().into_iter().filter(|k| !k.read_only) {
+            let default = &DEFAULT_MAP[&info.key];
+            if !(default.is_string() || default.is_null() || default.is_array()) {
+                continue;
+            }
+            for raw in [
+                MARK.to_string(),
+                format!("\"{MARK}\""),
+                format!("[{{ name = \"{MARK}\", regex = \"({MARK}\" }}]"),
+                format!("[\"({MARK}\"]"),
+            ] {
+                if let Err(errs) = resolve(None, &env(&[(&info.env_var, &raw)])) {
+                    for e in errs {
+                        assert!(
+                            !e.message.contains(MARK),
+                            "{} = {raw} echoed: {}",
+                            info.env_var,
+                            e.message
+                        );
+                    }
+                }
+            }
+        }
+        let errs = resolve(None, &env(&[("ALICE_JUDGE_PROVIDER", "jevv")])).unwrap_err();
+        assert_eq!(errs[0].key, "judge.provider");
+        let m = &errs[0].message;
+        assert!(
+            m.contains("ALICE_JUDGE_PROVIDER") && m.contains("heuristic") && m.contains("jev"),
+            "the fixed text still says what is accepted: {m}"
+        );
+    }
+
+    fn pattern(name: &str) -> CustomPattern {
+        CustomPattern {
+            name: name.into(),
+            regex: "TCK-[0-9]+".into(),
+        }
+    }
+
+    fn guarded() -> Settings {
+        let mut s = Settings::default();
+        s.privacy.redact_mode = RedactMode::Block;
+        s.privacy.custom_patterns = vec![pattern("ticket")];
+        s.privacy.cloud_denied_projects = vec!["a".into(), "b".into()];
+        s.privacy.allowlist = vec!["^ok$".into()];
+        s.judge.daily_budget_usd = 1.0;
+        s
+    }
+
+    #[test]
+    fn loosened_protections_names_each_protective_key_that_got_weaker() {
+        let base = guarded();
+        assert!(loosened_protections(&base, &base).is_empty());
+        // Tightening is not loosening.
+        let mut t = base.clone();
+        t.privacy.cloud_denied_projects.push("c".into());
+        t.privacy.custom_patterns.push(pattern("other"));
+        t.privacy.allowlist.clear();
+        t.judge.daily_budget_usd = 0.5;
+        assert!(loosened_protections(&base, &t).is_empty());
+
+        type Loosen = Box<dyn Fn(&mut Settings)>;
+        let cases: Vec<(&str, Loosen)> = vec![
+            ("privacy.redact", Box::new(|s| s.privacy.redact = false)),
+            (
+                "privacy.redact_mode",
+                Box::new(|s| s.privacy.redact_mode = RedactMode::Redact),
+            ),
+            (
+                "privacy.cloud_denied_projects",
+                Box::new(|s| {
+                    s.privacy.cloud_denied_projects.pop();
+                }),
+            ),
+            (
+                "privacy.custom_patterns",
+                Box::new(|s| s.privacy.custom_patterns.clear()),
+            ),
+            (
+                "privacy.allowlist",
+                Box::new(|s| s.privacy.allowlist.push(".*".into())),
+            ),
+            (
+                "judge.daily_budget_usd",
+                Box::new(|s| s.judge.daily_budget_usd = 5.0),
+            ),
+            (
+                "judge.provider",
+                Box::new(|s| s.judge.provider = JudgeProvider::Jev),
+            ),
+            (
+                "embedding.provider",
+                Box::new(|s| s.embedding.provider = EmbeddingProvider::Voyage),
+            ),
+        ];
+        for (key, change) in cases {
+            let mut looser = base.clone();
+            change(&mut looser);
+            assert_eq!(
+                loosened_protections(&base, &looser),
+                vec![key.to_string()],
+                "{key}"
+            );
+        }
+        // Moving between cloud providers, or to a local one, loosens nothing.
+        let mut cloud = base.clone();
+        cloud.judge.provider = JudgeProvider::Jev;
+        assert!(loosened_protections(&cloud, &base).is_empty());
+    }
+
+    #[test]
+    fn the_gate_lets_a_loosening_through_on_the_third_identical_poll() {
+        let mut g = LooseningGate::default();
+        assert!(g.admit(7, false), "tightening applies at once");
+        assert!(!g.admit(7, true) && g.is_pending());
+        assert!(!g.admit(7, true));
+        assert!(g.admit(7, true), "third time in a row");
+        assert!(!g.is_pending());
+        // A different content starts the count again.
+        assert!(!g.admit(1, true));
+        assert!(!g.admit(1, true));
+        assert!(!g.admit(2, true));
+        assert!(!g.admit(2, true));
+        // Going back to something that does not loosen clears it.
+        assert!(g.admit(2, false));
+        assert!(!g.admit(2, true), "count restarted after the reset");
+        g.reset();
+        assert!(!g.is_pending());
+    }
+
+    #[test]
+    fn a_project_is_cloud_denied_by_its_own_flag_or_the_global_list() {
+        let global = PrivacySettings {
+            cloud_denied_projects: vec!["listed".into()],
+            ..Default::default()
+        };
+        let plain = ProjectSettings::default().apply_to(&global);
+        assert!(plain.is_cloud_denied("listed"), "the global list alone");
+        assert!(!plain.is_cloud_denied("other"));
+        let mut flagged = ProjectSettings::default();
+        flagged.privacy.cloud_denied = true;
+        let eff = flagged.apply_to(&global);
+        assert!(eff.is_cloud_denied("other"), "the project's own flag alone");
+        assert!(eff.is_cloud_denied("listed"));
+    }
+
+    fn write_project(dir: &Path, text: &str) {
+        std::fs::write(dir.join(".alice.toml"), text).unwrap();
+    }
+
+    const STRICT: &str = "[privacy]\nblock_secrets = true\ncloud_denied = true\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]+\" }]\n";
+
+    #[test]
+    fn a_project_file_that_cannot_be_read_fails_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let cache = ProjectSettingsCache::default();
+        // Never seen a good one: closed.
+        write_project(d.path(), "[privacy\n");
+        let l = cache.get(d.path());
+        assert!(l.error.is_some());
+        assert!(l.settings.privacy.block_secrets && l.settings.privacy.cloud_denied);
+        // A good one, then a broken one: closed, and the last good patterns are kept.
+        write_project(d.path(), STRICT);
+        let l = cache.get(d.path());
+        assert!(l.error.is_none() && l.settings.privacy.custom_patterns.len() == 1);
+        write_project(d.path(), "[privacy]\nredact = false\n");
+        let l = cache.get(d.path());
+        assert!(l.error.is_some());
+        assert!(l.settings.privacy.block_secrets && l.settings.privacy.cloud_denied);
+        assert_eq!(l.settings.privacy.custom_patterns.len(), 1);
+        // Unreadable (a directory in its place) is an error too.
+        std::fs::remove_file(d.path().join(".alice.toml")).unwrap();
+        std::fs::create_dir(d.path().join(".alice.toml")).unwrap();
+        let l = cache.get(d.path());
+        assert!(l.error.is_some() && l.settings.privacy.cloud_denied);
+        assert_eq!(
+            ProjectSettings::fail_closed().privacy,
+            ProjectPrivacy {
+                block_secrets: true,
+                cloud_denied: true,
+                custom_patterns: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn a_project_file_that_loosens_must_hold_for_three_polls() {
+        let d = tempfile::tempdir().unwrap();
+        let cache = ProjectSettingsCache::default();
+        write_project(d.path(), STRICT);
+        assert!(cache.get(d.path()).settings.privacy.cloud_denied);
+        // Emptied (a half-written save): the last good one stays for two polls.
+        write_project(d.path(), "");
+        for _ in 0..2 {
+            let l = cache.get(d.path());
+            assert!(l.settings.privacy.cloud_denied && l.loosening_pending);
+        }
+        // Back to the strict content: nothing was applied, and the count is gone.
+        write_project(d.path(), STRICT);
+        assert!(!cache.get(d.path()).loosening_pending);
+        write_project(d.path(), "");
+        for _ in 0..2 {
+            assert!(cache.get(d.path()).settings.privacy.cloud_denied);
+        }
+        let l = cache.get(d.path());
+        assert!(
+            !l.settings.privacy.cloud_denied && !l.loosening_pending,
+            "applied on the third poll in a row"
+        );
+        // Tightening applies at once.
+        write_project(d.path(), STRICT);
+        assert!(cache.get(d.path()).settings.privacy.cloud_denied);
+        // So does removing a pattern only after three polls; deleting the file counts as emptying.
+        std::fs::remove_file(d.path().join(".alice.toml")).unwrap();
+        for _ in 0..2 {
+            assert!(cache.get(d.path()).settings.privacy.block_secrets);
+        }
+        assert!(!cache.get(d.path()).settings.privacy.block_secrets);
+    }
+
+    #[test]
+    fn toml_line_counts_lines_from_one() {
+        assert_eq!(toml_line("a = 1\nb = 2\nc", 0), 1);
+        assert_eq!(toml_line("a = 1\nb = 2\nc", 6), 2);
+        assert_eq!(toml_line("a = 1\nb = 2\nc", 12), 3);
+        assert_eq!(toml_line("a", 99), 1, "past the end is the last line");
     }
 }

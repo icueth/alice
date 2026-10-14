@@ -24,7 +24,7 @@ pub fn rrf(lists: &[Vec<ItemRef>]) -> HashMap<ItemRef, f64> {
 
 /// Ranking multipliers (spec §4.4); the `[search.weights]` settings.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Weights {
     /// Multiplier for knowledge memories.
     pub knowledge: f64,
@@ -173,6 +173,15 @@ pub fn boost(w: &Weights, b: &BoostInput) -> f64 {
 mod tests {
     use super::*;
     use crate::model::Status;
+
+    /// The published schema says `additionalProperties: false` for both groups alike.
+    #[test]
+    fn weights_and_half_lives_both_refuse_unknown_fields() {
+        let typo = serde_json::json!({"knowledgee": 2.0});
+        assert!(serde_json::from_value::<Weights>(typo.clone()).is_err());
+        assert!(serde_json::from_value::<HalfLives>(serde_json::json!({"statuss": 1.0})).is_err());
+        assert!(serde_json::from_value::<Weights>(serde_json::json!({"knowledge": 2.0})).is_ok());
+    }
 
     #[test]
     fn rrf_rewards_items_found_by_several_lists() {

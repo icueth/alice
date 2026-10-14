@@ -3,12 +3,30 @@
 //! file, patch or variable never replaces valid settings; the errors are kept for
 //! `alice config list`, `/api/v1/settings` and `alice doctor`.
 //!
+//! # Fail closed
+//!
+//! Settings that protect privacy are never loosened by a file that may be half written or
+//! broken:
+//!
+//! - a change that **loosens** a protective key (see
+//!   [`alice_core::settings::loosened_protections`]) or empties or removes a non-empty
+//!   `config.toml` applies only when the same content is read on three polls in a row
+//!   ([`alice_core::settings::LooseningGate`]); a change that tightens, or a `patch`, applies at
+//!   once;
+//! - a `patch` refuses to build a file from a read that is mid-write or not applied yet;
+//! - a leaf of `config.toml` that is invalid costs only itself ([`alice_core::settings::resolve_salvaging`]),
+//!   and while no valid file has ever loaded in this process [`SettingsHandle::config_degraded`]
+//!   is `true`. **Cloud consumers (the Jev judge, HTTP embedders) must treat that as "no cloud"**:
+//!   a typo in `privacy.cloud_denied_projects` itself would otherwise mean an empty denylist.
+//!
 //! Only `ALICE_*` variables are looked at, and only the values of setting variables are kept:
 //! a secret in `ALICE_EMBEDDING_API_KEY` (or one put in a misnamed variable) is never held,
 //! logged or shown here.
 
 use crate::paths::AliceHome;
-use alice_core::settings::{self, Resolved, SettingError, Settings, Source};
+use alice_core::settings::{
+    self, LooseningGate, Resolved, SettingError, Settings, Source, loosened_protections,
+};
 use parking_lot::{Mutex, RwLock};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -16,8 +34,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
-
-pub use alice_core::settings::JudgeProvider;
 
 /// How long a changed `config.toml` must hold still before it is read as the new settings. An
 /// editor that truncates the file and then writes it is not caught half-way: an empty file is
@@ -65,22 +81,37 @@ impl EnvLayer {
                 Err(e) => errors.extend(e),
             }
         }
-        if let Err(e) = settings::resolve(None, &vars) {
-            // Valid one by one, invalid together: none of them applies.
-            let names: Vec<&str> = vars
+        // Valid one by one, invalid together (a review threshold above the auto threshold): set
+        // aside the variables the errors name, and look again. An unrelated variable keeps
+        // working.
+        while let Err(e) = settings::resolve(None, &vars) {
+            let named: Vec<&str> = e.iter().map(|x| x.key.as_str()).collect();
+            let is_setting = |k: &str| settings::key_for_env_var(k).is_some();
+            let mut aside: Vec<String> = vars
                 .iter()
-                .filter(|(k, _)| settings::key_for_env_var(k).is_some())
-                .map(|(k, _)| k.as_str())
+                .filter(|(k, _)| {
+                    settings::key_for_env_var(k).is_some_and(|key| named.contains(&key))
+                })
+                .map(|(k, _)| k.clone())
                 .collect();
-            let names = names.join(", ");
+            if aside.is_empty() {
+                // The errors do not point at a variable: none of them can be trusted.
+                aside = vars
+                    .iter()
+                    .filter(|(k, _)| is_setting(k))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+            }
+            let names = aside.join(", ");
             errors.extend(e.into_iter().map(|x| SettingError {
                 message: format!(
-                    "{} (from the environment; {names} are ignored until this is fixed)",
-                    x.message
+                    "{} (from the environment; {names} {} ignored until this is fixed)",
+                    x.message,
+                    if aside.len() == 1 { "is" } else { "are" }
                 ),
                 key: x.key,
             }));
-            vars.retain(|(k, _)| settings::key_for_env_var(k).is_none());
+            vars.retain(|(k, _)| !aside.contains(k));
         }
         Self { vars, errors }
     }
@@ -136,6 +167,27 @@ fn fingerprint(read: &Read) -> u64 {
     h.finish()
 }
 
+/// Whether a read holds any settings text (a blank file is as good as none).
+fn has_text(read: &Read) -> bool {
+    matches!(read, Ok(Some(t)) if !t.trim().is_empty())
+}
+
+/// What the handle last acted on: the file's fingerprint and whether it had text.
+#[derive(Clone, Copy)]
+struct Seen {
+    fingerprint: u64,
+    had_text: bool,
+}
+
+impl Seen {
+    fn of(read: &Read) -> Self {
+        Self {
+            fingerprint: fingerprint(read),
+            had_text: has_text(read),
+        }
+    }
+}
+
 /// Two reads `settle` apart; `None` unless they agree (the file is still being written).
 fn settled<T: PartialEq>(mut read: impl FnMut() -> T, settle: Duration) -> Option<T> {
     let first = read();
@@ -147,18 +199,16 @@ fn default_resolved() -> Resolved {
     settings::resolve(None, &[]).expect("defaults are valid")
 }
 
-/// The file layer over the environment; when the file is the problem, the defaults plus the
-/// (already checked) environment, and the file's errors.
+/// The file layer over the environment. A leaf of the file that is invalid costs only itself
+/// (the privacy leaves that are valid always apply); the errors say what was left out. A file
+/// that cannot be read or does not parse leaves the defaults plus the (already checked)
+/// environment.
 fn resolve_layers(read: &Read, env: &EnvLayer) -> (Resolved, Vec<SettingError>) {
-    let with_file = match read {
-        Ok(text) => settings::resolve(text.as_deref(), &env.vars),
-        Err(e) => Err(vec![e.clone()]),
-    };
-    match with_file {
-        Ok(r) => (r, Vec::new()),
-        Err(errors) => (
+    match read {
+        Ok(text) => settings::resolve_salvaging(text.as_deref(), &env.vars),
+        Err(e) => (
             settings::resolve(None, &env.vars).unwrap_or_else(|_| default_resolved()),
-            errors,
+            vec![e.clone()],
         ),
     }
 }
@@ -176,9 +226,13 @@ fn log_problems(errors: &[SettingError], warnings: &[String]) {
 #[derive(Debug, Clone)]
 pub struct Effective {
     pub resolved: Resolved,
-    /// Problems in `config.toml` or in setting variables. A broken file means the defaults plus
-    /// the valid variables; an invalid variable is left out and the rest still applies.
+    /// Problems in `config.toml` or in setting variables. A bad leaf of the file is left out
+    /// (the rest applies); an invalid variable is left out and the rest still applies.
     pub errors: Vec<SettingError>,
+    /// `config.toml` could not be read, did not parse, or had leaves that were left out. A
+    /// leaf left out may be a privacy one (a typo inside `cloud_denied_projects` itself), so
+    /// a cloud consumer (Jev, an HTTP embedder) must treat `true` as "no cloud".
+    pub degraded: bool,
 }
 
 /// `config.toml` + the process's `ALICE_*` variables, resolved over the defaults. Never fails.
@@ -191,9 +245,14 @@ pub fn load_effective(home: &AliceHome) -> Effective {
 fn effective(file: &Path, env: &[(String, String)]) -> Effective {
     let env = EnvLayer::new(env);
     let (resolved, mut errors) = resolve_layers(&read_config(file), &env);
+    let degraded = !errors.is_empty();
     errors.extend(env.errors.iter().cloned());
     log_problems(&errors, &resolved.warnings);
-    Effective { resolved, errors }
+    Effective {
+        resolved,
+        errors,
+        degraded,
+    }
 }
 
 fn changed_keys(a: &Settings, b: &Settings) -> Vec<String> {
@@ -266,8 +325,13 @@ pub struct SettingsHandle {
     snapshot: RwLock<Snapshot>,
     /// Problems with `config.toml` (cleared by the next good read or patch).
     file_errors: RwLock<Vec<SettingError>>,
-    /// Fingerprint of the last `config.toml` read or written.
-    seen: Mutex<u64>,
+    /// The `config.toml` last read or written. A loosening that is waiting is not recorded
+    /// here, so it is looked at again on every poll.
+    seen: Mutex<Seen>,
+    /// Holds back loosenings until the same content is read on three polls in a row.
+    gate: Mutex<LooseningGate>,
+    /// A `config.toml` without errors (or none) has loaded in this process.
+    ever_valid: AtomicBool,
     /// Serialises reloads and patches.
     write: Mutex<()>,
     changes: tokio::sync::broadcast::Sender<Vec<String>>,
@@ -280,6 +344,7 @@ impl std::fmt::Debug for SettingsHandle {
             .field("file", &self.file)
             .field("env", &self.env.names())
             .field("errors", &self.errors())
+            .field("config_degraded", &self.config_degraded())
             .finish_non_exhaustive()
     }
 }
@@ -306,7 +371,9 @@ impl SettingsHandle {
         );
         let (changes, _) = tokio::sync::broadcast::channel(16);
         Arc::new(Self {
-            seen: Mutex::new(fingerprint(&read)),
+            seen: Mutex::new(Seen::of(&read)),
+            gate: Mutex::new(LooseningGate::default()),
+            ever_valid: AtomicBool::new(file_errors.is_empty()),
             file,
             env,
             snapshot: RwLock::new(Snapshot::new(resolved)),
@@ -336,6 +403,20 @@ impl SettingsHandle {
             .collect()
     }
 
+    /// `true` while no valid `config.toml` has loaded in this process: it did not parse, could
+    /// not be read, or had leaves left out (see [`alice_core::settings::resolve_salvaging`]),
+    /// and nothing better has been loaded since. A left-out leaf may be a privacy one (a typo
+    /// inside `privacy.cloud_denied_projects` itself leaves the denylist empty), so **cloud
+    /// consumers must treat `true` as "no cloud"**: the Jev judge (Task 9) sends nothing and
+    /// HTTP embedders (Task 16) are not used. `/api/v1/settings`, health and `alice doctor`
+    /// show it next to [`errors`](Self::errors).
+    ///
+    /// Once a valid file has loaded it stays `false`: a later invalid edit is not applied at
+    /// all, so the last valid settings (denylist included) remain in force.
+    pub fn config_degraded(&self) -> bool {
+        !self.ever_valid.load(Ordering::SeqCst)
+    }
+
     /// Ignored `ALICE_*` variables (reported in health and `alice config list`).
     pub fn warnings(&self) -> Vec<String> {
         self.snapshot.read().resolved.warnings.clone()
@@ -346,10 +427,10 @@ impl SettingsHandle {
         self.changes.subscribe()
     }
 
-    fn swap(&self, r: Resolved) -> Vec<String> {
+    fn swap(&self, r: Resolved, errors: Vec<SettingError>) -> Vec<String> {
         let changed = changed_keys(&self.snapshot.read().settings, &r.settings);
         *self.snapshot.write() = Snapshot::new(r);
-        self.file_errors.write().clear();
+        *self.file_errors.write() = errors;
         if !changed.is_empty() {
             let _ = self.changes.send(changed.clone());
         }
@@ -358,33 +439,70 @@ impl SettingsHandle {
 
     /// Re-read `config.toml` if it changed on disk (by content, not by time). `Some(changed
     /// keys)` when new settings took effect; `None` when nothing changed, the file is still
-    /// being written, or it is invalid (the last good settings stay, and `errors` says why).
+    /// being written, it is invalid (the last good settings stay, and `errors` says why), or it
+    /// loosens a protection and has not yet been read the same on three polls in a row.
     pub fn reload_if_changed(&self) -> Option<Vec<String>> {
         let _w = self.write.lock();
-        if fingerprint(&read_config(&self.file)) == *self.seen.lock() {
+        if fingerprint(&read_config(&self.file)) == self.seen.lock().fingerprint {
+            self.gate.lock().reset();
             return None;
         }
         // Still being written: the next poll looks again.
         let read = settled(|| read_config(&self.file), SETTLE)?;
-        *self.seen.lock() = fingerprint(&read);
-        let result = match &read {
-            Ok(text) => settings::resolve(text.as_deref(), &self.env.vars),
-            Err(e) => Err(vec![e.clone()]),
-        };
-        match result {
-            Ok(r) => Some(self.swap(r)),
-            Err(errs) => {
-                for e in &errs {
-                    tracing::warn!(key = %e.key, message = %e.message, "config.toml is invalid; keeping the previous settings");
-                }
-                *self.file_errors.write() = errs;
-                None
+        self.observe(read, true)
+    }
+
+    /// Turn one settled read of `config.toml` into settings, or not. `counts_as_poll` is false
+    /// for a `patch` looking at the file: it must not move a waiting loosening along.
+    fn observe(&self, read: Read, counts_as_poll: bool) -> Option<Vec<String>> {
+        let seen = *self.seen.lock();
+        let now = Seen::of(&read);
+        if now.fingerprint == seen.fingerprint {
+            self.gate.lock().reset();
+            return None;
+        }
+        let (candidate, errors) = resolve_layers(&read, &self.env);
+        let ever_valid = self.ever_valid.load(Ordering::SeqCst);
+        if !errors.is_empty() && ever_valid {
+            // An invalid edit is not applied, not even its valid parts: the last good settings
+            // stay exactly as they were. The same error is not logged on every poll.
+            for e in &errors {
+                tracing::warn!(key = %e.key, message = %e.message, "config.toml is invalid; keeping the previous settings");
+            }
+            *self.file_errors.write() = errors;
+            *self.seen.lock() = now;
+            self.gate.lock().reset();
+            return None;
+        }
+        // An emptied or removed file counts as loosening even when it holds nothing protective:
+        // it is the shape of a half-written save.
+        let loosens = !loosened_protections(&self.get(), &candidate.settings).is_empty()
+            || (seen.had_text && !now.had_text);
+        if loosens && !counts_as_poll {
+            return None;
+        }
+        if !self.gate.lock().admit(now.fingerprint, loosens) {
+            tracing::warn!(
+                "config.toml loosens a protection; applying it once it reads the same on 3 polls in a row"
+            );
+            return None;
+        }
+        *self.seen.lock() = now;
+        if errors.is_empty() {
+            self.ever_valid.store(true, Ordering::SeqCst);
+        } else {
+            for e in &errors {
+                tracing::warn!(key = %e.key, message = %e.message, "config.toml has invalid settings; they are left out and the rest applies");
             }
         }
+        Some(self.swap(candidate, errors))
     }
 
     /// Apply dotted-key changes (`null` removes a key from config.toml). All or nothing: on an
-    /// error the file and the settings stay as they were.
+    /// error the file and the settings stay as they were. Refused while `config.toml` is being
+    /// written or holds a change that has not been applied yet (a truncated file, or a
+    /// loosening waiting for its three polls): a file built from such a read would drop
+    /// whatever the truncated part held.
     pub fn patch(
         &self,
         changes: &serde_json::Map<String, serde_json::Value>,
@@ -393,9 +511,24 @@ impl SettingsHandle {
             return Ok(PatchOutcome::default());
         }
         let _w = self.write.lock();
-        let mut text = read_config(&self.file)
-            .map_err(|e| vec![e])?
-            .unwrap_or_default();
+        let busy = || {
+            vec![err(
+                "config.toml",
+                "changed on disk and that change is not applied yet (a program may still be writing it, or it removes protections and is waiting to hold still); wait a few seconds, then try again".into(),
+            )]
+        };
+        let read = settled(|| read_config(&self.file), SETTLE).ok_or_else(busy)?;
+        if let Err(e) = &read {
+            return Err(vec![e.clone()]);
+        }
+        if fingerprint(&read) != self.seen.lock().fingerprint {
+            // Changed since the last poll: the normal rules decide whether it is in force.
+            self.observe(read.clone(), false);
+            if fingerprint(&read) != self.seen.lock().fingerprint {
+                return Err(busy());
+            }
+        }
+        let mut text = read.map_err(|e| vec![e])?.unwrap_or_default();
         for (k, v) in changes {
             text = settings::edit_toml(&text, k, v).map_err(|e| vec![e])?;
         }
@@ -407,18 +540,20 @@ impl SettingsHandle {
                 format!("cannot write {}: {e}", target.display()),
             )]);
         }
-        *self.seen.lock() = fingerprint(&Ok(Some(text)));
+        *self.seen.lock() = Seen::of(&Ok(Some(text)));
+        self.gate.lock().reset();
+        self.ever_valid.store(true, Ordering::SeqCst);
         let overridden_by_env = changes
             .keys()
             .filter(|k| matches!(r.sources.get(k.as_str()), Some(Source::Env { .. })))
             .cloned()
             .collect();
+        let changed = self.swap(r, Vec::new());
         let restart_required = changes
             .keys()
-            .filter(|k| settings::RESTART_KEYS.contains(&k.as_str()))
+            .filter(|k| settings::RESTART_KEYS.contains(&k.as_str()) && changed.contains(*k))
             .cloned()
             .collect();
-        let changed = self.swap(r);
         Ok(PatchOutcome {
             changed,
             restart_required,
@@ -453,7 +588,7 @@ impl SettingsHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alice_core::settings::JudgeProvider;
+    use alice_core::settings::RedactMode;
 
     fn home() -> (tempfile::TempDir, AliceHome) {
         let d = tempfile::tempdir().unwrap();
@@ -583,25 +718,22 @@ mod tests {
     fn file_edits_apply_and_a_half_written_file_keeps_the_last_good_settings() {
         let (_d, h) = home();
         let s = SettingsHandle::load_with_env(&h, vec![]);
-        std::fs::write(h.config_file(), "[judge]\nprovider = \"jev\"\n").unwrap();
-        bump_mtime(&h.config_file());
+        std::fs::write(h.config_file(), "[judge]\nreview_threshold = 0.6\n").unwrap();
         assert_eq!(
             s.reload_if_changed().unwrap(),
-            vec!["judge.provider".to_string()]
+            vec!["judge.review_threshold".to_string()]
         );
-        assert_eq!(s.get().judge.provider, JudgeProvider::Jev);
-        std::fs::write(h.config_file(), "[judge]\nprovider = \"je").unwrap();
-        bump_mtime(&h.config_file());
+        assert_eq!(s.get().judge.review_threshold, 0.6);
+        std::fs::write(h.config_file(), "[judge]\nreview_threshold = 0.").unwrap();
         assert!(s.reload_if_changed().is_none());
         assert_eq!(
-            s.get().judge.provider,
-            JudgeProvider::Jev,
+            s.get().judge.review_threshold,
+            0.6,
             "last good settings stay"
         );
         assert!(s.errors().iter().any(|e| e.key == "config.toml"));
         // Fixed: the error goes away.
-        std::fs::write(h.config_file(), "[judge]\nprovider = \"jev\"\n").unwrap();
-        bump_mtime(&h.config_file());
+        std::fs::write(h.config_file(), "[judge]\nreview_threshold = 0.6\n").unwrap();
         assert_eq!(s.reload_if_changed(), Some(vec![]));
         assert!(s.errors().is_empty(), "{:?}", s.errors());
     }
@@ -678,7 +810,6 @@ mod tests {
         );
         // Edits still apply, and the variable's error stays in view.
         std::fs::write(h.config_file(), "[judge]\nreview_threshold = 0.7\n").unwrap();
-        bump_mtime(&h.config_file());
         assert!(s.reload_if_changed().is_some());
         assert_eq!(s.get().judge.review_threshold, 0.7);
         s.patch(&one("judge.auto_apply_threshold", serde_json::json!(0.9)))
@@ -810,7 +941,6 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let t = s.spawn_watcher(Duration::from_millis(50), stop.clone());
         std::fs::write(h.config_file(), "[mcp]\nadmin_tools = true\n").unwrap();
-        bump_mtime(&h.config_file());
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !s.get().mcp.admin_tools {
             assert!(
@@ -823,16 +953,269 @@ mod tests {
         t.join().unwrap();
     }
 
-    /// Some file systems keep 1 s mtimes: make each write look new.
-    fn bump_mtime(p: &std::path::Path) {
-        let f = std::fs::File::options().write(true).open(p).unwrap();
-        let t = std::time::SystemTime::now() + Duration::from_secs(rand_secs());
-        f.set_modified(t).unwrap();
+    // ------------------------------------------------------------ fix round 1
+
+    fn write(h: &AliceHome, text: &str) {
+        std::fs::write(h.config_file(), text).unwrap();
     }
 
-    fn rand_secs() -> u64 {
-        use std::sync::atomic::AtomicU64;
-        static N: AtomicU64 = AtomicU64::new(1);
-        N.fetch_add(1, Ordering::SeqCst)
+    const GUARDED: &str = "[privacy]\ncloud_denied_projects = [\"client-x\", \"client-y\"]\nredact_mode = \"block\"\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]+\" }]\n";
+
+    fn denylist(s: &SettingsHandle) -> Vec<String> {
+        s.get().privacy.cloud_denied_projects.clone()
+    }
+
+    /// R1: an editor that truncates and then writes shows an empty file for a moment. The
+    /// polls are the injected trigger: no clock, no sleeping.
+    #[test]
+    fn a_half_written_config_never_switches_protections_off_for_a_moment() {
+        let (_d, h) = home();
+        write(&h, GUARDED);
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert_eq!(denylist(&s), vec!["client-x", "client-y"]);
+        // Truncated: one poll sees the empty file, the denylist stays.
+        write(&h, "");
+        assert!(s.reload_if_changed().is_none());
+        assert_eq!(denylist(&s), vec!["client-x", "client-y"]);
+        // The writer finishes (the same content as before): nothing to apply, and the count of
+        // empty polls is gone.
+        write(&h, GUARDED);
+        assert!(s.reload_if_changed().is_none());
+        assert_eq!(denylist(&s), vec!["client-x", "client-y"]);
+        // Emptied again for two polls: still held back.
+        write(&h, "");
+        assert!(s.reload_if_changed().is_none());
+        assert!(s.reload_if_changed().is_none());
+        assert_eq!(denylist(&s), vec!["client-x", "client-y"]);
+        // The third poll in a row: a deliberate emptying is applied.
+        let changed = s.reload_if_changed().expect("applied on the third poll");
+        assert!(changed.contains(&"privacy.cloud_denied_projects".to_string()));
+        assert!(denylist(&s).is_empty());
+        assert_eq!(s.get().privacy.redact_mode, RedactMode::Redact);
+    }
+
+    #[test]
+    fn every_loosening_waits_for_three_polls_and_a_tightening_applies_at_once() {
+        const TWO_LEFT: &str = "[privacy]\ncloud_denied_projects = [\"client-x\"]\nredact_mode = \"block\"\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]+\" }]\n";
+        const NO_PATTERN: &str = "[privacy]\ncloud_denied_projects = [\"client-x\", \"client-y\"]\nredact_mode = \"block\"\n";
+        const THREE: &str = "[privacy]\ncloud_denied_projects = [\"client-x\", \"client-y\", \"client-z\"]\nredact_mode = \"block\"\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]+\" }]\n";
+        // (before, after, a key the after-file changes)
+        let loosenings = [
+            ("", "[privacy]\nredact = false\n", "privacy.redact"),
+            (
+                "[privacy]\nredact_mode = \"block\"\n",
+                "[privacy]\nredact_mode = \"redact\"\n",
+                "privacy.redact_mode",
+            ),
+            (GUARDED, TWO_LEFT, "privacy.cloud_denied_projects"),
+            (GUARDED, NO_PATTERN, "privacy.custom_patterns"),
+            (
+                "[privacy]\nallowlist = [\"^a$\"]\n",
+                "[privacy]\nallowlist = [\"^a$\", \"^b$\"]\n",
+                "privacy.allowlist",
+            ),
+            (
+                "[judge]\ndaily_budget_usd = 1.0\n",
+                "[judge]\ndaily_budget_usd = 5.0\n",
+                "judge.daily_budget_usd",
+            ),
+            ("", "[judge]\nprovider = \"jev\"\n", "judge.provider"),
+        ];
+        for (before, after, key) in loosenings {
+            let (_d, h) = home();
+            write(&h, before);
+            let s = SettingsHandle::load_with_env(&h, vec![]);
+            write(&h, after);
+            assert!(s.reload_if_changed().is_none(), "{key}: poll 1");
+            assert!(s.reload_if_changed().is_none(), "{key}: poll 2");
+            let changed = s
+                .reload_if_changed()
+                .unwrap_or_else(|| panic!("{key}: poll 3"));
+            assert!(changed.contains(&key.to_string()), "{key}: {changed:?}");
+        }
+        let tightenings = [
+            (GUARDED, THREE, "privacy.cloud_denied_projects"),
+            (
+                "",
+                "[privacy]\nredact_mode = \"block\"\n",
+                "privacy.redact_mode",
+            ),
+            (
+                "[judge]\ndaily_budget_usd = 5.0\n",
+                "[judge]\ndaily_budget_usd = 1.0\n",
+                "judge.daily_budget_usd",
+            ),
+        ];
+        for (before, after, key) in tightenings {
+            let (_d, h) = home();
+            write(&h, before);
+            let s = SettingsHandle::load_with_env(&h, vec![]);
+            write(&h, after);
+            let changed = s
+                .reload_if_changed()
+                .unwrap_or_else(|| panic!("{key}: at once"));
+            assert!(changed.contains(&key.to_string()), "{key}: {changed:?}");
+        }
+    }
+
+    #[test]
+    fn an_emptied_or_missing_config_waits_even_when_nothing_protective_is_in_it() {
+        type Gone = fn(&AliceHome);
+        let gone: [Gone; 2] = [
+            |h| std::fs::remove_file(h.config_file()).unwrap(),
+            |h| write(h, "  \n"),
+        ];
+        for gone in gone {
+            let (_d, h) = home();
+            write(&h, "[judge]\nreview_threshold = 0.6\n");
+            let s = SettingsHandle::load_with_env(&h, vec![]);
+            gone(&h);
+            assert!(s.reload_if_changed().is_none());
+            assert!(s.reload_if_changed().is_none());
+            assert_eq!(s.get().judge.review_threshold, 0.6, "held back");
+            assert!(s.reload_if_changed().is_some(), "third poll");
+            assert_eq!(s.get().judge.review_threshold, 0.5);
+        }
+    }
+
+    #[test]
+    fn a_patch_during_a_truncated_write_is_refused() {
+        let (_d, h) = home();
+        write(&h, GUARDED);
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        write(&h, ""); // an editor truncated the file and has not written it yet
+        let errs = s
+            .patch(&one("mcp.admin_tools", serde_json::json!(true)))
+            .unwrap_err();
+        assert_eq!(errs[0].key, "config.toml");
+        assert!(errs[0].message.contains("try again"), "{errs:?}");
+        assert_eq!(
+            std::fs::read_to_string(h.config_file()).unwrap(),
+            "",
+            "no file was built from the truncated read"
+        );
+        assert_eq!(denylist(&s), vec!["client-x", "client-y"]);
+        assert!(!s.get().mcp.admin_tools);
+        // The patch attempts did not count as polls: the emptying still needs three of its own.
+        assert!(
+            s.patch(&one("mcp.admin_tools", serde_json::json!(true)))
+                .is_err()
+        );
+        assert!(s.reload_if_changed().is_none());
+        assert_eq!(denylist(&s), vec!["client-x", "client-y"]);
+        // The writer finishes; the patch goes through on top of the real content.
+        write(&h, GUARDED);
+        s.patch(&one("mcp.admin_tools", serde_json::json!(true)))
+            .unwrap();
+        let text = std::fs::read_to_string(h.config_file()).unwrap();
+        assert!(
+            text.contains("client-y") && text.contains("admin_tools = true"),
+            "{text}"
+        );
+    }
+
+    /// R3: one conflicting pair of variables must not take an unrelated variable with it.
+    #[test]
+    fn conflicting_variables_set_aside_only_the_ones_the_error_names() {
+        let layer = EnvLayer::new(&[
+            ("ALICE_JUDGE_AUTO_APPLY_THRESHOLD".into(), "0.6".into()),
+            ("ALICE_JUDGE_REVIEW_THRESHOLD".into(), "0.7".into()),
+            ("ALICE_JUDGE_TIMEOUT_MS".into(), "2000".into()),
+        ]);
+        let kept: Vec<_> = layer.names();
+        assert!(kept.contains(&"ALICE_JUDGE_TIMEOUT_MS"), "{kept:?}");
+        assert!(
+            kept.contains(&"ALICE_JUDGE_AUTO_APPLY_THRESHOLD"),
+            "{kept:?}"
+        );
+        assert!(!kept.contains(&"ALICE_JUDGE_REVIEW_THRESHOLD"), "{kept:?}");
+        assert!(
+            layer
+                .errors
+                .iter()
+                .any(|e| e.key == "judge.review_threshold"
+                    && e.message.contains("ALICE_JUDGE_REVIEW_THRESHOLD")),
+            "{:?}",
+            layer.errors
+        );
+    }
+
+    /// R2: a typo in an unrelated key.
+    #[test]
+    fn a_typo_in_an_unrelated_key_keeps_the_privacy_settings() {
+        let (_d, h) = home();
+        write(
+            &h,
+            &format!("{GUARDED}\n[judge]\nreview_treshold = 0.7\nprovider = \"jev\"\n"),
+        );
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert_eq!(denylist(&s), vec!["client-x", "client-y"]);
+        assert_eq!(s.get().privacy.custom_patterns.len(), 1);
+        assert_eq!(s.get().privacy.redact_mode, RedactMode::Block);
+        assert!(s.errors().iter().any(|e| e.key == "judge.review_treshold"));
+        let e = effective(&h.config_file(), &[]);
+        assert_eq!(
+            e.resolved.settings.privacy.cloud_denied_projects,
+            vec!["client-x", "client-y"]
+        );
+    }
+
+    /// R2: the flag cloud consumers fail closed on.
+    #[test]
+    fn the_degraded_flag_says_no_valid_config_has_loaded() {
+        let (_d, h) = home();
+        // No file at all is a valid (default) configuration.
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert!(!s.config_degraded());
+        // A typo makes the file degraded: the denylist itself may be what was left out.
+        write(&h, "[privacy]\ncloud_denied_projects = \"client-x\"\n");
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert!(s.config_degraded());
+        assert!(denylist(&s).is_empty(), "the bad leaf is left out");
+        assert!(effective(&h.config_file(), &[]).degraded);
+        assert!(format!("{s:?}").contains("config_degraded: true"));
+        // Still bad, edited: still degraded, and the valid privacy leaves of the new text apply.
+        write(
+            &h,
+            "[privacy]\ncloud_denied_projects = \"client-x\"\nredact_mode = \"block\"\n",
+        );
+        assert!(s.reload_if_changed().is_some());
+        assert!(s.config_degraded());
+        assert_eq!(s.get().privacy.redact_mode, RedactMode::Block);
+        // A valid file ends it, for good.
+        write(&h, GUARDED);
+        assert!(s.reload_if_changed().is_some());
+        assert!(!s.config_degraded());
+        assert_eq!(denylist(&s), vec!["client-x", "client-y"]);
+        write(&h, "[privacy\n");
+        assert!(s.reload_if_changed().is_none());
+        assert!(
+            !s.config_degraded(),
+            "the last valid settings stay in force"
+        );
+        assert_eq!(denylist(&s), vec!["client-x", "client-y"]);
+        // A file nobody can read is degraded too.
+        std::fs::remove_file(h.config_file()).unwrap();
+        std::fs::create_dir(h.config_file()).unwrap();
+        assert!(SettingsHandle::load_with_env(&h, vec![]).config_degraded());
+        assert!(effective(&h.config_file(), &[]).degraded);
+        assert!(!effective(&home().1.config_file(), &[]).degraded);
+    }
+
+    /// m6: only keys whose value changed need a restart.
+    #[test]
+    fn restart_required_lists_only_keys_whose_value_changed() {
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        let out = s.patch(&one("server.port", serde_json::json!(0))).unwrap();
+        assert!(out.restart_required.is_empty(), "{out:?}");
+        let out = s
+            .patch(&one("server.port", serde_json::json!(4545)))
+            .unwrap();
+        assert_eq!(out.restart_required, vec!["server.port".to_string()]);
+        let out = s
+            .patch(&one("server.port", serde_json::json!(4545)))
+            .unwrap();
+        assert!(out.restart_required.is_empty(), "{out:?}");
     }
 }

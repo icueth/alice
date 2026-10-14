@@ -49,7 +49,8 @@ impl SecretName {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SecretStatus {
     pub set: bool,
-    /// The last four characters, e.g. `••••ab12` (only `••••` for short values).
+    /// The last four characters, e.g. `••••ab12`, for a value of 16 characters or more; `set`
+    /// for a shorter one (four characters are too much of it).
     pub hint: Option<String>,
     /// `file`, `keychain` or `env`.
     pub source: Option<String>,
@@ -75,11 +76,13 @@ pub trait SecretStore: Send + Sync {
     fn backend(&self) -> &'static str;
 }
 
-/// `••••` and the last four characters; only `••••` for values of 8 characters or fewer.
+/// `••••` and the last four characters of a value of 16 characters or more; `set` for a
+/// shorter one, of which four characters would be too large a part (a third of a 12-character
+/// key).
 pub fn hint(value: &str) -> String {
     let n = value.chars().count();
-    if n <= 8 {
-        "••••".into()
+    if n < 16 {
+        "set".into()
     } else {
         format!("••••{}", value.chars().skip(n - 4).collect::<String>())
     }
@@ -97,6 +100,11 @@ fn check_value(value: &str) -> Result<()> {
 
 /// `secrets.toml`: one `name = "value"` per secret, readable by its owner only (0600 on Unix;
 /// on Windows the file inherits the private ACL of the user's profile directory).
+///
+/// Writes (`set`, `delete`) are read-modify-write: they hold an in-process mutex and an
+/// exclusive lock on `secrets.toml.lock` beside the file, so the daemon and a `alice config
+/// set-secret` run in another process cannot lose each other's change. Reads never lock: the
+/// file is replaced by a rename, so a reader sees the old file or the new one.
 pub struct FileSecrets {
     path: PathBuf,
     lock: Mutex<()>,
@@ -110,11 +118,93 @@ impl std::fmt::Debug for FileSecrets {
     }
 }
 
+const TMP_PREFIX: &str = ".secrets.toml.";
+
 impl FileSecrets {
+    /// Opens the store. Temporary files a crashed write left beside the file (they hold a copy
+    /// of the secrets) are removed, unless another process is writing right now.
     pub fn new(path: PathBuf) -> Self {
-        Self {
+        let me = Self {
             path,
             lock: Mutex::new(()),
+        };
+        me.remove_stale_temporaries();
+        me
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "secrets.toml".into());
+        self.path.with_file_name(format!("{name}.lock"))
+    }
+
+    fn open_lock_file(&self) -> std::io::Result<std::fs::File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(self.lock_path())
+    }
+
+    /// Runs `f` holding the in-process mutex and the cross-process lock.
+    fn locked<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _in_process = self.lock.lock();
+        let file = self.open_lock_file().and_then(|file| {
+            file.lock()?;
+            Ok(file)
+        });
+        let file = file.map_err(|e| {
+            AliceError::Other(format!(
+                "cannot lock {}: {e}; check the permissions of the folder",
+                self.lock_path().display()
+            ))
+        })?;
+        let out = f();
+        drop(file); // releases the lock
+        out
+    }
+
+    fn remove_stale_temporaries(&self) {
+        let Some(dir) = self.path.parent() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let stale: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(TMP_PREFIX) && n.ends_with(".tmp")
+            })
+            .map(|e| e.path())
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        // Only while nobody is writing: a writer's temporary file is in use until its rename.
+        let Ok(lock) = self.open_lock_file() else {
+            return;
+        };
+        if lock.try_lock().is_err() {
+            return;
+        }
+        for f in stale {
+            match std::fs::remove_file(&f) {
+                Ok(()) => tracing::warn!(
+                    path = %f.display(),
+                    "removed a temporary secrets file that an interrupted write left behind"
+                ),
+                Err(e) => {
+                    tracing::warn!(path = %f.display(), "cannot remove a stale temporary secrets file: {e}")
+                }
+            }
         }
     }
 
@@ -135,12 +225,10 @@ impl FileSecrets {
             let line = e
                 .span()
                 .map(|s| {
-                    let at = s.start.min(text.len());
-                    let n = text.as_bytes()[..at]
-                        .iter()
-                        .filter(|b| **b == b'\n')
-                        .count();
-                    format!(" (line {})", n + 1)
+                    format!(
+                        " (line {})",
+                        alice_core::settings::toml_line(&text, s.start)
+                    )
                 })
                 .unwrap_or_default();
             AliceError::Other(format!(
@@ -175,12 +263,14 @@ impl FileSecrets {
     #[cfg(not(unix))]
     fn make_private(&self) {}
 
-    /// Written to a new private file, synced, then renamed over the old one.
+    /// Written to a new private file (created 0600, so it is private from its first byte),
+    /// synced, renamed over the old one, and the folder synced so the rename survives a crash.
+    /// The caller holds the lock.
     fn write(&self, t: &toml::Table) -> Result<()> {
         let text = toml::to_string(t).map_err(|e| AliceError::Other(e.to_string()))?;
         let tmp = self
             .path
-            .with_file_name(format!(".secrets.toml.{}.tmp", alice_core::ids::new_id()));
+            .with_file_name(format!("{TMP_PREFIX}{}.tmp", alice_core::ids::new_id()));
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -195,9 +285,8 @@ impl FileSecrets {
             drop(f);
             std::fs::rename(&tmp, &self.path)?;
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+            if let Some(dir) = self.path.parent() {
+                std::fs::File::open(dir)?.sync_all()?;
             }
             Ok(())
         })();
@@ -220,24 +309,26 @@ impl SecretStore for FileSecrets {
 
     fn set(&self, name: SecretName, value: &str) -> Result<()> {
         check_value(value)?;
-        let _l = self.lock.lock();
-        // A file that cannot be read is not overwritten: it may hold the other secrets.
-        let mut t = self.read()?;
-        t.insert(
-            name.as_str().into(),
-            toml::Value::String(value.trim().into()),
-        );
-        self.write(&t)
+        self.locked(|| {
+            // A file that cannot be read is not overwritten: it may hold the other secrets.
+            let mut t = self.read()?;
+            t.insert(
+                name.as_str().into(),
+                toml::Value::String(value.trim().into()),
+            );
+            self.write(&t)
+        })
     }
 
     fn delete(&self, name: SecretName) -> Result<bool> {
-        let _l = self.lock.lock();
-        let mut t = self.read()?;
-        let had = t.remove(name.as_str()).is_some();
-        if had {
-            self.write(&t)?;
-        }
-        Ok(had)
+        self.locked(|| {
+            let mut t = self.read()?;
+            let had = t.remove(name.as_str()).is_some();
+            if had {
+                self.write(&t)?;
+            }
+            Ok(had)
+        })
     }
 
     fn backend(&self) -> &'static str {
@@ -464,10 +555,11 @@ mod tests {
         );
         assert!(store.set(SecretName::JevApiKey, "").is_err());
         assert!(store.set(SecretName::JevApiKey, "two\nlines").is_err());
-        let left: Vec<_> = std::fs::read_dir(d.path())
+        let mut left: Vec<_> = std::fs::read_dir(d.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
+        left.retain(|n| n != "secrets.toml.lock");
         assert_eq!(left, vec!["secrets.toml"], "no temporary file is left");
     }
 
@@ -513,7 +605,7 @@ mod tests {
                 .as_deref(),
             Some("env")
         );
-        assert_eq!(hint("short"), "••••");
+        assert_eq!(hint("short"), "set");
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("abcdef"), "{json}");
         assert_eq!(
@@ -651,5 +743,101 @@ mod tests {
         assert_eq!(k.backend(), "keychain");
         #[cfg(not(feature = "keychain"))]
         assert_eq!(k.backend(), "file", "a build without keychain support");
+    }
+
+    // ------------------------------------------------------------ fix round 1
+
+    /// m3: four characters are a third of a 12-character key; show them only on a long one.
+    #[test]
+    fn the_hint_shows_four_characters_only_for_a_long_value() {
+        assert_eq!(hint("0123456789abcdef"), "••••cdef", "16 characters");
+        assert_eq!(hint("0123456789abcde"), "set", "15 characters");
+        assert_eq!(hint("sk-short-key1"), "set");
+        assert_eq!(hint(""), "set");
+        assert_eq!(hint("ключ-ключ-ключ-ключ"), "••••ключ", "counts characters");
+    }
+
+    /// m5: the variable wins over a key stored with `alice config set-secret`.
+    #[test]
+    fn typesafe_api_key_in_the_environment_beats_a_stored_jev_key() {
+        let d = tempfile::tempdir().unwrap();
+        let store = FileSecrets::new(d.path().join("secrets.toml"));
+        store.set(SecretName::JevApiKey, JEV_KEY).unwrap();
+        let from_env = concat!("ts_", "live_fromtheenvironment");
+        let env = |var: &str| (var == "TYPESAFE_API_KEY").then(|| from_env.to_string());
+        let (v, source) = resolve_with(&store, SecretName::JevApiKey, &env)
+            .unwrap()
+            .unwrap();
+        assert_eq!((v.expose(), source), (from_env, "env"));
+        // The other secret is not touched by that variable.
+        store.set(SecretName::EmbeddingApiKey, OTHER_KEY).unwrap();
+        let (v, source) = resolve_with(&store, SecretName::EmbeddingApiKey, &env)
+            .unwrap()
+            .unwrap();
+        assert_eq!((v.expose(), source), (OTHER_KEY, "file"));
+    }
+
+    /// m4: another process (or another `FileSecrets`) must not interleave a read-modify-write.
+    #[test]
+    fn a_second_writer_waits_for_the_lock_file() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("secrets.toml");
+        let first = FileSecrets::new(path.clone());
+        first.set(SecretName::JevApiKey, JEV_KEY).unwrap();
+        let lock = std::fs::File::options()
+            .write(true)
+            .open(d.path().join("secrets.toml.lock"))
+            .expect("the lock file sits beside secrets.toml");
+        lock.lock().unwrap(); // "another process" is in the middle of a write
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = FileSecrets::new(path.clone()); // its own in-process mutex
+        let t = std::thread::spawn(move || {
+            second.set(SecretName::EmbeddingApiKey, OTHER_KEY).unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the write went ahead while the lock was held"
+        );
+        drop(lock);
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the write goes ahead once the lock is free");
+        t.join().unwrap();
+        assert_eq!(first.get(SecretName::JevApiKey).unwrap(), secret(JEV_KEY));
+        assert_eq!(
+            first.get(SecretName::EmbeddingApiKey).unwrap(),
+            secret(OTHER_KEY)
+        );
+    }
+
+    /// m4: a crash between creating the temporary file and renaming it leaves a stale copy of
+    /// the secrets behind.
+    #[test]
+    fn opening_the_store_removes_stale_temporary_files() {
+        let d = tempfile::tempdir().unwrap();
+        let stale = d
+            .path()
+            .join(".secrets.toml.01ARZ3NDEKTSV4RRFFQ69G5FAV.tmp");
+        let unrelated = d.path().join("notes.tmp");
+        std::fs::write(&stale, "jev_api_key = \"left behind\"\n").unwrap();
+        std::fs::write(&unrelated, "keep").unwrap();
+        // Another process is writing right now (it holds the lock): its file is not stale.
+        let lock_path = d.path().join("secrets.toml.lock");
+        let lock = std::fs::File::create(&lock_path).unwrap();
+        lock.lock().unwrap();
+        let _busy = FileSecrets::new(d.path().join("secrets.toml"));
+        assert!(stale.exists(), "removed under another writer's feet");
+        drop(lock);
+        let store = FileSecrets::new(d.path().join("secrets.toml"));
+        assert!(!stale.exists(), "stale temporary file is cleaned on open");
+        assert!(unrelated.exists(), "only .secrets.toml.*.tmp");
+        store.set(SecretName::JevApiKey, JEV_KEY).unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["notes.tmp", "secrets.toml", "secrets.toml.lock"]);
     }
 }

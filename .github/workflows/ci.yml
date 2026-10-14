@@ -19,4 +19,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # The workspace build turns the daemon's `keychain` feature on (through `alice`); this lints
+      # the build without it, where `secrets.backend = "keychain"` falls back to the file.
+      - run: cargo clippy --locked -p alice-daemon --all-targets -- -D warnings
       - run: cargo test --locked --workspace --no-fail-fast
