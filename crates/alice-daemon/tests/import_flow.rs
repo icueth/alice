@@ -345,6 +345,137 @@ impl Flow {
         self.svc.patch_settings(m).unwrap();
     }
 
+    async fn count(&self, table: &str) -> i64 {
+        self.db()
+            .query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    async fn project_slugs(&self) -> Vec<String> {
+        let conn = self.db();
+        let mut stmt = conn
+            .prepare("SELECT slug FROM projects ORDER BY slug")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Where an old drawer id went (`type:id`).
+    async fn legacy_target(&self, id: &str) -> Option<String> {
+        self.db()
+            .query_row(
+                "SELECT target_type || ':' || target_id FROM legacy_ids WHERE legacy_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
+    async fn recall(&self, query: &str, raw: bool) -> String {
+        let r = self
+            .svc
+            .recall(alice_core::api::RecallRequest {
+                query: query.to_string(),
+                include_raw: raw,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let text = r.text.clone().unwrap_or_default();
+        let hits = r
+            .results
+            .iter()
+            .map(|h| {
+                format!(
+                    "{} {} {}",
+                    h.title,
+                    h.snippet,
+                    h.body.clone().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{text}\n{hits}")
+    }
+
+    async fn diary_author(&self) -> Option<String> {
+        self.db()
+            .query_row(
+                "SELECT author_agent FROM memories WHERE legacy_id = 'k_diary'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten()
+    }
+
+    async fn distinct(&self, table: &str, column: &str) -> Vec<String> {
+        let conn = self.db();
+        let mut stmt = conn
+            .prepare(&format!("SELECT DISTINCT {column} FROM {table} ORDER BY 1"))
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    async fn health(&self) -> alice_core::api::Health {
+        self.svc.health().await.unwrap()
+    }
+
+    async fn wait_embedded(&self) {
+        let t = Instant::now();
+        while self.health().await.embed_backlog > 0 {
+            assert!(
+                t.elapsed() < Duration::from_secs(60),
+                "embedding did not drain"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Tables (and columns) of the database that hold `needle` anywhere.
+    async fn tables_holding(&self, needle: &str) -> Vec<String> {
+        let conn = self.db();
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut hits = Vec::new();
+        for t in tables {
+            let cols: Vec<String> = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{t}')"))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for c in cols {
+                let sql = format!(
+                    "SELECT count(*) FROM \"{t}\" WHERE instr(CAST(\"{c}\" AS TEXT), ?1) > 0"
+                );
+                let n: i64 = match conn.query_row(&sql, [needle], |r| r.get(0)) {
+                    Ok(n) => n,
+                    Err(_) => continue, // a column a virtual table cannot be scanned for
+                };
+                if n > 0 {
+                    hits.push(format!("{t}.{c}"));
+                }
+            }
+        }
+        hits
+    }
+
     fn import_tmp_entries(&self) -> usize {
         std::fs::read_dir(self.home().join("import-tmp"))
             .map(|d| d.count())
@@ -407,18 +538,6 @@ async fn a_dry_run_reports_what_a_real_run_would_add_and_writes_nothing() {
     assert_eq!(f.import_tmp_entries(), 0, "snapshot removed");
     assert!(r.phases.iter().any(|p| p.phase == "survey"));
     assert!(r.render_text().contains("[dry run]"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_real_run_is_not_silently_empty_in_this_build() {
-    let f = Flow::new().await;
-    let st = f.run_import(f.request()).await;
-    assert_eq!(st.state, ImportState::Failed);
-    assert!(
-        st.error.unwrap().contains("--dry-run"),
-        "says what to do instead"
-    );
-    assert_eq!(f.import_tmp_entries(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -835,4 +954,400 @@ async fn the_reserved_lookup_applies_the_same_redaction_as_storage() {
             .unwrap()
             .is_empty()
     );
+}
+
+// ------------------------------------------------------------------ Task 10: knowledge and raw
+
+const SECRET: &str = concat!("gh", "p_", "abcdefghijklmnopqrstuvwxyz0123456789");
+
+fn secret_specs() -> Vec<DrawerSpec> {
+    let mut v = fixture_specs();
+    // A transcript chunk whose source path also holds the key.
+    v.push(chunk(
+        "sec_t",
+        &format!("transcript with {SECRET} inside"),
+        "sessions",
+        &format!("/h/.claude/projects/-Users-me-Code-pg-ai/{SECRET}.jsonl"),
+        0,
+    ));
+    // The diary text, under an id that holds the key as well.
+    v.push(DrawerSpec {
+        id: format!("diary_wing_claude_code_{SECRET}"),
+        text: format!("diary says {SECRET}"),
+        meta: DrawerMeta {
+            wing: "wing_claude_code".into(),
+            room: "diary".into(),
+            agent: s("claude-code"),
+            topic: s("keys"),
+            date: s("2026-04-17"),
+            filed_at: s("2026-04-17T20:00:00"),
+            ..Default::default()
+        },
+    });
+    // A code chunk, and one whose key straddles the 32,000-byte split point.
+    v.push(DrawerSpec {
+        id: "sec_f".into(),
+        text: format!("const KEY = \"{SECRET}\""),
+        meta: DrawerMeta {
+            wing: "devspace".into(),
+            room: "src".into(),
+            source_file: s("/h/Code/devspace/keys.go"),
+            added_by: s("claude"),
+            ingest_mode: s("projects"),
+            chunk_index: Some(0),
+            ..Default::default()
+        },
+    });
+    v.push(DrawerSpec {
+        id: "sec_big".into(),
+        text: format!("{}{SECRET}{}", "a ".repeat(15_995), " b".repeat(1_000)),
+        meta: DrawerMeta {
+            wing: "devspace".into(),
+            room: "src".into(),
+            source_file: s("/h/Code/devspace/keys.go"),
+            added_by: s("claude"),
+            ingest_mode: s("projects"),
+            chunk_index: Some(1),
+            ..Default::default()
+        },
+    });
+    v
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_palace_imports_into_both_tiers_with_projects_topics_and_authors() {
+    let f = Flow::new().await;
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(f.project_slugs().await, vec!["devspace", "global", "pg-ai"]);
+    assert_eq!(r.wing_map["wing_pg_ai"].to, "pg-ai");
+    assert_eq!(r.wing_map["wing_claude_code"].via, "inferred");
+    assert_eq!(f.count("memories").await, 4);
+    assert_eq!(f.count("chunks").await, 79 + 30);
+    assert_eq!(
+        f.legacy_target("k_dup_a").await,
+        f.legacy_target("k_dup_b").await
+    );
+    assert!(f.legacy_target("k_dup_a").await.is_some());
+    assert!(
+        f.recall("decision about the v4 frame", false)
+            .await
+            .contains("v4 frame")
+    );
+    assert!(
+        f.recall("quickstart transcript phrase", true)
+            .await
+            .contains("transcript phrase")
+    );
+    assert_eq!(f.diary_author().await.as_deref(), Some("claude-code"));
+    assert_eq!(f.distinct("memories", "judge_state").await, vec!["skipped"]);
+    assert_eq!(f.distinct("memories", "status").await, vec!["active"]);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    f.wait_embedded().await;
+    assert_eq!(f.health().await.embed_backlog, 0);
+    // The collapsed repeat points at the chunk it repeats.
+    assert_eq!(
+        f.legacy_target("s1_039").await,
+        f.legacy_target("s1_007").await
+    );
+    assert_eq!(f.import_tmp_entries(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn secrets_in_imported_history_never_reach_the_database_the_report_or_the_meta_marker() {
+    let plain = concat!("s", "k-", "abcdefghijklmnopqrstuvwx1234");
+    let mut specs = secret_specs();
+    // A wing and a room named like a key.
+    specs.push(knowledge(
+        "k_plain",
+        "a note about keys",
+        plain,
+        "knowledge",
+    ));
+    specs.push(knowledge("k_room", "a note in a room", "pg-ai", plain));
+    let f = Flow::with_specs(&specs).await;
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    for needle in [SECRET, plain, &SECRET[..20]] {
+        assert_eq!(f.tables_holding(needle).await, Vec::<String>::new());
+    }
+    let json = serde_json::to_string(&r).unwrap();
+    for needle in [SECRET, plain] {
+        assert!(!json.contains(needle) && !r.render_text().contains(needle));
+    }
+    let marked: i64 = f
+        .db()
+        .query_row(
+            "SELECT count(*) FROM chunks WHERE text LIKE '%[REDACTED:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(marked >= 3, "{marked}");
+    assert!(r.redacted_fields >= 4, "{}", r.redacted_fields);
+    // A second run recognises the drawers whose ids held the key (the stored id is the hashed one).
+    let again = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(again.redacted_fields, 0);
+    assert_eq!(again.tiers.knowledge, 0);
+    assert_eq!(again.tiers.raw_session_chunks, 0);
+    assert_eq!(f.tables_holding(SECRET).await, Vec::<String>::new());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redaction_runs_even_when_the_privacy_setting_is_off_and_the_report_says_so() {
+    let f = Flow::with_specs(&secret_specs()).await;
+    f.patch("privacy.redact", serde_json::json!(false)).await;
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(r.redaction_note.is_some());
+    assert_eq!(f.tables_holding(SECRET).await, Vec::<String>::new());
+    assert!(r.redacted_fields >= 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn block_mode_skips_the_drawer_names_the_detector_and_keeps_going() {
+    let f = Flow::with_specs(&secret_specs()).await;
+    f.patch("privacy.redact_mode", serde_json::json!("block"))
+        .await;
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    // Three chunk drawers and the diary hold the key.
+    assert_eq!(r.blocked_by_redaction["github_token"], 4);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert_eq!(f.count("memories").await, 4);
+    assert_eq!(f.count("chunks").await, 79 + 30);
+    assert_eq!(f.tables_holding(SECRET).await, Vec::<String>::new());
+}
+
+fn add_drawers(palace: &Path, specs: &[DrawerSpec]) {
+    let conn = rusqlite::Connection::open(palace.join("sqlite_exact.sqlite3")).unwrap();
+    for d in specs {
+        let m = &d.meta;
+        let mut o = serde_json::Map::new();
+        o.insert("wing".into(), m.wing.clone().into());
+        o.insert("room".into(), m.room.clone().into());
+        for (k, v) in [
+            ("source_file", &m.source_file),
+            ("added_by", &m.added_by),
+            ("ingest_mode", &m.ingest_mode),
+            ("filed_at", &m.filed_at),
+            ("authored_at", &m.authored_at),
+        ] {
+            if let Some(v) = v {
+                o.insert(k.into(), v.clone().into());
+            }
+        }
+        if let Some(i) = m.chunk_index {
+            o.insert("chunk_index".into(), i.into());
+        }
+        conn.execute(
+            "INSERT INTO documents (collection_id, id, document, metadata_json, embedding, dim, created_at, updated_at)
+             VALUES (1, ?1, ?2, ?3, zeroblob(16), 4, 'x', 'x')",
+            rusqlite::params![d.id, d.text, serde_json::Value::Object(o).to_string()],
+        )
+        .unwrap();
+    }
+}
+
+fn unindexed(id: &str, text: &str) -> DrawerSpec {
+    let mut d = chunk(id, text, "sessions", S1, 0);
+    d.meta.chunk_index = None;
+    d
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn running_again_imports_nothing_does_no_planning_work_and_new_drawers_are_picked_up() {
+    let mut specs = fixture_specs();
+    specs.push(unindexed("auto_1", "an unnumbered chunk"));
+    let f = Flow::with_specs(&specs).await;
+    let first = f.run_import(f.request()).await.report.unwrap();
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let counts = f.table_counts().await;
+    let (memories, chunks) = (counts["memories"], counts["chunks"]);
+
+    let second = f.run_import(f.request()).await.report.unwrap();
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
+    assert_eq!(
+        (
+            second.tiers.knowledge,
+            second.tiers.raw_session_chunks,
+            second.tiers.raw_file_chunks
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        second.already_imported,
+        5 + 81 + 30,
+        "every stored drawer, the repeat and the duplicate included"
+    );
+    assert_eq!(second.redacted_fields, 0);
+    assert_eq!(second.drawers_seen, second.drawers_accounted);
+    let work: f64 = second
+        .phases
+        .iter()
+        .filter(|p| p.phase == "knowledge" || p.phase == "raw")
+        .map(|p| p.seconds)
+        .sum();
+    assert!(work < 1.0, "{work}");
+    let counts = f.table_counts().await;
+    assert_eq!((counts["memories"], counts["chunks"]), (memories, chunks));
+
+    // Two new drawers: one unnumbered, one that asks for the position "auto_1" was given.
+    let asked: i64 = f
+        .db()
+        .query_row(
+            "SELECT c.ord FROM chunks c WHERE c.legacy_id = 'auto_1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut wants = chunk("new_b", "asks for a taken position", "sessions", S1, asked);
+    wants.meta.filed_at = s("2026-04-18T12:00:00");
+    add_drawers(
+        &f.palace,
+        &[unindexed("new_a", "another unnumbered chunk"), wants],
+    );
+    let third = f.run_import(f.request()).await.report.unwrap();
+    assert!(third.errors.is_empty(), "{:?}", third.errors);
+    assert_eq!(third.tiers.raw_session_chunks, 2);
+    assert_eq!(f.count("chunks").await, chunks + 2);
+    let clash: i64 = f
+        .db()
+        .query_row(
+            "SELECT count(*) FROM (SELECT source_id, ord FROM chunks GROUP BY 1, 2 HAVING count(*) > 1)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(clash, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversize_knowledge_drawer_becomes_parts_that_are_stored_together() {
+    let mut specs = fixture_specs();
+    let text = (0..13_000)
+        .map(|i| format!("word{i:05}"))
+        .collect::<Vec<_>>()
+        .join(" "); // about 130 KB
+    assert!(text.len() > 125_000);
+    specs.push(knowledge("big_k", &text, "pg-ai", "knowledge"));
+    let f = Flow::with_specs(&specs).await;
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    for id in ["big_k", "big_k#2", "big_k#3"] {
+        assert!(f.legacy_target(id).await.is_some(), "{id}");
+    }
+    assert!(f.legacy_target("big_k#4").await.is_none());
+    assert_eq!(r.split.memories, 1);
+    let events: i64 = f
+        .db()
+        .query_row(
+            "SELECT count(*) FROM memories WHERE legacy_id LIKE 'big_k%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(events, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odd_drawers_are_counted_not_fatal() {
+    let mut specs = fixture_specs();
+    let k = |id: &str, text: &str, wing: &str| knowledge(id, text, wing, "knowledge");
+    specs.push(k("odd_empty", "", "pg-ai"));
+    specs.push(k("odd_blank", "   \n\t", "pg-ai"));
+    specs.push(k("odd_nul", "has a nul\0inside", "pg-ai"));
+    let big = (0..13_000)
+        .map(|i| format!("word{i:05}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    specs.push(k("odd_big", &big, "pg-ai"));
+    specs.push(k("odd_nowing", "no wing at all", ""));
+    specs.push(k("odd_dashes", "wing of dashes", "---"));
+    let mut forty = chunk(
+        "odd_40k",
+        &"forty kilobytes of words. ".repeat(1_600),
+        "sessions",
+        S1,
+        100,
+    );
+    forty.meta.filed_at = s("2026-04-16T12:00:00");
+    specs.push(forty);
+    specs.push(unindexed("odd_noindex", "chunk with no index"));
+    let f = Flow::with_specs(&specs).await;
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.skipped["empty text"], 2);
+    assert_eq!(r.split.memories, 1);
+    assert_eq!(r.split.chunks, 1);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    let conn = f.db();
+    let body: i64 = conn
+        .query_row(
+            "SELECT max(length(CAST(body AS BLOB))) FROM memories",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let text: i64 = conn
+        .query_row(
+            "SELECT max(length(CAST(text AS BLOB))) FROM chunks",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(body <= 65_536 && text <= 32_768, "{body} {text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ignored_chunk_insert_is_an_error_entry_never_silent() {
+    // The second piece of an oversize chunk takes position 10,000,000 + its ord; another drawer
+    // of the same source asks for exactly that.
+    let mut specs = fixture_specs();
+    let mut a = chunk(
+        "coll_a",
+        &"a long chunk of words. ".repeat(2_000),
+        "devspace",
+        "/h/Code/devspace/collide.go",
+        5,
+    );
+    a.meta.ingest_mode = s("projects");
+    a.meta.convos_off();
+    let mut b = chunk(
+        "coll_b",
+        "asks for the position a piece took",
+        "devspace",
+        "/h/Code/devspace/collide.go",
+        10_000_005,
+    );
+    b.meta.convos_off();
+    specs.push(a);
+    specs.push(b);
+    let f = Flow::with_specs(&specs).await;
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+    assert!(r.errors[0].contains("coll_b"), "{:?}", r.errors);
+}
+
+trait ConvosOff {
+    fn convos_off(&mut self);
+}
+impl ConvosOff for DrawerMeta {
+    /// A file chunk from a curated-free room: the raw file tier.
+    fn convos_off(&mut self) {
+        self.ingest_mode = s("projects");
+        self.added_by = s("claude");
+        self.room = "src".into();
+    }
 }

@@ -336,9 +336,11 @@ impl Mapper<'_> {
         } else {
             Some(&*m.room)
         };
+        // The raw topic goes through the filter first: slugifying a key-shaped room name would
+        // lower-case it and strip its separators, and no detector would recognise it afterwards.
         let topics: Vec<String> = topic_source
-            .and_then(normalize_topic)
-            .map(|t| g.apply("topic", &t))
+            .map(|t| g.apply("topic", &nfc(t)))
+            .and_then(|t| normalize_topic(&t))
             .into_iter()
             .collect();
         let agent = if diary {
@@ -914,6 +916,25 @@ mod tests {
         assert_eq!(p[0].input.title, None);
         assert_eq!(p[0].input.author.agent.as_deref(), Some("claude-code"));
         assert_eq!(p[0].project.slug, "alice");
+    }
+
+    #[test]
+    fn a_key_shaped_room_name_is_redacted_before_it_becomes_a_topic() {
+        let secret = concat!("gh", "p_", "abcdefghijklmnopqrstuvwxyz0123456789");
+        let f = RedactingFilter;
+        let m = Mapper {
+            wings: &wings(),
+            assume: utc(),
+            filter: &f,
+        };
+        let Planned::Memories(p) = m.map(
+            &d("k", "Chose SQLite.", knowledge_meta("alice", secret)),
+            0,
+            (None, None),
+        ) else {
+            panic!("expected memories")
+        };
+        assert_eq!(p[0].input.topics, vec!["redacted-github-token".to_string()]);
     }
 
     #[test]

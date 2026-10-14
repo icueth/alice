@@ -4,7 +4,9 @@
 //! Phases: `snapshot` (copy the palace read-only into `ALICE_HOME/import-tmp/<job>/`), `survey`
 //! (one pass over every drawer: duplicates, chunk positions), then the planning passes
 //! (`knowledge`, `raw`) that turn drawers into what Alice would store. Without `dry_run` the
-//! planning passes will hand their batches to the writer; here they only count.
+//! planning passes hand their batches to the writer (one transaction each, closing at 200
+//! records or 64 KB of text and only between two drawers); a dry run does the same work and
+//! only counts.
 //!
 //! Redaction is this module's contract: the writer stores what it is given. Everything that is
 //! planned goes through [`RedactFilter`], which always redacts (whatever `privacy.redact`
@@ -34,30 +36,38 @@ use alice_core::import::report::{
 use alice_core::import::wings::{Via, WingMap, WingTarget};
 use alice_core::import::{ImportRequest, ImportState, ImportStatus, local_offset};
 use alice_core::model::{Kind, SourceType};
-use alice_core::normalize::{content_hash, derive_title, nfc};
+use alice_core::normalize::{content_hash, derive_title, nfc, sha256_hex, slugify};
 use alice_core::redact::Redactor;
 use alice_core::settings::{EmbeddingProvider, Settings};
 use alice_core::store::ReaderPool;
-use alice_core::store::import::legacy_existing;
+use alice_core::store::import::{
+    BatchOutcome, ImportBatch, ImportMemory, ImportProject, ImportSource, legacy_existing,
+};
+use alice_core::store::memories::NewMemoryInput;
+use alice_core::store::sources::{ChunkInput, SourceInput};
 use parking_lot::Mutex;
 
 use crate::config::SettingsHandle;
 use crate::maintenance::OwnedActivityGuard;
 use crate::paths::AliceHome;
 use crate::redaction::Redactors;
-use crate::writer::WriterHandle;
+use crate::writer::{WriteOp, WriteOutcome, WriterHandle};
 
 /// What a stopped job says (the daemon is shutting down); also the text of a failed status.
 pub const STOPPED: &str = "daemon stopped; run the import again to continue";
-
-/// This build can read and plan an import but does not write it yet.
-const NOT_WRITING: &str = "the phases that store the records are not part of this build yet; \
-                           run with --dry-run to see what an import would add";
 
 /// Drawers per read of the knowledge pass.
 const KNOWLEDGE_GROUP: usize = 100;
 /// Drawers per page of the raw pass.
 const RAW_PAGE: usize = 2_000;
+/// A batch closes at this many records ...
+const BATCH_RECORDS: usize = 200;
+/// ... or this many bytes of text, whichever comes first, and only between two drawers.
+const BATCH_BYTES: usize = 64 * 1024;
+/// Collapsed pairs per batch (they carry no text).
+const COLLAPSED_PER_BATCH: usize = 500;
+/// The report keeps this many store errors and warnings; the rest are counted.
+const REPORT_LIST_CAP: usize = 100;
 
 /// The single import slot of a service.
 pub struct ImportSlot {
@@ -198,17 +208,61 @@ impl RedactFilter {
     /// `text` with secrets replaced, for names shown in the report and lookups; not counted and
     /// never refused (a held-back drawer is counted where it is planned).
     ///
-    /// A second pass reads `_` as a separator: the detectors need a word boundary before a key
-    /// prefix, and `wing_sk-...` has none.
+    /// A second pass starts again after every `_`: the detectors need a word boundary before a
+    /// key prefix, and `wing_sk-...` or `diary_ghp_...` has none (the tail alone does).
     pub fn quiet(&self, text: &str) -> String {
-        let first = self.redactor.apply(text).text;
-        if !first.contains('_') {
-            return first;
+        let mut out = self.redactor.apply(text).text;
+        let mut from = 0;
+        while let Some(off) = out[from..].find('_') {
+            let cut = from + off + 1;
+            let tail = self.redactor.apply(&out[cut..]).text;
+            if tail != out[cut..] {
+                out.truncate(cut);
+                out.push_str(&tail);
+            }
+            from = cut;
         }
-        self.redactor
-            .apply(&first.replace('_', "\u{1}"))
-            .text
-            .replace('\u{1}', "_")
+        out
+    }
+}
+
+impl RedactFilter {
+    /// What storage would hold for `text` (the same detectors as [`TextFilter::filter`]), without
+    /// counting it; `None` when `block` mode would hold the text back.
+    pub fn stored_form(&self, field: &str, text: &str) -> Option<String> {
+        self.redactor.check(field, text).ok()
+    }
+
+    /// The id a drawer is filed under in `legacy_ids`. Drawer ids embed wing and room names, so
+    /// an id that holds a secret is stored as its redacted spelling plus a hash of the original
+    /// (two different secrets stay two different ids). The prefilter and the stored rows use
+    /// this one function.
+    pub fn legacy_key(&self, id: &str) -> String {
+        let clean = self.quiet(id);
+        if clean == id {
+            return clean;
+        }
+        let hash = sha256_hex(id.as_bytes());
+        format!("{clean}~{}", &hash[..16])
+    }
+}
+
+/// The id of part `i` (0 based) of the drawer filed under `key`.
+fn part_id(key: &str, i: usize) -> String {
+    if i == 0 {
+        key.to_string()
+    } else {
+        format!("{key}#{}", i + 1)
+    }
+}
+
+/// The project a stored record belongs to: the planner's slug, as clean as every other stored name.
+fn store_slug(filter: &RedactFilter, slug: &str) -> String {
+    let s = slugify(&filter.quiet(slug));
+    if s.is_empty() {
+        "global".to_string()
+    } else {
+        s
     }
 }
 
@@ -283,7 +337,10 @@ pub fn reserved_ords(
     filter: &RedactFilter,
     uri: &str,
 ) -> Result<BTreeSet<i64>> {
-    let stored = filter.quiet(uri);
+    // The form the chunks are stored under (the planner redacts the uri with the same detectors).
+    let Some(stored) = filter.stored_form("source.uri", uri) else {
+        return Ok(BTreeSet::new());
+    };
     readers.with(|c| {
         let mut stmt = c.prepare_cached(
             "SELECT c.ord FROM chunks c JOIN sources s ON s.id = c.source_id WHERE s.uri = ?1",
@@ -360,17 +417,83 @@ fn memory_identity(slug: &str, input: &alice_core::store::memories::NewMemoryInp
     content_hash(slug, input.kind.unwrap_or(Kind::Note), &title, &content)
 }
 
+// ------------------------------------------------------------------------------------- batching
+
+/// Groups units into batches: a batch closes at `BATCH_RECORDS` records or `BATCH_BYTES` bytes,
+/// and only between two units (a unit is one drawer, so the parts of one drawer always share a
+/// batch; a unit over the budget gets a batch of its own).
+struct Batcher<T> {
+    items: Vec<T>,
+    records: usize,
+    bytes: usize,
+}
+
+impl<T> Batcher<T> {
+    fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            records: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Adds a unit; returns the batch that had to close to make room for it.
+    fn push(&mut self, item: T, records: usize, bytes: usize) -> Option<Vec<T>> {
+        let closed = if !self.items.is_empty()
+            && (self.records + records > BATCH_RECORDS || self.bytes + bytes > BATCH_BYTES)
+        {
+            self.records = 0;
+            self.bytes = 0;
+            Some(std::mem::take(&mut self.items))
+        } else {
+            None
+        };
+        self.items.push(item);
+        self.records += records;
+        self.bytes += bytes;
+        closed
+    }
+
+    fn finish(&mut self) -> Option<Vec<T>> {
+        self.records = 0;
+        self.bytes = 0;
+        (!self.items.is_empty()).then(|| std::mem::take(&mut self.items))
+    }
+}
+
+/// All the stored rows of one drawer (its parts), already redacted and keyed.
+enum Unit {
+    Memories {
+        slug: String,
+        items: Vec<NewMemoryInput>,
+    },
+    Chunks {
+        slug: String,
+        source: SourceInput,
+        chunks: Vec<ChunkInput>,
+    },
+}
+
+impl Unit {
+    fn weight(&self) -> (usize, usize) {
+        match self {
+            Unit::Memories { items, .. } => (
+                items.len(),
+                items.iter().map(|m| m.content.len() + 64).sum(),
+            ),
+            Unit::Chunks { chunks, .. } => {
+                (chunks.len(), chunks.iter().map(|c| c.text.len() + 64).sum())
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------- the job
 
-// Notes for the phases that store records (Task 10):
-// - A drawer's legacy id is checked here (`legacy_existing`) and stored by the writer. Both must
-//   use the same id: filtered through the `TextFilter` (or hashed), never one raw and one not.
-// - `memory_identity` uses the planner's project slug; the store will use the filtered project
-//   name. Filter the slug before it is used for either.
+// Notes for the phases that store records (Task 11 adds the graph, tunnels and mentions):
 // - The dry run only dedupes knowledge drawers against each other: a memory already stored in
-//   Alice that an incoming drawer duplicates is reported by the real run (`memories_duplicate`).
-// - When `ImportProject.aliases` is built from `WingMap::aliases()`, skip the junk
-//   `transcript:` spellings.
+//   Alice that an incoming drawer duplicates is reported by the real run as a warning.
+// - Collapsed raw drawers are recorded at the end of the raw phase (they point at their keeper).
 
 /// What the planning passes count.
 #[derive(Default)]
@@ -381,6 +504,8 @@ struct Tally {
     already_session: u64,
     already_file: u64,
     knowledge_duplicates: u64,
+    /// Parts of those duplicates handed to the store (it answers "duplicate" for them too).
+    duplicate_parts_sent: u64,
     raw_collapsed: u64,
     memory_drawers: u64,
     chunk_drawers: u64,
@@ -392,6 +517,10 @@ struct Tally {
     blocked: BTreeMap<String, u64>,
     transcripts: HashSet<String>,
     seen_identities: HashSet<String>,
+    /// From the store's answers.
+    store_errors: Vec<String>,
+    store_warnings: BTreeSet<String>,
+    store_duplicate_memories: u64,
 }
 
 struct Ctx<'a> {
@@ -402,33 +531,64 @@ struct Ctx<'a> {
     planner: Planner<'a>,
     tally: Tally,
     done: u64,
+    dry: bool,
+    job_id: &'a str,
+    batcher: Batcher<Unit>,
+    /// Stored project slug -> the aliases to give it (sent with the first batch that names it).
+    aliases: HashMap<String, Vec<String>>,
+    sent_projects: HashSet<String>,
+    /// (collapsed drawer key, keeper key), recorded when the raw phase ends.
+    collapsed: Vec<(String, String)>,
 }
 
 impl Ctx<'_> {
-    fn project(&self, slug: &str) -> String {
-        self.filter.quiet(slug)
+    fn slug(&self, slug: &str) -> String {
+        store_slug(self.filter, slug)
     }
 
-    fn take(&mut self, d: &Drawer) {
+    /// Counts what `d` would add; in a real run also returns the rows to store.
+    fn take(&mut self, d: &Drawer) -> Option<Unit> {
         let planned = self.planner.plan(d);
+        let key = self.filter.legacy_key(&d.id);
         match planned {
             Planned::Memories(parts) => {
-                let Some(first) = parts.first() else { return };
-                let slug = first.project.slug.clone();
+                let first = parts.first()?;
+                let slug = self.slug(&first.project.slug);
                 let identity = memory_identity(&slug, &first.input);
-                if !self.tally.seen_identities.insert(identity) {
+                let duplicate = !self.tally.seen_identities.insert(identity);
+                if duplicate {
                     self.tally.knowledge_duplicates += 1;
-                    return;
+                    self.tally.duplicate_parts_sent += parts.len() as u64;
+                    // The store records the old id against the memory that survives; a dry run
+                    // has nothing to write.
+                } else {
+                    self.tally.memory_drawers += 1;
+                    if parts.len() > 1 {
+                        self.tally.split_memories += 1;
+                    }
+                    self.tally
+                        .projects
+                        .entry(slug.clone())
+                        .or_default()
+                        .memories += parts.len() as u64;
                 }
-                self.tally.memory_drawers += 1;
-                if parts.len() > 1 {
-                    self.tally.split_memories += 1;
+                if self.dry {
+                    return None;
                 }
-                let key = self.project(&slug);
-                self.tally.projects.entry(key).or_default().memories += parts.len() as u64;
+                let items = parts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let mut input = p.input;
+                        input.legacy_id = Some(part_id(&key, i));
+                        input
+                    })
+                    .collect();
+                Some(Unit::Memories { slug, items })
             }
             Planned::Chunks(parts) => {
-                let Some(first) = parts.first() else { return };
+                let first = parts.first()?;
+                let slug = self.slug(&first.project.slug);
                 self.tally.chunk_drawers += 1;
                 if parts.len() > 1 {
                     self.tally.split_chunks += 1;
@@ -436,19 +596,44 @@ impl Ctx<'_> {
                 if first.source.source_type == SourceType::Session {
                     self.tally.transcripts.insert(first.source.uri.clone());
                 }
-                let key = self.project(&first.project.slug);
-                self.tally.projects.entry(key).or_default().chunks += parts.len() as u64;
+                self.tally.projects.entry(slug.clone()).or_default().chunks += parts.len() as u64;
+                if self.dry {
+                    return None;
+                }
+                let source = first.source.clone();
+                let chunks = parts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let mut chunk = p.chunk;
+                        chunk.legacy_id = Some(part_id(&key, i));
+                        chunk
+                    })
+                    .collect();
+                Some(Unit::Chunks {
+                    slug,
+                    source,
+                    chunks,
+                })
             }
             Planned::Skipped { reason } => {
                 *self.tally.skipped.entry(reason.to_string()).or_default() += 1;
+                None
             }
             Planned::Blocked { detectors } => {
                 self.tally.blocked_drawers += 1;
                 for d in detectors {
                     *self.tally.blocked.entry(d).or_default() += 1;
                 }
+                None
             }
-            Planned::Collapsed { .. } => self.tally.raw_collapsed += 1,
+            Planned::Collapsed { keeper } => {
+                self.tally.raw_collapsed += 1;
+                if !self.dry {
+                    self.collapsed.push((key, self.filter.legacy_key(&keeper)));
+                }
+                None
+            }
         }
     }
 
@@ -456,9 +641,108 @@ impl Ctx<'_> {
         set_progress(&self.env.status, self.done, None);
     }
 
-    /// Drawers an earlier run stored, among `ids`.
-    fn stored(&self, ids: &[String]) -> Result<HashSet<String>> {
-        self.env.readers.with(|c| legacy_existing(c, ids))
+    /// Of `keys`, the ones an earlier run stored.
+    fn stored(&self, keys: &[String]) -> Result<HashSet<String>> {
+        self.env.readers.with(|c| legacy_existing(c, keys))
+    }
+
+    /// Adds a drawer's rows to the open batch; a batch that closes is written.
+    fn push(&mut self, unit: Unit) -> Result<()> {
+        let (records, bytes) = unit.weight();
+        if let Some(closed) = self.batcher.push(unit, records, bytes) {
+            self.write(closed)?;
+        }
+        Ok(())
+    }
+
+    fn finish_batch(&mut self) -> Result<()> {
+        if let Some(closed) = self.batcher.finish() {
+            self.write(closed)?;
+        }
+        Ok(())
+    }
+
+    fn batch(&self) -> ImportBatch {
+        ImportBatch {
+            job_id: self.job_id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn write(&mut self, units: Vec<Unit>) -> Result<()> {
+        let mut batch = self.batch();
+        let mut slugs: BTreeSet<String> = BTreeSet::new();
+        let mut at: HashMap<(String, &'static str, String), usize> = HashMap::new();
+        for unit in units {
+            match unit {
+                Unit::Memories { slug, items } => {
+                    slugs.insert(slug.clone());
+                    batch
+                        .memories
+                        .extend(items.into_iter().map(|input| ImportMemory {
+                            project_slug: slug.clone(),
+                            input,
+                        }));
+                }
+                Unit::Chunks {
+                    slug,
+                    source,
+                    chunks,
+                } => {
+                    slugs.insert(slug.clone());
+                    let k = (
+                        slug.clone(),
+                        source.source_type.as_str(),
+                        source.uri.clone(),
+                    );
+                    match at.get(&k) {
+                        Some(&i) => batch.sources[i].chunks.extend(chunks),
+                        None => {
+                            at.insert(k, batch.sources.len());
+                            batch.sources.push(ImportSource {
+                                project_slug: slug,
+                                source,
+                                chunks,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        for slug in slugs {
+            let aliases = if self.sent_projects.insert(slug.clone()) {
+                self.aliases.get(&slug).cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            batch.projects.push(ImportProject { slug, aliases });
+        }
+        self.submit(batch)
+    }
+
+    /// One writer transaction. The batch holds nothing the filter has not seen.
+    fn submit(&mut self, batch: ImportBatch) -> Result<()> {
+        check_stop(&self.env.stop)?;
+        match self
+            .env
+            .writer
+            .submit_blocking(WriteOp::ImportBatch(Box::new(batch)))?
+        {
+            WriteOutcome::Imported(out) => {
+                self.absorb(out);
+                Ok(())
+            }
+            other => Err(AliceError::Other(format!(
+                "the writer answered an import batch with {}",
+                other.name()
+            ))),
+        }
+    }
+
+    fn absorb(&mut self, out: BatchOutcome) {
+        self.tally.store_errors.extend(out.errors);
+        self.tally.store_warnings.extend(out.warnings);
+        self.tally.store_duplicate_memories += out.memories_duplicate as u64;
     }
 
     fn knowledge_pass(&mut self) -> Result<()> {
@@ -466,14 +750,17 @@ impl Ctx<'_> {
         for group in order.chunks(KNOWLEDGE_GROUP) {
             check_stop(&self.env.stop)?;
             // Drawers stored before cost nothing more: no reading, no redaction, no planning.
-            let stored = self.stored(group)?;
-            self.tally.already += stored.len() as u64;
-            self.tally.already_knowledge += stored.len() as u64;
-            let fresh: Vec<String> = group
-                .iter()
-                .filter(|id| !stored.contains(*id))
-                .cloned()
-                .collect();
+            let keys: Vec<String> = group.iter().map(|id| self.filter.legacy_key(id)).collect();
+            let stored = self.stored(&keys)?;
+            let mut fresh: Vec<String> = Vec::new();
+            for (id, key) in group.iter().zip(&keys) {
+                if stored.contains(key) {
+                    self.tally.already += 1;
+                    self.tally.already_knowledge += 1;
+                } else {
+                    fresh.push(id.clone());
+                }
+            }
             let mut by_id: HashMap<String, Drawer> = self
                 .reader
                 .get(&fresh)?
@@ -482,14 +769,16 @@ impl Ctx<'_> {
                 .collect();
             // In survey order: of identical memories the earliest filed is the one kept.
             for id in &fresh {
-                if let Some(d) = by_id.remove(id) {
-                    self.take(&d);
+                if let Some(d) = by_id.remove(id)
+                    && let Some(unit) = self.take(&d)
+                {
+                    self.push(unit)?;
                 }
             }
             self.done += group.len() as u64;
             self.progress();
         }
-        Ok(())
+        self.finish_batch()
     }
 
     fn raw_pass(&mut self, since: Option<&str>) -> Result<()> {
@@ -504,10 +793,14 @@ impl Ctx<'_> {
                 .map(|d| (d, classify(&d.id, &d.meta)))
                 .filter(|(_, t)| matches!(t, Tier::RawSession | Tier::RawFile))
                 .collect();
-            let ids: Vec<String> = raw.iter().map(|(d, _)| d.id.clone()).collect();
-            let stored = self.stored(&ids)?;
-            for (d, tier) in &raw {
-                if stored.contains(&d.id) {
+            let keys: Vec<String> = raw
+                .iter()
+                .map(|(d, _)| self.filter.legacy_key(&d.id))
+                .collect();
+            let stored = self.stored(&keys)?;
+            let mut units: Vec<Unit> = Vec::new();
+            for ((d, tier), key) in raw.iter().zip(&keys) {
+                if stored.contains(key) {
                     self.tally.already += 1;
                     if *tier == Tier::RawSession {
                         self.tally.already_session += 1;
@@ -516,12 +809,39 @@ impl Ctx<'_> {
                     }
                     continue;
                 }
-                self.take(d);
+                if let Some(unit) = self.take(d) {
+                    units.push(unit);
+                }
             }
+            // One source's chunks sit together, so a batch holds whole stretches of a source.
+            units.sort_by(|a, b| unit_source(a).cmp(&unit_source(b)));
+            for unit in units {
+                self.push(unit)?;
+            }
+            self.finish_batch()?;
             self.done += raw.len() as u64;
             self.progress();
         }
+        self.record_collapsed()
+    }
+
+    /// Collapsed drawers point where their keeper went; their keepers are stored by now.
+    fn record_collapsed(&mut self) -> Result<()> {
+        let pairs = std::mem::take(&mut self.collapsed);
+        for part in pairs.chunks(COLLAPSED_PER_BATCH) {
+            let mut batch = self.batch();
+            batch.collapsed = part.to_vec();
+            self.submit(batch)?;
+        }
         Ok(())
+    }
+}
+
+/// (project, source uri) of a chunk unit; knowledge sorts first.
+fn unit_source(u: &Unit) -> (&str, &str) {
+    match u {
+        Unit::Chunks { slug, source, .. } => (slug, &source.uri),
+        Unit::Memories { .. } => ("", ""),
     }
 }
 
@@ -592,7 +912,7 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     set_progress(&env.status, 0, Some(surveyed.total));
     check_stop(&env.stop)?;
 
-    // 3. plan every drawer that is not stored yet and count what it would add
+    // 3. plan every drawer that is not stored yet; unless this is a dry run, store what it adds
     let planner = Planner {
         mapper: Mapper {
             wings: &wings,
@@ -601,6 +921,18 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
         },
         survey: &surveyed,
     };
+    // The spellings that point at each project, as stored (a transcript folder is not a wing).
+    let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+    for (slug, spellings) in wings.projects() {
+        let stored = store_slug(&filter, &slug);
+        for w in spellings.iter().filter(|w| !w.starts_with("transcript:")) {
+            let alias = store_slug(&filter, w);
+            let list = aliases.entry(stored.clone()).or_default();
+            if alias != stored && !list.contains(&alias) {
+                list.push(alias);
+            }
+        }
+    }
     let skipped_by_survey: u64 = surveyed.skipped.values().sum();
     let mut ctx = Ctx {
         env,
@@ -610,6 +942,12 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
         planner,
         tally: Tally::default(),
         done: skipped_by_survey,
+        dry: req.dry_run,
+        job_id,
+        batcher: Batcher::new(),
+        aliases,
+        sent_projects: HashSet::new(),
+        collapsed: Vec::new(),
     };
     set_phase(&env.status, "knowledge");
     let t = Instant::now();
@@ -619,7 +957,28 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     let t = Instant::now();
     ctx.raw_pass(since)?;
     lap(&mut phases, "raw", t);
-    let tally = ctx.tally;
+    let mut tally = ctx.tally;
+    let mut store_errors = std::mem::take(&mut tally.store_errors);
+    if store_errors.len() > REPORT_LIST_CAP {
+        let more = store_errors.len() - REPORT_LIST_CAP;
+        store_errors.truncate(REPORT_LIST_CAP);
+        store_errors.push(format!("and {more} more rows were not stored"));
+    }
+    let mut store_warnings: Vec<String> = std::mem::take(&mut tally.store_warnings)
+        .into_iter()
+        .collect();
+    if store_warnings.len() > REPORT_LIST_CAP {
+        store_warnings.truncate(REPORT_LIST_CAP);
+    }
+    let already_in_alice = tally
+        .store_duplicate_memories
+        .saturating_sub(tally.duplicate_parts_sent);
+    if already_in_alice > 0 {
+        store_warnings.push(format!(
+            "{already_in_alice} imported memories were already in Alice (same project, kind, title and text); their old ids point at the memory Alice had"
+        ));
+    }
+    warnings.extend(store_warnings);
 
     let mut skipped: BTreeMap<String, u64> = BTreeMap::new();
     for (k, v) in &surveyed.skipped {
@@ -699,9 +1058,7 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
             report.drawers_seen, report.drawers_accounted
         ));
     }
-    if !req.dry_run {
-        return Err(AliceError::Other(NOT_WRITING.to_string()));
-    }
+    report.errors.extend(store_errors);
     report.phases = phases;
     report.peak_rss_mb = peak_rss_mb();
     report.finished_at = Some(now_rfc3339());
@@ -793,6 +1150,75 @@ mod tests {
             !f.quiet(secret).contains("ghp_"),
             "names stay clean even in block mode"
         );
+    }
+
+    fn drain(
+        b: &mut Batcher<&'static str>,
+        items: &[(&'static str, usize, usize)],
+    ) -> Vec<Vec<&'static str>> {
+        let mut out = Vec::new();
+        for (name, records, bytes) in items {
+            out.extend(b.push(name, *records, *bytes));
+        }
+        out.extend(b.finish());
+        out
+    }
+
+    #[test]
+    fn a_batch_closes_on_a_drawer_boundary_and_never_inside_one() {
+        // 100 + 150 would cross 200 records: the second drawer opens a new batch, whole.
+        let got = drain(
+            &mut Batcher::new(),
+            &[("d0", 100, 10), ("d1", 150, 10), ("d2", 1, 10)],
+        );
+        assert_eq!(got, vec![vec!["d0"], vec!["d1", "d2"]]);
+        // A drawer over the whole budget is a batch of its own.
+        let got = drain(
+            &mut Batcher::new(),
+            &[("a", 1, 10), ("huge", 250, 10), ("b", 1, 10)],
+        );
+        assert_eq!(got, vec![vec!["a"], vec!["huge"], vec!["b"]]);
+        // Bytes close a batch too.
+        let got = drain(
+            &mut Batcher::new(),
+            &[
+                ("a", 1, 40_000),
+                ("b", 1, 30_000),
+                ("c", 1, 100_000),
+                ("d", 1, 1),
+            ],
+        );
+        assert_eq!(got, vec![vec!["a"], vec!["b"], vec!["c"], vec!["d"]]);
+        // Exactly the limit still fits.
+        let got = drain(&mut Batcher::new(), &[("a", 100, 10), ("b", 100, 10)]);
+        assert_eq!(got, vec![vec!["a", "b"]]);
+        assert!(Batcher::<u8>::new().finish().is_none());
+    }
+
+    #[test]
+    fn a_drawer_id_that_holds_a_secret_is_filed_under_a_clean_distinct_key() {
+        let f = filter();
+        assert_eq!(f.legacy_key("drawer_plain_01"), "drawer_plain_01");
+        let a = f.legacy_key(concat!(
+            "diary_wing_gh",
+            "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"
+        ));
+        let b = f.legacy_key(concat!(
+            "diary_wing_gh",
+            "p_zYxWvUtSrQpOnMlKjIhGfEdCbA9876543210"
+        ));
+        assert!(!a.contains("ghp_") && a.contains("[REDACTED:"), "{a}");
+        assert_ne!(a, b, "two secrets stay two ids");
+        assert_eq!(
+            a,
+            f.legacy_key(concat!(
+                "diary_wing_gh",
+                "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"
+            ))
+        );
+        assert_eq!(part_id(&a, 0), a);
+        assert_eq!(part_id(&a, 2), format!("{a}#3"));
+        assert_eq!(f.redacted_fields(), 0, "keys are not counted");
     }
 
     #[test]
