@@ -94,6 +94,8 @@ fn token_ids_match_hugging_face() {
     let ours = UnigramTokenizer::from_file(&dir.join("tokenizer.json")).unwrap();
     let theirs = fastembed(&dir);
     let texts = corpus();
+    // Also without a prefix: empty text, spaces only, and text the normalizer removes whole.
+    let bare = ["", " ", "   ", "\u{200B}", "\u{0000}\u{0007}", "x"];
     let mut mismatches = Vec::new();
     for t in &texts {
         for text in [format!("passage: {t}"), format!("query: {t}")] {
@@ -109,11 +111,24 @@ fn token_ids_match_hugging_face() {
             }
         }
     }
+    for text in bare {
+        let want: Vec<u32> = theirs
+            .tokenizer
+            .encode(text, true)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        let got = ours.encode(text, 512);
+        if got != want {
+            mismatches.push(format!("{text:?}\n  ours   {got:?}\n  theirs {want:?}"));
+        }
+    }
     println!(
-        "token ids: {} mismatches over {} texts ({} encodings)",
+        "token ids: {} mismatches over {} texts ({} encodings, {} of them without a prefix)",
         mismatches.len(),
-        texts.len(),
-        texts.len() * 2
+        texts.len() + bare.len(),
+        texts.len() * 2 + bare.len(),
+        bare.len()
     );
     assert!(
         mismatches.is_empty(),

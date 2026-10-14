@@ -3,6 +3,11 @@
 use crate::error::Result;
 use crate::normalize::{nfc, truncate_chars};
 
+/// Why a query was not embedded: a local model unloaded after an idle period is loading again
+/// (search then uses word matches). Embedders put it at the start of that error's text.
+pub const MODEL_LOADING: &str =
+    "the embedding model is loading after an idle period; this search used word matches only";
+
 pub trait Embedder: Send + Sync {
     /// Identifier stored with each vector, e.g. `multilingual-e5-small`.
     fn model_id(&self) -> &str;

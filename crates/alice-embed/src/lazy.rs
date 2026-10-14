@@ -4,7 +4,8 @@
 //! Loads are serialised (`load_lock`), so a background reload and a caller that waits for the
 //! value never build two copies at once (the embedding model is the daemon's largest
 //! allocation), and no caller waits for a load while holding the value's lock: a query that
-//! finds the value missing returns at once while a load is in progress.
+//! finds the value missing returns at once while a load is in progress. The reaper frees the
+//! old value while holding the load lock too, so a reload never overlaps that free.
 
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,7 +19,10 @@ pub(crate) type Spawner =
 
 pub(crate) struct Lazy<T: Send + 'static> {
     slot: Mutex<Option<T>>,
-    /// Held for the whole of every load.
+    /// Whether `slot` holds the value; changed only under the slot lock, read without it (a
+    /// batch in progress holds the slot for a while).
+    loaded: AtomicBool,
+    /// Held for the whole of every load, and while the reaper frees the value.
     load_lock: Mutex<()>,
     /// A background load is queued or running.
     loading: AtomicBool,
@@ -56,6 +60,7 @@ impl<T: Send + 'static> Lazy<T> {
         let first = load()?;
         let me = Arc::new(Self {
             slot: Mutex::new(Some(first)),
+            loaded: AtomicBool::new(true),
             load_lock: Mutex::new(()),
             loading: AtomicBool::new(false),
             started: Instant::now(),
@@ -80,8 +85,15 @@ impl<T: Send + 'static> Lazy<T> {
             .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
+    /// Without waiting for a call in progress.
     pub(crate) fn is_loaded(&self) -> bool {
-        self.slot.lock().is_some()
+        self.loaded.load(Ordering::Acquire)
+    }
+
+    fn idle_for(&self, idle: Duration) -> bool {
+        let now = self.started.elapsed().as_millis() as u64;
+        let last = self.last_used_ms.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= idle.as_millis() as u64
     }
 
     /// Why the model is not loaded although a query asked for it, if a load failed.
@@ -91,7 +103,9 @@ impl<T: Send + 'static> Lazy<T> {
 
     #[cfg(test)]
     fn unload(&self) {
-        *self.slot.lock() = None;
+        let mut g = self.slot.lock();
+        *g = None;
+        self.loaded.store(false, Ordering::Release);
     }
 
     /// Load the value unless it is there (or another load put it there meanwhile). Holds the
@@ -107,6 +121,7 @@ impl<T: Send + 'static> Lazy<T> {
         let mut g = self.slot.lock();
         if g.is_none() {
             *g = Some(v);
+            self.loaded.store(true, Ordering::Release);
         }
         drop(g);
         *self.last_error.lock() = None;
@@ -143,12 +158,14 @@ impl<T: Send + 'static> Lazy<T> {
         if !self.loading.swap(true, Ordering::AcqRel) {
             let me = self.clone();
             let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+                // Clears `loading` however the load ends, a panic included, so the next query
+                // can start another.
+                let _done = LoadingDone(&me);
                 if let Err(e) = me.load_now() {
                     tracing::warn!(error = %e, "reloading the embedding model failed");
                     *me.last_error.lock() =
                         Some(format!("reloading the embedding model failed: {e}"));
                 }
-                me.loading.store(false, Ordering::Release);
             });
             if let Err(e) = (self.spawn)(job) {
                 // No thread, no load: say why, and let the next query try again.
@@ -162,19 +179,25 @@ impl<T: Send + 'static> Lazy<T> {
     }
 
     /// Drop the value if it has not been used for `idle`; returns whether it was dropped.
-    /// A value in use (its lock held) is left alone.
+    /// A value in use (its lock held) or being loaded is left alone, and the idle time is
+    /// checked again under the lock (a call may have finished just before).
     pub(crate) fn reap(&self) -> bool {
         let Some(idle) = self.idle else { return false };
-        let now = self.started.elapsed().as_millis() as u64;
-        let last = self.last_used_ms.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < idle.as_millis() as u64 {
+        if !self.idle_for(idle) {
             return false;
         }
+        // Held until the value is freed: a reload waits for that rather than overlap it.
+        let Some(_serial) = self.load_lock.try_lock() else {
+            return false;
+        };
         let dropped = match self.slot.try_lock() {
-            Some(mut g) if g.is_some() => g.take(),
+            Some(mut g) if g.is_some() && self.idle_for(idle) => {
+                self.loaded.store(false, Ordering::Release);
+                g.take()
+            }
             _ => None,
         };
-        // Freed outside the lock: a query arriving now is not held up by the deallocation.
+        // Freed outside the slot lock: a query arriving now is not held up by the free.
         let reaped = dropped.is_some();
         drop(dropped);
         if reaped {
@@ -184,6 +207,19 @@ impl<T: Send + 'static> Lazy<T> {
             );
         }
         reaped
+    }
+}
+
+/// Clears `loading` when a background load ends; records a panic as the reason.
+struct LoadingDone<'a, T: Send + 'static>(&'a Lazy<T>);
+
+impl<T: Send + 'static> Drop for LoadingDone<'_, T> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!("the embedding model loader panicked");
+            *self.0.last_error.lock() = Some("the embedding model loader panicked".into());
+        }
+        self.0.loading.store(false, Ordering::Release);
     }
 }
 
@@ -293,6 +329,114 @@ mod tests {
             t.elapsed()
         );
         assert_eq!(worker.join().unwrap(), 2);
+    }
+
+    /// A value whose drop takes a while, counting how many exist at once.
+    struct Tracked {
+        alive: Arc<AtomicUsize>,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(300));
+            self.alive.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Review M5: the reaper frees the old value while holding the load lock, so a reload that
+    /// arrives meanwhile waits for it instead of holding two models at once.
+    #[test]
+    fn a_reload_waits_until_the_reaped_value_is_freed() {
+        let (alive, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (a, m) = (alive.clone(), most.clone());
+        let lazy = Lazy::new(
+            Box::new(move || {
+                let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(now, Ordering::SeqCst);
+                Ok(Tracked { alive: a.clone() })
+            }),
+            Some(Duration::from_millis(50)),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lazy.is_loaded() {
+            assert!(Instant::now() < deadline, "never reaped");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The reaper is still freeing the old value (300 ms); the worker asks for it now.
+        lazy.with_blocking(|_| ()).unwrap();
+        assert_eq!(
+            most.load(Ordering::SeqCst),
+            1,
+            "a reload overlapped the drop of the reaped value"
+        );
+    }
+
+    /// Review M6: a loader that panics in the background does not leave `loading` set, so the
+    /// next query starts another load, and the reason is reported meanwhile.
+    #[test]
+    fn a_panicking_loader_does_not_stop_later_reloads() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let lazy = Lazy::new(
+            Box::new(move || {
+                let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+                assert!(n != 2, "loader panicked on purpose");
+                Ok(n)
+            }),
+            None,
+        )
+        .unwrap();
+        lazy.unload();
+        assert_eq!(
+            lazy.with_loaded(|v| *v),
+            None,
+            "starts a reload, which panics"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) < 2 || lazy.loading.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the panicking load never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            lazy.last_error().is_some_and(|e| e.contains("panicked")),
+            "{:?}",
+            lazy.last_error()
+        );
+        loop {
+            if let Some(v) = lazy.with_loaded(|v| *v) {
+                assert_eq!(v, 3);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no reload after a loader panic: {:?}",
+                lazy.last_error()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Review M7: `is_loaded` (health) answers while a batch holds the value.
+    #[test]
+    fn is_loaded_does_not_wait_for_a_call_in_progress() {
+        let (lazy, _) = counting(None);
+        let busy = {
+            let lazy = lazy.clone();
+            std::thread::spawn(move || {
+                lazy.with_blocking(|_| std::thread::sleep(Duration::from_millis(400)))
+                    .unwrap()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        assert!(lazy.is_loaded());
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "is_loaded waited {:?}",
+            t.elapsed()
+        );
+        busy.join().unwrap();
     }
 
     #[test]

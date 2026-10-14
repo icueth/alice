@@ -35,9 +35,9 @@ const BATCH_TOKENS: usize = 1_024;
 /// taken over the whole batch), so another id would move the vectors slightly.
 const PAD_ID: u32 = 0;
 
-/// Why a query was not embedded: the model was unloaded after an idle period and is loading.
-pub const MODEL_LOADING: &str =
-    "the embedding model is loading after an idle period; this search used word matches only";
+/// Why a query was not embedded: the model was unloaded after an idle period and is loading
+/// (defined in `alice_core::embed`, where search recognises it).
+pub use alice_core::embed::MODEL_LOADING;
 
 #[derive(Debug, Clone, Default)]
 pub struct OnnxOptions {

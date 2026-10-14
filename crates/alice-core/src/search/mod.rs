@@ -389,10 +389,23 @@ pub fn embed_query(
     index?;
     embedder
         .embed_query(text)
-        .inspect_err(
-            |e| tracing::warn!(error = %e, "query embedding failed; using word matches only"),
-        )
+        .inspect_err(|e| {
+            if embed_failure_level(e) == tracing::Level::DEBUG {
+                tracing::debug!(error = %e, "query embedding skipped; using word matches only");
+            } else {
+                tracing::warn!(error = %e, "query embedding failed; using word matches only");
+            }
+        })
         .ok()
+}
+
+/// How a query embedding failure is logged: a model reloading after an idle period is
+/// expected (debug; a reload that fails is logged where it fails), anything else warns.
+fn embed_failure_level(e: &AliceError) -> tracing::Level {
+    match e {
+        AliceError::Other(m) if m.starts_with(crate::embed::MODEL_LOADING) => tracing::Level::DEBUG,
+        _ => tracing::Level::WARN,
+    }
 }
 
 /// Run the recall pipeline. Fails only for an empty query or a database error; a missing
@@ -696,6 +709,22 @@ fn related_for(conn: &Connection, ids: &[String]) -> Result<Vec<RelatedRef>> {
 mod tests {
     use super::*;
     use crate::api::{MatchVia, Tier};
+
+    /// Review M8: a query that uses word matches because the model is reloading after an idle
+    /// period is expected (debug); any other embedding failure is a warning.
+    #[test]
+    fn a_reloading_model_is_logged_at_debug_and_other_failures_warn() {
+        use crate::embed::MODEL_LOADING;
+        use tracing::Level;
+        let loading = AliceError::Other(MODEL_LOADING.into());
+        assert_eq!(embed_failure_level(&loading), Level::DEBUG);
+        let failed_reload = AliceError::Other(format!(
+            "{MODEL_LOADING} (reloading the embedding model failed: no such file)"
+        ));
+        assert_eq!(embed_failure_level(&failed_reload), Level::DEBUG);
+        let broken = AliceError::Other("the embedding model failed: bad input".into());
+        assert_eq!(embed_failure_level(&broken), Level::WARN);
+    }
     use crate::embed::{Embedder, FakeEmbedder, memory_embed_text};
     use crate::model::{Kind, Status};
     use crate::project::ProjectRef;

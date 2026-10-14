@@ -9,14 +9,21 @@
 //! characters scored `min_score - 10` and consecutive unknowns in a word fused into one,
 //! `<s> … </s>` around the ids, and truncation to `max_len` ids including those two.
 //! Literal special-token text such as `</s>` in a passage is treated as text (Hugging Face
-//! would emit the special id there).
+//! would emit the special id there). A `tokenizer.json` with any other pipeline is refused.
 //!
 //! ```
 //! use alice_embed::tokenizer::UnigramTokenizer;
-//! let json = r#"{"model": {"type": "Unigram", "unk_id": 3, "vocab": [
+//! let json = r#"{
+//!   "normalizer": {"type": "Replace", "pattern": {"Regex": " {2,}"}, "content": " "},
+//!   "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "add_prefix_space": true},
+//!   "post_processor": {"type": "TemplateProcessing", "single": [
+//!     {"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+//!     {"SpecialToken": {"id": "</s>", "type_id": 0}}]},
+//!   "model": {"type": "Unigram", "unk_id": 3, "vocab": [
 //!     ["<s>", 0.0], ["<pad>", 0.0], ["</s>", 0.0], ["<unk>", 0.0], ["▁hi", -1.0]]}}"#;
 //! let t = UnigramTokenizer::from_json(json.as_bytes()).unwrap();
 //! assert_eq!(t.encode("hi", 512), vec![0, 4, 2]);
+//! assert_eq!(t.encode("", 512), vec![0, 2]);
 //! ```
 
 use alice_core::error::{AliceError, Result};
@@ -54,9 +61,20 @@ struct HeadModel {
 
 #[derive(Deserialize)]
 struct FileJson<'a> {
+    #[serde(default)]
+    added_tokens: Vec<AddedToken>,
     #[serde(default, borrow)]
     normalizer: Option<NormalizerJson<'a>>,
+    #[serde(default)]
+    pre_tokenizer: Option<serde_json::Value>,
+    #[serde(default)]
+    post_processor: Option<serde_json::Value>,
     model: ModelJson,
+}
+
+#[derive(Deserialize)]
+struct AddedToken {
+    content: String,
 }
 
 /// A normalizer as far as this tokenizer reads it: its type, a Precompiled one's charsmap
@@ -70,12 +88,18 @@ struct NormalizerJson<'a> {
     precompiled_charsmap: Option<Cow<'a, str>>,
     #[serde(default, borrow)]
     normalizers: Vec<NormalizerJson<'a>>,
+    #[serde(default)]
+    pattern: Option<serde_json::Value>,
+    #[serde(default, borrow)]
+    content: Option<Cow<'a, str>>,
 }
 
 #[derive(Deserialize)]
 struct ModelJson {
     #[serde(default)]
     unk_id: Option<u32>,
+    #[serde(default)]
+    byte_fallback: Option<bool>,
     vocab: Vec<(String, f64)>,
 }
 
@@ -85,33 +109,116 @@ fn broken(why: impl std::fmt::Display) -> AliceError {
     ))
 }
 
-/// The Precompiled normalizer inside `normalizer` (alone or in a Sequence), if any.
-fn find_precompiled(n: Option<&NormalizerJson>) -> Result<Option<spm_precompiled::Precompiled>> {
-    let Some(n) = n else { return Ok(None) };
-    match n.kind.as_ref() {
-        "Precompiled" => {
-            let charsmap = n
-                .precompiled_charsmap
-                .as_deref()
-                .ok_or_else(|| broken("a Precompiled normalizer without its charsmap"))?;
-            // Decoded by the crate's own deserializer, as `tokenizers` does. It reads the
-            // base64 text as a borrowed string, which `from_str` can give (a `Value` cannot).
-            let json = format!(
-                r#"{{"type":"Precompiled","precompiled_charsmap":{}}}"#,
-                serde_json::to_string(charsmap).map_err(broken)?
-            );
-            serde_json::from_str(&json).map(Some).map_err(broken)
-        }
-        "Sequence" => {
-            for m in &n.normalizers {
-                if let Some(p) = find_precompiled(Some(m))? {
-                    return Ok(Some(p));
-                }
-            }
-            Ok(None)
-        }
-        _ => Ok(None),
+/// The Precompiled normalizer, decoded by the crate's own deserializer as `tokenizers` does.
+/// It reads the base64 text as a borrowed string, which `from_str` can give (a `Value` cannot).
+fn precompiled(n: &NormalizerJson) -> Result<spm_precompiled::Precompiled> {
+    let charsmap = n
+        .precompiled_charsmap
+        .as_deref()
+        .ok_or_else(|| broken("a Precompiled normalizer without its charsmap"))?;
+    let json = format!(
+        r#"{{"type":"Precompiled","precompiled_charsmap":{}}}"#,
+        serde_json::to_string(charsmap).map_err(broken)?
+    );
+    serde_json::from_str(&json).map_err(broken)
+}
+
+/// `Replace(" {2,}" → " ")`: runs of spaces collapsed to one.
+fn collapses_spaces(n: &NormalizerJson) -> bool {
+    n.kind == "Replace"
+        && n.pattern
+            .as_ref()
+            .and_then(|p| p.get("Regex"))
+            .and_then(|r| r.as_str())
+            == Some(" {2,}")
+        && n.content.as_deref() == Some(" ")
+}
+
+/// The normalizer this tokenizer implements: an optional Precompiled one, then runs of spaces
+/// collapsed (alone or as a Sequence). Returns the Precompiled one.
+fn normalizer(n: Option<&NormalizerJson>) -> Result<Option<spm_precompiled::Precompiled>> {
+    let wrong = || {
+        broken(
+            "its normalizer is not the one this tokenizer implements: an optional Precompiled \
+             normalizer, then Replace(\" {2,}\" with \" \")",
+        )
+    };
+    let n = n.ok_or_else(wrong)?;
+    let members: Vec<&NormalizerJson> = if n.kind == "Sequence" {
+        n.normalizers.iter().collect()
+    } else {
+        vec![n]
+    };
+    let (found, rest) = match members.split_first() {
+        Some((first, rest)) if first.kind == "Precompiled" => (Some(precompiled(first)?), rest),
+        _ => (None, &members[..]),
+    };
+    match rest {
+        [only] if collapses_spaces(only) => Ok(found),
+        _ => Err(wrong()),
     }
+}
+
+/// Metaspace with `▁`, prepended to the text (legacy `add_prefix_space: true` or
+/// `prepend_scheme: "always"`), words split at it.
+fn check_pre_tokenizer(p: Option<&serde_json::Value>) -> Result<()> {
+    let absent_or = |p: &serde_json::Value, key: &str, ok: &dyn Fn(&serde_json::Value) -> bool| {
+        p.get(key).is_none_or(|v| v.is_null() || ok(v))
+    };
+    let fits = p.is_some_and(|p| {
+        p["type"].as_str() == Some("Metaspace")
+            && p["replacement"].as_str() == Some("▁")
+            && absent_or(p, "add_prefix_space", &|v| v.as_bool() == Some(true))
+            && absent_or(p, "prepend_scheme", &|v| v.as_str() == Some("always"))
+            && absent_or(p, "split", &|v| v.as_bool() == Some(true))
+    });
+    if fits {
+        Ok(())
+    } else {
+        Err(broken(
+            "its pre-tokenizer is not the one this tokenizer implements: Metaspace with \"▁\" \
+             prepended and words split at it",
+        ))
+    }
+}
+
+/// `<s> $A </s>`, with the vocabulary's ids for the two special tokens.
+fn check_post_processor(p: Option<&serde_json::Value>, bos: u32, eos: u32) -> Result<()> {
+    let wrong = || {
+        broken(
+            "its post-processor is not the one this tokenizer implements: the text between \
+             <s> and </s>",
+        )
+    };
+    let p = p.ok_or_else(wrong)?;
+    if p["type"].as_str() != Some("TemplateProcessing") {
+        return Err(wrong());
+    }
+    let single: Vec<(&str, &str)> = p["single"]
+        .as_array()
+        .ok_or_else(wrong)?
+        .iter()
+        .map(
+            |piece| match (piece.get("SpecialToken"), piece.get("Sequence")) {
+                (Some(t), None) => ("special", t["id"].as_str().unwrap_or("")),
+                (None, Some(t)) => ("sequence", t["id"].as_str().unwrap_or("")),
+                _ => ("other", ""),
+            },
+        )
+        .collect();
+    if single != [("special", "<s>"), ("sequence", "A"), ("special", "</s>")] {
+        return Err(wrong());
+    }
+    for (name, id) in [("<s>", bos), ("</s>", eos)] {
+        let ids = p
+            .get("special_tokens")
+            .and_then(|t| t.get(name))
+            .and_then(|t| t.get("ids"));
+        if ids.is_some_and(|ids| *ids != serde_json::json!([id])) {
+            return Err(wrong());
+        }
+    }
+    Ok(())
 }
 
 impl UnigramTokenizer {
@@ -125,7 +232,24 @@ impl UnigramTokenizer {
             return Err(broken(format!("a {} model, not Unigram", head.model.kind)));
         }
         let f: FileJson = serde_json::from_slice(bytes).map_err(broken)?;
-        let precompiled = find_precompiled(f.normalizer.as_ref())?;
+        let precompiled = normalizer(f.normalizer.as_ref())?;
+        check_pre_tokenizer(f.pre_tokenizer.as_ref())?;
+        if f.model.byte_fallback == Some(true) {
+            return Err(broken(
+                "its model uses byte fallback, which this tokenizer does not implement",
+            ));
+        }
+        if let Some(t) = f
+            .added_tokens
+            .iter()
+            .find(|t| !SPECIALS.contains(&t.content.as_str()))
+        {
+            return Err(broken(format!(
+                "it has added tokens other than {SPECIALS:?}, such as {:?}, which this tokenizer \
+                 does not implement",
+                t.content
+            )));
+        }
         let vocab = f.model.vocab;
         let mut pieces = HashMap::with_capacity(vocab.len());
         let mut scores = Vec::with_capacity(vocab.len());
@@ -155,6 +279,8 @@ impl UnigramTokenizer {
         if unk_id as usize >= scores.len() {
             return Err(broken(format!("unk_id {unk_id} is not in the vocabulary")));
         }
+        let (bos, eos) = (id_of("<s>")?, id_of("</s>")?);
+        check_post_processor(f.post_processor.as_ref(), bos, eos)?;
         Ok(Self {
             pieces,
             scores,
@@ -162,8 +288,8 @@ impl UnigramTokenizer {
             unk_score: min_score - UNK_PENALTY,
             max_piece_chars: max_chars,
             precompiled,
-            bos: id_of("<s>")?,
-            eos: id_of("</s>")?,
+            bos,
+            eos,
         })
     }
 
@@ -186,14 +312,16 @@ impl UnigramTokenizer {
                 prev_space = false;
             }
         }
-        if !out.starts_with('▁') {
+        // Metaspace prepends to a non-empty string only (`tokenizers` prepends nothing to an
+        // empty one), so empty text encodes as `<s> </s>`.
+        if !out.is_empty() && !out.starts_with('▁') {
             out.insert(0, '▁');
         }
         out
     }
 
     /// Token ids of `text`, `<s>` and `</s>` included, at most `max_len` (at least 2) of them.
-    /// `normalize` always starts the string with `▁`, so every word starts at a `▁`.
+    /// `normalize` starts every non-empty string with `▁`, so every word starts at a `▁`.
     pub fn encode(&self, text: &str, max_len: usize) -> Vec<u32> {
         let normalized = self.normalize(text);
         let starts: Vec<usize> = normalized
@@ -272,22 +400,164 @@ impl UnigramTokenizer {
 mod tests {
     use super::*;
 
-    /// A tiny Unigram vocabulary in the shape of the real tokenizer.json (no Precompiled
-    /// normalizer: identity), so Viterbi, Metaspace, unknowns and truncation are tested offline.
-    fn tiny() -> UnigramTokenizer {
-        let json = serde_json::json!({
+    /// A tiny Unigram vocabulary in the shape of the real tokenizer.json (its pre-tokenizer
+    /// and post-processor; no Precompiled normalizer: identity), so Viterbi, Metaspace,
+    /// unknowns and truncation are tested offline.
+    fn tiny_json() -> serde_json::Value {
+        serde_json::json!({
             "normalizer": {"type": "Sequence", "normalizers": [
                 {"type": "Replace", "pattern": {"Regex": " {2,}"}, "content": " "}
             ]},
             "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "add_prefix_space": true},
+            "post_processor": {"type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "<s>", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "</s>", "type_id": 0}}
+                ],
+                "pair": [],
+                "special_tokens": {
+                    "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]},
+                    "<s>": {"id": "<s>", "ids": [0], "tokens": ["<s>"]}
+                }},
             "model": {"type": "Unigram", "unk_id": 3, "vocab": [
                 ["<s>", 0.0], ["<pad>", 0.0], ["</s>", 0.0], ["<unk>", 0.0],
                 ["▁", -2.0], ["▁hello", -3.0], ["▁hell", -4.0], ["o", -4.5],
                 ["▁world", -3.5], ["h", -6.0], ["e", -6.0], ["l", -6.0], ["w", -6.0],
                 ["r", -6.0], ["d", -6.0], ["▁ไทย", -5.0], ["ไ", -7.0], ["ท", -7.0], ["ย", -7.0]
             ]}
-        });
-        UnigramTokenizer::from_json(json.to_string().as_bytes()).unwrap()
+        })
+    }
+
+    fn tiny() -> UnigramTokenizer {
+        UnigramTokenizer::from_json(tiny_json().to_string().as_bytes()).unwrap()
+    }
+
+    /// Review M2: like Hugging Face (Metaspace prepends nothing to an empty string), empty
+    /// text is `<s> </s>`.
+    #[test]
+    fn empty_text_is_just_the_special_tokens() {
+        let t = tiny();
+        assert_eq!(t.normalize(""), "");
+        assert_eq!(t.encode("", 512), vec![0, 2]);
+        assert_eq!(
+            t.encode(" ", 512),
+            vec![0, 4, 2],
+            "one space is a word of its own"
+        );
+    }
+
+    /// Review M3: a tokenizer.json whose pipeline is not the one implemented here is refused
+    /// with the next step, instead of being tokenized differently from Hugging Face.
+    #[test]
+    fn a_tokenizer_file_with_another_pipeline_is_refused() {
+        let change = |path: &[&str], value: serde_json::Value| {
+            let mut j = tiny_json();
+            let (last, parents) = path.split_last().unwrap();
+            let mut at = &mut j;
+            for p in parents {
+                at = match p.parse::<usize>() {
+                    Ok(i) => &mut at[i],
+                    Err(_) => &mut at[*p],
+                };
+            }
+            match value {
+                serde_json::Value::Null => {
+                    at.as_object_mut().unwrap().remove(*last);
+                }
+                v => at[*last] = v,
+            }
+            j
+        };
+        use serde_json::json;
+        let cases = [
+            (
+                "normalizer",
+                change(&["normalizer"], serde_json::Value::Null),
+            ),
+            (
+                "normalizer",
+                change(
+                    &["normalizer", "normalizers", "0", "pattern"],
+                    json!({"Regex": " +"}),
+                ),
+            ),
+            (
+                "normalizer",
+                change(
+                    &["normalizer", "normalizers"],
+                    json!([{"type": "Replace", "pattern": {"Regex": " {2,}"}, "content": " "},
+                           {"type": "Lowercase"}]),
+                ),
+            ),
+            (
+                "pre-tokenizer",
+                change(&["pre_tokenizer"], json!({"type": "Whitespace"})),
+            ),
+            (
+                "pre-tokenizer",
+                change(&["pre_tokenizer", "add_prefix_space"], json!(false)),
+            ),
+            (
+                "pre-tokenizer",
+                change(&["pre_tokenizer", "replacement"], json!("_")),
+            ),
+            (
+                "pre-tokenizer",
+                change(&["pre_tokenizer", "split"], json!(false)),
+            ),
+            (
+                "post-processor",
+                change(&["post_processor"], serde_json::Value::Null),
+            ),
+            (
+                "post-processor",
+                change(&["post_processor", "type"], json!("BertProcessing")),
+            ),
+            (
+                "post-processor",
+                change(
+                    &["post_processor", "single"],
+                    json!([{"SpecialToken": {"id": "<s>", "type_id": 0}},
+                           {"Sequence": {"id": "A", "type_id": 0}}]),
+                ),
+            ),
+            (
+                "post-processor",
+                change(
+                    &["post_processor", "special_tokens", "<s>", "ids"],
+                    json!([1]),
+                ),
+            ),
+            (
+                "byte fallback",
+                change(&["model", "byte_fallback"], json!(true)),
+            ),
+            (
+                "added tokens",
+                change(
+                    &["added_tokens"],
+                    json!([{"id": 0, "content": "<s>"}, {"id": 19, "content": "[CODE]"}]),
+                ),
+            ),
+        ];
+        for (what, j) in cases {
+            let err = UnigramTokenizer::from_json(j.to_string().as_bytes())
+                .err()
+                .unwrap_or_else(|| panic!("accepted a file with another {what}: {j}"))
+                .to_string();
+            assert!(
+                err.contains(what) && err.contains("alice model fetch"),
+                "{what}: {err}"
+            );
+        }
+        // The real file's legacy and current Metaspace spellings are both accepted.
+        let current = change(
+            &["pre_tokenizer"],
+            json!({"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always",
+                   "split": true}),
+        );
+        assert!(UnigramTokenizer::from_json(current.to_string().as_bytes()).is_ok());
     }
 
     #[test]
@@ -362,6 +632,11 @@ mod tests {
             r#"{{"normalizer": {{"type": "Sequence", "normalizers": [
                 {{"type": "Precompiled", "precompiled_charsmap": "{}"}},
                 {{"type": "Replace", "pattern": {{"Regex": " {{2,}}"}}, "content": " "}}]}},
+              "pre_tokenizer": {{"type": "Metaspace", "replacement": "▁", "add_prefix_space": true}},
+              "post_processor": {{"type": "TemplateProcessing", "single": [
+                {{"SpecialToken": {{"id": "<s>", "type_id": 0}}}},
+                {{"Sequence": {{"id": "A", "type_id": 0}}}},
+                {{"SpecialToken": {{"id": "</s>", "type_id": 0}}}}]}},
               "model": {{"type": "Unigram", "unk_id": 3, "vocab": [
                 ["<s>", 0.0], ["<pad>", 0.0], ["</s>", 0.0], ["<unk>", 0.0],
                 ["▁abc", -1.0], ["▁", -2.0], ["A", -3.0], ["b", -3.0], ["c", -3.0]]}}}}"#,

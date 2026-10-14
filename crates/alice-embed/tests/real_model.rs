@@ -163,7 +163,9 @@ fn the_real_model_is_unloaded_when_idle_and_reloaded_on_demand() {
     let reload_ms = reload.elapsed().as_millis();
     assert_eq!(e.embed_query("writer lease timeout").unwrap(), before);
     // Passages wait for a load instead of failing.
+    let deadline = Instant::now() + Duration::from_secs(10);
     while e.is_loaded() {
+        assert!(Instant::now() < deadline, "not unloaded again after 10 s");
         std::thread::sleep(Duration::from_millis(50));
     }
     let t = Instant::now();

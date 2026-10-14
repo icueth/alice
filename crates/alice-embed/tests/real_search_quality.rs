@@ -45,44 +45,85 @@ const UNRELATED: &[(&str, &str)] = &[
     ("ราคาทองคำวันนี้", "ราคาทองคำวันนี้ขึ้นอีกสองร้อยบาท"),
 ];
 
-/// Gold queries that share no word with their memory (checked: the hit's only match is the
-/// vector list): (what kind, query, wanted memory id from the gold file).
-const VECTOR_ONLY: &[(&str, &str, &str)] = &[
-    ("Thai for English", "เราดีพลอยระบบจริงไปไว้ที่ไหน", "deploy"),
-    ("Thai for English", "ควรตอบเจ้าของด้วยภาษาอะไร", "pref-thai"),
-    (
-        "Thai for English",
-        "เก็บจำนวนเงินเป็นสตริงเพื่อไม่ให้ปัดเศษผิด",
-        "money",
-    ),
-    ("Thai for English", "ทำไมบันทึกไดอารี่ถึงหมดเวลา", "lease"),
-    (
-        "English for Thai",
-        "agents' memory has to search Thai text that has no spaces between words",
-        "thai-mem",
-    ),
-    (
-        "paraphrase",
-        "a lone dedicated committer keeps lookups from stalling",
-        "wal",
-    ),
-    (
-        "paraphrase",
-        "the connection retried endlessly once the laptop woke up",
-        "reconnect",
-    ),
-    (
-        "paraphrase",
-        "currency amounts travel as text so decimals stay exact",
-        "money",
-    ),
-    (
-        "paraphrase",
-        "binary envelopes are mandatory; a text payload cannot be decoded",
-        "proto",
-    ),
-    ("paraphrase", "which host serves our live site", "deploy"),
+/// A gold query that shares no word with its memory (checked: the hit's only match is the
+/// vector list), with what retrieval does with it at the default floor today.
+struct VectorOnly {
+    what: &'static str,
+    query: &'static str,
+    /// Memory id from the gold file.
+    want: &'static str,
+    /// Measured with the default floor (0.82) and the int8 memory index: in the top 3 (true) or
+    /// not returned at all (false: no lexical match, similarity below the floor). A change to the
+    /// floor policy or to the model changes this column, and docs/benchmarks/m2.md with it.
+    returned_at_default_floor: bool,
+}
+
+const VECTOR_ONLY: &[VectorOnly] = &[
+    VectorOnly {
+        what: "Thai for English",
+        query: "เราดีพลอยระบบจริงไปไว้ที่ไหน",
+        want: "deploy",
+        returned_at_default_floor: false,
+    },
+    VectorOnly {
+        what: "Thai for English",
+        query: "ควรตอบเจ้าของด้วยภาษาอะไร",
+        want: "pref-thai",
+        returned_at_default_floor: true,
+    },
+    VectorOnly {
+        what: "Thai for English",
+        query: "เก็บจำนวนเงินเป็นสตริงเพื่อไม่ให้ปัดเศษผิด",
+        want: "money",
+        returned_at_default_floor: false,
+    },
+    VectorOnly {
+        what: "Thai for English",
+        query: "ทำไมบันทึกไดอารี่ถึงหมดเวลา",
+        want: "lease",
+        returned_at_default_floor: false,
+    },
+    VectorOnly {
+        what: "English for Thai",
+        query: "agents' memory has to search Thai text that has no spaces between words",
+        want: "thai-mem",
+        returned_at_default_floor: true,
+    },
+    VectorOnly {
+        what: "paraphrase",
+        query: "a lone dedicated committer keeps lookups from stalling",
+        want: "wal",
+        returned_at_default_floor: false,
+    },
+    VectorOnly {
+        what: "paraphrase",
+        query: "the connection retried endlessly once the laptop woke up",
+        want: "reconnect",
+        returned_at_default_floor: true,
+    },
+    VectorOnly {
+        what: "paraphrase",
+        query: "currency amounts travel as text so decimals stay exact",
+        want: "money",
+        returned_at_default_floor: true,
+    },
+    VectorOnly {
+        what: "paraphrase",
+        query: "binary envelopes are mandatory; a text payload cannot be decoded",
+        want: "proto",
+        returned_at_default_floor: false,
+    },
+    VectorOnly {
+        what: "paraphrase",
+        query: "which host serves our live site",
+        want: "deploy",
+        returned_at_default_floor: false,
+    },
 ];
+
+/// With every vector candidate let through (floor −1), at least this many of `VECTOR_ONLY` rank
+/// in the top 3: the ranking itself, whatever the floor decides.
+const VECTOR_ONLY_TOP3_UNFLOORED: usize = 8;
 
 fn models_dir() -> PathBuf {
     std::env::var_os("ALICE_MODELS_DIR")
@@ -185,7 +226,7 @@ fn real_model_gold_set_and_relevance_floor() {
     gold.extend(
         VECTOR_ONLY
             .iter()
-            .map(|(_, q, want)| (q.to_string(), want.to_string())),
+            .map(|v| (v.query.to_string(), v.want.to_string())),
     );
     for (i, (_, chunk)) in UNRELATED.iter().enumerate() {
         let out = sources::ingest(
@@ -276,8 +317,11 @@ fn real_model_gold_set_and_relevance_floor() {
         stats(&mut unrelated_i8)
     );
     println!("  queries sharing no word with their memory (exact / int8 index)");
-    for ((exact, i8), (what, q, want)) in vector_only_sims.iter().zip(VECTOR_ONLY) {
-        println!("    {exact:.3} / {i8:.3}  {what:<16} {want:<10} {q}");
+    for ((exact, i8), v) in vector_only_sims.iter().zip(VECTOR_ONLY) {
+        println!(
+            "    {exact:.3} / {i8:.3}  {:<16} {:<10} {}",
+            v.what, v.want, v.query
+        );
     }
     let above = |v: &[f32], floor: f32| v.iter().filter(|s| **s >= floor).count();
     let params = |q: &str, floor: f32| SearchParams {
@@ -380,33 +424,55 @@ fn real_model_gold_set_and_relevance_floor() {
             "{q:?}: expected {want} in the top 3, got {rank:?}"
         );
     }
-    // The vector-only queries share no word with their memory: with every vector candidate
-    // let through (floor -1), the memory is found by the vector list alone.
-    for (_, q, want) in VECTOR_ONLY {
-        let out = search(q, -1.0);
-        let hit = out.hits.iter().find(|h| h.id == ids[*want]);
+    // Fixture check (not a retrieval check: with ten memories and floor −1 every memory is
+    // returned): each vector-only query reaches its memory through the vector list alone, so it
+    // really shares no word with it.
+    for v in VECTOR_ONLY {
+        let out = search(v.query, -1.0);
+        let hit = out.hits.iter().find(|h| h.id == ids[v.want]);
         assert_eq!(
             hit.map(|h| h.matched.clone()),
             Some(vec![alice_core::api::MatchVia::Vector]),
-            "{q:?} must reach {want} through the vector list only"
+            "{:?} must reach {} through the vector list only",
+            v.query,
+            v.want
         );
     }
-    // The lower edge of the floor: a vector-only pair that clears it is ranked in the top 3; one
-    // below it is not returned at all (no lexical match, too little similarity). That share is
-    // measured, not asserted: the vectors are M1's (tests/onnx_equivalence.rs).
+    // The ranking, whatever the floor: with every candidate let through, most vector-only
+    // queries put their memory in the top 3.
+    let unfloored = evaluate(-1.0);
+    let unfloored_top3 = top3(&unfloored.ranks[shared_gold..]);
+    println!(
+        "  vector-only queries in the top 3 with no floor: {unfloored_top3} of {}",
+        VECTOR_ONLY.len()
+    );
+    assert!(
+        unfloored_top3 >= VECTOR_ONLY_TOP3_UNFLOORED,
+        "only {unfloored_top3} vector-only queries rank their memory in the top 3 without a floor"
+    );
+    // The floor's lower edge, pinned row by row: the rows marked returned are in the top 3, the
+    // others are not returned at all. A change in either direction must update VECTOR_ONLY and
+    // docs/benchmarks/m2.md.
     let mut below = Vec::new();
-    for ((sim, rank), (what, q, want)) in vector_only_i8.iter().zip(vector_only).zip(VECTOR_ONLY) {
-        if *sim >= floor {
+    for ((v, rank), sim) in VECTOR_ONLY.iter().zip(vector_only).zip(&vector_only_i8) {
+        if v.returned_at_default_floor {
             assert!(
                 rank.is_some_and(|r| r <= 3),
-                "{q:?} cleared the floor ({sim:.3}) but {want} ranked {rank:?}"
+                "{:?} ({sim:.3}) should rank {} in the top 3 at the default floor, got {rank:?}",
+                v.query,
+                v.want
             );
         } else {
-            below.push(format!("{sim:.3} {what}: {q}"));
+            assert_eq!(
+                *rank, None,
+                "{:?} ({sim:.3}) now returns {}: update VECTOR_ONLY and docs/benchmarks/m2.md",
+                v.query, v.want
+            );
+            below.push(format!("{sim:.3} {}: {}", v.what, v.query));
         }
     }
     println!(
-        "  vector-only pairs below the floor {floor} (not returned): {} of {}",
+        "  vector-only pairs not returned at the floor {floor}: {} of {}",
         below.len(),
         VECTOR_ONLY.len()
     );
