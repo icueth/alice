@@ -21,6 +21,11 @@ pub enum AliceError {
         field: String,
         detectors: Vec<String>,
     },
+    /// An embedding provider could not be reached or would not serve (a timeout, a refused
+    /// connection, 429, 5xx, a refused key). It says nothing about the text, so the embedding
+    /// worker keeps the text queued instead of counting the failure toward giving it up.
+    #[error("{0}")]
+    Unavailable(String),
     #[error("not found: {0}")]
     NotFound(String),
     /// Writes are refused until the cause is fixed.

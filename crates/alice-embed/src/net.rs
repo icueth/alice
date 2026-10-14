@@ -32,15 +32,40 @@ impl BlockingHttp {
     /// `user_agent` is sent as it is: pass `alice/<version>` and nothing that names a person or
     /// a machine.
     pub fn new(user_agent: &str) -> std::io::Result<Self> {
+        Self::build(user_agent, false, false)
+    }
+
+    /// For a request to an endpoint the person named (an embedding provider): redirects are not
+    /// followed (the body and the key would be posted to wherever a server points) and no
+    /// proxy from the environment reroutes the request.
+    pub fn direct(user_agent: &str) -> std::io::Result<Self> {
+        Self::build(user_agent, true, true)
+    }
+
+    /// Like [`new`](Self::new) but redirects are not followed (a redirect would post the
+    /// body, and the key, to wherever a server points); the environment's proxy is kept, for
+    /// a remote API a corporate network may require one for.
+    pub fn no_redirect(user_agent: &str) -> std::io::Result<Self> {
+        Self::build(user_agent, true, false)
+    }
+
+    fn build(user_agent: &str, no_redirect: bool, no_proxy: bool) -> std::io::Result<Self> {
         crate::install_tls_provider();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("alice-http")
             .enable_all()
             .build()?;
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .user_agent(user_agent)
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(10));
+        if no_redirect {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        if no_proxy {
+            builder = builder.no_proxy();
+        }
+        let client = builder
             .build()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(Self {
@@ -161,6 +186,12 @@ mod tests {
                     }
                     let head = String::from_utf8_lossy(&buf).into_owned();
                     log.lock().unwrap().push(head.clone());
+                    if head.contains("POST /moved") {
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        return;
+                    }
                     if head.contains("POST /stall") {
                         std::thread::sleep(Duration::from_secs(30));
                         return;
@@ -268,5 +299,45 @@ mod tests {
             HttpError::Build(m) => assert!(!m.contains("live_bad"), "{m}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// An embedding request is not re-posted where a server points it (the text and the key
+    /// would follow), and no proxy of the environment reroutes it.
+    #[test]
+    fn a_direct_client_does_not_follow_a_redirect() {
+        let (base, heads) = serve();
+        let body = || b"{\"secret\":true}".to_vec();
+        let direct = BlockingHttp::direct("alice/0.0.0-test").unwrap();
+        let r = direct
+            .post_json(
+                &format!("{base}/moved"),
+                Some("test-token"),
+                body(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(r.status, 307, "the redirect is the answer, not followed");
+        assert_eq!(heads.lock().unwrap().len(), 1, "nothing was posted again");
+        let nr = BlockingHttp::no_redirect("alice/0.0.0-test").unwrap();
+        let r = nr
+            .post_json(
+                &format!("{base}/moved"),
+                None,
+                body(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(r.status, 307, "the Jev client does not follow it either");
+        // The ordinary client follows it (this is why the embedding one must not).
+        let plain = BlockingHttp::new("alice/0.0.0-test").unwrap();
+        let r = plain
+            .post_json(
+                &format!("{base}/moved"),
+                None,
+                body(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(r.status, 200);
     }
 }

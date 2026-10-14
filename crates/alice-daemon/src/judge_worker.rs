@@ -30,6 +30,7 @@ use alice_core::store::memories;
 use alice_core::store::projects;
 use alice_core::store::reviews::{NewReview, ReviewType};
 use alice_core::vector::KeyFilter;
+use alice_core::vector::VectorIndex;
 use crossbeam_channel::Receiver;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -90,8 +91,9 @@ pub struct JudgeWorkerConfig {
     pub judge: Arc<dyn JudgeSource>,
     pub settings: Arc<SettingsHandle>,
     pub redactors: Arc<Redactors>,
-    /// The embedding model whose stored vectors the judge reads (follows a model switch).
-    pub model: Arc<dyn Fn() -> String + Send + Sync>,
+    /// The embedding model whose stored vectors the judge reads and the index holding them,
+    /// read together (follows a model switch).
+    pub model: Arc<dyn Fn() -> (String, Option<Arc<VectorIndex>>) + Send + Sync>,
     pub wake: Receiver<()>,
     pub stop: Arc<AtomicBool>,
     /// How often memories whose judgement failed (`retry`) are looked at again (each one waits
@@ -289,13 +291,13 @@ fn neighbours(
     item: &PendingJudgement,
     me: &JudgeMemory,
 ) -> Result<Vec<Neighbour>> {
-    let model = (cfg.model)();
+    let (model, live_index) = (cfg.model)();
     let my_vec = embeddings::get_many(c, &model, &[VecKey::Memory(item.seq)])?
         .pop()
         .map(|(_, v)| v);
     // seq -> hash, for the memories chosen, in order.
     let mut chosen: Vec<(i64, String)> = Vec::new();
-    if let (Some(v), Some(index)) = (&my_vec, cfg.index.read().clone()) {
+    if let (Some(v), Some(index)) = (&my_vec, live_index) {
         let mut depth = SEARCH_DEPTH;
         for _ in 0..3 {
             let hits = index.search(v, depth, KeyFilter::Memories)?;
@@ -821,7 +823,7 @@ mod tests {
             judge: Arc::new(Source(Arc::new(Panicky))),
             settings,
             redactors: Redactors::fixed(Default::default()),
-            model: Arc::new(|| "m".to_string()),
+            model: Arc::new(|| ("m".to_string(), None)),
             wake,
             stop: stop.clone(),
             retry_every: Duration::from_secs(3600),

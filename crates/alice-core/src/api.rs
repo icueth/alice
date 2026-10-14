@@ -121,6 +121,10 @@ pub struct RecallResponse {
     pub reranked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Things worth knowing about this answer, such as a search that used word matches only
+    /// because the project's memories may not be sent to the embedding provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// Save a memory: a decision, fix, fact, how-to, preference, warning or handoff worth keeping.
@@ -385,6 +389,22 @@ pub struct Health {
     /// Why the judge in force is not the one asked for (or out of budget), if it is not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_warning: Option<String>,
+    /// The embedding model in force (what vectors and queries use; `multilingual-e5-small-q8`
+    /// for the local model, `<provider>:<model>` otherwise).
+    #[serde(default)]
+    pub embedding_model: String,
+    /// Progress of a re-embed into another model after a change of `embedding.*`; the model in
+    /// force serves searches until it is done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reembed: Option<ReembedStatus>,
+    /// Why the embedding model asked for is not (yet) the one in force: the provider cannot be
+    /// reached, a key is missing, or a re-embed stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_error: Option<String>,
+    /// Memories and chunks not embedded because the embedder is remote and the cloud policy keeps
+    /// their project at home; they are searched by words only.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub embed_skipped_cloud: u64,
     /// The backups are behind: the newest is older than two backup periods (or none was made in
     /// a data directory that old).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -409,6 +429,19 @@ pub struct Health {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// A re-embed into another embedding model in progress (rows done of rows to do).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReembedStatus {
+    /// The model being filled.
+    pub model: String,
+    pub done: u64,
+    pub total: u64,
 }
 
 /// What the API shows about a secret: whether it is set, a hint, and where it comes from. The

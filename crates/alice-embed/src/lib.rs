@@ -247,6 +247,7 @@ async fn download(
 }
 
 // The tokenizer needs `spm_precompiled`, an optional dependency of feature `local`.
+pub mod http;
 #[cfg(feature = "local")]
 mod lazy;
 pub mod net;
@@ -256,6 +257,75 @@ pub mod onnx;
 pub mod tokenizer;
 #[cfg(feature = "local")]
 pub use onnx::{OnnxEmbedder, OnnxOptions};
+
+/// Builds an embedder from `[embedding]` settings and the `embedding_api_key` secret (the
+/// daemon resolves the key; a provider that needs none ignores it). It may talk to the provider
+/// (the dimension is probed), so call it off an async runtime's threads.
+pub type EmbedderFactory = std::sync::Arc<
+    dyn Fn(
+            &alice_core::settings::EmbeddingSettings,
+            Option<alice_core::settings::SecretValue>,
+        ) -> alice_core::Result<std::sync::Arc<dyn alice_core::embed::Embedder>>
+        + Send
+        + Sync,
+>;
+
+/// The model id the settings ask for (what vectors are stored under).
+///
+/// ```
+/// use alice_core::settings::{EmbeddingProvider, EmbeddingSettings};
+/// let mut s = EmbeddingSettings::default();
+/// assert_eq!(alice_embed::expected_model_id(&s), alice_embed::MODEL_ID);
+/// s.provider = EmbeddingProvider::Ollama;
+/// s.model = "nomic-embed-text".into();
+/// assert_eq!(alice_embed::expected_model_id(&s), "ollama:nomic-embed-text");
+/// ```
+pub fn expected_model_id(s: &alice_core::settings::EmbeddingSettings) -> String {
+    use alice_core::settings::EmbeddingProvider as P;
+    match s.provider {
+        P::Local => MODEL_ID.to_string(),
+        P::Openai => format!("openai:{}", s.model),
+        P::Ollama => format!("ollama:{}", s.model),
+        P::Voyage => format!("voyage:{}", s.model),
+    }
+}
+
+/// Builds embedders from `[embedding]` settings; `key` is `embedding_api_key`.
+#[cfg_attr(not(feature = "local"), allow(unused_variables))]
+pub fn factory(models_dir: PathBuf) -> EmbedderFactory {
+    std::sync::Arc::new(move |s, key| {
+        use alice_core::settings::EmbeddingProvider as P;
+        let remote = |p| -> alice_core::Result<std::sync::Arc<dyn alice_core::embed::Embedder>> {
+            Ok(std::sync::Arc::new(http::HttpEmbedder::new(
+                p,
+                &s.model,
+                s.endpoint.as_deref(),
+                key.clone(),
+                s.batch_size,
+            )?))
+        };
+        match s.provider {
+            #[cfg(feature = "local")]
+            P::Local => {
+                let idle = Some(s.idle_unload.0).filter(|d| !d.is_zero());
+                Ok(std::sync::Arc::new(OnnxEmbedder::new(
+                    &models_dir,
+                    OnnxOptions {
+                        idle_unload: idle,
+                        intra_threads: None,
+                    },
+                )?))
+            }
+            #[cfg(not(feature = "local"))]
+            P::Local => Err(alice_core::AliceError::invalid(
+                "this build has no local embedding model; set embedding.provider to openai, ollama or voyage",
+            )),
+            P::Openai => remote(http::HttpProvider::OpenAi),
+            P::Ollama => remote(http::HttpProvider::Ollama),
+            P::Voyage => remote(http::HttpProvider::Voyage),
+        }
+    })
+}
 
 #[cfg(test)]
 mod tests {

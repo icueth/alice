@@ -42,14 +42,21 @@ pub struct PendingItem {
     /// ([`put_if_current`], [`mark_failed_if_current`]), so an edit that lands while the old text
     /// is being embedded is never marked done with the old vector.
     pub stamp: String,
+    /// The id of the project the row belongs to (the cloud policy is asked per project).
+    pub project_id: String,
 }
+
+/// The `embed_state` of a row whose text was not embedded because the active embedder is a
+/// remote one and the cloud policy keeps the row's project at home. Such a row stays
+/// searchable by words; it is queued again (`pending`) when the policy or the provider changes.
+pub const SKIPPED_CLOUD: &str = "skipped_cloud";
 
 // `embed_state <> 'done'` repeats the WHERE term of the partial indexes `memories_embed` and
 // `chunks_embed`; SQLite uses a partial index only when the query contains that term literally.
-const PENDING_MEMORIES_SQL: &str = "SELECT seq, title, body, content_hash FROM memories
+const PENDING_MEMORIES_SQL: &str = "SELECT seq, title, body, content_hash, project_id FROM memories
      WHERE embed_state <> 'done' AND embed_state IN ('pending','retry') AND status <> 'trashed'
      ORDER BY seq LIMIT ?1";
-const PENDING_CHUNKS_SQL: &str = "SELECT seq, text, content_hash FROM chunks
+const PENDING_CHUNKS_SQL: &str = "SELECT seq, text, content_hash, project_id FROM chunks
      WHERE embed_state <> 'done' AND embed_state IN ('pending','retry')
      ORDER BY seq LIMIT ?1";
 const BACKLOG_SQL: &str = "SELECT
@@ -66,6 +73,7 @@ pub fn pending(conn: &Connection, limit: usize) -> Result<Vec<PendingItem>> {
             key: VecKey::Memory(r.get(0)?),
             text: memory_embed_text(&r.get::<_, String>(1)?, &r.get::<_, String>(2)?),
             stamp: r.get(3)?,
+            project_id: r.get(4)?,
         })
     })?;
     for r in rows {
@@ -78,6 +86,7 @@ pub fn pending(conn: &Connection, limit: usize) -> Result<Vec<PendingItem>> {
                 key: VecKey::Chunk(r.get(0)?),
                 text: r.get(1)?,
                 stamp: r.get(2)?,
+                project_id: r.get(3)?,
             })
         })?;
         for r in rows {
@@ -85,6 +94,208 @@ pub fn pending(conn: &Connection, limit: usize) -> Result<Vec<PendingItem>> {
         }
     }
     Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    Memory,
+    Chunk,
+}
+
+/// Rows after `after_seq` with no vector for `model`, in seq order (memories, trashed ones
+/// included: one restored after a model switch must have a vector for the new model; they
+/// are few and purged after `maintenance.trash_days`).
+/// What a model change has still to embed.
+pub fn missing(
+    conn: &Connection,
+    owner: Owner,
+    model: &str,
+    after_seq: i64,
+    limit: usize,
+) -> Result<Vec<PendingItem>> {
+    let sql = match owner {
+        Owner::Memory => {
+            "SELECT m.seq, m.title, m.body, m.content_hash, m.project_id FROM memories m
+             WHERE m.seq > ?1
+               AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.owner_type = 'memory' AND e.owner_seq = m.seq AND e.model = ?2)
+             ORDER BY m.seq LIMIT ?3"
+        }
+        Owner::Chunk => {
+            "SELECT c.seq, c.text, '', c.content_hash, c.project_id FROM chunks c
+             WHERE c.seq > ?1
+               AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.owner_type = 'chunk' AND e.owner_seq = c.seq AND e.model = ?2)
+             ORDER BY c.seq LIMIT ?3"
+        }
+    };
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt.query_map(params![after_seq, model, limit as i64], |r| {
+        let seq: i64 = r.get(0)?;
+        Ok(match owner {
+            Owner::Memory => PendingItem {
+                key: VecKey::Memory(seq),
+                text: memory_embed_text(&r.get::<_, String>(1)?, &r.get::<_, String>(2)?),
+                stamp: r.get(3)?,
+                project_id: r.get(4)?,
+            },
+            Owner::Chunk => PendingItem {
+                key: VecKey::Chunk(seq),
+                text: r.get(1)?,
+                stamp: r.get(3)?,
+                project_id: r.get(4)?,
+            },
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Store `model`'s vector if the row still holds the text stamped `stamp`; `embed_state` (which
+/// belongs to the active model) is not touched. Returns whether it applied.
+pub fn put_model_if_current(
+    conn: &Connection,
+    key: VecKey,
+    stamp: &str,
+    model: &str,
+    v: &[f32],
+) -> Result<bool> {
+    let (sql, seq) = match key {
+        VecKey::Memory(s) => (
+            "SELECT EXISTS(SELECT 1 FROM memories WHERE seq = ?1 AND content_hash = ?2)",
+            s,
+        ),
+        VecKey::Chunk(s) => (
+            "SELECT EXISTS(SELECT 1 FROM chunks WHERE seq = ?1 AND content_hash = ?2)",
+            s,
+        ),
+    };
+    let current: bool = conn.query_row(sql, params![seq, stamp], |r| r.get(0))?;
+    if current {
+        put(conn, key, model, v)?;
+    }
+    Ok(current)
+}
+
+/// Remove `model`'s vector of one row (its text changed, so the vector is stale).
+pub fn delete_vector(conn: &Connection, key: VecKey, model: &str) -> Result<()> {
+    let (t, s) = key.parts();
+    conn.execute(
+        "DELETE FROM embeddings WHERE owner_type = ?1 AND owner_seq = ?2 AND model = ?3",
+        params![t, s, model],
+    )?;
+    Ok(())
+}
+
+/// Delete up to `limit` stored vectors of `model`; returns how many went.
+pub fn delete_model(conn: &Connection, model: &str, limit: usize) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM embeddings WHERE rowid IN (SELECT rowid FROM embeddings WHERE model = ?1 LIMIT ?2)",
+        params![model, limit as i64],
+    )?)
+}
+
+/// Mark the text stamped `stamp` as held back by the cloud policy; returns whether it applied
+/// (a row edited since was put back to `pending` by the edit and is looked at again).
+pub fn mark_skipped_cloud_if_current(conn: &Connection, key: VecKey, stamp: &str) -> Result<bool> {
+    set_state_if_current(conn, key, stamp, SKIPPED_CLOUD)
+}
+
+// The queries on `skipped_cloud` rows repeat `embed_state <> 'done'`, the term of the partial
+// indexes `memories_embed` / `chunks_embed`; without it SQLite scans the whole table (a health
+// reading asks every few seconds).
+fn skipped_projects_sql(table: &str) -> String {
+    format!(
+        "SELECT project_id FROM {table} WHERE embed_state <> 'done' AND embed_state = ?1 GROUP BY project_id"
+    )
+}
+
+fn requeue_sql(table: &str, with_projects: usize) -> String {
+    let mut sql = format!(
+        "UPDATE {table} SET embed_state = 'pending' WHERE seq IN
+           (SELECT seq FROM {table} WHERE embed_state <> 'done' AND embed_state = ?1"
+    );
+    if with_projects > 0 {
+        let marks: Vec<String> = (0..with_projects).map(|i| format!("?{}", i + 3)).collect();
+        sql.push_str(&format!(" AND project_id IN ({})", marks.join(",")));
+    }
+    sql.push_str(" LIMIT ?2)");
+    sql
+}
+
+const SKIPPED_COUNT_SQL: &str = "SELECT
+       (SELECT count(*) FROM memories WHERE embed_state <> 'done' AND embed_state = ?1 AND status <> 'trashed')
+     + (SELECT count(*) FROM chunks WHERE embed_state <> 'done' AND embed_state = ?1)";
+
+/// Ids of the projects that have rows held back by the cloud policy.
+pub fn skipped_projects(conn: &Connection) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for table in ["memories", "chunks"] {
+        let mut stmt = conn.prepare(&skipped_projects_sql(table))?;
+        for id in stmt.query_map([SKIPPED_CLOUD], |r| r.get::<_, String>(0))? {
+            let id = id?;
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Queue up to `limit` rows held back by the cloud policy for embedding again, those of
+/// `projects` only (`None`: every project); returns how many were queued. Run it (in a loop
+/// until 0) when the policy or the provider changed.
+pub fn requeue_skipped_cloud(
+    conn: &Connection,
+    projects: Option<&[String]>,
+    limit: usize,
+) -> Result<usize> {
+    let mut n = 0;
+    for table in ["memories", "chunks"] {
+        let left = limit.saturating_sub(n);
+        if left == 0 {
+            break;
+        }
+        let mut args: Vec<rusqlite::types::Value> =
+            vec![SKIPPED_CLOUD.to_string().into(), (left as i64).into()];
+        let sql = match projects {
+            Some([]) => continue,
+            Some(ids) => {
+                args.extend(ids.iter().map(|i| rusqlite::types::Value::from(i.clone())));
+                requeue_sql(table, ids.len())
+            }
+            None => requeue_sql(table, 0),
+        };
+        n += conn.execute(&sql, rusqlite::params_from_iter(args))?;
+    }
+    Ok(n)
+}
+
+/// Rows held back by the cloud policy (memories, chunks).
+pub fn skipped_cloud_count(conn: &Connection) -> Result<usize> {
+    let n: i64 = conn.query_row(SKIPPED_COUNT_SQL, [SKIPPED_CLOUD], |r| r.get(0))?;
+    Ok(n as usize)
+}
+
+/// What a model change would embed, per project: `(project_id, memories, chunks)`.
+pub fn embeddable_by_project(conn: &Connection) -> Result<Vec<(String, usize, usize)>> {
+    let mut by: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    let mut stmt = conn.prepare("SELECT project_id, count(*) FROM memories GROUP BY project_id")?;
+    for r in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let (p, n) = r?;
+        by.entry(p).or_default().0 = n as usize;
+    }
+    let mut stmt = conn.prepare("SELECT project_id, count(*) FROM chunks GROUP BY project_id")?;
+    for r in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let (p, n) = r?;
+        by.entry(p).or_default().1 = n as usize;
+    }
+    Ok(by.into_iter().map(|(p, (m, c))| (p, m, c)).collect())
+}
+
+/// Rows a model change would send to a remote provider: all memories (trashed ones too) and
+/// all chunks.
+pub fn embeddable_count(conn: &Connection) -> Result<(usize, usize)> {
+    let m: i64 = conn.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))?;
+    let c: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?;
+    Ok((m as usize, c as usize))
 }
 
 pub fn put(conn: &Connection, key: VecKey, model: &str, v: &[f32]) -> Result<()> {
@@ -652,6 +863,214 @@ mod tests {
         assert!(
             b.contains("memories_embed") && b.contains("chunks_embed"),
             "{b}"
+        );
+    }
+    /// Three live memories in the global project; their seqs.
+    fn three_memories(c: &Connection) -> Vec<i64> {
+        let p = projects::upsert_project(c, &ProjectRef::global()).unwrap();
+        let mut seqs = Vec::new();
+        for t in ["one", "two", "three"] {
+            let m = memories::prepare(
+                memories::NewMemoryInput {
+                    content: t.into(),
+                    ..Default::default()
+                },
+                &p,
+                "h".into(),
+            )
+            .unwrap();
+            if let memories::InsertOutcome::New { seq, .. } = memories::insert(c, &m).unwrap() {
+                seqs.push(seq);
+            }
+        }
+        seqs
+    }
+
+    #[test]
+    fn missing_lists_rows_without_a_vector_for_the_model_after_a_cursor() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let seqs = three_memories(&c);
+        put(&c, VecKey::Memory(seqs[1]), "new", &[1.0]).unwrap();
+        let got: Vec<VecKey> = missing(&c, Owner::Memory, "new", 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        assert_eq!(got, vec![VecKey::Memory(seqs[0]), VecKey::Memory(seqs[2])]);
+        assert_eq!(
+            missing(&c, Owner::Memory, "new", seqs[0], 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            missing(&c, Owner::Chunk, "new", 0, 10).unwrap().is_empty(),
+            "no chunks"
+        );
+        let stamp: String = c
+            .query_row(
+                "SELECT content_hash FROM memories WHERE seq = ?1",
+                [seqs[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !put_model_if_current(&c, VecKey::Memory(seqs[0]), "stale", "new", &[0.5]).unwrap()
+        );
+        assert!(put_model_if_current(&c, VecKey::Memory(seqs[0]), &stamp, "new", &[0.5]).unwrap());
+        let state: String = c
+            .query_row(
+                "SELECT embed_state FROM memories WHERE seq = ?1",
+                [seqs[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            state, "pending",
+            "embed_state belongs to the active model and is untouched"
+        );
+        delete_vector(&c, VecKey::Memory(seqs[0]), "new").unwrap();
+        assert_eq!(count(&c, "new").unwrap(), 1);
+        assert_eq!(delete_model(&c, "new", 10).unwrap(), 1);
+        assert_eq!(count(&c, "new").unwrap(), 0);
+    }
+
+    #[test]
+    fn missing_lists_trashed_memories_and_chunks_with_their_project() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let seqs = three_memories(&c);
+        memories::set_status_by_seq(&c, seqs[0], crate::model::Status::Trashed).unwrap();
+        let p = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
+        sources::ingest(
+            &c,
+            &p,
+            &sources::SourceInput {
+                uri: "u".into(),
+                ..Default::default()
+            },
+            &[sources::ChunkInput {
+                ord: 0,
+                text: "a chunk".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let mem = missing(&c, Owner::Memory, "m", 0, 10).unwrap();
+        assert_eq!(
+            mem.len(),
+            3,
+            "a trashed memory may be restored: it is listed"
+        );
+        assert!(mem.iter().all(|i| i.project_id == p.id));
+        let chunks = missing(&c, Owner::Chunk, "m", 0, 10).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            (chunks[0].text.as_str(), chunks[0].project_id.as_str()),
+            ("a chunk", p.id.as_str())
+        );
+        assert_eq!(embeddable_count(&c).unwrap(), (3, 1));
+    }
+
+    #[test]
+    fn rows_held_back_by_the_cloud_policy_leave_the_queue_and_come_back() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let seqs = three_memories(&c);
+        let stamp = |seq: i64| -> String {
+            c.query_row(
+                "SELECT content_hash FROM memories WHERE seq = ?1",
+                [seq],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            mark_skipped_cloud_if_current(&c, VecKey::Memory(seqs[0]), &stamp(seqs[0])).unwrap()
+        );
+        assert!(
+            !mark_skipped_cloud_if_current(&c, VecKey::Memory(seqs[1]), "stale").unwrap(),
+            "an edited row is not marked"
+        );
+        assert_eq!(
+            pending(&c, 10).unwrap().len(),
+            2,
+            "a skipped row is not queued"
+        );
+        assert_eq!(backlog(&c).unwrap(), 2);
+        assert_eq!(skipped_cloud_count(&c).unwrap(), 1);
+        assert_eq!(requeue_skipped_cloud(&c, None, 10).unwrap(), 1);
+        assert_eq!(pending(&c, 10).unwrap().len(), 3);
+        assert_eq!(skipped_cloud_count(&c).unwrap(), 0);
+        assert_eq!(requeue_skipped_cloud(&c, None, 10).unwrap(), 0);
+    }
+
+    #[test]
+    fn held_back_rows_are_requeued_by_project_and_counted_per_project() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let seqs = three_memories(&c);
+        let stamp = |seq: i64| -> String {
+            c.query_row(
+                "SELECT content_hash FROM memories WHERE seq = ?1",
+                [seq],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        for s in &seqs[..2] {
+            assert!(mark_skipped_cloud_if_current(&c, VecKey::Memory(*s), &stamp(*s)).unwrap());
+        }
+        let global = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
+        assert_eq!(skipped_projects(&c).unwrap(), vec![global.id.clone()]);
+        assert_eq!(
+            embeddable_by_project(&c).unwrap(),
+            vec![(global.id.clone(), 3, 0)]
+        );
+        // A limit is honoured; another project's rows are left alone.
+        assert_eq!(
+            requeue_skipped_cloud(&c, Some(&["other".into()]), 10).unwrap(),
+            0
+        );
+        assert_eq!(
+            requeue_skipped_cloud(&c, Some(std::slice::from_ref(&global.id)), 1).unwrap(),
+            1
+        );
+        assert_eq!(skipped_cloud_count(&c).unwrap(), 1);
+        assert_eq!(requeue_skipped_cloud(&c, None, 10).unwrap(), 1);
+        assert!(skipped_projects(&c).unwrap().is_empty());
+    }
+
+    /// The queries on held-back rows must use the partial indexes, or a health reading scans
+    /// the whole table.
+    #[test]
+    fn held_back_row_queries_use_the_partial_embed_indexes() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open_writer(&d.path().join("a.db")).unwrap();
+        let plan = |sql: &str, n: usize| -> String {
+            let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let params: Vec<i64> = vec![1; n];
+            stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ")
+        };
+        for (table, index) in [("memories", "memories_embed"), ("chunks", "chunks_embed")] {
+            let p = plan(&skipped_projects_sql(table), 1);
+            assert!(p.contains(&format!("USING INDEX {index}")), "{p}");
+            for projects in [0, 2] {
+                let p = plan(&requeue_sql(table, projects), 2 + projects);
+                assert!(p.contains(&format!("INDEX {index}")), "{p}");
+            }
+        }
+        let p = plan(SKIPPED_COUNT_SQL, 1);
+        assert!(
+            p.contains("memories_embed") && p.contains("chunks_embed"),
+            "{p}"
         );
     }
 }

@@ -5,8 +5,9 @@
 
 use crate::backup::{self, BackupInfo, BackupKind};
 use crate::config::SettingsHandle;
+use crate::embedding::{self, Builder, EmbeddingCtl};
 use crate::importer::{self, ImportEnv, ImportSlot};
-use crate::judge_http::JudgeHub;
+use crate::judge_http::{DaemonJevPolicy, JudgeHub};
 use crate::judge_worker::{JudgeWorkerConfig, spawn_judge_worker};
 use crate::maintenance::{Activity, Job, JobReport, MaintenanceCtx, Scheduler};
 use crate::paths::AliceHome;
@@ -21,7 +22,7 @@ use alice_core::api::*;
 use alice_core::embed::Embedder;
 use alice_core::error::{AliceError, Result};
 use alice_core::ids::new_id;
-use alice_core::judge::jev::JevTransport;
+use alice_core::judge::jev::{JevPolicy, JevTransport};
 use alice_core::judge::{Judge, JudgeMemory, RELEVANCE_ANSWERS, RELEVANCE_PARTIAL};
 use alice_core::model::{Kind, limits};
 use alice_core::normalize::normalize_topic;
@@ -51,6 +52,25 @@ use std::time::{Duration, Instant};
 /// `None` while the index is being rebuilt; searches then use lexical candidates only.
 pub type IndexSlot = RwLock<Option<Arc<VectorIndex>>>;
 
+/// The embedding model in use: queries, the embedding worker and the judge read it per use;
+/// a model switch replaces all three parts at once.
+pub struct Active {
+    pub embedder: Arc<dyn Embedder>,
+    pub model: String,
+    pub vector_path: PathBuf,
+}
+
+pub type ActiveSlot = RwLock<Arc<Active>>;
+
+/// The model in use and the index that holds its vectors, read together. A model switch holds
+/// both slots' write locks while it replaces them (taken in this order), so the pair is always
+/// one model's embedder with that model's index.
+pub fn snapshot(active: &ActiveSlot, index: &IndexSlot) -> (Arc<Active>, Option<Arc<VectorIndex>>) {
+    let a = active.read();
+    let i = index.read().clone();
+    (a.clone(), i)
+}
+
 /// How long `shutdown` waits for the judge worker to leave a request to the judge.
 const JUDGE_STOP_WAIT: Duration = if cfg!(test) {
     Duration::from_millis(500)
@@ -75,6 +95,46 @@ const PREDICATE_VOCABULARY: usize = 500;
 
 /// Results the judge grades in precise mode (spec §4.4 step 4).
 const PRECISE_TOP: usize = 20;
+
+/// Said in a recall answer when its query was not sent to a remote embedding provider.
+const QUERY_HELD_BACK: &str = "this search used word matches only: the cloud policy keeps this project's text away from the embedding provider, so the query was not sent";
+
+/// What to send a remote embedder for a query asked from `choice`'s project: the query with that
+/// project's secrets redacted, or `None` when the cloud policy keeps the project at home
+/// (every identity of the project is asked; a degraded configuration says no). A project that
+/// was never written to is judged by its working tree's own `.alice.toml`.
+fn query_for_remote(
+    cloud: &DaemonJevPolicy,
+    readers: &ReaderPool,
+    settings: &SettingsHandle,
+    redactors: &Redactors,
+    choice: &ProjectChoice,
+    text: &str,
+) -> Option<String> {
+    let (allowed, redactor) = match choice {
+        ProjectChoice::Slug(s) => (cloud.cloud_allowed(s), cloud.redactor(s)),
+        ProjectChoice::Fallback => (cloud.cloud_allowed("global"), cloud.redactor("global")),
+        ProjectChoice::Detected(r) => {
+            let stored = readers
+                .with(|c| projects::find_by_key(c, &r.key))
+                .ok()
+                .flatten();
+            match stored {
+                Some(p) => (cloud.cloud_allowed(&p.slug), cloud.redactor(&p.slug)),
+                None => {
+                    let root = r.root.as_deref();
+                    let ok = !r.slug.trim().is_empty()
+                        && [r.slug.as_str(), r.name.as_str()]
+                            .into_iter()
+                            .filter(|n| !n.trim().is_empty())
+                            .all(|n| settings.cloud_allowed(n, root));
+                    (ok, redactors.for_root_always_on(root))
+                }
+            }
+        }
+    };
+    allowed.then(|| redactor.apply(text).text)
+}
 
 /// What the judge decided for a predicate that is new to the vocabulary.
 #[derive(Default)]
@@ -137,6 +197,12 @@ pub struct ServiceOptions {
     pub mempalace_home: Option<PathBuf>,
     /// Tests only: pause or panic an import job.
     pub import_hook: Option<Arc<importer::ImportHook>>,
+    /// Builds embedders from `[embedding]` settings. The daemon passes one; with it the model
+    /// follows the settings (a change starts a re-embed). `None` (tests, `alice bench`, the
+    /// fake embedder): the embedder `start` is given is the only one and nothing switches.
+    pub embedder_factory: Option<alice_embed::EmbedderFactory>,
+    /// The wait before a failed batch of a re-embed is tried again (it doubles each time).
+    pub reembed_retry_wait: Duration,
 }
 
 impl Default for ServiceOptions {
@@ -162,6 +228,8 @@ impl Default for ServiceOptions {
             judge_applies: true,
             mempalace_home: None,
             import_hook: None,
+            embedder_factory: None,
+            reembed_retry_wait: Duration::from_secs(2),
         }
     }
 }
@@ -319,6 +387,8 @@ impl ProjectResolver {
 struct Threads {
     maintenance: JoinHandle<()>,
     embed: JoinHandle<()>,
+    /// Compares `[embedding]` with the model in force and runs the re-embed.
+    embedding: JoinHandle<()>,
     judge: JoinHandle<()>,
     writer: JoinHandle<()>,
     watcher: JoinHandle<()>,
@@ -331,8 +401,12 @@ pub struct Service {
     vector_readers: Arc<ReaderPool>,
     writer: WriterHandle,
     index: Arc<IndexSlot>,
-    /// Shared by the embedding worker and query embedding.
-    embedder: Arc<dyn Embedder>,
+    /// The embedding model in force, shared by the embedding worker, queries and the judge.
+    active: Arc<ActiveSlot>,
+    /// Changes of the embedding model (re-embed) and the cloud gate of its texts.
+    embedding: Arc<EmbeddingCtl>,
+    /// The cloud policy: asked per project before text goes to a remote embedder.
+    cloud: Arc<DaemonJevPolicy>,
     opts: ServiceOptions,
     instance: String,
     stop: Arc<AtomicBool>,
@@ -430,6 +504,7 @@ fn unexpected(o: WriteOutcome) -> AliceError {
 /// still disagree afterwards: then the whole index is rebuilt.
 pub(crate) fn spawn_rebuild(
     slot: Arc<IndexSlot>,
+    active: Arc<ActiveSlot>,
     db: std::path::PathBuf,
     model: String,
     dim: usize,
@@ -472,15 +547,39 @@ pub(crate) fn spawn_rebuild(
                         secs = started.elapsed().as_secs_f32(),
                         "vector index rebuilt"
                     );
-                    *slot.write() = Some(Arc::new(idx));
+                    install_rebuilt(&slot, &active, &model, Some(Arc::new(idx)));
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "vector index rebuild failed; starting with an empty index");
-                    *slot.write() = VectorIndex::for_model(&model, dim).ok().map(Arc::new);
+                    install_rebuilt(
+                        &slot,
+                        &active,
+                        &model,
+                        VectorIndex::for_model(&model, dim).ok().map(Arc::new),
+                    );
                 }
             }
         })?;
     Ok(())
+}
+
+/// Puts a rebuilt index in the slot, unless the model changed while it was being built (a
+/// model switch put the new model's index there; this one is the old model's).
+fn install_rebuilt(
+    slot: &IndexSlot,
+    active: &ActiveSlot,
+    model: &str,
+    idx: Option<Arc<VectorIndex>>,
+) {
+    let a = active.read();
+    if a.model == model {
+        *slot.write() = idx;
+    } else {
+        tracing::info!(
+            model,
+            "dropped a rebuilt index of a model that is no longer in use"
+        );
+    }
 }
 
 /// Records every settings change that takes effect: a `settings.change` event naming the keys
@@ -489,12 +588,14 @@ fn spawn_config_events(
     settings: &Arc<SettingsHandle>,
     writer: &WriterHandle,
     judge: &Arc<JudgeHub>,
+    embedding: &Arc<EmbeddingCtl>,
 ) -> Result<()> {
     let rx = settings.subscribe();
     let start = settings.get();
     // Weak: the loop must not keep the handle (and so the channel) alive after shutdown.
     let weak = Arc::downgrade(settings);
     let weak_judge = Arc::downgrade(judge);
+    let weak_embedding = Arc::downgrade(embedding);
     let writer = writer.clone();
     std::thread::Builder::new()
         .name("alice-config-events".into())
@@ -523,17 +624,20 @@ fn spawn_config_events(
                     if let Some(judge) = weak_judge.upgrade() {
                         judge.on_change(&changed);
                     }
+                    // A new embedding model starts a re-embed; a new privacy rule or provider
+                    // may free (or hold back) rows the cloud policy had decided about.
+                    if let Some(embedding) = weak_embedding.upgrade()
+                        && changed
+                            .iter()
+                            .any(|k| k.starts_with("embedding.") || k.starts_with("privacy."))
+                    {
+                        embedding.recheck_skipped.store(true, Ordering::SeqCst);
+                        embedding.poke();
+                    }
                 },
             )
         })?;
     Ok(())
-}
-
-/// What to tell about a key that is saved but read by nothing yet.
-fn not_used_yet_note(key: &str) -> String {
-    format!(
-        "{key} is saved but not used yet: other embedding providers are not wired in, so the local model is always used and a restart changes nothing"
-    )
 }
 
 type SecretStatuses = BTreeMap<String, SecretStatus>;
@@ -590,11 +694,40 @@ impl Service {
         ));
         // One instance for the worker and for queries: the local model costs ~600 MB each. It
         // embeds passages in short batches and lets a waiting query go next after each one.
-        let embedder = make_embedder()?;
+        // With a factory the model in force is the one the database records (the settings may
+        // ask for another: the control thread starts a re-embed below); without one it is
+        // whatever `make_embedder` makes and nothing switches.
+        let builder = opts.embedder_factory.clone().map(|factory| Builder {
+            factory,
+            secrets: secrets.clone(),
+            env: secret_env.clone(),
+        });
+        let (embedder, embedding_error) = match &builder {
+            Some(b) => {
+                let plan = embedding::plan(b, &conn, &started_with.embedding)?;
+                if let Some(rec) = &plan.record {
+                    conn.execute(
+                        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        rusqlite::params![
+                            crate::reembed::ACTIVE_KEY,
+                            serde_json::to_string(rec).expect("settings serialise")
+                        ],
+                    )?;
+                }
+                (plan.active, plan.error)
+            }
+            None => (make_embedder()?, None),
+        };
         let model = embedder.model_id().to_string();
         let dim = embedder.dim();
         let index: Arc<IndexSlot> = Arc::new(RwLock::new(None));
         let vector_path = home.vector_file(&model);
+        let active: Arc<ActiveSlot> = Arc::new(RwLock::new(Arc::new(Active {
+            embedder: embedder.clone(),
+            model: model.clone(),
+            vector_path: vector_path.clone(),
+        })));
 
         let expected = embeddings::count(&conn, &model)?;
         // A clean stop marks the files it saved last. Without the mark (a crash, say while
@@ -604,7 +737,14 @@ impl Service {
         match VectorIndex::open(&vector_path, &model, dim) {
             Ok(idx) if !clean => {
                 tracing::info!("the last stop was not clean; rebuilding the chunk vectors");
-                spawn_rebuild(index.clone(), home.db(), model.clone(), dim, Some(idx))?;
+                spawn_rebuild(
+                    index.clone(),
+                    active.clone(),
+                    home.db(),
+                    model.clone(),
+                    dim,
+                    Some(idx),
+                )?;
             }
             Ok(idx) if idx.len() == expected => *index.write() = Some(Arc::new(idx)),
             Ok(idx) => {
@@ -613,11 +753,25 @@ impl Service {
                     stored = expected,
                     "vector index is out of date; rebuilding"
                 );
-                spawn_rebuild(index.clone(), home.db(), model.clone(), dim, None)?;
+                spawn_rebuild(
+                    index.clone(),
+                    active.clone(),
+                    home.db(),
+                    model.clone(),
+                    dim,
+                    None,
+                )?;
             }
             Err(e) => {
                 tracing::info!(error = %e, "no usable vector index; rebuilding");
-                spawn_rebuild(index.clone(), home.db(), model.clone(), dim, None)?;
+                spawn_rebuild(
+                    index.clone(),
+                    active.clone(),
+                    home.db(),
+                    model.clone(),
+                    dim,
+                    None,
+                )?;
             }
         }
 
@@ -629,18 +783,36 @@ impl Service {
         let stop = Arc::new(AtomicBool::new(false));
         // bounded(1): the embedding worker wakes the judge worker after each batch it stores.
         let (judge_wake_tx, judge_wake_rx) = crossbeam_channel::bounded(1);
+        // The one cloud policy: the Jev judge, the embedding worker, a re-embed and the query
+        // embedding of a recall all ask `SettingsHandle::cloud_allowed` through it.
+        let cloud = Arc::new(DaemonJevPolicy::new(
+            settings.clone(),
+            readers.clone(),
+            redactors.clone(),
+        ));
+        let policy: Arc<dyn JevPolicy> = cloud.clone();
+        let embedding_error: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(embedding_error));
+        let (main_paused, parked, recheck_skipped) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
         let worker_thread = spawn_worker(WorkerConfig {
             readers: readers.clone(),
             writer: writer.clone(),
             index: index.clone(),
-            embedder: embedder.clone(),
+            active: active.clone(),
             wake: wake_rx,
             stop: stop.clone(),
-            vector_path,
             // `embedding.batch_size` (a restart key: the worker is built once).
             batch: started_with.embedding.batch_size,
             judge_wake: Some(judge_wake_tx.clone()),
             save_every: SAVE_EVERY,
+            paused: main_paused.clone(),
+            parked: parked.clone(),
+            policy: Some(policy.clone()),
+            recheck_skipped: recheck_skipped.clone(),
+            error: embedding_error.clone(),
         });
         let judge = JudgeHub::new(
             settings.clone(),
@@ -652,7 +824,8 @@ impl Service {
             opts.jev_transport.clone(),
             opts.secrets_timeout,
         );
-        let judge_model = model.clone();
+        let judge_active = active.clone();
+        let judge_index = index.clone();
         let judge_thread = spawn_judge_worker(JudgeWorkerConfig {
             readers: readers.clone(),
             writer: writer.clone(),
@@ -660,7 +833,10 @@ impl Service {
             judge: judge.clone(),
             settings: settings.clone(),
             redactors: redactors.clone(),
-            model: Arc::new(move || judge_model.clone()),
+            model: Arc::new(move || {
+                let (a, i) = snapshot(&judge_active, &judge_index);
+                (a.model.clone(), i)
+            }),
             wake: judge_wake_rx,
             stop: stop.clone(),
             retry_every: opts.judge_retry_every,
@@ -668,26 +844,46 @@ impl Service {
             applies: opts.judge_applies,
         });
         let activity = Activity::new();
-        let maintenance_model = model.clone();
         let scheduler = Arc::new(Scheduler::new(MaintenanceCtx {
             home: home.clone(),
             readers: readers.clone(),
             writer: writer.clone(),
             index: index.clone(),
+            active: active.clone(),
             settings: settings.clone(),
             activity: activity.clone(),
-            model: Arc::new(move || maintenance_model.clone()),
-            dim,
             judge_wake: judge_wake_tx.clone(),
             stop: stop.clone(),
             free_space: Arc::new(|p: &Path| backup::free_space(p)),
         }));
         let maintenance_thread = scheduler.clone().spawn(stop.clone());
-        if let Err(e) = spawn_config_events(&settings, &writer, &judge) {
+        let (embedding_ctl, embedding_rx) = EmbeddingCtl::new(
+            builder,
+            home.clone(),
+            active.clone(),
+            index.clone(),
+            readers.clone(),
+            writer.clone(),
+            settings.clone(),
+            policy,
+            activity.clone(),
+            main_paused,
+            parked,
+            recheck_skipped,
+            embedding_error,
+            stop.clone(),
+            opts.reembed_retry_wait,
+        );
+        let embedding_thread = embedding_ctl.spawn(embedding_rx)?;
+        // A model change made while the daemon was stopped (or a re-embed it was in the middle
+        // of) is carried out now.
+        embedding_ctl.poke();
+        if let Err(e) = spawn_config_events(&settings, &writer, &judge, &embedding_ctl) {
             // The workers and the writer are running already: stop them, do not leak them.
             stop.store(true, Ordering::SeqCst);
             let _ = wake_tx.try_send(());
             let _ = judge_wake_tx.try_send(());
+            embedding_ctl.stop_run();
             writer.send_nowait(WriteOp::Shutdown);
             return Err(e);
         }
@@ -699,7 +895,9 @@ impl Service {
             vector_readers,
             writer,
             index,
-            embedder,
+            active,
+            embedding: embedding_ctl,
+            cloud,
             opts,
             instance: new_id(),
             stop,
@@ -708,6 +906,7 @@ impl Service {
             threads: Mutex::new(Some(Threads {
                 maintenance: maintenance_thread,
                 embed: worker_thread,
+                embedding: embedding_thread,
                 judge: judge_thread,
                 writer: writer_thread,
                 watcher,
@@ -740,9 +939,25 @@ impl Service {
         &self.home
     }
 
+    /// The embedder in force (it changes when the model does: read it per use).
+    pub fn embedder(&self) -> Arc<dyn Embedder> {
+        self.active.read().embedder.clone()
+    }
+
+    /// The id of the embedding model in force.
+    pub fn model(&self) -> String {
+        self.active.read().model.clone()
+    }
+
     /// Why writes are refused (`None` = writable). No database access, so it is cheap to poll.
     pub fn read_only(&self) -> Option<String> {
         self.writer.read_only.reason()
+    }
+
+    /// Tests: a handle to the writer, for ops the service has no method for.
+    #[cfg(test)]
+    pub(crate) fn writer_for_tests(&self) -> WriterHandle {
+        self.writer.clone()
     }
 
     /// Tests: refuse writes as a damaged database would.
@@ -760,6 +975,7 @@ impl Service {
         let Some(Threads {
             maintenance,
             embed: worker,
+            embedding,
             judge,
             writer,
             watcher,
@@ -789,6 +1005,17 @@ impl Service {
                 tracing::error!("the import thread panicked");
             }
         }
+        // No new re-embed after this; the one running stops at its next batch and saves its
+        // progress (the next start resumes it). Before the writer stops: it writes through it.
+        self.embedding.poke();
+        let waited = Instant::now();
+        while !embedding.is_finished() && waited.elapsed() < JUDGE_STOP_WAIT {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if embedding.is_finished() && embedding.join().is_err() {
+            tracing::error!("the embedding control thread panicked");
+        }
+        self.embedding.stop_run();
         // An integrity check in progress is interrupted; a backup stops at its next step.
         self.scheduler.interrupt_running();
         // A job ends at its next slice. One inside a long single step (a backup, a check of the
@@ -826,10 +1053,11 @@ impl Service {
             tracing::error!("the writer panicked");
         }
         // No index yet (still rebuilding): nothing is marked, so the next start rebuilds too.
-        let Some(idx) = self.index.read().clone() else {
+        let (active, idx) = snapshot(&self.active, &self.index);
+        let Some(idx) = idx.filter(|_| active.model != embedding::PLACEHOLDER_MODEL) else {
             return;
         };
-        let path = self.home.vector_file(self.embedder.model_id());
+        let path = active.vector_path.clone();
         // Saved even when nothing changed since start: an index that never came from these
         // files (an empty one after a failed rebuild, say) must replace them before the mark
         // vouches for them. Each part skips the write when its file already holds it.
@@ -1052,7 +1280,8 @@ impl Service {
         let cfg = self.settings();
         let max_tokens = req.max_tokens.unwrap_or(cfg.search.default_max_tokens);
         let format = req.format;
-        let index = self.index.read().clone();
+        // The model in force and its index, as one pair (a model switch replaces both at once).
+        let (active, index) = snapshot(&self.active, &self.index);
         // Embedded before a reader connection is taken: the model is shared with the
         // embedding worker, and a recall waiting for it must not hold a connection.
         let text = search::query_text(&req.query)?;
@@ -1064,22 +1293,51 @@ impl Service {
         } else {
             limit
         };
-        let vector = match &index {
-            Some(idx) => {
-                let (idx, embedder) = (idx.clone(), self.embedder.clone());
-                tokio::task::spawn_blocking(move || {
-                    search::embed_query(Some(&idx), embedder.as_ref(), &text)
-                })
-                .await
-                .map_err(join_err)?
-            }
-            None => None,
-        };
-        // Resolved before a reader connection is taken too: it may run git.
+        // Resolved before a reader connection is taken: it may run git. (And before the query is
+        // embedded: a remote embedder gets the query only if the project may use it.)
         let explicit = explicit_slug(req.project.as_deref()).is_some();
         let choice = self
             .choose(req.project.as_deref(), req.cwd.as_deref())
             .await?;
+        let mut notes: Vec<String> = Vec::new();
+        let vector = match &index {
+            Some(idx) if idx.model() == active.model => {
+                let embedder = active.embedder.clone();
+                // A remote embedder: the cloud policy decides for the recall's project, and the
+                // query is redacted with that project's rules before it leaves.
+                let send = if embedder.is_remote() {
+                    let (cloud, readers, settings, redactors) = (
+                        self.cloud.clone(),
+                        self.readers.clone(),
+                        self.settings.clone(),
+                        self.redactors.clone(),
+                    );
+                    let (choice, text) = (choice.clone(), text.clone());
+                    tokio::task::spawn_blocking(move || {
+                        query_for_remote(&cloud, &readers, &settings, &redactors, &choice, &text)
+                    })
+                    .await
+                    .map_err(join_err)?
+                } else {
+                    Some(text.clone())
+                };
+                match send {
+                    Some(q) => {
+                        let idx = idx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            search::embed_query(Some(&idx), embedder.as_ref(), &q)
+                        })
+                        .await
+                        .map_err(join_err)?
+                    }
+                    None => {
+                        notes.push(QUERY_HELD_BACK.into());
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         // The raw tier's chunk vector list reads on this pool, beside the main reader's word
         // lists: one connection of each, main first (`ServiceOptions::vector_reader_pool`).
         let vector_readers = self.vector_readers.clone();
@@ -1131,12 +1389,17 @@ impl Service {
                 let (text, omitted) = pack::pack_text(&out, Some(&slug), max_tokens);
                 let shown = &out.hits[..out.hits.len() - omitted];
                 let touched = returned_memories(out.memory_seqs.clone(), shown);
+                let mut text = text;
+                for n in &notes {
+                    text.push_str(&format!("\n({n})\n"));
+                }
                 let response = RecallResponse {
                     project: Some(slug),
                     omitted,
                     raw_fallback: out.raw_fallback,
                     reranked,
                     text: Some(text),
+                    notes: notes.clone(),
                     ..Default::default()
                 };
                 (response, touched)
@@ -1145,6 +1408,7 @@ impl Service {
                 let seqs = std::mem::take(&mut out.memory_seqs);
                 let mut response = pack::pack_json(out, Some(slug), max_tokens);
                 response.reranked = reranked;
+                response.notes = notes.clone();
                 let touched = returned_memories(seqs, &response.results);
                 (response, touched)
             }
@@ -1895,12 +2159,6 @@ impl Service {
                 "secrets.backend is {now} but this daemon started with {was}; the change applies after `alice daemon stop` and the next start, and the secrets are not copied: under {now} they show as not set until you set them again with `alice config set-secret <name>`"
             ));
         }
-        for k in restart_pending
-            .iter()
-            .filter(|k| settings::NOT_USED_YET_KEYS.contains(&k.as_str()))
-        {
-            notes.push(not_used_yet_note(k));
-        }
         for entry in self.unmatched_cloud_denied() {
             notes.push(format!(
                 "privacy.cloud_denied_projects lists \"{entry}\", which matches no project (by slug, alias or name); it is kept and denies any project later called that, but check it for a typo"
@@ -2007,12 +2265,13 @@ impl Service {
                 settings::LOOSEN_POLLS
             ));
         }
-        for k in out
-            .changed
-            .iter()
-            .filter(|k| settings::NOT_USED_YET_KEYS.contains(&k.as_str()))
-        {
-            notes.push(not_used_yet_note(k));
+        if out.changed.iter().any(|k| {
+            matches!(
+                k.as_str(),
+                "embedding.provider" | "embedding.model" | "embedding.endpoint"
+            )
+        }) {
+            notes.extend(self.reembed_note());
         }
         PatchResponse {
             changed: out.changed,
@@ -2021,6 +2280,46 @@ impl Service {
             notes,
             view,
         }
+    }
+
+    /// What a change of the embedding model will do: that everything is embedded again in the
+    /// background while the current model serves, and, for a remote provider, how many texts
+    /// will leave the machine (and how many the cloud policy keeps at home).
+    fn reembed_note(&self) -> Option<String> {
+        self.opts.embedder_factory.as_ref()?;
+        let want = self.settings.get().embedding.clone();
+        let want_id = alice_embed::expected_model_id(&want);
+        let current = self.model();
+        if want_id == current {
+            return None;
+        }
+        let Some((_, host)) = want.remote_destination() else {
+            return Some(format!(
+                "the embedding model changes to {want_id}: every memory and chunk is embedded again in the background, on this machine; {current} answers searches until the new index is complete, then the switch is atomic"
+            ));
+        };
+        let by_project = self.readers.with(embeddings::embeddable_by_project).ok()?;
+        let policy: Arc<dyn JevPolicy> = self.cloud.clone();
+        let mut cache = HashMap::new();
+        let (mut sent, mut kept) = ((0usize, 0usize), (0usize, 0usize));
+        for (project, memories, chunks) in by_project {
+            let slot = if crate::worker::project_allowed(
+                &self.readers,
+                Some(&policy),
+                &project,
+                &mut cache,
+            ) {
+                &mut sent
+            } else {
+                &mut kept
+            };
+            slot.0 += memories;
+            slot.1 += chunks;
+        }
+        Some(format!(
+            "the embedding model changes to {want_id}: about {} memories and {} chunks will be sent to {host} to be embedded again, in the background. The switch is gated by the cloud policy project by project: {} memories and {} chunks of projects it keeps at home (privacy.cloud_denied_projects, a project's cloud_denied) are not sent and stay searchable by words only. {current} answers searches until the new index is complete, then the switch is atomic",
+            sent.0, sent.1, kept.0, kept.1
+        ))
     }
 
     /// `patch_settings` for a request handler: the file work and the secrets' status stay off
@@ -2058,6 +2357,12 @@ impl Service {
         if name == SecretName::JevApiKey {
             self.judge.rebuild_now();
         }
+        if name == SecretName::EmbeddingApiKey {
+            // The embedder is built again with the new key (on its own thread: it may call the
+            // provider).
+            self.embedding.rebuild.store(true, Ordering::SeqCst);
+            self.embedding.poke();
+        }
         Ok(secrets::status_with(
             self.secrets.as_ref(),
             name,
@@ -2079,6 +2384,10 @@ impl Service {
             });
             if name == SecretName::JevApiKey {
                 self.judge.rebuild_now();
+            }
+            if name == SecretName::EmbeddingApiKey {
+                self.embedding.rebuild.store(true, Ordering::SeqCst);
+                self.embedding.poke();
             }
         }
         Ok(had)
@@ -2144,13 +2453,21 @@ impl Service {
         self.secrets_call(move || me.delete_secret(name)).await
     }
 
-    /// Connection test for a provider (`judge`, `embedding`; Task 16 adds HTTP embeddings).
+    /// Connection test for a provider (`judge`, `embedding`: the embedder in force).
     pub async fn test_provider(&self, which: &str) -> Result<ProviderTest> {
         let started = Instant::now();
         let took = || started.elapsed().as_millis() as u64;
         match which {
             "embedding" => {
-                let e = self.embedder.clone();
+                let e = self.embedder();
+                let id = e.model_id().to_string();
+                if e.is_remote() && self.settings.config_degraded() {
+                    return Ok(ProviderTest {
+                        ok: false,
+                        message: "config.toml has not loaded as a valid file since the daemon started, so no text is sent to a cloud provider; fix it first (alice config list)".into(),
+                        latency_ms: took(),
+                    });
+                }
                 let r = tokio::task::spawn_blocking(move || {
                     e.embed_passages(&["connection test".to_string()])
                 })
@@ -2159,11 +2476,7 @@ impl Service {
                 Ok(match r {
                     Ok(v) if v.len() == 1 => ProviderTest {
                         ok: true,
-                        message: format!(
-                            "{} answered with {} dimensions",
-                            self.embedder.model_id(),
-                            v[0].len()
-                        ),
+                        message: format!("{id} answered with {} dimensions", v[0].len()),
                         latency_ms: took(),
                     },
                     Ok(_) => ProviderTest {
@@ -2466,7 +2779,13 @@ impl Service {
         let config_degraded = self.settings.config_degraded();
         let instance = self.instance.clone();
         let read_only = self.writer.read_only.reason();
-        let index_ready = self.index.read().is_some();
+        // The model first, then the progress of a re-embed: the progress is hidden before the
+        // model changes, so an answer never shows a finished re-embed beside the old model.
+        let (active, index) = snapshot(&self.active, &self.index);
+        let index_ready = index.is_some();
+        let embedding_model = active.model.clone();
+        let reembed = self.embedding.status();
+        let embedding_error = self.embedding.problem();
         let judge_provider = self.judge().provider().to_string();
         let judge_warning = self.judge_warning();
         // Reads the backup directory and the database: off the runtime's threads.
@@ -2491,6 +2810,10 @@ impl Service {
                 judge_backlog: alice_core::store::judge::judge_backlog(c)?,
                 judge_provider,
                 judge_warning,
+                embedding_model,
+                reembed,
+                embedding_error,
+                embed_skipped_cloud: embeddings::skipped_cloud_count(c)? as u64,
                 maintenance_warning,
                 read_only,
                 index_ready,
@@ -2510,6 +2833,7 @@ impl Drop for Service {
             self.stop.store(true, Ordering::SeqCst);
             let _ = self.wake_worker.try_send(());
             let _ = self.wake_judge.try_send(());
+            self.embedding.signal_stop();
             self.writer.send_nowait(WriteOp::Shutdown);
         }
     }
@@ -4914,10 +5238,10 @@ mod tests {
         assert!(out.notes.is_empty(), "{:?}", out.notes);
     }
 
-    /// Until Task 16 nothing reads the embedding provider, model or endpoint: say so instead
-    /// of promising an effect after a restart.
+    /// The embedding provider, model and endpoint are read (a change starts a re-embed): they
+    /// are not marked unused and a change needs no restart. The batch size still does.
     #[tokio::test(flavor = "multi_thread")]
-    async fn embedding_keys_that_nothing_reads_yet_say_so() {
+    async fn embedding_keys_are_used_and_apply_without_a_restart() {
         let (_d, s) = svc().await;
         let view = s.settings_view();
         for k in [
@@ -4926,14 +5250,16 @@ mod tests {
             "embedding.endpoint",
         ] {
             assert!(
-                view.keys.iter().any(|i| i.key == k && i.not_used_yet),
+                view.keys
+                    .iter()
+                    .any(|i| i.key == k && !i.not_used_yet && !i.restart),
                 "{k}"
             );
         }
         assert!(
             view.keys
                 .iter()
-                .any(|i| i.key == "embedding.batch_size" && !i.not_used_yet)
+                .any(|i| i.key == "embedding.batch_size" && i.restart)
         );
         let out = s
             .patch_settings_async(patch_one(
@@ -4942,17 +5268,21 @@ mod tests {
             ))
             .await
             .unwrap();
-        let note = out
-            .notes
-            .iter()
-            .find(|n| n.contains("embedding.endpoint"))
-            .unwrap_or_else(|| panic!("{:?}", out.notes));
-        assert!(note.contains("not used yet"), "{note}");
+        assert!(
+            out.restart_required.is_empty(),
+            "{:?}",
+            out.restart_required
+        );
+        assert!(
+            out.notes.iter().all(|n| !n.contains("not used yet")),
+            "{:?}",
+            out.notes
+        );
         let out = s
             .patch_settings_async(patch_one("embedding.batch_size", serde_json::json!(16)))
             .await
             .unwrap();
-        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        assert_eq!(out.restart_required, vec!["embedding.batch_size"]);
     }
 
     /// A stand-in for the Jev API: always answers yes, counts the requests, and checks the key.

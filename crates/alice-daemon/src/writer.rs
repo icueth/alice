@@ -172,6 +172,36 @@ pub enum WriteOp {
         keys: Vec<(VecKey, String)>,
         retry: bool,
     },
+    /// `(key, stamp)` pairs that were not sent to a remote embedder because the cloud policy
+    /// keeps their project at home: `embed_state` becomes `skipped_cloud` (searchable by words,
+    /// not retried until the policy or the provider changes). Memories that no judge waits for
+    /// are activated, as for a given-up embedding.
+    EmbedSkipped {
+        keys: Vec<(VecKey, String)>,
+    },
+    /// Queue up to `limit` rows in state `skipped_cloud` for embedding again, those of
+    /// `projects` only (`None`: all); answers `Count` (call until 0). The embedding worker is
+    /// woken.
+    RequeueSkippedCloud {
+        projects: Option<Vec<String>>,
+        limit: usize,
+    },
+    /// The model a re-embed is filling, or `None` when none is. While one is, an edited row's
+    /// vector for that model is dropped when the active model re-embeds the row (the re-embed's
+    /// final pass embeds the new text).
+    SetReembedTarget(Option<String>),
+    /// `(key, stamp, vector)` of the re-embed's target `model`: stored only if the row still holds
+    /// the text stamped `stamp`; `embed_state` (the active model's) is not touched. Answers
+    /// `Embedded` with the items that were stored.
+    StoreModelVectors {
+        model: String,
+        items: Vec<(VecKey, String, Vec<f32>)>,
+    },
+    /// Delete up to `limit` stored vectors of `model` (after a model switch); answers `Count`.
+    DeleteModelVectors {
+        model: String,
+        limit: usize,
+    },
     /// A judgement for one memory: its actions, review items, kind and project, applied in one
     /// group, after which the memory is active. Ignored if the memory's text changed since it
     /// was judged, or if it is not waiting for the judge.
@@ -408,6 +438,8 @@ pub(crate) struct State {
     matcher: Option<EntityMatcher>,
     /// A job in this batch added or changed text that needs embedding.
     inserted: bool,
+    /// The model a re-embed is filling (see `WriteOp::SetReembedTarget`).
+    reembed_target: Option<String>,
     /// Raw chunks this batch may still write.
     chunk_budget: usize,
     /// Bytes of chunk text this batch may still write.
@@ -1370,9 +1402,45 @@ fn apply(
                 if let VecKey::Memory(seq) = key {
                     activate_if_unjudged(conn, seq, st)?;
                 }
+                // The text changed since the re-embed's target model embedded it (this row was
+                // queued again): that vector is stale, and the re-embed's final pass makes a
+                // new one.
+                if let Some(t) = st.reembed_target.as_deref().filter(|t| *t != model) {
+                    embeddings::delete_vector(conn, key, t)?;
+                }
                 applied.push((key, v));
             }
             WriteOutcome::Embedded(applied)
+        }
+        WriteOp::EmbedSkipped { keys } => {
+            for (key, stamp) in keys {
+                let marked = embeddings::mark_skipped_cloud_if_current(conn, key, &stamp)?;
+                if let (VecKey::Memory(seq), true) = (key, marked) {
+                    activate_if_unjudged(conn, seq, st)?;
+                }
+            }
+            WriteOutcome::Done
+        }
+        WriteOp::RequeueSkippedCloud { projects, limit } => {
+            let n = embeddings::requeue_skipped_cloud(conn, projects.as_deref(), limit)?;
+            st.inserted |= n > 0;
+            WriteOutcome::Count(n)
+        }
+        WriteOp::SetReembedTarget(t) => {
+            st.reembed_target = t;
+            WriteOutcome::Done
+        }
+        WriteOp::StoreModelVectors { model, items } => {
+            let mut applied = Vec::with_capacity(items.len());
+            for (key, stamp, v) in items {
+                if embeddings::put_model_if_current(conn, key, &stamp, &model, &v)? {
+                    applied.push((key, v));
+                }
+            }
+            WriteOutcome::Embedded(applied)
+        }
+        WriteOp::DeleteModelVectors { model, limit } => {
+            WriteOutcome::Count(embeddings::delete_model(conn, &model, limit)?)
         }
         WriteOp::EmbedFailed { keys, retry } => {
             for (key, stamp) in keys {
@@ -1995,6 +2063,7 @@ fn spawn_writer_inner(
                 hlc,
                 matcher: None,
                 inserted: false,
+                reembed_target: None,
                 chunk_budget: INGEST_SLICE,
                 byte_budget: INGEST_SLICE_BYTES,
                 stream: Vec::new(),
@@ -2471,6 +2540,120 @@ mod tests {
     fn pending_items(f: &Fixture) -> Vec<embeddings::PendingItem> {
         let c = alice_core::store::open_reader(&f.db()).unwrap();
         embeddings::pending(&c, 10).unwrap()
+    }
+
+    fn model_count(f: &Fixture, model: &str) -> i64 {
+        f.read("SELECT count(*) FROM embeddings WHERE model = ?1", [model])
+    }
+
+    /// A re-embed's vectors are stored for its own model: only for the text they were made from,
+    /// without touching the active model's `embed_state`; an edit re-embedded by the active
+    /// model drops the target's now-stale vector while a re-embed is on.
+    #[test]
+    fn a_re_embeds_vectors_go_to_its_model_and_an_edit_drops_the_stale_one() {
+        let f = fixture();
+        let (id, seq) = new_id(f.h.submit_blocking(remember("port is 8080")).unwrap());
+        let old = pending_items(&f).remove(0);
+        // Embedded by the active model first.
+        f.h.submit_blocking(WriteOp::StoreEmbeddings {
+            model: "old".into(),
+            items: vec![(old.key, old.stamp.clone(), vec![1.0, 0.0])],
+        })
+        .unwrap();
+        f.h.submit_blocking(WriteOp::SetReembedTarget(Some("new".into())))
+            .unwrap();
+        let WriteOutcome::Embedded(applied) =
+            f.h.submit_blocking(WriteOp::StoreModelVectors {
+                model: "new".into(),
+                items: vec![
+                    (old.key, "stale-stamp".into(), vec![0.0, 1.0]),
+                    (old.key, old.stamp.clone(), vec![0.0, 1.0]),
+                ],
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(applied.len(), 1, "the stale stamp is refused");
+        assert_eq!((model_count(&f, "new"), model_count(&f, "old")), (1, 1));
+        let state: String = f.read("SELECT embed_state FROM memories WHERE seq = ?1", [seq]);
+        assert_eq!(
+            state, "done",
+            "embed_state is the active model's and is not touched"
+        );
+        // The memory is edited and the active model embeds the new text: the target's vector of
+        // the old text goes, so the re-embed's final pass makes a new one.
+        f.h.submit_blocking(WriteOp::Update {
+            id,
+            update: MemoryUpdate {
+                body: Some("port is 9090".into()),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        let edited = pending_items(&f).remove(0);
+        f.h.submit_blocking(WriteOp::StoreEmbeddings {
+            model: "old".into(),
+            items: vec![(edited.key, edited.stamp, vec![1.0, 0.0])],
+        })
+        .unwrap();
+        assert_eq!((model_count(&f, "new"), model_count(&f, "old")), (0, 1));
+        // With no re-embed going, nothing is dropped.
+        f.h.submit_blocking(WriteOp::SetReembedTarget(None))
+            .unwrap();
+        f.h.submit_blocking(WriteOp::DeleteModelVectors {
+            model: "old".into(),
+            limit: 10,
+        })
+        .unwrap();
+        assert_eq!(model_count(&f, "old"), 0);
+    }
+
+    /// Rows held back by the cloud policy leave the queue, leave the judge's wait (a memory
+    /// that is not judged is activated) and come back when asked, per project.
+    #[test]
+    fn rows_held_back_by_the_cloud_policy_are_marked_and_queued_again() {
+        let f = fixture();
+        let (_, a) = new_id(f.h.submit_blocking(remember("first held back")).unwrap());
+        let (_, b) = new_id(
+            f.h.submit_blocking(remember("second stays pending"))
+                .unwrap(),
+        );
+        let items = pending_items(&f);
+        let first = items.iter().find(|i| i.key == VecKey::Memory(a)).unwrap();
+        f.h.submit_blocking(WriteOp::EmbedSkipped {
+            keys: vec![
+                (first.key, first.stamp.clone()),
+                (VecKey::Memory(b), "stale".into()),
+            ],
+        })
+        .unwrap();
+        let state = |seq: i64| -> String {
+            f.read("SELECT embed_state FROM memories WHERE seq = ?1", [seq])
+        };
+        assert_eq!(
+            (state(a).as_str(), state(b).as_str()),
+            ("skipped_cloud", "pending")
+        );
+        let project: String = f.read("SELECT project_id FROM memories WHERE seq = ?1", [a]);
+        let n = |projects: Option<Vec<String>>| match f
+            .h
+            .submit_blocking(WriteOp::RequeueSkippedCloud {
+                projects,
+                limit: 10,
+            })
+            .unwrap()
+        {
+            WriteOutcome::Count(n) => n,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(n(Some(vec!["another-project".into()])), 0);
+        assert_eq!(n(Some(vec![])), 0);
+        assert_eq!(state(a), "skipped_cloud");
+        assert_eq!(n(Some(vec![project])), 1);
+        assert_eq!(state(a), "pending");
+        assert_eq!(n(None), 0);
     }
 
     /// Ruling: an edit that lands while the old text is embedded must not be marked done.

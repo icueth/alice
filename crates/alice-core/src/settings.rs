@@ -20,27 +20,14 @@ use std::time::Duration;
 
 /// Keys the API and `alice config set` refuse to change.
 pub const READ_ONLY_KEYS: &[&str] = &["storage.data_dir"];
-/// Keys that take effect only after `alice daemon stop` and a new start. The embedding keys
-/// are here until the re-embed of Task 16 makes provider, model and endpoint apply live.
+/// Keys that take effect only after `alice daemon stop` and a new start. The embedding
+/// provider, model and endpoint are not here: a change starts a background re-embed and the
+/// daemon switches models when it is done.
 pub const RESTART_KEYS: &[&str] = &[
     "server.port",
     "secrets.backend",
     "embedding.idle_unload",
     "embedding.batch_size",
-    // Task 16 makes these three apply live, through a re-embed. Until then nothing reads
-    // them at all (see `NOT_USED_YET_KEYS`): a restart changes nothing.
-    "embedding.provider",
-    "embedding.model",
-    "embedding.endpoint",
-];
-/// Keys that are saved and validated but read by nothing yet: the daemon always embeds with the
-/// local model until Task 16 wires the other providers. They are also in [`RESTART_KEYS`], but a
-/// restart changes nothing for them, so the views say "not used yet" instead of promising an
-/// effect.
-pub const NOT_USED_YET_KEYS: &[&str] = &[
-    "embedding.provider",
-    "embedding.model",
-    "embedding.endpoint",
 ];
 
 /// `ALICE_*` variables read elsewhere that are not settings (never warned about). Secrets are
@@ -327,18 +314,72 @@ pub enum EmbeddingProvider {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingSettings {
-    /// Who computes embeddings: `local`, `openai`, `ollama` or `voyage`.
+    /// Who computes embeddings: `local`, `openai`, `ollama` or `voyage`. Changing the provider
+    /// or the model starts a background re-embed of everything; searches use the current model
+    /// until the new index is complete, then switch at once. A provider that is not on this
+    /// machine only gets text of projects the cloud policy allows.
     pub provider: EmbeddingProvider,
     /// `multilingual-e5-small-q8` for `local`; the provider's model name otherwise.
     pub model: String,
     /// Base URL for HTTP providers (defaults per provider). https:// is required when an API
-    /// key is sent, except to 127.0.0.1 or localhost.
+    /// key is sent, except to 127.0.0.1 or localhost. A server on this machine (127.0.0.1,
+    /// localhost) counts as local: the cloud policy does not apply to it.
     pub endpoint: Option<String>,
     /// Texts per embedding request (1 to 256).
     pub batch_size: usize,
     /// Unload the local model after this long without use, such as `10m` (`0` = never).
     #[schemars(with = "String")]
     pub idle_unload: HumanDuration,
+}
+
+impl EmbeddingSettings {
+    /// Where texts go: `None` for the built-in model and for an HTTP endpoint on this machine
+    /// (`127.0.0.1`, `::1`, any `127.x.x.x` or `localhost`: a local Ollama), else the provider
+    /// and the host of its endpoint (the provider's default when none is set). The cloud policy
+    /// applies to a remote destination only.
+    pub fn remote_destination(&self) -> Option<(EmbeddingProvider, String)> {
+        let default_host = match self.provider {
+            EmbeddingProvider::Local => return None,
+            EmbeddingProvider::Openai => "api.openai.com",
+            EmbeddingProvider::Ollama => "127.0.0.1",
+            EmbeddingProvider::Voyage => "api.voyageai.com",
+        };
+        let host = match self.endpoint.as_deref() {
+            None => default_host.to_string(),
+            // An endpoint that cannot be read is not assumed to be the provider's own, nor this
+            // machine: it counts as remote (fail closed).
+            Some(e) => match url_parts(e).map(|u| u.host.to_ascii_lowercase()) {
+                Some(h) if !h.is_empty() => h,
+                _ => return Some((self.provider, "(unreadable endpoint)".to_string())),
+            },
+        };
+        (!host_is_local(&host)).then_some((self.provider, host))
+    }
+
+    /// Whether texts leave this machine (see [`remote_destination`](Self::remote_destination)).
+    pub fn is_remote(&self) -> bool {
+        self.remote_destination().is_some()
+    }
+}
+
+/// Whether `host` (from a URL) is this machine: `localhost` or a loopback address.
+pub fn host_is_local(host: &str) -> bool {
+    let host = host.trim().trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether an embedding endpoint URL (or the provider's default when `None`) names a host other
+/// than this machine.
+pub fn endpoint_is_remote(provider: EmbeddingProvider, endpoint: Option<&str>) -> bool {
+    EmbeddingSettings {
+        provider,
+        endpoint: endpoint.map(String::from),
+        ..EmbeddingSettings::default()
+    }
+    .is_remote()
 }
 
 impl Default for EmbeddingSettings {
@@ -714,7 +755,7 @@ pub struct KeyInfo {
     pub env_var: String,
     pub read_only: bool,
     pub restart: bool,
-    /// Saved, but nothing reads it yet (see [`NOT_USED_YET_KEYS`]).
+    /// Saved, but nothing reads it yet. No key is at the moment; the field stays for clients.
     #[serde(default)]
     pub not_used_yet: bool,
 }
@@ -770,7 +811,7 @@ pub fn key_infos() -> Vec<KeyInfo> {
             env_var: env_var(key),
             read_only: READ_ONLY_KEYS.contains(&key.as_str()),
             restart: RESTART_KEYS.contains(&key.as_str()),
-            not_used_yet: NOT_USED_YET_KEYS.contains(&key.as_str()),
+            not_used_yet: false,
         })
         .collect()
 }
@@ -1607,7 +1648,8 @@ pub const LOOSEN_POLLS: u32 = 3;
 /// The protective keys that `new` makes weaker than `old` (empty when nothing got weaker):
 /// redaction off, `block` mode back to `redact`, an entry gone from the cloud denylist or the
 /// custom patterns, a longer allowlist, a higher daily judge budget, or a switch to a cloud
-/// judge or embedding provider, or the admin MCP tools switched on.
+/// judge, to an embedding provider or endpoint that is not on this machine (or to another remote
+/// host than before), or the admin MCP tools switched on.
 ///
 /// A half-written `config.toml` (an editor truncating then writing) reads as a file that
 /// loosens everything; see [`LooseningGate`].
@@ -1643,10 +1685,16 @@ pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
             "judge.provider",
             old.judge.provider != JudgeProvider::Jev && new.judge.provider == JudgeProvider::Jev,
         ),
+        // Texts start going to a remote host, or to another one than before.
         (
             "embedding.provider",
-            !is_cloud_embedding(old.embedding.provider)
-                && is_cloud_embedding(new.embedding.provider),
+            new.embedding.is_remote() && old.embedding.provider != new.embedding.provider,
+        ),
+        (
+            "embedding.endpoint",
+            new.embedding.is_remote()
+                && old.embedding.provider == new.embedding.provider
+                && old.embedding.remote_destination() != new.embedding.remote_destination(),
         ),
         // The admin tools let an agent resolve reviews and merge memories.
         (
@@ -1659,10 +1707,6 @@ pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
         .filter(|(_, loosened)| *loosened)
         .map(|(k, _)| k.to_string())
         .collect()
-}
-
-fn is_cloud_embedding(p: EmbeddingProvider) -> bool {
-    matches!(p, EmbeddingProvider::Openai | EmbeddingProvider::Voyage)
 }
 
 /// Fail-closed change control. Each poll of a source (the file, a project file) says whether
@@ -2634,15 +2678,20 @@ mod tests {
                 && k.env_var == "ALICE_JUDGE_JEV_RATE_PER_SEC")
         );
         assert!(keys.iter().any(|k| k.key == "server.port" && k.restart));
-        // Until the re-embed of Task 16, the embedding settings are read at start.
+        for k in ["embedding.idle_unload", "embedding.batch_size"] {
+            assert!(keys.iter().any(|i| i.key == k && i.restart), "{k}");
+        }
+        // The provider, model and endpoint apply live (a re-embed), and are used.
         for k in [
-            "embedding.idle_unload",
-            "embedding.batch_size",
             "embedding.provider",
             "embedding.model",
             "embedding.endpoint",
         ] {
-            assert!(keys.iter().any(|i| i.key == k && i.restart), "{k}");
+            assert!(
+                keys.iter()
+                    .any(|i| i.key == k && !i.restart && !i.not_used_yet),
+                "{k}"
+            );
         }
         assert!(
             keys.iter()
@@ -2881,6 +2930,107 @@ mod tests {
         let mut admin = base.clone();
         admin.mcp.admin_tools = true;
         assert!(loosened_protections(&admin, &base).is_empty());
+    }
+
+    fn embedding(provider: EmbeddingProvider, endpoint: Option<&str>) -> Settings {
+        let mut s = Settings::default();
+        s.embedding.provider = provider;
+        if provider != EmbeddingProvider::Local {
+            s.embedding.model = "m".into();
+        }
+        s.embedding.endpoint = endpoint.map(String::from);
+        s
+    }
+
+    #[test]
+    fn a_loopback_endpoint_is_local_and_any_other_host_is_remote() {
+        use EmbeddingProvider::*;
+        for (p, e, remote) in [
+            (Local, None, false),
+            (Ollama, None, false),
+            (Ollama, Some("http://127.0.0.1:11434/v1"), false),
+            (Ollama, Some("http://localhost:11434"), false),
+            (Ollama, Some("http://LOCALHOST:11434"), false),
+            (Ollama, Some("http://127.0.0.2:11434"), false),
+            (Ollama, Some("http://[::1]:11434/v1"), false),
+            (Openai, Some("http://127.0.0.1:8080/v1"), false),
+            (Openai, None, true),
+            (Voyage, None, true),
+            (Openai, Some("https://api.example.com/v1"), true),
+            (Ollama, Some("http://10.0.0.5:11434"), true),
+            (Ollama, Some("http://localhost.example.com/v1"), true),
+            (Ollama, Some("http://127.0.0.1.example.com/v1"), true),
+        ] {
+            assert_eq!(embedding(p, e).embedding.is_remote(), remote, "{p:?} {e:?}");
+        }
+        assert!(endpoint_is_remote(Voyage, None));
+        assert!(!endpoint_is_remote(Ollama, Some("http://localhost:1/v1")));
+    }
+
+    #[test]
+    fn an_endpoint_that_cannot_be_read_is_remote_never_the_providers_default_or_local() {
+        use EmbeddingProvider::*;
+        for e in ["", "not a url", "http://", "ftp:///x"] {
+            assert!(embedding(Ollama, Some(e)).embedding.is_remote(), "{e:?}");
+            assert!(embedding(Openai, Some(e)).embedding.is_remote(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn switching_to_a_remote_embedder_loosens_a_protection_and_a_local_one_does_not() {
+        use EmbeddingProvider::*;
+        let local = embedding(Local, None);
+        let lo = |a: &Settings, b: &Settings| loosened_protections(a, b);
+        assert_eq!(
+            lo(&local, &embedding(Openai, None)),
+            vec!["embedding.provider"]
+        );
+        assert_eq!(
+            lo(&local, &embedding(Voyage, Some("https://example.org/v1"))),
+            vec!["embedding.provider"]
+        );
+        // A local Ollama is local; moving to one loosens nothing.
+        assert!(lo(&local, &embedding(Ollama, None)).is_empty());
+        assert!(lo(&local, &embedding(Ollama, Some("http://localhost:1/v1"))).is_empty());
+        // The endpoint of a local Ollama moved to another host does.
+        assert_eq!(
+            lo(
+                &embedding(Ollama, None),
+                &embedding(Ollama, Some("http://10.0.0.5:11434"))
+            ),
+            vec!["embedding.endpoint"]
+        );
+        assert_eq!(
+            lo(
+                &embedding(Openai, None),
+                &embedding(Openai, Some("https://proxy.example.com/v1"))
+            ),
+            vec!["embedding.endpoint"]
+        );
+        // Another remote provider is another recipient.
+        assert_eq!(
+            lo(&embedding(Openai, None), &embedding(Voyage, None)),
+            vec!["embedding.provider"]
+        );
+        // Staying on the same remote host, or going back to local, loosens nothing.
+        let mut other_model = embedding(Openai, None);
+        other_model.embedding.model = "other".into();
+        assert!(lo(&embedding(Openai, None), &other_model).is_empty());
+        assert!(
+            lo(
+                &embedding(Openai, None),
+                &embedding(Openai, Some("https://api.openai.com/v1"))
+            )
+            .is_empty()
+        );
+        assert!(lo(&embedding(Openai, None), &local).is_empty());
+        assert!(
+            lo(
+                &embedding(Ollama, Some("http://10.0.0.5:11434")),
+                &embedding(Ollama, None)
+            )
+            .is_empty()
+        );
     }
 
     #[test]
