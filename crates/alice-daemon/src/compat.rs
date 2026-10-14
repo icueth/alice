@@ -6,12 +6,21 @@
 //! failure is a normal result `{"error": "..."}`, like MemPalace's own. Every text returned was
 //! redacted when it was stored, and a source is named by its file name, not its path.
 //!
+//! `mempalace_search` goes through [`Service::recall`], so, like a normal recall, it records
+//! that the memories it returns were accessed (the access data that feeds ranking); nothing
+//! else is written. `similarity` is relative: the best hit of a search is 1.0 and the others
+//! are their score divided by it, so a threshold on it keeps the best hit always. The keys of
+//! `status.wing_project_map` are slugified aliases (`wing-pg-ai`); lookups accept the old
+//! spelling (`wing_pg_ai`) too.
+//!
 //! This file holds the read tools. The write tools (and the knowledge-graph and diary ones)
 //! answer "not available yet" through one `match` arm.
 
 use crate::service::Service;
 use alice_core::api::{ContextRequest, GetRequest, OutputFormat, RecallRequest, Tier};
 use alice_core::error::Result;
+use alice_core::model::Status;
+use alice_core::normalize::normalize_topic;
 use alice_core::store::compat::{self as store, CompatDrawer, Overview};
 use alice_core::store::projects;
 use schemars::JsonSchema;
@@ -182,8 +191,28 @@ fn error(msg: impl Into<String>) -> Value {
     json!({ "error": msg.into() })
 }
 
+/// An error as the caller sees it. A message written for the caller (a bad argument) goes
+/// through; anything from the store (a database or file error) could name a path, so it becomes
+/// one fixed sentence.
+fn safe_error(e: alice_core::error::AliceError) -> String {
+    use alice_core::error::AliceError as E;
+    match e {
+        E::Invalid(_) | E::Refused { .. } => e.to_string(),
+        E::NotFound(_) => "not found".into(),
+        _ => "Alice could not read its memory store just now; run `alice status` for the cause"
+            .into(),
+    }
+}
+
 fn no_such_wing(wing: &str) -> String {
     format!("no project or alias named {wing}")
+}
+
+/// A day, or an ISO timestamp with or without an offset.
+fn is_date(s: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+        || chrono::DateTime::parse_from_rfc3339(s).is_ok()
+        || chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
 }
 
 /// The last path component (a source is shown by its file name, never its directory).
@@ -217,7 +246,7 @@ impl Service {
         call: &CompatCall,
         args: &Args,
     ) -> std::result::Result<Value, String> {
-        let internal = |e: alice_core::error::AliceError| e.to_string();
+        let internal = safe_error;
         match call.tool.as_str() {
             "mempalace_status" => self.compat_status(call).await.map_err(internal),
             "mempalace_list_wings" => self.compat_list_wings().await.map_err(internal),
@@ -322,7 +351,7 @@ impl Service {
     async fn compat_list_rooms(&self, args: &Args) -> std::result::Result<Value, String> {
         let wing = args.opt_str("wing")?;
         let Some(wing) = wing else {
-            let snap = self.snapshot().await.map_err(|e| e.to_string())?;
+            let snap = self.snapshot().await.map_err(safe_error)?;
             return Ok(json!({ "wing": "all", "rooms": snap.overview.rooms }));
         };
         let asked = wing.clone();
@@ -335,7 +364,7 @@ impl Service {
                 Ok(Some((p.slug, rooms)))
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(safe_error)?;
         Ok(match found {
             Some((slug, rooms)) => json!({ "wing": slug, "rooms": rooms }),
             None => json!({ "wing": wing, "rooms": {}, "note": no_such_wing(&wing) }),
@@ -363,6 +392,13 @@ impl Service {
         let room = args.opt_str("room")?;
         let since = args.opt_str("since")?;
         let before = args.opt_str("before")?;
+        for (name, v) in [("since", &since), ("before", &before)] {
+            if v.as_deref().is_some_and(|d| !is_date(d)) {
+                return Err(format!(
+                    "argument {name} must be a date (YYYY-MM-DD) or an ISO timestamp"
+                ));
+            }
+        }
         let source_file = args.opt_str("source_file")?;
 
         let mut notes: Vec<String> = Vec::new();
@@ -406,10 +442,24 @@ impl Service {
         };
 
         let project = match &wing {
-            Some(w) => match self.compat_wing(w).await.map_err(|e| e.to_string())? {
+            Some(w) => match self.compat_wing(w).await.map_err(safe_error)? {
                 Some(slug) => Some(slug),
                 None => {
                     notes.push(no_such_wing(w));
+                    return Ok(envelope(Vec::new(), &notes));
+                }
+            },
+            None => None,
+        };
+        // The room as a topic; one that does not normalise names nothing, so nothing matches
+        // (never an unfiltered search).
+        let room_topic = match &room {
+            Some(r) => match normalize_topic(r) {
+                Some(t) => Some(t),
+                None => {
+                    notes.push(format!(
+                        "room {r} is not a valid room name, so no memory can match"
+                    ));
                     return Ok(envelope(Vec::new(), &notes));
                 }
             },
@@ -422,7 +472,7 @@ impl Service {
             .recall(RecallRequest {
                 query: query.clone(),
                 project,
-                topics: room.iter().cloned().collect(),
+                topics: room_topic.iter().cloned().collect(),
                 since: since.clone(),
                 before: before.clone(),
                 include_raw: true,
@@ -433,7 +483,7 @@ impl Service {
                 ..Default::default()
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(safe_error)?;
         notes.extend(response.notes.iter().cloned());
 
         let (mut memory_ids, mut chunk_ids) = (Vec::new(), Vec::new());
@@ -446,7 +496,7 @@ impl Service {
         let details = self
             .read(move |c| store::hit_details(c, &memory_ids, &chunk_ids))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(safe_error)?;
         let best = response
             .results
             .iter()
@@ -455,6 +505,10 @@ impl Service {
         let results = response
             .results
             .iter()
+            .filter(|h| match &room_topic {
+                Some(t) => details.get(&h.id).is_some_and(|d| d.topics.contains(t)),
+                None => true,
+            })
             .map(|h| {
                 let d = details.get(&h.id).cloned().unwrap_or_default();
                 let similarity = if best > 0.0 {
@@ -471,7 +525,7 @@ impl Service {
                     "drawer_id": d.legacy_id.clone().unwrap_or_else(|| h.id.clone()),
                     "text": h.body.clone().unwrap_or_else(|| h.snippet.clone()),
                     "wing": h.project,
-                    "room": d.topics.first().cloned().unwrap_or_default(),
+                    "room": room_topic.clone().or_else(|| d.topics.first().cloned()).unwrap_or_default(),
                     "source_file": d.source_uri.as_deref().map(base_name).unwrap_or(""),
                     "source_path": "",
                     "created_at": h.created_at,
@@ -500,7 +554,7 @@ impl Service {
         let found = self
             .read(move |c| store::resolve_drawer(c, &asked))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(safe_error)?;
         match found {
             None => Ok(error(format!("Drawer not found: {id}"))),
             Some(CompatDrawer::Chunk {
@@ -532,7 +586,7 @@ impl Service {
                         include_provenance: false,
                     })
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(safe_error)?;
                 let Some(full) = got.memories.into_iter().next() else {
                     return Ok(error(format!("Drawer not found: {id}")));
                 };
@@ -557,11 +611,22 @@ impl Service {
                         "legacy_id": m.legacy_id,
                     },
                 });
-                if !got.redirects.is_empty() {
-                    out["note"] = json!(format!(
-                        "{id} is a duplicate that was merged into {}",
-                        out["drawer_id"].as_str().unwrap_or_default()
-                    ));
+                let mut notes: Vec<String> = Vec::new();
+                if id != m.id && m.legacy_id.as_deref() != Some(id.as_str()) {
+                    notes.push(format!("{id} was merged into {}", m.id));
+                }
+                match m.status {
+                    Status::Trashed => {
+                        out["trashed"] = json!(true);
+                        notes.push("this memory was forgotten (it is in the trash); it is shown for reference and is not returned by search".into());
+                    }
+                    Status::Superseded => {
+                        notes.push("this memory was superseded by a newer one".into());
+                    }
+                    _ => {}
+                }
+                if !notes.is_empty() {
+                    out["note"] = json!(notes.join("; "));
                 }
                 Ok(out)
             }

@@ -7,8 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alice_core::embed::{Embedder, FakeEmbedder};
-use alice_core::import::fixture::{DrawerSpec, build_sqlite_exact};
-use alice_core::import::palace::DrawerMeta;
+use alice_core::import::fixture::build_sqlite_exact;
 use alice_core::import::{ImportRequest, ImportState};
 use alice_daemon::compat::CompatCall;
 use alice_daemon::paths::AliceHome;
@@ -17,125 +16,9 @@ use serde_json::{Value, json};
 
 // ------------------------------------------------------------------------------------ fixtures
 
-fn s(v: &str) -> Option<String> {
-    Some(v.to_string())
-}
-
-fn knowledge(id: &str, text: &str, wing: &str, room: &str) -> DrawerSpec {
-    DrawerSpec {
-        id: id.into(),
-        text: text.into(),
-        meta: DrawerMeta {
-            wing: wing.into(),
-            room: room.into(),
-            added_by: s("claude-code"),
-            filed_at: s("2026-04-10T10:00:00"),
-            ..Default::default()
-        },
-    }
-}
-
-fn chunk(id: &str, text: &str, wing: &str, source: &str, index: i64) -> DrawerSpec {
-    DrawerSpec {
-        id: id.into(),
-        text: text.into(),
-        meta: DrawerMeta {
-            wing: wing.into(),
-            room: "technical".into(),
-            source_file: s(source),
-            ingest_mode: s("convos"),
-            chunk_index: Some(index),
-            authored_at: s(&format!("2026-04-16T11:{:02}:00", index % 60)),
-            filed_at: s("2026-04-16T12:00:00"),
-            ..Default::default()
-        },
-    }
-}
-
-const S1: &str = "/h/.claude/projects/-Users-me-Code-pg-ai/s1.jsonl";
-const S2: &str = "/h/.claude/projects/-Users-me-Code-devspace/s2.jsonl";
-
-/// The palace Tasks 9-11 share: 117 drawers (5 knowledge, 80 session chunks with one repeat,
-/// 30 file chunks, a registry entry and a drawer with unreadable metadata), a closet, a
-/// knowledge graph and a tunnels file.
-fn fixture_specs() -> Vec<DrawerSpec> {
-    let mut v = vec![
-        knowledge("k_dec", "decision about the v4 frame", "pg-ai", "decisions"),
-        knowledge(
-            "k_dup_a",
-            "Frames are framed protobuf",
-            "pg_ai",
-            "knowledge",
-        ),
-        knowledge(
-            "k_dup_b",
-            "Frames are framed protobuf",
-            "wing_pg_ai",
-            "knowledge",
-        ),
-        DrawerSpec {
-            id: "k_diary".into(),
-            text: "Set up the import today with alice".into(),
-            meta: DrawerMeta {
-                wing: "wing_claude_code".into(),
-                room: "diary".into(),
-                agent: s("claude-code"),
-                topic: s("setup"),
-                date: s("2026-04-16"),
-                filed_at: s("2026-04-16T20:00:00"),
-                ..Default::default()
-            },
-        },
-        knowledge(
-            "k_agent",
-            "Notes from the agent: pg-ai needs the frame, and pg-ai tests pass",
-            "wing_claude_code",
-            "knowledge",
-        ),
-    ];
-    for i in 0..40 {
-        // Chunk 7 of s1 is repeated once, as its last chunk.
-        let text = if i == 39 {
-            "s1 chunk 7 text".to_string()
-        } else {
-            format!("s1 chunk {i} text")
-        };
-        v.push(chunk(&format!("s1_{i:03}"), &text, "sessions", S1, i));
-        let text2 = if i == 3 {
-            "s2 chunk 3 with the quickstart transcript phrase".to_string()
-        } else {
-            format!("s2 chunk {i} text")
-        };
-        v.push(chunk(&format!("s2_{i:03}"), &text2, "sessions", S2, i));
-    }
-    for i in 0..30 {
-        v.push(DrawerSpec {
-            id: format!("f_{i:03}"),
-            text: format!("func f{i}() {{}}"),
-            meta: DrawerMeta {
-                wing: "devspace".into(),
-                room: "src".into(),
-                source_file: s(&format!("/h/Code/devspace/main_{}.go", i % 3)),
-                added_by: s("claude"),
-                ingest_mode: s("projects"),
-                chunk_index: Some(i / 3),
-                filed_at: s("2026-04-12T09:00:00"),
-                ..Default::default()
-            },
-        });
-    }
-    v.push(DrawerSpec {
-        id: "_reg_1".into(),
-        text: "registry".into(),
-        meta: DrawerMeta {
-            wing: "devspace".into(),
-            room: "_registry".into(),
-            ingest_mode: s("registry"),
-            ..Default::default()
-        },
-    });
-    v
-}
+#[path = "common/palace.rs"]
+mod palace;
+use palace::fixture_specs;
 
 struct Flow {
     _root: tempfile::TempDir,
@@ -556,4 +439,260 @@ async fn status_stays_under_the_budget_with_hundreds_of_rooms() {
         rooms["rooms"].as_object().unwrap().len() > 100,
         "list_rooms has the full set"
     );
+}
+
+fn results(v: &Value) -> &Vec<Value> {
+    v["results"].as_array().unwrap_or_else(|| panic!("{v}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wing_filter_excludes_other_projects() {
+    let f = Flow::imported().await;
+    let all = f
+        .call("mempalace_search", json!({"query": "chunk", "limit": 50}))
+        .await;
+    let wings: std::collections::HashSet<&str> = results(&all)
+        .iter()
+        .map(|r| r["wing"].as_str().unwrap())
+        .collect();
+    assert!(
+        wings.len() > 1,
+        "the unfiltered search spans projects: {wings:?}"
+    );
+    let one = f
+        .call(
+            "mempalace_search",
+            json!({"query": "chunk", "limit": 50, "wing": "devspace"}),
+        )
+        .await;
+    assert!(!results(&one).is_empty());
+    assert!(
+        results(&one).iter().all(|r| r["wing"] == "devspace"),
+        "{one}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn since_and_before_bound_the_results_and_a_bad_date_is_an_error_answer() {
+    let f = Flow::imported().await;
+    let q = |extra: Value| {
+        let mut a = json!({"query": "frame", "limit": 50});
+        a.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        a
+    };
+    let open = f.call("mempalace_search", q(json!({}))).await;
+    assert!(!results(&open).is_empty());
+    let future = f
+        .call("mempalace_search", q(json!({"since": "2099-01-01"})))
+        .await;
+    assert_eq!(results(&future).len(), 0, "{future}");
+    let past = f
+        .call("mempalace_search", q(json!({"before": "2000-01-01"})))
+        .await;
+    assert_eq!(results(&past).len(), 0, "{past}");
+    let within = f
+        .call(
+            "mempalace_search",
+            q(json!({"since": "2020-01-01", "before": "2099-01-01"})),
+        )
+        .await;
+    assert_eq!(results(&within).len(), results(&open).len(), "{within}");
+    let bad = f
+        .call("mempalace_search", q(json!({"since": "last tuesday"})))
+        .await;
+    assert!(bad.get("error").is_some(), "{bad}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_room_that_does_not_normalise_matches_nothing_and_a_room_hit_reports_that_room() {
+    let f = Flow::imported().await;
+    let bad = f
+        .call("mempalace_search", json!({"query": "frame", "room": "!!!"}))
+        .await;
+    assert_eq!(bad["results"], json!([]));
+    assert!(
+        bad["note"]
+            .as_str()
+            .unwrap()
+            .contains("not a valid room name"),
+        "{bad}"
+    );
+    let ok = f
+        .call(
+            "mempalace_search",
+            json!({"query": "frame", "room": "Decisions"}),
+        )
+        .await;
+    assert!(!results(&ok).is_empty(), "{ok}");
+    assert!(
+        results(&ok).iter().all(|r| r["room"] == "decisions"),
+        "{ok}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merged_old_id_says_so_and_a_trashed_memory_is_marked_and_left_out_of_search() {
+    let f = Flow::imported().await;
+    let merged = f
+        .call("mempalace_get_drawer", json!({"drawer_id": "k_dup_b"}))
+        .await;
+    assert!(
+        merged["note"].as_str().unwrap().contains("merged into"),
+        "{merged}"
+    );
+    let direct = f
+        .call("mempalace_get_drawer", json!({"drawer_id": "k_dup_a"}))
+        .await;
+    assert!(direct.get("note").is_none(), "{direct}");
+
+    let saved = f
+        .svc
+        .remember(alice_core::api::RememberRequest {
+            content: "zebracrossing is the unique word of this memory".into(),
+            project: Some("pg-ai".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let id = saved.id.unwrap();
+    let hit = f
+        .call("mempalace_search", json!({"query": "zebracrossing"}))
+        .await;
+    assert_eq!(results(&hit).len(), 1, "{hit}");
+    let before = f.call("mempalace_status", json!({})).await["memories"]
+        .as_u64()
+        .unwrap();
+    f.svc
+        .update(alice_core::api::UpdateRequest {
+            id: id.clone(),
+            update: alice_core::store::memories::MemoryUpdate {
+                action: alice_core::store::memories::UpdateAction::Forget,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let gone = f
+        .call("mempalace_search", json!({"query": "zebracrossing"}))
+        .await;
+    assert_eq!(results(&gone).len(), 0, "{gone}");
+    let shown = f
+        .call("mempalace_get_drawer", json!({"drawer_id": id}))
+        .await;
+    assert_eq!(shown["trashed"], true, "{shown}");
+    assert!(shown["note"].as_str().unwrap().contains("trash"), "{shown}");
+    // The overview is cached for 5 s, so count with a store query instead.
+    let live: i64 = rusqlite::Connection::open(f.svc.home().db())
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM memories WHERE status <> 'trashed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live as u64, before - 1, "one live memory fewer");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hostile_inputs_never_panic_and_no_path_separator_reaches_source_file() {
+    let f = Flow::imported().await;
+    let huge = "word ".repeat(200_000);
+    let queries = [
+        "\"unbalanced".to_string(),
+        "NEAR(a b, 2)".to_string(),
+        "a AND OR NOT (".to_string(),
+        "*".to_string(),
+        "col:val -x ^y".to_string(),
+        "nul\u{0}byte".to_string(),
+        "\u{202e}rtl\u{200b}zw\u{fe0f} 🧪 ก็ไม่เป็นไร e\u{301}".to_string(),
+        "' OR 1=1; --".to_string(),
+        huge,
+    ];
+    for q in queries {
+        let r = f.call("mempalace_search", json!({"query": q})).await;
+        assert!(r.is_object());
+        for hit in r["results"].as_array().into_iter().flatten() {
+            let sf = hit["source_file"].as_str().unwrap();
+            assert!(!sf.contains('/') && !sf.contains('\\'), "{sf}");
+        }
+    }
+    for limit in [
+        json!(0),
+        json!("0"),
+        json!(1_000_000_000u64),
+        json!("99999999999999999999"),
+        json!(1.5),
+        json!(-1),
+        json!(true),
+    ] {
+        let r = f
+            .call(
+                "mempalace_search",
+                json!({"query": "frame", "limit": limit}),
+            )
+            .await;
+        assert!(r.is_object());
+        assert!(r["results"].as_array().is_none_or(|a| a.len() <= 50), "{r}");
+    }
+    for arg in [
+        json!(null),
+        json!(7),
+        json!([]),
+        json!("{"),
+        json!({"drawer_id": ["a"]}),
+        json!({"drawer_id": "\u{0}"}),
+    ] {
+        let r = f.call("mempalace_get_drawer", arg).await;
+        assert!(r.get("error").is_some(), "{r}");
+    }
+    // The raw hits do carry a file name.
+    let raw = f
+        .call("mempalace_search", json!({"query": "s1 chunk 7 text"}))
+        .await;
+    assert!(
+        results(&raw).iter().any(|r| r["source_file"] == "s1.jsonl"),
+        "{raw}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_tools_write_nothing_but_the_access_counts_of_what_search_returns() {
+    let f = Flow::imported().await;
+    let counts = || -> Vec<i64> {
+        let c = rusqlite::Connection::open(f.svc.home().db()).unwrap();
+        [
+            "memories",
+            "chunks",
+            "events",
+            "links",
+            "legacy_ids",
+            "projects",
+        ]
+        .iter()
+        .map(|t| {
+            c.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        })
+        .collect()
+    };
+    let before = counts();
+    for (tool, args) in [
+        ("mempalace_status", json!({})),
+        ("mempalace_list_wings", json!({})),
+        ("mempalace_list_rooms", json!({"wing": "pg_ai"})),
+        ("mempalace_get_drawer", json!({"drawer_id": "k_dec"})),
+        ("mempalace_get_drawer", json!({"drawer_id": "s1_001"})),
+        ("mempalace_search", json!({"query": "frame"})),
+        (
+            "mempalace_add_drawer",
+            json!({"wing": "pg_ai", "room": "x", "content": "y"}),
+        ),
+        ("mempalace_mine", json!({})),
+    ] {
+        f.call(tool, args).await;
+    }
+    assert_eq!(counts(), before);
 }
