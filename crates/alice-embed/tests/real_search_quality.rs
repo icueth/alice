@@ -52,9 +52,10 @@ struct VectorOnly {
     query: &'static str,
     /// Memory id from the gold file.
     want: &'static str,
-    /// Measured with the default floor (0.82) and the int8 memory index: in the top 3 (true) or
-    /// not returned at all (false: no lexical match, similarity below the floor). A change to the
-    /// floor policy or to the model changes this column, and docs/benchmarks/m2.md with it.
+    /// Measured with the default floor (0.82) and the int8 memory index on Apple Silicon: in the
+    /// top 3 (true) or not returned at all (false: no lexical match, similarity below the floor).
+    /// A change to the floor policy or to the model changes this column, and
+    /// docs/benchmarks/m2.md with it. Rows within `PIN_MARGIN` of the floor are not pinned.
     returned_at_default_floor: bool,
 }
 
@@ -124,6 +125,13 @@ const VECTOR_ONLY: &[VectorOnly] = &[
 /// With every vector candidate let through (floor −1), at least this many of `VECTOR_ONLY` rank
 /// in the top 3: the ranking itself, whatever the floor decides.
 const VECTOR_ONLY_TOP3_UNFLOORED: usize = 8;
+
+/// The same model gives slightly different vectors on another CPU: ONNX Runtime's int8 kernels
+/// differ between x86-64 and ARM, and on windows-latest the vector-only similarities moved by up
+/// to 0.02 against Apple Silicon (`docs/benchmarks/m2.md`, Windows). A vector-only row this close
+/// to the floor can land on either side of it, so its outcome is reported, not pinned; if it is
+/// returned it must still be in the top 3.
+const PIN_MARGIN: f32 = 0.02;
 
 fn models_dir() -> PathBuf {
     std::env::var_os("ALICE_MODELS_DIR")
@@ -452,9 +460,24 @@ fn real_model_gold_set_and_relevance_floor() {
     );
     // The floor's lower edge, pinned row by row: the rows marked returned are in the top 3, the
     // others are not returned at all. A change in either direction must update VECTOR_ONLY and
-    // docs/benchmarks/m2.md.
+    // docs/benchmarks/m2.md. Rows within PIN_MARGIN of the floor are only reported.
     let mut below = Vec::new();
     for ((v, rank), sim) in VECTOR_ONLY.iter().zip(vector_only).zip(&vector_only_i8) {
+        if (sim - floor).abs() < PIN_MARGIN {
+            println!(
+                "  near the floor, not pinned: {sim:.3} {}: {} -> {rank:?}",
+                v.what, v.query
+            );
+            assert!(
+                rank.is_none_or(|r| r <= 3),
+                "{:?} ({sim:.3}) is returned but not in the top 3: {rank:?}",
+                v.query
+            );
+            if rank.is_none() {
+                below.push(format!("{sim:.3} {}: {}", v.what, v.query));
+            }
+            continue;
+        }
         if v.returned_at_default_floor {
             assert!(
                 rank.is_some_and(|r| r <= 3),
