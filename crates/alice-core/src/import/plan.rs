@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::palace::{Drawer, DrawerMeta, PalaceReader};
 use super::wings::{ProjectDecision, WingMap};
+use crate::error::AliceError;
 use crate::model::{Author, Kind, SourceType, limits};
 use crate::normalize::{derive_title, nfc, normalize_topic, slugify};
 use crate::store::memories::NewMemoryInput;
@@ -475,6 +476,9 @@ impl Mapper<'_> {
 // ---------------------------------------------------------------------------------------------
 
 const SURVEY_PAGE: usize = 5_000;
+/// Largest chunk_index a row may claim; real transcripts have a few thousand chunks at most. A
+/// larger value is junk and is numbered like a missing index (so ord arithmetic stays far from i64::MAX).
+const MAX_WANTED_ORD: i64 = 2_000_000_000;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TierCounts {
@@ -511,8 +515,22 @@ struct RawRow {
 }
 
 impl RawRow {
-    fn sort_key(&self) -> (i64, &str, &str) {
-        (self.chunk_index.unwrap_or(i64::MAX), &self.filed, &self.id)
+    /// A row without `filed_at` sorts after the ones that have it (the same choice as the
+    /// knowledge order), then by id.
+    fn sort_key(&self) -> (i64, bool, &str, &str) {
+        (
+            self.chunk_index.unwrap_or(i64::MAX),
+            self.filed.is_empty(),
+            &self.filed,
+            &self.id,
+        )
+    }
+
+    /// The chunk position this row asks for: only 0..=MAX_WANTED_ORD is usable; anything else is
+    /// deferred like a missing index.
+    fn wanted(&self) -> Option<i64> {
+        self.chunk_index
+            .filter(|c| (0..=MAX_WANTED_ORD).contains(c))
     }
 }
 
@@ -536,13 +554,24 @@ pub fn survey(
     assume: FixedOffset,
     reserved: &dyn Fn(&str) -> BTreeSet<i64>,
 ) -> crate::error::Result<Survey> {
+    survey_paged(reader, since, wings, assume, reserved, SURVEY_PAGE)
+}
+
+fn survey_paged(
+    reader: &dyn PalaceReader,
+    since: Option<&str>,
+    wings: &mut WingMap,
+    assume: FixedOffset,
+    reserved: &dyn Fn(&str) -> BTreeSet<i64>,
+    page_size: usize,
+) -> crate::error::Result<Survey> {
     let mut out = Survey::default();
     let mut by_wing: BTreeMap<String, u64> = BTreeMap::new();
     let mut knowledge: Vec<(String, String)> = Vec::new();
     let mut sources: HashMap<String, Vec<RawRow>> = HashMap::new();
     let mut after: Option<String> = None;
     loop {
-        let page = reader.page(after.as_deref(), SURVEY_PAGE, since)?;
+        let page = reader.page(after.as_deref(), page_size, since)?;
         let Some(last) = page.last() else { break };
         after = Some(last.id.clone());
         for d in page {
@@ -618,7 +647,7 @@ pub fn survey(
         let mut kept: Vec<usize> = Vec::new();
         let mut highest = -1i64; // the highest valid chunk_index of any row, collapsed or not
         for (i, r) in rows.iter().enumerate() {
-            if let Some(ci) = r.chunk_index.filter(|c| *c >= 0) {
+            if let Some(ci) = r.wanted() {
                 highest = highest.max(ci);
             }
             match keeper_of.get(&r.hash) {
@@ -635,7 +664,7 @@ pub fn survey(
         let mut claimed = reserved(&uri);
         let mut deferred: Vec<usize> = Vec::new();
         for &i in &kept {
-            match rows[i].chunk_index.filter(|c| *c >= 0) {
+            match rows[i].wanted() {
                 Some(ci) if !claimed.contains(&ci) => {
                     claimed.insert(ci);
                     out.ords.insert(rows[i].id.clone(), ci);
@@ -643,9 +672,22 @@ pub fn survey(
                 _ => deferred.push(i),
             }
         }
-        let first_free = claimed.last().copied().unwrap_or(-1).max(highest) + 1;
-        for (ord, i) in (first_free..).zip(deferred) {
-            out.ords.insert(rows[i].id.clone(), ord);
+        let overflow = || {
+            AliceError::invalid(format!(
+                "the chunk positions already stored for {uri} are too large to number new chunks after; \
+                 nothing was imported. Re-import into a fresh database or report this palace."
+            ))
+        };
+        let mut next = claimed
+            .last()
+            .copied()
+            .unwrap_or(-1)
+            .max(highest)
+            .checked_add(1)
+            .ok_or_else(overflow)?;
+        for i in deferred {
+            out.ords.insert(rows[i].id.clone(), next);
+            next = next.checked_add(1).ok_or_else(overflow)?;
         }
     }
     Ok(out)
@@ -665,7 +707,16 @@ impl Planner<'_> {
                 keeper: keeper.clone(),
             };
         }
-        let ord = self.survey.ords.get(&d.id).copied().unwrap_or(0);
+        let ord = match self.survey.ords.get(&d.id) {
+            Some(o) => *o,
+            None if matches!(classify(&d.id, &d.meta), Tier::RawSession | Tier::RawFile) => {
+                // Guessing a position could collide with a stored chunk (A12): do not import it.
+                return Planned::Skipped {
+                    reason: "not in survey",
+                };
+            }
+            None => 0,
+        };
         let span = self
             .survey
             .source_spans
@@ -1482,5 +1533,116 @@ mod tests {
             panic!("expected chunks")
         };
         assert_eq!(c1[0].chunk.ord, 1);
+    }
+
+    #[test]
+    fn huge_chunk_indexes_and_reserved_ords_never_wrap_or_panic() {
+        // chunk_index i64::MAX is unusable: deferred and numbered normally.
+        let specs = vec![
+            chunk_spec("a0", Some(i64::MAX), "x"),
+            chunk_spec("a1", Some(0), "y"),
+            chunk_spec("a2", Some(-5), "z"),
+        ];
+        let mut wm = wings();
+        let sv = run(&specs, None, &mut wm, &no_reserved);
+        assert_eq!(sv.ords["a1"], 0);
+        assert_eq!(sv.ords["a2"], 1, "negative: deferred, after the used 0");
+        assert_eq!(
+            sv.ords["a0"], 2,
+            "sorted order: -5 < 0 < MAX gives a2 then a0"
+        );
+        assert!(sv.ords.values().all(|o| *o >= 0));
+        // A reserved ord at i64::MAX cannot be numbered after: a clear error, no panic.
+        let (_a, _b, r) = open_fixture(&specs, |_| {});
+        let res = survey(r.as_ref(), None, &mut wm, utc(), &|_| Set::from([i64::MAX]));
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
+        // Many deferred rows running into the end of the range: error, not wrap.
+        let many: Vec<_> = (0..5)
+            .map(|i| chunk_spec(&format!("m{i}"), None, &format!("t{i}")))
+            .collect();
+        let (_a, _b, r) = open_fixture(&many, |_| {});
+        let res = survey(r.as_ref(), None, &mut wm, utc(), &|_| {
+            Set::from([i64::MAX - 3])
+        });
+        assert!(res.is_err());
+        // A high but sane reserved ord is fine: numbering continues after it.
+        let sv = survey(r.as_ref(), None, &mut wm, utc(), &|_| {
+            Set::from([1_999_999_999])
+        })
+        .unwrap();
+        let mut got: Vec<i64> = sv.ords.values().copied().collect();
+        got.sort();
+        assert_eq!(got, (2_000_000_000..2_000_000_005).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reserved_with_gaps_and_negative_indexes_number_after_the_highest() {
+        let specs = vec![
+            chunk_spec("b0", Some(3), "p"),
+            chunk_spec("b1", Some(-1), "q"),
+            chunk_spec("b2", Some(7), "r"),
+            chunk_spec("b3", None, "s"),
+        ];
+        let mut wm = wings();
+        let sv = run(&specs, None, &mut wm, &|_| Set::from([0, 3, 9]));
+        // b3 wants 3 (reserved) -> deferred; b2 takes 7; b1 and b0 deferred; max(9, 7) = 9.
+        assert_eq!(sv.ords["b2"], 7);
+        let mut rest: Vec<i64> = ["b0", "b1", "b3"].iter().map(|k| sv.ords[*k]).collect();
+        rest.sort();
+        assert_eq!(rest, vec![10, 11, 12]);
+        assert_eq!(
+            sv.ords["b1"], 10,
+            "sorted order: -1 first among the deferred"
+        );
+    }
+
+    #[test]
+    fn a_page_boundary_loses_and_duplicates_nothing() {
+        let specs: Vec<_> = (0..10)
+            .map(|i| chunk_spec(&format!("p{i:02}"), Some(i), &format!("text {i}")))
+            .collect();
+        let (_a, _b, r) = open_fixture(&specs, |_| {});
+        let mut wm = wings();
+        let sv = survey_paged(r.as_ref(), None, &mut wm, utc(), &no_reserved, 3).unwrap();
+        assert_eq!(sv.total, 10);
+        assert_eq!(sv.ords.len(), 10);
+        for i in 0..10 {
+            assert_eq!(sv.ords[&format!("p{i:02}")], i);
+        }
+    }
+
+    #[test]
+    fn a_missing_filed_at_sorts_after_dated_rows_and_the_planner_skips_unseen_raw_drawers() {
+        let mut undated = chunk_spec("c0", None, "same");
+        undated.meta.filed_at = None;
+        let dated = chunk_spec("c1", None, "same");
+        let mut wm = wings();
+        let sv = run(
+            &[undated.clone(), dated.clone()],
+            None,
+            &mut wm,
+            &no_reserved,
+        );
+        assert_eq!(sv.collapsed.get("c0").map(String::as_str), Some("c1"));
+
+        let f = NoFilter;
+        let planner = Planner {
+            mapper: Mapper {
+                wings: &wm,
+                assume: utc(),
+                filter: &f,
+            },
+            survey: &sv,
+        };
+        let unseen = d("zz", "never surveyed", dated.meta.clone());
+        assert!(matches!(
+            planner.plan(&unseen),
+            Planned::Skipped {
+                reason: "not in survey"
+            }
+        ));
+        let know = d("kz", "note", knowledge_meta("alice", "decisions"));
+        assert!(matches!(planner.plan(&know), Planned::Memories(_)));
     }
 }
