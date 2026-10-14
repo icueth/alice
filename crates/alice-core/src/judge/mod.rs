@@ -277,7 +277,7 @@ pub fn predicate_question(new: &str, existing: &[String]) -> (String, Vec<Choice
         .collect();
     (
         format!(
-            "A knowledge-graph relation is named \"{}\". Which existing relation name means the same?",
+            "A knowledge-graph relation is named \"{}\". Which existing relation name means the same? Names that express opposite directions (for example `belongs_to` and `owns`) are different relations.",
             new.replace('_', " ")
         ),
         options,

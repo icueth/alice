@@ -1284,7 +1284,7 @@ fn config_list_unset_delete_secret_and_the_problems_shown() {
     );
     assert_eq!(
         env.json(&["config", "get", "search.relevance_floor"]),
-        serde_json::json!(0.79)
+        serde_json::json!(0.805)
     );
     let missing = env.run(&["config", "get", "no.such.key"]);
     assert!(!missing.status.success());

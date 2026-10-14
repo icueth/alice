@@ -348,10 +348,15 @@ impl Default for EmbeddingSettings {
 pub struct SearchSettings {
     /// Token budget of a recall answer when the agent does not ask for one (100 to 50000).
     pub default_max_tokens: usize,
-    /// Cosine similarity at which a match found only by meaning counts as relevant (0 to 1).
+    /// Rescue floor for memories found only by meaning (cosine, 0 to 1): below the sure floor
+    /// such a match counts as relevant at or above this and within the margin of the best one.
     pub relevance_floor: f64,
-    /// A match found only by meaning is dropped when it is more than this below the best such
-    /// match of the query (0 to 1; 0 turns the relative cut off). Word matches always stay.
+    /// Sure floor for memories found only by meaning (cosine, 0 to 1, not below the rescue
+    /// floor): at or above it a match is always relevant.
+    pub relevance_sure: f64,
+    /// A memory found only by meaning below the sure floor is dropped when it is more than this
+    /// below the best such match of the query (0 to 1; 0 turns the relative cut off). Word
+    /// matches always stay. Transcript chunks use a fixed floor of 0.82.
     pub relevance_margin: f64,
     /// Fewer relevant memories than this bring in raw transcript chunks (0 to 50).
     pub raw_fallback_min_results: usize,
@@ -367,8 +372,9 @@ impl Default for SearchSettings {
             default_max_tokens: crate::model::limits::DEFAULT_RECALL_TOKENS,
             // `search::DEFAULT_RELEVANCE_FLOOR` and `DEFAULT_RELEVANCE_MARGIN` as written (the
             // f32 widened would show as 0.8199999928474426); a test keeps them equal.
-            relevance_floor: 0.79,
-            relevance_margin: 0.03,
+            relevance_floor: 0.805,
+            relevance_sure: 0.825,
+            relevance_margin: 0.015,
             raw_fallback_min_results: 3,
             weights: Weights::default(),
             half_life: HalfLives::default(),
@@ -1328,7 +1334,17 @@ impl Settings {
 
         let s = &self.search;
         unit(&mut e, "search.relevance_floor", s.relevance_floor);
+        unit(&mut e, "search.relevance_sure", s.relevance_sure);
         unit(&mut e, "search.relevance_margin", s.relevance_margin);
+        if s.relevance_sure < s.relevance_floor {
+            e.push(err(
+                "search.relevance_sure",
+                format!(
+                    "{} is below search.relevance_floor ({}); the sure floor must not be lower",
+                    s.relevance_sure, s.relevance_floor
+                ),
+            ));
+        }
         if !(100..=50_000).contains(&s.default_max_tokens) {
             e.push(err(
                 "search.default_max_tokens",
@@ -1992,8 +2008,9 @@ mod tests {
             (0.85, 0.5)
         );
         assert_eq!(s.judge.jev.model, "jev-1.13.0");
-        assert_eq!(s.search.relevance_floor, 0.79);
-        assert_eq!(s.search.relevance_margin, 0.03);
+        assert_eq!(s.search.relevance_floor, 0.805);
+        assert_eq!(s.search.relevance_sure, 0.825);
+        assert_eq!(s.search.relevance_margin, 0.015);
         assert_eq!(s.storage.raw_retention, Retention::Forever);
         assert_eq!((s.backup.daily, s.backup.weekly), (7, 4));
         assert_eq!(s.secrets.backend, SecretsBackend::File);
@@ -2013,6 +2030,10 @@ mod tests {
             crate::search::DEFAULT_RELEVANCE_MARGIN
         );
         assert_eq!(
+            s.search.relevance_sure as f32,
+            crate::search::DEFAULT_RELEVANCE_SURE
+        );
+        assert_eq!(
             s.search.default_max_tokens,
             crate::model::limits::DEFAULT_RECALL_TOKENS
         );
@@ -2023,11 +2044,11 @@ mod tests {
         // Shown as written, not as an f32 widened to f64 (0.8199999928474426).
         assert_eq!(
             get_key(&s, "search.relevance_floor"),
-            Some(serde_json::json!(0.79))
+            Some(serde_json::json!(0.805))
         );
         assert_eq!(
             get_key(&s, "search.relevance_margin"),
-            Some(serde_json::json!(0.03))
+            Some(serde_json::json!(0.015))
         );
         assert_eq!(
             get_key(&s, "judge.cluster_similarity"),
@@ -2094,6 +2115,11 @@ mod tests {
                 "",
                 &[("ALICE_SEARCH_RELEVANCE_FLOOR", "very")],
                 "search.relevance_floor",
+            ),
+            (
+                "[search]\nrelevance_floor = 0.9\n",
+                &[],
+                "search.relevance_sure",
             ),
             (
                 "[search]\nrelevance_margin = 1.5\n",

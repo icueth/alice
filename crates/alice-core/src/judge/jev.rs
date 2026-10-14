@@ -1827,6 +1827,36 @@ mod tests {
         );
     }
 
+    /// Predicate names go out only through the scoped override, covering `global` and the
+    /// projects given; the unscoped entry point is refused.
+    #[test]
+    fn predicate_matching_is_scoped_and_the_unscoped_entry_is_refused() {
+        let s = Scripted::ok();
+        let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
+        let existing = vec!["runs_on".to_string()];
+        assert_eq!(
+            j.match_predicate("is_hosted_on", &existing),
+            Err(JudgeError::Denied)
+        );
+        assert_eq!(
+            j.match_predicate_in(&["secret-proj"], "is_hosted_on", &existing),
+            Err(JudgeError::Denied)
+        );
+        assert!(
+            s.calls.lock().is_empty(),
+            "nothing was sent for a denied call"
+        );
+        // Allowed projects: one request, covering the names and nothing else.
+        let _ = j.match_predicate_in(&["alice"], "is_hosted_on", &existing);
+        let calls = s.calls.lock();
+        assert_eq!(calls.len(), 1);
+        let sent = calls[0].to_string();
+        assert!(
+            sent.contains("is hosted on") && sent.contains("runs on"),
+            "{sent}"
+        );
+    }
+
     #[test]
     fn a_call_covering_several_projects_needs_every_one_of_them_allowed() {
         let s = Scripted::ok();

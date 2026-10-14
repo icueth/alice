@@ -977,7 +977,9 @@ impl Service {
                     limit: search_limit,
                     // The one place the f64 setting becomes the f32 the search compares with.
                     relevance_floor: cfg.search.relevance_floor as f32,
+                    relevance_sure: Some(cfg.search.relevance_sure as f32),
                     relevance_margin: cfg.search.relevance_margin as f32,
+                    chunk_floor: Some(search::CHUNK_RELEVANCE_FLOOR),
                     raw_min_results: cfg.search.raw_fallback_min_results,
                     half_lives: cfg.search.half_life.clone(),
                     lists: search::Lists::Hybrid,
@@ -1043,15 +1045,35 @@ impl Service {
     ) -> (SearchOutput, bool) {
         let judge = self.judge();
         let mut reranked = false;
-        let model = judge.provider() != "heuristic" && self.judge.cloud_allowed(query_project);
-        if model {
+        // The cloud policy is asked once per distinct project, off the runtime's threads (each
+        // answer reads the store).
+        let allowed: std::collections::HashSet<String> = if judge.provider() == "heuristic" {
+            Default::default()
+        } else {
+            let mut projects = vec![query_project.to_string()];
+            for h in out.hits.iter().take(PRECISE_TOP) {
+                if h.tier == Tier::Knowledge && !projects.contains(&h.project) {
+                    projects.push(h.project.clone());
+                }
+            }
+            let hub = self.judge.clone();
+            tokio::task::spawn_blocking(move || {
+                projects
+                    .into_iter()
+                    .filter(|p| hub.cloud_allowed(p))
+                    .collect()
+            })
+            .await
+            .unwrap_or_default()
+        };
+        if allowed.contains(query_project) {
             // Knowledge hits among the top, with their place in the hit list.
             let graded: Vec<(usize, JudgeMemory)> = out
                 .hits
                 .iter()
                 .take(PRECISE_TOP)
                 .enumerate()
-                .filter(|(_, h)| h.tier == Tier::Knowledge && self.judge.cloud_allowed(&h.project))
+                .filter(|(_, h)| h.tier == Tier::Knowledge && allowed.contains(&h.project))
                 .map(|(i, h)| {
                     let ordinal = out.hits[..i]
                         .iter()
@@ -1120,7 +1142,9 @@ impl Service {
             .count();
         out.memory_seqs.truncate(shown);
         out.memory_importance.truncate(shown);
-        if reranked {
+        // `related` followed the unlimited search; it is recomputed for the results kept, which
+        // also puts back memories that only the cut-off results shadowed.
+        {
             let ids: Vec<String> = out
                 .hits
                 .iter()
@@ -3847,14 +3871,14 @@ mod tests {
             },
         )
         .unwrap();
-        std::fs::write(home.config_file(), "[search]\nrelevance_floor = 0.9\n").unwrap();
+        std::fs::write(home.config_file(), "[search]\nrelevance_floor = 0.81\n").unwrap();
         for _ in 0..200 {
-            if s.settings().search.relevance_floor == 0.9 {
+            if s.settings().search.relevance_floor == 0.81 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(s.settings().search.relevance_floor, 0.9);
+        assert_eq!(s.settings().search.relevance_floor, 0.81);
         assert_eq!(
             s.settings_view().sources["search.relevance_floor"],
             alice_core::settings::Source::File

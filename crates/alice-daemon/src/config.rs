@@ -904,7 +904,7 @@ mod tests {
             2000,
             "and so do the valid variables"
         );
-        assert_eq!(s.get().search.relevance_floor, 0.79);
+        assert_eq!(s.get().search.relevance_floor, 0.805);
         let errs = s.errors();
         assert!(
             errs.iter().any(|e| e.key == "search.relevance_floor"
