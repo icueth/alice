@@ -67,12 +67,14 @@ const KNOWLEDGE_GROUP: usize = 100;
 const RAW_PAGE: usize = 2_000;
 /// Pause after each committed batch (spec §10: 20 clients stay under 50 ms while an import runs).
 const BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(2);
+/// The job looks at the write-ahead log every this many batches.
+const WAL_CHECK_EVERY: u64 = 20;
 /// A batch closes at this many records ...
-const BATCH_RECORDS: usize = 50;
+pub const BATCH_RECORDS: usize = 50;
 /// ... or this many bytes of text, whichever comes first, and only between two drawers.
-const BATCH_BYTES: usize = 16 * 1024;
+pub const BATCH_BYTES: usize = 16 * 1024;
 /// Collapsed pairs per batch (they carry no text): one writer slice.
-const COLLAPSED_PER_BATCH: usize = 200;
+pub const COLLAPSED_PER_BATCH: usize = 200;
 /// Why a repeated chunk is not recorded: its keeper is not stored.
 const REPEAT_OF_UNSTORED: &str = "repeat of a chunk that was not stored";
 /// Facts per graph batch.
@@ -121,6 +123,30 @@ pub struct ImportEnv {
     pub status: Arc<Mutex<ImportStatus>>,
     /// Tests only: a pause and a panic inside the job.
     pub hook: Option<Arc<ImportHook>>,
+}
+
+/// Live bytes of the write-ahead log after a `PASSIVE` checkpoint (which never takes the write
+/// lock and never waits), on a short-lived connection of its own. The file itself never shrinks
+/// when the log restarts, so the frames in use are what counts. 0 when the log cannot be read.
+fn passive_checkpoint(db: &Path) -> u64 {
+    let Ok(conn) = rusqlite::Connection::open(db) else {
+        return 0;
+    };
+    let _ = conn.busy_timeout(std::time::Duration::ZERO);
+    let page: u64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
+        .map_or(4096, |p| p as u64);
+    conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get::<_, i64>(1))
+        .map_or(0, |frames| frames.max(0) as u64 * page)
+}
+
+/// Constant readers can keep SQLite from ever restarting the log, so it grows without bound
+/// (a 100,000-drawer import under 20 clients reached 4 GB). The job copies it back with
+/// `PASSIVE` checkpoints, which never wait and never touch the write lock. A blocking checkpoint
+/// (`RESTART`) would restart the log, but it made the writer's own transactions fail with
+/// "database is locked" under load, so it is not used. Returns the live size seen.
+fn relieve_wal(db: &Path) -> u64 {
+    passive_checkpoint(db)
 }
 
 /// Test hook: makes the job wait (`hold`) or panic (`panic`) right after its snapshot is taken.
@@ -915,11 +941,17 @@ impl Ctx<'_> {
                 // A breath between batches: remembers that queued behind this one are served
                 // before the next one is built, so the import never keeps the writer busy back to back.
                 std::thread::sleep(BATCH_PAUSE);
-                {
+                let batches = {
                     let mut st = self.env.status.lock();
                     st.batches += 1;
                     st.max_batch_records = st.max_batch_records.max(records as u64);
                     st.max_batch_bytes = st.max_batch_bytes.max(bytes as u64);
+                    st.batches
+                };
+                if batches.is_multiple_of(WAL_CHECK_EVERY) {
+                    let live = relieve_wal(&self.env.home.db());
+                    let mut st = self.env.status.lock();
+                    st.max_wal_bytes = st.max_wal_bytes.max(live);
                 }
                 Ok(self.absorb(out))
             }

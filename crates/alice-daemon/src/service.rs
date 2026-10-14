@@ -2762,6 +2762,7 @@ impl Service {
             batches: 0,
             max_batch_records: 0,
             max_batch_bytes: 0,
+            max_wal_bytes: 0,
         };
         *slot.status.lock() = first.clone();
         let env = ImportEnv {

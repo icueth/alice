@@ -2180,6 +2180,20 @@ mod import {
             assert_eq!(v["status"], "new", "{v}");
             acked.push(v["id"].as_str().unwrap().to_string());
         }
+        // What the import has committed so far (read while the daemon runs; the kill is next).
+        let kept_before_kill: i64 = {
+            let db = rusqlite::Connection::open_with_flags(
+                alice_daemon::paths::AliceHome::new(e.home.clone()).db(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            db.query_row("SELECT count(*) FROM legacy_ids", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(
+            kept_before_kill > 0,
+            "the import had committed nothing at the kill"
+        );
         let pid = e.daemon_pid().unwrap();
         // SAFETY: killing the daemon this test started.
         unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -2205,6 +2219,16 @@ mod import {
         };
         let second = run("rerun");
         assert_eq!(second.drawers_seen as usize, n);
+        // The resume kept the progress: what was committed before the kill is skipped, not redone.
+        assert!(
+            second.already_imported as i64 >= kept_before_kill,
+            "resumed run skipped {} drawers but {kept_before_kill} were stored before the kill",
+            second.already_imported
+        );
+        assert!(
+            (second.already_imported as usize) < n,
+            "the kill came after the import had finished"
+        );
         // 4. the third run finds everything stored
         let third = run("third");
         assert_eq!(third.tiers.knowledge, 0);
@@ -2248,6 +2272,77 @@ mod import {
     }
 
     #[test]
+    fn restore_during_an_import_ends_it_cleanly_and_the_rerun_finishes() {
+        let e = Env::new();
+        e.ok(&["remember", "alpha kept in the backup"]);
+        let name = e.json(&["backup", "now"])["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let palace_dir = e._dir.path().join("palace");
+        let fx = alice_core::import::fixture::synthetic_palace(&palace_dir, 20_000);
+        let importer =
+            e.alice_child(&["--json", "import", "mempalace", "--palace", p(&palace_dir)]);
+        let started = Instant::now();
+        loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(300),
+                "import never got going"
+            );
+            let st = e.alice(&["--json", "import", "status"]);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&st.stdout)
+                && v["state"] == "running"
+                && v["done"].as_u64().unwrap_or(0) >= 2_000
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let r = e.run(&["restore", &name, "--yes"]);
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        let out = importer.wait_with_output().unwrap();
+        assert!(
+            !out.status.success(),
+            "the import client outlived the restore"
+        );
+        // The next call starts a daemon: it sweeps import-tmp, and the restored database holds
+        // the backup's memory and none of the import.
+        let recall = e.alice(&["recall", "alpha kept in the backup"]);
+        assert!(recall.stdout.contains("alpha kept"), "{}", recall.stdout);
+        let left = std::fs::read_dir(e.home.join("import-tmp"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(left, 0, "import-tmp was swept");
+        let o = e.alice(&["--json", "import", "mempalace", "--palace", p(&palace_dir)]);
+        assert!(o.status.success(), "{}\n{}", o.stderr, o.stdout);
+        let rep: ImportReport = serde_json::from_str(&o.stdout).unwrap();
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+        assert_eq!(
+            rep.already_imported, 0,
+            "the restore took the half import away"
+        );
+        assert_eq!(rep.tiers.knowledge as usize, fx.knowledge);
+        e.ok(&["daemon", "stop"]);
+        let db = rusqlite::Connection::open_with_flags(
+            alice_daemon::paths::AliceHome::new(e.home.clone()).db(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let check: String = db
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        let chunk_rows: i64 = db
+            .query_row(
+                "SELECT count(*) FROM legacy_ids WHERE target_type = 'chunk'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_rows as usize, fx.chunk_drawers);
+    }
+
+    #[test]
     fn a_target_that_cannot_be_written_fails_cleanly_and_resumes() {
         use std::os::unix::fs::PermissionsExt;
         let e = Env::new();
@@ -2257,9 +2352,19 @@ mod import {
         let tmp = e.home.join("import-tmp");
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Whatever happens next, the folder is writable again when the test ends (a failed
+        // assertion would otherwise leave a directory the temp dir cannot delete).
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _restore = Restore(tmp.clone());
         let writable = std::fs::File::create(tmp.join("probe")).is_ok();
         if writable {
             // Running as root: permissions do not bind; nothing to prove.
+            eprintln!("skipped: permissions do not bind this user");
             let _ = std::fs::remove_file(tmp.join("probe"));
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
             return;

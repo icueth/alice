@@ -75,6 +75,9 @@ pub struct ImportStatus {
     pub max_batch_records: u64,
     #[serde(default)]
     pub max_batch_bytes: u64,
+    /// The most write-ahead log (bytes of live frames) seen at the job's checks.
+    #[serde(default)]
+    pub max_wal_bytes: u64,
 }
 
 impl ImportStatus {
@@ -90,6 +93,7 @@ impl ImportStatus {
             batches: 0,
             max_batch_records: 0,
             max_batch_bytes: 0,
+            max_wal_bytes: 0,
         }
     }
 }

@@ -278,7 +278,12 @@ async fn twenty_clients_keep_working_while_a_palace_imports() {
     );
     let (rp, cp) = (p95(&stats.remember_ms), p95(&stats.recall_ms));
     let wal = std::fs::metadata(format!("{}-wal", f.home.db().display())).map_or(0, |m| m.len());
-    eprintln!("write-ahead log at the end: {} MB", wal / 1_000_000);
+    let peak = f.svc.import_status().max_wal_bytes;
+    eprintln!(
+        "write-ahead log: live peak at the import's checks {} MB, file at the end {} MB",
+        peak / 1_000_000,
+        wal / 1_000_000
+    );
     eprintln!(
         "import {} drawers in {:?}; remember p95 {:.1} ms, recall p95 {:.1} ms ({} remembers, {} recalls)",
         n,
@@ -324,13 +329,15 @@ async fn one_batch_never_holds_the_writer_longer_than_the_slice_budget() {
     assert!(acks > 0);
     assert!(longest < bound, "longest ack {longest:?} (bound {bound:?})");
     assert!(st.batches > 0);
+    // Text batches close at BATCH_RECORDS / BATCH_BYTES; the text-free `collapsed` batches
+    // are the largest by records.
     assert!(
-        st.max_batch_records <= 200,
+        st.max_batch_records <= alice_daemon::importer::COLLAPSED_PER_BATCH as u64,
         "a batch of {} records",
         st.max_batch_records
     );
     assert!(
-        st.max_batch_bytes <= 64 * 1024,
+        st.max_batch_bytes <= alice_daemon::importer::BATCH_BYTES as u64,
         "a batch of {} bytes",
         st.max_batch_bytes
     );
