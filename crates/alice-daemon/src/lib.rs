@@ -3,6 +3,7 @@
 pub mod backup;
 pub mod client;
 pub mod compat;
+pub mod compat_schema;
 pub mod config;
 pub mod daemon;
 pub mod discovery;

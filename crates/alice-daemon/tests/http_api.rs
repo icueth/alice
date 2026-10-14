@@ -2004,13 +2004,16 @@ async fn the_flags_endpoint_answers_without_asking_the_secrets_store() {
     })
     .await;
     let flags: serde_json::Value = s.get_json("/api/v1/settings/flags").await;
-    assert_eq!(flags, serde_json::json!({ "mcp.admin_tools": false }));
+    assert_eq!(
+        flags,
+        serde_json::json!({ "mcp.admin_tools": false, "compat.mempalace": false })
+    );
     // An edit of config.toml (a PATCH would answer with the whole view, secrets included).
     std::fs::write(s.home.config_file(), "[mcp]\nadmin_tools = true\n").unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let flags: serde_json::Value = s.get_json("/api/v1/settings/flags").await;
-        if flags == serde_json::json!({ "mcp.admin_tools": true }) {
+        if flags == serde_json::json!({ "mcp.admin_tools": true, "compat.mempalace": false }) {
             break;
         }
         assert!(

@@ -1069,6 +1069,86 @@ async fn stdio_mcp_shim_lists_tools_and_round_trips() {
     assert_eq!(e.log().matches("daemon started").count(), 1);
 }
 
+/// The shim offers the MemPalace tools while the daemon says `compat.mempalace` is on (it asks
+/// the daemon, cached for a moment, and fails closed): a listing never starts a daemon, so with
+/// the daemon stopped the compat tools are gone and the daemon stays stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stdio_shim_lists_compat_tools_when_the_daemon_has_them_on() {
+    use rmcp::ServiceExt;
+    use rmcp::model::CallToolRequestParams;
+    use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+    let e = Env::new();
+    e.ok(&["remember", "seed for the compat shim"]);
+    e.ok(&["config", "set", "compat.mempalace", "true"]);
+    let (home, work) = (e.home.clone(), e.work.clone());
+    let client = ()
+        .serve(
+            TokioChildProcess::new(tokio::process::Command::new(BIN).configure(move |c| {
+                c.arg("mcp")
+                    .current_dir(&work)
+                    .env("ALICE_HOME", &home)
+                    .env("ALICE_EMBEDDER", "fake")
+                    .env("ALICE_LOG", "warn");
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let count = |tools: &[rmcp::model::Tool]| {
+        tools
+            .iter()
+            .filter(|t| t.name.starts_with("mempalace_"))
+            .count()
+    };
+    // The shim's answer about the switches is cached for a second, so wait for it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let tools = client.list_all_tools().await.unwrap();
+        if count(&tools) == 15 {
+            assert_eq!(tools.len(), 22);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no compat tools: {}",
+            tools.len()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let r = client
+        .call_tool(CallToolRequestParams::new("mempalace_list_wings"))
+        .await
+        .unwrap();
+    let text = r
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    assert_ne!(r.is_error, Some(true), "{text}");
+    assert!(text.contains("wings"), "{text}");
+
+    // Off again in the daemon: the listing follows.
+    e.ok(&["config", "set", "compat.mempalace", "false"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while count(&client.list_all_tools().await.unwrap()) != 0 {
+        assert!(Instant::now() < deadline, "compat tools stayed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // On, the daemon stopped: nothing answers, so nothing is offered, and listing starts nothing.
+    e.ok(&["config", "set", "compat.mempalace", "true"]);
+    e.ok(&["daemon", "stop"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !e.lock_free() {
+        assert!(Instant::now() < deadline, "the daemon did not stop");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(count(&client.list_all_tools().await.unwrap()), 0);
+    assert!(e.lock_free(), "listing started a daemon");
+    client.cancel().await.unwrap();
+}
+
 /// `alice bench` works on throw-away data: the ALICE_HOME in use is never touched (nor accepted
 /// as `--dir`), the temporary home is removed, its daemon is gone, and `--dir` data is reused.
 #[test]

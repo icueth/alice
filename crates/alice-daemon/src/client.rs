@@ -731,9 +731,10 @@ impl DaemonClient {
             ))
         }
     }
-    /// Whether `mcp.admin_tools` is on, asked of the small flags endpoint (no secrets' status)
-    /// with a short timeout.
-    pub async fn admin_tools_flag(&self) -> Result<bool> {
+    /// The switches `alice mcp` obeys (`mcp.admin_tools`, `compat.mempalace`), asked of the
+    /// small flags endpoint (no secrets' status) with a short timeout. A key the daemon does not
+    /// send reads as off.
+    pub async fn switches(&self) -> Result<crate::mcp::Switches> {
         let resp = self
             .http
             .get(format!("{}/api/v1/settings/flags", self.base))
@@ -743,7 +744,10 @@ impl DaemonClient {
             .await
             .map_err(transport)?;
         let v: serde_json::Value = Self::decode(resp).await?;
-        Ok(v["mcp.admin_tools"].as_bool() == Some(true))
+        Ok(crate::mcp::Switches {
+            admin_tools: v["mcp.admin_tools"].as_bool() == Some(true),
+            compat_mempalace: v["compat.mempalace"].as_bool() == Some(true),
+        })
     }
     pub async fn shutdown(&self) -> Result<()> {
         let resp = self

@@ -16,6 +16,16 @@ use alice_daemon::paths::AliceHome;
 use alice_daemon::service::{Service, ServiceOptions};
 use serde_json::{Value, json};
 
+use alice_daemon::client::Launcher;
+use alice_daemon::discovery::{DaemonInfo, write_info};
+use alice_daemon::mcp::{AliceMcp, Backend, RemoteBackend};
+use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation};
+use rmcp::transport::streamable_http_client::{
+    StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+};
+use rmcp::{ClientHandler, RoleClient, ServiceExt};
+use tokio_util::sync::CancellationToken;
+
 // ------------------------------------------------------------------------------------ fixtures
 
 #[path = "common/palace.rs"]
@@ -1721,4 +1731,369 @@ async fn a_secret_shaped_agent_name_is_stored_and_shown_redacted_and_diary_title
             panic!("{sql}: {rows:?}");
         }
     }
+}
+
+// ------------------------------------------------------------------------------------- MCP
+
+#[derive(Clone)]
+struct Named(&'static str);
+impl ClientHandler for Named {
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::new(
+            ClientCapabilities::default(),
+            Implementation::new(self.0, "1.0"),
+        )
+    }
+}
+
+/// The imported service served over HTTP (as the daemon does) and published for `alice mcp`.
+struct Served {
+    port: u16,
+    token: String,
+    stop: CancellationToken,
+}
+
+impl Flow {
+    async fn serve(&self) -> Served {
+        alice_daemon::install_tls();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let home = self.svc.home().clone();
+        let token = alice_daemon::discovery::load_or_create_token(&home).unwrap();
+        write_info(
+            &home,
+            &DaemonInfo {
+                pid: std::process::id(),
+                port,
+                instance: self.svc.instance().into(),
+                version: "t".into(),
+                started_at: "t".into(),
+            },
+        )
+        .unwrap();
+        let stop = CancellationToken::new();
+        let app = alice_daemon::http::router(self.svc.clone(), token.clone(), port, stop.clone());
+        let ct = stop.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { ct.cancelled().await })
+                .await
+                .unwrap()
+        });
+        Served { port, token, stop }
+    }
+
+    fn patch(&self, key: &str, on: bool) {
+        let mut change = serde_json::Map::new();
+        change.insert(key.into(), json!(on));
+        self.svc.settings_handle().patch(&change).unwrap();
+    }
+    fn set_compat(&self, on: bool) {
+        self.patch("compat.mempalace", on);
+    }
+}
+
+impl Served {
+    fn transport(&self) -> StreamableHttpClientTransport<reqwest::Client> {
+        let cfg = StreamableHttpClientTransportConfig::with_uri(format!(
+            "http://127.0.0.1:{}/mcp",
+            self.port
+        ))
+        .auth_header(self.token.clone());
+        StreamableHttpClientTransport::from_config(cfg)
+    }
+}
+
+type Client<C> = rmcp::service::RunningService<RoleClient, C>;
+
+async fn names<C: ClientHandler>(c: &Client<C>) -> Vec<String> {
+    let mut v: Vec<String> = c
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+fn compat_count(v: &[String]) -> usize {
+    v.iter().filter(|n| n.starts_with("mempalace_")).count()
+}
+
+fn tool_call(name: &str, v: Value) -> CallToolRequestParams {
+    CallToolRequestParams::new(name.to_string()).with_arguments(v.as_object().unwrap().clone())
+}
+
+fn first_text(r: &rmcp::model::CallToolResult) -> String {
+    r.content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .unwrap_or_default()
+}
+
+fn value_of(r: &rmcp::model::CallToolResult) -> Value {
+    serde_json::from_str(&first_text(r)).unwrap_or_else(|_| panic!("not JSON: {}", first_text(r)))
+}
+
+fn error_text(e: rmcp::ServiceError) -> String {
+    match e {
+        rmcp::ServiceError::McpError(d) => format!("{} {}", d.message, d.data.unwrap_or_default()),
+        other => other.to_string(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compat_tools_appear_and_vanish_with_the_setting_without_a_restart() {
+    let f = Flow::imported().await;
+    let s = f.serve().await;
+    let c = Named("test-agent").serve(s.transport()).await.unwrap();
+    f.set_compat(false);
+    assert_eq!(compat_count(&names(&c).await), 0);
+    f.set_compat(true);
+    let on = names(&c).await;
+    assert_eq!(compat_count(&on), 15, "{on:?}");
+    for core in [
+        "recall",
+        "remember",
+        "context",
+        "get_memory",
+        "update_memory",
+        "query_facts",
+        "assert_fact",
+    ] {
+        assert!(on.contains(&core.to_string()), "{core}");
+    }
+    f.set_compat(false);
+    assert_eq!(compat_count(&names(&c).await), 0);
+    c.cancel().await.ok();
+    s.stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_while_compat_is_off_is_refused_with_the_way_to_turn_it_on() {
+    let f = Flow::imported().await;
+    let s = f.serve().await;
+    let c = Named("test-agent").serve(s.transport()).await.unwrap();
+    f.set_compat(false);
+    for name in ["mempalace_search", "mempalace_mine"] {
+        let err = error_text(
+            c.call_tool(tool_call(name, json!({"query": "x"})))
+                .await
+                .unwrap_err(),
+        );
+        assert!(err.contains("tool not found"), "{err}");
+        assert!(err.contains("compat.mempalace"), "{err}");
+    }
+    f.set_compat(true);
+    let r = c
+        .call_tool(tool_call("mempalace_list_wings", json!({})))
+        .await
+        .unwrap();
+    assert_ne!(r.is_error, Some(true), "{}", first_text(&r));
+    assert!(value_of(&r).get("wings").is_some(), "{}", first_text(&r));
+    let r = c
+        .call_tool(tool_call("mempalace_search", json!({"query": "the"})))
+        .await
+        .unwrap();
+    assert!(value_of(&r).is_object());
+    c.cancel().await.ok();
+    s.stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unsupported_names_are_answered_but_not_listed() {
+    let f = Flow::imported().await;
+    f.set_compat(true);
+    let s = f.serve().await;
+    let c = Named("test-agent").serve(s.transport()).await.unwrap();
+    assert!(!names(&c).await.contains(&"mempalace_mine".to_string()));
+    let r = c
+        .call_tool(tool_call("mempalace_mine", json!({})))
+        .await
+        .unwrap();
+    assert_ne!(r.is_error, Some(true));
+    assert!(
+        first_text(&r).contains("alice import mempalace"),
+        "{}",
+        first_text(&r)
+    );
+    c.cancel().await.ok();
+    s.stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_listed_schema_names_mempalaces_arguments() {
+    let expected: &[(&str, &[&str])] = &[
+        ("mempalace_status", &[]),
+        ("mempalace_search", &["query"]),
+        ("mempalace_add_drawer", &["wing", "room", "content"]),
+        ("mempalace_diary_write", &["agent_name"]),
+        ("mempalace_diary_read", &["agent_name"]),
+        ("mempalace_get_drawer", &["drawer_id"]),
+        ("mempalace_update_drawer", &["drawer_id"]),
+        ("mempalace_delete_drawer", &["drawer_id"]),
+        ("mempalace_kg_query", &["entity"]),
+        ("mempalace_kg_add", &["subject", "predicate", "object"]),
+        (
+            "mempalace_kg_invalidate",
+            &["subject", "predicate", "object"],
+        ),
+        (
+            "mempalace_kg_supersede",
+            &["subject", "predicate", "old_object", "new_object"],
+        ),
+        ("mempalace_kg_timeline", &[]),
+        ("mempalace_list_wings", &[]),
+        ("mempalace_list_rooms", &[]),
+    ];
+    let tools = alice_daemon::compat_schema::tools();
+    assert_eq!(tools.len(), alice_daemon::compat::SUPPORTED.len());
+    for name in alice_daemon::compat::SUPPORTED {
+        assert!(tools.iter().any(|t| t.name == name), "{name}");
+    }
+    for t in &tools {
+        assert_eq!(t.input_schema["type"], "object", "{}", t.name);
+        assert!(t.description.as_deref().is_some_and(|d| !d.is_empty()));
+        let want = expected.iter().find(|(n, _)| *n == t.name).unwrap().1;
+        let got: Vec<&str> = t
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|a| a.iter().map(|v| v.as_str().unwrap()).collect())
+            .unwrap_or_default();
+        assert_eq!(got, want, "required of {}", t.name);
+    }
+    // A call built from the schema's own properties succeeds for the three writers.
+    let f = Flow::imported().await;
+    f.set_compat(true);
+    let s = f.serve().await;
+    let c = Named("test-agent").serve(s.transport()).await.unwrap();
+    let listed = c.list_all_tools().await.unwrap();
+    for (name, sample) in [
+        ("mempalace_search", json!({"query": "the"})),
+        (
+            "mempalace_add_drawer",
+            json!({"wing": "pg-ai", "room": "notes", "content": "a schema-built call"}),
+        ),
+        (
+            "mempalace_kg_add",
+            json!({"subject": "alpha", "predicate": "uses", "object": "beta"}),
+        ),
+    ] {
+        let t = listed.iter().find(|t| t.name == name).unwrap();
+        let props = t.input_schema["properties"].as_object().unwrap();
+        for k in sample.as_object().unwrap().keys() {
+            assert!(props.contains_key(k), "{name} lacks {k}");
+        }
+        let r = c.call_tool(tool_call(name, sample)).await.unwrap();
+        assert_ne!(r.is_error, Some(true));
+        let v = value_of(&r);
+        assert!(v.get("error").is_none(), "{name}: {v}");
+    }
+    c.cancel().await.ok();
+    s.stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn author_is_the_mcp_client_name_for_compat_writes() {
+    let f = Flow::imported().await;
+    f.set_compat(true);
+    let s = f.serve().await;
+    let c = Named("codex").serve(s.transport()).await.unwrap();
+    let a = c
+        .call_tool(tool_call(
+            "mempalace_add_drawer",
+            json!({"wing": "pg-ai", "room": "notes", "content": "written without added_by"}),
+        ))
+        .await
+        .unwrap();
+    let id = value_of(&a)["drawer_id"].as_str().unwrap().to_string();
+    assert_eq!(f.memory(&id).await.author.agent.as_deref(), Some("codex"));
+    let b = c
+        .call_tool(tool_call(
+            "mempalace_add_drawer",
+            json!({"wing": "pg-ai", "room": "notes", "content": "written with added_by", "added_by": "claude"}),
+        ))
+        .await
+        .unwrap();
+    let id = value_of(&b)["drawer_id"].as_str().unwrap().to_string();
+    assert_eq!(f.memory(&id).await.author.agent.as_deref(), Some("claude"));
+    c.cancel().await.ok();
+    s.stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_two_switches_are_independent_and_the_admin_one_is_unchanged() {
+    let f = Flow::imported().await;
+    let s = f.serve().await;
+    let c = Named("test-agent").serve(s.transport()).await.unwrap();
+    f.patch("mcp.admin_tools", true);
+    f.set_compat(false);
+    let n = names(&c).await;
+    assert_eq!((n.len(), compat_count(&n)), (11, 0), "{n:?}");
+    f.set_compat(true);
+    let n = names(&c).await;
+    assert_eq!((n.len(), compat_count(&n)), (26, 15), "{n:?}");
+    f.patch("mcp.admin_tools", false);
+    let n = names(&c).await;
+    assert_eq!((n.len(), compat_count(&n)), (22, 15), "{n:?}");
+    assert!(!n.contains(&"stats".to_string()));
+    let err = error_text(
+        c.call_tool(tool_call("stats", json!({})))
+            .await
+            .unwrap_err(),
+    );
+    assert!(err.contains("tool not found"), "{err}");
+    c.cancel().await.ok();
+    s.stop.cancel();
+}
+
+/// `alice mcp`'s backend asks the daemon for both switches in one question, fails closed when
+/// none answers, and sends the calls through the daemon's route.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stdio_backend_follows_both_switches_through_the_daemon_and_fails_closed() {
+    let f = Flow::imported().await;
+    let s = f.serve().await;
+    let server = AliceMcp::new(Backend::Remote(Arc::new(
+        RemoteBackend::new(f.svc.home().clone(), Launcher::None, None)
+            .with_admin_ttl(Duration::ZERO),
+    )));
+    let (a, b) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move { server.serve(a).await.unwrap().waiting().await });
+    let c = Named("shim-agent").serve(b).await.unwrap();
+    f.set_compat(false);
+    assert_eq!(compat_count(&names(&c).await), 0);
+    let err = error_text(
+        c.call_tool(tool_call("mempalace_list_wings", json!({})))
+            .await
+            .unwrap_err(),
+    );
+    assert!(err.contains("compat.mempalace"), "{err}");
+    f.set_compat(true);
+    assert_eq!(compat_count(&names(&c).await), 15);
+    let r = c
+        .call_tool(tool_call("mempalace_list_wings", json!({})))
+        .await
+        .unwrap();
+    assert!(value_of(&r).get("wings").is_some(), "{}", first_text(&r));
+    let w = c
+        .call_tool(tool_call(
+            "mempalace_add_drawer",
+            json!({"wing": "pg-ai", "room": "notes", "content": "through the shim"}),
+        ))
+        .await
+        .unwrap();
+    let id = value_of(&w)["drawer_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        f.memory(&id).await.author.agent.as_deref(),
+        Some("shim-agent")
+    );
+    // The daemon goes away: both switches read off.
+    s.stop.cancel();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(compat_count(&names(&c).await), 0, "no daemon answers: off");
+    c.cancel().await.ok();
 }

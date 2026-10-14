@@ -513,7 +513,11 @@ async fn patch_settings(
 /// The switches other processes read often (`alice mcp` asks before each tool listing): small,
 /// and without the secrets' status, which may wait on a keychain prompt.
 async fn settings_flags(State(st): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "mcp.admin_tools": st.svc.settings().mcp.admin_tools }))
+    let settings = st.svc.settings();
+    Json(serde_json::json!({
+        "mcp.admin_tools": settings.mcp.admin_tools,
+        "compat.mempalace": settings.compat.mempalace,
+    }))
 }
 
 /// The JSON Schema of the settings: the web UI renders its forms and help from it.
