@@ -19,6 +19,16 @@
 //! write. The caller's agent is the author (an `added_by` or `agent_name` argument wins); with no
 //! agent the write is the user's. Agents never create containers: a wing that is not an Alice
 //! project files the memory into the caller's current project and the answer says so.
+//!
+//! Actor mapping: the author of a write is the `added_by` / `agent_name` argument when given,
+//! else the call's `agent` (the MCP adapter fills it with the client's name). An author of
+//! `cli`, an empty one, or none is recorded as the user; any other string is a named agent, so a
+//! caller chooses its own attribution (as MemPalace's own `added_by` allowed). `update_drawer`,
+//! `delete_drawer` and the graph tools always act as the call's agent. A `source_file` is stored
+//! by file name only (`Source: <name>`), like everything else shown. Everything a write answers
+//! with is built from redacted values. `kg_timeline` needs an `entity` (Alice lists one entity's
+//! facts); `kg_add` with `valid_to` is two events (add, then end), reported honestly when the
+//! second step fails.
 
 use crate::service::Service;
 use alice_core::api::{
@@ -27,7 +37,7 @@ use alice_core::api::{
 };
 use alice_core::error::Result;
 use alice_core::import::plan::kind_for_room;
-use alice_core::model::{Author, Kind, Status};
+use alice_core::model::{Author, Kind, Memory, Status};
 use alice_core::normalize::normalize_topic;
 use alice_core::store::compat::{self as store, CompatDrawer, Overview};
 use alice_core::store::kg::{self, AssertFact, FactAction};
@@ -111,6 +121,13 @@ const WRITE_TOOLS: [&str; 7] = [
 ];
 const DIARY_DEFAULT_ENTRIES: u64 = 10;
 const DIARY_MAX_ENTRIES: u64 = 100;
+/// One diary entry is shown up to this many characters, and an answer up to this many bytes.
+const DIARY_ENTRY_CHARS: usize = 4_000;
+const DIARY_READ_BYTES: usize = 64_000;
+/// `kg_query` shows at most this many facts (a hub entity must not make a huge answer).
+const KG_QUERY_MAX_FACTS: usize = 200;
+const TRASHED_REFUSAL: &str =
+    "this memory was already forgotten (it is in the trash); `alice undo` brings it back";
 const TIMELINE_DEFAULT_LIMIT: u64 = 100;
 const TIMELINE_MAX_LIMIT: u64 = 1_000;
 const RAW_CHUNK_REFUSAL: &str = "raw transcript chunks cannot be changed one by one; they are the recorded history of a session. Save a corrected memory with mempalace_add_drawer instead";
@@ -226,6 +243,17 @@ fn check_time(name: &str, v: Option<String>) -> std::result::Result<Option<Strin
     }
 }
 
+/// An instant for ordering two caller-given times (a bare date is midnight UTC).
+fn instant(t: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(t)
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| {
+            chrono::NaiveDate::parse_from_str(t, "%Y-%m-%d")
+                .map(|d| d.and_time(chrono::NaiveTime::MIN).and_utc())
+                .unwrap_or_default()
+        })
+}
+
 fn now_millis() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -240,6 +268,17 @@ fn safe_error(e: alice_core::error::AliceError) -> String {
         E::NotFound(_) => "not found".into(),
         _ => "Alice could not read its memory store just now; run `alice status` for the cause"
             .into(),
+    }
+}
+
+/// [`safe_error`] for a write: the same rules, with sentences that say nothing was saved.
+fn write_error(e: alice_core::error::AliceError) -> String {
+    use alice_core::error::AliceError as E;
+    match e {
+        E::ReadOnly(_) => "Alice's memory is read-only just now, so this change was not saved; run `alice status` for the cause".into(),
+        E::Invalid(_) | E::Refused { .. } => e.to_string(),
+        E::NotFound(_) => "not found".into(),
+        _ => "Alice could not save that just now; run `alice status` for the cause".into(),
     }
 }
 
@@ -603,7 +642,10 @@ impl Service {
             .await
             .map_err(safe_error)?;
         match found {
-            None => Ok(error(format!("Drawer not found: {id}"))),
+            None => Ok(error(format!(
+                "Drawer not found: {}",
+                self.redact_echo(&id)
+            ))),
             Some(CompatDrawer::Chunk {
                 id,
                 project_slug,
@@ -635,7 +677,10 @@ impl Service {
                     .await
                     .map_err(safe_error)?;
                 let Some(full) = got.memories.into_iter().next() else {
-                    return Ok(error(format!("Drawer not found: {id}")));
+                    return Ok(error(format!(
+                        "Drawer not found: {}",
+                        self.redact_echo(&id)
+                    )));
                 };
                 let m = full.memory;
                 let room = m.topics.first().cloned().unwrap_or_default();
@@ -698,7 +743,7 @@ impl Service {
                 note: None,
             });
         };
-        Ok(match self.compat_wing(wing).await.map_err(safe_error)? {
+        Ok(match self.compat_wing(wing).await.map_err(write_error)? {
             Some(slug) => Target {
                 project: Some(slug),
                 note: None,
@@ -735,49 +780,79 @@ impl Service {
         let added_by = args.opt_str("added_by")?;
         let target = self.compat_target(Some(&wing)).await?;
         let content = match &source_file {
-            Some(sf) => format!("{content}\nSource: {sf}"),
+            Some(sf) => format!("{content}\nSource: {}", base_name(sf)),
             None => content,
         };
+        let topic = normalize_topic(&room);
         let r = self
-            .remember(RememberRequest {
+            .remember_or_spool(RememberRequest {
                 content,
                 kind: Some(kind_for_room(&room)),
                 project: target.project.clone(),
-                topics: normalize_topic(&room).into_iter().collect(),
+                topics: topic.iter().cloned().collect(),
                 cwd: call.cwd.clone(),
                 author: Self::author(call, added_by),
                 ..Default::default()
             })
             .await
-            .map_err(safe_error)?;
-        let Some(id) = r.id else {
-            return Err("the memory could not be saved just now; try again".into());
-        };
-        let mut out = match r.status {
-            RememberStatus::Duplicate => {
-                json!({ "success": true, "reason": "already_exists", "drawer_id": id })
+            .map_err(write_error)?;
+        let mut notes: Vec<String> = Vec::new();
+        if topic.is_none() {
+            notes.push(format!(
+                "room {} is not a usable room name; the memory was saved without a room",
+                self.redact_echo(&room)
+            ));
+        }
+        let mut out = match (r.status, r.id) {
+            (RememberStatus::Spooled, _) | (_, None) => {
+                if let Some(why) = r.reason {
+                    notes.push(why);
+                }
+                json!({ "success": true, "queued": true })
             }
-            _ => json!({ "success": true, "drawer_id": id, "wing": r.project, "room": room }),
+            (RememberStatus::Duplicate, Some(id)) => {
+                json!({ "success": true, "reason": "already_exists", "drawer_id": id, "wing": r.project })
+            }
+            (_, Some(id)) => json!({
+                "success": true, "drawer_id": id, "wing": r.project,
+                "room": topic.clone().unwrap_or_default(),
+            }),
         };
-        out["wing"] = json!(r.project);
         if let Some(n) = target.note {
-            out["note"] = json!(format!("{n}{}", r.project));
+            notes.insert(0, format!("{n}{}", r.project));
+        }
+        if !notes.is_empty() {
+            out["note"] = json!(notes.join("; "));
         }
         Ok(out)
     }
 
-    /// The memory a drawer id names; a raw chunk or an unknown id is the caller's error.
-    async fn compat_memory_id(&self, drawer_id: &str) -> std::result::Result<String, String> {
+    /// The live-or-not memory a drawer id names; a raw chunk or an unknown id is the caller's
+    /// error.
+    async fn compat_memory(&self, drawer_id: &str) -> std::result::Result<Memory, String> {
         let asked = drawer_id.to_string();
-        match self
+        let id = match self
             .read(move |c| store::resolve_drawer(c, &asked))
             .await
-            .map_err(safe_error)?
+            .map_err(write_error)?
         {
-            Some(CompatDrawer::Memory(id)) => Ok(id),
-            Some(CompatDrawer::Chunk { .. }) => Err(RAW_CHUNK_REFUSAL.into()),
-            None => Err(format!("Drawer not found: {drawer_id}")),
-        }
+            Some(CompatDrawer::Memory(id)) => id,
+            Some(CompatDrawer::Chunk { .. }) => return Err(RAW_CHUNK_REFUSAL.into()),
+            None => {
+                return Err(format!("Drawer not found: {}", self.redact_echo(drawer_id)));
+            }
+        };
+        self.get(GetRequest {
+            ids: vec![id],
+            include_provenance: false,
+        })
+        .await
+        .map_err(write_error)?
+        .memories
+        .into_iter()
+        .next()
+        .map(|m| m.memory)
+        .ok_or_else(|| format!("Drawer not found: {}", self.redact_echo(drawer_id)))
     }
 
     async fn compat_update_drawer(
@@ -789,21 +864,13 @@ impl Service {
         let content = args.opt_str("content")?;
         let wing = args.opt_str("wing")?;
         let room = args.opt_str("room")?;
-        let id = self.compat_memory_id(&drawer_id).await?;
-        let current = self
-            .get(GetRequest {
-                ids: vec![id.clone()],
-                include_provenance: false,
-            })
-            .await
-            .map_err(safe_error)?
-            .memories
-            .into_iter()
-            .next()
-            .ok_or_else(|| format!("Drawer not found: {drawer_id}"))?
-            .memory;
+        let current = self.compat_memory(&drawer_id).await?;
+        if current.status == Status::Trashed {
+            return Err(TRASHED_REFUSAL.into());
+        }
+        let id = current.id.clone();
         if let Some(w) = &wing {
-            let same = self.compat_wing(w).await.map_err(safe_error)?.as_deref()
+            let same = self.compat_wing(w).await.map_err(write_error)?.as_deref()
                 == Some(current.project.as_str());
             if !same {
                 return Err("moving a memory to another project is not supported; remember it in the new project and forget this one".into());
@@ -811,7 +878,10 @@ impl Service {
         }
         let topics = match &room {
             Some(r) => Some(vec![normalize_topic(r).ok_or_else(|| {
-                format!("argument room \"{r}\" is not a usable room name")
+                format!(
+                    "argument room \"{}\" is not a usable room name",
+                    self.redact_echo(r)
+                )
             })?]),
             None => None,
         };
@@ -830,7 +900,7 @@ impl Service {
                 author: Self::author(call, None),
             })
             .await
-            .map_err(safe_error)?;
+            .map_err(write_error)?;
         let m = done.memory;
         let mut out = json!({
             "success": true,
@@ -851,7 +921,11 @@ impl Service {
         args: &Args,
     ) -> std::result::Result<Value, String> {
         let drawer_id = args.required_str("drawer_id")?;
-        let id = self.compat_memory_id(&drawer_id).await?;
+        let current = self.compat_memory(&drawer_id).await?;
+        if current.status == Status::Trashed {
+            return Err(TRASHED_REFUSAL.into());
+        }
+        let id = current.id;
         let done = self
             .update(UpdateRequest {
                 id: id.clone(),
@@ -862,7 +936,7 @@ impl Service {
                 author: Self::author(call, None),
             })
             .await
-            .map_err(safe_error)?;
+            .map_err(write_error)?;
         let mut out = json!({
             "success": true,
             "drawer_id": drawer_id,
@@ -893,11 +967,20 @@ impl Service {
         let wing = args.opt_str("wing")?;
         let target = self.compat_target(wing.as_deref()).await?;
         let shown = topic.clone().unwrap_or_else(|| "general".into());
+        // A diary entry is an event, not a fact: the same words from another agent, or from the
+        // same agent later, are a new entry. The time and the agent are in the title, which the
+        // store's duplicate check reads, so only a retry in the same millisecond collides.
+        let stamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let title = format!(
+            "Diary {stamp} {}: {}",
+            agent.chars().take(40).collect::<String>(),
+            shown.chars().take(80).collect::<String>()
+        );
         let r = self
-            .remember(RememberRequest {
+            .remember_or_spool(RememberRequest {
                 content: entry,
                 kind: Some(Kind::Diary),
-                title: Some(format!("Diary: {shown}")),
+                title: Some(title),
                 project: target.project.clone(),
                 topics: topic.iter().filter_map(|t| normalize_topic(t)).collect(),
                 importance: Some(2),
@@ -909,23 +992,30 @@ impl Service {
                 ..Default::default()
             })
             .await
-            .map_err(safe_error)?;
-        let Some(id) = r.id else {
-            return Err("the entry could not be saved just now; try again".into());
-        };
-        let mut out = match r.status {
-            RememberStatus::Duplicate => json!({
+            .map_err(write_error)?;
+        let shown = self.redact_echo(&shown);
+        let mut notes: Vec<String> = Vec::new();
+        let mut out = match (r.status, r.id) {
+            (RememberStatus::Spooled, _) | (_, None) => {
+                if let Some(why) = r.reason {
+                    notes.push(why);
+                }
+                json!({ "success": true, "queued": true, "agent": agent, "topic": shown })
+            }
+            (RememberStatus::Duplicate, Some(id)) => json!({
                 "success": true, "reason": "already_exists", "entry_id": id,
-                "agent": agent, "topic": shown,
+                "agent": agent, "topic": shown, "wing": r.project,
             }),
-            _ => json!({
+            (_, Some(id)) => json!({
                 "success": true, "entry_id": id, "agent": agent, "topic": shown,
-                "timestamp": now_millis(),
+                "timestamp": now_millis(), "wing": r.project,
             }),
         };
-        out["wing"] = json!(r.project);
         if let Some(n) = target.note {
-            out["note"] = json!(format!("{n}{}", r.project));
+            notes.insert(0, format!("{n}{}", r.project));
+        }
+        if !notes.is_empty() {
+            out["note"] = json!(notes.join("; "));
         }
         Ok(out)
     }
@@ -959,22 +1049,38 @@ impl Service {
             })
             .await
             .map_err(safe_error)?;
-        let entries: Vec<Value> = rows
-            .iter()
-            .map(|m| {
-                json!({
-                    "date": m.created_at.chars().take(10).collect::<String>(),
-                    "timestamp": m.created_at,
-                    "topic": m.topics.first().cloned().unwrap_or_else(|| "general".into()),
-                    "content": m.body,
-                })
-            })
-            .collect();
+        let mut bytes = 0usize;
+        let mut cut = false;
+        let mut entries: Vec<Value> = Vec::new();
+        for m in &rows {
+            let content: String = m.body.chars().take(DIARY_ENTRY_CHARS).collect();
+            let truncated = content.len() < m.body.len();
+            bytes += content.len();
+            if bytes > DIARY_READ_BYTES && !entries.is_empty() {
+                cut = true;
+                break;
+            }
+            let mut e = json!({
+                "date": m.created_at.chars().take(10).collect::<String>(),
+                "timestamp": m.created_at,
+                "topic": m.topics.first().cloned().unwrap_or_else(|| "general".into()),
+                "content": content,
+            });
+            if truncated {
+                e["truncated"] = json!(true);
+            }
+            entries.push(e);
+        }
         let mut out = json!({
             "agent": agent, "entries": entries, "total": total, "showing": entries.len(),
         });
         if total == 0 {
             out["message"] = json!("No diary entries yet.");
+        }
+        if cut || entries.iter().any(|e| e.get("truncated").is_some()) {
+            out["note"] = json!(
+                "long entries are shortened and the answer is limited in size; ask for fewer entries (last_n) to see more"
+            );
         }
         Ok(out)
     }
@@ -1001,6 +1107,7 @@ impl Service {
         let now = now_millis();
         let (mut active, mut historical, mut future, mut all) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut matched = 0usize;
         for f in &r.facts {
             let dir = if kg::alias_key(&f.subject) == me {
                 "outgoing"
@@ -1008,6 +1115,10 @@ impl Service {
                 "incoming"
             };
             if direction != "both" && direction != dir {
+                continue;
+            }
+            matched += 1;
+            if matched > KG_QUERY_MAX_FACTS {
                 continue;
             }
             let row = fact_json(f, Some(dir));
@@ -1022,7 +1133,7 @@ impl Service {
                 active.push(row);
             }
         }
-        Ok(json!({
+        let mut out = json!({
             "entity": entity,
             "as_of": as_of,
             "active_facts": active,
@@ -1030,7 +1141,15 @@ impl Service {
             "future_facts": future,
             "facts": all,
             "count": all.len(),
-        }))
+        });
+        if matched > KG_QUERY_MAX_FACTS {
+            out["truncated"] = json!(true);
+            out["total"] = json!(matched);
+            out["note"] = json!(format!(
+                "only the first {KG_QUERY_MAX_FACTS} facts (oldest first) are shown; use as_of or mempalace_kg_timeline with offset for the rest"
+            ));
+        }
+        Ok(out)
     }
 
     async fn compat_kg_add(
@@ -1043,9 +1162,20 @@ impl Service {
         let object = args.required_str("object")?;
         let valid_from = check_time("valid_from", args.opt_str("valid_from")?)?;
         let valid_to = check_time("valid_to", args.opt_str("valid_to")?)?;
+        if let Some(to) = &valid_to {
+            let Some(from) = &valid_from else {
+                return Err("argument valid_to needs valid_from: say when the fact began".into());
+            };
+            if instant(to) < instant(from) {
+                return Err(
+                    "argument valid_to is before valid_from; a fact cannot end before it begins"
+                        .into(),
+                );
+            }
+        }
         // A memory the fact came from, when the drawer id names one.
         let source_memory_id = match args.opt_str("source_drawer_id")? {
-            Some(d) => self.compat_memory_id(&d).await.ok(),
+            Some(d) => self.compat_memory(&d).await.ok().map(|m| m.id),
             None => None,
         };
         let author = Self::author(call, None);
@@ -1061,11 +1191,12 @@ impl Service {
                 ..Default::default()
             })
             .await
-            .map_err(safe_error)?;
+            .map_err(write_error)?;
+        let fact = self.fact_text(&subject, &added.predicate, &object);
         let mut out = json!({
             "success": true,
             "triple_id": added.relation_id,
-            "fact": format!("{subject} → {predicate} → {object}"),
+            "fact": fact,
         });
         if let Some(s) = added.suggestion {
             out["note"] = json!(format!("a similar predicate exists: {s}"));
@@ -1081,13 +1212,30 @@ impl Service {
                     author,
                     ..Default::default()
                 })
-                .await
-                .map_err(safe_error)?;
-            if ended.ended == 0 {
-                out["note"] = json!("the fact was added but could not be ended at valid_to");
+                .await;
+            let problem = match ended {
+                Ok(e) if e.ended > 0 => None,
+                Ok(_) => Some("no current fact matched to end".to_string()),
+                Err(e) => Some(write_error(e)),
+            };
+            if let Some(p) = problem {
+                out["success"] = json!(false);
+                out["error"] = json!(format!(
+                    "the fact was added (triple_id above) but ending it at valid_to failed: {p}"
+                ));
             }
         }
         Ok(out)
+    }
+
+    /// "subject → predicate → object" from values that may be shown back.
+    fn fact_text(&self, subject: &str, predicate: &str, object: &str) -> String {
+        format!(
+            "{} → {} → {}",
+            self.redact_echo(subject),
+            self.redact_echo(predicate),
+            self.redact_echo(object)
+        )
     }
 
     async fn compat_kg_invalidate(
@@ -1113,10 +1261,10 @@ impl Service {
                 ..Default::default()
             })
             .await
-            .map_err(safe_error)?;
+            .map_err(write_error)?;
         let mut out = json!({
             "success": true,
-            "fact": format!("{subject} → {predicate} → {object}"),
+            "fact": self.fact_text(&subject, &r.predicate, &object),
             "ended": resolved,
         });
         if r.ended == 0 {
@@ -1144,7 +1292,7 @@ impl Service {
                 ..Default::default()
             })
             .await
-            .map_err(safe_error)?;
+            .map_err(write_error)?;
         let (me, old) = (kg::alias_key(&subject), kg::alias_key(&old_object));
         let values: Vec<&str> = current
             .facts
@@ -1152,15 +1300,17 @@ impl Service {
             .filter(|f| kg::alias_key(&f.subject) == me)
             .map(|f| f.object.as_str())
             .collect();
+        let (shown_subject, shown_old) =
+            (self.redact_echo(&subject), self.redact_echo(&old_object));
         let note = if values.iter().any(|v| kg::alias_key(v) == old) {
             None
         } else if values.is_empty() {
             Some(format!(
-                "{subject} had no current {predicate}, so nothing was closed (old_object {old_object} did not match)"
+                "{shown_subject} had no current {predicate}, so nothing was closed (old_object {shown_old} did not match)"
             ))
         } else {
             Some(format!(
-                "the current {predicate} of {subject} was {}, not {old_object}; it was closed anyway",
+                "the current {predicate} of {shown_subject} was {}, not {shown_old}; it was closed anyway",
                 values.join(", ")
             ))
         };
@@ -1175,12 +1325,12 @@ impl Service {
                 ..Default::default()
             })
             .await
-            .map_err(safe_error)?;
+            .map_err(write_error)?;
         let mut out = json!({
             "success": true,
             "triple_id": r.relation_id,
-            "fact": format!("{subject} → {predicate} → {new_object}"),
-            "superseded": old_object,
+            "fact": self.fact_text(&subject, &r.predicate, &new_object),
+            "superseded": shown_old,
         });
         if let Some(n) = note {
             out["note"] = json!(n);
@@ -1204,7 +1354,7 @@ impl Service {
                 ..Default::default()
             })
             .await
-            .map_err(safe_error)?;
+            .map_err(write_error)?;
         let total = r.facts.len();
         let timeline: Vec<Value> = r
             .facts

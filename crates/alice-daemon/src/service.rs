@@ -481,6 +481,17 @@ fn redact_field(r: &Redactor, field: &str, text: &str) -> Result<String> {
     Ok(out)
 }
 
+impl Service {
+    /// `text` as it may be shown back to a caller: redacted under the global rules, so an answer
+    /// never echoes a secret the store did not keep. A text the rules refuse is hidden whole.
+    pub(crate) fn redact_echo(&self, text: &str) -> String {
+        match self.redactors.for_root(None).check("echo", text) {
+            Ok(t) => t,
+            Err(_) => "[REDACTED]".into(),
+        }
+    }
+}
+
 /// The working-tree root of the project `choice` names.
 fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<PathBuf> {
     match choice {
