@@ -99,7 +99,7 @@ pub struct ImportReport {
     pub already_imported: u64,
     pub skipped: BTreeMap<String, u64>,
     pub split: SplitCounts,
-    /// Detector name -> drawers held back because they held that kind of secret.
+    /// Detector name -> drawers (and knowledge graph triples) held back because they held that kind of secret.
     pub blocked_by_redaction: BTreeMap<String, u64>,
     pub redacted_fields: u64,
     pub redaction_note: Option<String>,

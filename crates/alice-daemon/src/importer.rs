@@ -14,7 +14,7 @@
 //!
 //! Never log a drawer, a planned record or a knowledge-graph value with `{:?}`: they hold raw text.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use alice_core::error::{AliceError, Result};
 use alice_core::ids::now_rfc3339;
+use alice_core::import::kg::{PlannedFact, plan_kg, read_kg, read_tunnels};
 use alice_core::import::palace::{
     Drawer, PalaceInfo, PalaceReader, Snapshot, count_closets, detect_backend, open_snapshot,
     snapshot,
@@ -31,19 +32,23 @@ use alice_core::import::plan::{
     Mapper, Planned, Planner, Survey, TextFilter, Tier, classify, parse_time, survey,
 };
 use alice_core::import::report::{
-    ImportReport, PalaceSummary, PhaseTiming, ProjectCounts, WingMapEntry,
+    FactCounts, ImportReport, PalaceSummary, PhaseTiming, ProjectCounts, TunnelCounts, WingMapEntry,
 };
 use alice_core::import::wings::{Via, WingMap, WingTarget};
 use alice_core::import::{ImportRequest, ImportState, ImportStatus, local_offset};
 use alice_core::model::{Kind, SourceType};
 use alice_core::normalize::{content_hash, derive_title, nfc, sha256_hex, slugify};
 use alice_core::redact::Redactor;
-use alice_core::settings::{EmbeddingProvider, Settings};
+use alice_core::settings::{EmbeddingProvider, Settings, Source};
 use alice_core::store::ReaderPool;
+use alice_core::store::events::Actor;
 use alice_core::store::import::{
-    BatchOutcome, ImportBatch, ImportMemory, ImportProject, ImportSource, legacy_existing,
+    BatchOutcome, ImportBatch, ImportFact, ImportMemory, ImportProject, ImportSource,
+    legacy_existing,
 };
+use alice_core::store::kg::normalize_predicate;
 use alice_core::store::memories::NewMemoryInput;
+use alice_core::store::reviews::NewReview;
 use alice_core::store::sources::{ChunkInput, SourceInput};
 use parking_lot::Mutex;
 
@@ -68,6 +73,12 @@ const BATCH_BYTES: usize = 64 * 1024;
 const COLLAPSED_PER_BATCH: usize = 200;
 /// Why a repeated chunk is not recorded: its keeper is not stored.
 const REPEAT_OF_UNSTORED: &str = "repeat of a chunk that was not stored";
+/// Facts per graph batch.
+const FACTS_PER_BATCH: usize = 200;
+/// Tunnel links and review items per batch of the closing phase.
+const TAIL_PER_BATCH: usize = 200;
+/// Knowledge drawers per mention-linking batch.
+const MENTIONS_PER_BATCH: usize = 200;
 /// The report keeps this many store errors and warnings; the rest are counted.
 const REPORT_LIST_CAP: usize = 100;
 
@@ -538,7 +549,11 @@ impl Unit {
 
 // ---------------------------------------------------------------------------------------- the job
 
-// Notes for the phases that store records (Task 11 adds the graph, tunnels and mentions):
+// Notes for the phases that store records:
+// - Phases after `raw`: `graph` (facts), `collapsed` (repeated chunks point at their keeper),
+//   `mentions` (links of the memories stored in this run to the entities that exist now) and
+//   `done`. Tunnel links and review items travel in the closing batch(es), which also carry the
+//   `import.mempalace.last` marker, so a rerun that finds nothing new writes one small batch.
 // - The dry run only dedupes knowledge drawers against each other: a memory already stored in
 //   Alice that an incoming drawer duplicates is reported by the real run as a warning.
 // - Collapsed raw drawers are recorded at the end of the raw phase (they point at their keeper).
@@ -571,6 +586,18 @@ struct Tally {
     store_duplicate_memories: u64,
     /// Drawers the store refused (listed in the errors; they are accounted for there).
     rejected: u64,
+    // The graph.
+    facts_added: u64,
+    facts_ended: u64,
+    facts_skipped: u64,
+    isolated: u64,
+    kg_blocked: u64,
+    kg_warnings: Vec<String>,
+    links_made: u64,
+    links_dropped: u64,
+    tunnels_dropped: u64,
+    tunnels_topic: u64,
+    reviews_created: u64,
 }
 
 struct Ctx<'a> {
@@ -587,8 +614,15 @@ struct Ctx<'a> {
     /// Stored project slug -> the aliases to give it (sent with the first batch that names it).
     aliases: HashMap<String, Vec<String>>,
     sent_projects: HashSet<String>,
-    /// (collapsed drawer key, keeper key), recorded when the raw phase ends.
+    /// (collapsed drawer key, keeper key), recorded in the `collapsed` phase.
     collapsed: Vec<(String, String)>,
+    /// Batches the writer has taken (nothing was written while this is 0).
+    submitted: u64,
+    /// Keys of the memories handed to the store in this run (their mentions are linked last).
+    fresh_memories: Vec<String>,
+    /// Tunnel links and review items wait for the closing batch.
+    pending_links: Vec<(String, String)>,
+    pending_reviews: Vec<NewReview>,
 }
 
 impl Ctx<'_> {
@@ -705,6 +739,10 @@ impl Ctx<'_> {
 
     /// Adds a drawer's rows to the open batch; a batch that closes is written.
     fn push(&mut self, unit: Unit) -> Result<()> {
+        if let Unit::Memories { items, .. } = &unit {
+            self.fresh_memories
+                .extend(items.iter().filter_map(|m| m.legacy_id.clone()));
+        }
         let (records, bytes) = unit.weight();
         if let Some(closed) = self.batcher.push(unit, records, bytes) {
             self.write(closed)?;
@@ -862,7 +900,10 @@ impl Ctx<'_> {
             .writer
             .submit_blocking(WriteOp::ImportBatch(Box::new(batch)))?
         {
-            WriteOutcome::Imported(out) => Ok(self.absorb(out)),
+            WriteOutcome::Imported(out) => {
+                self.submitted += 1;
+                Ok(self.absorb(out))
+            }
             other => Err(AliceError::Other(format!(
                 "the writer answered an import batch with {}",
                 other.name()
@@ -874,6 +915,12 @@ impl Ctx<'_> {
         self.tally.store_errors.extend(out.errors);
         self.tally.store_warnings.extend(out.warnings);
         self.tally.store_duplicate_memories += out.memories_duplicate as u64;
+        self.tally.facts_added += out.facts_added as u64;
+        self.tally.facts_ended += out.facts_ended as u64;
+        self.tally.facts_skipped += out.facts_skipped as u64;
+        self.tally.links_made += out.links_made as u64;
+        self.tally.links_dropped += out.links_dropped as u64;
+        self.tally.reviews_created += out.reviews_created as u64;
         out.deferred_collapsed.len()
     }
 
@@ -954,13 +1001,13 @@ impl Ctx<'_> {
             self.done += raw.len() as u64;
             self.progress();
         }
-        self.record_collapsed()
+        Ok(())
     }
 
-    /// Collapsed drawers point where their keeper went; their keepers are stored by now. A
+    /// The `collapsed` phase. Collapsed drawers point where their keeper went; their keepers are stored by now. A
     /// repeat whose keeper was not stored (held back by block mode, or its insert failed) is left
     /// for the next run: it is accounted as skipped, not as a duplicate.
-    fn record_collapsed(&mut self) -> Result<()> {
+    fn collapsed_pass(&mut self) -> Result<()> {
         let pairs = std::mem::take(&mut self.collapsed);
         let mut deferred = 0usize;
         for part in pairs.chunks(COLLAPSED_PER_BATCH) {
@@ -983,11 +1030,335 @@ impl Ctx<'_> {
     }
 }
 
+impl Ctx<'_> {
+    /// The `graph` phase: the facts of the knowledge graph in batches; tunnel links and review
+    /// items are held for the closing batch (they need the facts and the memories stored).
+    fn graph_pass(
+        &mut self,
+        kg: Option<&Path>,
+        tunnels: Option<&Path>,
+        assume: chrono::FixedOffset,
+    ) -> Result<()> {
+        if let Some(path) = kg {
+            self.graph_facts(path, assume)?;
+        }
+        if let Some(path) = tunnels {
+            self.graph_tunnels(path);
+        }
+        Ok(())
+    }
+
+    fn graph_facts(&mut self, path: &Path, assume: chrono::FixedOffset) -> Result<()> {
+        check_stop(&self.env.stop)?;
+        let kg = match read_kg(path) {
+            Ok(kg) => kg,
+            Err(e) => {
+                // One unreadable graph never blocks the drawers; the report says what was lost.
+                self.tally.store_errors.push(format!(
+                    "the knowledge graph could not be read and was not imported: {}",
+                    self.filter.quiet(&e.to_string())
+                ));
+                return Ok(());
+            }
+        };
+        self.tally.isolated = kg.isolated_entities;
+        let existing: Vec<(String, u64)> = self.env.readers.with(|c| {
+            let mut st = c.prepare("SELECT predicate, count(*) FROM relations GROUP BY 1")?;
+            let rows = st.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })?;
+        let plan = plan_kg(&kg, &existing, assume, self.filter);
+        drop(kg);
+        for detectors in &plan.blocked {
+            self.tally.kg_blocked += 1;
+            for d in detectors {
+                *self.tally.blocked.entry(d.clone()).or_default() += 1;
+            }
+        }
+        self.tally.kg_warnings = plan.warnings;
+        // Validate before submitting: the store would refuse these one by one.
+        let mut ready: Vec<ImportFact> = Vec::new();
+        let mut invalid = 0u64;
+        for f in plan.facts {
+            if !fact_is_valid(&f) {
+                invalid += 1;
+                continue;
+            }
+            ready.push(ImportFact {
+                legacy_id: f.legacy_id,
+                add: f.add,
+                end_at: f.end_at,
+                source_drawer_id: f.source_drawer_id.map(|d| self.filter.legacy_key(&d)),
+            });
+        }
+        if invalid > 0 {
+            self.tally.facts_skipped += invalid;
+            self.tally.kg_warnings.push(format!(
+                "{invalid} triples have an empty subject, predicate or object and were not imported"
+            ));
+        }
+        for r in plan.reviews {
+            self.pending_reviews.push(self.clean_review(r));
+        }
+        // Facts an earlier run stored cost nothing more.
+        let ids: Vec<String> = ready.iter().map(|f| f.legacy_id.clone()).collect();
+        let stored = self.stored(&ids)?;
+        let (known, fresh): (Vec<ImportFact>, Vec<ImportFact>) = ready
+            .into_iter()
+            .partition(|f| stored.contains(&f.legacy_id));
+        self.tally.facts_skipped += known.len() as u64;
+        if self.dry {
+            self.tally.facts_added += fresh.len() as u64;
+            self.tally.facts_ended += fresh.iter().filter(|f| f.end_at.is_some()).count() as u64;
+            return Ok(());
+        }
+        let mut fresh: VecDeque<ImportFact> = fresh.into();
+        while !fresh.is_empty() {
+            let n = fresh.len().min(FACTS_PER_BATCH);
+            let mut batch = self.batch();
+            batch.facts = fresh.drain(..n).collect();
+            self.submit(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Review payloads are stored text like any other: through the same filter. The dedupe key
+    /// follows the (normalised) predicate it names.
+    fn clean_review(&self, mut r: NewReview) -> NewReview {
+        let mut renamed = None;
+        if let Some(obj) = r.payload.as_object_mut() {
+            for key in ["predicate", "canonical"] {
+                if let Some(v) = obj.get_mut(key)
+                    && let Some(text) = v.as_str()
+                {
+                    let clean = self.filter.quiet(text);
+                    if clean != text {
+                        if key == "predicate" {
+                            renamed = Some(clean.clone());
+                        }
+                        *v = serde_json::Value::String(clean);
+                    }
+                }
+            }
+        }
+        if let Some(p) = renamed {
+            r.dedupe_key = Some(format!("predicate:{}", normalize_predicate(&p)));
+        }
+        r
+    }
+
+    /// Explicit tunnels between two drawers become links; everything else is counted, not kept.
+    /// (A tunnel's label and its wing and room names are not stored anywhere, so there is
+    /// nothing in them to redact.)
+    fn graph_tunnels(&mut self, path: &Path) {
+        let tunnels = read_tunnels(path);
+        self.tally.tunnels_topic += tunnels.dropped_topic;
+        self.tally.tunnels_dropped += tunnels.dropped_malformed;
+        for t in tunnels.explicit {
+            match (t.source_drawer_id, t.target_drawer_id) {
+                (Some(a), Some(b)) => {
+                    let pair = (self.filter.legacy_key(&a), self.filter.legacy_key(&b));
+                    self.pending_links.push(pair);
+                }
+                _ => self.tally.tunnels_dropped += 1,
+            }
+        }
+    }
+
+    /// The `mentions` phase: the memories this run stored are matched against the entities that
+    /// exist now (the graph made them).
+    fn mentions_pass(&mut self) -> Result<()> {
+        if self.dry || self.fresh_memories.is_empty() {
+            return Ok(());
+        }
+        let entities: i64 = self
+            .env
+            .readers
+            .with(|c| Ok(c.query_row("SELECT count(*) FROM entities", [], |r| r.get(0))?))?;
+        if entities == 0 {
+            return Ok(());
+        }
+        let keys = std::mem::take(&mut self.fresh_memories);
+        for group in keys.chunks(MENTIONS_PER_BATCH) {
+            let mut batch = self.batch();
+            batch.link_mentions = group.to_vec();
+            self.submit(batch)?;
+        }
+        Ok(())
+    }
+
+    /// The closing batch(es): tunnel links, review items and (real runs) the marker of this run.
+    fn closing_pass(&mut self, meta: Option<(String, String)>) -> Result<()> {
+        let links = std::mem::take(&mut self.pending_links);
+        let reviews = std::mem::take(&mut self.pending_reviews);
+        let seen_keys: Vec<String> = reviews
+            .iter()
+            .filter_map(|r| r.dedupe_key.as_ref().map(|k| format!("review:{k}")))
+            .collect();
+        let seen = self.stored(&seen_keys)?;
+        let reviews: Vec<NewReview> = reviews
+            .into_iter()
+            .filter(|r| {
+                !r.dedupe_key
+                    .as_ref()
+                    .is_some_and(|k| seen.contains(&format!("review:{k}")))
+            })
+            .collect();
+        if self.dry {
+            self.tally.reviews_created += reviews.len() as u64;
+            // A link needs both ends among the memories this run would make or an earlier run made.
+            let known: HashSet<String> = self
+                .survey
+                .knowledge_order
+                .iter()
+                .map(|id| self.filter.legacy_key(id))
+                .collect();
+            let ends: Vec<String> = links
+                .iter()
+                .flat_map(|(a, b)| [a.clone(), b.clone()])
+                .collect();
+            let stored = self.stored(&ends)?;
+            let has = |k: &String| known.contains(k) || stored.contains(k);
+            for (a, b) in &links {
+                if a != b && has(a) && has(b) {
+                    self.tally.links_made += 1;
+                } else {
+                    self.tally.links_dropped += 1;
+                }
+            }
+            return Ok(());
+        }
+        let mut links: VecDeque<(String, String)> = links.into();
+        let mut reviews: VecDeque<NewReview> = reviews.into();
+        loop {
+            let mut batch = self.batch();
+            let mut n = 0;
+            while n < TAIL_PER_BATCH {
+                if let Some(l) = links.pop_front() {
+                    batch.links.push(l);
+                } else if let Some(r) = reviews.pop_front() {
+                    batch.reviews.push(r);
+                } else {
+                    break;
+                }
+                n += 1;
+            }
+            let last = links.is_empty() && reviews.is_empty();
+            if last && let Some(m) = meta.clone() {
+                batch.meta.push(m);
+            }
+            self.submit(batch)?;
+            if last {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// A triple the store would refuse: an empty part (after redaction and normalising).
+fn fact_is_valid(f: &PlannedFact) -> bool {
+    !f.add.subject.trim().is_empty()
+        && !normalize_predicate(&f.add.predicate).is_empty()
+        && !f.add.object.trim().is_empty()
+}
+
 /// (project, source uri) of a chunk unit; knowledge sorts first.
 fn unit_source(u: &Unit) -> (&str, &str) {
     match u {
         Unit::Chunks { slug, source, .. } => (slug, &source.uri),
         Unit::Memories { .. } => ("", ""),
+    }
+}
+
+/// Runs one phase: the status names it while it runs and the report times it.
+fn run_phase<T>(
+    status: &Mutex<ImportStatus>,
+    phases: &mut Vec<PhaseTiming>,
+    name: &str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    set_phase(status, name);
+    let t = Instant::now();
+    let out = f();
+    phases.push(PhaseTiming {
+        phase: name.to_string(),
+        seconds: (t.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+    });
+    out
+}
+
+/// Every drawer is imported, collapsed onto its keeper, skipped, held back, refused (and listed
+/// in the errors) or already imported by an earlier run. `skipped_total` is the survey's and
+/// the planner's skips together.
+fn accounted(t: &Tally, skipped_total: u64) -> u64 {
+    skipped_total
+        + t.already
+        + t.knowledge_duplicates
+        + t.raw_collapsed
+        + t.memory_drawers
+        + t.chunk_drawers
+        + t.blocked_drawers
+        + t.rejected
+}
+
+/// What a job that ended early says. Nothing was written: the error alone. Otherwise how far it
+/// got, and what to do; a stopped daemon keeps its own sentence.
+fn failure(e: AliceError, ctx: &Ctx<'_>) -> AliceError {
+    if ctx.submitted == 0 {
+        return e;
+    }
+    let t = &ctx.tally;
+    let stopped = matches!(&e, AliceError::Other(m) if m == STOPPED);
+    let mut msg = format!(
+        "{e}; {} drawers were stored before it ended",
+        t.memory_drawers + t.chunk_drawers + t.knowledge_duplicates
+    );
+    if !t.store_errors.is_empty() {
+        msg.push_str(&format!(
+            ", {} could not be stored (first: {})",
+            t.store_errors.len(),
+            t.store_errors[0]
+        ));
+    }
+    if !stopped {
+        msg.push_str("; run `alice import mempalace` again to continue; what was imported is kept");
+    }
+    AliceError::Other(msg)
+}
+
+/// A real run that found `compat.mempalace` at its default turns it on (a value the owner wrote,
+/// even `false`, is left alone). Returns a warning for the report when it could not.
+fn enable_compat(env: &ImportEnv, job_id: &str) -> Option<String> {
+    const KEY: &str = "compat.mempalace";
+    if env.settings.resolved().sources.get(KEY) != Some(&Source::Default) {
+        return None;
+    }
+    let mut change = serde_json::Map::new();
+    change.insert(KEY.to_string(), serde_json::Value::Bool(true));
+    if let Err(errors) = env.settings.patch(&change) {
+        let why = errors
+            .first()
+            .map(|e| e.message.clone())
+            .unwrap_or_default();
+        return Some(format!(
+            "the MemPalace compatibility layer could not be turned on ({why}); run `alice config set compat.mempalace true`"
+        ));
+    }
+    // The settings follower records the `settings.change`; this row says why.
+    match env.writer.submit_blocking(WriteOp::RecordEvent {
+        actor: Actor::Import,
+        action: "import.compat_enabled".into(),
+        target_type: "settings".into(),
+        target_id: KEY.into(),
+        before: None,
+        after: Some(serde_json::json!({ "job_id": job_id })),
+    }) {
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "the MemPalace compatibility layer is on, but the import could not record that: {e}"
+        )),
     }
 }
 
@@ -1102,35 +1473,58 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
         aliases,
         sent_projects: HashSet::new(),
         collapsed: Vec::new(),
+        submitted: 0,
+        fresh_memories: Vec::new(),
+        pending_links: Vec::new(),
+        pending_reviews: Vec::new(),
     };
     if let Some(hook) = &env.hook {
         hook.park_before_planning(&env.stop);
     }
-    set_phase(&env.status, "knowledge");
-    let t = Instant::now();
-    let mut outcome = ctx.knowledge_pass();
-    lap(&mut phases, "knowledge", t);
+    let kg_path = snap.kg.clone();
+    let tunnels_path = snap.tunnels.clone();
+    let mut outcome = run_phase(&env.status, &mut phases, "knowledge", || {
+        ctx.knowledge_pass()
+    });
     if outcome.is_ok() {
-        set_phase(&env.status, "raw");
-        let t = Instant::now();
-        outcome = ctx.raw_pass(since);
-        lap(&mut phases, "raw", t);
+        outcome = run_phase(&env.status, &mut phases, "raw", || ctx.raw_pass(since));
+    }
+    if outcome.is_ok() {
+        outcome = run_phase(&env.status, &mut phases, "graph", || {
+            ctx.graph_pass(kg_path.as_deref(), tunnels_path.as_deref(), assume)
+        });
+    }
+    if outcome.is_ok() {
+        outcome = run_phase(&env.status, &mut phases, "collapsed", || {
+            ctx.collapsed_pass()
+        });
+    }
+    if outcome.is_ok() {
+        outcome = run_phase(&env.status, &mut phases, "mentions", || ctx.mentions_pass());
+    }
+    // The accounting law is known before the closing batch, which carries its verdict.
+    let skipped_total: u64 =
+        surveyed.skipped.values().sum::<u64>() + ctx.tally.skipped.values().sum::<u64>();
+    let accounted = accounted(&ctx.tally, skipped_total);
+    let ok = ctx.tally.store_errors.is_empty() && accounted == surveyed.total;
+    let finished_at = now_rfc3339();
+    if outcome.is_ok() {
+        let marker = (!req.dry_run).then(|| {
+            let marker = serde_json::json!({
+                "job_id": job_id,
+                "palace": filter.quiet(&palace.display().to_string()),
+                "finished_at": finished_at,
+                "drawers_seen": surveyed.total,
+                "ok": ok,
+            });
+            ("import.mempalace.last".to_string(), marker.to_string())
+        });
+        outcome = run_phase(&env.status, &mut phases, "done", || {
+            ctx.closing_pass(marker)
+        });
     }
     if let Err(e) = outcome {
-        // What was stored stays stored (whole batches only); the message says how far it got.
-        let t = &ctx.tally;
-        let mut msg = format!(
-            "{e}; {} drawers were stored before it ended",
-            t.memory_drawers + t.chunk_drawers + t.knowledge_duplicates
-        );
-        if !t.store_errors.is_empty() {
-            msg.push_str(&format!(
-                ", {} could not be stored (first: {})",
-                t.store_errors.len(),
-                t.store_errors[0]
-            ));
-        }
-        return Err(AliceError::Other(msg));
+        return Err(failure(e, &ctx));
     }
     let mut tally = ctx.tally;
     let mut store_errors = std::mem::take(&mut tally.store_errors);
@@ -1154,6 +1548,13 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
         ));
     }
     warnings.extend(store_warnings);
+    if tally.kg_blocked > 0 {
+        warnings.push(format!(
+            "{} knowledge graph triples were held back because they hold a secret (privacy.redact_mode is block)",
+            tally.kg_blocked
+        ));
+    }
+    warnings.extend(std::mem::take(&mut tally.kg_warnings));
 
     let mut skipped: BTreeMap<String, u64> = BTreeMap::new();
     for (k, v) in &surveyed.skipped {
@@ -1162,7 +1563,6 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     for (k, v) in tally.skipped {
         *skipped.entry(k).or_default() += v;
     }
-    let skipped_total: u64 = skipped.values().sum();
     let wing_map: BTreeMap<String, WingMapEntry> = surveyed
         .wing_counts
         .iter()
@@ -1206,14 +1606,19 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
             raw: tally.raw_collapsed,
         },
         drawers_seen: surveyed.total,
-        drawers_accounted: skipped_total
-            + tally.already
-            + tally.knowledge_duplicates
-            + tally.raw_collapsed
-            + tally.memory_drawers
-            + tally.chunk_drawers
-            + tally.blocked_drawers
-            + tally.rejected,
+        drawers_accounted: accounted,
+        facts: FactCounts {
+            added: tally.facts_added,
+            ended: tally.facts_ended,
+            skipped: tally.facts_skipped,
+        },
+        tunnels: TunnelCounts {
+            linked: tally.links_made,
+            dropped: tally.tunnels_dropped + tally.links_dropped,
+            ignored_topic: tally.tunnels_topic,
+        },
+        isolated_entities: tally.isolated,
+        review_items: tally.reviews_created,
         closets_dropped: closets,
         already_imported: tally.already,
         skipped,
@@ -1237,7 +1642,12 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     report.errors.extend(store_errors);
     report.phases = phases;
     report.peak_rss_mb = peak_rss_mb();
-    report.finished_at = Some(now_rfc3339());
+    report.finished_at = Some(finished_at);
+    if !req.dry_run
+        && let Some(w) = enable_compat(env, job_id)
+    {
+        report.warnings.push(w);
+    }
     Ok(report)
 }
 

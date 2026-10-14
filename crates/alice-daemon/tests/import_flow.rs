@@ -78,7 +78,7 @@ fn fixture_specs() -> Vec<DrawerSpec> {
         ),
         DrawerSpec {
             id: "k_diary".into(),
-            text: "Set up the import today".into(),
+            text: "Set up the import today with alice".into(),
             meta: DrawerMeta {
                 wing: "wing_claude_code".into(),
                 room: "diary".into(),
@@ -141,7 +141,9 @@ fn fixture_specs() -> Vec<DrawerSpec> {
 }
 
 /// `root/palace/` holds the palace and its graph; `root/tunnels.json` is where MemPalace keeps tunnels.
-fn build_fixture(root: &Path, specs: &[DrawerSpec]) -> PathBuf {
+/// The fixture with more triples (subject `alice`, object an entity id that is not a row, so the
+/// id is the name).
+fn build_fixture_with(root: &Path, specs: &[DrawerSpec], extra: &[TripleSpec]) -> PathBuf {
     let palace = root.join("palace");
     std::fs::create_dir_all(&palace).unwrap();
     let file = build_sqlite_exact(&palace, specs);
@@ -156,6 +158,13 @@ fn build_fixture(root: &Path, specs: &[DrawerSpec]) -> PathBuf {
         source_drawer_id: s("k_dec"),
         ..Default::default()
     };
+    let mut triples = vec![
+        t("t1", "has_bug", "bug-a", Some("2026-02-01")),
+        t("t2", "has_bug", "bug-b", None),
+        t("t3", "had_bug", "bug-c", None),
+        t("t4", "located_at", "bangkok", None),
+    ];
+    triples.extend(extra.iter().cloned());
     build_kg(
         &palace,
         &[
@@ -166,12 +175,7 @@ fn build_fixture(root: &Path, specs: &[DrawerSpec]) -> PathBuf {
             ("bangkok", "bangkok"),
             ("orphan", "orphan"),
         ],
-        &[
-            t("t1", "has_bug", "bug-a", Some("2026-02-01")),
-            t("t2", "has_bug", "bug-b", None),
-            t("t3", "had_bug", "bug-c", None),
-            t("t4", "located_at", "bangkok", None),
-        ],
+        &triples,
         false,
     );
     build_tunnels(
@@ -265,9 +269,18 @@ impl Flow {
         specs: &[DrawerSpec],
         options: impl FnOnce(&Path) -> ServiceOptions,
     ) -> Flow {
+        Self::with_graph(specs, &[], options).await
+    }
+
+    /// `with_options` and more triples in the knowledge graph.
+    async fn with_graph(
+        specs: &[DrawerSpec],
+        extra: &[TripleSpec],
+        options: impl FnOnce(&Path) -> ServiceOptions,
+    ) -> Flow {
         let root = tempfile::tempdir().unwrap();
         let palace_root = tempfile::tempdir().unwrap();
-        let palace = build_fixture(palace_root.path(), specs);
+        let palace = build_fixture_with(palace_root.path(), specs, extra);
         let home = AliceHome::new(root.path().join("alice"));
         let svc = start_service_with(&home, options(palace_root.path()));
         Flow {
@@ -489,6 +502,58 @@ impl Flow {
             }
         }
         hits
+    }
+
+    /// The facts of `subject`, ended ones included.
+    async fn facts_timeline(&self, subject: &str) -> Vec<String> {
+        let conn = self.db();
+        let mut stmt = conn
+            .prepare(
+                "SELECT r.predicate || ' ' || coalesce(o.name, r.object_literal) || ' ' || coalesce(r.valid_to, '')
+                 FROM relations r JOIN entities e ON e.id = r.subject_id
+                 LEFT JOIN entities o ON o.id = r.object_entity_id
+                 WHERE e.name = ?1 ORDER BY r.valid_from, r.id",
+            )
+            .unwrap();
+        stmt.query_map([subject], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    async fn entity_mentions_exist(&self) -> bool {
+        self.count("mentions").await > 0
+    }
+
+    async fn meta(&self, key: &str) -> Option<String> {
+        self.db()
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .ok()
+    }
+
+    /// Events recorded as `actor action target_id`; the follower of the settings writes its own
+    /// asynchronously, so a caller waits with `wait_event`.
+    async fn events_of(&self, action: &str) -> Vec<String> {
+        let conn = self.db();
+        let mut stmt = conn
+            .prepare("SELECT actor || ' ' || target_id || ' ' || coalesce(after_json, '') FROM events WHERE action = ?1")
+            .unwrap();
+        stmt.query_map([action], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    async fn wait_event(&self, action: &str) -> Vec<String> {
+        let t = Instant::now();
+        loop {
+            let got = self.events_of(action).await;
+            if !got.is_empty() {
+                return got;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "no {action} event");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     fn import_tmp_entries(&self) -> usize {
@@ -1106,8 +1171,10 @@ async fn secrets_in_imported_history_never_reach_the_database_the_report_or_the_
     assert!(r.redacted_fields >= 4, "{}", r.redacted_fields);
     // A second run recognises the drawers whose ids held the key (the stored id is the hashed one).
     f.wait_embedded().await;
-    let before = f.table_counts().await;
+    let mut before = f.table_counts().await;
     let again = f.run_import(f.request()).await.report.unwrap();
+    // The one thing a rerun writes is its closing batch: an event, and the marker's new value.
+    *before.get_mut("events").unwrap() += 1;
     assert_eq!(f.table_counts().await, before);
     assert_eq!(again.redacted_fields, 0);
     assert_eq!(again.tiers.knowledge, 0);
@@ -1614,4 +1681,260 @@ impl ConvosOff for DrawerMeta {
         self.added_by = s("claude");
         self.room = "src".into();
     }
+}
+
+// ------------------------------------------------------------------- graph, tunnels, accounting
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_whole_fixture_imports_with_an_honest_report_and_the_accounting_law_holds() {
+    let f = Flow::new().await;
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        r.drawers_seen, r.drawers_accounted,
+        "every drawer is imported, collapsed, skipped, blocked or already imported"
+    );
+    assert_eq!(f.facts_timeline("alice").await.len(), 4); // the ended fact is included
+    assert_eq!(r.facts.ended, 1);
+    assert_eq!(r.facts.added, 4);
+    assert_eq!(r.review_items, 1); // has_bug / had_bug, M2 payload {predicate, canonical, p, provider}
+    assert_eq!(r.isolated_entities, 1);
+    assert_eq!((r.tunnels.linked, r.tunnels.dropped), (1, 1));
+    assert_eq!(r.tunnels.ignored_topic, 0);
+    assert!(f.entity_mentions_exist().await); // mention links made in the last phase
+    assert!(
+        f.meta("import.mempalace.last")
+            .await
+            .unwrap()
+            .contains("\"ok\":true")
+    );
+    let phases: Vec<&str> = r.phases.iter().map(|p| p.phase.as_str()).collect();
+    for want in ["graph", "collapsed", "mentions"] {
+        assert!(phases.contains(&want), "{phases:?}");
+    }
+    // The review payload is the M2 shape, with the direction flag.
+    let payload: String = f
+        .db()
+        .query_row("SELECT payload_json FROM review_items", [], |r| r.get(0))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    for k in ["predicate", "canonical", "p", "provider", "reversed"] {
+        assert!(v.get(k).is_some(), "{k} in {payload}");
+    }
+    let key: String = f
+        .db()
+        .query_row("SELECT dedupe_key FROM review_items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        key,
+        format!("predicate:{}", v["predicate"].as_str().unwrap())
+    );
+    // The tunnel linked the two knowledge memories; the marker names no text.
+    assert_eq!(f.count("links").await, 1);
+    let marker = f.meta("import.mempalace.last").await.unwrap();
+    assert!(
+        marker.contains(&r.job_id) && marker.contains("\"drawers_seen\":117"),
+        "{marker}"
+    );
+
+    // A rerun finds everything stored: the law still holds, nothing is added twice.
+    f.wait_embedded().await;
+    let again = f.run_import(f.request()).await.report.unwrap();
+    assert!(again.errors.is_empty(), "{:?}", again.errors);
+    assert_eq!(again.drawers_seen, again.drawers_accounted);
+    assert_eq!(
+        (again.facts.added, again.facts.ended, again.facts.skipped),
+        (0, 0, 4)
+    );
+    assert_eq!(again.review_items, 0);
+    assert_eq!(f.facts_timeline("alice").await.len(), 4);
+    assert_eq!(f.count("links").await, 1);
+    assert_eq!(f.count("review_items").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_counts_the_graph_without_writing_it() {
+    let f = Flow::new().await;
+    let before = f.table_counts().await;
+    let r = f
+        .run_import(f.request().dry_run(true))
+        .await
+        .report
+        .unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!((r.facts.added, r.facts.ended, r.facts.skipped), (4, 1, 0));
+    assert_eq!(r.review_items, 1);
+    assert_eq!(r.isolated_entities, 1);
+    assert_eq!((r.tunnels.linked, r.tunnels.dropped), (1, 1));
+    assert_eq!(f.table_counts().await, before);
+    assert!(f.meta("import.mempalace.last").await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compat_turns_on_by_itself_once_and_respects_an_explicit_off() {
+    let f = Flow::new().await;
+    assert!(!f.setting_bool("compat.mempalace").await);
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    assert!(f.setting_bool("compat.mempalace").await);
+    let changed = f.wait_event("settings.change").await;
+    assert!(
+        changed.iter().any(|e| e.contains("compat.mempalace")),
+        "{changed:?}"
+    );
+    let enabled = f.wait_event("import.compat_enabled").await;
+    assert_eq!(enabled.len(), 1);
+    assert!(
+        enabled[0].starts_with("import compat.mempalace"),
+        "{enabled:?}"
+    );
+    // A second run does not do it again.
+    f.run_import(f.request()).await;
+    assert_eq!(f.events_of("import.compat_enabled").await.len(), 1);
+
+    // An owner who wrote `false` keeps it.
+    let g = Flow::new().await;
+    g.patch("compat.mempalace", serde_json::json!(false)).await;
+    let st = g.run_import(g.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    assert!(!g.setting_bool("compat.mempalace").await);
+    assert!(g.events_of("import.compat_enabled").await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secret_in_a_kg_object_or_a_transcript_path_never_reaches_the_database() {
+    let secret = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let leak = TripleSpec {
+        id: "t_leak".into(),
+        subject: "alice".into(),
+        predicate: "keeps".into(),
+        object: format!("key {secret}"),
+        valid_from: s("2026-01-01"),
+        ..Default::default()
+    };
+    let leak_id = TripleSpec {
+        id: format!("t_{secret}"),
+        subject: "alice".into(),
+        predicate: "uses".into(),
+        object: "sqlite".into(),
+        valid_from: s("2026-01-02"),
+        ..Default::default()
+    };
+    // Redacted: the fact is kept without the secret.
+    let f = Flow::with_graph(&fixture_specs(), &[leak.clone(), leak_id.clone()], |_| {
+        ServiceOptions::default()
+    })
+    .await;
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.facts.added, 6);
+    assert!(r.redacted_fields >= 1);
+    for needle in [secret, &secret[..14]] {
+        assert_eq!(f.tables_holding(needle).await, Vec::<String>::new());
+    }
+    let json = serde_json::to_string(&r).unwrap();
+    assert!(!json.contains(&secret[..14]) && !r.render_text().contains(&secret[..14]));
+    assert!(
+        f.facts_timeline("alice")
+            .await
+            .iter()
+            .any(|x| x.contains("REDACTED"))
+    );
+
+    // Block mode: only those triples are held back, by name of detector.
+    let g = Flow::with_graph(&fixture_specs(), &[leak, leak_id], |_| {
+        ServiceOptions::default()
+    })
+    .await;
+    g.patch("privacy.redact_mode", serde_json::json!("block"))
+        .await;
+    let r = g.run_import(g.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    // The triple whose id holds the key is fine: the id is never stored, only its hash.
+    assert_eq!(r.facts.added, 5);
+    assert_eq!(r.blocked_by_redaction["github_token"], 1);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    for needle in [secret, &secret[..14]] {
+        assert_eq!(g.tables_holding(needle).await, Vec::<String>::new());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_database_mid_import_fails_with_the_resume_sentence() {
+    let f = Flow::with_specs(&big_specs(6_000)).await;
+    f.svc.start_import(f.request()).unwrap();
+    let t = Instant::now();
+    while f.count("chunks").await == 0 {
+        assert!(t.elapsed() < Duration::from_secs(60), "nothing was stored");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    f.svc.force_read_only("the disk is full");
+    let st = f.wait().await;
+    assert_eq!(st.state, ImportState::Failed, "{st:?}");
+    let e = st.error.unwrap();
+    assert!(
+        e.contains("run `alice import mempalace` again") && e.contains("what was imported is kept"),
+        "{e}"
+    );
+    assert_eq!(f.import_tmp_entries(), 0);
+    let stored = f.count("chunks").await;
+    assert!(stored > 0 && stored < 6_000, "{stored}");
+    assert_eq!(
+        stored,
+        f.count("legacy_ids").await,
+        "what was stored is whole batches"
+    );
+    assert!(f.meta("import.mempalace.last").await.is_none());
+    assert!(
+        !f.setting_bool("compat.mempalace").await,
+        "a failed run does not opt in"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_before_the_first_batch_writes_nothing() {
+    let f = Flow::new().await;
+    let before = f.table_counts().await;
+    f.svc.force_read_only("the disk is full");
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Failed, "{st:?}");
+    let e = st.error.unwrap();
+    assert!(
+        e.contains("read-only") && !e.contains("again to continue"),
+        "{e}"
+    );
+    assert_eq!(f.table_counts().await, before);
+    assert_eq!(f.import_tmp_entries(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn re_review_items_resolved_by_the_owner_come_back_zero_times() {
+    let f = Flow::new().await;
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(r.review_items, 1);
+    let open = f
+        .svc
+        .reviews(alice_core::store::reviews::ReviewQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(open.len(), 1);
+    f.svc
+        .resolve_review(alice_core::api::ResolveRequest {
+            id: open[0].id.clone(),
+            choice: "keep".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    f.wait_embedded().await;
+    let again = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(again.review_items, 0);
+    let still_open = f
+        .svc
+        .reviews(alice_core::store::reviews::ReviewQuery::default())
+        .await
+        .unwrap();
+    assert!(still_open.is_empty(), "{}", still_open.len());
 }

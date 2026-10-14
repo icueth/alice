@@ -746,8 +746,8 @@ impl Service {
     }
 
     /// Tests: refuse writes as a damaged database would.
-    #[cfg(test)]
-    pub(crate) fn force_read_only(&self, reason: &str) {
+    #[doc(hidden)]
+    pub fn force_read_only(&self, reason: &str) {
         self.writer.read_only.set(reason.to_string());
     }
 
