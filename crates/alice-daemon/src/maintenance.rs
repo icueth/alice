@@ -239,6 +239,11 @@ pub struct Scheduler {
     running: parking_lot::Mutex<()>,
     /// The connection of the integrity check in progress, so a stopping daemon can interrupt it.
     interrupt: parking_lot::Mutex<Option<rusqlite::InterruptHandle>>,
+    /// An interrupt was sent to the check in progress. SQLite reports it as `SQLITE_INTERRUPT`
+    /// inside the check, but as a plain "vtable constructor failed" when it lands while the
+    /// check is still setting up the full-text tables: either way the check was stopped, not
+    /// failed.
+    interrupted: std::sync::atomic::AtomicBool,
 }
 
 /// Rows per write in purges and retention.
@@ -272,6 +277,7 @@ impl Scheduler {
             ctx,
             running: parking_lot::Mutex::new(()),
             interrupt: parking_lot::Mutex::new(None),
+            interrupted: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -279,6 +285,7 @@ impl Scheduler {
     /// interrupt inside `PRAGMA quick_check`: the check returns `SQLITE_INTERRUPT` at once.
     pub fn interrupt_running(&self) {
         if let Some(h) = self.interrupt.lock().as_ref() {
+            self.interrupted.store(true, Ordering::SeqCst);
             h.interrupt();
         }
     }
@@ -610,10 +617,15 @@ impl Scheduler {
                     self.ctx.home.db(),
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 )?;
+                self.interrupted.store(false, Ordering::SeqCst);
                 *self.interrupt.lock() = Some(c.get_interrupt_handle());
                 let checked = m::quick_check(&c);
                 *self.interrupt.lock() = None;
                 match checked {
+                    // Stopped by `interrupt_running`, whichever way SQLite reported it.
+                    Err(_) if self.interrupted.load(Ordering::SeqCst) => {
+                        Ok(Step::Stopped("paused: the daemon is stopping".into()))
+                    }
                     Ok(problems) if problems.is_empty() => {
                         Ok(Step::Finished("quick_check ok".into()))
                     }
