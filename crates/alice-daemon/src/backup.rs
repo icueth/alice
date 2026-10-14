@@ -50,7 +50,8 @@ pub struct BackupInfo {
     pub bytes: u64,
 }
 
-const KEEP_SPECIAL_DAYS: i64 = 30;
+/// Days pre-migration and before-restore copies are kept (the newest of each kind for ever).
+pub const KEEP_SPECIAL_DAYS: i64 = 30;
 /// Manual backups kept, newest first, whatever the day: the daily/weekly policy never thins them.
 pub const KEEP_MANUAL: usize = 5;
 

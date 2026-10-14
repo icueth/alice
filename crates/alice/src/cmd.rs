@@ -1457,17 +1457,20 @@ async fn restore(home: &AliceHome, backup: Option<String>, yes: bool, json: bool
     let dir = alice_daemon::backup::backup_dir(home, &settings.backup);
     let path = r::find_backup(home, &dir, backup.as_deref())?;
     let verified = r::verify(&path)?;
+    // Everything that can be refused is refused before the daemon is touched.
+    r::check_room(home, &dir, &path)?;
     if !yes {
         anyhow::ensure!(
             std::io::stdin().is_terminal(),
             "restoring replaces the memory database; pass --yes to confirm"
         );
         eprint!(
-            "Restore {} ({} memories, {} chunks)? The current database is kept in {}. {} [y/N] ",
+            "Restore {} ({} memories, {} chunks)? Memories written after that backup leave the active database; they stay in a before-restore copy in {} (kept at least {} days), and `alice restore <that copy>` undoes this. {} [y/N] ",
             path.display(),
             verified.memories,
             verified.chunks,
             dir.display(),
+            r::KEEP_DAYS,
             r::CAVEATS
         );
         std::io::stderr().flush()?;
@@ -1478,8 +1481,13 @@ async fn restore(home: &AliceHome, backup: Option<String>, yes: bool, json: bool
             "restore cancelled"
         );
     }
+    // One restore at a time; while it is held, clients spool writes at once.
+    let guard = r::RestoreGuard::acquire(home)?;
     let mut report = None;
-    for _ in 0..RESTORE_ATTEMPTS {
+    for attempt in 0..RESTORE_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
         // Quiet: `restore` prints one document, its report, never stop's output too. Waits until
         // the daemon has let go of its lock (writes spool meanwhile).
         if let StopOutcome::Stopping(pid) = stop_daemon(home).await? {
@@ -1495,13 +1503,14 @@ async fn restore(home: &AliceHome, backup: Option<String>, yes: bool, json: bool
                 report = Some(rep);
                 break;
             }
-            // A command started a daemon in the gap: stop it again.
+            // Something else holds the daemon lock (a daemon started in the gap): stop it again.
             Err(e) if e.to_string().contains(r::DAEMON_RUNNING) => continue,
             Err(e) => return Err(e.into()),
         }
     }
+    drop(guard);
     let mut report = report.with_context(|| {
-        "a daemon keeps starting during the restore (agents are writing); nothing was changed, retry `alice restore`"
+        "something keeps holding the daemon lock during the restore; nothing was changed, retry `alice restore`"
     })?;
     // Starts the daemon on the restored database (it migrates an older one, rebuilds the index
     // and drains the spool).
@@ -1520,16 +1529,16 @@ async fn restore(home: &AliceHome, backup: Option<String>, yes: bool, json: bool
     }
     print(json, &report, || {
         let mut t = format!(
-            "Restored {}: {} memories, {} chunks.{}\n",
-            report.restored_from,
-            report.memories,
-            report.chunks,
-            report
-                .saved_current_as
-                .as_deref()
-                .map(|s| format!(" The previous database is {}.", dir.join(s).display()))
-                .unwrap_or_default()
+            "Restored {}: {} memories, {} chunks.\n",
+            report.restored_from, report.memories, report.chunks
         );
+        if let (Some(saved), Some(undo)) = (&report.saved_current_as, &report.undo) {
+            t.push_str(&format!(
+                "Memories written after that backup are no longer in the active database. They stay in {} (kept at least {} days).\nTo undo: {undo} --yes\n",
+                dir.join(saved).display(),
+                r::KEEP_DAYS
+            ));
+        }
         for w in &report.warnings {
             t.push_str(&format!("warning: {w}\n"));
         }

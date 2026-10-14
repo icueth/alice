@@ -94,6 +94,8 @@ pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
         );
         return Ok(());
     };
+    // A killed `alice restore` may have left its staged files; none runs while we hold the lock.
+    crate::restore::sweep_staged(&home);
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
     // Whatever daemon.json exists now is stale (its writer no longer holds the lock): drop it
