@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod discovery;
 pub mod http;
+pub mod judge_http;
 pub mod mcp;
 pub mod paths;
 pub mod redaction;

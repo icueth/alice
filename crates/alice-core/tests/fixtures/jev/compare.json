@@ -1,0 +1,102 @@
+{
+  "recorded": true,
+  "request": {
+    "model": "jev-1.13.0",
+    "questions": {
+      "fwd_1": {
+        "criteria": {
+          "contradicts": "they cannot both be true, and the new one does not clearly replace the existing one",
+          "duplicate": "both say the same thing; neither adds anything",
+          "unrelated": "different subjects, or compatible information that should both be kept",
+          "updates": "the new memory replaces the existing one with newer or corrected information about the same thing"
+        },
+        "instructions": "How does the new memory relate to existing memory 1?",
+        "type": "choice"
+      },
+      "fwd_2": {
+        "criteria": {
+          "contradicts": "they cannot both be true, and the new one does not clearly replace the existing one",
+          "duplicate": "both say the same thing; neither adds anything",
+          "unrelated": "different subjects, or compatible information that should both be kept",
+          "updates": "the new memory replaces the existing one with newer or corrected information about the same thing"
+        },
+        "instructions": "How does the new memory relate to existing memory 2?",
+        "type": "choice"
+      },
+      "rev_1": {
+        "criteria": {
+          "contradicts": "they cannot both be true, and the new one does not clearly replace the existing one",
+          "duplicate": "both say the same thing; neither adds anything",
+          "outdated_by": "the existing memory is replaced by the new one: newer or corrected information about the same thing",
+          "unrelated": "different subjects, or compatible information that should both be kept"
+        },
+        "instructions": "How does existing memory 1 relate to the new memory?",
+        "type": "choice"
+      },
+      "rev_2": {
+        "criteria": {
+          "contradicts": "they cannot both be true, and the new one does not clearly replace the existing one",
+          "duplicate": "both say the same thing; neither adds anything",
+          "outdated_by": "the existing memory is replaced by the new one: newer or corrected information about the same thing",
+          "unrelated": "different subjects, or compatible information that should both be kept"
+        },
+        "instructions": "How does existing memory 2 relate to the new memory?",
+        "type": "choice"
+      }
+    },
+    "state": "New memory (written today, kind decision, importance normal, project alice):\nTitle: Embeddings run on ONNX Runtime directly\nWe dropped fastembed: the daemon runs the int8 e5 model on ONNX Runtime with a compact tokenizer, which saves about 250 MB.\n\nExisting memory 1 (written two weeks ago, kind decision, importance normal, project alice):\nTitle: Embeddings run through fastembed\nThe daemon embeds with fastembed 7.1 and the Hugging Face tokenizer.\n\nExisting memory 2 (written a month ago, kind fact, importance normal, project alice):\nTitle: Thai search uses trigram FTS5\nThai has no spaces between words, so lexical search uses the FTS5 trigram tokenizer.\n"
+  },
+  "response": {
+    "answers": {
+      "fwd_1": {
+        "choice": "updates",
+        "confidence": 0.99,
+        "probabilities": {
+          "contradicts": 0.01,
+          "duplicate": 0.0,
+          "unrelated": 0.0,
+          "updates": 0.99
+        },
+        "type": "choice"
+      },
+      "fwd_2": {
+        "choice": "unrelated",
+        "confidence": 1.0,
+        "probabilities": {
+          "contradicts": 0.0,
+          "duplicate": 0.0,
+          "unrelated": 1.0,
+          "updates": 0.0
+        },
+        "type": "choice"
+      },
+      "rev_1": {
+        "choice": "outdated_by",
+        "confidence": 1.0,
+        "probabilities": {
+          "contradicts": 0.0,
+          "duplicate": 0.0,
+          "outdated_by": 1.0,
+          "unrelated": 0.0
+        },
+        "type": "choice"
+      },
+      "rev_2": {
+        "choice": "unrelated",
+        "confidence": 1.0,
+        "probabilities": {
+          "contradicts": 0.0,
+          "duplicate": 0.0,
+          "outdated_by": 0.0,
+          "unrelated": 1.0
+        },
+        "type": "choice"
+      }
+    },
+    "model": "jev-1.13.0",
+    "usage": {
+      "input_tokens": 947,
+      "output_tokens": 207
+    }
+  }
+}

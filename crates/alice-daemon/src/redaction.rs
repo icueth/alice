@@ -30,8 +30,9 @@ enum Source {
 
 pub struct Redactors {
     source: Source,
-    global: Mutex<Option<Entry>>,
-    projects: Mutex<HashMap<PathBuf, Entry>>,
+    /// Indexed by `always_on` (see [`Redactors::for_root_always_on`]).
+    global: Mutex<[Option<Entry>; 2]>,
+    projects: Mutex<HashMap<(PathBuf, bool), Entry>>,
 }
 
 impl Redactors {
@@ -48,7 +49,7 @@ impl Redactors {
     fn with(source: Source) -> Self {
         Self {
             source,
-            global: Mutex::new(None),
+            global: Mutex::new([None, None]),
             projects: Mutex::new(HashMap::new()),
         }
     }
@@ -67,12 +68,27 @@ impl Redactors {
     /// settings validation should have refused), the built-in detectors run with the configured
     /// switch and mode, and a warning names no pattern.
     pub fn for_root(&self, root: Option<&Path>) -> Arc<Redactor> {
-        let privacy = self.privacy_for(root);
+        self.cached(root, false)
+    }
+
+    /// [`for_root`](Self::for_root) with the `privacy.redact` switch forced on, whatever it
+    /// says: for text that leaves the machine (the Jev judge's requests), which is redacted
+    /// even when the person stores raw text. The mode does not matter to the caller, which
+    /// applies the redactor and never asks it to refuse.
+    pub fn for_root_always_on(&self, root: Option<&Path>) -> Arc<Redactor> {
+        self.cached(root, true)
+    }
+
+    fn cached(&self, root: Option<&Path>, always_on: bool) -> Arc<Redactor> {
+        let mut privacy = self.privacy_for(root);
+        if always_on {
+            privacy.redact = true;
+        }
         match root {
             Some(root) => {
                 let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
                 let mut cache = self.projects.lock();
-                if let Some((p, r)) = cache.get(&key)
+                if let Some((p, r)) = cache.get(&(key.clone(), always_on))
                     && *p == privacy
                 {
                     return r.clone();
@@ -81,18 +97,18 @@ impl Redactors {
                 if cache.len() >= MAX_ROOTS {
                     cache.clear();
                 }
-                cache.insert(key, (privacy, r.clone()));
+                cache.insert((key, always_on), (privacy, r.clone()));
                 r
             }
             None => {
                 let mut g = self.global.lock();
-                if let Some((p, r)) = g.as_ref()
+                if let Some((p, r)) = g[always_on as usize].as_ref()
                     && *p == privacy
                 {
                     return r.clone();
                 }
                 let r = Self::build(&privacy);
-                *g = Some((privacy, r.clone()));
+                g[always_on as usize] = Some((privacy, r.clone()));
                 r
             }
         }
@@ -156,6 +172,25 @@ mod tests {
         let red = r.for_root(Some(repo.path()));
         assert!(red.blocks(), "an invalid project file blocks secrets");
         assert!(red.check("content", "see TCK-1234").is_err());
+    }
+
+    #[test]
+    fn the_always_on_redactor_redacts_even_when_redaction_is_off() {
+        let r = Redactors::fixed(PrivacySettings {
+            redact: false,
+            ..Default::default()
+        });
+        let text = concat!("token gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 here");
+        assert_eq!(r.for_root(None).apply(text).text, text, "off for storage");
+        let on = r.for_root_always_on(None);
+        assert_eq!(on.apply(text).found, ["github_token"]);
+        assert!(Arc::ptr_eq(&on, &r.for_root_always_on(None)), "reused");
+        let repo = tempfile::tempdir().unwrap();
+        assert_eq!(
+            r.for_root_always_on(Some(repo.path())).apply(text).found,
+            ["github_token"]
+        );
+        assert!(r.for_root(Some(repo.path())).apply(text).found.is_empty());
     }
 
     #[test]

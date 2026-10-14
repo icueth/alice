@@ -4,6 +4,7 @@
 //! `spawn_blocking`, so neither ever waits for the other (spec §4.1).
 
 use crate::config::SettingsHandle;
+use crate::judge_http::JudgeHub;
 use crate::paths::AliceHome;
 use crate::redaction::Redactors;
 use crate::secrets::{self, SecretName, SecretStore};
@@ -14,6 +15,8 @@ use alice_core::api::*;
 use alice_core::embed::Embedder;
 use alice_core::error::{AliceError, Result};
 use alice_core::ids::new_id;
+use alice_core::judge::Judge;
+use alice_core::judge::jev::JevTransport;
 use alice_core::model::limits;
 use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
@@ -77,6 +80,9 @@ pub struct ServiceOptions {
     /// How long a request waits for the secrets store (an OS keychain may wait for a prompt
     /// nobody answers) before it says so and carries on.
     pub secrets_timeout: Duration,
+    /// The transport the Jev judge posts through; `None` makes the real HTTP client on first
+    /// use. Tests pass a scripted one, so none of them reaches the network.
+    pub jev_transport: Option<Arc<dyn JevTransport>>,
 }
 
 impl Default for ServiceOptions {
@@ -96,6 +102,7 @@ impl Default for ServiceOptions {
             secrets: None,
             secret_env: Some(Arc::new(|_: &str| None)),
             secrets_timeout: Duration::from_secs(5),
+            jev_transport: None,
         }
     }
 }
@@ -270,6 +277,9 @@ pub struct Service {
     started_with: Arc<Settings>,
     secrets: Arc<dyn SecretStore>,
     secret_env: SecretEnv,
+    /// The judge in force (rebuilt when its settings or its key change) and why it is not the
+    /// one the settings ask for.
+    judge: Arc<JudgeHub>,
     /// The read of the secrets' status in flight (it may be stuck on a keychain prompt):
     /// requests that overlap it wait for it instead of starting another.
     secrets_read: Arc<Mutex<Option<SecretsRead>>>,
@@ -381,11 +391,16 @@ fn spawn_rebuild(
 
 /// Records every settings change that takes effect: a `settings.change` event naming the keys
 /// (never a value) and a `settings` item on the stream. Ends when the handle is dropped.
-fn spawn_config_events(settings: &Arc<SettingsHandle>, writer: &WriterHandle) -> Result<()> {
+fn spawn_config_events(
+    settings: &Arc<SettingsHandle>,
+    writer: &WriterHandle,
+    judge: &Arc<JudgeHub>,
+) -> Result<()> {
     let rx = settings.subscribe();
     let start = settings.get();
     // Weak: the loop must not keep the handle (and so the channel) alive after shutdown.
     let weak = Arc::downgrade(settings);
+    let weak_judge = Arc::downgrade(judge);
     let writer = writer.clone();
     std::thread::Builder::new()
         .name("alice-config-events".into())
@@ -409,6 +424,11 @@ fn spawn_config_events(settings: &Arc<SettingsHandle>, writer: &WriterHandle) ->
                         before: None,
                         after: Some(after),
                     });
+                    // The judge reads its settings when it is built: rebuild it for a change
+                    // that can matter (this also runs after a lag, with the keys re-derived).
+                    if let Some(judge) = weak_judge.upgrade() {
+                        judge.on_change(&changed);
+                    }
                 },
             )
         })?;
@@ -522,7 +542,16 @@ impl Service {
             // `embedding.batch_size` (a restart key: the worker is built once).
             batch: started_with.embedding.batch_size,
         });
-        if let Err(e) = spawn_config_events(&settings, &writer) {
+        let judge = JudgeHub::new(
+            settings.clone(),
+            secrets.clone(),
+            secret_env.clone(),
+            readers.clone(),
+            writer.clone(),
+            redactors.clone(),
+            opts.jev_transport.clone(),
+        );
+        if let Err(e) = spawn_config_events(&settings, &writer, &judge) {
             // The worker and the writer are running already: stop them, do not leak them.
             stop.store(true, Ordering::SeqCst);
             let _ = wake_tx.try_send(());
@@ -550,6 +579,7 @@ impl Service {
             started_with,
             secrets,
             secret_env,
+            judge,
             secrets_read: Arc::new(Mutex::new(None)),
             secrets_write: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
@@ -1325,6 +1355,9 @@ impl Service {
             before: None,
             after: None,
         });
+        if name == SecretName::JevApiKey {
+            self.judge.rebuild();
+        }
         Ok(secrets::status_with(
             self.secrets.as_ref(),
             name,
@@ -1344,8 +1377,23 @@ impl Service {
                 before: None,
                 after: None,
             });
+            if name == SecretName::JevApiKey {
+                self.judge.rebuild();
+            }
         }
         Ok(had)
+    }
+
+    /// The judge in force: the one `judge.provider` names, or the heuristic when Jev cannot be
+    /// used (no key, no HTTP client).
+    pub fn judge(&self) -> Arc<dyn Judge> {
+        self.judge.current()
+    }
+
+    /// Why the judge is not working as set: it fell back to the heuristic, or Jev is paused
+    /// (its spend cannot be read, or the day's budget is used up).
+    pub fn judge_warning(&self) -> Option<String> {
+        self.judge.warning()
     }
 
     /// Runs `f` (a call into the secrets store) off the runtime's threads, for at most
@@ -1396,7 +1444,7 @@ impl Service {
         self.secrets_call(move || me.delete_secret(name)).await
     }
 
-    /// Connection test for a provider. Task 9 adds `judge` with Jev; Task 16 HTTP embeddings.
+    /// Connection test for a provider (`judge`, `embedding`; Task 16 adds HTTP embeddings).
     pub async fn test_provider(&self, which: &str) -> Result<ProviderTest> {
         let started = Instant::now();
         let took = || started.elapsed().as_millis() as u64;
@@ -1430,11 +1478,43 @@ impl Service {
                     },
                 })
             }
-            "judge" => Ok(ProviderTest {
-                ok: true,
-                message: "the heuristic judge needs no connection".into(),
-                latency_ms: took(),
-            }),
+            "judge" => {
+                let j = self.judge();
+                let provider = j.provider().to_string();
+                if provider == "heuristic" {
+                    // Jev wanted but not usable: the test fails and says why.
+                    let fell_back = self.judge.fell_back();
+                    return Ok(ProviderTest {
+                        ok: !fell_back,
+                        message: self
+                            .judge_warning()
+                            .unwrap_or_else(|| "the heuristic judge needs no connection".into()),
+                        latency_ms: took(),
+                    });
+                }
+                use alice_core::judge::jev::scenarios;
+                let r = tokio::task::spawn_blocking(move || {
+                    j.classify(scenarios::CLASSIFY_STATE, &scenarios::classify_choices())
+                })
+                .await
+                .map_err(join_err)?;
+                Ok(match r {
+                    Ok(d) => ProviderTest {
+                        ok: true,
+                        message: format!(
+                            "Jev answered ({})",
+                            d.best()
+                                .map_or("no choice".into(), |(c, p)| format!("{c}, {p:.2}"))
+                        ),
+                        latency_ms: took(),
+                    },
+                    Err(e) => ProviderTest {
+                        ok: false,
+                        message: e.to_string(),
+                        latency_ms: took(),
+                    },
+                })
+            }
             other => Err(AliceError::invalid(format!(
                 "unknown provider \"{other}\"; test judge or embedding"
             ))),
@@ -3529,6 +3609,141 @@ mod tests {
             .await
             .unwrap();
         assert!(out.notes.is_empty(), "{:?}", out.notes);
+    }
+
+    /// A stand-in for the Jev API: always answers yes, counts the requests, and checks the key.
+    struct ScriptedJev {
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    const JEV_TEST_KEY: &str = concat!("ts_", "live_service_test_0001");
+
+    impl alice_core::judge::jev::JevTransport for ScriptedJev {
+        fn post(
+            &self,
+            _endpoint: &str,
+            key: &str,
+            _body: &[u8],
+            _timeout: Duration,
+        ) -> std::result::Result<
+            alice_core::judge::jev::HttpReply,
+            alice_core::judge::jev::TransportError,
+        > {
+            assert_eq!(key, JEV_TEST_KEY);
+            self.sent.fetch_add(1, Ordering::SeqCst);
+            let ok = serde_json::json!({"answers": {"q": {"choice": "yes",
+                "probabilities": {"yes": 0.9, "no": 0.1}}}, "usage": {"input_tokens": 80, "output_tokens": 2}});
+            Ok(alice_core::judge::jev::HttpReply {
+                status: 200,
+                body: serde_json::to_vec(&ok).unwrap(),
+                retry_after: None,
+            })
+        }
+    }
+
+    async fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..250 {
+            if let Some(v) = f() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_jev_judge_follows_the_settings_and_the_key_and_records_its_cost() {
+        let d = tempfile::tempdir().unwrap();
+        let transport = Arc::new(ScriptedJev {
+            sent: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                jev_transport: Some(transport.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.judge().provider(), "heuristic");
+        assert_eq!(s.judge_warning(), None);
+        // Jev asked for, no key: the heuristic judges, and health says why.
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        let w = until("the no-key warning", || s.judge_warning()).await;
+        assert!(
+            w.contains("no TypeSafe key") && w.contains("set-secret"),
+            "{w}"
+        );
+        let t = s.test_provider("judge").await.unwrap();
+        assert!(!t.ok && t.message.contains("no TypeSafe key"), "{t:?}");
+        // The key arrives: the judge is Jev at once.
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        assert_eq!(s.judge().provider(), "jev");
+        assert_eq!(s.judge_warning(), None);
+        let t = s.test_provider("judge").await.unwrap();
+        assert!(t.ok && t.message.contains("yes"), "{t:?}");
+        assert!(!t.message.contains("service_test"), "{t:?}");
+        assert_eq!(transport.sent.load(Ordering::SeqCst), 1);
+        // The call is in the ledger and the cache (written fire-and-forget through the writer).
+        let (calls, usd): (i64, f64) = until("the ledger row", || {
+            futures::executor::block_on(s.read(|c| {
+                Ok(c.query_row(
+                    "SELECT coalesce(sum(calls), 0), coalesce(sum(usd), 0) FROM cost_ledger WHERE provider = 'jev'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            }))
+            .ok()
+            .filter(|(calls, _): &(i64, f64)| *calls == 1)
+        })
+        .await;
+        assert_eq!(calls, 1);
+        assert!((usd - 80.0 * 0.042 / 1e6).abs() < 1e-12, "{usd}");
+        let cached: i64 = s
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM judge_cache WHERE provider = 'jev'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(cached, 1);
+        // The same test again is answered from the cache: no request, no cost.
+        assert!(s.test_provider("judge").await.unwrap().ok);
+        assert_eq!(transport.sent.load(Ordering::SeqCst), 1);
+        // A privacy change applies to the very next call: `global` is denied, nothing is sent.
+        s.patch_settings(patch_one(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["global"]),
+        ))
+        .unwrap();
+        let t = s.test_provider("judge").await.unwrap();
+        assert!(!t.ok && t.message.contains("may not be sent"), "{t:?}");
+        assert_eq!(transport.sent.load(Ordering::SeqCst), 1);
+        // Back to the heuristic by setting; the key stays stored and unused.
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("heuristic")))
+            .unwrap();
+        until("the heuristic judge", || {
+            (s.judge().provider() == "heuristic").then_some(())
+        })
+        .await;
+        assert!(s.test_provider("judge").await.unwrap().ok);
+        // Deleting the key while Jev is wanted falls back with a warning.
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        until("the jev judge", || {
+            (s.judge().provider() == "jev").then_some(())
+        })
+        .await;
+        s.delete_secret(SecretName::JevApiKey).unwrap();
+        assert_eq!(s.judge().provider(), "heuristic");
+        assert!(s.judge_warning().unwrap().contains("no TypeSafe key"));
+        s.shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread")]

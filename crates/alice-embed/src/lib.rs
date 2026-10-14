@@ -249,6 +249,7 @@ async fn download(
 // The tokenizer needs `spm_precompiled`, an optional dependency of feature `local`.
 #[cfg(feature = "local")]
 mod lazy;
+pub mod net;
 #[cfg(feature = "local")]
 pub mod onnx;
 #[cfg(feature = "local")]

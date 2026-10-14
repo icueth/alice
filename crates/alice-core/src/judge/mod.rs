@@ -4,6 +4,7 @@
 //! otherwise do nothing; a failing judge never fails a write.
 
 pub mod heuristic;
+pub mod jev;
 pub mod text;
 pub mod verbal;
 
@@ -274,6 +275,12 @@ pub fn relevance_choices() -> Vec<Choice> {
 
 pub trait Judge: Send + Sync {
     fn provider(&self) -> &str;
+
+    /// A condition worth showing in health (e.g. Jev paused because its spend cannot be read
+    /// or the day's budget is used up).
+    fn warning(&self) -> Option<String> {
+        None
+    }
 
     /// P over `options` for `state`.
     fn classify(&self, state: &str, options: &[Choice]) -> JudgeResult<Distribution>;

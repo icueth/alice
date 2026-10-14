@@ -13,6 +13,7 @@ use alice_core::redact::Redactor;
 use alice_core::store::embeddings::{self, VecKey};
 use alice_core::store::events::{self, Actor, EventInput};
 use alice_core::store::history::{self, UndoOutcome};
+use alice_core::store::judge as judge_store;
 use alice_core::store::kg::{self, AssertFact, EntityMatcher, FactOutcome};
 use alice_core::store::memories::{
     self, InsertOutcome, MemoryUpdate, NewMemoryInput, UpdateAction,
@@ -99,6 +100,9 @@ pub enum WriteOp {
         before: Option<serde_json::Value>,
         after: Option<serde_json::Value>,
     },
+    /// A paid judge call that was answered: its response goes to the judge cache and its cost
+    /// to the day's ledger, in one transaction (a failing job rolls back alone).
+    JudgeCall(alice_core::judge::jev::JevCall),
     Shutdown,
 }
 
@@ -726,6 +730,21 @@ fn apply(
             if let Some(changed) = changed {
                 st.stream.push(StreamItem::Settings { changed });
             }
+            WriteOutcome::Done
+        }
+        WriteOp::JudgeCall(c) => {
+            judge_store::cache_put(conn, &c.hash, "jev", &c.model, &c.response_json)?;
+            judge_store::add_cost(
+                conn,
+                &judge_store::CostDelta {
+                    day: c.day,
+                    provider: "jev".into(),
+                    calls: 1,
+                    input_tokens: c.input_tokens,
+                    output_tokens: c.output_tokens,
+                    usd: c.usd,
+                },
+            )?;
             WriteOutcome::Done
         }
         WriteOp::Shutdown => WriteOutcome::Done,
