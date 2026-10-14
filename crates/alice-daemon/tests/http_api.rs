@@ -1308,7 +1308,7 @@ async fn the_provider_test_and_secret_errors_speak_plainly() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_settings_routes_are_guarded() {
     let s = Srv::start_with(quiet()).await;
-    let routes: [(reqwest::Method, &str); 16] = [
+    let routes: [(reqwest::Method, &str); 19] = [
         (reqwest::Method::GET, "/api/v1/reviews"),
         (reqwest::Method::GET, "/api/v1/reviews/X"),
         (reqwest::Method::POST, "/api/v1/reviews/X/resolve"),
@@ -1325,6 +1325,9 @@ async fn the_settings_routes_are_guarded() {
         (reqwest::Method::PUT, "/api/v1/secrets/jev_api_key"),
         (reqwest::Method::DELETE, "/api/v1/secrets/jev_api_key"),
         (reqwest::Method::POST, "/api/v1/settings/test/embedding"),
+        (reqwest::Method::GET, "/api/v1/settings/flags"),
+        (reqwest::Method::GET, "/api/v1/doctor"),
+        (reqwest::Method::POST, "/api/v1/admin/token/rotate"),
     ];
     for (method, path) in routes {
         let anon = s
@@ -1772,4 +1775,254 @@ async fn redirects_follow_chains_stop_at_eight_and_a_hand_restore_ends_them() {
         .await;
     assert_eq!(r.status(), 400);
     assert!(r.text().await.unwrap().contains("limit of 50"));
+}
+
+/// Replacing the token takes effect at once: the old one is refused from the next request on,
+/// the new one (in the token file, with mode 0600) works, and the answer never carries a token.
+#[tokio::test(flavor = "multi_thread")]
+async fn rotating_the_token_takes_effect_at_once() {
+    let s = Srv::start_with(quiet()).await;
+    let old = s.token.clone();
+    let r = s
+        .post("/api/v1/admin/token/rotate", &serde_json::json!({}))
+        .await;
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(!body.contains(&old) && body.contains("rotated"), "{body}");
+    let new = std::fs::read_to_string(s.home.token_file())
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(new, old);
+    assert!(!body.contains(&new), "the new token is not in the answer");
+    assert_eq!(
+        s.http
+            .get(s.url("/api/v1/health"))
+            .bearer_auth(&old)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        s.http
+            .get(s.url("/api/v1/health"))
+            .bearer_auth(&new)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    // The ping proof is made with the new token too, so a client with the old one sees a stranger.
+    let nonce = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+    let ping: alice_daemon::http::PingResponse = s
+        .http
+        .get(s.url(&format!("/api/v1/ping?nonce={nonce}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let proof = ping.proof.unwrap();
+    assert!(alice_daemon::discovery::verify_ping_proof(
+        &new,
+        nonce,
+        &ping.instance,
+        &proof
+    ));
+    assert!(!alice_daemon::discovery::verify_ping_proof(
+        &old,
+        nonce,
+        &ping.instance,
+        &proof
+    ));
+    // Unix file modes (0600); Windows has no mode bits.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(s.home.token_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    // And again: each rotation replaces the last, and the event holds no token.
+    let r = s
+        .http
+        .post(s.url("/api/v1/admin/token/rotate"))
+        .bearer_auth(&new)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let newer = std::fs::read_to_string(s.home.token_file())
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(newer, new);
+    // The event is written by the writer thread a moment later.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let events = loop {
+        let events: Vec<EventRow> = s
+            .http
+            .get(s.url("/api/v1/events?limit=50"))
+            .bearer_auth(&newer)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if events.iter().filter(|e| e.action == "token.rotate").count() == 2 {
+            break events;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the rotation events never appeared: {events:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    let all = serde_json::to_string(&events).unwrap();
+    assert!(
+        ![&old, &new, &newer]
+            .iter()
+            .any(|t| all.contains(t.as_str())),
+        "no event carries a token"
+    );
+}
+
+/// A rotation that cannot write the new token fails and leaves the old one working.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotation_that_cannot_write_leaves_the_old_token_in_force() {
+    let s = Srv::start_with(quiet()).await;
+    // A directory where the token file goes: the rename cannot replace it.
+    std::fs::create_dir(s.home.token_file()).unwrap();
+    let r = s
+        .post("/api/v1/admin/token/rotate", &serde_json::json!({}))
+        .await;
+    assert_eq!(r.status(), 500);
+    let e: serde_json::Value = r.json().await.unwrap();
+    assert!(
+        e["error"]
+            .as_str()
+            .unwrap()
+            .contains("old token stays in force"),
+        "{e}"
+    );
+    assert_eq!(
+        s.get("/api/v1/health").await.status(),
+        200,
+        "the old token still works"
+    );
+}
+
+/// `GET /api/v1/doctor` reports the daemon's checks, and `Health` carries the numbers `alice
+/// status` and the checks read.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_doctor_route_and_health_report_the_daemon_state() {
+    let s = Srv::start_with(quiet()).await;
+    let health: serde_json::Value = s.get_json("/api/v1/health").await;
+    for key in ["reviews_open", "model_loaded", "spool_pending"] {
+        assert!(health.get(key).is_some(), "{key} in {health}");
+    }
+    assert_eq!(health["model_loaded"], true);
+    assert_eq!(health["spool_pending"], 0);
+    assert!(
+        health.get("last_backup").is_none(),
+        "no backup yet: {health}"
+    );
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert!(health["memory_bytes"].as_u64().unwrap() > 0, "{health}");
+    }
+    // A write that waits in the spool is counted.
+    alice_daemon::spool::append(
+        &s.home.spool_dir(),
+        &alice_daemon::spool::SpoolEntry::Remember(RememberRequest {
+            content: "waiting in the spool".into(),
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+    let health: serde_json::Value = s.get_json("/api/v1/health").await;
+    assert_eq!(health["spool_pending"], 1, "{health}");
+    let report: alice_daemon::doctor::DoctorReport = s.get_json("/api/v1/doctor").await;
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.name == "spool" && c.detail.contains('1')),
+        "{report:?}"
+    );
+    let get = |n: &str| report.checks.iter().find(|c| c.name == n);
+    let db = get("database").unwrap_or_else(|| panic!("{report:?}"));
+    assert_eq!(db.status, alice_daemon::doctor::CheckStatus::Ok);
+    assert!(!report.failed(), "{report:?}");
+    // A backup shows in health and in the check.
+    let _: serde_json::Value = s.post_json("/api/v1/backups", &serde_json::json!({})).await;
+    let health: serde_json::Value = s.get_json("/api/v1/health").await;
+    let at = health["last_backup"].as_str().unwrap();
+    assert!(at.ends_with('Z'), "{at}");
+    let report: alice_daemon::doctor::DoctorReport = s.get_json("/api/v1/doctor").await;
+    let backups = report.checks.iter().find(|c| c.name == "backups").unwrap();
+    assert!(backups.detail.contains(at), "{backups:?}");
+}
+
+/// The flags endpoint answers the admin-tools switch without reading the secrets' status, so a
+/// secrets store that waits for a prompt does not slow `alice mcp`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_flags_endpoint_answers_without_asking_the_secrets_store() {
+    use alice_daemon::secrets::{SecretName, SecretStore, SecretValue};
+    struct Stuck(std::sync::atomic::AtomicUsize);
+    impl SecretStore for Stuck {
+        fn get(&self, _: SecretName) -> alice_core::Result<Option<SecretValue>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            Ok(None)
+        }
+        fn set(&self, _: SecretName, _: &str) -> alice_core::Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _: SecretName) -> alice_core::Result<bool> {
+            Ok(false)
+        }
+        fn backend(&self) -> &'static str {
+            "keychain"
+        }
+    }
+    let store = Arc::new(Stuck(Default::default()));
+    let s = Srv::start_with(ServiceOptions {
+        secrets: Some(store.clone()),
+        settings_poll: std::time::Duration::from_millis(50),
+        ..quiet()
+    })
+    .await;
+    let flags: serde_json::Value = s.get_json("/api/v1/settings/flags").await;
+    assert_eq!(flags, serde_json::json!({ "mcp.admin_tools": false }));
+    // An edit of config.toml (a PATCH would answer with the whole view, secrets included).
+    std::fs::write(s.home.config_file(), "[mcp]\nadmin_tools = true\n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let flags: serde_json::Value = s.get_json("/api/v1/settings/flags").await;
+        if flags == serde_json::json!({ "mcp.admin_tools": true }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the switch never showed: {flags}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(
+        store.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the store was not asked"
+    );
 }

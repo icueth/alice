@@ -1168,10 +1168,17 @@ mod tests {
         }
     }
 
-    /// A current database with committed rows that live only in its WAL (the connection is
-    /// leaked, so nothing checkpoints on close), as after a daemon that was killed.
+    /// A current database with committed rows that live only in its WAL, as after a daemon that
+    /// was killed: the database file and a `-wal` file with the rows, and no process that has
+    /// them open. The rows are written in a scratch directory by a connection that is leaked there
+    /// (so nothing checkpoints on close), and the two files are copied to `db`: a connection
+    /// leaked at `db` itself would keep the files open, which Windows does not let a restore
+    /// rename (and a killed daemon holds nothing open either).
     fn live_wal(db: &Path) {
-        let c = Connection::open(db).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let work = scratch.path().join("alice.db");
+        std::fs::copy(db, &work).unwrap();
+        let c = Connection::open(&work).unwrap();
         c.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
             .unwrap();
         c.execute_batch("PRAGMA wal_autocheckpoint = 0;").unwrap();
@@ -1180,6 +1187,9 @@ mod tests {
             [],
         )
         .unwrap();
+        let wal_of = |p: &Path| PathBuf::from(format!("{}-wal", p.display()));
+        std::fs::copy(&work, db).unwrap();
+        std::fs::copy(wal_of(&work), wal_of(db)).unwrap();
         std::mem::forget(c);
     }
 

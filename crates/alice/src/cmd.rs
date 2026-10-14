@@ -9,7 +9,9 @@ use alice_core::store::memories::{MemoryUpdate, UpdateAction};
 use alice_core::store::reviews::{ReviewItem, ReviewType};
 use alice_daemon::client::{DaemonClient, Launcher, Unavailable, remember_or_spool};
 use alice_daemon::daemon::{DaemonOptions, run};
+use alice_daemon::doctor::{self, Check, CheckStatus, DoctorReport};
 use alice_daemon::paths::AliceHome;
+use alice_daemon::service_install::{self as svcinst, Platform, Runner, SystemRunner};
 use alice_daemon::startup::{self, lock_free, lock_pid, pid_alive};
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
@@ -207,6 +209,41 @@ pub enum MaintenanceCmd {
     /// Run one job now, to its end: backup, quick_check, index_check, fts_optimize,
     /// raw_retention, trash_purge, judge_retry, merge_suggestions or events_prune.
     Run { job: String },
+}
+
+#[derive(Subcommand)]
+pub enum TokenCmd {
+    /// Replace the API token; a running daemon switches at once and refuses the old one.
+    Rotate {
+        /// Print the new token (by default it is only written to the `token` file).
+        #[arg(long)]
+        show: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ServiceCmd {
+    /// Run the daemon at login: a launchd agent (macOS), a systemd user unit (Linux) or a
+    /// scheduled task (Windows).
+    Install {
+        /// Print the files and commands; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Write the files under this directory instead of your home and run no command (for tests).
+        #[arg(long)]
+        target_dir: Option<std::path::PathBuf>,
+    },
+    /// Stop running the daemon at login and remove the unit.
+    Uninstall {
+        /// Print the commands; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove the files under this directory instead of your home and run no command.
+        #[arg(long)]
+        target_dir: Option<std::path::PathBuf>,
+    },
+    /// Whether the unit is installed.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -689,6 +726,13 @@ pub fn dispatch(command: Command, json: bool) -> Result<()> {
         Command::Import(ImportCmd::Snapshot(a)) => import_snapshot(a, json),
         // Not through `client_command`: that would start a daemon, and `restore` must have none.
         Command::Restore { backup, yes } => rt()?.block_on(restore(&home, backup, yes, json)),
+        // Neither starts a daemon: `doctor` reports on what is there, `token rotate` and
+        // `service` work with none.
+        Command::Doctor => rt()?.block_on(doctor_command(&home, json)),
+        Command::Token(TokenCmd::Rotate { show }) => {
+            rt()?.block_on(token_rotate(&home, show, json))
+        }
+        Command::Service(c) => service_command(&home, c, json),
         other => rt()?.block_on(client_command(home, other, json)),
     }
 }
@@ -958,6 +1002,9 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         | Command::Model(_)
         | Command::Bench(_)
         | Command::Import(ImportCmd::Snapshot(_))
+        | Command::Doctor
+        | Command::Token(_)
+        | Command::Service(_)
         | Command::Restore { .. } => {
             unreachable!("handled in dispatch")
         }
@@ -1444,7 +1491,9 @@ async fn patch(
     })
 }
 
-/// One line from stdin; on a Unix terminal the input is not echoed.
+/// One line from stdin; on a Unix terminal the input is not echoed, and the terminal is put back
+/// however the prompt ends: after the line, on an error, and when the process is killed
+/// (SIGINT, SIGTERM, SIGHUP) in the middle of it.
 fn read_secret(prompt: &str) -> Result<String> {
     use std::io::{BufRead, IsTerminal};
     let stdin = std::io::stdin();
@@ -1454,35 +1503,95 @@ fn read_secret(prompt: &str) -> Result<String> {
         std::io::stderr().flush()?;
     }
     #[cfg(unix)]
-    let restore = if tty {
-        // SAFETY: tcgetattr/tcsetattr on our own stdin with a zeroed termios they fill; the
-        // attributes are changed only when tcgetattr succeeded.
-        unsafe {
-            let mut t: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(0, &mut t) == 0 {
-                let old = t;
-                t.c_lflag &= !libc::ECHO;
-                libc::tcsetattr(0, libc::TCSANOW, &t);
-                Some(old)
-            } else {
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let echo_off = if tty { echo::EchoOff::new() } else { None };
     let mut line = String::new();
     let read = stdin.lock().read_line(&mut line);
     #[cfg(unix)]
-    if let Some(old) = restore {
-        // SAFETY: restores the attributes saved above.
-        unsafe { libc::tcsetattr(0, libc::TCSANOW, &old) };
+    if echo_off.is_some() {
+        drop(echo_off);
         eprintln!();
     }
     read.context("cannot read the secret from stdin")?;
     let v = line.trim().to_string();
     anyhow::ensure!(!v.is_empty(), "no secret was given; paste it on stdin");
     Ok(v)
+}
+
+/// Terminal echo off for the length of a prompt, restored by `Drop` and by a signal handler.
+#[cfg(unix)]
+mod echo {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The attributes to put back, readable by the signal handler: written once before
+    /// `SAVED` is set, never while it is set.
+    static mut OLD: std::mem::MaybeUninit<libc::termios> = std::mem::MaybeUninit::uninit();
+    static SAVED: AtomicBool = AtomicBool::new(false);
+    const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+    /// Put the saved attributes back (async-signal-safe: `tcsetattr` and an atomic read).
+    fn put_back() {
+        if SAVED.load(Ordering::Acquire) {
+            // SAFETY: `OLD` was written before `SAVED` was set and is not written while it is set;
+            // `tcsetattr` is async-signal-safe.
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, (&raw const OLD).cast()) };
+        }
+    }
+
+    extern "C" fn on_signal(sig: libc::c_int) {
+        put_back();
+        // SAFETY: back to the default action (`SA_RESETHAND` did that already; this is for a
+        // handler entered twice), then the signal again: the process ends as it would have.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+
+    pub struct EchoOff {
+        previous: Vec<(libc::c_int, libc::sigaction)>,
+    }
+
+    impl EchoOff {
+        /// Turn echo off on stdin; `None` when it is not a terminal that can be changed.
+        pub fn new() -> Option<EchoOff> {
+            // SAFETY: tcgetattr on our own stdin fills a termios; `OLD` is written only while
+            // `SAVED` is false, and only by the one prompt that runs at a time.
+            unsafe {
+                let mut t: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(0, &mut t) != 0 {
+                    return None;
+                }
+                (&raw mut OLD).write(std::mem::MaybeUninit::new(t));
+                SAVED.store(true, Ordering::Release);
+                // The handlers go in before echo goes off: a signal in between finds echo on.
+                let mut previous = Vec::new();
+                for sig in SIGNALS {
+                    let mut act: libc::sigaction = std::mem::zeroed();
+                    act.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
+                    act.sa_flags = libc::SA_RESETHAND;
+                    libc::sigemptyset(&mut act.sa_mask);
+                    let mut old: libc::sigaction = std::mem::zeroed();
+                    if libc::sigaction(sig, &act, &mut old) == 0 {
+                        previous.push((sig, old));
+                    }
+                }
+                t.c_lflag &= !libc::ECHO;
+                libc::tcsetattr(0, libc::TCSANOW, &t);
+                Some(EchoOff { previous })
+            }
+        }
+    }
+
+    impl Drop for EchoOff {
+        fn drop(&mut self) {
+            put_back();
+            SAVED.store(false, Ordering::Release);
+            for (sig, old) in &self.previous {
+                // SAFETY: the actions saved when the handlers were installed.
+                unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
+            }
+        }
+    }
 }
 
 /// The last `n` lines of the log at `path` (invalid UTF-8 replaced); none if there is no log yet.
@@ -1508,26 +1617,39 @@ fn log_tail(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
         .collect())
 }
 
-/// Never starts a daemon. Without one, says whether one is starting (and what it does) or why
-/// the last start failed.
+/// Never starts a daemon. Without one, says whether one is starting (and what it does), runs but
+/// does not answer, or why the last start failed.
 async fn status(home: &AliceHome, json: bool) -> Result<()> {
     let Some(c) = DaemonClient::try_existing(home).await else {
-        let starting = startup::lock_holder(home)
-            .map(|pid| (pid, startup::read_progress(home).map(|p| p.describe())));
-        let failed = startup::read_error(home).filter(|_| starting.is_none());
+        let holder = startup::lock_holder(home);
+        let progress = holder.and_then(|_| startup::read_progress(home));
+        // A holder that announces nothing and has been running longer than a start takes is not
+        // starting: it runs and does not answer.
+        let silent = holder.filter(|&pid| {
+            progress.is_none()
+                && startup::holder_age(home, pid).is_some_and(|age| age >= START_IDLE_WAIT)
+        });
+        let starting = holder
+            .filter(|_| silent.is_none())
+            .map(|pid| (pid, progress.as_ref().map(|p| p.describe())));
+        let failed = startup::read_error(home).filter(|_| holder.is_none());
         let value = serde_json::json!({
             "running": false,
             "starting": starting.as_ref().map(|(pid, doing)| serde_json::json!({"pid": pid, "doing": doing})),
+            "not_answering": silent,
             "start_error": failed.as_ref().map(|e| &e.error),
         });
-        return print(json, &value, || match (&starting, &failed) {
-            (Some((pid, Some(doing))), _) => format!("starting (pid {pid}): {doing}\n"),
-            (Some((pid, None)), _) => format!("starting (pid {pid})\n"),
-            (None, Some(e)) => format!(
+        return print(json, &value, || match (&starting, silent, &failed) {
+            (_, Some(pid), _) => format!(
+                "running (pid {pid}, not answering); see \"alice daemon logs\", or end it with \"kill {pid}\" and start again\n"
+            ),
+            (Some((pid, Some(doing))), _, _) => format!("starting (pid {pid}): {doing}\n"),
+            (Some((pid, None)), _, _) => format!("starting (pid {pid})\n"),
+            (None, _, Some(e)) => format!(
                 "not running; the last start failed ({}): {}\n",
                 e.at, e.error
             ),
-            (None, None) => "not running\n".into(),
+            (None, _, None) => "not running\n".into(),
         });
     };
     let h = c.health().await?;
@@ -1586,6 +1708,30 @@ fn health_notes(h: &Health) -> String {
     if let Some(e) = &h.embedding_error {
         out.push_str(&format!("WARNING: {e}\n"));
     }
+    if !h.judge_provider.is_empty() {
+        out.push_str(&format!(
+            "judge: {} (backlog {})\n",
+            h.judge_provider, h.judge_backlog
+        ));
+    }
+    if let Some(w) = &h.judge_warning {
+        out.push_str(&format!("WARNING: {w}\n"));
+    }
+    if h.reviews_open > 0 {
+        out.push_str(&format!(
+            "reviews open: {} (`alice review`)\n",
+            h.reviews_open
+        ));
+    }
+    if h.spool_pending > 0 {
+        out.push_str(&format!("spooled writes waiting: {}\n", h.spool_pending));
+    }
+    if let Some(t) = &h.last_backup {
+        out.push_str(&format!("last backup: {t}\n"));
+    }
+    if let Some(b) = h.memory_bytes {
+        out.push_str(&format!("memory in use: {} MB\n", b / 1_000_000));
+    }
     if let Some(w) = &h.maintenance_warning {
         out.push_str(&format!("WARNING: {w}\n"));
     }
@@ -1624,6 +1770,8 @@ fn stopped(json: bool, pid: Option<u32>) -> Result<()> {
 /// reported with its reason.
 async fn start(home: &AliceHome, json: bool) -> Result<()> {
     let launcher = launcher();
+    // A `daemon.error` older than this call belongs to an earlier daemon.
+    let since = startup::unix_ms();
     // What was last printed (step, file, percent in steps of 5) and the last announcement seen.
     let mut said = None;
     let mut seen = 0;
@@ -1640,10 +1788,15 @@ async fn start(home: &AliceHome, json: bool) -> Result<()> {
             if let Some(c) = DaemonClient::try_existing(home).await {
                 break 'started c;
             }
-            if let Some(e) = startup::read_error(home) {
+            let holder = startup::lock_holder(home);
+            // A live process holds the lock: it is starting, slowly, and an older failure is not
+            // its. Without a holder, the last failure is the answer.
+            if let Some(e) = startup::read_error(home)
+                && (e.unix_ms >= since || holder.is_none())
+            {
                 bail!("{}", Unavailable::StartFailed(e.error));
             }
-            let Some(pid) = startup::lock_holder(home) else {
+            let Some(pid) = holder else {
                 // The holder let go without serving or saying why: start one again.
                 break;
             };
@@ -1747,6 +1900,38 @@ async fn stop(home: &AliceHome, json: bool) -> Result<()> {
     }
 }
 
+/// Stop the daemon and swap the database, again if a write started a daemon in the gap.
+async fn swap_stopping_the_daemon(
+    home: &AliceHome,
+    dir: &Path,
+    verified: &alice_daemon::restore::VerifiedBackup,
+) -> Result<alice_daemon::restore::RestoreReport> {
+    use alice_daemon::restore as r;
+    for attempt in 0..RESTORE_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        // Quiet: `restore` prints one document, its report, never stop's output too. Waits until
+        // the daemon has let go of its lock (writes spool meanwhile).
+        if let StopOutcome::Stopping(pid) = stop_daemon(home).await? {
+            bail!(
+                "the daemon{} is still shutting down (an import or a long job may be ending); nothing was changed, retry `alice restore` in a moment",
+                pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+            );
+        }
+        let (h, d, v) = (home.clone(), dir.to_path_buf(), verified.clone());
+        match tokio::task::spawn_blocking(move || r::swap_now(&h, &d, &v)).await? {
+            Ok(rep) => return Ok(rep),
+            // Something else holds the daemon lock (a daemon started in the gap): stop it again.
+            Err(e) if e.to_string().contains(r::DAEMON_RUNNING) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!(
+        "something keeps holding the daemon lock during the restore; nothing was changed, retry `alice restore`"
+    )
+}
+
 /// How many times `restore` stops a daemon that an agent's write started in the gap before the swap.
 const RESTORE_ATTEMPTS: usize = 5;
 
@@ -1786,35 +1971,18 @@ async fn restore(home: &AliceHome, backup: Option<String>, yes: bool, json: bool
     }
     // One restore at a time; while it is held, clients spool writes at once.
     let guard = r::RestoreGuard::acquire(home)?;
-    let mut report = None;
-    for attempt in 0..RESTORE_ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-        // Quiet: `restore` prints one document, its report, never stop's output too. Waits until
-        // the daemon has let go of its lock (writes spool meanwhile).
-        if let StopOutcome::Stopping(pid) = stop_daemon(home).await? {
-            bail!(
-                "the daemon{} is still shutting down (an import or a long job may be ending); nothing was changed, retry `alice restore` in a moment",
-                pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
-            );
-        }
-        let (h, d, v) = (home.clone(), dir.clone(), verified.clone());
-        let done = tokio::task::spawn_blocking(move || r::swap_now(&h, &d, &v)).await?;
-        match done {
-            Ok(rep) => {
-                report = Some(rep);
-                break;
-            }
-            // Something else holds the daemon lock (a daemon started in the gap): stop it again.
-            Err(e) if e.to_string().contains(r::DAEMON_RUNNING) => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
+    // An installed service unit would start a daemon in the middle of the swap (launchd and
+    // systemd restart what exits): stop it first, and start it again afterwards.
+    let suspended = suspend_service()?;
+    let swapped = swap_stopping_the_daemon(home, &dir, &verified).await;
     drop(guard);
-    let mut report = report.with_context(|| {
-        "something keeps holding the daemon lock during the restore; nothing was changed, retry `alice restore`"
-    })?;
+    let resumed = suspended.map(Suspended::resume);
+    let mut report = swapped?;
+    if let Some(Err(e)) = resumed {
+        report.warnings.push(format!(
+            "the service unit could not be started again ({e}); start it with `alice service install`"
+        ));
+    }
     // Starts the daemon on the restored database (it migrates an older one, rebuilds the index
     // and drains the spool).
     match client(home).await {
@@ -1849,6 +2017,337 @@ async fn restore(home: &AliceHome, backup: Option<String>, yes: bool, json: bool
         t.push('\n');
         t
     })
+}
+
+// ---------------------------------------------------------------------------- doctor
+
+/// `alice doctor`: the checks that need no daemon, then the daemon's own when one answers. Never
+/// starts a daemon. Exits non-zero when any check fails.
+async fn doctor_command(home: &AliceHome, json: bool) -> Result<()> {
+    let daemon = DaemonClient::try_existing(home).await;
+    let health = match &daemon {
+        Some(c) => c.health().await.ok(),
+        None => None,
+    };
+    let mut checks = doctor::local_checks(home, health.as_ref());
+    if let Some(c) = &daemon {
+        match c.doctor().await {
+            Ok(r) => checks.extend(r.checks),
+            Err(e) => checks.push(Check {
+                name: "daemon report".into(),
+                status: CheckStatus::Warn,
+                detail: format!("the daemon could not report its checks: {e}"),
+                fix: Some(
+                    "run `alice daemon stop`; the next command starts the current version".into(),
+                ),
+            }),
+        }
+    }
+    let report = DoctorReport { checks };
+    print(json, &report, || {
+        report
+            .checks
+            .iter()
+            .map(|c| format!("{}\n", c.line()))
+            .collect()
+    })?;
+    let failed = report
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Fail)
+        .count();
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} check{} failed; the FAIL lines say what to do",
+        if failed == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------- token
+
+/// `alice token rotate`: a running daemon writes the new token and switches at once; with none,
+/// the file is replaced while this process holds the daemon lock (so no daemon starts on the
+/// old token meanwhile).
+async fn token_rotate(home: &AliceHome, show: bool, json: bool) -> Result<()> {
+    if let Some(c) = DaemonClient::try_existing(home).await {
+        c.rotate_token().await?;
+    } else {
+        home.ensure_dirs()?;
+        let Some(_lock) = alice_daemon::daemon::try_lock_home(home)? else {
+            bail!(
+                "a daemon holds {} but does not answer (it is starting or stopping); nothing was changed. Retry in a moment, or see \"alice daemon status\"",
+                home.lock_file().display()
+            );
+        };
+        alice_daemon::discovery::rotate_token(home).with_context(|| {
+            format!(
+                "cannot write the new token to {}; the old one stays in force. Check the permissions of {}",
+                home.token_file().display(),
+                home.root().display()
+            )
+        })?;
+    }
+    let token = show
+        .then(|| alice_daemon::discovery::read_token(home))
+        .flatten();
+    let value = match &token {
+        Some(t) => serde_json::json!({ "rotated": true, "token": t }),
+        None => serde_json::json!({ "rotated": true }),
+    };
+    print(json, &value, || {
+        let mut t =
+            "Token rotated. Clients that cached the old token reconnect on their next call.\n"
+                .to_string();
+        if let Some(token) = &token {
+            t.push_str(&format!("{token}\n"));
+        }
+        t
+    })
+}
+
+// ---------------------------------------------------------------------------- service
+
+/// How a service command treats the service manager.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServiceMode {
+    /// The user's home: commands run for real.
+    Real,
+    /// `--target-dir`: files go under that directory and no command runs.
+    TargetDir,
+    /// `ALICE_SERVICE_ROOT` (for tests): files go under that directory and the commands are
+    /// recorded in `service-commands.log` there instead of run.
+    Sandbox,
+}
+
+/// Where service files go, and whether commands may run.
+struct ServiceRoot {
+    path: std::path::PathBuf,
+    mode: ServiceMode,
+}
+
+fn service_root(target_dir: Option<std::path::PathBuf>) -> Result<ServiceRoot> {
+    if let Some(path) = target_dir {
+        return Ok(ServiceRoot {
+            path,
+            mode: ServiceMode::TargetDir,
+        });
+    }
+    if let Some(path) = std::env::var_os("ALICE_SERVICE_ROOT").filter(|v| !v.is_empty()) {
+        return Ok(ServiceRoot {
+            path: path.into(),
+            mode: ServiceMode::Sandbox,
+        });
+    }
+    Ok(ServiceRoot {
+        path: svcinst::user_home().context("cannot find your home directory")?,
+        mode: ServiceMode::Real,
+    })
+}
+
+fn user_id() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        unsafe { libc::getuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// A sandbox "runs" a command by appending it to `service-commands.log` in the sandbox, so a test
+/// can see what would have run without ever calling `launchctl`, `systemctl` or `schtasks`.
+struct LogRunner(std::path::PathBuf);
+
+impl Runner for LogRunner {
+    fn run(&self, cmd: &[String]) -> alice_core::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.0)?;
+        writeln!(f, "{}", cmd.join(" "))?;
+        Ok(())
+    }
+}
+
+/// The runner for a root, or `None` where no command may run (`--target-dir`).
+fn runner_for(root: &ServiceRoot) -> Option<Box<dyn Runner>> {
+    match root.mode {
+        ServiceMode::Real => Some(Box::new(SystemRunner)),
+        ServiceMode::Sandbox => Some(Box::new(LogRunner(root.path.join("service-commands.log")))),
+        ServiceMode::TargetDir => None,
+    }
+}
+
+/// A service unit stopped for a restore, to be started again afterwards.
+struct Suspended {
+    platform: Platform,
+    root: ServiceRoot,
+    runner: Box<dyn Runner>,
+}
+
+impl Suspended {
+    fn resume(self) -> alice_core::Result<()> {
+        svcinst::resume(
+            self.platform,
+            &self.root.path,
+            user_id(),
+            self.runner.as_ref(),
+        )
+    }
+}
+
+/// Stop the installed service unit's daemon. `None`: there is no unit (nothing to restart).
+/// A unit that cannot be stopped refuses the restore, before anything is changed.
+fn suspend_service() -> Result<Option<Suspended>> {
+    let Some(platform) = Platform::current() else {
+        return Ok(None);
+    };
+    let Ok(root) = service_root(None) else {
+        return Ok(None);
+    };
+    let Some(runner) = runner_for(&root) else {
+        return Ok(None);
+    };
+    match svcinst::suspend(platform, &root.path, user_id(), runner.as_ref()) {
+        Ok(true) => Ok(Some(Suspended {
+            platform,
+            root,
+            runner,
+        })),
+        Ok(false) => Ok(None),
+        Err(e) => bail!(
+            "the installed service could not be stopped ({e}); nothing was changed. It would start a daemon in the middle of the restore: stop it yourself (`alice service uninstall`), retry, and `alice service install` again afterwards"
+        ),
+    }
+}
+
+fn service_command(home: &AliceHome, c: ServiceCmd, json: bool) -> Result<()> {
+    let platform =
+        Platform::current().context("alice service supports macOS, Linux and Windows")?;
+    match c {
+        ServiceCmd::Install {
+            dry_run,
+            target_dir,
+        } => {
+            let root = service_root(target_dir)?;
+            // The program that is running now, and the home this command uses (absolute: the
+            // service runs from another directory).
+            let exe = std::env::current_exe().context("cannot find this program's path")?;
+            #[cfg(unix)]
+            let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+            let home = AliceHome::new(
+                std::path::absolute(home.root()).unwrap_or_else(|_| home.root().to_path_buf()),
+            );
+            let plan = svcinst::plan_install(platform, &root.path, &exe, &home, user_id());
+            if dry_run {
+                return print(
+                    json,
+                    &serde_json::json!({ "dry_run": true, "plan": plan }),
+                    || plan_text(&plan, "Would write", "Would run"),
+                );
+            }
+            let runner = runner_for(&root);
+            // A unit that is already loaded is unloaded first (launchd refuses to load it twice).
+            if let Some(r) = &runner
+                && svcinst::installed(platform, &root.path).is_some()
+            {
+                svcinst::unload(platform, &root.path, user_id(), r.as_ref())?;
+            }
+            // `--target-dir` writes the files and runs nothing.
+            svcinst::apply(&plan, runner.as_deref())?;
+            let ran = runner.is_some();
+            print(
+                json,
+                &serde_json::json!({ "installed": true, "files": plan.files.iter().map(|(p, _)| p).collect::<Vec<_>>(), "commands_run": ran }),
+                || {
+                    let mut t = String::new();
+                    for (p, _) in &plan.files {
+                        t.push_str(&format!("Wrote {}\n", p.display()));
+                    }
+                    for cmd in &plan.commands {
+                        t.push_str(&format!(
+                            "{}: {}\n",
+                            if ran { "Ran" } else { "not run (--target-dir)" },
+                            cmd.join(" ")
+                        ));
+                    }
+                    for n in &plan.notes {
+                        t.push_str(&format!("{n}\n"));
+                    }
+                    t
+                },
+            )
+        }
+        ServiceCmd::Uninstall {
+            dry_run,
+            target_dir,
+        } => {
+            let root = service_root(target_dir)?;
+            let plan = svcinst::plan_uninstall(platform, &root.path, user_id());
+            if dry_run {
+                let unit = svcinst::installed(platform, &root.path);
+                return print(
+                    json,
+                    &serde_json::json!({ "dry_run": true, "plan": plan, "would_remove": unit }),
+                    || {
+                        let mut t = plan_text(&plan, "Would write", "Would run");
+                        if let Some(u) = &unit {
+                            t.push_str(&format!("Would remove {}\n", u.display()));
+                        }
+                        t
+                    },
+                );
+            }
+            let runner = runner_for(&root);
+            svcinst::uninstall(platform, &root.path, user_id(), runner.as_deref())?;
+            print(json, &serde_json::json!({ "installed": false }), || {
+                "Service removed.\n".into()
+            })
+        }
+        ServiceCmd::Status => {
+            let root = service_root(None)?;
+            let unit = svcinst::installed(platform, &root.path);
+            // Windows keeps the task in the Task Scheduler, not in a file.
+            let task =
+                (platform == Platform::Windows && root.mode == ServiceMode::Real).then(|| {
+                    SystemRunner
+                        .run(&[
+                            "schtasks".into(),
+                            "/Query".into(),
+                            "/TN".into(),
+                            svcinst::TASK.into(),
+                        ])
+                        .is_ok()
+                });
+            let installed = unit.is_some() || task == Some(true);
+            print(
+                json,
+                &serde_json::json!({ "installed": installed, "path": unit }),
+                || match (&unit, task) {
+                    (Some(p), _) => format!("installed ({})\n", p.display()),
+                    (None, Some(true)) => format!("installed (scheduled task {})\n", svcinst::TASK),
+                    _ => "not installed\n".into(),
+                },
+            )
+        }
+    }
+}
+
+fn plan_text(plan: &svcinst::InstallPlan, write: &str, run: &str) -> String {
+    let mut t = String::new();
+    for (p, content) in &plan.files {
+        t.push_str(&format!("{write} {}:\n{content}\n", p.display()));
+    }
+    for cmd in &plan.commands {
+        t.push_str(&format!("{run}: {}\n", cmd.join(" ")));
+    }
+    for n in &plan.notes {
+        t.push_str(&format!("note: {n}\n"));
+    }
+    t
 }
 
 #[cfg(test)]

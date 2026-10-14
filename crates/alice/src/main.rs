@@ -72,6 +72,14 @@ enum Command {
     Projects,
     /// Daemon status and counts.
     Status,
+    /// Check the installation, the daemon and the data, with what to do about each problem.
+    Doctor,
+    /// Manage the API token.
+    #[command(subcommand)]
+    Token(cmd::TokenCmd),
+    /// Run the daemon at login (launchd, systemd --user, or a scheduled task).
+    #[command(subcommand)]
+    Service(cmd::ServiceCmd),
     /// Manage the background daemon.
     #[command(subcommand)]
     Daemon(cmd::DaemonCmd),

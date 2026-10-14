@@ -98,6 +98,11 @@ impl AliceHome {
     pub fn lock_file(&self) -> PathBuf {
         self.root.join("daemon.lock")
     }
+    /// The pid and start time of the daemon that holds the lock, in a file anyone can read
+    /// (Windows locks are mandatory: the lock file itself cannot be read while held).
+    pub fn daemon_pid(&self) -> PathBuf {
+        self.root.join("daemon.pid")
+    }
     /// Why the last daemon start failed (see `startup`).
     pub fn daemon_error(&self) -> PathBuf {
         self.root.join("daemon.error")
@@ -178,6 +183,7 @@ mod tests {
             home.secrets_file(),
             home.daemon_json(),
             home.lock_file(),
+            home.daemon_pid(),
             home.token_file(),
             home.daemon_error(),
             home.daemon_starting(),

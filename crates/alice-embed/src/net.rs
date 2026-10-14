@@ -263,7 +263,9 @@ mod tests {
                 &format!("http://127.0.0.1:{port}/secret-path?token=abc"),
                 None,
                 Vec::new(),
-                Duration::from_secs(2),
+                // Windows tries a refused loopback connection again for about two seconds
+                // before it reports the refusal: a shorter deadline ends in `Timeout` there.
+                Duration::from_secs(15),
             )
             .unwrap_err();
         match e {

@@ -431,6 +431,12 @@ pub struct Service {
     /// The read of the secrets' status in flight (it may be stuck on a keychain prompt):
     /// requests that overlap it wait for it instead of starting another.
     secrets_read: Arc<Mutex<Option<SecretsRead>>>,
+    /// Counts the changes that can alter what a settings view shows (a secret set or deleted, a
+    /// settings write), bumped after each lands. A view never joins a secrets read that began
+    /// before the latest change: it would show the state from before.
+    settings_gen: std::sync::atomic::AtomicU64,
+    /// Numbers the secrets reads, so a finishing read clears only its own record.
+    secrets_read_seq: std::sync::atomic::AtomicU64,
     /// One write to the secrets store at a time; a second waits (up to the timeout) rather than
     /// parking another thread behind a stuck store.
     secrets_write: Arc<tokio::sync::Mutex<()>>,
@@ -655,18 +661,34 @@ fn spawn_config_events(
 
 type SecretStatuses = BTreeMap<String, SecretStatus>;
 
-/// A read of the secrets' status that is running: when it began, and where its answer arrives.
+/// A read of the secrets' status that is running: which one, when it began, which generation of
+/// settings it began under, and where its answer arrives.
 struct SecretsRead {
+    id: u64,
     started: Instant,
+    gen_at_start: u64,
     answer: tokio::sync::watch::Receiver<Option<SecretStatuses>>,
 }
 
-/// Ends the "read in flight" record when the read ends, however it ends.
-struct ReadDone(Arc<Mutex<Option<SecretsRead>>>);
+/// What a request got from the secrets' status read.
+enum SecretsAnswer {
+    Statuses(SecretStatuses),
+    /// The store did not answer in time (a keychain waiting for a prompt).
+    Silent,
+    /// The read ended without an answer (it panicked).
+    Failed,
+}
+
+/// Ends the "read in flight" record when the read ends, however it ends (unless a newer read has
+/// already replaced it).
+struct ReadDone(Arc<Mutex<Option<SecretsRead>>>, u64);
 
 impl Drop for ReadDone {
     fn drop(&mut self) {
-        *self.0.lock() = None;
+        let mut slot = self.0.lock();
+        if slot.as_ref().is_some_and(|r| r.id == self.1) {
+            *slot = None;
+        }
     }
 }
 
@@ -933,6 +955,8 @@ impl Service {
             secret_env,
             judge,
             secrets_read: Arc::new(Mutex::new(None)),
+            settings_gen: Default::default(),
+            secrets_read_seq: Default::default(),
             secrets_write: Arc::new(tokio::sync::Mutex::new(())),
             activity,
             scheduler,
@@ -2109,6 +2133,13 @@ impl Service {
         )
     }
 
+    fn secrets_failed_note(&self) -> String {
+        format!(
+            "reading the {} failed (the daemon log has the cause); its secrets show as not set until it can be read",
+            self.secrets_store_name()
+        )
+    }
+
     /// The view without the secrets' status (which may wait on the store), plus notes.
     /// Entries of `privacy.cloud_denied_projects` that name no stored project by slug, alias or
     /// display name. Only a hint for typos: the entries are never changed or dropped.
@@ -2204,23 +2235,42 @@ impl Service {
         self.view_with(self.secret_statuses(), Vec::new())
     }
 
+    /// The view with every secret shown as not set, without asking the secrets store (which may
+    /// wait for a prompt): for callers that need only the errors, warnings and pending restarts.
+    pub fn settings_view_without_secrets(&self) -> SettingsView {
+        self.view_with(Self::unknown_secrets(), Vec::new())
+    }
+
+    /// One number from a read-only query that returns a single integer.
+    pub(crate) async fn count(&self, sql: &'static str) -> Result<u64> {
+        self.read(move |c| Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))?.max(0) as u64))
+            .await
+    }
+
     /// The secrets' status for a request handler, read off the runtime's threads. Requests that
-    /// overlap share one read. A read that has been running longer than `secrets_timeout` (a
-    /// keychain waiting for a prompt) is not waited for: `None`, with the answer unknown.
-    async fn secret_statuses_shared(self: &Arc<Self>) -> Option<SecretStatuses> {
+    /// overlap share one read, unless that read began before the latest change to a secret or a
+    /// setting (a view after a write must show the write). A read that has been running longer
+    /// than `secrets_timeout` (a keychain waiting for a prompt) is not waited for: `Silent`.
+    async fn secret_statuses_shared(self: &Arc<Self>) -> SecretsAnswer {
         let (started, mut answer) = {
             let mut running = self.secrets_read.lock();
-            match running.as_ref() {
+            // Read under the lock and before the read starts: a change that lands later only
+            // makes the next view start its own read.
+            let gen_now = self.settings_gen.load(Ordering::SeqCst);
+            match running.as_ref().filter(|r| r.gen_at_start == gen_now) {
                 Some(r) => (r.started, r.answer.clone()),
                 None => {
                     let (tx, rx) = tokio::sync::watch::channel(None);
                     let started = Instant::now();
+                    let id = self.secrets_read_seq.fetch_add(1, Ordering::SeqCst) + 1;
                     *running = Some(SecretsRead {
+                        id,
                         started,
+                        gen_at_start: gen_now,
                         answer: rx.clone(),
                     });
                     let me = self.clone();
-                    let done = ReadDone(self.secrets_read.clone());
+                    let done = ReadDone(self.secrets_read.clone(), id);
                     tokio::task::spawn_blocking(move || {
                         let _done = done;
                         let statuses = me.secret_statuses();
@@ -2232,13 +2282,22 @@ impl Service {
         };
         let wait = self.opts.secrets_timeout.saturating_sub(started.elapsed());
         match tokio::time::timeout(wait, answer.wait_for(|a| a.is_some())).await {
-            Ok(Ok(statuses)) => statuses.clone(),
+            Ok(Ok(statuses)) => match statuses.clone() {
+                Some(s) => SecretsAnswer::Statuses(s),
+                None => SecretsAnswer::Failed,
+            },
+            // The reader ended without sending: it panicked.
             Ok(Err(_)) => {
                 tracing::warn!("reading the secrets' status failed");
-                None
+                SecretsAnswer::Failed
             }
-            Err(_) => None,
+            Err(_) => SecretsAnswer::Silent,
         }
+    }
+
+    /// A change that a settings view shows has landed: later views read afresh.
+    fn settings_changed(&self) {
+        self.settings_gen.fetch_add(1, Ordering::SeqCst);
     }
 
     /// `settings_view` for a request handler: the secrets are read off the runtime's threads
@@ -2246,8 +2305,13 @@ impl Service {
     /// prompt) leaves them as not set, with a note, and overlapping requests share one read.
     pub async fn settings_view_async(self: &Arc<Self>) -> SettingsView {
         match self.secret_statuses_shared().await {
-            Some(secrets) => self.view_with(secrets, Vec::new()),
-            None => self.view_with(Self::unknown_secrets(), vec![self.secrets_silent_note()]),
+            SecretsAnswer::Statuses(secrets) => self.view_with(secrets, Vec::new()),
+            SecretsAnswer::Silent => {
+                self.view_with(Self::unknown_secrets(), vec![self.secrets_silent_note()])
+            }
+            SecretsAnswer::Failed => {
+                self.view_with(Self::unknown_secrets(), vec![self.secrets_failed_note()])
+            }
         }
     }
 
@@ -2259,6 +2323,7 @@ impl Service {
     ) -> std::result::Result<PatchResponse, Vec<SettingError>> {
         let before = self.settings.get();
         let out = self.settings.patch(&changes)?;
+        self.settings_changed();
         Ok(self.patch_response(&before, out, self.settings_view()))
     }
 
@@ -2352,6 +2417,7 @@ impl Service {
                     message: format!("internal task failed: {e}"),
                 }]
             })??;
+        self.settings_changed();
         let view = self.settings_view_async().await;
         Ok(self.patch_response(&before, out, view))
     }
@@ -2360,6 +2426,7 @@ impl Service {
     /// that it was set, never the value.
     pub fn set_secret(&self, name: SecretName, value: String) -> Result<SecretStatus> {
         self.secrets.set(name, &value)?;
+        self.settings_changed();
         self.writer.send_nowait(WriteOp::RecordEvent {
             actor: Actor::User,
             action: "secret.set".into(),
@@ -2387,6 +2454,7 @@ impl Service {
     /// `true` when there was a value to delete.
     pub fn delete_secret(&self, name: SecretName) -> Result<bool> {
         let had = self.secrets.delete(name)?;
+        self.settings_changed();
         if had {
             self.writer.send_nowait(WriteOp::RecordEvent {
                 actor: Actor::User,
@@ -2405,6 +2473,18 @@ impl Service {
             }
         }
         Ok(had)
+    }
+
+    /// Record that the API token was replaced (the event never holds the token).
+    pub fn record_token_rotation(&self) {
+        self.writer.send_nowait(WriteOp::RecordEvent {
+            actor: Actor::User,
+            action: "token.rotate".into(),
+            target_type: "token".into(),
+            target_id: "api".into(),
+            before: None,
+            after: None,
+        });
     }
 
     /// The judge in force: the one `judge.provider` names, or the heuristic when Jev cannot be
@@ -2802,12 +2882,23 @@ impl Service {
         let embedding_error = self.embedding.problem();
         let judge_provider = self.judge().provider().to_string();
         let judge_warning = self.judge_warning();
-        // Reads the backup directory and the database: off the runtime's threads.
+        let model_loaded = self.embedder().is_loaded();
+        let memory_bytes = crate::doctor::self_memory_bytes();
+        // Read the backup directory, the spool and the database: off the runtime's threads.
         let scheduler = self.scheduler.clone();
-        let maintenance_warning =
-            tokio::task::spawn_blocking(move || scheduler.backup_warning(chrono::Utc::now()))
-                .await
-                .map_err(join_err)?;
+        let backup_dir = backup::backup_dir(&self.home, &self.settings().backup);
+        let spool_dir = self.home.spool_dir();
+        let (maintenance_warning, last_backup, spool_pending) =
+            tokio::task::spawn_blocking(move || {
+                let warning = scheduler.backup_warning(chrono::Utc::now());
+                (
+                    warning,
+                    newest_backup_time(&backup_dir),
+                    spool::pending_count(&spool_dir) as u64,
+                )
+            })
+            .await
+            .map_err(join_err)?;
         self.read(move |c| {
             let count = |sql: &str| -> Result<u64> {
                 Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)
@@ -2830,6 +2921,11 @@ impl Service {
                 embed_skipped_cloud: embeddings::skipped_cloud_count(c)? as u64,
                 maintenance_warning,
                 read_only,
+                reviews_open: reviews::count_open(c)?,
+                model_loaded,
+                spool_pending,
+                last_backup,
+                memory_bytes,
                 index_ready,
                 settings_warnings,
                 settings_errors,
@@ -2838,6 +2934,19 @@ impl Service {
         })
         .await
     }
+}
+
+/// When the newest scheduled or manual backup was made (RFC 3339), if there is one. The
+/// copies kept before a migration or a restore are not backups of the current data.
+fn newest_backup_time(dir: &Path) -> Option<String> {
+    backup::list(dir)
+        .ok()?
+        .into_iter()
+        .find(|b| matches!(b.kind, BackupKind::Scheduled | BackupKind::Manual))
+        .map(|b| {
+            b.created_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        })
 }
 
 impl Drop for Service {
@@ -4573,6 +4682,14 @@ mod tests {
         /// Reads by the judge build worker running now, and the most that ever ran at once.
         active: std::sync::atomic::AtomicUsize,
         max_active: std::sync::atomic::AtomicUsize,
+        /// A request's read answers only once this is false (it has read the value by then);
+        /// only as many reads as `hold_budget` allows wait, the rest answer at once.
+        hold: AtomicBool,
+        hold_budget: std::sync::atomic::AtomicUsize,
+        /// Request reads waiting on `hold` right now.
+        held: std::sync::atomic::AtomicUsize,
+        /// A request's read panics, as a crashing keychain library would.
+        panic_get: AtomicBool,
     }
 
     impl MemSecrets {
@@ -4586,6 +4703,10 @@ mod tests {
                 first_get: Mutex::new(None),
                 active: Default::default(),
                 max_active: Default::default(),
+                hold: AtomicBool::new(false),
+                hold_budget: Default::default(),
+                held: Default::default(),
+                panic_get: AtomicBool::new(false),
             })
         }
         fn wait(&self) {
@@ -4607,13 +4728,31 @@ mod tests {
             if building {
                 self.active.fetch_sub(1, Ordering::SeqCst);
             }
-            if first && let Some(stale) = self.first_get.lock().take() {
-                return Ok(Some(SecretValue::new(stale)));
+            if !building && self.panic_get.load(Ordering::SeqCst) {
+                panic!("the keychain library crashed");
             }
-            if self.fail_get.load(Ordering::SeqCst) {
-                return Err(AliceError::Other("the keychain is locked".into()));
+            let answer = if first && let Some(stale) = self.first_get.lock().take() {
+                Ok(Some(SecretValue::new(stale)))
+            } else if self.fail_get.load(Ordering::SeqCst) {
+                Err(AliceError::Other("the keychain is locked".into()))
+            } else {
+                Ok(self.map.lock().get(&name).map(SecretValue::new))
+            };
+            // The value is read; a request's answer waits here (the judge worker never does).
+            if !building
+                && self.hold.load(Ordering::SeqCst)
+                && self
+                    .hold_budget
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |b| b.checked_sub(1))
+                    .is_ok()
+            {
+                self.held.fetch_add(1, Ordering::SeqCst);
+                while self.hold.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.held.fetch_sub(1, Ordering::SeqCst);
             }
-            Ok(self.map.lock().get(&name).map(SecretValue::new))
+            answer
         }
         fn set(&self, name: SecretName, value: &str) -> Result<()> {
             self.sets.fetch_add(1, Ordering::SeqCst);
@@ -5094,6 +5233,139 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// A view asked for after a secret was written must show the write, even when a read of the
+    /// store that began before it is still in flight (and would show the old state).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_view_after_a_secret_write_never_joins_a_read_that_began_before_it() {
+        let d = tempfile::tempdir().unwrap();
+        let store = MemSecrets::new(Duration::ZERO);
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                secrets: Some(store.clone()),
+                secrets_timeout: Duration::from_secs(20),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        // The first read has read the key (not set) and waits.
+        store.hold_budget.store(1, Ordering::SeqCst);
+        store.hold.store(true, Ordering::SeqCst);
+        let first = {
+            let s = s.clone();
+            tokio::spawn(async move { s.settings_view_async().await })
+        };
+        until("the first read to wait", || {
+            (store.held.load(Ordering::SeqCst) > 0).then_some(())
+        })
+        .await;
+        s.set_secret_async(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .await
+            .unwrap();
+        // Asked for while the first read is still in flight, after the write.
+        let second = {
+            let s = s.clone();
+            tokio::spawn(async move { s.settings_view_async().await })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        store.hold.store(false, Ordering::SeqCst);
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert!(
+            !first.secrets["jev_api_key"].set,
+            "the first read began before the write"
+        );
+        assert!(
+            second.secrets["jev_api_key"].set,
+            "a view after the write shows it: {:?}",
+            second.secrets
+        );
+        // Without a change in between, overlapping views still share one read.
+        store.gets.store(0, Ordering::SeqCst);
+        store.delay_ms.store(200, Ordering::SeqCst);
+        let (a, b) = tokio::join!(s.settings_view_async(), s.settings_view_async());
+        assert!(a.secrets["jev_api_key"].set && b.secrets["jev_api_key"].set);
+        assert_eq!(store.gets.load(Ordering::SeqCst), SecretName::ALL.len());
+    }
+
+    /// A read of the secrets' status that crashes is reported as having failed, not as a store
+    /// that did not answer, and the next view reads again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crashed_status_read_says_failed_not_silent() {
+        let d = tempfile::tempdir().unwrap();
+        let store = MemSecrets::new(Duration::ZERO);
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                secrets: Some(store.clone()),
+                secrets_timeout: Duration::from_secs(20),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        store.panic_get.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let view = s.settings_view_async().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a crashed read does not wait for the timeout"
+        );
+        assert!(view.secrets.values().all(|x| !x.set));
+        let note = view.notes.join("; ");
+        assert!(
+            note.contains("failed") && !note.contains("did not answer"),
+            "{note}"
+        );
+        store.panic_get.store(false, Ordering::SeqCst);
+        let view = s.settings_view_async().await;
+        assert!(view.notes.is_empty(), "{:?}", view.notes);
+    }
+
+    /// `alice doctor` on a fresh service is clean; a read-only database fails with what to do;
+    /// Jev asked for without a key warns and names `set-secret jev_api_key`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_checks_are_clean_when_fresh_and_name_a_read_only_database_and_a_missing_key() {
+        use crate::doctor::{CheckStatus, daemon_checks};
+        let (_d, s) = svc().await;
+        let checks = daemon_checks(&s).await.unwrap();
+        assert!(
+            checks.iter().all(|c| c.status != CheckStatus::Fail),
+            "{checks:?}"
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "database" && c.status == CheckStatus::Ok)
+        );
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        until("the no-key warning", || {
+            s.judge_warning().filter(|w| w.contains("no TypeSafe key"))
+        })
+        .await;
+        let checks = daemon_checks(&s).await.unwrap();
+        let judge = checks.iter().find(|c| c.name == "judge").unwrap();
+        assert_eq!(judge.status, CheckStatus::Warn, "{judge:?}");
+        assert!(
+            judge
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("set-secret jev_api_key"),
+            "{judge:?}"
+        );
+        // No key value, hint or provider response reaches a check.
+        let all = serde_json::to_string(&checks).unwrap();
+        assert!(!all.contains(JEV_TEST_KEY), "{all}");
+        s.force_read_only("the disk is full");
+        let checks = daemon_checks(&s).await.unwrap();
+        let db = checks.iter().find(|c| c.name == "database").unwrap();
+        assert_eq!(db.status, CheckStatus::Fail);
+        assert!(db.detail.contains("the disk is full"));
+        assert!(db.fix.as_deref().unwrap().contains("alice restore"));
     }
 
     /// Two requests that overlap share one read of the store: both see the stored key, and

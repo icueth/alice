@@ -31,6 +31,8 @@ use std::time::{Duration, Instant};
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(3 * 3_600);
 /// A daemon that does not answer the ping this fast counts as absent.
 const PING_TIMEOUT: Duration = Duration::from_millis(300);
+/// How long `alice mcp` waits for the daemon's answer about the admin-tools switch.
+const FLAGS_TIMEOUT: Duration = Duration::from_millis(800);
 /// How long a write waits for a starting daemon before it is spooled.
 pub(crate) const WRITE_WAIT: Duration = Duration::from_millis(1_500);
 /// How often `connect` looks for the daemon it started.
@@ -236,6 +238,9 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> std::io::Result<
     spawn_detached_with_env(exe, args, log, &[])
 }
 
+// `MallocLargeCache=0` (macOS) is deliberately not set for the daemon, here or in the service files:
+// it frees ~216 MB while loaded but halves the bulk embedding rate (docs/benchmarks/m2.md,
+// "macOS MallocLargeCache=0"), and the 800 MB budget is met without it.
 fn spawn_detached_with_env(
     exe: &Path,
     args: &[&str],
@@ -421,10 +426,13 @@ impl DaemonClient {
             }
             if Instant::now() >= deadline {
                 return Err(match failed {
-                    Some(e) => Unavailable::StartFailed(e.error),
-                    None => {
-                        Unavailable::Starting(startup::read_progress(home).map(|p| p.describe()))
+                    // An error from before this call belongs to an earlier daemon. While a live
+                    // process holds the lock, that one is starting (slowly): say what it does,
+                    // not why its predecessor failed.
+                    Some(e) if startup::lock_holder(home).is_none() => {
+                        Unavailable::StartFailed(e.error)
                     }
+                    _ => Unavailable::Starting(startup::read_progress(home).map(|p| p.describe())),
                 });
             }
         }
@@ -698,6 +706,44 @@ impl DaemonClient {
             Duration::from_secs(30),
         )
         .await
+    }
+    /// The checks only the daemon can make (`alice doctor` adds its own).
+    pub async fn doctor(&self) -> Result<crate::doctor::DoctorReport> {
+        self.get_json("/api/v1/doctor").await
+    }
+    /// Replace the API token. The daemon writes the new one to the token file and refuses the
+    /// old one from the next request on, so this client (which holds the old one) must
+    /// reconnect afterwards (`DaemonClient::try_existing`). Nothing is returned: the token
+    /// never travels.
+    pub async fn rotate_token(&self) -> Result<()> {
+        let v: serde_json::Value = self
+            .call(
+                "/api/v1/admin/token/rotate",
+                &serde_json::json!({}),
+                Duration::from_secs(10),
+            )
+            .await?;
+        if v["rotated"].as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err(AliceError::Other(
+                "the memory daemon did not confirm the token rotation; it may be an older version. Run \"alice daemon stop\", then retry".into(),
+            ))
+        }
+    }
+    /// Whether `mcp.admin_tools` is on, asked of the small flags endpoint (no secrets' status)
+    /// with a short timeout.
+    pub async fn admin_tools_flag(&self) -> Result<bool> {
+        let resp = self
+            .http
+            .get(format!("{}/api/v1/settings/flags", self.base))
+            .bearer_auth(&self.token)
+            .timeout(FLAGS_TIMEOUT)
+            .send()
+            .await
+            .map_err(transport)?;
+        let v: serde_json::Value = Self::decode(resp).await?;
+        Ok(v["mcp.admin_tools"].as_bool() == Some(true))
     }
     pub async fn shutdown(&self) -> Result<()> {
         let resp = self
@@ -1675,6 +1721,62 @@ mod tests {
         let why = r.reason.unwrap();
         assert!(why.contains(reason) && !why.contains("starting"), "{why}");
         assert_eq!(spool::pending_count(&home.spool_dir()), 1);
+    }
+
+    /// An error left by an earlier daemon is not the cause of a slow start: while a live process
+    /// holds the lock the answer is "starting"; with no holder, the last failure is the answer.
+    // Unix only: the stand-in for the `alice` binary is a `#!/bin/sh` script.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_older_failure_is_not_blamed_while_a_live_process_holds_the_lock() {
+        use std::io::Write;
+        crate::install_tls();
+        let (_d, home) = home();
+        let tools = tempfile::tempdir().unwrap();
+        // A failure from long ago (unix_ms 1) by a daemon that is gone.
+        std::fs::write(
+            home.daemon_error(),
+            r#"{"pid": 999999, "at": "t", "unix_ms": 1, "error": "alice.db is not a usable database"}"#,
+        )
+        .unwrap();
+        // This process holds the daemon lock, as a daemon that is slow to start would.
+        let mut lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(home.lock_file())
+            .unwrap();
+        lock.try_lock().unwrap();
+        lock.set_len(0).unwrap();
+        writeln!(lock, "{}", std::process::id()).unwrap();
+        let exe = script_exe(tools.path(), "exit 0");
+        let e = DaemonClient::connect(
+            &home,
+            &Launcher::Exe(exe.clone()),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.starts_with("memory daemon is starting") && !e.contains("alice.db"),
+            "{e}"
+        );
+        // The holder lets go: nothing runs, and the last failure is the answer.
+        drop(lock);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !startup::lock_free(&home) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let e = DaemonClient::connect(&home, &Launcher::Exe(exe), Duration::from_millis(500))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "memory daemon could not start: alice.db is not a usable database"
+        );
     }
 
     /// Review finding I-1: when the wait runs out while the daemon downloads the model, the

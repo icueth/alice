@@ -43,6 +43,10 @@ schemars.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# Windows finds a running daemon by its pid (`OpenProcess`): locks there cannot be read.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 alice-core = { path = "../alice-core", features = ["fixtures"] }
 tempfile.workspace = true

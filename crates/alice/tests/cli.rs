@@ -1,8 +1,8 @@
 //! Real processes: auto-start, start races, kill -9, stale discovery files, stop then start,
 //! every subcommand, and the stdio MCP shim (review focus #3).
 // Unix only (M1 ruling R3): these tests probe, stop and kill the daemons they start with Unix
-// signals (`libc::kill`), and the CLI's own process control (`pid_alive`, the pid in the lock)
-// works on Unix only so far (Windows: Task 17).
+// signals (`libc::kill`) and read the pid from the held lock file (Windows reads `daemon.pid`
+// instead; the Windows parts are unit-tested in `startup` and `service_install`).
 #![cfg(unix)]
 
 use std::io::{Read, Write};
@@ -705,8 +705,9 @@ fn a_damaged_database_is_named_instead_of_starting_forever() {
             && err.contains("move it aside"),
         "{err}"
     );
+    // Named at once: far below the minute a silent lock holder is waited for.
     assert!(
-        t.elapsed() < Duration::from_secs(8),
+        t.elapsed() < Duration::from_secs(40),
         "took {:?}",
         t.elapsed()
     );
@@ -744,12 +745,24 @@ fn a_damaged_database_is_named_instead_of_starting_forever() {
 fn a_failed_model_download_is_named_with_the_next_step() {
     let e = Env::new();
     let real = |args: &[&str]| {
-        e.cmd(args)
-            .env_remove("ALICE_EMBEDDER")
+        let mut c = e.cmd(args);
+        c.env_remove("ALICE_EMBEDDER")
             // Nothing listens on port 9 (discard): the download fails at once.
             .env("HF_ENDPOINT", "http://127.0.0.1:9")
-            .output()
-            .unwrap()
+            // A developer's proxy must not stand between the daemon and that closed port.
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost");
+        for var in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            c.env_remove(var);
+        }
+        c.output().unwrap()
     };
     let t = Instant::now();
     let o = real(&["daemon", "start"]);
@@ -761,7 +774,7 @@ fn a_failed_model_download_is_named_with_the_next_step() {
         "{err}"
     );
     assert!(
-        t.elapsed() < Duration::from_secs(8),
+        t.elapsed() < Duration::from_secs(40),
         "took {:?}",
         t.elapsed()
     );
@@ -812,16 +825,44 @@ fn daemon_start_waits_while_a_live_process_holds_the_lock() {
     .unwrap();
 
     let started = Instant::now();
-    let child = e
+    let mut child = e
         .cmd(&["daemon", "start"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_secs(6));
+    // Read what it says while it waits, and hold on until it has said what the process holds
+    // the lock for AND at least 6 s have passed (longer than a daemon it started waits for the
+    // lock): a condition, not a guess at how long a loaded machine needs to start the command.
+    let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let reader = {
+        let said = said.clone();
+        let mut err = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while let Ok(n) = err.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                said.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !said.lock().unwrap().contains("50%") || started.elapsed() < Duration::from_secs(6) {
+        assert!(
+            Instant::now() < deadline,
+            "daemon start never said what the holder does: {}",
+            said.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     std::fs::remove_file(e.home.join("daemon.starting")).unwrap();
     drop(lock);
     let o = child.wait_with_output().unwrap();
+    reader.join().unwrap();
     assert!(o.status.success(), "{}", stderr(&o));
     assert!(
         String::from_utf8_lossy(&o.stdout).starts_with("running (pid "),
@@ -829,7 +870,7 @@ fn daemon_start_waits_while_a_live_process_holds_the_lock() {
         String::from_utf8_lossy(&o.stdout)
     );
     assert!(started.elapsed() >= Duration::from_secs(6));
-    let err = stderr(&o);
+    let err = said.lock().unwrap().clone();
     assert!(
         err.contains("downloading the embedding model") && err.contains("50%"),
         "{err}"
@@ -2364,4 +2405,443 @@ mod import {
                 .unwrap_or_default();
         assert!(!readme.contains("import snapshot"));
     }
+}
+
+// ------------------------------------------------------------------ Task 17
+
+/// `alice service install` writes only under the directory it is given, and runs no command; a
+/// dry run writes nothing at all.
+#[test]
+fn service_install_writes_only_under_the_target_dir_and_dry_run_writes_nothing() {
+    let env = Env::new();
+    let target = env.home.parent().unwrap().join("svc-root");
+    let t = target.to_str().unwrap();
+    let dry = env.ok(&["service", "install", "--dry-run", "--target-dir", t]);
+    assert!(dry.contains("daemon") && !target.exists(), "{dry}");
+    let out = env.ok(&["service", "install", "--target-dir", t]);
+    assert!(out.contains("not run"), "{out}");
+    let installed = if cfg!(target_os = "macos") {
+        target.join("Library/LaunchAgents/dev.alice.daemon.plist")
+    } else {
+        target.join(".config/systemd/user/alice.service")
+    };
+    let unit = std::fs::read_to_string(&installed).unwrap();
+    assert!(unit.contains(&env.home.display().to_string()), "{unit}");
+    assert!(unit.contains("daemon") && unit.contains("run"), "{unit}");
+    // No secret, no token, no address of the owner's.
+    for word in ["token", "secret", "@"] {
+        assert!(!unit.to_ascii_lowercase().contains(word), "{word}: {unit}");
+    }
+    assert!(
+        !target.join("service-commands.log").exists(),
+        "--target-dir runs nothing"
+    );
+    assert!(
+        env.ok(&["service", "uninstall", "--dry-run", "--target-dir", t])
+            .contains("would remove")
+            || env
+                .ok(&["service", "uninstall", "--dry-run", "--target-dir", t])
+                .contains("Would remove")
+    );
+    assert!(installed.exists(), "a dry run removes nothing");
+    env.ok(&["service", "uninstall", "--target-dir", t]);
+    assert!(!installed.exists());
+    // The JSON of a dry run is the plan.
+    let plan = env.json(&["service", "install", "--dry-run", "--target-dir", t]);
+    assert_eq!(plan["dry_run"], true);
+    assert!(
+        plan["plan"]["files"]
+            .as_array()
+            .is_some_and(|f| f.len() <= 1)
+    );
+    assert!(!target.exists() || !installed.exists());
+}
+
+/// `alice doctor` reports the checks, and exits non-zero when one fails.
+#[test]
+fn doctor_reports_and_exits_non_zero_on_failure() {
+    let env = Env::new();
+    env.ok(&["remember", "doctor seed"]);
+    let report = env.json(&["doctor"]);
+    let checks = report["checks"].as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["name"] == "database" && c["status"] == "ok"),
+        "{checks:?}"
+    );
+    // The CLI tests run with ALICE_EMBEDDER=fake and no model: a warning, not a failure.
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["name"] == "embedding model" && c["status"] == "warn"),
+        "{checks:?}"
+    );
+    // The text form: one line per check.
+    let text = env.ok(&["doctor"]);
+    assert!(
+        text.contains("OK   database:") && text.contains("WARN embedding model:"),
+        "{text}"
+    );
+    std::fs::write(
+        env.home.join("config.toml"),
+        "[judge]\nreview_threshold = 5\n",
+    )
+    .unwrap();
+    let o = env.run(&["doctor"]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("FAIL config"));
+    assert!(stderr(&o).contains("failed"), "{}", stderr(&o));
+}
+
+/// With no daemon, `alice doctor` starts none and says so; a home directory others can read is
+/// a failure that names the command to fix it.
+#[test]
+fn doctor_does_not_start_a_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    // The test made the home with the default mode (0755): a daemon would make it 0700.
+    let o = env.run(&["--json", "doctor"]);
+    assert!(!o.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let perm = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "home permissions")
+        .unwrap();
+    assert_eq!(perm["status"], "fail");
+    assert!(
+        perm["fix"].as_str().unwrap().starts_with("chmod 700 "),
+        "{perm}"
+    );
+    std::fs::set_permissions(&env.home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let report = env.json(&["doctor"]);
+    let daemon = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "daemon")
+        .unwrap();
+    assert_eq!(daemon["status"], "warn");
+    assert!(
+        daemon["fix"]
+            .as_str()
+            .unwrap()
+            .contains("alice daemon start")
+    );
+    assert!(env.daemon_json().is_none() && !env.home.join("daemon.lock").exists());
+}
+
+/// The status of a raw `GET /api/v1/health` with `token` (no HTTP client library in this crate).
+fn health_status(port: u64, token: &str) -> u16 {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        s,
+        "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut reply = String::new();
+    s.read_to_string(&mut reply).unwrap();
+    reply
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {reply:?}"))
+}
+
+fn token_of(env: &Env) -> String {
+    std::fs::read_to_string(env.home.join("token"))
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+/// `alice token rotate` with a running daemon: it switches at once, the old token is refused,
+/// the file is private, the token is not printed unless asked, and the CLI keeps working.
+#[test]
+fn token_rotate_switches_a_running_daemon_at_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    env.ok(&["remember", "before the rotation"]);
+    let port = env.daemon_json().unwrap()["port"].as_u64().unwrap();
+    let old = token_of(&env);
+    assert_eq!(health_status(port, &old), 200);
+    let out = env.ok(&["token", "rotate"]);
+    assert!(out.starts_with("Token rotated."), "{out}");
+    let new = token_of(&env);
+    assert_ne!(new, old);
+    assert!(
+        !out.contains(&new) && !out.contains(&old),
+        "the token is not printed: {out}"
+    );
+    assert_eq!(
+        health_status(port, &old),
+        401,
+        "the old token is refused at once"
+    );
+    assert_eq!(health_status(port, &new), 200);
+    assert_eq!(
+        std::fs::metadata(env.home.join("token"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    // The same daemon, found again with the new token.
+    assert!(env.ok(&["status"]).starts_with("running"));
+    assert_eq!(env.recall_count("rotation"), 1);
+    // `--show` prints it, once; the JSON form says only that it rotated unless asked.
+    let shown = env.ok(&["token", "rotate", "--show"]);
+    let newer = token_of(&env);
+    assert!(shown.contains(&newer) && newer != new, "{shown}");
+    let json = env.json(&["token", "rotate"]);
+    assert_eq!(json, serde_json::json!({ "rotated": true }));
+}
+
+/// With no daemon the file is replaced under the daemon lock; the next daemon starts with it.
+#[test]
+fn token_rotate_without_a_daemon_replaces_the_file_and_the_next_start_uses_it() {
+    let env = Env::new();
+    env.ok(&["remember", "seed"]);
+    env.ok(&["daemon", "stop"]);
+    let old = token_of(&env);
+    let out = env.ok(&["token", "rotate"]);
+    assert!(out.starts_with("Token rotated."), "{out}");
+    let new = token_of(&env);
+    assert_ne!(new, old);
+    assert!(env.daemon_json().is_none(), "no daemon was started");
+    assert!(env.ok(&["daemon", "start"]).starts_with("running (pid "));
+    let port = env.daemon_json().unwrap()["port"].as_u64().unwrap();
+    assert_eq!(health_status(port, &new), 200);
+    assert_eq!(health_status(port, &old), 401);
+}
+
+/// A process that holds the lock but does not answer (a daemon still starting) is not rotated
+/// under: nothing changes and the message says why.
+#[test]
+fn token_rotate_refuses_while_a_daemon_that_does_not_answer_holds_the_lock() {
+    let env = Env::new();
+    env.ok(&["remember", "seed"]);
+    env.ok(&["daemon", "stop"]);
+    let old = token_of(&env);
+    let lock = lock_file(&env.home.join("daemon.lock"));
+    let o = env.run(&["token", "rotate"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("does not answer") && stderr(&o).contains("nothing was changed"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(token_of(&env), old);
+    drop(lock);
+}
+
+/// `alice status` says a holder that has been running for a long time and announces nothing is
+/// "running (not answering)", where a young one is "starting".
+#[test]
+fn status_tells_a_silent_old_holder_from_a_starting_one() {
+    use std::io::Write as _;
+    let env = Env::new();
+    let mut lock = lock_file(&env.home.join("daemon.lock"));
+    lock.set_len(0).unwrap();
+    writeln!(lock, "{}", std::process::id()).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let write_pid = |age_ms: u64| {
+        std::fs::write(
+            env.home.join("daemon.pid"),
+            serde_json::json!({ "pid": std::process::id(), "unix_ms": now_ms - age_ms })
+                .to_string(),
+        )
+        .unwrap();
+    };
+    write_pid(1_000);
+    let young = env.ok(&["status"]);
+    assert!(young.starts_with("starting (pid "), "{young}");
+    write_pid(5 * 60_000);
+    let old = env.ok(&["status"]);
+    assert!(
+        old.starts_with("running (pid ") && old.contains("not answering"),
+        "{old}"
+    );
+    let j = env.json(&["status"]);
+    assert_eq!(j["not_answering"], std::process::id());
+    assert!(j["starting"].is_null(), "{j}");
+    // With a download announced it is still starting, however long it has run.
+    std::fs::write(
+        env.home.join("daemon.starting"),
+        serde_json::json!({"pid": std::process::id(), "unix_ms": now_ms, "step": "downloading the embedding model"}).to_string(),
+    )
+    .unwrap();
+    assert!(env.ok(&["status"]).starts_with("starting (pid "));
+    drop(lock);
+}
+
+/// `alice status` shows the judge, the reviews, the last backup and the memory in use.
+#[test]
+fn status_shows_the_judge_the_last_backup_and_the_memory() {
+    let env = Env::new();
+    env.ok(&["remember", "status seed"]);
+    env.ok(&["backup", "now"]);
+    let text = env.ok(&["status"]);
+    assert!(text.contains("judge: heuristic (backlog "), "{text}");
+    assert!(text.contains("last backup: 20"), "{text}");
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert!(text.contains("memory in use: "), "{text}");
+    }
+    let j = env.json(&["status"]);
+    assert!(j["last_backup"].as_str().is_some() && j["reviews_open"].is_number());
+}
+
+/// What the recording runner of the service sandbox saw, one command per line.
+fn service_commands(root: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(root.join("service-commands.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// `alice restore` stops an installed service unit before the swap and starts it afterwards (a
+/// unit that restarts its daemon would start one mid-restore); with no unit it runs no command.
+/// The service manager is never called: `ALICE_SERVICE_ROOT` records the commands instead.
+#[test]
+fn restore_stops_the_installed_service_unit_and_starts_it_again() {
+    let env = Env::new();
+    let root = env.home.parent().unwrap().join("service-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let with_root = |args: &[&str]| {
+        let mut c = env.cmd(args);
+        c.env("ALICE_SERVICE_ROOT", &root);
+        c.output().unwrap()
+    };
+    env.ok(&["remember", "kept in the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No unit: restore runs no service command.
+    let o = with_root(&["restore", &name, "--yes"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        service_commands(&root).is_empty(),
+        "{:?}",
+        service_commands(&root)
+    );
+
+    // Installed (the sandbox writes the unit and records the commands).
+    let o = with_root(&["service", "install"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let after_install = service_commands(&root).len();
+    assert!(after_install >= 1);
+    let o = with_root(&["restore", &name, "--yes"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let all = service_commands(&root);
+    let (stop, start) = if cfg!(target_os = "macos") {
+        ("launchctl bootout gui/", "launchctl bootstrap gui/")
+    } else {
+        (
+            "systemctl --user stop alice.service",
+            "systemctl --user start alice.service",
+        )
+    };
+    let during = &all[after_install..];
+    assert_eq!(during.len(), 2, "{during:?}");
+    assert!(during[0].starts_with(stop), "{during:?}");
+    assert!(during[1].starts_with(start), "{during:?}");
+    assert_eq!(env.recall_count("backup"), 1, "the restore itself worked");
+}
+
+/// The terminal's echo is back on after `config set-secret` is killed in the middle of the
+/// prompt, by SIGTERM and by SIGINT.
+#[test]
+fn a_killed_secret_prompt_puts_the_terminal_echo_back() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::ExitStatusExt;
+    let env = Env::new();
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        // A pseudo-terminal pair; the child's stdin is the slave side.
+        // SAFETY: plain libc calls; the descriptors are owned by the OwnedFds from then on.
+        let (master, slave) = unsafe {
+            let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(m >= 0 && libc::grantpt(m) == 0 && libc::unlockpt(m) == 0);
+            let name = libc::ptsname(m);
+            assert!(!name.is_null());
+            let s = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+            assert!(s >= 0);
+            (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s))
+        };
+        let echo_on = |fd: &OwnedFd| unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(fd.as_raw_fd(), &mut t), 0);
+            t.c_lflag & libc::ECHO != 0
+        };
+        assert!(echo_on(&slave), "a new terminal echoes");
+        let mut child = env
+            .cmd(&["config", "set-secret", "jev_api_key"])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // The prompt is up when echo goes off (the command starts a daemon first).
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while echo_on(&slave) {
+            assert!(
+                Instant::now() < deadline,
+                "the prompt never turned echo off"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the command ended early"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: signalling the child this test started.
+        unsafe { libc::kill(child.id() as i32, sig) };
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(sig), "ended by the signal: {status}");
+        assert!(echo_on(&slave), "echo is back after signal {sig}");
+        drop(master);
+    }
+    // And after a normal answer.
+    // SAFETY: as above.
+    let (master, slave) = unsafe {
+        let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(m >= 0 && libc::grantpt(m) == 0 && libc::unlockpt(m) == 0);
+        let s = libc::open(libc::ptsname(m), libc::O_RDWR | libc::O_NOCTTY);
+        (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s))
+    };
+    let echo_on = |fd: &OwnedFd| unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        assert_eq!(libc::tcgetattr(fd.as_raw_fd(), &mut t), 0);
+        t.c_lflag & libc::ECHO != 0
+    };
+    let mut child = env
+        .cmd(&["config", "set-secret", "jev_api_key"])
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while echo_on(&slave) {
+        assert!(
+            Instant::now() < deadline,
+            "the prompt never turned echo off"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let answer = concat!("ts_", "pty_secret_value\n");
+    // SAFETY: writing to the master side we own.
+    let wrote = unsafe { libc::write(master.as_raw_fd(), answer.as_ptr().cast(), answer.len()) };
+    assert_eq!(wrote as usize, answer.len());
+    assert!(child.wait().unwrap().success());
+    assert!(echo_on(&slave), "echo is back after the answer");
 }

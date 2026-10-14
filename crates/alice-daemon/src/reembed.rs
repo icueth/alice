@@ -686,7 +686,15 @@ mod tests {
             .unwrap();
         assert!(found.results[0].matched.contains(&MatchVia::Vector));
         assert!(found.notes.is_empty(), "{:?}", found.notes);
-        // The old vectors go with the daily purge.
+        // The old vectors go with the daily purge. The switch lists the old model for it just
+        // after it shows in health, so wait for the listing rather than race it.
+        until("the old model to be queued for purging", 15, || async {
+            s.read(|c| get_meta(c, PURGE_KEY))
+                .await
+                .unwrap()
+                .is_some_and(|v| v.lines().any(|m| m == MODEL_ID))
+        })
+        .await;
         assert!(new_vectors(&s, MODEL_ID).await > 0);
         s.run_job(Job::ModelPurge).await.unwrap();
         assert_eq!(new_vectors(&s, MODEL_ID).await, 0);

@@ -80,7 +80,7 @@ alice model fetch      # ครั้งเดียวก่อนเริ่�
 |---|---|
 | macOS ชิป Apple Silicon | รองรับ, embedding ในเครื่อง |
 | Linux (glibc) x86_64 และ aarch64 | รองรับ, embedding ในเครื่อง |
-| Windows x86_64 | build ใน CI และรันชุดทดสอบแบบ in-process ส่วนการทดสอบ CLI และ process ของ daemon รันเฉพาะบน Unix; embedding ในเครื่องตรวจแล้วบน Windows ด้วย CI workflow `windows-real-model` (model จริง โดยโฟลเดอร์ข้อมูลอยู่ใต้ path ที่ไม่ใช่ ASCII) ข้อจำกัดที่รู้แล้ว: `alice daemon start` และ `alice status` มองไม่เห็น daemon ที่ยังเริ่มไม่เสร็จ *(วางแผนแก้แล้ว)*; `alice service install` (scheduled task) *(วางแผนไว้)* |
+| Windows x86_64 | build ใน CI และรันชุดทดสอบแบบ in-process ส่วนการทดสอบ CLI และ process ของ daemon รันเฉพาะบน Unix; embedding ในเครื่องตรวจแล้วบน Windows ด้วย CI workflow `windows-real-model` (model จริง โดยโฟลเดอร์ข้อมูลอยู่ใต้ path ที่ไม่ใช่ ASCII) `alice daemon start`, `status` และ `stop` หา daemon ที่กำลังเริ่มหรือกำลังทำงานเจอผ่าน `daemon.pid` (pid และเวลาเริ่ม วางไว้ข้างไฟล์ lock เพราะบน Windows อ่านไฟล์ lock ที่ถูกล็อกอยู่ไม่ได้) กับการตรวจ process ด้วย Win32 ส่วนนี้ครอบคลุมด้วย unit test บน Windows CI แต่ยังไม่มี process test; `alice service install` ลงทะเบียน scheduled task ที่เริ่ม daemon ตอน logon ตัวแผนมีการทดสอบแล้ว แต่ยังไม่เคยลองบนเครื่อง Windows จริง |
 | macOS ชิป Intel, Linux musl | ยังไม่รองรับ: ONNX Runtime ไม่มี library สำเร็จรูปให้ จึงรัน embedding ในเครื่องไม่ได้ จะใช้ได้เมื่อมี embedding provider ผ่าน HTTP (วางแผนไว้ใน M2) |
 
 ### ตัวติดตั้งแบบแพ็กเกจ (วางแผนไว้)
@@ -189,13 +189,16 @@ alice update <id> --action edit|supersede|archive|forget|restore [--title t] [--
 alice facts <entity> [--predicate p] [--as-of date] [--timeline]
 alice fact add|supersede|end <subject> <predicate> <object> [--from date]
 alice projects | status
+alice doctor                   # ตรวจพร้อมบอกว่าควรทำอะไรต่อ; exit 1 เมื่อมีข้อที่ไม่ผ่าน
 alice daemon start | stop | status | logs | run
+alice token rotate [--show]
+alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # MCP server แบบ stdio สำหรับ agent
 alice model fetch
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 ```
 
-ทุกคำสั่งใส่ `--json` ได้ ที่วางแผนไว้: `review`, `undo` (M2), `config`, `doctor`, `service`, `token rotate` (M2), `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3)
+ทุกคำสั่งใส่ `--json` ได้ ที่วางแผนไว้: `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3)
 
 ## การตั้งค่า
 
@@ -254,6 +257,21 @@ alice restore             # backup ล่าสุด หรือ: alice restor
 **ความจำที่เขียนหลังเวลาที่ backup จะออกจากฐานข้อมูลที่ใช้งานอยู่** ความจำเหล่านั้นอยู่ในสำเนา before-restore ซึ่งเก็บอย่างน้อย 30 วัน (อันล่าสุดเก็บไว้เสมอ) ถ้าจะยกเลิกการ restore ให้รัน `alice restore alice-before-restore-<เวลา>.db` อีกสองอย่างที่ restore ไม่ย้อนให้: ความจำที่คุณ purge หลังทำ backup จะกลับมาพร้อม backup และข้อความที่เก็บไว้ภายใต้กฎ redaction รุ่นเก่าจะไม่ถูกสแกนใหม่
 
 กับฐานข้อมูลใหญ่ daemon จะหยุดนานเท่ากับการคัดลอกสองครั้งและการตรวจ (หลายนาทีที่ 2.8 GB) ระหว่างนั้นงานเขียนของ agent ถูกพักใน spool ทันทีและนำมาใช้ภายหลัง
+
+## สุขภาพระบบ token และ service
+
+```bash
+alice status                  # daemon, จำนวนข้อมูล, judge, review ที่ค้าง, backup ล่าสุด, หน่วยความจำที่ใช้
+alice doctor                  # ทุกการตรวจ พร้อมบอกว่าควรทำอะไรต่อ; --json สำหรับสคริปต์; exit 1 เมื่อมีข้อที่ไม่ผ่าน
+alice token rotate [--show]   # API token ใหม่; daemon ที่ทำงานอยู่เปลี่ยนตามทันที
+alice service install         # ให้ daemon ทำงานตอน login
+```
+
+`alice doctor` ใช้ได้โดยไม่ต้องมี daemon (และไม่เปิด daemon ให้) ถ้าไม่มี daemon จะตรวจ `config.toml` กับตัวแปร `ALICE_*`, สิทธิ์ของโฟลเดอร์ข้อมูล, token และ `secrets.toml`, โมเดล embedding บนดิสก์ และดูว่ามี daemon หรือ service unit หรือไม่ ถ้ามี daemon จะตรวจเพิ่มเฉพาะสิ่งที่ daemon เท่านั้นที่เห็น ได้แก่ ฐานข้อมูล (read-only เมื่อดิสก์เต็ม), งาน maintenance และ backup, vector index, embedding ที่ล้มเหลวหรือที่นโยบาย cloud กันไว้, การ re-embed ที่กำลังทำ, judge (ไม่มี key ของ Jev, งบรายวัน), review ที่ค้าง, การเขียนที่รออยู่ใน spool, ค่าตั้งที่ daemon ปฏิเสธหรือรอรีสตาร์ท, หน่วยความจำ และพื้นที่ดิสก์ว่าง ทุกบรรทัดที่ไม่ปกติจะบอกว่าควรทำอะไรต่อ และแสดงกุญแจเพียงว่าตั้งไว้หรือไม่ ไม่แสดงค่า
+
+`alice token rotate` เขียน token สุ่มใหม่ลง `~/.alice/token` (mode 0600 และแทนที่ไฟล์แบบ atomic) daemon ที่ทำงานอยู่จะเปลี่ยนใช้ทันทีและปฏิเสธ token เก่าตั้งแต่คำขอถัดไป `alice mcp` และ CLI จะพบ token ใหม่ในการเรียกครั้งถัดไป ถ้าไม่มี daemon จะแทนที่ไฟล์ขณะที่คำสั่งถือ daemon lock อยู่ และจะแสดง token ก็ต่อเมื่อใส่ `--show`
+
+`alice service install` ลงทะเบียน launchd agent (macOS, `~/Library/LaunchAgents/dev.alice.daemon.plist`), systemd user unit (Linux, `~/.config/systemd/user/alice.service`) หรือ scheduled task ตอน logon (Windows) unit จะรัน `alice daemon run` กับโฟลเดอร์ข้อมูลเดียวกับที่ใช้ตอนสั่งคำสั่ง และไม่มีความลับอยู่ในนั้น `--dry-run` พิมพ์ไฟล์และคำสั่งโดยไม่เปลี่ยนอะไร ส่วน `--target-dir d` เขียนไฟล์ไว้ใต้ `d` และไม่รันคำสั่งใด บน Linux user service จะหยุดเมื่อ logout เว้นแต่ตั้ง `loginctl enable-linger $USER` `alice daemon stop` ปิด daemon อย่างเรียบร้อย unit จึงไม่เริ่มมันใหม่จนกว่าจะ login ครั้งหน้า `alice restore` หยุด unit ก่อนสลับฐานข้อมูลแล้วเริ่มใหม่ภายหลัง unit ที่เริ่ม daemon ใหม่เองจึงไม่เปิด daemon กลางการ restore `alice service uninstall` ถอด unit ออก
 
 ## Git sync *(วางแผนไว้ใน M4)*
 
