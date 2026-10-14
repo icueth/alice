@@ -4,6 +4,9 @@
 //! newest backup of each of the last `daily` days and of each of the last `weekly` ISO weeks,
 //! pre-migration and before-restore copies for 30 days, and never deletes the newest backup.
 //!
+//! Disk: a backup needs room for a second copy, so the job checks the free space first
+//! (`space_needed`, `free_space`). Leftover temporary files of a killed copy are swept.
+//!
 //! A backup is a copy of `alice.db` and nothing else: never `secrets.toml` (or its lock), the
 //! token or the vector files. The copy holds every memory, so it is private to its owner: the
 //! file is created 0600 and the directory 0700 (Unix).
@@ -86,13 +89,37 @@ fn parse_name(name: &str) -> Option<(BackupKind, DateTime<Utc>)> {
     Some((kind, t))
 }
 
+/// Pages copied per step of a backup, so the stop check runs about every 4 MB.
+const STEP_PAGES: i32 = 1024;
+/// Restarts (the writer committed during the copy and SQLite began again) after which the
+/// rest is copied in one step, which cannot be restarted.
+const MAX_RESTARTS: u32 = 3;
+/// A temporary file of a killed copy is swept when it is this old.
+const STALE_TEMP: std::time::Duration = std::time::Duration::from_secs(3_600);
+
 /// Copy `db` into `dir` as a checked, private backup file. On any failure nothing is left
 /// behind: the copy is made under a temporary name and renamed into place only when whole.
 pub fn create(db: &Path, dir: &Path, kind: BackupKind, now: DateTime<Utc>) -> Result<BackupInfo> {
+    create_stoppable(db, dir, kind, now, &|| false)?
+        .ok_or_else(|| AliceError::Other("the backup was stopped".into()))
+}
+
+/// [`create`] that looks at `stop` between steps of about 4 MB and gives up (`Ok(None)`, no file
+/// left) when it says so. The copy is made in steps, each a consistent view of its pages; when
+/// the writer commits meanwhile SQLite starts the copy again, and after `MAX_RESTARTS` of those
+/// the rest is taken in one step (a snapshot nothing can restart, but not stoppable).
+pub fn create_stoppable(
+    db: &Path,
+    dir: &Path,
+    kind: BackupKind,
+    now: DateTime<Utc>,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<BackupInfo>> {
     alice_core::store::create_private_dir(dir)?;
     if !db.exists() {
         return Err(AliceError::NotFound(format!("database {}", db.display())));
     }
+    sweep_temp(dir);
     let name = name_for(kind, now, alice_core::store::migrations::CURRENT_VERSION);
     let path = dir.join(&name);
     let tmp = dir.join(format!(".{name}.tmp"));
@@ -100,7 +127,7 @@ pub fn create(db: &Path, dir: &Path, kind: BackupKind, now: DateTime<Utc>) -> Re
     // A temporary file left by a run that was killed.
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&journal);
-    let made = (|| -> Result<()> {
+    let made = (|| -> Result<bool> {
         let src = Connection::open_with_flags(
             db,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -108,13 +135,37 @@ pub fn create(db: &Path, dir: &Path, kind: BackupKind, now: DateTime<Utc>) -> Re
         let mut dst = Connection::open(&tmp)?;
         alice_core::store::make_private(&tmp)?;
         {
+            use rusqlite::backup::StepResult;
             let b = rusqlite::backup::Backup::new(&src, &mut dst)?;
-            // One step: the whole database inside one read transaction (a consistent snapshot;
-            // a stepwise backup restarts whenever the writer commits).
-            b.step(-1)?;
+            let (mut restarts, mut last_remaining) = (0u32, None::<i32>);
+            loop {
+                if stop() {
+                    return Ok(false);
+                }
+                let pages = if restarts >= MAX_RESTARTS {
+                    -1
+                } else {
+                    STEP_PAGES
+                };
+                match b.step(pages)? {
+                    StepResult::Done => break,
+                    StepResult::Busy | StepResult::Locked => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    _ => {}
+                }
+                let remaining = b.progress().remaining;
+                if last_remaining.is_some_and(|prev| remaining > prev) {
+                    restarts += 1;
+                }
+                last_remaining = Some(remaining);
+            }
         }
         // The copy is a self-contained file (the source's WAL mode is not carried over).
         let _mode: String = dst.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+        if stop() {
+            return Ok(false);
+        }
         let problems = alice_core::store::maintenance::quick_check(&dst)?;
         if !problems.is_empty() {
             return Err(AliceError::Other(format!(
@@ -126,20 +177,80 @@ pub fn create(db: &Path, dir: &Path, kind: BackupKind, now: DateTime<Utc>) -> Re
         std::fs::File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &path)?;
         sync_dir(dir);
-        Ok(())
+        Ok(true)
     })();
-    if let Err(e) = made {
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(&journal);
-        return Err(e);
+    match made {
+        Ok(true) => Ok(Some(BackupInfo {
+            bytes: std::fs::metadata(&path)?.len(),
+            name,
+            path,
+            kind,
+            created_at: now,
+        })),
+        other => {
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&journal);
+            other.map(|_| None)
+        }
     }
-    Ok(BackupInfo {
-        bytes: std::fs::metadata(&path)?.len(),
-        name,
-        path,
-        kind,
-        created_at: now,
-    })
+}
+
+/// Delete temporary files of a copy that was killed (`.alice-….tmp`, `….tmp-journal`) once
+/// they are an hour old; a copy in progress is younger.
+pub fn sweep_temp(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with(".alice-") && name.contains(".tmp")) {
+            continue;
+        }
+        let old = e.metadata().ok().filter(|m| m.is_file()).is_some_and(|m| {
+            m.modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= STALE_TEMP)
+        });
+        if old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Room a backup of `db` needs: twice the database and its WAL (the copy, and slack for the
+/// writer's growth meanwhile).
+pub fn space_needed(db: &Path) -> u64 {
+    let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    2 * (len(db) + len(Path::new(&wal)))
+}
+
+/// Free bytes on the volume that holds `path` (or its nearest existing parent); `None` where
+/// that is not known (not Unix, or the call failed), and the caller then goes ahead.
+pub fn free_space(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut p = path;
+        while !p.exists() {
+            p = p.parent()?;
+        }
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `c` is a valid C string and `s` is a zeroed `statvfs` the call fills.
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; the call only writes into `s`.
+        let rc = unsafe { libc::statvfs(c.as_ptr(), &mut s) };
+        // The field types differ between systems (u32 here, u64 there).
+        #[allow(clippy::useless_conversion)]
+        (rc == 0).then(|| u64::from(s.f_bavail) * u64::from(s.f_frsize))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Make the rename durable (Unix; best effort).
@@ -178,9 +289,14 @@ pub fn list(dir: &Path) -> Result<Vec<BackupInfo>> {
     Ok(out)
 }
 
-/// Delete what the policy does not keep; returns the deleted paths. The newest backup of each
-/// kind is always kept, so a policy (or a bug) can never leave a directory without a backup.
+/// Delete what the policy does not keep; returns the deleted paths. Of the regular
+/// (scheduled and manual) backups it keeps the newest of each of the last `daily` days that
+/// have one, and the newest of each of the `weekly` most recent ISO weeks that the daily ones
+/// do not touch: with enough history exactly `daily + weekly` files (spec §5.6: 7 daily + 4
+/// weekly). The newest backup of each kind is always kept, so a policy (or a bug) can never
+/// leave a directory without a backup. Stale temporary files are swept too.
 pub fn rotate(dir: &Path, now: DateTime<Utc>, daily: u32, weekly: u32) -> Result<Vec<PathBuf>> {
+    sweep_temp(dir);
     let all = list(dir)?;
     let mut keep = std::collections::HashSet::new();
     let regular: Vec<&BackupInfo> = all
@@ -190,19 +306,27 @@ pub fn rotate(dir: &Path, now: DateTime<Utc>, daily: u32, weekly: u32) -> Result
     if let Some(newest) = regular.first() {
         keep.insert(newest.path.clone());
     }
+    let week_of = |b: &BackupInfo| {
+        (
+            b.created_at.iso_week().year(),
+            b.created_at.iso_week().week(),
+        )
+    };
     let mut days = Vec::new();
-    let mut weeks = Vec::new();
+    let mut covered_weeks = std::collections::HashSet::new();
     for b in &regular {
         let day = b.created_at.date_naive();
         if days.len() < daily as usize && !days.contains(&day) {
             days.push(day);
+            covered_weeks.insert(week_of(b));
             keep.insert(b.path.clone());
         }
-        let week = (
-            b.created_at.iso_week().year(),
-            b.created_at.iso_week().week(),
-        );
-        if weeks.len() < weekly as usize && !weeks.contains(&week) {
+    }
+    let mut weeks = Vec::new();
+    for b in &regular {
+        let week = week_of(b);
+        if weeks.len() < weekly as usize && !covered_weeks.contains(&week) && !weeks.contains(&week)
+        {
             weeks.push(week);
             keep.insert(b.path.clone());
         }
@@ -245,7 +369,7 @@ pub fn adopt_legacy(home: &AliceHome, dir: &Path) -> Result<usize> {
             continue;
         }
         // e.g. 2026-10-13T09-44-23-391Z
-        let mut t = NaiveDateTime::parse_from_str(&ts[..19.min(ts.len())], "%Y-%m-%dT%H-%M-%S")
+        let mut t = NaiveDateTime::parse_from_str(ts.get(..19).unwrap_or(ts), "%Y-%m-%dT%H-%M-%S")
             .map(|t| t.and_utc())
             .unwrap_or_else(|_| Utc::now());
         alice_core::store::create_private_dir(dir)?;
@@ -256,11 +380,27 @@ pub fn adopt_legacy(home: &AliceHome, dir: &Path) -> Result<usize> {
             }
             t += chrono::Duration::seconds(1);
         };
-        std::fs::rename(e.path(), &dest)?;
+        move_file(&e.path(), &dest)?;
         alice_core::store::make_private(&dest)?;
         n += 1;
     }
     Ok(n)
+}
+
+/// Rename `from` to `to`; across volumes (the backup directory may be elsewhere) copy it and
+/// then remove the original.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to).or_else(|_| copy_then_remove(from, to))
+}
+
+fn copy_then_remove(from: &Path, to: &Path) -> std::io::Result<()> {
+    let tmp = to.with_extension("db.moving");
+    let copied = std::fs::copy(from, &tmp).and_then(|_| std::fs::rename(&tmp, to));
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::remove_file(from)
 }
 
 #[cfg(test)]
@@ -373,24 +513,129 @@ mod tests {
         }
     }
 
+    fn put_backup(dir: &Path, t: DateTime<Utc>) {
+        std::fs::write(
+            dir.join(format!("alice-{}.db", t.format("%Y%m%dT%H%M%SZ"))),
+            b"x",
+        )
+        .unwrap();
+    }
+
+    fn regular(dir: &Path) -> Vec<BackupInfo> {
+        list(dir)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.kind == BackupKind::Scheduled)
+            .collect()
+    }
+
+    /// I-5 (spec §5.6): exactly 7 daily and 4 weekly. Daily backups for 60 days leave the newest
+    /// of each of the last 7 days and the newest of each of the 4 ISO weeks the daily ones do
+    /// not touch: 11 files, whatever the weekday.
     #[test]
-    fn rotation_keeps_seven_days_four_weeks_and_never_the_newest() {
+    fn rotation_keeps_exactly_seven_daily_and_four_weekly() {
+        for hour_shift in 0..7 {
+            let d = tempfile::tempdir().unwrap();
+            let now = chrono::Utc
+                .with_ymd_and_hms(2026, 10, 7 + hour_shift, 12, 0, 0)
+                .unwrap();
+            for day in 0..60 {
+                put_backup(d.path(), now - chrono::Duration::days(day));
+            }
+            std::fs::write(d.path().join("notes.txt"), b"not a backup").unwrap();
+            rotate(d.path(), now, 7, 4).unwrap();
+            let kept = regular(d.path());
+            assert_eq!(
+                kept.len(),
+                11,
+                "now = {now}: {:?}",
+                kept.iter().map(|b| &b.name).collect::<Vec<_>>()
+            );
+            // The 7 newest days are all there.
+            for day in 0..7 {
+                let want = (now - chrono::Duration::days(day)).date_naive();
+                assert!(
+                    kept.iter().any(|b| b.created_at.date_naive() == want),
+                    "day {day}"
+                );
+            }
+            // The other 4 are in 4 different ISO weeks, none of them a week of the daily 7.
+            let daily_weeks: std::collections::HashSet<_> = (0..7)
+                .map(|d| (now - chrono::Duration::days(d)).iso_week().week())
+                .collect();
+            let older: Vec<_> = kept.iter().skip(7).collect();
+            let weeks: std::collections::HashSet<_> = older
+                .iter()
+                .map(|b| b.created_at.iso_week().week())
+                .collect();
+            assert_eq!(weeks.len(), 4);
+            assert!(weeks.is_disjoint(&daily_weeks));
+            assert!(d.path().join("notes.txt").exists());
+        }
+        // Two backups a day: still one per day.
         let d = tempfile::tempdir().unwrap();
         let now = chrono::Utc
             .with_ymd_and_hms(2026, 10, 13, 12, 0, 0)
             .unwrap();
-        // Two backups a day for 60 days.
         for day in 0..60 {
-            for hour in [1, 13] {
-                let t = now - chrono::Duration::days(day) - chrono::Duration::hours(12 - hour);
-                std::fs::write(
-                    d.path()
-                        .join(format!("alice-{}.db", t.format("%Y%m%dT%H%M%SZ"))),
-                    b"x",
-                )
-                .unwrap();
-            }
+            put_backup(d.path(), now - chrono::Duration::days(day));
+            put_backup(
+                d.path(),
+                now - chrono::Duration::days(day) - chrono::Duration::hours(6),
+            );
         }
+        rotate(d.path(), now, 7, 4).unwrap();
+        assert_eq!(regular(d.path()).len(), 11);
+    }
+
+    /// With gaps (a machine that was off) the policy keeps what exists: the newest backup of
+    /// each of the last 7 days that have one, then the 4 weeks before them.
+    #[test]
+    fn rotation_with_gaps_and_short_histories() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 13, 12, 0, 0)
+            .unwrap();
+        // Backups on days 0, 1, 2, 20-22, 40-43, 60-66, 80 and 90.
+        let days = [
+            0, 1, 2, 20, 21, 22, 40, 41, 42, 43, 60, 61, 62, 63, 64, 65, 66, 80, 90,
+        ];
+        let d = tempfile::tempdir().unwrap();
+        for day in days {
+            put_backup(d.path(), now - chrono::Duration::days(day));
+        }
+        rotate(d.path(), now, 7, 4).unwrap();
+        let kept = regular(d.path());
+        // The 7 newest backups (0,1,2,20,21,22,40) are the daily ones; their weeks are covered
+        // (days 41-43 share the week of day 40), so the 4 weekly ones are the weeks of days
+        // 60, 65, 80 and 90.
+        assert_eq!(
+            kept.len(),
+            11,
+            "{:?}",
+            kept.iter().map(|b| &b.name).collect::<Vec<_>>()
+        );
+        for day in [0, 1, 2, 20, 21, 22, 40] {
+            let want = (now - chrono::Duration::days(day)).date_naive();
+            assert!(
+                kept.iter().any(|b| b.created_at.date_naive() == want),
+                "day {day}"
+            );
+        }
+        // A short history keeps everything it has, up to the policy.
+        let e = tempfile::tempdir().unwrap();
+        for day in [0, 3, 9] {
+            put_backup(e.path(), now - chrono::Duration::days(day));
+        }
+        assert!(rotate(e.path(), now, 7, 4).unwrap().is_empty());
+        assert_eq!(regular(e.path()).len(), 3);
+    }
+
+    #[test]
+    fn rotation_prunes_pre_migration_copies_and_never_the_newest() {
+        let d = tempfile::tempdir().unwrap();
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 13, 12, 0, 0)
+            .unwrap();
         std::fs::write(
             d.path().join("alice-pre-migration-v2-20260801T000000Z.db"),
             b"x",
@@ -401,39 +646,114 @@ mod tests {
             b"x",
         )
         .unwrap();
-        std::fs::write(d.path().join("notes.txt"), b"not a backup").unwrap();
+        std::fs::write(
+            d.path().join("alice-pre-migration-v2-20261010T000000Z.db"),
+            b"x",
+        )
+        .unwrap();
         rotate(d.path(), now, 7, 4).unwrap();
-        let kept = list(d.path()).unwrap();
-        let regular: Vec<&BackupInfo> = kept
-            .iter()
-            .filter(|b| b.kind == BackupKind::Scheduled)
-            .collect();
-        // 7 daily (newest of each of the last 7 days) + newest of each of the last 4 ISO weeks
-        // that are not already kept: between 7 and 11 files.
-        assert!((7..=11).contains(&regular.len()), "{}", regular.len());
-        assert_eq!(
-            regular[0].created_at.date_naive(),
-            now.date_naive(),
-            "the newest is kept"
-        );
-        let pre: Vec<&BackupInfo> = kept
-            .iter()
+        let pre: Vec<_> = list(d.path())
+            .unwrap()
+            .into_iter()
             .filter(|b| b.kind == BackupKind::PreMigration)
             .collect();
         assert_eq!(
             pre.len(),
             1,
-            "older than 30 days are pruned, the newest is always kept"
+            "only the recent copy is under 30 days; the newest is kept"
         );
-        assert!(
-            d.path().join("notes.txt").exists(),
-            "unknown files are never touched"
-        );
+        assert!(pre[0].name.contains("20261010"));
         // A single old backup is never deleted.
         let e = tempfile::tempdir().unwrap();
-        std::fs::write(e.path().join("alice-20250101T000000Z.db"), b"x").unwrap();
+        put_backup(
+            e.path(),
+            chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+        );
         rotate(e.path(), now, 7, 4).unwrap();
         assert_eq!(list(e.path()).unwrap().len(), 1);
+    }
+
+    /// I-4: the temporary file of a killed copy is swept once it is an hour old; a younger one
+    /// (a copy in progress) and anything else stay.
+    #[test]
+    fn stale_temporary_files_are_swept() {
+        let d = tempfile::tempdir().unwrap();
+        let old = d.path().join(".alice-20260101T000000Z.db.tmp");
+        let old_journal = d.path().join(".alice-20260101T000000Z.db.tmp-journal");
+        let fresh = d.path().join(".alice-20261013T000000Z.db.tmp");
+        let other = d.path().join(".hidden.tmp");
+        for p in [&old, &old_journal, &fresh, &other] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7_200);
+        for p in [&old, &old_journal, &other] {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(two_hours_ago)
+                .unwrap();
+        }
+        let now = chrono::Utc::now();
+        rotate(d.path(), now, 7, 4).unwrap();
+        assert!(!old.exists() && !old_journal.exists());
+        assert!(fresh.exists() && other.exists());
+    }
+
+    /// I-4: a backup that is asked to stop leaves no file, however far it got.
+    #[test]
+    fn a_backup_can_be_stopped_and_leaves_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        // A database of a few MB: several steps.
+        let db = d.path().join("alice.db");
+        {
+            let c = alice_core::store::open_writer(&db).unwrap();
+            c.execute_batch("CREATE TABLE junk (x BLOB)").unwrap();
+            for _ in 0..40 {
+                c.execute("INSERT INTO junk VALUES (randomblob(100000))", [])
+                    .unwrap();
+            }
+        }
+        let dir = d.path().join("backups");
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 13, 3, 0, 0).unwrap();
+        let steps = std::cell::Cell::new(0);
+        let stopped = create_stoppable(&db, &dir, BackupKind::Scheduled, now, &|| {
+            steps.set(steps.get() + 1);
+            steps.get() > 2
+        })
+        .unwrap();
+        assert!(stopped.is_none());
+        assert!(steps.get() >= 3, "it ran some steps before it stopped");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        // Not stopped: the copy is whole and checked.
+        let whole = create_stoppable(&db, &dir, BackupKind::Scheduled, now, &|| false)
+            .unwrap()
+            .unwrap();
+        assert!(whole.bytes > 4_000_000);
+    }
+
+    #[test]
+    fn the_space_a_backup_needs_and_the_free_space_are_known() {
+        let d = tempfile::tempdir().unwrap();
+        let db = db_with_rows(d.path());
+        let len = std::fs::metadata(&db).unwrap().len();
+        assert!(space_needed(&db) >= 2 * len);
+        #[cfg(unix)]
+        {
+            let free = free_space(&d.path().join("not/yet/there")).expect("a volume");
+            assert!(free > 1_000_000, "{free}");
+        }
+    }
+
+    #[test]
+    fn moving_across_volumes_copies_then_removes() {
+        let d = tempfile::tempdir().unwrap();
+        let (from, to) = (d.path().join("a.db"), d.path().join("b.db"));
+        std::fs::write(&from, b"payload").unwrap();
+        copy_then_remove(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+        assert!(!d.path().join("b.db.moving").exists());
     }
 
     #[test]

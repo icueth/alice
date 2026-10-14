@@ -194,13 +194,19 @@ pub enum WriteOp {
         key: String,
         value: String,
     },
-    /// Delete trashed memories for good, with a `memory.purge` event for each (returns their
-    /// seqs; the caller drops their vectors). The history of a purged memory is scrubbed.
+    /// Delete trashed memories for good, with a `memory.purge` event for each. Only memories
+    /// that are still in the trash and were last changed before `cutoff` (re-checked here: one
+    /// restored or edited since the job looked is kept). The writer works for about
+    /// [`SLICE_BUDGET`](crate::maintenance::SLICE_BUDGET) and answers `Purged` with the seqs it
+    /// did (the caller drops their vectors); the rest are still in the trash for the next look.
+    /// The history of a purged memory is scrubbed.
     PurgeMemories {
         seqs: Vec<i64>,
+        cutoff: String,
     },
     /// Delete raw chunks (retention), with one `raw.retention` event; the caller drops their
-    /// vectors. Answers `Count` with the chunks deleted.
+    /// vectors. Works for about the same time box and answers `Purged` with the chunk seqs it
+    /// dealt with (the others are untouched).
     DeleteChunks {
         seqs: Vec<i64>,
         reason: String,
@@ -242,7 +248,7 @@ pub enum WriteOutcome {
     Merged(Vec<String>),
     /// The `StoreEmbeddings` items that were stored; the others changed while being embedded.
     Embedded(Vec<(VecKey, Vec<f32>)>),
-    /// The seqs of the memories that were purged.
+    /// The seqs of the memories (or chunks) a time-boxed maintenance step dealt with.
     Purged(Vec<i64>),
     /// How many rows a maintenance step deleted (or review items it added).
     Count(usize),
@@ -1311,7 +1317,7 @@ fn apply(
             )?;
             WriteOutcome::Done
         }
-        WriteOp::PurgeMemories { seqs } => purge_memories(conn, st, &seqs)?,
+        WriteOp::PurgeMemories { seqs, cutoff } => purge_memories(conn, st, &seqs, &cutoff)?,
         WriteOp::DeleteChunks { seqs, reason } => delete_chunks(conn, st, &seqs, &reason)?,
         WriteOp::FtsMerge { table, pages } => {
             WriteOutcome::Flag(maintenance::fts_merge(conn, &table, pages)?)
@@ -1341,48 +1347,73 @@ fn apply(
 
 /// `PurgeMemories`: delete for good, then record a `memory.purge` event per memory. The event
 /// comes after the deletion, which scrubs the history of the memory: it names the id and the
-/// stub title `[purged]`, never the text.
-fn purge_memories(conn: &Connection, st: &mut State, seqs: &[i64]) -> Result<WriteOutcome> {
-    // Only trashed memories can be purged: a memory restored since the job looked is kept.
-    let mut trashed = Vec::with_capacity(seqs.len());
+/// stub title `[purged]`, never the text. Stops after [`SLICE_BUDGET`] so a request queued
+/// behind a purge waits for a few rows, not for a whole page of them.
+fn purge_memories(
+    conn: &Connection,
+    st: &mut State,
+    seqs: &[i64],
+    cutoff: &str,
+) -> Result<WriteOutcome> {
+    let started = Instant::now();
+    let mut done = Vec::with_capacity(seqs.len());
     for &seq in seqs {
-        let status: Option<String> = conn
-            .query_row("SELECT status FROM memories WHERE seq = ?1", [seq], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        if status.as_deref() == Some(Status::Trashed.as_str()) {
-            trashed.push(seq);
+        if started.elapsed() >= crate::maintenance::SLICE_BUDGET {
+            break;
         }
+        // Only a memory that is still trashed and still old enough: the job read the list a
+        // moment ago, and a restore or an edit in between wins.
+        let trashed: Option<i64> = conn
+            .query_row(
+                "SELECT seq FROM memories WHERE seq = ?1 AND status = 'trashed' AND updated_at < ?2",
+                rusqlite::params![seq, cutoff],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if trashed.is_none() {
+            continue;
+        }
+        for (id, _title) in maintenance::purge_memories(conn, &[seq])? {
+            let stub = serde_json::json!({ "id": id, "title": maintenance::PURGED_TITLE });
+            record(
+                conn,
+                st,
+                EventInput {
+                    actor: &Actor::System,
+                    action: "memory.purge",
+                    target_type: "memory",
+                    target_id: &id,
+                    before: Some(stub),
+                    after: None,
+                    group: None,
+                },
+            )?;
+        }
+        done.push(seq);
     }
-    let gone = maintenance::purge_memories(conn, &trashed)?;
-    for (id, _title) in &gone {
-        let stub = serde_json::json!({ "id": id, "title": maintenance::PURGED_TITLE });
-        record(
-            conn,
-            st,
-            EventInput {
-                actor: &Actor::System,
-                action: "memory.purge",
-                target_type: "memory",
-                target_id: id,
-                before: Some(stub),
-                after: None,
-                group: None,
-            },
-        )?;
-    }
-    Ok(WriteOutcome::Purged(trashed))
+    // Seqs the box left over are not "done"; seqs skipped as no longer purgeable are not either
+    // (they are not in the trash any more, so the next look does not list them).
+    Ok(WriteOutcome::Purged(done))
 }
 
-/// `DeleteChunks`: retention deletes raw chunks; one `raw.retention` event says how many and why.
+/// `DeleteChunks`: retention deletes raw chunks, in groups of 50, until [`SLICE_BUDGET`] has
+/// passed; one `raw.retention` event says how many and why.
 fn delete_chunks(
     conn: &Connection,
     st: &mut State,
     seqs: &[i64],
     reason: &str,
 ) -> Result<WriteOutcome> {
-    let n = maintenance::delete_chunks(conn, seqs)?;
+    const GROUP: usize = 50;
+    let started = Instant::now();
+    let (mut done, mut n) = (Vec::new(), 0);
+    for group in seqs.chunks(GROUP) {
+        if started.elapsed() >= crate::maintenance::SLICE_BUDGET {
+            break;
+        }
+        n += maintenance::delete_chunks(conn, group)?;
+        done.extend_from_slice(group);
+    }
     if n > 0 {
         record(
             conn,
@@ -1398,7 +1429,7 @@ fn delete_chunks(
             },
         )?;
     }
-    Ok(WriteOutcome::Count(n))
+    Ok(WriteOutcome::Purged(done))
 }
 
 /// A memory the judge never sees (`judge_state = 'skipped'`, an import) becomes active when its
@@ -4269,6 +4300,7 @@ mod tests {
         let mut rx = f.h.subscribe();
         let out = f.h.submit_blocking(WriteOp::PurgeMemories {
             seqs: vec![keep_seq, gone_seq, 99_999],
+            cutoff: "2999-01-01T00:00:00.000Z".into(),
         });
         let WriteOutcome::Purged(done) = out.unwrap() else {
             panic!("expected Purged")
@@ -4335,16 +4367,16 @@ mod tests {
                 .map(|r| r.unwrap())
                 .collect()
         };
-        let WriteOutcome::Count(n) =
+        let WriteOutcome::Purged(done) =
             f.h.submit_blocking(WriteOp::DeleteChunks {
                 seqs: seqs[..3].to_vec(),
                 reason: "90d".into(),
             })
             .unwrap()
         else {
-            panic!("expected Count")
+            panic!("expected Purged")
         };
-        assert_eq!(n, 3);
+        assert_eq!(done, seqs[..3].to_vec());
         let after: String = f.read(
             "SELECT after_json FROM events WHERE action = 'raw.retention'",
             [],

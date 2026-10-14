@@ -85,6 +85,11 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
     configure_common(&conn, WRITER_CACHE_KIB)?;
     migrations::migrate(&mut conn, path)?;
+    // Migration 3 creates these; a database that migrated before they were added gets them once.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS chunks_created ON chunks(created_at);
+         CREATE INDEX IF NOT EXISTS judge_cache_created ON judge_cache(created_at);",
+    )?;
     Ok(conn)
 }
 

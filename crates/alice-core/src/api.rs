@@ -380,6 +380,10 @@ pub struct Health {
     /// Why the judge in force is not the one asked for (or out of budget), if it is not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_warning: Option<String>,
+    /// The backups are behind: the newest is older than two backup periods (or none was made in
+    /// a data directory that old).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_warning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<String>,
     /// False while the vector index is being rebuilt (search is lexical-only meanwhile).

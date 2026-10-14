@@ -643,6 +643,7 @@ impl Service {
             dim,
             judge_wake: judge_wake_tx.clone(),
             stop: stop.clone(),
+            free_space: Arc::new(|p: &Path| backup::free_space(p)),
         }));
         let maintenance_thread = scheduler.clone().spawn(stop.clone());
         if let Err(e) = spawn_config_events(&settings, &writer, &judge) {
@@ -731,6 +732,8 @@ impl Service {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.wake_worker.try_send(());
         let _ = self.wake_judge.try_send(());
+        // An integrity check in progress is interrupted; a backup stops at its next step.
+        self.scheduler.interrupt_running();
         // A job ends at its next slice. One inside a long single step (a backup, a check of the
         // whole database) is left to finish on its own, as with the judge below; its writes
         // fail once the writer has stopped.
@@ -738,7 +741,8 @@ impl Service {
         while !maintenance.is_finished() && waited.elapsed() < MAINTENANCE_STOP_WAIT {
             std::thread::sleep(Duration::from_millis(10));
         }
-        if !maintenance.is_finished() {
+        let scheduler_stopped = maintenance.is_finished();
+        if !scheduler_stopped {
             tracing::warn!("a maintenance job is still running; stopping without it");
         } else if maintenance.join().is_err() {
             tracing::error!("the maintenance scheduler panicked");
@@ -772,10 +776,15 @@ impl Service {
         // Saved even when nothing changed since start: an index that never came from these
         // files (an empty one after a failed rebuild, say) must replace them before the mark
         // vouches for them. Each part skips the write when its file already holds it.
-        if let Err(e) = idx
-            .save(&path)
-            .and_then(|()| VectorIndex::mark_clean(&path))
-        {
+        // A maintenance job that did not stop in time may still change the index (a purge
+        // drops vectors): the files are saved but not marked, and the next start catches up.
+        let saved = idx.save(&path);
+        let marked = if scheduler_stopped {
+            saved.and_then(|()| VectorIndex::mark_clean(&path))
+        } else {
+            saved
+        };
+        if let Err(e) = marked {
             tracing::warn!(error = %e, "saving the vector index failed; the next start rebuilds it");
         }
     }
@@ -2008,6 +2017,11 @@ impl Service {
         .await
     }
 
+    /// Why the backups are behind, if they are (see `maintenance::backup_warning`).
+    fn backup_warning(&self) -> Option<String> {
+        self.scheduler.backup_warning(chrono::Utc::now())
+    }
+
     pub async fn health(&self) -> Result<Health> {
         #[cfg(test)]
         self.health_reads
@@ -2020,6 +2034,7 @@ impl Service {
         let index_ready = self.index.read().is_some();
         let judge_provider = self.judge().provider().to_string();
         let judge_warning = self.judge_warning();
+        let maintenance_warning = self.backup_warning();
         self.read(move |c| {
             let count = |sql: &str| -> Result<u64> {
                 Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)
@@ -2036,6 +2051,7 @@ impl Service {
                 judge_backlog: alice_core::store::judge::judge_backlog(c)?,
                 judge_provider,
                 judge_warning,
+                maintenance_warning,
                 read_only,
                 index_ready,
                 settings_warnings,
@@ -2975,6 +2991,34 @@ mod tests {
         );
         assert!(status.iter().all(|j| j.last_error.is_none()), "{status:?}");
         assert_eq!(s.backups().await.unwrap().len(), 1, "the scheduled backup");
+        tokio::task::spawn_blocking(move || s.shutdown())
+            .await
+            .unwrap();
+    }
+
+    /// M-6: backups that are behind show in the health (and so in `alice status`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overdue_backups_are_a_health_warning() {
+        let (d, s) = svc().await;
+        assert!(s.health().await.unwrap().maintenance_warning.is_none());
+        std::fs::create_dir_all(d.path().join("backups")).unwrap();
+        let old = chrono::Utc::now() - chrono::Duration::days(5);
+        std::fs::write(
+            d.path()
+                .join("backups")
+                .join(format!("alice-{}.db", old.format("%Y%m%dT%H%M%SZ"))),
+            b"x",
+        )
+        .unwrap();
+        let w = s
+            .health()
+            .await
+            .unwrap()
+            .maintenance_warning
+            .expect("warning");
+        assert!(w.contains("5 days old"), "{w}");
+        s.backup_now().await.unwrap();
+        assert!(s.health().await.unwrap().maintenance_warning.is_none());
         tokio::task::spawn_blocking(move || s.shutdown())
             .await
             .unwrap();

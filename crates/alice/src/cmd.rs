@@ -850,6 +850,7 @@ async fn maintenance(home: &AliceHome, c: MaintenanceCmd, json: bool) -> Result<
                 let outcome = match r.outcome {
                     alice_daemon::maintenance::JobOutcome::Done => "done",
                     alice_daemon::maintenance::JobOutcome::Paused => "paused",
+                    alice_daemon::maintenance::JobOutcome::Skipped => "skipped",
                     alice_daemon::maintenance::JobOutcome::Failed => "failed",
                 };
                 format!("{outcome}: {} ({} ms)\n", r.detail, r.took_ms)
@@ -1256,6 +1257,9 @@ fn health_notes(h: &Health) -> String {
             "PROBLEM {}: {} (see `alice config list`)\n",
             e.key, e.message
         ));
+    }
+    if let Some(w) = &h.maintenance_warning {
+        out.push_str(&format!("WARNING: {w}\n"));
     }
     for w in &h.settings_warnings {
         out.push_str(&format!("warning: {w}\n"));

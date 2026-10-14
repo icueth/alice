@@ -77,10 +77,13 @@ pub fn purge_memories(conn: &Connection, seqs: &[i64]) -> Result<Vec<(String, St
     Ok(gone)
 }
 
-/// Chunks authored (or stored) before `cutoff`, oldest first.
+/// Chunks stored in Alice before `cutoff`, oldest first. Age is the time a chunk was *stored*
+/// (`created_at`): what a chunk says about when it was written (`authored_at`, which an import
+/// may set to years ago) never makes it old, so Alice never deletes raw data that has been in
+/// Alice for less than the retention. Uses the `chunks_created` index.
 pub fn chunks_older_than(conn: &Connection, cutoff: &str, limit: usize) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT seq FROM chunks WHERE COALESCE(authored_at, created_at) < ?1 ORDER BY seq LIMIT ?2",
+        "SELECT seq FROM chunks WHERE created_at < ?1 ORDER BY created_at, seq LIMIT ?2",
     )?;
     Ok(stmt
         .query_map(params![cutoff, limit as i64], |r| r.get(0))?
@@ -173,28 +176,43 @@ pub fn fts_merge(conn: &Connection, table: &str, pages: i64) -> Result<bool> {
     Ok(conn.total_changes() - before > 1)
 }
 
+/// Delete up to `limit` events older than `before_ts`, a whole group or none of it: an event
+/// whose group has a member at or after `before_ts` stays, so the history never keeps half of a
+/// change (undo reverts a whole group).
 pub fn prune_events(conn: &Connection, before_ts: &str, limit: usize) -> Result<usize> {
     Ok(conn.execute(
-        "DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE ts < ?1 ORDER BY rowid LIMIT ?2)",
+        "DELETE FROM events WHERE rowid IN (
+           SELECT e.rowid FROM events e
+           WHERE e.ts < ?1
+             AND (e.group_id IS NULL
+                  OR NOT EXISTS (SELECT 1 FROM events g WHERE g.group_id = e.group_id AND g.ts >= ?1))
+           ORDER BY e.rowid LIMIT ?2)",
         params![before_ts, limit as i64],
     )?)
 }
 
-/// Delete up to `limit` judge-cache entries that are older than `before_ts` or fall outside the
-/// `keep` newest. A deleted entry costs at most one repeated (paid) call.
+/// Delete up to `limit` judge-cache entries older than `before_ts`, or, when none is, entries
+/// beyond the `keep` newest. A deleted entry costs at most one repeated (paid) call. Both
+/// queries walk the `judge_cache_created` index.
 pub fn prune_judge_cache(
     conn: &Connection,
     before_ts: &str,
     keep: usize,
     limit: usize,
 ) -> Result<usize> {
+    let old = conn.execute(
+        "DELETE FROM judge_cache WHERE request_hash IN (
+           SELECT request_hash FROM judge_cache WHERE created_at < ?1 ORDER BY created_at LIMIT ?2)",
+        params![before_ts, limit as i64],
+    )?;
+    if old > 0 {
+        return Ok(old);
+    }
     Ok(conn.execute(
         "DELETE FROM judge_cache WHERE request_hash IN (
-           SELECT request_hash FROM judge_cache
-           WHERE created_at < ?1
-              OR request_hash NOT IN (SELECT request_hash FROM judge_cache ORDER BY created_at DESC, request_hash LIMIT ?2)
-           LIMIT ?3)",
-        params![before_ts, keep as i64, limit as i64],
+           SELECT request_hash FROM judge_cache ORDER BY created_at DESC, request_hash
+           LIMIT ?2 OFFSET ?1)",
+        params![keep as i64, limit as i64],
     )?)
 }
 
@@ -378,6 +396,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.inserted, 10);
+        // Age is the time stored: backdate the rows (the ingest stored them now).
+        c.execute(
+            "UPDATE chunks SET created_at = '2026-01-' || printf('%02d', ord + 1) || 'T00:00:00.000Z'",
+            [],
+        )
+        .unwrap();
         let old = chunks_older_than(&c, "2026-01-04T00:00:00.000Z", 100).unwrap();
         assert_eq!(old.len(), 3);
         assert_eq!(delete_chunks(&c, &old).unwrap(), 3);
@@ -407,6 +431,80 @@ mod tests {
             .query_row("SELECT count(*) FROM sources", [], |r| r.get(0))
             .unwrap();
         assert_eq!(sources_left, 0, "a source with no chunks left is removed");
+    }
+
+    /// I-1: what a chunk says about when it was written never makes it old. An import authored
+    /// in 2020 and stored today survives a 90-day retention, and `authored_at` values that sort
+    /// as "old" text (an epoch, an empty string, a US date) change nothing.
+    #[test]
+    fn age_retention_counts_the_time_stored_not_the_time_authored() {
+        let (_d, c, p) = setup();
+        let weird = [
+            "0",
+            "",
+            "10/13/2026",
+            "1",
+            "2020-01-01T00:00:00.000Z",
+            "1577836800",
+        ];
+        let chunks: Vec<ChunkInput> = weird
+            .iter()
+            .enumerate()
+            .map(|(i, a)| ChunkInput {
+                ord: i as i64,
+                text: format!("imported chunk {i}"),
+                authored_at: Some(a.to_string()),
+                ..Default::default()
+            })
+            .collect();
+        sources::ingest(
+            &c,
+            &p,
+            &SourceInput {
+                uri: "import".into(),
+                ..Default::default()
+            },
+            &chunks,
+        )
+        .unwrap();
+        // Stored today: nothing is older than 90 days.
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(90))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        assert!(chunks_older_than(&c, &cutoff, 100).unwrap().is_empty());
+        // The same malformed values written straight into the table (an older build) too.
+        c.execute("UPDATE chunks SET authored_at = CASE ord WHEN 0 THEN '0' WHEN 1 THEN '' ELSE '10/13/2026' END", []).unwrap();
+        assert!(chunks_older_than(&c, &cutoff, 100).unwrap().is_empty());
+        // Stored long ago: old, whatever the text says.
+        c.execute("UPDATE chunks SET created_at = '2025-01-01T00:00:00.000Z', authored_at = '2030-01-01T00:00:00.000Z' WHERE ord < 2", []).unwrap();
+        assert_eq!(chunks_older_than(&c, &cutoff, 100).unwrap().len(), 2);
+    }
+
+    /// M-1: events of one group go together or not at all.
+    #[test]
+    fn pruning_events_never_takes_part_of_a_group() {
+        let (_d, c, _p) = setup();
+        let ev = |id: &str, ts: &str, group: Option<&str>| {
+            c.execute(
+                "INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id, group_id) VALUES (?1, ?2, 'h', 'user', 'memory.edit', 'memory', 'X', ?3)",
+                params![id, ts, group],
+            )
+            .unwrap();
+        };
+        ev("A1", "2020-01-01T00:00:00.000Z", Some("G1")); // whole group old
+        ev("A2", "2020-01-01T00:00:01.000Z", Some("G1"));
+        ev("B1", "2020-01-01T00:00:02.000Z", Some("G2")); // straddles the cutoff
+        ev("B2", "2026-06-01T00:00:00.000Z", Some("G2"));
+        ev("C1", "2020-01-01T00:00:03.000Z", None);
+        let n = prune_events(&c, "2025-01-01T00:00:00.000Z", 500).unwrap();
+        assert_eq!(n, 3, "G1 and the ungrouped event");
+        let left: Vec<String> = c
+            .prepare("SELECT id FROM events ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(left, vec!["B1", "B2"]);
     }
 
     #[test]

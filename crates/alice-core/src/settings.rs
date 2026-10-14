@@ -295,7 +295,9 @@ pub struct StorageSettings {
     /// Where Alice keeps its data (read-only here: set the ALICE_HOME environment variable).
     pub data_dir: Option<String>,
     /// How long raw transcripts are kept: `forever`, an age such as `90d` (at least `1d`), or
-    /// a total size such as `10GB` (at least `1MB`).
+    /// a total size such as `10GB` (at least `1MB`). An age counts from when Alice stored a
+    /// chunk, not from the date the chunk claims; a size counts the chunks' text bytes. The
+    /// database file does not shrink when chunks go.
     #[schemars(with = "String")]
     pub raw_retention: Retention,
 }
