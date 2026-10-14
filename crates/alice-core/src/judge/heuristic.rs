@@ -3,7 +3,7 @@
 //! name mentions, predicates by string similarity. It never claims more certainty than the
 //! rules justify: only duplicates (and identical predicates) reach the auto-apply threshold.
 
-use super::text::{predicate_similarity, stem_predicate, title_similarity};
+use super::text::{predicate_similarity, same_predicate, title_similarity};
 use super::{
     Choice, Distribution, Judge, JudgeMemory, JudgeResult, ProjectOption, Relation, Rubric, Score,
 };
@@ -240,7 +240,6 @@ impl Judge for HeuristicJudge {
     }
 
     fn match_predicate(&self, new: &str, existing: &[String]) -> JudgeResult<Distribution> {
-        let stem = stem_predicate(new);
         let key = normalize_predicate(new);
         // Best candidate: exact normalised match, then higher similarity, then the shorter
         // predicate, then lexicographic order, so the answer does not depend on input order.
@@ -261,7 +260,7 @@ impl Judge for HeuristicJudge {
                 .then(a.0.cmp(b.0))
         });
         Ok(match ranked.first() {
-            Some((p, _, _)) if stem_predicate(p) == stem => {
+            Some((p, _, _)) if same_predicate(new, p) => {
                 Distribution::from_pairs([((*p).clone(), 0.95), ("none".to_string(), 0.05)])
             }
             Some((p, s, _)) if *s >= self.title_similarity => {

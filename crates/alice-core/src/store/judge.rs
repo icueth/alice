@@ -59,6 +59,8 @@ pub fn spent(conn: &Connection, day: &str, provider: &str) -> Result<f64> {
         .unwrap_or(0.0))
 }
 
+/// Adds a delta to the day's totals. The sums are checked in Rust inside a savepoint: a total
+/// that would overflow is an error and nothing is written.
 pub fn add_cost(conn: &Connection, d: &CostDelta) -> Result<()> {
     if !d.usd.is_finite() || d.usd < 0.0 {
         return Err(AliceError::invalid(
@@ -74,21 +76,39 @@ pub fn add_cost(conn: &Connection, d: &CostDelta) -> Result<()> {
         to_i64(d.input_tokens)?,
         to_i64(d.output_tokens)?,
     );
-    conn.execute(
-        "INSERT INTO cost_ledger (day, provider, calls, input_tokens, output_tokens, usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(day, provider) DO UPDATE SET calls = calls + excluded.calls,
-           input_tokens = input_tokens + excluded.input_tokens,
-           output_tokens = output_tokens + excluded.output_tokens, usd = usd + excluded.usd",
-        params![
-            d.day,
-            d.provider,
-            calls,
-            input,
-            output,
-            d.usd
-        ],
-    )?;
-    Ok(())
+    conn.execute_batch("SAVEPOINT add_cost")?;
+    let result = (|| -> Result<()> {
+        let (c0, i0, o0, u0): (i64, i64, i64, f64) = conn
+            .query_row(
+                "SELECT calls, input_tokens, output_tokens, usd FROM cost_ledger WHERE day = ?1 AND provider = ?2",
+                params![d.day, d.provider],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+            .unwrap_or((0, 0, 0, 0.0));
+        let too_big = || AliceError::invalid("the day's cost totals are too large to record");
+        let usd = u0 + d.usd;
+        if !usd.is_finite() {
+            return Err(too_big());
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO cost_ledger (day, provider, calls, input_tokens, output_tokens, usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                d.day,
+                d.provider,
+                c0.checked_add(calls).ok_or_else(too_big)?,
+                i0.checked_add(input).ok_or_else(too_big)?,
+                o0.checked_add(output).ok_or_else(too_big)?,
+                usd
+            ],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("RELEASE add_cost")?,
+        Err(_) => conn.execute_batch("ROLLBACK TO add_cost; RELEASE add_cost")?,
+    }
+    result
 }
 
 pub fn cost_since(conn: &Connection, day: &str) -> Result<Vec<CostRow>> {

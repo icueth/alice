@@ -65,7 +65,8 @@ pub fn age(created_at: &str, now: DateTime<Utc>) -> String {
         return "at an unknown time".into();
     };
     let delta = now - t;
-    if delta < chrono::Duration::zero() {
+    // Under a minute ahead is clock skew, not the future.
+    if delta < chrono::Duration::seconds(-60) {
         return "in the future".into();
     }
     let days = delta.num_days();
@@ -133,10 +134,13 @@ mod tests {
         assert_eq!(age(&at(1_100), now), "three years ago");
         assert_eq!(age("not a date", now), "at an unknown time");
         assert_eq!(age(&at(-2), now), "in the future");
+        let ahead = |s: i64| (now + chrono::Duration::seconds(s)).to_rfc3339();
+        assert_eq!(age(&ahead(30), now), "today");
+        assert_eq!(age(&ahead(90), now), "in the future");
         assert_eq!(age(&at(361), now), "about a year ago");
         assert_eq!(age(&at(359), now), "eleven months ago");
         assert_eq!(age("2026-09-29 12:00:00", now), "two weeks ago");
-        assert_eq!(age("2026-10-13 11:59:59.250", now), "today");
+        assert_eq!(age("2026-10-13 12:00:00.250", now), "today");
         assert_eq!(number(12), "twelve");
         assert_eq!(number(40), "forty");
         assert_eq!(number(137), "137");

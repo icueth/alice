@@ -370,6 +370,28 @@ mod tests {
     }
 
     #[test]
+    fn huge_weights_do_not_overflow_and_deserialising_normalises() {
+        let d =
+            Distribution::from_pairs([("a".to_string(), f64::MAX), ("b".to_string(), f64::MAX)]);
+        assert_eq!((d.p("a"), d.p("b")), (0.5, 0.5));
+        let z = Distribution::from_pairs([("a".to_string(), 0.0), ("b".to_string(), f64::NAN)]);
+        assert!(
+            z.0.is_empty() && z.best().is_none(),
+            "zero-mass ids are dropped"
+        );
+        let d: Distribution = serde_json::from_str(r#"{"a":3,"b":1,"c":0}"#).unwrap();
+        assert_eq!((d.p("a"), d.p("b")), (0.75, 0.25));
+        assert!(!d.0.contains_key("c"));
+        let d: Distribution = serde_json::from_str(r#"{"a":-1,"b":2}"#).unwrap();
+        assert_eq!((d.p("a"), d.p("b")), (0.0, 1.0));
+        assert!(!d.0.contains_key("a"));
+        let zeros = Distribution(BTreeMap::from([("a".to_string(), 0.0)]));
+        assert_eq!(zeros.best(), None);
+        let one_side = Distribution::average(&Distribution::default(), &Distribution::certain("a"));
+        assert_eq!(one_side, Distribution::certain("a"));
+    }
+
+    #[test]
     fn relation_kinds_round_trip_and_choices_are_described() {
         for k in RelationKind::ALL {
             assert_eq!(RelationKind::parse(k.as_str()), Some(k));

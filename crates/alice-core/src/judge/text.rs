@@ -25,7 +25,9 @@ pub fn title_similarity(a: &str, b: &str) -> f64 {
 /// Snake-case predicate with English inflections removed per word: `uses` → `use`,
 /// `deployed_on` → `deploy_on`, `running_on` → `run_on`, `matches` → `match`,
 /// `processing` and `processes` → `process`. Words with any non-ASCII character (Thai, …) are
-/// left as normalised, unstemmed.
+/// left as normalised, unstemmed. `-es` is stripped only after `ch`, `sh`, `x`, `ss`; words
+/// like `caches` or `buses` are reconciled by [`predicate_similarity`], which also tries the
+/// other readings.
 pub fn stem_predicate(p: &str) -> String {
     normalize_predicate(p)
         .split('_')
@@ -52,7 +54,7 @@ fn stem_word(w: &str) -> String {
         }
     } else if n > 4 && w.ends_with("ied") {
         format!("{}y", &w[..n - 3])
-    } else if (n > 4 && w.ends_with("ed")) || (n > 2 && w.ends_with("es") && es_plural(&w[..n - 2]))
+    } else if (n > 4 && w.ends_with("ed")) || (n > 3 && w.ends_with("es") && es_plural(&w[..n - 2]))
     {
         w[..n - 2].to_string()
     } else if n > 3 && w.ends_with('s') && !w.ends_with("ss") {
@@ -62,16 +64,72 @@ fn stem_word(w: &str) -> String {
     }
 }
 
-/// Whether `-es` is the plural ending of `stem` (`match|es`, `fix|es`, `go|es`) rather than
-/// `-s` added to a word ending in `e` (`use|s`, `replace|s`).
+/// Whether `-es` is certainly the plural ending of `stem` (`match|es`, `fix|es`).
 fn es_plural(stem: &str) -> bool {
-    ["ch", "sh", "x", "ss", "z", "o"]
-        .iter()
-        .any(|e| stem.ends_with(e))
+    ["ch", "sh", "x", "ss"].iter().any(|e| stem.ends_with(e))
 }
 
+/// Every plausible stem of one word: the canonical stem plus, for `-es` words, the plain `-s`
+/// form and the `-es`-stripped form when the stripped stem is a sound base (ends in `s`, `x`,
+/// `z`, `ch`, `sh`, or is `go`/`do`). So `caches` reaches `cache`, `buses` reaches `bus`, but
+/// `toes` and `shoes` do not reach `to` and `sho`.
+fn word_candidates(w: &str) -> Vec<String> {
+    let mut out = vec![stem_word(w)];
+    let n = w.len();
+    if w.is_ascii() && n > 3 && w.ends_with("es") {
+        out.push(w[..n - 1].to_string());
+        let stem = &w[..n - 2];
+        let sound = ["s", "x", "z", "ch", "sh"]
+            .iter()
+            .any(|e| stem.ends_with(e))
+            || matches!(stem, "go" | "do");
+        if sound {
+            out.push(stem.to_string());
+            if stem.ends_with("zz") {
+                out.push(stem[..stem.len() - 1].to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// All stems of a predicate: the product of its words' candidates (capped).
+fn predicate_candidates(p: &str) -> Vec<String> {
+    let mut acc = vec![String::new()];
+    for (i, w) in normalize_predicate(p).split('_').enumerate() {
+        let cands = word_candidates(w);
+        let mut next = Vec::new();
+        for a in &acc {
+            for c in &cands {
+                next.push(if i == 0 {
+                    c.clone()
+                } else {
+                    format!("{a}_{c}")
+                });
+            }
+        }
+        next.truncate(32);
+        acc = next;
+    }
+    acc
+}
+
+/// The best Jaro-Winkler score over the candidate stems of both predicates; 1.0 means they
+/// read as the same predicate.
 pub fn predicate_similarity(a: &str, b: &str) -> f64 {
-    strsim::jaro_winkler(&stem_predicate(a), &stem_predicate(b))
+    let bs = predicate_candidates(b);
+    predicate_candidates(a)
+        .iter()
+        .flat_map(|x| bs.iter().map(move |y| strsim::jaro_winkler(x, y)))
+        .fold(0.0, f64::max)
+}
+
+/// Whether two predicates share a candidate stem.
+pub fn same_predicate(a: &str, b: &str) -> bool {
+    let bs = predicate_candidates(b);
+    predicate_candidates(a).iter().any(|x| bs.contains(x))
 }
 
 #[cfg(test)]
@@ -94,8 +152,7 @@ mod tests {
         for (w, base) in [
             ("matches", "match"),
             ("fixes", "fix"),
-            ("goes", "go"),
-            ("does", "do"),
+            ("pushes", "push"),
             ("processes", "process"),
             ("processing", "process"),
             ("uses", "use"),
@@ -104,6 +161,34 @@ mod tests {
             ("running", "run"),
         ] {
             assert_eq!(stem_predicate(w), base, "{w}");
+        }
+    }
+
+    #[test]
+    fn candidate_stems_reconcile_es_words_without_over_stripping() {
+        for (a, b) in [
+            ("caches", "cache"),
+            ("sizes", "size"),
+            ("serializes", "serialize"),
+            ("buses", "bus"),
+            ("goes", "go"),
+            ("does", "do"),
+            ("matches", "match"),
+            ("quizzes", "quiz"),
+            ("processes", "processing"),
+            ("deployed_on", "deploys_on"),
+        ] {
+            assert!(
+                same_predicate(a, b) && predicate_similarity(a, b) >= 1.0,
+                "{a} ~ {b}"
+            );
+            assert!(same_predicate(b, a), "{b} ~ {a}");
+        }
+        for (a, b) in [("toes", "to"), ("shoes", "sho"), ("owns", "deployed_on")] {
+            assert!(
+                !same_predicate(a, b) && predicate_similarity(a, b) < 1.0,
+                "{a} !~ {b}"
+            );
         }
     }
 
