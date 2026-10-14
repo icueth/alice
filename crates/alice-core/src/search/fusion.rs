@@ -1,6 +1,6 @@
 //! Reciprocal rank fusion and ranking boosts. Pure functions.
 
-use crate::model::Status;
+use crate::model::{Kind, Status};
 use std::collections::HashMap;
 
 pub const RRF_K: f64 = 60.0;
@@ -22,13 +22,21 @@ pub fn rrf(lists: &[Vec<ItemRef>]) -> HashMap<ItemRef, f64> {
     scores
 }
 
+/// Ranking multipliers (spec §4.4); the `[search.weights]` settings.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(default)]
 pub struct Weights {
+    /// Multiplier for knowledge memories.
     pub knowledge: f64,
+    /// Multiplier for raw transcript chunks.
     pub raw: f64,
+    /// Multiplier for results from the current project.
     pub current_project: f64,
+    /// Multiplier for results from the global project.
     pub global_project: f64,
+    /// Multiplier for superseded memories.
     pub superseded: f64,
+    /// Multiplier for archived memories.
     pub archived: f64,
     /// Maximum boost from frequent use (0.10 = +10 %).
     pub usage_max: f64,
@@ -45,6 +53,81 @@ impl Default for Weights {
             archived: 0.5,
             usage_max: 0.10,
         }
+    }
+}
+
+/// Recency half-lives in days per kind (spec §4.4); 0 means no decay. The `[search.half_life]`
+/// settings.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct HalfLives {
+    /// Days for `status` memories (0 = no decay).
+    pub status: f64,
+    /// Days for `handoff` memories (0 = no decay).
+    pub handoff: f64,
+    /// Days for `diary` memories (0 = no decay).
+    pub diary: f64,
+    /// Days for `note` memories (0 = no decay).
+    pub note: f64,
+    /// Days for `fact` memories (0 = no decay).
+    pub fact: f64,
+    /// Days for `howto` memories (0 = no decay).
+    pub howto: f64,
+    /// Days for `bugfix` memories (0 = no decay).
+    pub bugfix: f64,
+    /// Days for `summary` memories (0 = no decay).
+    pub summary: f64,
+    /// Days for `decision` memories (0 = no decay).
+    pub decision: f64,
+    /// Days for `preference` memories (0 = no decay).
+    pub preference: f64,
+    /// Days for `warning` memories (0 = no decay).
+    pub warning: f64,
+    /// Days for raw transcript chunks (0 = no decay).
+    pub raw: f64,
+}
+
+impl Default for HalfLives {
+    fn default() -> Self {
+        Self {
+            status: 7.0,
+            handoff: 14.0,
+            diary: 30.0,
+            note: 90.0,
+            fact: 180.0,
+            howto: 180.0,
+            bugfix: 180.0,
+            summary: 180.0,
+            decision: 0.0,
+            preference: 0.0,
+            warning: 0.0,
+            raw: crate::model::RAW_HALF_LIFE_DAYS,
+        }
+    }
+}
+
+impl HalfLives {
+    /// The half-life for `k`, or `None` when it does not decay.
+    pub fn days(&self, k: Kind) -> Option<f64> {
+        let d = match k {
+            Kind::Status => self.status,
+            Kind::Handoff => self.handoff,
+            Kind::Diary => self.diary,
+            Kind::Note => self.note,
+            Kind::Fact => self.fact,
+            Kind::Howto => self.howto,
+            Kind::Bugfix => self.bugfix,
+            Kind::Summary => self.summary,
+            Kind::Decision => self.decision,
+            Kind::Preference => self.preference,
+            Kind::Warning => self.warning,
+        };
+        (d > 0.0).then_some(d)
+    }
+
+    /// The half-life for raw chunks, or `None` when they do not decay.
+    pub fn raw_days(&self) -> Option<f64> {
+        (self.raw > 0.0).then_some(self.raw)
     }
 }
 
@@ -204,6 +287,23 @@ mod tests {
             },
         );
         assert!((critical - 1.15).abs() < 1e-9);
+    }
+
+    /// The settings' half-lives start as the spec's (spec §4.4), so ranking is unchanged.
+    #[test]
+    fn default_half_lives_are_the_kinds_own() {
+        let h = HalfLives::default();
+        for k in crate::model::Kind::ALL {
+            assert_eq!(h.days(k), k.half_life_days(), "{k:?}");
+        }
+        assert_eq!(h.raw_days(), Some(crate::model::RAW_HALF_LIFE_DAYS));
+        let no_decay = HalfLives {
+            status: 0.0,
+            raw: 0.0,
+            ..HalfLives::default()
+        };
+        assert_eq!(no_decay.days(crate::model::Kind::Status), None);
+        assert_eq!(no_decay.raw_days(), None);
     }
 
     #[test]

@@ -1,11 +1,13 @@
 //! Alice daemon library: storage service, HTTP API, MCP server and client.
 
 pub mod client;
+pub mod config;
 pub mod daemon;
 pub mod discovery;
 pub mod http;
 pub mod mcp;
 pub mod paths;
+pub mod secrets;
 pub mod service;
 pub mod spool;
 pub mod startup;

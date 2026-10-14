@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 alice-core = { path = "../alice-core" }
-alice-daemon = { path = "../alice-daemon" }
+alice-daemon = { path = "../alice-daemon", features = ["keychain"] }
 alice-embed = { path = "../alice-embed" }
 clap.workspace = true
 tokio.workspace = true

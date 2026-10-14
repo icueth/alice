@@ -48,6 +48,10 @@ impl AliceHome {
     pub fn config_file(&self) -> PathBuf {
         self.root.join("config.toml")
     }
+    /// API keys when `secrets.backend = "file"` (the default); private to its owner (0600).
+    pub fn secrets_file(&self) -> PathBuf {
+        self.root.join("secrets.toml")
+    }
     pub fn daemon_json(&self) -> PathBuf {
         self.root.join("daemon.json")
     }
@@ -113,6 +117,7 @@ mod tests {
         }
         for file in [
             home.config_file(),
+            home.secrets_file(),
             home.daemon_json(),
             home.lock_file(),
             home.token_file(),

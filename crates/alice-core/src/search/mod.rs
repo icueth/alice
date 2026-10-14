@@ -8,7 +8,7 @@ pub mod stopwords;
 use crate::api::{Hit, MatchVia, RelatedRef, Tier};
 use crate::embed::Embedder;
 use crate::error::{AliceError, Result};
-use crate::model::{Kind, Memory, RAW_HALF_LIFE_DAYS, Status, limits};
+use crate::model::{Kind, Memory, Status, limits};
 use crate::normalize::{nfc, normalize_topic};
 use crate::store::embeddings::VecKey;
 use crate::store::projects::GLOBAL_ID;
@@ -16,7 +16,7 @@ use crate::store::sources::ChunkRow;
 use crate::store::{ReaderPool, memories, sources};
 use crate::vector::{KeyFilter, VectorIndex};
 use chrono::{DateTime, SecondsFormat, Utc};
-use fusion::{BoostInput, ItemRef, Weights, boost, rrf};
+use fusion::{BoostInput, HalfLives, ItemRef, Weights, boost, rrf};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 
@@ -50,6 +50,8 @@ pub struct SearchParams {
     pub limit: usize,
     pub relevance_floor: f32,
     pub raw_min_results: usize,
+    /// Recency half-lives per kind and for raw chunks (`search.half_life`).
+    pub half_lives: HalfLives,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -611,7 +613,7 @@ impl Filters<'_> {
                 same_project: p.current_project_id.as_deref() == Some(project_id),
                 is_global: project_id == GLOBAL_ID,
                 age_days: age_days(&m.created_at, self.now),
-                half_life_days: m.kind.half_life_days(),
+                half_life_days: p.half_lives.days(m.kind),
                 importance: m.importance,
                 access_count: m.access_count,
                 status: m.status,
@@ -632,7 +634,7 @@ impl Filters<'_> {
                 same_project: p.current_project_id.as_deref() == Some(c.project_id.as_str()),
                 is_global: c.project_id == GLOBAL_ID,
                 age_days: age_days(when, self.now),
-                half_life_days: Some(RAW_HALF_LIFE_DAYS),
+                half_life_days: p.half_lives.raw_days(),
                 importance: 3,
                 access_count: 0,
                 status: Status::Active,
@@ -1057,6 +1059,35 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    /// `SearchParams::half_lives` (from `search.half_life`) decides the recency boost.
+    #[test]
+    fn half_lives_from_the_params_set_the_recency_boost() {
+        let f = fx();
+        let (id, _) = f.add_input(
+            &f.app,
+            memories::NewMemoryInput {
+                content: "zeta deploy checklist".into(),
+                kind: Some(Kind::Status),
+                created_at: Some("2025-01-05T10:00:00.000Z".into()),
+                ..Default::default()
+            },
+        );
+        let score = |half_lives: fusion::HalfLives| -> f64 {
+            let out = f.search(&SearchParams {
+                half_lives,
+                ..f.params("zeta deploy checklist")
+            });
+            out.hits.iter().find(|h| h.id == id).expect("found").score
+        };
+        let decayed = score(fusion::HalfLives::default());
+        let kept = score(fusion::HalfLives {
+            status: 0.0,
+            ..Default::default()
+        });
+        // A status note well over a year old keeps 0.7 of its score with a 7-day half-life.
+        assert!((decayed / kept - 0.7).abs() < 1e-6, "{decayed} / {kept}");
     }
 
     #[test]

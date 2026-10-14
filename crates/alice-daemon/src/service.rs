@@ -556,6 +556,8 @@ impl Service {
                     limit,
                     relevance_floor: opts.relevance_floor,
                     raw_min_results: opts.raw_min_results,
+                    // Task 6 passes `search.half_life` from the settings.
+                    half_lives: Default::default(),
                 };
                 let out = search::run_with_chunk_reads(
                     c,

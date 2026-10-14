@@ -7,7 +7,15 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Alice daemon: single-writer store, workers, HTTP API and MCP server"
 
+[features]
+default = []
+# The OS keychain as a secrets backend (`secrets.backend = "keychain"`); the `alice` binary
+# enables it. Tests never touch the real keychain: they use an in-memory stand-in.
+keychain = ["dep:keyring"]
+
 [dependencies]
+keyring = { workspace = true, optional = true }
+toml.workspace = true
 alice-core = { path = "../alice-core" }
 alice-embed = { path = "../alice-embed" }
 axum.workspace = true

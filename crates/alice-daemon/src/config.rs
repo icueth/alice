@@ -1,0 +1,838 @@
+//! The daemon's live settings: `config.toml` + environment, re-read when the file changes
+//! (polled), changed through `patch` (which edits the file and keeps its comments). An invalid
+//! file, patch or variable never replaces valid settings; the errors are kept for
+//! `alice config list`, `/api/v1/settings` and `alice doctor`.
+//!
+//! Only `ALICE_*` variables are looked at, and only the values of setting variables are kept:
+//! a secret in `ALICE_EMBEDDING_API_KEY` (or one put in a misnamed variable) is never held,
+//! logged or shown here.
+
+use crate::paths::AliceHome;
+use alice_core::settings::{self, Resolved, SettingError, Settings, Source};
+use parking_lot::{Mutex, RwLock};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+pub use alice_core::settings::JudgeProvider;
+
+/// How long a changed `config.toml` must hold still before it is read as the new settings. An
+/// editor that truncates the file and then writes it is not caught half-way: an empty file is
+/// valid and would mean every default (an empty `cloud_denied_projects` among them) for a
+/// moment.
+const SETTLE: Duration = Duration::from_millis(30);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct PatchOutcome {
+    /// Keys whose effective value changed.
+    pub changed: Vec<String>,
+    /// Keys written that apply only after a daemon restart.
+    pub restart_required: Vec<String>,
+    /// Keys written to config.toml but overridden by an environment variable.
+    pub overridden_by_env: Vec<String>,
+}
+
+fn err(key: &str, message: String) -> SettingError {
+    SettingError {
+        key: key.into(),
+        message,
+    }
+}
+
+/// The environment as the settings see it: `ALICE_*` names, with values only for setting
+/// variables that are valid, alone and together. A variable that is not a setting keeps its
+/// name only (enough for the warning about it), so its value (perhaps a secret) is never held.
+struct EnvLayer {
+    vars: Vec<(String, String)>,
+    /// Setting variables set aside because their values are invalid.
+    errors: Vec<SettingError>,
+}
+
+impl EnvLayer {
+    fn new(env: &[(String, String)]) -> Self {
+        let mut vars = Vec::new();
+        let mut errors = Vec::new();
+        for (k, v) in env.iter().filter(|(k, _)| k.starts_with("ALICE_")) {
+            if settings::key_for_env_var(k).is_none() {
+                vars.push((k.clone(), String::new()));
+                continue;
+            }
+            match settings::resolve(None, &[(k.clone(), v.clone())]) {
+                Ok(_) => vars.push((k.clone(), v.clone())),
+                Err(e) => errors.extend(e),
+            }
+        }
+        if let Err(e) = settings::resolve(None, &vars) {
+            // Valid one by one, invalid together: none of them applies.
+            let names: Vec<&str> = vars
+                .iter()
+                .filter(|(k, _)| settings::key_for_env_var(k).is_some())
+                .map(|(k, _)| k.as_str())
+                .collect();
+            let names = names.join(", ");
+            errors.extend(e.into_iter().map(|x| SettingError {
+                message: format!(
+                    "{} (from the environment; {names} are ignored until this is fixed)",
+                    x.message
+                ),
+                key: x.key,
+            }));
+            vars.retain(|(k, _)| settings::key_for_env_var(k).is_none());
+        }
+        Self { vars, errors }
+    }
+
+    fn names(&self) -> Vec<&str> {
+        self.vars.iter().map(|(k, _)| k.as_str()).collect()
+    }
+}
+
+/// The process's `ALICE_*` variables; values only for setting variables.
+fn process_env() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(k, v)| {
+            let k = k.into_string().ok()?;
+            if !k.starts_with("ALICE_") {
+                return None;
+            }
+            let v = match settings::key_for_env_var(&k) {
+                Some(_) => v.to_string_lossy().into_owned(),
+                None => String::new(),
+            };
+            Some((k, v))
+        })
+        .collect()
+}
+
+/// `config.toml`'s text; `None` when there is none. Not text, or unreadable: an error.
+fn read_config(path: &Path) -> Result<Option<String>, SettingError> {
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| {
+            err(
+                "config.toml",
+                format!("{} is not UTF-8 text; save it as UTF-8", path.display()),
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(err(
+            "config.toml",
+            format!("cannot read {}: {e}", path.display()),
+        )),
+    }
+}
+
+type Read = Result<Option<String>, SettingError>;
+
+fn fingerprint(read: &Read) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match read {
+        Ok(None) => 0u8.hash(&mut h),
+        Ok(Some(text)) => (1u8, text).hash(&mut h),
+        Err(e) => (2u8, &e.message).hash(&mut h),
+    }
+    h.finish()
+}
+
+/// Two reads `settle` apart; `None` unless they agree (the file is still being written).
+fn settled<T: PartialEq>(mut read: impl FnMut() -> T, settle: Duration) -> Option<T> {
+    let first = read();
+    std::thread::sleep(settle);
+    (read() == first).then_some(first)
+}
+
+fn default_resolved() -> Resolved {
+    settings::resolve(None, &[]).expect("defaults are valid")
+}
+
+/// The file layer over the environment; when the file is the problem, the defaults plus the
+/// (already checked) environment, and the file's errors.
+fn resolve_layers(read: &Read, env: &EnvLayer) -> (Resolved, Vec<SettingError>) {
+    let with_file = match read {
+        Ok(text) => settings::resolve(text.as_deref(), &env.vars),
+        Err(e) => Err(vec![e.clone()]),
+    };
+    match with_file {
+        Ok(r) => (r, Vec::new()),
+        Err(errors) => (
+            settings::resolve(None, &env.vars).unwrap_or_else(|_| default_resolved()),
+            errors,
+        ),
+    }
+}
+
+fn log_problems(errors: &[SettingError], warnings: &[String]) {
+    for e in errors {
+        tracing::warn!(key = %e.key, message = %e.message, "invalid setting; the last valid value (or the default) stays in effect");
+    }
+    for w in warnings {
+        tracing::warn!("{w}");
+    }
+}
+
+/// Settings as a process outside the running daemon sees them.
+#[derive(Debug, Clone)]
+pub struct Effective {
+    pub resolved: Resolved,
+    /// Problems in `config.toml` or in setting variables. A broken file means the defaults plus
+    /// the valid variables; an invalid variable is left out and the rest still applies.
+    pub errors: Vec<SettingError>,
+}
+
+/// `config.toml` + the process's `ALICE_*` variables, resolved over the defaults. Never fails.
+/// The one rule for code that cannot ask the daemon: spool redaction (Task 7), stdio MCP
+/// (Task 11), restore (Task 15) and doctor (Task 17). The daemon loads the same way.
+pub fn load_effective(home: &AliceHome) -> Effective {
+    effective(&home.config_file(), &process_env())
+}
+
+fn effective(file: &Path, env: &[(String, String)]) -> Effective {
+    let env = EnvLayer::new(env);
+    let (resolved, mut errors) = resolve_layers(&read_config(file), &env);
+    errors.extend(env.errors.iter().cloned());
+    log_problems(&errors, &resolved.warnings);
+    Effective { resolved, errors }
+}
+
+fn changed_keys(a: &Settings, b: &Settings) -> Vec<String> {
+    let a = settings::leaves(&serde_json::to_value(a).expect("settings serialise"));
+    let b: std::collections::BTreeMap<_, _> =
+        settings::leaves(&serde_json::to_value(b).expect("settings serialise"))
+            .into_iter()
+            .collect();
+    a.into_iter()
+        .filter(|(k, v)| b.get(k) != Some(v))
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// Where a write of `path` goes: through a symlink to its target (a config file kept in a
+/// dotfiles repository stays linked).
+fn write_target(path: &Path) -> PathBuf {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Written to a new file next to `target` (with `target`'s permissions), synced, then renamed
+/// over it: a reader sees the old file or the new one, never a half-written one.
+fn write_atomically(target: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".into());
+    let tmp = target.with_file_name(format!(".{name}.{}.tmp", alice_core::ids::new_id()));
+    let perms = std::fs::metadata(target).ok().map(|m| m.permissions());
+    let done = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create_new(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        if let Some(p) = perms {
+            f.set_permissions(p)?;
+        }
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, target)
+    })();
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
+}
+
+/// One consistent view: the settings and where they came from.
+struct Snapshot {
+    settings: Arc<Settings>,
+    resolved: Arc<Resolved>,
+}
+
+impl Snapshot {
+    fn new(r: Resolved) -> Self {
+        Self {
+            settings: Arc::new(r.settings.clone()),
+            resolved: Arc::new(r),
+        }
+    }
+}
+
+pub struct SettingsHandle {
+    file: PathBuf,
+    env: EnvLayer,
+    snapshot: RwLock<Snapshot>,
+    /// Problems with `config.toml` (cleared by the next good read or patch).
+    file_errors: RwLock<Vec<SettingError>>,
+    /// Fingerprint of the last `config.toml` read or written.
+    seen: Mutex<u64>,
+    /// Serialises reloads and patches.
+    write: Mutex<()>,
+    changes: tokio::sync::broadcast::Sender<Vec<String>>,
+}
+
+/// Names and problems only (the variables' values are not shown).
+impl std::fmt::Debug for SettingsHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsHandle")
+            .field("file", &self.file)
+            .field("env", &self.env.names())
+            .field("errors", &self.errors())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SettingsHandle {
+    /// The settings for `home` with the process's `ALICE_*` variables. Never fails.
+    pub fn load(home: &AliceHome) -> Arc<Self> {
+        Self::load_with_env(home, process_env())
+    }
+
+    /// The same with the environment passed in (tests).
+    pub fn load_with_env(home: &AliceHome, env: Vec<(String, String)>) -> Arc<Self> {
+        let file = home.config_file();
+        let env = EnvLayer::new(&env);
+        let read = read_config(&file);
+        let (resolved, file_errors) = resolve_layers(&read, &env);
+        log_problems(
+            &file_errors
+                .iter()
+                .chain(&env.errors)
+                .cloned()
+                .collect::<Vec<_>>(),
+            &resolved.warnings,
+        );
+        let (changes, _) = tokio::sync::broadcast::channel(16);
+        Arc::new(Self {
+            seen: Mutex::new(fingerprint(&read)),
+            file,
+            env,
+            snapshot: RwLock::new(Snapshot::new(resolved)),
+            file_errors: RwLock::new(file_errors),
+            write: Mutex::new(()),
+            changes,
+        })
+    }
+
+    /// The settings in effect (cheap: a shared pointer).
+    pub fn get(&self) -> Arc<Settings> {
+        self.snapshot.read().settings.clone()
+    }
+
+    /// The settings with each key's source and the ignored variables.
+    pub fn resolved(&self) -> Arc<Resolved> {
+        self.snapshot.read().resolved.clone()
+    }
+
+    /// Why `config.toml` or a setting variable is not in effect; empty when all is well.
+    pub fn errors(&self) -> Vec<SettingError> {
+        self.file_errors
+            .read()
+            .iter()
+            .chain(&self.env.errors)
+            .cloned()
+            .collect()
+    }
+
+    /// Ignored `ALICE_*` variables (reported in health and `alice config list`).
+    pub fn warnings(&self) -> Vec<String> {
+        self.snapshot.read().resolved.warnings.clone()
+    }
+
+    /// Changed keys, after every change that took effect.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Vec<String>> {
+        self.changes.subscribe()
+    }
+
+    fn swap(&self, r: Resolved) -> Vec<String> {
+        let changed = changed_keys(&self.snapshot.read().settings, &r.settings);
+        *self.snapshot.write() = Snapshot::new(r);
+        self.file_errors.write().clear();
+        if !changed.is_empty() {
+            let _ = self.changes.send(changed.clone());
+        }
+        changed
+    }
+
+    /// Re-read `config.toml` if it changed on disk (by content, not by time). `Some(changed
+    /// keys)` when new settings took effect; `None` when nothing changed, the file is still
+    /// being written, or it is invalid (the last good settings stay, and `errors` says why).
+    pub fn reload_if_changed(&self) -> Option<Vec<String>> {
+        let _w = self.write.lock();
+        if fingerprint(&read_config(&self.file)) == *self.seen.lock() {
+            return None;
+        }
+        // Still being written: the next poll looks again.
+        let read = settled(|| read_config(&self.file), SETTLE)?;
+        *self.seen.lock() = fingerprint(&read);
+        let result = match &read {
+            Ok(text) => settings::resolve(text.as_deref(), &self.env.vars),
+            Err(e) => Err(vec![e.clone()]),
+        };
+        match result {
+            Ok(r) => Some(self.swap(r)),
+            Err(errs) => {
+                for e in &errs {
+                    tracing::warn!(key = %e.key, message = %e.message, "config.toml is invalid; keeping the previous settings");
+                }
+                *self.file_errors.write() = errs;
+                None
+            }
+        }
+    }
+
+    /// Apply dotted-key changes (`null` removes a key from config.toml). All or nothing: on an
+    /// error the file and the settings stay as they were.
+    pub fn patch(
+        &self,
+        changes: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<PatchOutcome, Vec<SettingError>> {
+        if changes.is_empty() {
+            return Ok(PatchOutcome::default());
+        }
+        let _w = self.write.lock();
+        let mut text = read_config(&self.file)
+            .map_err(|e| vec![e])?
+            .unwrap_or_default();
+        for (k, v) in changes {
+            text = settings::edit_toml(&text, k, v).map_err(|e| vec![e])?;
+        }
+        let r = settings::resolve(Some(&text), &self.env.vars)?;
+        let target = write_target(&self.file);
+        if let Err(e) = write_atomically(&target, &text) {
+            return Err(vec![err(
+                "config.toml",
+                format!("cannot write {}: {e}", target.display()),
+            )]);
+        }
+        *self.seen.lock() = fingerprint(&Ok(Some(text)));
+        let overridden_by_env = changes
+            .keys()
+            .filter(|k| matches!(r.sources.get(k.as_str()), Some(Source::Env { .. })))
+            .cloned()
+            .collect();
+        let restart_required = changes
+            .keys()
+            .filter(|k| settings::RESTART_KEYS.contains(&k.as_str()))
+            .cloned()
+            .collect();
+        let changed = self.swap(r);
+        Ok(PatchOutcome {
+            changed,
+            restart_required,
+            overridden_by_env,
+        })
+    }
+
+    /// Poll `config.toml` every `every` until `stop` is set.
+    pub fn spawn_watcher(
+        self: &Arc<Self>,
+        every: Duration,
+        stop: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
+        let me = self.clone();
+        std::thread::Builder::new()
+            .name("alice-config".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some(changed) = me.reload_if_changed() {
+                        tracing::info!(?changed, "settings reloaded from config.toml");
+                    }
+                    let until = std::time::Instant::now() + every;
+                    while std::time::Instant::now() < until && !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(every.min(Duration::from_millis(50)));
+                    }
+                }
+            })
+            .expect("spawn config watcher")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alice_core::settings::JudgeProvider;
+
+    fn home() -> (tempfile::TempDir, AliceHome) {
+        let d = tempfile::tempdir().unwrap();
+        let h = AliceHome::new(d.path().to_path_buf());
+        h.ensure_dirs().unwrap();
+        (d, h)
+    }
+
+    fn one(key: &str, value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(key.into(), value);
+        m
+    }
+
+    #[test]
+    fn an_invalid_file_at_start_means_defaults_and_a_visible_error() {
+        let (_d, h) = home();
+        std::fs::write(h.config_file(), "[judge]\nreview_threshold = 2\n").unwrap();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert_eq!(s.get().judge.review_threshold, 0.5);
+        assert!(s.errors().iter().any(|e| e.key == "judge.review_threshold"));
+    }
+
+    #[test]
+    fn load_effective_reads_the_file_and_the_environment_like_the_daemon() {
+        let (_d, h) = home();
+        std::fs::write(
+            h.config_file(),
+            "[privacy]\ncloud_denied_projects = [\"p\"]\n",
+        )
+        .unwrap();
+        let e = effective(
+            &h.config_file(),
+            &[
+                ("ALICE_JUDGE_REVIEW_THRESHOLD".into(), "0.7".into()),
+                ("ALICE_NOPE".into(), "1".into()),
+            ],
+        );
+        assert!(e.errors.is_empty(), "{:?}", e.errors);
+        assert_eq!(e.resolved.settings.privacy.cloud_denied_projects, vec!["p"]);
+        assert_eq!(e.resolved.settings.judge.review_threshold, 0.7);
+        assert_eq!(e.resolved.warnings.len(), 1);
+        std::fs::write(h.config_file(), "[judge\n").unwrap();
+        let e = effective(
+            &h.config_file(),
+            &[("ALICE_JUDGE_REVIEW_THRESHOLD".into(), "0.7".into())],
+        );
+        assert_eq!(e.errors[0].key, "config.toml");
+        assert_eq!(
+            e.resolved.settings.judge.review_threshold, 0.7,
+            "a broken file keeps the valid environment"
+        );
+        let s = SettingsHandle::load_with_env(&h, vec![("ALICE_NOPE".into(), "1".into())]);
+        assert_eq!(
+            s.warnings().len(),
+            1,
+            "the handle reports ignored variables too"
+        );
+    }
+
+    #[test]
+    fn patch_validates_writes_the_file_and_notifies() {
+        let (_d, h) = home();
+        std::fs::write(h.config_file(), "# keep me\n").unwrap();
+        let s = SettingsHandle::load_with_env(
+            &h,
+            vec![("ALICE_SEARCH_RELEVANCE_FLOOR".into(), "0.8".into())],
+        );
+        let mut rx = s.subscribe();
+        let mut m = serde_json::Map::new();
+        m.insert("judge.review_threshold".into(), serde_json::json!(0.6));
+        m.insert("search.relevance_floor".into(), serde_json::json!(0.9));
+        m.insert("server.port".into(), serde_json::json!(4545));
+        let out = s.patch(&m).unwrap();
+        assert_eq!(s.get().judge.review_threshold, 0.6);
+        assert_eq!(
+            s.get().search.relevance_floor,
+            0.8,
+            "the environment still wins"
+        );
+        assert_eq!(
+            out.overridden_by_env,
+            vec!["search.relevance_floor".to_string()]
+        );
+        assert_eq!(out.restart_required, vec!["server.port".to_string()]);
+        let text = std::fs::read_to_string(h.config_file()).unwrap();
+        assert!(
+            text.contains("# keep me") && text.contains("review_threshold = 0.6"),
+            "{text}"
+        );
+        assert!(
+            rx.try_recv()
+                .unwrap()
+                .contains(&"judge.review_threshold".to_string())
+        );
+        assert!(
+            s.reload_if_changed().is_none(),
+            "its own write is not a change on disk"
+        );
+
+        let errs = s
+            .patch(&one("judge.auto_apply_threshold", serde_json::json!(0.1)))
+            .unwrap_err();
+        assert_eq!(errs[0].key, "judge.review_threshold");
+        assert_eq!(
+            std::fs::read_to_string(h.config_file()).unwrap(),
+            text,
+            "file untouched"
+        );
+        assert!(
+            s.patch(&one("storage.data_dir", serde_json::json!("/tmp")))
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err(), "a refused patch notifies nobody");
+    }
+
+    #[test]
+    fn an_empty_patch_writes_nothing() {
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        let out = s.patch(&serde_json::Map::new()).unwrap();
+        assert!(out.changed.is_empty() && out.restart_required.is_empty());
+        assert!(!h.config_file().exists());
+    }
+
+    #[test]
+    fn file_edits_apply_and_a_half_written_file_keeps_the_last_good_settings() {
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        std::fs::write(h.config_file(), "[judge]\nprovider = \"jev\"\n").unwrap();
+        bump_mtime(&h.config_file());
+        assert_eq!(
+            s.reload_if_changed().unwrap(),
+            vec!["judge.provider".to_string()]
+        );
+        assert_eq!(s.get().judge.provider, JudgeProvider::Jev);
+        std::fs::write(h.config_file(), "[judge]\nprovider = \"je").unwrap();
+        bump_mtime(&h.config_file());
+        assert!(s.reload_if_changed().is_none());
+        assert_eq!(
+            s.get().judge.provider,
+            JudgeProvider::Jev,
+            "last good settings stay"
+        );
+        assert!(s.errors().iter().any(|e| e.key == "config.toml"));
+        // Fixed: the error goes away.
+        std::fs::write(h.config_file(), "[judge]\nprovider = \"jev\"\n").unwrap();
+        bump_mtime(&h.config_file());
+        assert_eq!(s.reload_if_changed(), Some(vec![]));
+        assert!(s.errors().is_empty(), "{:?}", s.errors());
+    }
+
+    /// Same length, same modification time (coarse clocks, fast editors): still a change.
+    #[test]
+    fn an_edit_that_keeps_the_size_and_the_time_is_still_seen() {
+        let (_d, h) = home();
+        std::fs::write(h.config_file(), "[judge]\nreview_threshold = 0.6\n").unwrap();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        let before = std::fs::metadata(h.config_file())
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::write(h.config_file(), "[judge]\nreview_threshold = 0.7\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(h.config_file())
+            .unwrap()
+            .set_modified(before)
+            .unwrap();
+        assert_eq!(
+            s.reload_if_changed(),
+            Some(vec!["judge.review_threshold".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_read_counts_only_when_the_file_holds_still() {
+        let reads = |seq: &[&str]| {
+            let mut it = seq
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .into_iter();
+            settled(move || it.next(), Duration::ZERO)
+        };
+        assert_eq!(
+            reads(&["", "[judge]\nprovider = \"jev\"\n"]),
+            None,
+            "an editor truncated the file and is writing it"
+        );
+        assert_eq!(reads(&["a", "a"]), Some(Some("a".to_string())));
+    }
+
+    #[test]
+    fn a_bad_variable_keeps_the_file_and_later_edits_still_apply() {
+        let (_d, h) = home();
+        std::fs::write(h.config_file(), "[judge]\nreview_threshold = 0.6\n").unwrap();
+        let vars = vec![
+            (
+                "ALICE_SEARCH_RELEVANCE_FLOOR".to_string(),
+                "very".to_string(),
+            ),
+            ("ALICE_JUDGE_TIMEOUT_MS".to_string(), "2000".to_string()),
+        ];
+        let s = SettingsHandle::load_with_env(&h, vars.clone());
+        assert_eq!(
+            s.get().judge.review_threshold,
+            0.6,
+            "the file still applies"
+        );
+        assert_eq!(
+            s.get().judge.timeout_ms,
+            2000,
+            "and so do the valid variables"
+        );
+        assert_eq!(s.get().search.relevance_floor, 0.82);
+        let errs = s.errors();
+        assert!(
+            errs.iter().any(|e| e.key == "search.relevance_floor"
+                && e.message.contains("ALICE_SEARCH_RELEVANCE_FLOOR")),
+            "{errs:?}"
+        );
+        // Edits still apply, and the variable's error stays in view.
+        std::fs::write(h.config_file(), "[judge]\nreview_threshold = 0.7\n").unwrap();
+        bump_mtime(&h.config_file());
+        assert!(s.reload_if_changed().is_some());
+        assert_eq!(s.get().judge.review_threshold, 0.7);
+        s.patch(&one("judge.auto_apply_threshold", serde_json::json!(0.9)))
+            .unwrap();
+        assert_eq!(s.get().judge.auto_apply_threshold, 0.9);
+        assert!(s.errors().iter().any(|e| e.key == "search.relevance_floor"));
+        // The rule outside the daemon is the same.
+        let e = effective(&h.config_file(), &vars);
+        assert_eq!(e.resolved.settings.judge.review_threshold, 0.7);
+        assert_eq!(e.resolved.settings.judge.timeout_ms, 2000);
+        assert_eq!(e.errors.len(), 1, "{:?}", e.errors);
+    }
+
+    #[test]
+    fn variables_that_conflict_with_each_other_are_set_aside_together() {
+        let (_d, h) = home();
+        std::fs::write(h.config_file(), "[mcp]\nadmin_tools = true\n").unwrap();
+        // Each is valid alone; together the review threshold is above the auto threshold.
+        let e = effective(
+            &h.config_file(),
+            &[
+                ("ALICE_JUDGE_AUTO_APPLY_THRESHOLD".into(), "0.6".into()),
+                ("ALICE_JUDGE_REVIEW_THRESHOLD".into(), "0.7".into()),
+            ],
+        );
+        assert!(
+            e.resolved.settings.mcp.admin_tools,
+            "the file still applies"
+        );
+        assert_eq!(e.resolved.settings.judge.review_threshold, 0.5);
+        assert!(
+            e.errors.iter().any(|x| x.key == "judge.review_threshold"),
+            "{:?}",
+            e.errors
+        );
+    }
+
+    #[test]
+    fn secret_variables_are_neither_kept_nor_shown() {
+        let key = concat!("sk-", "proj-SECRETSECRET1234");
+        let (_d, h) = home();
+        let vars = vec![
+            ("ALICE_EMBEDDING_API_KEY".to_string(), key.to_string()),
+            ("ALICE_JUDGE_JEV_API_KEY".to_string(), key.to_string()),
+            ("TYPESAFE_API_KEY".to_string(), key.to_string()),
+            (
+                "ALICE_JUDGE_REVIEW_THRESHOLD".to_string(),
+                "0.6".to_string(),
+            ),
+        ];
+        let layer = EnvLayer::new(&vars);
+        assert!(
+            layer
+                .vars
+                .iter()
+                .all(|(k, v)| !v.contains("SECRET") && k.starts_with("ALICE_")),
+            "only setting values are kept: {:?}",
+            layer.vars.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+        let s = SettingsHandle::load_with_env(&h, vars);
+        assert_eq!(s.get().judge.review_threshold, 0.6);
+        assert_eq!(s.warnings().len(), 1, "the misplaced key is named");
+        let shown = format!(
+            "{s:?} {:?} {:?} {:?}",
+            s.resolved(),
+            s.errors(),
+            s.warnings()
+        );
+        assert!(!shown.contains("SECRETSECRET"), "{shown}");
+    }
+
+    #[test]
+    fn an_unreadable_config_is_an_error_not_the_defaults() {
+        let (_d, h) = home();
+        std::fs::write(h.config_file(), [b'[', 0xff, 0xfe, b']']).unwrap();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert!(
+            s.errors()
+                .iter()
+                .any(|e| e.key == "config.toml" && e.message.contains("UTF-8")),
+            "{:?}",
+            s.errors()
+        );
+        assert!(
+            s.patch(&one("mcp.admin_tools", serde_json::json!(true)))
+                .is_err(),
+            "a file that cannot be read is not overwritten"
+        );
+        std::fs::remove_file(h.config_file()).unwrap();
+        std::fs::create_dir(h.config_file()).unwrap();
+        let e = effective(&h.config_file(), &[]);
+        assert_eq!(e.errors[0].key, "config.toml", "{:?}", e.errors);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_writes_through_a_symlink_and_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (d, h) = home();
+        let real = d.path().join("dotfiles-alice.toml");
+        std::fs::write(&real, "# linked\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&real, h.config_file()).unwrap();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        s.patch(&one("mcp.admin_tools", serde_json::json!(true)))
+            .unwrap();
+        assert!(
+            std::fs::symlink_metadata(h.config_file())
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link stays a link"
+        );
+        let text = std::fs::read_to_string(&real).unwrap();
+        assert!(
+            text.contains("# linked") && text.contains("admin_tools = true"),
+            "{text}"
+        );
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+        assert!(s.reload_if_changed().is_none());
+        assert!(s.get().mcp.admin_tools);
+    }
+
+    #[test]
+    fn the_watcher_picks_up_an_edit() {
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let t = s.spawn_watcher(Duration::from_millis(50), stop.clone());
+        std::fs::write(h.config_file(), "[mcp]\nadmin_tools = true\n").unwrap();
+        bump_mtime(&h.config_file());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !s.get().mcp.admin_tools {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher did not reload"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, Ordering::SeqCst);
+        t.join().unwrap();
+    }
+
+    /// Some file systems keep 1 s mtimes: make each write look new.
+    fn bump_mtime(p: &std::path::Path) {
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        let t = std::time::SystemTime::now() + Duration::from_secs(rand_secs());
+        f.set_modified(t).unwrap();
+    }
+
+    fn rand_secs() -> u64 {
+        use std::sync::atomic::AtomicU64;
+        static N: AtomicU64 = AtomicU64::new(1);
+        N.fetch_add(1, Ordering::SeqCst)
+    }
+}
