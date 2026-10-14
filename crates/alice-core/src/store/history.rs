@@ -1191,6 +1191,17 @@ mod tests {
             err.contains("github_token") && !err.contains(token),
             "{err}"
         );
+        // Worded as a refused restore: field and detector named, no advice for a new write.
+        assert!(
+            err.contains("cannot undo")
+                && err.contains("privacy rules")
+                && err.contains("earlier title"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("send again") && !err.contains("remove it"),
+            "{err}"
+        );
         assert_eq!(t.body(&id), "deploy by hand");
         // Redact mode: restored with the token replaced, and the undo's own events carry no token.
         t.undo(&ev).unwrap();
@@ -1260,6 +1271,10 @@ mod tests {
         let err = t.undo_with(&a, block).unwrap_err().to_string();
         assert!(
             err.contains("github_token") && !err.contains(token),
+            "{err}"
+        );
+        assert!(
+            err.contains("cannot undo") && err.contains("object") && !err.contains("send again"),
             "{err}"
         );
         t.undo(&b).unwrap();

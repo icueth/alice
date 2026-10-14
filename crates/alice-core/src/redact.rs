@@ -97,23 +97,46 @@ const ACCESSOR_PREFIXES: &[&str] = &[
     "compute_",
 ];
 
-/// A value that is code and not a secret: a call or an index, a dotted attribute access
-/// (`config.secret_value`, `process.env.X`), or a call to an accessor by name. A plain
-/// `snake_case` word is not evidence of code: passphrases look like that, so redaction errs
-/// toward redacting it.
-fn code_like(v: &str) -> bool {
-    let attribute = v.contains('.')
-        && v.split('.').all(|p| {
-            p.chars()
-                .next()
-                .is_some_and(|c| c.is_alphabetic() || c == '_')
-                && p.chars().all(|c| c.is_alphanumeric() || c == '_')
-        });
-    v.contains(['(', '[']) || attribute || ACCESSOR_PREFIXES.iter().any(|a| v.starts_with(a))
+/// A plain identifier of at most 32 characters that does not look like (part of) a token: not
+/// 16 or more characters mixing letter cases or letters and digits, and not high-entropy.
+fn plain_identifier(p: &str) -> bool {
+    let starts = p
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let ident = starts && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ident || p.len() > 32 {
+        return false;
+    }
+    let lower = p.chars().any(|c| c.is_ascii_lowercase());
+    let upper = p.chars().any(|c| c.is_ascii_uppercase());
+    let digit = p.chars().any(|c| c.is_ascii_digit());
+    let tokenish = p.len() >= 16 && ((lower && upper) || (digit && (lower || upper)));
+    !tokenish && entropy(p) < HIGH_ENTROPY
 }
 
-/// A path segment that reads as a word: path characters only, and no run of case changes
-/// (`4AAQSkZJRgAB` is base64, `Users`, `AI` and `project-alice` are not).
+/// A dotted attribute access (`config.secret_value`, `process.env.X`): every segment a plain
+/// identifier, and not one segment repeated three or more times (`hunter2.hunter2.hunter2`).
+/// Dotted provider tokens (`SG.xxxx.yyyy`, `hvs.xxxx`) have a token-like segment and fail this.
+fn attribute_access(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() > 1
+        && parts.iter().all(|p| plain_identifier(p))
+        && !(parts.len() >= 3 && parts.iter().all(|p| *p == parts[0]))
+}
+
+/// A value that is code and not a secret: a call or an index, a dotted attribute access, or a
+/// call to an accessor by name. A plain `snake_case` word is not evidence of code: passphrases
+/// look like that, so redaction errs toward redacting it.
+fn code_like(v: &str) -> bool {
+    v.contains(['(', '['])
+        || attribute_access(v)
+        || ACCESSOR_PREFIXES.iter().any(|a| v.starts_with(a))
+}
+
+/// A path segment that reads as a word: path characters only, and not base64-shaped. CamelCase
+/// (`MyCoolProject`) is a word; a segment with digits among several case changes
+/// (`4AAQSkZJRgAB`) is not, and neither is one with very many case changes.
 fn path_word(seg: &str) -> bool {
     let ok = seg
         .chars()
@@ -123,7 +146,8 @@ fn path_word(seg: &str) -> bool {
         .windows(2)
         .filter(|w| w[0].is_lowercase() && w[1].is_uppercase())
         .count();
-    ok && rises < 2
+    let digits = chars.iter().any(|c| c.is_ascii_digit());
+    ok && if digits { rises < 2 } else { rises <= 4 }
 }
 
 /// A file path rather than a secret: it starts with `/`, `~/`, `./` or `../`, has at least two
@@ -238,6 +262,18 @@ fn builtin_detectors() -> Vec<Detector> {
             any,
         ),
         d(
+            "sendgrid_key",
+            r"(?-u:\b)SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}",
+            0,
+            any,
+        ),
+        d(
+            "vault_token",
+            r"(?-u:\b)hv[sbr]\.[A-Za-z0-9_-]{20,}",
+            0,
+            any,
+        ),
+        d(
             "anthropic_key",
             r"(?-u:\b)sk-ant-[A-Za-z0-9_\-]{20,}",
             0,
@@ -263,7 +299,7 @@ fn builtin_detectors() -> Vec<Detector> {
         ),
         d(
             "password_assignment",
-            r#"(?i)(?:^|[\s"'])--(?:password|passwd|token|secret|api-key|client-secret)(?:\s+|=)["']?([^\s"',;]{6,})"#,
+            r#"(?i)(?:^|[\s"'`(\[,])--(?:password|passwd|token|secret|api-key|client-secret)["']?(?:\s*,\s*|\s+|=)["']?([^\s"',;)\]`]{6,})"#,
             1,
             flag_value,
         ),
@@ -539,6 +575,123 @@ mod tests {
             "password_assignment",
             "abc12345",
         ),
+        ("password = hunter_two", "password_assignment", "hunter_two"),
+        (
+            "password = correct_horse_battery_staple",
+            "password_assignment",
+            "correct_horse_battery_staple",
+        ),
+        (
+            "password = my_pass1_ok",
+            "password_assignment",
+            "my_pass1_ok",
+        ),
+        ("API_KEY=prod_key_v2", "password_assignment", "prod_key_v2"),
+        (
+            "password = my_password_field_name_v2",
+            "password_assignment",
+            "my_password_field_name_v2",
+        ),
+        ("password = ~hunter22", "password_assignment", "~hunter22"),
+        (
+            "password = /Zm9vYmFyYmF6cXV4MTIzNDU2",
+            "password_assignment",
+            "/Zm9vYmFyYmF6cXV4MTIzNDU2",
+        ),
+        (
+            "SECRET_KEY=/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAAB",
+            "high_entropy",
+            "4AAQSkZJRgABAQEASABIAAD",
+        ),
+        (
+            "เชื่อมpostgres://admin:s3cr3tPass@db:5432/app",
+            "url_credentials",
+            "s3cr3tPass",
+        ),
+        (
+            "ใช้aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "aws_secret_key",
+            "wJalrXUtnFEMI/K7MDENG",
+        ),
+        (
+            "bash run.sh --password hunter2xyz",
+            "password_assignment",
+            "hunter2xyz",
+        ),
+        (
+            "curl --token=abc123def456ghi",
+            "password_assignment",
+            "abc123def456ghi",
+        ),
+        (
+            "x --client-secret Zm9vYmFyYmF6",
+            "password_assignment",
+            "Zm9vYmFyYmF6",
+        ),
+        ("password = ./hunter22", "password_assignment", "./hunter22"),
+        (
+            "{\"password\": \"hunter_two\"}",
+            "password_assignment",
+            "hunter_two",
+        ),
+        (
+            "\"api_key\": \"prod_key_v2\"",
+            "password_assignment",
+            "prod_key_v2",
+        ),
+        (
+            "password = /9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAK",
+            "password_assignment",
+            "4AAQSkZJRgABAQEASABIAAD",
+        ),
+        (
+            "deploy --api-key abc123def456",
+            "password_assignment",
+            "abc123def456",
+        ),
+        (
+            "`--password hunter2xyz`",
+            "password_assignment",
+            "hunter2xyz",
+        ),
+        (
+            "(--password hunter2xyz)",
+            "password_assignment",
+            "hunter2xyz",
+        ),
+        (
+            "[\"--password\", \"hunter2xyz\"]",
+            "password_assignment",
+            "hunter2xyz",
+        ),
+        (
+            concat!("mail SG", ".abcdefghijklmnop1234.ABCDEFGHIJKLMNOP5678-_x"),
+            "sendgrid_key",
+            "abcdefghijklmnop1234",
+        ),
+        (
+            concat!("login hv", "s.CAESIJabcdefghijklmnopqrstuvwxyz0123"),
+            "vault_token",
+            "CAESIJabcdefghijklmnopqrstuvwxyz0123",
+        ),
+        (
+            "auth_token = hunter2.hunter2.hunter2",
+            "password_assignment",
+            "hunter2.hunter2.hunter2",
+        ),
+        (
+            concat!(
+                "TFE_TOKEN=abcdefghijklmn.atlas",
+                "v1.Zm9vYmFyYmF6cXV4MTIzNDU2Zm9vYmFyYmF6cXV4MTIzNDU2"
+            ),
+            "password_assignment",
+            "Zm9vYmFyYmF6cXV4MTIzNDU2",
+        ),
+        (
+            "DOPPLER_TOKEN=dp.st.prod.Zm9vYmFyYmF6cXV4MTIzNDU2Zm9vYmFy",
+            "password_assignment",
+            "Zm9vYmFyYmF6cXV4MTIzNDU2",
+        ),
         (
             "DB_PASSWORD=hunter2hunter2",
             "password_assignment",
@@ -611,6 +764,10 @@ mod tests {
         "password = /Users/me/project",
         "secret = ~/.ssh/config",
         "token = ./build/out",
+        "PWD=/Users/icue/Code/MyCoolProject",
+        "token = self.token",
+        "secret = process.env.SECRET_KEY",
+        "api_key = os.environ",
         "run --password-file ./secrets/pw --token-file ~/.t",
     ];
 
