@@ -573,7 +573,19 @@ pub fn bench(user_home: AliceHome, args: BenchArgs, json: bool) -> Result<()> {
     report.embed_per_sec = embed_throughput(probe.as_ref(), &mut corpus)?;
     drop(probe);
 
-    let svc = Service::start(home.clone(), &make, ServiceOptions::process_env())?;
+    // Maintenance (backups, checks) would start whenever the bench waits for the embedding
+    // queue and spoil what it measures: it is off here, as in the daemon below.
+    let mut env = alice_daemon::config::process_env();
+    env.retain(|(k, _)| k != "ALICE_MAINTENANCE_ENABLED");
+    env.push(("ALICE_MAINTENANCE_ENABLED".into(), "false".into()));
+    let svc = Service::start(
+        home.clone(),
+        &make,
+        ServiceOptions {
+            settings_env: Some(env),
+            ..ServiceOptions::process_env()
+        },
+    )?;
     rt.block_on(load(&svc, &args, &mut corpus, &mut report))?;
     eprintln!("bench: measuring latency");
     report.latency = rt.block_on(latency(&svc, args.samples, &mut corpus))?;
@@ -955,6 +967,7 @@ fn daemon_run(
     cmd.args(["daemon", "run"])
         .env("ALICE_HOME", home.root())
         .env("ALICE_LOG", "info")
+        .env("ALICE_MAINTENANCE_ENABLED", "false")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));

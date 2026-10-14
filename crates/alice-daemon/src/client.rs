@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// How long a maintenance job or a backup requested by hand may take.
+const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(3 * 3_600);
 /// A daemon that does not answer the ping this fast counts as absent.
 const PING_TIMEOUT: Duration = Duration::from_millis(300);
 /// How long a write waits for a starting daemon before it is spooled.
@@ -557,6 +559,35 @@ impl DaemonClient {
     }
     pub async fn stats(&self) -> Result<Stats> {
         self.get_json("/api/v1/stats").await
+    }
+    /// Backups in the backup directory, newest first.
+    pub async fn backups(&self) -> Result<Vec<crate::backup::BackupInfo>> {
+        self.get_json("/api/v1/backups").await
+    }
+    /// Copy the database into the backup directory now (a copy of a large database takes minutes).
+    pub async fn backup_now(&self) -> Result<crate::backup::BackupInfo> {
+        self.call(
+            "/api/v1/backups",
+            &serde_json::json!({}),
+            MAINTENANCE_TIMEOUT,
+        )
+        .await
+    }
+    /// When each maintenance job last ran.
+    pub async fn maintenance_status(&self) -> Result<Vec<JobStatus>> {
+        self.get_json("/api/v1/maintenance").await
+    }
+    /// Run one maintenance job now, to its end (a job on a large database takes minutes).
+    pub async fn run_job(
+        &self,
+        job: crate::maintenance::Job,
+    ) -> Result<crate::maintenance::JobReport> {
+        self.call(
+            "/api/v1/maintenance/run",
+            &serde_json::json!({ "job": job.name() }),
+            MAINTENANCE_TIMEOUT,
+        )
+        .await
     }
     /// Every setting with its source, the problems, the secrets' status (never a value).
     pub async fn settings(&self) -> Result<SettingsView> {

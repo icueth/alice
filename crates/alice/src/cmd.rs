@@ -190,6 +190,23 @@ pub enum ReviewCmd {
 }
 
 #[derive(Subcommand)]
+pub enum BackupCmd {
+    /// Copy the database into the backup directory now.
+    Now,
+    /// The backups there, newest first.
+    List,
+}
+
+#[derive(Subcommand)]
+pub enum MaintenanceCmd {
+    /// When each job last ran.
+    Status,
+    /// Run one job now, to its end: backup, quick_check, index_check, fts_optimize,
+    /// raw_retention, trash_purge, judge_retry, merge_suggestions or events_prune.
+    Run { job: String },
+}
+
+#[derive(Subcommand)]
 pub enum DaemonCmd {
     /// Run in the foreground.
     Run,
@@ -612,6 +629,8 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
             let r = client(&home).await?.stats().await?;
             print(json, &r, || stats_text(&r))
         }
+        Command::Backup(c) => backup(&home, c, json).await,
+        Command::Maintenance(c) => maintenance(&home, c, json).await,
         Command::Projects => {
             let r = client(&home).await?.projects().await?;
             print(json, &r, || {
@@ -768,6 +787,86 @@ async fn review(home: &AliceHome, c: Option<ReviewCmd>, json: bool) -> Result<()
                 .await?;
             print(json, &r, || format!("{}\n", r.message))
         }
+    }
+}
+
+fn backup_line(b: &alice_daemon::backup::BackupInfo) -> String {
+    format!(
+        "{}  {}  {} bytes  {}\n",
+        b.created_at.format("%Y-%m-%d %H:%M:%S"),
+        b.kind.as_str(),
+        b.bytes,
+        b.path.display()
+    )
+}
+
+async fn backup(home: &AliceHome, c: BackupCmd, json: bool) -> Result<()> {
+    match c {
+        BackupCmd::Now => {
+            let b = client(home).await?.backup_now().await?;
+            print(json, &b, || format!("Backed up to {}\n", b.path.display()))
+        }
+        BackupCmd::List => {
+            let list = client(home).await?.backups().await?;
+            print(json, &list, || {
+                if list.is_empty() {
+                    "No backups yet; \"alice backup now\" makes one.\n".to_string()
+                } else {
+                    list.iter().map(backup_line).collect()
+                }
+            })
+        }
+    }
+}
+
+async fn maintenance(home: &AliceHome, c: MaintenanceCmd, json: bool) -> Result<()> {
+    use alice_daemon::maintenance::Job;
+    match c {
+        MaintenanceCmd::Status => {
+            let jobs = client(home).await?.maintenance_status().await?;
+            print(json, &jobs, || {
+                jobs.iter()
+                    .map(|j| {
+                        let mut line = format!(
+                            "{:<18} every {:<8} last run {}",
+                            j.job,
+                            every_text(j.every_secs),
+                            j.last_run.as_deref().unwrap_or("never")
+                        );
+                        if let Some(e) = &j.last_error {
+                            line.push_str(&format!("  last error: {e}"));
+                        }
+                        line.push('\n');
+                        line
+                    })
+                    .collect()
+            })
+        }
+        MaintenanceCmd::Run { job } => {
+            // Checked here too, so a typo is answered before a daemon is started for it.
+            let job = Job::parse_or_err(&job)?;
+            let r = client(home).await?.run_job(job).await?;
+            print(json, &r, || {
+                let outcome = match r.outcome {
+                    alice_daemon::maintenance::JobOutcome::Done => "done",
+                    alice_daemon::maintenance::JobOutcome::Paused => "paused",
+                    alice_daemon::maintenance::JobOutcome::Failed => "failed",
+                };
+                format!("{outcome}: {} ({} ms)\n", r.detail, r.took_ms)
+            })?;
+            if r.outcome == alice_daemon::maintenance::JobOutcome::Failed {
+                bail!("{} failed: {}", r.job.name(), r.detail);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn every_text(secs: u64) -> String {
+    match secs {
+        s if s % 86_400 == 0 => format!("{}d", s / 86_400),
+        s if s % 3_600 == 0 => format!("{}h", s / 3_600),
+        s => format!("{s}s"),
     }
 }
 

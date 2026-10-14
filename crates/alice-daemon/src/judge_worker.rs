@@ -67,7 +67,7 @@ const SEARCH_DEPTH: usize = 100;
 /// Memories judged per look at the queue.
 const BATCH: usize = 8;
 /// Times a memory is judged in all (the first and the retries after a failure).
-const MAX_ATTEMPTS: u32 = 5;
+pub(crate) const MAX_ATTEMPTS: u32 = 5;
 /// Projects offered to the router, newest first.
 const ROUTE_PROJECTS: usize = 50;
 /// Recent titles that describe a project to the router.

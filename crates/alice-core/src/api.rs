@@ -318,6 +318,21 @@ pub struct Stats {
     pub cost_7d_usd: f64,
 }
 
+/// When a maintenance job last ran (`alice maintenance status`). Times are RFC 3339 UTC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct JobStatus {
+    /// `backup`, `trash_purge`, ...
+    pub job: String,
+    /// How often the job is due, in seconds.
+    pub every_secs: u64,
+    /// The last time the job ran to its end or failed (a run a request interrupted does not count).
+    pub last_run: Option<String>,
+    /// The last time it finished without an error.
+    pub last_ok: Option<String>,
+    /// The last failure: its time, then what went wrong.
+    pub last_error: Option<String>,
+}
+
 /// What `/api/v1/events/stream` pushes (one JSON object per SSE message).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]

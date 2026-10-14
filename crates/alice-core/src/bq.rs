@@ -204,6 +204,21 @@ impl BinaryIndex {
         self.mean.is_none()
     }
 
+    /// Whether the vector of `seq` is held.
+    pub fn contains(&self, seq: i64) -> bool {
+        self.keys.binary_search(&seq).is_ok()
+            || self.boot.binary_search_by_key(&seq, |(s, _)| *s).is_ok()
+    }
+
+    /// Every seq held, ascending.
+    pub fn seqs(&self) -> Vec<i64> {
+        if self.mean.is_none() {
+            self.boot.iter().map(|(s, _)| *s).collect()
+        } else {
+            self.keys.clone()
+        }
+    }
+
     /// Insert or replace the vector of `seq`.
     pub fn upsert(&mut self, seq: i64, v: &[f32]) -> Result<()> {
         if v.len() != self.dim {

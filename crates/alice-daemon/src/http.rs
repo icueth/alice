@@ -381,6 +381,30 @@ async fn stats(State(st): State<AppState>) -> ApiResult<Stats> {
     Ok(Json(st.svc.stats().await?))
 }
 
+async fn list_backups(State(st): State<AppState>) -> ApiResult<Vec<crate::backup::BackupInfo>> {
+    Ok(Json(st.svc.backups().await?))
+}
+async fn make_backup(State(st): State<AppState>) -> ApiResult<crate::backup::BackupInfo> {
+    Ok(Json(st.svc.backup_now().await?))
+}
+async fn maintenance_status(State(st): State<AppState>) -> ApiResult<Vec<JobStatus>> {
+    Ok(Json(st.svc.maintenance_status().await?))
+}
+
+/// The body of `POST /api/v1/maintenance/run`.
+#[derive(serde::Deserialize)]
+struct RunJobBody {
+    job: String,
+}
+
+async fn run_maintenance(
+    State(st): State<AppState>,
+    ApiJson(body): ApiJson<RunJobBody>,
+) -> ApiResult<crate::maintenance::JobReport> {
+    let job = crate::maintenance::Job::parse_or_err(&body.job)?;
+    Ok(Json(st.svc.run_job(job).await?))
+}
+
 /// A refused settings change: the first problem as `error` (like every refusal), and all of
 /// them as `errors`, each with the key it is about.
 #[derive(Serialize)]
@@ -591,6 +615,9 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/reviews/{id}/resolve", post(resolve_review))
         .route("/api/v1/memories/merge", post(merge))
         .route("/api/v1/stats", get(stats))
+        .route("/api/v1/backups", get(list_backups).post(make_backup))
+        .route("/api/v1/maintenance", get(maintenance_status))
+        .route("/api/v1/maintenance/run", post(run_maintenance))
         .route("/api/v1/events/stream", get(stream))
         .route("/api/v1/settings", get(get_settings).patch(patch_settings))
         .route("/api/v1/settings/schema", get(settings_schema))

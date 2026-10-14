@@ -6,6 +6,7 @@ pub mod fts;
 pub mod history;
 pub mod judge;
 pub mod kg;
+pub mod maintenance;
 pub mod memories;
 pub mod migrations;
 pub mod projects;
@@ -104,12 +105,40 @@ fn open_reader_with_cache(path: &Path, cache_kib: i64) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Consistent snapshot of a live database.
+/// Consistent snapshot of a live database. The copy is private to its owner (0600 on Unix): it
+/// holds every memory.
 pub fn backup_into(conn: &Connection, dest: &Path) -> Result<()> {
     if dest.exists() {
         std::fs::remove_file(dest)?;
     }
     conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])?;
+    make_private(dest)?;
+    Ok(())
+}
+
+/// Create `dir` and any missing parents. What is created here is private to its owner (0700 on
+/// Unix); a directory that exists already keeps its mode.
+pub fn create_private_dir(dir: &Path) -> Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)?;
+    Ok(())
+}
+
+/// Make `path` readable and writable by its owner only (0600 on Unix; Windows has no mode bits).
+pub fn make_private(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -393,15 +422,17 @@ mod tests {
         assert_eq!(missing.state.lock().open, 0);
     }
 
+    /// Pre-migration backups live in `<dir>/backups/`, named `alice-pre-migration-v<from>-<stamp>.db`.
     fn pre_migration_backups(dir: &Path) -> Vec<PathBuf> {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
+        let Ok(rd) = std::fs::read_dir(dir.join("backups")) else {
+            return Vec::new();
+        };
+        rd.map(|e| e.unwrap().path())
             .filter(|p| {
                 p.file_name()
                     .unwrap()
                     .to_string_lossy()
-                    .starts_with("alice.pre-migration-")
+                    .starts_with("alice-pre-migration-")
             })
             .collect()
     }
@@ -476,17 +507,19 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert!(cols.contains(&"group_id".to_string()));
-        let backups = std::fs::read_dir(d.path())
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("pre-migration")
-            })
-            .count();
-        assert_eq!(backups, 1, "a backup was taken before migrating");
+        let backups = pre_migration_backups(d.path());
+        assert_eq!(backups.len(), 1, "a backup was taken before migrating");
+        let name = backups[0].file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("alice-pre-migration-v1-"), "{name}");
+        assert!(name.ends_with(".db"), "{name}");
+        // It holds every memory: private to its owner, in a private directory.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&backups[0]), 0o600);
+            assert_eq!(mode(&d.path().join("backups")), 0o700);
+        }
     }
 
     /// An M1 database with data keeps every row through migration 2, gains the new columns

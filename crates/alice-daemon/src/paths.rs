@@ -85,7 +85,10 @@ impl AliceHome {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
+            // Backups hold every memory: private even in a home an older build created.
+            for dir in [&self.root, &self.backups_dir()] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
         }
         Ok(())
     }

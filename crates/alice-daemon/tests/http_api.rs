@@ -1159,12 +1159,16 @@ async fn the_provider_test_and_secret_errors_speak_plainly() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_settings_routes_are_guarded() {
     let s = Srv::start_with(quiet()).await;
-    let routes: [(reqwest::Method, &str); 12] = [
+    let routes: [(reqwest::Method, &str); 16] = [
         (reqwest::Method::GET, "/api/v1/reviews"),
         (reqwest::Method::GET, "/api/v1/reviews/X"),
         (reqwest::Method::POST, "/api/v1/reviews/X/resolve"),
         (reqwest::Method::POST, "/api/v1/memories/merge"),
         (reqwest::Method::GET, "/api/v1/stats"),
+        (reqwest::Method::GET, "/api/v1/backups"),
+        (reqwest::Method::POST, "/api/v1/backups"),
+        (reqwest::Method::GET, "/api/v1/maintenance"),
+        (reqwest::Method::POST, "/api/v1/maintenance/run"),
         (reqwest::Method::GET, "/api/v1/settings"),
         (reqwest::Method::PATCH, "/api/v1/settings"),
         (reqwest::Method::GET, "/api/v1/settings/schema"),
@@ -1289,6 +1293,52 @@ async fn a_refused_secret_is_a_400_that_names_the_detector() {
     assert!(
         body.contains("github_token") && !body.contains(token),
         "{body}"
+    );
+}
+
+/// Task 14: backups and maintenance jobs over HTTP; an unknown job is refused naming the jobs.
+#[tokio::test(flavor = "multi_thread")]
+async fn backups_and_maintenance_jobs_over_http() {
+    use alice_daemon::backup::BackupInfo;
+    use alice_daemon::maintenance::{Job, JobOutcome, JobReport};
+    let s = Srv::start().await;
+    let none: Vec<BackupInfo> = s.get_json("/api/v1/backups").await;
+    assert!(none.is_empty());
+    let made: BackupInfo = s.post_json("/api/v1/backups", &serde_json::json!({})).await;
+    assert!(made.path.exists() && made.bytes > 0);
+    let listed: Vec<BackupInfo> = s.get_json("/api/v1/backups").await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, made.name);
+
+    let status: Vec<JobStatus> = s.get_json("/api/v1/maintenance").await;
+    assert_eq!(
+        status.iter().map(|j| j.job.as_str()).collect::<Vec<_>>(),
+        Job::names()
+    );
+    let report: JobReport = s
+        .post_json(
+            "/api/v1/maintenance/run",
+            &serde_json::json!({"job": "judge_retry"}),
+        )
+        .await;
+    assert_eq!(report.job, Job::JudgeRetry);
+    assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+    let status: Vec<JobStatus> = s.get_json("/api/v1/maintenance").await;
+    let retry = status.iter().find(|j| j.job == "judge_retry").unwrap();
+    assert!(retry.last_run.is_some() && retry.last_ok.is_some());
+
+    let bad = s
+        .post(
+            "/api/v1/maintenance/run",
+            &serde_json::json!({"job": "nope"}),
+        )
+        .await;
+    assert_eq!(bad.status(), 400);
+    let body: serde_json::Value = bad.json().await.unwrap();
+    let message = body["error"].as_str().unwrap();
+    assert!(
+        message.contains("\"nope\"") && message.contains("quick_check"),
+        "{message}"
     );
 }
 

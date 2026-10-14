@@ -52,6 +52,12 @@ enum Command {
     },
     /// Counts, review backlog and judge costs.
     Stats,
+    /// Backups of the database (`now` makes one; `list` shows them).
+    #[command(subcommand)]
+    Backup(cmd::BackupCmd),
+    /// Maintenance jobs: when they last ran, or run one now.
+    #[command(subcommand)]
+    Maintenance(cmd::MaintenanceCmd),
     /// List projects.
     Projects,
     /// Daemon status and counts.

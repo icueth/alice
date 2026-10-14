@@ -16,6 +16,7 @@ use alice_core::store::events::{self, Actor, EventInput};
 use alice_core::store::history::{self, UndoOutcome};
 use alice_core::store::judge as judge_store;
 use alice_core::store::kg::{self, AssertFact, EntityMatcher, FactOutcome};
+use alice_core::store::maintenance;
 use alice_core::store::memories::{
     self, InsertOutcome, MemoryUpdate, NewMemoryInput, UpdateAction,
 };
@@ -177,6 +178,43 @@ pub enum WriteOp {
     /// A paid judge call that was answered: its response goes to the judge cache and its cost
     /// to the day's ledger, in one transaction (a failing job rolls back alone).
     JudgeCall(alice_core::judge::jev::JevCall),
+    /// Remember a value under a `meta` key (maintenance runs, import markers). Nothing else is
+    /// recorded.
+    SetMeta {
+        key: String,
+        value: String,
+    },
+    /// Delete trashed memories for good, with a `memory.purge` event for each (returns their
+    /// seqs; the caller drops their vectors). The history of a purged memory is scrubbed.
+    PurgeMemories {
+        seqs: Vec<i64>,
+    },
+    /// Delete raw chunks (retention), with one `raw.retention` event; the caller drops their
+    /// vectors. Answers `Count` with the chunks deleted.
+    DeleteChunks {
+        seqs: Vec<i64>,
+        reason: String,
+    },
+    /// One bounded FTS merge step; `WriteOutcome::Flag(true)` while there was work.
+    FtsMerge {
+        table: String,
+        pages: i64,
+    },
+    /// Delete up to `limit` events older than `before`; answers `Count`.
+    PruneEvents {
+        before: String,
+        limit: usize,
+    },
+    /// Delete up to `limit` judge-cache entries older than `before` or beyond the `keep` newest;
+    /// answers `Count`.
+    PruneJudgeCache {
+        before: String,
+        keep: usize,
+        limit: usize,
+    },
+    /// Add a review item (the weekly merge suggestions); announced on the stream. Answers
+    /// `Count` of 1, or 0 when an open item asks the same question already.
+    CreateReview(NewReview),
     Shutdown,
 }
 
@@ -194,6 +232,12 @@ pub enum WriteOutcome {
     Merged(Vec<String>),
     /// The `StoreEmbeddings` items that were stored; the others changed while being embedded.
     Embedded(Vec<(VecKey, Vec<f32>)>),
+    /// The seqs of the memories that were purged.
+    Purged(Vec<i64>),
+    /// How many rows a maintenance step deleted (or review items it added).
+    Count(usize),
+    /// Whether a maintenance step still had work to do.
+    Flag(bool),
     Done,
 }
 
@@ -210,6 +254,9 @@ impl WriteOutcome {
             WriteOutcome::Resolved(_) => "Resolved",
             WriteOutcome::Merged(_) => "Merged",
             WriteOutcome::Embedded(_) => "Embedded",
+            WriteOutcome::Purged(_) => "Purged",
+            WriteOutcome::Count(_) => "Count",
+            WriteOutcome::Flag(_) => "Flag",
             WriteOutcome::Done => "Done",
         }
     }
@@ -1239,9 +1286,102 @@ fn apply(
             )?;
             WriteOutcome::Done
         }
+        WriteOp::SetMeta { key, value } => {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![key, value],
+            )?;
+            WriteOutcome::Done
+        }
+        WriteOp::PurgeMemories { seqs } => purge_memories(conn, st, &seqs)?,
+        WriteOp::DeleteChunks { seqs, reason } => delete_chunks(conn, st, &seqs, &reason)?,
+        WriteOp::FtsMerge { table, pages } => {
+            WriteOutcome::Flag(maintenance::fts_merge(conn, &table, pages)?)
+        }
+        WriteOp::PruneEvents { before, limit } => {
+            WriteOutcome::Count(maintenance::prune_events(conn, &before, limit)?)
+        }
+        WriteOp::PruneJudgeCache {
+            before,
+            keep,
+            limit,
+        } => WriteOutcome::Count(maintenance::prune_judge_cache(conn, &before, keep, limit)?),
+        WriteOp::CreateReview(r) => match reviews::create(conn, &r)? {
+            Some(id) => {
+                st.stream.push(StreamItem::Review {
+                    id,
+                    review_type: r.kind.as_str().into(),
+                });
+                WriteOutcome::Count(1)
+            }
+            None => WriteOutcome::Count(0),
+        },
         WriteOp::Shutdown => WriteOutcome::Done,
     };
     Ok(Applied::Done(outcome))
+}
+
+/// `PurgeMemories`: delete for good, then record a `memory.purge` event per memory. The event
+/// comes after the deletion, which scrubs the history of the memory: it names the id and the
+/// stub title `[purged]`, never the text.
+fn purge_memories(conn: &Connection, st: &mut State, seqs: &[i64]) -> Result<WriteOutcome> {
+    // Only trashed memories can be purged: a memory restored since the job looked is kept.
+    let mut trashed = Vec::with_capacity(seqs.len());
+    for &seq in seqs {
+        let status: Option<String> = conn
+            .query_row("SELECT status FROM memories WHERE seq = ?1", [seq], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if status.as_deref() == Some(Status::Trashed.as_str()) {
+            trashed.push(seq);
+        }
+    }
+    let gone = maintenance::purge_memories(conn, &trashed)?;
+    for (id, _title) in &gone {
+        let stub = serde_json::json!({ "id": id, "title": maintenance::PURGED_TITLE });
+        record(
+            conn,
+            st,
+            EventInput {
+                actor: &Actor::System,
+                action: "memory.purge",
+                target_type: "memory",
+                target_id: id,
+                before: Some(stub),
+                after: None,
+                group: None,
+            },
+        )?;
+    }
+    Ok(WriteOutcome::Purged(trashed))
+}
+
+/// `DeleteChunks`: retention deletes raw chunks; one `raw.retention` event says how many and why.
+fn delete_chunks(
+    conn: &Connection,
+    st: &mut State,
+    seqs: &[i64],
+    reason: &str,
+) -> Result<WriteOutcome> {
+    let n = maintenance::delete_chunks(conn, seqs)?;
+    if n > 0 {
+        record(
+            conn,
+            st,
+            EventInput {
+                actor: &Actor::System,
+                action: "raw.retention",
+                target_type: "raw",
+                target_id: "chunks",
+                before: None,
+                after: Some(serde_json::json!({ "deleted": n, "reason": reason })),
+                group: None,
+            },
+        )?;
+    }
+    Ok(WriteOutcome::Count(n))
 }
 
 /// A memory the judge never sees (`judge_state = 'skipped'`, an import) becomes active when its
@@ -4030,6 +4170,190 @@ mod tests {
         assert_eq!(
             body, "second [REDACTED:x]",
             "the destination's cleaned text is stored with the move"
+        );
+    }
+
+    /// Task 14: `SetMeta` upserts, `PurgeMemories` takes only trashed memories (the others are
+    /// left alone), records a `memory.purge` event by `system` that names no text, and scrubs
+    /// the history of the purged memory.
+    #[test]
+    fn set_meta_upserts_and_a_purge_takes_only_trashed_memories() {
+        let f = fixture();
+        for v in ["one", "two"] {
+            f.h.submit_blocking(WriteOp::SetMeta {
+                key: "maint.x.last_run".into(),
+                value: v.into(),
+            })
+            .unwrap();
+        }
+        let v: String = f.read("SELECT value FROM meta WHERE key = 'maint.x.last_run'", []);
+        assert_eq!(v, "two");
+
+        let (keep, keep_seq) = new_id(f.h.submit_blocking(remember("alive and well")).unwrap());
+        let (gone, gone_seq) = new_id(
+            f.h.submit_blocking(remember("the safe code is 1234 swordfish"))
+                .unwrap(),
+        );
+        f.h.submit_blocking(update(&gone, UpdateAction::Forget))
+            .unwrap();
+        let mut rx = f.h.subscribe();
+        let out = f.h.submit_blocking(WriteOp::PurgeMemories {
+            seqs: vec![keep_seq, gone_seq, 99_999],
+        });
+        let WriteOutcome::Purged(done) = out.unwrap() else {
+            panic!("expected Purged")
+        };
+        assert_eq!(
+            done,
+            vec![gone_seq],
+            "a live memory and a missing seq are skipped"
+        );
+        let n: i64 = f.read("SELECT count(*) FROM memories WHERE id = ?1", [&keep]);
+        assert_eq!(n, 1);
+        let n: i64 = f.read("SELECT count(*) FROM memories WHERE id = ?1", [&gone]);
+        assert_eq!(n, 0);
+        match rx.try_recv().unwrap() {
+            StreamItem::Event { event } => {
+                assert_eq!(event.action, "memory.purge");
+                assert_eq!(event.actor, "system");
+                assert_eq!(event.target_id, gone);
+                assert_eq!(
+                    event.before,
+                    Some(serde_json::json!({"id": gone, "title": "[purged]"}))
+                );
+                assert_eq!(event.after, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        let leaked: i64 = f.read(
+            "SELECT count(*) FROM events WHERE before_json LIKE '%swordfish%' OR after_json LIKE '%swordfish%'",
+            [],
+        );
+        assert_eq!(leaked, 0, "the history no longer holds the purged text");
+        // The memory next to it keeps its history.
+        let kept: i64 = f.read("SELECT count(*) FROM events WHERE target_id = ?1 AND after_json LIKE '%alive and well%'", [&keep]);
+        assert_eq!(kept, 1);
+    }
+
+    /// Task 14: retention deletes chunks with one event; pruning and merging report their work;
+    /// a review item is announced once and an open duplicate adds nothing.
+    #[test]
+    fn retention_pruning_merging_and_review_creation() {
+        let f = fixture();
+        let chunks: Vec<ChunkInput> = (0..4)
+            .map(|i| ChunkInput {
+                ord: i,
+                text: format!("transcript line {i}"),
+                ..Default::default()
+            })
+            .collect();
+        f.h.submit_blocking(WriteOp::Ingest {
+            project: ProjectChoice::Slug("global".into()),
+            source: SourceInput {
+                uri: "s".into(),
+                ..Default::default()
+            },
+            chunks,
+        })
+        .unwrap();
+        let seqs: Vec<i64> = {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.prepare("SELECT seq FROM chunks ORDER BY seq")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let WriteOutcome::Count(n) =
+            f.h.submit_blocking(WriteOp::DeleteChunks {
+                seqs: seqs[..3].to_vec(),
+                reason: "90d".into(),
+            })
+            .unwrap()
+        else {
+            panic!("expected Count")
+        };
+        assert_eq!(n, 3);
+        let after: String = f.read(
+            "SELECT after_json FROM events WHERE action = 'raw.retention'",
+            [],
+        );
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(after, serde_json::json!({"deleted": 3, "reason": "90d"}));
+        let left: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(left, 1);
+        // Nothing to delete: no event.
+        f.h.submit_blocking(WriteOp::DeleteChunks {
+            seqs: vec![seqs[0]],
+            reason: "90d".into(),
+        })
+        .unwrap();
+        let events: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'raw.retention'",
+            [],
+        );
+        assert_eq!(events, 1);
+
+        let WriteOutcome::Count(pruned) =
+            f.h.submit_blocking(WriteOp::PruneEvents {
+                before: "2999-01-01T00:00:00.000Z".into(),
+                limit: 2,
+            })
+            .unwrap()
+        else {
+            panic!("expected Count")
+        };
+        assert_eq!(pruned, 2, "at most `limit` events go per step");
+        assert!(matches!(
+            f.h.submit_blocking(WriteOp::PruneJudgeCache {
+                before: "2999-01-01T00:00:00.000Z".into(),
+                keep: 10,
+                limit: 10,
+            })
+            .unwrap(),
+            WriteOutcome::Count(0)
+        ));
+        assert!(matches!(
+            f.h.submit_blocking(WriteOp::FtsMerge {
+                table: "chunks_fts".into(),
+                pages: 100
+            })
+            .unwrap(),
+            WriteOutcome::Flag(_)
+        ));
+        assert!(
+            f.h.submit_blocking(WriteOp::FtsMerge {
+                table: "events".into(),
+                pages: 1
+            })
+            .is_err()
+        );
+
+        let mut rx = f.h.subscribe();
+        let review = || NewReview {
+            kind: ReviewType::Merge,
+            payload: serde_json::json!({"survivor": "A", "others": ["B"], "p": 0.93, "provider": "cluster"}),
+            confidence: Some(0.93),
+            dedupe_key: Some("merge:A:B".into()),
+        };
+        assert!(matches!(
+            f.h.submit_blocking(WriteOp::CreateReview(review()))
+                .unwrap(),
+            WriteOutcome::Count(1)
+        ));
+        assert!(matches!(
+            f.h.submit_blocking(WriteOp::CreateReview(review()))
+                .unwrap(),
+            WriteOutcome::Count(0)
+        ));
+        match rx.try_recv().unwrap() {
+            StreamItem::Review { review_type, .. } => assert_eq!(review_type, "merge"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "an open duplicate is not announced again"
         );
     }
 }

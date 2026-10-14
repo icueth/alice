@@ -119,7 +119,7 @@ impl EnvLayer {
 }
 
 /// The process's `ALICE_*` variables; values only for setting variables.
-fn process_env() -> Vec<(String, String)> {
+pub fn process_env() -> Vec<(String, String)> {
     std::env::vars_os()
         .filter_map(|(k, v)| {
             let k = k.into_string().ok()?;
