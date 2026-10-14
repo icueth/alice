@@ -16,7 +16,7 @@
 </p>
 
 > [!IMPORTANT]
-> **สถานะ: M1 เสร็จแล้ว — รุ่น alpha** ที่เก็บข้อมูล, การค้นหาแบบผสม (ไทย อังกฤษ และชื่อในโค้ด), daemon, MCP tool ทั้ง 7 ตัว, CLI และ HTTP API ใช้งานได้แล้ว และมี CI ทดสอบบน macOS, Linux และ Windows ยังไม่มี release แบบแพ็กเกจ ให้[ติดตั้งจาก source](#ติดตั้งจาก-source) ความสามารถที่มีป้าย *(วางแผนไว้)* จะตามมาใน milestone ถัดไป ดูได้ที่ [roadmap](#roadmap) ก่อนถึง 1.0 อาจมีการเปลี่ยนที่ไม่เข้ากับของเดิม
+> **สถานะ: M1 เสร็จแล้ว — รุ่น alpha** ที่เก็บข้อมูล, การค้นหาแบบผสม (ไทย อังกฤษ และชื่อในโค้ด), daemon, MCP tool ทั้ง 7 ตัว, CLI และ HTTP API ใช้งานได้แล้ว CI build และทดสอบบน macOS และ Linux ส่วนบน Windows นั้น CI build ทั้งหมดและรันชุดทดสอบแบบ in-process แต่การทดสอบ CLI และ process ของ daemon รันเฉพาะบน Unix (ดู[แพลตฟอร์มที่รองรับ](#แพลตฟอร์มที่รองรับ)) ยังไม่มี release แบบแพ็กเกจ ให้[ติดตั้งจาก source](#ติดตั้งจาก-source) ความสามารถที่มีป้าย *(วางแผนไว้)* จะตามมาใน milestone ถัดไป ดูได้ที่ [roadmap](#roadmap) ก่อนถึง 1.0 อาจมีการเปลี่ยนที่ไม่เข้ากับของเดิม
 
 ---
 
@@ -80,7 +80,7 @@ alice model fetch      # ครั้งเดียวก่อนเริ่�
 |---|---|
 | macOS ชิป Apple Silicon | รองรับ, embedding ในเครื่อง |
 | Linux (glibc) x86_64 และ aarch64 | รองรับ, embedding ในเครื่อง |
-| Windows x86_64 | build ได้และผ่านชุดทดสอบใน CI; embedding ในเครื่องใช้ได้ (ONNX Runtime แบบ prebuilt) ส่วนการเปิด daemon อัตโนมัติ, `alice service install` (scheduled task) และพฤติกรรมระดับ process ยังไม่ได้ตรวจบนเครื่อง Windows จริง |
+| Windows x86_64 | build ใน CI และรันชุดทดสอบแบบ in-process ส่วนการทดสอบ CLI และ process ของ daemon รันเฉพาะบน Unix; embedding ในเครื่องตรวจแล้วบน Windows ด้วย CI workflow `windows-real-model` (model จริง โดยโฟลเดอร์ข้อมูลอยู่ใต้ path ที่ไม่ใช่ ASCII) ข้อจำกัดที่รู้แล้ว: `alice daemon start` และ `alice status` มองไม่เห็น daemon ที่ยังเริ่มไม่เสร็จ *(วางแผนแก้แล้ว)*; `alice service install` (scheduled task) *(วางแผนไว้)* |
 | macOS ชิป Intel, Linux musl | ยังไม่รองรับ: ONNX Runtime ไม่มี library สำเร็จรูปให้ จึงรัน embedding ในเครื่องไม่ได้ จะใช้ได้เมื่อมี embedding provider ผ่าน HTTP (วางแผนไว้ใน M2) |
 
 ### ตัวติดตั้งแบบแพ็กเกจ (วางแผนไว้)

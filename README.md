@@ -16,7 +16,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Status: M1 complete — alpha.** The store, hybrid search (Thai, English and code identifiers), the daemon, the seven MCP tools, the CLI and the HTTP API work, and CI tests them on macOS, Linux and Windows. There are no packaged releases yet: [install from source](#install-from-source). Features marked *(planned)* arrive in later milestones; see the [roadmap](#roadmap). Expect breaking changes before 1.0.
+> **Status: M1 complete — alpha.** The store, hybrid search (Thai, English and code identifiers), the daemon, the seven MCP tools, the CLI and the HTTP API work. CI builds and tests them on macOS and Linux; on Windows it builds everything and runs the in-process test suite, while the CLI and daemon process tests run on Unix only (see [platform support](#platform-support)). There are no packaged releases yet: [install from source](#install-from-source). Features marked *(planned)* arrive in later milestones; see the [roadmap](#roadmap). Expect breaking changes before 1.0.
 
 ---
 
@@ -80,7 +80,7 @@ Run `alice model fetch` once before first use. Without it the first daemon start
 |---|---|
 | macOS, Apple Silicon | Supported, local embeddings |
 | Linux (glibc) x86_64 and aarch64 | Supported, local embeddings |
-| Windows x86_64 | Builds and passes the test suite in CI; local embeddings work (ONNX Runtime prebuilt). Auto-start of the daemon, `alice service install` (scheduled task) and process-level behaviour are not yet verified on a real Windows machine. |
+| Windows x86_64 | Builds in CI, which runs the in-process test suite; the CLI and daemon process tests run on Unix only. Local embeddings verified on Windows by the `windows-real-model` CI workflow (the real model, with the data directory under a non-ASCII path). Known gap: `alice daemon start` and `alice status` cannot see a daemon that is still starting *(fix planned)*. `alice service install` (a scheduled task) *(planned)*. |
 | macOS Intel, Linux musl | Not yet: ONNX Runtime has no prebuilt library for them, so local embeddings are unavailable. They will work with an HTTP embedding provider (planned, M2). |
 
 ### Packaged installers (planned)
