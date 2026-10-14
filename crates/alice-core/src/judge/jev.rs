@@ -30,6 +30,13 @@ use std::time::{Duration, Instant};
 /// USD per million input tokens (output is free).
 pub const USD_PER_MTOK_INPUT: f64 = 0.042;
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+/// Input tokens Jev adds to every request (its own prompt), as a safe upper bound. The recorded
+/// requests show 231 bytes costing 325 tokens; with `START_TOKEN_RATIO` below, a 231-byte
+/// request is reserved at 646 tokens.
+pub const REQUEST_OVERHEAD_TOKENS: f64 = 300.0;
+/// Input tokens per request byte before any reply has shown a higher one. The recorded
+/// requests range from 0.37 to 1.41 tokens a byte.
+pub const START_TOKEN_RATIO: f64 = 1.5;
 /// The project that text belonging to no project in particular is attributed to.
 pub const UNSCOPED: &str = "global";
 
@@ -43,7 +50,10 @@ pub struct HttpReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
     Timeout,
+    /// Nothing reached Jev (the connection could not be made).
     Connect(String),
+    /// The request may have reached Jev but its reply did not come back whole.
+    Lost(String),
 }
 
 pub trait JevTransport: Send + Sync {
@@ -122,6 +132,9 @@ pub struct JevCall {
     pub output_tokens: u64,
     pub usd: f64,
     pub latency_ms: u64,
+    /// `false` for a call that was sent but has no usable answer: it is billed in the ledger and
+    /// its response is not put in the cache.
+    pub cacheable: bool,
 }
 
 pub trait JevStore: Send + Sync {
@@ -158,9 +171,11 @@ impl JevStore for MemoryJevStore {
             .sum())
     }
     fn record(&self, call: &JevCall) {
-        self.cache
-            .lock()
-            .insert(call.hash.clone(), call.response_json.clone());
+        if call.cacheable {
+            self.cache
+                .lock()
+                .insert(call.hash.clone(), call.response_json.clone());
+        }
         self.calls.lock().push(call.clone());
     }
 }
@@ -221,6 +236,33 @@ struct Budget {
     spent: f64,
 }
 
+/// What every `JevJudge` of a daemon shares, however often the judge is rebuilt: the day's
+/// reservations, the learned tokens-per-byte ratio and the request rate slot. A rebuilt judge
+/// with fresh copies of these could overshoot the budget or the rate while the old one still
+/// has calls in flight.
+pub struct JevLimits {
+    next_slot: Mutex<Option<Instant>>,
+    budget: Mutex<Option<Budget>>,
+    /// Input tokens per request byte (raised if Jev ever counts more than it has so far).
+    token_ratio: Mutex<f64>,
+    /// Why today's spend could not be read (calls are refused meanwhile); `Judge::warning`.
+    spend_error: Mutex<Option<String>>,
+    /// The UTC day the budget stopped calls on, and why; `Judge::warning` while it is that day.
+    budget_stop: Mutex<Option<(String, String)>>,
+}
+
+impl Default for JevLimits {
+    fn default() -> Self {
+        Self {
+            next_slot: Mutex::new(None),
+            budget: Mutex::new(None),
+            token_ratio: Mutex::new(START_TOKEN_RATIO),
+            spend_error: Mutex::new(None),
+            budget_stop: Mutex::new(None),
+        }
+    }
+}
+
 pub struct JevJudge {
     cfg: JevConfig,
     transport: Arc<dyn JevTransport>,
@@ -228,14 +270,7 @@ pub struct JevJudge {
     policy: Arc<dyn JevPolicy>,
     clock: Clock,
     sleep: Sleeper,
-    next_slot: Mutex<Option<Instant>>,
-    budget: Mutex<Option<Budget>>,
-    /// Input tokens per request byte, at least 1 (raised if Jev ever counts more tokens than bytes).
-    token_ratio: Mutex<f64>,
-    /// Why today's spend could not be read (calls are refused meanwhile); `Judge::warning`.
-    spend_error: Mutex<Option<String>>,
-    /// The UTC day the budget stopped calls on, and why; `Judge::warning` while it is that day.
-    budget_stop: Mutex<Option<(String, String)>>,
+    limits: Arc<JevLimits>,
     last_request: Mutex<Option<Vec<u8>>>,
     stats: Mutex<JevStats>,
 }
@@ -364,6 +399,17 @@ fn parse(
     Ok((out, r.usage))
 }
 
+/// `(input, output)` tokens from a reply that may not otherwise be usable; `None` when it
+/// reports none.
+fn loose_usage(body: &[u8]) -> Option<(u64, u64)> {
+    #[derive(Deserialize)]
+    struct Loose {
+        usage: Option<UsageBody>,
+    }
+    let u = serde_json::from_slice::<Loose>(body).ok()?.usage?;
+    (u.input_tokens > 0).then_some((u.input_tokens, u.output_tokens))
+}
+
 fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(500 * 2u64.pow(attempt.min(5)))
 }
@@ -402,11 +448,7 @@ impl JevJudge {
             policy,
             clock: Arc::new(Utc::now),
             sleep: Arc::new(std::thread::sleep),
-            next_slot: Mutex::new(None),
-            budget: Mutex::new(None),
-            token_ratio: Mutex::new(1.0),
-            spend_error: Mutex::new(None),
-            budget_stop: Mutex::new(None),
+            limits: Arc::new(JevLimits::default()),
             last_request: Mutex::new(None),
             stats: Mutex::new(JevStats::default()),
         }
@@ -420,6 +462,23 @@ impl JevJudge {
     pub fn with_sleeper(mut self, sleep: Sleeper) -> Self {
         self.sleep = sleep;
         self
+    }
+
+    /// Share `limits` with other judges (the daemon passes the same one to every rebuild).
+    pub fn with_limits(mut self, limits: Arc<JevLimits>) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// The input tokens reserved for a request of `body_len` bytes: an upper bound on what Jev
+    /// bills, because of the fixed overhead and a ratio that only ever rises.
+    pub fn estimate_tokens(&self, body_len: usize) -> f64 {
+        body_len as f64 * *self.limits.token_ratio.lock() + REQUEST_OVERHEAD_TOKENS
+    }
+
+    /// The USD reserved for a request of `body_len` bytes.
+    pub fn estimate_usd(&self, body_len: usize) -> f64 {
+        self.estimate_tokens(body_len) * USD_PER_MTOK_INPUT / 1e6
     }
 
     pub fn stats(&self) -> JevStats {
@@ -516,7 +575,7 @@ impl JevJudge {
     fn wait_for_slot(&self) {
         let gap = Duration::from_secs_f64(1.0 / rate(self.cfg.rate_per_sec));
         let wait = {
-            let mut next = self.next_slot.lock();
+            let mut next = self.limits.next_slot.lock();
             let now = Instant::now();
             let slot = next.map_or(now, |n| n.max(now));
             *next = Some(slot + gap);
@@ -534,13 +593,13 @@ impl JevJudge {
     /// Reserve `estimate` USD of today's budget, or refuse. Failing closed: a spend that cannot
     /// be read, a budget that is not a number and a reservation that does not fit all refuse.
     fn reserve(&self, day: &str, estimate: f64) -> JudgeResult<()> {
-        let mut b = self.budget.lock();
+        let mut b = self.limits.budget.lock();
         if b.as_ref().is_none_or(|b| b.day != day) {
             // A spend that cannot be read counts as an exhausted budget (it is read again on
             // the next call, and the warning shows in health until then).
             match self.store.spent(day) {
                 Ok(spent) if spent.is_finite() => {
-                    *self.spend_error.lock() = None;
+                    *self.limits.spend_error.lock() = None;
                     *b = Some(Budget {
                         day: day.into(),
                         spent,
@@ -555,7 +614,7 @@ impl JevJudge {
                         "cannot read today's Jev spend ({why}); Jev calls are paused until it can be read"
                     );
                     *b = None;
-                    *self.spend_error.lock() = Some(msg.clone());
+                    *self.limits.spend_error.lock() = Some(msg.clone());
                     self.stats.lock().budget_stops += 1;
                     return Err(JudgeError::Budget(msg));
                 }
@@ -570,18 +629,18 @@ impl JevJudge {
                 b.spent, self.cfg.daily_budget_usd
             );
             self.stats.lock().budget_stops += 1;
-            *self.budget_stop.lock() =
+            *self.limits.budget_stop.lock() =
                 Some((day.into(), format!("Jev is paused for today: {msg}")));
             return Err(JudgeError::Budget(msg));
         }
-        *self.budget_stop.lock() = None;
+        *self.limits.budget_stop.lock() = None;
         b.spent += estimate;
         Ok(())
     }
 
     /// Replace the reservation of `estimate` with what the call really cost.
     fn settle(&self, day: &str, estimate: f64, actual: f64) {
-        if let Some(b) = self.budget.lock().as_mut()
+        if let Some(b) = self.limits.budget.lock().as_mut()
             && b.day == day
         {
             b.spent += actual - estimate;
@@ -608,13 +667,24 @@ impl JevJudge {
             return Ok(d);
         }
         let day = self.today();
-        // An upper bound on the cost: one input token per byte of the request (a token never
-        // covers less than one byte), so the day's spend never passes the budget. Should Jev
-        // ever count more tokens than bytes (a prompt of its own), the ratio rises to match.
-        let estimate = body.len() as f64 * *self.token_ratio.lock() * USD_PER_MTOK_INPUT / 1e6;
+        // An upper bound on the cost: the request's bytes at the highest tokens-per-byte seen
+        // so far (it starts above every recorded request and only rises) plus the fixed
+        // overhead Jev adds to every request. The reservation is shared by all judges of the
+        // daemon, so the day's spend never passes the budget, rebuilds included.
+        let estimate = self.estimate_usd(body.len());
         self.reserve(&day, estimate)?;
         let mut last = String::new();
+        // The request was sent at least once without an answer we could read: it may be billed.
+        let mut maybe_billed = false;
         for attempt in 0..=self.cfg.max_retries {
+            if attempt > 0 {
+                // A retry can come up to two minutes after the first try: the policy is asked
+                // again, so a denial that lands meanwhile stops it.
+                if let Err(e) = self.gate(projects) {
+                    self.settle_unanswered(&day, &hash, estimate, maybe_billed);
+                    return Err(e);
+                }
+            }
             self.wait_for_slot();
             let started = Instant::now();
             let reply = self.transport.post(
@@ -625,28 +695,49 @@ impl JevJudge {
             );
             let delay = match reply {
                 Ok(r) if r.status == 200 => {
+                    let latency_ms = started.elapsed().as_millis() as u64;
                     let (d, usage) = match parse(&r.body, questions) {
                         Ok(x) => x,
                         Err(e) => {
-                            self.settle(&day, estimate, 0.0);
+                            // Delivered and answered, but not in a form we can use. Whatever the
+                            // usage says (or the reservation, when it says nothing) is spent.
+                            let tokens = loose_usage(&r.body);
+                            let usd =
+                                tokens.map_or(estimate, |t| t.0 as f64 * USD_PER_MTOK_INPUT / 1e6);
+                            self.settle(&day, estimate, usd);
+                            self.store.record(&JevCall {
+                                day: day.clone(),
+                                hash: hash.clone(),
+                                model: self.cfg.model.clone(),
+                                response_json: String::new(),
+                                input_tokens: tokens.map_or(0, |t| t.0),
+                                output_tokens: tokens.map_or(0, |t| t.1),
+                                usd,
+                                latency_ms,
+                                cacheable: false,
+                            });
                             self.fail(&e);
                             return Err(e);
                         }
                     };
-                    let usd = usage.input_tokens as f64 * USD_PER_MTOK_INPUT / 1e6;
+                    // No usage reported: the real cost is unknown, so the reservation is it.
+                    let usd = if usage.input_tokens > 0 {
+                        usage.input_tokens as f64 * USD_PER_MTOK_INPUT / 1e6
+                    } else {
+                        estimate
+                    };
                     self.settle(&day, estimate, usd);
                     let ratio = usage.input_tokens as f64 / body.len().max(1) as f64;
                     {
-                        let mut r = self.token_ratio.lock();
+                        let mut r = self.limits.token_ratio.lock();
                         if ratio > *r {
                             tracing::warn!(
                                 ratio,
-                                "Jev counted more input tokens than request bytes; budget estimates scale up"
+                                "Jev counted more input tokens per request byte than before; budget estimates scale up"
                             );
                             *r = ratio;
                         }
                     }
-                    let latency_ms = started.elapsed().as_millis() as u64;
                     self.store.record(&JevCall {
                         day: day.clone(),
                         hash: hash.clone(),
@@ -656,6 +747,7 @@ impl JevJudge {
                         output_tokens: usage.output_tokens,
                         usd,
                         latency_ms,
+                        cacheable: true,
                     });
                     let mut s = self.stats.lock();
                     s.calls += 1;
@@ -666,7 +758,7 @@ impl JevJudge {
                     return Ok(d);
                 }
                 Ok(r) if r.status == 401 || r.status == 403 => {
-                    self.settle(&day, estimate, 0.0);
+                    self.settle_unanswered(&day, &hash, estimate, maybe_billed);
                     let e = JudgeError::Unavailable(format!(
                         "TypeSafe refused the API key ({}); set a valid one with `alice config set-secret jev_api_key`",
                         r.status
@@ -679,23 +771,35 @@ impl JevJudge {
                     r.retry_after.unwrap_or_else(|| backoff(attempt))
                 }
                 Ok(r) => {
-                    self.settle(&day, estimate, 0.0);
-                    let snippet: String =
-                        String::from_utf8_lossy(&r.body).chars().take(200).collect();
-                    let e = JudgeError::Failed(format!("Jev answered {}: {snippet}", r.status));
+                    self.settle_unanswered(&day, &hash, estimate, maybe_billed);
+                    // Only the status: a server's explanation may quote the request.
+                    let e = JudgeError::Failed(format!(
+                        "Jev refused the request ({}); check judge.jev.model and judge.jev.endpoint",
+                        r.status
+                    ));
                     self.fail(&e);
                     return Err(e);
                 }
                 Err(TransportError::Timeout) => {
+                    maybe_billed = true;
                     last = "Jev did not answer in time".into();
                     backoff(attempt)
                 }
                 Err(TransportError::Connect(e)) => {
                     // Spec §5.2: retries only on 429, 5xx and timeouts. Nothing reached Jev: the
                     // heuristic decides now and the judge stage asks again later.
-                    self.settle(&day, estimate, 0.0);
+                    self.settle_unanswered(&day, &hash, estimate, maybe_billed);
                     let e = JudgeError::Unavailable(format!(
                         "cannot reach Jev ({e}); will retry later"
+                    ));
+                    self.fail(&e);
+                    return Err(e);
+                }
+                Err(TransportError::Lost(e)) => {
+                    // Sent, reply lost: not retried (it may have been billed already).
+                    self.settle_unanswered(&day, &hash, estimate, true);
+                    let e = JudgeError::Unavailable(format!(
+                        "Jev's reply did not arrive whole ({e}); will retry later"
                     ));
                     self.fail(&e);
                     return Err(e);
@@ -706,10 +810,31 @@ impl JevJudge {
                 (self.sleep)(delay.min(MAX_RETRY_WAIT));
             }
         }
-        self.settle(&day, estimate, 0.0);
+        self.settle_unanswered(&day, &hash, estimate, maybe_billed);
         let e = JudgeError::Unavailable(format!("{last}; will retry later"));
         self.fail(&e);
         Err(e)
+    }
+
+    /// The end of a call that got no usable answer. If the request may have been billed the
+    /// reservation stays as its cost and goes in the ledger (never in the cache); otherwise it
+    /// is released.
+    fn settle_unanswered(&self, day: &str, hash: &str, estimate: f64, maybe_billed: bool) {
+        if !maybe_billed {
+            self.settle(day, estimate, 0.0);
+            return;
+        }
+        self.store.record(&JevCall {
+            day: day.into(),
+            hash: hash.into(),
+            model: self.cfg.model.clone(),
+            response_json: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            usd: estimate,
+            latency_ms: 0,
+            cacheable: false,
+        });
     }
 
     fn fail(&self, e: &JudgeError) {
@@ -722,8 +847,8 @@ impl JevJudge {
         (self.clock)()
     }
 
-    /// [`Judge::classify`] for text of `projects` (the trait method attributes its text to
-    /// [`UNSCOPED`]).
+    /// A classification of text that belongs to `projects`; every one must be allowed to the
+    /// cloud. (The trait's `classify` is refused: it names no project.)
     pub fn classify_in(
         &self,
         projects: &[&str],
@@ -747,34 +872,43 @@ impl Judge for JevJudge {
     }
 
     fn warning(&self) -> Option<String> {
-        if let Some(w) = self.spend_error.lock().clone() {
+        if let Some(w) = self.limits.spend_error.lock().clone() {
             return Some(w);
         }
         let today = self.today();
-        self.budget_stop
+        self.limits
+            .budget_stop
             .lock()
             .as_ref()
             .filter(|(day, _)| *day == today)
             .map(|(_, msg)| msg.clone())
     }
 
-    fn classify(&self, state: &str, options: &[Choice]) -> JudgeResult<Distribution> {
+    /// Refused: free text has no project, and "no project" would be taken for `global`, which
+    /// is open to the cloud. See [`Judge::classify_constant`] and [`JevJudge::classify_in`].
+    fn classify(&self, _state: &str, _options: &[Choice]) -> JudgeResult<Distribution> {
+        self.stats.lock().denied += 1;
+        Err(JudgeError::Denied)
+    }
+
+    fn classify_constant(
+        &self,
+        state: &'static str,
+        options: &[Choice],
+    ) -> JudgeResult<Distribution> {
         self.classify_in(&[UNSCOPED], state, options)
     }
 
-    fn score(&self, state: &str, rubric: &Rubric) -> JudgeResult<Score> {
-        let d = self.classify(&format!("{}\n\n{state}", rubric.question), &rubric.levels)?;
-        let n = rubric.levels.len().max(2) as f64 - 1.0;
-        let value = rubric
-            .levels
-            .iter()
-            .enumerate()
-            .map(|(i, l)| d.p(&l.id) * i as f64 / n)
-            .sum();
-        Ok(Score {
-            value,
-            confidence: d.best().map_or(0.0, |b| b.1),
-        })
+    /// Refused for the same reason as `classify`.
+    fn score(&self, _state: &str, _rubric: &Rubric) -> JudgeResult<Score> {
+        self.stats.lock().denied += 1;
+        Err(JudgeError::Denied)
+    }
+
+    /// Refused for the same reason as `classify`.
+    fn match_predicate(&self, _new: &str, _existing: &[String]) -> JudgeResult<Distribution> {
+        self.stats.lock().denied += 1;
+        Err(JudgeError::Denied)
     }
 
     fn compare(&self, new: &JudgeMemory, existing: &[JudgeMemory]) -> JudgeResult<Vec<Relation>> {
@@ -877,6 +1011,7 @@ impl Judge for JevJudge {
 
     fn grade_relevance(
         &self,
+        query_project: &str,
         query: &str,
         results: &[JudgeMemory],
     ) -> JudgeResult<Vec<Distribution>> {
@@ -896,7 +1031,9 @@ impl Judge for JevJudge {
                 options: relevance_choices(),
             });
         }
-        let projects = distinct(results.iter().map(|r| r.project.as_str()));
+        let projects = distinct(
+            std::iter::once(query_project).chain(results.iter().map(|r| r.project.as_str())),
+        );
         let answers = self.ask(&projects, &state, &questions)?;
         Ok((0..results.len())
             .map(|i| {
@@ -1067,6 +1204,10 @@ mod tests {
         script: PMutex<VecDeque<Result<u16, TransportError>>>,
         ok: serde_json::Value,
         calls: PMutex<Vec<serde_json::Value>>,
+        /// What a scripted status reply says in `Retry-After`.
+        retry_after: PMutex<Option<Duration>>,
+        /// What a 200 says instead of `ok`, as raw bytes, when set.
+        raw_ok: PMutex<Option<Vec<u8>>>,
     }
 
     impl Scripted {
@@ -1075,6 +1216,8 @@ mod tests {
                 script: PMutex::new(script.into()),
                 ok,
                 calls: PMutex::new(Vec::new()),
+                retry_after: PMutex::new(Some(Duration::ZERO)),
+                raw_ok: PMutex::new(None),
             })
         }
         fn ok() -> Arc<Self> {
@@ -1097,12 +1240,16 @@ mod tests {
                 Some(Ok(status)) => Ok(HttpReply {
                     status,
                     body: b"{\"detail\":\"x\"}".to_vec(),
-                    retry_after: Some(Duration::ZERO),
+                    retry_after: *self.retry_after.lock(),
                 }),
                 Some(Err(e)) => Err(e),
                 None => Ok(HttpReply {
                     status: 200,
-                    body: serde_json::to_vec(&self.ok).unwrap(),
+                    body: self
+                        .raw_ok
+                        .lock()
+                        .clone()
+                        .unwrap_or_else(|| serde_json::to_vec(&self.ok).unwrap()),
                     retry_after: None,
                 }),
             }
@@ -1261,14 +1408,14 @@ mod tests {
             scenarios::KIND_EXPECTED
         );
         let (query, results) = scenarios::relevance_case();
-        let grades = j.grade_relevance(&query, &results).unwrap();
+        let grades = j.grade_relevance("alice", &query, &results).unwrap();
         assert_eq!(grades.len(), results.len());
         assert!(
             grades[0].p(crate::judge::RELEVANCE_ANSWERS)
                 > grades[2].p(crate::judge::RELEVANCE_ANSWERS)
         );
         assert_eq!(
-            j.classify(scenarios::CLASSIFY_STATE, &scenarios::classify_choices())
+            j.classify_constant(scenarios::CLASSIFY_STATE, &scenarios::classify_choices())
                 .unwrap()
                 .best()
                 .unwrap()
@@ -1285,7 +1432,7 @@ mod tests {
         );
         let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
         assert_eq!(
-            j.classify("is this a test?", &yes_no())
+            j.classify_in(&[UNSCOPED], "is this a test?", &yes_no())
                 .unwrap()
                 .best()
                 .unwrap()
@@ -1301,7 +1448,7 @@ mod tests {
             let s = Scripted::new(vec![Ok(status)], classify_ok());
             let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
             let e = j
-                .classify(&format!("state {status}"), &yes_no())
+                .classify_in(&[UNSCOPED], &format!("state {status}"), &yes_no())
                 .unwrap_err();
             assert!(e.to_string().contains(want), "{status}: {e}");
             assert_eq!(s.calls.lock().len(), 1, "{status} is not retried");
@@ -1309,7 +1456,7 @@ mod tests {
         let s = Scripted::new(vec![Err(TransportError::Timeout); 4], classify_ok());
         let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
         assert!(matches!(
-            j.classify("t", &yes_no()),
+            j.classify_in(&[UNSCOPED], "t", &yes_no()),
             Err(JudgeError::Unavailable(_))
         ));
         assert_eq!(s.calls.lock().len(), 4, "one try and three retries");
@@ -1320,7 +1467,7 @@ mod tests {
             classify_ok(),
         );
         let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
-        let e = j.classify("c", &yes_no()).unwrap_err();
+        let e = j.classify_in(&[UNSCOPED], "c", &yes_no()).unwrap_err();
         assert!(
             matches!(e, JudgeError::Unavailable(_)) && e.to_string().contains("cannot reach Jev"),
             "{e}"
@@ -1353,13 +1500,13 @@ mod tests {
         .with_sleeper(Arc::new(|_| {}))
     }
 
-    /// What `classify(state, yes_no())` reserves: the body's bytes as tokens (ratio 1).
+    /// What `classify_in(state, yes_no())` reserves.
     fn estimate(j: &JevJudge, state: &str) -> f64 {
         let question = q("Choose the option that fits best.");
-        j.request_body(&[UNSCOPED], state, std::slice::from_ref(&question))
-            .len() as f64
-            * USD_PER_MTOK_INPUT
-            / 1e6
+        let len = j
+            .request_body(&[UNSCOPED], state, std::slice::from_ref(&question))
+            .len();
+        j.estimate_usd(len)
     }
 
     #[test]
@@ -1371,8 +1518,8 @@ mod tests {
         // fewer than the body's bytes, so the first call fits and settles below its estimate.
         let budget = estimate(&budget_judge(&s, &store, &day, 1.0), "first");
         let j = budget_judge(&s, &store, &day, budget);
-        j.classify("first", &yes_no()).unwrap();
-        let e = j.classify("second", &yes_no()).unwrap_err();
+        j.classify_in(&[UNSCOPED], "first", &yes_no()).unwrap();
+        let e = j.classify_in(&[UNSCOPED], "second", &yes_no()).unwrap_err();
         assert!(matches!(e, JudgeError::Budget(_)), "{e}");
         assert_eq!(
             s.calls.lock().len(),
@@ -1387,7 +1534,7 @@ mod tests {
         assert!(w.contains("2026-10-13") && w.contains("paused"), "{w}");
         *day.lock() = scenarios::fixed_now() + chrono::Duration::days(1);
         assert_eq!(j.warning(), None, "the new day's budget is a clean slate");
-        j.classify("third", &yes_no()).unwrap();
+        j.classify_in(&[UNSCOPED], "third", &yes_no()).unwrap();
         assert_eq!(s.calls.lock().len(), 2);
     }
 
@@ -1400,15 +1547,15 @@ mod tests {
         let day = Arc::new(PMutex::new(before));
         let budget = estimate(&budget_judge(&s, &store, &day, 1.0), "call a");
         let j = budget_judge(&s, &store, &day, budget);
-        j.classify("call a", &yes_no()).unwrap();
+        j.classify_in(&[UNSCOPED], "call a", &yes_no()).unwrap();
         assert!(matches!(
-            j.classify("call b", &yes_no()),
+            j.classify_in(&[UNSCOPED], "call b", &yes_no()),
             Err(JudgeError::Budget(_))
         ));
         let spent_old = store.spent("2026-10-13").unwrap();
         assert!(spent_old > 0.0);
         *day.lock() = Utc.with_ymd_and_hms(2026, 10, 14, 0, 0, 1).unwrap();
-        j.classify("call b", &yes_no()).unwrap();
+        j.classify_in(&[UNSCOPED], "call b", &yes_no()).unwrap();
         assert_eq!(
             store.spent("2026-10-13").unwrap(),
             spent_old,
@@ -1421,7 +1568,7 @@ mod tests {
         // A clock that goes back reads the old day's spend again instead of trusting memory.
         *day.lock() = before;
         assert!(matches!(
-            j.classify("call c", &yes_no()),
+            j.classify_in(&[UNSCOPED], "call c", &yes_no()),
             Err(JudgeError::Budget(_))
         ));
     }
@@ -1435,10 +1582,10 @@ mod tests {
         // Enough for the first call as Jev counts it, not for a second one of the same size.
         let budget = estimate(&probe, "first") + 10_000.0 * USD_PER_MTOK_INPUT / 1e6;
         let j = budget_judge(&s, &store, &day, budget);
-        j.classify("first", &yes_no()).unwrap();
+        j.classify_in(&[UNSCOPED], "first", &yes_no()).unwrap();
         // "2nd" is shorter than "first": by bytes alone it would fit and overspend.
         assert!(matches!(
-            j.classify("2nd", &yes_no()),
+            j.classify_in(&[UNSCOPED], "2nd", &yes_no()),
             Err(JudgeError::Budget(_))
         ));
         assert!(store.spent("2026-10-13").unwrap() <= budget);
@@ -1498,7 +1645,7 @@ mod tests {
             .map(|i| {
                 let (j, tx) = (j.clone(), tx.clone());
                 std::thread::spawn(move || {
-                    let r = j.classify(&format!("call-{i}"), &yes_no());
+                    let r = j.classify_in(&[UNSCOPED], &format!("call-{i}"), &yes_no());
                     tx.send(r.is_ok()).unwrap();
                 })
             })
@@ -1549,7 +1696,7 @@ mod tests {
         let s = Scripted::ok();
         let j = judge_with(s.clone(), broken.clone(), cfg(), policy());
         assert!(matches!(
-            j.classify("x", &yes_no()),
+            j.classify_in(&[UNSCOPED], "x", &yes_no()),
             Err(JudgeError::Budget(_))
         ));
         assert!(s.calls.lock().is_empty(), "fail closed: nothing is sent");
@@ -1561,7 +1708,7 @@ mod tests {
             j.warning()
         );
         broken.0.store(false, Ordering::SeqCst);
-        j.classify("x", &yes_no()).unwrap();
+        j.classify_in(&[UNSCOPED], "x", &yes_no()).unwrap();
         assert_eq!(
             j.warning(),
             None,
@@ -1581,7 +1728,7 @@ mod tests {
         let s = Scripted::ok();
         let j = judge_with(s.clone(), Arc::new(NotANumber), cfg(), policy());
         assert!(matches!(
-            j.classify("y", &yes_no()),
+            j.classify_in(&[UNSCOPED], "y", &yes_no()),
             Err(JudgeError::Budget(_))
         ));
         assert!(s.calls.lock().is_empty());
@@ -1596,7 +1743,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            j.classify("z", &yes_no()),
+            j.classify_in(&[UNSCOPED], "z", &yes_no()),
             Err(JudgeError::Budget(_))
         ));
         assert!(s.calls.lock().is_empty());
@@ -1622,7 +1769,8 @@ mod tests {
             None,
             "no body was built for a denied call"
         );
-        j.classify(
+        j.classify_in(
+            &[UNSCOPED],
             concat!("token gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 here"),
             &yes_no(),
         )
@@ -1649,7 +1797,7 @@ mod tests {
         let (query, mut results) = scenarios::relevance_case();
         results[2].project = "secret-proj".into();
         assert!(matches!(
-            j.grade_relevance(&query, &results),
+            j.grade_relevance("alice", &query, &results),
             Err(JudgeError::Denied)
         ));
         // A routing question names every candidate project in its options.
@@ -1718,8 +1866,8 @@ mod tests {
         let m = scenarios::kind_case();
         let (new, mut existing) = scenarios::compare_case();
         existing[1].project = "other".into();
-        j.classify("same", &yes_no()).unwrap();
-        j.classify("same", &yes_no()).unwrap();
+        j.classify_in(&[UNSCOPED], "same", &yes_no()).unwrap();
+        j.classify_in(&[UNSCOPED], "same", &yes_no()).unwrap();
         assert_eq!(j.stats().cache_hits, 1);
         assert_eq!(*sw.asked.lock(), ["global", "global"], "once per call");
         sw.asked.lock().clear();
@@ -1729,7 +1877,7 @@ mod tests {
         // The decision is made now, not when the judge was built.
         sw.allowed.store(false, Ordering::SeqCst);
         assert!(matches!(
-            j.classify("same", &yes_no()),
+            j.classify_in(&[UNSCOPED], "same", &yes_no()),
             Err(JudgeError::Denied)
         ));
         assert!(matches!(j.classify_kind(&m), Err(JudgeError::Denied)));
@@ -1849,12 +1997,15 @@ mod tests {
         assert!(shown.contains("redacted"));
         let s = Scripted::new(vec![Ok(500); 4], classify_ok());
         let j = judge(s, Arc::new(MemoryJevStore::default()), cfg());
-        let e = j.classify("x", &yes_no()).unwrap_err().to_string();
+        let e = j
+            .classify_in(&[UNSCOPED], "x", &yes_no())
+            .unwrap_err()
+            .to_string();
         let st = serde_json::to_string(&j.stats()).unwrap();
         assert!(!e.contains("abcdef1234567890") && !st.contains("abcdef1234567890"));
         let store = Arc::new(MemoryJevStore::default());
         let j = judge(Scripted::ok(), store.clone(), cfg());
-        j.classify("x", &yes_no()).unwrap();
+        j.classify_in(&[UNSCOPED], "x", &yes_no()).unwrap();
         let recorded = serde_json::to_string(&store.calls()).unwrap();
         assert!(!recorded.contains("abcdef1234567890"));
         let sent = String::from_utf8(j.last_request().unwrap()).unwrap();
@@ -1873,7 +2024,7 @@ mod tests {
                 *m = (*m).max(d);
             }));
         for i in 0..20 {
-            j.classify(&format!("distinct state {i}"), &yes_no())
+            j.classify_in(&[UNSCOPED], &format!("distinct state {i}"), &yes_no())
                 .unwrap();
         }
         // The sleeper does not really sleep, so the 20th call's slot is ~1.9 s after the first.
@@ -1899,10 +2050,390 @@ mod tests {
             let s = Scripted::new(Vec::new(), body);
             let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
             assert!(matches!(
-                j.classify("x", &yes_no()),
+                j.classify_in(&[UNSCOPED], "x", &yes_no()),
                 Err(JudgeError::Failed(_))
             ));
             assert_eq!(s.calls.lock().len(), 1);
         }
+    }
+
+    #[test]
+    fn generic_entry_points_are_denied_unless_the_text_is_marked_as_constant() {
+        let s = Scripted::ok();
+        let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
+        assert_eq!(j.classify("free text", &yes_no()), Err(JudgeError::Denied));
+        let rubric = Rubric {
+            question: "How good?".into(),
+            levels: yes_no(),
+        };
+        assert_eq!(j.score("free text", &rubric), Err(JudgeError::Denied));
+        assert_eq!(
+            j.score_many(&[("free text".into(), rubric)]),
+            Err(JudgeError::Denied)
+        );
+        assert_eq!(
+            j.match_predicate("works_on", &["worked_on".to_string()]),
+            Err(JudgeError::Denied)
+        );
+        assert!(s.calls.lock().is_empty() && j.last_request().is_none());
+        assert_eq!(j.stats().denied, 4);
+        // A constant of the program is fine.
+        assert_eq!(
+            j.classify_constant(scenarios::CLASSIFY_STATE, &yes_no())
+                .unwrap()
+                .best()
+                .unwrap()
+                .0,
+            "yes"
+        );
+        assert_eq!(s.calls.lock().len(), 1);
+        // The query's own project counts besides the results' projects.
+        let (query, results) = scenarios::relevance_case();
+        assert_eq!(
+            j.grade_relevance("secret-proj", &query, &results),
+            Err(JudgeError::Denied)
+        );
+        assert_eq!(s.calls.lock().len(), 1);
+    }
+
+    fn sum_spent(store: &MemoryJevStore) -> f64 {
+        store.spent("2026-10-13").unwrap()
+    }
+
+    #[test]
+    fn a_sent_call_with_unknown_usage_costs_its_reservation() {
+        let est = |j: &JevJudge, state: &str| estimate(j, state);
+        // A 200 that is not JSON at all.
+        let store = Arc::new(MemoryJevStore::default());
+        let s = Scripted::ok();
+        *s.raw_ok.lock() = Some(b"<html>gateway</html>".to_vec());
+        let j = judge(s.clone(), store.clone(), cfg());
+        assert!(matches!(
+            j.classify_in(&[UNSCOPED], "one", &yes_no()),
+            Err(JudgeError::Failed(_))
+        ));
+        assert!((sum_spent(&store) - est(&j, "one")).abs() < 1e-12);
+        // Not cached: the same request is sent again (and billed again).
+        let _ = j.classify_in(&[UNSCOPED], "one", &yes_no());
+        assert_eq!(s.calls.lock().len(), 2);
+        assert!((sum_spent(&store) - 2.0 * est(&j, "one")).abs() < 1e-12);
+        // A 200 with answers but no usage.
+        let store = Arc::new(MemoryJevStore::default());
+        let no_usage =
+            serde_json::json!({"answers": {"q": {"choice": "yes", "probabilities": {"yes": 1.0}}}});
+        let s = Scripted::new(Vec::new(), no_usage);
+        let j = judge(s, store.clone(), cfg());
+        j.classify_in(&[UNSCOPED], "two", &yes_no()).unwrap();
+        assert!((sum_spent(&store) - est(&j, "two")).abs() < 1e-12);
+        // A 200 that cannot be used but reports its usage: that usage is charged.
+        let store = Arc::new(MemoryJevStore::default());
+        let odd =
+            serde_json::json!({"answers": {}, "usage": {"input_tokens": 500, "output_tokens": 1}});
+        let j = judge(Scripted::new(Vec::new(), odd), store.clone(), cfg());
+        assert!(j.classify_in(&[UNSCOPED], "three", &yes_no()).is_err());
+        assert!((sum_spent(&store) - 500.0 * USD_PER_MTOK_INPUT / 1e6).abs() < 1e-12);
+        // Timeouts after sending: the reservation is the cost, once.
+        let store = Arc::new(MemoryJevStore::default());
+        let s = Scripted::new(vec![Err(TransportError::Timeout); 4], classify_ok());
+        let j = judge(s, store.clone(), cfg());
+        assert!(j.classify_in(&[UNSCOPED], "four", &yes_no()).is_err());
+        assert!((sum_spent(&store) - est(&j, "four")).abs() < 1e-12);
+        assert!(store.cached(&store.calls()[0].hash).is_none());
+        // A reply that was lost on the way back.
+        let store = Arc::new(MemoryJevStore::default());
+        let s = Scripted::new(
+            vec![Err(TransportError::Lost("reset".into()))],
+            classify_ok(),
+        );
+        let j = judge(s.clone(), store.clone(), cfg());
+        let e = j.classify_in(&[UNSCOPED], "five", &yes_no()).unwrap_err();
+        assert!(matches!(e, JudgeError::Unavailable(_)), "{e}");
+        assert_eq!(s.calls.lock().len(), 1, "not retried");
+        assert!((sum_spent(&store) - est(&j, "five")).abs() < 1e-12);
+        // Answers that were refused or never reached Jev cost nothing.
+        for script in [
+            vec![Ok(400)],
+            vec![Ok(401)],
+            vec![Err(TransportError::Connect("x".into()))],
+            vec![Ok(503); 4],
+        ] {
+            let store = Arc::new(MemoryJevStore::default());
+            let j = judge(Scripted::new(script, classify_ok()), store.clone(), cfg());
+            assert!(j.classify_in(&[UNSCOPED], "six", &yes_no()).is_err());
+            assert_eq!(sum_spent(&store), 0.0);
+        }
+    }
+
+    #[test]
+    fn a_reserved_unanswered_call_still_counts_against_the_budget() {
+        let store = Arc::new(MemoryJevStore::default());
+        let s = Scripted::new(vec![Err(TransportError::Timeout); 4], classify_ok());
+        let day = Arc::new(PMutex::new(scenarios::fixed_now()));
+        let budget = estimate(&budget_judge(&s, &store, &day, 1.0), "first") * 1.5;
+        let j = budget_judge(&s, &store, &day, budget);
+        assert!(j.classify_in(&[UNSCOPED], "first", &yes_no()).is_err());
+        // The timed-out call may have been billed: there is no room for a second one.
+        assert!(matches!(
+            j.classify_in(&[UNSCOPED], "other", &yes_no()),
+            Err(JudgeError::Budget(_))
+        ));
+    }
+
+    #[test]
+    fn error_texts_carry_the_status_and_never_the_servers_words() {
+        let s = Scripted::new(vec![Ok(400)], classify_ok());
+        let j = judge(s, Arc::new(MemoryJevStore::default()), cfg());
+        let e = j
+            .classify_in(&[UNSCOPED], "x", &yes_no())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("400"), "{e}");
+        let shown = format!("{e} {:?}", j.stats());
+        // The scripted body is {"detail":"x"}: nothing of it comes back.
+        assert!(!shown.contains("detail"), "{shown}");
+    }
+
+    /// Flips a policy off after its first request, answering 503.
+    struct DenyAfterFirst {
+        policy: Arc<Switch>,
+        calls: AtomicUsize,
+    }
+
+    impl JevTransport for DenyAfterFirst {
+        fn post(
+            &self,
+            _e: &str,
+            _k: &str,
+            _b: &[u8],
+            _t: Duration,
+        ) -> Result<HttpReply, TransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.policy.allowed.store(false, Ordering::SeqCst);
+            Ok(HttpReply {
+                status: 503,
+                body: Vec::new(),
+                retry_after: Some(Duration::ZERO),
+            })
+        }
+    }
+
+    #[test]
+    fn a_denial_that_lands_during_the_retries_stops_them() {
+        let sw = Arc::new(Switch {
+            allowed: AtomicBool::new(true),
+            asked: PMutex::new(Vec::new()),
+        });
+        let t = Arc::new(DenyAfterFirst {
+            policy: sw.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let store = Arc::new(MemoryJevStore::default());
+        let j = judge_with(t.clone(), store.clone(), cfg(), sw);
+        assert_eq!(
+            j.classify_in(&[UNSCOPED], "x", &yes_no()),
+            Err(JudgeError::Denied)
+        );
+        assert_eq!(t.calls.load(Ordering::SeqCst), 1, "no second try");
+        assert_eq!(sum_spent(&store), 0.0, "a 503 was not billed");
+    }
+
+    #[test]
+    fn retry_after_is_honoured_up_to_thirty_seconds_and_backoff_grows() {
+        let slept = Arc::new(PMutex::new(Vec::<Duration>::new()));
+        let rec = slept.clone();
+        let mk = |script: Vec<Result<u16, TransportError>>, after: Option<Duration>| {
+            let s = Scripted::new(script, classify_ok());
+            *s.retry_after.lock() = after;
+            let rec = rec.clone();
+            JevJudge::new(cfg(), s, Arc::new(MemoryJevStore::default()), policy())
+                .with_clock(Arc::new(scenarios::fixed_now))
+                .with_sleeper(Arc::new(move |d| rec.lock().push(d)))
+        };
+        let longest = |v: &Vec<Duration>| v.iter().copied().max().unwrap_or_default();
+        // The server asks for 7 s.
+        mk(vec![Ok(429)], Some(Duration::from_secs(7)))
+            .classify_in(&[UNSCOPED], "a", &yes_no())
+            .unwrap();
+        assert!(
+            slept.lock().contains(&Duration::from_secs(7)),
+            "{:?}",
+            slept.lock()
+        );
+        slept.lock().clear();
+        // An hour is capped.
+        mk(vec![Ok(503)], Some(Duration::from_secs(3_600)))
+            .classify_in(&[UNSCOPED], "b", &yes_no())
+            .unwrap();
+        assert_eq!(longest(&slept.lock()), Duration::from_secs(30));
+        slept.lock().clear();
+        // No header: 0.5 s, 1 s, 2 s.
+        mk(vec![Ok(429), Ok(429), Ok(429)], None)
+            .classify_in(&[UNSCOPED], "c", &yes_no())
+            .unwrap();
+        let waits: Vec<Duration> = slept
+            .lock()
+            .iter()
+            .copied()
+            .filter(|d| *d >= Duration::from_millis(500))
+            .collect();
+        assert_eq!(
+            waits,
+            [
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2)
+            ]
+        );
+    }
+
+    /// Records when each request is sent.
+    struct Stamps(PMutex<Vec<Instant>>, serde_json::Value);
+
+    impl JevTransport for Stamps {
+        fn post(
+            &self,
+            _e: &str,
+            _k: &str,
+            _b: &[u8],
+            _t: Duration,
+        ) -> Result<HttpReply, TransportError> {
+            self.0.lock().push(Instant::now());
+            Ok(HttpReply {
+                status: 200,
+                body: serde_json::to_vec(&self.1).unwrap(),
+                retry_after: None,
+            })
+        }
+    }
+
+    #[test]
+    fn many_threads_never_send_more_than_ten_requests_in_a_second() {
+        let t = Arc::new(Stamps(PMutex::new(Vec::new()), classify_ok()));
+        // Really sleeps, at the real clock.
+        let j = Arc::new(JevJudge::new(
+            cfg(),
+            t.clone(),
+            Arc::new(MemoryJevStore::default()),
+            policy(),
+        ));
+        let threads: Vec<_> = (0..6)
+            .map(|n| {
+                let j = j.clone();
+                std::thread::spawn(move || {
+                    for i in 0..4 {
+                        j.classify_in(&[UNSCOPED], &format!("t{n} call {i}"), &yes_no())
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for th in threads {
+            th.join().unwrap();
+        }
+        let mut at = t.0.lock().clone();
+        at.sort();
+        assert_eq!(at.len(), 24);
+        for w in at.windows(11) {
+            assert!(
+                w[10].duration_since(w[0]) >= Duration::from_millis(950),
+                "11 requests inside {:?}",
+                w[10].duration_since(w[0])
+            );
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_judge_shares_the_budget_the_rate_and_the_ratio_of_the_old_one() {
+        let store = Arc::new(MemoryJevStore::default());
+        let gate = Arc::new(Gate {
+            open: PMutex::new(false),
+            cv: parking_lot::Condvar::new(),
+            sent: AtomicUsize::new(0),
+            ok: classify_ok(),
+        });
+        let limits = Arc::new(JevLimits::default());
+        let probe = judge(Scripted::ok(), store.clone(), cfg());
+        let budget = estimate(&probe, "call-0") * 1.5;
+        let build = |gate: Arc<Gate>| {
+            Arc::new(
+                judge(
+                    gate,
+                    store.clone(),
+                    JevConfig {
+                        daily_budget_usd: budget,
+                        ..cfg()
+                    },
+                )
+                .with_limits(limits.clone()),
+            )
+        };
+        let old = build(gate.clone());
+        let t = {
+            let old = old.clone();
+            std::thread::spawn(move || old.classify_in(&[UNSCOPED], "call-0", &yes_no()))
+        };
+        while gate.sent.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The settings changed and the judge was rebuilt while that call is in flight.
+        let new = build(gate.clone());
+        assert!(matches!(
+            new.classify_in(&[UNSCOPED], "call-1", &yes_no()),
+            Err(JudgeError::Budget(_))
+        ));
+        *gate.open.lock() = true;
+        gate.cv.notify_all();
+        t.join().unwrap().unwrap();
+        assert_eq!(gate.sent.load(Ordering::SeqCst), 1);
+        assert!(sum_spent(&store) <= budget);
+        // What one judge learned about token counts, the other uses.
+        let loud = Scripted::new(Vec::new(), classify_ok_tokens(50_000));
+        let a = JevJudge::new(cfg(), loud, store.clone(), policy())
+            .with_clock(Arc::new(scenarios::fixed_now))
+            .with_sleeper(Arc::new(|_| {}))
+            .with_limits(limits.clone());
+        let before = new.estimate_tokens(300);
+        a.classify_in(&[UNSCOPED], "call-2", &yes_no()).ok();
+        assert!(new.estimate_tokens(300) > before * 10.0);
+    }
+
+    #[test]
+    fn the_reservation_covers_every_recorded_request() {
+        let j = judge(Scripted::ok(), Arc::new(MemoryJevStore::default()), cfg());
+        for raw in [
+            include_str!("../../tests/fixtures/jev/compare.json"),
+            include_str!("../../tests/fixtures/jev/kind.json"),
+            include_str!("../../tests/fixtures/jev/relevance.json"),
+            include_str!("../../tests/fixtures/jev/classify.json"),
+        ] {
+            let f: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let bytes = serde_json::to_vec(&f["request"]).unwrap().len();
+            let tokens = f["response"]["usage"]["input_tokens"].as_u64().unwrap() as f64;
+            assert!(
+                j.estimate_tokens(bytes) >= tokens,
+                "{bytes} bytes reserve {} tokens but cost {tokens}",
+                j.estimate_tokens(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn the_compare_fixture_averages_to_the_expected_numbers() {
+        let j = judge(
+            Arc::new(Fixtures::load()),
+            Arc::new(MemoryJevStore::default()),
+            cfg(),
+        );
+        let (new, existing) = scenarios::compare_case();
+        let rel = j.compare(&new, &existing).unwrap();
+        // forward 0.99 updates / 0.01 contradicts, reversed 1.0 outdated_by (= updates).
+        assert!(
+            (rel[0].probs.p("updates") - 0.995).abs() < 1e-9,
+            "{:?}",
+            rel[0]
+        );
+        assert!((rel[0].probs.p("contradicts") - 0.005).abs() < 1e-9);
+        assert_eq!(rel[0].agreement, Some(true));
+        assert!((rel[1].probs.p("unrelated") - 1.0).abs() < 1e-9);
     }
 }

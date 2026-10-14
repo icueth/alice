@@ -63,14 +63,7 @@ impl BlockingHttp {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
         if let Some(k) = bearer {
-            // Built by hand (not `bearer_auth`) so the value can be marked sensitive. The
-            // error names no part of the key.
-            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {k}"))
-                .map_err(|_| {
-                    HttpError::Other("the API key holds characters a header cannot carry".into())
-                })?;
-            value.set_sensitive(true);
-            req = req.header(reqwest::header::AUTHORIZATION, value);
+            req = req.header(reqwest::header::AUTHORIZATION, bearer_header(k)?);
         }
         self.rt
             .as_ref()
@@ -107,6 +100,17 @@ impl BlockingHttp {
             Err(_) => Err(HttpError::Timeout),
         }
     }
+}
+
+/// `Authorization: Bearer <k>`, built by hand (not `bearer_auth`) so the value is marked
+/// sensitive and stays out of any debug output. The error names no part of the key.
+fn bearer_header(k: &str) -> Result<reqwest::header::HeaderValue, HttpError> {
+    let mut value =
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {k}")).map_err(|_| {
+            HttpError::Other("the API key holds characters a header cannot carry".into())
+        })?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 /// The error's text without the URL it carries (a URL may hold a query token).
@@ -233,6 +237,15 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn the_bearer_header_is_sensitive_and_hidden_from_debug_output() {
+        let key = concat!("ts_", "live_header_test_key");
+        let v = bearer_header(key).unwrap();
+        assert!(v.is_sensitive());
+        assert!(!format!("{v:?}").contains("header_test_key"), "{v:?}");
+        assert_eq!(v.to_str().unwrap(), format!("Bearer {key}"));
     }
 
     #[test]

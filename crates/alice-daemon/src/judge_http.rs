@@ -14,7 +14,8 @@ use crate::writer::{WriteOp, WriterHandle};
 use alice_core::judge::Judge;
 use alice_core::judge::heuristic::HeuristicJudge;
 use alice_core::judge::jev::{
-    HttpReply, JevCall, JevConfig, JevJudge, JevPolicy, JevStore, JevTransport, TransportError,
+    HttpReply, JevCall, JevConfig, JevJudge, JevLimits, JevPolicy, JevStore, JevTransport,
+    TransportError,
 };
 use alice_core::redact::Redactor;
 use alice_core::settings::{JudgeProvider, Settings};
@@ -24,7 +25,8 @@ use alice_embed::net::{BlockingHttp, HttpError};
 use parking_lot::{Mutex, RwLock};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// The HTTP client's identity: the program and its version, nothing about the person or the
 /// machine.
@@ -68,7 +70,8 @@ impl JevTransport for ReqwestTransport {
                 })
             }
             Err(HttpError::Timeout) => Err(TransportError::Timeout),
-            Err(HttpError::Connect(e) | HttpError::Other(e)) => Err(TransportError::Connect(e)),
+            Err(HttpError::Connect(e)) => Err(TransportError::Connect(e)),
+            Err(HttpError::Other(e)) => Err(TransportError::Lost(e)),
         }
     }
 }
@@ -94,7 +97,14 @@ impl JevStore for DaemonJevStore {
     }
 
     fn record(&self, call: &JevCall) {
-        self.writer.send_nowait(WriteOp::JudgeCall(call.clone()));
+        // The judge has counted this spend in its in-memory budget either way; only the ledger
+        // row (and so a restart's view of the day) is lost if the writer has stopped.
+        if !self.writer.try_send(WriteOp::JudgeCall(call.clone())) {
+            tracing::error!(
+                usd = call.usd,
+                "the writer has stopped; a Jev call's cost and answer were not recorded"
+            );
+        }
     }
 }
 
@@ -191,6 +201,7 @@ fn heuristic() -> Arc<dyn Judge> {
 
 /// The judge `settings` ask for, and a warning when it had to fall back to the heuristic.
 /// `transport` is asked for only when Jev is wanted and has a key.
+#[allow(clippy::too_many_arguments)]
 pub fn build_judge(
     settings: &Settings,
     secrets: &dyn SecretStore,
@@ -198,6 +209,7 @@ pub fn build_judge(
     readers: Arc<ReaderPool>,
     writer: WriterHandle,
     policy: Arc<dyn JevPolicy>,
+    limits: Arc<JevLimits>,
     transport: &dyn Fn() -> Result<Arc<dyn JevTransport>, String>,
 ) -> (Arc<dyn Judge>, Option<String>) {
     if settings.judge.provider == JudgeProvider::Heuristic {
@@ -233,23 +245,38 @@ pub fn build_judge(
     };
     let cfg = JevConfig::from_settings(&settings.judge, key);
     (
-        Arc::new(JevJudge::new(
-            cfg,
-            transport,
-            Arc::new(DaemonJevStore { readers, writer }),
-            policy,
-        )),
+        Arc::new(
+            JevJudge::new(
+                cfg,
+                transport,
+                Arc::new(DaemonJevStore { readers, writer }),
+                policy,
+            )
+            .with_limits(limits),
+        ),
         None,
     )
 }
 
-/// The judge in force and the reason it is not the one asked for. Rebuilt when `judge.*` or
-/// `privacy.*` settings change or the Jev key is set or deleted; settings and secrets are read
-/// at each rebuild, never kept.
+/// The judge in force and the reason it is not the one asked for. Rebuilt when `judge.*`
+/// settings change or the Jev key is set or deleted; settings and secrets are read at each
+/// rebuild, never kept. (The cloud policy and the redactors are read at each call, so a
+/// `privacy.*` change needs no rebuild; a hand-edited `secrets.toml` is read at the next
+/// rebuild or restart.)
+///
+/// Reading the key may wait on an OS keychain prompt, so a rebuild for Jev runs on a worker
+/// thread: the heuristic (or the previous judge) answers meanwhile and `warning` says what is
+/// going on, and says so louder after `build_timeout`.
 pub struct JudgeHub {
     slot: RwLock<(Arc<dyn Judge>, Option<String>)>,
-    /// One rebuild at a time; the later one reads the newest settings.
-    building: Mutex<()>,
+    /// Counts builds; a build installs its judge only if it is still the newest.
+    generation: AtomicU64,
+    /// When the newest build, if it has not finished, began.
+    pending: Mutex<Option<Instant>>,
+    build_timeout: Duration,
+    /// Shared by every judge this hub builds: the budget reservations, the token ratio and the
+    /// request rate survive a rebuild.
+    limits: Arc<JevLimits>,
     settings: Arc<SettingsHandle>,
     secrets: Arc<dyn SecretStore>,
     secret_env: SecretEnv,
@@ -272,6 +299,7 @@ impl JudgeHub {
         writer: WriterHandle,
         redactors: Arc<Redactors>,
         injected: Option<Arc<dyn JevTransport>>,
+        build_timeout: Duration,
     ) -> Arc<Self> {
         let policy: Arc<dyn JevPolicy> = Arc::new(DaemonJevPolicy::new(
             settings.clone(),
@@ -280,7 +308,10 @@ impl JudgeHub {
         ));
         let hub = Arc::new(Self {
             slot: RwLock::new((heuristic(), None)),
-            building: Mutex::new(()),
+            generation: AtomicU64::new(0),
+            pending: Mutex::new(None),
+            build_timeout,
+            limits: Arc::new(JevLimits::default()),
             settings,
             secrets,
             secret_env,
@@ -301,6 +332,16 @@ impl JudgeHub {
     /// Why the judge is not the one the settings ask for, else what the judge itself reports
     /// (Jev paused for lack of a readable spend or a used-up budget).
     pub fn warning(&self) -> Option<String> {
+        if let Some(since) = *self.pending.lock() {
+            return Some(if since.elapsed() > self.build_timeout {
+                format!(
+                    "reading the TypeSafe key has taken more than {} s (is the secrets store waiting for a prompt?); the heuristic judge answers until it finishes",
+                    self.build_timeout.as_secs().max(1)
+                )
+            } else {
+                "reading the TypeSafe key for the Jev judge; the heuristic judge answers until it is ready".into()
+            });
+        }
         let (judge, build) = {
             let slot = self.slot.read();
             (slot.0.clone(), slot.1.clone())
@@ -308,9 +349,9 @@ impl JudgeHub {
         build.or_else(|| judge.warning())
     }
 
-    /// Whether the judge in force is a fallback for the one asked for.
+    /// Whether the judge in force is a stand-in for the one asked for.
     pub fn fell_back(&self) -> bool {
-        self.slot.read().1.is_some()
+        self.pending.lock().is_some() || self.slot.read().1.is_some()
     }
 
     fn transport(&self) -> Result<Arc<dyn JevTransport>, String> {
@@ -327,28 +368,62 @@ impl JudgeHub {
         Ok(t)
     }
 
-    /// Builds the judge from the settings and secrets as they are now.
-    pub fn rebuild(&self) {
-        let _one_at_a_time = self.building.lock();
-        let settings = self.settings.get();
-        let built = build_judge(
-            &settings,
+    fn build(&self) -> (Arc<dyn Judge>, Option<String>) {
+        build_judge(
+            &self.settings.get(),
             self.secrets.as_ref(),
             self.secret_env.as_ref(),
             self.readers.clone(),
             self.writer.clone(),
             self.policy.clone(),
+            self.limits.clone(),
             &|| self.transport(),
-        );
-        *self.slot.write() = built;
+        )
+    }
+
+    /// Installs `built` if build number `generation` is still the newest.
+    fn install(&self, generation: u64, built: (Arc<dyn Judge>, Option<String>)) {
+        let mut slot = self.slot.write();
+        if self.generation.load(Ordering::SeqCst) == generation {
+            *slot = built;
+            *self.pending.lock() = None;
+        }
+    }
+
+    /// Builds the judge now, on this thread, from the settings and secrets as they are. For a
+    /// caller that already waits on the secrets store with a timeout of its own (`set_secret`).
+    pub fn rebuild_now(&self) {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let built = self.build();
+        self.install(generation, built);
+    }
+
+    /// Builds the judge without waiting for it: at once when the heuristic is wanted (nothing
+    /// to read), otherwise on a worker thread.
+    pub fn rebuild(self: &Arc<Self>) {
+        if self.settings.get().judge.provider == JudgeProvider::Heuristic {
+            return self.rebuild_now();
+        }
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.pending.lock() = Some(Instant::now());
+        let hub = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("alice-judge-build".into())
+            .spawn(move || {
+                let built = hub.build();
+                hub.install(generation, built);
+            });
+        if let Err(e) = spawned {
+            tracing::error!(error = %e, "cannot start the judge build thread; building inline");
+            *self.pending.lock() = None;
+            let built = self.build();
+            self.install(generation, built);
+        }
     }
 
     /// Settings keys changed: rebuild when one of them can change the judge.
-    pub fn on_change(&self, changed: &[String]) {
-        if changed
-            .iter()
-            .any(|k| k.starts_with("judge.") || k.starts_with("privacy."))
-        {
+    pub fn on_change(self: &Arc<Self>, changed: &[String]) {
+        if changed.iter().any(|k| k.starts_with("judge.")) {
             self.rebuild();
         }
     }
@@ -478,7 +553,9 @@ mod tests {
         assert_eq!(f.judge.stats().denied, 1);
         // The other project, and the unscoped text, still go.
         f.judge.classify_in(&["plain"], "text", &yes_no()).unwrap();
-        f.judge.classify("other text", &yes_no()).unwrap();
+        f.judge
+            .classify_in(&["global"], "other text", &yes_no())
+            .unwrap();
         assert_eq!(f.transport.bodies.lock().len(), 2);
         // A call that covers both is denied as a whole.
         let (mut new, mut existing) = scenarios::compare_case();
@@ -600,6 +677,10 @@ mod tests {
             );
         }
         assert_eq!(f.judge.classify("text", &yes_no()), Err(JudgeError::Denied));
+        assert_eq!(
+            f.judge.classify_constant("text", &yes_no()),
+            Err(JudgeError::Denied)
+        );
         assert!(f.transport.bodies.lock().is_empty());
     }
 

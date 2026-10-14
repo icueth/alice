@@ -282,8 +282,22 @@ pub trait Judge: Send + Sync {
         None
     }
 
-    /// P over `options` for `state`.
+    /// P over `options` for `state`. A provider that sends text away (Jev) refuses this entry
+    /// point with [`JudgeError::Denied`]: it cannot know which project the text belongs to. A
+    /// caller with project text uses the scoped methods; one whose text carries none uses
+    /// [`classify_constant`](Self::classify_constant).
     fn classify(&self, state: &str, options: &[Choice]) -> JudgeResult<Distribution>;
+
+    /// [`classify`](Self::classify) for a text that is a constant of the program and so holds
+    /// no project content (a connection test). `'static` is the proof: a text built at run time
+    /// does not fit.
+    fn classify_constant(
+        &self,
+        state: &'static str,
+        options: &[Choice],
+    ) -> JudgeResult<Distribution> {
+        self.classify(state, options)
+    }
 
     /// The expected level of `rubric` (0 = worst, 1 = best) and how sure the judge is.
     fn score(&self, state: &str, rubric: &Rubric) -> JudgeResult<Score>;
@@ -329,8 +343,11 @@ pub trait Judge: Send + Sync {
         )
     }
 
+    /// `query_project` is the project the query was asked from: a provider that sends text
+    /// away needs it besides the projects of `results`.
     fn grade_relevance(
         &self,
+        _query_project: &str,
         query: &str,
         results: &[JudgeMemory],
     ) -> JudgeResult<Vec<Distribution>> {

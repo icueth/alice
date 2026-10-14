@@ -81,14 +81,14 @@ fn record_fixtures() {
     println!("kind: {:?}", kind.best());
     requests.push(("kind", j.last_request().unwrap()));
     let (q, results) = scenarios::relevance_case();
-    let grades = j.grade_relevance(&q, &results).unwrap();
+    let grades = j.grade_relevance("alice", &q, &results).unwrap();
     println!(
         "relevance: {:?}",
         grades.iter().map(|g| g.best()).collect::<Vec<_>>()
     );
     requests.push(("relevance", j.last_request().unwrap()));
     let yes = j
-        .classify(scenarios::CLASSIFY_STATE, &scenarios::classify_choices())
+        .classify_constant(scenarios::CLASSIFY_STATE, &scenarios::classify_choices())
         .unwrap();
     println!("classify: {:?}", yes.best());
     requests.push(("classify", j.last_request().unwrap()));

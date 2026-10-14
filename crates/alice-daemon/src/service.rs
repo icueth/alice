@@ -550,6 +550,7 @@ impl Service {
             writer.clone(),
             redactors.clone(),
             opts.jev_transport.clone(),
+            opts.secrets_timeout,
         );
         if let Err(e) = spawn_config_events(&settings, &writer, &judge) {
             // The worker and the writer are running already: stop them, do not leak them.
@@ -1398,7 +1399,7 @@ impl Service {
             after: None,
         });
         if name == SecretName::JevApiKey {
-            self.judge.rebuild();
+            self.judge.rebuild_now();
         }
         Ok(secrets::status_with(
             self.secrets.as_ref(),
@@ -1420,7 +1421,7 @@ impl Service {
                 after: None,
             });
             if name == SecretName::JevApiKey {
-                self.judge.rebuild();
+                self.judge.rebuild_now();
             }
         }
         Ok(had)
@@ -1536,7 +1537,7 @@ impl Service {
                 }
                 use alice_core::judge::jev::scenarios;
                 let r = tokio::task::spawn_blocking(move || {
-                    j.classify(scenarios::CLASSIFY_STATE, &scenarios::classify_choices())
+                    j.classify_constant(scenarios::CLASSIFY_STATE, &scenarios::classify_choices())
                 })
                 .await
                 .map_err(join_err)?;
@@ -2988,6 +2989,8 @@ mod tests {
         /// Calls that reached the store.
         gets: std::sync::atomic::AtomicUsize,
         sets: std::sync::atomic::AtomicUsize,
+        /// Reads fail as a locked keychain's would.
+        fail_get: AtomicBool,
     }
 
     impl MemSecrets {
@@ -2997,6 +3000,7 @@ mod tests {
                 delay_ms: std::sync::atomic::AtomicU64::new(delay.as_millis() as u64),
                 gets: Default::default(),
                 sets: Default::default(),
+                fail_get: AtomicBool::new(false),
             })
         }
         fn wait(&self) {
@@ -3009,6 +3013,9 @@ mod tests {
         fn get(&self, name: SecretName) -> Result<Option<SecretValue>> {
             self.gets.fetch_add(1, Ordering::SeqCst);
             self.wait();
+            if self.fail_get.load(Ordering::SeqCst) {
+                return Err(AliceError::Other("the keychain is locked".into()));
+            }
             Ok(self.map.lock().get(&name).map(SecretValue::new))
         }
         fn set(&self, name: SecretName, value: &str) -> Result<()> {
@@ -3785,6 +3792,105 @@ mod tests {
         s.delete_secret(SecretName::JevApiKey).unwrap();
         assert_eq!(s.judge().provider(), "heuristic");
         assert!(s.judge_warning().unwrap().contains("no TypeSafe key"));
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_secrets_store_never_holds_up_start_and_the_warning_says_so() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        home.ensure_dirs().unwrap();
+        std::fs::write(home.config_file(), "[judge]\nprovider = \"jev\"\n").unwrap();
+        let store = MemSecrets::new(Duration::ZERO);
+        store.set(SecretName::JevApiKey, JEV_TEST_KEY).unwrap();
+        store.delay_ms.store(500, Ordering::SeqCst);
+        let transport = Arc::new(ScriptedJev {
+            sent: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let started = Instant::now();
+        let s = Service::start(
+            home,
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                secrets: Some(store.clone()),
+                secrets_timeout: Duration::from_millis(150),
+                jev_transport: Some(transport),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            s.judge().provider(),
+            "heuristic",
+            "the heuristic answers meanwhile"
+        );
+        let w = s.judge_warning().expect("a warning while the key is read");
+        assert!(w.contains("reading the TypeSafe key"), "{w}");
+        let t = s.test_provider("judge").await.unwrap();
+        assert!(!t.ok, "{t:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let w = s.judge_warning().expect("still reading");
+        assert!(w.contains("taking") || w.contains("has taken"), "{w}");
+        until("the Jev judge", || {
+            (s.judge().provider() == "jev").then_some(())
+        })
+        .await;
+        assert_eq!(s.judge_warning(), None);
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_that_cannot_be_read_falls_back_with_a_warning_and_privacy_changes_keep_the_judge()
+     {
+        let d = tempfile::tempdir().unwrap();
+        let store = MemSecrets::new(Duration::ZERO);
+        store.set(SecretName::JevApiKey, JEV_TEST_KEY).unwrap();
+        let transport = Arc::new(ScriptedJev {
+            sent: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                secrets: Some(store.clone()),
+                jev_transport: Some(transport),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        store.fail_get.store(true, Ordering::SeqCst);
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        let w = until("the key warning", || {
+            s.judge_warning().filter(|w| w.contains("cannot be read"))
+        })
+        .await;
+        assert!(
+            w.contains("keychain is locked") && !w.contains("service_test"),
+            "{w}"
+        );
+        assert_eq!(s.judge().provider(), "heuristic");
+        store.fail_get.store(false, Ordering::SeqCst);
+        s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(2.0)))
+            .unwrap();
+        until("the Jev judge", || {
+            (s.judge().provider() == "jev").then_some(())
+        })
+        .await;
+        let judge = s.judge();
+        // A privacy change is read per call: the judge is not rebuilt.
+        s.patch_settings(patch_one(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["other"]),
+        ))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(Arc::ptr_eq(&judge, &s.judge()));
         s.shutdown();
     }
 

@@ -217,11 +217,18 @@ impl WriterHandle {
 
     /// Fire and forget (access counters, shutdown).
     pub fn send_nowait(&self, op: WriteOp) {
-        let _ = self.tx.send(Job {
-            op,
-            reply: None,
-            progress: None,
-        });
+        let _ = self.try_send(op);
+    }
+
+    /// Fire and forget, saying whether the writer took it (`false`: it has stopped).
+    pub fn try_send(&self, op: WriteOp) -> bool {
+        self.tx
+            .send(Job {
+                op,
+                reply: None,
+                progress: None,
+            })
+            .is_ok()
     }
 }
 
@@ -733,7 +740,9 @@ fn apply(
             WriteOutcome::Done
         }
         WriteOp::JudgeCall(c) => {
-            judge_store::cache_put(conn, &c.hash, "jev", &c.model, &c.response_json)?;
+            if c.cacheable {
+                judge_store::cache_put(conn, &c.hash, "jev", &c.model, &c.response_json)?;
+            }
             judge_store::add_cost(
                 conn,
                 &judge_store::CostDelta {
