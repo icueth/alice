@@ -589,6 +589,18 @@ impl DaemonClient {
         )
         .await
     }
+    /// Start importing a MemPalace palace; the answer is the job's first status.
+    pub async fn start_import(
+        &self,
+        r: &alice_core::import::ImportRequest,
+    ) -> Result<alice_core::import::ImportStatus> {
+        self.call("/api/v1/import/mempalace", r, Duration::from_secs(30))
+            .await
+    }
+    /// The running import's progress, or the last one's outcome.
+    pub async fn import_status(&self) -> Result<alice_core::import::ImportStatus> {
+        self.get_json("/api/v1/import/status").await
+    }
     /// Every setting with its source, the problems, the secrets' status (never a value).
     pub async fn settings(&self) -> Result<SettingsView> {
         self.get_json("/api/v1/settings").await

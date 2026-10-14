@@ -466,6 +466,34 @@ pub fn open_snapshot(s: &Snapshot, collection: Option<&str>) -> Result<Box<dyn P
     }
 }
 
+/// Documents in the palace's `mempalace_closets` collection (MemPalace's index of drawers; it is
+/// not imported). 0 when the collection is missing or unreadable: the number is only reported.
+pub fn count_closets(s: &Snapshot) -> u64 {
+    const NAME: &str = "mempalace_closets";
+    let (file, sql) = match s.backend {
+        Backend::SqliteExact => (
+            MAIN_FILE,
+            "SELECT count(*) FROM documents d JOIN collections c ON c.id = d.collection_id WHERE c.name = ?1",
+        ),
+        Backend::Chroma => (
+            CHROMA_FILE,
+            "SELECT count(*) FROM embeddings e
+             JOIN segments sg ON sg.id = e.segment_id AND sg.scope = 'METADATA'
+             JOIN collections c ON c.id = sg.collection
+             WHERE c.name = ?1",
+        ),
+    };
+    let Ok(conn) = Connection::open_with_flags(
+        s.dir.join(file),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return 0;
+    };
+    conn.query_row(sql, [NAME], |r| r.get::<_, i64>(0))
+        .map(|n| n.max(0) as u64)
+        .unwrap_or(0)
+}
+
 struct SqliteExactReader {
     info: PalaceInfo,
     conn: Connection,
@@ -752,6 +780,20 @@ mod tests {
             seen.extend(p.into_iter().map(|d| d.id));
         }
         seen
+    }
+
+    #[test]
+    fn closets_are_counted_from_the_snapshot_and_a_missing_collection_counts_zero() {
+        let src = tempfile::tempdir().unwrap();
+        build_sqlite_exact(src.path(), &sample(3));
+        let dst = tempfile::tempdir().unwrap();
+        let snap = snapshot(src.path(), dst.path(), None).unwrap();
+        assert_eq!(count_closets(&snap), 1);
+        let chroma_src = tempfile::tempdir().unwrap();
+        crate::import::fixture::build_chroma(chroma_src.path(), &sample(3));
+        let chroma_dst = tempfile::tempdir().unwrap();
+        let snap = snapshot(chroma_src.path(), chroma_dst.path(), None).unwrap();
+        assert_eq!(count_closets(&snap), 0, "the chroma fixture has no closets");
     }
 
     #[test]

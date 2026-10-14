@@ -630,6 +630,94 @@ async fn every_route_is_served() {
         .await
         .unwrap();
     assert_eq!(ingested["inserted"], 1);
+    // The import routes: idle at first, a refusal names the fix, a dry run answers 202.
+    let idle: alice_core::import::ImportStatus = s.get_json("/api/v1/import/status").await;
+    assert_eq!(idle.state, alice_core::import::ImportState::Idle);
+    let refused = s
+        .post("/api/v1/import/mempalace", &serde_json::json!({}))
+        .await;
+    assert_eq!(refused.status(), 400);
+    let e: serde_json::Value = refused.json().await.unwrap();
+    assert!(e["error"].as_str().unwrap().contains("--palace"), "{e}");
+    let palace = tempfile::tempdir().unwrap();
+    alice_core::import::fixture::build_sqlite_exact(
+        palace.path(),
+        &[alice_core::import::fixture::DrawerSpec {
+            id: "d1".into(),
+            text: "a note".into(),
+            meta: alice_core::import::palace::DrawerMeta {
+                wing: "w".into(),
+                room: "knowledge".into(),
+                ..Default::default()
+            },
+        }],
+    );
+    let started = s
+        .post(
+            "/api/v1/import/mempalace",
+            &serde_json::json!({"palace": palace.path(), "dry_run": true}),
+        )
+        .await;
+    assert_eq!(started.status(), 202);
+    let first: alice_core::import::ImportStatus = started.json().await.unwrap();
+    assert!(first.job_id.is_some());
+    let mut last = first;
+    for _ in 0..200 {
+        last = s.get_json("/api/v1/import/status").await;
+        if last.state != alice_core::import::ImportState::Running {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        last.state,
+        alice_core::import::ImportState::Done,
+        "{:?}",
+        last.error
+    );
+    assert_eq!(last.report.unwrap().tiers.knowledge, 1);
+}
+
+/// Both import routes sit behind the same guard as every other route.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_routes_need_the_token_host_and_origin_guards() {
+    let s = Srv::start().await;
+    for (method, path) in [
+        (reqwest::Method::POST, "/api/v1/import/mempalace"),
+        (reqwest::Method::GET, "/api/v1/import/status"),
+    ] {
+        let call = |token: Option<&str>, host: Option<&str>, origin: Option<&str>| {
+            let mut r = s
+                .http
+                .request(method.clone(), s.url(path))
+                .json(&serde_json::json!({}));
+            if let Some(t) = token {
+                r = r.bearer_auth(t);
+            }
+            if let Some(h) = host {
+                r = r.header("Host", h);
+            }
+            if let Some(o) = origin {
+                r = r.header("Origin", o);
+            }
+            r.send()
+        };
+        let no_token = call(None, None, None).await.unwrap();
+        assert_eq!(no_token.status(), 401, "{path}");
+        let bad_host = call(Some(&s.token), Some("evil.example:80"), None)
+            .await
+            .unwrap();
+        assert_eq!(bad_host.status(), 403, "{path}");
+        let bad_origin = call(Some(&s.token), None, Some("https://evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(bad_origin.status(), 403, "{path}");
+    }
+    assert_eq!(
+        s.svc.import_status().state,
+        alice_core::import::ImportState::Idle,
+        "a refused call starts nothing"
+    );
 }
 
 /// Bodies the API cannot parse get the same JSON error shape as every other error.

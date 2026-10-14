@@ -6,6 +6,7 @@ pub mod config;
 pub mod daemon;
 pub mod discovery;
 pub mod http;
+pub mod importer;
 pub mod judge_http;
 pub mod judge_worker;
 pub mod maintenance;

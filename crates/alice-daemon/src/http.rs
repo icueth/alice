@@ -405,6 +405,23 @@ async fn run_maintenance(
     Ok(Json(st.svc.run_job(job).await?))
 }
 
+/// Starts an import; the answer is its first status (poll `/api/v1/import/status`).
+async fn start_import(
+    State(st): State<AppState>,
+    ApiJson(req): ApiJson<alice_core::import::ImportRequest>,
+) -> Result<(StatusCode, Json<alice_core::import::ImportStatus>), ApiError> {
+    let svc = st.svc.clone();
+    // The folder checks touch the disk: off the runtime threads.
+    let status = tokio::task::spawn_blocking(move || svc.start_import(req))
+        .await
+        .map_err(|e| ApiError(AliceError::Other(format!("internal task failed: {e}"))))??;
+    Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+async fn import_status(State(st): State<AppState>) -> Json<alice_core::import::ImportStatus> {
+    Json(st.svc.import_status())
+}
+
 /// A refused settings change: the first problem as `error` (like every refusal), and all of
 /// them as `errors`, each with the key it is about.
 #[derive(Serialize)]
@@ -626,6 +643,8 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
             "/api/v1/secrets/{name}",
             put(put_secret).delete(delete_secret),
         )
+        .route("/api/v1/import/mempalace", post(start_import))
+        .route("/api/v1/import/status", get(import_status))
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         // Before the guard layer, so `/mcp` is covered by it.
         .nest_service(

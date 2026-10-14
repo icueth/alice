@@ -5,6 +5,7 @@
 
 use crate::backup::{self, BackupInfo, BackupKind};
 use crate::config::SettingsHandle;
+use crate::importer::{self, ImportEnv, ImportSlot};
 use crate::judge_http::JudgeHub;
 use crate::judge_worker::{JudgeWorkerConfig, spawn_judge_worker};
 use crate::maintenance::{Activity, Job, JobReport, MaintenanceCtx, Scheduler};
@@ -59,6 +60,8 @@ const JUDGE_STOP_WAIT: Duration = if cfg!(test) {
 
 /// How long `shutdown` waits for a maintenance job to reach the end of its slice.
 const MAINTENANCE_STOP_WAIT: Duration = Duration::from_secs(3);
+/// How long shutdown waits for an import that is inside one long step (a snapshot copy).
+const IMPORT_STOP_WAIT: Duration = Duration::from_secs(30);
 
 /// How long a working directory's detected project is reused before git is asked again.
 const DETECT_TTL: Duration = Duration::from_secs(60);
@@ -127,6 +130,11 @@ pub struct ServiceOptions {
     /// move or review item) and only activates memories. For `alice bench`, whose generated
     /// corpus must stay as it was written.
     pub judge_applies: bool,
+    /// MemPalace's own folder (`~/.mempalace`): an import never writes into it, and an import
+    /// that names no palace reads `<this>/palace`. `None`: no palace is ever looked up on the
+    /// machine (the default, so tests and embedded services touch nothing outside their home);
+    /// [`ServiceOptions::process_env`] sets it from `$HOME`.
+    pub mempalace_home: Option<PathBuf>,
 }
 
 impl Default for ServiceOptions {
@@ -150,6 +158,7 @@ impl Default for ServiceOptions {
             judge_retry_every: JudgeWorkerConfig::RETRY_EVERY,
             judge_retry_base: alice_core::store::judge::RETRY_BASE,
             judge_applies: true,
+            mempalace_home: None,
         }
     }
 }
@@ -161,6 +170,7 @@ impl ServiceOptions {
         Self {
             settings_env: None,
             secret_env: None,
+            mempalace_home: dirs::home_dir().map(|h| h.join(".mempalace")),
             ..Self::default()
         }
     }
@@ -351,6 +361,8 @@ pub struct Service {
     activity: Arc<Activity>,
     /// The maintenance jobs, shared with the scheduler thread so `run_job` can run one on demand.
     scheduler: Arc<Scheduler>,
+    /// The one import job (a running one, or the last one's outcome).
+    import: Mutex<ImportSlot>,
     /// Tests: time added to the age of the shared health reading.
     #[cfg(test)]
     health_aged: Mutex<Duration>,
@@ -545,6 +557,8 @@ impl Service {
         opts: ServiceOptions,
     ) -> Result<Arc<Service>> {
         home.ensure_dirs()?;
+        // No import can be running at start: whatever an earlier one left is garbage.
+        let _ = std::fs::remove_dir_all(home.import_tmp());
         // Settings first: everything below reads them (the model's idle unload and the port are
         // read by the daemon from the same handle).
         let settings = opts
@@ -707,6 +721,7 @@ impl Service {
             secrets_write: Arc::new(tokio::sync::Mutex::new(())),
             activity,
             scheduler,
+            import: Mutex::new(ImportSlot::new()),
             #[cfg(test)]
             health_aged: Mutex::new(Duration::ZERO),
             #[cfg(test)]
@@ -752,6 +767,19 @@ impl Service {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.wake_worker.try_send(());
         let _ = self.wake_judge.try_send(());
+        // The import first: it reads and, later, writes through the pieces stopped below.
+        let import = self.import.lock().handle.take();
+        if let Some(h) = import {
+            let waited = Instant::now();
+            while !h.is_finished() && waited.elapsed() < IMPORT_STOP_WAIT {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !h.is_finished() {
+                tracing::warn!("the import is inside a long step; stopping without it");
+            } else if h.join().is_err() {
+                tracing::error!("the import thread panicked");
+            }
+        }
         // An integrity check in progress is interrupted; a backup stops at its next step.
         self.scheduler.interrupt_running();
         // A job ends at its next slice. One inside a long single step (a backup, a check of the
@@ -2257,6 +2285,83 @@ impl Service {
     pub async fn projects(&self) -> Result<Vec<ResolvedProject>> {
         let _busy = self.activity.enter();
         self.read(projects::list_projects).await
+    }
+
+    // ------------------------------------------------------------------ import
+
+    /// Starts an import of a MemPalace palace on a thread of its own. The refusals that need
+    /// no work (one already running, no palace, a missing or foreign folder, a bad `since`, a
+    /// remote embedding provider) come back at once; everything else shows in
+    /// [`import_status`](Self::import_status).
+    pub fn start_import(
+        self: &Arc<Self>,
+        req: alice_core::import::ImportRequest,
+    ) -> Result<alice_core::import::ImportStatus> {
+        use alice_core::import::{ImportState, ImportStatus};
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(AliceError::invalid(
+                "the daemon is stopping; start it again and rerun the import",
+            ));
+        }
+        let mut slot = self.import.lock();
+        {
+            let st = slot.status.lock();
+            if st.state == ImportState::Running {
+                return Err(AliceError::invalid(format!(
+                    "an import is already running (phase {}, {} of {} drawers); wait for it, or follow it with `alice import status`",
+                    st.phase, st.done, st.total
+                )));
+            }
+        }
+        let palace = importer::preflight(
+            &req,
+            self.opts.mempalace_home.as_deref(),
+            &self.settings.get(),
+        )?;
+        // The last job has finished (its status is no longer `Running`).
+        if let Some(old) = slot.handle.take() {
+            let _ = old.join();
+        }
+        let job_id = new_id();
+        let first = ImportStatus {
+            state: ImportState::Running,
+            job_id: Some(job_id.clone()),
+            phase: "starting".to_string(),
+            done: 0,
+            total: 0,
+            report: None,
+            error: None,
+        };
+        *slot.status.lock() = first.clone();
+        let env = ImportEnv {
+            readers: self.readers.clone(),
+            writer: self.writer.clone(),
+            redactors: self.redactors.clone(),
+            settings: self.settings.clone(),
+            stop: self.stop.clone(),
+            home: self.home.clone(),
+            mempalace_home: self.opts.mempalace_home.clone(),
+            guard: self.activity.enter_owned(),
+            status: slot.status.clone(),
+        };
+        match importer::spawn(env, req, palace, job_id) {
+            Ok(handle) => {
+                slot.handle = Some(handle);
+                Ok(first)
+            }
+            Err(e) => {
+                *slot.status.lock() = ImportStatus::idle();
+                Err(AliceError::Other(format!(
+                    "could not start the import thread: {e}"
+                )))
+            }
+        }
+    }
+
+    /// The running import's progress, or the last one's outcome. Cheap: no I/O.
+    pub fn import_status(&self) -> alice_core::import::ImportStatus {
+        // Slot, then status: the order `start_import` takes them in.
+        self.import.lock().status.lock().clone()
     }
 
     // ------------------------------------------------------------------ maintenance

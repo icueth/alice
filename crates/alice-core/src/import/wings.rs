@@ -143,6 +143,14 @@ impl WingMap {
         }
     }
 
+    /// How `wing` reaches its target (for the report's wing map).
+    pub fn via(&self, wing: &str) -> Via {
+        match self.table.get(wing) {
+            Some((_, v)) => *v,
+            None => self.classify(wing).1,
+        }
+    }
+
     /// Project slugs (not agents) with the wing spellings that map to each: slug → wings.
     pub fn projects(&self) -> BTreeMap<String, Vec<String>> {
         self.projects.clone()
