@@ -1271,6 +1271,14 @@ fn import_batch(conn: &Connection, batch: Box<ImportBatch>, st: &mut State) -> R
     if !fresh {
         return Ok(Applied::More(WriteOp::ImportBatch(batch), None));
     }
+    let (records, bytes) = batch.weight();
+    if records > INGEST_SLICE || bytes > INGEST_SLICE_BYTES {
+        tracing::warn!(
+            records,
+            bytes,
+            "an import batch is heavier than one commit's budget; the importer should send smaller ones"
+        );
+    }
     // Charged in full, whatever the batch weighs (`ImportBatch::weight` is at most what a
     // fresh commit holds for the importer's batch sizes): nothing else of its kind joins it.
     st.chunk_budget = 0;
@@ -2293,15 +2301,25 @@ mod tests {
 
     #[tokio::test]
     async fn an_import_batch_and_an_ingest_slice_never_share_one_group_commit() {
+        for import_first in [false, true] {
+            never_share(import_first).await;
+        }
+    }
+
+    async fn never_share(import_first: bool) {
         let d = tempfile::tempdir().unwrap();
         let conn = open(d.path());
         let (wake_tx, _wake_rx) = crossbeam_channel::unbounded();
         let log: CommitLog = Arc::new(Mutex::new(Vec::new()));
         let (h, _t) = spawn_writer_logged(conn, "dev".into(), wake_tx, log.clone());
-        let (a, b) = tokio::join!(
-            h.submit(ingest("many", 200, |i| format!("short {i}"))),
-            h.submit(WriteOp::ImportBatch(Box::new(sample_import(200)))),
-        );
+        let ing = h.submit(ingest("many", 200, |i| format!("short {i}")));
+        let imp = h.submit(WriteOp::ImportBatch(Box::new(sample_import(200))));
+        let (a, b) = if import_first {
+            let (b, a) = tokio::join!(imp, ing);
+            (a, b)
+        } else {
+            tokio::join!(ing, imp)
+        };
         assert_eq!(ingested(a).inserted, 200);
         assert!(matches!(b, Ok(WriteOutcome::Imported(ref o)) if o.memories_new == 200));
         let log = log.lock();

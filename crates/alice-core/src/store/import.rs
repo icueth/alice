@@ -86,6 +86,11 @@ pub struct ImportFact {
     pub source_drawer_id: Option<String>,
 }
 
+/// One bounded batch of imported records.
+///
+/// Redaction is the importer's contract: every text in the batch (memory content and titles,
+/// chunk text, fact parts) must already be redacted. Neither `apply_batch` nor the writer
+/// redacts, and the event records counts only.
 #[derive(Default)]
 pub struct ImportBatch {
     pub projects: Vec<ImportProject>,
@@ -173,7 +178,7 @@ pub struct BatchOutcome {
     pub errors: Vec<String>,
 }
 
-/// Runs inside `SAVEPOINT import_batch`; on any error rolls back to it and returns the error.
+/// Text must already be redacted (see [`ImportBatch`]). Runs inside `SAVEPOINT import_batch`; on any error rolls back to it and returns the error.
 pub fn apply_batch(
     conn: &Connection,
     b: &ImportBatch,
@@ -204,6 +209,52 @@ fn memory_target(conn: &Connection, drawer_id: &str) -> Result<Option<String>> {
     Ok(legacy_get(conn, drawer_id)?
         .filter(|t| t.target_type == "memory")
         .map(|t| t.target_id))
+}
+
+fn import_fact(
+    conn: &Connection,
+    f: &ImportFact,
+    hlc: &mut dyn FnMut() -> String,
+    out: &mut BatchOutcome,
+) -> Result<()> {
+    let mut add = f.add.clone();
+    add.action = FactAction::Add;
+    if let Some(d) = &f.source_drawer_id {
+        add.source_memory_id = memory_target(conn, d)?;
+    }
+    let stamp = hlc();
+    let res = kg::assert_fact(conn, &add, stamp.clone())?;
+    let Some(rel) = res.relation_id else {
+        out.facts_skipped += 1;
+        return Ok(());
+    };
+    // `assert_fact` answers the open relation of the same triple when there is one; only a row
+    // carrying this call's stamp was created here.
+    let created: bool = conn.query_row(
+        "SELECT hlc = ?2 FROM relations WHERE id = ?1",
+        params![rel, stamp],
+        |r| r.get(0),
+    )?;
+    legacy_put(conn, &f.legacy_id, "relation", &rel)?;
+    if !created {
+        out.facts_skipped += 1;
+        if f.end_at.is_some() {
+            out.warnings.push(format!(
+                "fact {} is an ended interval of a fact that is open now; the open fact was left as it is",
+                f.legacy_id
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(end) = &f.end_at {
+        let mut end_fact = f.add.clone();
+        end_fact.action = FactAction::End;
+        end_fact.valid_from = Some(end.clone());
+        // The relation is new, so it is the only open one of its triple.
+        out.facts_ended += kg::assert_fact(conn, &end_fact, hlc())?.ended;
+    }
+    out.facts_added += 1;
+    Ok(())
 }
 
 fn apply_inner(
@@ -325,30 +376,28 @@ fn apply_inner(
         }
     }
 
-    // 4. Facts.
+    // 4. Facts. A fact is stored only when this import creates its relation: a triple that is
+    // already open (asserted by the owner, or by an earlier import line) is never changed, and
+    // never ended by `end_at`. A bad fact (invalid time, empty part) is reported in `errors`
+    // and does not fail the batch.
     for f in &b.facts {
         if legacy_get(conn, &f.legacy_id)?.is_some() {
             out.facts_skipped += 1;
             continue;
         }
-        let mut add = f.add.clone();
-        add.action = FactAction::Add;
-        if let Some(d) = &f.source_drawer_id {
-            add.source_memory_id = memory_target(conn, d)?;
+        conn.execute_batch("SAVEPOINT import_fact")?;
+        match import_fact(conn, f, hlc, &mut out) {
+            Ok(()) => conn.execute_batch("RELEASE import_fact")?,
+            Err(AliceError::Invalid(m)) => {
+                conn.execute_batch("ROLLBACK TO import_fact; RELEASE import_fact")?;
+                out.errors
+                    .push(format!("fact {} was not stored: {m}", f.legacy_id));
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK TO import_fact; RELEASE import_fact");
+                return Err(e);
+            }
         }
-        let res = kg::assert_fact(conn, &add, hlc())?;
-        let Some(rel) = res.relation_id else {
-            out.facts_skipped += 1;
-            continue;
-        };
-        out.facts_added += 1;
-        if let Some(end) = &f.end_at {
-            let mut end_fact = f.add.clone();
-            end_fact.action = FactAction::End;
-            end_fact.valid_from = Some(end.clone());
-            out.facts_ended += kg::assert_fact(conn, &end_fact, hlc())?.ended;
-        }
-        legacy_put(conn, &f.legacy_id, "relation", &rel)?;
     }
 
     // 5. Links.
@@ -779,6 +828,119 @@ mod tests {
         assert_eq!(
             legacy_get(&conn, "old").unwrap().unwrap().target_id,
             legacy_get(&conn, "d1").unwrap().unwrap().target_id
+        );
+    }
+
+    fn fact_of(legacy: &str, from: &str, end: Option<&str>) -> ImportFact {
+        ImportFact {
+            legacy_id: legacy.into(),
+            add: AssertFact {
+                subject: "alice".into(),
+                predicate: "uses".into(),
+                object: "SQLite".into(),
+                object_kind: ObjectKind::Entity,
+                valid_from: Some(from.into()),
+                ..Default::default()
+            },
+            end_at: end.map(Into::into),
+            source_drawer_id: None,
+        }
+    }
+
+    fn open_relations(conn: &Connection) -> i64 {
+        count(
+            conn,
+            "SELECT count(*) FROM relations WHERE valid_to IS NULL",
+        )
+    }
+
+    #[test]
+    fn an_ended_interval_imported_after_the_open_fact_leaves_the_live_fact_open() {
+        let (_d, conn) = conn();
+        let b = ImportBatch {
+            facts: vec![
+                fact_of("kg:now", "2025-01-01", None),
+                fact_of("kg:old", "2023-01-01", Some("2024-01-01")),
+            ],
+            job_id: "j".into(),
+            ..Default::default()
+        };
+        let out = apply_batch(&conn, &b, &mut hlc()).unwrap();
+        assert_eq!(
+            (out.facts_added, out.facts_ended, out.facts_skipped),
+            (1, 0, 1)
+        );
+        assert_eq!(out.warnings.len(), 1);
+        assert_eq!(open_relations(&conn), 1, "the live fact stays open");
+        assert!(legacy_get(&conn, "kg:old").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_pre_existing_user_fact_is_not_ended_by_an_import() {
+        let (_d, conn) = conn();
+        kg::assert_fact(&conn, &fact_of("", "2025-01-01", None).add, "h1".into()).unwrap();
+        let b = ImportBatch {
+            facts: vec![fact_of("kg:t", "2023-01-01", Some("2024-01-01"))],
+            job_id: "j".into(),
+            ..Default::default()
+        };
+        let out = apply_batch(&conn, &b, &mut hlc()).unwrap();
+        assert_eq!(
+            (out.facts_added, out.facts_ended, out.facts_skipped),
+            (0, 0, 1)
+        );
+        assert_eq!(open_relations(&conn), 1);
+        assert_eq!(count(&conn, "SELECT count(*) FROM relations"), 1);
+    }
+
+    #[test]
+    fn a_bad_fact_is_reported_and_the_rest_of_the_batch_lands() {
+        let (_d, conn) = conn();
+        let mut b = sample_batch();
+        b.facts = vec![
+            fact_of("kg:bad", "2023-01-01", Some("not a time")),
+            fact_of("kg:ok", "2023-01-01", Some("2024-01-01")),
+        ];
+        let out = apply_batch(&conn, &b, &mut hlc()).unwrap();
+        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+        assert!(out.errors[0].contains("kg:bad"));
+        assert_eq!(
+            (out.facts_added, out.facts_ended, out.memories_new),
+            (1, 1, 2)
+        );
+        assert!(legacy_get(&conn, "kg:bad").unwrap().is_none());
+        assert_eq!(count(&conn, "SELECT count(*) FROM relations"), 1);
+    }
+
+    #[test]
+    fn a_legacy_review_marker_skips_a_review_that_was_resolved_without_rejecting() {
+        let (_d, conn) = conn();
+        let b = ImportBatch {
+            reviews: vec![NewReview {
+                kind: reviews::ReviewType::Predicate,
+                payload: serde_json::json!({"p": "y"}),
+                confidence: None,
+                dedupe_key: Some("predicate:y".into()),
+            }],
+            job_id: "j".into(),
+            ..Default::default()
+        };
+        apply_batch(&conn, &b, &mut hlc()).unwrap();
+        let id = reviews::find_open(&conn, "predicate:y").unwrap().unwrap();
+        reviews::mark_resolved(&conn, &id, "map", &crate::store::events::Actor::User).unwrap();
+        assert!(!reviews::was_rejected(&conn, "predicate:y").unwrap());
+        let out = apply_batch(&conn, &b, &mut hlc()).unwrap();
+        assert_eq!((out.reviews_skipped, out.reviews_created), (1, 0));
+        assert_eq!(count(&conn, "SELECT count(*) FROM review_items"), 1);
+    }
+
+    #[test]
+    fn debug_of_a_batch_shows_counts_and_never_text() {
+        let shown = format!("{:?}", sample_batch());
+        assert!(shown.contains("memories: 2"), "{shown}");
+        assert!(
+            !shown.contains("SQLite") && !shown.contains("chunk text"),
+            "{shown}"
         );
     }
 }

@@ -833,7 +833,9 @@ impl Service {
     }
 
     /// One import batch, written by the writer in a commit of its own (the importer's only way
-    /// in; no logic here).
+    /// in; no logic here). The caller must have redacted every text in the batch already:
+    /// nothing below redacts it. Facts and other rows that cannot be stored come back in
+    /// `BatchOutcome::errors`; a batch-level failure rolls the whole batch back.
     #[allow(dead_code)] // the importer (a later task) is the caller
     pub(crate) async fn submit_import(
         &self,
