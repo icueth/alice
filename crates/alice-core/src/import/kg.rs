@@ -6,6 +6,7 @@ use std::path::Path;
 
 use chrono::FixedOffset;
 use rusqlite::{Connection, OpenFlags};
+use sha2::{Digest, Sha256};
 
 use super::plan::{TextFilter, parse_time};
 use crate::error::Result;
@@ -28,6 +29,8 @@ pub struct KgTriple {
     pub valid_to: Option<String>,
     pub extracted_at: Option<String>,
     pub source_drawer_id: Option<String>,
+    /// Read-time remarks (fixed text, no triple data), reported by the plan with an ordinal.
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -44,14 +47,18 @@ fn columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// At most this many individual warnings are kept per list; the rest become one summary line.
+/// At most this many individual warnings are kept; the rest become one summary line.
 const MAX_WARNINGS: usize = 20;
 
-/// Keeps the first [`MAX_WARNINGS`] warnings and adds one line counting the others.
+/// A time column that holds a non-text value (a blob): no date parses from it, so it takes the
+/// "unreadable" path (a warning, and for `valid_to` an ended fact) rather than reading as absent.
+const UNREADABLE: &str = "\u{0}unreadable";
+
 fn given(v: &Option<String>) -> Option<&str> {
     v.as_deref().filter(|s| !s.trim().is_empty())
 }
 
+/// Keeps the first [`MAX_WARNINGS`] warnings and adds one line counting the others.
 fn bounded(mut all: Vec<String>) -> Vec<String> {
     if all.len() > MAX_WARNINGS {
         let more = all.len() - MAX_WARNINGS;
@@ -63,12 +70,19 @@ fn bounded(mut all: Vec<String>) -> Vec<String> {
     all
 }
 
-/// Text of a column; a non-text, non-NULL value counts as missing and sets `bad`.
-fn opt_text(r: &rusqlite::Row<'_>, idx: usize, bad: &mut bool) -> Result<Option<String>> {
+/// Text of a column. A non-text, non-NULL value is [`UNREADABLE`] when `sentinel`, else missing
+/// (and sets `bad` so the triple gets a note).
+fn opt_text(
+    r: &rusqlite::Row<'_>,
+    idx: usize,
+    sentinel: bool,
+    bad: &mut bool,
+) -> Result<Option<String>> {
     use rusqlite::types::ValueRef;
     Ok(match r.get_ref(idx)? {
         ValueRef::Null => None,
         ValueRef::Text(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        _ if sentinel => Some(UNREADABLE.to_string()),
         _ => {
             *bad = true;
             None
@@ -76,8 +90,9 @@ fn opt_text(r: &rusqlite::Row<'_>, idx: usize, bad: &mut bool) -> Result<Option<
     })
 }
 
-/// Reads the copied knowledge graph read-only, resolving entity ids to names. Warnings never
-/// carry entity text; they name the triple id only.
+/// Reads the copied knowledge graph read-only, resolving entity ids to names. MemPalace triple
+/// ids embed the triple's text, so no warning ever prints one; read-time notes ride on the
+/// triple and are reported by position in the plan.
 pub fn read_kg(path: &Path) -> Result<Kg> {
     let conn = Connection::open_with_flags(
         path,
@@ -101,17 +116,17 @@ pub fn read_kg(path: &Path) -> Result<Kg> {
         col("extracted_at"),
     );
     let mut kg = Kg::default();
-    let mut warnings = Vec::new();
     let mut st = conn.prepare(&sql)?;
     let mut rows = st.query([])?;
     while let Some(r) = rows.next()? {
         let id: String = r.get(0)?;
+        let mut notes = Vec::new();
         let mut name = |idx: usize, role: &str| -> Result<String> {
             let ent: String = r.get(idx - 1)?;
             let resolved: Option<String> = r.get(idx)?;
             Ok(resolved.unwrap_or_else(|| {
-                warnings.push(format!(
-                    "triple {id}: the {role} entity has no entity row; its id is used as the name"
+                notes.push(format!(
+                    "the {role} entity has no entity row; its id is used as the name"
                 ));
                 ent
             }))
@@ -119,14 +134,13 @@ pub fn read_kg(path: &Path) -> Result<Kg> {
         let subject = name(2, "subject")?;
         let object = name(5, "object")?;
         let mut bad = false;
-        let valid_from = opt_text(r, 6, &mut bad)?;
-        let valid_to = opt_text(r, 7, &mut bad)?;
-        let source_drawer_id = opt_text(r, 8, &mut bad)?;
-        let extracted_at = opt_text(r, 9, &mut bad)?;
+        let valid_from = opt_text(r, 6, true, &mut bad)?;
+        let valid_to = opt_text(r, 7, true, &mut bad)?;
+        let source_drawer_id = opt_text(r, 8, false, &mut bad)?;
+        let extracted_at = opt_text(r, 9, false, &mut bad)?;
         if bad {
-            warnings.push(format!(
-                "triple {id}: a time or source column is not text; it is treated as missing"
-            ));
+            notes
+                .push("a source or extraction column is not text; it is treated as missing".into());
         }
         kg.triples.push(KgTriple {
             id: id.clone(),
@@ -137,11 +151,11 @@ pub fn read_kg(path: &Path) -> Result<Kg> {
             valid_to,
             source_drawer_id,
             extracted_at,
+            notes,
         });
     }
     drop(rows);
     drop(st);
-    kg.warnings = bounded(warnings);
     let isolated: i64 = conn.query_row(
         "SELECT COUNT(*) FROM entities e
          WHERE NOT EXISTS (SELECT 1 FROM triples t WHERE t.subject = e.id OR t.object = e.id)",
@@ -150,6 +164,13 @@ pub fn read_kg(path: &Path) -> Result<Kg> {
     )?;
     kg.isolated_entities = isolated.max(0) as u64;
     Ok(kg)
+}
+
+/// `kg:` plus 24 hex chars of SHA-256 of the triple id. MemPalace ids embed the triple's text
+/// (a secret in an object would survive in one), so the id itself is never stored.
+fn legacy_id(triple_id: &str) -> String {
+    let digest = Sha256::digest(triple_id.as_bytes());
+    format!("kg:{}", &hex::encode(digest)[..24])
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +208,7 @@ fn plan_kg_inner(
     max_pairing: usize,
 ) -> KgPlan {
     let mut plan = KgPlan::default();
-    let mut time_warnings = Vec::new();
+    let mut warnings = Vec::new();
     let utc = FixedOffset::east_opt(0).unwrap();
     let mut order: Vec<&KgTriple> = kg.triples.iter().collect();
     order.sort_by(|a, b| {
@@ -198,7 +219,11 @@ fn plan_kg_inner(
             &b.id,
         ))
     });
-    for t in order {
+    for (n, t) in order.into_iter().enumerate() {
+        let n = n + 1;
+        for note in &t.notes {
+            warnings.push(format!("triple #{n}: {note}"));
+        }
         let mut detectors = Vec::new();
         let mut field = |name: &str, text: &str| match filter.filter(name, text) {
             Ok(s) => s,
@@ -228,9 +253,8 @@ fn plan_kg_inner(
         if let Some(raw) = given(&t.valid_from) {
             from = parse_time(raw, assume);
             if from.is_none() {
-                time_warnings.push(format!(
-                    "triple {}: valid_from could not be read; the extraction time is used",
-                    t.id
+                warnings.push(format!(
+                    "triple #{n}: valid_from could not be read; the extraction time is used"
                 ));
             }
         }
@@ -244,16 +268,14 @@ fn plan_kg_inner(
                 Some(e) => Some(e),
                 None => match from.clone() {
                     Some(f) => {
-                        time_warnings.push(format!(
-                            "triple {}: valid_to could not be read; the fact is imported as ended at its start",
-                            t.id
+                        warnings.push(format!(
+                            "triple #{n}: valid_to could not be read; the fact is imported as ended at its start"
                         ));
                         Some(f)
                     }
                     None => {
-                        time_warnings.push(format!(
-                            "triple {}: valid_to could not be read and no start time exists; the triple was not imported",
-                            t.id
+                        warnings.push(format!(
+                            "triple #{n}: valid_to could not be read and no start time exists; the triple was not imported"
                         ));
                         continue;
                     }
@@ -261,7 +283,7 @@ fn plan_kg_inner(
             },
         };
         plan.facts.push(PlannedFact {
-            legacy_id: format!("kg:{}", t.id),
+            legacy_id: legacy_id(&t.id),
             add: AssertFact {
                 subject,
                 predicate,
@@ -279,9 +301,12 @@ fn plan_kg_inner(
             source_drawer_id: t.source_drawer_id.clone(),
         });
     }
-    plan.warnings = kg.warnings.clone();
-    plan.warnings.extend(bounded(time_warnings));
+    // The pairing warning (if any) goes first; one global cap applies to the whole list.
     plan_predicate_reviews(&mut plan, existing, max_pairing);
+    let mut all = std::mem::take(&mut plan.warnings);
+    all.extend(kg.warnings.iter().cloned());
+    all.extend(warnings);
+    plan.warnings = bounded(all);
     plan
 }
 
@@ -449,6 +474,10 @@ mod tests {
     use crate::import::fixture::{TripleSpec, build_kg, build_tunnels};
     use crate::import::plan::NoFilter;
 
+    fn lid(id: &str) -> String {
+        legacy_id(id)
+    }
+
     fn utc() -> FixedOffset {
         FixedOffset::east_opt(0).unwrap()
     }
@@ -473,6 +502,7 @@ mod tests {
             valid_to: None,
             extracted_at: None,
             source_drawer_id: None,
+            notes: Vec::new(),
         }
     }
 
@@ -532,8 +562,11 @@ mod tests {
         assert_eq!(kg.triples[1].valid_to.as_deref(), Some("2026-03-01"));
         assert_eq!(kg.triples[2].subject, "e9");
         assert_eq!(kg.triples[2].object, "sqlite");
-        assert_eq!(kg.warnings.len(), 1);
-        assert!(kg.warnings[0].contains("t3") && !kg.warnings[0].contains("e9"));
+        assert!(kg.warnings.is_empty());
+        assert_eq!(kg.triples[2].notes.len(), 1);
+        let plan = plan_kg(&kg, &[], utc(), &NoFilter);
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].starts_with("triple #3:") && !plan.warnings[0].contains("e9"));
         assert_eq!(kg.isolated_entities, 1);
     }
 
@@ -555,33 +588,33 @@ mod tests {
         );
         let plan = plan_kg(&read_kg(&path).unwrap(), &[], utc(), &NoFilter);
         assert_eq!(plan.facts.len(), 3);
-        let by = |id: &str| plan.facts.iter().find(|f| f.legacy_id == id).unwrap();
-        assert_eq!(by("kg:t1").end_at, None);
+        let by = |id: String| plan.facts.iter().find(|f| f.legacy_id == id).unwrap();
+        assert_eq!(by(lid("t1")).end_at, None);
         assert_eq!(
-            by("kg:t1").add.valid_from.as_deref(),
+            by(lid("t1")).add.valid_from.as_deref(),
             Some("2026-01-05T00:00:00.000Z")
         );
         assert_eq!(
-            by("kg:t2").end_at.as_deref(),
+            by(lid("t2")).end_at.as_deref(),
             Some("2026-03-01T00:00:00.000Z")
         );
         assert_eq!(
-            by("kg:t2").add.valid_from.as_deref(),
+            by(lid("t2")).add.valid_from.as_deref(),
             Some("2026-02-01T00:00:00.000Z")
         );
         assert_eq!(
-            by("kg:t3").add.valid_from.as_deref(),
+            by(lid("t3")).add.valid_from.as_deref(),
             Some("2026-04-02T10:00:00.000Z")
         );
-        assert_eq!(by("kg:t2").add.action, FactAction::Add);
-        assert_eq!(by("kg:t2").add.object_kind, ObjectKind::Auto);
+        assert_eq!(by(lid("t2")).add.action, FactAction::Add);
+        assert_eq!(by(lid("t2")).add.object_kind, ObjectKind::Auto);
         assert_eq!(
-            by("kg:t2").add.author.agent.as_deref(),
+            by(lid("t2")).add.author.agent.as_deref(),
             Some("mempalace-import")
         );
         // Sorted by (subject, predicate, valid_from, id): "likes" before "uses".
-        let order: Vec<&str> = plan.facts.iter().map(|f| f.legacy_id.as_str()).collect();
-        assert_eq!(order, ["kg:t3", "kg:t1", "kg:t2"]);
+        let order: Vec<String> = plan.facts.iter().map(|f| f.legacy_id.clone()).collect();
+        assert_eq!(order, [lid("t3"), lid("t1"), lid("t2")]);
     }
 
     #[test]
@@ -670,8 +703,8 @@ mod tests {
         );
         let plan = plan_kg(&read_kg(&path).unwrap(), &[], utc(), &Blocker);
         assert_eq!(plan.blocked, vec![vec!["test-secret".to_string()]]);
-        let ids: Vec<&str> = plan.facts.iter().map(|f| f.legacy_id.as_str()).collect();
-        assert_eq!(ids, ["kg:t1", "kg:t3"]);
+        let ids: Vec<String> = plan.facts.iter().map(|f| f.legacy_id.clone()).collect();
+        assert_eq!(ids, [lid("t1"), lid("t3")]);
         assert!(!plan.facts.iter().any(|f| f.add.object.contains("BLOCKME")));
     }
 
@@ -777,7 +810,9 @@ mod tests {
             Some("2026-02-01T00:00:00.000Z")
         );
         assert_eq!(plan.warnings.len(), 1);
-        assert!(plan.warnings[0].contains("t1") && !plan.warnings[0].contains("garbage"));
+        assert!(
+            plan.warnings[0].starts_with("triple #1:") && !plan.warnings[0].contains("garbage")
+        );
     }
 
     #[test]
@@ -855,28 +890,116 @@ mod tests {
     }
 
     #[test]
-    fn a_non_text_time_column_does_not_fail_the_read() {
+    fn a_non_text_time_column_is_unreadable_not_absent() {
         let dir = tempfile::tempdir().unwrap();
+        let mut x = t("t1", "e1", "uses", "e2");
+        x.extracted_at = Some("2026-04-02 10:00:00".into());
         let path = build_kg(
             dir.path(),
             &[("e1", "alice"), ("e2", "sqlite")],
-            &[t("t1", "e1", "uses", "e2")],
+            &[x],
             false,
         );
         let conn = Connection::open(&path).unwrap();
         conn.execute(
-            "UPDATE triples SET valid_from = x'00ff', valid_to = x'00ff', extracted_at = x'00ff'",
+            "UPDATE triples SET valid_from = x'00ff', valid_to = x'00ff'",
             [],
         )
         .unwrap();
         drop(conn);
         let kg = read_kg(&path).unwrap();
         assert_eq!(kg.triples.len(), 1);
-        assert_eq!(kg.triples[0].valid_from, None);
-        assert_eq!(kg.triples[0].valid_to, None);
+        let plan = plan_kg(&kg, &[], utc(), &NoFilter);
+        // valid_to is not "absent": the fact is ended (at extracted_at), never current.
+        assert_eq!(plan.facts.len(), 1);
+        assert_eq!(
+            plan.facts[0].add.valid_from.as_deref(),
+            Some("2026-04-02T10:00:00.000Z")
+        );
+        assert_eq!(
+            plan.facts[0].end_at.as_deref(),
+            Some("2026-04-02T10:00:00.000Z")
+        );
+        assert_eq!(plan.warnings.len(), 2);
+
+        // A blob in extracted_at / source_drawer_id is treated as missing with one note.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE triples SET valid_from = '2026-01-01', valid_to = NULL, extracted_at = x'00ff', source_drawer_id = x'00ff'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let kg = read_kg(&path).unwrap();
         assert_eq!(kg.triples[0].extracted_at, None);
-        assert_eq!(kg.warnings.len(), 1);
-        assert!(kg.warnings[0].contains("t1"));
+        assert_eq!(kg.triples[0].source_drawer_id, None);
+        let plan = plan_kg(&kg, &[], utc(), &NoFilter);
+        assert_eq!(plan.warnings.len(), 1);
+        assert_eq!(plan.facts[0].end_at, None);
+    }
+
+    #[test]
+    fn legacy_ids_and_warnings_carry_no_triple_text() {
+        let secret = concat!("gh", "p_AbCdEf0123456789AbCdEf0123456789AbCd");
+        let tid = format!("t_alice_uses_{secret}");
+        let dir = tempfile::tempdir().unwrap();
+        let mut x = t(&tid, "e1", "uses", "e2");
+        x.valid_from = Some("2026-02-01".into());
+        x.valid_to = Some("junk".into());
+        let path = build_kg(
+            dir.path(),
+            &[("e1", "alice"), ("e2", &format!("token {secret}"))],
+            &[
+                x,
+                t("t_other", "e9", "has_bug", "e2"),
+                t("t_b", "e1", "had_bug", "e2"),
+            ],
+            false,
+        );
+        let plan = plan_kg(&read_kg(&path).unwrap(), &[], utc(), &NoFilter);
+        let again = plan_kg(&read_kg(&path).unwrap(), &[], utc(), &NoFilter);
+        let ids = |p: &KgPlan| {
+            p.facts
+                .iter()
+                .map(|f| f.legacy_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&plan), ids(&again));
+        assert!(plan.facts.iter().any(|f| f.legacy_id == legacy_id(&tid)));
+        assert_eq!(legacy_id(&tid).len(), "kg:".len() + 24);
+        assert!(legacy_id(&tid)[3..].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(legacy_id("a"), legacy_id("b"));
+        let all = format!("{:?} {:?}", ids(&plan), plan.warnings);
+        assert!(
+            !all.contains(secret) && !all.contains("t_alice") && !all.contains("e9"),
+            "{all}"
+        );
+        assert!(!format!("{:?}", plan.reviews).contains(secret));
+        assert!(plan.warnings.iter().any(|w| w.starts_with("triple #")));
+    }
+
+    #[test]
+    fn a_zero_length_interval_applies_through_the_store() {
+        let plan = one_triple_plan(Some("2026-02-01"), Some("junk"), None, utc());
+        let f = &plan.facts[0];
+        assert_eq!(f.add.valid_from, f.end_at);
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        crate::store::kg::assert_fact(&c, &f.add, "h1".into()).unwrap();
+        let end = AssertFact {
+            action: FactAction::End,
+            valid_from: f.end_at.clone(),
+            ..f.add.clone()
+        };
+        let out = crate::store::kg::assert_fact(&c, &end, "h2".into()).unwrap();
+        assert_eq!(out.ended, 1);
+        let (from, to): (String, Option<String>) = c
+            .query_row("SELECT valid_from, valid_to FROM relations", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(from, "2026-02-01T00:00:00.000Z");
+        assert_eq!(to.as_deref(), Some("2026-02-01T00:00:00.001Z"));
     }
 
     #[test]
