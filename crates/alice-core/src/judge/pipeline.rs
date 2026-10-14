@@ -3,7 +3,9 @@
 //! `decide` is pure: it never looks at the database or the network. A relation at or above the
 //! auto-apply threshold becomes an action, one between the thresholds becomes a review item, and
 //! anything below the review threshold is ignored. The heuristic's relations auto-apply only for
-//! duplicates (its "updates" are a title-similarity guess, so they are suggestions at most).
+//! exact duplicates (`Relation::agreement == Some(true)`: the same text; its other duplicates
+//! and its "updates" are similarity guesses, so they are suggestions at most). A heuristic that
+//! stands in for the judge asked for, or answers because that judge failed, only suggests.
 
 use super::{JudgeMemory, Relation};
 use crate::store::reviews::{NewReview, ReviewType};
@@ -61,13 +63,18 @@ fn merge_review(new_id: &str, survivor: &str, p: f64, provider: &str) -> NewRevi
 }
 
 /// What to do with `new` given how it relates to `relations` (decided by `provider`).
+/// With `review_only` nothing is applied: every result at or above the review threshold becomes
+/// a review item.
 pub fn decide(
     new: &JudgeMemory,
     relations: &[Relation],
     t: &Thresholds,
     provider: &str,
+    review_only: bool,
 ) -> Decided {
     let heuristic = provider == "heuristic";
+    // May this relation be applied without asking? The heuristic is sure of the same text only.
+    let may_apply = |r: &Relation| !review_only && (!heuristic || r.agreement == Some(true));
     let mut out = Decided::default();
     // A confident duplicate settles it: the new memory goes to the trash and nothing else about
     // it matters.
@@ -75,7 +82,7 @@ pub fn decide(
         .iter()
         .filter_map(|r| {
             strongest(r)
-                .filter(|(k, p)| *k == "duplicate" && *p >= t.auto)
+                .filter(|(k, p)| *k == "duplicate" && *p >= t.auto && may_apply(r))
                 .map(|(_, p)| (r, p))
         })
         .max_by(|a, b| a.1.total_cmp(&b.1))
@@ -95,7 +102,7 @@ pub fn decide(
         }
         let old = r.existing_id.clone();
         match kind {
-            "updates" if p >= t.auto && !heuristic => {
+            "updates" if p >= t.auto && !heuristic && !review_only => {
                 out.actions.push(JudgeAction::Supersedes { old, p });
             }
             "updates" => out
@@ -103,10 +110,12 @@ pub fn decide(
                 .push(supersede_review(&new.id, &old, p, provider)),
             "duplicate" => out.reviews.push(merge_review(&new.id, &old, p, provider)),
             "contradicts" => {
-                out.actions.push(JudgeAction::Contradicts {
-                    other: old.clone(),
-                    p,
-                });
+                if !review_only {
+                    out.actions.push(JudgeAction::Contradicts {
+                        other: old.clone(),
+                        p,
+                    });
+                }
                 out.reviews.push(NewReview {
                     kind: ReviewType::Contradiction,
                     payload: serde_json::json!({"new_id": new.id, "old_id": old, "p": p, "provider": provider}),
@@ -175,6 +184,7 @@ mod tests {
             ],
             &T,
             "jev",
+            false,
         );
         assert_eq!(
             d.actions,
@@ -184,30 +194,52 @@ mod tests {
             }]
         );
         assert!(d.reviews.is_empty());
-        let h = decide(
+        let exact = Relation {
+            agreement: Some(true),
+            ..rel("B", &[("duplicate", 0.98), ("unrelated", 0.02)])
+        };
+        let h = decide(&new(), std::slice::from_ref(&exact), &T, "heuristic", false);
+        assert_eq!(h.actions.len(), 1, "the heuristic applies the same text");
+    }
+
+    #[test]
+    fn the_heuristic_only_asks_about_a_near_miss_and_a_stand_in_never_applies() {
+        let near = rel("B", &[("duplicate", 0.99), ("unrelated", 0.01)]);
+        let h = decide(&new(), std::slice::from_ref(&near), &T, "heuristic", false);
+        assert!(h.actions.is_empty(), "similar is not the same");
+        assert_eq!(h.reviews.len(), 1);
+        assert_eq!(h.reviews[0].kind, ReviewType::Merge);
+        let exact = Relation {
+            agreement: Some(true),
+            ..near.clone()
+        };
+        let stand_in = decide(&new(), std::slice::from_ref(&exact), &T, "heuristic", true);
+        assert!(
+            stand_in.actions.is_empty(),
+            "an outage fallback applies nothing"
+        );
+        assert_eq!(stand_in.reviews.len(), 1);
+        let model_exact = decide(
             &new(),
-            &[rel("B", &[("duplicate", 0.98), ("unrelated", 0.02)])],
+            &[rel("B", &[("duplicate", 0.99)])],
             &T,
-            "heuristic",
+            "jev",
+            false,
         );
-        assert_eq!(
-            h.actions.len(),
-            1,
-            "duplicates auto-apply for the heuristic too"
-        );
+        assert_eq!(model_exact.actions.len(), 1, "a model judge is unaffected");
     }
 
     #[test]
     fn updates_apply_for_a_model_judge_but_only_suggest_for_the_heuristic() {
         let r = [rel("OLD", &[("updates", 0.9), ("unrelated", 0.1)])];
         assert_eq!(
-            decide(&new(), &r, &T, "jev").actions,
+            decide(&new(), &r, &T, "jev", false).actions,
             vec![JudgeAction::Supersedes {
                 old: "OLD".into(),
                 p: 0.9
             }]
         );
-        let h = decide(&new(), &r, &T, "heuristic");
+        let h = decide(&new(), &r, &T, "heuristic", false);
         assert!(h.actions.is_empty());
         assert_eq!(h.reviews.len(), 1);
         assert_eq!(h.reviews[0].kind, ReviewType::Supersede);
@@ -224,6 +256,7 @@ mod tests {
             &[rel("C", &[("contradicts", 0.8), ("unrelated", 0.2)])],
             &T,
             "jev",
+            false,
         );
         assert_eq!(
             d.actions,
@@ -238,6 +271,7 @@ mod tests {
             &[rel("D", &[("duplicate", 0.6), ("unrelated", 0.4)])],
             &T,
             "jev",
+            false,
         );
         assert!(mid.actions.is_empty());
         assert_eq!(mid.reviews[0].kind, ReviewType::Merge);
@@ -247,6 +281,7 @@ mod tests {
             &[rel("E", &[("updates", 0.4), ("unrelated", 0.6)])],
             &T,
             "jev",
+            false,
         );
         assert_eq!((low.actions.len(), low.reviews.len()), (0, 0));
     }

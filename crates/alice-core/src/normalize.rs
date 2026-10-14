@@ -99,6 +99,13 @@ pub fn content_hash(project: &str, kind: Kind, title: &str, body: &str) -> Strin
     sha256_hex(normalized.as_bytes())
 }
 
+/// Whether two memories hold the same title and body under the identity `content_hash` uses
+/// (NFC, whitespace collapsed): case and punctuation count, the kind and project do not.
+pub fn same_text(a_title: &str, a_body: &str, b_title: &str, b_body: &str) -> bool {
+    let norm = |s: &str| collapse_whitespace(&nfc(s));
+    norm(a_title) == norm(b_title) && norm(a_body) == norm(b_body)
+}
+
 /// Rough token count used for budgets: one token per four UTF-8 bytes, rounded up.
 pub fn estimate_tokens(s: &str) -> usize {
     s.len().div_ceil(4)

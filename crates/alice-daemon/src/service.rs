@@ -49,7 +49,11 @@ use std::time::{Duration, Instant};
 pub type IndexSlot = RwLock<Option<Arc<VectorIndex>>>;
 
 /// How long `shutdown` waits for the judge worker to leave a request to the judge.
-const JUDGE_STOP_WAIT: Duration = Duration::from_secs(3);
+const JUDGE_STOP_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(3)
+};
 
 /// How long a working directory's detected project is reused before git is asked again.
 const DETECT_TTL: Duration = Duration::from_secs(60);
@@ -92,6 +96,12 @@ pub struct ServiceOptions {
     pub jev_transport: Option<Arc<dyn JevTransport>>,
     /// How often memories whose judgement failed (the judge was down) are judged again.
     pub judge_retry_every: Duration,
+    /// The first wait of a memory whose judgement failed; it doubles with every failure.
+    pub judge_retry_base: Duration,
+    /// False: the judge reads and decides but changes nothing (no merge, supersede, link, kind,
+    /// move or review item) and only activates memories. For `alice bench`, whose generated
+    /// corpus must stay as it was written.
+    pub judge_applies: bool,
 }
 
 impl Default for ServiceOptions {
@@ -113,6 +123,8 @@ impl Default for ServiceOptions {
             secrets_timeout: Duration::from_secs(5),
             jev_transport: None,
             judge_retry_every: JudgeWorkerConfig::RETRY_EVERY,
+            judge_retry_base: alice_core::store::judge::RETRY_BASE,
+            judge_applies: true,
         }
     }
 }
@@ -592,6 +604,8 @@ impl Service {
             wake: judge_wake_rx,
             stop: stop.clone(),
             retry_every: opts.judge_retry_every,
+            retry_base: opts.judge_retry_base,
+            applies: opts.judge_applies,
         });
         if let Err(e) = spawn_config_events(&settings, &writer, &judge) {
             // The workers and the writer are running already: stop them, do not leak them.
@@ -2022,11 +2036,11 @@ fn screen_resolution(
             let Some(m) = memories::get_many(c, &[text("memory_id")])?.pop() else {
                 return Ok(None);
             };
-            // The hash of the text screened below: the writer refuses the move if it changed.
-            let content_hash: String = c.query_row(
-                "SELECT content_hash FROM memories WHERE id = ?1",
+            // The hash and time of the memory screened below: the writer refuses the move if either changed.
+            let (content_hash, updated_at): (String, String) = c.query_row(
+                "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
                 [&m.id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             let root = projects::root_of(c, &target.id)?;
             let r = redactors.for_root(root.as_deref().map(Path::new));
@@ -2060,6 +2074,7 @@ fn screen_resolution(
             // memory edited after it was screened.
             Ok(Some(ResolveText::Moved {
                 content_hash,
+                updated_at,
                 title,
                 body,
                 topics,
@@ -3235,13 +3250,8 @@ mod tests {
     async fn only_returned_memories_count_an_access() {
         let (_d, s) = svc().await;
         let mut ids = Vec::new();
-        // Different enough that the judge keeps all six (near-identical text is merged).
-        const WORDS: [&str; 6] = ["amber", "basil", "cedar", "dune", "ember", "fjord"];
-        for w in WORDS {
-            let content = format!(
-                "zebra crossing note {w}: {}",
-                format!("{w} padding ").repeat(40)
-            );
+        for i in 0..6 {
+            let content = format!("zebra crossing note {i}: {}", "padding words ".repeat(40));
             let r = s
                 .remember(RememberRequest {
                     content,
@@ -3495,13 +3505,9 @@ mod tests {
     async fn the_default_token_budget_is_a_setting() {
         let (d, s) = svc().await;
         let cwd = repo(&d, "proj");
-        // Different enough that the judge keeps all five (near-identical text is merged).
-        for w in ["amber", "basil", "cedar", "dune", "ember"] {
+        for i in 0..5 {
             s.remember(RememberRequest {
-                content: format!(
-                    "budget memory {w}: lease timeout {}",
-                    format!("{w} filler ").repeat(30)
-                ),
+                content: format!("budget memory {i}: {}", "lease timeout ".repeat(30)),
                 cwd: cwd.clone(),
                 ..Default::default()
             })
@@ -4703,6 +4709,7 @@ mod tests {
             t.clone(),
             ServiceOptions {
                 judge_retry_every: Duration::from_millis(100),
+                judge_retry_base: Duration::from_millis(10),
                 ..quiet()
             },
         )
@@ -5082,7 +5089,303 @@ mod tests {
             t.mentioned("hintproj"),
             "the project and its title were offered"
         );
+        assert!(
+            t.mentioned("hintproj deploy token"),
+            "a plain word of the hint title reaches the model"
+        );
+        assert!(t.mentioned("[REDACTED"), "where the token was");
         assert!(!t.mentioned(token), "the token reached the model");
+        s.shutdown();
+    }
+
+    // ------------------------------------------------------------------ fix round 1
+
+    async fn open_reviews(s: &Service, kind: &str) -> Vec<ReviewItem> {
+        s.reviews(ReviewQuery::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.review_type.as_str() == kind)
+            .collect()
+    }
+
+    fn near_miss(port: u32) -> String {
+        format!("deploy checklist port {port} {}", "common step ".repeat(30))
+    }
+
+    /// C1: the heuristic merges the same text only; a number that differs is a question.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_near_miss_number_is_asked_about_not_merged() {
+        let (d, s) = svc().await;
+        let cwd = repo(&d, "proj");
+        let a = remember_id(&s, &near_miss(5432), Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        let b = remember_id(&s, &near_miss(5433), Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        assert_eq!(state_of(&s, &a).await.1, "active");
+        assert_eq!(
+            state_of(&s, &b).await,
+            ("done".to_string(), "active".to_string())
+        );
+        let asks = open_reviews(&s, "merge").await;
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        assert_eq!(asks[0].payload["survivor"], a.as_str());
+        assert_eq!(asks[0].payload["provider"], "heuristic");
+        s.shutdown();
+    }
+
+    /// C1/M7: a heuristic that answers because the judge could not (an outage, or no key) only
+    /// suggests, even for the same text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_outage_fallback_and_a_stand_in_heuristic_apply_nothing() {
+        let text = "Use WAL mode so readers never block the writer";
+        // Outage.
+        let t = crate::judge_http::ScriptedJev::failing(503);
+        let (d, s) = svc_with_jev(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        let a = remember_id(&s, text, Some(Kind::Decision), &cwd).await;
+        wait_settled(&s).await;
+        let b = remember_id(&s, text, Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        assert!(t.sent() >= 1, "the comparison was tried");
+        assert_eq!(state_of(&s, &a).await.1, "active");
+        assert_eq!(
+            state_of(&s, &b).await,
+            ("retry".to_string(), "active".to_string())
+        );
+        assert_eq!(open_reviews(&s, "merge").await.len(), 1);
+        s.shutdown();
+        // No key: the heuristic stands in for Jev.
+        let (d, s) = svc().await;
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        until("the stand-in", || {
+            s.judge_warning().filter(|w| w.contains("no TypeSafe key"))
+        })
+        .await;
+        let cwd = repo(&d, "proj");
+        let a = remember_id(&s, text, Some(Kind::Decision), &cwd).await;
+        wait_settled(&s).await;
+        let b = remember_id(&s, text, Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        assert_eq!(state_of(&s, &a).await.1, "active");
+        assert_eq!(
+            state_of(&s, &b).await,
+            ("retry".to_string(), "active".to_string())
+        );
+        assert_eq!(open_reviews(&s, "merge").await.len(), 1);
+        s.shutdown();
+    }
+
+    /// I1: two twins judged in one batch meet once, and the older survives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_older_of_two_twins_judged_together_survives() {
+        let (d, s) = svc().await;
+        let cwd = repo(&d, "proj");
+        let text = "Use WAL mode so readers never block the writer";
+        let a = remember_id(&s, text, Some(Kind::Decision), &cwd).await;
+        let b = remember_id(&s, text, Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        assert_eq!(state_of(&s, &a).await.1, "active", "the older survives");
+        assert_eq!(state_of(&s, &b).await.1, "trashed");
+        assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
+        s.shutdown();
+    }
+
+    /// M10: a judge that is told not to change anything only activates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_judge_that_does_not_apply_changes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                judge_applies: false,
+                ..quiet()
+            },
+        )
+        .unwrap();
+        let cwd = repo(&d, "proj");
+        let text = "Use WAL mode so readers never block the writer";
+        let a = remember_id(&s, text, Some(Kind::Decision), &cwd).await;
+        let b = remember_id(&s, text, Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        assert_eq!(state_of(&s, &a).await.1, "active");
+        assert_eq!(
+            state_of(&s, &b).await,
+            ("done".to_string(), "active".to_string())
+        );
+        assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
+        s.shutdown();
+    }
+
+    /// M8: the local router looks first; a memory that names a project the cloud may not see
+    /// stays on this machine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_naming_a_denied_project_is_not_sent_to_a_model_to_route() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            project: Some(("allowedproj", 0.95)),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        let denied = repo(&d, "deniedproj");
+        std::fs::write(
+            std::path::Path::new(denied.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        remember_id(&s, "deniedproj keeps notes", Some(Kind::Note), &denied).await;
+        remember_id(
+            &s,
+            "allowedproj keeps a wiki",
+            Some(Kind::Note),
+            &repo(&d, "allowedproj"),
+        )
+        .await;
+        wait_settled(&s).await;
+        let id = remember_id(
+            &s,
+            "release notes about deniedproj",
+            Some(Kind::Note),
+            &None,
+        )
+        .await;
+        wait_settled(&s).await;
+        assert_eq!(t.sent(), 0, "the memory never left");
+        assert_eq!(memory_of(&s, &id).await.memory.project, "global");
+        let asks = open_reviews(&s, "project").await;
+        assert!(
+            asks.iter().any(|r| r.payload["to"] == "deniedproj"),
+            "{asks:?}"
+        );
+        s.shutdown();
+    }
+
+    /// M4: neighbours in the project are found even when the nearest vectors are all in others.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_search_widens_when_the_nearest_memories_belong_to_other_projects() {
+        let t = crate::judge_http::ScriptedJev::new(("updates", 0.95));
+        let (d, s) = svc_with_jev(t).await;
+        let mine = repo(&d, "mine");
+        let theirs = repo(&d, "theirs");
+        let old = remember_id(
+            &s,
+            "Staging Postgres listens on port 5432",
+            Some(Kind::Fact),
+            &mine,
+        )
+        .await;
+        wait_settled(&s).await;
+        let text = "Staging Postgres listens on port 5433 now";
+        for kind in [
+            Kind::Note,
+            Kind::Fact,
+            Kind::Decision,
+            Kind::Bugfix,
+            Kind::Howto,
+            Kind::Warning,
+        ] {
+            remember_id(&s, text, Some(kind), &theirs).await;
+            wait_settled(&s).await;
+        }
+        // Identical to all six of the other project's, so they are its nearest; the search
+        // starts two deep in tests.
+        remember_id(&s, text, Some(Kind::Note), &mine).await;
+        wait_settled(&s).await;
+        assert_eq!(
+            memory_of(&s, &old).await.memory.status.as_str(),
+            "superseded"
+        );
+        s.shutdown();
+    }
+
+    /// M3: a judge that is slow to answer does not hold up shutdown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_does_not_wait_for_a_slow_judge() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            delay: Duration::from_secs(8),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        remember_id(&s, "deploy notes for staging", Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        remember_id(
+            &s,
+            "deploy notes for staging servers",
+            Some(Kind::Note),
+            &cwd,
+        )
+        .await;
+        until("the judge inside its request", || {
+            (t.sent() >= 1).then_some(())
+        })
+        .await;
+        let started = Instant::now();
+        let s2 = s.clone();
+        tokio::task::spawn_blocking(move || s2.shutdown())
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(s.read_only().is_none(), "a clean stop, not a failure");
+    }
+
+    // ------------------------------------------------------------------ fix round 2
+
+    /// N3: when the local router says a memory is about a project the cloud may not see, its
+    /// comparison and its kind question stay local too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_about_a_denied_project_stays_local_for_comparison_and_kind() {
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("updates", 0.95),
+            kind: Some(("bugfix", 0.95)),
+            project: Some(("allowedproj", 0.95)),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        let denied = repo(&d, "deniedproj");
+        std::fs::write(
+            std::path::Path::new(denied.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        remember_id(&s, "deniedproj keeps notes", Some(Kind::Note), &denied).await;
+        remember_id(
+            &s,
+            "allowedproj keeps a wiki",
+            Some(Kind::Note),
+            &repo(&d, "allowedproj"),
+        )
+        .await;
+        wait_settled(&s).await;
+        let old = remember_id(
+            &s,
+            "release notes about deniedproj",
+            Some(Kind::Note),
+            &None,
+        )
+        .await;
+        wait_settled(&s).await;
+        let new = remember_id(&s, "release notes about deniedproj again", None, &None).await;
+        wait_settled(&s).await;
+        assert_eq!(
+            t.sent(),
+            0,
+            "nothing about it was sent: no comparison, kind or route"
+        );
+        assert!(!t.mentioned("deniedproj"));
+        assert_eq!(memory_of(&s, &new).await.memory.kind, Kind::Note);
+        assert_eq!(
+            memory_of(&s, &old).await.memory.status.as_str(),
+            "active",
+            "no model update"
+        );
         s.shutdown();
     }
 }
