@@ -65,6 +65,8 @@ pub enum ResolveText {
     /// in between is never stored unscreened.
     Moved {
         content_hash: String,
+        /// `updated_at` of the screened memory (topics and importance are not in the hash).
+        updated_at: String,
         title: String,
         body: String,
         topics: Vec<String>,
@@ -79,6 +81,8 @@ pub struct Judgement {
     pub id: String,
     /// `content_hash` of the text that was judged: nothing is applied if the memory changed.
     pub stamp: String,
+    /// `updated_at` when it was read: topics and importance are not in the hash.
+    pub updated_at: String,
     /// The provider that compared the memory with its neighbours (the actor `judge:<provider>`
     /// of the actions); `heuristic` when the model could not answer.
     pub provider: String,
@@ -94,6 +98,11 @@ pub struct Judgement {
     pub project_provider: Option<String>,
     /// The judge failed or ran out of time: the heuristic decided; try again later.
     pub retry: bool,
+    /// Every failure behind `retry` was the judge being unreachable (it does not count toward
+    /// giving up).
+    pub unavailable: bool,
+    /// How long a memory that failed waits before it is judged again.
+    pub retry_wait: Duration,
     /// `(id, content_hash)` of every existing memory the judge saw, read together with its
     /// text. An action on one that has changed since becomes a review item instead (nothing is
     /// applied on stale information).
@@ -168,6 +177,7 @@ pub enum WriteOp {
     /// `retry` memories go back to `pending` (up to `max_attempts` in all); the rest give up.
     RequeueJudgeRetries {
         max_attempts: u32,
+        now: String,
     },
     TouchAccess(Vec<i64>),
     /// A change that is not to a memory or a fact (settings, secrets): one history row, and for
@@ -933,15 +943,22 @@ fn resolve_review(
             }
             // The text that was screened with the destination's rules must be the text that
             // moves: an edit that landed since is refused, never stored unscreened.
-            if let Some(ResolveText::Moved { content_hash, .. }) = &text {
-                let now: Option<String> = conn
+            if let Some(ResolveText::Moved {
+                content_hash,
+                updated_at,
+                ..
+            }) = &text
+            {
+                let now: Option<(String, String)> = conn
                     .query_row(
-                        "SELECT content_hash FROM memories WHERE id = ?1",
+                        "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
                         [before["id"].as_str().unwrap_or(&memory)],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()?;
-                if now.as_deref() != Some(content_hash.as_str()) {
+                if now.as_ref().map(|(h, u)| (h.as_str(), u.as_str()))
+                    != Some((content_hash.as_str(), updated_at.as_str()))
+                {
                     return Err(AliceError::invalid(format!(
                         "memory {memory} was edited while its move was being checked against the privacy rules of project {}; nothing was changed, try again",
                         target.slug
@@ -1235,8 +1252,8 @@ fn apply(
             WriteOutcome::Done
         }
         WriteOp::ApplyJudgement(j) => apply_judgement(conn, st, j)?,
-        WriteOp::RequeueJudgeRetries { max_attempts } => {
-            let (requeued, given_up) = judge_store::requeue_retries(conn, max_attempts)?;
+        WriteOp::RequeueJudgeRetries { max_attempts, now } => {
+            let (requeued, given_up) = judge_store::requeue_retries(conn, max_attempts, &now)?;
             if requeued + given_up > 0 {
                 tracing::info!(requeued, given_up, "memories with a failed judgement");
             }
@@ -1342,24 +1359,29 @@ fn target_state(conn: &Connection, seen: &[(String, String)], id: &str) -> Resul
     })
 }
 
-/// Apply a judgement (spec §5.1 step 5): the project move, the kind, the actions and the review
-/// items of one memory in one event group, then activate it. Nothing is applied on stale
-/// information: a memory whose text changed since it was judged is left for the next judgement,
-/// and an action on an existing memory that changed since becomes a review item.
+/// Apply a judgement (spec §5.1 step 5): the project move, the actions, the kind and the
+/// review items of one memory in one event group, and activate it. Nothing is applied on stale
+/// information: a memory whose text (or `updated_at`) changed since it was judged is left for
+/// the next judgement, and an action on an existing memory that changed since becomes a review
+/// item. A memory the judge moved is judged again in its new project (its neighbours were the
+/// old project's), so it stays `pending`.
 fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<WriteOutcome> {
-    let row: Option<(String, String, String)> = conn
+    let row: Option<(String, String, String, String)> = conn
         .query_row(
-            "SELECT content_hash, status, judge_state FROM memories WHERE seq = ?1",
+            "SELECT content_hash, status, judge_state, updated_at FROM memories WHERE seq = ?1",
             [j.seq],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let Some((hash, status, judge_state)) = row else {
+    let Some((hash, status, judge_state, updated_at)) = row else {
         return Ok(WriteOutcome::Done);
     };
     // Edited while being judged: it stays pending and the new text is judged. Imports
     // (`skipped`) are never judged, and a memory already judged is not judged twice.
-    if hash != j.stamp || !matches!(judge_state.as_str(), "pending" | "retry") {
+    if hash != j.stamp
+        || updated_at != j.updated_at
+        || !matches!(judge_state.as_str(), "pending" | "retry")
+    {
         return Ok(WriteOutcome::Done);
     }
     let live = status == Status::Pending.as_str() || status == Status::Active.as_str();
@@ -1372,6 +1394,7 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
         activate(conn, j.seq, st.matcher(conn)?)?;
     }
     let mut trashed = !live;
+    let mut moved = false;
     if live
         && let Some(slug) = &j.project_to
         && let Some(target) = projects::resolve_slug(conn, slug)?
@@ -1381,10 +1404,7 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
         let h = st.hlc.tick();
         match memories::move_to_project(conn, &j.id, &target.id, &h)? {
             memories::MoveOutcome::Moved => {
-                conn.execute(
-                    "UPDATE memories SET project_defaulted = 0 WHERE seq = ?1",
-                    [j.seq],
-                )?;
+                moved = true;
                 record(
                     conn,
                     st,
@@ -1413,7 +1433,12 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
         }
     }
     let mut reviews = j.reviews.clone();
-    for a in &j.actions {
+    // The comparisons were made in the project the memory has left.
+    let actions: &[JudgeAction] = if moved { &[] } else { &j.actions };
+    if moved {
+        reviews.retain(|r| r.kind == ReviewType::Project);
+    }
+    for a in actions {
         if trashed {
             break;
         }
@@ -1483,22 +1508,26 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
             kind: Some(kind),
             ..Default::default()
         };
-        // Refused (not applied, nothing written) when the project already holds this text
-        // under that kind: the memory keeps the kind it has.
-        if memories::apply_update(conn, &j.id, &edit, h).is_ok() {
-            record(
-                conn,
-                st,
-                EventInput {
-                    actor: &actor,
-                    action: "memory.edit",
-                    target_type: "memory",
-                    target_id: &j.id,
-                    before,
-                    after: snap(conn, &j.id)?,
-                    group: Some(&group),
-                },
-            )?;
+        match memories::apply_update(conn, &j.id, &edit, h) {
+            Ok(_) => {
+                record(
+                    conn,
+                    st,
+                    EventInput {
+                        actor: &actor,
+                        action: "memory.edit",
+                        target_type: "memory",
+                        target_id: &j.id,
+                        before,
+                        after: snap(conn, &j.id)?,
+                        group: Some(&group),
+                    },
+                )?;
+            }
+            // The project already holds this text under that kind: nothing was written, and
+            // the memory keeps the kind it has.
+            Err(AliceError::Invalid(_)) => {}
+            Err(e) => tracing::warn!(error = %e, id = %j.id, "the judge's kind was not stored"),
         }
     }
     for r in reviews.iter().filter(|_| live) {
@@ -1509,10 +1538,33 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
             });
         }
     }
-    conn.execute(
-        "UPDATE memories SET judge_state = ?1, judge_attempts = judge_attempts + 1 WHERE seq = ?2",
-        rusqlite::params![if j.retry { "retry" } else { "done" }, j.seq],
-    )?;
+    if moved && !trashed {
+        // Judged again in the new project.
+        return Ok(WriteOutcome::Done);
+    }
+    if j.retry {
+        // A failure counts toward giving up unless the judge was merely unreachable; both
+        // lengthen the wait.
+        let (attempts, unavailable): (i64, i64) = conn.query_row(
+            "SELECT judge_attempts + ?1, judge_unavailable + ?2 FROM memories WHERE seq = ?3",
+            rusqlite::params![i64::from(!j.unavailable), i64::from(j.unavailable), j.seq],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let next = (chrono::Utc::now()
+            + chrono::Duration::from_std(j.retry_wait).unwrap_or(chrono::Duration::hours(6)))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE memories SET judge_state = 'retry', judge_attempts = ?1, judge_unavailable = ?2,
+                judge_next_try_at = ?3 WHERE seq = ?4",
+            rusqlite::params![attempts, unavailable, next, j.seq],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE memories SET judge_state = 'done', judge_attempts = judge_attempts + 1,
+                judge_next_try_at = NULL WHERE seq = ?1",
+            [j.seq],
+        )?;
+    }
     Ok(WriteOutcome::Done)
 }
 
@@ -1863,10 +1915,12 @@ mod tests {
     /// A heuristic judgement that decides nothing: the memory is activated as it stands.
     fn judged(f: &Fixture, id: &str, seq: i64) {
         let stamp: String = f.read("SELECT content_hash FROM memories WHERE seq = ?1", [seq]);
+        let updated_at: String = f.read("SELECT updated_at FROM memories WHERE seq = ?1", [seq]);
         f.h.submit_blocking(WriteOp::ApplyJudgement(Judgement {
             seq,
             id: id.into(),
             stamp,
+            updated_at,
             provider: "heuristic".into(),
             ..Default::default()
         }))
@@ -3517,6 +3571,7 @@ mod tests {
             seq: seq_of(f, id),
             id: id.into(),
             stamp: hash_of(f, id),
+            updated_at: f.read("SELECT updated_at FROM memories WHERE id = ?1", [id]),
             provider: provider.into(),
             ..Default::default()
         }
@@ -3738,6 +3793,7 @@ mod tests {
                 review: 0.5,
             },
             "jev",
+            false,
         );
         apply_j(
             &f,
@@ -3879,8 +3935,11 @@ mod tests {
             "active",
             "the heuristic's answer is live meanwhile"
         );
-        f.h.submit_blocking(WriteOp::RequeueJudgeRetries { max_attempts: 2 })
-            .unwrap();
+        f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
+            max_attempts: 2,
+            now: "2099-01-01T00:00:00.000Z".into(),
+        })
+        .unwrap();
         assert_eq!(judge_state_of(&f, &id), ("pending".to_string(), 1));
         apply_j(
             &f,
@@ -3890,8 +3949,11 @@ mod tests {
             },
         );
         assert_eq!(judge_state_of(&f, &id), ("retry".to_string(), 2));
-        f.h.submit_blocking(WriteOp::RequeueJudgeRetries { max_attempts: 2 })
-            .unwrap();
+        f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
+            max_attempts: 2,
+            now: "2099-01-01T00:00:00.000Z".into(),
+        })
+        .unwrap();
         assert_eq!(
             judge_state_of(&f, &id),
             ("done".to_string(), 2),
@@ -3994,6 +4056,7 @@ mod tests {
         add_project(&f, "other");
         let (m, _) = new_id(f.h.submit_blocking(remember("screened text")).unwrap());
         let screened = hash_of(&f, &m);
+        let screened_at: String = f.read("SELECT updated_at FROM memories WHERE id = ?1", [&m]);
         let item = add_review(
             &f,
             ReviewType::Project,
@@ -4010,8 +4073,9 @@ mod tests {
             actor: Actor::User,
         })
         .unwrap();
-        let moved = |hash: &str, body: &str| ResolveText::Moved {
+        let moved = |hash: &str, at: &str, body: &str| ResolveText::Moved {
             content_hash: hash.into(),
+            updated_at: at.into(),
             title: "screened text".into(),
             body: body.into(),
             topics: Vec::new(),
@@ -4021,7 +4085,7 @@ mod tests {
                 id: item.clone(),
                 choice: "move".into(),
                 actor: Actor::User,
-                text: Some(moved(&screened, "screened text")),
+                text: Some(moved(&screened, &screened_at, "screened text")),
             })
             .unwrap_err()
             .to_string();
@@ -4042,6 +4106,7 @@ mod tests {
         // Screened again with the current text, the move goes through; text the rules left as
         // it is records no edit, text they changed is stored in the same group.
         let now = hash_of(&f, &m);
+        let now_at: String = f.read("SELECT updated_at FROM memories WHERE id = ?1", [&m]);
         let cur: (String, String) = {
             let c = alice_core::store::open_reader(&f.db()).unwrap();
             c.query_row(
@@ -4057,6 +4122,7 @@ mod tests {
             actor: Actor::User,
             text: Some(ResolveText::Moved {
                 content_hash: now,
+                updated_at: now_at,
                 title: cur.0,
                 body: cur.1,
                 topics: Vec::new(),
@@ -4088,7 +4154,11 @@ mod tests {
             id: item2,
             choice: "move".into(),
             actor: Actor::User,
-            text: Some(moved(&hash_of(&f, &m2), "second [REDACTED:x]")),
+            text: Some(moved(
+                &hash_of(&f, &m2),
+                &f.read::<String>("SELECT updated_at FROM memories WHERE id = ?1", [&m2]),
+                "second [REDACTED:x]",
+            )),
         })
         .unwrap();
         let body: String = f.read("SELECT body FROM memories WHERE id = ?1", [&m2]);
@@ -4096,5 +4166,186 @@ mod tests {
             body, "second [REDACTED:x]",
             "the destination's cleaned text is stored with the move"
         );
+    }
+
+    // ------------------------------------------------------------------ fix round 1
+
+    /// M5: topics and importance are not in the hash, but a judgement made before they changed
+    /// is stale all the same.
+    #[test]
+    fn a_judgement_made_before_an_importance_edit_is_stale() {
+        let f = fixture();
+        let (id, _) = new_id(f.h.submit_blocking(remember("importance moves")).unwrap());
+        let stale = judgement(&f, &id, "jev");
+        f.h.submit_blocking(WriteOp::Update {
+            id: id.clone(),
+            update: MemoryUpdate {
+                importance: Some(5),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        apply_j(&f, stale);
+        assert_eq!(
+            (
+                status_of(&f, &id).as_str(),
+                judge_state_of(&f, &id).0.as_str()
+            ),
+            ("pending", "pending")
+        );
+        apply_j(&f, judgement(&f, &id, "jev"));
+        assert_eq!(judge_state_of(&f, &id).0, "done");
+    }
+
+    #[test]
+    fn a_move_screened_before_an_importance_edit_is_refused() {
+        let f = fixture();
+        add_project(&f, "other");
+        let (m, _) = new_id(f.h.submit_blocking(remember("importance edit")).unwrap());
+        let hash = hash_of(&f, &m);
+        let at: String = f.read("SELECT updated_at FROM memories WHERE id = ?1", [&m]);
+        let item = add_review(
+            &f,
+            ReviewType::Project,
+            serde_json::json!({"memory_id": m, "from": "global", "to": "other", "p": 0.8, "provider": "heuristic"}),
+            "mv",
+        );
+        f.h.submit_blocking(WriteOp::Update {
+            id: m.clone(),
+            update: MemoryUpdate {
+                importance: Some(4),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        let err =
+            f.h.submit_blocking(WriteOp::ResolveReview {
+                id: item,
+                choice: "move".into(),
+                actor: Actor::User,
+                text: Some(ResolveText::Moved {
+                    content_hash: hash,
+                    updated_at: at,
+                    title: "importance edit".into(),
+                    body: "importance edit".into(),
+                    topics: Vec::new(),
+                }),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("edited while its move"), "{err}");
+    }
+
+    /// M6: a memory the judge moved is compared again in its new project, not acted on with
+    /// the old project's neighbours.
+    #[test]
+    fn a_moved_memory_skips_its_old_actions_and_is_judged_again_there() {
+        let f = fixture();
+        add_project(&f, "proj");
+        let (old, old_seq) = new_id(f.h.submit_blocking(remember("global fact")).unwrap());
+        judged(&f, &old, old_seq);
+        let (id, _) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "global fact again".into(),
+                    ..Default::default()
+                },
+                project: ProjectChoice::Fallback,
+            })
+            .unwrap(),
+        );
+        apply_j(
+            &f,
+            Judgement {
+                project_to: Some("proj".into()),
+                actions: vec![JudgeAction::Supersedes {
+                    old: old.clone(),
+                    p: 0.95,
+                }],
+                reviews: vec![
+                    alice_core::judge::pipeline::as_review(
+                        &id,
+                        &JudgeAction::Supersedes {
+                            old: old.clone(),
+                            p: 0.95,
+                        },
+                        "jev",
+                    )
+                    .unwrap(),
+                ],
+                seen: vec![(old.clone(), hash_of(&f, &old))],
+                ..judgement(&f, &id, "jev")
+            },
+        );
+        assert_eq!(
+            status_of(&f, &old),
+            "active",
+            "the old project's neighbour is left alone"
+        );
+        let n: i64 = f.read("SELECT count(*) FROM review_items", []);
+        assert_eq!(n, 0);
+        assert_eq!(status_of(&f, &id), "active");
+        assert_eq!(judge_state_of(&f, &id).0, "pending", "judged again in proj");
+    }
+
+    /// M2: a failed judgement waits, and a judge that was only unreachable does not count
+    /// toward giving up.
+    #[test]
+    fn a_failed_judgement_waits_and_unreachability_does_not_count() {
+        let f = fixture();
+        let (id, _) = new_id(f.h.submit_blocking(remember("backoff")).unwrap());
+        apply_j(
+            &f,
+            Judgement {
+                retry: true,
+                unavailable: true,
+                retry_wait: Duration::from_secs(600),
+                ..judgement(&f, &id, "heuristic")
+            },
+        );
+        let counts: (i64, i64) = {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.query_row(
+                "SELECT judge_attempts, judge_unavailable FROM memories WHERE id = ?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(counts, (0, 1), "unreachable: not counted");
+        // Not yet due.
+        f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
+            max_attempts: 1,
+            now: alice_core::ids::now_rfc3339(),
+        })
+        .unwrap();
+        assert_eq!(judge_state_of(&f, &id).0, "retry");
+        // Due, and never given up however often it was unreachable (max 1, attempts 0).
+        f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
+            max_attempts: 1,
+            now: "2099-01-01T00:00:00.000Z".into(),
+        })
+        .unwrap();
+        assert_eq!(judge_state_of(&f, &id).0, "pending");
+    }
+
+    /// C1/M7 at the writer: nothing here changes a judgement's own actions; the decision is
+    /// made upstream, but a stand-in's judgement carries none.
+    #[test]
+    fn a_plain_judgement_activates_without_touching_anything() {
+        let f = fixture();
+        let (id, _) = new_id(f.h.submit_blocking(remember("just activate")).unwrap());
+        apply_j(
+            &f,
+            Judgement {
+                retry: true,
+                ..judgement(&f, &id, "heuristic")
+            },
+        );
+        assert_eq!(status_of(&f, &id), "active");
+        let n: i64 = f.read("SELECT count(*) FROM events WHERE actor LIKE 'judge:%'", []);
+        assert_eq!(n, 0);
     }
 }

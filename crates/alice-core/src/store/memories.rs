@@ -530,7 +530,7 @@ pub fn move_to_project(
         return Ok(MoveOutcome::DuplicateOf(other));
     }
     conn.execute(
-        "UPDATE memories SET project_id = ?1, content_hash = ?2, updated_at = ?3, hlc = ?4 WHERE seq = ?5",
+        "UPDATE memories SET project_id = ?1, content_hash = ?2, updated_at = ?3, hlc = ?4, project_defaulted = 0 WHERE seq = ?5",
         params![project_id, hash, now_rfc3339(), hlc, seq],
     )?;
     Ok(MoveOutcome::Moved)
@@ -589,8 +589,9 @@ pub fn apply_update(conn: &Connection, id: &str, u: &MemoryUpdate, hlc: String) 
             let text_changed = title != current.title || body != current.body;
             conn.execute(
                 "UPDATE memories SET title=?1, body=?2, kind=?3, importance=?4, content_hash=?5, updated_at=?6, hlc=?7,
-                    embed_state = CASE WHEN ?8 THEN 'pending' ELSE embed_state END WHERE seq=?9",
-                params![title, body, kind.as_str(), importance, hash, now_rfc3339(), hlc, text_changed, seq],
+                    embed_state = CASE WHEN ?8 THEN 'pending' ELSE embed_state END,
+                    kind_explicit = CASE WHEN ?10 THEN 1 ELSE kind_explicit END WHERE seq=?9",
+                params![title, body, kind.as_str(), importance, hash, now_rfc3339(), hlc, text_changed, seq, u.kind.is_some()],
             )?;
             if let Some(topics) = &new_topics {
                 conn.execute(
@@ -743,6 +744,52 @@ mod tests {
             (0, 1),
             "no kind given, no project known"
         );
+    }
+
+    #[test]
+    fn a_chosen_kind_or_project_is_never_the_judges_to_change() {
+        let (_d, c, p) = setup();
+        let mut i = input("kind and project were not given");
+        i.project_defaulted = true;
+        let InsertOutcome::New { id, seq } =
+            insert(&c, &prepare(i, &p, "h".into()).unwrap()).unwrap()
+        else {
+            panic!()
+        };
+        let flags = |c: &rusqlite::Connection| -> (i64, i64) {
+            c.query_row(
+                "SELECT kind_explicit, project_defaulted FROM memories WHERE seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(flags(&c), (0, 1));
+        // An edit that does not name a kind leaves the flag alone; one that does makes it explicit.
+        let edit = |kind| MemoryUpdate {
+            action: UpdateAction::Edit,
+            importance: Some(4),
+            kind,
+            ..Default::default()
+        };
+        apply_update(&c, &id, &edit(None), "h".into()).unwrap();
+        assert_eq!(flags(&c), (0, 1));
+        apply_update(&c, &id, &edit(Some(Kind::Decision)), "h".into()).unwrap();
+        assert_eq!(flags(&c), (1, 1));
+        // Moving it anywhere is a choice about the project.
+        let other = projects::upsert_project(
+            &c,
+            &ProjectRef {
+                key: "k2".into(),
+                slug: "other".into(),
+                name: "other".into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        move_to_project(&c, &id, &other.id, "h").unwrap();
+        assert_eq!(flags(&c), (1, 0));
     }
 
     #[test]

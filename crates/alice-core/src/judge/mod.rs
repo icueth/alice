@@ -170,7 +170,10 @@ pub struct JudgeMemory {
 pub struct Relation {
     pub existing_id: String,
     pub probs: Distribution,
-    /// Forward and reversed questions picked the same answer (providers that ask both).
+    /// For a model: forward and reversed questions picked the same answer. For the heuristic
+    /// (which asks once): `Some(true)` marks a duplicate that is the same text, the only
+    /// heuristic result `pipeline::decide` applies without asking, and `Some(false)` a near
+    /// twin by vector only.
     pub agreement: Option<bool>,
 }
 

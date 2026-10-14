@@ -118,19 +118,27 @@ pub struct PendingJudgement {
     pub id: String,
     /// `content_hash` when read: the judgement applies only if the text is unchanged.
     pub stamp: String,
+    /// `updated_at` when read (topics and importance are not in the hash): also compared.
+    pub updated_at: String,
     pub project_id: String,
     pub project_slug: String,
     pub kind_explicit: bool,
     pub project_defaulted: bool,
     pub attempts: u32,
+    /// Failed judgements that were only the judge being unreachable.
+    pub unavailable: u32,
 }
 
 // Only `pending` rows are ever judged: `skipped` (imported memories) and `retry` (waiting for
 // `requeue_retries`) are left alone. `judge_state <> 'done'` repeats the partial index's term so
 // SQLite uses `memories_judge`.
-const PENDING_SQL: &str = "SELECT m.seq, m.id, m.content_hash, m.project_id, p.slug, m.kind_explicit, m.project_defaulted, m.judge_attempts
+// A memory waits for older ones that are still being embedded: it is compared only with older
+// memories, so those must be in the index (and judged) first.
+const PENDING_SQL: &str = "SELECT m.seq, m.id, m.content_hash, m.updated_at, m.project_id, p.slug, m.kind_explicit, m.project_defaulted, m.judge_attempts, m.judge_unavailable
      FROM memories m JOIN projects p ON p.id = m.project_id
      WHERE m.judge_state <> 'done' AND m.judge_state = 'pending' AND m.embed_state IN ('done', 'failed') AND m.status <> 'trashed'
+       AND NOT EXISTS (SELECT 1 FROM memories o WHERE o.seq < m.seq AND o.judge_state <> 'done' AND o.judge_state = 'pending'
+                       AND o.embed_state IN ('pending', 'retry') AND o.status <> 'trashed')
      ORDER BY m.seq LIMIT ?1";
 
 /// Memories whose embedding step is over and that wait for the judge, oldest first.
@@ -142,11 +150,13 @@ pub fn pending(conn: &Connection, limit: usize) -> Result<Vec<PendingJudgement>>
                 seq: r.get(0)?,
                 id: r.get(1)?,
                 stamp: r.get(2)?,
-                project_id: r.get(3)?,
-                project_slug: r.get(4)?,
-                kind_explicit: r.get::<_, i64>(5)? != 0,
-                project_defaulted: r.get::<_, i64>(6)? != 0,
-                attempts: r.get::<_, i64>(7)?.max(0) as u32,
+                updated_at: r.get(3)?,
+                project_id: r.get(4)?,
+                project_slug: r.get(5)?,
+                kind_explicit: r.get::<_, i64>(6)? != 0,
+                project_defaulted: r.get::<_, i64>(7)? != 0,
+                attempts: r.get::<_, i64>(8)?.max(0) as u32,
+                unavailable: r.get::<_, i64>(9)?.max(0) as u32,
             })
         })?
         .collect::<std::result::Result<_, _>>()?)
@@ -162,16 +172,28 @@ pub fn judge_backlog(conn: &Connection) -> Result<u64> {
     Ok(n as u64)
 }
 
-/// `retry` becomes `pending` for another try; after `max_attempts` they stop (`done`). Only
-/// `retry` rows change. Returns (requeued, given up).
-pub fn requeue_retries(conn: &Connection, max_attempts: u32) -> Result<(usize, usize)> {
+/// The wait before a `retry` memory is judged again after its `failures`-th failed judgement
+/// (counted or not): `base` (5 minutes in the daemon), doubling every time, at most 6 hours.
+pub fn retry_backoff(base: std::time::Duration, failures: u32) -> std::time::Duration {
+    let wait = base.saturating_mul(1u32 << failures.saturating_sub(1).min(10));
+    wait.min(std::time::Duration::from_secs(6 * 3600))
+}
+
+/// The default `base` of [`retry_backoff`].
+pub const RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `retry` memories whose time has come (`judge_next_try_at` passed, `now` is an RFC 3339
+/// string) become `pending` for another try; those that failed `max_attempts` times stop
+/// (`done`). Only `retry` rows change. Returns (requeued, given up).
+pub fn requeue_retries(conn: &Connection, max_attempts: u32, now: &str) -> Result<(usize, usize)> {
     let given_up = conn.execute(
         "UPDATE memories SET judge_state = 'done' WHERE judge_state <> 'done' AND judge_state = 'retry' AND judge_attempts >= ?1",
         [max_attempts],
     )?;
     let requeued = conn.execute(
-        "UPDATE memories SET judge_state = 'pending' WHERE judge_state <> 'done' AND judge_state = 'retry' AND judge_attempts < ?1",
-        [max_attempts],
+        "UPDATE memories SET judge_state = 'pending' WHERE judge_state <> 'done' AND judge_state = 'retry'
+           AND judge_attempts < ?1 AND (judge_next_try_at IS NULL OR judge_next_try_at <= ?2)",
+        params![max_attempts, now],
     )?;
     Ok((requeued, given_up))
 }
@@ -327,13 +349,87 @@ mod tests {
         memory_with(&c, "SKIP", "skipped", "done", "active", 9);
         memory_with(&c, "DONE", "done", "done", "active", 0);
         memory_with(&c, "PEND", "pending", "done", "pending", 0);
-        assert_eq!(requeue_retries(&c, 3).unwrap(), (1, 1));
+        assert_eq!(
+            requeue_retries(&c, 3, "2099-01-01T00:00:00.000Z").unwrap(),
+            (1, 1)
+        );
         assert_eq!(state_of(&c, "R1"), "pending");
         assert_eq!(state_of(&c, "R3"), "done", "given up after three attempts");
         assert_eq!(state_of(&c, "SKIP"), "skipped", "imports keep their state");
         assert_eq!(state_of(&c, "DONE"), "done");
         assert_eq!(state_of(&c, "PEND"), "pending");
-        assert_eq!(requeue_retries(&c, 3).unwrap(), (0, 0));
+        assert_eq!(
+            requeue_retries(&c, 3, "2099-01-01T00:00:00.000Z").unwrap(),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn a_retry_waits_for_its_time_and_the_wait_doubles_up_to_six_hours() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        memory_with(&c, "LATER", "retry", "done", "active", 1);
+        memory_with(&c, "DUE", "retry", "done", "active", 1);
+        memory_with(&c, "UNSET", "retry", "done", "active", 1);
+        c.execute(
+            "UPDATE memories SET judge_next_try_at = '2026-10-14T12:00:00.000Z' WHERE id = 'LATER'",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE memories SET judge_next_try_at = '2026-10-14T10:00:00.000Z' WHERE id = 'DUE'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            requeue_retries(&c, 5, "2026-10-14T11:00:00.000Z").unwrap(),
+            (2, 0)
+        );
+        assert_eq!(state_of(&c, "LATER"), "retry");
+        assert_eq!(state_of(&c, "DUE"), "pending");
+        assert_eq!(state_of(&c, "UNSET"), "pending");
+        let secs: Vec<u64> = (1..=14)
+            .map(|n| retry_backoff(RETRY_BASE, n).as_secs())
+            .collect();
+        assert_eq!(&secs[..3], &[300, 600, 1200], "5 minutes, doubling");
+        assert!(
+            secs.iter().all(|s| *s <= 6 * 3600) && secs[13] == 6 * 3600,
+            "{secs:?}"
+        );
+    }
+
+    #[test]
+    fn the_queue_query_uses_the_partial_index_for_both_the_rows_and_the_older_check() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {PENDING_SQL}"))
+            .unwrap()
+            .query_map([10], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan.join("\n");
+        assert!(plan.matches("memories_judge").count() >= 2, "{plan}");
+    }
+
+    #[test]
+    fn a_memory_waits_while_an_older_one_is_still_being_embedded() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        memory_with(&c, "A-OLD", "pending", "pending", "pending", 0);
+        memory_with(&c, "B-NEW", "pending", "done", "pending", 0);
+        assert!(
+            pending(&c, 10).unwrap().is_empty(),
+            "B would miss A as a neighbour"
+        );
+        c.execute(
+            "UPDATE memories SET embed_state = 'done' WHERE id = 'A-OLD'",
+            [],
+        )
+        .unwrap();
+        let ids: Vec<String> = pending(&c, 10).unwrap().into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, ["A-OLD", "B-NEW"], "oldest first");
     }
 
     #[test]

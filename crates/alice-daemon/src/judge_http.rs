@@ -500,6 +500,8 @@ pub(crate) struct ScriptedJev {
     pub project: Option<(&'static str, f64)>,
     pub predicate: Option<(&'static str, f64)>,
     pub status: Mutex<Option<u16>>,
+    /// Every request takes this long to answer.
+    pub delay: Duration,
     pub calls: Mutex<usize>,
     pub bodies: Mutex<Vec<String>>,
 }
@@ -546,6 +548,9 @@ impl JevTransport for ScriptedJev {
         _timeout: Duration,
     ) -> Result<HttpReply, TransportError> {
         *self.calls.lock() += 1;
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
         self.bodies
             .lock()
             .push(String::from_utf8_lossy(body).into_owned());
