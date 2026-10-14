@@ -44,4 +44,5 @@ schemars.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+alice-core = { path = "../alice-core", features = ["fixtures"] }
 tempfile.workspace = true
