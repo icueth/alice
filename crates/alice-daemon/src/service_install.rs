@@ -395,13 +395,16 @@ pub enum UnitState {
 
 /// launchd's exit code for "Could not find specified service" (`launchctl error 113`).
 const LAUNCHD_NOT_FOUND: i32 = 113;
+/// launchd's exit code for "Could not find specified domain" (`launchctl error 112`): no GUI
+/// session for the user (an SSH-only login), so no agent of that domain can be loaded or run.
+const LAUNCHD_NO_DOMAIN: i32 = 112;
 
 /// Ask the manager about the unit, by exit codes and the manager's fixed state identifiers
 /// (never its messages, which are localised). Not used for Windows, whose task has no restart
 /// policy.
 ///
-/// - launchd `print`: exit 0 is loaded (and `KeepAlive` can restart it), 113 is not found,
-///   anything else is unknown.
+/// - launchd `print`: exit 0 is loaded (and `KeepAlive` can restart it), 113 (no such service)
+///   and 112 (no GUI domain for the user) are not running, anything else is unknown.
 /// - systemd `show -p ActiveState -p SubState --value`: a non-zero exit or output that names no
 ///   state is unknown; `active`, `activating`, `reloading`, `deactivating` or a `SubState` of
 ///   `auto-restart` is running; `inactive` or `failed` otherwise is not.
@@ -418,7 +421,7 @@ pub fn unit_state(p: Platform, uid: u32, r: &dyn Runner) -> UnitState {
                 Err(e) => unknown(e.to_string()),
                 Ok(e) => match e.code {
                     Some(0) => UnitState::Running,
-                    Some(LAUNCHD_NOT_FOUND) => UnitState::NotRunning,
+                    Some(LAUNCHD_NOT_FOUND | LAUNCHD_NO_DOMAIN) => UnitState::NotRunning,
                     other => unknown(format!(
                         "`launchctl print` exited with {}",
                         other.map_or("a signal".to_string(), |c| c.to_string())
@@ -451,28 +454,24 @@ pub fn unit_state(p: Platform, uid: u32, r: &dyn Runner) -> UnitState {
             }
             let text = decode_text(&e.stdout);
             let words: Vec<&str> = text.split_whitespace().collect();
-            let active = words.iter().find(|w| {
+            // Any running word wins over a stopped one, whatever order the values come in.
+            let running = words.iter().any(|w| {
                 [
                     "active",
                     "activating",
                     "reloading",
                     "deactivating",
-                    "inactive",
-                    "failed",
+                    "auto-restart",
                 ]
-                .contains(*w)
+                .contains(w)
             });
-            match active {
-                None => unknown("systemctl named no state".into()),
-                Some(&state) => {
-                    if words.contains(&"auto-restart")
-                        || ["active", "activating", "reloading", "deactivating"].contains(&state)
-                    {
-                        UnitState::Running
-                    } else {
-                        UnitState::NotRunning
-                    }
-                }
+            let stopped = words.iter().any(|w| ["inactive", "failed"].contains(w));
+            if running {
+                UnitState::Running
+            } else if stopped {
+                UnitState::NotRunning
+            } else {
+                unknown("systemctl named no state".into())
             }
         }
         Platform::Windows => {
@@ -998,6 +997,11 @@ mod tests {
         assert_eq!(linux(0, "reloading\nreload\n"), UnitState::Running);
         assert_eq!(linux(0, "failed\nfailed\n"), UnitState::NotRunning);
         assert_eq!(linux(0, "inactive\ndead\n"), UnitState::NotRunning);
+        assert_eq!(
+            linux(0, "failed\nactive\n"),
+            UnitState::Running,
+            "a running word wins whatever the order"
+        );
         assert!(matches!(linux(1, ""), UnitState::Unknown(_)), "no user bus");
         assert!(
             matches!(linux(3, "inactive\ndead\n"), UnitState::Unknown(_)),
@@ -1020,10 +1024,12 @@ mod tests {
         };
         assert_eq!(mac(Some(0)), UnitState::Running);
         assert_eq!(mac(Some(113)), UnitState::NotRunning, "service not found");
-        assert!(
-            matches!(mac(Some(5)), UnitState::Unknown(_)),
-            "no gui domain, say"
+        assert_eq!(
+            mac(Some(112)),
+            UnitState::NotRunning,
+            "no GUI domain (SSH-only login)"
         );
+        assert!(matches!(mac(Some(5)), UnitState::Unknown(_)));
         assert!(matches!(mac(None), UnitState::Unknown(_)));
     }
 

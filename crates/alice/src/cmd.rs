@@ -2065,7 +2065,7 @@ fn suspend_service(home: &AliceHome) -> Result<Option<Suspended>> {
             }))
         }
         Err(e) => bail!(
-            "the installed service could not be stopped or checked ({e}); nothing was changed. It would start a daemon in the middle of the restore: stop it yourself (`alice service uninstall`), retry, and `alice service install` again afterwards"
+            "the installed service could not be stopped or checked ({e}); nothing was changed. It would start a daemon in the middle of the restore: stop it with the service manager (macOS: `launchctl bootout gui/$(id -u)/dev.alice.daemon`; Linux: `systemctl --user stop alice.service`), retry, and start it again afterwards (or `alice service install`)"
         ),
     }
 }
