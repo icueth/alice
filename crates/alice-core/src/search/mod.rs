@@ -1258,8 +1258,10 @@ mod tests {
             status: 0.0,
             ..Default::default()
         });
-        // A status note well over a year old keeps 0.7 of its score with a 7-day half-life.
-        assert!((decayed / kept - 0.7).abs() < 1e-6, "{decayed} / {kept}");
+        // A status note well over a year old keeps 0.7 of its boost with a 7-day half-life; the
+        // score carries the boosts to the power λ.
+        let want = 0.7f64.powf(Fusion::default().boost_exponent);
+        assert!((decayed / kept - want).abs() < 1e-6, "{decayed} / {kept}");
     }
 
     /// Task 19, ruling 3, end to end with the fake embedder (no meaning to fall back on): a Thai
@@ -1367,8 +1369,9 @@ mod tests {
             ..f.params(&format!("{word} deploy checklist"))
         };
         let ratio = score_at(&f, &p, id, day(300)) / score_at(&f, &p, id, day(1));
-        let expect =
-            (0.7 + 0.3 * (-300.0f64 / 180.0).exp()) / (0.7 + 0.3 * (-1.0f64 / 180.0).exp());
+        let expect = ((0.7 + 0.3 * (-300.0f64 / 180.0).exp())
+            / (0.7 + 0.3 * (-1.0f64 / 180.0).exp()))
+        .powf(Fusion::default().boost_exponent);
         assert!((ratio - expect).abs() < 1e-9, "{ratio} vs {expect}");
         // A raw chunk decays with its 90-day half-life.
         f.chunk(&f.app, "s-decay", "betaraw deploy checklist");

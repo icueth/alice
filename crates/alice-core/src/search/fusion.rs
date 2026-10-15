@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 /// Default `search.rrf_k`: the constant of reciprocal rank fusion (a smaller k lets a list's
 /// first places count for more).
-pub const DEFAULT_RRF_K: f64 = 60.0;
+pub const DEFAULT_RRF_K: f64 = 10.0;
 /// Default `search.boost_exponent`: the weight of the priors in the final score.
-pub const DEFAULT_BOOST_EXPONENT: f64 = 1.0;
+pub const DEFAULT_BOOST_EXPONENT: f64 = 0.5;
 
 /// How the candidate lists and the priors are combined: `score = rrf_k(item) × boost(item)^λ`.
 /// The `search.rrf_k` and `search.boost_exponent` settings.
