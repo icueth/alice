@@ -51,6 +51,11 @@ fn is_diary(id: &str, meta: &DrawerMeta) -> bool {
         || id.starts_with("diary_")
 }
 
+/// MemPalace files its auto-save under the diary topic `checkpoint`.
+fn is_checkpoint_topic(topic: Option<&str>) -> bool {
+    topic.is_some_and(|t| t.trim().eq_ignore_ascii_case("checkpoint"))
+}
+
 pub fn classify(id: &str, meta: &DrawerMeta) -> Tier {
     if meta.unreadable {
         return Tier::Skip("unreadable metadata");
@@ -304,7 +309,11 @@ impl Mapper<'_> {
         if g.is_blocked() {
             return g.into_planned();
         }
-        let project = self.wings.decide(&d.meta, &text);
+        let project = if tier == Tier::Knowledge && is_diary(&d.id, &d.meta) {
+            self.wings.decide_diary(&d.meta, &text)
+        } else {
+            self.wings.decide(&d.meta, &text)
+        };
         let out = if tier == Tier::Knowledge {
             self.knowledge(&mut g, d, text, project)
         } else {
@@ -326,8 +335,10 @@ impl Mapper<'_> {
     ) -> Planned {
         let m = &d.meta;
         let diary = is_diary(&d.id, m);
+        // MemPalace's auto-save diaries (topic `checkpoint`) are low weight: kept, but importance 1.
+        let checkpoint = diary && is_checkpoint_topic(m.topic.as_deref());
         let (kind, importance) = if diary {
-            (Kind::Diary, 2)
+            (Kind::Diary, if checkpoint { 1 } else { 2 })
         } else {
             (kind_for_room(&m.room), 3)
         };
@@ -983,6 +994,111 @@ mod tests {
         assert_eq!(i.created_at.as_deref(), Some("2026-04-16T04:34:59.427Z"));
         assert_eq!(i.legacy_id.as_deref(), Some(id));
         assert_eq!(p[0].legacy_id, id);
+    }
+
+    fn diary_meta(wing: &str, topic: &str) -> DrawerMeta {
+        DrawerMeta {
+            wing: wing.into(),
+            room: "diary".into(),
+            agent: s("claude-code"),
+            topic: s(topic),
+            date: s("2026-04-16"),
+            ..Default::default()
+        }
+    }
+
+    fn map_one(id: &str, text: &str, meta: DrawerMeta) -> Vec<PlannedMemory> {
+        let f = NoFilter;
+        let m = Mapper {
+            wings: &wings(),
+            assume: utc(),
+            filter: &f,
+        };
+        let Planned::Memories(p) = m.map(&d(id, text, meta), 0, (None, None)) else {
+            panic!("expected memories")
+        };
+        p
+    }
+
+    #[test]
+    fn a_checkpoint_diary_is_low_weight_but_keeps_its_text_and_topic() {
+        for topic in ["checkpoint", "Checkpoint ", "CHECKPOINT"] {
+            let p = map_one(
+                "diary_wing_claude_code_1_ab",
+                "AUTO-SAVE: the session state.",
+                diary_meta("wing_claude_code", topic),
+            );
+            let i = &p[0].input;
+            assert_eq!(i.kind, Some(Kind::Diary), "{topic}");
+            assert_eq!(i.importance, Some(1), "{topic}");
+            assert_eq!(i.topics, vec!["checkpoint".to_string()], "{topic}");
+            assert_eq!(i.content, "AUTO-SAVE: the session state.");
+        }
+    }
+
+    #[test]
+    fn other_diaries_and_knowledge_keep_their_importance() {
+        for topic in [
+            "system-maintenance",
+            "checkpoints-review",
+            "precompact-checkpoint",
+        ] {
+            let p = map_one(
+                "diary_wing_claude_code_2_ab",
+                "text",
+                diary_meta("wing_claude_code", topic),
+            );
+            assert_eq!(p[0].input.importance, Some(2), "{topic}");
+        }
+        // A knowledge drawer in a room called `checkpoint` is not a diary.
+        let p = map_one("k1", "text", knowledge_meta("alice", "checkpoint"));
+        assert_eq!(p[0].input.importance, Some(3));
+    }
+
+    #[test]
+    fn a_diary_goes_to_the_project_its_topic_names() {
+        let mut wm = wings();
+        wm.note_transcript_dir("/h/.claude/projects/-Users-x-Code-AI-devspace/a.jsonl");
+        let f = NoFilter;
+        let m = Mapper {
+            wings: &wm,
+            assume: utc(),
+            filter: &f,
+        };
+        let Planned::Memories(p) = m.map(
+            &d(
+                "diary_wing_claude_code_3_ab",
+                "text about a test of tests",
+                diary_meta("wing_claude_code", "devspace-chat-tabs"),
+            ),
+            0,
+            (None, None),
+        ) else {
+            panic!("expected memories")
+        };
+        assert_eq!(p[0].project.slug, "devspace");
+    }
+
+    #[test]
+    fn a_transcript_chunk_in_a_diary_room_keeps_the_ordinary_rules() {
+        let mut meta = diary_meta("wing_claude_code", "devspace-chat-tabs");
+        meta.ingest_mode = s("convos");
+        meta.source_file = s("/Users/x/.claude/projects/-Users-x-alice/abc.jsonl");
+        let mut wm = wings();
+        wm.note_transcript_dir("/h/.claude/projects/-Users-x-Code-AI-devspace/a.jsonl");
+        let f = NoFilter;
+        let m = Mapper {
+            wings: &wm,
+            assume: utc(),
+            filter: &f,
+        };
+        let Planned::Chunks(c) = m.map(&d("c1", "chunk text", meta), 0, (None, None)) else {
+            panic!("expected chunks")
+        };
+        assert_eq!(
+            c[0].project.slug, "alice",
+            "the transcript folder, not the topic"
+        );
     }
 
     #[test]

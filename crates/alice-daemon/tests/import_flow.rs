@@ -795,6 +795,95 @@ async fn names_that_look_like_secrets_never_reach_the_status_or_the_text() {
     }
 }
 
+fn diary_spec(id: &str, text: &str, wing: &str, topic: &str) -> DrawerSpec {
+    DrawerSpec {
+        id: id.into(),
+        text: text.into(),
+        meta: DrawerMeta {
+            wing: wing.into(),
+            room: "diary".into(),
+            agent: s("claude-code"),
+            topic: s(topic),
+            date: s("2026-04-16"),
+            filed_at: s("2026-04-16T20:00:00"),
+            ..Default::default()
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diary_project_rules_and_checkpoint_weight_show_in_the_import_report_and_the_store() {
+    let mut specs = vec![
+        knowledge("k_dev", "devspace note", "devspace", "decisions"),
+        knowledge("k_tsm", "tara note", "tara-stock-market", "decisions"),
+        knowledge("k_tv", "valley note", "tara_valley", "decisions"),
+        knowledge("k_test", "a test wing note", "test", "decisions"),
+        knowledge("k_pg", "pg note", "pg_ai", "decisions"),
+        // topic names a project (the wing is another project's, or an agent wing)
+        diary_spec(
+            "diary_1",
+            "tara diary, the test suite passed",
+            "tara_valley",
+            "tara-stock-market",
+        ),
+        diary_spec(
+            "diary_2",
+            "devspace diary, test test test",
+            "wing_claude_code",
+            "devspace-chat-tabs",
+        ),
+        // agent wing ending in a project
+        diary_spec("diary_3", "pg diary one", "wing_claude_code_pgai", "setup"),
+        // text full of `test` and no other signal: global, never `test`
+        diary_spec(
+            "diary_4",
+            "test test test, more test",
+            "wing_claude_code",
+            "deployment",
+        ),
+        // auto-save checkpoints: low weight, same project rules as other diaries
+        diary_spec(
+            "diary_5",
+            "auto-save one",
+            "wing_claude_code_pgai",
+            "checkpoint",
+        ),
+        diary_spec("diary_6", "auto-save two", "wing_claude_code", "checkpoint"),
+    ];
+    specs.push(knowledge("k_x", "x note", "wing_claude_code", "knowledge"));
+    let f = Flow::with_specs(&specs).await;
+    let st = f.run_import(f.request().dry_run(true)).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    // Per project: its own wing note, plus the diaries the rules send there.
+    assert_eq!(r.projects["tara-stock-market"].memories, 2);
+    assert_eq!(r.projects["tara-valley"].memories, 1);
+    assert_eq!(r.projects["devspace"].memories, 2);
+    assert_eq!(r.projects["pg-ai"].memories, 3);
+    assert_eq!(
+        r.projects["test"].memories, 1,
+        "only the `test` wing's own drawer"
+    );
+    assert_eq!(r.projects["global"].memories, 3);
+
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let row = |legacy: &str| -> (String, i64) {
+        f.db()
+            .query_row(
+                "SELECT p.slug, m.importance FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.legacy_id = ?1",
+                [legacy],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(row("diary_1"), ("tara-stock-market".to_string(), 2));
+    assert_eq!(row("diary_4"), ("global".to_string(), 2));
+    assert_eq!(row("diary_5"), ("pg-ai".to_string(), 1));
+    assert_eq!(row("diary_6"), ("global".to_string(), 1));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_joins_the_import_thread_and_the_daemon_start_sweeps_import_tmp() {
     let f = Flow::with_specs(&big_specs(30_000)).await;

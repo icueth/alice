@@ -343,7 +343,9 @@ pub struct ImportMempalaceArgs {
     /// Only drawers filed at or after this date (YYYY-MM-DD or RFC 3339).
     #[arg(long)]
     pub since: Option<String>,
-    /// Map a MemPalace wing to an Alice project, as wing=project (repeatable).
+    /// Map a MemPalace wing to an Alice project, as wing=project (repeatable). This fixes a wing's
+    /// project on a fresh import; `alice projects merge <from> <into>` fixes it afterwards (that
+    /// command is being added in the next task).
     #[arg(long, value_name = "WING=PROJECT", value_parser = parse_map_wing)]
     pub map_wing: Vec<(String, String)>,
     /// The collection that holds the drawers (default mempalace_drawers).
