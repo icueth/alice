@@ -205,6 +205,8 @@ pub struct Scope<'a> {
     pub project: Option<&'a str>,
     pub cwd: Option<&'a str>,
     pub client_project: Option<&'a ClientProject>,
+    /// A project name from a direct MCP caller; honoured in tenant mode only.
+    pub project_hint: Option<&'a str>,
 }
 
 /// A request that names its project.
@@ -220,6 +222,7 @@ macro_rules! scoped {
                     project: self.project.as_deref(),
                     cwd: self.cwd.as_deref(),
                     client_project: self.client_project.as_ref(),
+                    project_hint: self.project_hint.as_deref(),
                 }
             }
         }
@@ -1218,7 +1221,7 @@ impl Service {
             .map_err(join_err)?
     }
 
-    /// Project for a request (precedence: spec §4.1). A `client_project` is mirrored first
+    /// Project for a request (precedence: spec §4.1, then §2.8's project hint on a tenant). A `client_project` is mirrored first
     /// (on the blocking pool), whatever wins; a working directory not seen in the last minute is
     /// resolved with git on the blocking pool, and never on a server tenant.
     async fn choose(&self, scope: Scope<'_>) -> Result<ProjectChoice> {
@@ -1240,6 +1243,31 @@ impl Service {
         }
         if let Some(r) = mirrored {
             return Ok(ProjectChoice::Detected(r));
+        }
+        if self.opts.tenant
+            && let Some(hint) = scope.project_hint
+        {
+            let slug = alice_core::normalize::slugify(hint);
+            if !slug.is_empty() {
+                let name = hint.trim().to_string();
+                let lookup = slug.clone();
+                let found = self
+                    .read(move |conn| alice_core::store::projects::resolve_slug(conn, &lookup))
+                    .await?;
+                return Ok(match found {
+                    Some(p) => ProjectChoice::Slug(p.slug),
+                    None => ProjectChoice::Detected(ProjectRef {
+                        key: format!(
+                            "{}{slug}",
+                            alice_core::store::projects::PLACEHOLDER_KEY_PREFIX
+                        ),
+                        slug,
+                        name,
+                        root: None,
+                        remote: None,
+                    }),
+                });
+            }
         }
         let cwd = if self.opts.tenant { None } else { scope.cwd };
         if let Some(choice) = self.resolver.choose_without_git(None, cwd) {
@@ -8696,6 +8724,95 @@ mod tests {
         )
         .unwrap();
         (d, s)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_hint_makes_or_finds_a_placeholder_in_tenant_mode_only() {
+        let (_d, s) = tenant_svc().await;
+        let hint = |content: &str, h: &str| RememberRequest {
+            content: content.into(),
+            project_hint: Some(h.into()),
+            ..Default::default()
+        };
+        let r = s
+            .remember(hint("first note via mcp", "My App"))
+            .await
+            .unwrap();
+        assert_eq!(r.project, "my-app");
+        let conn = alice_core::store::open_reader(&s.home().db()).unwrap();
+        let (key, root): (String, Option<String>) = conn
+            .query_row(
+                "SELECT key, root_path FROM projects WHERE slug = 'my-app'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            key,
+            format!(
+                "{}my-app",
+                alice_core::store::projects::PLACEHOLDER_KEY_PREFIX
+            )
+        );
+        assert!(root.is_none(), "no path is stored for a hint");
+        // The second time it finds the same project; an explicit slug still wins.
+        assert_eq!(
+            s.remember(hint("second note via mcp", "my-app"))
+                .await
+                .unwrap()
+                .project,
+            "my-app"
+        );
+        let r = s
+            .remember(RememberRequest {
+                content: "explicit".into(),
+                project: Some("global".into()),
+                project_hint: Some("my-app".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.project, "global");
+        // A local daemon ignores the hint.
+        let (_d2, local) = svc().await;
+        assert_eq!(
+            local
+                .remember(hint("local note", "my-app"))
+                .await
+                .unwrap()
+                .project,
+            "global"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_redacts_even_when_redaction_is_off_in_the_file() {
+        let (d, s) = tenant_svc().await;
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        assert!(
+            s.patch_settings(patch_one("privacy.redact", serde_json::json!(false)))
+                .is_err()
+        );
+        s.remember(RememberRequest {
+            content: format!("deploy key {token}"),
+            project_hint: Some("ops".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // The database is in WAL mode: the text may sit in either file.
+        let db = s.home().db();
+        let mut wal = db.as_os_str().to_owned();
+        wal.push("-wal");
+        for f in [db, std::path::PathBuf::from(wal)] {
+            let bytes = std::fs::read(&f).unwrap_or_default();
+            assert!(
+                !bytes.windows(token.len()).any(|w| w == token.as_bytes()),
+                "the secret reached {}",
+                f.display()
+            );
+        }
+        drop(d);
     }
 
     #[tokio::test(flavor = "multi_thread")]

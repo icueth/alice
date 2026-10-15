@@ -89,6 +89,11 @@ pub struct RecallRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub client_project: Option<ClientProject>,
+    /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
+    /// by the MCP handlers; never on the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -234,6 +239,11 @@ pub struct RememberRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub client_project: Option<ClientProject>,
+    /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
+    /// by the MCP handlers; never on the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_hint: Option<String>,
     #[serde(default)]
     #[schemars(skip)]
     pub author: Author,
@@ -273,6 +283,11 @@ pub struct ContextRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub client_project: Option<ClientProject>,
+    /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
+    /// by the MCP handlers; never on the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -457,6 +472,11 @@ pub struct IngestRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub client_project: Option<ClientProject>,
+    /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
+    /// by the MCP handlers; never on the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

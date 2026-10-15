@@ -163,6 +163,7 @@ pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
                         project: project.as_deref(),
                         cwd: cwd.as_deref(),
                         client_project: client_project.as_ref(),
+                        project_hint: None,
                     })
                     .await
                 {

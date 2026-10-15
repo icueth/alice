@@ -416,6 +416,7 @@ impl AliceMcp {
             arguments: serde_json::Value::Object(request.arguments.unwrap_or_default()),
             cwd: self.cwd(ctx).await,
             agent: Self::agent(ctx),
+            project_hint: None,
         };
         match self.backend.compat_call(call).await {
             Ok(r) => text(serde_json::to_string(&r.value).unwrap_or_default()),

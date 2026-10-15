@@ -81,7 +81,9 @@ impl Redactors {
 
     fn cached(&self, root: Option<&Path>, always_on: bool) -> Arc<Redactor> {
         let mut privacy = self.privacy_for(root);
-        if always_on {
+        // A server tenant always redacts: whatever the settings snapshot says.
+        let tenant = matches!(&self.source, Source::Live(s) if s.is_tenant());
+        if always_on || tenant {
             privacy.redact = true;
         }
         match root {
@@ -205,5 +207,35 @@ mod tests {
         });
         let red = r.for_root(None);
         assert!(red.check("content", "password = hunter2").is_err());
+    }
+
+    #[test]
+    fn a_tenant_redacts_even_when_the_settings_say_redaction_is_off() {
+        // The environment is the one layer a tenant's rules do not replace with defaults, so a
+        // variable can leave `privacy.redact` off in the snapshot; the redactors still redact.
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let env = vec![("ALICE_PRIVACY_REDACT".to_string(), "false".to_string())];
+        let s = SettingsHandle::load_with(&home, env.clone(), true);
+        assert!(s.is_tenant());
+        assert!(
+            !s.get().privacy.redact,
+            "the snapshot says redaction is off"
+        );
+        let text = concat!("token gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 here");
+        let r = Redactors::new(s);
+        assert_eq!(r.for_root(None).apply(text).found, ["github_token"]);
+        assert_eq!(
+            r.for_root_always_on(None).apply(text).found,
+            ["github_token"]
+        );
+        let repo = tempfile::tempdir().unwrap();
+        assert_eq!(
+            r.for_root(Some(repo.path())).apply(text).found,
+            ["github_token"]
+        );
+        // A local daemon with the same variable stores the text as it is.
+        let local = Redactors::new(SettingsHandle::load_with(&home, env, false));
+        assert!(local.for_root(None).apply(text).found.is_empty());
     }
 }

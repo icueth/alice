@@ -1755,6 +1755,12 @@ pub fn validate_tenant(s: &Settings, home: &Path, port_from_file: bool) -> Vec<S
             "the server's admin sets the port of a server tenant",
         ));
     }
+    if !s.privacy.redact {
+        e.push(err(
+            "privacy.redact",
+            "a server tenant always redacts secrets before storing them",
+        ));
+    }
     if s.secrets.backend == SecretsBackend::Keychain {
         e.push(err(
             "secrets.backend",
@@ -3945,6 +3951,7 @@ mod tests {
             ("[judge.jev]\nendpoint = \"https://[fe80::1]/v1\"\n".into(), "judge.jev.endpoint"),
             ("[sync]\nremote = \"git@192.168.1.5:me/mem.git\"\n".into(), "sync.remote"),
             ("[secrets]\nbackend = \"keychain\"\n".into(), "secrets.backend"),
+            ("[privacy]\nredact = false\n".into(), "privacy.redact"),
         ];
         for (toml, key) in &refused {
             assert!(
