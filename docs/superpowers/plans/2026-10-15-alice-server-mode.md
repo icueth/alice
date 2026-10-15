@@ -3123,6 +3123,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - **New command `alice-server cli <name> <alice arguments…>`** (R31): run
   `sudo -u alice-<name> env ALICE_HOME="$SRV/<name>" ALICE_NO_AUTOSTART=1 "$BIN" "$@"`, with the tenant's terminal attached
   so `config set-secret` can prompt.
+  **It never takes a secret on its command line** (argv shows in `ps` and shell history; controller condition on R31).
+  `alice config set-secret <name>` already takes only the name and reads the value from stdin or a prompt with echo off,
+  and `alice-server cli` passes stdin and the terminal through unchanged. The script refuses an invocation whose
+  arguments contain `set-secret` followed by more than one further argument, with "a secret is never passed on the
+  command line; run `alice-server cli <name> config set-secret <secret-name>` and paste it when asked". Add the test
+  scenario `cli_refuses_a_secret_in_argv`.
 - **New test scenarios in `deploy/server/tests/run.sh`:**
   - `snippet_routes_mcp`: `ann.caddy` contains `/mcp /mcp/*` and `respond @admin 404`.
   - `import_moves_runs_and_cleans`: the stub `alice` records its arguments. The palace directory moves into
@@ -3188,7 +3194,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   the server always redacts.
 - **Import:** describe the admin import (`alice-server import`): the person hands their palace to the admin; the server
   copy is deleted afterwards.
-- **Keys and settings:** describe `alice-server cli` for setting a person's Jev key and settings.
+- **Keys and settings:** describe `alice-server cli` for setting a person's Jev key and settings. A secret is shown being
+  entered at the prompt (`alice-server cli <name> config set-secret typesafe`, then paste), or piped on stdin; it is never
+  shown as a command-line argument.
 - **Windows:** the `alice` binary is supported on macOS and Linux. On Windows, or anywhere without the binary, connect an
   agent to the server's MCP endpoint.
 - **Deferred client:** the `alice remote` client is not built yet. Do not document §3's commands as available.
