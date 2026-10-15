@@ -1366,6 +1366,7 @@ fn import_batch(conn: &Connection, batch: Box<ImportBatch>, st: &mut State) -> R
                 "reviews_created": out.reviews_created,
                 "reviews_skipped": out.reviews_skipped,
                 "collapsed_recorded": out.collapsed_recorded,
+                "joined_recorded": out.joined_recorded,
                 "projects_created": out.projects_created,
                 "mentions_linked": out.mentions_linked,
                 "errors": out.errors.len(),

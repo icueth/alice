@@ -24,6 +24,13 @@ pub struct TierReport {
     pub raw_session_chunks: u64,
     pub raw_session_transcripts: u64,
     pub raw_file_chunks: u64,
+    /// MemPalace's auto-save diaries (topic `checkpoint`), filed as raw session chunks (fragments
+    /// of one diary counted one by one) ...
+    #[serde(default)]
+    pub checkpoint_diaries: u64,
+    /// ... in this many sources (one per wing and day).
+    #[serde(default)]
+    pub checkpoint_sources: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -93,6 +100,13 @@ pub struct ImportReport {
     pub tunnels: TunnelCounts,
     pub drawers_seen: u64,
     pub drawers_accounted: u64,
+    /// Drawers MemPalace had cut into fragments (`…_chunk_000001`): the fragments beyond the
+    /// first that were joined back into their drawer ...
+    #[serde(default)]
+    pub fragments_joined: u64,
+    /// ... and the drawers they were joined into.
+    #[serde(default)]
+    pub fragment_groups: u64,
     pub closets_dropped: u64,
     pub isolated_entities: u64,
     pub review_items: u64,
@@ -171,6 +185,24 @@ impl ImportReport {
             ),
         );
         line(&mut o, "Raw file chunks", &num(self.tiers.raw_file_chunks));
+        line(
+            &mut o,
+            "Checkpoint diaries",
+            &format!(
+                "{} as raw chunks in {} sources",
+                num(self.tiers.checkpoint_diaries),
+                num(self.tiers.checkpoint_sources)
+            ),
+        );
+        line(
+            &mut o,
+            "Fragments joined",
+            &format!(
+                "{} into {} drawers",
+                num(self.fragments_joined),
+                num(self.fragment_groups)
+            ),
+        );
         line(
             &mut o,
             "Duplicates collapsed",
@@ -354,7 +386,11 @@ mod tests {
                 raw_session_chunks: 76_126,
                 raw_session_transcripts: 130,
                 raw_file_chunks: 38_000,
+                checkpoint_diaries: 1_643,
+                checkpoint_sources: 74,
             },
+            fragments_joined: 721,
+            fragment_groups: 647,
             duplicates: DuplicateCounts {
                 knowledge: 5,
                 raw: 27,
@@ -397,6 +433,10 @@ mod tests {
         for needle in [
             "Knowledge memories",
             "Raw session chunks",
+            "Checkpoint diaries",
+            "1,643 as raw chunks in 74 sources",
+            "Fragments joined",
+            "721 into 647 drawers",
             "Duplicates collapsed",
             "Already imported",
             "Closets dropped",

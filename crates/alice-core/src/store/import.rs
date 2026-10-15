@@ -101,6 +101,9 @@ pub struct ImportBatch {
     pub links: Vec<(String, String)>,
     /// (collapsed drawer id, keeper drawer id).
     pub collapsed: Vec<(String, String)>,
+    /// (fragment drawer id, id of the drawer its text was joined into): the fragment's id is
+    /// filed against the same memory or chunk, in the same transaction as the joined drawer.
+    pub joined: Vec<(String, String)>,
     /// Drawer ids of imported memories whose entity mentions to (re)link.
     pub link_mentions: Vec<String>,
     pub reviews: Vec<NewReview>,
@@ -120,6 +123,7 @@ impl std::fmt::Debug for ImportBatch {
             .field("facts", &self.facts.len())
             .field("links", &self.links.len())
             .field("collapsed", &self.collapsed.len())
+            .field("joined", &self.joined.len())
             .field("link_mentions", &self.link_mentions.len())
             .field("reviews", &self.reviews.len())
             .field("meta", &self.meta.len())
@@ -136,6 +140,7 @@ impl ImportBatch {
             + self.facts.len()
             + self.links.len()
             + self.collapsed.len()
+            + self.joined.len()
             + self.link_mentions.len()
             + self.reviews.len();
         let mut bytes: usize = self.memories.iter().map(|m| m.input.content.len()).sum();
@@ -169,6 +174,9 @@ pub struct BatchOutcome {
     pub reviews_created: usize,
     pub reviews_skipped: usize,
     pub collapsed_recorded: usize,
+    /// Fragment ids filed against the drawer they were joined into.
+    #[serde(default)]
+    pub joined_recorded: usize,
     pub projects_created: usize,
     pub mentions_linked: usize,
     /// Keeper not stored yet (the importer sends collapsed pairs last, so normally empty).
@@ -373,6 +381,20 @@ fn apply_inner(
                     c.ord
                 )),
             }
+        }
+    }
+
+    // 3b. Fragments joined into a drawer of this batch point where that drawer went. Written in
+    // the transaction of the drawer, so a stored drawer never lacks its fragments' ids.
+    for (fragment, head) in &b.joined {
+        match legacy_get(conn, head)? {
+            Some(t) => {
+                legacy_put(conn, fragment, &t.target_type, &t.target_id)?;
+                out.joined_recorded += 1;
+            }
+            None => out.errors.push(format!(
+                "fragment {fragment} was not filed: the drawer it was joined into ({head}) was not stored"
+            )),
         }
     }
 

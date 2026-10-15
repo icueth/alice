@@ -23,6 +23,9 @@ pub enum Tier {
     Knowledge,
     RawSession,
     RawFile,
+    /// A diary of MemPalace's auto-save (topic `checkpoint`): a transcript in disguise, filed
+    /// in the raw tier as session chunks (one source per wing and day).
+    Checkpoint,
     Skip(&'static str),
 }
 
@@ -75,7 +78,14 @@ pub fn classify(id: &str, meta: &DrawerMeta) -> Tier {
     {
         return Tier::RawSession;
     }
-    if is_diary(id, meta) || meta.source_file.is_none() {
+    if is_diary(id, meta) {
+        return if is_checkpoint_topic(meta.topic.as_deref()) {
+            Tier::Checkpoint
+        } else {
+            Tier::Knowledge
+        };
+    }
+    if meta.source_file.is_none() {
         return Tier::Knowledge;
     }
     let curated = CURATED_ROOMS.contains(&slugify(&meta.room).as_str());
@@ -275,6 +285,58 @@ fn source_uri(m: &DrawerMeta) -> String {
     }
 }
 
+/// The agent label of the raw sources made from checkpoint diaries.
+const CHECKPOINT_AGENT: &str = "mempalace checkpoint";
+/// What every checkpoint source uri starts with.
+pub const CHECKPOINT_URI_PREFIX: &str = "mempalace-checkpoint:";
+
+/// The source a checkpoint diary's chunk is filed under: one per wing and day, so a day of
+/// auto-saves reads as one stretch of history (`mempalace-checkpoint:<wing>:<yyyy-mm-dd>`).
+/// The day is the diary's own date, else the date part of its filing time.
+pub fn checkpoint_uri(m: &DrawerMeta) -> String {
+    let day = |t: &str| {
+        let t = t.trim();
+        NaiveDate::parse_from_str(t.get(..10).unwrap_or(t), "%Y-%m-%d")
+            .ok()
+            .map(|d| d.format("%Y-%m-%d").to_string())
+    };
+    let day = m
+        .date
+        .as_deref()
+        .and_then(day)
+        .or_else(|| m.filed_at.as_deref().and_then(day))
+        .unwrap_or_else(|| "undated".to_string());
+    format!("{CHECKPOINT_URI_PREFIX}{}:{day}", m.wing)
+}
+
+/// The source uri of whatever tier the drawer is in (before redaction).
+fn tier_uri(tier: &Tier, m: &DrawerMeta) -> String {
+    if *tier == Tier::Checkpoint {
+        checkpoint_uri(m)
+    } else {
+        source_uri(m)
+    }
+}
+
+/// MemPalace cuts a long knowledge drawer into fragments whose ids are the drawer's id plus
+/// `_chunk_<number>` (`diary_wing_x_20260416_ab_chunk_000001`). Returns the drawer's id and the
+/// number, or `None` for any other id.
+pub fn chunk_suffix(id: &str) -> Option<(&str, i64)> {
+    let at = id.rfind("_chunk_")?;
+    let digits = &id[at + "_chunk_".len()..];
+    if at == 0 || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((&id[..at], digits.parse().ok()?))
+}
+
+/// Where a fragment sits in its drawer: the metadata's `chunk_index` when it has one, else the
+/// number in the id.
+fn fragment_index(id: &str, meta: &DrawerMeta) -> Option<i64> {
+    meta.chunk_index
+        .or_else(|| chunk_suffix(id).map(|(_, n)| n))
+}
+
 pub struct Mapper<'a> {
     pub wings: &'a WingMap,
     pub assume: FixedOffset,
@@ -284,6 +346,36 @@ pub struct Mapper<'a> {
 impl Mapper<'_> {
     /// `ord` is the chunk position inside its source (Task 6 supplies it); ignored for knowledge.
     pub fn map(&self, d: &Drawer, ord: i64, span: (Option<String>, Option<String>)) -> Planned {
+        self.map_members(std::slice::from_ref(d), ord, span)
+    }
+
+    /// The fragments of one drawer (`…_chunk_000000`, `…_chunk_000001`, ...), first fragment
+    /// first: they are joined into one drawer and mapped as one. The text is joined before
+    /// anything else happens to it, so a secret cut by a fragment boundary is whole when the
+    /// detectors see it.
+    pub fn map_group(
+        &self,
+        members: &[Drawer],
+        ord: i64,
+        span: (Option<String>, Option<String>),
+    ) -> Planned {
+        self.map_members(members, ord, span)
+    }
+
+    fn map_members(
+        &self,
+        members: &[Drawer],
+        ord: i64,
+        span: (Option<String>, Option<String>),
+    ) -> Planned {
+        let joined;
+        let d: &Drawer = match members {
+            [one] => one,
+            _ => {
+                joined = self.join(members);
+                &joined
+            }
+        };
         let tier = classify(&d.id, &d.meta);
         if let Tier::Skip(reason) = tier {
             return Planned::Skipped { reason };
@@ -309,13 +401,20 @@ impl Mapper<'_> {
         if g.is_blocked() {
             return g.into_planned();
         }
-        let project = if tier == Tier::Knowledge && is_diary(&d.id, &d.meta) {
+        let diary_rules =
+            matches!(tier, Tier::Knowledge | Tier::Checkpoint) && is_diary(&d.id, &d.meta);
+        let project = if diary_rules {
             self.wings.decide_diary(&d.meta, &text)
         } else {
             self.wings.decide(&d.meta, &text)
         };
         let out = if tier == Tier::Knowledge {
-            self.knowledge(&mut g, d, text, project)
+            let extra: Vec<String> = members
+                .iter()
+                .skip(1)
+                .filter_map(|m| topic_source(&m.id, &m.meta))
+                .collect();
+            self.knowledge(&mut g, d, text, project, &extra)
         } else {
             self.chunks(&mut g, d, &tier, text, project, ord, span)
         };
@@ -326,34 +425,51 @@ impl Mapper<'_> {
         }
     }
 
+    /// One drawer out of the fragments: the first fragment's id and metadata, the fragments'
+    /// text end to end (MemPalace cuts at a fixed size, so nothing is added between them), and
+    /// the earliest filing time of the fragments.
+    fn join(&self, members: &[Drawer]) -> Drawer {
+        let mut meta = members[0].meta.clone();
+        let earliest = members
+            .iter()
+            .filter_map(|m| m.meta.filed_at.as_deref())
+            .filter_map(|t| parse_time(t, self.assume).map(|p| (p, t)))
+            .min_by(|a, b| a.0.cmp(&b.0));
+        if let Some((_, original)) = earliest {
+            meta.filed_at = Some(original.to_string());
+        }
+        Drawer {
+            id: members[0].id.clone(),
+            text: members.iter().map(|m| m.text.as_str()).collect(),
+            meta,
+        }
+    }
+
     fn knowledge(
         &self,
         g: &mut Guard,
         d: &Drawer,
         text: String,
         project: ProjectDecision,
+        extra_topics: &[String],
     ) -> Planned {
         let m = &d.meta;
         let diary = is_diary(&d.id, m);
-        // MemPalace's auto-save diaries (topic `checkpoint`) are low weight: kept, but importance 1.
-        let checkpoint = diary && is_checkpoint_topic(m.topic.as_deref());
         let (kind, importance) = if diary {
-            (Kind::Diary, if checkpoint { 1 } else { 2 })
+            (Kind::Diary, 2)
         } else {
             (kind_for_room(&m.room), 3)
         };
-        let topic_source = if diary {
-            m.topic.as_deref()
-        } else {
-            Some(&*m.room)
-        };
         // The raw topic goes through the filter first: slugifying a key-shaped room name would
         // lower-case it and strip its separators, and no detector would recognise it afterwards.
-        let topics: Vec<String> = topic_source
-            .map(|t| g.apply("topic", &nfc(t)))
-            .and_then(|t| normalize_topic(&t))
-            .into_iter()
-            .collect();
+        let mut topics: Vec<String> = Vec::new();
+        for t in topic_source(&d.id, m).iter().chain(extra_topics) {
+            if let Some(t) = normalize_topic(&g.apply("topic", &nfc(t)))
+                && !topics.contains(&t)
+            {
+                topics.push(t);
+            }
+        }
         let agent = if diary {
             m.agent.clone()
         } else {
@@ -428,12 +544,17 @@ impl Mapper<'_> {
         span: (Option<String>, Option<String>),
     ) -> Planned {
         let m = &d.meta;
-        let session = *tier == Tier::RawSession;
-        let uri = source_uri(m);
-        let uri = g.apply("source.uri", &uri);
+        let checkpoint = *tier == Tier::Checkpoint;
+        let session = *tier == Tier::RawSession || checkpoint;
+        let uri = g.apply("source.uri", &tier_uri(tier, m));
         let path = m.source_file.as_deref().unwrap_or("");
-        let agent = g.opt("source.agent", agent_from_path(path).map(str::to_string));
-        let session_id = if session {
+        let agent = if checkpoint {
+            Some(CHECKPOINT_AGENT.to_string())
+        } else {
+            agent_from_path(path).map(str::to_string)
+        };
+        let agent = g.opt("source.agent", agent);
+        let session_id = if *tier == Tier::RawSession {
             m.source_file
                 .as_deref()
                 .and_then(|f| Path::new(f).file_stem())
@@ -455,7 +576,11 @@ impl Mapper<'_> {
             ended_at: span.1,
             ..Default::default()
         };
-        let stamp = if session { &m.authored_at } else { &m.filed_at };
+        let stamp = if *tier == Tier::RawSession {
+            &m.authored_at
+        } else {
+            &m.filed_at
+        };
         let authored_at = stamp.as_deref().and_then(|t| parse_time(t, self.assume));
         let pieces = size_parts(text, limits::MAX_CHUNK_BYTES, CHUNK_PIECE);
         Planned::Chunks(
@@ -485,6 +610,15 @@ impl Mapper<'_> {
     }
 }
 
+/// The name a knowledge drawer's topic is made from: a diary's topic, else its room.
+fn topic_source(id: &str, m: &DrawerMeta) -> Option<String> {
+    if is_diary(id, m) {
+        m.topic.clone()
+    } else {
+        Some(m.room.clone())
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Survey: one pass over the whole palace (ids, metadata, a hash per raw text) so exact duplicates
 // collapse and every raw chunk gets a position (`ord`) that no earlier run has used.
@@ -502,14 +636,23 @@ pub struct TierCounts {
     pub knowledge: u64,
     pub raw_session: u64,
     pub raw_file: u64,
+    /// Checkpoint diaries (fragments counted one by one), which are filed as raw session chunks.
+    pub checkpoint: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct Survey {
     pub total: u64,
     pub wing_counts: Vec<(String, u64)>,
-    /// Knowledge drawer ids, earliest filed first (ties by id).
+    /// Knowledge drawer ids, earliest filed first (ties by id). A drawer MemPalace cut into
+    /// fragments is listed once, under its first fragment's id (see `fragments`).
     pub knowledge_order: Vec<String>,
+    /// The checkpoint diaries, the same way: earliest filed first, one id per drawer.
+    pub checkpoint_order: Vec<String>,
+    /// First fragment's id -> the ids of all the fragments of that drawer in order (first
+    /// included). Only drawers of two or more fragments are here; this is the one place the
+    /// survey keeps anything per fragment, and it holds ids only.
+    pub fragments: HashMap<String, Vec<String>>,
     /// Raw drawer id -> ord inside its source.
     pub ords: HashMap<String, i64>,
     /// Raw drawer id -> keeper drawer id.
@@ -520,6 +663,17 @@ pub struct Survey {
     pub tiers: TierCounts,
     /// Raw drawer id -> source uri.
     pub raw_source_of: HashMap<String, String>,
+}
+
+/// What the survey keeps per knowledge or checkpoint drawer (or fragment of one): no text.
+struct Fragment {
+    id: String,
+    /// The fragment's place in its drawer (`None`: a drawer that was never cut).
+    index: Option<i64>,
+    /// Normalised `filed_at` ("" when absent).
+    filed: String,
+    /// A checkpoint's source uri.
+    uri: Option<String>,
 }
 
 /// What the survey keeps per raw drawer: no text.
@@ -584,7 +738,10 @@ fn survey_paged(
 ) -> crate::error::Result<Survey> {
     let mut out = Survey::default();
     let mut by_wing: BTreeMap<String, u64> = BTreeMap::new();
-    let mut knowledge: Vec<(String, String)> = Vec::new();
+    // Knowledge and checkpoint drawers by (drawer id, is a checkpoint), fragments gathered. A
+    // drawer without fragments is a group of one. Memory: one small record per such drawer
+    // (ids and times, no text).
+    let mut drawers: HashMap<(String, bool, bool), Vec<Fragment>> = HashMap::new();
     let mut sources: HashMap<String, Vec<RawRow>> = HashMap::new();
     let mut after: Option<String> = None;
     loop {
@@ -596,15 +753,31 @@ fn survey_paged(
             *by_wing.entry(d.meta.wing.clone()).or_default() += 1;
             match classify(&d.id, &d.meta) {
                 Tier::Skip(reason) => *out.skipped.entry(reason).or_default() += 1,
-                Tier::Knowledge => {
-                    out.tiers.knowledge += 1;
+                tier @ (Tier::Knowledge | Tier::Checkpoint) => {
+                    let checkpoint = tier == Tier::Checkpoint;
+                    if checkpoint {
+                        out.tiers.checkpoint += 1;
+                    } else {
+                        out.tiers.knowledge += 1;
+                    }
                     let filed = d
                         .meta
                         .filed_at
                         .as_deref()
                         .map(|t| norm_time(t, assume))
                         .unwrap_or_default();
-                    knowledge.push((filed, d.id));
+                    let member = Fragment {
+                        index: fragment_index(&d.id, &d.meta),
+                        uri: checkpoint.then(|| checkpoint_uri(&d.meta)),
+                        filed,
+                        id: d.id,
+                    };
+                    // Fragments are gathered under their drawer's id; anything else is a drawer of its own.
+                    let key = match chunk_suffix(&member.id) {
+                        Some((base, _)) => (base.to_string(), checkpoint, true),
+                        None => (member.id.clone(), checkpoint, false),
+                    };
+                    drawers.entry(key).or_default().push(member);
                 }
                 tier => {
                     if tier == Tier::RawSession {
@@ -654,8 +827,55 @@ fn survey_paged(
     counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out.wing_counts = counts;
 
-    knowledge.sort_by(|a, b| (a.0.is_empty(), &a.0, &a.1).cmp(&(b.0.is_empty(), &b.0, &b.1)));
-    out.knowledge_order = knowledge.into_iter().map(|(_, id)| id).collect();
+    let mut knowledge: Vec<(String, String)> = Vec::new();
+    let mut checkpoints: Vec<(String, String)> = Vec::new();
+    for ((_, checkpoint, _), mut members) in drawers {
+        members.sort_by(|a, b| {
+            (a.index.unwrap_or(i64::MAX), &a.id).cmp(&(b.index.unwrap_or(i64::MAX), &b.id))
+        });
+        // The drawer is filed when its earliest fragment was.
+        let filed = members
+            .iter()
+            .map(|m| m.filed.as_str())
+            .filter(|f| !f.is_empty())
+            .min()
+            .unwrap_or("")
+            .to_string();
+        let head = members[0].id.clone();
+        if checkpoint {
+            let uri = members[0].uri.clone().unwrap_or_default();
+            let stamps = members.iter().filter(|m| !m.filed.is_empty());
+            let span = out.source_spans.entry(uri.clone()).or_default();
+            for m in stamps {
+                if span.0.as_ref().is_none_or(|f| m.filed < *f) {
+                    span.0 = Some(m.filed.clone());
+                }
+                if span.1.as_ref().is_none_or(|l| m.filed > *l) {
+                    span.1 = Some(m.filed.clone());
+                }
+            }
+            // Numbered like a raw chunk without an index (after the highest used), in the order filed.
+            sources.entry(uri).or_default().push(RawRow {
+                hash: text_hash(&format!("checkpoint\0{head}")),
+                chunk_index: None,
+                filed: filed.clone(),
+                id: head.clone(),
+            });
+            checkpoints.push((filed, head.clone()));
+        } else {
+            knowledge.push((filed, head.clone()));
+        }
+        if members.len() > 1 {
+            out.fragments
+                .insert(head, members.into_iter().map(|m| m.id).collect());
+        }
+    }
+    let order = |mut v: Vec<(String, String)>| {
+        v.sort_by(|a, b| (a.0.is_empty(), &a.0, &a.1).cmp(&(b.0.is_empty(), &b.0, &b.1)));
+        v.into_iter().map(|(_, id)| id).collect::<Vec<String>>()
+    };
+    out.knowledge_order = order(knowledge);
+    out.checkpoint_order = order(checkpoints);
 
     for (uri, mut rows) in sources {
         rows.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
@@ -731,9 +951,21 @@ impl Planner<'_> {
                 keeper: keeper.clone(),
             };
         }
+        self.plan_members(std::slice::from_ref(d))
+    }
+
+    /// A drawer MemPalace cut into fragments (`Survey::fragments` lists their ids): `members`
+    /// are all of them, first fragment first. Planned as the one drawer they make up.
+    pub fn plan_group(&self, members: &[Drawer]) -> Planned {
+        self.plan_members(members)
+    }
+
+    fn plan_members(&self, members: &[Drawer]) -> Planned {
+        let d = &members[0];
+        let tier = classify(&d.id, &d.meta);
         let ord = match self.survey.ords.get(&d.id) {
             Some(o) => *o,
-            None if matches!(classify(&d.id, &d.meta), Tier::RawSession | Tier::RawFile) => {
+            None if matches!(tier, Tier::RawSession | Tier::RawFile | Tier::Checkpoint) => {
                 // Guessing a position could collide with a stored chunk (A12): do not import it.
                 return Planned::Skipped {
                     reason: "not in survey",
@@ -744,10 +976,10 @@ impl Planner<'_> {
         let span = self
             .survey
             .source_spans
-            .get(&source_uri(&d.meta))
+            .get(&tier_uri(&tier, &d.meta))
             .cloned()
             .unwrap_or((None, None));
-        self.mapper.map(d, ord, span)
+        self.mapper.map_group(members, ord, span)
     }
 }
 
@@ -1020,20 +1252,213 @@ mod tests {
         p
     }
 
+    fn map_any(id: &str, text: &str, meta: DrawerMeta, ord: i64) -> Planned {
+        let f = NoFilter;
+        let m = Mapper {
+            wings: &wings(),
+            assume: utc(),
+            filter: &f,
+        };
+        m.map(&d(id, text, meta), ord, (None, None))
+    }
+
     #[test]
-    fn a_checkpoint_diary_is_low_weight_but_keeps_its_text_and_topic() {
+    fn a_checkpoint_diary_is_a_raw_session_chunk_not_a_memory() {
         for topic in ["checkpoint", "Checkpoint ", "CHECKPOINT"] {
-            let p = map_one(
+            let mut meta = diary_meta("wing_claude_code", topic);
+            meta.filed_at = s("2026-04-16T20:00:00");
+            assert_eq!(
+                classify("diary_wing_claude_code_1_ab", &meta),
+                Tier::Checkpoint
+            );
+            let Planned::Chunks(c) = map_any(
                 "diary_wing_claude_code_1_ab",
                 "AUTO-SAVE: the session state.",
-                diary_meta("wing_claude_code", topic),
+                meta,
+                7,
+            ) else {
+                panic!("a checkpoint is raw chunks, not memories: {topic}")
+            };
+            assert_eq!(c.len(), 1, "{topic}");
+            let (src, ch) = (&c[0].source, &c[0].chunk);
+            assert_eq!(src.source_type, SourceType::Session);
+            assert_eq!(src.uri, "mempalace-checkpoint:wing_claude_code:2026-04-16");
+            assert_eq!(src.agent.as_deref(), Some("mempalace checkpoint"));
+            assert_eq!(src.session_id, None);
+            assert_eq!(ch.text, "AUTO-SAVE: the session state.");
+            assert_eq!(ch.ord, 7);
+            assert_eq!(ch.authored_at.as_deref(), Some("2026-04-16T20:00:00.000Z"));
+            assert_eq!(ch.legacy_id.as_deref(), Some("diary_wing_claude_code_1_ab"));
+            assert_eq!(
+                c[0].project.slug, "global",
+                "the diary rules, as for any diary"
             );
-            let i = &p[0].input;
-            assert_eq!(i.kind, Some(Kind::Diary), "{topic}");
-            assert_eq!(i.importance, Some(1), "{topic}");
-            assert_eq!(i.topics, vec!["checkpoint".to_string()], "{topic}");
-            assert_eq!(i.content, "AUTO-SAVE: the session state.");
         }
+    }
+
+    #[test]
+    fn a_checkpoint_follows_the_diary_project_rules_and_its_source_names_wing_and_day() {
+        let mut meta = diary_meta("wing_claude_code", "checkpoint");
+        meta.date = None;
+        meta.filed_at = s("2026-05-02T01:02:03.5");
+        let Planned::Chunks(c) = map_any("diary_x_1", "alice work, see alice", meta.clone(), 0)
+        else {
+            panic!("chunks")
+        };
+        assert_eq!(
+            c[0].source.uri,
+            "mempalace-checkpoint:wing_claude_code:2026-05-02"
+        );
+        assert_eq!(c[0].project.slug, "alice", "the text names the project");
+        // No date at all.
+        meta.filed_at = None;
+        assert_eq!(
+            checkpoint_uri(&meta),
+            "mempalace-checkpoint:wing_claude_code:undated"
+        );
+        // An over-long checkpoint is cut into pieces that keep the ord arithmetic.
+        let long = "x ".repeat(limits::MAX_CHUNK_BYTES);
+        let Planned::Chunks(c) = map_any(
+            "diary_x_2",
+            &long,
+            diary_meta("wing_claude_code", "checkpoint"),
+            3,
+        ) else {
+            panic!("chunks")
+        };
+        assert!(c.len() > 1);
+        assert_eq!(c[1].chunk.ord, 3 + PIECE_ORD_STEP);
+        assert_eq!(c[1].legacy_id, "diary_x_2#2");
+    }
+
+    #[test]
+    fn chunk_suffix_reads_fragment_ids_only() {
+        assert_eq!(
+            chunk_suffix("diary_w_1_ab_chunk_000002"),
+            Some(("diary_w_1_ab", 2))
+        );
+        assert_eq!(chunk_suffix("a_chunk_0"), Some(("a", 0)));
+        for no in [
+            "diary_w_1_ab",
+            "x_chunk_",
+            "x_chunk_12a",
+            "_chunk_000001",
+            "x_chunk_-1",
+        ] {
+            assert_eq!(chunk_suffix(no), None, "{no}");
+        }
+    }
+
+    fn fragment(base: &str, n: i64, text: &str, filed: &str, topic: &str) -> Drawer {
+        let mut meta = diary_meta("wing_claude_code", topic);
+        meta.filed_at = s(filed);
+        meta.chunk_index = Some(n);
+        d(&format!("{base}_chunk_{n:06}"), text, meta)
+    }
+
+    #[test]
+    fn fragments_join_into_one_memory_with_the_whole_body_the_earliest_time_and_all_topics() {
+        let base = "diary_wing_claude_code_20260416_ab";
+        let frags = vec![
+            fragment(base, 0, "Cleaned up the ca", "2026-04-16T11:00:00", "cache"),
+            fragment(base, 1, "che. Then shipp", "2026-04-16T10:00:00", "cache"),
+            fragment(base, 2, "ed it.", "2026-04-16T12:00:00", "shipping"),
+        ];
+        let f = NoFilter;
+        let m = Mapper {
+            wings: &wings(),
+            assume: utc(),
+            filter: &f,
+        };
+        let Planned::Memories(p) = m.map_group(&frags, 0, (None, None)) else {
+            panic!("memories")
+        };
+        assert_eq!(p.len(), 1);
+        let i = &p[0].input;
+        assert_eq!(i.content, "Cleaned up the cache. Then shipped it.");
+        assert_eq!(i.created_at.as_deref(), Some("2026-04-16T10:00:00.000Z"));
+        assert_eq!(i.topics, vec!["cache".to_string(), "shipping".to_string()]);
+        assert_eq!(i.title.as_deref(), Some("Diary 2026-04-16: cache"));
+        assert_eq!(i.kind, Some(Kind::Diary));
+        assert_eq!(p[0].legacy_id, format!("{base}_chunk_000000"));
+        assert_eq!(i.legacy_id.as_deref(), Some(p[0].legacy_id.as_str()));
+    }
+
+    #[test]
+    fn a_secret_cut_by_a_fragment_boundary_is_redacted_because_the_join_comes_first() {
+        let secret = concat!("gh", "p_", "abcdefghijklmnopqrstuvwxyz0123456789");
+        let (left, right) = secret.split_at(2);
+        let base = "diary_wing_claude_code_20260416_cd";
+        let frags = vec![
+            fragment(
+                base,
+                0,
+                &format!("the key is {left}"),
+                "2026-04-16T11:00:00",
+                "keys",
+            ),
+            fragment(
+                base,
+                1,
+                &format!("{right} and nothing else"),
+                "2026-04-16T11:00:00",
+                "keys",
+            ),
+        ];
+        let f = RedactingFilter;
+        // Each piece alone shows the filter nothing it recognises ...
+        for fr in &frags {
+            assert_eq!(f.filter("content", &fr.text).unwrap(), fr.text);
+        }
+        let m = Mapper {
+            wings: &wings(),
+            assume: utc(),
+            filter: &f,
+        };
+        let Planned::Memories(p) = m.map_group(&frags, 0, (None, None)) else {
+            panic!("memories")
+        };
+        // ... but the joined text is whole when the filter sees it.
+        assert_eq!(
+            p[0].input.content,
+            "the key is [REDACTED:github_token] and nothing else"
+        );
+        // And a held-back secret blocks the whole drawer.
+        let blocked = vec![
+            fragment(base, 0, "block", "2026-04-16T11:00:00", "keys"),
+            fragment(base, 1, "me please", "2026-04-16T11:00:00", "keys"),
+        ];
+        assert!(matches!(
+            m.map_group(&blocked, 0, (None, None)),
+            Planned::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn two_checkpoint_fragments_become_one_raw_chunk() {
+        let base = "diary_wing_claude_code_20260416_ef";
+        let frags = vec![
+            fragment(
+                base,
+                0,
+                "AUTO-SAVE: half ",
+                "2026-04-16T11:00:00",
+                "checkpoint",
+            ),
+            fragment(base, 1, "of it.", "2026-04-16T11:00:00", "checkpoint"),
+        ];
+        let f = NoFilter;
+        let m = Mapper {
+            wings: &wings(),
+            assume: utc(),
+            filter: &f,
+        };
+        let Planned::Chunks(c) = m.map_group(&frags, 4, (None, None)) else {
+            panic!("chunks")
+        };
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].chunk.text, "AUTO-SAVE: half of it.");
+        assert_eq!(c[0].legacy_id, format!("{base}_chunk_000000"));
     }
 
     #[test]
@@ -1833,5 +2258,144 @@ mod tests {
         ));
         let know = d("kz", "note", knowledge_meta("alice", "decisions"));
         assert!(matches!(planner.plan(&know), Planned::Memories(_)));
+    }
+
+    // ---- fragments and checkpoints in the survey ----
+
+    fn diary_spec(id: &str, text: &str, topic: &str, ci: Option<i64>, filed: &str) -> DrawerSpec {
+        let mut meta = diary_meta("wing_claude_code", topic);
+        meta.filed_at = s(filed);
+        meta.chunk_index = ci;
+        spec(id, text, meta)
+    }
+
+    #[test]
+    fn the_survey_gathers_fragments_under_their_first_fragment_wherever_they_sit_in_id_order() {
+        let t = "2026-04-16T11:00:00";
+        let specs = vec![
+            // Fragments listed out of order, with another drawer sorting between them.
+            diary_spec("diary_a_chunk_000002", "c", "setup", Some(2), t),
+            diary_spec("diary_a_chunk_000000", "a", "setup", Some(0), t),
+            diary_spec("diary_a_chunk_000001", "b", "setup", Some(1), t),
+            diary_spec(
+                "diary_a_chunk_000001z",
+                "other",
+                "setup",
+                None,
+                "2026-04-17T00:00:00",
+            ),
+            // chunk_index in the metadata wins over the number in the id.
+            diary_spec("diary_b_chunk_000000", "second", "setup", Some(5), t),
+            diary_spec("diary_b_chunk_000001", "first", "setup", Some(4), t),
+            // A drawer that was never cut, and one with a single fragment.
+            diary_spec("diary_c", "alone", "setup", None, t),
+            diary_spec("diary_d_chunk_000000", "solo", "setup", Some(0), t),
+            // A checkpoint in two fragments and a whole one.
+            diary_spec("diary_e_chunk_000000", "cp1", "checkpoint", Some(0), t),
+            diary_spec("diary_e_chunk_000001", "cp2", "checkpoint", Some(1), t),
+            diary_spec("diary_f", "cp3", "checkpoint", None, "2026-04-16T12:00:00"),
+        ];
+        let mut wm = wings();
+        let sv = run(&specs, None, &mut wm, &no_reserved);
+        assert_eq!(sv.total, 11);
+        assert_eq!(sv.tiers.knowledge, 8);
+        assert_eq!(sv.tiers.checkpoint, 3);
+        assert_eq!(
+            sv.knowledge_order,
+            vec![
+                "diary_a_chunk_000000",
+                "diary_b_chunk_000001",
+                "diary_c",
+                "diary_d_chunk_000000",
+                "diary_a_chunk_000001z",
+            ]
+        );
+        assert_eq!(
+            sv.fragments["diary_a_chunk_000000"],
+            vec![
+                "diary_a_chunk_000000",
+                "diary_a_chunk_000001",
+                "diary_a_chunk_000002"
+            ]
+        );
+        assert_eq!(
+            sv.fragments["diary_b_chunk_000001"],
+            vec!["diary_b_chunk_000001", "diary_b_chunk_000000"]
+        );
+        assert_eq!(
+            sv.fragments.len(),
+            3,
+            "singles are not groups: {:?}",
+            sv.fragments
+        );
+        assert_eq!(sv.checkpoint_order, vec!["diary_e_chunk_000000", "diary_f"]);
+        // The checkpoints take the next free positions of their wing-day source, in filing order.
+        assert_eq!(sv.ords["diary_e_chunk_000000"], 0);
+        assert_eq!(sv.ords["diary_f"], 1);
+        let uri = "mempalace-checkpoint:wing_claude_code:2026-04-16";
+        assert_eq!(
+            sv.source_spans[uri],
+            (
+                Some("2026-04-16T11:00:00.000Z".to_string()),
+                Some("2026-04-16T12:00:00.000Z".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn a_later_run_numbers_new_checkpoints_after_the_ones_already_stored() {
+        let t = "2026-04-16T11:00:00";
+        let specs = vec![
+            diary_spec(
+                "diary_g",
+                "later",
+                "checkpoint",
+                None,
+                "2026-04-16T13:00:00",
+            ),
+            diary_spec("diary_h", "earlier", "checkpoint", None, t),
+        ];
+        let mut wm = wings();
+        let sv = run(&specs, None, &mut wm, &|u: &str| {
+            if u == "mempalace-checkpoint:wing_claude_code:2026-04-16" {
+                Set::from([0, 1, 2])
+            } else {
+                Set::new()
+            }
+        });
+        assert_eq!(sv.ords["diary_h"], 3);
+        assert_eq!(sv.ords["diary_g"], 4);
+    }
+
+    #[test]
+    fn the_planner_plans_a_fragment_group_as_one_drawer() {
+        let t = "2026-04-16T11:00:00";
+        let specs = vec![
+            diary_spec("diary_a_chunk_000000", "Hello ", "setup", Some(0), t),
+            diary_spec("diary_a_chunk_000001", "world", "setup", Some(1), t),
+        ];
+        let (_a, _b, r) = open_fixture(&specs, |_| {});
+        let mut wm = wings();
+        let sv = survey(r.as_ref(), None, &mut wm, utc(), &no_reserved).unwrap();
+        let ids = &sv.fragments["diary_a_chunk_000000"];
+        let members = r.get(ids).unwrap();
+        let by_id: std::collections::HashMap<_, _> =
+            members.into_iter().map(|d| (d.id.clone(), d)).collect();
+        let members: Vec<Drawer> = ids.iter().map(|i| by_id[i].clone()).collect();
+        let f = NoFilter;
+        let planner = Planner {
+            mapper: Mapper {
+                wings: &wm,
+                assume: utc(),
+                filter: &f,
+            },
+            survey: &sv,
+        };
+        let Planned::Memories(p) = planner.plan_group(&members) else {
+            panic!("memories")
+        };
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].input.content, "Hello world");
+        assert_eq!(p[0].legacy_id, "diary_a_chunk_000000");
     }
 }
