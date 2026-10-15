@@ -1308,8 +1308,10 @@ async fn the_provider_test_and_secret_errors_speak_plainly() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_settings_routes_are_guarded() {
     let s = Srv::start_with(quiet()).await;
-    let routes: [(reqwest::Method, &str); 19] = [
+    let routes: [(reqwest::Method, &str); 21] = [
         (reqwest::Method::GET, "/api/v1/reviews"),
+        (reqwest::Method::GET, "/api/v1/reviews/counts"),
+        (reqwest::Method::POST, "/api/v1/reviews/dismiss"),
         (reqwest::Method::GET, "/api/v1/reviews/X"),
         (reqwest::Method::POST, "/api/v1/reviews/X/resolve"),
         (reqwest::Method::POST, "/api/v1/memories/merge"),
@@ -1618,6 +1620,93 @@ async fn the_review_inbox_lists_resolves_once_and_stats_follow() {
         evs.iter()
             .any(|e| e.action == "review.resolve" && e.target_id == review)
     );
+}
+
+/// Task 23: a flooded inbox can be paged, counted and cleared by type without touching memories.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flooded_review_inbox_pages_counts_and_dismisses_by_type() {
+    use alice_core::store::reviews::{NewReview, ReviewType, create};
+    let s = Srv::start().await;
+    let r: RememberResponse = s
+        .post_json(
+            "/api/v1/remember",
+            &serde_json::json!({"content": "a memory the dismissal must not touch"}),
+        )
+        .await;
+    let memory = r.id.unwrap();
+    let c = alice_core::store::open_writer(&s.home.db()).unwrap();
+    let add = |kind, provider: Option<&str>, key: String| {
+        create(
+            &c,
+            &NewReview {
+                kind,
+                payload: provider.map_or_else(
+                    || serde_json::json!({}),
+                    |p| serde_json::json!({"provider": p}),
+                ),
+                confidence: Some(0.92),
+                dedupe_key: Some(key),
+            },
+        )
+        .unwrap()
+        .unwrap()
+    };
+    for k in 0..7 {
+        add(ReviewType::Merge, Some("cluster"), format!("c{k}"));
+    }
+    add(ReviewType::Merge, Some("jev"), "j".into());
+    let predicate = add(ReviewType::Predicate, None, "p".into());
+
+    let counts: ReviewCounts = s.get_json("/api/v1/reviews/counts").await;
+    assert_eq!(
+        (
+            counts.total,
+            counts.by_type["merge"],
+            counts.by_type["predicate"]
+        ),
+        (9, 8, 1)
+    );
+    let page1: Vec<ReviewItem> = s.get_json("/api/v1/reviews?limit=4").await;
+    let page2: Vec<ReviewItem> = s.get_json("/api/v1/reviews?limit=4&offset=4").await;
+    let page3: Vec<ReviewItem> = s.get_json("/api/v1/reviews?limit=4&offset=8").await;
+    assert_eq!((page1.len(), page2.len(), page3.len()), (4, 4, 1));
+    assert_ne!(page1[3].id, page2[0].id);
+    let narrowed: ReviewCounts = s
+        .get_json("/api/v1/reviews/counts?review_type=merge&provider=cluster")
+        .await;
+    assert_eq!(narrowed.total, 7);
+
+    let done: DismissResponse = s
+        .post_json(
+            "/api/v1/reviews/dismiss",
+            &serde_json::json!({"review_type": "merge", "provider": "cluster"}),
+        )
+        .await;
+    assert_eq!(done.dismissed, 7);
+    let counts: ReviewCounts = s.get_json("/api/v1/reviews/counts").await;
+    assert_eq!((counts.total, counts.by_type["merge"]), (2, 1));
+    let left: Vec<ReviewItem> = s.get_json("/api/v1/reviews").await;
+    assert!(
+        left.iter().any(|i| i.id == predicate),
+        "predicate item untouched"
+    );
+    let got: GetResponse = s
+        .post_json("/api/v1/get", &serde_json::json!({"ids": [memory]}))
+        .await;
+    assert_eq!(
+        got.memories[0].memory.body,
+        "a memory the dismissal must not touch"
+    );
+    let evs: Vec<EventRow> = s.get_json("/api/v1/events?limit=50").await;
+    assert!(evs.iter().any(|e| e.action == "review.dismiss_all"));
+    // Types whose every answer changes something are refused.
+    let refused = s
+        .post(
+            "/api/v1/reviews/dismiss",
+            &serde_json::json!({"review_type": "contradiction"}),
+        )
+        .await;
+    assert_eq!(refused.status(), 400);
 }
 
 #[tokio::test(flavor = "multi_thread")]

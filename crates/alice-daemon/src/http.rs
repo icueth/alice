@@ -475,6 +475,31 @@ async fn list_reviews(
     })?;
     Ok(Json(st.svc.reviews(q).await?))
 }
+/// The query of `GET /api/v1/reviews/counts`.
+#[derive(serde::Deserialize)]
+struct ReviewCountsQuery {
+    review_type: Option<alice_core::store::reviews::ReviewType>,
+    provider: Option<String>,
+}
+
+async fn review_counts(
+    State(st): State<AppState>,
+    query: Result<Query<ReviewCountsQuery>, QueryRejection>,
+) -> ApiResult<alice_core::store::reviews::ReviewCounts> {
+    let Query(q) = query.map_err(|r| {
+        ApiError(AliceError::Invalid(format!(
+            "{}; use /api/v1/reviews/counts?review_type=<type>&provider=<provider>",
+            r.body_text()
+        )))
+    })?;
+    Ok(Json(st.svc.review_counts(q.review_type, q.provider).await?))
+}
+async fn dismiss_reviews(
+    State(st): State<AppState>,
+    ApiJson(req): ApiJson<DismissRequest>,
+) -> ApiResult<DismissResponse> {
+    Ok(Json(st.svc.dismiss_reviews(req).await?))
+}
 async fn get_review(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -807,6 +832,8 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/events", get(events))
         .route("/api/v1/undo", post(undo))
         .route("/api/v1/reviews", get(list_reviews))
+        .route("/api/v1/reviews/counts", get(review_counts))
+        .route("/api/v1/reviews/dismiss", post(dismiss_reviews))
         .route("/api/v1/reviews/{id}", get(get_review))
         .route("/api/v1/reviews/{id}/resolve", post(resolve_review))
         .route("/api/v1/memories/merge", post(merge))

@@ -218,6 +218,7 @@ pub fn pack_json(out: SearchOutput, project: Option<String>, max_tokens: usize) 
         related: out.related,
         raw_fallback: out.raw_fallback,
         reranked: false,
+        low_confidence: false,
         text: None,
         notes: Vec::new(),
     }
@@ -241,6 +242,7 @@ mod tests {
             body: Some(body.into()),
             created_at: "2026-10-13T00:00:00.000Z".into(),
             score: 1.0,
+            relevance: None,
             matched: vec![MatchVia::Words],
             status: None,
             source: None,

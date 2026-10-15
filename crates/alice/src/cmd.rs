@@ -191,6 +191,27 @@ pub enum ReviewCmd {
         /// Resolved items too.
         #[arg(long)]
         all: bool,
+        /// Items per page.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Page to show, counting from 1 (newest items first).
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+    },
+    /// Close every open item of a type without changing any memory (`--all` is required).
+    Dismiss {
+        /// The type to close: merge, supersede, predicate, project or undo.
+        #[arg(long = "type")]
+        review_type: String,
+        /// Only items from this provider (`cluster` is the weekly merge job).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Confirm that every matching open item is meant.
+        #[arg(long)]
+        all: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
     },
     /// One item in full.
     Show { id: String },
@@ -1115,41 +1136,150 @@ fn review_full(i: &ReviewItem) -> String {
     s
 }
 
+/// The footer of a review list: the open total by type and which items this page showed.
+fn review_footer(counts: &ReviewCounts, page: usize, limit: usize, shown: usize) -> String {
+    let by_type = counts
+        .by_type
+        .iter()
+        .map(|(t, n)| format!("{t} {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let from = (page - 1) * limit + 1;
+    let mut s = format!("{} open: {by_type}.", counts.total);
+    if shown > 0 {
+        let to = from + shown - 1;
+        s.push_str(&format!(" Showing {from}-{to}."));
+        if (to as u64) < counts.total {
+            s.push_str(&format!(
+                " Next page: alice review list --page {}",
+                page + 1
+            ));
+        }
+    }
+    s.push('\n');
+    s
+}
+
 async fn review(home: &AliceHome, c: Option<ReviewCmd>, json: bool) -> Result<()> {
     match c.unwrap_or(ReviewCmd::List {
         review_type: None,
         all: false,
+        limit: 50,
+        page: 1,
     }) {
-        ReviewCmd::List { review_type, all } => {
+        ReviewCmd::List {
+            review_type,
+            all,
+            limit,
+            page,
+        } => {
             let review_type = review_type_arg(&review_type)?;
+            let (limit, page) = (limit.clamp(1, 500), page.max(1));
             let client = client(home).await?;
+            let counts = client.review_counts(review_type, None).await?;
             let mut items = client
                 .reviews(&ReviewQuery {
                     review_type,
+                    limit: Some(limit),
+                    offset: Some((page - 1) * limit),
                     ..Default::default()
                 })
                 .await?;
+            let shown = items.len();
             if all {
                 items.extend(
                     client
                         .reviews(&ReviewQuery {
                             status: Some(alice_core::store::reviews::ReviewStatus::Resolved),
                             review_type,
+                            limit: Some(limit),
+                            offset: Some((page - 1) * limit),
                             ..Default::default()
                         })
                         .await?,
                 );
             }
-            print(json, &items, || {
-                if items.is_empty() {
+            let value = serde_json::json!({
+                "total": counts.total,
+                "by_type": counts.by_type,
+                "page": page,
+                "limit": limit,
+                "items": items,
+            });
+            print(json, &value, || {
+                if items.is_empty() && counts.total == 0 {
                     "Nothing waits for a decision.\n".to_string()
                 } else {
-                    items
+                    let mut text = items
                         .iter()
                         .map(review_block)
                         .collect::<Vec<_>>()
-                        .join("\n")
+                        .join("\n");
+                    if shown == 0 {
+                        text.push_str(&format!("Nothing on page {page}. "));
+                    } else {
+                        text.push('\n');
+                    }
+                    text.push_str(&review_footer(&counts, page, limit, shown));
+                    text
                 }
+            })
+        }
+        ReviewCmd::Dismiss {
+            review_type,
+            provider,
+            all,
+            yes,
+        } => {
+            use std::io::{BufRead, IsTerminal};
+            let review_type = review_type_arg(&Some(review_type))?
+                .ok_or_else(|| anyhow::anyhow!("pass the type to close with --type"))?;
+            anyhow::ensure!(
+                all,
+                "this closes every open {} item; pass --all to confirm which items are meant (see them with `alice review list --type {0}`)",
+                review_type.as_str()
+            );
+            let provider = provider.filter(|p| !p.trim().is_empty());
+            let client = client(home).await?;
+            let waiting = client
+                .review_counts(Some(review_type), provider.as_deref())
+                .await?
+                .total;
+            if waiting == 0 {
+                return print(json, &serde_json::json!({ "dismissed": 0 }), || {
+                    format!("No open {} items.\n", review_type.as_str())
+                });
+            }
+            if !yes {
+                anyhow::ensure!(
+                    std::io::stdin().is_terminal(),
+                    "dismissing {waiting} items closes their questions; pass --yes to confirm"
+                );
+                eprint!(
+                    "Dismiss {waiting} open {} items? No memory changes; only the questions are closed. [y/N] ",
+                    review_type.as_str()
+                );
+                std::io::stderr().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().lock().read_line(&mut answer)?;
+                anyhow::ensure!(
+                    matches!(answer.trim(), "y" | "Y" | "yes"),
+                    "dismiss cancelled"
+                );
+            }
+            let r = client
+                .dismiss_reviews(&DismissRequest {
+                    review_type,
+                    provider,
+                    author: author("cli"),
+                })
+                .await?;
+            print(json, &r, || {
+                format!(
+                    "Dismissed {} {} items.\n",
+                    r.dismissed,
+                    review_type.as_str()
+                )
             })
         }
         ReviewCmd::Show { id } => {

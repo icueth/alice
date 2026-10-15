@@ -1706,6 +1706,99 @@ fn review_inbox_and_stats_through_the_cli() {
     assert!(e.ok(&["get", &id]).contains("third text"));
 }
 
+/// Task 23: a flooded inbox through the CLI: the total by type, pages, and a bulk dismissal that
+/// asks first, closes only what matches and leaves the memories alone.
+#[test]
+fn a_flooded_review_inbox_pages_and_is_dismissed_in_bulk() {
+    use alice_core::store::reviews::{NewReview, ReviewType, create};
+    let e = Env::new();
+    {
+        // Written before the first command starts the daemon.
+        let c = alice_core::store::open_writer(&e.home.join("alice.db")).unwrap();
+        for (kind, provider, n) in [
+            (ReviewType::Merge, "cluster", 7),
+            (ReviewType::Merge, "jev", 1),
+            (ReviewType::Predicate, "judge", 2),
+        ] {
+            for k in 0..n {
+                create(
+                    &c,
+                    &NewReview {
+                        kind,
+                        payload: serde_json::json!({"provider": provider}),
+                        confidence: Some(0.92),
+                        dedupe_key: Some(format!("{provider}{k}")),
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+    let kept = e.json(&["remember", "a memory the bulk dismissal leaves alone"]);
+    let kept = kept["id"].as_str().unwrap().to_string();
+
+    let page1 = e.json(&["review", "list", "--limit", "4"]);
+    assert_eq!(page1["total"], 10, "{page1}");
+    assert_eq!(page1["by_type"]["merge"], 8, "{page1}");
+    assert_eq!(page1["by_type"]["predicate"], 2, "{page1}");
+    assert_eq!(page1["items"].as_array().unwrap().len(), 4);
+    let page3 = e.json(&["review", "list", "--limit", "4", "--page", "3"]);
+    assert_eq!(page3["items"].as_array().unwrap().len(), 2, "{page3}");
+    assert_ne!(page1["items"][0]["id"], page3["items"][0]["id"]);
+    let text = e.ok(&["review", "list", "--limit", "4"]);
+    assert!(
+        text.contains("10 open: merge 8, predicate 2")
+            && text.contains("Showing 1-4")
+            && text.contains("--page 2"),
+        "{text}"
+    );
+    let last = e.ok(&["review", "list", "--limit", "4", "--page", "3"]);
+    assert!(
+        last.contains("Showing 9-10") && !last.contains("--page 4"),
+        "{last}"
+    );
+
+    // Nothing is dismissed without --all, nor (away from a terminal) without --yes.
+    let no_all = e.run(&["review", "dismiss", "--type", "merge"]);
+    assert!(!no_all.status.success());
+    assert!(stderr(&no_all).contains("--all"), "{}", stderr(&no_all));
+    let no_yes = e.run(&["review", "dismiss", "--type", "merge", "--all"]);
+    assert!(!no_yes.status.success());
+    assert!(stderr(&no_yes).contains("--yes"), "{}", stderr(&no_yes));
+    assert_eq!(e.json(&["review", "list"])["total"], 10);
+
+    let out = e.ok(&[
+        "review",
+        "dismiss",
+        "--type",
+        "merge",
+        "--provider",
+        "cluster",
+        "--all",
+        "--yes",
+    ]);
+    assert_eq!(out, "Dismissed 7 merge items.\n");
+    let after = e.json(&["review", "list"]);
+    assert_eq!(
+        (after["total"].clone(), after["by_type"]["merge"].clone()),
+        (3.into(), 1.into()),
+        "{after}"
+    );
+    let json = e.json(&["review", "dismiss", "--type", "merge", "--all", "--yes"]);
+    assert_eq!(json["dismissed"], 1, "{json}");
+    assert_eq!(e.json(&["review", "list"])["by_type"]["predicate"], 2);
+    assert!(
+        e.ok(&["get", &kept])
+            .contains("a memory the bulk dismissal leaves alone")
+    );
+    let bad = e.run(&["review", "dismiss", "--type", "nonsense", "--all", "--yes"]);
+    assert!(
+        stderr(&bad).contains("unknown review type"),
+        "{}",
+        stderr(&bad)
+    );
+}
+
 /// Task 14: `alice backup now|list` and `alice maintenance status|run <job>` through real
 /// processes.
 #[test]

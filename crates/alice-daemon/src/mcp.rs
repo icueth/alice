@@ -500,7 +500,7 @@ impl AliceMcp {
 #[tool_router]
 impl AliceMcp {
     #[tool(
-        description = "Search long-term memory: decisions, bug fixes, facts, how-tos, preferences and past work. Use before answering about anything done before. By default a configured model judge (judge.provider = jev) grades the top results, so recall is precise (slower, about half a second); pass mode \"fast\" to skip the judge, or mode \"precise\" to force it.",
+        description = "Search long-term memory: decisions, bug fixes, facts, how-tos, preferences and past work. Use before answering about anything done before. By default a configured model judge (judge.provider = jev) grades the top results, so recall is precise (slower, about half a second); pass mode \"fast\" to skip the judge, or mode \"precise\" to force it. In json format each result has `score` (the search's fusion score, which does not follow the judge's order) and, when the judge graded it, `relevance`; `low_confidence` is true when the judge found nothing that clearly answers (a note says so in either format).",
         annotations(read_only_hint = true)
     )]
     async fn recall(

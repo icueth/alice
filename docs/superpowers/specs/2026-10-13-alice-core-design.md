@@ -277,6 +277,7 @@ Migrations are forward-only, numbered, and run at daemon start inside a transact
 - Default text format: one block per result with id, kind, project, date, title, a 1–2 line snippet, and `matched: vector|words|code|exact`. Full bodies for the top results while the token budget allows.
 - `max_tokens` (default 1,500) caps the response; the server packs results to fit and reports how many were omitted.
 - `format: "json"` returns structured results.
+- *As built (M2 Task 23):* in precise mode a result's JSON `score` is the search's fusion score and does not follow the displayed order, which is the judge's. A result the judge graded also carries `relevance`, its P(relevant) (P(answers) + ½ P(partially)); it is absent for ungraded results and in fast mode. When the judge graded the results and none of them reached P(answers) ≥ 0.5 (the rescue threshold), the response carries `low_confidence: true` and the note "nothing found clearly answers this; the closest matches follow" (in `notes`, and appended to the text format); `low_confidence` is always false in fast mode, and when the judge could not grade.
 - Each returned memory's `access_count` is incremented asynchronously.
 
 ### 4.6 Performance budgets
@@ -369,6 +370,8 @@ Review items have a type (`supersede`, `contradiction`, `merge`, `predicate`, `p
 | `undo` | `apply` (undo anyway), `dismiss` |
 | `sync_conflict` (M4) | `keep_local`, `keep_remote` |
 
+*As built (M2 Task 23):* `alice review list` pages (`--page N`, `--limit N`, default 50 per page) and ends with the open total by type; `--json` returns `{total, by_type, page, limit, items}`. `GET /api/v1/reviews` takes `offset` besides `limit`, and `GET /api/v1/reviews/counts?review_type=&provider=` answers `{total, by_type}`. `alice review dismiss --type t [--provider p] --all [--yes]` (`POST /api/v1/reviews/dismiss`, not an MCP tool) closes every open item of that type with its answer that changes nothing (`reject` for `merge` and `supersede`, so a dismissed merge is never suggested again; `keep` for `predicate` and `project`; `dismiss` for `undo`), asks for confirmation unless `--yes`, and reports the count; `contradiction` and `sync_conflict` items are resolved one by one. One history row records it.
+
 At most one open item exists per question (`dedupe_key`), so a judge or a weekly job asking again finds the open one; resolving a resolved item is an error that says so.
 
 ### 5.5 History and undo
@@ -393,7 +396,7 @@ Runs in a low-priority worker when the daemon has been idle for `maintenance.idl
 | `index_check`: vector index count check and rebuild if needed | Daily |
 | `fts_optimize`: bounded FTS `merge` steps (500 pages per writer slice) over the four FTS tables | Weekly |
 | `raw_retention`: raw tier (`forever` default; or by age, e.g. `90d`, counted from when Alice stored a chunk; or by size, e.g. `10GB`, counted in chunk text bytes) | Daily |
-| `merge_suggestions`: similar-memory clusters (cosine ≥ `judge.cluster_similarity`, 0.92) → `merge` review items | Weekly |
+| `merge_suggestions`: similar-memory clusters (cosine ≥ `judge.cluster_similarity`, 0.92) → `merge` review items; *as built (M2 Task 23)* it adds none while 50 `merge` items are open (it reports "skipped: 50 merge reviews already open" and resumes where it stopped), and never more than fit under 50 in one run | Weekly |
 | `trash_purge`: trashed memories older than `maintenance.trash_days` (30) | Daily |
 | `events_prune`: events older than `maintenance.events_days` (365), whole groups, and old judge-cache entries | Daily |
 | `model_purge`: vectors and index files of an embedding model that is no longer in force | Daily |
@@ -542,7 +545,7 @@ Names are verbs without the brand, so a rename never breaks prompts.
 |---|---|---|
 | `recall` | `query`, `project?`, `topics?`, `kinds?`, `since?`, `before?`, `include_raw?`, `mode? (fast\|precise)`, `max_tokens?`, `format? (text\|json)` | Ranked results, `related`, omitted count |
 | `remember` | `content`, `kind?`, `title?`, `project?`, `topics?`, `importance?`, `supersedes?`, `idempotency_key?` | `{id, status: new\|duplicate\|pending}` |
-| `context` | `project?`, `max_tokens?` (default 1,200) | Briefing: high-importance and pinned memories, recent decisions, active warnings, latest handoff, user preferences, pending review count |
+| `context` | `project?`, `max_tokens?` (default 1,200) | Briefing: high-importance and pinned memories, recent decisions, active warnings, latest handoff, user preferences, *as built (M2 Task 23)* the five newest diary entries that are not auto-save checkpoints ("Recent diary", after the other sections and the first to be cut by the token budget), and the pending review count (with more than 10 open items the line only says how many wait in `alice review`; with 1–10 it also suggests asking the user) |
 | `get_memory` | `ids[]`, `include_provenance?` | Full memories with links and provenance |
 | `update_memory` | `id`, `action (edit\|supersede\|archive\|forget\|restore)`, fields | Updated memory and event id |
 | `query_facts` | `entity`, `predicate?`, `as_of?`, `timeline?` | Relations valid at the time, or a timeline |
@@ -588,7 +591,7 @@ alice get <id>... [--provenance]       alice update <id> --action edit|supersede
 alice facts <entity> [--predicate p] [--as-of date] [--timeline]
 alice fact add|supersede|end <subject> <predicate> <object> [--from date]
 alice history [target] [--actor a] [--limit n]       alice undo <event-id>
-alice review [list [--type t] [--all] | show <id> | resolve <id> <choice>]
+alice review [list [--type t] [--all] [--page n] [--limit n] | show <id> | resolve <id> <choice> | dismiss --type t [--provider p] --all [--yes]]
 alice stats                 alice projects              alice status
 alice backup now|list       alice restore [backup] [--yes]
 alice maintenance status | run <job>

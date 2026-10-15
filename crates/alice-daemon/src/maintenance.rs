@@ -281,6 +281,9 @@ type QuickCheckHook = Arc<dyn Fn(&rusqlite::Connection) + Send + Sync>;
 const SLICE: usize = 500;
 /// Memories looked at per slice of the merge-suggestion job.
 const MERGE_PAGE: i64 = 200;
+/// The job adds no `merge` item while this many are open, and never more than fit under it, so
+/// one run cannot flood the inbox.
+const MERGE_OPEN_MAX: u64 = 50;
 
 enum Step {
     More,
@@ -897,6 +900,16 @@ impl Scheduler {
             return Ok(Step::Skipped("index not ready".into()));
         };
         let model = active.model.clone();
+        let open = self
+            .ctx
+            .readers
+            .with(|c| reviews::count_open_of(c, reviews::ReviewType::Merge))?;
+        if open >= MERGE_OPEN_MAX {
+            return Ok(Step::Skipped(format!(
+                "skipped: {MERGE_OPEN_MAX} merge reviews already open"
+            )));
+        }
+        let room = (MERGE_OPEN_MAX - open) as usize;
         let cursor: i64 = self
             .meta("maint.merge.cursor")
             .and_then(|v| v.parse().ok())
@@ -917,7 +930,12 @@ impl Scheduler {
             return Ok(Step::Finished("merge suggestions done".into()));
         }
         let mut made = 0;
+        let mut last = cursor;
         for (seq, id, project) in &rows {
+            if made >= room {
+                break;
+            }
+            last = *seq;
             let Some((_, v)) = self
                 .ctx
                 .readers
@@ -989,7 +1007,6 @@ impl Scheduler {
                 made += n;
             }
         }
-        let last = rows.last().map(|r| r.0).unwrap_or(cursor);
         self.set_meta("maint.merge.cursor", &last.to_string());
         tracing::debug!(suggested = made, up_to_seq = last, "merge suggestions");
         Ok(Step::More)
@@ -1793,6 +1810,84 @@ mod tests {
             r.count("SELECT count(*) FROM review_items WHERE type = 'merge'"),
             1,
             "rejected: never suggested again"
+        );
+    }
+
+    /// `n` clusters of two near-identical vectors, 2 degrees apart from each other (so a high
+    /// `judge.cluster_similarity` pairs only the twins).
+    fn twin_clusters(n: usize) -> Vec<(&'static str, [f32; 3])> {
+        (0..n)
+            .flat_map(|k| {
+                let a = (k as f32 * 2.0).to_radians();
+                let b = a + 0.2_f32.to_radians();
+                [
+                    ("twin", [a.cos(), a.sin(), 0.0]),
+                    ("twin", [b.cos(), b.sin(), 0.0]),
+                ]
+            })
+            .collect()
+    }
+
+    const TWINS: &str = "[judge]\ncluster_similarity = 0.9999\n";
+    const OPEN_MERGES: &str =
+        "SELECT count(*) FROM review_items WHERE type = 'merge' AND status = 'open'";
+
+    #[test]
+    fn merge_suggestions_wait_while_fifty_merge_items_are_open() {
+        let r = rig_with(TWINS);
+        r.insert_memories_with_vectors(&twin_clusters(3));
+        let c = r.sql();
+        for k in 0..50 {
+            alice_core::store::reviews::create(
+                &c,
+                &reviews::NewReview {
+                    kind: reviews::ReviewType::Merge,
+                    payload: serde_json::json!({}),
+                    confidence: Some(0.92),
+                    dedupe_key: Some(format!("open{k}")),
+                },
+            )
+            .unwrap();
+        }
+        let report = r
+            .sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert_eq!(report.outcome, JobOutcome::Skipped, "{report:?}");
+        assert!(
+            report
+                .detail
+                .contains("skipped: 50 merge reviews already open"),
+            "{report:?}"
+        );
+        assert_eq!(r.count(OPEN_MERGES), 50, "none created");
+        // Room again: it resumes where it stopped and makes the suggestions.
+        c.execute(
+            "UPDATE review_items SET status = 'resolved', resolution = 'reject', resolved_at = 'x', resolved_by = 'user' WHERE dedupe_key = 'open0'",
+            [],
+        )
+        .unwrap();
+        let again = r
+            .sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert_eq!(again.outcome, JobOutcome::Skipped, "{again:?}");
+        assert_eq!(
+            r.count(OPEN_MERGES),
+            50,
+            "one slot: one suggestion, then full"
+        );
+    }
+
+    #[test]
+    fn merge_suggestions_create_at_most_fifty_in_one_run() {
+        let r = rig_with(TWINS);
+        r.insert_memories_with_vectors(&twin_clusters(60));
+        let report = r
+            .sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert_eq!(r.count(OPEN_MERGES), 50, "{report:?}");
+        assert!(
+            report.detail.contains("50 merge reviews already open"),
+            "{report:?}"
         );
     }
 
