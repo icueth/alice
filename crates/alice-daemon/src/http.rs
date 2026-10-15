@@ -1,7 +1,7 @@
 //! JSON API over loopback HTTP. The guard (token + Host + Origin) is the code verified in the spike.
 
 use crate::secrets::SecretName;
-use crate::service::Service;
+use crate::service::{Scoped, Service};
 use alice_core::api::*;
 use alice_core::error::AliceError;
 use alice_core::settings::SettingError;
@@ -69,11 +69,62 @@ fn bearer(h: &HeaderMap) -> Option<&str> {
 struct ErrorBody {
     error: String,
     kind: &'static str,
+    /// Present when a write was refused for secret-shaped content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refused: Option<RefusedBody>,
+    /// The project's rules were fail-closed when the refusal was made: the same write may be
+    /// accepted later, so a replayed spool entry is kept, not withheld.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    retry_later: bool,
+}
+
+/// The field and the detectors of a refused write.
+#[derive(Debug, Serialize)]
+struct RefusedBody {
+    field: String,
+    detectors: Vec<String>,
 }
 
 fn refuse(status: StatusCode, kind: &'static str, error: String) -> Response {
-    (status, Json(ErrorBody { error, kind })).into_response()
+    (
+        status,
+        Json(ErrorBody {
+            error,
+            kind,
+            refused: None,
+            retry_later: false,
+        }),
+    )
+        .into_response()
 }
+
+/// The answer to a refused write: `invalid`, with the field and detectors, and whether a retry
+/// may succeed later.
+fn refusal_response(e: AliceError, retry_later: bool) -> Response {
+    let refused = match &e {
+        AliceError::Refused { field, detectors } => Some(RefusedBody {
+            field: field.clone(),
+            detectors: detectors.clone(),
+        }),
+        _ => None,
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorBody {
+            error: e.to_string(),
+            kind: "invalid",
+            refused,
+            retry_later,
+        }),
+    )
+        .into_response()
+}
+
+/// A capability of this daemon the client may rely on: it accepts `client_project` and the
+/// project's `.alice.toml` text.
+pub const CAP_CLIENT_PROJECT: &str = "client-project";
+/// The daemon serves one person on a shared server (`--tenant`).
+pub const CAP_TENANT: &str = "tenant";
 
 /// The refusal for a request whose Host or Origin is not this daemon's, if it is refused.
 fn host_or_origin_refusal(g: &Guard, req: &Request) -> Option<Response> {
@@ -169,6 +220,9 @@ impl IntoResponse for ApiError {
             AliceError::ReadOnly(_) => (StatusCode::SERVICE_UNAVAILABLE, "read_only"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
+        if matches!(self.0, AliceError::Refused { .. }) {
+            return refusal_response(self.0, false);
+        }
         refuse(status, kind, self.0.to_string())
     }
 }
@@ -212,6 +266,10 @@ pub struct PingResponse {
     /// `discovery::ping_proof(token, nonce, instance)` when the ping carried `?nonce=`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<String>,
+    /// What this daemon supports beyond the base API (`CAP_CLIENT_PROJECT`, `CAP_TENANT`); an
+    /// older daemon sends none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -247,11 +305,16 @@ async fn ping(
             )));
         }
     };
+    let mut capabilities = vec![CAP_CLIENT_PROJECT.to_string()];
+    if st.svc.is_tenant() {
+        capabilities.push(CAP_TENANT.to_string());
+    }
     Ok(Json(PingResponse {
         service: "alice".into(),
         instance: st.svc.instance().to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
         proof,
+        capabilities,
     }))
 }
 async fn health(State(st): State<AppState>) -> ApiResult<Health> {
@@ -273,7 +336,15 @@ async fn remember(
     State(st): State<AppState>,
     ApiJson(req): ApiJson<RememberRequest>,
 ) -> Result<Response, ApiError> {
-    let r = st.svc.remember_or_spool(req).await?;
+    let scope_req = req.clone();
+    let r = match st.svc.remember_or_spool(req).await {
+        Ok(r) => r,
+        Err(e) if alice_core::redact::is_refusal(&e) => {
+            let later = st.svc.rules_fail_closed(scope_req.scope()).await;
+            return Ok(refusal_response(e, later));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let status = match r.status {
         RememberStatus::Spooled => StatusCode::ACCEPTED,
         _ => StatusCode::OK,
@@ -319,8 +390,16 @@ async fn assert_fact(
 async fn ingest(
     State(st): State<AppState>,
     ApiJson(req): ApiJson<IngestRequest>,
-) -> ApiResult<alice_core::store::sources::IngestOutcome> {
-    Ok(Json(st.svc.ingest(req).await?))
+) -> Result<Response, ApiError> {
+    let scope_req = req.clone();
+    match st.svc.ingest(req).await {
+        Ok(o) => Ok(Json(o).into_response()),
+        Err(e) if alice_core::redact::is_refusal(&e) => {
+            let later = st.svc.rules_fail_closed(scope_req.scope()).await;
+            Ok(refusal_response(e, later))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 async fn admin_shutdown(State(st): State<AppState>) -> StatusCode {
     st.shutdown.cancel();
@@ -755,6 +834,52 @@ mod tests {
     use crate::paths::AliceHome;
     use crate::service::ServiceOptions;
     use alice_core::embed::{Embedder, FakeEmbedder};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ping_lists_capabilities_and_a_tenant_says_so() {
+        crate::install_tls();
+        for tenant in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let svc = Service::start(
+                AliceHome::new(d.path().to_path_buf()),
+                &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+                ServiceOptions {
+                    tenant,
+                    ..ServiceOptions::default()
+                },
+            )
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = router(svc, "t".repeat(64), port, CancellationToken::new());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let p: PingResponse = reqwest::get(format!("http://127.0.0.1:{port}/api/v1/ping"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(p.capabilities.contains(&CAP_CLIENT_PROJECT.to_string()));
+            assert_eq!(p.capabilities.contains(&CAP_TENANT.to_string()), tenant);
+        }
+    }
+
+    #[test]
+    fn a_refusal_carries_its_field_and_detectors() {
+        let r = ApiError(AliceError::Refused {
+            field: "content".into(),
+            detectors: vec!["github_token".into()],
+        })
+        .into_response();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let body =
+            futures::executor::block_on(axum::body::to_bytes(r.into_body(), 1 << 20)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["kind"], "invalid");
+        assert_eq!(v["refused"]["field"], "content");
+        assert_eq!(v["refused"]["detectors"][0], "github_token");
+        assert!(v.get("retry_later").is_none());
+    }
 
     /// A client that falls more than the stream's capacity behind is told how many items it
     /// missed (it can list `/api/v1/events` again), instead of a silent gap.

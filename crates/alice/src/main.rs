@@ -103,7 +103,7 @@ fn main() -> std::process::ExitCode {
     alice_daemon::install_tls();
     let is_server = matches!(
         cli.command,
-        Command::Daemon(cmd::DaemonCmd::Run) | Command::Mcp
+        Command::Daemon(cmd::DaemonCmd::Run { .. }) | Command::Mcp
     );
     // Logs go to stderr: on stdio MCP, stdout is the protocol channel. The daemon's stderr is
     // its log file, so colours only when a person watches.

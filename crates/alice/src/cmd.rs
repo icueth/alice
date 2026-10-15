@@ -253,7 +253,13 @@ pub enum ServiceCmd {
 #[derive(Subcommand)]
 pub enum DaemonCmd {
     /// Run in the foreground.
-    Run,
+    Run {
+        #[arg(
+            long,
+            help = "Serve one person on a shared server (alice-server's units use it)"
+        )]
+        tenant: bool,
+    },
     /// Start in the background if not running.
     Start,
     /// Stop the running daemon.
@@ -702,12 +708,13 @@ async fn client(home: &AliceHome) -> Result<DaemonClient> {
 pub fn dispatch(command: Command, json: bool) -> Result<()> {
     let home = AliceHome::from_env();
     match command {
-        Command::Daemon(DaemonCmd::Run) => run(
+        Command::Daemon(DaemonCmd::Run { tenant }) => run(
             home,
             DaemonOptions {
                 port: 0,
                 fake_embedder: std::env::var("ALICE_EMBEDDER").is_ok_and(|v| v == "fake"),
                 settings_env: None,
+                tenant,
             },
         ),
         Command::Mcp => rt()?.block_on(alice_daemon::mcp::run_stdio(home, launcher())),
@@ -1006,7 +1013,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         Command::Config(c) => config(&home, c, json).await,
         Command::Import(ImportCmd::Mempalace(a)) => import_mempalace(&home, a, json).await,
         Command::Import(ImportCmd::Status) => import_status(&home, json).await,
-        Command::Daemon(DaemonCmd::Run)
+        Command::Daemon(DaemonCmd::Run { .. })
         | Command::Mcp
         | Command::Model(_)
         | Command::Bench(_)

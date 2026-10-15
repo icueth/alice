@@ -39,6 +39,8 @@ pub struct DaemonOptions {
     /// The `ALICE_*` variables the settings see; `None`: the process's. Tests pass an empty
     /// list so a developer's shell cannot change them.
     pub settings_env: Option<Vec<(String, String)>>,
+    /// Server mode (`alice daemon run --tenant`): one person on a shared server.
+    pub tenant: bool,
 }
 
 /// The single-instance lock, or `None` when another daemon holds it.
@@ -215,10 +217,14 @@ fn start_and_serve(
         &startup::StartProgress::step("opening the database and loading the embedding model"),
     );
     // The settings come first: the model's idle unload and the port are read from them.
-    let settings = match &opts.settings_env {
-        Some(env) => SettingsHandle::load_with_env(home, env.clone()),
-        None => SettingsHandle::load(home),
-    };
+    tracing::info!(tenant = opts.tenant, "starting");
+    let settings = SettingsHandle::load_with(
+        home,
+        opts.settings_env
+            .clone()
+            .unwrap_or_else(crate::config::process_env),
+        opts.tenant,
+    );
     let started = settings.get();
     // The local model is downloaded when it is the one asked for (a remote provider needs none).
     if !opts.fake_embedder
@@ -262,6 +268,7 @@ fn start_and_serve(
         ServiceOptions {
             settings: Some(settings),
             embedder_factory: factory,
+            tenant: opts.tenant,
             // The daemon reads the real environment (the secrets' status shows a variable).
             ..ServiceOptions::process_env()
         },

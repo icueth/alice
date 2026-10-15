@@ -3009,6 +3009,13 @@ impl Service {
         if self.stop.load(Ordering::SeqCst) {
             return Err(stopping());
         }
+        // Task 15 lets a tenant import an uploaded bundle; until `ImportRequest` carries one,
+        // every import is refused here.
+        if self.opts.tenant {
+            return Err(AliceError::invalid(
+                "a server tenant imports only a bundle uploaded by `alice import mempalace` from your own machine; it cannot read a palace on the server",
+            ));
+        }
         let running = |slot: &ImportSlot| {
             let st = slot.status.lock();
             (st.state == ImportState::Running).then(|| {
@@ -3106,6 +3113,11 @@ impl Service {
 
     /// Copy the database into the backup directory now (`alice backup now`).
     pub async fn backup_now(&self) -> Result<BackupInfo> {
+        if self.opts.tenant {
+            return Err(AliceError::invalid(
+                "on a server tenant backups are scheduled (the last 2 are kept); ask the server's admin for an extra copy",
+            ));
+        }
         let _busy = self.activity.enter();
         let (db, dir) = (
             self.home.db(),
@@ -8650,6 +8662,26 @@ mod tests {
             remote: None,
             rules,
         })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_refuses_manual_backups_and_server_palace_imports() {
+        let (_d, s) = tenant_svc().await;
+        let e = s.backup_now().await.unwrap_err().to_string();
+        assert!(e.contains("backups are scheduled"), "{e}");
+        let e = s
+            .start_import(alice_core::import::ImportRequest {
+                palace: Some("/srv/x".into()),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("server tenant"), "{e}");
+        let e = s
+            .start_import(alice_core::import::ImportRequest::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("server tenant"), "{e}");
     }
 
     async fn tenant_svc() -> (tempfile::TempDir, Arc<Service>) {
