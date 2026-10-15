@@ -284,6 +284,23 @@ const MERGE_PAGE: i64 = 200;
 /// The job adds no `merge` item while this many are open, and never more than fit under it, so
 /// one run cannot flood the inbox.
 const MERGE_OPEN_MAX: u64 = 50;
+/// The most memories one `merge` item groups.
+const MERGE_GROUP_MAX: usize = 5;
+
+/// Cosine similarity of two vectors (0 for a zero vector or sizes that differ).
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
+    let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let d = norm(a) * norm(b);
+    if d == 0.0 { 0.0 } else { dot / d }
+}
 
 enum Step {
     More,
@@ -914,10 +931,13 @@ impl Scheduler {
             .meta("maint.merge.cursor")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        // Diaries are session logs: they share a format, so their vectors sit close without
+        // being duplicates. They are never clustered.
         let rows: Vec<(i64, String, String)> = self.ctx.readers.with(|c| {
             let mut stmt = c.prepare(
                 "SELECT seq, id, project_id FROM memories
-                 WHERE seq > ?1 AND status IN ('active','pending') ORDER BY seq LIMIT ?2",
+                 WHERE seq > ?1 AND status IN ('active','pending') AND kind != 'diary'
+                 ORDER BY seq LIMIT ?2",
             )?;
             Ok(stmt
                 .query_map(rusqlite::params![cursor, MERGE_PAGE], |r| {
@@ -929,6 +949,27 @@ impl Scheduler {
             self.set_meta("maint.merge.cursor", "0");
             return Ok(Step::Finished("merge suggestions done".into()));
         }
+        // A memory already in an open merge item is not put in another.
+        let mut claimed: std::collections::HashSet<String> = self.ctx.readers.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT payload_json FROM review_items WHERE type = 'merge' AND status = 'open'",
+            )?;
+            let mut ids = std::collections::HashSet::new();
+            for p in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                let p = p?;
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&p) else {
+                    tracing::warn!(
+                        "merge suggestions: an open merge item has a malformed payload; skipped"
+                    );
+                    continue;
+                };
+                ids.extend(v["survivor"].as_str().map(str::to_string));
+                for o in v["others"].as_array().into_iter().flatten() {
+                    ids.extend(o.as_str().map(str::to_string));
+                }
+            }
+            Ok(ids)
+        })?;
         let mut made = 0;
         let mut last = cursor;
         for (seq, id, project) in &rows {
@@ -936,6 +977,9 @@ impl Scheduler {
                 break;
             }
             last = *seq;
+            if claimed.contains(id) {
+                continue;
+            }
             let Some((_, v)) = self
                 .ctx
                 .readers
@@ -955,31 +999,47 @@ impl Scheduler {
             if near.is_empty() {
                 continue;
             }
-            let members: Vec<(String, String)> = self.ctx.readers.with(|c| {
+            // Live, same project, not a diary, not in an open item: (seq, id, vector).
+            let candidates: Vec<(String, Vec<f32>)> = self.ctx.readers.with(|c| {
                 let mut out = Vec::new();
                 for o in &near {
-                    if let Some(r) = c
+                    let Some((oid, oproject)) = c
                         .query_row(
-                            "SELECT id, project_id FROM memories WHERE seq = ?1 AND status IN ('active','pending')",
+                            "SELECT id, project_id FROM memories
+                             WHERE seq = ?1 AND status IN ('active','pending') AND kind != 'diary'",
                             [o],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
+                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
                         )
                         .optional()?
+                    else {
+                        continue;
+                    };
+                    if &oproject != project || claimed.contains(&oid) {
+                        continue;
+                    }
+                    if let Some((_, ov)) =
+                        embeddings::get_many(c, &model, &[VecKey::Memory(*o)])?.pop()
                     {
-                        out.push(r);
+                        out.push((oid, ov));
                     }
                 }
                 Ok(out)
             })?;
-            let mut group: Vec<String> = members
-                .into_iter()
-                .filter(|(_, p)| p == project)
-                .map(|(i, _)| i)
-                .collect();
-            if group.is_empty() {
+            // Complete linkage: a candidate joins only when it is alike every member so far, not
+            // just the seed (a chain A~B, B~C is not a group), up to `MERGE_GROUP_MAX`.
+            let mut members: Vec<(&str, &[f32])> = vec![(id.as_str(), v.as_slice())];
+            for (cid, cv) in &candidates {
+                if members.len() >= MERGE_GROUP_MAX {
+                    break;
+                }
+                if members.iter().all(|(_, mv)| cosine(mv, cv) >= threshold) {
+                    members.push((cid.as_str(), cv.as_slice()));
+                }
+            }
+            let mut group: Vec<String> = members.iter().map(|(i, _)| (*i).to_string()).collect();
+            if group.len() < 2 {
                 continue;
             }
-            group.push(id.clone());
             group.sort();
             group.dedup();
             let key = format!("merge:{}", group.join(":"));
@@ -1005,6 +1065,9 @@ impl Scheduler {
                     }))?
             {
                 made += n;
+                if n > 0 {
+                    claimed.extend(group.iter().cloned());
+                }
             }
         }
         self.set_meta("maint.merge.cursor", &last.to_string());
@@ -1889,6 +1952,115 @@ mod tests {
             report.detail.contains("50 merge reviews already open"),
             "{report:?}"
         );
+    }
+
+    /// A run of vectors `step_deg` apart in a plane (every pair has the cosine of its angle).
+    fn fan(n: usize, step_deg: f32) -> Vec<(&'static str, [f32; 3])> {
+        (0..n)
+            .map(|k| {
+                let a = (k as f32 * step_deg).to_radians();
+                ("fan", [a.cos(), a.sin(), 0.0])
+            })
+            .collect()
+    }
+
+    /// The memory ids of every open merge item, one list per item.
+    fn open_groups(r: &Rig) -> Vec<Vec<String>> {
+        let c = r.sql();
+        let mut stmt = c
+            .prepare(
+                "SELECT payload_json FROM review_items WHERE type = 'merge' AND status = 'open'",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|p| {
+                let v: serde_json::Value = serde_json::from_str(&p.unwrap()).unwrap();
+                let mut ids = vec![v["survivor"].as_str().unwrap().to_string()];
+                ids.extend(
+                    v["others"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|o| o.as_str().unwrap().to_string()),
+                );
+                ids
+            })
+            .collect()
+    }
+
+    const NEAR: &str = "[judge]\ncluster_similarity = 0.99\n";
+
+    #[test]
+    fn merge_suggestions_never_cluster_diaries() {
+        let r = rig_with(NEAR);
+        r.insert_memories_with_vectors(&fan(4, 0.1));
+        r.sql()
+            .execute("UPDATE memories SET kind = 'diary' WHERE seq IN (SELECT seq FROM memories LIMIT 2)", [])
+            .unwrap();
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        // The two diaries are alike but are session logs, not duplicates; the other two pair.
+        let groups = open_groups(&r);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let diaries: Vec<String> = {
+            let c = r.sql();
+            let mut stmt = c
+                .prepare("SELECT id FROM memories WHERE kind = 'diary'")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+        };
+        assert!(
+            groups[0].iter().all(|id| !diaries.contains(id)),
+            "{groups:?} {diaries:?}"
+        );
+    }
+
+    #[test]
+    fn merge_suggestions_need_every_pair_alike_not_a_chain() {
+        let r = rig_with(NEAR);
+        // 0 and 5 degrees, 5 and 10 degrees are alike (cos 0.996); 0 and 10 are not (0.985).
+        r.insert_memories_with_vectors(&fan(3, 5.0));
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        let groups = open_groups(&r);
+        assert!(!groups.is_empty(), "the near pair is still suggested");
+        assert!(groups.iter().all(|g| g.len() == 2), "{groups:?}");
+    }
+
+    #[test]
+    fn merge_suggestions_never_put_a_memory_in_two_open_items() {
+        let r = rig_with(NEAR);
+        r.insert_memories_with_vectors(&fan(6, 5.0));
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        // A second run, as the weekly job would: nothing already open is taken again.
+        r.sched.run_job(
+            Job::MergeSuggestions,
+            chrono::Utc::now() + chrono::Duration::days(8),
+            true,
+        );
+        let groups = open_groups(&r);
+        assert!(!groups.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for id in groups.iter().flatten() {
+            assert!(seen.insert(id.clone()), "{id} is in two items: {groups:?}");
+        }
+    }
+
+    #[test]
+    fn merge_suggestions_group_at_most_five_memories() {
+        let r = rig_with(NEAR);
+        r.insert_memories_with_vectors(&fan(8, 0.01));
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        let groups = open_groups(&r);
+        assert!(!groups.is_empty());
+        assert!(groups.iter().all(|g| g.len() <= 5), "{groups:?}");
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), 8, "{groups:?}");
     }
 
     #[test]

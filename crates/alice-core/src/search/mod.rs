@@ -516,6 +516,18 @@ pub fn query_text(query: &str) -> Result<String> {
     Ok(normalized)
 }
 
+/// [`query_text`] for a recall: a query with no letter or digit (`?`, `...`) is as empty as a
+/// blank one, so nothing is searched for it.
+pub fn recall_query_text(query: &str) -> Result<String> {
+    let text = query_text(query)?;
+    if !text.chars().any(char::is_alphanumeric) {
+        return Err(AliceError::invalid(
+            "query is empty; pass keywords or a question",
+        ));
+    }
+    Ok(text)
+}
+
 /// The query vector for `text` (from [`query_text`]), or `None` when there is no index (it is
 /// being rebuilt) or the embedder fails: the search then uses the word and code lists only.
 pub fn embed_query(
@@ -923,6 +935,18 @@ mod tests {
     use crate::store::embeddings::VecKey;
     use crate::store::{memories, open_writer, projects, sources};
     use crate::vector::VectorIndex;
+
+    /// A query with no letter or digit (`?`, `...`) is empty like the blank one.
+    #[test]
+    fn a_query_without_letters_or_digits_is_empty() {
+        for q in ["", "  ", "?", "...", " ?! ", "—", "😀"] {
+            let e = recall_query_text(q).unwrap_err().to_string();
+            assert!(e.contains("query is empty"), "{q:?}: {e}");
+        }
+        for q in ["a", "7", "ก", "?x", "C++"] {
+            assert!(recall_query_text(q).is_ok(), "{q:?}");
+        }
+    }
 
     /// Review M8: a query that uses word matches because the model is reloading after an idle
     /// period is expected (debug); any other embedding failure is a warning.

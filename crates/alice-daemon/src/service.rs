@@ -120,6 +120,43 @@ const NEAR_FLOOR_BAND: f32 = 0.03;
 /// `jev_eval.rs`).
 const RESCUE_ANSWERS_MIN: f64 = 0.5;
 
+/// Whether `hay` holds `needle` with no letter, digit or `_` on either side.
+fn contains_bounded(hay: &str, needle: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    hay.match_indices(needle).any(|(i, m)| {
+        !hay[..i].chars().next_back().is_some_and(word)
+            && !hay[i + m.len()..].chars().next().is_some_and(word)
+    })
+}
+
+/// Whether `hit` holds, verbatim (ignoring case) in its title, snippet or body, a distinctive
+/// token of `query` (6 or more characters with a digit or a `_`: a code, id or identifier;
+/// not an ordinary hyphenated word or filename) or the whole `query` as a phrase (3 or more
+/// words; a query without spaces, as in Thai, 12 or more characters). Words and tokens match on
+/// boundaries. Such a hit is no "nothing found".
+fn exact_match(query: &str, hit: &alice_core::api::Hit) -> bool {
+    let hay = format!(
+        "{}\n{}\n{}",
+        hit.title,
+        hit.snippet,
+        hit.body.as_deref().unwrap_or("")
+    )
+    .to_lowercase();
+    let whole = query.trim().to_lowercase();
+    let words = whole.split_whitespace().count();
+    let phrase = if words >= 3 {
+        contains_bounded(&hay, &whole)
+    } else {
+        words == 1 && whole.chars().count() >= 12 && hay.contains(&whole)
+    };
+    phrase
+        || whole
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+            .filter(|t| t.chars().count() >= 6 && t.chars().any(|c| c.is_ascii_digit() || c == '_'))
+            .any(|t| contains_bounded(&hay, t))
+}
+
 /// Said in a recall answer when its query was not sent to a remote embedding provider.
 const QUERY_HELD_BACK: &str = "this search used word matches only: the cloud policy keeps this project's text away from the embedding provider, so the query was not sent";
 
@@ -1888,7 +1925,7 @@ impl Service {
         let (active, index) = snapshot(&self.active, &self.index);
         // Embedded before a reader connection is taken: the model is shared with the
         // embedding worker, and a recall waiting for it must not hold a connection.
-        let text = search::query_text(&req.query)?;
+        let text = search::recall_query_text(&req.query)?;
         // The mode: the request's own, else `search.default_mode`; `auto` is precise exactly
         // when the judge in force is a model judge (the heuristic cannot grade).
         let can_grade = self.judge().provider() != "heuristic";
@@ -2068,6 +2105,15 @@ impl Service {
                 )
                 .await;
             notes.extend(why);
+            // The judge doubts it, but the top result holds a code or the whole phrase verbatim.
+            if low_confidence
+                && out
+                    .hits
+                    .first()
+                    .is_some_and(|h| exact_match(&judged_query, h))
+            {
+                low_confidence = false;
+            }
             if low_confidence {
                 notes.push(NOTE_NOTHING_ANSWERS.into());
             }
@@ -2101,10 +2147,16 @@ impl Service {
                 let (text, omitted) = pack::pack_text(&out, Some(&slug), max_tokens);
                 let shown = &out.hits[..out.hits.len() - omitted];
                 let touched = returned_memories(out.memory_seqs.clone(), shown);
-                let mut text = text;
+                // The notes come first: a reader going top-down meets the doubt before the results.
+                let mut head = String::new();
                 for n in &notes {
-                    text.push_str(&format!("\n({n})\n"));
+                    head.push_str(&format!("({n})\n"));
                 }
+                let text = if head.is_empty() {
+                    text
+                } else {
+                    format!("{head}\n{text}")
+                };
                 let response = RecallResponse {
                     project: Some(slug),
                     omitted,
@@ -8528,6 +8580,8 @@ mod tests {
         assert!(text.reranked && text.text.unwrap().contains("ZEBRA"));
     }
 
+    /// A vague two-word question: as a phrase it is too short to count as an exact match.
+    const VAGUE: &str = "deploy notes";
     const NOTHING_ANSWERS: &str = "nothing found clearly answers this; the closest matches follow";
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8538,7 +8592,7 @@ mod tests {
         let cwd = repo(&d, "proj");
         remember_deploy_notes(&s, &cwd).await;
         let r = s
-            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .recall(recall_req(VAGUE, RecallMode::Precise, &cwd))
             .await
             .unwrap();
         assert!(r.reranked && !r.results.is_empty(), "{r:?}");
@@ -8551,7 +8605,7 @@ mod tests {
         let text = s
             .recall(RecallRequest {
                 format: OutputFormat::Text,
-                ..recall_req("deploy notes", RecallMode::Precise, &cwd)
+                ..recall_req(VAGUE, RecallMode::Precise, &cwd)
             })
             .await
             .unwrap();
@@ -8561,7 +8615,7 @@ mod tests {
         assert_eq!(json["low_confidence"], true, "{json}");
         // Fast mode never says it: the judge graded nothing.
         let fast = s
-            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .recall(recall_req(VAGUE, RecallMode::Fast, &cwd))
             .await
             .unwrap();
         assert!(
@@ -8581,6 +8635,133 @@ mod tests {
             .unwrap();
         assert!(r.reranked && !r.low_confidence, "{:?}", r.notes);
         assert!(r.notes.iter().all(|n| n != NOTHING_ANSWERS));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_verbatim_marker_or_phrase_in_the_top_hit_is_not_low_confidence() {
+        // The judge grades every result "unrelated" (it knows no WOMBAT).
+        let (d, s) = svc_with_grader(KeywordGrader::new("WOMBAT")).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        remember_id(
+            &s,
+            "release marker marmot-cobalt-4417 sits in the vault",
+            Some(Kind::Note),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let vague = s
+            .recall(recall_req(VAGUE, RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(vague.reranked && vague.low_confidence, "{:?}", vague.notes);
+        // A code of 6+ characters with `-`, found verbatim in the top hit.
+        let marker = s
+            .recall(recall_req(
+                "deploy marmot-cobalt-4417 notes",
+                RecallMode::Precise,
+                &cwd,
+            ))
+            .await
+            .unwrap();
+        assert!(marker.reranked, "{marker:?}");
+        assert!(
+            marker.results[0].title.contains("marmot-cobalt-4417")
+                || marker.results[0]
+                    .body
+                    .as_deref()
+                    .is_some_and(|b| b.contains("marmot-cobalt-4417")),
+            "{:?}",
+            marker.results[0]
+        );
+        assert!(!marker.low_confidence, "{:?}", marker.notes);
+        assert!(marker.notes.iter().all(|n| n != NOTHING_ANSWERS));
+    }
+
+    fn hit_with(title: &str, body: &str) -> alice_core::api::Hit {
+        alice_core::api::Hit {
+            id: "x".into(),
+            tier: Tier::Knowledge,
+            kind: None,
+            project: "p".into(),
+            title: title.into(),
+            snippet: String::new(),
+            body: Some(body.into()),
+            created_at: String::new(),
+            score: 0.0,
+            relevance: None,
+            matched: vec![],
+            status: None,
+            source: None,
+            author: None,
+            cloud_ok: None,
+        }
+    }
+
+    #[test]
+    fn exact_match_needs_a_real_phrase_or_a_distinctive_token() {
+        let h = hit_with(
+            "capital follow-up",
+            "the capital city, readme.md and auto-save; deploy notes here; deploy the staging cluster today; merge_suggestions ran; marmot-cobalt-4417",
+        );
+        // Short queries are no exact match, even when they occur in the text.
+        assert!(!exact_match("api", &h));
+        assert!(!exact_match("deploy notes", &h));
+        assert!(!exact_match("capital", &h));
+        // Ordinary hyphenated words and filenames are not distinctive tokens.
+        assert!(!exact_match("follow-up", &h));
+        assert!(!exact_match("auto-save", &h));
+        assert!(!exact_match("readme.md", &h));
+        // A code with a digit, or an identifier with `_`, is.
+        assert!(exact_match("marmot-cobalt-4417", &h));
+        assert!(exact_match("what is merge_suggestions", &h));
+        // Three words found verbatim, on word boundaries.
+        assert!(exact_match("deploy the staging cluster", &h));
+        assert!(!exact_match("eploy the staging", &h));
+        // No spaces (Thai): 12 characters or more as a substring.
+        let th = hit_with("บันทึก", "ระบบความจำสำหรับเอเจนต์");
+        assert!(exact_match("ความจำสำหรับเอเจนต์", &th));
+        assert!(!exact_match("ความจำ", &th));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_text_format_prints_the_note_before_the_results() {
+        let (d, s) = svc_with_grader(KeywordGrader::new("WOMBAT")).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let text = s
+            .recall(RecallRequest {
+                format: OutputFormat::Text,
+                ..recall_req(VAGUE, RecallMode::Precise, &cwd)
+            })
+            .await
+            .unwrap()
+            .text
+            .unwrap();
+        assert!(
+            text.starts_with(&format!("({NOTHING_ANSWERS})\n")),
+            "{text}"
+        );
+        assert!(text.contains("results"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_query_without_letters_or_digits_is_refused_like_an_empty_one() {
+        let (d, s) = svc_with_grader(KeywordGrader::new("ZEBRA")).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        for q in ["?", "...", "", "  "] {
+            let e = s
+                .recall(recall_req(q, RecallMode::Precise, &cwd))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("query is empty; pass keywords or a question"),
+                "{q:?}: {e}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

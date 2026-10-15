@@ -29,6 +29,15 @@ const KEY_MEMORIES: Select = (
     "importance >= 4 AND kind NOT IN ('handoff','diary')",
     BY_IMPORTANCE,
 );
+/// What stands in for the key memories of a project that has none of importance 4 and up (an
+/// imported project: its runbooks and decisions came in at 3). The recent decisions have a
+/// section of their own.
+const FALLBACK_KEY_MEMORIES: Select = (
+    "importance >= 3 AND kind NOT IN ('handoff','diary') AND NOT (kind = 'decision' AND created_at >= ?2)",
+    BY_IMPORTANCE,
+);
+/// Most memories the fallback shows.
+const FALLBACK_KEY_CAP: usize = 3;
 const RECENT_DECISIONS: Select = ("kind = 'decision' AND created_at >= ?2", "created_at DESC");
 const PREFERENCES: Select = ("kind = 'preference'", BY_IMPORTANCE);
 /// Live diary entries except auto-save checkpoints (a title ending `: checkpoint`, or the topic).
@@ -196,6 +205,7 @@ pub fn build(
             ));
         }
     }
+    let since = (now - Duration::days(RECENT_DAYS)).to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut b = Briefing {
         conn,
         max_tokens,
@@ -203,10 +213,21 @@ pub fn build(
         out,
         shown: Vec::new(),
     };
-    let since = (now - Duration::days(RECENT_DAYS)).to_rfc3339_opts(SecondsFormat::Millis, true);
     b.section("Last handoff", LAST_HANDOFF, &[&pid], 1, handoff)?;
     b.section("Warnings", WARNINGS, &[&pid], 5, line)?;
+    // Key memories that would render empty (none of importance 4 and up, or the warnings took
+    // them all) are replaced by the project's best of importance 3.
+    let before = b.out.len();
     b.section("Key memories", KEY_MEMORIES, &[&pid], 8, line)?;
+    if b.out.len() == before {
+        b.section(
+            "Key memories",
+            FALLBACK_KEY_MEMORIES,
+            &[&pid, &since],
+            FALLBACK_KEY_CAP,
+            line,
+        )?;
+    }
     b.section(
         "Recent decisions",
         RECENT_DECISIONS,
@@ -428,7 +449,8 @@ mod tests {
             ("decision from 13.5 days ago", "2026-09-30T00:00:00.000Z"),
             ("decision from yesterday", "2026-10-12T12:00:00.000Z"),
         ] {
-            let mut i = input(Kind::Decision, 3, text);
+            // Importance 2: below the key-memories fallback, so only the window decides.
+            let mut i = input(Kind::Decision, 2, text);
             i.created_at = Some(created.into());
             put(&c, &app, i);
         }
@@ -586,6 +608,42 @@ mod tests {
         let text = build(&c, &other, 5_000, at(NOW)).unwrap();
         assert_eq!(text.matches("low warning ").count(), 5, "{text}");
         assert_eq!(text.matches("key note ").count(), 8, "{text}");
+    }
+
+    #[test]
+    fn a_project_without_important_memories_shows_its_best_ones_under_key_memories() {
+        let (_d, c, app) = setup("app");
+        put(&c, &app, input(Kind::Howto, 3, "runbook three"));
+        put(&c, &app, input(Kind::Decision, 3, "decision three"));
+        put(&c, &app, input(Kind::Fact, 3, "fact three"));
+        put(&c, &app, input(Kind::Fact, 3, "fact four"));
+        put(&c, &app, input(Kind::Note, 2, "minor note"));
+        put(&c, &app, input(Kind::Diary, 3, "diary three"));
+        let text = build(&c, &app, 2_000, at(NOW)).unwrap();
+        let (_, rest) = text.split_once("## Key memories").unwrap();
+        let key = rest.split("\n## ").next().unwrap();
+        // Up to three, newest first among equals; nothing below importance 3, no diary.
+        assert_eq!(
+            key.lines().filter(|l| l.starts_with("- ")).count(),
+            3,
+            "{text}"
+        );
+        assert!(!text.contains("minor note"), "{text}");
+        assert!(!key.contains("diary three"), "{text}");
+        assert!(
+            key.contains("fact four") && key.contains("fact three"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_project_with_important_memories_keeps_the_usual_key_memories() {
+        let (_d, c, app) = setup("app");
+        put(&c, &app, input(Kind::Fact, 4, "key fact"));
+        put(&c, &app, input(Kind::Howto, 3, "runbook three"));
+        let text = build(&c, &app, 2_000, at(NOW)).unwrap();
+        assert!(text.contains("key fact"), "{text}");
+        assert!(!text.contains("runbook three"), "{text}");
     }
 
     #[test]
