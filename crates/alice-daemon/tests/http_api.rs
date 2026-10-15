@@ -2247,6 +2247,93 @@ async fn two_folders(s: &Srv) -> (String, String) {
     (a, b)
 }
 
+/// Merging a project that is kept away from cloud providers into one that is not would make its
+/// rows eligible for the cloud judge and remote embedders: refused, dry run included, with the
+/// fix named. Denied into denied, allowed into denied and allowed into allowed all go through.
+#[tokio::test(flavor = "multi_thread")]
+async fn merging_a_cloud_denied_project_into_an_allowed_one_is_refused() {
+    let s = Srv::start().await;
+    let (_a, _b) = two_folders(&s).await;
+    let deny = |names: &[&str]| {
+        let mut changes = serde_json::Map::new();
+        changes.insert("privacy.cloud_denied_projects".into(), serde_json::json!(names));
+        s.svc.patch_settings(changes).unwrap();
+    };
+    let req = |dry_run: bool| ProjectMergeRequest {
+        from: "alpha".into(),
+        into: "beta".into(),
+        dry_run,
+        ..Default::default()
+    };
+    // Sanity: with nothing denied, allowed into allowed is a plain dry run.
+    let ok: ProjectMergeResponse = s.post_json("/api/v1/projects/merge", &req(true)).await;
+    assert!(!ok.merged);
+
+    deny(&["alpha"]);
+    let before = placement(&s);
+    for dry in [true, false] {
+        let r = s.post("/api/v1/projects/merge", &req(dry)).await;
+        assert_eq!(r.status(), 400, "dry_run {dry}");
+        let text = r.text().await.unwrap();
+        assert!(
+            text.contains("deny \\\"beta\\\" first") && text.contains("cloud providers"),
+            "{text}"
+        );
+    }
+    assert_eq!(placement(&s), before, "nothing moved");
+    assert_eq!(slugs(&s), ["alpha", "beta", "global"]);
+
+    // The other way round loosens nothing: allowed into denied.
+    deny(&["beta"]);
+    let back: ProjectMergeResponse = s.post_json("/api/v1/projects/merge", &req(true)).await;
+    assert!(!back.merged);
+    // Both denied: fine, and the merged rows are in a denied project.
+    deny(&["alpha", "beta"]);
+    let done: ProjectMergeResponse = s.post_json("/api/v1/projects/merge", &req(false)).await;
+    assert!(done.merged, "{done:?}");
+    assert_eq!(slugs(&s), ["beta", "global"]);
+}
+
+/// A denial that comes from the checkout's own `.alice.toml` counts like one in the settings.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_file_denial_blocks_the_merge_into_an_allowed_project_too() {
+    let s = Srv::start().await;
+    let mut cwds = Vec::new();
+    for name in ["gamma", "delta"] {
+        let dir = s._d.path().join(name);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        cwds.push(dir.to_string_lossy().into_owned());
+    }
+    std::fs::write(
+        s._d.path().join("gamma").join(".alice.toml"),
+        "[privacy]\ncloud_denied = true\n",
+    )
+    .unwrap();
+    for (cwd, text) in cwds.iter().zip(["a gamma note", "a delta note"]) {
+        s.svc
+            .remember(RememberRequest {
+                content: text.into(),
+                cwd: Some(cwd.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let r = s
+        .post(
+            "/api/v1/projects/merge",
+            &ProjectMergeRequest {
+                from: "gamma".into(),
+                into: "delta".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(r.status(), 400);
+    let text = r.text().await.unwrap();
+    assert!(text.contains("cloud providers"), "{text}");
+}
+
 /// `POST /api/v1/projects/merge`: behind the token, a dry run changes nothing, the refusals say
 /// what to do, a merge moves the rows and leaves the old name working, and undo (by the event
 /// the merge answers with) puts every row back where it was.

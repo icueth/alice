@@ -519,6 +519,11 @@ fn undo_with(
             return Err(AliceError::invalid(why));
         }
     }
+    for e in &todo {
+        if e.action == project_merge::MERGE_ACTION {
+            project_merge::check_undo_possible(conn, e)?;
+        }
+    }
     // Each target must look as its newest event in the group left it.
     let mut checked = HashSet::new();
     for e in &todo {

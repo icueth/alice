@@ -13,7 +13,7 @@
 //! and the vectors are keyed by row, not by project, and a search filters on the row's project.
 
 use crate::error::{AliceError, Result};
-use crate::ids::{new_id, now_rfc3339};
+use crate::ids::new_id;
 use crate::model::Kind;
 use crate::normalize::content_hash;
 use crate::store::projects::{self, GLOBAL_ID, ResolvedProject};
@@ -80,6 +80,14 @@ pub struct MergeBefore {
     pub chunks: u64,
     pub sources: u64,
     pub facts: u64,
+    /// The root path `into` had before the merge (a later write by a checkout of `from` may
+    /// have given a root-less `into` the root of that checkout; undo takes it back).
+    #[serde(default)]
+    pub into_root: Option<String>,
+    /// Moved memories that had `project_defaulted = 1` (a merge is a decision, so it clears the
+    /// flag; undo sets it again on exactly these).
+    #[serde(default)]
+    pub defaulted: Vec<String>,
 }
 
 /// The after-state of a merge event, and what [`current_state`] reads back to compare it with:
@@ -196,24 +204,26 @@ fn moved_hash(conn: &Connection, to: &ResolvedProject, m: &MemoryText) -> Result
 }
 
 /// Move the memories `ids` (those that are in project `from_id`) to `to`, with the content hash
-/// of their new project.
+/// of their new project. `updated_at` stays as it was (it orders recall and context); `hlc`
+/// moves on so sync sees the change. `clear_defaulted` clears `project_defaulted` (a merge is a
+/// decision about the project; undo leaves the flag to be put back by the caller).
 fn move_memories(
     conn: &Connection,
     ids: &[String],
     from_id: &str,
     to: &ResolvedProject,
     hlc: &str,
+    clear_defaulted: bool,
 ) -> Result<()> {
     let mut read = conn.prepare_cached(
         "SELECT seq, status, kind, title, body FROM memories WHERE id = ?1 AND project_id = ?2",
     )?;
     let mut keep = conn.prepare_cached(
-        "UPDATE memories SET project_id = ?1, updated_at = ?2, hlc = ?3, project_defaulted = 0 WHERE seq = ?4",
+        "UPDATE memories SET project_id = ?1, hlc = ?2, project_defaulted = CASE WHEN ?3 THEN 0 ELSE project_defaulted END WHERE seq = ?4",
     )?;
     let mut rehash = conn.prepare_cached(
-        "UPDATE memories SET project_id = ?1, content_hash = ?2, updated_at = ?3, hlc = ?4, project_defaulted = 0 WHERE seq = ?5",
+        "UPDATE memories SET project_id = ?1, content_hash = ?2, hlc = ?3, project_defaulted = CASE WHEN ?4 THEN 0 ELSE project_defaulted END WHERE seq = ?5",
     )?;
-    let now = now_rfc3339();
     for id in ids {
         let Some(m) = read
             .query_row(params![id, from_id], |r| {
@@ -230,8 +240,8 @@ fn move_memories(
             continue;
         };
         match moved_hash(conn, to, &m)? {
-            Some(h) => rehash.execute(params![to.id, h, now, hlc, m.seq])?,
-            None => keep.execute(params![to.id, now, hlc, m.seq])?,
+            Some(h) => rehash.execute(params![to.id, h, hlc, clear_defaulted, m.seq])?,
+            None => keep.execute(params![to.id, hlc, clear_defaulted, m.seq])?,
         };
     }
     Ok(())
@@ -293,7 +303,13 @@ pub fn merge(conn: &Connection, from: &str, into: &str, hlc: &str) -> Result<Mer
         "SELECT row_id FROM project_merge_rows WHERE merge_id = ?1 AND kind = 'memory'",
         [&merge_id],
     )?;
-    move_memories(conn, &memory_ids, &from.id, &into, hlc)?;
+    let defaulted = ids_of(
+        conn,
+        "SELECT id FROM memories WHERE project_id = ?1 AND project_defaulted = 1 ORDER BY id",
+        [&from.id],
+    )?;
+    let into_root = projects::root_of(conn, &into.id)?;
+    move_memories(conn, &memory_ids, &from.id, &into, hlc, true)?;
     conn.execute(
         "UPDATE sources SET project_id = ?1 WHERE project_id = ?2",
         params![into.id, from.id],
@@ -333,6 +349,8 @@ pub fn merge(conn: &Connection, from: &str, into: &str, hlc: &str) -> Result<Mer
         chunks: counts.chunks,
         sources: counts.sources,
         facts: counts.facts,
+        into_root,
+        defaulted,
     };
     let after = MergeState {
         merge_id,
@@ -384,6 +402,51 @@ pub fn current_state(conn: &Connection, spec: &serde_json::Value) -> Result<serd
         sources: still_in("source", "sources")?,
         ..spec
     })
+}
+
+/// Refuse to undo merge event `ev` while a later merge still depends on it: when `into` was
+/// merged away since, `into` no longer exists and the rows are not where undo would look. Names
+/// that later merge's event, so the person undoes it first. Nothing is written.
+pub fn check_undo_possible(conn: &Connection, ev: &crate::store::events::EventRow) -> Result<()> {
+    use crate::store::events::{self, EventQuery};
+    let Some(after) = ev.after.as_ref() else {
+        return Ok(());
+    };
+    let Ok(state) = serde_json::from_value::<MergeState>(after.clone()) else {
+        return Ok(());
+    };
+    let into_exists = count(
+        conn,
+        "SELECT count(*) FROM projects WHERE id = ?1",
+        [&state.into_id],
+    )? > 0;
+    if into_exists {
+        return Ok(());
+    }
+    let later = events::list(
+        conn,
+        &EventQuery {
+            target_id: Some(state.into_id.clone()),
+            limit: Some(500),
+            ..Default::default()
+        },
+    )?;
+    for l in later {
+        if l.id == ev.id {
+            break;
+        }
+        if l.action != MERGE_ACTION || l.target_type != MERGE_TARGET {
+            continue;
+        }
+        if events::undone_by(conn, &l.id)?.is_some() {
+            continue;
+        }
+        return Err(AliceError::invalid(format!(
+            "cannot undo event {}: its target project was merged into another one by the later merge event {}; undo event {} first, then this one",
+            ev.id, l.id, l.id
+        )));
+    }
+    Ok(())
 }
 
 /// Reverse a merge from its before-state: the project row comes back with the names it had, and
@@ -454,7 +517,21 @@ pub fn unmerge(conn: &Connection, before: &serde_json::Value, hlc: &str) -> Resu
         "SELECT row_id FROM project_merge_rows WHERE merge_id = ?1 AND kind = 'memory'",
         [&b.merge_id],
     )?;
-    move_memories(conn, &memory_ids, &into.id, &back, hlc)?;
+    move_memories(conn, &memory_ids, &into.id, &back, hlc, false)?;
+    let mut flag = conn.prepare_cached(
+        "UPDATE memories SET project_defaulted = 1 WHERE id = ?1 AND project_id = ?2",
+    )?;
+    for id in &b.defaulted {
+        flag.execute(params![id, b.from.id])?;
+    }
+    // A root that `into` took after the merge, from a checkout of `from`, goes back to none (a
+    // checkout of `into` itself sets it again on its next write).
+    if b.into_root.is_none() {
+        conn.execute(
+            "UPDATE projects SET root_path = NULL WHERE id = ?1",
+            [&b.into_id],
+        )?;
+    }
     for (kind, table) in [("source", "sources"), ("chunk", "chunks")] {
         conn.execute(
             &format!(
@@ -824,6 +901,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    fn cell(t: &T, id: &str, col: &str) -> String {
+        t.c.query_row(
+            &format!("SELECT CAST({col} AS TEXT) FROM memories WHERE id = ?1"),
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_merge_keeps_updated_at_and_undo_puts_project_defaulted_back() {
+        let (mut t, a, b) = two_projects();
+        let ids: Vec<String> = t.in_project("memories", &a.id).into_iter().collect();
+        let (defaulted, plain) = (ids[0].clone(), ids[1].clone());
+        t.c.execute(
+            "UPDATE memories SET project_defaulted = 1, updated_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+            [&defaulted],
+        )
+        .unwrap();
+        t.c.execute(
+            "UPDATE memories SET updated_at = '2021-02-02T00:00:00Z' WHERE id = ?1",
+            [&plain],
+        )
+        .unwrap();
+        let (_, event) = t.merge("alice", "project-alice");
+        assert!(t.in_project("memories", &b.id).contains(&defaulted));
+        assert_eq!(cell(&t, &defaulted, "project_defaulted"), "0");
+        assert_eq!(cell(&t, &defaulted, "updated_at"), "2020-01-01T00:00:00Z");
+        assert_eq!(cell(&t, &plain, "updated_at"), "2021-02-02T00:00:00Z");
+        t.undo(&event, false).unwrap();
+        assert_eq!(cell(&t, &defaulted, "project_defaulted"), "1");
+        assert_eq!(cell(&t, &plain, "project_defaulted"), "0");
+        assert_eq!(cell(&t, &defaulted, "updated_at"), "2020-01-01T00:00:00Z");
+        assert_eq!(cell(&t, &plain, "updated_at"), "2021-02-02T00:00:00Z");
+    }
+
+    #[test]
+    fn undo_takes_back_a_root_that_the_target_adopted_after_the_merge() {
+        let mut t = T::new();
+        let d = tempfile::tempdir().unwrap();
+        let root_a = d.path().join("a");
+        std::fs::create_dir_all(&root_a).unwrap();
+        let mut ra = pref("k/a", "a");
+        ra.root = Some(root_a.clone());
+        let a = projects::upsert_project(&t.c, &ra).unwrap();
+        let b = t.project("k/b", "b");
+        let (_, event) = t.merge("a", "b");
+        // A write from the old checkout reaches `b`, which had no root and takes this one.
+        projects::upsert_project(&t.c, &ra).unwrap();
+        assert_eq!(
+            projects::root_of(&t.c, &b.id).unwrap().as_deref(),
+            root_a.to_str()
+        );
+        t.undo(&event, false).unwrap();
+        assert_eq!(projects::root_of(&t.c, &b.id).unwrap(), None);
+        assert_eq!(
+            projects::root_of(&t.c, &a.id).unwrap().as_deref(),
+            root_a.to_str()
+        );
+    }
+
+    #[test]
+    fn an_older_merge_cannot_be_undone_while_a_later_one_depends_on_it() {
+        let mut t = T::new();
+        let a = t.project("k/a", "a");
+        let b = t.project("k/b", "b");
+        let c = t.project("k/c", "c");
+        t.remember(&a, "in a");
+        let (_, first) = t.merge("a", "b");
+        let (_, second) = t.merge("b", "c");
+        let before = world(&t.c);
+        let err = t.undo(&first, false).unwrap_err().to_string();
+        assert!(
+            err.contains(&second) && err.contains("first"),
+            "names the later merge and says to undo it first: {err}"
+        );
+        let err = t.undo(&first, true).unwrap_err().to_string();
+        assert!(err.contains(&second), "{err}");
+        assert_eq!(world(&t.c), before, "nothing changed");
+        let open_reviews: i64 =
+            t.c.query_row("SELECT count(*) FROM review_items", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(open_reviews, 0, "no review item is opened");
+        // Newest first works, and then the older one.
+        t.undo(&second, false).unwrap();
+        t.undo(&first, false).unwrap();
+        assert!(projects::get_by_id(&t.c, &a.id).is_ok());
+        assert!(projects::get_by_id(&t.c, &b.id).is_ok());
     }
 
     #[test]
