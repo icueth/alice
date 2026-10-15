@@ -1362,27 +1362,80 @@ async fn no_drawer_can_ask_for_the_position_a_piece_of_another_takes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_drawer_the_store_refuses_is_an_error_entry_and_the_import_goes_on() {
+async fn a_drawer_with_a_blank_source_file_is_imported_without_an_error() {
     let mut specs = fixture_specs();
-    // A source that is only blanks has no uri the store accepts.
-    let mut bad = chunk(
-        "bad_uri",
-        "text of a chunk with no source",
-        "devspace",
-        "   ",
-        0,
-    );
-    bad.meta.convos_off();
-    specs.push(bad);
+    // The owner's palace has drawers whose source_file is "" (and some that are only blanks): the
+    // reader takes them as having no source, so they are knowledge and nothing is refused.
+    for (id, blank) in [("blank_a", ""), ("blank_b", "   ")] {
+        let mut d = chunk(
+            id,
+            &format!("text of {id}, a drawer with no source"),
+            "devspace",
+            blank,
+            0,
+        );
+        d.meta.convos_off();
+        specs.push(d);
+    }
     let f = Flow::with_specs(&specs).await;
     let st = f.run_import(f.request()).await;
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
     let r = st.report.unwrap();
-    assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
-    assert!(r.errors[0].contains("bad_uri"), "{:?}", r.errors);
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    for id in ["blank_a", "blank_b"] {
+        let t = f.legacy_target(id).await.unwrap_or_default();
+        assert!(t.starts_with("memory:"), "{id}: {t:?}");
+    }
+    assert_eq!(f.count("chunks").await, 79 + 30, "no chunk was added");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drawer_the_store_refuses_is_an_error_entry_and_the_import_goes_on() {
+    // The planner keeps every field inside the store's limits (it redacts, normalises and splits
+    // first), so no palace data makes the store refuse a drawer: the test hook does.
+    let mut specs = fixture_specs();
+    let mut bad = chunk(
+        "bad_chunk",
+        "text of a chunk the store will refuse",
+        "devspace",
+        "/h/Code/devspace/bad.go",
+        0,
+    );
+    bad.meta.convos_off();
+    specs.push(bad);
+    specs.push(knowledge(
+        "bad_note",
+        "a note the store will refuse",
+        "devspace",
+        "knowledge",
+    ));
+    let hook = Arc::new(ImportHook::default());
+    hook.refuse
+        .lock()
+        .unwrap()
+        .extend(["bad_chunk".to_string(), "bad_note".to_string()]);
+    let h = hook.clone();
+    let f = Flow::with_options(&specs, move |_| ServiceOptions {
+        import_hook: Some(h),
+        ..Default::default()
+    })
+    .await;
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert_eq!(r.errors.len(), 2, "{:?}", r.errors);
+    for id in ["bad_chunk", "bad_note"] {
+        assert!(
+            r.errors.iter().any(|e| e.contains(id)),
+            "{id}: {:?}",
+            r.errors
+        );
+        assert!(f.legacy_target(id).await.is_none(), "{id}");
+    }
     assert_eq!(r.drawers_seen, r.drawers_accounted);
     assert_eq!(f.count("chunks").await, 79 + 30, "the others are stored");
-    assert!(f.legacy_target("bad_uri").await.is_none());
+    assert!(f.legacy_target("k_dec").await.is_some());
 }
 
 fn assert_clean(tables: Vec<String>, what: &str) {

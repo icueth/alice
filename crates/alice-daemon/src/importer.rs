@@ -150,6 +150,9 @@ pub struct ImportHook {
     pub parked_mentions: AtomicBool,
     /// Drawers the planner was run on (a rerun that stores nothing new plans none).
     pub planned: std::sync::atomic::AtomicU64,
+    /// Legacy ids whose write the store is made to refuse (as invalid), for the path that has
+    /// no data-only trigger: the planner already keeps every field inside the store's limits.
+    pub refuse: std::sync::Mutex<Vec<String>>,
 }
 
 impl ImportHook {
@@ -167,6 +170,23 @@ impl ImportHook {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         parked.store(false, Ordering::SeqCst);
+    }
+
+    fn refuses(&self, batch: &ImportBatch) -> bool {
+        let ids = self.refuse.lock().unwrap_or_else(|e| e.into_inner());
+        if ids.is_empty() {
+            return false;
+        }
+        let memories = batch
+            .memories
+            .iter()
+            .filter_map(|m| m.input.legacy_id.as_ref());
+        let chunks = batch
+            .sources
+            .iter()
+            .flat_map(|s| s.chunks.iter())
+            .filter_map(|c| c.legacy_id.as_ref());
+        memories.chain(chunks).any(|id| ids.contains(id))
     }
 
     fn run(&self, stop: &AtomicBool) {
@@ -845,6 +865,11 @@ impl Ctx<'_> {
                     }
                 }
             }
+        }
+        if let Some(h) = &self.env.hook
+            && h.refuses(&batch)
+        {
+            return Err(AliceError::invalid("refused by the test hook"));
         }
         // Aliases go with the first batch that names a project, once it is stored.
         for slug in &slugs {
