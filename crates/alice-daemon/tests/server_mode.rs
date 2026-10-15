@@ -311,3 +311,84 @@ async fn streams_pass_the_emulator_unbuffered() {
     assert!(next_data(&mut resp, Duration::from_secs(1)).await.is_some());
     c.cancel().await.ok();
 }
+
+/// Waits until the service's import job has ended.
+async fn wait_import(
+    svc: &std::sync::Arc<alice_daemon::service::Service>,
+) -> alice_core::import::ImportStatus {
+    let t = std::time::Instant::now();
+    loop {
+        let st = svc.import_status();
+        if st.state != alice_core::import::ImportState::Running {
+            return st;
+        }
+        assert!(t.elapsed() < Duration::from_secs(300), "import did not end");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dest);
+        } else {
+            std::fs::copy(e.path(), dest).unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admin_import_matches_a_local_import() {
+    use alice_core::embed::{Embedder, FakeEmbedder};
+    use alice_core::import::{ImportRequest, ImportState};
+    use alice_daemon::paths::AliceHome;
+    use alice_daemon::service::{Service, ServiceOptions};
+    use std::sync::Arc;
+
+    let src = tempfile::tempdir().unwrap();
+    let palace = alice_core::import::fixture::synthetic_palace(&src.path().join("palace"), 600);
+    let start = |home: &Path, tenant: bool| {
+        Service::start(
+            AliceHome::new(home.to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let local = start(&a.path().join("alice"), false);
+    let tenant = start(&b.path().join("alice"), true);
+
+    local
+        .start_import(ImportRequest {
+            palace: Some(palace.dir.display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    let inbox = b.path().join("alice/import-inbox/j1/palace");
+    copy_tree(&palace.dir, &inbox);
+    tenant
+        .start_import(ImportRequest {
+            palace: Some(inbox.display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    let (l, t) = (wait_import(&local).await, wait_import(&tenant).await);
+    assert_eq!(l.state, ImportState::Done, "{:?}", l.error);
+    assert_eq!(t.state, ImportState::Done, "{:?}", t.error);
+    let (l, t) = (l.report.unwrap(), t.report.unwrap());
+    assert!(l.drawers_seen >= 600);
+    assert_eq!(l.tiers, t.tiers);
+    assert_eq!(l.projects, t.projects);
+    assert_eq!(l.duplicates, t.duplicates);
+    assert_eq!(l.facts, t.facts);
+    assert_eq!(l.skipped, t.skipped);
+    assert_eq!(l.drawers_seen, t.drawers_seen);
+    assert_eq!(l.drawers_accounted, t.drawers_accounted);
+}

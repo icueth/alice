@@ -235,6 +235,31 @@ scoped!(
     IngestRequest
 );
 
+/// A tenant import must leave at least this many bytes free once its copy exists.
+pub const IMPORT_MIN_FREE_AFTER: u64 = 2_000_000_000;
+
+/// The total size of the regular files under `dir`; links are counted for nothing and not followed.
+fn tree_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            if m.is_dir() {
+                todo.push(e.path());
+            } else if m.is_file() {
+                total = total.saturating_add(m.len());
+            }
+        }
+    }
+    total
+}
+
 #[derive(Clone)]
 pub struct ServiceOptions {
     /// Most read connections open at once (each has its own page cache); further reads wait.
@@ -295,6 +320,9 @@ pub struct ServiceOptions {
     /// (no git on a client's path), the settings follow the tenant rules, and a project root
     /// that is not there fails closed.
     pub tenant: bool,
+    /// Free bytes at a path (tests inject a value); `None` reads the volume
+    /// (`backup::free_space`). A tenant import checks it before it starts.
+    pub free_space: Option<crate::maintenance::FreeSpace>,
 }
 
 impl Default for ServiceOptions {
@@ -324,6 +352,7 @@ impl Default for ServiceOptions {
             reembed_retry_wait: Duration::from_secs(2),
             precise_clock: None,
             tenant: false,
+            free_space: None,
         }
     }
 }
@@ -3023,6 +3052,37 @@ impl Service {
 
     // ------------------------------------------------------------------ import
 
+    /// The tenant rules of an import (spec §2.9): the palace lies strictly inside
+    /// `import-inbox/` (placed there by the admin's `alice-server import`), and the disk keeps
+    /// room for twice its size plus [`IMPORT_MIN_FREE_AFTER`].
+    fn check_tenant_import(&self, req: &alice_core::import::ImportRequest) -> Result<()> {
+        let outside = || {
+            AliceError::invalid(
+                "a server tenant imports only a palace the admin placed under import-inbox/ with `alice-server import`; it cannot read other paths on the server",
+            )
+        };
+        let inbox = std::fs::canonicalize(self.home.import_inbox()).map_err(|_| outside())?;
+        let palace = req.palace.as_deref().ok_or_else(outside)?;
+        let palace = std::fs::canonicalize(palace).map_err(|_| outside())?;
+        if palace == inbox || !palace.starts_with(&inbox) {
+            return Err(outside());
+        }
+        let size = tree_size(&palace);
+        let home = self.home.root();
+        let free = match &self.opts.free_space {
+            Some(f) => f(home),
+            None => backup::free_space(home),
+        };
+        // An unknown free size cannot prove there is room.
+        let free = free.unwrap_or(0);
+        if free < size.saturating_mul(2).saturating_add(IMPORT_MIN_FREE_AFTER) {
+            return Err(AliceError::invalid(format!(
+                "the server has {free} bytes free; importing this {size}-byte palace needs about twice its size plus 2 GB; ask the server's admin"
+            )));
+        }
+        Ok(())
+    }
+
     /// Starts an import of a MemPalace palace on a thread of its own. The refusals that need
     /// no work (one already running, no palace, a missing or foreign folder, a bad `since`, a
     /// remote embedding provider) come back at once; everything else shows in
@@ -3037,12 +3097,8 @@ impl Service {
         if self.stop.load(Ordering::SeqCst) {
             return Err(stopping());
         }
-        // Task 15 lets a tenant import an uploaded bundle; until `ImportRequest` carries one,
-        // every import is refused here.
         if self.opts.tenant {
-            return Err(AliceError::invalid(
-                "a server tenant imports only a bundle uploaded by `alice import mempalace` from your own machine; it cannot read a palace on the server",
-            ));
+            self.check_tenant_import(&req)?;
         }
         let running = |slot: &ImportSlot| {
             let st = slot.status.lock();
@@ -8966,6 +9022,66 @@ mod tests {
                 ..Default::default()
             })
             .await
+        );
+    }
+
+    // ---------------------------------------------------------------- tenant import inbox
+
+    fn palace_request(p: &Path) -> alice_core::import::ImportRequest {
+        alice_core::import::ImportRequest {
+            palace: Some(p.display().to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_imports_only_from_its_import_inbox() {
+        let (d, s) = tenant_svc().await;
+        let inbox = d.path().join("import-inbox");
+        let outside = tempfile::tempdir().unwrap();
+        let out_palace = alice_core::import::fixture::synthetic_palace(outside.path(), 20).dir;
+        std::fs::create_dir_all(inbox.join("j2")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&out_palace, inbox.join("j2/palace")).unwrap();
+        for bad in [
+            Some(out_palace.clone()),
+            Some(inbox.clone()),
+            Some(inbox.join("j2/palace")),
+            None,
+        ] {
+            let req = match &bad {
+                Some(p) => palace_request(p),
+                None => Default::default(),
+            };
+            let e = s.start_import(req).unwrap_err().to_string();
+            assert!(e.contains("import-inbox/"), "{e}");
+        }
+        let ok = inbox.join("j1/palace");
+        alice_core::import::fixture::synthetic_palace(&ok, 20);
+        let st = s.start_import(palace_request(&ok)).unwrap();
+        assert_eq!(st.state, alice_core::import::ImportState::Running);
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_import_is_refused_when_the_disk_would_get_too_full() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                free_space: Some(Arc::new(|_| Some(1))),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        let p = d.path().join("import-inbox/j1/palace");
+        alice_core::import::fixture::synthetic_palace(&p, 20);
+        let e = s.start_import(palace_request(&p)).unwrap_err().to_string();
+        assert!(
+            e.contains("1 bytes free") && e.contains("twice its size plus 2 GB"),
+            "{e}"
         );
     }
 }

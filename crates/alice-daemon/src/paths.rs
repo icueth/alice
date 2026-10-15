@@ -79,6 +79,10 @@ impl AliceHome {
     pub fn import_tmp(&self) -> PathBuf {
         self.root.join("import-tmp")
     }
+    /// Server mode: where the admin places a palace to import (`alice-server import`).
+    pub fn import_inbox(&self) -> PathBuf {
+        self.root.join("import-inbox")
+    }
     /// Server mode: the copies of remote projects' `.alice.toml` (spec §2.2 item 3).
     pub fn client_projects_dir(&self) -> PathBuf {
         self.root.join("client-projects")
