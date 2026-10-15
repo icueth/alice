@@ -1940,7 +1940,9 @@ pub fn parse_project(name: &str, text: &str) -> Result<ProjectSettings, SettingE
         let why = rest.lines().next().unwrap_or("").trim();
         return Err(err(
             name,
-            format!("the client could not read this project's .alice.toml {why}; its rules fail closed until the client can read it"),
+            format!(
+                "the client could not read this project's .alice.toml {why}; its rules fail closed until the client can read it"
+            ),
         ));
     }
     let p: ProjectSettings = toml::from_str(text).map_err(|e| {
@@ -2138,10 +2140,20 @@ mod tests {
         assert!(text.starts_with(UNREADABLE_MARKER));
         assert_eq!(text.lines().count(), 1, "one line: {text:?}");
         let e = parse_project("/srv/x/.alice.toml", &text).unwrap_err();
-        assert!(e.message.contains("the client could not read this project's .alice.toml"), "{}", e.message);
+        assert!(
+            e.message
+                .contains("the client could not read this project's .alice.toml"),
+            "{}",
+            e.message
+        );
         assert!(e.message.contains("permission denied"), "{}", e.message);
         // Ordinary text still parses.
-        assert!(parse_project("f", "[privacy]\ncloud_denied = true\n").unwrap().privacy.cloud_denied);
+        assert!(
+            parse_project("f", "[privacy]\ncloud_denied = true\n")
+                .unwrap()
+                .privacy
+                .cloud_denied
+        );
     }
 
     #[test]

@@ -137,7 +137,6 @@ pub struct RecallResponse {
     pub notes: Vec<String>,
 }
 
-/// Save a memory: a decision, fix, fact, how-to, preference, warning or handoff worth keeping.
 /// Largest `.alice.toml` a remote client may send (spec §4.1).
 pub const CLIENT_RULES_MAX_BYTES: usize = 64 * 1024;
 
@@ -205,6 +204,7 @@ impl ClientProject {
     }
 }
 
+/// Save a memory: a decision, fix, fact, how-to, preference, warning or handoff worth keeping.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct RememberRequest {
     /// The memory text. The first line becomes the title unless `title` is given.
@@ -664,6 +664,13 @@ mod tests {
     use super::*;
     use crate::store::memories::UpdateAction;
 
+    #[test]
+    fn remember_request_schema_keeps_its_description() {
+        let v = serde_json::to_value(schemars::schema_for!(RememberRequest)).unwrap();
+        let d = v["description"].as_str().unwrap_or("");
+        assert!(d.contains("Save a memory"), "description: {d:?}");
+    }
+
     fn cp(key: &str, slug: &str) -> ClientProject {
         ClientProject {
             key: key.into(),
@@ -681,7 +688,9 @@ mod tests {
             slug: "alice".into(),
             name: "alice".into(),
             remote: Some("github.com/icueth/alice".into()),
-            rules: ClientRules::File { text: "[privacy]\ncloud_denied = true\n".into() },
+            rules: ClientRules::File {
+                text: "[privacy]\ncloud_denied = true\n".into(),
+            },
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["rules"]["state"], "file");
@@ -692,12 +701,20 @@ mod tests {
         assert_eq!(none, ClientRules::None);
         let bad: ClientRules =
             serde_json::from_str(r#"{"state":"unreadable","reason":"permission denied"}"#).unwrap();
-        assert_eq!(bad, ClientRules::Unreadable { reason: "permission denied".into() });
+        assert_eq!(
+            bad,
+            ClientRules::Unreadable {
+                reason: "permission denied".into()
+            }
+        );
     }
 
     #[test]
     fn a_request_without_client_project_serialises_as_before() {
-        let r = RememberRequest { content: "x".into(), ..Default::default() };
+        let r = RememberRequest {
+            content: "x".into(),
+            ..Default::default()
+        };
         let v = serde_json::to_value(&r).unwrap();
         assert!(v.get("client_project").is_none());
         let r: RecallRequest = serde_json::from_str(r#"{"query":"q"}"#).unwrap();
@@ -717,7 +734,10 @@ mod tests {
             ("slug not slugified", cp("k", "My Repo")),
         ] {
             let e = p.validate().unwrap_err().to_string();
-            assert!(!e.contains("My Repo") && !e.contains(&long), "{case}: echoed: {e}");
+            assert!(
+                !e.contains("My Repo") && !e.contains(&long),
+                "{case}: echoed: {e}"
+            );
         }
         let mut p = cp("k", "b");
         p.name = "n".repeat(201);
@@ -726,10 +746,14 @@ mod tests {
         p.remote = Some("r".repeat(1025));
         assert!(p.validate().is_err(), "long remote");
         let mut p = cp("k", "b");
-        p.rules = ClientRules::File { text: "#".repeat(CLIENT_RULES_MAX_BYTES + 1) };
+        p.rules = ClientRules::File {
+            text: "#".repeat(CLIENT_RULES_MAX_BYTES + 1),
+        };
         assert!(p.validate().is_err(), "large rules");
         let mut p = cp("k", "b");
-        p.rules = ClientRules::Unreadable { reason: "r".repeat(501) };
+        p.rules = ClientRules::Unreadable {
+            reason: "r".repeat(501),
+        };
         assert!(p.validate().is_err(), "long reason");
     }
 
