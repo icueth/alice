@@ -112,6 +112,8 @@ pub enum ActionArg {
     Archive,
     Forget,
     Restore,
+    /// Move to another project (with --project).
+    Move,
 }
 
 #[derive(Args)]
@@ -130,6 +132,9 @@ pub struct UpdateArgs {
     /// For supersede: the id of the replacing memory.
     #[arg(long)]
     pub by: Option<String>,
+    /// For move: the slug of the project to move it to (created as a placeholder if new).
+    #[arg(long)]
+    pub project: Option<String>,
     /// Who makes the change, in the history (default: $ALICE_AGENT or "cli").
     #[arg(long, env = "ALICE_AGENT", default_value = "cli")]
     pub agent: String,
@@ -928,12 +933,14 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
             })
         }
         Command::Update(a) => {
+            let moved = matches!(a.action, ActionArg::Move);
             let action = match a.action {
                 ActionArg::Edit => UpdateAction::Edit,
                 ActionArg::Supersede => UpdateAction::Supersede,
                 ActionArg::Archive => UpdateAction::Archive,
                 ActionArg::Forget => UpdateAction::Forget,
                 ActionArg::Restore => UpdateAction::Restore,
+                ActionArg::Move => UpdateAction::Move,
             };
             let update = MemoryUpdate {
                 action,
@@ -943,6 +950,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                 topics: None,
                 importance: a.importance,
                 superseded_by: a.by,
+                project: a.project,
             };
             let r = client(&home)
                 .await?
@@ -958,6 +966,12 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                     .as_deref()
                     .map(|e| format!(" (event {e}; undo with `alice undo {e}`)"))
                     .unwrap_or_default();
+                if moved {
+                    return format!(
+                        "{} is now in project {}{undo}\n",
+                        r.memory.id, r.memory.project
+                    );
+                }
                 format!(
                     "{} is now {}{undo}\n",
                     r.memory.id,

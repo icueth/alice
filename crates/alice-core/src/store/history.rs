@@ -8,7 +8,7 @@ use crate::normalize::content_hash;
 use crate::redact::Redactor;
 use crate::store::events::{self, Actor, EventInput, EventRow};
 use crate::store::reviews::{self, NewReview, ReviewType};
-use crate::store::{fts, kg, memories, project_merge};
+use crate::store::{fts, kg, memories, project_merge, projects};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -133,6 +133,8 @@ enum Target {
     Predicate,
     /// A project merge (`project.merge`): see [`project_merge`].
     Project,
+    /// The placeholder project a move created: see [`projects::PlaceholderState`].
+    Placeholder,
 }
 
 /// Undo knows memories and relations; any other target type is refused as such.
@@ -142,6 +144,7 @@ fn target_kind(target_type: &str) -> Result<Target> {
         "relation" => Ok(Target::Relation),
         "predicate" => Ok(Target::Predicate),
         project_merge::MERGE_TARGET => Ok(Target::Project),
+        projects::PLACEHOLDER_TARGET => Ok(Target::Placeholder),
         other => Err(AliceError::invalid(format!(
             "changes to a {other} cannot be undone; only memory, fact, predicate and project-merge changes can"
         ))),
@@ -163,6 +166,14 @@ fn current(
         Target::Project => {
             let Some(spec) = spec else { return Ok(None) };
             project_merge::current_state(conn, spec).map(Some)
+        }
+        Target::Placeholder => {
+            let Some(spec) = spec else { return Ok(None) };
+            let spec: projects::PlaceholderState =
+                serde_json::from_value(spec.clone()).map_err(|e| {
+                    AliceError::invalid(format!("the recorded placeholder is unreadable ({e})"))
+                })?;
+            to_json(projects::placeholder_now(conn, &spec)?).map(Some)
         }
         Target::Predicate => {
             let Some(spec) = spec else { return Ok(None) };
@@ -530,6 +541,11 @@ fn undo_with(
         if !checked.insert((e.target_type.as_str(), e.target_id.as_str())) {
             continue;
         }
+        // A placeholder is only ever removed while empty and put back when absent: whatever
+        // happened to it since, undoing the move around it is not in conflict.
+        if e.target_type == projects::PLACEHOLDER_TARGET {
+            continue;
+        }
         let (_, after) = states(conn, e)?;
         let now = current(conn, &e.target_type, &e.target_id, after.as_ref())?;
         if now.is_none() && after.is_some() {
@@ -611,6 +627,21 @@ fn undo_with(
                 kg::restore_predicates(conn, &s, &h)?;
             }
             (Target::Project, Some(b)) => project_merge::unmerge(conn, &b, &h)?,
+            // Undoing the creation (nothing before it) removes the placeholder if it is still
+            // empty; undoing a removal puts it back.
+            (Target::Placeholder, None) => {
+                let spec: projects::PlaceholderState =
+                    serde_json::from_value(after.clone().unwrap_or_default()).map_err(bad)?;
+                projects::remove_empty_placeholder(conn, &spec)?;
+            }
+            (Target::Placeholder, Some(b)) => {
+                let spec: projects::PlaceholderState = serde_json::from_value(b).map_err(bad)?;
+                if spec.present {
+                    projects::recreate_placeholder(conn, &spec)?;
+                } else {
+                    projects::remove_empty_placeholder(conn, &spec)?;
+                }
+            }
             (Target::Project, None) => {
                 return Err(AliceError::invalid(format!(
                     "event {} ({}) records no before-state for project {}; it cannot be undone",

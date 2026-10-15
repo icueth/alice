@@ -18,7 +18,7 @@
 //!
 //! `test` is never a project inferred for a diary (topic, agent wing or text); only a diary
 //! filed in the `test` wing itself follows it. Auto-save diaries (topic `checkpoint`) follow
-//! the same rules; their weight is set in `plan.rs`.
+//! the same rules; `plan.rs` files them as raw session chunks instead of memories.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;

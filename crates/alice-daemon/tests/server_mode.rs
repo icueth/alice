@@ -788,6 +788,43 @@ async fn only_the_author_updates_a_shared_memory_and_anyone_reads_it() {
     assert_eq!(stored_body, "Ann's corrected text");
 }
 
+/// `update --action move` of a `team:` id is an update like any other: only its author may, and
+/// the target project is one of the team store's; the memory never enters a personal store.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_memory_moves_only_within_the_team_store_and_only_by_its_author() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    let (ann, bob) = (&s.tenant("ann").svc, &s.tenant("bob").svc);
+    let mut req = shared("The shared deploy checklist", Some("cursor"));
+    req.project_hint = Some("shared-proj".into());
+    let id = ann.remember(req).await.unwrap().id.unwrap();
+    let move_to = |agent: &str| UpdateRequest {
+        id: id.clone(),
+        update: MemoryUpdate {
+            action: UpdateAction::Move,
+            project: Some("Team Ops".into()),
+            ..Default::default()
+        },
+        author: Author {
+            agent: Some(agent.into()),
+            ..Default::default()
+        },
+    };
+    let e = bob.update(move_to("cursor")).await.unwrap_err();
+    assert!(
+        matches!(&e, alice_core::error::AliceError::Invalid(m) if m == SHARED_REFUSAL),
+        "{e:?}"
+    );
+    let team_home = &s.team.as_ref().unwrap().home;
+    assert_eq!(stored(team_home), vec![("shared-proj".to_string(), None)]);
+    let out = ann.update(move_to("cursor")).await.unwrap();
+    assert_eq!(out.memory.id, id);
+    assert_eq!(out.memory.project, "team-ops");
+    assert!(out.event_id.as_deref().unwrap().starts_with("team:"));
+    assert_eq!(stored(team_home), vec![("team-ops".to_string(), None)]);
+    assert!(stored(&s.tenant("ann").home).is_empty());
+    assert!(stored(&s.tenant("bob").home).is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn only_the_author_undoes_a_shared_change() {
     let s = Server::start_with_team(&["ann", "bob"]).await;

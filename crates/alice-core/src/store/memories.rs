@@ -5,7 +5,7 @@ use crate::ids::{new_id, now_rfc3339};
 use crate::model::{Author, Kind, Memory, Status, limits};
 use crate::normalize::{content_hash, derive_title, nfc, normalize_topic};
 use crate::store::fts;
-use crate::store::projects::ResolvedProject;
+use crate::store::projects::{self, ResolvedProject};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,9 @@ pub enum UpdateAction {
     Archive,
     Forget,
     Restore,
+    /// Move to another project (`project`). Not offered over MCP: the schema leaves it out.
+    #[schemars(skip)]
+    Move,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -86,6 +89,10 @@ pub struct MemoryUpdate {
     /// For `supersede`: the id of the memory that replaces this one.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// For `move`: the slug (or alias) of the project the memory goes to. Not offered over MCP.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub project: Option<String>,
 }
 
 fn normalize_topics(raw: &[String]) -> Result<Vec<String>> {
@@ -641,6 +648,24 @@ pub fn apply_update(conn: &Connection, id: &str, u: &MemoryUpdate, hlc: String) 
                 "DELETE FROM links WHERE from_id = ?1 AND type = 'duplicate_of'",
                 [&current.id],
             )?;
+        }
+        UpdateAction::Move => {
+            let raw = u.project.as_deref().ok_or_else(|| {
+                AliceError::invalid("move needs project: the slug of the project to move it to")
+            })?;
+            let slug = projects::move_slug(raw)?;
+            let target = projects::resolve_move_target(conn, &slug)?.ok_or_else(|| {
+                AliceError::NotFound(format!("project {slug}; moving into it creates it"))
+            })?;
+            match move_to_project(conn, &current.id, &target.id, &hlc)? {
+                MoveOutcome::Moved => {}
+                MoveOutcome::DuplicateOf(other) => {
+                    return Err(AliceError::invalid(format!(
+                        "project {} already holds the same text as memory {other}; nothing was moved",
+                        target.slug
+                    )));
+                }
+            }
         }
     }
     let (_, updated) = get_by_seqs(conn, &[seq])?

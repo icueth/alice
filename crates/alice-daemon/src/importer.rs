@@ -29,7 +29,8 @@ use alice_core::import::palace::{
     snapshot,
 };
 use alice_core::import::plan::{
-    Mapper, Planned, Planner, Survey, TextFilter, Tier, classify, parse_time, survey,
+    CHECKPOINT_URI_PREFIX, Mapper, Planned, Planner, Survey, TextFilter, Tier, classify,
+    parse_time, survey,
 };
 use alice_core::import::report::{
     FactCounts, ImportReport, PalaceSummary, PhaseTiming, ProjectCounts, TunnelCounts, WingMapEntry,
@@ -571,24 +572,29 @@ enum Unit {
         items: Vec<NewMemoryInput>,
         /// The drawer repeats one already planned in this run (counted as a duplicate).
         dup: bool,
+        /// The keys of the other fragments joined into this drawer.
+        joined: Vec<String>,
     },
     Chunks {
         slug: String,
         source: SourceInput,
         chunks: Vec<ChunkInput>,
+        /// The keys of the other fragments joined into this drawer.
+        joined: Vec<String>,
     },
 }
 
 impl Unit {
     fn weight(&self) -> (usize, usize) {
         match self {
-            Unit::Memories { items, .. } => (
-                items.len(),
+            Unit::Memories { items, joined, .. } => (
+                items.len() + joined.len(),
                 items.iter().map(|m| m.content.len() + 64).sum(),
             ),
-            Unit::Chunks { chunks, .. } => {
-                (chunks.len(), chunks.iter().map(|c| c.text.len() + 64).sum())
-            }
+            Unit::Chunks { chunks, joined, .. } => (
+                chunks.len() + joined.len(),
+                chunks.iter().map(|c| c.text.len() + 64).sum(),
+            ),
         }
     }
 }
@@ -612,6 +618,15 @@ struct Tally {
     already_knowledge: u64,
     already_session: u64,
     already_file: u64,
+    already_checkpoint: u64,
+    /// Fragments folded into the drawer they belong to (each is a drawer of the palace).
+    fragments_joined: u64,
+    /// Drawers made of two or more fragments.
+    fragment_groups: u64,
+    /// Drawers an earlier run stored only some fragments of (left as they are).
+    partial_groups: u64,
+    /// Checkpoint sources this run stored chunks in.
+    checkpoint_sources: HashSet<String>,
     knowledge_duplicates: u64,
     /// Parts of those duplicates handed to the store (it answers "duplicate" for them too).
     duplicate_parts_sent: u64,
@@ -674,19 +689,36 @@ impl Ctx<'_> {
         store_slug(self.filter, slug)
     }
 
-    /// Counts what `d` would add; in a real run also returns the rows to store.
-    fn take(&mut self, d: &Drawer) -> Option<Unit> {
+    /// Counts what the drawer would add; in a real run also returns the rows to store.
+    /// `members` are the fragments of one drawer, first fragment first (a drawer that was never
+    /// cut is a list of one). Every fragment is a drawer of the palace: the first one stands for
+    /// the drawer and takes the outcome, the others are counted as joined into it (or share its
+    /// fate when it is skipped or held back).
+    fn take(&mut self, members: &[Drawer]) -> Option<Unit> {
         if let Some(h) = &self.env.hook {
             h.planned.fetch_add(1, Ordering::Relaxed);
         }
-        let planned = self.planner.plan(d);
+        let d = members.first()?;
+        let planned = if members.len() > 1 {
+            self.planner.plan_group(members)
+        } else {
+            self.planner.plan(d)
+        };
         let key = self.filter.legacy_key(&d.id);
+        let joined: Vec<String> = members
+            .iter()
+            .skip(1)
+            .map(|m| self.filter.legacy_key(&m.id))
+            .collect();
+        let extra = joined.len() as u64;
         match planned {
             Planned::Memories(parts) => {
                 let first = parts.first()?;
                 let slug = self.slug(&first.project.slug);
                 let identity = memory_identity(&slug, &first.input);
                 let duplicate = !self.tally.seen_identities.insert(identity);
+                self.tally.fragments_joined += extra;
+                self.tally.fragment_groups += u64::from(extra > 0);
                 if duplicate {
                     self.tally.knowledge_duplicates += 1;
                     self.tally.duplicate_parts_sent += parts.len() as u64;
@@ -719,16 +751,23 @@ impl Ctx<'_> {
                     slug,
                     items,
                     dup: duplicate,
+                    joined,
                 })
             }
             Planned::Chunks(parts) => {
                 let first = parts.first()?;
                 let slug = self.slug(&first.project.slug);
                 self.tally.chunk_drawers += 1;
+                self.tally.fragments_joined += extra;
+                self.tally.fragment_groups += u64::from(extra > 0);
                 if parts.len() > 1 {
                     self.tally.split_chunks += 1;
                 }
-                if first.source.source_type == SourceType::Session {
+                if first.source.uri.starts_with(CHECKPOINT_URI_PREFIX) {
+                    self.tally
+                        .checkpoint_sources
+                        .insert(first.source.uri.clone());
+                } else if first.source.source_type == SourceType::Session {
                     self.tally.transcripts.insert(first.source.uri.clone());
                 }
                 self.tally.projects.entry(slug.clone()).or_default().chunks += parts.len() as u64;
@@ -749,16 +788,17 @@ impl Ctx<'_> {
                     slug,
                     source,
                     chunks,
+                    joined,
                 })
             }
             Planned::Skipped { reason } => {
-                *self.tally.skipped.entry(reason.to_string()).or_default() += 1;
+                *self.tally.skipped.entry(reason.to_string()).or_default() += 1 + extra;
                 None
             }
             Planned::Blocked { detectors } => {
-                self.tally.blocked_drawers += 1;
+                self.tally.blocked_drawers += 1 + extra;
                 for d in detectors {
-                    *self.tally.blocked.entry(d).or_default() += 1;
+                    *self.tally.blocked.entry(d).or_default() += 1 + extra;
                 }
                 None
             }
@@ -832,8 +872,19 @@ impl Ctx<'_> {
         let mut at: HashMap<(String, &'static str, String), usize> = HashMap::new();
         for unit in units.iter().cloned() {
             match unit {
-                Unit::Memories { slug, items, .. } => {
+                Unit::Memories {
+                    slug,
+                    items,
+                    joined,
+                    ..
+                } => {
                     slugs.insert(slug.clone());
+                    let head = items.first().and_then(|m| m.legacy_id.clone());
+                    if let Some(head) = head {
+                        batch
+                            .joined
+                            .extend(joined.into_iter().map(|f| (f, head.clone())));
+                    }
                     batch
                         .memories
                         .extend(items.into_iter().map(|input| ImportMemory {
@@ -845,8 +896,15 @@ impl Ctx<'_> {
                     slug,
                     source,
                     chunks,
+                    joined,
                 } => {
                     slugs.insert(slug.clone());
+                    let head = chunks.first().and_then(|c| c.legacy_id.clone());
+                    if let Some(head) = head {
+                        batch
+                            .joined
+                            .extend(joined.into_iter().map(|f| (f, head.clone())));
+                    }
                     let k = (
                         slug.clone(),
                         source.source_type.as_str(),
@@ -891,8 +949,13 @@ impl Ctx<'_> {
     /// The store refused this drawer: it is listed in the errors, and counted there instead of
     /// among the drawers that were stored.
     fn reject(&mut self, unit: &Unit, why: &str) {
+        let joined = match unit {
+            Unit::Memories { joined, .. } | Unit::Chunks { joined, .. } => joined.len() as u64,
+        };
         let (id, parts) = match unit {
-            Unit::Memories { items, dup, slug } => {
+            Unit::Memories {
+                items, dup, slug, ..
+            } => {
                 let n = items.len() as u64;
                 if *dup {
                     self.tally.knowledge_duplicates -= 1;
@@ -928,7 +991,10 @@ impl Ctx<'_> {
                 (chunks.first().and_then(|c| c.legacy_id.clone()), n)
             }
         };
-        self.tally.rejected += 1;
+        // The fragments joined into the refused drawer are refused with it.
+        self.tally.fragments_joined -= joined;
+        self.tally.fragment_groups -= u64::from(joined > 0);
+        self.tally.rejected += 1 + joined;
         let why: String = self.filter.quiet(why).chars().take(300).collect();
         self.tally.store_errors.push(format!(
             "drawer {} ({parts} rows) was not stored: {why}",
@@ -986,39 +1052,83 @@ impl Ctx<'_> {
     }
 
     fn knowledge_pass(&mut self) -> Result<()> {
-        let order: &[String] = &self.survey.knowledge_order;
+        let survey = self.survey;
+        self.drawer_pass(&survey.knowledge_order, false)?;
+        // Checkpoint diaries are read the same way and filed as raw chunks.
+        self.drawer_pass(&survey.checkpoint_order, true)?;
+        self.finish_batch()
+    }
+
+    /// One pass over drawers listed by their first fragment (`Survey::fragments` has the rest).
+    ///
+    /// A drawer is imported only when none of its ids is stored: the first fragment's id is the
+    /// drawer's own and is stored with every id of the fragments in one transaction, so a drawer
+    /// of this version is all there or not at all. A drawer with some ids stored (an earlier
+    /// version stored the fragments one by one, or a run died between them) is left as it is and
+    /// counted as already imported, with a warning when ids are missing: joining it now would
+    /// store the text a second time. Reading is bounded by the group of drawers in hand.
+    fn drawer_pass(&mut self, order: &[String], checkpoint: bool) -> Result<()> {
+        let survey = self.survey;
+        let members_of = |head: &String| -> Vec<String> {
+            survey
+                .fragments
+                .get(head)
+                .cloned()
+                .unwrap_or_else(|| vec![head.clone()])
+        };
         for group in order.chunks(KNOWLEDGE_GROUP) {
             check_stop(&self.env.stop)?;
             // Drawers stored before cost nothing more: no reading, no redaction, no planning.
-            let keys: Vec<String> = group.iter().map(|id| self.filter.legacy_key(id)).collect();
+            let wanted: Vec<(&String, Vec<String>)> =
+                group.iter().map(|id| (id, members_of(id))).collect();
+            let keys: Vec<String> = wanted
+                .iter()
+                .flat_map(|(_, ms)| ms.iter().map(|m| self.filter.legacy_key(m)))
+                .collect();
             let stored = self.stored(&keys)?;
-            let mut fresh: Vec<String> = Vec::new();
-            for (id, key) in group.iter().zip(&keys) {
-                if stored.contains(key) {
-                    self.tally.already += 1;
-                    self.tally.already_knowledge += 1;
+            let mut fresh: Vec<Vec<String>> = Vec::new();
+            for (_, ms) in wanted {
+                let known = ms
+                    .iter()
+                    .filter(|m| stored.contains(&self.filter.legacy_key(m)))
+                    .count();
+                if known == 0 {
+                    fresh.push(ms);
+                    continue;
+                }
+                let n = ms.len() as u64;
+                self.tally.already += n;
+                if checkpoint {
+                    self.tally.already_checkpoint += n;
                 } else {
-                    fresh.push(id.clone());
+                    self.tally.already_knowledge += n;
+                }
+                if known < ms.len() {
+                    self.tally.partial_groups += 1;
                 }
             }
+            let ids: Vec<String> = fresh.iter().flatten().cloned().collect();
             let mut by_id: HashMap<String, Drawer> = self
                 .reader
-                .get(&fresh)?
+                .get(&ids)?
                 .into_iter()
                 .map(|d| (d.id.clone(), d))
                 .collect();
             // In survey order: of identical memories the earliest filed is the one kept.
-            for id in &fresh {
-                if let Some(d) = by_id.remove(id)
-                    && let Some(unit) = self.take(&d)
-                {
+            for ms in &fresh {
+                let members: Vec<Drawer> = ms.iter().filter_map(|id| by_id.remove(id)).collect();
+                if let Some(unit) = self.take(&members) {
                     self.push(unit)?;
                 }
             }
-            self.done += group.len() as u64;
+            // Progress counts drawers of the palace, fragments included.
+            self.done += group
+                .iter()
+                .map(|id| survey.fragments.get(id).map_or(1, Vec::len) as u64)
+                .sum::<u64>();
             self.progress();
         }
-        self.finish_batch()
+        Ok(())
     }
 
     fn raw_pass(&mut self, since: Option<&str>) -> Result<()> {
@@ -1049,7 +1159,7 @@ impl Ctx<'_> {
                     }
                     continue;
                 }
-                if let Some(unit) = self.take(d) {
+                if let Some(unit) = self.take(std::slice::from_ref(*d)) {
                     units.push(unit);
                 }
             }
@@ -1329,6 +1439,7 @@ impl Ctx<'_> {
                 .survey
                 .knowledge_order
                 .iter()
+                .chain(self.survey.fragments.values().flatten())
                 .map(|id| self.filter.legacy_key(id))
                 .collect();
             let ends: Vec<String> = links
@@ -1454,6 +1565,7 @@ fn accounted(t: &Tally, skipped_total: u64) -> u64 {
     skipped_total
         + t.already
         + t.knowledge_duplicates
+        + t.fragments_joined
         + t.raw_collapsed
         + t.memory_drawers
         + t.chunk_drawers
@@ -1471,7 +1583,7 @@ fn failure(e: AliceError, ctx: &Ctx<'_>) -> AliceError {
     let stopped = matches!(&e, AliceError::Other(m) if m == STOPPED);
     let mut msg = format!(
         "{e}; {} drawers were stored before it ended",
-        t.memory_drawers + t.chunk_drawers + t.knowledge_duplicates
+        t.memory_drawers + t.chunk_drawers + t.knowledge_duplicates + t.fragments_joined
     );
     if !t.store_errors.is_empty() {
         msg.push_str(&format!(
@@ -1722,6 +1834,12 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     if store_warnings.len() > REPORT_LIST_CAP {
         store_warnings.truncate(REPORT_LIST_CAP);
     }
+    if tally.partial_groups > 0 {
+        warnings.push(format!(
+            "{} drawers MemPalace had cut into fragments were only partly in Alice from an earlier run; they were left as they are, and the fragments Alice lacks were not imported (import into a fresh ALICE_HOME to get them joined)",
+            tally.partial_groups
+        ));
+    }
     let already_in_alice = tally
         .store_duplicate_memories
         .saturating_sub(tally.duplicate_parts_sent);
@@ -1781,7 +1899,14 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
                 .saturating_sub(tally.already_session),
             raw_session_transcripts: tally.transcripts.len() as u64,
             raw_file_chunks: surveyed.tiers.raw_file.saturating_sub(tally.already_file),
+            checkpoint_diaries: surveyed
+                .tiers
+                .checkpoint
+                .saturating_sub(tally.already_checkpoint),
+            checkpoint_sources: tally.checkpoint_sources.len() as u64,
         },
+        fragments_joined: tally.fragments_joined,
+        fragment_groups: tally.fragment_groups,
         projects: tally.projects,
         wing_map,
         duplicates: alice_core::import::report::DuplicateCounts {

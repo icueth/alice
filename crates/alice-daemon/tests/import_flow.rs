@@ -812,7 +812,8 @@ fn diary_spec(id: &str, text: &str, wing: &str, topic: &str) -> DrawerSpec {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn diary_project_rules_and_checkpoint_weight_show_in_the_import_report_and_the_store() {
+async fn diary_project_rules_show_in_the_import_report_and_checkpoints_follow_them_into_the_raw_tier()
+ {
     let mut specs = vec![
         knowledge("k_dev", "devspace note", "devspace", "decisions"),
         knowledge("k_tsm", "tara note", "tara-stock-market", "decisions"),
@@ -841,7 +842,7 @@ async fn diary_project_rules_and_checkpoint_weight_show_in_the_import_report_and
             "wing_claude_code",
             "deployment",
         ),
-        // auto-save checkpoints: low weight, same project rules as other diaries
+        // auto-save checkpoints: raw chunks, same project rules as other diaries
         diary_spec(
             "diary_5",
             "auto-save one",
@@ -872,12 +873,16 @@ async fn diary_project_rules_and_checkpoint_weight_show_in_the_import_report_and
     assert_eq!(r.projects["tara-stock-market"].memories, 2);
     assert_eq!(r.projects["tara-valley"].memories, 1);
     assert_eq!(r.projects["devspace"].memories, 2);
-    assert_eq!(r.projects["pg-ai"].memories, 3);
+    // The checkpoints (diary_5, diary_6) are not memories: they are raw chunks of the same projects.
+    assert_eq!(r.projects["pg-ai"].memories, 2);
+    assert_eq!(r.projects["pg-ai"].chunks, 1);
     assert_eq!(
         r.projects["test"].memories, 1,
         "only the `test` wing's own drawer"
     );
-    assert_eq!(r.projects["global"].memories, 3);
+    assert_eq!(r.projects["global"].memories, 2);
+    assert_eq!(r.projects["global"].chunks, 1);
+    assert_eq!(r.tiers.checkpoint_diaries, 2);
 
     let st = f.run_import(request()).await;
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
@@ -892,8 +897,28 @@ async fn diary_project_rules_and_checkpoint_weight_show_in_the_import_report_and
     };
     assert_eq!(row("diary_1"), ("tara-stock-market".to_string(), 2));
     assert_eq!(row("diary_4"), ("global".to_string(), 2));
-    assert_eq!(row("diary_5"), ("pg-ai".to_string(), 1));
-    assert_eq!(row("diary_6"), ("global".to_string(), 1));
+    let chunk_project = |legacy: &str| -> String {
+        f.db()
+            .query_row(
+                "SELECT p.slug FROM chunks c JOIN projects p ON p.id = c.project_id WHERE c.legacy_id = ?1",
+                [legacy],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(chunk_project("diary_5"), "pg-ai");
+    assert_eq!(chunk_project("diary_6"), "global");
+    for id in ["diary_5", "diary_6"] {
+        let as_memory: i64 = f
+            .db()
+            .query_row(
+                "SELECT count(*) FROM memories WHERE legacy_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(as_memory, 0, "{id} is not a knowledge memory");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2239,4 +2264,495 @@ async fn re_review_items_resolved_by_the_owner_come_back_zero_times() {
         .await
         .unwrap();
     assert!(still_open.is_empty(), "{}", still_open.len());
+}
+
+// ------------------------------------------------------- fragments and checkpoints (follow-up 2)
+
+/// A diary drawer, or one fragment of it when `fragment` is given.
+fn diary_part(
+    base: &str,
+    fragment: Option<i64>,
+    text: &str,
+    wing: &str,
+    topic: &str,
+    filed: &str,
+) -> DrawerSpec {
+    let id = match fragment {
+        Some(n) => format!("{base}_chunk_{n:06}"),
+        None => base.to_string(),
+    };
+    DrawerSpec {
+        id,
+        text: text.into(),
+        meta: DrawerMeta {
+            wing: wing.into(),
+            room: "diary".into(),
+            agent: s("claude-code"),
+            topic: s(topic),
+            date: s(&filed[..10]),
+            filed_at: s(filed),
+            chunk_index: fragment,
+            ..Default::default()
+        },
+    }
+}
+
+const FRAGMENTED: &str = "diary_wing_claude_code_20260416_aa";
+
+fn fragmented_specs() -> Vec<DrawerSpec> {
+    let w = "wing_claude_code";
+    vec![
+        // A diary cut into three fragments (the middle one filed first), at a fixed size.
+        diary_part(
+            FRAGMENTED,
+            Some(0),
+            "Reworked the sched",
+            w,
+            "scheduler",
+            "2026-04-16T11:00:00",
+        ),
+        diary_part(
+            FRAGMENTED,
+            Some(1),
+            "uler; marmot-cobalt-4417 is the ",
+            w,
+            "scheduler",
+            "2026-04-16T10:30:00",
+        ),
+        diary_part(
+            FRAGMENTED,
+            Some(2),
+            "marker. Done.",
+            w,
+            "retro",
+            "2026-04-16T12:00:00",
+        ),
+        // A diary that was never cut, and one with a single fragment.
+        diary_part(
+            "diary_wing_claude_code_20260416_bb",
+            None,
+            "A short diary.",
+            w,
+            "short",
+            "2026-04-16T13:00:00",
+        ),
+        diary_part(
+            "diary_wing_claude_code_20260416_cc",
+            Some(0),
+            "Alone in its drawer.",
+            w,
+            "solo",
+            "2026-04-16T14:00:00",
+        ),
+    ]
+}
+
+async fn memory_count(f: &Flow) -> i64 {
+    f.count("memories").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fragments_of_a_diary_drawer_import_as_one_memory_and_a_rerun_imports_nothing() {
+    let f = Flow::with_hook(&fragmented_specs()).await;
+    let dry = f
+        .run_import(f.request().dry_run(true))
+        .await
+        .report
+        .unwrap();
+    assert_eq!((dry.fragments_joined, dry.fragment_groups), (2, 1));
+    assert_eq!(memory_count(&f).await, 0, "a dry run stores nothing");
+
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!((r.fragments_joined, r.fragment_groups), (2, 1));
+    assert_eq!(
+        r.drawers_seen, 6,
+        "five drawers and the fixture's unreadable one"
+    );
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert_eq!(r.tiers.knowledge, 5);
+    // Three memories: the joined diary, the one that was never cut, the single fragment.
+    assert_eq!(memory_count(&f).await, 3);
+    let (body, created, title): (String, String, String) = f
+        .db()
+        .query_row(
+            "SELECT body, created_at, title FROM memories WHERE legacy_id = ?1",
+            [format!("{FRAGMENTED}_chunk_000000")],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        body,
+        "Reworked the scheduler; marmot-cobalt-4417 is the marker. Done."
+    );
+    assert!(
+        created.starts_with("2026-04-16T10:30:00") || created.contains("T03:30:00"),
+        "{created}"
+    );
+    assert_eq!(title, "Diary 2026-04-16: scheduler");
+    let topics: Vec<String> = f
+        .db()
+        .prepare("SELECT topic FROM memory_topics t JOIN memories m ON m.id = t.memory_id WHERE m.legacy_id = ?1 ORDER BY topic")
+        .unwrap()
+        .query_map([format!("{FRAGMENTED}_chunk_000000")], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(topics, vec!["retro", "scheduler"]);
+    // Every fragment id leads to the one memory.
+    let head = f.legacy_target(&format!("{FRAGMENTED}_chunk_000000")).await;
+    assert!(head.as_deref().is_some_and(|t| t.starts_with("memory:")));
+    for n in 1..3 {
+        assert_eq!(
+            f.legacy_target(&format!("{FRAGMENTED}_chunk_{n:06}")).await,
+            head
+        );
+    }
+    // Single drawers are as they always were.
+    assert!(
+        f.legacy_target("diary_wing_claude_code_20260416_bb")
+            .await
+            .is_some()
+    );
+    assert!(
+        f.legacy_target("diary_wing_claude_code_20260416_cc_chunk_000000")
+            .await
+            .is_some()
+    );
+    assert!(
+        f.recall("marmot-cobalt-4417", false)
+            .await
+            .contains("marmot-cobalt-4417")
+    );
+
+    // A rerun plans nothing and stores nothing.
+    let planned = f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed);
+    let again = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(
+        f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed),
+        planned
+    );
+    assert_eq!(again.already_imported, 5);
+    assert_eq!((again.fragments_joined, again.fragment_groups), (0, 0));
+    assert_eq!(again.drawers_seen, again.drawers_accounted);
+    assert_eq!(memory_count(&f).await, 3);
+    assert!(
+        again.warnings.iter().all(|w| !w.contains("fragments")),
+        "{:?}",
+        again.warnings
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drawer_with_only_some_of_its_fragment_ids_stored_is_left_alone_and_said_so() {
+    for lost in [
+        // The tail ids are missing (a run died, or the ids were never filed) ...
+        vec![
+            format!("{FRAGMENTED}_chunk_000001"),
+            format!("{FRAGMENTED}_chunk_000002"),
+        ],
+        // ... or the first one is (a block-mode hold of the first piece in an earlier version).
+        vec![format!("{FRAGMENTED}_chunk_000000")],
+    ] {
+        let f = Flow::with_hook(&fragmented_specs()).await;
+        f.run_import(f.request()).await.report.unwrap();
+        for id in &lost {
+            f.db()
+                .execute("DELETE FROM legacy_ids WHERE legacy_id = ?1", [id])
+                .unwrap();
+        }
+        let before = memory_count(&f).await;
+        let planned = f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed);
+        let r = f.run_import(f.request()).await.report.unwrap();
+        assert_eq!(
+            memory_count(&f).await,
+            before,
+            "no second copy of its text: {lost:?}"
+        );
+        assert_eq!(
+            f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed),
+            planned
+        );
+        assert_eq!(r.already_imported, 5, "{lost:?}");
+        assert_eq!(r.drawers_seen, r.drawers_accounted);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("only partly in Alice")),
+            "{:?}",
+            r.warnings
+        );
+    }
+}
+
+fn checkpoint_specs() -> Vec<DrawerSpec> {
+    let w = "wing_claude_code";
+    vec![
+        knowledge(
+            "k_note",
+            "devspace note about the scheduler",
+            "devspace",
+            "decisions",
+        ),
+        diary_part(
+            "diary_wing_claude_code_20260416_c1",
+            None,
+            "AUTO-SAVE whole quokka-saffron-9021 state",
+            w,
+            "checkpoint",
+            "2026-04-16T09:00:00",
+        ),
+        diary_part(
+            "diary_wing_claude_code_20260416_c2",
+            Some(0),
+            "AUTO-SAVE joined pelican-",
+            w,
+            "Checkpoint ",
+            "2026-04-16T09:30:00",
+        ),
+        diary_part(
+            "diary_wing_claude_code_20260416_c2",
+            Some(1),
+            "umber-3310 state",
+            w,
+            "Checkpoint ",
+            "2026-04-16T09:30:00",
+        ),
+        diary_part(
+            "diary_wing_claude_code_20260417_c3",
+            None,
+            "AUTO-SAVE next day heron-teal-5512",
+            w,
+            "checkpoint",
+            "2026-04-17T09:00:00",
+        ),
+        diary_part(
+            "diary_wing_claude_code_20260416_d1",
+            None,
+            "A real diary about the roadmap",
+            w,
+            "roadmap",
+            "2026-04-16T15:00:00",
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_diaries_land_in_the_raw_tier_and_never_in_knowledge_hits_or_the_briefing() {
+    let f = Flow::with_hook(&checkpoint_specs()).await;
+    let dry = f
+        .run_import(f.request().dry_run(true))
+        .await
+        .report
+        .unwrap();
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    for rep in [&dry, &r] {
+        assert_eq!(rep.tiers.knowledge, 2, "the note and the real diary");
+        assert_eq!(
+            rep.tiers.checkpoint_diaries, 4,
+            "three drawers, one in two fragments"
+        );
+        assert_eq!(
+            rep.tiers.checkpoint_sources, 2,
+            "one source per wing and day"
+        );
+        assert_eq!((rep.fragments_joined, rep.fragment_groups), (1, 1));
+        assert_eq!(rep.tiers.raw_session_transcripts, 0);
+        assert_eq!(rep.drawers_seen, rep.drawers_accounted);
+    }
+    // Memories: the note and the real diary only.
+    assert_eq!(memory_count(&f).await, 2);
+    let titles: Vec<String> = f.distinct("memories", "title").await;
+    assert!(
+        titles
+            .iter()
+            .all(|t| !t.to_lowercase().contains("checkpoint")),
+        "{titles:?}"
+    );
+    // Chunks: three, in two sources, filed as sessions of the checkpoint agent.
+    assert_eq!(f.count("chunks").await, 3);
+    let sources: Vec<(String, String, Option<String>)> = f
+        .db()
+        .prepare("SELECT uri, type, agent FROM sources ORDER BY uri")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        sources,
+        vec![
+            (
+                "mempalace-checkpoint:wing_claude_code:2026-04-16".into(),
+                "session".into(),
+                Some("mempalace checkpoint".into())
+            ),
+            (
+                "mempalace-checkpoint:wing_claude_code:2026-04-17".into(),
+                "session".into(),
+                Some("mempalace checkpoint".into())
+            ),
+        ]
+    );
+    // The joined checkpoint is one chunk with the whole text; its second fragment id leads there.
+    let joined: String = f
+        .db()
+        .query_row("SELECT text FROM chunks WHERE legacy_id = 'diary_wing_claude_code_20260416_c2_chunk_000000'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(joined, "AUTO-SAVE joined pelican-umber-3310 state");
+    assert_eq!(
+        f.legacy_target("diary_wing_claude_code_20260416_c2_chunk_000001")
+            .await,
+        f.legacy_target("diary_wing_claude_code_20260416_c2_chunk_000000")
+            .await
+    );
+    assert!(
+        f.legacy_target("diary_wing_claude_code_20260416_c2_chunk_000001")
+            .await
+            .unwrap()
+            .starts_with("chunk:")
+    );
+    // Stable positions inside a source: filing order.
+    let ords: Vec<i64> = f
+        .db()
+        .prepare("SELECT c.ord FROM chunks c JOIN sources s ON s.id = c.source_id WHERE s.uri LIKE '%2026-04-16' ORDER BY c.ord")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ords, vec![0, 1]);
+
+    // Raw recall finds them; knowledge-only recall and the briefing never show them.
+    for (marker, text) in [
+        (
+            "quokka-saffron-9021",
+            "AUTO-SAVE whole quokka-saffron-9021 state",
+        ),
+        (
+            "pelican-umber-3310",
+            "AUTO-SAVE joined pelican-umber-3310 state",
+        ),
+        ("heron-teal-5512", "AUTO-SAVE next day heron-teal-5512"),
+    ] {
+        // Raw recall shows the chunk itself (as a raw hit); the answer text does not echo the query.
+        let raw = f.recall(marker, true).await;
+        assert!(
+            raw.contains("\u{b7} raw \u{b7}") && raw.contains(text),
+            "{marker} is found with raw recall: {raw}"
+        );
+        // Without `include_raw` the knowledge hits are the `results`; the checkpoint is no memory.
+        // (The answer text may still add raw excerpts when few memories match: that is the
+        // designed fallback, and it is raw, not knowledge.)
+        let knowledge = f
+            .svc
+            .recall(alice_core::api::RecallRequest {
+                query: marker.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            knowledge.results.iter().all(|h| {
+                let all = format!(
+                    "{} {} {}",
+                    h.title,
+                    h.snippet,
+                    h.body.clone().unwrap_or_default()
+                );
+                !all.contains("AUTO-SAVE")
+            }),
+            "{marker} leaked into knowledge hits"
+        );
+        let diaries = f
+            .svc
+            .recall(alice_core::api::RecallRequest {
+                query: marker.to_string(),
+                kinds: vec![alice_core::model::Kind::Diary],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            diaries.results.is_empty(),
+            "{marker}: no diary memory holds it"
+        );
+    }
+    for project in [
+        None,
+        Some("global".to_string()),
+        Some("devspace".to_string()),
+    ] {
+        let ctx = f
+            .svc
+            .context(alice_core::api::ContextRequest {
+                project,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!ctx.text.contains("AUTO-SAVE"), "{}", ctx.text);
+    }
+
+    // A rerun stores nothing more.
+    let planned = f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed);
+    let chunks = f.count("chunks").await;
+    let again = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(
+        f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed),
+        planned
+    );
+    assert_eq!(f.count("chunks").await, chunks);
+    assert_eq!(again.already_imported, 6);
+    assert_eq!(again.drawers_seen, again.drawers_accounted);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secret_cut_by_a_fragment_boundary_never_reaches_the_database() {
+    let token = concat!("gh", "p_", "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let (a, b) = token.split_at(2);
+    let w = "wing_claude_code";
+    let specs = vec![
+        diary_part(
+            "diary_wing_claude_code_20260416_s1",
+            Some(0),
+            &format!("token {a}"),
+            w,
+            "keys",
+            "2026-04-16T11:00:00",
+        ),
+        diary_part(
+            "diary_wing_claude_code_20260416_s1",
+            Some(1),
+            &format!("{b} end"),
+            w,
+            "keys",
+            "2026-04-16T11:00:00",
+        ),
+        diary_part(
+            "diary_wing_claude_code_20260416_s2",
+            Some(0),
+            &format!("auto-save {a}"),
+            w,
+            "checkpoint",
+            "2026-04-16T11:00:00",
+        ),
+        diary_part(
+            "diary_wing_claude_code_20260416_s2",
+            Some(1),
+            &format!("{b} end"),
+            w,
+            "checkpoint",
+            "2026-04-16T11:00:00",
+        ),
+    ];
+    let f = Flow::with_specs(&specs).await;
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert!(r.redacted_fields >= 2, "{}", r.redacted_fields);
+    for needle in [token, &token[..14]] {
+        assert_eq!(f.tables_holding(needle).await, Vec::<String>::new());
+    }
 }
