@@ -1128,7 +1128,7 @@ impl JevJudge {
         for (i, r) in results.iter().enumerate() {
             let k = i + 1;
             state.push('\n');
-            let bound = if r.is_raw_chunk() {
+            let bound = if r.raw {
                 super::verbal::RAW_BODY_CHARS
             } else {
                 super::verbal::BODY_CHARS
@@ -1184,6 +1184,7 @@ pub mod scenarios {
             importance: 3,
             created_at: (fixed_now() - chrono::Duration::days(days_ago)).to_rfc3339(),
             similarity: None,
+            raw: false,
         }
     }
 

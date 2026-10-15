@@ -172,6 +172,7 @@ mod tests {
             importance: 5,
             created_at: (now - chrono::Duration::days(14)).to_rfc3339(),
             similarity: None,
+            raw: false,
         };
         let b = memory_block("Existing memory 1", &m, now);
         assert!(
@@ -201,6 +202,7 @@ mod tests {
             importance: 3,
             created_at: now.to_rfc3339(),
             similarity: None,
+            raw: false,
         };
         let b = memory_block("Memory", &m, now);
         let body = b.lines().nth(2).unwrap();

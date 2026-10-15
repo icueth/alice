@@ -100,6 +100,9 @@ const NOTE_DENIED: &str =
     "the cloud policy does not let the judge see this project; this answer is the fast one";
 const NOTE_BUDGET: &str = "the judge's daily budget is spent; this answer is the fast one";
 const NOTE_UNAVAILABLE: &str = "the judge is unavailable; this answer is the fast one";
+const NOTE_UNEXPECTED: &str =
+    "the judge's answer did not match the results sent; this answer is the fast one";
+const NOTE_NO_GRADES: &str = "the judge gave no grade; this answer is the fast one";
 const NOTE_BUSY: &str = "the judge is busy with other recalls; this answer is the fast one";
 const NOTE_SLOW: &str =
     "the judge did not answer within search.precise_timeout_ms; this answer is the fast one";
@@ -1459,7 +1462,6 @@ impl Service {
         let mut why: Option<String> = None;
         if judge.provider() == "heuristic" {
             why = Some(NOTE_NO_MODEL_JUDGE.into());
-        } else if false {
         }
         let near = std::mem::take(&mut out.near);
         let window = out.hits.len().min(PRECISE_TOP);
@@ -1502,6 +1504,7 @@ impl Service {
                 importance,
                 created_at: h.created_at.clone(),
                 similarity: None,
+                raw: h.tier == Tier::Raw,
             };
             let mut shown: Vec<(usize, JudgeMemory)> = Vec::new();
             let mut ordinal = 0;
@@ -1541,25 +1544,25 @@ impl Service {
                     }
                 };
                 if let Some(permit) = permit {
-                    let probe = permit.is_probe();
                     let (q, p) = (query.to_string(), query_project.to_string());
                     let ms: Vec<JudgeMemory> = shown.iter().map(|(_, m)| m.clone()).collect();
                     let asked = tokio::time::timeout(
                         budget,
                         tokio::task::spawn_blocking(move || {
-                            // The slot is freed when the judge call ends, not when the recall stops
-                            // waiting for it.
-                            let _permit = permit;
-                            judge.grade_relevance_within(&p, &q, &ms, budget)
+                            // The permit goes with the call: the slot is freed, and the outcome
+                            // recorded, when the judge call ends, whether or not this recall is
+                            // still waiting for it (its future may have been dropped).
+                            let mut permit = permit;
+                            let r = judge.grade_relevance_within(&p, &q, &ms, budget);
+                            // Budget and Denied are answers; a failure is not.
+                            permit.settle(matches!(
+                                &r,
+                                Ok(_) | Err(JudgeError::Budget(_) | JudgeError::Denied)
+                            ));
+                            r
                         }),
                     )
                     .await;
-                    // Budget and Denied are answers; a deadline or a failure is not.
-                    let answered = matches!(
-                        &asked,
-                        Ok(Ok(Ok(_) | Err(JudgeError::Budget(_) | JudgeError::Denied)))
-                    );
-                    self.precise_gate.finish(probe, answered);
                     match asked {
                         Ok(Ok(Ok(grades))) if grades.len() == shown.len() => {
                             // (index, P(relevant)) of what was graded; near-floor candidates
@@ -1578,6 +1581,9 @@ impl Service {
                             }
                             graded.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
                             reranked = !graded.is_empty();
+                            if graded.is_empty() {
+                                why = Some(NOTE_NO_GRADES.into());
+                            }
                             let rescued = graded.iter().filter(|(i, _)| *i >= near_start).count();
                             // The near-floor candidates join the list after the search's own
                             // hits, so that `reorder` finds them by index.
@@ -1617,7 +1623,8 @@ impl Service {
                             out = reorder(out, &order);
                         }
                         Ok(Ok(Ok(_))) => {
-                            tracing::warn!("the judge graded another number of results")
+                            tracing::warn!("the judge graded another number of results");
+                            why = Some(NOTE_UNEXPECTED.into());
                         }
                         Ok(Ok(Err(e))) => {
                             tracing::debug!(error = %e, "precise recall: the judge did not grade; the search order stands");
@@ -8138,7 +8145,14 @@ mod tests {
             &cwd,
         )
         .await;
-        remember_id(&s, "deploy notes second", Some(Kind::Howto), &cwd).await;
+        // A memory whose title merely starts like a raw chunk's is still a memory.
+        remember_id(
+            &s,
+            &format!("raw · x deploy notes\n{}", "w".repeat(5_000)),
+            Some(Kind::Howto),
+            &cwd,
+        )
+        .await;
         ingest_raw(
             &s,
             "long",
@@ -8156,6 +8170,11 @@ mod tests {
         assert!(!state.contains(&"y".repeat(2_000)));
         assert!(state.contains(&"z".repeat(670)), "memory: 700 characters");
         assert!(!state.contains(&"z".repeat(700)));
+        assert!(state.contains(&"w".repeat(650)));
+        assert!(
+            !state.contains(&"w".repeat(700)),
+            "a memory titled like a raw chunk keeps 700 characters"
+        );
     }
 
     /// A rescued raw chunk of a recall that did not ask for raw results is labelled and packed
@@ -8208,5 +8227,57 @@ mod tests {
         let text = text.text.unwrap();
         assert!(text.contains("raw"), "{text}");
         assert!(text.contains("OKAPI rollout"), "{text}");
+    }
+
+    // ------------------------------------------------------- Task 21 fix round 2
+
+    /// R-1: a recall dropped while its probe is out (a client that disconnects) cannot leave
+    /// the breaker stuck: the call still ends and settles, and a later recall closes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_probing_recall_does_not_leave_the_breaker_stuck() {
+        let base = std::time::Instant::now();
+        let offset = Arc::new(Mutex::new(Duration::ZERO));
+        let clock: crate::precise_gate::Clock = {
+            let offset = offset.clone();
+            Arc::new(move || base + *offset.lock())
+        };
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader_clock(t.clone(), Some(clock)).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        t.fail_grading.store(true, Ordering::SeqCst);
+        for i in 0..3 {
+            s.recall(precise_q(&format!("deploy notes {i}"), &cwd))
+                .await
+                .unwrap();
+        }
+        assert_eq!(t.graded(), 3, "the breaker is open now");
+        // The judge works again, slowly; a minute later the probe starts and is dropped.
+        t.fail_grading.store(false, Ordering::SeqCst);
+        t.grading_delay_ms.store(600, Ordering::SeqCst);
+        *offset.lock() = Duration::from_secs(61);
+        let probing = {
+            let (s, cwd) = (s.clone(), cwd.clone());
+            tokio::spawn(async move { s.recall(precise_q("deploy notes 3", &cwd)).await })
+        };
+        for _ in 0..100 {
+            if t.graded() == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(t.graded(), 4, "the probe is out");
+        probing.abort();
+        let _ = probing.await;
+        // While the dropped probe's call is still running, no other recall probes.
+        let r = s.recall(precise_q("deploy notes 4", &cwd)).await.unwrap();
+        assert_eq!(t.graded(), 4);
+        assert!(!r.reranked);
+        // The call ends and settles as a success: the breaker is closed.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        t.grading_delay_ms.store(0, Ordering::SeqCst);
+        let r = s.recall(precise_q("deploy notes 5", &cwd)).await.unwrap();
+        assert!(r.reranked, "{:?}", r.notes);
+        assert_eq!(t.graded(), 5);
     }
 }

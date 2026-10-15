@@ -293,6 +293,7 @@ fn mem(
         importance: v["importance"].as_u64().unwrap_or(3) as u8,
         created_at: (now - chrono::Duration::days(v["days_ago"].as_i64().unwrap())).to_rfc3339(),
         similarity: sim,
+        raw: false,
     }
 }
 

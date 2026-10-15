@@ -150,11 +150,8 @@ pub struct Score {
     pub confidence: f64,
 }
 
-/// The start of the title of a raw transcript chunk (`raw · <source>`).
-pub const RAW_TITLE_PREFIX: &str = "raw · ";
-
-/// A memory as a judge sees it. (A raw chunk is shown as a `note` whose title starts with
-/// [`RAW_TITLE_PREFIX`]: the item header takes a memory kind, and there is no other one.)
+/// A memory as a judge sees it. (A raw chunk is shown as a `note` marked by `raw`: the item
+/// header takes a memory kind, and there is no other one.)
 #[derive(Debug, Clone, PartialEq)]
 pub struct JudgeMemory {
     pub id: String,
@@ -167,14 +164,9 @@ pub struct JudgeMemory {
     pub created_at: String,
     /// Cosine similarity to the memory it is compared with, when known.
     pub similarity: Option<f32>,
-}
-
-impl JudgeMemory {
-    /// True for a raw transcript chunk, which a recall grading shows up to
-    /// [`verbal::RAW_BODY_CHARS`] characters of.
-    pub fn is_raw_chunk(&self) -> bool {
-        self.title.starts_with(RAW_TITLE_PREFIX)
-    }
+    /// A raw transcript chunk, not a memory: a recall grading shows up to
+    /// [`verbal::RAW_BODY_CHARS`] characters of it.
+    pub raw: bool,
 }
 
 /// How a new memory relates to one existing memory: P over `RelationKind` names.
