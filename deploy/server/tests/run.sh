@@ -52,13 +52,19 @@ echo "systemctl $*" >>"$ALICE_SERVER_ROOT/calls.log"
 if [ "${1:-}" = enable ] && [ "${2:-}" = --now ]; then
   n="${3#alice@}"
   mkdir -p "$ALICE_SERVER_ROOT/srv/alice/$n"
-  printf 'tok-%s-0123456789abcdef0123456789abcdef\n' "$n" >"$ALICE_SERVER_ROOT/srv/alice/$n/token"
+  [ -z "${NO_TOKEN:-}" ] && printf 'tok-%s-0123456789abcdef0123456789abcdef\n' "$n" >"$ALICE_SERVER_ROOT/srv/alice/$n/token"
 fi
 exit 0
 EOF
 stub caddy <<'EOF'
 echo "caddy $*" >>"$ALICE_SERVER_ROOT/calls.log"
-if [ "${1:-}" = validate ]; then exit "${CADDY_FAIL:-0}"; fi
+if [ "${1:-}" = validate ]; then
+  if [ -f "$ALICE_SERVER_ROOT/caddy-fail-first" ]; then rm -f -- "${ALICE_SERVER_ROOT:?}/caddy-fail-first"; exit 1; fi
+  n=$(($(cat "$ALICE_SERVER_ROOT/vcount" 2>/dev/null || echo 0) + 1)); echo "$n" >"$ALICE_SERVER_ROOT/vcount"
+  # CADDY_FAIL_FROM=n fails the n-th and later validations (n=2: the Caddyfile passes, the route is refused)
+  if [ -n "${CADDY_FAIL_FROM:-}" ] && [ "$n" -ge "$CADDY_FAIL_FROM" ]; then exit 1; fi
+  exit "${CADDY_FAIL:-0}"
+fi
 exit 0
 EOF
 stub curl <<'EOF'
@@ -192,7 +198,8 @@ bad_names_are_refused() {
 }
 
 caddy_failure_rolls_back() {
-  CADDY_FAIL=1 run add carl
+  rm -f -- "${R:?}/vcount"
+  CADDY_FAIL_FROM=2 run add carl
   [ "$RC" != 0 ] || fail "add carl succeeded with a failing caddy"
   [ ! -e "$TENANTS/carl.env" ] || fail "carl.env left behind"
   [ ! -e "$R/etc/caddy/alice.d/carl.caddy" ] || fail "carl.caddy left behind"
@@ -240,18 +247,17 @@ list_shows_and_warns() {
 }
 
 PALACE="$T/palace-src"
-make_palace() { rm -rf -- "${PALACE:?}"; mkdir -p "$PALACE"; echo drawer >"$PALACE/drawer.txt"; }
+make_palace() { rm -rf -- "${PALACE:?}"; mkdir -p "$PALACE"; echo drawer >"$PALACE/drawer.txt"; echo db >"$PALACE/chroma.sqlite3"; }
 
 import_moves_runs_and_cleans() {
   make_palace
   rm -f -- "${R:?}/import-seen"
-  run import ann "$PALACE" --dry-run
+  run import ann "$PALACE"
   [ "$RC" = 0 ] || fail "import exited $RC: $OUT"
   printf '%s\n' "$OUT" | grep -qF 'import report: ok' || fail "report not printed"
   has "$R/import-seen" "palace=$SRV/ann/import-inbox/"
   has "$R/import-seen" '/palace present=yes'
   has "$R/calls.log" 'import mempalace --palace '
-  has "$R/calls.log" '--dry-run'
   has "$R/calls.log" 'sudo -u alice-ann env ALICE_HOME='
   has "$R/calls.log" 'chown -R alice-ann:alice-ann'
   [ ! -e "$PALACE" ] || fail "the original palace path still exists"
@@ -345,6 +351,87 @@ refuses_to_run_with_empty_roots() {
   pass
 }
 
+dry_run_import_keeps_the_source() {
+  make_palace
+  run import ann "$PALACE" --dry-run
+  [ "$RC" = 0 ] || fail "dry-run exited $RC: $OUT"
+  has "$R/import-seen" '/palace present=yes'
+  has "$R/calls.log" '--dry-run'
+  [ -f "$PALACE/drawer.txt" ] || fail "the dry run consumed the source"
+  [ -z "$(ls -A "$SRV/ann/import-inbox")" ] || fail "job folder left behind"
+  pass
+}
+
+import_refuses_a_tenant_home() {
+  echo db >"$SRV/ann/chroma.sqlite3"
+  echo x >"$SRV/ann/marker"
+  run import ann "$SRV/ann"
+  [ "$RC" != 0 ] || fail "imported a tenant home"
+  run import ann "$SRV/ann/import-inbox/.."
+  [ "$RC" != 0 ] || fail "imported a tenant home through .."
+  mkdir -p "$SRV/bob"; echo db >"$SRV/bob/chroma.sqlite3"; echo x >"$SRV/bob/marker"
+  run import ann "$SRV/bob"
+  [ "$RC" != 0 ] || fail "imported another tenant's home"
+  [ -f "$SRV/ann/marker" ] && [ -f "$SRV/bob/marker" ] || fail "a home was moved or deleted"
+  run import ann "$SRV"
+  [ "$RC" != 0 ] || fail "imported the whole srv"
+  rm -f -- "${SRV:?}/ann/chroma.sqlite3" "${SRV:?}/ann/marker"
+  rm -rf -- "${SRV:?}/bob"
+  pass
+}
+
+import_refuses_root_and_system_dirs() {
+  local d
+  for d in / // /usr /etc /var/lib /root /home "$R/etc/alice" "$R/etc/alice/"; do
+    run import ann "$d"
+    [ "$RC" != 0 ] || fail "import of $d succeeded"
+  done
+  [ -d /usr ] && [ -d /etc ] || fail "unexpected"
+  pass
+}
+
+import_refuses_a_non_palace() {
+  mkdir -p "$T/not-a-palace"; echo x >"$T/not-a-palace/file"
+  run import ann "$T/not-a-palace"
+  [ "$RC" != 0 ] || fail "imported a non-palace"
+  [ -f "$T/not-a-palace/file" ] || fail "the non-palace was moved"
+  pass
+}
+
+add_restores_the_caddyfile_when_validation_fails() {
+  printf 'old caddyfile\n' >"$R/etc/caddy/Caddyfile"
+  cp "$R/etc/caddy/Caddyfile" "$T/caddyfile.before"
+  : >"$R/caddy-fail-first"
+  run add frank
+  [ "$RC" != 0 ] || fail "add succeeded though validation failed"
+  cmp "$T/caddyfile.before" "$R/etc/caddy/Caddyfile" || fail "the Caddyfile was not restored"
+  [ ! -e "$TENANTS/frank.env" ] || fail "a tenant was created"
+  ls "$R/etc/caddy"/Caddyfile.prev-run.* >/dev/null 2>&1 && fail "temporary copy left behind"
+  pass
+}
+
+add_reloads_after_removing_the_snippet() {
+  local before after
+  before=$(grep -c 'systemctl reload caddy' "$R/calls.log" || true)
+  NO_TOKEN=1 run add gina
+  [ "$RC" != 0 ] || fail "add succeeded without a token"
+  after=$(grep -c 'systemctl reload caddy' "$R/calls.log" || true)
+  [ "$((after - before))" -ge 2 ] || fail "Caddy was not reloaded after the rollback ($before -> $after)"
+  [ ! -e "$R/etc/caddy/alice.d/gina.caddy" ] || fail "the snippet is still there"
+  [ ! -e "$TENANTS/gina.env" ] || fail "tenant file left behind"
+  pass
+}
+
+test_hooks_are_ignored_without_a_test_root() {
+  # Without ALICE_SERVER_ROOT the SRV override must be ignored: the script reaches its usage error (exit 2)
+  # instead of refusing an empty SRV (exit 1). "bogus" exits before any action.
+  RC=0
+  OUT=$(ALICE_SERVER_ROOT="" ALICE_SERVER_SRV_DIR="" ALICE_PING_TIMEOUT=0 /bin/bash "$SCRIPT" bogus 2>&1) || RC=$?
+  [ "$RC" = 2 ] || fail "expected the usage exit 2, got $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -q 'SRV' && fail "the SRV override was honoured"
+  pass
+}
+
 remove_archives_then_deletes() {
   run remove ann </dev/null
   [ "$RC" != 0 ] || fail "remove without confirmation succeeded"
@@ -363,7 +450,9 @@ for CURRENT in \
   add_creates_everything add_is_idempotent ports_skip_used bad_names_are_refused \
   caddy_failure_rolls_back snippet_routes_mcp add_prints_the_mcp_url rotate_prints_a_new_token \
   list_shows_and_warns import_moves_runs_and_cleans import_cleans_on_failure \
-  import_refuses_a_missing_palace import_refuses_an_unknown_tenant cli_runs_as_the_tenant \
+  import_refuses_a_missing_palace import_refuses_an_unknown_tenant dry_run_import_keeps_the_source \
+  import_refuses_a_tenant_home import_refuses_root_and_system_dirs import_refuses_a_non_palace \
+  add_restores_the_caddyfile_when_validation_fails add_reloads_after_removing_the_snippet test_hooks_are_ignored_without_a_test_root cli_runs_as_the_tenant \
   cli_refuses_a_secret_in_argv upgrade_rolls_back_on_a_failed_ping upgrade_installs_and_keeps_prev \
   refuses_to_run_with_empty_roots remove_archives_then_deletes; do
   "$CURRENT"
