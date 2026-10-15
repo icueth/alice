@@ -395,7 +395,11 @@ impl Flow {
             Some(user_models) => {
                 home.ensure_dirs().unwrap();
                 let dest = alice_embed::model_dir(&home.models_dir());
-                std::os::unix::fs::symlink(alice_embed::model_dir(user_models), &dest).unwrap();
+                let src = alice_embed::model_dir(user_models);
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&src, &dest).unwrap();
+                #[cfg(not(unix))]
+                copy_dir_all(&src, &dest);
                 assert!(
                     alice_embed::is_model_present(&home.models_dir()),
                     "the e5 model is not in ~/.alice/models"
@@ -689,6 +693,21 @@ async fn alice_beats_mempalace_on_the_gold_set() {
         let (a, b) = (alice.by_cat.get(c), base.by_cat.get(c));
         if let (Some(a), Some(b)) = (a, b) {
             assert!(a.ndcg_at_10 + 0.05 >= b.ndcg_at_10, "{c} regressed");
+        }
+    }
+}
+
+/// Windows has no unprivileged symlinks: stand the model directory in by copying it.
+#[cfg(not(unix))]
+fn copy_dir_all(src: &Path, dest: &Path) {
+    std::fs::create_dir_all(dest).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let to = dest.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_all(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).unwrap();
         }
     }
 }

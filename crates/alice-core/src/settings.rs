@@ -3952,13 +3952,12 @@ mod tests {
                 "{key}: {toml}"
             );
         }
-        for dir in ["backups/../backups"] {
-            assert!(
-                tenant_errors(&format!("[backup]\ndir = \"{dir}\"\n"), &home, false)
-                    .contains(&"backup.dir".to_string()),
-                "{dir}"
-            );
-        }
+        let dir = "backups/../backups";
+        assert!(
+            tenant_errors(&format!("[backup]\ndir = \"{dir}\"\n"), &home, false)
+                .contains(&"backup.dir".to_string()),
+            "{dir}"
+        );
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("/nonexistent/x", home.join("dangling")).unwrap();
