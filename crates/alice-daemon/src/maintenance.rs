@@ -933,7 +933,13 @@ impl Scheduler {
             )?;
             let mut ids = std::collections::HashSet::new();
             for p in stmt.query_map([], |r| r.get::<_, String>(0))? {
-                let v: serde_json::Value = serde_json::from_str(&p?).unwrap_or_default();
+                let p = p?;
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&p) else {
+                    tracing::warn!(
+                        "merge suggestions: an open merge item has a malformed payload; skipped"
+                    );
+                    continue;
+                };
                 ids.extend(v["survivor"].as_str().map(str::to_string));
                 for o in v["others"].as_array().into_iter().flatten() {
                     ids.extend(o.as_str().map(str::to_string));

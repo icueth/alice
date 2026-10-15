@@ -215,15 +215,11 @@ pub fn build(
     };
     b.section("Last handoff", LAST_HANDOFF, &[&pid], 1, handoff)?;
     b.section("Warnings", WARNINGS, &[&pid], 5, line)?;
-    let has_key: bool = conn
-        .prepare_cached(&format!(
-            "SELECT EXISTS(SELECT 1 FROM memories WHERE project_id = ?1 AND {} AND {LIVE})",
-            KEY_MEMORIES.0
-        ))?
-        .query_row([pid], |r| r.get(0))?;
-    if has_key {
-        b.section("Key memories", KEY_MEMORIES, &[&pid], 8, line)?;
-    } else {
+    // Key memories that would render empty (none of importance 4 and up, or the warnings took
+    // them all) are replaced by the project's best of importance 3.
+    let before = b.out.len();
+    b.section("Key memories", KEY_MEMORIES, &[&pid], 8, line)?;
+    if b.out.len() == before {
         b.section(
             "Key memories",
             FALLBACK_KEY_MEMORIES,

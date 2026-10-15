@@ -117,9 +117,20 @@ const NEAR_FLOOR_BAND: f32 = 0.03;
 /// `jev_eval.rs`).
 const RESCUE_ANSWERS_MIN: f64 = 0.5;
 
+/// Whether `hay` holds `needle` with no letter, digit or `_` on either side.
+fn contains_bounded(hay: &str, needle: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    hay.match_indices(needle).any(|(i, m)| {
+        !hay[..i].chars().next_back().is_some_and(word)
+            && !hay[i + m.len()..].chars().next().is_some_and(word)
+    })
+}
+
 /// Whether `hit` holds, verbatim (ignoring case) in its title, snippet or body, a distinctive
-/// token of `query` (6 or more characters with a digit, `-`, `_` or `.`: a code, id, marker or
-/// version) or the whole `query` as a phrase. Such a hit is no "nothing found".
+/// token of `query` (6 or more characters with a digit or a `_`: a code, id or identifier;
+/// not an ordinary hyphenated word or filename) or the whole `query` as a phrase (3 or more
+/// words; a query without spaces, as in Thai, 12 or more characters). Words and tokens match on
+/// boundaries. Such a hit is no "nothing found".
 fn exact_match(query: &str, hit: &alice_core::api::Hit) -> bool {
     let hay = format!(
         "{}\n{}\n{}",
@@ -129,18 +140,18 @@ fn exact_match(query: &str, hit: &alice_core::api::Hit) -> bool {
     )
     .to_lowercase();
     let whole = query.trim().to_lowercase();
-    if !whole.is_empty() && hay.contains(&whole) {
-        return true;
-    }
-    whole
-        .split_whitespace()
-        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
-        .filter(|t| {
-            t.chars().count() >= 6
-                && t.chars()
-                    .any(|c| c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
-        })
-        .any(|t| hay.contains(t))
+    let words = whole.split_whitespace().count();
+    let phrase = if words >= 3 {
+        contains_bounded(&hay, &whole)
+    } else {
+        words == 1 && whole.chars().count() >= 12 && hay.contains(&whole)
+    };
+    phrase
+        || whole
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+            .filter(|t| t.chars().count() >= 6 && t.chars().any(|c| c.is_ascii_digit() || c == '_'))
+            .any(|t| contains_bounded(&hay, t))
 }
 
 /// Said in a recall answer when its query was not sent to a remote embedding provider.
@@ -7461,8 +7472,8 @@ mod tests {
         assert!(text.reranked && text.text.unwrap().contains("ZEBRA"));
     }
 
-    /// The same words as the notes, but not as a phrase: a vague question.
-    const VAGUE: &str = "notes deploy";
+    /// A vague two-word question: as a phrase it is too short to count as an exact match.
+    const VAGUE: &str = "deploy notes";
     const NOTHING_ANSWERS: &str = "nothing found clearly answers this; the closest matches follow";
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7558,16 +7569,49 @@ mod tests {
         );
         assert!(!marker.low_confidence, "{:?}", marker.notes);
         assert!(marker.notes.iter().all(|n| n != NOTHING_ANSWERS));
-        // The whole query as a phrase counts too.
-        let phrase = s
-            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
-            .await
-            .unwrap();
-        assert!(
-            phrase.reranked && !phrase.low_confidence,
-            "{:?}",
-            phrase.notes
+    }
+
+    fn hit_with(title: &str, body: &str) -> alice_core::api::Hit {
+        alice_core::api::Hit {
+            id: "x".into(),
+            tier: Tier::Knowledge,
+            kind: None,
+            project: "p".into(),
+            title: title.into(),
+            snippet: String::new(),
+            body: Some(body.into()),
+            created_at: String::new(),
+            score: 0.0,
+            relevance: None,
+            matched: vec![],
+            status: None,
+        }
+    }
+
+    #[test]
+    fn exact_match_needs_a_real_phrase_or_a_distinctive_token() {
+        let h = hit_with(
+            "capital follow-up",
+            "the capital city, readme.md and auto-save; deploy notes here; deploy the staging cluster today; merge_suggestions ran; marmot-cobalt-4417",
         );
+        // Short queries are no exact match, even when they occur in the text.
+        assert!(!exact_match("api", &h));
+        assert!(!exact_match("deploy notes", &h));
+        assert!(!exact_match("capital", &h));
+        // Ordinary hyphenated words and filenames are not distinctive tokens.
+        assert!(!exact_match("follow-up", &h));
+        assert!(!exact_match("auto-save", &h));
+        assert!(!exact_match("readme.md", &h));
+        // A code with a digit, or an identifier with `_`, is.
+        assert!(exact_match("marmot-cobalt-4417", &h));
+        assert!(exact_match("what is merge_suggestions", &h));
+        // Three words found verbatim, on word boundaries.
+        assert!(exact_match("deploy the staging cluster", &h));
+        assert!(!exact_match("eploy the staging", &h));
+        // No spaces (Thai): 12 characters or more as a substring.
+        let th = hit_with("บันทึก", "ระบบความจำสำหรับเอเจนต์");
+        assert!(exact_match("ความจำสำหรับเอเจนต์", &th));
+        assert!(!exact_match("ความจำ", &th));
     }
 
     #[tokio::test(flavor = "multi_thread")]
