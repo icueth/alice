@@ -69,9 +69,14 @@ task numbering:
 | 3 | **23**: direct MCP — the handlers' project identity, the Caddy emulator, end-to-end MCP tests | new |
 | 4 | **24**: admin import — the tenant's `import-inbox/` rule, the disk rule, an in-process import test | new |
 | 5 | **17**: `alice-server`, as amended below (the MCP route, `import`, `cli`) | amended |
-| 6 | **18**: documentation, as amended below | amended |
-| 7 | **19**: merge both heads, run the gates (no Windows), the opus review | unchanged |
-| 8 | **20**: deployment, as amended below — STOP for the controller's go | amended |
+| 6 | **25**: the project hint survives the spool; project names capped (controller-ordered defects) | new |
+| 7 | **26**: team link and the `--team-store` role (addendum 3) | new |
+| 8 | **27**: shared writes and the rules for changing shared memories (addendum 3) | new |
+| 9 | **28**: the read merge — `recall` and `context` with team hits (addendum 3) | new |
+| 10 | **29**: `alice-server add --team` and provisioning (addendum 3) | new |
+| 11 | **18**: documentation, as amended below (plus the team memory) | amended |
+| 12 | **19**: merge both heads, run the gates (no Windows), the opus review | unchanged |
+| 13 | **20**: deployment, as amended below (the team store first) — STOP for the controller's go | amended |
 | — | 7–12 | **deferred**, the remote client; only if the owner asks |
 | — | 13–16 | **dropped**, the import bundle; Task 24 and the amended Task 17 replace it |
 
@@ -3180,6 +3185,13 @@ git commit -m "docs: server mode — admin and person guides, disk budget, trust
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
+**Addendum 3 amendment to Task 18:** `docs/server.md` (and the Thai section) describe the shared team memory:
+- how a person asks for it ("save this to the shared memory");
+- that every team member can read it;
+- that only the author or the admin can change it;
+- that the team store has no URL of its own;
+- that the admin creates it with `alice-server add --team team`.
+
 **Addendum 2 amendments to Task 18:**
 - `docs/server.md`'s main path **for a person** is direct MCP:
   - the URL `https://<host>/u/<name>/mcp?project=<slug>`;
@@ -3235,6 +3247,9 @@ exactly:
   handover is the controller's.
 
 Report every measurement (RAM, disk before and after each step, RSS per tenant) to the controller.
+
+**Addendum 3 amendment to Task 20:** create the `team` store first (`alice-server add --team team`), then the test
+tenants. Run spec §8.3 step 9b, then remove the test tenants. The real four are created on the controller's go.
 
 **Addendum 2 amendments to Task 20:** follow spec §8.3 as amended.
 - **Step 8b, direct MCP from this Mac.** Run Claude Code in a scratch folder:
@@ -3495,3 +3510,230 @@ Local mode is unchanged.
   - `cargo fmt --all --check`.
 - [ ] **Step 5: Commit:**
   `feat(import): a server tenant imports only from its import-inbox, with a disk guard (addendum 2)`.
+
+---
+
+### Task 25: The project hint survives the server's spool; project names are capped (controller-ordered defects)
+
+Context: Tasks 22-23 added `project_hint` (`#[serde(skip)]`) on `RecallRequest`, `RememberRequest`, `ContextRequest`,
+`IngestRequest` and `compat::CompatCall`; in tenant mode `Service::choose` resolves it (existing slug/alias, else a
+placeholder `import:<slug>`), and the MCP handlers set it from `?project=` or the first root's basename
+(`mcp.rs` `hint_and_cwd`). Two defects:
+
+**Defect 1 — the hint is lost in the daemon's own spool.** While a tenant's database is read-only,
+`Service::remember_or_spool` writes the (redacted) request to `spool/` with serde; `#[serde(skip)]` drops the hint, so on
+drain the memory lands in `global`. Fix (controller ruling):
+- `project_hint` on the four requests and on `CompatCall` becomes
+  `#[serde(default, skip_serializing_if = "Option::is_none")]` (keep `#[schemars(skip)]` on the requests), so a spool entry
+  keeps it and an old entry without the field still parses.
+- The hint must still never come from the wire: every HTTP API handler in `crates/alice-daemon/src/http.rs` that accepts
+  one of those request types or a `CompatCall` sets `project_hint = None` on entry (remember, recall, context, ingest,
+  compat call — check for any other handler deserialising these types). Only in-process callers (the MCP handlers) set it.
+- Tests (each must fail before the fix — record RED):
+  - service test: a tenant service with `force_read_only(..)` (the helper used by
+    `a_read_only_spool_holds_the_redacted_request_and_block_mode_refuses`); `remember_or_spool` with
+    `project_hint: Some("Hinted App")` is spooled; the spool file contains the hint; after the read-only state is cleared
+    and the spool drained (follow how the existing read-only/spool tests do it), the memory's project is `hinted-app`, not
+    `global`.
+  - http test (in `crates/alice-daemon/tests/http_api.rs` or `tests/server_mode.rs`): a tenant daemon; `POST
+    /api/v1/remember` with a JSON body containing `"project_hint": "sneaky"` stores into `global` (the hint is ignored on
+    the wire), and no project `sneaky` exists.
+
+**Defect 2 — `?project=` is uncapped.** Add to `alice_core::model::limits`:
+`pub const MAX_PROJECT_SLUG_CHARS: usize = 100;` and `pub const MAX_PROJECT_NAME_CHARS: usize = 200;` (doc comments: a
+slug longer than GitHub's 100-character repository-name limit cannot be a detected project; a name up to 200 characters,
+as `ClientProject.name`). Apply them (controller ruling):
+- MCP `?project=` value: if its trimmed length exceeds `MAX_PROJECT_NAME_CHARS` chars, or its slugified form exceeds
+  `MAX_PROJECT_SLUG_CHARS` chars, the tool call fails with an invalid-params error naming the limit (never echoing the
+  value). Do this in `hint_and_cwd` (or where the query is read) so the agent sees it.
+- Root basename: over either limit → dropped (no hint; falls through to `global`), never an error.
+- `Service::choose`, tenant hint step: defensively refuse a hint over either limit with `AliceError::Invalid` (same
+  message shape).
+- Explicit `project` argument (`explicit_slug`): longer than `MAX_PROJECT_SLUG_CHARS` → `AliceError::Invalid("project names are at most 100 characters")`
+  (do not echo it). Apply in `Service::choose` before the lookup.
+- `ClientProject::validate` (alice-core api.rs): slug longer than `MAX_PROJECT_SLUG_CHARS` → refused; name already capped
+  at 200 — switch it to the constant.
+- Tests (RED first): a 101-character slug in `?project=` → the MCP tool call errors and nothing is stored (through the
+  Caddy emulator in `tests/server_mode.rs`, reusing its helpers); a 100-character one works; a root basename of 150
+  characters → stored in `global`, no error; an explicit `project` of 101 characters → invalid; `ClientProject` with a
+  101-character slug → `validate` error.
+
+Checks before committing (prefix from global-constraints.md, one at a time): `cargo test -p alice-core client_project`,
+`cargo test -p alice-daemon --lib`, `cargo test -p alice-daemon --test server_mode`, `cargo test -p alice-daemon --test
+http_api`, `cargo test -p alice-daemon --test mcp`, `cargo clippy --locked --workspace --all-targets -j 4 -- -D warnings`,
+`cargo fmt --all --check`.
+
+Commit (stage by name; never `.superpowers/`): `fix(server): the project hint survives the daemon's spool; project names
+are capped at 100/200 characters`, trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+
+---
+
+### Task 26: The team link and the team-store role (addendum 3)
+
+**Files:**
+- Create: `crates/alice-daemon/src/team.rs` (`TeamLink`)
+- Modify:
+  - `crates/alice-core/src/settings.rs`: `ALICE_TEAM_URL` and `ALICE_TENANT_NAME` join `NON_SETTING_ENV`;
+  - `crates/alice-daemon/src/daemon.rs` and `crates/alice/src/cmd.rs`: `daemon run --team-store` → `DaemonOptions::team_store` → `ServiceOptions::team_store`;
+  - `crates/alice-daemon/src/http.rs`: Task 25's hint clearing is skipped when `svc.is_team_store()`;
+  - `crates/alice-daemon/src/service.rs`: it holds `Option<Arc<TeamLink>>`, built at start, and `tenant_name: Option<String>` from `ALICE_TENANT_NAME`. Health reports a link problem.
+- Test: in-file tests of `team.rs`; `tests/server_mode.rs` (the emulator gains a team daemon with no route).
+
+**Interfaces** (produced; later tasks use these exact names):
+
+```rust
+pub struct TeamLink { /* url, token file path, reqwest client (no proxy, no redirects), verified: Mutex<Option<String /*instance*/>> */ }
+impl TeamLink {
+    /// From `ALICE_TEAM_URL` (loopback http only) and `<home>/team.token`; `Err(reason)` disables the link.
+    pub fn from_env(home: &AliceHome, url: Option<&str>) -> Result<Option<Arc<TeamLink>>, String>;
+    /// Ping with a fresh nonce, check `service == "alice"`, verify the proof with the token (re-read from the file) and the
+    /// answer's instance; cached until a call fails with 401 or a transport error.
+    pub async fn ensure_verified(&self) -> alice_core::error::Result<()>;
+    /// POST/GET a JSON API path on the team store with the bearer token, after `ensure_verified`; a 401 or transport error
+    /// clears the verification so the next call re-reads the token.
+    pub async fn call<Req: Serialize + ?Sized, Resp: DeserializeOwned>(&self, method: reqwest::Method, path: &str, body: Option<&Req>, timeout: Duration) -> alice_core::error::Result<Resp>;
+}
+// ServiceOptions: `pub team_store: bool`, `pub team_url: Option<String>`, `pub tenant_name: Option<String>` (the daemon fills
+// them from DaemonOptions / the environment; tests set them directly). Service: `pub fn team(&self) -> Option<&Arc<TeamLink>>`,
+// `pub fn is_team_store(&self) -> bool`, `pub fn tenant_name(&self) -> Option<&str>`.
+```
+
+**Tests:**
+- RED first.
+- **`TeamLink` (unit tests, against an in-process team daemon):**
+  - it verifies the proof and calls;
+  - a URL with a non-loopback host, or `https://`, is refused by `from_env`;
+  - a wrong token is never sent: the team daemon's recorder sees no `Authorization` before a good proof;
+  - after `team.token` is rewritten and the team daemon's token rotated, the next call succeeds without rebuilding the
+    link.
+- **`server_mode` tests:**
+  - with tenants A and B plus a team daemon behind the emulator, `/u/team/api/v1/ping` is 404 from outside;
+  - A's `/api/v1/settings` contains neither the team URL nor the token;
+  - `PATCH /api/v1/settings` with any `team.*` key is refused;
+  - a `--team-store` daemon keeps `project_hint` from an HTTP body, and a normal tenant clears it.
+- **Checks:**
+  - the same set as Task 25: `cargo test -p alice-core client_project`, `cargo test -p alice-daemon --lib`,
+    `cargo test -p alice-daemon --test server_mode`, `cargo test -p alice-daemon --test http_api`,
+    `cargo test -p alice-daemon --test mcp`, clippy as in the Global Constraints, and `cargo fmt --all --check`.
+- **Commit** (stage by name):
+  `feat(team): the team link (loopback, proof before token, token re-read) and the team-store role (addendum 3)`.
+
+---
+
+### Task 27: Shared writes and the rules for changing shared memories (addendum 3)
+
+**Files:**
+- Modify:
+  - `crates/alice-core/src/api.rs`: `RememberRequest.shared: bool` (`#[serde(default)]`, in the schema, with the
+    description from spec §2.10); `RememberResponse.shared: bool` (`#[serde(default, skip_serializing_if = "std::ops::Not::not")]`);
+  - `crates/alice-daemon/src/service.rs`: routing in `remember` / `remember_or_spool`, plus `get`, `update` and `undo` on
+    `team:` ids;
+  - `crates/alice-daemon/src/mcp.rs`: the `remember` tool's description mentions `shared`, and the reply says "Saved to
+    the team memory";
+  - `crates/alice-daemon/src/http.rs`: no change beyond what the service does.
+- Test: `service.rs` tests with an in-process team service; `tests/server_mode.rs` through the emulator.
+
+**Behaviour** (spec §2.10, R34):
+- **`remember` with `shared: true`:**
+  1. no team link → `Invalid("no team memory is configured on this server; ask the admin")`;
+  2. resolve the project as for a write; redact with the person's rules (the same `redact_remember_in`);
+  3. build the team request: content, title and topics redacted, kind, importance and supersedes as given, `shared: false`,
+     `project_hint: Some(<the resolved project's slug>)` (none for `global`), and the author
+     `Author { agent: Some(format!("{tenant}/{agent}")) or Some(tenant), model, session: None }`;
+  4. `team.call(POST, "/api/v1/remember", …)` with a 5 s timeout;
+  5. answer with the team's id prefixed `team:`, `project` as the team answered it, and `shared: true`.
+
+  A team error becomes `AliceError::Other("the team memory is unreachable (…); nothing was saved. Retry, or save it
+  personally without shared")`. It is never spooled.
+- **`remember_or_spool`:** with `shared: true` it never spools, because the shared path does not touch the personal
+  database.
+- **`get` with `team:` ids:** fetch them from the team store in one call. Return them with the `team:` prefix, plus
+  `source` and `author` (add `#[serde(default, skip_serializing_if = "Option::is_none")] pub source: Option<String>` and
+  `pub author_name: Option<String>` to `MemoryFull`).
+- **`update` with a `team:<id>`:** `get` it from the team store and check that the author's `<tenant>` part is this
+  tenant. Otherwise `Invalid("only the author or the admin can change a shared memory")`. If it is, forward the update
+  with the author set as above.
+- **`undo` with `team:<event id>`:** list the team store's events with `actor=<this tenant's author string>` (the events
+  API filter), and check the id is among them. Otherwise refuse with the same message.
+- **Tests (RED first):**
+  - A's shared `remember` lands in the team store with author agent `A/<agent>`, and A's own database has no such memory;
+  - with no team link the answer is a clear `Invalid`;
+  - with the team daemon stopped, a clear error, and nothing is spooled;
+  - B's `update` of A's `team:` id is refused, and A's succeeds;
+  - B's `undo` of A's team event is refused, and A's succeeds;
+  - over MCP through the emulator, `tools/list` shows `remember` with a `shared` boolean whose description contains
+    "shared" and "every team member";
+  - a client-sent `author` on a shared write is replaced.
+- **Commit:**
+  `feat(team): remember shared:true goes to the team store with its author; only the author changes it (addendum 3)`.
+
+---
+
+### Task 28: The read merge — `recall` and `context` with team hits (addendum 3)
+
+**Files:**
+- Modify: `crates/alice-core/src/api.rs` (`Hit.source: Option<String>`, `Hit.author: Option<String>`, both skipped
+  when `None`); `crates/alice-daemon/src/service.rs` (`recall`, `context`); the `recall` text rendering, so a team hit
+  shows "(team, by <author>)".
+- Test: `service.rs` tests and `tests/server_mode.rs`.
+
+**Behaviour** (spec §2.10, R35–R37):
+- **`recall`.** When a team link exists, start the team query **in parallel** with the personal search: the same query,
+  limit, kinds and since/before; `project_hint` set to the resolved project's slug (none for `global`); `mode: fast`;
+  `include_raw: false`; JSON format. Give it a total deadline of **800 ms** (`TEAM_DEADLINE`), which covers the batch
+  `get` for authors.
+  - **On time:** the team hits get the `team:` prefix, `source: Some("team")`, and `author` (the `<tenant>` part of each
+    memory's `author.agent`, from one `get` of the hit ids). They are dropped when the content hash of title plus snippet
+    (`alice_core::normalize::content_hash`) equals a personal hit's.
+  - **Fast mode:** all hits are ordered by score.
+  - **Precise mode:** the personal hits keep the judge's order and the team hits follow by score (R35).
+  - Truncate to `limit`. Re-render `text` when the format is text.
+  - **Late or failed:** the personal answer plus the note `"the team memory did not answer in time; this answer is personal only"`.
+- **`context`.** Ask the team store's `context` for the same project, with `max_tokens` a third of the budget and the
+  same 800 ms deadline. Append it under a `## Team memory` heading, or the same note on failure.
+- **Tests (RED first):**
+  - B's recall returns A's shared memory, labelled team with author A, with a `team:` id;
+  - a personal hit with the same title and snippet as a team hit appears once;
+  - the team daemon delayed past 800 ms (a hook in the emulator, or a stopped team daemon) → the recall returns within
+    about 1.5 s with the note;
+  - in precise mode with a grader, the team text never reaches the grader (`graded_states` holds none of the team hit's
+    words);
+  - B's context contains `## Team memory` and A's shared title;
+  - project scoping: a team memory in project `x` shows in a recall from project `x`, and not from project `y`.
+- **Commit:** `feat(team): recall and context merge the team memory, labelled with its author (addendum 3)`.
+
+---
+
+### Task 29: `alice-server add --team` and provisioning (addendum 3)
+
+**Files:**
+- Modify: `deploy/server/alice-server`, `deploy/server/tests/run.sh`.
+
+**Behaviour** (spec §2.10, R32):
+- **Every personal tenant file** always gets `ALICE_TENANT_NAME=<name>`.
+- **`add --team team`** (the name must be `team`; any other with `--team` is refused):
+  - like `add`, but with no Caddy snippet;
+  - its unit runs `alice daemon run --tenant --team-store`: add a second template unit `alice-team@.service`, identical
+    except for `ExecStart`, or an `ALICE_DAEMON_ARGS` line in the tenant file that `ExecStart` expands; choose one and
+    document it;
+  - the output prints no URL, and its token is printed once;
+  - then it provisions every existing personal tenant: `ALICE_TEAM_URL=http://127.0.0.1:<team port>` appended to its
+    env file (idempotent), and `<home>/team.token` written 0600 and owned by `alice-<name>`, guarded writes. Each is
+    restarted.
+- **`add <person>` when a team exists:** provision the new tenant before its first start.
+- **`rotate team`:** rotate as for any tenant, then rewrite every `team.token`. No restarts: the link re-reads the
+  token.
+- **`remove <person>`:** removes the copy along with the home. **`remove team`** removes `ALICE_TEAM_URL` from every
+  tenant file and every `team.token`, then restarts them.
+- **`list`:** marks the team store `(team, no URL)`.
+- **Stub scenarios** (RED first):
+  - `add_team_writes_no_snippet`;
+  - `add_team_provisions_existing_tenants` (the env line, plus `team.token` mode 0600 with the chown recorded);
+  - `add_person_after_team_is_provisioned`;
+  - `rotate_team_rewrites_every_copy`;
+  - `remove_team_unprovisions`;
+  - `team_token_never_in_env_files`;
+  - `list_marks_the_team_store`.
+
+  Every rm/mv stays guarded; the script stays bash 3.2 compatible and shellcheck clean.
+- **Commit:** `feat(deploy): alice-server add --team and team provisioning (addendum 3)`.

@@ -6,7 +6,8 @@
   `feat/m2-judge-settings` 9dfac19 (M2 Task 22); addendum 1 (the owner's answers: four tenants, MemPalace import through
   a client-made bundle, a fixed disk) folded in, with `feat/m3-import` 3dbfa31 merged; **addendum 2** (the owner,
   2026-10-15 20:30: no Windows, the team goes through the server's MCP endpoint) folded in. Where addendum 2 changes an
-  earlier section, that section says so; §2.8 and §2.9 hold the new design.
+  earlier section, that section says so; §2.8 and §2.9 hold the new design. **Addendum 3** (the owner: shared team
+  memory) folded in; §2.10 holds it.
 - **Owner:** icueth (vision); technical choices delegated to this lane
 - **Lane:** server mode, worktree `project-alice-srv`, branch `feat/server-mode` (from `feat/m2-judge-settings` b28b99f)
 - **Builds on:** `2026-10-13-alice-core-design.md` (the core spec), the M2 handoff `docs/superpowers/handoff/2026-10-14-m2-handoff.md`
@@ -88,12 +89,22 @@
     - the counts equal a local import of the same palace;
     - a palace outside the tenant's `import-inbox/` is refused;
     - the server's copy of the palace is gone afterwards.
+13. **Shared team memory (§2.10).** A's `remember shared:true` lands in the team store with author A, and not in A's
+    store. Then:
+    - B's `recall` and `context` return it, labelled team with author A;
+    - duplicates collapse;
+    - with the team store down, A's `recall` answers within its deadline with a note, and A's shared write fails
+      clearly;
+    - B cannot update or undo A's shared memory, and A can;
+    - `/u/team/…` is 404 from outside;
+    - no setting or endpoint reveals or sets the team URL or token.
 
 ### 0.4 Out of scope
 
-Shared or team memory, accounts, a web UI, a domain, Docker, encryption at rest, and moving an existing local **Alice** home
+Accounts, a web UI, a domain, Docker, encryption at rest, and moving an existing local **Alice** home
 onto a tenant. A person brings their history by importing their MemPalace palace instead (§3.8). Moving an Alice home is
-possible by hand (§10, Q2) but is not built here.
+possible by hand (§10, Q2) but is not built here. (Shared team memory was out of scope here; addendum 3 brings it in,
+§2.10.)
 
 ---
 
@@ -514,6 +525,82 @@ size would leave less than 2 GB free (R29); the existing disk-full behaviour sta
 The deployment task imports a **synthetic** palace only. Real palaces are imported after handover, by the admin, one at
 a time, with the person's consent.
 
+### 2.10 Shared team memory (addendum 3)
+
+The owner: "อยากให้มี ความจำส่วนรวมได้ด้วย เช่น ผู้ใช้บอก ให้บันทึกลงความจำส่วนกลางด้วยนะ ก็จะไปบันทึกในส่วนของ global
+memory ด้วยและใช้ร่วมกันได้". When a person tells their agent "save this to the shared memory too", it goes to a shared
+store that every team member's recall uses. Personal memory stays private and unchanged.
+
+**The team store** is one more tenant daemon, `team`, created with `alice-server add --team team`. It runs
+`alice daemon run --tenant --team-store` and has its own user, home, port, token, backups and disk rules. It has **no
+Caddy route**: `/u/team/…` is 404 from outside, and only the personal daemons reach it, over loopback. The admin manages
+it with `alice-server cli team …`.
+
+**Federation is provisioned by the admin, never over the API (R32).** Each personal tenant's env file gets
+`ALICE_TENANT_NAME=<name>` (every tenant, always) and, when a team store exists, `ALICE_TEAM_URL=http://127.0.0.1:<team port>`.
+Its home gets `team.token` (the team's token; mode 0600, owned by `alice-<name>`). The token is never in the 0644 env file.
+- `add --team` provisions every existing personal tenant.
+- `add <person>` provisions the new one when a team store exists.
+- `rotate team` rewrites every `team.token`. The personal daemons re-read it when the team's proof fails, so no restart
+  is needed.
+- `remove <person>` removes the copy along with the home.
+
+Both variables join `NON_SETTING_ENV`. No setting, endpoint or answer reads, changes or reveals the team URL or token.
+
+**The link.** The personal daemon's `TeamLink` is built at start from `ALICE_TEAM_URL` and reads `<home>/team.token`.
+- It accepts only `http://127.0.0.1:<port>`, `http://localhost:<port>` or `http://[::1]:<port>`. Anything else disables
+  the link, with a warning in the log and in health.
+- It verifies the team daemon's ping proof with the token (the proof check of §3.2, using the answer's instance) before
+  the first call, and again after a 401 or a transport error, re-reading the token file.
+- It uses no proxy and no redirects.
+
+**Writing (`remember` with `shared: true`).** `RememberRequest` gains a wire field, `shared: bool` (default false), which
+the MCP `remember` tool exposes. Its description says to set it only when the user explicitly asks to save to the shared,
+team or central memory ("ความจำส่วนกลาง", "for the team"), and that shared memories are visible to every team member.
+With `shared: true`, the personal daemon:
+1. redacts with its own rules, as for any write;
+2. resolves the project as for any write, then forwards the project's slug as a `project_hint` (`global` stays global);
+3. sets the author to `agent: "<tenant>/<the client's agent name>"`, or `<tenant>` alone when the client gave none. Any
+   client-sent author is replaced (R34);
+4. sends the write to the team store **only**: no personal copy. The person sees it again through the merge.
+
+The answer carries `shared: true` and says the memory went to the team memory. With no team configured, or the team store
+unreachable, the call fails with a clear message: no silent personal fallback, and no spool in v1. A team-store daemon
+(`--team-store`) is the one place a `project_hint` is accepted over HTTP, because only federated personal daemons reach
+it (R33).
+
+**Reading (`recall`, `context`).** A personal tenant with a team configured also asks the team store, in parallel, with
+the same query, project and limit, in fast mode, and its own **800 ms** deadline. Then it merges:
+- team hits get `source: "team"` and `author` (the `<tenant>` part of the team memory's `author.agent`, read with one
+  batch `get` against the team store inside the same deadline);
+- their ids are prefixed `team:`;
+- they are deduplicated against personal hits by the content hash of title plus snippet (a personal hit wins);
+- **in fast mode** all hits are ordered by score;
+- **in precise mode** the person's judge grades the personal hits only, and team hits follow, ordered by their score
+  (R35).
+
+For `context`, a "Team memory" section with the team store's context for the same project is appended within a third of
+the budget. Project scoping works as for personal hits: a project's recall shows that project's team memories and the
+team's global ones. Team down or slow gives the personal answer plus the note "the team memory did not answer in time;
+this answer is personal only".
+
+**Changing shared memories.**
+- `get` accepts `team:<id>`.
+- `update` (edit, supersede, archive, forget, restore) of a `team:` id is allowed only when the memory's author is this
+  tenant: the personal daemon checks it with a `get` first.
+- `undo` of a `team:<event id>` is allowed only when that event's actor is this tenant: the personal daemon checks the
+  team store's events filtered by actor.
+- Anything else is refused with "only the author or the admin can change a shared memory". The admin can do anything
+  with `alice-server cli team …`.
+
+**Privacy.** Shared memories are readable by every team member; that is the point, and the tool description and
+`docs/server.md` say so. Both daemons redact: the person's daemon before forwarding, the team daemon when it stores. The
+team store's own settings decide its judge (heuristic by default) and its cloud policy. A person's Jev key never reaches
+the team daemon, and **team texts are never sent to a person's cloud judge** (R35).
+
+**Out of scope (v1):** sharing knowledge-graph facts directly (the team daemon's own judge derives facts from its
+memories), per-person tokens on the team store, partial teams, and a spool for shared writes.
+
 ## 3. Client remote mode (deferred by addendum 2)
 
 *Addendum 2 defers this whole section.* The team uses direct MCP (§2.8), and its design is kept here unchanged for a
@@ -891,6 +978,11 @@ daemon's connection is dropped by the unit's `IPAddressDeny` (R18), and the embe
 | `?project=` names a slug that does not exist | A placeholder project with that slug is created on the first write (`import:<slug>`, no root); reads see an empty project until then |
 | An admin import's palace is outside `import-inbox/`, or too large for the disk | Refused before any work (§2.9) |
 | An admin import fails half-way | The script's trap deletes the inbox copy; M3's job cleans its snapshot; a rerun resumes by dedup |
+| `remember shared:true` with no team store, or the team store down | Refused with a clear message; nothing is stored personally (no silent fallback, no spool in v1) |
+| The team store is slow or down during `recall` or `context` | The personal answer within its own time, plus the note "the team memory did not answer in time; this answer is personal only" |
+| `team.token` rotated by the admin | The next team call fails the proof; the link re-reads `team.token` and verifies again; no restart |
+| A person tries to change another person's shared memory | Refused: "only the author or the admin can change a shared memory" |
+| `ALICE_TEAM_URL` names a non-loopback host | The link stays off (warning in the log and in health); shared writes are refused |
 
 ---
 
@@ -917,6 +1009,12 @@ daemon's connection is dropped by the unit's `IPAddressDeny` (R18), and the embe
   it is stored or logged (forced on in tenant mode). A repository's `.alice.toml` does not apply on this path; the tenant's
   global deny list does. Only a project slug is stored for a root, never its path.
 - **Admin import (addendum 2):** the raw palace sits under the tenant's 0700 `import-inbox/` only while the job runs.
+- **Team memory (addendum 3):**
+  - shared memories are readable by every team member;
+  - the team store has no route from outside, and its token lives only in each personal home (0600);
+  - the team URL and token cannot be read or set through any API;
+  - a person can change only the shared memories they wrote;
+  - team texts never go to a person's cloud judge.
 - **Import (addendum 1, dropped):** a person's palace never leaves their machine unredacted. The bundle holds only redacted text, and in block mode
   the drawers with secrets are held back. The server reads an uploaded SQLite file read-only with `trusted_schema = OFF`
   after `quick_check`, as the tenant's own Unix user, so a crafted file can only affect the tenant that sent it.
@@ -1054,6 +1152,10 @@ the tests cover the following.
     Never a real person's palace.
 9. `alice-server remove t1 --yes` and `remove t2 --yes`. Delete their archives too, to give the space back. Report the
    memory and disk use measured.
+9b. Team store (addendum 3): `alice-server add --team team` first, then the test tenants. Check:
+    - t1's `remember shared:true` over MCP appears in t2's `recall` with author t1;
+    - `/u/team/` is 404;
+    - stopping the team unit leaves t1's `recall` answering with the note.
 10. Only with the controller's go: `alice-server add` for `icue`, `joe-hermes`, `joe` and `petch`. Token handover is the
     controller's. Each person imports their own palace after handover.
 
@@ -1100,6 +1202,12 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R30 | **Windows dropped** from CI and from this lane (addendum 2); existing Windows code stays, untested | The owner's decision; the team uses MCP, not the binary | A Windows regression in the binary goes unnoticed (the manual `windows-real-model.yml` stays) |
 | R31 | `alice-server cli <name> <args…>` runs the `alice` CLI as the tenant's user | With no client binary, the admin needs a way to set a person's key and settings | The admin types a person's Jev key (the admin can read it anyway, Q1) |
 | R4, R20–R22, R24 | Superseded by addendum 2 (R4: `/mcp` is now routed; R20–R22, R24: the bundle is dropped) | — | — |
+| R32 | Team federation is **admin-provisioned** (`ALICE_TEAM_URL` and `ALICE_TENANT_NAME` in the env file, `team.token` 0600 in the home), never a setting (controller's ruling) | A tenant must not point its daemon at another store or read the team's token | Changing the team store needs the admin |
+| R33 | A **`--team-store`** daemon accepts `project_hint` over HTTP; every other daemon clears it on entry (Task 25) | The team store is reachable only by federated personal daemons over loopback; they must forward a project identity that may not exist in the team store yet | A process on the server holding the team token could create placeholder projects in the team store |
+| R34 | A shared memory's author is `"<tenant>/<agent>"` in `author.agent`, set by the personal daemon; ownership = the `<tenant>` part | No schema change; a tenant name cannot contain `/` | Agent names that already contain `/` are shown as-is after the tenant |
+| R35 | In precise mode, **team hits are not graded by the person's judge**; they follow the graded personal hits (addendum 3 asked to grade them) | Grading would send team texts to a person's cloud judge, bypassing the team store's own cloud policy (addendum 3 rule 6) | Team hits are ordered by fusion score only; the controller may overrule if the team store's policy allows the cloud |
+| R36 | Team hits are deduplicated against personal hits by the content hash of title plus snippet | `Hit` carries no content hash and snippets are deterministic; no search change | Two memories with the same title and snippet start but different bodies collapse into one (rare) |
+| R37 | `context` appends a "Team memory" section within a third of the budget | Keeps the person's own briefing first | A large team context is cut harder than the personal one |
 
 ---
 
@@ -1115,6 +1223,9 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
   - the team goes through the server's MCP endpoint (§2.8);
   - import is done by the admin (§2.9);
   - the `alice remote` client is deferred (the controller asks the owner whether he wants it for his own Mac).
+- **Addendum 3 (the owner, 2026-10-15):** shared team memory, `remember shared:true` (§2.10). Reported to the controller:
+  - the precise-mode grading of team hits is not done (R35, privacy), so the controller can overrule;
+  - the team store accepts project hints over HTTP (R33).
 - **Q3 — Remote mode switches a whole machine**, or one `ALICE_HOME` through the environment, not single projects.
 - **Q4 — Resources (measured by the controller):** 15 GB of RAM (13 GB free), 4 vCPU, and a 28 GB root filesystem with 19 GB
   free. Five tenants need about 0.6 GB for models, plus their data and backups. The NAT masquerades (R19).
@@ -1167,3 +1278,12 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 7. Deployment (gated).
 
 The remote-client items 3–5 of this outline are deferred (§3), and item 5a is dropped.
+
+**Addendum 3** adds four tasks after Task 25 and before the docs and deployment:
+- the team link and the team-store role;
+- shared writes and the rules for changing shared memories;
+- the read merge;
+- `alice-server add --team` with its provisioning.
+
+Deployment creates the `team` store first, runs its checks with two test tenants and the team store, then removes the
+test tenants and creates the real ones on the controller's go.
