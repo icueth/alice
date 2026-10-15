@@ -1177,9 +1177,8 @@ mod tests {
 
     #[test]
     fn an_empty_source_file_counts_as_missing() {
-        let pairs = |v: &str| {
-            vec![("source_file".to_string(), MetaValue::Str(v.to_string()))].into_iter()
-        };
+        let pairs =
+            |v: &str| vec![("source_file".to_string(), MetaValue::Str(v.to_string()))].into_iter();
         assert_eq!(meta_from_pairs(pairs("")).source_file, None);
         assert_eq!(meta_from_pairs(pairs("  ")).source_file, None);
         assert_eq!(
