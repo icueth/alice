@@ -1,6 +1,7 @@
 # Alice Server Mode — Design Spec
 
 - **Date:** 2026-10-15
+- **Addresses:** the repository is public, so this spec writes `<server-ip>`, `<host>`, `<vm-lan-ip>` and `<nat-gateway>`. The real values live only in `/etc/alice/server.env` on the server and in the controller's git-ignored notes.
 - **Status:** approved by the controller with binding changes (spec-review.md, 2026-10-15), applied here; base merged with
   `feat/m2-judge-settings` 9dfac19 (M2 Task 22); addendum 1 (the owner's answers: four tenants, MemPalace import through
   a client-made bundle, a fixed disk) folded in, with `feat/m3-import` 3dbfa31 merged
@@ -16,7 +17,7 @@
 
 - Alice must be usable from one server by **at most 5 people**. Each person is identified by **their own API token**, and each
   person's memory is their own. There is no shared team memory.
-- The server is an Ubuntu 24.04 VM on the public IP `212.80.214.149` (NAT to 192.168.100.153; ports 22, 80 and 443 forwarded).
+- The server is an Ubuntu 24.04 VM on the public IP `<server-ip>` (NAT to <vm-lan-ip>; ports 22, 80 and 443 forwarded).
   Caddy serves the bare IP; there is no domain.
 - Every technical choice is delegated. This spec records each one as a ruling (§9).
 - **The tenants (addendum 1):** exactly four people, `icue`, `joe-hermes`, `joe` and `petch`. Each one's memory is their own.
@@ -29,7 +30,7 @@
 
 1. **One daemon per person.** Each daemon has its own Linux user `alice-<name>`, its own `ALICE_HOME=/srv/alice/<name>`, port and
    token. It runs under the systemd template unit `alice@<name>.service` and listens on 127.0.0.1 only.
-2. **Caddy routes by path.** `https://212.80.214.149/u/<name>/…` has the prefix stripped and goes to `127.0.0.1:<port>`, with the
+2. **Caddy routes by path.** `https://<host>/u/<name>/…` has the prefix stripped and goes to `127.0.0.1:<port>`, with the
    upstream `Host` rewritten so the daemon's Host check (`http.rs` `Guard`) stays as it is. Streaming responses are not buffered.
    The bearer token is the only credential. (The fail2ban jail first ruled here is dropped: the server's NAT masquerades, so
    Caddy sees only the gateway's address; see §2.4.)
@@ -44,7 +45,7 @@
 
 ### 0.3 Success criteria (each one is checked in §8)
 
-1. From a Mac, `alice remote set https://212.80.214.149/u/<name>` (token on stdin) is enough for these to work against the server:
+1. From a Mac, `alice remote set https://<host>/u/<name>` (token on stdin) is enough for these to work against the server:
    `alice recall`, `alice remember`, `alice context` and `alice mcp`.
 2. Tenant A's token is refused on tenant B's path, and A's client never sends A's token to B's daemon.
 3. A project's `.alice.toml` changes server-side behaviour exactly as it would locally: `cloud_denied` keeps its memories away
@@ -53,7 +54,7 @@
 4. A secret in a `remember` is redacted on the client; it never reaches the network.
 5. With the server unreachable, `remember` answers "Queued" within the 3 s ping, and the queued write is stored on the server
    after a later call, once (replay is at least once, and deduplication makes the result single).
-6. A tenant daemon cannot reach the LAN (192.168.100.0/24 and every private range), nor Caddy's admin API, whatever URL its
+6. A tenant daemon cannot reach the LAN (the VM's private /24 and every private range), nor Caddy's admin API, whatever URL its
    settings name (R18); the public internet stays reachable for Jev and the model download.
 7. `/api/v1/events/stream` delivers events through Caddy without buffering.
 8. The token never appears in a log, an error message, `Debug` output, `alice remote status`, or Caddy's access log.
@@ -78,7 +79,7 @@ possible by hand (§10, Q2) but is not built here.
 ## 1. Overview
 
 ```
- person's machine (macOS/Linux/Windows)                     server 212.80.214.149 (Ubuntu 24.04)
+ person's machine (macOS/Linux/Windows)                     server <server-ip> (Ubuntu 24.04)
  ┌───────────────────────────────────────┐                 ┌──────────────────────────────────────────────────┐
  │ agent ──stdio── alice mcp ─┐          │                 │ Caddy :443 (LE IP cert, default_sni)              │
  │ hooks ── alice context ────┤          │   HTTPS + Bearer│  /u/ann/api/v1/* ─strip, Host:127.0.0.1:47801──┐ │
@@ -163,7 +164,7 @@ admin's environment, so a `TYPESAFE_API_KEY` in an admin shell never reaches a t
 
 **No LAN access (R18).** A tenant controls its own settings through `PATCH /api/v1/settings`, including the URLs the daemon
 calls. Without a limit a tenant could make its daemon reach the owner's LAN, where the Proxmox host and the gateway sit in
-192.168.100.0/24. Three layers stop that:
+the VM's private /24. Three layers stop that:
 
 1. `IPAddressAllow=localhost` with `IPAddressDeny=` every private, link-local, CGNAT and ULA range, in the unit. systemd applies
    it to every socket of the unit's processes. Localhost stays allowed: Caddy reaches the daemon there, and DNS is
@@ -247,16 +248,16 @@ worker stay as they are.
 ### 2.3 Caddy
 
 `alice-server` manages `/etc/caddy/Caddyfile` from one template. The template reproduces the controller's settings: the global
-`default_sni 212.80.214.149`, and the site's `tls { issuer acme { profile shortlived } }` with no contact email. On first use the
+`default_sni <server-ip>`, and the site's `tls { issuer acme { profile shortlived } }` with no contact email. On first use the
 script copies the existing file to `/etc/caddy/Caddyfile.pre-alice` (once). The deployment task diffs the two before the switch.
 
 ```caddyfile
 {
-	default_sni 212.80.214.149
+	default_sni <server-ip>
 	admin unix//run/caddy/admin.sock
 }
 
-https://212.80.214.149 {
+https://<server-ip> {
 	tls {
 		issuer acme {
 			profile shortlived
@@ -313,7 +314,7 @@ handle_path /u/<name>/* {
 
 ### 2.4 No per-IP banning (the NAT masquerades)
 
-The controller measured that every connection reaches the VM from the NAT gateway `192.168.100.99`: SSH, HTTPS and Let's
+The controller measured that every connection reaches the VM from the NAT gateway `<nat-gateway>`: SSH, HTTPS and Let's
 Encrypt's tls-alpn-01 checks alike. A ban would ban the gateway, which would lock everyone out and stop the IP certificate's
 renewal. So `alice-server` installs **no** fail2ban jail, and the controller has disabled fail2ban server-wide.
 
@@ -337,7 +338,7 @@ The deployment task still records one access-log line's `client_ip`, for the rec
 The script is bash, `set -euo pipefail`, and must pass `shellcheck`. It runs as root (via sudo) and takes a lock
 (`flock /run/alice-server.lock`). It is idempotent: running a command twice leaves the same state and says so. It is installed
 as `/usr/local/sbin/alice-server`. The unit and the Caddy template live inside it as heredocs, so the script
-is the single source. The public host comes from `/etc/alice/server.env` (`ALICE_PUBLIC_HOST=212.80.214.149`), so the IP is
+is the single source. The public host comes from `/etc/alice/server.env` (`ALICE_PUBLIC_HOST=<server-ip>`), so the IP is
 not hard-coded. Each command below is followed by what it does.
 
 **`add <name>`**
@@ -749,7 +750,7 @@ it under the replay lock.
 against Ann's token, so the client stops with "did not prove it holds this token". No request carries the token, so there is
 no 401.
 
-**A tenant aims a setting at the LAN.** `PATCH /api/v1/settings` with `embedding.endpoint = "http://192.168.100.99/"` is
+**A tenant aims a setting at the LAN.** `PATCH /api/v1/settings` with `embedding.endpoint = "http://<nat-gateway>/"` is
 refused by tenant-mode validation (§2.2, item 6). A public name that resolves to a LAN address passes validation, but the
 daemon's connection is dropped by the unit's `IPAddressDeny` (R18), and the embedder reports the endpoint as unreachable.
 
@@ -908,7 +909,7 @@ the tests cover the following.
    the admin socket and that nothing listens on port 2019. Record `ss -ltnp` and report any listener besides sshd, Caddy, the
    DNS stub and the tenants.
 3. From this Mac, with a scratch `ALICE_HOME`:
-   - `alice remote set https://212.80.214.149/u/t1` (token on stdin);
+   - `alice remote set https://<host>/u/t1` (token on stdin);
    - `alice remember` and `alice recall` in a scratch git repository that has a `.alice.toml` with `cloud_denied = true` and a
      custom pattern;
    - check the mirror on the server and `alice projects`;
@@ -918,8 +919,8 @@ the tests cover the following.
 6. Check that the token does not appear in `/var/log/caddy/alice-access.log`, in `journalctl -u alice@t1`, or in the client's
    logs.
 7. R18: t1's daemon has downloaded its model (public internet works). A `systemd-run --uid=alice-t1 -p IPAddressAllow=localhost
-   -p IPAddressDeny=<the unit's ranges> curl -m 5 http://192.168.100.99/` fails. Patching t1's `embedding.endpoint` to
-   `http://192.168.100.99/` is refused. Record one access-log line's `client_ip`, for the record (the gateway is expected).
+   -p IPAddressDeny=<the unit's ranges> curl -m 5 http://<nat-gateway>/` fails. Patching t1's `embedding.endpoint` to
+   `http://<nat-gateway>/` is refused. Record one access-log line's `client_ip`, for the record (the gateway is expected).
 8. Run `alice-server upgrade` with the same binary (a restart round trip) and `alice-server rotate t1`: the old token is
    refused, and `alice remote set` with the new one works.
 8a. Import: a **synthetic** palace (built on this Mac by a small test binary with M3's fixture, a few thousand drawers
@@ -963,7 +964,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R16 | Build on the server (rustup and a native release build) in the deployment task | Avoids cross-compiling ONNX Runtime and glibc mismatches | Disk and time on the server (about 6 GB during the build); `target/` is removed afterwards if the disk is tight |
 | R17 | The remote client honours **system proxy** variables for `https://` only | TLS hides the token from a CONNECT proxy; some networks need one | A misconfigured proxy shows up as "unreachable" with its error |
 | R18 | **No LAN access from a tenant daemon** (controller's ruling, with two layers added here): the unit's `IPAddressAllow=localhost` and `IPAddressDeny=` of the private, link-local, CGNAT and ULA ranges; Caddy's admin API moved to a Unix socket; tenant-mode validation of every URL and path setting (§2.2, item 6) | A tenant controls URLs its daemon calls; the LAN holds the Proxmox host and the gateway; localhost must stay allowed (Caddy, DNS), which would otherwise leave Caddy's admin API on 2019 open to a tenant | A tenant cannot use a LAN or self-hosted embedding server (Ollama); none is planned on the server |
-| R19 | **No fail2ban jail** (controller's ruling) | The NAT masquerades: every client arrives from `192.168.100.99`, so a ban would lock everyone out, including the IP certificate's renewal | Brute force is unthrottled, which is irrelevant against a 256-bit token |
+| R19 | **No fail2ban jail** (controller's ruling) | The NAT masquerades: every client arrives from `<nat-gateway>`, so a ban would lock everyone out, including the IP certificate's renewal | Brute force is unthrottled, which is irrelevant against a 256-bit token |
 | R20 | **MemPalace import through a redacted bundle made on the client** and read on the server by a third `Backend` (controller's ruling; seam confirmed against M3's code: `Backend::Bundle` + `BundleReader`, a pre-made snapshot as the entry point) | The palace is on the person's machine; secrets must not leave it; M3's job then runs unchanged | Two readers to keep in step with MemPalace's format: the client's (unchanged M3 code) and the bundle's (ours, versioned) |
 | R21 | The bundle is **one SQLite file** (drawers, MemPalace-schema graph, tunnels JSON, metadata) | One stream to upload and cap; `read_kg` reads the graph tables unchanged; paging by id needs an index, not memory | A format change needs a version bump (`bundle_meta.version`) |
 | R22 | **Wings travel as redacted names; no `ClientProject` per wing** | M3's wing map is name-based and imported projects are placeholders; the first `client_project` of the same slug adopts the placeholder and brings its mirror, which is the local behaviour | An imported project's own `.alice.toml` applies only from that project's first remote request on, as locally |

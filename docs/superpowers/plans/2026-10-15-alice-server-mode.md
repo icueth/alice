@@ -16,6 +16,7 @@
 
 ## Global Constraints
 
+- The repository is public: no committed file (code, tests, docs, scripts, this plan) names the server's address. Write `<server-ip>` or `https://<host>/u/<name>`; tests use documentation addresses such as `203.0.113.7`. The real address lives only in `/etc/alice/server.env` on the server and in git-ignored notes.
 - Work only in `/Users/icue/Code/AI/project-alice-srv` (branch `feat/server-mode`). Never write in `/Users/icue/Code/AI/project-alice` or `/Users/icue/Code/AI/project-alice-m3`.
 - **Every cargo command** uses this prefix (one heavy run at a time on this Mac; throttled; no secrets in the environment):
   `cd /Users/icue/Code/AI/project-alice-srv && source "$HOME/.cargo/env" && env -u TYPESAFE_API_KEY -u ALICE_EMBEDDING_API_KEY CARGO_TARGET_DIR=/Users/icue/Code/AI/project-alice-srv/target nice -n 15 cargo <subcommand> -j 4 …`
@@ -383,11 +384,11 @@ Parse with `std::net::IpAddr`; strip `[ ]` first.
     #[test]
     fn private_hosts_are_recognised() {
         for h in ["localhost", "LOCALHOST", "x.localhost", "127.0.0.1", "127.1.2.3", "10.0.0.5",
-                  "172.16.0.1", "172.31.255.1", "192.168.100.99", "169.254.1.1", "100.64.0.1",
+                  "172.16.0.1", "172.31.255.1", "192.168.1.99", "169.254.1.1", "100.64.0.1",
                   "0.0.0.0", "::1", "[::1]", "fc00::1", "fd12::1", "fe80::1", "::ffff:192.168.1.1"] {
             assert!(host_is_private(h), "{h}");
         }
-        for h in ["api.typesafe.ai", "8.8.8.8", "172.32.0.1", "100.128.0.1", "2001:4860::8888", "212.80.214.149"] {
+        for h in ["api.typesafe.ai", "8.8.8.8", "172.32.0.1", "100.128.0.1", "2001:4860::8888", "203.0.113.7"] {
             assert!(!host_is_private(h), "{h}");
         }
     }
@@ -409,7 +410,7 @@ Parse with `std::net::IpAddr`; strip `[ ]` first.
         let refused = [
             (format!("[backup]\ndir = \"{}\"\n", outside.display()), "backup.dir"),
             ("[backup]\ndir = \"../outside\"\n".to_string(), "backup.dir"),
-            ("[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"https://192.168.100.99/v1\"\n".into(), "embedding.endpoint"),
+            ("[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"https://192.168.1.99/v1\"\n".into(), "embedding.endpoint"),
             ("[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"http://127.0.0.1:2019/v1\"\n".into(), "embedding.endpoint"),
             ("[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"http://api.openai.com/v1\"\n".into(), "embedding.endpoint"),
             ("[embedding]\nprovider = \"ollama\"\nmodel = \"m\"\n".into(), "embedding.provider"),
@@ -584,14 +585,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
         let (_d, h) = home();
         let s = SettingsHandle::load_with(&h, Vec::new(), true);
         assert!(s.is_tenant());
-        let e = s.patch(&one("judge.jev.endpoint", serde_json::json!("https://192.168.100.99/v1"))).unwrap_err();
+        let e = s.patch(&one("judge.jev.endpoint", serde_json::json!("https://192.168.1.99/v1"))).unwrap_err();
         assert!(e.iter().any(|e| e.key == "judge.jev.endpoint"), "{e:?}");
         assert!(!h.config_file().exists() || !std::fs::read_to_string(h.config_file()).unwrap().contains("192.168"));
         // The same patch is fine for a local daemon.
         let (_d2, h2) = home();
         let local = SettingsHandle::load_with_env(&h2, Vec::new());
         assert!(!local.is_tenant());
-        local.patch(&one("judge.jev.endpoint", serde_json::json!("https://192.168.100.99/v1"))).unwrap();
+        local.patch(&one("judge.jev.endpoint", serde_json::json!("https://192.168.1.99/v1"))).unwrap();
     }
 
     #[test]
@@ -1570,12 +1571,12 @@ mod tests {
 
     #[test]
     fn urls_are_normalized_and_refused_by_the_spec_rules() {
-        assert_eq!(normalize_url("HTTPS://212.80.214.149:8443/u/ann/").unwrap(), "https://212.80.214.149:8443/u/ann");
+        assert_eq!(normalize_url("HTTPS://203.0.113.7:8443/u/ann/").unwrap(), "https://203.0.113.7:8443/u/ann");
         assert_eq!(normalize_url("https://Example.COM").unwrap(), "https://example.com");
         assert_eq!(normalize_url(" http://127.0.0.1:47801/u/t/ ").unwrap(), "http://127.0.0.1:47801/u/t");
         assert_eq!(normalize_url("http://localhost:9").unwrap(), "http://localhost:9");
         assert_eq!(normalize_url("http://[::1]:9/x").unwrap(), "http://[::1]:9/x");
-        for bad in ["http://212.80.214.149/u/ann", "ftp://x", "https://", "https://u:p@host/x",
+        for bad in ["http://203.0.113.7/u/ann", "ftp://x", "https://", "https://u:p@host/x",
                     "https://host/x?y=1", "https://host/x#f", "host/u/ann", ""] {
             assert!(normalize_url(bad).is_err(), "{bad}");
         }
@@ -1586,7 +1587,7 @@ mod tests {
     fn the_file_is_private_and_the_environment_wins() {
         let (_d, h) = home();
         assert!(load_with(&h, &|_| None).unwrap().is_none());
-        save(&h, "https://212.80.214.149/u/ann", TOKEN).unwrap();
+        save(&h, "https://203.0.113.7/u/ann", TOKEN).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1594,7 +1595,7 @@ mod tests {
             std::fs::set_permissions(h.remote_file(), std::fs::Permissions::from_mode(0o644)).unwrap();
         }
         let c = load_with(&h, &|_| None).unwrap().unwrap();
-        assert_eq!((c.url.as_str(), c.token.as_str(), c.source), ("https://212.80.214.149/u/ann", TOKEN, ConfigSource::File));
+        assert_eq!((c.url.as_str(), c.token.as_str(), c.source), ("https://203.0.113.7/u/ann", TOKEN, ConfigSource::File));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3135,7 +3136,7 @@ This task is run by the lane's controller session, not by an implementer subagen
 
 This task touches the server. Do not start it without the controller's go in this session. Follow spec §8.3, steps 1–10,
 exactly:
-- the server is reached with `ssh -i ~/.ssh/alice_server_ed25519 -o IdentitiesOnly=yes alice@212.80.214.149`;
+- the server is reached with `ssh -i ~/.ssh/alice_server_ed25519 -o IdentitiesOnly=yes alice@<server-ip>`, where `<server-ip>` is in the controller's git-ignored notes (never in a committed file);
 - never change SSH, sudoers or the firewall;
 - record `df -h` before and after the build;
 - **only the binary stays** after the build (R25);
