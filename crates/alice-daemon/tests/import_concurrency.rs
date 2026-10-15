@@ -321,8 +321,11 @@ async fn one_batch_never_holds_the_writer_longer_than_the_slice_budget() {
     }
     let st = f.wait_import().await;
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    // A debug build on a shared CI runner is several times slower than release; the 150 ms
+    // release bound is the real budget, the debug one only catches a batch that holds the
+    // writer for seconds.
     let bound = if cfg!(debug_assertions) {
-        Duration::from_millis(750)
+        Duration::from_millis(1500)
     } else {
         Duration::from_millis(150)
     };

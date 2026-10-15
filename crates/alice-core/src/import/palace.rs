@@ -233,6 +233,8 @@ fn snapshot_inner(
     written: &mut Vec<PathBuf>,
 ) -> Result<Snapshot> {
     let created = !dest_dir.exists();
+    #[cfg(not(unix))]
+    let _ = created;
     std::fs::create_dir_all(dest_dir)?;
     #[cfg(unix)]
     if created {
