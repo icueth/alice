@@ -177,7 +177,7 @@ Agents that cannot use MCP can call the CLI (`alice recall`, `alice remember`, `
 | `query_facts` | Knowledge-graph lookups, `as_of` a date, or as a timeline. |
 | `assert_fact` | Add, supersede or end a fact, with predicate suggestions. |
 
-The server also sends usage instructions, offers `recall` and `remember-session` prompts and the `memory://context` and `memory://m/{id}` resources. An admin toolset (`review_list`, `review_resolve`, `merge_memories`, `stats`) is off by default: switch it on with `alice config set mcp.admin_tools true` (the stdio shim asks the daemon, so the switch takes effect without restarting the agent).
+The server also sends usage instructions, offers `recall` and `remember-session` prompts and the `memory://context` and `memory://m/{id}` resources. An admin toolset (`review_list`, `review_resolve`, `merge_memories`, `stats`) is off by default: switch it on with `alice config set mcp.admin_tools true` (the stdio shim asks the daemon each time it lists tools, so no restart is needed).
 
 ## CLI
 
