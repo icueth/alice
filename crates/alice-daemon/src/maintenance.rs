@@ -244,7 +244,15 @@ pub struct Scheduler {
     /// check is still setting up the full-text tables: either way the check was stopped, not
     /// failed.
     interrupted: std::sync::atomic::AtomicBool,
+    /// Tests only: runs on the integrity check's connection once its interrupt handle is
+    /// registered and before the check starts.
+    #[cfg(test)]
+    quick_check_hook: parking_lot::Mutex<Option<QuickCheckHook>>,
 }
+
+/// A test's hook into the integrity check (see `Scheduler::quick_check_hook`).
+#[cfg(test)]
+type QuickCheckHook = Arc<dyn Fn(&rusqlite::Connection) + Send + Sync>;
 
 /// Rows per write in purges and retention.
 const SLICE: usize = 500;
@@ -278,6 +286,8 @@ impl Scheduler {
             running: parking_lot::Mutex::new(()),
             interrupt: parking_lot::Mutex::new(None),
             interrupted: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            quick_check_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -619,6 +629,10 @@ impl Scheduler {
                 )?;
                 self.interrupted.store(false, Ordering::SeqCst);
                 *self.interrupt.lock() = Some(c.get_interrupt_handle());
+                #[cfg(test)]
+                if let Some(hook) = self.quick_check_hook.lock().clone() {
+                    hook(&c);
+                }
                 let checked = m::quick_check(&c);
                 *self.interrupt.lock() = None;
                 self.quick_check_step(checked, self.interrupted.load(Ordering::SeqCst))
@@ -2039,39 +2053,71 @@ mod tests {
         assert!(r.sched.meta("maint.quick_check.last_error").is_some());
     }
 
+    /// Holds a running statement at its first progress callback until the test lets it go, so an
+    /// interrupt sent meanwhile lands inside the statement however the threads are scheduled.
+    #[derive(Default)]
+    struct Gate {
+        running: AtomicBool,
+        go: AtomicBool,
+    }
+
+    /// SQLite's progress callback: announces that the statement is running, then waits for `go`.
+    unsafe extern "C" fn hold_at_gate(arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+        // SAFETY: `arg` is the `Gate` the test registered; the test keeps it alive until the
+        // job has ended, and the callback runs only inside a statement of that job.
+        let gate = unsafe { &*(arg as *const Gate) };
+        gate.running.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !gate.go.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        0
+    }
+
     /// I-4: an integrity check is interrupted when the daemon stops. (SQLite honours it inside
-    /// `PRAGMA quick_check`.)
+    /// `PRAGMA quick_check`.) SQLite drops an interrupt that arrives while no statement runs, so
+    /// the test holds the check inside its statement (a progress callback every 1,000
+    /// operations parks it at the first one) and interrupts only then: no timing decides it.
     #[test]
     fn a_running_integrity_check_is_interrupted_at_shutdown() {
         let r = rig();
         {
             let c = r.sql();
             c.execute_batch("CREATE TABLE junk (x BLOB)").unwrap();
-            for _ in 0..300 {
+            for _ in 0..100 {
                 c.execute("INSERT INTO junk VALUES (randomblob(500000))", [])
                     .unwrap();
             }
             c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         }
+        let gate = Arc::new(Gate::default());
+        let held = gate.clone();
+        *r.sched.quick_check_hook.lock() = Some(Arc::new(move |c: &rusqlite::Connection| {
+            // SAFETY: `held` outlives the connection's use of the pointer (see `hold_at_gate`),
+            // and the handle is valid while `c` is.
+            unsafe {
+                rusqlite::ffi::sqlite3_progress_handler(
+                    c.handle(),
+                    1_000,
+                    Some(hold_at_gate),
+                    Arc::as_ptr(&held) as *mut std::ffi::c_void,
+                );
+            }
+        }));
         let sched = r.sched.clone();
-        let started = Instant::now();
         let t =
             std::thread::spawn(move || sched.run_job(Job::QuickCheck, chrono::Utc::now(), true));
-        // Wait until the check has registered its connection, then interrupt.
-        while r.sched.interrupt.lock().is_none() {
-            assert!(started.elapsed() < Duration::from_secs(20));
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        // SQLite ignores an interrupt that arrives while no statement runs (the check may not
-        // have started its statement yet), so keep interrupting until the job has ended.
-        while !t.is_finished() {
-            r.sched.interrupt_running();
+        let started = Instant::now();
+        while !gate.running.load(Ordering::SeqCst) {
             assert!(
                 started.elapsed() < Duration::from_secs(60),
-                "the check never ended"
+                "the check never reached a progress callback"
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        // The statement is parked inside the check: this interrupt cannot be lost.
+        r.sched.interrupt_running();
+        gate.go.store(true, Ordering::SeqCst);
         let report = t.join().unwrap();
         assert_eq!(report.outcome, JobOutcome::Paused, "{report:?}");
         assert!(
