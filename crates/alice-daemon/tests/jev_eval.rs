@@ -75,6 +75,33 @@ const MODES: [(&str, Lists, f32); 4] = [
     ("vector only, no floor", Lists::VectorOnly, 0.0),
 ];
 
+/// The judge's budget: `ALICE_EVAL_BUDGET_USD` when set (a malformed value is an error, not the
+/// default), else $0.50 for a cached ranking comparison (`ALICE_EVAL_GRADES`), else the full
+/// run's $2.
+fn eval_budget(var: Option<&str>, cached_grades: bool) -> f64 {
+    match var {
+        Some(v) => v
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|b| b.is_finite() && *b >= 0.0)
+            .unwrap_or_else(|| panic!("ALICE_EVAL_BUDGET_USD={v:?} is not a dollar amount")),
+        None if cached_grades => 0.5,
+        None => BUDGET_USD,
+    }
+}
+
+#[test]
+fn the_eval_budget_is_strict_and_defaults_to_fifty_cents_for_cached_grades() {
+    assert_eq!(eval_budget(None, false), BUDGET_USD);
+    assert_eq!(eval_budget(None, true), 0.5);
+    assert_eq!(eval_budget(Some("0.15"), true), 0.15);
+    for bad in ["", "abc", "-1", "NaN"] {
+        let r = std::panic::catch_unwind(|| eval_budget(Some(bad), true));
+        assert!(r.is_err(), "{bad:?} must fail loudly");
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Plumbing: the dry transport, the call log, the thread pool, small statistics.
 
@@ -321,10 +348,10 @@ impl Env {
                 api_key: key,
                 rate_per_sec: if dry { 1000.0 } else { 8.0 },
                 timeout: Duration::from_secs(30),
-                daily_budget_usd: std::env::var("ALICE_EVAL_BUDGET_USD")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(BUDGET_USD),
+                daily_budget_usd: eval_budget(
+                    std::env::var("ALICE_EVAL_BUDGET_USD").ok().as_deref(),
+                    std::env::var("ALICE_EVAL_GRADES").is_ok(),
+                ),
                 max_retries: 3,
             },
             transport,

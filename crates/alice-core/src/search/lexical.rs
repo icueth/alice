@@ -705,6 +705,8 @@ fn rank_trigram_terms(
 /// Characters of one piece cut into trigrams: the first 128 (126 windows). Probing every window
 /// of a 2,000-character wall would cost more than the question is worth.
 const NGRAM_WINDOW: usize = 128;
+/// Trigrams probed for rarity in all, whatever the number of pieces.
+const NGRAM_PROBE_CAP: usize = 128;
 /// A partial hit is a lexical match when it shares at least this many distinct trigrams ...
 const NGRAM_MIN_SHARED: usize = 3;
 /// ... and at least this percentage of the piece's distinct trigrams.
@@ -747,11 +749,45 @@ fn ngram_pieces(query: &str) -> Vec<Vec<String>> {
             out.push(grams);
         }
     }
-    out
+    cap_round_robin(out, NGRAM_PROBE_CAP)
+}
+
+/// At most `cap` trigrams in all: each piece keeps its first ones, taken one piece at a time in
+/// turn, so a query of many pieces probes a few trigrams of each.
+fn cap_round_robin(pieces: Vec<Vec<String>>, cap: usize) -> Vec<Vec<String>> {
+    if pieces.iter().map(Vec::len).sum::<usize>() <= cap {
+        return pieces;
+    }
+    let mut keep = vec![0usize; pieces.len()];
+    let mut left = cap;
+    while left > 0 {
+        let mut any = false;
+        for (k, p) in keep.iter_mut().zip(&pieces) {
+            if left > 0 && *k < p.len() {
+                *k += 1;
+                left -= 1;
+                any = true;
+            }
+        }
+        if !any {
+            break;
+        }
+    }
+    pieces
+        .into_iter()
+        .zip(keep)
+        .map(|(mut p, k)| {
+            p.truncate(k);
+            p
+        })
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// The trigrams of the query's unspaced pieces that one search reads, chosen by rarity.
 struct NgramPlan {
+    /// How many distinct trigrams were probed for their document frequency.
+    probed: usize,
     /// The trigrams to search, in query order, without repeats.
     terms: Vec<String>,
     /// Per piece: indexes into `terms`, and the number of the piece's distinct trigrams a text
@@ -781,6 +817,7 @@ fn plan_ngrams(conn: &Connection, table: &str, query: &str, budget: usize) -> Ng
     let pieces = ngram_pieces(query);
     if pieces.is_empty() || budget == 0 {
         return NgramPlan {
+            probed: 0,
             terms: Vec::new(),
             pieces: Vec::new(),
         };
@@ -821,6 +858,7 @@ fn plan_ngrams(conn: &Connection, table: &str, query: &str, budget: usize) -> Ng
         })
         .collect();
     NgramPlan {
+        probed: freq.len(),
         terms,
         pieces: plans,
     }
@@ -1775,6 +1813,46 @@ mod tests {
             "{:?}",
             plan.terms
         );
+    }
+
+    /// Fix round 1: the trigrams probed for rarity are capped over the whole query, not per
+    /// piece. A 2,000-character query of about 400 Thai words probes at most 128 and plans no
+    /// more than `MAX_TERMS` terms with the whole pieces.
+    #[test]
+    fn a_many_piece_thai_query_probes_at_most_the_cap_in_all() {
+        let mut x: u32 = 777;
+        let mut q = String::new();
+        while q.chars().count() < 1_990 {
+            let len = 4 + (x >> 8) as usize % 3;
+            for _ in 0..len {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                q.push(char::from_u32(0x0E01 + (x >> 16) % 46).unwrap());
+            }
+            q.push(' ');
+        }
+        let grams: usize = ngram_pieces(&q).iter().map(Vec::len).sum();
+        assert!(grams <= NGRAM_PROBE_CAP, "{grams} candidates");
+        assert!(grams > 100, "the cap is used: {grams}");
+        let (_d, c) = db_with(&[q.as_str()]);
+        let whole = trigram_terms(&q).len();
+        let plan = plan_ngrams(&c, "memories_tri", &q, MAX_TERMS.saturating_sub(whole));
+        assert!(plan.probed <= NGRAM_PROBE_CAP, "{} probes", plan.probed);
+        assert!(whole + plan.terms.len() <= MAX_TERMS);
+        let hits = memory_trigram_hits(&c, &q, 10);
+        assert_eq!(hits.ids.len(), 1);
+    }
+
+    /// Fix round 1: in the raw tier the whole-piece term shares its window with the gram terms
+    /// and a text holding the whole piece is still found, and not weak, with a small window.
+    #[test]
+    fn raw_whole_piece_matches_survive_the_shared_window() {
+        let mut texts: Vec<String> = (0..8).map(|i| format!("ภาษาไทยดีมาก a{i}")).collect();
+        texts.extend((0..8).map(|i| format!("สัญญาเช่าบ้าน b{i}")));
+        let (_d, c, seqs) = chunks_db(&texts);
+        let hits = chunk_trigram_hits_in(&c, "ภาษาไทยดีมาก", 4, 8);
+        assert_eq!(hits.ids.len(), 4, "{hits:?}");
+        assert!(hits.ids.iter().all(|s| seqs[..8].contains(s)), "{hits:?}");
+        assert!(hits.weak.is_empty(), "{hits:?}");
     }
 
     /// Every FTS5 operator and quoting mistake from Review Focus #1, plus short and Thai input.

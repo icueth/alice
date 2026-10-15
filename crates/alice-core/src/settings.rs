@@ -2175,14 +2175,42 @@ mod tests {
             });
             assert!(e.message.contains(needle), "{file:?}: {}", e.message);
         }
-        for (v, ok) in [("1", true), ("200", true), ("0", true), ("1.0", true)] {
-            let key = if v == "0" || v == "1.0" {
-                ("ALICE_SEARCH_BOOST_EXPONENT", "search.boost_exponent")
-            } else {
-                ("ALICE_SEARCH_RRF_K", "search.rrf_k")
-            };
-            let r = resolve(Some(""), &env(&[(key.0, v)]));
-            assert_eq!(r.is_ok(), ok, "{key:?}={v}: {r:?}");
+        for (var, value, key, ok) in [
+            ("ALICE_SEARCH_RRF_K", "1", "search.rrf_k", true),
+            ("ALICE_SEARCH_RRF_K", "200", "search.rrf_k", true),
+            ("ALICE_SEARCH_RRF_K", "0", "search.rrf_k", false),
+            ("ALICE_SEARCH_RRF_K", "201", "search.rrf_k", false),
+            (
+                "ALICE_SEARCH_BOOST_EXPONENT",
+                "0",
+                "search.boost_exponent",
+                true,
+            ),
+            (
+                "ALICE_SEARCH_BOOST_EXPONENT",
+                "1.0",
+                "search.boost_exponent",
+                true,
+            ),
+            (
+                "ALICE_SEARCH_BOOST_EXPONENT",
+                "1.1",
+                "search.boost_exponent",
+                false,
+            ),
+            (
+                "ALICE_SEARCH_BOOST_EXPONENT",
+                "-0.1",
+                "search.boost_exponent",
+                false,
+            ),
+        ] {
+            let r = resolve(Some(""), &env(&[(var, value)]));
+            assert_eq!(r.is_ok(), ok, "{var}={value}: {r:?}");
+            if let Err(errs) = r {
+                let e = errs.iter().find(|e| e.key == key).expect(key);
+                assert!(e.message.contains("outside"), "{}", e.message);
+            }
         }
         let keys = key_infos();
         for k in ["search.rrf_k", "search.boost_exponent"] {
