@@ -369,6 +369,37 @@ impl AliceMcp {
         self.backend.default_cwd()
     }
 
+    /// The project identity of a call: `(project_hint, cwd)`. On a server tenant a client's
+    /// path means nothing (no git there), so `cwd` is none and the hint is the `?project=` of
+    /// the MCP URL, else the name of the client's first root; the service slugifies it. Locally
+    /// the hint stays empty and `cwd` is as `cwd` says.
+    async fn hint_and_cwd(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> (Option<String>, Option<String>) {
+        if !matches!(&self.backend, Backend::Local(s) if s.is_tenant()) {
+            return (None, self.cwd(ctx).await);
+        }
+        let queried = ctx
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|p| p.uri.query())
+            .and_then(|q| {
+                url::form_urlencoded::parse(q.as_bytes())
+                    .find(|(k, v)| k == "project" && !v.trim().is_empty())
+                    .map(|(_, v)| v.into_owned())
+            });
+        let hint = match queried {
+            Some(q) => Some(q),
+            None => self.first_root(ctx).await.and_then(|root| {
+                std::path::Path::new(&root)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            }),
+        };
+        (hint, None)
+    }
+
     /// The client's first root as a local directory, asked once per connection and again after
     /// `roots/list_changed`. A timeout or error is not cached: the next request asks again.
     async fn first_root(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
@@ -411,12 +442,13 @@ impl AliceMcp {
         request: CallToolRequestParams,
         ctx: &RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let (project_hint, cwd) = self.hint_and_cwd(ctx).await;
         let call = CompatCall {
             tool: request.name.to_string(),
             arguments: serde_json::Value::Object(request.arguments.unwrap_or_default()),
-            cwd: self.cwd(ctx).await,
+            cwd,
             agent: Self::agent(ctx),
-            project_hint: None,
+            project_hint,
         };
         match self.backend.compat_call(call).await {
             Ok(r) => text(serde_json::to_string(&r.value).unwrap_or_default()),
@@ -447,7 +479,7 @@ impl AliceMcp {
         Parameters(mut req): Parameters<RecallRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        req.cwd = self.cwd(&ctx).await;
+        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await;
         let format = req.format;
         Ok(match self.backend.recall(req).await {
             Ok(r) if format == OutputFormat::Json => json(&r),
@@ -464,7 +496,7 @@ impl AliceMcp {
         Parameters(mut req): Parameters<RememberRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        req.cwd = self.cwd(&ctx).await;
+        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await;
         if req.author.agent.is_none() {
             req.author.agent = Self::agent(&ctx);
         }
@@ -490,7 +522,7 @@ impl AliceMcp {
         Parameters(mut req): Parameters<ContextRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        req.cwd = self.cwd(&ctx).await;
+        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await;
         Ok(match self.backend.context(req).await {
             Ok(r) => text(r.text),
             Err(e) => tool_err(e),
@@ -788,11 +820,12 @@ impl ServerHandler for AliceMcp {
     ) -> Result<ReadResourceResponse, McpError> {
         let uri = request.uri.clone();
         let body = if uri == "memory://context" {
-            let cwd = self.cwd(&ctx).await;
+            let (project_hint, cwd) = self.hint_and_cwd(&ctx).await;
             let r = self
                 .backend
                 .context(ContextRequest {
                     cwd,
+                    project_hint,
                     ..Default::default()
                 })
                 .await
