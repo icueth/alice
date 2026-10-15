@@ -539,6 +539,7 @@ fn update_action(a: UpdateAction) -> &'static str {
         UpdateAction::Archive => "memory.archive",
         UpdateAction::Forget => "memory.forget",
         UpdateAction::Restore => "memory.restore",
+        UpdateAction::Move => "memory.move",
     }
 }
 
@@ -627,9 +628,58 @@ fn update(
         Some(b) => snap(conn, b)?,
         None => None,
     };
+    // A move into a slug no project has creates its placeholder first, in this transaction;
+    // the event that records it shares the group with the move, so undo reverses both.
+    let mut group = None;
+    if update.action == UpdateAction::Move {
+        let own = memories::id_of(conn, id)?.ok_or_else(|| {
+            AliceError::NotFound(format!(
+                "memory {id}; check the id returned by recall or remember"
+            ))
+        })?;
+        let slug = projects::move_slug(update.project.as_deref().ok_or_else(|| {
+            AliceError::invalid("move needs project: the slug of the project to move it to")
+        })?)?;
+        match projects::resolve_move_target(conn, &slug)? {
+            Some(target) => {
+                let current: String = conn.query_row(
+                    "SELECT project_id FROM memories WHERE id = ?1",
+                    [&own],
+                    |r| r.get(0),
+                )?;
+                if current == target.id {
+                    // Already there: nothing to change, nothing to undo.
+                    let m = memories::get_many(conn, std::slice::from_ref(&own))?
+                        .pop()
+                        .ok_or_else(|| AliceError::NotFound(format!("memory {id}")))?;
+                    return Ok(WriteOutcome::Updated(m, None));
+                }
+            }
+            None => {
+                let g = new_id();
+                let spec = projects::create_placeholder(conn, &slug)?;
+                record(
+                    conn,
+                    st,
+                    EventInput {
+                        actor,
+                        action: projects::PLACEHOLDER_ACTION,
+                        target_type: projects::PLACEHOLDER_TARGET,
+                        target_id: &spec.id,
+                        before: None,
+                        after: Some(serde_json::to_value(&spec).map_err(|e| {
+                            AliceError::Other(format!("placeholder snapshot: {e}"))
+                        })?),
+                        group: Some(&g),
+                    },
+                )?;
+                group = Some(g);
+            }
+        }
+    }
     let m = memories::apply_update(conn, id, update, st.hlc.tick())?;
     st.inserted = true; // edits may need re-embedding
-    let group = by.is_some().then(new_id);
+    let group = group.or_else(|| by.is_some().then(new_id));
     let after = snap(conn, &m.id)?;
     let event = record(
         conn,
@@ -5425,5 +5475,290 @@ mod tests {
         f.h.submit_blocking(remember("and one more")).unwrap();
         let n: i64 = f.read("SELECT count(*) FROM memories", []);
         assert_eq!(n, 8);
+    }
+
+    // ---- `update` action move ----
+
+    fn pref(key: &str, slug: &str) -> ProjectRef {
+        ProjectRef {
+            key: key.into(),
+            slug: slug.into(),
+            name: slug.into(),
+            root: None,
+            remote: None,
+        }
+    }
+
+    fn remember_in(text: &str, slug: &str) -> WriteOp {
+        WriteOp::Remember {
+            input: NewMemoryInput {
+                content: text.into(),
+                ..Default::default()
+            },
+            project: ProjectChoice::Slug(slug.into()),
+        }
+    }
+
+    fn mv(id: &str, project: Option<&str>) -> WriteOp {
+        WriteOp::Update {
+            id: id.into(),
+            update: MemoryUpdate {
+                action: UpdateAction::Move,
+                project: project.map(String::from),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        }
+    }
+
+    fn project_of(f: &Fixture, id: &str) -> String {
+        f.read(
+            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
+            [id],
+        )
+    }
+
+    fn placeholders(f: &Fixture, slug: &str) -> i64 {
+        f.read(
+            "SELECT count(*) FROM projects WHERE key = ?1 AND root_path IS NULL",
+            [format!("import:{slug}")],
+        )
+    }
+
+    fn with_project(f: &Fixture, key: &str, slug: &str) -> ResolvedProject {
+        projects::upsert_project(&open(f.dir.path()), &pref(key, slug)).unwrap()
+    }
+
+    #[test]
+    fn a_move_into_an_existing_project_follows_its_slug_and_its_aliases() {
+        let f = fixture();
+        let other = with_project(&f, "k-other", "other");
+        projects::add_alias(&open(f.dir.path()), "second-name", &other.id).unwrap();
+        let (a, _) = new_id(f.h.submit_blocking(remember("move me to other")).unwrap());
+        let (b, _) = new_id(f.h.submit_blocking(remember("move me by alias")).unwrap());
+        let WriteOutcome::Updated(m, Some(ev)) =
+            f.h.submit_blocking(mv(&a, Some("Other"))).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(m.project, "other");
+        assert_eq!(project_of(&f, &a), "other");
+        f.h.submit_blocking(mv(&b, Some("second-name"))).unwrap();
+        assert_eq!(project_of(&f, &b), "other");
+        let action: String = f.read("SELECT action FROM events WHERE id = ?1", [&ev]);
+        assert_eq!(action, "memory.move");
+        let created: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'project.create'",
+            [],
+        );
+        assert_eq!(created, 0, "an existing project is not created");
+        let projects_now: i64 = f.read("SELECT count(*) FROM projects", []);
+        assert_eq!(projects_now, 2, "global and other");
+    }
+
+    #[test]
+    fn a_move_into_an_unknown_slug_creates_one_placeholder_and_reuses_it() {
+        let f = fixture();
+        let (a, _) = new_id(f.h.submit_blocking(remember("first to move")).unwrap());
+        let (b, _) = new_id(f.h.submit_blocking(remember("second to move")).unwrap());
+        f.h.submit_blocking(mv(&a, Some("Fresh Start"))).unwrap();
+        assert_eq!(project_of(&f, &a), "fresh-start");
+        assert_eq!(placeholders(&f, "fresh-start"), 1);
+        let name: String = f.read(
+            "SELECT name FROM projects WHERE key = 'import:fresh-start'",
+            [],
+        );
+        assert_eq!(name, "fresh-start");
+        let remote: Option<String> = f.read(
+            "SELECT git_remote FROM projects WHERE key = 'import:fresh-start'",
+            [],
+        );
+        assert_eq!(remote, None);
+        f.h.submit_blocking(mv(&b, Some("fresh-start"))).unwrap();
+        assert_eq!(project_of(&f, &b), "fresh-start");
+        assert_eq!(
+            placeholders(&f, "fresh-start"),
+            1,
+            "the second move reuses it"
+        );
+        let created: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'project.create'",
+            [],
+        );
+        assert_eq!(created, 1);
+    }
+
+    #[test]
+    fn a_read_from_an_unstored_checkout_finds_the_placeholder_and_a_write_adopts_it() {
+        let f = fixture();
+        let (a, _) = new_id(
+            f.h.submit_blocking(remember("lives in a placeholder"))
+                .unwrap(),
+        );
+        f.h.submit_blocking(mv(&a, Some("newproj"))).unwrap();
+        let placeholder: String = f.read("SELECT id FROM projects WHERE slug = 'newproj'", []);
+        let checkout = pref("git:newproj-checkout", "newproj");
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        assert_eq!(
+            projects::detected_for_read(&c, &checkout).unwrap(),
+            projects::DetectedForRead::Placeholder(ResolvedProject {
+                id: placeholder.clone(),
+                slug: "newproj".into(),
+                name: "newproj".into(),
+            })
+        );
+        let (b, _) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "first real write".into(),
+                    ..Default::default()
+                },
+                project: ProjectChoice::Detected(checkout),
+            })
+            .unwrap(),
+        );
+        let (id_b, key): (String, String) = (
+            f.read("SELECT project_id FROM memories WHERE id = ?1", [&b]),
+            f.read("SELECT key FROM projects WHERE id = ?1", [&placeholder]),
+        );
+        assert_eq!(id_b, placeholder, "the write adopted the placeholder");
+        assert_eq!(key, "git:newproj-checkout");
+        assert_eq!(project_of(&f, &a), "newproj");
+    }
+
+    #[test]
+    fn undoing_a_move_restores_the_project_and_removes_the_empty_placeholder_it_made() {
+        let f = fixture();
+        let (a, _) = new_id(f.h.submit_blocking(remember("will come back")).unwrap());
+        f.h.submit_blocking(mv(&a, Some("gone-again"))).unwrap();
+        assert_eq!(placeholders(&f, "gone-again"), 1);
+        let placeholder: String = f.read("SELECT id FROM projects WHERE slug = 'gone-again'", []);
+        let WriteOutcome::Undo(UndoOutcome::Undone { reverted, .. }) =
+            undo(&f, &event_of(&f, "memory.move", &a)).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(reverted.len(), 2, "the move and the placeholder's creation");
+        assert_eq!(project_of(&f, &a), "global");
+        assert_eq!(placeholders(&f, "gone-again"), 0);
+        // Undoing the undo puts both back.
+        undo(&f, &event_of(&f, "undo:memory.move", &a)).unwrap();
+        assert_eq!(project_of(&f, &a), "gone-again");
+        let again: String = f.read("SELECT id FROM projects WHERE slug = 'gone-again'", []);
+        assert_eq!(again, placeholder);
+    }
+
+    #[test]
+    fn undoing_a_move_leaves_a_placeholder_that_has_since_received_other_memories() {
+        let f = fixture();
+        let (a, _) = new_id(
+            f.h.submit_blocking(remember("made the placeholder"))
+                .unwrap(),
+        );
+        let (b, _) = new_id(f.h.submit_blocking(remember("arrived later")).unwrap());
+        f.h.submit_blocking(mv(&a, Some("busy"))).unwrap();
+        f.h.submit_blocking(mv(&b, Some("busy"))).unwrap();
+        undo(&f, &event_of(&f, "memory.move", &a)).unwrap();
+        assert_eq!(project_of(&f, &a), "global");
+        assert_eq!(project_of(&f, &b), "busy");
+        assert_eq!(placeholders(&f, "busy"), 1, "it still holds a memory");
+    }
+
+    #[test]
+    fn undoing_a_move_leaves_a_placeholder_that_a_checkout_adopted() {
+        let f = fixture();
+        let (a, _) = new_id(f.h.submit_blocking(remember("adopted soon")).unwrap());
+        f.h.submit_blocking(mv(&a, Some("adoptee"))).unwrap();
+        f.h.submit_blocking(WriteOp::Remember {
+            input: NewMemoryInput {
+                content: "a real write".into(),
+                ..Default::default()
+            },
+            project: ProjectChoice::Detected(pref("git:adoptee", "adoptee")),
+        })
+        .unwrap();
+        undo(&f, &event_of(&f, "memory.move", &a)).unwrap();
+        assert_eq!(project_of(&f, &a), "global");
+        let n: i64 = f.read("SELECT count(*) FROM projects WHERE slug = 'adoptee'", []);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn a_move_that_would_duplicate_text_in_the_target_is_refused_and_creates_nothing() {
+        let f = fixture();
+        with_project(&f, "k-other", "other");
+        let (a, _) = new_id(
+            f.h.submit_blocking(remember("identical text here"))
+                .unwrap(),
+        );
+        f.h.submit_blocking(remember_in("identical text here", "other"))
+            .unwrap();
+        let err = f.h.submit_blocking(mv(&a, Some("other"))).unwrap_err();
+        assert!(err.to_string().contains("same text"), "{err}");
+        assert_eq!(project_of(&f, &a), "global");
+        let moves: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'memory.move'",
+            [],
+        );
+        assert_eq!(moves, 0);
+    }
+
+    #[test]
+    fn moves_into_and_out_of_global_follow_the_store_rules_only() {
+        let f = fixture();
+        with_project(&f, "k-other", "other");
+        let (a, _) = new_id(
+            f.h.submit_blocking(remember_in("project notes", "other"))
+                .unwrap(),
+        );
+        f.h.submit_blocking(mv(&a, Some("global"))).unwrap();
+        assert_eq!(project_of(&f, &a), "global");
+        f.h.submit_blocking(mv(&a, Some("other"))).unwrap();
+        assert_eq!(project_of(&f, &a), "other");
+        assert_eq!(placeholders(&f, "global"), 0);
+        // Into global where the same text already is: the store's same-text check.
+        f.h.submit_blocking(remember("project notes")).unwrap();
+        let err = f.h.submit_blocking(mv(&a, Some("global"))).unwrap_err();
+        assert!(err.to_string().contains("same text"), "{err}");
+    }
+
+    #[test]
+    fn a_move_to_where_the_memory_already_is_changes_and_records_nothing() {
+        let f = fixture();
+        let (a, _) = new_id(f.h.submit_blocking(remember("stay put")).unwrap());
+        let WriteOutcome::Updated(_, event) = f.h.submit_blocking(mv(&a, Some("global"))).unwrap()
+        else {
+            panic!()
+        };
+        assert!(event.is_none());
+        let n: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'memory.move'",
+            [],
+        );
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn a_move_names_an_unknown_memory_a_missing_project_and_a_bad_slug_in_one_sentence() {
+        let f = fixture();
+        let (a, _) = new_id(
+            f.h.submit_blocking(remember("target of bad moves"))
+                .unwrap(),
+        );
+        let cases = [
+            (mv("01K7NOSUCHMEMORY0000000000", Some("x")), "memory"),
+            (mv(&a, None), "needs project"),
+            (mv(&a, Some("   ")), "empty"),
+            (mv(&a, Some("a/b")), "not a project slug"),
+            (mv(&a, Some("..\\x")), "not a project slug"),
+        ];
+        for (op, needle) in cases {
+            let e = f.h.submit_blocking(op).unwrap_err().to_string();
+            assert!(e.contains(needle), "{e}");
+            assert!(!e.trim_end().contains('\n'), "one sentence: {e}");
+        }
+        let n: i64 = f.read("SELECT count(*) FROM projects", []);
+        assert_eq!(n, 1, "no placeholder came of a refused move");
+        assert_eq!(project_of(&f, &a), "global");
     }
 }

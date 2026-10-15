@@ -751,6 +751,78 @@ fn projects_merge_confirms_moves_keeps_the_old_name_and_undoes() {
     assert_eq!(found["results"].as_array().unwrap().len(), 1, "{found}");
 }
 
+/// `alice update <id> --action move --project <slug>`: into a project that does not exist yet (a
+/// placeholder is made), recalled there and no longer in the old one, undone with `alice undo`,
+/// and the three input mistakes each answer in a sentence.
+#[test]
+fn update_move_relocates_a_memory_and_undo_brings_it_back() {
+    let e = Env::new();
+    e.ok(&["remember", "capybara census results", "--project", "global"]);
+    eventually(|| e.recall_count("capybara") == 1, "the memory");
+    let id = e.json(&["recall", "capybara"])["results"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let slugs = |e: &Env| -> Vec<String> {
+        e.ok(&["projects"])
+            .lines()
+            .map(|l| l.split('\t').next().unwrap().to_string())
+            .collect()
+    };
+    let before = slugs(&e);
+
+    for (args, said) in [
+        (vec!["update", &id, "--action", "move"], "needs project"),
+        (
+            vec!["update", &id, "--action", "move", "--project", "a/b"],
+            "not a project slug",
+        ),
+        (
+            vec!["update", &id, "--action", "move", "--project", "  "],
+            "empty",
+        ),
+        (
+            vec![
+                "update",
+                "01K7NOSUCHMEMORY0000000000",
+                "--action",
+                "move",
+                "--project",
+                "x",
+            ],
+            "memory",
+        ),
+    ] {
+        let o = e.run(&args);
+        assert!(!o.status.success(), "{args:?}");
+        assert!(stderr(&o).contains(said), "{args:?}: {}", stderr(&o));
+    }
+    assert_eq!(slugs(&e), before, "a refused move makes no project");
+
+    let out = e.ok(&["update", &id, "--action", "move", "--project", "Zoo Survey"]);
+    assert!(
+        out.starts_with(&format!("{id} is now in project zoo-survey (event "))
+            && out.contains("undo with `alice undo "),
+        "{out}"
+    );
+    assert!(slugs(&e).contains(&"zoo-survey".to_string()));
+    let found = |project: &str| {
+        e.json(&["recall", "capybara", "--project", project, "--limit", "20"])["results"]
+            .as_array()
+            .map_or(0, Vec::len)
+    };
+    assert_eq!((found("zoo-survey"), found("global")), (1, 0));
+
+    let event = out
+        .rsplit("alice undo ")
+        .next()
+        .unwrap()
+        .trim_end_matches(['`', ')', '\n'])
+        .to_string();
+    e.ok(&["undo", &event]);
+    assert_eq!((found("global"), slugs(&e)), (1, before));
+}
+
 /// The pending entries in the spool.
 fn spooled(e: &Env) -> usize {
     std::fs::read_dir(e.home.join("spool"))

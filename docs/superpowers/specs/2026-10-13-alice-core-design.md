@@ -584,7 +584,7 @@ alice recall <query> [--project p] [--kind k] [--topic t] [--raw] [--precise] [-
 alice remember [--kind k] [--title t] [--topic t]... [--project p] [--importance 1-5]
                [--supersedes id]... (<text> | -)
 alice context [--project p] [--max-tokens n]
-alice get <id>... [--provenance]       alice update <id> --action edit|supersede|archive|forget|restore ...
+alice get <id>... [--provenance]       alice update <id> --action edit|supersede|archive|forget|restore|move ...
 alice facts <entity> [--predicate p] [--as-of date] [--timeline]
 alice fact add|supersede|end <subject> <predicate> <object> [--from date]
 alice history [target] [--actor a] [--limit n]       alice undo <event-id>

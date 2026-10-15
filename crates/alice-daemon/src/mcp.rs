@@ -10,6 +10,7 @@ use crate::service::Service;
 use alice_core::api::*;
 use alice_core::error::AliceError;
 use alice_core::model::Author;
+use alice_core::store::memories::UpdateAction;
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -518,6 +519,12 @@ impl AliceMcp {
         Parameters(mut req): Parameters<UpdateRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // Moving between projects is for the CLI and the HTTP API; the tool never offers it.
+        if req.update.action == UpdateAction::Move || req.update.project.is_some() {
+            return Ok(tool_err(AliceError::invalid(
+                "update_memory cannot move a memory between projects; use `alice update <id> --action move --project <slug>`",
+            )));
+        }
         // The change is the client's: history records it as `agent:<client name>`.
         if req.author.agent.is_none() {
             req.author.agent = Self::agent(&ctx);

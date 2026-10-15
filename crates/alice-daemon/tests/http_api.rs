@@ -256,6 +256,59 @@ async fn update_returns_its_event_id() {
     );
 }
 
+/// `move` over HTTP: the memory leaves its project for a placeholder that is created on the way,
+/// recall in the new project finds it and the old one no longer does, and undo reverses both.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_move_relocates_a_memory_and_undo_reverses_it() {
+    let s = Srv::start().await;
+    let r: RememberResponse = s
+        .post_json(
+            "/api/v1/remember",
+            &serde_json::json!({"content": "zebrafish husbandry notes", "project": "global"}),
+        )
+        .await;
+    let id = r.id.unwrap();
+    let recall = |project: &'static str| {
+        let s = &s;
+        async move {
+            let r: serde_json::Value = s
+                .post_json(
+                    "/api/v1/recall",
+                    &serde_json::json!({"query": "zebrafish", "project": project, "format": "json"}),
+                )
+                .await;
+            r["results"].as_array().map_or(0, Vec::len)
+        }
+    };
+    let moved: MemoryFull = s
+        .post_json(
+            "/api/v1/update",
+            &serde_json::json!({"id": id, "action": "move", "project": "Lab Notes"}),
+        )
+        .await;
+    assert_eq!(moved.memory.project, "lab-notes");
+    let ev = moved.event_id.expect("a move is undoable");
+    assert_eq!(recall("lab-notes").await, 1);
+    assert_eq!(recall("global").await, 0);
+    let _: serde_json::Value = s
+        .post_json("/api/v1/undo", &serde_json::json!({"event_id": ev}))
+        .await;
+    assert_eq!(recall("global").await, 1);
+    let projects: serde_json::Value = s.get_json("/api/v1/projects").await;
+    assert!(
+        !projects.to_string().contains("lab-notes"),
+        "the empty placeholder is gone: {projects}"
+    );
+    let bad = s
+        .post(
+            "/api/v1/update",
+            &serde_json::json!({"id": id, "action": "move"}),
+        )
+        .await;
+    assert_eq!(bad.status(), 400);
+    assert!(bad.text().await.unwrap().contains("needs project"));
+}
+
 /// Undo never overwrites a later change: the answer is a review item, not an error.
 #[tokio::test(flavor = "multi_thread")]
 async fn undo_after_a_later_change_answers_with_a_review_item() {

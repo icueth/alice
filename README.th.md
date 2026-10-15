@@ -189,6 +189,7 @@ alice remember [--kind k] [--title t] [--topic t]... [--project p] [--importance
 alice context [--project p] [--max-tokens n]
 alice get <id>... [--provenance]
 alice update <id> --action edit|supersede|archive|forget|restore [--title t] [--body b] [--by id]
+alice update <id> --action move --project <slug>   (CLI and HTTP only, not MCP; undoable)
 alice facts <entity> [--predicate p] [--as-of date] [--timeline]
 alice fact add|supersede|end <subject> <predicate> <object> [--from date]
 alice history [target] [--actor a] [--limit n]       # ใครเปลี่ยนอะไร

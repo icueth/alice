@@ -9,6 +9,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Keys starting with this belong to projects created by an import before any checkout existed.
 pub const PLACEHOLDER_KEY_PREFIX: &str = "import:";
 
+/// The event a move records when it creates the placeholder it moves into, and its target type.
+pub const PLACEHOLDER_ACTION: &str = "project.create";
+pub const PLACEHOLDER_TARGET: &str = "placeholder";
+
 pub const GLOBAL_ID: &str = "00000000000000000000GLOBAL";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -232,6 +236,118 @@ pub fn resolve_slug(conn: &Connection, slug_or_alias: &str) -> Result<Option<Res
             row,
         )
         .optional()?)
+}
+
+/// The slug a `move` names: slugified, never empty, and never a path (a `/` or `\\` is a typo,
+/// not a separator to quietly turn into a dash).
+pub fn move_slug(raw: &str) -> Result<String> {
+    if raw.contains(['/', '\\']) {
+        return Err(AliceError::invalid(format!(
+            "project {raw:?} is not a project slug; name the project, not a path"
+        )));
+    }
+    let slug = slugify(raw);
+    if slug.is_empty() {
+        return Err(AliceError::invalid(
+            "project is empty after normalisation; pass a project slug made of letters or digits",
+        ));
+    }
+    Ok(slug)
+}
+
+/// The project a move into `slug` (already through [`move_slug`]) lands in: a project by slug
+/// or alias, or the project a placeholder of that slug was merged into. `None`: no such project.
+pub fn resolve_move_target(conn: &Connection, slug: &str) -> Result<Option<ResolvedProject>> {
+    if let Some(p) = resolve_slug(conn, slug)? {
+        return Ok(Some(p));
+    }
+    find_by_key(conn, &format!("{PLACEHOLDER_KEY_PREFIX}{slug}"))
+}
+
+/// A placeholder project as an event records it: what undo needs to remove it again, or to
+/// bring it back when that undo is itself undone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlaceholderState {
+    pub id: String,
+    pub key: String,
+    pub slug: String,
+    pub name: String,
+    /// Whether the project row exists now (always true in the event of the creation itself).
+    pub present: bool,
+}
+
+/// Create the placeholder project `import:<slug>` (no root, no remote) for a slug no project has.
+pub fn create_placeholder(conn: &Connection, slug: &str) -> Result<PlaceholderState> {
+    let p = upsert_project(
+        conn,
+        &ProjectRef {
+            key: format!("{PLACEHOLDER_KEY_PREFIX}{slug}"),
+            slug: slug.to_string(),
+            name: slug.to_string(),
+            root: None,
+            remote: None,
+        },
+    )?;
+    Ok(PlaceholderState {
+        id: p.id,
+        key: format!("{PLACEHOLDER_KEY_PREFIX}{slug}"),
+        slug: p.slug,
+        name: p.name,
+        present: true,
+    })
+}
+
+/// `spec` as it is now (`present` follows the project row).
+pub fn placeholder_now(conn: &Connection, spec: &PlaceholderState) -> Result<PlaceholderState> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM projects WHERE id = ?1",
+        [&spec.id],
+        |r| r.get(0),
+    )?;
+    Ok(PlaceholderState {
+        present: n > 0,
+        ..spec.clone()
+    })
+}
+
+/// Remove the placeholder `spec` names, but only while it is still the empty shell the move
+/// made: key still `import:…`, no root, and no memory, chunk, source, alias or merged key
+/// pointing at it. Anything else leaves it. Returns whether it was removed.
+pub fn remove_empty_placeholder(conn: &Connection, spec: &PlaceholderState) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM projects p WHERE p.id = ?1 AND p.key = ?2 AND p.root_path IS NULL
+           AND NOT EXISTS (SELECT 1 FROM memories WHERE project_id = p.id)
+           AND NOT EXISTS (SELECT 1 FROM chunks WHERE project_id = p.id)
+           AND NOT EXISTS (SELECT 1 FROM sources WHERE project_id = p.id)
+           AND NOT EXISTS (SELECT 1 FROM project_aliases WHERE project_id = p.id)
+           AND NOT EXISTS (SELECT 1 FROM project_key_aliases WHERE project_id = p.id)",
+        params![spec.id, spec.key],
+        |r| r.get(0),
+    )?;
+    if n == 0 {
+        return Ok(false);
+    }
+    conn.execute("DELETE FROM projects WHERE id = ?1", [&spec.id])?;
+    Ok(true)
+}
+
+/// Bring a removed placeholder back (undoing its removal). A slug someone took meanwhile makes
+/// the undo impossible, said so.
+pub fn recreate_placeholder(conn: &Connection, spec: &PlaceholderState) -> Result<()> {
+    if placeholder_now(conn, spec)?.present {
+        return Ok(());
+    }
+    if slug_taken(conn, &spec.slug)? || find_by_own_key(conn, &spec.key)?.is_some() {
+        return Err(AliceError::invalid(format!(
+            "cannot undo: project {} exists again; nothing was changed",
+            spec.slug
+        )));
+    }
+    conn.execute(
+        "INSERT INTO projects (id, key, slug, name, git_remote, root_path, created_at) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5)",
+        params![spec.id, spec.key, spec.slug, spec.name, now_rfc3339()],
+    )?;
+    Ok(())
 }
 
 /// Point `alias` (slugified) at a project, moving it if it already names another project.
