@@ -32,7 +32,7 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
 - **ความรู้มาก่อน transcript ดิบเรียกเมื่อต้องการ** ข้อมูลมี 2 ชั้น ชั้นแรกคือ *memory* สั้นๆ ที่กลั่นแล้ว (decision, การแก้บั๊ก, fact, how-to, preference, warning, handoff) ซึ่งค้นหาเป็นค่าเริ่มต้น ชั้นที่สองคือ transcript ดิบที่เก็บไว้เป็นหลักฐาน ค้นเมื่อขอหรือเมื่อชั้นแรกมีผลไม่พอ *(การเก็บ transcript และกลั่นความรู้อัตโนมัติ: วางแผนไว้ใน SP2)*
 - **ค้นเข้าใจทั้งโค้ดและภาษาไทย** รวมการค้น 4 แบบ: vector หลายภาษา, BM25, trigram สำหรับภาษาที่ไม่เว้นวรรค (ไทย จีน ญี่ปุ่น) และการค้นที่เข้าใจชื่อในโค้ด (`HostLinkReconnect`, `writer_lease`, path ไฟล์) ผลค้นหาให้น้ำหนักกับโปรเจกต์ปัจจุบัน ความสดใหม่ ความสำคัญ และสถานะ
 - **ความจำแก้ตัวเองได้** memory ใหม่จะถูกเทียบกับของเดิมที่คล้ายกัน ข้อความที่เหมือนกันเป๊ะจะรวมเข้ากับอันเก่า ถ้าเปิด Judge จะให้ข้อมูลใหม่แทนที่ (supersede) ของเก่าได้ และเรื่องขัดแย้งจะเข้าคิว review (`alice review`) ทุกการเปลี่ยนแปลงถูกบันทึกไว้ (`alice history`) และ undo ได้ (`alice undo`)
-- **มี AI Judge ให้เลือกเปิด** ต่อกับ [TypeSafe Jev](https://typesafe.ai) เพื่อช่วยตัดสินใจ (กันซ้ำ, ระบุ kind, จัดเข้าโปรเจกต์, เรียงผลค้นหา) ด้วยความน่าจะเป็นที่เชื่อถือได้ ตั้งเกณฑ์ความมั่นใจได้ มี cache และมีงบรายวันที่ใช้เกินไม่ได้ ถ้าไม่เปิด Alice จะใช้กฎที่ทำงานในเครื่อง ซึ่งรวมเฉพาะข้อความที่เหมือนกันทุกตัวอักษร ส่วนที่เหลือทิ้งไว้ให้คุณตรวจ
+- **มี AI Judge ให้เลือกเปิด** ต่อกับ [TypeSafe Jev](https://typesafe.ai) เพื่อช่วยตัดสินใจ (กันซ้ำ, ระบุ kind, จัดเข้าโปรเจกต์, ให้คะแนนผลค้นหา) ด้วยความน่าจะเป็นที่เชื่อถือได้ ตั้งเกณฑ์ความมั่นใจได้ มี cache และมีงบรายวันที่ใช้เกินไม่ได้ ถ้าไม่เปิด Alice จะใช้กฎที่ทำงานในเครื่อง ซึ่งรวมเฉพาะข้อความที่เหมือนกันทุกตัวอักษร ส่วนที่เหลือทิ้งไว้ให้คุณตรวจ
 - **MCP tool น้อยแต่ตรงจุด** มี tool หลัก 7 ตัว (`recall`, `remember`, `context`, `get_memory`, `update_memory`, `query_facts`, `assert_fact`) แทนที่จะมีหลายสิบตัว ผลลัพธ์กระชับและคุมจำนวน token ได้ มีคำแนะนำการใช้งานในตัว พร้อม slash command และ resource ชุด tool สำหรับดูแลระบบ (review, รวม memory, สถิติ) พร้อมให้เปิดเมื่อต้องการ
 - **ได้สรุปสั้น ไม่ใช่ข้อมูลทั้งก้อน** `context` สรุปสิ่งสำคัญของโปรเจกต์ปัจจุบันให้อยู่ในงบ token ที่กำหนด: memory หลัก, decision ล่าสุด, warning, handoff ล่าสุด และ preference ของคุณ
 - **Knowledge graph ที่รู้เรื่องเวลา** เก็บ entity และ relation พร้อมช่วงเวลาที่ข้อมูลยังเป็นจริง ถามย้อนเวลาได้ด้วย `as_of` และดูเป็น timeline ได้ มีพจนานุกรม predicate กันไม่ให้เกิด `has_bug` กับ `had_bug` ปนกัน
@@ -169,7 +169,7 @@ agent ที่ใช้ MCP ไม่ได้ เรียกผ่าน CLI 
 
 | Tool | หน้าที่ |
 |---|---|
-| `recall` | ค้นหา memory กรองตามโปรเจกต์, topic, kind และช่วงวันได้ ใส่ `include_raw` เพื่อค้น transcript ด้วย กำหนดงบ `max_tokens` ได้ `mode: precise` ให้ Judge เรียงผลอันดับต้น ๆ ใหม่ (ช้ากว่า ต้องตั้ง `judge.provider = jev`) |
+| `recall` | ค้นหา memory กรองตามโปรเจกต์, topic, kind และช่วงวันได้ ใส่ `include_raw` เพื่อค้น transcript ด้วย กำหนดงบ `max_tokens` ได้ เมื่อตั้ง model judge ไว้ (`judge.provider = jev`) recall จะเป็นแบบ **precise** เป็นค่าเริ่มต้น: Judge ให้คะแนนผลอันดับต้น ๆ 20 อันของทุกชั้น รวมถึง chunk ของ transcript และช่วยดึงคำตอบที่ต่ำกว่าเกณฑ์ vector เพียงนิดเดียวกลับมา (ช้ากว่า ราวครึ่งวินาที) `mode: "fast"` ข้าม Judge และ `mode: "precise"` บังคับใช้ ถ้าไม่มี model judge recall เป็นแบบ fast เสมอ |
 | `remember` | บันทึก memory (`kind`, `title`, `topics`, `importance`, `supersedes`) เรียกซ้ำได้ปลอดภัย |
 | `context` | สรุปของโปรเจกต์ปัจจุบันภายในงบ token |
 | `get_memory` | ดู memory ฉบับเต็ม พร้อม link และแหล่งที่มา ถ้าขอ memory ที่ Judge รวมเข้ากับอันเก่าไปแล้ว จะได้อันเก่ากลับมา |
@@ -182,7 +182,7 @@ server ส่งคำแนะนำการใช้งานให้ agent 
 ## CLI
 
 ```
-alice recall <query> [--project p] [--kind k]... [--topic t]... [--raw] [--precise] [--limit n]
+alice recall <query> [--project p] [--kind k]... [--topic t]... [--raw] [--precise | --fast] [--limit n]
              [--max-tokens n] [--since date] [--before date]
 alice remember [--kind k] [--title t] [--topic t]... [--project p] [--importance 1-5]
                [--supersedes id]... (<text> | -)
@@ -237,6 +237,7 @@ endpoint = "http://127.0.0.1:11434/v1"   # ไม่ใส่ก็ได้ แ
 
 [search]
 default_max_tokens = 1500
+default_mode = "auto"                # auto (precise เมื่อมี model judge ไม่งั้น fast) | fast | precise
 
 [maintenance]
 enabled = true
