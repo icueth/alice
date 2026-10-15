@@ -1403,6 +1403,10 @@ impl Service {
                     chunk_floor: Some(search::CHUNK_RELEVANCE_FLOOR),
                     raw_min_results: cfg.search.raw_fallback_min_results,
                     half_lives: cfg.search.half_life.clone(),
+                    fusion: search::fusion::Fusion {
+                        rrf_k: cfg.search.rrf_k,
+                        boost_exponent: cfg.search.boost_exponent,
+                    },
                     lists: search::Lists::Hybrid,
                 };
                 let out = search::run_with_chunk_reads(
@@ -4829,6 +4833,46 @@ mod tests {
         );
     }
 
+    /// Task 19: `search.rrf_k` and `search.boost_exponent` apply to the next recall like the
+    /// other `search.*` keys. With the exponent 0 the score is the fused rank score alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rrf_k_and_boost_exponent_apply_to_the_next_recall_without_a_restart() {
+        let (d, s) = svc().await;
+        let cwd = repo(&d, "proj");
+        s.remember(RememberRequest {
+            content: "lease timeouts in the hub writer".into(),
+            cwd: cwd.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_settled(&s).await;
+        let top = |s: &Arc<Service>| {
+            let s = s.clone();
+            let req = RecallRequest {
+                query: "writer hub lease timeout problem".into(),
+                cwd: cwd.clone(),
+                format: OutputFormat::Json,
+                ..Default::default()
+            };
+            async move { s.recall(req).await.unwrap().results[0].score }
+        };
+        let base = top(&s).await;
+        let out = s
+            .patch_settings(patch_one("search.boost_exponent", serde_json::json!(0.0)))
+            .unwrap();
+        assert_eq!(out.changed, vec!["search.boost_exponent".to_string()]);
+        let flat = top(&s).await;
+        assert_ne!(flat, base, "the boosts no longer weigh: {base} -> {flat}");
+        s.patch_settings(patch_one("search.rrf_k", serde_json::json!(1)))
+            .unwrap();
+        let sharp = top(&s).await;
+        assert!(
+            sharp > flat,
+            "a smaller k gives the first place more: {flat} -> {sharp}"
+        );
+    }
+
     /// The token budget of a recall and the half-lives come from the settings too.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_default_token_budget_is_a_setting() {
@@ -7304,6 +7348,35 @@ mod tests {
             before,
             "nothing is sent against a budget of zero"
         );
+    }
+
+    /// A PATCH that has returned is seen by the very next precise recall: the judge in force
+    /// reads the budget from the settings at each call, not from the one it was built with (the
+    /// rebuild after a `judge.*` change runs in the background). Without that, a recall right
+    /// after a budget of zero was still graded and billed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_budget_patched_to_zero_stops_the_very_next_precise_recall() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        for round in 0..40 {
+            s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(0.0)))
+                .unwrap();
+            let r = s
+                .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+                .await
+                .unwrap();
+            assert!(
+                !r.reranked,
+                "round {round}: graded against a budget of zero"
+            );
+            assert_eq!(t.graded(), 0, "round {round}: a request was sent");
+            // Back up, without a recall: the next round starts from a judge that has not
+            // been rebuilt yet, which is the window the bug lived in.
+            s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(1.0)))
+                .unwrap();
+        }
     }
 
     /// Precise mode sends the query and results of allowed projects only, scoped to the

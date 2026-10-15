@@ -3,7 +3,43 @@
 use crate::model::{Kind, Status};
 use std::collections::HashMap;
 
-pub const RRF_K: f64 = 60.0;
+/// Default `search.rrf_k`: the constant of reciprocal rank fusion (a smaller k lets a list's
+/// first places count for more).
+pub const DEFAULT_RRF_K: f64 = 10.0;
+/// Default `search.boost_exponent`: the weight of the priors in the final score.
+pub const DEFAULT_BOOST_EXPONENT: f64 = 0.5;
+
+/// How the candidate lists and the priors are combined: `score = rrf_k(item) × boost(item)^λ`.
+/// The `search.rrf_k` and `search.boost_exponent` settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fusion {
+    /// The k of reciprocal rank fusion (1 to 200).
+    pub rrf_k: f64,
+    /// λ, the exponent of the boost product (0 to 1): 1 multiplies the boosts in whole, 0 ignores them.
+    pub boost_exponent: f64,
+}
+
+impl Default for Fusion {
+    fn default() -> Self {
+        Self {
+            rrf_k: DEFAULT_RRF_K,
+            boost_exponent: DEFAULT_BOOST_EXPONENT,
+        }
+    }
+}
+
+impl Fusion {
+    /// The final score of an item: its fused rank score times its boosts to the power λ.
+    ///
+    /// ```
+    /// use alice_core::search::fusion::Fusion;
+    /// let f = Fusion { rrf_k: 60.0, boost_exponent: 0.5 };
+    /// assert!((f.combine(0.02, 4.0) - 0.04).abs() < 1e-12);
+    /// ```
+    pub fn combine(&self, rrf_score: f64, boost: f64) -> f64 {
+        rrf_score * boost.powf(self.boost_exponent)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ItemRef {
@@ -12,11 +48,11 @@ pub enum ItemRef {
 }
 
 /// Sum of 1 / (k + rank) over every list an item appears in (rank starts at 1).
-pub fn rrf(lists: &[Vec<ItemRef>]) -> HashMap<ItemRef, f64> {
+pub fn rrf(lists: &[Vec<ItemRef>], k: f64) -> HashMap<ItemRef, f64> {
     let mut scores = HashMap::new();
     for list in lists {
         for (i, item) in list.iter().enumerate() {
-            *scores.entry(*item).or_insert(0.0) += 1.0 / (RRF_K + (i + 1) as f64);
+            *scores.entry(*item).or_insert(0.0) += 1.0 / (k + (i + 1) as f64);
         }
     }
     scores
@@ -67,15 +103,15 @@ pub struct HalfLives {
     pub handoff: f64,
     /// Days for `diary` memories (0 = no decay).
     pub diary: f64,
-    /// Days for `note` memories (0 = no decay).
+    /// Days for `note` memories (0 = no decay, the default).
     pub note: f64,
-    /// Days for `fact` memories (0 = no decay).
+    /// Days for `fact` memories (0 = no decay, the default).
     pub fact: f64,
-    /// Days for `howto` memories (0 = no decay).
+    /// Days for `howto` memories (0 = no decay, the default).
     pub howto: f64,
-    /// Days for `bugfix` memories (0 = no decay).
+    /// Days for `bugfix` memories (0 = no decay, the default).
     pub bugfix: f64,
-    /// Days for `summary` memories (0 = no decay).
+    /// Days for `summary` memories (0 = no decay, the default).
     pub summary: f64,
     /// Days for `decision` memories (0 = no decay).
     pub decision: f64,
@@ -93,11 +129,11 @@ impl Default for HalfLives {
             status: 7.0,
             handoff: 14.0,
             diary: 30.0,
-            note: 90.0,
-            fact: 180.0,
-            howto: 180.0,
-            bugfix: 180.0,
-            summary: 180.0,
+            note: 0.0,
+            fact: 0.0,
+            howto: 0.0,
+            bugfix: 0.0,
+            summary: 0.0,
             decision: 0.0,
             preference: 0.0,
             warning: 0.0,
@@ -187,10 +223,10 @@ mod tests {
     fn rrf_rewards_items_found_by_several_lists() {
         let a = ItemRef::Memory(1);
         let b = ItemRef::Memory(2);
-        let s = rrf(&[vec![a, b], vec![a]]);
+        let s = rrf(&[vec![a, b], vec![a]], 60.0);
         assert!(s[&a] > s[&b]);
         assert!((s[&b] - 1.0 / 62.0).abs() < 1e-9);
-        assert!(rrf(&[vec![], vec![]]).is_empty());
+        assert!(rrf(&[vec![], vec![]], 60.0).is_empty());
     }
 
     fn base() -> BoostInput {
@@ -344,5 +380,58 @@ mod tests {
             },
         );
         assert!((negative - 1.05).abs() < 1e-9);
+    }
+
+    /// The fused score of an item that sits at `ranks` (1-based) in lists, times its boost.
+    fn final_score(f: &Fusion, ranks: &[usize], boost: f64) -> f64 {
+        let rrf: f64 = ranks.iter().map(|r| 1.0 / (f.rrf_k + *r as f64)).sum();
+        f.combine(rrf, boost)
+    }
+
+    /// Task 19, ruling 2: relevance leads and the priors break ties. An item first in two lists
+    /// (a raw chunk from another project, 0.6, aged to 0.73) outranks one 20th in both lists
+    /// that is in the current project (1.3) at the defaults, and does not at the old k = 60,
+    /// λ = 1 (so the two settings are what changed the order).
+    #[test]
+    fn relevance_outranks_priors_at_the_defaults_and_not_at_the_old_ones() {
+        let (first, twentieth) = (0.6 * 0.73, 1.3);
+        let d = Fusion::default();
+        assert!(
+            final_score(&d, &[1, 1], first) > final_score(&d, &[20, 20], twentieth),
+            "defaults {d:?}"
+        );
+        let old = Fusion {
+            rrf_k: 60.0,
+            boost_exponent: 1.0,
+        };
+        assert!(final_score(&old, &[1, 1], first) < final_score(&old, &[20, 20], twentieth));
+    }
+
+    #[test]
+    fn the_exponent_scales_the_priors_in_the_log_domain() {
+        let f = Fusion {
+            rrf_k: 60.0,
+            boost_exponent: 0.0,
+        };
+        assert_eq!(f.combine(0.03, 123.0), 0.03, "λ = 0 ignores the boosts");
+        let f = Fusion {
+            rrf_k: 60.0,
+            boost_exponent: 1.0,
+        };
+        assert!(
+            (f.combine(0.03, 2.0) - 0.06).abs() < 1e-12,
+            "λ = 1 multiplies"
+        );
+    }
+
+    /// The published defaults are the module's constants, in range of the settings' rules.
+    #[test]
+    fn default_fusion_is_in_the_valid_range() {
+        let d = Fusion::default();
+        assert_eq!(
+            (d.rrf_k, d.boost_exponent),
+            (DEFAULT_RRF_K, DEFAULT_BOOST_EXPONENT)
+        );
+        assert!((1.0..=200.0).contains(&d.rrf_k) && (0.0..=1.0).contains(&d.boost_exponent));
     }
 }

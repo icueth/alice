@@ -419,6 +419,14 @@ pub struct SearchSettings {
     pub relevance_margin: f64,
     /// Fewer relevant memories than this bring in raw transcript chunks (0 to 50).
     pub raw_fallback_min_results: usize,
+    /// The k of reciprocal rank fusion (1 to 200): the smaller it is, the more the first places of
+    /// a candidate list count against the later ones.
+    pub rrf_k: f64,
+    /// How strongly the boosts (tier, project, recency, importance, use, status) weigh against
+    /// relevance (0 to 1): the score is the fused rank score times the boost product to this
+    /// power. 1 multiplies the boosts in whole; 0 ignores them; a smaller value lets them break
+    /// ties between about equally relevant results.
+    pub boost_exponent: f64,
     /// Ranking multipliers.
     pub weights: Weights,
     /// Recency half-lives in days per kind of memory (0 = no decay).
@@ -435,6 +443,8 @@ impl Default for SearchSettings {
             relevance_sure: 0.825,
             relevance_margin: 0.015,
             raw_fallback_min_results: 3,
+            rrf_k: crate::search::fusion::DEFAULT_RRF_K,
+            boost_exponent: crate::search::fusion::DEFAULT_BOOST_EXPONENT,
             weights: Weights::default(),
             half_life: HalfLives::default(),
         }
@@ -1422,6 +1432,18 @@ impl Settings {
                 "must be between 100 and 50000",
             ));
         }
+        if !(1.0..=200.0).contains(&s.rrf_k) {
+            e.push(err(
+                "search.rrf_k",
+                format!("{} is outside 1 and 200", s.rrf_k),
+            ));
+        }
+        if !(0.0..=1.0).contains(&s.boost_exponent) {
+            e.push(err(
+                "search.boost_exponent",
+                format!("{} is outside 0 and 1", s.boost_exponent),
+            ));
+        }
         if s.raw_fallback_min_results > crate::model::limits::MAX_RECALL_LIMIT {
             e.push(err(
                 "search.raw_fallback_min_results",
@@ -2116,6 +2138,110 @@ mod tests {
         assert_eq!((s.backup.daily, s.backup.weekly), (7, 4));
         assert_eq!(s.secrets.backend, SecretsBackend::File);
         assert!(!s.mcp.admin_tools);
+    }
+
+    /// Task 19: `search.rrf_k` and `search.boost_exponent` are ordinary search settings with
+    /// ranges, a place in the key list and the schema, and an environment variable.
+    #[test]
+    fn rrf_k_and_boost_exponent_are_validated_search_settings() {
+        let d = Settings::default();
+        assert_eq!(d.search.rrf_k, crate::search::fusion::DEFAULT_RRF_K);
+        assert_eq!(
+            d.search.boost_exponent,
+            crate::search::fusion::DEFAULT_BOOST_EXPONENT
+        );
+        let ok = resolve(Some("[search]\nrrf_k = 20\nboost_exponent = 0.5\n"), &[]).unwrap();
+        assert_eq!(
+            (ok.settings.search.rrf_k, ok.settings.search.boost_exponent),
+            (20.0, 0.5)
+        );
+        for (file, key, needle) in [
+            ("[search]\nrrf_k = 0\n", "search.rrf_k", "1 and 200"),
+            ("[search]\nrrf_k = 201\n", "search.rrf_k", "1 and 200"),
+            (
+                "[search]\nboost_exponent = -0.1\n",
+                "search.boost_exponent",
+                "0 and 1",
+            ),
+            (
+                "[search]\nboost_exponent = 1.1\n",
+                "search.boost_exponent",
+                "0 and 1",
+            ),
+        ] {
+            let errs = resolve(Some(file), &[]).unwrap_err();
+            let e = errs.iter().find(|e| e.key == key).unwrap_or_else(|| {
+                panic!("{file:?}: no error for {key}: {errs:?}");
+            });
+            assert!(e.message.contains(needle), "{file:?}: {}", e.message);
+        }
+        for (var, value, key, ok) in [
+            ("ALICE_SEARCH_RRF_K", "1", "search.rrf_k", true),
+            ("ALICE_SEARCH_RRF_K", "200", "search.rrf_k", true),
+            ("ALICE_SEARCH_RRF_K", "0", "search.rrf_k", false),
+            ("ALICE_SEARCH_RRF_K", "201", "search.rrf_k", false),
+            (
+                "ALICE_SEARCH_BOOST_EXPONENT",
+                "0",
+                "search.boost_exponent",
+                true,
+            ),
+            (
+                "ALICE_SEARCH_BOOST_EXPONENT",
+                "1.0",
+                "search.boost_exponent",
+                true,
+            ),
+            (
+                "ALICE_SEARCH_BOOST_EXPONENT",
+                "1.1",
+                "search.boost_exponent",
+                false,
+            ),
+            (
+                "ALICE_SEARCH_BOOST_EXPONENT",
+                "-0.1",
+                "search.boost_exponent",
+                false,
+            ),
+        ] {
+            let r = resolve(Some(""), &env(&[(var, value)]));
+            assert_eq!(r.is_ok(), ok, "{var}={value}: {r:?}");
+            if let Err(errs) = r {
+                let e = errs.iter().find(|e| e.key == key).expect(key);
+                assert!(e.message.contains("outside"), "{}", e.message);
+            }
+        }
+        let keys = key_infos();
+        for k in ["search.rrf_k", "search.boost_exponent"] {
+            let info = keys
+                .iter()
+                .find(|i| i.key == k)
+                .unwrap_or_else(|| panic!("{k}"));
+            assert!(
+                !info.restart && !info.read_only && !info.not_used_yet,
+                "{k}"
+            );
+        }
+        // Neither is a protective key: loosening them says nothing about protections.
+        let mut loose = Settings::default();
+        loose.search.rrf_k = 1.0;
+        loose.search.boost_exponent = 0.0;
+        assert!(loosened_protections(&Settings::default(), &loose).is_empty());
+    }
+
+    /// The new keys can be set from the settings file by `edit_toml` and read back.
+    #[test]
+    fn rrf_k_and_boost_exponent_round_trip_through_the_file_and_the_view() {
+        let t = edit_toml("", "search.rrf_k", &serde_json::json!(10)).unwrap();
+        let t = edit_toml(&t, "search.boost_exponent", &serde_json::json!(0.25)).unwrap();
+        let s = resolve(Some(&t), &[]).unwrap().settings;
+        assert_eq!((s.search.rrf_k, s.search.boost_exponent), (10.0, 0.25));
+        assert_eq!(get_key(&s, "search.rrf_k"), Some(serde_json::json!(10.0)));
+        assert_eq!(
+            get_key(&s, "search.boost_exponent"),
+            Some(serde_json::json!(0.25))
+        );
     }
 
     /// The settings defaults are the values the code used before settings existed.

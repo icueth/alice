@@ -17,7 +17,9 @@ use alice_core::model::Kind;
 use alice_core::project::ProjectRef;
 use alice_core::search::{
     CHUNK_RELEVANCE_FLOOR, DEFAULT_RELEVANCE_FLOOR, DEFAULT_RELEVANCE_MARGIN,
-    DEFAULT_RELEVANCE_SURE, SearchParams, fusion::Weights, run,
+    DEFAULT_RELEVANCE_SURE, SearchParams,
+    fusion::{Fusion, Weights},
+    run,
 };
 use alice_core::store::embeddings::VecKey;
 use alice_core::store::{memories, open_writer, projects, sources};
@@ -139,6 +141,21 @@ const PIN_MARGIN: f32 = 0.02;
 /// A row the policy decides is pinned only when its similarity is at least this far from both
 /// floors: closer, the 0.002 that separates Apple Silicon from x86-64 on this model decides it.
 const DECIDED_EDGE: f32 = 0.005;
+
+/// The fusion settings of the run: the defaults, or `ALICE_EVAL_FUSION=<rrf_k>,<boost_exponent>`
+/// (a ranking comparison, `docs/benchmarks/m2.md`, Task 19).
+fn eval_fusion() -> Fusion {
+    let Ok(v) = std::env::var("ALICE_EVAL_FUSION") else {
+        return Fusion::default();
+    };
+    let (k, l) = v
+        .split_once(',')
+        .expect("ALICE_EVAL_FUSION=<rrf_k>,<boost_exponent>");
+    Fusion {
+        rrf_k: k.trim().parse().unwrap(),
+        boost_exponent: l.trim().parse().unwrap(),
+    }
+}
 
 fn models_dir() -> PathBuf {
     std::env::var_os("ALICE_MODELS_DIR")
@@ -347,6 +364,7 @@ fn real_model_gold_set_and_relevance_floor() {
             CHUNK_RELEVANCE_FLOOR
         }),
         raw_min_results: 3,
+        fusion: eval_fusion(),
         ..Default::default()
     };
     let search = |q: &str, floor: f32| {

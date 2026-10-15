@@ -229,6 +229,8 @@ pub struct JevStats {
 }
 
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+/// Where a judge reads the day's budget (USD) at each call.
+pub type BudgetSource = Arc<dyn Fn() -> f64 + Send + Sync>;
 pub type Sleeper = Arc<dyn Fn(Duration) + Send + Sync>;
 
 struct Budget {
@@ -266,6 +268,8 @@ impl Default for JevLimits {
 
 pub struct JevJudge {
     cfg: JevConfig,
+    /// The day's budget as the settings hold it right now; `cfg.daily_budget_usd` when unset.
+    budget_source: Option<BudgetSource>,
     transport: Arc<dyn JevTransport>,
     store: Arc<dyn JevStore>,
     policy: Arc<dyn JevPolicy>,
@@ -445,6 +449,7 @@ impl JevJudge {
     ) -> Self {
         Self {
             cfg,
+            budget_source: None,
             transport,
             store,
             policy,
@@ -464,6 +469,21 @@ impl JevJudge {
     pub fn with_sleeper(mut self, sleep: Sleeper) -> Self {
         self.sleep = sleep;
         self
+    }
+
+    /// Read the daily budget from `source` at each call instead of from the configuration the
+    /// judge was built with. The daemon rebuilds its judge in the background after a `judge.*`
+    /// change, so a judge still in force would otherwise spend by the old budget for a moment
+    /// after a PATCH had returned.
+    pub fn with_live_budget(mut self, source: BudgetSource) -> Self {
+        self.budget_source = Some(source);
+        self
+    }
+
+    fn daily_budget(&self) -> f64 {
+        self.budget_source
+            .as_ref()
+            .map_or(self.cfg.daily_budget_usd, |f| f())
     }
 
     /// Share `limits` with other judges (the daemon passes the same one to every rebuild).
@@ -624,11 +644,12 @@ impl JevJudge {
         }
         let b = b.as_mut().expect("set above");
         // `NaN` on either side fails the comparison, so it refuses.
-        let fits = b.spent + estimate <= self.cfg.daily_budget_usd;
+        let budget = self.daily_budget();
+        let fits = b.spent + estimate <= budget;
         if !fits {
             let msg = format!(
-                "${:.4} of ${:.2} spent on {day}; raise judge.daily_budget_usd or wait for the next UTC day",
-                b.spent, self.cfg.daily_budget_usd
+                "${:.4} of ${budget:.2} spent on {day}; raise judge.daily_budget_usd or wait for the next UTC day",
+                b.spent
             );
             self.stats.lock().budget_stops += 1;
             *self.limits.budget_stop.lock() =
@@ -1552,6 +1573,25 @@ mod tests {
             .request_body(&[UNSCOPED], state, std::slice::from_ref(&question))
             .len();
         j.estimate_usd(len)
+    }
+
+    /// A budget change reaches a judge that is already built: it reads the budget at each call.
+    #[test]
+    fn a_live_budget_applies_to_the_very_next_call() {
+        let store = Arc::new(MemoryJevStore::default());
+        let s = Scripted::ok();
+        let day = Arc::new(PMutex::new(scenarios::fixed_now()));
+        let now = Arc::new(PMutex::new(1.0_f64));
+        let source = now.clone();
+        let j =
+            budget_judge(&s, &store, &day, 1.0).with_live_budget(Arc::new(move || *source.lock()));
+        *now.lock() = 0.0;
+        let e = j.classify_in(&[UNSCOPED], "none", &yes_no()).unwrap_err();
+        assert!(matches!(e, JudgeError::Budget(_)), "{e}");
+        assert_eq!(s.calls.lock().len(), 0, "a budget of zero sends nothing");
+        *now.lock() = 1.0;
+        j.classify_in(&[UNSCOPED], "some", &yes_no()).unwrap();
+        assert_eq!(s.calls.lock().len(), 1);
     }
 
     #[test]

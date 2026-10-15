@@ -69,15 +69,25 @@ impl Kind {
         Kind::ALL.into_iter().find(|k| k.as_str() == wanted)
     }
 
-    /// Recency half-life used by ranking; `None` means the kind does not decay.
+    /// Recency half-life used by ranking; `None` means the kind does not decay. Only the
+    /// short-lived kinds decay: durable knowledge keeps its rank however old it is, because
+    /// what stopped being true is handled by superseding it or by its status, not by its age
+    /// (an imported palace is uniformly old). Task 19 changed `note` from 90 days and `fact`,
+    /// `howto`, `bugfix` and `summary` from 180 days to no decay; `search.half_life.*` sets any
+    /// of them again.
     pub fn half_life_days(self) -> Option<f64> {
         match self {
             Kind::Status => Some(7.0),
             Kind::Handoff => Some(14.0),
             Kind::Diary => Some(30.0),
-            Kind::Note => Some(90.0),
-            Kind::Fact | Kind::Howto | Kind::Bugfix | Kind::Summary => Some(180.0),
-            Kind::Decision | Kind::Preference | Kind::Warning => None,
+            Kind::Note
+            | Kind::Fact
+            | Kind::Howto
+            | Kind::Bugfix
+            | Kind::Summary
+            | Kind::Decision
+            | Kind::Preference
+            | Kind::Warning => None,
         }
     }
 }
@@ -210,8 +220,19 @@ mod tests {
     #[test]
     fn durable_kinds_do_not_decay() {
         assert_eq!(Kind::Status.half_life_days(), Some(7.0));
-        assert_eq!(Kind::Note.half_life_days(), Some(90.0));
-        for k in [Kind::Decision, Kind::Preference, Kind::Warning] {
+        assert_eq!(Kind::Handoff.half_life_days(), Some(14.0));
+        assert_eq!(Kind::Diary.half_life_days(), Some(30.0));
+        // Task 19: durable knowledge does not age out; supersede and status handle truth over time.
+        for k in [
+            Kind::Note,
+            Kind::Fact,
+            Kind::Howto,
+            Kind::Bugfix,
+            Kind::Summary,
+            Kind::Decision,
+            Kind::Preference,
+            Kind::Warning,
+        ] {
             assert_eq!(k.half_life_days(), None, "{k:?}");
         }
     }

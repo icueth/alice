@@ -14,8 +14,8 @@ use crate::writer::{WriteOp, WriterHandle};
 use alice_core::judge::Judge;
 use alice_core::judge::heuristic::HeuristicJudge;
 use alice_core::judge::jev::{
-    HttpReply, JevCall, JevConfig, JevJudge, JevLimits, JevPolicy, JevStore, JevTransport,
-    TransportError,
+    BudgetSource, HttpReply, JevCall, JevConfig, JevJudge, JevLimits, JevPolicy, JevStore,
+    JevTransport, TransportError,
 };
 use alice_core::redact::Redactor;
 use alice_core::settings::{JudgeProvider, Settings};
@@ -213,6 +213,7 @@ pub fn build_judge(
     writer: WriterHandle,
     policy: Arc<dyn JevPolicy>,
     limits: Arc<JevLimits>,
+    live_budget: BudgetSource,
     transport: &dyn Fn() -> Result<Arc<dyn JevTransport>, String>,
 ) -> (Arc<dyn Judge>, Option<String>) {
     if settings.judge.provider == JudgeProvider::Heuristic {
@@ -255,7 +256,8 @@ pub fn build_judge(
                 Arc::new(DaemonJevStore { readers, writer }),
                 policy,
             )
-            .with_limits(limits),
+            .with_limits(limits)
+            .with_live_budget(live_budget),
         ),
         None,
     )
@@ -398,6 +400,10 @@ impl JudgeHub {
             self.writer.clone(),
             self.policy.clone(),
             self.limits.clone(),
+            {
+                let settings = self.settings.clone();
+                Arc::new(move || settings.get().judge.daily_budget_usd)
+            },
             &|| self.transport(),
         )
     }
