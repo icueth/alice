@@ -106,17 +106,7 @@ pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProje
             return adopt_root(conn, found, p);
         }
         // A real project adopts the placeholder of the same slug (or an alias equal to it).
-        let placeholder: Option<ResolvedProject> = conn
-            .query_row(
-                "SELECT id, slug, name FROM projects WHERE slug = ?1 AND key LIKE 'import:%'
-                 UNION ALL
-                 SELECT p.id, p.slug, p.name FROM project_aliases a JOIN projects p ON p.id = a.project_id
-                  WHERE a.alias = ?1 AND p.key LIKE 'import:%'
-                 LIMIT 1",
-                [&base],
-                row,
-            )
-            .optional()?;
+        let placeholder = placeholder_candidates(conn, &base)?.into_iter().next();
         if let Some(found) = placeholder {
             let root = p
                 .root
@@ -170,6 +160,62 @@ pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProje
         id,
         slug,
         name: p.name.clone(),
+    })
+}
+
+/// The placeholder projects (key `import:…`) whose slug, or one of whose aliases, is `base` (an
+/// already-slugified string), oldest first. What a real project of that slug adopts when it is
+/// first written, and what a read from a not-yet-stored checkout of that slug may use.
+fn placeholder_candidates(conn: &Connection, base: &str) -> Result<Vec<ResolvedProject>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, name FROM (
+             SELECT p.id AS id, p.slug AS slug, p.name AS name, p.created_at AS created_at
+               FROM projects p WHERE p.slug = ?1 AND p.key LIKE 'import:%'
+             UNION
+             SELECT p.id, p.slug, p.name, p.created_at
+               FROM project_aliases a JOIN projects p ON p.id = a.project_id
+              WHERE a.alias = ?1 AND p.key LIKE 'import:%'
+         ) ORDER BY created_at, id",
+    )?;
+    let found = stmt
+        .query_map([base], row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(found)
+}
+
+/// What a read from a checkout whose project `p` was detected (not named) works with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetectedForRead {
+    /// The detected project is stored.
+    Stored(ResolvedProject),
+    /// It is not stored, and exactly one stored project is what a write from here would adopt
+    /// (an import placeholder of the same slug or alias, or the project a placeholder of that
+    /// slug was merged into).
+    Placeholder(ResolvedProject),
+    /// Several placeholders match: none is guessed. Their slugs.
+    Ambiguous(Vec<String>),
+    /// Nothing stored matches: the project is only known by what was detected.
+    Unstored,
+}
+
+/// Resolve a detected project for a read, without creating anything. Uses the matching of
+/// [`upsert_project`]'s adoption, so a read and the first write agree on the project.
+pub fn detected_for_read(conn: &Connection, p: &ProjectRef) -> Result<DetectedForRead> {
+    if let Some(found) = find_by_key(conn, &p.key)? {
+        return Ok(DetectedForRead::Stored(found));
+    }
+    let base = slugify(&p.slug);
+    if base.is_empty() || p.key.starts_with(PLACEHOLDER_KEY_PREFIX) {
+        return Ok(DetectedForRead::Unstored);
+    }
+    if let Some(found) = find_by_key_alias(conn, &format!("{PLACEHOLDER_KEY_PREFIX}{base}"))? {
+        return Ok(DetectedForRead::Placeholder(found));
+    }
+    let mut found = placeholder_candidates(conn, &base)?;
+    Ok(match found.len() {
+        0 => DetectedForRead::Unstored,
+        1 => DetectedForRead::Placeholder(found.remove(0)),
+        _ => DetectedForRead::Ambiguous(found.into_iter().map(|f| f.slug).collect()),
     })
 }
 
@@ -371,6 +417,55 @@ mod tests {
         let adopted =
             upsert_project(&conn, &pref("github.com/icueth/alice", "project-alice")).unwrap();
         assert_eq!(adopted.id, imported.id, "no project-alice-<hash> twin");
+    }
+
+    #[test]
+    fn a_read_finds_the_placeholder_a_write_would_adopt_and_never_writes() {
+        let (_d, c) = conn();
+        let real = pref("github.com/icueth/pg-ai", "pg-ai");
+        assert_eq!(
+            detected_for_read(&c, &real).unwrap(),
+            DetectedForRead::Unstored
+        );
+        let imported = upsert_project(&c, &pref("import:pg-ai", "pg-ai")).unwrap();
+        let count = || -> i64 {
+            c.query_row("SELECT count(*) FROM projects", [], |r| r.get(0))
+                .unwrap()
+        };
+        let n = count();
+        assert_eq!(
+            detected_for_read(&c, &real).unwrap(),
+            DetectedForRead::Placeholder(imported.clone())
+        );
+        // An alias equal to the detected slug counts, as it does for adoption.
+        let other = upsert_project(&c, &pref("import:old", "old")).unwrap();
+        add_alias(&c, "pg-ai-checkout", &other.id).unwrap();
+        assert_eq!(
+            detected_for_read(&c, &pref("k/x", "pg-ai-checkout")).unwrap(),
+            DetectedForRead::Placeholder(other.clone())
+        );
+        assert_eq!(count(), n + 1, "reads create nothing");
+        // Two placeholders answering to the name: none is chosen.
+        c.execute(
+            "INSERT INTO project_aliases (alias, project_id) VALUES ('pg-ai', ?1)",
+            [&other.id],
+        )
+        .unwrap();
+        assert!(matches!(
+            detected_for_read(&c, &real).unwrap(),
+            DetectedForRead::Ambiguous(v) if v.len() == 2
+        ));
+        // A real project is never a placeholder, and a stored detected key wins.
+        let stored = upsert_project(&c, &pref("path:/x/solid", "solid")).unwrap();
+        assert_eq!(
+            detected_for_read(&c, &pref("path:/x/solid", "pg-ai")).unwrap(),
+            DetectedForRead::Stored(stored)
+        );
+        assert_eq!(
+            detected_for_read(&c, &pref("import:zzz", "pg-ai")).unwrap(),
+            DetectedForRead::Unstored,
+            "a placeholder key is not a checkout"
+        );
     }
 
     #[test]

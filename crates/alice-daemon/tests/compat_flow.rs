@@ -167,6 +167,47 @@ async fn old_wing_names_resolve_through_aliases() {
     );
 }
 
+/// A checkout of an imported project that no write has stored yet reads as that project.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_from_an_unstored_checkout_briefs_the_imported_project() {
+    let f = Flow::imported().await;
+    // A key memory of the imported project, so that its briefing has something to show.
+    f.call(
+        "mempalace_add_drawer",
+        json!({"wing": "pg-ai", "room": "decisions", "content": "KEYNOTE the pg-ai frame is final"}),
+    )
+    .await;
+    let checkout = tempfile::tempdir().unwrap();
+    let cwd = checkout.path().join("pg-ai");
+    std::fs::create_dir(&cwd).unwrap();
+    let rows = |f: &Flow| -> i64 {
+        rusqlite::Connection::open(f.svc.home().db())
+            .unwrap()
+            .query_row("SELECT count(*) FROM projects", [], |r| r.get(0))
+            .unwrap()
+    };
+    let n = rows(&f);
+    let by_name = f
+        .svc
+        .context(alice_core::api::ContextRequest {
+            project: Some("pg-ai".into()),
+            max_tokens: None,
+            cwd: None,
+        })
+        .await
+        .unwrap();
+    let s = f
+        .call_with("mempalace_status", json!({}), Some(cwd.to_str().unwrap()))
+        .await;
+    assert_eq!(
+        s["context"].as_str().unwrap().trim(),
+        by_name.text.trim(),
+        "{s}"
+    );
+    assert!(s["context"].as_str().unwrap().contains("KEYNOTE"), "{s}");
+    assert_eq!(rows(&f), n, "a read created no project");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn search_fills_room_and_source_file_for_knowledge_and_raw_hits() {
     let f = Flow::imported().await;

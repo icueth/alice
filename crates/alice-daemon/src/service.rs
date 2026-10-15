@@ -36,7 +36,7 @@ use alice_core::store::events::Actor;
 use alice_core::store::history::UndoOutcome;
 use alice_core::store::kg::{self, FactOutcome};
 use alice_core::store::memories::{self, InsertOutcome, NewMemoryInput};
-use alice_core::store::projects::{self, ResolvedProject};
+use alice_core::store::projects::{self, DetectedForRead, ResolvedProject};
 use alice_core::store::reviews::{self, NewReview, ReviewItem, ReviewQuery, ReviewType};
 use alice_core::store::sources::{self, IngestOutcome};
 use alice_core::store::{ReaderPool, VECTOR_READER_CACHE_KIB, open_reader, open_writer};
@@ -147,25 +147,34 @@ fn query_cloud(
         ProjectChoice::Slug(s) => known(cloud.cloud_allowed(s), cloud.redactor(s)),
         ProjectChoice::Fallback => known(cloud.cloud_allowed("global"), cloud.redactor("global")),
         ProjectChoice::Detected(r) => {
-            let stored = readers
-                .with(|c| projects::find_by_key(c, &r.key))
-                .ok()
-                .flatten();
-            match stored {
-                Some(p) => known(cloud.cloud_allowed(&p.slug), cloud.redactor(&p.slug)),
-                None => {
-                    let root = r.root.as_deref();
-                    let allowed = !r.slug.trim().is_empty()
-                        && [r.slug.as_str(), r.name.as_str()]
-                            .into_iter()
-                            .filter(|n| !n.trim().is_empty())
-                            .all(|n| settings.cloud_allowed(n, root));
-                    QueryCloud {
-                        allowed,
-                        redactor: redactors.for_root_always_on(root),
-                        unstored: true,
-                    }
+            let found = readers
+                .with(|c| projects::detected_for_read(c, r))
+                .unwrap_or(DetectedForRead::Unstored);
+            // What the working tree itself says (its `.alice.toml` and the global lists), for a
+            // project the store does not hold as the detected one.
+            let root = r.root.as_deref();
+            let tree_allows = !r.slug.trim().is_empty()
+                && [r.slug.as_str(), r.name.as_str()]
+                    .into_iter()
+                    .filter(|n| !n.trim().is_empty())
+                    .all(|n| settings.cloud_allowed(n, root));
+            match found {
+                DetectedForRead::Stored(p) => {
+                    known(cloud.cloud_allowed(&p.slug), cloud.redactor(&p.slug))
                 }
+                // An import placeholder stands in for the project: its own policy applies, and
+                // so does the tree's (a placeholder has no root of its own to carry the tree's
+                // file). A tree that denies is judged as an unstored one is: denied.
+                DetectedForRead::Placeholder(p) => QueryCloud {
+                    allowed: tree_allows && cloud.cloud_allowed(&p.slug),
+                    redactor: redactors.for_root_always_on(root),
+                    unstored: !tree_allows,
+                },
+                DetectedForRead::Ambiguous(_) | DetectedForRead::Unstored => QueryCloud {
+                    allowed: tree_allows,
+                    redactor: redactors.for_root_always_on(root),
+                    unstored: true,
+                },
             }
         }
     }
@@ -341,6 +350,33 @@ impl Default for ProjectResolver {
     }
 }
 
+/// The stand-in for a detected project the store does not hold: no id, the slug and name it
+/// would get.
+fn unstored_project(r: ProjectRef) -> ResolvedProject {
+    ResolvedProject {
+        id: String::new(),
+        slug: r.slug,
+        name: r.name,
+    }
+}
+
+/// Said once per slug and run: several import placeholders match a checkout, so none is used.
+fn warn_ambiguous_placeholders(slug: &str, candidates: &[String]) {
+    static SAID: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let first = SAID
+        .get_or_init(Mutex::default)
+        .lock()
+        .insert(slug.to_string());
+    if first {
+        tracing::warn!(
+            slug,
+            placeholders = ?candidates,
+            "several imported projects match this checkout; reading as an unstored project (merge them with `alice projects merge`)"
+        );
+    }
+}
+
 fn explicit_slug(explicit: Option<&str>) -> Option<&str> {
     explicit.map(str::trim).filter(|s| !s.is_empty())
 }
@@ -419,11 +455,14 @@ impl ProjectResolver {
                 })
             }
             ProjectChoice::Detected(r) => {
-                let project = projects::find_by_key(conn, &r.key)?.unwrap_or(ResolvedProject {
-                    id: String::new(),
-                    slug: r.slug,
-                    name: r.name,
-                });
+                let project = match projects::detected_for_read(conn, &r)? {
+                    DetectedForRead::Stored(p) | DetectedForRead::Placeholder(p) => p,
+                    DetectedForRead::Ambiguous(slugs) => {
+                        warn_ambiguous_placeholders(&r.slug, &slugs);
+                        unstored_project(r)
+                    }
+                    DetectedForRead::Unstored => unstored_project(r),
+                };
                 Ok(ReadScope {
                     filter_id: None,
                     project,
@@ -8655,5 +8694,311 @@ mod tests {
         let r = s.recall(precise_q("deploy notes 5", &cwd)).await.unwrap();
         assert!(r.reranked, "{:?}", r.notes);
         assert_eq!(t.graded(), 5);
+    }
+
+    // ------------------------------------- reads from a checkout that only an import knows
+
+    use alice_core::import::fixture::{DrawerSpec, build_sqlite_exact};
+    use alice_core::import::palace::DrawerMeta;
+    use alice_core::import::{ImportRequest, ImportState};
+
+    /// Imports a palace of one wing holding `DEPLOY_NOTES` as knowledge (the wing's project
+    /// is stored as an import placeholder, with no root).
+    async fn import_wing(s: &Arc<Service>, d: &tempfile::TempDir, wing: &str) {
+        let palace = d.path().join(format!("palace-{wing}")).join("palace");
+        std::fs::create_dir_all(&palace).unwrap();
+        let specs: Vec<DrawerSpec> = DEPLOY_NOTES
+            .iter()
+            .enumerate()
+            .map(|(i, text)| DrawerSpec {
+                id: format!("k_{wing}_{i}"),
+                text: text.to_string(),
+                meta: DrawerMeta {
+                    wing: wing.into(),
+                    room: "decisions".into(),
+                    added_by: Some("claude-code".into()),
+                    filed_at: Some("2026-04-10T10:00:00".into()),
+                    ..Default::default()
+                },
+            })
+            .collect();
+        build_sqlite_exact(&palace, &specs);
+        s.start_import(ImportRequest {
+            palace: Some(palace.display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        for _ in 0..3000 {
+            let st = s.import_status();
+            if st.state != ImportState::Running {
+                assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+                wait_settled(s).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("import did not end");
+    }
+
+    /// A key memory in the imported project (it shows in that project's briefing).
+    async fn key_note(s: &Service) {
+        s.remember(RememberRequest {
+            content: "KEYNOTE pg-ai ships on Fridays".into(),
+            kind: Some(Kind::Note),
+            importance: Some(5),
+            project: Some("pg-ai".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_settled(s).await;
+    }
+
+    fn db_of(d: &tempfile::TempDir) -> Connection {
+        alice_core::store::open_writer(&AliceHome::new(d.path().to_path_buf()).db()).unwrap()
+    }
+
+    fn project_rows(d: &tempfile::TempDir) -> Vec<(String, String)> {
+        let c = db_of(d);
+        let mut st = c
+            .prepare("SELECT key, slug FROM projects ORDER BY key")
+            .unwrap();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    async fn context_of(s: &Service, cwd: &Option<String>) -> ContextResponse {
+        s.context(ContextRequest {
+            project: None,
+            max_tokens: None,
+            cwd: cwd.clone(),
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_from_an_unstored_checkout_uses_the_imported_placeholder() {
+        let (d, s) = svc().await;
+        import_wing(&s, &d, "pg_ai").await;
+        key_note(&s).await;
+        let rows = project_rows(&d);
+        assert!(rows.iter().any(|(k, _)| k == "import:pg-ai"), "{rows:?}");
+        let cwd = repo(&d, "pg-ai");
+        // The briefing of the checkout is the imported project's.
+        let by_name = s
+            .context(ContextRequest {
+                project: Some("pg-ai".into()),
+                max_tokens: None,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        let ctx = context_of(&s, &cwd).await;
+        assert!(ctx.text.contains("KEYNOTE"), "{}", ctx.text);
+        assert_eq!(ctx.text, by_name.text);
+        assert_eq!(ctx.project, "pg-ai");
+        // The search boosts the imported project: the scope names its id.
+        let detected = detect_project(Path::new(cwd.as_deref().unwrap()));
+        let placeholder_id = s
+            .read(|c| Ok(projects::resolve_slug(c, "pg-ai")?.unwrap().id))
+            .await
+            .unwrap();
+        let scope = s
+            .read(move |c| ProjectResolver::read_scope(c, ProjectChoice::Detected(detected), false))
+            .await
+            .unwrap();
+        assert_eq!(scope.current_id(), Some(placeholder_id.clone()));
+        assert_eq!(
+            scope.filter_id, None,
+            "a detected project boosts, never filters"
+        );
+        // An explicit slug of the placeholder filters to it (it did before, and still does).
+        let scope = s
+            .read(|c| ProjectResolver::read_scope(c, ProjectChoice::Slug("pg-ai".into()), true))
+            .await
+            .unwrap();
+        assert_eq!(scope.filter_id, Some(placeholder_id));
+        // Reads created nothing.
+        assert_eq!(project_rows(&d), rows);
+        let r = s
+            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        assert_eq!(r.project.as_deref(), Some("pg-ai"));
+        assert!(r.results.iter().any(|h| h.project == "pg-ai"));
+        assert_eq!(project_rows(&d), rows, "a recall created no project");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_precise_recall_from_an_unstored_checkout_is_judged_under_the_placeholder() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        import_wing(&s, &d, "pg_ai").await;
+        let cwd = repo(&d, "pg-ai");
+        // `global` is denied the cloud: an unstored checkout used to be judged as `global`.
+        s.patch_settings(patch_one(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["global"]),
+        ))
+        .unwrap();
+        let before = t.graded();
+        let r = s.recall(precise_q("deploy notes", &cwd)).await.unwrap();
+        assert!(r.reranked, "notes: {:?}", r.notes);
+        assert_eq!(t.graded(), before + 1);
+        assert!(r.results[0].title.contains("ZEBRA"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denied_placeholder_keeps_a_precise_recall_from_its_checkout_local() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        import_wing(&s, &d, "pg_ai").await;
+        let cwd = repo(&d, "pg-ai");
+        s.patch_settings(patch_one(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["pg-ai"]),
+        ))
+        .unwrap();
+        let before = t.graded();
+        let r = s.recall(precise_q("deploy notes", &cwd)).await.unwrap();
+        assert!(!r.reranked);
+        assert_eq!(t.graded(), before, "the denied project's query is not sent");
+        assert!(has_note(&r, NOTE_DENIED), "{:?}", r.notes);
+        assert!(!r.results.is_empty(), "the fast answer is still given");
+        // An alias of the placeholder in the list denies it too.
+        s.patch_settings(patch_one(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["old-name"]),
+        ))
+        .unwrap();
+        db_of(&d)
+            .execute(
+                "INSERT INTO project_aliases (alias, project_id) SELECT 'old-name', id FROM projects WHERE key = 'import:pg-ai'",
+                [],
+            )
+            .unwrap();
+        let r = s.recall(precise_q("deploy notes", &cwd)).await.unwrap();
+        assert!(!r.reranked && has_note(&r, NOTE_DENIED), "{:?}", r.notes);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_checkout_that_denies_the_cloud_stays_denied_whatever_the_placeholder_allows() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        import_wing(&s, &d, "pg_ai").await;
+        let cwd = repo(&d, "pg-ai");
+        std::fs::write(
+            Path::new(cwd.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        let before = t.graded();
+        let r = s.recall(precise_q("deploy notes", &cwd)).await.unwrap();
+        assert!(!r.reranked);
+        assert_eq!(t.graded(), before);
+        assert!(has_note(&r, NOTE_DENIED), "{:?}", r.notes);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_matching_placeholders_are_not_guessed_between() {
+        let (d, s) = svc().await;
+        import_wing(&s, &d, "pg_ai").await;
+        key_note(&s).await;
+        import_wing(&s, &d, "other_wing").await;
+        // A second placeholder that answers to the same name through an alias.
+        db_of(&d)
+            .execute(
+                "INSERT INTO project_aliases (alias, project_id) SELECT 'pg-ai', id FROM projects WHERE key = 'import:other-wing'",
+                [],
+            )
+            .unwrap();
+        let rows = project_rows(&d);
+        let cwd = repo(&d, "pg-ai");
+        let ctx = context_of(&s, &cwd).await;
+        assert!(!ctx.text.contains("KEYNOTE"), "{}", ctx.text);
+        let detected = detect_project(Path::new(cwd.as_deref().unwrap()));
+        let scope = s
+            .read(move |c| ProjectResolver::read_scope(c, ProjectChoice::Detected(detected), false))
+            .await
+            .unwrap();
+        assert_eq!(scope.current_id(), None, "no guess: the unstored stand-in");
+        s.recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        assert_eq!(project_rows(&d), rows);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_explicit_unknown_slug_still_errors_and_a_placeholder_slug_resolves() {
+        let (d, s) = svc().await;
+        import_wing(&s, &d, "pg_ai").await;
+        let cwd = repo(&d, "pg-ai");
+        let err = s
+            .context(ContextRequest {
+                project: Some("no-such-project".into()),
+                max_tokens: None,
+                cwd: cwd.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown project"), "{err}");
+        let err = s
+            .recall(RecallRequest {
+                project: Some("no-such-project".into()),
+                ..recall_req("deploy notes", RecallMode::Fast, &cwd)
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown project"), "{err}");
+        // A placeholder-only slug (and its alias spellings) is a known project.
+        for project in ["pg-ai", "pg_ai", "PG-AI"] {
+            let r = s
+                .recall(RecallRequest {
+                    project: Some(project.into()),
+                    ..recall_req("deploy notes", RecallMode::Fast, &None)
+                })
+                .await
+                .unwrap_or_else(|e| panic!("{project}: {e}"));
+            assert!(
+                !r.results.is_empty() && r.results.iter().all(|h| h.project == "pg-ai"),
+                "{project}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_a_real_write_the_real_project_adopts_the_placeholder_and_reads_still_work() {
+        let (d, s) = svc().await;
+        import_wing(&s, &d, "pg_ai").await;
+        key_note(&s).await;
+        let cwd = repo(&d, "pg-ai");
+        let before = context_of(&s, &cwd).await;
+        let imported_id = s
+            .read(|c| Ok(projects::resolve_slug(c, "pg-ai")?.unwrap().id))
+            .await
+            .unwrap();
+        remember_id(&s, "pg-ai first real note", Some(Kind::Note), &cwd).await;
+        wait_settled(&s).await;
+        let rows = project_rows(&d);
+        assert!(
+            !rows.iter().any(|(k, _)| k.starts_with("import:")),
+            "{rows:?}"
+        );
+        let adopted = s
+            .read(|c| Ok(projects::resolve_slug(c, "pg-ai")?.unwrap().id))
+            .await
+            .unwrap();
+        assert_eq!(adopted, imported_id);
+        let after = context_of(&s, &cwd).await;
+        assert!(after.text.contains("KEYNOTE"), "{}", after.text);
+        assert_eq!(after.project, before.project);
+        let r = s
+            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        assert!(r.results.iter().any(|h| h.project == "pg-ai"));
     }
 }
