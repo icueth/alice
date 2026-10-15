@@ -16,6 +16,13 @@
 //! (request hash, response body, tokens, cost, latency; never a header) in `m2-jev-calls.jsonl`
 //! beside it. The call log is truncated at the start of a run; with `ALICE_EVAL_REUSE=1` it is
 //! read back as a cache instead, and the report says how many requests were replayed.
+//!
+//! Ranking comparison (Task 19, `docs/benchmarks/m2.md`): with `ALICE_EVAL_GRADES=<file>` the run
+//! is search only (no relation or kind calls) and keeps a grade cache in that JSON file, keyed by
+//! the query and the memory's text, so a ranking that surfaces a memory nobody graded costs one
+//! request for it and not a regrade of the whole set; `ALICE_EVAL_GRID=<k>:<lambda>,...` runs the
+//! search once per fusion setting (`search.rrf_k`, `search.boost_exponent`) and prints one line
+//! each; `ALICE_EVAL_BUDGET_USD` lowers the judge's budget (default $2).
 mod common;
 
 use alice_core::embed::{Embedder, cosine, memory_embed_text};
@@ -30,7 +37,11 @@ use alice_core::judge::{
 };
 use alice_core::model::Kind;
 use alice_core::redact::Redactor;
-use alice_core::search::{Lists, SearchParams, fusion::Weights, run};
+use alice_core::search::{
+    Lists, SearchParams,
+    fusion::{Fusion, Weights},
+    run,
+};
 use alice_core::settings::SecretValue;
 use alice_core::store::embeddings::VecKey;
 use alice_core::store::memories::{self, InsertOutcome, NewMemoryInput};
@@ -46,7 +57,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 type RelationSlot = Mutex<Option<(Distribution, Option<bool>)>>;
-type GradeMap = HashMap<(usize, String), (f64, f64, f64)>;
+type GradeTriple = (f64, f64, f64);
+type GradeMap = HashMap<(usize, String), GradeTriple>;
+/// A grade cache: (query, memory text) to (grade, P(answers), P(partially)).
+type GradeCache = HashMap<String, GradeTriple>;
 
 const LABELS: [&str; 4] = ["duplicate", "updates", "contradicts", "unrelated"];
 const BUDGET_USD: f64 = 2.0;
@@ -307,7 +321,10 @@ impl Env {
                 api_key: key,
                 rate_per_sec: if dry { 1000.0 } else { 8.0 },
                 timeout: Duration::from_secs(30),
-                daily_budget_usd: BUDGET_USD,
+                daily_budget_usd: std::env::var("ALICE_EVAL_BUDGET_USD")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(BUDGET_USD),
                 max_retries: 3,
             },
             transport,
@@ -713,6 +730,7 @@ fn run_queries(
     e: &alice_embed::OnnxEmbedder,
     corpus: &Corpus,
     queries: &[serde_json::Value],
+    fusion: Fusion,
 ) -> Vec<Q> {
     let search = |q: &str, lists: Lists, floor: f32, limit: usize| -> Vec<String> {
         let params = SearchParams {
@@ -722,6 +740,7 @@ fn run_queries(
             relevance_floor: floor,
             raw_min_results: 0,
             lists,
+            fusion,
             ..Default::default()
         };
         run(
@@ -1058,6 +1077,149 @@ fn report_floor(rows: &[Row]) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Ranking comparison with a grade cache (Task 19).
+
+/// `ALICE_EVAL_GRID=60:1.0,20:0.5`: the fusion settings to run, or just the defaults.
+fn grid_rows() -> Vec<Fusion> {
+    match std::env::var("ALICE_EVAL_GRID") {
+        Err(_) => vec![Fusion::default()],
+        Ok(v) => v
+            .split(',')
+            .map(|r| {
+                let (k, l) = r.split_once(':').expect("ALICE_EVAL_GRID=<k>:<lambda>,...");
+                Fusion {
+                    rrf_k: k.trim().parse().unwrap(),
+                    boost_exponent: l.trim().parse().unwrap(),
+                }
+            })
+            .collect(),
+    }
+}
+
+/// What a grade is stored under: the query and the text of the memory, not its random id.
+fn grade_key(query: &str, m: &JudgeMemory) -> String {
+    format!("{query}\u{1f}{:?}\u{1f}{}\u{1f}{}", m.kind, m.title, m.body)
+}
+
+/// [`grade_all`] for the candidates the cache does not hold (in batches of ten, per query),
+/// then everything from the cache.
+fn grade_missing(
+    env: &Env,
+    by_id: &HashMap<String, JudgeMemory>,
+    qs: &[Q],
+    cache: &mut GradeCache,
+) -> (GradeMap, usize) {
+    let tasks: Vec<(usize, Vec<String>)> = qs
+        .iter()
+        .enumerate()
+        .flat_map(|(qi, q)| {
+            let missing: Vec<String> = q
+                .graded
+                .iter()
+                .filter(|id| !cache.contains_key(&grade_key(&q.text, &by_id[*id])))
+                .cloned()
+                .collect();
+            missing
+                .chunks(10)
+                .map(|b| (qi, b.to_vec()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let fresh: Mutex<Vec<(String, GradeTriple)>> = Mutex::new(Vec::new());
+    parallel(tasks.len(), env.workers, &env.stop, |t| {
+        let (qi, ids) = &tasks[t];
+        let ms: Vec<JudgeMemory> = ids.iter().map(|id| by_id[id].clone()).collect();
+        match env.jev.grade_relevance("eval", &qs[*qi].text, &ms) {
+            Ok(ds) => {
+                let mut f = fresh.lock();
+                for (m, d) in ms.iter().zip(ds) {
+                    f.push((
+                        grade_key(&qs[*qi].text, m),
+                        (
+                            2.0 * d.p(RELEVANCE_ANSWERS) + d.p(RELEVANCE_PARTIAL),
+                            d.p(RELEVANCE_ANSWERS),
+                            d.p(RELEVANCE_PARTIAL),
+                        ),
+                    ));
+                }
+            }
+            Err(err) => env.note_err(&qs[*qi].text, err),
+        }
+    });
+    let requested: usize = tasks.iter().map(|t| t.1.len()).sum();
+    cache.extend(fresh.into_inner());
+    let mut grades = GradeMap::new();
+    for (qi, q) in qs.iter().enumerate() {
+        for id in &q.graded {
+            if let Some(g) = cache.get(&grade_key(&q.text, &by_id[id])) {
+                grades.insert((qi, id.clone()), *g);
+            }
+        }
+    }
+    (grades, requested)
+}
+
+/// Mean hybrid nDCG@10 over the answerable queries and over the cross-lingual and paraphrase
+/// queries (the two numbers of `report_search`), the counts, and the queries left out because a
+/// candidate has no grade.
+fn hybrid_ndcg(qs: &[Q], grades: &GradeMap) -> ((f64, usize), (f64, usize), usize) {
+    let (mut ans, mut hard, mut incomplete) = (vec![], vec![], 0);
+    for (qi, q) in qs.iter().enumerate() {
+        if !q
+            .graded
+            .iter()
+            .all(|id| grades.contains_key(&(qi, id.clone())))
+        {
+            incomplete += 1;
+            continue;
+        }
+        let g = |id: &String| grades[&(qi, id.clone())].0;
+        let pool: Vec<f64> = q.pool.iter().map(g).collect();
+        let gr: Vec<f64> = q.rankings[0].iter().map(g).collect();
+        let n = ndcg_at(&gr, &pool, 10);
+        if q.answerable {
+            ans.push(n);
+        }
+        if q.kind != "same" {
+            hard.push(n);
+        }
+    }
+    let mean = |v: &[f64]| (v.iter().sum::<f64>() / v.len().max(1) as f64, v.len());
+    (mean(&ans), mean(&hard), incomplete)
+}
+
+fn cached_grid(
+    env: &Env,
+    e: &alice_embed::OnnxEmbedder,
+    corpus: &Corpus,
+    queries: &[serde_json::Value],
+    cache_path: &Path,
+) {
+    let mut cache: GradeCache = std::fs::read_to_string(cache_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    println!("grade cache: {} entries", cache.len());
+    for f in grid_rows() {
+        let qs = run_queries(env, e, corpus, queries, f);
+        let (grades, requested) = grade_missing(env, &corpus.by_id, &qs, &mut cache);
+        let (ans, hard, incomplete) = hybrid_ndcg(&qs, &grades);
+        println!(
+            "GRID rrf_k={} boost_exponent={} answerable={:.4} (n={}) cross_lingual_paraphrase={:.4} (n={}) incomplete={incomplete} newly_graded_pairs={requested}",
+            f.rrf_k, f.boost_exponent, ans.0, ans.1, hard.0, hard.1
+        );
+        std::fs::write(cache_path, serde_json::to_string(&cache).unwrap()).unwrap();
+    }
+    let fresh = env.store.fresh.lock();
+    println!(
+        "spend this run: {} requests, ${:.4}; errors {:?}",
+        fresh.len(),
+        fresh.iter().map(|c| c.usd).sum::<f64>(),
+        env.errors.lock()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 
 #[test]
 #[ignore = "network and real model: TYPESAFE_API_KEY and ALICE_MODELS_DIR (JEV_EVAL_DRY=1 estimates without either key or network)"]
@@ -1102,9 +1264,14 @@ fn jev_versus_heuristic_and_graded_search() {
             )
         })
         .collect();
+    if let Ok(cache) = std::env::var("ALICE_EVAL_GRADES") {
+        let corpus = build_corpus(&e, &pairs, &vecs, env.now);
+        cached_grid(&env, &e, &corpus, &queries, Path::new(&cache));
+        return;
+    }
     let relations = run_relations(&env, &pairs, &news, &olds);
     let corpus = build_corpus(&e, &pairs, &vecs, env.now);
-    let qs = run_queries(&env, &e, &corpus, &queries);
+    let qs = run_queries(&env, &e, &corpus, &queries, Fusion::default());
     let grades = grade_all(&env, &corpus.by_id, &qs);
 
     if env.dry {

@@ -429,12 +429,7 @@ pub fn memory_words(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
 }
 
 pub fn memory_trigram(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
-    run(
-        conn,
-        "SELECT rowid FROM memories_tri WHERE memories_tri MATCH ?1 ORDER BY bm25(memories_tri, 2.0, 1.0) LIMIT ?2",
-        or_query(&trigram_terms(q)),
-        k,
-    )
+    memory_trigram_hits(conn, q, k).ids
 }
 
 pub fn memory_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
@@ -606,32 +601,52 @@ pub fn chunk_code(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
 /// terms past their shares share the list. Not BM25: its IDF needs every match of each phrase,
 /// 60–400 ms per list at 1M chunks. `k` is 100, or 400 when filters apply.
 pub fn chunk_trigram(conn: &Connection, q: &str, k: usize) -> Vec<i64> {
-    chunk_trigram_in(conn, q, k, RAW_WINDOW)
+    chunk_trigram_hits(conn, q, k).ids
 }
 
 /// A trigram candidate: summed weight, then (best position in a term's list, that term).
 type Ranked = (f64, (usize, usize));
 
 /// Newest chunks holding the substring `term`, older than `before` when given, at most `limit`.
-/// Never fails, like [`run`].
 fn newest_substrings(conn: &Connection, term: &str, before: Option<i64>, limit: usize) -> Vec<i64> {
-    let result = (|| -> rusqlite::Result<Vec<i64>> {
-        let mut stmt = conn.prepare_cached(
-            "SELECT rowid FROM chunks_tri WHERE chunks_tri MATCH ?1 AND rowid < ?3 \
-             ORDER BY rowid DESC LIMIT ?2",
-        )?;
-        let params = rusqlite::params![quote(term), limit as i64, before.unwrap_or(i64::MAX)];
-        let rows = stmt.query_map(params, |r| r.get(0))?;
-        rows.collect()
-    })();
-    result.unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "fts query failed; treating as no lexical matches");
-        Vec::new()
-    })
+    newest_in(conn, "chunks_tri", term, before, limit)
 }
 
+/// The ranking of the whole terms alone (no overlapping trigrams) with a window of the test's
+/// choosing: the sharing and tie rules of [`rank_trigram_terms`] on a small corpus.
+#[cfg(test)]
 fn chunk_trigram_in(conn: &Connection, q: &str, k: usize, window: usize) -> Vec<i64> {
-    let terms = trigram_terms(q);
+    rank_trigram_terms(conn, &trigram_terms(q), k, window).0
+}
+
+/// The raw tier's trigram list with its partial hits marked ([`TrigramHits`]); the whole terms
+/// and the overlapping trigrams of unspaced pieces are terms of one list and share one window.
+pub fn chunk_trigram_hits(conn: &Connection, q: &str, k: usize) -> TrigramHits {
+    chunk_trigram_hits_in(conn, q, k, RAW_WINDOW)
+}
+
+fn chunk_trigram_hits_in(conn: &Connection, q: &str, k: usize, window: usize) -> TrigramHits {
+    let mut terms = trigram_terms(q);
+    let whole_terms = terms.len();
+    let plan = plan_ngrams(conn, "chunks_tri", q, MAX_TERMS.saturating_sub(whole_terms));
+    terms.extend(plan.terms.iter().cloned());
+    let (ids, lists) = rank_trigram_terms(conn, &terms, k, window);
+    let weak = if plan.terms.is_empty() {
+        HashSet::new()
+    } else {
+        let whole: HashSet<i64> = lists[..whole_terms].iter().flatten().copied().collect();
+        weak_ids(&plan, &lists[whole_terms..], &whole, &ids)
+    };
+    TrigramHits { ids, weak }
+}
+
+/// The best `k` chunks for the substring `terms`, and what each term read (newest first).
+fn rank_trigram_terms(
+    conn: &Connection,
+    terms: &[String],
+    k: usize,
+    window: usize,
+) -> (Vec<i64>, Vec<Vec<i64>>) {
     // Each non-ASCII term first reads up to the share of all of them; the read tells which have
     // a match (no separate probe). Terms without one take no share: when some have none, the
     // others read on from their oldest row read so far, up to the share of those with a match.
@@ -659,10 +674,10 @@ fn chunk_trigram_in(conn: &Connection, q: &str, k: usize, window: usize) -> Vec<
     // Per chunk: summed weight, then (its best position in any term's newest-first list, that
     // term's index) so that ties are taken term by term, round-robin.
     let mut found: HashMap<i64, Ranked> = HashMap::new();
-    for (term, ids) in lists.into_iter().enumerate() {
+    for (term, ids) in lists.iter().enumerate() {
         let weight = 1.0 / ids.len().max(1) as f64;
-        for (pos, id) in ids.into_iter().enumerate() {
-            let e = found.entry(id).or_insert((0.0, (pos, term)));
+        for (pos, id) in ids.iter().enumerate() {
+            let e = found.entry(*id).or_insert((0.0, (pos, term)));
             e.0 += weight;
             e.1 = e.1.min((pos, term));
         }
@@ -675,7 +690,230 @@ fn chunk_trigram_in(conn: &Connection, q: &str, k: usize, window: usize) -> Vec<
             .then(b.0.cmp(&a.0))
     });
     v.truncate(k);
-    v.into_iter().map(|(id, _)| id).collect()
+    (v.into_iter().map(|(id, _)| id).collect(), lists)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Overlapping trigrams of pieces in scripts written without spaces (Task 19, ruling 3).
+//
+// A Thai question has no spaces, so it is one piece, and the trigram list used to need that whole
+// piece as a substring of the text: a text holding `ปุ่มลบ` and `ไม่ทำงาน` apart never matched
+// `ทำไมปุ่มลบไม่ทำงาน`. The trigram list now also searches the piece's overlapping trigrams
+// (OR), ranks by what they are worth (BM25 in the knowledge tier, 1 / matches per trigram in the
+// raw tier), and says which hits are only partial.
+
+/// Characters of one piece cut into trigrams: the first 128 (126 windows). Probing every window
+/// of a 2,000-character wall would cost more than the question is worth.
+const NGRAM_WINDOW: usize = 128;
+/// A partial hit is a lexical match when it shares at least this many distinct trigrams ...
+const NGRAM_MIN_SHARED: usize = 3;
+/// ... and at least this percentage of the piece's distinct trigrams.
+const NGRAM_MIN_PERCENT: usize = 30;
+/// A trigram's document frequency is counted up to this many rows when the rarest are picked.
+const DOC_FREQ_CAP: usize = 256;
+
+/// The hits of one tier's trigram list: ids in rank order, and among them those that matched
+/// only in part (a few trigrams of a longer piece): ranked, but no evidence of a lexical match.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TrigramHits {
+    pub ids: Vec<i64>,
+    pub weak: HashSet<i64>,
+}
+
+/// The distinct overlapping trigrams of each piece of the query that holds a character of a
+/// script written without spaces and is longer than one trigram (3 code points).
+fn ngram_pieces(query: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for w in pieces(query) {
+        if !w.chars().any(in_unspaced_script) || !longer_than(w, 3) {
+            continue;
+        }
+        let lower: Vec<char> = w
+            .chars()
+            .take(NGRAM_WINDOW)
+            .collect::<String>()
+            .to_lowercase()
+            .chars()
+            .take(NGRAM_WINDOW)
+            .collect();
+        let mut seen = HashSet::new();
+        let grams: Vec<String> = lower
+            .windows(3)
+            .filter(|g| !g.contains(&'_') && g.iter().any(|c| c.is_alphanumeric()))
+            .map(|g| g.iter().collect::<String>())
+            .filter(|g| seen.insert(g.clone()))
+            .collect();
+        if !grams.is_empty() {
+            out.push(grams);
+        }
+    }
+    out
+}
+
+/// The trigrams of the query's unspaced pieces that one search reads, chosen by rarity.
+struct NgramPlan {
+    /// The trigrams to search, in query order, without repeats.
+    terms: Vec<String>,
+    /// Per piece: indexes into `terms`, and the number of the piece's distinct trigrams a text
+    /// is measured against.
+    pieces: Vec<(Vec<usize>, usize)>,
+}
+
+/// How many rows of `table` hold the trigram `term`, counted up to [`DOC_FREQ_CAP`].
+fn doc_freq(conn: &Connection, table: &str, term: &str) -> usize {
+    let sql = format!(
+        "SELECT count(*) FROM (SELECT 1 FROM {table} WHERE {table} MATCH ?1 LIMIT {DOC_FREQ_CAP})"
+    );
+    conn.prepare_cached(&sql)
+        .and_then(|mut stmt| stmt.query_row(rusqlite::params![quote(term)], |r| r.get::<_, i64>(0)))
+        .map(|n| n as usize)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "fts query failed; treating as no lexical matches");
+            0
+        })
+}
+
+/// Picks at most `budget` trigrams of the query's unspaced pieces: those found in `table`,
+/// the rarest first (counted up to [`DOC_FREQ_CAP`], ties in query order). A trigram that no
+/// text holds cannot match and takes no place. Each piece is measured against its distinct
+/// trigrams, or, when the budget left some that exist unsearched, against those searched.
+fn plan_ngrams(conn: &Connection, table: &str, query: &str, budget: usize) -> NgramPlan {
+    let pieces = ngram_pieces(query);
+    if pieces.is_empty() || budget == 0 {
+        return NgramPlan {
+            terms: Vec::new(),
+            pieces: Vec::new(),
+        };
+    }
+    let mut freq: HashMap<&str, usize> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
+    for g in pieces.iter().flatten() {
+        if !freq.contains_key(g.as_str()) {
+            freq.insert(g, doc_freq(conn, table, g));
+            order.push(g);
+        }
+    }
+    let mut by_rarity: Vec<&str> = order.iter().copied().filter(|g| freq[g] > 0).collect();
+    by_rarity.sort_by_key(|g| freq[g]); // stable: ties stay in query order
+    let chosen: HashSet<&str> = by_rarity.into_iter().take(budget).collect();
+    let terms: Vec<String> = order
+        .iter()
+        .filter(|g| chosen.contains(*g))
+        .map(|g| g.to_string())
+        .collect();
+    let index: HashMap<&str, usize> = terms
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i))
+        .collect();
+    let plans = pieces
+        .iter()
+        .map(|piece| {
+            let idx: Vec<usize> = piece
+                .iter()
+                .filter_map(|g| index.get(g.as_str()).copied())
+                .collect();
+            let unsearched = piece
+                .iter()
+                .any(|g| freq[g.as_str()] > 0 && !chosen.contains(g.as_str()));
+            let denominator = if unsearched { idx.len() } else { piece.len() };
+            (idx, denominator)
+        })
+        .collect();
+    NgramPlan {
+        terms,
+        pieces: plans,
+    }
+}
+
+/// The ids among `found` that hold some of the plan's trigrams but are not a lexical match:
+/// not in `whole` (they hold no whole piece or other term) and, for every piece, below
+/// [`NGRAM_MIN_SHARED`] distinct trigrams or [`NGRAM_MIN_PERCENT`] % of the piece's.
+/// `read[i]` are the ids that hold the plan's trigram `i`.
+fn weak_ids(
+    plan: &NgramPlan,
+    read: &[Vec<i64>],
+    whole: &HashSet<i64>,
+    found: &[i64],
+) -> HashSet<i64> {
+    let mut strong: HashSet<i64> = HashSet::new();
+    for (idx, denominator) in &plan.pieces {
+        let mut shared: HashMap<i64, usize> = HashMap::new();
+        for &i in idx {
+            for id in &read[i] {
+                *shared.entry(*id).or_default() += 1;
+            }
+        }
+        strong.extend(shared.into_iter().filter_map(|(id, n)| {
+            (n >= NGRAM_MIN_SHARED && n * 100 >= NGRAM_MIN_PERCENT * denominator).then_some(id)
+        }));
+    }
+    found
+        .iter()
+        .copied()
+        .filter(|id| !whole.contains(id) && !strong.contains(id))
+        .collect()
+}
+
+/// Newest rows of `table` holding the substring `term`, older than `before` when given, at most
+/// `limit`. Never fails, like [`run`].
+fn newest_in(
+    conn: &Connection,
+    table: &str,
+    term: &str,
+    before: Option<i64>,
+    limit: usize,
+) -> Vec<i64> {
+    let sql = format!(
+        "SELECT rowid FROM {table} WHERE {table} MATCH ?1 AND rowid < ?3 ORDER BY rowid DESC LIMIT ?2"
+    );
+    let result = (|| -> rusqlite::Result<Vec<i64>> {
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let params = rusqlite::params![quote(term), limit as i64, before.unwrap_or(i64::MAX)];
+        let rows = stmt.query_map(params, |r| r.get(0))?;
+        rows.collect()
+    })();
+    result.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "fts query failed; treating as no lexical matches");
+        Vec::new()
+    })
+}
+
+/// The knowledge tier's trigram list: the whole terms of [`trigram_terms`] and the overlapping
+/// trigrams of unspaced pieces ([`plan_ngrams`]) in one BM25 query. A text is `weak` when only a
+/// few of the trigrams matched (see [`weak_ids`]); the trigrams are read newest first up to
+/// their share of [`RAW_WINDOW`], as in the raw tier.
+pub fn memory_trigram_hits(conn: &Connection, q: &str, k: usize) -> TrigramHits {
+    let whole = trigram_terms(q);
+    let plan = plan_ngrams(
+        conn,
+        "memories_tri",
+        q,
+        MAX_TERMS.saturating_sub(whole.len()),
+    );
+    let all: Vec<String> = whole.iter().chain(&plan.terms).cloned().collect();
+    let ids = run(
+        conn,
+        "SELECT rowid FROM memories_tri WHERE memories_tri MATCH ?1 ORDER BY bm25(memories_tri, 2.0, 1.0) LIMIT ?2",
+        or_query(&all),
+        k,
+    );
+    if plan.terms.is_empty() || ids.is_empty() {
+        return TrigramHits {
+            ids,
+            weak: HashSet::new(),
+        };
+    }
+    let limit = share(RAW_WINDOW, all.len(), k);
+    let read = |terms: &[String]| -> Vec<Vec<i64>> {
+        terms
+            .iter()
+            .map(|t| newest_in(conn, "memories_tri", t, None, limit))
+            .collect()
+    };
+    let whole_ids: HashSet<i64> = read(&whole).into_iter().flatten().collect();
+    let weak = weak_ids(&plan, &read(&plan.terms), &whole_ids, &ids);
+    TrigramHits { ids, weak }
 }
 
 /// Non-ASCII terms of 1–2 code points (e.g. Thai "จำ" = จ + ำ) are below the trigram minimum.
@@ -1428,6 +1666,115 @@ mod tests {
             memories::insert(&c, &m).unwrap();
         }
         (d, c)
+    }
+
+    /// Task 19, ruling 3: a question in a script written without spaces matches by the
+    /// trigrams it shares with a text.
+    const THAI_Q: &str = "ทำไมปุ่มลบไม่ทำงาน";
+
+    fn seqs_of(c: &Connection) -> Vec<i64> {
+        let mut stmt = c.prepare("SELECT seq FROM memories ORDER BY seq").unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn an_unspaced_piece_longer_than_a_trigram_has_overlapping_trigrams() {
+        let pieces = ngram_pieces(THAI_Q);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].len(), 16, "18 code points, 16 distinct windows");
+        assert_eq!(pieces[0][0], "ทำไ");
+        assert!(pieces[0].iter().all(|t| t.chars().count() == 3));
+        // Not for spaced scripts, a single trigram, or a word of one or two code points.
+        assert!(ngram_pieces("deploy the writer lease").is_empty());
+        assert!(ngram_pieces("ไทย").is_empty());
+        assert!(ngram_pieces("จำ").is_empty());
+        // Four code points have two windows; repeated windows count once; CJK counts too.
+        assert_eq!(ngram_pieces("ภาษาไ")[0].len(), 3);
+        assert_eq!(ngram_pieces("กกกกกก")[0], vec!["กกก".to_string()]);
+        assert_eq!(ngram_pieces("数据库连接")[0].len(), 3);
+        // Each piece of a query on its own, with the same separators as the other lists.
+        assert_eq!(ngram_pieces("ปุ่มลบ ไม่ทำงาน").len(), 2);
+    }
+
+    #[test]
+    fn a_question_finds_a_text_that_holds_its_parts_separately() {
+        let (_d, c) = db_with(&[
+            "รายงานบั๊ก: ปุ่มลบในหน้ารายการกดแล้วเงียบ และฟอร์มไม่ทำงาน",
+            "การเดินทางไปเชียงใหม่ด้วยรถไฟ",
+            "ตั้งค่า SQLite แบบ WAL",
+        ]);
+        let s = seqs_of(&c);
+        let hits = memory_trigram_hits(&c, THAI_Q, 10);
+        assert_eq!(hits.ids.first(), Some(&s[0]), "{hits:?}");
+        assert!(
+            !hits.weak.contains(&s[0]),
+            "shares 10 of 16 trigrams: {hits:?}"
+        );
+    }
+
+    /// One shared common trigram (`การ`) is not evidence: the text is a candidate but not a
+    /// lexical match.
+    #[test]
+    fn one_shared_common_trigram_is_not_a_lexical_match() {
+        let (_d, c) = db_with(&[
+            "รายงานบั๊ก: ปุ่มลบในหน้ารายการกดแล้วเงียบ และฟอร์มไม่ทำงาน",
+            "การเดินทางไปเชียงใหม่ด้วยรถไฟ",
+        ]);
+        let s = seqs_of(&c);
+        let hits = memory_trigram_hits(&c, "ทำไมการลบไม่ทำงาน", 10);
+        assert!(hits.ids.contains(&s[1]), "a candidate: {hits:?}");
+        assert!(hits.weak.contains(&s[1]), "but weak: {hits:?}");
+        assert!(
+            !hits.weak.contains(&s[0]),
+            "the first shares 6 of 15: {hits:?}"
+        );
+    }
+
+    /// A word of one or two code points is below a trigram: the LIKE scan keeps it, and the
+    /// trigram list has nothing to add.
+    #[test]
+    fn a_single_short_thai_word_keeps_the_like_scan() {
+        let (_d, c) = db_with(&["ระบบความจำสำหรับเอเจนต์", "ตั้งค่า SQLite แบบ WAL"]);
+        assert!(ngram_pieces("จำ").is_empty());
+        assert!(memory_trigram_hits(&c, "จำ", 10).ids.is_empty());
+        assert_eq!(memory_like(&c, "จำ", 10).len(), 1);
+    }
+
+    /// Terms are bounded: a 2,000-character Thai query reads at most `MAX_TERMS` terms, the
+    /// rarest trigrams of what the index holds.
+    #[test]
+    fn a_long_thai_query_has_at_most_max_terms_terms_and_keeps_the_rarest() {
+        let mut x: u32 = 12345;
+        let wall: String = (0..2_000)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                char::from_u32(0x0E01 + (x >> 16) % 46).unwrap()
+            })
+            .collect();
+        let (_d, c) = db_with(&[wall.as_str(), "ภาษาไทยดีมาก"]);
+        let plan = plan_ngrams(&c, "memories_tri", &wall, MAX_TERMS - 1);
+        assert_eq!(plan.terms.len(), MAX_TERMS - 1, "{:?}", plan.terms);
+        assert!(plan.terms.iter().all(|t| t.chars().count() == 3));
+        let s = seqs_of(&c);
+        let hits = memory_trigram_hits(&c, &wall, 10);
+        assert_eq!(hits.ids.first(), Some(&s[0]));
+        // The rarest are kept: three of the query's trigrams that exist once beat common ones.
+        let mut docs = vec!["การเดินทางไป n".to_string(); 20];
+        docs.push("ภาษาไทยดีมาก".into());
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let (_d2, c2) = db_with(&refs);
+        let plan = plan_ngrams(&c2, "memories_tri", "ภาษาไทยการเดิน", 3);
+        assert_eq!(plan.terms.len(), 3);
+        assert!(
+            plan.terms
+                .iter()
+                .all(|t| "ภาษาไทยดีมาก".contains(t.as_str())),
+            "{:?}",
+            plan.terms
+        );
     }
 
     /// Every FTS5 operator and quoting mistake from Review Focus #1, plus short and Thai input.

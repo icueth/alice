@@ -1329,6 +1329,10 @@ impl Service {
                     chunk_floor: Some(search::CHUNK_RELEVANCE_FLOOR),
                     raw_min_results: cfg.search.raw_fallback_min_results,
                     half_lives: cfg.search.half_life.clone(),
+                    fusion: search::fusion::Fusion {
+                        rrf_k: cfg.search.rrf_k,
+                        boost_exponent: cfg.search.boost_exponent,
+                    },
                     lists: search::Lists::Hybrid,
                 };
                 let out = search::run_with_chunk_reads(
@@ -4658,6 +4662,46 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("search.weights.knowledge")
+        );
+    }
+
+    /// Task 19: `search.rrf_k` and `search.boost_exponent` apply to the next recall like the
+    /// other `search.*` keys. With the exponent 0 the score is the fused rank score alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rrf_k_and_boost_exponent_apply_to_the_next_recall_without_a_restart() {
+        let (d, s) = svc().await;
+        let cwd = repo(&d, "proj");
+        s.remember(RememberRequest {
+            content: "lease timeouts in the hub writer".into(),
+            cwd: cwd.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_settled(&s).await;
+        let top = |s: &Arc<Service>| {
+            let s = s.clone();
+            let req = RecallRequest {
+                query: "writer hub lease timeout problem".into(),
+                cwd: cwd.clone(),
+                format: OutputFormat::Json,
+                ..Default::default()
+            };
+            async move { s.recall(req).await.unwrap().results[0].score }
+        };
+        let base = top(&s).await;
+        let out = s
+            .patch_settings(patch_one("search.boost_exponent", serde_json::json!(0.0)))
+            .unwrap();
+        assert_eq!(out.changed, vec!["search.boost_exponent".to_string()]);
+        let flat = top(&s).await;
+        assert_ne!(flat, base, "the boosts no longer weigh: {base} -> {flat}");
+        s.patch_settings(patch_one("search.rrf_k", serde_json::json!(1)))
+            .unwrap();
+        let sharp = top(&s).await;
+        assert!(
+            sharp > flat,
+            "a smaller k gives the first place more: {flat} -> {sharp}"
         );
     }
 

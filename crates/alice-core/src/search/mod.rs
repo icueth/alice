@@ -16,7 +16,7 @@ use crate::store::sources::ChunkRow;
 use crate::store::{ReaderPool, memories, sources};
 use crate::vector::{KeyFilter, VectorIndex};
 use chrono::{DateTime, SecondsFormat, Utc};
-use fusion::{BoostInput, HalfLives, ItemRef, Weights, boost, rrf};
+use fusion::{BoostInput, Fusion, HalfLives, ItemRef, Weights, boost, rrf};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 
@@ -83,6 +83,8 @@ pub struct SearchParams {
     pub raw_min_results: usize,
     /// Recency half-lives per kind and for raw chunks (`search.half_life`).
     pub half_lives: HalfLives,
+    /// How the lists and the priors combine (`search.rrf_k`, `search.boost_exponent`).
+    pub fusion: Fusion,
     /// Which candidate lists to use (evaluation only).
     pub lists: Lists,
 }
@@ -160,6 +162,8 @@ struct Query<'a> {
     vector: Option<Vec<f32>>,
     text: &'a str,
     k: usize,
+    /// The k of reciprocal rank fusion.
+    rrf_k: f64,
     reads: ChunkReads<'a>,
     lists: Lists,
 }
@@ -245,20 +249,20 @@ impl Query<'_> {
         if self.lists != Lists::VectorOnly {
             let words = lexical::memory_words(c, q, k);
             let use_trigram = lexical::should_use_trigram(q) || words.len() < SHORT_LIST;
-            lists.push((MatchVia::Words, refs(words, ItemRef::Memory)));
-            lists.push((
+            lists.push(LexList::new(MatchVia::Words, refs(words, ItemRef::Memory)));
+            lists.push(LexList::new(
                 MatchVia::Code,
                 refs(lexical::memory_code(c, q, k), ItemRef::Memory),
             ));
             if use_trigram {
-                lists.push((
-                    MatchVia::Words,
-                    refs(lexical::memory_trigram(c, q, k), ItemRef::Memory),
+                lists.push(LexList::trigram(
+                    lexical::memory_trigram_hits(c, q, k),
+                    ItemRef::Memory,
                 ));
             }
             let like = lexical::memory_like(c, q, k);
             if !like.is_empty() {
-                lists.push((MatchVia::Words, refs(like, ItemRef::Memory)));
+                lists.push(LexList::new(MatchVia::Words, refs(like, ItemRef::Memory)));
             }
         }
         let vector = self
@@ -269,7 +273,7 @@ impl Query<'_> {
                 VecKey::Chunk(_) => None,
             })
             .collect();
-        collect(lists, vector)
+        collect(lists, vector, self.rrf_k)
     }
 
     /// The raw tier's lists: word, code and trigram lists here, and the chunk vector list
@@ -280,15 +284,15 @@ impl Query<'_> {
         if self.lists != Lists::VectorOnly {
             let words = lexical::chunk_words(c, q, k);
             let use_trigram = lexical::should_use_trigram(q) || words.len() < SHORT_LIST;
-            lists.push((MatchVia::Words, refs(words, ItemRef::Chunk)));
-            lists.push((
+            lists.push(LexList::new(MatchVia::Words, refs(words, ItemRef::Chunk)));
+            lists.push(LexList::new(
                 MatchVia::Code,
                 refs(lexical::chunk_code(c, q, k), ItemRef::Chunk),
             ));
             if use_trigram {
-                lists.push((
-                    MatchVia::Words,
-                    refs(lexical::chunk_trigram(c, q, k), ItemRef::Chunk),
+                lists.push(LexList::trigram(
+                    lexical::chunk_trigram_hits(c, q, k),
+                    ItemRef::Chunk,
                 ));
             }
         }
@@ -306,7 +310,7 @@ impl Query<'_> {
                 Vec::new()
             }),
         };
-        collect(lists, vector)
+        collect(lists, vector, self.rrf_k)
     }
 }
 
@@ -314,17 +318,44 @@ fn refs(seqs: Vec<i64>, f: fn(i64) -> ItemRef) -> Vec<ItemRef> {
     seqs.into_iter().map(f).collect()
 }
 
+/// One lexical candidate list: how it found its items, in rank order, and the items that
+/// matched only in part. A partial match is ranked with the rest but is no evidence of a
+/// lexical match (neither `matched` nor the relevance rule counts it).
+struct LexList {
+    via: MatchVia,
+    items: Vec<ItemRef>,
+    weak: HashSet<ItemRef>,
+}
+
+impl LexList {
+    fn new(via: MatchVia, items: Vec<ItemRef>) -> Self {
+        Self {
+            via,
+            items,
+            weak: HashSet::new(),
+        }
+    }
+
+    fn trigram(hits: lexical::TrigramHits, f: fn(i64) -> ItemRef) -> Self {
+        Self {
+            via: MatchVia::Words,
+            items: refs(hits.ids, f),
+            weak: hits.weak.into_iter().map(f).collect(),
+        }
+    }
+}
+
 /// Fuse the lexical lists and the vector list, remembering how each item was found.
-fn collect(lists: Vec<(MatchVia, Vec<ItemRef>)>, vector: Vec<(ItemRef, f32)>) -> Candidates {
+fn collect(lists: Vec<LexList>, vector: Vec<(ItemRef, f32)>, rrf_k: f64) -> Candidates {
     let mut signals: HashMap<ItemRef, Signals> = HashMap::new();
     let mut ranked: Vec<Vec<ItemRef>> = Vec::with_capacity(lists.len() + 1);
-    for (via, list) in lists {
-        for item in &list {
+    for list in lists {
+        for item in list.items.iter().filter(|i| !list.weak.contains(i)) {
             let s = signals.entry(*item).or_default();
-            s.via.insert(via);
+            s.via.insert(list.via);
             s.lexical = true;
         }
-        ranked.push(list);
+        ranked.push(list.items);
     }
     for (item, sim) in &vector {
         let s = signals.entry(*item).or_insert_with(|| Signals {
@@ -335,7 +366,7 @@ fn collect(lists: Vec<(MatchVia, Vec<ItemRef>)>, vector: Vec<(ItemRef, f32)>) ->
         s.similarity = s.similarity.max(*sim);
     }
     ranked.push(vector.into_iter().map(|(i, _)| i).collect());
-    (rrf(&ranked), signals)
+    (rrf(&ranked, rrf_k), signals)
 }
 
 fn ordered_via(s: &Signals) -> Vec<MatchVia> {
@@ -553,6 +584,7 @@ pub fn run_with_chunk_reads(
         } else {
             CANDIDATES
         },
+        rrf_k: p.fusion.rrf_k,
         reads,
         lists: p.lists,
     };
@@ -670,7 +702,10 @@ impl Filters<'_> {
         let mut out: Vec<Scored> = Vec::new();
         let mut push = |item: ItemRef, row: Row, input: BoostInput| {
             let s = signals.get(&item).unwrap_or(&empty);
-            let score = scores[&item] * boost(self.weights, &input);
+            let score = self
+                .p
+                .fusion
+                .combine(scores[&item], boost(self.weights, &input));
             out.push(Scored {
                 row,
                 score,
@@ -1075,6 +1110,7 @@ mod tests {
                 vector: None,
                 text: &text,
                 k: CANDIDATES,
+                rrf_k: Fusion::default().rrf_k,
                 reads: ChunkReads::Inline,
                 lists: Lists::Hybrid,
             };
@@ -1224,6 +1260,132 @@ mod tests {
         });
         // A status note well over a year old keeps 0.7 of its score with a 7-day half-life.
         assert!((decayed / kept - 0.7).abs() < 1e-6, "{decayed} / {kept}");
+    }
+
+    /// Task 19, ruling 3, end to end with the fake embedder (no meaning to fall back on): a Thai
+    /// question finds the memory that holds its parts apart, a memory that shares only the
+    /// common `การ` is not returned, and a one-word query of two code points still finds by
+    /// the LIKE scan. The same holds in the raw tier.
+    #[test]
+    fn a_thai_question_matches_by_shared_trigrams() {
+        let f = fx();
+        let (hit, _) = f.add(
+            &f.app,
+            Kind::Bugfix,
+            "รายงานบั๊ก: ปุ่มลบในหน้ารายการกดแล้วเงียบ และฟอร์มไม่ทำงาน",
+        );
+        let (decoy, _) = f.add(&f.app, Kind::Note, "การเดินทางไปเชียงใหม่ด้วยรถไฟ");
+        f.add(&f.app, Kind::Note, "ตั้งค่า SQLite แบบ WAL");
+        f.chunk(&f.app, "s-thai", "เมื่อวานคุยกันว่าปุ่มลบในหน้ารายการไม่ทำงาน");
+        let out = f.search(&f.params("ทำไมปุ่มลบไม่ทำงาน"));
+        let first = out.hits.first().expect("a lexical match");
+        assert_eq!(first.id, hit, "{:?}", out.hits);
+        assert!(first.matched.contains(&MatchVia::Words), "{first:?}");
+        let out = f.search(&f.params("ทำไมการลบไม่ทำงาน"));
+        assert!(
+            out.hits.iter().all(|h| h.id != decoy),
+            "one shared trigram is not a match: {:?}",
+            out.hits
+        );
+        assert!(out.hits.iter().any(|h| h.id == hit));
+        // The raw tier: the chunk holds the parts too.
+        let raw = f.search(&SearchParams {
+            include_raw: true,
+            ..f.params("ทำไมปุ่มลบไม่ทำงาน")
+        });
+        assert!(
+            raw.hits.iter().any(|h| h.tier == Tier::Raw),
+            "{:?}",
+            raw.hits
+        );
+        f.add(&f.app, Kind::Note, "ระบบความจำสำหรับเอเจนต์");
+        assert!(!f.search(&f.params("จำ")).hits.is_empty(), "LIKE scan");
+    }
+
+    /// Score of the hit `id` for `p` when the clock reads `now`.
+    fn score_at(f: &Fx, p: &SearchParams, id: &str, now: DateTime<Utc>) -> f64 {
+        let out = run(&f.c, Some(&f.idx), &f.e, &Weights::default(), p, now).unwrap();
+        out.hits.iter().find(|h| h.id == id).expect("found").score
+    }
+
+    /// Task 19, ruling 1: durable knowledge does not age out. A note, fact, how-to, bugfix or
+    /// summary scores the same at 1 day and at 300 days; a status, handoff, diary entry or raw
+    /// chunk still decays; a user half-life brings the decay back.
+    #[test]
+    fn durable_kinds_keep_their_score_and_short_lived_ones_decay() {
+        let f = fx();
+        let created = "2026-01-05T10:00:00.000Z";
+        let day = |n: i64| {
+            DateTime::parse_from_rfc3339(created)
+                .unwrap()
+                .with_timezone(&Utc)
+                + chrono::Duration::days(n)
+        };
+        let mut ids = Vec::new();
+        for (kind, word) in [
+            (Kind::Note, "alphanote"),
+            (Kind::Fact, "alphafact"),
+            (Kind::Howto, "alphahowto"),
+            (Kind::Bugfix, "alphabugfix"),
+            (Kind::Summary, "alphasummary"),
+            (Kind::Status, "alphastatus"),
+            (Kind::Handoff, "alphahandoff"),
+            (Kind::Diary, "alphadiary"),
+        ] {
+            let (id, _) = f.add_input(
+                &f.app,
+                memories::NewMemoryInput {
+                    content: format!("{word} deploy checklist"),
+                    kind: Some(kind),
+                    created_at: Some(created.into()),
+                    ..Default::default()
+                },
+            );
+            ids.push((kind, word, id));
+        }
+        for (kind, word, id) in &ids {
+            let p = f.params(&format!("{word} deploy checklist"));
+            let (young, old) = (score_at(&f, &p, id, day(1)), score_at(&f, &p, id, day(300)));
+            match kind {
+                Kind::Status | Kind::Handoff | Kind::Diary => {
+                    assert!(old < young * 0.99, "{kind:?} decays: {young} -> {old}")
+                }
+                _ => assert!(
+                    (young - old).abs() < 1e-12,
+                    "{kind:?} does not decay: {young} -> {old}"
+                ),
+            }
+        }
+        // A user half-life of 180 days on `fact` restores the decay (0.7 + 0.3 e^(-299/180) at
+        // 300 days against 0.7 + 0.3 e^(-1/180) at 1 day).
+        let (id, word) = (&ids[1].2, ids[1].1);
+        let p = SearchParams {
+            half_lives: fusion::HalfLives {
+                fact: 180.0,
+                ..Default::default()
+            },
+            ..f.params(&format!("{word} deploy checklist"))
+        };
+        let ratio = score_at(&f, &p, id, day(300)) / score_at(&f, &p, id, day(1));
+        let expect =
+            (0.7 + 0.3 * (-300.0f64 / 180.0).exp()) / (0.7 + 0.3 * (-1.0f64 / 180.0).exp());
+        assert!((ratio - expect).abs() < 1e-9, "{ratio} vs {expect}");
+        // A raw chunk decays with its 90-day half-life.
+        f.chunk(&f.app, "s-decay", "betaraw deploy checklist");
+        let p = SearchParams {
+            include_raw: true,
+            ..f.params("betaraw deploy checklist")
+        };
+        let now = Utc::now();
+        let raw_id = |at| {
+            let out = run(&f.c, Some(&f.idx), &f.e, &Weights::default(), &p, at).unwrap();
+            out.hits
+                .iter()
+                .find(|h| h.tier == Tier::Raw)
+                .expect("raw hit")
+                .score
+        };
+        assert!(raw_id(now + chrono::Duration::days(300)) < raw_id(now) * 0.99);
     }
 
     #[test]
