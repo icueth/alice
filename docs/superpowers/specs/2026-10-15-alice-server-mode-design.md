@@ -4,7 +4,9 @@
 - **Addresses:** the repository is public, so this spec writes `<server-ip>`, `<host>`, `<vm-lan-ip>` and `<nat-gateway>`. The real values live only in `/etc/alice/server.env` on the server and in the controller's git-ignored notes.
 - **Status:** approved by the controller with binding changes (spec-review.md, 2026-10-15), applied here; base merged with
   `feat/m2-judge-settings` 9dfac19 (M2 Task 22); addendum 1 (the owner's answers: four tenants, MemPalace import through
-  a client-made bundle, a fixed disk) folded in, with `feat/m3-import` 3dbfa31 merged
+  a client-made bundle, a fixed disk) folded in, with `feat/m3-import` 3dbfa31 merged; **addendum 2** (the owner,
+  2026-10-15 20:30: no Windows, the team goes through the server's MCP endpoint) folded in. Where addendum 2 changes an
+  earlier section, that section says so; §2.8 and §2.9 hold the new design.
 - **Owner:** icueth (vision); technical choices delegated to this lane
 - **Lane:** server mode, worktree `project-alice-srv`, branch `feat/server-mode` (from `feat/m2-judge-settings` b28b99f)
 - **Builds on:** `2026-10-13-alice-core-design.md` (the core spec), the M2 handoff `docs/superpowers/handoff/2026-10-14-m2-handoff.md`
@@ -25,6 +27,14 @@
   go. Token handover is the controller's call; the script prints a token once and never writes it outside the tenant's home.
 - **MemPalace import is in scope (addendum 1):** each person imports their own palace into their own tenant (§3.8).
 - **The disk will not be grown (addendum 1):** 28 GB root with about 19 GB free; the budget is §2.7.
+- **Addendum 2 (the owner):** "ไม่ต้องทำ windows แล้ว เดี๋ยว ทำให้ทีมให้ผ่าน server mcp แทน". The changes:
+  - **No Windows.** Windows is no longer a target: CI drops `windows-latest`, and this lane writes no more Windows code.
+  - **The team installs nothing.** Each person's agent connects straight to their tenant's MCP endpoint over HTTPS
+    (§2.8).
+  - **Import is done by the admin.** The admin imports a person's palace with `alice-server import` (§2.9); the
+    client-made bundle is dropped.
+  - **The `alice remote` client (§3) is deferred.** It is kept as a design for later, if the owner wants it for his
+    own Mac.
 
 ### 0.2 Architecture rulings from the controller (binding; this spec fills in the details)
 
@@ -34,7 +44,7 @@
    upstream `Host` rewritten so the daemon's Host check (`http.rs` `Guard`) stays as it is. Streaming responses are not buffered.
    The bearer token is the only credential. (The fail2ban jail first ruled here is dropped: the server's NAT masquerades, so
    Caddy sees only the gateway's address; see §2.4.)
-3. **Client remote mode.** `alice` (the CLI, `alice mcp` and the agent hooks that call the CLI) can point at a URL and a token
+3. **Client remote mode** *(deferred by addendum 2: §3 keeps the design for later; the team uses §2.8)*. `alice` (the CLI, `alice mcp` and the agent hooks that call the CLI) can point at a URL and a token
    instead of a local daemon. The project is detected on the client. A working tree's `.alice.toml` applies on the server exactly
    as it would locally, failing closed. Writes spool while the server is unreachable. The connection uses HTTPS, or plain HTTP to
    loopback only.
@@ -45,20 +55,20 @@
 
 ### 0.3 Success criteria (each one is checked in §8)
 
-1. From a Mac, `alice remote set https://<host>/u/<name>` (token on stdin) is enough for these to work against the server:
+1. *(Deferred with §3.)* From a Mac, `alice remote set https://<host>/u/<name>` (token on stdin) is enough for these to work against the server:
    `alice recall`, `alice remember`, `alice context` and `alice mcp`.
 2. Tenant A's token is refused on tenant B's path, and A's client never sends A's token to B's daemon.
 3. A project's `.alice.toml` changes server-side behaviour exactly as it would locally: `cloud_denied` keeps its memories away
    from Jev and from remote embedders, `block_secrets` refuses writes, and custom patterns redact. This holds for later judge
    calls about that project too, and it fails closed when the rules are missing, invalid or unreadable.
-4. A secret in a `remember` is redacted on the client; it never reaches the network.
-5. With the server unreachable, `remember` answers "Queued" within the 3 s ping, and the queued write is stored on the server
+4. *(Deferred with §3.)* A secret in a `remember` is redacted on the client; it never reaches the network.
+5. *(Deferred with §3.)* With the server unreachable, `remember` answers "Queued" within the 3 s ping, and the queued write is stored on the server
    after a later call, once (replay is at least once, and deduplication makes the result single).
 6. A tenant daemon cannot reach the LAN (the VM's private /24 and every private range), nor Caddy's admin API, whatever URL its
    settings name (R18); the public internet stays reachable for Jev and the model download.
 7. `/api/v1/events/stream` delivers events through Caddy without buffering.
 8. The token never appears in a log, an error message, `Debug` output, `alice remote status`, or Caddy's access log.
-9. `alice import mempalace` in remote mode imports the person's own palace into their tenant:
+9. *(Replaced by 12; the bundle is dropped by addendum 2.)* `alice import mempalace` in remote mode imports the person's own palace into their tenant:
    - the counts equal a local import of the same palace;
    - a secret-shaped drawer never appears in the uploaded bytes, and block mode holds it back on the client;
    - a rerun imports nothing new;
@@ -67,6 +77,17 @@
    - uploads that would leave less than 2 GB free are refused up front;
    - each tenant keeps at most 2 scheduled backups and makes no manual ones;
    - `alice-server list` warns below 3 GB free.
+11. **Direct MCP (§2.8).** An agent with no Alice binary (Claude Code, Codex) is configured with
+    `https://<host>/u/<name>/mcp` and the header `Authorization: Bearer <token>`. Then:
+    - `recall`, `remember` and `context` work;
+    - the request is refused without the token, or with another tenant's;
+    - the project follows the precedence of §2.8, and no client path is stored;
+    - a secret sent through MCP is stored redacted;
+    - streamed responses pass through Caddy unbuffered.
+12. **Admin import (§2.9).** `alice-server import <name> <palace-dir>` imports a palace into that tenant:
+    - the counts equal a local import of the same palace;
+    - a palace outside the tenant's `import-inbox/` is refused;
+    - the server's copy of the palace is gone afterwards.
 
 ### 0.4 Out of scope
 
@@ -284,8 +305,8 @@ handle_path /u/<name>/* {
 	route {
 		@admin path /api/v1/admin/*
 		respond @admin 404
-		@api path /api/v1/*
-		reverse_proxy @api 127.0.0.1:<port> {
+		@alice path /api/v1/* /mcp /mcp/*
+		reverse_proxy @alice 127.0.0.1:<port> {
 			header_up Host {upstream_hostport}
 			header_up -Origin
 			header_up -X-Forwarded-For
@@ -297,8 +318,8 @@ handle_path /u/<name>/* {
 ```
 
 - `handle_path` strips `/u/<name>`. `route` keeps the order as written.
-- Only `/api/v1/*` is exposed. `/mcp` is not routed. A remote agent goes through `alice mcp` on its own machine: that is where
-  the project is detected and text is redacted (Ruling R4). `/api/v1/admin/*` (shutdown, token rotation) is not routed either:
+- `/api/v1/*` and `/mcp` are exposed (addendum 2 reverses R4: direct MCP is the team's way in, §2.8).
+  `/api/v1/admin/*` (shutdown, token rotation) is not routed:
   a rotation over the WAN would lock the person out, because the new token is never returned (Ruling R5).
 - `header_up Host {upstream_hostport}` sends `127.0.0.1:<port>`, which the daemon's `Guard` accepts. `-Origin` drops any
   Origin header a browser might add.
@@ -414,7 +435,90 @@ The admin's lever is one line per tenant: `ALICE_BACKUP_DAILY=1` in that tenant'
 
 ---
 
-## 3. Client remote mode
+### 2.8 Direct MCP over HTTPS (addendum 2: the primary way in)
+
+**Route.** Each tenant's Caddy snippet routes `/u/<name>/mcp`, together with `/api/v1/*`, to the daemon's existing `/mcp`
+service (rmcp Streamable HTTP, in `http.rs`, behind the same token, Host and Origin guard), using:
+- the same `Host` rewrite;
+- `Origin` dropped;
+- `flush_interval -1`, so streamed responses pass unbuffered;
+- the session header (`Mcp-Session-Id`) passed through untouched.
+
+The bearer token, sent by the agent as a header, is the only credential.
+
+**Agent setup** (documented in `docs/server.md` and verified in the deployment task; each client's current syntax is
+checked against its own docs when that file is written):
+- **Claude Code:**
+  `claude mcp add --transport http alice "https://<host>/u/<name>/mcp?project=<slug>" --header "Authorization: Bearer ${ALICE_TOKEN}"`.
+  A `.mcp.json` with `${ALICE_URL}` and `${ALICE_TOKEN}` expansion also works, so a team repository can commit it without
+  a token.
+- **Codex:**
+  ```
+  [mcp_servers.alice]
+  url = "https://<host>/u/<name>/mcp"
+  bearer_token_env_var = "ALICE_TOKEN"
+  ```
+
+**Project identity without a client binary** (tenant mode: git never runs, and a client path is never used or stored).
+The project of a tool call is, in order:
+1. the call's explicit `project` argument;
+2. the connection's default project: the query `?project=<slug>` on the MCP URL (R26);
+3. the basename of the first root the client offers (the MCP server already asks for roots), slugified;
+4. `global`.
+
+For 2 and 3 the slug resolves to an existing project with that slug or alias. If there is none, it resolves to a
+**placeholder** project: the key is `import:<slug>` (the store's existing placeholder prefix, R27) and there is no root.
+This is the same placeholder an import of a wing with that slug creates, so MCP writes and an imported palace land in one
+project, and a later `client_project` of that slug adopts it. Only the slug is stored; a root's full path never leaves
+the request handler.
+
+**Implementation.**
+- The four scoped requests and `CompatCall` gain a non-wire field, `project_hint: Option<String>` (`#[serde(skip)]`).
+- The MCP tool handlers in tenant mode set `cwd = None` and fill `project_hint` from 2 or 3.
+- `Service::choose` gains the step "explicit slug → `client_project` → `project_hint` (tenant mode only) → `cwd`
+  (local only) → `global`".
+
+**Privacy on this path.**
+- Text arrives inside TLS **unredacted** and is redacted on the server, with the tenant's rules, before anything is
+  stored or logged.
+- In tenant mode `privacy.redact` is forced on for every write (`Redactors`), and tenant validation refuses
+  `privacy.redact = false` (R28). This is the R6 principle moved to the server.
+- A repository's own `.alice.toml` is **not** available on this path (no client reads it). Per-project cloud denial is
+  the tenant's `privacy.cloud_denied_projects` list. `docs/server.md` says this plainly.
+
+**Settings and keys without a client binary.** `alice-server cli <name> <alice arguments…>` runs the `alice` CLI as the
+tenant's user against its own daemon (R31), so the admin can set a person's Jev key or settings for them. An HTTP client
+with the token can also call `/u/<name>/api/v1/settings` directly.
+
+**No hooks on this path.** The MCP server's instructions tell the agent when to recall and remember. Their wording is
+checked for a remote agent (no mention of a local daemon) and adjusted only where needed.
+
+### 2.9 Import by the admin (addendum 2: replaces the bundle, §3.8 and §4.5)
+
+The team has no client binary, so a palace reaches the server through the admin.
+`alice-server import <name> <palace-dir> [--dry-run]` works like this:
+1. The admin has copied the person's palace to the server (for example with `scp`; the person hands it over).
+2. The script moves it to `<home>/import-inbox/<job>/palace`, owned by `alice-<name>` (folders 0700).
+3. It runs M3's importer for that tenant: `alice import mempalace --palace <that path> [--dry-run]`, as the tenant's
+   user, against its own daemon, a local path.
+4. It prints the report.
+5. It **deletes the copy** at the end, success or failure (a trap).
+
+M3's importer always redacts and holds back block-mode drawers, so what is stored is redacted. The raw palace exists on
+the server only while the job runs (the admin can read everything anyway, Q1).
+
+**Tenant mode** allows an import only of a palace that resolves strictly inside that tenant's `import-inbox/`
+(canonical paths). Every other path keeps the refusal of §2.2 item 7. It also refuses up front when twice the palace's
+size would leave less than 2 GB free (R29); the existing disk-full behaviour stays the last line.
+
+The deployment task imports a **synthetic** palace only. Real palaces are imported after handover, by the admin, one at
+a time, with the person's consent.
+
+## 3. Client remote mode (deferred by addendum 2)
+
+*Addendum 2 defers this whole section.* The team uses direct MCP (§2.8), and its design is kept here unchanged for a
+later sub-project, if the owner wants the `alice remote` client for his own Mac. Nothing in §3 is built in this lane
+unless the controller says so.
 
 ### 3.1 Configuration
 
@@ -584,7 +688,7 @@ updates the mirror before the write is applied.
 root or the shim's cwd, as today, followed by §3.3. The admin-tools flag is read from the server with the remote timeout. The
 background replay of §3.5 runs inside it.
 
-### 3.8 Import from MemPalace (addendum 1)
+### 3.8 Import from MemPalace (addendum 1) — dropped by addendum 2 (§2.9 replaces it)
 
 The importer of `feat/m3-import` is a daemon job. It snapshots a palace **on the daemon's disk** (`importer::run`: snapshot,
 survey, then the knowledge, raw, graph, collapsed, mentions and done passes), redacts everything it plans with `RedactFilter`,
@@ -699,7 +803,7 @@ request's project rules are fail-closed (§3.5).
 
 Settings: none added. The environment variables `ALICE_REMOTE_URL` and `ALICE_REMOTE_TOKEN` join `NON_SETTING_ENV`.
 
-### 4.5 Import bundle upload
+### 4.5 Import bundle upload — dropped by addendum 2 (§2.9 replaces it)
 
 `PUT /api/v1/import/bundle`. The body is the bundle file (`application/octet-stream`), and `Content-Length` is required.
 The route is behind the token guard and has its own body rule in place of the 40 MB API limit. The server:
@@ -782,6 +886,11 @@ daemon's connection is dropped by the unit's `IPAddressDeny` (R18), and the embe
 | The import job fails or the daemon stops mid-import | The existing M3 behaviour: the job's folder (the bundle) is deleted; a rerun uploads again and resumes by dedup |
 | A drawer or fact holds a secret in block mode | Held back on the client and counted; it never leaves the machine |
 | A tenant asks for a manual backup | Refused (§2.2 item 7) |
+| An MCP request without the token, or with another tenant's | 401 from that tenant's daemon; the token is never logged |
+| An MCP client offers no roots and sets no `?project=` | The call's `project` argument decides, else `global` |
+| `?project=` names a slug that does not exist | A placeholder project with that slug is created on the first write (`import:<slug>`, no root); reads see an empty project until then |
+| An admin import's palace is outside `import-inbox/`, or too large for the disk | Refused before any work (§2.9) |
+| An admin import fails half-way | The script's trap deletes the inbox copy; M3's job cleans its snapshot; a rerun resumes by dedup |
 
 ---
 
@@ -804,7 +913,11 @@ daemon's connection is dropped by the unit's `IPAddressDeny` (R18), and the embe
   nothing on localhost can reconfigure the server.
 - **Brute force:** 2^256 tokens. There is no per-IP banning, because the NAT hides client addresses (§2.4).
 - **Backups:** tenant backups and `remove` archives sit on the same disk as the data. A copy off the machine is the admin's job.
-- **Import:** a person's palace never leaves their machine unredacted. The bundle holds only redacted text, and in block mode
+- **Direct MCP (addendum 2):** the agent's text reaches the server unredacted inside TLS and is redacted there before
+  it is stored or logged (forced on in tenant mode). A repository's `.alice.toml` does not apply on this path; the tenant's
+  global deny list does. Only a project slug is stored for a root, never its path.
+- **Admin import (addendum 2):** the raw palace sits under the tenant's 0700 `import-inbox/` only while the job runs.
+- **Import (addendum 1, dropped):** a person's palace never leaves their machine unredacted. The bundle holds only redacted text, and in block mode
   the drawers with secrets are held back. The server reads an uploaded SQLite file read-only with `trusted_schema = OFF`
   after `quick_check`, as the tenant's own Unix user, so a crafted file can only affect the tenant that sent it.
 
@@ -923,8 +1036,17 @@ the tests cover the following.
    `http://<nat-gateway>/` is refused. Record one access-log line's `client_ip`, for the record (the gateway is expected).
 8. Run `alice-server upgrade` with the same binary (a restart round trip) and `alice-server rotate t1`: the old token is
    refused, and `alice remote set` with the new one works.
-8a. Import: a **synthetic** palace (built on this Mac by a small test binary with M3's fixture, a few thousand drawers
-    with one `concat!`-built secret drawer), imported into t1 with `alice import mempalace --palace <it>`:
+8b. Direct MCP from this Mac (addendum 2). Claude Code runs in a scratch folder with
+    `claude -p … --mcp-config <scratch file> --strict-mcp-config`, where the file names
+    `https://<host>/u/t1/mcp?project=scratch` with the bearer header from an environment variable. This never touches
+    `~/.claude*`. Check:
+    - a `remember` and a `recall` through MCP work;
+    - the project is `scratch`;
+    - no client path is in the tenant's database;
+    - t2's token on t1's MCP URL is refused.
+8a. Import: a **synthetic** palace (built on this Mac with M3's fixture, a few thousand drawers, one `concat!`-built
+    secret drawer) is copied to the server and imported into t1 with `alice-server import t1 <dir>` (addendum 2; was the
+    bundle):
     - the counts equal a local import of the same palace;
     - the secret is not in the server's database (`grep -c` on a copy);
     - `import-tmp/` is empty afterwards;
@@ -971,6 +1093,13 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R23 | **Backups pinned to 2 scheduled, 0 weekly, no manual** on tenants (environment plus a tenant-mode refusal) | The disk is fixed (§2.7); manual backups are kept apart from the rotation | A person cannot make an extra copy on demand; the admin can |
 | R24 | **Upload guard:** 4 GiB cap, refused below 2 GB free after the upload, one at a time, swept after 1 hour | The import must never be what fills the disk | A palace whose redacted text exceeds 4 GiB cannot be imported in one go; no such palace is known |
 | R25 | After the build, **only the binary stays** (target, caches, checkout and toolchain removed) | About 6 GB back before any data exists | The next build reinstalls the toolchain (minutes) |
+| R26 | The connection's default project is the **query `?project=<slug>`** on the MCP URL (addendum 2 let us pick header or query) | Every MCP client can set a URL; not every one can set custom headers; Caddy keeps the query when it strips the prefix | The slug shows in Caddy's access log (a project name, not a secret) |
+| R27 | An MCP project hint that names no stored project makes a placeholder with the **existing `import:` prefix**, not `mcp:` | The store adopts only `import:%` placeholders; an `mcp:` key would split one project between MCP writes and its import and never be adopted | The key's prefix reads "import" for a project that started over MCP (internal only) |
+| R28 | Tenant mode **forces `privacy.redact` on** for every write and refuses `privacy.redact = false` | Direct MCP sends text unredacted inside TLS; the server is the only place left to redact it | A person cannot store raw secrets on the server |
+| R29 | Admin import: only a palace strictly inside the tenant's `import-inbox/`; refused when 2 × its size would leave < 2 GB free | The raw palace stays inside the tenant's own 0700 home and only for the job; the import must not be what fills the disk | A palace larger than (free − 2 GB)/2 cannot be imported in one go |
+| R30 | **Windows dropped** from CI and from this lane (addendum 2); existing Windows code stays, untested | The owner's decision; the team uses MCP, not the binary | A Windows regression in the binary goes unnoticed (the manual `windows-real-model.yml` stays) |
+| R31 | `alice-server cli <name> <args…>` runs the `alice` CLI as the tenant's user | With no client binary, the admin needs a way to set a person's key and settings | The admin types a person's Jev key (the admin can read it anyway, Q1) |
+| R4, R20–R22, R24 | Superseded by addendum 2 (R4: `/mcp` is now routed; R20–R22, R24: the bundle is dropped) | — | — |
 
 ---
 
@@ -981,6 +1110,11 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
   Moving an existing local Alice home stays out of scope (possible by hand: the admin restores a backup into the tenant
   home, and R3 keeps those projects fail-closed until the owner's client sends each project's identity once).
 - **Tenants:** `icue`, `joe-hermes`, `joe` and `petch`, created after the controller's go (§8.3 step 10).
+- **Addendum 2 (the owner, 2026-10-15 20:30):**
+  - no Windows;
+  - the team goes through the server's MCP endpoint (§2.8);
+  - import is done by the admin (§2.9);
+  - the `alice remote` client is deferred (the controller asks the owner whether he wants it for his own Mac).
 - **Q3 — Remote mode switches a whole machine**, or one `ALICE_HOME` through the environment, not single projects.
 - **Q4 — Resources (measured by the controller):** 15 GB of RAM (13 GB free), 4 vCPU, and a 28 GB root filesystem with 19 GB
   free. Five tenants need about 0.6 GB for models, plus their data and backups. The NAT masquerades (R19).
@@ -1020,3 +1154,16 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 9. Merge the head of `feat/m2-judge-settings` again before the final review (the M2 final-review fix wave lands after
    2026-10-16 17:00).
 10. The deployment task (§8.3), only after the controller's go.
+
+**Order after addendum 2.** Tasks 1–6 are done (tenant mode, the mirror, settings rules, ping capabilities, refusals and
+`--tenant`). Then:
+1. CI: one green run, then drop `windows-latest`.
+2. Direct MCP (§2.8).
+3. Admin import (§2.9).
+4. `alice-server` with the MCP route and the `import` and `cli` commands.
+5. Docs (MCP setup for Claude Code and Codex, the Windows note, the admin import, the privacy difference on the MCP
+   path).
+6. Merge both heads, run the gates, and the opus review.
+7. Deployment (gated).
+
+The remote-client items 3–5 of this outline are deferred (§3), and item 5a is dropped.

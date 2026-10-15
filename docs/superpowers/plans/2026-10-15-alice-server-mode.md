@@ -55,6 +55,36 @@
   | `alice-server list` | warns below 3 GB free |
   | Base branches | `origin/feat/m2-judge-settings` and `origin/feat/m3-import` are merged; merge both again in Task 19. Keep changes to M3's importer additive (a backend and an entry point) |
 
+## Execution order (addendum 2 — binding)
+
+The owner changed direction on 2026-10-15 20:30 (spec addendum 2, folded into the spec). There is **no Windows**, and
+**the team uses the server's MCP endpoint**: no client binary, and the admin does the imports. This section overrides the
+task numbering:
+
+| Order | Task | Status |
+|---|---|---|
+| — | 1–6 | done |
+| 1 | **21**: CI drops `windows-latest` (after one green run on all three OS) | new |
+| 2 | **22**: project hint and forced redaction in tenant mode (service level) | new |
+| 3 | **23**: direct MCP — the handlers' project identity, the Caddy emulator, end-to-end MCP tests | new |
+| 4 | **24**: admin import — the tenant's `import-inbox/` rule, the disk rule, an in-process import test | new |
+| 5 | **17**: `alice-server`, as amended below (the MCP route, `import`, `cli`) | amended |
+| 6 | **18**: documentation, as amended below | amended |
+| 7 | **19**: merge both heads, run the gates (no Windows), the opus review | unchanged |
+| 8 | **20**: deployment, as amended below — STOP for the controller's go | amended |
+| — | 7–12 | **deferred**, the remote client; only if the owner asks |
+| — | 13–16 | **dropped**, the import bundle; Task 24 and the amended Task 17 replace it |
+
+Global constraints added by addendum 2:
+- No new Windows code, tests or fixes. Existing Windows paths stay as they are.
+- Every implementer runs `cargo clippy --locked --workspace --all-targets -- -D warnings` before committing, as CI does.
+- The direct-MCP default project is the query `?project=<slug>` on the MCP URL (spec R26).
+- A project hint that names no stored project makes a placeholder whose key starts with
+  `alice_core::store::projects::PLACEHOLDER_KEY_PREFIX` (`import:`), with no root (R27).
+- Tenant mode forces `privacy.redact` on (R28).
+- The admin import accepts only a palace under `<ALICE_HOME>/import-inbox/`, and refuses it when 2 × its size would
+  leave less than 2 GB free (R29).
+
 ## Review Focus
 
 These input classes and failure modes are implied by the spec but not exercised by any task's main tests. Each one has a test added to the task that owns the code.
@@ -1390,7 +1420,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 7: `SpoolSink` — one drain for the daemon and the remote client
+### Task 7: `SpoolSink` — one drain for the daemon and the remote client — DEFERRED (addendum 2; do not dispatch unless the controller says so)
 
 **Files:**
 - Modify: `crates/alice-daemon/src/spool.rs` (`drain` near line 128)
@@ -1517,7 +1547,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 8: Remote configuration — `remote_config.rs`
+### Task 8: Remote configuration — `remote_config.rs` — DEFERRED (addendum 2; do not dispatch unless the controller says so)
 
 **Files:**
 - Create: `crates/alice-daemon/src/remote_config.rs`
@@ -1662,7 +1692,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 9: The remote target in `DaemonClient`, and the Caddy emulator harness
+### Task 9: The remote target in `DaemonClient`, and the Caddy emulator harness — DEFERRED (addendum 2; do not dispatch unless the controller says so)
 
 **Files:**
 - Modify: `crates/alice-daemon/src/client.rs` (struct `DaemonClient`, `Unavailable`, `http_client`, `proves`, `try_connect`, `try_existing`, `is_live`, `call`, `get_json`, every method's timeout)
@@ -1887,7 +1917,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 10: Client-side preparation — project identity and redaction (`remote_prepare.rs`)
+### Task 10: Client-side preparation — project identity and redaction (`remote_prepare.rs`) — DEFERRED (addendum 2; do not dispatch unless the controller says so)
 
 **Files:**
 - Create: `crates/alice-daemon/src/remote_prepare.rs`
@@ -2140,7 +2170,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 11: Remote replay (`remote_replay.rs`)
+### Task 11: Remote replay (`remote_replay.rs`) — DEFERRED (addendum 2; do not dispatch unless the controller says so)
 
 **Files:**
 - Create: `crates/alice-daemon/src/remote_replay.rs`
@@ -2259,7 +2289,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 12: CLI and `alice mcp` in remote mode
+### Task 12: CLI and `alice mcp` in remote mode — DEFERRED (addendum 2; do not dispatch unless the controller says so)
 
 **Files:**
 - Modify: `crates/alice/src/main.rs` (`Command::Remote(cmd::RemoteCmd)`)
@@ -2400,7 +2430,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
-### Task 13: The bundle format — `Backend::Bundle`, `BundleWriter`, `BundleReader`
+### Task 13: The bundle format — `Backend::Bundle`, `BundleWriter`, `BundleReader` — DROPPED (addendum 2; replaced by Task 24 and the amended Task 17)
 
 **Files:**
 - Create: `crates/alice-core/src/import/bundle.rs`
@@ -2609,7 +2639,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 14: The redacting bundle builder (client side)
+### Task 14: The redacting bundle builder (client side) — DROPPED (addendum 2; replaced by Task 24 and the amended Task 17)
 
 **Files:**
 - Create: `crates/alice-daemon/src/import_bundle.rs`
@@ -2722,7 +2752,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 15: Server — the upload endpoint and the bundle entry point of the import job
+### Task 15: Server — the upload endpoint and the bundle entry point of the import job — DROPPED (addendum 2; replaced by Task 24 and the amended Task 17)
 
 **Files:**
 - Modify: `crates/alice-daemon/src/http.rs` (route `PUT /api/v1/import/bundle` with its own body rule)
@@ -2826,7 +2856,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 16: `alice import mempalace` in remote mode
+### Task 16: `alice import mempalace` in remote mode — DROPPED (addendum 2; replaced by Task 24 and the amended Task 17)
 
 **Files:**
 - Modify: `crates/alice-daemon/src/client.rs`:
@@ -3071,6 +3101,38 @@ git commit -m "feat(deploy): alice-server — add, remove, rotate, list, upgrade
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
+**Addendum 2 amendments to Task 17** (binding; they override the text above where they differ):
+- **The tenant snippet routes MCP too.** Inside `route`:
+  ```
+  @admin path /api/v1/admin/*
+  respond @admin 404
+  @alice path /api/v1/* /mcp /mcp/*
+  reverse_proxy @alice 127.0.0.1:<port> { header_up Host {upstream_hostport}; header_up -Origin; header_up -X-Forwarded-For; flush_interval -1 }
+  respond 404
+  ```
+  The `add` output prints the MCP URL `https://<host>/u/<name>/mcp`, plus a one-line Claude Code example using
+  `--header "Authorization: Bearer ${ALICE_TOKEN}"`. The token itself is printed once, as before.
+- **New command `alice-server import <name> <palace-dir> [--dry-run]`** (spec §2.9):
+  1. Validate the name, that the tenant exists, and that `<palace-dir>` is a directory.
+  2. Set `job=$(date -u +%Y%m%dT%H%M%SZ)-$$` and `dir="$SRV/<name>/import-inbox/$job"`. Run
+     `install -d -m 0700 "$SRV/<name>/import-inbox" "$dir"`, then `mv "<palace-dir>" "$dir/palace"` (`mv` copies across
+     filesystems), then `chown -R alice-<name>:alice-<name> "$SRV/<name>/import-inbox"`.
+  3. `trap 'rm -rf "${dir:?}"' EXIT`.
+  4. Run `sudo -u alice-<name> env ALICE_HOME="$SRV/<name>" ALICE_NO_AUTOSTART=1 "$BIN" import mempalace --palace "$dir/palace" [--dry-run]`.
+     Print its output, and exit with its status. The copy is gone afterwards, whatever happened.
+- **New command `alice-server cli <name> <alice arguments…>`** (R31): run
+  `sudo -u alice-<name> env ALICE_HOME="$SRV/<name>" ALICE_NO_AUTOSTART=1 "$BIN" "$@"`, with the tenant's terminal attached
+  so `config set-secret` can prompt.
+- **New test scenarios in `deploy/server/tests/run.sh`:**
+  - `snippet_routes_mcp`: `ann.caddy` contains `/mcp /mcp/*` and `respond @admin 404`.
+  - `import_moves_runs_and_cleans`: the stub `alice` records its arguments. The palace directory moves into
+    `import-inbox/<job>/palace`. The stub sees `import mempalace --palace …/import-inbox/…/palace`. Afterwards the job
+    folder is gone and the original path no longer exists.
+  - `import_cleans_on_failure`: the stub `alice` exits 1. `alice-server import` exits non-zero, and the job folder is
+    still gone.
+  - `import_refuses_a_missing_palace` and `import_refuses_an_unknown_tenant`.
+  - `cli_runs_as_the_tenant`: `sudo -u alice-ann` and `ALICE_HOME=…/ann` appear in `calls.log`.
+
 ---
 
 ### Task 18: Documentation
@@ -3112,6 +3174,26 @@ git commit -m "docs: server mode — admin and person guides, disk budget, trust
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
+**Addendum 2 amendments to Task 18:**
+- `docs/server.md`'s main path **for a person** is direct MCP:
+  - the URL `https://<host>/u/<name>/mcp?project=<slug>`;
+  - the bearer header, with the token kept in an environment variable (`ALICE_TOKEN`);
+  - Claude Code: `claude mcp add --transport http …` and a `.mcp.json` with `${ALICE_URL}` and `${ALICE_TOKEN}`;
+  - Codex: `[mcp_servers.alice] url … bearer_token_env_var`.
+
+  **Check each client's current syntax against its official docs** (use the web search or fetch tools) and quote what you
+  checked in the report.
+- **Privacy:** say plainly that a repository's `.alice.toml` does not apply over direct MCP; per-project cloud denial is
+  the tenant's `privacy.cloud_denied_projects` list (set by the admin with `alice-server cli <name> config set …`), and
+  the server always redacts.
+- **Import:** describe the admin import (`alice-server import`): the person hands their palace to the admin; the server
+  copy is deleted afterwards.
+- **Keys and settings:** describe `alice-server cli` for setting a person's Jev key and settings.
+- **Windows:** the `alice` binary is supported on macOS and Linux. On Windows, or anywhere without the binary, connect an
+  agent to the server's MCP endpoint.
+- **Deferred client:** the `alice remote` client is not built yet. Do not document §3's commands as available.
+- **Thai section:** `README.th.md`'s Thai section follows the same structure.
+
 ---
 
 ### Task 19: Merge the lane heads again, full gates, whole-branch review
@@ -3145,3 +3227,263 @@ exactly:
   handover is the controller's.
 
 Report every measurement (RAM, disk before and after each step, RSS per tenant) to the controller.
+
+**Addendum 2 amendments to Task 20:** follow spec §8.3 as amended.
+- **Step 8b, direct MCP from this Mac.** Run Claude Code in a scratch folder:
+  `claude -p "<prompt>" --mcp-config <scratch json> --strict-mcp-config`. The JSON names
+  `https://<host>/u/t1/mcp?project=scratch` with `"headers": {"Authorization": "Bearer ${ALICE_TOKEN}"}`, and the
+  variable is set in the command's environment only. Never touch `~/.claude*`. Check that `remember` and `recall` work,
+  that the project is `scratch`, that the tenant database holds no client path, and that t2's token on t1's URL is
+  refused.
+- **Step 8a, import a synthetic palace.** Copy it with `scp`, then run `alice-server import t1 <dir>`. Check the counts
+  against a local import, that the secret is absent from the server's database, and that `import-inbox/` and
+  `import-tmp/` are empty afterwards.
+
+---
+
+### Task 21: CI — drop `windows-latest` (addendum 2, R30)
+
+**Files:**
+- Modify: `.github/workflows/ci.yml` (the matrix line `os: [ubuntu-latest, macos-latest, windows-latest]`)
+
+**Preconditions.** The CI run on `785c2cc` (the Ctrl-C cfg fix) must be green on all three OS. The controller checks
+this before dispatching the task.
+
+- [ ] **Step 1:** Change the matrix to `os: [ubuntu-latest, macos-latest]`. Leave `.github/workflows/windows-real-model.yml`
+  untouched.
+- [ ] **Step 2:** Commit:
+
+```bash
+git add .github/workflows/ci.yml
+git commit -m "ci: drop windows-latest (addendum 2: Windows is no longer a target; the manual windows-real-model workflow stays)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 22: Tenant mode — project hint and forced redaction (service level)
+
+**Files:**
+- Modify: `crates/alice-core/src/api.rs`: `project_hint` on `RecallRequest`, `RememberRequest`, `ContextRequest` and
+  `IngestRequest`.
+- Modify: `crates/alice-core/src/settings.rs`: `validate_tenant` refuses `privacy.redact = false`.
+- Modify: `crates/alice-daemon/src/service.rs`:
+  - `Scope.project_hint`;
+  - the `scoped!` macro;
+  - one new step in `choose`.
+- Modify: `crates/alice-daemon/src/redaction.rs`: forced on in tenant mode.
+- Modify: `crates/alice-daemon/src/compat.rs`: `CompatCall.project_hint`, passed into the requests it builds.
+- Test: in-file tests of `service.rs`, `redaction.rs` and `settings.rs`.
+
+**Interfaces:**
+- Consumes: `Scope`, `Scoped`, `ServiceOptions::tenant` and `tenant_svc()` (Task 5);
+  `SettingsHandle::is_tenant()` (Task 3); `alice_core::store::projects::{PLACEHOLDER_KEY_PREFIX, resolve_slug}`.
+- Produces:
+  - `project_hint: Option<String>` with `#[serde(skip)]` and `#[schemars(skip)]` on the four requests and on
+    `CompatCall` (`#[serde(skip)]` only). It is never on the wire; only in-process callers (the MCP handlers, Task 23)
+    set it;
+  - `Scope { project, cwd, client_project, project_hint: Option<&'a str> }`.
+
+**Behaviour** (spec §2.8):
+- **Precedence in `choose`:**
+  1. explicit slug;
+  2. `client_project`, with the mirror synced first, as today;
+  3. **when `self.opts.tenant` and `project_hint` is `Some(h)`:** let `slug = alice_core::normalize::slugify(h)`. If it
+     is empty, ignore the hint. Otherwise look it up with `projects::resolve_slug(conn, &slug)` on a reader (off the
+     runtime).
+     - **Found:** `ProjectChoice::Slug(found.slug)`.
+     - **Not found:**
+       `ProjectChoice::Detected(ProjectRef { key: format!("{PLACEHOLDER_KEY_PREFIX}{slug}"), slug, name: <the hint as given, trimmed>, root: None, remote: None })`;
+  4. `cwd` (local only);
+  5. `global`.
+
+  A local daemon ignores `project_hint`.
+- **Redaction.** `Redactors::cached`: when the source is `Source::Live(settings)` and `settings.is_tenant()`, force
+  `privacy.redact = true` before building or looking up (for both `for_root` and `for_root_always_on`).
+- **Settings.** `validate_tenant`: `privacy.redact == false` gives
+  `err("privacy.redact", "a server tenant always redacts secrets before storing them")`. The default is `true`, so
+  defaults pass.
+
+- [ ] **Step 1: Write the failing tests** (`service.rs` tests; reuse `tenant_svc()` and `svc()`):
+
+```rust
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_hint_makes_or_finds_a_placeholder_in_tenant_mode_only() {
+        let (_d, s) = tenant_svc().await;
+        let hint = |content: &str, h: &str| RememberRequest { content: content.into(), project_hint: Some(h.into()), ..Default::default() };
+        let r = s.remember(hint("first note via mcp", "My App")).await.unwrap();
+        assert_eq!(r.project, "my-app");
+        let conn = alice_core::store::open_reader(&s.home().db()).unwrap();
+        let (key, root): (String, Option<String>) = conn.query_row(
+            "SELECT key, root_path FROM projects WHERE slug = 'my-app'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(key, format!("{}my-app", alice_core::store::projects::PLACEHOLDER_KEY_PREFIX));
+        assert!(root.is_none(), "no path is stored for a hint");
+        // The second time it finds the same project; an explicit slug still wins.
+        assert_eq!(s.remember(hint("second note via mcp", "my-app")).await.unwrap().project, "my-app");
+        let r = s.remember(RememberRequest { content: "explicit".into(), project: Some("global".into()),
+            project_hint: Some("my-app".into()), ..Default::default() }).await.unwrap();
+        assert_eq!(r.project, "global");
+        // A local daemon ignores the hint.
+        let (_d2, local) = svc().await;
+        assert_eq!(local.remember(hint("local note", "my-app")).await.unwrap().project, "global");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_redacts_even_when_redaction_is_off_in_the_file() {
+        let (d, s) = tenant_svc().await;
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        assert!(s.patch_settings(patch_one("privacy.redact", serde_json::json!(false))).is_err());
+        s.remember(RememberRequest { content: format!("deploy key {token}"), project_hint: Some("ops".into()), ..Default::default() }).await.unwrap();
+        let bytes = std::fs::read(s.home().db()).unwrap();
+        assert!(!bytes.windows(token.len()).any(|w| w == token.as_bytes()), "the secret reached the database");
+        drop(d);
+    }
+```
+
+  The second test reads the database file directly. Write-ahead-log contents may sit in `alice.db-wal`: read both files,
+  or call the service's checkpoint helper if one exists, before scanning. Add a `redaction.rs` unit test: a `Redactors`
+  built over a tenant `SettingsHandle` (`SettingsHandle::load_with(&home, vec![], true)`) returns a redactor that
+  redacts even after the settings snapshot says `redact = false`. Construct that case through the handle's test hooks;
+  if none exists, assert through `privacy_for` plus `cached`.
+
+- [ ] **Step 2: Run** and see them fail (RED; record it): `cargo test -p alice-daemon --lib service::tests::a_project_hint`.
+- [ ] **Step 3: Implement** as above, and update every full struct literal the compiler reports with
+  `project_hint: None`.
+- [ ] **Step 4: Run.**
+  - `cargo test -p alice-daemon --lib`;
+  - `cargo test -p alice-core tenant_rules`;
+  - `cargo clippy --locked --workspace --all-targets -j 4 -- -D warnings`;
+  - `cargo fmt --all --check`.
+- [ ] **Step 5: Commit** (stage by name):
+  `feat(daemon): tenant project hints become placeholder projects; redaction is always on for a tenant (addendum 2)`.
+
+---
+
+### Task 23: Direct MCP — the handlers' project identity, the Caddy emulator, end-to-end tests
+
+**Files:**
+- Modify: `crates/alice-daemon/src/mcp.rs`: the tool handlers that set `req.cwd = self.cwd(&ctx).await` (`recall`,
+  `remember`, `context`, the compat tool and any other), plus `INSTRUCTIONS` wording if needed.
+- Create: `crates/alice-daemon/tests/support/mod.rs`, `crates/alice-daemon/tests/support/caddy.rs`,
+  `crates/alice-daemon/tests/server_mode.rs`.
+- Test: `server_mode.rs` (integration).
+
+**Interfaces:**
+- Consumes: `project_hint` and the tenant precedence (Task 22); `Service::is_tenant()`.
+- Produces: the Caddy emulator harness (below), which later tests reuse.
+
+**Behaviour** (spec §2.8):
+- **Handlers.** For `Backend::Local(s)` where `s.is_tenant()`, the handler sets `cwd = None` and `project_hint` in this
+  order:
+  1. the `project` query parameter of the HTTP request. Read it from
+     `ctx.extensions.get::<http::request::Parts>()`, using its `uri.query()` and `url::form_urlencoded::parse`. rmcp
+     injects the request's `Parts` there; see the doc comment in `rmcp-3.5.1/src/transport/streamable_http_server/tower.rs`
+     around line 1276;
+  2. else the basename of `self.first_root(&ctx)`.
+
+  `slugify` happens in the service. Pass the raw text; never pass the full root path anywhere. Local mode keeps today's
+  `cwd` behaviour. Add a small private `fn hint_and_cwd(&self, ctx) -> (Option<String>, Option<String>)`, so every
+  handler uses one rule.
+- **Instructions.** Read `INSTRUCTIONS`. If any line assumes a local daemon or a local binary, reword it so it reads well
+  for a remote agent too. Keep the substance.
+- **The Caddy emulator** (`tests/support/caddy.rs`), the spec §2.3 behaviour in-process:
+
+```rust
+pub struct Tenant { pub name: String, pub home: AliceHome, pub svc: Arc<Service>, pub token: String, pub port: u16 }
+pub struct Server { pub base: String, pub tenants: Vec<Tenant>, /* stop token, temp dirs, recorder, pause flag */ }
+impl Server {
+    /// Tenants `names` (tenant mode on, fake embedder, tokens from load_or_create_token) behind one emulator on 127.0.0.1:0.
+    pub async fn start(names: &[&str]) -> Server;
+    pub fn url(&self, name: &str) -> String;          // "{base}/u/{name}"
+    pub fn tenant(&self, name: &str) -> &Tenant;
+    /// (method, path_and_query, authorization present, body bytes) of every request the emulator received for `name`.
+    pub fn seen(&self, name: &str) -> Vec<(String, String, bool, Vec<u8>)>;
+}
+```
+
+  - **Routing:** `/u/<name>` is stripped (`Router::nest`), and only `/api/v1/*`, `/mcp` and `/mcp/*` are forwarded.
+    `/api/v1/admin/*` and everything else gets 404 with an HTML body.
+  - **Rewrites:** `Host` becomes `127.0.0.1:<that tenant's fake port>` (47801, 47802, …); `Origin` is dropped.
+  - **Recording** happens before forwarding.
+  - **Each tenant's router** is `alice_daemon::http::router(svc, token, port, stop)`, built with that fake port. No
+    separate listener per tenant: the emulator owns the only listener.
+- **Tests** (`tests/server_mode.rs`). Use rmcp's client with `StreamableHttpClientTransport` and its config's
+  `auth_header` field (see `rmcp-3.5.1/src/transport/streamable_http_client.rs` around line 517), and the
+  `RootsClient` pattern from `tests/mcp.rs` for roots. They cover:
+  1. `mcp_with_the_bearer_token_recalls_and_remembers`: `initialize`, then `tools/call remember`, then `tools/call recall`
+     through `{url}/mcp?project=scratch` returns the memory, and the stored project is `scratch`.
+  2. `mcp_without_or_with_another_tenants_token_is_refused`: connecting to ann's `/mcp` with no auth header fails, with
+     bob's token fails, and ann's recorder shows no successful call.
+  3. `mcp_project_precedence`:
+     - the `project` argument (an existing slug) beats `?project=`;
+     - `?project=` beats a root;
+     - a root `…/work/Root Repo` with no query gives `root-repo`;
+     - no root and no query gives `global`.
+  4. `mcp_stores_no_client_path`: after a `remember` with a root such as `<tmp>/clientside-unique-dirname/app`, neither
+     the tenant's database files nor its home tree (grep the bytes) contain `clientside-unique-dirname`, and
+     `projects.root_path` is `NULL` for `app`.
+  5. `mcp_stores_a_secret_redacted`: a `concat!`-built token sent in `remember` content is absent from the tenant's
+     database bytes.
+  6. `streams_pass_the_emulator_unbuffered`: a `GET {url}/api/v1/events/stream` with ann's token returns its first
+     `data:` chunk within 2 s, and a further event after a `remember`, within 1 s.
+
+- [ ] **Step 1:** write the support module and the tests (RED: they fail to compile or fail).
+- [ ] **Step 2:** implement the handler changes.
+- [ ] **Step 3: Run.**
+  - `cargo test -p alice-daemon --test server_mode`;
+  - `cargo test -p alice-daemon --test mcp` (the existing MCP suite stays green);
+  - `cargo clippy --locked --workspace --all-targets -j 4 -- -D warnings`;
+  - `cargo fmt --all --check`.
+- [ ] **Step 4: Commit** (stage by name; never anything under `.superpowers/`):
+  `feat(mcp): direct MCP for server tenants — project from argument, ?project= or root name; Caddy emulator tests (addendum 2)`.
+
+---
+
+### Task 24: Admin import — the tenant's `import-inbox/` and the disk rule
+
+**Files:**
+- Modify: `crates/alice-daemon/src/service.rs`:
+  - in `start_import`, Task 6's tenant refusal becomes the inbox rule;
+  - `ServiceOptions::free_space` for tests.
+- Test: in-file tests of `service.rs`, and `crates/alice-daemon/tests/server_mode.rs` (one in-process import test).
+
+**Interfaces:**
+- Consumes: Task 6's tenant refusal, M3's `start_import`, `backup::free_space`, and
+  `alice_core::import::fixture::synthetic_palace` (available to alice-daemon's tests through the `fixtures` feature).
+- Produces: `ServiceOptions::free_space: Option<Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>>` (default `None`, which
+  uses `backup::free_space`); the constant `IMPORT_MIN_FREE_AFTER: u64 = 2_000_000_000`.
+
+**Behaviour** (spec §2.9). In tenant mode, `start_import` checks, in order:
+1. `req.palace` is `Some(p)`, and `canonicalize(p)` lies strictly below `canonicalize(<home>/import-inbox)`, not equal to
+   it. Otherwise refuse:
+   "a server tenant imports only a palace the admin placed under import-inbox/ with `alice-server import`; it cannot read
+   other paths on the server".
+2. `size` is the total of the regular files under the palace (walk with `symlink_metadata`, and do not follow links).
+   Refuse when `free_space(home) < 2 * size + IMPORT_MIN_FREE_AFTER`:
+   "the server has {free} bytes free; importing this {size}-byte palace needs about twice its size plus 2 GB; ask the
+   server's admin".
+
+Local mode is unchanged.
+
+- [ ] **Step 1: Write the failing tests.**
+  - **service tests:**
+    - a tenant refuses `palace` outside the inbox, the inbox itself, and a symlink inside the inbox pointing outside;
+    - it accepts (starts) a palace at `<home>/import-inbox/j1/palace` built with
+      `alice_core::import::fixture::synthetic_palace`;
+    - with an injected `free_space` returning `Some(1)`, it refuses with the disk message.
+  - **server_mode test** `an_admin_import_matches_a_local_import`: build one synthetic palace of 600 drawers. Import it
+    into a local service, and into a tenant service with the palace copied under the tenant's `import-inbox/j1/palace`
+    (wait for `Done` on both, polling `import_status()`). Assert equality of the reports' `tiers`, `projects`,
+    `duplicates`, `facts`, `skipped`, `drawers_seen` and `drawers_accounted`. Read
+    `crates/alice-daemon/tests/import_flow.rs` for how M3's tests wait for and compare reports, and follow it.
+- [ ] **Step 2: Run** them (RED; record it).
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run.**
+  - `cargo test -p alice-daemon --lib service::`;
+  - `cargo test -p alice-daemon --test server_mode`;
+  - `cargo test -p alice-daemon --test import_flow`;
+  - clippy, as in the Global Constraints;
+  - `cargo fmt --all --check`.
+- [ ] **Step 5: Commit:**
+  `feat(import): a server tenant imports only from its import-inbox, with a disk guard (addendum 2)`.
