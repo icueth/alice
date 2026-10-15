@@ -512,7 +512,13 @@ async fn refusals_are_one_clear_sentence_each_and_create_no_files() {
     let e = refused(ImportRequest::default());
     assert!(e.contains("--palace"), "{e}");
     let e = refused(ImportRequest {
-        palace: Some("/nonexistent/palace".into()),
+        // Absolute on every platform (a bare "/x" is not absolute on Windows).
+        palace: Some(
+            std::env::temp_dir()
+                .join("alice-no-such-palace-7f3a")
+                .to_string_lossy()
+                .into_owned(),
+        ),
         ..Default::default()
     });
     assert!(e.contains("does not exist"), "{e}");
@@ -719,7 +725,11 @@ async fn without_palace_the_default_under_mempalace_home_is_read() {
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
     let r = st.report.unwrap();
     assert_eq!(r.tiers.knowledge, 5);
-    assert!(r.palace.path.ends_with("/palace"), "{}", r.palace.path);
+    assert!(
+        std::path::Path::new(&r.palace.path).ends_with("palace"),
+        "{}",
+        r.palace.path
+    );
     assert_eq!(f.import_tmp_entries(), 0);
 }
 

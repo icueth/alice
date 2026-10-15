@@ -234,6 +234,8 @@ fn snapshot_inner(
 ) -> Result<Snapshot> {
     #[cfg(unix)]
     let created = !dest_dir.exists();
+    #[cfg(not(unix))]
+    let _ = created;
     std::fs::create_dir_all(dest_dir)?;
     #[cfg(unix)]
     if created {
