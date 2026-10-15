@@ -2,13 +2,17 @@ name: windows-real-model
 # The real embedding model on Windows, which the per-push CI never loads: its model tests are
 # #[ignore] because they need the model (~136 MB from Hugging Face). Start it by hand:
 #   gh workflow run windows-real-model.yml --ref <branch>
-# GitHub dispatches a workflow only once its file is on the default branch, so until then a push
-# to a feat/ branch that changes this file runs it too.
+# It also runs on a push to main that changes the embedding crate, the dependency lock or this
+# file, so a change that could break the real model on Windows is noticed after it merges.
 on:
   workflow_dispatch:
   push:
-    branches: ["feat/**"]
-    paths: [".github/workflows/windows-real-model.yml"]
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-real-model.yml"
+      - "crates/alice-embed/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
 permissions:
   contents: read
 jobs:
