@@ -1393,7 +1393,16 @@ async fn the_review_inbox_lists_resolves_once_and_stats_follow() {
     );
     assert_eq!(list[0].subjects[0].id, id, "the memory the item is about");
     let one: ReviewItem = s.get_json(&format!("/api/v1/reviews/{review}")).await;
-    assert_eq!(one, list[0]);
+    // The judge may activate the memory between the two reads (`pending` -> `active`): that
+    // is the subject's status moving, not the item differing.
+    let mut one = one;
+    let mut first = list[0].clone();
+    for item in [&mut one, &mut first] {
+        for subject in &mut item.subjects {
+            subject.status.clear();
+        }
+    }
+    assert_eq!(one, first);
     assert_eq!(s.get("/api/v1/reviews/NOSUCHITEM").await.status(), 404);
     let bad = s.get("/api/v1/reviews?limit=lots").await;
     assert_eq!(bad.status(), 400);
