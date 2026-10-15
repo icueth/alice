@@ -318,6 +318,285 @@ pub struct BenchArgs {
     pub dir: Option<std::path::PathBuf>,
 }
 
+#[derive(Subcommand)]
+pub enum ImportCmd {
+    /// Import a MemPalace palace. Reads the palace through a read-only snapshot; MemPalace does
+    /// not need to be installed or stopped. Run it again any time: it imports only what is new.
+    /// Add --dry-run to see what would happen.
+    Mempalace(ImportMempalaceArgs),
+    /// Progress of the running import, or the outcome of the last one.
+    Status,
+    /// Copy a palace through the audited snapshot path (no daemon).
+    #[command(hide = true)]
+    Snapshot(ImportSnapshotArgs),
+}
+
+#[derive(Args)]
+pub struct ImportMempalaceArgs {
+    /// The palace folder (default: $MEMPALACE_PALACE_PATH, $MEMPAL_PALACE_PATH, or the
+    /// palace_path in ~/.mempalace/config.json).
+    #[arg(long)]
+    pub palace: Option<std::path::PathBuf>,
+    /// Report what would be imported and change nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Only drawers filed at or after this date (YYYY-MM-DD or RFC 3339).
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Map a MemPalace wing to an Alice project, as wing=project (repeatable).
+    #[arg(long, value_name = "WING=PROJECT", value_parser = parse_map_wing)]
+    pub map_wing: Vec<(String, String)>,
+    /// The collection that holds the drawers (default mempalace_drawers).
+    #[arg(long)]
+    pub collection: Option<String>,
+    /// Let the configured remote embedding provider receive every chunk of your MemPalace
+    /// history (without it, an import refuses when the provider is not the local model).
+    #[arg(long)]
+    pub allow_remote_embedding: bool,
+}
+
+#[derive(Args)]
+pub struct ImportSnapshotArgs {
+    #[arg(long)]
+    pub palace: std::path::PathBuf,
+    #[arg(long)]
+    pub out: std::path::PathBuf,
+}
+
+/// `wing=project`, split at the first `=`.
+fn parse_map_wing(s: &str) -> std::result::Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((w, p)) if !w.trim().is_empty() && !p.trim().is_empty() => {
+            Ok((w.trim().to_string(), p.trim().to_string()))
+        }
+        _ => Err(format!(
+            "\"{s}\" is not wing=project (for example wing_project_alice=alice)"
+        )),
+    }
+}
+
+/// The palace folder, absolute: `--palace`, else `MEMPALACE_PALACE_PATH`, else
+/// `MEMPAL_PALACE_PATH`, else `palace_path` in `<home>/.mempalace/config.json` (read only).
+/// The daemon never does this: it only reads the folder it is given.
+fn resolve_palace(
+    arg: Option<std::path::PathBuf>,
+    env: &dyn Fn(&str) -> Option<String>,
+    home: Option<&Path>,
+    cwd: &Path,
+) -> Result<std::path::PathBuf> {
+    let not_found = || anyhow::anyhow!("no palace found; pass --palace <folder>");
+    let chosen = if let Some(a) = arg {
+        a
+    } else if let Some(v) = ["MEMPALACE_PALACE_PATH", "MEMPAL_PALACE_PATH"]
+        .iter()
+        .filter_map(|k| env(k))
+        .find(|v| !v.trim().is_empty())
+    {
+        std::path::PathBuf::from(v)
+    } else {
+        let home = home.ok_or_else(not_found)?;
+        let cfg = home.join(".mempalace").join("config.json");
+        let raw = match std::fs::read_to_string(&cfg) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found()),
+            Err(e) => bail!("cannot read {}: {e}; pass --palace <folder>", cfg.display()),
+        };
+        let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "{} is not valid JSON ({e}); pass --palace <folder>",
+                cfg.display()
+            )
+        })?;
+        let path = v
+            .get("palace_path")
+            .and_then(|p| p.as_str())
+            .filter(|p| !p.trim().is_empty())
+            .ok_or_else(not_found)?;
+        match path.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None if path == "~" => home.to_path_buf(),
+            None => std::path::PathBuf::from(path),
+        }
+    };
+    Ok(if chosen.is_absolute() {
+        chosen
+    } else {
+        cwd.join(chosen)
+    })
+}
+
+fn user_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+const IMPORT_POLL: Duration = Duration::from_millis(500);
+
+async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) -> Result<()> {
+    use alice_core::import::{ImportRequest, ImportState};
+    use std::io::IsTerminal;
+    // Everything the CLI can refuse by itself happens before a daemon is started.
+    let cwd = std::env::current_dir().context("cannot read the working folder")?;
+    let palace = resolve_palace(
+        a.palace,
+        &|k| std::env::var(k).ok(),
+        user_home().as_deref(),
+        &cwd,
+    )?;
+    let mut map_wing = std::collections::BTreeMap::new();
+    for (wing, project) in a.map_wing {
+        if let Some(old) = map_wing.insert(wing.clone(), project.clone()) {
+            bail!(
+                "--map-wing names the wing {wing} twice ({old} and {project}); give each wing one project"
+            );
+        }
+    }
+    // Registered before the daemon starts or the job begins, so a Ctrl-C at any point ends
+    // only this command.
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("cannot listen for Ctrl-C")?;
+    let req = ImportRequest {
+        palace: Some(palace.to_string_lossy().into_owned()),
+        dry_run: a.dry_run,
+        since: a.since,
+        map_wing,
+        collection: a.collection,
+        allow_remote_embedding: a.allow_remote_embedding,
+    };
+    let c = client(home).await?;
+    let first = c.start_import(&req).await?;
+    let tty = std::io::stderr().is_terminal();
+    let mut last_phase = String::new();
+    let mut drew = false;
+    let mut status = first;
+    // Ctrl-C ends the wait, never the job: the daemon keeps importing and the next run resumes.
+    const CONTINUES: &str = "the import continues in the background (`alice import status` shows it, and the next `alice import mempalace` resumes)";
+    let progress = |s: &alice_core::import::ImportStatus| {
+        if s.total == 0 {
+            format!("{}\u{2026}", s.phase)
+        } else {
+            format!("{}: {} of {}", s.phase, s.done, s.total)
+        }
+    };
+    loop {
+        if status.state != ImportState::Running {
+            break;
+        }
+        if tty {
+            eprint!("\r\x1b[2K{}", progress(&status));
+            drew = true;
+        } else if status.phase != last_phase {
+            eprintln!(
+                "{}: {} of {} drawers",
+                status.phase, status.done, status.total
+            );
+        }
+        last_phase.clone_from(&status.phase);
+        tokio::select! {
+            _ = sigint.recv() => {
+                if drew { eprintln!(); }
+                bail!("stopped waiting; {CONTINUES}");
+            }
+            () = tokio::time::sleep(IMPORT_POLL) => {}
+        }
+        status = match c.import_status().await {
+            Ok(s) => s,
+            Err(e) => {
+                if drew {
+                    eprintln!();
+                }
+                bail!("lost contact with the daemon ({e}); {CONTINUES}")
+            }
+        };
+    }
+    if drew {
+        eprint!("\r\x1b[2K");
+    }
+    match &status.report {
+        Some(r) => print(json, r, || r.render_text())?,
+        None => print(json, &status, String::new)?,
+    }
+    import_verdict(&status)
+}
+
+/// Exit 0 only for a finished import without errors; otherwise the one sentence for stderr.
+fn import_verdict(status: &alice_core::import::ImportStatus) -> Result<()> {
+    use alice_core::import::ImportState;
+    match status.state {
+        ImportState::Done => match status.report.as_ref().map(|r| &r.errors) {
+            Some(errors) if !errors.is_empty() => bail!(
+                "the import finished with {} error(s); the first: {}",
+                errors.len(),
+                errors[0]
+            ),
+            _ => Ok(()),
+        },
+        ImportState::Failed => bail!(
+            "the import failed: {}",
+            status.error.as_deref().unwrap_or("no reason was given")
+        ),
+        ImportState::Idle => {
+            bail!("no import is running and none has run since the daemon started")
+        }
+        ImportState::Running => bail!("the import is still running"),
+    }
+}
+
+async fn import_status(home: &AliceHome, json: bool) -> Result<()> {
+    use alice_core::import::ImportState;
+    let s = client(home).await?.import_status().await?;
+    match (&s.report, s.state) {
+        (Some(r), ImportState::Done) if !json => out(&r.render_text()),
+        _ => print(json, &s, || match s.state {
+            ImportState::Idle => "No import has run since the daemon started.\n".into(),
+            ImportState::Running => format!(
+                "Import running: {}, {} of {} drawers.\n",
+                s.phase, s.done, s.total
+            ),
+            ImportState::Failed => format!(
+                "The last import failed: {}\n",
+                s.error.as_deref().unwrap_or("no reason was given")
+            ),
+            ImportState::Done => "The last import finished.\n".into(),
+        }),
+    }
+}
+
+/// The audited copy of a palace (no daemon): prints the notes and the files written.
+fn import_snapshot(a: ImportSnapshotArgs, json: bool) -> Result<()> {
+    use alice_core::import::palace::{Backend, snapshot};
+    let cwd = std::env::current_dir().context("cannot read the working folder")?;
+    let abs = |p: std::path::PathBuf| if p.is_absolute() { p } else { cwd.join(p) };
+    let (palace, dest) = (abs(a.palace), abs(a.out));
+    let mp_home = user_home()
+        .map(|h| h.join(".mempalace"))
+        .filter(|h| h.is_dir());
+    let snap = snapshot(&palace, &dest, mp_home.as_deref())?;
+    let main = snap.dir.join(match snap.backend {
+        Backend::SqliteExact => "sqlite_exact.sqlite3",
+        Backend::Chroma => "chroma.sqlite3",
+    });
+    let mut files = vec![main];
+    files.extend(snap.kg.clone());
+    files.extend(snap.tunnels.clone());
+    let value = serde_json::json!({
+        "dir": snap.dir,
+        "notes": snap.notes,
+        "files": files,
+    });
+    print(json, &value, || {
+        let mut t = String::new();
+        for n in &snap.notes {
+            t.push_str(&format!("{n}\n"));
+        }
+        for f in &files {
+            t.push_str(&format!("wrote {}\n", f.display()));
+        }
+        t
+    })
+}
+
 fn rt() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -447,6 +726,8 @@ pub fn dispatch(command: Command, json: bool) -> Result<()> {
             Ok(())
         }),
         Command::Bench(args) => crate::bench::bench(home, args, json),
+        // No daemon: the snapshot is a plain read-only copy.
+        Command::Import(ImportCmd::Snapshot(a)) => import_snapshot(a, json),
         // Not through `client_command`: that would start a daemon, and `restore` must have none.
         Command::Restore { backup, yes } => rt()?.block_on(restore(&home, backup, yes, json)),
         // Neither starts a daemon: `doctor` reports on what is there, `token rotate` and
@@ -721,10 +1002,13 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
             out(&lines.iter().map(|l| format!("{l}\n")).collect::<String>())
         }
         Command::Config(c) => config(&home, c, json).await,
+        Command::Import(ImportCmd::Mempalace(a)) => import_mempalace(&home, a, json).await,
+        Command::Import(ImportCmd::Status) => import_status(&home, json).await,
         Command::Daemon(DaemonCmd::Run)
         | Command::Mcp
         | Command::Model(_)
         | Command::Bench(_)
+        | Command::Import(ImportCmd::Snapshot(_))
         | Command::Doctor
         | Command::Token(_)
         | Command::Service(_)
@@ -2226,6 +2510,103 @@ fn plan_text(plan: &svcinst::InstallPlan, write: &str, run: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn the_palace_comes_from_the_argument_then_two_variables_then_the_config() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/work");
+        let arg = Some(std::path::PathBuf::from("rel/palace"));
+        assert_eq!(
+            resolve_palace(
+                arg,
+                &lookup(&[("MEMPALACE_PALACE_PATH", "/env")]),
+                Some(home.path()),
+                cwd
+            )
+            .unwrap(),
+            Path::new("/work/rel/palace")
+        );
+        let both = [
+            ("MEMPALACE_PALACE_PATH", "/a"),
+            ("MEMPAL_PALACE_PATH", "/b"),
+        ];
+        assert_eq!(
+            resolve_palace(None, &lookup(&both), Some(home.path()), cwd).unwrap(),
+            Path::new("/a")
+        );
+        assert_eq!(
+            resolve_palace(
+                None,
+                &lookup(&[("MEMPAL_PALACE_PATH", "/b")]),
+                Some(home.path()),
+                cwd
+            )
+            .unwrap(),
+            Path::new("/b")
+        );
+        // An empty variable counts as unset.
+        let e = resolve_palace(
+            None,
+            &lookup(&[("MEMPALACE_PALACE_PATH", "")]),
+            Some(home.path()),
+            cwd,
+        );
+        assert!(e.unwrap_err().to_string().contains("--palace"));
+        std::fs::create_dir_all(home.path().join(".mempalace")).unwrap();
+        std::fs::write(
+            home.path().join(".mempalace/config.json"),
+            r#"{"palace_path": "~/pal"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_palace(None, &lookup(&[]), Some(home.path()), cwd).unwrap(),
+            home.path().join("pal")
+        );
+    }
+
+    #[test]
+    fn a_broken_config_says_so_and_a_missing_one_asks_for_the_flag() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/work");
+        let e = resolve_palace(None, &lookup(&[]), Some(home.path()), cwd)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("no palace found") && e.contains("--palace"),
+            "{e}"
+        );
+        std::fs::create_dir_all(home.path().join(".mempalace")).unwrap();
+        std::fs::write(home.path().join(".mempalace/config.json"), "{ nope").unwrap();
+        let e = resolve_palace(None, &lookup(&[]), Some(home.path()), cwd)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("config.json") && e.contains("--palace"), "{e}");
+        std::fs::write(
+            home.path().join(".mempalace/config.json"),
+            r#"{"other": 1}"#,
+        )
+        .unwrap();
+        let e = resolve_palace(None, &lookup(&[]), Some(home.path()), cwd)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no palace found"), "{e}");
+    }
+
+    #[test]
+    fn map_wing_splits_on_the_first_equals_sign() {
+        assert_eq!(parse_map_wing("w=a=b").unwrap(), ("w".into(), "a=b".into()));
+        assert!(parse_map_wing("nope").is_err());
+        assert!(parse_map_wing("=x").is_err());
+        assert!(parse_map_wing("x=").is_err());
+    }
 
     #[test]
     fn log_tail_reads_only_the_end_and_never_a_partial_line() {

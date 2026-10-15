@@ -2,12 +2,15 @@
 
 pub mod backup;
 pub mod client;
+pub mod compat;
+pub mod compat_schema;
 pub mod config;
 pub mod daemon;
 pub mod discovery;
 pub mod doctor;
 pub mod embedding;
 pub mod http;
+pub mod importer;
 pub mod judge_http;
 pub mod judge_worker;
 pub mod maintenance;

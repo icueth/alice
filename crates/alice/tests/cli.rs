@@ -1085,6 +1085,86 @@ async fn stdio_mcp_shim_lists_tools_and_round_trips() {
     assert_eq!(e.log().matches("daemon started").count(), 1);
 }
 
+/// The shim offers the MemPalace tools while the daemon says `compat.mempalace` is on (it asks
+/// the daemon, cached for a moment, and fails closed): a listing never starts a daemon, so with
+/// the daemon stopped the compat tools are gone and the daemon stays stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stdio_shim_lists_compat_tools_when_the_daemon_has_them_on() {
+    use rmcp::ServiceExt;
+    use rmcp::model::CallToolRequestParams;
+    use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+    let e = Env::new();
+    e.ok(&["remember", "seed for the compat shim"]);
+    e.ok(&["config", "set", "compat.mempalace", "true"]);
+    let (home, work) = (e.home.clone(), e.work.clone());
+    let client = ()
+        .serve(
+            TokioChildProcess::new(tokio::process::Command::new(BIN).configure(move |c| {
+                c.arg("mcp")
+                    .current_dir(&work)
+                    .env("ALICE_HOME", &home)
+                    .env("ALICE_EMBEDDER", "fake")
+                    .env("ALICE_LOG", "warn");
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let count = |tools: &[rmcp::model::Tool]| {
+        tools
+            .iter()
+            .filter(|t| t.name.starts_with("mempalace_"))
+            .count()
+    };
+    // The shim's answer about the switches is cached for a second, so wait for it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let tools = client.list_all_tools().await.unwrap();
+        if count(&tools) == 15 {
+            assert_eq!(tools.len(), 22);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no compat tools: {}",
+            tools.len()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let r = client
+        .call_tool(CallToolRequestParams::new("mempalace_list_wings"))
+        .await
+        .unwrap();
+    let text = r
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    assert_ne!(r.is_error, Some(true), "{text}");
+    assert!(text.contains("wings"), "{text}");
+
+    // Off again in the daemon: the listing follows.
+    e.ok(&["config", "set", "compat.mempalace", "false"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while count(&client.list_all_tools().await.unwrap()) != 0 {
+        assert!(Instant::now() < deadline, "compat tools stayed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // On, the daemon stopped: nothing answers, so nothing is offered, and listing starts nothing.
+    e.ok(&["config", "set", "compat.mempalace", "true"]);
+    e.ok(&["daemon", "stop"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !e.lock_free() {
+        assert!(Instant::now() < deadline, "the daemon did not stop");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(count(&client.list_all_tools().await.unwrap()), 0);
+    assert!(e.lock_free(), "listing started a daemon");
+    client.cancel().await.unwrap();
+}
+
 /// `alice bench` works on throw-away data: the ALICE_HOME in use is never touched (nor accepted
 /// as `--dir`), the temporary home is removed, its daemon is gone, and `--dir` data is reused.
 #[test]
@@ -1965,6 +2045,762 @@ fn restore_says_where_the_lost_memories_went_and_undo_brings_them_back() {
         .to_string();
     env.ok(&["restore", &kept, "--yes"]);
     assert_eq!(env.recall_count("lima"), 1, "undone");
+}
+
+// ---------------------------------------------------------------------------------------------
+// `alice import` (M3 Task 12). Palaces are synthetic (alice_core::import::fixture); the real
+// ~/.mempalace is never read: HOME points at an empty temp folder.
+
+mod import {
+    use super::*;
+    use alice_core::import::ImportReport;
+    use alice_core::import::fixture::{DrawerSpec, build_sqlite_exact, build_sqlite_exact_wal};
+    use alice_core::import::palace::DrawerMeta;
+
+    pub struct Out {
+        pub status: std::process::ExitStatus,
+        pub stdout: String,
+        pub stderr: String,
+    }
+
+    fn meta(wing: &str, room: &str) -> DrawerMeta {
+        DrawerMeta {
+            wing: wing.into(),
+            room: room.into(),
+            added_by: Some("claude-code".into()),
+            filed_at: Some("2026-04-10T10:00:00".into()),
+            ..Default::default()
+        }
+    }
+
+    fn specs() -> Vec<DrawerSpec> {
+        let k = |id: &str, text: &str, wing: &str, room: &str| DrawerSpec {
+            id: id.into(),
+            text: text.into(),
+            meta: meta(wing, room),
+        };
+        vec![
+            k(
+                "k_dec",
+                "decision about the v4 frame",
+                "wing_project_alice",
+                "decisions",
+            ),
+            k(
+                "k_two",
+                "the importer reads a snapshot, never the live palace",
+                "wing_project_alice",
+                "design",
+            ),
+            k(
+                "k_three",
+                "pg-ai keeps its offline stalls in the snapshot proxy",
+                "pg-ai",
+                "notes",
+            ),
+        ]
+    }
+
+    impl Env {
+        /// `<tmp>/palace` with a few knowledge drawers.
+        pub fn fixture_palace(&self) -> PathBuf {
+            let palace = self._dir.path().join("palace");
+            std::fs::create_dir_all(&palace).unwrap();
+            build_sqlite_exact(&palace, &specs());
+            palace
+        }
+
+        /// `alice …` with an empty HOME and no palace environment variables.
+        pub fn alice(&self, args: &[&str]) -> Out {
+            let fake_home = self._dir.path().join("fake-home");
+            std::fs::create_dir_all(&fake_home).unwrap();
+            let o = self
+                .cmd(args)
+                .env("HOME", &fake_home)
+                .env_remove("MEMPALACE_PALACE_PATH")
+                .env_remove("MEMPAL_PALACE_PATH")
+                .env("ALICE_JUDGE_PROVIDER", "heuristic")
+                .output()
+                .unwrap();
+            Out {
+                status: o.status,
+                stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+            }
+        }
+    }
+
+    fn p(path: &std::path::Path) -> &str {
+        path.to_str().unwrap()
+    }
+
+    // ---- Task 16: concurrency and crash safety
+
+    /// Hash of every file under `dir` (names and bytes), to prove a palace was never written.
+    fn tree_hash(dir: &std::path::Path) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        names.sort();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for n in names {
+            n.file_name().hash(&mut h);
+            std::fs::read(&n).unwrap().hash(&mut h);
+        }
+        h.finish()
+    }
+
+    impl Env {
+        /// `alice …` as `alice()` runs it, but as a child left running.
+        fn alice_child(&self, args: &[&str]) -> std::process::Child {
+            let fake_home = self._dir.path().join("fake-home");
+            std::fs::create_dir_all(&fake_home).unwrap();
+            self.cmd(args)
+                .env("HOME", &fake_home)
+                .env_remove("MEMPALACE_PALACE_PATH")
+                .env_remove("MEMPAL_PALACE_PATH")
+                .env("ALICE_JUDGE_PROVIDER", "heuristic")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn kill_minus_nine_during_an_import_loses_nothing_and_the_rerun_finishes_exactly() {
+        let e = Env::new();
+        let palace_dir = e._dir.path().join("palace");
+        let n = std::env::var("ALICE_TEST_BULK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000usize);
+        let fx = alice_core::import::fixture::synthetic_palace(&palace_dir, n);
+        let before = tree_hash(&palace_dir);
+
+        // 1. the import runs in the background; wait until 3,000 drawers are done
+        let importer =
+            e.alice_child(&["--json", "import", "mempalace", "--palace", p(&palace_dir)]);
+        let started = Instant::now();
+        loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(600),
+                "import never got going"
+            );
+            let st = e.alice(&["--json", "import", "status"]);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&st.stdout)
+                && v["state"] == "running"
+                && v["done"].as_u64().unwrap_or(0) >= 3_000
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+
+        // 2. twenty acknowledged remembers, then SIGKILL
+        let mut acked = Vec::new();
+        for i in 0..20 {
+            let out = e.alice(&["--json", "remember", &format!("acked before kill {i}")]);
+            assert!(out.status.success(), "{}", out.stderr);
+            let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+            assert_eq!(v["status"], "new", "{v}");
+            acked.push(v["id"].as_str().unwrap().to_string());
+        }
+        // What the import has committed so far (read while the daemon runs; the kill is next).
+        let kept_before_kill: i64 = {
+            let db = rusqlite::Connection::open_with_flags(
+                alice_daemon::paths::AliceHome::new(e.home.clone()).db(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            // Drawer rows only (a graph triple has one too). The synthetic palace stores one row
+            // per drawer, which the exact counts at the end of the test check.
+            db.query_row(
+                "SELECT count(*) FROM legacy_ids WHERE target_type IN ('memory', 'chunk')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            kept_before_kill > 0,
+            "the import had committed nothing at the kill"
+        );
+        let pid = e.daemon_pid().unwrap();
+        // SAFETY: killing the daemon this test started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        eventually(|| !alive(pid), "the killed daemon to go away");
+        let out = importer.wait_with_output().unwrap();
+        assert!(
+            !out.status.success(),
+            "the client of a killed daemon cannot succeed"
+        );
+
+        // 3. any call restarts the daemon, which sweeps import-tmp; the rerun finishes
+        let r = e.alice(&["--json", "recall", "acked before kill"]);
+        assert!(r.status.success(), "{}", r.stderr);
+        let tmp = e.home.join("import-tmp");
+        let left = std::fs::read_dir(&tmp).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0, "import-tmp was swept at daemon start");
+        let run = |label: &str| -> ImportReport {
+            let o = e.alice(&["--json", "import", "mempalace", "--palace", p(&palace_dir)]);
+            assert!(o.status.success(), "{label}: {}\n{}", o.stderr, o.stdout);
+            let r: ImportReport = serde_json::from_str(&o.stdout).unwrap();
+            assert!(r.errors.is_empty(), "{label}: {:?}", r.errors);
+            r
+        };
+        let second = run("rerun");
+        assert_eq!(second.drawers_seen as usize, n);
+        // The resume kept the progress: what was committed before the kill is skipped, not redone.
+        assert!(
+            second.already_imported as i64 >= kept_before_kill,
+            "resumed run skipped {} drawers but {kept_before_kill} were stored before the kill",
+            second.already_imported
+        );
+        assert!(
+            (second.already_imported as usize) < n,
+            "the kill came after the import had finished"
+        );
+        // 4. the third run finds everything stored
+        let third = run("third");
+        assert_eq!(third.tiers.knowledge, 0);
+        assert_eq!(third.tiers.raw_session_chunks, 0);
+        assert_eq!(third.tiers.raw_file_chunks, 0);
+        assert_eq!(third.already_imported, third.drawers_seen);
+        assert_eq!(third.already_imported as usize, n);
+
+        // stop the daemon, then look at the database on its own
+        e.ok(&["daemon", "stop"]);
+        let db = rusqlite::Connection::open_with_flags(
+            alice_daemon::paths::AliceHome::new(e.home.clone()).db(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let check: String = db
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        let count = |sql: &str| -> usize {
+            db.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap() as usize
+        };
+        for id in &acked {
+            let k = db
+                .query_row("SELECT count(*) FROM memories WHERE id = ?1", [id], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
+            assert_eq!(k, 1, "acknowledged {id} is lost");
+        }
+        assert_eq!(
+            count("SELECT count(*) FROM memories WHERE legacy_id IS NOT NULL"),
+            fx.knowledge
+        );
+        let chunks = count("SELECT count(*) FROM chunks");
+        let collapsed =
+            count("SELECT count(*) FROM legacy_ids WHERE target_type = 'chunk'") - chunks;
+        assert_eq!(chunks + collapsed, fx.chunk_drawers);
+        assert_eq!(collapsed, fx.repeats);
+        assert_eq!(tree_hash(&palace_dir), before, "the palace was not touched");
+    }
+
+    #[test]
+    fn restore_during_an_import_ends_it_cleanly_and_the_rerun_finishes() {
+        let e = Env::new();
+        e.ok(&["remember", "alpha kept in the backup"]);
+        let name = e.json(&["backup", "now"])["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let palace_dir = e._dir.path().join("palace");
+        let fx = alice_core::import::fixture::synthetic_palace(&palace_dir, 20_000);
+        let importer =
+            e.alice_child(&["--json", "import", "mempalace", "--palace", p(&palace_dir)]);
+        let started = Instant::now();
+        loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(300),
+                "import never got going"
+            );
+            let st = e.alice(&["--json", "import", "status"]);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&st.stdout)
+                && v["state"] == "running"
+                && v["done"].as_u64().unwrap_or(0) >= 2_000
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let r = e.run(&["restore", &name, "--yes"]);
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        let out = importer.wait_with_output().unwrap();
+        assert!(
+            !out.status.success(),
+            "the import client outlived the restore"
+        );
+        // The next call starts a daemon: it sweeps import-tmp, and the restored database holds
+        // the backup's memory and none of the import.
+        let recall = e.alice(&["recall", "alpha kept in the backup"]);
+        assert!(recall.stdout.contains("alpha kept"), "{}", recall.stdout);
+        let left = std::fs::read_dir(e.home.join("import-tmp"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(left, 0, "import-tmp was swept");
+        let o = e.alice(&["--json", "import", "mempalace", "--palace", p(&palace_dir)]);
+        assert!(o.status.success(), "{}\n{}", o.stderr, o.stdout);
+        let rep: ImportReport = serde_json::from_str(&o.stdout).unwrap();
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+        assert_eq!(
+            rep.already_imported, 0,
+            "the restore took the half import away"
+        );
+        assert_eq!(rep.tiers.knowledge as usize, fx.knowledge);
+        e.ok(&["daemon", "stop"]);
+        let db = rusqlite::Connection::open_with_flags(
+            alice_daemon::paths::AliceHome::new(e.home.clone()).db(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let check: String = db
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        let chunk_rows: i64 = db
+            .query_row(
+                "SELECT count(*) FROM legacy_ids WHERE target_type = 'chunk'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_rows as usize, fx.chunk_drawers);
+    }
+
+    #[test]
+    fn a_target_that_cannot_be_written_fails_cleanly_and_resumes() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        // The daemon is up first (it sweeps import-tmp at start), then the folder is made unwritable.
+        e.ok(&["daemon", "start"]);
+        let tmp = e.home.join("import-tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Whatever happens next, the folder is writable again when the test ends (a failed
+        // assertion would otherwise leave a directory the temp dir cannot delete).
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _restore = Restore(tmp.clone());
+        let writable = std::fs::File::create(tmp.join("probe")).is_ok();
+        if writable {
+            // Running as root: permissions do not bind; nothing to prove.
+            eprintln!("skipped: permissions do not bind this user");
+            let _ = std::fs::remove_file(tmp.join("probe"));
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let o = e.alice(&["import", "mempalace", "--palace", p(&palace)]);
+        assert_eq!(o.status.code(), Some(1), "{}\n{}", o.stderr, o.stdout);
+        assert!(
+            o.stderr.contains("import failed") && o.stderr.contains("import-tmp"),
+            "the sentence names the folder: {}",
+            o.stderr
+        );
+        let st = e.alice(&["--json", "import", "status"]);
+        let v: serde_json::Value = serde_json::from_str(&st.stdout).unwrap();
+        assert_eq!(v["state"], "failed", "{v}");
+        // Permissions back: the rerun succeeds.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let o = e.alice(&["--json", "import", "mempalace", "--palace", p(&palace)]);
+        assert!(o.status.success(), "{}\n{}", o.stderr, o.stdout);
+        let r: ImportReport = serde_json::from_str(&o.stdout).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.tiers.knowledge, 3);
+    }
+
+    #[test]
+    fn import_dry_run_prints_the_report_and_changes_nothing() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let out = e.alice(&["import", "mempalace", "--dry-run", "--palace", p(&palace)]);
+        assert!(out.status.success(), "{}", out.stderr);
+        for needle in [
+            "MemPalace import",
+            "[dry run]",
+            "Knowledge memories",
+            "Wing \u{2192} project map",
+        ] {
+            assert!(out.stdout.contains(needle), "{needle}\n{}", out.stdout);
+        }
+        assert_eq!(
+            e.alice(&["recall", "decision about the v4 frame"])
+                .stdout
+                .matches("v4 frame")
+                .count(),
+            0,
+            "nothing was imported"
+        );
+    }
+
+    #[test]
+    fn import_then_recall_finds_the_old_memory_and_json_is_valid() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let out = e.alice(&["--json", "import", "mempalace", "--palace", p(&palace)]);
+        assert!(out.status.success(), "{}\n{}", out.stderr, out.stdout);
+        let report: ImportReport = serde_json::from_str(&out.stdout)
+            .unwrap_or_else(|er| panic!("not an ImportReport ({er}): {}", out.stdout));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.tiers.knowledge, 3);
+        assert!(
+            e.alice(&["recall", "decision about the v4 frame"])
+                .stdout
+                .contains("v4 frame"),
+            "the old memory is found"
+        );
+        let st = e.alice(&["--json", "import", "status"]);
+        assert!(st.status.success(), "{}", st.stderr);
+        let v: serde_json::Value = serde_json::from_str(&st.stdout).unwrap();
+        assert_eq!(v["state"], "done", "{v}");
+        // Again: nothing is new.
+        let again = e.alice(&["--json", "import", "mempalace", "--palace", p(&palace)]);
+        assert!(again.status.success(), "{}\n{}", again.stderr, again.stdout);
+        let r2: ImportReport = serde_json::from_str(&again.stdout).unwrap();
+        assert_eq!(r2.tiers.knowledge, 0);
+        assert_eq!(r2.tiers.raw_session_chunks, 0);
+        assert_eq!(r2.tiers.raw_file_chunks, 0);
+        // The text form of `status` prints the finished report.
+        let text = e.alice(&["import", "status"]);
+        assert!(text.stdout.contains("MemPalace import"), "{}", text.stdout);
+    }
+
+    #[test]
+    fn bad_inputs_exit_nonzero_with_one_sentence_on_stderr() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let o = e.alice(&["import", "mempalace", "--palace", "/nonexistent/palace"]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(o.stderr.contains("does not exist"), "{}", o.stderr);
+
+        let o = e.alice(&[
+            "import",
+            "mempalace",
+            "--palace",
+            p(&palace),
+            "--since",
+            "nope",
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(o.stderr.contains("--since"), "{}", o.stderr);
+
+        let o = e.alice(&[
+            "import",
+            "mempalace",
+            "--palace",
+            p(&palace),
+            "--map-wing",
+            "nope",
+        ]);
+        assert_eq!(o.status.code(), Some(2), "{}", o.stderr);
+
+        let fresh = Env::new();
+        let o = fresh.alice(&["import", "mempalace"]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(o.stderr.contains("--palace"), "{}", o.stderr);
+        assert!(
+            fresh.daemon_json().is_none() && fresh.lock_free(),
+            "no daemon was started for a palace that cannot be found"
+        );
+    }
+
+    #[test]
+    fn map_wing_overrides_reach_the_daemon() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let out = e.alice(&[
+            "--json",
+            "import",
+            "mempalace",
+            "--dry-run",
+            "--palace",
+            p(&palace),
+            "--map-wing",
+            "wing_project_alice=alice",
+        ]);
+        assert!(out.status.success(), "{}", out.stderr);
+        let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(v["wing_map"]["wing_project_alice"]["to"], "alice", "{v}");
+    }
+
+    #[test]
+    fn a_remote_embedding_provider_needs_the_explicit_flag() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let set = e.alice(&["config", "set", "embedding.provider", "ollama"]);
+        assert!(set.status.success(), "{}", set.stderr);
+        let o = e.alice(&["import", "mempalace", "--dry-run", "--palace", p(&palace)]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(
+            o.stderr.contains("--allow-remote-embedding"),
+            "{}",
+            o.stderr
+        );
+        let o = e.alice(&[
+            "import",
+            "mempalace",
+            "--dry-run",
+            "--allow-remote-embedding",
+            "--palace",
+            p(&palace),
+        ]);
+        assert!(o.status.success(), "{}", o.stderr);
+    }
+
+    #[test]
+    fn the_palace_defaults_come_from_the_environment_then_the_config() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        // MEMPALACE_PALACE_PATH
+        let o = e
+            .cmd(&["import", "mempalace", "--dry-run"])
+            .env("HOME", e._dir.path().join("fake-home"))
+            .env("MEMPALACE_PALACE_PATH", &palace)
+            .env_remove("MEMPAL_PALACE_PATH")
+            .env("ALICE_JUDGE_PROVIDER", "heuristic")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let used = |o: &std::process::Output| {
+            let text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.contains(palace.canonicalize().unwrap().to_str().unwrap())
+                || text.contains(palace.to_str().unwrap())
+        };
+        assert!(used(&o), "the report names the palace from the variable");
+        // ~/.mempalace/config.json
+        let h = e._dir.path().join("cfg-home");
+        std::fs::create_dir_all(h.join(".mempalace")).unwrap();
+        std::fs::write(
+            h.join(".mempalace/config.json"),
+            serde_json::json!({"palace_path": palace}).to_string(),
+        )
+        .unwrap();
+        let o = e
+            .cmd(&["import", "mempalace", "--dry-run"])
+            .env("HOME", &h)
+            .env_remove("MEMPALACE_PALACE_PATH")
+            .env_remove("MEMPAL_PALACE_PATH")
+            .env("ALICE_JUDGE_PROVIDER", "heuristic")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(used(&o), "the report names the palace from config.json");
+    }
+
+    #[test]
+    fn the_same_wing_mapped_twice_is_refused() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let o = e.alice(&[
+            "import",
+            "mempalace",
+            "--dry-run",
+            "--palace",
+            p(&palace),
+            "--map-wing",
+            "w=a",
+            "--map-wing",
+            "w=b",
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(
+            o.stderr.contains("--map-wing") && o.stderr.contains("twice"),
+            "{}",
+            o.stderr
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_destinations_in_or_around_the_palace_and_the_mempalace_home() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let fake_home = e._dir.path().join("fake-home");
+        let mp = fake_home.join(".mempalace");
+        std::fs::create_dir_all(&mp).unwrap();
+        let link = e._dir.path().join("link-to-palace");
+        std::os::unix::fs::symlink(&palace, &link).unwrap();
+        let entries = |d: &std::path::Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|x| x.unwrap().file_name())
+                .collect();
+            v.sort();
+            v
+        };
+        let (pal_before, mp_before) = (entries(&palace), entries(&mp));
+        let cases: Vec<PathBuf> = vec![
+            palace.clone(),
+            palace.join("snap"),
+            palace.join("a/b/c"),
+            link.join("via-link"),
+            link.clone(),
+            mp.clone(),
+            mp.join("snap"),
+            mp.join("deep/er"),
+            palace.join("x/../snap"),
+        ];
+        for out in cases {
+            let o = e.alice(&[
+                "import",
+                "snapshot",
+                "--palace",
+                p(&palace),
+                "--out",
+                p(&out),
+            ]);
+            assert_eq!(o.status.code(), Some(1), "{}: {}", out.display(), o.stdout);
+            assert!(
+                o.stderr.contains("palace folder") || o.stderr.contains("MemPalace home"),
+                "{}: {}",
+                out.display(),
+                o.stderr
+            );
+        }
+        assert_eq!(
+            entries(&palace),
+            pal_before,
+            "nothing was created in the palace"
+        );
+        assert_eq!(
+            entries(&mp),
+            mp_before,
+            "nothing was created in ~/.mempalace"
+        );
+        assert!(!palace.join("snap").exists() && !mp.join("snap").exists());
+        // A palace under ~/.mempalace protects the whole home, too.
+        let inner = mp.join("palace");
+        std::fs::create_dir_all(&inner).unwrap();
+        build_sqlite_exact(&inner, &specs());
+        let o = e.alice(&[
+            "import",
+            "snapshot",
+            "--palace",
+            p(&inner),
+            "--out",
+            p(&mp.join("other")),
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stderr);
+        assert!(!mp.join("other").exists());
+    }
+
+    #[test]
+    fn snapshot_never_overwrites_a_file_in_the_destination() {
+        let e = Env::new();
+        let palace = e.fixture_palace();
+        let out_dir = e._dir.path().join("snap");
+        let first = e.alice(&[
+            "import",
+            "snapshot",
+            "--palace",
+            p(&palace),
+            "--out",
+            p(&out_dir),
+        ]);
+        assert!(first.status.success(), "{}", first.stderr);
+        let copy = out_dir.join("sqlite_exact.sqlite3");
+        let before = std::fs::read(&copy).unwrap();
+        let again = e.alice(&[
+            "import",
+            "snapshot",
+            "--palace",
+            p(&palace),
+            "--out",
+            p(&out_dir),
+        ]);
+        assert_eq!(again.status.code(), Some(1), "{}", again.stdout);
+        assert_eq!(
+            std::fs::read(&copy).unwrap(),
+            before,
+            "the first copy is intact"
+        );
+        // A foreign file already at the target name is left alone too.
+        let other = e._dir.path().join("snap2");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("sqlite_exact.sqlite3"), b"mine").unwrap();
+        let o = e.alice(&[
+            "import",
+            "snapshot",
+            "--palace",
+            p(&palace),
+            "--out",
+            p(&other),
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{}", o.stdout);
+        assert_eq!(
+            std::fs::read(other.join("sqlite_exact.sqlite3")).unwrap(),
+            b"mine"
+        );
+    }
+
+    #[test]
+    fn the_hidden_snapshot_command_copies_through_the_audited_path_and_leaves_the_source_alone() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let e = Env::new();
+        let src = e._dir.path().join("wal-palace");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut wal = build_sqlite_exact_wal(&src, &specs());
+        wal.release_writer();
+        let main = src.join("sqlite_exact.sqlite3");
+        let hash = |f: &std::path::Path| {
+            let mut h = DefaultHasher::new();
+            std::fs::read(f).unwrap().hash(&mut h);
+            h.finish()
+        };
+        let before = hash(&main);
+        let out_dir = e._dir.path().join("snap");
+        let o = e.alice(&[
+            "import",
+            "snapshot",
+            "--palace",
+            p(&src),
+            "--out",
+            p(&out_dir),
+        ]);
+        assert!(o.status.success(), "{}", o.stderr);
+        assert!(o.stdout.contains("sqlite_exact.sqlite3"), "{}", o.stdout);
+        let copy = rusqlite::Connection::open_with_flags(
+            out_dir.join("sqlite_exact.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let n: i64 = copy
+            .query_row(
+                "SELECT count(*) FROM documents WHERE collection_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(hash(&main), before, "the source's main file is untouched");
+        assert!(e.daemon_json().is_none(), "snapshot needs no daemon");
+        // Hidden from --help and the README.
+        let help = e.alice(&["import", "--help"]);
+        assert!(
+            !help
+                .stdout
+                .lines()
+                .any(|l| l.trim_start().starts_with("snapshot")),
+            "{}",
+            help.stdout
+        );
+        let readme =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
+                .unwrap_or_default();
+        assert!(!readme.contains("import snapshot"));
+    }
 }
 
 // ------------------------------------------------------------------ Task 17

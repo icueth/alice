@@ -1,9 +1,11 @@
 //! SQLite storage. Only the daemon opens the database.
 
+pub mod compat;
 pub mod embeddings;
 pub mod events;
 pub mod fts;
 pub mod history;
+pub mod import;
 pub mod judge;
 pub mod kg;
 pub mod maintenance;

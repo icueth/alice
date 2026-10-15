@@ -630,6 +630,155 @@ async fn every_route_is_served() {
         .await
         .unwrap();
     assert_eq!(ingested["inserted"], 1);
+    // The import routes: idle at first, a refusal names the fix, a dry run answers 202.
+    let idle: alice_core::import::ImportStatus = s.get_json("/api/v1/import/status").await;
+    assert_eq!(idle.state, alice_core::import::ImportState::Idle);
+    let refused = s
+        .post("/api/v1/import/mempalace", &serde_json::json!({}))
+        .await;
+    assert_eq!(refused.status(), 400);
+    let e: serde_json::Value = refused.json().await.unwrap();
+    assert!(e["error"].as_str().unwrap().contains("--palace"), "{e}");
+    let palace = tempfile::tempdir().unwrap();
+    alice_core::import::fixture::build_sqlite_exact(
+        palace.path(),
+        &[alice_core::import::fixture::DrawerSpec {
+            id: "d1".into(),
+            text: "a note".into(),
+            meta: alice_core::import::palace::DrawerMeta {
+                wing: "w".into(),
+                room: "knowledge".into(),
+                ..Default::default()
+            },
+        }],
+    );
+    let started = s
+        .post(
+            "/api/v1/import/mempalace",
+            &serde_json::json!({"palace": palace.path(), "dry_run": true}),
+        )
+        .await;
+    assert_eq!(started.status(), 202);
+    let first: alice_core::import::ImportStatus = started.json().await.unwrap();
+    assert!(first.job_id.is_some());
+    let mut last = first;
+    for _ in 0..200 {
+        last = s.get_json("/api/v1/import/status").await;
+        if last.state != alice_core::import::ImportState::Running {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        last.state,
+        alice_core::import::ImportState::Done,
+        "{:?}",
+        last.error
+    );
+    assert_eq!(last.report.unwrap().tiers.knowledge, 1);
+}
+
+/// Both import routes sit behind the same guard as every other route.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_routes_need_the_token_host_and_origin_guards() {
+    let s = Srv::start().await;
+    for (method, path) in [
+        (reqwest::Method::POST, "/api/v1/import/mempalace"),
+        (reqwest::Method::GET, "/api/v1/import/status"),
+    ] {
+        let call = |token: Option<&str>, host: Option<&str>, origin: Option<&str>| {
+            let mut r = s
+                .http
+                .request(method.clone(), s.url(path))
+                .json(&serde_json::json!({}));
+            if let Some(t) = token {
+                r = r.bearer_auth(t);
+            }
+            if let Some(h) = host {
+                r = r.header("Host", h);
+            }
+            if let Some(o) = origin {
+                r = r.header("Origin", o);
+            }
+            r.send()
+        };
+        let no_token = call(None, None, None).await.unwrap();
+        assert_eq!(no_token.status(), 401, "{path}");
+        let bad_host = call(Some(&s.token), Some("evil.example:80"), None)
+            .await
+            .unwrap();
+        assert_eq!(bad_host.status(), 403, "{path}");
+        let bad_origin = call(Some(&s.token), None, Some("https://evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(bad_origin.status(), 403, "{path}");
+    }
+    assert_eq!(
+        s.svc.import_status().state,
+        alice_core::import::ImportState::Idle,
+        "a refused call starts nothing"
+    );
+}
+
+/// The compatibility route answers 409 with the way to turn it on while `compat.mempalace` is
+/// off, serves once it is on, and sits behind the same guard as every other route.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_compat_route_refuses_while_compat_is_off_and_is_guarded() {
+    let s = Srv::start().await;
+    let call = serde_json::json!({"tool": "mempalace_list_wings", "arguments": {}});
+    let off = s.post("/api/v1/compat/call", &call).await;
+    assert_eq!(off.status(), 409);
+    let e: serde_json::Value = off.json().await.unwrap();
+    assert!(
+        e["error"].as_str().unwrap().contains("compat.mempalace"),
+        "{e}"
+    );
+
+    let mut changes = serde_json::Map::new();
+    changes.insert("compat.mempalace".into(), serde_json::json!(true));
+    s.svc.patch_settings(changes).unwrap();
+    let on = s.post("/api/v1/compat/call", &call).await;
+    assert_eq!(on.status(), 200);
+    let v: serde_json::Value = on.json().await.unwrap();
+    assert!(v["value"]["wings"].is_object(), "{v}");
+    // An unsupported tool and a bad argument are normal answers, not HTTP errors.
+    let r: serde_json::Value = s
+        .post_json(
+            "/api/v1/compat/call",
+            &serde_json::json!({"tool": "mempalace_search", "arguments": {}}),
+        )
+        .await;
+    assert_eq!(r["value"]["error"], "missing required argument: query");
+
+    let path = "/api/v1/compat/call";
+    let send = |token: Option<&str>, host: Option<&str>, origin: Option<&str>| {
+        let mut r = s.http.post(s.url(path)).json(&call);
+        if let Some(t) = token {
+            r = r.bearer_auth(t);
+        }
+        if let Some(h) = host {
+            r = r.header("Host", h);
+        }
+        if let Some(o) = origin {
+            r = r.header("Origin", o);
+        }
+        r.send()
+    };
+    assert_eq!(send(None, None, None).await.unwrap().status(), 401);
+    assert_eq!(
+        send(Some(&s.token), Some("evil.example:80"), None)
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        send(Some(&s.token), None, Some("https://evil.example"))
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
 }
 
 /// Bodies the API cannot parse get the same JSON error shape as every other error.
@@ -1864,13 +2013,16 @@ async fn the_flags_endpoint_answers_without_asking_the_secrets_store() {
     })
     .await;
     let flags: serde_json::Value = s.get_json("/api/v1/settings/flags").await;
-    assert_eq!(flags, serde_json::json!({ "mcp.admin_tools": false }));
+    assert_eq!(
+        flags,
+        serde_json::json!({ "mcp.admin_tools": false, "compat.mempalace": false })
+    );
     // An edit of config.toml (a PATCH would answer with the whole view, secrets included).
     std::fs::write(s.home.config_file(), "[mcp]\nadmin_tools = true\n").unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let flags: serde_json::Value = s.get_json("/api/v1/settings/flags").await;
-        if flags == serde_json::json!({ "mcp.admin_tools": true }) {
+        if flags == serde_json::json!({ "mcp.admin_tools": true, "compat.mempalace": false }) {
             break;
         }
         assert!(

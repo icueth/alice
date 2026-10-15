@@ -41,7 +41,7 @@ Alice is built for that workload: many agents, many projects, one memory that st
 - **One binary.** Daemon, CLI and MCP server (and, in SP2, hooks) in a single Rust binary with the embedding runtime built in. No Python environments, no Docker. Other embedding providers (Ollama, OpenAI-compatible, Voyage) are a setting away.
 - **Git sync as Markdown** *(planned, M4)*. Push and pull memories to any git remote as one Markdown file per memory. Readable on GitHub, opens in Obsidian, syncs across machines with record-level merging. The database file never goes into git.
 - **Graph and management UI** *(planned, SP3)*. Explore the memory graph, edit memories, resolve reviews, change every setting and run git push/pull from the browser or a desktop app.
-- **Bring your MemPalace** *(planned, M3)*. Import an existing MemPalace palace (drawers, diaries, knowledge graph) and keep using `mempalace_*` tool names through an optional compatibility layer.
+- **Bring your MemPalace.** Import an existing MemPalace palace (drawers, diaries, knowledge graph) and keep using `mempalace_*` tool names through an optional compatibility layer.
 
 ## How it works
 
@@ -115,7 +115,7 @@ alice status                   # daemon, counts, embedding and judge backlog, op
 alice doctor                   # what is wrong, if anything, and what to do next
 ```
 
-The project is detected from the working directory (git remote, or the directory name); memories written outside any project go to `global`. Planned: `alice setup` to connect every installed agent (SP2), `alice import mempalace` (M3) and `alice ui` (SP3).
+The project is detected from the working directory (git remote, or the directory name); memories written outside any project go to `global`. `alice import mempalace` brings an existing MemPalace in ([details](#importing-from-mempalace)). Planned: `alice setup` to connect every installed agent (SP2) and `alice ui` (SP3).
 
 ## Connecting agents
 
@@ -207,9 +207,12 @@ alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # stdio MCP server for agents
 alice model fetch
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
+alice import mempalace [--palace dir] [--dry-run] [--since date] [--map-wing wing=project]...
+                       [--collection name] [--allow-remote-embedding]
+alice import status
 ```
 
-Every command takes `--json`. Planned: `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3).
+Every command takes `--json`. Planned: `sync` (M4), `hook` (SP2), `ui` (SP3).
 
 ## Configuration
 
@@ -332,14 +335,9 @@ alice sync pull
 
 Each memory becomes `<project>/<kind>/<year>/<id>-<slug>.md` with YAML frontmatter; the knowledge graph is stored as sorted JSONL. Alice merges per record, so two machines can edit different memories without conflicts; when both edit the same memory, the newer version wins and the other goes to the review inbox. Use a **private** repository: memories can contain sensitive project details, even after redaction.
 
-## Coming from MemPalace *(importer planned, M3)*
+## Coming from MemPalace
 
-Alice is inspired by [MemPalace](https://github.com/MemPalace/mempalace) and will import its palaces:
-
-```bash
-alice import mempalace --dry-run   # preview the wing → project mapping
-alice import mempalace
-```
+Alice is inspired by [MemPalace](https://github.com/MemPalace/mempalace) and imports its palaces. The main differences:
 
 | | MemPalace | Alice |
 |---|---|---|
@@ -351,7 +349,56 @@ alice import mempalace
 | MCP tools | ~45 | 7 core + optional admin and compat sets |
 | Sharing | Shared-brain hub | Git as Markdown with record-level merge |
 
-Drawers mined from transcripts and files become raw sources, diaries and agent-written drawers become memories, wings map to projects (name variants merged), rooms become topics, and the knowledge graph carries over. Turn on `compat.mempalace` to keep calling `mempalace_*` tools.
+## Importing from MemPalace
+
+```bash
+alice import mempalace --dry-run   # report what would be imported; changes nothing
+alice import mempalace             # import (the daemon is started if it is not running)
+alice import status                # progress of a running import, or the last report
+```
+
+- **Safe to run again.** Every drawer keeps its MemPalace id, so a re-run imports only what is new (`--since 2026-04-16` narrows it to recent drawers). A run that was stopped, or that you ended with Ctrl-C (the daemon keeps going), is resumed by running the command again.
+- **MemPalace need not be stopped.** Alice copies the palace through SQLite's backup API into a private temporary folder and reads that snapshot; your palace files are opened read-only and never changed. The copy needs about the palace's size in free disk space and is removed afterwards.
+- **Finding the palace.** `--palace <folder>`, else `$MEMPALACE_PALACE_PATH`, else `$MEMPAL_PALACE_PATH`, else `palace_path` in `~/.mempalace/config.json`. The `sqlite_exact` and `chroma` backends are read; `--collection <name>` picks another collection than `mempalace_drawers`.
+- **Where things go:**
+  - Drawers from session transcripts (`*.jsonl`, wing `sessions`) and from mined files become the raw tier: one source per transcript or file, drawers as ordered chunks. Exact repeats within one source are collapsed.
+  - Diary entries and drawers written by agents (no source file, or from a curated room such as `decisions` or `runbook`) become memories, with the kind taken from the room (`decisions` is a decision, `bug-classes` a bugfix, and so on). They are stored active and are not run through the judge.
+  - Wings become projects (`wing_pg_ai` and `pg_ai` are one project). Agent wings such as `wing_claude_code` become `global`, with the agent as author, unless the text names a project. Fix a mapping you disagree with by adding `--map-wing wing_project_alice=alice` (repeatable) and importing again.
+  - Rooms become topics; closets are dropped (Alice builds its own indexes).
+  - The knowledge graph (`knowledge_graph.sqlite3` in the palace folder, else `~/.mempalace/`) becomes facts with their validity periods; similar predicate names become review items instead of being merged. Entities that have no fact are not imported. Tunnels that name two importable drawers become `relates_to` links.
+- **Private by construction.** Secrets are redacted in everything the import writes, whatever `privacy.redact` says. Nothing leaves the machine and no judge runs; once imported, the memories are ordinary ones. Times MemPalace stored without a zone are read in this machine's UTC offset (the report prints it).
+- **The report** counts every drawer: `drawers_seen` must equal the drawers imported, collapsed, skipped or already present, and a mismatch is an error and a non-zero exit. It also lists the wing to project map, items queued for review and anything skipped, with the reason.
+- **Embeddings are computed in the background** with Alice's own model (MemPalace's vectors are ignored). Search works the moment the import ends, by keywords; meaning-based matching of the raw tier fills in as chunks are embedded.
+- **A remote embedding provider.** If `embedding.provider` is not the local model, the import refuses to start, because every chunk of your history would be sent to that provider. `--allow-remote-embedding` says you accept that.
+
+One 122,000-drawer palace imported in about two minutes (peak memory under 200 MB) with embedding left out, and in about four minutes with the real model, by which time the knowledge tier was embedded; the 116,000 raw chunks then embed at roughly 34 per second. Importing very large palaces while many agents are busy can slow `recall` until the import ends: see [docs/benchmarks/m3.md](docs/benchmarks/m3.md).
+
+## MemPalace compatibility
+
+Prompts and hooks written for MemPalace call tools named `mempalace_*`. Alice answers fifteen of them from its own data, in the shape MemPalace returns: `status`, `search`, `add_drawer`, `get_drawer`, `update_drawer`, `delete_drawer`, `diary_write`, `diary_read`, `kg_query`, `kg_add`, `kg_invalidate`, `kg_supersede`, `kg_timeline`, `list_wings` and `list_rooms`.
+
+The layer is the setting `compat.mempalace`. A real (not `--dry-run`) import turns it on if you never set it yourself; otherwise:
+
+```bash
+alice config set compat.mempalace true     # or false to hide the tools again
+```
+
+The change applies to running clients within a second, with no restart. When the daemon cannot be reached the tools are hidden.
+
+Register `alice mcp` under the server name your prompts expect. Claude Code names a tool `mcp__<server>__<tool>`, so prompts that call `mcp__plugin_mempalace_mempalace__mempalace_search` need the server entry to be called `plugin_mempalace_mempalace`:
+
+```bash
+claude mcp add --scope user plugin_mempalace_mempalace -- alice mcp
+```
+
+For other clients give the same name to the entry in their configuration (`mcp_servers.plugin_mempalace_mempalace` in Codex, and so on). Disable the real MemPalace plugin first, or two servers answer to one name. One entry is enough: it serves the seven Alice tools and, while the layer is on, the fifteen `mempalace_*` tools.
+
+Differences to know about:
+
+- `similarity` in search results is relative: 1.0 for the best hit, the others scaled to it. Alice's scores are not cosine distances, so a prompt that thresholds on MemPalace distances will behave differently.
+- Writes go through the normal Alice paths: redacted, judged, recorded in `alice history` and undoable. A `wing` that is not an Alice project files the memory into the current project (the answer says so); an agent never creates a project this way.
+- Drawer ids from your palace keep working (`mempalace_get_drawer`, `update_drawer`, `delete_drawer`), including ids of drawers that were collapsed into an earlier identical one.
+- The other MemPalace tools (`mine`, `traverse`, tunnels, `check_duplicate` and so on) are not listed, and calling one returns a message naming the Alice equivalent instead of an error.
 
 ## Performance
 
@@ -375,7 +422,7 @@ M1 missed the memory budget (about 1.4 GB projected with the model). M2 meets it
 |---|---|---|
 | **SP1 · M1** | Store, hybrid search, daemon, MCP, CLI, HTTP API | Done (alpha) |
 | **SP1 · M2** | Judge (heuristic + Jev), review inbox, undo, redaction, backups and restore, maintenance, live settings, doctor, service install, HTTP embedding providers, Windows build, the 800 MB memory budget | Done (alpha) |
-| **SP1 · M3** | MemPalace importer and compatibility layer | Next |
+| **SP1 · M3** | MemPalace importer and compatibility layer | Built, in final review (alpha) |
 | **SP1 · M4** | Git sync | Planned |
 | **SP2** | Automatic capture and distillation, `alice setup`, hooks/plugins for every supported agent | Planned |
 | **SP3** | Web UI (graph, memory manager, reviews, settings, sync, health), then a desktop app | Planned |
