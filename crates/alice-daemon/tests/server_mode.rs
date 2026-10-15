@@ -1295,3 +1295,112 @@ async fn only_a_team_store_marks_cloud_ok_on_its_hits() {
     assert!(r.results.iter().all(|h| h.cloud_ok.is_none()));
     assert!(!r.results.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_team_hit_of_a_project_the_person_denies_never_reaches_the_grader_and_follows_the_graded()
+{
+    let (s, grader) = precise_server("staging").await;
+    share(
+        &s,
+        "ann",
+        "teamproj",
+        "Deploy kappa",
+        "deploy notes: the KAPPA cluster deploy is open to the team store",
+    )
+    .await;
+    // The team store allows `teamproj`; the person does not.
+    s.tenant("bob")
+        .svc
+        .patch_settings(patch(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["teamproj"]),
+        ))
+        .unwrap();
+    enable_judge(&s).await;
+    let r = s
+        .tenant("bob")
+        .svc
+        .recall(precise("deploy notes"))
+        .await
+        .unwrap();
+    let states = grader.states.lock().join("\n");
+    assert!(!states.is_empty(), "the personal hits are graded");
+    assert!(
+        !states.contains("KAPPA"),
+        "never sent to the grader: {states}"
+    );
+    assert!(r.reranked, "{:?}", r.notes);
+    let titles = ids(&r);
+    assert_eq!(titles.len(), 4, "{titles:?}");
+    assert_eq!(
+        titles[3], "Deploy kappa",
+        "after the graded hits: {titles:?}"
+    );
+    assert!(r.results.iter().all(|h| h.cloud_ok.is_none()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_team_hit_both_policies_allow_is_graded_and_no_precise_hit_carries_a_mark() {
+    let (s, grader) = precise_server("ZEBRA").await;
+    share(
+        &s,
+        "ann",
+        "teamproj",
+        "Deploy zebra",
+        "deploy notes: the ZEBRA cluster deploy uses blue green",
+    )
+    .await;
+    // The person denies another project; `teamproj` stays allowed on both sides.
+    s.tenant("bob")
+        .svc
+        .patch_settings(patch(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["elsewhere"]),
+        ))
+        .unwrap();
+    enable_judge(&s).await;
+    let r = s
+        .tenant("bob")
+        .svc
+        .recall(precise("deploy notes"))
+        .await
+        .unwrap();
+    let states = grader.states.lock().join("\n");
+    assert!(states.contains("ZEBRA"), "graded: {states}");
+    assert_eq!(r.results[0].title, "Deploy zebra", "{:?}", ids(&r));
+    assert!(r.results.iter().all(|h| h.cloud_ok.is_none()), "{r:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_whose_own_project_the_person_denies_sends_nothing_to_the_grader() {
+    let (s, grader) = precise_server("ZEBRA").await;
+    share(
+        &s,
+        "ann",
+        "teamproj",
+        "Deploy zebra",
+        "deploy notes: the ZEBRA cluster deploy uses blue green",
+    )
+    .await;
+    s.tenant("bob")
+        .svc
+        .patch_settings(patch(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["p"]),
+        ))
+        .unwrap();
+    enable_judge(&s).await;
+    let r = s
+        .tenant("bob")
+        .svc
+        .recall(precise("deploy notes"))
+        .await
+        .unwrap();
+    assert!(
+        grader.states.lock().is_empty(),
+        "nothing reaches the grader: {:?}",
+        grader.states.lock()
+    );
+    assert!(r.results.iter().all(|h| h.cloud_ok.is_none()));
+    assert!(!r.results.is_empty());
+}

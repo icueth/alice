@@ -1992,7 +1992,10 @@ impl Service {
         let mut team_rest = Vec::new();
         if let Some(task) = team_task {
             match task.await {
-                Ok(Ok(hits)) => {
+                Ok(Ok(mut hits)) => {
+                    if precise {
+                        withhold_from_judge(&self.settings, &mut hits);
+                    }
                     (team_ok, team_rest) = merge_team(&mut out, hits, precise);
                     if !precise {
                         out.hits.truncate(limit);
@@ -4086,6 +4089,23 @@ async fn team_recall(team: &crate::team::TeamLink, body: RecallRequest) -> Resul
     match asked {
         Err(AliceError::Invalid(_)) => Ok(Vec::new()),
         other => other,
+    }
+}
+
+/// Takes the team store's `cloud_ok` mark off every team hit whose project the person's own
+/// cloud policy does not allow (the person's `privacy.cloud_denied_projects`, or a degraded
+/// configuration): a team hit reaches the person's judge only when the team store and the
+/// person both allow its project. The policy is asked once per distinct project slug, with no
+/// project root, so it reads only the settings snapshot.
+fn withhold_from_judge(settings: &SettingsHandle, hits: &mut [Hit]) {
+    let mut asked: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for h in hits.iter_mut().filter(|h| h.cloud_ok == Some(true)) {
+        let allowed = *asked
+            .entry(h.project.clone())
+            .or_insert_with(|| settings.cloud_allowed(&h.project, None));
+        if !allowed {
+            h.cloud_ok = Some(false);
+        }
     }
 }
 
