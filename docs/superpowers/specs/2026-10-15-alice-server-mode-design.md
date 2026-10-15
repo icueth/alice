@@ -1,7 +1,8 @@
 # Alice Server Mode — Design Spec
 
 - **Date:** 2026-10-15
-- **Status:** design, for the controller's review (no code yet)
+- **Status:** approved by the controller with binding changes (spec-review.md, 2026-10-15), applied here; base merged with
+  `feat/m2-judge-settings` 9dfac19 (M2 Task 22)
 - **Owner:** icueth (vision); technical choices delegated to this lane
 - **Lane:** server mode, worktree `project-alice-srv`, branch `feat/server-mode` (from `feat/m2-judge-settings` b28b99f)
 - **Builds on:** `2026-10-13-alice-core-design.md` (the core spec), the M2 handoff `docs/superpowers/handoff/2026-10-14-m2-handoff.md`
@@ -24,7 +25,8 @@
    token. It runs under the systemd template unit `alice@<name>.service` and listens on 127.0.0.1 only.
 2. **Caddy routes by path.** `https://212.80.214.149/u/<name>/…` has the prefix stripped and goes to `127.0.0.1:<port>`, with the
    upstream `Host` rewritten so the daemon's Host check (`http.rs` `Guard`) stays as it is. Streaming responses are not buffered.
-   The bearer token is the only credential. A fail2ban jail bans repeated 401s found in Caddy's access log.
+   The bearer token is the only credential. (The fail2ban jail first ruled here is dropped: the server's NAT masquerades, so
+   Caddy sees only the gateway's address; see §2.4.)
 3. **Client remote mode.** `alice` (the CLI, `alice mcp` and the agent hooks that call the CLI) can point at a URL and a token
    instead of a local daemon. The project is detected on the client. A working tree's `.alice.toml` applies on the server exactly
    as it would locally, failing closed. Writes spool while the server is unreachable. The connection uses HTTPS, or plain HTTP to
@@ -45,7 +47,8 @@
 4. A secret in a `remember` is redacted on the client; it never reaches the network.
 5. With the server unreachable, `remember` answers "Queued" within the 3 s ping, and the queued write is stored on the server
    after a later call, once (replay is at least once, and deduplication makes the result single).
-6. A burst of 401s through Caddy gets the source IP banned on 80/443. SSH is unaffected.
+6. A tenant daemon cannot reach the LAN (192.168.100.0/24 and every private range), nor Caddy's admin API, whatever URL its
+   settings name (R18); the public internet stays reachable for Jev and the model download.
 7. `/api/v1/events/stream` delivers events through Caddy without buffering.
 8. The token never appears in a log, an error message, `Debug` output, `alice remote status`, or Caddy's access log.
 
@@ -65,7 +68,7 @@ tenant. The last one is possible by hand (§10, Q2) but is not built here.
  │ hooks ── alice context ────┤          │   HTTPS + Bearer│  /u/ann/api/v1/* ─strip, Host:127.0.0.1:47801──┐ │
  │ alice recall/remember ─────┤          │ ───────────────▶│  /u/bob/api/v1/* ─strip, Host:127.0.0.1:47802─┐│ │
  │                            ▼          │                 │  /u/*/api/v1/admin/*, /u/*/mcp, else → 404    ││ │
- │ DaemonClient (remote target)          │                 │  access log (JSON) ──▶ fail2ban "alice-caddy" ││ │
+ │ DaemonClient (remote target)          │                 │  access log (JSON, Authorization redacted)    ││ │
  │  • detects the project locally (git)  │                 │                                               ▼▼ │
  │  • reads <root>/.alice.toml           │                 │ alice@ann.service  user alice-ann              │
  │  • redacts before sending             │                 │   alice daemon run --tenant                     │
@@ -118,7 +121,9 @@ Restart=always
 RestartSec=5
 TimeoutStopSec=30
 UMask=0077
-MemoryMax=1536M
+MemoryMax=3G
+IPAddressAllow=localhost
+IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -136,9 +141,25 @@ WantedBy=multi-user.target
 ```
 
 `Restart=always` is used because a clean exit, such as `POST /api/v1/admin/shutdown` from a local admin call, must not leave a
-tenant down. `MemoryMax` keeps one tenant's runaway ingest from starving the others. The daemon's measured budget is 800 MB
-(docs/benchmarks/m2.md). The unit passes no secret: systemd does not inherit the admin's environment, so a
-`TYPESAFE_API_KEY` in an admin shell never reaches a tenant.
+tenant down. `MemoryMax` keeps one tenant's runaway ingest from starving the others: 3 GB each, so five fit the server's
+15 GB, against a measured budget of 800 MB (docs/benchmarks/m2.md). The unit passes no secret: systemd does not inherit the
+admin's environment, so a `TYPESAFE_API_KEY` in an admin shell never reaches a tenant.
+
+**No LAN access (R18).** A tenant controls its own settings through `PATCH /api/v1/settings`, including the URLs the daemon
+calls. Without a limit a tenant could make its daemon reach the owner's LAN, where the Proxmox host and the gateway sit in
+192.168.100.0/24. Three layers stop that:
+
+1. `IPAddressAllow=localhost` with `IPAddressDeny=` every private, link-local, CGNAT and ULA range, in the unit. systemd applies
+   it to every socket of the unit's processes. Localhost stays allowed: Caddy reaches the daemon there, and DNS is
+   `127.0.0.53`. The public internet stays reachable for Jev and the model download.
+2. Caddy's admin API moves off `localhost:2019` to a Unix socket (`admin unix//run/caddy/admin.sock`, §2.3). Localhost is
+   reachable from a tenant, so a tenant URL pointed at port 2019 could otherwise stop or reload Caddy.
+3. Tenant-mode validation of the URL settings (§2.2, item 6) refuses loopback, private and link-local hosts before the daemon
+   ever calls them.
+
+What stays reachable on localhost is another tenant's daemon (which refuses requests without its token), Caddy's own 80/443
+(the public proxy) and the DNS stub. The deployment task lists the server's listening sockets (`ss -ltnp`) and reports
+anything else.
 
 ### 2.2 Tenant mode in the daemon (`alice daemon run --tenant`)
 
@@ -152,8 +173,10 @@ cannot switch it off through `PATCH /api/v1/settings`. Its effects:
    updates the project's mirror (item 3), and continues with
    `ProjectChoice::Detected(ProjectRef { key, slug, name, remote, root: Some(<mirror dir>) })`. From there the existing code
    runs unchanged: `upsert_project` stores the mirror directory as `root_path` (it exists, so it replaces any older root), and
-   `project_root_in`, `Redactors::for_root`, `SettingsHandle::cloud_allowed`, `DaemonJevPolicy::lookup` and `query_for_remote`
-   all read `<mirror dir>/.alice.toml` the way they read a working tree's file today.
+   `project_root_in`, `Redactors::for_root`, `SettingsHandle::cloud_allowed`, `DaemonJevPolicy::lookup` and `query_cloud` (the
+   rule shared by `query_for_remote` and, since M2 Task 22, by a precise recall from a never-stored tree) all read
+   `<mirror dir>/.alice.toml` the way they read a working tree's file today. A project the store never saw is "never stored"
+   only on its first request: `query_cloud` then judges it by the mirror (its `root`), exactly as Task 22 judges a local tree.
 3. **The mirror.** Each project has `<ALICE_HOME>/client-projects/<h>/.alice.toml`, where `<h>` is the first 32 hex characters
    of `SHA-256(key)`. The directory name never comes from a client string. Directories are mode 0700 and files 0600. On every
    request that carries `client_project`:
@@ -174,6 +197,25 @@ cannot switch it off through `PATCH /api/v1/settings`. Its effects:
    database restored from a laptop. Locally, a missing root still means "no project file", as today.
 5. **Ping capabilities.** `/api/v1/ping` answers `capabilities: ["client-project", "tenant"]` (§4.2). Every daemon built from
    this branch, tenant or not, lists `"client-project"`.
+6. **Settings that name a URL or a path.** A tenant changes its own settings through `PATCH /api/v1/settings`. Tenant mode
+   adds a validation layer (`Settings::validate_tenant(home)`), run on every patch and on every load of `config.toml`. A
+   violation is refused like any other invalid value: the patch is rejected, or the file is not applied and the last valid
+   settings stay. These are all the settings that name a URL or a path, and what tenant mode does with each:
+
+   | Setting | What it names | Tenant mode |
+   |---|---|---|
+   | `storage.data_dir` | the data directory | already read-only (`READ_ONLY_KEYS`); `ALICE_HOME` from the unit decides |
+   | `backup.dir` | where backups are written and listed | must resolve inside `ALICE_HOME` (after `..` and symlinks); refused otherwise |
+   | `embedding.endpoint` | an HTTP provider's base URL | `https://` only; a host that is `localhost` or an IP literal in a loopback, private, link-local, CGNAT or ULA range is refused; R18 is the second layer |
+   | `embedding.provider = "ollama"` | a local or LAN Ollama server | refused: the server runs none, and a LAN one is what R18 forbids |
+   | `judge.jev.endpoint` | the Jev API | same rule as `embedding.endpoint` |
+   | `sync.remote` | the git remote of M4 sync | refused while set: sync is not built yet, and a git remote can name a LAN host or a local path; M4 decides its tenant behaviour |
+   | `server.port` | the daemon's port | refused: `ALICE_SERVER_PORT` from the unit wins over the file anyway, and the admin owns it |
+   | `secrets.backend` | where keys are kept | must stay `file`: there is no keychain on the server |
+
+   No other setting names a URL or a path. The `distill.*` settings name a provider and a model, both unused until SP2, and
+   SP2 must add its endpoint to this table. The rest are numbers, switches, durations and patterns. systemd's
+   `ProtectSystem=strict` with `ReadWritePaths=/srv/alice/%i` stays as the second layer for paths, and R18 for URLs.
 
 Nothing else changes. The token, the Host and Origin guard, the ping proof, the rotation, the spool, the writer and the judge
 worker stay as they are.
@@ -187,6 +229,7 @@ script copies the existing file to `/etc/caddy/Caddyfile.pre-alice` (once). The 
 ```caddyfile
 {
 	default_sni 212.80.214.149
+	admin unix//run/caddy/admin.sock
 }
 
 https://212.80.214.149 {
@@ -240,50 +283,41 @@ handle_path /u/<name>/* {
   task checks the log for the token (§8.4).
 - Every change runs `caddy validate --config /etc/caddy/Caddyfile`, then `systemctl reload caddy`. If validation fails, the
   change is undone and the script exits non-zero.
+- `admin unix//run/caddy/admin.sock` takes Caddy's admin API off `localhost:2019` (R18). The packaged unit's `caddy reload`
+  reads the admin address from the Caddyfile, so reloads keep working; the deployment task checks one reload and that
+  nothing listens on 2019 afterwards.
 
-### 2.4 fail2ban
+### 2.4 No per-IP banning (the NAT masquerades)
 
-`/etc/fail2ban/filter.d/alice-caddy.conf`:
+The controller measured that every connection reaches the VM from the NAT gateway `192.168.100.99`: SSH, HTTPS and Let's
+Encrypt's tls-alpn-01 checks alike. A ban would ban the gateway, which would lock everyone out and stop the IP certificate's
+renewal. So `alice-server` installs **no** fail2ban jail, and the controller has disabled fail2ban server-wide.
+
+The protection is the 256-bit token. A well-behaved client also never produces a 401: it sends its token only after the ping
+proof verified (§3.2), and the public ping never answers 401.
+
+An admin whose NAT preserves client addresses may add a jail by hand. `docs/server.md` gives this filter as a **disabled**
+example (it is not installed):
 
 ```ini
+# /etc/fail2ban/filter.d/alice-caddy.conf (example; needs real client addresses in the log)
 [Definition]
 failregex = ^.*"client_ip":"<ADDR>".*"status":401\b
 datepattern = "ts":{EPOCH}
 ```
 
-`/etc/fail2ban/jail.d/alice-caddy.local`:
-
-```ini
-[alice-caddy]
-enabled  = true
-filter   = alice-caddy
-logpath  = /var/log/caddy/alice-access.log
-port     = http,https
-maxretry = 10
-findtime = 10m
-bantime  = 1h
-ignoreip = 127.0.0.1/8 ::1
-```
-
-The ban action is the system default, the one the existing `sshd` jail uses. Only 80 and 443 are banned, so SSH stays open.
-A well-behaved client produces no 401s at all: it sends its token only after the ping proof verified (§3.2), and the public
-ping never answers 401. A wrong or stale token therefore stops before any request carries it. The filter is checked with
-`fail2ban-regex` against a real log line in the deployment task.
-
-**NAT check.** The jail works only if Caddy sees real client addresses. If the host's port forward masquerades (SNAT), every
-client appears as the NAT gateway. The deployment task checks a log line's `client_ip`. If it shows the gateway, the jail is
-left disabled and the controller is told; banning the gateway would lock everyone out.
+The deployment task still records one access-log line's `client_ip`, for the record.
 
 ### 2.5 The admin script `deploy/server/alice-server`
 
 The script is bash, `set -euo pipefail`, and must pass `shellcheck`. It runs as root (via sudo) and takes a lock
 (`flock /run/alice-server.lock`). It is idempotent: running a command twice leaves the same state and says so. It is installed
-as `/usr/local/sbin/alice-server`. The unit, the Caddy template and the fail2ban files live inside it as heredocs, so the script
+as `/usr/local/sbin/alice-server`. The unit and the Caddy template live inside it as heredocs, so the script
 is the single source. The public host comes from `/etc/alice/server.env` (`ALICE_PUBLIC_HOST=212.80.214.149`), so the IP is
 not hard-coded. Each command below is followed by what it does.
 
 **`add <name>`**
-1. Makes sure the base exists: directories, the unit, the Caddyfile with its import, and the fail2ban files.
+1. Makes sure the base exists: directories, the unit, and the Caddyfile with its import and admin socket.
 2. If the tenant exists, prints its URL (not the token) and stops: "exists; `alice-server rotate <name>` gives a new token".
 3. Picks a port. Creates the user and the home (0700). Writes the tenant file.
 4. Runs `systemctl enable --now alice@<name>` and waits up to 180 s for `GET http://127.0.0.1:<port>/api/v1/ping` (with
@@ -305,7 +339,9 @@ through the local API (the old token is refused at once); otherwise it rewrites 
 token once, with the `alice remote set` line.
 
 **`list`**
-One row per tenant: name, port, unit state, the version the ping reports, URL and home size. No token.
+One row per tenant: name, port, unit state, the version the ping reports, URL and home size (its backups included). Then a
+last line with the free space on the disk that holds `/srv/alice`, and the size of the `remove` archives in
+`/srv/alice/backups`. No token.
 
 **`upgrade <binary>`**
 1. Checks that `<binary> --version` runs.
@@ -440,7 +476,7 @@ mirror. Redaction is idempotent. The two layers cover each other:
   `.alice.toml` read by the client once is a single weak read; the server still holds the last good rules.
 
 Later judge calls about a project (the judge worker, the precise recall's Jev call, a remote embedder's query) use
-`DaemonJevPolicy` and `query_for_remote`. Both resolve the stored root, which is the mirror, so they follow the rules the client
+`DaemonJevPolicy` and `query_cloud`. Both resolve the stored root, which is the mirror, so they follow the rules the client
 last sent. **Known window:** when a person tightens `.alice.toml`, the server learns of it on that project's next request.
 Memories already queued for judging can still be judged under the older rules until then. New writes cannot: their request
 updates the mirror before the write is applied.
@@ -573,8 +609,9 @@ Settings: none added. The environment variables `ALICE_REMOTE_URL` and `ALICE_RE
 7. The writer applies the write, and the judge worker later judges the memory. `cloud_allowed(slug)` reads the stored root, the
    mirror, so a `cloud_denied` project never reaches Jev.
 
-**Precise recall (Jev on).** The client redacts the query (apply). The daemon's `query_for_remote` and the Jev grading call use
-the mirror's rules. A denied project gets the fast answer with the existing note.
+**Precise recall (Jev on).** The client redacts the query (apply). The daemon's `query_cloud` (for the remote embedder and, for a
+project not yet stored, for the grading call) and `DaemonJevPolicy` (for a stored one) use the mirror's rules. A denied project
+gets the fast answer with the existing note.
 
 **Offline write.** The ping fails within 3 s. The prepared request goes to the client spool, and the answer is "Queued: the
 memory server … is unreachable; the memory is sent when it is back". The next `alice` call, or `alice mcp`'s 30 s replay, sends
@@ -582,7 +619,11 @@ it under the replay lock.
 
 **Wrong tenant.** A client configured with `/u/bob` but holding Ann's token pings Bob's daemon. Bob's proof does not verify
 against Ann's token, so the client stops with "did not prove it holds this token". No request carries the token, so there is
-no 401 and no ban.
+no 401.
+
+**A tenant aims a setting at the LAN.** `PATCH /api/v1/settings` with `embedding.endpoint = "http://192.168.100.99/"` is
+refused by tenant-mode validation (§2.2, item 6). A public name that resolves to a LAN address passes validation, but the
+daemon's connection is dropped by the unit's `IPAddressDeny` (R18), and the embedder reports the endpoint as unreachable.
 
 ---
 
@@ -599,12 +640,13 @@ no 401 and no ban.
 | `.alice.toml` loosened or deleted | Applied on the server after three spaced looks (the existing gate). Until then the stronger rules stay |
 | Mirror deleted or root missing on the server | Tenant mode fails closed (§2.2.4) until the next request recreates the mirror |
 | Request with `cwd` but no `client_project` in tenant mode | `cwd` is ignored and the memory goes to `global`. Only a hand-made request can do this; the `alice` client always sends the identity |
-| A client hammering with a bad token | Never sent by `alice` (proof first). Anything else: 401, then a fail2ban ban on 80/443 after 10 in 10 minutes |
+| A client hammering with a bad token | Never sent by `alice` (proof first). Anything else: a 401 per request. No ban (the NAT hides addresses, §2.4); the 256-bit token is the protection |
+| A tenant setting names a LAN, loopback or private URL, or a path outside its home | Refused by tenant-mode validation (§2.2, item 6). A DNS name that resolves to a LAN address is dropped by `IPAddressDeny` (R18) |
 | Several client processes replaying at once | Advisory lock; the losers skip. Idempotency keys and content deduplication stop doubles |
 | Caddy config invalid after a change | `caddy validate` fails, the change is undone, and the script exits non-zero. The running Caddy is never reloaded with a bad file |
 | Upgrade breaks a tenant | `alice.prev` is restored, all tenants restart, and the script exits non-zero naming the tenant |
 | Disk full on the server | The existing read-only and spool behaviour of the daemon applies (writes answer 202 "queued on the server") |
-| NAT masquerades source IPs | The jail stays disabled and the controller is told (§2.4) |
+| Tenant backups or `remove` archives fill the disk | They share the server's 28 GB disk. `alice-server list` shows each home's size and the free space; off-machine copies are the admin's job (`docs/server.md`) |
 
 ---
 
@@ -622,8 +664,11 @@ no 401 and no ban.
 - **Exposed surface per tenant:** `/api/v1/*` minus `/api/v1/admin/*`. The ping is public and returns the version, the instance
   and a proof. A proof is an HMAC-SHA256 under a 256-bit random key, so it does not help guess the token.
 - **Path safety:** mirror directory names come from a hash, never from a client string, and the 64 KiB caps bound what a client
-  can make the server write.
-- **Brute force:** 2^256 tokens; the fail2ban jail is defense in depth.
+  can make the server write. Tenant settings that name a path must resolve inside `ALICE_HOME` (§2.2, item 6).
+- **Egress (R18):** a tenant daemon reaches the public internet and localhost only. Caddy's admin API is on a Unix socket, so
+  nothing on localhost can reconfigure the server.
+- **Brute force:** 2^256 tokens. There is no per-IP banning, because the NAT hides client addresses (§2.4).
+- **Backups:** tenant backups and `remove` archives sit on the same disk as the data. A copy off the machine is the admin's job.
 
 ---
 
@@ -657,8 +702,8 @@ the tests cover the following.
 - In tenant mode `cwd` is ignored, and a missing root fails closed.
 
 **Privacy:**
-- `cloud_denied` sent by the client makes `DaemonJevPolicy::cloud_allowed` false, both for the judge worker's later call and for
-  `query_for_remote`.
+- `cloud_denied` sent by the client makes `DaemonJevPolicy::cloud_allowed` false for the judge worker's later call, and makes
+  `query_cloud` deny both a stored project and one seen for the first time (the Task 22 path, with the mirror as its root).
 - A loosened mirror waits for the gate; custom patterns from the mirror redact on the server.
 - A secret in `remember` never reaches the server: a recording proxy checks the bodies with `grep -c` semantics.
 - `block_secrets` refuses on the client and nothing is sent. Queries are redacted (apply).
@@ -669,6 +714,13 @@ the tests cover the following.
 - Two concurrent replayers produce no duplicates.
 - A `retry_later` refusal is kept; a plain refusal is withheld.
 - Local-mode entries are prepared at replay time.
+
+**Tenant settings (§2.2, item 6):**
+- Each row of the table: the refused values (`backup.dir` outside the home, after `..` and a symlink; `embedding.endpoint` and
+  `judge.jev.endpoint` with `localhost`, 127.0.0.1, `[::1]`, 10.x, 172.16.x, 192.168.x, 169.254.x, 100.64.x, `fc00::`,
+  `fe80::` and `http://`; `ollama`; `sync.remote`; `server.port`; `secrets.backend = "keychain"`) are refused on a patch and
+  leave a `config.toml` load not applied, and an allowed value of each passes.
+- The same values pass when the daemon is not in tenant mode.
 
 **Commands and protocol:**
 - Every refused command in §3.6 gives its message, and `remote status` exits 0 or 1 correctly.
@@ -682,7 +734,11 @@ the tests cover the following.
   `sudo` and `flock`, under a temporary root (`ALICE_SERVER_ROOT=<tmp>` prefixes every path the script touches). It checks:
   - `add` twice is idempotent;
   - port allocation skips used ports;
-  - the snippet, unit and tenant file have the expected content and modes, and no token is written outside the tenant home;
+  - the snippet, unit and tenant file have the expected content and modes (the unit carries `MemoryMax=3G` and the R18
+    `IPAddressAllow`/`IPAddressDeny` lines; the Caddyfile carries the admin socket), and no token is written outside the
+    tenant home;
+  - nothing fail2ban-related is installed;
+  - `list` prints the free disk and the archive size;
   - `remove` archives before it deletes;
   - `upgrade` rolls back when a stubbed ping fails;
   - a bad name is refused.
@@ -693,7 +749,9 @@ the tests cover the following.
    `rust-toolchain.toml`, check out `feat/server-mode` and run `cargo build --release -p alice` (or copy a Linux binary).
    Remove `target/` afterwards if less than 8 GB stays free.
 2. Install `alice-server`, then run `alice-server add t1` and `alice-server add t2`. Diff the managed Caddyfile against
-   `Caddyfile.pre-alice`: the IP certificate settings and `default_sni` must be unchanged.
+   `Caddyfile.pre-alice`: the IP certificate settings and `default_sni` must be unchanged. Check that a reload works through
+   the admin socket and that nothing listens on port 2019. Record `ss -ltnp` and report any listener besides sshd, Caddy, the
+   DNS stub and the tenants.
 3. From this Mac, with a scratch `ALICE_HOME`:
    - `alice remote set https://212.80.214.149/u/t1` (token on stdin);
    - `alice remember` and `alice recall` in a scratch git repository that has a `.alice.toml` with `cloud_denied = true` and a
@@ -704,8 +762,9 @@ the tests cover the following.
 5. SSE: `curl -N` on `/u/t1/api/v1/events/stream` with the token shows an event within a second of a `remember`.
 6. Check that the token does not appear in `/var/log/caddy/alice-access.log`, in `journalctl -u alice@t1`, or in the client's
    logs.
-7. Check that the log line's `client_ip` is this Mac's public IP (NAT check). Then send 12 bad-token requests: the IP is banned
-   on 443, and SSH still works. Then `fail2ban-client set alice-caddy unbanip <ip>`.
+7. R18: t1's daemon has downloaded its model (public internet works). A `systemd-run --uid=alice-t1 -p IPAddressAllow=localhost
+   -p IPAddressDeny=<the unit's ranges> curl -m 5 http://192.168.100.99/` fails. Patching t1's `embedding.endpoint` to
+   `http://192.168.100.99/` is refused. Record one access-log line's `client_ip`, for the record (the gateway is expected).
 8. Run `alice-server upgrade` with the same binary (a restart round trip) and `alice-server rotate t1`: the old token is
    refused, and `alice remote set` with the new one works.
 9. `alice-server remove t1 --yes` and `remove t2 --yes` (archives kept), unless the controller says otherwise. Report the
@@ -722,7 +781,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 
 | # | Ruling | Why | Cost if wrong |
 |---|---|---|---|
-| R1 | Project rules reach the server as a **mirror file** per project (`client-projects/<hash>/.alice.toml`), stored as the project's root | Every privacy path (`ProjectSettingsCache`, `Redactors`, `cloud_allowed`, `DaemonJevPolicy`, `query_for_remote`, the judge worker) already reads `<root>/.alice.toml` with its fail-closed rules and loosening gate. A mirror reuses all of it with no second rules mechanism | If a later design wants rules in the database, a migration from mirror files to rows; small |
+| R1 | Project rules reach the server as a **mirror file** per project (`client-projects/<hash>/.alice.toml`), stored as the project's root | Every privacy path (`ProjectSettingsCache`, `Redactors`, `cloud_allowed`, `DaemonJevPolicy`, `query_cloud`, the judge worker) already reads `<root>/.alice.toml` with its fail-closed rules and loosening gate. A mirror reuses all of it with no second rules mechanism | If a later design wants rules in the database, a migration from mirror files to rows; small |
 | R2 | Tenant mode is a **process flag** (`--tenant`), not a setting | A setting could be switched off through the API; the flag is fixed by the unit file | None for clients; a local daemon behaves as today |
 | R3 | In tenant mode a **missing root fails closed** | A missing directory means rules this machine cannot know; "no rules" would send a denied project to the cloud | A restored laptop database stays fail-closed for a project until its client sends the identity once (intended) |
 | R4 | Caddy exposes **only `/api/v1/*`**, not `/mcp` | Direct HTTP MCP from an agent would skip client-side detection and redaction, and its roots name paths the server cannot see, so memories would land in `global` | A person without the `alice` binary on their machine cannot connect an agent directly; adding the route later is one snippet line |
@@ -733,29 +792,26 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R9 | A verified remote client is **reused without a per-call ping**; it is re-verified after a transport error or 401 | A WAN ping per tool call doubles latency; TLS pins the host and the first proof pins the tenant | A route swapped by the admin mid-session is noticed at the next failure, not before the next call |
 | R10 | The ping carries **capabilities**, and the client requires `client-project` | An older server would silently ignore `client_project` and file everything in `global` without the project's rules | One more field on the ping |
 | R11 | Spool **replay by the client**: a background loop in `alice mcp` (30 s), and a 2 s budget after one-shot commands, under an advisory lock | No local daemon drains the spool in remote mode; hooks must stay fast | Writes queued by a one-shot command wait until the next `alice` call when no `alice mcp` runs |
-| R12 | **Per-tenant model copy** (about 118 MB each), not a shared model directory | 0.6 GB for five tenants fits 20 GB free; sharing needs a new path setting and permission rules | 0.5 GB of disk |
+| R12 | **Per-tenant model copy** (about 118 MB each), not a shared model directory | 0.6 GB for five tenants fits 19 GB free; sharing needs a new path setting and permission rules | 0.5 GB of disk |
 | R13 | `alice-server` **owns the Caddyfile** from one template that reproduces the controller's IP-cert settings, with tenants as imported snippets | Editing a hand-written Caddyfile with sed is fragile; a template plus `caddy validate` is safe and idempotent | Other sites on this Caddy must go into an imported file; the backup `Caddyfile.pre-alice` keeps the original |
 | R14 | Ports 47801–47899 on 127.0.0.1; tenant names `^[a-z][a-z0-9-]{0,15}$` | A fixed port per tenant is what Caddy routes to; the name goes into a user name, a URL path and a unit name | None at five tenants |
-| R15 | `MemoryMax=1536M` per tenant | One tenant's runaway must not starve the others; the measured budget is 800 MB | A large ingest by one person could be OOM-killed and restarted; raising the limit is one line |
+| R15 | `MemoryMax=3G` per tenant (controller's ruling) | One tenant's runaway must not starve the others; five times 3 GB fits the server's 15 GB, against a measured budget of 800 MB | A very large ingest by one person could be OOM-killed and restarted; raising the limit is one line |
 | R16 | Build on the server (rustup and a native release build) in the deployment task | Avoids cross-compiling ONNX Runtime and glibc mismatches | Disk and time on the server (about 6 GB during the build); `target/` is removed afterwards if the disk is tight |
 | R17 | The remote client honours **system proxy** variables for `https://` only | TLS hides the token from a CONNECT proxy; some networks need one | A misconfigured proxy shows up as "unreachable" with its error |
+| R18 | **No LAN access from a tenant daemon** (controller's ruling, with two layers added here): the unit's `IPAddressAllow=localhost` and `IPAddressDeny=` of the private, link-local, CGNAT and ULA ranges; Caddy's admin API moved to a Unix socket; tenant-mode validation of every URL and path setting (§2.2, item 6) | A tenant controls URLs its daemon calls; the LAN holds the Proxmox host and the gateway; localhost must stay allowed (Caddy, DNS), which would otherwise leave Caddy's admin API on 2019 open to a tenant | A tenant cannot use a LAN or self-hosted embedding server (Ollama); none is planned on the server |
+| R19 | **No fail2ban jail** (controller's ruling) | The NAT masquerades: every client arrives from `192.168.100.99`, so a ban would lock everyone out, including the IP certificate's renewal | Brute force is unthrottled, which is irrelevant against a 256-bit token |
 
 ---
 
-## 10. Open questions for the controller (vision only; the technical side is ruled above)
+## 10. Questions decided by the controller (relayed to the owner, who may overrule)
 
-- **Q1 — Trust model.** The server's admin can read every tenant's memory and key (§7). Is that acceptable for the owner's
-  people, or does the owner want encryption at rest, which is a larger design? Default: acceptable; documented in
-  `docs/server.md`.
-- **Q2 — The owner's existing local memory.** Should it move onto his tenant now? Default: no, it stays out of scope. It is
-  possible by hand: the admin copies a backup into the tenant home and restores it, and R3 keeps those projects fail-closed until
-  the owner's client sends each project's identity once.
-- **Q3 — All or nothing per machine.** Remote mode switches a whole client machine (or one `ALICE_HOME`) to the server. Some
-  projects on the server and others local would need per-project targets, which is a larger change. Default: per machine, or
-  per `ALICE_HOME` via the environment.
-- **Q4 — Disk and RAM.** Five tenants need about 0.6 GB for models, plus each tenant's data and backups. RAM is about
-  300–800 MB per active tenant. The deployment task reports what it measures, and if the VM's RAM is under 4 GB the controller
-  may want to ask the owner to grow it.
+- **Q1 — Trust model:** the admin (the owner) can read every tenant's memory and key; this is documented in `docs/server.md`.
+- **Q2 — The owner's existing local memory:** moving it is out of scope. It is possible by hand: the admin copies a backup into
+  the tenant home and restores it, and R3 keeps those projects fail-closed until the owner's client sends each project's
+  identity once.
+- **Q3 — Remote mode switches a whole machine**, or one `ALICE_HOME` through the environment, not single projects.
+- **Q4 — Resources (measured by the controller):** 15 GB of RAM (13 GB free), 4 vCPU, and a 28 GB root filesystem with 19 GB
+  free. Five tenants need about 0.6 GB for models, plus their data and backups. The NAT masquerades (R19).
 
 ---
 
@@ -764,7 +820,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 1. `alice-core`: `ClientProject` and `ClientRules`, the `client_project` fields, `PingResponse.capabilities`, the `parse_project`
    marker, and the `NON_SETTING_ENV` entries.
 2. `alice-daemon` server side:
-   - tenant mode (flag, ignore `cwd`, missing root fails closed);
+   - tenant mode (flag, ignore `cwd`, missing root fails closed, tenant settings validation of §2.2 item 6);
    - the mirror module (`client_projects.rs`);
    - the `Scope` value through `choose` and `rules_fail_closed`;
    - `retry_later`; the ping capabilities.
@@ -777,6 +833,12 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
    replay after one-shot commands.
 5. `alice mcp`: the background replay and the remote flag timeout.
 6. The Caddy emulator test harness, and the end-to-end tests of §8.1.
-7. `deploy/server/alice-server` with its stub tests (§8.2).
-8. Documents: `docs/server.md`, the `README.th.md` Thai section, and a short pointer in `README.md`.
-9. The deployment task (§8.3).
+7. `deploy/server/alice-server` with its stub tests (§8.2): the unit with R15 and R18, the Caddyfile with the admin socket,
+   no fail2ban.
+8. Documents: `docs/server.md`, the `README.th.md` Thai section, and a short pointer in `README.md`. `docs/server.md` covers:
+   - the trust model (Q1);
+   - why there is no per-IP ban, with the example filter (§2.4);
+   - that tenant backups and `remove` archives share the 28 GB disk with the data, and off-machine copies are the admin's job.
+9. Merge the head of `feat/m2-judge-settings` again before the final review (the M2 final-review fix wave lands after
+   2026-10-16 17:00).
+10. The deployment task (§8.3), only after the controller's go.
