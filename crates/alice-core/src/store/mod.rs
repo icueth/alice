@@ -50,6 +50,9 @@ fn configure_sqlite_once() {
     });
 }
 
+/// How long a connection waits for a lock before it reports `SQLITE_BUSY`.
+pub const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
+
 /// Page cache of the writer connection, in KiB.
 const WRITER_CACHE_KIB: i64 = 64 * 1024;
 /// Page cache of each reader connection, in KiB. Readers are pooled (8 in the daemon), so
@@ -64,7 +67,7 @@ pub const VECTOR_READER_CACHE_KIB: i64 = 4 * 1024;
 /// mapping 256 MB each reached gigabytes). Reads through the OS file cache measured the same
 /// speed for Alice's queries.
 fn configure_common(conn: &Connection, cache_kib: i64) -> Result<()> {
-    conn.busy_timeout(Duration::from_millis(5_000))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.execute_batch(&format!(
         "PRAGMA foreign_keys = ON;
          PRAGMA temp_store = MEMORY;
@@ -433,7 +436,10 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        // A statement stepped once and then left: its snapshot is open too.
+        // A statement stepped once and then left: its snapshot is open too. The statement is
+        // leaked on purpose (a dropped one would be reset), so SQLite cannot close this
+        // connection: the pool discards it and it stays allocated for the life of the test.
+        // Only the transaction case above is actually closed.
         let half = pool.lease().unwrap();
         {
             let c = half.conn.as_ref().unwrap();

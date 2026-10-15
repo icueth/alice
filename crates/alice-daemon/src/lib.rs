@@ -21,6 +21,7 @@ pub mod service;
 pub mod service_install;
 pub mod spool;
 pub mod startup;
+pub mod wal;
 pub mod worker;
 pub mod writer;
 
