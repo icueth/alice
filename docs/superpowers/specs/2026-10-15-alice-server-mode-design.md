@@ -2,7 +2,8 @@
 
 - **Date:** 2026-10-15
 - **Status:** approved by the controller with binding changes (spec-review.md, 2026-10-15), applied here; base merged with
-  `feat/m2-judge-settings` 9dfac19 (M2 Task 22)
+  `feat/m2-judge-settings` 9dfac19 (M2 Task 22); addendum 1 (the owner's answers: four tenants, MemPalace import through
+  a client-made bundle, a fixed disk) folded in, with `feat/m3-import` 3dbfa31 merged
 - **Owner:** icueth (vision); technical choices delegated to this lane
 - **Lane:** server mode, worktree `project-alice-srv`, branch `feat/server-mode` (from `feat/m2-judge-settings` b28b99f)
 - **Builds on:** `2026-10-13-alice-core-design.md` (the core spec), the M2 handoff `docs/superpowers/handoff/2026-10-14-m2-handoff.md`
@@ -18,6 +19,11 @@
 - The server is an Ubuntu 24.04 VM on the public IP `212.80.214.149` (NAT to 192.168.100.153; ports 22, 80 and 443 forwarded).
   Caddy serves the bare IP; there is no domain.
 - Every technical choice is delegated. This spec records each one as a ruling (§9).
+- **The tenants (addendum 1):** exactly four people, `icue`, `joe-hermes`, `joe` and `petch`. Each one's memory is their own.
+  They are created only in the deployment task, after its test tenants pass and are removed, and only with the controller's
+  go. Token handover is the controller's call; the script prints a token once and never writes it outside the tenant's home.
+- **MemPalace import is in scope (addendum 1):** each person imports their own palace into their own tenant (§3.8).
+- **The disk will not be grown (addendum 1):** 28 GB root with about 19 GB free; the budget is §2.7.
 
 ### 0.2 Architecture rulings from the controller (binding; this spec fills in the details)
 
@@ -51,11 +57,21 @@
    settings name (R18); the public internet stays reachable for Jev and the model download.
 7. `/api/v1/events/stream` delivers events through Caddy without buffering.
 8. The token never appears in a log, an error message, `Debug` output, `alice remote status`, or Caddy's access log.
+9. `alice import mempalace` in remote mode imports the person's own palace into their tenant:
+   - the counts equal a local import of the same palace;
+   - a secret-shaped drawer never appears in the uploaded bytes, and block mode holds it back on the client;
+   - a rerun imports nothing new;
+   - a tenant refuses an import that names a path on the server.
+10. The disk stays inside its budget (§2.7):
+   - uploads that would leave less than 2 GB free are refused up front;
+   - each tenant keeps at most 2 scheduled backups and makes no manual ones;
+   - `alice-server list` warns below 3 GB free.
 
 ### 0.4 Out of scope
 
-Shared or team memory, accounts, a web UI, a domain, Docker, encryption at rest, and moving an existing local memory onto a
-tenant. The last one is possible by hand (§10, Q2) but is not built here.
+Shared or team memory, accounts, a web UI, a domain, Docker, encryption at rest, and moving an existing local **Alice** home
+onto a tenant. A person brings their history by importing their MemPalace palace instead (§3.8). Moving an Alice home is
+possible by hand (§10, Q2) but is not built here.
 
 ---
 
@@ -95,7 +111,7 @@ next to the local daemon it discovers today.
 | Linux user | `alice-<name>`: a system user with its own group, shell `/usr/sbin/nologin`, home `/srv/alice/<name>` |
 | `ALICE_HOME` | `/srv/alice/<name>`, owner `alice-<name>`, mode 0700; `/srv/alice` is root-owned, mode 0755 |
 | Port | the lowest free port in 47801–47899: not in any tenant file, and not listening (`ss -ltn`) |
-| Registry | `/etc/alice/tenants/<name>.env` (root, mode 0644): `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALICE_LOG=info`. **No token, no key.** |
+| Registry | `/etc/alice/tenants/<name>.env` (root, mode 0644): `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALICE_LOG=info`, `ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0`. **No token, no key.** |
 | Unit | `/etc/systemd/system/alice@.service` (below) |
 | Binary | `/usr/local/bin/alice` (the previous one is kept as `/usr/local/bin/alice.prev`) |
 | Model | each tenant downloads its own copy on first start: `multilingual-e5-small-q8`, about 118 MB. Five copies (about 0.6 GB) fit the disk, so nothing is shared |
@@ -216,6 +232,14 @@ cannot switch it off through `PATCH /api/v1/settings`. Its effects:
    No other setting names a URL or a path. The `distill.*` settings name a provider and a model, both unused until SP2, and
    SP2 must add its endpoint to this table. The rest are numbers, switches, durations and patterns. systemd's
    `ProtectSystem=strict` with `ReadWritePaths=/srv/alice/%i` stays as the second layer for paths, and R18 for URLs.
+   `backup.daily` and `backup.weekly` are pinned by the unit's environment (`ALICE_BACKUP_DAILY=2`,
+   `ALICE_BACKUP_WEEKLY=0`; the environment wins over the file), so a tenant's patch of them has no effect, and the patch
+   answer says the variable overrides it (§2.7).
+7. **What only the admin may do on the server's disk:**
+   - `POST /api/v1/backups` (a manual backup) is refused: "on a server tenant backups are scheduled (the last 2 are kept);
+     ask the server's admin for an extra copy". Manual backups are kept apart from the rotation (up to 5), which the disk
+     budget cannot afford.
+   - An import that names a palace path, or none, is refused. A tenant imports only a bundle it uploaded (§3.8).
 
 Nothing else changes. The token, the Host and Origin guard, the ping proof, the rotation, the spool, the writer and the judge
 worker stay as they are.
@@ -341,7 +365,7 @@ token once, with the `alice remote set` line.
 **`list`**
 One row per tenant: name, port, unit state, the version the ping reports, URL and home size (its backups included). Then a
 last line with the free space on the disk that holds `/srv/alice`, and the size of the `remove` archives in
-`/srv/alice/backups`. No token.
+`/srv/alice/backups`. It prints a warning line when less than 3 GB is free (§2.7). No token.
 
 **`upgrade <binary>`**
 1. Checks that `<binary> --version` runs.
@@ -357,6 +381,35 @@ Nothing is configured centrally. A person turns Jev on for their own tenant from
 and `PATCH /api/v1/settings` to that tenant's `secrets.toml` (the `file` backend, 0600, owned by `alice-<name>`). The tenant's
 `judge.daily_budget_usd` caps the spend. Other tenants cannot read the file: separate Unix users, 0700 homes. The default
 judge stays `heuristic` (`JudgeSettings::default`), so a tenant without a key gets the fast recall.
+
+### 2.7 Disk budget (the disk is not grown)
+
+The root filesystem is 28 GB with about 19 GB free (measured by the controller). The rules below keep five sources of disk
+use inside it.
+
+| Use | Size | Rule |
+|---|---|---|
+| The build (R16) | about 6 GB while it runs | Built **before** any tenant or import exists. Right after the build, `target/`, the cargo registry and git caches, the checkout and the rustup toolchain are removed; only `/usr/local/bin/alice` stays. `df -h` is recorded before and after |
+| A tenant's home | up to about 2 GB (the owner's palace of 1.6 GB gave a 1.1 GB home with partial embedding; about 2 GB fully embedded), plus the 118 MB model | Shown per tenant by `alice-server list` |
+| Scheduled backups | one copy of `alice.db` each (vectors and model are not backed up); about 1–1.5 GB for an owner-sized tenant | `ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0` in the unit's environment: at most 2 per tenant. The backup job's own free-space check (`space_needed`) skips a backup that has no room |
+| Manual backups | — | Refused on a tenant (§2.2 item 7) |
+| Pre-migration copies | one copy of `alice.db` per tenant, kept 30 days by the existing rotation | Only when an upgrade migrates the schema; `alice-server upgrade` prints the free space before it restarts the tenants |
+| An import | the uploaded bundle (text and graph only, no vectors; estimated 0.3–1 GB for an owner-sized palace) while the job runs; the database grows by what is imported | One import per tenant at a time. An upload is refused up front when its declared size would leave less than **2 GB** free, or when it exceeds the 4 GiB cap. The bundle is deleted when the job ends, however it ends. Uploads never started are swept after 1 hour |
+| `remove` archives | a gzip of the home | Counted by `alice-server list`; deleting old archives is the admin's job (`docs/server.md`) |
+
+**Expected total:**
+- the owner's tenant: about 2 GB home plus 2 backups of about 1.2 GB = about 4.4 GB;
+- three tenants a quarter of that size: about 1.1 GB each;
+- together about 8 GB of the 19 GB.
+
+**Worst case:** four owner-sized tenants come to about 17.6 GB, which does not fit with a 3 GB reserve. The guards then act in
+this order:
+1. `alice-server list` warns below 3 GB free;
+2. uploads are refused below the 2 GB line;
+3. the backup job skips copies it has no room for;
+4. the daemon's existing disk-full behaviour (read-only, writes spooled) is the last line.
+
+The admin's lever is one line per tenant: `ALICE_BACKUP_DAILY=1` in that tenant's file, then a restart of that tenant.
 
 ---
 
@@ -512,7 +565,10 @@ updates the mirror before the write is applied.
 |---|---|
 | recall, remember, context, get, update, facts, fact, history, undo, review, stats, projects, status, mcp | through the server (§3.2–3.5) |
 | config list/get/set/unset/set-secret/delete-secret/test | the tenant's settings and secrets on the server |
-| backup now/list, maintenance status/run | on the server (the tenant's own backups) |
+| backup list, maintenance status/run | on the server (the tenant's own backups) |
+| backup now | refused by the server on a tenant (§2.2 item 7) |
+| import mempalace | builds, uploads and imports a redacted bundle (§3.8) |
+| import status | the server's import status |
 | doctor | remote checks: `remote.json` mode, URL scheme, ping proof, capabilities, version skew, queued writes; then the server's `/api/v1/doctor`. Local daemon checks are skipped |
 | config edit | refused: "this client uses the memory server <url>; change settings with `alice config set`" |
 | daemon start/stop/status/logs | refused: "… uses the memory server <url>; `alice remote unset` to use a local daemon" |
@@ -526,6 +582,54 @@ updates the mirror before the write is applied.
 `RemoteBackend` already goes through `DaemonClient`, so it gets the remote target. Project detection uses the client's first
 root or the shim's cwd, as today, followed by §3.3. The admin-tools flag is read from the server with the remote timeout. The
 background replay of §3.5 runs inside it.
+
+### 3.8 Import from MemPalace (addendum 1)
+
+The importer of `feat/m3-import` is a daemon job. It snapshots a palace **on the daemon's disk** (`importer::run`: snapshot,
+survey, then the knowledge, raw, graph, collapsed, mentions and done passes), redacts everything it plans with `RedactFilter`,
+and hands batches to the writer. A remote client's palace is not on the server, so (ruling R20):
+
+**On the client: a redacted bundle.** `alice import mempalace [--palace …]` in remote mode:
+1. Resolves the palace as today (`resolve_palace`) and snapshots it into the client's own `import-tmp/<id>/`, with the audited
+   `snapshot()` (read-only, never modifies the palace).
+2. Writes one SQLite file, `bundle.sqlite3`, from the snapshot:
+   - **Drawer text:** goes through `RedactFilter::filter("drawer", text)`. The redactor is the client's global privacy
+     rules (`config.toml` and `ALICE_*`) with redaction forced on, the same rule M3 uses locally
+     (`for_root_always_on(None)`). In block mode a drawer whose text holds a secret is **held back**: it is not written, and
+     it is counted and reported on the client.
+   - **Drawer ids** become `RedactFilter::legacy_key(id)`, everywhere they appear (drawers, graph sources, tunnel
+     endpoints), so references stay consistent and two different secrets stay two ids.
+   - **Every other string goes through `RedactFilter::quiet`:** wing, room, hall, source file, agent, topic and the other
+     metadata strings; entity names and ids; triple ids, predicates and objects; every string of the tunnels file.
+   - **Graph facts:** a triple whose subject, predicate or object block mode would refuse is held back too.
+   - **The rest:** the closets count and the snapshot's notes go into the bundle's metadata.
+3. Deletes the snapshot copy, then uploads the bundle (§4.5). It prints the size first, then progress.
+4. Starts the server's import with `ImportRequest { bundle: Some(<id>), palace: None, … }` (dry run, `--since`,
+   `--map-wing`, `--collection` and `--allow-remote-embedding` pass through unchanged). Then it polls `/api/v1/import/status`
+   and prints the existing report. A last line gives the drawers and facts held back on this machine.
+5. Deletes its local bundle. A dry run uploads too, because the server is what plans.
+
+**Project identity.** M3's wing map is name-based: it uses the palace's own wing list, not git and not `.alice.toml`. An
+imported project is a placeholder (`key = import:<slug>`, no root) under the global rules, exactly as in a local import.
+The first `client_project` with the same slug **adopts** the placeholder (`upsert_project`): it takes the client's key and
+the mirror as its root, so from then on the working tree's `.alice.toml` applies, again exactly as locally. The bundle
+therefore carries wing names (redacted), not one `ClientProject` per wing, and no new privacy rule is needed.
+
+**On the server: a third backend.** Changes to M3's code are additive:
+- `Backend::Bundle` in `alice_core::import::palace`, with a `BundleReader` that implements `PalaceReader` (page by id, `get`,
+  `wing_counts`, `since` on `filed_at`, the same semantics as the sqlite_exact reader);
+- an arm for it in `open_snapshot` and `count_closets` (the closets count comes from the bundle's metadata);
+- `ImportRequest::bundle: Option<String>`;
+- in `importer::run`, the snapshot step becomes "use the uploaded bundle as the snapshot" when `bundle` is set: the job id
+  is the bundle id, so the job's folder is the upload's folder and the existing cleanup deletes it when the job ends;
+- `snap.kg` is the bundle file itself (it holds `entities` and `triples` in MemPalace's schema, so `read_kg` reads it
+  unchanged), and `snap.tunnels` is a `tunnels.json` the server extracts from the bundle into the job folder.
+
+Survey, planning, dedup by legacy id (a rerun imports nothing new), the writer path, the report and the server's own
+`RedactFilter` (idempotent on redacted text) are all reused as they are.
+
+**Tenant mode** refuses an import whose request names a palace path, or none, unless it names an uploaded bundle (§2.2
+item 7). A bundle id must be a ULID naming an existing `import-tmp/<id>/bundle.sqlite3`.
 
 ---
 
@@ -594,6 +698,30 @@ request's project rules are fail-closed (§3.5).
 
 Settings: none added. The environment variables `ALICE_REMOTE_URL` and `ALICE_REMOTE_TOKEN` join `NON_SETTING_ENV`.
 
+### 4.5 Import bundle upload
+
+`PUT /api/v1/import/bundle`. The body is the bundle file (`application/octet-stream`), and `Content-Length` is required.
+The route is behind the token guard and has its own body rule in place of the 40 MB API limit. The server:
+1. Refuses with `invalid` when an import is running or another upload is in progress, when the length is missing, zero, or
+   above 4 GiB, or when the length would leave less than 2 GB free on the disk of `ALICE_HOME`
+   (`backup::free_space`).
+2. Sweeps `import-tmp/` folders holding an upload older than 1 hour that no job is using.
+3. Streams the body to `import-tmp/<new ULID>/bundle.sqlite3.part` (folder 0700, file 0600). It stops and deletes the part
+   when more bytes arrive than declared or the connection ends early.
+4. Syncs the file and renames it to `bundle.sqlite3`.
+5. Opens it read-only with `PRAGMA trusted_schema = OFF` and runs `quick_check`. It checks
+   `bundle_meta.format = "alice-import-bundle"` and `version = 1`, and that the bundle's tables are present. Anything else
+   deletes the folder and refuses with `invalid`.
+6. Answers `201 {"bundle": "<id>", "bytes": n}`.
+
+`ImportRequest` gains `#[serde(default)] bundle: Option<String>`. The bundle file's schema:
+- `bundle_meta(key TEXT PRIMARY KEY, value TEXT)`: `format`, `version`, `source_backend`, `drawers`, `closets`,
+  `held_back`, `notes` (a JSON array), `created_at`;
+- `bundle_drawers(id TEXT PRIMARY KEY, text TEXT NOT NULL, wing TEXT NOT NULL, filed_at TEXT, meta TEXT NOT NULL)`, where
+  `meta` is the redacted `DrawerMeta` as JSON;
+- MemPalace's `entities` and `triples` tables;
+- `bundle_tunnels(json TEXT)`.
+
 ---
 
 ## 5. Data flow
@@ -646,7 +774,13 @@ daemon's connection is dropped by the unit's `IPAddressDeny` (R18), and the embe
 | Caddy config invalid after a change | `caddy validate` fails, the change is undone, and the script exits non-zero. The running Caddy is never reloaded with a bad file |
 | Upgrade breaks a tenant | `alice.prev` is restored, all tenants restart, and the script exits non-zero naming the tenant |
 | Disk full on the server | The existing read-only and spool behaviour of the daemon applies (writes answer 202 "queued on the server") |
-| Tenant backups or `remove` archives fill the disk | They share the server's 28 GB disk. `alice-server list` shows each home's size and the free space; off-machine copies are the admin's job (`docs/server.md`) |
+| Tenant backups or `remove` archives fill the disk | They share the server's 28 GB disk. `alice-server list` shows each home's size and the free space, and warns below 3 GB; off-machine copies are the admin's job (`docs/server.md`) |
+| A bundle upload would leave less than 2 GB free, or is above 4 GiB | Refused before a byte is written; the client says how much is free and how large the bundle is |
+| An upload breaks off (network, client killed) | The part file is deleted; nothing was started; the client can run the import again |
+| An uploaded bundle is never imported | Swept after 1 hour by the next upload |
+| The import job fails or the daemon stops mid-import | The existing M3 behaviour: the job's folder (the bundle) is deleted; a rerun uploads again and resumes by dedup |
+| A drawer or fact holds a secret in block mode | Held back on the client and counted; it never leaves the machine |
+| A tenant asks for a manual backup | Refused (§2.2 item 7) |
 
 ---
 
@@ -669,6 +803,9 @@ daemon's connection is dropped by the unit's `IPAddressDeny` (R18), and the embe
   nothing on localhost can reconfigure the server.
 - **Brute force:** 2^256 tokens. There is no per-IP banning, because the NAT hides client addresses (§2.4).
 - **Backups:** tenant backups and `remove` archives sit on the same disk as the data. A copy off the machine is the admin's job.
+- **Import:** a person's palace never leaves their machine unredacted. The bundle holds only redacted text, and in block mode
+  the drawers with secrets are held back. The server reads an uploaded SQLite file read-only with `trusted_schema = OFF`
+  after `quick_check`, as the tenant's own Unix user, so a crafted file can only affect the tenant that sent it.
 
 ---
 
@@ -722,6 +859,19 @@ the tests cover the following.
   leave a `config.toml` load not applied, and an allowed value of each passes.
 - The same values pass when the daemon is not in tenant mode.
 
+**Import bundle (§3.8):**
+- A bundle built from M3's synthetic fixture palace (`alice_core::import::fixture::synthetic_palace`, with a knowledge graph
+  and tunnels from `build_kg` and `build_tunnels`) imports the same report counts (projects, memories, chunks, facts, links,
+  skipped) as a local import of that palace.
+- A drawer and a fact holding a secret-shaped string (built with `concat!`) never appear in the bundle's or the upload's
+  bytes. In block mode they are held back and counted on the client; in redact mode the text arrives redacted.
+- Ids with a secret map to `legacy_key` consistently in drawers, triples and tunnels.
+- A rerun imports nothing new.
+- The upload refuses: a missing or too large length; too little free space (an injected free-space function); a body
+  longer than declared; a file that is not a bundle. Each of these leaves no folder behind.
+- A tenant refuses `palace: Some(..)`, `palace: None` without a bundle, and an unknown bundle id.
+- A tenant refuses `POST /api/v1/backups`.
+
 **Commands and protocol:**
 - Every refused command in §3.6 gives its message, and `remote status` exits 0 or 1 correctly.
 - SSE: `/api/v1/events/stream` through the emulator delivers a `remember` event within 1 s.
@@ -738,6 +888,8 @@ the tests cover the following.
     `IPAddressAllow`/`IPAddressDeny` lines; the Caddyfile carries the admin socket), and no token is written outside the
     tenant home;
   - nothing fail2ban-related is installed;
+  - the tenant file carries `ALICE_BACKUP_DAILY=2` and `ALICE_BACKUP_WEEKLY=0`;
+  - `list` warns when the stubbed free space is under 3 GB;
   - `list` prints the free disk and the archive size;
   - `remove` archives before it deletes;
   - `upgrade` rolls back when a stubbed ping fails;
@@ -745,9 +897,12 @@ the tests cover the following.
 
 ### 8.3 Deployment task (the only time the server is touched)
 
-1. Record `free -m`, `df -h`, `uname -m` and the Caddyfile in force. Install rustup with the toolchain from
-   `rust-toolchain.toml`, check out `feat/server-mode` and run `cargo build --release -p alice` (or copy a Linux binary).
-   Remove `target/` afterwards if less than 8 GB stays free.
+1. Record `free -m`, `df -h`, `uname -m` and the Caddyfile in force.
+   - Install rustup with the toolchain from `rust-toolchain.toml`, check out `feat/server-mode` and run
+     `cargo build --release -p alice`.
+   - Install the binary. Then remove `target/`, `~/.cargo/registry`, `~/.cargo/git`, the checkout and the toolchain
+     (`rustup self uninstall -y`).
+   - Record `df -h` again. This happens before any tenant or import exists.
 2. Install `alice-server`, then run `alice-server add t1` and `alice-server add t2`. Diff the managed Caddyfile against
    `Caddyfile.pre-alice`: the IP certificate settings and `default_sni` must be unchanged. Check that a reload works through
    the admin socket and that nothing listens on port 2019. Record `ss -ltnp` and report any listener besides sshd, Caddy, the
@@ -767,8 +922,17 @@ the tests cover the following.
    `http://192.168.100.99/` is refused. Record one access-log line's `client_ip`, for the record (the gateway is expected).
 8. Run `alice-server upgrade` with the same binary (a restart round trip) and `alice-server rotate t1`: the old token is
    refused, and `alice remote set` with the new one works.
-9. `alice-server remove t1 --yes` and `remove t2 --yes` (archives kept), unless the controller says otherwise. Report the
+8a. Import: a **synthetic** palace (built on this Mac by a small test binary with M3's fixture, a few thousand drawers
+    with one `concat!`-built secret drawer), imported into t1 with `alice import mempalace --palace <it>`:
+    - the counts equal a local import of the same palace;
+    - the secret is not in the server's database (`grep -c` on a copy);
+    - `import-tmp/` is empty afterwards;
+    - `df -h` is recorded.
+    Never a real person's palace.
+9. `alice-server remove t1 --yes` and `remove t2 --yes`. Delete their archives too, to give the space back. Report the
    memory and disk use measured.
+10. Only with the controller's go: `alice-server add` for `icue`, `joe-hermes`, `joe` and `petch`. Token handover is the
+    controller's. Each person imports their own palace after handover.
 
 ### 8.4 Gates before the final review
 
@@ -800,15 +964,22 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R17 | The remote client honours **system proxy** variables for `https://` only | TLS hides the token from a CONNECT proxy; some networks need one | A misconfigured proxy shows up as "unreachable" with its error |
 | R18 | **No LAN access from a tenant daemon** (controller's ruling, with two layers added here): the unit's `IPAddressAllow=localhost` and `IPAddressDeny=` of the private, link-local, CGNAT and ULA ranges; Caddy's admin API moved to a Unix socket; tenant-mode validation of every URL and path setting (§2.2, item 6) | A tenant controls URLs its daemon calls; the LAN holds the Proxmox host and the gateway; localhost must stay allowed (Caddy, DNS), which would otherwise leave Caddy's admin API on 2019 open to a tenant | A tenant cannot use a LAN or self-hosted embedding server (Ollama); none is planned on the server |
 | R19 | **No fail2ban jail** (controller's ruling) | The NAT masquerades: every client arrives from `192.168.100.99`, so a ban would lock everyone out, including the IP certificate's renewal | Brute force is unthrottled, which is irrelevant against a 256-bit token |
+| R20 | **MemPalace import through a redacted bundle made on the client** and read on the server by a third `Backend` (controller's ruling; seam confirmed against M3's code: `Backend::Bundle` + `BundleReader`, a pre-made snapshot as the entry point) | The palace is on the person's machine; secrets must not leave it; M3's job then runs unchanged | Two readers to keep in step with MemPalace's format: the client's (unchanged M3 code) and the bundle's (ours, versioned) |
+| R21 | The bundle is **one SQLite file** (drawers, MemPalace-schema graph, tunnels JSON, metadata) | One stream to upload and cap; `read_kg` reads the graph tables unchanged; paging by id needs an index, not memory | A format change needs a version bump (`bundle_meta.version`) |
+| R22 | **Wings travel as redacted names; no `ClientProject` per wing** | M3's wing map is name-based and imported projects are placeholders; the first `client_project` of the same slug adopts the placeholder and brings its mirror, which is the local behaviour | An imported project's own `.alice.toml` applies only from that project's first remote request on, as locally |
+| R23 | **Backups pinned to 2 scheduled, 0 weekly, no manual** on tenants (environment plus a tenant-mode refusal) | The disk is fixed (§2.7); manual backups are kept apart from the rotation | A person cannot make an extra copy on demand; the admin can |
+| R24 | **Upload guard:** 4 GiB cap, refused below 2 GB free after the upload, one at a time, swept after 1 hour | The import must never be what fills the disk | A palace whose redacted text exceeds 4 GiB cannot be imported in one go; no such palace is known |
+| R25 | After the build, **only the binary stays** (target, caches, checkout and toolchain removed) | About 6 GB back before any data exists | The next build reinstalls the toolchain (minutes) |
 
 ---
 
 ## 10. Questions decided by the controller (relayed to the owner, who may overrule)
 
 - **Q1 — Trust model:** the admin (the owner) can read every tenant's memory and key; this is documented in `docs/server.md`.
-- **Q2 — The owner's existing local memory:** moving it is out of scope. It is possible by hand: the admin copies a backup into
-  the tenant home and restores it, and R3 keeps those projects fail-closed until the owner's client sends each project's
-  identity once.
+- **Q2 — History:** importing each person's own MemPalace palace into their own tenant is **in scope** (addendum 1, §3.8).
+  Moving an existing local Alice home stays out of scope (possible by hand: the admin restores a backup into the tenant
+  home, and R3 keeps those projects fail-closed until the owner's client sends each project's identity once).
+- **Tenants:** `icue`, `joe-hermes`, `joe` and `petch`, created after the controller's go (§8.3 step 10).
 - **Q3 — Remote mode switches a whole machine**, or one `ALICE_HOME` through the environment, not single projects.
 - **Q4 — Resources (measured by the controller):** 15 GB of RAM (13 GB free), 4 vCPU, and a 28 GB root filesystem with 19 GB
   free. Five tenants need about 0.6 GB for models, plus their data and backups. The NAT masquerades (R19).
@@ -820,7 +991,8 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 1. `alice-core`: `ClientProject` and `ClientRules`, the `client_project` fields, `PingResponse.capabilities`, the `parse_project`
    marker, and the `NON_SETTING_ENV` entries.
 2. `alice-daemon` server side:
-   - tenant mode (flag, ignore `cwd`, missing root fails closed, tenant settings validation of §2.2 item 6);
+   - tenant mode (flag, ignore `cwd`, missing root fails closed, tenant settings validation of §2.2 item 6, the refusals of
+     §2.2 item 7);
    - the mirror module (`client_projects.rs`);
    - the `Scope` value through `choose` and `rules_fail_closed`;
    - `retry_later`; the ping capabilities.
@@ -832,6 +1004,11 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 4. `alice` CLI: `alice remote set/status/unset`, `daemon run --tenant`, the refusals of §3.6, the remote doctor checks, and the
    replay after one-shot commands.
 5. `alice mcp`: the background replay and the remote flag timeout.
+5a. Import (§3.8, §4.5):
+    - `Backend::Bundle` with `BundleReader` and the bundle writer in `alice-core`;
+    - the redacting bundle builder in `alice-daemon` (client side);
+    - the upload endpoint and the bundle entry point of the import job;
+    - `alice import mempalace` in remote mode.
 6. The Caddy emulator test harness, and the end-to-end tests of §8.1.
 7. `deploy/server/alice-server` with its stub tests (§8.2): the unit with R15 and R18, the Caddyfile with the admin socket,
    no fail2ban.
