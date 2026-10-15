@@ -613,8 +613,8 @@ fn survey_paged(
                         out.tiers.raw_file += 1;
                     }
                     let uri = source_uri(&d.meta);
+                    // Every chunk counts toward the weight of the project its folder names.
                     if tier == Tier::RawSession
-                        && !sources.contains_key(&uri)
                         && let Some(f) = d.meta.source_file.as_deref()
                     {
                         wings.note_transcript_dir(f);
@@ -1057,8 +1057,15 @@ mod tests {
 
     #[test]
     fn a_diary_goes_to_the_project_its_topic_names() {
-        let mut wm = wings();
-        wm.note_transcript_dir("/h/.claude/projects/-Users-x-Code-AI-devspace/a.jsonl");
+        let wm = WingMap::build(
+            &[
+                ("sessions".to_string(), 10),
+                ("alice".to_string(), 5),
+                ("wing_claude_code".to_string(), 3),
+                ("devspace".to_string(), 40),
+            ],
+            &BTreeMap::new(),
+        );
         let f = NoFilter;
         let m = Mapper {
             wings: &wm,

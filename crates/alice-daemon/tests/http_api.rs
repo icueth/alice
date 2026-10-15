@@ -2256,7 +2256,10 @@ async fn merging_a_cloud_denied_project_into_an_allowed_one_is_refused() {
     let (_a, _b) = two_folders(&s).await;
     let deny = |names: &[&str]| {
         let mut changes = serde_json::Map::new();
-        changes.insert("privacy.cloud_denied_projects".into(), serde_json::json!(names));
+        changes.insert(
+            "privacy.cloud_denied_projects".into(),
+            serde_json::json!(names),
+        );
         s.svc.patch_settings(changes).unwrap();
     };
     let req = |dry_run: bool| ProjectMergeRequest {

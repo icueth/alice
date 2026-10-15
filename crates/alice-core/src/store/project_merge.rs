@@ -969,7 +969,7 @@ mod tests {
         let mut t = T::new();
         let a = t.project("k/a", "a");
         let b = t.project("k/b", "b");
-        let c = t.project("k/c", "c");
+        t.project("k/c", "c");
         t.remember(&a, "in a");
         let (_, first) = t.merge("a", "b");
         let (_, second) = t.merge("b", "c");

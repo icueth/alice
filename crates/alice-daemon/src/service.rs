@@ -2948,8 +2948,7 @@ impl Service {
         // Privacy first: rows of a project kept away from cloud providers must not become
         // eligible for them by moving into one that is not. The one policy the judge and the
         // remote embedder ask (every name of the project, its `.alice.toml`, degraded config).
-        if !self.cloud.cloud_allowed(&plan.from.slug) && self.cloud.cloud_allowed(&plan.into.slug)
-        {
+        if !self.cloud.cloud_allowed(&plan.from.slug) && self.cloud.cloud_allowed(&plan.into.slug) {
             return Err(AliceError::invalid(format!(
                 "project \"{}\" is kept away from cloud providers and \"{}\" is not: deny \"{}\" first (add it to privacy.cloud_denied_projects or set cloud_denied in its .alice.toml), or remove the denial of \"{}\", then merge",
                 plan.from.slug, plan.into.slug, plan.into.slug, plan.from.slug

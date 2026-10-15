@@ -852,7 +852,19 @@ async fn diary_project_rules_and_checkpoint_weight_show_in_the_import_report_and
     ];
     specs.push(knowledge("k_x", "x note", "wing_claude_code", "knowledge"));
     let f = Flow::with_specs(&specs).await;
-    let st = f.run_import(f.request().dry_run(true)).await;
+    // One-drawer wings are not trusted by the diary rules; naming them with --map-wing is.
+    let request = || ImportRequest {
+        map_wing: [
+            ("devspace", "devspace"),
+            ("tara-stock-market", "tara-stock-market"),
+            ("pg_ai", "pg-ai"),
+        ]
+        .into_iter()
+        .map(|(w, p)| (w.to_string(), p.to_string()))
+        .collect(),
+        ..f.request()
+    };
+    let st = f.run_import(request().dry_run(true)).await;
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
     let r = st.report.unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);
@@ -867,7 +879,7 @@ async fn diary_project_rules_and_checkpoint_weight_show_in_the_import_report_and
     );
     assert_eq!(r.projects["global"].memories, 3);
 
-    let st = f.run_import(f.request()).await;
+    let st = f.run_import(request()).await;
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
     let row = |legacy: &str| -> (String, i64) {
         f.db()
