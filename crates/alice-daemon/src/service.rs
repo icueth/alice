@@ -1268,6 +1268,11 @@ impl Service {
             None => None,
         };
         if let Some(slug) = explicit_slug(scope.project) {
+            if slug.chars().count() > limits::MAX_PROJECT_SLUG_CHARS {
+                return Err(AliceError::Invalid(
+                    "project names are at most 100 characters".into(),
+                ));
+            }
             return Ok(ProjectChoice::Slug(slug.to_string()));
         }
         if let Some(r) = mirrored {
@@ -1277,6 +1282,13 @@ impl Service {
             && let Some(hint) = scope.project_hint
         {
             let slug = alice_core::normalize::slugify(hint);
+            if hint.trim().chars().count() > limits::MAX_PROJECT_NAME_CHARS
+                || slug.chars().count() > limits::MAX_PROJECT_SLUG_CHARS
+            {
+                return Err(AliceError::Invalid(
+                    "a project name is at most 200 characters and its slug at most 100".into(),
+                ));
+            }
             if !slug.is_empty() {
                 let name = hint.trim().to_string();
                 let lookup = slug.clone();
@@ -8839,6 +8851,88 @@ mod tests {
                 .project,
             "global"
         );
+    }
+
+    /// A tenant's read-only spool keeps the project hint: after the repair the memory lands in
+    /// the hinted project, not in `global`, and an old entry without the field still parses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_only_spool_keeps_the_project_hint_through_the_drain() {
+        let (d, s) = tenant_svc().await;
+        s.force_read_only("disk full");
+        let r = s
+            .remember_or_spool(RememberRequest {
+                content: "spooled with a hint".into(),
+                project_hint: Some("Hinted App".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.status, RememberStatus::Spooled);
+        let dir = s.home().spool_dir();
+        let text: String = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(text.contains("Hinted App"), "{text}");
+        // The repair: a fresh service on the same home drains the spool.
+        s.shutdown();
+        let s2 = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                ..quiet()
+            },
+        )
+        .unwrap();
+        let report = spool::drain(&dir, &s2).await;
+        assert_eq!(report.processed, 1, "{report:?}");
+        let conn = alice_core::store::open_reader(&s2.home().db()).unwrap();
+        let project: String = conn
+            .query_row(
+                "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, "hinted-app");
+        // An entry written before the field existed still parses.
+        let parsed: RememberRequest = serde_json::from_str(r#"{"content":"old entry"}"#).unwrap();
+        assert!(parsed.project_hint.is_none());
+    }
+
+    /// Project names are capped: a hint or an explicit project over the limits is refused, one
+    /// at the limit works, and the refusal never echoes the value.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn project_names_over_the_limits_are_refused() {
+        let (_d, s) = tenant_svc().await;
+        let remember = |hint: Option<String>, project: Option<String>| RememberRequest {
+            content: "a note".into(),
+            project_hint: hint,
+            project,
+            ..Default::default()
+        };
+        let long = "a".repeat(101);
+        for req in [
+            remember(Some(long.clone()), None),
+            remember(Some(format!("{} ", "b".repeat(201))), None),
+            remember(None, Some(long.clone())),
+        ] {
+            let e = s.remember(req).await.unwrap_err();
+            assert!(matches!(e, AliceError::Invalid(_)), "{e}");
+            let msg = e.to_string();
+            assert!(
+                !msg.contains(&long) && !msg.contains("bbbbbbbb"),
+                "echoed: {msg}"
+            );
+        }
+        let ok = s
+            .remember(remember(Some("c".repeat(100)), None))
+            .await
+            .unwrap();
+        assert_eq!(ok.project, "c".repeat(100));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -9,7 +9,7 @@ use crate::paths::AliceHome;
 use crate::service::Service;
 use alice_core::api::*;
 use alice_core::error::AliceError;
-use alice_core::model::Author;
+use alice_core::model::{Author, limits};
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -322,6 +322,13 @@ fn json<T: serde::Serialize>(v: &T) -> CallToolResult {
     text(serde_json::to_string_pretty(v).unwrap_or_default())
 }
 
+/// Whether a project name fits the limits: at most `MAX_PROJECT_NAME_CHARS` characters
+/// trimmed, and a slug of at most `MAX_PROJECT_SLUG_CHARS`.
+fn within_project_limits(name: &str) -> bool {
+    name.trim().chars().count() <= limits::MAX_PROJECT_NAME_CHARS
+        && alice_core::normalize::slugify(name).chars().count() <= limits::MAX_PROJECT_SLUG_CHARS
+}
+
 fn resource_err(e: AliceError) -> McpError {
     match e {
         AliceError::Invalid(m) => McpError::invalid_params(m, None),
@@ -373,12 +380,15 @@ impl AliceMcp {
     /// path means nothing (no git there), so `cwd` is none and the hint is the `?project=` of
     /// the MCP URL, else the name of the client's first root; the service slugifies it. Locally
     /// the hint stays empty and `cwd` is as `cwd` says.
+    ///
+    /// A `?project=` over the name or slug limit fails the call (the message names the limit,
+    /// never the value); a root basename over either is dropped, so the call falls to `global`.
     async fn hint_and_cwd(
         &self,
         ctx: &RequestContext<RoleServer>,
-    ) -> (Option<String>, Option<String>) {
+    ) -> Result<(Option<String>, Option<String>), McpError> {
         if !matches!(&self.backend, Backend::Local(s) if s.is_tenant()) {
-            return (None, self.cwd(ctx).await);
+            return Ok((None, self.cwd(ctx).await));
         }
         let queried = ctx
             .extensions
@@ -390,14 +400,28 @@ impl AliceMcp {
                     .map(|(_, v)| v.into_owned())
             });
         let hint = match queried {
-            Some(q) => Some(q),
-            None => self.first_root(ctx).await.and_then(|root| {
-                std::path::Path::new(&root)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-            }),
+            Some(q) if within_project_limits(&q) => Some(q),
+            Some(_) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "the project name in ?project= is too long: at most {} characters, and its slug at most {}",
+                        limits::MAX_PROJECT_NAME_CHARS,
+                        limits::MAX_PROJECT_SLUG_CHARS
+                    ),
+                    None,
+                ));
+            }
+            None => self
+                .first_root(ctx)
+                .await
+                .and_then(|root| {
+                    std::path::Path::new(&root)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                })
+                .filter(|n| within_project_limits(n)),
         };
-        (hint, None)
+        Ok((hint, None))
     }
 
     /// The client's first root as a local directory, asked once per connection and again after
@@ -442,7 +466,12 @@ impl AliceMcp {
         request: CallToolRequestParams,
         ctx: &RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let (project_hint, cwd) = self.hint_and_cwd(ctx).await;
+        let (project_hint, cwd) = match self.hint_and_cwd(ctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                return CallToolResult::error(vec![ContentBlock::text(e.message.to_string())]);
+            }
+        };
         let call = CompatCall {
             tool: request.name.to_string(),
             arguments: serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -479,7 +508,7 @@ impl AliceMcp {
         Parameters(mut req): Parameters<RecallRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await;
+        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await?;
         let format = req.format;
         Ok(match self.backend.recall(req).await {
             Ok(r) if format == OutputFormat::Json => json(&r),
@@ -496,7 +525,7 @@ impl AliceMcp {
         Parameters(mut req): Parameters<RememberRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await;
+        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await?;
         if req.author.agent.is_none() {
             req.author.agent = Self::agent(&ctx);
         }
@@ -522,7 +551,7 @@ impl AliceMcp {
         Parameters(mut req): Parameters<ContextRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await;
+        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await?;
         Ok(match self.backend.context(req).await {
             Ok(r) => text(r.text),
             Err(e) => tool_err(e),
@@ -820,7 +849,7 @@ impl ServerHandler for AliceMcp {
     ) -> Result<ReadResourceResponse, McpError> {
         let uri = request.uri.clone();
         let body = if uri == "memory://context" {
-            let (project_hint, cwd) = self.hint_and_cwd(&ctx).await;
+            let (project_hint, cwd) = self.hint_and_cwd(&ctx).await?;
             let r = self
                 .backend
                 .context(ContextRequest {

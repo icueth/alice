@@ -88,9 +88,9 @@ pub struct CompatCall {
     /// The calling agent's name.
     #[serde(default)]
     pub agent: Option<String>,
-    /// A project name from a direct MCP caller (tenant mode only); set in-process, never on
-    /// the wire.
-    #[serde(skip)]
+    /// A project name from a direct MCP caller (tenant mode only); set in-process, and cleared
+    /// by the HTTP API on entry so it never comes from the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_hint: Option<String>,
 }
 

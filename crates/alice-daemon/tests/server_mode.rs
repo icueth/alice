@@ -269,6 +269,103 @@ async fn mcp_stores_a_secret_redacted() {
     assert!(!tree_contains(t.home.root(), &secret[4..]));
 }
 
+/// A hint can never come from the wire: a `project_hint` in a JSON body is ignored, so the
+/// memory lands in `global` and no project of that name exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_http_api_ignores_a_project_hint_in_the_body() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/remember", s.url("ann")))
+        .bearer_auth(&t.token)
+        .json(&serde_json::json!({
+            "content": "A note whose body tries to name its project",
+            "project_hint": "sneaky"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let rows = stored(&t.home);
+    assert_eq!(rows, vec![("global".to_string(), None)]);
+}
+
+/// The outcome of a tool call that may fail either as an MCP error or as an error result:
+/// `Err(message)` for a failure, `Ok(text)` otherwise.
+async fn try_tool(c: &Conn, name: &'static str, args: serde_json::Value) -> Result<String, String> {
+    let a = args.as_object().unwrap().clone();
+    match c
+        .call_tool(CallToolRequestParams::new(name).with_arguments(a))
+        .await
+    {
+        Ok(r) if r.is_error == Some(true) => Err(text(&r)),
+        Ok(r) => Ok(text(&r)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_query_over_the_limits_is_refused_and_nothing_is_stored() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let base = s.url("ann");
+    let long = "q".repeat(101);
+    let c = connect(&format!("{base}/mcp?project={long}"), Some(&t.token), None)
+        .await
+        .unwrap();
+    for name in ["remember", "recall", "context"] {
+        let args = match name {
+            "remember" => serde_json::json!({"content": "too long a project name"}),
+            "recall" => serde_json::json!({"query": "anything at all"}),
+            _ => serde_json::json!({}),
+        };
+        let e = try_tool(&c, name, args).await.unwrap_err();
+        assert!(e.contains("100") || e.contains("200"), "{name}: {e}");
+        assert!(!e.contains(&long), "{name} echoed the value: {e}");
+    }
+    c.cancel().await.ok();
+    assert!(stored(&t.home).is_empty());
+    // Exactly at the limit works.
+    let ok = "r".repeat(100);
+    let c = connect(&format!("{base}/mcp?project={ok}"), Some(&t.token), None)
+        .await
+        .unwrap();
+    let out = try_tool(
+        &c,
+        "remember",
+        serde_json::json!({"content": "a name at the limit"}),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains(&ok), "{out}");
+    c.cancel().await.ok();
+    assert_eq!(stored(&t.home), vec![(ok, None)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_root_basename_over_the_limits_is_dropped_not_an_error() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let root = format!("/srv/clientside/work/{}", "d".repeat(150));
+    let c = connect(
+        &format!("{}/mcp", s.url("ann")),
+        Some(&t.token),
+        Some(Path::new(&root)),
+    )
+    .await
+    .unwrap();
+    let out = try_tool(
+        &c,
+        "remember",
+        serde_json::json!({"content": "a root with a very long name"}),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("global"), "{out}");
+    c.cancel().await.ok();
+    assert_eq!(stored(&t.home), vec![("global".to_string(), None)]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn streams_pass_the_emulator_unbuffered() {
     let s = Server::start(&["ann"]).await;

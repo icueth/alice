@@ -90,8 +90,9 @@ pub struct RecallRequest {
     #[schemars(skip)]
     pub client_project: Option<ClientProject>,
     /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
-    /// by the MCP handlers; never on the wire.
-    #[serde(skip)]
+    /// by the MCP handlers; the HTTP API clears it on entry, so it never comes from the wire.
+    /// It is serialised so that a spooled request keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub project_hint: Option<String>,
 }
@@ -191,7 +192,10 @@ impl ClientProject {
         if self.slug.is_empty() || crate::normalize::slugify(&self.slug) != self.slug {
             return bad("slug must be a non-empty slug (lower case, digits and -)");
         }
-        if self.name.chars().count() > 200 {
+        if self.slug.chars().count() > crate::model::limits::MAX_PROJECT_SLUG_CHARS {
+            return bad("slug must be at most 100 characters");
+        }
+        if self.name.chars().count() > crate::model::limits::MAX_PROJECT_NAME_CHARS {
             return bad("name must be at most 200 characters");
         }
         if self.remote.as_ref().is_some_and(|r| r.len() > 1024) {
@@ -240,8 +244,9 @@ pub struct RememberRequest {
     #[schemars(skip)]
     pub client_project: Option<ClientProject>,
     /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
-    /// by the MCP handlers; never on the wire.
-    #[serde(skip)]
+    /// by the MCP handlers; the HTTP API clears it on entry, so it never comes from the wire.
+    /// It is serialised so that a spooled request keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub project_hint: Option<String>,
     #[serde(default)]
@@ -284,8 +289,9 @@ pub struct ContextRequest {
     #[schemars(skip)]
     pub client_project: Option<ClientProject>,
     /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
-    /// by the MCP handlers; never on the wire.
-    #[serde(skip)]
+    /// by the MCP handlers; the HTTP API clears it on entry, so it never comes from the wire.
+    /// It is serialised so that a spooled request keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub project_hint: Option<String>,
 }
@@ -473,8 +479,9 @@ pub struct IngestRequest {
     #[schemars(skip)]
     pub client_project: Option<ClientProject>,
     /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
-    /// by the MCP handlers; never on the wire.
-    #[serde(skip)]
+    /// by the MCP handlers; the HTTP API clears it on entry, so it never comes from the wire.
+    /// It is serialised so that a spooled request keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub project_hint: Option<String>,
 }
@@ -762,6 +769,11 @@ mod tests {
         let mut p = cp("k", "b");
         p.name = "n".repeat(201);
         assert!(p.validate().is_err(), "long name");
+        let slug100 = "s".repeat(100);
+        assert!(cp("k", &slug100).validate().is_ok(), "a 100-character slug");
+        let slug101 = "s".repeat(101);
+        let e = cp("k", &slug101).validate().unwrap_err().to_string();
+        assert!(!e.contains(&slug101), "echoed: {e}");
         let mut p = cp("k", "b");
         p.remote = Some("r".repeat(1025));
         assert!(p.validate().is_err(), "long remote");
