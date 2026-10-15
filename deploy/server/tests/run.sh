@@ -21,6 +21,8 @@ printf 'ALICE_PUBLIC_HOST=203.0.113.7\n' >"$R/etc/alice/server.env"
 : >"$R/users"
 : >"$R/listening"
 : >"$R/calls.log"
+mkdir -p "$R/proc"
+printf 'processor\t: 0\nflags\t\t: fpu vme sse4_2 avx avx2 bmi2 avx512f\n' >"$R/proc/cpuinfo"
 
 stub() { # name ; body on stdin
   { printf '#!/bin/bash\n'; cat; } >"$S/$1"
@@ -369,14 +371,14 @@ import_refuses_a_tenant_home() {
   [ "$RC" != 0 ] || fail "imported a tenant home"
   run import ann "$SRV/ann/import-inbox/.."
   [ "$RC" != 0 ] || fail "imported a tenant home through .."
-  mkdir -p "$SRV/bob"; echo db >"$SRV/bob/chroma.sqlite3"; echo x >"$SRV/bob/marker"
+  mkdir -p "$SRV/bob"; echo db >"$SRV/bob/chroma.sqlite3"; echo x >"$SRV/bob/marker"   # bob is a real tenant: keep its home
   run import ann "$SRV/bob"
   [ "$RC" != 0 ] || fail "imported another tenant's home"
   [ -f "$SRV/ann/marker" ] && [ -f "$SRV/bob/marker" ] || fail "a home was moved or deleted"
   run import ann "$SRV"
   [ "$RC" != 0 ] || fail "imported the whole srv"
   rm -f -- "${SRV:?}/ann/chroma.sqlite3" "${SRV:?}/ann/marker"
-  rm -rf -- "${SRV:?}/bob"
+  rm -f -- "${SRV:?}/bob/chroma.sqlite3" "${SRV:?}/bob/marker"
   pass
 }
 
@@ -446,6 +448,163 @@ remove_archives_then_deletes() {
   pass
 }
 
+is_0600() { [ -n "$(find "$1" -maxdepth 0 -perm 600)" ]; }
+team_port() { sed -n 's/^ALICE_SERVER_PORT=//p' "$TENANTS/team.env"; }
+PERSONAL="ann bob dave"
+
+add_refuses_a_cpu_without_avx2() {
+  local before
+  cp "$R/proc/cpuinfo" "$T/cpuinfo.good"
+  # avx is present, avx2 is not (avx512f must not count as either)
+  printf 'processor\t: 0\nflags\t\t: fpu sse4_2 avx avx512f\n' >"$R/proc/cpuinfo"
+  before=$(wc -l <"$R/calls.log")
+  run add zoe
+  cp "$T/cpuinfo.good" "$R/proc/cpuinfo"
+  [ "$RC" != 0 ] || fail "add succeeded on a CPU without AVX2"
+  printf '%s\n' "$OUT" | grep -qF "this CPU lacks AVX/AVX2, which Alice's embedding runtime needs (it would die with 'Illegal instruction'); on Proxmox set the VM's CPU type to host (or x86-64-v3), then shut the VM down and start it again (a reboot from inside the guest does not apply a CPU type change)" || fail "no CPU message: $OUT"
+  [ "$(wc -l <"$R/calls.log")" = "$before" ] || fail "a command ran before the CPU refusal"
+  [ ! -e "$TENANTS/zoe.env" ] || fail "a tenant was created"
+  pass
+}
+
+upgrade_refuses_a_cpu_without_avx2() {
+  local before
+  cp "$R/proc/cpuinfo" "$T/cpuinfo.good"
+  printf 'processor\t: 0\nflags\t\t: fpu sse4_2 avx2\n' >"$R/proc/cpuinfo"   # avx2 without avx still refuses
+  cp -p "$R/usr/local/bin/alice" "$T/alice.saved"
+  before=$(wc -l <"$R/calls.log")
+  run upgrade "$R/new-alice"
+  cp "$T/cpuinfo.good" "$R/proc/cpuinfo"
+  [ "$RC" != 0 ] || fail "upgrade succeeded on a CPU without AVX"
+  printf '%s\n' "$OUT" | grep -qF 'this CPU lacks AVX/AVX2' || fail "no CPU message: $OUT"
+  [ "$(wc -l <"$R/calls.log")" = "$before" ] || fail "a command ran before the CPU refusal"
+  cmp "$T/alice.saved" "$R/usr/local/bin/alice" || fail "the binary changed"
+  pass
+}
+
+add_team_writes_no_snippet() {
+  run add --team bob
+  [ "$RC" != 0 ] || fail "--team with another name succeeded"
+  run add team
+  [ "$RC" != 0 ] || fail "a plain add of the name team succeeded"
+  [ ! -e "$TENANTS/team.env" ] || fail "team.env created by a refused add"
+  run add --team team
+  [ "$RC" = 0 ] || fail "add --team exited $RC: $OUT"
+  [ ! -e "$R/etc/caddy/alice.d/team.caddy" ] || fail "the team store got a Caddy snippet"
+  has "$TENANTS/team.env" 'ALICE_DAEMON_ARGS=--team-store'
+  hasnt "$TENANTS/team.env" 'ALICE_TENANT_NAME'
+  hasnt "$TENANTS/team.env" 'ALICE_TEAM_URL'
+  # shellcheck disable=SC2016  # the literal text $ALICE_DAEMON_ARGS is what the unit must hold
+  has "$R/etc/systemd/system/alice@.service" 'ExecStart=/usr/local/bin/alice daemon run --tenant $ALICE_DAEMON_ARGS'
+  hasnt "$TENANTS/bob.env" 'ALICE_DAEMON_ARGS'
+  printf '%s\n' "$OUT" | grep -q 'https\?://' && fail "the team output prints a URL: $OUT"
+  [ "$(count_in 'tok-team-0123456789abcdef0123456789abcdef')" = 1 ] || fail "team token not printed exactly once: $OUT"
+  pass
+}
+
+add_team_provisions_existing_tenants() {
+  local n tp
+  tp=$(team_port)
+  [ -n "$tp" ] || fail "no team port"
+  for n in $PERSONAL; do
+    has "$TENANTS/$n.env" "ALICE_TEAM_URL=http://127.0.0.1:$tp"
+    has "$TENANTS/$n.env" "ALICE_TENANT_NAME=$n"
+    is_0600 "$SRV/$n/team.token" || fail "$n team.token is not mode 0600"
+    cmp "$SRV/team/token" "$SRV/$n/team.token" || fail "$n team.token differs from the team token"
+    grep -qE "chown alice-$n:alice-$n .*$n/team.token" "$R/calls.log" || fail "no chown of $n team.token"
+    has "$R/calls.log" "systemctl restart alice@$n"
+  done
+  # idempotent: again, with an old tenant file that lacks ALICE_TENANT_NAME
+  grep -v '^ALICE_TENANT_NAME=' "$TENANTS/dave.env" >"$T/dave.env" && cp "$T/dave.env" "$TENANTS/dave.env"
+  run add --team team
+  [ "$RC" = 0 ] || fail "second add --team exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -q 'tok-' && fail "second add --team printed a token"
+  for n in $PERSONAL; do
+    [ "$(grep -c '^ALICE_TEAM_URL=' "$TENANTS/$n.env")" = 1 ] || fail "$n has not exactly one ALICE_TEAM_URL"
+    [ "$(grep -c '^ALICE_TENANT_NAME=' "$TENANTS/$n.env")" = 1 ] || fail "$n has not exactly one ALICE_TENANT_NAME"
+  done
+  hasnt "$TENANTS/team.env" 'ALICE_TEAM_URL'
+  pass
+}
+
+add_person_after_team_is_provisioned() {
+  local tp l_chown l_start
+  tp=$(team_port)
+  run add hal
+  [ "$RC" = 0 ] || fail "add hal exited $RC: $OUT"
+  has "$TENANTS/hal.env" "ALICE_TEAM_URL=http://127.0.0.1:$tp"
+  has "$TENANTS/hal.env" 'ALICE_TENANT_NAME=hal'
+  is_0600 "$SRV/hal/team.token" || fail "hal team.token is not mode 0600"
+  cmp "$SRV/team/token" "$SRV/hal/team.token" || fail "hal team.token differs"
+  l_chown=$(grep -nE 'chown alice-hal:alice-hal .*hal/team.token' "$R/calls.log" | head -n 1 | cut -d: -f1)
+  l_start=$(grep -n 'systemctl enable --now alice@hal' "$R/calls.log" | head -n 1 | cut -d: -f1)
+  [ -n "$l_chown" ] && [ -n "$l_start" ] && [ "$l_chown" -lt "$l_start" ] || fail "team.token not in place before the first start ($l_chown, $l_start)"
+  PERSONAL="ann bob dave hal"
+  pass
+}
+
+rotate_team_rewrites_every_copy() {
+  local n before after
+  before=$(grep -c 'systemctl restart' "$R/calls.log" || true)
+  run rotate team
+  [ "$RC" = 0 ] || fail "rotate team exited $RC: $OUT"
+  [ "$(count_in 'tok-rot2-')" = 1 ] || fail "new team token not printed once: $OUT"
+  has "$SRV/team/token" 'tok-rot2-'
+  for n in $PERSONAL; do
+    cmp "$SRV/team/token" "$SRV/$n/team.token" || fail "$n team.token was not rewritten"
+    is_0600 "$SRV/$n/team.token" || fail "$n team.token is not mode 0600"
+  done
+  after=$(grep -c 'systemctl restart' "$R/calls.log" || true)
+  [ "$before" = "$after" ] || fail "rotate team restarted a daemon"
+  pass
+}
+
+team_token_never_in_env_files() {
+  local tok leaked
+  tok=$(head -n 1 "$SRV/team/token")
+  if grep -rqF -- "$tok" "$R/etc"; then fail "the team token is under etc"; fi
+  leaked=$(grep -rlF -- "$tok" "$R" | grep -v -F -- "$SRV/" || true)
+  [ -z "$leaked" ] || fail "the team token is outside the tenant homes: $leaked"
+  pass
+}
+
+list_marks_the_team_store() {
+  run list
+  [ "$RC" = 0 ] || fail "list exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -E '^team ' | grep -qF '(team, no URL)' || fail "team row not marked: $OUT"
+  printf '%s\n' "$OUT" | grep -E '^team ' | grep -qF 'https://' && fail "team row has a URL"
+  printf '%s\n' "$OUT" | grep -E '^hal ' | grep -qF 'https://203.0.113.7/u/hal' || fail "hal row missing"
+  pass
+}
+
+remove_person_deletes_the_team_copy() {
+  local archive
+  run remove hal --yes
+  [ "$RC" = 0 ] || fail "remove hal exited $RC: $OUT"
+  [ ! -e "$SRV/hal" ] || fail "hal home left behind"
+  archive=$(find "$SRV/backups" -name 'hal-*.tar.gz' | head -n 1)
+  if tar -tzf "$archive" | grep -q 'team.token'; then fail "the archive holds a team.token"; fi
+  PERSONAL="ann bob dave"
+  pass
+}
+
+remove_team_unprovisions() {
+  local n before after
+  before=$(grep -c 'systemctl restart' "$R/calls.log" || true)
+  run remove team --yes
+  [ "$RC" = 0 ] || fail "remove team exited $RC: $OUT"
+  [ ! -e "$TENANTS/team.env" ] || fail "team.env left behind"
+  [ ! -e "$SRV/team" ] || fail "team home left behind"
+  for n in $PERSONAL; do
+    hasnt "$TENANTS/$n.env" 'ALICE_TEAM_URL'
+    has "$TENANTS/$n.env" "ALICE_TENANT_NAME=$n"
+    [ ! -e "$SRV/$n/team.token" ] || fail "$n team.token left behind"
+  done
+  after=$(grep -c 'systemctl restart' "$R/calls.log" || true)
+  [ "$((after - before))" = 3 ] || fail "expected 3 restarts, saw $((after - before))"
+  pass
+}
+
 for CURRENT in \
   add_creates_everything add_is_idempotent ports_skip_used bad_names_are_refused \
   caddy_failure_rolls_back snippet_routes_mcp add_prints_the_mcp_url rotate_prints_a_new_token \
@@ -454,6 +613,10 @@ for CURRENT in \
   import_refuses_a_tenant_home import_refuses_root_and_system_dirs import_refuses_a_non_palace \
   add_restores_the_caddyfile_when_validation_fails add_reloads_after_removing_the_snippet test_hooks_are_ignored_without_a_test_root cli_runs_as_the_tenant \
   cli_refuses_a_secret_in_argv upgrade_rolls_back_on_a_failed_ping upgrade_installs_and_keeps_prev \
+  add_refuses_a_cpu_without_avx2 upgrade_refuses_a_cpu_without_avx2 \
+  add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \
+  rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store \
+  remove_person_deletes_the_team_copy remove_team_unprovisions \
   refuses_to_run_with_empty_roots remove_archives_then_deletes; do
   "$CURRENT"
 done

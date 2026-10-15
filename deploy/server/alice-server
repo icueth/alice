@@ -39,6 +39,8 @@ say() { printf '%s\n' "$*"; }
 usage() {
   cat <<'EOF'
 usage: alice-server add <name>
+       alice-server add --team team
+           (the shared team store: a daemon with no URL; every personal tenant is linked to it)
        alice-server remove <name> [--yes]
        alice-server rotate <name>
        alice-server list
@@ -52,6 +54,10 @@ valid_name() {
   [[ "$1" =~ $NAME_RE ]] || die "\"$1\" is not a tenant name: lower-case letters, digits and -, starting with a letter, at most 16 characters"
 }
 tenant_exists() { [ -f "$TENANTS/$1.env" ]; }
+# The team store is the tenant named team whose file carries ALICE_DAEMON_ARGS=--team-store.
+TEAM=team
+is_team() { grep -qx 'ALICE_DAEMON_ARGS=--team-store' "$TENANTS/$1.env" 2>/dev/null; }
+team_exists() { tenant_exists "$TEAM" && is_team "$TEAM"; }
 need_tenant() { tenant_exists "$1" || die "no tenant named $1 (alice-server list shows the tenants)"; }
 
 public_host() { # from /etc/alice/server.env
@@ -67,6 +73,18 @@ port_of() { sed -n 's/^ALICE_SERVER_PORT=//p' "$TENANTS/$1.env"; }
 put() { # path mode ; the content comes on stdin. Written through a temporary file, so a reader never sees half of it.
   local tmp="$1.tmp.$$"
   cat >"${tmp:?}" && chmod -- "$2" "${tmp:?}" && mv -- "${tmp:?}" "${1:?}"
+}
+
+# Refuses a CPU without AVX and AVX2: the prebuilt ONNX Runtime in the binary dies with "Illegal instruction" there.
+# Reads $R/proc/cpuinfo (the real /proc/cpuinfo on the server); both flags must be whole words on a flags line.
+need_avx() {
+  local flags
+  flags=$(grep -E '^flags[[:space:]]*:' "$R/proc/cpuinfo" 2>/dev/null | head -n 1 || true)
+  if printf '%s\n' "$flags" | grep -Eq '(^|[[:space:]])avx([[:space:]]|$)' \
+    && printf '%s\n' "$flags" | grep -Eq '(^|[[:space:]])avx2([[:space:]]|$)'; then
+    return 0
+  fi
+  die "this CPU lacks AVX/AVX2, which Alice's embedding runtime needs (it would die with 'Illegal instruction'); on Proxmox set the VM's CPU type to host (or x86-64-v3), then shut the VM down and start it again (a reboot from inside the guest does not apply a CPU type change)"
 }
 
 free_port() {
@@ -90,6 +108,8 @@ wait_ping() { # port seconds
   done
 }
 
+# One template unit serves every tenant. The team store differs only by ALICE_DAEMON_ARGS=--team-store in its own
+# tenant file, which ExecStart expands (systemd splits $ALICE_DAEMON_ARGS into words; unset, it expands to nothing).
 write_unit() {
   put "$UNIT" 0644 <<EOF
 [Unit]
@@ -102,7 +122,7 @@ Type=simple
 User=alice-%i
 Group=alice-%i
 EnvironmentFile=/etc/alice/tenants/%i.env
-ExecStart=/usr/local/bin/alice daemon run --tenant
+ExecStart=/usr/local/bin/alice daemon run --tenant \$ALICE_DAEMON_ARGS
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
@@ -214,6 +234,78 @@ as_tenant() { # name args...
   sudo -u "alice-$name" env ALICE_HOME="$SRV/$name" ALICE_NO_AUTOSTART=1 "$BIN" "$@"
 }
 
+# --- team federation (spec 2.10) ---------------------------------------------------------------------------------
+personal_tenants() { # names of the tenants that are not the team store, one per line
+  local f n
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    n=$(basename "$f" .env)
+    if ! is_team "$n"; then printf '%s\n' "$n"; fi
+  done
+}
+set_env_line() { # name KEY VALUE: replace or append one line of a tenant file (never a secret: the file is 0644)
+  local f="$TENANTS/$1.env"
+  { grep -v "^$2=" "$f" || true; printf '%s=%s\n' "$2" "$3"; } | put "$f" 0644
+}
+drop_env_line() { # name KEY
+  local f="$TENANTS/$1.env"
+  { grep -v "^$2=" "$f" || true; } | put "$f" 0644
+}
+write_team_token() { # name token: <home>/team.token, 0600, the tenant's own, through a temporary file
+  local tmp="$SRV/$1/team.token.tmp.$$"
+  { ( umask 077; printf '%s\n' "$2" >"${tmp:?}" ) \
+    && chown "alice-$1:alice-$1" -- "${tmp:?}" \
+    && chmod -- 0600 "${tmp:?}" \
+    && mv -- "${tmp:?}" "${SRV:?}/${1:?}/team.token"; } || { rm -f -- "${tmp:?}"; return 1; }
+}
+team_token() {
+  [ -s "$SRV/$TEAM/token" ] || die "the team store has no token yet"
+  head -n 1 "$SRV/$TEAM/token"
+}
+provision_files() { # name: the env lines and the token copy; no restart
+  local tp
+  tp=$(port_of "$TEAM")
+  set_env_line "$1" ALICE_TENANT_NAME "$1" || return 1
+  set_env_line "$1" ALICE_TEAM_URL "http://127.0.0.1:$tp" || return 1
+  write_team_token "$1" "$(team_token)"
+}
+restart_one() { # name: restart and wait for the ping; true on success
+  systemctl restart "alice@$1" && wait_ping "$(port_of "$1")" "$PING_UPGRADE"
+}
+# Links every personal tenant to the team store and restarts it (the link is read at start). Idempotent.
+provision_all() {
+  local n failed=""
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if provision_files "$n" && restart_one "$n"; then say "linked $n to the team store"; else failed="$failed $n"; fi
+  done <<EOF
+$(personal_tenants)
+EOF
+  if [ -n "$failed" ]; then
+    printf 'alice-server: WARNING: these tenants were not linked or did not come back:%s; run alice-server add --team team again\n' "$failed" >&2
+    return 1
+  fi
+}
+unprovision_all() {
+  local n failed=""
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if drop_env_line "$n" ALICE_TEAM_URL && rm -f -- "${SRV:?}/${n:?}/team.token" && restart_one "$n"; then
+      say "unlinked $n from the team store"
+    else
+      failed="$failed $n"
+    fi
+  done <<EOF
+$(personal_tenants)
+EOF
+  [ -z "$failed" ] || printf 'alice-server: WARNING: these tenants did not come back after the unlink:%s\n' "$failed" >&2
+}
+
+tenant_env_text() { # name port team(0|1)
+  printf 'ALICE_HOME=%s/%s\nALICE_SERVER_PORT=%s\nALICE_LOG=info\nALICE_BACKUP_DAILY=2\nALICE_BACKUP_WEEKLY=0\n' "$REAL_SRV" "$1" "$2"
+  if [ "$3" = 1 ]; then printf 'ALICE_DAEMON_ARGS=--team-store\n'; else printf 'ALICE_TENANT_NAME=%s\n' "$1"; fi
+}
+
 rollback_add() { # name: undo what add created, in reverse order
   local n=$1
   if [ "$A_SNIP" = 1 ]; then rm -f -- "${CADDY_D:?}/${n:?}.caddy"; fi
@@ -227,11 +319,16 @@ rollback_add() { # name: undo what add created, in reverse order
 }
 add_fail() { rollback_add "$1"; die "$2 - undone, nothing is left of $1"; }
 
-cmd_add() {
-  local name=$1 home="$SRV/$1" port token
+cmd_add() { # name [team: 1 for the team store]
+  local name=$1 team=${2:-0} home="$SRV/$1" port token
   need_host
   ensure_base
   if tenant_exists "$name"; then
+    if [ "$team" = 1 ]; then
+      say "the team store exists (alice-server rotate $name gives a new token); linking the personal tenants again"
+      provision_all || return 1
+      return 0
+    fi
     say "$name exists: $(url "$name")"
     say "(alice-server rotate $name gives a new token.)"
     return 0
@@ -248,22 +345,28 @@ cmd_add() {
   { mkdir -p "$home" && chmod -- 0700 "$home" && chown "alice-$name:alice-$name" -- "$home"; } \
     || add_fail "$name" "could not create the home"
   A_ENV=1
-  put "$TENANTS/$name.env" 0644 <<EOF || add_fail "$name" "could not write the tenant file"
-ALICE_HOME=$REAL_SRV/$name
-ALICE_SERVER_PORT=$port
-ALICE_LOG=info
-ALICE_BACKUP_DAILY=2
-ALICE_BACKUP_WEEKLY=0
-EOF
+  tenant_env_text "$name" "$port" "$team" | put "$TENANTS/$name.env" 0644 || add_fail "$name" "could not write the tenant file"
+  if [ "$team" = 0 ] && team_exists; then # linked before the first start, so the daemon starts with the link
+    provision_files "$name" || add_fail "$name" "could not link the tenant to the team store"
+  fi
   A_UNIT=1
   systemctl enable --now "alice@$name" || add_fail "$name" "could not start alice@$name"
   wait_ping "$port" "$PING_ADD" || add_fail "$name" "alice@$name did not answer a ping in $PING_ADD s (journalctl -u alice@$name)"
-  A_SNIP=1
-  { write_snippet "$name" "$port" && reload_caddy; } || add_fail "$name" "Caddy refused the new route"
-  A_RELOADED=1
+  if [ "$team" = 0 ]; then # the team store has no route: only the other daemons reach it, on localhost
+    A_SNIP=1
+    { write_snippet "$name" "$port" && reload_caddy; } || add_fail "$name" "Caddy refused the new route"
+    A_RELOADED=1
+  fi
   [ -s "$home/token" ] || add_fail "$name" "the daemon wrote no token"
   token=$(head -n 1 "$home/token")
 
+  if [ "$team" = 1 ]; then
+    say "Created the team store."
+    say "Token (shown once; the personal tenants get their copy now, and alice-server rotate $name gives a new one):"
+    say "  $token"
+    provision_all || return 1
+    return 0
+  fi
   say "Created tenant $name."
   say "URL:    $(url "$name")"
   say "MCP:    $(url "$name")/mcp"
@@ -276,15 +379,17 @@ EOF
 }
 
 cmd_remove() { # name [--yes]
-  local name=$1 flag=${2:-} home="$SRV/$1" ans="" archive
+  local name=$1 flag=${2:-} home="$SRV/$1" ans="" archive was_team=0
   case "$flag" in ""|--yes) ;; *) usage >&2; exit 2 ;; esac
   need_tenant "$name"
+  if is_team "$name"; then was_team=1; fi
   if [ "$flag" != --yes ]; then
     printf 'Remove %s? Its home is archived in %s first, then deleted. [y/N] ' "$name" "$ARCHIVES" >&2
     read -r ans || ans=""
     case "$ans" in y|Y|yes|YES) ;; *) die "cancelled; nothing was removed" ;; esac
   fi
   systemctl disable --now "alice@$name" || true
+  rm -f -- "${SRV:?}/${name:?}/team.token"      # the archive never holds the copy of the team token
   rm -f -- "${CADDY_D:?}/${name:?}.caddy"
   reload_caddy || die "Caddy did not accept the config without $name; fix it, then run remove again"
   mkdir -p "$ARCHIVES"; chmod 0700 "$ARCHIVES"
@@ -298,6 +403,7 @@ cmd_remove() { # name [--yes]
   rm -rf -- "${home:?}"
   rm -f -- "${TENANTS:?}/${name:?}.env"
   say "Removed tenant $name."
+  if [ "$was_team" = 1 ]; then unprovision_all; fi
 }
 
 cmd_rotate() {
@@ -308,11 +414,22 @@ cmd_rotate() {
   [ -n "$token" ] || die "alice printed no token"
   say "New token for $name (shown once; the old one no longer works):"
   say "  $token"
-  say "  alice remote set $(url "$name")   (paste the token when asked)"
+  if is_team "$name"; then
+    local n
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      write_team_token "$n" "$token" || die "could not rewrite the team token for $n; run alice-server rotate $name again"
+    done <<EOF
+$(personal_tenants)
+EOF
+    say "  (every tenant's copy was rewritten; no restart is needed)"
+  else
+    say "  alice remote set $(url "$name")   (paste the token when asked)"
+  fi
 }
 
 cmd_list() {
-  local f n port state version size kb free_k fs archive_kb
+  local f n port state version size kb free_k fs archive_kb link
   need_host
   mkdir -p "$SRV"
   printf '%-16s %-6s %-10s %-10s %-8s %s\n' name port state version size url
@@ -327,7 +444,8 @@ cmd_list() {
     [ -n "$version" ] || version=-
     kb=$(du -sk "$SRV/$n" 2>/dev/null | cut -f1 || true)
     size=$(awk -v k="${kb:-0}" 'BEGIN { printf "%.0f MB", k / 1024 }')
-    printf '%-16s %-6s %-10s %-10s %-8s %s\n' "$n" "$port" "$state" "$version" "$size" "$(url "$n")"
+    if is_team "$n"; then link="(team, no URL)"; else link=$(url "$n"); fi
+    printf '%-16s %-6s %-10s %-10s %-8s %s\n' "$n" "$port" "$state" "$version" "$size" "$link"
   done
   free_k=$(free_kb)
   fs=$(df -Pk "$SRV" | awk 'NR==2 {print $6}')
@@ -355,6 +473,7 @@ restart_all() { # progress goes to stderr; the failed tenants, space separated, 
 
 cmd_upgrade() { # binary
   local new=$1 failed
+  need_avx
   [ -f "$new" ] && [ -x "$new" ] || die "$new is not an executable file"
   "$new" --version >/dev/null 2>&1 || die "$new --version failed; the new binary was not installed"
   [ -f "$BIN" ] || die "$BIN is not installed; copy the binary there once by hand"
@@ -440,10 +559,24 @@ take_lock() {
   flock -n 9 || die "another alice-server is running"
 }
 
+main_add() { # add <name> | add --team team
+  local team=0 name
+  shift
+  if [ "${1:-}" = --team ]; then team=1; shift; fi
+  [[ $# -eq 1 ]] || { usage; exit 2; }
+  name=$1
+  valid_name "$name"
+  if [ "$team" = 1 ] && [ "$name" != "$TEAM" ]; then die "the team store is named $TEAM: alice-server add --team $TEAM"; fi
+  if [ "$team" = 0 ] && [ "$name" = "$TEAM" ]; then die "$TEAM is the shared team store: run alice-server add --team $TEAM"; fi
+  need_avx
+  take_lock
+  cmd_add "$name" "$team"
+}
+
 main() {
   [[ $# -ge 1 ]] || { usage; exit 2; }
   case "$1" in
-    add) [[ $# -eq 2 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_add "$2" ;;
+    add) main_add "$@" ;;
     remove) [[ $# -ge 2 && $# -le 3 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_remove "$2" "${3:-}" ;;
     rotate) [[ $# -eq 2 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_rotate "$2" ;;
     list) cmd_list ;;
