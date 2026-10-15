@@ -253,6 +253,7 @@ drop_env_line() { # name KEY
 }
 write_team_token() { # name token: <home>/team.token, 0600, the tenant's own, through a temporary file
   local tmp="$SRV/$1/team.token.tmp.$$"
+  [ -n "$2" ] || { printf 'alice-server: refusing to write an empty team.token for %s\n' "$1" >&2; return 1; }
   { ( umask 077; printf '%s\n' "$2" >"${tmp:?}" ) \
     && chown "alice-$1:alice-$1" -- "${tmp:?}" \
     && chmod -- 0600 "${tmp:?}" \
@@ -263,11 +264,13 @@ team_token() {
   head -n 1 "$SRV/$TEAM/token"
 }
 provision_files() { # name: the env lines and the token copy; no restart
-  local tp
+  local tp tok
   tp=$(port_of "$TEAM")
   set_env_line "$1" ALICE_TENANT_NAME "$1" || return 1
   set_env_line "$1" ALICE_TEAM_URL "http://127.0.0.1:$tp" || return 1
-  write_team_token "$1" "$(team_token)"
+  tok=$(team_token) || return 1
+  [ -n "$tok" ] || { printf 'alice-server: the team token is empty; %s was not linked\n' "$1" >&2; return 1; }
+  write_team_token "$1" "$tok"
 }
 restart_one() { # name: restart and wait for the ping; true on success
   systemctl restart "alice@$1" && wait_ping "$(port_of "$1")" "$PING_UPGRADE"

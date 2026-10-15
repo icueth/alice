@@ -605,6 +605,24 @@ remove_team_unprovisions() {
   pass
 }
 
+provision_refuses_a_missing_team_token() {
+  run add --team team
+  [ "$RC" = 0 ] || fail "add --team exited $RC: $OUT"
+  : >"$SRV/team/token"
+  run add ivy
+  [ "$RC" != 0 ] || fail "add ivy succeeded with an empty team token"
+  [ ! -e "$SRV/ivy" ] || fail "ivy was left behind"
+  [ ! -e "$TENANTS/ivy.env" ] || fail "ivy.env was left behind"
+  find "$SRV" -name 'team.token*' -size 0 | grep -q . && fail "an empty team.token exists"
+  rm -f -- "${SRV:?}/team/token"
+  run add ivy
+  [ "$RC" != 0 ] || fail "add ivy succeeded with no team token"
+  [ ! -e "$SRV/ivy" ] || fail "ivy was left behind (no token)"
+  run remove team --yes
+  [ "$RC" = 0 ] || fail "remove team exited $RC: $OUT"
+  pass
+}
+
 for CURRENT in \
   add_creates_everything add_is_idempotent ports_skip_used bad_names_are_refused \
   caddy_failure_rolls_back snippet_routes_mcp add_prints_the_mcp_url rotate_prints_a_new_token \
@@ -616,7 +634,7 @@ for CURRENT in \
   add_refuses_a_cpu_without_avx2 upgrade_refuses_a_cpu_without_avx2 \
   add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \
   rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store \
-  remove_person_deletes_the_team_copy remove_team_unprovisions \
+  remove_person_deletes_the_team_copy remove_team_unprovisions provision_refuses_a_missing_team_token \
   refuses_to_run_with_empty_roots remove_archives_then_deletes; do
   "$CURRENT"
 done
