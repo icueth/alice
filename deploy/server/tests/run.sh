@@ -139,7 +139,6 @@ add_creates_everything() {
   [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
   printf '%s\n' "$OUT" | grep -qF 'https://203.0.113.7/u/ann' || fail "no URL: $OUT"
   [ "$(count_in 'tok-ann-0123456789abcdef0123456789abcdef')" = 1 ] || fail "token not printed exactly once"
-  printf '%s\n' "$OUT" | grep -qF 'alice remote set https://203.0.113.7/u/ann' || fail "no remote set line"
   FIRST_TOKEN=$(cat "$SRV/ann/token")
   local e="$TENANTS/ann.env"
   has "$e" 'ALICE_SERVER_PORT=47801'
@@ -225,6 +224,31 @@ add_prints_the_mcp_url() {
   # shellcheck disable=SC2016  # the literal text ${ALICE_TOKEN} is what must be printed
   printf '%s\n' "$OUT" | grep -qF 'Authorization: Bearer ${ALICE_TOKEN}' || fail "no literal \${ALICE_TOKEN} example"
   [ "$(count_in 'tok-dave-')" = 1 ] || fail "token not printed once"
+  pass
+}
+
+add_prints_a_single_quoted_mcp_hint() {
+  run add gus
+  [ "$RC" = 0 ] || fail "add gus exited $RC: $OUT"
+  local hint
+  hint=$(printf '%s\n' "$OUT" | grep -F 'claude mcp add' || true)
+  [ -n "$hint" ] || fail "no claude mcp add line: $OUT"
+  # shellcheck disable=SC2016  # the literal text ${ALICE_TOKEN} is what must be printed
+  printf '%s\n' "$hint" | grep -qF "'Authorization: Bearer \${ALICE_TOKEN}'" || fail "hint lacks the single-quoted header: $hint"
+  printf '%s\n' "$hint" | grep -qF "'https://203.0.113.7/u/gus/mcp'" || fail "hint lacks the quoted URL: $hint"
+  printf '%s\n' "$hint" | grep -qF '"Authorization' && fail "double-quoted Authorization: $hint"
+  printf '%s\n' "$OUT" | grep -qF 'docs/server.md' || fail "no pointer to docs/server.md"
+  [ "$(count_in 'tok-gus-')" = 1 ] || fail "token not printed once"
+  pass
+}
+
+no_remote_set_line() {
+  run add ned
+  [ "$RC" = 0 ] || fail "add ned exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'alice remote set' && fail "add prints alice remote set: $OUT"
+  run rotate ned
+  [ "$RC" = 0 ] || fail "rotate ned exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'alice remote set' && fail "rotate prints alice remote set: $OUT"
   pass
 }
 
@@ -635,7 +659,8 @@ for CURRENT in \
   add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \
   rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store \
   remove_person_deletes_the_team_copy remove_team_unprovisions provision_refuses_a_missing_team_token \
-  refuses_to_run_with_empty_roots remove_archives_then_deletes; do
+  refuses_to_run_with_empty_roots remove_archives_then_deletes \
+  add_prints_a_single_quoted_mcp_hint no_remote_set_line; do
   "$CURRENT"
 done
 echo "all $COUNT scenarios passed"

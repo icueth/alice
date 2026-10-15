@@ -10,7 +10,7 @@ Placeholders used below: `<host>` is the server's public name or address, `<name
 - **One URL per person.** A person's endpoint is `https://<host>/u/<name>`. The MCP endpoint is `https://<host>/u/<name>/mcp`. Caddy terminates TLS and forwards each path to the right daemon on the loopback interface.
 - **Direct MCP is the way in.** The team connects an agent (Claude Code, Codex and others) straight to the MCP endpoint, with the token in an `Authorization: Bearer` header. No client binary is needed.
 - **Platforms.** The `alice` binary runs on macOS and Linux. On Windows, or anywhere the binary is not installed, connect an agent to the MCP endpoint. The server itself runs on Linux.
-- **A shared team memory** is optional. See [Shared team memory](#shared-team-memory).
+- **A shared team memory** is optional. See [Shared team memory (admin)](#shared-team-memory-admin) and [Shared team memory (person)](#shared-team-memory-person).
 
 ### Trust model
 
@@ -71,12 +71,13 @@ MCP:    https://<host>/u/<name>/mcp
 Token (shown once, hand it over now; alice-server rotate <name> gives a new one):
   <token>
 Claude Code, with the token in the environment variable ALICE_TOKEN:
-  claude mcp add --transport http alice-<name> https://<host>/u/<name>/mcp --header "Authorization: Bearer ${ALICE_TOKEN}"
+  claude mcp add --transport http alice 'https://<host>/u/<name>/mcp' --header 'Authorization: Bearer ${ALICE_TOKEN}'
+The .mcp.json form is in docs/server.md.
 ```
 
 The token is shown once. Hand it to the person over a private channel. If the tenant already exists, `add` prints its URL (not the token) and stops. If anything fails, it undoes what it created.
 
-The script may also print a line about `alice remote set`. Ignore it: that client is not built yet. Use the setup in [For a person](#for-a-person).
+The `claude mcp add` line keeps `${ALICE_TOKEN}` literal, in single quotes, so the token never lands in a saved configuration. The person sets `ALICE_TOKEN` in their shell.
 
 The tenant file holds no secret. It sets `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALICE_LOG=info`, `ALICE_BACKUP_DAILY=2` and `ALICE_BACKUP_WEEKLY=0`.
 
@@ -93,6 +94,7 @@ The tenant file holds no secret. It sets `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALI
 ```
 name             port   state      version    size     url
 <name>           47801  active     0.1.0      1234 MB  https://<host>/u/<name>
+team             47802  active     0.1.0      56 MB    (team, no URL)
 free: 19.0 GB on /; remove archives: 0 MB
 ```
 
@@ -134,7 +136,7 @@ alice-server cli <name> config set-secret typesafe
 
 Settings are TOML values or plain text, and they take effect at once. The daemon refuses a few settings in tenant mode (for example `privacy.redact = false`, or a private-network URL).
 
-### Shared team memory
+### Shared team memory (admin)
 
 The shared team memory lives in one extra daemon named `team`:
 
@@ -202,7 +204,7 @@ Check one line of `/var/log/caddy/alice-access.log` first. If `client_ip` is you
 
 ### What is exposed
 
-For each tenant Caddy exposes `/api/v1/*` and `/mcp`, except `/api/v1/admin/*` (shutdown and token rotation), which is never routed. Caddy does not log the `Authorization` header. The ping endpoint is public and shows only the version and an identity proof.
+For each tenant Caddy exposes `/api/v1/*` and `/mcp`, except `/api/v1/admin/*` (shutdown and token rotation), which is never routed. The access log shows the `Authorization` header as redacted, never the token. The ping endpoint is public and shows only the version and an identity proof.
 
 ## For a person
 
@@ -277,7 +279,7 @@ A slug that matches no stored project makes a new, empty project of that name. M
 - **Your repository's `.alice.toml` does not apply.** The server never sees your repository. To keep a project away from cloud services such as Jev, ask your admin to add it to your `privacy.cloud_denied_projects`.
 - The admin can read your memory. Do not store what you would not show the admin.
 
-### Shared team memory
+### Shared team memory (person)
 
 If your admin created the team store, you can save a memory for the whole team. Tell your agent:
 
@@ -308,16 +310,13 @@ Send the key over a private channel, never in a chat room or an issue. Without a
 
 Give your palace folder to your admin. The admin runs `alice-server import` (see above), checks the report with you and deletes the server's copy. Secrets are redacted on import.
 
-### The `alice remote` client
-
-A command-line client with `alice remote` commands is planned but not built. Do not look for it. The setup above is the supported one.
-
 ## Troubleshooting
 
 | What you see | Meaning | What to do |
 |---|---|---|
 | `alice-server: this CPU lacks AVX/AVX2` | The VM's CPU type has no AVX2 | Set the CPU type to `host` or `x86-64-v3`, shut the VM down, start it again |
-| `ALICE_PUBLIC_HOST is empty` | `/etc/alice/server.env` is missing or empty | Write `ALICE_PUBLIC_HOST=<host>` to it |
+| `write ALICE_PUBLIC_HOST=<the server's public IP or name> to /etc/alice/server.env first` | `/etc/alice/server.env` does not exist | Create it with `ALICE_PUBLIC_HOST=<host>` |
+| `ALICE_PUBLIC_HOST is empty in /etc/alice/server.env` | The file exists but the host is empty | Write `ALICE_PUBLIC_HOST=<host>` to it |
 | HTTP 401 from the MCP URL | The token is wrong or was rotated | Check `ALICE_TOKEN`; ask the admin for a new token |
 | HTTP 404 from the MCP URL | The tenant name is wrong or was removed; `/u/team/` never exists | Check the URL with the admin |
 | The agent cannot start the server entry | `ALICE_URL` or `ALICE_TOKEN` is not set in the agent's environment | Set them in the shell that starts the agent, then restart it |

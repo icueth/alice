@@ -376,9 +376,8 @@ cmd_add() { # name [team: 1 for the team store]
   say "Token (shown once, hand it over now; alice-server rotate $name gives a new one):"
   say "  $token"
   say "Claude Code, with the token in the environment variable ALICE_TOKEN:"
-  say "  claude mcp add --transport http alice-$name $(url "$name")/mcp --header \"Authorization: Bearer \${ALICE_TOKEN}\""
-  say "Alice client:"
-  say "  alice remote set $(url "$name")   (paste the token when asked)"
+  say "  claude mcp add --transport http alice '$(url "$name")/mcp' --header 'Authorization: Bearer \${ALICE_TOKEN}'"
+  say "The .mcp.json form is in docs/server.md."
 }
 
 cmd_remove() { # name [--yes]
@@ -426,8 +425,6 @@ cmd_rotate() {
 $(personal_tenants)
 EOF
     say "  (every tenant's copy was rewritten; no restart is needed)"
-  else
-    say "  alice remote set $(url "$name")   (paste the token when asked)"
   fi
 }
 
