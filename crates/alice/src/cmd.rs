@@ -454,8 +454,7 @@ async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) 
     }
     // Registered before the daemon starts or the job begins, so a Ctrl-C at any point ends
     // only this command.
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("cannot listen for Ctrl-C")?;
+    let mut sigint = Interrupt::listen().context("cannot listen for Ctrl-C")?;
     let req = ImportRequest {
         palace: Some(palace.to_string_lossy().into_owned()),
         dry_run: a.dry_run,
@@ -494,7 +493,7 @@ async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) 
         }
         last_phase.clone_from(&status.phase);
         tokio::select! {
-            _ = sigint.recv() => {
+            () = sigint.wait() => {
                 if drew { eprintln!(); }
                 bail!("stopped waiting; {CONTINUES}");
             }
@@ -2505,6 +2504,36 @@ fn plan_text(plan: &svcinst::InstallPlan, write: &str, run: &str) -> String {
         t.push_str(&format!("note: {n}\n"));
     }
     t
+}
+
+/// Ctrl-C as a thing to wait for. On Unix the handler is installed when it is created, so one
+/// created before the daemon starts catches an interrupt at any later point.
+#[cfg(unix)]
+struct Interrupt(tokio::signal::unix::Signal);
+
+#[cfg(unix)]
+impl Interrupt {
+    fn listen() -> std::io::Result<Self> {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).map(Self)
+    }
+
+    async fn wait(&mut self) {
+        self.0.recv().await;
+    }
+}
+
+#[cfg(not(unix))]
+struct Interrupt;
+
+#[cfg(not(unix))]
+impl Interrupt {
+    fn listen() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn wait(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(test)]

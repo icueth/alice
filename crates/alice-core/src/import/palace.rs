@@ -793,17 +793,21 @@ mod tests {
         let palace = home.join("palace");
         std::fs::create_dir_all(&palace).unwrap();
         build_sqlite_exact(&palace, &[spec("a", "text", "w", None)]);
-        let link = root.path().join("link");
-        std::os::unix::fs::symlink(&palace, &link).unwrap();
-        for dest in [
+        let mut dests = vec![
             palace.clone(),
             palace.join("new/deeper"),
-            link.join("via"),
             home.clone(),
             home.join("snap"),
             root.path().join("home/palace/x/../snap"),
             root.path().to_path_buf(),
-        ] {
+        ];
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&palace, &link).unwrap();
+            dests.push(link.join("via"));
+        }
+        for dest in dests {
             let e = snapshot(&palace, &dest, Some(&home))
                 .unwrap_err()
                 .to_string();

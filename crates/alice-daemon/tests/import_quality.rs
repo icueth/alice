@@ -395,7 +395,11 @@ impl Flow {
             Some(user_models) => {
                 home.ensure_dirs().unwrap();
                 let dest = alice_embed::model_dir(&home.models_dir());
-                std::os::unix::fs::symlink(alice_embed::model_dir(user_models), &dest).unwrap();
+                let target = alice_embed::model_dir(user_models);
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, &dest).unwrap();
+                #[cfg(windows)]
+                std::os::windows::fs::symlink_dir(target, &dest).unwrap();
                 assert!(
                     alice_embed::is_model_present(&home.models_dir()),
                     "the e5 model is not in ~/.alice/models"
