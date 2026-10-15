@@ -141,9 +141,9 @@ pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
                 continue;
             }
         };
-        let scope = match &entry {
-            SpoolEntry::Remember(r) => (r.project.clone(), r.cwd.clone()),
-            SpoolEntry::Ingest(r) => (r.project.clone(), r.cwd.clone()),
+        let (project, cwd, client_project) = match &entry {
+            SpoolEntry::Remember(r) => (r.project.clone(), r.cwd.clone(), r.client_project.clone()),
+            SpoolEntry::Ingest(r) => (r.project.clone(), r.cwd.clone(), r.client_project.clone()),
         };
         let result = match entry {
             SpoolEntry::Remember(r) => svc.remember(r).await.map(|_| ()),
@@ -159,7 +159,11 @@ pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
                 // Refused only because the project's rules are in a fail-closed state (a
                 // half-written `.alice.toml`, say): keep the entry for the next drain.
                 if svc
-                    .rules_fail_closed(scope.0.as_deref(), scope.1.as_deref())
+                    .rules_fail_closed(crate::service::Scope {
+                        project: project.as_deref(),
+                        cwd: cwd.as_deref(),
+                        client_project: client_project.as_ref(),
+                    })
                     .await
                 {
                     if REPORTED.lock().insert(file.clone()) {

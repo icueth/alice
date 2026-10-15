@@ -198,6 +198,40 @@ struct PredicateVerdict {
 /// Reads one environment variable for the secrets' status (tests replace the process's).
 pub type SecretEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// What a request says about its project (spec §4.1): an explicit slug, the client's working
+/// directory (local daemons only) and the project a remote client detected.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Scope<'a> {
+    pub project: Option<&'a str>,
+    pub cwd: Option<&'a str>,
+    pub client_project: Option<&'a ClientProject>,
+}
+
+/// A request that names its project.
+pub trait Scoped {
+    fn scope(&self) -> Scope<'_>;
+}
+
+macro_rules! scoped {
+    ($($t:ty),*) => {$(
+        impl Scoped for $t {
+            fn scope(&self) -> Scope<'_> {
+                Scope {
+                    project: self.project.as_deref(),
+                    cwd: self.cwd.as_deref(),
+                    client_project: self.client_project.as_ref(),
+                }
+            }
+        }
+    )*};
+}
+scoped!(
+    RememberRequest,
+    RecallRequest,
+    ContextRequest,
+    IngestRequest
+);
+
 #[derive(Clone)]
 pub struct ServiceOptions {
     /// Most read connections open at once (each has its own page cache); further reads wait.
@@ -254,6 +288,10 @@ pub struct ServiceOptions {
     pub reembed_retry_wait: Duration,
     /// Tests: the clock of the breaker around the judge call of a precise recall.
     pub precise_clock: Option<crate::precise_gate::Clock>,
+    /// Server mode (`alice daemon run --tenant`, spec §2.2): a request's `cwd` is never used
+    /// (no git on a client's path), the settings follow the tenant rules, and a project root
+    /// that is not there fails closed.
+    pub tenant: bool,
 }
 
 impl Default for ServiceOptions {
@@ -282,6 +320,7 @@ impl Default for ServiceOptions {
             embedder_factory: None,
             reembed_retry_wait: Duration::from_secs(2),
             precise_clock: None,
+            tenant: false,
         }
     }
 }
@@ -761,7 +800,8 @@ impl Service {
             .settings
             .clone()
             .unwrap_or_else(|| match &opts.settings_env {
-                Some(env) => SettingsHandle::load_with_env(&home, env.clone()),
+                Some(env) => SettingsHandle::load_with(&home, env.clone(), opts.tenant),
+                None if opts.tenant => SettingsHandle::load_tenant(&home),
                 None => SettingsHandle::load(&home),
             });
         let started_with = settings.get();
@@ -1178,17 +1218,43 @@ impl Service {
             .map_err(join_err)?
     }
 
-    /// Project for a write. A working directory not seen in the last minute is resolved with
-    /// git, which runs on the blocking pool rather than on the async runtime.
-    async fn choose(&self, explicit: Option<&str>, cwd: Option<&str>) -> Result<ProjectChoice> {
-        if let Some(choice) = self.resolver.choose_without_git(explicit, cwd) {
+    /// Project for a request (precedence: spec §4.1). A `client_project` is mirrored first
+    /// (on the blocking pool), whatever wins; a working directory not seen in the last minute is
+    /// resolved with git on the blocking pool, and never on a server tenant.
+    async fn choose(&self, scope: Scope<'_>) -> Result<ProjectChoice> {
+        let mirrored = match scope.client_project {
+            Some(cp) => {
+                let (home, cp) = (self.home.clone(), cp.clone());
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        crate::client_projects::sync_mirror(&home, &cp)
+                    })
+                    .await
+                    .map_err(join_err)??,
+                )
+            }
+            None => None,
+        };
+        if let Some(slug) = explicit_slug(scope.project) {
+            return Ok(ProjectChoice::Slug(slug.to_string()));
+        }
+        if let Some(r) = mirrored {
+            return Ok(ProjectChoice::Detected(r));
+        }
+        let cwd = if self.opts.tenant { None } else { scope.cwd };
+        if let Some(choice) = self.resolver.choose_without_git(None, cwd) {
             return Ok(choice);
         }
         let resolver = self.resolver.clone();
-        let (explicit, cwd) = (explicit.map(String::from), cwd.map(String::from));
-        tokio::task::spawn_blocking(move || resolver.choose(explicit.as_deref(), cwd.as_deref()))
+        let cwd = cwd.map(String::from);
+        tokio::task::spawn_blocking(move || resolver.choose(None, cwd.as_deref()))
             .await
             .map_err(join_err)
+    }
+
+    /// Whether this service runs in server mode (`--tenant`).
+    pub fn is_tenant(&self) -> bool {
+        self.opts.tenant
     }
 
     /// One import batch, written by the writer in a commit of its own (the importer's only way
@@ -1216,9 +1282,7 @@ impl Service {
 
     pub async fn remember(&self, req: RememberRequest) -> Result<RememberResponse> {
         let _busy = self.activity.enter();
-        let project = self
-            .choose(req.project.as_deref(), req.cwd.as_deref())
-            .await?;
+        let project = self.choose(req.scope()).await?;
         // Before anything else touches the text: the writer, the spool and the logs only ever
         // see the redacted request (spec §5.1 step 2).
         let req = self.redact_remember_in(&project, req).await?;
@@ -1263,8 +1327,8 @@ impl Service {
     /// Whether a write to this project (named, or detected from `cwd`) would be judged under
     /// fail-closed rules at the moment (see [`SettingsHandle::project_fail_closed`]). The spool
     /// asks before it discards a request that block mode refused.
-    pub async fn rules_fail_closed(&self, project: Option<&str>, cwd: Option<&str>) -> bool {
-        let Ok(choice) = self.choose(project, cwd).await else {
+    pub async fn rules_fail_closed(&self, scope: Scope<'_>) -> bool {
+        let Ok(choice) = self.choose(scope).await else {
             return false;
         };
         let (readers, settings) = (self.readers.clone(), self.settings.clone());
@@ -1327,9 +1391,7 @@ impl Service {
     /// `req` with secrets redacted, or an error naming the detector in `block` mode. Idempotent:
     /// text that is redacted already comes back as it is. What a request is spooled as.
     pub async fn redact_remember(&self, req: RememberRequest) -> Result<RememberRequest> {
-        let choice = self
-            .choose(req.project.as_deref(), req.cwd.as_deref())
-            .await?;
+        let choice = self.choose(req.scope()).await?;
         self.redact_remember_in(&choice, req).await
     }
 
@@ -1406,9 +1468,7 @@ impl Service {
         // Resolved before a reader connection is taken: it may run git. (And before the query is
         // embedded: a remote embedder gets the query only if the project may use it.)
         let explicit = explicit_slug(req.project.as_deref()).is_some();
-        let choice = self
-            .choose(req.project.as_deref(), req.cwd.as_deref())
-            .await?;
+        let choice = self.choose(req.scope()).await?;
         let mut notes: Vec<String> = Vec::new();
         let vector = match &index {
             Some(idx) if idx.model() == active.model => {
@@ -1823,9 +1883,7 @@ impl Service {
         let _busy = self.activity.enter();
         let max_tokens = req.max_tokens.unwrap_or(limits::DEFAULT_CONTEXT_TOKENS);
         let explicit = explicit_slug(req.project.as_deref()).is_some();
-        let choice = self
-            .choose(req.project.as_deref(), req.cwd.as_deref())
-            .await?;
+        let choice = self.choose(req.scope()).await?;
         self.read(move |c| {
             let scope = ProjectResolver::read_scope(c, choice, explicit)?;
             // A placeholder project (never written to) gets the hint and the global preferences.
@@ -2891,9 +2949,7 @@ impl Service {
         let _busy = self.activity.enter();
         // Checked here so an oversized request never reaches (or delays) the writer.
         sources::validate_chunks(&req.chunks)?;
-        let project = self
-            .choose(req.project.as_deref(), req.cwd.as_deref())
-            .await?;
+        let project = self.choose(req.scope()).await?;
         // The whole request is redacted (or refused) before its first slice is written, off the
         // runtime's threads: a request can hold 32 MB of text.
         let r = self.redactor(&project).await?;
@@ -8582,5 +8638,185 @@ mod tests {
         let r = s.recall(precise_q("deploy notes 5", &cwd)).await.unwrap();
         assert!(r.reranked, "{:?}", r.notes);
         assert_eq!(t.graded(), 5);
+    }
+
+    // ------------------------------------------------- server mode: client_project and tenant mode
+
+    fn client_project(key: &str, slug: &str, rules: ClientRules) -> Option<ClientProject> {
+        Some(ClientProject {
+            key: key.into(),
+            slug: slug.into(),
+            name: slug.into(),
+            remote: None,
+            rules,
+        })
+    }
+
+    async fn tenant_svc() -> (tempfile::TempDir, Arc<Service>) {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                ..quiet()
+            },
+        )
+        .unwrap();
+        (d, s)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_project_is_stored_with_its_mirror_as_the_root() {
+        let (_d, s) = tenant_svc().await;
+        assert!(s.is_tenant());
+        let rules = || ClientRules::File {
+            text: "[privacy]\nblock_secrets = true\n".into(),
+        };
+        let r = s
+            .remember(RememberRequest {
+                content: "Staging runs on Fly".into(),
+                client_project: client_project("github.com/me/app", "app", rules()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.project, "app");
+        let root = s
+            .read(|c| projects::root_of(c, "app"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(&root),
+            crate::client_projects::mirror_dir(s.home(), "github.com/me/app")
+        );
+        // The mirror's block_secrets applies on the server.
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let e = s
+            .remember(RememberRequest {
+                content: format!("deploy with {token}"),
+                client_project: client_project("github.com/me/app", "app", rules()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(alice_core::redact::is_refusal(&e), "{e}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_ignores_cwd_and_an_explicit_slug_still_wins() {
+        let (d, s) = tenant_svc().await;
+        let cwd = repo(&d, "somewhere");
+        let r = s
+            .remember(RememberRequest {
+                content: "a note".into(),
+                cwd: cwd.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            r.project, "global",
+            "no git on a client path in tenant mode"
+        );
+        s.remember(RememberRequest {
+            content: "first app note".into(),
+            client_project: client_project("k/app", "app", ClientRules::None),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let r = s
+            .remember(RememberRequest {
+                content: "named note".into(),
+                project: Some("global".into()),
+                client_project: client_project("k/app", "app", ClientRules::None),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.project, "global");
+        // The local meaning of cwd is untouched.
+        let (d2, local) = svc().await;
+        let cwd2 = repo(&d2, "proj");
+        let r = local
+            .remember(RememberRequest {
+                content: "local note".into(),
+                cwd: cwd2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.project, "proj");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mirrored_cloud_denial_keeps_the_judge_and_the_query_away() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let denied = client_project(
+            "k/secret",
+            "secret",
+            ClientRules::File {
+                text: "[privacy]\ncloud_denied = true\n".into(),
+            },
+        );
+        // Never stored yet: the Task 22 path (query_cloud on the mirror root) denies the grading.
+        let r = s
+            .recall(RecallRequest {
+                client_project: denied.clone(),
+                ..recall_req("deploy notes", RecallMode::Precise, &None)
+            })
+            .await
+            .unwrap();
+        assert!(!r.reranked);
+        assert_eq!(t.graded(), 0);
+        // Stored: the judge's policy reads the mirror for later calls.
+        for text in DEPLOY_NOTES {
+            s.remember(RememberRequest {
+                content: text.into(),
+                kind: Some(Kind::Howto),
+                client_project: denied.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        wait_settled(&s).await;
+        assert!(!s.cloud.cloud_allowed("secret"));
+        let r = s
+            .recall(RecallRequest {
+                client_project: denied,
+                ..recall_req("deploy notes", RecallMode::Precise, &None)
+            })
+            .await
+            .unwrap();
+        assert!(!r.reranked);
+        assert!(r.notes.iter().any(|n| n == NOTE_DENIED), "{:?}", r.notes);
+        assert_eq!(t.graded(), 0);
+        drop(d);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_project_whose_mirror_is_gone_fails_closed() {
+        let (_d, s) = tenant_svc().await;
+        s.remember(RememberRequest {
+            content: "app note".into(),
+            client_project: client_project("k/app", "app", ClientRules::None),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dir = crate::client_projects::mirror_dir(s.home(), "k/app");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!s.cloud.cloud_allowed("app"));
+        assert!(
+            s.rules_fail_closed(Scope {
+                project: Some("app"),
+                ..Default::default()
+            })
+            .await
+        );
     }
 }
