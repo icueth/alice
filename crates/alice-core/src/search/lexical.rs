@@ -786,7 +786,8 @@ fn cap_round_robin(pieces: Vec<Vec<String>>, cap: usize) -> Vec<Vec<String>> {
 
 /// The trigrams of the query's unspaced pieces that one search reads, chosen by rarity.
 struct NgramPlan {
-    /// How many distinct trigrams were probed for their document frequency.
+    /// How many distinct trigrams were probed for their document frequency (read by tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     probed: usize,
     /// The trigrams to search, in query order, without repeats.
     terms: Vec<String>,
