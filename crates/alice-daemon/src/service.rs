@@ -28,7 +28,7 @@ use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
 use alice_core::redact::Redactor;
 use alice_core::search::{self, SearchOutput, SearchParams, pack};
-use alice_core::settings::{self, SettingError, Settings};
+use alice_core::settings::{self, DefaultRecallMode, SettingError, Settings};
 use alice_core::store::embeddings;
 use alice_core::store::events::Actor;
 use alice_core::store::history::UndoOutcome;
@@ -92,6 +92,14 @@ const PREDICATE_VOCABULARY: usize = 500;
 
 /// Results the judge grades in precise mode (spec §4.4 step 4).
 const PRECISE_TOP: usize = 20;
+/// How far below its vector floor a candidate may fall and still be shown to the judge in
+/// precise mode (cosine; spec §4.4 step 4). Chosen before the evaluation that motivated it
+/// (the paraphrase answers missed the floor by 0.004 to 0.011), not tuned afterwards.
+const NEAR_FLOOR_BAND: f32 = 0.03;
+/// A near-floor candidate is kept when the judge says it answers the query with at least this
+/// probability (`P(answers) >= 0.5`, the relevance rule of the M2 floor evaluation,
+/// `jev_eval.rs`).
+const RESCUE_ANSWERS_MIN: f64 = 0.5;
 
 /// Said in a recall answer when its query was not sent to a remote embedding provider.
 const QUERY_HELD_BACK: &str = "this search used word matches only: the cloud policy keeps this project's text away from the embedding provider, so the query was not sent";
@@ -1249,13 +1257,28 @@ impl Service {
         // Embedded before a reader connection is taken: the model is shared with the
         // embedding worker, and a recall waiting for it must not hold a connection.
         let text = search::query_text(&req.query)?;
-        let (precise, judged_query) = (req.mode == RecallMode::Precise, text.clone());
+        // The mode: the request's own, else `search.default_mode`; `auto` is precise exactly
+        // when the judge in force is a model judge (the heuristic cannot grade).
+        let can_grade = self.judge().provider() != "heuristic";
+        let mode = req.mode.unwrap_or(match cfg.search.default_mode {
+            DefaultRecallMode::Fast => RecallMode::Fast,
+            DefaultRecallMode::Precise => RecallMode::Precise,
+            DefaultRecallMode::Auto if can_grade => RecallMode::Precise,
+            DefaultRecallMode::Auto => RecallMode::Fast,
+        });
+        let (precise, judged_query) = (mode == RecallMode::Precise, text.clone());
         // Precise mode grades PRECISE_TOP results and keeps `limit` of them, so it searches
-        // for at least that many.
+        // for at least that many; with a judge that can grade it also asks for the candidates
+        // just below the vector floor.
         let search_limit = if precise {
             limit.max(PRECISE_TOP)
         } else {
             limit
+        };
+        let (near_band, near_limit) = if precise && can_grade {
+            (NEAR_FLOOR_BAND, PRECISE_TOP)
+        } else {
+            (0.0, 0)
         };
         // Resolved before a reader connection is taken: it may run git. (And before the query is
         // embedded: a remote embedder gets the query only if the project may use it.)
@@ -1328,6 +1351,8 @@ impl Service {
                     relevance_margin: cfg.search.relevance_margin as f32,
                     chunk_floor: Some(search::CHUNK_RELEVANCE_FLOOR),
                     raw_min_results: cfg.search.raw_fallback_min_results,
+                    near_band,
+                    near_limit,
                     half_lives: cfg.search.half_life.clone(),
                     fusion: search::fusion::Fusion {
                         rrf_k: cfg.search.rrf_k,
@@ -1387,12 +1412,16 @@ impl Service {
         Ok(response)
     }
 
-    /// Precise mode (spec §4.4 step 4): the judge grades the top `PRECISE_TOP` results in one
-    /// batched call and the memories among them are re-ordered by P(relevant), in the places
-    /// those memories held (raw chunks, and memories of a project the cloud may not see, keep
-    /// theirs). Then `limit` results are kept. Without a model judge, or when it answers
-    /// `Denied`, `Budget` or an error, or too slowly, the order is the search's and the
-    /// answer says so (`false`). The call is scoped to the project the query was asked from.
+    /// Precise mode (spec §4.4 step 4): the judge grades the top `PRECISE_TOP` results of every
+    /// tier, raw chunks included, together with the near-floor candidates (those that missed
+    /// their vector floor by at most `NEAR_FLOOR_BAND`), in one batched call. The graded
+    /// results are re-ordered by P(relevant), in the places the graded results held (results
+    /// of a project the cloud may not see, and results the judge gave no grade, keep theirs);
+    /// a near-floor candidate is added when the judge says it answers the query
+    /// (`RESCUE_ANSWERS_MIN`), among the graded results by its grade. Then `limit` results are
+    /// kept. Without a model judge, or when it answers `Denied`, `Budget` or an error, or too
+    /// slowly, the order is the search's, no near-floor candidate is returned, and the answer
+    /// says so (`false`). The call is scoped to the project the query was asked from.
     async fn rerank(
         &self,
         mut out: SearchOutput,
@@ -1402,15 +1431,21 @@ impl Service {
     ) -> (SearchOutput, bool) {
         let judge = self.judge();
         let mut reranked = false;
+        let near = std::mem::take(&mut out.near);
+        let window = out.hits.len().min(PRECISE_TOP);
         // The cloud policy is asked once per distinct project, off the runtime's threads (each
         // answer reads the store).
         let allowed: std::collections::HashSet<String> = if judge.provider() == "heuristic" {
             Default::default()
         } else {
             let mut projects = vec![query_project.to_string()];
-            for h in out.hits.iter().take(PRECISE_TOP) {
-                if h.tier == Tier::Knowledge && !projects.contains(&h.project) {
-                    projects.push(h.project.clone());
+            let seen = out.hits[..window]
+                .iter()
+                .chain(near.iter().map(|n| &n.hit))
+                .map(|h| h.project.clone());
+            for p in seen {
+                if !projects.contains(&p) {
+                    projects.push(p);
                 }
             }
             let hub = self.judge.clone();
@@ -1424,59 +1459,95 @@ impl Service {
             .unwrap_or_default()
         };
         if allowed.contains(query_project) {
-            // Knowledge hits among the top, with their place in the hit list.
-            let graded: Vec<(usize, JudgeMemory)> = out
-                .hits
-                .iter()
-                .take(PRECISE_TOP)
-                .enumerate()
-                .filter(|(_, h)| h.tier == Tier::Knowledge && allowed.contains(&h.project))
-                .map(|(i, h)| {
-                    let ordinal = out.hits[..i]
-                        .iter()
-                        .filter(|p| p.tier == Tier::Knowledge)
-                        .count();
-                    (
-                        i,
-                        JudgeMemory {
-                            id: h.id.clone(),
-                            project: h.project.clone(),
-                            kind: h.kind.unwrap_or(Kind::Note),
-                            title: h.title.clone(),
-                            body: h.body.clone().unwrap_or_else(|| h.snippet.clone()),
-                            importance: out.memory_importance.get(ordinal).copied().unwrap_or(3),
-                            created_at: h.created_at.clone(),
-                            similarity: None,
-                        },
-                    )
-                })
-                .collect();
-            if graded.len() > 1 {
+            // What the judge is shown, with the place of each: results among the top (their
+            // index in the hit list), then near-floor candidates (index `hits.len() + j`).
+            let judged = |h: &Hit, importance: u8| JudgeMemory {
+                id: h.id.clone(),
+                project: h.project.clone(),
+                // A raw chunk has no kind; its title ("raw · <source>") says what it is. The
+                // text is the stored (redacted) one, bounded like a memory's by the judge.
+                kind: h.kind.unwrap_or(Kind::Note),
+                title: h.title.clone(),
+                body: h.body.clone().unwrap_or_else(|| h.snippet.clone()),
+                importance,
+                created_at: h.created_at.clone(),
+                similarity: None,
+            };
+            let mut shown: Vec<(usize, JudgeMemory)> = Vec::new();
+            let mut ordinal = 0;
+            for (i, h) in out.hits.iter().enumerate().take(window) {
+                let importance = if h.tier == Tier::Knowledge {
+                    ordinal += 1;
+                    out.memory_importance.get(ordinal - 1).copied().unwrap_or(3)
+                } else {
+                    3
+                };
+                if allowed.contains(&h.project) {
+                    shown.push((i, judged(h, importance)));
+                }
+            }
+            let near_start = out.hits.len();
+            for (j, n) in near.iter().enumerate() {
+                if allowed.contains(&n.hit.project) {
+                    let importance = n.memory.map_or(3, |(_, imp)| imp);
+                    shown.push((near_start + j, judged(&n.hit, importance)));
+                }
+            }
+            // One result alone has nothing to be ordered against, but a near-floor candidate
+            // alone still has a ruling to get.
+            if shown.len() > 1 || shown.iter().any(|(i, _)| *i >= near_start) {
                 let wait = Duration::from_millis(self.settings().judge.timeout_ms) * 2;
                 let (q, p) = (query.to_string(), query_project.to_string());
-                let ms: Vec<JudgeMemory> = graded.iter().map(|(_, m)| m.clone()).collect();
+                let ms: Vec<JudgeMemory> = shown.iter().map(|(_, m)| m.clone()).collect();
                 let asked = tokio::time::timeout(
                     wait,
                     tokio::task::spawn_blocking(move || judge.grade_relevance(&p, &q, &ms)),
                 )
                 .await;
                 match asked {
-                    Ok(Ok(Ok(grades))) if grades.len() == graded.len() => {
-                        let mut scored: Vec<(usize, f64)> = graded
-                            .iter()
-                            .zip(&grades)
-                            .filter(|(_, d)| !d.0.is_empty())
-                            .map(|((i, _), d)| {
-                                (*i, d.p(RELEVANCE_ANSWERS) + 0.5 * d.p(RELEVANCE_PARTIAL))
-                            })
-                            .collect();
-                        let slots: Vec<usize> = scored.iter().map(|(i, _)| *i).collect();
-                        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-                        let mut order: Vec<usize> = (0..out.hits.len()).collect();
-                        for (slot, (from, _)) in slots.iter().zip(&scored) {
-                            order[*slot] = *from;
+                    Ok(Ok(Ok(grades))) if grades.len() == shown.len() => {
+                        // (index, P(relevant)) of what was graded; near-floor candidates
+                        // only when they answer the query.
+                        let mut graded: Vec<(usize, f64)> = Vec::new();
+                        for ((i, _), d) in shown.iter().zip(&grades) {
+                            if d.0.is_empty() {
+                                continue;
+                            }
+                            if *i < near_start || d.p(RELEVANCE_ANSWERS) >= RESCUE_ANSWERS_MIN {
+                                graded.push((
+                                    *i,
+                                    d.p(RELEVANCE_ANSWERS) + 0.5 * d.p(RELEVANCE_PARTIAL),
+                                ));
+                            }
                         }
-                        reranked = !scored.is_empty();
+                        graded.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                        reranked = !graded.is_empty();
+                        let rescued = graded.iter().filter(|(i, _)| *i >= near_start).count();
+                        // The near-floor candidates join the list after the search's own
+                        // hits, so that `reorder` finds them by index.
+                        for n in &near {
+                            out.hits.push(n.hit.clone());
+                            if let Some((seq, importance)) = n.memory {
+                                out.memory_seqs.push(seq);
+                                out.memory_importance.push(importance);
+                            }
+                        }
+                        // Ungraded results of the top keep their places; the graded ones
+                        // (and the rescued) fill the others, best first; the rest follows.
+                        let held: std::collections::HashSet<usize> = (0..window)
+                            .filter(|i| !graded.iter().any(|(g, _)| g == i))
+                            .collect();
+                        let top = window + rescued;
+                        let mut stream = graded.iter().map(|(i, _)| *i);
+                        let mut order: Vec<usize> = Vec::with_capacity(top);
+                        for place in 0..top {
+                            if held.contains(&place) {
+                                order.push(place);
+                            } else if let Some(from) = stream.next() {
+                                order.push(from);
+                            }
+                        }
+                        order.extend(window..near_start);
                         out = reorder(out, &order);
                     }
                     Ok(Ok(Ok(_))) => tracing::warn!("the judge graded another number of results"),
@@ -6944,6 +7015,8 @@ mod tests {
         keyword: &'static str,
         grading_calls: std::sync::atomic::AtomicUsize,
         fail_grading: AtomicBool,
+        /// Milliseconds a grading request takes before it answers.
+        grading_delay_ms: std::sync::atomic::AtomicU64,
         /// The states of the grading requests.
         graded_states: Mutex<Vec<String>>,
     }
@@ -6954,6 +7027,7 @@ mod tests {
                 keyword,
                 grading_calls: Default::default(),
                 fail_grading: AtomicBool::new(false),
+                grading_delay_ms: Default::default(),
                 graded_states: Default::default(),
             })
         }
@@ -7020,6 +7094,10 @@ mod tests {
             if grading {
                 self.graded_states.lock().push(state.to_string());
                 self.grading_calls.fetch_add(1, Ordering::SeqCst);
+                let delay = self.grading_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
                 if self.fail_grading.load(Ordering::SeqCst) {
                     return Ok(alice_core::judge::jev::HttpReply {
                         status: 503,
@@ -7065,7 +7143,7 @@ mod tests {
     fn recall_req(query: &str, mode: RecallMode, cwd: &Option<String>) -> RecallRequest {
         RecallRequest {
             query: query.into(),
-            mode,
+            mode: Some(mode),
             cwd: cwd.clone(),
             format: OutputFormat::Json,
             ..Default::default()
@@ -7252,5 +7330,459 @@ mod tests {
             r.results.iter().any(|h| h.project == "filed"),
             "but they are still results, in their places"
         );
+    }
+
+    // ------------------------------------------------------- Task 21: all tiers, rescue, default
+
+    const RAW_NOTE: &str =
+        "session transcript about the deploy notes: the OKAPI rollout was paused";
+
+    async fn ingest_raw(s: &Service, uri: &str, text: &str, cwd: &Option<String>) -> String {
+        s.ingest(IngestRequest {
+            source: SourceInput {
+                uri: uri.into(),
+                ..Default::default()
+            },
+            chunks: vec![ChunkInput {
+                ord: 0,
+                text: text.into(),
+                ..Default::default()
+            }],
+            cwd: cwd.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_settled(s).await;
+        // The chunk's id, as recall shows it.
+        let r = s
+            .recall(RecallRequest {
+                include_raw: true,
+                project: None,
+                ..recall_req(text, RecallMode::Fast, cwd)
+            })
+            .await
+            .unwrap();
+        r.results
+            .iter()
+            .find(|h| h.tier == Tier::Raw)
+            .map(|h| h.id.clone())
+            .expect("the chunk is found by its own text")
+    }
+
+    fn raw_recall(mode: Option<RecallMode>, cwd: &Option<String>) -> RecallRequest {
+        RecallRequest {
+            mode,
+            include_raw: true,
+            ..recall_req("deploy notes", RecallMode::Fast, cwd)
+        }
+    }
+
+    fn ids_of(r: &RecallResponse) -> Vec<String> {
+        r.results.iter().map(|h| h.id.clone()).collect()
+    }
+
+    /// Task 21: precise mode grades raw chunks too, so a chunk the judge grades highest moves
+    /// above the knowledge hits; fast mode leaves it where the search put it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_mode_moves_a_raw_chunk_the_judge_grades_highest_above_knowledge_hits() {
+        let t = KeywordGrader::new("OKAPI");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let chunk = ingest_raw(&s, "session-1", RAW_NOTE, &cwd).await;
+        let fast = s
+            .recall(raw_recall(Some(RecallMode::Fast), &cwd))
+            .await
+            .unwrap();
+        let place = fast.results.iter().position(|h| h.id == chunk).unwrap();
+        assert!(
+            place > 0,
+            "the test needs the chunk behind knowledge hits: {:?}",
+            fast.results.iter().map(|h| &h.title).collect::<Vec<_>>()
+        );
+        assert_eq!(t.graded(), 0, "fast mode does not grade");
+        let precise = s
+            .recall(raw_recall(Some(RecallMode::Precise), &cwd))
+            .await
+            .unwrap();
+        assert!(precise.reranked);
+        assert_eq!(t.graded(), 1, "one batched call");
+        assert_eq!(precise.results[0].id, chunk, "{:?}", ids_of(&precise));
+        assert_eq!(precise.results[0].tier, Tier::Raw);
+        let (mut a, mut b) = (ids_of(&fast), ids_of(&precise));
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "the same results in another order");
+        // The chunk's text went to the judge, redacted text bounded like a memory's.
+        assert!(t.graded_states.lock()[0].contains("OKAPI rollout"));
+        // And fast mode still keeps the place.
+        let again = s
+            .recall(raw_recall(Some(RecallMode::Fast), &cwd))
+            .await
+            .unwrap();
+        assert_eq!(again.results[place].id, chunk);
+    }
+
+    /// Task 21: a raw chunk of a project the cloud may not see is neither sent nor moved in
+    /// precise mode, and the others move around it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_raw_chunk_of_a_cloud_denied_project_keeps_its_place_in_precise_mode() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let filed = repo(&d, "filed");
+        std::fs::write(
+            std::path::Path::new(filed.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        let open = repo(&d, "open");
+        remember_deploy_notes(&s, &open).await;
+        let secret = "session transcript about the deploy notes: the ZEBRA vault is sealed";
+        let chunk = ingest_raw(&s, "session-f", secret, &filed).await;
+        let fast = s
+            .recall(raw_recall(Some(RecallMode::Fast), &open))
+            .await
+            .unwrap();
+        let place = fast.results.iter().position(|h| h.id == chunk).unwrap();
+        let precise = s
+            .recall(raw_recall(Some(RecallMode::Precise), &open))
+            .await
+            .unwrap();
+        assert!(precise.reranked);
+        assert_eq!(
+            precise.results[place].id, chunk,
+            "the chunk keeps its place"
+        );
+        let state = t.graded_states.lock()[0].clone();
+        assert!(!state.contains("vault is sealed"), "not sent: {state}");
+        assert!(!state.contains("project filed"), "{state}");
+        assert!(
+            precise.results[0].title.contains("ZEBRA"),
+            "the allowed ones were ordered: {:?}",
+            precise.results.iter().map(|h| &h.title).collect::<Vec<_>>()
+        );
+    }
+
+    /// The cosine the fake embedder (and so the index) gives a query and a memory.
+    async fn cosine_to(s: &Service, id: &str, query: &str) -> f64 {
+        let m = s
+            .get(GetRequest {
+                ids: vec![id.into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .memories
+            .remove(0)
+            .memory;
+        let e = FakeEmbedder::new(384);
+        let doc = e
+            .embed_passages(&[alice_core::embed::memory_embed_text(&m.title, &m.body)])
+            .unwrap()
+            .remove(0);
+        f64::from(alice_core::embed::cosine(
+            &doc,
+            &e.embed_query(query).unwrap(),
+        ))
+    }
+
+    fn floors(x: f64) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = patch_one("search.relevance_floor", serde_json::json!(x));
+        m.insert("search.relevance_sure".into(), serde_json::json!(x));
+        m.insert("search.relevance_margin".into(), serde_json::json!(0.0));
+        m
+    }
+
+    /// Shares no word, stem or substring with `RESCUE_NOTE`: only the vector list can find it.
+    const RESCUE_QUERY: &str = "launch calendar";
+    const RESCUE_NOTE: &str = "the OKAPI rollout plan for staging";
+
+    /// Task 21: a knowledge candidate 0.01 below its floor is returned in precise mode when the
+    /// judge says it answers, not when it says otherwise, never in fast mode, and a candidate
+    /// further below (0.035; the band is 0.03) is not even sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_candidate_just_below_the_floor_is_rescued_only_when_the_judge_says_it_answers() {
+        let recall = |mode, cwd: &Option<String>| RecallRequest {
+            query: RESCUE_QUERY.into(),
+            mode,
+            ..recall_req(RESCUE_QUERY, RecallMode::Fast, cwd)
+        };
+        // Graded relevant.
+        let t = KeywordGrader::new("OKAPI");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        let id = remember_id(&s, RESCUE_NOTE, Some(Kind::Fact), &cwd).await;
+        wait_settled(&s).await;
+        let c = cosine_to(&s, &id, RESCUE_QUERY).await;
+        assert!((0.0..0.9).contains(&c), "{c}");
+        s.patch_settings(floors(c + 0.01)).unwrap();
+        let fast = s
+            .recall(recall(Some(RecallMode::Fast), &cwd))
+            .await
+            .unwrap();
+        assert!(
+            fast.results.is_empty(),
+            "below the floor: {:?}",
+            fast.results
+        );
+        assert_eq!(t.graded(), 0, "fast mode sends nothing");
+        let precise = s
+            .recall(recall(Some(RecallMode::Precise), &cwd))
+            .await
+            .unwrap();
+        assert_eq!(t.graded(), 1);
+        assert!(precise.reranked);
+        assert_eq!(ids_of(&precise), std::slice::from_ref(&id), "rescued");
+        // Fast mode still returns nothing afterwards.
+        let fast = s
+            .recall(recall(Some(RecallMode::Fast), &cwd))
+            .await
+            .unwrap();
+        assert!(fast.results.is_empty());
+
+        // Graded irrelevant: dropped.
+        let t2 = KeywordGrader::new("NO-SUCH-WORD");
+        let (d2, s2) = svc_with_grader(t2.clone()).await;
+        let cwd2 = repo(&d2, "proj");
+        let id2 = remember_id(&s2, RESCUE_NOTE, Some(Kind::Fact), &cwd2).await;
+        wait_settled(&s2).await;
+        s2.patch_settings(floors(cosine_to(&s2, &id2, RESCUE_QUERY).await + 0.01))
+            .unwrap();
+        let r = s2
+            .recall(recall(Some(RecallMode::Precise), &cwd2))
+            .await
+            .unwrap();
+        assert_eq!(t2.graded(), 1, "it was shown to the judge");
+        assert!(r.results.is_empty(), "graded unrelated: {:?}", r.results);
+
+        // Beyond the band: not a candidate, nothing is sent.
+        s.patch_settings(floors(c + 0.035)).unwrap();
+        let before = t.graded();
+        let r = s
+            .recall(recall(Some(RecallMode::Precise), &cwd))
+            .await
+            .unwrap();
+        assert!(r.results.is_empty());
+        assert_eq!(t.graded(), before, "0.035 below is outside the band");
+    }
+
+    /// Task 21: when the judge cannot grade (a used-up budget, an outage, a deadline) the
+    /// near-floor candidates are dropped and the answer is the fast one. (Each recall asks a
+    /// query of its own: the judge answers an identical request from its cache.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_candidate_is_rescued_when_the_judge_cannot_grade() {
+        let t = KeywordGrader::new("OKAPI");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        let id = remember_id(&s, RESCUE_NOTE, Some(Kind::Fact), &cwd).await;
+        wait_settled(&s).await;
+        // The floors sit 0.01 above the cosine of the query asked.
+        async fn ask(s: &Service, id: &str, n: usize, cwd: &Option<String>) -> RecallResponse {
+            let q = format!("{RESCUE_QUERY} q{n}");
+            let c = cosine_to(s, id, &q).await;
+            s.patch_settings(floors(c + 0.01)).unwrap();
+            s.recall(RecallRequest {
+                query: q.clone(),
+                ..recall_req(&q, RecallMode::Precise, cwd)
+            })
+            .await
+            .unwrap()
+        }
+        // Sanity: it is rescued while the judge works.
+        assert_eq!(
+            ids_of(&ask(&s, &id, 0, &cwd).await),
+            std::slice::from_ref(&id)
+        );
+        // An outage.
+        t.fail_grading.store(true, Ordering::SeqCst);
+        let r = ask(&s, &id, 1, &cwd).await;
+        assert!(!r.reranked && r.results.is_empty(), "{:?}", r.results);
+        t.fail_grading.store(false, Ordering::SeqCst);
+        // A deadline: twice `judge.timeout_ms`.
+        s.patch_settings(patch_one("judge.timeout_ms", serde_json::json!(100)))
+            .unwrap();
+        t.grading_delay_ms.store(1_500, Ordering::SeqCst);
+        let r = ask(&s, &id, 2, &cwd).await;
+        assert!(!r.reranked && r.results.is_empty(), "{:?}", r.results);
+        t.grading_delay_ms.store(0, Ordering::SeqCst);
+        s.patch_settings(patch_one("judge.timeout_ms", serde_json::json!(10_000)))
+            .unwrap();
+        // A budget of zero: nothing is sent.
+        s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(0.0)))
+            .unwrap();
+        let before = t.graded();
+        let r = ask(&s, &id, 3, &cwd).await;
+        assert!(!r.reranked && r.results.is_empty(), "{:?}", r.results);
+        assert_eq!(t.graded(), before);
+        // The heuristic judge cannot grade either.
+        let (d, h) = svc().await;
+        let cwd = repo(&d, "proj");
+        let id = remember_id(&h, RESCUE_NOTE, Some(Kind::Fact), &cwd).await;
+        wait_settled(&h).await;
+        let r = ask(&h, &id, 4, &cwd).await;
+        assert!(!r.reranked && r.results.is_empty());
+    }
+
+    /// An embedder with chosen cosines: every passage is the first axis, every query is at the
+    /// cosine `cos` of it.
+    struct AtCosine {
+        cos: f32,
+    }
+
+    impl Embedder for AtCosine {
+        fn model_id(&self) -> &str {
+            "fake"
+        }
+        fn dim(&self) -> usize {
+            384
+        }
+        fn embed_passages(&self, texts: &[String]) -> alice_core::error::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|_| {
+                    let mut v = vec![0.0; 384];
+                    v[0] = 1.0;
+                    v
+                })
+                .collect())
+        }
+        fn embed_query(&self, _text: &str) -> alice_core::error::Result<Vec<f32>> {
+            let mut v = vec![0.0; 384];
+            v[0] = self.cos;
+            v[1] = (1.0 - self.cos * self.cos).sqrt();
+            Ok(v)
+        }
+    }
+
+    /// Task 21: a raw chunk 0.01 below the chunk floor of 0.82 (a cosine of 0.81, on an
+    /// embedder with chosen cosines) is rescued the same way, and one 0.031 below is not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_raw_chunk_just_below_the_chunk_floor_is_rescued_in_precise_mode_only() {
+        for (cos, rescued) in [(0.81f32, true), (0.789, false)] {
+            let t = KeywordGrader::new("OKAPI");
+            let d = tempfile::tempdir().unwrap();
+            let s = Service::start(
+                AliceHome::new(d.path().to_path_buf()),
+                &move || Ok(Arc::new(AtCosine { cos }) as Arc<dyn Embedder>),
+                ServiceOptions {
+                    jev_transport: Some(t.clone()),
+                    ..quiet()
+                },
+            )
+            .unwrap();
+            s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+                .unwrap();
+            s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+                .unwrap();
+            let cwd = repo(&d, "proj");
+            s.ingest(IngestRequest {
+                source: SourceInput {
+                    uri: "s".into(),
+                    ..Default::default()
+                },
+                chunks: vec![ChunkInput {
+                    ord: 0,
+                    text: "the OKAPI rollout was paused after the review".into(),
+                    ..Default::default()
+                }],
+                cwd: cwd.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            wait_settled(&s).await;
+            let q = "zzz yyy";
+            let req = |mode| RecallRequest {
+                query: q.into(),
+                mode: Some(mode),
+                include_raw: true,
+                ..recall_req(q, RecallMode::Fast, &cwd)
+            };
+            let fast = s.recall(req(RecallMode::Fast)).await.unwrap();
+            assert!(fast.results.is_empty(), "{cos}: {:?}", fast.results);
+            assert_eq!(t.graded(), 0);
+            let precise = s.recall(req(RecallMode::Precise)).await.unwrap();
+            if rescued {
+                assert_eq!(precise.results.len(), 1, "{cos}: rescued");
+                assert_eq!(precise.results[0].tier, Tier::Raw);
+                assert!(precise.reranked);
+                assert_eq!(t.graded(), 1);
+                assert!(
+                    s.recall(req(RecallMode::Fast))
+                        .await
+                        .unwrap()
+                        .results
+                        .is_empty(),
+                    "fast mode never returns it"
+                );
+            } else {
+                assert!(precise.results.is_empty(), "{cos}: {:?}", precise.results);
+                assert_eq!(t.graded(), 0, "outside the band: nothing is sent");
+            }
+        }
+    }
+
+    /// Task 21: `search.default_mode`. `auto` is precise with a model judge and fast with the
+    /// heuristic; a request's own mode wins either way; the setting live-reloads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_default_mode_is_precise_with_a_model_judge_and_a_request_overrides_it() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let ask = |mode: Option<RecallMode>| RecallRequest {
+            mode,
+            ..recall_req("deploy notes", RecallMode::Fast, &cwd)
+        };
+        assert_eq!(s.settings().search.default_mode, DefaultRecallMode::Auto);
+        // auto, model judge, no mode named: precise.
+        let r = s.recall(ask(None)).await.unwrap();
+        assert!(r.reranked && t.graded() == 1);
+        assert!(r.results[0].title.contains("ZEBRA"));
+        // An explicit fast wins over auto.
+        let r = s.recall(ask(Some(RecallMode::Fast))).await.unwrap();
+        assert!(!r.reranked && t.graded() == 1);
+        // Live: fast as the default; no request mode is fast, an explicit precise wins.
+        s.patch_settings(patch_one("search.default_mode", serde_json::json!("fast")))
+            .unwrap();
+        let r = s.recall(ask(None)).await.unwrap();
+        assert!(!r.reranked && t.graded() == 1);
+        // (The same request again would come from the judge's cache, so no count here.)
+        let r = s.recall(ask(Some(RecallMode::Precise))).await.unwrap();
+        assert!(r.reranked);
+        // Back to precise, then back to auto.
+        s.patch_settings(patch_one(
+            "search.default_mode",
+            serde_json::json!("precise"),
+        ))
+        .unwrap();
+        assert!(s.recall(ask(None)).await.unwrap().reranked);
+        s.patch_settings(patch_one("search.default_mode", serde_json::json!("auto")))
+            .unwrap();
+        assert!(s.recall(ask(None)).await.unwrap().reranked);
+
+        let jev_cwd = cwd.clone();
+        // The heuristic cannot grade: auto is fast, and nothing is sent anywhere.
+        let (d, h) = svc().await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&h, &cwd).await;
+        let fast = h.recall(ask(Some(RecallMode::Fast))).await.unwrap();
+        let auto = h.recall(ask(None)).await.unwrap();
+        assert!(!auto.reranked);
+        assert_eq!(ids_of(&auto), ids_of(&fast));
+        // A client that sends `"mode":"fast"` still gets fast, with a model judge too.
+        let old: RecallRequest =
+            serde_json::from_str(r#"{"query":"deploy notes","mode":"fast"}"#).unwrap();
+        let before = t.graded();
+        let r = s
+            .recall(RecallRequest {
+                cwd: jev_cwd,
+                ..old
+            })
+            .await
+            .unwrap();
+        assert!(!r.reranked);
+        assert_eq!(t.graded(), before);
     }
 }

@@ -398,9 +398,25 @@ impl Default for EmbeddingSettings {
     }
 }
 
+/// What a recall without an explicit `mode` does (`search.default_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultRecallMode {
+    /// Precise when the configured judge is a model judge (Jev), fast otherwise.
+    #[default]
+    Auto,
+    /// Always the local hybrid search.
+    Fast,
+    /// Always ask the judge to grade (it still falls back to fast when it cannot grade).
+    Precise,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct SearchSettings {
+    /// The mode of a recall that does not name one: `auto` (precise when a model judge is
+    /// configured, fast otherwise), `fast` or `precise`. A request's own `mode` wins.
+    pub default_mode: DefaultRecallMode,
     /// Token budget of a recall answer when the agent does not ask for one (100 to 50000).
     pub default_max_tokens: usize,
     /// Rescue floor for memories found only by meaning (cosine, 0 to 1): below the sure floor
@@ -436,6 +452,7 @@ pub struct SearchSettings {
 impl Default for SearchSettings {
     fn default() -> Self {
         Self {
+            default_mode: DefaultRecallMode::Auto,
             default_max_tokens: crate::model::limits::DEFAULT_RECALL_TOKENS,
             // `search::DEFAULT_RELEVANCE_FLOOR` and `DEFAULT_RELEVANCE_MARGIN` as written (the
             // f32 widened would show as 0.8199999928474426); a test keeps them equal.
@@ -2138,6 +2155,56 @@ mod tests {
         assert_eq!((s.backup.daily, s.backup.weekly), (7, 4));
         assert_eq!(s.secrets.backend, SecretsBackend::File);
         assert!(!s.mcp.admin_tools);
+    }
+
+    /// Task 21: `search.default_mode` is `auto` (the default), `fast` or `precise`; anything
+    /// else is refused with a message naming the key; it is in the key list, the schema (with a
+    /// description) and has an environment variable. It is not a protective key: it spends
+    /// nothing that `judge.provider` and the budget do not already allow.
+    #[test]
+    fn default_mode_is_a_validated_search_setting() {
+        assert_eq!(
+            Settings::default().search.default_mode,
+            DefaultRecallMode::Auto
+        );
+        for (v, mode) in [
+            ("auto", DefaultRecallMode::Auto),
+            ("fast", DefaultRecallMode::Fast),
+            ("precise", DefaultRecallMode::Precise),
+        ] {
+            let r = resolve(Some(&format!("[search]\ndefault_mode = \"{v}\"\n")), &[]).unwrap();
+            assert_eq!(r.settings.search.default_mode, mode);
+            assert_eq!(r.sources["search.default_mode"], Source::File);
+        }
+        let errs = resolve(Some("[search]\ndefault_mode = \"turbo\"\n"), &[]).unwrap_err();
+        let e = errs
+            .iter()
+            .find(|e| e.key == "search.default_mode")
+            .unwrap();
+        assert!(
+            e.message.contains("auto") && e.message.contains("precise"),
+            "the message names the values: {}",
+            e.message
+        );
+        let r = resolve(None, &env(&[("ALICE_SEARCH_DEFAULT_MODE", "fast")])).unwrap();
+        assert_eq!(r.settings.search.default_mode, DefaultRecallMode::Fast);
+        let k = key_infos()
+            .into_iter()
+            .find(|k| k.key == "search.default_mode")
+            .unwrap();
+        assert_eq!(k.env_var, "ALICE_SEARCH_DEFAULT_MODE");
+        assert!(!k.restart && !k.read_only);
+        let schema = serde_json::to_string(&schemars::schema_for!(Settings)).unwrap();
+        assert!(
+            schema.contains("\"auto\"") && schema.contains("precise"),
+            "{schema}"
+        );
+        let mut precise = Settings::default();
+        precise.search.default_mode = DefaultRecallMode::Precise;
+        assert!(
+            loosened_protections(&Settings::default(), &precise).is_empty(),
+            "not a protective key"
+        );
     }
 
     /// Task 19: `search.rrf_k` and `search.boost_exponent` are ordinary search settings with

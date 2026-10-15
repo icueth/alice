@@ -1712,7 +1712,19 @@ fn recall_precise_reaches_the_daemon() {
     assert!(text.contains("lease timeouts"), "{text}");
     assert!(!text.contains("re-ranked by the judge"), "{text}");
     let help = e.run(&["recall", "--help"]);
-    assert!(String::from_utf8_lossy(&help.stdout).contains("--precise"));
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.contains("--precise") && help.contains("--fast"),
+        "{help}"
+    );
+    // Task 21: `--fast` forces the local search, and the two flags exclude each other.
+    let forced = e.json(&["recall", "lease timeouts", "--fast"]);
+    assert_eq!(forced["reranked"], false, "{forced}");
+    assert!(
+        !e.run(&["recall", "x", "--fast", "--precise"])
+            .status
+            .success()
+    );
 }
 
 /// Task 15: `alice restore` through real processes. The backup comes back, a write made while

@@ -59,9 +59,13 @@ pub struct RecallArgs {
     pub since: Option<String>,
     #[arg(long)]
     pub before: Option<String>,
-    /// Let the judge re-rank the top results (slower; uses Jev when it is configured).
-    #[arg(long)]
+    /// Let the judge grade the top results (slower; needs judge.provider = jev). This is
+    /// already the default when a model judge is configured (`search.default_mode`).
+    #[arg(long, conflicts_with = "fast")]
     pub precise: bool,
+    /// Skip the judge: local hybrid search only, even when a model judge is configured.
+    #[arg(long)]
+    pub fast: bool,
 }
 
 #[derive(Args)]
@@ -472,10 +476,13 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                 since: a.since,
                 before: a.before,
                 include_raw: a.raw,
+                // Neither flag: the daemon's `search.default_mode` decides.
                 mode: if a.precise {
-                    RecallMode::Precise
+                    Some(RecallMode::Precise)
+                } else if a.fast {
+                    Some(RecallMode::Fast)
                 } else {
-                    RecallMode::Fast
+                    None
                 },
                 limit: a.limit,
                 max_tokens: a.max_tokens,
