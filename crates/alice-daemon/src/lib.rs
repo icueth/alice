@@ -2,6 +2,7 @@
 
 pub mod backup;
 pub mod client;
+pub mod client_projects;
 pub mod compat;
 pub mod compat_schema;
 pub mod config;
