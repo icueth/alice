@@ -366,6 +366,8 @@ pub struct ImportMempalaceArgs {
     pub since: Option<String>,
     /// Map a MemPalace wing to an Alice project, as wing=project (repeatable). This fixes a wing's
     /// project on a fresh import; `alice projects merge <from> <into>` fixes it afterwards.
+    /// A re-run only adds what is new and never re-homes memories already imported: to re-home
+    /// those use `alice projects merge`, or import into a fresh home.
     #[arg(long, value_name = "WING=PROJECT", value_parser = parse_map_wing)]
     pub map_wing: Vec<(String, String)>,
     /// The collection that holds the drawers (default mempalace_drawers).
