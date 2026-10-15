@@ -460,8 +460,11 @@ async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) 
     }
     // Registered before the daemon starts or the job begins, so a Ctrl-C at any point ends
     // only this command.
+    #[cfg(unix)]
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .context("cannot listen for Ctrl-C")?;
+    #[cfg(windows)]
+    let mut sigint = tokio::signal::windows::ctrl_c().context("cannot listen for Ctrl-C")?;
     let req = ImportRequest {
         palace: Some(palace.to_string_lossy().into_owned()),
         dry_run: a.dry_run,
