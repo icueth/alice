@@ -3187,7 +3187,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **CPU requirement (controller's server finding):** `docs/server.md` lists the server's requirements, among them an
 **x86-64 CPU with AVX2**. The embedding runtime dies with "Illegal instruction" without it. On Proxmox, set the VM's CPU
-type to `host` (or `x86-64-v3`); Proxmox's default "QEMU Virtual CPU" lacks AVX. Say that `alice-server` checks this
+type to `host` (or `x86-64-v3`), then shut the VM down and start it again (a reboot from inside the guest does not
+apply a CPU type change); Proxmox's default "QEMU Virtual CPU" lacks AVX. Say that `alice-server` checks this
 before `add` and `upgrade`.
 
 **Addendum 3 amendment to Task 18:** `docs/server.md` (and the Thai section) describe the shared team memory:
@@ -3757,7 +3758,8 @@ impl TeamLink {
   `add` and `upgrade` first read `$R/proc/cpuinfo`. The test root prefixes it, so the stubs provide one. Its `flags`
   line must contain both `avx` and `avx2` as whole words. Otherwise refuse before any change, with: "this CPU lacks
   AVX/AVX2, which Alice's embedding runtime needs (it would die with 'Illegal instruction'); on Proxmox set the VM's
-  CPU type to host (or x86-64-v3) and reboot it". Scenarios: `add_refuses_a_cpu_without_avx2` and
+  CPU type to host (or x86-64-v3), then shut the VM down and start it again (a reboot from inside the guest does not
+  apply a CPU type change)". Scenarios: `add_refuses_a_cpu_without_avx2` and
   `upgrade_refuses_a_cpu_without_avx2` (each leaves nothing changed); the existing scenarios' stub `cpuinfo` carries
   `avx avx2`.
 - **Commit:** `feat(deploy): alice-server add --team and team provisioning (addendum 3)`.
