@@ -3185,6 +3185,11 @@ git commit -m "docs: server mode — admin and person guides, disk budget, trust
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
+**CPU requirement (controller's server finding):** `docs/server.md` lists the server's requirements, among them an
+**x86-64 CPU with AVX2**. The embedding runtime dies with "Illegal instruction" without it. On Proxmox, set the VM's CPU
+type to `host` (or `x86-64-v3`); Proxmox's default "QEMU Virtual CPU" lacks AVX. Say that `alice-server` checks this
+before `add` and `upgrade`.
+
 **Addendum 3 amendment to Task 18:** `docs/server.md` (and the Thai section) describe the shared team memory:
 - how a person asks for it ("save this to the shared memory");
 - that every team member can read it;
@@ -3747,4 +3752,12 @@ impl TeamLink {
   - `list_marks_the_team_store`.
 
   Every rm/mv stays guarded; the script stays bash 3.2 compatible and shellcheck clean.
+- **CPU preflight** (controller's server finding: the prebuilt ONNX Runtime in the binary dies with "Illegal
+  instruction" on a CPU without AVX/AVX2, such as Proxmox's default "QEMU Virtual CPU"; no product code changes).
+  `add` and `upgrade` first read `$R/proc/cpuinfo`. The test root prefixes it, so the stubs provide one. Its `flags`
+  line must contain both `avx` and `avx2` as whole words. Otherwise refuse before any change, with: "this CPU lacks
+  AVX/AVX2, which Alice's embedding runtime needs (it would die with 'Illegal instruction'); on Proxmox set the VM's
+  CPU type to host (or x86-64-v3) and reboot it". Scenarios: `add_refuses_a_cpu_without_avx2` and
+  `upgrade_refuses_a_cpu_without_avx2` (each leaves nothing changed); the existing scenarios' stub `cpuinfo` carries
+  `avx avx2`.
 - **Commit:** `feat(deploy): alice-server add --team and team provisioning (addendum 3)`.
