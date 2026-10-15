@@ -9,6 +9,8 @@ on:
   push:
     branches: ["feat/**"]
     paths: [".github/workflows/windows-real-model.yml"]
+permissions:
+  contents: read
 jobs:
   real-model:
     runs-on: windows-latest
