@@ -793,6 +793,7 @@ mod tests {
         let palace = home.join("palace");
         std::fs::create_dir_all(&palace).unwrap();
         build_sqlite_exact(&palace, &[spec("a", "text", "w", None)]);
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut dests = vec![
             palace.clone(),
             palace.join("new/deeper"),
