@@ -773,6 +773,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                     OutputFormat::Text
                 },
                 cwd: cwd(),
+                client_project: None,
             };
             let r = client(&home).await?.recall(&req).await?;
             print(json, &r, || recall_text(&r))
@@ -826,6 +827,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                     project: a.project,
                     max_tokens: a.max_tokens,
                     cwd: cwd(),
+                    client_project: None,
                 })
                 .await?;
             print(json, &r, || r.text.clone())

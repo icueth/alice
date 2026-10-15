@@ -48,6 +48,9 @@ pub const NON_SETTING_ENV: &[&str] = &[
     "ALICE_SERVICE_ROOT",
     "ALICE_SERVICE_FAIL",
     "ALICE_EMBEDDING_API_KEY",
+    // Server mode: the remote server a client talks to, and its token (both or neither).
+    "ALICE_REMOTE_URL",
+    "ALICE_REMOTE_TOKEN",
 ];
 
 /// The model the `local` embedding provider runs (`alice_embed::MODEL_ID`; `alice-core` does
@@ -1918,7 +1921,28 @@ fn read_project_text(path: &Path) -> Result<Option<String>, SettingError> {
     }
 }
 
-fn parse_project(name: &str, text: &str) -> Result<ProjectSettings, SettingError> {
+/// The first line of a server-side mirror whose client could not read the project's
+/// `.alice.toml` (server mode, spec §2.2 item 3). [`parse_project`] refuses it, so the rules fail closed.
+pub const UNREADABLE_MARKER: &str = "# alice: the client could not read .alice.toml";
+
+/// The one-line mirror text for an unreadable project file; `reason` is flattened to one line.
+pub fn unreadable_marker_text(reason: &str) -> String {
+    let reason: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(500)
+        .collect();
+    format!("{UNREADABLE_MARKER} ({})\n", reason.trim())
+}
+
+pub fn parse_project(name: &str, text: &str) -> Result<ProjectSettings, SettingError> {
+    if let Some(rest) = text.strip_prefix(UNREADABLE_MARKER) {
+        let why = rest.lines().next().unwrap_or("").trim();
+        return Err(err(
+            name,
+            format!("the client could not read this project's .alice.toml {why}; its rules fail closed until the client can read it"),
+        ));
+    }
     let p: ProjectSettings = toml::from_str(text).map_err(|e| {
         err(
             name,
@@ -2107,6 +2131,25 @@ impl ProjectSettingsCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_unreadable_marker_fails_with_a_clear_message() {
+        let text = unreadable_marker_text("permission denied\nsecond line");
+        assert!(text.starts_with(UNREADABLE_MARKER));
+        assert_eq!(text.lines().count(), 1, "one line: {text:?}");
+        let e = parse_project("/srv/x/.alice.toml", &text).unwrap_err();
+        assert!(e.message.contains("the client could not read this project's .alice.toml"), "{}", e.message);
+        assert!(e.message.contains("permission denied"), "{}", e.message);
+        // Ordinary text still parses.
+        assert!(parse_project("f", "[privacy]\ncloud_denied = true\n").unwrap().privacy.cloud_denied);
+    }
+
+    #[test]
+    fn the_remote_variables_are_not_settings() {
+        for v in ["ALICE_REMOTE_URL", "ALICE_REMOTE_TOKEN"] {
+            assert!(NON_SETTING_ENV.contains(&v), "{v}");
+        }
+    }
 
     /// N-1: an absurd age is refused (it once overflowed into "zero" and deleted everything).
     #[test]

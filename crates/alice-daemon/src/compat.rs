@@ -411,6 +411,7 @@ impl Service {
                 project: None,
                 max_tokens: Some(STATUS_CONTEXT_TOKENS),
                 cwd: call.cwd.clone(),
+                client_project: None,
             })
             .await
         {
@@ -568,6 +569,7 @@ impl Service {
                 limit: Some(limit),
                 max_tokens: Some(SEARCH_MAX_TOKENS),
                 cwd: call.cwd.clone(),
+                client_project: None,
                 ..Default::default()
             })
             .await
@@ -797,6 +799,7 @@ impl Service {
                 project: target.project.clone(),
                 topics: topic.iter().cloned().collect(),
                 cwd: call.cwd.clone(),
+                client_project: None,
                 author: self.author(call, added_by),
                 ..Default::default()
             })
@@ -1001,6 +1004,7 @@ impl Service {
                 topics: topic.iter().filter_map(|t| normalize_topic(t)).collect(),
                 importance: Some(2),
                 cwd: call.cwd.clone(),
+                client_project: None,
                 author: Author {
                     agent: Some(agent.clone()),
                     ..Default::default()

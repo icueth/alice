@@ -1,5 +1,6 @@
 //! Request and response types shared by the HTTP API, MCP tools and the CLI.
 
+use crate::error::{AliceError, Result};
 use crate::kg_types::*;
 use crate::model::{Author, Kind, Memory, Status};
 use crate::settings::{KeyInfo, SettingError, Source};
@@ -84,6 +85,10 @@ pub struct RecallRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub cwd: Option<String>,
+    /// Server mode: the project the remote client detected (spec §4.1). Wins over `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub client_project: Option<ClientProject>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -133,6 +138,73 @@ pub struct RecallResponse {
 }
 
 /// Save a memory: a decision, fix, fact, how-to, preference, warning or handoff worth keeping.
+/// Largest `.alice.toml` a remote client may send (spec §4.1).
+pub const CLIENT_RULES_MAX_BYTES: usize = 64 * 1024;
+
+/// The project a remote client detected for its working directory, with that working tree's
+/// privacy rules as the client read them (server mode, spec §3.3 and §4.1). A server uses it
+/// instead of running git on a path it does not have.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientProject {
+    /// `ProjectRef::key` as detected on the client (a normalized remote, or `path:<dir>`).
+    pub key: String,
+    pub slug: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    pub rules: ClientRules,
+}
+
+/// The working tree's `.alice.toml`, as the client found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ClientRules {
+    /// The working tree has no `.alice.toml`.
+    None,
+    /// Its content, at most [`CLIENT_RULES_MAX_BYTES`].
+    File { text: String },
+    /// It exists but could not be read; the rules fail closed.
+    Unreadable { reason: String },
+}
+
+impl ClientProject {
+    /// The limits of spec §4.1. A refusal names the field, never the value.
+    pub fn validate(&self) -> Result<()> {
+        let bad = |what: &str| {
+            Err(AliceError::invalid(format!(
+                "client_project.{what}; update the alice client, or report it if it is current"
+            )))
+        };
+        if self.key.is_empty() || self.key.len() > 1024 {
+            return bad("key must be 1 to 1024 bytes");
+        }
+        if self.key.chars().any(char::is_control) {
+            return bad("key must not contain control characters");
+        }
+        if self.key == "global" {
+            return bad("key must not be \"global\" (send no client_project for global)");
+        }
+        if self.slug.is_empty() || crate::normalize::slugify(&self.slug) != self.slug {
+            return bad("slug must be a non-empty slug (lower case, digits and -)");
+        }
+        if self.name.chars().count() > 200 {
+            return bad("name must be at most 200 characters");
+        }
+        if self.remote.as_ref().is_some_and(|r| r.len() > 1024) {
+            return bad("remote must be at most 1024 bytes");
+        }
+        match &self.rules {
+            ClientRules::File { text } if text.len() > CLIENT_RULES_MAX_BYTES => {
+                bad("rules.text must be at most 64 KiB")
+            }
+            ClientRules::Unreadable { reason } if reason.chars().count() > 500 => {
+                bad("rules.reason must be at most 500 characters")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct RememberRequest {
     /// The memory text. The first line becomes the title unless `title` is given.
@@ -158,6 +230,10 @@ pub struct RememberRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub cwd: Option<String>,
+    /// Server mode: the project the remote client detected (spec §4.1). Wins over `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub client_project: Option<ClientProject>,
     #[serde(default)]
     #[schemars(skip)]
     pub author: Author,
@@ -193,6 +269,10 @@ pub struct ContextRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub cwd: Option<String>,
+    /// Server mode: the project the remote client detected (spec §4.1). Wins over `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub client_project: Option<ClientProject>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -373,6 +453,10 @@ pub struct IngestRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub cwd: Option<String>,
+    /// Server mode: the project the remote client detected (spec §4.1). Wins over `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub client_project: Option<ClientProject>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -579,6 +663,75 @@ pub struct FactsResponse {
 mod tests {
     use super::*;
     use crate::store::memories::UpdateAction;
+
+    fn cp(key: &str, slug: &str) -> ClientProject {
+        ClientProject {
+            key: key.into(),
+            slug: slug.into(),
+            name: slug.into(),
+            remote: None,
+            rules: ClientRules::None,
+        }
+    }
+
+    #[test]
+    fn client_project_round_trips_in_the_documented_shape() {
+        let p = ClientProject {
+            key: "github.com/icueth/alice".into(),
+            slug: "alice".into(),
+            name: "alice".into(),
+            remote: Some("github.com/icueth/alice".into()),
+            rules: ClientRules::File { text: "[privacy]\ncloud_denied = true\n".into() },
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["rules"]["state"], "file");
+        assert_eq!(v["rules"]["text"], "[privacy]\ncloud_denied = true\n");
+        let back: ClientProject = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+        let none: ClientRules = serde_json::from_str(r#"{"state":"none"}"#).unwrap();
+        assert_eq!(none, ClientRules::None);
+        let bad: ClientRules =
+            serde_json::from_str(r#"{"state":"unreadable","reason":"permission denied"}"#).unwrap();
+        assert_eq!(bad, ClientRules::Unreadable { reason: "permission denied".into() });
+    }
+
+    #[test]
+    fn a_request_without_client_project_serialises_as_before() {
+        let r = RememberRequest { content: "x".into(), ..Default::default() };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("client_project").is_none());
+        let r: RecallRequest = serde_json::from_str(r#"{"query":"q"}"#).unwrap();
+        assert!(r.client_project.is_none());
+    }
+
+    #[test]
+    fn client_project_validation_refuses_what_the_spec_refuses() {
+        assert!(cp("github.com/a/b", "b").validate().is_ok());
+        let long = "k".repeat(1025);
+        for (case, p) in [
+            ("empty key", cp("", "b")),
+            ("global key", cp("global", "b")),
+            ("long key", cp(&long, "b")),
+            ("control char in key", cp("a\u{7}b", "b")),
+            ("empty slug", cp("k", "")),
+            ("slug not slugified", cp("k", "My Repo")),
+        ] {
+            let e = p.validate().unwrap_err().to_string();
+            assert!(!e.contains("My Repo") && !e.contains(&long), "{case}: echoed: {e}");
+        }
+        let mut p = cp("k", "b");
+        p.name = "n".repeat(201);
+        assert!(p.validate().is_err(), "long name");
+        let mut p = cp("k", "b");
+        p.remote = Some("r".repeat(1025));
+        assert!(p.validate().is_err(), "long remote");
+        let mut p = cp("k", "b");
+        p.rules = ClientRules::File { text: "#".repeat(CLIENT_RULES_MAX_BYTES + 1) };
+        assert!(p.validate().is_err(), "large rules");
+        let mut p = cp("k", "b");
+        p.rules = ClientRules::Unreadable { reason: "r".repeat(501) };
+        assert!(p.validate().is_err(), "long reason");
+    }
 
     #[test]
     fn requests_need_only_their_required_fields() {
