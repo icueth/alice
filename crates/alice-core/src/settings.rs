@@ -1610,11 +1610,22 @@ impl Settings {
 /// server tenant's settings must not point at (spec R18). Names other than `localhost` are not
 /// resolved here; the unit's `IPAddressDeny` covers a public name that resolves privately.
 pub fn host_is_private(host: &str) -> bool {
-    use std::net::{IpAddr, Ipv4Addr};
     let h = host.trim().trim_start_matches('[').trim_end_matches(']');
-    if h.eq_ignore_ascii_case("localhost") || h.to_ascii_lowercase().ends_with(".localhost") {
+    let h = h.strip_suffix('.').unwrap_or(h);
+    if domain_is_localhost(h) {
         return true;
     }
+    h.parse::<std::net::IpAddr>().is_ok_and(ip_is_private)
+}
+
+fn domain_is_localhost(d: &str) -> bool {
+    let d = d.to_ascii_lowercase();
+    let d = d.strip_suffix('.').unwrap_or(&d);
+    d == "localhost" || d.ends_with(".localhost")
+}
+
+fn ip_is_private(ip: std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr};
     let v4 = |a: Ipv4Addr| {
         let o = a.octets();
         a.is_loopback()
@@ -1624,9 +1635,10 @@ pub fn host_is_private(host: &str) -> bool {
             || a.is_broadcast()
             || (o[0] == 100 && (64..128).contains(&o[1]))
     };
-    match h.parse::<IpAddr>() {
-        Ok(IpAddr::V4(a)) => v4(a),
-        Ok(IpAddr::V6(a)) => {
+    match ip {
+        IpAddr::V4(a) => v4(a),
+        IpAddr::V6(a) => {
+            // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) forms.
             if let Some(m) = a.to_ipv4_mapped() {
                 return v4(m);
             }
@@ -1635,8 +1647,8 @@ pub fn host_is_private(host: &str) -> bool {
                 || a.is_unspecified()
                 || (s & 0xfe00) == 0xfc00
                 || (s & 0xffc0) == 0xfe80
+                || (a.segments()[..6].iter().all(|&x| x == 0) && a.to_ipv4().is_some_and(v4))
         }
-        Err(_) => false,
     }
 }
 
@@ -1657,7 +1669,7 @@ fn resolves_inside(home: &Path, p: &str) -> bool {
     // Canonicalize the longest existing ancestor, then add the rest back.
     let mut existing = lexical.clone();
     let mut rest = Vec::new();
-    while !existing.exists() {
+    while std::fs::symlink_metadata(&existing).is_err() {
         match (
             existing.file_name().map(|n| n.to_owned()),
             existing.parent(),
@@ -1680,12 +1692,24 @@ fn resolves_inside(home: &Path, p: &str) -> bool {
 }
 
 fn check_tenant_endpoint(e: &mut Vec<SettingError>, key: &str, url: &str) {
-    match url_parts(url) {
-        Some(u) if u.scheme == "https" && !u.host.is_empty() && !host_is_private(u.host) => {}
-        _ => e.push(err(
+    use url::Host;
+    // Parse as the HTTP client does, so `127.1`, `2130706433` and `0x7f.0.0.1` are seen as
+    // the loopback addresses they are.
+    let public = url::Url::parse(url.trim())
+        .ok()
+        .filter(|u| u.scheme() == "https")
+        .and_then(|u| match u.host() {
+            Some(Host::Ipv4(a)) => Some(!ip_is_private(a.into())),
+            Some(Host::Ipv6(a)) => Some(!ip_is_private(a.into())),
+            Some(Host::Domain(d)) => Some(!domain_is_localhost(d)),
+            None => None,
+        })
+        .unwrap_or(false);
+    if !public {
+        e.push(err(
             key,
             "on a server tenant this must be an https:// URL of a public host (not localhost, a private network or a link-local address)",
-        )),
+        ));
     }
 }
 
@@ -1695,11 +1719,14 @@ fn check_tenant_endpoint(e: &mut Vec<SettingError>, key: &str, url: &str) {
 pub fn validate_tenant(s: &Settings, home: &Path, port_from_file: bool) -> Vec<SettingError> {
     let mut e = Vec::new();
     if let Some(dir) = s.backup.dir.as_deref().filter(|d| !d.trim().is_empty())
-        && !resolves_inside(home, dir)
+        && (Path::new(dir)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+            || !resolves_inside(home, dir))
     {
         e.push(err(
             "backup.dir",
-            "on a server tenant this must be a directory inside the tenant's data directory",
+            "on a server tenant this must be a directory inside the tenant's data directory, written without `..`",
         ));
     }
     if s.embedding.provider == EmbeddingProvider::Ollama {
@@ -3925,6 +3952,58 @@ mod tests {
                 "{key}: {toml}"
             );
         }
+        for dir in ["backups/../backups"] {
+            assert!(
+                tenant_errors(&format!("[backup]\ndir = \"{dir}\"\n"), &home, false)
+                    .contains(&"backup.dir".to_string()),
+                "{dir}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/nonexistent/x", home.join("dangling")).unwrap();
+            for dir in ["escape/../x", "dangling/b"] {
+                assert!(
+                    tenant_errors(&format!("[backup]\ndir = \"{dir}\"\n"), &home, false)
+                        .contains(&"backup.dir".to_string()),
+                    "{dir}"
+                );
+            }
+        }
+        for host in [
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "localhost.",
+            "[::ffff:10.0.0.1]",
+            "[::127.0.0.1]",
+        ] {
+            for sect in [
+                "[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint",
+                "[judge.jev]\nendpoint",
+            ] {
+                let key = if sect.starts_with("[emb") {
+                    "embedding.endpoint"
+                } else {
+                    "judge.jev.endpoint"
+                };
+                let toml = format!("{sect} = \"https://{host}/v1\"\n");
+                let r = resolve(Some(&toml), &[]).unwrap_or_else(|e| panic!("{host}: {e:?}"));
+                assert!(
+                    validate_tenant(&r.settings, &home, false)
+                        .iter()
+                        .any(|e| e.key == key),
+                    "{host} {key}"
+                );
+            }
+        }
+        for host in ["api.openai.com", "203.0.113.7"] {
+            let toml = format!(
+                "[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"https://{host}/v1\"\n[judge.jev]\nendpoint = \"https://{host}/v1\"\n"
+            );
+            assert!(tenant_errors(&toml, &home, false).is_empty(), "{host}");
+        }
+        assert!(host_is_private("localhost."));
         // `resolve` itself refuses plain http to a public host, so set this one directly.
         let mut plain_http = resolve(
             Some("[embedding]\nprovider = \"openai\"\nmodel = \"m\"\n"),

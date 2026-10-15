@@ -58,6 +58,7 @@ dependencies = [
  "tracing",
  "ulid",
  "unicode-normalization",
+ "url",
  "usearch",
 ]
 
