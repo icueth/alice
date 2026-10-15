@@ -416,6 +416,12 @@ Measured for M2 on an Apple M4 Pro with `alice bench` ([full results](docs/bench
 
 M1 missed the memory budget (about 1.4 GB projected with the model). M2 meets it: chunk vectors moved into a 53 MB sign-bit index (the int8 graph took 508 MB) and the embedding model runs on ONNX Runtime directly (about 350 MB loaded instead of 600). The 1M run fills the index with synthetic vectors under the real model's id (embedding a million chunks takes hours; a vector costs the same whatever its values), then starts a real daemon that loads the real model, embeds 256 new memories and serves four bursts of 64 concurrent recalls (no errors). Search quality is unchanged: the gold set keeps MRR 1.000 with all 13 queries in the top 3, and recall@10 of the chunk index against the exact top 10 is 0.99 at 96,000 real passages.
 
+## Use Alice from a server
+
+A small team can share one Linux server. Each person gets their own Alice daemon behind `https://<host>/u/<name>`, and agents (Claude Code, Codex and others) connect straight to the MCP endpoint `https://<host>/u/<name>/mcp` with a bearer token. No client binary is needed, so this also works on Windows. An optional shared team memory lets a person tell their agent "save this to the shared memory"; every team member can read it, and only its author or the admin can change it. The server's admin can read every person's memory, and a repository's `.alice.toml` does not apply over direct MCP. The server needs an x86-64 CPU with AVX2.
+
+The admin guide (setup, `alice-server`, disk budget, backups, privacy) and the setup for each agent are in [docs/server.md](docs/server.md).
+
 ## Roadmap
 
 | Phase | Scope | Status |

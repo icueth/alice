@@ -416,6 +416,80 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 
 ตอนจบ M1 หน่วยความจำยังไม่ผ่านเป้า (คาดว่าราว 1.4GB เมื่อรวมโมเดล) M2 ทำให้ผ่านได้: vector ของ chunk ย้ายไปอยู่ใน index แบบ sign-bit ขนาด 53MB (กราฟ int8 เดิมใช้ 508MB) และโมเดล embedding รันบน ONNX Runtime โดยตรง (โหลดแล้วราว 350MB แทนที่จะเป็น 600MB) รอบ 1M chunk เติม index ด้วย vector สังเคราะห์ที่ใช้ id ของโมเดลจริง (การ embed ล้านชิ้นใช้เวลาหลายชั่วโมง และ vector กินที่ใน index เท่ากันไม่ว่าค่าข้างในจะเป็นอะไร) แล้วเปิด daemon จริงที่โหลดโมเดลจริง embed memory ใหม่ 256 อัน และรับ recall พร้อมกัน 64 คำขอ 4 ชุด (ไม่มี error) คุณภาพการค้นไม่ตก: ชุด gold ยังได้ MRR 1.000 โดยทั้ง 13 คำถามอยู่ใน top 3 และ recall@10 ของ chunk index เทียบกับ top 10 ที่แท้จริงอยู่ที่ 0.99 กับ passage จริง 96,000 ชิ้น
 
+## ใช้ Alice ผ่านเซิร์ฟเวอร์
+
+ทีมเล็ก ๆ ใช้เซิร์ฟเวอร์ Linux เครื่องเดียวร่วมกันได้ แต่ละคนมี Alice daemon ของตัวเองที่ `https://<host>/u/<name>` และ agent (Claude Code, Codex ฯลฯ) เชื่อมต่อกับ MCP endpoint `https://<host>/u/<name>/mcp` ได้โดยตรงด้วย bearer token ไม่ต้องติดตั้งโปรแกรมฝั่งผู้ใช้ จึงใช้บน Windows ได้ด้วย และมี "ความจำส่วนกลาง" ของทีมให้เลือกใช้: สั่ง agent ว่า "บันทึกลงความจำส่วนกลางด้วย" ทุกคนในทีมอ่านได้ แต่เจ้าของเรื่องหรือแอดมินเท่านั้นที่แก้ได้ แอดมินของเซิร์ฟเวอร์อ่านความจำของทุกคนได้ และไฟล์ `.alice.toml` ของ repo ไม่มีผลเมื่อเชื่อมต่อ MCP ตรง เซิร์ฟเวอร์ต้องใช้ CPU x86-64 ที่มี AVX2
+
+คู่มือฉบับเต็มอยู่ที่ [docs/server.md](docs/server.md) (ภาษาอังกฤษ) ด้านล่างเป็นสรุปภาษาไทยในลำดับเดียวกัน
+
+### สำหรับแอดมิน
+
+1. ตั้งค่าครั้งแรก: เขียน `ALICE_PUBLIC_HOST=<host>` ลง `/etc/alice/server.env` แล้วติดตั้งสคริปต์ `deploy/server/alice-server` ไว้ที่ `/usr/local/sbin/alice-server` สคริปต์จัดการ Caddyfile เอง และเก็บไฟล์เดิมไว้เป็น `/etc/caddy/Caddyfile.pre-alice`
+2. คำสั่ง:
+
+   ```
+   alice-server add <name>                 # สร้างผู้ใช้ใหม่ แสดง URL และ token ครั้งเดียว
+   alice-server add --team team            # สร้างความจำส่วนกลาง (ไม่มี URL ของตัวเอง)
+   alice-server remove <name> [--yes]      # เก็บ archive แล้วลบ
+   alice-server rotate <name>              # ออก token ใหม่
+   alice-server list                       # รายชื่อ สถานะ พื้นที่ดิสก์
+   alice-server upgrade <binary>           # อัปเกรดทุกคน ย้อนกลับเองถ้าไม่ขึ้น
+   alice-server import <name> <palace-dir> [--dry-run]
+   alice-server cli <name> <คำสั่ง alice…>
+   ```
+
+3. CPU ต้องมี AVX2 บน Proxmox ให้ตั้งชนิด CPU ของ VM เป็น `host` (หรือ `x86-64-v3`) แล้ว **ปิด VM แล้วเปิดใหม่** การ reboot จากในเครื่องไม่ทำให้ค่านี้มีผล `alice-server` ตรวจเรื่องนี้ก่อน `add` และ `upgrade`
+4. การ import: คนที่ไม่มีโปรแกรม `alice` ส่ง palace ให้แอดมิน แอดมินรัน `alice-server import <name> <palace-dir>` (ลอง `--dry-run` ก่อนได้ ซึ่งทำงานบนสำเนาและไม่แตะโฟลเดอร์เดิม) การ import จริงจะ **ย้ายและใช้โฟลเดอร์นั้นหมด** และลบสำเนาในเซิร์ฟเวอร์เมื่อจบงาน
+5. ตั้งค่าและ key ของ Jev: ใช้ `alice-server cli <name> config set-secret typesafe` แล้ววาง key เมื่อถูกถาม หรือส่งผ่าน stdin ห้ามใส่ key เป็นอาร์กิวเมนต์ในบรรทัดคำสั่ง จากนั้น `alice-server cli <name> config set judge.provider jev`
+6. ความเป็นส่วนตัว: เซิร์ฟเวอร์ปิดบัง secret (redact) เสมอ `.alice.toml` ของ repo ไม่มีผลทาง MCP ตรง การห้ามส่งโปรเจกต์ขึ้น cloud ตั้งที่รายการ `privacy.cloud_denied_projects` ของผู้ใช้ เช่น `alice-server cli <name> config set privacy.cloud_denied_projects '["my-secret-app"]'`
+7. ดิสก์: แต่ละคนมี backup ตามกำหนด 2 ชุด (ทำเองไม่ได้) `alice-server list` เตือนเมื่อพื้นที่ว่างต่ำกว่า 3 GB ให้ลบ archive เก่าของ `remove` หรือตั้ง `ALICE_BACKUP_DAILY=1` ในไฟล์ของผู้ใช้นั้นแล้วรีสตาร์ท การเก็บสำเนานอกเครื่องเป็นหน้าที่ของแอดมิน
+8. ไม่แบนตาม IP เพราะ NAT ทำให้ทุกการเชื่อมต่อมาจาก IP เดียว ตัวอย่าง filter fail2ban (ปิดไว้) อยู่ใน `docs/server.md` สำหรับแอดมินที่ NAT ส่งต่อ IP จริง
+
+### สำหรับผู้ใช้
+
+เก็บ token ไว้ในตัวแปรสภาพแวดล้อม `ALICE_TOKEN` ห้ามใส่ใน URL หรือ commit ลง repo
+
+- **Claude Code:** สร้าง `.mcp.json` ใน repo (ไม่มี secret จึง commit ได้):
+
+  ```json
+  {
+    "mcpServers": {
+      "alice": {
+        "type": "http",
+        "url": "${ALICE_URL}?project=<slug>",
+        "headers": { "Authorization": "Bearer ${ALICE_TOKEN}" }
+      }
+    }
+  }
+  ```
+
+  หรือใช้คำสั่ง (ใส่เครื่องหมายคำพูดเดี่ยวเพื่อไม่ให้ shell แทนค่า token):
+
+  ```bash
+  claude mcp add --transport http --scope project alice \
+    'https://<host>/u/<name>/mcp?project=<slug>' \
+    --header 'Authorization: Bearer ${ALICE_TOKEN}'
+  ```
+
+- **Codex** (`~/.codex/config.toml`):
+
+  ```toml
+  [mcp_servers.alice]
+  url = "https://<host>/u/<name>/mcp"
+  bearer_token_env_var = "ALICE_TOKEN"
+  ```
+
+- **โปรเจกต์ที่ใช้:** ลำดับคือ argument `project` ของ tool, แล้ว `?project=<slug>` ใน URL (ยาวไม่เกิน 100 ตัวอักษร), แล้วชื่อโฟลเดอร์ของ root แรกที่ agent ส่งมา, สุดท้ายคือ `global`
+- **ความจำส่วนกลาง:** บอก agent ว่า "บันทึกอันนี้ลงความจำส่วนกลางด้วย" ความจำนั้นไปอยู่ที่ส่วนกลางที่เดียว ไม่มีสำเนาส่วนตัว ทุกคนอ่านได้ ผลค้นหาของ `recall` และ `context` จะรวมความจำส่วนกลางและบอกชื่อเจ้าของ แก้ ลบ หรือ undo ได้เฉพาะเรื่องที่ตัวเองเขียน (หรือผ่านแอดมิน) ถ้าส่วนกลางไม่ตอบ การบันทึกส่วนกลางจะล้มเหลวโดยบอกชัดเจน และการค้นหาจะได้ผลส่วนตัวพร้อมหมายเหตุ ส่วนกลางไม่มี URL ของตัวเอง
+- **โมเดลตัดสิน (judge) กับความจำส่วนกลาง:** ในโหมด precise ความจำส่วนกลางจะถูกส่งให้ judge ของคุณให้คะแนนก็ต่อเมื่อนโยบาย cloud ของส่วนกลางสำหรับโปรเจกต์นั้น **และ** นโยบาย cloud ของคุณสำหรับโปรเจกต์นั้นอนุญาตทั้งคู่ ถ้าฝ่ายใดห้าม จะไม่ถูกส่งให้ judge เลย และจะแสดงต่อท้ายผลที่ให้คะแนนแล้ว
+- **Jev และการตั้งค่า:** ขอให้แอดมินรัน `alice-server cli` ให้ (ดูด้านบน) ส่ง key ผ่านช่องทางส่วนตัวเท่านั้น
+- **Import MemPalace:** ส่งโฟลเดอร์ palace ให้แอดมินเป็นคนรัน `alice-server import`
+- **แพลตฟอร์ม:** โปรแกรม `alice` ใช้ได้บน macOS และ Linux ส่วน Windows หรือเครื่องที่ไม่มีโปรแกรม ให้เชื่อม agent เข้ากับ MCP endpoint ของเซิร์ฟเวอร์ ไคลเอนต์ `alice remote` ยังไม่ได้สร้าง จึงยังไม่มีให้ใช้
+
+### ข้อควรรู้
+
+แอดมินอ่านความจำและ key ของทุกคนได้ อย่าเก็บสิ่งที่ไม่อยากให้แอดมินเห็นไว้ใน Alice ส่วนวิธีแก้ปัญหาตามข้อความที่เจอ ดูตาราง Troubleshooting ใน [docs/server.md](docs/server.md)
+
 ## Roadmap
 
 | ช่วง | ขอบเขต | สถานะ |
