@@ -582,3 +582,288 @@ async fn an_admin_import_matches_a_local_import() {
     assert_eq!(l.drawers_seen, t.drawers_seen);
     assert_eq!(l.drawers_accounted, t.drawers_accounted);
 }
+
+// ---------------------------------------------------------------------------------------
+// Shared writes and the rules for changing shared memories (spec §2.10, R34).
+// ---------------------------------------------------------------------------------------
+
+use alice_core::api::{GetRequest, RememberRequest, RememberStatus, UndoRequest, UpdateRequest};
+use alice_core::model::Author;
+use alice_core::store::memories::{MemoryUpdate, UpdateAction};
+
+const SHARED_REFUSAL: &str = "only the author or the admin can change a shared memory";
+
+fn shared(content: &str, agent: Option<&str>) -> RememberRequest {
+    RememberRequest {
+        content: content.into(),
+        shared: true,
+        author: Author {
+            agent: agent.map(Into::into),
+            model: Some("m1".into()),
+            session: Some("s1".into()),
+        },
+        ..Default::default()
+    }
+}
+
+fn edit(id: &str, body: &str, agent: &str) -> UpdateRequest {
+    UpdateRequest {
+        id: id.into(),
+        update: MemoryUpdate {
+            action: UpdateAction::Edit,
+            body: Some(body.into()),
+            ..Default::default()
+        },
+        author: Author {
+            agent: Some(agent.into()),
+            ..Default::default()
+        },
+    }
+}
+
+/// The author of a memory as the team store holds it.
+async fn team_author(s: &Server, team_id: &str) -> Author {
+    let id = team_id.strip_prefix("team:").unwrap();
+    let got = s
+        .team
+        .as_ref()
+        .unwrap()
+        .svc
+        .get(GetRequest {
+            ids: vec![id.into()],
+            include_provenance: false,
+        })
+        .await
+        .unwrap();
+    got.memories[0].memory.author.clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_remember_lands_in_the_team_store_with_its_tenant_as_author_and_not_in_the_personal_one()
+ {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    let ann = s.tenant("ann");
+    let mut req = shared("The release train leaves on Fridays", Some("cursor"));
+    req.project_hint = Some("shared-proj".into());
+    let r = ann.svc.remember_or_spool(req).await.unwrap();
+    assert_eq!(r.status, RememberStatus::New);
+    assert!(r.shared);
+    let id = r.id.clone().unwrap();
+    assert!(id.starts_with("team:"), "{id}");
+    assert_eq!(r.project, "shared-proj");
+    let a = team_author(&s, &id).await;
+    assert_eq!(a.agent.as_deref(), Some("ann/cursor"));
+    assert_eq!(a.session, None);
+    assert_eq!(
+        stored(&s.team.as_ref().unwrap().home),
+        vec![("shared-proj".to_string(), None)]
+    );
+    assert!(stored(&ann.home).is_empty(), "no personal copy");
+    assert!(stored(&s.tenant("bob").home).is_empty());
+    // A client that names no agent is the tenant alone.
+    let r = ann
+        .svc
+        .remember(shared("A second shared note", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        team_author(&s, &r.id.unwrap()).await.agent.as_deref(),
+        Some("ann")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_sent_author_on_a_shared_write_is_replaced() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    let r = s
+        .tenant("ann")
+        .svc
+        .remember(shared("Claims to be bob", Some("bob")))
+        .await
+        .unwrap();
+    let a = team_author(&s, &r.id.unwrap()).await;
+    // Whatever the client says, the tenant part is the caller's own.
+    assert_eq!(a.agent.as_deref(), Some("ann/bob"));
+    assert_eq!(a.model.as_deref(), Some("m1"));
+    assert_eq!(a.session, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_remember_without_a_team_link_is_a_clear_invalid() {
+    let s = Server::start(&["solo"]).await;
+    let e = s
+        .tenant("solo")
+        .svc
+        .remember_or_spool(shared("Nowhere to go", Some("cursor")))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, alice_core::error::AliceError::Invalid(m)
+            if m == "no team memory is configured on this server; ask the admin"),
+        "{e:?}"
+    );
+    assert!(stored(&s.tenant("solo").home).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_remember_with_the_team_store_down_fails_and_spools_nothing() {
+    let s = Server::start_with_team(&["ann"]).await;
+    let ann = s.tenant("ann");
+    ann.svc.team().unwrap().ensure_verified().await.unwrap();
+    s.stop_team().await;
+    let e = ann
+        .svc
+        .remember_or_spool(shared("Team is away", Some("cursor")))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("the team memory is unreachable"), "{e}");
+    assert!(e.contains("nothing was saved"), "{e}");
+    assert!(e.contains("save it personally without shared"), "{e}");
+    let team = s.team.as_ref().unwrap();
+    assert!(!e.contains(&team.token), "{e}");
+    assert!(!e.contains(&team.port.to_string()), "{e}");
+    let spooled = std::fs::read_dir(ann.home.spool_dir())
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(spooled, 0, "a shared write is never spooled");
+    assert!(stored(&ann.home).is_empty(), "and never saved personally");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_author_updates_a_shared_memory_and_anyone_reads_it() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    let (ann, bob) = (&s.tenant("ann").svc, &s.tenant("bob").svc);
+    let id = ann
+        .remember(shared("Original shared text", Some("cursor")))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    // Anyone reads it, with the team prefix, its source and its author's tenant.
+    let got = bob
+        .get(GetRequest {
+            ids: vec![id.clone()],
+            include_provenance: false,
+        })
+        .await
+        .unwrap();
+    assert!(got.missing.is_empty(), "{:?}", got.missing);
+    assert_eq!(got.memories[0].memory.id, id);
+    assert_eq!(got.memories[0].source.as_deref(), Some("team"));
+    assert_eq!(got.memories[0].author_name.as_deref(), Some("ann"));
+    // Bob cannot change it.
+    let e = bob
+        .update(edit(&id, "Bob rewrites it", "cursor"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, alice_core::error::AliceError::Invalid(m) if m == SHARED_REFUSAL),
+        "{e:?}"
+    );
+    // Ann can.
+    let out = ann
+        .update(edit(&id, "Ann's corrected text", "cursor"))
+        .await
+        .unwrap();
+    assert_eq!(out.memory.id, id);
+    assert_eq!(out.memory.body, "Ann's corrected text");
+    assert!(out.event_id.as_deref().unwrap().starts_with("team:"));
+    let team_id = id.strip_prefix("team:").unwrap().to_string();
+    let stored_body = s
+        .team
+        .as_ref()
+        .unwrap()
+        .svc
+        .get(GetRequest {
+            ids: vec![team_id],
+            include_provenance: false,
+        })
+        .await
+        .unwrap()
+        .memories[0]
+        .memory
+        .body
+        .clone();
+    assert_eq!(stored_body, "Ann's corrected text");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_author_undoes_a_shared_change() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    let (ann, bob) = (&s.tenant("ann").svc, &s.tenant("bob").svc);
+    let id = ann
+        .remember(shared("Shared and then edited", Some("cursor")))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let event = ann
+        .update(edit(&id, "An edit worth undoing", "cursor"))
+        .await
+        .unwrap()
+        .event_id
+        .unwrap();
+    assert!(event.starts_with("team:"), "{event}");
+    let undo = |e: &str| UndoRequest {
+        event_id: e.into(),
+        author: Author {
+            agent: Some("cursor".into()),
+            ..Default::default()
+        },
+    };
+    let e = bob.undo(undo(&event)).await.unwrap_err();
+    assert!(
+        matches!(&e, alice_core::error::AliceError::Invalid(m) if m == SHARED_REFUSAL),
+        "{e:?}"
+    );
+    let r = ann.undo(undo(&event)).await.unwrap();
+    assert!(r.undone, "{}", r.message);
+    let body = ann
+        .get(GetRequest {
+            ids: vec![id],
+            include_provenance: false,
+        })
+        .await
+        .unwrap()
+        .memories[0]
+        .memory
+        .body
+        .clone();
+    assert_eq!(body, "Shared and then edited");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_lists_remember_with_a_shared_flag_and_saves_to_the_team_memory() {
+    let s = Server::start_with_team(&["ann"]).await;
+    let t = s.tenant("ann");
+    let url = format!("{}/mcp", s.url("ann"));
+    let c = connect(&url, Some(&t.token), None).await.unwrap();
+    let tools = c.list_all_tools().await.unwrap();
+    let remember = tools.iter().find(|t| t.name == "remember").unwrap();
+    let props = remember.input_schema.get("properties").unwrap();
+    let flag = props.get("shared").expect("remember exposes `shared`");
+    assert_eq!(flag["type"], "boolean", "{flag}");
+    let d = flag["description"].as_str().unwrap();
+    assert!(d.contains("shared"), "{d}");
+    assert!(d.contains("every team member"), "{d}");
+    let reply = try_tool(
+        &c,
+        "remember",
+        serde_json::json!({"content": "Central note over MCP", "shared": true}),
+    )
+    .await
+    .unwrap();
+    assert!(reply.contains("Saved to the team memory"), "{reply}");
+    assert!(stored(&t.home).is_empty());
+    assert_eq!(stored(&s.team.as_ref().unwrap().home).len(), 1);
+    let id = reply
+        .split_whitespace()
+        .find(|w| w.starts_with("team:"))
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        team_author(&s, &id).await.agent.as_deref(),
+        Some("ann/team-agent")
+    );
+}

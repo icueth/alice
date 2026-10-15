@@ -36,6 +36,7 @@ pub struct Server {
     recorders: Vec<(String, Arc<Mutex<Vec<Seen>>>)>,
     paused: Arc<AtomicBool>,
     stop: CancellationToken,
+    team_stop: CancellationToken,
     _dirs: Vec<tempfile::TempDir>,
 }
 
@@ -114,6 +115,7 @@ impl Server {
         let mut dirs = Vec::new();
         let mut team = None;
         let mut team_url = None;
+        let team_stop = stop.child_token();
         if with_team {
             let dir = tempfile::tempdir().unwrap();
             let home = AliceHome::new(dir.path().to_path_buf());
@@ -130,9 +132,13 @@ impl Server {
             let token = alice_daemon::discovery::load_or_create_token(&home).unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
-            let app =
-                alice_daemon::http::router(svc.clone(), token.clone(), port, stop.child_token());
-            let ct = stop.clone();
+            let app = alice_daemon::http::router(
+                svc.clone(),
+                token.clone(),
+                port,
+                team_stop.child_token(),
+            );
+            let ct = team_stop.clone();
             tokio::spawn(async move {
                 axum::serve(listener, app)
                     .with_graceful_shutdown(async move { ct.cancelled().await })
@@ -208,6 +214,7 @@ impl Server {
             recorders,
             paused,
             stop,
+            team_stop,
             _dirs: dirs,
         }
     }
@@ -228,6 +235,13 @@ impl Server {
             .find(|(n, _)| n == name)
             .map(|(_, r)| r.lock().clone())
             .unwrap_or_default()
+    }
+
+    /// Stops the team store's listener, as when its daemon is down. Its service stays alive, so
+    /// its database can still be read.
+    pub async fn stop_team(&self) {
+        self.team_stop.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
     /// While paused, routed requests get a 502, as when a tenant's daemon is down.

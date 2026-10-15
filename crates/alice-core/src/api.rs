@@ -249,6 +249,12 @@ pub struct RememberRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub project_hint: Option<String>,
+    /// Set only when the user explicitly asks to save this to the shared, team or central memory
+    /// ("ความจำส่วนกลาง", "for the team"). A shared memory is kept only in the team store and is
+    /// visible to every team member; only its author or the admin can change it later. Leave
+    /// it unset for anything personal.
+    #[serde(default)]
+    pub shared: bool,
     #[serde(default)]
     #[schemars(skip)]
     pub author: Author,
@@ -271,6 +277,9 @@ pub struct RememberResponse {
     /// Only for `spooled`: why the request was queued and when it will be saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// True when the memory went to the team store (its id then starts with `team:`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared: bool,
 }
 
 /// Briefing for the current project: key memories, warnings, recent decisions, last handoff, preferences.
@@ -326,6 +335,12 @@ pub struct MemoryFull {
     /// Set on `update` answers: the event that recorded the change (pass it to `undo`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
+    /// `team` for a memory read from the team store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// For a team memory: the tenant that wrote it (the `<tenant>` part of its author).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -871,6 +886,8 @@ mod tests {
             links: Vec::new(),
             provenance: Vec::new(),
             event_id: None,
+            source: None,
+            author_name: None,
         };
         assert!(
             serde_json::to_value(&full)

@@ -907,6 +907,15 @@ pub(crate) async fn remember_via(
     client: std::result::Result<DaemonClient, Unavailable>,
     req: RememberRequest,
 ) -> Result<RememberResponse> {
+    // A shared write goes to the team store through the daemon; it is never queued here.
+    if req.shared {
+        return match client {
+            Ok(c) => c.remember(&req).await,
+            Err(u) => Err(AliceError::Other(format!(
+                "{u}; nothing was saved. Retry, or save it personally without shared"
+            ))),
+        };
+    }
     let (cause, note) = match client {
         Ok(c) => match c.remember(&req).await {
             Err(e) => match spool_cause(&e) {
@@ -926,6 +935,7 @@ pub(crate) async fn remember_via(
         status: RememberStatus::Spooled,
         project: String::new(),
         reason: Some(note),
+        shared: false,
     })
 }
 

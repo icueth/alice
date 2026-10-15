@@ -25,14 +25,14 @@ use alice_core::error::{AliceError, Result};
 use alice_core::ids::new_id;
 use alice_core::judge::jev::{JevPolicy, JevTransport};
 use alice_core::judge::{Judge, JudgeError, JudgeMemory, RELEVANCE_ANSWERS, RELEVANCE_PARTIAL};
-use alice_core::model::{Kind, limits};
+use alice_core::model::{Author, Kind, limits};
 use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
 use alice_core::redact::Redactor;
 use alice_core::search::{self, SearchOutput, SearchParams, pack};
 use alice_core::settings::{self, DefaultRecallMode, SettingError, Settings};
 use alice_core::store::embeddings;
-use alice_core::store::events::Actor;
+use alice_core::store::events::{Actor, EventRow};
 use alice_core::store::history::UndoOutcome;
 use alice_core::store::kg::{self, FactOutcome};
 use alice_core::store::memories::{self, InsertOutcome, NewMemoryInput};
@@ -1395,6 +1395,9 @@ impl Service {
     }
 
     pub async fn remember(&self, req: RememberRequest) -> Result<RememberResponse> {
+        if req.shared {
+            return self.remember_shared(req).await;
+        }
         let _busy = self.activity.enter();
         let project = self.choose(req.scope()).await?;
         // Before anything else touches the text: the writer, the spool and the logs only ever
@@ -1421,12 +1424,14 @@ impl Service {
                 status: RememberStatus::New,
                 project: p.slug,
                 reason: None,
+                shared: false,
             }),
             WriteOutcome::Remembered(InsertOutcome::Duplicate { id }, p) => Ok(RememberResponse {
                 id: Some(id),
                 status: RememberStatus::Duplicate,
                 project: p.slug,
                 reason: None,
+                shared: false,
             }),
             other => Err(unexpected(other)),
         }
@@ -1514,6 +1519,11 @@ impl Service {
     /// daemon (the JSON API, MCP over HTTP) remembers through this. If even the spool cannot be
     /// written (often the same cause, a full disk), the read-only error says what to do.
     pub async fn remember_or_spool(&self, req: RememberRequest) -> Result<RememberResponse> {
+        // A shared write goes to the team store and never touches this database, so there is
+        // nothing to spool and nothing to fall back to.
+        if req.shared {
+            return self.remember_shared(req).await;
+        }
         let read_only = match self.remember(req.clone()).await {
             Err(AliceError::ReadOnly(reason)) => reason,
             other => return other,
@@ -1528,6 +1538,7 @@ impl Service {
                 status: RememberStatus::Spooled,
                 project: String::new(),
                 reason: Some(spool::read_only_note(&read_only)),
+                shared: false,
             }),
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "cannot spool a remember while read-only");
@@ -1538,6 +1549,216 @@ impl Service {
                 Err(AliceError::ReadOnly(read_only))
             }
         }
+    }
+
+    // ------------------------------------------------------------------ shared team memory
+
+    /// The team link and this tenant's name, or the error that says why a shared call cannot be made.
+    fn team_parts(&self) -> Result<(&Arc<crate::team::TeamLink>, &str)> {
+        let (Some(team), Some(tenant)) = (self.team(), self.tenant_name()) else {
+            return Err(AliceError::Invalid(
+                "no team memory is configured on this server; ask the admin".into(),
+            ));
+        };
+        Ok((team, tenant))
+    }
+
+    /// The author the team store records (R34): `<tenant>/<client agent>`, or the tenant alone.
+    /// Whatever the client sent, the part before the first `/` is this tenant, and the session
+    /// is dropped.
+    fn shared_author(tenant: &str, sent: &Author) -> Author {
+        let agent = match sent
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            Some(a) => format!("{tenant}/{a}"),
+            None => tenant.to_string(),
+        };
+        Author {
+            agent: Some(agent),
+            model: sent.model.clone(),
+            session: None,
+        }
+    }
+
+    /// A call to the team store that is a read or a change of an existing memory: its errors
+    /// already say what failed.
+    async fn team_json<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Req>,
+    ) -> Result<Resp> {
+        let (team, _) = self.team_parts()?;
+        team.call(method, path, body, SHARED_TIMEOUT).await
+    }
+
+    async fn team_get(&self, req: GetRequest) -> Result<GetResponse> {
+        self.team_json(reqwest::Method::POST, "/api/v1/get", Some(&req))
+            .await
+    }
+
+    /// `remember` with `shared: true`: redacted with this person's rules, then written to the
+    /// team store only, as this tenant (spec §2.10). It is never spooled and never saved here.
+    async fn remember_shared(&self, req: RememberRequest) -> Result<RememberResponse> {
+        let (team, tenant) = self.team_parts()?;
+        let _busy = self.activity.enter();
+        let project = self.choose(req.scope()).await?;
+        let req = self.redact_remember_in(&project, req).await?;
+        let slug = match &project {
+            ProjectChoice::Slug(s) => s.clone(),
+            ProjectChoice::Detected(r) => r.slug.clone(),
+            ProjectChoice::Fallback => "global".into(),
+        };
+        let body = RememberRequest {
+            content: req.content,
+            kind: req.kind,
+            title: req.title,
+            topics: req.topics,
+            importance: req.importance,
+            supersedes: req
+                .supersedes
+                .iter()
+                .map(|id| id.strip_prefix(TEAM_PREFIX).unwrap_or(id).to_string())
+                .collect(),
+            // Keys are per tenant: another tenant's retry key must not return this memory.
+            idempotency_key: req.idempotency_key.map(|k| format!("{tenant}:{k}")),
+            project_hint: (slug != "global").then_some(slug),
+            author: Self::shared_author(tenant, &req.author),
+            shared: false,
+            ..Default::default()
+        };
+        let r: RememberResponse = team
+            .call(
+                reqwest::Method::POST,
+                "/api/v1/remember",
+                Some(&body),
+                SHARED_TIMEOUT,
+            )
+            .await
+            .map_err(|e| match e {
+                // The team store's own refusal (its redaction rules) is the answer as it is.
+                e if alice_core::redact::is_refusal(&e) => e,
+                e => AliceError::Other(format!(
+                    "the team memory is unreachable ({e}); nothing was saved. Retry, or save it personally without shared"
+                )),
+            })?;
+        Ok(RememberResponse {
+            id: r.id.map(|id| format!("{TEAM_PREFIX}{id}")),
+            status: r.status,
+            project: r.project,
+            reason: r.reason,
+            shared: true,
+        })
+    }
+
+    /// The memory `id` from the team store, when this tenant is its author; otherwise the refusal.
+    async fn require_shared_author(&self, id: &str) -> Result<()> {
+        let (_, tenant) = self.team_parts()?;
+        let got = self
+            .team_get(GetRequest {
+                ids: vec![id.to_string()],
+                include_provenance: false,
+            })
+            .await?;
+        let memory = got
+            .memories
+            .iter()
+            .find(|m| m.memory.id == id)
+            .ok_or_else(|| AliceError::NotFound(format!("shared memory {TEAM_PREFIX}{id}")))?;
+        if author_tenant(&memory.memory.author) == Some(tenant) {
+            Ok(())
+        } else {
+            Err(AliceError::Invalid(SHARED_REFUSAL.into()))
+        }
+    }
+
+    /// `update` of a `team:` id, for its author only.
+    async fn update_shared(&self, mut req: UpdateRequest) -> Result<MemoryFull> {
+        let (_, tenant) = self.team_parts()?;
+        let id = req.id[TEAM_PREFIX.len()..].to_string();
+        self.require_shared_author(&id).await?;
+        if req.update.title.is_some() || req.update.body.is_some() || req.update.topics.is_some() {
+            let r = self.redactor(&ProjectChoice::Fallback).await?;
+            let u = &mut req.update;
+            if let Some(t) = &u.title {
+                u.title = Some(redact_field(&r, "title", t)?);
+            }
+            if let Some(b) = &u.body {
+                u.body = Some(redact_field(&r, "body", b)?);
+            }
+            if let Some(topics) = &u.topics {
+                u.topics = Some(
+                    topics
+                        .iter()
+                        .map(|t| redact_field(&r, "topic", t))
+                        .collect::<Result<_>>()?,
+                );
+            }
+        }
+        if let Some(by) = &req.update.superseded_by {
+            req.update.superseded_by = Some(by.strip_prefix(TEAM_PREFIX).unwrap_or(by).to_string());
+        }
+        let body = UpdateRequest {
+            id,
+            update: req.update,
+            author: Self::shared_author(tenant, &req.author),
+        };
+        let out: MemoryFull = self
+            .team_json(reqwest::Method::POST, "/api/v1/update", Some(&body))
+            .await?;
+        let mut out = into_team_view(out);
+        out.event_id = out.event_id.map(|e| format!("{TEAM_PREFIX}{e}"));
+        Ok(out)
+    }
+
+    /// `undo` of a `team:<event id>`, when that event was made by this tenant. The team store's
+    /// events API filters by exact actor, and an actor is `agent:<tenant>/<client>` with any
+    /// client, so the events are listed newest first (a page of 500, up to
+    /// [`SHARED_UNDO_PAGES`] pages) until the one asked for is found, then its actor is checked.
+    async fn undo_shared(&self, req: UndoRequest) -> Result<UndoResponse> {
+        let (_, tenant) = self.team_parts()?;
+        let id = req.event_id[TEAM_PREFIX.len()..].to_string();
+        let mut before: Option<String> = None;
+        let mut mine = false;
+        'pages: for _ in 0..SHARED_UNDO_PAGES {
+            let path = match &before {
+                Some(b) => format!("/api/v1/events?limit=500&before={b}"),
+                None => "/api/v1/events?limit=500".to_string(),
+            };
+            let page: Vec<EventRow> = self
+                .team_json(reqwest::Method::GET, &path, None::<&()>)
+                .await?;
+            for e in &page {
+                if e.id == id {
+                    mine = e.actor == format!("agent:{tenant}")
+                        || e.actor.starts_with(&format!("agent:{tenant}/"));
+                    break 'pages;
+                }
+            }
+            match page.last() {
+                Some(last) if page.len() >= 500 => before = Some(last.id.clone()),
+                _ => break,
+            }
+        }
+        if !mine {
+            return Err(AliceError::Invalid(SHARED_REFUSAL.into()));
+        }
+        let body = UndoRequest {
+            event_id: id,
+            author: Self::shared_author(tenant, &req.author),
+        };
+        let mut out: UndoResponse = self
+            .team_json(reqwest::Method::POST, "/api/v1/undo", Some(&body))
+            .await?;
+        out.reverted = out
+            .reverted
+            .into_iter()
+            .map(|e| format!("{TEAM_PREFIX}{e}"))
+            .collect();
+        Ok(out)
     }
 
     pub async fn recall(&self, req: RecallRequest) -> Result<RecallResponse> {
@@ -2013,8 +2234,43 @@ impl Service {
 
     /// Memories by id. A duplicate that was merged into another memory is answered with the
     /// survivor, and `redirects` says so (spec §5.2).
-    pub async fn get(&self, req: GetRequest) -> Result<GetResponse> {
+    pub async fn get(&self, mut req: GetRequest) -> Result<GetResponse> {
         let _busy = self.activity.enter();
+        let (team_ids, own): (Vec<String>, Vec<String>) = std::mem::take(&mut req.ids)
+            .into_iter()
+            .partition(|id| id.starts_with(TEAM_PREFIX));
+        if team_ids.is_empty() {
+            req.ids = own;
+            return self.get_personal(req).await;
+        }
+        let team_req = GetRequest {
+            ids: team_ids
+                .iter()
+                .map(|id| id[TEAM_PREFIX.len()..].to_string())
+                .collect(),
+            include_provenance: req.include_provenance,
+        };
+        let mut out = if own.is_empty() {
+            GetResponse::default()
+        } else {
+            req.ids = own;
+            self.get_personal(req).await?
+        };
+        let shared = self.team_get(team_req).await?;
+        out.memories
+            .extend(shared.memories.into_iter().map(into_team_view));
+        out.missing
+            .extend(shared.missing.iter().map(|id| format!("{TEAM_PREFIX}{id}")));
+        out.redirects
+            .extend(shared.redirects.into_iter().map(|r| Redirect {
+                from: format!("{TEAM_PREFIX}{}", r.from),
+                to: format!("{TEAM_PREFIX}{}", r.to),
+            }));
+        out.notes.extend(shared.notes);
+        Ok(out)
+    }
+
+    async fn get_personal(&self, req: GetRequest) -> Result<GetResponse> {
         self.read(move |c| {
             let found = memories::get_many(c, &req.ids)?;
             let mut out = GetResponse::default();
@@ -2073,6 +2329,9 @@ impl Service {
     /// The memory after the change, with the event that recorded it (`undo` takes its id).
     pub async fn update(&self, mut req: UpdateRequest) -> Result<MemoryFull> {
         let _busy = self.activity.enter();
+        if req.id.starts_with(TEAM_PREFIX) {
+            return self.update_shared(req).await;
+        }
         let actor = Actor::from_author(&req.author);
         if req.update.title.is_some() || req.update.body.is_some() || req.update.topics.is_some() {
             let r = self.redactor_for_memory(req.id.clone()).await?;
@@ -2306,6 +2565,9 @@ impl Service {
     /// the answer names the review item that asks what to do instead.
     pub async fn undo(&self, req: UndoRequest) -> Result<UndoResponse> {
         let _busy = self.activity.enter();
+        if req.event_id.starts_with(TEAM_PREFIX) {
+            return self.undo_shared(req).await;
+        }
         let actor = Actor::from_author(&req.author);
         match self
             .writer
@@ -3602,6 +3864,34 @@ fn screen_resolution(
     }
 }
 
+/// The prefix of an id that lives in the team store.
+const TEAM_PREFIX: &str = "team:";
+/// A call to the team store for one shared write, read or change.
+const SHARED_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many pages of 500 events `undo` of a shared change looks through for the event.
+const SHARED_UNDO_PAGES: usize = 20;
+/// The refusal for a shared memory (or event) that this tenant did not write.
+const SHARED_REFUSAL: &str = "only the author or the admin can change a shared memory";
+
+/// The tenant part of a shared memory's author: the text before the first `/`.
+fn author_tenant(a: &Author) -> Option<&str> {
+    a.agent
+        .as_deref()
+        .and_then(|s| s.split('/').next())
+        .filter(|t| !t.is_empty())
+}
+
+/// A memory of the team store as this tenant shows it: `team:` ids, its source and author.
+fn into_team_view(mut m: MemoryFull) -> MemoryFull {
+    m.source = Some("team".into());
+    m.author_name = author_tenant(&m.memory.author).map(str::to_string);
+    m.memory.id = format!("{TEAM_PREFIX}{}", m.memory.id);
+    for l in &mut m.links {
+        l.id = format!("{TEAM_PREFIX}{}", l.id);
+    }
+    m
+}
+
 fn full(
     c: &Connection,
     m: alice_core::model::Memory,
@@ -3632,6 +3922,8 @@ fn full(
         links,
         provenance,
         event_id: None,
+        source: None,
+        author_name: None,
     })
 }
 

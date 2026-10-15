@@ -518,7 +518,7 @@ impl AliceMcp {
     }
 
     #[tool(
-        description = "Save one memory worth keeping: a decision (with why), bug fix (symptom, cause, fix), fact, how-to, preference, warning or end-of-task handoff. Set kind; pass supersedes to replace older memories."
+        description = "Save one memory worth keeping: a decision (with why), bug fix (symptom, cause, fix), fact, how-to, preference, warning or end-of-task handoff. Set kind; pass supersedes to replace older memories. Set shared to true only when the user explicitly asks to save it to the shared, team or central memory; every team member can then read it."
     )]
     async fn remember(
         &self,
@@ -535,6 +535,10 @@ impl AliceMcp {
                 (RememberStatus::Duplicate, Some(id)) => {
                     text(format!("Already remembered as {id} in {}.", r.project))
                 }
+                (_, Some(id)) if r.shared => text(format!(
+                    "Saved to the team memory as {id} in {}.",
+                    r.project
+                )),
                 (_, Some(id)) => text(format!("Saved {id} in {}.", r.project)),
                 (_, None) => text("Saved."),
             },
