@@ -150,7 +150,11 @@ pub struct Score {
     pub confidence: f64,
 }
 
-/// A memory as a judge sees it.
+/// The start of the title of a raw transcript chunk (`raw · <source>`).
+pub const RAW_TITLE_PREFIX: &str = "raw · ";
+
+/// A memory as a judge sees it. (A raw chunk is shown as a `note` whose title starts with
+/// [`RAW_TITLE_PREFIX`]: the item header takes a memory kind, and there is no other one.)
 #[derive(Debug, Clone, PartialEq)]
 pub struct JudgeMemory {
     pub id: String,
@@ -163,6 +167,14 @@ pub struct JudgeMemory {
     pub created_at: String,
     /// Cosine similarity to the memory it is compared with, when known.
     pub similarity: Option<f32>,
+}
+
+impl JudgeMemory {
+    /// True for a raw transcript chunk, which a recall grading shows up to
+    /// [`verbal::RAW_BODY_CHARS`] characters of.
+    pub fn is_raw_chunk(&self) -> bool {
+        self.title.starts_with(RAW_TITLE_PREFIX)
+    }
 }
 
 /// How a new memory relates to one existing memory: P over `RelationKind` names.
@@ -389,6 +401,19 @@ pub trait Judge: Send + Sync {
                 )
             })
             .collect()
+    }
+
+    /// [`grade_relevance`](Self::grade_relevance) for a recall: one attempt, no retries, and
+    /// the whole call ends within `budget` (a provider that waits on a network sets its
+    /// request timeout to it). The default is the plain call.
+    fn grade_relevance_within(
+        &self,
+        query_project: &str,
+        query: &str,
+        results: &[JudgeMemory],
+        _budget: std::time::Duration,
+    ) -> JudgeResult<Vec<Distribution>> {
+        self.grade_relevance(query_project, query, results)
     }
 }
 

@@ -13,6 +13,7 @@ pub mod judge_worker;
 pub mod maintenance;
 pub mod mcp;
 pub mod paths;
+pub mod precise_gate;
 pub mod redaction;
 pub mod reembed;
 pub mod restore;

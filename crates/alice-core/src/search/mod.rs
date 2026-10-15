@@ -481,7 +481,7 @@ impl Scored {
                     tier: Tier::Raw,
                     kind: None,
                     project,
-                    title: format!("raw · {}", c.source_id),
+                    title: format!("{}{}", crate::judge::RAW_TITLE_PREFIX, c.source_id),
                     body: Some(c.text),
                     created_at,
                     score: self.score,

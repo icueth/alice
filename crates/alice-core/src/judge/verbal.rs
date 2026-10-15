@@ -6,6 +6,9 @@ use chrono::{DateTime, Utc};
 
 /// Characters of a memory body sent to a judge.
 pub const BODY_CHARS: usize = 700;
+/// Characters of a raw transcript chunk sent to a judge when grading a recall (Task 21):
+/// grading on the whole chunk differs from grading on its first 700 characters.
+pub const RAW_BODY_CHARS: usize = 2_000;
 
 const WORDS: [&str; 21] = [
     "zero",
@@ -95,7 +98,17 @@ pub fn importance(i: u8) -> &'static str {
 }
 
 pub fn memory_block(label: &str, m: &JudgeMemory, now: DateTime<Utc>) -> String {
-    let body = crate::normalize::truncate_chars(&m.body, BODY_CHARS);
+    memory_block_bounded(label, m, now, BODY_CHARS)
+}
+
+/// [`memory_block`] with its own bound on the body.
+pub fn memory_block_bounded(
+    label: &str,
+    m: &JudgeMemory,
+    now: DateTime<Utc>,
+    body_chars: usize,
+) -> String {
+    let body = crate::normalize::truncate_chars(&m.body, body_chars);
     format!(
         "{label} (written {}, kind {}, {}, project {}):\nTitle: {}\n{}\n",
         age(&m.created_at, now),

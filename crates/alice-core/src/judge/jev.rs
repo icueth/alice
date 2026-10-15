@@ -679,6 +679,25 @@ impl JevJudge {
         state: &str,
         questions: &[Question],
     ) -> JudgeResult<BTreeMap<String, Distribution>> {
+        self.ask_with(
+            projects,
+            state,
+            questions,
+            self.cfg.max_retries,
+            self.cfg.timeout,
+        )
+    }
+
+    /// [`ask`](Self::ask) with its own retry count and per-request timeout. A recall asks with
+    /// no retries and its whole budget as the timeout, so the call ends with the deadline.
+    pub fn ask_with(
+        &self,
+        projects: &[&str],
+        state: &str,
+        questions: &[Question],
+        max_retries: u32,
+        timeout: Duration,
+    ) -> JudgeResult<BTreeMap<String, Distribution>> {
         self.gate(projects)?;
         let body = self.request_body(projects, state, questions);
         *self.last_request.lock() = Some(body.clone());
@@ -702,7 +721,7 @@ impl JevJudge {
         let mut reserved = estimate;
         let mut charged = 0.0;
         let mut last = String::new();
-        for attempt in 0..=self.cfg.max_retries {
+        for attempt in 0..=max_retries {
             if attempt > 0 {
                 // A retry can come up to two minutes after the first try: the policy is asked
                 // again, so a denial that lands meanwhile stops it.
@@ -717,7 +736,7 @@ impl JevJudge {
                 &self.cfg.endpoint,
                 self.cfg.api_key.expose(),
                 &body,
-                self.cfg.timeout,
+                timeout,
             );
             let delay = match reply {
                 Ok(r) if r.status == 200 => {
@@ -810,7 +829,7 @@ impl JevJudge {
                     charged += reserved;
                     reserved = 0.0;
                     last = "Jev did not answer in time".into();
-                    if attempt < self.cfg.max_retries {
+                    if attempt < max_retries {
                         // Room for the next attempt as well, or the retries stop here.
                         if let Err(e) = self.reserve(&day, estimate) {
                             self.settle_unanswered(&day, &hash, 0.0, charged, false);
@@ -841,7 +860,7 @@ impl JevJudge {
                     return Err(e);
                 }
             };
-            if attempt < self.cfg.max_retries {
+            if attempt < max_retries {
                 self.stats.lock().retries += 1;
                 (self.sleep)(delay.min(MAX_RETRY_WAIT));
             }
@@ -1077,6 +1096,29 @@ impl Judge for JevJudge {
         query: &str,
         results: &[JudgeMemory],
     ) -> JudgeResult<Vec<Distribution>> {
+        self.grade(query_project, query, results, None)
+    }
+
+    fn grade_relevance_within(
+        &self,
+        query_project: &str,
+        query: &str,
+        results: &[JudgeMemory],
+        budget: Duration,
+    ) -> JudgeResult<Vec<Distribution>> {
+        self.grade(query_project, query, results, Some(budget))
+    }
+}
+
+impl JevJudge {
+    /// One batched grading call; with a `budget` it is made once, with that timeout.
+    fn grade(
+        &self,
+        query_project: &str,
+        query: &str,
+        results: &[JudgeMemory],
+        budget: Option<Duration>,
+    ) -> JudgeResult<Vec<Distribution>> {
         if results.is_empty() {
             return Ok(Vec::new());
         }
@@ -1086,7 +1128,17 @@ impl Judge for JevJudge {
         for (i, r) in results.iter().enumerate() {
             let k = i + 1;
             state.push('\n');
-            state.push_str(&memory_block(&format!("Result {k}"), r, now));
+            let bound = if r.is_raw_chunk() {
+                super::verbal::RAW_BODY_CHARS
+            } else {
+                super::verbal::BODY_CHARS
+            };
+            state.push_str(&super::verbal::memory_block_bounded(
+                &format!("Result {k}"),
+                r,
+                now,
+                bound,
+            ));
             questions.push(Question {
                 id: format!("r_{k}"),
                 instructions: format!("How well does result {k} answer the query?"),
@@ -1096,7 +1148,10 @@ impl Judge for JevJudge {
         let projects = distinct(
             std::iter::once(query_project).chain(results.iter().map(|r| r.project.as_str())),
         );
-        let answers = self.ask(&projects, &state, &questions)?;
+        let answers = match budget {
+            None => self.ask(&projects, &state, &questions)?,
+            Some(b) => self.ask_with(&projects, &state, &questions, 0, b)?,
+        };
         Ok((0..results.len())
             .map(|i| {
                 answers
