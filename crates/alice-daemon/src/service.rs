@@ -118,10 +118,58 @@ const RESCUE_ANSWERS_MIN: f64 = 0.5;
 /// Said in a recall answer when its query was not sent to a remote embedding provider.
 const QUERY_HELD_BACK: &str = "this search used word matches only: the cloud policy keeps this project's text away from the embedding provider, so the query was not sent";
 
+/// The cloud decision for a query asked from `choice`'s project: whether it may leave, the
+/// redactor that screens it, and whether the project is a detected one the store never saw.
+/// A project that was never written to is judged by its working tree's own `.alice.toml` and
+/// the global lists (every identity of it is asked; an empty slug says no).
+struct QueryCloud {
+    allowed: bool,
+    redactor: Arc<Redactor>,
+    unstored: bool,
+}
+
+fn query_cloud(
+    cloud: &DaemonJevPolicy,
+    readers: &ReaderPool,
+    settings: &SettingsHandle,
+    redactors: &Redactors,
+    choice: &ProjectChoice,
+) -> QueryCloud {
+    let known = |allowed, redactor| QueryCloud {
+        allowed,
+        redactor,
+        unstored: false,
+    };
+    match choice {
+        ProjectChoice::Slug(s) => known(cloud.cloud_allowed(s), cloud.redactor(s)),
+        ProjectChoice::Fallback => known(cloud.cloud_allowed("global"), cloud.redactor("global")),
+        ProjectChoice::Detected(r) => {
+            let stored = readers
+                .with(|c| projects::find_by_key(c, &r.key))
+                .ok()
+                .flatten();
+            match stored {
+                Some(p) => known(cloud.cloud_allowed(&p.slug), cloud.redactor(&p.slug)),
+                None => {
+                    let root = r.root.as_deref();
+                    let allowed = !r.slug.trim().is_empty()
+                        && [r.slug.as_str(), r.name.as_str()]
+                            .into_iter()
+                            .filter(|n| !n.trim().is_empty())
+                            .all(|n| settings.cloud_allowed(n, root));
+                    QueryCloud {
+                        allowed,
+                        redactor: redactors.for_root_always_on(root),
+                        unstored: true,
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// What to send a remote embedder for a query asked from `choice`'s project: the query with that
-/// project's secrets redacted, or `None` when the cloud policy keeps the project at home
-/// (every identity of the project is asked; a degraded configuration says no). A project that
-/// was never written to is judged by its working tree's own `.alice.toml`.
+/// project's secrets redacted, or `None` when the cloud policy keeps the project at home.
 fn query_for_remote(
     cloud: &DaemonJevPolicy,
     readers: &ReaderPool,
@@ -130,29 +178,8 @@ fn query_for_remote(
     choice: &ProjectChoice,
     text: &str,
 ) -> Option<String> {
-    let (allowed, redactor) = match choice {
-        ProjectChoice::Slug(s) => (cloud.cloud_allowed(s), cloud.redactor(s)),
-        ProjectChoice::Fallback => (cloud.cloud_allowed("global"), cloud.redactor("global")),
-        ProjectChoice::Detected(r) => {
-            let stored = readers
-                .with(|c| projects::find_by_key(c, &r.key))
-                .ok()
-                .flatten();
-            match stored {
-                Some(p) => (cloud.cloud_allowed(&p.slug), cloud.redactor(&p.slug)),
-                None => {
-                    let root = r.root.as_deref();
-                    let ok = !r.slug.trim().is_empty()
-                        && [r.slug.as_str(), r.name.as_str()]
-                            .into_iter()
-                            .filter(|n| !n.trim().is_empty())
-                            .all(|n| settings.cloud_allowed(n, root));
-                    (ok, redactors.for_root_always_on(root))
-                }
-            }
-        }
-    };
-    allowed.then(|| redactor.apply(text).text)
+    let q = query_cloud(cloud, readers, settings, redactors, choice);
+    q.allowed.then(|| q.redactor.apply(text).text)
 }
 
 /// What the judge decided for a predicate that is new to the vocabulary.
@@ -1350,6 +1377,27 @@ impl Service {
         // The raw tier's chunk vector list reads on this pool, beside the main reader's word
         // lists: one connection of each, main first (`ServiceOptions::vector_reader_pool`).
         let vector_readers = self.vector_readers.clone();
+        // A precise recall from a tree the store never saw: the judge's cloud decision for the
+        // query (decided here, before `choice` is spent on the read).
+        let unstored_query = if precise && can_grade && matches!(choice, ProjectChoice::Detected(_))
+        {
+            let (cloud, readers, settings, redactors) = (
+                self.cloud.clone(),
+                self.readers.clone(),
+                self.settings.clone(),
+                self.redactors.clone(),
+            );
+            let (choice, text) = (choice.clone(), text.clone());
+            tokio::task::spawn_blocking(move || {
+                let q = query_cloud(&cloud, &readers, &settings, &redactors, &choice);
+                q.unstored
+                    .then(|| q.allowed.then(|| q.redactor.apply(&text).text))
+            })
+            .await
+            .map_err(join_err)?
+        } else {
+            None
+        };
         let (out, slug) = self
             .read(move |c| {
                 let scope = ProjectResolver::read_scope(c, choice, explicit)?;
@@ -1399,7 +1447,14 @@ impl Service {
         if precise {
             let why;
             (out, reranked, why) = self
-                .rerank(out, &slug, &judged_query, limit, include_raw)
+                .rerank(
+                    out,
+                    &slug,
+                    unstored_query,
+                    &judged_query,
+                    limit,
+                    include_raw,
+                )
                 .await;
             notes.extend(why);
         }
@@ -1448,10 +1503,17 @@ impl Service {
     /// kept. Without a model judge, or when it answers `Denied`, `Budget` or an error, or too
     /// slowly, the order is the search's, no near-floor candidate is returned, and the answer
     /// says so (`false`). The call is scoped to the project the query was asked from.
+    ///
+    /// `unstored_query` is set when that project is a detected one the store never saw: `None`
+    /// inside means its working tree's own file or the global lists deny the cloud (the answer
+    /// is the fast one); `Some(text)` is the query redacted with the tree's rules, and the call
+    /// then runs under `global`, a project the policy knows, whose gate and redaction apply on
+    /// top.
     async fn rerank(
         &self,
         mut out: SearchOutput,
         query_project: &str,
+        unstored_query: Option<Option<String>>,
         query: &str,
         limit: usize,
         include_raw: bool,
@@ -1463,6 +1525,13 @@ impl Service {
         if judge.provider() == "heuristic" {
             why = Some(NOTE_NO_MODEL_JUDGE.into());
         }
+        let (query_project, query) = match unstored_query {
+            Some(Some(redacted)) => ("global", redacted),
+            // Denied by the tree itself: no project name is asked of the policy for it.
+            Some(None) => ("", query.to_string()),
+            None => (query_project, query.to_string()),
+        };
+        let query = query.as_str();
         let near = std::mem::take(&mut out.near);
         let window = out.hits.len().min(PRECISE_TOP);
         // The cloud policy is asked once per distinct project, off the runtime's threads (each
@@ -7425,6 +7494,72 @@ mod tests {
             r.results.iter().any(|h| h.project == "filed"),
             "but they are still results, in their places"
         );
+    }
+
+    // ------------------------------------------------- Task 22: a recall from a never-stored tree
+
+    /// A recall from a working tree whose project was never written to is judged by that tree's
+    /// own `.alice.toml` and the global lists, like a remote embedding of its query.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_recall_from_a_never_stored_tree_is_graded_when_its_own_file_allows() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let stored = repo(&d, "stored");
+        remember_deploy_notes(&s, &stored).await;
+        let fresh = repo(&d, "fresh");
+        let r = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &fresh))
+            .await
+            .unwrap();
+        assert!(r.reranked, "notes: {:?}", r.notes);
+        assert!(!r.notes.iter().any(|n| n == NOTE_DENIED), "{:?}", r.notes);
+        assert_eq!(t.graded(), 1);
+        assert!(r.results[0].title.contains("ZEBRA"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_recall_from_a_never_stored_tree_that_denies_the_cloud_stays_fast() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let stored = repo(&d, "stored");
+        remember_deploy_notes(&s, &stored).await;
+        let fresh = repo(&d, "fresh");
+        std::fs::write(
+            std::path::Path::new(fresh.as_deref().unwrap()).join(".alice.toml"),
+            "[privacy]\ncloud_denied = true\n",
+        )
+        .unwrap();
+        let r = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &fresh))
+            .await
+            .unwrap();
+        assert!(!r.reranked);
+        assert_eq!(t.graded(), 0, "a denying tree's query is not sent");
+        assert!(r.notes.iter().any(|n| n == NOTE_DENIED), "{:?}", r.notes);
+        assert!(!r.results.is_empty(), "the fast answer is still given");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_recall_from_a_never_stored_tree_sends_the_query_redacted() {
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let stored = repo(&d, "stored");
+        remember_deploy_notes(&s, &stored).await;
+        let fresh = repo(&d, "fresh");
+        let r = s
+            .recall(recall_req(
+                &format!("deploy notes {token}"),
+                RecallMode::Precise,
+                &fresh,
+            ))
+            .await
+            .unwrap();
+        assert!(r.reranked, "notes: {:?}", r.notes);
+        let states = t.graded_states.lock().clone();
+        assert_eq!(states.len(), 1);
+        assert!(!states[0].contains(token), "{}", states[0]);
+        assert!(states[0].contains("deploy notes"), "{}", states[0]);
     }
 
     // ------------------------------------------------------- Task 21: all tiers, rescue, default
