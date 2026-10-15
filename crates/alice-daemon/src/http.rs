@@ -332,9 +332,13 @@ async fn projects(
     Ok(Json(st.svc.projects().await?))
 }
 /// A project hint is set in-process by the MCP handlers and never comes from the wire: every
-/// handler that takes a request carrying one clears it on entry, through this function.
-fn clear_wire_hint(hint: &mut Option<String>) {
-    *hint = None;
+/// handler that takes a request carrying one clears it on entry, through this function. The one
+/// exception is the team store (`--team-store`), whose callers are the personal daemons on the
+/// same server (they hold its token) and name the shared project in the body.
+fn clear_wire_hint(svc: &Service, hint: &mut Option<String>) {
+    if !svc.is_team_store() {
+        *hint = None;
+    }
 }
 
 /// A read-only database never loses a `remember`: it is spooled (202) and applied after repair.
@@ -342,7 +346,7 @@ async fn remember(
     State(st): State<AppState>,
     ApiJson(mut req): ApiJson<RememberRequest>,
 ) -> Result<Response, ApiError> {
-    clear_wire_hint(&mut req.project_hint);
+    clear_wire_hint(&st.svc, &mut req.project_hint);
     let scope_req = req.clone();
     let r = match st.svc.remember_or_spool(req).await {
         Ok(r) => r,
@@ -362,14 +366,14 @@ async fn recall(
     State(st): State<AppState>,
     ApiJson(mut req): ApiJson<RecallRequest>,
 ) -> ApiResult<RecallResponse> {
-    clear_wire_hint(&mut req.project_hint);
+    clear_wire_hint(&st.svc, &mut req.project_hint);
     Ok(Json(st.svc.recall(req).await?))
 }
 async fn context(
     State(st): State<AppState>,
     ApiJson(mut req): ApiJson<ContextRequest>,
 ) -> ApiResult<ContextResponse> {
-    clear_wire_hint(&mut req.project_hint);
+    clear_wire_hint(&st.svc, &mut req.project_hint);
     Ok(Json(st.svc.context(req).await?))
 }
 async fn get_memories(
@@ -400,7 +404,7 @@ async fn ingest(
     State(st): State<AppState>,
     ApiJson(mut req): ApiJson<IngestRequest>,
 ) -> Result<Response, ApiError> {
-    clear_wire_hint(&mut req.project_hint);
+    clear_wire_hint(&st.svc, &mut req.project_hint);
     let scope_req = req.clone();
     match st.svc.ingest(req).await {
         Ok(o) => Ok(Json(o).into_response()),
@@ -554,7 +558,7 @@ async fn compat_call(
     State(st): State<AppState>,
     ApiJson(mut call): ApiJson<crate::compat::CompatCall>,
 ) -> Response {
-    clear_wire_hint(&mut call.project_hint);
+    clear_wire_hint(&st.svc, &mut call.project_hint);
     if !st.svc.settings().compat.mempalace {
         return refuse(
             StatusCode::CONFLICT,

@@ -41,6 +41,8 @@ pub struct DaemonOptions {
     pub settings_env: Option<Vec<(String, String)>>,
     /// Server mode (`alice daemon run --tenant`): one person on a shared server.
     pub tenant: bool,
+    /// The team store (`--team-store`, needs `tenant`): the shared team memory (spec §2.10).
+    pub team_store: bool,
 }
 
 /// The single-instance lock, or `None` when another daemon holds it.
@@ -202,6 +204,11 @@ fn fetch_model(home: &AliceHome, runtime: &tokio::runtime::Runtime) -> anyhow::R
 
 /// Everything after the lock: the model, the service, then serving until stopped. Sets
 /// `published` once daemon.json is written (from then on a failure is not a start-up error).
+/// A non-empty environment variable of the daemon's process.
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
 fn start_and_serve(
     home: &AliceHome,
     opts: &DaemonOptions,
@@ -217,7 +224,14 @@ fn start_and_serve(
         &startup::StartProgress::step("opening the database and loading the embedding model"),
     );
     // The settings come first: the model's idle unload and the port are read from them.
-    tracing::info!(tenant = opts.tenant, "starting");
+    if opts.team_store && !opts.tenant {
+        anyhow::bail!("--team-store needs --tenant: the team store is a server tenant of its own");
+    }
+    tracing::info!(
+        tenant = opts.tenant,
+        team_store = opts.team_store,
+        "starting"
+    );
     let settings = SettingsHandle::load_with(
         home,
         opts.settings_env
@@ -269,6 +283,10 @@ fn start_and_serve(
             settings: Some(settings),
             embedder_factory: factory,
             tenant: opts.tenant,
+            team_store: opts.team_store,
+            // The personal daemons link to the team store; the team store links to nothing.
+            team_url: env_var("ALICE_TEAM_URL").filter(|_| !opts.team_store),
+            tenant_name: env_var("ALICE_TENANT_NAME"),
             // The daemon reads the real environment (the secrets' status shows a variable).
             ..ServiceOptions::process_env()
         },

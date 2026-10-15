@@ -31,6 +31,8 @@ pub struct Tenant {
 pub struct Server {
     pub base: String,
     pub tenants: Vec<Tenant>,
+    /// The team store, when started: its own loopback listener and no route in the emulator.
+    pub team: Option<Tenant>,
     recorders: Vec<(String, Arc<Mutex<Vec<Seen>>>)>,
     paused: Arc<AtomicBool>,
     stop: CancellationToken,
@@ -92,6 +94,17 @@ impl Server {
     /// Tenants `names` (tenant mode on, fake embedder, tokens from `load_or_create_token`)
     /// behind one emulator on 127.0.0.1:0.
     pub async fn start(names: &[&str]) -> Server {
+        Self::start_with(names, false).await
+    }
+
+    /// Like [`Server::start`], plus a team store: a `--team-store` daemon on its own
+    /// `127.0.0.1:<port>` that the emulator does not route (`/u/team/...` is 404). Every tenant
+    /// gets its URL and a `team.token` file.
+    pub async fn start_with_team(names: &[&str]) -> Server {
+        Self::start_with(names, true).await
+    }
+
+    async fn start_with(names: &[&str], with_team: bool) -> Server {
         alice_daemon::install_tls();
         let stop = CancellationToken::new();
         let paused = Arc::new(AtomicBool::new(false));
@@ -99,7 +112,9 @@ impl Server {
         let mut tenants = Vec::new();
         let mut recorders = Vec::new();
         let mut dirs = Vec::new();
-        for (i, name) in names.iter().enumerate() {
+        let mut team = None;
+        let mut team_url = None;
+        if with_team {
             let dir = tempfile::tempdir().unwrap();
             let home = AliceHome::new(dir.path().to_path_buf());
             let svc = Service::start(
@@ -107,6 +122,47 @@ impl Server {
                 &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
                 ServiceOptions {
                     tenant: true,
+                    team_store: true,
+                    ..ServiceOptions::default()
+                },
+            )
+            .unwrap();
+            let token = alice_daemon::discovery::load_or_create_token(&home).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app =
+                alice_daemon::http::router(svc.clone(), token.clone(), port, stop.child_token());
+            let ct = stop.clone();
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move { ct.cancelled().await })
+                    .await
+                    .unwrap()
+            });
+            team_url = Some(format!("http://127.0.0.1:{port}"));
+            team = Some(Tenant {
+                name: "team".into(),
+                home,
+                svc,
+                token,
+                port,
+            });
+            dirs.push(dir);
+        }
+        for (i, name) in names.iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let home = AliceHome::new(dir.path().to_path_buf());
+            home.ensure_dirs().unwrap();
+            if let Some(t) = &team {
+                std::fs::write(home.team_token_file(), &t.token).unwrap();
+            }
+            let svc = Service::start(
+                home.clone(),
+                &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+                ServiceOptions {
+                    tenant: true,
+                    team_url: team_url.clone(),
+                    tenant_name: Some(name.to_string()),
                     ..ServiceOptions::default()
                 },
             )
@@ -148,6 +204,7 @@ impl Server {
         Server {
             base: format!("http://{addr}"),
             tenants,
+            team,
             recorders,
             paused,
             stop,

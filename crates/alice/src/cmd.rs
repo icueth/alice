@@ -259,6 +259,12 @@ pub enum DaemonCmd {
             help = "Serve one person on a shared server (alice-server's units use it)"
         )]
         tenant: bool,
+        #[arg(
+            long,
+            requires = "tenant",
+            help = "Hold the shared team memory (needs --tenant; alice-server's team unit uses it)"
+        )]
+        team_store: bool,
     },
     /// Start in the background if not running.
     Start,
@@ -711,13 +717,14 @@ async fn client(home: &AliceHome) -> Result<DaemonClient> {
 pub fn dispatch(command: Command, json: bool) -> Result<()> {
     let home = AliceHome::from_env();
     match command {
-        Command::Daemon(DaemonCmd::Run { tenant }) => run(
+        Command::Daemon(DaemonCmd::Run { tenant, team_store }) => run(
             home,
             DaemonOptions {
                 port: 0,
                 fake_embedder: std::env::var("ALICE_EMBEDDER").is_ok_and(|v| v == "fake"),
                 settings_env: None,
                 tenant,
+                team_store,
             },
         ),
         Command::Mcp => rt()?.block_on(alice_daemon::mcp::run_stdio(home, launcher())),

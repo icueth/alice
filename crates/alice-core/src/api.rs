@@ -557,6 +557,9 @@ pub struct Health {
     /// be missing a privacy setting; cloud providers are off meanwhile.
     #[serde(default, skip_serializing_if = "is_false")]
     pub config_degraded: bool,
+    /// Why the link to the team store is off or failing (server mode); never the token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_warning: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {

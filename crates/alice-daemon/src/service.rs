@@ -323,6 +323,15 @@ pub struct ServiceOptions {
     /// Free bytes at a path (tests inject a value); `None` reads the volume
     /// (`backup::free_space`). A tenant import checks it before it starts.
     pub free_space: Option<crate::maintenance::FreeSpace>,
+    /// Server mode, the team store (`alice daemon run --tenant --team-store`, spec §2.10): this
+    /// daemon holds the shared team memory, so it keeps a project hint from an HTTP body (its
+    /// callers are the personal daemons, which name the project).
+    pub team_store: bool,
+    /// The team store's URL (`ALICE_TEAM_URL`, loopback http only); the daemon fills it from
+    /// its environment, tests set it directly.
+    pub team_url: Option<String>,
+    /// This tenant's name (`ALICE_TENANT_NAME`), the author the team store records.
+    pub tenant_name: Option<String>,
 }
 
 impl Default for ServiceOptions {
@@ -353,6 +362,9 @@ impl Default for ServiceOptions {
             precise_clock: None,
             tenant: false,
             free_space: None,
+            team_store: false,
+            team_url: None,
+            tenant_name: None,
         }
     }
 }
@@ -531,6 +543,10 @@ pub struct Service {
     /// The cloud policy: asked per project before text goes to a remote embedder.
     cloud: Arc<DaemonJevPolicy>,
     opts: ServiceOptions,
+    /// The link to the team store; `None` when none is configured or it was refused.
+    team: Option<Arc<crate::team::TeamLink>>,
+    /// Why the link is disabled, when `team_url` was given and refused (health reports it).
+    team_error: Option<String>,
     instance: String,
     stop: Arc<AtomicBool>,
     wake_worker: crossbeam_channel::Sender<()>,
@@ -1051,6 +1067,18 @@ impl Service {
         let watcher = settings.spawn_watcher(opts.settings_poll, stop.clone());
         let resolver = ProjectResolver::new(opts.detect_project);
         let precise_gate = crate::precise_gate::PreciseGate::new(opts.precise_clock.clone());
+        // The team store never links to itself.
+        let (team, team_error) = if opts.team_store {
+            (None, None)
+        } else {
+            match crate::team::TeamLink::from_env(&home, opts.team_url.as_deref()) {
+                Ok(link) => (link, None),
+                Err(reason) => {
+                    tracing::warn!("the team link is off: {reason}");
+                    (None, Some(reason))
+                }
+            }
+        };
         Ok(Arc::new(Service {
             home,
             readers,
@@ -1061,6 +1089,8 @@ impl Service {
             embedding: embedding_ctl,
             cloud,
             opts,
+            team,
+            team_error,
             instance: new_id(),
             stop,
             wake_worker: wake_tx,
@@ -1324,6 +1354,21 @@ impl Service {
     /// Whether this service runs in server mode (`--tenant`).
     pub fn is_tenant(&self) -> bool {
         self.opts.tenant
+    }
+
+    /// Whether this service is the team store (`--team-store`).
+    pub fn is_team_store(&self) -> bool {
+        self.opts.team_store
+    }
+
+    /// This tenant's name, when the daemon was given one (`ALICE_TENANT_NAME`).
+    pub fn tenant_name(&self) -> Option<&str> {
+        self.opts.tenant_name.as_deref()
+    }
+
+    /// The link to the team store, when one is configured and usable.
+    pub fn team(&self) -> Option<&Arc<crate::team::TeamLink>> {
+        self.team.as_ref()
     }
 
     /// One import batch, written by the writer in a commit of its own (the importer's only way
@@ -3284,6 +3329,10 @@ impl Service {
         let embedding_error = self.embedding.problem();
         let judge_provider = self.judge().provider().to_string();
         let judge_warning = self.judge_warning();
+        let team_warning = self
+            .team_error
+            .clone()
+            .or_else(|| self.team.as_ref().and_then(|t| t.problem()));
         let model_loaded = self.embedder().is_loaded();
         let memory_bytes = crate::doctor::self_memory_bytes();
         // Read the backup directory, the spool and the database: off the runtime's threads.
@@ -3332,6 +3381,7 @@ impl Service {
                 settings_warnings,
                 settings_errors,
                 config_degraded,
+                team_warning,
             })
         })
         .await

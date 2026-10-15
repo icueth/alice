@@ -290,6 +290,99 @@ async fn the_http_api_ignores_a_project_hint_in_the_body() {
     assert_eq!(rows, vec![("global".to_string(), None)]);
 }
 
+/// The team store has no route behind the emulator; a tenant's settings show neither its URL
+/// nor its token, and no `team.*` key can be set.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_team_store_is_unrouted_and_hidden_from_the_settings() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    let team = s.team.as_ref().unwrap();
+    let http = reqwest::Client::new();
+    for path in ["/u/team/api/v1/ping", "/u/team/api/v1/health"] {
+        let r = http
+            .get(format!("{}{path}", s.base))
+            .bearer_auth(&team.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "{path}");
+    }
+    // Both personal daemons linked to it: the link is verified and healthy.
+    for name in ["ann", "bob"] {
+        let t = s.tenant(name);
+        let link = t.svc.team().expect("the link is built");
+        link.ensure_verified().await.unwrap();
+        assert!(t.svc.health().await.unwrap().team_warning.is_none());
+        assert_eq!(t.svc.tenant_name(), Some(name));
+        assert!(!format!("{link:?}").contains(&team.token));
+    }
+    let t = s.tenant("ann");
+    let body = http
+        .get(format!("{}/api/v1/settings", s.url("ann")))
+        .bearer_auth(&t.token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!body.contains(&team.token), "{body}");
+    assert!(!body.contains(&team.port.to_string()), "{body}");
+    assert!(!body.contains("team.token"), "{body}");
+    let health = http
+        .get(format!("{}/api/v1/health", s.url("ann")))
+        .bearer_auth(&t.token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!health.contains(&team.token), "{health}");
+    for key in ["team.url", "team.token", "team.enabled"] {
+        let r = http
+            .patch(format!("{}/api/v1/settings", s.url("ann")))
+            .bearer_auth(&t.token)
+            .json(&serde_json::json!({ key: "x" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_client_error(), "{key}: {}", r.status());
+    }
+}
+
+/// Only the team store keeps a project hint that comes in an HTTP body.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_team_store_keeps_the_project_hint_of_a_body_and_a_tenant_clears_it() {
+    let s = Server::start_with_team(&["ann"]).await;
+    let team = s.team.as_ref().unwrap();
+    let http = reqwest::Client::new();
+    let body = serde_json::json!({
+        "content": "A note naming its project in the body",
+        "project_hint": "shared-proj"
+    });
+    let r = http
+        .post(format!("http://127.0.0.1:{}/api/v1/remember", team.port))
+        .bearer_auth(&team.token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.status());
+    let slugs: Vec<String> = stored(&team.home).into_iter().map(|(s, _)| s).collect();
+    assert_eq!(slugs, vec!["shared-proj".to_string()]);
+    let t = s.tenant("ann");
+    let r = http
+        .post(format!("{}/api/v1/remember", s.url("ann")))
+        .bearer_auth(&t.token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.status());
+    let slugs: Vec<String> = stored(&t.home).into_iter().map(|(s, _)| s).collect();
+    assert_eq!(slugs, vec!["global".to_string()]);
+}
+
 /// The outcome of a tool call that may fail either as an MCP error or as an error result:
 /// `Err(message)` for a failure, `Ok(text)` otherwise.
 async fn try_tool(c: &Conn, name: &'static str, args: serde_json::Value) -> Result<String, String> {

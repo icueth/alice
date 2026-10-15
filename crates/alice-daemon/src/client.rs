@@ -196,7 +196,7 @@ pub fn refusal_retry_later(body: &serde_json::Value) -> bool {
     body["retry_later"].as_bool() == Some(true)
 }
 
-fn error_from(status: reqwest::StatusCode, body: &serde_json::Value) -> AliceError {
+pub(crate) fn error_from(status: reqwest::StatusCode, body: &serde_json::Value) -> AliceError {
     let Some(msg) = body["error"].as_str() else {
         return AliceError::Other(format!(
             "the memory daemon answered {status} without an explanation; it may be an older version. Run \"alice daemon stop\", then retry"

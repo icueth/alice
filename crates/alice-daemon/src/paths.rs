@@ -122,6 +122,10 @@ impl AliceHome {
     pub fn token_file(&self) -> PathBuf {
         self.root.join("token")
     }
+    /// The team store's token, readable by a personal daemon (server mode, spec §2.10).
+    pub fn team_token_file(&self) -> PathBuf {
+        self.root.join("team.token")
+    }
 
     /// Create the directory tree. On Unix the root is private (0700).
     pub fn ensure_dirs(&self) -> std::io::Result<()> {

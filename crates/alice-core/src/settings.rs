@@ -51,6 +51,9 @@ pub const NON_SETTING_ENV: &[&str] = &[
     // Server mode: the remote server a client talks to, and its token (both or neither).
     "ALICE_REMOTE_URL",
     "ALICE_REMOTE_TOKEN",
+    // Server mode, shared team memory: the team store's loopback URL and this tenant's name.
+    "ALICE_TEAM_URL",
+    "ALICE_TENANT_NAME",
 ];
 
 /// The model the `local` embedding provider runs (`alice_embed::MODEL_ID`; `alice-core` does
@@ -2322,7 +2325,12 @@ mod tests {
 
     #[test]
     fn the_remote_variables_are_not_settings() {
-        for v in ["ALICE_REMOTE_URL", "ALICE_REMOTE_TOKEN"] {
+        for v in [
+            "ALICE_REMOTE_URL",
+            "ALICE_REMOTE_TOKEN",
+            "ALICE_TEAM_URL",
+            "ALICE_TENANT_NAME",
+        ] {
             assert!(NON_SETTING_ENV.contains(&v), "{v}");
         }
     }
