@@ -39,10 +39,114 @@ const BATCH_MAX: usize = 256;
 /// (`/api/v1/events` still lists every change).
 const STREAM_CAPACITY: usize = 256;
 /// Raw chunks written per batch, at most. A larger ingest continues in the following batches
-/// (each its own short transaction) and is acknowledged once all of it is committed.
-const INGEST_SLICE: usize = 200;
-/// Chunk text written per batch, at most (FTS work grows with text, not with chunk count).
-const INGEST_SLICE_BYTES: usize = 64 * 1024;
+/// (each its own short transaction) and is acknowledged once all of it is committed. A write
+/// that arrives while a slice is being written waits for that slice, so its size is what a
+/// `remember` can wait behind during an import: 200 chunks / 64 KiB gave a p95 of 117 ms with
+/// 20 clients at a 100k-chunk import, 50 chunks / 32 KiB about 58 ms (`docs/benchmarks/m2.md`,
+/// Task 20); the import took 16 % longer.
+const INGEST_SLICE: usize = 50;
+/// Chunk text written per batch, at most (FTS work grows with text, not with chunk count). It
+/// must not be less than one chunk of [`alice_core::model::limits::MAX_CHUNK_BYTES`], or a chunk that large would
+/// never fit a slice (`slice_len` takes one chunk anyway only when the budget is this full).
+const INGEST_SLICE_BYTES: usize = alice_core::model::limits::MAX_CHUNK_BYTES;
+
+/// The writer's own WAL hygiene (spec §4.1). SQLite's automatic checkpoint is PASSIVE: it
+/// copies frames home but never restarts the log, and the log restarts only when no reader
+/// is still using it. Under constant readers (a large import while clients recall) that
+/// moment never comes and the `-wal` file grows without bound (364 MiB at a 30k-chunk
+/// import, measured in `docs/benchmarks/m2.md`), which makes every read walk a longer
+/// wal-index. So, between its own transactions and on its own connection, the writer
+/// restarts the log once the file is over [`WalPolicy::limit`].
+#[derive(Debug, Clone)]
+pub struct WalPolicy {
+    /// A `-wal` file larger than this is restarted; `journal_size_limit` truncates a
+    /// restarted log back to it.
+    pub limit: u64,
+    /// At most one restart attempt per this long.
+    pub min_gap: Duration,
+    /// How long one attempt waits for readers that began before it (total, not per reader).
+    pub busy_wait: Duration,
+}
+
+impl Default for WalPolicy {
+    fn default() -> Self {
+        Self {
+            limit: 64 * 1024 * 1024,
+            min_gap: Duration::from_secs(2),
+            busy_wait: Duration::from_millis(100),
+        }
+    }
+}
+
+/// What one look at the log came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalCheck {
+    /// Under the limit, or tried less than `min_gap` ago.
+    NotDue,
+    /// The log was restarted: the next write begins at its start.
+    Restarted,
+    /// A reader still used the log, or the checkpoint failed; the next opportunity retries.
+    Skipped,
+}
+
+/// The writer's checkpoint bookkeeping.
+pub(crate) struct WalKeeper {
+    policy: WalPolicy,
+    wal: std::path::PathBuf,
+    last_try: Option<Instant>,
+}
+
+/// The busy timeout every connection has (`alice_core::store`); restored after an attempt.
+const NORMAL_BUSY: Duration = Duration::from_millis(5_000);
+
+impl WalKeeper {
+    /// Applies `journal_size_limit` to `conn` and remembers where its log lives.
+    pub(crate) fn new(conn: &Connection, policy: WalPolicy) -> Self {
+        let limit = i64::try_from(policy.limit).unwrap_or(i64::MAX);
+        if let Err(e) = conn.execute_batch(&format!("PRAGMA journal_size_limit = {limit};")) {
+            tracing::warn!(error = %e, "journal_size_limit was not set");
+        }
+        let mut wal = conn
+            .path()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .into_os_string();
+        wal.push("-wal");
+        Self {
+            policy,
+            wal: wal.into(),
+            last_try: None,
+        }
+    }
+
+    /// Restart the log if it is over the limit and the last attempt is old enough. Call it
+    /// only between transactions. It waits for readers at most `busy_wait` and never fails.
+    pub(crate) fn check(&mut self, conn: &Connection, now: Instant) -> WalCheck {
+        if self
+            .last_try
+            .is_some_and(|t| now.duration_since(t) < self.policy.min_gap)
+        {
+            return WalCheck::NotDue;
+        }
+        let len = std::fs::metadata(&self.wal).map(|m| m.len()).unwrap_or(0);
+        if len <= self.policy.limit {
+            return WalCheck::NotDue;
+        }
+        self.last_try = Some(now);
+        let _ = conn.busy_timeout(self.policy.busy_wait);
+        // (busy, frames in the log, frames checkpointed); busy = 1: a reader kept it from finishing.
+        let r = conn.query_row("PRAGMA wal_checkpoint(RESTART)", [], |r| r.get::<_, i64>(0));
+        let _ = conn.busy_timeout(NORMAL_BUSY);
+        match r {
+            Ok(0) => WalCheck::Restarted,
+            Ok(_) => WalCheck::Skipped,
+            Err(e) => {
+                tracing::debug!(error = %e, "wal restart skipped");
+                WalCheck::Skipped
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ProjectChoice {
@@ -1931,10 +2035,21 @@ pub(crate) fn spawn_writer(
 /// [`spawn_writer`] with the privacy rules the writer applies to the history it records and to
 /// the text an undo restores.
 pub fn spawn_writer_with(
+    conn: Connection,
+    device: String,
+    wake_worker: Sender<()>,
+    redactors: Arc<Redactors>,
+) -> (WriterHandle, JoinHandle<()>) {
+    spawn_writer_tuned(conn, device, wake_worker, redactors, WalPolicy::default())
+}
+
+/// [`spawn_writer_with`] with an explicit [`WalPolicy`] (tests use small limits).
+pub fn spawn_writer_tuned(
     mut conn: Connection,
     device: String,
     wake_worker: Sender<()>,
     redactors: Arc<Redactors>,
+    wal_policy: WalPolicy,
 ) -> (WriterHandle, JoinHandle<()>) {
     let (tx, rx): (Sender<Job>, Receiver<Job>) = unbounded();
     let read_only = Arc::new(ReadOnlyState::default());
@@ -1962,10 +2077,14 @@ pub fn spawn_writer_with(
             };
             let mut carry: VecDeque<Job> = VecDeque::new();
             let mut stopping = false;
+            // The last batch held only jobs that came in during an ingest, ahead of its next slice.
+            let mut queued_ran_last = false;
+            let mut wal = WalKeeper::new(&conn, wal_policy);
             loop {
                 let mut batch: Vec<Job> = carry.drain(..).collect();
                 if !stopping {
                     if batch.is_empty() {
+                        queued_ran_last = false;
                         let Ok(first) = rx.recv() else { break };
                         batch.push(first);
                         let deadline = Instant::now() + BATCH_WINDOW;
@@ -1976,12 +2095,25 @@ pub fn spawn_writer_with(
                             }
                         }
                     } else {
-                        // Continuing an ingest: add what is already queued, without waiting.
-                        while !ends_batch(&batch) && batch.len() < BATCH_MAX {
+                        // Continuing an ingest. What was queued meanwhile is written first and
+                        // alone, in a transaction of its own: a `remember` then waits for the
+                        // slice in progress and its own short transaction, not for the next
+                        // slice as well. The slice that follows is the ingest's alone again
+                        // (so a busy queue slows an import by at most half, never stops it).
+                        let mut queued = Vec::new();
+                        while !ends_batch(&queued) && queued.len() < BATCH_MAX {
                             match rx.try_recv() {
-                                Ok(j) => batch.push(j),
+                                Ok(j) => queued.push(j),
                                 Err(_) => break,
                             }
+                        }
+                        if queued.is_empty() || queued_ran_last {
+                            batch.extend(queued);
+                            queued_ran_last = false;
+                        } else {
+                            carry.extend(batch.drain(..));
+                            batch = queued;
+                            queued_ran_last = true;
                         }
                     }
                     // Jobs sent after a shutdown are dropped (their callers get an error);
@@ -2037,6 +2169,10 @@ pub fn spawn_writer_with(
                             }));
                         }
                     }
+                }
+                // Between transactions, after the callers have their replies.
+                if !stopping {
+                    wal.check(&conn, Instant::now());
                 }
             }
         })
@@ -2736,8 +2872,12 @@ mod tests {
         };
         let fresh = (INGEST_SLICE, INGEST_SLICE_BYTES);
         assert_eq!(slice_len(&chunks(1_000, 60), fresh), INGEST_SLICE);
-        assert_eq!(slice_len(&chunks(1_000, 2_048), fresh), 32);
-        assert_eq!(slice_len(&chunks(10, 32_768), fresh), 2);
+        assert_eq!(slice_len(&chunks(1_000, 2_048), fresh), 16);
+        assert_eq!(
+            slice_len(&chunks(10, 32_768), fresh),
+            1,
+            "a largest chunk fills a slice"
+        );
         assert_eq!(
             slice_len(&chunks(10, 100_000), fresh),
             1,
@@ -4861,5 +5001,187 @@ mod tests {
         assert_eq!(status_of(&f, &id), "active");
         let n: i64 = f.read("SELECT count(*) FROM events WHERE actor LIKE 'judge:%'", []);
         assert_eq!(n, 0);
+    }
+
+    /// Small writes that arrive during an import are written ahead of its next slice, but never
+    /// instead of it: with writers that never pause, the import still finishes.
+    #[test]
+    fn an_import_still_finishes_while_small_writes_keep_arriving() {
+        let f = fixture();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let (h, stop) = (f.h.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut n = 0;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        h.submit_blocking(remember(&format!("busy writer {t} note {n}")))
+                            .unwrap();
+                        n += 1;
+                    }
+                    n
+                })
+            })
+            .collect();
+        let started = Instant::now();
+        let out = ingested(f.h.submit_blocking(ingest("busy", 1_000, long_text)));
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let written: i32 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert_eq!(out.inserted, 1_000);
+        assert!(written > 0, "the small writes ran during the import");
+        assert!(
+            took < Duration::from_secs(120),
+            "the import took {took:?} beside {written} small writes"
+        );
+    }
+
+    fn wal_bytes(db: &Path) -> u64 {
+        let mut p = db.as_os_str().to_owned();
+        p.push("-wal");
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    }
+
+    fn tuned(limit: u64, gap: Duration) -> Fixture {
+        let d = tempfile::tempdir().unwrap();
+        let conn = open(d.path());
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded();
+        let redactors = Redactors::fixed(alice_core::settings::PrivacySettings::default());
+        let policy = WalPolicy {
+            limit,
+            min_gap: gap,
+            busy_wait: Duration::from_millis(100),
+        };
+        let (h, thread) = spawn_writer_tuned(conn, "dev".into(), wake_tx, redactors, policy);
+        Fixture {
+            dir: d,
+            h,
+            wake: wake_rx,
+            thread,
+        }
+    }
+
+    /// Queries as a client does: short read transactions, back to back, never a gap in which
+    /// no reader is on the log. Returns the stop flag and the thread.
+    fn busy_reader(db: std::path::PathBuf) -> (Arc<std::sync::atomic::AtomicBool>, JoinHandle<()>) {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let t = std::thread::spawn(move || {
+            let a = alice_core::store::open_reader(&db).unwrap();
+            let b = alice_core::store::open_reader(&db).unwrap();
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                for c in [&a, &b] {
+                    let _: i64 = c
+                        .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
+                        .unwrap();
+                    let _: i64 = c
+                        .query_row(
+                            "SELECT count(*) FROM (SELECT rowid FROM chunks LIMIT 50)",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                }
+            }
+        });
+        (stop, t)
+    }
+
+    /// The incident behind Task 20: with readers that never leave the log, SQLite's own
+    /// checkpoint never restarts it and the file only grows. With the writer's policy it
+    /// stays near the limit. (With `WalPolicy { limit: u64::MAX, .. }` this test fails: the
+    /// log ends several times over the bound.)
+    #[test]
+    fn a_long_ingest_beside_a_reader_that_keeps_querying_leaves_a_bounded_wal() {
+        const LIMIT: u64 = 2 * 1024 * 1024;
+        let f = tuned(LIMIT, Duration::ZERO);
+        let (stop, reader) = busy_reader(f.db());
+        let mut peak = 0;
+        for round in 0..6 {
+            ingested(f.h.submit_blocking(ingest(&format!("bulk{round}"), 1_000, long_text)));
+            peak = peak.max(wal_bytes(&f.db()));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+        let n: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(n, 6_000, "nothing was lost to the restarts");
+        assert!(
+            peak <= 2 * LIMIT,
+            "the -wal reached {peak} bytes with a limit of {LIMIT}"
+        );
+    }
+
+    /// A reader that began before the restart keeps its snapshot, so the restart is skipped,
+    /// and not one write in flight fails or waits more than the bounded wait for it.
+    #[test]
+    fn a_restart_skipped_for_a_reader_never_fails_the_write_in_flight() {
+        let f = tuned(1, Duration::ZERO);
+        f.h.submit_blocking(remember("first")).unwrap();
+        let held = alice_core::store::open_reader(&f.db()).unwrap();
+        held.execute_batch("BEGIN").unwrap();
+        let _: i64 = held
+            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        let started = Instant::now();
+        for i in 0..5 {
+            f.h.submit_blocking(remember(&format!("while a reader holds the log {i}")))
+                .expect("a skipped restart is not a failed write");
+        }
+        // Five writes, each followed by at most one 100 ms attempt.
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "took {:?}",
+            started.elapsed()
+        );
+        // The held reader still sees its own snapshot, undisturbed.
+        let seen: i64 = held
+            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seen, 1);
+        held.execute_batch("COMMIT").unwrap();
+        // Once it lets go, the next write is followed by a restart that works.
+        f.h.submit_blocking(remember("after the reader left"))
+            .unwrap();
+        f.h.submit_blocking(remember("and one more")).unwrap();
+        let n: i64 = f.read("SELECT count(*) FROM memories", []);
+        assert_eq!(n, 8);
+    }
+
+    #[test]
+    fn the_keeper_reports_what_it_did() {
+        let d = tempfile::tempdir().unwrap();
+        let conn = open(d.path());
+        let policy = WalPolicy {
+            limit: 1,
+            min_gap: Duration::from_secs(2),
+            busy_wait: Duration::from_millis(50),
+        };
+        let mut keeper = WalKeeper::new(&conn, policy);
+        let t0 = Instant::now();
+        conn.execute_batch("INSERT INTO meta (key, value) VALUES ('k', 'v')")
+            .unwrap();
+        assert!(wal_bytes(&d.path().join("a.db")) > 1);
+        // A reader pinned to the log: the attempt is skipped.
+        let held = alice_core::store::open_reader(&d.path().join("a.db")).unwrap();
+        held.execute_batch("BEGIN").unwrap();
+        let _: i64 = held
+            .query_row("SELECT count(*) FROM meta", [], |r| r.get(0))
+            .unwrap();
+        conn.execute_batch("INSERT INTO meta (key, value) VALUES ('k2', 'v')")
+            .unwrap();
+        assert_eq!(keeper.check(&conn, t0), WalCheck::Skipped);
+        // Tried a moment ago: not due, however large the log is.
+        assert_eq!(
+            keeper.check(&conn, t0 + Duration::from_secs(1)),
+            WalCheck::NotDue
+        );
+        held.execute_batch("COMMIT").unwrap();
+        assert_eq!(
+            keeper.check(&conn, t0 + Duration::from_secs(3)),
+            WalCheck::Restarted
+        );
+        // The writer's own transactions are still fine afterwards.
+        conn.execute_batch("INSERT INTO meta (key, value) VALUES ('k3', 'v')")
+            .unwrap();
     }
 }

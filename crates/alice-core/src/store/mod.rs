@@ -179,7 +179,18 @@ impl Drop for Lease<'_> {
         let mut st = self.pool.state.lock();
         match conn {
             // A panic may have left a statement or transaction open: do not reuse that one.
-            Some(c) if !std::thread::panicking() => st.idle.push(c),
+            // Neither may a connection that comes back inside a transaction or with a statement
+            // half-read: its read snapshot would pin the write-ahead log, and with it every
+            // restart of the log, for as long as the connection idles in the pool.
+            Some(c) if !std::thread::panicking() && c.is_autocommit() && !c.is_busy() => {
+                st.idle.push(c)
+            }
+            Some(_) if !std::thread::panicking() => {
+                tracing::warn!(
+                    "a pooled reader came back inside a transaction or mid-statement; closed"
+                );
+                st.open -= 1;
+            }
             _ => st.open -= 1,
         }
         drop(st);
@@ -394,6 +405,52 @@ mod tests {
         );
         assert_eq!(pool.state.lock().open, 3);
         assert_eq!(pool.state.lock().idle.len(), 3);
+    }
+
+    /// A reader that keeps a read snapshot while it idles would stop the writer from ever
+    /// restarting the log (Task 20), so such a connection is closed, not pooled.
+    #[test]
+    fn a_connection_returned_inside_a_transaction_or_mid_statement_is_not_reused() {
+        let (_d, path) = temp_db();
+        let w = open_writer(&path).unwrap();
+        w.execute_batch("INSERT INTO meta (key, value) VALUES ('a', '1'), ('b', '2')")
+            .unwrap();
+        let pool = ReaderPool::new(path, 1);
+        // Back to back, as clients do: each reader sees an idle connection, no snapshot held.
+        pool.with(|c| {
+            assert!(c.is_autocommit() && !c.is_busy());
+            Ok(())
+        })
+        .unwrap();
+        pool.with(|c| {
+            c.execute_batch("BEGIN")?;
+            c.query_row("SELECT count(*) FROM meta", [], |r| r.get::<_, i64>(0))?;
+            Ok(())
+        })
+        .unwrap();
+        pool.with(|c| {
+            assert!(c.is_autocommit(), "the open transaction was not handed on");
+            Ok(())
+        })
+        .unwrap();
+        // A statement stepped once and then left: its snapshot is open too.
+        let half = pool.lease().unwrap();
+        {
+            let c = half.conn.as_ref().unwrap();
+            let mut stmt = c.prepare("SELECT key FROM meta").unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            assert!(rows.next().unwrap().is_some());
+            assert!(c.is_busy());
+            std::mem::forget(rows);
+            std::mem::forget(stmt);
+        }
+        // Hand the busy connection back through the pool's own path.
+        drop(half);
+        pool.with(|c| {
+            assert!(!c.is_busy(), "a half-read statement was not handed on");
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
