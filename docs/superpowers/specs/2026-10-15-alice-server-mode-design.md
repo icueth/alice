@@ -576,8 +576,10 @@ the same query, project and limit, in fast mode, and its own **800 ms** deadline
 - their ids are prefixed `team:`;
 - they are deduplicated against personal hits by the content hash of title plus snippet (a personal hit wins);
 - **in fast mode** all hits are ordered by score;
-- **in precise mode** the person's judge grades the personal hits only, and team hits follow, ordered by their score
-  (R35).
+- **in precise mode** the team store has marked each hit it returns to a federated caller with `cloud_ok`: its own cloud
+  policy for that hit's project, fail-closed. The person's judge grades the merged top, personal hits plus the team hits
+  with `cloud_ok = true`. Team hits with `cloud_ok = false` (or no mark) are never sent to the person's judge; they
+  follow the graded hits, ordered by score (R35, as revised by the controller).
 
 For `context`, a "Team memory" section with the team store's context for the same project is appended within a third of
 the budget. Project scoping works as for personal hits: a project's recall shows that project's team memories and the
@@ -596,7 +598,8 @@ this answer is personal only".
 **Privacy.** Shared memories are readable by every team member; that is the point, and the tool description and
 `docs/server.md` say so. Both daemons redact: the person's daemon before forwarding, the team daemon when it stores. The
 team store's own settings decide its judge (heuristic by default) and its cloud policy. A person's Jev key never reaches
-the team daemon, and **team texts are never sent to a person's cloud judge** (R35).
+the team daemon, and a team text reaches a person's cloud judge **only when the team store's own cloud policy allows its
+project** (`cloud_ok`, R35).
 
 **Out of scope (v1):** sharing knowledge-graph facts directly (the team daemon's own judge derives facts from its
 memories), per-person tokens on the team store, partial teams, and a spool for shared writes.
@@ -1205,7 +1208,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R32 | Team federation is **admin-provisioned** (`ALICE_TEAM_URL` and `ALICE_TENANT_NAME` in the env file, `team.token` 0600 in the home), never a setting (controller's ruling) | A tenant must not point its daemon at another store or read the team's token | Changing the team store needs the admin |
 | R33 | A **`--team-store`** daemon accepts `project_hint` over HTTP; every other daemon clears it on entry (Task 25) | The team store is reachable only by federated personal daemons over loopback; they must forward a project identity that may not exist in the team store yet | A process on the server holding the team token could create placeholder projects in the team store |
 | R34 | A shared memory's author is `"<tenant>/<agent>"` in `author.agent`, set by the personal daemon; ownership = the `<tenant>` part | No schema change; a tenant name cannot contain `/` | Agent names that already contain `/` are shown as-is after the tenant |
-| R35 | In precise mode, **team hits are not graded by the person's judge**; they follow the graded personal hits (addendum 3 asked to grade them) | Grading would send team texts to a person's cloud judge, bypassing the team store's own cloud policy (addendum 3 rule 6) | Team hits are ordered by fusion score only; the controller may overrule if the team store's policy allows the cloud |
+| R35 | (Revised by the controller.) In precise mode, the person's judge grades the merged top **including team hits the team store marked `cloud_ok`**: the team store's own cloud policy for that hit's project, fail-closed. Team hits not `cloud_ok` follow the graded hits, by fusion score | Grading shared knowledge keeps precise mode's quality; the team store's mark keeps its cloud policy in force (addendum 3 rule 6) | A team store that allows the cloud for a project lets its texts reach a person's judge, which is that policy's meaning |
 | R36 | Team hits are deduplicated against personal hits by the content hash of title plus snippet | `Hit` carries no content hash and snippets are deterministic; no search change | Two memories with the same title and snippet start but different bodies collapse into one (rare) |
 | R37 | `context` appends a "Team memory" section within a third of the budget | Keeps the person's own briefing first | A large team context is cut harder than the personal one |
 
@@ -1224,7 +1227,8 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
   - import is done by the admin (§2.9);
   - the `alice remote` client is deferred (the controller asks the owner whether he wants it for his own Mac).
 - **Addendum 3 (the owner, 2026-10-15):** shared team memory, `remember shared:true` (§2.10). Reported to the controller:
-  - the precise-mode grading of team hits is not done (R35, privacy), so the controller can overrule;
+  - the precise-mode grading of team hits: first left ungraded (R35, privacy); the controller revised it so team hits
+    marked `cloud_ok` by the team store are graded;
   - the team store accepts project hints over HTTP (R33).
 - **Q3 — Remote mode switches a whole machine**, or one `ALICE_HOME` through the environment, not single projects.
 - **Q4 — Resources (measured by the controller):** 15 GB of RAM (13 GB free), 4 vCPU, and a 28 GB root filesystem with 19 GB

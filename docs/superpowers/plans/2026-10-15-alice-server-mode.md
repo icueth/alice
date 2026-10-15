@@ -3672,8 +3672,8 @@ impl TeamLink {
 ### Task 28: The read merge — `recall` and `context` with team hits (addendum 3)
 
 **Files:**
-- Modify: `crates/alice-core/src/api.rs` (`Hit.source: Option<String>`, `Hit.author: Option<String>`, both skipped
-  when `None`); `crates/alice-daemon/src/service.rs` (`recall`, `context`); the `recall` text rendering, so a team hit
+- Modify: `crates/alice-core/src/api.rs` (`Hit.source: Option<String>`, `Hit.author: Option<String>`,
+  `Hit.cloud_ok: Option<bool>`, all skipped when `None`); `crates/alice-daemon/src/service.rs` (`recall`, `context`); the `recall` text rendering, so a team hit
   shows "(team, by <author>)".
 - Test: `service.rs` tests and `tests/server_mode.rs`.
 
@@ -3686,7 +3686,14 @@ impl TeamLink {
     memory's `author.agent`, from one `get` of the hit ids). They are dropped when the content hash of title plus snippet
     (`alice_core::normalize::content_hash`) equals a personal hit's.
   - **Fast mode:** all hits are ordered by score.
-  - **Precise mode:** the personal hits keep the judge's order and the team hits follow by score (R35).
+  - **Precise mode** (R35, as revised by the controller):
+    - **Team store side.** When `svc.is_team_store()`, `recall` sets `cloud_ok: Some(<its DaemonJevPolicy::cloud_allowed
+      for the hit's project>)` on every hit it returns, fail-closed: `false` on any doubt.
+    - **Personal side.** Team hits with `cloud_ok == Some(true)` join the personal candidates **before** the person's
+      `rerank`, and one judge call grades the merged top. Their per-project cloud check is the team store's mark; the
+      person's global switches (a degraded configuration, the budget, the breaker) still apply as for any grading.
+      Text is redacted again by the person's judge redactor (always on).
+    - Team hits that are not `cloud_ok` never reach the judge; they follow the graded hits, by score.
   - Truncate to `limit`. Re-render `text` when the format is text.
   - **Late or failed:** the personal answer plus the note `"the team memory did not answer in time; this answer is personal only"`.
 - **`context`.** Ask the team store's `context` for the same project, with `max_tokens` a third of the budget and the
@@ -3696,8 +3703,12 @@ impl TeamLink {
   - a personal hit with the same title and snippet as a team hit appears once;
   - the team daemon delayed past 800 ms (a hook in the emulator, or a stopped team daemon) → the recall returns within
     about 1.5 s with the note;
-  - in precise mode with a grader, the team text never reaches the grader (`graded_states` holds none of the team hit's
-    words);
+  - in precise mode with a grader:
+    - a team hit whose project the team store allows (`cloud_ok`) is graded: its words appear in `graded_states`, and a
+      grader that favours it moves it above personal hits;
+    - a team hit in a project on the team store's `privacy.cloud_denied_projects` list never reaches the grader (none of
+      its words in `graded_states`) and comes after the graded hits;
+    - the team store's own recall sets `cloud_ok` on its hits only in team-store mode;
   - B's context contains `## Team memory` and A's shared title;
   - project scoping: a team memory in project `x` shows in a recall from project `x`, and not from project `y`.
 - **Commit:** `feat(team): recall and context merge the team memory, labelled with its author (addendum 3)`.
