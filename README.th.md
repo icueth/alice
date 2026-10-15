@@ -169,7 +169,7 @@ agent ที่ใช้ MCP ไม่ได้ เรียกผ่าน CLI 
 
 | Tool | หน้าที่ |
 |---|---|
-| `recall` | ค้นหา memory กรองตามโปรเจกต์, topic, kind และช่วงวันได้ ใส่ `include_raw` เพื่อค้น transcript ด้วย กำหนดงบ `max_tokens` ได้ เมื่อตั้ง model judge ไว้ (`judge.provider = jev`) recall จะเป็นแบบ **precise** เป็นค่าเริ่มต้น: Judge ให้คะแนนผลอันดับต้น ๆ 20 อันของทุกชั้น รวมถึง chunk ของ transcript และช่วยดึงคำตอบที่ต่ำกว่าเกณฑ์ vector เพียงนิดเดียวกลับมา (ช้ากว่า ราวครึ่งวินาที) `mode: "fast"` ข้าม Judge และ `mode: "precise"` บังคับใช้ ถ้าไม่มี model judge recall เป็นแบบ fast เสมอ |
+| `recall` | ค้นหา memory กรองตามโปรเจกต์, topic, kind และช่วงวันได้ ใส่ `include_raw` เพื่อค้น transcript ด้วย กำหนดงบ `max_tokens` ได้ เมื่อตั้ง model judge ไว้ (`judge.provider = jev`) recall จะเป็นแบบ **precise** เป็นค่าเริ่มต้น: Judge ให้คะแนนผลอันดับต้น ๆ 20 อันของทุกชั้น รวมถึง chunk ของ transcript และช่วยดึงคำตอบที่ต่ำกว่าเกณฑ์ vector เพียงนิดเดียวกลับมา (ช้ากว่า ราวครึ่งวินาที) `mode: "fast"` ข้าม Judge และ `mode: "precise"` บังคับใช้ ถ้าไม่มี model judge recall เป็นแบบ fast เสมอ ถ้า Judge ช้าหรือล้มเหลว recall เสียเวลาไม่เกิน `search.precise_timeout_ms` (ค่าเริ่มต้น 2.5 วินาที และถ้าล้มเหลวติดกัน 3 ครั้งจะข้าม Judge ไปหนึ่งนาที) แล้วตอบแบบ fast พร้อมหมายเหตุบอกเหตุผล |
 | `remember` | บันทึก memory (`kind`, `title`, `topics`, `importance`, `supersedes`) เรียกซ้ำได้ปลอดภัย |
 | `context` | สรุปของโปรเจกต์ปัจจุบันภายในงบ token |
 | `get_memory` | ดู memory ฉบับเต็ม พร้อม link และแหล่งที่มา ถ้าขอ memory ที่ Judge รวมเข้ากับอันเก่าไปแล้ว จะได้อันเก่ากลับมา |
@@ -238,6 +238,7 @@ endpoint = "http://127.0.0.1:11434/v1"   # ไม่ใส่ก็ได้ แ
 [search]
 default_max_tokens = 1500
 default_mode = "auto"                # auto (precise เมื่อมี model judge ไม่งั้น fast) | fast | precise
+precise_timeout_ms = 2500               # งบเวลาทั้งหมดของการเรียก Judge ใน recall แบบ precise
 
 [maintenance]
 enabled = true

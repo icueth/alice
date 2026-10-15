@@ -169,7 +169,7 @@ Agents that cannot use MCP can call the CLI (`alice recall`, `alice remember`, `
 
 | Tool | Purpose |
 |---|---|
-| `recall` | Search memories. Filters for project, topics, kinds and dates; `include_raw` for transcripts; `max_tokens` budget. With a model judge configured (`judge.provider = jev`) recall is **precise** by default: the judge grades the top 20 results of every tier, transcript chunks included, and rescues answers that fall just below the vector floor (slower, about half a second). `mode: "fast"` skips the judge and `mode: "precise"` forces it; without a model judge recall is always fast. |
+| `recall` | Search memories. Filters for project, topics, kinds and dates; `include_raw` for transcripts; `max_tokens` budget. With a model judge configured (`judge.provider = jev`) recall is **precise** by default: the judge grades the top 20 results of every tier, transcript chunks included, and rescues answers that fall just below the vector floor (slower, about half a second). `mode: "fast"` skips the judge and `mode: "precise"` forces it; without a model judge recall is always fast. A slow or failing judge costs a recall at most `search.precise_timeout_ms` (2.5 s by default; after three failures the judge is skipped for a minute): the answer is then the fast one, with a note saying why. |
 | `remember` | Save a memory (`kind`, `title`, `topics`, `importance`, `supersedes`). Idempotent. |
 | `context` | Token-budgeted briefing for the current project. |
 | `get_memory` | Full memories with links and provenance. Asking for a memory the judge folded into an older one answers with the older one. |
@@ -238,6 +238,7 @@ endpoint = "http://127.0.0.1:11434/v1"   # optional; each provider has a default
 [search]
 default_max_tokens = 1500
 default_mode = "auto"                # auto (precise with a model judge, else fast) | fast | precise
+precise_timeout_ms = 2500               # the whole budget of the judge call of a precise recall
 
 [maintenance]
 enabled = true
