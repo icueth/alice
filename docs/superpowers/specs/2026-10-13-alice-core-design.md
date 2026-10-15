@@ -589,7 +589,7 @@ alice facts <entity> [--predicate p] [--as-of date] [--timeline]
 alice fact add|supersede|end <subject> <predicate> <object> [--from date]
 alice history [target] [--actor a] [--limit n]       alice undo <event-id>
 alice review [list [--type t] [--all] | show <id> | resolve <id> <choice>]
-alice stats                 alice projects              alice status
+alice stats                 alice projects [merge <from> <into> [--yes]]   alice status
 alice backup now|list       alice restore [backup] [--yes]
 alice maintenance status | run <job>
 alice config list|get|set|unset|edit|set-secret|delete-secret|test

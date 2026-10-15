@@ -11,6 +11,7 @@ pub mod kg;
 pub mod maintenance;
 pub mod memories;
 pub mod migrations;
+pub mod project_merge;
 pub mod projects;
 pub mod reviews;
 pub mod sources;

@@ -2937,6 +2937,70 @@ impl Service {
         self.read(projects::list_projects).await
     }
 
+    /// Merge project `from` into `into` (or, with `dry_run`, say what that would move). The
+    /// answer carries the event id that `alice undo` reverses.
+    pub async fn merge_projects(&self, req: ProjectMergeRequest) -> Result<ProjectMergeResponse> {
+        let _busy = self.activity.enter();
+        let (from, into) = (req.from.clone(), req.into.clone());
+        let plan = self
+            .read(move |c| alice_core::store::project_merge::plan(c, &from, &into))
+            .await?;
+        let answer = |merged: bool,
+                      event_id: Option<String>,
+                      c: &alice_core::store::project_merge::MergeCounts| {
+            ProjectMergeResponse {
+                from: plan.from.slug.clone(),
+                into: plan.into.slug.clone(),
+                merged,
+                memories: c.memories,
+                chunks: c.chunks,
+                sources: c.sources,
+                facts: c.facts,
+                message: if merged {
+                    format!(
+                        "Merged \"{}\" into \"{}\": {} memories, {} chunks, {} sources, {} facts moved. \"{}\" now names \"{}\".{}",
+                        plan.from.slug,
+                        plan.into.slug,
+                        c.memories,
+                        c.chunks,
+                        c.sources,
+                        c.facts,
+                        plan.from.slug,
+                        plan.into.slug,
+                        event_id
+                            .as_deref()
+                            .map(|e| format!(" To undo: alice undo {e}"))
+                            .unwrap_or_default()
+                    )
+                } else {
+                    format!(
+                        "Would merge \"{}\" into \"{}\": {} memories, {} chunks, {} sources, {} facts.",
+                        plan.from.slug, plan.into.slug, c.memories, c.chunks, c.sources, c.facts
+                    )
+                },
+                event_id,
+            }
+        };
+        if req.dry_run {
+            return Ok(answer(false, None, &plan.counts));
+        }
+        match self
+            .writer
+            .submit(WriteOp::MergeProjects {
+                from: req.from,
+                into: req.into,
+                actor: Actor::from_author(&req.author),
+            })
+            .await?
+        {
+            WriteOutcome::ProjectMerged(done) => {
+                let (done, event) = *done;
+                Ok(answer(true, Some(event), &done.counts))
+            }
+            other => Err(unexpected(other)),
+        }
+    }
+
     // ------------------------------------------------------------------ import
 
     /// Starts an import of a MemPalace palace on a thread of its own. The refusals that need

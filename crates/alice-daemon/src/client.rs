@@ -495,6 +495,15 @@ impl DaemonClient {
     pub async fn projects(&self) -> Result<Vec<ResolvedProject>> {
         self.get_json("/api/v1/projects").await
     }
+    /// Merge one project into another (`dry_run`: only count what would move).
+    pub async fn merge_projects(
+        &self,
+        r: &alice_core::api::ProjectMergeRequest,
+    ) -> Result<alice_core::api::ProjectMergeResponse> {
+        // A palace import can mean hundreds of thousands of rows to move.
+        self.call("/api/v1/projects/merge", r, Duration::from_secs(600))
+            .await
+    }
     pub async fn remember(&self, r: &RememberRequest) -> Result<RememberResponse> {
         self.call("/api/v1/remember", r, Duration::from_secs(5))
             .await

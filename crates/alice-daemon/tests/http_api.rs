@@ -2168,3 +2168,239 @@ async fn rotating_the_token_ends_an_open_mcp_stream() {
         );
     }
 }
+
+// ------------------------------------------------------------------------ projects merge
+
+/// (id, project slug) of every memory, chunk and source, by id.
+fn placement(s: &Srv) -> std::collections::BTreeMap<String, String> {
+    let c = rusqlite::Connection::open(s.home.db()).unwrap();
+    let mut out = std::collections::BTreeMap::new();
+    for t in ["memories", "chunks", "sources"] {
+        let mut st = c
+            .prepare(&format!(
+                "SELECT x.id, p.slug FROM {t} x JOIN projects p ON p.id = x.project_id"
+            ))
+            .unwrap();
+        for r in st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+        {
+            let (id, slug) = r.unwrap();
+            out.insert(id, slug);
+        }
+    }
+    out
+}
+
+fn slugs(s: &Srv) -> Vec<String> {
+    let c = rusqlite::Connection::open(s.home.db()).unwrap();
+    c.prepare("SELECT slug FROM projects ORDER BY slug")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+/// Projects `alpha` and `beta`, each detected from a folder of that name.
+async fn two_folders(s: &Srv) -> (String, String) {
+    let alpha = s._d.path().join("alpha");
+    let beta = s._d.path().join("beta");
+    std::fs::create_dir_all(&alpha).unwrap();
+    std::fs::create_dir_all(&beta).unwrap();
+    let (a, b) = (
+        alpha.to_string_lossy().into_owned(),
+        beta.to_string_lossy().into_owned(),
+    );
+    for (cwd, text) in [
+        (&a, "kiwi decision in alpha"),
+        (&a, "kiwi second note in alpha"),
+        (&b, "kiwi decision in beta"),
+    ] {
+        s.svc
+            .remember(RememberRequest {
+                content: text.into(),
+                cwd: Some(cwd.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    s.svc
+        .ingest(IngestRequest {
+            source: SourceInput {
+                uri: "file:///alpha/session.jsonl".into(),
+                ..Default::default()
+            },
+            chunks: (0..3)
+                .map(|i| ChunkInput {
+                    ord: i,
+                    text: format!("alpha transcript piece {i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            project: None,
+            cwd: Some(a.clone()),
+        })
+        .await
+        .unwrap();
+    (a, b)
+}
+
+/// `POST /api/v1/projects/merge`: behind the token, a dry run changes nothing, the refusals say
+/// what to do, a merge moves the rows and leaves the old name working, and undo (by the event
+/// the merge answers with) puts every row back where it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn projects_merge_route_moves_keeps_the_old_name_and_undoes_exactly() {
+    let s = Srv::start().await;
+    let (a, b) = two_folders(&s).await;
+    assert_eq!(slugs(&s), ["alpha", "beta", "global"]);
+    let before = placement(&s);
+    assert_eq!(before.len(), 3 + 3 + 1);
+
+    let body = ProjectMergeRequest {
+        from: "alpha".into(),
+        into: "beta".into(),
+        ..Default::default()
+    };
+    // The same guard as every route.
+    let r = s
+        .http
+        .post(s.url("/api/v1/projects/merge"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+
+    let dry: ProjectMergeResponse = s
+        .post_json(
+            "/api/v1/projects/merge",
+            &ProjectMergeRequest {
+                dry_run: true,
+                ..body.clone()
+            },
+        )
+        .await;
+    assert!(!dry.merged && dry.event_id.is_none());
+    assert_eq!(
+        (dry.memories, dry.chunks, dry.sources, dry.facts),
+        (2, 3, 1, 0)
+    );
+    assert_eq!(placement(&s), before, "a dry run moves nothing");
+
+    for (from, into, said) in [
+        ("global", "beta", "global"),
+        ("alpha", "alpha", "same project"),
+        ("alpha", "global", "global"),
+        ("nope", "beta", "unknown project"),
+    ] {
+        let r = s
+            .post(
+                "/api/v1/projects/merge",
+                &ProjectMergeRequest {
+                    from: from.into(),
+                    into: into.into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(r.status(), 400, "{from} -> {into}");
+        let text = r.text().await.unwrap();
+        assert!(text.contains(said), "{from} -> {into}: {text}");
+    }
+    assert_eq!(placement(&s), before);
+
+    let done: ProjectMergeResponse = s.post_json("/api/v1/projects/merge", &body).await;
+    assert!(done.merged, "{done:?}");
+    assert_eq!((done.memories, done.chunks, done.sources), (2, 3, 1));
+    let event = done.event_id.clone().unwrap();
+    assert!(done.message.contains(&event), "{}", done.message);
+    assert_eq!(slugs(&s), ["beta", "global"]);
+    let merged = placement(&s);
+    assert_eq!(merged.len(), before.len());
+    assert!(
+        merged.values().all(|p| p == "beta"),
+        "everything is in beta now: {merged:?}"
+    );
+    assert!(merged.values().all(|p| p != "alpha"));
+    // The event is in the history, with the id undo takes.
+    let events: Vec<alice_core::store::events::EventRow> =
+        s.get_json("/api/v1/events?limit=5").await;
+    assert_eq!(events[0].id, event);
+    assert_eq!(events[0].action, "project.merge");
+
+    // The old name still works: as a project argument, and from the old folder.
+    let found = s
+        .svc
+        .recall(RecallRequest {
+            query: "kiwi".into(),
+            project: Some("alpha".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let text = found.text.clone().unwrap_or_default();
+    assert!(
+        text.contains("3 results (project beta)")
+            && [
+                "decision in beta",
+                "decision in alpha",
+                "second note in alpha"
+            ]
+            .iter()
+            .all(|t| text.contains(t)),
+        "all three kiwi memories, found by the old name: {text}"
+    );
+    for (cwd, project) in [(Some(a.clone()), None), (None, Some("alpha".to_string()))] {
+        s.svc
+            .remember(RememberRequest {
+                content: format!("written after the merge {project:?}"),
+                cwd,
+                project,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(slugs(&s), ["beta", "global"], "no project came back");
+    let after_writes = placement(&s);
+    assert_eq!(after_writes.len(), before.len() + 2);
+    assert!(
+        after_writes
+            .iter()
+            .filter(|(id, _)| !before.contains_key(*id))
+            .all(|(_, p)| p == "beta")
+    );
+    let _ = b;
+
+    // Undo: the project and every moved row are back; what was written since stays in beta.
+    let u: UndoResponse = s
+        .post_json(
+            "/api/v1/undo",
+            &UndoRequest {
+                event_id: event,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(u.undone, "{}", u.message);
+    assert_eq!(slugs(&s), ["alpha", "beta", "global"]);
+    let restored = placement(&s);
+    for (id, project) in &before {
+        assert_eq!(restored.get(id), Some(project), "{id}");
+    }
+    assert_eq!(restored.len(), before.len() + 2);
+    // And a write from the folder of alpha goes to alpha again.
+    let r = s
+        .svc
+        .remember(RememberRequest {
+            content: "after the undo".into(),
+            cwd: Some(a),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let id = r.id.unwrap();
+    assert_eq!(placement(&s)[&id], "alpha");
+}

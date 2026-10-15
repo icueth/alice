@@ -1194,6 +1194,87 @@ async fn block_mode_skips_the_drawer_names_the_detector_and_keeps_going() {
     assert_eq!(f.tables_holding(SECRET).await, Vec::<String>::new());
 }
 
+/// After `alice projects merge`, an import run again names the old project (a wing) and the rows
+/// land in the project it was merged into: no twin project, no rows under the old name. Drawers
+/// that were imported before are not imported again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_after_a_project_merge_lands_in_the_project_it_was_merged_into() {
+    let f = Flow::new().await;
+    let first = f.run_import(f.request()).await;
+    assert_eq!(first.state, ImportState::Done, "{:?}", first.error);
+    assert_eq!(f.project_slugs().await, vec!["devspace", "global", "pg-ai"]);
+    let memories = f.count("memories").await;
+    let chunks = f.count("chunks").await;
+    let pg = f.svc.projects().await.unwrap();
+    let pg_id = pg.iter().find(|p| p.slug == "pg-ai").unwrap().id.clone();
+
+    let merged = f
+        .svc
+        .merge_projects(alice_core::api::ProjectMergeRequest {
+            from: "devspace".into(),
+            into: "pg-ai".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(merged.merged && merged.chunks > 0, "{merged:?}");
+    assert_eq!(f.project_slugs().await, vec!["global", "pg-ai"]);
+
+    // Same palace: nothing new. A new drawer in the wing of the merged project, and one in a
+    // wing of the target, both land in `pg-ai`.
+    let second = f.run_import(f.request()).await.report.unwrap();
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
+    assert_eq!(
+        f.project_slugs().await,
+        vec!["global", "pg-ai"],
+        "no devspace twin"
+    );
+    assert_eq!(
+        (f.count("memories").await, f.count("chunks").await),
+        (memories, chunks)
+    );
+    add_drawers(
+        &f.palace,
+        &[
+            knowledge(
+                "new_k",
+                "devspace decision about the build cache",
+                "devspace",
+                "decisions",
+            ),
+            knowledge(
+                "new_p",
+                "pg-ai decision about the retry budget",
+                "pg-ai",
+                "decisions",
+            ),
+        ],
+    );
+    let third = f.run_import(f.request()).await.report.unwrap();
+    assert!(third.errors.is_empty(), "{:?}", third.errors);
+    assert_eq!(f.project_slugs().await, vec!["global", "pg-ai"]);
+    for legacy in ["new_k", "new_p"] {
+        let project: String = f
+            .db()
+            .query_row(
+                "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.legacy_id = ?1",
+                [legacy],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, "pg-ai", "{legacy}");
+    }
+    let in_target: i64 = f
+        .db()
+        .query_row(
+            "SELECT count(*) FROM chunks WHERE project_id = ?1",
+            [&pg_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(in_target >= merged.chunks as i64, "{in_target}");
+}
+
 fn add_drawers(palace: &Path, specs: &[DrawerSpec]) {
     let conn = rusqlite::Connection::open(palace.join("sqlite_exact.sqlite3")).unwrap();
     for d in specs {

@@ -57,10 +57,26 @@ fn slug_taken(conn: &Connection, s: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// A project reached through the key of one merged into it takes the live working tree as its
+/// root only when it has none: the project keeps the root of its own checkout otherwise.
+fn adopt_root(
+    conn: &Connection,
+    found: ResolvedProject,
+    p: &ProjectRef,
+) -> Result<ResolvedProject> {
+    if let Some(root) = p.root.as_ref().filter(|r| r.exists()) {
+        conn.execute(
+            "UPDATE projects SET root_path = ?1 WHERE id = ?2 AND root_path IS NULL",
+            params![root.to_string_lossy(), found.id],
+        )?;
+    }
+    Ok(found)
+}
+
 /// Insert the project if its key is new; returns the stored project either way.
 /// A slug already in use gets a suffix from the key's hash, lengthened until it is free.
 pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProject> {
-    if let Some(found) = find_by_key(conn, &p.key)? {
+    if let Some(found) = find_by_own_key(conn, &p.key)? {
         // The working tree may have moved (a re-clone, a new worktree): the rules of its
         // `.alice.toml` are read from the live root, so a root that exists replaces the stored one.
         if let Some(root) = p.root.as_ref().filter(|r| r.exists()) {
@@ -72,6 +88,10 @@ pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProje
         }
         return Ok(found);
     }
+    // The key of a project that was merged into another now names that one.
+    if let Some(found) = find_by_key_alias(conn, &p.key)? {
+        return adopt_root(conn, found, p);
+    }
     let base = slugify(&p.slug);
     if base.is_empty() {
         return Err(AliceError::invalid(format!(
@@ -80,6 +100,11 @@ pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProje
         )));
     }
     if !p.key.starts_with(PLACEHOLDER_KEY_PREFIX) {
+        // A placeholder of this slug that was merged into another project: the real project
+        // is that other one (the placeholder row is gone, its key still resolves).
+        if let Some(found) = find_by_key_alias(conn, &format!("{PLACEHOLDER_KEY_PREFIX}{base}"))? {
+            return adopt_root(conn, found, p);
+        }
         // A real project adopts the placeholder of the same slug (or an alias equal to it).
         let placeholder: Option<ResolvedProject> = conn
             .query_row(
@@ -189,8 +214,8 @@ pub fn add_alias(conn: &Connection, alias: &str, project_id: &str) -> Result<()>
     Ok(())
 }
 
-/// Look up a project by its stable key without creating it (read paths).
-pub fn find_by_key(conn: &Connection, key: &str) -> Result<Option<ResolvedProject>> {
+/// The project whose own key this is (not through a merge).
+fn find_by_own_key(conn: &Connection, key: &str) -> Result<Option<ResolvedProject>> {
     Ok(conn
         .query_row(
             "SELECT id, slug, name FROM projects WHERE key = ?1",
@@ -198,6 +223,26 @@ pub fn find_by_key(conn: &Connection, key: &str) -> Result<Option<ResolvedProjec
             row,
         )
         .optional()?)
+}
+
+/// The project that a merged project's key now names.
+fn find_by_key_alias(conn: &Connection, key: &str) -> Result<Option<ResolvedProject>> {
+    Ok(conn
+        .query_row(
+            "SELECT p.id, p.slug, p.name FROM project_key_aliases a JOIN projects p ON p.id = a.project_id WHERE a.key = ?1",
+            [key],
+            row,
+        )
+        .optional()?)
+}
+
+/// Look up a project by its stable key without creating it (read paths). The key of a project
+/// that was merged into another finds that other project.
+pub fn find_by_key(conn: &Connection, key: &str) -> Result<Option<ResolvedProject>> {
+    match find_by_own_key(conn, key)? {
+        Some(p) => Ok(Some(p)),
+        None => find_by_key_alias(conn, key),
+    }
 }
 
 /// The working-tree root a project was detected from, if it has one. `project_id_or_slug` is

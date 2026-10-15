@@ -687,6 +687,70 @@ fn every_subcommand_round_trips() {
     assert!(err.contains("already undone"), "{err}");
 }
 
+/// `alice projects merge`: asks (or refuses without a terminal), moves, keeps the old name
+/// working, and `alice undo` brings the project back.
+#[test]
+fn projects_merge_confirms_moves_keeps_the_old_name_and_undoes() {
+    let e = Env::new();
+    let other = e.work.parent().unwrap().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    e.ok(&["remember", "the quokka decision lives in the work project"]);
+    let o = e
+        .cmd(&["remember", "the quokka note lives in the other project"])
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    let slugs = |e: &Env| -> Vec<String> {
+        e.ok(&["projects"])
+            .lines()
+            .map(|l| l.split('\t').next().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(slugs(&e), ["global", "other", "work"]);
+
+    // No terminal and no --yes: refused, and nothing changed.
+    let o = e.run(&["projects", "merge", "other", "work"]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("--yes"), "{}", stderr(&o));
+    assert_eq!(slugs(&e), ["global", "other", "work"]);
+    // The refusals that name a fix.
+    for (from, into, said) in [
+        ("global", "work", "global"),
+        ("work", "work", "same project"),
+        ("nope", "work", "unknown project \"nope\""),
+    ] {
+        let o = e.run(&["projects", "merge", from, into, "--yes"]);
+        assert!(!o.status.success());
+        assert!(stderr(&o).contains(said), "{from}: {}", stderr(&o));
+    }
+
+    let out = e.ok(&["projects", "merge", "other", "work", "--yes"]);
+    assert!(
+        out.contains("1 memories") && out.contains("To undo: alice undo "),
+        "{out}"
+    );
+    assert_eq!(slugs(&e), ["global", "work"]);
+    // Both memories are in `work`; the old slug still names it.
+    let found = e.json(&["recall", "quokka", "--project", "other", "--limit", "20"]);
+    assert_eq!(found["results"].as_array().unwrap().len(), 2, "{found}");
+    // A write from the old checkout lands in `work` and makes no project.
+    let o = e
+        .cmd(&["remember", "written from the old checkout"])
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(slugs(&e), ["global", "work"]);
+
+    let event = out.rsplit("alice undo ").next().unwrap().trim().to_string();
+    let undone = e.ok(&["undo", &event]);
+    assert!(undone.starts_with("Undone: 1 change(s)"), "{undone}");
+    assert_eq!(slugs(&e), ["global", "other", "work"]);
+    let found = e.json(&["recall", "quokka", "--project", "other", "--limit", "20"]);
+    assert_eq!(found["results"].as_array().unwrap().len(), 1, "{found}");
+}
+
 /// The pending entries in the spool.
 fn spooled(e: &Env) -> usize {
     std::fs::read_dir(e.home.join("spool"))
