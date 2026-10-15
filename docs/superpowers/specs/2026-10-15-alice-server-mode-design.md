@@ -458,7 +458,7 @@ The admin's lever is one line per tenant: `ALICE_BACKUP_DAILY=1` in that tenant'
   everything under `global` without the project's rules.
 - **One check per process.** A verified remote client is reused without a ping before every call. A WAN round trip per tool call
   would double latency. A call that fails with a transport error or 401 drops the cached client, and the next call verifies
-  again. `is_live` still pings when asked.
+  again. `is_live` answers from that state without a ping; `alice remote status` pings afresh (`server_ping`).
 - **HTTP client.** The same reqwest/rustls stack the Jev and embedding clients use, with the system trust store through
   reqwest's platform verifier. The server's Let's Encrypt certificate is an IP certificate and chains to ISRG Root X1.
   - No redirects (`Policy::none()`): a redirect could carry the token elsewhere.
