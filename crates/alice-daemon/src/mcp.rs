@@ -438,7 +438,7 @@ impl AliceMcp {
 #[tool_router]
 impl AliceMcp {
     #[tool(
-        description = "Search long-term memory: decisions, bug fixes, facts, how-tos, preferences and past work. Use before answering about anything done before. Pass mode \"precise\" to have the judge re-rank the top results (slower; needs judge.provider = jev).",
+        description = "Search long-term memory: decisions, bug fixes, facts, how-tos, preferences and past work. Use before answering about anything done before. By default a configured model judge (judge.provider = jev) grades the top results, so recall is precise (slower, about half a second); pass mode \"fast\" to skip the judge, or mode \"precise\" to force it.",
         annotations(read_only_hint = true)
     )]
     async fn recall(

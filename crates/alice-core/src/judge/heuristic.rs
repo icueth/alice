@@ -313,6 +313,7 @@ mod tests {
             importance: 3,
             created_at: created.into(),
             similarity: sim,
+            raw: false,
         }
     }
 

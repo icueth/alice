@@ -32,7 +32,7 @@ Alice is built for that workload: many agents, many projects, one memory that st
 - **Knowledge first, transcripts on demand.** Two tiers: short, distilled *memories* (decisions, fixes, facts, how-tos, preferences, warnings, handoffs) are searched by default; raw session transcripts are kept as evidence and searched when you ask or when knowledge runs thin. *(Automatic transcript capture and distillation: planned, SP2.)*
 - **Search that understands code and Thai.** Hybrid retrieval: multilingual vectors, BM25, trigram matching for languages without spaces (Thai, CJK), and identifier-aware matching (`HostLinkReconnect`, `writer_lease`, file paths). Results respect the current project, recency, importance and status.
 - **Memory that corrects itself.** A new memory is compared with the similar ones already stored. A copy of the same text folds into the older memory; with the optional judge, updates supersede old facts and contradictions go to a review inbox (`alice review`). Every change is logged (`alice history`) and can be undone (`alice undo`).
-- **Optional AI judge.** Plug in [TypeSafe Jev](https://typesafe.ai) for calibrated decisions (deduplication, kind, project routing, re-ranking) with confidence thresholds, a response cache and a daily budget that is never exceeded. Without it, Alice uses offline rules that merge only text that is identical and leave everything else for you to review.
+- **Optional AI judge.** Plug in [TypeSafe Jev](https://typesafe.ai) for calibrated decisions (deduplication, kind, project routing, grading search results) with confidence thresholds, a response cache and a daily budget that is never exceeded. Without it, Alice uses offline rules that merge only text that is identical and leave everything else for you to review.
 - **Small, sharp MCP surface.** Seven core tools (`recall`, `remember`, `context`, `get_memory`, `update_memory`, `query_facts`, `assert_fact`) instead of dozens, compact token-budgeted output, built-in usage instructions, slash-command prompts and resources. An admin set (reviews, merging, stats) is there when you switch it on.
 - **A briefing instead of a dump.** `context` returns what matters for the current project within a token budget: key memories, recent decisions, warnings, the last handoff and your preferences.
 - **Knowledge graph with time.** Entities and relations with validity periods (`as_of` queries, timelines) and a predicate vocabulary that prevents `has_bug` / `had_bug` drift.
@@ -169,7 +169,7 @@ Agents that cannot use MCP can call the CLI (`alice recall`, `alice remember`, `
 
 | Tool | Purpose |
 |---|---|
-| `recall` | Search memories. Filters for project, topics, kinds and dates; `include_raw` for transcripts; `max_tokens` budget. `mode: precise` has the judge re-rank the top results (slower; needs `judge.provider = jev`). |
+| `recall` | Search memories. Filters for project, topics, kinds and dates; `include_raw` for transcripts; `max_tokens` budget. With a model judge configured (`judge.provider = jev`) recall is **precise** by default: the judge grades the top 20 results of every tier, transcript chunks included, and rescues answers that fall just below the vector floor (slower, about half a second). `mode: "fast"` skips the judge and `mode: "precise"` forces it; without a model judge recall is always fast. A slow or failing judge costs a recall at most `search.precise_timeout_ms` (2.5 s by default; after three failures the judge is skipped for a minute): the answer is then the fast one, with a note saying why. |
 | `remember` | Save a memory (`kind`, `title`, `topics`, `importance`, `supersedes`). Idempotent. |
 | `context` | Token-budgeted briefing for the current project. |
 | `get_memory` | Full memories with links and provenance. Asking for a memory the judge folded into an older one answers with the older one. |
@@ -182,7 +182,7 @@ The server also sends usage instructions, offers `recall` and `remember-session`
 ## CLI
 
 ```
-alice recall <query> [--project p] [--kind k]... [--topic t]... [--raw] [--precise] [--limit n]
+alice recall <query> [--project p] [--kind k]... [--topic t]... [--raw] [--precise | --fast] [--limit n]
              [--max-tokens n] [--since date] [--before date]
 alice remember [--kind k] [--title t] [--topic t]... [--project p] [--importance 1-5]
                [--supersedes id]... (<text> | -)
@@ -240,6 +240,8 @@ endpoint = "http://127.0.0.1:11434/v1"   # optional; each provider has a default
 
 [search]
 default_max_tokens = 1500
+default_mode = "auto"                # auto (precise with a model judge, else fast) | fast | precise
+precise_timeout_ms = 2500               # the whole budget of the judge call of a precise recall
 
 [maintenance]
 enabled = true

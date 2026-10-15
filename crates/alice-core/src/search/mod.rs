@@ -81,6 +81,12 @@ pub struct SearchParams {
     /// Raw tier: its vector floor, nothing else (`None`: `relevance_floor`, as before).
     pub chunk_floor: Option<f32>,
     pub raw_min_results: usize,
+    /// Precise recall's near-floor band (cosine; 0 = off, as in fast mode): candidates found
+    /// only by meaning whose similarity misses the floor that applies to them by at most this
+    /// much are returned apart, in [`SearchOutput::near`], for the judge to rule on.
+    pub near_band: f32,
+    /// At most this many near-floor candidates are returned.
+    pub near_limit: usize,
     /// Recency half-lives per kind and for raw chunks (`search.half_life`).
     pub half_lives: HalfLives,
     /// How the lists and the priors combine (`search.rrf_k`, `search.boost_exponent`).
@@ -99,6 +105,17 @@ pub struct SearchOutput {
     /// Importance (1 to 5) of each returned memory, parallel to `memory_seqs`: precise mode
     /// hands it to the judge with the memory.
     pub memory_importance: Vec<u8>,
+    /// Near-floor candidates (precise mode only, see [`SearchParams::near_band`]), best score
+    /// first. They are not results: the judge keeps the ones it grades relevant.
+    pub near: Vec<NearCandidate>,
+}
+
+/// A candidate that missed its vector floor by less than the near-floor band.
+#[derive(Debug, Clone)]
+pub struct NearCandidate {
+    pub hit: Hit,
+    /// Sequence number and importance of a memory (`None` for a raw chunk).
+    pub memory: Option<(i64, u8)>,
 }
 
 #[derive(Default)]
@@ -418,6 +435,8 @@ struct Scored {
     row: Row,
     score: f64,
     relevant: bool,
+    /// Not relevant, but within the near-floor band of the floor that applies to it.
+    near: bool,
     matched: Vec<MatchVia>,
     /// Found by a word, code or trigram list.
     lexical: bool,
@@ -598,7 +617,7 @@ pub fn run_with_chunk_reads(
 
     // Raw chunks have no kind or topics, so those filters leave the knowledge tier only.
     let raw_allowed = p.kinds.is_empty() && topics.is_empty();
-    let (mut ranked, raw_fallback) = std::thread::scope(|scope| -> Result<_> {
+    let (mut ranked, near, raw_fallback) = std::thread::scope(|scope| -> Result<_> {
         let with_raw = p.include_raw && raw_allowed;
         // Started first, so it also overlaps the knowledge tier.
         let chunks = if with_raw {
@@ -617,25 +636,38 @@ pub fn run_with_chunk_reads(
         // relevance_floor. The lexical lists search content terms only (English stopwords are
         // left out whenever the query has other words), so a lexical match is a content-term
         // match.
-        let mut ranked: Vec<Scored> = filters
-            .score(conn, &scores, &signals)?
-            .into_iter()
-            .filter(|s| s.relevant)
-            .collect();
+        let mut near: Vec<Scored> = Vec::new();
+        let mut ranked: Vec<Scored> = Vec::new();
+        for s in filters.score(conn, &scores, &signals)? {
+            if s.relevant {
+                ranked.push(s);
+            } else if s.near {
+                near.push(s);
+            }
+        }
         let mut raw_fallback = false;
         let knowledge_relevant = ranked.iter().filter(|s| s.is_knowledge()).count();
         if !p.include_raw && raw_allowed && knowledge_relevant < p.raw_min_results {
             let (s, sig) = query.raw(query.chunk_vectors(scope));
-            let extra: Vec<Scored> = filters
-                .score(conn, &s, &sig)?
-                .into_iter()
-                .filter(|s| s.relevant)
-                .collect();
+            let mut extra: Vec<Scored> = Vec::new();
+            for s in filters.score(conn, &s, &sig)? {
+                if s.relevant {
+                    extra.push(s);
+                } else if s.near {
+                    near.push(s);
+                }
+            }
             raw_fallback = !extra.is_empty();
             // Spec §4.4 step 5: appended after the knowledge results.
             ranked.extend(extra);
         }
-        Ok((ranked, raw_fallback))
+        near.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| b.tie_key().cmp(&a.tie_key()))
+        });
+        near.truncate(p.near_limit);
+        Ok((ranked, near, raw_fallback))
     })?;
     ranked.truncate(limit);
 
@@ -655,6 +687,19 @@ pub fn run_with_chunk_reads(
             s.into_hit(&terms)
         })
         .collect();
+    let near: Vec<NearCandidate> = near
+        .into_iter()
+        .map(|s| {
+            let memory = match &s.row {
+                Row::Memory { seq, memory } => Some((*seq, memory.importance)),
+                Row::Chunk { .. } => None,
+            };
+            NearCandidate {
+                hit: s.into_hit(&terms),
+                memory,
+            }
+        })
+        .collect();
     let related = related_for(conn, &memory_ids)?;
     Ok(SearchOutput {
         hits,
@@ -662,6 +707,7 @@ pub fn run_with_chunk_reads(
         raw_fallback,
         memory_seqs,
         memory_importance,
+        near,
     })
 }
 
@@ -710,6 +756,7 @@ impl Filters<'_> {
                 row,
                 score,
                 relevant: false,
+                near: false,
                 matched: ordered_via(s),
                 lexical: s.lexical,
                 similarity: s.similarity,
@@ -776,15 +823,26 @@ impl Filters<'_> {
             .map(|s| s.similarity)
             .fold(f32::NEG_INFINITY, f32::max);
         for s in &mut out {
-            let vector = if s.is_knowledge() {
-                let near_top =
-                    p.relevance_margin <= 0.0 || s.similarity >= best_memory - p.relevance_margin;
-                p.relevance_sure.is_some_and(|sure| s.similarity >= sure)
-                    || (s.similarity >= p.relevance_floor && near_top)
+            // The similarity a vector-only candidate needs: a memory passes at the sure floor,
+            // or at the rescue floor and within the margin of the best one, i.e. at the lower
+            // of the sure floor and the higher of the rescue floor and `best - margin`.
+            let needed = if s.is_knowledge() {
+                let rescue = if p.relevance_margin <= 0.0 {
+                    p.relevance_floor
+                } else {
+                    p.relevance_floor.max(best_memory - p.relevance_margin)
+                };
+                p.relevance_sure.map_or(rescue, |sure| sure.min(rescue))
             } else {
-                s.similarity >= p.chunk_floor.unwrap_or(p.relevance_floor)
+                p.chunk_floor.unwrap_or(p.relevance_floor)
             };
-            s.relevant = s.lexical || vector;
+            s.relevant = s.lexical || s.similarity >= needed;
+            // Only precise recall asks for the band; a similarity of negative infinity (no
+            // vector match) is never near.
+            s.near = p.near_band > 0.0
+                && !s.relevant
+                && s.similarity.is_finite()
+                && s.similarity >= needed - p.near_band;
         }
         out.sort_by(|a, b| {
             b.score
@@ -2243,5 +2301,111 @@ mod tests {
             "0.90 and 0.84 are admitted, 0.80 is not"
         );
         assert_eq!(run_raw(Some(0.79)), 3);
+    }
+
+    /// Task 21: `(hits, near)` ids for a vector-only query with the default floors.
+    fn hits_and_near(t: &Cos, band: f32, include_raw: bool) -> (Vec<String>, Vec<String>) {
+        let p = SearchParams {
+            query: "qzxv".into(),
+            limit: 20,
+            include_raw,
+            relevance_floor: 0.805,
+            relevance_sure: Some(0.825),
+            relevance_margin: 0.015,
+            chunk_floor: Some(CHUNK_RELEVANCE_FLOOR),
+            raw_min_results: 0,
+            near_band: band,
+            near_limit: 20,
+            ..Default::default()
+        };
+        let out = run_with_vector(
+            &t.c,
+            Some(&t.idx),
+            Some(at(1.0)),
+            &Weights::default(),
+            &p,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        (
+            out.hits.into_iter().map(|h| h.id).collect(),
+            out.near.into_iter().map(|n| n.hit.id).collect(),
+        )
+    }
+
+    /// Task 21: a memory that misses the rescue floor by at most the band is a near-floor
+    /// candidate (apart from the hits), one that misses it by more is not, and with no band
+    /// (fast mode) there are none.
+    #[test]
+    fn a_memory_just_below_the_rescue_floor_is_a_near_candidate_only_inside_the_band() {
+        let t = Cos::new();
+        let best = t.add(&t.app, "alpha one", 0.90, 0.90);
+        // 0.01 below the rescue floor of 0.805, then 0.031 below it.
+        let close = t.add(&t.app, "beta two", 0.795, 0.795);
+        let far = t.add(&t.app, "gamma three", 0.774, 0.774);
+        let (hits, near) = hits_and_near(&t, 0.03, false);
+        assert_eq!(hits, std::slice::from_ref(&best));
+        assert_eq!(near, [close], "0.031 below is not a candidate: {far}");
+        let (hits, near) = hits_and_near(&t, 0.0, false);
+        assert_eq!(hits, [best]);
+        assert!(near.is_empty(), "no band, no candidates");
+    }
+
+    /// Task 21: the floor a candidate misses is the one that applies: the margin below the
+    /// best match raises the rescue floor above 0.805, and a match between the rescue floor
+    /// and the sure floor but outside the margin is near by its shortfall to that margin line.
+    #[test]
+    fn the_margin_line_is_the_floor_that_applies_to_a_memory_near_the_best_match() {
+        let t = Cos::new();
+        let best = t.add(&t.app, "alpha one", 0.83, 0.83);
+        // The margin line is 0.83 - 0.015 = 0.815: 0.81 misses it by 0.005 (near), 0.78 by
+        // 0.035 (not), though 0.78 is only 0.025 below the rescue floor of 0.805.
+        let outside_margin = t.add(&t.app, "beta two", 0.81, 0.81);
+        let _too_far = t.add(&t.app, "gamma three", 0.78, 0.78);
+        let (hits, near) = hits_and_near(&t, 0.03, false);
+        assert_eq!(hits, [best]);
+        assert_eq!(near, [outside_margin]);
+    }
+
+    fn add_chunk(t: &Cos, name: &str, c: f32) -> String {
+        sources::ingest(
+            &t.c,
+            &t.app,
+            &sources::SourceInput {
+                uri: name.into(),
+                ..Default::default()
+            },
+            &[sources::ChunkInput {
+                ord: 0,
+                text: format!("{name} filler"),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let (seq, id): (i64, String) =
+            t.c.query_row(
+                "SELECT seq, id FROM chunks WHERE text = ?1",
+                [format!("{name} filler")],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        t.idx.upsert(VecKey::Chunk(seq), &at(c)).unwrap();
+        embeddings::put(&t.c, VecKey::Chunk(seq), "test-model", &at(c)).unwrap();
+        id
+    }
+
+    /// Task 21: the same for a raw chunk against its fixed floor of 0.82.
+    #[test]
+    fn a_chunk_just_below_the_chunk_floor_is_a_near_candidate_only_inside_the_band() {
+        let t = Cos::new();
+        let pass = add_chunk(&t, "zzza", 0.90);
+        let close = add_chunk(&t, "zzzb", 0.81);
+        let _far = add_chunk(&t, "zzzc", 0.788);
+        let (hits, near) = hits_and_near(&t, 0.03, true);
+        assert_eq!(hits, std::slice::from_ref(&pass));
+        assert_eq!(near, [close], "0.032 below 0.82 is not a candidate");
+        let (hits, near) = hits_and_near(&t, 0.0, true);
+        assert_eq!(hits, [pass]);
+        assert!(near.is_empty());
     }
 }

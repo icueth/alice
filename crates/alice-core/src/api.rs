@@ -15,10 +15,11 @@ pub use crate::store::reviews::{ReviewItem, ReviewQuery};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RecallMode {
-    /// Hybrid search without the judge (default).
+    /// Hybrid search without the judge.
     #[default]
     Fast,
-    /// Re-rank the top results with the judge when one is configured.
+    /// The judge grades the top results of every tier (raw chunks too) and also looks at a few
+    /// candidates just below the vector floor; needs a model judge (`judge.provider = jev`).
     Precise,
 }
 
@@ -66,8 +67,12 @@ pub struct RecallRequest {
     /// Also search raw session transcripts.
     #[serde(default)]
     pub include_raw: bool,
+    /// `fast` (local hybrid search only) or `precise` (the judge grades the top results and
+    /// rescues answers just below the vector floor; needs `judge.provider = jev`). Absent: the
+    /// `search.default_mode` setting, which by default is `precise` when a model judge is
+    /// configured and `fast` otherwise.
     #[serde(default)]
-    pub mode: RecallMode,
+    pub mode: Option<RecallMode>,
     /// Response budget in tokens (default 1500).
     #[serde(default)]
     pub max_tokens: Option<usize>,
@@ -579,7 +584,17 @@ mod tests {
     fn requests_need_only_their_required_fields() {
         let r: RecallRequest = serde_json::from_str(r#"{"query":"lease"}"#).unwrap();
         assert_eq!(r.query, "lease");
-        assert_eq!((r.mode, r.format), (RecallMode::Fast, OutputFormat::Text));
+        assert_eq!((r.mode, r.format), (None, OutputFormat::Text));
+        let old: RecallRequest =
+            serde_json::from_str(r#"{"query":"lease","mode":"fast"}"#).unwrap();
+        assert_eq!(
+            old.mode,
+            Some(RecallMode::Fast),
+            "an old client's explicit mode parses"
+        );
+        let p: RecallRequest =
+            serde_json::from_str(r#"{"query":"lease","mode":"precise"}"#).unwrap();
+        assert_eq!(p.mode, Some(RecallMode::Precise));
         assert!(!r.include_raw && r.limit.is_none() && r.cwd.is_none());
         let m: RememberRequest = serde_json::from_str(r#"{"content":"x"}"#).unwrap();
         assert_eq!(m.author, Author::default());
