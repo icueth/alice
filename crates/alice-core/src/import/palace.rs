@@ -679,7 +679,9 @@ pub(crate) fn meta_from_pairs(pairs: impl Iterator<Item = (String, MetaValue)>) 
             "wing" => m.wing = s,
             "room" => m.room = s,
             "hall" => m.hall = Some(s),
-            "source_file" => m.source_file = Some(s),
+            // An empty or blank source_file is the same as none: it would otherwise become an empty
+            // source uri that the store refuses.
+            "source_file" => m.source_file = Some(s).filter(|f| !f.trim().is_empty()),
             "added_by" => m.added_by = Some(s),
             "ingest_mode" => m.ingest_mode = Some(s),
             "filed_at" => m.filed_at = Some(s),
@@ -1171,6 +1173,19 @@ mod tests {
         assert_eq!(one[0].id, "b");
         let next = r.page(Some("b"), 5, Some("2026-03-01")).unwrap();
         assert_eq!(next[0].id, "c");
+    }
+
+    #[test]
+    fn an_empty_source_file_counts_as_missing() {
+        let pairs = |v: &str| {
+            vec![("source_file".to_string(), MetaValue::Str(v.to_string()))].into_iter()
+        };
+        assert_eq!(meta_from_pairs(pairs("")).source_file, None);
+        assert_eq!(meta_from_pairs(pairs("  ")).source_file, None);
+        assert_eq!(
+            meta_from_pairs(pairs("/h/a.rs")).source_file.as_deref(),
+            Some("/h/a.rs")
+        );
     }
 
     #[test]
