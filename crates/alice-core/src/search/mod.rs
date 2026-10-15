@@ -816,6 +816,12 @@ pub fn related_for(conn: &Connection, ids: &[String]) -> Result<Vec<RelatedRef>>
 mod tests {
     use super::*;
     use crate::api::{MatchVia, Tier};
+    use crate::embed::{Embedder, FakeEmbedder, memory_embed_text};
+    use crate::model::{Kind, Status};
+    use crate::project::ProjectRef;
+    use crate::store::embeddings::VecKey;
+    use crate::store::{memories, open_writer, projects, sources};
+    use crate::vector::VectorIndex;
 
     /// Review M8: a query that uses word matches because the model is reloading after an idle
     /// period is expected (debug); any other embedding failure is a warning.
@@ -832,12 +838,6 @@ mod tests {
         let broken = AliceError::Other("the embedding model failed: bad input".into());
         assert_eq!(embed_failure_level(&broken), Level::WARN);
     }
-    use crate::embed::{Embedder, FakeEmbedder, memory_embed_text};
-    use crate::model::{Kind, Status};
-    use crate::project::ProjectRef;
-    use crate::store::embeddings::VecKey;
-    use crate::store::{memories, open_writer, projects, sources};
-    use crate::vector::VectorIndex;
 
     struct Fx {
         _d: tempfile::TempDir,

@@ -16,7 +16,7 @@
 </p>
 
 > [!IMPORTANT]
-> **สถานะ: M1 เสร็จแล้ว — รุ่น alpha** ที่เก็บข้อมูล, การค้นหาแบบผสม (ไทย อังกฤษ และชื่อในโค้ด), daemon, MCP tool ทั้ง 7 ตัว, CLI และ HTTP API ใช้งานได้แล้ว CI build และทดสอบบน macOS และ Linux ส่วนบน Windows นั้น CI build ทั้งหมดและรันชุดทดสอบแบบ in-process แต่การทดสอบ CLI และ process ของ daemon รันเฉพาะบน Unix (ดู[แพลตฟอร์มที่รองรับ](#แพลตฟอร์มที่รองรับ)) ยังไม่มี release แบบแพ็กเกจ ให้[ติดตั้งจาก source](#ติดตั้งจาก-source) ความสามารถที่มีป้าย *(วางแผนไว้)* จะตามมาใน milestone ถัดไป ดูได้ที่ [roadmap](#roadmap) ก่อนถึง 1.0 อาจมีการเปลี่ยนที่ไม่เข้ากับของเดิม
+> **สถานะ: M2 เสร็จแล้ว — รุ่น alpha** ที่เก็บข้อมูล, การค้นหาแบบผสม (ไทย อังกฤษ และชื่อในโค้ด), daemon, MCP tool ทั้ง 7 ตัว, CLI และ HTTP API (M1) ตอนนี้มีเส้นทางการเขียนที่ดูแลตัวเองได้ครบ: ตัด secret ออกก่อนบันทึก, Judge ที่ทำงานในเครื่องพร้อม TypeSafe Jev เป็นตัวเลือก, คิว review, ประวัติและ undo, backup และ restore, ค่าตั้งที่มีผลทันทีพร้อมไฟล์ secret ส่วนตัว, `alice doctor`, `alice service install` และ embedding provider ผ่าน HTTP (M2) CI build และทดสอบทั้งหมดนี้บน macOS, Linux และ Windows ส่วนบน Windows การทดสอบ CLI และ process ของ daemon รันเฉพาะบน Unix (ดู[แพลตฟอร์มที่รองรับ](#แพลตฟอร์มที่รองรับ)) ยังไม่มี release แบบแพ็กเกจ ให้[ติดตั้งจาก source](#ติดตั้งจาก-source) ความสามารถที่มีป้าย *(วางแผนไว้)* จะตามมาใน milestone ถัดไป ดูได้ที่ [roadmap](#roadmap) ก่อนถึง 1.0 อาจมีการเปลี่ยนที่ไม่เข้ากับของเดิม
 
 ---
 
@@ -31,14 +31,15 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
 - **agent ไม่ต้องรอ memory อีก** มี daemon ตัวเดียวเป็นเจ้าของฐานข้อมูล การเขียนตอบกลับภายใน 50ms ส่วนงานหนักอย่าง embedding และการทำ index ทำเบื้องหลังทั้งหมด ถ้า daemon ไม่ได้รันหรือยังเปิดไม่เสร็จ การเขียนจะพักลงดิสก์ไว้ก่อน ข้อมูลไม่หาย
 - **ความรู้มาก่อน transcript ดิบเรียกเมื่อต้องการ** ข้อมูลมี 2 ชั้น ชั้นแรกคือ *memory* สั้นๆ ที่กลั่นแล้ว (decision, การแก้บั๊ก, fact, how-to, preference, warning, handoff) ซึ่งค้นหาเป็นค่าเริ่มต้น ชั้นที่สองคือ transcript ดิบที่เก็บไว้เป็นหลักฐาน ค้นเมื่อขอหรือเมื่อชั้นแรกมีผลไม่พอ *(การเก็บ transcript และกลั่นความรู้อัตโนมัติ: วางแผนไว้ใน SP2)*
 - **ค้นเข้าใจทั้งโค้ดและภาษาไทย** รวมการค้น 4 แบบ: vector หลายภาษา, BM25, trigram สำหรับภาษาที่ไม่เว้นวรรค (ไทย จีน ญี่ปุ่น) และการค้นที่เข้าใจชื่อในโค้ด (`HostLinkReconnect`, `writer_lease`, path ไฟล์) ผลค้นหาให้น้ำหนักกับโปรเจกต์ปัจจุบัน ความสดใหม่ ความสำคัญ และสถานะ
-- **ความจำแก้ตัวเองได้** *(วางแผนไว้ใน M2)* memory ใหม่จะถูกเทียบกับของเดิมที่คล้ายกัน ถ้าซ้ำจะรวมกัน ถ้าเป็นข้อมูลที่ใหม่กว่าจะแทนที่ (supersede) ของเก่า ถ้าขัดแย้งกันจะเข้าคิว review ทุกการเปลี่ยนแปลงถูกบันทึกไว้และ undo ได้
-- **มี AI Judge ให้เลือกเปิด** *(วางแผนไว้ใน M2)* ต่อกับ [TypeSafe Jev](https://typesafe.ai) เพื่อช่วยตัดสินใจ (กันซ้ำ, จัดเข้าโปรเจกต์, เรียงผลค้นหา) ด้วยความน่าจะเป็นที่เชื่อถือได้ ตั้งเกณฑ์ความมั่นใจได้ มี cache และจำกัดงบรายวัน ถ้าไม่เปิด Alice จะใช้กฎที่ทำงานในเครื่องแทน
-- **MCP tool น้อยแต่ตรงจุด** มี tool หลัก 7 ตัว (`recall`, `remember`, `context`, `get_memory`, `update_memory`, `query_facts`, `assert_fact`) แทนที่จะมีหลายสิบตัว ผลลัพธ์กระชับและคุมจำนวน token ได้ มีคำแนะนำการใช้งานในตัว พร้อม slash command และ resource
+- **ความจำแก้ตัวเองได้** memory ใหม่จะถูกเทียบกับของเดิมที่คล้ายกัน ข้อความที่เหมือนกันเป๊ะจะรวมเข้ากับอันเก่า ถ้าเปิด Judge จะให้ข้อมูลใหม่แทนที่ (supersede) ของเก่าได้ และเรื่องขัดแย้งจะเข้าคิว review (`alice review`) ทุกการเปลี่ยนแปลงถูกบันทึกไว้ (`alice history`) และ undo ได้ (`alice undo`)
+- **มี AI Judge ให้เลือกเปิด** ต่อกับ [TypeSafe Jev](https://typesafe.ai) เพื่อช่วยตัดสินใจ (กันซ้ำ, ระบุ kind, จัดเข้าโปรเจกต์, เรียงผลค้นหา) ด้วยความน่าจะเป็นที่เชื่อถือได้ ตั้งเกณฑ์ความมั่นใจได้ มี cache และมีงบรายวันที่ใช้เกินไม่ได้ ถ้าไม่เปิด Alice จะใช้กฎที่ทำงานในเครื่อง ซึ่งรวมเฉพาะข้อความที่เหมือนกันทุกตัวอักษร ส่วนที่เหลือทิ้งไว้ให้คุณตรวจ
+- **MCP tool น้อยแต่ตรงจุด** มี tool หลัก 7 ตัว (`recall`, `remember`, `context`, `get_memory`, `update_memory`, `query_facts`, `assert_fact`) แทนที่จะมีหลายสิบตัว ผลลัพธ์กระชับและคุมจำนวน token ได้ มีคำแนะนำการใช้งานในตัว พร้อม slash command และ resource ชุด tool สำหรับดูแลระบบ (review, รวม memory, สถิติ) พร้อมให้เปิดเมื่อต้องการ
 - **ได้สรุปสั้น ไม่ใช่ข้อมูลทั้งก้อน** `context` สรุปสิ่งสำคัญของโปรเจกต์ปัจจุบันให้อยู่ในงบ token ที่กำหนด: memory หลัก, decision ล่าสุด, warning, handoff ล่าสุด และ preference ของคุณ
 - **Knowledge graph ที่รู้เรื่องเวลา** เก็บ entity และ relation พร้อมช่วงเวลาที่ข้อมูลยังเป็นจริง ถามย้อนเวลาได้ด้วย `as_of` และดูเป็น timeline ได้ มีพจนานุกรม predicate กันไม่ให้เกิด `has_bug` กับ `had_bug` ปนกัน
+- **เป็นส่วนตัวเป็นค่าเริ่มต้น** ข้อมูลอยู่ในเครื่อง และ server รับเฉพาะการเชื่อมต่อจากเครื่องตัวเอง โดยตรวจ token และ origin ทุกคำขอ secret ในข้อความ (API key, token, รหัสผ่าน, private key) ถูกตัดออกก่อนบันทึก เข้าคิว หรือส่งออกทุกครั้ง API key เก็บในไฟล์ส่วนตัว (`secrets.toml` สิทธิ์ 0600) และเลือกใช้ Keychain ของ OS แทนได้ โปรเจกต์ไหนจะห้ามส่งไปบริการ cloud ใดๆ ก็ได้
+- **ดูแลตัวเองได้** ตอน daemon ว่าง จะสำรองข้อมูลรายวันพร้อมหมุนเวียนไฟล์, ตรวจความสมบูรณ์, เก็บตามนโยบายการเก็บรักษา และล้างถังขยะ `alice doctor` บอกว่าอะไรผิดและควรทำอะไรต่อ `alice service install` ให้ daemon เริ่มเองตอน login และค่าตั้งเปลี่ยนแล้วมีผลทันทีโดยไม่ต้อง restart
+- **ไฟล์เดียวจบ** daemon, CLI และ MCP server (และ hook ใน SP2) อยู่ใน binary Rust ไฟล์เดียวที่มีตัวรัน embedding ในตัว ไม่ต้องมี Python env หรือ Docker ถ้าอยากใช้ embedding จากที่อื่น (Ollama, endpoint แบบ OpenAI, Voyage) ก็แค่ตั้งค่า
 - **Git sync เป็นไฟล์ Markdown** *(วางแผนไว้ใน M4)* push/pull ความจำไปที่ git remote ไหนก็ได้ เก็บ memory ละหนึ่งไฟล์ Markdown เปิดอ่านบน GitHub ได้ เปิดใน Obsidian ได้ และ sync ข้ามเครื่องได้โดย merge ทีละ record ไฟล์ฐานข้อมูลไม่เคยถูกใส่ใน git
-- **ไฟล์เดียวจบ** daemon, CLI และ MCP server (และ hook ใน SP2) อยู่ใน binary Rust ไฟล์เดียวที่มีตัวรัน embedding ในตัว ไม่ต้องมี Python env หรือ Docker
-- **เป็นส่วนตัวเป็นค่าเริ่มต้น** ข้อมูลอยู่ในเครื่อง และ server รับเฉพาะการเชื่อมต่อจากเครื่องตัวเอง โดยตรวจ token และ origin ทุกคำขอ *(วางแผนไว้ใน M2: ตัด secret ออกก่อนบันทึกหรือส่งออกทุกครั้ง และเก็บ API key ในไฟล์ส่วนตัว โดยเลือกใช้ Keychain ของ OS ได้)*
 - **UI สำหรับดู graph และจัดการข้อมูล** *(วางแผนไว้ใน SP3)* ดู graph ความจำ แก้ memory ตัดสินรายการใน review ตั้งค่าได้ทุกอย่าง และสั่ง git push/pull ได้จากเบราว์เซอร์หรือแอป desktop
 - **ย้ายมาจาก MemPalace ได้** *(วางแผนไว้ใน M3)* import palace เดิมได้ครบทั้ง drawer, diary และ knowledge graph และยังเรียก tool ชื่อ `mempalace_*` ได้ผ่าน compatibility layer ที่เลือกเปิดได้
 
@@ -52,7 +53,7 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
  Browser ─── `alice ui` ────────────────────────────────────────────┘      ├─ writer (ทำแต่ transaction สั้นๆ)
                                                                             ├─ workers: embed · judge · import · sync
                                                                             ├─ scheduler: backup · ตรวจสุขภาพ · เก็บกวาด
-                                                                            └─ SQLite (WAL) + FTS5 + HNSW vectors
+                                                                            └─ SQLite (WAL) + FTS5 + vector index
 ```
 
 | แนวคิด | ความหมาย |
@@ -62,6 +63,7 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
 | **Source / chunk** | หลักฐานดิบ (transcript, ไฟล์, ข้อมูลที่ import มา) ที่ memory ชี้กลับไปหาได้ |
 | **Fact** | ความสัมพันธ์ใน knowledge graph ระหว่าง entity พร้อมช่วงเวลาที่ยังเป็นจริง |
 | **Review** | เรื่องที่ระบบมั่นใจไม่พอจะตัดสินเอง จึงรอให้คนตัดสิน |
+| **Event** | การเปลี่ยนแปลงหนึ่งครั้งที่ถูกบันทึกไว้ (ใคร ทำอะไร ก่อนและหลัง) `alice undo` ย้อนกลับได้ |
 
 ## ติดตั้งจาก source
 
@@ -80,8 +82,8 @@ alice model fetch      # ครั้งเดียวก่อนเริ่�
 |---|---|
 | macOS ชิป Apple Silicon | รองรับ, embedding ในเครื่อง |
 | Linux (glibc) x86_64 และ aarch64 | รองรับ, embedding ในเครื่อง |
-| Windows x86_64 | build ใน CI และรันชุดทดสอบแบบ in-process ส่วนการทดสอบ CLI และ process ของ daemon รันเฉพาะบน Unix; embedding ในเครื่องตรวจแล้วบน Windows ด้วย CI workflow `windows-real-model` (model จริง โดยโฟลเดอร์ข้อมูลอยู่ใต้ path ที่ไม่ใช่ ASCII) `alice daemon start`, `status` และ `stop` หา daemon ที่กำลังเริ่มหรือกำลังทำงานเจอผ่าน `daemon.pid` (pid และเวลาเริ่ม วางไว้ข้างไฟล์ lock เพราะบน Windows อ่านไฟล์ lock ที่ถูกล็อกอยู่ไม่ได้) กับการตรวจ process ด้วย Win32 ส่วนนี้ครอบคลุมด้วย unit test บน Windows CI แต่ยังไม่มี process test; `alice service install` ลงทะเบียน scheduled task ที่เริ่ม daemon ตอน logon ตัวแผนมีการทดสอบแล้ว แต่ยังไม่เคยลองบนเครื่อง Windows จริง |
-| macOS ชิป Intel, Linux musl | ยังไม่รองรับ: ONNX Runtime ไม่มี library สำเร็จรูปให้ จึงรัน embedding ในเครื่องไม่ได้ จะใช้ได้เมื่อมี embedding provider ผ่าน HTTP (วางแผนไว้ใน M2) |
+| Windows x86_64 | build และ link ผ่าน CI รัน `fmt`, `clippy` และชุดทดสอบแบบ in-process ส่วนการทดสอบ CLI และ process ของ daemon รันเฉพาะบน Unix; โมเดลในเครื่องตรวจแล้วบน Windows ด้วย CI workflow `windows-real-model` ที่สั่งรันเอง (โมเดลจริง โดยโฟลเดอร์ข้อมูลอยู่ใต้ path ที่ไม่ใช่ ASCII) `alice daemon start`, `status` และ `stop` หา daemon ที่กำลังเริ่มหรือกำลังทำงานเจอผ่าน `daemon.pid` (pid และเวลาเริ่ม วางไว้ข้างไฟล์ lock เพราะบน Windows อ่านไฟล์ lock ที่ถูกล็อกอยู่ไม่ได้) กับการตรวจ process ด้วย Win32 ส่วนนี้ครอบคลุมด้วย unit test บน Windows CI แต่ยังไม่มี process test; `alice service install` ลงทะเบียน scheduled task ที่เริ่ม daemon ตอน logon ตัวแผนมีการทดสอบแล้ว แต่ยังไม่เคยลองบนเครื่อง Windows จริง |
+| macOS ชิป Intel, Linux musl | ยังไม่รองรับ ONNX Runtime ไม่มี library สำเร็จรูปให้ จึง build โมเดลในเครื่องบนแพลตฟอร์มนี้ไม่ได้ embedding provider ผ่าน HTTP (`ollama`, `openai`, `voyage` ดู[การตั้งค่า](#การตั้งค่า)) เขียนและทดสอบแล้ว และ `alice-embed` compile ได้โดยไม่มีโมเดลในเครื่อง แต่แพ็กเกจ `alice` ยังไม่มีแบบ build ที่ตัดโมเดลออก และ CI ก็ยังไม่ build เป้าหมายเหล่านี้ ตอนนี้จึงถือว่ายังไม่รองรับ |
 
 ### ตัวติดตั้งแบบแพ็กเกจ (วางแผนไว้)
 
@@ -109,14 +111,15 @@ alice model fetch              # ครั้งเดียว: โมเดล
 alice remember --kind decision "ใช้ SQLite WAL กับ writer thread ตัวเดียว"   # เปิด daemon ให้เองถ้ายังไม่รัน
 alice recall "ทำไมใช้ writer ตัวเดียว"
 alice context                  # สรุปของโปรเจกต์ปัจจุบัน
-alice status                   # สถานะ daemon, จำนวนข้อมูล, คิว embedding
+alice status                   # daemon, จำนวนข้อมูล, คิว embedding และ judge, review ที่ค้าง, backup ล่าสุด
+alice doctor                   # ถ้ามีอะไรผิด จะบอกว่าผิดตรงไหนและควรทำอะไรต่อ
 ```
 
 โปรเจกต์ตรวจหาจาก directory ที่ทำงานอยู่ (git remote หรือชื่อ directory) memory ที่เขียนนอกโปรเจกต์ใดๆ จะเข้า `global` ที่วางแผนไว้: `alice setup` ต่อ agent ทุกตัวในเครื่องให้อัตโนมัติ (SP2), `alice import mempalace` (M3) และ `alice ui` (SP3)
 
 ## การเชื่อมต่อ agent
 
-ลงทะเบียน `alice mcp` เป็น MCP server แบบ stdio (ใน SP2 `alice setup` จะทำให้อัตโนมัติ) ตัว shim จะเปิด daemon ให้เองเมื่อจำเป็น และถ้า client ส่ง workspace root มา โปรเจกต์จะยึดตาม root นั้น:
+ลงทะเบียน `alice mcp` เป็น MCP server แบบ stdio (ใน SP2 `alice setup` จะทำให้อัตโนมัติ) ตัว shim จะเปิด daemon ให้เองเมื่อจำเป็น และถ้า client ส่ง workspace root มา โปรเจกต์จะยึดตาม root นั้น ชื่อของ client จะถูกบันทึกเป็นผู้เขียนของทุกอย่างที่มันเขียน:
 
 <details>
 <summary><b>Claude Code</b></summary>
@@ -169,12 +172,12 @@ agent ที่ใช้ MCP ไม่ได้ เรียกผ่าน CLI 
 | `recall` | ค้นหา memory กรองตามโปรเจกต์, topic, kind และช่วงวันได้ ใส่ `include_raw` เพื่อค้น transcript ด้วย กำหนดงบ `max_tokens` ได้ `mode: precise` ให้ Judge เรียงผลอันดับต้น ๆ ใหม่ (ช้ากว่า ต้องตั้ง `judge.provider = jev`) |
 | `remember` | บันทึก memory (`kind`, `title`, `topics`, `importance`, `supersedes`) เรียกซ้ำได้ปลอดภัย |
 | `context` | สรุปของโปรเจกต์ปัจจุบันภายในงบ token |
-| `get_memory` | ดู memory ฉบับเต็ม พร้อม link และแหล่งที่มา |
+| `get_memory` | ดู memory ฉบับเต็ม พร้อม link และแหล่งที่มา ถ้าขอ memory ที่ Judge รวมเข้ากับอันเก่าไปแล้ว จะได้อันเก่ากลับมา |
 | `update_memory` | แก้ไข, supersede, archive, forget หรือ restore |
 | `query_facts` | ถาม knowledge graph ได้ทั้งภาพ ณ วันที่ระบุ (`as_of`) และ timeline |
 | `assert_fact` | เพิ่ม แทนที่ หรือปิดอายุ fact พร้อมแนะนำ predicate ที่มีอยู่แล้ว |
 
-server ส่งคำแนะนำการใช้งานให้ agent ด้วย มี prompt `recall` และ `remember-session` และ resource `memory://context` กับ `memory://m/{id}` ส่วนชุด tool สำหรับดูแลระบบ (`review_list`, `review_resolve`, `merge_memories`, `stats`) วางแผนไว้ใน M2
+server ส่งคำแนะนำการใช้งานให้ agent ด้วย มี prompt `recall` และ `remember-session` และ resource `memory://context` กับ `memory://m/{id}` ส่วนชุด tool สำหรับดูแลระบบ (`review_list`, `review_resolve`, `merge_memories`, `stats`) ปิดอยู่เป็นค่าเริ่มต้น เปิดได้ด้วย `alice config set mcp.admin_tools true` (stdio shim ถาม daemon ทุกครั้งที่แสดงรายการ tool จึงไม่ต้อง restart)
 
 ## CLI
 
@@ -188,6 +191,14 @@ alice get <id>... [--provenance]
 alice update <id> --action edit|supersede|archive|forget|restore [--title t] [--body b] [--by id]
 alice facts <entity> [--predicate p] [--as-of date] [--timeline]
 alice fact add|supersede|end <subject> <predicate> <object> [--from date]
+alice history [target] [--actor a] [--limit n]       # ใครเปลี่ยนอะไร
+alice undo <event-id>                                 # ย้อนการเปลี่ยนแปลง (ทั้งกลุ่ม)
+alice review [list [--type t] [--all] | show <id> | resolve <id> <choice>]
+alice stats                    # จำนวนข้อมูล, review ที่ค้าง, ค่าใช้จ่ายของ judge
+alice backup now | list       alice restore [backup] [--yes]
+alice maintenance status | run <job>
+alice config list | get <key> | set <key> <value> | unset <key> | edit
+             | set-secret <name> | delete-secret <name> | test <provider>
 alice projects | status
 alice doctor                   # ตรวจพร้อมบอกว่าควรทำอะไรต่อ; exit 1 เมื่อมีข้อที่ไม่ผ่าน
 alice daemon start | stop | status | logs | run
@@ -202,47 +213,79 @@ alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out 
 
 ## การตั้งค่า
 
-M1 ยังไม่มีไฟล์ตั้งค่า อ่านค่าจาก environment variable เหล่านี้:
-
-| ตัวแปร | ความหมาย |
-|---|---|
-| `ALICE_HOME` | directory เก็บข้อมูล (ค่าเริ่มต้น `~/.alice`) |
-| `ALICE_LOG` | ตัวกรอง log เช่น `info` หรือ `alice_daemon=debug` (daemon เขียน log ที่ `$ALICE_HOME/logs/daemon.log`) |
-| `ALICE_AGENT` | ชื่อผู้เขียนที่ CLI บันทึกไว้กับ memory (ค่าเริ่มต้น `cli`) |
-| `ALICE_NO_AUTOSTART` | ถ้าตั้งค่า (และไม่ใช่ `0`) คำสั่งต่างๆ จะไม่เริ่ม daemon เอง การเขียนตอนที่ไม่มี daemon จะเข้าคิวใน `$ALICE_HOME/spool` (ลบความลับก่อน) แล้วถูกบันทึกเมื่อ daemon เริ่มทำงาน |
-| `HF_ENDPOINT` | mirror ของ Hugging Face สำหรับ `alice model fetch` |
-
-*(วางแผนไว้ใน M2)* ค่าต่างๆ จะอยู่ใน `~/.alice/config.toml` แต่ละ repo เขียนทับได้ด้วย `.alice.toml` และทุกค่าแก้ผ่าน UI ได้ เปลี่ยนแล้วมีผลทันทีโดยไม่ต้อง restart
+ค่าตั้งอยู่ใน `~/.alice/config.toml` ลำดับชั้น (ชั้นหลังชนะ): ค่าเริ่มต้นในโปรแกรม, `config.toml`, `.alice.toml` ของ repo (เฉพาะหมวด privacy ดูข้างล่าง) และ environment variable อ่านและเปลี่ยนทุกค่าได้ด้วย `alice config list | get | set | unset | edit` และแก้แล้วมีผลโดยไม่ต้อง restart daemon
 
 ```toml
+[judge]
+provider = "jev"                    # heuristic (ค่าเริ่มต้น) | jev
+auto_apply_threshold = 0.85         # มั่นใจตั้งแต่ค่านี้ ระบบลงมือเอง
+review_threshold = 0.5              # มั่นใจตั้งแต่ค่านี้แต่ไม่ถึงข้างบน ให้คนตัดสิน
+daily_budget_usd = 1.0              # หยุดทันทีเมื่อครบ ต่อวัน UTC
+timeout_ms = 10000
+
+[privacy]
+redact = true
+redact_mode = "redact"              # redact | block (ปฏิเสธการเขียนที่มี secret)
+cloud_denied_projects = ["client-work"]   # ห้ามส่งไป Jev หรือ embedding provider ที่อยู่นอกเครื่อง
+custom_patterns = [{ name = "ticket", regex = "TCK-[0-9]{6}" }]
+
 [embedding]
-provider = "local"                  # local | ollama | openai | voyage
-model = "multilingual-e5-small"
+provider = "ollama"                 # local (ค่าเริ่มต้น) | ollama | openai | voyage
+model = "nomic-embed-text"          # ชื่อโมเดลของ provider
+endpoint = "http://127.0.0.1:11434/v1"   # ไม่ใส่ก็ได้ แต่ละ provider มีค่าเริ่มต้น
+# idle_unload = "10m"               # เฉพาะโมเดลในเครื่อง: ถอนโมเดลออกเมื่อไม่ได้ใช้นานเท่านี้ ("0" = ไม่ถอน)
 
 [search]
 default_max_tokens = 1500
 
-[judge]
-provider = "heuristic"              # heuristic | jev
-auto_apply_threshold = 0.85         # มั่นใจเกินค่านี้ ระบบลงมือเอง
-review_threshold = 0.5              # มั่นใจเกินค่านี้ แต่ไม่ถึงข้างบน ให้คนตัดสิน
-daily_budget_usd = 1.0
-
-[privacy]
-redact = true
-cloud_denied_projects = ["client-work"]   # โปรเจกต์ที่ห้ามส่งไป judge บน cloud
-
-[sync]
-remote = "git@github.com:you/alice-memory.git"
-auto = "idle"                       # off | idle | 15m
-include_raw = false
+[maintenance]
+enabled = true
+idle_secs = 60                      # งานเบื้องหลังเริ่มเมื่อเงียบมานานเท่านี้
+trash_days = 30                     # memory ที่ forget แล้วถูกลบถาวรเมื่อครบกี่วัน
+events_days = 365                   # ประวัติที่เก่ากว่านี้ถูกลบ
 
 [backup]
 daily = 7
 weekly = 4
 ```
 
-secret อย่าง API key ของ Jev จะเก็บใน `~/.alice/secrets.toml` (สิทธิ์ 0600) ด้วยคำสั่ง `alice config set-secret judge.jev.api_key` และเลือกใช้ Keychain ของ OS แทนได้
+Environment variable:
+
+| ตัวแปร | ความหมาย |
+|---|---|
+| `ALICE_<SECTION>_<KEY>` | ตั้งค่าใดก็ได้ ใช้ชื่อ key แบบมีจุดแล้วแปลงเป็นตัวพิมพ์ใหญ่และเปลี่ยนจุดเป็น `_`: `judge.review_threshold` คือ `ALICE_JUDGE_REVIEW_THRESHOLD`, `judge.jev.rate_per_sec` คือ `ALICE_JUDGE_JEV_RATE_PER_SEC` environment ชนะไฟล์ ชื่อ `ALICE_*` ที่ไม่ใช่ค่าตั้งจะถูกข้ามพร้อมคำเตือน (ดู `alice config list` และ `alice doctor`) ค่าอื่นไม่ได้รับผลกระทบ |
+| `ALICE_HOME` | directory เก็บข้อมูล (ค่าเริ่มต้น `~/.alice`) |
+| `ALICE_LOG` | ตัวกรอง log เช่น `info` หรือ `alice_daemon=debug` (daemon เขียน log ที่ `$ALICE_HOME/logs/daemon.log`) |
+| `ALICE_AGENT` | ชื่อผู้เขียนที่ CLI บันทึกไว้กับ memory (ค่าเริ่มต้น `cli`) |
+| `ALICE_NO_AUTOSTART` | ถ้าตั้งค่า (และไม่ใช่ `0`) คำสั่งต่างๆ จะไม่เริ่ม daemon เอง การเขียนตอนที่ไม่มี daemon จะเข้าคิวใน `$ALICE_HOME/spool` (ลบความลับก่อน) แล้วถูกบันทึกเมื่อ daemon เริ่มทำงาน |
+| `TYPESAFE_API_KEY`, `ALICE_EMBEDDING_API_KEY` | key ของ Jev และ key ของ embedding provider ผ่าน HTTP ชนะค่าที่เก็บไว้ และไม่ถูกเขียนลงที่ไหนเลย |
+| `HF_ENDPOINT` | mirror ของ Hugging Face สำหรับ `alice model fetch` |
+
+**Secret** key ไม่อยู่ใน `config.toml` `alice config set-secret jev_api_key` (และ `embedding_api_key` สำหรับ `openai` หรือ `voyage`) อ่านค่าจาก standard input ไม่รับจาก command line แล้วเก็บใน `~/.alice/secrets.toml` (สิทธิ์ 0600) settings API บอกได้แค่ว่าตั้งไว้หรือยัง ตั้ง `secrets.backend = "keychain"` เพื่อใช้ Keychain ของ OS แทน (บน macOS อาจถามสิทธิ์ทุกครั้งที่อัปเดต) มีสองเรื่องที่ควรรู้: `secrets.toml` ที่แก้ด้วยมือ Judge จะอ่านตอนมันถูกสร้างใหม่ครั้งถัดไป จึงควรสั่ง `alice daemon stop` หลังแก้ (คำสั่งถัดไปจะเปิด daemon ให้ใหม่) และการสลับ `secrets.backend` ไม่ย้าย secret ที่เก็บไว้ ต้องตั้งใหม่
+
+**ความเป็นส่วนตัวระดับ repo** repo ใส่ `.alice.toml` ไว้ที่ root ได้ ไฟล์นี้รับเฉพาะหมวด `[privacy]` และเฉพาะค่าที่ทำให้ Alice ระวังมากขึ้น ค่าอื่นจะถูกปฏิเสธ:
+
+```toml
+[privacy]
+block_secrets = true      # ปฏิเสธการเขียนในโปรเจกต์นี้ที่มี secret
+cloud_denied = true       # ห้ามส่งข้อความของโปรเจกต์นี้ไป Jev หรือ embedding provider ที่อยู่นอกเครื่อง
+custom_patterns = [{ name = "internal_id", regex = "ID-[0-9]{8}" }]
+```
+
+**การเปลี่ยนค่าทำอย่างระมัดระวัง** `config.toml` ถูกตรวจทุก 2 วินาที ไฟล์หรือค่าที่ไม่ถูกต้องจะไม่ทับค่าที่ใช้งานได้: ค่าเดิมยังอยู่ และ error แสดงใน `alice config list`, `/api/v1/settings` และ `alice doctor` การเปลี่ยนที่ทำให้การป้องกันอ่อนลง (ปิด redaction, เอาโปรเจกต์ออกจาก `cloud_denied_projects`, เพิ่มงบ, สลับไปใช้ Jev หรือ embedding provider นอกเครื่อง, เปิด admin tools) จะมีผลก็ต่อเมื่ออ่านไฟล์ได้เหมือนกัน 3 ครั้งติดกัน (ราว 6 วินาที) ไฟล์ที่เซฟค้างครึ่งทางจึงปิด redaction แม้ชั่วขณะไม่ได้ ส่วน `alice config set` มีผลทันทีและบอกไว้ในผลลัพธ์ ตราบที่ยังไม่เคยโหลด `config.toml` ที่ถูกต้องสำเร็จ จะไม่ส่งอะไรไปบริการ cloud เลย ค่าเหล่านี้ต้อง restart daemon (`alice daemon stop`): `server.port`, `secrets.backend`, `embedding.idle_unload`, `embedding.batch_size` ส่วนการเปลี่ยน embedding provider หรือโมเดลไม่ต้อง restart: โมเดลใหม่ถูกเติมเบื้องหลังและสลับเข้าแทนแบบ atomic เมื่อครบ
+
+**redaction ตัดอะไรบ้าง** ก่อนบันทึกหรือส่งออก memory, chunk ของ transcript, snapshot ในประวัติ, งานเขียนที่รอในคิว หรือคำขอไป Jev Alice จะแทน secret ด้วย `[REDACTED:<type>]` ได้แก่ private key, JWT, key ของ AWS, GitHub, GitLab, Slack, Stripe, SendGrid, Vault, Anthropic และ OpenAI, รหัสผ่านใน URL, การกำหนดค่าแบบ `password=`/`token=` และค่าที่สุ่มสูงยาวๆ ที่ตามหลังชื่อคล้าย key รวมถึง `custom_patterns` ของคุณเอง ถ้าตั้ง `redact_mode = "block"` จะปฏิเสธการเขียนแทน โดย error บอกชื่อ field และ detector (ไม่บอก secret)
+
+**embedding ในเครื่องหรือไม่** ค่าเริ่มต้นคือโมเดลหลายภาษาในเครื่อง provider ผ่าน HTTP (`ollama` ในเครื่องหรือในเครือข่ายของคุณ, `openai` สำหรับ endpoint ที่เข้ากันกับ OpenAI, `voyage`) จะได้รับข้อความเฉพาะโปรเจกต์ที่นโยบาย cloud อนุญาต และ `ollama` บน `localhost` ถือว่าเป็นในเครื่อง รายละเอียด: [docs/benchmarks/m2-embedding.md](docs/benchmarks/m2-embedding.md)
+
+## Judge, review และ undo
+
+เมื่อเขียน memory ระบบจะเทียบกับ memory ที่มีอยู่แล้วในโปรเจกต์เดียวกันเบื้องหลัง แล้วจึงเปลี่ยนสถานะเป็น `active`:
+
+- **Heuristic (ค่าเริ่มต้น ทำงานในเครื่อง ฟรี)** รวม memory ใหม่เข้ากับอันเก่าก็ต่อเมื่อข้อความเหมือนกันหลัง normalize Unicode และยุบช่องว่าง (ตัวพิมพ์เล็กใหญ่และเครื่องหมายวรรคตอนมีผล) ไม่เคยรวมเพราะความคล้ายอย่างเดียว: ถ้าน่าจะซ้ำ น่าจะเป็นการอัปเดต หรือน่าจะอยู่คนละโปรเจกต์ จะกลายเป็นรายการในคิว review และไม่ตั้ง kind ให้
+- **Jev (เลือกเปิด)** โมเดล Jev ของ TypeSafe ตอบคำถามแบบเลือกคำตอบพร้อมความน่าจะเป็น Alice ถามว่า memory ใหม่ซ้ำ, อัปเดต, ขัดแย้ง หรือไม่เกี่ยวกับเพื่อนบ้านที่ใกล้ที่สุดแต่ละอัน และ kind กับโปรเจกต์ไหนเหมาะ ถ้าถึง `judge.auto_apply_threshold` จะลงมือเลย ถ้าอยู่ระหว่างสองเกณฑ์จะเป็นรายการ review ต่ำกว่านั้นไม่ทำอะไร คำตอบถูก cache ตามคำขอ จำกัดอัตราการเรียก และงบรายวันถูกจองไว้ก่อนเรียกทุกครั้ง ยอดใช้ในวันจึงไม่เกิน `judge.daily_budget_usd` ถ้า Jev ล่ม งบหมด หรือโปรเจกต์นั้นไม่ได้รับอนุญาต heuristic จะตัดสินแทนและ memory จะถูกตัดสินใหม่ภายหลัง ปัญหาของ Judge ไม่เคยทำให้การเขียนล้มเหลว จากการประเมินแบบสังเคราะห์ใน [docs/benchmarks/m2-jev.md](docs/benchmarks/m2-jev.md) ค่าใช้จ่ายอยู่ที่ **$0.0113 ต่อ 1,000 การตัดสินใจ** (หนึ่งการตัดสินใจคือเทียบ memory หนึ่งคู่ ราคา input token $0.042 ต่อล้าน token) และ smoke test สดของการเทียบหนึ่งครั้งอยู่ที่ราว **$0.00004** การประเมินนั้น (216 คู่ที่เขียนขึ้นเพื่อการนี้ รันครั้งเดียว) ได้ความแม่นยำของ Jev ในการระบุความสัมพันธ์ 0.917 เทียบกับ heuristic 0.287 ควรอ่านข้อควรระวังในหน้านั้นก่อนเชื่อตัวเลขสำหรับการใช้งานจริง
+- **คิว review** `alice review` แสดงสิ่งที่ Alice ตัดสินเองไม่ได้ (supersede, contradiction, merge, predicate, project, undo) ส่วน `alice review show <id>` กับ `alice review resolve <id> <choice>` ใช้ตอบ
+- **ประวัติและ undo** ทุกการเปลี่ยนแปลงเป็น event: `alice history [id]` แสดงว่าใครเปลี่ยนอะไร `alice undo <event-id>` ย้อนกลับพร้อมกับการเปลี่ยนอื่นที่เกิดจากการกระทำเดียวกัน (เช่น merge หรือ supersede) ถ้าเป้าหมายเปลี่ยนไปแล้ว Alice จะเปิดรายการ review แทนการเขียนทับ การเปลี่ยนของ memory, fact และ predicate ย้อนได้ ส่วน memory ที่ถูก purge แล้วย้อนกลับมาไม่ได้
 
 ## Backup และ restore
 
@@ -252,11 +295,15 @@ alice backup list
 alice restore             # backup ล่าสุด หรือ: alice restore <ชื่อหรือ path> [--yes]
 ```
 
+daemon ยังสำรองข้อมูลรายวันเองตอนว่าง โดยเก็บอันล่าสุดของแต่ละวันใน 7 วัน และของแต่ละสัปดาห์ใน 4 สัปดาห์ (`backup.daily`, `backup.weekly`) backup ที่สั่งเองเก็บ 5 อันล่าสุด สำเนาที่ทำก่อน migrate ฐานข้อมูลหรือก่อน restore เก็บ 30 วัน (อันล่าสุดของแต่ละชนิดเก็บไว้เสมอ) backup มีแต่ฐานข้อมูล ไม่มี `secrets.toml` หรือ token
+
 `alice restore` ตรวจ backup ก่อน (ไฟล์ SQLite ที่ผ่าน `quick_check` และ schema ที่ build นี้อ่านได้ ถ้าใหม่กว่าจะปฏิเสธก่อนหยุดอะไรทั้งนั้น) แล้วหยุด daemon เก็บฐานข้อมูลปัจจุบันไว้เป็น `backups/alice-before-restore-<เวลา>.db` สลับ backup เข้าที่ด้วย rename ครั้งเดียว แล้วเริ่ม daemon ใหม่ ซึ่งสร้าง vector index ใหม่และนำงานเขียนที่ agent พักไว้ใน spool มาใช้ `alice.db` เป็นฐานข้อมูลเก่าที่สมบูรณ์หรือฐานข้อมูลที่กู้แล้วที่สมบูรณ์เสมอ ถ้าขั้นใดล้มเหลว ฐานข้อมูลเก่ายังอยู่ backup ที่ schema เก่ากว่าจะถูก migrate ตอนเริ่ม (พร้อม backup ก่อน migrate ของมันเอง) `secrets.toml`, `config.toml` และ spool ไม่ถูกแตะ ต้องมีที่ว่างพอสำหรับสำเนาที่เก็บไว้และไฟล์ที่กู้ ถ้าไม่พอจะปฏิเสธโดยไม่เปลี่ยนอะไร
 
 **ความจำที่เขียนหลังเวลาที่ backup จะออกจากฐานข้อมูลที่ใช้งานอยู่** ความจำเหล่านั้นอยู่ในสำเนา before-restore ซึ่งเก็บอย่างน้อย 30 วัน (อันล่าสุดเก็บไว้เสมอ) ถ้าจะยกเลิกการ restore ให้รัน `alice restore alice-before-restore-<เวลา>.db` อีกสองอย่างที่ restore ไม่ย้อนให้: ความจำที่คุณ purge หลังทำ backup จะกลับมาพร้อม backup และข้อความที่เก็บไว้ภายใต้กฎ redaction รุ่นเก่าจะไม่ถูกสแกนใหม่
 
 กับฐานข้อมูลใหญ่ daemon จะหยุดนานเท่ากับการคัดลอกสองครั้งและการตรวจ (หลายนาทีที่ 2.8 GB) ระหว่างนั้นงานเขียนของ agent ถูกพักใน spool ทันทีและนำมาใช้ภายหลัง
+
+งาน maintenance ทำงานเองเมื่อ daemon ว่างมาหนึ่งนาที และหลีกทางทันทีที่มีคำขอเข้ามา: รายวันคือ backup, ตรวจความสมบูรณ์, ตรวจ vector index, นโยบายการเก็บ raw, ล้างถังขยะ และลบประวัติเก่า รายสัปดาห์คือ merge ของ full-text index และข้อเสนอให้รวม memory ที่คล้ายกัน รายชั่วโมงคือลองตัดสินใหม่กับ memory ที่ judge ล้มเหลว `alice maintenance status` แสดงว่าแต่ละงานรันล่าสุดเมื่อไร และ `alice maintenance run <job>` สั่งรันงานนั้นทันที
 
 ## สุขภาพระบบ token และ service
 
@@ -271,7 +318,7 @@ alice service install         # ให้ daemon ทำงานตอน login
 
 `alice token rotate` เขียน token สุ่มใหม่ลง `~/.alice/token` (mode 0600 และแทนที่ไฟล์แบบ atomic) daemon ที่ทำงานอยู่จะเปลี่ยนใช้ทันทีและปฏิเสธ token เก่าตั้งแต่คำขอถัดไป `alice mcp` และ CLI จะพบ token ใหม่ในการเรียกครั้งถัดไป ถ้าไม่มี daemon จะแทนที่ไฟล์ขณะที่คำสั่งถือ daemon lock อยู่ และจะแสดง token ก็ต่อเมื่อใส่ `--show`
 
-`alice service install` ลงทะเบียน launchd agent (macOS, `~/Library/LaunchAgents/dev.alice.daemon.plist`), systemd user unit (Linux, `~/.config/systemd/user/alice.service`) หรือ scheduled task ตอน logon (Windows ชื่อ `dev.alice.daemon`) unit จะรัน `alice daemon run` กับโฟลเดอร์ข้อมูลเดียวกับที่ใช้ตอนสั่งคำสั่ง และไม่มีความลับอยู่ในนั้น `--dry-run` พิมพ์ไฟล์และคำสั่งโดยไม่เปลี่ยนอะไร ส่วน `--target-dir d` เขียนไฟล์ไว้ใต้ `d` และไม่รันคำสั่งใด บน Linux user service จะหยุดเมื่อ logout เว้นแต่ตั้ง `loginctl enable-linger $USER` `alice daemon stop` ปิด daemon อย่างเรียบร้อย unit จึงไม่เริ่มมันใหม่จนกว่าจะ login ครั้งหน้า `alice restore` หยุด unit ก่อนสลับฐานข้อมูลแล้วเริ่มใหม่ภายหลัง unit ที่เริ่ม daemon ใหม่เองจึงไม่เปิด daemon กลางการ restore `alice service uninstall` ถอด unit ออก
+`alice service install` ลงทะเบียน launchd agent (macOS, `~/Library/LaunchAgents/dev.alice.daemon.plist`), systemd user unit (Linux, `~/.config/systemd/user/alice.service`) หรือ scheduled task ตอน logon (Windows ชื่อ `dev.alice.daemon` ยังไม่เคยลองบนเครื่อง Windows จริง) unit จะรัน `alice daemon run` กับโฟลเดอร์ข้อมูลเดียวกับที่ใช้ตอนสั่งคำสั่ง และไม่มีความลับอยู่ในนั้น `--dry-run` พิมพ์ไฟล์และคำสั่งโดยไม่เปลี่ยนอะไร ส่วน `--target-dir d` เขียนไฟล์ไว้ใต้ `d` และไม่รันคำสั่งใด บน Linux user service จะหยุดเมื่อ logout เว้นแต่ตั้ง `loginctl enable-linger $USER` `alice daemon stop` ปิด daemon อย่างเรียบร้อย unit จึงไม่เริ่มมันใหม่จนกว่าจะ login ครั้งหน้า `alice restore` หยุด unit ก่อนสลับฐานข้อมูลแล้วเริ่มใหม่ภายหลัง unit ที่เริ่ม daemon ใหม่เองจึงไม่เปิด daemon กลางการ restore `alice service uninstall` ถอด unit ออก
 
 ## Git sync *(วางแผนไว้ใน M4)*
 
@@ -298,7 +345,7 @@ alice import mempalace
 | การเขียนพร้อมกัน | hub ที่ถือสิทธิ์เขียนได้ทีละคน | daemon เป็นเจ้าของ DB คนเดียว งานหนักไม่ถือสิทธิ์เขียน |
 | การจัดระเบียบ | wing, room, drawer, closet, tunnel | project, topic, memory, source, link |
 | ข้อมูลดิบกับความรู้ | เก็บรวมกัน | แยกชั้น ค้นความรู้ก่อน |
-| การแก้ตัวเอง | agent ต้องเรียก tool เฉพาะเอง (เช่น ตรวจซ้ำ, KG supersede) | Judge ช่วยกันซ้ำ, supersede และส่งเรื่องขัดแย้งเข้า review อัตโนมัติ |
+| การแก้ตัวเอง | agent ต้องเรียก tool เฉพาะเอง (เช่น ตรวจซ้ำ, KG supersede) | Judge ช่วยกันซ้ำ, supersede และส่งเรื่องขัดแย้งเข้า review อัตโนมัติ พร้อม undo |
 | MCP tools | ~45 | หลัก 7 ตัว + ชุด admin และ compat ที่เลือกเปิดได้ |
 | การแชร์ | shared-brain hub | git เป็น Markdown พร้อม merge ทีละ record |
 
@@ -306,26 +353,27 @@ drawer ที่ mine มาจาก transcript และไฟล์กลา�
 
 ## ประสิทธิภาพ
 
-วัดตอนจบ M1 บน Apple M4 Pro ด้วย `alice bench` ([ผลทั้งหมด](docs/benchmarks/m1.md)) ค่า p95:
+วัดตอนจบ M2 บน Apple M4 Pro ด้วย `alice bench` ([ผลทั้งหมด](docs/benchmarks/m2.md)) รันอย่างละหนึ่งครั้ง ค่า p95:
 
-| | เป้าหมาย | 100k chunk, โมเดลในเครื่อง | 1M chunk |
+| | เป้าหมาย | 100k chunk, โมเดลในเครื่อง | 1M chunk, โมเดลในเครื่อง |
 |---|---|---|---|
-| `remember` ตอบรับ | < 50ms | 34ms (เครื่องทำงานหนัก) | 10.0ms |
-| `recall` (ชั้นความรู้) | < 200ms | 31ms | 9.7ms |
-| `recall` แบบ `include_raw` | < 200ms | 49ms | 139–177ms |
-| `context` | < 150ms | 3.4ms | 0.8ms |
-| หน่วยความจำของ daemon: RSS ปกติ / สูงสุด | RSS < 800MB ที่ 1M chunk | 0.58–0.76 / 0.91GB | ไม่รวมโมเดล 0.67–0.78 / 0.86GB ถ้ารวมโมเดลคาดว่า ≈1.4 / ≈1.6–1.7GB (ยังไม่ผ่านเป้า) |
-| physical footprint ปกติ / สูงสุด | | 0.69–0.75 / 0.85GB | ไม่รวมโมเดล 0.77–0.86 / 0.86GB ถ้ารวมโมเดลคาดว่า ≈1.4–1.5 / ≈1.55GB |
+| `remember` ตอบรับ | < 50ms | 4.4ms | 13.4ms |
+| `recall` (ชั้นความรู้) | < 200ms | 6.2ms | 15.6ms |
+| `recall` แบบ `include_raw` | < 200ms | 26ms | 119ms |
+| `context` | < 150ms | 0.43ms | 0.50ms |
+| `alice mcp` เริ่มทำงาน (ตั้งแต่สั่งรันจนตอบ `initialize`) | < 20ms | 4.8ms (p50), 5.2ms (p95) | |
+| หน่วยความจำของ daemon: RSS สูงสุด | RSS < 800MB ที่ 1M chunk | 534MB | **564MB ผ่านเป้า** |
+| physical footprint สูงสุด | | 511MB | 585MB |
 
-รอบ 1M chunk ใช้ embedder จำลอง ส่วนโมเดลในเครื่องที่โหลดแล้วหนึ่งชุดกินหน่วยความจำราว 600MB ด้วยตัวมันเอง
+ตอนจบ M1 หน่วยความจำยังไม่ผ่านเป้า (คาดว่าราว 1.4GB เมื่อรวมโมเดล) M2 ทำให้ผ่านได้: vector ของ chunk ย้ายไปอยู่ใน index แบบ sign-bit ขนาด 53MB (กราฟ int8 เดิมใช้ 508MB) และโมเดล embedding รันบน ONNX Runtime โดยตรง (โหลดแล้วราว 350MB แทนที่จะเป็น 600MB) รอบ 1M chunk เติม index ด้วย vector สังเคราะห์ที่ใช้ id ของโมเดลจริง (การ embed ล้านชิ้นใช้เวลาหลายชั่วโมง และ vector กินที่ใน index เท่ากันไม่ว่าค่าข้างในจะเป็นอะไร) แล้วเปิด daemon จริงที่โหลดโมเดลจริง embed memory ใหม่ 256 อัน และรับ recall พร้อมกัน 64 คำขอ 4 ชุด (ไม่มี error) คุณภาพการค้นไม่ตก: ชุด gold ยังได้ MRR 1.000 โดยทั้ง 13 คำถามอยู่ใน top 3 และ recall@10 ของ chunk index เทียบกับ top 10 ที่แท้จริงอยู่ที่ 0.99 กับ passage จริง 96,000 ชิ้น
 
 ## Roadmap
 
 | ช่วง | ขอบเขต | สถานะ |
 |---|---|---|
 | **SP1 · M1** | ที่เก็บข้อมูล, การค้นหาแบบผสม, daemon, MCP, CLI, HTTP API | เสร็จแล้ว (alpha) |
-| **SP1 · M2** | Judge (กฎในเครื่อง + Jev), คิว review, undo, ตัด secret, backup, settings ที่มีผลทันที, embedding provider ผ่าน HTTP | ลำดับถัดไป |
-| **SP1 · M3** | ตัว import จาก MemPalace และ compatibility layer | วางแผนแล้ว |
+| **SP1 · M2** | Judge (กฎในเครื่อง + Jev), คิว review, undo, ตัด secret, backup และ restore, maintenance, settings ที่มีผลทันที, doctor, service install, embedding provider ผ่าน HTTP, build บน Windows, เป้าหน่วยความจำ 800MB | เสร็จแล้ว (alpha) |
+| **SP1 · M3** | ตัว import จาก MemPalace และ compatibility layer | ลำดับถัดไป |
 | **SP1 · M4** | Git sync | วางแผนแล้ว |
 | **SP2** | เก็บและกลั่นความรู้อัตโนมัติ, `alice setup`, hook/plugin สำหรับทุก agent ที่รองรับ | วางแผนแล้ว |
 | **SP3** | Web UI (graph, จัดการ memory, review, settings, sync, สุขภาพระบบ) แล้วตามด้วยแอป desktop | วางแผนแล้ว |
@@ -334,7 +382,7 @@ drawer ที่ mine มาจาก transcript และไฟล์กลา�
 
 ## ร่วมพัฒนา
 
-เปิด issue, ร่วมคุยเรื่อง spec หรือส่ง pull request ได้เลย workspace มี 4 crate: `alice-core` (โมเดลข้อมูล, ที่เก็บ, การค้นหา), `alice-embed` (embedding provider), `alice-daemon` (writer, worker, HTTP API, MCP server, client) และ `alice` (ตัว binary, แพ็กเกจ `alice-memory`) ก่อนส่ง pull request ให้รัน:
+เปิด issue, ร่วมคุยเรื่อง spec หรือส่ง pull request ได้เลย workspace มี 4 crate: `alice-core` (โมเดลข้อมูล, ที่เก็บ, การค้นหา, judge), `alice-embed` (embedding provider), `alice-daemon` (writer, worker, HTTP API, MCP server, client) และ `alice` (ตัว binary, แพ็กเกจ `alice-memory`) ก่อนส่ง pull request ให้รัน:
 
 ```bash
 cargo fmt --all --check
