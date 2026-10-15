@@ -112,6 +112,16 @@ pub struct Hit {
     pub matched: Vec<MatchVia>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<Status>,
+    /// `team` for a hit that came from the shared team memory; absent for a personal one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The tenant that wrote a team hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// Set by a team store on the hits it returns: whether the cloud policy lets this hit's
+    /// project be sent to a model. `Some(false)` on any doubt; absent outside the team store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_ok: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -968,6 +978,9 @@ mod tests {
             score: 0.5,
             matched: vec![MatchVia::Words],
             status: None,
+            source: None,
+            author: None,
+            cloud_ok: None,
         };
         let v = serde_json::to_value(&hit).unwrap();
         assert!(v.get("body").is_none() && v.get("status").is_none());

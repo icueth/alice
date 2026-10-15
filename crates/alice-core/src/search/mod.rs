@@ -472,6 +472,9 @@ impl Scored {
                 created_at: m.created_at,
                 score: self.score,
                 matched: self.matched,
+                source: None,
+                author: None,
+                cloud_ok: None,
             },
             Row::Chunk { chunk: c, project } => {
                 let created_at = c.authored_at.unwrap_or(c.created_at);
@@ -487,6 +490,9 @@ impl Scored {
                     score: self.score,
                     matched: self.matched,
                     status: None,
+                    source: None,
+                    author: None,
+                    cloud_ok: None,
                 }
             }
         }

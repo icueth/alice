@@ -13,7 +13,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
 
 /// One request the emulator received: method, path and query, whether `Authorization` was
@@ -35,6 +35,8 @@ pub struct Server {
     pub team: Option<Tenant>,
     recorders: Vec<(String, Arc<Mutex<Vec<Seen>>>)>,
     paused: Arc<AtomicBool>,
+    /// Milliseconds the team store waits before it answers `/api/v1/recall`.
+    team_recall_delay_ms: Arc<AtomicU64>,
     stop: CancellationToken,
     team_stop: CancellationToken,
     _dirs: Vec<tempfile::TempDir>,
@@ -91,21 +93,43 @@ async fn front(State(f): State<Front>, req: Request, next: Next) -> Response {
         .await
 }
 
+/// Holds back the team store's `/api/v1/recall` answer while a delay is set.
+async fn team_delay(State(ms): State<Arc<AtomicU64>>, req: Request, next: Next) -> Response {
+    let wait = ms.load(Ordering::SeqCst);
+    if wait > 0 && req.uri().path() == "/api/v1/recall" {
+        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+    }
+    next.run(req).await
+}
+
 impl Server {
     /// Tenants `names` (tenant mode on, fake embedder, tokens from `load_or_create_token`)
     /// behind one emulator on 127.0.0.1:0.
     pub async fn start(names: &[&str]) -> Server {
-        Self::start_with(names, false).await
+        Self::start_with(names, false, None).await
     }
 
     /// Like [`Server::start`], plus a team store: a `--team-store` daemon on its own
     /// `127.0.0.1:<port>` that the emulator does not route (`/u/team/...` is 404). Every tenant
     /// gets its URL and a `team.token` file.
     pub async fn start_with_team(names: &[&str]) -> Server {
-        Self::start_with(names, true).await
+        Self::start_with(names, true, None).await
     }
 
-    async fn start_with(names: &[&str], with_team: bool) -> Server {
+    /// Like [`Server::start_with_team`], and every personal tenant posts its judge calls through
+    /// `jev` (the test turns the judge on with `judge.provider` and a key).
+    pub async fn start_with_team_and_judge(
+        names: &[&str],
+        jev: Arc<dyn alice_core::judge::jev::JevTransport>,
+    ) -> Server {
+        Self::start_with(names, true, Some(jev)).await
+    }
+
+    async fn start_with(
+        names: &[&str],
+        with_team: bool,
+        jev: Option<Arc<dyn alice_core::judge::jev::JevTransport>>,
+    ) -> Server {
         alice_daemon::install_tls();
         let stop = CancellationToken::new();
         let paused = Arc::new(AtomicBool::new(false));
@@ -116,6 +140,7 @@ impl Server {
         let mut team = None;
         let mut team_url = None;
         let team_stop = stop.child_token();
+        let team_recall_delay_ms = Arc::new(AtomicU64::new(0));
         if with_team {
             let dir = tempfile::tempdir().unwrap();
             let home = AliceHome::new(dir.path().to_path_buf());
@@ -137,7 +162,11 @@ impl Server {
                 token.clone(),
                 port,
                 team_stop.child_token(),
-            );
+            )
+            .layer(middleware::from_fn_with_state(
+                team_recall_delay_ms.clone(),
+                team_delay,
+            ));
             let ct = team_stop.clone();
             tokio::spawn(async move {
                 axum::serve(listener, app)
@@ -169,6 +198,7 @@ impl Server {
                     tenant: true,
                     team_url: team_url.clone(),
                     tenant_name: Some(name.to_string()),
+                    jev_transport: jev.clone(),
                     ..ServiceOptions::default()
                 },
             )
@@ -213,6 +243,7 @@ impl Server {
             team,
             recorders,
             paused,
+            team_recall_delay_ms,
             stop,
             team_stop,
             _dirs: dirs,
@@ -242,6 +273,11 @@ impl Server {
     pub async fn stop_team(&self) {
         self.team_stop.cancel();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    /// Makes the team store wait `ms` milliseconds before it answers a recall (0: no wait).
+    pub fn delay_team_recall(&self, ms: u64) {
+        self.team_recall_delay_ms.store(ms, Ordering::SeqCst);
     }
 
     /// While paused, routed requests get a 502, as when a tenant's daemon is down.

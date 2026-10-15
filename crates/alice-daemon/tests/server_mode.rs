@@ -867,3 +867,431 @@ async fn mcp_lists_remember_with_a_shared_flag_and_saves_to_the_team_memory() {
         Some("ann/team-agent")
     );
 }
+
+// ---------------------------------------------------------------------------- the read merge
+
+use alice_core::api::{ContextRequest, OutputFormat, RecallMode, RecallRequest, RecallResponse};
+use alice_core::judge::jev::{HttpReply, JevTransport, TransportError};
+use alice_core::model::Kind;
+use std::sync::Arc;
+
+const TEAM_LATE_NOTE: &str = "the team memory did not answer in time; this answer is personal only";
+
+fn recall_in(query: &str, project: Option<&str>, hint: Option<&str>) -> RecallRequest {
+    RecallRequest {
+        query: query.into(),
+        project: project.map(Into::into),
+        project_hint: hint.map(Into::into),
+        mode: Some(RecallMode::Fast),
+        format: OutputFormat::Json,
+        ..Default::default()
+    }
+}
+
+/// A shared memory written by `tenant` into the team project `project`.
+async fn share(s: &Server, tenant: &str, project: &str, title: &str, content: &str) -> String {
+    let mut req = shared(content, Some("cursor"));
+    req.title = Some(title.into());
+    req.project_hint = Some(project.into());
+    req.kind = Some(Kind::Decision);
+    let r = s.tenant(tenant).svc.remember(req).await.unwrap();
+    r.id.unwrap()
+}
+
+/// A personal memory of `tenant` in `project`.
+async fn own(s: &Server, tenant: &str, project: &str, title: &str, content: &str) {
+    let req = RememberRequest {
+        content: content.into(),
+        title: Some(title.into()),
+        kind: Some(Kind::Decision),
+        project_hint: Some(project.into()),
+        ..Default::default()
+    };
+    s.tenant(tenant).svc.remember(req).await.unwrap();
+}
+
+fn ids(r: &RecallResponse) -> Vec<String> {
+    r.results.iter().map(|h| h.title.clone()).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recall_returns_the_team_memory_labelled_with_its_author() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    let id = share(
+        &s,
+        "ann",
+        "wiki",
+        "Quokka rollout checklist",
+        "The quokka rollout checklist lives in the wiki",
+    )
+    .await;
+    let bob = &s.tenant("bob").svc;
+    let r = bob
+        .recall(recall_in("quokka rollout", None, None))
+        .await
+        .unwrap();
+    let hit = r
+        .results
+        .iter()
+        .find(|h| h.title == "Quokka rollout checklist")
+        .unwrap_or_else(|| panic!("no team hit: {r:?}"));
+    assert_eq!(hit.id, id);
+    assert!(hit.id.starts_with("team:"));
+    assert_eq!(hit.source.as_deref(), Some("team"));
+    assert_eq!(hit.author.as_deref(), Some("ann"));
+    assert_eq!(
+        hit.cloud_ok, None,
+        "the team store's mark stays out of the answer"
+    );
+    assert!(r.notes.is_empty(), "{:?}", r.notes);
+    // The text form says whose it is.
+    let mut text_req = recall_in("quokka rollout", None, None);
+    text_req.format = OutputFormat::Text;
+    let t = bob.recall(text_req).await.unwrap().text.unwrap();
+    assert!(t.contains("(team, by ann)"), "{t}");
+    // The author's own personal answer has none of this.
+    assert!(
+        !ann_has_team_label(&s).await,
+        "a personal tenant without a team memory hit"
+    );
+}
+
+async fn ann_has_team_label(s: &Server) -> bool {
+    let r = s
+        .tenant("ann")
+        .svc
+        .recall(recall_in("zzzz nothing matches this", None, None))
+        .await
+        .unwrap();
+    r.results.iter().any(|h| h.source.is_some())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_personal_hit_equal_to_a_team_hit_appears_once() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    let body = "The quokka rollout checklist lives in the wiki";
+    share(&s, "ann", "wiki", "Quokka rollout checklist", body).await;
+    own(&s, "bob", "wiki", "Quokka rollout checklist", body).await;
+    let r = s
+        .tenant("bob")
+        .svc
+        .recall(recall_in("quokka rollout", None, Some("wiki")))
+        .await
+        .unwrap();
+    let same: Vec<_> = r
+        .results
+        .iter()
+        .filter(|h| h.title == "Quokka rollout checklist")
+        .collect();
+    assert_eq!(same.len(), 1, "{:?}", ids(&r));
+    assert!(!same[0].id.starts_with("team:"), "the personal one stays");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_team_memory_leaves_the_personal_answer_with_a_note() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    share(&s, "ann", "wiki", "Quokka team note", "quokka team note").await;
+    own(&s, "bob", "wiki", "Quokka own note", "quokka own note").await;
+    s.delay_team_recall(3_000);
+    let t0 = std::time::Instant::now();
+    let r = s
+        .tenant("bob")
+        .svc
+        .recall(recall_in("quokka", None, Some("wiki")))
+        .await
+        .unwrap();
+    assert!(
+        t0.elapsed() < Duration::from_millis(1_500),
+        "{:?}",
+        t0.elapsed()
+    );
+    assert_eq!(r.notes, vec![TEAM_LATE_NOTE.to_string()]);
+    assert_eq!(ids(&r), vec!["Quokka own note".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_team_store_leaves_the_personal_answer_with_a_note() {
+    let s = Server::start_with_team(&["bob"]).await;
+    own(&s, "bob", "wiki", "Quokka own note", "quokka own note").await;
+    s.stop_team().await;
+    let t0 = std::time::Instant::now();
+    let r = s
+        .tenant("bob")
+        .svc
+        .recall(recall_in("quokka", None, Some("wiki")))
+        .await
+        .unwrap();
+    assert!(
+        t0.elapsed() < Duration::from_millis(1_500),
+        "{:?}",
+        t0.elapsed()
+    );
+    assert_eq!(r.notes, vec![TEAM_LATE_NOTE.to_string()]);
+    assert_eq!(ids(&r), vec!["Quokka own note".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_team_memory_shows_in_its_own_project_and_not_in_another() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    share(&s, "ann", "x", "Quokka in x", "quokka lives in project x").await;
+    own(&s, "bob", "x", "Own note in x", "own note in project x").await;
+    own(&s, "bob", "y", "Own note in y", "own note in project y").await;
+    let bob = &s.tenant("bob").svc;
+    let in_x = bob
+        .recall(recall_in("quokka", Some("x"), None))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&in_x),
+        vec!["Quokka in x".to_string()],
+        "{:?}",
+        in_x.notes
+    );
+    let in_y = bob
+        .recall(recall_in("quokka", Some("y"), None))
+        .await
+        .unwrap();
+    assert!(ids(&in_y).is_empty(), "{:?}", ids(&in_y));
+    assert!(
+        in_y.notes.is_empty(),
+        "no note for a project the team lacks: {:?}",
+        in_y.notes
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_context_carries_the_team_memory_or_says_it_is_missing() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    share(
+        &s,
+        "ann",
+        "x",
+        "Quokka decision",
+        "we decided about the quokka",
+    )
+    .await;
+    let bob = &s.tenant("bob").svc;
+    let ctx = |hint: &str| ContextRequest {
+        project_hint: Some(hint.into()),
+        ..Default::default()
+    };
+    let c = bob.context(ctx("x")).await.unwrap();
+    assert!(c.text.contains("## Team memory"), "{}", c.text);
+    assert!(c.text.contains("Quokka decision"), "{}", c.text);
+    s.stop_team().await;
+    let c = bob.context(ctx("x")).await.unwrap();
+    assert!(c.text.contains(TEAM_LATE_NOTE), "{}", c.text);
+}
+
+// ------------------------------------------------------------------- precise mode, team hits
+
+const JEV_KEY: &str = concat!("ts_", "live_server_mode_0001");
+
+/// Grades a result that contains `keyword` as answering, the rest as unrelated; records the
+/// state of every grading request.
+struct Grader {
+    keyword: &'static str,
+    states: parking_lot::Mutex<Vec<String>>,
+}
+
+impl JevTransport for Grader {
+    fn post(
+        &self,
+        _endpoint: &str,
+        _key: &str,
+        body: &[u8],
+        _timeout: Duration,
+    ) -> Result<HttpReply, TransportError> {
+        let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let state = req["state"].as_str().unwrap();
+        let mut answers = serde_json::Map::new();
+        let mut grading = false;
+        for (qid, q) in req["questions"].as_object().unwrap() {
+            let options: Vec<String> = q["criteria"].as_object().unwrap().keys().cloned().collect();
+            let (choice, other) = if let Some(k) = qid.strip_prefix("r_") {
+                grading = true;
+                let block = state
+                    .split(&format!("Result {k} ("))
+                    .nth(1)
+                    .unwrap_or("")
+                    .split("\nResult ")
+                    .next()
+                    .unwrap_or("");
+                if block.contains(self.keyword) {
+                    ("answers", "unrelated")
+                } else {
+                    ("unrelated", "answers")
+                }
+            } else {
+                ("unrelated", "duplicate")
+            };
+            let probs: serde_json::Map<String, serde_json::Value> = options
+                .iter()
+                .map(|o| {
+                    let p = if o == choice {
+                        0.9
+                    } else if o == other {
+                        0.05
+                    } else {
+                        0.05 / (options.len().max(3) - 2) as f64
+                    };
+                    (o.clone(), serde_json::json!(p))
+                })
+                .collect();
+            answers.insert(
+                qid.clone(),
+                serde_json::json!({"type": "choice", "choice": choice, "confidence": 0.9, "probabilities": probs}),
+            );
+        }
+        if grading {
+            self.states.lock().push(state.to_string());
+        }
+        let resp = serde_json::json!({"model": "jev-1.13.0", "answers": answers,
+            "usage": {"input_tokens": 800, "output_tokens": 0}});
+        Ok(HttpReply {
+            status: 200,
+            body: serde_json::to_vec(&resp).unwrap(),
+            retry_after: None,
+        })
+    }
+}
+
+fn patch(key: &str, value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    m.insert(key.into(), value);
+    m
+}
+
+/// A server whose tenant `bob` has three personal deploy notes in project `p` and a model judge
+/// (a scripted grader that likes `keyword`).
+async fn precise_server(keyword: &'static str) -> (Server, Arc<Grader>) {
+    let grader = Arc::new(Grader {
+        keyword,
+        states: Default::default(),
+    });
+    let s = Server::start_with_team_and_judge(&["ann", "bob"], grader.clone()).await;
+    for n in ["staging", "freeze", "canary"] {
+        own(
+            &s,
+            "bob",
+            "p",
+            &format!("Deploy {n}"),
+            &format!("deploy notes: the {n} deploy runs make deploy"),
+        )
+        .await;
+    }
+    (s, grader)
+}
+
+async fn enable_judge(s: &Server) {
+    let bob = &s.tenant("bob").svc;
+    bob.patch_settings(patch("judge.provider", serde_json::json!("jev")))
+        .unwrap();
+    bob.set_secret(alice_daemon::secrets::SecretName::JevApiKey, JEV_KEY.into())
+        .unwrap();
+}
+
+fn precise(query: &str) -> RecallRequest {
+    RecallRequest {
+        mode: Some(RecallMode::Precise),
+        ..recall_in(query, None, Some("p"))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cloud_ok_team_hit_is_graded_with_the_personal_hits_and_can_rank_first() {
+    let (s, grader) = precise_server("ZEBRA").await;
+    share(
+        &s,
+        "ann",
+        "teamproj",
+        "Deploy zebra",
+        "deploy notes: the ZEBRA cluster deploy uses blue green",
+    )
+    .await;
+    enable_judge(&s).await;
+    let r = s
+        .tenant("bob")
+        .svc
+        .recall(precise("deploy notes"))
+        .await
+        .unwrap();
+    let states = grader.states.lock().join("\n");
+    assert!(states.contains("ZEBRA"), "the team hit is graded: {states}");
+    assert!(r.reranked, "{:?}", r.notes);
+    assert_eq!(r.results[0].title, "Deploy zebra", "{:?}", ids(&r));
+    assert_eq!(r.results[0].source.as_deref(), Some("team"));
+    assert_eq!(r.results.len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_team_hit_of_a_cloud_denied_project_never_reaches_the_grader_and_follows_the_graded() {
+    let (s, grader) = precise_server("staging").await;
+    s.team
+        .as_ref()
+        .unwrap()
+        .svc
+        .patch_settings(patch(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["secretproj"]),
+        ))
+        .unwrap();
+    share(
+        &s,
+        "ann",
+        "secretproj",
+        "Deploy kappa",
+        "deploy notes: the KAPPA cluster deploy is secret",
+    )
+    .await;
+    enable_judge(&s).await;
+    let r = s
+        .tenant("bob")
+        .svc
+        .recall(precise("deploy notes"))
+        .await
+        .unwrap();
+    let states = grader.states.lock().join("\n");
+    assert!(!states.is_empty(), "the personal hits are graded");
+    assert!(
+        !states.contains("KAPPA"),
+        "never sent to the grader: {states}"
+    );
+    assert!(r.reranked, "{:?}", r.notes);
+    let titles = ids(&r);
+    assert_eq!(titles.len(), 4, "{titles:?}");
+    assert_eq!(
+        titles[3], "Deploy kappa",
+        "after the graded hits: {titles:?}"
+    );
+    assert_eq!(r.results[0].title, "Deploy staging", "{titles:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_team_store_marks_cloud_ok_on_its_hits() {
+    let (s, _grader) = precise_server("ZEBRA").await;
+    let team = &s.team.as_ref().unwrap().svc;
+    team.patch_settings(patch(
+        "privacy.cloud_denied_projects",
+        serde_json::json!(["secretproj"]),
+    ))
+    .unwrap();
+    share(&s, "ann", "teamproj", "Deploy open", "deploy notes: open").await;
+    share(&s, "ann", "secretproj", "Deploy shut", "deploy notes: shut").await;
+    let r = team
+        .recall(recall_in("deploy notes", None, None))
+        .await
+        .unwrap();
+    let mark = |t: &str| r.results.iter().find(|h| h.title == t).unwrap().cloud_ok;
+    assert_eq!(mark("Deploy open"), Some(true));
+    assert_eq!(mark("Deploy shut"), Some(false));
+    // A personal tenant's own hits carry no mark.
+    let r = s
+        .tenant("bob")
+        .svc
+        .recall(recall_in("deploy notes", None, Some("p")))
+        .await
+        .unwrap();
+    assert!(r.results.iter().all(|h| h.cloud_ok.is_none()));
+    assert!(!r.results.is_empty());
+}

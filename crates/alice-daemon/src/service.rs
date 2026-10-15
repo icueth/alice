@@ -1607,11 +1607,7 @@ impl Service {
         let _busy = self.activity.enter();
         let project = self.choose(req.scope()).await?;
         let req = self.redact_remember_in(&project, req).await?;
-        let slug = match &project {
-            ProjectChoice::Slug(s) => s.clone(),
-            ProjectChoice::Detected(r) => r.slug.clone(),
-            ProjectChoice::Fallback => "global".into(),
-        };
+        let slug = choice_slug(&project);
         let body = RememberRequest {
             content: req.content,
             kind: req.kind,
@@ -1761,6 +1757,81 @@ impl Service {
         Ok(out)
     }
 
+    /// Starts the team store's recall for `req` (spec §2.10): the same query, filters and limit,
+    /// fast mode, JSON, no raw chunks, asked about the project this recall resolved to. It runs
+    /// beside the personal search; `None` when there is no team link (or this is the team store).
+    fn start_team_recall(
+        &self,
+        req: &RecallRequest,
+        choice: &ProjectChoice,
+        limit: usize,
+    ) -> Option<tokio::task::JoinHandle<Result<Vec<Hit>>>> {
+        if self.is_team_store() {
+            return None;
+        }
+        let team = self.team()?.clone();
+        let slug = choice_slug(choice);
+        let body = RecallRequest {
+            query: req.query.clone(),
+            project: explicit_slug(req.project.as_deref()).map(str::to_string),
+            topics: req.topics.clone(),
+            kinds: req.kinds.clone(),
+            since: req.since.clone(),
+            before: req.before.clone(),
+            include_raw: false,
+            mode: Some(RecallMode::Fast),
+            max_tokens: Some(TEAM_RECALL_TOKENS),
+            format: OutputFormat::Json,
+            limit: Some(limit),
+            project_hint: (slug != "global").then_some(slug),
+            ..Default::default()
+        };
+        Some(tokio::spawn(async move { team_recall(&team, body).await }))
+    }
+
+    /// Starts the team store's context for the same project, with a third of the budget.
+    fn start_team_context(
+        &self,
+        req: &ContextRequest,
+        choice: &ProjectChoice,
+        max_tokens: usize,
+    ) -> Option<tokio::task::JoinHandle<Result<Option<String>>>> {
+        if self.is_team_store() {
+            return None;
+        }
+        let team = self.team()?.clone();
+        let slug = choice_slug(choice);
+        let body = ContextRequest {
+            project: explicit_slug(req.project.as_deref()).map(str::to_string),
+            max_tokens: Some(max_tokens / 3),
+            project_hint: (slug != "global").then_some(slug),
+            ..Default::default()
+        };
+        Some(tokio::spawn(async move {
+            let asked = tokio::time::timeout(
+                TEAM_DEADLINE,
+                team.call::<_, ContextResponse>(
+                    reqwest::Method::POST,
+                    "/api/v1/context",
+                    Some(&body),
+                    TEAM_DEADLINE,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(AliceError::Other(
+                    "the team store did not answer in time".into(),
+                ))
+            });
+            match asked {
+                Ok(c) => Ok(Some(c.text)),
+                // A project only this person has: the team has nothing to add, and nothing failed.
+                Err(AliceError::Invalid(_)) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }))
+    }
+
     pub async fn recall(&self, req: RecallRequest) -> Result<RecallResponse> {
         let _busy = self.activity.enter();
         let limit = req
@@ -1804,6 +1875,7 @@ impl Service {
         // embedded: a remote embedder gets the query only if the project may use it.)
         let explicit = explicit_slug(req.project.as_deref()).is_some();
         let choice = self.choose(req.scope()).await?;
+        let team_task = self.start_team_recall(&req, &choice, limit);
         let mut notes: Vec<String> = Vec::new();
         let vector = match &index {
             Some(idx) if idx.model() == active.model => {
@@ -1912,6 +1984,30 @@ impl Service {
             })
             .await?;
         let mut out = out;
+        // The team's hits join the personal ones before the person's judge sees the top: in
+        // fast mode they are ordered by score with the rest; in precise mode the ones the team
+        // store marked `cloud_ok` do the same (`team_ok` names them for `rerank`) and the others
+        // wait in `team_rest` to follow the graded hits.
+        let mut team_ok = std::collections::HashSet::new();
+        let mut team_rest = Vec::new();
+        if let Some(task) = team_task {
+            match task.await {
+                Ok(Ok(hits)) => {
+                    (team_ok, team_rest) = merge_team(&mut out, hits, precise);
+                    if !precise {
+                        out.hits.truncate(limit);
+                        let kept = out
+                            .hits
+                            .iter()
+                            .filter(|h| h.tier == Tier::Knowledge)
+                            .count();
+                        out.memory_seqs.truncate(kept);
+                        out.memory_importance.truncate(kept);
+                    }
+                }
+                _ => notes.push(NOTE_TEAM_LATE.into()),
+            }
+        }
         let mut reranked = false;
         if precise {
             let why;
@@ -1923,9 +2019,34 @@ impl Service {
                     &judged_query,
                     limit,
                     include_raw,
+                    &team_ok,
                 )
                 .await;
             notes.extend(why);
+            append_team(&mut out, team_rest, limit);
+        }
+        if self.is_team_store() {
+            // What a federated caller needs to know before it grades these hits (R35): the cloud
+            // policy of this store for each hit's project. Any doubt, a failed task included, is `false`.
+            let mut projects: Vec<String> = Vec::new();
+            for h in &out.hits {
+                if !projects.contains(&h.project) {
+                    projects.push(h.project.clone());
+                }
+            }
+            let cloud = self.cloud.clone();
+            let allowed: std::collections::HashSet<String> =
+                tokio::task::spawn_blocking(move || {
+                    projects
+                        .into_iter()
+                        .filter(|p| cloud.cloud_allowed(p))
+                        .collect()
+                })
+                .await
+                .unwrap_or_default();
+            for h in &mut out.hits {
+                h.cloud_ok = Some(allowed.contains(&h.project));
+            }
         }
         let (response, touched) = match format {
             OutputFormat::Text => {
@@ -1978,6 +2099,13 @@ impl Service {
     /// is the fast one); `Some(text)` is the query redacted with the tree's rules, and the call
     /// then runs under `global`, a project the policy knows, whose gate and redaction apply on
     /// top.
+    ///
+    /// `team_ok` holds the ids of team hits the team store marked `cloud_ok`. The person's
+    /// policy knows nothing of a team project, so those hits are allowed by the team store's mark
+    /// instead of by their project, and the judge is told they belong to the query's project (the
+    /// project whose gate and redaction this call runs under). The other switches (a heuristic
+    /// judge, a degraded configuration, the budget, the breaker) apply to them as to any hit.
+    #[allow(clippy::too_many_arguments)] // one call site; a struct would only rename them
     async fn rerank(
         &self,
         mut out: SearchOutput,
@@ -1986,6 +2114,7 @@ impl Service {
         query: &str,
         limit: usize,
         include_raw: bool,
+        team_ok: &std::collections::HashSet<String>,
     ) -> (SearchOutput, bool, Option<String>) {
         let judge = self.judge();
         let mut reranked = false;
@@ -2011,6 +2140,7 @@ impl Service {
             let mut projects = vec![query_project.to_string()];
             let seen = out.hits[..window]
                 .iter()
+                .filter(|h| !team_ok.contains(&h.id))
                 .chain(near.iter().map(|n| &n.hit))
                 .map(|h| h.project.clone());
             for p in seen {
@@ -2033,7 +2163,11 @@ impl Service {
             // index in the hit list), then near-floor candidates (index `hits.len() + j`).
             let judged = |h: &Hit, importance: u8| JudgeMemory {
                 id: h.id.clone(),
-                project: h.project.clone(),
+                project: if team_ok.contains(&h.id) {
+                    query_project.to_string()
+                } else {
+                    h.project.clone()
+                },
                 // A raw chunk has no kind; its title ("raw · <source>") says what it is. The
                 // text is the stored (redacted) one, bounded like a memory's by the judge.
                 kind: h.kind.unwrap_or(Kind::Note),
@@ -2053,7 +2187,7 @@ impl Service {
                 } else {
                     3
                 };
-                if allowed.contains(&h.project) {
+                if allowed.contains(&h.project) || team_ok.contains(&h.id) {
                     shown.push((i, judged(h, importance)));
                 }
             }
@@ -2219,17 +2353,29 @@ impl Service {
         let max_tokens = req.max_tokens.unwrap_or(limits::DEFAULT_CONTEXT_TOKENS);
         let explicit = explicit_slug(req.project.as_deref()).is_some();
         let choice = self.choose(req.scope()).await?;
-        self.read(move |c| {
-            let scope = ProjectResolver::read_scope(c, choice, explicit)?;
-            // A placeholder project (never written to) gets the hint and the global preferences.
-            let text =
-                alice_core::context::build(c, &scope.project, max_tokens, chrono::Utc::now())?;
-            Ok(ContextResponse {
-                project: scope.project.slug,
-                text,
+        let team_task = self.start_team_context(&req, &choice, max_tokens);
+        let mut out = self
+            .read(move |c| {
+                let scope = ProjectResolver::read_scope(c, choice, explicit)?;
+                // A placeholder project (never written to) gets the hint and the global preferences.
+                let text =
+                    alice_core::context::build(c, &scope.project, max_tokens, chrono::Utc::now())?;
+                Ok(ContextResponse {
+                    project: scope.project.slug,
+                    text,
+                })
             })
-        })
-        .await
+            .await?;
+        if let Some(task) = team_task {
+            match task.await {
+                Ok(Ok(Some(team))) => {
+                    out.text.push_str(&format!("\n## Team memory\n{team}"));
+                }
+                Ok(Ok(None)) => {}
+                _ => out.text.push_str(&format!("\n({NOTE_TEAM_LATE})\n")),
+            }
+        }
+        Ok(out)
     }
 
     /// Memories by id. A duplicate that was merged into another memory is answered with the
@@ -3716,6 +3862,8 @@ fn returned_memories(mut seqs: Vec<i64>, returned: &[Hit]) -> Vec<i64> {
             .filter(|h| h.tier == Tier::Knowledge)
             .count(),
     );
+    // A team hit has no personal memory to count an access for.
+    seqs.retain(|s| *s != TEAM_SEQ);
     seqs
 }
 
@@ -3866,6 +4014,160 @@ fn screen_resolution(
 
 /// The prefix of an id that lives in the team store.
 const TEAM_PREFIX: &str = "team:";
+/// The team store's total time to answer a recall or a context, the batch `get` for authors
+/// included (spec §2.10).
+const TEAM_DEADLINE: Duration = Duration::from_millis(800);
+/// The budget a recall asks of the team store; the person's own `max_tokens` packs the merged answer.
+const TEAM_RECALL_TOKENS: usize = 4_000;
+/// The answer when the team store did not answer within [`TEAM_DEADLINE`].
+const NOTE_TEAM_LATE: &str = "the team memory did not answer in time; this answer is personal only";
+/// The place of a team hit in `SearchOutput::memory_seqs`: it has no personal sequence number,
+/// so the parallel arrays stay one entry per knowledge hit, and no access is counted for it.
+const TEAM_SEQ: i64 = -1;
+/// The importance a team hit has for the judge (the team's own is not in a hit).
+const TEAM_IMPORTANCE: u8 = 3;
+
+/// The slug of the project a read or write resolved to (`global` when nothing named one).
+fn choice_slug(c: &ProjectChoice) -> String {
+    match c {
+        ProjectChoice::Slug(s) => s.clone(),
+        ProjectChoice::Detected(r) => r.slug.clone(),
+        ProjectChoice::Fallback => "global".into(),
+    }
+}
+
+/// What the team store answers to a recall, as this tenant shows it: `team:` ids, `source` and
+/// the `author` (one batch `get`), all inside [`TEAM_DEADLINE`]. A project the team store does
+/// not know (a refusal, not a failure) is an empty answer.
+async fn team_recall(team: &crate::team::TeamLink, body: RecallRequest) -> Result<Vec<Hit>> {
+    let asked = tokio::time::timeout(TEAM_DEADLINE, async {
+        let found: RecallResponse = team
+            .call(
+                reqwest::Method::POST,
+                "/api/v1/recall",
+                Some(&body),
+                TEAM_DEADLINE,
+            )
+            .await?;
+        let mut hits = found.results;
+        hits.retain(|h| h.tier == Tier::Knowledge);
+        if hits.is_empty() {
+            return Ok(hits);
+        }
+        let got: GetResponse = team
+            .call(
+                reqwest::Method::POST,
+                "/api/v1/get",
+                Some(&GetRequest {
+                    ids: hits.iter().map(|h| h.id.clone()).collect(),
+                    include_provenance: false,
+                }),
+                TEAM_DEADLINE,
+            )
+            .await?;
+        for h in &mut hits {
+            h.author = got
+                .memories
+                .iter()
+                .find(|m| m.memory.id == h.id)
+                .and_then(|m| author_tenant(&m.memory.author))
+                .map(str::to_string);
+            h.id = format!("{TEAM_PREFIX}{}", h.id);
+            h.source = Some("team".into());
+        }
+        Ok(hits)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(AliceError::Other(
+            "the team store did not answer in time".into(),
+        ))
+    });
+    match asked {
+        Err(AliceError::Invalid(_)) => Ok(Vec::new()),
+        other => other,
+    }
+}
+
+/// The hash two hits are the same memory by: title and snippet (R36).
+fn hit_hash(h: &Hit) -> String {
+    alice_core::normalize::content_hash("", Kind::Note, &h.title, &h.snippet)
+}
+
+/// Adds the team's hits to the personal search `out`, dropping the ones a personal hit equals.
+/// Fast mode (`precise == false`): all join and the list is ordered by score. Precise mode: the
+/// ones the team store marked `cloud_ok` join (their ids are returned) so the judge can grade
+/// them with the rest, and the others are returned to follow the graded hits. The team's mark
+/// is not part of the answer, so it is cleared here.
+fn merge_team(
+    out: &mut SearchOutput,
+    team: Vec<Hit>,
+    precise: bool,
+) -> (std::collections::HashSet<String>, Vec<Hit>) {
+    let personal: std::collections::HashSet<String> = out.hits.iter().map(hit_hash).collect();
+    let mut ok = std::collections::HashSet::new();
+    let (mut joined, mut rest) = (Vec::new(), Vec::new());
+    for mut h in team {
+        if personal.contains(&hit_hash(&h)) {
+            continue;
+        }
+        let gradable = h.cloud_ok == Some(true);
+        h.cloud_ok = None;
+        if precise && !gradable {
+            rest.push(h);
+            continue;
+        }
+        if precise {
+            ok.insert(h.id.clone());
+        }
+        joined.push(h);
+    }
+    rest.sort_by(|a, b| b.score.total_cmp(&a.score));
+    if !joined.is_empty() {
+        let hits = std::mem::take(&mut out.hits);
+        let (seqs, importance) = (
+            std::mem::take(&mut out.memory_seqs),
+            std::mem::take(&mut out.memory_importance),
+        );
+        let mut knowledge = 0;
+        let mut entries: Vec<(Hit, Option<(i64, u8)>)> = hits
+            .into_iter()
+            .map(|h| {
+                let memory = (h.tier == Tier::Knowledge).then(|| {
+                    knowledge += 1;
+                    (seqs[knowledge - 1], importance[knowledge - 1])
+                });
+                (h, memory)
+            })
+            .collect();
+        entries.extend(
+            joined
+                .into_iter()
+                .map(|h| (h, Some((TEAM_SEQ, TEAM_IMPORTANCE)))),
+        );
+        entries.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+        for (h, memory) in entries {
+            out.hits.push(h);
+            if let Some((seq, imp)) = memory {
+                out.memory_seqs.push(seq);
+                out.memory_importance.push(imp);
+            }
+        }
+    }
+    (ok, rest)
+}
+
+/// Puts the team hits the judge did not see after the graded results, up to `limit`.
+fn append_team(out: &mut SearchOutput, rest: Vec<Hit>, limit: usize) {
+    for h in rest {
+        if out.hits.len() >= limit {
+            break;
+        }
+        out.hits.push(h);
+        out.memory_seqs.push(TEAM_SEQ);
+        out.memory_importance.push(TEAM_IMPORTANCE);
+    }
+}
 /// A call to the team store for one shared write, read or change.
 const SHARED_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many pages of 500 events `undo` of a shared change looks through for the event.
