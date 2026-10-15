@@ -2101,6 +2101,9 @@ mod tests {
     /// `PRAGMA quick_check`.) SQLite drops an interrupt that arrives while no statement runs, so
     /// the test holds the check inside its statement (a progress callback every 1,000
     /// operations parks it at the first one) and interrupts only then: no timing decides it.
+    /// The first callback may fire while the full-text tables are still being set up rather
+    /// than inside the check proper; the job maps both interrupt outcomes (`SQLITE_INTERRUPT`
+    /// and "vtable constructor failed") to Paused, and the assertion accepts either.
     #[test]
     fn a_running_integrity_check_is_interrupted_at_shutdown() {
         let r = rig();

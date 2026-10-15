@@ -4,6 +4,7 @@
 //! ingest is written a slice at a time, so small writes queued behind it never wait for all of it.
 
 use crate::redaction::Redactors;
+use crate::wal::{WalKeeper, WalPolicy};
 use alice_core::api::StreamItem;
 use alice_core::error::{AliceError, Result};
 use alice_core::ids::{Hlc, new_id};
@@ -47,107 +48,10 @@ const STREAM_CAPACITY: usize = 256;
 /// Task 20); the import took 16 % longer.
 const INGEST_SLICE: usize = 50;
 /// Chunk text written per batch, at most (FTS work grows with text, not with chunk count). It
-/// must not be less than one chunk of [`alice_core::model::limits::MAX_CHUNK_BYTES`], or a chunk that large would
-/// never fit a slice (`slice_len` takes one chunk anyway only when the budget is this full).
+/// must be at least one largest chunk ([`alice_core::model::limits::MAX_CHUNK_BYTES`]): a
+/// chunk is deferred when it does not fit what is left of a slice, and only a slice with
+/// all of this budget left takes one regardless (see `slice_len`).
 const INGEST_SLICE_BYTES: usize = alice_core::model::limits::MAX_CHUNK_BYTES;
-
-/// The writer's own WAL hygiene (spec §4.1). SQLite's automatic checkpoint is PASSIVE: it
-/// copies frames home but never restarts the log, and the log restarts only when no reader
-/// is still using it. Under constant readers (a large import while clients recall) that
-/// moment never comes and the `-wal` file grows without bound (364 MiB at a 30k-chunk
-/// import, measured in `docs/benchmarks/m2.md`), which makes every read walk a longer
-/// wal-index. So, between its own transactions and on its own connection, the writer
-/// restarts the log once the file is over [`WalPolicy::limit`].
-#[derive(Debug, Clone)]
-pub struct WalPolicy {
-    /// A `-wal` file larger than this is restarted; `journal_size_limit` truncates a
-    /// restarted log back to it.
-    pub limit: u64,
-    /// At most one restart attempt per this long.
-    pub min_gap: Duration,
-    /// How long one attempt waits for readers that began before it (total, not per reader).
-    pub busy_wait: Duration,
-}
-
-impl Default for WalPolicy {
-    fn default() -> Self {
-        Self {
-            limit: 64 * 1024 * 1024,
-            min_gap: Duration::from_secs(2),
-            busy_wait: Duration::from_millis(100),
-        }
-    }
-}
-
-/// What one look at the log came to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WalCheck {
-    /// Under the limit, or tried less than `min_gap` ago.
-    NotDue,
-    /// The log was restarted: the next write begins at its start.
-    Restarted,
-    /// A reader still used the log, or the checkpoint failed; the next opportunity retries.
-    Skipped,
-}
-
-/// The writer's checkpoint bookkeeping.
-pub(crate) struct WalKeeper {
-    policy: WalPolicy,
-    wal: std::path::PathBuf,
-    last_try: Option<Instant>,
-}
-
-/// The busy timeout every connection has (`alice_core::store`); restored after an attempt.
-const NORMAL_BUSY: Duration = Duration::from_millis(5_000);
-
-impl WalKeeper {
-    /// Applies `journal_size_limit` to `conn` and remembers where its log lives.
-    pub(crate) fn new(conn: &Connection, policy: WalPolicy) -> Self {
-        let limit = i64::try_from(policy.limit).unwrap_or(i64::MAX);
-        if let Err(e) = conn.execute_batch(&format!("PRAGMA journal_size_limit = {limit};")) {
-            tracing::warn!(error = %e, "journal_size_limit was not set");
-        }
-        let mut wal = conn
-            .path()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .into_os_string();
-        wal.push("-wal");
-        Self {
-            policy,
-            wal: wal.into(),
-            last_try: None,
-        }
-    }
-
-    /// Restart the log if it is over the limit and the last attempt is old enough. Call it
-    /// only between transactions. It waits for readers at most `busy_wait` and never fails.
-    pub(crate) fn check(&mut self, conn: &Connection, now: Instant) -> WalCheck {
-        if self
-            .last_try
-            .is_some_and(|t| now.duration_since(t) < self.policy.min_gap)
-        {
-            return WalCheck::NotDue;
-        }
-        let len = std::fs::metadata(&self.wal).map(|m| m.len()).unwrap_or(0);
-        if len <= self.policy.limit {
-            return WalCheck::NotDue;
-        }
-        self.last_try = Some(now);
-        let _ = conn.busy_timeout(self.policy.busy_wait);
-        // (busy, frames in the log, frames checkpointed); busy = 1: a reader kept it from finishing.
-        let r = conn.query_row("PRAGMA wal_checkpoint(RESTART)", [], |r| r.get::<_, i64>(0));
-        let _ = conn.busy_timeout(NORMAL_BUSY);
-        match r {
-            Ok(0) => WalCheck::Restarted,
-            Ok(_) => WalCheck::Skipped,
-            Err(e) => {
-                tracing::debug!(error = %e, "wal restart skipped");
-                WalCheck::Skipped
-            }
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub enum ProjectChoice {
@@ -5382,43 +5286,5 @@ mod tests {
         f.h.submit_blocking(remember("and one more")).unwrap();
         let n: i64 = f.read("SELECT count(*) FROM memories", []);
         assert_eq!(n, 8);
-    }
-
-    #[test]
-    fn the_keeper_reports_what_it_did() {
-        let d = tempfile::tempdir().unwrap();
-        let conn = open(d.path());
-        let policy = WalPolicy {
-            limit: 1,
-            min_gap: Duration::from_secs(2),
-            busy_wait: Duration::from_millis(50),
-        };
-        let mut keeper = WalKeeper::new(&conn, policy);
-        let t0 = Instant::now();
-        conn.execute_batch("INSERT INTO meta (key, value) VALUES ('k', 'v')")
-            .unwrap();
-        assert!(wal_bytes(&d.path().join("a.db")) > 1);
-        // A reader pinned to the log: the attempt is skipped.
-        let held = alice_core::store::open_reader(&d.path().join("a.db")).unwrap();
-        held.execute_batch("BEGIN").unwrap();
-        let _: i64 = held
-            .query_row("SELECT count(*) FROM meta", [], |r| r.get(0))
-            .unwrap();
-        conn.execute_batch("INSERT INTO meta (key, value) VALUES ('k2', 'v')")
-            .unwrap();
-        assert_eq!(keeper.check(&conn, t0), WalCheck::Skipped);
-        // Tried a moment ago: not due, however large the log is.
-        assert_eq!(
-            keeper.check(&conn, t0 + Duration::from_secs(1)),
-            WalCheck::NotDue
-        );
-        held.execute_batch("COMMIT").unwrap();
-        assert_eq!(
-            keeper.check(&conn, t0 + Duration::from_secs(3)),
-            WalCheck::Restarted
-        );
-        // The writer's own transactions are still fine afterwards.
-        conn.execute_batch("INSERT INTO meta (key, value) VALUES ('k3', 'v')")
-            .unwrap();
     }
 }
