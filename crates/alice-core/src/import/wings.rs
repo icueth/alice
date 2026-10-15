@@ -1,6 +1,24 @@
 //! Mapping MemPalace wings (and transcript folders) to Alice projects.
 //!
 //! The rules are data-driven: they use the palace's own wing list, so they work on any palace.
+//!
+//! A diary picks its project by these rules (`WingMap::decide_diary`), first match wins, and
+//! none reads more of the drawer text than the existing 4,000-character project-name scan:
+//! 1. `--map-wing` always wins.
+//! 2. Its topic equals a known project slug or starts with `<slug>-` (longest slug), unless the wing's
+//!    own project already contains that slug as whole tokens (`alice` in `project-alice`).
+//! 3. A project wing names its project.
+//! 4. An agent wing whose name ends in a known project slug (`wing_claude_code_pgai`) names it.
+//! 5. Otherwise as for any drawer: transcript folder, project named in the text, `global`.
+//!
+//! Rules 2 and 4 only trust an established project: its wings hold at least `ESTABLISHED_DRAWERS`
+//! drawers in total, or one of its wings is named by `--map-wing`. Rule 2 knows a project by its
+//! slug and by the spellings of its wings; rule 4 needs a slug of at least 4 characters with an
+//! ASCII letter or digit that is not made only of generic agent-name words (`code`, `claude`...).
+//!
+//! `test` is never a project inferred for a diary (topic, agent wing or text); only a diary
+//! filed in the `test` wing itself follows it. Auto-save diaries (topic `checkpoint`) follow
+//! the same rules; their weight is set in `plan.rs`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -27,6 +45,10 @@ pub enum Via {
     Override,
     TranscriptPath,
     Inferred,
+    /// A diary whose own topic names a known project.
+    Topic,
+    /// A diary in an agent wing whose name ends in a known project.
+    AgentWing,
     Global,
 }
 
@@ -38,6 +60,16 @@ pub struct ProjectDecision {
 }
 
 const GLOBAL: &str = "global";
+/// A common word that is also a wing name: never a project inferred for a diary.
+const NEVER_FROM_A_DIARY: &str = "test";
+/// A project is established (trusted by the diary topic and agent-wing rules) when its wings
+/// hold at least this many drawers in all, or a wing of it is named by `--map-wing`.
+pub const ESTABLISHED_DRAWERS: u64 = 15;
+/// Words of common agent wing names (`wing_claude_code`, `wing_general_purpose`...): a project
+/// named only of these is never taken from the end of an agent wing's name.
+const GENERIC_AGENT_WORDS: [&str; 9] = [
+    "code", "claude", "codex", "opus", "fable", "general", "purpose", "lead", "reviewer",
+];
 const INFER_WINDOW_CHARS: usize = 4_000;
 /// Slugs shorter than this are never matched by content or by transcript-folder suffix.
 const MIN_MATCH_SLUG_CHARS: usize = 4;
@@ -52,6 +84,10 @@ pub struct WingMap {
     plain_canons: BTreeSet<String>,
     /// (raw key, canon of key, project slug) from `--map-wing`.
     overrides: Vec<(String, String, String)>,
+    /// slug -> drawers in all its wings (transcript-derived projects have none).
+    weight: BTreeMap<String, u64>,
+    /// Projects with a wing named by `--map-wing`.
+    explicit: BTreeSet<String>,
 }
 
 fn canon(w: &str) -> String {
@@ -89,11 +125,17 @@ impl WingMap {
             projects: BTreeMap::new(),
             plain_canons,
             overrides,
+            weight: BTreeMap::new(),
+            explicit: BTreeSet::new(),
         };
-        for (w, _) in wings {
+        for (w, n) in wings {
             let (t, via) = map.classify(w);
             if let WingTarget::Project { slug } = &t {
                 add_wing(&mut map.projects, slug, w);
+                *map.weight.entry(slug.clone()).or_default() += n;
+                if via == Via::Override {
+                    map.explicit.insert(slug.clone());
+                }
             }
             map.table.insert(w.clone(), (t, via));
         }
@@ -171,6 +213,118 @@ impl WingMap {
     }
 
     pub fn decide(&self, meta: &DrawerMeta, text: &str) -> ProjectDecision {
+        self.decide_with(meta, text, false)
+    }
+
+    /// `decide` for a diary, whose topic and agent wing carry project signals a plain drawer lacks.
+    /// Rules, first match wins (`--map-wing` always wins; `test` is never inferred):
+    /// 1. the diary's topic equals a known project slug, or starts with `<slug>-`: that project (longest slug),
+    ///    unless the wing's own project already contains that slug as whole tokens (`alice` in `project-alice`);
+    /// 2. otherwise a project wing names the project (as for any drawer);
+    /// 3. otherwise an agent wing whose name ends in a known project slug (`wing_claude_code_pgai`) names it;
+    /// 4. otherwise the transcript folder, then the drawer text, then `global` (as for any drawer), never `test`.
+    pub fn decide_diary(&self, meta: &DrawerMeta, text: &str) -> ProjectDecision {
+        let (target, via) = match self.table.get(&meta.wing) {
+            Some(x) => x.clone(),
+            None => self.classify(&meta.wing),
+        };
+        if via == Via::Override {
+            return self.decide(meta, text);
+        }
+        let agent = match &target {
+            WingTarget::Agent { agent } => Some(agent.clone()),
+            _ => None,
+        };
+        let wing_project = match &target {
+            WingTarget::Project { slug } => Some(slug.as_str()),
+            _ => None,
+        };
+        if let Some(slug) = meta
+            .topic
+            .as_deref()
+            .and_then(|t| self.project_for_topic(t))
+            && !wing_project.is_some_and(|w| contains_tokens(w, &slug))
+        {
+            return ProjectDecision {
+                slug,
+                via: Via::Topic,
+                agent,
+            };
+        }
+        if wing_project.is_none()
+            && let WingTarget::Agent { agent: a } = &target
+            && let Some(slug) = self.project_for_agent_wing(a)
+        {
+            return ProjectDecision {
+                slug,
+                via: Via::AgentWing,
+                agent: Some(a.clone()),
+            };
+        }
+        self.decide_with(meta, text, true)
+    }
+
+    /// The established project (not `test`) with the longest name (≥ 4 characters: its slug or
+    /// the spelling of one of its wings) that the topic equals or starts with.
+    fn project_for_topic(&self, topic: &str) -> Option<String> {
+        let t = slugify(topic);
+        self.known_slugs()
+            .filter_map(|slug| {
+                let best = self
+                    .names_of(slug)
+                    .into_iter()
+                    .filter(|n| t == *n || t.starts_with(&format!("{n}-")))
+                    .map(|n| n.len())
+                    .max()?;
+                Some((best, slug))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, slug)| slug.clone())
+    }
+
+    /// The slug and the canon of every wing spelling of a project, each ≥ 4 characters.
+    fn names_of(&self, slug: &str) -> BTreeSet<String> {
+        let mut names = BTreeSet::from([slug.to_string()]);
+        for w in self.projects.get(slug).into_iter().flatten() {
+            if !w.starts_with("transcript:") {
+                names.insert(canon(w));
+            }
+        }
+        names
+            .into_iter()
+            .filter(|n| n.chars().count() >= MIN_MATCH_SLUG_CHARS && n != NEVER_FROM_A_DIARY)
+            .collect()
+    }
+
+    /// Whether the diary rules may trust `slug`: see [`ESTABLISHED_DRAWERS`].
+    fn is_established(&self, slug: &str) -> bool {
+        self.explicit.contains(slug)
+            || self.weight.get(slug).copied().unwrap_or(0) >= ESTABLISHED_DRAWERS
+    }
+
+    /// Longest established project slug that ends the agent-wing name at a token boundary (`pgai` = `pg-ai`).
+    fn project_for_agent_wing(&self, agent: &str) -> Option<String> {
+        let toks: Vec<&str> = agent.split(['-', '_']).filter(|t| !t.is_empty()).collect();
+        self.known_slugs()
+            .filter(|s| {
+                let want = compact(s);
+                !want.is_empty()
+                    && !s.split('-').all(|t| GENERIC_AGENT_WORDS.contains(&t))
+                    && (0..toks.len()).any(|i| compact(&toks[i..].join("")) == want)
+            })
+            .max_by_key(|s| s.len())
+            .cloned()
+    }
+
+    fn known_slugs(&self) -> impl Iterator<Item = &String> {
+        self.projects.keys().filter(|s| {
+            s.chars().count() >= MIN_MATCH_SLUG_CHARS
+                && s.as_str() != NEVER_FROM_A_DIARY
+                && self.is_established(s)
+        })
+    }
+
+    fn decide_with(&self, meta: &DrawerMeta, text: &str, diary: bool) -> ProjectDecision {
         let (target, via) = match self.table.get(&meta.wing) {
             Some(x) => x.clone(),
             None => self.classify(&meta.wing),
@@ -197,7 +351,7 @@ impl WingMap {
             return decision(slug, Via::TranscriptPath);
         }
         if !matches!(target, WingTarget::Unnamed)
-            && let Some(slug) = self.infer(text)
+            && let Some(slug) = self.infer(text, diary)
         {
             return decision(slug, Via::Inferred);
         }
@@ -206,13 +360,14 @@ impl WingMap {
 
     /// Known project (≥ 4 characters) whose spellings occur most often as whole tokens in the
     /// first 4,000 characters; a tie or no hit gives `None`.
-    fn infer(&self, text: &str) -> Option<String> {
+    fn infer(&self, text: &str, diary: bool) -> Option<String> {
         let head: String = text.chars().take(INFER_WINDOW_CHARS).collect();
         let head = head.to_lowercase();
         let mut best: Option<(&str, usize)> = None;
         let mut tied = false;
         for slug in self.projects.keys() {
-            if slug.chars().count() < MIN_MATCH_SLUG_CHARS {
+            if slug.chars().count() < MIN_MATCH_SLUG_CHARS || (diary && slug == NEVER_FROM_A_DIARY)
+            {
                 continue;
             }
             let spellings: BTreeSet<String> =
@@ -253,8 +408,9 @@ impl WingMap {
         derived_slug(&tokens)
     }
 
-    /// Called by the survey for each transcript path: a folder that decodes to a project nobody
-    /// named adds that project (wing spelling `transcript:<folder>`).
+    /// Called by the survey for each transcript chunk: a folder that decodes to a project nobody
+    /// named adds that project (wing spelling `transcript:<folder>`), and every chunk adds one
+    /// to the weight of the project (see [`ESTABLISHED_DRAWERS`]).
     pub fn note_transcript_dir(&mut self, source_file: &str) {
         let (Some(folder), Some(slug)) = (
             transcript_folder(source_file),
@@ -262,10 +418,22 @@ impl WingMap {
         ) else {
             return;
         };
+        *self.weight.entry(slug.clone()).or_default() += 1;
         if !self.projects.contains_key(&slug) {
             add_wing(&mut self.projects, &slug, &format!("transcript:{folder}"));
         }
     }
+}
+
+fn compact(s: &str) -> String {
+    s.chars().filter(char::is_ascii_alphanumeric).collect()
+}
+
+/// Whether `needle`'s hyphen-separated tokens occur as a contiguous run inside `hay`'s.
+fn contains_tokens(hay: &str, needle: &str) -> bool {
+    let h: Vec<&str> = hay.split('-').collect();
+    let n: Vec<&str> = needle.split('-').collect();
+    h.windows(n.len()).any(|w| w == n.as_slice())
 }
 
 fn is_transcript(source_file: &str) -> bool {
@@ -595,5 +763,215 @@ mod tests {
         );
         assert_eq!(d.slug, "global");
         assert_eq!(d.via, Via::Global);
+    }
+
+    // ---- diary inference ----
+
+    fn diary(wing: &str, topic: &str) -> DrawerMeta {
+        DrawerMeta {
+            wing: wing.into(),
+            room: "diary".into(),
+            topic: Some(topic.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Wings with `n` drawers each.
+    fn sized(ws: &[&str], n: u64) -> Vec<(String, u64)> {
+        ws.iter().map(|w| (w.to_string(), n)).collect()
+    }
+
+    fn diary_map() -> WingMap {
+        let mut wings = sized(
+            &[
+                "tara_valley",
+                "tara-stock-market",
+                "tara_stock",
+                "alice",
+                "project-alice",
+                "pg-ai",
+                "devspace",
+                "sessions",
+                "wing_claude_code",
+                "wing_claude_code_pgai",
+                "wing_project_alice_m3",
+            ],
+            ESTABLISHED_DRAWERS,
+        );
+        wings.push(("test".into(), 1));
+        let mut m = WingMap::build(&wings, &Default::default());
+        m.note_transcript_dir("/h/.claude/projects/-Users-me-Code-AI-project-alice-m3/s.jsonl");
+        m
+    }
+
+    #[test]
+    fn a_diary_topic_naming_a_known_project_beats_the_wing_default() {
+        let m = diary_map();
+        // `tara_valley` is a project wing, but this diary is about tara-stock-market.
+        let d = m.decide_diary(&diary("tara_valley", "tara-stock-market"), "x");
+        assert_eq!((d.slug.as_str(), d.via), ("tara-stock-market", Via::Topic));
+        // Longest slug wins and a topic that merely starts with the slug counts.
+        let d = m.decide_diary(&diary("wing_claude_code", "tara-stock-market-m2"), "x");
+        assert_eq!(d.slug, "tara-stock-market");
+        let d = m.decide_diary(&diary("wing_claude_code", "devspace-chat-tabs"), "x");
+        assert_eq!((d.slug.as_str(), d.via), ("devspace", Via::Topic));
+        // The topic must be the slug or start with `<slug>-`: a longer word is no match.
+        let d = m.decide_diary(&diary("wing_claude_code", "devspaces-notes"), "x");
+        assert_eq!(d.slug, "global");
+        // The wing's own topic about itself changes nothing.
+        let d = m.decide_diary(&diary("tara_valley", "tara-valley-sales"), "x");
+        assert_eq!(d.slug, "tara-valley");
+    }
+
+    #[test]
+    fn a_topic_naming_part_of_the_wings_own_project_does_not_move_the_diary() {
+        let m = diary_map();
+        let d = m.decide_diary(&diary("wing_project_alice", "alice-m1-task14"), "x");
+        assert_eq!(d.slug, "project-alice");
+        // Without that wing the same topic does name `alice`.
+        let d = m.decide_diary(&diary("wing_claude_code", "alice-design"), "x");
+        assert_eq!((d.slug.as_str(), d.via), ("alice", Via::Topic));
+        let d = m.decide_diary(&diary("memory_vault", "alice-design"), "x");
+        assert_eq!(d.slug, "alice");
+    }
+
+    #[test]
+    fn an_agent_wing_ending_in_a_known_project_names_it() {
+        let m = diary_map();
+        let d = m.decide_diary(&diary("wing_claude_code_pgai", "checkpoint"), "x");
+        assert_eq!((d.slug.as_str(), d.via), ("pg-ai", Via::AgentWing));
+        assert_eq!(d.agent.as_deref(), Some("claude-code-pgai"));
+        // A project known only from a few transcript chunks has no weight: not trusted here...
+        let d = m.decide_diary(&diary("wing_project_alice_m3", "checkpoint"), "x");
+        assert_eq!(d.slug, "global");
+        // ...and with enough chunks it is.
+        let mut m = m;
+        for _ in 0..ESTABLISHED_DRAWERS {
+            m.note_transcript_dir("/h/.claude/projects/-Users-me-Code-AI-project-alice-m3/s.jsonl");
+        }
+        let d = m.decide_diary(&diary("wing_project_alice_m3", "checkpoint"), "x");
+        assert_eq!(d.slug, "project-alice-m3");
+        // Not at a token boundary: no match.
+        let d = m.decide_diary(&diary("wing_claude_code", "checkpoint"), "x");
+        assert_eq!(d.slug, "global");
+    }
+
+    #[test]
+    fn test_is_never_a_project_inferred_for_a_diary() {
+        let m = diary_map();
+        let text = "ran the test suite, then another test, test test";
+        // Text inference would pick `test` for an ordinary drawer...
+        let plain = DrawerMeta {
+            wing: "wing_claude_code".into(),
+            ..Default::default()
+        };
+        assert_eq!(m.decide(&plain, text).slug, "test");
+        // ...but not for a diary, by text or by topic.
+        let d = m.decide_diary(&diary("wing_claude_code", "deployment"), text);
+        assert_eq!(d.slug, "global");
+        let d = m.decide_diary(&diary("wing_claude_code", "test-run"), "x");
+        assert_eq!(d.slug, "global");
+        // A diary filed in the `test` wing itself still follows that wing.
+        assert_eq!(
+            m.decide_diary(&diary("test", "deployment"), text).slug,
+            "test"
+        );
+    }
+
+    #[test]
+    fn map_wing_still_beats_every_diary_rule() {
+        let ov: BTreeMap<String, String> = [("tara_valley".to_string(), "farm".to_string())].into();
+        let m = WingMap::build(&counts(&["tara_valley", "tara-stock-market"]), &ov);
+        let d = m.decide_diary(&diary("tara_valley", "tara-stock-market"), "x");
+        assert_eq!((d.slug.as_str(), d.via), ("farm", Via::Override));
+    }
+
+    #[test]
+    fn a_tiny_project_does_not_capture_diaries_by_topic() {
+        let mut wings = sized(&["pg-ai", "wing_claude_code"], 500);
+        wings.extend([
+            ("docs".into(), 3),
+            ("demo".into(), 1),
+            ("notes".into(), ESTABLISHED_DRAWERS - 1),
+        ]);
+        let m = WingMap::build(&wings, &Default::default());
+        for topic in ["docs", "docs-update", "demo-run", "notes-x"] {
+            let d = m.decide_diary(&diary("wing_claude_code", topic), "x");
+            assert_eq!(d.slug, "global", "{topic}");
+        }
+        // The same project with enough drawers is trusted; so is an explicit `--map-wing`.
+        wings[4].1 = ESTABLISHED_DRAWERS;
+        let m = WingMap::build(&wings, &Default::default());
+        let d = m.decide_diary(&diary("wing_claude_code", "demo-run"), "x");
+        assert_eq!(d.slug, "global", "demo is still tiny");
+        let d = m.decide_diary(&diary("wing_claude_code", "notes-x"), "x");
+        assert_eq!((d.slug.as_str(), d.via), ("notes", Via::Topic));
+        let ov: BTreeMap<String, String> = [("demo".to_string(), "demo".to_string())].into();
+        let m = WingMap::build(&wings, &ov);
+        let d = m.decide_diary(&diary("wing_claude_code", "demo-run"), "x");
+        assert_eq!((d.slug.as_str(), d.via), ("demo", Via::Topic));
+    }
+
+    #[test]
+    fn a_topic_may_name_a_project_by_the_spelling_of_one_of_its_wings() {
+        let mut wings = sized(&["games-platform", "wing_claude_code"], 300);
+        wings.push(("slotgames".into(), 5));
+        let ov: BTreeMap<String, String> =
+            [("slotgames".to_string(), "games-platform".to_string())].into();
+        let m = WingMap::build(&wings, &ov);
+        let d = m.decide_diary(&diary("wing_claude_code", "slotgames-reels"), "x");
+        assert_eq!((d.slug.as_str(), d.via), ("games-platform", Via::Topic));
+        // Without the mapping the spelling is its own tiny project: no capture.
+        let m = WingMap::build(&wings, &Default::default());
+        let d = m.decide_diary(&diary("wing_claude_code", "slotgames-reels"), "x");
+        assert_eq!(d.slug, "global");
+    }
+
+    #[test]
+    fn the_agent_wing_suffix_rule_skips_generic_junk_and_unspellable_slugs() {
+        let wings = sized(
+            &[
+                "code",
+                "lead",
+                "reviewer",
+                "purpose",
+                "opus",
+                "ไทย",
+                "app",
+                "pg-ai",
+                "wing_claude_code",
+                "wing_claude_code_lead",
+                "wing_general_purpose",
+                "wing_the_reviewer",
+                "wing_x_opus",
+                "wing_a_lead_ไทย",
+                "wing_x_app",
+                "wing_claude_code_pgai",
+            ],
+            500,
+        );
+        let m = WingMap::build(&wings, &Default::default());
+        for w in [
+            "wing_claude_code",
+            "wing_claude_code_lead",
+            "wing_general_purpose",
+            "wing_the_reviewer",
+            "wing_x_opus",
+            "wing_a_lead_ไทย",
+            "wing_x_app",
+        ] {
+            let d = m.decide_diary(&diary(w, "checkpoint"), "x");
+            assert_eq!(d.slug, "global", "{w}");
+        }
+        // A real project still works on the same map.
+        let d = m.decide_diary(&diary("wing_claude_code_pgai", "checkpoint"), "x");
+        assert_eq!((d.slug.as_str(), d.via), ("pg-ai", Via::AgentWing));
+        // A tiny project is not trusted by the suffix rule either.
+        let m = WingMap::build(
+            &[("zebra".into(), 2), ("wing_claude_zebra".into(), 9)],
+            &Default::default(),
+        );
+        let d = m.decide_diary(&diary("wing_claude_zebra", "checkpoint"), "x");
+        assert_eq!(d.slug, "global");
     }
 }

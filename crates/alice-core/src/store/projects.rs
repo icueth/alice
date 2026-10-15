@@ -57,10 +57,26 @@ fn slug_taken(conn: &Connection, s: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// A project reached through the key of one merged into it takes the live working tree as its
+/// root only when it has none: the project keeps the root of its own checkout otherwise.
+fn adopt_root(
+    conn: &Connection,
+    found: ResolvedProject,
+    p: &ProjectRef,
+) -> Result<ResolvedProject> {
+    if let Some(root) = p.root.as_ref().filter(|r| r.exists()) {
+        conn.execute(
+            "UPDATE projects SET root_path = ?1 WHERE id = ?2 AND root_path IS NULL",
+            params![root.to_string_lossy(), found.id],
+        )?;
+    }
+    Ok(found)
+}
+
 /// Insert the project if its key is new; returns the stored project either way.
 /// A slug already in use gets a suffix from the key's hash, lengthened until it is free.
 pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProject> {
-    if let Some(found) = find_by_key(conn, &p.key)? {
+    if let Some(found) = find_by_own_key(conn, &p.key)? {
         // The working tree may have moved (a re-clone, a new worktree): the rules of its
         // `.alice.toml` are read from the live root, so a root that exists replaces the stored one.
         if let Some(root) = p.root.as_ref().filter(|r| r.exists()) {
@@ -72,6 +88,10 @@ pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProje
         }
         return Ok(found);
     }
+    // The key of a project that was merged into another now names that one.
+    if let Some(found) = find_by_key_alias(conn, &p.key)? {
+        return adopt_root(conn, found, p);
+    }
     let base = slugify(&p.slug);
     if base.is_empty() {
         return Err(AliceError::invalid(format!(
@@ -80,18 +100,13 @@ pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProje
         )));
     }
     if !p.key.starts_with(PLACEHOLDER_KEY_PREFIX) {
+        // A placeholder of this slug that was merged into another project: the real project
+        // is that other one (the placeholder row is gone, its key still resolves).
+        if let Some(found) = find_by_key_alias(conn, &format!("{PLACEHOLDER_KEY_PREFIX}{base}"))? {
+            return adopt_root(conn, found, p);
+        }
         // A real project adopts the placeholder of the same slug (or an alias equal to it).
-        let placeholder: Option<ResolvedProject> = conn
-            .query_row(
-                "SELECT id, slug, name FROM projects WHERE slug = ?1 AND key LIKE 'import:%'
-                 UNION ALL
-                 SELECT p.id, p.slug, p.name FROM project_aliases a JOIN projects p ON p.id = a.project_id
-                  WHERE a.alias = ?1 AND p.key LIKE 'import:%'
-                 LIMIT 1",
-                [&base],
-                row,
-            )
-            .optional()?;
+        let placeholder = placeholder_candidates(conn, &base)?.into_iter().next();
         if let Some(found) = placeholder {
             let root = p
                 .root
@@ -148,6 +163,62 @@ pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProje
     })
 }
 
+/// The placeholder projects (key `import:…`) whose slug, or one of whose aliases, is `base` (an
+/// already-slugified string), oldest first. What a real project of that slug adopts when it is
+/// first written, and what a read from a not-yet-stored checkout of that slug may use.
+fn placeholder_candidates(conn: &Connection, base: &str) -> Result<Vec<ResolvedProject>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, name FROM (
+             SELECT p.id AS id, p.slug AS slug, p.name AS name, p.created_at AS created_at
+               FROM projects p WHERE p.slug = ?1 AND p.key LIKE 'import:%'
+             UNION
+             SELECT p.id, p.slug, p.name, p.created_at
+               FROM project_aliases a JOIN projects p ON p.id = a.project_id
+              WHERE a.alias = ?1 AND p.key LIKE 'import:%'
+         ) ORDER BY created_at, id",
+    )?;
+    let found = stmt
+        .query_map([base], row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(found)
+}
+
+/// What a read from a checkout whose project `p` was detected (not named) works with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetectedForRead {
+    /// The detected project is stored.
+    Stored(ResolvedProject),
+    /// It is not stored, and exactly one stored project is what a write from here would adopt
+    /// (an import placeholder of the same slug or alias, or the project a placeholder of that
+    /// slug was merged into).
+    Placeholder(ResolvedProject),
+    /// Several placeholders match: none is guessed. Their slugs.
+    Ambiguous(Vec<String>),
+    /// Nothing stored matches: the project is only known by what was detected.
+    Unstored,
+}
+
+/// Resolve a detected project for a read, without creating anything. Uses the matching of
+/// [`upsert_project`]'s adoption, so a read and the first write agree on the project.
+pub fn detected_for_read(conn: &Connection, p: &ProjectRef) -> Result<DetectedForRead> {
+    if let Some(found) = find_by_key(conn, &p.key)? {
+        return Ok(DetectedForRead::Stored(found));
+    }
+    let base = slugify(&p.slug);
+    if base.is_empty() || p.key.starts_with(PLACEHOLDER_KEY_PREFIX) {
+        return Ok(DetectedForRead::Unstored);
+    }
+    if let Some(found) = find_by_key_alias(conn, &format!("{PLACEHOLDER_KEY_PREFIX}{base}"))? {
+        return Ok(DetectedForRead::Placeholder(found));
+    }
+    let mut found = placeholder_candidates(conn, &base)?;
+    Ok(match found.len() {
+        0 => DetectedForRead::Unstored,
+        1 => DetectedForRead::Placeholder(found.remove(0)),
+        _ => DetectedForRead::Ambiguous(found.into_iter().map(|f| f.slug).collect()),
+    })
+}
+
 /// Resolve a slug or any registered alias (case and separator insensitive).
 pub fn resolve_slug(conn: &Connection, slug_or_alias: &str) -> Result<Option<ResolvedProject>> {
     let s = slugify(slug_or_alias);
@@ -189,8 +260,8 @@ pub fn add_alias(conn: &Connection, alias: &str, project_id: &str) -> Result<()>
     Ok(())
 }
 
-/// Look up a project by its stable key without creating it (read paths).
-pub fn find_by_key(conn: &Connection, key: &str) -> Result<Option<ResolvedProject>> {
+/// The project whose own key this is (not through a merge).
+fn find_by_own_key(conn: &Connection, key: &str) -> Result<Option<ResolvedProject>> {
     Ok(conn
         .query_row(
             "SELECT id, slug, name FROM projects WHERE key = ?1",
@@ -198,6 +269,26 @@ pub fn find_by_key(conn: &Connection, key: &str) -> Result<Option<ResolvedProjec
             row,
         )
         .optional()?)
+}
+
+/// The project that a merged project's key now names.
+fn find_by_key_alias(conn: &Connection, key: &str) -> Result<Option<ResolvedProject>> {
+    Ok(conn
+        .query_row(
+            "SELECT p.id, p.slug, p.name FROM project_key_aliases a JOIN projects p ON p.id = a.project_id WHERE a.key = ?1",
+            [key],
+            row,
+        )
+        .optional()?)
+}
+
+/// Look up a project by its stable key without creating it (read paths). The key of a project
+/// that was merged into another finds that other project.
+pub fn find_by_key(conn: &Connection, key: &str) -> Result<Option<ResolvedProject>> {
+    match find_by_own_key(conn, key)? {
+        Some(p) => Ok(Some(p)),
+        None => find_by_key_alias(conn, key),
+    }
 }
 
 /// The working-tree root a project was detected from, if it has one. `project_id_or_slug` is
@@ -326,6 +417,55 @@ mod tests {
         let adopted =
             upsert_project(&conn, &pref("github.com/icueth/alice", "project-alice")).unwrap();
         assert_eq!(adopted.id, imported.id, "no project-alice-<hash> twin");
+    }
+
+    #[test]
+    fn a_read_finds_the_placeholder_a_write_would_adopt_and_never_writes() {
+        let (_d, c) = conn();
+        let real = pref("github.com/icueth/pg-ai", "pg-ai");
+        assert_eq!(
+            detected_for_read(&c, &real).unwrap(),
+            DetectedForRead::Unstored
+        );
+        let imported = upsert_project(&c, &pref("import:pg-ai", "pg-ai")).unwrap();
+        let count = || -> i64 {
+            c.query_row("SELECT count(*) FROM projects", [], |r| r.get(0))
+                .unwrap()
+        };
+        let n = count();
+        assert_eq!(
+            detected_for_read(&c, &real).unwrap(),
+            DetectedForRead::Placeholder(imported.clone())
+        );
+        // An alias equal to the detected slug counts, as it does for adoption.
+        let other = upsert_project(&c, &pref("import:old", "old")).unwrap();
+        add_alias(&c, "pg-ai-checkout", &other.id).unwrap();
+        assert_eq!(
+            detected_for_read(&c, &pref("k/x", "pg-ai-checkout")).unwrap(),
+            DetectedForRead::Placeholder(other.clone())
+        );
+        assert_eq!(count(), n + 1, "reads create nothing");
+        // Two placeholders answering to the name: none is chosen.
+        c.execute(
+            "INSERT INTO project_aliases (alias, project_id) VALUES ('pg-ai', ?1)",
+            [&other.id],
+        )
+        .unwrap();
+        assert!(matches!(
+            detected_for_read(&c, &real).unwrap(),
+            DetectedForRead::Ambiguous(v) if v.len() == 2
+        ));
+        // A real project is never a placeholder, and a stored detected key wins.
+        let stored = upsert_project(&c, &pref("path:/x/solid", "solid")).unwrap();
+        assert_eq!(
+            detected_for_read(&c, &pref("path:/x/solid", "pg-ai")).unwrap(),
+            DetectedForRead::Stored(stored)
+        );
+        assert_eq!(
+            detected_for_read(&c, &pref("import:zzz", "pg-ai")).unwrap(),
+            DetectedForRead::Unstored,
+            "a placeholder key is not a checkout"
+        );
     }
 
     #[test]

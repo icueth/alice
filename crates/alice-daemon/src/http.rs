@@ -341,6 +341,12 @@ fn clear_wire_hint(svc: &Service, hint: &mut Option<String>) {
     }
 }
 
+async fn merge_projects(
+    State(st): State<AppState>,
+    ApiJson(req): ApiJson<alice_core::api::ProjectMergeRequest>,
+) -> ApiResult<alice_core::api::ProjectMergeResponse> {
+    Ok(Json(st.svc.merge_projects(req).await?))
+}
 /// A read-only database never loses a `remember`: it is spooled (202) and applied after repair.
 async fn remember(
     State(st): State<AppState>,
@@ -821,6 +827,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/health", get(health))
         .route("/api/v1/doctor", get(doctor))
         .route("/api/v1/projects", get(projects))
+        .route("/api/v1/projects/merge", post(merge_projects))
         .route("/api/v1/remember", post(remember))
         .route("/api/v1/recall", post(recall))
         .route("/api/v1/context", post(context))

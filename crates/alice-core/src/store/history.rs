@@ -8,7 +8,7 @@ use crate::normalize::content_hash;
 use crate::redact::Redactor;
 use crate::store::events::{self, Actor, EventInput, EventRow};
 use crate::store::reviews::{self, NewReview, ReviewType};
-use crate::store::{fts, kg, memories};
+use crate::store::{fts, kg, memories, project_merge};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -131,6 +131,8 @@ enum Target {
     Relation,
     /// A predicate mapping: the vocabulary rows and relations it touched.
     Predicate,
+    /// A project merge (`project.merge`): see [`project_merge`].
+    Project,
 }
 
 /// Undo knows memories and relations; any other target type is refused as such.
@@ -139,8 +141,9 @@ fn target_kind(target_type: &str) -> Result<Target> {
         "memory" => Ok(Target::Memory),
         "relation" => Ok(Target::Relation),
         "predicate" => Ok(Target::Predicate),
+        project_merge::MERGE_TARGET => Ok(Target::Project),
         other => Err(AliceError::invalid(format!(
-            "changes to a {other} cannot be undone; only memory, fact and predicate changes can"
+            "changes to a {other} cannot be undone; only memory, fact, predicate and project-merge changes can"
         ))),
     }
 }
@@ -157,6 +160,10 @@ fn current(
     match target_kind(target_type)? {
         Target::Memory => snapshot_memory(conn, id)?.map(to_json).transpose(),
         Target::Relation => snapshot_relation(conn, id)?.map(to_json).transpose(),
+        Target::Project => {
+            let Some(spec) = spec else { return Ok(None) };
+            project_merge::current_state(conn, spec).map(Some)
+        }
         Target::Predicate => {
             let Some(spec) = spec else { return Ok(None) };
             let spec: kg::PredicateSnapshot =
@@ -269,14 +276,25 @@ pub fn scrub_snapshots(
 fn restore_memory(conn: &Connection, id: &str, s: &MemorySnapshot, hlc: &str) -> Result<()> {
     let seq =
         memories::seq_of(conn, id)?.ok_or_else(|| AliceError::NotFound(format!("memory {id}")))?;
-    let slug: String = conn.query_row(
-        "SELECT slug FROM projects WHERE id = ?1",
-        [&s.project_id],
-        |r| r.get(0),
-    )?;
+    // A project merged into another is gone: its memories are in the other one now.
+    let found: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, slug FROM projects WHERE id = ?1",
+            [&s.project_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (project_id, slug) = match found {
+        Some(p) => p,
+        None => conn.query_row(
+            "SELECT p.id, p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.seq = ?1",
+            [seq],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?,
+    };
     let hash = content_hash(&slug, s.kind, &s.title, &s.body);
     if s.status != Status::Trashed {
-        memories::ensure_unique_content(conn, seq, &s.project_id, &hash).map_err(|e| match e {
+        memories::ensure_unique_content(conn, seq, &project_id, &hash).map_err(|e| match e {
             AliceError::Invalid(m) => AliceError::invalid(format!("cannot undo: {m}")),
             e => e,
         })?;
@@ -304,7 +322,7 @@ fn restore_memory(conn: &Connection, id: &str, s: &MemorySnapshot, hlc: &str) ->
             s.title,
             s.body,
             s.importance,
-            s.project_id,
+            project_id,
             hash,
             now_rfc3339(),
             hlc,
@@ -393,6 +411,8 @@ fn undoable(action: &str) -> bool {
             | "settings.change"
             | "secret.set"
             | "secret.delete"
+            // Undoing an undo would have to merge again: run `alice projects merge` instead.
+            | "undo:project.merge"
     )
 }
 
@@ -499,6 +519,11 @@ fn undo_with(
             return Err(AliceError::invalid(why));
         }
     }
+    for e in &todo {
+        if e.action == project_merge::MERGE_ACTION {
+            project_merge::check_undo_possible(conn, e)?;
+        }
+    }
     // Each target must look as its newest event in the group left it.
     let mut checked = HashSet::new();
     for e in &todo {
@@ -584,6 +609,13 @@ fn undo_with(
             (Target::Predicate, Some(b)) => {
                 let s: kg::PredicateSnapshot = serde_json::from_value(b).map_err(bad)?;
                 kg::restore_predicates(conn, &s, &h)?;
+            }
+            (Target::Project, Some(b)) => project_merge::unmerge(conn, &b, &h)?,
+            (Target::Project, None) => {
+                return Err(AliceError::invalid(format!(
+                    "event {} ({}) records no before-state for project {}; it cannot be undone",
+                    e.id, e.action, e.target_id
+                )));
             }
             (Target::Predicate, None) => {
                 return Err(AliceError::invalid(format!(

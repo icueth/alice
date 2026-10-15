@@ -415,6 +415,38 @@ pub struct UndoResponse {
     pub message: String,
 }
 
+/// Merge the project `from` into `into` (CLI and HTTP only; MCP does not offer it). With
+/// `dry_run` nothing is changed and the response says what would move.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectMergeRequest {
+    /// The project to merge away: a slug or an alias. Not `global`.
+    pub from: String,
+    /// The project that receives its memories, sources, chunks and names.
+    pub into: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub author: Author,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectMergeResponse {
+    /// Slugs of the two projects, as stored.
+    pub from: String,
+    pub into: String,
+    /// False for a dry run (nothing changed).
+    pub merged: bool,
+    pub memories: u64,
+    pub chunks: u64,
+    pub sources: u64,
+    /// Facts learned from the moved memories; they follow their memories.
+    pub facts: u64,
+    /// The event that recorded the merge: `alice undo <event_id>` reverses it.
+    pub event_id: Option<String>,
+    pub message: String,
+}
+
 /// Apply one of a review item's choices.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ResolveRequest {

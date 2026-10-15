@@ -22,6 +22,7 @@ use alice_core::store::maintenance;
 use alice_core::store::memories::{
     self, InsertOutcome, MemoryUpdate, NewMemoryInput, UpdateAction,
 };
+use alice_core::store::project_merge;
 use alice_core::store::projects::{self, ResolvedProject};
 use alice_core::store::reviews::{self, NewReview, ReviewItem, ReviewType};
 use alice_core::store::sources::{self, ChunkInput, IngestOutcome, SourceInput};
@@ -288,6 +289,13 @@ pub enum WriteOp {
     /// batch has written in the commit yet, and nothing of that kind joins it. Records one
     /// `import.batch` event; answers `Imported`.
     ImportBatch(Box<ImportBatch>),
+    /// `alice projects merge`: move everything of `from` into `into` and record the event that
+    /// undo reverses (see `store::project_merge`). One transaction, and a commit of its own.
+    MergeProjects {
+        from: String,
+        into: String,
+        actor: Actor,
+    },
     Shutdown,
 }
 
@@ -312,6 +320,8 @@ pub enum WriteOutcome {
     /// Whether a maintenance step still had work to do.
     Flag(bool),
     Imported(BatchOutcome),
+    /// A project merge: what moved, and the event that recorded it.
+    ProjectMerged(Box<(project_merge::MergeDone, String)>),
     Done,
 }
 
@@ -332,6 +342,7 @@ impl WriteOutcome {
             WriteOutcome::Count(_) => "Count",
             WriteOutcome::Flag(_) => "Flag",
             WriteOutcome::Imported(_) => "Imported",
+            WriteOutcome::ProjectMerged(_) => "ProjectMerged",
             WriteOutcome::Done => "Done",
         }
     }
@@ -1399,6 +1410,47 @@ fn import_batch(conn: &Connection, batch: Box<ImportBatch>, st: &mut State) -> R
     Ok(Applied::Done(WriteOutcome::Imported(out)))
 }
 
+/// `WriteOp::MergeProjects`: takes a commit to itself, like an import batch (it can update
+/// every row a project holds), and records one `project.merge` event.
+fn merge_projects(
+    conn: &Connection,
+    from: String,
+    into: String,
+    actor: Actor,
+    st: &mut State,
+) -> Result<Applied> {
+    let fresh = st.chunk_budget == INGEST_SLICE && st.byte_budget == INGEST_SLICE_BYTES;
+    if !fresh {
+        return Ok(Applied::More(
+            WriteOp::MergeProjects { from, into, actor },
+            None,
+        ));
+    }
+    st.chunk_budget = 0;
+    st.byte_budget = 0;
+    #[cfg(test)]
+    st.applied.push("MergeProjects");
+    let hlc = st.hlc.tick();
+    let done = project_merge::merge(conn, &from, &into, &hlc)?;
+    let event = record(
+        conn,
+        st,
+        EventInput {
+            actor: &actor,
+            action: project_merge::MERGE_ACTION,
+            target_type: project_merge::MERGE_TARGET,
+            target_id: &done.from.id,
+            before: Some(done.before.clone()),
+            after: Some(done.after.clone()),
+            group: None,
+        },
+    )?;
+    // Moved text is searched and embedded as before; only the project of the rows changed.
+    Ok(Applied::Done(WriteOutcome::ProjectMerged(Box::new((
+        done, event,
+    )))))
+}
+
 fn apply(
     conn: &Connection,
     op: WriteOp,
@@ -1588,6 +1640,9 @@ fn apply(
             None => WriteOutcome::Count(0),
         },
         WriteOp::ImportBatch(batch) => return import_batch(conn, batch, st),
+        WriteOp::MergeProjects { from, into, actor } => {
+            return merge_projects(conn, from, into, actor, st);
+        }
         WriteOp::Shutdown => WriteOutcome::Done,
     };
     Ok(Applied::Done(outcome))
@@ -2493,6 +2548,88 @@ mod tests {
                 .all(|c| !(c.contains(&"Ingest") && c.contains(&"ImportBatch"))),
             "shared a commit: {log:?}"
         );
+    }
+
+    /// A project merge can update every row of a project: it takes a commit to itself, one
+    /// event records it, and one that is refused writes nothing.
+    #[tokio::test]
+    async fn a_project_merge_never_shares_a_group_commit_and_a_refused_one_writes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let conn = open(d.path());
+        for (key, slug) in [("k/a", "a"), ("k/b", "b")] {
+            projects::upsert_project(
+                &conn,
+                &alice_core::project::ProjectRef {
+                    key: key.into(),
+                    slug: slug.into(),
+                    name: slug.into(),
+                    root: None,
+                    remote: None,
+                },
+            )
+            .unwrap();
+        }
+        let (wake_tx, _wake_rx) = crossbeam_channel::unbounded();
+        let log: CommitLog = Arc::new(Mutex::new(Vec::new()));
+        let (h, _t) = spawn_writer_logged(conn, "dev".into(), wake_tx, log.clone());
+        let ing = h.submit(WriteOp::Ingest {
+            project: ProjectChoice::Slug("a".into()),
+            source: SourceInput {
+                uri: "many".into(),
+                ..Default::default()
+            },
+            chunks: (0..200)
+                .map(|i| ChunkInput {
+                    ord: i,
+                    text: format!("short {i}"),
+                    ..Default::default()
+                })
+                .collect(),
+        });
+        let merge = |from: &str, into: &str| {
+            h.submit(WriteOp::MergeProjects {
+                from: from.into(),
+                into: into.into(),
+                actor: Actor::User,
+            })
+        };
+        let refused = merge("global", "b");
+        let ok = merge("a", "b");
+        let (ing, refused, ok) = tokio::join!(ing, refused, ok);
+        assert_eq!(ingested(ing).inserted, 200);
+        let msg = refused.unwrap_err().to_string();
+        assert!(msg.contains("global"), "{msg}");
+        let Ok(WriteOutcome::ProjectMerged(done)) = ok else {
+            panic!("merge failed")
+        };
+        let (done, event) = *done;
+        assert_eq!(done.counts.chunks, 200, "the ingest ahead of it was moved");
+        {
+            let log = log.lock();
+            assert!(log.iter().any(|c| c.contains(&"MergeProjects")), "{log:?}");
+            assert!(
+                log.iter()
+                    .all(|c| !(c.contains(&"Ingest") && c.contains(&"MergeProjects"))),
+                "shared a commit: {log:?}"
+            );
+        }
+        let c = open(d.path());
+        let merges: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE action = 'project.merge' AND id = ?1",
+                [&event],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(merges, 1);
+        let all: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE action = 'project.merge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(all, 1, "the refused merge recorded nothing");
     }
 
     #[test]

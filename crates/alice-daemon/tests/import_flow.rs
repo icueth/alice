@@ -795,6 +795,107 @@ async fn names_that_look_like_secrets_never_reach_the_status_or_the_text() {
     }
 }
 
+fn diary_spec(id: &str, text: &str, wing: &str, topic: &str) -> DrawerSpec {
+    DrawerSpec {
+        id: id.into(),
+        text: text.into(),
+        meta: DrawerMeta {
+            wing: wing.into(),
+            room: "diary".into(),
+            agent: s("claude-code"),
+            topic: s(topic),
+            date: s("2026-04-16"),
+            filed_at: s("2026-04-16T20:00:00"),
+            ..Default::default()
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diary_project_rules_and_checkpoint_weight_show_in_the_import_report_and_the_store() {
+    let mut specs = vec![
+        knowledge("k_dev", "devspace note", "devspace", "decisions"),
+        knowledge("k_tsm", "tara note", "tara-stock-market", "decisions"),
+        knowledge("k_tv", "valley note", "tara_valley", "decisions"),
+        knowledge("k_test", "a test wing note", "test", "decisions"),
+        knowledge("k_pg", "pg note", "pg_ai", "decisions"),
+        // topic names a project (the wing is another project's, or an agent wing)
+        diary_spec(
+            "diary_1",
+            "tara diary, the test suite passed",
+            "tara_valley",
+            "tara-stock-market",
+        ),
+        diary_spec(
+            "diary_2",
+            "devspace diary, test test test",
+            "wing_claude_code",
+            "devspace-chat-tabs",
+        ),
+        // agent wing ending in a project
+        diary_spec("diary_3", "pg diary one", "wing_claude_code_pgai", "setup"),
+        // text full of `test` and no other signal: global, never `test`
+        diary_spec(
+            "diary_4",
+            "test test test, more test",
+            "wing_claude_code",
+            "deployment",
+        ),
+        // auto-save checkpoints: low weight, same project rules as other diaries
+        diary_spec(
+            "diary_5",
+            "auto-save one",
+            "wing_claude_code_pgai",
+            "checkpoint",
+        ),
+        diary_spec("diary_6", "auto-save two", "wing_claude_code", "checkpoint"),
+    ];
+    specs.push(knowledge("k_x", "x note", "wing_claude_code", "knowledge"));
+    let f = Flow::with_specs(&specs).await;
+    // One-drawer wings are not trusted by the diary rules; naming them with --map-wing is.
+    let request = || ImportRequest {
+        map_wing: [
+            ("devspace", "devspace"),
+            ("tara-stock-market", "tara-stock-market"),
+            ("pg_ai", "pg-ai"),
+        ]
+        .into_iter()
+        .map(|(w, p)| (w.to_string(), p.to_string()))
+        .collect(),
+        ..f.request()
+    };
+    let st = f.run_import(request().dry_run(true)).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    // Per project: its own wing note, plus the diaries the rules send there.
+    assert_eq!(r.projects["tara-stock-market"].memories, 2);
+    assert_eq!(r.projects["tara-valley"].memories, 1);
+    assert_eq!(r.projects["devspace"].memories, 2);
+    assert_eq!(r.projects["pg-ai"].memories, 3);
+    assert_eq!(
+        r.projects["test"].memories, 1,
+        "only the `test` wing's own drawer"
+    );
+    assert_eq!(r.projects["global"].memories, 3);
+
+    let st = f.run_import(request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let row = |legacy: &str| -> (String, i64) {
+        f.db()
+            .query_row(
+                "SELECT p.slug, m.importance FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.legacy_id = ?1",
+                [legacy],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(row("diary_1"), ("tara-stock-market".to_string(), 2));
+    assert_eq!(row("diary_4"), ("global".to_string(), 2));
+    assert_eq!(row("diary_5"), ("pg-ai".to_string(), 1));
+    assert_eq!(row("diary_6"), ("global".to_string(), 1));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_joins_the_import_thread_and_the_daemon_start_sweeps_import_tmp() {
     let f = Flow::with_specs(&big_specs(30_000)).await;
@@ -1103,6 +1204,87 @@ async fn block_mode_skips_the_drawer_names_the_detector_and_keeps_going() {
     assert_eq!(f.count("memories").await, 4);
     assert_eq!(f.count("chunks").await, 79 + 30);
     assert_eq!(f.tables_holding(SECRET).await, Vec::<String>::new());
+}
+
+/// After `alice projects merge`, an import run again names the old project (a wing) and the rows
+/// land in the project it was merged into: no twin project, no rows under the old name. Drawers
+/// that were imported before are not imported again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_after_a_project_merge_lands_in_the_project_it_was_merged_into() {
+    let f = Flow::new().await;
+    let first = f.run_import(f.request()).await;
+    assert_eq!(first.state, ImportState::Done, "{:?}", first.error);
+    assert_eq!(f.project_slugs().await, vec!["devspace", "global", "pg-ai"]);
+    let memories = f.count("memories").await;
+    let chunks = f.count("chunks").await;
+    let pg = f.svc.projects().await.unwrap();
+    let pg_id = pg.iter().find(|p| p.slug == "pg-ai").unwrap().id.clone();
+
+    let merged = f
+        .svc
+        .merge_projects(alice_core::api::ProjectMergeRequest {
+            from: "devspace".into(),
+            into: "pg-ai".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(merged.merged && merged.chunks > 0, "{merged:?}");
+    assert_eq!(f.project_slugs().await, vec!["global", "pg-ai"]);
+
+    // Same palace: nothing new. A new drawer in the wing of the merged project, and one in a
+    // wing of the target, both land in `pg-ai`.
+    let second = f.run_import(f.request()).await.report.unwrap();
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
+    assert_eq!(
+        f.project_slugs().await,
+        vec!["global", "pg-ai"],
+        "no devspace twin"
+    );
+    assert_eq!(
+        (f.count("memories").await, f.count("chunks").await),
+        (memories, chunks)
+    );
+    add_drawers(
+        &f.palace,
+        &[
+            knowledge(
+                "new_k",
+                "devspace decision about the build cache",
+                "devspace",
+                "decisions",
+            ),
+            knowledge(
+                "new_p",
+                "pg-ai decision about the retry budget",
+                "pg-ai",
+                "decisions",
+            ),
+        ],
+    );
+    let third = f.run_import(f.request()).await.report.unwrap();
+    assert!(third.errors.is_empty(), "{:?}", third.errors);
+    assert_eq!(f.project_slugs().await, vec!["global", "pg-ai"]);
+    for legacy in ["new_k", "new_p"] {
+        let project: String = f
+            .db()
+            .query_row(
+                "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.legacy_id = ?1",
+                [legacy],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, "pg-ai", "{legacy}");
+    }
+    let in_target: i64 = f
+        .db()
+        .query_row(
+            "SELECT count(*) FROM chunks WHERE project_id = ?1",
+            [&pg_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(in_target >= merged.chunks as i64, "{in_target}");
 }
 
 fn add_drawers(palace: &Path, specs: &[DrawerSpec]) {

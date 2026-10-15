@@ -905,6 +905,42 @@ async fn a_refused_secret_is_a_tool_error_naming_the_detector() {
     d.stop().await;
 }
 
+/// Merging projects moves a whole project's rows: the CLI and HTTP offer it, an agent over MCP
+/// never does, whether or not the admin tools are on, and a call answers as for a missing tool.
+#[tokio::test(flavor = "multi_thread")]
+async fn merging_projects_is_not_an_mcp_tool() {
+    let (_d, _home, d) = daemon().await;
+    let client = TestClient.serve(http_transport(&d)).await.unwrap();
+    for admin in [false, true] {
+        set_admin(&d, admin);
+        let names = tool_names(&client).await;
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.contains("project") && !n.contains("merge_proj")),
+            "{names:?}"
+        );
+    }
+    for name in [
+        "projects_merge",
+        "merge_projects",
+        "project_merge",
+        "projects",
+    ] {
+        let err = client
+            .call_tool(call(
+                name,
+                serde_json::json!({"from": "a", "into": "b", "yes": true}),
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tool not found"), "{name}: {err}");
+    }
+    client.cancel().await.ok();
+    d.stop().await;
+}
+
 const ADMIN: [&str; 4] = ["merge_memories", "review_list", "review_resolve", "stats"];
 
 async fn tool_names<C: ClientHandler>(

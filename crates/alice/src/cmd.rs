@@ -181,6 +181,27 @@ pub struct HistoryArgs {
 }
 
 #[derive(Subcommand)]
+pub enum ProjectsCmd {
+    /// List projects (the default for `alice projects`).
+    List,
+    /// Move every memory, chunk, source and fact of project <FROM> into <INTO>, and make FROM's
+    /// slug, key and aliases names of INTO, so later writes and imports land in INTO.
+    /// `alice undo <event id>` reverses it. Not for `global`.
+    Merge {
+        /// The project to merge away (a slug or an alias; see `alice projects`).
+        from: String,
+        /// The project that receives it.
+        into: String,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Who merges (default: $ALICE_AGENT or "cli", as for `remember`).
+        #[arg(long, env = "ALICE_AGENT", default_value = "cli")]
+        agent: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ReviewCmd {
     /// Open items (or all with --all). The default for `alice review`.
     List {
@@ -376,7 +397,10 @@ pub struct ImportMempalaceArgs {
     /// Only drawers filed at or after this date (YYYY-MM-DD or RFC 3339).
     #[arg(long)]
     pub since: Option<String>,
-    /// Map a MemPalace wing to an Alice project, as wing=project (repeatable).
+    /// Map a MemPalace wing to an Alice project, as wing=project (repeatable). This fixes a wing's
+    /// project on a fresh import; `alice projects merge <from> <into>` fixes it afterwards.
+    /// A re-run only adds what is new and never re-homes memories already imported: to re-home
+    /// those use `alice projects merge`, or import into a fresh home.
     #[arg(long, value_name = "WING=PROJECT", value_parser = parse_map_wing)]
     pub map_wing: Vec<(String, String)>,
     /// The collection that holds the drawers (default mempalace_drawers).
@@ -1022,7 +1046,18 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         }
         Command::Backup(c) => backup(&home, c, json).await,
         Command::Maintenance(c) => maintenance(&home, c, json).await,
-        Command::Projects => {
+        Command::Projects {
+            cmd:
+                Some(ProjectsCmd::Merge {
+                    from,
+                    into,
+                    yes,
+                    agent,
+                }),
+        } => projects_merge(&home, from, into, yes, &agent, json).await,
+        Command::Projects {
+            cmd: None | Some(ProjectsCmd::List),
+        } => {
             let r = client(&home).await?.projects().await?;
             print(json, &r, || {
                 r.iter()
@@ -1054,6 +1089,74 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
             unreachable!("handled in dispatch")
         }
     }
+}
+
+/// Ask before `projects merge` changes anything. `yes` skips the question; without a terminal
+/// to ask on, the merge is refused instead of guessed.
+fn confirm_merge(
+    yes: bool,
+    interactive: bool,
+    question: &str,
+    answers: &mut dyn std::io::BufRead,
+    ask: &mut dyn std::io::Write,
+) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        interactive,
+        "merging projects moves rows between them; pass --yes to confirm (this is not a terminal, so there is nobody to ask)"
+    );
+    write!(ask, "{question} [y/N] ")?;
+    ask.flush()?;
+    let mut answer = String::new();
+    answers.read_line(&mut answer)?;
+    anyhow::ensure!(
+        matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"),
+        "merge cancelled; nothing was changed"
+    );
+    Ok(())
+}
+
+/// `alice projects merge <from> <into>`: count what would move (nothing is written), ask, then
+/// merge. The answer names the event that `alice undo` reverses.
+async fn projects_merge(
+    home: &AliceHome,
+    from: String,
+    into: String,
+    yes: bool,
+    agent: &str,
+    json: bool,
+) -> Result<()> {
+    use std::io::IsTerminal;
+    let c = client(home).await?;
+    let mut req = alice_core::api::ProjectMergeRequest {
+        from,
+        into,
+        dry_run: true,
+        author: author(agent),
+    };
+    let plan = c.merge_projects(&req).await?;
+    confirm_merge(
+        yes,
+        std::io::stdin().is_terminal(),
+        &format!(
+            "Merge \"{}\" into \"{}\"? That moves {} memories, {} chunks, {} sources and {} facts, and \"{}\" becomes another name of \"{}\". `alice undo` reverses it.",
+            plan.from,
+            plan.into,
+            plan.memories,
+            plan.chunks,
+            plan.sources,
+            plan.facts,
+            plan.from,
+            plan.into
+        ),
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+    )?;
+    req.dry_run = false;
+    let r = c.merge_projects(&req).await?;
+    print(json, &r, || format!("{}\n", r.message))
 }
 
 fn review_type_arg(t: &Option<String>) -> Result<Option<ReviewType>> {
@@ -2687,6 +2790,40 @@ impl Interrupt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn confirm(yes: bool, tty: bool, typed: &str) -> (Result<()>, String) {
+        let mut asked = Vec::new();
+        let r = confirm_merge(
+            yes,
+            tty,
+            "Merge a into b?",
+            &mut typed.as_bytes(),
+            &mut asked,
+        );
+        (r, String::from_utf8(asked).unwrap())
+    }
+
+    #[test]
+    fn merging_projects_asks_on_a_terminal_and_refuses_without_one_unless_yes() {
+        // --yes never asks, with or without a terminal.
+        for tty in [true, false] {
+            let (r, asked) = confirm(true, tty, "");
+            r.unwrap();
+            assert_eq!(asked, "");
+        }
+        // No terminal and no --yes: refused, naming the flag, without asking anything.
+        let (r, asked) = confirm(false, false, "y\n");
+        assert!(r.unwrap_err().to_string().contains("--yes"));
+        assert_eq!(asked, "");
+        // On a terminal the answer decides, and anything but yes is a no.
+        let (r, asked) = confirm(false, true, "y\n");
+        r.unwrap();
+        assert!(asked.starts_with("Merge a into b? [y/N]"), "{asked}");
+        for no in ["n\n", "\n", "", "maybe\n"] {
+            let (r, _) = confirm(false, true, no);
+            assert!(r.unwrap_err().to_string().contains("nothing was changed"));
+        }
+    }
 
     fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k| {
