@@ -471,6 +471,7 @@ impl Scored {
                 body: Some(m.body),
                 created_at: m.created_at,
                 score: self.score,
+                relevance: None,
                 matched: self.matched,
             },
             Row::Chunk { chunk: c, project } => {
@@ -485,6 +486,7 @@ impl Scored {
                     body: Some(c.text),
                     created_at,
                     score: self.score,
+                    relevance: None,
                     matched: self.matched,
                     status: None,
                 }

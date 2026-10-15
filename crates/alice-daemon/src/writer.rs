@@ -162,6 +162,13 @@ pub enum WriteOp {
         actor: Actor,
         text: Option<ResolveText>,
     },
+    /// Close every open review item of a type (and `provider`) with the answer that changes
+    /// nothing; one history row records it. Yields `Count`.
+    DismissReviews {
+        review_type: reviews::ReviewType,
+        provider: Option<String>,
+        actor: Actor,
+    },
     /// `others` become duplicates of `survivor` (admin tool, review `merge`).
     Merge {
         survivor: String,
@@ -1155,6 +1162,33 @@ fn resolve_review(
     )))
 }
 
+/// Dismiss the open items of `review_type` in one step; no memory or fact changes.
+fn dismiss_reviews(
+    conn: &Connection,
+    st: &mut State,
+    review_type: reviews::ReviewType,
+    provider: Option<&str>,
+    actor: &Actor,
+) -> Result<WriteOutcome> {
+    let n = reviews::dismiss_open(conn, review_type, provider, actor)?;
+    if n > 0 {
+        record(
+            conn,
+            st,
+            EventInput {
+                actor,
+                action: "review.dismiss_all",
+                target_type: "review",
+                target_id: review_type.as_str(),
+                before: None,
+                after: Some(serde_json::json!({"dismissed": n, "provider": provider})),
+                group: None,
+            },
+        )?;
+    }
+    Ok(WriteOutcome::Count(n as usize))
+}
+
 impl State {
     fn matcher(&mut self, conn: &Connection) -> Result<&EntityMatcher> {
         if self.matcher.is_none() {
@@ -1316,6 +1350,11 @@ fn apply(
             actor,
             text,
         } => resolve_review(conn, st, &id, &choice, &actor, text)?,
+        WriteOp::DismissReviews {
+            review_type,
+            provider,
+            actor,
+        } => dismiss_reviews(conn, st, review_type, provider.as_deref(), &actor)?,
         WriteOp::Merge {
             survivor,
             others,

@@ -327,6 +327,9 @@ fn review_query_string(q: &ReviewQuery) -> String {
     if let Some(l) = q.limit {
         qs.append_pair("limit", &l.to_string());
     }
+    if let Some(o) = q.offset {
+        qs.append_pair("offset", &o.to_string());
+    }
     qs.finish()
 }
 
@@ -555,6 +558,27 @@ impl DaemonClient {
         } else {
             self.get_json(&format!("/api/v1/reviews?{qs}")).await
         }
+    }
+    /// Open items in all and by type, narrowed to a type and provider.
+    pub async fn review_counts(
+        &self,
+        review_type: Option<ReviewType>,
+        provider: Option<&str>,
+    ) -> Result<ReviewCounts> {
+        let mut qs = url::form_urlencoded::Serializer::new(String::new());
+        if let Some(t) = review_type {
+            qs.append_pair("review_type", t.as_str());
+        }
+        if let Some(p) = provider {
+            qs.append_pair("provider", p);
+        }
+        self.get_json(&format!("/api/v1/reviews/counts?{}", qs.finish()))
+            .await
+    }
+    /// Close every open item of a type (and provider) without changing any memory.
+    pub async fn dismiss_reviews(&self, r: &DismissRequest) -> Result<DismissResponse> {
+        self.call("/api/v1/reviews/dismiss", r, Duration::from_secs(60))
+            .await
     }
     pub async fn review(&self, id: &str) -> Result<ReviewItem> {
         self.get_json(&format!("/api/v1/reviews/{}", path_segment(id)))

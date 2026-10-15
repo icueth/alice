@@ -102,6 +102,8 @@ const NOTE_BUDGET: &str = "the judge's daily budget is spent; this answer is the
 const NOTE_UNAVAILABLE: &str = "the judge is unavailable; this answer is the fast one";
 const NOTE_UNEXPECTED: &str =
     "the judge's answer did not match the results sent; this answer is the fast one";
+/// The judge graded the results and none clearly answers the query (precise mode).
+const NOTE_NOTHING_ANSWERS: &str = "nothing found clearly answers this; the closest matches follow";
 const NOTE_NO_GRADES: &str = "the judge gave no grade; this answer is the fast one";
 const NOTE_BUSY: &str = "the judge is busy with other recalls; this answer is the fast one";
 const NOTE_SLOW: &str =
@@ -1444,9 +1446,10 @@ impl Service {
             .await?;
         let mut out = out;
         let mut reranked = false;
+        let mut low_confidence = false;
         if precise {
             let why;
-            (out, reranked, why) = self
+            (out, reranked, low_confidence, why) = self
                 .rerank(
                     out,
                     &slug,
@@ -1457,6 +1460,9 @@ impl Service {
                 )
                 .await;
             notes.extend(why);
+            if low_confidence {
+                notes.push(NOTE_NOTHING_ANSWERS.into());
+            }
         }
         let (response, touched) = match format {
             OutputFormat::Text => {
@@ -1472,6 +1478,7 @@ impl Service {
                     omitted,
                     raw_fallback: out.raw_fallback,
                     reranked,
+                    low_confidence,
                     text: Some(text),
                     notes: notes.clone(),
                     ..Default::default()
@@ -1482,6 +1489,7 @@ impl Service {
                 let seqs = std::mem::take(&mut out.memory_seqs);
                 let mut response = pack::pack_json(out, Some(slug), max_tokens);
                 response.reranked = reranked;
+                response.low_confidence = low_confidence;
                 response.notes = notes.clone();
                 let touched = returned_memories(seqs, &response.results);
                 (response, touched)
@@ -1517,9 +1525,10 @@ impl Service {
         query: &str,
         limit: usize,
         include_raw: bool,
-    ) -> (SearchOutput, bool, Option<String>) {
+    ) -> (SearchOutput, bool, bool, Option<String>) {
         let judge = self.judge();
         let mut reranked = false;
+        let mut low_confidence = false;
         // Why the answer is the fast one, when precise mode could not grade.
         let mut why: Option<String> = None;
         if judge.provider() == "heuristic" {
@@ -1650,6 +1659,11 @@ impl Service {
                             }
                             graded.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
                             reranked = !graded.is_empty();
+                            // Graded, and not one of them clearly answers the query.
+                            low_confidence = reranked
+                                && !shown.iter().zip(&grades).any(|(_, d)| {
+                                    !d.0.is_empty() && d.p(RELEVANCE_ANSWERS) >= RESCUE_ANSWERS_MIN
+                                });
                             if graded.is_empty() {
                                 why = Some(NOTE_NO_GRADES.into());
                             }
@@ -1662,6 +1676,9 @@ impl Service {
                                     out.memory_seqs.push(seq);
                                     out.memory_importance.push(importance);
                                 }
+                            }
+                            for (i, p) in &graded {
+                                out.hits[*i].relevance = Some(*p as f32);
                             }
                             // Ungraded results of the top keep their places; the graded ones
                             // (and the rescued) fill the others, best first; the rest follows.
@@ -1742,7 +1759,7 @@ impl Service {
                 out.related = related;
             }
         }
-        (out, reranked, why)
+        (out, reranked, low_confidence, why)
     }
 
     pub async fn context(&self, req: ContextRequest) -> Result<ContextResponse> {
@@ -2095,6 +2112,36 @@ impl Service {
     pub async fn reviews(&self, q: ReviewQuery) -> Result<Vec<ReviewItem>> {
         let _busy = self.activity.enter();
         self.read(move |c| reviews::list(c, &q)).await
+    }
+
+    /// Open items in all and by type, narrowed to a type and provider.
+    pub async fn review_counts(
+        &self,
+        review_type: Option<reviews::ReviewType>,
+        provider: Option<String>,
+    ) -> Result<reviews::ReviewCounts> {
+        let _busy = self.activity.enter();
+        self.read(move |c| reviews::counts_open(c, review_type, provider.as_deref()))
+            .await
+    }
+
+    /// Close every open item of a type (and provider) without changing any memory.
+    pub async fn dismiss_reviews(&self, req: DismissRequest) -> Result<DismissResponse> {
+        let _busy = self.activity.enter();
+        match self
+            .writer
+            .submit(WriteOp::DismissReviews {
+                review_type: req.review_type,
+                provider: req.provider.filter(|p| !p.trim().is_empty()),
+                actor: Actor::from_author(&req.author),
+            })
+            .await?
+        {
+            WriteOutcome::Count(n) => Ok(DismissResponse {
+                dismissed: n as u64,
+            }),
+            other => Err(unexpected(other)),
+        }
     }
 
     pub async fn review(&self, id: String) -> Result<ReviewItem> {
@@ -7371,6 +7418,100 @@ mod tests {
             .await
             .unwrap();
         assert!(text.reranked && text.text.unwrap().contains("ZEBRA"));
+    }
+
+    const NOTHING_ANSWERS: &str = "nothing found clearly answers this; the closest matches follow";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_precise_recall_where_nothing_answers_says_so_and_one_that_answers_does_not() {
+        // No note contains the keyword: the judge grades every result "unrelated".
+        let none = KeywordGrader::new("WOMBAT");
+        let (d, s) = svc_with_grader(none.clone()).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let r = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(r.reranked && !r.results.is_empty(), "{r:?}");
+        assert!(r.low_confidence, "{:?}", r.notes);
+        assert!(
+            r.notes.iter().any(|n| n == NOTHING_ANSWERS),
+            "{:?}",
+            r.notes
+        );
+        let text = s
+            .recall(RecallRequest {
+                format: OutputFormat::Text,
+                ..recall_req("deploy notes", RecallMode::Precise, &cwd)
+            })
+            .await
+            .unwrap();
+        assert!(text.low_confidence, "{:?}", text.notes);
+        assert!(text.text.unwrap().contains(NOTHING_ANSWERS));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["low_confidence"], true, "{json}");
+        // Fast mode never says it: the judge graded nothing.
+        let fast = s
+            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        assert!(
+            !fast.low_confidence && fast.notes.is_empty(),
+            "{:?}",
+            fast.notes
+        );
+
+        // One result that answers clears the doubt.
+        let some = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(some).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let r = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(r.reranked && !r.low_confidence, "{:?}", r.notes);
+        assert!(r.notes.iter().all(|n| n != NOTHING_ANSWERS));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graded_hits_carry_the_judges_relevance_and_keep_the_search_score() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let fast = s
+            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        assert!(fast.results.iter().all(|h| h.relevance.is_none()));
+        let fast_json = serde_json::to_value(&fast).unwrap();
+        assert!(
+            fast_json["results"][0].get("relevance").is_none(),
+            "absent, not null: {fast_json}"
+        );
+        let precise = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(precise.reranked);
+        // The display order is the judge's: relevance never rises down the list.
+        let rel: Vec<f32> = precise
+            .results
+            .iter()
+            .map(|h| h.relevance.expect("every result was graded"))
+            .collect();
+        assert!(rel.windows(2).all(|w| w[0] >= w[1]), "{rel:?}");
+        assert!(
+            rel[0] >= 0.5 && precise.results[0].title.contains("ZEBRA"),
+            "{rel:?}"
+        );
+        // `score` stays the search's fusion score, whatever the display order.
+        for h in &precise.results {
+            let before = fast.results.iter().find(|f| f.id == h.id).unwrap();
+            assert_eq!(h.score, before.score, "{}", h.title);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
