@@ -7182,6 +7182,35 @@ mod tests {
         );
     }
 
+    /// A PATCH that has returned is seen by the very next precise recall: the judge in force
+    /// reads the budget from the settings at each call, not from the one it was built with (the
+    /// rebuild after a `judge.*` change runs in the background). Without that, a recall right
+    /// after a budget of zero was still graded and billed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_budget_patched_to_zero_stops_the_very_next_precise_recall() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        for round in 0..40 {
+            s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(0.0)))
+                .unwrap();
+            let r = s
+                .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+                .await
+                .unwrap();
+            assert!(
+                !r.reranked,
+                "round {round}: graded against a budget of zero"
+            );
+            assert_eq!(t.graded(), 0, "round {round}: a request was sent");
+            // Back up, without a recall: the next round starts from a judge that has not
+            // been rebuilt yet, which is the window the bug lived in.
+            s.patch_settings(patch_one("judge.daily_budget_usd", serde_json::json!(1.0)))
+                .unwrap();
+        }
+    }
+
     /// Precise mode sends the query and results of allowed projects only, scoped to the
     /// project the query was asked from.
     #[tokio::test(flavor = "multi_thread")]
