@@ -10,7 +10,8 @@
   memory) folded in; §2.10 holds it. **The server's CPU has AVX but not AVX2** (controller, 2026-10-16): server builds link
   Microsoft's ONNX Runtime and `alice-server` self-tests every binary before it switches a unit; §2.11 holds it.
   **Addendum 4** (the owner already runs Alice locally): `alice-server adopt` moves a person's own database onto their
-  fresh tenant; §2.12 holds it.
+  fresh tenant; §2.12 holds it. **Addendum 5** (the owner): Jev is on for every tenant with the owner's one key;
+  §2.13 holds it.
 - **Owner:** icueth (vision); technical choices delegated to this lane
 - **Lane:** server mode, worktree `project-alice-srv`, branch `feat/server-mode` (from `feat/m2-judge-settings` b28b99f)
 - **Builds on:** `2026-10-13-alice-core-design.md` (the core spec), the M2 handoff `docs/superpowers/handoff/2026-10-14-m2-handoff.md`
@@ -678,6 +679,31 @@ about 6 hours to embed. The other people keep the MemPalace import.
 - Content is not scrubbed: a memory that mentions a file path in its text keeps it (it is what the person wrote). The
   staging check "no client path in the store" applies to the columns above.
 
+### 2.13 One shared Jev key (addendum 5)
+
+Jev is on for everyone on this server, with the owner's single key, which the owner manages; people never see or
+supply a key.
+
+- **`alice-server jev-key set`** (root): reads the key from `/dev/tty` with echo off, or from stdin when it is not a
+  terminal; never argv or the environment. Refuses an empty key, one with spaces, quotes or backslashes, or one shorter
+  than 16 characters, before any change. Writes it to `/etc/alice/jev.key` (root, 0600, through a temporary file made
+  under `umask 077`), then for every tenant, the team store included, pipes it into `alice config set-secret
+  jev_api_key` and runs `alice config set judge.provider jev` as that tenant (through its running daemon, so it applies
+  at once: the tenant's `secrets.toml` is 0600 and its user's). Their output is discarded (it carries a hint of the
+  key). Tenants that did not take it are named and the command exits non-zero. Re-running it rotates the key
+  everywhere.
+- **`alice-server add`** gives a new tenant the key and the Jev judge when `/etc/alice/jev.key` exists (a failure undoes
+  the add).
+- **`alice-server jev-key status`**: set or not set (with the file's time) and, per tenant, "the server's key",
+  "another key" or "no key", read by root from the tenant's `secrets.toml` and compared in the shell; no value or part
+  of one is printed (R45).
+- **Budget:** each tenant keeps its own `judge.daily_budget_usd` (1.0 by default); `docs/server.md` states the
+  deployment-wide ceiling (tenants × the per-tenant budget) and how to change one tenant's.
+- **SP2:** `give_jev_key` is the one place a tenant is switched to Jev; `distill.provider = jev` joins it when SP2 lands
+  on this branch.
+- Real check: a **dummy** key on a staging tenant (the judge fails closed with a note); never the owner's key, which the
+  owner sets at handover. The dummy key file is removed afterwards.
+
 ## 3. Client remote mode (deferred by addendum 2)
 
 *Addendum 2 defers this whole section.* The team uses direct MCP (§2.8), and its design is kept here unchanged for a
@@ -1196,6 +1222,10 @@ the tests cover the following.
     from `alice adopt` (non-empty tenant, another schema, a damaged file) starts the unit again and changes nothing; a
     symlink, a missing file, another user's file, a full disk, an unknown tenant and the team store are refused before
     any command; a tenant that does not come back gets its own database back (`alice restore <saved> --yes`);
+  - (§2.13) `jev-key set` with a key on stdin: every tenant, the team store included, holds it in a 0600
+    `secrets.toml` with `judge.provider = jev`; `/etc/alice/jev.key` is 0600; the key is in no command line (the calls
+    log), tenant file or output, nor its last four characters; `add` after `set` inherits it; a second `set` rotates it
+    everywhere; `status` names each tenant's state and prints no key; an empty, spaced or short key changes nothing;
   - (§2.11) `build-release` refuses a download that fails its SHA-256 (deleted, never unpacked), and links the pinned
     runtime with the rpath and the dist layout above (stubbed `curl`, `cargo`, `sha256sum` and `uname`).
 
@@ -1306,6 +1336,8 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R41 | `adopt` rewrites project keys made from a folder (`path:<root>`) and file-path source URIs to `adopted:<hash>` (a source keeps its file name) | Addendum 4 keeps keys, but such a key is itself a client path; on a tenant projects are found by slug and alias, never by key | A future client that sends the same checkout's `path:` key would not match the adopted project (it would adopt a placeholder by slug, as for imports) |
 | R42 | A memory whose text, once redacted, equals another memory's is trashed before it is redacted | The unique-content rule would otherwise make the whole adoption fail on one pair of notes that differ only by a secret | The trashed copy stays in the trash; nothing is lost but the duplicate |
 | R43 | `adopt` also redacts event snapshots and review payloads, and deletes the judge cache | History and the inbox hold what the person's machine stored; a tenant's database must hold no unredacted secret | Undo of an older edit restores redacted text, as it does for anything the rules redact |
+| R44 | The server keeps the shared Jev key in `/etc/alice/jev.key` (root, 0600) | `add` needs the value for each new tenant; re-reading a tenant's `secrets.toml` would tie the script to that file's format | One more root-only copy of the key on the server |
+| R45 | `jev-key status` prints no hint of a key (not even its last four characters, which `config set-secret` shows) | Addendum 5: status never prints the value | Telling two keys apart needs `jev-key set` again |
 
 ---
 

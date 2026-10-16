@@ -17,6 +17,9 @@ CADDY_LOG="$R/var/log/caddy/alice-access.log"
 # with the offset of the person's own machine, as it would on a Mac; stored times stay UTC. This deployment's people
 # are in Thailand; `add <name> --tz <IANA zone>` sets another.
 ZONEINFO="$R/usr/share/zoneinfo"; DEFAULT_TZ=Asia/Bangkok
+# The owner's one Jev key, which every tenant gets (addendum 5): root's only, 0600. A tenant keeps its copy in its own
+# secrets.toml (0600, its user's), written through its daemon by `alice config set-secret`.
+JEV_KEY_FILE="$R/etc/alice/jev.key"; JEV_SECRET=jev_api_key
 BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
 # The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
 # $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
@@ -43,7 +46,7 @@ fi
 # A broken environment must never turn a removal into rm -rf /...: refuse to run with an empty root.
 : "${ETC:?}" "${TENANTS:?}" "${SRV:?}" "${ARCHIVES:?}" "${CADDY_D:?}" "${UNIT:?}" "${CADDYFILE:?}" "${BIN:?}" "${LOCK:?}"
 : "${LIBDIR:?}" "${MODEL_CACHE:?}" "${SELFTEST_TMP:?}" "${CADDY_DROPIN:?}" "${ADMIN_SOCK:?}" "${CADDY_LOG:?}"
-: "${ZONEINFO:?}"
+: "${ZONEINFO:?}" "${JEV_KEY_FILE:?}"
 
 HOST=""
 SELFTEST_WHY=""
@@ -66,6 +69,9 @@ usage: alice-server add <name> [--tz <IANA zone>]
            (also the first install; a build of deploy/server/build-release brings its ONNX Runtime along)
        alice-server import <name> <palace-dir> [--dry-run]
        alice-server adopt <name> <backup-file>
+       alice-server jev-key set
+           (the owner's Jev key, pasted at the prompt or piped in, for every tenant and every new one)
+       alice-server jev-key status
            (a person's own Alice database, from `alice backup now` on their machine, onto their fresh tenant)
            (a real import MOVES and consumes <palace-dir>; --dry-run works on a copy and keeps it)
        alice-server cli <name> <alice arguments...>
@@ -451,6 +457,9 @@ cmd_add() { # name team(0|1) tz tz-given(0|1)
     { write_snippet "$name" "$port" && reload_caddy; } || add_fail "$name" "Caddy refused the new route"
     A_RELOADED=1
   fi
+  if [ -s "$JEV_KEY_FILE" ]; then
+    give_jev_key "$name" "$(head -n 1 "$JEV_KEY_FILE")" || add_fail "$name" "could not give $name the server's Jev key"
+  fi
   [ -s "$home/token" ] || add_fail "$name" "the daemon wrote no token"
   token=$(head -n 1 "$home/token")
 
@@ -732,6 +741,67 @@ cmd_adopt() { # name backup-file
   say "Delete $file now: it holds what the person's machine stored, unredacted."
 }
 
+# Reads a key from the terminal with echo off, or from stdin when it is not a terminal; never from argv or the
+# environment. Prints it on stdout for the caller's variable only.
+read_key() {
+  local key="" saved
+  if [ -t 0 ]; then
+    printf 'Paste the Jev key and press Enter: ' >/dev/tty
+    saved=$(stty -g </dev/tty)
+    stty -echo </dev/tty
+    IFS= read -r key </dev/tty || true
+    stty "$saved" </dev/tty
+    printf '\n' >/dev/tty
+  else
+    IFS= read -r key || true
+  fi
+  printf '%s' "$key"
+}
+
+# One tenant gets the key (through its running daemon, so it applies at once) and the Jev judge. SP2's distillation
+# (`distill.provider = jev`) joins here once it lands on this branch.
+give_jev_key() { # name key
+  printf '%s\n' "$2" | as_tenant "$1" config set-secret "$JEV_SECRET" >/dev/null 2>&1 || return 1
+  as_tenant "$1" config set judge.provider jev >/dev/null 2>&1 || return 1
+}
+
+cmd_jev_key_set() {
+  local key t f failed="" done=""
+  key=$(read_key)
+  [ -n "$key" ] || die "no key was given; nothing changed"
+  case "$key" in *[[:space:]\"\\]*) die "that is not a Jev key (it holds spaces, quotes or backslashes); nothing changed" ;; esac
+  [ "${#key}" -ge 16 ] || die "that is not a Jev key (too short); nothing changed"
+  ( umask 077; printf '%s\n' "$key" | put "$JEV_KEY_FILE" 0600 ) || die "could not write $JEV_KEY_FILE"
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    t=$(basename "$f" .env)
+    if give_jev_key "$t" "$key"; then done="$done $t"; else failed="$failed $t"; fi
+  done
+  say "The Jev key is set, and judge.provider = jev, for:${done:- (no tenant yet)}"
+  say "New tenants get it when they are added; run this again to rotate it everywhere."
+  if [ -n "$failed" ]; then die "these tenants did not take it (is their daemon running?):$failed; run jev-key set again"; fi
+}
+
+cmd_jev_key_status() {
+  local f t file_key="" line state
+  if [ -s "$JEV_KEY_FILE" ]; then
+    say "Jev key: set (since $(date -u -r "$JEV_KEY_FILE" +%Y-%m-%dT%H:%MZ 2>/dev/null || echo unknown))"
+    file_key=$(head -n 1 "$JEV_KEY_FILE")
+  else
+    say "Jev key: not set (alice-server jev-key set)"
+  fi
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    t=$(basename "$f" .env)
+    line=$(grep -m 1 "^$JEV_SECRET = " "$SRV/$t/secrets.toml" 2>/dev/null || true)
+    if [ -z "$line" ]; then state="no key"
+    elif [ -n "$file_key" ] && [ "$line" = "$JEV_SECRET = \"$file_key\"" ]; then state="the server's key"
+    else state="another key"
+    fi
+    printf '  %-16s %s\n' "$t" "$state"
+  done
+}
+
 cmd_cli() { # name alice-args...
   local name=$1 a seen=0 extra=0
   shift
@@ -791,6 +861,14 @@ main() {
     import) [[ $# -ge 3 && $# -le 4 ]] || { usage; exit 2; }; valid_name "$2"; cmd_import "$2" "$3" "${4:-}" ;;
     cli) [[ $# -ge 3 ]] || { usage; exit 2; }; valid_name "$2"; cmd_cli "${@:2}" ;;
     adopt) [[ $# -eq 3 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_adopt "$2" "$3" ;;
+    jev-key)
+      [[ $# -eq 2 ]] || { usage; exit 2; }
+      case "$2" in
+        set) take_lock; cmd_jev_key_set ;;
+        status) cmd_jev_key_status ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
     -h|--help|help) usage ;;
     *) usage; exit 2 ;;
   esac

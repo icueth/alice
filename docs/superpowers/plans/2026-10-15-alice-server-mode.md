@@ -3836,3 +3836,15 @@ hint finds the project), `adopt_refuses_a_tenant_that_holds_anything_and_leaves_
 synthetic local home made on this Mac in a throwaway `ALICE_HOME` (never `~/.alice`), adopted into a staging tenant,
 recall over MCP by `?project=`, then cleanup. The real adoption waits for the review's fix wave and the controller's go.
 
+### Task 34: one shared Jev key for every tenant (addendum 5)
+
+**Files:** modify `deploy/server/alice-server` (`read_key`, `give_jev_key`, `jev-key set|status`, `add` inherits),
+`deploy/server/tests/run.sh`, `docs/server.md` (jev-key, budget, the `jev_api_key` secret name: the docs said
+`typesafe`, which `config set-secret` refuses), `README.th.md`, spec §2.13 + §8.2 + R44-R45.
+
+**Steps:** as spec §2.13. Stub scenarios: `jev_key_set_reaches_every_tenant_and_nothing_else`,
+`jev_key_is_inherited_by_a_new_tenant`, `jev_key_rotation_replaces_it_everywhere`,
+`jev_key_status_names_tenants_and_never_the_key`, `jev_key_refuses_an_empty_or_malformed_key`. Real check: a dummy key on
+a staging tenant, a precise recall fails closed with a note, `status` shows the tenants; then the dummy key file and the
+tenant are removed. Never the owner's key.
+

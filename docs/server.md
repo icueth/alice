@@ -71,6 +71,8 @@ alice-server list
 alice-server upgrade <binary>
 alice-server import <name> <palace-dir> [--dry-run]
 alice-server adopt <name> <backup-file>
+alice-server jev-key set
+alice-server jev-key status
 alice-server cli <name> <alice arguments...>
 ```
 
@@ -154,17 +156,32 @@ The script moves the folder into the tenant's `import-inbox/` (owned by the tena
 
 It prints a report: memories, chunks, facts and projects, the paths cleared and the redactions. Delete the backup file afterwards: it holds what the person's machine stored, before the server's redaction.
 
+#### jev-key
+
+On this server Jev is on for everyone, with the owner's one Jev key. People never see or supply a key.
+
+```
+sudo alice-server jev-key set        # paste the key at the prompt (it is not shown), or pipe it in
+sudo alice-server jev-key status
+```
+
+`jev-key set` reads the key from the terminal with echo off, or from standard input; never from the command line or the environment. It keeps it in `/etc/alice/jev.key` (root's only, 0600) and gives it to every tenant, the team store included: into the tenant's own `secrets.toml` (0600, its user's), through its running daemon, with `judge.provider = jev`. It takes effect at once; nothing restarts. `alice-server add` gives every new tenant the key. Run `jev-key set` again to rotate the key everywhere. `jev-key status` says whether a key is set and, for each tenant, whether it holds the server's key, another one or none. It never prints a key or part of one.
+
+**Budget.** Each tenant keeps its own judge budget, `judge.daily_budget_usd`, 1.00 USD a day by default. The deployment-wide ceiling is the number of tenants times that: with four people and the team store, 5.00 USD a day. Change one tenant's with `alice-server cli <name> config set judge.daily_budget_usd 0.5`. When a tenant reaches its budget, precise recall answers with the search order and says so.
+
+SP2's distillation (`distill.provider = jev`) will be switched on by the same command once it lands on this branch.
+
 #### cli
 
-`alice-server cli <name> <alice arguments...>` runs the `alice` command as the tenant's Unix user against that tenant's own daemon. Use it to set a person's settings or Jev key:
+`alice-server cli <name> <alice arguments...>` runs the `alice` command as the tenant's Unix user against that tenant's own daemon. Use it for a person's settings, or for a key of their own:
 
 ```
 alice-server cli <name> config get judge
 alice-server cli <name> config set judge.provider jev
-alice-server cli <name> config set-secret typesafe
+alice-server cli <name> config set-secret jev_api_key
 ```
 
-`config set-secret typesafe` reads the key from standard input. Run it as shown and paste the key when it asks, or pipe it in from a file or a secret manager. The script refuses a secret on the command line, because a command line is visible to other users in the process list and in shell history. Never type the key as an argument.
+`config set-secret jev_api_key` reads the key from standard input. Run it as shown and paste the key when it asks, or pipe it in from a file or a secret manager. The script refuses a secret on the command line, because a command line is visible to other users in the process list and in shell history. Never type the key as an argument.
 
 Settings are TOML values or plain text, and they take effect at once. The daemon refuses a few settings in tenant mode (for example `privacy.redact = false`, or a private-network URL).
 
@@ -329,14 +346,14 @@ How team memories meet your model judge: in precise recall, a team memory is gra
 
 ### Settings and your Jev key
 
-You do not need a client binary for this. Ask your admin to run, on the server:
+On this server the admin gives every tenant the owner's Jev key (`alice-server jev-key set`), so precise recall uses the Jev judge without anything from you. If you ever need a key of your own, the admin runs, on the server:
 
 ```
-alice-server cli <name> config set-secret typesafe     # the admin pastes your key at the prompt
+alice-server cli <name> config set-secret jev_api_key     # the admin pastes your key at the prompt
 alice-server cli <name> config set judge.provider jev
 ```
 
-Send the key over a private channel, never in a chat room or an issue. Without a key, the judge stays on the offline rules.
+Send such a key over a private channel, never in a chat room or an issue. Without any key, the judge stays on the offline rules.
 
 ### Moving your local Alice to the server
 
@@ -372,4 +389,6 @@ Give your palace folder to your admin. The admin runs `alice-server import` (see
 | `alice-server list` warns about free space | Under 3 GB free | See [Disk budget](#disk-budget) |
 | A tenant is not `active` in `list` | The daemon stopped | `journalctl -u alice@<name>`, then `systemctl restart alice@<name>` |
 | `alice-server upgrade` exits with tenant names | Those tenants did not restart | The previous binary was restored; read `journalctl -u alice@<name>` |
-| `alice-server: a secret is never passed on the command line` | You put a key after `set-secret` | Run `config set-secret typesafe` alone and paste the key at the prompt |
+| `alice-server: a secret is never passed on the command line` | You put a key after `set-secret` | Run `config set-secret jev_api_key` alone and paste the key at the prompt |
+| `unknown secret name; use one of: jev_api_key, embedding_api_key` | The secret's name is wrong | The Jev key is `jev_api_key` |
+| `these tenants did not take it (is their daemon running?)` after `jev-key set` | A tenant's daemon was down | Start it (`systemctl start alice@<name>`), then run `jev-key set` again |

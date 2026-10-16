@@ -118,6 +118,13 @@ case "$*" in
     printf '{\n  "adopted_from": "%s",\n  "memories": 3,\n  "chunks": 2,\n  "paths_cleared": 3,\n  "redacted_memories": 2,\n  "saved_tenant_db_as": "alice-before-restore-20261016T070000Z.db"\n}\n' "${3:-}"
     ;;
   "restore "*) echo "restored" ;;
+  "config set-secret jev_api_key")
+    # As the daemon does: the value from stdin into the tenant's own secrets.toml, 0600.
+    IFS= read -r v
+    ( umask 077; printf 'jev_api_key = "%s"\n' "$v" >"$ALICE_HOME/secrets.toml" )
+    echo "jev_api_key set (****${v: -4})"
+    ;;
+  "config set judge.provider jev") echo jev >"$ALICE_HOME/judge.provider" ;;
   "model fetch")
     if [ "${SELFTEST:-}" = fetchfail ]; then
       i=0; while [ "$i" -lt 2000 ]; do printf '\rmodel_quantized.onnx: %5.1f%%' "$i" >&2; i=$((i + 1)); done
@@ -978,6 +985,77 @@ adopt_refuses_the_team_store() {
   pass
 }
 
+JEV_A="jev-test-0123456789abcdef-A"
+JEV_B="jev-test-fedcba9876543210-B"
+jev_set() { RC=0; OUT=$(printf '%s\n' "$1" | ALICE_SERVER_ROOT="$R" /bin/bash "$SCRIPT" jev-key set 2>&1) || RC=$?; }
+tenant_names() { for f in "$TENANTS"/*.env; do basename "$f" .env; done; }
+# The key is nowhere a person or a log could read it: not in any command line, tenant file or output.
+key_nowhere_else() { # key
+  hasnt "$R/calls.log" "$1"
+  for f in "$TENANTS"/*.env; do hasnt "$f" "$1"; done
+  if printf '%s\n' "$OUT" | grep -qF -- "$1"; then fail "the key was printed"; fi
+  if printf '%s\n' "$OUT" | grep -qF -- "${1: -4}"; then fail "part of the key was printed"; fi
+}
+has_key() { # tenant key
+  [ "$(cat "$SRV/$1/secrets.toml" 2>/dev/null)" = "jev_api_key = \"$2\"" ] || fail "$1 does not hold the key"
+  [ -n "$(find "$SRV/$1/secrets.toml" -perm 600)" ] || fail "$1's secrets.toml is not 0600"
+  [ "$(cat "$SRV/$1/judge.provider" 2>/dev/null)" = jev ] || fail "$1's judge is not jev"
+}
+
+jev_key_set_reaches_every_tenant_and_nothing_else() {
+  local t
+  jev_set "$JEV_A"
+  [ "$RC" = 0 ] || fail "jev-key set exited $RC: $OUT"
+  for t in $(tenant_names); do has_key "$t" "$JEV_A"; done
+  has_key team "$JEV_A"
+  [ "$(cat "$R/etc/alice/jev.key")" = "$JEV_A" ] || fail "the server's copy is wrong"
+  [ -n "$(find "$R/etc/alice/jev.key" -perm 600)" ] || fail "jev.key is not 0600"
+  key_nowhere_else "$JEV_A"
+  pass
+}
+
+jev_key_is_inherited_by_a_new_tenant() {
+  run add jevp
+  [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
+  has_key jevp "$JEV_A"
+  key_nowhere_else "$JEV_A"
+  run remove jevp --yes
+  pass
+}
+
+jev_key_rotation_replaces_it_everywhere() {
+  local t
+  jev_set "$JEV_B"
+  [ "$RC" = 0 ] || fail "rotation exited $RC: $OUT"
+  for t in $(tenant_names); do has_key "$t" "$JEV_B"; done
+  [ "$(cat "$R/etc/alice/jev.key")" = "$JEV_B" ] || fail "the server's copy was not rotated"
+  key_nowhere_else "$JEV_B"
+  pass
+}
+
+jev_key_status_names_tenants_and_never_the_key() {
+  printf 'jev_api_key = "someone-elses-key-0000000000"\n' >"$SRV/ann/secrets.toml"
+  run jev-key status
+  [ "$RC" = 0 ] || fail "status exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'Jev key: set' || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  team +the server.s key$' || fail "team not shown with the key: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  ann +another key$' || fail "ann's other key not shown: $OUT"
+  key_nowhere_else "$JEV_B"
+  if printf '%s\n' "$OUT" | grep -qF 'someone-elses'; then fail "another key was printed"; fi
+  pass
+}
+
+jev_key_refuses_an_empty_or_malformed_key() {
+  local bad
+  for bad in "" "has a space in it 0123456789" "short"; do
+    jev_set "$bad"
+    [ "$RC" != 0 ] || fail "accepted '$bad'"
+    printf '%s\n' "$OUT" | grep -qF 'nothing changed' || fail "$OUT"
+    [ "$(cat "$R/etc/alice/jev.key")" = "$JEV_B" ] || fail "'$bad' replaced the key"
+  done
+  pass
+}
+
 remove_person_deletes_the_team_copy() {
   local archive
   run remove hal --yes
@@ -1041,6 +1119,9 @@ for CURRENT in \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \
   add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \
   rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store adopt_refuses_the_team_store \
+  jev_key_set_reaches_every_tenant_and_nothing_else jev_key_is_inherited_by_a_new_tenant \
+  jev_key_rotation_replaces_it_everywhere jev_key_status_names_tenants_and_never_the_key \
+  jev_key_refuses_an_empty_or_malformed_key \
   remove_person_deletes_the_team_copy remove_team_unprovisions provision_refuses_a_missing_team_token \
   refuses_to_run_with_empty_roots remove_archives_then_deletes \
   add_prints_a_single_quoted_mcp_hint no_remote_set_line; do
