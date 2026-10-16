@@ -2056,7 +2056,7 @@ fn activate(conn: &Connection, seq: i64, matcher: &EntityMatcher) -> Result<()> 
         return Ok(());
     };
     if status == Status::Pending.as_str() {
-        memories::set_status_by_seq(conn, seq, Status::Active)?;
+        memories::activate_pending(conn, seq)?;
     }
     let ids = matcher.find_in(&format!("{title}\n{body}"));
     if !ids.is_empty() {
@@ -5699,6 +5699,63 @@ mod tests {
         let body: String = f.read("SELECT body FROM memories WHERE id = ?1", [&a]);
         assert_eq!(body, "see TCK-12345 here");
         assert_eq!(placeholders(&f, "strict"), 0);
+    }
+
+    /// Activation ends a memory's write path; it is not an edit. A move screened while the
+    /// memory was still `pending` goes through when the judge's verdict (or, for an import,
+    /// the embedder's) activated it in between: nothing it screened changed.
+    #[test]
+    fn a_move_screened_while_pending_goes_through_after_the_memory_is_activated() {
+        let f = fixture();
+        let (judged, judged_seq) =
+            new_id(f.h.submit_blocking(remember("judged then moved")).unwrap());
+        let (imported, imported_seq) = new_id(
+            f.h.submit_blocking(remember("imported then moved"))
+                .unwrap(),
+        );
+        let w = open(f.dir.path());
+        w.execute(
+            "UPDATE memories SET judge_state = 'skipped' WHERE seq = ?1",
+            [imported_seq],
+        )
+        .unwrap();
+        // Written a while ago (so the clock has moved on by the time it is activated).
+        w.execute(
+            "UPDATE memories SET updated_at = '2020-01-01T00:00:00.000Z' WHERE seq IN (?1, ?2)",
+            [judged_seq, imported_seq],
+        )
+        .unwrap();
+        drop(w);
+        let screened = |id: &str| alice_core::store::memories::ScreenedMove {
+            content_hash: hash_of(&f, id),
+            updated_at: f.read("SELECT updated_at FROM memories WHERE id = ?1", [id]),
+            title: f.read("SELECT title FROM memories WHERE id = ?1", [id]),
+            body: f.read("SELECT body FROM memories WHERE id = ?1", [id]),
+            topics: Vec::new(),
+        };
+        let (judged_screen, imported_screen) = (screened(&judged), screened(&imported));
+        assert_eq!(status_of(&f, &judged), "pending");
+        apply_j(&f, judgement(&f, &judged, "heuristic"));
+        let stamp = hash_of(&f, &imported);
+        f.h.submit_blocking(WriteOp::EmbedSkipped {
+            keys: vec![(VecKey::Memory(imported_seq), stamp)],
+        })
+        .unwrap();
+        for (id, s) in [(&judged, judged_screen), (&imported, imported_screen)] {
+            assert_eq!(status_of(&f, id), "active", "activated in between");
+            f.h.submit_blocking(WriteOp::Update {
+                id: id.clone(),
+                update: MemoryUpdate {
+                    action: UpdateAction::Move,
+                    project: Some("elsewhere".into()),
+                    screened: Some(s),
+                    ..Default::default()
+                },
+                actor: Actor::User,
+            })
+            .unwrap_or_else(|e| panic!("the move of {id} was refused: {e}"));
+            assert_eq!(project_of(&f, id), "elsewhere");
+        }
     }
 
     #[test]

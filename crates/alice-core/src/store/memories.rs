@@ -225,6 +225,17 @@ pub fn set_status_by_seq(conn: &Connection, seq: i64, status: Status) -> Result<
     set_status(conn, seq, status, None)
 }
 
+/// A `pending` memory becomes `active`: the end of its write path, not a change to it (undo's
+/// comparison holds the two states equal too). `updated_at` and `hlc` stay as the write left
+/// them, so a move screened while the memory was pending is not refused as an edit.
+pub fn activate_pending(conn: &Connection, seq: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE memories SET status = 'active' WHERE seq = ?1 AND status = 'pending'",
+        [seq],
+    )?;
+    Ok(())
+}
+
 /// Status change; `hlc` stamps it for sync when the change comes from a user or agent action.
 fn set_status(conn: &Connection, seq: i64, status: Status, hlc: Option<&str>) -> Result<()> {
     conn.execute(
