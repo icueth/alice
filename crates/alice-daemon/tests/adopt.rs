@@ -128,12 +128,32 @@ fn contains(hay: &[u8], needle: &str) -> bool {
     hay.windows(needle.len()).any(|w| w == needle.as_bytes())
 }
 
+/// Also the lower-case form: the full-text tokenizers fold case.
+fn contains_any_case(hay: &[u8], needle: &str) -> bool {
+    contains(hay, needle) || contains(hay, &needle.to_lowercase())
+}
+
+/// Text the person deleted on their machine: in free pages of the backup file.
+const DELETED_ON_THE_MAC: &str = "deleted-on-the-mac-zebra-falcon-0042";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_adopted_database_loses_the_machines_paths_and_is_redacted_with_the_tenants_rules() {
     let d = tempfile::tempdir().unwrap();
     let (source, checkout, backup) = person(d.path()).await;
+    {
+        let c = Connection::open(&backup).unwrap();
+        c.execute_batch(&format!(
+            "PRAGMA secure_delete = OFF; CREATE TABLE gone (t TEXT); INSERT INTO gone VALUES ('{}'); DROP TABLE gone;",
+            DELETED_ON_THE_MAC.repeat(40)
+        ))
+        .unwrap();
+    }
     let src = std::fs::read(&backup).unwrap();
     assert!(contains(&src, SECRET), "the person's machine kept the key");
+    assert!(
+        contains(&src, DELETED_ON_THE_MAC),
+        "the backup carries free pages"
+    );
     assert!(contains(&src, &checkout.display().to_string()));
     let tenant = fresh_tenant(d.path(), "tenant");
 
@@ -188,9 +208,10 @@ async fn an_adopted_database_loses_the_machines_paths_and_is_redacted_with_the_t
         &checkout.display().to_string()[..],
         TRANSCRIPT,
         "/Users/someone",
+        DELETED_ON_THE_MAC,
     ] {
         assert!(
-            !contains(&bytes, gone),
+            !contains_any_case(&bytes, gone),
             "{gone} is still in the tenant's database"
         );
     }

@@ -1717,13 +1717,7 @@ impl Service {
                 SHARED_TIMEOUT,
             )
             .await
-            .map_err(|e| match e {
-                // The team store's own refusal (its redaction rules) is the answer as it is.
-                e if alice_core::redact::is_refusal(&e) => e,
-                e => AliceError::Other(format!(
-                    "the team memory is unreachable ({e}); nothing was saved. Retry, or save it personally without shared"
-                )),
-            })?;
+            .map_err(shared_write_error)?;
         Ok(RememberResponse {
             id: r.id.map(|id| format!("{TEAM_PREFIX}{id}")),
             status: r.status,
@@ -4239,6 +4233,26 @@ fn screen_resolution(
 
 /// The prefix of an id that lives in the team store.
 const TEAM_PREFIX: &str = "team:";
+
+/// What a person is told when a shared write fails. The team store's own answer (its redaction
+/// rules' refusal, an invalid request, a missing memory) is passed on as it is; no answer, or a
+/// broken one, after the request went out means it may have been saved; only a store that could
+/// not be reached means nothing was.
+fn shared_write_error(e: AliceError) -> AliceError {
+    let text = e.to_string();
+    match e {
+        e if alice_core::redact::is_refusal(&e) => e,
+        e @ (AliceError::Invalid(_) | AliceError::NotFound(_)) => e,
+        _ if text.contains("did not answer in time") || text.contains("broke off its answer") => {
+            AliceError::Other(format!(
+                "the team memory did not confirm the write ({text}); it may have been saved: recall it before saving it again"
+            ))
+        }
+        _ => AliceError::Other(format!(
+            "the team memory is unreachable ({text}); nothing was saved. Retry, or save it personally without shared"
+        )),
+    }
+}
 /// The team store's total time to answer a recall or a context, the batch `get` for authors
 /// included (spec §2.10).
 const TEAM_DEADLINE: Duration = Duration::from_millis(800);
@@ -9889,6 +9903,22 @@ mod tests {
         assert!(e.contains("server tenant"), "{e}");
     }
 
+    /// A tenant whose disk always has room: an accept test must not depend on the host's.
+    async fn tenant_svc_with_room() -> (tempfile::TempDir, Arc<Service>) {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                free_space: Some(Arc::new(|_| Some(u64::MAX / 4))),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        (d, s)
+    }
+
     async fn tenant_svc() -> (tempfile::TempDir, Arc<Service>) {
         let d = tempfile::tempdir().unwrap();
         let s = Service::start(
@@ -10239,7 +10269,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_tenant_imports_only_from_its_import_inbox() {
-        let (d, s) = tenant_svc().await;
+        let (d, s) = tenant_svc_with_room().await;
         let inbox = d.path().join("import-inbox");
         let outside = tempfile::tempdir().unwrap();
         let out_palace = alice_core::import::fixture::synthetic_palace(outside.path(), 20).dir;
@@ -10747,5 +10777,24 @@ mod tests {
         assert_eq!(v.settings["judge"]["daily_budget_usd"], 1.0);
         let k = &v.secrets["jev_api_key"];
         assert!(k.set && k.hint.is_none(), "{k:?}");
+    }
+
+    /// Final review M-3: the team store's own answers pass through; a timeout may have saved.
+    #[test]
+    fn a_shared_write_error_says_what_may_have_happened() {
+        let invalid = shared_write_error(AliceError::invalid("content is empty"));
+        assert!(matches!(&invalid, AliceError::Invalid(m) if m == "content is empty"));
+        let missing = shared_write_error(AliceError::NotFound("memory x".into()));
+        assert!(matches!(missing, AliceError::NotFound(_)));
+        let late = shared_write_error(AliceError::Other(
+            "the team store did not answer in time".into(),
+        ))
+        .to_string();
+        assert!(late.contains("may have been saved"), "{late}");
+        let down = shared_write_error(AliceError::Other(
+            "the team store is unreachable: connection refused".into(),
+        ))
+        .to_string();
+        assert!(down.contains("nothing was saved"), "{down}");
     }
 }

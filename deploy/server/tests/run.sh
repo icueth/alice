@@ -113,6 +113,7 @@ case "$*" in
       nonempty) echo "alice: this tenant already holds 3 memories, 0 chunks and 0 facts; adopt needs a fresh tenant" >&2; exit 1 ;;
       older) echo "alice: the file was made by an older Alice (schema v4; the server runs v5): upgrade the source Alice first" >&2; exit 1 ;;
       damaged) echo "alice: the file fails SQLite's integrity check (row 3 missing)" >&2; exit 1 ;;
+      notputback) echo "alice: [not put back] adopting failed (disk full), and the tenant's own database could not be put back" >&2; exit 1 ;;
     esac
     [ -f "${3:-}" ] && cp -- "$3" "$ALICE_SERVER_ROOT/adopted-copy"
     printf '{\n  "adopted_from": "%s",\n  "memories": 3,\n  "chunks": 2,\n  "paths_cleared": 3,\n  "redacted_memories": 2,\n  "saved_tenant_db_as": "alice-before-restore-20261016T070000Z.db"\n}\n' "${3:-}"
@@ -410,6 +411,9 @@ upgrade_rolls_back_on_a_failed_ping() {
   [ "$RC" != 0 ] || fail "upgrade succeeded with a failing ping"
   cmp "$T/alice.saved" "$R/usr/local/bin/alice" || fail "old binary not restored"
   printf '%s\n' "$OUT" | grep -qF 'ann' || fail "failed tenants not named: $OUT"
+  # Still down after the rollback (final review I-3): named, with what to do.
+  printf '%s\n' "$OUT" | grep -qF 'With the previous binary back, these are still down: ann' || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -qF 'cannot start on the old one' || fail "$OUT"
   pass
 }
 
@@ -892,6 +896,40 @@ adopt_refuses_bad_files_before_any_change() {
   pass
 }
 
+adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back() {
+  local starts
+  starts=$(grep -c 'systemctl start alice@ann' "$R/calls.log" || true)
+  ADOPT=notputback adopt ann "$ADOPT_FILE"
+  [ "$RC" != 0 ] || fail "adopt succeeded"
+  printf '%s\n' "$OUT" | grep -qF 'ann stays stopped' || fail "$OUT"
+  [ "$(grep -c 'systemctl start alice@ann' "$R/calls.log")" = "$starts" ] || fail "the tenant was started on the unscrubbed copy"
+  pass
+}
+
+commands_that_restart_daemons_wait_for_an_import() {
+  mkdir -p "$SRV/ann/import-inbox/20261016T000000Z-1/palace"
+  run upgrade "$R/new-alice"
+  [ "$RC" != 0 ] || fail "upgrade ran during an import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running for: ann' || fail "$OUT"
+  run remove ann --yes
+  [ "$RC" != 0 ] || fail "remove ran during the tenant's import"
+  adopt ann "$ADOPT_FILE"
+  [ "$RC" != 0 ] || fail "adopt ran during the tenant's import"
+  rm -rf -- "${SRV:?}/ann/import-inbox/20261016T000000Z-1"
+  run upgrade "$R/new-alice"
+  [ "$RC" = 0 ] || fail "upgrade after the import exited $RC: $OUT"
+  pass
+}
+
+dry_run_import_checks_the_disk_first() {
+  make_palace
+  FREE_KB=1000 run import ann "$PALACE" --dry-run
+  [ "$RC" != 0 ] || fail "a dry run copied without room"
+  printf '%s\n' "$OUT" | grep -qF 'needs twice its size plus 2 GB' || fail "$OUT"
+  [ -z "$(ls -A "$SRV/ann/import-inbox" 2>/dev/null)" ] || fail "something was copied"
+  pass
+}
+
 adopt_rolls_back_when_the_tenant_does_not_come_back() {
   PING_FAIL=1 adopt ann "$ADOPT_FILE"
   [ "$RC" != 0 ] || fail "adopt succeeded although the tenant did not come back"
@@ -917,7 +955,9 @@ add_team_writes_no_snippet() {
   has "$R/etc/systemd/system/alice@.service" 'ExecStart=/usr/local/bin/alice daemon run --tenant $ALICE_DAEMON_ARGS'
   hasnt "$TENANTS/bob.env" 'ALICE_DAEMON_ARGS'
   printf '%s\n' "$OUT" | grep -q 'https\?://' && fail "the team output prints a URL: $OUT"
-  [ "$(count_in 'tok-team-0123456789abcdef0123456789abcdef')" = 1 ] || fail "team token not printed exactly once: $OUT"
+  # Nobody needs the team store's token (final review M-9): it is never printed.
+  [ "$(count_in 'tok-team-')" = 0 ] || fail "the team token was printed: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'Its token stays on the server' || fail "$OUT"
   pass
 }
 
@@ -930,7 +970,8 @@ add_team_provisions_existing_tenants() {
     has "$TENANTS/$n.env" "ALICE_TENANT_NAME=$n"
     is_0600 "$SRV/$n/team.token" || fail "$n team.token is not mode 0600"
     cmp "$SRV/team/token" "$SRV/$n/team.token" || fail "$n team.token differs from the team token"
-    grep -qE "chown alice-$n:alice-$n .*$n/team.token" "$R/calls.log" || fail "no chown of $n team.token"
+    # Written through a mktemp file in the home (final review M-5), chowned, then moved into place.
+    grep -qE "chown alice-$n:alice-$n .*$n/\.team\.token\." "$R/calls.log" || fail "no chown of $n team.token"
     has "$R/calls.log" "systemctl restart alice@$n"
   done
   # idempotent: again, with an old tenant file that lacks ALICE_TENANT_NAME
@@ -955,7 +996,7 @@ add_person_after_team_is_provisioned() {
   has "$TENANTS/hal.env" 'ALICE_TENANT_NAME=hal'
   is_0600 "$SRV/hal/team.token" || fail "hal team.token is not mode 0600"
   cmp "$SRV/team/token" "$SRV/hal/team.token" || fail "hal team.token differs"
-  l_chown=$(grep -nE 'chown alice-hal:alice-hal .*hal/team.token' "$R/calls.log" | head -n 1 | cut -d: -f1)
+  l_chown=$(grep -nE 'chown alice-hal:alice-hal .*hal/\.team\.token\.' "$R/calls.log" | head -n 1 | cut -d: -f1 || true)
   l_start=$(grep -n 'systemctl enable --now alice@hal' "$R/calls.log" | head -n 1 | cut -d: -f1)
   [ -n "$l_chown" ] && [ -n "$l_start" ] && [ "$l_chown" -lt "$l_start" ] || fail "team.token not in place before the first start ($l_chown, $l_start)"
   PERSONAL="ann bob dave hal"
@@ -967,7 +1008,8 @@ rotate_team_rewrites_every_copy() {
   before=$(grep -c 'systemctl restart' "$R/calls.log" || true)
   run rotate team
   [ "$RC" = 0 ] || fail "rotate team exited $RC: $OUT"
-  [ "$(count_in 'tok-rot2-')" = 1 ] || fail "new team token not printed once: $OUT"
+  [ "$(count_in 'tok-rot2-')" = 0 ] || fail "the team token was printed: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'New team token in place' || fail "$OUT"
   has "$SRV/team/token" 'tok-rot2-'
   for n in $PERSONAL; do
     cmp "$SRV/team/token" "$SRV/$n/team.token" || fail "$n team.token was not rewritten"
@@ -1135,6 +1177,8 @@ for CURRENT in \
   upgrade_restores_the_library_when_the_binary_cannot_be_installed add_takes_a_time_zone \
   upgrade_adds_the_time_zone_to_older_tenants adopt_installs_and_reports adopt_refuses_and_leaves_the_tenant_as_it_was \
   adopt_refuses_bad_files_before_any_change adopt_rolls_back_when_the_tenant_does_not_come_back \
+  adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back commands_that_restart_daemons_wait_for_an_import \
+  dry_run_import_checks_the_disk_first \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \
   add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \

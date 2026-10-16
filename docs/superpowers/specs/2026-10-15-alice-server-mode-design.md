@@ -105,9 +105,8 @@
 
 ### 0.4 Out of scope
 
-Accounts, a web UI, a domain, Docker, encryption at rest, and moving an existing local **Alice** home
-onto a tenant. A person brings their history by importing their MemPalace palace instead (§3.8). Moving an Alice home is
-possible by hand (§10, Q2) but is not built here. (Shared team memory was out of scope here; addendum 3 brings it in,
+Accounts, a web UI, a domain, Docker and encryption at rest. (Moving an existing local Alice home onto a tenant was out
+of scope here; addendum 4 brings it in, §2.12. Shared team memory was out of scope here; addendum 3 brings it in,
 §2.10.)
 
 ---
@@ -422,7 +421,8 @@ last line with the free space on the disk that holds `/srv/alice`, and the size 
 
 ### 2.6 Jev per tenant
 
-Nothing is configured centrally. A person turns Jev on for their own tenant from their own client:
+*(Superseded by addendum 5, §2.13: one shared key set by the admin with `alice-server jev-key set`; the secret's name is
+`jev_api_key`, not `typesafe`.)* Nothing is configured centrally. A person turns Jev on for their own tenant from their own client:
 `alice config set-secret typesafe`, then `alice config set judge.provider jev`. Both go through `PUT /api/v1/secrets/typesafe`
 and `PATCH /api/v1/settings` to that tenant's `secrets.toml` (the `file` backend, 0600, owned by `alice-<name>`). The tenant's
 `judge.daily_budget_usd` caps the spend. Other tenants cannot read the file: separate Unix users, 0700 homes. The default
@@ -561,7 +561,8 @@ Its home gets `team.token` (the team's token; mode 0600, owned by `alice-<name>`
 Both variables join `NON_SETTING_ENV`. No setting, endpoint or answer reads, changes or reveals the team URL or token.
 
 **The link.** The personal daemon's `TeamLink` is built at start from `ALICE_TEAM_URL` and reads `<home>/team.token`.
-- It accepts only `http://127.0.0.1:<port>`, `http://localhost:<port>` or `http://[::1]:<port>`. Anything else disables
+- It accepts only `http://127.0.0.1:<port>` or `http://localhost:<port>` (`alice-server` writes 127.0.0.1; `[::1]` is
+  refused, which fails closed). Anything else disables
   the link, with a warning in the log and in health.
 - It verifies the team daemon's ping proof with the token (the proof check of §3.2, using the answer's instance) before
   the first call, and again after a 401 or a transport error, re-reading the token file.
@@ -674,6 +675,10 @@ about 6 hours to embed. The other people keep the MemPalace import.
   5. on any failure after the swap, swaps the tenant's own database back, so an unscrubbed copy is never served;
   6. reports memories, chunks, facts, projects, paths cleared, records rewritten, redactions, duplicates trashed, the
      saved database and the time.
+- Facts (`relations.object_literal`), entity names and topics are taken as they are: §2.12 redacts memories, raw chunks
+  and history only (final review M-8, parked). After the transaction the file is optimised (the four FTS5 tables merge)
+  and rewritten with `VACUUM`, so no replaced or deleted text stays in its pages (final review I-2); if the swap back
+  fails, `alice adopt` says `[not put back]` and `alice-server` leaves the tenant stopped (M-4).
 - Settings, secrets, the token and the Jev key are not taken from the source: only `alice.db` changes. The person's
   cloud denials therefore do not come along on their own (final review I-4): `--cloud-denied` (slugs, a-z 0-9 -) sets
   the tenant's `privacy.cloud_denied_projects` once it answers, and the report's `projects_with_roots` names the
@@ -1124,7 +1129,8 @@ daemon's connection is dropped by the unit's `IPAddressDeny` (R18), and the embe
   - the team store has no route from outside, and its token lives only in each personal home (0600);
   - the team URL and token cannot be read or set through any API;
   - a person can change only the shared memories they wrote;
-  - team texts never go to a person's cloud judge.
+  - a team text reaches a person's cloud judge only when the team store marks it `cloud_ok` and the person's own policy
+    allows its project (revised R35, Task 30).
 - **Import (addendum 1, dropped):** a person's palace never leaves their machine unredacted. The bundle holds only redacted text, and in block mode
   the drawers with secrets are held back. The server reads an uploaded SQLite file read-only with `trusted_schema = OFF`
   after `quick_check`, as the tenant's own Unix user, so a crafted file can only affect the tenant that sent it.
@@ -1242,7 +1248,8 @@ the tests cover the following.
    - Install rustup with the toolchain from `rust-toolchain.toml`, check out `feat/server-mode` and run
      `cargo build --release -p alice`.
    - Install the binary. Then remove `target/`, `~/.cargo/registry`, `~/.cargo/git`, the checkout and the toolchain
-     (`rustup self uninstall -y`).
+     (`rustup self uninstall -y`). *(Superseded by R38: the server builds its own binary with `build-release`, so the
+     checkout and the toolchain stay; see docs/server.md's disk budget.)*
    - Record `df -h` again. This happens before any tenant or import exists.
 2. Install `alice-server`, then run `alice-server add t1` and `alice-server add t2`. Diff the managed Caddyfile against
    `Caddyfile.pre-alice`: the IP certificate settings and `default_sni` must be unchanged. Check that a reload works through
@@ -1323,7 +1330,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R22 | **Wings travel as redacted names; no `ClientProject` per wing** | M3's wing map is name-based and imported projects are placeholders; the first `client_project` of the same slug adopts the placeholder and brings its mirror, which is the local behaviour | An imported project's own `.alice.toml` applies only from that project's first remote request on, as locally |
 | R23 | **Backups pinned to 2 scheduled, 0 weekly, no manual** on tenants (environment plus a tenant-mode refusal) | The disk is fixed (§2.7); manual backups are kept apart from the rotation | A person cannot make an extra copy on demand; the admin can |
 | R24 | **Upload guard:** 4 GiB cap, refused below 2 GB free after the upload, one at a time, swept after 1 hour | The import must never be what fills the disk | A palace whose redacted text exceeds 4 GiB cannot be imported in one go; no such palace is known |
-| R25 | After the build, **only the binary stays** (target, caches, checkout and toolchain removed) | About 6 GB back before any data exists | The next build reinstalls the toolchain (minutes) |
+| R25 | *(Superseded by R38: the build area stays.)* After the build, **only the binary stays** (target, caches, checkout and toolchain removed) | About 6 GB back before any data exists | The next build reinstalls the toolchain (minutes) |
 | R26 | The connection's default project is the **query `?project=<slug>`** on the MCP URL (addendum 2 let us pick header or query) | Every MCP client can set a URL; not every one can set custom headers; Caddy keeps the query when it strips the prefix | The slug shows in Caddy's access log (a project name, not a secret) |
 | R27 | An MCP project hint that names no stored project makes a placeholder with the **existing `import:` prefix**, not `mcp:` | The store adopts only `import:%` placeholders; an `mcp:` key would split one project between MCP writes and its import and never be adopted | The key's prefix reads "import" for a project that started over MCP (internal only) |
 | R28 | Tenant mode **forces `privacy.redact` on** for every write and refuses `privacy.redact = false` | Direct MCP sends text unredacted inside TLS; the server is the only place left to redact it | A person cannot store raw secrets on the server |
@@ -1353,8 +1360,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 
 - **Q1 — Trust model:** the admin (the owner) can read every tenant's memory and key; this is documented in `docs/server.md`.
 - **Q2 — History:** importing each person's own MemPalace palace into their own tenant is **in scope** (addendum 1, §3.8).
-  Moving an existing local Alice home stays out of scope (possible by hand: the admin restores a backup into the tenant
-  home, and R3 keeps those projects fail-closed until the owner's client sends each project's identity once).
+  Moving an existing local Alice home was out of scope here; addendum 4 brings it in (`alice-server adopt`, §2.12).
 - **Tenants:** `icue`, `joe-hermes`, `joe` and `petch`, created after the controller's go (§8.3 step 10).
 - **Addendum 2 (the owner, 2026-10-15 20:30):**
   - no Windows;

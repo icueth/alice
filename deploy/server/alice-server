@@ -347,8 +347,10 @@ drop_env_line() { # name KEY
   { grep -v "^$2=" "$f" || true; } | put "$f" 0644
 }
 write_team_token() { # name token: <home>/team.token, 0600, the tenant's own, through a temporary file
-  local tmp="$SRV/$1/team.token.tmp.$$"
+  local tmp
   [ -n "$2" ] || { printf 'alice-server: refusing to write an empty team.token for %s\n' "$1" >&2; return 1; }
+  # mktemp makes a new file (never one the tenant placed, nor a link's target) before root writes the token.
+  tmp=$(mktemp "$SRV/$1/.team.token.XXXXXX") || return 1
   { ( umask 077; printf '%s\n' "$2" >"${tmp:?}" ) \
     && chown "alice-$1:alice-$1" -- "${tmp:?}" \
     && chmod -- 0600 "${tmp:?}" \
@@ -422,6 +424,7 @@ add_fail() { rollback_add "$1"; die "$2 - undone, nothing is left of $1"; }
 cmd_add() { # name team(0|1) tz tz-given(0|1)
   local name=$1 team=${2:-0} tz=${3:-$DEFAULT_TZ} tz_given=${4:-0} home="$SRV/$1" port token
   need_host
+  if [ "$team" = 1 ]; then no_import_running; fi
   ensure_base
   if tenant_exists "$name" && [ "$tz_given" = 1 ]; then
     set_env_line "$name" TZ "$tz"
@@ -470,9 +473,8 @@ cmd_add() { # name team(0|1) tz tz-given(0|1)
   token=$(head -n 1 "$home/token")
 
   if [ "$team" = 1 ]; then
-    say "Created the team store."
-    say "Token (shown once; the personal tenants get their copy now, and alice-server rotate $name gives a new one):"
-    say "  $token"
+    say "Created the team store. Its token stays on the server: every personal tenant gets its copy now"
+    say "(alice-server rotate $name gives a new one)."
     provision_all || return 1
     return 0
   fi
@@ -490,6 +492,7 @@ cmd_remove() { # name [--yes]
   local name=$1 flag=${2:-} home="$SRV/$1" ans="" archive was_team=0
   case "$flag" in ""|--yes) ;; *) usage >&2; exit 2 ;; esac
   need_tenant "$name"
+  no_import_running "$name"
   if is_team "$name"; then was_team=1; fi
   if [ "$flag" != --yes ]; then
     printf 'Remove %s? Its home is archived in %s first, then deleted. [y/N] ' "$name" "$ARCHIVES" >&2
@@ -503,7 +506,9 @@ cmd_remove() { # name [--yes]
   mkdir -p "$ARCHIVES"; chmod 0700 "$ARCHIVES"
   if [ -d "$home" ]; then
     archive="$ARCHIVES/$name-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
-    ( umask 077; tar -czf "$archive" -C "$SRV" -- "$name" ) || die "could not archive $home; nothing was deleted"
+    # The model is left out: it is downloaded again by any new tenant.
+    ( umask 077; tar -czf "$archive" --exclude="$name/models" -C "$SRV" -- "$name" ) \
+      || die "could not archive $home; nothing was deleted"
     chmod -- 0600 "$archive"
     say "archived to $archive"
   fi
@@ -518,11 +523,15 @@ cmd_rotate() {
   local name=$1 token
   need_tenant "$name"
   need_host
-  token=$(as_tenant "$name" token rotate --show | tail -n 1)
+  token=$(as_tenant "$name" token rotate --show | tail -n 1) \
+    || die "rotating the token failed; the old one is still in force (journalctl -u alice@$name)"
   [ -n "$token" ] || die "alice printed no token"
-  say "New token for $name (shown once; the old one no longer works):"
-  say "  $token"
+  if ! is_team "$name"; then
+    say "New token for $name (shown once; the old one no longer works):"
+    say "  $token"
+  fi
   if is_team "$name"; then
+    say "New team token in place (it stays on the server)."
     local n
     while IFS= read -r n; do
       [ -n "$n" ] || continue
@@ -580,11 +589,16 @@ restart_all() { # progress goes to stderr; the failed tenants, space separated, 
 # Puts back what install_new replaced: the previous binary and library, or nothing at all after a first install.
 # A .prev only ever exists complete (keep_prev), so restoring one never puts a half copy in place.
 restore_prev() {
-  if [ -f "$BIN.prev" ]; then mv -- "${BIN:?}.prev" "${BIN:?}"
-  elif [ "$FIRST_INSTALL" = 1 ]; then rm -f -- "${BIN:?}"
+  local bin_ok=1 lib_ok=1
+  if [ -f "$BIN.prev" ]; then mv -- "${BIN:?}.prev" "${BIN:?}" || bin_ok=0
+  elif [ "$FIRST_INSTALL" = 1 ]; then rm -f -- "${BIN:?}" || bin_ok=0
   fi
-  if [ -f "$LIBDIR/$ORT_LIB.prev" ]; then mv -- "${LIBDIR:?}/$ORT_LIB.prev" "${LIBDIR:?}/$ORT_LIB"
-  elif [ "$NEW_LIB" = 1 ]; then rm -f -- "${LIBDIR:?}/${ORT_LIB:?}"
+  # The library is put back even when the binary could not be (each step is tried).
+  if [ -f "$LIBDIR/$ORT_LIB.prev" ]; then mv -- "${LIBDIR:?}/$ORT_LIB.prev" "${LIBDIR:?}/$ORT_LIB" || lib_ok=0
+  elif [ "$NEW_LIB" = 1 ]; then rm -f -- "${LIBDIR:?}/${ORT_LIB:?}" || lib_ok=0
+  fi
+  if [ "$bin_ok" = 0 ] || [ "$lib_ok" = 0 ]; then
+    die "the previous version could not be fully put back ($([ "$bin_ok" = 0 ] && printf 'the binary: move %s.prev to %s by hand' "$BIN" "$BIN")$([ "$bin_ok$lib_ok" = 00 ] && printf '; ')$([ "$lib_ok" = 0 ] && printf 'the library: move %s.prev to %s by hand' "$LIBDIR/$ORT_LIB" "$LIBDIR/$ORT_LIB"))"
   fi
 }
 
@@ -639,7 +653,8 @@ add_missing_tz() {
 }
 
 cmd_upgrade() { # binary (also the first install)
-  local new=$1 lib failed
+  local new=$1 lib failed still
+  no_import_running
   need_avx
   [ -f "$new" ] && [ -x "$new" ] || die "$new is not an executable file"
   # A build of deploy/server/build-release keeps its ONNX Runtime where the binary's rpath looks: ../lib/alice.
@@ -658,14 +673,34 @@ cmd_upgrade() { # binary (also the first install)
   failed=$(restart_all)
   if [ -n "$failed" ]; then
     restore_prev
-    restart_all >/dev/null || true
-    die "these tenants did not come back: $failed; the previous binary is restored"
+    still=$(restart_all) || true
+    if [ -n "$still" ]; then
+      die "these tenants did not come back: $failed. With the previous binary back, these are still down: $still. A database the new binary migrated cannot start on the old one: fix the failing tenant and run the upgrade again, or restore that tenant's pre-migration backup"
+    fi
+    die "these tenants did not come back: $failed; the previous binary is restored and every tenant runs on it again"
   fi
   if [ -f "$BIN.prev" ]; then
     say "upgraded to $("$BIN" --version); the previous binary is $BIN.prev"
   else
     say "installed $("$BIN" --version)"
   fi
+}
+
+# An import runs for hours and loses its palace if its daemon restarts: commands that restart daemons wait for it.
+imports_running() { # [name]: the tenants with an import in progress (all tenants without a name)
+  local d t names="" pat=${1:-*}   # a validated name, or every tenant
+  # shellcheck disable=SC2231
+  for d in "$SRV"/$pat/import-inbox/*/; do
+    [ -d "$d" ] || continue
+    t=${d#"$SRV"/}; t=${t%%/*}
+    case " $names " in *" $t "*) ;; *) names="$names $t" ;; esac
+  done
+  printf '%s' "${names# }"
+}
+no_import_running() { # [name]
+  local busy
+  busy=$(imports_running "${1:-}")
+  [ -z "$busy" ] || die "an import is running for: $busy; wait until it ends (it restarts no daemon), then run this again"
 }
 
 canon_dir() { # prints the physical path of a directory; fails when it is not one
@@ -692,6 +727,14 @@ cmd_import() { # name palace-dir [--dry-run]
   refuse_protected "$pal"
   if [ ! -f "$pal/sqlite_exact.sqlite3" ] && [ ! -f "$pal/chroma.sqlite3" ]; then
     die "$2 does not look like a MemPalace palace (no sqlite_exact.sqlite3 or chroma.sqlite3 inside); nothing was moved"
+  fi
+  [ ! -L "$SRV/$name/import-inbox" ] || die "$SRV/$name/import-inbox is a symbolic link; refusing to write through it"
+  if [ "$dry" = --dry-run ]; then # a dry run copies the palace: room for it first, as the daemon then checks
+    local size_k need free_k
+    size_k=$(du -sk -- "$pal" | cut -f1)
+    need=$(( 2 * size_k + 2 * 1024 * 1024 ))
+    free_k=$(free_kb)
+    [ "$free_k" -ge "$need" ] || die "a dry run copies the palace; it needs twice its size plus 2 GB free, and $(gb "$free_k") GB is free"
   fi
   job="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   IMPORT_DIR="$SRV/$name/import-inbox/$job"
@@ -732,15 +775,20 @@ cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
   need=$(( 2 * ($(file_bytes "$file") / 1024 + 1) + 2 * 1024 * 1024 ))
   free_k=$(free_kb)
   [ "$free_k" -ge "$need" ] || die "adopting $file needs twice its size plus 2 GB free; $(gb "$free_k") GB is free"
+  no_import_running "$name"
   ADOPT_DIR="$home/adopt-inbox"
   trap 'rm -rf -- "${ADOPT_DIR:?}"' EXIT
   trap 'exit 1' INT TERM HUP
+  rm -rf -- "${ADOPT_DIR:?}"   # anything placed there (a link included) goes; root then makes it anew
   install -d -m 0700 "$ADOPT_DIR"
   cp -- "$file" "$ADOPT_DIR/alice.db"
   chmod -- 0600 "$ADOPT_DIR/alice.db"
   chown -R "alice-$name:alice-$name" -- "$ADOPT_DIR"
   systemctl stop "alice@$name"
   if ! out=$(as_tenant "$name" --json adopt "$ADOPT_DIR/alice.db" 2>&1); then
+    if printf '%s\n' "$out" | grep -qF '[not put back]'; then
+      die "the adoption failed and $name's own database could not be put back, so $name stays stopped (it would serve the unscrubbed copy): $(printf '%s\n' "$out" | tail -n 1)"
+    fi
     systemctl start "alice@$name" || true
     die "nothing was adopted and $name is as it was: $(printf '%s\n' "$out" | tail -n 1)"
   fi

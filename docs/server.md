@@ -58,7 +58,7 @@ A tenant cannot reach the admin's network. The service unit allows only the publ
 
 `alice-server` manages `/etc/caddy/Caddyfile` from one template. The first time it runs, it copies your existing Caddyfile to `/etc/caddy/Caddyfile.pre-alice` and never overwrites that copy. Compare the two files before the switch. After every change it runs `caddy validate`, then reloads Caddy. If validation fails, it undoes the change and exits with an error. The template also moves Caddy's admin API from `localhost:2019` to a Unix socket, so a tenant cannot reach it.
 
-The script takes a lock, so two runs cannot overlap, and it is safe to run twice: a repeated command leaves the same state and says so.
+The script takes a lock, so two runs cannot overlap, and it is safe to run twice: a repeated command leaves the same state and says so. `import` is the exception: it can run for hours, and two may run at once. While one runs, `upgrade`, `add --team`, and `remove` or `adopt` of that tenant refuse to start, because they would restart the daemon the import needs.
 
 ### Commands
 
@@ -80,7 +80,7 @@ A tenant name matches `^[a-z][a-z0-9-]{0,15}$` (a lowercase letter, then up to 1
 
 #### add
 
-`alice-server add <name>` creates the user, the home directory (`/srv/alice/<name>`, mode 0700), a tenant file in `/etc/alice/tenants/` and a port (the lowest free one in 47801-47899). It starts the daemon, waits for it to answer (the first start downloads the model, about 118 MB), adds the Caddy route and prints the details once:
+`alice-server add <name>` creates the user, the home directory (`/srv/alice/<name>`, mode 0700), a tenant file in `/etc/alice/tenants/` and a port (the lowest free one in 47801-47899). It starts the daemon, waits for it to answer (the first start downloads the model, about about 130 MB), adds the Caddy route and prints the details once:
 
 ```
 Created tenant <name>.
@@ -154,7 +154,7 @@ The script moves the folder into the tenant's `import-inbox/` (owned by the tena
 - Settings, secrets, the token and the Jev key stay the tenant's own: only the database is replaced. So do the person's cloud rules: the projects they kept from the cloud on their machine (their `privacy.cloud_denied_projects`, and repositories whose `.alice.toml` says `cloud_denied = true`) are not denied on the tenant unless you name them with `--cloud-denied`, which sets the tenant's list once it is up. The report's `projects_with_roots` lists the projects that had a working tree on the machine, the ones to ask about.
 - The tenant starts again and rebuilds its vector index from the stored embeddings (no re-embedding, unless the source used another model). If it does not come back, its own database is put back.
 
-It prints a report: memories, chunks, facts and projects, the paths cleared and the redactions. Delete the backup file afterwards: it holds what the person's machine stored, before the server's redaction.
+It prints a report: memories, chunks, facts and projects, the paths cleared and the redactions. Facts, entity names and topics are taken as they are, not redacted again. The file is rewritten at the end (`VACUUM`), so nothing the redaction replaced or the person had deleted stays in it. Delete the backup file afterwards: it holds what the person's machine stored, before the server's redaction.
 
 #### jev-key
 
@@ -215,10 +215,13 @@ The disk is not grown for Alice, so the budget matters. Plan for these uses:
 
 | Use | Size |
 |---|---|
-| A tenant's home | up to about 2 GB for a large palace (fully embedded), plus the 118 MB model |
+| A tenant's home | about 16.8 KB per drawer with its two backups (measured: about 2.0 GB for 121,000 drawers), plus its own copy of the model, about 130 MB |
+| The server build | about 3 GB in the admin's checkout and toolchain (`target/` 2.1 GB, rustup 0.6 GB, cargo 0.3 GB); `cargo clean` in the checkout gives back 2.1 GB, and the next build then takes about 8 minutes instead of 3 |
+| The self-test's model | about 136 MB in `/var/cache/alice-server/models` |
+| The previous version | `alice.prev` and `libonnxruntime.so.1.prev`, about 52 MB |
 | Scheduled backups | one copy of the database each; about 1-1.5 GB for a large tenant |
 | Backups per tenant | 2 daily, no weekly (`ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0`); a tenant cannot make manual backups |
-| `remove` archives | a gzip of the removed home, in `/srv/alice/backups` |
+| `remove` archives | a gzip of the removed home without its model, in `/srv/alice/backups` |
 | Schema migrations | one extra copy of each database, kept 30 days |
 
 Rough totals: a large tenant uses about 4.4 GB with its two backups. Three smaller tenants use about 1.1 GB each. If four large tenants share one 28 GB disk, they do not fit with a 3 GB reserve.
@@ -392,6 +395,9 @@ Give your palace folder to your admin. The admin runs `alice-server import` (see
 | `alice-server list` warns about free space | Under 3 GB free | See [Disk budget](#disk-budget) |
 | A tenant is not `active` in `list` | The daemon stopped | `journalctl -u alice@<name>`, then `systemctl restart alice@<name>` |
 | `alice-server upgrade` exits with tenant names | Those tenants did not restart | The previous binary was restored; read `journalctl -u alice@<name>` |
+| `… still down: <names> … cannot start on the old one` after an upgrade | The new binary migrated those databases, and the old one cannot read them | Fix the failing tenant (its journal), then run the upgrade again; or restore that tenant's pre-migration backup |
+| `an import is running for: <names>` | An import is still embedding | Wait until it ends, then run the command again |
+| `the adoption failed … stays stopped` | The adopted database could not be swapped back | Run the `alice restore` command it names with `alice-server cli`, then `systemctl start alice@<name>` |
 | `alice-server: a secret is never passed on the command line` | You put a key after `set-secret` | Run `config set-secret jev_api_key` alone and paste the key at the prompt |
 | `unknown secret name; use one of: jev_api_key, embedding_api_key` | The secret's name is wrong | The Jev key is `jev_api_key` |
 | `these tenants did not take it (is their daemon running?)` after `jev-key set` | A tenant's daemon was down | Start it (`systemctl start alice@<name>`), then run `jev-key set` again |

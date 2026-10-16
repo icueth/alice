@@ -35,6 +35,9 @@ const PATH_KEY_PREFIX: &str = "path:";
 const ADOPTED_PREFIX: &str = "adopted:";
 /// The event a chunk redacted in place records (never undone: the old text held the secret).
 pub const CHUNK_REDACT_ACTION: &str = "chunk.redact";
+/// How an error starts when the adopted, unscrubbed database is still in place: `alice-server`
+/// then leaves the tenant stopped.
+pub const NOT_PUT_BACK: &str = "[not put back]";
 
 /// What `alice adopt` did.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -150,13 +153,20 @@ pub fn adopt(home: &AliceHome, path: &Path, now: DateTime<Utc>) -> Result<AdoptR
                 .as_ref()
                 .map(|saved| restore::swap(home, &dir, &dir.join(saved), now));
             return Err(match back {
+                Some(Ok(put_back)) => {
+                    // The swap back kept the adopted file, unscrubbed, as a before-restore copy.
+                    if let Some(copy) = put_back.saved_current_as {
+                        let _ = std::fs::remove_file(dir.join(copy));
+                    }
+                    AliceError::Other(format!(
+                        "adopting failed, the tenant's own database is back: {e}"
+                    ))
+                }
                 Some(Err(b)) => AliceError::Other(format!(
-                    "adopting failed ({e}), and the tenant's own database could not be put back ({b}); restore it with `alice restore {}`",
+                    "{NOT_PUT_BACK} adopting failed ({e}), and the tenant's own database could not be put back ({b}); restore it with `alice restore {}` before the tenant starts",
                     swapped.saved_current_as.as_deref().unwrap_or("")
                 )),
-                _ => AliceError::Other(format!(
-                    "adopting failed, the tenant's own database is back: {e}"
-                )),
+                None => AliceError::Other(format!("adopting failed: {e}")),
             });
         }
     };
@@ -180,6 +190,11 @@ fn finish(home: &AliceHome, redactor: &Arc<Redactor>) -> Result<AdoptReport> {
     let mut r = AdoptReport::default();
     scrub_paths(&tx, &mut r)?;
     redact_all(&tx, redactor, &mut r)?;
+    // A contentless FTS5 table keeps a deleted row's terms in its segments until they merge: the
+    // text replaced above, and whatever the person deleted on their machine, would stay readable.
+    for t in ["memories_fts", "memories_tri", "chunks_fts", "chunks_tri"] {
+        tx.execute(&format!("INSERT INTO {t}({t}) VALUES('optimize')"), [])?;
+    }
     let count = |table: &str| -> Result<u64> {
         Ok(
             tx.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
@@ -192,7 +207,9 @@ fn finish(home: &AliceHome, redactor: &Arc<Redactor>) -> Result<AdoptReport> {
     r.facts = count("relations")?;
     r.projects = count("projects")?;
     tx.commit()?;
-    // Into the main file now, so neither the WAL nor an old page holds the replaced text.
+    // The file is rewritten: free pages (the person's deleted rows ride along in a backup) and
+    // the pages of replaced text are gone, then the WAL goes into the main file.
+    conn.execute_batch("VACUUM")?;
     conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
     Ok(r)
 }

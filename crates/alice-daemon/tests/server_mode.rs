@@ -546,6 +546,8 @@ async fn an_admin_import_matches_a_local_import() {
             &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
             ServiceOptions {
                 tenant,
+                // An accept test must not depend on the host's free space.
+                free_space: Some(Arc::new(|_| Some(u64::MAX / 4))),
                 ..Default::default()
             },
         )
