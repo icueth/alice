@@ -3859,15 +3859,27 @@ fn hook(e: &Env, args: &[&str], input: &[u8], vars: &[(&str, &str)]) -> Output {
     out
 }
 
-/// Exit 0 with nothing on stdout or stderr.
-fn assert_quiet(o: &Output, what: &str) {
-    assert!(o.status.success(), "{what}: {}", o.status);
+/// Exit 0 with nothing on stdout or stderr; a failure shows `e`'s hook.log, where the hook says
+/// why.
+fn assert_quiet(e: &Env, o: &Output, what: &str) {
+    assert!(
+        o.status.success(),
+        "{what}: {}; hook.log: {:?}",
+        o.status,
+        hook_log(e)
+    );
     assert!(
         o.stdout.is_empty(),
-        "{what}: stdout {:?}",
-        String::from_utf8_lossy(&o.stdout)
+        "{what}: stdout {:?}; hook.log: {:?}",
+        String::from_utf8_lossy(&o.stdout),
+        hook_log(e)
     );
-    assert!(o.stderr.is_empty(), "{what}: stderr {:?}", stderr(o));
+    assert!(
+        o.stderr.is_empty(),
+        "{what}: stderr {:?}; hook.log: {:?}",
+        stderr(o),
+        hook_log(e)
+    );
 }
 
 /// The lines of `logs/hook.log`.
@@ -3988,10 +4000,15 @@ fn hook_notifies_and_capture_follows() {
         serde_json::json!({"stop_hook_active": false}),
     );
     let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &[]);
-    assert_quiet(&o, "stop");
+    assert_quiet(&e, &o, "stop");
     // Checked at once: the daemon drains its spool every few seconds, so later a spooled
     // notice would look delivered too.
-    assert_eq!(spooled(&e), 0, "the daemon took the notice");
+    assert_eq!(
+        spooled(&e),
+        0,
+        "the daemon took the notice; hook.log: {:?}",
+        hook_log(&e)
+    );
     eventually(
         || !raw_hits(&e, "quokkalantern").is_empty(),
         "the turn in the raw tier",
@@ -4027,9 +4044,19 @@ fn hook_session_start_prints_the_briefing_json() {
     };
     let args = ["session-start", "--agent", "claude-code"];
     let o = hook(&e, &args, &start("startup"), &[]);
-    assert!(o.status.success() && o.stderr.is_empty(), "{}", stderr(&o));
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout)
-        .unwrap_or_else(|err| panic!("not JSON ({err}): {}", String::from_utf8_lossy(&o.stdout)));
+    assert!(
+        o.status.success() && o.stderr.is_empty(),
+        "{}; hook.log: {:?}",
+        stderr(&o),
+        hook_log(&e)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|err| {
+        panic!(
+            "not JSON ({err}): {:?}; hook.log: {:?}",
+            String::from_utf8_lossy(&o.stdout),
+            hook_log(&e)
+        )
+    });
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
     let briefing = v["hookSpecificOutput"]["additionalContext"]
         .as_str()
@@ -4037,18 +4064,20 @@ fn hook_session_start_prints_the_briefing_json() {
     assert!(briefing.starts_with("# Context · work"), "{briefing}");
     assert!(briefing.contains("rotates every Monday"), "{briefing}");
     // A resumed session already holds its briefing.
-    assert_quiet(&hook(&e, &args, &start("resume"), &[]), "resume");
+    assert_quiet(&e, &hook(&e, &args, &start("resume"), &[]), "resume");
     // Codex gets it through the MCP instructions; its transcript path may be null.
     let codex = serde_json::to_vec(&serde_json::json!({"session_id": "s-codex-1",
         "transcript_path": null, "cwd": e.work, "hook_event_name": "SessionStart",
         "source": "startup"}))
     .unwrap();
     assert_quiet(
+        &e,
         &hook(&e, &["session-start", "--agent", "codex"], &codex, &[]),
         "codex",
     );
     e.ok(&["config", "set", "capture.briefing", "false"]);
     assert_quiet(
+        &e,
         &hook(&e, &args, &start("startup"), &[]),
         "capture.briefing = false",
     );
@@ -4066,8 +4095,8 @@ fn hook_with_the_daemon_down_spools_and_exits_zero() {
     let no_start = [("ALICE_NO_AUTOSTART", "1")];
     let input = hook_input("Stop", "s-down-1", &path, &e.work, serde_json::json!({}));
     let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &no_start);
-    assert_quiet(&o, "stop");
-    assert_eq!(spooled(&e), 1);
+    assert_quiet(&e, &o, "stop");
+    assert_eq!(spooled(&e), 1, "hook.log: {:?}", hook_log(&e));
     let entry = the_spooled_entry(&e);
     assert_eq!(entry["op"], "capture_notify", "{entry}");
     assert_eq!(entry["agent"], "claude-code", "{entry}");
@@ -4088,8 +4117,8 @@ fn hook_with_the_daemon_down_spools_and_exits_zero() {
         &start,
         &no_start,
     );
-    assert_quiet(&o, "session-start");
-    assert_eq!(spooled(&e), 2);
+    assert_quiet(&e, &o, "session-start");
+    assert_eq!(spooled(&e), 2, "hook.log: {:?}", hook_log(&e));
     assert!(
         e.daemon_json().is_none() && e.lock_free(),
         "no daemon was started"
@@ -4111,7 +4140,7 @@ fn hook_with_the_daemon_down_starts_one_detached() {
     let path = write_transcript(&transcripts_dir(&e, &e.work), "s-auto-1", "axolotlbeacon");
     let input = hook_input("Stop", "s-auto-1", &path, &e.work, serde_json::json!({}));
     let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &[]);
-    assert_quiet(&o, "stop");
+    assert_quiet(&e, &o, "stop");
     eventually(|| e.daemon_json().is_some(), "the daemon the hook started");
     eventually(|| spooled(&e) == 0, "the spool drained");
     eventually(
@@ -4160,7 +4189,7 @@ fn hook_never_fails_on_garbage_input() {
     ];
     for (i, (what, args, input)) in cases.iter().enumerate() {
         let o = hook(&e, args, input, &[]);
-        assert_quiet(&o, what);
+        assert_quiet(&e, &o, what);
         let log = hook_log(&e);
         assert_eq!(log.len(), i + 1, "{what}: one line each: {log:?}");
     }
@@ -4204,8 +4233,13 @@ fn hook_passes_a_thai_path_with_spaces_and_quotes() {
         "raw UTF-8 with escaped quotes"
     );
     let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &[]);
-    assert_quiet(&o, "stop");
-    assert_eq!(spooled(&e), 0, "the daemon took the notice");
+    assert_quiet(&e, &o, "stop");
+    assert_eq!(
+        spooled(&e),
+        0,
+        "the daemon took the notice; hook.log: {:?}",
+        hook_log(&e)
+    );
     eventually(
         || !raw_hits(&e, "numbatlantern").is_empty(),
         "the turn in the raw tier",
