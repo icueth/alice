@@ -715,8 +715,30 @@ async fn subagent_files_are_their_own_sources() {
     )
     .await;
     assert_eq!((a.turns_stored, a.chunks_stored), (0, 0));
-    assert_eq!(a.next_offset, tiny.len(), "the client moves past it");
+    assert_eq!(
+        a.next_offset, 0,
+        "the client keeps its place, so later growth is judged whole"
+    );
     assert!(!source_exists(&svc, "claude-code:session:sa:agent:agent2"));
+    // It grows past 200 characters: the whole file is captured, from its first turn.
+    tiny.prompt("sa-agent2-p2", "Now explain the choice.")
+        .reply(
+            "sa-agent2-a2",
+            &"The title names the feature and the reason it exists, nothing more. ".repeat(3),
+        );
+    let a = send(
+        &svc,
+        TranscriptQuery {
+            subagent: Some("agent2".into()),
+            ..q("sa", 0, "subagent-stop")
+        },
+        &tiny.bytes,
+    )
+    .await;
+    assert_eq!((a.turns_stored, a.next_offset), (2, tiny.len()));
+    let row = state_of(&svc, "claude-code:session:sa:agent:agent2").unwrap();
+    assert_eq!(row.gaps, 0, "never captured in part as a gap");
+    assert_eq!(chunks_holding(&svc, "Suggest a title."), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1138,4 +1160,184 @@ async fn an_unanswered_tool_call_keeps_the_turn_open_until_session_end() {
     assert!(state_of(&svc, &uri("ut")).unwrap().ended);
     let st = svc.capture_status().await.unwrap();
     assert!(st.sessions.iter().any(|s| s.uri == uri("ut") && s.ended));
+}
+
+// ---- Fix round 1 (Task 6a review) ----
+
+/// An offset beyond any transcript (over 2^53) is refused before anything is read or written:
+/// unchecked, it would overflow or be stored saturated and wedge the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offset_beyond_any_transcript_is_refused_and_leaves_no_state() {
+    let (_d, svc) = tenant();
+    let mut t = Transcript::default();
+    t.turn("big-off", 1, "an ordinary turn");
+    for offset in [(1u64 << 53) + 1, u64::MAX] {
+        for no_capture in [None, Some(1)] {
+            let e = svc
+                .capture_transcript(
+                    TranscriptQuery {
+                        no_capture,
+                        ..q("big-off", offset, "stop")
+                    },
+                    Bytes::from(t.bytes.clone()),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(e, alice_core::AliceError::Invalid(_)),
+                "{offset}: {e}"
+            );
+        }
+    }
+    assert!(!source_exists(&svc, &uri("big-off")), "no state is left");
+
+    // An existing source keeps its cursor and counts no gap.
+    let cursor = send(&svc, q("big-off", 0, "stop"), &t.bytes)
+        .await
+        .next_offset;
+    for offset in [(1u64 << 53) + 1, u64::MAX] {
+        let e = svc
+            .capture_transcript(q("big-off", offset, "stop"), Bytes::from_static(b"{}\n"))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, alice_core::AliceError::Invalid(_)), "{e}");
+    }
+    let row = state_of(&svc, &uri("big-off")).unwrap();
+    assert_eq!((row.byte_offset, row.gaps), (cursor, 0));
+}
+
+/// Controller ruling: Codex transcripts are refused until their reader exists (Task 17), so a
+/// client never re-sends a growing body that is never consumed, and no empty source is made.
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_uploads_are_refused_until_their_reader_exists() {
+    let (_d, svc) = tenant();
+    for event in ["session-start", "stop"] {
+        let e = svc
+            .capture_transcript(
+                TranscriptQuery {
+                    agent: "codex".into(),
+                    ..q("cx1", 0, event)
+                },
+                Bytes::from_static(b"{\"type\":\"session_meta\"}\n"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, alice_core::AliceError::Invalid(m) if m.contains("Codex")),
+            "{e}"
+        );
+    }
+    assert!(!source_exists(&svc, "codex:session:cx1"));
+    assert!(svc.capture_status().await.unwrap().sessions.is_empty());
+}
+
+/// `no_distill=1` turns the flag on for an existing source even when nothing new arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_distill_turns_on_for_an_existing_source_with_nothing_new() {
+    let (_d, svc) = tenant();
+    let mut t = Transcript::default();
+    t.turn("nd2", 1, "kept and distilled for now");
+    let cursor = send(&svc, q("nd2", 0, "stop"), &t.bytes).await.next_offset;
+    assert!(!state_of(&svc, &uri("nd2")).unwrap().no_distill);
+    let chunks = chunks_of(&svc, &uri("nd2")).len();
+
+    let a = send(
+        &svc,
+        TranscriptQuery {
+            no_distill: Some(1),
+            ..q("nd2", cursor, "stop")
+        },
+        b"",
+    )
+    .await;
+    assert_eq!((a.next_offset, a.turns_stored), (cursor, 0));
+    let row = state_of(&svc, &uri("nd2")).unwrap();
+    assert!(row.no_distill, "the flag turned on");
+    assert_eq!(row.byte_offset, cursor);
+    assert_eq!(chunks_of(&svc, &uri("nd2")).len(), chunks);
+}
+
+/// `session-start` registers a session the server never saw, even with nothing complete yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_start_registers_a_session_with_nothing_complete() {
+    let (_d, svc) = tenant();
+    let a = send(
+        &svc,
+        q("ss1", 0, "session-start"),
+        br#"{"type":"user","uuid":"ss1-p1","message":{"role":"us"#,
+    )
+    .await;
+    assert_eq!((a.next_offset, a.turns_stored, a.chunks_stored), (0, 0, 0));
+    let row = state_of(&svc, &uri("ss1")).expect("the session is registered");
+    assert_eq!((row.byte_offset, row.gaps, row.ended), (0, 0, false));
+    assert!(chunks_of(&svc, &uri("ss1")).is_empty());
+    let st = svc.capture_status().await.unwrap();
+    assert!(
+        st.sessions
+            .iter()
+            .any(|s| s.uri == uri("ss1") && s.chunks == 0)
+    );
+    // Any other event with nothing complete writes nothing for a session never seen.
+    send(
+        &svc,
+        q("ss2", 0, "stop"),
+        br#"{"type":"user","uuid":"ss2-p1","message":{"role":"us"#,
+    )
+    .await;
+    assert!(!source_exists(&svc, &uri("ss2")));
+}
+
+/// A pass that waits (the project's rules are unknown) records no gap, even from beyond the
+/// cursor; the gap is counted once, by the pass that captures.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_pass_records_no_gap() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    let repo = d.path().join("gap-repo");
+    std::fs::create_dir(&repo).unwrap();
+    let local = |q: TranscriptQuery| TranscriptQuery {
+        cwd: Some(repo.to_string_lossy().into_owned()),
+        ..q
+    };
+    let mut t = Transcript::default();
+    t.turn("wg", 1, "captured before the break");
+    let c1 = t.len();
+    t.turn("wg", 2, "skipped by the client");
+    let c2 = t.len();
+    t.turn("wg", 3, "sent from beyond the cursor");
+    assert_eq!(
+        send(&svc, local(q("wg", 0, "stop")), &t.bytes[..c1 as usize])
+            .await
+            .next_offset,
+        c1
+    );
+
+    std::fs::write(repo.join(".alice.toml"), "[privacy\nno_capture = tru").unwrap();
+    let a = send(&svc, local(q("wg", c2, "stop")), &t.bytes[c2 as usize..]).await;
+    assert_eq!(
+        (a.next_offset, a.turns_stored),
+        (c2, 0),
+        "the pass waits: nothing consumed"
+    );
+    let row = state_of(&svc, &uri("wg")).unwrap();
+    assert_eq!((row.gaps, row.byte_offset), (0, c1), "no gap is recorded");
+
+    std::fs::write(
+        repo.join(".alice.toml"),
+        "[privacy]\nblock_secrets = false\n",
+    )
+    .unwrap();
+    let t0 = Instant::now();
+    loop {
+        let a = send(&svc, local(q("wg", c2, "stop")), &t.bytes[c2 as usize..]).await;
+        if a.turns_stored > 0 {
+            assert_eq!(a.next_offset, t.len());
+            break;
+        }
+        assert_eq!(a.next_offset, c2);
+        assert!(t0.elapsed() < Duration::from_secs(30), "never captured");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let row = state_of(&svc, &uri("wg")).unwrap();
+    assert_eq!((row.gaps, row.byte_offset), (1, t.len()), "counted once");
 }

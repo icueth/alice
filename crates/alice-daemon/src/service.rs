@@ -4105,6 +4105,8 @@ impl Service {
 
     /// [`capture_transcript`](Self::capture_transcript) with the whole report of the pass.
     ///
+    /// - refused (`Invalid`, nothing written): an unknown agent or event, a bad id, an offset
+    ///   over [`crate::capture::MAX_OFFSET`], and Codex (no reader until Task 17);
     /// - `no_capture=1` is a no-op: nothing is read or written, and the client moves past the
     ///   body's last complete line;
     /// - the project: on a server tenant, the hint (`project_header`, the `X-Alice-Project`
@@ -4125,11 +4127,19 @@ impl Service {
                 q.agent
             ))
         })?;
+        // Controller ruling: nothing reads a Codex rollout yet (Task 17). Accepted, its offset
+        // would never move and the client would send a growing body on every event.
+        if agent == alice_core::capture::AgentKind::Codex {
+            return Err(AliceError::invalid(
+                "Codex transcripts are not captured by this server yet; capture for Codex arrives in a later version",
+            ));
+        }
         crate::capture::check_ids(&q.session, q.subagent.as_deref())?;
         crate::capture::check_event(&q.event)?;
+        crate::capture::check_offset(q.offset)?;
         if q.no_capture.is_some_and(|v| v != 0) {
             let uri = agent.source_uri(&q.session, q.subagent.as_deref());
-            return Ok(PassReport::not_captured(uri, q.offset, &body));
+            return PassReport::not_captured(uri, q.offset, &body);
         }
         let nonempty = |s: &Option<String>| s.clone().filter(|v| !v.trim().is_empty());
         let hint = nonempty(&q.project_header).or_else(|| nonempty(&q.project));

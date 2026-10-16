@@ -54,6 +54,10 @@ const MIN_SUBAGENT_CHARS: usize = 200;
 const SKIPPED_KEYS_PER_SLICE: usize = 500;
 /// How many days of unrecognised-line counts are kept.
 const UNKNOWN_DAYS: i64 = 7;
+/// The largest byte offset a transcript can have: 2^53, exact in every JSON client and far
+/// beyond any transcript. A larger offset is refused before anything is read, so no offset
+/// arithmetic can overflow and no cursor is stored saturated (SQLite integers are signed).
+pub const MAX_OFFSET: u64 = 1 << 53;
 
 /// The events a transcript upload can be for (spec §5.2).
 pub const UPLOAD_EVENTS: &[&str] = &[
@@ -83,7 +87,8 @@ pub struct PassInput {
     /// The transcript's bytes from `offset`. Only the first `MAX_PASS_BYTES` are read, and only
     /// complete lines are used.
     pub bytes: Bytes,
-    /// The byte offset of `bytes[0]` in the transcript.
+    /// The byte offset of `bytes[0]` in the transcript; at most [`MAX_OFFSET`] (a larger one
+    /// is refused).
     pub offset: u64,
     /// `bytes` start at byte 0 of the transcript (records before the first prompt are a head
     /// turn, not the late tail of an earlier one).
@@ -117,8 +122,9 @@ pub struct PassReport {
     pub behind: Option<u64>,
     /// What the capture rules decided; `None` when the pass stopped before asking.
     pub verdict: Option<CaptureVerdict>,
-    /// Why the whole pass was dropped (a subagent too short, subagents off): nothing was
-    /// written, and `next_offset` moves past what was read.
+    /// Why the whole pass was dropped: nothing was written. With subagents off `next_offset`
+    /// moves past what was read; a subagent too short to keep leaves it at `offset`, so the
+    /// file is judged whole again when it grows (never captured in part, as a gap).
     pub dropped: Option<&'static str>,
     /// The bytes started beyond the cursor: the cursor moved there and the gap was counted.
     pub gap: bool,
@@ -154,13 +160,13 @@ impl PassReport {
 
     /// An upload the client asked not to capture (`no_capture=1`): nothing is read or written,
     /// and the client moves past the body's last complete line.
-    pub fn not_captured(uri: String, offset: u64, body: &[u8]) -> Self {
+    pub fn not_captured(uri: String, offset: u64, body: &[u8]) -> Result<Self> {
         let lines = body.iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
-        PassReport {
+        Ok(PassReport {
             uri,
-            next_offset: offset + lines as u64,
+            next_offset: offset_plus(offset, lines as u64)?,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -177,6 +183,28 @@ pub fn check_ids(session: &str, subagent: Option<&str>) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Checks an upload's offset: at most [`MAX_OFFSET`].
+pub fn check_offset(offset: u64) -> Result<()> {
+    if offset > MAX_OFFSET {
+        return Err(AliceError::invalid(format!(
+            "the offset {offset} is beyond any transcript (at most {MAX_OFFSET}); send the byte offset of the body's first byte in the file"
+        )));
+    }
+    Ok(())
+}
+
+/// `offset + n`, refused when it would pass [`MAX_OFFSET`] (and so never overflows).
+fn offset_plus(offset: u64, n: u64) -> Result<u64> {
+    offset
+        .checked_add(n)
+        .filter(|&end| end <= MAX_OFFSET)
+        .ok_or_else(|| {
+            AliceError::invalid(format!(
+                "the offset {offset} plus {n} bytes is beyond any transcript (at most {MAX_OFFSET}); send the byte offset of the body's first byte in the file"
+            ))
+        })
 }
 
 /// Checks an upload's event (spec §5.2).
@@ -246,7 +274,8 @@ impl Drop for SourceLock<'_> {
 struct Unit {
     key: String,
     chunks: Vec<capture::RenderedChunk>,
-    /// Where it ends in the pass's bytes: the next turn's start, or what the read consumed.
+    /// Where it ends, as a byte offset in the transcript: the next turn's start, or the end of
+    /// what the read consumed.
     end: u64,
     /// A turn (`false`: a tail, which continues the previous turn).
     turn: bool,
@@ -306,6 +335,7 @@ impl CaptureCtl {
     }
 
     fn pass(&self, uri: &str, input: PassInput) -> Result<PassReport> {
+        check_offset(input.offset)?;
         let mut report = PassReport {
             uri: uri.to_owned(),
             next_offset: input.offset,
@@ -338,7 +368,7 @@ impl CaptureCtl {
             report.oversized_line = true;
             return Ok(report);
         }
-        let done = input.offset + out.consumed;
+        let done = offset_plus(input.offset, out.consumed)?;
 
         let owner = state.as_ref().map(|s| s.project_id.clone());
         let identity = self
@@ -369,9 +399,9 @@ impl CaptureCtl {
                 .map(|c| c.text.chars().count())
                 .sum();
             if chars < MIN_SUBAGENT_CHARS {
+                // `next_offset` stays at `offset`: the file is judged whole when it grows.
                 report.dropped = Some("the subagent's whole rendering is under 200 characters");
                 report.turns_skipped = out.turns.len() as u64;
-                report.next_offset = done;
                 return Ok(report);
             }
         }
@@ -388,13 +418,18 @@ impl CaptureCtl {
             .readers
             .with(|c| store::known_turns(c, input.agent.as_str(), &keys))?;
         let imported_until = mempalace_imported_until(&input);
+        // Where each turn ends in the transcript: where the next starts, the last at `done`.
         let ends: Vec<u64> = out
             .turns
             .iter()
             .skip(1)
-            .map(|t| t.start)
-            .chain([out.consumed])
-            .collect();
+            .map(|t| offset_plus(input.offset, t.start))
+            .chain([Ok(done)])
+            .collect::<Result<_>>()?;
+        let tail_end = match out.turns.first() {
+            Some(t) => offset_plus(input.offset, t.start)?,
+            None => done,
+        };
         let mut seen = HashSet::new();
         let mut units = Vec::new();
         if let Some(key) = out.tail_key.clone()
@@ -404,7 +439,7 @@ impl CaptureCtl {
             units.push(Unit {
                 key,
                 chunks: out.tail,
-                end: out.turns.first().map_or(out.consumed, |t| t.start),
+                end: tail_end,
                 turn: false,
                 started_at: None,
             });
@@ -578,11 +613,7 @@ fn excluded_slices(
             end = unit.end;
         }
         let last = units.peek().is_none();
-        slice.cursor = Some(if last {
-            (done, next_ord)
-        } else {
-            (input.offset + end, next_ord)
-        });
+        slice.cursor = Some((if last { done } else { end }, next_ord));
         slice.ended = last && input.end;
         slices.push(slice);
         if last {
@@ -628,7 +659,7 @@ fn stored_slices(
             next_ord += 1;
         }
         slice.turn_keys.push((unit.key, first_ord));
-        complete = (input.offset + unit.end, next_ord);
+        complete = (unit.end, next_ord);
     }
     slice.cursor = Some((done, next_ord));
     slice.ended = input.end;
@@ -991,6 +1022,27 @@ mod tests {
     }
 
     #[test]
+    fn offsets_stay_within_max_offset_and_never_overflow() {
+        assert!(check_offset(MAX_OFFSET).is_ok());
+        assert!(check_offset(MAX_OFFSET + 1).is_err());
+        assert!(check_offset(u64::MAX).is_err());
+        assert_eq!(offset_plus(10, 5).unwrap(), 15);
+        assert_eq!(offset_plus(MAX_OFFSET - 5, 5).unwrap(), MAX_OFFSET);
+        assert!(offset_plus(MAX_OFFSET, 1).is_err());
+        assert!(
+            offset_plus(u64::MAX, 1).is_err(),
+            "an overflow is refused, not wrapped"
+        );
+        assert!(PassReport::not_captured("u".into(), u64::MAX, b"x\n").is_err());
+        assert_eq!(
+            PassReport::not_captured("u".into(), 7, b"a\nb\nhalf")
+                .unwrap()
+                .next_offset,
+            11
+        );
+    }
+
+    #[test]
     fn fit_cuts_at_a_character_boundary() {
         let text = "é".repeat(MAX_CHUNK_BYTES);
         let cut = fit(text);
@@ -1053,10 +1105,10 @@ mod tests {
     fn slices_carry_keys_and_cursors_with_each_turns_last_chunk() {
         let big = INGEST_SLICE_BYTES / 2 + 1;
         let units = vec![
-            unit("a", &[10, 10], 100),
-            unit("b", &[big, big, big], 200),
-            unit("empty", &[], 220),
-            unit("c", &[10], 300),
+            unit("a", &[10, 10], 1100),
+            unit("b", &[big, big, big], 1200),
+            unit("empty", &[], 1220),
+            unit("c", &[10], 1300),
         ];
         let slices = stored_slices(&base(), &input(1000, true), units, 1350, 7);
         /// `(ords, turn keys, cursor, record_event, ended)` of a slice.
@@ -1110,7 +1162,7 @@ mod tests {
     #[test]
     fn excluded_slices_record_keys_and_move_the_cursor() {
         let units: Vec<Unit> = (0..1_200)
-            .map(|i| unit(&format!("k{i}"), &[10], i + 1))
+            .map(|i| unit(&format!("k{i}"), &[10], 50 + i + 1))
             .collect();
         let slices = excluded_slices(&base(), &input(50, false), units, 1_300, 4);
         assert_eq!(
