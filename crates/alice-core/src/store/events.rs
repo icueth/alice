@@ -15,6 +15,8 @@ pub enum Actor {
     Agent(String),
     User,
     Judge(String),
+    /// A memory distilled from a captured session, by the provider that chose it (SP2 spec §6.5).
+    Distill(String),
     Sync,
     Import,
     /// Maintenance jobs (purges, retention).
@@ -27,6 +29,7 @@ impl Actor {
             Actor::Agent(a) => format!("agent:{a}"),
             Actor::User => "user".into(),
             Actor::Judge(p) => format!("judge:{p}"),
+            Actor::Distill(p) => format!("distill:{p}"),
             Actor::Sync => "sync".into(),
             Actor::Import => "import".into(),
             Actor::System => "system".into(),
@@ -42,6 +45,7 @@ impl Actor {
             _ => match s.split_once(':') {
                 Some(("agent", a)) => Actor::Agent(a.into()),
                 Some(("judge", p)) => Actor::Judge(p.into()),
+                Some(("distill", p)) => Actor::Distill(p.into()),
                 _ => Actor::Agent(s.into()),
             },
         }
@@ -85,7 +89,8 @@ pub struct EventRow {
     pub id: String,
     pub ts: String,
     pub hlc: String,
-    /// `agent:<name>`, `user`, `judge:<provider>`, `sync`, `import` or `system`.
+    /// `agent:<name>`, `user`, `judge:<provider>`, `distill:<provider>`, `sync`, `import` or
+    /// `system`.
     pub actor: String,
     pub action: String,
     pub target_type: String,
@@ -260,6 +265,7 @@ mod tests {
             Actor::Agent("claude-code".into()),
             Actor::User,
             Actor::Judge("jev".into()),
+            Actor::Distill("jev".into()),
             Actor::Sync,
             Actor::Import,
             Actor::System,
@@ -271,6 +277,7 @@ mod tests {
                 serde_json::Value::String(s)
             );
         }
+        assert_eq!(Actor::Distill("jev".into()).as_string(), "distill:jev");
         use crate::model::Author;
         assert_eq!(Actor::from_author(&Author::default()), Actor::User);
         assert_eq!(

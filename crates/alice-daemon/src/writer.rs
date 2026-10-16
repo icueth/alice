@@ -9,9 +9,10 @@ use alice_core::api::StreamItem;
 use alice_core::error::{AliceError, Result};
 use alice_core::ids::{Hlc, new_id};
 use alice_core::judge::pipeline::JudgeAction;
-use alice_core::model::{Kind, Memory, Status};
+use alice_core::model::{Kind, Memory, Origin, SourceType, Status};
 use alice_core::project::ProjectRef;
 use alice_core::redact::Redactor;
+use alice_core::store::capture::{self as capture_store, DistillState};
 use alice_core::store::embeddings::{self, VecKey};
 use alice_core::store::events::{self, Actor, EventInput};
 use alice_core::store::history::{self, UndoOutcome};
@@ -117,6 +118,77 @@ pub struct Judgement {
     /// text. An action on one that has changed since becomes a review item instead (nothing is
     /// applied on stale information).
     pub seen: Vec<(String, String)>,
+}
+
+/// The provider that distils memories from captured sessions; their events carry the actor
+/// `distill:<provider>` (SP2 spec §6.5).
+const DISTILL_PROVIDER: &str = "jev";
+
+/// One slice of a capture pass (SP2 spec §3.8), written in one transaction.
+#[derive(Debug, Clone)]
+pub struct CaptureSlice {
+    /// The transcript's source: type `session`, uri `<agent>:session:<id>[:agent:<id>]`.
+    pub source: SourceInput,
+    /// The project of a new source. An existing source keeps its own (spec §3.1).
+    pub project: ProjectChoice,
+    /// The capture state of a new source.
+    pub init: CaptureInit,
+    /// At most [`INGEST_SLICE`] chunks and [`INGEST_SLICE_BYTES`] of text.
+    pub chunks: Vec<ChunkInput>,
+    /// `(turn key, first ord)` of the turns that end in this slice. A turn that rendered no
+    /// chunk names the ord the next chunk would get.
+    pub turn_keys: Vec<(String, i64)>,
+    /// Keys of turns that are not stored (an excluded project, spec §3.6). Recorded with the ord
+    /// the next chunk would get.
+    pub skipped_keys: Vec<String>,
+    /// `(byte_offset, next_ord)` after the slice's last complete turn.
+    pub cursor: Option<(u64, i64)>,
+    /// The hook event behind the pass.
+    pub last_event: Option<String>,
+    /// The session ended (an ended source stays ended).
+    pub ended: bool,
+    /// Record the pass's `source.capture` event with this slice, if it stored a chunk.
+    pub record_event: bool,
+}
+
+/// What a new capture source's state starts with.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureInit {
+    pub agent: String,
+    pub session_id: String,
+    /// A subagent's main session; its source id is stored when that source exists.
+    pub parent_uri: Option<String>,
+    /// Local only.
+    pub transcript_path: Option<String>,
+    /// Local only: `dev:inode:sha256(first line)`.
+    pub file_key: Option<String>,
+    /// The tenant client's flag. It only ever turns on.
+    pub no_distill: bool,
+}
+
+/// A change to a capture source's state (`WriteOp::CaptureStateUpdate`).
+#[derive(Debug, Clone)]
+pub enum CaptureChange {
+    /// Where its distillation stands, when it is tried next, and how often it failed.
+    Distill {
+        state: DistillState,
+        next_try_at: Option<String>,
+        attempts: i64,
+    },
+    /// Its chunks below `distill_ord` are distilled (it never moves back).
+    Distilled {
+        distill_ord: i64,
+    },
+    Ended,
+    /// A tenant client sent from beyond the cursor: the cursor moves there.
+    Gap {
+        byte_offset: u64,
+    },
+    /// The local file is new or was replaced: its identity and where reading goes on.
+    FileKey {
+        file_key: String,
+        byte_offset: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -295,6 +367,17 @@ pub enum WriteOp {
         into: String,
         actor: Actor,
     },
+    /// One slice of a capture pass (SP2 spec §3.8): the source and its capture state (created
+    /// if new), the chunks, the turn keys and the cursor, in one transaction. It is written
+    /// whole and counts against the ingest slice budget: it joins a group commit only if it
+    /// fits what is left, and a fresh commit always takes it. Answers `Captured`.
+    CaptureSlice(Box<CaptureSlice>),
+    /// A change to a capture source's state. Answers `Count`: 0 when the source has no capture
+    /// state (retention deleted it).
+    CaptureStateUpdate {
+        source_id: String,
+        change: CaptureChange,
+    },
     Shutdown,
 }
 
@@ -321,6 +404,11 @@ pub enum WriteOutcome {
     Imported(BatchOutcome),
     /// A project merge: what moved, and the event that recorded it.
     ProjectMerged(Box<(project_merge::MergeDone, String)>),
+    /// A capture slice: its source, and the chunks it stored (repeats are not counted).
+    Captured {
+        source_id: String,
+        inserted: usize,
+    },
     Done,
 }
 
@@ -342,6 +430,7 @@ impl WriteOutcome {
             WriteOutcome::Flag(_) => "Flag",
             WriteOutcome::Imported(_) => "Imported",
             WriteOutcome::ProjectMerged(_) => "ProjectMerged",
+            WriteOutcome::Captured { .. } => "Captured",
             WriteOutcome::Done => "Done",
         }
     }
@@ -574,7 +663,10 @@ fn remember(
     let out = memories::insert(conn, &prepared)?;
     if let InsertOutcome::New { id, .. } = &out {
         st.inserted = true;
-        let actor = Actor::from_author(&prepared.author);
+        let actor = match prepared.origin {
+            Origin::Distill => Actor::Distill(DISTILL_PROVIDER.into()),
+            Origin::Agent | Origin::Import => Actor::from_author(&prepared.author),
+        };
         let group = (!prepared.supersedes.is_empty()).then(new_id);
         let after = snap(conn, id)?;
         record(
@@ -1501,6 +1593,173 @@ fn merge_projects(
     )))))
 }
 
+/// `WriteOp::CaptureSlice`. Everything is checked before anything is written; a failure rolls
+/// back the whole slice (its savepoint), so chunks, keys and cursor land together or not at all.
+fn capture_slice(conn: &Connection, slice: Box<CaptureSlice>, st: &mut State) -> Result<Applied> {
+    let bytes: usize = slice.chunks.iter().map(|c| c.text.len()).sum();
+    let fresh = st.chunk_budget == INGEST_SLICE && st.byte_budget == INGEST_SLICE_BYTES;
+    if !fresh && (slice.chunks.len() > st.chunk_budget || bytes > st.byte_budget) {
+        return Ok(Applied::More(WriteOp::CaptureSlice(slice), None));
+    }
+    let s = *slice;
+    if s.source.source_type != SourceType::Session {
+        return Err(AliceError::invalid(
+            "a captured transcript must be a source of type session",
+        ));
+    }
+    if s.turn_keys
+        .iter()
+        .map(|(k, _)| k)
+        .chain(&s.skipped_keys)
+        .any(|k| k.is_empty())
+    {
+        return Err(AliceError::invalid(
+            "a capture turn key is empty; every captured turn needs its key",
+        ));
+    }
+    sources::validate_chunks(&s.chunks)?;
+    st.chunk_budget = st.chunk_budget.saturating_sub(s.chunks.len());
+    st.byte_budget = st.byte_budget.saturating_sub(bytes);
+    #[cfg(test)]
+    st.applied.push("CaptureSlice");
+    // The source owns its project (spec §3.1): only a new source takes the one the slice
+    // names, so a later slice neither moves it nor creates the project it named.
+    let owner: Option<String> = conn
+        .query_row(
+            "SELECT project_id FROM sources WHERE type = ?1 AND uri = ?2",
+            rusqlite::params![s.source.source_type.as_str(), s.source.uri],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let project = match owner {
+        Some(id) => projects::get_by_id(conn, &id)?,
+        None => resolve(conn, &s.project)?,
+    };
+    let out = sources::ingest(conn, &project, &s.source, &s.chunks)?;
+    // The source spans its first and its newest captured record.
+    let times: Vec<String> = s
+        .chunks
+        .iter()
+        .filter_map(|c| sources::normalise_authored(c.authored_at.as_deref()))
+        .collect();
+    if let (Some(first), Some(newest)) = (times.iter().min(), times.iter().max()) {
+        conn.execute(
+            "UPDATE sources SET started_at = COALESCE(started_at, ?2),
+                ended_at = CASE WHEN ended_at IS NULL OR ended_at < ?3 THEN ?3 ELSE ended_at END
+             WHERE id = ?1",
+            rusqlite::params![out.source_id, first, newest],
+        )?;
+    }
+    let parent = match &s.init.parent_uri {
+        Some(uri) => capture_store::source_id_by_uri(conn, uri)?,
+        None => None,
+    };
+    capture_store::ensure_state(
+        conn,
+        &out.source_id,
+        &capture_store::NewState {
+            agent: &s.init.agent,
+            session_id: &s.init.session_id,
+            parent_source_id: parent.as_deref(),
+            transcript_path: s.init.transcript_path.as_deref(),
+            file_key: s.init.file_key.as_deref(),
+            no_distill: s.init.no_distill,
+        },
+    )?;
+    let (agent, stored_next): (String, i64) = conn.query_row(
+        "SELECT agent, next_ord FROM capture_state WHERE source_id = ?1",
+        [&out.source_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let next_ord = match s.cursor {
+        Some((_, ord)) => ord,
+        None => s
+            .chunks
+            .iter()
+            .map(|c| c.ord + 1)
+            .fold(stored_next, i64::max),
+    };
+    let keys = s
+        .turn_keys
+        .iter()
+        .map(|(k, ord)| (k.as_str(), *ord))
+        .chain(s.skipped_keys.iter().map(|k| (k.as_str(), next_ord)));
+    let new_keys = capture_store::record_turns(conn, &agent, &out.source_id, keys)?;
+    capture_store::advance(
+        conn,
+        &out.source_id,
+        &capture_store::Progress {
+            cursor: s.cursor,
+            last_event: s.last_event.as_deref(),
+            ended: s.ended,
+            captured: out.inserted > 0 || new_keys > 0,
+        },
+    )?;
+    if out.inserted > 0 {
+        st.inserted = true;
+    }
+    // One history row per pass, like `source.ingest`: never per chunk, and not undoable.
+    if s.record_event && out.inserted > 0 {
+        let actor = Actor::from_author(&alice_core::model::Author {
+            agent: Some(agent.clone()),
+            ..Default::default()
+        });
+        record(
+            conn,
+            st,
+            EventInput {
+                actor: &actor,
+                action: "source.capture",
+                target_type: "source",
+                target_id: &out.source_id,
+                before: None,
+                after: Some(serde_json::json!({
+                    "source_id": out.source_id,
+                    "uri": s.source.uri,
+                    "agent": agent,
+                    "session_id": s.init.session_id,
+                    "inserted": out.inserted,
+                    "skipped": out.skipped,
+                    "turns": s.turn_keys.len(),
+                    "turns_skipped": s.skipped_keys.len(),
+                    "bytes": bytes,
+                })),
+                group: None,
+            },
+        )?;
+    }
+    Ok(Applied::Done(WriteOutcome::Captured {
+        source_id: out.source_id,
+        inserted: out.inserted,
+    }))
+}
+
+/// `WriteOp::CaptureStateUpdate`: the rows changed (0: no such capture source).
+fn capture_state_update(
+    conn: &Connection,
+    source_id: &str,
+    change: &CaptureChange,
+) -> Result<usize> {
+    match change {
+        CaptureChange::Distill {
+            state,
+            next_try_at,
+            attempts,
+        } => capture_store::set_distill(conn, source_id, *state, next_try_at.as_deref(), *attempts),
+        CaptureChange::Distilled { distill_ord } => {
+            capture_store::set_distilled(conn, source_id, *distill_ord)
+        }
+        CaptureChange::Ended => capture_store::set_ended(conn, source_id),
+        CaptureChange::Gap { byte_offset } => {
+            capture_store::record_gap(conn, source_id, *byte_offset)
+        }
+        CaptureChange::FileKey {
+            file_key,
+            byte_offset,
+        } => capture_store::set_file_key(conn, source_id, file_key, *byte_offset),
+    }
+}
+
 fn apply(
     conn: &Connection,
     op: WriteOp,
@@ -1692,6 +1951,10 @@ fn apply(
         WriteOp::ImportBatch(batch) => return import_batch(conn, batch, st),
         WriteOp::MergeProjects { from, into, actor } => {
             return merge_projects(conn, from, into, actor, st);
+        }
+        WriteOp::CaptureSlice(slice) => return capture_slice(conn, slice, st),
+        WriteOp::CaptureStateUpdate { source_id, change } => {
+            WriteOutcome::Count(capture_state_update(conn, &source_id, &change)?)
         }
         WriteOp::Shutdown => WriteOutcome::Done,
     };
@@ -5798,5 +6061,467 @@ mod tests {
         let n: i64 = f.read("SELECT count(*) FROM projects", []);
         assert_eq!(n, 1, "no placeholder came of a refused move");
         assert_eq!(project_of(&f, &a), "global");
+    }
+
+    // ---- SP2 capture (Task 5) ----
+
+    const CAPTURE_AGENT: &str = "claude-code";
+
+    fn capture_uri(session: &str) -> String {
+        format!("{CAPTURE_AGENT}:session:{session}")
+    }
+
+    /// A capture slice of `session` holding the chunks `ords` (authored one second apart), with
+    /// no turn keys and no cursor.
+    fn capture_slice(
+        session: &str,
+        project: ProjectChoice,
+        ords: std::ops::Range<i64>,
+    ) -> CaptureSlice {
+        CaptureSlice {
+            source: SourceInput {
+                source_type: alice_core::model::SourceType::Session,
+                uri: capture_uri(session),
+                agent: Some(CAPTURE_AGENT.into()),
+                session_id: Some(session.into()),
+                ..Default::default()
+            },
+            project,
+            init: CaptureInit {
+                agent: CAPTURE_AGENT.into(),
+                session_id: session.into(),
+                parent_uri: None,
+                transcript_path: Some(format!("/tmp/t/{session}.jsonl")),
+                file_key: None,
+                no_distill: false,
+            },
+            chunks: ords
+                .map(|i| ChunkInput {
+                    ord: i,
+                    text: format!("captured turn text {session} {i}"),
+                    authored_at: Some(format!("2026-10-16T10:00:{i:02}.000Z")),
+                    ..Default::default()
+                })
+                .collect(),
+            turn_keys: Vec::new(),
+            skipped_keys: Vec::new(),
+            cursor: None,
+            last_event: Some("stop".into()),
+            ended: false,
+            record_event: true,
+        }
+    }
+
+    fn global() -> ProjectChoice {
+        ProjectChoice::Slug("global".into())
+    }
+
+    fn capture(s: &CaptureSlice) -> WriteOp {
+        WriteOp::CaptureSlice(Box::new(s.clone()))
+    }
+
+    fn captured(o: Result<WriteOutcome>) -> (String, usize) {
+        match o {
+            Ok(WriteOutcome::Captured {
+                source_id,
+                inserted,
+            }) => (source_id, inserted),
+            other => panic!("expected Captured, got {other:?}"),
+        }
+    }
+
+    fn turn_keys(k: &[&str]) -> Vec<String> {
+        k.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn known(c: &Connection, k: &[&str]) -> std::collections::HashSet<String> {
+        capture_store::known_turns(c, CAPTURE_AGENT, &turn_keys(k)).unwrap()
+    }
+
+    /// SP2 spec §3.8: one slice writes its chunks, its turn keys and the cursor in one
+    /// transaction. Repeating it stores nothing and leaves the cursor where it was; a slice that
+    /// is refused writes nothing at all.
+    #[test]
+    fn capture_slice_writes_chunks_keys_and_cursor_atomically() {
+        let f = fixture();
+        let mut s = capture_slice("S1", global(), 0..3);
+        s.turn_keys = vec![("u-1".into(), 0), ("u-2".into(), 2)];
+        s.cursor = Some((4096, 3));
+        let (source_id, inserted) = captured(f.h.submit_blocking(capture(&s)));
+        assert_eq!(inserted, 3);
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        assert_eq!(
+            known(&c, &["u-1", "u-2", "u-3"]),
+            known_set(&["u-1", "u-2"])
+        );
+        assert!(
+            capture_store::known_turns(&c, "codex", &turn_keys(&["u-1"]))
+                .unwrap()
+                .is_empty(),
+            "turn keys are per agent"
+        );
+        let st = capture_store::by_uri(&c, &capture_uri("S1"))
+            .unwrap()
+            .expect("the source has a capture state");
+        assert_eq!((st.byte_offset, st.next_ord), (4096, 3));
+        assert_eq!(st.source_id, source_id);
+        assert_eq!(
+            (st.agent.as_str(), st.session_id.as_str()),
+            (CAPTURE_AGENT, "S1")
+        );
+        assert_eq!(st.transcript_path.as_deref(), Some("/tmp/t/S1.jsonl"));
+        assert_eq!(st.last_event.as_deref(), Some("stop"));
+        assert!(st.last_capture_at.is_some());
+        assert_eq!(st.distill_state, DistillState::Idle);
+        assert!(!st.ended && !st.no_distill);
+        assert_eq!(st.project_id, projects::GLOBAL_ID);
+        let first_ord: i64 = f.read(
+            "SELECT first_ord FROM capture_turns WHERE turn_key = 'u-2'",
+            [],
+        );
+        assert_eq!(first_ord, 2);
+        let started: String = f.read("SELECT started_at FROM sources WHERE id = ?1", [&source_id]);
+        let ended: String = f.read("SELECT ended_at FROM sources WHERE id = ?1", [&source_id]);
+        assert_eq!(
+            (started.as_str(), ended.as_str()),
+            ("2026-10-16T10:00:00.000Z", "2026-10-16T10:00:02.000Z"),
+            "the source spans its first and newest captured record"
+        );
+        let events = || -> i64 {
+            f.read(
+                "SELECT count(*) FROM events WHERE action = 'source.capture' AND target_id = ?1",
+                [&source_id],
+            )
+        };
+        assert_eq!(events(), 1);
+        let actor: String = f.read(
+            "SELECT actor FROM events WHERE action = 'source.capture'",
+            [],
+        );
+        assert_eq!(actor, "agent:claude-code");
+
+        // The same slice again: a hook that fired twice, or a pass repeated after a crash.
+        let (again_id, again) = captured(f.h.submit_blocking(capture(&s)));
+        assert_eq!((again_id.as_str(), again), (source_id.as_str(), 0));
+        let st = capture_store::by_uri(&c, &capture_uri("S1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((st.byte_offset, st.next_ord), (4096, 3));
+        let chunks: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(chunks, 3);
+        assert_eq!(events(), 1, "a slice that stored nothing records no event");
+
+        // A refused slice (an empty turn key after its chunks) writes nothing.
+        let mut bad = capture_slice("S2", global(), 0..2);
+        bad.turn_keys = vec![("u-9".into(), 0), (String::new(), 1)];
+        bad.cursor = Some((100, 2));
+        let err = f.h.submit_blocking(capture(&bad)).unwrap_err().to_string();
+        assert!(err.contains("turn key"), "{err}");
+        assert!(
+            capture_store::by_uri(&c, &capture_uri("S2"))
+                .unwrap()
+                .is_none()
+        );
+        let sources: i64 = f.read(
+            "SELECT count(*) FROM sources WHERE uri = ?1",
+            [capture_uri("S2")],
+        );
+        assert_eq!(sources, 0);
+        assert!(known(&c, &["u-9"]).is_empty());
+        let chunks: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(chunks, 3);
+    }
+
+    fn known_set(k: &[&str]) -> std::collections::HashSet<String> {
+        turn_keys(k).into_iter().collect()
+    }
+
+    /// SP2 spec §3.1: the source owns its project. A later slice that names another project
+    /// stores its chunks under the first one, and the project it named is not created.
+    #[test]
+    fn a_capture_source_keeps_its_first_project() {
+        let f = fixture();
+        let detected = |slug: &str| {
+            ProjectChoice::Detected(alice_core::project::ProjectRef {
+                key: format!("path:/work/{slug}"),
+                slug: slug.into(),
+                name: slug.into(),
+                root: None,
+                remote: None,
+            })
+        };
+        let (source_id, first) =
+            captured(f.h.submit_blocking(capture(&capture_slice("S1", detected("alpha"), 0..2))));
+        let (again, second) =
+            captured(f.h.submit_blocking(capture(&capture_slice("S1", detected("beta"), 2..4))));
+        assert_eq!((first, second), (2, 2));
+        assert_eq!(again, source_id);
+        let alpha: String = f.read("SELECT id FROM projects WHERE slug = 'alpha'", []);
+        let owner: String = f.read("SELECT project_id FROM sources WHERE id = ?1", [&source_id]);
+        assert_eq!(owner, alpha);
+        let theirs: i64 = f.read(
+            "SELECT count(*) FROM chunks WHERE source_id = ?1 AND project_id = ?2",
+            [&source_id, &alpha],
+        );
+        assert_eq!(theirs, 4, "the second slice's chunks follow the source");
+        let beta: i64 = f.read("SELECT count(*) FROM projects WHERE slug = 'beta'", []);
+        assert_eq!(beta, 0, "the project the later slice named is not created");
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        let st = capture_store::by_source(&c, &source_id).unwrap().unwrap();
+        assert_eq!(st.project_id, alpha);
+    }
+
+    /// SP2 spec §3.6: an excluded project's turns store nothing, but their keys are recorded and
+    /// the cursor moves past them.
+    #[test]
+    fn skipped_keys_are_recorded_without_chunks() {
+        let f = fixture();
+        let mut s = capture_slice("S1", global(), 0..0);
+        s.skipped_keys = turn_keys(&["x-1", "x-2"]);
+        s.cursor = Some((2048, 0));
+        let (source_id, inserted) = captured(f.h.submit_blocking(capture(&s)));
+        assert_eq!(inserted, 0);
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        assert_eq!(known(&c, &["x-1", "x-2"]), known_set(&["x-1", "x-2"]));
+        let rows: i64 = f.read(
+            "SELECT count(*) FROM capture_turns WHERE source_id = ?1 AND first_ord = 0",
+            [&source_id],
+        );
+        assert_eq!(rows, 2);
+        let chunks: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(chunks, 0);
+        let st = capture_store::by_uri(&c, &capture_uri("S1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((st.byte_offset, st.next_ord), (2048, 0));
+        let events: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'source.capture'",
+            [],
+        );
+        assert_eq!(events, 0);
+    }
+
+    /// SP2 spec §6.5: a distilled memory carries its provenance (inserted with it) and the actor
+    /// `distill:jev`. A re-run returns the first memory by its idempotency key and adds no
+    /// provenance, even when it names one more chunk.
+    #[test]
+    fn a_distilled_remember_records_provenance_and_its_actor() {
+        let f = fixture();
+        let (source_id, _) =
+            captured(f.h.submit_blocking(capture(&capture_slice("S1", global(), 0..3))));
+        let chunk = |ord: i64| -> String {
+            f.read(
+                "SELECT id FROM chunks WHERE source_id = ?1 AND ord = ?2",
+                rusqlite::params![source_id, ord],
+            )
+        };
+        let (c1, c2, c3) = (chunk(0), chunk(1), chunk(2));
+        let distilled = |provenance: Vec<String>| WriteOp::Remember {
+            input: NewMemoryInput {
+                content: "We pin the toolchain to Rust 1.99 so CI and laptops agree".into(),
+                kind: Some(Kind::Decision),
+                idempotency_key: Some("distill:0123456789abcdef0123456789abcdef".into()),
+                author: alice_core::model::Author {
+                    agent: Some(CAPTURE_AGENT.into()),
+                    session: Some("S1".into()),
+                    model: None,
+                },
+                origin: Origin::Distill,
+                provenance,
+                ..Default::default()
+            },
+            project: global(),
+        };
+        let (id, _) = new_id(
+            f.h.submit_blocking(distilled(vec![c1.clone(), c2.clone()]))
+                .unwrap(),
+        );
+        let rows = || -> i64 { f.read("SELECT count(*) FROM provenance", []) };
+        assert_eq!(rows(), 2);
+        let mine: i64 = f.read(
+            "SELECT count(*) FROM provenance WHERE memory_id = ?1 AND chunk_id IN (?2, ?3)",
+            [&id, &c1, &c2],
+        );
+        assert_eq!(mine, 2);
+        let actor: String = f.read(
+            "SELECT actor FROM events WHERE action = 'memory.create' AND target_id = ?1",
+            [&id],
+        );
+        assert_eq!(actor, "distill:jev");
+        let origin: String = f.read("SELECT origin FROM memories WHERE id = ?1", [&id]);
+        assert_eq!(origin, "distill");
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        let m = memories::get_many(&c, std::slice::from_ref(&id)).unwrap();
+        assert_eq!(m[0].origin, Origin::Distill);
+
+        let again = f.h.submit_blocking(distilled(vec![c1, c2, c3])).unwrap();
+        assert!(
+            matches!(&again, WriteOutcome::Remembered(InsertOutcome::Duplicate { id: d }, _) if *d == id),
+            "{again:?}"
+        );
+        assert_eq!(rows(), 2, "a duplicate inserts no provenance");
+
+        // An agent's memory keeps the agent's actor and origin.
+        let (plain, _) = new_id(f.h.submit_blocking(remember("an ordinary memory")).unwrap());
+        let origin: String = f.read("SELECT origin FROM memories WHERE id = ?1", [&plain]);
+        assert_eq!(origin, "agent");
+        let actor: String = f.read(
+            "SELECT actor FROM events WHERE action = 'memory.create' AND target_id = ?1",
+            [&plain],
+        );
+        assert_eq!(actor, "user");
+    }
+
+    /// SP2 spec §3.5: retention deletes a source with its last chunk and its capture state goes
+    /// with it (`ON DELETE CASCADE`), but the turn keys stay, so the file is not captured again.
+    #[test]
+    fn deleting_a_sources_chunks_cascades_its_state_but_keeps_turn_keys() {
+        let f = fixture();
+        let mut s = capture_slice("S1", global(), 0..2);
+        s.turn_keys = vec![("u-1".into(), 0), ("u-2".into(), 1)];
+        s.cursor = Some((900, 2));
+        let (source_id, _) = captured(f.h.submit_blocking(capture(&s)));
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        let seqs: Vec<i64> = c
+            .prepare("SELECT seq FROM chunks WHERE source_id = ?1 ORDER BY seq")
+            .unwrap()
+            .query_map([&source_id], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(seqs.len(), 2);
+        let WriteOutcome::Purged(done) =
+            f.h.submit_blocking(WriteOp::DeleteChunks { seqs: seqs.clone() })
+                .unwrap()
+        else {
+            panic!("expected Purged")
+        };
+        assert_eq!(done, seqs);
+        assert!(
+            capture_store::by_uri(&c, &capture_uri("S1"))
+                .unwrap()
+                .is_none()
+        );
+        let states: i64 = f.read(
+            "SELECT count(*) FROM capture_state WHERE source_id = ?1",
+            [&source_id],
+        );
+        assert_eq!(states, 0, "the state goes with its source");
+        let sources: i64 = f.read("SELECT count(*) FROM sources WHERE id = ?1", [&source_id]);
+        assert_eq!(sources, 0);
+        assert_eq!(known(&c, &["u-1", "u-2"]), known_set(&["u-1", "u-2"]));
+    }
+
+    /// `CaptureStateUpdate`: each change sets its own fields; `due` lists a due source once its
+    /// next try has come; an unknown source changes nothing.
+    #[test]
+    fn capture_state_updates_change_their_fields_and_due_follows_them() {
+        let f = fixture();
+        let mut s = capture_slice("S1", global(), 0..2);
+        s.cursor = Some((500, 2));
+        let (source_id, _) = captured(f.h.submit_blocking(capture(&s)));
+        let update = |id: &str, change: CaptureChange| -> usize {
+            match f.h.submit_blocking(WriteOp::CaptureStateUpdate {
+                source_id: id.into(),
+                change,
+            }) {
+                Ok(WriteOutcome::Count(n)) => n,
+                other => panic!("expected Count, got {other:?}"),
+            }
+        };
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        let state = || capture_store::by_source(&c, &source_id).unwrap().unwrap();
+
+        let at = "2026-10-16T12:00:00.000Z";
+        let changed = update(
+            &source_id,
+            CaptureChange::Distill {
+                state: DistillState::Due,
+                next_try_at: Some(at.into()),
+                attempts: 2,
+            },
+        );
+        assert_eq!(changed, 1);
+        let st = state();
+        assert_eq!(
+            (
+                st.distill_state,
+                st.distill_next_try_at.as_deref(),
+                st.distill_attempts
+            ),
+            (DistillState::Due, Some(at), 2)
+        );
+        assert!(
+            capture_store::due(&c, "2026-10-16T11:59:59.999Z", 10)
+                .unwrap()
+                .is_empty(),
+            "not before its next try"
+        );
+        let due = capture_store::due(&c, at, 10).unwrap();
+        assert_eq!(
+            due.iter().map(|d| d.source_id.as_str()).collect::<Vec<_>>(),
+            [source_id.as_str()]
+        );
+
+        update(&source_id, CaptureChange::Distilled { distill_ord: 2 });
+        assert_eq!(state().distill_ord, 2);
+        update(&source_id, CaptureChange::Gap { byte_offset: 9000 });
+        let st = state();
+        assert_eq!((st.byte_offset, st.gaps), (9000, 1));
+        update(
+            &source_id,
+            CaptureChange::FileKey {
+                file_key: "1:2:abc".into(),
+                byte_offset: 0,
+            },
+        );
+        let st = state();
+        assert_eq!(
+            (st.file_key.as_deref(), st.byte_offset, st.next_ord),
+            (Some("1:2:abc"), 0, 2),
+            "a replaced file resets the offset, not the ords"
+        );
+        let open = |c: &Connection| -> bool {
+            capture_store::open_sources(c)
+                .unwrap()
+                .iter()
+                .any(|o| o.source_id == source_id)
+        };
+        assert!(open(&c));
+        update(&source_id, CaptureChange::Ended);
+        assert!(state().ended);
+        assert!(!open(&c));
+        assert_eq!(
+            update("01K7NOSUCHSOURCE0000000000", CaptureChange::Ended),
+            0
+        );
+    }
+
+    /// A capture slice is written whole, within the ingest slice budget: it joins a commit only
+    /// when it fits what is left of it, so two 30-chunk slices never share one.
+    #[tokio::test]
+    async fn capture_slices_share_the_ingest_budget_and_are_never_split() {
+        let d = tempfile::tempdir().unwrap();
+        let conn = open(d.path());
+        let (wake_tx, _wake_rx) = crossbeam_channel::unbounded();
+        let log: CommitLog = Arc::new(Mutex::new(Vec::new()));
+        let (h, _t) = spawn_writer_logged(conn, "dev".into(), wake_tx, log.clone());
+        let ing = h.submit(ingest("many", 120, |i| format!("short {i}")));
+        let a = h.submit(capture(&capture_slice("A", global(), 0..30)));
+        let b = h.submit(capture(&capture_slice("B", global(), 0..30)));
+        let (ing, a, b) = tokio::join!(ing, a, b);
+        assert_eq!(ingested(ing).inserted, 120);
+        assert_eq!((captured(a).1, captured(b).1), (30, 30));
+        let log = log.lock();
+        let slices: usize = log
+            .iter()
+            .map(|c| c.iter().filter(|n| **n == "CaptureSlice").count())
+            .sum();
+        assert_eq!(slices, 2, "each slice is written once, whole: {log:?}");
+        assert!(
+            log.iter()
+                .all(|c| c.iter().filter(|n| **n == "CaptureSlice").count() <= 1),
+            "two slices shared a commit: {log:?}"
+        );
     }
 }

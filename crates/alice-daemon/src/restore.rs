@@ -1138,6 +1138,10 @@ mod tests {
                  DROP TABLE IF EXISTS legacy_ids;
                  DROP TABLE IF EXISTS project_key_aliases;
                  DROP TABLE IF EXISTS project_merge_rows;
+                 DROP TABLE IF EXISTS capture_state;
+                 DROP TABLE IF EXISTS capture_turns;
+                 DROP INDEX IF EXISTS sources_session;
+                 ALTER TABLE memories DROP COLUMN origin;
                  DELETE FROM schema_migrations WHERE version >= 3;",
             )
             .unwrap();

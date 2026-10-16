@@ -2,7 +2,7 @@
 
 use crate::error::{AliceError, Result};
 use crate::ids::{new_id, now_rfc3339};
-use crate::model::{Author, Kind, Memory, Status, limits};
+use crate::model::{Author, Kind, Memory, Origin, Status, limits};
 use crate::normalize::{content_hash, derive_title, nfc, normalize_topic};
 use crate::store::fts;
 use crate::store::projects::{self, ResolvedProject};
@@ -28,6 +28,11 @@ pub struct NewMemoryInput {
     /// The project is `global` only because nothing named one (no project, no working
     /// directory): the judge may route the memory to a project later.
     pub project_defaulted: bool,
+    /// How the memory came to exist. Internal: never taken from a request.
+    pub origin: Origin,
+    /// The ids of the raw chunks the memory was distilled from, recorded with it in
+    /// `provenance`. Internal: never taken from a request.
+    pub provenance: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +56,9 @@ pub struct PreparedMemory {
     /// classify it).
     pub kind_explicit: bool,
     pub project_defaulted: bool,
+    pub origin: Origin,
+    /// Chunk ids, without blanks or repeats.
+    pub provenance: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +169,13 @@ pub fn prepare(
     let topics = normalize_topics(&input.topics)?;
     let importance = check_importance(input.importance)?;
     let hash = content_hash(&project.slug, kind, &title, &content);
+    let mut provenance: Vec<String> = Vec::with_capacity(input.provenance.len());
+    for c in input.provenance {
+        let c = c.trim();
+        if !c.is_empty() && !provenance.iter().any(|p| p == c) {
+            provenance.push(c.to_string());
+        }
+    }
     Ok(PreparedMemory {
         id: new_id(),
         project_id: project.id.clone(),
@@ -179,6 +194,8 @@ pub fn prepare(
         legacy_id: input.legacy_id,
         kind_explicit: input.kind.is_some(),
         project_defaulted: input.project_defaulted,
+        origin: input.origin,
+        provenance,
     })
 }
 
@@ -249,8 +266,8 @@ pub fn link(conn: &Connection, from: &str, to: &str, kind: &str, by: &str) -> Re
     Ok(())
 }
 
-/// Insert a prepared memory (status `pending`) with its topics and FTS rows.
-/// Exact duplicates and repeated idempotency keys return the existing id.
+/// Insert a prepared memory (status `pending`) with its topics, provenance and FTS rows.
+/// Exact duplicates and repeated idempotency keys return the existing id and write nothing.
 /// Each id in `supersedes` gets a `supersedes` link and becomes `superseded`; unknown ids are
 /// skipped and trashed memories keep their status. Call inside a transaction (the writer does).
 pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
@@ -279,8 +296,8 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
     conn.execute(
         "INSERT INTO memories (id, project_id, kind, title, body, importance, status, content_hash,
             author_agent, author_model, author_session, idempotency_key, created_at, updated_at, hlc, legacy_id,
-            kind_explicit, project_defaulted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            kind_explicit, project_defaulted, origin)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             m.id,
             m.project_id,
@@ -298,7 +315,8 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
             m.hlc,
             m.legacy_id,
             m.kind_explicit,
-            m.project_defaulted
+            m.project_defaulted,
+            m.origin.as_str()
         ],
     )?;
     let seq = conn.last_insert_rowid();
@@ -307,6 +325,12 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
             "INSERT OR IGNORE INTO memory_topics (memory_id, topic) VALUES (?1, ?2)",
             params![m.id, t],
         )?;
+    }
+    for chunk in &m.provenance {
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO provenance (memory_id, chunk_id) VALUES (?1, ?2)",
+        )?
+        .execute(params![m.id, chunk])?;
     }
     fts::index_memory(conn, seq, &m.title, &m.body, &m.topics)?;
     let by = m.author.agent.clone().unwrap_or_else(|| "user".into());
@@ -332,12 +356,14 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
 }
 
 const SELECT_MEMORY: &str = "SELECT m.seq, m.id, p.slug, m.kind, m.title, m.body, m.importance, m.status,
-    m.author_agent, m.author_model, m.author_session, m.created_at, m.updated_at, m.access_count, m.legacy_id
+    m.author_agent, m.author_model, m.author_session, m.created_at, m.updated_at, m.access_count, m.legacy_id,
+    m.origin
     FROM memories m JOIN projects p ON p.id = m.project_id";
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Memory)> {
     let kind: String = r.get(3)?;
     let status: String = r.get(7)?;
+    let origin: String = r.get(15)?;
     Ok((
         r.get(0)?,
         Memory {
@@ -358,6 +384,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Memory)> {
             updated_at: r.get(12)?,
             access_count: r.get(13)?,
             legacy_id: r.get(14)?,
+            origin: Origin::parse(&origin).unwrap_or_default(),
         },
     ))
 }

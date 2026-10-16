@@ -1,5 +1,6 @@
 //! SQLite storage. Only the daemon opens the database.
 
+pub mod capture;
 pub mod compat;
 pub mod embeddings;
 pub mod events;
@@ -737,6 +738,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index, 1);
+    }
+
+    /// A v5 database migrates to v6 after a backup: imported memories (`judge_state =
+    /// 'skipped'`) get `origin = 'import'`, every other one `agent`, and the capture tables and
+    /// their four indexes exist (SP2 spec §8.1).
+    #[test]
+    fn migration_0006_adds_capture_tables_and_backfills_import_origin() {
+        let (d, path) = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)").unwrap();
+            let tx = conn.transaction().unwrap();
+            for sql in [
+                include_str!("sql/0001_init.sql"),
+                include_str!("sql/0002_events_reviews.sql"),
+                include_str!("sql/0003_judge.sql"),
+                include_str!("sql/0004_import.sql"),
+                include_str!("sql/0005_project_merge.sql"),
+            ] {
+                tx.execute_batch(sql).unwrap();
+            }
+            for v in 1..=5 {
+                tx.execute("INSERT INTO schema_migrations VALUES (?1, 'x')", [v])
+                    .unwrap();
+            }
+            for (id, judge) in [("M-IMPORTED", "skipped"), ("M-AGENT", "done")] {
+                tx.execute(
+                    "INSERT INTO memories (id, project_id, kind, title, body, status, content_hash, created_at, updated_at, hlc, judge_state)
+                     VALUES (?1, '00000000000000000000GLOBAL', 'note', 't', 'b', 'active', ?1,
+                             '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z', 'h', ?2)",
+                    [id, judge],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let conn = open_writer(&path).unwrap();
+        let origin = |id: &str| -> String {
+            conn.query_row("SELECT origin FROM memories WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(origin("M-IMPORTED"), "import", "M3 imports are backfilled");
+        assert_eq!(origin("M-AGENT"), "agent");
+        let count = |kind: &str, names: &str| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM sqlite_master WHERE type = ?1 AND name IN ({names})"
+                ),
+                [kind],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("table", "'capture_state', 'capture_turns'"), 2);
+        assert_eq!(
+            count(
+                "index",
+                "'capture_state_distill', 'capture_state_session', 'capture_state_parent', 'sources_session'"
+            ),
+            4
+        );
+        let backups = pre_migration_backups(d.path());
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        let name = backups[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(name.starts_with("alice-pre-migration-v5-"), "{name}");
     }
 
     #[test]
