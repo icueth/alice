@@ -323,8 +323,10 @@ fn restore_memory(conn: &Connection, id: &str, s: &MemorySnapshot, hlc: &str) ->
     fts::index_memory(conn, seq, &s.title, &s.body, &s.topics)?;
     conn.execute("DELETE FROM links WHERE from_id = ?1", [id])?;
     for (to, kind) in &s.links_out {
+        // A link to a memory purged since is not put back (links have no foreign key).
         conn.execute(
-            "INSERT OR IGNORE INTO links (from_id, to_id, type, created_by, created_at) VALUES (?1, ?2, ?3, 'undo', ?4)",
+            "INSERT OR IGNORE INTO links (from_id, to_id, type, created_by, created_at)
+             SELECT ?1, ?2, ?3, 'undo', ?4 WHERE EXISTS (SELECT 1 FROM memories WHERE id = ?2)",
             params![id, to, kind, now_rfc3339()],
         )?;
     }
@@ -1462,6 +1464,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("purged"), "{err}");
+    }
+
+    /// Final review B-M5: an undo never puts back a link to a memory purged since (a purge
+    /// removes the links to it without an event).
+    #[test]
+    fn an_undo_never_restores_a_link_to_a_purged_memory() {
+        let mut t = T::new();
+        let old = t.remember("the old fact");
+        let (new, _) = t.remember_superseding("the new fact", &[&old]);
+        let ev = t.edit(&new, "the new fact, edited");
+        // The purge of the old memory, as maintenance does it: the row and the links to it.
+        t.c.execute("DELETE FROM links WHERE to_id = ?1", [&old])
+            .unwrap();
+        t.c.execute("DELETE FROM memories WHERE id = ?1", [&old])
+            .unwrap();
+        let out = t.force_undo_with(&ev, Redactor::builtin()).unwrap();
+        assert!(matches!(out, UndoOutcome::Undone { .. }), "{out:?}");
+        assert_eq!(t.body(&new), "the new fact");
+        let dangling: i64 =
+            t.c.query_row("SELECT count(*) FROM links WHERE to_id = ?1", [&old], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dangling, 0);
     }
 
     /// R2: force skips the conflict check only, never the privacy rules.
