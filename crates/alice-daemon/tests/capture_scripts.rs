@@ -1379,9 +1379,13 @@ async fn a_turn_over_two_mebibytes_escalates_the_cap() {
     assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
 }
 
-/// The lock of a transcript: a stale one (dead holder, old `at`) is taken over; a live holder
-/// is waited for; a worker refreshes `at` on every pass, and one that lost its lock stops and
-/// never removes the lock it no longer owns.
+/// The lock of a transcript (ages are planted by writing `at` directly):
+/// - a dead holder whose `at` is older than 360 s is taken over;
+/// - a live holder is never broken under 900 s, however old its `at` (one upload may take
+///   5 + 300 s);
+/// - a dead holder with a recent `at` is respected;
+/// - a worker refreshes `at` every pass, and one that lost its lock stops, writes no state and
+///   never removes the lock it no longer owns.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_lock_is_taken_over_and_a_foreign_lock_is_never_removed() {
     let s = Server::start(&["ann"]).await;
@@ -1396,6 +1400,13 @@ async fn a_stale_lock_is_taken_over_and_a_foreign_lock_is_never_removed() {
             .as_secs()
     };
     let me = std::process::id().to_string();
+    // A pid that is surely dead: a child that has exited and been reaped.
+    let dead = {
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid.to_string()
+    };
     let plant = |key: &str, at: u64, pid: &str| {
         let lock = state.join(format!("{key}.lock"));
         std::fs::create_dir_all(&lock).unwrap();
@@ -1405,10 +1416,10 @@ async fn a_stale_lock_is_taken_over_and_a_foreign_lock_is_never_removed() {
     };
     let cwd = env.root.join("work");
 
-    // Stale: taken over, and nothing of it is left behind.
+    // Dead holder, `at` older than 360 s: taken over, and nothing of it is left behind.
     let mut a = Session::new(&env, "lock-stale", &cwd);
     a.turn(1, "behind a stale lock");
-    let lock_a = plant(&a.key(), now() - 500, "999999");
+    let lock_a = plant(&a.key(), now() - 400, &dead);
     env.hook(&a.input("Stop"));
     env.wait_idle();
     assert_eq!(turns_of(&t.home, &uri("lock-stale")), 1);
@@ -1420,27 +1431,43 @@ async fn a_stale_lock_is_taken_over_and_a_foreign_lock_is_never_removed() {
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 
-    // Live: waited for, and the worker goes on once it is released.
+    // A live holder whose `at` is 400 s old (a long upload), and a dead holder whose `at` is
+    // 200 s old: both waited for, and the workers go on once they are released.
     let mut b = Session::new(&env, "lock-live", &cwd);
     b.turn(1, "behind a live lock");
-    let lock_b = plant(&b.key(), now(), &me);
+    let lock_b = plant(&b.key(), now() - 400, &me);
+    let mut d = Session::new(&env, "lock-recent", &cwd);
+    d.turn(1, "behind a recent lock");
+    let lock_d = plant(&d.key(), now() - 200, &dead);
     env.hook(&b.input("Stop"));
-    std::thread::sleep(Duration::from_secs(4));
+    env.hook(&d.input("Stop"));
+    // A sweep (no wait at all) must not break them either.
+    let sweeper = Session::new(&env, "lock-sweeper", &cwd);
+    env.hook(&sweeper.input("SessionStart"));
+    std::thread::sleep(Duration::from_secs(5));
     assert!(
-        uploads(&s, "lock-live").is_empty(),
-        "nothing while it is held"
+        uploads(&s, "lock-live").is_empty() && uploads(&s, "lock-recent").is_empty(),
+        "nothing while they are held"
     );
     assert_eq!(
         read(&lock_b.join("pid")).trim(),
         me,
-        "never broken while fresh"
+        "a live holder is never broken"
+    );
+    assert_eq!(
+        read(&lock_d.join("pid")).trim(),
+        dead,
+        "a recent lock is respected"
     );
     std::fs::remove_dir_all(&lock_b).unwrap();
+    std::fs::remove_dir_all(&lock_d).unwrap();
     env.wait_idle();
     assert_eq!(turns_of(&t.home, &uri("lock-live")), 1);
+    assert_eq!(turns_of(&t.home, &uri("lock-recent")), 1);
 
-    // Mid-run: `at` is refreshed every pass; taken over during pass 2, the worker stops at
-    // pass 3 and leaves the new holder's lock alone.
+    // Mid-run: `at` is refreshed every pass. Taken over while pass 2 is in flight, the worker
+    // writes nothing more (not even pass 2's answer), stops, and leaves the new holder's lock
+    // alone.
     let mut c = Session::new(&env, "lock-mid", &cwd);
     let filler = "a long answer line ".repeat(1000);
     let mut i = 0;
@@ -1471,10 +1498,16 @@ async fn a_stale_lock_is_taken_over_and_a_foreign_lock_is_never_removed() {
         at2 > at1,
         "`at` is refreshed at each pass: {at1} then {at2}"
     );
+    let offset_at_loss = env.offset(&c.key()).unwrap();
     std::fs::remove_dir_all(&lock_c).unwrap();
     plant(&c.key(), now(), &me);
     env.wait_idle();
     s.delay_requests(0);
+    assert_eq!(
+        env.offset(&c.key()),
+        Some(offset_at_loss),
+        "a worker that lost its lock writes no state"
+    );
     assert_eq!(
         uploads(&s, "lock-mid").len(),
         2,
@@ -1491,6 +1524,79 @@ async fn a_stale_lock_is_taken_over_and_a_foreign_lock_is_never_removed() {
     env.wait_idle();
     assert_eq!(env.offset(&c.key()), Some(c.tr.len()));
     assert_eq!(turns_of(&t.home, &uri("lock-mid")), i as i64);
+}
+
+/// A state whose transcript does not exist (yet) is kept for a week from when it last saw its
+/// transcript (its `seen` line), whatever its mtime says: a session's state is written at
+/// SessionStart, before Claude Code creates the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_state_for_a_transcript_not_written_yet_survives_a_sweep() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    let early = Session::new(&env, "not-yet", &cwd);
+    assert!(!early.path.exists());
+    env.hook(&early.input("SessionStart"));
+    env.wait_idle();
+    assert!(env.state_file(&early.key()).exists());
+    // Planted: transcripts gone for eight days and for six.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let plant = |key: &str, days: u64| {
+        std::fs::write(
+            env.state_file(key),
+            format!(
+                "0 /nowhere/{key}.jsonl\nsession {key}\ncwd \nseen {}\n",
+                now - days * 86_400
+            ),
+        )
+        .unwrap();
+    };
+    plant("claude-code-gone-8d", 8);
+    plant("claude-code-gone-6d", 6);
+    // A state first written eight days ago whose transcript was captured just now, then
+    // deleted: `seen` was refreshed by that capture, so it is kept.
+    let mut recent = Session::new(&env, "seen-recently", &cwd);
+    recent.turn(1, "captured just before its file went");
+    std::fs::write(
+        env.state_file(&recent.key()),
+        format!(
+            "0 {}\nsession seen-recently\ncwd {}\nseen {}\n",
+            recent.path.display(),
+            cwd.display(),
+            now - 8 * 86_400
+        ),
+    )
+    .unwrap();
+    env.hook(&recent.input("Stop"));
+    env.wait_idle();
+    assert_eq!(env.offset(&recent.key()), Some(recent.tr.len()));
+    std::fs::remove_file(&recent.path).unwrap();
+    let sweeper = Session::new(&env, "not-yet-sweeper", &cwd);
+    env.hook(&sweeper.input("SessionStart"));
+    env.wait_idle();
+    assert!(
+        env.state_file(&early.key()).exists(),
+        "a state written before its transcript survives a sweep"
+    );
+    assert!(env.state_file("claude-code-gone-6d").exists());
+    assert!(
+        !env.state_file("claude-code-gone-8d").exists(),
+        "gone for a week: forgotten"
+    );
+    assert!(
+        env.state_file(&recent.key()).exists(),
+        "`seen` is refreshed whenever the transcript is there"
+    );
+    // The early session's transcript appears: captured from 0.
+    let mut early = early;
+    early.turn(1, "written after the state");
+    env.hook(&early.input("Stop"));
+    env.wait_idle();
+    assert_eq!(turns_of(&s.tenant("ann").home, &uri("not-yet")), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

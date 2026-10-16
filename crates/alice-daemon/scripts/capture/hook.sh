@@ -17,9 +17,9 @@
 #   token, url         read only, never written here (the team's setup document or setup.sh)
 #   capture.conf       briefing=on|off
 #   state/<agent>-<session>[-<agent_id>].offset
-#                      "<offset> <path>", then session, subagent, cwd, and hold/stopped lines;
-#                      its mtime is set back to 1971 while work is left, so a sweep sees the
-#                      transcript as newer
+#                      "<offset> <path>", then session, subagent, cwd, seen (when the transcript
+#                      was last there), and hold/stopped lines; its mtime is set back to 1971
+#                      while work is left, so a sweep sees the transcript as newer
 #   state/<key>.lock/  pid and at (refreshed every pass) of the worker sending that transcript
 #   capture.log        at most 256 KB; never the token, never transcript text
 #   paused-until       when the server refused the token: no upload before this time
@@ -299,9 +299,10 @@ brief() {
 
 # ---- The background worker ----
 
-# Reads state file $1 into s_off s_path s_session s_sub s_cwd s_hold s_stopped (1 if absent).
+# Reads state file $1 into s_off s_path s_session s_sub s_cwd s_seen s_hold s_stopped (1 if
+# absent).
 read_state() {
-  s_off=0 s_path= s_session= s_sub= s_cwd= s_hold= s_stopped=
+  s_off=0 s_path= s_session= s_sub= s_cwd= s_seen= s_hold= s_stopped=
   [ -f "$1" ] || return 1
   rs_first=1
   while IFS= read -r rs_line || [ -n "$rs_line" ]; do
@@ -315,35 +316,65 @@ read_state() {
       "session "*) s_session=${rs_line#session } ;;
       "subagent "*) s_sub=${rs_line#subagent } ;;
       "cwd "*) s_cwd=${rs_line#cwd } ;;
+      "seen "*) s_seen=${rs_line#seen } ;;
       "hold "*) s_hold=${rs_line#hold } ;;
       "stopped "*) s_stopped=${rs_line#stopped } ;;
     esac
   done <"$1"
   case $s_off in '' | *[!0-9]*) s_off=0 ;; esac
   case $s_hold in *[!0-9]*) s_hold= ;; esac
+  case $s_seen in *[!0-9]*) s_seen= ;; esac
   return 0
 }
 
-# Writes the s_* values to state file $1 (written whole, then moved into place).
+# Writes the s_* values to state file $1 (written whole, then moved into place). `seen` is
+# now when the transcript exists (or for a new state), else it keeps its last value.
 write_state() {
+  if [ -f "$s_path" ] || [ -z "$s_seen" ]; then s_seen=$(date +%s); fi
   {
     printf '%s %s\n' "$s_off" "$s_path"
     printf 'session %s\n' "$s_session"
     if [ -n "$s_sub" ]; then printf 'subagent %s\n' "$s_sub"; fi
     printf 'cwd %s\n' "$s_cwd"
+    printf 'seen %s\n' "$s_seen"
     if [ -n "$s_hold" ]; then printf 'hold %s\n' "$s_hold"; fi
     if [ -n "$s_stopped" ]; then printf 'stopped %s\n' "$s_stopped"; fi
   } >"$1.tmp.$$" 2>/dev/null && mv -f "$1.tmp.$$" "$1"
 }
 
-# Whether lock directory $1 is stale: its holder last showed life ($1/at, refreshed every
-# pass) more than 120 s ago, or it never wrote `at` while we tried $2 times.
+# Whether lock directory $1 may be broken (we tried $2 times). Its holder refreshes `at` at
+# the start of every pass, and one pass (one upload) may take 5 + 300 s.
+# - A live holder (kill -0 on its pid) is never broken until its `at` is 900 s old, a guard
+#   against a pid reused by another process.
+# - A dead or unknown holder is broken once its `at` is 360 s old.
+# - A dead or unknown holder that never wrote `at` is broken after 5 tries.
 lock_stale() {
   ls_at=$(cat "$1/at" 2>/dev/null)
-  case $ls_at in
-    '' | *[!0-9]*) [ "$2" -gt 5 ] ;;
-    *) [ $(($(date +%s) - ls_at)) -gt 120 ] ;;
+  ls_pid=$(cat "$1/pid" 2>/dev/null)
+  ls_alive=
+  case $ls_pid in
+    '' | *[!0-9]*) ;;
+    *) if kill -0 "$ls_pid" 2>/dev/null; then ls_alive=1; fi ;;
   esac
+  case $ls_at in
+    '' | *[!0-9]*)
+      [ -z "$ls_alive" ] && [ "$2" -gt 5 ]
+      return
+      ;;
+  esac
+  ls_age=$(($(date +%s) - ls_at))
+  if [ -n "$ls_alive" ]; then
+    [ "$ls_age" -gt 900 ]
+  else
+    [ "$ls_age" -gt 360 ]
+  fi
+}
+
+# Writes the s_* values to state file $1 only while this worker holds the lock; 1, writing
+# nothing, once another worker has taken it over.
+save_state() {
+  own_lock || return 1
+  write_state "$1"
 }
 
 # Takes the lock of state key $1: a directory holding the owner's pid and `at`. A stale lock is
@@ -466,7 +497,7 @@ capture_one() {
         if [ -f "$s_path" ]; then
           co_end=$(complete_end "$s_path")
           if [ "$co_end" -gt "$s_off" ]; then s_off=$co_end s_hold=; fi
-          write_state "$co_st"
+          save_state "$co_st"
         fi
         log "session $3: .alice.toml says no_capture = true; event skipped, and its turns so far are never sent"
         unlock
@@ -483,8 +514,7 @@ capture_one() {
       co_flags="&no_distill=1"
     fi
   fi
-  if [ ! -f "$co_st" ]; then
-    write_state "$co_st"
+  if [ ! -f "$co_st" ] && save_state "$co_st"; then
     mark_pending "$co_st"
   fi
   if [ ! -f "$s_path" ] || ! make_tmp; then
@@ -501,7 +531,6 @@ capture_one() {
   while [ "$co_pass" -lt "$PASSES" ]; do
     co_pass=$((co_pass + 1))
     if ! refresh_lock; then
-      log "session $3: another worker took over this transcript's lock; stopping here"
       co_lost=1
       break
     fi
@@ -519,8 +548,9 @@ capture_one() {
     co_n=$(fsize "$tmpd/body")
     [ "$co_n" -gt 0 ] || break
     co_q="agent=claude-code&session=$3&offset=$s_off&event=$co_event$co_flags"
-    # A capped body: the transcript goes on, so the server keeps the body's last turn open.
-    if [ "$co_n" -ge "$co_cap" ] && [ $((s_off + co_n)) -lt "$co_size" ]; then co_q="$co_q&more=1"; fi
+    # A capped body (as long as the cap): the transcript may go on, so the server keeps the
+    # body's last turn open.
+    if [ "$co_n" -ge "$co_cap" ]; then co_q="$co_q&more=1"; fi
     if [ -n "$4" ]; then co_q="$co_q&subagent=$4"; fi
     co_code=$(post "$co_q")
     co_rc=$?
@@ -548,7 +578,10 @@ capture_one() {
           fi
           log "session $3: skipped an oversized line of $co_len bytes at offset $s_off"
           s_off=$((s_off + co_len)) s_hold= co_cap=$BODY_START
-          write_state "$co_st"
+          save_state "$co_st" || {
+            co_lost=1
+            break
+          }
           continue
         fi
         case $co_next in
@@ -577,7 +610,10 @@ capture_one() {
         fi
         log "session $3: sent $co_n bytes from offset $s_off ($co_event); the server's cursor is at $co_next"
         s_off=$co_next s_hold= co_cap=$BODY_START
-        write_state "$co_st"
+        save_state "$co_st" || {
+          co_lost=1
+          break
+        }
         ;;
       409)
         case $co_next in
@@ -593,7 +629,10 @@ capture_one() {
           break
         fi
         s_off=$co_next s_hold=
-        write_state "$co_st"
+        save_state "$co_st" || {
+          co_lost=1
+          break
+        }
         ;;
       401)
         log "the token was refused; run the setup command again (capture is paused for an hour)"
@@ -619,8 +658,10 @@ capture_one() {
         ;;
     esac
   done
+  if [ -z "$co_lost" ] && ! own_lock; then co_lost=1; fi
   if [ -n "$co_lost" ]; then
-    # The state and the lock are the new holder's now.
+    # The state and the lock are the new holder's now: write nothing, remove nothing.
+    log "session $3: another worker took over this transcript's lock; stopping without writing"
     lockdir=
     return 0
   fi
@@ -628,8 +669,7 @@ capture_one() {
     { [ -z "$s_hold" ] || [ "$(fsize "$s_path")" -gt "$s_hold" ]; }; then
     co_pending=1 # out of passes with bytes left
   fi
-  write_state "$co_st"
-  if [ -n "$co_pending" ]; then mark_pending "$co_st"; fi
+  if save_state "$co_st" && [ -n "$co_pending" ]; then mark_pending "$co_st"; fi
   unlock
   return 0
 }
@@ -648,8 +688,9 @@ sweep() {
     valid_id "$s_session" || continue
     if [ -n "$s_sub" ]; then valid_id "$s_sub" || continue; fi
     if [ ! -f "$s_path" ]; then
-      # Its transcript is gone: forget it after a week.
-      if [ -n "$(find "$sw_st" -mtime +7 2>/dev/null)" ]; then rm -f "$sw_st"; fi
+      # No transcript (gone, or not written yet): forget it a week after it was last there.
+      # The `seen` line decides, not the mtime (which mark_pending sets back).
+      if [ -n "$s_seen" ] && [ $(($(date +%s) - s_seen)) -gt 604800 ]; then rm -f "$sw_st"; fi
       continue
     fi
     # Untouched since its state was written (and no work left, see mark_pending): skip.
