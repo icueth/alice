@@ -2920,8 +2920,13 @@ impl Service {
         req = tokio::task::spawn_blocking(move || -> Result<IngestRequest> {
             req.source.uri = redact_field(&r, "source uri", &req.source.uri)?;
             let mut redacted = 0usize;
-            for c in &mut req.chunks {
-                let text = r.check("chunk text", &c.text)?;
+            // In order: a private key cut across chunks is redacted in every one of them.
+            let mut order: Vec<usize> = (0..req.chunks.len()).collect();
+            order.sort_by_key(|&i| req.chunks[i].ord);
+            let mut open = false;
+            for i in order {
+                let c = &mut req.chunks[i];
+                let text = r.check_piece("chunk text", &c.text, &mut open)?;
                 if text != c.text {
                     redacted += 1;
                     c.text = text;

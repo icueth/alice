@@ -846,8 +846,13 @@ async fn redacted_ingest_for_spool(
     tokio::task::spawn_blocking(move || {
         let r = spool_redactor(&home, req.project.as_deref(), req.cwd.as_deref());
         req.source.uri = r.check("source uri", &req.source.uri)?;
-        for c in &mut req.chunks {
-            c.text = r.check("chunk text", &c.text)?;
+        // In order: a private key cut across chunks is redacted in every one of them.
+        let mut order: Vec<usize> = (0..req.chunks.len()).collect();
+        order.sort_by_key(|&i| req.chunks[i].ord);
+        let mut open = false;
+        for i in order {
+            let c = &mut req.chunks[i];
+            c.text = r.check_piece("chunk text", &c.text, &mut open)?;
         }
         Ok(req)
     })
@@ -1522,6 +1527,53 @@ mod tests {
             .unwrap_err();
         assert!(matches!(&e, AliceError::Refused { .. }), "{e:?}");
         assert!(!spool_text(&home).contains(GITHUB));
+    }
+
+    /// Final review A-I1: a private key cut by size across the chunks of one spooled ingest
+    /// leaves nothing of its body in the spool (the chunks may come in any order).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_private_key_cut_across_spooled_chunks_is_redacted_in_every_chunk() {
+        crate::install_tls();
+        let (_d, home) = home();
+        let body: Vec<String> = (0..20u32)
+            .map(|i| {
+                (0..64u32)
+                    .map(|j| {
+                        let n = (i * 131 + j * 17 + (i ^ j) * 7) % 64;
+                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                            [n as usize] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let text = format!(
+            "before\n{}\n{}\n-----END OPENSSH PRIVATE KEY-----\nafter",
+            concat!("-----BEGIN OPENSSH PRIVATE ", "KEY-----"),
+            body.join("\n")
+        );
+        let (a, b) = (text.len() / 3 + 5, 2 * text.len() / 3 + 11);
+        let chunk = |ord: i64, t: &str| ChunkInput {
+            ord,
+            text: t.to_string(),
+            ..Default::default()
+        };
+        let req = IngestRequest {
+            chunks: vec![
+                chunk(2, &text[b..]),
+                chunk(0, &text[..a]),
+                chunk(1, &text[a..b]),
+            ],
+            ..ingest_req(String::new())
+        };
+        ingest_or_spool(&home, &Launcher::None, req).await.unwrap();
+        let spooled = spool_text(&home);
+        let leaked: Vec<&str> = body
+            .iter()
+            .flat_map(|l| (0..=52).map(move |i| &l[i..i + 12]))
+            .filter(|w| spooled.contains(w))
+            .collect();
+        assert!(leaked.is_empty(), "{leaked:?} in {spooled}");
+        assert!(spooled.contains("before") && spooled.contains("after"));
     }
 
     /// The length is checked on the redacted text (as the daemon does): a request that redaction

@@ -227,6 +227,70 @@ async fn every_write_path_redacts_and_nothing_reaches_the_history_the_stream_or_
     assert_eq!(files_holding_a_secret(d.path()), Vec::<String>::new());
 }
 
+/// Final review A-I1: a private key cut by size across the chunks of one ingest (mid-line, in
+/// two and three chunks) leaves nothing of its body in the stored chunks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_private_key_cut_across_ingest_chunks_is_redacted_in_every_chunk() {
+    let (_d, s) = start().await;
+    let body: Vec<String> = (0..24u32)
+        .map(|i| {
+            (0..64u32)
+                .map(|j| {
+                    let n = (i * 37 + j * 11 + (i * j) % 13) % 64;
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[n as usize]
+                        as char
+                })
+                .collect()
+        })
+        .collect();
+    let text = format!(
+        "pasted:\n{}\n{}\n-----END RSA PRIVATE KEY-----\nand then the build passed",
+        concat!("-----BEGIN RSA PRIVATE ", "KEY-----"),
+        body.join("\n")
+    );
+    for (n, uri) in [(2usize, "two"), (3, "three")] {
+        let cuts: Vec<usize> = (0..=n)
+            .map(|k| (text.len() * k / n + 3 * k).min(text.len()))
+            .collect();
+        let chunks = cuts
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| ChunkInput {
+                ord: i as i64,
+                text: text[w[0]..w[1]].to_string(),
+                ..Default::default()
+            })
+            .collect();
+        s.ingest(IngestRequest {
+            source: SourceInput {
+                uri: uri.into(),
+                ..Default::default()
+            },
+            chunks,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let c = alice_core::store::open_reader(&s.home().db()).unwrap();
+    let mut stmt = c.prepare("SELECT text FROM chunks").unwrap();
+    let stored: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(stored.len(), 5);
+    let all = stored.join("\n");
+    let leaked: Vec<&str> = body
+        .iter()
+        .flat_map(|l| (0..=52).map(move |i| &l[i..i + 12]))
+        .filter(|w| all.contains(w))
+        .collect();
+    assert!(leaked.is_empty(), "{leaked:?} in {all}");
+    assert!(all.contains("and then the build passed"));
+    s.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_project_file_can_block_and_a_broken_one_fails_closed_keeping_its_patterns() {
     let (d, s) = start().await;

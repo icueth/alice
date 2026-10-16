@@ -200,6 +200,12 @@ fn flag_value(v: &str) -> bool {
     !v.starts_with(['-', '$']) && !v.starts_with("[REDACTED") && !v.contains(['(', ')', '{', '}'])
 }
 
+/// Base64 lines, not a list of hex digests (a key's body is never hex only).
+fn not_hex_only(v: &str) -> bool {
+    v.chars()
+        .any(|c| !c.is_ascii_hexdigit() && !c.is_whitespace())
+}
+
 fn high_entropy(v: &str) -> bool {
     !v.starts_with("[REDACTED") && !code_like(v) && !path_like(v) && entropy(v) >= HIGH_ENTROPY
 }
@@ -217,6 +223,16 @@ fn builtin_detectors() -> Vec<Detector> {
             r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)",
             0,
             any,
+        ),
+        // The tail of a key whose `BEGIN` line is in an earlier piece (a chunk cut by size):
+        // the text starts with its base64 lines and ends the key.
+        d("pem_private_key", KEY_TAIL, 0, any),
+        // A key's body cut from both its lines: three or more base64 lines of a key's width.
+        d(
+            "base64_block",
+            r"(?m)(?:^[ \t]*[A-Za-z0-9+/]{60,76}={0,2}[ \t]*\r?(?:\n|\z)){3,}",
+            0,
+            not_hex_only,
         ),
         d(
             "jwt",
@@ -310,6 +326,30 @@ fn builtin_detectors() -> Vec<Detector> {
             high_entropy,
         ),
     ]
+}
+
+/// Base64 lines (and the headers of an encrypted key) at the very start of a text, then the
+/// `END` line of a private key.
+const KEY_TAIL: &str = r"\A\s*(?:(?:Proc-Type|DEK-Info):[^\n]*\n\s*)*(?:[A-Za-z0-9+/=]+[ \t]*\r?\n\s*)*[A-Za-z0-9+/=]*\s*-----END [A-Z ]*PRIVATE KEY-----";
+
+/// What a piece that continues a private key starts with: its base64 lines (and the headers of
+/// an encrypted key), through the key's `END` line when it is there.
+static KEY_CONTINUED: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"\A\s*(?:(?:Proc-Type|DEK-Info):[^\n]*(?:\n\s*|\z))*(?:[A-Za-z0-9+/=]+[ \t]*(?:\r?\n\s*|\z))*(?:-----END [A-Z ]*PRIVATE KEY-----)?")
+        .expect("built-in pattern")
+});
+
+static KEY_LINE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"-----(BEGIN|END) [A-Z ]*PRIVATE KEY-----").expect("built-in pattern")
+});
+
+/// Whether `text` ends inside a private key block: its last `BEGIN … PRIVATE KEY` line has no
+/// `END` line after it.
+pub fn ends_inside_key(text: &str) -> bool {
+    KEY_LINE
+        .captures_iter(text)
+        .last()
+        .is_some_and(|c| &c[1] == "BEGIN")
 }
 
 impl Redactor {
@@ -424,6 +464,62 @@ impl Redactor {
             text: out.into_owned(),
             found,
         }
+    }
+
+    /// [`apply`](Self::apply) for the next of consecutive pieces of one text (the chunks of one
+    /// ingest, in order). `open` says whether the piece before ended inside a private key block
+    /// (see [`ends_inside_key`]); the base64 lines this piece then starts with, through the
+    /// key's `END` line, are the rest of that key and are redacted too. `open` is updated for
+    /// the piece after this one.
+    ///
+    /// ```
+    /// use alice_core::redact::Redactor;
+    ///
+    /// let r = Redactor::builtin();
+    /// let mut open = false;
+    /// let first = r.apply_piece(concat!("key:\n-----BEGIN RSA PRIVATE ", "KEY-----\nMIIE"), &mut open);
+    /// assert!(open && !first.text.contains("MIIE"));
+    /// let second = r.apply_piece("pAIBAAKCAQEA1234\nzzzz\n-----END RSA PRIVATE KEY-----\nafter", &mut open);
+    /// assert_eq!(second.text, "[REDACTED:pem_private_key]\nafter");
+    /// assert!(!open);
+    /// ```
+    pub fn apply_piece(&self, text: &str, open: &mut bool) -> Redaction {
+        if !self.enabled {
+            *open = ends_inside_key(text);
+            return self.apply(text);
+        }
+        let head = if *open {
+            KEY_CONTINUED.find(text).map_or(0, |m| m.end())
+        } else {
+            0
+        };
+        let (key, rest) = text.split_at(head);
+        let whole = head == text.len();
+        *open = (whole && !key.contains("-----END")) || ends_inside_key(rest);
+        let mut out = self.apply(rest);
+        if !key.trim().is_empty() {
+            let name = "pem_private_key".to_string();
+            out.text = format!("[REDACTED:{name}]{}", out.text);
+            if !out.found.contains(&name) {
+                out.found.insert(0, name);
+            }
+        } else {
+            out.text = format!("{key}{}", out.text);
+        }
+        out
+    }
+
+    /// [`check`](Self::check) for the next of consecutive pieces of one text (see
+    /// [`apply_piece`](Self::apply_piece)).
+    pub fn check_piece(&self, field: &str, text: &str, open: &mut bool) -> Result<String> {
+        let r = self.apply_piece(text, open);
+        if self.blocks() && !r.found.is_empty() {
+            return Err(AliceError::Refused {
+                field: field.to_string(),
+                detectors: r.found,
+            });
+        }
+        Ok(r.text)
     }
 
     /// Every string inside `value` redacted (keys are left alone); the detectors that fired.
@@ -769,7 +865,129 @@ mod tests {
         "secret = process.env.SECRET_KEY",
         "api_key = os.environ",
         "run --password-file ./secrets/pw --token-file ~/.t",
+        concat!(
+            "the file must end with -----END RSA PRIVATE ",
+            "KEY----- and a newline"
+        ),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
+         e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
+         e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     ];
+
+    /// A made-up PEM key of `lines` base64 lines of 64 characters, and those lines.
+    fn fake_key(lines: usize) -> (String, Vec<String>) {
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let body: Vec<String> = (0..lines)
+            .map(|_| {
+                (0..64)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        alphabet[(x % 64) as usize] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let text = format!(
+            "{}\n{}\n-----END RSA PRIVATE KEY-----",
+            concat!("-----BEGIN RSA PRIVATE ", "KEY-----"),
+            body.join("\n")
+        );
+        (text, body)
+    }
+
+    /// Any 12 characters in a row of the key's body found in `text`.
+    fn key_leaks(text: &str, body: &[String]) -> Vec<String> {
+        body.iter()
+            .flat_map(|l| (0..=l.len() - 12).map(move |i| &l[i..i + 12]))
+            .filter(|w| text.contains(w))
+            .map(String::from)
+            .collect()
+    }
+
+    /// Final review A-I1: a key cut by size across the chunks of one ingest (even mid-line)
+    /// leaves nothing of its body in any chunk.
+    #[test]
+    fn a_private_key_cut_across_pieces_is_redacted_in_every_piece() {
+        let r = Redactor::builtin();
+        let (key, body) = fake_key(26);
+        let text = format!("notes before\n{key}\nnotes after");
+        let start = text.find(&body[0]).unwrap();
+        let len = body.len() * 65;
+        for pieces in [2usize, 3, 4] {
+            for shift in [0usize, 7, 31, 64] {
+                let mut cuts: Vec<usize> = (1..pieces)
+                    .map(|k| start + len * k / pieces + shift)
+                    .collect();
+                cuts.dedup();
+                let mut parts = Vec::new();
+                let mut from = 0;
+                for c in cuts.iter().copied().chain([text.len()]) {
+                    parts.push(&text[from..c]);
+                    from = c;
+                }
+                let mut open = false;
+                let out: Vec<String> = parts
+                    .iter()
+                    .map(|p| r.apply_piece(p, &mut open).text)
+                    .collect();
+                let all = out.join("|");
+                assert!(
+                    key_leaks(&all, &body).is_empty(),
+                    "{pieces} pieces, shift {shift}: {all}"
+                );
+                assert!(
+                    all.starts_with("notes before") && all.ends_with("notes after"),
+                    "{all}"
+                );
+                assert!(!open, "the key ended");
+            }
+        }
+        // A piece after one that did not end inside a key is redacted as usual.
+        let mut open = false;
+        assert_eq!(r.apply_piece("ZZZZ plain", &mut open).text, "ZZZZ plain");
+        // Text that only mentions a key opens nothing that eats the next piece's prose.
+        let mut open = false;
+        r.apply_piece(
+            concat!("paste the -----BEGIN RSA PRIVATE ", "KEY----- line"),
+            &mut open,
+        );
+        assert!(open);
+        assert_eq!(r.apply_piece("then run it", &mut open).text, "then run it");
+        assert!(!open);
+    }
+
+    /// Final review A-I1: a key's tail (its last base64 lines and its `END` line) and a body cut
+    /// from both its lines are caught in a piece on its own, too.
+    #[test]
+    fn the_tail_and_the_body_of_a_cut_key_are_caught_on_their_own() {
+        let r = Redactor::builtin();
+        let (_, body) = fake_key(26);
+        let middle = body[3..12].join("\n");
+        let out = r.apply(&format!("{middle}\nand prose"));
+        assert_eq!(out.found, ["base64_block"]);
+        assert!(key_leaks(&out.text, &body[3..12]).is_empty() && out.text.ends_with("and prose"));
+        let tail = format!(
+            "{}\n-----END RSA PRIVATE KEY-----\nafter",
+            body[20..].join("\n")
+        );
+        let out = r.apply(&tail);
+        assert!(
+            out.found.contains(&"pem_private_key".to_string()),
+            "{:?}",
+            out.found
+        );
+        assert!(key_leaks(&out.text, &body[20..]).is_empty(), "{}", out.text);
+        assert!(out.text.ends_with("\nafter"));
+        // A tail cut mid-line starts with part of a line.
+        let cut = format!(
+            "{}\n-----END RSA PRIVATE KEY-----",
+            &body.join("\n")[64 * 24 + 30..]
+        );
+        assert!(key_leaks(&r.apply(&cut).text, &body[25..]).is_empty());
+    }
 
     #[test]
     fn every_builtin_detector_fires_and_removes_the_secret() {
