@@ -5,6 +5,7 @@
 //! duplicates, so a renderer only ever sees finished turns.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use serde_json::Value;
 
@@ -77,6 +78,13 @@ const WRAPPER_PREFIXES: &[&str] = &[
     "[Request interrupted by user",
 ];
 
+/// The opening of a background-task notification written as a user message.
+pub(crate) const TASK_NOTIFICATION: &str = "<task-notification>";
+
+/// Alice's own session briefing, when a hook leaves it as plain user text (spec §3.3: injected
+/// context is not captured).
+pub(crate) const BRIEFING_PREFIX: &str = "# Context · ";
+
 const REMINDER_OPEN: &str = "<system-reminder>";
 const REMINDER_CLOSE: &str = "</system-reminder>";
 
@@ -97,17 +105,32 @@ impl Record {
         }
     }
 
-    /// The text of a prompt, `<system-reminder>` spans removed, text blocks joined by `\n`.
-    pub fn prompt_text(&self) -> String {
-        let parts: Vec<Cow<'_, str>> = self
-            .blocks
-            .iter()
-            .filter_map(|block| match block {
-                Block::Text(text) => Some(strip_system_reminders(text)),
-                _ => None,
-            })
-            .collect();
-        parts.join("\n").trim().to_owned()
+    /// The person's own words, for [`super::CapturedTurn::prompt`]: set only when this record
+    /// starts a turn as a prompt. Reminder spans, harness wrappers and briefings are removed. A
+    /// task notification (or any prompt left with no words) falls back to its `<summary>`;
+    /// without one there is no prompt.
+    pub fn real_prompt(&self) -> Option<String> {
+        if self.kind != RecordKind::Prompt || !self.starts_turn() {
+            return None;
+        }
+        let mut summary = None;
+        let mut parts: Vec<String> = Vec::new();
+        for block in &self.blocks {
+            let Block::Text(text) = block else { continue };
+            let stripped = strip_system_reminders(text);
+            let rest = stripped.trim();
+            if rest.starts_with(TASK_NOTIFICATION) {
+                summary = summary.or_else(|| tag_content(rest, "summary"));
+            } else if is_typed_text(rest) {
+                parts.push(rest.to_owned());
+            }
+        }
+        let words = parts.join("\n");
+        if words.trim().is_empty() {
+            summary.filter(|s| !s.is_empty())
+        } else {
+            Some(words)
+        }
     }
 
     /// This record's turn key (spec §3.5): its uuid, else a hash of its time and first text.
@@ -154,7 +177,17 @@ impl Record {
 fn is_typed_text(text: &str) -> bool {
     let stripped = strip_system_reminders(text);
     let rest = stripped.trim_start();
-    !rest.is_empty() && !WRAPPER_PREFIXES.iter().any(|p| rest.starts_with(p))
+    !rest.is_empty()
+        && !rest.starts_with(BRIEFING_PREFIX)
+        && !WRAPPER_PREFIXES.iter().any(|p| rest.starts_with(p))
+}
+
+/// The trimmed text between `<tag>` and `</tag>`, the first time it appears.
+pub(crate) fn tag_content(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let from = text.find(&open)? + open.len();
+    let len = text[from..].find(&format!("</{tag}>"))?;
+    Some(text[from..from + len].trim().to_owned())
 }
 
 /// Removes every `<system-reminder>…</system-reminder>` span (injected context, spec §3.3). An
@@ -286,6 +319,10 @@ pub(crate) fn group(records: Vec<Located>, opts: GroupOptions) -> Grouped {
     if opts.at_file_start {
         if !head_complete {
             out.resume = Some(0);
+        } else if head.is_empty() && out.turns.is_empty() && turns.is_empty() && !opts.full_pass {
+            // Nothing to emit: keep the cursor at 0, so content that arrives later, before any
+            // prompt, still becomes a keyed head turn instead of a keyless tail.
+            out.resume = Some(0);
         } else if let Some(first) = head.first() {
             out.turns.push(RawTurn {
                 key: first.turn_key(),
@@ -315,23 +352,20 @@ pub(crate) fn group(records: Vec<Located>, opts: GroupOptions) -> Grouped {
 /// Spec §3.3: within a turn, a block identical to one already seen under the same `message.id`
 /// is skipped. Records left with nothing are removed.
 fn drop_streaming_duplicates(records: &mut Vec<Record>) {
-    for i in 0..records.len() {
-        let (before, rest) = records.split_at_mut(i);
-        let current = &mut rest[0];
-        let Some(id) = current.message_id.as_deref() else {
+    // The blocks kept so far under each message id.
+    let mut kept_by_id: HashMap<String, Vec<Block>> = HashMap::new();
+    for record in records.iter_mut() {
+        let Some(id) = record.message_id.clone() else {
             continue;
         };
-        let mut kept: Vec<Block> = Vec::with_capacity(current.blocks.len());
-        for block in current.blocks.drain(..) {
-            let seen = kept.contains(&block)
-                || before
-                    .iter()
-                    .any(|r| r.message_id.as_deref() == Some(id) && r.blocks.contains(&block));
+        let kept = kept_by_id.entry(id).or_default();
+        record.blocks.retain(|block| {
+            let seen = kept.contains(block);
             if !seen {
-                kept.push(block);
+                kept.push(block.clone());
             }
-        }
-        current.blocks = kept;
+            !seen
+        });
     }
     records.retain(|r| !r.blocks.is_empty() || r.starts_turn());
 }
@@ -395,7 +429,7 @@ mod tests {
             "u",
             vec![text("<system-reminder>ctx</system-reminder>  Do it. Now.")],
         );
-        assert_eq!(r.prompt_text(), "Do it. Now.");
+        assert_eq!(r.real_prompt().as_deref(), Some("Do it. Now."));
     }
 
     #[test]

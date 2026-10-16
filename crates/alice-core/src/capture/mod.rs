@@ -10,10 +10,13 @@
 
 mod claude;
 mod record;
+mod render;
+
+pub use render::{MEMORY_TOOLS, TAGS, trim};
 
 use sha2::{Digest, Sha256};
 
-use record::{Block, GroupOptions, Located, Record, RecordKind};
+use record::{GroupOptions, Located, Record};
 
 /// A line longer than this is not parsed; it leaves `[record skipped: too large]` in its turn.
 pub const MAX_LINE_BYTES: usize = 4 << 20;
@@ -122,8 +125,10 @@ pub struct CapturedTurn {
     pub key: String,
     /// The first timestamped record's time.
     pub started_at: Option<String>,
-    /// The first sentence of the turn's prompt, at most 200 characters. `None` for a compaction
-    /// summary or a head turn.
+    /// The first sentence of the turn's prompt, at most 200 characters, without harness markup.
+    /// It is set only when the turn's first record is a real prompt: a compaction summary and a
+    /// head turn (records before the first prompt) have none. A task-notification turn takes its
+    /// `<summary>`, and a prompt with no words and no summary has none.
     pub prompt: Option<String>,
     pub chunks: Vec<RenderedChunk>,
 }
@@ -150,10 +155,11 @@ pub struct ReadStats {
     pub too_large: u64,
 }
 
-/// The turn key: the uuid when present, else the first 32 hex digits of
+/// The turn key: the uuid when it is a valid id (lines can come from clients, so an unbounded or
+/// odd uuid is not used), else the first 32 hex digits of
 /// `sha256(timestamp ‖ "\x1f" ‖ the first 200 characters of first_text)` (spec §3.5).
 pub fn turn_key(first_uuid: Option<&str>, timestamp: Option<&str>, first_text: &str) -> String {
-    if let Some(uuid) = first_uuid.filter(|u| !u.is_empty()) {
+    if let Some(uuid) = first_uuid.filter(|u| valid_id(u)) {
         return uuid.to_owned();
     }
     let end = first_text
@@ -201,6 +207,10 @@ pub fn read(agent: AgentKind, input: &[u8], opts: &ReadOptions) -> ReadOutcome {
         }
         match parse(line) {
             claude::LineResult::Record(record) => records.push(Located { start, record }),
+            claude::LineResult::Drift(record) => {
+                out.stats.unknown += 1;
+                records.push(Located { start, record });
+            }
             claude::LineResult::Unknown => out.stats.unknown += 1,
             claude::LineResult::Invalid => out.stats.invalid += 1,
         }
@@ -228,13 +238,13 @@ pub fn read(agent: AgentKind, input: &[u8], opts: &ReadOptions) -> ReadOutcome {
             prompt: turn
                 .records
                 .first()
-                .filter(|r| r.kind == RecordKind::Prompt)
-                .and_then(|r| first_sentence(&r.prompt_text(), PROMPT_CHARS)),
-            chunks: render_placeholder(&turn.records, opts),
+                .and_then(Record::real_prompt)
+                .and_then(|text| first_sentence(&text, PROMPT_CHARS)),
+            chunks: render::turn(&turn, opts),
             key: turn.key,
         })
         .collect();
-    out.tail = render_placeholder(&grouped.tail, opts);
+    out.tail = render::records(&grouped.tail, opts);
     out
 }
 
@@ -260,38 +270,6 @@ fn first_sentence(text: &str, max_chars: usize) -> Option<String> {
     }
     let sentence = text[..end].trim();
     (!sentence.is_empty()).then(|| sentence.to_owned())
-}
-
-/// Task 2's stand-in renderer: one chunk holding every block, joined by `\n`. Task 3 replaces it.
-fn render_placeholder(records: &[Record], opts: &ReadOptions) -> Vec<RenderedChunk> {
-    let lines: Vec<String> = records
-        .iter()
-        .flat_map(|r| &r.blocks)
-        .filter_map(|block| match block {
-            Block::Text(text) => Some(text.clone()),
-            Block::Thinking(text) => opts.include_thinking.then(|| text.clone()),
-            Block::ToolUse { id, name, input } => Some(format!("{name} {id} {input}")),
-            Block::ToolResult {
-                tool_use_id,
-                text,
-                is_error,
-            } => Some(format!(
-                "{tool_use_id}{}: {text}",
-                if *is_error { " error" } else { "" }
-            )),
-            Block::Image => Some("[image]".to_owned()),
-            Block::Document => Some("[document]".to_owned()),
-            Block::Audio => Some("[audio]".to_owned()),
-            Block::TooLarge => Some("[record skipped: too large]".to_owned()),
-        })
-        .collect();
-    if lines.is_empty() {
-        return Vec::new();
-    }
-    vec![RenderedChunk {
-        text: lines.join("\n"),
-        authored_at: records.iter().find_map(|r| r.timestamp.clone()),
-    }]
 }
 
 #[cfg(test)]
@@ -416,8 +394,8 @@ mod tests {
             "a main-file sidechain is not captured"
         );
         assert!(
-            text.contains("hello world"),
-            "tool results stay inside their turn"
+            text.contains("[tool Read]") && !text.contains("hello world"),
+            "tool calls stay inside their turn; a Read result is file content and is not kept"
         );
         assert!(turn_text(&out.turns[1]).contains("a.txt holds a greeting"));
         assert_eq!(out.stats.lines, 20);
@@ -670,8 +648,9 @@ mod tests {
         // The rest of the turn arrives as the late tail.
         let rest = read(CLAUDE, &file[consumed..], &opts(false, true));
         assert!(rest.turns.is_empty());
-        assert_eq!(rest.tail.len(), 1);
-        assert!(rest.tail[0].text.contains(&format!("part {n} ")));
+        assert!(!rest.tail.is_empty());
+        let tail: String = rest.tail.iter().map(|c| c.text.as_str()).collect();
+        assert!(tail.contains(&format!("part {n} ")));
     }
 
     #[test]
@@ -781,6 +760,11 @@ mod tests {
             key,
             "an empty uuid is absent"
         );
+        // Only a valid id is used verbatim; anything else falls back to the hash.
+        for odd in [&"u".repeat(129), "has space", "a/b", "-lead", "é"] {
+            assert_eq!(turn_key(Some(odd), Some(ts), "hello"), key, "{odd}");
+        }
+        assert_eq!(turn_key(Some(&"u".repeat(128)), None, "x"), "u".repeat(128));
         let no_ts = hex::encode(Sha256::digest("\x1fhello".as_bytes()));
         assert_eq!(turn_key(None, None, "hello"), no_ts[..32]);
         // Only the first 200 characters count.
@@ -792,5 +776,182 @@ mod tests {
             turn_key(None, Some(ts), &"é".repeat(199)),
             turn_key(None, Some(ts), &"é".repeat(200))
         );
+    }
+
+    #[test]
+    fn a_head_turn_opening_with_a_wrapper_has_no_prompt() {
+        let mut input = line(json!({
+            "type": "user", "uuid": "w-1", "isSidechain": false,
+            "timestamp": "2026-10-14T09:00:00.000Z",
+            "message": {"role": "user",
+                        "content": "<command-name>/x</command-name>\n<command-args></command-args>"},
+        }));
+        input.extend(assistant_line("a-1", "msg_w", "Ran the command."));
+        input.extend(prompt_line("p-1", "Now fix the bug. Then test it."));
+        let out = read(CLAUDE, &input, &opts(true, true));
+        assert_eq!(keys(&out), ["w-1", "p-1"]);
+        assert_eq!(out.turns[0].prompt, None, "a head turn is not a prompt");
+        assert_eq!(out.turns[1].prompt.as_deref(), Some("Now fix the bug."));
+    }
+
+    #[test]
+    fn a_prompt_never_holds_harness_markup() {
+        // A notification turn takes its summary.
+        let note = line(json!({
+            "type": "user", "uuid": "n-1", "isSidechain": false,
+            "timestamp": "2026-10-14T09:00:00.000Z",
+            "message": {"role": "user", "content":
+                "<task-notification>\n<summary>Background build finished</summary>\n</task-notification>"},
+        }));
+        let out = read(CLAUDE, &note, &opts(true, true));
+        assert_eq!(
+            out.turns[0].prompt.as_deref(),
+            Some("Background build finished")
+        );
+
+        // Without a summary there is no prompt.
+        let bare = line(json!({
+            "type": "user", "uuid": "n-2", "isSidechain": false,
+            "message": {"role": "user", "content": "<task-notification>\n<status>done</status>\n</task-notification>"},
+        }));
+        assert_eq!(read(CLAUDE, &bare, &opts(true, true)).turns[0].prompt, None);
+
+        // A wrapper block beside typed text is stripped from the prompt.
+        let mixed = line(json!({
+            "type": "user", "uuid": "m-1", "isSidechain": false,
+            "message": {"role": "user", "content": [
+                {"type": "text", "text": "<command-name>/x</command-name>"},
+                {"type": "text", "text": "Real words here."}]},
+        }));
+        let out = read(CLAUDE, &mixed, &opts(true, true));
+        assert_eq!(out.turns[0].prompt.as_deref(), Some("Real words here."));
+
+        // An image-only prompt starts a turn and has no text.
+        let image = line(json!({
+            "type": "user", "uuid": "i-1", "isSidechain": false,
+            "message": {"role": "user", "content": [{"type": "image", "source": {}}]},
+        }));
+        assert_eq!(
+            read(CLAUDE, &image, &opts(true, true)).turns[0].prompt,
+            None
+        );
+    }
+
+    #[test]
+    fn a_closed_pass_at_the_file_start_keeps_the_cursor_at_zero_without_content() {
+        let bookkeeping = line(json!({"type": "mode", "mode": "default", "sessionId": "s"}));
+        let out = read(CLAUDE, &bookkeeping, &opts(true, true));
+        assert!(out.turns.is_empty() && out.tail.is_empty());
+        assert_eq!(
+            out.consumed, 0,
+            "nothing was emitted, so nothing is consumed"
+        );
+
+        // Content that arrives later, before any prompt, becomes a keyed head turn.
+        let mut grown = bookkeeping.clone();
+        grown.extend(assistant_line("a-late", "msg_late", "Resumed work."));
+        let out = read(CLAUDE, &grown, &opts(true, true));
+        assert_eq!(keys(&out), ["a-late"]);
+        assert!(out.tail.is_empty());
+        assert_eq!(out.consumed, grown.len() as u64);
+
+        // At a cursor, a pass that carries nothing still moves on.
+        let out = read(CLAUDE, &bookkeeping, &opts(false, true));
+        assert_eq!(out.consumed, bookkeeping.len() as u64);
+    }
+
+    #[test]
+    fn an_unrecognised_block_beside_known_ones_counts_once_per_line() {
+        let drift = line(json!({
+            "type": "assistant", "uuid": "a-1", "isSidechain": false,
+            "message": {"id": "m", "role": "assistant", "content": [
+                {"type": "text", "text": "Known text."},
+                {"type": "hologram", "payload": 1},
+                {"type": "hologram", "payload": 2}]},
+        }));
+        let mut input = prompt_line("p-1", "Go.");
+        input.extend(&drift);
+        let out = read(CLAUDE, &input, &opts(true, true));
+        assert_eq!(out.stats.unknown, 1, "once per line, not per block");
+        assert!(turn_text(&out.turns[0]).contains("Known text."));
+
+        let clean = read(CLAUDE, &prompt_line("p-1", "Go."), &opts(true, true));
+        assert_eq!(clean.stats.unknown, 0);
+    }
+
+    /// Reads `input` in passes ending at `cuts` and then at its end, the way the daemon does:
+    /// each pass starts at the cursor, `at_file_start` holds at 0, and only the last pass closes
+    /// the trailing turn. Returns every turn key and every rendered chunk, in order.
+    fn replay(input: &[u8], cuts: &[usize]) -> (Vec<String>, Vec<String>) {
+        let mut ends: Vec<usize> = cuts.iter().copied().filter(|&c| c < input.len()).collect();
+        ends.sort_unstable();
+        ends.dedup();
+        ends.push(input.len());
+        let (mut cursor, mut turn_keys, mut chunks) = (0usize, Vec::new(), Vec::new());
+        for (i, &end) in ends.iter().enumerate() {
+            let last = i + 1 == ends.len();
+            let out = read(CLAUDE, &input[cursor..end], &opts(cursor == 0, last));
+            turn_keys.extend(keys(&out));
+            chunks.extend(out.tail.iter().map(|c| c.text.clone()));
+            chunks.extend(
+                out.turns
+                    .iter()
+                    .flat_map(|t| t.chunks.iter().map(|c| c.text.clone())),
+            );
+            cursor += out.consumed as usize;
+            assert!(cursor <= end, "pass {i}: the cursor passed the input");
+        }
+        assert_eq!(cursor, input.len(), "the last pass consumes everything");
+        (turn_keys, chunks)
+    }
+
+    #[test]
+    fn reading_pass_by_pass_equals_one_full_read() {
+        for (name, input) in [
+            ("turns", TURNS),
+            ("sample-1", SAMPLE_1),
+            ("sample-2", SAMPLE_2),
+        ] {
+            let full = read(CLAUDE, input, &opts(true, true));
+            let want_keys = keys(&full);
+            let want_chunks: Vec<String> = full
+                .turns
+                .iter()
+                .flat_map(|t| t.chunks.iter().map(|c| c.text.clone()))
+                .collect();
+            assert!(!want_keys.is_empty(), "{name}");
+
+            let multibyte = input.iter().position(|&b| b >= 0x80).map_or(1, |p| p + 1);
+            let after_first_line = input.iter().position(|&b| b == b'\n').unwrap() + 1;
+            let mut cuts = vec![
+                1,
+                multibyte,
+                after_first_line,
+                after_first_line + 7,
+                input.len() / 4,
+                input.len() / 3,
+                input.len() / 2,
+                input.len() * 3 / 4,
+                input.len() - 1,
+            ];
+            // Every turn start, and one byte into every turn.
+            for key in &want_keys {
+                let at = line_start(input, &format!("\"uuid\":\"{key}\"")) as usize;
+                cuts.extend([at, at + 1, at.saturating_sub(1)]);
+            }
+            let (got_keys, got_chunks) = replay(input, &cuts);
+            assert_eq!(got_keys, want_keys, "{name}: every turn exactly once");
+            assert_eq!(got_chunks, want_chunks, "{name}: same rendered text");
+
+            // One cut at a time, and a pass per few bytes of the start.
+            for cut in (0..input.len()).step_by((input.len() / 40).max(1)) {
+                let (k, c) = replay(input, &[cut]);
+                assert_eq!(
+                    (k, c),
+                    (want_keys.clone(), want_chunks.clone()),
+                    "{name} cut {cut}"
+                );
+            }
+        }
     }
 }

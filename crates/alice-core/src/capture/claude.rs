@@ -12,6 +12,9 @@ use super::record::{Block, Record, RecordKind};
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LineResult {
     Record(Record),
+    /// A record with an unrecognised block beside the known ones. The known blocks are kept;
+    /// the caller counts the line as unknown, so format drift shows up in the stats.
+    Drift(Record),
     /// A JSON object whose shape the parser does not recognise (counted, never fatal).
     Unknown,
     /// Not UTF-8, not JSON, or a JSON value that is not an object.
@@ -129,13 +132,19 @@ fn record(
     } else {
         kind
     };
-    LineResult::Record(Record {
+    let drift = parsed.unknown && kind != RecordKind::Skip;
+    let record = Record {
         uuid: string(obj, "uuid"),
         message_id,
         timestamp: string(obj, "timestamp"),
         kind,
         blocks: parsed.blocks,
-    })
+    };
+    if drift {
+        LineResult::Drift(record)
+    } else {
+        LineResult::Record(record)
+    }
 }
 
 /// `type: "user"`: a prompt, tool results, injected harness text, or the compaction summary
