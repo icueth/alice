@@ -640,6 +640,20 @@ fn update(
         let slug = projects::move_slug(update.project.as_deref().ok_or_else(|| {
             AliceError::invalid("move needs project: the slug of the project to move it to")
         })?)?;
+        // The text screened with the destination's rules must be the text that moves: an edit
+        // that landed since is refused, never stored unscreened.
+        if let Some(s) = &update.screened {
+            let now: (String, String) = conn.query_row(
+                "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
+                [&own],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if now != (s.content_hash.clone(), s.updated_at.clone()) {
+                return Err(AliceError::invalid(format!(
+                    "memory {id} was edited while its move was being checked against the privacy rules of project {slug}; nothing was changed, try again"
+                )));
+            }
+        }
         match projects::resolve_move_target(conn, &slug)? {
             Some(target) => {
                 let current: String = conn.query_row(
@@ -677,9 +691,22 @@ fn update(
             }
         }
     }
-    let m = memories::apply_update(conn, id, update, st.hlc.tick())?;
+    let mut m = memories::apply_update(conn, id, update, st.hlc.tick())?;
     st.inserted = true; // edits may need re-embedding
-    let group = group.or_else(|| by.is_some().then(new_id));
+    // A moved memory whose text the destination's rules clean is stored cleaned, as an edit in
+    // the same group (undo of the move reverses both), as the review move does.
+    let cleaned = match &update.screened {
+        Some(s)
+            if update.action == UpdateAction::Move
+                && (m.title != s.title || m.body != s.body || m.topics != s.topics) =>
+        {
+            Some(s)
+        }
+        _ => None,
+    };
+    let group = group
+        .or_else(|| by.is_some().then(new_id))
+        .or_else(|| cleaned.is_some().then(new_id));
     let after = snap(conn, &m.id)?;
     let event = record(
         conn,
@@ -694,6 +721,34 @@ fn update(
             group: group.as_deref(),
         },
     )?;
+    if let Some(s) = cleaned {
+        let before = snap(conn, &m.id)?;
+        m = memories::apply_update(
+            conn,
+            &m.id,
+            &MemoryUpdate {
+                action: UpdateAction::Edit,
+                title: Some(s.title.clone()),
+                body: Some(s.body.clone()),
+                topics: Some(s.topics.clone()),
+                ..Default::default()
+            },
+            st.hlc.tick(),
+        )?;
+        record(
+            conn,
+            st,
+            EventInput {
+                actor,
+                action: "memory.edit",
+                target_type: "memory",
+                target_id: &m.id,
+                before,
+                after: snap(conn, &m.id)?,
+                group: group.as_deref(),
+            },
+        )?;
+    }
     if let Some(by) = &by {
         let after_by = snap(conn, by)?;
         if after_by != before_by {
@@ -5586,6 +5641,64 @@ mod tests {
             [],
         );
         assert_eq!(created, 1);
+    }
+
+    /// A move the daemon screened carries the text it screened: an edit that landed since
+    /// refuses the move (nothing is created); a text the destination's rules cleaned is stored
+    /// with the move, as an edit in its group, and undo of the move brings back both.
+    #[test]
+    fn a_screened_move_refuses_a_changed_memory_and_stores_the_cleaned_text_with_the_move() {
+        let f = fixture();
+        let (a, _) = new_id(f.h.submit_blocking(remember("see TCK-12345 here")).unwrap());
+        let home = project_of(&f, &a);
+        let hash: String = f.read("SELECT content_hash FROM memories WHERE id = ?1", [&a]);
+        let at: String = f.read("SELECT updated_at FROM memories WHERE id = ?1", [&a]);
+        let clean = "see [REDACTED:custom:ticket] here";
+        let op = |hash: &str| WriteOp::Update {
+            id: a.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Move,
+                project: Some("strict".into()),
+                screened: Some(alice_core::store::memories::ScreenedMove {
+                    content_hash: hash.into(),
+                    updated_at: at.clone(),
+                    title: clean.into(),
+                    body: clean.into(),
+                    topics: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        };
+        let err = f.h.submit_blocking(op("stale")).unwrap_err().to_string();
+        assert!(
+            err.contains("was edited while its move was being checked"),
+            "{err}"
+        );
+        assert_eq!(project_of(&f, &a), home);
+        assert_eq!(
+            placeholders(&f, "strict"),
+            0,
+            "a refused move makes nothing"
+        );
+
+        f.h.submit_blocking(op(&hash)).unwrap();
+        assert_eq!(project_of(&f, &a), "strict");
+        let (title, body): (String, String) = (
+            f.read("SELECT title FROM memories WHERE id = ?1", [&a]),
+            f.read("SELECT body FROM memories WHERE id = ?1", [&a]),
+        );
+        assert_eq!((title.as_str(), body.as_str()), (clean, clean));
+        let actions: String = f.read(
+            "SELECT group_concat(action, ',') FROM (SELECT action FROM events WHERE group_id = (SELECT group_id FROM events WHERE action = 'memory.move') ORDER BY rowid)",
+            [],
+        );
+        assert_eq!(actions, "project.create,memory.move,memory.edit");
+        undo(&f, &event_of(&f, "memory.move", &a)).unwrap();
+        assert_eq!(project_of(&f, &a), home);
+        let body: String = f.read("SELECT body FROM memories WHERE id = ?1", [&a]);
+        assert_eq!(body, "see TCK-12345 here");
+        assert_eq!(placeholders(&f, "strict"), 0);
     }
 
     #[test]

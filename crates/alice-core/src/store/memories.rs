@@ -93,6 +93,24 @@ pub struct MemoryUpdate {
     #[serde(default)]
     #[schemars(skip)]
     pub project: Option<String>,
+    /// For `move`: the memory's text as the destination's privacy rules leave it, set by the
+    /// daemon after it screened the text (never by a caller: not part of any request). The
+    /// writer refuses the move if the memory changed since, and stores this text with it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub screened: Option<ScreenedMove>,
+}
+
+/// A memory's text screened with the privacy rules of the project it is moving to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenedMove {
+    /// `content_hash` and `updated_at` of the memory that was screened: topics and importance
+    /// are not in the hash.
+    pub content_hash: String,
+    pub updated_at: String,
+    pub title: String,
+    pub body: String,
+    pub topics: Vec<String>,
 }
 
 fn normalize_topics(raw: &[String]) -> Result<Vec<String>> {

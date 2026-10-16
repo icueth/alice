@@ -309,6 +309,56 @@ async fn update_move_relocates_a_memory_and_undo_reverses_it() {
     assert!(bad.text().await.unwrap().contains("needs project"));
 }
 
+/// `update` refuses what its action would otherwise drop without a word: other fields given
+/// with `move`, and `project` given with any other action. Nothing changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_refuses_fields_its_action_does_not_use() {
+    let s = Srv::start().await;
+    let r: RememberResponse = s
+        .post_json(
+            "/api/v1/remember",
+            &serde_json::json!({"content": "okapi field notes", "project": "global"}),
+        )
+        .await;
+    let id = r.id.unwrap();
+    for (body, said) in [
+        (
+            serde_json::json!({"id": id, "action": "move", "project": "zoo", "title": "renamed"}),
+            "title",
+        ),
+        (
+            serde_json::json!({"id": id, "action": "move", "project": "zoo", "body": "new text", "importance": 5}),
+            "body, importance",
+        ),
+        (
+            serde_json::json!({"id": id, "action": "archive", "project": "zoo"}),
+            "project",
+        ),
+        (
+            serde_json::json!({"id": id, "action": "edit", "body": "changed", "project": "zoo"}),
+            "project",
+        ),
+    ] {
+        let r = s.post("/api/v1/update", &body).await;
+        assert_eq!(r.status(), 400, "{body}");
+        let text = r.text().await.unwrap();
+        assert!(
+            text.contains(said) && text.contains("move"),
+            "{body}: {text}"
+        );
+    }
+    let got: GetResponse = s
+        .post_json("/api/v1/get", &serde_json::json!({"ids": [id]}))
+        .await;
+    let m = &got.memories[0].memory;
+    assert_eq!(
+        (m.project.as_str(), m.title.as_str(), m.body.as_str()),
+        ("global", "okapi field notes", "okapi field notes")
+    );
+    assert_ne!(m.status.as_str(), "archived");
+    assert_eq!(slugs(&s), ["global"], "no project was made");
+}
+
 /// Undo never overwrites a later change: the answer is a review item, not an error.
 #[tokio::test(flavor = "multi_thread")]
 async fn undo_after_a_later_change_answers_with_a_review_item() {
@@ -2348,6 +2398,153 @@ async fn merging_a_cloud_denied_project_into_an_allowed_one_is_refused() {
     let done: ProjectMergeResponse = s.post_json("/api/v1/projects/merge", &req(false)).await;
     assert!(done.merged, "{done:?}");
     assert_eq!(slugs(&s), ["beta", "global"]);
+}
+
+/// `update --action move` never loosens a cloud denial either: a memory of a denied project is
+/// refused a move into an allowed one, whether the destination exists or would be a new
+/// placeholder (a slug no project has is judged by the settings alone). Into a denied project,
+/// new or not, it goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_a_memory_out_of_a_cloud_denied_project_into_an_allowed_one_is_refused() {
+    let s = Srv::start().await;
+    let (_a, _b) = two_folders(&s).await;
+    let deny = |names: &[&str]| {
+        let mut changes = serde_json::Map::new();
+        changes.insert(
+            "privacy.cloud_denied_projects".into(),
+            serde_json::json!(names),
+        );
+        s.svc.patch_settings(changes).unwrap();
+    };
+    let id: String = rusqlite::Connection::open(s.home.db())
+        .unwrap()
+        .query_row(
+            "SELECT m.id FROM memories m JOIN projects p ON p.id = m.project_id WHERE p.slug = 'alpha' ORDER BY m.seq LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mv = |to: &str| serde_json::json!({"id": id, "action": "move", "project": to});
+
+    deny(&["alpha"]);
+    let before = placement(&s);
+    for to in ["beta", "brand-new"] {
+        let r = s.post("/api/v1/update", &mv(to)).await;
+        assert_eq!(r.status(), 400, "{to}");
+        let text = r.text().await.unwrap();
+        assert!(
+            text.contains("cloud providers") && text.contains(&format!("deny \\\"{to}\\\" first")),
+            "{text}"
+        );
+    }
+    assert_eq!(placement(&s), before, "nothing moved");
+    assert_eq!(
+        slugs(&s),
+        ["alpha", "beta", "global"],
+        "no placeholder was made"
+    );
+
+    // A new slug the settings deny is a denied destination.
+    deny(&["alpha", "vault"]);
+    let moved: MemoryFull = s.post_json("/api/v1/update", &mv("vault")).await;
+    assert_eq!(moved.memory.project, "vault");
+    // Denied into denied.
+    deny(&["alpha", "vault", "beta"]);
+    let moved: MemoryFull = s.post_json("/api/v1/update", &mv("beta")).await;
+    assert_eq!(moved.memory.project, "beta");
+}
+
+/// A move screens the memory's text with the destination's privacy rules, as the review move
+/// does: in block mode a text those rules would change is refused (naming the detector, never
+/// the text) and nothing moves; in redact mode it moves with the text those rules leave, and
+/// undo brings back both the project and the text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_screens_the_text_with_the_destination_rules() {
+    let s = Srv::start().await;
+    let loose = s._d.path().join("loose");
+    let strict = s._d.path().join("strict");
+    for d in [&loose, &strict] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(
+        strict.join(".alice.toml"),
+        "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
+    )
+    .unwrap();
+    // Written where no such rule exists.
+    let m = s
+        .svc
+        .remember(RememberRequest {
+            content: "see TCK-12345 for details".into(),
+            cwd: Some(loose.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s.svc
+        .remember(RememberRequest {
+            content: "something in the strict project".into(),
+            cwd: Some(strict.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let id = m.id.unwrap();
+    let strict_slug = slugs(&s)
+        .into_iter()
+        .find(|p| p.starts_with("strict"))
+        .expect("a strict project");
+    let where_is = || -> (String, String) {
+        rusqlite::Connection::open(s.home.db())
+            .unwrap()
+            .query_row(
+                "SELECT p.slug, m.body FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    let start = where_is();
+    assert_eq!(start.1, "see TCK-12345 for details");
+    let mode = |m: &str| {
+        let mut changes = serde_json::Map::new();
+        changes.insert("privacy.redact_mode".into(), serde_json::json!(m));
+        s.svc.patch_settings(changes).unwrap();
+    };
+    let mv = serde_json::json!({"id": id, "action": "move", "project": strict_slug});
+
+    mode("block");
+    let r = s.post("/api/v1/update", &mv).await;
+    assert_eq!(r.status(), 400);
+    let text = r.text().await.unwrap();
+    assert!(
+        text.contains("custom:ticket")
+            && text.contains("cannot move")
+            && !text.contains("TCK-12345"),
+        "{text}"
+    );
+    assert_eq!(where_is(), start, "nothing moved");
+
+    mode("redact");
+    let moved: MemoryFull = s.post_json("/api/v1/update", &mv).await;
+    assert_eq!(moved.memory.project, strict_slug);
+    assert_eq!(
+        moved.memory.body,
+        "see [REDACTED:custom:ticket] for details"
+    );
+    assert_eq!(where_is(), (strict_slug.clone(), moved.memory.body.clone()));
+    let u: UndoResponse = s
+        .post_json(
+            "/api/v1/undo",
+            &serde_json::json!({"event_id": moved.event_id.expect("a move is undoable")}),
+        )
+        .await;
+    assert!(u.undone, "{}", u.message);
+    assert_eq!(
+        where_is(),
+        start,
+        "undo brings back the project and the text"
+    );
 }
 
 /// A denial that comes from the checkout's own `.alice.toml` counts like one in the settings.

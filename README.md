@@ -213,6 +213,8 @@ alice import mempalace [--palace dir] [--dry-run] [--since date] [--map-wing win
 alice import status
 ```
 
+`--action move` takes `--project` alone (other flags are refused, and so is `--project` with any other action). Like a project merge, it refuses to move a memory out of a project kept away from cloud providers into one that is not, and it checks the text against the destination's privacy rules: in `block` mode a text those rules would change is refused, otherwise it moves redacted by them.
+
 Every command takes `--json`. Planned: `sync` (M4), `hook` (SP2), `ui` (SP3).
 
 ## Configuration

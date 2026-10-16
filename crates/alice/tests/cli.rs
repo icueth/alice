@@ -823,6 +823,56 @@ fn update_move_relocates_a_memory_and_undo_brings_it_back() {
     assert_eq!((found("global"), slugs(&e)), (1, before));
 }
 
+/// `alice update` refuses flags its action would drop, before it asks the daemon anything (none
+/// is started): anything but `--project` with `--action move`, and `--project` with any other
+/// action.
+#[test]
+fn update_refuses_flags_its_action_ignores_without_starting_a_daemon() {
+    let e = Env::new();
+    let id = "01K7NOSUCHMEMORY0000000000";
+    for (args, said) in [
+        (
+            vec![
+                "update",
+                id,
+                "--action",
+                "move",
+                "--project",
+                "zoo",
+                "--title",
+                "t",
+            ],
+            "--title",
+        ),
+        (
+            vec![
+                "update",
+                id,
+                "--action",
+                "move",
+                "--project",
+                "zoo",
+                "--by",
+                "x",
+            ],
+            "--by",
+        ),
+        (
+            vec!["update", id, "--action", "archive", "--project", "zoo"],
+            "--project",
+        ),
+    ] {
+        let o = e.run(&args);
+        assert!(!o.status.success(), "{args:?}");
+        let err = stderr(&o);
+        assert!(
+            err.contains(said) && err.contains("move"),
+            "{args:?}: {err}"
+        );
+    }
+    assert!(e.daemon_json().is_none(), "no daemon was started");
+}
+
 /// The pending entries in the spool.
 fn spooled(e: &Env) -> usize {
     std::fs::read_dir(e.home.join("spool"))

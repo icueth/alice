@@ -35,7 +35,9 @@ use alice_core::store::embeddings;
 use alice_core::store::events::Actor;
 use alice_core::store::history::UndoOutcome;
 use alice_core::store::kg::{self, FactOutcome};
-use alice_core::store::memories::{self, InsertOutcome, NewMemoryInput};
+use alice_core::store::memories::{
+    self, InsertOutcome, MemoryUpdate, NewMemoryInput, ScreenedMove, UpdateAction,
+};
 use alice_core::store::projects::{self, DetectedForRead, ResolvedProject};
 use alice_core::store::reviews::{self, NewReview, ReviewItem, ReviewQuery, ReviewType};
 use alice_core::store::sources::{self, IngestOutcome};
@@ -572,6 +574,35 @@ fn join_err(e: tokio::task::JoinError) -> AliceError {
 
 /// `text` for `field` through `r`: redacted, or refused in `block` mode. Logs the field and
 /// that something was redacted, never the text.
+/// An update refuses what its action would otherwise drop without a word: a `move` takes only
+/// `project`, and `project` belongs to `move` alone.
+fn check_update_fields(u: &MemoryUpdate) -> Result<()> {
+    if u.action == UpdateAction::Move {
+        let extra: Vec<&str> = [
+            ("title", u.title.is_some()),
+            ("body", u.body.is_some()),
+            ("kind", u.kind.is_some()),
+            ("topics", u.topics.is_some()),
+            ("importance", u.importance.is_some()),
+            ("superseded_by", u.superseded_by.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, given)| given.then_some(field))
+        .collect();
+        if !extra.is_empty() {
+            return Err(AliceError::invalid(format!(
+                "move takes only project ({} given too); move the memory first, then edit it",
+                extra.join(", ")
+            )));
+        }
+    } else if u.project.is_some() {
+        return Err(AliceError::invalid(
+            "project is only for action \"move\"; to move the memory, update it with action \"move\" and project alone",
+        ));
+    }
+    Ok(())
+}
+
 fn redact_field(r: &Redactor, field: &str, text: &str) -> Result<String> {
     let out = r.check(field, text)?;
     if out != text {
@@ -1941,7 +1972,13 @@ impl Service {
     pub async fn update(&self, mut req: UpdateRequest) -> Result<MemoryFull> {
         let _busy = self.activity.enter();
         let actor = Actor::from_author(&req.author);
-        if req.update.title.is_some() || req.update.body.is_some() || req.update.topics.is_some() {
+        check_update_fields(&req.update)?;
+        if req.update.action == UpdateAction::Move {
+            req.update.screened = Some(self.screen_move(&req.id, &req.update).await?);
+        } else if req.update.title.is_some()
+            || req.update.body.is_some()
+            || req.update.topics.is_some()
+        {
             let r = self.redactor_for_memory(req.id.clone()).await?;
             let u = &mut req.update;
             if let Some(t) = &u.title {
@@ -1974,6 +2011,84 @@ impl Service {
         let mut out = self.read(move |c| full(c, m, false)).await?;
         out.event_id = event_id;
         Ok(out)
+    }
+
+    /// What a `move` is allowed to do, decided before the writer is asked: a memory of a project
+    /// kept away from cloud providers never moves into one that is not (the rule of the project
+    /// merge; a slug no project has yet is judged by the settings alone, as the placeholder the
+    /// move would make has no `.alice.toml`), and its text is screened with the destination's
+    /// privacy rules as the review move does (`block` refuses a text they would change, `redact`
+    /// cleans it). The answer carries what the memory looked like, so the writer refuses a
+    /// memory edited in between.
+    async fn screen_move(&self, id: &str, u: &MemoryUpdate) -> Result<ScreenedMove> {
+        let raw = u.project.as_deref().ok_or_else(|| {
+            AliceError::invalid("move needs project: the slug of the project to move it to")
+        })?;
+        let slug = projects::move_slug(raw)?;
+        let (asked, wanted) = (id.to_string(), slug.clone());
+        let (m, content_hash, updated_at, target, root) = self
+            .read(move |c| {
+                let own = memories::id_of(c, &asked)?.ok_or_else(|| {
+                    AliceError::NotFound(format!(
+                        "memory {asked}; check the id returned by recall or remember"
+                    ))
+                })?;
+                let m = memories::get_many(c, std::slice::from_ref(&own))?
+                    .pop()
+                    .ok_or_else(|| AliceError::NotFound(format!("memory {asked}")))?;
+                let (hash, at): (String, String) = c.query_row(
+                    "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
+                    [&own],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let target = projects::resolve_move_target(c, &wanted)?;
+                let root = match &target {
+                    Some(t) => projects::root_of(c, &t.id)?,
+                    None => None,
+                };
+                Ok((m, hash, at, target, root))
+            })
+            .await?;
+        let (dest, dest_allowed) = match &target {
+            Some(t) => (t.slug.clone(), self.cloud.cloud_allowed(&t.slug)),
+            None => (slug.clone(), self.settings.cloud_allowed(&slug, None)),
+        };
+        if dest != m.project && dest_allowed && !self.cloud.cloud_allowed(&m.project) {
+            return Err(AliceError::invalid(format!(
+                "project \"{}\" is kept away from cloud providers and \"{dest}\" is not: deny \"{dest}\" first (add it to privacy.cloud_denied_projects or set cloud_denied in its .alice.toml), or remove the denial of \"{}\", then move memory {}",
+                m.project, m.project, m.id
+            )));
+        }
+        let r = self.redactors.for_root(root.as_deref().map(Path::new));
+        let screen = |field: &str, t: &str| -> Result<String> {
+            let red = r.apply(t);
+            if red.found.is_empty() {
+                return Ok(t.to_string());
+            }
+            if r.blocks() {
+                return Err(AliceError::invalid(format!(
+                    "cannot move memory {}: the privacy rules of project {dest} (block mode) refuse its {field}, which contains what looks like a secret ({}); keep it where it is",
+                    m.id,
+                    red.found.join(", ")
+                )));
+            }
+            tracing::info!(
+                field,
+                "redacted a moved memory with the destination's rules"
+            );
+            Ok(red.text)
+        };
+        Ok(ScreenedMove {
+            title: screen("title", &m.title)?,
+            body: screen("body", &m.body)?,
+            topics: m
+                .topics
+                .iter()
+                .map(|t| screen("topic", t))
+                .collect::<Result<_>>()?,
+            content_hash,
+            updated_at,
+        })
     }
 
     pub async fn facts(&self, req: FactsRequest) -> Result<FactsResponse> {

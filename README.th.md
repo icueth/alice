@@ -213,6 +213,8 @@ alice import mempalace [--palace dir] [--dry-run] [--since date] [--map-wing win
 alice import status
 ```
 
+`--action move` รับแค่ `--project` (flag อื่นจะถูกปฏิเสธ และ `--project` คู่กับ action อื่นก็ถูกปฏิเสธเช่นกัน) เหมือนการ merge project คือจะไม่ย้าย memory จาก project ที่ถูกกันไม่ให้ส่งขึ้น cloud ไปยัง project ที่ส่งได้ และจะตรวจข้อความกับกฎความเป็นส่วนตัวของ project ปลายทาง: โหมด `block` ปฏิเสธข้อความที่กฎนั้นจะเปลี่ยน ส่วนโหมดอื่นจะย้ายไปพร้อมข้อความที่ถูกปกปิดตามกฎนั้น
+
 ทุกคำสั่งใส่ `--json` ได้ ที่วางแผนไว้: `sync` (M4), `hook` (SP2), `ui` (SP3)
 
 ## การตั้งค่า
