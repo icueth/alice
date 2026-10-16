@@ -1839,6 +1839,125 @@ async fn the_tail_of_an_imported_turn_is_skipped_too() {
     );
 }
 
+// ---- Task 18b: the rest of the import-first rule (18a's deferred minors) ----
+
+/// One record line of `t` as written, with no `timestamp` field when `at` is `None` (the
+/// `Transcript` helper always stamps one).
+fn line_at(t: &mut Transcript, mut v: serde_json::Value, at: Option<&str>) {
+    v["isSidechain"] = json!(false);
+    if let Some(at) = at {
+        v["timestamp"] = json!(at);
+    }
+    t.bytes.extend(serde_json::to_vec(&v).unwrap());
+    t.bytes.push(b'\n');
+}
+
+/// A turn of `session` whose two records carry the time `at` (none when `None`).
+fn turn_at(t: &mut Transcript, session: &str, i: usize, marker: &str, at: Option<&str>) {
+    line_at(
+        t,
+        json!({"type": "user", "uuid": format!("{session}-p{i}"),
+            "message": {"role": "user", "content": format!("Question {i} about {marker}.")}}),
+        at,
+    );
+    line_at(
+        t,
+        json!({"type": "assistant", "uuid": format!("{session}-a{i}"),
+            "message": {"id": format!("msg-{session}-a{i}"), "type": "message",
+                "role": "assistant", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": format!("Answer {i}: {marker} is settled.")}]}}),
+        at,
+    );
+}
+
+/// Spec §9.2 end to end: on the first capture of an imported session, a turn whose records carry
+/// no time, or a time that does not parse, is kept; the turns stamped by the import's end are
+/// skipped around them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_without_a_time_or_with_a_junk_time_is_kept_after_an_import() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    import_palace(
+        &svc,
+        d.path(),
+        &mined(
+            "jt1",
+            &[("mined text of jt1", Some("2026-10-16T00:00:04Z"))],
+        ),
+    )
+    .await;
+    // Turn 1 at 00:00:01 and turn 4 at :03 are held by the import; turn 5 at :05 is after it.
+    let mut t = Transcript::default();
+    t.turn("jt1", 1, "first words");
+    turn_at(&mut t, "jt1", 2, "timeless words", None);
+    turn_at(
+        &mut t,
+        "jt1",
+        3,
+        "junk-time words",
+        Some("soon after lunch"),
+    );
+    t.turn("jt1", 4, "fourth words")
+        .turn("jt1", 5, "fifth words");
+    let a = send(&svc, q("jt1", 0, "stop"), &t.bytes).await;
+    assert_eq!(
+        (a.turns_stored, a.turns_skipped, a.next_offset),
+        (3, 2, t.len())
+    );
+    for (marker, n) in [
+        ("first words is settled", 0),
+        ("timeless words is settled", 1),
+        ("junk-time words is settled", 1),
+        ("fourth words is settled", 0),
+        ("fifth words is settled", 1),
+    ] {
+        assert_eq!(chunks_holding(&svc, marker), n, "{marker}");
+    }
+    let keys = known_keys(&svc);
+    for k in ["jt1-p1", "jt1-p2", "jt1-p3", "jt1-p4", "jt1-p5"] {
+        assert!(keys.contains(k), "{k} is recorded: {keys:?}");
+    }
+}
+
+/// Spec §9.2 end to end: an imported transcript whose only end does not parse (and one with no
+/// end) is no evidence of what it holds, so the first capture stores every turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_an_unparseable_imported_end_captures_everything() {
+    use alice_core::store::sources::{ChunkInput, SourceInput};
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    for (file, end) in [("ue1", Some("soon")), ("ue1-b", None)] {
+        svc.ingest(IngestRequest {
+            source: SourceInput {
+                uri: imported_uri(file),
+                session_id: Some("ue1".into()),
+                ended_at: end.map(String::from),
+                ..Default::default()
+            },
+            chunks: vec![ChunkInput {
+                ord: 0,
+                text: format!("an earlier transcript of {file}"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        ended_at_of(&svc, &imported_uri("ue1")).as_deref(),
+        Some("soon"),
+        "stored as the importer wrote it"
+    );
+    let mut t = Transcript::default();
+    t.turn("ue1", 1, "first words")
+        .turn("ue1", 2, "second words");
+    let a = send(&svc, q("ue1", 0, "stop"), &t.bytes).await;
+    assert_eq!((a.turns_stored, a.turns_skipped), (2, 0));
+    assert_eq!(chunks_holding(&svc, "first words is settled"), 1);
+    assert_eq!(chunks_holding(&svc, "second words is settled"), 1);
+}
+
 // ---- Task 6b: local capture (the daemon reads the transcript after a notify) ----
 
 /// Local timings short enough for tests: the settle delay and the sweep period. The quiet and
