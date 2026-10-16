@@ -2019,7 +2019,9 @@ mod tests {
         /// Chunks `ords` of `source`, stored `days` ago, of `bytes` bytes of text each, each with
         /// a vector (stored and in the index); for a capture source also each turn's key and the
         /// cursor past it, as capture records them, and a state no newer than its oldest chunk
-        /// (capture stamps the state before it stores the first chunk). Returns their seqs.
+        /// (the writer stores a source's first chunks moments before it creates the state; here
+        /// they are as old as each other, well within the age walk's day of margin). Returns
+        /// their seqs.
         fn transcript_chunks(
             &self,
             c: &rusqlite::Connection,
@@ -2172,9 +2174,9 @@ mod tests {
         );
     }
 
-    /// The age walk starts at the first capture (the oldest `capture_state`): imported chunks
-    /// stored before it are skipped, a captured chunk just past the cutoff (and as old as its
-    /// state) still goes, and one just inside the cutoff stays.
+    /// The age walk starts a day before the first capture (the oldest `capture_state`): imported
+    /// chunks stored before that are skipped, a captured chunk just past the cutoff (and as old as
+    /// its state) still goes, and one just inside the cutoff stays.
     #[test]
     fn capture_retention_by_age_starts_at_the_first_capture() {
         let r = rig_with("[capture]\nraw_retention = \"180d\"\n");

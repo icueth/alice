@@ -119,9 +119,9 @@ const CAPTURE_CHUNKS_OLDER_THAN: &str =
 /// index from a day before the first capture on and looks each chunk's source up in
 /// `capture_state`. States are kept (SP2 R11), and a source's first chunks precede its state
 /// by moments only (the writer stores a slice's chunks, then creates the state): the day's
-/// margin covers them, so no capture chunk is skipped, and the chunks of an import stored
-/// before capture began are never read. The bound is written as stored timestamps are (RFC
-/// 3339, milliseconds, `Z`), so it compares as text.
+/// margin covers them, so no capture chunk is skipped, and the chunks of an import stored more
+/// than a day before the first capture are never read. The bound is written as stored
+/// timestamps are (RFC 3339, milliseconds, `Z`), so it compares as text.
 pub fn capture_chunks_older_than(
     conn: &Connection,
     cutoff: &str,
