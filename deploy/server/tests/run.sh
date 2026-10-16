@@ -102,7 +102,14 @@ cat >"$R/usr/local/bin/alice" <<'EOF'
 echo "alice $* ALICE_HOME=${ALICE_HOME:-}" >>"$ALICE_SERVER_ROOT/calls.log"
 case "$*" in
   "--version") echo "alice 0.1.0" ;;
-  "model fetch") mkdir -p "$ALICE_HOME/models/test-model" ;;
+  "model fetch")
+    if [ "${SELFTEST:-}" = fetchfail ]; then
+      i=0; while [ "$i" -lt 2000 ]; do printf '\rmodel_quantized.onnx: %5.1f%%' "$i" >&2; i=$((i + 1)); done
+      printf '\nalice: the embedding model could not be downloaded: connection refused\n' >&2
+      exit 1
+    fi
+    mkdir -p "$ALICE_HOME/models/test-model"
+    ;;
   "model check")
     # SELFTEST=sigill|fail breaks every binary; SELFTEST_INSTALLED=fail only the installed one.
     if [ "$0" = "$ALICE_SERVER_ROOT/usr/local/bin/alice" ] && [ -n "${SELFTEST_INSTALLED:-}" ]; then
@@ -563,6 +570,8 @@ refused_unchanged() { # what
 
 upgrade_refuses_a_binary_that_fails_its_self_test() {
   make_dist "$T/dist" "lib v0"
+  mkdir -p "$R/usr/local/lib/alice"
+  echo "lib in place" >"$LIB"
   cp -p "$R/usr/local/bin/alice" "$T/alice.saved"
   cp -p "$R/usr/local/bin/alice.prev" "$T/prev.saved"
   RESTARTS=$(grep -c 'systemctl restart' "$R/calls.log" || true)
@@ -570,14 +579,21 @@ upgrade_refuses_a_binary_that_fails_its_self_test() {
   refused_unchanged "the self-test died of SIGILL"
   printf '%s\n' "$OUT" | grep -qF 'failed its self-test (killed by SIGILL: this CPU cannot run its ONNX Runtime' || fail "no SIGILL reason: $OUT"
   printf '%s\n' "$OUT" | grep -qF 'nothing was installed' || fail "$OUT"
-  [ ! -e "$LIB" ] || fail "the library was installed"
+  [ "$(cat "$LIB")" = "lib in place" ] || fail "the library changed"
   SELFTEST=fail run upgrade "$T/dist/bin/alice"
   refused_unchanged "the self-test exited 1"
   printf '%s\n' "$OUT" | grep -qF 'exit 1; last output: the model could not be loaded' || fail "no exit reason: $OUT"
   TIMEOUT_EXPIRES=1 run upgrade "$T/dist/bin/alice"
   refused_unchanged "the self-test timed out"
   printf '%s\n' "$OUT" | grep -qF 'no answer within 300 s' || fail "no timeout reason: $OUT"
-  [ ! -e "$LIB" ] || fail "the library was installed"
+  # A failed first download: its progress line is dropped and the reason stays readable.
+  SELFTEST=fetchfail run upgrade "$T/dist/bin/alice"
+  refused_unchanged "the model download failed"
+  printf '%s\n' "$OUT" | grep -qF 'exit 1; last output: alice: the embedding model could not be downloaded: connection refused' || fail "no download reason: $OUT"
+  [ "${#OUT}" -lt 1000 ] || fail "the reason is ${#OUT} characters long"
+  [ "$(cat "$LIB")" = "lib in place" ] || fail "the library changed"
+  [ ! -e "$LIB.prev" ] || fail "a library .prev was made"
+  rm -rf -- "${R:?}/usr/local/lib/alice"
   pass
 }
 
@@ -608,6 +624,25 @@ upgrade_installs_the_runtime_library_and_restores_it() {
   [ "$(cat "$LIB")" = "lib v2" ] || fail "library not restored: $(cat "$LIB")"
   [ "$(grep -c 'systemctl restart' "$R/calls.log")" = "$RESTARTS" ] || fail "a tenant was restarted"
   no_selftest_home_left
+  pass
+}
+
+upgrade_restores_the_library_when_the_binary_cannot_be_installed() {
+  local lib_before left
+  if [ "$(id -u)" = 0 ]; then pass; return; fi   # root writes through a read-only directory
+  make_dist "$T/dist" "lib v9"
+  cp -p "$R/usr/local/bin/alice" "$T/alice.saved"
+  lib_before=$(cat "$LIB")
+  # The library goes in first; then the binary's directory refuses the copy.
+  chmod a-w "$R/usr/local/bin"
+  run upgrade "$T/dist/bin/alice"
+  chmod u+w "$R/usr/local/bin"
+  [ "$RC" != 0 ] || fail "upgrade succeeded although the binary could not be installed"
+  printf '%s\n' "$OUT" | grep -qF 'could not keep a copy of the current binary; the previous version is restored' || fail "$OUT"
+  cmp "$T/alice.saved" "$R/usr/local/bin/alice" || fail "the binary changed"
+  [ "$(cat "$LIB")" = "$lib_before" ] || fail "the library was not restored: $(cat "$LIB")"
+  left=$(find "$R/usr/local/bin" "$R/usr/local/lib/alice" \( -name '*.new' -o -name '*.prev.tmp' \) -print)
+  [ -z "$left" ] || fail "temporary files left: $left"
   pass
 }
 
@@ -659,8 +694,13 @@ prev=""; for a in "\$@"; do [ "\$prev" = -o ] && cp "$T/ort.tgz" "\$a"; prev="\$
 EOF
   cat >"$B/sha256sum" <<'EOF'
 #!/bin/bash
-cat >/dev/null
+echo "sha256sum $* $(cat)" >>"$BUILD_LOG"
 exit "${SHA_FAIL:-0}"
+EOF
+  cat >"$B/id" <<'EOF'
+#!/bin/bash
+if [ "$*" = "-u" ]; then echo 1000; exit 0; fi
+exec /usr/bin/id "$@"
 EOF
   cat >"$B/cargo" <<'EOF'
 #!/bin/bash
@@ -690,6 +730,8 @@ build_release_links_the_pinned_runtime_and_lays_out_the_dist() {
   build
   [ "$RC" = 0 ] || fail "build exited $RC: $OUT"
   has "$T/build.log" 'releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz'
+  has "$T/build.log" "sha256sum -c --status - 3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747  $T/bcache/onnxruntime-linux-x64-1.24.4.tgz"
+  [ ! -e "$T/btarget/server-dist.new" ] || fail "the dist's staging directory was left"
   has "$T/build.log" "cargo build --release --locked -p alice-memory ORT_LIB_LOCATION=$T/bcache/onnxruntime-linux-x64-1.24.4/lib ORT_PREFER_DYNAMIC_LINK=1 RUSTFLAGS=-C link-arg=-Wl,-rpath,\$ORIGIN/../lib/alice"
   [ -x "$T/btarget/server-dist/bin/alice" ] || fail "no dist binary"
   [ "$(cat "$T/btarget/server-dist/lib/alice/libonnxruntime.so.1")" = "ort 1.24.4" ] || fail "no dist library"
@@ -852,6 +894,7 @@ for CURRENT in \
   cli_refuses_a_secret_in_argv upgrade_rolls_back_on_a_failed_ping upgrade_installs_and_keeps_prev \
   add_refuses_a_cpu_without_avx upgrade_refuses_a_cpu_without_avx upgrade_accepts_avx_without_avx2 \
   upgrade_refuses_a_binary_that_fails_its_self_test upgrade_installs_the_runtime_library_and_restores_it \
+  upgrade_restores_the_library_when_the_binary_cannot_be_installed \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \
   add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \

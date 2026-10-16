@@ -1145,7 +1145,9 @@ the tests cover the following.
   - (§2.11) a CPU with `avx` and no `avx2` passes the flag check, one without `avx` is refused before any change (`add` and
     `upgrade`); a self-test that dies of SIGILL, exits non-zero or times out refuses the upgrade and changes nothing; the
     installed pair failing its self-test restores the binary and the library before any restart; a failed ping restores
-    both; `upgrade` is also the first install and a failed first install leaves nothing behind;
+    both, and so does a binary that cannot be installed after the library was (a `.prev` is only ever a complete copy);
+    a failed model download's progress line is dropped from the reason; `upgrade` is also the first install and a failed
+    first install leaves nothing behind;
   - (§2.11) `build-release` refuses a download that fails its SHA-256 (deleted, never unpacked), and links the pinned
     runtime with the rpath and the dist layout above (stubbed `curl`, `cargo`, `sha256sum` and `uname`).
 

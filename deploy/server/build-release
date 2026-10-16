@@ -43,14 +43,19 @@ lib="$CACHE/$ORT_NAME/lib"
 
 # ort links this library instead of downloading its own, dynamically; the binary looks for it in ../lib/alice next to
 # itself ($ORIGIN is for the dynamic loader, not the shell), so neither the units nor a shell need LD_LIBRARY_PATH.
+# RUSTFLAGS is part of cargo's fingerprint: a plain `cargo build --release` in the same target directory rebuilds
+# everything, and so does this script after one. On the server this script is the only builder.
 cd -- "$REPO"
 # shellcheck disable=SC2016
 ORT_LIB_LOCATION="$lib" ORT_PREFER_DYNAMIC_LINK=1 RUSTFLAGS='-C link-arg=-Wl,-rpath,$ORIGIN/../lib/alice' \
   nice -n 10 cargo build --release --locked -p alice-memory
 
+# Laid out beside the old dist, then swapped in, so a failure never leaves a half-written one.
+rm -rf -- "${DIST:?}.new"
+install -d -m 0755 "$DIST.new/bin" "$DIST.new/lib/alice"
+install -m 0755 "$TARGET/release/alice" "$DIST.new/bin/alice"
+install -m 0644 "$lib/libonnxruntime.so.$ORT_VERSION" "$DIST.new/lib/alice/libonnxruntime.so.1"
 rm -rf -- "${DIST:?}"
-install -d -m 0755 "$DIST/bin" "$DIST/lib/alice"
-install -m 0755 "$TARGET/release/alice" "$DIST/bin/alice"
-install -m 0644 "$lib/libonnxruntime.so.$ORT_VERSION" "$DIST/lib/alice/libonnxruntime.so.1"
+mv -- "${DIST:?}.new" "${DIST:?}"
 printf 'built %s with ONNX Runtime %s (%s)\n' "$DIST/bin/alice" "$ORT_VERSION" "$DIST/lib/alice/libonnxruntime.so.1"
 printf 'install it: sudo alice-server upgrade %s\n' "$DIST/bin/alice"

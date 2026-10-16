@@ -100,12 +100,17 @@ need_avx() {
 # it did; otherwise SELFTEST_WHY says why (a signal such as an illegal instruction, an exit code, or the timeout). The
 # model comes from MODEL_CACHE, fetched by the binary the first time (about 136 MB) and checked on every run.
 self_test() { # binary
-  local bin=$1 home rc=0 out
-  install -d -m 0755 "$MODEL_CACHE" "$SELFTEST_TMP"
+  local bin=$1 home rc=0 out last
+  install -d -m 0755 "$MODEL_CACHE" "$SELFTEST_TMP" \
+    || { SELFTEST_WHY="cannot create $MODEL_CACHE or $SELFTEST_TMP"; return 1; }
   home=$(mktemp -d "$SELFTEST_TMP/alice-selftest.XXXXXX") || { SELFTEST_WHY="no temporary directory"; return 1; }
-  ln -s -- "$MODEL_CACHE" "$home/models"
-  out=$( { ALICE_HOME="$home" ALICE_NO_AUTOSTART=1 timeout "$SELFTEST_TIMEOUT" "$bin" model fetch \
-    && ALICE_HOME="$home" ALICE_NO_AUTOSTART=1 timeout "$SELFTEST_TIMEOUT" "$bin" model check; } 2>&1 ) || rc=$?
+  if ! ln -s -- "$MODEL_CACHE" "$home/models"; then
+    rm -rf -- "${home:?}"
+    SELFTEST_WHY="cannot prepare the self-test home"
+    return 1
+  fi
+  out=$( { ALICE_HOME="$home" ALICE_NO_AUTOSTART=1 timeout "$SELFTEST_TIMEOUT" "$bin" model fetch </dev/null \
+    && ALICE_HOME="$home" ALICE_NO_AUTOSTART=1 timeout "$SELFTEST_TIMEOUT" "$bin" model check </dev/null; } 2>&1 ) || rc=$?
   rm -rf -- "${home:?}"
   [ "$rc" = 0 ] && return 0
   if [ "$rc" = 124 ]; then SELFTEST_WHY="no answer within $SELFTEST_TIMEOUT s"
@@ -113,7 +118,9 @@ self_test() { # binary
   elif [ "$rc" -gt 128 ]; then SELFTEST_WHY="killed by signal $((rc - 128))"
   else SELFTEST_WHY="exit $rc"
   fi
-  SELFTEST_WHY="$SELFTEST_WHY; last output: $(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ')"
+  # The download's progress is one long line of carriage returns: drop it, keep the last real lines, bounded.
+  last=$(printf '%s\n' "$out" | tr '\r' '\n' | { grep -v -e '%$' -e '^[[:space:]]*$' || true; } | tail -n 3 | tr '\n' ' ' | cut -c1-400)
+  SELFTEST_WHY="$SELFTEST_WHY; last output: $last"
   return 1
 }
 
@@ -502,26 +509,43 @@ restart_all() { # progress goes to stderr; the failed tenants, space separated, 
 }
 
 # Puts back what install_new replaced: the previous binary and library, or nothing at all after a first install.
+# A .prev only ever exists complete (keep_prev), so restoring one never puts a half copy in place.
 restore_prev() {
-  if [ -f "$BIN.prev" ]; then mv -- "${BIN:?}.prev" "${BIN:?}"; else rm -f -- "${BIN:?}"; fi
+  if [ -f "$BIN.prev" ]; then mv -- "${BIN:?}.prev" "${BIN:?}"
+  elif [ "$FIRST_INSTALL" = 1 ]; then rm -f -- "${BIN:?}"
+  fi
   if [ -f "$LIBDIR/$ORT_LIB.prev" ]; then mv -- "${LIBDIR:?}/$ORT_LIB.prev" "${LIBDIR:?}/$ORT_LIB"
   elif [ "$NEW_LIB" = 1 ]; then rm -f -- "${LIBDIR:?}/${ORT_LIB:?}"
   fi
 }
 
-NEW_LIB=0
+keep_prev() { # file: a complete copy as file.prev, or none at all
+  cp -p -- "${1:?}" "${1:?}.prev.tmp" && mv -- "${1:?}.prev.tmp" "${1:?}.prev"
+}
+
+install_failed() { # message: undo a partial install_new and stop
+  rm -f -- "${BIN:?}.new" "${BIN:?}.prev.tmp" "${LIBDIR:?}/${ORT_LIB:?}.new" "${LIBDIR:?}/${ORT_LIB:?}.prev.tmp"
+  restore_prev
+  die "$1; the previous version is restored"
+}
+
+FIRST_INSTALL=0; NEW_LIB=0
 install_new() { # binary library-or-empty: each through a temporary file, the current one kept as .prev
   local new=$1 lib=$2
   rm -f -- "${BIN:?}.prev" "${LIBDIR:?}/${ORT_LIB:?}.prev"
+  [ -f "$BIN" ] || FIRST_INSTALL=1
   if [ -n "$lib" ]; then
-    install -d -m 0755 "$LIBDIR"
-    if [ -f "$LIBDIR/$ORT_LIB" ]; then cp -p -- "${LIBDIR:?}/$ORT_LIB" "${LIBDIR:?}/$ORT_LIB.prev"; else NEW_LIB=1; fi
-    install -m 0644 "$lib" "$LIBDIR/$ORT_LIB.new" || die "could not copy $lib"
-    mv -- "${LIBDIR:?}/$ORT_LIB.new" "${LIBDIR:?}/$ORT_LIB"
+    install -d -m 0755 "$LIBDIR" || die "could not create $LIBDIR; nothing was installed"
+    if [ -f "$LIBDIR/$ORT_LIB" ]; then
+      keep_prev "$LIBDIR/$ORT_LIB" || install_failed "could not keep a copy of the current library"
+    else
+      NEW_LIB=1
+    fi
+    { install -m 0644 "$lib" "$LIBDIR/$ORT_LIB.new" && mv -- "${LIBDIR:?}/$ORT_LIB.new" "${LIBDIR:?}/$ORT_LIB"; } \
+      || install_failed "could not install $lib"
   fi
-  if [ -f "$BIN" ]; then cp -p -- "${BIN:?}" "${BIN:?}.prev"; fi
-  if ! install -m 0755 "$new" "$BIN.new"; then restore_prev; die "could not copy $new"; fi
-  mv -- "${BIN:?}.new" "${BIN:?}"
+  if [ "$FIRST_INSTALL" = 0 ]; then keep_prev "$BIN" || install_failed "could not keep a copy of the current binary"; fi
+  { install -m 0755 "$new" "$BIN.new" && mv -- "${BIN:?}.new" "${BIN:?}"; } || install_failed "could not install $new"
 }
 
 cmd_upgrade() { # binary (also the first install)
