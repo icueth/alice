@@ -100,6 +100,10 @@ enum Command {
     /// Agent hook (Claude Code, Codex): tell the daemon a session's transcript grew, and print
     /// the briefing at SessionStart. Reads the hook's JSON on stdin and always exits 0.
     Hook(cmd::HookArgs),
+    /// Capture hooks: add, remove or check Alice's entries in Claude Code's settings.json or
+    /// Codex's hooks.json (`alice hooks install claude`).
+    #[command(subcommand)]
+    Hooks(cmd::HooksCmd),
     /// Read and change settings (config.toml, applied live) and secrets.
     #[command(subcommand)]
     Config(cmd::ConfigCmd),

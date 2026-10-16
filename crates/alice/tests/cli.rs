@@ -3859,15 +3859,27 @@ fn hook(e: &Env, args: &[&str], input: &[u8], vars: &[(&str, &str)]) -> Output {
     out
 }
 
-/// Exit 0 with nothing on stdout or stderr.
-fn assert_quiet(o: &Output, what: &str) {
-    assert!(o.status.success(), "{what}: {}", o.status);
+/// Exit 0 with nothing on stdout or stderr; a failure shows `e`'s hook.log, where the hook says
+/// why.
+fn assert_quiet(e: &Env, o: &Output, what: &str) {
+    assert!(
+        o.status.success(),
+        "{what}: {}; hook.log: {:?}",
+        o.status,
+        hook_log(e)
+    );
     assert!(
         o.stdout.is_empty(),
-        "{what}: stdout {:?}",
-        String::from_utf8_lossy(&o.stdout)
+        "{what}: stdout {:?}; hook.log: {:?}",
+        String::from_utf8_lossy(&o.stdout),
+        hook_log(e)
     );
-    assert!(o.stderr.is_empty(), "{what}: stderr {:?}", stderr(o));
+    assert!(
+        o.stderr.is_empty(),
+        "{what}: stderr {:?}; hook.log: {:?}",
+        stderr(o),
+        hook_log(e)
+    );
 }
 
 /// The lines of `logs/hook.log`.
@@ -3988,10 +4000,15 @@ fn hook_notifies_and_capture_follows() {
         serde_json::json!({"stop_hook_active": false}),
     );
     let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &[]);
-    assert_quiet(&o, "stop");
+    assert_quiet(&e, &o, "stop");
     // Checked at once: the daemon drains its spool every few seconds, so later a spooled
     // notice would look delivered too.
-    assert_eq!(spooled(&e), 0, "the daemon took the notice");
+    assert_eq!(
+        spooled(&e),
+        0,
+        "the daemon took the notice; hook.log: {:?}",
+        hook_log(&e)
+    );
     eventually(
         || !raw_hits(&e, "quokkalantern").is_empty(),
         "the turn in the raw tier",
@@ -4027,9 +4044,19 @@ fn hook_session_start_prints_the_briefing_json() {
     };
     let args = ["session-start", "--agent", "claude-code"];
     let o = hook(&e, &args, &start("startup"), &[]);
-    assert!(o.status.success() && o.stderr.is_empty(), "{}", stderr(&o));
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout)
-        .unwrap_or_else(|err| panic!("not JSON ({err}): {}", String::from_utf8_lossy(&o.stdout)));
+    assert!(
+        o.status.success() && o.stderr.is_empty(),
+        "{}; hook.log: {:?}",
+        stderr(&o),
+        hook_log(&e)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|err| {
+        panic!(
+            "not JSON ({err}): {:?}; hook.log: {:?}",
+            String::from_utf8_lossy(&o.stdout),
+            hook_log(&e)
+        )
+    });
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
     let briefing = v["hookSpecificOutput"]["additionalContext"]
         .as_str()
@@ -4037,18 +4064,20 @@ fn hook_session_start_prints_the_briefing_json() {
     assert!(briefing.starts_with("# Context · work"), "{briefing}");
     assert!(briefing.contains("rotates every Monday"), "{briefing}");
     // A resumed session already holds its briefing.
-    assert_quiet(&hook(&e, &args, &start("resume"), &[]), "resume");
+    assert_quiet(&e, &hook(&e, &args, &start("resume"), &[]), "resume");
     // Codex gets it through the MCP instructions; its transcript path may be null.
     let codex = serde_json::to_vec(&serde_json::json!({"session_id": "s-codex-1",
         "transcript_path": null, "cwd": e.work, "hook_event_name": "SessionStart",
         "source": "startup"}))
     .unwrap();
     assert_quiet(
+        &e,
         &hook(&e, &["session-start", "--agent", "codex"], &codex, &[]),
         "codex",
     );
     e.ok(&["config", "set", "capture.briefing", "false"]);
     assert_quiet(
+        &e,
         &hook(&e, &args, &start("startup"), &[]),
         "capture.briefing = false",
     );
@@ -4066,8 +4095,8 @@ fn hook_with_the_daemon_down_spools_and_exits_zero() {
     let no_start = [("ALICE_NO_AUTOSTART", "1")];
     let input = hook_input("Stop", "s-down-1", &path, &e.work, serde_json::json!({}));
     let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &no_start);
-    assert_quiet(&o, "stop");
-    assert_eq!(spooled(&e), 1);
+    assert_quiet(&e, &o, "stop");
+    assert_eq!(spooled(&e), 1, "hook.log: {:?}", hook_log(&e));
     let entry = the_spooled_entry(&e);
     assert_eq!(entry["op"], "capture_notify", "{entry}");
     assert_eq!(entry["agent"], "claude-code", "{entry}");
@@ -4088,8 +4117,8 @@ fn hook_with_the_daemon_down_spools_and_exits_zero() {
         &start,
         &no_start,
     );
-    assert_quiet(&o, "session-start");
-    assert_eq!(spooled(&e), 2);
+    assert_quiet(&e, &o, "session-start");
+    assert_eq!(spooled(&e), 2, "hook.log: {:?}", hook_log(&e));
     assert!(
         e.daemon_json().is_none() && e.lock_free(),
         "no daemon was started"
@@ -4111,7 +4140,7 @@ fn hook_with_the_daemon_down_starts_one_detached() {
     let path = write_transcript(&transcripts_dir(&e, &e.work), "s-auto-1", "axolotlbeacon");
     let input = hook_input("Stop", "s-auto-1", &path, &e.work, serde_json::json!({}));
     let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &[]);
-    assert_quiet(&o, "stop");
+    assert_quiet(&e, &o, "stop");
     eventually(|| e.daemon_json().is_some(), "the daemon the hook started");
     eventually(|| spooled(&e) == 0, "the spool drained");
     eventually(
@@ -4160,7 +4189,7 @@ fn hook_never_fails_on_garbage_input() {
     ];
     for (i, (what, args, input)) in cases.iter().enumerate() {
         let o = hook(&e, args, input, &[]);
-        assert_quiet(&o, what);
+        assert_quiet(&e, &o, what);
         let log = hook_log(&e);
         assert_eq!(log.len(), i + 1, "{what}: one line each: {log:?}");
     }
@@ -4204,8 +4233,13 @@ fn hook_passes_a_thai_path_with_spaces_and_quotes() {
         "raw UTF-8 with escaped quotes"
     );
     let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &[]);
-    assert_quiet(&o, "stop");
-    assert_eq!(spooled(&e), 0, "the daemon took the notice");
+    assert_quiet(&e, &o, "stop");
+    assert_eq!(
+        spooled(&e),
+        0,
+        "the daemon took the notice; hook.log: {:?}",
+        hook_log(&e)
+    );
     eventually(
         || !raw_hits(&e, "numbatlantern").is_empty(),
         "the turn in the raw tier",
@@ -4318,4 +4352,173 @@ fn hook_finishes_under_100ms() {
         briefed * 100 >= RUNS * 95,
         "the briefing arrived within the deadline in {briefed} of {RUNS} runs"
     );
+}
+
+// ---------------------------------------------------------- SP2 Task 8: `alice hooks`
+
+/// `alice hooks install | status | uninstall` for Claude Code and Codex, in the test's own
+/// HOME, CLAUDE_CONFIG_DIR and CODEX_HOME, with the `--json` shapes; and doctor's hooks line.
+#[test]
+fn alice_hooks_cli_round_trip() {
+    let e = Env::new();
+    let settings = e.claude_dir().join("settings.json");
+    let alice = std::fs::canonicalize(BIN).unwrap();
+    let out = e.ok(&["hooks", "install", "claude"]);
+    assert!(
+        out.contains(&settings.display().to_string())
+            && out.contains("To remove them: alice hooks uninstall claude"),
+        "{out}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    // The ALICE_HOME of the install (not the default) and this very program, quoted.
+    assert_eq!(
+        v["hooks"]["Stop"][0]["hooks"][0]["command"],
+        format!(
+            "ALICE_HOME='{}' '{}' hook stop --agent claude-code || true",
+            e.home.display(),
+            alice.display()
+        )
+    );
+    let s = e.json(&["hooks", "status", "claude"]);
+    assert_eq!(s["agent"], "claude", "{s}");
+    assert_eq!(s["file"], settings.display().to_string(), "{s}");
+    assert_eq!(
+        (&s["installed"], &s["binary_exists"]),
+        (&serde_json::json!(true), &serde_json::json!(true)),
+        "{s}"
+    );
+    assert_eq!(s["events"].as_array().unwrap().len(), 5, "{s}");
+    assert_eq!(s["binaries"][0], alice.display().to_string(), "{s}");
+    assert_eq!(s["missing"], serde_json::json!([]), "{s}");
+    // `hooks status` starts no daemon to learn the last capture.
+    assert_eq!(s["daemon_running"], false, "{s}");
+    assert!(s["last_capture_at"].is_null(), "{s}");
+    assert!(e.daemon_json().is_none());
+    // Again: nothing changes.
+    let again = e.json(&["hooks", "install", "claude"]);
+    assert_eq!(again["agent"], "claude");
+    assert_eq!(again["dry_run"], false);
+    assert_eq!(again["changed"], false, "{again}");
+    assert_eq!(again["removed"], 5);
+    assert_eq!(again["added"].as_array().unwrap().len(), 5);
+    assert!(again["backup"].is_null() && again["others"] == serde_json::json!([]));
+    assert!(
+        again.get("text").is_none(),
+        "the file is never printed: {again}"
+    );
+    assert_eq!(again["notes"], serde_json::json!([]), "{again}");
+    let before = std::fs::read(&settings).unwrap();
+    let dry = e.json(&["hooks", "uninstall", "claude", "--dry-run"]);
+    assert_eq!(
+        (&dry["dry_run"], &dry["changed"], &dry["removed"]),
+        (
+            &serde_json::json!(true),
+            &serde_json::json!(true),
+            &serde_json::json!(5)
+        ),
+        "{dry}"
+    );
+    assert_eq!(std::fs::read(&settings).unwrap(), before);
+    let gone = e.json(&["hooks", "uninstall", "claude"]);
+    assert_eq!(gone["removed"], 5, "{gone}");
+    let backup = std::path::PathBuf::from(gone["backup"].as_str().unwrap());
+    assert_eq!(std::fs::read(&backup).unwrap(), before);
+    let s = e.json(&["hooks", "status", "claude"]);
+    assert_eq!(s["installed"], false, "{s}");
+    assert_eq!(s["events"], serde_json::json!([]), "{s}");
+
+    // Codex: its hooks.json, SessionEnd at 3 s, and the trust step last.
+    let hooks_json = e.user_home.join(".codex/hooks.json");
+    let out = e.ok(&["hooks", "install", "codex"]);
+    assert!(
+        out.trim_end()
+            .ends_with("open /hooks in Codex once and trust the Alice entries."),
+        "{out}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks_json).unwrap()).unwrap();
+    assert_eq!(v["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+    assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["timeout"], 10);
+    assert!(
+        v["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" hook stop --agent codex || true")
+    );
+    // `--json` carries the trust step too.
+    let dry = e.json(&["hooks", "install", "codex", "--dry-run"]);
+    assert_eq!(
+        dry["notes"],
+        serde_json::json!([
+            "Codex runs a hook only after you trust it: open /hooks in Codex once and trust the Alice entries."
+        ]),
+        "{dry}"
+    );
+    let s = e.json(&["hooks", "status", "codex"]);
+    assert_eq!(
+        (&s["agent"], &s["installed"]),
+        (&serde_json::json!("codex"), &serde_json::json!(true)),
+        "{s}"
+    );
+    assert_eq!(s["file"], hooks_json.display().to_string());
+    // Codex's inline hooks in config.toml stop an install.
+    std::fs::write(e.user_home.join(".codex/config.toml"), "[hooks]\n").unwrap();
+    let o = e.run(&["hooks", "install", "codex"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("one format per layer"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::remove_file(e.user_home.join(".codex/config.toml")).unwrap();
+    assert_eq!(e.json(&["hooks", "uninstall", "codex"])["removed"], 5);
+
+    // `--settings` names another file.
+    let other = e.user_home.join("elsewhere/settings.json");
+    let other_arg = other.to_str().unwrap();
+    let own = std::fs::read(&settings).unwrap();
+    let out = e.ok(&["hooks", "install", "claude", "--settings", other_arg]);
+    assert!(
+        out.contains(&format!(
+            "To remove them: alice hooks uninstall claude --settings '{other_arg}'"
+        )),
+        "the undo names the file too: {out}"
+    );
+    assert!(other.exists());
+    assert_eq!(
+        std::fs::read(&settings).unwrap(),
+        own,
+        "Claude Code's own file is untouched"
+    );
+    let s = e.json(&["hooks", "status", "claude", "--settings", other_arg]);
+    assert_eq!(s["installed"], true, "{s}");
+
+    // A malformed file is refused with its name, and left as it is.
+    std::fs::write(&settings, "{\"model\": \"opus\",}").unwrap();
+    let o = e.run(&["hooks", "install", "claude"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains(&settings.display().to_string()),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        "{\"model\": \"opus\",}"
+    );
+
+    // Doctor reads the hooks Claude Code reads, and their program exists.
+    std::fs::remove_file(&settings).unwrap();
+    e.ok(&["hooks", "install", "claude"]);
+    let o = e.run(&["--json", "doctor"]);
+    let report: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let hooks = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "capture hooks")
+        .unwrap_or_else(|| panic!("{report}"));
+    assert_eq!(hooks["status"], "ok", "{hooks}");
+    assert_eq!(hooks["detail"], "installed for Claude Code", "{hooks}");
 }

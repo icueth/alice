@@ -20,12 +20,29 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+// The budgets below are the release build's, which `hook_finishes_under_100ms` measures. A debug
+// build (the functional tests, also on slow CI runners where a debug daemon needs longer for the
+// ping, the notice and the briefing) gets generous ones, so those tests check what the hook
+// does, not how fast the machine is.
+
 /// The whole hook, from its start: a briefing that has not arrived by then is not printed.
-pub const HOOK_DEADLINE: Duration = Duration::from_millis(90);
+pub const HOOK_DEADLINE: Duration = if cfg!(debug_assertions) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_millis(90)
+};
 /// How long the daemon may take to answer the ping that proves it holds the token.
-pub const HOOK_PING: Duration = Duration::from_millis(30);
+pub const HOOK_PING: Duration = if cfg!(debug_assertions) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_millis(30)
+};
 /// How long the daemon may take to accept the notice.
-pub const HOOK_REQUEST: Duration = Duration::from_millis(40);
+pub const HOOK_REQUEST: Duration = if cfg!(debug_assertions) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_millis(40)
+};
 /// Stdin past this is not read: a hook's input is a few hundred bytes.
 const MAX_INPUT: usize = 1 << 20;
 /// `hook.log` becomes `hook.log.1` past this size.
@@ -145,7 +162,10 @@ fn read_input(deadline: Instant) -> Result<Vec<u8>, String> {
         }
         Ok(Ok(buf)) => Ok(buf),
         Ok(Err(e)) => Err(format!("ignored: cannot read stdin: {e}")),
-        Err(_) => Err("ignored: stdin was not closed within the hook's 90 ms".into()),
+        Err(_) => Err(format!(
+            "ignored: stdin was not closed within the hook's {} ms",
+            HOOK_DEADLINE.as_millis()
+        )),
     }
 }
 
@@ -260,7 +280,10 @@ async fn deliver(home: &AliceHome, n: &CaptureNotify, started: Instant, log: &Lo
 async fn print_briefing(daemon: &DaemonClient, n: &CaptureNotify, started: Instant, log: &Log) {
     let left = HOOK_DEADLINE.saturating_sub(started.elapsed());
     if left.is_zero() {
-        return log.line("no briefing: the hook's 90 ms were used up before it was asked for");
+        return log.line(&format!(
+            "no briefing: the hook's {} ms were used up before it was asked for",
+            HOOK_DEADLINE.as_millis()
+        ));
     }
     let q = BriefingQuery {
         source: n.source.clone(),
@@ -270,7 +293,12 @@ async fn print_briefing(daemon: &DaemonClient, n: &CaptureNotify, started: Insta
     let text = match daemon.capture_briefing(&q, left).await {
         Ok(Some(text)) if !text.trim().is_empty() => text,
         Ok(_) => return,
-        Err(e) => return log.line(&format!("no briefing within the hook's 90 ms: {e}")),
+        Err(e) => {
+            return log.line(&format!(
+                "no briefing within the hook's {} ms: {e}",
+                HOOK_DEADLINE.as_millis()
+            ));
+        }
     };
     let out = serde_json::json!({
         "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}

@@ -4688,6 +4688,7 @@ impl Service {
         let memory_bytes = crate::doctor::self_memory_bytes();
         let unrecognised_lines = self.capture.unrecognised_lines_7d();
         let distill = self.distill.clone();
+        let capture_counts = self.capture_counts();
         let capture_settings = self.settings();
         let tenant = self.opts.tenant;
         // Read the backup directory, the spool and the database: off the runtime's threads.
@@ -4739,7 +4740,12 @@ impl Service {
                 team_warning,
                 capture: distill.fill_health(
                     c,
-                    crate::capture::health(c, &capture_settings, unrecognised_lines)?,
+                    crate::capture::health(
+                        c,
+                        &capture_settings,
+                        unrecognised_lines,
+                        capture_counts,
+                    )?,
                 )?,
                 tenant,
             })
