@@ -499,13 +499,20 @@ fn undo_with(
             return Err(AliceError::invalid(why));
         }
     }
-    // An event that changed nothing its snapshot holds (the survivor of a merge) has nothing to
-    // revert and nothing to compare: a later change of that target neither blocks the undo nor
-    // is overwritten by it.
+    // An event that changed nothing its snapshot holds, the only one of its target in the group
+    // (the survivor of a merge), has nothing to revert and nothing to compare: a later change of
+    // that target neither blocks the undo nor is overwritten by it. (A target with more events
+    // in the group keeps its newest as the reference: its recorded snapshots are redacted, so
+    // a re-redaction after a move looks unchanged although it changed the text.)
     let mut unchanged = HashSet::new();
     for e in &todo {
+        let alone = todo
+            .iter()
+            .filter(|o| o.target_type == e.target_type && o.target_id == e.target_id)
+            .count()
+            == 1;
         let (before, after) = states(conn, e)?;
-        if before.is_some() && before == after {
+        if alone && before.is_some() && before == after {
             unchanged.insert(e.id.clone());
         }
     }
