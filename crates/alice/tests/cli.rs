@@ -3916,8 +3916,8 @@ fn queued(out: &str) -> Vec<String> {
 
 /// SP2 spec §4.4, Task 18b: `alice capture backfill claude --since <date>` queues the session
 /// files modified since the date, and their subagents' files, one notice each, and prints
-/// them. The daemon captures them under their working directory's project, and a main source
-/// it registers this way is `skipped_backfill`: not distilled. Backfilling again with
+/// them. The daemon captures them under their working directory's project, and a source it
+/// registers this way (a subagent's too) is `skipped_backfill`: not distilled. Backfilling again with
 /// `--distill` stores nothing twice and marks the sessions due.
 #[test]
 fn backfill_queues_files_since_a_date_and_does_not_distill() {
@@ -3970,7 +3970,10 @@ fn backfill_queues_files_since_a_date_and_does_not_distill() {
     let backfilled = ("work".to_string(), "skipped_backfill".to_string());
     assert_eq!(c[main1], backfilled, "{c:?}");
     assert_eq!(c[main2], backfilled, "{c:?}");
-    assert_eq!(c[sub1].1, "idle", "a subagent stands for its session");
+    assert_eq!(
+        c[sub1].1, "skipped_backfill",
+        "a backfilled subagent too (review M6)"
+    );
     assert!(!c.contains_key("claude-code:session:s-old"), "{c:?}");
     eventually(
         || !raw_hits(&e, "newerquokka").is_empty(),

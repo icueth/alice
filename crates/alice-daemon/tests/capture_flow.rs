@@ -2244,13 +2244,27 @@ fn distill_state_of(svc: &Service, uri: &str) -> String {
         .unwrap()
 }
 
-/// Task 18b (spec §4.4, ruling R-P1): a main source a backfill registers starts
-/// `skipped_backfill`, so a first backfill of months of sessions is not distilled unless asked
-/// (`alice capture distill`). A source its hooks registered first keeps its state, a subagent's
-/// source stands for its session (its main source decides), and a backfill notice that meets a
-/// hook's pending notice of a new session leaves it a live session.
+/// `(distill_state, distill_ord, next_ord)` of the capture source `uri`.
+fn distill_of(svc: &Service, uri: &str) -> (String, i64, i64) {
+    db(svc)
+        .query_row(
+            "SELECT c.distill_state, c.distill_ord, c.next_ord
+             FROM capture_state c JOIN sources s ON s.id = c.source_id WHERE s.uri = ?1",
+            [uri],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+}
+
+/// Task 18b (spec §4.4, ruling R-P1): a source a backfill registers starts `skipped_backfill`,
+/// a subagent's too (review M6), so a first backfill of months of sessions is not distilled
+/// unless asked (`alice capture distill`); backfilling it again leaves it so. A source its hooks
+/// registered first keeps its state, and a backfill notice that meets a hook's pending notice of
+/// a new session leaves it a live session. Review I1: a hook's pass that stores new turns in a
+/// backfilled session (a resumed one) makes it live again from there, and its backfilled
+/// subagent is moved past its chunks.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_backfill_registers_its_main_sources_as_skipped_backfill() {
+async fn a_backfill_registers_its_sources_as_skipped_backfill() {
     let d = tempfile::tempdir().unwrap();
     // A settle delay long enough that a backfill notice sent right after a hook's always meets it
     // in the queue.
@@ -2293,7 +2307,17 @@ async fn a_backfill_registers_its_main_sources_as_skipped_backfill() {
     until("its subagent read", read_to_end(sub_uri.into(), a1.len())).await;
     assert_eq!(chunks_holding(&svc, "backfilled words is settled"), 1);
     assert_eq!(distill_state_of(&svc, &uri("bf1")), "skipped_backfill");
-    assert_eq!(distill_state_of(&svc, sub_uri), "idle");
+    assert_eq!(distill_state_of(&svc, sub_uri), "skipped_backfill");
+    // Backfilled again after it grew: a backfill's pass never makes it live.
+    t1.turn("bf1", 2, "more backfilled words");
+    write("bf1.jsonl", &t1);
+    age(&p1, Duration::from_secs(3 * 24 * 3600));
+    svc.capture_notify(backfill_notify("bf1", &p1, None))
+        .await
+        .unwrap();
+    until("bf1 read again", read_to_end(uri("bf1"), t1.len())).await;
+    assert_eq!(chunks_holding(&svc, "more backfilled words is settled"), 1);
+    assert_eq!(distill_state_of(&svc, &uri("bf1")), "skipped_backfill");
 
     // bf2 was captured by its hook first: a backfill of its grown file leaves its state.
     let mut t2 = Transcript::default();
@@ -2339,6 +2363,35 @@ async fn a_backfill_registers_its_main_sources_as_skipped_backfill() {
         )
         .unwrap();
     assert_eq!(last_event, "stop");
+
+    // bf1 goes on live: `claude --resume` appends to the same file, and its hook's stop stores
+    // the new turn. The session is live again from there: its backfilled chunks, and its
+    // backfilled subagent's, count as distilled; the new turn's do not.
+    let (_, _, backfilled_end) = distill_of(&svc, &uri("bf1"));
+    let (_, _, sub_end) = distill_of(&svc, sub_uri);
+    assert!(backfilled_end > 0 && sub_end > 0);
+    t1.turn("bf1", 3, "resumed words");
+    write("bf1.jsonl", &t1);
+    svc.capture_notify(notify("bf1", &p1, "stop"))
+        .await
+        .unwrap();
+    until("bf1's live turn read", read_to_end(uri("bf1"), t1.len())).await;
+    assert_eq!(chunks_holding(&svc, "resumed words is settled"), 1);
+    let (state, distill_ord, next_ord) = distill_of(&svc, &uri("bf1"));
+    assert_eq!(
+        (state.as_str(), distill_ord),
+        ("idle", backfilled_end),
+        "live from the new turn on"
+    );
+    assert!(
+        next_ord > backfilled_end,
+        "the new turn waits for distillation"
+    );
+    assert_eq!(
+        distill_of(&svc, sub_uri),
+        ("idle".to_string(), sub_end, sub_end),
+        "the backfilled subagent is past its chunks"
+    );
 }
 
 // ---- Task 6b: local capture (the daemon reads the transcript after a notify) ----

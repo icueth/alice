@@ -523,6 +523,27 @@ impl CaptureCtl {
             });
         }
 
+        // Review I1: a hook's pass that is about to store new turns in a source a backfill
+        // registered makes it a live session again (`claude --resume` and `codex resume` append
+        // to the same file). Its backfilled history, below its `next_ord` now, stays undistilled;
+        // what is captured from here on is distilled as any session's is. A sweep's or a
+        // backfill's pass may only be catching up on the backfilled file, so it never revives.
+        // Before the slices: a pass cut short then leaves nothing of the live part behind.
+        if let Some(st) = &state
+            && st.distill_state == store::DistillState::SkippedBackfill
+            && !matches!(input.event.as_str(), "backfill" | "sweep")
+            && !matches!(verdict, CaptureVerdict::Excluded(_))
+            && units.iter().any(|u| !u.imported)
+        {
+            self.writer.submit_blocking(WriteOp::CaptureStateUpdate {
+                source_id: st.source_id.clone(),
+                change: CaptureChange::LiveAfterBackfill {
+                    from_ord: st.next_ord,
+                },
+            })?;
+            report.writes += 1;
+        }
+
         let base = self.base_slice(
             uri,
             &input,
@@ -965,8 +986,9 @@ impl CaptureCtl {
     /// distillation, when distillation is on and the source holds chunks not distilled yet (its
     /// own, or a subagent's that is not skipped for its own project's rules). A source due
     /// already keeps its next try, and a backfilled one is distilled only when asked (`alice
-    /// capture distill`). The capture is written either way: a failure here is logged, and the
-    /// distill worker's quiet check finds the source later.
+    /// capture distill`), or once a hook's pass found it going on live (then from there; see
+    /// `pass`). The capture is written either way: a failure here is logged, and the distill
+    /// worker's quiet check finds the source later.
     ///
     /// Only the event's last pass marks it: the one that closes the trailing turn. A pass that
     /// leaves it open (a capped upload, `more=1`; a local pass short of the end of the file) is
@@ -1795,9 +1817,11 @@ mod local {
                     init: CaptureInit {
                         transcript_path: Some(path.to_string_lossy().into_owned()),
                         file_key: Some(key),
-                        // Spec §4.4: a main source a backfill registers is not distilled unless
-                        // asked. A subagent's stands for its session, whose source decides.
-                        backfill: job.event == "backfill" && job.subagent.is_none(),
+                        // Spec §4.4: a source a backfill registers is not distilled unless asked.
+                        // A subagent's too: its chunks go with its session's run, and when the
+                        // session goes on live (review I1) only the live part is distilled; one
+                        // with no main source is then never distilled on its own (review M6).
+                        backfill: job.event == "backfill",
                         ..Default::default()
                     },
                     project: project.clone(),

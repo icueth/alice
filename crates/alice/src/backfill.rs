@@ -5,9 +5,11 @@
 //! `backfill` notice like the one a hook sends. The daemon's capture worker reads every file
 //! later, from its source's cursor, closing turns by the file's age as its sweep does. Turn
 //! dedupe and the MemPalace rule (spec §9.2) keep what is stored or imported already from being
-//! stored twice. A main source that a backfill registers starts `skipped_backfill`, so months
-//! of sessions do not become a burst of memories or spend; `--distill` marks the sessions due
-//! once the daemon has registered them (`alice capture distill`'s route).
+//! stored twice. A source that a backfill registers (a subagent's too) starts
+//! `skipped_backfill`, so months of sessions do not become a burst of memories or spend;
+//! `--distill` marks the sessions due once the daemon has registered them (`alice capture
+//! distill`'s route). A backfilled session that goes on live (a resumed session's hooks) is
+//! distilled from there on, never its backfilled history.
 
 use alice_core::api::{CaptureDistillRequest, CaptureNotify};
 use alice_core::error::AliceError;
