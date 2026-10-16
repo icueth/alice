@@ -10,6 +10,8 @@ SRV="$R/srv/alice"
 ARCHIVES="$SRV/backups"
 UNIT="$R/etc/systemd/system/alice@.service"
 CADDYFILE="$R/etc/caddy/Caddyfile"; CADDY_D="$R/etc/caddy/alice.d"
+# Caddy's admin API moves from localhost:2019 to this socket; the drop-in has systemd make its directory at every start.
+CADDY_DROPIN="$R/etc/systemd/system/caddy.service.d/alice.conf"; ADMIN_SOCK="$R/run/caddy/admin.sock"
 BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
 # The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
 # $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
@@ -35,7 +37,7 @@ if [ -n "$R" ]; then
 fi
 # A broken environment must never turn a removal into rm -rf /...: refuse to run with an empty root.
 : "${ETC:?}" "${TENANTS:?}" "${SRV:?}" "${ARCHIVES:?}" "${CADDY_D:?}" "${UNIT:?}" "${CADDYFILE:?}" "${BIN:?}" "${LOCK:?}"
-: "${LIBDIR:?}" "${MODEL_CACHE:?}" "${SELFTEST_TMP:?}"
+: "${LIBDIR:?}" "${MODEL_CACHE:?}" "${SELFTEST_TMP:?}" "${CADDY_DROPIN:?}" "${ADMIN_SOCK:?}"
 
 HOST=""
 SELFTEST_WHY=""
@@ -248,9 +250,23 @@ write_caddyfile_checked() {
   rm -f -- "${keep:?}"
 }
 
+# The first time, the running Caddy still has its own admin address (localhost:2019): a reload would look for the
+# socket the managed Caddyfile names and fail, so Caddy is restarted onto it (the drop-in gives it /run/caddy). Once the
+# socket is there, a reload goes through it.
 reload_caddy() {
   caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null || return 1
-  systemctl reload caddy
+  if [ -e "$ADMIN_SOCK" ]; then systemctl reload caddy; else systemctl restart caddy; fi
+}
+
+write_caddy_dropin() {
+  put "$CADDY_DROPIN" 0644 <<'EOF'
+# Written by alice-server: Caddy's admin API listens on /run/caddy/admin.sock (see /etc/caddy/Caddyfile), not on
+# localhost:2019, so a tenant's daemon cannot reach it. systemd makes the directory, for the caddy user only, at every
+# start.
+[Service]
+RuntimeDirectory=caddy
+RuntimeDirectoryMode=0750
+EOF
 }
 
 ensure_base() {
@@ -258,11 +274,17 @@ ensure_base() {
   chmod 0755 "$ETC" "$TENANTS" "$SRV" "$CADDY_D"
   chmod 0700 "$ARCHIVES"
   write_unit
+  mkdir -p "$(dirname "$CADDY_DROPIN")"
+  write_caddy_dropin
   write_caddyfile_checked
   systemctl daemon-reload
 }
 
-free_kb() { df -Pk "$SRV" | awk 'NR==2 {print $4}'; }
+free_kb() { # on the disk that holds $SRV (before the first add, its nearest existing parent)
+  local d=$SRV
+  while [ ! -d "$d" ]; do d=$(dirname -- "$d"); done
+  df -Pk "$d" | awk 'NR==2 {print $4}'
+}
 gb() { awk -v k="$1" 'BEGIN { printf "%.1f", k / 1048576 }'; }
 
 # Runs the alice CLI as the tenant's own user, against the tenant's own home.

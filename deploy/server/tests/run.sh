@@ -51,6 +51,10 @@ echo "chown $*" >>"$ALICE_SERVER_ROOT/calls.log"
 EOF
 stub systemctl <<'EOF'
 echo "systemctl $*" >>"$ALICE_SERVER_ROOT/calls.log"
+# A restarted Caddy listens on its admin socket (the drop-in gives it /run/caddy).
+if [ "${1:-}" = restart ] && [ "${2:-}" = caddy ]; then
+  mkdir -p "$ALICE_SERVER_ROOT/run/caddy"; : >"$ALICE_SERVER_ROOT/run/caddy/admin.sock"
+fi
 if [ "${1:-}" = enable ] && [ "${2:-}" = --now ]; then
   n="${3#alice@}"
   mkdir -p "$ALICE_SERVER_ROOT/srv/alice/$n"
@@ -178,6 +182,12 @@ add_creates_everything() {
   has "$u" 'ExecStart=/usr/local/bin/alice daemon run --tenant'
   local c="$R/etc/caddy/Caddyfile"
   has "$c" 'admin unix//run/caddy/admin.sock'
+  local d="$R/etc/systemd/system/caddy.service.d/alice.conf"
+  has "$d" 'RuntimeDirectory=caddy'
+  has "$d" 'RuntimeDirectoryMode=0750'
+  # The first route moves Caddy off localhost:2019: a restart, since a reload would look for the socket.
+  has "$R/calls.log" 'systemctl restart caddy'
+  hasnt "$R/calls.log" 'systemctl reload caddy'
   has "$c" 'default_sni 203.0.113.7'
   has "$c" 'profile shortlived'
   has "$c" 'import /etc/caddy/alice.d/*.caddy'
@@ -464,6 +474,8 @@ add_restores_the_caddyfile_when_validation_fails() {
 
 add_reloads_after_removing_the_snippet() {
   local before after
+  # Caddy is on its admin socket by now: every later change is a reload, never another restart.
+  [ "$(grep -c 'systemctl restart caddy' "$R/calls.log")" = 1 ] || fail "Caddy was restarted more than once"
   before=$(grep -c 'systemctl reload caddy' "$R/calls.log" || true)
   NO_TOKEN=1 run add gina
   [ "$RC" != 0 ] || fail "add succeeded without a token"
