@@ -179,7 +179,11 @@ curl -fsSL https://alice.example/u/<name>/api/v1/capture/setup.sh | sh -s -- htt
 ```
 
 It reuses `~/.config/alice/token` and `~/.config/alice/url`, installs the hook script and the `alice-capture` plugin from
-a local marketplace, writes Codex's `hooks.json` when Codex is installed, and prints how to check and remove it. Details:
+a local marketplace, writes Codex's `hooks.json` when Codex is installed, and prints how to check and remove it.
+
+The hook script does not update itself: setup downloads it once, into `~/.config/alice/alice-capture.sh`. After a server
+upgrade that changes the capture scripts, run the same setup line again to get the new one. It is idempotent, and it
+reuses `~/.config/alice/token` and `~/.config/alice/url` without asking. Details:
 [server.md, "Capture for team members"](server.md#capture-for-team-members).
 
 ## Privacy
