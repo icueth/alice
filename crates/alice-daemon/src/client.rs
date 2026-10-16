@@ -799,9 +799,10 @@ fn spool_redactor(home: &AliceHome, project: Option<&str>, cwd: Option<&str>) ->
     let mut global = effective.resolved.settings.privacy;
     if effective.degraded {
         // A leaf of config.toml was left out and may have been a privacy one: fail closed, as
-        // the daemon does, rather than spool with rules that may be weaker than the person's.
-        global.redact = true;
-        global.redact_mode = alice_core::settings::RedactMode::Block;
+        // the daemon does (secrets blocked, the privacy last applied kept), rather than spool
+        // with rules that may be weaker than the person's.
+        global =
+            crate::config::fail_closed_privacy(&global, crate::config::kept_privacy(home).as_ref());
     }
     let named = project.is_some_and(|p| !p.trim().is_empty());
     let root = cwd
@@ -1574,6 +1575,33 @@ mod tests {
             .collect();
         assert!(leaked.is_empty(), "{leaked:?} in {spooled}");
         assert!(spooled.contains("before") && spooled.contains("after"));
+    }
+
+    /// Final review A-I4: with a `config.toml` that does not parse, the spool keeps the custom
+    /// patterns last applied (and blocks secrets), as the daemon does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_broken_config_keeps_the_last_privacy_in_the_spool() {
+        crate::install_tls();
+        let (_d, home) = home();
+        std::fs::write(
+            home.config_file(),
+            "[privacy]\ncustom_patterns = [{ name = \"acme\", regex = \"ACME-[0-9]{6}\" }]\n",
+        )
+        .unwrap();
+        // A daemon (or any settings handle) applied it once.
+        drop(crate::config::SettingsHandle::load_with_env(
+            &home,
+            Vec::new(),
+        ));
+        std::fs::write(home.config_file(), "[privacy\ncustom_patterns = [").unwrap();
+        let e = remember_or_spool(&home, &Launcher::None, remember_req("ticket ACME-123456"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, AliceError::Refused { detectors, .. } if detectors == &["custom:acme"]),
+            "{e:?}"
+        );
+        assert_eq!(spool::pending_count(&home.spool_dir()), 0);
     }
 
     /// The length is checked on the redacted text (as the daemon does): a request that redaction

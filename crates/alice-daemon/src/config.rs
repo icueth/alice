@@ -25,8 +25,8 @@
 
 use crate::paths::AliceHome;
 use alice_core::settings::{
-    self, LooseningGate, ProjectSettingsCache, ProjectTree, Resolved, SettingError, Settings,
-    Source, loosened_protections,
+    self, LooseningGate, PrivacySettings, ProjectSettingsCache, ProjectTree, RedactMode, Resolved,
+    SettingError, Settings, Source, loosened_protections,
 };
 use parking_lot::{Mutex, RwLock};
 use std::hash::{Hash, Hasher};
@@ -252,6 +252,62 @@ fn effective(file: &Path, env: &[(String, String)]) -> Effective {
     }
 }
 
+/// The global `[privacy]` settings last applied from a valid `config.toml` in `home`, if any.
+pub fn kept_privacy(home: &AliceHome) -> Option<PrivacySettings> {
+    let text = std::fs::read_to_string(home.last_privacy_file()).ok()?;
+    match serde_json::from_str(&text) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(
+                line = e.line(),
+                "the privacy settings last applied do not parse; they are not used"
+            );
+            None
+        }
+    }
+}
+
+/// The privacy in force while no valid `config.toml` has loaded: redaction on and secrets
+/// blocked (as the spool does), and never weaker than `kept`, the settings last applied from a
+/// valid file (its patterns and denied projects are added; an allowlist entry stays only when
+/// both have it). A file that does not parse would otherwise drop the person's custom patterns
+/// and block mode for every write.
+pub fn fail_closed_privacy(
+    current: &PrivacySettings,
+    kept: Option<&PrivacySettings>,
+) -> PrivacySettings {
+    let mut p = current.clone();
+    p.redact = true;
+    p.redact_mode = RedactMode::Block;
+    if let Some(k) = kept {
+        for c in &k.custom_patterns {
+            if !p.custom_patterns.contains(c) {
+                p.custom_patterns.push(c.clone());
+            }
+        }
+        for d in &k.cloud_denied_projects {
+            if !p.cloud_denied_projects.contains(d) {
+                p.cloud_denied_projects.push(d.clone());
+            }
+        }
+        p.allowlist.retain(|a| k.allowlist.contains(a));
+    }
+    p
+}
+
+/// What `config.toml` gives while it cannot be used as a whole: its salvaged settings with the
+/// privacy made fail-closed, and a warning that says so.
+fn fail_closed(mut r: Resolved, home: &AliceHome) -> Resolved {
+    let kept = kept_privacy(home);
+    r.settings.privacy = fail_closed_privacy(&r.settings.privacy, kept.as_ref());
+    r.warnings.push(if kept.is_some() {
+        "config.toml cannot be used: the privacy settings last applied stay in force, with redaction on and secrets blocked, until it is fixed".to_string()
+    } else {
+        "config.toml cannot be used: redaction is on and secrets are blocked until it is fixed".to_string()
+    });
+    r
+}
+
 pub(crate) fn changed_keys(a: &Settings, b: &Settings) -> Vec<String> {
     let a = settings::leaves(&serde_json::to_value(a).expect("settings serialise"));
     let b: std::collections::BTreeMap<_, _> =
@@ -351,6 +407,9 @@ impl Snapshot {
 
 pub struct SettingsHandle {
     file: PathBuf,
+    home: AliceHome,
+    /// The privacy last written to `last-privacy.json` (not written again unchanged).
+    kept: Mutex<Option<PrivacySettings>>,
     env: EnvLayer,
     snapshot: RwLock<Snapshot>,
     /// Problems with `config.toml` (cleared by the next good read or patch).
@@ -393,6 +452,11 @@ impl SettingsHandle {
         let env = EnvLayer::new(&env);
         let read = read_config(&file);
         let (resolved, file_errors) = resolve_layers(&read, &env);
+        let resolved = if file_errors.is_empty() {
+            resolved
+        } else {
+            fail_closed(resolved, home)
+        };
         log_problems(
             &file_errors
                 .iter()
@@ -402,7 +466,11 @@ impl SettingsHandle {
             &resolved.warnings,
         );
         let (changes, _) = tokio::sync::broadcast::channel(16);
-        Arc::new(Self {
+        let valid = file_errors.is_empty();
+        let privacy = resolved.settings.privacy.clone();
+        let me = Arc::new(Self {
+            home: home.clone(),
+            kept: Mutex::new(kept_privacy(home)),
             seen: Mutex::new(Seen::of(&read)),
             gate: Mutex::new(LooseningGate::default()),
             ever_valid: AtomicBool::new(file_errors.is_empty()),
@@ -413,7 +481,26 @@ impl SettingsHandle {
             file_errors: RwLock::new(file_errors),
             write: Mutex::new(()),
             changes,
-        })
+        });
+        if valid {
+            me.keep_privacy(&privacy);
+        }
+        me
+    }
+
+    /// Record `privacy` as the last applied from a valid `config.toml` (when it changed).
+    fn keep_privacy(&self, privacy: &PrivacySettings) {
+        let mut kept = self.kept.lock();
+        if kept.as_ref() == Some(privacy) {
+            return;
+        }
+        let text = serde_json::to_string_pretty(privacy).expect("privacy serialises");
+        match settings::write_private(&self.home.last_privacy_file(), &text) {
+            Ok(()) => *kept = Some(privacy.clone()),
+            Err(e) => {
+                tracing::warn!(error = %e, "the privacy settings in force could not be kept for a start with a broken config.toml")
+            }
+        }
     }
 
     /// The settings in effect (cheap: a shared pointer).
@@ -530,6 +617,12 @@ impl SettingsHandle {
     }
 
     fn swap(&self, r: Resolved, errors: Vec<SettingError>) -> Vec<String> {
+        let r = if self.config_degraded() {
+            fail_closed(r, &self.home)
+        } else {
+            self.keep_privacy(&r.settings.privacy);
+            r
+        };
         let changed = changed_keys(&self.snapshot.read().settings, &r.settings);
         *self.snapshot.write() = Snapshot::new(r);
         *self.file_errors.write() = errors;
@@ -749,10 +842,14 @@ mod tests {
             "a broken file keeps the valid environment"
         );
         let s = SettingsHandle::load_with_env(&h, vec![("ALICE_NOPE".into(), "1".into())]);
-        assert_eq!(
-            s.warnings().len(),
-            1,
-            "the handle reports ignored variables too"
+        let w = s.warnings();
+        assert!(
+            w.iter().any(|w| w.contains("ALICE_NOPE")),
+            "the handle reports ignored variables too: {w:?}"
+        );
+        assert!(
+            w.iter().any(|w| w.contains("config.toml cannot be used")),
+            "and that the broken file keeps privacy closed: {w:?}"
         );
     }
 

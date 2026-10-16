@@ -93,6 +93,11 @@ impl AliceHome {
     pub fn project_rules_file(&self) -> PathBuf {
         self.root.join("project-rules.json")
     }
+    /// The global `[privacy]` settings last applied from a valid `config.toml`: a daemon that
+    /// starts while the file cannot be used keeps them in force (0600).
+    pub fn last_privacy_file(&self) -> PathBuf {
+        self.root.join("last-privacy.json")
+    }
     pub fn daemon_json(&self) -> PathBuf {
         self.root.join("daemon.json")
     }

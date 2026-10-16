@@ -2293,8 +2293,9 @@ impl ProjectSettingsCache {
     }
 }
 
-/// `text` written to a new 0600 file next to `target`, synced, then renamed over it.
-fn write_private(target: &Path, text: &str) -> std::io::Result<()> {
+/// `text` written to a new 0600 file next to `target`, synced, then renamed over it: a reader
+/// sees the old file or the new one, and nobody else can read either.
+pub fn write_private(target: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     let name = target
         .file_name()

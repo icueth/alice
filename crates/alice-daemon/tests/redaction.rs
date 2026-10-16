@@ -838,6 +838,94 @@ async fn a_worktree_without_the_project_file_keeps_the_projects_rules_and_cloud_
     s.shutdown();
 }
 
+/// Final review A-I4: a daemon that starts while `config.toml` does not parse keeps the privacy
+/// last applied from a valid file (custom patterns) and blocks secrets; a home that never had a
+/// valid file blocks secrets too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_started_with_a_broken_config_keeps_the_last_privacy_and_blocks_secrets() {
+    let d = tempfile::tempdir().unwrap();
+    let open = |dir: &Path| {
+        Service::start(
+            AliceHome::new(dir.to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions::default(),
+        )
+        .unwrap()
+    };
+    let remember = |s: &Arc<Service>, content: String| {
+        let s = s.clone();
+        async move {
+            s.remember(RememberRequest {
+                content,
+                ..Default::default()
+            })
+            .await
+        }
+    };
+    let home = AliceHome::new(d.path().to_path_buf());
+    std::fs::write(
+        home.config_file(),
+        "[privacy]\ncustom_patterns = [{ name = \"acme\", regex = \"ACME-[0-9]{6}\" }]\n",
+    )
+    .unwrap();
+    let s = open(d.path());
+    remember(&s, "ticket ACME-123456 is open".into())
+        .await
+        .unwrap();
+    s.shutdown();
+    drop(s);
+    // A typo, then a restart.
+    std::fs::write(home.config_file(), "[privacy\ncustom_patterns = [").unwrap();
+    let s = open(d.path());
+    assert!(s.settings_handle().config_degraded());
+    let e = remember(&s, "ticket ACME-654321 again".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, alice_core::error::AliceError::Refused { detectors, .. } if detectors == &["custom:acme"]),
+        "{e:?}"
+    );
+    let e = remember(&s, format!("deploy with {GITHUB}"))
+        .await
+        .unwrap_err();
+    assert!(alice_core::redact::is_refusal(&e), "{e:?}");
+    remember(&s, "nothing secret here".into()).await.unwrap();
+    assert!(
+        s.settings_handle()
+            .warnings()
+            .iter()
+            .any(|w| w.contains("config.toml cannot be used")),
+        "{:?}",
+        s.settings_handle().warnings()
+    );
+    s.shutdown();
+    drop(s);
+    // Fixed: the file applies again (the loosening from block mode waits for its polls).
+    std::fs::write(
+        home.config_file(),
+        "[privacy]\ncustom_patterns = [{ name = \"acme\", regex = \"ACME-[0-9]{6}\" }]\n",
+    )
+    .unwrap();
+    let s = open(d.path());
+    assert!(!s.settings_handle().config_degraded());
+    remember(&s, format!("deploy with {GITHUB}")).await.unwrap();
+    s.shutdown();
+
+    // A fresh home whose first file is broken: nothing kept, secrets blocked all the same.
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::write(
+        AliceHome::new(fresh.path().to_path_buf()).config_file(),
+        "[privacy\n",
+    )
+    .unwrap();
+    let s = open(fresh.path());
+    let e = remember(&s, format!("deploy with {GITHUB}"))
+        .await
+        .unwrap_err();
+    assert!(alice_core::redact::is_refusal(&e), "{e:?}");
+    s.shutdown();
+}
+
 /// A review item the way the judge will leave it (Task 12): written straight into the inbox.
 fn add_review(
     s: &Service,
