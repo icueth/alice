@@ -602,7 +602,7 @@ alice stats                 alice projects [merge <from> <into> [--yes]]   alice
 alice backup now|list       alice restore [backup] [--yes]
 alice maintenance status | run <job>
 alice config list|get|set|unset|edit|set-secret|delete-secret|test
-alice doctor                alice bench                 alice model fetch
+alice doctor                alice bench                 alice model fetch|check
 alice daemon [start|stop|status|logs|run]
 alice service [install|uninstall|status] [--dry-run] [--target-dir d]
 alice token rotate [--show]

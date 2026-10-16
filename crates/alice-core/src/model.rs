@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 pub mod limits {
     pub const MAX_CONTENT_BYTES: usize = 65_536;
     pub const MAX_TITLE_CHARS: usize = 200;
+    /// The longest project slug. GitHub caps a repository name at 100 characters, so a longer
+    /// slug cannot be a detected project.
+    pub const MAX_PROJECT_SLUG_CHARS: usize = 100;
+    /// The longest project name, as `ClientProject.name` allows.
+    pub const MAX_PROJECT_NAME_CHARS: usize = 200;
     pub const MAX_TOPICS: usize = 20;
     pub const MAX_TOPIC_CHARS: usize = 64;
     pub const MAX_CHUNK_BYTES: usize = 32_768;

@@ -246,7 +246,14 @@ pub fn preflight(
         }
     };
     detect_backend(&palace)?;
-    if settings.embedding.provider != EmbeddingProvider::Local && !req.allow_remote_embedding {
+    check_remote_embedding(settings, req.allow_remote_embedding)?;
+    Ok(palace)
+}
+
+/// An import queues every chunk for the embedding provider: a remote one is used only when the
+/// caller said so.
+pub fn check_remote_embedding(settings: &Settings, allow_remote: bool) -> Result<()> {
+    if settings.embedding.provider != EmbeddingProvider::Local && !allow_remote {
         let provider = serde_json::to_value(settings.embedding.provider)
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
@@ -255,7 +262,7 @@ pub fn preflight(
             "importing queues every chunk for {provider}, which would send the owner's history to it; pass --allow-remote-embedding if that is what you want"
         )));
     }
-    Ok(palace)
+    Ok(())
 }
 
 // ------------------------------------------------------------------------------------ redaction
@@ -2208,6 +2215,11 @@ fn thread_main(env: ImportEnv, req: ImportRequest, palace: PathBuf, job_id: Stri
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(&env, &req, &palace, &job_id)
     }));
+    conclude(env, outcome);
+}
+
+/// Ends the status of a job as `Done` or `Failed`, after the activity guard is released.
+fn conclude(env: ImportEnv, outcome: std::thread::Result<Result<ImportReport>>) {
     let ImportEnv { status, guard, .. } = env;
     // The snapshot folder went with `run`'s frame; the guard goes now, before the status says
     // the job is over, so a caller that sees `done` also sees maintenance allowed again.
@@ -2236,6 +2248,65 @@ fn thread_main(env: ImportEnv, req: ImportRequest, palace: PathBuf, job_id: Stri
             );
         }
     }
+}
+
+/// What an upload job works on: the stored archive and the folder it is unpacked into.
+pub struct UploadJob {
+    pub archive: PathBuf,
+    pub archive_len: u64,
+    pub dir: PathBuf,
+    /// `import.max_upload_bytes` when the upload began.
+    pub cap: u64,
+}
+
+/// Starts the thread of an upload job. The status is already `Unpacking`; the thread unpacks,
+/// finds the palace, runs the same import the admin path runs, and in every case removes the
+/// archive and the unpacked folder before the status says the job is over.
+pub fn spawn_upload(
+    env: ImportEnv,
+    req: ImportRequest,
+    job: UploadJob,
+    job_id: String,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("alice-import-upload".into())
+        .spawn(move || upload_main(env, req, job, job_id))
+}
+
+fn upload_main(mut env: ImportEnv, mut req: ImportRequest, job: UploadJob, job_id: String) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        upload_run(&mut env, &mut req, &job, &job_id)
+    }));
+    let _ = std::fs::remove_file(&job.archive);
+    let _ = std::fs::remove_dir_all(&job.dir);
+    conclude(env, outcome);
+}
+
+fn upload_run(
+    env: &mut ImportEnv,
+    req: &mut ImportRequest,
+    job: &UploadJob,
+    job_id: &str,
+) -> Result<ImportReport> {
+    set_phase(&env.status, "unpacking");
+    crate::upload::unpack(&job.archive, &job.dir, job.archive_len, job.cap, &env.stop)?;
+    // The archive has done its work; free its space for the snapshot.
+    let _ = std::fs::remove_file(&job.archive);
+    check_stop(&env.stop)?;
+    let found = crate::upload::locate(&job.dir)?;
+    // The graph may lie outside the palace folder: the snapshot looks in the "MemPalace home".
+    if let Some(kg_dir) = found.kg_dir {
+        env.mempalace_home = Some(kg_dir);
+    }
+    req.palace = Some(found.palace.display().to_string());
+    {
+        let mut s = env.status.lock();
+        s.state = ImportState::Importing;
+        s.phase = "starting".to_string();
+        s.done = 0;
+        s.total = 0;
+    }
+    run(env, req, &found.palace, job_id)
 }
 
 #[cfg(test)]

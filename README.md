@@ -41,7 +41,7 @@ Alice is built for that workload: many agents, many projects, one memory that st
 - **One binary.** Daemon, CLI and MCP server (and, in SP2, hooks) in a single Rust binary with the embedding runtime built in. No Python environments, no Docker. Other embedding providers (Ollama, OpenAI-compatible, Voyage) are a setting away.
 - **Git sync as Markdown** *(planned, M4)*. Push and pull memories to any git remote as one Markdown file per memory. Readable on GitHub, opens in Obsidian, syncs across machines with record-level merging. The database file never goes into git.
 - **Graph and management UI** *(planned, SP3)*. Explore the memory graph, edit memories, resolve reviews, change every setting and run git push/pull from the browser or a desktop app.
-- **Bring your MemPalace.** Import an existing MemPalace palace (drawers, diaries, knowledge graph) and keep using `mempalace_*` tool names through an optional compatibility layer.
+- **Bring your MemPalace.** Import an existing MemPalace palace (drawers, diaries, knowledge graph) and keep using `mempalace_*` tool names through an optional compatibility layer. On a shared server, a person uploads their own palace with one script ([docs/server.md](docs/server.md#a-person-imports-their-own-mempalace)).
 
 ## How it works
 
@@ -206,7 +206,7 @@ alice daemon start | stop | status | logs | run
 alice token rotate [--show]
 alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # stdio MCP server for agents
-alice model fetch
+alice model fetch | check      # check: load the model and embed one text (no daemon)
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 alice import mempalace [--palace dir] [--dry-run] [--since date] [--map-wing wing=project]...
                        [--collection name] [--allow-remote-embedding]
@@ -255,6 +255,9 @@ events_days = 365                   # history older than this is pruned
 [backup]
 daily = 7
 weekly = 4
+
+[import]
+max_upload_bytes = 4294967296       # server tenant: the largest palace archive a person may upload
 ```
 
 Environment variables:
@@ -425,6 +428,12 @@ Measured for M2 on an Apple M4 Pro with `alice bench` ([full results](docs/bench
 | Physical footprint, peak | | 511 MB | 585 MB |
 
 M1 missed the memory budget (about 1.4 GB projected with the model). M2 meets it: chunk vectors moved into a 53 MB sign-bit index (the int8 graph took 508 MB) and the embedding model runs on ONNX Runtime directly (about 350 MB loaded instead of 600). The 1M run fills the index with synthetic vectors under the real model's id (embedding a million chunks takes hours; a vector costs the same whatever its values), then starts a real daemon that loads the real model, embeds 256 new memories and serves four bursts of 64 concurrent recalls (no errors). Search quality is unchanged: the gold set keeps MRR 1.000 with all 13 queries in the top 3, and recall@10 of the chunk index against the exact top 10 is 0.99 at 96,000 real passages.
+
+## Use Alice from a server
+
+A small team can share one Linux server. Each person gets their own Alice daemon behind `https://<host>/u/<name>`, and agents (Claude Code, Codex and others) connect straight to the MCP endpoint `https://<host>/u/<name>/mcp` with a bearer token. No client binary is needed, so this also works on Windows. An optional shared team memory lets a person tell their agent "save this to the shared memory"; every team member can read it, and only its author or the admin can change it. The server's admin can read every person's memory, and a repository's `.alice.toml` does not apply over direct MCP. The server needs an x86-64 CPU with AVX (AVX2 is not needed: `deploy/server/build-release` builds the server binary with Microsoft's ONNX Runtime).
+
+The admin guide (setup, `alice-server`, disk budget, backups, privacy) and the setup for each agent are in [docs/server.md](docs/server.md).
 
 ## Roadmap
 

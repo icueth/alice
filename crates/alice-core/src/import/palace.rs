@@ -232,6 +232,7 @@ fn snapshot_inner(
     backend: Backend,
     written: &mut Vec<PathBuf>,
 ) -> Result<Snapshot> {
+    #[cfg(unix)]
     let created = !dest_dir.exists();
     #[cfg(not(unix))]
     let _ = created;

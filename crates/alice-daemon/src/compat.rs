@@ -92,6 +92,10 @@ pub struct CompatCall {
     /// The calling agent's name.
     #[serde(default)]
     pub agent: Option<String>,
+    /// A project name from a direct MCP caller (tenant mode only); set in-process, and cleared
+    /// by the HTTP API on entry so it never comes from the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -415,6 +419,8 @@ impl Service {
                 project: None,
                 max_tokens: Some(STATUS_CONTEXT_TOKENS),
                 cwd: call.cwd.clone(),
+                client_project: None,
+                project_hint: call.project_hint.clone(),
             })
             .await
         {
@@ -572,6 +578,8 @@ impl Service {
                 limit: Some(limit),
                 max_tokens: Some(SEARCH_MAX_TOKENS),
                 cwd: call.cwd.clone(),
+                client_project: None,
+                project_hint: call.project_hint.clone(),
                 ..Default::default()
             })
             .await
@@ -799,6 +807,8 @@ impl Service {
                 project: target.project.clone(),
                 topics: topic.iter().cloned().collect(),
                 cwd: call.cwd.clone(),
+                client_project: None,
+                project_hint: call.project_hint.clone(),
                 author: self.author(call, added_by),
                 ..Default::default()
             })
@@ -1027,6 +1037,8 @@ impl Service {
                 topics: topic.iter().filter_map(|t| normalize_topic(t)).collect(),
                 importance: Some(2),
                 cwd: call.cwd.clone(),
+                client_project: None,
+                project_hint: call.project_hint.clone(),
                 author: Author {
                     agent: Some(agent.clone()),
                     ..Default::default()

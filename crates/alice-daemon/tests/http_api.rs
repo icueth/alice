@@ -2433,6 +2433,7 @@ async fn two_folders(s: &Srv) -> (String, String) {
                 .collect(),
             project: None,
             cwd: Some(a.clone()),
+            ..Default::default()
         })
         .await
         .unwrap();

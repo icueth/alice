@@ -51,9 +51,26 @@ pub struct ImportRequest {
 #[serde(rename_all = "snake_case")]
 pub enum ImportState {
     Idle,
+    /// A job that reads a palace already on the machine (the CLI and the admin path).
     Running,
+    /// An upload job: the archive is arriving ...
+    Receiving,
+    /// ... being unpacked ...
+    Unpacking,
+    /// ... and being imported.
+    Importing,
     Done,
     Failed,
+}
+
+impl ImportState {
+    /// A job holds the one import slot: nothing else may start.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Running | Self::Receiving | Self::Unpacking | Self::Importing
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -79,6 +96,13 @@ pub struct ImportStatus {
     /// The largest size of the write-ahead log file seen at the job's checks (every 20 batches).
     #[serde(default)]
     pub max_wal_bytes: u64,
+    /// An upload job: bytes of the archive received so far.
+    #[serde(default)]
+    pub bytes_received: u64,
+    /// Chunks still waiting for a vector, so a person can see when vector search is complete
+    /// (the daemon fills it in when it answers `/api/v1/import/status`).
+    #[serde(default)]
+    pub embedding_backlog: u64,
 }
 
 impl ImportStatus {
@@ -95,6 +119,8 @@ impl ImportStatus {
             max_batch_records: 0,
             max_batch_bytes: 0,
             max_wal_bytes: 0,
+            bytes_received: 0,
+            embedding_backlog: 0,
         }
     }
 }

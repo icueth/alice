@@ -68,6 +68,14 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Server admin (`alice-server adopt` runs it): make a person's own Alice database, from
+    /// `alice backup now` on their machine, this fresh tenant's. Their machine paths are cleared
+    /// and the tenant's redaction rules applied again; settings, secrets and the token stay.
+    #[command(hide = true)]
+    Adopt {
+        /// The backup file.
+        file: std::path::PathBuf,
+    },
     /// List projects, or fix a wrong one with `projects merge`.
     Projects {
         #[command(subcommand)]
@@ -130,7 +138,7 @@ fn main() -> std::process::ExitCode {
     alice_daemon::install_tls();
     let is_server = matches!(
         cli.command,
-        Command::Daemon(cmd::DaemonCmd::Run) | Command::Mcp
+        Command::Daemon(cmd::DaemonCmd::Run { .. }) | Command::Mcp
     );
     // Logs go to stderr: on stdio MCP, stdout is the protocol channel. The daemon's stderr is
     // its log file, so colours only when a person watches.

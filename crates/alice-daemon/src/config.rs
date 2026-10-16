@@ -25,8 +25,8 @@
 
 use crate::paths::AliceHome;
 use alice_core::settings::{
-    self, LooseningGate, PrivacySettings, ProjectSettingsCache, ProjectTree, RedactMode, Resolved,
-    SettingError, Settings, Source, loosened_protections,
+    self, LooseningGate, PrivacySettings, ProjectLoad, ProjectSettings, ProjectSettingsCache,
+    ProjectTree, RedactMode, Resolved, SettingError, Settings, Source, loosened_protections,
 };
 use parking_lot::{Mutex, RwLock};
 use std::hash::{Hash, Hasher};
@@ -208,6 +208,35 @@ fn resolve_layers(read: &Read, env: &EnvLayer) -> (Resolved, Vec<SettingError>) 
             vec![e.clone()],
         ),
     }
+}
+
+/// Whether the `config.toml` text sets `server.port` (the admin owns the port on a tenant, so
+/// the file may not, whatever the environment says).
+fn text_sets_port(text: &str) -> bool {
+    toml::from_str::<toml::Value>(text)
+        .ok()
+        .is_some_and(|v| v.get("server").and_then(|s| s.get("port")).is_some())
+}
+
+/// `resolve_layers`, then the tenant rules: a file that breaks one is not applied at all, and
+/// its violations are reported with the file's errors.
+fn resolve_for(
+    read: &Read,
+    env: &EnvLayer,
+    tenant: Option<&Path>,
+) -> (Resolved, Vec<SettingError>) {
+    let (resolved, mut errors) = resolve_layers(read, env);
+    let Some(home) = tenant else {
+        return (resolved, errors);
+    };
+    let port_from_file = matches!(read, Ok(Some(text)) if text_sets_port(text));
+    let violations = settings::validate_tenant(&resolved.settings, home, port_from_file);
+    if violations.is_empty() {
+        return (resolved, errors);
+    }
+    errors.extend(violations);
+    let base = settings::resolve(None, &env.vars).unwrap_or_else(|_| default_resolved());
+    (base, errors)
 }
 
 fn log_problems(errors: &[SettingError], warnings: &[String]) {
@@ -451,6 +480,8 @@ pub struct SettingsHandle {
     projects: ProjectSettingsCache,
     /// Serialises reloads and patches.
     write: Mutex<()>,
+    /// On a server tenant: the canonical home root the tenant rules are checked against.
+    tenant: Option<PathBuf>,
     changes: tokio::sync::broadcast::Sender<Vec<String>>,
 }
 
@@ -474,10 +505,30 @@ impl SettingsHandle {
 
     /// The same with the environment passed in (tests).
     pub fn load_with_env(home: &AliceHome, env: Vec<(String, String)>) -> Arc<Self> {
+        Self::load_with(home, env, false)
+    }
+
+    /// The settings of a server tenant: the process environment, tenant rules on.
+    pub fn load_tenant(home: &AliceHome) -> Arc<Self> {
+        Self::load_with(home, process_env(), true)
+    }
+
+    /// Whether the tenant rules apply to this handle.
+    pub fn is_tenant(&self) -> bool {
+        self.tenant.is_some()
+    }
+
+    /// Load with the environment passed in and the tenant rules on or off.
+    pub fn load_with(home: &AliceHome, env: Vec<(String, String)>, tenant: bool) -> Arc<Self> {
+        let tenant = tenant.then(|| {
+            home.root()
+                .canonicalize()
+                .unwrap_or_else(|_| home.root().to_path_buf())
+        });
         let file = home.config_file();
         let env = EnvLayer::new(&env);
         let read = read_config(&file);
-        let (resolved, file_errors) = resolve_layers(&read, &env);
+        let (resolved, file_errors) = resolve_for(&read, &env, tenant.as_deref());
         let resolved = if file_errors.is_empty() {
             resolved
         } else {
@@ -506,6 +557,7 @@ impl SettingsHandle {
             snapshot: RwLock::new(Snapshot::new(resolved)),
             file_errors: RwLock::new(file_errors),
             write: Mutex::new(()),
+            tenant,
             changes,
         });
         if valid {
@@ -578,6 +630,23 @@ impl SettingsHandle {
         self.cloud_allowed_with(project_slug, tree, &self.projects)
     }
 
+    /// The project file for `root`; on a server tenant a root that is not there fails closed,
+    /// because its rules are on a machine this server cannot see. A tree without a root (rules
+    /// a project merge carried, kept in the store) reads as anywhere else.
+    fn project_load(&self, tree: &ProjectTree, projects: &ProjectSettingsCache) -> ProjectLoad {
+        if self.tenant.is_some() && tree.has_root() && !tree.root.is_dir() {
+            return ProjectLoad {
+                settings: ProjectSettings::fail_closed(),
+                error: Some(SettingError {
+                    key: tree.root.join(".alice.toml").display().to_string(),
+                    message: "this project's rules are not on this server; they fail closed until its client sends them again".into(),
+                }),
+                loosening_pending: false,
+            };
+        }
+        projects.get_tree(tree)
+    }
+
     /// [`cloud_allowed`](Self::cloud_allowed) over a project cache of the caller's (tests with
     /// a clock of their own). Not public: a caller with a cache of its own would have a gate of
     /// its own, and a repository would be looked at twice.
@@ -590,7 +659,7 @@ impl SettingsHandle {
         if self.config_degraded() || project_slug.trim().is_empty() {
             return false;
         }
-        let project = tree.map(|t| projects.get_tree(t).settings);
+        let project = tree.map(|t| self.project_load(t, projects).settings);
         let effective = project.unwrap_or_default().apply_to(&self.get().privacy);
         !effective.is_cloud_denied(project_slug)
     }
@@ -608,7 +677,12 @@ impl SettingsHandle {
     ) -> alice_core::settings::PrivacySettings {
         let global = self.get().privacy.clone();
         match tree {
-            Some(t) => self.projects.get_tree(t).settings.apply_to(&global).privacy,
+            Some(t) => {
+                self.project_load(t, &self.projects)
+                    .settings
+                    .apply_to(&global)
+                    .privacy
+            }
             None => global,
         }
     }
@@ -636,7 +710,7 @@ impl SettingsHandle {
         self.config_degraded()
             || self.loosening_waiting()
             || tree.is_some_and(|t| {
-                let l = self.projects.get_tree(t);
+                let l = self.project_load(t, &self.projects);
                 l.error.is_some() || l.loosening_pending
             })
     }
@@ -697,7 +771,7 @@ impl SettingsHandle {
             self.gate.lock().reset();
             return None;
         }
-        let (candidate, errors) = resolve_layers(&read, &self.env);
+        let (candidate, errors) = resolve_for(&read, &self.env, self.tenant.as_deref());
         let ever_valid = self.ever_valid.load(Ordering::SeqCst);
         if !errors.is_empty() && ever_valid {
             // An invalid edit is not applied, not even its valid parts: the last good settings
@@ -769,6 +843,12 @@ impl SettingsHandle {
             text = settings::edit_toml(&text, k, v).map_err(|e| vec![e])?;
         }
         let r = settings::resolve(Some(&text), &self.env.vars)?;
+        if let Some(home) = &self.tenant {
+            let violations = settings::validate_tenant(&r.settings, home, text_sets_port(&text));
+            if !violations.is_empty() {
+                return Err(violations);
+            }
+        }
         let target = write_target(&self.file);
         if let Err(e) = write_atomically(&target, &text) {
             return Err(vec![err(
@@ -842,6 +922,107 @@ mod tests {
         let mut m = serde_json::Map::new();
         m.insert(key.into(), value);
         m
+    }
+
+    #[test]
+    fn a_tenant_refuses_a_patch_that_points_at_the_lan() {
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with(&h, Vec::new(), true);
+        assert!(s.is_tenant());
+        let e = s
+            .patch(&one(
+                "judge.jev.endpoint",
+                serde_json::json!("https://192.168.1.99/v1"),
+            ))
+            .unwrap_err();
+        assert!(e.iter().any(|e| e.key == "judge.jev.endpoint"), "{e:?}");
+        assert!(
+            !h.config_file().exists()
+                || !std::fs::read_to_string(h.config_file())
+                    .unwrap()
+                    .contains("192.168")
+        );
+        // The same patch is fine for a local daemon.
+        let (_d2, h2) = home();
+        let local = SettingsHandle::load_with_env(&h2, Vec::new());
+        assert!(!local.is_tenant());
+        local
+            .patch(&one(
+                "judge.jev.endpoint",
+                serde_json::json!("https://192.168.1.99/v1"),
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_tenant_does_not_apply_a_hand_edited_file_that_breaks_its_rules() {
+        let (_d, h) = home();
+        std::fs::write(
+            h.config_file(),
+            "[sync]\nremote = \"git@10.0.0.5:m.git\"\n[search]\ndefault_max_tokens = 999\n",
+        )
+        .unwrap();
+        let s = SettingsHandle::load_with(&h, Vec::new(), true);
+        assert!(s.get().sync.remote.is_none());
+        assert_ne!(
+            s.get().search.default_max_tokens,
+            999,
+            "nothing of a violating file applies"
+        );
+        assert!(s.errors().iter().any(|e| e.key == "sync.remote"));
+        assert!(s.config_degraded(), "cloud consumers fail closed");
+    }
+
+    #[test]
+    fn a_tenant_port_from_the_environment_is_fine_and_from_the_file_is_refused() {
+        let (_d, h) = home();
+        let env = vec![("ALICE_SERVER_PORT".to_string(), "47801".to_string())];
+        let s = SettingsHandle::load_with(&h, env.clone(), true);
+        assert_eq!(s.get().server.port, 47801);
+        assert!(s.errors().is_empty(), "{:?}", s.errors());
+        let e = s
+            .patch(&one("server.port", serde_json::json!(47802)))
+            .unwrap_err();
+        assert!(e.iter().any(|e| e.key == "server.port"), "{e:?}");
+    }
+
+    #[test]
+    fn a_tenant_fails_closed_for_a_project_root_that_is_not_there() {
+        let (d, h) = home();
+        let s = SettingsHandle::load_with(&h, Vec::new(), true);
+        let gone = ProjectTree::new("path:proj", d.path().join("never-created"));
+        assert!(!s.cloud_allowed("proj", Some(&gone)));
+        assert!(s.project_fail_closed(Some(&gone)));
+        assert_eq!(
+            s.project_privacy(Some(&gone)).redact_mode,
+            RedactMode::Block
+        );
+        // Since M2's A-C1 a project's rules belong to the project: a tree that is gone and was
+        // never read fails closed for a local daemon too.
+        let local = SettingsHandle::load_with_env(&h, Vec::new());
+        assert!(!local.cloud_allowed("proj", Some(&gone)));
+        // Rules a project merge carried are in the store, not in a tree (M3's rules-only tree, no
+        // root): a tenant applies them as they are, neither failing them closed nor loosening them.
+        use alice_core::settings::{ProjectPrivacy, ProjectSettings};
+        let carried = ProjectTree::rules_only("path:merged", ProjectSettings::default());
+        assert!(s.cloud_allowed("merged", Some(&carried)));
+        assert!(!s.project_fail_closed(Some(&carried)));
+        let denied = ProjectTree::rules_only(
+            "path:denied",
+            ProjectSettings {
+                privacy: ProjectPrivacy {
+                    cloud_denied: true,
+                    ..Default::default()
+                },
+            },
+        );
+        assert!(!s.cloud_allowed("denied", Some(&denied)));
+        let unread = ProjectTree::unreadable("path:unread", None);
+        assert!(!s.cloud_allowed("unread", Some(&unread)));
+        assert_eq!(
+            s.project_privacy(Some(&unread)).redact_mode,
+            RedactMode::Block
+        );
     }
 
     #[test]

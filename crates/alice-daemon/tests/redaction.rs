@@ -9,9 +9,19 @@ use alice_core::kg_types::AssertFact;
 use alice_core::store::memories::{MemoryUpdate, UpdateAction};
 use alice_core::store::sources::{ChunkInput, SourceInput};
 use alice_daemon::paths::AliceHome;
-use alice_daemon::service::{Service, ServiceOptions};
+use alice_daemon::service::{Scope, Service, ServiceOptions};
 use std::path::Path;
 use std::sync::Arc;
+
+/// The scope of a request that names only a project and a working directory.
+fn scope<'a>(project: Option<&'a str>, cwd: Option<&'a str>) -> Scope<'a> {
+    Scope {
+        project,
+        cwd,
+        client_project: None,
+        project_hint: None,
+    }
+}
 
 const GITHUB: &str = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
 const ANTHROPIC: &str = concat!("sk-", "ant-api03-abcdefghijklmnopqrstuvwxyz012345");
@@ -983,7 +993,7 @@ async fn a_project_without_a_working_tree_is_never_a_gone_tree() {
         got.memories[0].memory.body,
         "deploy with [REDACTED:github_token]"
     );
-    assert!(!s.rules_fail_closed(Some("tenant-x"), None).await);
+    assert!(!s.rules_fail_closed(scope(Some("tenant-x"), None)).await);
     assert!(s.settings_handle().cloud_allowed("tenant-x", None));
     // A client's working directory that this machine does not have.
     let away = s
@@ -996,7 +1006,7 @@ async fn a_project_without_a_working_tree_is_never_a_gone_tree() {
         .expect("redacted, not refused");
     assert_eq!(away.project, "global");
     assert!(
-        !s.rules_fail_closed(None, Some("/nonexistent/client/home/code/tenant-x"))
+        !s.rules_fail_closed(scope(None, Some("/nonexistent/client/home/code/tenant-x")))
             .await
     );
     s.shutdown();
@@ -1052,7 +1062,7 @@ async fn a_project_whose_carried_rules_cannot_be_read_is_screened_closed() {
             .unwrap_err();
         assert!(alice_core::redact::is_refusal(&e), "{project:?}: {e:?}");
         assert!(
-            s.rules_fail_closed(project, cwd.as_deref()).await,
+            s.rules_fail_closed(scope(project, cwd.as_deref())).await,
             "{project:?}: a refusal the spool may retry"
         );
     }

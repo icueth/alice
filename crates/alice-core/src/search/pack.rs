@@ -68,14 +68,20 @@ fn header(i: usize, h: &Hit) -> String {
         .map(|s| format!(" · {}", s.as_str()))
         .unwrap_or_default();
     let date: String = h.created_at.chars().take(10).collect();
+    let team = match (h.source.as_deref(), h.author.as_deref()) {
+        (Some("team"), Some(a)) => format!(" · (team, by {a})"),
+        (Some("team"), None) => " · (team)".to_string(),
+        _ => String::new(),
+    };
     format!(
-        "[{}] {} · {} · {} · {}{} · matched: {}\n",
+        "[{}] {} · {} · {} · {}{}{} · matched: {}\n",
         i + 1,
         h.id,
         kind,
         h.project,
         date,
         status,
+        team,
         via_label(&h.matched)
     )
 }
@@ -239,6 +245,9 @@ mod tests {
             relevance: None,
             matched: vec![MatchVia::Words],
             status: None,
+            source: None,
+            author: None,
+            cloud_ok: None,
         }
     }
 

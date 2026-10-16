@@ -123,7 +123,7 @@ pub(crate) trait Applier {
     /// Apply one queued request.
     async fn apply(&self, entry: SpoolEntry) -> Result<(), AliceError>;
     /// Whether a write to this project would be judged under fail-closed rules right now.
-    async fn fail_closed(&self, project: Option<&str>, cwd: Option<&str>) -> bool;
+    async fn fail_closed(&self, scope: crate::service::Scope<'_>) -> bool;
 }
 
 impl Applier for Service {
@@ -134,8 +134,8 @@ impl Applier for Service {
         }
     }
 
-    async fn fail_closed(&self, project: Option<&str>, cwd: Option<&str>) -> bool {
-        self.rules_fail_closed(project, cwd).await
+    async fn fail_closed(&self, scope: crate::service::Scope<'_>) -> bool {
+        self.rules_fail_closed(scope).await
     }
 }
 
@@ -244,9 +244,19 @@ pub(crate) async fn drain_with<A: Applier>(dir: &Path, svc: &A) -> DrainReport {
                 continue;
             }
         };
-        let scope = match &entry {
-            SpoolEntry::Remember(r) => (r.project.clone(), r.cwd.clone()),
-            SpoolEntry::Ingest(r) => (r.project.clone(), r.cwd.clone()),
+        let (project, cwd, client_project, hint) = match &entry {
+            SpoolEntry::Remember(r) => (
+                r.project.clone(),
+                r.cwd.clone(),
+                r.client_project.clone(),
+                r.project_hint.clone(),
+            ),
+            SpoolEntry::Ingest(r) => (
+                r.project.clone(),
+                r.cwd.clone(),
+                r.client_project.clone(),
+                r.project_hint.clone(),
+            ),
         };
         let result = svc.apply(entry).await;
         match result {
@@ -260,7 +270,12 @@ pub(crate) async fn drain_with<A: Applier>(dir: &Path, svc: &A) -> DrainReport {
                 // Refused only because the project's rules are in a fail-closed state (a
                 // half-written `.alice.toml`, say): keep the entry for the next drain.
                 if svc
-                    .fail_closed(scope.0.as_deref(), scope.1.as_deref())
+                    .fail_closed(crate::service::Scope {
+                        project: project.as_deref(),
+                        cwd: cwd.as_deref(),
+                        client_project: client_project.as_ref(),
+                        project_hint: hint.as_deref(),
+                    })
                     .await
                 {
                     failed(file, "fail-closed", false, now);
@@ -543,7 +558,7 @@ mod tests {
                 self.applied.lock().push(r.content);
                 Ok(())
             }
-            async fn fail_closed(&self, _: Option<&str>, _: Option<&str>) -> bool {
+            async fn fail_closed(&self, _: crate::service::Scope<'_>) -> bool {
                 false
             }
         }

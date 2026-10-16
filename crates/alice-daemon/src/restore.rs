@@ -64,7 +64,7 @@ pub struct RestoreReport {
 
 /// Open `path` read-only. A valid file whose directory cannot be written (a WAL-mode file needs
 /// to create `-shm`) is opened `immutable` instead of being reported as not a backup.
-fn open_ro(path: &Path) -> std::result::Result<Connection, String> {
+pub(crate) fn open_ro(path: &Path) -> std::result::Result<Connection, String> {
     let probe = |c: Connection| -> rusqlite::Result<Connection> {
         c.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
             r.get::<_, i64>(0)

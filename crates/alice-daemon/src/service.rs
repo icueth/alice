@@ -25,14 +25,14 @@ use alice_core::error::{AliceError, Result};
 use alice_core::ids::new_id;
 use alice_core::judge::jev::{JevPolicy, JevTransport};
 use alice_core::judge::{Judge, JudgeError, JudgeMemory, RELEVANCE_ANSWERS, RELEVANCE_PARTIAL};
-use alice_core::model::{Kind, limits};
+use alice_core::model::{Author, Kind, limits};
 use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
 use alice_core::redact::Redactor;
 use alice_core::search::{self, SearchOutput, SearchParams, pack};
 use alice_core::settings::{self, DefaultRecallMode, ProjectTree, SettingError, Settings};
 use alice_core::store::embeddings;
-use alice_core::store::events::Actor;
+use alice_core::store::events::{Actor, EventRow};
 use alice_core::store::history::UndoOutcome;
 use alice_core::store::kg::{self, FactOutcome};
 use alice_core::store::memories::{
@@ -300,6 +300,203 @@ struct PredicateVerdict {
 /// Reads one environment variable for the secrets' status (tests replace the process's).
 pub type SecretEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// What a request says about its project (spec §4.1): an explicit slug, the client's working
+/// directory (local daemons only) and the project a remote client detected.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Scope<'a> {
+    pub project: Option<&'a str>,
+    pub cwd: Option<&'a str>,
+    pub client_project: Option<&'a ClientProject>,
+    /// A project name from a direct MCP caller; honoured in tenant mode only.
+    pub project_hint: Option<&'a str>,
+}
+
+/// A request that names its project.
+pub trait Scoped {
+    fn scope(&self) -> Scope<'_>;
+}
+
+macro_rules! scoped {
+    ($($t:ty),*) => {$(
+        impl Scoped for $t {
+            fn scope(&self) -> Scope<'_> {
+                Scope {
+                    project: self.project.as_deref(),
+                    cwd: self.cwd.as_deref(),
+                    client_project: self.client_project.as_ref(),
+                    project_hint: self.project_hint.as_deref(),
+                }
+            }
+        }
+    )*};
+}
+scoped!(
+    RememberRequest,
+    RecallRequest,
+    ContextRequest,
+    IngestRequest
+);
+
+/// A tenant import must leave at least this many bytes free once its copy exists.
+pub const IMPORT_MIN_FREE_AFTER: u64 = 2_000_000_000;
+
+fn too_large_message(n: u64, cap: u64) -> String {
+    format!(
+        "the upload is {n} bytes, over the limit of {cap} bytes (import.max_upload_bytes); upload a smaller palace or ask the server's admin to raise the limit"
+    )
+}
+
+/// Why an upload was not admitted or stopped.
+#[derive(Debug)]
+pub enum UploadError {
+    /// Another import holds the slot (409).
+    Conflict(String),
+    /// Over `import.max_upload_bytes` (413).
+    TooLarge(String),
+    Other(AliceError),
+}
+
+impl From<AliceError> for UploadError {
+    fn from(e: AliceError) -> Self {
+        Self::Other(e)
+    }
+}
+
+/// An admitted upload: it holds the one import slot until [`finish`](Self::finish) hands it to
+/// the job thread. Dropped before that (a refusal, a broken connection), it deletes the
+/// partial archive and leaves the status `failed` with the reason.
+pub struct UploadTicket {
+    svc: Arc<Service>,
+    archive: PathBuf,
+    dir: PathBuf,
+    job_id: String,
+    cap: u64,
+    declared: Option<u64>,
+    received: u64,
+    guard: Option<crate::maintenance::OwnedActivityGuard>,
+    allow_remote_embedding: bool,
+    reason: Option<String>,
+    armed: bool,
+}
+
+impl UploadTicket {
+    /// Where the body is to be stored; the file must not exist yet.
+    pub fn archive_path(&self) -> &Path {
+        &self.archive
+    }
+
+    /// Counts `n` more bytes that arrived (and are being stored). Over the cap, or without
+    /// room on the disk any more, the upload ends here: the error says why.
+    pub fn account(&mut self, n: u64) -> std::result::Result<(), UploadError> {
+        self.received = self.received.saturating_add(n);
+        self.svc.import.lock().status.lock().bytes_received = self.received;
+        if self.received > self.cap {
+            let msg = too_large_message(self.received, self.cap);
+            self.reason = Some(msg.clone());
+            return Err(UploadError::TooLarge(msg));
+        }
+        let size = self.declared.unwrap_or(0).max(self.received);
+        if let Err(e) = self.svc.check_upload_room(size, self.received) {
+            self.reason = Some(e.to_string());
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// Records why the upload ends, when it is not one of [`account`](Self::account)'s errors.
+    pub fn fail(&mut self, why: impl Into<String>) {
+        self.reason = Some(why.into());
+    }
+
+    /// The whole body is stored: answers with the status (`unpacking`) and runs the rest on a
+    /// thread of its own.
+    pub fn finish(mut self) -> std::result::Result<alice_core::import::ImportStatus, UploadError> {
+        use alice_core::import::ImportState;
+        if self.received == 0 {
+            self.fail("the upload was empty; send the palace as a gzip tar in the request body");
+            return Err(AliceError::invalid(
+                "the upload is empty; send the palace as a gzip tar in the request body",
+            )
+            .into());
+        }
+        let svc = self.svc.clone();
+        let mut slot = svc.import.lock();
+        {
+            let mut st = slot.status.lock();
+            st.state = ImportState::Unpacking;
+            st.phase = "unpacking".to_string();
+            st.bytes_received = self.received;
+        }
+        let guard = self.guard.take().expect("the guard is held until finish");
+        let env = svc.import_env(&slot, guard);
+        let req = alice_core::import::ImportRequest {
+            allow_remote_embedding: self.allow_remote_embedding,
+            ..Default::default()
+        };
+        let job = importer::UploadJob {
+            archive: self.archive.clone(),
+            archive_len: self.received,
+            dir: self.dir.clone(),
+            cap: self.cap,
+        };
+        match importer::spawn_upload(env, req, job, self.job_id.clone()) {
+            Ok(handle) => {
+                slot.handle = Some(handle);
+                self.armed = false;
+                let st = slot.status.lock().clone();
+                Ok(st)
+            }
+            Err(e) => {
+                self.fail("the server could not start the import");
+                Err(AliceError::Other(format!("could not start the import thread: {e}")).into())
+            }
+        }
+    }
+}
+
+impl Drop for UploadTicket {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.archive);
+        let _ = std::fs::remove_dir_all(&self.dir);
+        let slot = self.svc.import.lock();
+        let mut st = slot.status.lock();
+        if st.state == alice_core::import::ImportState::Receiving
+            || st.job_id.as_deref() == Some(self.job_id.as_str())
+                && st.state == alice_core::import::ImportState::Unpacking
+        {
+            st.state = alice_core::import::ImportState::Failed;
+            st.error = Some(self.reason.take().unwrap_or_else(|| {
+                "the upload ended before the whole archive arrived; upload it again".to_string()
+            }));
+        }
+    }
+}
+
+/// The total size of the regular files under `dir`; links are counted for nothing and not followed.
+fn tree_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            if m.is_dir() {
+                todo.push(e.path());
+            } else if m.is_file() {
+                total = total.saturating_add(m.len());
+            }
+        }
+    }
+    total
+}
+
 #[derive(Clone)]
 pub struct ServiceOptions {
     /// Most read connections open at once (each has its own page cache); further reads wait.
@@ -356,6 +553,22 @@ pub struct ServiceOptions {
     pub reembed_retry_wait: Duration,
     /// Tests: the clock of the breaker around the judge call of a precise recall.
     pub precise_clock: Option<crate::precise_gate::Clock>,
+    /// Server mode (`alice daemon run --tenant`, spec §2.2): a request's `cwd` is never used
+    /// (no git on a client's path), the settings follow the tenant rules, and a project root
+    /// that is not there fails closed.
+    pub tenant: bool,
+    /// Free bytes at a path (tests inject a value); `None` reads the volume
+    /// (`backup::free_space`). A tenant import checks it before it starts.
+    pub free_space: Option<crate::maintenance::FreeSpace>,
+    /// Server mode, the team store (`alice daemon run --tenant --team-store`, spec §2.10): this
+    /// daemon holds the shared team memory, so it keeps a project hint from an HTTP body (its
+    /// callers are the personal daemons, which name the project).
+    pub team_store: bool,
+    /// The team store's URL (`ALICE_TEAM_URL`, loopback http only); the daemon fills it from
+    /// its environment, tests set it directly.
+    pub team_url: Option<String>,
+    /// This tenant's name (`ALICE_TENANT_NAME`), the author the team store records.
+    pub tenant_name: Option<String>,
 }
 
 impl Default for ServiceOptions {
@@ -384,6 +597,11 @@ impl Default for ServiceOptions {
             embedder_factory: None,
             reembed_retry_wait: Duration::from_secs(2),
             precise_clock: None,
+            tenant: false,
+            free_space: None,
+            team_store: false,
+            team_url: None,
+            tenant_name: None,
         }
     }
 }
@@ -592,6 +810,10 @@ pub struct Service {
     /// The cloud policy: asked per project before text goes to a remote embedder.
     cloud: Arc<DaemonJevPolicy>,
     opts: ServiceOptions,
+    /// The link to the team store; `None` when none is configured or it was refused.
+    team: Option<Arc<crate::team::TeamLink>>,
+    /// Why the link is disabled, when `team_url` was given and refused (health reports it).
+    team_error: Option<String>,
     instance: String,
     stop: Arc<AtomicBool>,
     wake_worker: crossbeam_channel::Sender<()>,
@@ -964,13 +1186,24 @@ impl Service {
         home.ensure_dirs()?;
         // No import can be running at start: whatever an earlier one left is garbage.
         let _ = std::fs::remove_dir_all(home.import_tmp());
+        // ... and so is an upload a crash cut short (archives and unpacked folders).
+        if opts.tenant {
+            let n = crate::upload::sweep(&home.import_inbox());
+            if n > 0 {
+                tracing::warn!(
+                    removed = n,
+                    "removed what an interrupted upload left behind"
+                );
+            }
+        }
         // Settings first: everything below reads them (the model's idle unload and the port are
         // read by the daemon from the same handle).
         let settings = opts
             .settings
             .clone()
             .unwrap_or_else(|| match &opts.settings_env {
-                Some(env) => SettingsHandle::load_with_env(&home, env.clone()),
+                Some(env) => SettingsHandle::load_with(&home, env.clone(), opts.tenant),
+                None if opts.tenant => SettingsHandle::load_tenant(&home),
                 None => SettingsHandle::load(&home),
             });
         let started_with = settings.get();
@@ -1188,6 +1421,18 @@ impl Service {
         let watcher = settings.spawn_watcher(opts.settings_poll, stop.clone());
         let resolver = ProjectResolver::new(opts.detect_project);
         let precise_gate = crate::precise_gate::PreciseGate::new(opts.precise_clock.clone());
+        // The team store never links to itself.
+        let (team, team_error) = if opts.team_store {
+            (None, None)
+        } else {
+            match crate::team::TeamLink::from_env(&home, opts.team_url.as_deref()) {
+                Ok(link) => (link, None),
+                Err(reason) => {
+                    tracing::warn!("the team link is off: {reason}");
+                    (None, Some(reason))
+                }
+            }
+        };
         Ok(Arc::new(Service {
             home,
             readers,
@@ -1198,6 +1443,8 @@ impl Service {
             embedding: embedding_ctl,
             cloud,
             opts,
+            team,
+            team_error,
             instance: new_id(),
             stop,
             wake_worker: wake_tx,
@@ -1300,7 +1547,7 @@ impl Service {
                 tracing::warn!("the import is inside a long step; stopping without it");
                 let slot = self.import.lock();
                 let mut st = slot.status.lock();
-                if st.state == alice_core::import::ImportState::Running {
+                if st.state.is_active() {
                     st.state = alice_core::import::ImportState::Failed;
                     st.error = Some(importer::STOPPED.to_string());
                 }
@@ -1387,17 +1634,95 @@ impl Service {
             .map_err(join_err)?
     }
 
-    /// Project for a write. A working directory not seen in the last minute is resolved with
-    /// git, which runs on the blocking pool rather than on the async runtime.
-    async fn choose(&self, explicit: Option<&str>, cwd: Option<&str>) -> Result<ProjectChoice> {
-        if let Some(choice) = self.resolver.choose_without_git(explicit, cwd) {
+    /// Project for a request (precedence: spec §4.1, then §2.8's project hint on a tenant). A `client_project` is mirrored first
+    /// (on the blocking pool), whatever wins; a working directory not seen in the last minute is
+    /// resolved with git on the blocking pool, and never on a server tenant.
+    async fn choose(&self, scope: Scope<'_>) -> Result<ProjectChoice> {
+        let mirrored = match scope.client_project {
+            Some(cp) => {
+                let (home, cp) = (self.home.clone(), cp.clone());
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        crate::client_projects::sync_mirror(&home, &cp)
+                    })
+                    .await
+                    .map_err(join_err)??,
+                )
+            }
+            None => None,
+        };
+        if let Some(slug) = explicit_slug(scope.project) {
+            if slug.chars().count() > limits::MAX_PROJECT_SLUG_CHARS {
+                return Err(AliceError::Invalid(
+                    "project names are at most 100 characters".into(),
+                ));
+            }
+            return Ok(ProjectChoice::Slug(slug.to_string()));
+        }
+        if let Some(r) = mirrored {
+            return Ok(ProjectChoice::Detected(r));
+        }
+        if self.opts.tenant
+            && let Some(hint) = scope.project_hint
+        {
+            let slug = alice_core::normalize::slugify(hint);
+            if hint.trim().chars().count() > limits::MAX_PROJECT_NAME_CHARS
+                || slug.chars().count() > limits::MAX_PROJECT_SLUG_CHARS
+            {
+                return Err(AliceError::Invalid(
+                    "a project name is at most 200 characters and its slug at most 100".into(),
+                ));
+            }
+            if !slug.is_empty() {
+                let name = hint.trim().to_string();
+                let lookup = slug.clone();
+                let found = self
+                    .read(move |conn| alice_core::store::projects::resolve_slug(conn, &lookup))
+                    .await?;
+                return Ok(match found {
+                    Some(p) => ProjectChoice::Slug(p.slug),
+                    None => ProjectChoice::Detected(ProjectRef {
+                        key: format!(
+                            "{}{slug}",
+                            alice_core::store::projects::PLACEHOLDER_KEY_PREFIX
+                        ),
+                        slug,
+                        name,
+                        root: None,
+                        remote: None,
+                    }),
+                });
+            }
+        }
+        let cwd = if self.opts.tenant { None } else { scope.cwd };
+        if let Some(choice) = self.resolver.choose_without_git(None, cwd) {
             return Ok(choice);
         }
         let resolver = self.resolver.clone();
-        let (explicit, cwd) = (explicit.map(String::from), cwd.map(String::from));
-        tokio::task::spawn_blocking(move || resolver.choose(explicit.as_deref(), cwd.as_deref()))
+        let cwd = cwd.map(String::from);
+        tokio::task::spawn_blocking(move || resolver.choose(None, cwd.as_deref()))
             .await
             .map_err(join_err)
+    }
+
+    /// Whether this service runs in server mode (`--tenant`).
+    pub fn is_tenant(&self) -> bool {
+        self.opts.tenant
+    }
+
+    /// Whether this service is the team store (`--team-store`).
+    pub fn is_team_store(&self) -> bool {
+        self.opts.team_store
+    }
+
+    /// This tenant's name, when the daemon was given one (`ALICE_TENANT_NAME`).
+    pub fn tenant_name(&self) -> Option<&str> {
+        self.opts.tenant_name.as_deref()
+    }
+
+    /// The link to the team store, when one is configured and usable.
+    pub fn team(&self) -> Option<&Arc<crate::team::TeamLink>> {
+        self.team.as_ref()
     }
 
     /// One import batch, written by the writer in a commit of its own (the importer's only way
@@ -1424,6 +1749,10 @@ impl Service {
     }
 
     pub async fn remember(&self, req: RememberRequest) -> Result<RememberResponse> {
+        // A shared write goes to the team store (`remember_shared` holds the activity guard itself).
+        if req.shared {
+            return self.remember_shared(req).await;
+        }
         let _busy = self.activity.enter();
         self.remember_spooled(req).await
     }
@@ -1431,9 +1760,11 @@ impl Service {
     /// [`remember`](Self::remember) for a write the spool queued: the drain is the daemon's own
     /// timer, not a request, so it does not keep maintenance (backups included) from starting.
     pub async fn remember_spooled(&self, req: RememberRequest) -> Result<RememberResponse> {
-        let project = self
-            .choose(req.project.as_deref(), req.cwd.as_deref())
-            .await?;
+        // Clients never queue a shared write; one found in the spool still goes to the team.
+        if req.shared {
+            return self.remember_shared(req).await;
+        }
+        let project = self.choose(req.scope()).await?;
         // Before anything else touches the text: the writer, the spool and the logs only ever
         // see the redacted request (spec §5.1 step 2).
         let req = self.redact_remember_in(&project, req).await?;
@@ -1458,12 +1789,14 @@ impl Service {
                 status: RememberStatus::New,
                 project: p.slug,
                 reason: None,
+                shared: false,
             }),
             WriteOutcome::Remembered(InsertOutcome::Duplicate { id }, p) => Ok(RememberResponse {
                 id: Some(id),
                 status: RememberStatus::Duplicate,
                 project: p.slug,
                 reason: None,
+                shared: false,
             }),
             other => Err(unexpected(other)),
         }
@@ -1479,8 +1812,8 @@ impl Service {
     /// fail-closed rules at the moment (see [`SettingsHandle::project_fail_closed`]; a project
     /// whose rules the store cannot read is too). The spool asks before it discards a request
     /// that block mode refused.
-    pub async fn rules_fail_closed(&self, project: Option<&str>, cwd: Option<&str>) -> bool {
-        let Ok(choice) = self.choose(project, cwd).await else {
+    pub async fn rules_fail_closed(&self, scope: Scope<'_>) -> bool {
+        let Ok(choice) = self.choose(scope).await else {
             return false;
         };
         let (readers, settings) = (self.readers.clone(), self.settings.clone());
@@ -1545,9 +1878,7 @@ impl Service {
     /// `req` with secrets redacted, or an error naming the detector in `block` mode. Idempotent:
     /// text that is redacted already comes back as it is. What a request is spooled as.
     pub async fn redact_remember(&self, req: RememberRequest) -> Result<RememberRequest> {
-        let choice = self
-            .choose(req.project.as_deref(), req.cwd.as_deref())
-            .await?;
+        let choice = self.choose(req.scope()).await?;
         self.redact_remember_in(&choice, req).await
     }
 
@@ -1556,6 +1887,11 @@ impl Service {
     /// daemon (the JSON API, MCP over HTTP) remembers through this. If even the spool cannot be
     /// written (often the same cause, a full disk), the read-only error says what to do.
     pub async fn remember_or_spool(&self, req: RememberRequest) -> Result<RememberResponse> {
+        // A shared write goes to the team store and never touches this database, so there is
+        // nothing to spool and nothing to fall back to.
+        if req.shared {
+            return self.remember_shared(req).await;
+        }
         let read_only = match self.remember(req.clone()).await {
             Err(AliceError::ReadOnly(reason)) => reason,
             other => return other,
@@ -1570,6 +1906,7 @@ impl Service {
                 status: RememberStatus::Spooled,
                 project: String::new(),
                 reason: Some(spool::read_only_note(&read_only)),
+                shared: false,
             }),
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "cannot spool a remember while read-only");
@@ -1580,6 +1917,286 @@ impl Service {
                 Err(AliceError::ReadOnly(read_only))
             }
         }
+    }
+
+    // ------------------------------------------------------------------ shared team memory
+
+    /// The team link and this tenant's name, or the error that says why a shared call cannot be made.
+    fn team_parts(&self) -> Result<(&Arc<crate::team::TeamLink>, &str)> {
+        let (Some(team), Some(tenant)) = (self.team(), self.tenant_name()) else {
+            return Err(AliceError::Invalid(
+                "no team memory is configured on this server; ask the admin".into(),
+            ));
+        };
+        Ok((team, tenant))
+    }
+
+    /// The author the team store records (R34): `<tenant>/<client agent>`, or the tenant alone.
+    /// Whatever the client sent, the part before the first `/` is this tenant, and the session
+    /// is dropped.
+    fn shared_author(tenant: &str, sent: &Author) -> Author {
+        let agent = match sent
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            Some(a) => format!("{tenant}/{a}"),
+            None => tenant.to_string(),
+        };
+        Author {
+            agent: Some(agent),
+            model: sent.model.clone(),
+            session: None,
+        }
+    }
+
+    /// A call to the team store that is a read or a change of an existing memory: its errors
+    /// already say what failed.
+    async fn team_json<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Req>,
+    ) -> Result<Resp> {
+        let (team, _) = self.team_parts()?;
+        team.call(method, path, body, SHARED_TIMEOUT).await
+    }
+
+    async fn team_get(&self, req: GetRequest) -> Result<GetResponse> {
+        self.team_json(reqwest::Method::POST, "/api/v1/get", Some(&req))
+            .await
+    }
+
+    /// `remember` with `shared: true`: redacted with this person's rules, then written to the
+    /// team store only, as this tenant (spec §2.10). It is never spooled and never saved here.
+    async fn remember_shared(&self, req: RememberRequest) -> Result<RememberResponse> {
+        let (team, tenant) = self.team_parts()?;
+        let _busy = self.activity.enter();
+        let project = self.choose(req.scope()).await?;
+        let req = self.redact_remember_in(&project, req).await?;
+        let slug = choice_slug(&project);
+        // Superseding marks the older memory too: only its author may (spec §2.10).
+        let supersedes: Vec<String> = req
+            .supersedes
+            .iter()
+            .map(|id| id.strip_prefix(TEAM_PREFIX).unwrap_or(id).to_string())
+            .collect();
+        for id in &supersedes {
+            self.require_shared_author(id).await?;
+        }
+        let body = RememberRequest {
+            content: req.content,
+            kind: req.kind,
+            title: req.title,
+            topics: req.topics,
+            importance: req.importance,
+            supersedes,
+            // Keys are per tenant: another tenant's retry key must not return this memory.
+            idempotency_key: req.idempotency_key.map(|k| format!("{tenant}:{k}")),
+            project_hint: (slug != "global").then_some(slug),
+            author: Self::shared_author(tenant, &req.author),
+            shared: false,
+            ..Default::default()
+        };
+        let r: RememberResponse = team
+            .call(
+                reqwest::Method::POST,
+                "/api/v1/remember",
+                Some(&body),
+                SHARED_TIMEOUT,
+            )
+            .await
+            .map_err(shared_write_error)?;
+        Ok(RememberResponse {
+            id: r.id.map(|id| format!("{TEAM_PREFIX}{id}")),
+            status: r.status,
+            project: r.project,
+            reason: r.reason,
+            shared: true,
+        })
+    }
+
+    /// The memory `id` from the team store, when this tenant is its author; otherwise the refusal.
+    async fn require_shared_author(&self, id: &str) -> Result<()> {
+        let (_, tenant) = self.team_parts()?;
+        let got = self
+            .team_get(GetRequest {
+                ids: vec![id.to_string()],
+                include_provenance: false,
+            })
+            .await?;
+        let memory = got
+            .memories
+            .iter()
+            .find(|m| m.memory.id == id)
+            .ok_or_else(|| AliceError::NotFound(format!("shared memory {TEAM_PREFIX}{id}")))?;
+        if author_tenant(&memory.memory.author) == Some(tenant) {
+            Ok(())
+        } else {
+            Err(AliceError::Invalid(SHARED_REFUSAL.into()))
+        }
+    }
+
+    /// `update` of a `team:` id, for its author only.
+    async fn update_shared(&self, mut req: UpdateRequest) -> Result<MemoryFull> {
+        let (_, tenant) = self.team_parts()?;
+        let id = req.id[TEAM_PREFIX.len()..].to_string();
+        self.require_shared_author(&id).await?;
+        if req.update.title.is_some() || req.update.body.is_some() || req.update.topics.is_some() {
+            let r = self.redactor(&ProjectChoice::Fallback).await?;
+            let u = &mut req.update;
+            if let Some(t) = &u.title {
+                u.title = Some(redact_field(&r, "title", t)?);
+            }
+            if let Some(b) = &u.body {
+                u.body = Some(redact_field(&r, "body", b)?);
+            }
+            if let Some(topics) = &u.topics {
+                u.topics = Some(
+                    topics
+                        .iter()
+                        .map(|t| redact_field(&r, "topic", t))
+                        .collect::<Result<_>>()?,
+                );
+            }
+        }
+        if let Some(by) = &req.update.superseded_by {
+            req.update.superseded_by = Some(by.strip_prefix(TEAM_PREFIX).unwrap_or(by).to_string());
+        }
+        let body = UpdateRequest {
+            id,
+            update: req.update,
+            author: Self::shared_author(tenant, &req.author),
+        };
+        let out: MemoryFull = self
+            .team_json(reqwest::Method::POST, "/api/v1/update", Some(&body))
+            .await?;
+        let mut out = into_team_view(out);
+        out.event_id = out.event_id.map(|e| format!("{TEAM_PREFIX}{e}"));
+        Ok(out)
+    }
+
+    /// `undo` of a `team:<event id>`, when that event was made by this tenant. The team store's
+    /// events API filters by exact actor, and an actor is `agent:<tenant>/<client>` with any
+    /// client, so the events are listed newest first (a page of 500, up to
+    /// [`SHARED_UNDO_PAGES`] pages) until the one asked for is found, then its actor is checked.
+    async fn undo_shared(&self, req: UndoRequest) -> Result<UndoResponse> {
+        let (_, tenant) = self.team_parts()?;
+        let id = req.event_id[TEAM_PREFIX.len()..].to_string();
+        let mut before: Option<String> = None;
+        let mut mine = false;
+        'pages: for _ in 0..SHARED_UNDO_PAGES {
+            let path = match &before {
+                Some(b) => format!("/api/v1/events?limit=500&before={b}"),
+                None => "/api/v1/events?limit=500".to_string(),
+            };
+            let page: Vec<EventRow> = self
+                .team_json(reqwest::Method::GET, &path, None::<&()>)
+                .await?;
+            for e in &page {
+                if e.id == id {
+                    mine = e.actor == format!("agent:{tenant}")
+                        || e.actor.starts_with(&format!("agent:{tenant}/"));
+                    break 'pages;
+                }
+            }
+            match page.last() {
+                Some(last) if page.len() >= 500 => before = Some(last.id.clone()),
+                _ => break,
+            }
+        }
+        if !mine {
+            return Err(AliceError::Invalid(SHARED_REFUSAL.into()));
+        }
+        let body = UndoRequest {
+            event_id: id,
+            author: Self::shared_author(tenant, &req.author),
+        };
+        let mut out: UndoResponse = self
+            .team_json(reqwest::Method::POST, "/api/v1/undo", Some(&body))
+            .await?;
+        out.reverted = out
+            .reverted
+            .into_iter()
+            .map(|e| format!("{TEAM_PREFIX}{e}"))
+            .collect();
+        Ok(out)
+    }
+
+    /// Starts the team store's recall for `req` (spec §2.10): the same query, filters and limit,
+    /// fast mode, JSON, no raw chunks, asked about the project this recall resolved to. It runs
+    /// beside the personal search; `None` when there is no team link (or this is the team store).
+    fn start_team_recall(
+        &self,
+        req: &RecallRequest,
+        choice: &ProjectChoice,
+        limit: usize,
+    ) -> Option<tokio::task::JoinHandle<Result<Vec<Hit>>>> {
+        if self.is_team_store() {
+            return None;
+        }
+        let team = self.team()?.clone();
+        let slug = choice_slug(choice);
+        let body = RecallRequest {
+            query: req.query.clone(),
+            project: explicit_slug(req.project.as_deref()).map(str::to_string),
+            topics: req.topics.clone(),
+            kinds: req.kinds.clone(),
+            since: req.since.clone(),
+            before: req.before.clone(),
+            include_raw: false,
+            mode: Some(RecallMode::Fast),
+            max_tokens: Some(TEAM_RECALL_TOKENS),
+            format: OutputFormat::Json,
+            limit: Some(limit),
+            project_hint: (slug != "global").then_some(slug),
+            ..Default::default()
+        };
+        Some(tokio::spawn(async move { team_recall(&team, body).await }))
+    }
+
+    /// Starts the team store's context for the same project, with a third of the budget.
+    fn start_team_context(
+        &self,
+        req: &ContextRequest,
+        choice: &ProjectChoice,
+        max_tokens: usize,
+    ) -> Option<tokio::task::JoinHandle<Result<Option<String>>>> {
+        if self.is_team_store() {
+            return None;
+        }
+        let team = self.team()?.clone();
+        let slug = choice_slug(choice);
+        let body = ContextRequest {
+            project: explicit_slug(req.project.as_deref()).map(str::to_string),
+            max_tokens: Some(max_tokens / 3),
+            project_hint: (slug != "global").then_some(slug),
+            ..Default::default()
+        };
+        Some(tokio::spawn(async move {
+            let asked = tokio::time::timeout(
+                TEAM_DEADLINE,
+                team.call::<_, ContextResponse>(
+                    reqwest::Method::POST,
+                    "/api/v1/context",
+                    Some(&body),
+                    TEAM_DEADLINE,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(AliceError::Other(
+                    "the team store did not answer in time".into(),
+                ))
+            });
+            match asked {
+                Ok(c) => Ok(Some(c.text)),
+                // A project only this person has: the team has nothing to add, and nothing failed.
+                Err(AliceError::Invalid(_)) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }))
     }
 
     pub async fn recall(&self, req: RecallRequest) -> Result<RecallResponse> {
@@ -1624,9 +2241,8 @@ impl Service {
         // Resolved before a reader connection is taken: it may run git. (And before the query is
         // embedded: a remote embedder gets the query only if the project may use it.)
         let explicit = explicit_slug(req.project.as_deref()).is_some();
-        let choice = self
-            .choose(req.project.as_deref(), req.cwd.as_deref())
-            .await?;
+        let choice = self.choose(req.scope()).await?;
+        let team_task = self.start_team_recall(&req, &choice, limit);
         let mut notes: Vec<String> = Vec::new();
         let vector = match &index {
             Some(idx) if idx.model() == active.model => {
@@ -1750,6 +2366,33 @@ impl Service {
             })
             .await?;
         let mut out = out;
+        // The team's hits join the personal ones before the person's judge sees the top: in
+        // fast mode they are ordered by score with the rest; in precise mode the ones the team
+        // store marked `cloud_ok` do the same (`team_ok` names them for `rerank`) and the others
+        // wait in `team_rest` to follow the graded hits.
+        let mut team_ok = std::collections::HashSet::new();
+        let mut team_rest = Vec::new();
+        if let Some(task) = team_task {
+            match task.await {
+                Ok(Ok(mut hits)) => {
+                    if precise {
+                        withhold_from_judge(&self.settings, &mut hits);
+                    }
+                    (team_ok, team_rest) = merge_team(&mut out, hits, precise);
+                    if !precise {
+                        out.hits.truncate(limit);
+                        let kept = out
+                            .hits
+                            .iter()
+                            .filter(|h| h.tier == Tier::Knowledge)
+                            .count();
+                        out.memory_seqs.truncate(kept);
+                        out.memory_importance.truncate(kept);
+                    }
+                }
+                _ => notes.push(NOTE_TEAM_LATE.into()),
+            }
+        }
         let mut reranked = false;
         let mut low_confidence = false;
         if precise {
@@ -1762,6 +2405,7 @@ impl Service {
                     &judged_query,
                     limit,
                     include_raw,
+                    &team_ok,
                 )
                 .await;
             notes.extend(why);
@@ -1780,6 +2424,30 @@ impl Service {
             }
             if low_confidence {
                 notes.push(NOTE_NOTHING_ANSWERS.into());
+            }
+            append_team(&mut out, team_rest, limit);
+        }
+        if self.is_team_store() {
+            // What a federated caller needs to know before it grades these hits (R35): the cloud
+            // policy of this store for each hit's project. Any doubt, a failed task included, is `false`.
+            let mut projects: Vec<String> = Vec::new();
+            for h in &out.hits {
+                if !projects.contains(&h.project) {
+                    projects.push(h.project.clone());
+                }
+            }
+            let cloud = self.cloud.clone();
+            let allowed: std::collections::HashSet<String> =
+                tokio::task::spawn_blocking(move || {
+                    projects
+                        .into_iter()
+                        .filter(|p| cloud.cloud_allowed(p))
+                        .collect()
+                })
+                .await
+                .unwrap_or_default();
+            for h in &mut out.hits {
+                h.cloud_ok = Some(allowed.contains(&h.project));
             }
         }
         let (response, touched) = match format {
@@ -1842,6 +2510,13 @@ impl Service {
     /// then runs under `global`, a project the policy knows, whose gate and redaction apply on
     /// top. It is `Some(None)` too for a stored project that the tree the query comes from
     /// denies, and for an import placeholder read for the checkout that its policy denies.
+    ///
+    /// `team_ok` holds the ids of team hits the team store marked `cloud_ok`. The person's
+    /// policy knows nothing of a team project, so those hits are allowed by the team store's mark
+    /// instead of by their project, and the judge is told they belong to the query's project (the
+    /// project whose gate and redaction this call runs under). The other switches (a heuristic
+    /// judge, a degraded configuration, the budget, the breaker) apply to them as to any hit.
+    #[allow(clippy::too_many_arguments)] // one call site; a struct would only rename them
     async fn rerank(
         &self,
         mut out: SearchOutput,
@@ -1850,6 +2525,7 @@ impl Service {
         query: &str,
         limit: usize,
         include_raw: bool,
+        team_ok: &std::collections::HashSet<String>,
     ) -> (SearchOutput, bool, bool, Option<String>) {
         let judge = self.judge();
         let mut reranked = false;
@@ -1876,6 +2552,7 @@ impl Service {
             let mut projects = vec![query_project.to_string()];
             let seen = out.hits[..window]
                 .iter()
+                .filter(|h| !team_ok.contains(&h.id))
                 .chain(near.iter().map(|n| &n.hit))
                 .map(|h| h.project.clone());
             for p in seen {
@@ -1898,7 +2575,11 @@ impl Service {
             // index in the hit list), then near-floor candidates (index `hits.len() + j`).
             let judged = |h: &Hit, importance: u8| JudgeMemory {
                 id: h.id.clone(),
-                project: h.project.clone(),
+                project: if team_ok.contains(&h.id) {
+                    query_project.to_string()
+                } else {
+                    h.project.clone()
+                },
                 // A raw chunk has no kind; its title ("raw · <source>") says what it is. The
                 // text is the stored (redacted) one, bounded like a memory's by the judge.
                 kind: h.kind.unwrap_or(Kind::Note),
@@ -1919,7 +2600,7 @@ impl Service {
                 } else {
                     3
                 };
-                if allowed.contains(&h.project) {
+                if allowed.contains(&h.project) || team_ok.contains(&h.id) {
                     shown.push((i, judged(h, importance)));
                 }
             }
@@ -2113,26 +2794,71 @@ impl Service {
         let _busy = self.activity.enter();
         let max_tokens = req.max_tokens.unwrap_or(limits::DEFAULT_CONTEXT_TOKENS);
         let explicit = explicit_slug(req.project.as_deref()).is_some();
-        let choice = self
-            .choose(req.project.as_deref(), req.cwd.as_deref())
-            .await?;
-        self.read(move |c| {
-            let scope = ProjectResolver::read_scope(c, choice, explicit)?;
-            // A placeholder project (never written to) gets the hint and the global preferences.
-            let text =
-                alice_core::context::build(c, &scope.project, max_tokens, chrono::Utc::now())?;
-            Ok(ContextResponse {
-                project: scope.project.slug,
-                text,
+        let choice = self.choose(req.scope()).await?;
+        let team_task = self.start_team_context(&req, &choice, max_tokens);
+        let mut out = self
+            .read(move |c| {
+                let scope = ProjectResolver::read_scope(c, choice, explicit)?;
+                // A placeholder project (never written to) gets the hint and the global preferences.
+                let text =
+                    alice_core::context::build(c, &scope.project, max_tokens, chrono::Utc::now())?;
+                Ok(ContextResponse {
+                    project: scope.project.slug,
+                    text,
+                })
             })
-        })
-        .await
+            .await?;
+        if let Some(task) = team_task {
+            match task.await {
+                Ok(Ok(Some(team))) => {
+                    out.text.push_str(&format!("\n## Team memory\n{team}"));
+                }
+                Ok(Ok(None)) => {}
+                _ => out.text.push_str(&format!("\n({NOTE_TEAM_LATE})\n")),
+            }
+        }
+        Ok(out)
     }
 
     /// Memories by id. A duplicate that was merged into another memory is answered with the
     /// survivor, and `redirects` says so (spec §5.2).
-    pub async fn get(&self, req: GetRequest) -> Result<GetResponse> {
+    pub async fn get(&self, mut req: GetRequest) -> Result<GetResponse> {
         let _busy = self.activity.enter();
+        let (team_ids, own): (Vec<String>, Vec<String>) = std::mem::take(&mut req.ids)
+            .into_iter()
+            .partition(|id| id.starts_with(TEAM_PREFIX));
+        if team_ids.is_empty() {
+            req.ids = own;
+            return self.get_personal(req).await;
+        }
+        let team_req = GetRequest {
+            ids: team_ids
+                .iter()
+                .map(|id| id[TEAM_PREFIX.len()..].to_string())
+                .collect(),
+            include_provenance: req.include_provenance,
+        };
+        let mut out = if own.is_empty() {
+            GetResponse::default()
+        } else {
+            req.ids = own;
+            self.get_personal(req).await?
+        };
+        let shared = self.team_get(team_req).await?;
+        out.memories
+            .extend(shared.memories.into_iter().map(into_team_view));
+        out.missing
+            .extend(shared.missing.iter().map(|id| format!("{TEAM_PREFIX}{id}")));
+        out.redirects
+            .extend(shared.redirects.into_iter().map(|r| Redirect {
+                from: format!("{TEAM_PREFIX}{}", r.from),
+                to: format!("{TEAM_PREFIX}{}", r.to),
+            }));
+        out.notes.extend(shared.notes);
+        Ok(out)
+    }
+
+    async fn get_personal(&self, req: GetRequest) -> Result<GetResponse> {
         self.read(move |c| {
             let found = memories::get_many(c, &req.ids)?;
             let mut out = GetResponse::default();
@@ -2191,6 +2917,9 @@ impl Service {
     /// The memory after the change, with the event that recorded it (`undo` takes its id).
     pub async fn update(&self, mut req: UpdateRequest) -> Result<MemoryFull> {
         let _busy = self.activity.enter();
+        if req.id.starts_with(TEAM_PREFIX) {
+            return self.update_shared(req).await;
+        }
         let actor = Actor::from_author(&req.author);
         check_update_fields(&req.update)?;
         if req.update.action == UpdateAction::Move {
@@ -2502,6 +3231,9 @@ impl Service {
     /// the answer names the review item that asks what to do instead.
     pub async fn undo(&self, req: UndoRequest) -> Result<UndoResponse> {
         let _busy = self.activity.enter();
+        if req.event_id.starts_with(TEAM_PREFIX) {
+            return self.undo_shared(req).await;
+        }
         let actor = Actor::from_author(&req.author);
         match self
             .writer
@@ -2812,9 +3544,15 @@ impl Service {
 
     fn view_with(
         &self,
-        secrets: BTreeMap<String, SecretStatus>,
+        mut secrets: BTreeMap<String, SecretStatus>,
         mut notes: Vec<String>,
     ) -> SettingsView {
+        // On a server the Jev key is the owner's (addendum 5): a person sees only that it is set.
+        if self.opts.tenant {
+            for s in secrets.values_mut() {
+                s.hint = None;
+            }
+        }
         // The errors before the settings: a reload swaps the settings first and clears the
         // errors second, so an empty list read here is followed by settings that are new.
         let errors = self.settings.errors();
@@ -3295,9 +4033,7 @@ impl Service {
     pub async fn ingest_spooled(&self, mut req: IngestRequest) -> Result<IngestOutcome> {
         // Checked here so an oversized request never reaches (or delays) the writer.
         sources::validate_chunks(&req.chunks)?;
-        let project = self
-            .choose(req.project.as_deref(), req.cwd.as_deref())
-            .await?;
+        let project = self.choose(req.scope()).await?;
         // The whole request is redacted (or refused) before its first slice is written, off the
         // runtime's threads: a request can hold 32 MB of text.
         let r = self.redactor(&project).await?;
@@ -3470,6 +4206,61 @@ impl Service {
 
     // ------------------------------------------------------------------ import
 
+    /// The tenant rules of an import (spec §2.9): the palace lies strictly inside
+    /// `import-inbox/` (placed there by the admin's `alice-server import`), and the disk keeps
+    /// room for twice its size plus [`IMPORT_MIN_FREE_AFTER`].
+    fn check_tenant_import(&self, req: &alice_core::import::ImportRequest) -> Result<()> {
+        let outside = || {
+            AliceError::invalid(
+                "a server tenant imports only a palace the admin placed under import-inbox/ with `alice-server import`; it cannot read other paths on the server",
+            )
+        };
+        let inbox = std::fs::canonicalize(self.home.import_inbox()).map_err(|_| outside())?;
+        let palace = req.palace.as_deref().ok_or_else(outside)?;
+        let palace = std::fs::canonicalize(palace).map_err(|_| outside())?;
+        if palace == inbox || !palace.starts_with(&inbox) {
+            return Err(outside());
+        }
+        let size = tree_size(&palace);
+        // An unknown free size cannot prove there is room.
+        let free = self.free_bytes().unwrap_or(0);
+        if free < size.saturating_mul(2).saturating_add(IMPORT_MIN_FREE_AFTER) {
+            return Err(AliceError::invalid(format!(
+                "the server has {free} bytes free; importing this {size}-byte palace needs about twice its size plus 2 GB; ask the server's admin"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Free bytes on the volume of the data directory (`None`: unknown).
+    fn free_bytes(&self) -> Option<u64> {
+        let home = self.home.root();
+        match &self.opts.free_space {
+            Some(f) => f(home),
+            None => backup::free_space(home),
+        }
+    }
+
+    /// The pieces a job thread needs, taken from the service while `slot` is held.
+    fn import_env(
+        &self,
+        slot: &ImportSlot,
+        guard: crate::maintenance::OwnedActivityGuard,
+    ) -> ImportEnv {
+        ImportEnv {
+            readers: self.readers.clone(),
+            writer: self.writer.clone(),
+            redactors: self.redactors.clone(),
+            settings: self.settings.clone(),
+            stop: self.stop.clone(),
+            home: self.home.clone(),
+            mempalace_home: self.opts.mempalace_home.clone(),
+            guard,
+            status: slot.status.clone(),
+            hook: self.opts.import_hook.clone(),
+        }
+    }
+
     /// Starts an import of a MemPalace palace on a thread of its own. The refusals that need
     /// no work (one already running, no palace, a missing or foreign folder, a bad `since`, a
     /// remote embedding provider) come back at once; everything else shows in
@@ -3484,9 +4275,12 @@ impl Service {
         if self.stop.load(Ordering::SeqCst) {
             return Err(stopping());
         }
+        if self.opts.tenant {
+            self.check_tenant_import(&req)?;
+        }
         let running = |slot: &ImportSlot| {
             let st = slot.status.lock();
-            (st.state == ImportState::Running).then(|| {
+            st.state.is_active().then(|| {
                 AliceError::invalid(format!(
                     "an import is already running (phase {}, {} of {} drawers); wait for it, or follow it with `alice import status`",
                     st.phase, st.done, st.total
@@ -3528,20 +4322,11 @@ impl Service {
             max_batch_records: 0,
             max_batch_bytes: 0,
             max_wal_bytes: 0,
+            bytes_received: 0,
+            embedding_backlog: 0,
         };
         *slot.status.lock() = first.clone();
-        let env = ImportEnv {
-            readers: self.readers.clone(),
-            writer: self.writer.clone(),
-            redactors: self.redactors.clone(),
-            settings: self.settings.clone(),
-            stop: self.stop.clone(),
-            home: self.home.clone(),
-            mempalace_home: self.opts.mempalace_home.clone(),
-            guard: self.activity.enter_owned(),
-            status: slot.status.clone(),
-            hook: self.opts.import_hook.clone(),
-        };
+        let env = self.import_env(&slot, self.activity.enter_owned());
         match importer::spawn(env, req, palace, job_id) {
             Ok(handle) => {
                 slot.handle = Some(handle);
@@ -3560,6 +4345,99 @@ impl Service {
     pub fn import_status(&self) -> alice_core::import::ImportStatus {
         // Slot, then status: the order `start_import` takes them in.
         self.import.lock().status.lock().clone()
+    }
+
+    /// Chunks still waiting for a vector (what `stats` and `health` call the embed backlog).
+    pub async fn embed_backlog(&self) -> Result<u64> {
+        self.read(|c| Ok(embeddings::backlog(c)? as u64)).await
+    }
+
+    /// Whether the data directory has room for an upload of `size` bytes, `received` of which
+    /// are already on the disk: about three times its size (the archive, the unpacked copy and
+    /// the database growth) must remain free above [`IMPORT_MIN_FREE_AFTER`].
+    fn check_upload_room(&self, size: u64, received: u64) -> Result<()> {
+        // An unknown free size cannot prove there is room.
+        let free = self.free_bytes().unwrap_or(0);
+        if free.saturating_add(received)
+            < size.saturating_mul(3).saturating_add(IMPORT_MIN_FREE_AFTER)
+        {
+            return Err(AliceError::invalid(format!(
+                "the server has {free} bytes free; importing an upload of {size} bytes needs about three times its size plus 2 GB; ask the server's admin"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Admits an upload (`POST /api/v1/import/upload`, tenant mode): refuses at once what the
+    /// headers already show (over the cap, no room on the disk, a remote embedding provider
+    /// not allowed) and takes the one import slot BEFORE a byte of the body is read.
+    pub fn upload_begin(
+        self: &Arc<Self>,
+        content_length: Option<u64>,
+        allow_remote_embedding: bool,
+    ) -> std::result::Result<UploadTicket, UploadError> {
+        use alice_core::import::{ImportState, ImportStatus};
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(AliceError::invalid(
+                "the daemon is stopping; try the upload again in a minute",
+            )
+            .into());
+        }
+        let settings = self.settings.get();
+        let cap = settings.import.max_upload_bytes;
+        if let Some(n) = content_length.filter(|n| *n > cap) {
+            return Err(UploadError::TooLarge(too_large_message(n, cap)));
+        }
+        importer::check_remote_embedding(&settings, allow_remote_embedding)?;
+        if let Some(n) = content_length {
+            self.check_upload_room(n, 0)?;
+        }
+        let mut slot = self.import.lock();
+        {
+            let st = slot.status.lock();
+            if st.state.is_active() {
+                return Err(UploadError::Conflict(format!(
+                    "an import is already in progress ({}); wait until `GET /api/v1/import/status` says done or failed, then upload again",
+                    match st.state {
+                        ImportState::Receiving => "receiving an upload".to_string(),
+                        ImportState::Unpacking => "unpacking an upload".to_string(),
+                        _ => format!("phase {}", st.phase),
+                    }
+                )));
+            }
+        }
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(AliceError::invalid(
+                "the daemon is stopping; try the upload again in a minute",
+            )
+            .into());
+        }
+        if let Some(old) = slot.handle.take() {
+            let _ = old.join();
+        }
+        let inbox = self.home.import_inbox();
+        std::fs::create_dir_all(&inbox).map_err(AliceError::Io)?;
+        let job_id = new_id();
+        *slot.status.lock() = ImportStatus {
+            state: ImportState::Receiving,
+            job_id: Some(job_id.clone()),
+            phase: "receiving".to_string(),
+            ..ImportStatus::idle()
+        };
+        let name = format!("{}{job_id}", crate::upload::PREFIX);
+        Ok(UploadTicket {
+            svc: self.clone(),
+            archive: inbox.join(format!("{name}.tar.gz")),
+            dir: inbox.join(&name),
+            job_id,
+            cap,
+            declared: content_length,
+            received: 0,
+            guard: Some(self.activity.enter_owned()),
+            allow_remote_embedding,
+            reason: None,
+            armed: true,
+        })
     }
 
     // ------------------------------------------------------------------ maintenance
@@ -3581,6 +4459,11 @@ impl Service {
 
     /// Copy the database into the backup directory now (`alice backup now`).
     pub async fn backup_now(&self) -> Result<BackupInfo> {
+        if self.opts.tenant {
+            return Err(AliceError::invalid(
+                "on a server tenant backups are scheduled (the last 2 are kept); ask the server's admin for an extra copy",
+            ));
+        }
         let _busy = self.activity.enter();
         let (db, dir) = (
             self.home.db(),
@@ -3651,6 +4534,10 @@ impl Service {
         let embedding_error = self.embedding.problem();
         let judge_provider = self.judge().provider().to_string();
         let judge_warning = self.judge_warning();
+        let team_warning = self
+            .team_error
+            .clone()
+            .or_else(|| self.team.as_ref().and_then(|t| t.problem()));
         let model_loaded = self.embedder().is_loaded();
         let memory_bytes = crate::doctor::self_memory_bytes();
         // Read the backup directory, the spool and the database: off the runtime's threads.
@@ -3699,6 +4586,7 @@ impl Service {
                 settings_warnings,
                 settings_errors,
                 config_degraded,
+                team_warning,
             })
         })
         .await
@@ -3771,6 +4659,8 @@ fn returned_memories(mut seqs: Vec<i64>, returned: &[Hit]) -> Vec<i64> {
             .filter(|h| h.tier == Tier::Knowledge)
             .count(),
     );
+    // A team hit has no personal memory to count an access for.
+    seqs.retain(|s| *s != TEAM_SEQ);
     seqs
 }
 
@@ -3950,6 +4840,228 @@ fn screen_resolution(
     }
 }
 
+/// The prefix of an id that lives in the team store.
+const TEAM_PREFIX: &str = "team:";
+
+/// What a person is told when a shared write fails. The team store's own answer (its redaction
+/// rules' refusal, an invalid request, a missing memory) is passed on as it is; no answer, or a
+/// broken one, after the request went out means it may have been saved; only a store that could
+/// not be reached means nothing was.
+fn shared_write_error(e: AliceError) -> AliceError {
+    let text = e.to_string();
+    match e {
+        e if alice_core::redact::is_refusal(&e) => e,
+        e @ (AliceError::Invalid(_) | AliceError::NotFound(_)) => e,
+        _ if text.contains("did not answer in time")
+            || text.contains("broke off its answer")
+            || text.contains("sent an answer this daemon cannot read") =>
+        {
+            AliceError::Other(format!(
+                "the team memory did not confirm the write ({text}); it may have been saved: recall it before saving it again"
+            ))
+        }
+        _ => AliceError::Other(format!(
+            "the team memory is unreachable ({text}); nothing was saved. Retry, or save it personally without shared"
+        )),
+    }
+}
+/// The team store's total time to answer a recall or a context, the batch `get` for authors
+/// included (spec §2.10).
+const TEAM_DEADLINE: Duration = Duration::from_millis(800);
+/// The budget a recall asks of the team store; the person's own `max_tokens` packs the merged answer.
+const TEAM_RECALL_TOKENS: usize = 4_000;
+/// The answer when the team store did not answer within [`TEAM_DEADLINE`].
+const NOTE_TEAM_LATE: &str = "the team memory did not answer in time; this answer is personal only";
+/// The place of a team hit in `SearchOutput::memory_seqs`: it has no personal sequence number,
+/// so the parallel arrays stay one entry per knowledge hit, and no access is counted for it.
+const TEAM_SEQ: i64 = -1;
+/// The importance a team hit has for the judge (the team's own is not in a hit).
+const TEAM_IMPORTANCE: u8 = 3;
+
+/// The slug of the project a read or write resolved to (`global` when nothing named one).
+fn choice_slug(c: &ProjectChoice) -> String {
+    match c {
+        ProjectChoice::Slug(s) => s.clone(),
+        ProjectChoice::Detected(r) => r.slug.clone(),
+        ProjectChoice::Fallback => "global".into(),
+    }
+}
+
+/// What the team store answers to a recall, as this tenant shows it: `team:` ids, `source` and
+/// the `author` (one batch `get`), all inside [`TEAM_DEADLINE`]. A project the team store does
+/// not know (a refusal, not a failure) is an empty answer.
+async fn team_recall(team: &crate::team::TeamLink, body: RecallRequest) -> Result<Vec<Hit>> {
+    let asked = tokio::time::timeout(TEAM_DEADLINE, async {
+        let found: RecallResponse = team
+            .call(
+                reqwest::Method::POST,
+                "/api/v1/recall",
+                Some(&body),
+                TEAM_DEADLINE,
+            )
+            .await?;
+        let mut hits = found.results;
+        hits.retain(|h| h.tier == Tier::Knowledge);
+        if hits.is_empty() {
+            return Ok(hits);
+        }
+        let got: GetResponse = team
+            .call(
+                reqwest::Method::POST,
+                "/api/v1/get",
+                Some(&GetRequest {
+                    ids: hits.iter().map(|h| h.id.clone()).collect(),
+                    include_provenance: false,
+                }),
+                TEAM_DEADLINE,
+            )
+            .await?;
+        for h in &mut hits {
+            h.author = got
+                .memories
+                .iter()
+                .find(|m| m.memory.id == h.id)
+                .and_then(|m| author_tenant(&m.memory.author))
+                .map(str::to_string);
+            h.id = format!("{TEAM_PREFIX}{}", h.id);
+            h.source = Some("team".into());
+        }
+        Ok(hits)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(AliceError::Other(
+            "the team store did not answer in time".into(),
+        ))
+    });
+    match asked {
+        Err(AliceError::Invalid(_)) => Ok(Vec::new()),
+        other => other,
+    }
+}
+
+/// Takes the team store's `cloud_ok` mark off every team hit whose project the person's own
+/// cloud policy does not allow (the person's `privacy.cloud_denied_projects`, or a degraded
+/// configuration): a team hit reaches the person's judge only when the team store and the
+/// person both allow its project. The policy is asked once per distinct project slug, with no
+/// project root, so it reads only the settings snapshot.
+fn withhold_from_judge(settings: &SettingsHandle, hits: &mut [Hit]) {
+    let mut asked: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for h in hits.iter_mut().filter(|h| h.cloud_ok == Some(true)) {
+        let allowed = *asked
+            .entry(h.project.clone())
+            .or_insert_with(|| settings.cloud_allowed(&h.project, None));
+        if !allowed {
+            h.cloud_ok = Some(false);
+        }
+    }
+}
+
+/// The hash two hits are the same memory by: title and snippet (R36).
+fn hit_hash(h: &Hit) -> String {
+    alice_core::normalize::content_hash("", Kind::Note, &h.title, &h.snippet)
+}
+
+/// Adds the team's hits to the personal search `out`, dropping the ones a personal hit equals.
+/// Fast mode (`precise == false`): all join and the list is ordered by score. Precise mode: the
+/// ones the team store marked `cloud_ok` join (their ids are returned) so the judge can grade
+/// them with the rest, and the others are returned to follow the graded hits. The team's mark
+/// is not part of the answer, so it is cleared here.
+fn merge_team(
+    out: &mut SearchOutput,
+    team: Vec<Hit>,
+    precise: bool,
+) -> (std::collections::HashSet<String>, Vec<Hit>) {
+    let personal: std::collections::HashSet<String> = out.hits.iter().map(hit_hash).collect();
+    let mut ok = std::collections::HashSet::new();
+    let (mut joined, mut rest) = (Vec::new(), Vec::new());
+    for mut h in team {
+        if personal.contains(&hit_hash(&h)) {
+            continue;
+        }
+        let gradable = h.cloud_ok == Some(true);
+        h.cloud_ok = None;
+        if precise && !gradable {
+            rest.push(h);
+            continue;
+        }
+        if precise {
+            ok.insert(h.id.clone());
+        }
+        joined.push(h);
+    }
+    rest.sort_by(|a, b| b.score.total_cmp(&a.score));
+    if !joined.is_empty() {
+        let hits = std::mem::take(&mut out.hits);
+        let (seqs, importance) = (
+            std::mem::take(&mut out.memory_seqs),
+            std::mem::take(&mut out.memory_importance),
+        );
+        let mut knowledge = 0;
+        let mut entries: Vec<(Hit, Option<(i64, u8)>)> = hits
+            .into_iter()
+            .map(|h| {
+                let memory = (h.tier == Tier::Knowledge).then(|| {
+                    knowledge += 1;
+                    (seqs[knowledge - 1], importance[knowledge - 1])
+                });
+                (h, memory)
+            })
+            .collect();
+        entries.extend(
+            joined
+                .into_iter()
+                .map(|h| (h, Some((TEAM_SEQ, TEAM_IMPORTANCE)))),
+        );
+        entries.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+        for (h, memory) in entries {
+            out.hits.push(h);
+            if let Some((seq, imp)) = memory {
+                out.memory_seqs.push(seq);
+                out.memory_importance.push(imp);
+            }
+        }
+    }
+    (ok, rest)
+}
+
+/// Puts the team hits the judge did not see after the graded results, up to `limit`.
+fn append_team(out: &mut SearchOutput, rest: Vec<Hit>, limit: usize) {
+    for h in rest {
+        if out.hits.len() >= limit {
+            break;
+        }
+        out.hits.push(h);
+        out.memory_seqs.push(TEAM_SEQ);
+        out.memory_importance.push(TEAM_IMPORTANCE);
+    }
+}
+/// A call to the team store for one shared write, read or change.
+const SHARED_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many pages of 500 events `undo` of a shared change looks through for the event.
+const SHARED_UNDO_PAGES: usize = 20;
+/// The refusal for a shared memory (or event) that this tenant did not write.
+const SHARED_REFUSAL: &str = "only the author or the admin can change a shared memory";
+
+/// The tenant part of a shared memory's author: the text before the first `/`.
+fn author_tenant(a: &Author) -> Option<&str> {
+    a.agent
+        .as_deref()
+        .and_then(|s| s.split('/').next())
+        .filter(|t| !t.is_empty())
+}
+
+/// A memory of the team store as this tenant shows it: `team:` ids, its source and author.
+fn into_team_view(mut m: MemoryFull) -> MemoryFull {
+    m.source = Some("team".into());
+    m.author_name = author_tenant(&m.memory.author).map(str::to_string);
+    m.memory.id = format!("{TEAM_PREFIX}{}", m.memory.id);
+    for l in &mut m.links {
+        l.id = format!("{TEAM_PREFIX}{}", l.id);
+    }
+    m
+}
+
 fn full(
     c: &Connection,
     m: alice_core::model::Memory,
@@ -3980,6 +5092,8 @@ fn full(
         links,
         provenance,
         event_id: None,
+        source: None,
+        author_name: None,
     })
 }
 
@@ -8690,6 +9804,9 @@ mod tests {
             relevance: None,
             matched: vec![],
             status: None,
+            source: None,
+            author: None,
+            cloud_ok: None,
         }
     }
 
@@ -9840,6 +10957,453 @@ mod tests {
         assert_eq!(t.graded(), 5);
     }
 
+    // ------------------------------------------------- server mode: client_project and tenant mode
+
+    fn client_project(key: &str, slug: &str, rules: ClientRules) -> Option<ClientProject> {
+        Some(ClientProject {
+            key: key.into(),
+            slug: slug.into(),
+            name: slug.into(),
+            remote: None,
+            rules,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_refuses_manual_backups_and_server_palace_imports() {
+        let (_d, s) = tenant_svc().await;
+        let e = s.backup_now().await.unwrap_err().to_string();
+        assert!(e.contains("backups are scheduled"), "{e}");
+        let e = s
+            .start_import(alice_core::import::ImportRequest {
+                palace: Some("/srv/x".into()),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("server tenant"), "{e}");
+        let e = s
+            .start_import(alice_core::import::ImportRequest::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("server tenant"), "{e}");
+    }
+
+    /// A tenant whose disk always has room: an accept test must not depend on the host's.
+    async fn tenant_svc_with_room() -> (tempfile::TempDir, Arc<Service>) {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                free_space: Some(Arc::new(|_| Some(u64::MAX / 4))),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        (d, s)
+    }
+
+    async fn tenant_svc() -> (tempfile::TempDir, Arc<Service>) {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                ..quiet()
+            },
+        )
+        .unwrap();
+        (d, s)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_hint_makes_or_finds_a_placeholder_in_tenant_mode_only() {
+        let (_d, s) = tenant_svc().await;
+        let hint = |content: &str, h: &str| RememberRequest {
+            content: content.into(),
+            project_hint: Some(h.into()),
+            ..Default::default()
+        };
+        let r = s
+            .remember(hint("first note via mcp", "My App"))
+            .await
+            .unwrap();
+        assert_eq!(r.project, "my-app");
+        let conn = alice_core::store::open_reader(&s.home().db()).unwrap();
+        let (key, root): (String, Option<String>) = conn
+            .query_row(
+                "SELECT key, root_path FROM projects WHERE slug = 'my-app'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            key,
+            format!(
+                "{}my-app",
+                alice_core::store::projects::PLACEHOLDER_KEY_PREFIX
+            )
+        );
+        assert!(root.is_none(), "no path is stored for a hint");
+        // The second time it finds the same project; an explicit slug still wins.
+        assert_eq!(
+            s.remember(hint("second note via mcp", "my-app"))
+                .await
+                .unwrap()
+                .project,
+            "my-app"
+        );
+        let r = s
+            .remember(RememberRequest {
+                content: "explicit".into(),
+                project: Some("global".into()),
+                project_hint: Some("my-app".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.project, "global");
+        // A local daemon ignores the hint.
+        let (_d2, local) = svc().await;
+        assert_eq!(
+            local
+                .remember(hint("local note", "my-app"))
+                .await
+                .unwrap()
+                .project,
+            "global"
+        );
+    }
+
+    /// A tenant's read-only spool keeps the project hint: after the repair the memory lands in
+    /// the hinted project, not in `global`, and an old entry without the field still parses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_only_spool_keeps_the_project_hint_through_the_drain() {
+        let (d, s) = tenant_svc().await;
+        s.force_read_only("disk full");
+        let r = s
+            .remember_or_spool(RememberRequest {
+                content: "spooled with a hint".into(),
+                project_hint: Some("Hinted App".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.status, RememberStatus::Spooled);
+        let dir = s.home().spool_dir();
+        let text: String = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(text.contains("Hinted App"), "{text}");
+        // The repair: a fresh service on the same home drains the spool.
+        s.shutdown();
+        let s2 = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                ..quiet()
+            },
+        )
+        .unwrap();
+        let report = spool::drain(&dir, &s2).await;
+        assert_eq!(report.processed, 1, "{report:?}");
+        let conn = alice_core::store::open_reader(&s2.home().db()).unwrap();
+        let project: String = conn
+            .query_row(
+                "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, "hinted-app");
+        // An entry written before the field existed still parses.
+        let parsed: RememberRequest = serde_json::from_str(r#"{"content":"old entry"}"#).unwrap();
+        assert!(parsed.project_hint.is_none());
+    }
+
+    /// Project names are capped: a hint or an explicit project over the limits is refused, one
+    /// at the limit works, and the refusal never echoes the value.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn project_names_over_the_limits_are_refused() {
+        let (_d, s) = tenant_svc().await;
+        let remember = |hint: Option<String>, project: Option<String>| RememberRequest {
+            content: "a note".into(),
+            project_hint: hint,
+            project,
+            ..Default::default()
+        };
+        let long = "a".repeat(101);
+        for req in [
+            remember(Some(long.clone()), None),
+            remember(Some(format!("{} ", "b".repeat(201))), None),
+            remember(None, Some(long.clone())),
+        ] {
+            let e = s.remember(req).await.unwrap_err();
+            assert!(matches!(e, AliceError::Invalid(_)), "{e}");
+            let msg = e.to_string();
+            assert!(
+                !msg.contains(&long) && !msg.contains("bbbbbbbb"),
+                "echoed: {msg}"
+            );
+        }
+        let ok = s
+            .remember(remember(Some("c".repeat(100)), None))
+            .await
+            .unwrap();
+        assert_eq!(ok.project, "c".repeat(100));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_redacts_even_when_redaction_is_off_in_the_file() {
+        let (d, s) = tenant_svc().await;
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        assert!(
+            s.patch_settings(patch_one("privacy.redact", serde_json::json!(false)))
+                .is_err()
+        );
+        s.remember(RememberRequest {
+            content: format!("deploy key {token}"),
+            project_hint: Some("ops".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // The database is in WAL mode: the text may sit in either file.
+        let db = s.home().db();
+        let mut wal = db.as_os_str().to_owned();
+        wal.push("-wal");
+        for f in [db, std::path::PathBuf::from(wal)] {
+            let bytes = std::fs::read(&f).unwrap_or_default();
+            assert!(
+                !bytes.windows(token.len()).any(|w| w == token.as_bytes()),
+                "the secret reached {}",
+                f.display()
+            );
+        }
+        drop(d);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_project_is_stored_with_its_mirror_as_the_root() {
+        let (_d, s) = tenant_svc().await;
+        assert!(s.is_tenant());
+        let rules = || ClientRules::File {
+            text: "[privacy]\nblock_secrets = true\n".into(),
+        };
+        let r = s
+            .remember(RememberRequest {
+                content: "Staging runs on Fly".into(),
+                client_project: client_project("github.com/me/app", "app", rules()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.project, "app");
+        let root = s
+            .read(|c| projects::root_of(c, "app"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(&root),
+            crate::client_projects::mirror_dir(s.home(), "github.com/me/app")
+        );
+        // The mirror's block_secrets applies on the server.
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let e = s
+            .remember(RememberRequest {
+                content: format!("deploy with {token}"),
+                client_project: client_project("github.com/me/app", "app", rules()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(alice_core::redact::is_refusal(&e), "{e}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_ignores_cwd_and_an_explicit_slug_still_wins() {
+        let (d, s) = tenant_svc().await;
+        let cwd = repo(&d, "somewhere");
+        let r = s
+            .remember(RememberRequest {
+                content: "a note".into(),
+                cwd: cwd.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            r.project, "global",
+            "no git on a client path in tenant mode"
+        );
+        s.remember(RememberRequest {
+            content: "first app note".into(),
+            client_project: client_project("k/app", "app", ClientRules::None),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let r = s
+            .remember(RememberRequest {
+                content: "named note".into(),
+                project: Some("global".into()),
+                client_project: client_project("k/app", "app", ClientRules::None),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.project, "global");
+        // The local meaning of cwd is untouched.
+        let (d2, local) = svc().await;
+        let cwd2 = repo(&d2, "proj");
+        let r = local
+            .remember(RememberRequest {
+                content: "local note".into(),
+                cwd: cwd2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.project, "proj");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mirrored_cloud_denial_keeps_the_judge_and_the_query_away() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t.clone()).await;
+        let denied = client_project(
+            "k/secret",
+            "secret",
+            ClientRules::File {
+                text: "[privacy]\ncloud_denied = true\n".into(),
+            },
+        );
+        // Never stored yet: the Task 22 path (query_cloud on the mirror root) denies the grading.
+        let r = s
+            .recall(RecallRequest {
+                client_project: denied.clone(),
+                ..recall_req("deploy notes", RecallMode::Precise, &None)
+            })
+            .await
+            .unwrap();
+        assert!(!r.reranked);
+        assert_eq!(t.graded(), 0);
+        // Stored: the judge's policy reads the mirror for later calls.
+        for text in DEPLOY_NOTES {
+            s.remember(RememberRequest {
+                content: text.into(),
+                kind: Some(Kind::Howto),
+                client_project: denied.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        wait_settled(&s).await;
+        assert!(!s.cloud.cloud_allowed("secret"));
+        let r = s
+            .recall(RecallRequest {
+                client_project: denied,
+                ..recall_req("deploy notes", RecallMode::Precise, &None)
+            })
+            .await
+            .unwrap();
+        assert!(!r.reranked);
+        assert!(r.notes.iter().any(|n| n == NOTE_DENIED), "{:?}", r.notes);
+        assert_eq!(t.graded(), 0);
+        drop(d);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_project_whose_mirror_is_gone_fails_closed() {
+        let (_d, s) = tenant_svc().await;
+        s.remember(RememberRequest {
+            content: "app note".into(),
+            client_project: client_project("k/app", "app", ClientRules::None),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dir = crate::client_projects::mirror_dir(s.home(), "k/app");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!s.cloud.cloud_allowed("app"));
+        assert!(
+            s.rules_fail_closed(Scope {
+                project: Some("app"),
+                ..Default::default()
+            })
+            .await
+        );
+    }
+
+    // ---------------------------------------------------------------- tenant import inbox
+
+    fn palace_request(p: &Path) -> alice_core::import::ImportRequest {
+        alice_core::import::ImportRequest {
+            palace: Some(p.display().to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_imports_only_from_its_import_inbox() {
+        let (d, s) = tenant_svc_with_room().await;
+        let inbox = d.path().join("import-inbox");
+        let outside = tempfile::tempdir().unwrap();
+        let out_palace = alice_core::import::fixture::synthetic_palace(outside.path(), 20).dir;
+        std::fs::create_dir_all(inbox.join("j2")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&out_palace, inbox.join("j2/palace")).unwrap();
+        for bad in [
+            Some(out_palace.clone()),
+            Some(inbox.clone()),
+            Some(inbox.join("j2/palace")),
+            None,
+        ] {
+            let req = match &bad {
+                Some(p) => palace_request(p),
+                None => Default::default(),
+            };
+            let e = s.start_import(req).unwrap_err().to_string();
+            assert!(e.contains("import-inbox/"), "{e}");
+        }
+        let ok = inbox.join("j1/palace");
+        alice_core::import::fixture::synthetic_palace(&ok, 20);
+        let st = s.start_import(palace_request(&ok)).unwrap();
+        assert_eq!(st.state, alice_core::import::ImportState::Running);
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_import_is_refused_when_the_disk_would_get_too_full() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                free_space: Some(Arc::new(|_| Some(1))),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        let p = d.path().join("import-inbox/j1/palace");
+        alice_core::import::fixture::synthetic_palace(&p, 20);
+        let e = s.start_import(palace_request(&p)).unwrap_err().to_string();
+        assert!(
+            e.contains("1 bytes free") && e.contains("twice its size plus 2 GB"),
+            "{e}"
+        );
+    }
+
     // ------------------------------------- reads from a checkout that only an import knows
 
     use alice_core::import::fixture::{DrawerSpec, build_sqlite_exact};
@@ -9850,7 +11414,12 @@ mod tests {
     /// is stored as an import placeholder, with no root).
     async fn import_wing(s: &Arc<Service>, d: &tempfile::TempDir, wing: &str) {
         let palace = d.path().join(format!("palace-{wing}")).join("palace");
-        std::fs::create_dir_all(&palace).unwrap();
+        import_wing_at(s, &palace, wing).await;
+    }
+
+    /// `import_wing`, from a palace at `palace` (a tenant imports only from its inbox).
+    async fn import_wing_at(s: &Arc<Service>, palace: &Path, wing: &str) {
+        std::fs::create_dir_all(palace).unwrap();
         let specs: Vec<DrawerSpec> = DEPLOY_NOTES
             .iter()
             .enumerate()
@@ -9866,7 +11435,7 @@ mod tests {
                 },
             })
             .collect();
-        build_sqlite_exact(&palace, &specs);
+        build_sqlite_exact(palace, &specs);
         s.start_import(ImportRequest {
             palace: Some(palace.display().to_string()),
             ..Default::default()
@@ -9918,6 +11487,7 @@ mod tests {
             project: None,
             max_tokens: None,
             cwd: cwd.clone(),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -9937,6 +11507,7 @@ mod tests {
                 project: Some("pg-ai".into()),
                 max_tokens: None,
                 cwd: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -10085,6 +11656,7 @@ mod tests {
                 project: Some("no-such-project".into()),
                 max_tokens: None,
                 cwd: cwd.clone(),
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -10144,5 +11716,176 @@ mod tests {
             .await
             .unwrap();
         assert!(r.results.iter().any(|h| h.project == "pg-ai"));
+    }
+
+    /// On a tenant, the project hint (`?project=` or the client's root basename) of a project an
+    /// inbox import created reads and writes that `import:` placeholder: the read path that looks
+    /// placeholders up for a detected checkout never runs there, because the hint resolves the
+    /// slug first. After `projects merge`, the hint follows the placeholder to its new project.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_hint_reads_and_writes_the_imported_placeholder() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                free_space: Some(Arc::new(|_| Some(u64::MAX / 4))),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        import_wing_at(&s, &d.path().join("import-inbox/j1/palace"), "pg_ai").await;
+        key_note(&s).await;
+        let rows = project_rows(&d);
+        assert!(rows.iter().any(|(k, _)| k == "import:pg-ai"), "{rows:?}");
+        // `pg_ai` is what a client whose root is `.../pg_ai` sends; `pg-ai` what `?project=` may.
+        for hint in ["pg_ai", "pg-ai", "PG AI"] {
+            let r = s
+                .recall(RecallRequest {
+                    query: "deploy notes".into(),
+                    mode: Some(RecallMode::Fast),
+                    format: OutputFormat::Json,
+                    project_hint: Some(hint.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(r.project.as_deref(), Some("pg-ai"), "{hint}");
+            assert!(r.results.iter().any(|h| h.project == "pg-ai"), "{hint}");
+            let ctx = s
+                .context(ContextRequest {
+                    project_hint: Some(hint.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(ctx.project, "pg-ai", "{hint}");
+            assert!(ctx.text.contains("KEYNOTE"), "{hint}: {}", ctx.text);
+        }
+        let w = s
+            .remember(RememberRequest {
+                content: "the pg-ai deploy window is 22:00".into(),
+                project_hint: Some("pg_ai".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(w.project, "pg-ai");
+        assert_eq!(
+            project_rows(&d),
+            rows,
+            "a hint of a stored project adds no row"
+        );
+
+        // Merged into another project, the placeholder's slug still leads there.
+        s.remember(RememberRequest {
+            content: "the real app".into(),
+            project_hint: Some("Real App".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_settled(&s).await;
+        s.merge_projects(alice_core::api::ProjectMergeRequest {
+            from: "pg-ai".into(),
+            into: "real-app".into(),
+            dry_run: false,
+            author: Default::default(),
+        })
+        .await
+        .unwrap();
+        wait_settled(&s).await;
+        let ctx = s
+            .context(ContextRequest {
+                project_hint: Some("pg_ai".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ctx.project, "real-app");
+        assert!(ctx.text.contains("KEYNOTE"), "{}", ctx.text);
+        let w = s
+            .remember(RememberRequest {
+                content: "after the merge".into(),
+                project_hint: Some("pg-ai".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(w.project, "real-app");
+    }
+
+    /// Final review C1: on a server the Jev endpoint and the judge budget are the admin's, pinned
+    /// in the tenant file (here: the settings environment). A person's PATCH does not move them,
+    /// and the view shows the shared key as set without any hint of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_cannot_move_the_jev_endpoint_or_budget_and_sees_no_key_hint() {
+        let d = tempfile::tempdir().unwrap();
+        let store = MemSecrets::new(Duration::ZERO);
+        let official = "https://api.typesafe.ai/v1/systemone";
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                secrets: Some(store.clone()),
+                settings_env: Some(vec![
+                    ("ALICE_JUDGE_JEV_ENDPOINT".into(), official.into()),
+                    ("ALICE_JUDGE_DAILY_BUDGET_USD".into(), "1.0".into()),
+                ]),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.set_secret_async(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .await
+            .unwrap();
+        let out = s
+            .patch_settings(patch_one(
+                "judge.jev.endpoint",
+                serde_json::json!("https://collector.example/v1"),
+            ))
+            .unwrap();
+        assert!(
+            out.overridden_by_env
+                .iter()
+                .any(|k| k == "judge.jev.endpoint"),
+            "{out:?}"
+        );
+        s.patch_settings(patch_one(
+            "judge.daily_budget_usd",
+            serde_json::json!(500.0),
+        ))
+        .unwrap();
+        let v = s.settings_view_async().await;
+        assert_eq!(v.settings["judge"]["jev"]["endpoint"], official);
+        assert_eq!(v.settings["judge"]["daily_budget_usd"], 1.0);
+        let k = &v.secrets["jev_api_key"];
+        assert!(k.set && k.hint.is_none(), "{k:?}");
+    }
+
+    /// Final review M-3: the team store's own answers pass through; a timeout may have saved.
+    #[test]
+    fn a_shared_write_error_says_what_may_have_happened() {
+        let invalid = shared_write_error(AliceError::invalid("content is empty"));
+        assert!(matches!(&invalid, AliceError::Invalid(m) if m == "content is empty"));
+        let missing = shared_write_error(AliceError::NotFound("memory x".into()));
+        assert!(matches!(missing, AliceError::NotFound(_)));
+        let late = shared_write_error(AliceError::Other(
+            "the team store did not answer in time".into(),
+        ))
+        .to_string();
+        assert!(late.contains("may have been saved"), "{late}");
+        let garbled = shared_write_error(AliceError::Other(
+            "the team store sent an answer this daemon cannot read: eof".into(),
+        ))
+        .to_string();
+        assert!(garbled.contains("may have been saved"), "{garbled}");
+        let down = shared_write_error(AliceError::Other(
+            "the team store is unreachable: connection refused".into(),
+        ))
+        .to_string();
+        assert!(down.contains("nothing was saved"), "{down}");
     }
 }

@@ -9,7 +9,7 @@ use crate::paths::AliceHome;
 use crate::service::Service;
 use alice_core::api::*;
 use alice_core::error::AliceError;
-use alice_core::model::Author;
+use alice_core::model::{Author, limits};
 use alice_core::store::memories::UpdateAction;
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -331,6 +331,43 @@ fn json<T: serde::Serialize>(v: &T) -> CallToolResult {
     text(serde_json::to_string_pretty(v).unwrap_or_default())
 }
 
+/// The header a tenant's MCP client may name its project in (after `?project=`, before a root).
+/// UTF-8, or percent-encoded UTF-8 (Node's fetch, behind Claude Code's `headersHelper`, cannot
+/// send other bytes).
+pub const PROJECT_HEADER: &str = "x-alice-project";
+
+/// `%XX` sequences decoded; `None` when the bytes are not UTF-8 afterwards.
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (
+            b[i],
+            b.get(i + 1).copied().and_then(hex),
+            b.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Whether a project name fits the limits: at most `MAX_PROJECT_NAME_CHARS` characters
+/// trimmed, and a slug of at most `MAX_PROJECT_SLUG_CHARS`.
+fn within_project_limits(name: &str) -> bool {
+    name.trim().chars().count() <= limits::MAX_PROJECT_NAME_CHARS
+        && alice_core::normalize::slugify(name).chars().count() <= limits::MAX_PROJECT_SLUG_CHARS
+}
+
 fn resource_err(e: AliceError) -> McpError {
     match e {
         AliceError::Invalid(m) => McpError::invalid_params(m, None),
@@ -378,6 +415,76 @@ impl AliceMcp {
         self.backend.default_cwd()
     }
 
+    /// The project identity of a call: `(project_hint, cwd)`. On a server tenant a client's
+    /// path means nothing (no git there), so `cwd` is none and the hint is the `?project=` of
+    /// the MCP URL, else the `X-Alice-Project` header (Claude Code sends no roots over HTTP; its
+    /// `headersHelper` can send the checkout's name), else the name of the client's first root;
+    /// the service slugifies it. A tool's own `project` argument beats all three. Locally the
+    /// hint stays empty and `cwd` is as `cwd` says.
+    ///
+    /// A `?project=` or header over the name or slug limit fails the call (the message names the
+    /// limit, never the value); a root basename over either is dropped, so the call falls to
+    /// `global`.
+    async fn hint_and_cwd(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<(Option<String>, Option<String>), McpError> {
+        if !matches!(&self.backend, Backend::Local(s) if s.is_tenant()) {
+            return Ok((None, self.cwd(ctx).await));
+        }
+        let parts = ctx.extensions.get::<axum::http::request::Parts>();
+        let queried = parts.and_then(|p| p.uri.query()).and_then(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .find(|(k, v)| k == "project" && !v.trim().is_empty())
+                .map(|(_, v)| v.into_owned())
+        });
+        // UTF-8 or percent-encoded UTF-8; anything else fails the call rather than falling to
+        // another project.
+        let header = match parts.and_then(|p| p.headers.get(PROJECT_HEADER)) {
+            None => None,
+            Some(v) => {
+                let decoded = std::str::from_utf8(v.as_bytes())
+                    .ok()
+                    .and_then(percent_decode)
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            "the X-Alice-Project header is not UTF-8: send the project name as UTF-8 or percent-encoded UTF-8",
+                            None,
+                        )
+                    })?;
+                Some(decoded.trim().to_string()).filter(|v| !v.is_empty())
+            }
+        };
+        let (named, from) = match (queried, header) {
+            (Some(q), _) => (Some(q), "?project="),
+            (None, Some(h)) => (Some(h), "the X-Alice-Project header"),
+            (None, None) => (None, ""),
+        };
+        let hint = match named {
+            Some(q) if within_project_limits(&q) => Some(q),
+            Some(_) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "the project name in {from} is too long: at most {} characters, and its slug at most {}",
+                        limits::MAX_PROJECT_NAME_CHARS,
+                        limits::MAX_PROJECT_SLUG_CHARS
+                    ),
+                    None,
+                ));
+            }
+            None => self
+                .first_root(ctx)
+                .await
+                .and_then(|root| {
+                    std::path::Path::new(&root)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                })
+                .filter(|n| within_project_limits(n)),
+        };
+        Ok((hint, None))
+    }
+
     /// The client's first root as a local directory, asked once per connection and again after
     /// `roots/list_changed`. A timeout or error is not cached: the next request asks again.
     async fn first_root(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
@@ -420,11 +527,18 @@ impl AliceMcp {
         request: CallToolRequestParams,
         ctx: &RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let (project_hint, cwd) = match self.hint_and_cwd(ctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                return CallToolResult::error(vec![ContentBlock::text(e.message.to_string())]);
+            }
+        };
         let call = CompatCall {
             tool: request.name.to_string(),
             arguments: serde_json::Value::Object(request.arguments.unwrap_or_default()),
-            cwd: self.cwd(ctx).await,
+            cwd,
             agent: Self::agent(ctx),
+            project_hint,
         };
         match self.backend.compat_call(call).await {
             Ok(r) => text(serde_json::to_string(&r.value).unwrap_or_default()),
@@ -462,7 +576,7 @@ impl AliceMcp {
         Parameters(mut req): Parameters<RecallRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        req.cwd = self.cwd(&ctx).await;
+        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await?;
         let format = req.format;
         Ok(match self.backend.recall(req).await {
             Ok(r) if format == OutputFormat::Json => json(&r),
@@ -472,14 +586,14 @@ impl AliceMcp {
     }
 
     #[tool(
-        description = "Save one memory worth keeping: a decision (with why), bug fix (symptom, cause, fix), fact, how-to, preference, warning or end-of-task handoff. Set kind; pass supersedes to replace older memories."
+        description = "Save one memory worth keeping: a decision (with why), bug fix (symptom, cause, fix), fact, how-to, preference, warning or end-of-task handoff. Set kind; pass supersedes to replace older memories. Set shared to true only when the user explicitly asks to save it to the shared, team or central memory; every team member can then read it."
     )]
     async fn remember(
         &self,
         Parameters(mut req): Parameters<RememberRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        req.cwd = self.cwd(&ctx).await;
+        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await?;
         req.author.agent = Some(Self::author(&ctx));
         Ok(match self.backend.remember(req).await {
             Ok(r) => match (r.status, r.id) {
@@ -487,6 +601,10 @@ impl AliceMcp {
                 (RememberStatus::Duplicate, Some(id)) => {
                     text(format!("Already remembered as {id} in {}.", r.project))
                 }
+                (_, Some(id)) if r.shared => text(format!(
+                    "Saved to the team memory as {id} in {}.",
+                    r.project
+                )),
                 (_, Some(id)) => text(format!("Saved {id} in {}.", r.project)),
                 (_, None) => text("Saved."),
             },
@@ -503,7 +621,7 @@ impl AliceMcp {
         Parameters(mut req): Parameters<ContextRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        req.cwd = self.cwd(&ctx).await;
+        (req.project_hint, req.cwd) = self.hint_and_cwd(&ctx).await?;
         Ok(match self.backend.context(req).await {
             Ok(r) => text(r.text),
             Err(e) => tool_err(e),
@@ -814,11 +932,12 @@ impl ServerHandler for AliceMcp {
     ) -> Result<ReadResourceResponse, McpError> {
         let uri = request.uri.clone();
         let body = if uri == "memory://context" {
-            let cwd = self.cwd(&ctx).await;
+            let (project_hint, cwd) = self.hint_and_cwd(&ctx).await?;
             let r = self
                 .backend
                 .context(ContextRequest {
                     cwd,
+                    project_hint,
                     ..Default::default()
                 })
                 .await

@@ -38,7 +38,12 @@ pub fn remove_info_if(home: &AliceHome, instance: &str) {
 }
 
 pub fn read_token(home: &AliceHome) -> Option<String> {
-    std::fs::read_to_string(home.token_file())
+    read_token_file(&home.token_file())
+}
+
+/// The trimmed, non-empty contents of a token file.
+pub fn read_token_file(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

@@ -300,7 +300,19 @@ pub enum ServiceCmd {
 #[derive(Subcommand)]
 pub enum DaemonCmd {
     /// Run in the foreground.
-    Run,
+    Run {
+        #[arg(
+            long,
+            help = "Serve one person on a shared server (alice-server's units use it)"
+        )]
+        tenant: bool,
+        #[arg(
+            long,
+            requires = "tenant",
+            help = "Hold the shared team memory (needs --tenant; alice-server's team unit uses it)"
+        )]
+        team_store: bool,
+    },
     /// Start in the background if not running.
     Start,
     /// Stop the running daemon.
@@ -336,6 +348,9 @@ pub enum ConfigCmd {
 pub enum ModelCmd {
     /// Download the embedding model (~136 MB) for offline use.
     Fetch,
+    /// Load the embedding model and embed one short text: proves this machine runs the
+    /// embedding runtime (`alice-server` runs it before it installs a new binary).
+    Check,
 }
 
 #[derive(Args)]
@@ -484,7 +499,7 @@ fn user_home() -> Option<std::path::PathBuf> {
 const IMPORT_POLL: Duration = Duration::from_millis(500);
 
 async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) -> Result<()> {
-    use alice_core::import::{ImportRequest, ImportState};
+    use alice_core::import::ImportRequest;
     use std::io::IsTerminal;
     // Everything the CLI can refuse by itself happens before a daemon is started.
     let cwd = std::env::current_dir().context("cannot read the working folder")?;
@@ -529,7 +544,7 @@ async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) 
         }
     };
     loop {
-        if status.state != ImportState::Running {
+        if !status.state.is_active() {
             break;
         }
         if tty {
@@ -588,7 +603,10 @@ fn import_verdict(status: &alice_core::import::ImportStatus) -> Result<()> {
         ImportState::Idle => {
             bail!("no import is running and none has run since the daemon started")
         }
-        ImportState::Running => bail!("the import is still running"),
+        ImportState::Running
+        | ImportState::Receiving
+        | ImportState::Unpacking
+        | ImportState::Importing => bail!("the import is still running"),
     }
 }
 
@@ -599,7 +617,10 @@ async fn import_status(home: &AliceHome, json: bool) -> Result<()> {
         (Some(r), ImportState::Done) if !json => out(&r.render_text()),
         _ => print(json, &s, || match s.state {
             ImportState::Idle => "No import has run since the daemon started.\n".into(),
-            ImportState::Running => format!(
+            ImportState::Running
+            | ImportState::Receiving
+            | ImportState::Unpacking
+            | ImportState::Importing => format!(
                 "Import running: {}, {} of {} drawers.\n",
                 s.phase, s.done, s.total
             ),
@@ -736,6 +757,74 @@ fn recall_text(r: &RecallResponse) -> String {
     text
 }
 
+/// `alice adopt <file>`: see `alice_daemon::adopt`.
+fn adopt_command(home: &AliceHome, file: &Path, json: bool) -> Result<()> {
+    let r = alice_daemon::adopt::adopt_now(home, file)?;
+    print(json, &r, || {
+        format!(
+            "Adopted {}: {} memories, {} chunks, {} facts, {} projects.\n\
+             Machine paths cleared: {} (and {} history records rewritten).\n\
+             Redacted again with this tenant's rules: {} memories ({} duplicates trashed), {} chunks, {} history records.\n\
+             The tenant's own database before: {}.\n\
+             Took {:.1} s. The daemon rebuilds its vector index when it starts.\n",
+            r.adopted_from,
+            r.memories,
+            r.chunks,
+            r.facts,
+            r.projects,
+            r.paths_cleared,
+            r.records_rewritten,
+            r.redacted_memories,
+            r.duplicates_trashed,
+            r.redacted_chunks,
+            r.redacted_records,
+            r.saved_tenant_db_as.as_deref().unwrap_or("none"),
+            r.secs
+        )
+    })
+}
+
+/// What `alice model check` reports.
+#[derive(serde::Serialize)]
+struct ModelCheck {
+    model: String,
+    dim: usize,
+    ms: u128,
+}
+
+/// `alice model check`: no daemon; the model is loaded in this process, so a CPU the runtime
+/// cannot run on ends this process (with a signal), which is what a caller checks.
+fn model_check(home: &AliceHome, json: bool) -> Result<()> {
+    use alice_core::embed::Embedder as _;
+    let started = Instant::now();
+    let e = alice_embed::OnnxEmbedder::new(
+        &home.models_dir(),
+        alice_embed::OnnxOptions {
+            idle_unload: None,
+            intra_threads: None,
+        },
+    )?;
+    let v = e.embed_passages(&["Alice checks that this machine can embed a text.".to_string()])?;
+    anyhow::ensure!(
+        v.len() == 1
+            && v[0].len() == e.dim()
+            && v[0].iter().all(|x| x.is_finite())
+            && v[0].iter().any(|x| *x != 0.0),
+        "the embedding model returned an unexpected vector"
+    );
+    let r = ModelCheck {
+        model: e.model_id().to_string(),
+        dim: e.dim(),
+        ms: started.elapsed().as_millis(),
+    };
+    print(json, &r, || {
+        format!(
+            "ok: {} embedded a test text ({} dimensions) in {} ms\n",
+            r.model, r.dim, r.ms
+        )
+    })
+}
+
 fn print<T: serde::Serialize>(json: bool, value: &T, text: impl FnOnce() -> String) -> Result<()> {
     if json {
         out(&format!("{}\n", serde_json::to_string_pretty(value)?))
@@ -751,12 +840,14 @@ async fn client(home: &AliceHome) -> Result<DaemonClient> {
 pub fn dispatch(command: Command, json: bool) -> Result<()> {
     let home = AliceHome::from_env();
     match command {
-        Command::Daemon(DaemonCmd::Run) => run(
+        Command::Daemon(DaemonCmd::Run { tenant, team_store }) => run(
             home,
             DaemonOptions {
                 port: 0,
                 fake_embedder: std::env::var("ALICE_EMBEDDER").is_ok_and(|v| v == "fake"),
                 settings_env: None,
+                tenant,
+                team_store,
             },
         ),
         Command::Mcp => rt()?.block_on(alice_daemon::mcp::run_stdio(home, launcher())),
@@ -774,11 +865,14 @@ pub fn dispatch(command: Command, json: bool) -> Result<()> {
             );
             Ok(())
         }),
+        Command::Model(ModelCmd::Check) => model_check(&home, json),
         Command::Bench(args) => crate::bench::bench(home, args, json),
         // No daemon: the snapshot is a plain read-only copy.
         Command::Import(ImportCmd::Snapshot(a)) => import_snapshot(a, json),
         // Not through `client_command`: that would start a daemon, and `restore` must have none.
         Command::Restore { backup, yes } => rt()?.block_on(restore(&home, backup, yes, json)),
+        // No daemon either: the swap needs the daemon lock, and the tenant's unit is stopped.
+        Command::Adopt { file } => adopt_command(&home, &file, json),
         // Neither starts a daemon: `doctor` reports on what is there, `token rotate` and
         // `service` work with none.
         Command::Doctor => rt()?.block_on(doctor_command(&home, json)),
@@ -822,6 +916,8 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                     OutputFormat::Text
                 },
                 cwd: cwd(),
+                client_project: None,
+                project_hint: None,
             };
             let r = client(&home).await?.recall(&req).await?;
             print(json, &r, || recall_text(&r))
@@ -875,6 +971,8 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                     project: a.project,
                     max_tokens: a.max_tokens,
                     cwd: cwd(),
+                    client_project: None,
+                    project_hint: None,
                 })
                 .await?;
             print(json, &r, || r.text.clone())
@@ -1098,7 +1196,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         Command::Config(c) => config(&home, c, json).await,
         Command::Import(ImportCmd::Mempalace(a)) => import_mempalace(&home, a, json).await,
         Command::Import(ImportCmd::Status) => import_status(&home, json).await,
-        Command::Daemon(DaemonCmd::Run)
+        Command::Daemon(DaemonCmd::Run { .. })
         | Command::Mcp
         | Command::Model(_)
         | Command::Bench(_)
@@ -1106,7 +1204,8 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         | Command::Doctor
         | Command::Token(_)
         | Command::Service(_)
-        | Command::Restore { .. } => {
+        | Command::Restore { .. }
+        | Command::Adopt { .. } => {
             unreachable!("handled in dispatch")
         }
     }

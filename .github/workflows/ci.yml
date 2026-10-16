@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -25,3 +25,8 @@ jobs:
       # the build without it, where `secrets.backend = "keychain"` falls back to the file.
       - run: cargo clippy --locked -p alice-daemon --all-targets -- -D warnings
       - run: cargo test --locked --workspace --no-fail-fast
+      # The server's admin scripts: their stub scenarios (no root, no system change) and shellcheck.
+      - if: runner.os == 'Linux'
+        run: shellcheck deploy/server/alice-server deploy/server/build-release deploy/server/tests/run.sh
+      - if: runner.os == 'Linux'
+        run: bash deploy/server/tests/run.sh

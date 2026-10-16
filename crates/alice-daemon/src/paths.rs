@@ -79,6 +79,14 @@ impl AliceHome {
     pub fn import_tmp(&self) -> PathBuf {
         self.root.join("import-tmp")
     }
+    /// Server mode: where the admin places a palace to import (`alice-server import`).
+    pub fn import_inbox(&self) -> PathBuf {
+        self.root.join("import-inbox")
+    }
+    /// Server mode: the copies of remote projects' `.alice.toml` (spec §2.2 item 3).
+    pub fn client_projects_dir(&self) -> PathBuf {
+        self.root.join("client-projects")
+    }
     pub fn backups_dir(&self) -> PathBuf {
         self.root.join("backups")
     }
@@ -123,6 +131,10 @@ impl AliceHome {
     }
     pub fn token_file(&self) -> PathBuf {
         self.root.join("token")
+    }
+    /// The team store's token, readable by a personal daemon (server mode, spec §2.10).
+    pub fn team_token_file(&self) -> PathBuf {
+        self.root.join("team.token")
     }
 
     /// Create the directory tree. On Unix the root is private (0700).

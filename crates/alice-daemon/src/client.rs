@@ -192,12 +192,29 @@ async fn proves(http: &reqwest::Client, base: &str, token: &str, instance: &str)
 }
 
 /// The JSON error body (`{"error", "kind"}`) as the error the service raised.
-fn error_from(status: reqwest::StatusCode, body: &serde_json::Value) -> AliceError {
+/// Whether a refusal answer says the project's rules were fail-closed when it was made, so the
+/// same write may be accepted later (a replayed spool entry is kept, not withheld).
+pub fn refusal_retry_later(body: &serde_json::Value) -> bool {
+    body["retry_later"].as_bool() == Some(true)
+}
+
+pub(crate) fn error_from(status: reqwest::StatusCode, body: &serde_json::Value) -> AliceError {
     let Some(msg) = body["error"].as_str() else {
         return AliceError::Other(format!(
             "the memory daemon answered {status} without an explanation; it may be an older version. Run \"alice daemon stop\", then retry"
         ));
     };
+    if let Some(r) = body.get("refused").filter(|r| r.is_object()) {
+        return AliceError::Refused {
+            field: r["field"].as_str().unwrap_or("text").to_string(),
+            detectors: r["detectors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| d.as_str().map(String::from))
+                .collect(),
+        };
+    }
     match body["kind"].as_str() {
         Some("invalid") => AliceError::Invalid(msg.to_string()),
         Some("not_found") => {
@@ -935,6 +952,15 @@ pub(crate) async fn remember_via(
     client: std::result::Result<DaemonClient, Unavailable>,
     req: RememberRequest,
 ) -> Result<RememberResponse> {
+    // A shared write goes to the team store through the daemon; it is never queued here.
+    if req.shared {
+        return match client {
+            Ok(c) => c.remember(&req).await,
+            Err(u) => Err(AliceError::Other(format!(
+                "{u}; nothing was saved. Retry, or save it personally without shared"
+            ))),
+        };
+    }
     let (cause, note) = match client {
         Ok(c) => match c.remember(&req).await {
             Err(e) => match spool_cause(&e) {
@@ -954,6 +980,7 @@ pub(crate) async fn remember_via(
         status: RememberStatus::Spooled,
         project: String::new(),
         reason: Some(note),
+        shared: false,
     })
 }
 
@@ -996,6 +1023,18 @@ pub async fn ingest_or_spool(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refusal_body_becomes_a_refusal_error() {
+        let body = serde_json::json!({"error": "the content contains …", "kind": "invalid",
+            "refused": {"field": "content", "detectors": ["github_token"]}, "retry_later": true});
+        let e = error_from(reqwest::StatusCode::BAD_REQUEST, &body);
+        assert!(alice_core::redact::is_refusal(&e), "{e}");
+        assert!(refusal_retry_later(&body));
+        assert!(!refusal_retry_later(
+            &serde_json::json!({"error": "x", "kind": "invalid"})
+        ));
+    }
+
     use super::*;
     use crate::discovery::{DaemonInfo, load_or_create_token, ping_proof, write_info};
     use crate::service::{Service, ServiceOptions};

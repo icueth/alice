@@ -132,6 +132,7 @@ impl Flow {
                 arguments,
                 cwd: cwd.map(String::from),
                 agent: None,
+                project_hint: None,
             })
             .await
             .expect("a compat call never fails at the protocol level")
@@ -198,6 +199,7 @@ async fn a_status_from_an_unstored_checkout_briefs_the_imported_project() {
             project: Some("pg-ai".into()),
             max_tokens: None,
             cwd: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1104,6 +1106,7 @@ async fn writes_are_redacted_and_carry_the_calling_agent() {
             arguments: json!({"drawer_id": id, "content": format!("again {secret}")}),
             cwd: None,
             agent: Some("codex".into()),
+            project_hint: None,
         })
         .await
         .unwrap()
@@ -1507,6 +1510,7 @@ impl Flow {
                 arguments,
                 cwd: None,
                 agent: Some(agent.into()),
+                project_hint: None,
             })
             .await
             .unwrap()

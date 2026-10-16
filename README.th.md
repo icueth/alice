@@ -41,7 +41,7 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
 - **ไฟล์เดียวจบ** daemon, CLI และ MCP server (และ hook ใน SP2) อยู่ใน binary Rust ไฟล์เดียวที่มีตัวรัน embedding ในตัว ไม่ต้องมี Python env หรือ Docker ถ้าอยากใช้ embedding จากที่อื่น (Ollama, endpoint แบบ OpenAI, Voyage) ก็แค่ตั้งค่า
 - **Git sync เป็นไฟล์ Markdown** *(วางแผนไว้ใน M4)* push/pull ความจำไปที่ git remote ไหนก็ได้ เก็บ memory ละหนึ่งไฟล์ Markdown เปิดอ่านบน GitHub ได้ เปิดใน Obsidian ได้ และ sync ข้ามเครื่องได้โดย merge ทีละ record ไฟล์ฐานข้อมูลไม่เคยถูกใส่ใน git
 - **UI สำหรับดู graph และจัดการข้อมูล** *(วางแผนไว้ใน SP3)* ดู graph ความจำ แก้ memory ตัดสินรายการใน review ตั้งค่าได้ทุกอย่าง และสั่ง git push/pull ได้จากเบราว์เซอร์หรือแอป desktop
-- **ย้ายมาจาก MemPalace ได้** import palace เดิมได้ครบทั้ง drawer, diary และ knowledge graph และยังเรียก tool ชื่อ `mempalace_*` ได้ผ่าน compatibility layer ที่เลือกเปิดได้
+- **ย้ายมาจาก MemPalace ได้** import palace เดิมได้ครบทั้ง drawer, diary และ knowledge graph และยังเรียก tool ชื่อ `mempalace_*` ได้ผ่าน compatibility layer ที่เลือกเปิดได้ บน server ที่ใช้ร่วมกัน แต่ละคนอัปโหลด palace ของตัวเองได้ด้วยสคริปต์เดียว ([docs/server.md](docs/server.md#a-person-imports-their-own-mempalace))
 
 ## หลักการทำงาน
 
@@ -206,7 +206,7 @@ alice daemon start | stop | status | logs | run
 alice token rotate [--show]
 alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # MCP server แบบ stdio สำหรับ agent
-alice model fetch
+alice model fetch | check      # check: โหลดโมเดลแล้วลองสร้าง embedding หนึ่งข้อความ (ไม่เปิด daemon)
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 alice import mempalace [--palace dir] [--dry-run] [--since date] [--map-wing wing=project]...
                        [--collection name] [--allow-remote-embedding]
@@ -295,7 +295,7 @@ custom_patterns = [{ name = "internal_id", regex = "ID-[0-9]{8}" }]
 - **Heuristic (ค่าเริ่มต้น ทำงานในเครื่อง ฟรี)** รวม memory ใหม่เข้ากับอันเก่าก็ต่อเมื่อข้อความเหมือนกันหลัง normalize Unicode และยุบช่องว่าง (ตัวพิมพ์เล็กใหญ่และเครื่องหมายวรรคตอนมีผล) ไม่เคยรวมเพราะความคล้ายอย่างเดียว: ถ้าน่าจะซ้ำ น่าจะเป็นการอัปเดต หรือน่าจะอยู่คนละโปรเจกต์ จะกลายเป็นรายการในคิว review และไม่ตั้ง kind ให้
 - **Jev (เลือกเปิด)** โมเดล Jev ของ TypeSafe ตอบคำถามแบบเลือกคำตอบพร้อมความน่าจะเป็น Alice ถามว่า memory ใหม่ซ้ำ, อัปเดต, ขัดแย้ง หรือไม่เกี่ยวกับเพื่อนบ้านที่ใกล้ที่สุดแต่ละอัน และ kind กับโปรเจกต์ไหนเหมาะ ถ้าถึง `judge.auto_apply_threshold` จะลงมือเลย ถ้าอยู่ระหว่างสองเกณฑ์จะเป็นรายการ review ต่ำกว่านั้นไม่ทำอะไร คำตอบถูก cache ตามคำขอ จำกัดอัตราการเรียก และงบรายวันถูกจองไว้ก่อนเรียกทุกครั้ง ยอดใช้ในวันจึงไม่เกิน `judge.daily_budget_usd` ถ้า Jev ล่ม งบหมด หรือโปรเจกต์นั้นไม่ได้รับอนุญาต heuristic จะตัดสินแทนและ memory จะถูกตัดสินใหม่ภายหลัง ปัญหาของ Judge ไม่เคยทำให้การเขียนล้มเหลว จากการประเมินแบบสังเคราะห์ใน [docs/benchmarks/m2-jev.md](docs/benchmarks/m2-jev.md) ค่าใช้จ่ายอยู่ที่ **$0.0113 ต่อ 1,000 การตัดสินใจ** (หนึ่งการตัดสินใจคือเทียบ memory หนึ่งคู่ ราคา input token $0.042 ต่อล้าน token) และ smoke test สดของการเทียบหนึ่งครั้งอยู่ที่ราว **$0.00004** การประเมินนั้น (216 คู่ที่เขียนขึ้นเพื่อการนี้ รันครั้งเดียว) ได้ความแม่นยำของ Jev ในการระบุความสัมพันธ์ 0.917 เทียบกับ heuristic 0.287 ควรอ่านข้อควรระวังในหน้านั้นก่อนเชื่อตัวเลขสำหรับการใช้งานจริง
 - **คิว review** `alice review` แสดงสิ่งที่ Alice ตัดสินเองไม่ได้ (supersede, contradiction, merge, predicate, project, undo) ส่วน `alice review show <id>` กับ `alice review resolve <id> <choice>` ใช้ตอบ รายการแบ่งหน้าได้ (`--page`) และบรรทัดท้ายบอกจำนวนที่ค้างทั้งหมดแยกตามประเภท (`--json` ให้ `{total, by_type, page, limit, items}`) ส่วน `alice review dismiss --type merge --all` ปิดทั้งประเภทในครั้งเดียวโดยไม่แก้ memory ใดๆ (กลุ่ม merge ที่ปิดไปแล้วจะไม่ถูกเสนออีก) job แนะนำการรวม (merge) รายสัปดาห์จะหยุดเสนอเมื่อมี merge ค้างครบ 50 รายการ และ `context` จะบอกให้ถามผู้ใช้เรื่อง review ก็ต่อเมื่อมีค้างไม่เกิน 10 รายการ
-- **ประวัติและ undo** ทุกการเปลี่ยนแปลงเป็น event: `alice history [id]` แสดงว่าใครเปลี่ยนอะไร `alice undo <event-id>` ย้อนกลับพร้อมกับการเปลี่ยนอื่นที่เกิดจากการกระทำเดียวกัน (เช่น merge หรือ supersede) ถ้าเป้าหมายเปลี่ยนไปแล้ว Alice จะเปิดรายการ review แทนการเขียนทับ การเปลี่ยนของ memory, fact และ predicate ย้อนได้ ส่วน memory ที่ถูก purge แล้วย้อนกลับมาไม่ได้
+- **ประวัติและ undo** ทุกการเปลี่ยนแปลงเป็น event: `alice history [id]` แสดงว่าใครเปลี่ยนอะไร `alice undo <event-id>` ย้อนกลับพร้อมกับการเปลี่ยนอื่นที่เกิดจากการกระทำเดียวกัน (เช่น merge หรือ supersede) ถ้าเป้าหมายเปลี่ยนไปแล้ว Alice จะเปิดรายการ review แทนการเขียนทับ การเปลี่ยนของ memory, fact, predicate และการรวมโปรเจกต์ (project merge) ย้อนได้ ส่วน memory ที่ถูก purge แล้วย้อนกลับมาไม่ได้
 
 ## Backup และ restore
 
@@ -425,6 +425,86 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 | physical footprint สูงสุด | | 511MB | 585MB |
 
 ตอนจบ M1 หน่วยความจำยังไม่ผ่านเป้า (คาดว่าราว 1.4GB เมื่อรวมโมเดล) M2 ทำให้ผ่านได้: vector ของ chunk ย้ายไปอยู่ใน index แบบ sign-bit ขนาด 53MB (กราฟ int8 เดิมใช้ 508MB) และโมเดล embedding รันบน ONNX Runtime โดยตรง (โหลดแล้วราว 350MB แทนที่จะเป็น 600MB) รอบ 1M chunk เติม index ด้วย vector สังเคราะห์ที่ใช้ id ของโมเดลจริง (การ embed ล้านชิ้นใช้เวลาหลายชั่วโมง และ vector กินที่ใน index เท่ากันไม่ว่าค่าข้างในจะเป็นอะไร) แล้วเปิด daemon จริงที่โหลดโมเดลจริง embed memory ใหม่ 256 อัน และรับ recall พร้อมกัน 64 คำขอ 4 ชุด (ไม่มี error) คุณภาพการค้นไม่ตก: ชุด gold ยังได้ MRR 1.000 โดยทั้ง 13 คำถามอยู่ใน top 3 และ recall@10 ของ chunk index เทียบกับ top 10 ที่แท้จริงอยู่ที่ 0.99 กับ passage จริง 96,000 ชิ้น
+
+## ใช้ Alice ผ่านเซิร์ฟเวอร์
+
+ทีมเล็ก ๆ ใช้เซิร์ฟเวอร์ Linux เครื่องเดียวร่วมกันได้ แต่ละคนมี Alice daemon ของตัวเองที่ `https://<host>/u/<name>` และ agent (Claude Code, Codex ฯลฯ) เชื่อมต่อกับ MCP endpoint `https://<host>/u/<name>/mcp` ได้โดยตรงด้วย bearer token ไม่ต้องติดตั้งโปรแกรมฝั่งผู้ใช้ จึงใช้บน Windows ได้ด้วย และมี "ความจำส่วนกลาง" ของทีมให้เลือกใช้: สั่ง agent ว่า "บันทึกลงความจำส่วนกลางด้วย" ทุกคนในทีมอ่านได้ แต่เจ้าของเรื่องหรือแอดมินเท่านั้นที่แก้ได้ แอดมินของเซิร์ฟเวอร์อ่านความจำของทุกคนได้ และไฟล์ `.alice.toml` ของ repo ไม่มีผลเมื่อเชื่อมต่อ MCP ตรง เซิร์ฟเวอร์ต้องใช้ CPU x86-64 ที่มี AVX (ไม่ต้องมี AVX2 เพราะ `deploy/server/build-release` สร้างโปรแกรมฝั่งเซิร์ฟเวอร์ด้วย ONNX Runtime ของ Microsoft)
+
+คู่มือฉบับเต็มอยู่ที่ [docs/server.md](docs/server.md) (ภาษาอังกฤษ) ด้านล่างเป็นสรุปภาษาไทยในลำดับเดียวกัน
+
+### สำหรับแอดมิน
+
+1. ตั้งค่าครั้งแรก: เขียน `ALICE_PUBLIC_HOST=<host>` ลง `/etc/alice/server.env` แล้วติดตั้งสคริปต์ `deploy/server/alice-server` ไว้ที่ `/usr/local/sbin/alice-server` สคริปต์จัดการ Caddyfile เอง และเก็บไฟล์เดิมไว้เป็น `/etc/caddy/Caddyfile.pre-alice`
+2. คำสั่ง:
+
+   ```
+   alice-server add <name> [--tz <zone>]   # สร้างผู้ใช้ใหม่ แสดง URL และ token ครั้งเดียว (เขตเวลา ค่าเริ่มต้น Asia/Bangkok ใช้ตอน import)
+   alice-server add --team team            # สร้างความจำส่วนกลาง (ไม่มี URL ของตัวเอง)
+   alice-server remove <name> [--yes]      # เก็บ archive แล้วลบ
+   alice-server rotate <name>              # ออก token ใหม่
+   alice-server list                       # รายชื่อ สถานะ พื้นที่ดิสก์
+   alice-server upgrade <binary>           # อัปเกรดทุกคน ย้อนกลับเองถ้าไม่ขึ้น
+   alice-server import <name> <palace-dir> [--dry-run]
+   alice-server adopt <name> <backup-file>  # ย้ายฐานข้อมูล Alice ในเครื่องของคนนั้น (จาก alice backup now) ขึ้น tenant ใหม่
+   alice-server cli <name> <คำสั่ง alice…>
+   ```
+
+3. CPU ต้องมี AVX (ไม่ต้องมี AVX2) บน Proxmox ให้ตั้งชนิด CPU ของ VM เป็น `host` แล้ว **ปิด VM แล้วเปิดใหม่** การ reboot จากในเครื่องไม่ทำให้ค่านี้มีผล `alice-server` ตรวจเรื่องนี้ก่อน `add` และ `upgrade` สร้างโปรแกรมบนเซิร์ฟเวอร์ด้วย `deploy/server/build-release` (รันเป็นผู้ใช้แอดมิน ไม่ใช่ root) แล้วติดตั้งด้วย `sudo alice-server upgrade target/server-dist/bin/alice` ซึ่งเป็นการติดตั้งครั้งแรกด้วย ก่อนติดตั้ง `upgrade` จะให้โปรแกรมใหม่ลองสร้าง embedding หนึ่งข้อความ ถ้าไม่ผ่านจะไม่ติดตั้งอะไรเลย
+4. การ import: คนที่ไม่มีโปรแกรม `alice` ส่ง palace ให้แอดมิน แอดมินรัน `alice-server import <name> <palace-dir>` (ลอง `--dry-run` ก่อนได้ ซึ่งทำงานบนสำเนาและไม่แตะโฟลเดอร์เดิม) การ import จริงจะ **ย้ายและใช้โฟลเดอร์นั้นหมด** และลบสำเนาในเซิร์ฟเวอร์เมื่อจบงาน
+5. key ของ Jev: เซิร์ฟเวอร์นี้ใช้ key ของเจ้าของเพียงอันเดียวให้ทุกคน ใช้ `sudo alice-server jev-key set` แล้ววาง key เมื่อถูกถาม (ไม่แสดงบนจอ) หรือส่งผ่าน stdin ห้ามใส่ key เป็นอาร์กิวเมนต์ ทุก tenant (รวม team) ได้ key และ `judge.provider = jev` ทันที คนที่เพิ่มทีหลังก็ได้ด้วย สั่งซ้ำเพื่อเปลี่ยน key ทุกที่ `jev-key status` บอกว่าใครมี key แต่ไม่แสดง key ไฟล์ของแต่ละ tenant ตรึง endpoint ของ Jev และงบ `ALICE_JUDGE_DAILY_BUDGET_USD` (ค่าเริ่มต้น 1 USD ต่อวันต่อคน) ผู้ใช้จึงส่ง key ไปที่อื่นหรือเพิ่มงบเองไม่ได้ และเห็นแค่ว่า key ตั้งไว้แล้ว
+6. ความเป็นส่วนตัว: เซิร์ฟเวอร์ปิดบัง secret (redact) เสมอ `.alice.toml` ของ repo ไม่มีผลทาง MCP ตรง การห้ามส่งโปรเจกต์ขึ้น cloud ตั้งที่รายการ `privacy.cloud_denied_projects` ของผู้ใช้ เช่น `alice-server cli <name> config set privacy.cloud_denied_projects '["my-secret-app"]'`
+7. ดิสก์: แต่ละคนมี backup ตามกำหนด 2 ชุด (ทำเองไม่ได้) `alice-server list` เตือนเมื่อพื้นที่ว่างต่ำกว่า 3 GB ให้ลบ archive เก่าของ `remove` หรือตั้ง `ALICE_BACKUP_DAILY=1` ในไฟล์ของผู้ใช้นั้นแล้วรีสตาร์ท การเก็บสำเนานอกเครื่องเป็นหน้าที่ของแอดมิน
+8. ไม่แบนตาม IP เพราะ NAT ทำให้ทุกการเชื่อมต่อมาจาก IP เดียว ตัวอย่าง filter fail2ban (ปิดไว้) อยู่ใน `docs/server.md` สำหรับแอดมินที่ NAT ส่งต่อ IP จริง
+
+### สำหรับผู้ใช้
+
+เก็บ token ไว้ในตัวแปรสภาพแวดล้อม `ALICE_TOKEN` ห้ามใส่ใน URL หรือ commit ลง repo
+
+- **Claude Code:** สร้าง `.mcp.json` ใน repo (ไม่มี secret จึง commit ได้):
+
+  ```json
+  {
+    "mcpServers": {
+      "alice": {
+        "type": "http",
+        "url": "${ALICE_URL}?project=<slug>",
+        "headers": { "Authorization": "Bearer ${ALICE_TOKEN}" }
+      }
+    }
+  }
+  ```
+
+  หรือใช้คำสั่ง (ใส่เครื่องหมายคำพูดเดี่ยวเพื่อไม่ให้ shell แทนค่า token):
+
+  ```bash
+  claude mcp add --transport http --scope project alice \
+    'https://<host>/u/<name>/mcp?project=<slug>' \
+    --header 'Authorization: Bearer ${ALICE_TOKEN}'
+  ```
+
+- **Codex** (`~/.codex/config.toml`):
+
+  ```toml
+  [mcp_servers.alice]
+  url = "https://<host>/u/<name>/mcp"
+  bearer_token_env_var = "ALICE_TOKEN"
+  ```
+
+- **โปรเจกต์ที่ใช้:** ลำดับคือ argument `project` ของ tool, แล้ว `?project=<slug>` ใน URL (ยาวไม่เกิน 100 ตัวอักษร), แล้วชื่อโฟลเดอร์ของ root แรกที่ agent ส่งมา, สุดท้ายคือ `global`
+- **ความจำส่วนกลาง:** บอก agent ว่า "บันทึกอันนี้ลงความจำส่วนกลางด้วย" ความจำนั้นไปอยู่ที่ส่วนกลางที่เดียว ไม่มีสำเนาส่วนตัว ทุกคนอ่านได้ ผลค้นหาของ `recall` และ `context` จะรวมความจำส่วนกลางและบอกชื่อเจ้าของ แก้ ลบ หรือ undo ได้เฉพาะเรื่องที่ตัวเองเขียน (หรือผ่านแอดมิน) ถ้าส่วนกลางไม่ตอบ การบันทึกส่วนกลางจะล้มเหลวโดยบอกชัดเจน และการค้นหาจะได้ผลส่วนตัวพร้อมหมายเหตุ ส่วนกลางไม่มี URL ของตัวเอง
+- **โมเดลตัดสิน (judge) กับความจำส่วนกลาง:** ในโหมด precise ความจำส่วนกลางจะถูกส่งให้ judge ของคุณให้คะแนนก็ต่อเมื่อนโยบาย cloud ของส่วนกลางสำหรับโปรเจกต์นั้น **และ** นโยบาย cloud ของคุณสำหรับโปรเจกต์นั้นอนุญาตทั้งคู่ ถ้าฝ่ายใดห้าม จะไม่ถูกส่งให้ judge เลย และจะแสดงต่อท้ายผลที่ให้คะแนนแล้ว
+- **Jev และการตั้งค่า:** ขอให้แอดมินรัน `alice-server cli` ให้ (ดูด้านบน) ส่ง key ผ่านช่องทางส่วนตัวเท่านั้น
+- **Import MemPalace:** ส่งโฟลเดอร์ palace ให้แอดมินเป็นคนรัน `alice-server import`
+- **แพลตฟอร์ม:** โปรแกรม `alice` ใช้ได้บน macOS และ Linux ส่วน Windows หรือเครื่องที่ไม่มีโปรแกรม ให้เชื่อม agent เข้ากับ MCP endpoint ของเซิร์ฟเวอร์
+
+### ข้อควรรู้
+
+- **ความต้องการของเซิร์ฟเวอร์:** CPU x86-64 ที่มี AVX (บน Xeon E5-2620 4 vCPU ทำ embedding ได้ราว 5.5 chunk ต่อวินาที palace ขนาด 121,000 chunk ใช้เวลาราว 6 ชั่วโมง) แต่ละ daemon จำกัดหน่วยความจำที่ 3 GB (ใช้จริงราว 800 MB) และควรมีพื้นที่ดิสก์ว่างอย่างน้อย 3 GB รายละเอียดอยู่ในหัวข้อ Requirements และ Disk budget ของ [docs/server.md](docs/server.md)
+- **สิ่งที่ผู้ใช้แต่ละคนเปลี่ยนเองไม่ได้:** โฟลเดอร์ข้อมูล พอร์ต ตำแหน่งและรอบของ backup, ที่เก็บ secret และสวิตช์ปกปิด secret (เปิดตลอด) นอกจากนี้ daemon ของผู้ใช้เข้าถึงเครือข่ายภายใน (LAN) ของแอดมินไม่ได้ และปฏิเสธค่าตั้งที่ชี้ไปยังที่อยู่ภายในหรือ loopback
+- **ความจำส่วนกลาง:** ผู้เขียนหรือแอดมินเท่านั้นที่แก้หรือลบความจำส่วนกลางได้
+- **ปัญหาที่พบบ่อย:** ข้อความที่เจอพร้อมวิธีแก้อยู่ในตาราง Troubleshooting ของ [docs/server.md](docs/server.md) (ภาษาอังกฤษ)
+
+แอดมินอ่านความจำและ key ของทุกคนได้ อย่าเก็บสิ่งที่ไม่อยากให้แอดมินเห็นไว้ใน Alice
 
 ## Roadmap
 

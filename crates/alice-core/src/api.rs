@@ -1,5 +1,6 @@
 //! Request and response types shared by the HTTP API, MCP tools and the CLI.
 
+use crate::error::{AliceError, Result};
 use crate::kg_types::*;
 use crate::model::{Author, Kind, Memory, Status};
 use crate::settings::{KeyInfo, SettingError, Source};
@@ -84,6 +85,16 @@ pub struct RecallRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub cwd: Option<String>,
+    /// Server mode: the project the remote client detected (spec §4.1). Wins over `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub client_project: Option<ClientProject>,
+    /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
+    /// by the MCP handlers; the HTTP API clears it on entry, so it never comes from the wire.
+    /// It is serialised so that a spooled request keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub project_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -107,6 +118,16 @@ pub struct Hit {
     pub matched: Vec<MatchVia>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<Status>,
+    /// `team` for a hit that came from the shared team memory; absent for a personal one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The tenant that wrote a team hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// Set by a team store on the hits it returns: whether the cloud policy lets this hit's
+    /// project be sent to a model. `Some(false)` on any doubt; absent outside the team store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_ok: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -143,6 +164,76 @@ pub struct RecallResponse {
     pub notes: Vec<String>,
 }
 
+/// Largest `.alice.toml` a remote client may send (spec §4.1).
+pub const CLIENT_RULES_MAX_BYTES: usize = 64 * 1024;
+
+/// The project a remote client detected for its working directory, with that working tree's
+/// privacy rules as the client read them (server mode, spec §3.3 and §4.1). A server uses it
+/// instead of running git on a path it does not have.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientProject {
+    /// `ProjectRef::key` as detected on the client (a normalized remote, or `path:<dir>`).
+    pub key: String,
+    pub slug: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    pub rules: ClientRules,
+}
+
+/// The working tree's `.alice.toml`, as the client found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ClientRules {
+    /// The working tree has no `.alice.toml`.
+    None,
+    /// Its content, at most [`CLIENT_RULES_MAX_BYTES`].
+    File { text: String },
+    /// It exists but could not be read; the rules fail closed.
+    Unreadable { reason: String },
+}
+
+impl ClientProject {
+    /// The limits of spec §4.1. A refusal names the field, never the value.
+    pub fn validate(&self) -> Result<()> {
+        let bad = |what: &str| {
+            Err(AliceError::invalid(format!(
+                "client_project.{what}; update the alice client, or report it if it is current"
+            )))
+        };
+        if self.key.is_empty() || self.key.len() > 1024 {
+            return bad("key must be 1 to 1024 bytes");
+        }
+        if self.key.chars().any(char::is_control) {
+            return bad("key must not contain control characters");
+        }
+        if self.key == "global" {
+            return bad("key must not be \"global\" (send no client_project for global)");
+        }
+        if self.slug.is_empty() || crate::normalize::slugify(&self.slug) != self.slug {
+            return bad("slug must be a non-empty slug (lower case, digits and -)");
+        }
+        if self.slug.chars().count() > crate::model::limits::MAX_PROJECT_SLUG_CHARS {
+            return bad("slug must be at most 100 characters");
+        }
+        if self.name.chars().count() > crate::model::limits::MAX_PROJECT_NAME_CHARS {
+            return bad("name must be at most 200 characters");
+        }
+        if self.remote.as_ref().is_some_and(|r| r.len() > 1024) {
+            return bad("remote must be at most 1024 bytes");
+        }
+        match &self.rules {
+            ClientRules::File { text } if text.len() > CLIENT_RULES_MAX_BYTES => {
+                bad("rules.text must be at most 64 KiB")
+            }
+            ClientRules::Unreadable { reason } if reason.chars().count() > 500 => {
+                bad("rules.reason must be at most 500 characters")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Save a memory: a decision, fix, fact, how-to, preference, warning or handoff worth keeping.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct RememberRequest {
@@ -169,6 +260,22 @@ pub struct RememberRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub cwd: Option<String>,
+    /// Server mode: the project the remote client detected (spec §4.1). Wins over `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub client_project: Option<ClientProject>,
+    /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
+    /// by the MCP handlers; the HTTP API clears it on entry, so it never comes from the wire.
+    /// It is serialised so that a spooled request keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub project_hint: Option<String>,
+    /// Set only when the user explicitly asks to save this to the shared, team or central memory
+    /// ("ความจำส่วนกลาง", "for the team"). A shared memory is kept only in the team store and is
+    /// visible to every team member; only its author or the admin can change it later. Leave
+    /// it unset for anything personal.
+    #[serde(default)]
+    pub shared: bool,
     #[serde(default)]
     #[schemars(skip)]
     pub author: Author,
@@ -191,6 +298,9 @@ pub struct RememberResponse {
     /// Only for `spooled`: why the request was queued and when it will be saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// True when the memory went to the team store (its id then starts with `team:`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared: bool,
 }
 
 /// Briefing for the current project: key memories, warnings, recent decisions, last handoff, preferences.
@@ -204,6 +314,16 @@ pub struct ContextRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub cwd: Option<String>,
+    /// Server mode: the project the remote client detected (spec §4.1). Wins over `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub client_project: Option<ClientProject>,
+    /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
+    /// by the MCP handlers; the HTTP API clears it on entry, so it never comes from the wire.
+    /// It is serialised so that a spooled request keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub project_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -236,6 +356,12 @@ pub struct MemoryFull {
     /// Set on `update` answers: the event that recorded the change (pass it to `undo`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
+    /// `team` for a memory read from the team store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// For a team memory: the tenant that wrote it (the `<tenant>` part of its author).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -440,6 +566,16 @@ pub struct IngestRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub cwd: Option<String>,
+    /// Server mode: the project the remote client detected (spec §4.1). Wins over `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub client_project: Option<ClientProject>,
+    /// Server mode: a project name a direct MCP caller gave (tenant mode only). Set in-process
+    /// by the MCP handlers; the HTTP API clears it on entry, so it never comes from the wire.
+    /// It is serialised so that a spooled request keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub project_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -513,6 +649,9 @@ pub struct Health {
     /// be missing a privacy setting; cloud providers are off meanwhile.
     #[serde(default, skip_serializing_if = "is_false")]
     pub config_degraded: bool,
+    /// Why the link to the team store is off or failing (server mode); never the token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_warning: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -648,6 +787,104 @@ mod tests {
     use crate::store::memories::UpdateAction;
 
     #[test]
+    fn remember_request_schema_keeps_its_description() {
+        let v = serde_json::to_value(schemars::schema_for!(RememberRequest)).unwrap();
+        let d = v["description"].as_str().unwrap_or("");
+        assert!(d.contains("Save a memory"), "description: {d:?}");
+    }
+
+    fn cp(key: &str, slug: &str) -> ClientProject {
+        ClientProject {
+            key: key.into(),
+            slug: slug.into(),
+            name: slug.into(),
+            remote: None,
+            rules: ClientRules::None,
+        }
+    }
+
+    #[test]
+    fn client_project_round_trips_in_the_documented_shape() {
+        let p = ClientProject {
+            key: "github.com/icueth/alice".into(),
+            slug: "alice".into(),
+            name: "alice".into(),
+            remote: Some("github.com/icueth/alice".into()),
+            rules: ClientRules::File {
+                text: "[privacy]\ncloud_denied = true\n".into(),
+            },
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["rules"]["state"], "file");
+        assert_eq!(v["rules"]["text"], "[privacy]\ncloud_denied = true\n");
+        let back: ClientProject = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+        let none: ClientRules = serde_json::from_str(r#"{"state":"none"}"#).unwrap();
+        assert_eq!(none, ClientRules::None);
+        let bad: ClientRules =
+            serde_json::from_str(r#"{"state":"unreadable","reason":"permission denied"}"#).unwrap();
+        assert_eq!(
+            bad,
+            ClientRules::Unreadable {
+                reason: "permission denied".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_request_without_client_project_serialises_as_before() {
+        let r = RememberRequest {
+            content: "x".into(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("client_project").is_none());
+        let r: RecallRequest = serde_json::from_str(r#"{"query":"q"}"#).unwrap();
+        assert!(r.client_project.is_none());
+    }
+
+    #[test]
+    fn client_project_validation_refuses_what_the_spec_refuses() {
+        assert!(cp("github.com/a/b", "b").validate().is_ok());
+        let long = "k".repeat(1025);
+        for (case, p) in [
+            ("empty key", cp("", "b")),
+            ("global key", cp("global", "b")),
+            ("long key", cp(&long, "b")),
+            ("control char in key", cp("a\u{7}b", "b")),
+            ("empty slug", cp("k", "")),
+            ("slug not slugified", cp("k", "My Repo")),
+        ] {
+            let e = p.validate().unwrap_err().to_string();
+            assert!(
+                !e.contains("My Repo") && !e.contains(&long),
+                "{case}: echoed: {e}"
+            );
+        }
+        let mut p = cp("k", "b");
+        p.name = "n".repeat(201);
+        assert!(p.validate().is_err(), "long name");
+        let slug100 = "s".repeat(100);
+        assert!(cp("k", &slug100).validate().is_ok(), "a 100-character slug");
+        let slug101 = "s".repeat(101);
+        let e = cp("k", &slug101).validate().unwrap_err().to_string();
+        assert!(!e.contains(&slug101), "echoed: {e}");
+        let mut p = cp("k", "b");
+        p.remote = Some("r".repeat(1025));
+        assert!(p.validate().is_err(), "long remote");
+        let mut p = cp("k", "b");
+        p.rules = ClientRules::File {
+            text: "#".repeat(CLIENT_RULES_MAX_BYTES + 1),
+        };
+        assert!(p.validate().is_err(), "large rules");
+        let mut p = cp("k", "b");
+        p.rules = ClientRules::Unreadable {
+            reason: "r".repeat(501),
+        };
+        assert!(p.validate().is_err(), "long reason");
+    }
+
+    #[test]
     fn requests_need_only_their_required_fields() {
         let r: RecallRequest = serde_json::from_str(r#"{"query":"lease"}"#).unwrap();
         assert_eq!(r.query, "lease");
@@ -726,6 +963,8 @@ mod tests {
             links: Vec::new(),
             provenance: Vec::new(),
             event_id: None,
+            source: None,
+            author_name: None,
         };
         assert!(
             serde_json::to_value(&full)
@@ -807,6 +1046,9 @@ mod tests {
             relevance: None,
             matched: vec![MatchVia::Words],
             status: None,
+            source: None,
+            author: None,
+            cloud_ok: None,
         };
         let v = serde_json::to_value(&hit).unwrap();
         assert!(v.get("body").is_none() && v.get("status").is_none());

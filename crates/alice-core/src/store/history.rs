@@ -420,6 +420,9 @@ fn undoable(action: &str) -> bool {
             | "import.batch"
             | "import.compat_enabled"
             | "memory.purge"
+            // A raw chunk redacted when a database was adopted onto a server (`alice adopt`):
+            // the text before held the secret.
+            | "chunk.redact"
             | "raw.retention"
             | "settings.change"
             | "secret.set"

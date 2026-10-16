@@ -48,6 +48,12 @@ pub const NON_SETTING_ENV: &[&str] = &[
     "ALICE_SERVICE_ROOT",
     "ALICE_SERVICE_FAIL",
     "ALICE_EMBEDDING_API_KEY",
+    // Server mode: the remote server a client talks to, and its token (both or neither).
+    "ALICE_REMOTE_URL",
+    "ALICE_REMOTE_TOKEN",
+    // Server mode, shared team memory: the team store's loopback URL and this tenant's name.
+    "ALICE_TEAM_URL",
+    "ALICE_TENANT_NAME",
 ];
 
 /// The model the `local` embedding provider runs (`alice_embed::MODEL_ID`; `alice-core` does
@@ -286,6 +292,8 @@ pub struct Settings {
     pub secrets: SecretsSettings,
     /// Background jobs that keep the store tidy.
     pub maintenance: MaintenanceSettings,
+    /// Importing from other memory systems.
+    pub import: ImportSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
@@ -674,6 +682,26 @@ impl Default for BackupSettings {
             daily: 7,
             weekly: 4,
             dir: None,
+        }
+    }
+}
+
+/// Importing a MemPalace palace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImportSettings {
+    /// Largest palace archive a server tenant may upload (`POST /api/v1/import/upload`), in
+    /// bytes. The server's web front applies the same limit.
+    pub max_upload_bytes: u64,
+}
+
+/// The default of [`ImportSettings::max_upload_bytes`]: 4 GiB.
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+impl Default for ImportSettings {
+    fn default() -> Self {
+        Self {
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
         }
     }
 }
@@ -1600,6 +1628,10 @@ impl Settings {
             ));
         }
 
+        if self.import.max_upload_bytes < 1 {
+            e.push(err("import.max_upload_bytes", "must be at least 1"));
+        }
+
         let mt = &self.maintenance;
         if mt.idle_secs < 5 {
             e.push(err("maintenance.idle_secs", "must be at least 5"));
@@ -1615,6 +1647,173 @@ impl Settings {
         }
         e
     }
+}
+
+/// Whether `host` names this machine, a private network or a link-local address: what a
+/// server tenant's settings must not point at (spec R18). Names other than `localhost` are not
+/// resolved here; the unit's `IPAddressDeny` covers a public name that resolves privately.
+pub fn host_is_private(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let h = h.strip_suffix('.').unwrap_or(h);
+    if domain_is_localhost(h) {
+        return true;
+    }
+    h.parse::<std::net::IpAddr>().is_ok_and(ip_is_private)
+}
+
+fn domain_is_localhost(d: &str) -> bool {
+    let d = d.to_ascii_lowercase();
+    let d = d.strip_suffix('.').unwrap_or(&d);
+    d == "localhost" || d.ends_with(".localhost")
+}
+
+fn ip_is_private(ip: std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr};
+    let v4 = |a: Ipv4Addr| {
+        let o = a.octets();
+        a.is_loopback()
+            || a.is_private()
+            || a.is_link_local()
+            || a.is_unspecified()
+            || a.is_broadcast()
+            || (o[0] == 100 && (64..128).contains(&o[1]))
+    };
+    match ip {
+        IpAddr::V4(a) => v4(a),
+        IpAddr::V6(a) => {
+            // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) forms.
+            if let Some(m) = a.to_ipv4_mapped() {
+                return v4(m);
+            }
+            let s = a.segments()[0];
+            a.is_loopback()
+                || a.is_unspecified()
+                || (s & 0xfe00) == 0xfc00
+                || (s & 0xffc0) == 0xfe80
+                || (a.segments()[..6].iter().all(|&x| x == 0) && a.to_ipv4().is_some_and(v4))
+        }
+    }
+}
+
+/// `p` (relative to `home` when relative) resolves inside `home`, symlinks included.
+fn resolves_inside(home: &Path, p: &str) -> bool {
+    use std::path::Component;
+    let joined = home.join(p);
+    let mut lexical = std::path::PathBuf::new();
+    for c in joined.components() {
+        match c {
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            Component::CurDir => {}
+            other => lexical.push(other),
+        }
+    }
+    // Canonicalize the longest existing ancestor, then add the rest back.
+    let mut existing = lexical.clone();
+    let mut rest = Vec::new();
+    while std::fs::symlink_metadata(&existing).is_err() {
+        match (
+            existing.file_name().map(|n| n.to_owned()),
+            existing.parent(),
+        ) {
+            (Some(n), Some(parent)) => {
+                rest.push(n);
+                existing = parent.to_path_buf();
+            }
+            _ => return false,
+        }
+    }
+    let Ok(mut real) = existing.canonicalize() else {
+        return false;
+    };
+    for n in rest.into_iter().rev() {
+        real.push(n);
+    }
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    real.starts_with(&home)
+}
+
+fn check_tenant_endpoint(e: &mut Vec<SettingError>, key: &str, url: &str) {
+    use url::Host;
+    // Parse as the HTTP client does, so `127.1`, `2130706433` and `0x7f.0.0.1` are seen as
+    // the loopback addresses they are.
+    let public = url::Url::parse(url.trim())
+        .ok()
+        .filter(|u| u.scheme() == "https")
+        .and_then(|u| match u.host() {
+            Some(Host::Ipv4(a)) => Some(!ip_is_private(a.into())),
+            Some(Host::Ipv6(a)) => Some(!ip_is_private(a.into())),
+            Some(Host::Domain(d)) => Some(!domain_is_localhost(d)),
+            None => None,
+        })
+        .unwrap_or(false);
+    if !public {
+        e.push(err(
+            key,
+            "on a server tenant this must be an https:// URL of a public host (not localhost, a private network or a link-local address)",
+        ));
+    }
+}
+
+/// The extra rules a server tenant's settings follow (spec §2.2 item 6, R18): no path outside
+/// `home`, no URL into the machine or the LAN, nothing the server's admin owns.
+/// `port_from_file`: `server.port` is set in `config.toml` rather than only in the environment.
+pub fn validate_tenant(s: &Settings, home: &Path, port_from_file: bool) -> Vec<SettingError> {
+    let mut e = Vec::new();
+    // `~` is refused rather than checked: the daemon expands it to `$HOME`, which this check
+    // cannot see.
+    if let Some(dir) = s.backup.dir.as_deref().filter(|d| !d.trim().is_empty())
+        && (dir.trim_start().starts_with('~')
+            || Path::new(dir)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            || !resolves_inside(home, dir))
+    {
+        e.push(err(
+            "backup.dir",
+            "on a server tenant this must be a directory inside the tenant's data directory, written without `..` or `~`",
+        ));
+    }
+    if s.embedding.provider == EmbeddingProvider::Ollama {
+        e.push(err(
+            "embedding.provider",
+            "ollama is not available on a server tenant (it runs on this machine or the LAN); use local, openai or voyage",
+        ));
+    }
+    if let Some(url) = s.embedding.endpoint.as_deref() {
+        check_tenant_endpoint(&mut e, "embedding.endpoint", url);
+    }
+    check_tenant_endpoint(&mut e, "judge.jev.endpoint", &s.judge.jev.endpoint);
+    if s.sync
+        .remote
+        .as_deref()
+        .is_some_and(|r| !r.trim().is_empty())
+    {
+        e.push(err(
+            "sync.remote",
+            "sync is not available on a server tenant yet",
+        ));
+    }
+    if port_from_file && s.server.port != 0 {
+        e.push(err(
+            "server.port",
+            "the server's admin sets the port of a server tenant",
+        ));
+    }
+    if !s.privacy.redact {
+        e.push(err(
+            "privacy.redact",
+            "a server tenant always redacts secrets before storing them",
+        ));
+    }
+    if s.secrets.backend == SecretsBackend::Keychain {
+        e.push(err(
+            "secrets.backend",
+            "a server tenant keeps its keys in secrets.toml (\"file\"); there is no keychain on the server",
+        ));
+    }
+    e
 }
 
 // ---------------------------------------------------------------- editing config.toml
@@ -2037,7 +2236,30 @@ fn read_project_text(path: &Path) -> Result<Option<String>, SettingError> {
     }
 }
 
-fn parse_project(name: &str, text: &str) -> Result<ProjectSettings, SettingError> {
+/// The first line of a server-side mirror whose client could not read the project's
+/// `.alice.toml` (server mode, spec §2.2 item 3). [`parse_project`] refuses it, so the rules fail closed.
+pub const UNREADABLE_MARKER: &str = "# alice: the client could not read .alice.toml";
+
+/// The one-line mirror text for an unreadable project file; `reason` is flattened to one line.
+pub fn unreadable_marker_text(reason: &str) -> String {
+    let reason: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(500)
+        .collect();
+    format!("{UNREADABLE_MARKER} ({})\n", reason.trim())
+}
+
+pub fn parse_project(name: &str, text: &str) -> Result<ProjectSettings, SettingError> {
+    if let Some(rest) = text.strip_prefix(UNREADABLE_MARKER) {
+        let why = rest.lines().next().unwrap_or("").trim();
+        return Err(err(
+            name,
+            format!(
+                "the client could not read this project's .alice.toml {why}; its rules fail closed until the client can read it"
+            ),
+        ));
+    }
     let p: ProjectSettings = toml::from_str(text).map_err(|e| {
         err(
             name,
@@ -2531,6 +2753,40 @@ pub fn write_private(target: &Path, text: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_unreadable_marker_fails_with_a_clear_message() {
+        let text = unreadable_marker_text("permission denied\nsecond line");
+        assert!(text.starts_with(UNREADABLE_MARKER));
+        assert_eq!(text.lines().count(), 1, "one line: {text:?}");
+        let e = parse_project("/srv/x/.alice.toml", &text).unwrap_err();
+        assert!(
+            e.message
+                .contains("the client could not read this project's .alice.toml"),
+            "{}",
+            e.message
+        );
+        assert!(e.message.contains("permission denied"), "{}", e.message);
+        // Ordinary text still parses.
+        assert!(
+            parse_project("f", "[privacy]\ncloud_denied = true\n")
+                .unwrap()
+                .privacy
+                .cloud_denied
+        );
+    }
+
+    #[test]
+    fn the_remote_variables_are_not_settings() {
+        for v in [
+            "ALICE_REMOTE_URL",
+            "ALICE_REMOTE_TOKEN",
+            "ALICE_TEAM_URL",
+            "ALICE_TENANT_NAME",
+        ] {
+            assert!(NON_SETTING_ENV.contains(&v), "{v}");
+        }
+    }
+
     /// N-1: an absurd age is refused (it once overflowed into "zero" and deleted everything).
     #[test]
     fn a_retention_longer_than_a_hundred_years_is_refused() {
@@ -2589,6 +2845,20 @@ mod tests {
         assert_eq!((s.backup.daily, s.backup.weekly), (7, 4));
         assert_eq!(s.secrets.backend, SecretsBackend::File);
         assert!(!s.mcp.admin_tools);
+    }
+
+    #[test]
+    fn the_upload_limit_defaults_to_4_gib_and_must_be_positive() {
+        let r = resolve(None, &[]).unwrap();
+        assert_eq!(r.settings.import.max_upload_bytes, 4 * 1024 * 1024 * 1024);
+        let r = resolve(Some("[import]\nmax_upload_bytes = 1000\n"), &[]).unwrap();
+        assert_eq!(r.settings.import.max_upload_bytes, 1000);
+        let from_env = resolve(None, &env(&[("ALICE_IMPORT_MAX_UPLOAD_BYTES", "2048")])).unwrap();
+        assert_eq!(from_env.settings.import.max_upload_bytes, 2048);
+        assert_eq!(
+            error_keys("[import]\nmax_upload_bytes = 0\n", &[]),
+            vec!["import.max_upload_bytes".to_string()]
+        );
     }
 
     /// Task 21: `search.default_mode` is `auto` (the default), `fast` or `precise`; anything
@@ -4359,5 +4629,167 @@ custom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]+\" }]
             errs.iter().any(|e| e.key == "search.relevance_sure"),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn private_hosts_are_recognised() {
+        for h in [
+            "localhost",
+            "LOCALHOST",
+            "x.localhost",
+            "127.0.0.1",
+            "127.1.2.3",
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.1",
+            "192.168.1.99",
+            "169.254.1.1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "[::1]",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "::ffff:192.168.1.1",
+        ] {
+            assert!(host_is_private(h), "{h}");
+        }
+        for h in [
+            "api.typesafe.ai",
+            "8.8.8.8",
+            "172.32.0.1",
+            "100.128.0.1",
+            "2001:4860::8888",
+            "203.0.113.7",
+        ] {
+            assert!(!host_is_private(h), "{h}");
+        }
+    }
+
+    fn tenant_errors(toml: &str, home: &Path, port_from_file: bool) -> Vec<String> {
+        let r = resolve(Some(toml), &[]).unwrap();
+        validate_tenant(&r.settings, home, port_from_file)
+            .into_iter()
+            .map(|e| e.key)
+            .collect()
+    }
+
+    #[test]
+    fn tenant_rules_refuse_each_row_of_the_table_and_allow_good_values() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let outside = d.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, home.join("escape")).unwrap();
+        let refused = [
+            (format!("[backup]\ndir = \"{}\"\n", outside.display()), "backup.dir"),
+            ("[backup]\ndir = \"../outside\"\n".to_string(), "backup.dir"),
+            ("[backup]\ndir = \"~/backups\"\n".to_string(), "backup.dir"),
+            ("[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"https://192.168.1.99/v1\"\n".into(), "embedding.endpoint"),
+            ("[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"http://127.0.0.1:2019/v1\"\n".into(), "embedding.endpoint"),
+            ("[embedding]\nprovider = \"ollama\"\nmodel = \"m\"\n".into(), "embedding.provider"),
+            ("[judge.jev]\nendpoint = \"http://localhost:9/v1\"\n".into(), "judge.jev.endpoint"),
+            ("[judge.jev]\nendpoint = \"https://[fe80::1]/v1\"\n".into(), "judge.jev.endpoint"),
+            ("[sync]\nremote = \"git@192.168.1.5:me/mem.git\"\n".into(), "sync.remote"),
+            ("[secrets]\nbackend = \"keychain\"\n".into(), "secrets.backend"),
+            ("[privacy]\nredact = false\n".into(), "privacy.redact"),
+        ];
+        for (toml, key) in &refused {
+            assert!(
+                tenant_errors(toml, &home, false).contains(&key.to_string()),
+                "{key}: {toml}"
+            );
+        }
+        let dir = "backups/../backups";
+        assert!(
+            tenant_errors(&format!("[backup]\ndir = \"{dir}\"\n"), &home, false)
+                .contains(&"backup.dir".to_string()),
+            "{dir}"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/nonexistent/x", home.join("dangling")).unwrap();
+            for dir in ["escape/../x", "dangling/b"] {
+                assert!(
+                    tenant_errors(&format!("[backup]\ndir = \"{dir}\"\n"), &home, false)
+                        .contains(&"backup.dir".to_string()),
+                    "{dir}"
+                );
+            }
+        }
+        for host in [
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "localhost.",
+            "[::ffff:10.0.0.1]",
+            "[::127.0.0.1]",
+        ] {
+            for sect in [
+                "[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint",
+                "[judge.jev]\nendpoint",
+            ] {
+                let key = if sect.starts_with("[emb") {
+                    "embedding.endpoint"
+                } else {
+                    "judge.jev.endpoint"
+                };
+                let toml = format!("{sect} = \"https://{host}/v1\"\n");
+                let r = resolve(Some(&toml), &[]).unwrap_or_else(|e| panic!("{host}: {e:?}"));
+                assert!(
+                    validate_tenant(&r.settings, &home, false)
+                        .iter()
+                        .any(|e| e.key == key),
+                    "{host} {key}"
+                );
+            }
+        }
+        for host in ["api.openai.com", "203.0.113.7"] {
+            let toml = format!(
+                "[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"https://{host}/v1\"\n[judge.jev]\nendpoint = \"https://{host}/v1\"\n"
+            );
+            assert!(tenant_errors(&toml, &home, false).is_empty(), "{host}");
+        }
+        assert!(host_is_private("localhost."));
+        // `resolve` itself refuses plain http to a public host, so set this one directly.
+        let mut plain_http = resolve(
+            Some("[embedding]\nprovider = \"openai\"\nmodel = \"m\"\n"),
+            &[],
+        )
+        .unwrap()
+        .settings;
+        plain_http.embedding.endpoint = Some("http://api.openai.com/v1".into());
+        assert!(
+            validate_tenant(&plain_http, &home, false)
+                .iter()
+                .any(|e| e.key == "embedding.endpoint")
+        );
+        #[cfg(unix)]
+        assert!(
+            tenant_errors("[backup]\ndir = \"escape/b\"\n", &home, false)
+                .contains(&"backup.dir".to_string()),
+            "symlink escape"
+        );
+        assert!(
+            tenant_errors("[server]\nport = 47801\n", &home, true)
+                .contains(&"server.port".to_string())
+        );
+        assert!(
+            tenant_errors("[server]\nport = 47801\n", &home, false).is_empty(),
+            "port from the environment"
+        );
+        let allowed = [
+            format!("[backup]\ndir = \"{}\"\n", home.join("backups").display()),
+            "[backup]\ndir = \"backups/daily\"\n".to_string(),
+            "[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"https://api.openai.com/v1\"\n".into(),
+            "[judge]\nprovider = \"jev\"\n".into(),
+            String::new(),
+        ];
+        for toml in &allowed {
+            assert!(tenant_errors(toml, &home, false).is_empty(), "{toml}");
+        }
     }
 }

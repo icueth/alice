@@ -473,6 +473,18 @@ fn stale_discovery_file_never_sends_the_token_to_a_stranger() {
     assert_eq!(e.json(&["status"])["pid"], info["pid"]);
 }
 
+/// The team store is a tenant of its own: `--team-store` without `--tenant` is refused up
+/// front, with the flag named, and nothing is started.
+#[test]
+fn a_team_store_daemon_needs_the_tenant_flag() {
+    let e = Env::new();
+    let o = e.run(&["daemon", "run", "--team-store"]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("--tenant"), "{err}");
+    assert_eq!(e.ok(&["daemon", "status"]), "not running\n");
+}
+
 #[test]
 fn stop_waits_until_the_daemon_lets_go_so_a_restart_finds_the_data() {
     let e = Env::new();
@@ -939,6 +951,21 @@ fn a_damaged_database_is_named_instead_of_starting_forever() {
     eventually(
         || e.recall_count("database is damaged") == 1,
         "the queued write",
+    );
+}
+
+/// `alice model check` loads the model in its own process and starts no daemon; without the
+/// model it fails at once and names the next step.
+#[test]
+fn model_check_without_the_model_fails_and_names_fetch() {
+    let e = Env::new();
+    let o = e.run(&["model", "check"]);
+    assert!(!o.status.success());
+    let err = stderr(&o);
+    assert!(err.contains("alice model fetch"), "{err}");
+    assert!(
+        !e.home.join("daemon.pid").exists() && !e.home.join("alice.db").exists(),
+        "no daemon and no store"
     );
 }
 

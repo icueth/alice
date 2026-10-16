@@ -1,0 +1,1025 @@
+#!/usr/bin/env bash
+# alice-server - run Alice for a few people on this server: one daemon, Linux user, port and token per person.
+# Spec: docs/superpowers/specs/2026-10-15-alice-server-mode-design.md section 2. Run as root (sudo).
+set -euo pipefail
+umask 022
+
+R="${ALICE_SERVER_ROOT:-}"                      # tests only: a prefix for every path this script writes or reads
+ETC="$R/etc/alice"; TENANTS="$ETC/tenants"
+SRV="$R/srv/alice"
+ARCHIVES="$SRV/backups"
+UNIT="$R/etc/systemd/system/alice@.service"
+CADDYFILE="$R/etc/caddy/Caddyfile"; CADDY_D="$R/etc/caddy/alice.d"
+# Caddy's admin API moves from localhost:2019 to this socket; the drop-in has systemd make its directory at every start.
+CADDY_DROPIN="$R/etc/systemd/system/caddy.service.d/alice.conf"; ADMIN_SOCK="$R/run/caddy/admin.sock"
+CADDY_LOG="$R/var/log/caddy/alice-access.log"
+# Each daemon runs in its person's time zone (TZ in the tenant file), so an import reads MemPalace's naive local times
+# with the offset of the person's own machine, as it would on a Mac; stored times stay UTC. This deployment's people
+# are in Thailand; `add <name> --tz <IANA zone>` sets another.
+ZONEINFO="$R/usr/share/zoneinfo"; DEFAULT_TZ=Asia/Bangkok
+# The owner's one Jev key, which every tenant gets (addendum 5): root's only, 0600. A tenant keeps its copy in its own
+# secrets.toml (0600, its user's), written through its daemon by `alice config set-secret`.
+JEV_KEY_FILE="$R/etc/alice/jev.key"; JEV_SECRET=jev_api_key
+# The shared key goes only to this endpoint, and spends at most this much a day per tenant: both are pinned in the
+# tenant file (the environment wins over a person's settings), so a person can neither redirect the owner's key nor
+# raise the budget. Change one tenant's budget in its tenant file, then restart it.
+JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone; JEV_MODEL=jev-1.13.0; JEV_BUDGET_USD=1.0
+BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
+# The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
+# $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
+LIBDIR="$R/usr/local/lib/alice"; ORT_LIB=libonnxruntime.so.1
+# The self-test's model (fetched once, reused by every later self-test) and its throwaway homes.
+MODEL_CACHE="$R/var/cache/alice-server/models"; SELFTEST_TMP="$R/tmp"
+SELFTEST_TIMEOUT=300
+# The real paths below go INSIDE the files this script writes; the prefix above never does.
+REAL_SRV=/srv/alice
+PORT_MIN=47801; PORT_MAX=47899
+WARN_FREE_KB=$((3 * 1024 * 1024))
+DENY="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10"
+NAME_RE='^[a-z][a-z0-9-]{0,15}$'
+# Test hooks: shorten the wait for a daemon's ping.
+PING_INTERVAL=2; PING_ADD=180; PING_UPGRADE=120
+# Test hooks, honoured only in test mode (ALICE_SERVER_ROOT set): on the server they are ignored.
+if [ -n "$R" ]; then
+  SRV="${ALICE_SERVER_SRV_DIR-$SRV}"            # set-but-empty is honoured, so a test can empty it
+  PING_INTERVAL="${ALICE_PING_INTERVAL:-$PING_INTERVAL}"
+  PING_ADD="${ALICE_PING_TIMEOUT:-$PING_ADD}"
+  PING_UPGRADE="${ALICE_PING_TIMEOUT:-$PING_UPGRADE}"
+  ARCHIVES="$SRV/backups"
+fi
+# A broken environment must never turn a removal into rm -rf /...: refuse to run with an empty root.
+: "${ETC:?}" "${TENANTS:?}" "${SRV:?}" "${ARCHIVES:?}" "${CADDY_D:?}" "${UNIT:?}" "${CADDYFILE:?}" "${BIN:?}" "${LOCK:?}"
+: "${LIBDIR:?}" "${MODEL_CACHE:?}" "${SELFTEST_TMP:?}" "${CADDY_DROPIN:?}" "${ADMIN_SOCK:?}" "${CADDY_LOG:?}"
+: "${ZONEINFO:?}" "${JEV_KEY_FILE:?}"
+
+HOST=""
+SELFTEST_WHY=""
+ADOPT_DIR=""
+A_USER=0; A_HOME=0; A_ENV=0; A_UNIT=0; A_SNIP=0; A_RELOADED=0
+IMPORT_DIR=""
+
+die() { printf 'alice-server: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+usage() {
+  cat <<'EOF'
+usage: alice-server add <name> [--tz <IANA zone>]
+           (the daemon's time zone, for imports: default Asia/Bangkok; on an existing tenant it changes it)
+       alice-server add --team team
+           (the shared team store: a daemon with no URL; every personal tenant is linked to it)
+       alice-server remove <name> [--yes]
+       alice-server rotate <name>
+       alice-server list
+       alice-server upgrade <binary>
+           (also the first install; a build of deploy/server/build-release brings its ONNX Runtime along)
+       alice-server import <name> <palace-dir> [--dry-run]
+           (a real import MOVES and consumes <palace-dir>; --dry-run works on a copy and keeps it)
+       alice-server adopt <name> <backup-file> [--cloud-denied <slug,slug...>]
+           (a person's own Alice database, from `alice backup now` on their machine, onto their fresh tenant;
+            --cloud-denied carries the projects they kept from the cloud there)
+       alice-server jev-key set
+           (the owner's Jev key, pasted at the prompt or piped in, for every tenant and every new one)
+       alice-server jev-key status
+       alice-server cli <name> <alice arguments...>
+EOF
+}
+valid_name() {
+  [[ "$1" =~ $NAME_RE ]] || die "\"$1\" is not a tenant name: lower-case letters, digits and -, starting with a letter, at most 16 characters"
+}
+tenant_exists() { [ -f "$TENANTS/$1.env" ]; }
+valid_tz() { # an IANA name with a zone file under /usr/share/zoneinfo
+  if [[ "$1" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] && [ -f "$ZONEINFO/$1" ]; then return 0; fi
+  die "\"$1\" is not a time zone in /usr/share/zoneinfo; use an IANA name such as Asia/Bangkok"
+}
+# The team store is the tenant named team whose file carries ALICE_DAEMON_ARGS=--team-store.
+TEAM=team
+is_team() { grep -qx 'ALICE_DAEMON_ARGS=--team-store' "$TENANTS/$1.env" 2>/dev/null; }
+team_exists() { tenant_exists "$TEAM" && is_team "$TEAM"; }
+need_tenant() { tenant_exists "$1" || die "no tenant named $1 (alice-server list shows the tenants)"; }
+
+public_host() { # from /etc/alice/server.env
+  [[ -f "$ETC/server.env" ]] || die "write ALICE_PUBLIC_HOST=<the server's public IP or name> to $ETC/server.env first"
+  # shellcheck disable=SC1091
+  ( . "$ETC/server.env"; [[ -n "${ALICE_PUBLIC_HOST:-}" ]] || exit 1; printf '%s' "$ALICE_PUBLIC_HOST" ) \
+    || die "ALICE_PUBLIC_HOST is empty in $ETC/server.env"
+}
+need_host() { HOST=$(public_host); }
+url() { printf 'https://%s/u/%s' "$HOST" "$1"; }
+port_of() { sed -n 's/^ALICE_SERVER_PORT=//p' "$TENANTS/$1.env"; }
+
+put() { # path mode ; the content comes on stdin. Written through a temporary file, so a reader never sees half of it.
+  local tmp="$1.tmp.$$"
+  cat >"${tmp:?}" && chmod -- "$2" "${tmp:?}" && mv -- "${tmp:?}" "${1:?}"
+}
+
+# Refuses a CPU without AVX: the ONNX Runtime a server build links (Microsoft's release, which picks its SIMD kernels
+# at run time) needs AVX, not AVX2. Reads $R/proc/cpuinfo (the real /proc/cpuinfo on the server); the flag must be a
+# whole word on a flags line. What the shipped runtime really runs is proven by self_test.
+need_avx() {
+  local flags
+  flags=$(grep -E '^flags[[:space:]]*:' "$R/proc/cpuinfo" 2>/dev/null | head -n 1 || true)
+  if printf '%s\n' "$flags" | grep -Eq '(^|[[:space:]])avx([[:space:]]|$)'; then
+    return 0
+  fi
+  die "this CPU lacks AVX, which Alice's embedding runtime needs (it would die with 'Illegal instruction'); on Proxmox set the VM's CPU type to host, then shut the VM down and start it again (a reboot from inside the guest does not apply a CPU type change)"
+}
+
+# Runs `<binary> model check` in a throwaway home: the binary loads the embedding model and embeds one text. True when
+# it did; otherwise SELFTEST_WHY says why (a signal such as an illegal instruction, an exit code, or the timeout). The
+# model comes from MODEL_CACHE, fetched by the binary the first time (about 136 MB) and checked on every run.
+self_test() { # binary
+  local bin=$1 home rc=0 out last
+  install -d -m 0755 "$MODEL_CACHE" "$SELFTEST_TMP" \
+    || { SELFTEST_WHY="cannot create $MODEL_CACHE or $SELFTEST_TMP"; return 1; }
+  home=$(mktemp -d "$SELFTEST_TMP/alice-selftest.XXXXXX") || { SELFTEST_WHY="no temporary directory"; return 1; }
+  if ! ln -s -- "$MODEL_CACHE" "$home/models"; then
+    rm -rf -- "${home:?}"
+    SELFTEST_WHY="cannot prepare the self-test home"
+    return 1
+  fi
+  out=$( { ALICE_HOME="$home" ALICE_NO_AUTOSTART=1 timeout "$SELFTEST_TIMEOUT" "$bin" model fetch </dev/null \
+    && ALICE_HOME="$home" ALICE_NO_AUTOSTART=1 timeout "$SELFTEST_TIMEOUT" "$bin" model check </dev/null; } 2>&1 ) || rc=$?
+  rm -rf -- "${home:?}"
+  [ "$rc" = 0 ] && return 0
+  if [ "$rc" = 124 ]; then SELFTEST_WHY="no answer within $SELFTEST_TIMEOUT s"
+  elif [ "$rc" = 132 ]; then SELFTEST_WHY="killed by SIGILL: this CPU cannot run its ONNX Runtime"
+  elif [ "$rc" -gt 128 ]; then SELFTEST_WHY="killed by signal $((rc - 128))"
+  else SELFTEST_WHY="exit $rc"
+  fi
+  # The download's progress is one long line of carriage returns: drop it, keep the last real lines, bounded.
+  last=$(printf '%s\n' "$out" | tr '\r' '\n' | { grep -v -e '%$' -e '^[[:space:]]*$' || true; } | tail -n 3 | tr '\n' ' ' | cut -c1-400)
+  SELFTEST_WHY="$SELFTEST_WHY; last output: $last"
+  return 1
+}
+
+free_port() {
+  local p=$PORT_MIN listening
+  listening=$(ss -ltnH 2>/dev/null || true)
+  while [ "$p" -le "$PORT_MAX" ]; do
+    if ! grep -sx "ALICE_SERVER_PORT=$p" "$TENANTS"/*.env >/dev/null 2>&1 \
+      && ! printf '%s\n' "$listening" | grep -E "[:.]$p([[:space:]]|\$)" >/dev/null; then
+      printf '%s' "$p"; return 0
+    fi
+    p=$((p + 1))
+  done
+  return 1
+}
+
+wait_ping() { # port seconds
+  local port=$1 deadline=$((SECONDS + $2))
+  until curl -fsS -m 3 -H "Host: 127.0.0.1:$port" "http://127.0.0.1:$port/api/v1/ping" >/dev/null 2>&1; do
+    (( SECONDS < deadline )) || return 1
+    sleep "$PING_INTERVAL"
+  done
+}
+
+# One template unit serves every tenant. The team store differs only by ALICE_DAEMON_ARGS=--team-store in its own
+# tenant file, which ExecStart expands (systemd splits $ALICE_DAEMON_ARGS into words; unset, it expands to nothing).
+write_unit() {
+  put "$UNIT" 0644 <<EOF
+[Unit]
+Description=Alice memory daemon for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alice-%i
+Group=alice-%i
+EnvironmentFile=/etc/alice/tenants/%i.env
+ExecStart=/usr/local/bin/alice daemon run --tenant \$ALICE_DAEMON_ARGS
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+MemoryMax=3G
+IPAddressAllow=localhost
+IPAddressDeny=$DENY
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/alice/%i
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_caddyfile() {
+  # The first time, keep the controller's own file so the deployment task can diff it.
+  if [ -f "$CADDYFILE" ] && [ ! -e "$CADDYFILE.pre-alice" ]; then
+    cp -p -- "${CADDYFILE:?}" "${CADDYFILE:?}.pre-alice"
+  fi
+  put "$CADDYFILE" 0644 <<EOF
+{
+	default_sni $HOST
+	admin unix//run/caddy/admin.sock
+}
+
+https://$HOST {
+	tls {
+		issuer acme {
+			profile shortlived
+		}
+	}
+	log {
+		output file /var/log/caddy/alice-access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+		format json
+	}
+	import /etc/caddy/alice.d/*.caddy
+	handle {
+		respond "Alice server" 404
+	}
+}
+EOF
+}
+
+write_snippet() { # name port
+  put "$CADDY_D/$1.caddy" 0644 <<EOF
+handle_path /u/$1/* {
+	route {
+		@admin path /api/v1/admin/*
+		respond @admin 404
+		# A person's uploaded MemPalace (import.max_upload_bytes, 4 GiB by default): a big body and a long wait.
+		# Every other route keeps Caddy's defaults.
+		@import path /api/v1/import/upload
+		request_body @import {
+			max_size 4GiB
+		}
+		reverse_proxy @import 127.0.0.1:$2 {
+			header_up Host {upstream_hostport}
+			header_up -Origin
+			header_up -X-Forwarded-For
+			flush_interval -1
+			transport http {
+				read_timeout 30m
+				write_timeout 30m
+			}
+		}
+		@alice path /api/v1/* /mcp /mcp/*
+		reverse_proxy @alice 127.0.0.1:$2 {
+			header_up Host {upstream_hostport}
+			header_up -Origin
+			header_up -X-Forwarded-For
+			flush_interval -1
+		}
+		respond 404
+	}
+}
+EOF
+}
+
+# Writes the Caddyfile and validates it at once. If Caddy refuses it, the file as it was before this run comes back
+# and nothing else is touched.
+write_caddyfile_checked() {
+  local keep="$CADDYFILE.prev-run.$$"
+  if [ -f "$CADDYFILE" ]; then cp -p -- "${CADDYFILE:?}" "${keep:?}"; fi
+  write_caddyfile
+  prepare_caddy_log
+  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null; then
+    if [ -f "$keep" ]; then mv -- "${keep:?}" "${CADDYFILE:?}"; else rm -f -- "${CADDYFILE:?}"; fi
+    die "Caddy refused the new Caddyfile; the previous one is back and nothing else was changed"
+  fi
+  rm -f -- "${keep:?}"
+}
+
+# The first time, the running Caddy still has its own admin address (localhost:2019): a reload would look for the
+# socket the managed Caddyfile names and fail, so Caddy is restarted onto it (the drop-in gives it /run/caddy). Once the
+# socket is there, a reload goes through it.
+reload_caddy() {
+  prepare_caddy_log
+  caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null || return 1
+  if [ -e "$ADMIN_SOCK" ]; then systemctl reload caddy; else systemctl restart caddy; fi
+}
+
+# `caddy validate` runs as root and opens the access log the Caddyfile names: were the file missing, it would be made
+# root's (0600) and Caddy, as the caddy user, could not open it at its next start. So it exists first, Caddy's own.
+prepare_caddy_log() {
+  mkdir -p "$(dirname "$CADDY_LOG")"
+  [ -e "$CADDY_LOG" ] || : >"$CADDY_LOG"
+  chown caddy:caddy "$(dirname "$CADDY_LOG")" "$CADDY_LOG"
+  chmod 0640 "$CADDY_LOG"
+}
+
+write_caddy_dropin() {
+  put "$CADDY_DROPIN" 0644 <<'EOF'
+# Written by alice-server: Caddy's admin API listens on /run/caddy/admin.sock (see /etc/caddy/Caddyfile), not on
+# localhost:2019, so a tenant's daemon cannot reach it. systemd makes the directory, for the caddy user only, at every
+# start.
+[Service]
+RuntimeDirectory=caddy
+RuntimeDirectoryMode=0750
+EOF
+}
+
+ensure_base() {
+  mkdir -p "$ETC" "$TENANTS" "$SRV" "$CADDY_D" "$(dirname "$UNIT")" "$ARCHIVES"
+  chmod 0755 "$ETC" "$TENANTS" "$SRV" "$CADDY_D"
+  chmod 0700 "$ARCHIVES"
+  write_unit
+  mkdir -p "$(dirname "$CADDY_DROPIN")"
+  write_caddy_dropin
+  write_caddyfile_checked
+  systemctl daemon-reload
+}
+
+free_kb() { # on the disk that holds $SRV (before the first add, its nearest existing parent)
+  local d=$SRV
+  while [ ! -d "$d" ]; do d=$(dirname -- "$d"); done
+  df -Pk "$d" | awk 'NR==2 {print $4}'
+}
+gb() { awk -v k="$1" 'BEGIN { printf "%.1f", k / 1048576 }'; }
+
+# Runs the alice CLI as the tenant's own user, against the tenant's own home.
+as_tenant() { # name args...
+  local name=$1; shift
+  sudo -u "alice-$name" env ALICE_HOME="$SRV/$name" ALICE_NO_AUTOSTART=1 "$BIN" "$@"
+}
+
+# --- team federation (spec 2.10) ---------------------------------------------------------------------------------
+all_tenants() { # names of every tenant, one per line
+  local f
+  for f in "$TENANTS"/*.env; do
+    if [ -e "$f" ]; then basename "$f" .env; fi
+  done
+}
+personal_tenants() { # names of the tenants that are not the team store, one per line
+  local f n
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    n=$(basename "$f" .env)
+    if ! is_team "$n"; then printf '%s\n' "$n"; fi
+  done
+}
+set_env_line() { # name KEY VALUE: replace or append one line of a tenant file (never a secret: the file is 0644)
+  local f="$TENANTS/$1.env"
+  { grep -v "^$2=" "$f" || true; printf '%s=%s\n' "$2" "$3"; } | put "$f" 0644
+}
+drop_env_line() { # name KEY
+  local f="$TENANTS/$1.env"
+  { grep -v "^$2=" "$f" || true; } | put "$f" 0644
+}
+write_team_token() { # name token: <home>/team.token, 0600, written by the tenant's own user
+  [ -n "$2" ] || { printf 'alice-server: refusing to write an empty team.token for %s\n' "$1" >&2; return 1; }
+  # Root supplies only the content, on stdin: it never writes, chowns or chmods inside a home its tenant controls.
+  # shellcheck disable=SC2016  # the script is for the tenant's shell, which expands its own variables
+  printf '%s\n' "$2" | sudo -u "alice-$1" sh -c 'umask 077; t=$(mktemp "$1/.team.token.XXXXXX") && cat >"$t" && mv -f -- "$t" "$1/team.token"' sh "$SRV/$1"
+}
+team_token() {
+  [ -s "$SRV/$TEAM/token" ] || die "the team store has no token yet"
+  head -n 1 "$SRV/$TEAM/token"
+}
+provision_files() { # name: the env lines and the token copy; no restart
+  local tp tok
+  tp=$(port_of "$TEAM")
+  set_env_line "$1" ALICE_TENANT_NAME "$1" || return 1
+  set_env_line "$1" ALICE_TEAM_URL "http://127.0.0.1:$tp" || return 1
+  tok=$(team_token) || return 1
+  [ -n "$tok" ] || { printf 'alice-server: the team token is empty; %s was not linked\n' "$1" >&2; return 1; }
+  write_team_token "$1" "$tok"
+}
+# An import runs inside the tenant's daemon (an admin's import or a person's upload over HTTPS) and is cut off when that
+# daemon restarts or stops. The lock covers only admin commands, so these ask the daemons themselves. A daemon that does
+# not answer runs no import.
+daemon_imports() { # names...: those whose daemon is importing right now
+  local t busy=""
+  for t in "$@"; do
+    [ -n "$t" ] || continue
+    systemctl is-active --quiet "alice@$t" || continue
+    if as_tenant "$t" --json import status 2>/dev/null | grep -qE '"state": *"(running|receiving|unpacking|importing)"'; then
+      busy="$busy $t"
+    fi
+  done
+  printf '%s' "${busy# }"
+}
+no_daemon_import() { # names...
+  local busy
+  busy=$(daemon_imports "$@")
+  [ -z "$busy" ] || die "an import is running on: $busy; this would restart its daemon and cut it off. Wait until 'alice-server cli <name> import status' no longer says running, then run this again"
+}
+restart_one() { # name: restart and wait for the ping; true on success
+  systemctl restart "alice@$1" && wait_ping "$(port_of "$1")" "$PING_UPGRADE"
+}
+# Links every personal tenant to the team store and restarts it (the link is read at start). Idempotent.
+provision_all() {
+  local n failed=""
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if provision_files "$n" && restart_one "$n"; then say "linked $n to the team store"; else failed="$failed $n"; fi
+  done <<EOF
+$(personal_tenants)
+EOF
+  if [ -n "$failed" ]; then
+    printf 'alice-server: WARNING: these tenants were not linked or did not come back:%s; run alice-server add --team team again\n' "$failed" >&2
+    return 1
+  fi
+}
+unprovision_all() {
+  local n failed=""
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if drop_env_line "$n" ALICE_TEAM_URL && rm -f -- "${SRV:?}/${n:?}/team.token" && restart_one "$n"; then
+      say "unlinked $n from the team store"
+    else
+      failed="$failed $n"
+    fi
+  done <<EOF
+$(personal_tenants)
+EOF
+  [ -z "$failed" ] || printf 'alice-server: WARNING: these tenants did not come back after the unlink:%s\n' "$failed" >&2
+}
+
+tenant_env_text() { # name port team(0|1) tz
+  printf 'ALICE_HOME=%s/%s\nALICE_SERVER_PORT=%s\nALICE_LOG=info\nALICE_BACKUP_DAILY=2\nALICE_BACKUP_WEEKLY=0\nTZ=%s\n' \
+    "$REAL_SRV" "$1" "$2" "$4"
+  printf 'ALICE_JUDGE_JEV_ENDPOINT=%s\nALICE_JUDGE_JEV_MODEL=%s\nALICE_JUDGE_DAILY_BUDGET_USD=%s\n' \
+    "$JEV_ENDPOINT" "$JEV_MODEL" "$JEV_BUDGET_USD"
+  if [ "$3" = 1 ]; then printf 'ALICE_DAEMON_ARGS=--team-store\n'; else printf 'ALICE_TENANT_NAME=%s\n' "$1"; fi
+}
+
+rollback_add() { # name: undo what add created, in reverse order
+  local n=$1
+  if [ "$A_SNIP" = 1 ]; then rm -f -- "${CADDY_D:?}/${n:?}.caddy"; fi
+  if [ "$A_RELOADED" = 1 ] && ! reload_caddy >/dev/null 2>&1; then
+    printf 'alice-server: WARNING: Caddy could not be reloaded after removing the route for %s; check "caddy validate" and reload it by hand\n' "$n" >&2
+  fi
+  if [ "$A_UNIT" = 1 ]; then systemctl disable --now "alice@$n" >/dev/null 2>&1 || true; fi
+  if [ "$A_ENV" = 1 ]; then rm -f -- "${TENANTS:?}/${n:?}.env"; fi
+  if [ "$A_USER" = 1 ]; then userdel "alice-$n" >/dev/null 2>&1 || true; fi
+  if [ "$A_HOME" = 1 ]; then rm -rf -- "${SRV:?}/${n:?}"; fi
+}
+add_fail() { rollback_add "$1"; die "$2 - undone, nothing is left of $1"; }
+
+cmd_add() { # name team(0|1) tz tz-given(0|1)
+  local name=$1 team=${2:-0} tz=${3:-$DEFAULT_TZ} tz_given=${4:-0} home="$SRV/$1" port token
+  need_host
+  ensure_base
+  if [ "$team" = 1 ]; then
+    # shellcheck disable=SC2046  # one name per word
+    no_daemon_import $(personal_tenants)   # linking restarts every personal tenant
+  fi
+  if tenant_exists "$name" && [ "$tz_given" = 1 ]; then
+    no_daemon_import "$name"
+    set_env_line "$name" TZ "$tz"
+    restart_one "$name" || die "$name did not come back after its time zone changed; journalctl -u alice@$name"
+    say "$name now runs in $tz"
+    return 0
+  fi
+  if tenant_exists "$name"; then
+    if [ "$team" = 1 ]; then
+      say "the team store exists (alice-server rotate $name gives a new token); linking the personal tenants again"
+      provision_all || return 1
+      return 0
+    fi
+    say "$name exists: $(url "$name")"
+    say "(alice-server rotate $name gives a new token.)"
+    return 0
+  fi
+  if id -u "alice-$name" >/dev/null 2>&1; then die "the Linux user alice-$name exists but $name is not a tenant; remove that user first"; fi
+  [ ! -e "$home" ] || die "$home exists but $name is not a tenant; move it away first"
+  port=$(free_port) || die "no free port in $PORT_MIN-$PORT_MAX"
+
+  A_RELOADED=0
+  A_USER=1
+  useradd --system --user-group --home-dir "$REAL_SRV/$name" --no-create-home --shell /usr/sbin/nologin "alice-$name" \
+    || add_fail "$name" "could not create the Linux user"
+  A_HOME=1
+  { mkdir -p "$home" && chmod -- 0700 "$home" && chown "alice-$name:alice-$name" -- "$home"; } \
+    || add_fail "$name" "could not create the home"
+  A_ENV=1
+  tenant_env_text "$name" "$port" "$team" "$tz" | put "$TENANTS/$name.env" 0644 || add_fail "$name" "could not write the tenant file"
+  if [ "$team" = 0 ] && team_exists; then # linked before the first start, so the daemon starts with the link
+    provision_files "$name" || add_fail "$name" "could not link the tenant to the team store"
+  fi
+  A_UNIT=1
+  systemctl enable --now "alice@$name" || add_fail "$name" "could not start alice@$name"
+  wait_ping "$port" "$PING_ADD" || add_fail "$name" "alice@$name did not answer a ping in $PING_ADD s (journalctl -u alice@$name)"
+  if [ "$team" = 0 ]; then # the team store has no route: only the other daemons reach it, on localhost
+    A_SNIP=1
+    { write_snippet "$name" "$port" && reload_caddy; } || add_fail "$name" "Caddy refused the new route"
+    A_RELOADED=1
+  fi
+  if [ -s "$JEV_KEY_FILE" ]; then
+    give_jev_key "$name" "$(head -n 1 "$JEV_KEY_FILE")" || add_fail "$name" "could not give $name the server's Jev key"
+  fi
+  [ -s "$home/token" ] || add_fail "$name" "the daemon wrote no token"
+  token=$(head -n 1 "$home/token")
+
+  if [ "$team" = 1 ]; then
+    say "Created the team store. Its token stays on the server: every personal tenant gets its copy now"
+    say "(alice-server rotate $name gives a new one)."
+    provision_all || return 1
+    return 0
+  fi
+  say "Created tenant $name."
+  say "URL:    $(url "$name")"
+  say "MCP:    $(url "$name")/mcp"
+  say "Token (shown once, hand it over now; alice-server rotate $name gives a new one):"
+  say "  $token"
+  say "Claude Code, with the token in the environment variable ALICE_TOKEN:"
+  say "  claude mcp add --transport http alice '$(url "$name")/mcp' --header 'Authorization: Bearer \${ALICE_TOKEN}'"
+  say "The .mcp.json form is in docs/server.md."
+}
+
+cmd_remove() { # name [--yes]
+  local name=$1 flag=${2:-} home="$SRV/$1" ans="" archive was_team=0
+  case "$flag" in ""|--yes) ;; *) usage >&2; exit 2 ;; esac
+  need_tenant "$name"
+  if is_team "$name"; then
+    was_team=1
+    # shellcheck disable=SC2046  # one name per word
+    no_daemon_import $(personal_tenants)   # unlinking restarts every personal tenant
+  fi
+  no_daemon_import "$name"
+  if [ "$flag" != --yes ]; then
+    printf 'Remove %s? Its home is archived in %s first, then deleted. [y/N] ' "$name" "$ARCHIVES" >&2
+    read -r ans || ans=""
+    case "$ans" in y|Y|yes|YES) ;; *) die "cancelled; nothing was removed" ;; esac
+  fi
+  systemctl disable --now "alice@$name" || true
+  rm -f -- "${SRV:?}/${name:?}/team.token"      # the archive never holds the copy of the team token
+  rm -f -- "${CADDY_D:?}/${name:?}.caddy"
+  reload_caddy || die "Caddy did not accept the config without $name; fix it, then run remove again"
+  mkdir -p "$ARCHIVES"; chmod 0700 "$ARCHIVES"
+  if [ -d "$home" ]; then
+    archive="$ARCHIVES/$name-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+    # The model is left out: it is downloaded again by any new tenant.
+    ( umask 077; tar -czf "$archive" --exclude="$name/models" -C "$SRV" -- "$name" ) \
+      || die "could not archive $home; nothing was deleted"
+    chmod -- 0600 "$archive"
+    say "archived to $archive"
+  fi
+  if id -u "alice-$name" >/dev/null 2>&1; then userdel "alice-$name"; fi
+  rm -rf -- "${home:?}"
+  rm -f -- "${TENANTS:?}/${name:?}.env"
+  say "Removed tenant $name."
+  if [ "$was_team" = 1 ]; then unprovision_all; fi
+}
+
+cmd_rotate() {
+  local name=$1 token
+  need_tenant "$name"
+  need_host
+  token=$(as_tenant "$name" token rotate --show | tail -n 1) \
+    || die "rotating the token failed; the old one is still in force (journalctl -u alice@$name)"
+  [ -n "$token" ] || die "alice printed no token"
+  if ! is_team "$name"; then
+    say "New token for $name (shown once; the old one no longer works):"
+    say "  $token"
+  fi
+  if is_team "$name"; then
+    say "New team token in place (it stays on the server)."
+    local n
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      write_team_token "$n" "$token" || die "could not rewrite the team token for $n; run alice-server rotate $name again"
+    done <<EOF
+$(personal_tenants)
+EOF
+    say "  (every tenant's copy was rewritten; no restart is needed)"
+  fi
+}
+
+cmd_list() {
+  local f n port state version size kb free_k fs archive_kb link
+  need_host
+  mkdir -p "$SRV"
+  printf '%-16s %-6s %-10s %-10s %-8s %s\n' name port state version size url
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    n=$(basename "$f" .env)
+    port=$(port_of "$n")
+    state=$(systemctl is-active "alice@$n" 2>/dev/null || true)
+    [ -n "$state" ] || state=unknown
+    version=$(curl -fsS -m 3 -H "Host: 127.0.0.1:$port" "http://127.0.0.1:$port/api/v1/ping" 2>/dev/null \
+      | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' || true)
+    [ -n "$version" ] || version=-
+    kb=$(du -sk "$SRV/$n" 2>/dev/null | cut -f1 || true)
+    size=$(awk -v k="${kb:-0}" 'BEGIN { printf "%.0f MB", k / 1024 }')
+    if is_team "$n"; then link="(team, no URL)"; else link=$(url "$n"); fi
+    printf '%-16s %-6s %-10s %-10s %-8s %s\n' "$n" "$port" "$state" "$version" "$size" "$link"
+  done
+  free_k=$(free_kb)
+  fs=$(df -Pk "$SRV" | awk 'NR==2 {print $6}')
+  archive_kb=$(du -sk "$ARCHIVES" 2>/dev/null | cut -f1 || true)
+  say "free: $(gb "$free_k") GB on $fs; remove archives: $(awk -v k="${archive_kb:-0}" 'BEGIN { printf "%.0f", k / 1024 }') MB"
+  if [ "$free_k" -lt "$WARN_FREE_KB" ]; then
+    say "WARNING: only $(gb "$free_k") GB free; below 3 GB, uploads and backups are refused. Delete old archives in $ARCHIVES or set ALICE_BACKUP_DAILY=1 in a tenant file."
+  fi
+}
+
+restart_all() { # progress goes to stderr; the failed tenants, space separated, are the only stdout line
+  local f t failed=""
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    t=$(basename "$f" .env)
+    if systemctl restart "alice@$t" && wait_ping "$(port_of "$t")" "$PING_UPGRADE"; then
+      printf 'ok %s\n' "$t" >&2
+    else
+      printf 'FAILED %s\n' "$t" >&2
+      failed="$failed $t"
+    fi
+  done
+  printf '%s\n' "${failed# }"
+}
+
+# Puts back what install_new replaced: the previous binary and library, or nothing at all after a first install.
+# A .prev only ever exists complete (keep_prev), so restoring one never puts a half copy in place.
+restore_prev() {
+  local bin_ok=1 lib_ok=1
+  if [ -f "$BIN.prev" ]; then mv -- "${BIN:?}.prev" "${BIN:?}" || bin_ok=0
+  elif [ "$FIRST_INSTALL" = 1 ]; then rm -f -- "${BIN:?}" || bin_ok=0
+  fi
+  # The library is put back even when the binary could not be (each step is tried).
+  if [ -f "$LIBDIR/$ORT_LIB.prev" ]; then mv -- "${LIBDIR:?}/$ORT_LIB.prev" "${LIBDIR:?}/$ORT_LIB" || lib_ok=0
+  elif [ "$NEW_LIB" = 1 ]; then rm -f -- "${LIBDIR:?}/${ORT_LIB:?}" || lib_ok=0
+  fi
+  if [ "$bin_ok" = 0 ] || [ "$lib_ok" = 0 ]; then
+    die "the previous version could not be fully put back ($([ "$bin_ok" = 0 ] && printf 'the binary: move %s.prev to %s by hand' "$BIN" "$BIN")$([ "$bin_ok$lib_ok" = 00 ] && printf '; ')$([ "$lib_ok" = 0 ] && printf 'the library: move %s.prev to %s by hand' "$LIBDIR/$ORT_LIB" "$LIBDIR/$ORT_LIB"))"
+  fi
+}
+
+keep_prev() { # file: a complete copy as file.prev, or none at all
+  cp -p -- "${1:?}" "${1:?}.prev.tmp" && mv -- "${1:?}.prev.tmp" "${1:?}.prev"
+}
+
+install_failed() { # message: undo a partial install_new and stop
+  rm -f -- "${BIN:?}.new" "${BIN:?}.prev.tmp" "${LIBDIR:?}/${ORT_LIB:?}.new" "${LIBDIR:?}/${ORT_LIB:?}.prev.tmp"
+  restore_prev
+  die "$1; the previous version is restored"
+}
+
+FIRST_INSTALL=0; NEW_LIB=0
+install_new() { # binary library-or-empty: each through a temporary file, the current one kept as .prev
+  local new=$1 lib=$2
+  rm -f -- "${BIN:?}.prev" "${LIBDIR:?}/${ORT_LIB:?}.prev"
+  [ -f "$BIN" ] || FIRST_INSTALL=1
+  if [ -n "$lib" ]; then
+    install -d -m 0755 "$LIBDIR" || die "could not create $LIBDIR; nothing was installed"
+    if [ -f "$LIBDIR/$ORT_LIB" ]; then
+      keep_prev "$LIBDIR/$ORT_LIB" || install_failed "could not keep a copy of the current library"
+    else
+      NEW_LIB=1
+    fi
+    { install -m 0644 "$lib" "$LIBDIR/$ORT_LIB.new" && mv -- "${LIBDIR:?}/$ORT_LIB.new" "${LIBDIR:?}/$ORT_LIB"; } \
+      || install_failed "could not install $lib"
+  fi
+  if [ "$FIRST_INSTALL" = 0 ]; then keep_prev "$BIN" || install_failed "could not keep a copy of the current binary"; fi
+  { install -m 0755 "$new" "$BIN.new" && mv -- "${BIN:?}.new" "${BIN:?}"; } || install_failed "could not install $new"
+}
+
+# A tenant made before a pinned line existed gets it: TZ (a zone set with --tz is kept), the Jev endpoint and the
+# judge budget (a budget the admin changed is kept).
+add_missing_tz() {
+  local f t added="" pinned=""
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    t=$(basename "$f" .env)
+    if ! grep -q '^TZ=' "$f"; then set_env_line "$t" TZ "$DEFAULT_TZ"; added="$added $t"; fi
+    if ! grep -q '^ALICE_JUDGE_JEV_ENDPOINT=' "$f"; then
+      set_env_line "$t" ALICE_JUDGE_JEV_ENDPOINT "$JEV_ENDPOINT"
+      pinned="$pinned $t"
+    fi
+    if ! grep -q '^ALICE_JUDGE_JEV_MODEL=' "$f"; then
+      set_env_line "$t" ALICE_JUDGE_JEV_MODEL "$JEV_MODEL"
+      case " $pinned " in *" $t "*) ;; *) pinned="$pinned $t" ;; esac
+    fi
+    if ! grep -q '^ALICE_JUDGE_DAILY_BUDGET_USD=' "$f"; then
+      set_env_line "$t" ALICE_JUDGE_DAILY_BUDGET_USD "$JEV_BUDGET_USD"
+      case " $pinned " in *" $t "*) ;; *) pinned="$pinned $t" ;; esac
+    fi
+  done
+  if [ -n "$added" ]; then say "TZ=$DEFAULT_TZ added for:$added"; fi
+  if [ -n "$pinned" ]; then say "the Jev endpoint, model and budget pinned for:$pinned"; fi
+}
+
+# A route written by an older version lacks the upload route's body limit and timeouts: write every personal tenant's again
+# and reload Caddy once (a snippet Caddy refuses leaves the running configuration as it was).
+refresh_snippets() {
+  local t n=0
+  for t in $(personal_tenants); do
+    write_snippet "$t" "$(port_of "$t")" && n=$((n + 1))
+  done
+  if [ "$n" -gt 0 ] && ! reload_caddy >/dev/null 2>&1; then
+    printf 'alice-server: WARNING: Caddy could not be reloaded with the new routes; check "caddy validate" and reload it by hand\n' >&2
+  fi
+}
+
+cmd_upgrade() { # binary (also the first install)
+  local new=$1 lib failed still
+  need_avx
+  if [ ! -f "$new" ] || [ ! -x "$new" ]; then die "$new is not an executable file"; fi
+  # shellcheck disable=SC2046  # one name per word
+  no_daemon_import $(all_tenants)
+  # A build of deploy/server/build-release keeps its ONNX Runtime where the binary's rpath looks: ../lib/alice.
+  lib="$(dirname -- "$new")/../lib/alice/$ORT_LIB"
+  [ -f "$lib" ] || lib=""
+  "$new" --version >/dev/null 2>&1 || die "$new --version failed; the new binary was not installed"
+  self_test "$new" || die "the new binary failed its self-test ($SELFTEST_WHY); nothing was installed"
+  install_new "$new" "$lib"
+  # The installed pair, found through the rpath as the units will run it, before any unit is switched.
+  if ! self_test "$BIN"; then
+    restore_prev
+    die "the installed binary failed its self-test ($SELFTEST_WHY); the previous version is restored"
+  fi
+  say "free: $(gb "$(free_kb)") GB (a schema migration copies each tenant's database once)"
+  add_missing_tz
+  refresh_snippets
+  failed=$(restart_all)
+  if [ -n "$failed" ]; then
+    restore_prev
+    still=$(restart_all) || true
+    if [ -n "$still" ]; then
+      die "these tenants did not come back: $failed. With the previous binary back, these are still down: $still. A database the new binary migrated cannot start on the old one: fix the failing tenant and run the upgrade again, or restore that tenant's pre-migration backup"
+    fi
+    die "these tenants did not come back: $failed; the previous binary is restored and every tenant runs on it again"
+  fi
+  if [ -f "$BIN.prev" ]; then
+    say "upgraded to $("$BIN" --version); the previous binary is $BIN.prev"
+  else
+    say "installed $("$BIN" --version)"
+  fi
+}
+
+canon_dir() { # prints the physical path of a directory; fails when it is not one
+  ( cd -- "$1" 2>/dev/null && pwd -P )
+}
+# Refuses a palace path that is, is inside, or contains a place the import (and its cleanup) must never touch.
+refuse_protected() { # canonical path
+  local pal=$1 p c
+  [ "$pal" != / ] || die "refusing to import /"
+  for p in "$SRV" "$ETC" /etc /usr /var/lib /root; do
+    c=$(canon_dir "$p" 2>/dev/null) || c=$p
+    case "$pal/" in "$c/"*) die "refusing $pal: it is inside $c" ;; esac
+    case "$c/" in "$pal/"*) die "refusing $pal: it contains $c" ;; esac
+  done
+  [ "$pal" != /home ] || die "refusing /home itself; give the palace directory, such as /home/<user>/palace"
+}
+
+cmd_import() { # name palace-dir [--dry-run]
+  local name=$1 dry=${3:-} pal job rc=0
+  case "$dry" in ""|--dry-run) ;; *) usage >&2; exit 2 ;; esac
+  need_tenant "$name"
+  [ ! -L "$2" ] || die "$2 is a symbolic link; give the palace directory itself"
+  pal=$(canon_dir "$2") || die "$2 is not a directory"
+  refuse_protected "$pal"
+  if [ ! -f "$pal/sqlite_exact.sqlite3" ] && [ ! -f "$pal/chroma.sqlite3" ]; then
+    die "$2 does not look like a MemPalace palace (no sqlite_exact.sqlite3 or chroma.sqlite3 inside); nothing was moved"
+  fi
+  [ ! -L "$SRV/$name/import-inbox" ] || die "$SRV/$name/import-inbox is a symbolic link; refusing to write through it"
+  if [ "$dry" = --dry-run ]; then # a dry run copies the palace: room for it first, as the daemon then checks
+    local size_k need free_k
+    size_k=$(du -sk -- "$pal" | cut -f1)
+    need=$(( 2 * size_k + 2 * 1024 * 1024 ))
+    free_k=$(free_kb)
+    [ "$free_k" -ge "$need" ] || die "a dry run copies the palace; it needs twice its size plus 2 GB free, and $(gb "$free_k") GB is free"
+  fi
+  job="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  IMPORT_DIR="$SRV/$name/import-inbox/$job"
+  trap 'rm -rf -- "${IMPORT_DIR:?}"' EXIT
+  trap 'exit 1' INT TERM HUP
+  install -d -m 0700 "$SRV/$name/import-inbox" "$IMPORT_DIR"
+  if [ "$dry" = --dry-run ]; then
+    cp -pR -- "${pal:?}" "${IMPORT_DIR:?}/palace"      # a dry run never consumes the admin's copy
+  else
+    mv -- "${pal:?}" "${IMPORT_DIR:?}/palace"
+  fi
+  chown -R "alice-$name:alice-$name" -- "$SRV/$name/import-inbox"
+  if [ "$dry" = --dry-run ]; then
+    as_tenant "$name" import mempalace --palace "$IMPORT_DIR/palace" --dry-run || rc=$?
+  else
+    as_tenant "$name" import mempalace --palace "$IMPORT_DIR/palace" || rc=$?
+  fi
+  exit "$rc"
+}
+
+file_uid() { stat -c %u -- "$1" 2>/dev/null || stat -f %u -- "$1"; }
+file_bytes() { stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1"; }
+
+# A person's own Alice database becomes their fresh tenant's (spec section 2.12). `alice adopt`, run as the tenant
+# with its daemon stopped, checks the file, refuses a tenant that holds anything, swaps it in (keeping the tenant's
+# own database as a before-restore backup), clears the machine's paths and redacts with the tenant's rules. If the
+# daemon does not come back, the tenant's own database goes back.
+cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
+  local name=$1 file=$2 denied=${3:-} home="$SRV/$1" admin=${SUDO_UID:-0} owner need free_k out saved port list="" s
+  if [ -n "$denied" ]; then
+    case ",$denied," in
+      *[!abcdefghijklmnopqrstuvwxyz0123456789,-]*|*,,*) die "--cloud-denied takes project slugs separated by commas (a-z, 0-9, -, none empty); set any other list with: alice-server cli $name config set privacy.cloud_denied_projects '[...]'" ;;
+    esac
+    for s in $(printf '%s' "$denied" | tr ',' ' '); do list="$list${list:+,}\"$s\""; done
+  fi
+  need_tenant "$name"
+  if is_team "$name"; then die "$TEAM is the shared team store; adopt a person's database into their own tenant"; fi
+  if [ -L "$file" ] || [ ! -f "$file" ]; then die "$file is not a regular file"; fi
+  owner=$(file_uid "$file")
+  [ "$owner" = "$admin" ] || die "$file belongs to uid $owner; copy it into your own home first (it must be the admin's file, uid $admin)"
+  need=$(( 2 * ($(file_bytes "$file") / 1024 + 1) + 2 * 1024 * 1024 ))
+  free_k=$(free_kb)
+  [ "$free_k" -ge "$need" ] || die "adopting $file needs twice its size plus 2 GB free; $(gb "$free_k") GB is free"
+  no_daemon_import "$name"   # adopting stops the daemon
+  # The person's cloud denials go first, on the fresh tenant while it runs: the adoption replaces only alice.db, so they
+  # hold from the adopted database's first moment, and a failure here changes nothing else.
+  if [ -n "$list" ]; then
+    as_tenant "$name" config set privacy.cloud_denied_projects "[$list]" >/dev/null \
+      || die "the cloud denials could not be set, so nothing was adopted: alice-server cli $name config set privacy.cloud_denied_projects '[$list]'"
+    say "Kept from the cloud on $name: $denied"
+  fi
+  # Stopped before anything is staged in its home: no process of the tenant's can race root there.
+  systemctl stop "alice@$name"
+  ADOPT_DIR="$home/adopt-inbox"
+  trap 'rm -rf -- "${ADOPT_DIR:?}"' EXIT
+  trap 'exit 1' INT TERM HUP
+  rm -rf -- "${ADOPT_DIR:?}"   # anything placed there (a link included) goes; root then makes it anew
+  install -d -m 0700 "$ADOPT_DIR"
+  cp -- "$file" "$ADOPT_DIR/alice.db"
+  chmod -- 0600 "$ADOPT_DIR/alice.db"
+  chown -R "alice-$name:alice-$name" -- "$ADOPT_DIR"
+  if ! out=$(as_tenant "$name" --json adopt "$ADOPT_DIR/alice.db" 2>&1); then
+    # Started again only when `alice adopt` says the tenant's own database is in place; any other end (a panic, a kill,
+    # a swap back that failed) may have left the unscrubbed copy, so the tenant stays stopped.
+    if printf '%s\n' "$out" | grep -qF -e '[untouched]' -e '[put back]'; then
+      systemctl start "alice@$name" || true
+      die "nothing was adopted; $name's database is as it was: $(printf '%s\n' "$out" | tail -n 1)"
+    fi
+    die "the adoption failed and $name's own database may not be in place, so $name stays stopped (it could serve the unscrubbed copy): $(printf '%s\n' "$out" | tail -n 1). Restore its own database (alice-server cli $name restore <the newest alice-before-restore file> --yes), then systemctl start alice@$name"
+  fi
+  saved=$(printf '%s\n' "$out" | sed -n 's/.*"saved_tenant_db_as": *"\([^"]*\)".*/\1/p')
+  systemctl start "alice@$name"
+  port=$(port_of "$name")
+  if ! wait_ping "$port" "$PING_ADD"; then
+    systemctl stop "alice@$name" || true
+    if [ -n "$saved" ] && as_tenant "$name" restore "$saved" --yes >/dev/null 2>&1; then
+      systemctl start "alice@$name" || true
+      die "$name did not come back with the adopted database; its own database ($saved) is back"
+    fi
+    die "$name did not come back with the adopted database, and its own could not be put back; restore it with: alice-server cli $name restore ${saved:-<before-restore backup>} --yes"
+  fi
+  say "Adopted into $name:"
+  printf '%s\n' "$out" | sed -n 's/^ *"\([a-z_]*\)": *\(.*\),\{0,1\}$/  \1: \2/p' | sed 's/,$//'
+  say "Delete $file now: it holds what the person's machine stored, unredacted."
+}
+
+# Reads a key from the terminal with echo off, or from stdin when it is not a terminal; never from argv or the
+# environment. Prints it on stdout for the caller's variable only.
+read_key() {
+  local key="" saved
+  if [ -t 0 ]; then
+    printf 'Paste the Jev key and press Enter: ' >/dev/tty
+    saved=$(stty -g </dev/tty)
+    stty -echo </dev/tty
+    IFS= read -r key </dev/tty || true
+    stty "$saved" </dev/tty
+    printf '\n' >/dev/tty
+  else
+    IFS= read -r key || true
+  fi
+  printf '%s' "$key"
+}
+
+# One tenant gets the key (through its running daemon, so it applies at once) and the Jev judge. SP2's distillation
+# (`distill.provider = jev`) joins here once it lands on this branch.
+give_jev_key() { # name key
+  printf '%s\n' "$2" | as_tenant "$1" config set-secret "$JEV_SECRET" >/dev/null 2>&1 || return 1
+  as_tenant "$1" config set judge.provider jev >/dev/null 2>&1 || return 1
+}
+
+cmd_jev_key_set() {
+  local key t f failed="" done="" unpinned=""
+  # The key goes only to tenants whose files pin where it is sent, which model it pays for and how much a day.
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    if ! grep -q '^ALICE_JUDGE_JEV_ENDPOINT=' "$f" || ! grep -q '^ALICE_JUDGE_JEV_MODEL=' "$f" \
+      || ! grep -q '^ALICE_JUDGE_DAILY_BUDGET_USD=' "$f"; then
+      unpinned="$unpinned $(basename "$f" .env)"
+    fi
+  done
+  [ -z "$unpinned" ] || die "these tenants do not pin the Jev endpoint, model and budget yet:$unpinned; run alice-server upgrade first (it adds them), then jev-key set"
+  key=$(read_key)
+  [ -n "$key" ] || die "no key was given; nothing changed"
+  case "$key" in *[[:space:]\"\\]*) die "that is not a Jev key (it holds spaces, quotes or backslashes); nothing changed" ;; esac
+  [ "${#key}" -ge 16 ] || die "that is not a Jev key (too short); nothing changed"
+  ( umask 077; printf '%s\n' "$key" | put "$JEV_KEY_FILE" 0600 ) || die "could not write $JEV_KEY_FILE"
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    t=$(basename "$f" .env)
+    if give_jev_key "$t" "$key"; then done="$done $t"; else failed="$failed $t"; fi
+  done
+  say "The Jev key is set, and judge.provider = jev, for:${done:- (no tenant yet)}"
+  say "New tenants get it when they are added; run this again to rotate it everywhere."
+  if [ -n "$failed" ]; then die "these tenants did not take it (is their daemon running?):$failed; run jev-key set again"; fi
+}
+
+cmd_jev_key_status() {
+  local f t file_key="" line state
+  if [ -s "$JEV_KEY_FILE" ]; then
+    say "Jev key: set (since $(date -u -r "$JEV_KEY_FILE" +%Y-%m-%dT%H:%MZ 2>/dev/null || echo unknown))"
+    file_key=$(head -n 1 "$JEV_KEY_FILE")
+  else
+    say "Jev key: not set (alice-server jev-key set)"
+  fi
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    t=$(basename "$f" .env)
+    line=$(grep -m 1 "^$JEV_SECRET = " "$SRV/$t/secrets.toml" 2>/dev/null || true)
+    if [ -z "$line" ]; then state="no key"
+    elif [ -n "$file_key" ] && [ "$line" = "$JEV_SECRET = \"$file_key\"" ]; then state="the server's key"
+    else state="another key"
+    fi
+    printf '  %-16s %s\n' "$t" "$state"
+  done
+}
+
+cmd_cli() { # name alice-args...
+  local name=$1 a seen=0 extra=0
+  shift
+  [ $# -ge 1 ] || { usage >&2; exit 2; }
+  need_tenant "$name"
+  for a in "$@"; do
+    if [ "$seen" = 1 ]; then
+      extra=$((extra + 1))
+      # The one argument after set-secret is the secret's NAME; anything that is not name-shaped could be a value.
+      if [ "$extra" -gt 1 ] || ! [[ "$a" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        # shellcheck disable=SC2016  # the backticks are literal text for the admin, not a command substitution
+        die 'a secret is never passed on the command line; run `alice-server cli <name> config set-secret <secret-name>` and paste it when asked'
+      fi
+    fi
+    if [ "$a" = set-secret ]; then seen=1; fi
+  done
+  exec sudo -u "alice-$name" env ALICE_HOME="$SRV/$name" ALICE_NO_AUTOSTART=1 "$BIN" "$@"
+}
+
+# Every command that changes the server takes the lock alone; imports share it, so two imports run together and an
+# import (it can run for hours, and loses its palace if its daemon restarts) never overlaps an upgrade, a restart or a
+# removal. A lock dies with its process: nothing is left to clear by hand.
+take_lock() {
+  mkdir -p "$(dirname "$LOCK")"
+  exec 9>"$LOCK"
+  flock -n 9 || die "another alice-server command, or an import, is running; wait until it ends, then run this again"
+}
+take_shared_lock() {
+  mkdir -p "$(dirname "$LOCK")"
+  exec 9>"$LOCK"
+  flock -s -n 9 || die "another alice-server command (upgrade, add, remove, adopt, rotate, jev-key) is running; wait until it ends, then import"
+}
+
+main_add() { # add [--team] <name> [--tz <IANA zone>]
+  local team=0 name="" tz="" tz_given=0
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --team) team=1 ;;
+      --tz) [ $# -ge 2 ] || { usage; exit 2; }; tz=$2; tz_given=1; shift ;;
+      -*) usage; exit 2 ;;
+      *) [ -z "$name" ] || { usage; exit 2; }; name=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || { usage; exit 2; }
+  valid_name "$name"
+  if [ "$team" = 1 ] && [ "$name" != "$TEAM" ]; then die "the team store is named $TEAM: alice-server add --team $TEAM"; fi
+  if [ "$team" = 0 ] && [ "$name" = "$TEAM" ]; then die "$TEAM is the shared team store: run alice-server add --team $TEAM"; fi
+  if [ "$tz_given" = 0 ]; then tz=$DEFAULT_TZ; fi
+  valid_tz "$tz"
+  need_avx
+  take_lock
+  cmd_add "$name" "$team" "$tz" "$tz_given"
+}
+
+main() {
+  [[ $# -ge 1 ]] || { usage; exit 2; }
+  case "$1" in
+    add) main_add "$@" ;;
+    remove) [[ $# -ge 2 && $# -le 3 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_remove "$2" "${3:-}" ;;
+    rotate) [[ $# -eq 2 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_rotate "$2" ;;
+    list) cmd_list ;;
+    upgrade) [[ $# -eq 2 ]] || { usage; exit 2; }; take_lock; cmd_upgrade "$2" ;;
+    import) [[ $# -ge 3 && $# -le 4 ]] || { usage; exit 2; }; valid_name "$2"; take_shared_lock; cmd_import "$2" "$3" "${4:-}" ;;
+    cli) [[ $# -ge 3 ]] || { usage; exit 2; }; valid_name "$2"; cmd_cli "${@:2}" ;;
+    adopt)
+      if [[ $# -eq 5 && "$4" = --cloud-denied ]]; then valid_name "$2"; take_lock; cmd_adopt "$2" "$3" "$5"
+      elif [[ $# -eq 3 ]]; then valid_name "$2"; take_lock; cmd_adopt "$2" "$3"
+      else usage; exit 2
+      fi
+      ;;
+    jev-key)
+      [[ $# -eq 2 ]] || { usage; exit 2; }
+      case "$2" in
+        set) take_lock; cmd_jev_key_set ;;
+        status) cmd_jev_key_status ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+main "$@"

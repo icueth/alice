@@ -1,7 +1,7 @@
 //! JSON API over loopback HTTP. The guard (token + Host + Origin) is the code verified in the spike.
 
 use crate::secrets::SecretName;
-use crate::service::Service;
+use crate::service::{Scoped, Service};
 use alice_core::api::*;
 use alice_core::error::AliceError;
 use alice_core::settings::SettingError;
@@ -69,11 +69,62 @@ fn bearer(h: &HeaderMap) -> Option<&str> {
 struct ErrorBody {
     error: String,
     kind: &'static str,
+    /// Present when a write was refused for secret-shaped content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refused: Option<RefusedBody>,
+    /// The project's rules were fail-closed when the refusal was made: the same write may be
+    /// accepted later, so a replayed spool entry is kept, not withheld.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    retry_later: bool,
+}
+
+/// The field and the detectors of a refused write.
+#[derive(Debug, Serialize)]
+struct RefusedBody {
+    field: String,
+    detectors: Vec<String>,
 }
 
 fn refuse(status: StatusCode, kind: &'static str, error: String) -> Response {
-    (status, Json(ErrorBody { error, kind })).into_response()
+    (
+        status,
+        Json(ErrorBody {
+            error,
+            kind,
+            refused: None,
+            retry_later: false,
+        }),
+    )
+        .into_response()
 }
+
+/// The answer to a refused write: `invalid`, with the field and detectors, and whether a retry
+/// may succeed later.
+fn refusal_response(e: AliceError, retry_later: bool) -> Response {
+    let refused = match &e {
+        AliceError::Refused { field, detectors } => Some(RefusedBody {
+            field: field.clone(),
+            detectors: detectors.clone(),
+        }),
+        _ => None,
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorBody {
+            error: e.to_string(),
+            kind: "invalid",
+            refused,
+            retry_later,
+        }),
+    )
+        .into_response()
+}
+
+/// A capability of this daemon the client may rely on: it accepts `client_project` and the
+/// project's `.alice.toml` text.
+pub const CAP_CLIENT_PROJECT: &str = "client-project";
+/// The daemon serves one person on a shared server (`--tenant`).
+pub const CAP_TENANT: &str = "tenant";
 
 /// The refusal for a request whose Host or Origin is not this daemon's, if it is refused.
 fn host_or_origin_refusal(g: &Guard, req: &Request) -> Option<Response> {
@@ -169,6 +220,9 @@ impl IntoResponse for ApiError {
             AliceError::ReadOnly(_) => (StatusCode::SERVICE_UNAVAILABLE, "read_only"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
+        if matches!(self.0, AliceError::Refused { .. }) {
+            return refusal_response(self.0, false);
+        }
         refuse(status, kind, self.0.to_string())
     }
 }
@@ -212,6 +266,10 @@ pub struct PingResponse {
     /// `discovery::ping_proof(token, nonce, instance)` when the ping carried `?nonce=`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<String>,
+    /// What this daemon supports beyond the base API (`CAP_CLIENT_PROJECT`, `CAP_TENANT`); an
+    /// older daemon sends none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -247,11 +305,16 @@ async fn ping(
             )));
         }
     };
+    let mut capabilities = vec![CAP_CLIENT_PROJECT.to_string()];
+    if st.svc.is_tenant() {
+        capabilities.push(CAP_TENANT.to_string());
+    }
     Ok(Json(PingResponse {
         service: "alice".into(),
         instance: st.svc.instance().to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
         proof,
+        capabilities,
     }))
 }
 async fn health(State(st): State<AppState>) -> ApiResult<Health> {
@@ -268,6 +331,16 @@ async fn projects(
 ) -> ApiResult<Vec<alice_core::store::projects::ResolvedProject>> {
     Ok(Json(st.svc.projects().await?))
 }
+/// A project hint is set in-process by the MCP handlers and never comes from the wire: every
+/// handler that takes a request carrying one clears it on entry, through this function. The one
+/// exception is the team store (`--team-store`), whose callers are the personal daemons on the
+/// same server (they hold its token) and name the shared project in the body.
+fn clear_wire_hint(svc: &Service, hint: &mut Option<String>) {
+    if !svc.is_team_store() {
+        *hint = None;
+    }
+}
+
 async fn merge_projects(
     State(st): State<AppState>,
     ApiJson(req): ApiJson<alice_core::api::ProjectMergeRequest>,
@@ -277,9 +350,18 @@ async fn merge_projects(
 /// A read-only database never loses a `remember`: it is spooled (202) and applied after repair.
 async fn remember(
     State(st): State<AppState>,
-    ApiJson(req): ApiJson<RememberRequest>,
+    ApiJson(mut req): ApiJson<RememberRequest>,
 ) -> Result<Response, ApiError> {
-    let r = st.svc.remember_or_spool(req).await?;
+    clear_wire_hint(&st.svc, &mut req.project_hint);
+    let scope_req = req.clone();
+    let r = match st.svc.remember_or_spool(req).await {
+        Ok(r) => r,
+        Err(e) if alice_core::redact::is_refusal(&e) => {
+            let later = st.svc.rules_fail_closed(scope_req.scope()).await;
+            return Ok(refusal_response(e, later));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let status = match r.status {
         RememberStatus::Spooled => StatusCode::ACCEPTED,
         _ => StatusCode::OK,
@@ -288,14 +370,16 @@ async fn remember(
 }
 async fn recall(
     State(st): State<AppState>,
-    ApiJson(req): ApiJson<RecallRequest>,
+    ApiJson(mut req): ApiJson<RecallRequest>,
 ) -> ApiResult<RecallResponse> {
+    clear_wire_hint(&st.svc, &mut req.project_hint);
     Ok(Json(st.svc.recall(req).await?))
 }
 async fn context(
     State(st): State<AppState>,
-    ApiJson(req): ApiJson<ContextRequest>,
+    ApiJson(mut req): ApiJson<ContextRequest>,
 ) -> ApiResult<ContextResponse> {
+    clear_wire_hint(&st.svc, &mut req.project_hint);
     Ok(Json(st.svc.context(req).await?))
 }
 async fn get_memories(
@@ -324,9 +408,18 @@ async fn assert_fact(
 }
 async fn ingest(
     State(st): State<AppState>,
-    ApiJson(req): ApiJson<IngestRequest>,
-) -> ApiResult<alice_core::store::sources::IngestOutcome> {
-    Ok(Json(st.svc.ingest(req).await?))
+    ApiJson(mut req): ApiJson<IngestRequest>,
+) -> Result<Response, ApiError> {
+    clear_wire_hint(&st.svc, &mut req.project_hint);
+    let scope_req = req.clone();
+    match st.svc.ingest(req).await {
+        Ok(o) => Ok(Json(o).into_response()),
+        Err(e) if alice_core::redact::is_refusal(&e) => {
+            let later = st.svc.rules_fail_closed(scope_req.scope()).await;
+            Ok(refusal_response(e, later))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 async fn admin_shutdown(State(st): State<AppState>) -> StatusCode {
     st.shutdown.cancel();
@@ -494,8 +587,9 @@ async fn start_import(
 /// to turn it on (the MCP adapter says the same).
 async fn compat_call(
     State(st): State<AppState>,
-    ApiJson(call): ApiJson<crate::compat::CompatCall>,
+    ApiJson(mut call): ApiJson<crate::compat::CompatCall>,
 ) -> Response {
+    clear_wire_hint(&st.svc, &mut call.project_hint);
     if !st.svc.settings().compat.mempalace {
         return refuse(
             StatusCode::CONFLICT,
@@ -509,8 +603,133 @@ async fn compat_call(
     }
 }
 
+/// The upload script a person runs on their own machine: static text compiled into the binary,
+/// with no secret and no address in it. Only a server tenant serves it.
+const UPLOAD_SCRIPT: &str = include_str!("../assets/upload.sh");
+
+async fn upload_script(State(st): State<AppState>) -> Response {
+    if !st.svc.is_tenant() {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "not found: the upload script is only served by a server tenant".into(),
+        );
+    }
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        UPLOAD_SCRIPT,
+    )
+        .into_response()
+}
+
 async fn import_status(State(st): State<AppState>) -> Json<alice_core::import::ImportStatus> {
-    Json(st.svc.import_status())
+    let mut status = st.svc.import_status();
+    // How much of the imported text still waits for a vector (0 when it cannot be read now).
+    status.embedding_backlog = st.svc.embed_backlog().await.unwrap_or(0);
+    Json(status)
+}
+
+#[derive(serde::Deserialize, Default)]
+struct UploadQuery {
+    /// The same switch as `--allow-remote-embedding`.
+    #[serde(default)]
+    allow_remote_embedding: bool,
+}
+
+fn upload_refusal(e: crate::service::UploadError) -> Response {
+    use crate::service::UploadError;
+    match e {
+        UploadError::Conflict(m) => refuse(StatusCode::CONFLICT, "conflict", m),
+        UploadError::TooLarge(m) => refuse(StatusCode::PAYLOAD_TOO_LARGE, "too_large", m),
+        UploadError::Other(e) => ApiError(e).into_response(),
+    }
+}
+
+/// `POST /api/v1/import/upload` (server tenants): the body is a gzip tar of the person's
+/// MemPalace, streamed to a file in `import-inbox/` and never held in memory. The answer is 202
+/// once it is stored; unpacking and importing go on in the background
+/// (`GET /api/v1/import/status`).
+async fn upload_import(
+    State(st): State<AppState>,
+    query: Result<Query<UploadQuery>, QueryRejection>,
+    req: Request,
+) -> Response {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    if !st.svc.is_tenant() {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "not found: uploads are only for a server tenant".into(),
+        );
+    }
+    let Query(q) = match query {
+        Ok(q) => q,
+        Err(r) => {
+            return ApiError(AliceError::Invalid(format!(
+                "{}; the only option is ?allow_remote_embedding=true",
+                r.body_text()
+            )))
+            .into_response();
+        }
+    };
+    let declared = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    // Admitted (and the one import slot taken) before the first byte of the body is read.
+    let mut ticket = match st.svc.upload_begin(declared, q.allow_remote_embedding) {
+        Ok(t) => t,
+        Err(e) => return upload_refusal(e),
+    };
+    // Declared after the ticket: dropped first, so the file is closed before it is deleted.
+    let file = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(ticket.archive_path())
+    };
+    let mut file = match file {
+        Ok(f) => tokio::fs::File::from_std(f),
+        Err(e) => {
+            ticket.fail(format!("the server cannot store the upload ({e})"));
+            return ApiError(AliceError::Io(e)).into_response();
+        }
+    };
+    let mut body = req.into_body().into_data_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                ticket.fail(format!("the upload broke off before it was complete ({e})"));
+                return ApiError(AliceError::invalid(format!(
+                    "the upload broke off before it was complete ({e})"
+                )))
+                .into_response();
+            }
+        };
+        if let Err(e) = ticket.account(chunk.len() as u64) {
+            return upload_refusal(e);
+        }
+        if let Err(e) = file.write_all(&chunk).await {
+            ticket.fail(format!("the server cannot store the upload ({e})"));
+            return ApiError(AliceError::Io(e)).into_response();
+        }
+    }
+    if let Err(e) = file.flush().await {
+        ticket.fail(format!("the server cannot store the upload ({e})"));
+        return ApiError(AliceError::Io(e)).into_response();
+    }
+    drop(file);
+    match ticket.finish() {
+        Ok(status) => (StatusCode::ACCEPTED, Json(status)).into_response(),
+        Err(e) => upload_refusal(e),
+    }
 }
 
 /// A refused settings change: the first problem as `error` (like every refusal), and all of
@@ -713,7 +932,7 @@ async fn end_on_rotation(State(st): State<AppState>, req: Request, next: Next) -
     Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
-/// Build the router: the public ping, and everything else (the JSON API and the MCP service
+/// Build the router: the public ping and upload script, and everything else (the JSON API and the MCP service
 /// at `/mcp`) behind the token, Host and Origin guard.
 pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: CancellationToken) -> Router {
     let token: SharedToken = Arc::new(parking_lot::RwLock::new(Arc::from(token)));
@@ -727,6 +946,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
     };
     let public = Router::new()
         .route("/api/v1/ping", get(ping))
+        .route("/api/v1/import/upload.sh", get(upload_script))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(g.clone(), host_guard));
     let private = Router::new()
@@ -765,6 +985,11 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         )
         .route("/api/v1/import/mempalace", post(start_import))
         .route("/api/v1/import/status", get(import_status))
+        // The body is the archive itself, streamed to disk: the JSON limit does not apply.
+        .route(
+            "/api/v1/import/upload",
+            post(upload_import).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/v1/compat/call", post(compat_call))
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         .route("/api/v1/admin/token/rotate", post(rotate_token))
@@ -789,6 +1014,52 @@ mod tests {
     use crate::paths::AliceHome;
     use crate::service::ServiceOptions;
     use alice_core::embed::{Embedder, FakeEmbedder};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ping_lists_capabilities_and_a_tenant_says_so() {
+        crate::install_tls();
+        for tenant in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let svc = Service::start(
+                AliceHome::new(d.path().to_path_buf()),
+                &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+                ServiceOptions {
+                    tenant,
+                    ..ServiceOptions::default()
+                },
+            )
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = router(svc, "t".repeat(64), port, CancellationToken::new());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let p: PingResponse = reqwest::get(format!("http://127.0.0.1:{port}/api/v1/ping"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(p.capabilities.contains(&CAP_CLIENT_PROJECT.to_string()));
+            assert_eq!(p.capabilities.contains(&CAP_TENANT.to_string()), tenant);
+        }
+    }
+
+    #[test]
+    fn a_refusal_carries_its_field_and_detectors() {
+        let r = ApiError(AliceError::Refused {
+            field: "content".into(),
+            detectors: vec!["github_token".into()],
+        })
+        .into_response();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let body =
+            futures::executor::block_on(axum::body::to_bytes(r.into_body(), 1 << 20)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["kind"], "invalid");
+        assert_eq!(v["refused"]["field"], "content");
+        assert_eq!(v["refused"]["detectors"][0], "github_token");
+        assert!(v.get("retry_later").is_none());
+    }
 
     /// A client that falls more than the stream's capacity behind is told how many items it
     /// missed (it can list `/api/v1/events` again), instead of a silent gap.
