@@ -20,10 +20,11 @@
 //! - **Seeding:** an `already` session's `remember` calls are stored first, as the agent's own
 //!   memories in the session's project, and are judged. Then the transcript is uploaded as a
 //!   session end, and everything is distilled and judged before any result is read.
-//! - **Matching:** a distilled memory counts while it is not trashed. It matches a labelled item of
-//!   its own session when its body, without the `Context:` line, holds the item's phrase and its
-//!   kind is one of the item's kinds. Each memory is matched on its own; s29's summary is cut into
-//!   two chunks, and memories are never joined across that cut.
+//! - **Matching:** a distilled memory counts while it is active; one the judge trashed does not,
+//!   and any other status fails the test. A memory matches a labelled item of its own session
+//!   when its body, without the `Context:` line, holds the item's phrase and its kind is one of
+//!   the item's kinds. Each memory is matched on its own; s29's summary is cut into two chunks,
+//!   and memories are never joined across that cut.
 //!
 //! **Clocks.** The distillation request holds no clock: `alice_core::distill` is pure. The judge's
 //! comparison gives each memory's age (`age(created_at, now)`). The writer's clock and the judge's
@@ -496,8 +497,10 @@ struct Mem {
 }
 
 impl Mem {
+    /// Stored and counted: `active`. A judged distilled memory is either that or `trashed`
+    /// (`run_session` fails on any other status, so a superseded copy is never scored silently).
     fn live(&self) -> bool {
-        self.status != "trashed"
+        self.status == "active"
     }
 
     /// The body without the `Context:` line that distillation adds (spec §6.5).
@@ -735,6 +738,16 @@ async fn run_session(t: &Arc<EvalTransport>, s: &Session, key: &str, limit: Dura
             p, source_project,
             "{}: the agent's memories are in the session's project",
             s.file
+        );
+    }
+    for (m, _) in &rows {
+        assert!(
+            m.status == "active" || m.status == "trashed",
+            "{}: the distilled {} «{}» is {}; the evaluation scores only active and trashed memories",
+            s.file,
+            m.kind,
+            m.title,
+            m.status
         );
     }
     let questions = svc
@@ -1075,6 +1088,8 @@ async fn distill_eval_replays_the_recorded_answers() {
     let keys: HashSet<String> = recorded.keys().cloned().collect();
     let t = EvalTransport::new(Mode::Replay(recorded));
     let outcomes = run_all(&t, &set, FAKE_KEY, Duration::from_secs(60)).await;
+    // A request sent while the last session was read or shut down is checked too.
+    t.check("after the last session");
     let asked: HashSet<String> = t.hashes().into_iter().collect();
     let mut unused: Vec<&String> = keys.difference(&asked).collect();
     unused.sort();
@@ -1111,6 +1126,7 @@ async fn distill_eval_live() {
         };
         run_all(&t, &set, &key, Duration::from_secs(300)).await
     };
+    t.check("after the last session");
     let m = metrics(&set, &outcomes);
     println!("{}", report(&set, &outcomes, &m));
     let mut lat = t.latencies_ms.lock().clone();
@@ -1136,6 +1152,7 @@ async fn dry_run(set: &[Session]) {
     for n in 1..=2 {
         let t = EvalTransport::new(Mode::Dry);
         let outcomes = run_all(&t, set, FAKE_KEY, Duration::from_secs(60)).await;
+        t.check("after the last session");
         let m = metrics(set, &outcomes);
         let hashes = t.hashes();
         let bytes: usize = t

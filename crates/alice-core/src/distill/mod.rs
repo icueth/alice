@@ -1169,9 +1169,10 @@ fn units(lines: &[Line]) -> Vec<Unit> {
     out
 }
 
-/// A heading line that is a plain paragraph: one short line that does not end a sentence, such
-/// as `Next steps:` or a title in a script without sentence marks. Followed by list items, it
-/// heads them as a heading does.
+/// A heading line that is a plain paragraph: one line of at most [`PASSAGE_MIN`] characters that
+/// does not end in `. ! ?` or their full-width forms, such as `Next steps:` (a Thai line, which has
+/// no sentence mark, qualifies whatever it says). Followed by list items, it heads them as a
+/// heading does.
 fn is_lead_line(unit: &Unit) -> bool {
     let t = unit.text.s.trim();
     unit.kind == UnitKind::Para
@@ -2007,32 +2008,59 @@ mod tests {
     }
 
     /// Task 13 tuning: a heading line keeps its whole bullet group in one passage, so a handoff
-    /// holds what is done and what comes next together. A heading line is a heading, or one short
-    /// line that ends no sentence (with or without a colon, in any script); a sentence before a
-    /// list does not head it.
+    /// holds what is done and what comes next together. A heading line is a heading, or one line
+    /// of at most 80 characters that does not end in `. ! ?` or their full-width forms (with or
+    /// without a colon; a Thai line has no sentence mark); a sentence before a list does not head
+    /// it.
     #[test]
     fn a_heading_line_keeps_its_bullet_group_together() {
         let [a, b, c, d, e] = [500, 501, 502, 503, 504].map(|s| words(s, 12));
-        let reply = format!(
+        let conclusions = |reply: &str| -> Vec<String> {
+            let main = render(&[User("Wrap up the work for today."), Say(reply)]);
+            of(&prepare(&run(main, vec![], true)), S::Conclusion)
+                .iter()
+                .map(|c| c.text.clone())
+                .collect()
+        };
+        let texts = conclusions(&format!(
             "Status for the next session\n- Done: {a}.\n- Next: {b}.\n- Open: {c}.\n\nThat is all for the list.\n- {d}.\n- {e}."
-        );
-        let main = render(&[User("Wrap up the work for today."), Say(&reply)]);
-        let p = prepare(&run(main, vec![], true));
-        let texts: Vec<&str> = of(&p, S::Conclusion)
-            .iter()
-            .map(|c| c.text.as_str())
-            .collect();
+        ));
         assert!(
-            texts.contains(
-                &format!("Status for the next session\n- Done: {a}.\n- Next: {b}.\n- Open: {c}.")
-                    .as_str()
-            ),
+            texts.contains(&format!(
+                "Status for the next session\n- Done: {a}.\n- Next: {b}.\n- Open: {c}."
+            )),
             "{texts:#?}"
         );
         assert!(
             !texts.iter().any(|t| t.contains(&d) && t.contains(&e)),
             "a sentence does not head the list after it: {texts:#?}"
         );
+
+        // A Thai line has no sentence mark: it heads the list after it.
+        let thai = "งานที่ค้างอยู่ตอนนี้";
+        let texts = conclusions(&format!("{thai}\n- {a}.\n- {b}."));
+        assert!(
+            texts.contains(&format!("{thai}\n- {a}.\n- {b}.")),
+            "{texts:#?}"
+        );
+
+        // The bound: a line of 80 characters heads its list, one of 81 does not.
+        for (n, leads) in [(80, true), (81, false)] {
+            let line = format!("Heading {}", "x".repeat(n - 8));
+            assert_eq!(line.chars().count(), n);
+            let texts = conclusions(&format!("{line}\n- {a}.\n- {b}."));
+            assert_eq!(
+                texts.iter().any(|t| t.contains(&line) && t.contains(&a)),
+                leads,
+                "a line of {n} characters: {texts:#?}"
+            );
+            if leads {
+                assert!(
+                    texts.contains(&format!("{line}\n- {a}.\n- {b}.")),
+                    "{texts:#?}"
+                );
+            }
+        }
 
         let summary = format!("## Pending tasks\n- {a}.\n- {b}.\n\n## Current work\n{c}.");
         let p = prepare(&run(render(&[Compact(&summary)]), vec![], false));

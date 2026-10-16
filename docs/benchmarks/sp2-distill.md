@@ -51,7 +51,8 @@ on scheduling.
    offered.
 3. **Settling:** the test waits until the session is distilled and every memory is judged. A distilled duplicate of an
    older memory is trashed.
-4. **Reading:** the test reads the memories with origin `distill`. A memory counts while it is not trashed.
+4. **Reading:** the test reads the memories with origin `distill`. A memory counts while it is active. One the judge
+   trashed does not count, and any other status (pending, superseded, archived) fails the test, naming the memory.
 
 **Matching.** A memory matches a labelled item of its own session when two things hold:
 
@@ -173,7 +174,8 @@ The changes below were made in one round, each to one of the knobs spec §11.3 a
 - **(d) Heading-led bullet groups,** a candidate rule. A heading line followed by list items now keeps the whole group in
   one passage, so a handoff holds what is done and what comes next together.
   - A heading line is either a heading (markdown, a numbered section head, or bold), or one line of at most 80
-    characters that ends no sentence, in any script, with or without a colon.
+    characters that does not end in . ! ? or their full-width forms, with or without a colon. A Thai line has no
+    sentence mark, so any Thai line of 80 characters or fewer before a list heads it.
   - A sentence before a list does not head it.
   - This changed the passages of 4 sessions (s21, s23, s29, s30). Questions went from 232 to 226.
 - **`distill.min_confidence` stays at 0.70.** It was decided before run 2, by a rule the controller fixed in advance:
@@ -194,8 +196,8 @@ The changes below were made in one round, each to one of the knobs spec §11.3 a
 **What each change did in run 2:**
 
 - **(a)** removed 8 of the 9 user prompts. The one left is a pick that gives its reason (s21, decision 0.97).
-- **(c)** made `already_saved` the answer for 6 of the 10 already items. The other four were kept below 0.70 or trashed
-  by the judge.
+- **(c)** made `already_saved` the answer for 6 of the 10 already items. Three more were answered with a knowledge
+  option below 0.70, so they were never kept. The tenth, s25's howto, was kept and then trashed by the judge.
 - **(d)** recovered s29's labelled handoff.
 - **Recall:** the new wording also moved two summary bullets under 0.70 (s09's decision 0.74 → 0.64, s29's bugfix 0.76 →
   0.66). With the s29 handoff gained, recall went from 36 to 35.
@@ -295,5 +297,11 @@ here as numbers only.
   older memories it compares can differ in production.
 - **Jev varies.** Its answers to the same wording can vary between runs. The replay pins the answers recorded here, not
   Jev's behaviour.
-- **One platform.** The replay was checked on macOS arm64 only. On another platform it relies on the fake embedder and the
-  vector index giving the same neighbour order; a near tie could differ.
+- **One platform, and a timing window.** The replay was checked on macOS arm64 only.
+  - **Neighbour order is not the risk.** The fake vectors are bit-exact, and the closest two neighbours in any recorded
+    comparison differ in similarity by 0.02 or more.
+  - **The residual is a timing window in the product.** The embed worker marks a memory's embedding done before it adds
+    the vector to the index. On a loaded runner, the judge can read a newer memory's neighbours before an older
+    memory's vector is in the index. The newer memory's comparison body then differs.
+  - **Effect:** the replay fails loudly, with a miss and an unused answer, and never passes falsely.
+  - **Owner:** the fix is in product code, and it is a follow-up for pane 4.
