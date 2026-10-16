@@ -4031,11 +4031,12 @@ mod tests {
         Some(repo.to_string_lossy().into_owned())
     }
 
+    type Hooks = parking_lot::Mutex<HashMap<String, Box<dyn FnMut() + Send>>>;
+
     /// Run by [`stamped_memory`] between its two reads of the memory with that id (tests only).
     /// Keyed by id: the reads run on the reader pool's threads, beside other tests.
-    static BETWEEN_STAMP_AND_TEXT: std::sync::LazyLock<
-        parking_lot::Mutex<HashMap<String, Box<dyn FnMut() + Send>>>,
-    > = std::sync::LazyLock::new(Default::default);
+    static BETWEEN_STAMP_AND_TEXT: std::sync::LazyLock<Hooks> =
+        std::sync::LazyLock::new(Default::default);
 
     pub(super) fn between_stamp_and_text(id: &str) {
         if let Some(f) = BETWEEN_STAMP_AND_TEXT.lock().get_mut(id) {
