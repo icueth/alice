@@ -25,7 +25,7 @@ const DISTILL_KINDS: [&str; 7] = [
     "handoff",
 ];
 
-/// The blocks the distiller reads passages from (spec §6.3); tool calls and results are not.
+/// Blocks a person or a model wrote, as opposed to tool calls and results.
 const READABLE: [&str; 4] = ["[user]", "[assistant]", "[summary]", "[subagent "];
 
 const REMEMBER: &str = "mcp__alice__remember";
@@ -45,23 +45,86 @@ fn session_bytes(file: &str) -> Vec<u8> {
     std::fs::read(dir().join("sessions").join(file)).unwrap()
 }
 
-/// The rendered text of every block the distiller can read, one string per block (a block runs
-/// from its tag line to the next tag line).
-fn readable_blocks(rendered: &str) -> Vec<String> {
-    let mut blocks: Vec<(bool, String)> = Vec::new();
-    for line in rendered.lines() {
-        if TAGS.iter().any(|t| line.starts_with(t)) {
-            let readable = READABLE.iter().any(|t| line.starts_with(t));
-            blocks.push((readable, line.to_owned()));
-        } else if let Some((_, block)) = blocks.last_mut() {
-            block.push('\n');
-            block.push_str(line);
+/// One rendered block: a tag line and the lines up to the next tag.
+struct Block {
+    /// `[user]`, `[assistant]`, `[subagent Explore]`, `[tool Bash]`, …
+    tag: String,
+    /// The text after the tag (and after a split block's `(cont.)`).
+    body: String,
+    /// The distiller takes passages from it (spec §6.3): a user prompt, a compaction summary, a
+    /// subagent's report, or the last assistant text of the turn.
+    candidate: bool,
+}
+
+impl Block {
+    fn readable(&self) -> bool {
+        READABLE.iter().any(|t| self.tag.starts_with(t))
+    }
+}
+
+/// The blocks of one turn's rendered chunks.
+fn turn_blocks(text: &str) -> Vec<Block> {
+    let mut blocks: Vec<Block> = Vec::new();
+    for line in text.lines() {
+        if !TAGS.iter().any(|t| line.starts_with(t)) {
+            if let Some(block) = blocks.last_mut() {
+                block.body.push('\n');
+                block.body.push_str(line);
+            }
+            continue;
         }
+        let (tag, rest) = line.split_at(line.find(']').unwrap() + 1);
+        let body = rest.strip_prefix(' ').unwrap_or(rest);
+        let body = body.strip_prefix("(cont.) ").unwrap_or(body);
+        let candidate = match tag {
+            "[user]" | "[summary]" => true,
+            // A subagent call is `[subagent <type>] <description>`, then its report under the same
+            // tag (no call in the set runs in parallel with another).
+            t if t.starts_with("[subagent ") => {
+                blocks.last().is_some_and(|b| b.tag == t && !b.candidate)
+            }
+            _ => false,
+        };
+        blocks.push(Block {
+            tag: tag.to_owned(),
+            body: body.to_owned(),
+            candidate,
+        });
+    }
+    if let Some(last) = blocks.iter_mut().rev().find(|b| b.tag == "[assistant]") {
+        last.candidate = true;
     }
     blocks
-        .into_iter()
-        .filter_map(|(readable, block)| readable.then_some(block))
-        .collect()
+}
+
+/// Where a gold phrase sits must be a passage the distiller proposes (spec §6.3; the brief's
+/// placement rule): a whole user prompt of 20–800 characters, or one paragraph or bullet group
+/// of 80–1,200 characters; and the phrase ends within the passage's first 1,000 characters, so an
+/// extractive memory of the passage holds it.
+fn check_placement(file: &str, phrase: &str, block: &Block) {
+    let chars = |s: &str| s.chars().count();
+    let passage = if block.tag == "[user]" {
+        assert!(
+            (20..=800).contains(&chars(&block.body)),
+            "{file}: {phrase:?}: a user prompt of {} characters",
+            chars(&block.body)
+        );
+        block.body.as_str()
+    } else {
+        let paragraph = block
+            .body
+            .split("\n\n")
+            .find(|p| p.contains(phrase))
+            .unwrap();
+        assert!(
+            (80..=1200).contains(&chars(paragraph)),
+            "{file}: {phrase:?}: a passage of {} characters",
+            chars(paragraph)
+        );
+        paragraph
+    };
+    let end = chars(&passage[..passage.find(phrase).unwrap()]) + chars(phrase);
+    assert!(end <= 1000, "{file}: {phrase:?} ends at character {end}");
 }
 
 /// The `content` of every `mcp__alice__remember` call in the raw transcript.
@@ -154,17 +217,19 @@ fn distill_fixtures_read_cleanly_and_match_their_labels() {
             "{file}: {} turns",
             out.turns.len()
         );
-        let rendered = out
+        let turns: Vec<String> = out
             .turns
             .iter()
-            .flat_map(|t| &t.chunks)
-            .map(|c| c.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|t| {
+                let chunks: Vec<&str> = t.chunks.iter().map(|c| c.text.as_str()).collect();
+                chunks.join("\n")
+            })
+            .collect();
+        let rendered = turns.join("\n");
         if is_thai(&rendered) {
             thai.push(kind);
         }
-        let blocks = readable_blocks(&rendered);
+        let blocks: Vec<Block> = turns.iter().flat_map(|t| turn_blocks(t)).collect();
         let saved = remembered(&bytes);
         assert_eq!(
             kind == "already",
@@ -191,9 +256,24 @@ fn distill_fixtures_read_cleanly_and_match_their_labels() {
                 rendered.contains(phrase),
                 "{file}: {phrase:?} is not in the rendered text"
             );
-            // One passage holds the phrase: no other block the distiller reads repeats it.
-            let hits: usize = blocks.iter().map(|b| b.matches(phrase).count()).sum();
+            // One passage holds the phrase: no other written block repeats it, and the one that
+            // holds it is a candidate passage.
+            let hits: usize = blocks
+                .iter()
+                .filter(|b| b.readable())
+                .map(|b| b.body.matches(phrase).count())
+                .sum();
             assert_eq!(hits, 1, "{file}: {phrase:?} in {hits} readable places");
+            let holder = blocks
+                .iter()
+                .find(|b| b.readable() && b.body.contains(phrase))
+                .unwrap();
+            assert!(
+                holder.candidate,
+                "{file}: {phrase:?} is in a {} block that is not a candidate passage",
+                holder.tag
+            );
+            check_placement(file, phrase, holder);
             if kind == "already" {
                 assert!(
                     saved.iter().any(|c| c.contains(phrase)),

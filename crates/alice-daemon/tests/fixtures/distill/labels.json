@@ -89,7 +89,8 @@
         {
           "phrase": "rust_decimal for parcel weights instead of f64",
           "kinds": [
-            "decision"
+            "decision",
+            "bugfix"
           ]
         },
         {
@@ -139,7 +140,8 @@
         {
           "phrase": "จะไม่เก็บเลขบัตรประชาชนคนไข้ลง database",
           "kinds": [
-            "decision"
+            "decision",
+            "preference"
           ]
         },
         {
@@ -169,7 +171,8 @@
         {
           "phrase": "dedupe key now includes business_date",
           "kinds": [
-            "decision"
+            "decision",
+            "bugfix"
           ]
         },
         {
@@ -280,7 +283,8 @@
           "phrase": "Typing events go through PubSub only",
           "kinds": [
             "warning",
-            "decision"
+            "decision",
+            "bugfix"
           ]
         }
       ]
@@ -305,7 +309,8 @@
         {
           "phrase": "Prod applies run from CI only",
           "kinds": [
-            "warning"
+            "warning",
+            "fact"
           ]
         },
         {
@@ -447,7 +452,8 @@
         {
           "phrase": "deployed only on tags matching v*",
           "kinds": [
-            "fact"
+            "fact",
+            "warning"
           ]
         }
       ]
@@ -459,7 +465,8 @@
         {
           "phrase": "อย่า cache ค่าส่งเกิน 10 นาที",
           "kinds": [
-            "warning"
+            "warning",
+            "bugfix"
           ]
         },
         {
