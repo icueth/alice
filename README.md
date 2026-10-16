@@ -29,7 +29,7 @@ Alice is built for that workload: many agents, many projects, one memory that st
 ## Highlights
 
 - **Never blocks your agent.** A single daemon owns the database. Writes are acknowledged in under 50 ms; embedding and indexing run in the background. If the daemon is down or still starting, writes spool to disk and nothing is lost.
-- **Knowledge first, transcripts on demand.** Two tiers: short, distilled *memories* (decisions, fixes, facts, how-tos, preferences, warnings, handoffs) are searched by default; raw session transcripts are kept as evidence and searched when you ask or when knowledge runs thin. *(Automatic transcript capture and distillation: planned, SP2.)*
+- **Knowledge first, transcripts on demand.** Two tiers: short, distilled *memories* (decisions, fixes, facts, how-tos, preferences, warnings, handoffs) are searched by default; raw session transcripts are kept as evidence and searched when you ask or when knowledge runs thin. Claude Code and Codex sessions are captured into the raw tier as they happen, and can be distilled into memories ([automatic capture](#automatic-capture)).
 - **Search that understands code and Thai.** Hybrid retrieval: multilingual vectors, BM25, trigram matching for languages without spaces (Thai, CJK), and identifier-aware matching (`HostLinkReconnect`, `writer_lease`, file paths). Results respect the current project, recency, importance and status.
 - **Memory that corrects itself.** A new memory is compared with the similar ones already stored. A copy of the same text folds into the older memory; with the optional judge, updates supersede old facts and contradictions go to a review inbox (`alice review`). Every change is logged (`alice history`) and can be undone (`alice undo`).
 - **Optional AI judge.** Plug in [TypeSafe Jev](https://typesafe.ai) for calibrated decisions (deduplication, kind, project routing, grading search results) with confidence thresholds, a response cache and a daily budget that is never exceeded. Without it, Alice uses offline rules that merge only text that is identical and leave everything else for you to review.
@@ -38,7 +38,7 @@ Alice is built for that workload: many agents, many projects, one memory that st
 - **Knowledge graph with time.** Entities and relations with validity periods (`as_of` queries, timelines) and a predicate vocabulary that prevents `has_bug` / `had_bug` drift.
 - **Private by default.** Local-first storage and a loopback-only server with token and origin checks. Secrets (API keys, tokens, passwords, private keys) in text are redacted before anything is written, queued or sent; API keys live in a private file (`secrets.toml`, mode 0600) with the OS keychain as an option; a project can be kept away from every cloud service.
 - **Looks after itself.** Daily backups with rotation, integrity checks, retention and trash purge run when the daemon is idle; `alice doctor` says what is wrong and what to do next; `alice service install` starts the daemon at login. Settings change live, without a restart.
-- **One binary.** Daemon, CLI and MCP server (and, in SP2, hooks) in a single Rust binary with the embedding runtime built in. No Python environments, no Docker. Other embedding providers (Ollama, OpenAI-compatible, Voyage) are a setting away.
+- **One binary.** Daemon, CLI, MCP server and agent hooks in a single Rust binary with the embedding runtime built in. No Python environments, no Docker. Other embedding providers (Ollama, OpenAI-compatible, Voyage) are a setting away.
 - **Git sync as Markdown** *(planned, M4)*. Push and pull memories to any git remote as one Markdown file per memory. Readable on GitHub, opens in Obsidian, syncs across machines with record-level merging. The database file never goes into git.
 - **Graph and management UI** *(planned, SP3)*. Explore the memory graph, edit memories, resolve reviews, change every setting and run git push/pull from the browser or a desktop app.
 - **Bring your MemPalace.** Import an existing MemPalace palace (drawers, diaries, knowledge graph) and keep using `mempalace_*` tool names through an optional compatibility layer. On a shared server, a person uploads their own palace with one script ([docs/server.md](docs/server.md#a-person-imports-their-own-mempalace)).
@@ -64,6 +64,23 @@ Alice is built for that workload: many agents, many projects, one memory that st
 | **Fact** | A knowledge-graph relation between entities, valid over a period of time. |
 | **Review** | A decision the system was not confident enough to make alone. |
 | **Event** | One recorded change (who, what, before and after). `alice undo` reverses it. |
+
+## Choose: local or server
+
+Alice runs where you choose: on your own machine, or as your own space (a "tenant") on a server your team shares.
+
+| | Local | Server tenant |
+|---|---|---|
+| Where your memory lives | `~/.alice` on your machine | Your own daemon on the team's Linux server, at `https://<host>/u/<name>` |
+| What you install | The `alice` binary, built from source | Nothing heavy: agents connect over HTTPS, and capture needs only `sh` and `curl` |
+| How agents connect | `alice mcp` (stdio) | MCP over HTTPS with your bearer token |
+| Automatic capture | `alice hooks install claude` (or `codex`) | One setup line from your admin |
+| Privacy | Text leaves the machine only for the cloud services you turn on; a repository's `.alice.toml` applies in full | The server always redacts secrets, the admin can read your memory, and `.alice.toml` does not apply over MCP |
+| Shared team memory | No | Optional |
+| Platforms | macOS (Apple Silicon), Linux | Any agent that speaks MCP over HTTP; capture on macOS and Linux |
+| Setup guide | [docs/setup-local.md](docs/setup-local.md) | [docs/setup-server.md](docs/setup-server.md) |
+
+Both setup guides are written for an agent: hand the file to Claude Code or Codex ("Read docs/setup-local.md and follow every step") and it installs and connects everything, asking you only about your choices (importing MemPalace, retiring it, turning distillation on). You can start locally and move later: your admin can adopt your local database into a tenant ([docs/server.md](docs/server.md#moving-your-local-alice-to-the-server)).
 
 ## Install from source
 
@@ -115,11 +132,11 @@ alice status                   # daemon, counts, embedding and judge backlog, op
 alice doctor                   # what is wrong, if anything, and what to do next
 ```
 
-The project is detected from the working directory (git remote, or the directory name); memories written outside any project go to `global`. `alice import mempalace` brings an existing MemPalace in ([details](#importing-from-mempalace)). Planned: `alice setup` to connect every installed agent (SP2) and `alice ui` (SP3).
+The project is detected from the working directory (git remote, or the directory name); memories written outside any project go to `global`. `alice import mempalace` brings an existing MemPalace in ([details](#importing-from-mempalace)). To have an agent install and connect everything for you, hand it [docs/setup-local.md](docs/setup-local.md). Planned: `alice ui` (SP3).
 
 ## Connecting agents
 
-Register `alice mcp` as a stdio MCP server (`alice setup` will do this automatically in SP2). The shim starts the daemon when needed, and the client's workspace root, if it sends one, decides the project. The client's name is recorded as the author of what it writes:
+Register `alice mcp` as a stdio MCP server ([docs/setup-local.md](docs/setup-local.md) lets an agent do this for you). The shim starts the daemon when needed, and the client's workspace root, if it sends one, decides the project. The client's name is recorded as the author of what it writes:
 
 <details>
 <summary><b>Claude Code</b></summary>
@@ -179,6 +196,28 @@ Agents that cannot use MCP can call the CLI (`alice recall`, `alice remember`, `
 
 The server also sends usage instructions, offers `recall` and `remember-session` prompts and the `memory://context` and `memory://m/{id}` resources. An admin toolset (`review_list`, `review_resolve`, `merge_memories`, `stats`) is off by default: switch it on with `alice config set mcp.admin_tools true` (the stdio shim asks the daemon each time it lists tools, so no daemon restart is needed; an agent that listed its tools before sees them in its next session).
 
+## Automatic capture
+
+Alice can keep every Claude Code and Codex session as it happens, without the agent doing anything:
+
+```bash
+alice hooks install claude      # Claude Code: five hooks in ~/.claude/settings.json (backed up; other hooks kept)
+alice hooks install codex       # Codex: ~/.codex/hooks.json; then trust the hooks once in Codex's /hooks
+alice capture status            # captured sessions, how far each was read, where its distillation stands
+alice recall --raw "the migration error from yesterday"
+```
+
+- **Every turn, once.** Each finished turn is stored in the raw tier, in the session's project. Hooks that fire twice, a crash, or a resumed or forked session never store a turn twice. Transcripts are found with `recall --raw` (`include_raw`) and never fill the knowledge hits or the briefing.
+- **Trimmed, not dumped.** Tool output keeps its head and tail; file contents read or edited, thinking, images and memory-tool results are never stored; secrets are redacted (in block mode a chunk with a secret is withheld and capture goes on).
+- **Never in the way.** `alice hook` ends within 100 ms (about 7 ms at p95 with the daemon up), always exits 0, and spools when the daemon is down.
+- **A briefing at the start.** Each new Claude Code session starts with the project's `context` briefing (`capture.briefing = false` turns it off).
+- **You decide what is kept.** `capture.excluded_projects`, `no_capture = true` in a repository's `.alice.toml`, or `capture.enabled = false`.
+- **Distillation, if you want it.** With the Jev judge, `alice config set distill.provider jev` turns ended sessions into a few short memories, marked `(auto)`, within a share of the judge's daily budget. It is off by default, and it never asks you anything.
+- **Older sessions too.** `alice capture backfill claude --since 2026-09-01` captures what is already on disk.
+- **On a server tenant**, one setup line from your admin does the same, with no Alice binary ([docs/server.md](docs/server.md#capture-for-team-members)).
+
+Details, privacy and the settings: [docs/capture.md](docs/capture.md).
+
 ## CLI
 
 ```
@@ -206,6 +245,11 @@ alice daemon start | stop | status | logs | run
 alice token rotate [--show]
 alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # stdio MCP server for agents
+alice hook <session-start|stop|subagent-stop|pre-compact|session-end> [--agent claude-code|codex]
+                               # what agents' hooks run (the hook's JSON on stdin); always exits 0
+alice hooks install | uninstall | status <claude|codex> [--settings <file>] [--dry-run]
+alice capture status | distill <session-id>
+alice capture backfill <claude|codex> [--since YYYY-MM-DD] [--project <slug>] [--distill]
 alice model fetch | check      # check: load the model and embed one text (no daemon)
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 alice import mempalace [--palace dir] [--dry-run] [--since date] [--map-wing wing=project]...
@@ -215,7 +259,7 @@ alice import status
 
 `--action move` takes `--project` alone (other flags are refused, and so is `--project` with any other action). Like a project merge, it refuses to move a memory out of a project kept away from cloud providers into one that is not, and it checks the text against the destination's privacy rules: in `block` mode a text those rules would change is refused, otherwise it moves redacted by them.
 
-Every command takes `--json` (except `daemon logs`, `config edit` and `model fetch`, which print no JSON document). Planned: `sync` (M4), `hook` (SP2), `ui` (SP3).
+Every command takes `--json` (except `daemon logs`, `config edit`, `model fetch` and `hook`, which print no JSON document). Planned: `sync` (M4), `ui` (SP3).
 
 ## Configuration
 
@@ -280,6 +324,7 @@ Environment variables:
 [privacy]
 block_secrets = true      # refuse writes in this project that contain a secret
 cloud_denied = true       # never send this project's text to Jev or a remote embedding provider
+no_capture = true         # never capture agent sessions in this repository
 custom_patterns = [{ name = "internal_id", regex = "ID-[0-9]{8}" }]
 ```
 
@@ -433,7 +478,7 @@ M1 missed the memory budget (about 1.4 GB projected with the model). M2 meets it
 
 A small team can share one Linux server. Each person gets their own Alice daemon behind `https://<host>/u/<name>`, and agents (Claude Code, Codex and others) connect straight to the MCP endpoint `https://<host>/u/<name>/mcp` with a bearer token. No client binary is needed, so this also works on Windows. An optional shared team memory lets a person tell their agent "save this to the shared memory"; every team member can read it, and only its author or the admin can change it. The server's admin can read every person's memory, and a repository's `.alice.toml` does not apply over direct MCP. The server needs an x86-64 CPU with AVX (AVX2 is not needed: `deploy/server/build-release` builds the server binary with Microsoft's ONNX Runtime).
 
-The admin guide (setup, `alice-server`, disk budget, backups, privacy) and the setup for each agent are in [docs/server.md](docs/server.md).
+The admin guide (setup, `alice-server`, disk budget, backups, privacy), the setup for each agent and capture for team members are in [docs/server.md](docs/server.md). A person can hand [docs/setup-server.md](docs/setup-server.md) to their agent, which connects everything.
 
 ## Roadmap
 
@@ -443,8 +488,10 @@ The admin guide (setup, `alice-server`, disk budget, backups, privacy) and the s
 | **SP1 · M2** | Judge (heuristic + Jev), review inbox, undo, redaction, backups and restore, maintenance, live settings, doctor, service install, HTTP embedding providers, Windows build, the 800 MB memory budget | Done (alpha) |
 | **SP1 · M3** | MemPalace importer and compatibility layer | Built, in final review (alpha) |
 | **SP1 · M4** | Git sync | Planned |
-| **SP2** | Automatic capture and distillation, `alice setup`, hooks/plugins for every supported agent | Planned |
+| **SP2** | Automatic capture of Claude Code and Codex sessions (local hooks and server-tenant scripts), distillation with Jev, MemPalace cut-over and backfill, agent-runnable setup guides | Built (alpha) |
 | **SP3** | Web UI (graph, memory manager, reviews, settings, sync, health), then a desktop app | Planned |
+
+Capture for Cursor, Windsurf, OpenCode and Gemini CLI comes later; their `capture.*` switches already exist.
 
 Design details: [Alice Core design spec](docs/superpowers/specs/2026-10-13-alice-core-design.md).
 
