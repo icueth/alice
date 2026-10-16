@@ -651,7 +651,7 @@ The owner already runs Alice on their Mac (3,286 memories, 121,007 chunks, every
 hand, memories that MemPalace does not have). A MemPalace import would lose the cleanups and those memories and take
 about 6 hours to embed. The other people keep the MemPalace import.
 
-- **`alice-server adopt <name> <backup-file>`** (root): the person's `alice backup now` file becomes the tenant's
+- **`alice-server adopt <name> <backup-file> [--cloud-denied <slug,…>]`** (root): the person's `alice backup now` file becomes the tenant's
   database. It refuses the team store, a file that is not a regular file owned by the admin (`SUDO_UID`), and a disk with
   less than twice the file plus 2 GB free. It copies the file into `<home>/adopt-inbox/` (the tenant's, 0600), stops the
   unit, runs `alice --json adopt <copy>` as the tenant, starts the unit and waits for its ping. If the tenant does not
@@ -674,7 +674,10 @@ about 6 hours to embed. The other people keep the MemPalace import.
   5. on any failure after the swap, swaps the tenant's own database back, so an unscrubbed copy is never served;
   6. reports memories, chunks, facts, projects, paths cleared, records rewritten, redactions, duplicates trashed, the
      saved database and the time.
-- Settings, secrets, the token and the Jev key are not taken from the source: only `alice.db` changes.
+- Settings, secrets, the token and the Jev key are not taken from the source: only `alice.db` changes. The person's
+  cloud denials therefore do not come along on their own (final review I-4): `--cloud-denied` (slugs, a-z 0-9 -) sets
+  the tenant's `privacy.cloud_denied_projects` once it answers, and the report's `projects_with_roots` names the
+  projects that had a working tree (whose `.alice.toml` may have denied the cloud).
 - If the source used another embedding model, the existing re-embed path runs at start.
 - Content is not scrubbed: a memory that mentions a file path in its text keeps it (it is what the person wrote). The
   staging check "no client path in the store" applies to the columns above.
@@ -699,6 +702,10 @@ supply a key.
   of one is printed (R45).
 - **Budget:** each tenant keeps its own `judge.daily_budget_usd` (1.0 by default); `docs/server.md` states the
   deployment-wide ceiling (tenants × the per-tenant budget) and how to change one tenant's.
+- **Pins (final review C1, R46):** every tenant file carries `ALICE_JUDGE_JEV_ENDPOINT=<Jev's endpoint>` and
+  `ALICE_JUDGE_DAILY_BUDGET_USD=1.0`; the environment wins over a person's `PATCH /api/v1/settings` (reported as
+  overridden), so the owner's key goes nowhere else and the budget holds. `upgrade` adds both where missing and keeps a
+  budget the admin changed. A tenant's settings view shows a secret as set with no hint.
 - **SP2:** `give_jev_key` is the one place a tenant is switched to Jev; `distill.provider = jev` joins it when SP2 lands
   on this branch.
 - Real check: a **dummy** key on a staging tenant (the judge fails closed with a note); never the owner's key, which the
@@ -1338,6 +1345,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R43 | `adopt` also redacts event snapshots and review payloads, and deletes the judge cache | History and the inbox hold what the person's machine stored; a tenant's database must hold no unredacted secret | Undo of an older edit restores redacted text, as it does for anything the rules redact |
 | R44 | The server keeps the shared Jev key in `/etc/alice/jev.key` (root, 0600) | `add` needs the value for each new tenant; re-reading a tenant's `secrets.toml` would tie the script to that file's format | One more root-only copy of the key on the server |
 | R45 | `jev-key status` prints no hint of a key (not even its last four characters, which `config set-secret` shows) | Addendum 5: status never prints the value | Telling two keys apart needs `jev-key set` again |
+| R46 | The Jev endpoint and the judge budget are pinned in every tenant file (final review C1) | With one shared key, a person who could change the endpoint could send the owner's key to their own host; one who could raise the budget would spend the owner's money | Changing a tenant's budget means editing its tenant file and restarting it |
 
 ---
 

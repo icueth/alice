@@ -194,6 +194,8 @@ add_creates_everything() {
   has "$e" 'ALICE_BACKUP_DAILY=2'
   has "$e" 'ALICE_BACKUP_WEEKLY=0'
   has "$e" 'TZ=Asia/Bangkok'
+  has "$e" 'ALICE_JUDGE_JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone'
+  has "$e" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
   hasnt "$e" 'tok-'
   local u="$R/etc/systemd/system/alice@.service"
   has "$u" 'MemoryMax=3G'
@@ -831,6 +833,16 @@ upgrade_adds_the_time_zone_to_older_tenants() {
   has "$TENANTS/bob.env" 'TZ=Europe/Berlin'
   hasnt "$TENANTS/bob.env" 'TZ=Asia/Bangkok'
   printf '%s\n' "$OUT" | grep -qF 'TZ=Asia/Bangkok added for: ann' || fail "$OUT"
+  # The Jev pins (final review C1) arrive the same way, and a budget the admin changed is kept.
+  grep -v '^ALICE_JUDGE_' "$TENANTS/ann.env" >"$T/ann.env" && cat "$T/ann.env" >"$TENANTS/ann.env"
+  sed 's/^ALICE_JUDGE_DAILY_BUDGET_USD=.*/ALICE_JUDGE_DAILY_BUDGET_USD=0.5/' "$TENANTS/bob.env" >"$T/bob.env"
+  cat "$T/bob.env" >"$TENANTS/bob.env"
+  run upgrade "$R/new-alice"
+  [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
+  has "$TENANTS/ann.env" 'ALICE_JUDGE_JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone'
+  has "$TENANTS/ann.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
+  has "$TENANTS/bob.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=0.5'
+  printf '%s\n' "$OUT" | grep -qF 'the Jev endpoint and budget pinned for: ann' || fail "$OUT"
   run add bob --tz Asia/Bangkok
   pass
 }
@@ -852,6 +864,14 @@ adopt_installs_and_reports() {
   [ "$(grep -c 'systemctl start alice@ann' "$R/calls.log")" = "$((starts + 1))" ] || fail "the unit was not started once"
   printf '%s\n' "$OUT" | grep -qF 'paths_cleared: 3' || fail "no report: $OUT"
   printf '%s\n' "$OUT" | grep -qF "Delete $ADOPT_FILE now" || fail "$OUT"
+  hasnt "$R/calls.log" 'privacy.cloud_denied_projects'
+  # The person's cloud denials come along when the admin names them (final review I-4).
+  adopt ann "$ADOPT_FILE" --cloud-denied client-x,shop
+  [ "$RC" = 0 ] || fail "adopt --cloud-denied exited $RC: $OUT"
+  has "$R/calls.log" 'alice config set privacy.cloud_denied_projects ["client-x","shop"]'
+  printf '%s\n' "$OUT" | grep -qF 'Kept from the cloud on ann: client-x,shop' || fail "$OUT"
+  adopt ann "$ADOPT_FILE" --cloud-denied 'x;rm'
+  [ "$RC" != 0 ] || fail "a bad slug list was accepted"
   [ ! -e "$SRV/ann/adopt-inbox" ] || fail "the staged copy was left"
   [ -f "$ADOPT_FILE" ] || fail "the admin's file was consumed"
   pass

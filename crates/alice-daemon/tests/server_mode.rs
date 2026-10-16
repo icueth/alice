@@ -825,6 +825,46 @@ async fn a_shared_memory_moves_only_within_the_team_store_and_only_by_its_author
     assert!(stored(&s.tenant("bob").home).is_empty());
 }
 
+/// Final review I-1: superseding marks the older memory, so it is the older memory's author's to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_author_supersedes_a_shared_memory() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    let (ann, bob) = (&s.tenant("ann").svc, &s.tenant("bob").svc);
+    let id = ann
+        .remember(shared("The deploy window is on Friday", Some("cursor")))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let status = |s: &Server, team_id: &str| {
+        let id = team_id.strip_prefix("team:").unwrap().to_string();
+        let svc = s.team.as_ref().unwrap().svc.clone();
+        async move {
+            svc.get(GetRequest {
+                ids: vec![id],
+                include_provenance: false,
+            })
+            .await
+            .unwrap()
+            .memories[0]
+                .memory
+                .status
+        }
+    };
+    let mut by_bob = shared("The deploy window is on Monday", Some("cursor"));
+    by_bob.supersedes = vec![id.clone()];
+    let e = bob.remember(by_bob).await.unwrap_err();
+    assert!(
+        matches!(&e, alice_core::error::AliceError::Invalid(m) if m == SHARED_REFUSAL),
+        "{e:?}"
+    );
+    assert_ne!(status(&s, &id).await, alice_core::model::Status::Superseded);
+    let mut by_ann = shared("The deploy window is on Monday", Some("cursor"));
+    by_ann.supersedes = vec![id.clone()];
+    ann.remember(by_ann).await.unwrap();
+    assert_eq!(status(&s, &id).await, alice_core::model::Status::Superseded);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn only_the_author_undoes_a_shared_change() {
     let s = Server::start_with_team(&["ann", "bob"]).await;
