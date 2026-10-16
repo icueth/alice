@@ -2515,6 +2515,12 @@ async fn a_null_codex_path_is_found_by_session_id() {
     assert_eq!(svc.capture_counts().rollouts_not_found, 1);
     assert!(!source_exists(&svc, &format!("codex:session:{old_id}")));
     assert!(!source_exists(&svc, &format!("codex:session:{zst_id}")));
+    // Task 8: `alice doctor` reads the counts from the health's capture line.
+    let capture = svc.health().await.unwrap().capture.unwrap();
+    assert_eq!(
+        (capture.rollouts_not_found, capture.rollouts_compressed),
+        (1, 1)
+    );
 }
 
 /// Review fix F1: a rollout is `rollout-*-<session id>.jsonl` (or `.jsonl.zst`), the whole id at
@@ -2573,6 +2579,9 @@ async fn a_rollout_matches_the_whole_session_id() {
     .await;
     assert_eq!(svc.capture_counts().rollouts_compressed, 0);
     assert!(!source_exists(&svc, "codex:session:bc"));
+    // Task 8: counted for `alice doctor` though nothing was ever captured.
+    let capture = svc.health().await.unwrap().capture.unwrap();
+    assert_eq!((capture.rollouts_not_found, capture.sessions_24h), (1, 0));
 }
 
 /// Review fix F2: a compressed rollout named by the hook itself is skipped by its file name,

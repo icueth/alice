@@ -937,17 +937,23 @@ fn distill_state(s: &Settings) -> &'static str {
     }
 }
 
-/// The capture line of the health; `None` while capture never ran.
+/// The capture line of the health; `None` while capture never ran. `rollouts`: what the local
+/// worker counted (zeros on a tenant).
 pub(crate) fn health(
     conn: &Connection,
     settings: &Settings,
     unrecognised_lines_7d: u64,
+    rollouts: LocalCaptureCounts,
 ) -> Result<Option<Box<CaptureHealth>>> {
     let count = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<u64> {
         Ok(conn.query_row(sql, p, |r| r.get::<_, i64>(0))? as u64)
     };
     let sources = count("SELECT count(*) FROM capture_state", &[])?;
-    if sources == 0 && unrecognised_lines_7d == 0 {
+    if sources == 0
+        && unrecognised_lines_7d == 0
+        && rollouts.rollouts_not_found == 0
+        && rollouts.rollouts_compressed == 0
+    {
         return Ok(None);
     }
     let since = (chrono::Utc::now() - chrono::Duration::hours(24))
@@ -980,6 +986,8 @@ pub(crate) fn health(
         distill_dropped_24h: 0,
         distill_warning: None,
         unrecognised_lines_7d,
+        rollouts_not_found: rollouts.rollouts_not_found,
+        rollouts_compressed: rollouts.rollouts_compressed,
     })))
 }
 

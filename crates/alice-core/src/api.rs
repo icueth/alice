@@ -697,6 +697,14 @@ pub struct CaptureHealth {
     /// Transcript lines of a shape the reader did not recognise in the last 7 days (a hint that
     /// an agent's format changed). Counted in memory: it starts from zero with the daemon.
     pub unrecognised_lines_7d: u64,
+    /// Codex sessions whose hook gave no transcript path and whose rollout was not found
+    /// (spec §4.2), since the daemon started.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rollouts_not_found: u64,
+    /// Compressed Codex rollouts (`*.jsonl.zst`) skipped unread (spec §10), since the daemon
+    /// started.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rollouts_compressed: u64,
 }
 
 /// `GET /api/v1/capture/status`: the capture switch, distillation and the recent sessions.

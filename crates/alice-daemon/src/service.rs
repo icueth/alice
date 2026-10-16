@@ -4633,6 +4633,7 @@ impl Service {
         let model_loaded = self.embedder().is_loaded();
         let memory_bytes = crate::doctor::self_memory_bytes();
         let unrecognised_lines = self.capture.unrecognised_lines_7d();
+        let capture_counts = self.capture_counts();
         let capture_settings = self.settings();
         let tenant = self.opts.tenant;
         // Read the backup directory, the spool and the database: off the runtime's threads.
@@ -4682,7 +4683,12 @@ impl Service {
                 settings_errors,
                 config_degraded,
                 team_warning,
-                capture: crate::capture::health(c, &capture_settings, unrecognised_lines)?,
+                capture: crate::capture::health(
+                    c,
+                    &capture_settings,
+                    unrecognised_lines,
+                    capture_counts,
+                )?,
                 tenant,
             })
         })

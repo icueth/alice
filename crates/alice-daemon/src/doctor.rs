@@ -134,7 +134,16 @@ fn mode(path: &Path) -> Option<u32> {
 /// the daemon that answers, if one does.
 pub fn local_checks(home: &AliceHome, daemon: Option<&Health>) -> Vec<Check> {
     let fake_embedder = std::env::var("ALICE_EMBEDDER").is_ok_and(|v| v == "fake");
-    local_checks_with(home, daemon, fake_embedder)
+    let mut out = local_checks_with(home, daemon, fake_embedder);
+    // The agents' hooks are on this machine; a server tenant's are on its person's.
+    if !daemon.is_some_and(|h| h.tenant) {
+        out.extend(capture_checks(
+            daemon,
+            &|k| std::env::var_os(k),
+            chrono::Utc::now(),
+        ));
+    }
+    out
 }
 
 /// `local_checks` with the test-embedder switch passed in (tests set it either way).
@@ -302,6 +311,147 @@ pub(crate) fn service_check(home: &AliceHome, root: &Path) -> Option<Check> {
             "not installed (optional: the daemon starts on first use)",
             Some("`alice service install` keeps it running"),
         ),
+    })
+}
+
+/// Days without a capture after which doctor warns while capture hooks are installed.
+const CAPTURE_QUIET_DAYS: i64 = 7;
+
+/// The capture checks (SP2 spec §4.3, §10): whether Claude Code's and Codex's hooks, in the
+/// files `env` locates, run an `alice` that exists; and the capture line of the daemon's health.
+pub(crate) fn capture_checks(
+    daemon: Option<&Health>,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Check> {
+    use crate::agent_hooks::{HookAgent, HookTarget, status};
+    // Only files that hold Alice's entries: one that is missing or unreadable is the agent's
+    // business, not a capture problem.
+    let found: Vec<_> = [HookAgent::Claude, HookAgent::Codex]
+        .into_iter()
+        .filter_map(|a| {
+            let s = status(&HookTarget::locate(a, None, env).ok()?).ok()?;
+            (!s.events.is_empty()).then_some((a, s))
+        })
+        .collect();
+    let broken: Vec<_> = found
+        .iter()
+        .filter(|(_, s)| !s.missing.is_empty())
+        .collect();
+    let mut out = vec![if !broken.is_empty() {
+        let detail = broken
+            .iter()
+            .map(|(a, s)| {
+                format!(
+                    "{}'s hooks in {} run {}, which does not exist",
+                    a.label(),
+                    s.file.display(),
+                    s.missing.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let fix = broken
+            .iter()
+            .map(|(a, _)| format!("`alice hooks install {}`", a.name()))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        check(
+            "capture hooks",
+            CheckStatus::Warn,
+            format!("{detail}, so those sessions are not captured"),
+            Some(&format!("run {fix}")),
+        )
+    } else if found.is_empty() {
+        check(
+            "capture hooks",
+            CheckStatus::Ok,
+            "not installed (optional: sessions are then not captured automatically)",
+            Some("`alice hooks install claude` (or `codex`) captures sessions as they run"),
+        )
+    } else {
+        let agents: Vec<&str> = found.iter().map(|(a, _)| a.label()).collect();
+        check(
+            "capture hooks",
+            CheckStatus::Ok,
+            format!("installed for {}", agents.join(" and ")),
+            None,
+        )
+    }];
+    out.extend(daemon.and_then(|h| capture_check(h, !found.is_empty(), now)));
+    out
+}
+
+/// The capture line of the daemon's health; `None` while capture never ran.
+pub(crate) fn capture_check(
+    h: &Health,
+    hooks_installed: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Check> {
+    let c = h.capture.as_deref()?;
+    let mut problems = Vec::new();
+    let mut fixes = Vec::new();
+    let quiet = c
+        .last_capture_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| {
+            now - t.with_timezone(&chrono::Utc) > chrono::Duration::days(CAPTURE_QUIET_DAYS)
+        });
+    if hooks_installed && quiet {
+        problems.push(format!(
+            "nothing was captured for {CAPTURE_QUIET_DAYS} days (last at {})",
+            c.last_capture_at.as_deref().unwrap_or_default()
+        ));
+        fixes.push("check `alice hooks status claude` (or `codex`) and `alice daemon logs`");
+    }
+    if c.unrecognised_lines_7d > 0 {
+        problems.push(format!(
+            "{} transcript lines of the last 7 days had a shape Alice does not know and were skipped; the agent's transcript format may have changed",
+            c.unrecognised_lines_7d
+        ));
+        fixes.push("update Alice");
+    }
+    if c.rollouts_not_found > 0 {
+        problems.push(format!(
+            "{} Codex sessions gave no transcript path and no rollout of theirs was found in CODEX_HOME/sessions since the daemon started",
+            c.rollouts_not_found
+        ));
+        fixes.push(
+            "if Codex keeps its sessions elsewhere, start the daemon with the same CODEX_HOME",
+        );
+    }
+    if c.rollouts_compressed > 0 {
+        problems.push(format!(
+            "{} Codex rollouts are compressed (.jsonl.zst) and were skipped since the daemon started",
+            c.rollouts_compressed
+        ));
+        fixes.push(
+            "nothing to do in Alice: it reads only uncompressed rollouts, so those sessions are not captured",
+        );
+    }
+    Some(if problems.is_empty() {
+        let last = c
+            .last_capture_at
+            .as_deref()
+            .map(|t| format!("; last at {t}"))
+            .unwrap_or_default();
+        check(
+            "capture",
+            CheckStatus::Ok,
+            format!(
+                "{} sessions and {} chunks captured in the last 24 hours{last}",
+                c.sessions_24h, c.chunks_24h
+            ),
+            None,
+        )
+    } else {
+        check(
+            "capture",
+            CheckStatus::Warn,
+            problems.join("; "),
+            Some(&fixes.join("; ")),
+        )
     })
 }
 
@@ -983,5 +1133,136 @@ mod tests {
             assert!(self_memory_bytes().unwrap() > 0);
             assert!(free_disk_bytes(Path::new(".")).unwrap() > 0);
         }
+    }
+
+    /// SP2 Task 8: hooks that run an `alice` which is gone (a moved binary) are a warning that
+    /// names the agent, the program and the command that repairs them.
+    #[test]
+    fn doctor_warns_when_hooks_point_at_a_missing_binary() {
+        use crate::agent_hooks::{self as ah, HookAgent, HookTarget};
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_path_buf();
+        let env = {
+            let root = root.clone();
+            move |k: &str| -> Option<std::ffi::OsString> {
+                Some(match k {
+                    "HOME" => root.join("home").into(),
+                    "CLAUDE_CONFIG_DIR" => root.join("home/.claude").into(),
+                    "CODEX_HOME" => root.join("home/.codex").into(),
+                    "ALICE_HOME" => root.join("alice").into(),
+                    _ => return None,
+                })
+            }
+        };
+        let now = chrono::Utc::now();
+        let hooks = || find(&capture_checks(None, &env, now), "capture hooks").clone();
+        let c = hooks();
+        assert_eq!(c.status, CheckStatus::Ok, "nothing installed: {c:?}");
+        assert!(
+            c.fix
+                .as_deref()
+                .unwrap()
+                .contains("alice hooks install claude"),
+            "{c:?}"
+        );
+        let target = |agent, alice: std::path::PathBuf| HookTarget {
+            alice,
+            ..HookTarget::locate(agent, None, &env).unwrap()
+        };
+        let gone = root.join("gone/alice");
+        ah::install(&target(HookAgent::Claude, gone.clone()), false).unwrap();
+        let c = hooks();
+        assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+        assert!(
+            c.detail.contains("Claude Code") && c.detail.contains(&gone.display().to_string()),
+            "{c:?}"
+        );
+        assert_eq!(c.fix.as_deref(), Some("run `alice hooks install claude`"));
+        ah::install(&target(HookAgent::Codex, gone.clone()), false).unwrap();
+        let fix = hooks().fix.unwrap();
+        assert!(
+            fix.contains("alice hooks install claude") && fix.contains("alice hooks install codex"),
+            "{fix}"
+        );
+        // Installed again from an `alice` that exists: fine.
+        let alice = root.join("bin/alice");
+        std::fs::create_dir_all(alice.parent().unwrap()).unwrap();
+        std::fs::write(&alice, "").unwrap();
+        ah::install(&target(HookAgent::Claude, alice.clone()), false).unwrap();
+        ah::install(&target(HookAgent::Codex, alice), false).unwrap();
+        let c = hooks();
+        assert_eq!(c.status, CheckStatus::Ok, "{c:?}");
+        assert!(
+            c.detail.contains("Claude Code") && c.detail.contains("Codex"),
+            "{c:?}"
+        );
+        // A settings file that is not JSON is the agent's to report, not a hooks warning.
+        std::fs::write(root.join("home/.claude/settings.json"), "{,").unwrap();
+        assert_eq!(hooks().status, CheckStatus::Ok);
+    }
+
+    /// SP2 Task 8: the capture line of the health warns when installed hooks captured nothing
+    /// for a week, when transcript lines were not recognised, and names the Codex rollouts that
+    /// were not found or were compressed.
+    #[test]
+    fn doctor_capture_line_warns_on_a_quiet_week_and_unrecognised_lines() {
+        use alice_core::api::CaptureHealth;
+        let now = chrono::Utc::now();
+        let ago = |days| {
+            (now - chrono::Duration::days(days))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let mut h = health();
+        assert_eq!(capture_check(&h, true, now), None, "capture never ran");
+        h.capture = Some(Box::new(CaptureHealth {
+            last_capture_at: Some(ago(8)),
+            open_sessions: 1,
+            ..Default::default()
+        }));
+        let c = capture_check(&h, true, now).unwrap();
+        assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+        assert!(
+            c.detail.contains("nothing was captured for 7 days"),
+            "{c:?}"
+        );
+        assert!(c.fix.is_some(), "{c:?}");
+        // With no hooks installed, a quiet week is what to expect.
+        assert_eq!(
+            capture_check(&h, false, now).unwrap().status,
+            CheckStatus::Ok
+        );
+        let cap = h.capture.as_mut().unwrap();
+        cap.last_capture_at = Some(ago(2));
+        cap.sessions_24h = 4;
+        cap.chunks_24h = 30;
+        let c = capture_check(&h, true, now).unwrap();
+        assert_eq!(c.status, CheckStatus::Ok, "{c:?}");
+        assert!(
+            c.detail.contains("4 sessions") && c.detail.contains("30 chunks"),
+            "{c:?}"
+        );
+        h.capture.as_mut().unwrap().unrecognised_lines_7d = 12;
+        let c = capture_check(&h, true, now).unwrap();
+        assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+        assert!(
+            c.detail.contains("12")
+                && c.detail
+                    .contains("the agent's transcript format may have changed"),
+            "{c:?}"
+        );
+        let cap = h.capture.as_mut().unwrap();
+        cap.unrecognised_lines_7d = 0;
+        cap.rollouts_not_found = 3;
+        cap.rollouts_compressed = 2;
+        let c = capture_check(&h, true, now).unwrap();
+        assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+        assert!(
+            c.detail.contains("3 Codex sessions") && c.detail.contains("2 Codex rollouts"),
+            "{c:?}"
+        );
+        assert!(c.fix.is_some(), "{c:?}");
+        // The counts are sent only when set: a daemon's health reads as before.
+        let json = serde_json::to_string(&CaptureHealth::default()).unwrap();
+        assert!(!json.contains("rollouts"), "{json}");
     }
 }
