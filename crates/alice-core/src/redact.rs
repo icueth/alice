@@ -125,13 +125,26 @@ fn attribute_access(v: &str) -> bool {
         && !(parts.len() >= 3 && parts.iter().all(|p| *p == parts[0]))
 }
 
-/// A value that is code and not a secret: a call or an index, a dotted attribute access, or a
-/// call to an accessor by name. A plain `snake_case` word is not evidence of code: passphrases
-/// look like that, so redaction errs toward redacting it.
+/// A value that points at a secret kept elsewhere rather than being one, judged on the whole
+/// value: a variable (`$NAME`, `${NAME}`, a shell substitution `$(…)`), a placeholder
+/// (`<name>`, `{name}`, `{{ … }}`), or code that calls, indexes or names a generic type
+/// (`get(…)`, `env[…]`, `Option<…>`). A `$`, a bracket or `<>` inside a value does not make it
+/// one: generated passwords hold them (`Pa$$w0rd`, `Tr0ub4dor&3(x)`).
+fn reference(v: &str) -> bool {
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"^(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(.*|<[^<>]*>?|\{[A-Za-z0-9_.]*\}|\{\{.*|[A-Za-z0-9_.:]+[(\[<].*)$",
+        )
+        .expect("built-in pattern")
+    });
+    RE.is_match(v)
+}
+
+/// A value that is code and not a secret: a reference (see [`reference`]), a dotted attribute
+/// access, or a call to an accessor by name. A plain `snake_case` word is not evidence of code:
+/// passphrases look like that, so redaction errs toward redacting it.
 fn code_like(v: &str) -> bool {
-    v.contains(['(', '['])
-        || attribute_access(v)
-        || ACCESSOR_PREFIXES.iter().any(|a| v.starts_with(a))
+    reference(v) || attribute_access(v) || ACCESSOR_PREFIXES.iter().any(|a| v.starts_with(a))
 }
 
 /// A path segment that reads as a word: path characters only, and not base64-shaped. CamelCase
@@ -170,20 +183,19 @@ const PATH_ENTROPY: f64 = 4.5;
 /// Bits per character from which a long token-shaped value counts as random.
 const HIGH_ENTROPY: f64 = 3.5;
 
-/// A value after `password =` etc. that is a secret, not code or prose: no call, index,
-/// template or path; not an ENV_NAME; and either letters with digits or long and varied.
+/// A value after `password =` etc. that is a secret, not code or prose: not a reference, code
+/// or a path; not an ENV_NAME; and either letters with digits or long and varied.
 fn secret_value(v: &str) -> bool {
-    if v.starts_with("[REDACTED")
-        || v.contains(['(', ')', '[', ']', '{', '}', '<', '>', '$'])
-        || code_like(v)
-        || path_like(v)
-    {
+    if v.starts_with("[REDACTED") || code_like(v) || path_like(v) {
         return false;
     }
-    let env_name = v
+    // An ENV_NAME has no digit (`DATABASE_URL`), or words joined by `_` (`MY_VAR_2`); upper
+    // case with digits and no `_` is how many keys look (`7KQ2M9X4P8R3T6W1`).
+    let upper = v
         .chars()
         .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    if env_name {
+    let inner_underscore = v.trim_matches('_').contains('_');
+    if upper && (!v.chars().any(|c| c.is_ascii_digit()) || inner_underscore) {
         return false;
     }
     let letters = v.chars().any(|c| c.is_alphabetic());
@@ -197,7 +209,7 @@ fn secret_value(v: &str) -> bool {
 /// The value after a command-line flag such as `--password`: anything that is not another
 /// flag, a variable or code.
 fn flag_value(v: &str) -> bool {
-    !v.starts_with(['-', '$']) && !v.starts_with("[REDACTED") && !v.contains(['(', ')', '{', '}'])
+    !v.starts_with('-') && !v.starts_with("[REDACTED") && !reference(v)
 }
 
 /// Base64 lines, not a list of hex digests (a key's body is never hex only).
@@ -838,6 +850,33 @@ mod tests {
             "high_entropy",
             "whsec_9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a",
         ),
+        // Final review A-I2: `$`, brackets and upper-case keys are values too.
+        (
+            "DB_PASSWORD=Pa$$w0rd2024",
+            "password_assignment",
+            "Pa$$w0rd2024",
+        ),
+        (
+            "\"password\": \"Tr0ub4dor&3(x)\"",
+            "password_assignment",
+            "Tr0ub4dor&3(x)",
+        ),
+        (
+            "API_KEY=7KQ2M9X4P8R3T6W1",
+            "password_assignment",
+            "7KQ2M9X4P8R3T6W1",
+        ),
+        (
+            "password: HUNTER2HUNTER2",
+            "password_assignment",
+            "HUNTER2HUNTER2",
+        ),
+        (
+            "mysql --password 'Tr0ub4dor&3(x)'",
+            "password_assignment",
+            "Tr0ub4dor&3(x)",
+        ),
+        ("token = <x7Kq9>Zz!2", "password_assignment", "<x7Kq9>Zz!2"),
     ];
 
     /// Text that must come out unchanged (code and prose that only look like secrets).
@@ -865,6 +904,16 @@ mod tests {
         "secret = process.env.SECRET_KEY",
         "api_key = os.environ",
         "run --password-file ./secrets/pw --token-file ~/.t",
+        "password = $DB_PASSWORD",
+        "token: ${GITHUB_TOKEN}",
+        "API_KEY=$(vault_read api)",
+        "password = <your-password>",
+        "token: Option<Arc<str>>,",
+        "password = {password}",
+        "secret = data[\"secret\"]",
+        "password = MY_VAR_2",
+        "token = client.get_token(scope)",
+        "--password $PGPASSWORD",
         concat!(
             "the file must end with -----END RSA PRIVATE ",
             "KEY----- and a newline"
@@ -1007,6 +1056,35 @@ mod tests {
                 out.text
             );
         }
+    }
+
+    /// Final review A-I2: a value is a reference only when the whole value is one; an upper-case
+    /// value with digits and no `_` is a key, not an ENV_NAME.
+    #[test]
+    fn passwords_with_dollars_brackets_and_upper_case_keys_are_redacted() {
+        let r = Redactor::builtin();
+        for (input, secret) in [
+            ("DB_PASSWORD=Pa$$w0rd2024", "Pa$$w0rd2024"),
+            ("\"password\": \"Tr0ub4dor&3(x)\"", "Tr0ub4dor&3(x)"),
+            ("API_KEY=7KQ2M9X4P8R3T6W1", "7KQ2M9X4P8R3T6W1"),
+            ("password: HUNTER2HUNTER2", "HUNTER2HUNTER2"),
+        ] {
+            let out = r.apply(input);
+            assert_eq!(out.found, ["password_assignment"], "{input}");
+            assert!(!out.text.contains(secret), "{input} -> {}", out.text);
+        }
+        for reference in [
+            "$DB_PASSWORD",
+            "${DB_PASSWORD}",
+            "<your-password>",
+            "{password}",
+            "Option<String>",
+            "env[\"X\"]",
+            "get_secret(x)",
+        ] {
+            assert!(super::code_like(reference), "{reference}");
+        }
+        assert!(!super::code_like("Tr0ub4dor&3(x)") && !super::code_like("Pa$$w0rd2024"));
     }
 
     #[test]
