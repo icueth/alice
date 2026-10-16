@@ -4,6 +4,7 @@ use crate::error::{AliceError, Result};
 use crate::ids::{new_id, now_rfc3339};
 use crate::normalize::{sha256_hex, slugify};
 use crate::project::ProjectRef;
+use crate::settings::ProjectTree;
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub const GLOBAL_ID: &str = "00000000000000000000GLOBAL";
@@ -196,12 +197,42 @@ pub fn root_of(conn: &Connection, project_id_or_slug: &str) -> Result<Option<Str
 
 /// The root of the project a memory (named by its id or legacy id) belongs to.
 pub fn root_of_memory(conn: &Connection, memory_id: &str) -> Result<Option<String>> {
+    Ok(tree_of_memory(conn, memory_id)?.map(|t| t.root.to_string_lossy().into_owned()))
+}
+
+fn tree_row(key: String, root: Option<String>) -> Option<ProjectTree> {
+    root.map(|r| ProjectTree::new(key, r))
+}
+
+/// The working tree a project (an id, a slug or an alias) was last detected in, keyed by the
+/// project: its privacy rules are kept per project, whatever tree is current.
+pub fn tree_of(conn: &Connection, project_id_or_slug: &str) -> Result<Option<ProjectTree>> {
+    let by_id = |id: &str| -> Result<Option<Option<ProjectTree>>> {
+        Ok(conn
+            .query_row(
+                "SELECT key, root_path FROM projects WHERE id = ?1",
+                [id],
+                |r| Ok(tree_row(r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    };
+    if let Some(tree) = by_id(project_id_or_slug)? {
+        return Ok(tree);
+    }
+    let Some(p) = resolve_slug(conn, project_id_or_slug)? else {
+        return Ok(None);
+    };
+    Ok(by_id(&p.id)?.flatten())
+}
+
+/// [`tree_of`] the project a memory (named by its id or legacy id) belongs to.
+pub fn tree_of_memory(conn: &Connection, memory_id: &str) -> Result<Option<ProjectTree>> {
     Ok(conn
         .query_row(
-            "SELECT p.root_path FROM memories m JOIN projects p ON p.id = m.project_id
+            "SELECT p.key, p.root_path FROM memories m JOIN projects p ON p.id = m.project_id
              WHERE m.id = ?1 OR m.legacy_id = ?1 ORDER BY m.seq LIMIT 1",
             [memory_id],
-            |r| r.get::<_, Option<String>>(0),
+            |r| Ok(tree_row(r.get(0)?, r.get(1)?)),
         )
         .optional()?
         .flatten())

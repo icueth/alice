@@ -88,6 +88,11 @@ impl AliceHome {
     pub fn secrets_file(&self) -> PathBuf {
         self.root.join("secrets.toml")
     }
+    /// The `.alice.toml` rules in force per project and the tree each was read in, so a
+    /// restart, a new worktree or a removed checkout never loses them (0600).
+    pub fn project_rules_file(&self) -> PathBuf {
+        self.root.join("project-rules.json")
+    }
     pub fn daemon_json(&self) -> PathBuf {
         self.root.join("daemon.json")
     }

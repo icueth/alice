@@ -1952,7 +1952,7 @@ pub fn load_project(root: &Path) -> Result<ProjectSettings, SettingError> {
     }
 }
 
-/// What [`ProjectSettingsCache::get`] decided for one repository.
+/// What [`ProjectSettingsCache::get_tree`] decided for one repository.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectLoad {
     /// The settings to apply: never weaker than the last good ones unless a loosening has held
@@ -1964,7 +1964,36 @@ pub struct ProjectLoad {
     pub loosening_pending: bool,
 }
 
-/// Per-repository `.alice.toml` settings that fail closed.
+/// A working tree of a project as its privacy rules see it: the project's stable key and the
+/// tree's root. The rules are kept per project, whatever tree they were read in, so a new
+/// worktree, a fresh clone or a removed checkout of the project never loses them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProjectTree {
+    /// The project's key (`projects.key`, or a detected [`crate::project::ProjectRef::key`]);
+    /// `None` keeps the rules for this tree alone.
+    pub key: Option<String>,
+    /// The tree's root, where `.alice.toml` is read.
+    pub root: std::path::PathBuf,
+}
+
+impl ProjectTree {
+    pub fn new(key: impl Into<String>, root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            key: Some(key.into()),
+            root: root.into(),
+        }
+    }
+
+    /// A tree whose rules are its own (no stored project names it).
+    pub fn alone(root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            key: None,
+            root: root.into(),
+        }
+    }
+}
+
+/// Per-project `.alice.toml` settings that fail closed.
 ///
 /// - a file that is invalid or cannot be read gives `block_secrets` and `cloud_denied` on (and
 ///   the last good custom patterns), plus the error, until it is valid again;
@@ -1972,26 +2001,44 @@ pub struct ProjectLoad {
 ///   deleted file) applies only when the same content is read on [`LOOSEN_POLLS`] polls in a
 ///   row, so a half-written save never switches protections off; until then the last good
 ///   settings stay;
+/// - the rules belong to the project, not to the tree they were read in: a tree of the project
+///   that has no `.alice.toml` (a new worktree, a clone of a repository whose file is not
+///   committed) never loosens rules read in another tree, and a tree that is gone or cannot be
+///   listed (a removed worktree) keeps them as they are. Only the tree the rules were read in
+///   loosens them by deleting the file; any tree loosens them through a file that says less;
 /// - a look counts as a poll only when at least the cache's interval has passed since the last
-///   counted look at that repository, so many calls inside one truncate-then-write window are
+///   counted look at that project, so many calls inside one truncate-then-write window are
 ///   one poll (the interval is the settings poll interval, 2 s in the daemon);
 /// - a file that tightens, or changes nothing protective, applies at once;
-/// - the first look at a repository has nothing to compare with and applies as read, except a
+/// - the first look at a project has nothing to compare with and applies as read, except a
 ///   blank file: that is not yet "no protections" but a possible half-written save, and it
 ///   fails closed until it has been seen on the poll rule. A repository with no file at all
-///   has no project settings, and that applies at once.
+///   has no project settings, and that applies at once. A first look at a tree that is gone
+///   fails closed: nothing is known about its rules.
+///
+/// With a store ([`with_store`](Self::with_store), the daemon's `project-rules.json`), the
+/// rules in force for each project and the tree they were read in survive a restart, so the
+/// first look after one is not a first look.
 pub struct ProjectSettingsCache {
     every: Duration,
     clock: Clock,
-    entries: parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, ProjectEntry>>,
+    entries: parking_lot::Mutex<std::collections::HashMap<EntryKey, ProjectEntry>>,
+    store: Option<std::path::PathBuf>,
 }
 
 type Clock = std::sync::Arc<dyn Fn() -> std::time::Instant + Send + Sync>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum EntryKey {
+    Project(String),
+    Tree(std::path::PathBuf),
+}
 
 impl std::fmt::Debug for ProjectSettingsCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProjectSettingsCache")
             .field("every", &self.every)
+            .field("store", &self.store)
             .finish_non_exhaustive()
     }
 }
@@ -2003,12 +2050,31 @@ impl Default for ProjectSettingsCache {
     }
 }
 
+#[derive(Default)]
 struct ProjectEntry {
     /// The settings in force and whether their file had content.
     good: Option<(ProjectSettings, bool)>,
+    /// The tree `good` was read in.
+    read_in: Option<std::path::PathBuf>,
     gate: LooseningGate,
     /// When the last look that counted as a poll was made.
     last_counted: Option<std::time::Instant>,
+}
+
+/// One project's rules as the store keeps them.
+#[derive(Debug, Serialize, Deserialize)]
+struct KeptRules {
+    settings: ProjectSettings,
+    /// The file had content (a blank one is not "no rules").
+    nonempty: bool,
+    /// The tree the rules were read in.
+    read_in: std::path::PathBuf,
+}
+
+/// The store's file: the rules in force per project key.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct KeptFile {
+    projects: BTreeMap<String, KeptRules>,
 }
 
 impl ProjectSettingsCache {
@@ -2023,32 +2089,103 @@ impl ProjectSettingsCache {
             every,
             clock,
             entries: Default::default(),
+            store: None,
         }
     }
 
+    /// [`new`](Self::new) that keeps each project's rules in force in `store` (a JSON file,
+    /// written atomically with mode 0600 whenever they change) and starts from what it holds.
+    /// A store that cannot be read is logged and starts empty.
+    pub fn with_store(every: Duration, store: std::path::PathBuf) -> Self {
+        Self::with_store_and_clock(every, store, std::sync::Arc::new(std::time::Instant::now))
+    }
+
+    /// [`with_store`](Self::with_store) on a clock of the caller's.
+    pub fn with_store_and_clock(every: Duration, store: std::path::PathBuf, clock: Clock) -> Self {
+        let mut entries = std::collections::HashMap::new();
+        match std::fs::read_to_string(&store) {
+            Ok(text) => match serde_json::from_str::<KeptFile>(&text) {
+                Ok(kept) => {
+                    for (key, k) in kept.projects {
+                        entries.insert(
+                            EntryKey::Project(key),
+                            ProjectEntry {
+                                good: Some((k.settings, k.nonempty)),
+                                read_in: Some(k.read_in),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    file = %store.display(),
+                    line = e.line(),
+                    "the kept project rules do not parse; each project's .alice.toml is read as found"
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                file = %store.display(),
+                error = %e,
+                "the kept project rules cannot be read; each project's .alice.toml is read as found"
+            ),
+        }
+        Self {
+            every,
+            clock,
+            entries: parking_lot::Mutex::new(entries),
+            store: Some(store),
+        }
+    }
+
+    /// The rules of the tree at `root` alone (no stored project names it).
     pub fn get(&self, root: &Path) -> ProjectLoad {
+        self.get_tree(&ProjectTree::alone(root))
+    }
+
+    pub fn get_tree(&self, tree: &ProjectTree) -> ProjectLoad {
         // Two spellings of one repository (a symlink, `..`) share one entry and one gate.
-        let root = &std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let root = std::fs::canonicalize(&tree.root).unwrap_or_else(|_| tree.root.clone());
+        let key = match &tree.key {
+            Some(k) => EntryKey::Project(k.clone()),
+            None => EntryKey::Tree(root.clone()),
+        };
         let path = root.join(".alice.toml");
         let name = path.display().to_string();
         let now = (self.clock)();
-        let read = read_project_text(&path).and_then(|text| match text {
-            None => Ok((ProjectSettings::default(), false, false, 0)),
-            Some(t) => {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                t.hash(&mut h);
-                parse_project(&name, &t).map(|p| (p, true, !t.trim().is_empty(), h.finish()))
-            }
+        let there = std::fs::metadata(&root).is_ok_and(|m| m.is_dir());
+        let read = there.then(|| {
+            read_project_text(&path).and_then(|text| match text {
+                None => Ok((ProjectSettings::default(), false, false, 0)),
+                Some(t) => {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    t.hash(&mut h);
+                    parse_project(&name, &t).map(|p| (p, true, !t.trim().is_empty(), h.finish()))
+                }
+            })
         });
         let mut entries = self.entries.lock();
-        let entry = entries
-            .entry(root.to_path_buf())
-            .or_insert_with(|| ProjectEntry {
-                good: None,
-                gate: LooseningGate::default(),
-                last_counted: None,
-            });
+        let entry = entries.entry(key.clone()).or_default();
+        let Some(read) = read else {
+            // A tree that is gone (a removed worktree) or cannot be listed says nothing.
+            entry.gate.reset();
+            return match &entry.good {
+                Some((good, _)) => ProjectLoad {
+                    settings: good.clone(),
+                    error: None,
+                    loosening_pending: false,
+                },
+                None => ProjectLoad {
+                    settings: ProjectSettings::fail_closed(),
+                    error: Some(err(
+                        name,
+                        "its working tree is gone or cannot be read, so the project's rules are not known; secrets are blocked and nothing goes to a cloud provider until a write comes from a tree that exists",
+                    )),
+                    loosening_pending: false,
+                },
+            };
+        };
         let (new, exists, nonempty, fingerprint) = match read {
             Ok(r) => r,
             Err(error) => {
@@ -2062,11 +2199,13 @@ impl ProjectSettingsCache {
             }
         };
         if entry.good.is_none() {
+            entry.read_in = Some(root.clone());
             if exists && !nonempty {
                 // A blank file on the first look: wait for it, closed.
                 entry.good = Some((ProjectSettings::fail_closed(), true));
             } else {
                 entry.good = Some((new.clone(), nonempty));
+                self.keep(&entries);
                 return ProjectLoad {
                     settings: new,
                     error: None,
@@ -2076,6 +2215,14 @@ impl ProjectSettingsCache {
         }
         let (good, good_nonempty) = entry.good.clone().expect("set above");
         let loosens = good.loosened_by(&new) || (good_nonempty && !nonempty);
+        if loosens && !exists && entry.read_in.as_deref() != Some(root.as_path()) {
+            // Another tree of the project without the file: the rules read elsewhere stay.
+            return ProjectLoad {
+                settings: good,
+                error: None,
+                loosening_pending: false,
+            };
+        }
         let counts = entry
             .last_counted
             .is_none_or(|t| now.saturating_duration_since(t) >= self.every);
@@ -2089,7 +2236,18 @@ impl ProjectSettingsCache {
             false
         };
         if admitted {
+            let changed = entry.good.as_ref() != Some(&(new.clone(), nonempty));
+            // The tree the rules were read in moves with a change, or when that tree is gone.
+            let moved = changed
+                || entry
+                    .read_in
+                    .as_ref()
+                    .is_none_or(|r| r != &root && !r.is_dir());
             entry.good = Some((new.clone(), nonempty));
+            if moved {
+                entry.read_in = Some(root);
+                self.keep(&entries);
+            }
             return ProjectLoad {
                 settings: new,
                 error: None,
@@ -2102,6 +2260,62 @@ impl ProjectSettingsCache {
             loosening_pending: true,
         }
     }
+
+    /// Write the rules in force of every project to the store (when there is one).
+    fn keep(&self, entries: &std::collections::HashMap<EntryKey, ProjectEntry>) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let kept = KeptFile {
+            projects: entries
+                .iter()
+                .filter_map(|(k, e)| match (k, &e.good, &e.read_in) {
+                    (EntryKey::Project(key), Some((settings, nonempty)), Some(read_in)) => Some((
+                        key.clone(),
+                        KeptRules {
+                            settings: settings.clone(),
+                            nonempty: *nonempty,
+                            read_in: read_in.clone(),
+                        },
+                    )),
+                    _ => None,
+                })
+                .collect(),
+        };
+        let text = serde_json::to_string_pretty(&kept).expect("project rules serialise");
+        if let Err(e) = write_private(store, &text) {
+            tracing::warn!(
+                file = %store.display(),
+                error = %e,
+                "the project rules in force could not be kept; they apply until the daemon stops"
+            );
+        }
+    }
+}
+
+/// `text` written to a new 0600 file next to `target`, synced, then renamed over it.
+fn write_private(target: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = target.with_file_name(format!(".{name}.{}.tmp", crate::ids::new_id()));
+    let done = (|| -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let mut f = opts.open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, target)
+    })();
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
 }
 
 #[cfg(test)]
@@ -3539,6 +3753,116 @@ mod tests {
             !cache.get(&real).settings.privacy.cloud_denied,
             "poll 3 completes the run: one entry, one gate"
         );
+    }
+
+    /// Final review A-C1: a project's rules belong to the project, not to the tree that last
+    /// wrote. A worktree (or a fresh clone) without `.alice.toml` never loosens them.
+    #[test]
+    fn a_tree_of_the_project_without_the_file_never_loosens_its_rules() {
+        let d = tempfile::tempdir().unwrap();
+        let (main, worktree) = (d.path().join("main"), d.path().join("feat"));
+        std::fs::create_dir(&main).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        let (cache, now) = clocked();
+        let at = |root: &Path| ProjectTree::new("github.com/me/client-x", root);
+        write_project(&main, STRICT);
+        assert!(cache.get_tree(&at(&main)).settings.privacy.cloud_denied);
+        for i in 0..6 {
+            tick(&now);
+            let l = cache.get_tree(&at(&worktree));
+            assert!(
+                l.settings.privacy.cloud_denied && l.settings.privacy.block_secrets,
+                "look {i} at the worktree loosened the project"
+            );
+            assert_eq!(l.settings.privacy.custom_patterns.len(), 1, "patterns kept");
+            assert!(!l.loosening_pending && l.error.is_none());
+        }
+        // A tree's own file that says less is a deliberate edit: it waits for three polls.
+        write_project(&worktree, "[privacy]\nblock_secrets = true\n");
+        for _ in 0..2 {
+            tick(&now);
+            let l = cache.get_tree(&at(&worktree));
+            assert!(l.settings.privacy.cloud_denied && l.loosening_pending);
+        }
+        tick(&now);
+        let l = cache.get_tree(&at(&worktree));
+        assert!(!l.settings.privacy.cloud_denied && l.settings.privacy.block_secrets);
+    }
+
+    /// Final review A-C1: a tree that is gone (a removed worktree) keeps the project's rules;
+    /// a first look at one fails closed.
+    #[test]
+    fn a_removed_tree_keeps_the_rules_and_an_unknown_one_fails_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let main = d.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        let (cache, now) = clocked();
+        let at = |root: &Path| ProjectTree::new("k/app", root);
+        write_project(&main, STRICT);
+        assert!(cache.get_tree(&at(&main)).settings.privacy.cloud_denied);
+        std::fs::remove_dir_all(&main).unwrap();
+        for _ in 0..4 {
+            tick(&now);
+            let l = cache.get_tree(&at(&main));
+            assert!(l.settings.privacy.cloud_denied && l.error.is_none());
+            assert_eq!(l.settings.privacy.custom_patterns.len(), 1);
+        }
+        let l = cache.get_tree(&ProjectTree::new("k/never-seen", d.path().join("gone")));
+        assert!(l.error.is_some(), "nothing is known about it");
+        assert!(l.settings.privacy.cloud_denied && l.settings.privacy.block_secrets);
+    }
+
+    /// Final review A-C1: the rules in force survive a restart, so the first look after one is
+    /// not a first look (a file momentarily missing, or a tree without it, loosens nothing).
+    #[test]
+    fn the_rules_in_force_survive_a_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let (main, worktree) = (d.path().join("main"), d.path().join("feat"));
+        std::fs::create_dir(&main).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        let store = d.path().join("home").join("project-rules.json");
+        std::fs::create_dir(store.parent().unwrap()).unwrap();
+        let at = |root: &Path| ProjectTree::new("k/app", root);
+        let clock = || {
+            let now = std::sync::Arc::new(parking_lot::Mutex::new(std::time::Instant::now()));
+            let n = now.clone();
+            let c: Clock = std::sync::Arc::new(move || *n.lock());
+            (c, now)
+        };
+        {
+            let (c, _) = clock();
+            let cache = ProjectSettingsCache::with_store_and_clock(EVERY, store.clone(), c);
+            write_project(&main, STRICT);
+            assert!(cache.get_tree(&at(&main)).settings.privacy.cloud_denied);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&store).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "kept private");
+        }
+        // After a restart: the worktree (no file) is not a first look.
+        let (c, now) = clock();
+        let cache = ProjectSettingsCache::with_store_and_clock(EVERY, store.clone(), c);
+        let l = cache.get_tree(&at(&worktree));
+        assert!(l.settings.privacy.cloud_denied && !l.loosening_pending);
+        assert_eq!(l.settings.privacy.custom_patterns.len(), 1);
+        // The tree the rules were read in, its file momentarily missing: a loosening that waits.
+        std::fs::remove_file(main.join(".alice.toml")).unwrap();
+        for _ in 0..2 {
+            let l = cache.get_tree(&at(&main));
+            assert!(l.settings.privacy.cloud_denied && l.loosening_pending);
+            tick(&now);
+        }
+        let l = cache.get_tree(&at(&main));
+        assert!(
+            !l.settings.privacy.cloud_denied,
+            "a deletion that holds in the tree the rules came from applies"
+        );
+        // A store that does not parse starts empty (and says so in the log).
+        std::fs::write(&store, "{not json").unwrap();
+        let cache = ProjectSettingsCache::with_store(EVERY, store);
+        assert!(!cache.get_tree(&at(&worktree)).settings.privacy.cloud_denied);
     }
 
     #[test]

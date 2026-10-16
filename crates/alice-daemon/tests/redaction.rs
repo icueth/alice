@@ -668,6 +668,112 @@ async fn a_moved_working_tree_brings_its_project_rules_to_update_and_undo() {
     s.shutdown();
 }
 
+/// Final review A-C1: a write from a worktree that has no `.alice.toml` moves the project's
+/// stored root there, but the project's rules (and its cloud denial) stay, also after a restart
+/// and after that worktree is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_without_the_project_file_keeps_the_projects_rules_and_cloud_denial() {
+    use alice_core::settings::ProjectTree;
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git {args:?}");
+    }
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path().join("home");
+    let open = || {
+        Service::start(
+            AliceHome::new(home.clone()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions::default(),
+        )
+        .unwrap()
+    };
+    let (main, feat) = (d.path().join("client-x"), d.path().join("client-x-feat"));
+    for dir in [&main, &feat] {
+        std::fs::create_dir(dir).unwrap();
+        git(dir, &["init", "-q"]);
+        git(
+            dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/me/client-x.git",
+            ],
+        );
+    }
+    std::fs::write(
+        main.join(".alice.toml"),
+        "[privacy]\ncloud_denied = true\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
+    )
+    .unwrap();
+    let remember = |s: &Arc<Service>, dir: &Path, content: &str| {
+        let (s, cwd) = (s.clone(), dir.to_string_lossy().into_owned());
+        let content = content.to_string();
+        async move {
+            s.remember(RememberRequest {
+                content,
+                cwd: Some(cwd),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let key = "example.com/me/client-x";
+    let s = open();
+    remember(&s, &main, "a note from the main checkout").await;
+    let from_feat = remember(&s, &feat, "see TCK-12345 from the worktree").await;
+    let body = |s: &Arc<Service>, id: String| {
+        let s = s.clone();
+        async move {
+            s.get(GetRequest {
+                ids: vec![id],
+                include_provenance: false,
+            })
+            .await
+            .unwrap()
+            .memories[0]
+                .memory
+                .body
+                .clone()
+        }
+    };
+    assert_eq!(
+        body(&s, from_feat.id.clone().unwrap()).await,
+        "see [REDACTED:custom:ticket] from the worktree"
+    );
+    let denied = |s: &Arc<Service>, root: &Path| {
+        !s.settings_handle()
+            .cloud_allowed("client-x", Some(&ProjectTree::new(key, root)))
+    };
+    assert!(
+        denied(&s, &feat),
+        "the worktree has no file, the project is denied"
+    );
+    s.shutdown();
+    drop(s);
+
+    // A restart, then the worktree is removed: still denied, still redacted.
+    let s = open();
+    assert!(denied(&s, &feat));
+    std::fs::remove_dir_all(&feat).unwrap();
+    assert!(denied(&s, &feat), "a removed worktree loosens nothing");
+    let again = remember(&s, &main, "TCK-99999 again").await;
+    assert_eq!(
+        body(&s, again.id.unwrap()).await,
+        "[REDACTED:custom:ticket] again"
+    );
+    s.shutdown();
+}
+
 /// A review item the way the judge will leave it (Task 12): written straight into the inbox.
 fn add_review(
     s: &Service,

@@ -29,7 +29,7 @@ use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
 use alice_core::redact::Redactor;
 use alice_core::search::{self, SearchOutput, SearchParams, pack};
-use alice_core::settings::{self, DefaultRecallMode, SettingError, Settings};
+use alice_core::settings::{self, DefaultRecallMode, ProjectTree, SettingError, Settings};
 use alice_core::store::embeddings;
 use alice_core::store::events::Actor;
 use alice_core::store::history::UndoOutcome;
@@ -190,15 +190,15 @@ fn query_cloud(
             match stored {
                 Some(p) => known(cloud.cloud_allowed(&p.slug), cloud.redactor(&p.slug)),
                 None => {
-                    let root = r.root.as_deref();
+                    let tree = r.tree();
                     let allowed = !r.slug.trim().is_empty()
                         && [r.slug.as_str(), r.name.as_str()]
                             .into_iter()
                             .filter(|n| !n.trim().is_empty())
-                            .all(|n| settings.cloud_allowed(n, root));
+                            .all(|n| settings.cloud_allowed(n, tree.as_ref()));
                     QueryCloud {
                         allowed,
-                        redactor: redactors.for_root_always_on(root),
+                        redactor: redactors.for_root_always_on(tree.as_ref()),
                         unstored: true,
                     }
                 }
@@ -563,17 +563,13 @@ fn redact_field(r: &Redactor, field: &str, text: &str) -> Result<String> {
     Ok(out)
 }
 
-/// The working-tree root of the project `choice` names.
-fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<PathBuf> {
+/// The working tree of the project `choice` names, keyed by the project.
+fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<ProjectTree> {
     match choice {
-        ProjectChoice::Detected(r) => r.root.clone(),
+        ProjectChoice::Detected(r) => r.tree(),
         // `global` has no working tree: the global privacy settings apply.
         ProjectChoice::Fallback => None,
-        ProjectChoice::Slug(s) => readers
-            .with(|c| projects::root_of(c, s))
-            .ok()
-            .flatten()
-            .map(PathBuf::from),
+        ProjectChoice::Slug(s) => readers.with(|c| projects::tree_of(c, s)).ok().flatten(),
     }
 }
 
@@ -1219,9 +1215,9 @@ impl Service {
         }
     }
 
-    /// The working-tree root of the project a write goes to, if it has one. A named project is
+    /// The working tree of the project a write goes to, if it has one. A named project is
     /// looked up in the database, so call this off the async runtime.
-    pub fn project_root(&self, choice: &ProjectChoice) -> Option<PathBuf> {
+    pub fn project_root(&self, choice: &ProjectChoice) -> Option<ProjectTree> {
         project_root_in(&self.readers, choice)
     }
 
@@ -1234,8 +1230,8 @@ impl Service {
         };
         let (readers, settings) = (self.readers.clone(), self.settings.clone());
         tokio::task::spawn_blocking(move || {
-            let root = project_root_in(&readers, &choice);
-            settings.project_fail_closed(root.as_deref())
+            let tree = project_root_in(&readers, &choice);
+            settings.project_fail_closed(tree.as_ref())
         })
         .await
         .unwrap_or(false)
@@ -1248,8 +1244,8 @@ impl Service {
         let (readers, redactors, choice) =
             (self.readers.clone(), self.redactors.clone(), choice.clone());
         tokio::task::spawn_blocking(move || {
-            let root = project_root_in(&readers, &choice);
-            redactors.for_root(root.as_deref())
+            let tree = project_root_in(&readers, &choice);
+            redactors.for_root(tree.as_ref())
         })
         .await
         .map_err(join_err)
@@ -1260,12 +1256,11 @@ impl Service {
     async fn redactor_for_memory(&self, id: String) -> Result<Arc<Redactor>> {
         let (readers, redactors) = (self.readers.clone(), self.redactors.clone());
         tokio::task::spawn_blocking(move || {
-            let root = readers
-                .with(|c| projects::root_of_memory(c, &id))
+            let tree = readers
+                .with(|c| projects::tree_of_memory(c, &id))
                 .ok()
-                .flatten()
-                .map(PathBuf::from);
-            redactors.for_root(root.as_deref())
+                .flatten();
+            redactors.for_root(tree.as_ref())
         })
         .await
         .map_err(join_err)
@@ -3277,8 +3272,8 @@ fn screen_resolution(
                 [&m.id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            let root = projects::root_of(c, &target.id)?;
-            let r = redactors.for_root(root.as_deref().map(Path::new));
+            let tree = projects::tree_of(c, &target.id)?;
+            let r = redactors.for_root(tree.as_ref());
             let apply = |field: &str, t: &str| -> Result<(String, bool)> {
                 let red = r.apply(t);
                 if red.found.is_empty() {
