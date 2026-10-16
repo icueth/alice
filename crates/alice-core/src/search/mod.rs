@@ -903,24 +903,26 @@ impl Filters<'_> {
 
 /// The seqs among `found` of distilled memories whose judge stage is not over: a recall skips
 /// them until it is, so a near-copy of an explicit memory never shows twice while the judge
-/// works or is unreachable (SP2 spec §6.6). One query, and only when one of them is distilled.
+/// works or is unreachable (SP2 spec §6.6). Read only when one of them is distilled, one query
+/// per batch of seqs (as `memories::get_by_seqs` reads them).
 fn unjudged_distilled(conn: &Connection, found: &[(i64, Memory)]) -> Result<HashSet<i64>> {
     let distilled: Vec<i64> = found
         .iter()
         .filter(|(_, m)| m.origin == Origin::Distill)
         .map(|(s, _)| *s)
         .collect();
-    if distilled.is_empty() {
-        return Ok(HashSet::new());
+    let mut out = HashSet::new();
+    for batch in distilled.chunks(memories::IN_BATCH) {
+        let sql = format!(
+            "SELECT seq FROM memories WHERE judge_state <> 'done' AND seq IN ({})",
+            vec!["?"; batch.len()].join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        for seq in stmt.query_map(rusqlite::params_from_iter(batch), |r| r.get(0))? {
+            out.insert(seq?);
+        }
     }
-    // A recall's candidates are a few hundred: well within one statement's bound parameters.
-    let sql = format!(
-        "SELECT seq FROM memories WHERE judge_state <> 'done' AND seq IN ({})",
-        vec!["?"; distilled.len()].join(",")
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(&distilled), |r| r.get(0))?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    Ok(out)
 }
 
 fn project_slugs(conn: &Connection) -> Result<HashMap<String, String>> {
@@ -934,7 +936,8 @@ fn related_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, Strin
 }
 
 /// Up to five memories one hop from the top three results, through links or shared entities.
-/// Results themselves and trashed memories are left out.
+/// Results themselves, trashed memories and distilled ones the judge has not finished (SP2 spec
+/// §6.6) are left out.
 pub fn related_for(conn: &Connection, ids: &[String]) -> Result<Vec<RelatedRef>> {
     let exclude: HashSet<&String> = ids.iter().collect();
     let mut out: Vec<RelatedRef> = Vec::new();
@@ -955,6 +958,7 @@ pub fn related_for(conn: &Connection, ids: &[String]) -> Result<Vec<RelatedRef>>
             "SELECT m.id, m.kind, m.title, l.type FROM links l
              JOIN memories m ON m.id = CASE WHEN l.from_id = ?1 THEN l.to_id ELSE l.from_id END
              WHERE (l.from_id = ?1 OR l.to_id = ?1) AND m.status <> 'trashed'
+               AND NOT (m.origin = 'distill' AND m.judge_state <> 'done')
              ORDER BY l.created_at DESC LIMIT 5",
         )?;
         for r in stmt.query_map([id], related_row)? {
@@ -965,6 +969,7 @@ pub fn related_for(conn: &Connection, ids: &[String]) -> Result<Vec<RelatedRef>>
              JOIN mentions b ON a.entity_id = b.entity_id AND b.memory_id <> a.memory_id
              JOIN memories m ON m.id = b.memory_id JOIN entities e ON e.id = a.entity_id
              WHERE a.memory_id = ?1 AND m.status <> 'trashed'
+               AND NOT (m.origin = 'distill' AND m.judge_state <> 'done')
              ORDER BY m.importance DESC, m.updated_at DESC LIMIT 5",
         )?;
         for r in stmt.query_map([id], related_row)? {
@@ -2162,6 +2167,64 @@ mod tests {
             .expect("shared entity");
         assert_eq!(rel.via, "entity:Easypanel");
         assert_eq!(rel.kind, Kind::Warning);
+    }
+
+    /// SP2 spec §6.6: a distilled memory the judge has not finished is not offered as related
+    /// either, through a link or through a shared entity; once judged it is.
+    #[test]
+    fn related_lists_a_distilled_memory_only_once_judged() {
+        let f = fx();
+        let (hit, _) = f.add(&f.app, Kind::Fact, "deploys go to easypanel");
+        let distilled = |text: &str| {
+            f.add_input(
+                &f.app,
+                memories::NewMemoryInput {
+                    content: text.into(),
+                    kind: Some(Kind::Warning),
+                    origin: Origin::Distill,
+                    ..Default::default()
+                },
+            )
+        };
+        // Linked to the hit, and sharing an entity with it.
+        let (linked, linked_seq) = distilled("rotate the panel token monthly");
+        memories::link(&f.c, &linked, &hit, "relates_to", "t").unwrap();
+        let (mentioned, mentioned_seq) = distilled("the staging host restarts nightly");
+        f.c.execute(
+            "INSERT INTO entities (id, name, created_at) VALUES ('E1', 'Easypanel', '2026-10-13T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        for id in [&hit, &mentioned] {
+            f.c.execute(
+                "INSERT INTO mentions (memory_id, entity_id) VALUES (?1, 'E1')",
+                [id],
+            )
+            .unwrap();
+        }
+        let related = || -> Vec<(String, String)> {
+            let out = f.search(&f.params("deploys"));
+            assert_eq!(out.hits.len(), 1, "{:?}", out.hits);
+            out.related.into_iter().map(|r| (r.id, r.via)).collect()
+        };
+        let judged = |seq: i64| {
+            f.c.execute(
+                "UPDATE memories SET judge_state = 'done' WHERE seq = ?1",
+                [seq],
+            )
+            .unwrap();
+        };
+        assert!(related().is_empty(), "{:?}", related());
+        judged(linked_seq);
+        assert_eq!(related(), [(linked.clone(), "relates_to".to_string())]);
+        judged(mentioned_seq);
+        assert_eq!(
+            related(),
+            [
+                (linked, "relates_to".to_string()),
+                (mentioned, "entity:Easypanel".to_string())
+            ]
+        );
     }
 
     // ------------------------------------------------------------------ relevance policy

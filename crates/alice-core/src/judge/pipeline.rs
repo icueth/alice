@@ -517,6 +517,16 @@ mod tests {
                 }],
             ),
             (
+                "contradicts >= auto: the link, without the review item",
+                rel("OLD", &[("contradicts", 0.9), ("unrelated", 0.1)]),
+                "jev",
+                false,
+                vec![JudgeAction::Contradicts {
+                    other: "OLD".into(),
+                    p: 0.9,
+                }],
+            ),
+            (
                 "below the review threshold: nothing",
                 rel("OLD", &[("updates", 0.4), ("unrelated", 0.6)]),
                 "jev",

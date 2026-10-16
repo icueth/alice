@@ -1053,6 +1053,56 @@ mod tests {
         let text = build(&c, &other, 2_000, at(NOW)).unwrap();
         assert_eq!(text.matches("- [decision] explicit ").count(), 5, "{text}");
         assert!(!text.contains("auto decision newest"), "{text}");
+
+        // An explicit decision already shown under Key memories is skipped, by both queries:
+        // the newest decision of all, it uses up a row of each, and the places it leaves are
+        // still filled (the limit counts the rows shown earlier).
+        let third = project(&c, "third");
+        let mut key = decision("key decision", "2026-10-12T09:00:00.000Z");
+        key.importance = Some(5);
+        let (key, _) = put(&c, &third, key);
+        let (e2, _) = put(
+            &c,
+            &third,
+            decision("explicit two", "2026-10-11T09:00:00.000Z"),
+        );
+        let (e1, _) = put(
+            &c,
+            &third,
+            decision("explicit one", "2026-10-10T09:00:00.000Z"),
+        );
+        let mut auto = Vec::new();
+        for (n, day) in [(4, "09"), (3, "08"), (2, "07"), (1, "06")] {
+            auto.push(distilled(
+                &c,
+                &third,
+                decision(
+                    &format!("auto pick {n}"),
+                    &format!("2026-10-0{day}T09:00:00.000Z"),
+                ),
+                true,
+            ));
+        }
+        let text = build(&c, &third, 2_000, at(NOW)).unwrap();
+        let (_, keys) = text.split_once("## Key memories\n").unwrap();
+        assert!(
+            keys.starts_with(&format!("- [decision] key decision ({key})\n")),
+            "{text}"
+        );
+        let (_, section) = text.split_once("## Recent decisions\n").unwrap();
+        let lines: Vec<&str> = section
+            .lines()
+            .take_while(|l| l.starts_with("- "))
+            .collect();
+        let want = [
+            format!("- [decision] explicit two ({e2})"),
+            format!("- [decision] explicit one ({e1})"),
+            format!("- [decision] auto pick 4 ({}) (auto)", auto[0]),
+            format!("- [decision] auto pick 3 ({}) (auto)", auto[1]),
+            format!("- [decision] auto pick 2 ({}) (auto)", auto[2]),
+        ];
+        assert_eq!(lines, want, "{text}");
+        assert_eq!(text.matches(&key).count(), 1, "{text}");
     }
 
     /// SP2 spec §6.6: the key-memories fallback (importance 3) is the explicit memories' own;

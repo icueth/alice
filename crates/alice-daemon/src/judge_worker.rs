@@ -938,10 +938,13 @@ mod tests {
                 })
                 .unwrap();
         };
-        let sql = |q: &str| {
+        let set_origin = |id: &str, origin: Origin| {
             alice_core::store::open_writer(&home.db())
                 .unwrap()
-                .execute(q, [])
+                .execute(
+                    "UPDATE memories SET origin = ?1 WHERE id = ?2",
+                    [origin.as_str(), id],
+                )
                 .unwrap();
         };
         let (old, old_seq) = remember("deploy notes for staging", Origin::Agent, global());
@@ -1034,15 +1037,9 @@ mod tests {
                     "{name}: {j:?}"
                 );
                 // The control: the same memory, written by an agent, is asked about.
-                sql(&format!(
-                    "UPDATE memories SET origin = 'agent' WHERE id = '{}'",
-                    item.id
-                ));
+                set_origin(&item.id, Origin::Agent);
                 let agent = judge_one(cfg, item).unwrap().unwrap();
-                sql(&format!(
-                    "UPDATE memories SET origin = 'distill' WHERE id = '{}'",
-                    item.id
-                ));
+                set_origin(&item.id, Origin::Distill);
                 let asked: Vec<ReviewType> = agent.reviews.iter().map(|r| r.kind).collect();
                 let want = if item.id == twin {
                     ReviewType::Merge

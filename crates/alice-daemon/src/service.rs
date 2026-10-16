@@ -8678,16 +8678,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unjudged_distilled_memories_are_hidden_from_recall_and_the_briefing() {
-        let t = crate::judge_http::ScriptedJev::failing(503);
-        let (d, s) = svc_with_jev_opts(
-            t.clone(),
-            ServiceOptions {
-                judge_retry_every: Duration::from_millis(50),
-                judge_retry_base: Duration::from_millis(1),
-                ..quiet()
-            },
-        )
-        .await;
+        // Jev is down, and each request takes a while: a try of the comparison (four requests)
+        // keeps the memory `pending` for 0.8 s. A failed judgement waits in `retry` until the test
+        // queues it again (the retry interval is long here).
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            status: parking_lot::Mutex::new(Some(503)),
+            delay: Duration::from_millis(200),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
         let cwd = repo(&d, "proj");
         // A neighbour, so the judge has a question to ask about the distilled memory.
         remember_id(
@@ -8708,22 +8708,43 @@ mod tests {
                 ..Default::default()
             })
         };
-        // Pending, then waiting for the judge that cannot answer: hidden all along.
-        for _ in 0..2 {
-            assert_ne!(state_of(&s, &auto).await.0, "done");
-            let r = recall().await.unwrap();
-            assert!(r.results.iter().all(|h| h.id != auto), "{:?}", r.results);
-            let ctx = context_of(&s, &cwd).await.text;
-            assert!(!ctx.contains("blue green"), "{ctx}");
-            assert_eq!(memory_of(&s, &auto).await.memory.id, auto, "get finds it");
-            until("a failed judgement", || (t.sent() >= 4).then_some(())).await;
-        }
+        // Recall and the briefing leave it out, and get finds it, while its judge state is `want`.
+        let hidden = |want: &'static str| {
+            let (s, cwd, auto, recall) = (&s, &cwd, &auto, &recall);
+            async move {
+                assert_eq!(state_of(s, auto).await.0, want);
+                let r = recall().await.unwrap();
+                assert!(
+                    r.results.iter().all(|h| h.id != *auto),
+                    "{want}: {:?}",
+                    r.results
+                );
+                let ctx = context_of(s, cwd).await.text;
+                assert!(!ctx.contains("blue green"), "{want}: {ctx}");
+                assert_eq!(
+                    memory_of(s, auto).await.memory.id,
+                    *auto,
+                    "{want}: get finds it"
+                );
+            }
+        };
+        hidden("pending").await;
+        // The judge cannot answer: the memory waits for it.
         until("waiting for the judge", || {
             (futures::executor::block_on(state_of(&s, &auto)).0 == "retry").then_some(())
         })
         .await;
-        // The judge is back: once judged, the memory is shown, marked.
+        hidden("retry").await;
+        assert!(t.sent() >= 4, "the comparison was tried");
+        // The judge is back and the memory is queued again: once judged, it is shown, marked.
         t.set_status(None);
+        s.writer
+            .submit(WriteOp::RequeueJudgeRetries {
+                max_attempts: crate::judge_worker::MAX_ATTEMPTS,
+                now: "9999-12-31T00:00:00.000Z".into(),
+            })
+            .await
+            .unwrap();
         until("the judgement", || {
             (futures::executor::block_on(state_of(&s, &auto)).0 == "done").then_some(())
         })
