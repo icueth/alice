@@ -420,6 +420,42 @@ struct Scratch {
     reason: String,
 }
 
+/// The chunks a raw retention job ages out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawScope {
+    /// Every raw chunk (`storage.raw_retention`).
+    All,
+    /// The chunks of capture sources only (`capture.raw_retention`, spec §3.9): imported
+    /// transcripts and other raw sources are never aged out by it.
+    Capture,
+}
+
+impl RawScope {
+    /// The chunks of the scope stored before `cutoff`, oldest first, a slice at most.
+    fn older_than(self, c: &rusqlite::Connection, cutoff: &str) -> Result<Vec<i64>> {
+        match self {
+            RawScope::All => m::chunks_older_than(c, cutoff, SLICE),
+            RawScope::Capture => m::capture_chunks_older_than(c, cutoff, SLICE),
+        }
+    }
+
+    /// The text bytes of the scope's chunks.
+    fn bytes(self, c: &rusqlite::Connection) -> Result<u64> {
+        match self {
+            RawScope::All => m::raw_bytes(c),
+            RawScope::Capture => m::capture_raw_bytes(c),
+        }
+    }
+
+    /// (seq, text bytes) of the scope's oldest chunks, a slice at most.
+    fn oldest(self, c: &rusqlite::Connection) -> Result<Vec<(i64, u64)>> {
+        match self {
+            RawScope::All => m::oldest_chunks(c, SLICE),
+            RawScope::Capture => m::oldest_capture_chunks(c, SLICE),
+        }
+    }
+}
+
 impl Scheduler {
     pub fn new(ctx: MaintenanceCtx) -> Self {
         Self {
@@ -639,81 +675,7 @@ impl Scheduler {
                 Ok(Step::More)
             }
             Job::RawRetention => {
-                // (seq, text bytes) of the chunks to delete in this slice.
-                let take: Vec<(i64, u64)> = match s.storage.raw_retention {
-                    Retention::Forever => {
-                        return Ok(Step::Finished("retention is forever".into()));
-                    }
-                    // Age is the time a chunk was stored in Alice (`created_at`), never the
-                    // time it says it was written.
-                    Retention::Age(age) => {
-                        // An age that does not convert (the settings refuse anything over 100
-                        // years, but a stale value must never turn into zero): delete nothing.
-                        let Some(since) = age_cutoff(now, age) else {
-                            return Ok(Step::Finished(
-                                "raw_retention is too large to apply; nothing deleted".into(),
-                            ));
-                        };
-                        let cutoff = ts(since);
-                        self.ctx
-                            .readers
-                            .with(|c| m::chunks_older_than(c, &cutoff, SLICE))?
-                            .into_iter()
-                            .map(|seq| (seq, 0))
-                            .collect()
-                    }
-                    Retention::Size(limit) => {
-                        // The total is read once per run; slices count down from it.
-                        let over = match sc.over_bytes {
-                            Some(o) => o,
-                            None => {
-                                let total = self.ctx.readers.with(m::raw_bytes)?;
-                                total.saturating_sub(limit)
-                            }
-                        };
-                        sc.over_bytes = Some(over);
-                        let mut left = over;
-                        let mut take = Vec::new();
-                        if over > 0 {
-                            for (seq, bytes) in
-                                self.ctx.readers.with(|c| m::oldest_chunks(c, SLICE))?
-                            {
-                                if left == 0 {
-                                    break;
-                                }
-                                take.push((seq, bytes));
-                                left = left.saturating_sub(bytes);
-                            }
-                        }
-                        take
-                    }
-                };
-                if take.is_empty() {
-                    return Ok(Step::Finished(format!(
-                        "raw tier within retention; {} chunks deleted",
-                        sc.deleted
-                    )));
-                }
-                sc.reason = s.storage.raw_retention.to_string();
-                let seqs: Vec<i64> = take.iter().map(|(seq, _)| *seq).collect();
-                let WriteOutcome::Purged(done) =
-                    w.submit_blocking(WriteOp::DeleteChunks { seqs })?
-                else {
-                    return Ok(Step::More);
-                };
-                sc.deleted += done.len();
-                if let Some(o) = sc.over_bytes {
-                    let freed: u64 = take
-                        .iter()
-                        .filter(|(seq, _)| done.contains(seq))
-                        .map(|(_, b)| *b)
-                        .sum();
-                    sc.over_bytes = Some(o.saturating_sub(freed));
-                }
-                if let Some(idx) = self.ctx.index.read().clone() {
-                    idx.remove_chunks(&done)?;
-                }
-                Ok(Step::More)
+                self.raw_retention(now, sc, s.storage.raw_retention, RawScope::All)
             }
             Job::EventsPrune => {
                 let before = ts(now - chrono::Duration::days(i64::from(s.maintenance.events_days)));
@@ -782,31 +744,53 @@ impl Scheduler {
             Job::ModelPurge => self.model_purge(sc),
             Job::Backup => self.backup(now),
             Job::MergeSuggestions => self.merge_suggestions(s.judge.cluster_similarity),
-            Job::CaptureRetention => self.capture_retention(now, sc),
+            Job::CaptureRetention => {
+                self.raw_retention(now, sc, s.capture.raw_retention, RawScope::Capture)
+            }
         }
     }
 
-    /// `capture.raw_retention`: raw retention's rules over the chunks of capture sources only
-    /// (spec §3.9). Imported transcripts and other raw sources follow `storage.raw_retention`
-    /// alone. A capture source emptied here keeps its cursor and turn keys (`m::delete_chunks`).
-    fn capture_retention(&self, now: DateTime<Utc>, sc: &mut Scratch) -> Result<Step> {
-        let retention = self.ctx.settings.get().capture.raw_retention;
+    /// One slice of raw retention: delete up to a slice of the `scope`'s chunks that `retention`
+    /// no longer keeps. A capture source emptied here keeps its cursor and turn keys
+    /// (`m::delete_chunks`).
+    fn raw_retention(
+        &self,
+        now: DateTime<Utc>,
+        sc: &mut Scratch,
+        retention: Retention,
+        scope: RawScope,
+    ) -> Result<Step> {
         // (seq, text bytes) of the chunks to delete in this slice.
         let take: Vec<(i64, u64)> = match retention {
             Retention::Forever => {
-                return Ok(Step::Finished("capture retention is forever".into()));
+                return Ok(Step::Finished(
+                    match scope {
+                        RawScope::All => "retention is forever",
+                        RawScope::Capture => "capture retention is forever",
+                    }
+                    .into(),
+                ));
             }
-            // Age is the time a chunk was stored in Alice (`created_at`).
+            // Age is the time a chunk was stored in Alice (`created_at`), never the
+            // time it says it was written.
             Retention::Age(age) => {
+                // An age that does not convert (the settings refuse anything over 100
+                // years, but a stale value must never turn into zero): delete nothing.
                 let Some(since) = age_cutoff(now, age) else {
                     return Ok(Step::Finished(
-                        "capture.raw_retention is too large to apply; nothing deleted".into(),
+                        match scope {
+                            RawScope::All => "raw_retention is too large to apply; nothing deleted",
+                            RawScope::Capture => {
+                                "capture.raw_retention is too large to apply; nothing deleted"
+                            }
+                        }
+                        .into(),
                     ));
                 };
                 let cutoff = since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 self.ctx
                     .readers
-                    .with(|c| m::capture_chunks_older_than(c, &cutoff, SLICE))?
+                    .with(|c| scope.older_than(c, &cutoff))?
                     .into_iter()
                     .map(|seq| (seq, 0))
                     .collect()
@@ -816,7 +800,7 @@ impl Scheduler {
                 let over = match sc.over_bytes {
                     Some(o) => o,
                     None => {
-                        let total = self.ctx.readers.with(m::capture_raw_bytes)?;
+                        let total = self.ctx.readers.with(|c| scope.bytes(c))?;
                         total.saturating_sub(limit)
                     }
                 };
@@ -824,11 +808,7 @@ impl Scheduler {
                 let mut left = over;
                 let mut take = Vec::new();
                 if over > 0 {
-                    for (seq, bytes) in self
-                        .ctx
-                        .readers
-                        .with(|c| m::oldest_capture_chunks(c, SLICE))?
-                    {
+                    for (seq, bytes) in self.ctx.readers.with(|c| scope.oldest(c))? {
                         if left == 0 {
                             break;
                         }
@@ -840,12 +820,20 @@ impl Scheduler {
             }
         };
         if take.is_empty() {
-            return Ok(Step::Finished(format!(
-                "captured transcripts within retention; {} chunks deleted",
-                sc.deleted
-            )));
+            return Ok(Step::Finished(match scope {
+                RawScope::All => {
+                    format!("raw tier within retention; {} chunks deleted", sc.deleted)
+                }
+                RawScope::Capture => format!(
+                    "captured transcripts within retention; {} chunks deleted",
+                    sc.deleted
+                ),
+            }));
         }
-        sc.reason = format!("capture: {retention}");
+        sc.reason = match scope {
+            RawScope::All => retention.to_string(),
+            RawScope::Capture => format!("capture: {retention}"),
+        };
         let seqs: Vec<i64> = take.iter().map(|(seq, _)| *seq).collect();
         let WriteOutcome::Purged(done) = self
             .ctx
