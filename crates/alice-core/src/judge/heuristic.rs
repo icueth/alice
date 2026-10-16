@@ -314,6 +314,7 @@ mod tests {
             created_at: created.into(),
             similarity: sim,
             raw: false,
+            status: None,
         }
     }
 

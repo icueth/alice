@@ -1636,6 +1636,7 @@ impl Service {
                 created_at: h.created_at.clone(),
                 similarity: None,
                 raw: h.tier == Tier::Raw,
+                status: h.status,
             };
             let mut shown: Vec<(usize, JudgeMemory)> = Vec::new();
             let mut ordinal = 0;
@@ -1710,7 +1711,28 @@ impl Service {
                                     ));
                                 }
                             }
-                            graded.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                            // Ordered by the grade with the status prior of the search kept
+                            // (`weight^λ`, as in fusion): an outdated fact still "answers", and
+                            // must not lead the memory that replaced it.
+                            let cfg = self.settings();
+                            let all_hits = |i: usize| {
+                                if i < near_start {
+                                    &out.hits[i]
+                                } else {
+                                    &near[i - near_start].hit
+                                }
+                            };
+                            let prior = |i: usize| {
+                                all_hits(i).status.map_or(1.0, |st| {
+                                    search::fusion::status_weight(&cfg.search.weights, st)
+                                        .powf(cfg.search.boost_exponent)
+                                })
+                            };
+                            graded.sort_by(|a, b| {
+                                (b.1 * prior(b.0))
+                                    .total_cmp(&(a.1 * prior(a.0)))
+                                    .then(a.0.cmp(&b.0))
+                            });
                             reranked = !graded.is_empty();
                             // Graded, and not one of them clearly answers the query.
                             low_confidence = reranked
@@ -7430,6 +7452,166 @@ mod tests {
             remember_id(s, text, Some(Kind::Howto), cwd).await;
         }
         wait_settled(s).await;
+    }
+
+    /// Grades a result by the first of `scores` its block holds: `(marker, P(answers))`; other
+    /// questions are answered `unrelated`. Keeps the grading states.
+    struct ScoreGrader {
+        scores: Vec<(&'static str, f64)>,
+        states: Mutex<Vec<String>>,
+    }
+
+    impl alice_core::judge::jev::JevTransport for ScoreGrader {
+        fn post(
+            &self,
+            _endpoint: &str,
+            _key: &str,
+            body: &[u8],
+            _timeout: Duration,
+        ) -> std::result::Result<
+            alice_core::judge::jev::HttpReply,
+            alice_core::judge::jev::TransportError,
+        > {
+            let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let state = req["state"].as_str().unwrap();
+            let mut answers = serde_json::Map::new();
+            for (qid, q) in req["questions"].as_object().unwrap() {
+                let options: Vec<String> =
+                    q["criteria"].as_object().unwrap().keys().cloned().collect();
+                let p = qid.strip_prefix("r_").map(|k| {
+                    let k: usize = k.parse().unwrap();
+                    let block = state
+                        .split(&format!("Result {k} ("))
+                        .nth(1)
+                        .unwrap_or("")
+                        .split("\nResult ")
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    self.scores
+                        .iter()
+                        .find(|(m, _)| block.contains(m))
+                        .map_or(0.02, |(_, p)| *p)
+                });
+                let (choice, probs): (&str, serde_json::Map<String, serde_json::Value>) = match p {
+                    Some(p) => (
+                        if p >= 0.5 { "answers" } else { "unrelated" },
+                        options
+                            .iter()
+                            .map(|o| {
+                                let v = match o.as_str() {
+                                    "answers" => p,
+                                    "unrelated" => 1.0 - p - 0.01,
+                                    _ => 0.01 / (options.len().max(3) - 2) as f64,
+                                };
+                                (o.clone(), serde_json::json!(v))
+                            })
+                            .collect(),
+                    ),
+                    None => (
+                        "unrelated",
+                        options
+                            .iter()
+                            .map(|o| {
+                                let v = if o == "unrelated" {
+                                    0.9
+                                } else {
+                                    0.1 / options.len() as f64
+                                };
+                                (o.clone(), serde_json::json!(v))
+                            })
+                            .collect(),
+                    ),
+                };
+                if p.is_some() {
+                    self.states.lock().push(state.to_string());
+                }
+                answers.insert(
+                    qid.clone(),
+                    serde_json::json!({"type": "choice", "choice": choice, "confidence": 0.9, "probabilities": probs}),
+                );
+            }
+            let resp = serde_json::json!({"model": "jev-1.13.0", "answers": answers,
+                "usage": {"input_tokens": 800, "output_tokens": 0}});
+            Ok(alice_core::judge::jev::HttpReply {
+                status: 200,
+                body: serde_json::to_vec(&resp).unwrap(),
+                retry_after: None,
+            })
+        }
+    }
+
+    /// Final review C-I1: the judge grades an outdated fact as answering too; precise mode tells
+    /// it the memory was superseded and keeps the status prior, so the replacement leads even
+    /// when the old version is graded a little higher.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_mode_keeps_a_replacement_above_the_memory_it_superseded() {
+        let t = Arc::new(ScoreGrader {
+            scores: vec![("5432", 0.93), ("5433", 0.91)],
+            states: Default::default(),
+        });
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                jev_transport: Some(t.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        let cwd = repo(&d, "proj");
+        let old = remember_id(
+            &s,
+            "Postgres in staging listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        s.remember(RememberRequest {
+            supersedes: vec![old.clone()],
+            ..remember_req(
+                "Postgres in staging now listens on port 5433",
+                Some(Kind::Fact),
+                &cwd,
+            )
+        })
+        .await
+        .unwrap();
+        wait_settled(&s).await;
+        assert_eq!(state_of(&s, &old).await.1, "superseded");
+        let r = s
+            .recall(recall_req(
+                "which port does Postgres in staging listen on",
+                RecallMode::Precise,
+                &cwd,
+            ))
+            .await
+            .unwrap();
+        assert!(r.reranked, "{:?}", r.notes);
+        let titles: Vec<&str> = r.results.iter().map(|h| h.title.as_str()).collect();
+        assert!(titles[0].contains("5433"), "{titles:?}");
+        let old_hit = r
+            .results
+            .iter()
+            .find(|h| h.id == old)
+            .expect("the old one is shown");
+        assert!(
+            old_hit.relevance.unwrap() > r.results[0].relevance.unwrap(),
+            "graded higher"
+        );
+        assert!(
+            t.states
+                .lock()
+                .iter()
+                .any(|st| st.contains("status superseded: a newer memory replaced it")),
+            "the judge was told"
+        );
+        s.shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread")]

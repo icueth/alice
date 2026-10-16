@@ -167,6 +167,9 @@ pub struct JudgeMemory {
     /// A raw transcript chunk, not a memory: a recall grading shows up to
     /// [`verbal::RAW_BODY_CHARS`] characters of it.
     pub raw: bool,
+    /// The memory's status when the question depends on it (a precise recall): a superseded
+    /// or archived memory says so in its header. `None`: not stated.
+    pub status: Option<crate::model::Status>,
 }
 
 /// How a new memory relates to one existing memory: P over `RelationKind` names.
