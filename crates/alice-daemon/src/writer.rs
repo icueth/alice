@@ -290,10 +290,13 @@ pub enum WriteOp {
     ImportBatch(Box<ImportBatch>),
     /// `alice projects merge`: move everything of `from` into `into` and record the event that
     /// undo reverses (see `store::project_merge`). One transaction, and a commit of its own.
+    /// `rules`: what `from`'s own `.alice.toml` puts in force (the merge carries them, and what
+    /// earlier merges carried into `from`, into `into`).
     MergeProjects {
         from: String,
         into: String,
         actor: Actor,
+        rules: Box<alice_core::settings::ProjectSettings>,
     },
     Shutdown,
 }
@@ -1522,12 +1525,18 @@ fn merge_projects(
     from: String,
     into: String,
     actor: Actor,
+    rules: Box<alice_core::settings::ProjectSettings>,
     st: &mut State,
 ) -> Result<Applied> {
     let fresh = st.chunk_budget == INGEST_SLICE && st.byte_budget == INGEST_SLICE_BYTES;
     if !fresh {
         return Ok(Applied::More(
-            WriteOp::MergeProjects { from, into, actor },
+            WriteOp::MergeProjects {
+                from,
+                into,
+                actor,
+                rules,
+            },
             None,
         ));
     }
@@ -1536,7 +1545,7 @@ fn merge_projects(
     #[cfg(test)]
     st.applied.push("MergeProjects");
     let hlc = st.hlc.tick();
-    let done = project_merge::merge(conn, &from, &into, &hlc)?;
+    let done = project_merge::merge(conn, &from, &into, &hlc, &rules)?;
     let event = record(
         conn,
         st,
@@ -1745,8 +1754,13 @@ fn apply(
             None => WriteOutcome::Count(0),
         },
         WriteOp::ImportBatch(batch) => return import_batch(conn, batch, st),
-        WriteOp::MergeProjects { from, into, actor } => {
-            return merge_projects(conn, from, into, actor, st);
+        WriteOp::MergeProjects {
+            from,
+            into,
+            actor,
+            rules,
+        } => {
+            return merge_projects(conn, from, into, actor, rules, st);
         }
         WriteOp::Shutdown => WriteOutcome::Done,
     };
@@ -2696,6 +2710,7 @@ mod tests {
                 from: from.into(),
                 into: into.into(),
                 actor: Actor::User,
+                rules: Default::default(),
             })
         };
         let refused = merge("global", "b");

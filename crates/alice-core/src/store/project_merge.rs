@@ -11,11 +11,19 @@
 //! be too many for an event payload. Undo moves back exactly those rows that are still in `into`.
 //! Nothing that carries a project is stored outside the rows moved here: the full-text indexes
 //! and the vectors are keyed by row, not by project, and a search filters on the row's project.
+//!
+//! The privacy rules of `from` are not lost: the merge carries them into `into` (a row of
+//! `project_rules` under the merge's id, holding what the caller read from `from`'s
+//! `.alice.toml` and what earlier merges had carried into `from`). `into`'s rules are then the
+//! stricter of both, whatever its own file says (see [`projects::carried_rules`]). Undo deletes
+//! that one row, so `into` has exactly the rules it had before, plus whatever a later merge
+//! carried into it.
 
 use crate::error::{AliceError, Result};
 use crate::ids::new_id;
 use crate::model::Kind;
 use crate::normalize::content_hash;
+use crate::settings::ProjectSettings;
 use crate::store::projects::{self, GLOBAL_ID, ResolvedProject};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -36,19 +44,23 @@ pub struct MergeCounts {
 }
 
 /// A merge that is allowed, with what it would move.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MergePlan {
     pub from: ResolvedProject,
     pub into: ResolvedProject,
     pub counts: MergeCounts,
+    /// The rules earlier merges carried into `from` (they are carried on into `into`).
+    pub from_carried: Option<ProjectSettings>,
 }
 
-/// What a merge did: the event states (see [`MergeState`]) and the counts.
+/// What a merge did: the event states (see [`MergeState`]), the counts and the rules it carried
+/// into `into`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeDone {
     pub from: ResolvedProject,
     pub into: ResolvedProject,
     pub counts: MergeCounts,
+    pub carried: ProjectSettings,
     pub before: serde_json::Value,
     pub after: serde_json::Value,
 }
@@ -88,6 +100,11 @@ pub struct MergeBefore {
     /// flag; undo sets it again on exactly these).
     #[serde(default)]
     pub defaulted: Vec<String>,
+    /// The names of the privacy rules the merge carried into `into` (`cloud_denied`,
+    /// `block_secrets`, `custom:<name>`), for the history; the rules themselves are in
+    /// `project_rules` under `merge_id`, and undo deletes that row.
+    #[serde(default)]
+    pub rules_carried: Vec<String>,
 }
 
 /// The after-state of a merge event, and what [`current_state`] reads back to compare it with:
@@ -163,11 +180,22 @@ pub fn plan(conn: &Connection, from: &str, into: &str) -> Result<MergePlan> {
         ));
     }
     let counts = counts_of(conn, &from_p.id)?;
+    let from_carried = projects::carried_rules(conn, &from_p.id)?;
     Ok(MergePlan {
         from: from_p,
         into: into_p,
         counts,
+        from_carried,
     })
+}
+
+/// The rules a merge of `plan` carries into `into`: `from_rules` (what `from`'s own
+/// `.alice.toml` says, read by the caller) and what earlier merges carried into `from`.
+pub fn rules_to_carry(plan: &MergePlan, from_rules: &ProjectSettings) -> ProjectSettings {
+    match &plan.from_carried {
+        Some(c) => from_rules.stricter(c),
+        None => from_rules.clone(),
+    }
 }
 
 /// The part of a memory row that its content hash is made of.
@@ -255,9 +283,21 @@ fn ids_of(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Vec<
 }
 
 /// Merge `from` into `into` (both already checked by [`plan`], inside the transaction that
-/// calls this). Returns the event states.
-pub fn merge(conn: &Connection, from: &str, into: &str, hlc: &str) -> Result<MergeDone> {
-    let MergePlan { from, into, counts } = plan(conn, from, into)?;
+/// calls this). `from_rules` are the rules `from`'s own `.alice.toml` puts in force (the caller
+/// reads them; the store does not see working trees): they are carried into `into`, with those
+/// earlier merges carried into `from`. Returns the event states.
+pub fn merge(
+    conn: &Connection,
+    from: &str,
+    into: &str,
+    hlc: &str,
+    from_rules: &ProjectSettings,
+) -> Result<MergeDone> {
+    let plan = plan(conn, from, into)?;
+    let carried = rules_to_carry(&plan, from_rules);
+    let MergePlan {
+        from, into, counts, ..
+    } = plan;
     let merge_id = new_id();
     let row: ProjectRow = conn.query_row(
         "SELECT id, key, slug, name, git_remote, root_path, created_at FROM projects WHERE id = ?1",
@@ -337,6 +377,16 @@ pub fn merge(conn: &Connection, from: &str, into: &str, hlc: &str) -> Result<Mer
         "INSERT INTO project_aliases (alias, project_id) VALUES (?1, ?2) ON CONFLICT(alias) DO UPDATE SET project_id = excluded.project_id",
         params![row.slug, into.id],
     )?;
+    // The rules of `from` go with its rows. (Its own carried rows stay under its id, for the
+    // undo that brings it back.)
+    if carried != ProjectSettings::default() {
+        let json = serde_json::to_string(&carried)
+            .map_err(|e| AliceError::Other(format!("merge rules: {e}")))?;
+        conn.execute(
+            "INSERT INTO project_rules (project_id, merge_id, rules_json) VALUES (?1, ?2, ?3)",
+            params![into.id, merge_id, json],
+        )?;
+    }
 
     let before = MergeBefore {
         merge_id: merge_id.clone(),
@@ -351,6 +401,7 @@ pub fn merge(conn: &Connection, from: &str, into: &str, hlc: &str) -> Result<Mer
         facts: counts.facts,
         into_root,
         defaulted,
+        rules_carried: carried.rule_names(),
     };
     let after = MergeState {
         merge_id,
@@ -365,6 +416,7 @@ pub fn merge(conn: &Connection, from: &str, into: &str, hlc: &str) -> Result<Mer
         from,
         into,
         counts,
+        carried,
         before: to_json(&before)?,
         after: to_json(&after)?,
     })
@@ -545,6 +597,11 @@ pub fn unmerge(conn: &Connection, before: &serde_json::Value, hlc: &str) -> Resu
         "DELETE FROM project_merge_rows WHERE merge_id = ?1",
         [&b.merge_id],
     )?;
+    // What the merge carried into `into` goes with it; rules a later merge carried stay.
+    conn.execute(
+        "DELETE FROM project_rules WHERE merge_id = ?1 AND project_id = ?2",
+        params![b.merge_id, b.into_id],
+    )?;
     Ok(())
 }
 
@@ -672,8 +729,17 @@ mod tests {
         }
         /// Merge and record the event as the writer does; returns its id.
         fn merge(&mut self, from: &str, into: &str) -> (MergeDone, String) {
+            self.merge_with(from, into, &ProjectSettings::default())
+        }
+        /// [`merge`](Self::merge) with the rules `from`'s own file puts in force.
+        fn merge_with(
+            &mut self,
+            from: &str,
+            into: &str,
+            rules: &ProjectSettings,
+        ) -> (MergeDone, String) {
             let h = self.hlc();
-            let done = merge(&self.c, from, into, &h).unwrap();
+            let done = merge(&self.c, from, into, &h, rules).unwrap();
             let id = events::record(
                 &self.c,
                 &EventInput {
@@ -1165,5 +1231,127 @@ mod tests {
             InsertOutcome::Duplicate { id } => assert_eq!(id, ma),
             other => panic!("{other:?}"),
         }
+    }
+
+    fn rules(block: bool, cloud: bool, patterns: &[&str]) -> ProjectSettings {
+        let mut r = ProjectSettings::default();
+        r.privacy.block_secrets = block;
+        r.privacy.cloud_denied = cloud;
+        r.privacy.custom_patterns = patterns
+            .iter()
+            .map(|n| crate::settings::CustomPattern {
+                name: n.to_string(),
+                regex: format!("{}-[0-9]+", n.to_uppercase()),
+            })
+            .collect();
+        r
+    }
+
+    fn carried(t: &T, id: &str) -> Option<ProjectSettings> {
+        projects::carried_rules(&t.c, id).unwrap()
+    }
+
+    /// The ruling: a merge carries the rules of `from` into `into`, which keeps the stricter of
+    /// both; each merge's share is its own row, so undoing one takes back exactly what it carried
+    /// and leaves what another merge carried (even the same rule) in place.
+    #[test]
+    fn a_merge_carries_the_rules_of_from_and_undo_takes_back_exactly_its_share() {
+        let mut t = T::new();
+        t.project("k/a", "a");
+        let b = t.project("k/b", "b");
+        t.project("k/c", "c");
+        let (done, first) = t.merge_with("a", "b", &rules(true, false, &["ticket"]));
+        assert_eq!(done.carried, rules(true, false, &["ticket"]));
+        assert_eq!(carried(&t, &b.id), Some(rules(true, false, &["ticket"])));
+        let before: MergeBefore = serde_json::from_value(done.before.clone()).unwrap();
+        assert_eq!(before.rules_carried, ["block_secrets", "custom:ticket"]);
+        assert!(
+            !done.before.to_string().contains("TICKET-"),
+            "the event never holds a pattern's expression"
+        );
+        // A second merge carries block mode again, and a cloud denial.
+        let (_, second) = t.merge_with("c", "b", &rules(true, true, &["acct"]));
+        let mut both = carried(&t, &b.id).unwrap();
+        both.privacy
+            .custom_patterns
+            .sort_by(|x, y| x.name.cmp(&y.name));
+        assert_eq!(both, rules(true, true, &["acct", "ticket"]));
+        // Undoing the first keeps everything the second carried, block mode included.
+        assert!(matches!(
+            t.undo(&first, false).unwrap(),
+            history::UndoOutcome::Undone { .. }
+        ));
+        assert_eq!(carried(&t, &b.id), Some(rules(true, true, &["acct"])));
+        t.undo(&second, false).unwrap();
+        assert_eq!(carried(&t, &b.id), None, "exactly as before the merges");
+    }
+
+    /// What earlier merges carried into a project goes on with it when it is merged again, and
+    /// comes back with it when that merge is undone. A project with no root keeps carried rules
+    /// all the same: its tree is the rules alone.
+    #[test]
+    fn carried_rules_travel_on_with_a_merged_project_and_come_back_with_it() {
+        let mut t = T::new();
+        t.project("k/a", "a");
+        let b = t.project("k/b", "b");
+        let c = t.project("k/c", "c");
+        t.merge_with("a", "b", &rules(false, false, &["ticket"]));
+        let p = plan(&t.c, "b", "c").unwrap();
+        assert_eq!(p.from_carried, Some(rules(false, false, &["ticket"])));
+        let (done, event) = t.merge_with("b", "c", &rules(false, true, &[]));
+        assert_eq!(done.carried, rules(false, true, &["ticket"]));
+        assert_eq!(carried(&t, &c.id), Some(rules(false, true, &["ticket"])));
+        // `c` has no working tree: its tree is the carried rules.
+        let tree = projects::tree_of(&t.c, "c")
+            .unwrap()
+            .expect("a tree for the rules");
+        assert!(!tree.has_root());
+        assert_eq!(tree.carried, Some(rules(false, true, &["ticket"])));
+        // The old names find it too.
+        assert_eq!(
+            projects::tree_of(&t.c, "a").unwrap().unwrap().carried,
+            tree.carried
+        );
+        t.undo(&event, false).unwrap();
+        assert_eq!(carried(&t, &c.id), None);
+        assert_eq!(carried(&t, &b.id), Some(rules(false, false, &["ticket"])));
+        assert_eq!(
+            projects::tree_of(&t.c, "c").unwrap(),
+            None,
+            "no root, no rules"
+        );
+    }
+
+    /// A write from the old checkout of a merged project lands in the survivor: its tree keeps
+    /// the checkout's own key and root, takes the rules carried into the survivor, and has the
+    /// survivor's own tree along. A checkout of the survivor itself has no such second tree.
+    #[test]
+    fn the_old_checkout_of_a_merged_project_is_screened_with_the_survivors_rules_too() {
+        let mut t = T::new();
+        let d = tempfile::tempdir().unwrap();
+        let (root_a, root_b) = (d.path().join("a"), d.path().join("b"));
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let mut ra = pref("k/a", "a");
+        ra.root = Some(root_a.clone());
+        let mut rb = pref("k/b", "b");
+        rb.root = Some(root_b.clone());
+        projects::upsert_project(&t.c, &ra).unwrap();
+        projects::upsert_project(&t.c, &rb).unwrap();
+        // Before the merge: each checkout is its own project.
+        assert_eq!(projects::tree_of_detected(&t.c, &ra).unwrap(), ra.tree());
+        t.merge_with("a", "b", &rules(false, false, &["ticket"]));
+        let tree = projects::tree_of_detected(&t.c, &ra).unwrap().unwrap();
+        assert_eq!((tree.key.as_deref(), &tree.root), (Some("k/a"), &root_a));
+        assert_eq!(tree.carried, Some(rules(false, false, &["ticket"])));
+        let also = tree.also.expect("the survivor's tree");
+        assert_eq!((also.key.as_deref(), &also.root), (Some("k/b"), &root_b));
+        let own = projects::tree_of_detected(&t.c, &rb).unwrap().unwrap();
+        assert!(own.also.is_none());
+        assert_eq!(own.carried, tree.carried);
+        // A checkout nobody stored: its own tree, nothing else.
+        let mut rc = pref("k/c", "c");
+        rc.root = Some(d.path().to_path_buf());
+        assert_eq!(projects::tree_of_detected(&t.c, &rc).unwrap(), rc.tree());
     }
 }

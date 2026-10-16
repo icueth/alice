@@ -1951,6 +1951,41 @@ impl ProjectSettings {
                 .iter()
                 .any(|p| !n.custom_patterns.contains(p))
     }
+
+    /// Both sets of rules at once: every flag either sets, every pattern either has (`self`'s
+    /// first, a pattern both have once). Never looser than either side.
+    pub fn stricter(&self, other: &Self) -> Self {
+        let mut out = self.clone();
+        out.privacy.block_secrets |= other.privacy.block_secrets;
+        out.privacy.cloud_denied |= other.privacy.cloud_denied;
+        for p in &other.privacy.custom_patterns {
+            if !out.privacy.custom_patterns.contains(p) {
+                out.privacy.custom_patterns.push(p.clone());
+            }
+        }
+        out
+    }
+
+    /// The rules as they are named to a person: `block_secrets`, `cloud_denied`,
+    /// `custom:<name>`. A pattern's expression is never shown (people write known secrets as
+    /// patterns).
+    pub fn rule_names(&self) -> Vec<String> {
+        let p = &self.privacy;
+        let mut out = Vec::new();
+        if p.block_secrets {
+            out.push("block_secrets".to_string());
+        }
+        if p.cloud_denied {
+            out.push("cloud_denied".to_string());
+        }
+        for c in &p.custom_patterns {
+            let name = format!("custom:{}", c.name);
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
 }
 
 /// `<repo>/.alice.toml` read as text; `None` when there is none.
@@ -2014,13 +2049,25 @@ pub struct ProjectLoad {
 /// A working tree of a project as its privacy rules see it: the project's stable key and the
 /// tree's root. The rules are kept per project, whatever tree they were read in, so a new
 /// worktree, a fresh clone or a removed checkout of the project never loses them.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Two more sources of rules ride along (both read from the store, both only ever add rules):
+/// the rules project merges carried into the stored project (`carried`), and, for a checkout
+/// of a project that was merged into another, the tree of the project it writes into now
+/// (`also`). [`ProjectSettingsCache::get_tree`] applies all of them.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProjectTree {
     /// The project's key (`projects.key`, or a detected [`crate::project::ProjectRef::key`]);
     /// `None` keeps the rules for this tree alone.
     pub key: Option<String>,
-    /// The tree's root, where `.alice.toml` is read.
+    /// The tree's root, where `.alice.toml` is read. Empty for a project that has no working
+    /// tree but carries rules (see [`rules_only`](Self::rules_only)): no file is read.
     pub root: std::path::PathBuf,
+    /// Rules that `alice projects merge` carried into the stored project (from the projects
+    /// merged into it), on top of whatever the tree's file says.
+    pub carried: Option<ProjectSettings>,
+    /// The tree of the stored project this tree's project was merged into (a checkout of the
+    /// merged project writes there now): its rules apply too.
+    pub also: Option<Box<ProjectTree>>,
 }
 
 impl ProjectTree {
@@ -2028,6 +2075,8 @@ impl ProjectTree {
         Self {
             key: Some(key.into()),
             root: root.into(),
+            carried: None,
+            also: None,
         }
     }
 
@@ -2036,7 +2085,36 @@ impl ProjectTree {
         Self {
             key: None,
             root: root.into(),
+            carried: None,
+            also: None,
         }
+    }
+
+    /// A stored project with no working tree whose rules are only those merges carried into it.
+    pub fn rules_only(key: impl Into<String>, carried: ProjectSettings) -> Self {
+        Self {
+            key: Some(key.into()),
+            root: std::path::PathBuf::new(),
+            carried: Some(carried),
+            also: None,
+        }
+    }
+
+    /// This tree with the rules merges carried into its project (`None`: none).
+    pub fn with_carried(mut self, carried: Option<ProjectSettings>) -> Self {
+        self.carried = carried;
+        self
+    }
+
+    /// This tree with the tree of the project it writes into (see [`also`](Self::also)).
+    pub fn with_also(mut self, also: Option<ProjectTree>) -> Self {
+        self.also = also.map(Box::new);
+        self
+    }
+
+    /// No working tree: only carried rules (see [`rules_only`](Self::rules_only)).
+    pub fn has_root(&self) -> bool {
+        !self.root.as_os_str().is_empty()
     }
 }
 
@@ -2190,7 +2268,34 @@ impl ProjectSettingsCache {
         self.get_tree(&ProjectTree::alone(root))
     }
 
+    /// The rules in force for `tree`: what its `.alice.toml` says under the project's kept rules
+    /// (below), with the rules merges carried into the project and those of the tree it writes
+    /// into ([`ProjectTree::also`]) on top. Those two only ever add: a flag either sets, a
+    /// pattern either has. An error or a waiting loosening of any of them is reported.
     pub fn get_tree(&self, tree: &ProjectTree) -> ProjectLoad {
+        let mut load = if tree.has_root() {
+            self.get_file(tree)
+        } else {
+            ProjectLoad {
+                settings: ProjectSettings::default(),
+                error: None,
+                loosening_pending: false,
+            }
+        };
+        if let Some(c) = &tree.carried {
+            load.settings = load.settings.stricter(c);
+        }
+        if let Some(also) = &tree.also {
+            let other = self.get_tree(also);
+            load.settings = load.settings.stricter(&other.settings);
+            load.error = load.error.or(other.error);
+            load.loosening_pending |= other.loosening_pending;
+        }
+        load
+    }
+
+    /// What the tree's `.alice.toml` says, under the rules kept for its project (see the type).
+    fn get_file(&self, tree: &ProjectTree) -> ProjectLoad {
         // Two spellings of one repository (a symlink, `..`) share one entry and one gate.
         let root = std::fs::canonicalize(&tree.root).unwrap_or_else(|_| tree.root.clone());
         let key = match &tree.key {
@@ -3883,6 +3988,117 @@ mod tests {
         tick(&now);
         let l = cache.get_tree(&at(&worktree));
         assert!(!l.settings.privacy.cloud_denied && l.settings.privacy.block_secrets);
+    }
+
+    /// The rules a project merge carried into a project ride on its tree: they apply on top of
+    /// whatever its own file says, so its file saying less (even after the three looks that
+    /// let a loosening through) never drops them. A project with no tree has them alone.
+    #[test]
+    fn carried_rules_apply_on_top_of_the_trees_file_and_never_loosen() {
+        let d = tempfile::tempdir().unwrap();
+        let main = d.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        let (cache, now) = clocked();
+        let mut carried = ProjectSettings::default();
+        carried.privacy.cloud_denied = true;
+        carried.privacy.custom_patterns.push(CustomPattern {
+            name: "acct".into(),
+            regex: "ACCT-[0-9]+".into(),
+        });
+        let at = || ProjectTree::new("k/app", &main).with_carried(Some(carried.clone()));
+        write_project(
+            &main,
+            "[privacy]
+block_secrets = true
+",
+        );
+        let l = cache.get_tree(&at());
+        assert!(l.settings.privacy.block_secrets && l.settings.privacy.cloud_denied);
+        assert_eq!(l.settings.privacy.custom_patterns.len(), 1);
+        std::fs::remove_file(main.join(".alice.toml")).unwrap();
+        for _ in 0..4 {
+            tick(&now);
+            cache.get_tree(&at());
+        }
+        let l = cache.get_tree(&at());
+        assert!(
+            !l.settings.privacy.block_secrets,
+            "the file's own rule went"
+        );
+        assert!(l.settings.privacy.cloud_denied, "the carried ones did not");
+        assert_eq!(
+            l.settings.privacy.custom_patterns,
+            carried.privacy.custom_patterns
+        );
+        // No working tree: the carried rules alone, and nothing is read.
+        let l = cache.get_tree(&ProjectTree::rules_only("k/placeholder", carried.clone()));
+        assert_eq!(
+            (l.settings, l.error, l.loosening_pending),
+            (carried.clone(), None, false)
+        );
+    }
+
+    /// The checkout of a project that was merged into another writes into the survivor: the
+    /// survivor's tree rides along (`also`) and its rules apply as well as the checkout's own;
+    /// a fail-closed state of either is reported.
+    #[test]
+    fn the_tree_a_merged_checkout_writes_into_adds_its_rules() {
+        let d = tempfile::tempdir().unwrap();
+        let (old, survivor) = (d.path().join("old"), d.path().join("survivor"));
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&survivor).unwrap();
+        let (cache, _now) = clocked();
+        write_project(&survivor, STRICT);
+        write_project(
+            &old,
+            "[privacy]
+custom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]+\" }]
+",
+        );
+        let tree = ProjectTree::new("k/old", &old)
+            .with_also(Some(ProjectTree::new("k/survivor", &survivor)));
+        let l = cache.get_tree(&tree);
+        let p = &l.settings.privacy;
+        assert!(p.block_secrets && p.cloud_denied);
+        let mut names: Vec<_> = p.custom_patterns.iter().map(|c| c.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["acct", "ticket"]);
+        // A broken file in the survivor's tree closes the checkout's writes too.
+        write_project(&survivor, "[privacy\n");
+        let l = cache.get_tree(&tree);
+        assert!(l.error.is_some() && l.settings.privacy.block_secrets);
+    }
+
+    #[test]
+    fn stricter_keeps_every_flag_and_pattern_once() {
+        let pat = |n: &str| CustomPattern {
+            name: n.into(),
+            regex: format!("{n}-[0-9]+"),
+        };
+        let mut a = ProjectSettings::default();
+        a.privacy.block_secrets = true;
+        a.privacy.custom_patterns = vec![pat("x"), pat("y")];
+        let mut b = ProjectSettings::default();
+        b.privacy.cloud_denied = true;
+        b.privacy.custom_patterns = vec![pat("y"), pat("z")];
+        let s = a.stricter(&b);
+        assert!(s.privacy.block_secrets && s.privacy.cloud_denied);
+        assert_eq!(
+            s.privacy.custom_patterns,
+            vec![pat("x"), pat("y"), pat("z")]
+        );
+        assert!(!a.loosened_by(&s) && !b.loosened_by(&s));
+        assert_eq!(
+            s.rule_names(),
+            [
+                "block_secrets",
+                "cloud_denied",
+                "custom:x",
+                "custom:y",
+                "custom:z"
+            ]
+        );
+        assert_eq!(ProjectSettings::default().stricter(&a), a);
     }
 
     /// Final review A-C1: a tree that is gone (a removed worktree) keeps the project's rules;

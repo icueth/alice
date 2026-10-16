@@ -613,6 +613,16 @@ impl SettingsHandle {
         }
     }
 
+    /// The project rules in force for `tree` (its `.alice.toml` as kept for the project, and the
+    /// rules merges carried into it); none for `None`. What a project merge carries.
+    pub fn project_rules(
+        &self,
+        tree: Option<&ProjectTree>,
+    ) -> alice_core::settings::ProjectSettings {
+        tree.map(|t| self.projects.get_tree(t).settings)
+            .unwrap_or_default()
+    }
+
     /// Whether the privacy rules for `tree` are in a fail-closed state right now rather than
     /// the ones a person configured: `config.toml` is degraded, or the project's `.alice.toml`
     /// is invalid or unreadable, or blank on its first look, or a loosening of it (or of `config.toml`) is

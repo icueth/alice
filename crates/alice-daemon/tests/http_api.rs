@@ -2676,6 +2676,274 @@ async fn a_project_file_denial_blocks_the_merge_into_an_allowed_project_too() {
     assert!(text.contains("cloud providers"), "{text}");
 }
 
+/// Every rule a project's `.alice.toml` can set: block mode, cloud denial, a custom pattern.
+const STRICT_RULES: &str = "[privacy]\nblock_secrets = true\ncloud_denied = true\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n";
+
+/// Folders `names` under the test's temp dir, each a project detected from it with one note.
+async fn projects_in_folders(
+    s: &Srv,
+    names: &[&str],
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for name in names {
+        let dir = s._d.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        out.insert(name.to_string(), dir.to_string_lossy().into_owned());
+    }
+    out
+}
+
+async fn note_in(s: &Srv, cwd: &str, text: &str) {
+    s.svc
+        .remember(RememberRequest {
+            content: text.into(),
+            cwd: Some(cwd.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+fn deny_in_settings(s: &Srv, names: &[&str]) {
+    let mut changes = serde_json::Map::new();
+    changes.insert(
+        "privacy.cloud_denied_projects".into(),
+        serde_json::json!(names),
+    );
+    s.svc.patch_settings(changes).unwrap();
+}
+
+async fn merge_now(s: &Srv, from: &str, into: &str, dry_run: bool) -> reqwest::Response {
+    s.post(
+        "/api/v1/projects/merge",
+        &ProjectMergeRequest {
+            from: from.into(),
+            into: into.into(),
+            dry_run,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// A write of `text` (from the checkout `cwd`, or naming `project`): the stored body, or the
+/// refusal.
+async fn write_text(
+    s: &Srv,
+    cwd: Option<&str>,
+    project: Option<&str>,
+    text: &str,
+) -> Result<String, String> {
+    match s
+        .svc
+        .remember(RememberRequest {
+            content: text.into(),
+            cwd: cwd.map(str::to_string),
+            project: project.map(str::to_string),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(r) => {
+            let id = r.id.unwrap();
+            Ok(rusqlite::Connection::open(s.home.db())
+                .unwrap()
+                .query_row("SELECT body FROM memories WHERE id = ?1", [&id], |r| {
+                    r.get(0)
+                })
+                .unwrap())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Ruling after the M2 merge: `projects merge` carries the stricter of both projects' rules into
+/// the survivor. The rules of `from` (block mode, cloud denial, custom patterns: everything the
+/// project rules keep) are not lost: writes into the survivor, from its own checkout or under the
+/// merged project's old name, are screened with them, and lifting the denial that let the merge
+/// through (the refusal of a cloud loosening stays) does not open the survivor to the cloud.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_merge_carries_the_rules_of_the_merged_project_into_the_survivor() {
+    let s = Srv::start().await;
+    let dirs = projects_in_folders(&s, &["strict", "loose", "open"]).await;
+    std::fs::write(
+        std::path::Path::new(&dirs["strict"]).join(".alice.toml"),
+        STRICT_RULES,
+    )
+    .unwrap();
+    for (name, dir) in &dirs {
+        note_in(&s, dir, &format!("a note in {name}")).await;
+    }
+    assert_eq!(slugs(&s), ["global", "loose", "open", "strict"]);
+
+    // The refusal stays: a denied project never merges into an allowed one.
+    let r = merge_now(&s, "strict", "loose", true).await;
+    assert_eq!(r.status(), 400);
+    assert!(r.text().await.unwrap().contains("cloud providers"));
+
+    deny_in_settings(&s, &["loose"]);
+    let dry: ProjectMergeResponse = merge_now(&s, "strict", "loose", true)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let mut carried = dry.rules_carried.clone();
+    carried.sort();
+    assert_eq!(carried, ["block_secrets", "cloud_denied", "custom:ticket"]);
+    let done: ProjectMergeResponse = merge_now(&s, "strict", "loose", false)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(done.merged, "{done:?}");
+    let mut carried = done.rules_carried.clone();
+    carried.sort();
+    assert_eq!(carried, ["block_secrets", "cloud_denied", "custom:ticket"]);
+    assert!(
+        done.message.contains("block_secrets") && !done.message.contains("TCK-"),
+        "{}",
+        done.message
+    );
+    assert_eq!(slugs(&s), ["global", "loose", "open"]);
+
+    // The settings no longer deny `loose`: the carried denial still does.
+    deny_in_settings(&s, &[]);
+    let r = merge_now(&s, "loose", "open", true).await;
+    assert_eq!(r.status(), 400, "loose is still kept from the cloud");
+    assert!(r.text().await.unwrap().contains("cloud providers"));
+
+    // Block mode and the pattern apply to every write into the survivor.
+    for (cwd, project) in [
+        (Some(dirs["loose"].as_str()), None),
+        (None, Some("strict")),
+        (None, Some("loose")),
+    ] {
+        let out = write_text(&s, cwd, project, "see TCK-12345 for details").await;
+        let err = out.expect_err("block mode refuses a ticket");
+        assert!(
+            err.contains("custom:ticket") && !err.contains("TCK-12345"),
+            "{err}"
+        );
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let out = write_text(&s, cwd, project, &format!("the key is {token}")).await;
+        assert!(out.is_err(), "block mode refuses a secret: {out:?}");
+    }
+    // The old checkout of `strict` still reads its own file, and writes into `loose` now.
+    let out = write_text(&s, Some(&dirs["strict"]), None, "see TCK-12345 again").await;
+    assert!(out.is_err(), "{out:?}");
+}
+
+/// Merging a loose project into a strict one leaves the survivor as strict as it was, and that
+/// holds for the merged project's old checkout too: its key now names the survivor, so a write
+/// from there is screened with the survivor's rules as well as its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn merging_a_loose_project_into_a_strict_one_keeps_the_survivor_strict_from_every_checkout() {
+    let s = Srv::start().await;
+    let dirs = projects_in_folders(&s, &["strict", "loose", "open"]).await;
+    std::fs::write(
+        std::path::Path::new(&dirs["strict"]).join(".alice.toml"),
+        STRICT_RULES,
+    )
+    .unwrap();
+    for (name, dir) in &dirs {
+        note_in(&s, dir, &format!("a note in {name}")).await;
+    }
+    let done: ProjectMergeResponse = merge_now(&s, "loose", "strict", false)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(done.merged, "{done:?}");
+    assert!(done.rules_carried.is_empty(), "{:?}", done.rules_carried);
+    assert_eq!(slugs(&s), ["global", "open", "strict"]);
+    for (cwd, project) in [
+        (Some(dirs["strict"].as_str()), None),
+        (Some(dirs["loose"].as_str()), None),
+        (None, Some("loose")),
+        (None, Some("strict")),
+    ] {
+        let out = write_text(&s, cwd, project, "see TCK-12345 for details").await;
+        let err = out.expect_err("the survivor's block mode");
+        assert!(err.contains("custom:ticket"), "{cwd:?} {project:?}: {err}");
+    }
+    let r = merge_now(&s, "strict", "open", true).await;
+    assert_eq!(r.status(), 400, "the survivor is still kept from the cloud");
+}
+
+/// Undoing a merge gives the survivor back exactly the rules it had before: what that merge
+/// carried goes, what an earlier merge carried into it stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn undoing_a_project_merge_restores_the_survivors_previous_rules_exactly() {
+    let s = Srv::start().await;
+    let dirs = projects_in_folders(&s, &["accounts", "strict", "loose", "open"]).await;
+    std::fs::write(
+        std::path::Path::new(&dirs["accounts"]).join(".alice.toml"),
+        "[privacy]\ncustom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]{6}\" }]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        std::path::Path::new(&dirs["strict"]).join(".alice.toml"),
+        STRICT_RULES,
+    )
+    .unwrap();
+    for (name, dir) in &dirs {
+        note_in(&s, dir, &format!("a note in {name}")).await;
+    }
+    // An earlier merge carries the acct pattern into `loose`.
+    let first: ProjectMergeResponse = merge_now(&s, "accounts", "loose", false)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first.rules_carried, ["custom:acct"]);
+    let text = "see TCK-12345 and ACCT-123456";
+    assert_eq!(
+        write_text(&s, Some(&dirs["loose"]), None, text)
+            .await
+            .unwrap(),
+        "see TCK-12345 and [REDACTED:custom:acct]"
+    );
+
+    deny_in_settings(&s, &["loose"]);
+    let done: ProjectMergeResponse = merge_now(&s, "strict", "loose", false)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(done.merged);
+    let u: UndoResponse = s
+        .post_json(
+            "/api/v1/undo",
+            &serde_json::json!({"event_id": done.event_id.unwrap()}),
+        )
+        .await;
+    assert!(u.undone, "{}", u.message);
+    assert_eq!(slugs(&s), ["global", "loose", "open", "strict"]);
+
+    // `loose` is as before the second merge: allowed once the settings allow it, no block
+    // mode, no ticket pattern, and still the acct pattern.
+    deny_in_settings(&s, &[]);
+    let ok: ProjectMergeResponse = merge_now(&s, "loose", "open", true)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(!ok.merged);
+    let text2 = "again TCK-12345 and ACCT-654321";
+    assert_eq!(
+        write_text(&s, Some(&dirs["loose"]), None, text2)
+            .await
+            .unwrap(),
+        "again TCK-12345 and [REDACTED:custom:acct]"
+    );
+    // `strict` is a project of its own again, with its own rules.
+    assert!(
+        write_text(&s, None, Some("strict"), "see TCK-12345")
+            .await
+            .is_err()
+    );
+}
+
 /// `POST /api/v1/projects/merge`: behind the token, a dry run changes nothing, the refusals say
 /// what to do, a merge moves the rows and leaves the old name working, and undo (by the event
 /// the merge answers with) puts every row back where it was.

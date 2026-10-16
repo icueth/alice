@@ -188,12 +188,17 @@ fn query_cloud(
         ProjectChoice::Slug(s) => known(cloud.cloud_allowed(s), cloud.redactor(s)),
         ProjectChoice::Fallback => known(cloud.cloud_allowed("global"), cloud.redactor("global")),
         ProjectChoice::Detected(r) => {
-            let found = readers
-                .with(|c| projects::detected_for_read(c, r))
-                .unwrap_or(DetectedForRead::Unstored);
-            // What the working tree itself says (its `.alice.toml`, kept per project key, and
-            // the global lists), for a project the store does not hold as the detected one.
-            let tree = r.tree();
+            let (found, tree) = readers
+                .with(|c| {
+                    Ok((
+                        projects::detected_for_read(c, r)?,
+                        projects::tree_of_detected(c, r)?,
+                    ))
+                })
+                .unwrap_or_else(|_| (DetectedForRead::Unstored, r.tree()));
+            // What the working tree itself says (its `.alice.toml`, kept per project key, the
+            // rules merges carried into the project a write from it would land in, and the
+            // global lists), for a project the store does not hold as the detected one.
             let tree_allows = !r.slug.trim().is_empty()
                 && [r.slug.as_str(), r.name.as_str()]
                     .into_iter()
@@ -661,10 +666,16 @@ impl Service {
     }
 }
 
-/// The working tree of the project `choice` names, keyed by the project.
+/// The working tree of the project `choice` names, keyed by the project, with the rules project
+/// merges carried into it (for a detected checkout: into the stored project its writes land in,
+/// whose own tree applies too when that is another project; see
+/// [`projects::tree_of_detected`]).
 fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<ProjectTree> {
     match choice {
-        ProjectChoice::Detected(r) => r.tree(),
+        // A store that cannot be read leaves the checkout's own rules.
+        ProjectChoice::Detected(r) => readers
+            .with(|c| projects::tree_of_detected(c, r))
+            .unwrap_or_else(|_| r.tree()),
         // `global` has no working tree: the global privacy settings apply.
         ProjectChoice::Fallback => None,
         ProjectChoice::Slug(s) => readers.with(|c| projects::tree_of(c, s)).ok().flatten(),
@@ -3232,24 +3243,54 @@ impl Service {
 
     /// Merge project `from` into `into` (or, with `dry_run`, say what that would move). The
     /// answer carries the event id that `alice undo` reverses.
+    ///
+    /// The privacy rules of `from` (its `.alice.toml`, and what earlier merges carried into it)
+    /// are carried into `into`, which keeps the stricter of both from then on; undo takes back
+    /// exactly what this merge carried.
     pub async fn merge_projects(&self, req: ProjectMergeRequest) -> Result<ProjectMergeResponse> {
+        use alice_core::store::project_merge;
         let _busy = self.activity.enter();
         let (from, into) = (req.from.clone(), req.into.clone());
-        let plan = self
-            .read(move |c| alice_core::store::project_merge::plan(c, &from, &into))
+        let (plan, from_tree) = self
+            .read(move |c| {
+                let plan = project_merge::plan(c, &from, &into)?;
+                let tree = projects::tree_of(c, &plan.from.id)?;
+                Ok((plan, tree))
+            })
             .await?;
         // Privacy first: rows of a project kept away from cloud providers must not become
         // eligible for them by moving into one that is not. The one policy the judge and the
         // remote embedder ask (every name of the project, its `.alice.toml`, degraded config).
+        // The merge carries `from`'s own denial into `into`, but `into` must be denied already:
+        // the person decides that, not the merge.
         if !self.cloud.cloud_allowed(&plan.from.slug) && self.cloud.cloud_allowed(&plan.into.slug) {
             return Err(AliceError::invalid(format!(
                 "project \"{}\" is kept away from cloud providers and \"{}\" is not: deny \"{}\" first (add it to privacy.cloud_denied_projects or set cloud_denied in its .alice.toml), or remove the denial of \"{}\", then merge",
                 plan.from.slug, plan.into.slug, plan.into.slug, plan.from.slug
             )));
         }
+        // What `from`'s own file puts in force now (a file that cannot be read counts closed).
+        let from_rules = self.settings.project_rules(from_tree.as_ref());
         let answer = |merged: bool,
                       event_id: Option<String>,
-                      c: &alice_core::store::project_merge::MergeCounts| {
+                      c: &project_merge::MergeCounts,
+                      carried: &alice_core::settings::ProjectSettings| {
+            let rules = carried.rule_names();
+            let kept = if rules.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " \"{}\" {} the privacy rules of \"{}\": {}.",
+                    plan.into.slug,
+                    if merged {
+                        "now also keeps"
+                    } else {
+                        "would also keep"
+                    },
+                    plan.from.slug,
+                    rules.join(", ")
+                )
+            };
             ProjectMergeResponse {
                 from: plan.from.slug.clone(),
                 into: plan.into.slug.clone(),
@@ -3260,7 +3301,7 @@ impl Service {
                 facts: c.facts,
                 message: if merged {
                     format!(
-                        "Merged \"{}\" into \"{}\": {} memories, {} chunks, {} sources, {} facts moved. \"{}\" now names \"{}\".{}",
+                        "Merged \"{}\" into \"{}\": {} memories, {} chunks, {} sources, {} facts moved. \"{}\" now names \"{}\".{kept}{}",
                         plan.from.slug,
                         plan.into.slug,
                         c.memories,
@@ -3276,15 +3317,17 @@ impl Service {
                     )
                 } else {
                     format!(
-                        "Would merge \"{}\" into \"{}\": {} memories, {} chunks, {} sources, {} facts.",
+                        "Would merge \"{}\" into \"{}\": {} memories, {} chunks, {} sources, {} facts.{kept}",
                         plan.from.slug, plan.into.slug, c.memories, c.chunks, c.sources, c.facts
                     )
                 },
                 event_id,
+                rules_carried: rules,
             }
         };
         if req.dry_run {
-            return Ok(answer(false, None, &plan.counts));
+            let carried = project_merge::rules_to_carry(&plan, &from_rules);
+            return Ok(answer(false, None, &plan.counts, &carried));
         }
         match self
             .writer
@@ -3292,12 +3335,13 @@ impl Service {
                 from: req.from,
                 into: req.into,
                 actor: Actor::from_author(&req.author),
+                rules: Box::new(from_rules),
             })
             .await?
         {
             WriteOutcome::ProjectMerged(done) => {
                 let (done, event) = *done;
-                Ok(answer(true, Some(event), &done.counts))
+                Ok(answer(true, Some(event), &done.counts, &done.carried))
             }
             other => Err(unexpected(other)),
         }
