@@ -1,7 +1,13 @@
 # Alice SP2 — Automatic Capture — Design Spec
 
 - **Date:** 2026-10-16
-- **Status:** draft for the controller's review, then the owner's. Nothing here is built.
+- **Status:** approved by the controller with six rulings (`sp2-spec-review.md`, 2026-10-16) and by the owner, whose
+  decision on the Jev key is folded in too. Nothing here is built. The changes:
+  - **R13:** tenants get a bounded SessionStart briefing (§5.7);
+  - **retention:** a capture-scoped retention, 180 days on tenants (§3.9, R25);
+  - **adoption:** the owner becomes a tenant (§9.4, R26);
+  - **samples:** permission for structure-only transcript samples, with conditions (§11.1, §13);
+  - **the owner's decision:** Jev on for every tenant with one shared key the owner manages (§9.3, R27).
 - **Owner:** icueth (vision); technical choices delegated to this lane and recorded as rulings (§12).
 - **Lane:** SP2, worktree `project-alice-sp2`, branch `feat/sp2-capture`, from `origin/feat/server-mode` at `16641c8`
   (which contains M2 through Task 24 and M3).
@@ -59,12 +65,16 @@
 7. The day's Jev spend for distillation stays within its share of `judge.daily_budget_usd`. Three Jev failures in a row
    open the breaker, and `alice doctor` says so.
 8. A server tenant's person runs one pasted command. From then on their Claude Code sessions are captured in their tenant
-   over HTTPS, with no Alice binary. Their token is in a 0600 file only, and the server redacts the text.
+   over HTTPS, with no Alice binary. Their token is in a 0600 file only, and the server redacts the text. Their sessions
+   start with the briefing, or with nothing within 2 s when the server is slow or down.
 9. `alice hooks install claude` against a throwaway HOME backs up `settings.json`, merges without touching other hooks, is
    idempotent, and `alice hooks uninstall claude` removes exactly what it added.
 10. On the committed synthetic set, distillation reaches the thresholds declared in §11.3. The owner's real sessions are
     checked locally before acceptance.
 11. A MemPalace transcript already imported and the same session captured by SP2 do not both hold the same turns (§9).
+12. Captured transcripts age out by `capture.raw_retention` (180 days on tenants), and imported history never does.
+13. After the owner's database is adopted into their tenant, the tenant hook's resend from offset 0 stores no turn that was
+    captured locally (§9.4).
 
 ### 0.4 Out of scope
 
@@ -112,7 +122,7 @@
  │  │ parse JSONL → turns → render & trim →    │ │         │  │ (same code; the bytes come in the body,   │     │
  │  │ dedupe turns → redact → write chunks +   │ │         │  │  never from a path on the server)         │     │
  │  │ cursor in one transaction (raw tier)     │ │         │  └──────────────────────────────────────────┘     │
- │  └──────────────────────────────────────────┘ │         │  distill worker (the tenant's own Jev key)        │
+ │  └──────────────────────────────────────────┘ │         │  distill worker (the owner's shared Jev key)       │
  │  distill worker (background):                 │         └──────────────────────────────────────────────────┘
  │   session quiet/ended → candidates → one Jev  │
  │   choice request → memories (origin=distill,  │
@@ -385,14 +395,45 @@ capture worker pauses 2 ms after each commit, as the importer does, so `remember
 embedded by the existing worker; with a remote embedder, the cloud policy holds back a denied project's chunks as today.
 A pass that stored something records one `source.capture` history event (like `source.ingest`, not undoable).
 
-### 3.9 Volume, and what it costs
+### 3.9 Volume, retention, and what it costs
 
-- **Per turn:** with the trimming above, a turn renders to about 1–3 KB, about one chunk on average.
-- **The owner:** about 20 sessions a day of about 50 turns each makes ~1,000 chunks/day, ~365,000/year. That is within the
-  1M-chunk budget, on top of the 121k imported.
-- **A tenant:** ~2 MB/day of text and vectors per active person, ~0.7 GB/year. Embedding takes ~3 minutes a day at the
-  server's 5.5 chunks/s.
-- `storage.raw_retention` stays `forever` by default. §9.3 recommends a retention for tenants, and the admin decides.
+**Rate.** With the trimming above, a turn renders to about 1–3 KB, about one chunk on average. The owner runs about 20
+sessions a day of about 50 turns each, so **~1,000 chunks a day, ~365,000 a year**. That is within the 1M-chunk search
+budget, on top of the 121k imported.
+
+**Disk on the server.** The controller measured about **16.8 KB per chunk** on the server, counting the database with its
+text, FTS rows and vectors, plus two scheduled backups. The rates below are estimates; the real-session check measures the
+owner's actual rate and reports it.
+
+| Who | Chunks/day | Kept at 180 days | Disk at 180 days |
+|---|---|---|---|
+| The owner | ~1,000 | ~180,000 | ~3.0 GB |
+| Each of the other three tenants (assumed 300/day) | ~300 | ~54,000 | ~0.9 GB each, ~2.7 GB together |
+| **All four** | ~1,900 | ~342,000 | **~5.7 GB** |
+| All four at the owner's pace (worst case) | ~4,000 | ~720,000 | ~12.1 GB |
+
+**Why the cap is needed.** Without a cap, the owner alone adds ~6.1 GB a year and keeps growing. The disk is not grown,
+19 GB were free, and §2.7 of the server spec already plans ~8 GB for homes and backups. A year of uncapped capture would
+fill it.
+
+**What it does:**
+- **`capture.raw_retention`** (§7) ages out raw chunks of **capture sources only**: sources with a `capture_state` row,
+  i.e. uris `claude-code:…` and `codex:…`.
+- **Imported MemPalace history and other raw sources are never touched by it**; they follow `storage.raw_retention` alone,
+  as today.
+- **Defaults:** `forever` locally; **180 days on tenants**, set by `alice-server` (§9.5).
+- **The worst case** at 180 days does not fit beside the planned homes. The admin's lever there is `90d` for the heaviest
+  tenant, and the guard order of server spec §2.7 still applies.
+
+**How it runs.** The existing `raw_retention` maintenance job gains a second pass with the same rules:
+- by age, counted from when Alice stored the chunk (`created_at`), at least `1d`; or by size of capture-chunk text, at
+  least `1MB`;
+- deletes in slices of at most 500 rows;
+- one `raw.retention` event per run.
+Deleting a source's old chunks leaves its cursor and its turn keys, so the live file is not captured again (§3.5).
+Distilled and explicit memories stay; their provenance rows to deleted chunks go with the chunks, as today.
+
+**Embedding.** A tenant's ~300–1,000 chunks a day take 1–3 minutes of CPU at the server's 5.5 chunks/s.
 
 ---
 
@@ -408,8 +449,9 @@ and `session-end`; the stdin `hook_event_name`, when present, wins over the argu
 2. **Notify the daemon.** Discover the daemon as clients do today (`daemon.json`, then the ping proof), with hook-specific
    timeouts: 30 ms for the ping and 40 ms for the request. Then send `POST /api/v1/capture/notify`.
 3. **Print the briefing on SessionStart.** Only for `source` = `startup`, `clear` or `compact`: on `resume` and `fork` the
-   restored conversation already holds one. The hook also calls `context` for the session's `cwd` within the remaining
-   budget, and prints
+   restored conversation already holds one. `capture.briefing = false` turns this off. The hook calls
+   `GET /api/v1/capture/briefing` for the session's `cwd` within the remaining budget (the same route the tenant script
+   uses, §5.7), and prints
    `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"<briefing>"}}`. The briefing starts
    `# Context · <project>`, which the MCP instructions already treat as "a briefing is in the conversation". This replaces
    the stopgap script's `alice context`.
@@ -559,8 +601,9 @@ and `awk` are optional. The plugin's hook command is `sh "$HOME/.config/alice/al
 1. **Read the input.** Read stdin (at most 1 MiB). Extract `hook_event_name`, `session_id`, `transcript_path`, `cwd`,
    `agent_id` and `agent_transcript_path` with a JSON-string `sed` pattern that undoes `\\`, `\"` and `\/`. A value holding
    a `\u` escape is not guessed: that event is skipped and logged.
-2. **Return at once.** Pass the extracted fields to a background copy of the script, as arguments (no token among them),
-   started with `nohup sh … >/dev/null 2>&1 </dev/null &`, then `exit 0`. The agent never waits on the network.
+2. **Send the work to the background.** Pass the extracted fields to a background copy of the script, as arguments (no
+   token among them), started with `nohup sh … >/dev/null 2>&1 </dev/null &`. Then `exit 0`, except on `SessionStart`,
+   which first prints the briefing (step 5, at most 2 s). The agent never waits on capture.
 3. **In the background:**
    - Take a per-file lock, a `mkdir` lock that is broken when older than 120 s.
    - Wait 2 s on stop-type events (the transcript may lag).
@@ -575,12 +618,14 @@ and `awk` are optional. The plugin's hook command is `sh "$HOME/.config/alice/al
    - On `401`, log "the token was refused; run the setup command again" and pause for 1 hour (marker file).
 4. **Sweep.** On `SessionStart`, also run up to 5 other state files whose transcript has grown, so a session that ended
    while the server was unreachable is finished later.
-5. **Project and privacy.**
+5. **Briefing on `SessionStart`.** Before exiting, the foreground part prints the briefing as §5.7 says. It is the one
+   synchronous network call, bounded to 2 s, and the capture work has already been sent to the background.
+6. **Project and privacy.**
    - The project hint is the basename of `git -C <cwd> rev-parse --show-toplevel`, else of `cwd`.
    - If that top-level (or `cwd`) has a `.alice.toml` with a line `no_capture = true`, the event is skipped entirely. A
      line `cloud_denied = true` sends `no_distill=1`.
    - If the file exists but cannot be read, the event is skipped (fail closed).
-6. **Log.** `~/.config/alice/capture.log`, kept under 256 KB, never holds the token or transcript text.
+7. **Log.** `~/.config/alice/capture.log`, kept under 256 KB, never holds the token or transcript text.
 
 ### 5.4 The setup command (the one copy-paste step)
 
@@ -598,7 +643,8 @@ no address, and they are in the public repository anyway. The setup script:
 2. **Asks for the token** from `/dev/tty` with echo off. It never takes the token from argv or the environment.
 3. **Verifies the token** with `GET <url>/api/v1/capture/status`. The `Authorization` header goes to curl through
    `-K -` from `printf` (a shell builtin), so the token is never in a process's argv.
-4. **Writes `~/.config/alice/capture.conf`** (0600, in a 0700 directory): `url=` and `token=`.
+4. **Writes `~/.config/alice/capture.conf`** (0600, in a 0700 directory): `url=`, `token=` and `briefing=on`. The person
+   may change the last one to `off`.
 5. **Installs** `alice-capture.sh` from `<url>/api/v1/capture/hook.sh`.
 6. **Writes the local marketplace** `~/.config/alice/claude-marketplace/`, containing
    `.claude-plugin/marketplace.json` (marketplace `alice-local`) and the plugin `alice-capture/`. The plugin holds
@@ -638,10 +684,24 @@ It matches the direct-MCP path (server spec §2.8):
 - Full `.alice.toml` rules (custom patterns, block mode) on a tenant wait for the deferred `alice remote` client. This is
   said plainly in `docs/server.md`.
 
-### 5.7 No briefing on tenants at SessionStart
+### 5.7 The SessionStart briefing on tenants (bounded)
 
-The tenant script injects no briefing. That would put a WAN round trip in the agent's start path, against "never
-blocks". The MCP instructions already make the agent call `context` (R13).
+The team uses only the server. Without this step they would never get the briefing that local users get (controller's
+ruling, R13).
+
+- **When:** on `SessionStart` with `source` = `startup`, `clear` or `compact`, as locally.
+- **The call:** the script asks
+  `GET <url>/api/v1/capture/briefing?project=<basename>&source=<source>` with
+  `curl --connect-timeout 1 --max-time 2` (token through `-K -`, as everywhere).
+- **The output:** it prints the answer's text to stdout. For `SessionStart`, Claude Code adds plain stdout to the context,
+  so no JSON escaping is needed in `sh`.
+- **Failure:** on any failure, timeout or non-200 answer it prints nothing. It always exits 0.
+- **The route** resolves the project from the hint exactly as the transcript route does (§5.2). It answers the `context`
+  briefing as `text/plain`, at most 10,000 characters (Claude Code's cap), and `204` when the briefing is off.
+- **Two switches turn it off:**
+  - the tenant setting `capture.briefing = false`;
+  - the line `briefing=off` in `capture.conf`, which saves the round trip.
+- **Cost:** up to 2 s at the start of a session when the server is slow or down.
 
 ---
 
@@ -842,6 +902,9 @@ include_subagents = true
 include_thinking = false
 tool_output_chars = 800     # 0–8,000: head 5/8, tail 3/8
 chunk_chars = 2000          # 500–8,000
+briefing = true             # the SessionStart briefing (local hook and tenant script)
+raw_retention = "forever"   # captured transcripts only (§3.9); same syntax and limits as storage.raw_retention;
+                            # tenants: 180d, pinned by ALICE_CAPTURE_RAW_RETENTION in the tenant's env file
 
 [distill]
 provider = "off"            # "off" | "jev"   (the existing string becomes an enum)
@@ -867,8 +930,9 @@ change is announced and named in the `settings.change` event:
 closed, which here means no capture.
 
 **Defaults.**
-- `distill.provider` defaults to `off`, because sending session text to a cloud model is opt-in for an open-source tool.
-  The owner turns it on (`alice config set distill.provider jev`) (R15).
+- `distill.provider` defaults to `off`, because sending session text to a cloud model is opt-in for an open-source tool
+  (R15). The owner turns it on (`alice config set distill.provider jev`), and this deployment turns it on for every tenant
+  (§9.3).
 - `capture.enabled` defaults to on, because installing the hooks is the opt-in.
 
 **Tenants.** No new setting names a URL or a path, so tenant validation (server spec §2.2 item 6) gains no entry. The
@@ -935,6 +999,7 @@ All routes are behind the existing token, Host and Origin guard, except the two 
 | `POST /api/v1/capture/transcript` | Tenant byte upload (§5.2); its own 8 MiB body limit |
 | `GET /api/v1/capture/status` | Recent sessions (50), cursors, distill states and counters; also `{tenant: bool}`, which setup uses to check the token |
 | `POST /api/v1/capture/distill` | `{session_id}` or `{source_id}`, marks it due now |
+| `GET /api/v1/capture/briefing?project=…&source=…` | The SessionStart briefing as `text/plain` (≤ 10,000 characters); `204` when `capture.briefing` is off or `source` is `resume` or `fork`. The project resolves from `cwd` locally (the hook sends it as a query parameter) and from the hint on a tenant (§5.7) |
 | `GET /api/v1/capture/setup.sh`, `GET /api/v1/capture/hook.sh` | Public static scripts (`text/plain; charset=utf-8`, `Cache-Control: no-store`) |
 
 - **The spool** gains `SpoolEntry::CaptureNotify`.
@@ -986,7 +1051,8 @@ The cut-over, in this order:
    `compat.mempalace` stays on, so prompts that still call `mempalace_*` tools keep working against Alice.
 5. **Optionally trim the "MemPalace Protocol" blocks** in CLAUDE.md files (diary after every 5 tool uses). Capture makes
    them redundant, and explicit `remember`s of decisions and fixes remain the better memories. This is the owner's call.
-6. **Turn distillation on:** `alice config set distill.provider jev` (the judge is already `jev`).
+6. **Turn distillation on:** `alice config set distill.provider jev` (the judge is already `jev`). This step is for the
+   owner's local install until the owner moves to the server (§9.4). After the move, the tenant's settings decide (§9.3).
 
 ### 9.2 No duplicate transcripts
 
@@ -1011,14 +1077,62 @@ by one side**:
 
 - A team member's palace is imported by the admin (server spec §2.9). The importer's skip rule above applies there too.
 - They have no MemPalace hooks to remove, only the setup line to run.
-- **Distillation on a tenant** is off by default (R15) and needs that person's own Jev key. The admin turns it on for a
-  person who wants it and has given a key:
-  `alice-server cli <name> config set-secret jev_api_key` (pasted at the prompt), then `config set judge.provider jev`
-  and `config set distill.provider jev`. `docs/server.md` says so, and the setup script's last lines say whether
-  distillation is on for that tenant (from `/capture/status`).
-- **Recommendation for the admin:** given the disk budget (server spec §2.7) and the raw-tier growth of §3.9, set
-  `storage.raw_retention = "180d"` per tenant (`alice-server cli <name> config set storage.raw_retention 180d`). The admin
-  decides; the default stays `forever`.
+- **Jev is on for every tenant, with one shared key the owner manages** (the owner's decision, 2026-10-16).
+  - The product default in the open-source code stays `distill.provider = off` (R15). It is **this deployment** that turns
+    distillation on.
+  - When the admin has provisioned the shared key (server lane: `alice-server jev-key set`, server-mode addendum 5),
+    `alice-server add` gives each tenant `judge.provider = jev` and `distill.provider = jev`.
+  - How the key reaches each daemon is that lane's design. SP2 only needs the judge's existing key lookup
+    (`jev_api_key`) to find it.
+  - A person never sees or supplies the key. The setup script never asks for one. Its last lines say whether
+    distillation is on for that tenant (from `/capture/status`).
+- **Spend is per tenant,** within each tenant's own `judge.daily_budget_usd` (default $1.00), of which distillation may use
+  `distill.budget_share` (default 0.5).
+  - **The deployment-wide ceiling** is 5 daemons (four people and the team store) × the per-tenant budget: **$5.00 a day
+    at the default**, of which distillation can be at most 4 × $0.50 = $2.00.
+  - **Expected spend** is far lower: about $0.001–0.003 per distilled session (§6.4), a few cents a day per person.
+  - The owner changes a tenant's budget with `alice-server cli <name> config set judge.daily_budget_usd <usd>`. Raising it
+    counts as a loosening and is named in the tenant's history.
+- **Retention:** captured transcripts age out after 180 days on tenants (§3.9). `alice-server` pins it (§9.5). Imported
+  history is not affected.
+
+### 9.4 The owner becomes a tenant (adoption)
+
+Server-mode addendum 4 (`alice-server adopt`) moves the owner's Mac database onto their tenant after the reviews. If SP2
+ran locally before the move, the variant goes:
+
+1. **Before the move,** on the Mac: let the local capture finish (the session in progress ends, or the daemon has swept).
+   `alice import mempalace` runs one last time if MemPalace is still active.
+2. **The admin adopts the database** (pane 3).
+3. **On the Mac:** run `alice hooks uninstall claude`, which removes the local hooks (backup kept). Also remove the
+   stopgap SessionStart script, if it is still there. If SP2 never ran locally, there is nothing to uninstall and the local
+   hooks are never installed.
+4. **Run the tenant setup line** (§5.4) instead of `alice hooks install claude`. Then disable the MemPalace plugin and trim
+   the CLAUDE.md protocol blocks, as in §9.1 steps 4–5.
+
+**No duplicates across the move:**
+- **The tables travel.** `capture_turns` and `capture_state` live in `alice.db`, so they move with it.
+- **First upload from 0.** The tenant script's first upload for a session the Mac already captured starts at offset 0. The
+  server's cursor for that source is ahead, so it answers `409` with that cursor, and the script jumps there. It is the
+  same file on the same Mac, so the byte offsets agree.
+- **Fallback.** Any resent turn is skipped by its turn key (R2). No locally captured turn is stored twice.
+- **Local paths stay unread.** In tenant mode the capture worker never reads files: notify is refused and sweeps of file
+  paths do not run. An adopted row's `transcript_path` and `file_key` are ignored. A source left open by the move is marked
+  ended after 24 hours without events and distilled as usual, without a final file pass.
+- **Tested** by capturing into a local home, starting a `--tenant` daemon on the same database, and uploading the same
+  transcript from offset 0. The test checks the 409 jump, that no turn is stored again, and that the next real turn is
+  stored once (§11.1).
+
+### 9.5 Interfaces the server lane implements
+
+SP2 needs these from `deploy/server/alice-server` (pane 3). SP2 does not edit that script.
+
+| Interface | What it does |
+|---|---|
+| Print the setup line | `alice-server add <name>` (and a command to print it again) prints `curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh \| sh -s -- https://<host>/u/<name>` |
+| Pin capture retention | `add` writes `ALICE_CAPTURE_RAW_RETENTION=180d` into the tenant's env file, and `upgrade` adds it where unset. The environment wins over `config.toml`, as `ALICE_BACKUP_DAILY` does (server spec §2.7), so a tenant's own patch cannot loosen it; the admin changes the line |
+| Jev on with the shared key | When `alice-server jev-key set` has provisioned the key, `add` sets `judge.provider = jev` and `distill.provider = jev` for the tenant (server-mode addendum 5) |
+| Adoption | `alice-server adopt` (addendum 4) moves the database whole, so `capture_state` and `capture_turns` travel with it (§9.4) |
 
 ---
 
@@ -1038,6 +1152,9 @@ by one side**:
 | Block mode and a secret in a turn | That chunk becomes `[withheld: …]` and capture continues |
 | Tenant unreachable | The script keeps its offset and the next hook retries. `SessionStart` sweeps up to 5 unfinished sessions |
 | Tenant token rotated | `401` → the script logs once and pauses 1 h; re-running the setup line fixes it |
+| Tenant slow or down at `SessionStart` | The briefing call gives up after 2 s (1 s to connect) and prints nothing; the session starts without it and the MCP instructions still ask for `context` |
+| Capture retention reached | Old captured chunks are deleted; imported history, cursors, turn keys and memories stay |
+| Owner's database adopted into a tenant | The tenant script's offset-0 upload gets a `409` jump; resent turns are skipped by key; local paths in adopted rows are ignored |
 | Tenant client lost its offset | `409` with the server's cursor; at most one wasted upload |
 | Tenant server restored to an older copy | A forward offset is accepted as a gap and counted |
 | Jev unreachable or failing | Distill breaker (15 min doubling to 6 h); raw capture continues; `alice doctor` shows it |
@@ -1059,7 +1176,18 @@ temporary directory), never the real ones.
 
 ### 11.1 Unit and integration tests
 
-**Reader and renderer:** synthetic Claude Code and Codex JSONL fixtures, committed. They cover:
+**Structure-only samples first** (the controller's permission, with its conditions). At the start of execution:
+1. Copy at most two Claude Code transcripts, and one Codex rollout if one exists, read-only into the lane's scratch
+   directory.
+2. Commit only **structure-only** fixtures made from them: every text value replaced, and ids, timestamps, paths and the
+   project name rewritten.
+3. Before committing, run a one-off check. No substring of 16 or more characters from the copies' text values may appear
+   in the fixtures, and `grep -c -F -- "$TYPESAFE_API_KEY"` on each fixture must print 0.
+4. Delete the copies. Record the check's result in the lane's ledger.
+If there is no Codex rollout, Codex stays seam-only until a sample exists (§13).
+
+**Reader and renderer:** synthetic Claude Code and Codex JSONL fixtures, committed (the structure-only samples plus
+hand-written ones). They cover:
 - turn boundaries and completeness;
 - every row of the rendering table;
 - `system-reminder` stripping;
@@ -1080,7 +1208,12 @@ temporary directory), never the real ones.
 - late records of a stored turn becoming its continuation chunks;
 - excluded projects (cursor moves, nothing stored, turn keys recorded, so a continuation file stores nothing either);
 - block-mode stubs;
-- retention deleting a source, after which a re-pass stores nothing.
+- retention deleting a source, after which a re-pass stores nothing;
+- `capture.raw_retention` deleting old captured chunks while an imported source of the same age, and other raw sources,
+  are untouched; the environment pin wins over a patch;
+- **adoption:** capture into a local home, start a `--tenant` daemon on the same database, upload the same transcript from
+  offset 0. The upload gets the `409` jump, no turn is stored again, the next real turn is stored once, and the adopted
+  rows' local paths are never read.
 
 **`alice hook`:**
 - the output JSON for `SessionStart` (`startup`, `clear` and `compact`; none for `resume`);
@@ -1112,6 +1245,9 @@ temporary directory), never the real ones.
   - the token never appears in any process's argv (a `ps` sampler during the run) or in the log;
   - the plugin files are well formed;
   - a transcript grown in steps is captured once;
+  - the `SessionStart` briefing is printed as plain text;
+  - nothing is printed within 2 s when the daemon is stopped, or made to stall by a test stand-in;
+  - nothing is printed with `briefing=off` or `capture.briefing = false`;
   - uninstall removes what setup wrote.
 
 **Distillation**, with recorded Jev fixtures (request and response bodies only, no headers):
@@ -1212,7 +1348,7 @@ a caveat the results state, as `m2-jev.md` does.
 | R10 | **No root allowlist for the local notify path** | A local token holder is the same user and can read those files anyway; validation is a regular `.jsonl` file opened read-only | A local process with the token can make the daemon store any readable `.jsonl` file of that user |
 | R11 | **Tenants: a Claude Code plugin from a local marketplace written by the setup script**, plus a POSIX `sh` + `curl` hook script | Claude Code merges and removes plugin hooks itself (no JSON tooling on the person's machine); the files come from the tenant at its version | Needs `claude plugin` (with a printed `/plugin` fallback); an update means re-running the setup line |
 | R12 | **The tenant script verifies no ping proof** | An HMAC with `openssl` puts the token in argv; TLS with a public certificate pins the host | A wrong `/u/<name>` sends the token to another tenant's daemon inside TLS, where it is refused and not logged |
-| R13 | **No briefing injection on tenants** | A WAN call in the agent's start path breaks "never blocks"; the MCP instructions already ask for `context` | One extra tool call at a tenant session's start |
+| R13 | (Overruled by the controller.) **Tenants get the SessionStart briefing, bounded:** `curl --connect-timeout 1 --max-time 2`, plain stdout, nothing on any failure, exit 0; `capture.briefing` or `briefing=off` in `capture.conf` turns it off | The team uses only the server; without it they never get the briefing local users get | Up to 2 s at the start of a session when the server is slow or down |
 | R14 | **Distillation requires `judge.provider = jev`** | The judge is what removes duplicates of explicit memories; without it, near-copies would be stored or become review items | A person without the Jev judge gets raw capture only |
 | R15 | **`distill.provider` defaults to `off`** | Sending session text to a cloud model is opt-in in an open-source product; the owner turns it on in one command | New users get raw capture only until they opt in |
 | R16 | **At most 40 candidates per request and `max_per_run` (8) kept**, by priority (summaries, conclusions, user statements, subagent reports) | Bounded cost and no floods; compaction summaries and turn conclusions carry most lasting knowledge | A very long quiet-free stretch loses its lowest-priority candidates |
@@ -1224,31 +1360,25 @@ a caveat the results state, as `m2-jev.md` does.
 | R22 | **No request compression for tenant uploads** | It needs a new dependency; the upload runs in the background | More upstream bandwidth for large transcripts |
 | R23 | **Distilled importance 2 (setting 1–3), no topics, an `(auto)` mark** | Explicit memories (default 3) rank higher and own the key-memory sections; the mark tells the agent what is machine-extracted | Some valuable distilled memories rank a little lower than their content deserves |
 | R24 | **A `jev:distill` ledger row, the total still capped by `judge.daily_budget_usd`, distill capped at `budget_share`** | The owner asked for the judge's budget; a share keeps memory judging and precise recall working | Needs a consumer tag in the Jev client and ledger (small) |
+| R25 | (Controller's ruling.) **`capture.raw_retention` ages out captured transcripts only**: a second pass of the `raw_retention` job over capture sources. Default `forever`; 180 days on tenants, pinned by `ALICE_CAPTURE_RAW_RETENTION` in the tenant's env file (written by `alice-server`) | The server disk is not grown, and the owner's own volume (~365k chunks a year at ~16.8 KB each with two backups) would fill it within a year; imported history must never age out by it | Transcripts older than 180 days are gone on tenants; distilled and explicit memories stay |
+| R26 | (Controller's ruling.) **The owner becomes a tenant by adoption**; then the tenant setup line replaces `alice hooks install claude`, and the local hooks are removed | One memory for the owner, on the server like the team's | Sessions open during the move may finish capturing a little late (24 h stale end) |
+| R27 | (The owner's decision.) **On this deployment Jev is on for every tenant with one shared key the owner manages**; the product default stays `distill.provider = off` | The owner wants the same quality for the whole team and manages one key | The owner pays for every tenant's Jev use, capped at 5 × each tenant's `judge.daily_budget_usd` ($5.00 a day at the default) |
 
 ---
 
 ## 13. Questions for the controller
 
-No new vision question came up. The owner's three decisions covered capture, distillation and the provider.
+The controller's review (2026-10-16) settled every open point, and the owner settled the one it left open:
 
-**One permission is needed before execution.** The transcript formats are undocumented, and the lane brief keeps this lane
-out of `~/.claude` and `~/.codex`, except for copies made for the real-session check.
-
-- **The ask:** at the start of Phase 3, copy one or two of the owner's Claude Code transcripts, and a Codex rollout if one
-  exists, into the scratch directory. From the copies, commit **structure-only** fixtures: every text value replaced by
-  placeholder text, and ids, timestamps and paths rewritten.
-- **Why now:** the reader's field mapping would otherwise rest on community descriptions until the end of the work.
-- **If there is no Codex rollout on the machine,** Codex stays seam-only (the reader trait and the installer's refusal
-  path) until a sample exists.
-
-These calls are worth the controller's or the owner's attention, because they shape daily use:
-
-1. **R15:** distillation is off by default for everyone, and the owner turns it on.
-2. **R19:** machine-made memories never ask a person. An uncertain duplicate is trashed (undoable for 30 days), and an
-   uncertain update is linked, not asked.
-3. **R13:** tenants get no SessionStart briefing injection.
-4. **§9.3:** a 180-day raw retention is recommended for tenants (the admin's call).
-5. **§5.4:** whether `alice-server` prints each person's setup line (the server lane's call).
+| Point | Outcome |
+|---|---|
+| Transcript samples | **Permission granted with conditions** (§11.1): at most two Claude Code transcripts and one Codex rollout, structure-only fixtures, a 16-character overlap check and a key check before committing, and copies deleted. If there is no Codex rollout on the machine, Codex stays seam-only (the reader trait and the installer's refusal path) until a sample exists |
+| R15 | Accepted (product default `off`). On this deployment the owner turns distillation on for themselves and for every tenant with one shared key (R27, §9.3) |
+| R19 | Accepted: machine-made memories never ask a person |
+| R13 | Overruled: tenants get a bounded SessionStart briefing (§5.7) |
+| Retention | A capture-scoped retention, 180 days on tenants (R25, §3.9) |
+| Adoption | The owner becomes a tenant (R26, §9.4) |
+| The setup line | An interface the server lane implements (§9.5) |
 
 ---
 
@@ -1256,20 +1386,22 @@ These calls are worth the controller's or the owner's attention, because they sh
 
 Claude Code first, then the tenant path, then Codex, so that each step is usable:
 
-1. **Core reader and renderer** (`alice-core::capture`): the Claude Code reader, turns, the rendering contract, chunk cuts
-   and turn keys, with the fixture tests.
+1. **Structure-only samples** (§11.1, with the check recorded in the ledger). Then the **core reader and renderer**
+   (`alice-core::capture`): the Claude Code reader, turns, the rendering contract, chunk cuts and turn keys, with the
+   fixture tests.
 2. **Schema and writer:** the migration, `CaptureSlice`, `CaptureStateUpdate`, and the `origin` and provenance plumbing in
    `Remember`.
-3. **Capture service:** the notify endpoint, the capture worker (settle, sweep, stale end), exclusions and the
-   `source.capture` event; then `alice capture status`, health and the doctor line.
+3. **Capture service:** the notify endpoint, the capture worker (settle, sweep, stale end), exclusions, the
+   `source.capture` event and the capture-scoped retention pass; then `alice capture status`, health and the doctor
+   line.
 4. **`alice hook`:** the spool variant, hook timeouts, SessionStart output, and the latency test.
 5. **`alice hooks install/uninstall/status claude`.**
 6. **Settings:** `[capture]`, `[distill]`, loosening, project `no_capture`.
 7. **Distillation:** candidates, the request, answers to memories, the ledger consumer tag and budget share, the breaker,
    the worker, the judge's §6.6 rules, the briefing and recall marks, stats and the doctor line.
 8. **The synthetic set and recorded fixtures,** the live evaluation, and `docs/benchmarks/sp2-distill.md`.
-9. **The tenant path:** the transcript endpoint, `hook.sh`, `setup.sh`, the public routes, and the script tests on both
-   operating systems.
+9. **The tenant path:** the transcript and briefing endpoints, `hook.sh` (with the bounded briefing), `setup.sh`, the
+   public routes, the adoption test, and the script tests on both operating systems.
 10. **Codex:** the rollout reader, `alice hooks install codex`, and the tenant setup's Codex part.
 11. **MemPalace migration:** continue after an imported session, the importer skip, `origin = 'import'`, and backfill.
 12. **Docs:** `docs/capture.md` (new: local install, removal, privacy, the cut-over), `README.md` and `README.th.md` in
