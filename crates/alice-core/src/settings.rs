@@ -1980,7 +1980,9 @@ pub const LOOSEN_POLLS: u32 = 3;
 /// redaction off, `block` mode back to `redact`, an entry gone from the cloud denylist or the
 /// custom patterns, a longer allowlist, a higher daily judge budget, or a switch to a cloud
 /// judge, to an embedding provider or endpoint that is not on this machine (or to another remote
-/// host than before), or the admin MCP tools switched on.
+/// host than before), the admin MCP tools switched on, or more captured or distilled: capture
+/// switched on (the master switch or an agent's), an entry gone from `capture.excluded_projects`,
+/// thinking kept, distillation switched to a cloud judge or given a larger budget share.
 ///
 /// A half-written `config.toml` (an editor truncating then writing) reads as a file that
 /// loosens everything; see [`LooseningGate`].
@@ -2196,7 +2198,7 @@ impl ProjectSettings {
         }
     }
 
-    /// What a project whose file cannot be read gets: secrets blocked and no cloud.
+    /// What a project whose file cannot be read gets: secrets blocked, no cloud and no capture.
     pub fn fail_closed() -> Self {
         Self::default().closed()
     }
@@ -2333,7 +2335,7 @@ impl ProjectTree {
 
 /// Per-project `.alice.toml` settings that fail closed.
 ///
-/// - a file that is invalid or cannot be read gives `block_secrets` and `cloud_denied` on (and
+/// - a file that is invalid or cannot be read gives `block_secrets`, `cloud_denied` and `no_capture` on (and
 ///   the last good custom patterns), plus the error, until it is valid again;
 /// - a file that loosens the last good settings (a flag off, a pattern removed, an emptied or
 ///   deleted file) applies only when the same content is read on [`LOOSEN_POLLS`] polls in a
@@ -3627,6 +3629,36 @@ mod tests {
             ]
         );
         assert!(loosened_protections(&loose, &tight).is_empty());
+    }
+
+    #[test]
+    fn the_other_agent_flags_and_idle_minutes_are_covered() {
+        for (flag, set) in [
+            (
+                "capture.cursor",
+                (|s: &mut Settings| s.capture.cursor = true) as fn(&mut Settings),
+            ),
+            ("capture.windsurf", |s| s.capture.windsurf = true),
+            ("capture.opencode", |s| s.capture.opencode = true),
+            ("capture.gemini", |s| s.capture.gemini = true),
+        ] {
+            let mut tight = Settings::default();
+            tight.capture.cursor = false;
+            tight.capture.windsurf = false;
+            tight.capture.opencode = false;
+            tight.capture.gemini = false;
+            let mut loose = tight.clone();
+            set(&mut loose);
+            assert_eq!(loosened_protections(&tight, &loose), vec![flag]);
+            assert!(loosened_protections(&loose, &tight).is_empty());
+        }
+        for bad in ["0", "1441"] {
+            let file = format!("[distill]\nidle_minutes = {bad}\n");
+            assert_eq!(
+                error_keys(&file, &[]),
+                vec!["distill.idle_minutes".to_string()]
+            );
+        }
     }
 
     #[test]

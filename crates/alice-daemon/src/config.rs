@@ -685,26 +685,38 @@ impl SettingsHandle {
             })
     }
 
-    /// Whether a session of `agent` in `project_slug` (its working tree `root`, when it has
+    /// Whether a session of `agent` in `project_slug` (its working tree `tree`, when it has
     /// one) is captured. The one answer the capture paths use; none of them reads
     /// `capture.*` or `.alice.toml` itself. In this order: `Wait` while the rules are unknown
-    /// (the configuration is degraded, or a loosening or a broken project file is not settled),
-    /// then `Excluded` for the master switch, the agent's switch, `capture.excluded_projects`
-    /// (slugified on both sides, as the cloud list is) and the project's `no_capture`.
+    /// (the configuration is degraded or has a loosening waiting, or the project file is broken
+    /// or has a loosening waiting), then `Excluded` for the master switch, the agent's switch,
+    /// `capture.excluded_projects` (slugified on both sides, as the cloud list is) and the
+    /// project's `no_capture`.
+    ///
+    /// `tree` is keyed by the project, so worktrees share its rules, as for
+    /// [`cloud_allowed`](Self::cloud_allowed). Like that path, a caller that knows several
+    /// identities of a project (slug, aliases, display name) asks about each one: the
+    /// `excluded_projects` entry matches only the name it is written as.
     pub fn capture_verdict(
         &self,
         agent: AgentKind,
         project_slug: &str,
-        root: Option<&Path>,
+        tree: Option<&ProjectTree>,
     ) -> CaptureVerdict {
-        let tree = root.map(ProjectTree::alone);
         if self.config_degraded() {
             return CaptureVerdict::Wait("the configuration is degraded".into());
         }
-        if self.project_fail_closed(tree.as_ref()) {
+        if self.loosening_waiting() {
+            return CaptureVerdict::Wait("a change to config.toml is waiting to settle".into());
+        }
+        // One load of the project file: a second read could meet a half-written save and turn
+        // a Wait into a permanent exclusion.
+        let project = tree.map(|t| self.project_load(t, &self.projects));
+        if let Some(l) = &project
+            && (l.error.is_some() || l.loosening_pending)
+        {
             return CaptureVerdict::Wait(
-                "the privacy rules are not settled (a broken .alice.toml or a pending loosening)"
-                    .into(),
+                "the project's .alice.toml is broken or has a change waiting to settle".into(),
             );
         }
         let settings = self.get();
@@ -727,13 +739,7 @@ impl SettingsHandle {
         {
             return CaptureVerdict::Excluded("project excluded");
         }
-        let no_capture = tree.is_some_and(|t| {
-            self.project_load(&t, &self.projects)
-                .settings
-                .apply_to(&settings.privacy)
-                .no_capture
-        });
-        if no_capture {
+        if project.is_some_and(|l| l.settings.privacy.no_capture) {
             return CaptureVerdict::Excluded("the project's .alice.toml says no_capture");
         }
         CaptureVerdict::Capture
@@ -1707,7 +1713,8 @@ mod tests {
         use alice_core::capture::AgentKind::{ClaudeCode, Codex};
         let (_d, h) = home();
         let repo = tempfile::tempdir().unwrap();
-        let root = Some(repo.path());
+        let tree = ProjectTree::new("proj", repo.path());
+        let root = Some(&tree);
         // A degraded configuration waits, whatever else it says.
         write(
             &h,
@@ -1722,7 +1729,7 @@ mod tests {
         // A valid configuration: the exclusions in order.
         write(
             &h,
-            "[capture]\nexcluded_projects = [\"Client X\"]\ncodex = false\n",
+            "[capture]\nexcluded_projects = [\"Client X\", \"codex-only\"]\ncodex = false\n",
         );
         let s = SettingsHandle::load_with_env(&h, vec![]);
         assert_eq!(
@@ -1741,10 +1748,15 @@ mod tests {
             s.capture_verdict(ClaudeCode, "client-x", root),
             CaptureVerdict::Excluded("project excluded")
         );
-        write(&h, "[capture]\nenabled = false\n");
-        let s2 = SettingsHandle::load_with_env(&h, vec![]);
         assert_eq!(
-            s2.capture_verdict(ClaudeCode, "p", root),
+            s.capture_verdict(Codex, "client-x", root),
+            CaptureVerdict::Excluded("this agent's capture is off"),
+            "the agent flag is answered before the project list"
+        );
+        write(&h, "[capture]\nenabled = false\n");
+        let off = SettingsHandle::load_with_env(&h, vec![]);
+        assert_eq!(
+            off.capture_verdict(ClaudeCode, "p", root),
             CaptureVerdict::Excluded("capture is off")
         );
         // The project's own file.
@@ -1755,13 +1767,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            s.capture_verdict(ClaudeCode, "p", Some(nc.path())),
+            s.capture_verdict(ClaudeCode, "p", Some(&ProjectTree::new("nc", nc.path()))),
             CaptureVerdict::Excluded("the project's .alice.toml says no_capture")
         );
+        // A broken file waits, and never reads as no_capture (the fail-closed settings set it).
         let broken = tempfile::tempdir().unwrap();
         std::fs::write(broken.path().join(".alice.toml"), "[privacy\n").unwrap();
+        let bt = ProjectTree::new("broken", broken.path());
+        for _ in 0..3 {
+            assert!(matches!(
+                s.capture_verdict(ClaudeCode, "p", Some(&bt)),
+                CaptureVerdict::Wait(_)
+            ));
+        }
+    }
+
+    /// The project's rules belong to the project: a worktree whose file is only in the main tree.
+    #[test]
+    fn capture_verdict_uses_the_projects_rules_in_a_worktree() {
+        use alice_core::capture::AgentKind::ClaudeCode;
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        let (main, wt) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(
+            main.path().join(".alice.toml"),
+            "[privacy]\nno_capture = true\n",
+        )
+        .unwrap();
+        let main_tree = ProjectTree::new("proj", main.path());
+        let verdict = CaptureVerdict::Excluded("the project's .alice.toml says no_capture");
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "p", Some(&main_tree)),
+            verdict
+        );
+        let wt_tree = ProjectTree::new("proj", wt.path());
+        assert_eq!(s.capture_verdict(ClaudeCode, "p", Some(&wt_tree)), verdict);
+        // Another project's worktree is not affected.
+        let other = ProjectTree::new("other", wt.path());
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "p", Some(&other)),
+            CaptureVerdict::Capture
+        );
+    }
+
+    #[test]
+    fn capture_verdict_waits_for_a_pending_loosening_of_either_file() {
+        use alice_core::capture::AgentKind::ClaudeCode;
+        let (_d, h) = home();
+        let repo = tempfile::tempdir().unwrap();
+        let tree = ProjectTree::new("proj", repo.path());
+        let toml = repo.path().join(".alice.toml");
+        std::fs::write(&toml, "[privacy]\nno_capture = true\n").unwrap();
+        write(&h, "[capture]\nenabled = false\n");
+        let s = SettingsHandle::load_with_env(&h, vec![]);
         assert!(matches!(
-            s.capture_verdict(ClaudeCode, "p", Some(broken.path())),
+            s.capture_verdict(ClaudeCode, "p", Some(&tree)),
+            CaptureVerdict::Excluded(_)
+        ));
+        // Removing no_capture loosens: the first looks wait.
+        std::fs::write(&toml, "[privacy]\nblock_secrets = true\n").unwrap();
+        assert!(matches!(
+            s.capture_verdict(ClaudeCode, "p", Some(&tree)),
             CaptureVerdict::Wait(_)
         ));
     }
