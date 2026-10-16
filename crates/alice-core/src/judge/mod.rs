@@ -10,7 +10,7 @@ pub mod pipeline;
 pub mod text;
 pub mod verbal;
 
-use crate::model::Kind;
+use crate::model::{Kind, Origin};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -170,6 +170,9 @@ pub struct JudgeMemory {
     /// The memory's status when the question depends on it (a precise recall): a superseded
     /// or archived memory says so in its header. `None`: not stated.
     pub status: Option<crate::model::Status>,
+    /// How the memory came to exist: a distilled newcomer is never reviewed and never replaces
+    /// an explicit memory (SP2 spec §6.6).
+    pub origin: Origin,
 }
 
 /// How a new memory relates to one existing memory: P over `RelationKind` names.
@@ -182,6 +185,9 @@ pub struct Relation {
     /// heuristic result `pipeline::decide` applies without asking, and `Some(false)` a near
     /// twin by vector only.
     pub agreement: Option<bool>,
+    /// How the existing memory came to exist. A judge leaves the default (`agent`); the caller
+    /// fills it in from the memories it read (SP2 spec §6.6).
+    pub existing_origin: Origin,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -128,6 +128,10 @@ pub struct Hit {
     /// project be sent to a model. `Some(false)` on any doubt; absent outside the team store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_ok: Option<bool>,
+    /// `distill` for a memory distilled from a captured session (the text format marks it
+    /// `(auto)`); absent for any other (SP2 spec §6.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1220,6 +1224,7 @@ mod tests {
             source: None,
             author: None,
             cloud_ok: None,
+            origin: None,
         };
         let v = serde_json::to_value(&hit).unwrap();
         assert!(v.get("body").is_none() && v.get("status").is_none());

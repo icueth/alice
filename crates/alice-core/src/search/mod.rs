@@ -8,7 +8,7 @@ pub mod stopwords;
 use crate::api::{Hit, MatchVia, RelatedRef, Tier};
 use crate::embed::Embedder;
 use crate::error::{AliceError, Result};
-use crate::model::{Kind, Memory, Status, limits};
+use crate::model::{Kind, Memory, Origin, Status, limits};
 use crate::normalize::{nfc, normalize_topic};
 use crate::store::embeddings::{self, VecKey};
 use crate::store::projects::GLOBAL_ID;
@@ -463,6 +463,7 @@ impl Scored {
                 snippet: pack::make_snippet(&m.body, terms, SNIPPET_CHARS),
                 status: (m.status != Status::Active && m.status != Status::Pending)
                     .then_some(m.status),
+                origin: (m.origin == Origin::Distill).then(|| m.origin.as_str().to_string()),
                 id: m.id,
                 tier: Tier::Knowledge,
                 kind: Some(m.kind),
@@ -495,6 +496,7 @@ impl Scored {
                     source: None,
                     author: None,
                     cloud_ok: None,
+                    origin: None,
                 }
             }
         }
@@ -763,7 +765,8 @@ struct Filters<'a> {
 }
 
 impl Filters<'_> {
-    /// Fetch the rows, drop trashed and filtered-out items, apply boosts; best first.
+    /// Fetch the rows, drop trashed, unjudged distilled and filtered-out items, apply boosts;
+    /// best first.
     fn score(
         &self,
         conn: &Connection,
@@ -805,8 +808,10 @@ impl Filters<'_> {
                 similarity: s.similarity,
             });
         };
-        for (seq, m) in memories::get_by_seqs(conn, &mem_seqs)? {
-            if m.status == Status::Trashed {
+        let found = memories::get_by_seqs(conn, &mem_seqs)?;
+        let unjudged = unjudged_distilled(conn, &found)?;
+        for (seq, m) in found {
+            if m.status == Status::Trashed || unjudged.contains(&seq) {
                 continue;
             }
             let project_id = id_by_slug.get(m.project.as_str()).copied().unwrap_or("");
@@ -894,6 +899,28 @@ impl Filters<'_> {
         });
         Ok(out)
     }
+}
+
+/// The seqs among `found` of distilled memories whose judge stage is not over: a recall skips
+/// them until it is, so a near-copy of an explicit memory never shows twice while the judge
+/// works or is unreachable (SP2 spec §6.6). One query, and only when one of them is distilled.
+fn unjudged_distilled(conn: &Connection, found: &[(i64, Memory)]) -> Result<HashSet<i64>> {
+    let distilled: Vec<i64> = found
+        .iter()
+        .filter(|(_, m)| m.origin == Origin::Distill)
+        .map(|(s, _)| *s)
+        .collect();
+    if distilled.is_empty() {
+        return Ok(HashSet::new());
+    }
+    // A recall's candidates are a few hundred: well within one statement's bound parameters.
+    let sql = format!(
+        "SELECT seq FROM memories WHERE judge_state <> 'done' AND seq IN ({})",
+        vec!["?"; distilled.len()].join(",")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(&distilled), |r| r.get(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 fn project_slugs(conn: &Connection) -> Result<HashMap<String, String>> {
@@ -1311,6 +1338,65 @@ mod tests {
             assert!(!out.raw_fallback);
             assert!(out.hits.iter().all(|h| h.tier == Tier::Knowledge));
         }
+    }
+
+    /// SP2 spec §6.6: a distilled memory is found only once its judge stage is over, and then
+    /// says what it is: `origin: "distill"` in JSON, ` (auto)` in text. An explicit hit carries
+    /// no origin at all.
+    #[test]
+    fn recall_json_marks_distilled_hits() {
+        let f = fx();
+        let (agent, _) = f.add(&f.app, Kind::Fact, "the billing worker retries webhooks");
+        let (auto, auto_seq) = f.add_input(
+            &f.app,
+            memories::NewMemoryInput {
+                content: "the billing worker retries webhooks five times".into(),
+                kind: Some(Kind::Fact),
+                origin: Origin::Distill,
+                ..Default::default()
+            },
+        );
+        let p = f.params("billing worker webhooks");
+        for state in ["pending", "retry"] {
+            f.c.execute(
+                "UPDATE memories SET judge_state = ?1 WHERE seq = ?2",
+                rusqlite::params![state, auto_seq],
+            )
+            .unwrap();
+            let out = f.search(&p);
+            let ids: Vec<&str> = out.hits.iter().map(|h| h.id.as_str()).collect();
+            assert_eq!(ids, [agent.as_str()], "{state}");
+            assert!(out.near.iter().all(|n| n.hit.id != auto), "{state}");
+        }
+        f.c.execute(
+            "UPDATE memories SET judge_state = 'done' WHERE seq = ?1",
+            [auto_seq],
+        )
+        .unwrap();
+        let out = f.search(&p);
+        let hit = |id: &str| out.hits.iter().find(|h| h.id == id).unwrap();
+        assert_eq!(hit(&auto).origin.as_deref(), Some("distill"));
+        assert_eq!(hit(&agent).origin, None);
+        let json = serde_json::to_value(pack::pack_json(out.clone(), None, 10_000)).unwrap();
+        let by_id = |id: &str| {
+            json["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id(&auto)["origin"], "distill");
+        assert!(by_id(&agent).get("origin").is_none(), "{json}");
+        let (text, _) = pack::pack_text(&out, Some("app"), 1_500);
+        let header = |id: &str| {
+            text.lines()
+                .find(|l| l.contains(id) && l.contains(" · matched: "))
+                .unwrap_or_else(|| panic!("no header for {id}:\n{text}"))
+        };
+        assert!(header(&auto).ends_with(" (auto)"), "{text}");
+        assert!(!header(&agent).contains("(auto)"), "{text}");
     }
 
     #[test]

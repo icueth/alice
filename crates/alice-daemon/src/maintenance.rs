@@ -1025,10 +1025,12 @@ impl Scheduler {
             .unwrap_or(0);
         // Diaries are session logs and status notes time-stamped snapshots: they share a format
         // by design, so their vectors sit close without being duplicates. Never clustered.
+        // Distilled memories are the judge's alone (SP2 spec §6.6): never put to a person.
         let rows: Vec<(i64, String, String)> = self.ctx.readers.with(|c| {
             let mut stmt = c.prepare(
                 "SELECT seq, id, project_id FROM memories
                  WHERE seq > ?1 AND status IN ('active','pending') AND kind NOT IN ('diary','status')
+                   AND origin <> 'distill'
                  ORDER BY seq LIMIT ?2",
             )?;
             Ok(stmt
@@ -1107,14 +1109,16 @@ impl Scheduler {
             if near.is_empty() {
                 continue;
             }
-            // Live, same project, not a diary, not in an open item: (seq, id, vector).
+            // Live, same project, not a diary, not distilled, not in an open item: (seq, id,
+            // vector).
             let candidates: Vec<(String, Vec<f32>, MergeText)> = self.ctx.readers.with(|c| {
                 let mut out = Vec::new();
                 for o in &near {
                     let Some((oid, oproject, okind, otitle, obody)) = c
                         .query_row(
                             "SELECT id, project_id, kind, title, body FROM memories
-                             WHERE seq = ?1 AND status IN ('active','pending') AND kind NOT IN ('diary','status')",
+                             WHERE seq = ?1 AND status IN ('active','pending') AND kind NOT IN ('diary','status')
+                               AND origin <> 'distill'",
                             [o],
                             |r| {
                                 Ok((
@@ -2161,6 +2165,42 @@ mod tests {
         assert!(
             groups[0].iter().all(|id| !diaries.contains(id)),
             "{groups:?} {diaries:?}"
+        );
+    }
+
+    /// SP2 spec §6.6: distilled memories are left to the judge, as diaries are left out: never
+    /// put in a merge suggestion.
+    #[test]
+    fn merge_suggestions_skip_distilled_memories() {
+        let r = rig_with(NEAR);
+        r.insert_memories_with_vectors(&fan(4, 0.1));
+        r.sql()
+            .execute(
+                "UPDATE memories SET origin = 'distill', judge_state = 'done'
+                 WHERE seq IN (SELECT seq FROM memories ORDER BY seq LIMIT 2)",
+                [],
+            )
+            .unwrap();
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        // The two distilled memories are alike, and alike the other two; only those two pair.
+        let groups = open_groups(&r);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let distilled: Vec<String> = {
+            let c = r.sql();
+            let mut stmt = c
+                .prepare("SELECT id FROM memories WHERE origin = 'distill'")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+        };
+        assert_eq!(distilled.len(), 2);
+        assert_eq!(groups[0].len(), 2, "{groups:?}");
+        assert!(
+            groups[0].iter().all(|id| !distilled.contains(id)),
+            "{groups:?} {distilled:?}"
         );
     }
 

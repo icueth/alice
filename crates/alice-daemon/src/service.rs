@@ -2611,6 +2611,11 @@ impl Service {
                 similarity: None,
                 raw: h.tier == Tier::Raw,
                 status: h.status,
+                origin: h
+                    .origin
+                    .as_deref()
+                    .and_then(alice_core::model::Origin::parse)
+                    .unwrap_or_default(),
             };
             let mut shown: Vec<(usize, JudgeMemory)> = Vec::new();
             let mut ordinal = 0;
@@ -8521,6 +8526,219 @@ mod tests {
         s.shutdown();
     }
 
+    // ------------------------------------------------- distilled memories (SP2 spec §6.6)
+
+    /// A distilled memory, written as the distiller writes it (SP2 spec §6.5): the service's
+    /// project choice, `origin = distill`.
+    async fn remember_distilled(
+        s: &Service,
+        content: &str,
+        kind: Kind,
+        cwd: &Option<String>,
+    ) -> String {
+        let project = s
+            .choose(remember_req(content, Some(kind), cwd).scope())
+            .await
+            .unwrap();
+        match s
+            .writer
+            .submit(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: content.into(),
+                    kind: Some(kind),
+                    origin: alice_core::model::Origin::Distill,
+                    ..Default::default()
+                },
+                project,
+            })
+            .await
+            .unwrap()
+        {
+            WriteOutcome::Remembered(InsertOutcome::New { id, .. }, _) => id,
+            o => panic!("{o:?}"),
+        }
+    }
+
+    /// `(to_id, type)` of the links from `id`.
+    async fn links_from(s: &Service, id: &str) -> Vec<(String, String)> {
+        let id = id.to_string();
+        s.read(move |c| {
+            let mut st =
+                c.prepare("SELECT to_id, type FROM links WHERE from_id = ?1 ORDER BY type")?;
+            let rows = st
+                .query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_memory_replaces_an_older_distilled_duplicate() {
+        let (d, s) = svc_with_jev(crate::judge_http::ScriptedJev::new(("duplicate", 0.95))).await;
+        let cwd = repo(&d, "proj");
+        let auto = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5432",
+            Kind::Fact,
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let mine = remember_id(
+            &s,
+            "The staging Postgres server listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        // The explicit memory survives, though it is the newer one.
+        assert_eq!(
+            state_of(&s, &mine).await,
+            ("done".to_string(), "active".to_string())
+        );
+        assert_eq!(state_of(&s, &auto).await.1, "trashed");
+        assert_eq!(
+            links_from(&s, &auto).await,
+            [(mine.clone(), "duplicate_of".to_string())]
+        );
+        assert_eq!(
+            memory_of(&s, &auto).await.memory.id,
+            mine,
+            "the survivor answers for the distilled copy"
+        );
+        assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
+        let ev = s
+            .events(EventsRequest {
+                target_id: Some(auto.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| e.action == "memory.merge" && e.actor == "judge:jev"),
+            "{ev:?}"
+        );
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_distilled_memory_never_supersedes_an_agent_memory() {
+        let (d, s) = svc_with_jev(crate::judge_http::ScriptedJev::new(("updates", 0.95))).await;
+        let cwd = repo(&d, "proj");
+        let mine = remember_id(
+            &s,
+            "Staging Postgres listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let auto = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5433 now",
+            Kind::Fact,
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let live = ("done".to_string(), "active".to_string());
+        assert_eq!(state_of(&s, &mine).await.1, "active", "both stay");
+        assert_eq!(state_of(&s, &auto).await, live);
+        assert_eq!(
+            links_from(&s, &auto).await,
+            [(mine.clone(), "relates_to".to_string())]
+        );
+        assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
+        // A distilled update of an older distilled memory supersedes it, as an agent's would.
+        let newer = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5434 now",
+            Kind::Fact,
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        assert_eq!(state_of(&s, &newer).await, live);
+        assert_eq!(state_of(&s, &auto).await.1, "superseded");
+        assert_eq!(state_of(&s, &mine).await.1, "active");
+        assert_eq!(
+            links_from(&s, &newer).await,
+            [
+                (mine.clone(), "relates_to".to_string()),
+                (auto.clone(), "supersedes".to_string()),
+            ]
+        );
+        assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unjudged_distilled_memories_are_hidden_from_recall_and_the_briefing() {
+        let t = crate::judge_http::ScriptedJev::failing(503);
+        let (d, s) = svc_with_jev_opts(
+            t.clone(),
+            ServiceOptions {
+                judge_retry_every: Duration::from_millis(50),
+                judge_retry_base: Duration::from_millis(1),
+                ..quiet()
+            },
+        )
+        .await;
+        let cwd = repo(&d, "proj");
+        // A neighbour, so the judge has a question to ask about the distilled memory.
+        remember_id(
+            &s,
+            "Staging Postgres listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let text = "We release the billing service with blue green deploys";
+        let auto = remember_distilled(&s, text, Kind::Decision, &cwd).await;
+        let recall = || {
+            s.recall(RecallRequest {
+                query: "billing blue green deploys".into(),
+                cwd: cwd.clone(),
+                format: OutputFormat::Json,
+                ..Default::default()
+            })
+        };
+        // Pending, then waiting for the judge that cannot answer: hidden all along.
+        for _ in 0..2 {
+            assert_ne!(state_of(&s, &auto).await.0, "done");
+            let r = recall().await.unwrap();
+            assert!(r.results.iter().all(|h| h.id != auto), "{:?}", r.results);
+            let ctx = context_of(&s, &cwd).await.text;
+            assert!(!ctx.contains("blue green"), "{ctx}");
+            assert_eq!(memory_of(&s, &auto).await.memory.id, auto, "get finds it");
+            until("a failed judgement", || (t.sent() >= 4).then_some(())).await;
+        }
+        until("waiting for the judge", || {
+            (futures::executor::block_on(state_of(&s, &auto)).0 == "retry").then_some(())
+        })
+        .await;
+        // The judge is back: once judged, the memory is shown, marked.
+        t.set_status(None);
+        until("the judgement", || {
+            (futures::executor::block_on(state_of(&s, &auto)).0 == "done").then_some(())
+        })
+        .await;
+        let r = recall().await.unwrap();
+        let hit = r.results.iter().find(|h| h.id == auto).unwrap();
+        assert_eq!(hit.origin.as_deref(), Some("distill"));
+        let ctx = context_of(&s, &cwd).await.text;
+        assert!(
+            ctx.contains(&format!("- [decision] {text} ({auto}) (auto)\n")),
+            "{ctx}"
+        );
+        s.shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn kind_is_set_only_when_the_writer_gave_none() {
         let t = Arc::new(crate::judge_http::ScriptedJev {
@@ -10229,6 +10447,7 @@ mod tests {
             source: None,
             author: None,
             cloud_ok: None,
+            origin: None,
         }
     }
 
