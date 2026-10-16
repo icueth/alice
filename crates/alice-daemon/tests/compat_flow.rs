@@ -42,11 +42,16 @@ struct Flow {
 impl Flow {
     /// A service whose store holds the imported fixture palace.
     async fn imported() -> Flow {
+        Self::imported_with(&fixture_specs()).await
+    }
+
+    /// A service whose store holds a palace of these drawers, imported.
+    async fn imported_with(specs: &[alice_core::import::fixture::DrawerSpec]) -> Flow {
         let root = tempfile::tempdir().unwrap();
         let palace_root = tempfile::tempdir().unwrap();
         let palace = palace_root.path().join("palace");
         std::fs::create_dir_all(&palace).unwrap();
-        build_sqlite_exact(&palace, &fixture_specs());
+        build_sqlite_exact(&palace, specs);
         let home = AliceHome::new(root.path().join("alice"));
         let svc = Service::start(
             home,
@@ -401,6 +406,120 @@ async fn get_drawer_resolves_alice_ids_old_ids_collapsed_ids_and_raw_chunks() {
     assert!(
         missing["error"].as_str().unwrap().contains("not found"),
         "{missing}"
+    );
+}
+
+/// The id of a long entry, as MemPalace answered it (`<id>`; it stores only the fragments
+/// `<id>_chunk_NNNNNN`, each naming it as `parent_drawer_id`).
+const LOGICAL: &str = "drawer_pg_ai_decisions_5f3a9c";
+
+/// The fixture palace plus one decision MemPalace cut into two fragments.
+fn specs_with_a_cut_drawer() -> Vec<alice_core::import::fixture::DrawerSpec> {
+    let mut specs = fixture_specs();
+    for (n, text) in [
+        (0, "We picked the framed proto"),
+        (1, "buf layout for v4 frames."),
+    ] {
+        let mut d = palace::knowledge(
+            &format!("{LOGICAL}_chunk_{n:06}"),
+            text,
+            "pg-ai",
+            "decisions",
+        );
+        d.meta.chunk_index = Some(n);
+        d.meta.parent_drawer_id = Some(LOGICAL.into());
+        specs.push(d);
+    }
+    specs
+}
+
+/// The id MemPalace answered for a long entry still gets, updates and deletes it after the
+/// import, as MemPalace's own tools did.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_id_mempalace_answered_for_a_long_entry_gets_updates_and_deletes_it() {
+    let f = Flow::imported_with(&specs_with_a_cut_drawer()).await;
+    let got = f
+        .call("mempalace_get_drawer", json!({"drawer_id": LOGICAL}))
+        .await;
+    assert_eq!(
+        got["content"], "We picked the framed protobuf layout for v4 frames.",
+        "{got}"
+    );
+    let id = got["drawer_id"].as_str().unwrap().to_string();
+    let up = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": LOGICAL, "content": "We picked the framed protobuf layout."}),
+        )
+        .await;
+    assert_eq!(up["success"], true, "{up}");
+    assert_eq!(up["drawer_id"], id.as_str(), "{up}");
+    assert_eq!(
+        f.memory(&id).await.body,
+        "We picked the framed protobuf layout."
+    );
+    let del = f
+        .call("mempalace_delete_drawer", json!({"drawer_id": LOGICAL}))
+        .await;
+    assert_eq!(del["success"], true, "{del}");
+    assert!(f.is_forgotten(&id).await);
+}
+
+/// `update_drawer` and `delete_drawer` through the old id of a collapsed duplicate act on the
+/// memory it was merged into, and say so as `get_drawer` does. The ids of a memory's own drawer
+/// (its old id, its fragments, the id MemPalace answered for a drawer it cut) are no merge.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_through_a_merged_old_id_say_which_memory_they_changed() {
+    let f = Flow::imported_with(&specs_with_a_cut_drawer()).await;
+    let up = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": "k_dup_b", "content": "Frames are framed protobuf, v4."}),
+        )
+        .await;
+    assert_eq!(up["success"], true, "{up}");
+    let survivor = up["drawer_id"].as_str().unwrap().to_string();
+    assert!(
+        up["note"]
+            .as_str()
+            .is_some_and(|n| n.contains(&format!("k_dup_b was merged into {survivor}"))),
+        "{up}"
+    );
+    let own = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": "k_dup_a", "room": "decisions"}),
+        )
+        .await;
+    assert_eq!(own["success"], true, "{own}");
+    assert!(own.get("note").is_none(), "{own}");
+    for id in [
+        LOGICAL.to_string(),
+        format!("{LOGICAL}_chunk_000000"),
+        format!("{LOGICAL}_chunk_000001"),
+    ] {
+        let got = f
+            .call("mempalace_get_drawer", json!({"drawer_id": id}))
+            .await;
+        assert!(got.get("note").is_none(), "{id}: {got}");
+    }
+    let cut = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": format!("{LOGICAL}_chunk_000001"), "content": "We picked the framed protobuf layout."}),
+        )
+        .await;
+    assert_eq!(cut["success"], true, "{cut}");
+    assert!(cut.get("note").is_none(), "{cut}");
+    let del = f
+        .call("mempalace_delete_drawer", json!({"drawer_id": "k_dup_b"}))
+        .await;
+    assert_eq!(del["deleted_ids"], json!([survivor]), "{del}");
+    assert!(
+        del["note"].as_str().is_some_and(|n| n
+            .contains(&format!("k_dup_b was merged into {survivor}"))
+            && n.contains("trash")),
+        "{del}"
     );
 }
 
@@ -2158,9 +2277,21 @@ async fn the_stdio_backend_follows_both_switches_through_the_daemon_and_fails_cl
         f.memory(&id).await.author.agent.as_deref(),
         Some("shim-agent")
     );
-    // The daemon goes away: both switches read off.
+    // The daemon goes away: both switches read off, and a call says the daemon cannot be
+    // reached (the setting is still on: "turn it on" would send the agent to rewrite it).
     s.stop.cancel();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(compat_count(&names(&c).await), 0, "no daemon answers: off");
+    let err = error_text(
+        c.call_tool(tool_call("mempalace_list_wings", json!({})))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        err.contains("not reachable")
+            && err.contains("alice status")
+            && !err.contains("turn it on"),
+        "{err}"
+    );
     c.cancel().await.ok();
 }

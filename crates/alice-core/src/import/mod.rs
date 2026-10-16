@@ -86,8 +86,9 @@ pub struct ImportStatus {
     /// Writer batches the job has had committed so far.
     #[serde(default)]
     pub batches: u64,
-    /// The largest batch so far, in records and in bytes of text (a batch closes at 200 records
-    /// or 64 KB, so a short writer slice is visible here).
+    /// The largest batch so far, in records and in bytes of text (a batch closes at 50 records
+    /// or 16 KB of text, the importer's `BATCH_RECORDS` and `BATCH_BYTES`, so a short writer
+    /// slice is visible here).
     #[serde(default)]
     pub max_batch_records: u64,
     #[serde(default)]

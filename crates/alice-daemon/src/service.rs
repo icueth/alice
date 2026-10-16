@@ -35,7 +35,9 @@ use alice_core::store::embeddings;
 use alice_core::store::events::{Actor, EventRow};
 use alice_core::store::history::UndoOutcome;
 use alice_core::store::kg::{self, FactOutcome};
-use alice_core::store::memories::{self, InsertOutcome, NewMemoryInput};
+use alice_core::store::memories::{
+    self, InsertOutcome, MemoryUpdate, NewMemoryInput, ScreenedMove, UpdateAction,
+};
 use alice_core::store::projects::{self, DetectedForRead, ResolvedProject};
 use alice_core::store::reviews::{self, NewReview, ReviewItem, ReviewQuery, ReviewType};
 use alice_core::store::sources::{self, IngestOutcome};
@@ -161,13 +163,30 @@ fn exact_match(query: &str, hit: &alice_core::api::Hit) -> bool {
 const QUERY_HELD_BACK: &str = "this search used word matches only: the cloud policy keeps this project's text away from the embedding provider, so the query was not sent";
 
 /// The cloud decision for a query asked from `choice`'s project: whether it may leave, the
-/// redactor that screens it, and whether the project is a detected one the store never saw.
+/// redactors that screen it, and whether the project is a detected one the store never saw.
 /// A project that was never written to is judged by its working tree's own `.alice.toml` and
-/// the global lists (every identity of it is asked; an empty slug says no).
+/// the global lists (every identity of it is asked; an empty slug says no). A stored project
+/// asked from one of its trees is judged by that tree too, not only by the tree it was last
+/// written from (final re-review N-I1). The tree carries the rules project merges carried into
+/// the project a write from it lands in; a checkout read as an import placeholder is judged by
+/// its tree and the placeholder's policy.
 struct QueryCloud {
     allowed: bool,
     redactor: Arc<Redactor>,
+    /// The rules as read in the tree the query comes from, when that is not the stored one.
+    also: Option<Arc<Redactor>>,
     unstored: bool,
+}
+
+impl QueryCloud {
+    /// `text` through every redactor of the decision (redaction is idempotent).
+    fn redact(&self, text: &str) -> String {
+        let once = self.redactor.apply(text).text;
+        match &self.also {
+            Some(r) => r.apply(&once).text,
+            None => once,
+        }
+    }
 }
 
 fn query_cloud(
@@ -180,38 +199,73 @@ fn query_cloud(
     let known = |allowed, redactor| QueryCloud {
         allowed,
         redactor,
+        also: None,
         unstored: false,
     };
     match choice {
         ProjectChoice::Slug(s) => known(cloud.cloud_allowed(s), cloud.redactor(s)),
         ProjectChoice::Fallback => known(cloud.cloud_allowed("global"), cloud.redactor("global")),
         ProjectChoice::Detected(r) => {
-            let found = readers
-                .with(|c| projects::detected_for_read(c, r))
-                .unwrap_or(DetectedForRead::Unstored);
-            // What the working tree itself says (its `.alice.toml` and the global lists), for a
-            // project the store does not hold as the detected one.
-            let tree = r.tree();
-            let tree_allows = !r.slug.trim().is_empty()
-                && [r.slug.as_str(), r.name.as_str()]
-                    .into_iter()
-                    .filter(|n| !n.trim().is_empty())
-                    .all(|n| settings.cloud_allowed(n, tree.as_ref()));
+            // The tree the query comes from, with the rules merges carried into the project a
+            // write from it would land in (and that project's own tree when it is another one).
+            // A store that cannot say which rules those are judges the tree closed: denied.
+            let (found, tree) = readers
+                .with(|c| {
+                    Ok((
+                        projects::detected_for_read(c, r)?,
+                        projects::tree_of_detected(c, r)?,
+                    ))
+                })
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "a project's rules could not be read; the query is kept from cloud providers");
+                    (
+                        DetectedForRead::Unstored,
+                        Some(ProjectTree::unreadable(r.key.clone(), r.tree())),
+                    )
+                });
+            // What the working tree itself says (its `.alice.toml`, kept per project key, the
+            // carried rules, and the global lists), for a project the store does not hold as the
+            // detected one.
+            let tree_allows = || {
+                !r.slug.trim().is_empty()
+                    && [r.slug.as_str(), r.name.as_str()]
+                        .into_iter()
+                        .filter(|n| !n.trim().is_empty())
+                        .all(|n| settings.cloud_allowed(n, tree.as_ref()))
+            };
             match found {
                 DetectedForRead::Stored(p) => {
-                    known(cloud.cloud_allowed(&p.slug), cloud.redactor(&p.slug))
+                    // The tree the query comes from first (with the rules merges carried into the
+                    // project): its `.alice.toml` may deny what the stored tree (a worktree
+                    // without the file, say) does not. The look lands in the project's one entry
+                    // of kept rules, so the hits' checks and later looks from other trees keep
+                    // what it read (final re-review N-I1).
+                    let here = tree
+                        .as_ref()
+                        .is_none_or(|t| settings.cloud_allowed(&p.slug, Some(t)));
+                    QueryCloud {
+                        allowed: here && cloud.cloud_allowed(&p.slug),
+                        redactor: cloud.redactor(&p.slug),
+                        also: tree.as_ref().map(|t| redactors.for_root_always_on(Some(t))),
+                        unstored: false,
+                    }
                 }
                 // An import placeholder stands in for the project: its own policy applies, and
                 // so does the tree's (a placeholder has no root of its own to carry the tree's
                 // file). A tree that denies is judged as an unstored one is: denied.
-                DetectedForRead::Placeholder(p) => QueryCloud {
-                    allowed: tree_allows && cloud.cloud_allowed(&p.slug),
-                    redactor: redactors.for_root_always_on(tree.as_ref()),
-                    unstored: !tree_allows,
-                },
+                DetectedForRead::Placeholder(p) => {
+                    let here = tree_allows();
+                    QueryCloud {
+                        allowed: here && cloud.cloud_allowed(&p.slug),
+                        redactor: redactors.for_root_always_on(tree.as_ref()),
+                        also: None,
+                        unstored: !here,
+                    }
+                }
                 DetectedForRead::Ambiguous(_) | DetectedForRead::Unstored => QueryCloud {
-                    allowed: tree_allows,
+                    allowed: tree_allows(),
                     redactor: redactors.for_root_always_on(tree.as_ref()),
+                    also: None,
                     unstored: true,
                 },
             }
@@ -230,7 +284,7 @@ fn query_for_remote(
     text: &str,
 ) -> Option<String> {
     let q = query_cloud(cloud, readers, settings, redactors, choice);
-    q.allowed.then(|| q.redactor.apply(text).text)
+    q.allowed.then(|| q.redact(text))
 }
 
 /// What the judge decided for a predicate that is new to the vocabulary.
@@ -833,6 +887,35 @@ fn join_err(e: tokio::task::JoinError) -> AliceError {
 
 /// `text` for `field` through `r`: redacted, or refused in `block` mode. Logs the field and
 /// that something was redacted, never the text.
+/// An update refuses what its action would otherwise drop without a word: a `move` takes only
+/// `project`, and `project` belongs to `move` alone.
+fn check_update_fields(u: &MemoryUpdate) -> Result<()> {
+    if u.action == UpdateAction::Move {
+        let extra: Vec<&str> = [
+            ("title", u.title.is_some()),
+            ("body", u.body.is_some()),
+            ("kind", u.kind.is_some()),
+            ("topics", u.topics.is_some()),
+            ("importance", u.importance.is_some()),
+            ("superseded_by", u.superseded_by.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, given)| given.then_some(field))
+        .collect();
+        if !extra.is_empty() {
+            return Err(AliceError::invalid(format!(
+                "move takes only project ({} given too); move the memory first, then edit it",
+                extra.join(", ")
+            )));
+        }
+    } else if u.project.is_some() {
+        return Err(AliceError::invalid(
+            "project is only for action \"move\"; to move the memory, update it with action \"move\" and project alone",
+        ));
+    }
+    Ok(())
+}
+
 fn redact_field(r: &Redactor, field: &str, text: &str) -> Result<String> {
     let out = r.check(field, text)?;
     if out != text {
@@ -852,14 +935,66 @@ impl Service {
     }
 }
 
-/// The working tree of the project `choice` names, keyed by the project.
+/// The working tree of the project `choice` names, keyed by the project, with the rules project
+/// merges carried into it (for a detected checkout: into the stored project its writes land in,
+/// whose own tree applies too when that is another project; see
+/// [`projects::tree_of_detected`]).
 fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<ProjectTree> {
-    match choice {
-        ProjectChoice::Detected(r) => r.tree(),
+    project_tree_in(readers, choice).0
+}
+
+/// [`project_root_in`], and whether the store could not say which rules the project carries.
+/// Such a project gets the closed rules (secrets blocked, no cloud; a checkout keeps its own
+/// file on top), never the global ones alone: a rule that cannot be read must not loosen
+/// anything (final re-review 2, I-1).
+fn project_tree_in(readers: &ReaderPool, choice: &ProjectChoice) -> (Option<ProjectTree>, bool) {
+    let looked = match choice {
+        ProjectChoice::Detected(r) => readers
+            .with(|c| projects::tree_of_detected(c, r))
+            .map_err(|e| (e, r.key.clone(), r.tree())),
         // `global` has no working tree: the global privacy settings apply.
-        ProjectChoice::Fallback => None,
-        ProjectChoice::Slug(s) => readers.with(|c| projects::tree_of(c, s)).ok().flatten(),
+        ProjectChoice::Fallback => Ok(None),
+        ProjectChoice::Slug(s) => readers
+            .with(|c| projects::tree_of(c, s))
+            .map_err(|e| (e, s.clone(), None)),
+    };
+    match looked {
+        Ok(tree) => (tree, false),
+        Err((e, key, own)) => {
+            tracing::warn!(error = %e, "a project's rules could not be read; its writes are screened closed");
+            (Some(ProjectTree::unreadable(key, own)), true)
+        }
     }
+}
+
+/// Why a project merge cannot carry the rules of the project `slug` (its tree `tree`, its rules
+/// as loaded `load`) right now, said plainly with what to do; `None` when they are its rules.
+/// Never names a pattern or quotes the file (people write known secrets as patterns).
+fn rules_not_known(
+    slug: &str,
+    tree: Option<&ProjectTree>,
+    load: &alice_core::settings::ProjectLoad,
+) -> Option<String> {
+    let root = tree.filter(|t| t.has_root()).map(|t| t.root.clone());
+    if load.error.is_some() {
+        let because = match &root {
+            Some(r) if !r.is_dir() => format!(
+                "its working tree ({}) is gone or cannot be read, and its .alice.toml was never read on this machine. Bring the working tree back at that path (a clone, or an empty folder if the project had no .alice.toml), or write to the project once from another checkout of it, then merge",
+                r.display()
+            ),
+            Some(r) => format!(
+                "its .alice.toml ({}) is invalid or cannot be read. Fix the file, then merge",
+                r.join(".alice.toml").display()
+            ),
+            None => "they cannot be read. Try the merge again; if it is refused again, run `alice doctor`".into(),
+        };
+        return Some(format!(
+            "the privacy rules of project \"{slug}\" are not known, so the merge cannot carry them: {because}"
+        ));
+    }
+    load.loosening_pending.then(|| format!(
+        "the privacy rules of project \"{slug}\" are not in force yet, so the merge cannot carry them: its .alice.toml is blank or now protects less than before, and such a change applies only once it has been read the same three times, 2 seconds apart (each merge attempt reads it). Try the merge again in a few seconds"
+    ))
 }
 
 fn unexpected(o: WriteOutcome) -> AliceError {
@@ -1674,16 +1809,17 @@ impl Service {
     }
 
     /// Whether a write to this project (named, or detected from `cwd`) would be judged under
-    /// fail-closed rules at the moment (see [`SettingsHandle::project_fail_closed`]). The spool
-    /// asks before it discards a request that block mode refused.
+    /// fail-closed rules at the moment (see [`SettingsHandle::project_fail_closed`]; a project
+    /// whose rules the store cannot read is too). The spool asks before it discards a request
+    /// that block mode refused.
     pub async fn rules_fail_closed(&self, scope: Scope<'_>) -> bool {
         let Ok(choice) = self.choose(scope).await else {
             return false;
         };
         let (readers, settings) = (self.readers.clone(), self.settings.clone());
         tokio::task::spawn_blocking(move || {
-            let tree = project_root_in(&readers, &choice);
-            settings.project_fail_closed(tree.as_ref())
+            let (tree, unread) = project_tree_in(&readers, &choice);
+            unread || settings.project_fail_closed(tree.as_ref())
         })
         .await
         .unwrap_or(false)
@@ -1704,14 +1840,17 @@ impl Service {
     }
 
     /// The redactor for the project a memory (an id or legacy id) belongs to; the global rules
-    /// for one that is not there (the writer then reports it as unknown).
+    /// for one that is not there (the writer then reports it as unknown), the closed ones when
+    /// the store cannot say which rules apply.
     async fn redactor_for_memory(&self, id: String) -> Result<Arc<Redactor>> {
         let (readers, redactors) = (self.readers.clone(), self.redactors.clone());
         tokio::task::spawn_blocking(move || {
             let tree = readers
                 .with(|c| projects::tree_of_memory(c, &id))
-                .ok()
-                .flatten();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "a project's rules could not be read; the edit is screened closed");
+                    Some(ProjectTree::unreadable(id.clone(), None))
+                });
             redactors.for_root(tree.as_ref())
         })
         .await
@@ -2167,8 +2306,15 @@ impl Service {
             let (choice, text) = (choice.clone(), text.clone());
             tokio::task::spawn_blocking(move || {
                 let q = query_cloud(&cloud, &readers, &settings, &redactors, &choice);
-                q.unstored
-                    .then(|| q.allowed.then(|| q.redactor.apply(&text).text))
+                if q.unstored {
+                    Some(q.allowed.then(|| q.redact(&text)))
+                } else if !q.allowed {
+                    // A stored project that a tree of it denies (the one the query comes from):
+                    // no project name is asked of the judge, as for a tree that denies itself.
+                    Some(None)
+                } else {
+                    None
+                }
             })
             .await
             .map_err(join_err)?
@@ -2362,7 +2508,8 @@ impl Service {
     /// inside means its working tree's own file or the global lists deny the cloud (the answer
     /// is the fast one); `Some(text)` is the query redacted with the tree's rules, and the call
     /// then runs under `global`, a project the policy knows, whose gate and redaction apply on
-    /// top.
+    /// top. It is `Some(None)` too for a stored project that the tree the query comes from
+    /// denies, and for an import placeholder read for the checkout that its policy denies.
     ///
     /// `team_ok` holds the ids of team hits the team store marked `cloud_ok`. The person's
     /// policy knows nothing of a team project, so those hits are allowed by the team store's mark
@@ -2774,7 +2921,13 @@ impl Service {
             return self.update_shared(req).await;
         }
         let actor = Actor::from_author(&req.author);
-        if req.update.title.is_some() || req.update.body.is_some() || req.update.topics.is_some() {
+        check_update_fields(&req.update)?;
+        if req.update.action == UpdateAction::Move {
+            req.update.screened = Some(self.screen_move(&req.id, &req.update).await?);
+        } else if req.update.title.is_some()
+            || req.update.body.is_some()
+            || req.update.topics.is_some()
+        {
             let r = self.redactor_for_memory(req.id.clone()).await?;
             let u = &mut req.update;
             if let Some(t) = &u.title {
@@ -2807,6 +2960,78 @@ impl Service {
         let mut out = self.read(move |c| full(c, m, false)).await?;
         out.event_id = event_id;
         Ok(out)
+    }
+
+    /// What a `move` is allowed to do, decided before the writer is asked: a memory of a project
+    /// kept away from cloud providers never moves into one that is not (the rule of the project
+    /// merge; a slug no project has yet is judged by the settings alone, as the placeholder the
+    /// move would make has no `.alice.toml`), and its text is screened with the destination's
+    /// privacy rules as the review move does (`block` refuses a text they would change, `redact`
+    /// cleans it). The answer carries what the memory looked like, so the writer refuses a
+    /// memory edited in between.
+    async fn screen_move(&self, id: &str, u: &MemoryUpdate) -> Result<ScreenedMove> {
+        let raw = u.project.as_deref().ok_or_else(|| {
+            AliceError::invalid("move needs project: the slug of the project to move it to")
+        })?;
+        let slug = projects::move_slug(raw)?;
+        let (asked, wanted) = (id.to_string(), slug.clone());
+        let (m, content_hash, updated_at, target, tree) = self
+            .read(move |c| {
+                let own = memories::id_of(c, &asked)?.ok_or_else(|| {
+                    AliceError::NotFound(format!(
+                        "memory {asked}; check the id returned by recall or remember"
+                    ))
+                })?;
+                let (m, hash, at) = stamped_memory(c, &own)?
+                    .ok_or_else(|| AliceError::NotFound(format!("memory {asked}")))?;
+                let target = projects::resolve_move_target(c, &wanted)?;
+                let tree = match &target {
+                    Some(t) => projects::tree_of(c, &t.id)?,
+                    None => None,
+                };
+                Ok((m, hash, at, target, tree))
+            })
+            .await?;
+        let (dest, dest_allowed) = match &target {
+            Some(t) => (t.slug.clone(), self.cloud.cloud_allowed(&t.slug)),
+            None => (slug.clone(), self.settings.cloud_allowed(&slug, None)),
+        };
+        if dest != m.project && dest_allowed && !self.cloud.cloud_allowed(&m.project) {
+            return Err(AliceError::invalid(format!(
+                "project \"{}\" is kept away from cloud providers and \"{dest}\" is not: deny \"{dest}\" first (add it to privacy.cloud_denied_projects or set cloud_denied in its .alice.toml), or remove the denial of \"{}\", then move memory {}",
+                m.project, m.project, m.id
+            )));
+        }
+        let r = self.redactors.for_root(tree.as_ref());
+        let screen = |field: &str, t: &str| -> Result<String> {
+            let red = r.apply(t);
+            if red.found.is_empty() {
+                return Ok(t.to_string());
+            }
+            if r.blocks() {
+                return Err(AliceError::invalid(format!(
+                    "cannot move memory {}: the privacy rules of project {dest} (block mode) refuse its {field}, which contains what looks like a secret ({}); keep it where it is",
+                    m.id,
+                    red.found.join(", ")
+                )));
+            }
+            tracing::info!(
+                field,
+                "redacted a moved memory with the destination's rules"
+            );
+            Ok(red.text)
+        };
+        Ok(ScreenedMove {
+            title: screen("title", &m.title)?,
+            body: screen("body", &m.body)?,
+            topics: m
+                .topics
+                .iter()
+                .map(|t| screen("topic", t))
+                .collect::<Result<_>>()?,
+            content_hash,
+            updated_at,
+        })
     }
 
     pub async fn facts(&self, req: FactsRequest) -> Result<FactsResponse> {
@@ -3859,24 +4084,70 @@ impl Service {
 
     /// Merge project `from` into `into` (or, with `dry_run`, say what that would move). The
     /// answer carries the event id that `alice undo` reverses.
+    ///
+    /// The privacy rules of `from` (its `.alice.toml`, and what earlier merges carried into it)
+    /// are carried into `into`, which keeps the stricter of both from then on; undo takes back
+    /// exactly what this merge carried.
     pub async fn merge_projects(&self, req: ProjectMergeRequest) -> Result<ProjectMergeResponse> {
+        use alice_core::store::project_merge;
         let _busy = self.activity.enter();
         let (from, into) = (req.from.clone(), req.into.clone());
-        let plan = self
-            .read(move |c| alice_core::store::project_merge::plan(c, &from, &into))
+        let (plan, from_tree) = self
+            .read(move |c| {
+                let plan = project_merge::plan(c, &from, &into)?;
+                let tree = projects::tree_of(c, &plan.from.id)?;
+                Ok((plan, tree))
+            })
             .await?;
+        // What `from`'s own file puts in force now. While that is only the closed stand-in (its
+        // tree is gone and was never read here, its file is invalid) or not in force yet (a
+        // loosening waiting for its polls), the merge would carry block mode and a cloud denial
+        // `from` never had into `into` for good: refused, with the reason. Asked before the
+        // cloud check, whose "kept away from cloud providers" would not be true.
+        let from_load = self.settings.project_rules(from_tree.as_ref());
+        if let Some(why) = rules_not_known(&plan.from.slug, from_tree.as_ref(), &from_load) {
+            return Err(AliceError::invalid(why));
+        }
         // Privacy first: rows of a project kept away from cloud providers must not become
         // eligible for them by moving into one that is not. The one policy the judge and the
         // remote embedder ask (every name of the project, its `.alice.toml`, degraded config).
-        if !self.cloud.cloud_allowed(&plan.from.slug) && self.cloud.cloud_allowed(&plan.into.slug) {
+        // The merge carries `from`'s own denial into `into`, but `into` must be denied already:
+        // the person decides that, not the merge.
+        let from_denied = !self.cloud.cloud_allowed(&plan.from.slug);
+        if from_denied && self.cloud.cloud_allowed(&plan.into.slug) {
             return Err(AliceError::invalid(format!(
                 "project \"{}\" is kept away from cloud providers and \"{}\" is not: deny \"{}\" first (add it to privacy.cloud_denied_projects or set cloud_denied in its .alice.toml), or remove the denial of \"{}\", then merge",
                 plan.from.slug, plan.into.slug, plan.into.slug, plan.from.slug
             )));
         }
+        let mut from_rules = from_load.settings;
+        // A denial of `from` that is not in its file (the global list naming its slug, an alias
+        // or its display name, which do not all become names of `into`) is carried too, as the
+        // refusal above treats `from` as denied. Not while the configuration is degraded: that
+        // denies every project, and would be carried for good (final re-review 2, M-3).
+        if from_denied && !self.settings.config_degraded() {
+            from_rules.privacy.cloud_denied = true;
+        }
         let answer = |merged: bool,
                       event_id: Option<String>,
-                      c: &alice_core::store::project_merge::MergeCounts| {
+                      c: &project_merge::MergeCounts,
+                      carried: &alice_core::settings::ProjectSettings| {
+            let rules = carried.rule_names();
+            let kept = if rules.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " \"{}\" {} the privacy rules of \"{}\": {}.",
+                    plan.into.slug,
+                    if merged {
+                        "now also keeps"
+                    } else {
+                        "would also keep"
+                    },
+                    plan.from.slug,
+                    rules.join(", ")
+                )
+            };
             ProjectMergeResponse {
                 from: plan.from.slug.clone(),
                 into: plan.into.slug.clone(),
@@ -3887,7 +4158,7 @@ impl Service {
                 facts: c.facts,
                 message: if merged {
                     format!(
-                        "Merged \"{}\" into \"{}\": {} memories, {} chunks, {} sources, {} facts moved. \"{}\" now names \"{}\".{}",
+                        "Merged \"{}\" into \"{}\": {} memories, {} chunks, {} sources, {} facts moved. \"{}\" now names \"{}\".{kept}{}",
                         plan.from.slug,
                         plan.into.slug,
                         c.memories,
@@ -3903,15 +4174,17 @@ impl Service {
                     )
                 } else {
                     format!(
-                        "Would merge \"{}\" into \"{}\": {} memories, {} chunks, {} sources, {} facts.",
+                        "Would merge \"{}\" into \"{}\": {} memories, {} chunks, {} sources, {} facts.{kept}",
                         plan.from.slug, plan.into.slug, c.memories, c.chunks, c.sources, c.facts
                     )
                 },
                 event_id,
+                rules_carried: rules,
             }
         };
         if req.dry_run {
-            return Ok(answer(false, None, &plan.counts));
+            let carried = project_merge::rules_to_carry(&plan, &from_rules);
+            return Ok(answer(false, None, &plan.counts, &carried));
         }
         match self
             .writer
@@ -3919,12 +4192,13 @@ impl Service {
                 from: req.from,
                 into: req.into,
                 actor: Actor::from_author(&req.author),
+                rules: Box::new(from_rules),
             })
             .await?
         {
             WriteOutcome::ProjectMerged(done) => {
                 let (done, event) = *done;
-                Ok(answer(true, Some(event), &done.counts))
+                Ok(answer(true, Some(event), &done.counts, &done.carried))
             }
             other => Err(unexpected(other)),
         }
@@ -4449,6 +4723,41 @@ fn follow_merges(c: &Connection, m: &alice_core::model::Memory) -> Result<Option
     }))
 }
 
+/// The memory `id` (or legacy id) with the `(content_hash, updated_at)` stamp a guarded write (a
+/// move) is checked against. `None`: no memory has this id.
+///
+/// The stamp is read before the text, as the judge worker reads its items: two autocommit reads
+/// are two snapshots, and an edit landing between them must leave the writer a stamp older than
+/// the text (it refuses the move), never the edit's stamp with the text from before it (the move
+/// would put that old text back over the edit).
+fn stamped_memory(
+    c: &Connection,
+    id: &str,
+) -> Result<Option<(alice_core::model::Memory, String, String)>> {
+    let Some((own, hash, at)) = c
+        .query_row(
+            "SELECT id, content_hash, updated_at FROM memories WHERE id = ?1 OR legacy_id = ?1 ORDER BY seq LIMIT 1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    tests::between_stamp_and_text(&own);
+    let Some(m) = memories::get_many(c, &[own])?.pop() else {
+        return Ok(None);
+    };
+    Ok(Some((m, hash, at)))
+}
+
 /// What the privacy rules say about the text a review resolution writes, before it is sent to
 /// the writer (which does not scan content). `Predicate`/`map`: the two names, redacted (or
 /// refused in `block` mode). `Project`/`move`: the memory arrives in a project whose rules may
@@ -4484,15 +4793,11 @@ fn screen_resolution(
             let Some(target) = projects::resolve_slug(c, &text("to"))? else {
                 return Ok(None); // the writer says the project is gone
             };
-            let Some(m) = memories::get_many(c, &[text("memory_id")])?.pop() else {
+            // The hash and time of the memory screened below: the writer refuses the move if
+            // either changed.
+            let Some((m, content_hash, updated_at)) = stamped_memory(c, &text("memory_id"))? else {
                 return Ok(None);
             };
-            // The hash and time of the memory screened below: the writer refuses the move if either changed.
-            let (content_hash, updated_at): (String, String) = c.query_row(
-                "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
-                [&m.id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
             let tree = projects::tree_of(c, &target.id)?;
             let r = redactors.for_root(tree.as_ref());
             let apply = |field: &str, t: &str| -> Result<(String, bool)> {
@@ -4838,6 +5143,142 @@ mod tests {
         let repo = d.path().join(name);
         std::fs::create_dir(&repo).unwrap();
         Some(repo.to_string_lossy().into_owned())
+    }
+
+    type Hooks = parking_lot::Mutex<HashMap<String, Box<dyn FnMut() + Send>>>;
+
+    /// Run by [`stamped_memory`] between its two reads of the memory with that id (tests only).
+    /// Keyed by id: the reads run on the reader pool's threads, beside other tests.
+    static BETWEEN_STAMP_AND_TEXT: std::sync::LazyLock<Hooks> =
+        std::sync::LazyLock::new(Default::default);
+
+    pub(super) fn between_stamp_and_text(id: &str) {
+        if let Some(f) = BETWEEN_STAMP_AND_TEXT.lock().get_mut(id) {
+            f()
+        }
+    }
+
+    /// From now on (until its entry is removed), another connection to `db` edits memory `id`
+    /// between the two reads of [`stamped_memory`].
+    fn edit_between_the_reads(db: &std::path::Path, id: &str) {
+        let other = rusqlite::Connection::open(db).unwrap();
+        let edit_id = id.to_string();
+        let edit = move || {
+            other
+                .execute(
+                    "UPDATE memories SET body = 'the deploy runs on mondays', content_hash = 'edited', updated_at = '2999-01-01T00:00:00Z' WHERE id = ?1",
+                    [&edit_id],
+                )
+                .unwrap();
+        };
+        BETWEEN_STAMP_AND_TEXT
+            .lock()
+            .insert(id.to_string(), Box::new(edit));
+    }
+
+    /// A move is screened from the memory's text and checked by the writer against the stamp
+    /// read with it. An edit that lands between the two reads must leave the writer a stamp
+    /// older than the text (it then refuses the move), never the edit's stamp with the text from
+    /// before it (the move would then put the old text back over the edit). `screen_move` and
+    /// the review move both read through `stamped_memory`.
+    #[test]
+    fn an_edit_between_the_reads_of_a_move_leaves_a_stamp_the_writer_refuses() {
+        use alice_core::project::ProjectRef;
+        use alice_core::store::memories::{InsertOutcome, NewMemoryInput};
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("a.db");
+        let c = alice_core::store::open_writer(&db).unwrap();
+        let p = projects::upsert_project(
+            &c,
+            &ProjectRef {
+                key: "k/app".into(),
+                slug: "app".into(),
+                name: "app".into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        let m = memories::prepare(
+            NewMemoryInput {
+                content: "the deploy runs on fridays".into(),
+                kind: Some(Kind::Fact),
+                ..Default::default()
+            },
+            &p,
+            "0000000001000-0000-dev".into(),
+        )
+        .unwrap();
+        let InsertOutcome::New { id, .. } = memories::insert(&c, &m).unwrap() else {
+            panic!("duplicate")
+        };
+        let stamp = |c: &Connection| -> (String, String) {
+            c.query_row(
+                "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let before = stamp(&c);
+        // Another writer edits the memory while the move reads it.
+        edit_between_the_reads(&db, &id);
+        let (read, hash, at) = stamped_memory(&c, &id).unwrap().unwrap();
+        BETWEEN_STAMP_AND_TEXT.lock().remove(&id);
+        assert_ne!(stamp(&c), before, "the edit landed");
+        assert_eq!(
+            (hash, at),
+            before,
+            "the stamp is the one from before the edit, so the writer refuses the move"
+        );
+        assert!(
+            read.body.contains("mondays"),
+            "the text read is the edited one"
+        );
+    }
+
+    /// Final re-review 2, M-6: the same through `update`, which pins `screen_move` to
+    /// [`stamped_memory`]: the writer refuses the move, and the edit stays where it was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_screened_across_an_edit_is_refused_and_the_edit_stays() {
+        let (d, s) = svc().await;
+        let mut ids = Vec::new();
+        for (content, dir) in [("the deploy runs on fridays", "a"), ("a note in b", "b")] {
+            let (content, cwd) = (content.into(), repo(&d, dir));
+            let r = s.remember(RememberRequest {
+                content,
+                cwd,
+                ..Default::default()
+            });
+            ids.push(r.await.unwrap().id.unwrap());
+        }
+        wait_settled(&s).await;
+        let id = ids.swap_remove(0);
+        edit_between_the_reads(&s.home().db(), &id);
+        let (action, project) = (UpdateAction::Move, Some("b".into()));
+        let update = MemoryUpdate {
+            action,
+            project,
+            ..Default::default()
+        };
+        let moved = s.update(UpdateRequest {
+            id: id.clone(),
+            update,
+            ..Default::default()
+        });
+        let moved = moved.await;
+        BETWEEN_STAMP_AND_TEXT.lock().remove(&id);
+        let e = moved.expect_err("the writer refuses the move").to_string();
+        assert!(e.contains("was edited while its move"), "{e}");
+        let got = s.get(GetRequest {
+            ids: vec![id],
+            include_provenance: false,
+        });
+        let m = got.await.unwrap().memories.remove(0).memory;
+        assert_eq!(
+            (m.project.as_str(), m.body.as_str()),
+            ("a", "the deploy runs on mondays")
+        );
     }
 
     /// A `remember` queued because the database is read-only holds no secret, and in `block`
@@ -9115,6 +9556,85 @@ mod tests {
                 .await
                 .unwrap();
             assert!(text.text.unwrap().contains("word matches only"));
+        }
+        s.shutdown();
+    }
+
+    /// Two checkouts of one repository (same remote), for the tests of a project's trees.
+    fn checkouts(d: &tempfile::TempDir, names: [&str; 2]) -> [std::path::PathBuf; 2] {
+        names.map(|n| {
+            let dir = d.path().join(n);
+            std::fs::create_dir(&dir).unwrap();
+            for args in [
+                &["init", "-q"][..],
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.com/me/client-x.git",
+                ],
+            ] {
+                let ok = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .status()
+                    .is_ok_and(|s| s.success());
+                assert!(ok, "git {args:?}");
+            }
+            dir
+        })
+    }
+
+    /// Final re-review N-I1: a recall from a stored project is judged by the tree it comes
+    /// from too. The project was last written from a worktree without `.alice.toml` and nothing
+    /// is kept for it yet (every project right after the A-C1 build); a precise recall from the
+    /// main checkout, whose file denies the cloud, sends nothing to the judge, and what it read
+    /// is kept: a recall from the worktree is denied as well.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_from_a_tree_whose_file_denies_the_cloud_never_reaches_the_judge() {
+        let grader = KeywordGrader::new("narwhal");
+        let (d, s) = svc_with_grader(grader.clone()).await;
+        let [main, feat] = checkouts(&d, ["client-x", "client-x-feat"]);
+        std::fs::write(main.join(".alice.toml"), "[privacy]\ncloud_denied = true\n").unwrap();
+        let (main, feat) = (
+            Some(main.to_string_lossy().into_owned()),
+            Some(feat.to_string_lossy().into_owned()),
+        );
+        remember_id(
+            &s,
+            "the narwhal tusk is in the vault",
+            Some(Kind::Fact),
+            &feat,
+        )
+        .await;
+        remember_id(
+            &s,
+            "the narwhal migrates north in spring",
+            Some(Kind::Fact),
+            &feat,
+        )
+        .await;
+        wait_settled(&s).await;
+        let before = grader.graded();
+        for (from, cwd) in [("the main checkout", &main), ("the worktree", &feat)] {
+            let r = s
+                .recall(recall_req(
+                    "where is the narwhal tusk",
+                    RecallMode::Precise,
+                    cwd,
+                ))
+                .await
+                .unwrap();
+            assert!(!r.results.is_empty(), "{from}: words still find them");
+            assert!(!r.reranked, "{from}: {:?}", r.notes);
+            assert!(
+                r.notes.iter().any(|n| n == NOTE_DENIED),
+                "{from}: {:?}",
+                r.notes
+            );
+            assert_eq!(grader.graded(), before, "{from}: nothing went to the judge");
         }
         s.shutdown();
     }

@@ -12,9 +12,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, include_str!("sql/0003_judge.sql")),
     (4, include_str!("sql/0004_import.sql")),
     (5, include_str!("sql/0005_project_merge.sql")),
+    (6, include_str!("sql/0006_project_rules.sql")),
 ];
 
-pub const CURRENT_VERSION: i64 = 5;
+pub const CURRENT_VERSION: i64 = 6;
 
 // CURRENT_VERSION must name the newest migration.
 const _: () = assert!(MIGRATIONS[MIGRATIONS.len() - 1].0 == CURRENT_VERSION);

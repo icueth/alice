@@ -4,7 +4,7 @@
 //! Safety order inside `Mapper::map`: clean the text, redact the WHOLE text, only then split by
 //! size, and re-check byte sizes after redaction (a marker can be longer than the secret).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use chrono::{FixedOffset, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone};
@@ -169,6 +169,18 @@ pub trait TextFilter: Sync {
     fn changed(&self, before: &str, after: &str) -> bool {
         before != after
     }
+    /// `text` screened with the rules of the project `slug` (the one the drawer goes to), when
+    /// that project has rules beyond [`filter`](Self::filter)'s (its `.alice.toml`, rules a
+    /// project merge carried into it). Those rules include `filter`'s. `None`: the project adds
+    /// nothing and `filter` decides alone.
+    fn for_project(
+        &self,
+        _slug: &str,
+        _field: &str,
+        _text: &str,
+    ) -> Option<Result<String, Vec<String>>> {
+        None
+    }
 }
 
 pub struct NoFilter;
@@ -207,15 +219,24 @@ pub enum Planned {
     },
 }
 
-/// Runs every emitted string through the filter and remembers which detectors blocked.
+/// Runs every emitted string through the filter and remembers which detectors blocked. Once the
+/// drawer's project is known, the strings go through that project's rules instead (when it has
+/// rules of its own), except the source uri: it names the file the chunks' positions belong to,
+/// and stays as the import's own rules leave it.
 struct Guard<'a> {
     filter: &'a dyn TextFilter,
     blocked: BTreeSet<String>,
+    project: Option<String>,
 }
 
 impl Guard<'_> {
     fn apply(&mut self, field: &str, text: &str) -> String {
-        match self.filter.filter(field, text) {
+        let project = self
+            .project
+            .as_deref()
+            .filter(|_| field != "source.uri")
+            .and_then(|p| self.filter.for_project(p, field, text));
+        match project.unwrap_or_else(|| self.filter.filter(field, text)) {
             Ok(t) => t,
             Err(detectors) => {
                 self.blocked.extend(detectors);
@@ -391,6 +412,7 @@ impl Mapper<'_> {
         let mut g = Guard {
             filter: self.filter,
             blocked: BTreeSet::new(),
+            project: None,
         };
         let field = if tier == Tier::Knowledge {
             "content"
@@ -407,6 +429,17 @@ impl Mapper<'_> {
             self.wings.decide_diary(&d.meta, &text)
         } else {
             self.wings.decide(&d.meta, &text)
+        };
+        // (c') the project's own rules, when it has any: the whole text again, still before
+        // anything is split, and every string from here on.
+        g.project = Some(project.slug.clone());
+        let text = match self.filter.for_project(&project.slug, field, &cleaned) {
+            None => text,
+            Some(Ok(t)) => t,
+            Some(Err(detectors)) => {
+                g.blocked.extend(detectors);
+                return g.into_planned();
+            }
         };
         let out = if tier == Tier::Knowledge {
             let extra: Vec<String> = members
@@ -650,8 +683,9 @@ pub struct Survey {
     /// The checkpoint diaries, the same way: earliest filed first, one id per drawer.
     pub checkpoint_order: Vec<String>,
     /// First fragment's id -> the ids of all the fragments of that drawer in order (first
-    /// included). Only drawers of two or more fragments are here; this is the one place the
-    /// survey keeps anything per fragment, and it holds ids only.
+    /// included), for knowledge, checkpoint and raw drawers alike. Only drawers of two or more
+    /// fragments are here; with `raw_tails`, this is the one place the survey keeps anything
+    /// per fragment, and it holds ids only.
     pub fragments: HashMap<String, Vec<String>>,
     /// Raw drawer id -> ord inside its source.
     pub ords: HashMap<String, i64>,
@@ -663,6 +697,13 @@ pub struct Survey {
     pub tiers: TierCounts,
     /// Raw drawer id -> source uri.
     pub raw_source_of: HashMap<String, String>,
+    /// The fragments of raw drawers (two or more fragments) other than the first: each is
+    /// planned with its drawer, under the first fragment's id (`fragments` lists them).
+    pub raw_tails: HashSet<String>,
+    /// First fragment's id -> the id MemPalace answered for the drawer it cut (its fragments'
+    /// `parent_drawer_id`, else the id they share), which its get, update and delete accept.
+    /// Only drawers of two or more fragments whose id is not a drawer of its own.
+    pub logical_ids: HashMap<String, String>,
 }
 
 /// What the survey keeps per knowledge or checkpoint drawer (or fragment of one): no text.
@@ -674,6 +715,16 @@ struct Fragment {
     filed: String,
     /// A checkpoint's source uri.
     uri: Option<String>,
+    /// `parent_drawer_id`: the id MemPalace answered for the drawer this fragment is part of.
+    parent: Option<String>,
+}
+
+/// What the survey keeps per fragment of a raw drawer: its row, its place in the drawer and the
+/// id MemPalace answered for the drawer (`parent_drawer_id`).
+struct RawFragment {
+    index: Option<i64>,
+    parent: Option<String>,
+    row: RawRow,
 }
 
 /// What the survey keeps per raw drawer: no text.
@@ -743,6 +794,10 @@ fn survey_paged(
     // (ids and times, no text).
     let mut drawers: HashMap<(String, bool, bool), Vec<Fragment>> = HashMap::new();
     let mut sources: HashMap<String, Vec<RawRow>> = HashMap::new();
+    // Fragments of raw drawers by (drawer id, source uri), with their place in the drawer: ids,
+    // times and hashes only. MemPalace cuts few drawers that carry a source file (79 fragments
+    // on the owner's palace).
+    let mut raw_fragments: HashMap<(String, String), Vec<RawFragment>> = HashMap::new();
     let mut after: Option<String> = None;
     loop {
         let page = reader.page(after.as_deref(), page_size, since)?;
@@ -770,6 +825,7 @@ fn survey_paged(
                         index: fragment_index(&d.id, &d.meta),
                         uri: checkpoint.then(|| checkpoint_uri(&d.meta)),
                         filed,
+                        parent: d.meta.parent_drawer_id.clone(),
                         id: d.id,
                     };
                     // Fragments are gathered under their drawer's id; anything else is a drawer of its own.
@@ -806,6 +862,8 @@ fn survey_paged(
                             span.1 = Some(t);
                         }
                     }
+                    let index = fragment_index(&d.id, &d.meta);
+                    let parent = d.meta.parent_drawer_id.clone();
                     let row = RawRow {
                         hash: text_hash(&d.text),
                         chunk_index: d.meta.chunk_index,
@@ -817,6 +875,15 @@ fn survey_paged(
                             .unwrap_or_default(),
                         id: d.id,
                     };
+                    // A fragment of a drawer MemPalace cut waits for the others of its drawer
+                    // (same source): the drawer becomes one row once they are all seen.
+                    if let Some((base, _)) = chunk_suffix(&row.id) {
+                        raw_fragments
+                            .entry((base.to_string(), uri))
+                            .or_default()
+                            .push(RawFragment { index, parent, row });
+                        continue;
+                    }
                     out.raw_source_of.insert(row.id.clone(), uri.clone());
                     sources.entry(uri).or_default().push(row);
                 }
@@ -827,9 +894,24 @@ fn survey_paged(
     counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out.wing_counts = counts;
 
+    // The id MemPalace answered for a drawer it cut is filed with the drawer unless the palace
+    // holds a drawer of that id in its own right (that drawer keeps its id).
+    let own_ids: HashSet<String> = drawers
+        .keys()
+        .filter(|(_, _, fragment)| !fragment)
+        .map(|(id, _, _)| id.clone())
+        .collect();
+    let mut out_logical: HashMap<String, String> = HashMap::new();
+    let mut logical =
+        |head: &str, parent: Option<&String>, base: &str, raw_ids: &HashMap<String, String>| {
+            let id = parent.map_or(base, String::as_str);
+            if !id.is_empty() && !own_ids.contains(id) && !raw_ids.contains_key(id) {
+                out_logical.insert(head.to_string(), id.to_string());
+            }
+        };
     let mut knowledge: Vec<(String, String)> = Vec::new();
     let mut checkpoints: Vec<(String, String)> = Vec::new();
-    for ((_, checkpoint, _), mut members) in drawers {
+    for ((base, checkpoint, _), mut members) in drawers {
         members.sort_by(|a, b| {
             (a.index.unwrap_or(i64::MAX), &a.id).cmp(&(b.index.unwrap_or(i64::MAX), &b.id))
         });
@@ -866,6 +948,7 @@ fn survey_paged(
             knowledge.push((filed, head.clone()));
         }
         if members.len() > 1 {
+            logical(&head, members[0].parent.as_ref(), &base, &out.raw_source_of);
             out.fragments
                 .insert(head, members.into_iter().map(|m| m.id).collect());
         }
@@ -876,6 +959,48 @@ fn survey_paged(
     };
     out.knowledge_order = order(knowledge);
     out.checkpoint_order = order(checkpoints);
+
+    // A raw drawer of two or more fragments is one row of its source, under its first fragment:
+    // one position, and one hash made of the fragments' hashes in order (a repeat of the whole
+    // drawer collapses onto it). Its text is joined, then redacted whole, by the planner.
+    for ((base, uri), mut members) in raw_fragments {
+        if members.len() == 1 {
+            let row = members.remove(0).row;
+            out.raw_source_of.insert(row.id.clone(), uri.clone());
+            sources.entry(uri).or_default().push(row);
+            continue;
+        }
+        members.sort_by(|a, b| {
+            (a.index.unwrap_or(i64::MAX), &a.row.id).cmp(&(b.index.unwrap_or(i64::MAX), &b.row.id))
+        });
+        let mut digest = Sha256::new();
+        digest.update(b"fragments\0");
+        for m in &members {
+            digest.update(m.row.hash);
+        }
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(&digest.finalize()[..16]);
+        let filed = members
+            .iter()
+            .map(|m| m.row.filed.as_str())
+            .filter(|f| !f.is_empty())
+            .min()
+            .unwrap_or("")
+            .to_string();
+        let ids: Vec<String> = members.iter().map(|m| m.row.id.clone()).collect();
+        let head = ids[0].clone();
+        logical(&head, members[0].parent.as_ref(), &base, &out.raw_source_of);
+        out.raw_tails.extend(ids[1..].iter().cloned());
+        out.raw_source_of.insert(head.clone(), uri.clone());
+        sources.entry(uri).or_default().push(RawRow {
+            id: head.clone(),
+            chunk_index: members[0].row.chunk_index,
+            filed,
+            hash,
+        });
+        out.fragments.insert(head, ids);
+    }
+    out.logical_ids = out_logical;
 
     for (uri, mut rows) in sources {
         rows.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
@@ -946,22 +1071,23 @@ impl Planner<'_> {
     /// `Collapsed` when the survey folded this drawer into a keeper, else `Mapper::map` with the
     /// survey's ord and the source's time span.
     pub fn plan(&self, d: &Drawer) -> Planned {
-        if let Some(keeper) = self.survey.collapsed.get(&d.id) {
-            return Planned::Collapsed {
-                keeper: keeper.clone(),
-            };
-        }
         self.plan_members(std::slice::from_ref(d))
     }
 
     /// A drawer MemPalace cut into fragments (`Survey::fragments` lists their ids): `members`
-    /// are all of them, first fragment first. Planned as the one drawer they make up.
+    /// are all of them, first fragment first. Planned as the one drawer they make up (a raw
+    /// one may have collapsed onto an earlier identical drawer).
     pub fn plan_group(&self, members: &[Drawer]) -> Planned {
         self.plan_members(members)
     }
 
     fn plan_members(&self, members: &[Drawer]) -> Planned {
         let d = &members[0];
+        if let Some(keeper) = self.survey.collapsed.get(&d.id) {
+            return Planned::Collapsed {
+                keeper: keeper.clone(),
+            };
+        }
         let tier = classify(&d.id, &d.meta);
         let ord = match self.survey.ords.get(&d.id) {
             Some(o) => *o,
@@ -2365,6 +2491,139 @@ mod tests {
         });
         assert_eq!(sv.ords["diary_h"], 3);
         assert_eq!(sv.ords["diary_g"], 4);
+    }
+
+    fn raw_file_spec(id: &str, text: &str, ci: Option<i64>) -> DrawerSpec {
+        spec(
+            id,
+            text,
+            DrawerMeta {
+                wing: "devspace".into(),
+                room: "notes".into(),
+                source_file: s("/h/notes/todo.md"),
+                added_by: s("claude"),
+                chunk_index: ci,
+                filed_at: s("2026-04-16T11:00:00"),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The members of `head`'s drawer, read back from the palace in the survey's order.
+    fn members_of(r: &dyn PalaceReader, sv: &Survey, head: &str) -> Vec<Drawer> {
+        let ids = &sv.fragments[head];
+        let by_id: std::collections::HashMap<_, _> = r
+            .get(ids)
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.id.clone(), d))
+            .collect();
+        ids.iter().map(|i| by_id[i].clone()).collect()
+    }
+
+    /// A raw-file drawer MemPalace cut into fragments is one row of its source: one position,
+    /// one hash (a repeat of the whole drawer collapses onto it), and the planner joins it
+    /// before anything else, like a knowledge drawer. Single fragments and mined chunks of the
+    /// same file stay rows of their own.
+    #[test]
+    fn raw_file_fragments_are_one_row_of_their_source_and_are_planned_as_one_chunk() {
+        let specs = vec![
+            raw_file_spec("drawer_n_chunk_000001", "second half", Some(1)),
+            raw_file_spec("drawer_n_chunk_000000", "first half, ", Some(0)),
+            // The same text cut the same way, filed again for the same file.
+            raw_file_spec("drawer_r_chunk_000000", "first half, ", Some(0)),
+            raw_file_spec("drawer_r_chunk_000001", "second half", Some(1)),
+            raw_file_spec("drawer_s_chunk_000000", "solo", Some(0)),
+            raw_file_spec("mined_1", "mined text", Some(3)),
+        ];
+        let (_a, _b, r) = open_fixture(&specs, |_| {});
+        let mut wm = wings();
+        let sv = survey(r.as_ref(), None, &mut wm, utc(), &no_reserved).unwrap();
+        assert_eq!((sv.total, sv.tiers.raw_file), (6, 6));
+        let head = "drawer_n_chunk_000000";
+        assert_eq!(
+            sv.fragments[head],
+            vec!["drawer_n_chunk_000000", "drawer_n_chunk_000001"]
+        );
+        assert!(sv.ords.contains_key(head));
+        assert!(!sv.ords.contains_key("drawer_n_chunk_000001"));
+        assert!(sv.raw_tails.contains("drawer_n_chunk_000001"));
+        assert!(!sv.raw_tails.contains(head));
+        assert_eq!(
+            sv.collapsed
+                .get("drawer_r_chunk_000000")
+                .map(String::as_str),
+            Some(head),
+            "a repeat of the whole drawer collapses onto it"
+        );
+        assert!(sv.raw_tails.contains("drawer_r_chunk_000001"));
+        for single in ["drawer_s_chunk_000000", "mined_1"] {
+            assert!(sv.ords.contains_key(single), "{single}");
+        }
+        let ords: Set<i64> = sv.ords.values().copied().collect();
+        assert_eq!(ords.len(), sv.ords.len(), "positions are unique");
+
+        let f = NoFilter;
+        let planner = Planner {
+            mapper: Mapper {
+                wings: &wm,
+                assume: utc(),
+                filter: &f,
+            },
+            survey: &sv,
+        };
+        let Planned::Chunks(c) = planner.plan_group(&members_of(r.as_ref(), &sv, head)) else {
+            panic!("chunks")
+        };
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].chunk.text, "first half, second half");
+        assert_eq!(c[0].legacy_id, head);
+        assert_eq!(c[0].chunk.ord, sv.ords[head]);
+        assert!(matches!(
+            planner.plan_group(&members_of(r.as_ref(), &sv, "drawer_r_chunk_000000")),
+            Planned::Collapsed { keeper } if keeper == head
+        ));
+    }
+
+    /// The id MemPalace answered for a drawer it cut (the fragments' `parent_drawer_id`, else
+    /// the id they share) is kept for the drawer, so the import can file it with it. A drawer
+    /// that was never cut has none, a lone fragment has none, and neither has a drawer whose
+    /// shared id is a drawer of the palace in its own right.
+    #[test]
+    fn the_survey_keeps_the_id_mempalace_answered_for_a_drawer_it_cut() {
+        let t = "2026-04-16T11:00:00";
+        let parented = |id: &str, ci: i64| {
+            let mut sp = diary_spec(id, id, "setup", Some(ci), t);
+            sp.meta.parent_drawer_id = s("diary_p_logical");
+            sp
+        };
+        let specs = vec![
+            diary_spec("diary_a_chunk_000000", "a", "setup", Some(0), t),
+            diary_spec("diary_a_chunk_000001", "b", "setup", Some(1), t),
+            parented("diary_p_chunk_000000", 0),
+            parented("diary_p_chunk_000001", 1),
+            diary_spec("diary_x", "x itself", "setup", None, t),
+            diary_spec("diary_x_chunk_000000", "x0", "setup", Some(0), t),
+            diary_spec("diary_x_chunk_000001", "x1", "setup", Some(1), t),
+            diary_spec("diary_c", "never cut", "setup", None, t),
+            diary_spec("diary_d_chunk_000000", "solo", "setup", Some(0), t),
+            diary_spec("diary_e_chunk_000000", "cp1", "checkpoint", Some(0), t),
+            diary_spec("diary_e_chunk_000001", "cp2", "checkpoint", Some(1), t),
+            raw_file_spec("drawer_n_chunk_000000", "first half, ", Some(0)),
+            raw_file_spec("drawer_n_chunk_000001", "second half", Some(1)),
+        ];
+        let mut wm = wings();
+        let sv = run(&specs, None, &mut wm, &no_reserved);
+        let want: std::collections::HashMap<String, String> = [
+            ("diary_a_chunk_000000", "diary_a"),
+            ("diary_p_chunk_000000", "diary_p_logical"),
+            ("diary_e_chunk_000000", "diary_e"),
+            ("drawer_n_chunk_000000", "drawer_n"),
+        ]
+        .into_iter()
+        .map(|(h, l)| (h.to_string(), l.to_string()))
+        .collect();
+        assert_eq!(sv.logical_ids, want);
     }
 
     #[test]

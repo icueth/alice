@@ -1153,3 +1153,144 @@ async fn a_remote_provider_gets_text_redacted_with_todays_rules_whatever_was_sto
     assert!(body.contains(token));
     s.shutdown();
 }
+
+/// Final re-review N-I1: a recall from a stored project's tree whose `.alice.toml` denies the
+/// cloud sends no query to a remote embedder, although the project was last written from a
+/// worktree without the file; and the project's later writes stay at home.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_from_a_tree_whose_file_denies_the_cloud_is_not_sent_to_a_remote_embedder() {
+    let mock = Mock::start();
+    let d = tempfile::tempdir().unwrap();
+    let s = start(
+        d.path(),
+        options(http_factory(true, Arc::default())),
+        &remote_toml(&mock, "m", ""),
+    );
+    until("the provider's embedder to be built", 15, || async {
+        s.model() == "openai:m"
+    })
+    .await;
+    let [main, feat] = ["client-x", "client-x-feat"].map(|n| {
+        let dir = d.path().join(n);
+        std::fs::create_dir(&dir).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/me/client-x.git",
+            ],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "git {args:?}");
+        }
+        Some(dir.to_string_lossy().into_owned())
+    });
+    std::fs::write(
+        std::path::Path::new(main.as_deref().unwrap()).join(".alice.toml"),
+        "[privacy]\ncloud_denied = true\n",
+    )
+    .unwrap();
+    let remember = |cwd: &Option<String>, text: &str| {
+        let (s, cwd, text) = (s.clone(), cwd.clone(), text.to_string());
+        async move {
+            s.remember(RememberRequest {
+                content: text,
+                cwd,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+        }
+    };
+    remember(&feat, "the pelican nests by the harbour").await;
+    settled(&s).await;
+    assert!(mock.saw("pelican"), "nothing said otherwise yet");
+    let sent = mock.texts().len();
+    let r = s
+        .recall(RecallRequest {
+            query: "where does the pelican nest".into(),
+            cwd: main.clone(),
+            format: OutputFormat::Json,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        r.notes.iter().any(|n| n.contains("word matches only")),
+        "{:?}",
+        r.notes
+    );
+    assert_eq!(mock.texts().len(), sent, "the query never left");
+    remember(&feat, "the walrus colony is on the north shore").await;
+    settled(&s).await;
+    assert!(
+        !mock.saw("walrus"),
+        "the project stays at home from every tree"
+    );
+    assert_eq!(state_of(&s, "walrus").await, "skipped_cloud");
+    s.shutdown();
+}
+
+/// Final re-review 2, I-1: a recall from the checkout of a stored project whose carried rules
+/// the store cannot read (its `project_rules` table is missing: another branch's migration took
+/// the number) sends no query to a remote embedder. The project is judged closed, not by the
+/// checkout's own file alone, which would let the query out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_from_a_project_whose_carried_rules_cannot_be_read_is_not_sent() {
+    let mock = Mock::start();
+    let d = tempfile::tempdir().unwrap();
+    let s = start(
+        d.path(),
+        options(http_factory(true, Arc::default())),
+        &remote_toml(&mock, "m", ""),
+    );
+    until("the provider's embedder to be built", 15, || async {
+        s.model() == "openai:m"
+    })
+    .await;
+    let cwd = repo(&d, "client-y");
+    s.remember(RememberRequest {
+        content: "the pelican nests by the harbour".into(),
+        cwd: cwd.clone(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    settled(&s).await;
+    let recall = || {
+        s.recall(RecallRequest {
+            query: "where does the pelican nest".into(),
+            cwd: cwd.clone(),
+            format: OutputFormat::Json,
+            ..Default::default()
+        })
+    };
+    let sent = mock.texts().len();
+    recall().await.unwrap();
+    assert!(
+        mock.texts().len() > sent,
+        "the query leaves while the rules can be read"
+    );
+
+    rusqlite::Connection::open(crate::paths::AliceHome::new(d.path().to_path_buf()).db())
+        .unwrap()
+        .execute_batch("DROP TABLE project_rules")
+        .unwrap();
+    let sent = mock.texts().len();
+    let r = recall().await.unwrap();
+    assert!(
+        r.notes.iter().any(|n| n.contains("word matches only")),
+        "{:?}",
+        r.notes
+    );
+    assert_eq!(mock.texts().len(), sent, "the query never left");
+    s.shutdown();
+}

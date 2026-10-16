@@ -1014,6 +1014,30 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         }
         Command::Update(a) => {
             let moved = matches!(a.action, ActionArg::Move);
+            // A flag the action does not use would be dropped without a word: refuse it here,
+            // before any daemon is asked (the daemon refuses the same for other clients).
+            if moved {
+                let extra: Vec<&str> = [
+                    ("--title", a.title.is_some()),
+                    ("--body", a.body.is_some()),
+                    ("--kind", a.kind.is_some()),
+                    ("--importance", a.importance.is_some()),
+                    ("--by", a.by.is_some()),
+                ]
+                .into_iter()
+                .filter_map(|(flag, given)| given.then_some(flag))
+                .collect();
+                if !extra.is_empty() {
+                    bail!(
+                        "--action move takes only --project ({} given too); move the memory first, then change it with --action edit",
+                        extra.join(", ")
+                    );
+                }
+            } else if a.project.is_some() {
+                bail!(
+                    "--project is only for --action move; to move the memory run `alice update <id> --action move --project <slug>`"
+                );
+            }
             let action = match a.action {
                 ActionArg::Edit => UpdateAction::Edit,
                 ActionArg::Supersede => UpdateAction::Supersede,
@@ -1031,6 +1055,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                 importance: a.importance,
                 superseded_by: a.by,
                 project: a.project,
+                screened: None,
             };
             let r = client(&home)
                 .await?

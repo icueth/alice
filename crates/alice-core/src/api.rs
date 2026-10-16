@@ -445,6 +445,11 @@ pub struct ProjectMergeResponse {
     /// The event that recorded the merge: `alice undo <event_id>` reverses it.
     pub event_id: Option<String>,
     pub message: String,
+    /// The privacy rules of `from` that `into` keeps from now on (`cloud_denied`,
+    /// `block_secrets`, `custom:<name>`; never a pattern's expression), whether or not `into`
+    /// already had them. For a dry run: what the merge would carry.
+    #[serde(default)]
+    pub rules_carried: Vec<String>,
 }
 
 /// Apply one of a review item's choices.
