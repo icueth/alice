@@ -1,5 +1,6 @@
 //! `alice`: long-term memory for AI coding agents.
 
+mod backfill;
 mod bench;
 mod cmd;
 mod hook;
