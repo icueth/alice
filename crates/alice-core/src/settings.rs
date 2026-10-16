@@ -292,6 +292,8 @@ pub struct Settings {
     pub secrets: SecretsSettings,
     /// Background jobs that keep the store tidy.
     pub maintenance: MaintenanceSettings,
+    /// Importing from other memory systems.
+    pub import: ImportSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
@@ -680,6 +682,26 @@ impl Default for BackupSettings {
             daily: 7,
             weekly: 4,
             dir: None,
+        }
+    }
+}
+
+/// Importing a MemPalace palace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImportSettings {
+    /// Largest palace archive a server tenant may upload (`POST /api/v1/import/upload`), in
+    /// bytes. The server's web front applies the same limit.
+    pub max_upload_bytes: u64,
+}
+
+/// The default of [`ImportSettings::max_upload_bytes`]: 4 GiB.
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+impl Default for ImportSettings {
+    fn default() -> Self {
+        Self {
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
         }
     }
 }
@@ -1604,6 +1626,10 @@ impl Settings {
                 "backup.dir",
                 "must not be empty; remove it for the default",
             ));
+        }
+
+        if self.import.max_upload_bytes < 1 {
+            e.push(err("import.max_upload_bytes", "must be at least 1"));
         }
 
         let mt = &self.maintenance;
@@ -2658,6 +2684,20 @@ mod tests {
         assert_eq!((s.backup.daily, s.backup.weekly), (7, 4));
         assert_eq!(s.secrets.backend, SecretsBackend::File);
         assert!(!s.mcp.admin_tools);
+    }
+
+    #[test]
+    fn the_upload_limit_defaults_to_4_gib_and_must_be_positive() {
+        let r = resolve(None, &[]).unwrap();
+        assert_eq!(r.settings.import.max_upload_bytes, 4 * 1024 * 1024 * 1024);
+        let r = resolve(Some("[import]\nmax_upload_bytes = 1000\n"), &[]).unwrap();
+        assert_eq!(r.settings.import.max_upload_bytes, 1000);
+        let from_env = resolve(None, &env(&[("ALICE_IMPORT_MAX_UPLOAD_BYTES", "2048")])).unwrap();
+        assert_eq!(from_env.settings.import.max_upload_bytes, 2048);
+        assert_eq!(
+            error_keys("[import]\nmax_upload_bytes = 0\n", &[]),
+            vec!["import.max_upload_bytes".to_string()]
+        );
     }
 
     /// Task 21: `search.default_mode` is `auto` (the default), `fast` or `precise`; anything

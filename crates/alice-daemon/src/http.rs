@@ -603,8 +603,133 @@ async fn compat_call(
     }
 }
 
+/// The upload script a person runs on their own machine: static text compiled into the binary,
+/// with no secret and no address in it. Only a server tenant serves it.
+const UPLOAD_SCRIPT: &str = include_str!("../assets/upload.sh");
+
+async fn upload_script(State(st): State<AppState>) -> Response {
+    if !st.svc.is_tenant() {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "not found: the upload script is only served by a server tenant".into(),
+        );
+    }
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        UPLOAD_SCRIPT,
+    )
+        .into_response()
+}
+
 async fn import_status(State(st): State<AppState>) -> Json<alice_core::import::ImportStatus> {
-    Json(st.svc.import_status())
+    let mut status = st.svc.import_status();
+    // How much of the imported text still waits for a vector (0 when it cannot be read now).
+    status.embedding_backlog = st.svc.embed_backlog().await.unwrap_or(0);
+    Json(status)
+}
+
+#[derive(serde::Deserialize, Default)]
+struct UploadQuery {
+    /// The same switch as `--allow-remote-embedding`.
+    #[serde(default)]
+    allow_remote_embedding: bool,
+}
+
+fn upload_refusal(e: crate::service::UploadError) -> Response {
+    use crate::service::UploadError;
+    match e {
+        UploadError::Conflict(m) => refuse(StatusCode::CONFLICT, "conflict", m),
+        UploadError::TooLarge(m) => refuse(StatusCode::PAYLOAD_TOO_LARGE, "too_large", m),
+        UploadError::Other(e) => ApiError(e).into_response(),
+    }
+}
+
+/// `POST /api/v1/import/upload` (server tenants): the body is a gzip tar of the person's
+/// MemPalace, streamed to a file in `import-inbox/` and never held in memory. The answer is 202
+/// once it is stored; unpacking and importing go on in the background
+/// (`GET /api/v1/import/status`).
+async fn upload_import(
+    State(st): State<AppState>,
+    query: Result<Query<UploadQuery>, QueryRejection>,
+    req: Request,
+) -> Response {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    if !st.svc.is_tenant() {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "not found: uploads are only for a server tenant".into(),
+        );
+    }
+    let Query(q) = match query {
+        Ok(q) => q,
+        Err(r) => {
+            return ApiError(AliceError::Invalid(format!(
+                "{}; the only option is ?allow_remote_embedding=true",
+                r.body_text()
+            )))
+            .into_response();
+        }
+    };
+    let declared = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    // Admitted (and the one import slot taken) before the first byte of the body is read.
+    let mut ticket = match st.svc.upload_begin(declared, q.allow_remote_embedding) {
+        Ok(t) => t,
+        Err(e) => return upload_refusal(e),
+    };
+    // Declared after the ticket: dropped first, so the file is closed before it is deleted.
+    let file = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(ticket.archive_path())
+    };
+    let mut file = match file {
+        Ok(f) => tokio::fs::File::from_std(f),
+        Err(e) => {
+            ticket.fail(format!("the server cannot store the upload ({e})"));
+            return ApiError(AliceError::Io(e)).into_response();
+        }
+    };
+    let mut body = req.into_body().into_data_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                ticket.fail(format!("the upload broke off before it was complete ({e})"));
+                return ApiError(AliceError::invalid(format!(
+                    "the upload broke off before it was complete ({e})"
+                )))
+                .into_response();
+            }
+        };
+        if let Err(e) = ticket.account(chunk.len() as u64) {
+            return upload_refusal(e);
+        }
+        if let Err(e) = file.write_all(&chunk).await {
+            ticket.fail(format!("the server cannot store the upload ({e})"));
+            return ApiError(AliceError::Io(e)).into_response();
+        }
+    }
+    if let Err(e) = file.flush().await {
+        ticket.fail(format!("the server cannot store the upload ({e})"));
+        return ApiError(AliceError::Io(e)).into_response();
+    }
+    drop(file);
+    match ticket.finish() {
+        Ok(status) => (StatusCode::ACCEPTED, Json(status)).into_response(),
+        Err(e) => upload_refusal(e),
+    }
 }
 
 /// A refused settings change: the first problem as `error` (like every refusal), and all of
@@ -807,7 +932,7 @@ async fn end_on_rotation(State(st): State<AppState>, req: Request, next: Next) -
     Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
-/// Build the router: the public ping, and everything else (the JSON API and the MCP service
+/// Build the router: the public ping and upload script, and everything else (the JSON API and the MCP service
 /// at `/mcp`) behind the token, Host and Origin guard.
 pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: CancellationToken) -> Router {
     let token: SharedToken = Arc::new(parking_lot::RwLock::new(Arc::from(token)));
@@ -821,6 +946,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
     };
     let public = Router::new()
         .route("/api/v1/ping", get(ping))
+        .route("/api/v1/import/upload.sh", get(upload_script))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(g.clone(), host_guard));
     let private = Router::new()
@@ -859,6 +985,11 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         )
         .route("/api/v1/import/mempalace", post(start_import))
         .route("/api/v1/import/status", get(import_status))
+        // The body is the archive itself, streamed to disk: the JSON limit does not apply.
+        .route(
+            "/api/v1/import/upload",
+            post(upload_import).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/v1/compat/call", post(compat_call))
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         .route("/api/v1/admin/token/rotate", post(rotate_token))

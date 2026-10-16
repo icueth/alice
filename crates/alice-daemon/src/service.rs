@@ -286,6 +286,141 @@ scoped!(
 /// A tenant import must leave at least this many bytes free once its copy exists.
 pub const IMPORT_MIN_FREE_AFTER: u64 = 2_000_000_000;
 
+fn too_large_message(n: u64, cap: u64) -> String {
+    format!(
+        "the upload is {n} bytes, over the limit of {cap} bytes (import.max_upload_bytes); upload a smaller palace or ask the server's admin to raise the limit"
+    )
+}
+
+/// Why an upload was not admitted or stopped.
+#[derive(Debug)]
+pub enum UploadError {
+    /// Another import holds the slot (409).
+    Conflict(String),
+    /// Over `import.max_upload_bytes` (413).
+    TooLarge(String),
+    Other(AliceError),
+}
+
+impl From<AliceError> for UploadError {
+    fn from(e: AliceError) -> Self {
+        Self::Other(e)
+    }
+}
+
+/// An admitted upload: it holds the one import slot until [`finish`](Self::finish) hands it to
+/// the job thread. Dropped before that (a refusal, a broken connection), it deletes the
+/// partial archive and leaves the status `failed` with the reason.
+pub struct UploadTicket {
+    svc: Arc<Service>,
+    archive: PathBuf,
+    dir: PathBuf,
+    job_id: String,
+    cap: u64,
+    declared: Option<u64>,
+    received: u64,
+    guard: Option<crate::maintenance::OwnedActivityGuard>,
+    allow_remote_embedding: bool,
+    reason: Option<String>,
+    armed: bool,
+}
+
+impl UploadTicket {
+    /// Where the body is to be stored; the file must not exist yet.
+    pub fn archive_path(&self) -> &Path {
+        &self.archive
+    }
+
+    /// Counts `n` more bytes that arrived (and are being stored). Over the cap, or without
+    /// room on the disk any more, the upload ends here: the error says why.
+    pub fn account(&mut self, n: u64) -> std::result::Result<(), UploadError> {
+        self.received = self.received.saturating_add(n);
+        self.svc.import.lock().status.lock().bytes_received = self.received;
+        if self.received > self.cap {
+            let msg = too_large_message(self.received, self.cap);
+            self.reason = Some(msg.clone());
+            return Err(UploadError::TooLarge(msg));
+        }
+        let size = self.declared.unwrap_or(0).max(self.received);
+        if let Err(e) = self.svc.check_upload_room(size, self.received) {
+            self.reason = Some(e.to_string());
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// Records why the upload ends, when it is not one of [`account`](Self::account)'s errors.
+    pub fn fail(&mut self, why: impl Into<String>) {
+        self.reason = Some(why.into());
+    }
+
+    /// The whole body is stored: answers with the status (`unpacking`) and runs the rest on a
+    /// thread of its own.
+    pub fn finish(mut self) -> std::result::Result<alice_core::import::ImportStatus, UploadError> {
+        use alice_core::import::ImportState;
+        if self.received == 0 {
+            self.fail("the upload was empty; send the palace as a gzip tar in the request body");
+            return Err(AliceError::invalid(
+                "the upload is empty; send the palace as a gzip tar in the request body",
+            )
+            .into());
+        }
+        let svc = self.svc.clone();
+        let mut slot = svc.import.lock();
+        {
+            let mut st = slot.status.lock();
+            st.state = ImportState::Unpacking;
+            st.phase = "unpacking".to_string();
+            st.bytes_received = self.received;
+        }
+        let guard = self.guard.take().expect("the guard is held until finish");
+        let env = svc.import_env(&slot, guard);
+        let req = alice_core::import::ImportRequest {
+            allow_remote_embedding: self.allow_remote_embedding,
+            ..Default::default()
+        };
+        let job = importer::UploadJob {
+            archive: self.archive.clone(),
+            archive_len: self.received,
+            dir: self.dir.clone(),
+            cap: self.cap,
+        };
+        match importer::spawn_upload(env, req, job, self.job_id.clone()) {
+            Ok(handle) => {
+                slot.handle = Some(handle);
+                self.armed = false;
+                let st = slot.status.lock().clone();
+                Ok(st)
+            }
+            Err(e) => {
+                self.fail("the server could not start the import");
+                Err(AliceError::Other(format!("could not start the import thread: {e}")).into())
+            }
+        }
+    }
+}
+
+impl Drop for UploadTicket {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.archive);
+        let _ = std::fs::remove_dir_all(&self.dir);
+        let slot = self.svc.import.lock();
+        let mut st = slot.status.lock();
+        if st.state == alice_core::import::ImportState::Receiving
+            || st.job_id.as_deref() == Some(self.job_id.as_str())
+                && st.state == alice_core::import::ImportState::Unpacking
+        {
+            st.state = alice_core::import::ImportState::Failed;
+            st.error = Some(self.reason.take().unwrap_or_else(|| {
+                "the upload ended before the whole archive arrived; upload it again".to_string()
+            }));
+        }
+    }
+}
+
 /// The total size of the regular files under `dir`; links are counted for nothing and not followed.
 fn tree_size(dir: &Path) -> u64 {
     let mut total = 0u64;
@@ -916,6 +1051,16 @@ impl Service {
         home.ensure_dirs()?;
         // No import can be running at start: whatever an earlier one left is garbage.
         let _ = std::fs::remove_dir_all(home.import_tmp());
+        // ... and so is an upload a crash cut short (archives and unpacked folders).
+        if opts.tenant {
+            let n = crate::upload::sweep(&home.import_inbox());
+            if n > 0 {
+                tracing::warn!(
+                    removed = n,
+                    "removed what an interrupted upload left behind"
+                );
+            }
+        }
         // Settings first: everything below reads them (the model's idle unload and the port are
         // read by the daemon from the same handle).
         let settings = opts
@@ -1267,7 +1412,7 @@ impl Service {
                 tracing::warn!("the import is inside a long step; stopping without it");
                 let slot = self.import.lock();
                 let mut st = slot.status.lock();
-                if st.state == alice_core::import::ImportState::Running {
+                if st.state.is_active() {
                     st.state = alice_core::import::ImportState::Failed;
                     st.error = Some(importer::STOPPED.to_string());
                 }
@@ -3803,19 +3948,43 @@ impl Service {
             return Err(outside());
         }
         let size = tree_size(&palace);
-        let home = self.home.root();
-        let free = match &self.opts.free_space {
-            Some(f) => f(home),
-            None => backup::free_space(home),
-        };
         // An unknown free size cannot prove there is room.
-        let free = free.unwrap_or(0);
+        let free = self.free_bytes().unwrap_or(0);
         if free < size.saturating_mul(2).saturating_add(IMPORT_MIN_FREE_AFTER) {
             return Err(AliceError::invalid(format!(
                 "the server has {free} bytes free; importing this {size}-byte palace needs about twice its size plus 2 GB; ask the server's admin"
             )));
         }
         Ok(())
+    }
+
+    /// Free bytes on the volume of the data directory (`None`: unknown).
+    fn free_bytes(&self) -> Option<u64> {
+        let home = self.home.root();
+        match &self.opts.free_space {
+            Some(f) => f(home),
+            None => backup::free_space(home),
+        }
+    }
+
+    /// The pieces a job thread needs, taken from the service while `slot` is held.
+    fn import_env(
+        &self,
+        slot: &ImportSlot,
+        guard: crate::maintenance::OwnedActivityGuard,
+    ) -> ImportEnv {
+        ImportEnv {
+            readers: self.readers.clone(),
+            writer: self.writer.clone(),
+            redactors: self.redactors.clone(),
+            settings: self.settings.clone(),
+            stop: self.stop.clone(),
+            home: self.home.clone(),
+            mempalace_home: self.opts.mempalace_home.clone(),
+            guard,
+            status: slot.status.clone(),
+            hook: self.opts.import_hook.clone(),
+        }
     }
 
     /// Starts an import of a MemPalace palace on a thread of its own. The refusals that need
@@ -3837,7 +4006,7 @@ impl Service {
         }
         let running = |slot: &ImportSlot| {
             let st = slot.status.lock();
-            (st.state == ImportState::Running).then(|| {
+            st.state.is_active().then(|| {
                 AliceError::invalid(format!(
                     "an import is already running (phase {}, {} of {} drawers); wait for it, or follow it with `alice import status`",
                     st.phase, st.done, st.total
@@ -3879,20 +4048,11 @@ impl Service {
             max_batch_records: 0,
             max_batch_bytes: 0,
             max_wal_bytes: 0,
+            bytes_received: 0,
+            embedding_backlog: 0,
         };
         *slot.status.lock() = first.clone();
-        let env = ImportEnv {
-            readers: self.readers.clone(),
-            writer: self.writer.clone(),
-            redactors: self.redactors.clone(),
-            settings: self.settings.clone(),
-            stop: self.stop.clone(),
-            home: self.home.clone(),
-            mempalace_home: self.opts.mempalace_home.clone(),
-            guard: self.activity.enter_owned(),
-            status: slot.status.clone(),
-            hook: self.opts.import_hook.clone(),
-        };
+        let env = self.import_env(&slot, self.activity.enter_owned());
         match importer::spawn(env, req, palace, job_id) {
             Ok(handle) => {
                 slot.handle = Some(handle);
@@ -3911,6 +4071,99 @@ impl Service {
     pub fn import_status(&self) -> alice_core::import::ImportStatus {
         // Slot, then status: the order `start_import` takes them in.
         self.import.lock().status.lock().clone()
+    }
+
+    /// Chunks still waiting for a vector (what `stats` and `health` call the embed backlog).
+    pub async fn embed_backlog(&self) -> Result<u64> {
+        self.read(|c| Ok(embeddings::backlog(c)? as u64)).await
+    }
+
+    /// Whether the data directory has room for an upload of `size` bytes, `received` of which
+    /// are already on the disk: about three times its size (the archive, the unpacked copy and
+    /// the database growth) must remain free above [`IMPORT_MIN_FREE_AFTER`].
+    fn check_upload_room(&self, size: u64, received: u64) -> Result<()> {
+        // An unknown free size cannot prove there is room.
+        let free = self.free_bytes().unwrap_or(0);
+        if free.saturating_add(received)
+            < size.saturating_mul(3).saturating_add(IMPORT_MIN_FREE_AFTER)
+        {
+            return Err(AliceError::invalid(format!(
+                "the server has {free} bytes free; importing an upload of {size} bytes needs about three times its size plus 2 GB; ask the server's admin"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Admits an upload (`POST /api/v1/import/upload`, tenant mode): refuses at once what the
+    /// headers already show (over the cap, no room on the disk, a remote embedding provider
+    /// not allowed) and takes the one import slot BEFORE a byte of the body is read.
+    pub fn upload_begin(
+        self: &Arc<Self>,
+        content_length: Option<u64>,
+        allow_remote_embedding: bool,
+    ) -> std::result::Result<UploadTicket, UploadError> {
+        use alice_core::import::{ImportState, ImportStatus};
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(AliceError::invalid(
+                "the daemon is stopping; try the upload again in a minute",
+            )
+            .into());
+        }
+        let settings = self.settings.get();
+        let cap = settings.import.max_upload_bytes;
+        if let Some(n) = content_length.filter(|n| *n > cap) {
+            return Err(UploadError::TooLarge(too_large_message(n, cap)));
+        }
+        importer::check_remote_embedding(&settings, allow_remote_embedding)?;
+        if let Some(n) = content_length {
+            self.check_upload_room(n, 0)?;
+        }
+        let mut slot = self.import.lock();
+        {
+            let st = slot.status.lock();
+            if st.state.is_active() {
+                return Err(UploadError::Conflict(format!(
+                    "an import is already in progress ({}); wait until `GET /api/v1/import/status` says done or failed, then upload again",
+                    match st.state {
+                        ImportState::Receiving => "receiving an upload".to_string(),
+                        ImportState::Unpacking => "unpacking an upload".to_string(),
+                        _ => format!("phase {}", st.phase),
+                    }
+                )));
+            }
+        }
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(AliceError::invalid(
+                "the daemon is stopping; try the upload again in a minute",
+            )
+            .into());
+        }
+        if let Some(old) = slot.handle.take() {
+            let _ = old.join();
+        }
+        let inbox = self.home.import_inbox();
+        std::fs::create_dir_all(&inbox).map_err(AliceError::Io)?;
+        let job_id = new_id();
+        *slot.status.lock() = ImportStatus {
+            state: ImportState::Receiving,
+            job_id: Some(job_id.clone()),
+            phase: "receiving".to_string(),
+            ..ImportStatus::idle()
+        };
+        let name = format!("{}{job_id}", crate::upload::PREFIX);
+        Ok(UploadTicket {
+            svc: self.clone(),
+            archive: inbox.join(format!("{name}.tar.gz")),
+            dir: inbox.join(&name),
+            job_id,
+            cap,
+            declared: content_length,
+            received: 0,
+            guard: Some(self.activity.enter_owned()),
+            allow_remote_embedding,
+            reason: None,
+            armed: true,
+        })
     }
 
     // ------------------------------------------------------------------ maintenance
