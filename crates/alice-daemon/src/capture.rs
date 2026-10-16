@@ -944,9 +944,15 @@ impl CaptureCtl {
     /// already keeps its next try, and a backfilled one is distilled only when asked (`alice
     /// capture distill`). The capture is written either way: a failure here is logged, and the
     /// distill worker's quiet check finds the source later.
+    ///
+    /// Only the event's last pass marks it: the one that closes the trailing turn. A pass that
+    /// leaves it open (a capped upload, `more=1`; a local pass short of the end of the file) is
+    /// followed by the rest of the session, and a run before that would take part of the
+    /// session for its end (and offer a handoff from the middle of it).
     fn mark_due(&self, input: &PassInput, report: &PassReport) {
         if input.subagent.is_some()
             || !matches!(input.event.as_str(), "session-end" | "pre-compact")
+            || !(input.close_trailing || input.force_close)
             || self.settings.get().distill.provider == DistillProvider::Off
         {
             return;

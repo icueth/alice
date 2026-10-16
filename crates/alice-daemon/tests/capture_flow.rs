@@ -1610,6 +1610,56 @@ async fn a_session_mempalace_mined_continues_after_the_import() {
     assert_eq!(chunks_holding(&svc, "third words is settled"), 1);
 }
 
+/// Merge boundary (Tasks 6b and 18a): a local pass, which the worker reads from the transcript
+/// file after a notify, follows the import-first rule too. The first capture of a session that
+/// MemPalace mined stores only the turns that started after the import's end. The earlier turns'
+/// keys are recorded as skipped, and the cursor moves past them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_pass_continues_after_the_import() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_with(&d.path().join("home"), local_options());
+    import_palace(
+        &svc,
+        d.path(),
+        &mined(
+            "lm1",
+            &[
+                ("mined text of turn one", Some("2026-10-16T00:00:02Z")),
+                ("mined text of turn two", Some("2026-10-16T00:00:04Z")),
+            ],
+        ),
+    )
+    .await;
+    // Turns start at 00:00:01, :03, :05 and :07.
+    let mut t = Transcript::default();
+    t.turn("lm1", 1, "first words")
+        .turn("lm1", 2, "second words")
+        .turn("lm1", 3, "third words")
+        .turn("lm1", 4, "fourth words");
+    let path = d.path().join("lm1.jsonl");
+    std::fs::write(&path, &t.bytes).unwrap();
+    svc.capture_notify(notify("lm1", &path, "stop"))
+        .await
+        .unwrap();
+    until("the local pass reaches the end of the file", || {
+        state_of(&svc, &uri("lm1")).is_some_and(|s| s.byte_offset == t.len())
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "first words is settled"), 0);
+    assert_eq!(chunks_holding(&svc, "second words is settled"), 0);
+    assert_eq!(chunks_holding(&svc, "third words is settled"), 1);
+    assert_eq!(chunks_holding(&svc, "fourth words is settled"), 1);
+    assert_eq!(
+        chunks_holding(&svc, "mined text of turn"),
+        2,
+        "the import's"
+    );
+    let keys = known_keys(&svc);
+    for k in ["lm1-p1", "lm1-p2", "lm1-p3", "lm1-p4"] {
+        assert!(keys.contains(k), "{k} is recorded: {keys:?}");
+    }
+}
+
 /// An imported transcript with no end time is no evidence of what it holds: the first capture
 /// stores every turn.
 #[tokio::test(flavor = "multi_thread")]

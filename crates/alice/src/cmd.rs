@@ -270,7 +270,8 @@ pub enum MaintenanceCmd {
     /// When each job last ran.
     Status,
     /// Run one job now, to its end: backup, quick_check, index_check, fts_optimize,
-    /// raw_retention, trash_purge, judge_retry, merge_suggestions or events_prune.
+    /// raw_retention, capture_retention, trash_purge, judge_retry, merge_suggestions,
+    /// events_prune or model_purge.
     Run { job: String },
 }
 
@@ -2992,6 +2993,29 @@ impl Interrupt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `alice maintenance run --help` names every job the daemon runs (the merge boundary found
+    /// `capture_retention` and `model_purge` missing from the hand-written list).
+    #[test]
+    fn the_maintenance_run_help_names_every_job() {
+        let cmd = MaintenanceCmd::augment_subcommands(clap::Command::new("maintenance"));
+        let run = cmd
+            .find_subcommand("run")
+            .expect("`maintenance run` exists");
+        let help = format!(
+            "{} {}",
+            run.get_about().map(ToString::to_string).unwrap_or_default(),
+            run.get_long_about()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        );
+        let words: Vec<&str> = help
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .collect();
+        for job in alice_daemon::maintenance::Job::names() {
+            assert!(words.contains(&job), "the help names {job}: {help}");
+        }
+    }
 
     fn confirm(yes: bool, tty: bool, typed: &str) -> (Result<()>, String) {
         let mut asked = Vec::new();

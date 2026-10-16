@@ -230,6 +230,10 @@ fn start_service(home: &Path, script: &Arc<DistillScript>, o: &Opts) -> Arc<Serv
             distill_idle_override: o.idle,
             tenant: o.tenant,
             judge_retry_every: Duration::from_millis(200),
+            // The local capture worker (Task 6b) runs beside the distill worker on a local
+            // daemon; uploaded sources have no transcript path, so its sweep leaves them alone.
+            capture_settle: Duration::from_millis(50),
+            capture_sweep_every: Duration::from_millis(100),
             ..Default::default()
         },
     )
@@ -331,7 +335,7 @@ impl Daemon {
         self.db()
             .query_row(
                 "SELECT c.source_id, c.distill_state, c.distill_ord, c.next_ord, c.distill_attempts,
-                        c.distill_next_try_at, c.ended
+                        c.distill_next_try_at, c.ended, c.byte_offset
                  FROM capture_state c JOIN sources s ON s.id = c.source_id WHERE s.uri = ?1",
                 [uri],
                 |r| {
@@ -343,10 +347,48 @@ impl Daemon {
                         attempts: r.get(4)?,
                         next_try_at: r.get(5)?,
                         ended: r.get(6)?,
+                        byte_offset: r.get(7)?,
                     })
                 },
             )
             .unwrap_or_else(|e| panic!("no capture state for {uri}: {e}"))
+    }
+
+    /// Whether `uri` has a capture state yet.
+    fn has_state(&self, uri: &str) -> bool {
+        self.db()
+            .query_row(
+                "SELECT count(*) FROM capture_state c JOIN sources s ON s.id = c.source_id
+                 WHERE s.uri = ?1",
+                [uri],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0
+    }
+
+    /// Writes `t` as session `session`'s transcript file, beside the home, for the local
+    /// capture worker to read.
+    fn write_transcript(&self, session: &str, t: &Transcript) -> PathBuf {
+        let path = self.dir.path().join(format!("{session}.jsonl"));
+        std::fs::write(&path, &t.bytes).unwrap();
+        path
+    }
+
+    /// What `alice hook <event>` sends for a Claude Code session of project `slug` whose
+    /// transcript is `path`: the local worker reads the file later.
+    async fn notify(&self, slug: &str, session: &str, path: &Path, event: &str) {
+        self.svc
+            .capture_notify(CaptureNotify {
+                agent: "claude-code".into(),
+                event: event.into(),
+                session_id: session.into(),
+                transcript_path: path.to_string_lossy().into_owned(),
+                cwd: Some(self.repo(slug).to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
     }
 
     fn distilled(&self) -> Vec<Distilled> {
@@ -442,6 +484,7 @@ struct SourceState {
     attempts: i64,
     next_try_at: Option<String>,
     ended: bool,
+    byte_offset: i64,
 }
 
 #[derive(Debug)]
@@ -2137,5 +2180,330 @@ async fn a_subagent_with_unknown_rules_puts_its_session_off() {
         .filter(|r| r.uri == uri("uk1"))
         .count();
     assert_eq!(runs, 1, "not run again every tick");
+    d.shutdown();
+}
+
+// ---- The merge boundary: capture, distillation and the judge rules together ----
+
+/// A Codex rollout, built line by line (format: `alice-core/tests/fixtures/capture/codex`).
+#[derive(Default)]
+struct Rollout {
+    bytes: Vec<u8>,
+    clock: u64,
+}
+
+impl Rollout {
+    fn line(&mut self, kind: &str, payload: serde_json::Value) -> &mut Self {
+        self.clock += 1;
+        let c = self.clock;
+        let v = json!({
+            "timestamp": format!("2026-10-16T{:02}:{:02}:{:02}.000Z", (c / 3600) % 24, (c / 60) % 60, c % 60),
+            "ordinal": c - 1, "type": kind, "payload": payload,
+        });
+        self.bytes.extend(serde_json::to_vec(&v).unwrap());
+        self.bytes.push(b'\n');
+        self
+    }
+
+    fn message(&mut self, role: &str, kind: &str, text: &str) -> &mut Self {
+        let block = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        self.line(
+            "response_item",
+            json!({"type": "message", "id": format!("m{}", self.clock), "role": role,
+                   "content": [{"type": block, "text": text}],
+                   "internal_chat_message_metadata_passthrough": {"content_item_kinds": [kind]}}),
+        )
+    }
+
+    fn prompt(&mut self, text: &str) -> &mut Self {
+        self.message("user", "user.text", text)
+    }
+
+    fn reply(&mut self, text: &str) -> &mut Self {
+        self.message("assistant", "unknown", text)
+    }
+}
+
+/// Sets `path`'s modification time to `age` ago (an idle transcript, without waiting).
+fn age(path: &Path, age: Duration) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+}
+
+/// Merge boundary (Tasks 12 and 17a): a Codex session on a server tenant is distilled like a
+/// Claude Code one. It takes one run and one request, the memories' author is the Codex session,
+/// a conclusion carries its prompt, and the provenance is the rollout's own chunks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_session_is_distilled_like_a_claude_code_one() {
+    let d = Daemon::start(
+        Opts {
+            tenant: true,
+            ..Opts::jev()
+        },
+        DistillScript::new(ANSWERS),
+    );
+    let mut r = Rollout::default();
+    r.line(
+        "session_meta",
+        json!({"id": "cxd1", "cwd": "/home/user/shop"}),
+    )
+    .prompt(DECISION_PROMPT)
+    .reply(DECISION)
+    .prompt(BUGFIX_PROMPT)
+    .reply(BUGFIX);
+    let a = d
+        .send_q(
+            TranscriptQuery {
+                agent: "codex".into(),
+                session: "cxd1".into(),
+                offset: 0,
+                event: "session-end".into(),
+                project_header: Some("shop".into()),
+                ..Default::default()
+            },
+            &r.bytes,
+        )
+        .await;
+    assert_eq!(a.turns_stored, 2);
+    let uri = "codex:session:cxd1";
+    until("the Codex session is distilled", || {
+        d.state(uri).state == "done"
+    })
+    .await;
+    let st = d.state(uri);
+    assert_eq!(st.distill_ord, st.next_ord, "the cursor is at the end");
+    assert!(st.ended);
+    assert_eq!(d.script.distill_calls(), 1, "one request for the run");
+    let mems = d.distilled();
+    let mut kinds: Vec<&str> = mems.iter().map(|m| m.kind.as_str()).collect();
+    kinds.sort_unstable();
+    assert_eq!(kinds, ["bugfix", "decision"], "{mems:?}");
+    for m in &mems {
+        assert_eq!(m.agent.as_deref(), Some("codex"));
+        assert_eq!(m.session.as_deref(), Some("cxd1"));
+        assert_eq!(m.project, "shop");
+    }
+    let decision = mems.iter().find(|m| m.kind == "decision").unwrap();
+    assert!(
+        decision
+            .body
+            .ends_with(&format!("\n\nContext: {DECISION_PROMPT}")),
+        "a Codex conclusion carries its prompt: {}",
+        decision.body
+    );
+    assert_eq!(
+        d.provenance(&decision.id),
+        d.chunks_with(uri, "decided to use pnpm workspaces")
+    );
+    assert!(!d.provenance(&decision.id).is_empty());
+    d.shutdown();
+}
+
+/// Merge boundary (Tasks 6b and 12): a session end that the local worker reads after a notify
+/// makes the session due at once (the quiet trigger would wait 15 minutes here), and the ended
+/// session offers its handoff.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_session_end_notify_makes_the_session_due_at_once() {
+    let d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    let mut t = one_decision("ln1");
+    t.prompt("ln1-p2", "Where do we stand with the cache work right now?")
+        .reply("ln1-a2", HANDOFF);
+    let path = d.write_transcript("ln1", &t);
+    d.notify("shop", "ln1", &path, "session-end").await;
+    until("the local session is distilled", || {
+        d.has_state(&uri("ln1")) && d.state(&uri("ln1")).state == "done"
+    })
+    .await;
+    let st = d.state(&uri("ln1"));
+    assert!(st.ended, "the session end ended the source");
+    assert_eq!(st.byte_offset, t.len() as i64, "the worker read the file");
+    assert_eq!(st.distill_ord, st.next_ord);
+    assert_eq!(d.script.distill_calls(), 1);
+    let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, ["decision", "handoff"]);
+    d.shutdown();
+}
+
+/// Merge boundary (Tasks 6b, 12 and 15): a session end sent in several bodies (a capped upload
+/// says `more=1`; the local worker reads a long transcript in several passes) makes the session
+/// due only with its last body. A run before it would take part of the session for its end and
+/// offer a handoff from the middle of the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capped_session_end_is_due_only_after_its_last_body() {
+    let d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    let mut t = decision_and_bugfix("cp1");
+    let capped = t.len() as usize;
+    t.prompt("cp1-p3", "Where do we stand with the cache work right now?")
+        .reply("cp1-a3", HANDOFF);
+    let q = |offset: u64, more: Option<u8>| TranscriptQuery {
+        agent: "claude-code".into(),
+        session: "cp1".into(),
+        offset,
+        event: "session-end".into(),
+        cwd: Some(d.repo("shop").to_string_lossy().into_owned()),
+        more,
+        ..Default::default()
+    };
+    // The first body: a capped one, whose last turn stays open.
+    let a = d.send_q(q(0, Some(1)), &t.bytes[..capped]).await;
+    assert_eq!(a.turns_stored, 1);
+    settle().await;
+    let st = d.state(&uri("cp1"));
+    assert_eq!(st.state, "idle", "not due before the last body: {st:?}");
+    assert!(!st.ended);
+    assert_eq!(
+        d.script.distill_calls(),
+        0,
+        "no run over part of the session"
+    );
+
+    // The last body: the session end, whole.
+    let a2 = d
+        .send_q(q(a.next_offset, None), &t.bytes[a.next_offset as usize..])
+        .await;
+    assert_eq!(a2.turns_stored, 2);
+    until("the whole session is distilled", || {
+        d.state(&uri("cp1")).state == "done"
+    })
+    .await;
+    let st = d.state(&uri("cp1"));
+    assert!(st.ended);
+    assert_eq!(st.distill_ord, st.next_ord);
+    assert_eq!(
+        d.script.distill_calls(),
+        1,
+        "one run, over the whole session"
+    );
+    let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, ["decision", "bugfix", "handoff"]);
+    d.shutdown();
+}
+
+/// Merge boundary (Tasks 6b and 12; the ruling "locally Task 6b's sweep owns the stale end"): on
+/// a local daemon both workers run. A session whose last capture was 30 hours ago is not ended
+/// by the distill worker while its transcript is fresh. The sweep ends it once the file has been
+/// idle for a day, and its final pass captures the trailing turn. An end by the distill worker
+/// would have lost that turn, because an ended source is never swept again.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_sweep_ends_a_stale_local_session() {
+    let mut d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    let mut t = one_decision("sw1");
+    let open_at = t.len() as i64;
+    // The trailing turn waits for its tool call: a `stop` leaves it open.
+    t.prompt("sw1-p2", "Watch the nightly build for me.").tool(
+        "sw1-a2",
+        "tu_sw",
+        "Bash",
+        json!({"command": "sleep 999"}),
+    );
+    let path = d.write_transcript("sw1", &t);
+    d.notify("shop", "sw1", &path, "stop").await;
+    until("the complete turn is captured", || {
+        d.has_state(&uri("sw1")) && d.state(&uri("sw1")).byte_offset == open_at
+    })
+    .await;
+    d.restart_with(&format!(
+        "UPDATE capture_state SET last_capture_at = '{0}', created_at = '{0}'",
+        hours_ago(30)
+    ))
+    .await;
+    // The quiet session is distilled as an open one meanwhile; it is not ended.
+    until("the quiet session is distilled", || {
+        d.state(&uri("sw1")).state == "done"
+    })
+    .await;
+    settle().await;
+    let st = d.state(&uri("sw1"));
+    assert!(
+        !st.ended,
+        "the distill worker leaves a local session to the sweep"
+    );
+    assert_eq!(st.byte_offset, open_at);
+
+    age(&path, Duration::from_secs(25 * 3600));
+    until("the sweep ends the stale session", || {
+        d.state(&uri("sw1")).ended
+    })
+    .await;
+    let st = d.state(&uri("sw1"));
+    assert_eq!(
+        st.byte_offset,
+        t.len() as i64,
+        "the final pass read to the end"
+    );
+    assert_eq!(
+        d.chunks_with(&uri("sw1"), "sleep 999").len(),
+        1,
+        "the final pass closed the trailing turn"
+    );
+    d.shutdown();
+}
+
+/// Merge boundary (Tasks 12 and 16, rule R11): capture retention empties a captured session but
+/// keeps its source and its state. Asked to distil it, the distiller finds nothing left to read
+/// and settles it as `done`, with no request and no second run.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_emptied_capture_source_settles_done_without_a_request() {
+    let config = "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\n\n[capture]\nraw_retention = \"30d\"\n";
+    let mut d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(ANSWERS),
+    );
+    let t = decision_and_bugfix("er1");
+    d.send("shop", "er1", &t, 0, "stop").await;
+    // Captured 40 days ago (a state is stamped before its first chunk) and never distilled.
+    d.restart_with(&format!(
+        "UPDATE chunks SET created_at = '{0}'
+           WHERE source_id IN (SELECT source_id FROM capture_state);
+         UPDATE capture_state SET created_at = '{1}', last_capture_at = '{0}';",
+        hours_ago(40 * 24),
+        hours_ago(41 * 24)
+    ))
+    .await;
+    d.svc
+        .run_job(alice_daemon::maintenance::Job::CaptureRetention)
+        .await
+        .unwrap();
+    until("retention empties the session", || {
+        d.chunks_with(&uri("er1"), "").is_empty()
+    })
+    .await;
+    let st = d.state(&uri("er1"));
+    assert!(
+        st.next_ord > 0,
+        "R11 keeps the emptied source and its state: {st:?}"
+    );
+    assert_eq!((st.state.as_str(), st.distill_ord), ("idle", 0));
+
+    d.svc.capture_distill_now("er1").await.unwrap();
+    until("the empty run settles", || {
+        let st = d.state(&uri("er1"));
+        st.state == "done" && st.distill_ord == st.next_ord
+    })
+    .await;
+    settle().await;
+    let st = d.state(&uri("er1"));
+    assert_eq!(st.state, "done", "{st:?}");
+    assert_eq!((st.attempts, st.next_try_at.as_deref()), (0, None));
+    assert_eq!(d.script.distill_calls(), 0, "nothing to ask about");
+    let runs = d
+        .svc
+        .distill_runs()
+        .iter()
+        .filter(|r| r.uri == uri("er1"))
+        .count();
+    assert_eq!(runs, 1, "one run, then it rests");
+    assert!(d.distilled().is_empty());
     d.shutdown();
 }
