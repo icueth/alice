@@ -59,6 +59,8 @@
 3. Re-running a hook, killing the daemon mid-capture, truncating the cursor, or resuming or forking a session never
    stores a turn twice.
 4. With `distill.provider = jev`, a session that has ended is distilled into at most `distill.max_per_run` memories per run.
+   One session keeps at most `distill.max_per_session` memories over all its runs, its subagents included.
+   One run keeps at most `distill.max_per_subagent_run` of them from subagent reports.
    They come from a project the cloud policy allows, carry provenance to their chunks, and are marked as distilled.
 5. A memory the agent already `remember`ed in the session is not stored a second time by distillation.
 6. Distillation never creates a review item, and transcripts never appear in the `context` briefing or as knowledge hits.
@@ -885,15 +887,17 @@ no lesson.
 - **Keeping a candidate:** it is kept when its most probable option is a knowledge option with probability ≥
   `distill.min_confidence` (default 0.7).
 - **Ranking (Task 12b).** The candidates kept by that rule are ranked by priority, then probability, then session
-  order: a main-session passage before a subagent report; among equals, decision, bugfix, warning, fact, howto,
-  preference, then handoff. Every cap below takes from the top of that order, so a verdict that Jev scores 0.99 never
-  displaces a fact of the main session.
+  order: a main-session passage before a subagent report; among equals, handoff, decision, bugfix, warning, fact,
+  howto, then preference. Every cap below takes from the top of that order, so a verdict that Jev scores 0.99 never
+  displaces a fact of the main session. The handoff comes first because there is at most one, offered at the session's
+  end, and it is what continuing the work needs most: the caps never crowd it out, and it still counts toward them.
 - **Caps.** One run keeps at most `distill.max_per_run` (default 8), and at most one `handoff`. Of them, at most
   `distill.max_per_subagent_run` (default 2) are subagent reports.
 - **The session's caps (Task 12b).** One session keeps at most `distill.max_per_session` (default 16) memories over all
   its runs: its main source and its subagent sources together. The worker counts the live (`origin = distill`, not
   trashed) memories whose provenance chunks belong to any of the session's sources; those whose idempotency key starts
-  with `distill:sub:` came from subagent reports. Subagent reports of the whole session keep at most half of
+  with `distill:sub:` came from subagent reports (the main session's copy of a report or the subagent's own; the
+  prefix is the only mark a stored memory carries of that, so there is no new column and no migration; §6.5). Subagent reports of the whole session keep at most half of
   `distill.max_per_session`, rounded down (8 of 16), so the main session always has room. A run keeps at most
   `min(max_per_run, what the session has left)`, and of them at most `min(max_per_subagent_run, what the subagents'
   share has left)` subagent reports.

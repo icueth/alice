@@ -339,6 +339,8 @@ provider = "off"            # "off" | "jev"
 # model                     # reserved; ignored with "jev" (judge.jev.model is used)
 min_confidence = 0.7        # 0.5-0.99
 max_per_run = 8             # 1-50
+max_per_session = 16        # 1-200: one session over all its runs, its subagents included
+max_per_subagent_run = 2    # 0-50: subagent reports kept in one run
 idle_minutes = 15           # 1-1,440
 importance = 2              # 1-3
 budget_share = 0.5          # 0.05-1.0 of judge.daily_budget_usd

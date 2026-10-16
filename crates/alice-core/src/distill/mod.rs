@@ -409,7 +409,7 @@ impl Candidate {
 /// Maps Jev's answers to memories (spec §6.4 and §6.5). A candidate is kept when its most
 /// probable option is a knowledge option with at least `min_confidence`. The kept are ranked by
 /// priority, then probability, then session order: the main session's passages before subagent
-/// reports, and among equals decision, bugfix, warning, fact, howto, preference, handoff. From
+/// reports, and among equals handoff, decision, bugfix, warning, fact, howto, preference. From
 /// the top of that order at most `max_per_run` are kept, of them at most `max_subagent` subagent
 /// reports and one `handoff`. A `preference_user` passage that names the project stays in it.
 /// The memories come in session order.
@@ -473,21 +473,24 @@ pub fn decide(
         .collect()
 }
 
-/// A knowledge kind's place in the ranking (the controller's ruling in Task 12b).
+/// A knowledge kind's place in the ranking (the controller's rulings in Task 12b). A `handoff`
+/// comes first: one at most, offered at the session's end, it is what continuing needs most, so
+/// the caps never crowd it out (it still counts toward them).
 fn kind_rank(kind: Kind) -> u8 {
     match kind {
-        Kind::Decision => 0,
-        Kind::Bugfix => 1,
-        Kind::Warning => 2,
-        Kind::Fact => 3,
-        Kind::Howto => 4,
-        Kind::Preference => 5,
-        _ => 6,
+        Kind::Handoff => 0,
+        Kind::Decision => 1,
+        Kind::Bugfix => 2,
+        Kind::Warning => 3,
+        Kind::Fact => 4,
+        Kind::Howto => 5,
+        Kind::Preference => 6,
+        _ => 7,
     }
 }
 
 /// `distill:` and the first 32 hex digits of `sha256(uri ‖ 0x1f ‖ passage)`, so a re-run of the
-/// same passage returns the first memory.
+/// same passage returns the first memory. A subagent report's key is [`subagent_key`] instead.
 pub fn idempotency_key(uri: &str, passage: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(uri.as_bytes());
@@ -497,11 +500,14 @@ pub fn idempotency_key(uri: &str, passage: &str) -> String {
     format!("distill:{}", &hex[..32])
 }
 
-/// The key prefix of a memory kept from a subagent report: the worker counts a session's
-/// subagent memories by it (spec §6.4).
+/// The key prefix of a memory kept from a subagent report, the main session's copy of it or the
+/// subagent's own (spec §6.4, §6.5): the only mark a stored memory carries of where it came from,
+/// so the worker counts a session's subagent memories by it among those whose provenance is in
+/// the session's sources (Task 12b; no column, no migration).
 pub const SUBAGENT_KEY_PREFIX: &str = "distill:sub:";
 
-/// [`idempotency_key`] for a subagent report: [`SUBAGENT_KEY_PREFIX`] in place of `distill:`.
+/// [`idempotency_key`] for a subagent report: [`SUBAGENT_KEY_PREFIX`] in place of `distill:`,
+/// then the same 32 hex digits.
 pub fn subagent_key(uri: &str, passage: &str) -> String {
     let key = idempotency_key(uri, passage);
     format!("{SUBAGENT_KEY_PREFIX}{}", &key["distill:".len()..])
@@ -3731,6 +3737,39 @@ mod tests {
         );
         assert_eq!(kept_of(8, 2).len(), 8);
         assert_eq!(kept_of(8, 0).len(), 7, "no subagent room");
+    }
+
+    /// The controller's ruling on Task 12b: a `handoff` ranks first, before a decision, so the
+    /// caps never crowd out the session's one handoff; it still counts toward them.
+    #[test]
+    fn a_handoff_ranks_first_and_counts_toward_the_cap() {
+        let p = conclusions_run(10, true);
+        assert!(p.candidates[8].handoff_ok && p.candidates[9].handoff_ok);
+        let mut answers: BTreeMap<String, Distribution> = (1..=9)
+            .map(|i| (format!("c{i}"), answer("decision", 0.99)))
+            .collect();
+        answers.insert("c10".into(), answer("handoff", 0.71));
+        let kept = decide(&p, &answers, URI, &DistillConfig::from(&caps(8, 16, 2)));
+        assert_eq!(kept.len(), 8);
+        assert_eq!(
+            kept.iter().filter(|m| m.kind == Kind::Handoff).count(),
+            1,
+            "{kept:#?}"
+        );
+        assert_eq!(kept.last().unwrap().body, p.candidates[9].text);
+        // A run with room for one keeps the handoff.
+        let cfg = DistillConfig::for_session(
+            &caps(8, 16, 2),
+            SessionKept {
+                all: 15,
+                subagent: 0,
+            },
+        );
+        let kept = decide(&p, &answers, URI, &cfg);
+        assert_eq!(
+            kept.iter().map(|m| m.kind).collect::<Vec<_>>(),
+            [Kind::Handoff]
+        );
     }
 
     /// The brief: a title that is a heading, a table header or 25 characters or fewer becomes the
