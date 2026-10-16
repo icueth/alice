@@ -3982,24 +3982,43 @@ fn backfill_queues_files_since_a_date_and_does_not_distill() {
     assert!(!raw_hits(&e, "subquokka").is_empty());
     assert!(raw_hits(&e, "oldquokka").is_empty());
 
-    // `--distill`: the same files are queued again, nothing is stored twice, and the sessions
-    // are marked due (distillation is off here, so the daemon says so and nothing runs).
-    let out = e.ok(&[
-        "capture",
-        "backfill",
-        "claude",
-        "--since",
-        &since,
-        "--distill",
-    ]);
+    // `--distill` while distillation is off: the same files are queued again, nothing is
+    // stored twice, and nothing is marked due (review M1: marked now, the whole backfill would
+    // be distilled at once when it is turned on).
+    let backfill_distill = || {
+        e.ok(&[
+            "capture",
+            "backfill",
+            "claude",
+            "--since",
+            &since,
+            "--distill",
+        ])
+    };
+    let out = backfill_distill();
     assert_eq!(queued(&out).len(), 3, "{out}");
+    assert!(!out.contains("due for distillation"), "{out}");
+    assert!(
+        out.contains("Distillation is off") && out.contains("backfill again with --distill"),
+        "{out}"
+    );
+    let c = captured(&e);
+    for uri in [main1, main2, sub1] {
+        assert_eq!(c[uri].1, "skipped_backfill", "{uri}: {c:?}");
+    }
+    assert_eq!(raw_hits(&e, "newerquokka").len(), 1, "stored once");
+
+    // With distillation on, `--distill` marks the sessions due. (The judge here is not Jev, so
+    // they then wait for it; nothing is sent anywhere.)
+    e.ok(&["config", "set", "distill.provider", "jev"]);
+    let out = backfill_distill();
     for uri in [main1, main2] {
         assert!(
             out.contains(&format!("due for distillation: {uri}\n")),
             "{out}"
         );
     }
-    assert!(out.contains("Distillation is off"), "{out}");
+    assert!(!out.contains("Distillation is off"), "{out}");
     let c = captured(&e);
     for uri in [main1, main2] {
         assert_ne!(c[uri].1, "skipped_backfill", "{uri}: {c:?}");
@@ -4009,7 +4028,8 @@ fn backfill_queues_files_since_a_date_and_does_not_distill() {
 
 /// `--project` keeps one project's sessions; Codex rollouts are found under CODEX_HOME and named
 /// by their session meta, a compressed one is counted and skipped; and a backfill is refused
-/// while capture is off, since the daemon would record every turn as not captured.
+/// while capture, or the agent's capture, is off, since the daemon would record every turn as
+/// not captured.
 #[test]
 fn backfill_filters_by_project_reads_codex_and_refuses_while_capture_is_off() {
     let e = Env::new();
@@ -4032,6 +4052,17 @@ fn backfill_filters_by_project_reads_codex_and_refuses_while_capture_is_off() {
     assert!(stderr(&o).contains("capture is off"), "{}", stderr(&o));
     assert!(queued(&String::from_utf8_lossy(&o.stdout)).is_empty());
     e.ok(&["config", "set", "capture.enabled", "true"]);
+    // The agent's own switch too (review M7).
+    e.ok(&["config", "set", "capture.claude_code", "false"]);
+    let o = e.run(&["capture", "backfill", "claude"]);
+    assert!(!o.status.success(), "refused");
+    assert!(
+        stderr(&o).contains("capture of claude-code is off (capture.claude_code = false)"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(queued(&String::from_utf8_lossy(&o.stdout)).is_empty());
+    e.ok(&["config", "set", "capture.claude_code", "true"]);
     assert!(captured(&e).is_empty(), "nothing was queued");
 
     let out = e.ok(&["capture", "backfill", "claude", "--project", "work"]);

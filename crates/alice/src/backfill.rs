@@ -18,7 +18,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -37,8 +37,8 @@ pub struct BackfillArgs {
     #[arg(long)]
     pub project: Option<String>,
     /// Distil the backfilled sessions too: each is marked due once the daemon has registered
-    /// it. Without it they are captured but not distilled (`alice capture distill <session>`
-    /// distils one later).
+    /// it (only while distillation is on). Without it they are captured but not distilled
+    /// (`alice capture distill <session>` distils one later).
     #[arg(long)]
     pub distill: bool,
 }
@@ -166,7 +166,8 @@ pub struct BackfillReport {
     /// `--distill`: the sessions the daemon had not registered when the command stopped
     /// waiting (nothing complete in them yet, or still in the queue).
     pub not_due: Vec<String>,
-    /// `--distill` with `distill.provider = off`: marked due, but nothing is distilled.
+    /// `--distill` with `distill.provider = off`: nothing was marked due, so the sessions stay
+    /// `skipped_backfill` (marked now, they would be distilled all at once when it is turned on).
     pub distill_off: bool,
 }
 
@@ -223,7 +224,7 @@ impl BackfillReport {
             );
         } else if self.distill_off {
             t.push_str(
-                "Distillation is off (distill.provider = off), so nothing is distilled yet: `alice config set distill.provider jev` turns it on.\n",
+                "Distillation is off (distill.provider = off), so no session was marked due; they stay skipped_backfill. Turn it on with `alice config set distill.provider jev`, then backfill again with --distill (or `alice capture distill <session>`).\n",
             );
         }
         t
@@ -302,9 +303,9 @@ fn plan_in(agent: BackfillAgent, root: PathBuf, since: Option<i64>, want: Option
     }
 }
 
-/// Sends one `backfill` notice per planned file and, with `distill`, marks the sessions due as
-/// the daemon registers them. Refuses to start while the agent's capture is switched off: the
-/// daemon would record every turn as not captured, for good.
+/// Sends one `backfill` notice per planned file and, with `distill` (and distillation on),
+/// marks the sessions due as the daemon registers them. Refuses to start while the agent's
+/// capture is switched off: the daemon would record every turn as not captured, for good.
 pub async fn send(daemon: &DaemonClient, plan: Plan, distill: bool) -> Result<BackfillReport> {
     let view = daemon.settings().await?;
     let switch = |path: &[&str]| {
@@ -360,7 +361,10 @@ pub async fn send(daemon: &DaemonClient, plan: Plan, distill: bool) -> Result<Ba
             }
         }
     }
-    if distill {
+    // With distillation off, a session marked due is set back to idle at once, and the quiet
+    // trigger would then distil the whole backfill in a burst once it is turned on (review M1):
+    // nothing is marked, and the report says to run it again.
+    if distill && !distill_off {
         mark_due(daemon, &mut report).await?;
     }
     Ok(report)
@@ -591,25 +595,28 @@ struct Head {
 
 /// The working directory (and a rollout's session id) from the first [`HEAD_BYTES`] of a
 /// transcript: a Claude Code record's `cwd`; a Codex `session_meta`'s `id` and `cwd`, or a
-/// `turn_context`'s `cwd`. Lines that do not parse are passed over.
+/// `turn_context`'s `cwd`. Lines that do not parse are passed over. Read a line at a time,
+/// stopping at the first answer (usually the first line or two, review M3).
 fn head_facts(path: &Path, agent: BackfillAgent) -> Head {
-    let mut buf = Vec::new();
-    if std::fs::File::open(path)
-        .and_then(|f| f.take(HEAD_BYTES).read_to_end(&mut buf))
-        .is_err()
-    {
+    let Ok(file) = std::fs::File::open(path) else {
         return Head::default();
-    }
+    };
+    let mut reader = std::io::BufReader::new(file).take(HEAD_BYTES);
     let text = |v: &serde_json::Value| {
         v.as_str()
             .filter(|s| !s.trim().is_empty())
             .map(str::to_owned)
     };
     let mut head = Head::default();
-    // Only complete lines: the last one may be cut at the limit.
-    let complete = buf.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1);
-    for line in buf[..complete].split(|&b| b == b'\n') {
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // Only complete lines: the last one may be cut at the limit (or the file's end).
+        match reader.read_until(b'\n', &mut line) {
+            Ok(_) if line.last() == Some(&b'\n') => {}
+            _ => return head,
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line) else {
             continue;
         };
         match agent {
@@ -638,7 +645,6 @@ fn head_facts(path: &Path, agent: BackfillAgent) -> Head {
             }
         }
     }
-    head
 }
 
 /// `--since` as milliseconds since the Unix epoch: a date is local midnight, as for
