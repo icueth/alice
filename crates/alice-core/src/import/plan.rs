@@ -169,6 +169,18 @@ pub trait TextFilter: Sync {
     fn changed(&self, before: &str, after: &str) -> bool {
         before != after
     }
+    /// `text` screened with the rules of the project `slug` (the one the drawer goes to), when
+    /// that project has rules beyond [`filter`](Self::filter)'s (its `.alice.toml`, rules a
+    /// project merge carried into it). Those rules include `filter`'s. `None`: the project adds
+    /// nothing and `filter` decides alone.
+    fn for_project(
+        &self,
+        _slug: &str,
+        _field: &str,
+        _text: &str,
+    ) -> Option<Result<String, Vec<String>>> {
+        None
+    }
 }
 
 pub struct NoFilter;
@@ -207,15 +219,24 @@ pub enum Planned {
     },
 }
 
-/// Runs every emitted string through the filter and remembers which detectors blocked.
+/// Runs every emitted string through the filter and remembers which detectors blocked. Once the
+/// drawer's project is known, the strings go through that project's rules instead (when it has
+/// rules of its own), except the source uri: it names the file the chunks' positions belong to,
+/// and stays as the import's own rules leave it.
 struct Guard<'a> {
     filter: &'a dyn TextFilter,
     blocked: BTreeSet<String>,
+    project: Option<String>,
 }
 
 impl Guard<'_> {
     fn apply(&mut self, field: &str, text: &str) -> String {
-        match self.filter.filter(field, text) {
+        let project = self
+            .project
+            .as_deref()
+            .filter(|_| field != "source.uri")
+            .and_then(|p| self.filter.for_project(p, field, text));
+        match project.unwrap_or_else(|| self.filter.filter(field, text)) {
             Ok(t) => t,
             Err(detectors) => {
                 self.blocked.extend(detectors);
@@ -391,6 +412,7 @@ impl Mapper<'_> {
         let mut g = Guard {
             filter: self.filter,
             blocked: BTreeSet::new(),
+            project: None,
         };
         let field = if tier == Tier::Knowledge {
             "content"
@@ -407,6 +429,17 @@ impl Mapper<'_> {
             self.wings.decide_diary(&d.meta, &text)
         } else {
             self.wings.decide(&d.meta, &text)
+        };
+        // (c') the project's own rules, when it has any: the whole text again, still before
+        // anything is split, and every string from here on.
+        g.project = Some(project.slug.clone());
+        let text = match self.filter.for_project(&project.slug, field, &cleaned) {
+            None => text,
+            Some(Ok(t)) => t,
+            Some(Err(detectors)) => {
+                g.blocked.extend(detectors);
+                return g.into_planned();
+            }
         };
         let out = if tier == Tier::Knowledge {
             let extra: Vec<String> = members

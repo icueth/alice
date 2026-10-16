@@ -1231,6 +1231,111 @@ async fn block_mode_skips_the_drawer_names_the_detector_and_keeps_going() {
     assert_eq!(f.tables_holding(SECRET).await, Vec::<String>::new());
 }
 
+/// Ruling after the M2 merge: an import into a project is screened with that project's rules,
+/// and a wing that names a project merged into another gets the rules the merge carried into
+/// it. Here `strict` (block mode and a ticket pattern) was merged into `loose`: the drawers of
+/// the `strict` wing land in `loose`, and those its rules refuse (a ticket, a secret the global
+/// rules would only have redacted) are held back. A wing of a project without such rules keeps
+/// the ticket text.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_into_a_merged_projects_name_is_screened_with_the_rules_the_merge_carried() {
+    let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let specs = vec![
+        knowledge("k_t", "the ticket TCK-12345 is open", "strict", "decisions"),
+        knowledge("k_s", &format!("the key is {token}"), "strict", "decisions"),
+        knowledge(
+            "k_ok",
+            "a plain decision about the cache",
+            "strict",
+            "decisions",
+        ),
+        chunk(
+            "c_t",
+            "a transcript line about TCK-99999",
+            "strict",
+            "/h/.claude/projects/-Users-me-Code-strict/s9.jsonl",
+            0,
+        ),
+        knowledge(
+            "k_other",
+            "the other ticket TCK-55555",
+            "other",
+            "decisions",
+        ),
+    ];
+    let f = Flow::with_specs(&specs).await;
+    let mut cwd = BTreeMap::new();
+    for name in ["strict", "loose"] {
+        let dir = f._root.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        cwd.insert(name, dir.to_string_lossy().into_owned());
+    }
+    std::fs::write(
+        f._root.path().join("strict").join(".alice.toml"),
+        "[privacy]\nblock_secrets = true\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
+    )
+    .unwrap();
+    for (name, dir) in &cwd {
+        f.svc
+            .remember(alice_core::api::RememberRequest {
+                content: format!("a note in {name}"),
+                cwd: Some(dir.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let merged = f
+        .svc
+        .merge_projects(alice_core::api::ProjectMergeRequest {
+            from: "strict".into(),
+            into: "loose".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(merged.merged, "{merged:?}");
+
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert_eq!(
+        r.blocked_by_redaction.get("custom:ticket"),
+        Some(&2),
+        "{:?}",
+        r.blocked_by_redaction
+    );
+    assert_eq!(
+        r.blocked_by_redaction.get("github_token"),
+        Some(&1),
+        "{:?}",
+        r.blocked_by_redaction
+    );
+    for needle in ["TCK-12345", "TCK-99999", "aBcDeFgHiJkLmNoPqRsTuVwXyZ"] {
+        assert_eq!(
+            f.tables_holding(needle).await,
+            Vec::<String>::new(),
+            "{needle}"
+        );
+    }
+    // A drawer the rules allow is imported, into the survivor.
+    let project: String = f
+        .db()
+        .query_row(
+            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.body = 'a plain decision about the cache'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(project, "loose");
+    assert!(
+        !f.tables_holding("TCK-55555").await.is_empty(),
+        "a project without the pattern keeps the text"
+    );
+}
+
 /// After `alice projects merge`, an import run again names the old project (a wing) and the rows
 /// land in the project it was merged into: no twin project, no rows under the old name. Drawers
 /// that were imported before are not imported again.

@@ -260,17 +260,106 @@ pub fn preflight(
 
 // ------------------------------------------------------------------------------------ redaction
 
-/// The detectors as a [`TextFilter`]: always on, `block` mode honoured, changes counted.
+/// The detectors as a [`TextFilter`]: always on, `block` mode honoured, changes counted. With
+/// [`with_project_rules`](Self::with_project_rules), a drawer bound for a project with rules of
+/// its own (its `.alice.toml`, rules a project merge carried into it) is screened with those.
 pub struct RedactFilter {
     redactor: Arc<Redactor>,
     redacted: AtomicU64,
+    projects: Option<ProjectRules>,
 }
+
+/// The rules of the projects drawers go to, looked up by slug as the store resolves it (a slug
+/// or an alias: a project merged into another names the survivor).
+struct ProjectRules {
+    readers: Arc<ReaderPool>,
+    redactors: Arc<Redactors>,
+    /// Slug -> when it was looked up, and the project's redactor when its rules add to the
+    /// import's. Looked up again after [`PROJECT_RULES_FRESH`], like the settings.
+    cache: Mutex<HashMap<String, LookedUp>>,
+}
+
+/// When a project's rules were looked up, and its redactor (`None`: nothing beyond the import's).
+type LookedUp = (Instant, Option<Arc<Redactor>>);
+
+/// How long a project's rules are used before they are looked up again.
+const PROJECT_RULES_FRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl RedactFilter {
     pub fn new(redactor: Arc<Redactor>) -> Self {
         Self {
             redactor,
             redacted: AtomicU64::new(0),
+            projects: None,
+        }
+    }
+
+    /// This filter, screening each drawer with the rules of the project it goes to as well.
+    pub fn with_project_rules(
+        mut self,
+        readers: Arc<ReaderPool>,
+        redactors: Arc<Redactors>,
+    ) -> Self {
+        self.projects = Some(ProjectRules {
+            readers,
+            redactors,
+            cache: Mutex::new(HashMap::new()),
+        });
+        self
+    }
+
+    /// The redactor of the project `slug` names, when its rules add to the import's own; `None`
+    /// when they do not (or no project has the slug yet: a new one has no rules). A store that
+    /// cannot be read gives the closed rules: secrets are held back, never let through.
+    fn project_redactor(&self, slug: &str) -> Option<Arc<Redactor>> {
+        let p = self.projects.as_ref()?;
+        let key = slugify(slug);
+        if let Some((at, r)) = p.cache.lock().get(&key)
+            && at.elapsed() < PROJECT_RULES_FRESH
+        {
+            return r.clone();
+        }
+        let tree = match p
+            .readers
+            .with(|c| alice_core::store::projects::tree_of(c, &key))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "the project's rules could not be read; its drawers are screened closed");
+                Some(alice_core::settings::ProjectTree::rules_only(
+                    key.clone(),
+                    alice_core::settings::ProjectSettings::fail_closed(),
+                ))
+            }
+        };
+        let r = tree.and_then(|t| {
+            let on = |mut privacy: alice_core::settings::PrivacySettings| {
+                privacy.redact = true;
+                privacy
+            };
+            (on(p.redactors.privacy_for(Some(&t))) != on(p.redactors.privacy_for(None)))
+                .then(|| p.redactors.for_root_always_on(Some(&t)))
+        });
+        p.cache.lock().insert(key, (Instant::now(), r.clone()));
+        r
+    }
+
+    /// `text` through `redactor`, counted like [`TextFilter::filter`].
+    fn screen(
+        &self,
+        redactor: &Redactor,
+        field: &str,
+        text: &str,
+    ) -> std::result::Result<String, Vec<String>> {
+        match redactor.check(field, text) {
+            Ok(out) => {
+                if out != text {
+                    self.redacted.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(out)
+            }
+            Err(AliceError::Refused { detectors, .. }) => Err(detectors),
+            Err(_) => Err(vec!["redaction".to_string()]),
         }
     }
 
@@ -342,16 +431,17 @@ fn store_slug(filter: &RedactFilter, slug: &str) -> String {
 
 impl TextFilter for RedactFilter {
     fn filter(&self, field: &str, text: &str) -> std::result::Result<String, Vec<String>> {
-        match self.redactor.check(field, text) {
-            Ok(out) => {
-                if out != text {
-                    self.redacted.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(out)
-            }
-            Err(AliceError::Refused { detectors, .. }) => Err(detectors),
-            Err(_) => Err(vec!["redaction".to_string()]),
-        }
+        self.screen(&self.redactor, field, text)
+    }
+
+    fn for_project(
+        &self,
+        slug: &str,
+        field: &str,
+        text: &str,
+    ) -> Option<std::result::Result<String, Vec<String>>> {
+        let r = self.project_redactor(slug)?;
+        Some(self.screen(&r, field, text))
     }
 }
 
@@ -1778,7 +1868,8 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     let started_at = now_rfc3339();
     let settings = env.settings.get();
     let assume = local_offset();
-    let filter = RedactFilter::new(env.redactors.for_root_always_on(None));
+    let filter = RedactFilter::new(env.redactors.for_root_always_on(None))
+        .with_project_rules(env.readers.clone(), env.redactors.clone());
     let mut phases: Vec<PhaseTiming> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let lap = |phases: &mut Vec<PhaseTiming>, name: &str, t: Instant| {
