@@ -1400,11 +1400,14 @@ impl Service {
                 match send {
                     Some(q) => {
                         let idx = idx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            search::embed_query(Some(&idx), embedder.as_ref(), &q)
+                        let v = tokio::task::spawn_blocking(move || {
+                            search::embed_query_or_why(Some(&idx), embedder.as_ref(), &q)
                         })
                         .await
-                        .map_err(join_err)?
+                        .map_err(join_err)?;
+                        // A recall that used word matches only says so (the first one after
+                        // the model was unloaded for being idle, a provider that is down).
+                        v.map_err(|why| notes.push(why)).ok()
                     }
                     None => {
                         notes.push(QUERY_HELD_BACK.into());
@@ -1412,8 +1415,13 @@ impl Service {
                     }
                 }
             }
-            _ => None,
+            _ => {
+                notes.push(search::INDEX_REBUILDING.into());
+                None
+            }
         };
+        // Whether meaning-search ran: without it, "nothing answers" would claim too much.
+        let vector_ran = vector.is_some();
         // The raw tier's chunk vector list reads on this pool, beside the main reader's word
         // lists: one connection of each, main first (`ServiceOptions::vector_reader_pool`).
         let vector_readers = self.vector_readers.clone();
@@ -1505,6 +1513,10 @@ impl Service {
                     .first()
                     .is_some_and(|h| exact_match(&judged_query, h))
             {
+                low_confidence = false;
+            }
+            // Only words were searched: what was not found by meaning may still be there.
+            if !vector_ran {
                 low_confidence = false;
             }
             if low_confidence {
@@ -7611,6 +7623,105 @@ mod tests {
                 .any(|st| st.contains("status superseded: a newer memory replaced it")),
             "the judge was told"
         );
+        s.shutdown();
+    }
+
+    /// A fake embedder whose query embedding fails with `fail` while it is set (a text that
+    /// starts with `MODEL_LOADING` fails as an unloaded model does, any other as a provider
+    /// that is down).
+    struct FlakyQueries {
+        inner: FakeEmbedder,
+        fail: Arc<Mutex<Option<String>>>,
+    }
+
+    impl Embedder for FlakyQueries {
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.inner.embed_passages(texts)
+        }
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            match self.fail.lock().clone() {
+                Some(m) if m.starts_with(alice_core::embed::MODEL_LOADING) => {
+                    Err(AliceError::Other(m))
+                }
+                Some(m) => Err(AliceError::Unavailable(m)),
+                None => self.inner.embed_query(text),
+            }
+        }
+    }
+
+    /// Final review C-I2: a recall whose query was not embedded (the model reloading after an
+    /// idle unload, a provider that is down) says it used word matches only, and is never
+    /// flagged `low_confidence`: meaning-search did not run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_whose_query_was_not_embedded_says_so_and_is_not_low_confidence() {
+        let grader = KeywordGrader::new("WOMBAT");
+        let fail: Arc<Mutex<Option<String>>> = Default::default();
+        let d = tempfile::tempdir().unwrap();
+        let f = fail.clone();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &move || {
+                Ok(Arc::new(FlakyQueries {
+                    inner: FakeEmbedder::new(384),
+                    fail: f.clone(),
+                }) as Arc<dyn Embedder>)
+            },
+            ServiceOptions {
+                jev_transport: Some(grader.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        // With a query vector: graded, nothing answers, and it says so.
+        let r = s
+            .recall(recall_req(VAGUE, RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(r.reranked && r.low_confidence, "{:?}", r.notes);
+        for (why, said) in [
+            (
+                alice_core::embed::MODEL_LOADING.to_string(),
+                alice_core::embed::MODEL_LOADING,
+            ),
+            (
+                "the provider did not answer".to_string(),
+                "this search used word matches only: the embedding provider is unavailable",
+            ),
+        ] {
+            *fail.lock() = Some(why);
+            let r = s
+                .recall(recall_req(VAGUE, RecallMode::Precise, &cwd))
+                .await
+                .unwrap();
+            assert!(!r.results.is_empty(), "words still find them");
+            assert!(r.notes.iter().any(|n| n == said), "{:?}", r.notes);
+            assert!(!r.low_confidence, "{:?}", r.notes);
+            assert!(
+                r.notes.iter().all(|n| n != NOTHING_ANSWERS),
+                "{:?}",
+                r.notes
+            );
+            let text = s
+                .recall(RecallRequest {
+                    format: OutputFormat::Text,
+                    ..recall_req(VAGUE, RecallMode::Fast, &cwd)
+                })
+                .await
+                .unwrap();
+            assert!(text.text.unwrap().contains("word matches only"));
+        }
         s.shutdown();
     }
 
