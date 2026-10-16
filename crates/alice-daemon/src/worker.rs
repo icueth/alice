@@ -285,33 +285,35 @@ pub(crate) fn project_allowed(
     allowed
 }
 
-/// The texts of `items` as the embedder may see them. A remote one gets each text redacted with
-/// its project's always-on rules (the ones a Jev request gets: today's patterns, whatever
-/// `privacy.redact` stored); a local one gets the stored text. Items the policy did not allow
-/// never get here (see [`split_by_policy`]).
-pub(crate) fn texts_for(
+/// `items` with their texts as the embedder may see them. For a remote one each text is
+/// redacted with its project's always-on rules (the ones a Jev request gets: today's patterns,
+/// whatever `privacy.redact` stored); a local one gets the stored text. Done before
+/// [`split_by_policy`], so the policy is still asked right before the texts are sent (and
+/// redaction is idempotent, so a retry may run it again).
+pub(crate) fn redacted_for(
     readers: &ReaderPool,
     policy: Option<&Arc<dyn JevPolicy>>,
     remote: bool,
-    items: &[PendingItem],
-) -> Vec<String> {
+    mut items: Vec<PendingItem>,
+) -> Vec<PendingItem> {
     if !remote {
-        return items.iter().map(|i| i.text.clone()).collect();
+        return items;
     }
-    let mut rules: HashMap<&str, Arc<Redactor>> = HashMap::new();
+    let mut rules: HashMap<String, Arc<Redactor>> = HashMap::new();
+    for i in &mut items {
+        let r = rules.entry(i.project_id.clone()).or_insert_with(|| {
+            match (policy, slug_of(readers, &i.project_id)) {
+                (Some(p), Some(slug)) => p.redactor(&slug),
+                // Never sent (no policy, an unknown project); redacted all the same.
+                _ => Arc::new(Redactor::builtin()),
+            }
+        });
+        let out = r.apply(&i.text);
+        if !out.found.is_empty() {
+            i.text = out.text;
+        }
+    }
     items
-        .iter()
-        .map(|i| {
-            let r = rules.entry(i.project_id.as_str()).or_insert_with(|| {
-                match (policy, slug_of(readers, &i.project_id)) {
-                    (Some(p), Some(slug)) => p.redactor(&slug),
-                    // Never sent (no policy, an unknown project); redacted all the same.
-                    _ => Arc::new(Redactor::builtin()),
-                }
-            });
-            r.apply(&i.text).text
-        })
-        .collect()
 }
 
 /// `items` split into those that may be sent to the embedder and those the cloud policy keeps
@@ -430,7 +432,8 @@ fn run(cfg: WorkerConfig) {
             continue;
         }
 
-        // A remote embedder gets only what the cloud policy lets leave the machine.
+        // A remote embedder gets only what the cloud policy lets leave the machine, redacted.
+        let items = redacted_for(&cfg.readers, cfg.policy.as_ref(), remote, items);
         let (items, held_back) = split_by_policy(&cfg.readers, cfg.policy.as_ref(), remote, items);
         if !held_back.is_empty() {
             tracing::info!(
@@ -449,7 +452,7 @@ fn run(cfg: WorkerConfig) {
         }
 
         let n_items = items.len();
-        let texts = texts_for(&cfg.readers, cfg.policy.as_ref(), remote, &items);
+        let texts = items.iter().map(|i| i.text.clone()).collect();
         let results = embed_each(active.embedder.as_ref(), texts, !remote);
         let mut done = Vec::new();
         let (mut retry, mut give_up) = (Vec::new(), Vec::new());
