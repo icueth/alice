@@ -35,6 +35,9 @@ pub struct Server {
     pub team: Option<Tenant>,
     recorders: Vec<(String, Arc<Mutex<Vec<Seen>>>)>,
     paused: Arc<AtomicBool>,
+    stalled: Arc<AtomicBool>,
+    /// Milliseconds every routed request waits before it is forwarded.
+    request_delay_ms: Arc<AtomicU64>,
     /// Milliseconds the team store waits before it answers `/api/v1/recall`.
     team_recall_delay_ms: Arc<AtomicU64>,
     stop: CancellationToken,
@@ -47,7 +50,12 @@ struct Front {
     port: u16,
     recorder: Arc<Mutex<Vec<Seen>>>,
     paused: Arc<AtomicBool>,
+    stalled: Arc<AtomicBool>,
+    request_delay_ms: Arc<AtomicU64>,
 }
+
+/// The longest a stalled request is held (a test that forgets to release it still ends).
+const STALL_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn not_found() -> Response {
     (
@@ -80,6 +88,14 @@ async fn front(State(f): State<Front>, req: Request, next: Next) -> Response {
         || path.starts_with("/mcp/");
     if !routed {
         return not_found();
+    }
+    let delay = f.request_delay_ms.load(Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+    let held = std::time::Instant::now();
+    while f.stalled.load(Ordering::SeqCst) && held.elapsed() < STALL_CAP {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     if f.paused.load(Ordering::SeqCst) {
         return StatusCode::BAD_GATEWAY.into_response();
@@ -150,6 +166,8 @@ impl Server {
         alice_daemon::install_tls();
         let stop = CancellationToken::new();
         let paused = Arc::new(AtomicBool::new(false));
+        let stalled = Arc::new(AtomicBool::new(false));
+        let request_delay_ms = Arc::new(AtomicU64::new(0));
         let mut app = Router::new();
         let mut tenants = Vec::new();
         let mut recorders = Vec::new();
@@ -234,6 +252,8 @@ impl Server {
                 port,
                 recorder: recorder.clone(),
                 paused: paused.clone(),
+                stalled: stalled.clone(),
+                request_delay_ms: request_delay_ms.clone(),
             };
             app = app.nest(
                 &format!("/u/{name}"),
@@ -265,6 +285,8 @@ impl Server {
             team,
             recorders,
             paused,
+            stalled,
+            request_delay_ms,
             team_recall_delay_ms,
             stop,
             team_stop,
@@ -305,6 +327,19 @@ impl Server {
     /// While paused, routed requests get a 502, as when a tenant's daemon is down.
     pub fn pause(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
+    }
+
+    /// While stalled, routed requests are held (the connection stays open and nothing is
+    /// answered), as when a tenant's daemon hangs; released, they go on as usual. A request is
+    /// held at most a minute.
+    pub fn stall(&self, stalled: bool) {
+        self.stalled.store(stalled, Ordering::SeqCst);
+    }
+
+    /// Makes every routed request wait `ms` milliseconds before it is forwarded (0: no wait),
+    /// as a slow link does: each client process then lives at least that long.
+    pub fn delay_requests(&self, ms: u64) {
+        self.request_delay_ms.store(ms, Ordering::SeqCst);
     }
 }
 

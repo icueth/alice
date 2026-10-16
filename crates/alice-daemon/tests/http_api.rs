@@ -881,6 +881,72 @@ async fn guard_refusals_explain_themselves() {
     assert_eq!(e["kind"], "forbidden");
 }
 
+/// SP2 §5.4: the tenant's capture scripts are public, like the ping (one pasted command fetches
+/// them before any token is known), static, and behind the Host and Origin guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_public_scripts_need_no_token_and_hold_no_secret() {
+    let s = Srv::start().await;
+    for (path, expected) in [
+        (
+            "/api/v1/capture/setup.sh",
+            include_str!("../scripts/capture/setup.sh"),
+        ),
+        (
+            "/api/v1/capture/hook.sh",
+            include_str!("../scripts/capture/hook.sh"),
+        ),
+    ] {
+        let r = s.http.get(s.url(path)).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{path} needs no token");
+        assert_eq!(
+            r.headers()["content-type"],
+            "text/plain; charset=utf-8",
+            "{path}"
+        );
+        assert_eq!(r.headers()["cache-control"], "no-store", "{path}");
+        let body = r.text().await.unwrap();
+        assert!(body.starts_with("#!/bin/sh\n"), "{path}");
+        assert_eq!(body, expected, "{path} is the compiled-in script");
+        // With a token it is the same text.
+        let r = s.get(path).await;
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.text().await.unwrap(), expected);
+        // The Host and Origin guard still applies.
+        let r = s
+            .http
+            .get(s.url(path))
+            .header("Host", "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "{path}");
+        let r = s
+            .http
+            .get(s.url(path))
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "{path}");
+        // No secret: not the daemon's token, and not the developer's key when it is set
+        // (the check `grep -c -F -- "$TYPESAFE_API_KEY"` makes, without printing the key).
+        assert!(!body.contains(&s.token), "{path}");
+        if let Ok(key) = std::env::var("TYPESAFE_API_KEY")
+            && !key.is_empty()
+        {
+            assert!(!body.contains(&key), "{path}");
+        }
+    }
+    // Only GET.
+    let r = s
+        .http
+        .post(s.url("/api/v1/capture/setup.sh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 405);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_shutdown_needs_the_token_and_cancels() {
     let s = Srv::start().await;

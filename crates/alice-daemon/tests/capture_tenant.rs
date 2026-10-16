@@ -475,6 +475,96 @@ async fn the_project_header_is_read_as_the_mcp_path_reads_it() {
     assert!(source_project(&t.home, &uri("tl")).is_none());
 }
 
+/// The name of the project the source `uri` (or, with `memory`, the memory holding that text)
+/// belongs to.
+fn project_name(home: &AliceHome, sql_key: &str, memory: bool) -> String {
+    let sql = if memory {
+        "SELECT p.name FROM memories m JOIN projects p ON p.id = m.project_id
+         WHERE instr(m.body, ?1) > 0"
+    } else {
+        "SELECT p.name FROM sources s JOIN projects p ON p.id = s.project_id WHERE s.uri = ?1"
+    };
+    db(home).query_row(sql, [sql_key], |r| r.get(0)).unwrap()
+}
+
+/// Every project name holds no control character.
+fn assert_no_control_in_names(home: &AliceHome) {
+    let c = db(home);
+    let mut st = c.prepare("SELECT name FROM projects").unwrap();
+    let names: Vec<String> = st
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for n in names {
+        assert!(!n.chars().any(char::is_control), "{n:?}");
+    }
+}
+
+/// Task 14 review: control characters in a hint (`%0A`, `%1B`, a raw tab) are stripped as the
+/// hint is decoded, so they never reach a stored project name: the capture routes' header and
+/// `project` query.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_characters_in_a_capture_hint_are_stripped() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let base = s.url("ann");
+    for (session, header, query, expected) in [
+        ("cc1", Some(b"Repo%0AOne%1B".as_slice()), None, "RepoOne"),
+        ("cc2", None, Some("Repo\nTwo\u{1b}"), "RepoTwo"),
+        ("cc3", Some(b"Tab\tRepo".as_slice()), None, "TabRepo"),
+    ] {
+        let mut tr = Transcript::default();
+        tr.turn(session, 1, "a hint with control characters");
+        let query = match query {
+            Some(p) => q_project(session, 0, "stop", p),
+            None => q(session, 0, "stop"),
+        };
+        accepted(upload(&base, Some(&t.token), &query, header, tr.bytes.clone()).await).await;
+        assert_eq!(project_name(&t.home, &uri(session), false), expected);
+    }
+    // The briefing reads the hint the same way: the stripped name is the project briefed.
+    let got = briefed(
+        briefing(
+            &base,
+            Some(&t.token),
+            &[("source", "startup")],
+            Some(b"Repo%0AOne"),
+        )
+        .await,
+    )
+    .await;
+    assert!(got.starts_with("# Context · repoone\n"), "{got}");
+    assert_no_control_in_names(&t.home);
+}
+
+/// The same on the MCP path: the `X-Alice-Project` header and the `?project=` of the URL.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_characters_in_an_mcp_hint_are_stripped() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let base = s.url("ann");
+    let c = connect_with_header(&format!("{base}/mcp"), &t.token, b"Repo%0AThree%1B").await;
+    let content = "a note sent with a control character in its header";
+    let r = tool(&c, "remember", json!({"content": content})).await;
+    c.cancel().await.ok();
+    assert_ne!(r.is_error, Some(true), "{}", text(&r));
+    assert_eq!(project_name(&t.home, content, true), "RepoThree");
+
+    let c = connect_with_header(
+        &format!("{base}/mcp?project=Repo%0AFour%07"),
+        &t.token,
+        b"ignored",
+    )
+    .await;
+    let content = "a note sent with a control character in its query";
+    let r = tool(&c, "remember", json!({"content": content})).await;
+    c.cancel().await.ok();
+    assert_ne!(r.is_error, Some(true), "{}", text(&r));
+    assert_eq!(project_name(&t.home, content, true), "RepoFour");
+    assert_no_control_in_names(&t.home);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lower_offset_answers_409_over_http() {
     let s = Server::start(&["ann"]).await;
@@ -691,12 +781,15 @@ async fn an_adopted_database_is_not_captured_twice() {
         "the cursor travels; the laptop's path and file identity are cleared at the tenant start"
     );
 
-    // 3. The tenant script's first upload for the session starts from 0: a 409 jump.
+    // 3. The tenant script's first upload for the session starts from 0: a 409 jump. Its hint
+    // names another project than the laptop's (the checkout was renamed since), so a source that
+    // followed the hint would be caught moving.
+    assert_ne!(laptop_project.1, "renamed-repo");
     let r = upload(
         &base,
         Some(&t.token),
         &q("ad", 0, "stop"),
-        Some(b"laptop-repo"),
+        Some(b"Renamed Repo"),
         tr.bytes.clone(),
     )
     .await;
@@ -714,7 +807,7 @@ async fn an_adopted_database_is_not_captured_twice() {
             &base,
             Some(&t.token),
             &q("ad", from, "stop"),
-            Some(b"laptop-repo"),
+            Some(b"Renamed Repo"),
             tr.bytes[from as usize..].to_vec(),
         )
         .await,
@@ -732,6 +825,14 @@ async fn an_adopted_database_is_not_captured_twice() {
     // the row still names no path.
     assert_eq!(source_project(&home, &uri("ad")).unwrap(), laptop_project);
     assert_eq!(count(&home, "SELECT count(*) FROM projects"), projects);
+    assert_eq!(
+        count(
+            &home,
+            "SELECT count(*) FROM projects WHERE slug = 'renamed-repo' OR key = 'import:renamed-repo'"
+        ),
+        0,
+        "the hint made no project"
+    );
     assert_eq!(capture_row(&home, &uri("ad")), (tr.len(), None, None));
 }
 

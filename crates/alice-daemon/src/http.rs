@@ -605,19 +605,23 @@ async fn compat_call(
 
 /// The project hint of a capture request, read as the MCP path reads it
 /// (`mcp::project_header`, `mcp::check_project_name`): the `X-Alice-Project` header, which wins
-/// over the `project` query parameter, each refused over the name limits. Only a tenant reads
-/// either, as MCP does; a local daemon takes the project from `cwd` (plan decision P8), so the
-/// header is not read there. Returns the header's name; the query's stays where it is.
+/// over the `project` query parameter, each refused over the name limits and each with its
+/// control characters removed (`query` is cleaned in place). Only a tenant reads either, as MCP
+/// does; a local daemon takes the project from `cwd` (plan decision P8), so the header is not
+/// read there. Returns the header's name; the query's stays where it is.
 fn capture_hint(
     svc: &Service,
     headers: &HeaderMap,
-    query: Option<&str>,
+    query: &mut Option<String>,
 ) -> Result<Option<String>, ApiError> {
     if !svc.is_tenant() {
         return Ok(None);
     }
+    if let Some(q) = query.as_mut() {
+        *q = crate::mcp::strip_controls(q);
+    }
     let header = crate::mcp::project_header(headers)?;
-    match (&header, query.filter(|q| !q.trim().is_empty())) {
+    match (&header, query.as_deref().filter(|q| !q.trim().is_empty())) {
         (Some(h), _) => crate::mcp::check_project_name(h, crate::mcp::FROM_PROJECT_HEADER)?,
         (None, Some(q)) => crate::mcp::check_project_name(q, crate::mcp::FROM_PROJECT_QUERY)?,
         (None, None) => {}
@@ -645,7 +649,7 @@ async fn capture_transcript(
             .into_response();
         }
     };
-    q.project_header = match capture_hint(&st.svc, &headers, q.project.as_deref()) {
+    q.project_header = match capture_hint(&st.svc, &headers, &mut q.project) {
         Ok(h) => h,
         Err(e) => return e.into_response(),
     };
@@ -697,11 +701,41 @@ async fn capture_briefing(
             r.body_text()
         )))
     })?;
-    q.project_header = capture_hint(&st.svc, &headers, q.project.as_deref())?;
+    q.project_header = capture_hint(&st.svc, &headers, &mut q.project)?;
     Ok(match st.svc.capture_briefing(q).await? {
         Some(text) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
     })
+}
+
+/// The tenant capture scripts (SP2 spec §5.3, §5.4), compiled in. They hold no secret and no
+/// address: the setup script takes the tenant's URL as its argument and the token from a file
+/// or the terminal.
+const SETUP_SH: &str = include_str!("../scripts/capture/setup.sh");
+const HOOK_SH: &str = include_str!("../scripts/capture/hook.sh");
+
+/// A capture script as plain text, never cached (a re-run of setup must get this version's).
+fn capture_script(text: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        text,
+    )
+        .into_response()
+}
+
+/// `GET /api/v1/capture/setup.sh`: public, like the ping (the one pasted command fetches it
+/// before any token is known), behind the Host and Origin guard.
+async fn capture_setup_script() -> Response {
+    capture_script(SETUP_SH)
+}
+
+/// `GET /api/v1/capture/hook.sh`: public; `setup.sh` installs it as
+/// `~/.config/alice/alice-capture.sh`.
+async fn capture_hook_script() -> Response {
+    capture_script(HOOK_SH)
 }
 
 async fn import_status(State(st): State<AppState>) -> Json<alice_core::import::ImportStatus> {
@@ -908,8 +942,8 @@ async fn end_on_rotation(State(st): State<AppState>, req: Request, next: Next) -
     Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
-/// Build the router: the public ping, and everything else (the JSON API and the MCP service
-/// at `/mcp`) behind the token, Host and Origin guard.
+/// Build the router: the public ping and capture scripts, and everything else (the JSON API and
+/// the MCP service at `/mcp`) behind the token, Host and Origin guard.
 pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: CancellationToken) -> Router {
     let token: SharedToken = Arc::new(parking_lot::RwLock::new(Arc::from(token)));
     let g = Guard::new(token.clone(), port);
@@ -922,6 +956,8 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
     };
     let public = Router::new()
         .route("/api/v1/ping", get(ping))
+        .route("/api/v1/capture/setup.sh", get(capture_setup_script))
+        .route("/api/v1/capture/hook.sh", get(capture_hook_script))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(g.clone(), host_guard));
     let private = Router::new()

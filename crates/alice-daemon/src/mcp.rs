@@ -365,10 +365,18 @@ pub(crate) const FROM_PROJECT_HEADER: &str = "the X-Alice-Project header";
 /// See [`FROM_PROJECT_HEADER`].
 pub(crate) const FROM_PROJECT_QUERY: &str = "?project=";
 
-/// The project the `X-Alice-Project` header names: UTF-8 or percent-encoded UTF-8, trimmed;
-/// `None` when the header is absent or blank. Other bytes are refused rather than falling to
-/// another project. The MCP handlers and the capture routes both read the header with this, so
-/// they resolve the same hint the same way.
+/// A project hint a client sent, with its control characters (a newline, an escape, a tab,
+/// percent-encoded or not) removed, so none reaches a stored project name. Applied wherever a
+/// hint is decoded: the `X-Alice-Project` header, MCP's `?project=` and root name, and the
+/// capture routes' `project` query.
+pub(crate) fn strip_controls(hint: &str) -> String {
+    hint.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// The project the `X-Alice-Project` header names: UTF-8 or percent-encoded UTF-8, control
+/// characters removed, trimmed; `None` when the header is absent or blank. Other bytes are
+/// refused rather than falling to another project. The MCP handlers and the capture routes both
+/// read the header with this, so they resolve the same hint the same way.
 pub(crate) fn project_header(
     headers: &axum::http::HeaderMap,
 ) -> Result<Option<String>, AliceError> {
@@ -383,7 +391,7 @@ pub(crate) fn project_header(
                 "the X-Alice-Project header is not UTF-8: send the project name as UTF-8 or percent-encoded UTF-8",
             )
         })?;
-    Ok(Some(decoded.trim().to_string()).filter(|v| !v.is_empty()))
+    Ok(Some(strip_controls(&decoded).trim().to_string()).filter(|v| !v.is_empty()))
 }
 
 /// Refuses a project name a caller sent over the name or slug limit. The message says where it
@@ -467,8 +475,8 @@ impl AliceMcp {
         let parts = ctx.extensions.get::<axum::http::request::Parts>();
         let queried = parts.and_then(|p| p.uri.query()).and_then(|q| {
             url::form_urlencoded::parse(q.as_bytes())
-                .find(|(k, v)| k == "project" && !v.trim().is_empty())
-                .map(|(_, v)| v.into_owned())
+                .find(|(k, v)| k == "project" && !strip_controls(v).trim().is_empty())
+                .map(|(_, v)| strip_controls(&v))
         });
         let invalid = |e: AliceError| McpError::invalid_params(e.to_string(), None);
         let header = match parts {
@@ -491,8 +499,9 @@ impl AliceMcp {
                 .and_then(|root| {
                     std::path::Path::new(&root)
                         .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
+                        .map(|n| strip_controls(&n.to_string_lossy()))
                 })
+                .filter(|n| !n.trim().is_empty())
                 .filter(|n| within_project_limits(n)),
         };
         Ok((hint, None))
