@@ -54,6 +54,8 @@ struct DistillScript {
     questions: Mutex<Vec<Vec<String>>>,
     /// Every request body received (the judge's and distillation's).
     bodies: Mutex<Vec<String>>,
+    /// The probability of a distillation answer's option (1.0); the rest goes to `ephemeral`.
+    top: Mutex<f64>,
 }
 
 fn is_distill_question(id: &str) -> bool {
@@ -71,6 +73,7 @@ impl DistillScript {
             distill_calls: AtomicUsize::new(0),
             questions: Mutex::new(Vec::new()),
             bodies: Mutex::new(Vec::new()),
+            top: Mutex::new(1.0),
         })
     }
 
@@ -162,13 +165,27 @@ impl JevTransport for DistillScript {
                     .find(|o| offered(o))
                     .map_or_else(|| options[0].clone(), str::to_string)
             };
+            let top = if is_distill_question(qid) && choice != "ephemeral" {
+                *self.top.lock()
+            } else {
+                1.0
+            };
             let probs: serde_json::Map<String, serde_json::Value> = options
                 .iter()
-                .map(|o| (o.clone(), json!(if *o == choice { 1.0 } else { 0.0 })))
+                .map(|o| {
+                    let p = if *o == choice {
+                        top
+                    } else if o == "ephemeral" {
+                        1.0 - top
+                    } else {
+                        0.0
+                    };
+                    (o.clone(), json!(p))
+                })
                 .collect();
             answers.insert(
                 qid.clone(),
-                json!({"type": "choice", "choice": choice, "confidence": 1.0, "probabilities": probs}),
+                json!({"type": "choice", "choice": choice, "confidence": top, "probabilities": probs}),
             );
         }
         let resp = json!({"model": "jev-1.13.0", "answers": answers,
@@ -2633,5 +2650,228 @@ async fn an_emptied_capture_source_settles_done_without_a_request() {
         .count();
     assert_eq!(runs, 1, "one run, then it rests");
     assert!(d.distilled().is_empty());
+    d.shutdown();
+}
+
+/// `n` pseudo-words of random syllables, so generated passages share few trigrams.
+fn words(seed: u64, n: usize) -> String {
+    const C: [&str; 17] = [
+        "b", "d", "f", "g", "k", "l", "m", "n", "p", "r", "s", "t", "v", "z", "ch", "sh", "th",
+    ];
+    const V: [&str; 6] = ["a", "e", "i", "o", "u", "ai"];
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+    let mut next = || {
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (x >> 33) as usize
+    };
+    (0..n)
+        .map(|_| {
+            (0..2 + next() % 2)
+                .map(|_| format!("{}{}", C[next() % C.len()], V[next() % V.len()]))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Task 12b, the brief's flow: one session of three main runs and twelve subagent sources, every
+/// passage answered at p 0.95 as knowledge. `distill.max_per_subagent_run = 4` here, so the
+/// subagents' share of the session (8 of 16) is what stops them. The session keeps 16 in all, 8
+/// of them from subagents; its third run still keeps main-session memories and asks nothing
+/// about the subagents' passages; and once it is capped, a further due-mark sends nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_session_with_many_subagents_keeps_at_most_its_cap() {
+    let config =
+        "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_subagent_run = 4\n";
+    let d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(&[("Main fact", "fact"), ("Review finding", "decision")]),
+    );
+    *d.script.top.lock() = 0.95;
+    let cwd = d.repo("shop").to_string_lossy().into_owned();
+    let mut main = Transcript::default();
+    let mut sent = 0;
+    let mut agents = 0;
+    // (main turns, subagents) per run; then a fourth due-mark after the cap.
+    for (run, turns, subagents) in [(1u64, 3, 4), (2, 3, 4), (3, 4, 4), (4, 2, 1)] {
+        for i in 0..turns {
+            main.prompt(&format!("fl-p{run}-{i}"), &format!("Go on {run}.{i}."))
+                .reply(
+                    &format!("fl-a{run}-{i}"),
+                    &format!("Main fact {run}.{i}: {}.", words(100 * run + i, 18)),
+                );
+        }
+        d.send("shop", "fl1", &main, sent, "stop").await;
+        sent = main.len();
+        for _ in 0..subagents {
+            agents += 1;
+            let id = format!("ag{agents}");
+            let mut sub = Transcript::subagent(&id);
+            sub.prompt(
+                &format!("{id}-p"),
+                "Review this part of the change and report back.",
+            )
+            .reply(
+                &format!("{id}-a"),
+                &format!("Review finding {agents}: {}.", words(5_000 + agents, 30)),
+            );
+            let a = d
+                .send_q(
+                    TranscriptQuery {
+                        agent: "claude-code".into(),
+                        session: "fl1".into(),
+                        subagent: Some(id.clone()),
+                        offset: 0,
+                        event: "subagent-stop".into(),
+                        cwd: Some(cwd.clone()),
+                        ..Default::default()
+                    },
+                    &sub.bytes,
+                )
+                .await;
+            assert!(a.turns_stored >= 1, "{a:?}");
+        }
+        let calls = d.script.distill_calls();
+        d.svc.capture_distill_now("fl1").await.unwrap();
+        until("the run is over", || {
+            let runs = d.svc.distill_runs();
+            runs.len() as u64 == run && d.state(&uri("fl1")).state == "done"
+        })
+        .await;
+        let got = d.svc.distill_runs().last().cloned().unwrap();
+        let mems = d.distilled();
+        let sub_keys = mems
+            .iter()
+            .filter(|m| {
+                let key: String = d
+                    .db()
+                    .query_row(
+                        "SELECT idempotency_key FROM memories WHERE id = ?1",
+                        [&m.id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                key.starts_with("distill:sub:")
+            })
+            .count();
+        let in_subagents = mems
+            .iter()
+            .filter(|m| {
+                d.db()
+                    .query_row(
+                        "SELECT count(*) FROM provenance p JOIN chunks ch ON ch.id = p.chunk_id
+                         JOIN capture_state s ON s.source_id = ch.source_id
+                         WHERE p.memory_id = ?1 AND s.parent_source_id IS NOT NULL",
+                        [&m.id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap()
+                    > 0
+            })
+            .count();
+        assert_eq!(sub_keys, in_subagents, "run {run}: {mems:#?}");
+        let main_mems = mems.len() - in_subagents;
+        match run {
+            1 => assert_eq!((got.stored, mems.len(), in_subagents), (7, 7, 4), "{got:?}"),
+            2 => assert_eq!(
+                (got.stored, mems.len(), in_subagents),
+                (7, 14, 8),
+                "{got:?}"
+            ),
+            3 => {
+                assert_eq!(
+                    (got.stored, mems.len(), in_subagents),
+                    (2, 16, 8),
+                    "{got:?}"
+                );
+                assert_eq!(
+                    main_mems, 8,
+                    "the third run still keeps main-session memories"
+                );
+                let asked = d.script.questions.lock().last().cloned().unwrap();
+                assert_eq!(asked.len(), 4, "the main passages only: {asked:#?}");
+                assert!(asked.iter().all(|q| !q.contains("Review finding")));
+            }
+            _ => {
+                assert_eq!(
+                    d.script.distill_calls(),
+                    calls,
+                    "a capped session sends nothing"
+                );
+                assert_eq!(
+                    (got.questions, got.stored, got.state.as_str()),
+                    (0, 0, "done")
+                );
+                assert_eq!((mems.len(), in_subagents), (16, 8));
+            }
+        }
+        assert!(
+            mems.iter()
+                .all(|m| m.status == "active" || m.judge_state != "done")
+        );
+    }
+    // The cursors moved over what the capped run did not ask about.
+    let st = d.state(&uri("fl1"));
+    assert_eq!(st.distill_ord, st.next_ord);
+    let last = d.state(&format!("{}:agent:ag{agents}", uri("fl1")));
+    assert_eq!(last.distill_ord, last.next_ord);
+    // A further due-mark: still nothing sent.
+    let calls = d.script.distill_calls();
+    d.svc.capture_distill_now("fl1").await.unwrap();
+    until("the fifth run is over", || d.svc.distill_runs().len() == 5).await;
+    settle().await;
+    assert_eq!(d.script.distill_calls(), calls);
+    assert_eq!(d.distilled().len(), 16);
+    d.shutdown();
+}
+
+/// Task 12b, ruling F4: the worker hands the project's names to the routing guard. A preference
+/// of the user's that names the repository's folder (`Shop_Front`, whose slug is not that) stays
+/// in the project; one that names nothing of it goes to `global`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_users_preference_that_names_the_repository_stays_in_it() {
+    let d = Daemon::start(
+        Opts::jev(),
+        DistillScript::new(&[
+            ("Shop_Front changelog", "preference_user"),
+            ("always answer in British English", "preference_user"),
+        ]),
+    );
+    let mut t = Transcript::default();
+    t.prompt("pr-p1", "Go on.")
+        .reply(
+            "pr-a1",
+            "Noted: keep the Shop_Front changelog in English and Thai, and update both in the same commit.",
+        )
+        .prompt("pr-p2", "And one more.")
+        .reply(
+            "pr-a2",
+            "Understood: from now on I will always answer in British English in every project, including code comments and commit messages.",
+        );
+    d.send("Shop_Front", "pr1", &t, 0, "session-end").await;
+    until("the session is distilled", || {
+        d.state(&uri("pr1")).state == "done"
+    })
+    .await;
+    let mems = d.distilled();
+    assert_eq!(mems.len(), 2, "{mems:?}");
+    let project = |needle: &str| -> String {
+        mems.iter()
+            .find(|m| m.body.contains(needle))
+            .unwrap_or_else(|| panic!("{needle}: {mems:?}"))
+            .project
+            .clone()
+    };
+    assert_ne!(project("Shop_Front changelog"), "global", "{mems:?}");
+    assert!(
+        !project("Shop_Front changelog").contains('_'),
+        "the slug is not the folder's name"
+    );
+    assert_eq!(project("British English"), "global");
     d.shutdown();
 }

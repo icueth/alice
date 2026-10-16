@@ -21,15 +21,19 @@
 //!    - the breaker is open: `due` again at its time.
 //! 2. Each subagent by its own project's rules (the same three, without the switches): one
 //!    that is not allowed keeps its chunks and says why in its own state.
-//! 3. The session's chunks from `distill_ord` on, and the allowed subagents' from theirs, about
+//! 3. The session's caps (Task 12b, spec §6.4): what the session's earlier runs kept
+//!    ([`session_kept`]) sets this run's room under `distill.max_per_session` and the
+//!    subagents' share. A session with no room left sends nothing: its cursors move to the end
+//!    of what is written, and it is `done`.
+//! 4. The session's chunks from `distill_ord` on, and the allowed subagents' from theirs, about
 //!    two runs' worth and below each source's `next_ord`, with their turn starts (Task 12
 //!    supplement, items 1 and 11).
-//! 4. [`distill::prepare`], one Jev request for every project the run covers
-//!    ([`Judge::ask_distill`], so at most one in flight), then [`distill::decide`].
-//! 5. Each kept passage written with [`write_memory`] in the project of the source it came from:
+//! 5. [`distill::prepare`] within the run's caps, one Jev request for every project the run
+//!    covers ([`Judge::ask_distill`], so at most one in flight), then [`distill::decide`].
+//! 6. Each kept passage written with [`write_memory`] in the project of the source it came from:
 //!    redacted with that project's rules, `origin = distill`, its chunks as provenance and an
 //!    idempotency key, so a repeated run (a crash before the cursor moved) stores nothing twice.
-//! 6. The cursors move to the end of the run; the source is `done`, or `due` again when more of
+//! 7. The cursors move to the end of the run; the source is `done`, or `due` again when more of
 //!    it is left.
 //!
 //! `Budget` waits for the next UTC day (`waiting_budget`) and `Denied` is `skipped_cloud`: both
@@ -45,7 +49,7 @@ use crate::redaction::Redactors;
 use crate::writer::{CaptureChange, ProjectChoice, WriteOp, WriteOutcome, WriterHandle};
 use alice_core::capture::AgentKind;
 use alice_core::distill::{
-    self, DistillConfig, DistilledMemory, RUN_MAX_CHARS, RunChunk, RunInput,
+    self, DistillConfig, DistilledMemory, RUN_MAX_CHARS, RunChunk, RunInput, SessionKept,
 };
 use alice_core::ids::now_rfc3339;
 use alice_core::judge::{Judge, JudgeError};
@@ -636,6 +640,43 @@ impl DistillCtl {
                 other => (other, None),
             }
         };
+        // The session's caps (Task 12b): what its earlier runs kept bounds this one. A session
+        // that has kept `distill.max_per_session` asks Jev nothing more: its cursors move to the
+        // end of what is written, and it is done.
+        let kept = match self.ctx.readers.with(|c| session_kept(c, &src.source_id)) {
+            Ok(k) => k,
+            Err(e) => return self.read_failed(src, report, &e),
+        };
+        let cfg = DistillConfig::for_session(&s.distill, kept);
+        if !cfg.keeps_any() {
+            if src.next_ord > src.distill_ord {
+                self.change(
+                    &src.source_id,
+                    CaptureChange::Distilled {
+                        distill_ord: src.next_ord,
+                    },
+                )?;
+            }
+            for (k, _) in &included {
+                self.change(
+                    &k.source_id,
+                    CaptureChange::Distilled {
+                        distill_ord: k.next_ord,
+                    },
+                )?;
+            }
+            tracing::info!(
+                uri = src.uri,
+                kept = kept.all,
+                "the session has kept distill.max_per_session memories; the rest of it is not sent to Jev"
+            );
+            let (state, next) = rest(DistillState::Done);
+            return self.leave(src, report, state, next, 0);
+        }
+        let project_names = match self.ctx.readers.with(|c| project_names(c, &src.project_id)) {
+            Ok(n) => n,
+            Err(e) => return self.read_failed(src, report, &e),
+        };
 
         let mut loaded = match self.load(src, &included) {
             Ok(l) => l,
@@ -658,6 +699,7 @@ impl DistillCtl {
         let input = RunInput {
             uri: src.uri.clone(),
             project: slug.clone(),
+            project_names,
             closes_session: !loaded.main_cut
                 && (src.ended
                     || matches!(
@@ -666,7 +708,7 @@ impl DistillCtl {
                     )),
             chunks: std::mem::take(&mut loaded.chunks),
         };
-        let prepared = distill::prepare(&input);
+        let prepared = distill::prepare(&input).within(&cfg);
         let mut report = report;
         report.questions = prepared.questions.len();
         let memories = if prepared.questions.is_empty() {
@@ -684,12 +726,7 @@ impl DistillCtl {
                     if !cached {
                         self.breaker.lock().success();
                     }
-                    distill::decide(
-                        &prepared,
-                        &answers,
-                        &src.uri,
-                        &DistillConfig::from(&s.distill),
-                    )
+                    distill::decide(&prepared, &answers, &src.uri, &cfg)
                 }
                 // Our own words: the judge error's wraps the share stop in the judge's budget.
                 Err(JudgeError::Budget(_)) => {
@@ -1302,6 +1339,42 @@ pub(crate) fn write_memory(
             other.name()
         ))),
     }
+}
+
+/// What the session of the main source `source_id` has kept so far (spec §6.4): its live
+/// (`origin = distill`, not trashed) memories, found by their provenance in any of its sources,
+/// the subagents' included, and of them those kept from a subagent report (their key starts with
+/// [`distill::SUBAGENT_KEY_PREFIX`]).
+fn session_kept(c: &Connection, source_id: &str) -> Result<SessionKept> {
+    let prefix = distill::SUBAGENT_KEY_PREFIX;
+    let (all, subagent): (i64, i64) = c.query_row(
+        "SELECT count(*), coalesce(sum(substr(m.idempotency_key, 1, ?2) = ?3), 0)
+         FROM memories m
+         WHERE m.origin = 'distill' AND m.status <> 'trashed'
+           AND m.id IN (SELECT p.memory_id FROM capture_state s
+                        JOIN chunks ch ON ch.source_id = s.source_id
+                        JOIN provenance p ON p.chunk_id = ch.id
+                        WHERE s.source_id = ?1 OR s.parent_source_id = ?1)",
+        rusqlite::params![source_id, prefix.len() as i64, prefix],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(SessionKept {
+        all: usize::try_from(all).unwrap_or(0),
+        subagent: usize::try_from(subagent).unwrap_or(0),
+    })
+}
+
+/// The other names of project `project_id` for distillation's routing guard (spec §6.5): its
+/// name, and the folder and path of its working tree when it has one.
+fn project_names(c: &Connection, project_id: &str) -> Result<Vec<String>> {
+    let mut names = vec![projects::get_by_id(c, project_id)?.name];
+    if let Some(root) = projects::root_of(c, project_id)? {
+        if let Some(folder) = std::path::Path::new(&root).file_name() {
+            names.push(folder.to_string_lossy().into_owned());
+        }
+        names.push(root);
+    }
+    Ok(names)
 }
 
 /// A stored chunk: `(id, ord, text)`.

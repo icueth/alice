@@ -13,6 +13,11 @@
 //!   `cargo test -p alice-daemon --test distill_eval distill_eval_live -- --ignored --nocapture`.
 //!   With `ALICE_DISTILL_EVAL_DRY=1` nothing is sent: a scripted Jev answers, and the pipeline runs
 //!   twice and must send the same bodies both times. This is the free check before a live run.
+//! - `distill_eval_flood_replay` and `distill_eval_flood_live` (Task 12b): the same two for the
+//!   flood set in `fixtures/distill/flood/` (twenty reviewer verdicts next to three lessons), with
+//!   its own `recorded.jsonl` and thresholds; Task 13's set and thresholds are not touched. Record
+//!   it with `cargo test -p alice-daemon --test distill_eval distill_eval_flood_live -- --ignored
+//!   --nocapture` (`ALICE_DISTILL_EVAL_DRY=1` for the free check first).
 //!
 //! How the set is run:
 //! - **Isolation:** each session gets its own daemon, so what the judge compares never depends on
@@ -71,6 +76,11 @@ fn recorded_path() -> PathBuf {
     dir().join("recorded.jsonl")
 }
 
+/// The flood set (Task 12b): one session of reviewer verdicts next to three lessons.
+fn flood_dir() -> PathBuf {
+    dir().join("flood")
+}
+
 // ---- The set ----
 
 #[derive(Debug, Clone)]
@@ -99,6 +109,9 @@ struct Session {
     /// Written in Thai, or in Thai and English.
     thai: bool,
     remembered: Vec<Remembered>,
+    /// The flood set: the opening words of each verdict or status report, which should end
+    /// `ephemeral`.
+    verdicts: Vec<String>,
 }
 
 impl Session {
@@ -112,7 +125,11 @@ impl Session {
 }
 
 fn load_set() -> Vec<Session> {
-    let text = std::fs::read_to_string(dir().join("labels.json")).unwrap();
+    load_set_in(&dir())
+}
+
+fn load_set_in(dir: &Path) -> Vec<Session> {
+    let text = std::fs::read_to_string(dir.join("labels.json")).unwrap();
     let labels: Value = serde_json::from_str(&text).unwrap();
     let opts = ReadOptions {
         at_file_start: true,
@@ -125,7 +142,7 @@ fn load_set() -> Vec<Session> {
         .iter()
         .map(|s| {
             let file = s["file"].as_str().unwrap().to_owned();
-            let bytes = std::fs::read(dir().join("sessions").join(&file)).unwrap();
+            let bytes = std::fs::read(dir.join("sessions").join(&file)).unwrap();
             let (mut id, mut cwd, mut remembered) = (None, None, Vec::new());
             for line in std::str::from_utf8(&bytes).unwrap().lines() {
                 let v: Value = serde_json::from_str(line).unwrap();
@@ -182,6 +199,12 @@ fn load_set() -> Vec<Session> {
                     .iter()
                     .any(|t| t.chars().any(|c| ('\u{0E00}'..='\u{0E7F}').contains(&c))),
                 remembered,
+                verdicts: s["verdicts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.as_str().unwrap().to_owned())
+                    .collect(),
                 bytes,
                 file,
             }
@@ -191,7 +214,11 @@ fn load_set() -> Vec<Session> {
 
 /// `recorded.jsonl`: the response body of each request body, by the request body's SHA-256.
 fn load_recorded() -> HashMap<String, Vec<u8>> {
-    let text = std::fs::read_to_string(recorded_path()).unwrap_or_else(|e| {
+    load_recorded_from(&recorded_path())
+}
+
+fn load_recorded_from(path: &Path) -> HashMap<String, Vec<u8>> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
         panic!(
             "no recorded answers ({e}); record them once with the live run (see the module docs)"
         )
@@ -450,6 +477,8 @@ fn dry_answer(body: &str, items: &[Item]) -> Vec<u8> {
 struct Recorder {
     t: Arc<EvalTransport>,
     key: String,
+    /// Where it writes: `recorded.jsonl` of the set it ran.
+    path: PathBuf,
 }
 
 impl Drop for Recorder {
@@ -474,7 +503,7 @@ impl Drop for Recorder {
             eprintln!("recorded.jsonl is not written: a body holds the key or a header");
             return;
         }
-        match std::fs::write(recorded_path(), &text) {
+        match std::fs::write(&self.path, &text) {
             Ok(()) => println!(
                 "recorded.jsonl: {} requests, {} bytes",
                 seen.len(),
@@ -1110,7 +1139,8 @@ async fn distill_eval_replays_the_recorded_answers() {
 async fn distill_eval_live() {
     let set = load_set();
     if std::env::var_os(DRY_ENV).is_some() {
-        return dry_run(&set).await;
+        dry_run(&set).await;
+        return;
     }
     // Never printed: an unset or non-UTF-8 value names only the variable.
     let key = std::env::var("TYPESAFE_API_KEY")
@@ -1123,6 +1153,7 @@ async fn distill_eval_live() {
         let _recorder = Recorder {
             t: t.clone(),
             key: key.clone(),
+            path: recorded_path(),
         };
         run_all(&t, &set, &key, Duration::from_secs(300)).await
     };
@@ -1146,9 +1177,10 @@ async fn distill_eval_live() {
 /// The free check before a live run: a scripted Jev, the whole pipeline twice, and the same
 /// request bodies both times. It prints the metrics the script gets (the passages it keeps are the
 /// labelled ones, so its recall is what candidate extraction allows) and an upper bound on the
-/// spend.
-async fn dry_run(set: &[Session]) {
+/// spend. Returns the second run.
+async fn dry_run(set: &[Session]) -> (Arc<EvalTransport>, Vec<Outcome>) {
     let mut runs = Vec::new();
+    let mut last = None;
     for n in 1..=2 {
         let t = EvalTransport::new(Mode::Dry);
         let outcomes = run_all(&t, set, FAKE_KEY, Duration::from_secs(60)).await;
@@ -1170,6 +1202,7 @@ async fn dry_run(set: &[Session]) {
             m.spend_usd
         );
         runs.push(hashes);
+        last = Some((t, outcomes));
     }
     let same_order = runs[0] == runs[1];
     for r in &mut runs {
@@ -1183,4 +1216,150 @@ async fn dry_run(set: &[Session]) {
         "dry runs: the same {} request bodies both times (same order: {same_order})",
         runs[0].len()
     );
+    last.expect("two runs")
+}
+
+// ---- The flood set (Task 12b) ----
+
+/// What Jev answered about each verdict of the flood set that it was asked about: the verdict's
+/// opening words and the option it found most probable.
+fn verdict_answers(t: &EvalTransport, s: &Session) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (request, response) in t.answered.lock().iter() {
+        let (Ok(req), Ok(resp)) = (
+            serde_json::from_slice::<Value>(request),
+            serde_json::from_slice::<Value>(response),
+        ) else {
+            continue;
+        };
+        for (qid, q) in req["questions"].as_object().into_iter().flatten() {
+            if !is_distill_question(qid) {
+                continue;
+            }
+            let passage = quoted_passage(q["instructions"].as_str().unwrap_or_default());
+            let Some(v) = s.verdicts.iter().find(|v| passage.contains(v.as_str())) else {
+                continue;
+            };
+            let best = resp["answers"][qid]["probabilities"]
+                .as_object()
+                .and_then(|p| {
+                    p.iter()
+                        .max_by(|a, b| {
+                            let p = |x: &Value| x.as_f64().unwrap_or(0.0);
+                            p(a.1).total_cmp(&p(b.1))
+                        })
+                        .map(|(o, _)| o.clone())
+                })
+                .unwrap_or_default();
+            out.push((v.clone(), best));
+        }
+    }
+    out
+}
+
+/// The flood set's thresholds (Task 12b, declared before any run): nearly all of the twenty
+/// verdicts reach Jev; most of them end `ephemeral`; at most five are kept, as in the real-session
+/// check; and the three lessons are kept, the one stated inside a reviewer's verdict too.
+fn assert_flood(set: &[Session], outcomes: &[Outcome], t: &EvalTransport) {
+    let (s, o) = (&set[0], &outcomes[0]);
+    let answers = verdict_answers(t, s);
+    let asked: HashSet<&str> = answers.iter().map(|(v, _)| v.as_str()).collect();
+    let ephemeral = answers.iter().filter(|(_, a)| a == "ephemeral").count();
+    let live: Vec<&Mem> = o.memories.iter().filter(|m| m.live()).collect();
+    let kept_verdicts: Vec<&&Mem> = live
+        .iter()
+        .filter(|m| s.verdicts.iter().any(|v| m.passage().contains(v.as_str())))
+        .collect();
+    println!(
+        "flood: {} of {} verdicts asked, {ephemeral} answered ephemeral, {} kept; {} live memories, {} questions",
+        asked.len(),
+        s.verdicts.len(),
+        kept_verdicts.len(),
+        live.len(),
+        o.questions
+    );
+    for (v, a) in &answers {
+        println!("- {a}: {v}");
+    }
+    for m in &live {
+        println!("+ {} «{}»", m.kind, m.title);
+    }
+    assert!(
+        asked.len() + 2 >= s.verdicts.len(),
+        "the verdicts reach Jev: {answers:?}"
+    );
+    assert!(
+        ephemeral * 2 > answers.len(),
+        "most verdicts end ephemeral: {answers:?}"
+    );
+    assert!(kept_verdicts.len() <= 5, "{kept_verdicts:#?}");
+    for item in &s.items {
+        assert!(
+            live.iter().any(|m| m.matches(item)),
+            "the lesson «{}» ({}) is kept: {live:#?}",
+            item.phrase,
+            item.kinds.join("|")
+        );
+    }
+}
+
+/// The flood set replayed (Task 12b): one session whose plan ran through twenty reviewer
+/// subagents, each answering with a one-task verdict or status report, next to three lessons.
+/// Every request is answered from `fixtures/distill/flood/recorded.jsonl`, as in
+/// [`distill_eval_replays_the_recorded_answers`], and the flood's thresholds are asserted. Task
+/// 13's set and thresholds are not touched. Until the live run records the file, every request
+/// misses and the test fails on that alone (ruling F8).
+#[tokio::test(flavor = "multi_thread")]
+async fn distill_eval_flood_replay() {
+    let set = load_set_in(&flood_dir());
+    let recorded = load_recorded_from(&flood_dir().join("recorded.jsonl"));
+    let keys: HashSet<String> = recorded.keys().cloned().collect();
+    let t = EvalTransport::new(Mode::Replay(recorded));
+    let outcomes = run_all(&t, &set, FAKE_KEY, Duration::from_secs(60)).await;
+    t.check("after the flood session");
+    let asked: HashSet<String> = t.hashes().into_iter().collect();
+    let mut unused: Vec<&String> = keys.difference(&asked).collect();
+    unused.sort();
+    assert!(
+        unused.is_empty(),
+        "recorded answers no request asked for, so the pipeline no longer sends what \
+         flood/recorded.jsonl holds (record it again with the live run): {unused:?}"
+    );
+    assert_flood(&set, &outcomes, &t);
+}
+
+/// The flood set with the real Jev, once (Task 12b): it writes `fixtures/distill/flood/recorded.jsonl`
+/// and stops once its spend passes $0.10:
+/// `cargo test -p alice-daemon --test distill_eval distill_eval_flood_live -- --ignored --nocapture`.
+/// With `ALICE_DISTILL_EVAL_DRY=1`, the free dry check instead.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "network: the real Jev, with TYPESAFE_API_KEY; rewrites fixtures/distill/flood/recorded.jsonl"]
+async fn distill_eval_flood_live() {
+    let set = load_set_in(&flood_dir());
+    if std::env::var_os(DRY_ENV).is_some() {
+        let (t, outcomes) = dry_run(&set).await;
+        assert_flood(&set, &outcomes, &t);
+        return;
+    }
+    // Never printed: an unset or non-UTF-8 value names only the variable.
+    let key = std::env::var("TYPESAFE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .unwrap_or_else(|| panic!("set TYPESAFE_API_KEY (the key is never printed)"));
+    let t = EvalTransport::new(Mode::Live(ReqwestTransport::new().unwrap()));
+    let outcomes = {
+        let _recorder = Recorder {
+            t: t.clone(),
+            key: key.clone(),
+            path: flood_dir().join("recorded.jsonl"),
+        };
+        run_all(&t, &set, &key, Duration::from_secs(300)).await
+    };
+    t.check("after the flood session");
+    println!(
+        "Jev requests sent: {}; spend by Jev's usage ${:.4}",
+        t.latencies_ms.lock().len(),
+        *t.spent.lock()
+    );
+    assert_flood(&set, &outcomes, &t);
 }
