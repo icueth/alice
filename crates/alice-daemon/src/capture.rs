@@ -2,7 +2,8 @@
 //! keys and a cursor, each written exactly once.
 //!
 //! [`CaptureCtl::apply`] runs one pass of one source over bytes handed to it: a tenant upload
-//! today (`Service::capture_transcript`), the local file reader of Task 6b later. A pass:
+//! (`Service::capture_transcript`), or the local worker reading a transcript file
+//! ([`CaptureWorker`], below). A pass:
 //!
 //! 1. checks the bytes' offset against the source's cursor: lower is refused with the cursor
 //!    (the route's `409`), higher is a gap that is counted (spec §5.2);
@@ -251,6 +252,9 @@ pub struct CaptureCtl {
     /// Unrecognised transcript lines per UTC day, the last [`UNKNOWN_DAYS`] days (in memory: a
     /// format-drift hint that starts from zero with the daemon).
     unknown: Mutex<VecDeque<(chrono::NaiveDate, u64)>>,
+    /// Tests only (`ServiceOptions::capture_fail_after_slices`): slices left before a write
+    /// fails as a kill between slices would; `None`: never.
+    fail_after_slices: Mutex<Option<usize>>,
 }
 
 /// A lock per source uri. An entry lives while a pass holds or waits for it.
@@ -319,7 +323,14 @@ impl CaptureCtl {
             redactors,
             locks: SourceLocks::default(),
             unknown: Mutex::new(VecDeque::new()),
+            fail_after_slices: Mutex::new(None),
         })
+    }
+
+    /// Tests only: after `n` more slices, the next slice write fails (once), as a daemon killed
+    /// between two slices of a pass would leave it.
+    pub(crate) fn fail_after_slices(&self, n: Option<usize>) {
+        *self.fail_after_slices.lock() = n;
     }
 
     /// Runs one pass (see the module docs). Blocks: call it from a blocking thread.
@@ -616,6 +627,19 @@ impl CaptureCtl {
 
     /// Writes one slice and waits for it: `(source_id, chunks inserted, keys new)`.
     fn send(&self, slice: CaptureSlice) -> Result<(String, usize, usize)> {
+        {
+            let mut left = self.fail_after_slices.lock();
+            match left.as_mut() {
+                Some(0) => {
+                    *left = None;
+                    return Err(AliceError::Other(
+                        "the capture pass stopped between two slices (test hook)".into(),
+                    ));
+                }
+                Some(n) => *n -= 1,
+                None => {}
+            }
+        }
         match self
             .writer
             .submit_blocking(WriteOp::CaptureSlice(Box::new(slice)))?
@@ -993,6 +1017,939 @@ pub(crate) fn status(
         distill_state: distill_state(settings).into(),
         sessions,
     })
+}
+
+// ---- Local capture (Task 6b; spec §4.2, §10): the worker that reads transcript files ----
+
+pub use local::{
+    CaptureWorker, Close, Job, LocalCaptureConfig, LocalCaptureCounts, NOTIFY_EVENTS,
+    TENANT_NOTIFY_REFUSAL, find_rollout,
+};
+
+/// Local capture: a notify queues a pass of its session's transcript, and one low-priority
+/// thread, `alice-capture`, reads the file from the source's cursor and hands the bytes to
+/// [`CaptureCtl::apply`], the pipeline uploads go through too.
+///
+/// - **Queue.** One job per source waits in a map: the newest event wins, a `session-end` is
+///   never lost and no close is weakened. A `stop`-class event waits the settle delay first.
+/// - **Close** (ruling 1). `stop`, `subagent-stop`, `pre-compact` and a quiet sweep close the
+///   trailing turn unless its last tool call waits for a result; `session-end` and a stale
+///   sweep close it whatever it waits for. A pass that stops short of the end of the file
+///   leaves its last turn open, as a capped upload does.
+/// - **The file** must be a regular file named `*.jsonl`, opened read-only (a FIFO cannot hold
+///   the thread). Its identity, `dev:inode:sha256(first line)`, is kept with the source: a
+///   changed identity, or a file shorter than the cursor, puts the cursor back to 0, and the
+///   turn keys skip what is stored (spec §3.2).
+/// - **A line longer than a pass** (ruling 2): its end is found by reading on, and the next
+///   pass starts `MAX_LINE_BYTES + 1` bytes before that end, as a skip from beyond the cursor
+///   (a gap, as a tenant client's skip of the line is). The reader keeps those last bytes as one
+///   line too large to parse: the stub `[result] [record skipped: too large]`, with the line's
+///   uuid and time when they sit near its end (Claude Code writes them there).
+/// - **The sweep**, every `sweep_every` and at start, passes the open sources whose transcript
+///   changed since their last pass, or whose idle time asks for a stronger close: quiet for
+///   `quiet` closes the trailing turn, idle for `stale` makes a final pass and ends the source.
+/// - **Codex** (ruling 6): a null transcript path is looked for under `$CODEX_HOME/sessions`.
+///
+/// A server tenant runs no worker: it never opens a client's files (spec §5.6).
+mod local {
+    use super::{CaptureCtl, PassInput, check_ids};
+    use crate::config::CaptureVerdict;
+    use crate::service::ProjectResolver;
+    use crate::writer::{CaptureChange, CaptureInit, WriteOp, WriterHandle};
+    use alice_core::api::CaptureNotify;
+    use alice_core::capture::{self, AgentKind, MAX_LINE_BYTES, MAX_PASS_BYTES};
+    use alice_core::store::ReaderPool;
+    use alice_core::store::capture as store;
+    use alice_core::{AliceError, Result};
+    use axum::body::Bytes;
+    use parking_lot::Mutex;
+    use sha2::{Digest, Sha256};
+    use std::collections::hash_map::Entry;
+    use std::collections::{HashMap, HashSet};
+    use std::fs::{File, Metadata};
+    use std::io::{Read, Seek, SeekFrom};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant, SystemTime};
+
+    /// The events a notify can be for (spec §4.1; `backfill`: §4.4).
+    pub const NOTIFY_EVENTS: &[&str] = &[
+        "session-start",
+        "stop",
+        "subagent-stop",
+        "pre-compact",
+        "session-end",
+        "sweep",
+        "backfill",
+    ];
+
+    /// A server tenant's answer to a notify (spec §4.2).
+    pub const TENANT_NOTIFY_REFUSAL: &str =
+        "this server cannot read files on your machine; use the capture script (docs/capture.md)";
+
+    /// How much of a transcript's first line its identity hashes (a line can be megabytes).
+    const KEY_LINE_BYTES: u64 = 64 << 10;
+    /// What is read at a time while looking for the end of a line longer than a pass.
+    const SCAN_BLOCK: usize = 1 << 20;
+    /// Passes one job runs before the other sources' jobs go first (64 MiB of transcript).
+    const PASSES_PER_TURN: usize = 8;
+    /// Date folders of `$CODEX_HOME/sessions` searched for a rollout (spec §4.2).
+    const ROLLOUT_DAYS: usize = 7;
+
+    /// How a pass treats the transcript's trailing turn (ruling 1). Ordered: a stronger close
+    /// is never replaced by a weaker one.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Close {
+        /// Only turns another turn follows are complete (`session-start`).
+        #[default]
+        Open,
+        /// `close_trailing`: complete unless its last tool call has no result yet (`stop`,
+        /// `subagent-stop`, `pre-compact`, a quiet sweep).
+        Trailing,
+        /// `force_close`: complete whatever it waits for (`session-end`, a stale sweep).
+        Force,
+    }
+
+    /// The next pass of one source, waiting in the worker's queue.
+    #[derive(Debug, Clone)]
+    pub struct Job {
+        pub agent: AgentKind,
+        pub session: String,
+        pub subagent: Option<String>,
+        /// The transcript; `None` for a Codex session whose hook gave no path (its rollout is
+        /// searched for by the session id).
+        pub path: Option<PathBuf>,
+        /// The session's working directory: a new source's project.
+        pub cwd: Option<String>,
+        /// The event behind the pass (`capture_state.last_event`).
+        pub event: String,
+        pub close: Close,
+        /// Mark the source ended after the pass that reaches the end of the file.
+        pub end: bool,
+        /// Decide the close when the pass runs, from how long the transcript has been idle
+        /// (a sweep): quiet closes the trailing turn, stale forces it and ends the source.
+        pub by_age: bool,
+        /// The settle delay: the pass waits until then.
+        pub not_before: Instant,
+    }
+
+    impl Job {
+        pub fn uri(&self) -> String {
+            self.agent
+                .source_uri(&self.session, self.subagent.as_deref())
+        }
+
+        /// Coalesces `newer`, a later notification of the same source: its event wins unless
+        /// this one ends the session, and closes, ends and waits only grow.
+        fn merge(&mut self, newer: Job) {
+            if !self.end || newer.end {
+                self.event = newer.event;
+            }
+            self.close = self.close.max(newer.close);
+            self.end |= newer.end;
+            self.by_age |= newer.by_age;
+            self.not_before = self.not_before.max(newer.not_before);
+            if newer.path.is_some() {
+                self.path = newer.path;
+            }
+            if newer.cwd.is_some() {
+                self.cwd = newer.cwd;
+            }
+        }
+    }
+
+    /// Checks a notification (spec §4.1) and makes its job; `settle` delays a `stop`-class
+    /// event.
+    fn notify_job(n: CaptureNotify, settle: Duration) -> Result<Job> {
+        let agent = AgentKind::parse(&n.agent).ok_or_else(|| {
+            AliceError::invalid(format!(
+                "unknown agent \"{}\"; use claude-code or codex",
+                n.agent
+            ))
+        })?;
+        if !NOTIFY_EVENTS.contains(&n.event.as_str()) {
+            return Err(AliceError::invalid(format!(
+                "unknown capture event \"{}\"; use one of {}",
+                n.event,
+                NOTIFY_EVENTS.join(", ")
+            )));
+        }
+        let absolute = |field: &str, p: &str| -> Result<PathBuf> {
+            let p = PathBuf::from(p);
+            if p.is_absolute() {
+                Ok(p)
+            } else {
+                Err(AliceError::invalid(format!(
+                    "{field} must be an absolute path; send the path the hook gave"
+                )))
+            }
+        };
+        let main = match n.transcript_path.trim() {
+            "" if agent == AgentKind::Codex => None,
+            "" => {
+                return Err(AliceError::invalid(
+                    "transcript_path is empty; send the transcript path the hook gave",
+                ));
+            }
+            p => Some(absolute("transcript_path", p)?),
+        };
+        let own = n
+            .agent_transcript_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let (subagent, path) = match own {
+            Some(p) => {
+                let Some(id) = n
+                    .agent_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                else {
+                    return Err(AliceError::invalid(
+                        "agent_transcript_path needs the subagent's agent_id; send both, as the SubagentStop hook gives them",
+                    ));
+                };
+                (
+                    Some(id.to_owned()),
+                    Some(absolute("agent_transcript_path", p)?),
+                )
+            }
+            None => (None, main),
+        };
+        check_ids(&n.session_id, subagent.as_deref())?;
+        let (close, end, by_age, settles) = match n.event.as_str() {
+            "session-start" => (Close::Open, false, false, false),
+            "session-end" => (Close::Force, true, false, true),
+            "sweep" | "backfill" => (Close::Open, false, true, false),
+            _ => (Close::Trailing, false, false, true),
+        };
+        Ok(Job {
+            agent,
+            session: n.session_id,
+            subagent,
+            path,
+            cwd: n.cwd.filter(|c| !c.trim().is_empty()),
+            event: n.event,
+            close,
+            end,
+            by_age,
+            not_before: Instant::now() + if settles { settle } else { Duration::ZERO },
+        })
+    }
+
+    /// The worker's timings (`ServiceOptions`; tests shorten them) and Codex's home.
+    #[derive(Debug, Clone)]
+    pub struct LocalCaptureConfig {
+        /// A pass caused by `stop`, `subagent-stop`, `pre-compact` or `session-end` waits this
+        /// long first, so the agent has finished writing the turn.
+        pub settle: Duration,
+        /// How often the open sources are looked at (and once at start).
+        pub sweep_every: Duration,
+        /// A transcript idle this long has its trailing turn closed.
+        pub quiet: Duration,
+        /// A transcript idle this long gets a final pass, and its source ends.
+        pub stale: Duration,
+        /// `$CODEX_HOME`: where a Codex session's rollout is looked for when its hook gave no
+        /// path. `None`: never looked for.
+        pub codex_home: Option<PathBuf>,
+    }
+
+    /// What the worker counted since the daemon started (for `alice doctor`).
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct LocalCaptureCounts {
+        /// Passes run, each over at most `MAX_PASS_BYTES` of one transcript.
+        pub passes: u64,
+        /// Codex sessions whose hook gave no transcript path and whose rollout was not found.
+        pub rollouts_not_found: u64,
+        /// Compressed Codex rollouts (`*.jsonl.zst`), skipped unread (spec §10).
+        pub rollouts_compressed: u64,
+    }
+
+    /// What a source's last finished job saw. The sweep passes the source again when its
+    /// transcript changed since, or when its idle time now asks for a stronger close.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Seen {
+        len: u64,
+        mtime: Option<SystemTime>,
+        close: Close,
+    }
+
+    /// How a job ended.
+    enum Outcome {
+        /// The transcript was read as far as it can be now.
+        Done(Seen),
+        /// The file cannot be read, or the worker is stopping: the next event or sweep tries
+        /// again.
+        Retry,
+        /// The job is back in the queue: more is left (behind the other sources' jobs), or the
+        /// project's rules are unknown for now (a sweep period later, so a `session-end` is
+        /// not lost and a source never stored is tried again too).
+        Requeued,
+    }
+
+    /// The local capture worker: its queue and its thread.
+    pub struct CaptureWorker {
+        ctl: Arc<CaptureCtl>,
+        readers: Arc<ReaderPool>,
+        writer: WriterHandle,
+        resolver: ProjectResolver,
+        cfg: LocalCaptureConfig,
+        /// The jobs waiting, one per source uri.
+        pending: Mutex<HashMap<String, Job>>,
+        /// bounded(1): notifications that arrive together wake the thread once.
+        wake_tx: crossbeam_channel::Sender<()>,
+        wake_rx: crossbeam_channel::Receiver<()>,
+        stop: AtomicBool,
+        thread: Mutex<Option<JoinHandle<()>>>,
+        passes: AtomicU64,
+        rollouts_not_found: AtomicU64,
+        rollouts_compressed: AtomicU64,
+    }
+
+    impl CaptureWorker {
+        pub fn new(
+            ctl: Arc<CaptureCtl>,
+            readers: Arc<ReaderPool>,
+            writer: WriterHandle,
+            resolver: ProjectResolver,
+            cfg: LocalCaptureConfig,
+        ) -> Arc<Self> {
+            let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+            Arc::new(Self {
+                ctl,
+                readers,
+                writer,
+                resolver,
+                cfg,
+                pending: Mutex::new(HashMap::new()),
+                wake_tx,
+                wake_rx,
+                stop: AtomicBool::new(false),
+                thread: Mutex::new(None),
+                passes: AtomicU64::new(0),
+                rollouts_not_found: AtomicU64::new(0),
+                rollouts_compressed: AtomicU64::new(0),
+            })
+        }
+
+        /// Starts the thread `alice-capture`, which sweeps at once.
+        pub fn spawn(self: &Arc<Self>) {
+            let me = self.clone();
+            let handle = std::thread::Builder::new()
+                .name("alice-capture".into())
+                .spawn(move || me.run())
+                .expect("spawn capture thread");
+            *self.thread.lock() = Some(handle);
+        }
+
+        /// Checks a notification and queues its pass; the file is read later (spec §4.2).
+        pub fn queue(&self, n: CaptureNotify) -> Result<()> {
+            self.notify(notify_job(n, self.cfg.settle)?);
+            Ok(())
+        }
+
+        /// Queues `job`, coalesced with the one waiting for its source.
+        pub fn notify(&self, job: Job) {
+            match self.pending.lock().entry(job.uri()) {
+                Entry::Occupied(mut e) => e.get_mut().merge(job),
+                Entry::Vacant(e) => {
+                    e.insert(job);
+                }
+            }
+            let _ = self.wake_tx.try_send(());
+        }
+
+        pub fn counts(&self) -> LocalCaptureCounts {
+            LocalCaptureCounts {
+                passes: self.passes.load(Ordering::Relaxed),
+                rollouts_not_found: self.rollouts_not_found.load(Ordering::Relaxed),
+                rollouts_compressed: self.rollouts_compressed.load(Ordering::Relaxed),
+            }
+        }
+
+        /// Asks the thread to stop after its current pass, without waiting.
+        pub fn signal_stop(&self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = self.wake_tx.try_send(());
+        }
+
+        /// Stops the thread, waiting up to `wait` for its current pass to end. A pass that does
+        /// not end in time is left; its writes fail once the writer has stopped.
+        pub fn stop(&self, wait: Duration) {
+            self.signal_stop();
+            let Some(handle) = self.thread.lock().take() else {
+                return;
+            };
+            let waited = Instant::now();
+            while !handle.is_finished() && waited.elapsed() < wait {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !handle.is_finished() {
+                tracing::warn!("a capture pass is still running; stopping without it");
+            } else if handle.join().is_err() {
+                tracing::error!("the capture worker panicked");
+            }
+        }
+
+        fn stopping(&self) -> bool {
+            self.stop.load(Ordering::Relaxed)
+        }
+
+        fn run(&self) {
+            crate::maintenance::lower_priority();
+            let mut seen: HashMap<String, Seen> = HashMap::new();
+            let mut next_sweep = Instant::now();
+            while !self.stopping() {
+                if Instant::now() >= next_sweep {
+                    if let Err(e) = self.sweep(&mut seen) {
+                        tracing::warn!(error = %e, "the capture sweep failed; it runs again later");
+                    }
+                    next_sweep = Instant::now() + self.cfg.sweep_every;
+                }
+                while Instant::now() < next_sweep {
+                    let Some(job) = self.take_due() else { break };
+                    if self.stopping() {
+                        return;
+                    }
+                    // A pass that panics (a transcript no one foresaw) costs its own source a
+                    // retry, not every session's capture for the rest of the daemon's life.
+                    let uri = job.uri();
+                    let run = std::panic::AssertUnwindSafe(|| self.run_job(job, &mut seen));
+                    if std::panic::catch_unwind(run).is_err() {
+                        seen.remove(&uri);
+                        tracing::error!(
+                            uri,
+                            "a capture pass panicked; the next event or sweep tries it again"
+                        );
+                    }
+                }
+                let due = self.pending.lock().values().map(|j| j.not_before).min();
+                let until = due.map_or(next_sweep, |d| d.min(next_sweep));
+                let _ = self
+                    .wake_rx
+                    .recv_timeout(until.saturating_duration_since(Instant::now()));
+            }
+        }
+
+        /// The waiting job that is due first, if one is due.
+        fn take_due(&self) -> Option<Job> {
+            let now = Instant::now();
+            let mut pending = self.pending.lock();
+            let uri = pending
+                .iter()
+                .filter(|(_, j)| j.not_before <= now)
+                .min_by_key(|(_, j)| j.not_before)
+                .map(|(uri, _)| uri.clone())?;
+            pending.remove(&uri)
+        }
+
+        /// Puts `job` back behind the others; a notification that came meanwhile is merged
+        /// into it as the newer one.
+        fn requeue(&self, job: Job) {
+            match self.pending.lock().entry(job.uri()) {
+                Entry::Occupied(mut e) => {
+                    let newer = e.insert(job);
+                    e.get_mut().merge(newer);
+                }
+                Entry::Vacant(e) => {
+                    e.insert(job);
+                }
+            }
+            let _ = self.wake_tx.try_send(());
+        }
+
+        /// `quiet` and `stale` applied to a transcript last changed at `mtime`.
+        fn close_by_age(&self, mtime: Option<SystemTime>, now: SystemTime) -> Close {
+            let idle = mtime
+                .and_then(|m| now.duration_since(m).ok())
+                .unwrap_or_default();
+            if idle >= self.cfg.stale {
+                Close::Force
+            } else if idle >= self.cfg.quiet {
+                Close::Trailing
+            } else {
+                Close::Open
+            }
+        }
+
+        /// Queues a pass of each open source whose transcript changed since its last pass, or
+        /// whose idle time asks for a stronger close (a stale one always: its final pass ends
+        /// it). A source with no transcript path (an upload's) or whose file is gone is left
+        /// to its age (Task 12).
+        fn sweep(&self, seen: &mut HashMap<String, Seen>) -> Result<()> {
+            let open = self.readers.with(store::open_sources)?;
+            let uris: HashSet<&str> = open.iter().map(|s| s.uri.as_str()).collect();
+            seen.retain(|uri, _| uris.contains(uri.as_str()));
+            let now = SystemTime::now();
+            for s in &open {
+                let Some(path) = s.transcript_path.as_deref() else {
+                    continue;
+                };
+                let Some(agent) = AgentKind::parse(&s.agent) else {
+                    continue;
+                };
+                // Ids never hold ':', so the subagent's is what follows `:agent:`.
+                let subagent = s.uri.split_once(":agent:").map(|(_, a)| a.to_owned());
+                if agent.source_uri(&s.session_id, subagent.as_deref()) != s.uri
+                    || self.pending.lock().contains_key(&s.uri)
+                {
+                    continue;
+                }
+                let Ok(meta) = std::fs::metadata(path) else {
+                    continue;
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                let (len, mtime) = (meta.len(), meta.modified().ok());
+                let close = self.close_by_age(mtime, now);
+                let last = seen.get(&s.uri);
+                let changed = last.is_none_or(|l| l.len != len || l.mtime != mtime);
+                let wanted = close == Close::Force
+                    || (len != s.byte_offset && (changed || last.is_some_and(|l| l.close < close)));
+                if wanted {
+                    self.notify(Job {
+                        agent,
+                        session: s.session_id.clone(),
+                        subagent,
+                        path: Some(PathBuf::from(path)),
+                        cwd: None,
+                        event: "sweep".into(),
+                        close: Close::Open,
+                        end: false,
+                        by_age: true,
+                        not_before: Instant::now(),
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        fn run_job(&self, job: Job, seen: &mut HashMap<String, Seen>) {
+            let uri = job.uri();
+            let Some(path) = self.transcript(&job) else {
+                return;
+            };
+            match self.passes(&uri, &job, &path) {
+                Ok(Outcome::Done(s)) => {
+                    seen.insert(uri, s);
+                }
+                Ok(Outcome::Retry | Outcome::Requeued) => {
+                    seen.remove(&uri);
+                }
+                Err(e) => {
+                    seen.remove(&uri);
+                    tracing::warn!(uri, error = %e, "a capture pass failed; the next event or sweep tries again");
+                }
+            }
+        }
+
+        /// The transcript `job` reads: its path, or the rollout of a Codex session whose hook
+        /// gave none. `None` (counted, for a Codex rollout) when there is none to read.
+        fn transcript(&self, job: &Job) -> Option<PathBuf> {
+            let path = match &job.path {
+                Some(p) => p.clone(),
+                None => {
+                    let found = self
+                        .cfg
+                        .codex_home
+                        .as_deref()
+                        .map(|home| search_rollouts(home, &job.session))
+                        .unwrap_or_default();
+                    match found.path {
+                        Some(p) => p,
+                        None if found.compressed => {
+                            self.rollouts_compressed.fetch_add(1, Ordering::Relaxed);
+                            tracing::info!(
+                                session = job.session.as_str(),
+                                "this Codex session's rollout is compressed (.jsonl.zst); it is not captured"
+                            );
+                            return None;
+                        }
+                        None => {
+                            self.rollouts_not_found.fetch_add(1, Ordering::Relaxed);
+                            tracing::info!(
+                                session = job.session.as_str(),
+                                "no rollout of this Codex session was found in the newest date folders of CODEX_HOME/sessions; it is not captured"
+                            );
+                            return None;
+                        }
+                    }
+                }
+            };
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.ends_with(".jsonl") {
+                return Some(path);
+            }
+            if name.ends_with(".jsonl.zst") {
+                self.rollouts_compressed.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::info!(
+                path = %path.display(),
+                "a capture notify names a file that is not a .jsonl transcript; it is not read"
+            );
+            None
+        }
+
+        /// Up to `PASSES_PER_TURN` passes over `path`, each from the source's cursor.
+        fn passes(&self, uri: &str, job: &Job, path: &Path) -> Result<Outcome> {
+            // A new source's project; an existing one keeps its own (spec §3.1). Git runs at
+            // most once a minute per directory.
+            let project = self.resolver.choose(None, job.cwd.as_deref());
+            // Where the next pass starts, past a line longer than a pass.
+            let mut skip_to = None;
+            for _ in 0..PASSES_PER_TURN {
+                if self.stopping() {
+                    return Ok(Outcome::Retry);
+                }
+                let (mut file, meta) = match open_transcript(path) {
+                    Ok(f) => f,
+                    // A new session's transcript is written with its first message, after
+                    // SessionStart: the source is registered by the first pass that finds it.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::debug!(uri, "the transcript does not exist yet");
+                        return Ok(Outcome::Retry);
+                    }
+                    Err(e) => {
+                        tracing::info!(uri, error = %e, "the transcript cannot be read; the next event or sweep tries again");
+                        return Ok(Outcome::Retry);
+                    }
+                };
+                let (len, mtime) = (meta.len(), meta.modified().ok());
+                let key = file_key(&mut file, &meta)?;
+                let state = self.readers.with(|c| store::by_uri(c, uri))?;
+                let mut cursor = state.as_ref().map_or(0, |s| s.byte_offset);
+                if let Some(s) = &state
+                    && (s.file_key.as_deref() != Some(key.as_str()) || len < cursor)
+                {
+                    // Replaced or cut short (spec §3.2): read again from 0, and the turn keys
+                    // skip what is stored. A source that never had a key gets one where it is.
+                    let from = if s.file_key.is_none() && len >= cursor {
+                        cursor
+                    } else {
+                        0
+                    };
+                    self.writer.submit_blocking(WriteOp::CaptureStateUpdate {
+                        source_id: s.source_id.clone(),
+                        change: CaptureChange::FileKey {
+                            file_key: key.clone(),
+                            byte_offset: from,
+                        },
+                    })?;
+                    if from < cursor {
+                        tracing::info!(
+                            uri,
+                            "the transcript was replaced or cut short; it is read again from the start, and stored turns are skipped"
+                        );
+                    }
+                    cursor = from;
+                    skip_to = None;
+                }
+                let close = if job.by_age {
+                    job.close.max(self.close_by_age(mtime, SystemTime::now()))
+                } else {
+                    job.close
+                };
+                let end = job.end || (job.by_age && close == Close::Force);
+                let offset = skip_to
+                    .take()
+                    .filter(|&o| o > cursor && o < len)
+                    .unwrap_or(cursor);
+                let want = len.saturating_sub(offset).min(MAX_PASS_BYTES as u64);
+                let bytes = read_at(&mut file, offset, want)?;
+                // A pass short of the end of the file leaves its last turn open: it may go on
+                // past what was read (as a capped upload's does).
+                let more = offset + (bytes.len() as u64) < len;
+                let report = self.ctl.apply(PassInput {
+                    agent: job.agent,
+                    session: job.session.clone(),
+                    subagent: job.subagent.clone(),
+                    init: CaptureInit {
+                        transcript_path: Some(path.to_string_lossy().into_owned()),
+                        file_key: Some(key),
+                        ..Default::default()
+                    },
+                    project: project.clone(),
+                    bytes: Bytes::from(bytes),
+                    offset,
+                    at_file_start: offset == 0,
+                    close_trailing: !more && close >= Close::Trailing,
+                    force_close: !more && close == Close::Force,
+                    event: job.event.clone(),
+                    end: !more && end,
+                });
+                self.passes.fetch_add(1, Ordering::Relaxed);
+                let report = report?;
+                if report.behind.is_some() {
+                    // Another pass moved the cursor meanwhile: go on from there.
+                    continue;
+                }
+                if report.oversized_line {
+                    // Ruling 2: the next pass starts `MAX_LINE_BYTES + 1` bytes before the
+                    // line's end, which the reader keeps as one line too large to parse (the
+                    // stub). Its end is at least a pass past `offset`, so this is past it.
+                    match self.line_end(&mut file, offset + MAX_PASS_BYTES as u64, len)? {
+                        Some(nl) => {
+                            skip_to = Some(nl - MAX_LINE_BYTES as u64 - 1);
+                            continue;
+                        }
+                        // The line has no end yet: when the file grows.
+                        None => return Ok(Outcome::Done(Seen { len, mtime, close })),
+                    }
+                }
+                if matches!(report.verdict, Some(CaptureVerdict::Wait(_))) {
+                    self.requeue(Job {
+                        not_before: Instant::now() + self.cfg.sweep_every,
+                        ..job.clone()
+                    });
+                    return Ok(Outcome::Requeued);
+                }
+                if !more || report.dropped.is_some() || report.next_offset <= offset {
+                    return Ok(Outcome::Done(Seen { len, mtime, close }));
+                }
+            }
+            if self.stopping() {
+                return Ok(Outcome::Retry);
+            }
+            self.requeue(Job {
+                not_before: Instant::now(),
+                ..job.clone()
+            });
+            Ok(Outcome::Requeued)
+        }
+
+        /// The offset of the `\n` that ends the line running through `from`, or `None` when
+        /// the file ends first (or the worker is stopping).
+        fn line_end(&self, file: &mut File, from: u64, len: u64) -> Result<Option<u64>> {
+            file.seek(SeekFrom::Start(from))?;
+            let mut buf = vec![0u8; SCAN_BLOCK];
+            let mut at = from;
+            while at < len && !self.stopping() {
+                let want = SCAN_BLOCK.min((len - at) as usize);
+                let n = file.read(&mut buf[..want])?;
+                if n == 0 {
+                    break;
+                }
+                if let Some(i) = buf[..n].iter().position(|&b| b == b'\n') {
+                    return Ok(Some(at + i as u64));
+                }
+                at += n as u64;
+            }
+            Ok(None)
+        }
+    }
+
+    /// Opens a transcript read-only; it must be a regular file. Non-blocking, so a FIFO named
+    /// like a transcript cannot hold the thread at `open`.
+    fn open_transcript(path: &Path) -> std::io::Result<(File, Metadata)> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options.open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Ok((file, meta))
+    }
+
+    /// The file's identity (spec §3.2): `dev:inode:sha256(first line)`, the first line without
+    /// its `\n` and hashed over its first `KEY_LINE_BYTES` at most.
+    fn file_key(file: &mut File, meta: &Metadata) -> std::io::Result<String> {
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = {
+            let _ = meta;
+            (0u64, 0u64)
+        };
+        let head = read_at(file, 0, KEY_LINE_BYTES)?;
+        let line = head
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(&head[..], |nl| &head[..nl]);
+        Ok(format!("{dev}:{ino}:{}", hex::encode(Sha256::digest(line))))
+    }
+
+    /// At most `n` bytes of `file` from `offset`.
+    fn read_at(file: &mut File, offset: u64, n: u64) -> std::io::Result<Vec<u8>> {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = Vec::with_capacity(n as usize);
+        file.by_ref().take(n).read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// What a search for a Codex rollout found.
+    #[derive(Debug, Default)]
+    struct Rollout {
+        path: Option<PathBuf>,
+        /// A compressed rollout (`*.jsonl.zst`) names the session, and no plain one does.
+        compressed: bool,
+    }
+
+    /// Ruling 6: the rollout of the Codex session `session_id`, for a hook that gave no
+    /// transcript path. It is `rollout-*<session_id>*.jsonl` in one of the newest 7
+    /// `sessions/YYYY/MM/DD` folders under `codex_home`, the newest folder first. A compressed
+    /// rollout (`.jsonl.zst`) is not read.
+    pub fn find_rollout(codex_home: &Path, session_id: &str) -> Option<PathBuf> {
+        search_rollouts(codex_home, session_id).path
+    }
+
+    fn search_rollouts(codex_home: &Path, session_id: &str) -> Rollout {
+        let mut out = Rollout::default();
+        if !capture::valid_id(session_id) {
+            return out;
+        }
+        for dir in newest_days(&codex_home.join("sessions"), ROLLOUT_DAYS) {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut names: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.starts_with("rollout-") && n.contains(session_id))
+                .collect();
+            // The newest first: a rollout's name starts with its time.
+            names.sort_unstable_by(|a, b| b.cmp(a));
+            for name in names {
+                if name.ends_with(".jsonl") {
+                    out.path = Some(dir.join(name));
+                    return out;
+                }
+                out.compressed |= name.ends_with(".jsonl.zst");
+            }
+        }
+        out
+    }
+
+    /// The `YYYY/MM/DD` folders under `sessions`, newest first, at most `n`.
+    fn newest_days(sessions: &Path, n: usize) -> Vec<PathBuf> {
+        let named = |dir: &Path, digits: usize| -> Vec<String> {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return Vec::new();
+            };
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|s| s.len() == digits && s.bytes().all(|b| b.is_ascii_digit()))
+                .collect()
+        };
+        let mut days = Vec::new();
+        for y in named(sessions, 4) {
+            let year = sessions.join(&y);
+            for m in named(&year, 2) {
+                let month = year.join(&m);
+                for d in named(&month, 2) {
+                    days.push((y.clone(), m.clone(), d));
+                }
+            }
+        }
+        days.sort_unstable_by(|a, b| b.cmp(a));
+        days.truncate(n);
+        days.into_iter()
+            .map(|(y, m, d)| sessions.join(y).join(m).join(d))
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn job(event: &str) -> Job {
+            notify_job(
+                CaptureNotify {
+                    agent: "claude-code".into(),
+                    event: event.into(),
+                    session_id: "s1".into(),
+                    transcript_path: "/t/s1.jsonl".into(),
+                    ..Default::default()
+                },
+                Duration::from_millis(1500),
+            )
+            .unwrap()
+        }
+
+        /// The newest event wins, a `session-end` is never lost and no close is weakened.
+        #[test]
+        fn notifications_coalesce_and_a_session_end_is_never_lost() {
+            let mut j = job("stop");
+            assert_eq!((j.close, j.end, j.by_age), (Close::Trailing, false, false));
+            let settled = j.not_before;
+            j.merge(job("session-start"));
+            assert_eq!(j.event, "session-start");
+            assert_eq!(j.close, Close::Trailing, "the stop's close is kept");
+            assert!(j.not_before >= settled, "the settle delay is kept");
+
+            j.merge(job("session-end"));
+            assert_eq!(
+                (j.event.as_str(), j.close, j.end),
+                ("session-end", Close::Force, true)
+            );
+            j.merge(job("stop"));
+            j.merge(job("sweep"));
+            assert_eq!(
+                (j.event.as_str(), j.close, j.end, j.by_age),
+                ("session-end", Close::Force, true, true),
+                "a later event never loses the end"
+            );
+
+            let start = job("session-start");
+            assert!(start.not_before <= Instant::now(), "no settle delay");
+            assert_eq!(start.close, Close::Open);
+            assert!(job("backfill").by_age && job("sweep").by_age);
+            let end = job("session-end");
+            assert!(end.not_before > Instant::now(), "session-end settles too");
+        }
+
+        #[test]
+        fn a_transcripts_identity_is_its_inode_and_first_line() {
+            let d = tempfile::tempdir().unwrap();
+            let path = d.path().join("k.jsonl");
+            let key = |p: &Path| {
+                let (mut f, meta) = open_transcript(p).unwrap();
+                file_key(&mut f, &meta).unwrap()
+            };
+            std::fs::write(&path, b"{\"first\":1}\n{\"second\":2}\n").unwrap();
+            let k1 = key(&path);
+            let parts: Vec<&str> = k1.split(':').collect();
+            assert_eq!(parts.len(), 3);
+            assert_eq!(
+                parts[2],
+                hex::encode(Sha256::digest(b"{\"first\":1}")),
+                "the first line, without its newline"
+            );
+            // Appending, or rewriting in place with the same first line: the same identity.
+            std::fs::write(&path, b"{\"first\":1}\n{\"other\":3}\n{\"more\":4}\n").unwrap();
+            assert_eq!(key(&path), k1);
+            // Another first line: another identity.
+            std::fs::write(&path, b"{\"first\":0}\n").unwrap();
+            assert_ne!(key(&path), k1);
+            // Replaced by another file with the same content: another inode.
+            let k2 = key(&path);
+            let tmp = d.path().join("k.tmp");
+            std::fs::write(&tmp, b"{\"first\":0}\n").unwrap();
+            std::fs::rename(&tmp, &path).unwrap();
+            if cfg!(unix) {
+                assert_ne!(key(&path), k2);
+            }
+            // Not a regular file: refused.
+            assert!(open_transcript(d.path()).is_err());
+        }
+    }
 }
 
 #[cfg(test)]

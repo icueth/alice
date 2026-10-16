@@ -799,6 +799,42 @@ pub struct TranscriptAnswer {
     pub oversized_line: bool,
 }
 
+/// `POST /api/v1/capture/notify` (SP2 spec §4.1, §4.2): an agent hook fired, so the local
+/// daemon reads the session's transcript from its cursor. The fields are the hook's input. A
+/// server tenant refuses it (it cannot read the client's files).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CaptureNotify {
+    /// `claude-code` or `codex`.
+    pub agent: String,
+    /// `session-start`, `stop`, `subagent-stop`, `pre-compact`, `session-end`, `sweep` or
+    /// `backfill`.
+    pub event: String,
+    pub session_id: String,
+    /// The transcript's absolute path. Empty (or `null`) when the agent gave none: a Codex
+    /// session's rollout is then searched for by its id.
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub transcript_path: String,
+    /// The session's working directory, which decides a new source's project.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// `subagent-stop`: the subagent's id.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// `subagent-stop`: the subagent's own transcript, captured as its own source.
+    #[serde(default)]
+    pub agent_transcript_path: Option<String>,
+    /// SessionStart's `source` (`startup`, `resume`, `clear`, `compact`, `fork`).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// SessionEnd's `reason`.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
 /// The longest SessionStart briefing (`GET /api/v1/capture/briefing`), in characters: Claude
 /// Code's cap on the context a hook adds. A longer one is cut at a line end.
 pub const BRIEFING_MAX_CHARS: usize = 10_000;

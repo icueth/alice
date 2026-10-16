@@ -2,7 +2,7 @@
 //! One file per request (`<ulid>.json`), written atomically, so concurrent writers never collide.
 
 use crate::service::Service;
-use alice_core::api::{IngestRequest, RememberRequest};
+use alice_core::api::{CaptureNotify, IngestRequest, RememberRequest};
 use alice_core::error::AliceError;
 use alice_core::ids::new_id;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 pub enum SpoolEntry {
     Remember(RememberRequest),
     Ingest(IngestRequest),
+    /// A capture notify written by `alice hook` while the daemon was down (SP2 spec §4.1):
+    /// drained, it is an ordinary notify, and the pass reads from the source's cursor.
+    CaptureNotify(CaptureNotify),
 }
 
 /// What a reply says about a write queued because the database is read-only (`reason`).
@@ -131,6 +134,7 @@ impl Applier for Service {
         match entry {
             SpoolEntry::Remember(r) => self.remember_spooled(r).await.map(|_| ()),
             SpoolEntry::Ingest(r) => self.ingest_spooled(r).await.map(|_| ()),
+            SpoolEntry::CaptureNotify(n) => self.capture_notify_spooled(n),
         }
     }
 
@@ -200,7 +204,7 @@ fn retry_wait(first: Duration, failures: u32) -> Duration {
 ///
 /// Delivery is at-least-once: an entry applied just before a crash is applied again on the
 /// next drain, which is harmless because `remember` and `ingest` both skip content they
-/// already hold.
+/// already hold, and a capture notify reads from the source's cursor.
 pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
     drain_with(dir, svc).await
 }
@@ -257,6 +261,7 @@ pub(crate) async fn drain_with<A: Applier>(dir: &Path, svc: &A) -> DrainReport {
                 r.client_project.clone(),
                 r.project_hint.clone(),
             ),
+            SpoolEntry::CaptureNotify(n) => (None, n.cwd.clone(), None, None),
         };
         let result = svc.apply(entry).await;
         match result {
