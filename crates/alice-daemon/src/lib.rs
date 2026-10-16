@@ -11,6 +11,7 @@ pub mod compat_schema;
 pub mod config;
 pub mod daemon;
 pub mod discovery;
+pub mod distill;
 pub mod doctor;
 pub mod embedding;
 pub mod http;

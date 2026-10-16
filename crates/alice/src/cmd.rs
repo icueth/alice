@@ -317,7 +317,8 @@ pub enum MaintenanceCmd {
     /// When each job last ran.
     Status,
     /// Run one job now, to its end: backup, quick_check, index_check, fts_optimize,
-    /// raw_retention, trash_purge, judge_retry, merge_suggestions or events_prune.
+    /// raw_retention, capture_retention, trash_purge, judge_retry, merge_suggestions,
+    /// events_prune or model_purge.
     Run { job: String },
 }
 
@@ -437,6 +438,17 @@ pub struct BenchArgs {
     /// already holds the requested data. Never point it at a real ALICE_HOME.
     #[arg(long)]
     pub dir: Option<std::path::PathBuf>,
+}
+
+#[derive(Subcommand)]
+pub enum CaptureCmd {
+    /// Captured sessions: their cursors, chunks and where each one's distillation stands.
+    Status,
+    /// Distil a captured session now (also one skipped as a backfill, or one that failed).
+    Distill {
+        /// The session id (or a capture source's id or uri, from `alice capture status`).
+        session_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1262,6 +1274,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         Command::Config(c) => config(&home, c, json).await,
         Command::Import(ImportCmd::Mempalace(a)) => import_mempalace(&home, a, json).await,
         Command::Import(ImportCmd::Status) => import_status(&home, json).await,
+        Command::Capture(c) => capture(&home, c, json).await,
         Command::Daemon(DaemonCmd::Run { .. })
         | Command::Hook(_)
         | Command::Hooks(_)
@@ -1620,6 +1633,54 @@ async fn backup(home: &AliceHome, c: BackupCmd, json: bool) -> Result<()> {
     }
 }
 
+async fn capture(home: &AliceHome, c: CaptureCmd, json: bool) -> Result<()> {
+    match c {
+        CaptureCmd::Status => {
+            let st = client(home).await?.capture_status().await?;
+            print(json, &st, || capture_status_text(&st))
+        }
+        CaptureCmd::Distill { session_id } => {
+            let r = client(home)
+                .await?
+                .capture_distill(&CaptureDistillRequest {
+                    session_id: Some(session_id),
+                    source_id: None,
+                })
+                .await?;
+            print(json, &r, || {
+                r.due
+                    .iter()
+                    .map(|uri| format!("due for distillation: {uri}\n"))
+                    .collect()
+            })
+        }
+    }
+}
+
+fn capture_status_text(st: &CaptureStatus) -> String {
+    let mut t = format!(
+        "capture: {}; distillation: {} ({})\n",
+        if st.enabled { "on" } else { "off" },
+        st.distill_provider,
+        st.distill_state.replace('_', " ")
+    );
+    if st.sessions.is_empty() {
+        t.push_str("no captured sessions yet\n");
+    }
+    for s in &st.sessions {
+        t.push_str(&format!(
+            "{}  {}  {} chunks  {}{}  last capture {}\n",
+            s.uri,
+            s.project,
+            s.chunks,
+            s.distill_state,
+            if s.ended { "  ended" } else { "" },
+            s.last_capture_at.as_deref().unwrap_or("never")
+        ));
+    }
+    t
+}
+
 async fn maintenance(home: &AliceHome, c: MaintenanceCmd, json: bool) -> Result<()> {
     use alice_daemon::maintenance::Job;
     match c {
@@ -1713,6 +1774,10 @@ fn stats_text(s: &Stats) -> String {
     if let Some(w) = &s.judge_warning {
         t.push_str(&format!("judge warning: {w}\n"));
     }
+    t.push_str(&format!(
+        "distilled today: {} kept, {} dropped, ${:.4}\n",
+        s.distilled_today, s.distill_dropped_today, s.distill_cost_today_usd
+    ));
     t
 }
 
@@ -3078,6 +3143,29 @@ impl Interrupt {
 mod tests {
     use super::*;
 
+    /// `alice maintenance run --help` names every job the daemon runs (the merge boundary found
+    /// `capture_retention` and `model_purge` missing from the hand-written list).
+    #[test]
+    fn the_maintenance_run_help_names_every_job() {
+        let cmd = MaintenanceCmd::augment_subcommands(clap::Command::new("maintenance"));
+        let run = cmd
+            .find_subcommand("run")
+            .expect("`maintenance run` exists");
+        let help = format!(
+            "{} {}",
+            run.get_about().map(ToString::to_string).unwrap_or_default(),
+            run.get_long_about()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        );
+        let words: Vec<&str> = help
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .collect();
+        for job in alice_daemon::maintenance::Job::names() {
+            assert!(words.contains(&job), "the help names {job}: {help}");
+        }
+    }
+
     fn confirm(yes: bool, tty: bool, typed: &str) -> (Result<()>, String) {
         let mut asked = Vec::new();
         let r = confirm_merge(
@@ -3296,6 +3384,50 @@ mod tests {
                 && notes.contains("7 rows held back by the cloud policy")
                 && notes.contains("WARNING: openai:m is unreachable"),
             "{notes}"
+        );
+    }
+
+    /// SP2 Task 12 (ruling 6): `alice stats` shows distillation's part of the day, and
+    /// `alice capture status` lists the sessions with their distillation states.
+    #[test]
+    fn stats_and_capture_status_show_distillation() {
+        let stats = Stats {
+            judge_provider: "jev".into(),
+            distilled_today: 7,
+            distill_dropped_today: 2,
+            distill_cost_today_usd: 0.0012,
+            ..Default::default()
+        };
+        let text = stats_text(&stats);
+        assert!(
+            text.contains("distilled today: 7 kept, 2 dropped, $0.0012"),
+            "{text}"
+        );
+        let st = CaptureStatus {
+            tenant: false,
+            enabled: true,
+            distill_provider: "jev".into(),
+            distill_state: "waiting_budget".into(),
+            sessions: vec![CaptureSessionRow {
+                uri: "claude-code:session:s1".into(),
+                project: "shop".into(),
+                chunks: 4,
+                ended: true,
+                distill_state: "done".into(),
+                last_capture_at: Some("2026-10-17T01:02:03.000Z".into()),
+                ..Default::default()
+            }],
+        };
+        let text = capture_status_text(&st);
+        assert!(
+            text.starts_with("capture: on; distillation: jev (waiting budget)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "claude-code:session:s1  shop  4 chunks  done  ended  last capture 2026-10-17T01:02:03.000Z"
+            ),
+            "{text}"
         );
     }
 }

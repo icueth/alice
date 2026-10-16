@@ -180,6 +180,7 @@ mod tests {
             similarity: None,
             raw: false,
             status: None,
+            origin: Default::default(),
         };
         let b = memory_block("Existing memory 1", &m, now);
         assert!(
@@ -211,6 +212,7 @@ mod tests {
             similarity: None,
             raw: false,
             status: None,
+            origin: Default::default(),
         };
         let b = memory_block("Memory", &m, now);
         let body = b.lines().nth(2).unwrap();

@@ -110,6 +110,9 @@ enum Command {
     /// Bring memories in from another system (MemPalace).
     #[command(subcommand)]
     Import(cmd::ImportCmd),
+    /// Captured agent sessions: their status, and distilling one now.
+    #[command(subcommand)]
+    Capture(cmd::CaptureCmd),
     /// Embedding model management.
     #[command(subcommand)]
     Model(cmd::ModelCmd),

@@ -128,6 +128,10 @@ pub struct Hit {
     /// project be sent to a model. `Some(false)` on any doubt; absent outside the team store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_ok: Option<bool>,
+    /// `distill` for a memory distilled from a captured session (the text format marks it
+    /// `(auto)`); absent for any other (SP2 spec §6.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -741,6 +745,22 @@ pub struct CaptureSessionRow {
     pub gaps: i64,
 }
 
+/// `POST /api/v1/capture/distill` (SP2 spec §8.2): the captured session to distil now, by its
+/// session id or by a capture source's id (or uri). One of the two.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CaptureDistillRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+}
+
+/// What `POST /api/v1/capture/distill` made due: the capture sources' uris.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CaptureDistillAnswer {
+    pub due: Vec<String>,
+}
+
 /// The largest transcript upload (`POST /api/v1/capture/transcript`): one pass's worth.
 pub const TRANSCRIPT_BODY_LIMIT: usize = 8 << 20;
 
@@ -1268,6 +1288,7 @@ mod tests {
             source: None,
             author: None,
             cloud_ok: None,
+            origin: None,
         };
         let v = serde_json::to_value(&hit).unwrap();
         assert!(v.get("body").is_none() && v.get("status").is_none());

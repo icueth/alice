@@ -874,39 +874,470 @@ async fn setup_prints_the_plugin_commands_when_claude_fails() {
     );
 }
 
+/// The command every Codex hook runs, as the `hooks.json` setup writes must hold it.
+const CODEX_HOOK_COMMAND: &str = r#"sh "$HOME/.config/alice/alice-capture.sh" hook codex || true"#;
+
+/// The parsed `$CODEX_HOME/hooks.json`.
+fn codex_hooks(env: &Env) -> serde_json::Value {
+    serde_json::from_str(&read(&env.codex_home.join("hooks.json"))).unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn codex_is_skipped_with_a_message() {
+async fn setup_handles_codex_hooks_json() {
     let s = Server::start(&["ann"]).await;
     let env = Env::new();
     write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
     env.write_credentials(&s.url("ann"), &s.tenant("ann").token);
+    let hooks = env.codex_home.join("hooks.json");
+
+    // Absent: setup writes it, with the five events, and reminds the person to trust it.
     let r = env.setup(&s.url("ann"), "", &[]);
     assert!(r.ok(), "{r}");
+    assert!(!r.stdout.contains("later version"), "{r}");
+    assert!(r.stdout.contains("/hooks"), "the trust reminder: {r}");
+    assert_eq!(mode(&hooks), 0o600);
+    let written = codex_hooks(&env);
+    for event in FIVE_EVENTS {
+        let entry = &written["hooks"][event][0]["hooks"][0];
+        assert_eq!(entry["type"], "command", "{event}");
+        assert_eq!(entry["command"], CODEX_HOOK_COMMAND, "{event}");
+        assert!(entry["timeout"].as_u64().unwrap() <= 10, "{event}");
+    }
+    assert_eq!(written["hooks"].as_object().unwrap().len(), 5);
+    assert_eq!(
+        written["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3,
+        "SessionEnd allows at most 3 s"
+    );
+    let first = read(&hooks);
+
+    // Again: the file is still setup's own, so it is updated in place, byte for byte.
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&hooks), first);
+    assert!(
+        r.stdout.contains("Codex: wrote"),
+        "updated in place, not left as the person's: {r}"
+    );
+    assert!(!r.stdout.contains("already exists"), "{r}");
+
+    // Uninstall removes a hooks.json that is still exactly the one setup wrote.
+    let r = env.capture_sh(&["uninstall"], &[("ALICE_SETUP_ASSUME_YES", "1")]);
+    assert!(r.ok(), "{r}");
+    assert!(!hooks.exists(), "{r}");
+
+    // Present and the person's own: left untouched, the entries are printed to add.
+    let own = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}"#;
+    write_mode(&hooks, own.as_bytes(), 0o600);
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&hooks), own, "an existing hooks.json is never edited");
+    assert!(r.stdout.contains("already exists"), "{r}");
     assert!(
         r.stdout
-            .contains("Codex capture arrives in a later version"),
+            .contains(r#"alice-capture.sh\" hook codex || true"#),
         "{r}"
     );
+    assert!(r.stdout.contains("/hooks"), "{r}");
+    // And uninstall keeps a file that is not the one setup wrote.
+    let r = env.capture_sh(&["uninstall"], &[("ALICE_SETUP_ASSUME_YES", "1")]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&hooks), own);
+
+    // Inline `[hooks]` tables in config.toml are the person's format for this layer: hooks.json
+    // is not written beside them.
+    std::fs::remove_file(&hooks).unwrap();
+    std::fs::write(
+        env.codex_home.join("config.toml"),
+        "model = \"x\"\n\n[hooks]\n",
+    )
+    .unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert!(!hooks.exists(), "{r}");
+    assert!(
+        r.stdout
+            .contains(r#"alice-capture.sh\" hook codex || true"#),
+        "{r}"
+    );
+
+    // No `codex` command on PATH: Codex is not mentioned and nothing is written.
+    std::fs::remove_file(env.codex_home.join("config.toml")).unwrap();
+    std::fs::remove_file(env.bin.join("codex")).unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert!(!r.stdout.contains("Codex"), "{r}");
+    assert_eq!(std::fs::read_dir(&env.codex_home).unwrap().count(), 0);
+}
+
+/// A person who edits the `hooks.json` setup wrote must never lose the edit: a re-run of setup
+/// leaves the file alone (and says the Alice entries are in it), and uninstall keeps it. Each
+/// guard is pinned on its own: the edited file stays while `codex-hooks.written` still exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edited_codex_hooks_json_is_kept_by_setup_and_uninstall() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.write_credentials(&s.url("ann"), &s.tenant("ann").token);
+    let hooks = env.codex_home.join("hooks.json");
+    let copy = env.alice().join("codex-hooks.written");
+
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert!(r.stdout.contains("Codex: wrote"), "{r}");
+    let original = read(&hooks);
+    assert_eq!(read(&copy), original, "setup records what it wrote");
+
+    // The person adds an entry of their own.
+    let edited = original.replacen(
+        "\"hooks\": {",
+        "\"hooks\": {\n    \"PostToolUse\": [ { \"hooks\": [ { \"type\": \"command\", \"command\": \"echo mine\" } ] } ],",
+        1,
+    );
+    assert_ne!(edited, original);
+    write_mode(&hooks, edited.as_bytes(), 0o600);
+
+    // Setup again: byte-identical, and it says why. The Alice entries are in the file, so it
+    // must not invite a second copy of them.
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
     assert_eq!(
-        std::fs::read_dir(&env.codex_home).unwrap().count(),
-        0,
-        "nothing is written for Codex"
+        read(&hooks),
+        edited,
+        "setup never overwrites an edited file"
     );
-    // The hook script takes only Claude Code for now: a Codex event sends nothing.
-    let cwd = env.root.join("work");
-    let mut sess = Session::new(&env, "codex-one", &cwd);
-    sess.turn(1, "codex turn");
-    let mut c = env.command(&env.sh());
-    c.arg(env.script()).args(["hook", "codex"]);
-    let r = env.run(
-        c,
-        &serde_json::to_vec(&sess.input("Stop")).unwrap(),
-        Duration::from_secs(30),
+    assert!(r.stdout.contains("already exists"), "{r}");
+    assert!(!r.stdout.contains("Codex: wrote"), "{r}");
+    assert!(
+        !r.stdout.contains("Add these hook entries"),
+        "the Alice entries are in the file already: {r}"
     );
-    assert!(r.ok() && r.stdout.is_empty(), "{r}");
+    assert!(
+        r.stdout.contains("already has the Alice capture entries"),
+        "{r}"
+    );
+    assert_eq!(read(&copy), original, "the record is of what setup wrote");
+
+    // Uninstall: the record still exists, the file differs from it, so it is kept.
+    let r = env.capture_sh(&["uninstall"], &[("ALICE_SETUP_ASSUME_YES", "1")]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&hooks), edited, "uninstall keeps an edited file");
+    assert!(r.stdout.contains("has changed"), "{r}");
+}
+
+/// The record of the written file is made before `hooks.json` is touched: a record that cannot be
+/// written is not a failed `hooks.json` write, and leaves no file that later runs would take for
+/// the person's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_record_that_cannot_be_written_leaves_hooks_json_unwritten() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.write_credentials(&s.url("ann"), &s.tenant("ann").token);
+    let hooks = env.codex_home.join("hooks.json");
+    // Where the record is staged: a directory in the way makes the write fail.
+    let stage = env.alice().join("codex-hooks.written.new");
+    std::fs::create_dir_all(&stage).unwrap();
+
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert!(!hooks.exists(), "hooks.json is not written: {r}");
+    assert!(
+        !r.stdout
+            .contains(&format!("could not write {}", hooks.display())),
+        "it must not say hooks.json could not be written: {r}"
+    );
+    assert!(r.stdout.contains("could not write the record"), "{r}");
+    assert!(
+        r.stdout.contains("codex-hooks.written"),
+        "it names the record: {r}"
+    );
+    assert!(
+        r.stdout.contains("hook codex"),
+        "the entries are printed: {r}"
+    );
+    assert!(!env.alice().join("codex-hooks.written").exists());
+
+    // The way cleared, the next run writes both.
+    std::fs::remove_dir(&stage).unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert!(r.stdout.contains("Codex: wrote"), "{r}");
+    assert_eq!(read(&hooks), read(&env.alice().join("codex-hooks.written")));
+}
+
+/// Every TOML spelling of a `[hooks]` table keeps hooks.json from being written beside it
+/// (spec section 2.2: one format per layer); other keys and tables do not.
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_finds_every_toml_form_of_inline_hooks() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.write_credentials(&s.url("ann"), &s.tenant("ann").token);
+    let hooks = env.codex_home.join("hooks.json");
+    let copy = env.alice().join("codex-hooks.written");
+    let config = env.codex_home.join("config.toml");
+    let forms: [(&str, bool); 15] = [
+        ("[hooks]\n", true),
+        ("[ hooks ]\n", true),
+        ("  [hooks.Stop]\n", true),
+        ("[[hooks.Stop]]\n", true),
+        ("[[ hooks.Stop ]]\n", true),
+        ("[ hooks . Stop ]\n", true),
+        ("[\"hooks\"]\n", true),
+        ("['hooks'.Stop]\n", true),
+        ("hooks.Stop = [ { hooks = [] } ]\n", true),
+        ("hooks . Stop = []\n", true),
+        ("\"hooks\" = { Stop = [] }\n", true),
+        ("hooks = { Stop = [] }\n", true),
+        (
+            "[hooks_extra]\nhooks_dir = \"x\"\n# [hooks]\n[other.hooks]\n",
+            false,
+        ),
+        ("model = \"hooks\"\n[hookstop]\n", false),
+        ("", false),
+    ];
+    for (toml, inline) in forms {
+        let _ = std::fs::remove_file(&hooks);
+        let _ = std::fs::remove_file(&copy);
+        std::fs::write(&config, toml).unwrap();
+        let r = env.setup(&s.url("ann"), "", &[]);
+        assert!(r.ok(), "{toml:?}: {r}");
+        assert_eq!(!hooks.exists(), inline, "{toml:?}: {r}");
+        if inline {
+            assert!(r.stdout.contains("config.toml"), "{toml:?}: {r}");
+        }
+    }
+}
+
+/// `status` tells where the Codex hooks stand (spec section 5.4 step 9 points people to it).
+#[tokio::test(flavor = "multi_thread")]
+async fn status_reports_the_codex_hooks() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.install(&s);
+    let hooks = env.codex_home.join("hooks.json");
+    let status = |env: &Env| env.capture_sh(&["status"], &[]).stdout;
+    let out = status(&env);
+    assert!(out.contains("codex hooks: installed"), "{out}");
+    assert!(out.contains("/hooks"), "the trust reminder: {out}");
+
+    let mut text = read(&hooks);
+    text.push('\n');
+    std::fs::write(&hooks, &text).unwrap();
+    let out = status(&env);
+    assert!(out.contains("codex hooks: in"), "{out}");
+    assert!(out.contains("changed"), "{out}");
+
+    std::fs::write(&hooks, r#"{"hooks":{}}"#).unwrap();
+    let out = status(&env);
+    assert!(out.contains("codex hooks: not found"), "{out}");
+
+    std::fs::remove_file(&hooks).unwrap();
+    let out = status(&env);
+    assert!(out.contains("codex hooks: not found"), "{out}");
+}
+
+/// A Codex rollout of `turns` question/answer pairs, in the shape of the sampled format.
+fn rollout(sid: &str, turns: &[&str]) -> String {
+    let mut out = format!(
+        "{}\n",
+        json!({"timestamp": "2026-10-16T01:00:00.000Z", "type": "session_meta",
+               "payload": {"id": sid, "session_id": sid, "cwd": "/home/user/project-x"}})
+    );
+    for (i, marker) in turns.iter().enumerate() {
+        let item = |role: &str, kind: &str, block: &str, text: String, second: usize| {
+            format!(
+                "{}\n",
+                json!({"timestamp": format!("2026-10-16T01:{:02}:{:02}.000Z", i + 1, second),
+                       "type": "response_item",
+                       "payload": {"type": "message", "id": format!("m{i}{second}"), "role": role,
+                                   "content": [{"type": block, "text": text}],
+                                   "internal_chat_message_metadata_passthrough":
+                                       {"content_item_kinds": [kind]}}})
+            )
+        };
+        out += &item(
+            "user",
+            "user.text",
+            "input_text",
+            format!("Question {i} about {marker}."),
+            1,
+        );
+        out += &item(
+            "assistant",
+            "unknown",
+            "output_text",
+            format!("Answer {i}: {marker} is settled."),
+            2,
+        );
+    }
+    out
+}
+
+impl Env {
+    /// The Codex hook command, with `input` on stdin.
+    fn codex_hook(&self, input: &serde_json::Value) -> Run {
+        let mut c = self.command(&self.sh());
+        c.arg("-c").arg(CODEX_HOOK_COMMAND);
+        let r = self.run(
+            c,
+            &serde_json::to_vec(input).unwrap(),
+            Duration::from_secs(30),
+        );
+        assert!(r.ok(), "a hook must always exit 0: {r}");
+        assert!(r.stderr.is_empty(), "a hook writes nothing to stderr: {r}");
+        r
+    }
+
+    /// A rollout under `$CODEX_HOME/sessions/<day>/`.
+    fn write_rollout(&self, day: &str, sid: &str, text: &str) -> PathBuf {
+        let dir = self.codex_home.join("sessions").join(day);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-10-16T01-02-03-{sid}.jsonl"));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+}
+
+fn codex_input(sid: &str, path: serde_json::Value, cwd: &Path, event: &str) -> serde_json::Value {
+    json!({"session_id": sid, "transcript_path": path, "cwd": cwd, "hook_event_name": event})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hook_captures_a_codex_session_and_finds_a_null_transcript_path() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.install(&s);
+    let work = env.root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let codex_uri = |sid: &str| format!("codex:session:{sid}");
+
+    // `transcript_path` is null: the script finds the rollout by its session id.
+    let sid = "019f0000-aaaa-7000-8000-000000000001";
+    let text = rollout(sid, &["firstquokka", "secondquokka"]);
+    env.write_rollout("2026/10/16", sid, &text);
+    // A rollout of another session in the same folder is not this one's.
+    env.write_rollout(
+        "2026/10/16",
+        "019f0000-bbbb-7000-8000-000000000002",
+        &rollout("other", &["otherquokka"]),
+    );
+    let r = env.codex_hook(&codex_input(sid, json!(null), &work, "SessionStart"));
+    assert!(r.stdout.is_empty(), "no briefing is printed for Codex: {r}");
+    let r = env.codex_hook(&codex_input(sid, json!(null), &work, "Stop"));
+    assert!(r.stdout.is_empty(), "{r}");
     env.wait_idle();
-    assert!(uploads(&s, "codex-one").is_empty());
-    assert!(env.log().contains("Codex"), "{}", env.log());
+    let key = format!("codex-{sid}");
+    assert_eq!(env.offset(&key), Some(text.len() as u64), "{}", env.log());
+    assert_eq!(turns_of(&t.home, &codex_uri(sid)), 2, "{}", env.log());
+    for marker in ["firstquokka", "secondquokka"] {
+        assert_eq!(chunks_holding(&t.home, marker), 1, "{marker}");
+    }
+    assert_eq!(chunks_holding(&t.home, "otherquokka"), 0);
+    assert_eq!(
+        turns_of(&t.home, &uri(sid)),
+        0,
+        "no Claude Code source is made"
+    );
+    let ups = uploads(&s, sid);
+    assert!(!ups.is_empty(), "{ups:?}");
+    assert!(ups.iter().all(|q| q["agent"] == "codex"), "{ups:?}");
+
+    // A string path is used as it is, and the file growing is sent from the stored offset.
+    let sid2 = "019f0000-cccc-7000-8000-000000000003";
+    let elsewhere = env.root.join("transcripts").join("custom-rollout.jsonl");
+    let mut text2 = rollout(sid2, &["thirdquokka"]);
+    std::fs::write(&elsewhere, &text2).unwrap();
+    env.codex_hook(&codex_input(sid2, json!(elsewhere), &work, "Stop"));
+    env.wait_idle();
+    assert_eq!(turns_of(&t.home, &codex_uri(sid2)), 1, "{}", env.log());
+    let more = rollout(sid2, &["fourthquokka"]);
+    let more = more.split_once('\n').unwrap().1; // without a second session_meta
+    text2.push_str(more);
+    std::fs::write(&elsewhere, &text2).unwrap();
+    env.codex_hook(&codex_input(sid2, json!(elsewhere), &work, "SessionEnd"));
+    env.wait_idle();
+    assert_eq!(turns_of(&t.home, &codex_uri(sid2)), 2, "{}", env.log());
+    assert_eq!(chunks_holding(&t.home, "thirdquokka"), 1);
+
+    // Only the newest seven day folders are searched.
+    let old = "019f0000-dddd-7000-8000-000000000004";
+    env.write_rollout("2026/09/01", old, &rollout(old, &["oldquokka"]));
+    for day in 10..=16 {
+        let other = format!("019f0000-eeee-7000-8000-0000000000{day}");
+        env.write_rollout(&format!("2026/10/{day}"), &other, &rollout(&other, &["x"]));
+    }
+    env.codex_hook(&codex_input(old, json!(null), &work, "Stop"));
+    env.wait_idle();
+    assert!(uploads(&s, old).is_empty());
+    assert!(env.log().contains(old), "{}", env.log());
+    // ... and the seventh newest is searched: a session whose rollout is only there is found.
+    let seventh = "019f0000-9999-7000-8000-000000000007";
+    env.write_rollout("2026/10/10", seventh, &rollout(seventh, &["seventhquokka"]));
+    env.codex_hook(&codex_input(seventh, json!(null), &work, "Stop"));
+    env.wait_idle();
+    assert_eq!(chunks_holding(&t.home, "seventhquokka"), 1, "{}", env.log());
+
+    // A session id is matched whole: a piece of another session's id finds nothing.
+    for piece in ["7000", "aaaa-7000", "019f0000-aaaa"] {
+        env.codex_hook(&codex_input(piece, json!(null), &work, "Stop"));
+    }
+    env.wait_idle();
+    for piece in ["7000", "aaaa-7000", "019f0000-aaaa"] {
+        assert!(uploads(&s, piece).is_empty(), "{piece}");
+        assert!(env.offset(&format!("codex-{piece}")).is_none(), "{piece}");
+    }
+
+    // A compressed rollout is counted in the log and never read or sent.
+    let zst = env.root.join("transcripts").join("rollout-z.jsonl.zst");
+    std::fs::write(&zst, [0x28, 0xb5, 0x2f, 0xfd, 0, 1, 2]).unwrap();
+    let sid3 = "019f0000-ffff-7000-8000-000000000005";
+    env.codex_hook(&codex_input(sid3, json!(zst), &work, "Stop"));
+    env.wait_idle();
+    assert!(uploads(&s, sid3).is_empty());
+    assert!(env.log().contains("zst"), "{}", env.log());
+    assert!(env.tmp_entries().is_empty(), "{:?}", env.tmp_entries());
+}
+
+/// A Codex state whose recorded rollout is gone is not paired with another file: the sweep
+/// does not look the session up again, so the stored offset never meets a different file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sweep_does_not_pair_a_vanished_codex_rollout_with_another_file() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.install(&s);
+    let work = env.root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let sid = "019f0000-1111-7000-8000-000000000011";
+    let text = rollout(sid, &["vanishedquokka", "otherquokka"]);
+    env.write_rollout("2026/10/16", sid, &text);
+    std::fs::write(
+        env.state_file(&format!("codex-{sid}")),
+        format!(
+            "50 {}/gone/rollout.jsonl\nsession {sid}\ncwd {}\n",
+            env.root.display(),
+            work.display()
+        ),
+    )
+    .unwrap();
+    // The state is older than the rollout, as it would be had the file been moved since.
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(env.state_file(&format!("codex-{sid}")))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let other = "019f0000-2222-7000-8000-000000000022";
+    env.write_rollout("2026/10/16", other, &rollout(other, &["sweeperquokka"]));
+    env.codex_hook(&codex_input(other, json!(null), &work, "SessionStart"));
+    env.wait_idle();
+    assert!(uploads(&s, sid).is_empty(), "{}", env.log());
+    assert_eq!(env.offset(&format!("codex-{sid}")), Some(50));
 }
 
 // ---- The token ----

@@ -252,10 +252,15 @@ pub struct CaptureCtl {
     /// Unrecognised transcript lines per UTC day, the last [`UNKNOWN_DAYS`] days (in memory: a
     /// format-drift hint that starts from zero with the daemon).
     unknown: Mutex<VecDeque<(chrono::NaiveDate, u64)>>,
+    /// Called when a pass makes its source due for distillation (wakes the distill worker).
+    on_due: Mutex<Option<DueHook>>,
     /// Tests only (`ServiceOptions::capture_fail_after_slices`): slices left before a write
     /// fails as a kill between slices would; `None`: never.
     fail_after_slices: Mutex<Option<usize>>,
 }
+
+/// What [`CaptureCtl::set_on_due`] installs.
+pub type DueHook = Arc<dyn Fn() + Send + Sync>;
 
 /// A lock per source uri. An entry lives while a pass holds or waits for it.
 #[derive(Default)]
@@ -323,6 +328,7 @@ impl CaptureCtl {
             redactors,
             locks: SourceLocks::default(),
             unknown: Mutex::new(VecDeque::new()),
+            on_due: Mutex::new(None),
             fail_after_slices: Mutex::new(None),
         })
     }
@@ -589,6 +595,7 @@ impl CaptureCtl {
                 "another pass stored some of this pass's turns first"
             );
         }
+        self.mark_due(&input, &report);
         report.next_offset = done;
         Ok(report)
     }
@@ -920,6 +927,98 @@ pub(crate) fn forget_local_paths(conn: &Connection) -> Result<usize> {
          WHERE transcript_path IS NOT NULL OR file_key IS NOT NULL",
         [],
     )?)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Distillation (SP2 Task 12, spec §6.2).
+
+impl CaptureCtl {
+    /// Installs what a pass calls after it makes its source due (the distill worker's wake-up).
+    pub fn set_on_due(&self, hook: DueHook) {
+        *self.on_due.lock() = Some(hook);
+    }
+
+    /// Spec §6.2: a pass for a session end or a compaction makes its (main) source due for
+    /// distillation, when distillation is on and the source holds chunks not distilled yet (its
+    /// own, or a subagent's that is not skipped for its own project's rules). A source due
+    /// already keeps its next try, and a backfilled one is distilled only when asked (`alice
+    /// capture distill`). The capture is written either way: a failure here is logged, and the
+    /// distill worker's quiet check finds the source later.
+    ///
+    /// Only the event's last pass marks it: the one that closes the trailing turn. A pass that
+    /// leaves it open (a capped upload, `more=1`; a local pass short of the end of the file) is
+    /// followed by the rest of the session, and a run before that would take part of the
+    /// session for its end (and offer a handoff from the middle of it).
+    fn mark_due(&self, input: &PassInput, report: &PassReport) {
+        if input.subagent.is_some()
+            || !matches!(input.event.as_str(), "session-end" | "pre-compact")
+            || !(input.close_trailing || input.force_close)
+            || self.settings.get().distill.provider == DistillProvider::Off
+        {
+            return;
+        }
+        let Some(source_id) = report.source_id.as_deref() else {
+            return;
+        };
+        let pending = self.readers.with(|c| {
+            let Some(st) = store::by_source(c, source_id)? else {
+                return Ok(None);
+            };
+            if matches!(
+                st.distill_state,
+                store::DistillState::Due | store::DistillState::SkippedBackfill
+            ) {
+                return Ok(None);
+            }
+            let undistilled = st.next_ord > st.distill_ord
+                || store::children(c, source_id)?.iter().any(|k| {
+                    k.next_ord > k.distill_ord
+                        && !matches!(
+                            k.distill_state,
+                            store::DistillState::SkippedCloud
+                                | store::DistillState::SkippedExcluded
+                        )
+                });
+            Ok(undistilled.then_some(st))
+        });
+        let st = match pending {
+            Ok(Some(st)) => st,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(uri = report.uri, error = %e, "cannot tell whether a session is due for distillation; the distill worker looks again later");
+                return;
+            }
+        };
+        let marked = self.writer.submit_blocking(WriteOp::CaptureStateUpdate {
+            source_id: st.source_id,
+            change: CaptureChange::Distill {
+                state: store::DistillState::Due,
+                next_try_at: None,
+                attempts: 0,
+            },
+        });
+        if let Err(e) = marked {
+            tracing::warn!(uri = report.uri, error = %e, "cannot mark a session due for distillation; the distill worker looks again later");
+            return;
+        }
+        let hook = self.on_due.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// The capture verdict for a stored source's project, asked for every name the project is known
+/// by (ruling 3), and its working tree: the distill worker's "excluded" check.
+pub(crate) fn source_verdict(
+    readers: &ReaderPool,
+    settings: &SettingsHandle,
+    agent: AgentKind,
+    project_id: &str,
+) -> Result<(CaptureVerdict, Option<ProjectTree>)> {
+    let identity = readers.with(|c| stored_identity(c, project_id))?;
+    let v = verdict(settings, agent, &identity);
+    Ok((v, identity.tree))
 }
 
 fn distill_provider(s: &Settings) -> &'static str {

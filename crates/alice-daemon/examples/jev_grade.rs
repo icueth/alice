@@ -87,6 +87,7 @@ fn main() -> anyhow::Result<()> {
         similarity: None,
         raw: false,
         status: None,
+        origin: Default::default(),
     };
     let (mut out, mut failed, mut graded) = (serde_json::Map::new(), Vec::new(), 0usize);
     let mut counts = [0usize; 3];

@@ -207,6 +207,10 @@ fn heuristic() -> Arc<dyn Judge> {
     Arc::new(HeuristicJudge::default())
 }
 
+/// The words of [`build_judge`]'s fallback warning when Jev is asked for and no key is set
+/// ([`JudgeHub::key_missing`] looks for them).
+const NO_KEY: &str = "no TypeSafe key is set";
+
 /// The judge `settings` ask for, and a warning when it had to fall back to the heuristic.
 /// `transport` is asked for only when Jev is wanted and has a key.
 #[allow(clippy::too_many_arguments)]
@@ -229,7 +233,9 @@ pub fn build_judge(
         Ok(None) => {
             return (
                 heuristic(),
-                Some("judge.provider is jev but no TypeSafe key is set; using the heuristic judge. Set one with `alice config set-secret jev_api_key`".into()),
+                Some(format!(
+                    "judge.provider is jev but {NO_KEY}; using the heuristic judge. Set one with `alice config set-secret jev_api_key`"
+                )),
             );
         }
         Err(e) => {
@@ -380,6 +386,19 @@ impl JudgeHub {
     /// Whether the judge in force is a stand-in for the one asked for.
     pub fn fell_back(&self) -> bool {
         self.pending.lock().is_some() || self.slot.read().1.is_some()
+    }
+
+    /// Whether the judge in force stands in for Jev because no TypeSafe key is set (the last
+    /// build found none; a build in progress has not decided yet). The distiller reports it as
+    /// `no_key` (SP2 spec §8.4).
+    pub fn key_missing(&self) -> bool {
+        self.pending.lock().is_none()
+            && self
+                .slot
+                .read()
+                .1
+                .as_deref()
+                .is_some_and(|w| w.contains(NO_KEY))
     }
 
     fn transport(&self) -> Result<Arc<dyn JevTransport>, String> {

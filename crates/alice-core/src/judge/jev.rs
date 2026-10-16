@@ -1160,6 +1160,7 @@ impl Judge for JevJudge {
                     existing_id: e.id.clone(),
                     probs: Distribution::average(&fwd, &rev),
                     agreement,
+                    existing_origin: crate::model::Origin::default(),
                 }
             })
             .collect())
@@ -1217,6 +1218,16 @@ impl Judge for JevJudge {
         budget: Duration,
     ) -> JudgeResult<Vec<Distribution>> {
         self.grade(query_project, query, results, Some(budget))
+    }
+
+    /// The cache lookup [`ask_distill`](Judge::ask_distill) makes first, on its own: the same
+    /// request body (redacted for every project), so the same hash.
+    fn distill_cached(&self, projects: &[&str], state: &str, questions: &[Question]) -> bool {
+        let body = self.request_body(projects, state, questions);
+        let hash = request_hash(&self.cfg.model, &body);
+        self.store
+            .cached(&hash)
+            .is_some_and(|cached| parse(cached.as_bytes(), questions).is_ok())
     }
 
     /// [`ask`](JevJudge::ask) for distillation (SP2 spec §6.7): the configured retries and
@@ -1316,6 +1327,7 @@ pub mod scenarios {
             similarity: None,
             raw: false,
             status: None,
+            origin: Default::default(),
         }
     }
 
@@ -2974,5 +2986,33 @@ mod tests {
             );
         }
         assert!(s.calls.lock().is_empty());
+    }
+
+    /// SP2 Task 12 fix round 1: `distill_cached` tells, without sending or spending anything,
+    /// whether `ask_distill` would answer from the cache (the distiller's breaker counts only
+    /// answers from the model).
+    #[test]
+    fn distill_cached_tells_a_cache_answer_without_asking() {
+        let s = Scripted::new(Vec::new(), distill_and_compare_ok(100));
+        let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
+        let state = "Project: alice\nSession excerpt:";
+        assert!(!j.distill_cached(&["alice"], state, &[distill_q()]));
+        assert!(s.calls.lock().is_empty(), "the lookup sends nothing");
+        j.ask_distill(&["alice"], state, &[distill_q()], 1.0)
+            .unwrap();
+        assert_eq!(s.calls.lock().len(), 1);
+        assert!(j.distill_cached(&["alice"], state, &[distill_q()]));
+        assert!(!j.distill_cached(&["alice"], "Project: alice\nanother run", &[distill_q()]));
+        j.ask_distill(&["alice"], state, &[distill_q()], 1.0)
+            .unwrap();
+        assert_eq!(s.calls.lock().len(), 1, "the repeat came from the cache");
+        assert!(
+            !crate::judge::heuristic::HeuristicJudge::default().distill_cached(
+                &["alice"],
+                state,
+                &[distill_q()]
+            ),
+            "a judge without a cache never says so"
+        );
     }
 }

@@ -573,6 +573,12 @@ pub struct ServiceOptions {
     pub team_url: Option<String>,
     /// This tenant's name (`ALICE_TENANT_NAME`), the author the team store records.
     pub tenant_name: Option<String>,
+    /// How often the distill worker looks for sessions to distil when nothing wakes it (SP2
+    /// spec §6.2: 60 s). Tests shorten it.
+    pub distill_tick: Duration,
+    /// Tests: how long a session must be quiet before it is distilled, in place of
+    /// `distill.idle_minutes`.
+    pub distill_idle_override: Option<Duration>,
     /// Local capture (SP2 spec §4.2): a pass caused by `stop`, `subagent-stop`, `pre-compact`
     /// or `session-end` waits this long first, so the agent has finished writing the turn.
     pub capture_settle: Duration,
@@ -623,6 +629,8 @@ impl Default for ServiceOptions {
             team_store: false,
             team_url: None,
             tenant_name: None,
+            distill_tick: crate::distill::TICK,
+            distill_idle_override: None,
             capture_settle: Duration::from_millis(1500),
             capture_sweep_every: Duration::from_secs(60),
             capture_quiet: Duration::from_secs(5 * 60),
@@ -887,6 +895,8 @@ pub struct Service {
     import: Mutex<ImportSlot>,
     /// The capture pipeline (SP2): transcript bytes into chunks, turn keys and cursors.
     capture: Arc<CaptureCtl>,
+    /// The distill worker (SP2 Task 12): captured sessions into memories.
+    distill: Arc<crate::distill::DistillCtl>,
     /// Local capture: the worker that reads transcript files after a notify (SP2 spec §4.2).
     /// `None` on a server tenant, which never reads a client's files.
     capture_worker: Option<Arc<CaptureWorker>>,
@@ -1474,6 +1484,28 @@ impl Service {
             settings.clone(),
             redactors.clone(),
         );
+        let distill = crate::distill::DistillCtl::new(crate::distill::DistillCfg {
+            ctx: crate::distill::DistillCtx {
+                readers: readers.clone(),
+                writer: writer.clone(),
+                settings: settings.clone(),
+                redactors: redactors.clone(),
+                judge: judge.clone(),
+            },
+            tick: opts.distill_tick,
+            idle_override: opts.distill_idle_override,
+        });
+        {
+            let weak = Arc::downgrade(&distill);
+            capture.set_on_due(Arc::new(move || {
+                if let Some(d) = weak.upgrade() {
+                    d.wake();
+                }
+            }));
+        }
+        if let Err(e) = distill.spawn() {
+            tracing::error!(error = %e, "cannot start the distill worker; captured sessions are not distilled until the daemon restarts");
+        }
         capture.fail_after_slices(opts.capture_fail_after_slices);
         let capture_worker = (!opts.tenant).then(|| {
             let worker = CaptureWorker::new(
@@ -1545,6 +1577,7 @@ impl Service {
             scheduler,
             import: Mutex::new(ImportSlot::new()),
             capture,
+            distill,
             capture_worker,
             compat: crate::compat::CompatState::default(),
             #[cfg(test)]
@@ -1609,6 +1642,7 @@ impl Service {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.wake_worker.try_send(());
         let _ = self.wake_judge.try_send(());
+        self.distill.signal_stop();
         // The capture worker writes through the writer: it ends its pass before that stops.
         if let Some(w) = &self.capture_worker {
             w.stop(CAPTURE_STOP_WAIT);
@@ -1675,6 +1709,8 @@ impl Service {
         } else if judge.join().is_err() {
             tracing::error!("the judge worker panicked");
         }
+        // It may be waiting for Jev, like the judge worker: a moment, then it is left.
+        self.distill.stop();
         self.writer.send_nowait(WriteOp::Shutdown);
         if writer.join().is_err() {
             tracing::error!("the writer panicked");
@@ -2667,6 +2703,11 @@ impl Service {
                 similarity: None,
                 raw: h.tier == Tier::Raw,
                 status: h.status,
+                origin: h
+                    .origin
+                    .as_deref()
+                    .and_then(alice_core::model::Origin::parse)
+                    .unwrap_or_default(),
             };
             let mut shown: Vec<(usize, JudgeMemory)> = Vec::new();
             let mut ordinal = 0;
@@ -3462,6 +3503,9 @@ impl Service {
                 .format("%Y-%m-%d")
                 .to_string();
             let costs = alice_core::store::judge::cost_since(c, &week)?;
+            // What the distiller stored today, and how much of it was trashed since.
+            let (distilled_today, distill_dropped_today) =
+                crate::distill::distilled_since(c, &format!("{today}T00:00:00.000Z"))?;
             // The judge's spend is every one of its ledger rows: its own and distillation's.
             use alice_core::judge::jev::{LEDGER_DISTILL, LEDGER_ROWS};
             let judge_costs = |keep: &dyn Fn(&alice_core::store::judge::CostRow) -> bool| {
@@ -3498,9 +3542,8 @@ impl Service {
                 distill_cost_today_usd: judge_costs(&|r| {
                     r.day == today && r.provider == LEDGER_DISTILL
                 }),
-                // Filled by the distiller (SP2 Task 12).
-                distilled_today: 0,
-                distill_dropped_today: 0,
+                distilled_today,
+                distill_dropped_today,
             })
         })
         .await
@@ -4633,6 +4676,7 @@ impl Service {
         let model_loaded = self.embedder().is_loaded();
         let memory_bytes = crate::doctor::self_memory_bytes();
         let unrecognised_lines = self.capture.unrecognised_lines_7d();
+        let distill = self.distill.clone();
         let capture_counts = self.capture_counts();
         let capture_settings = self.settings();
         let tenant = self.opts.tenant;
@@ -4683,11 +4727,14 @@ impl Service {
                 settings_errors,
                 config_degraded,
                 team_warning,
-                capture: crate::capture::health(
+                capture: distill.fill_health(
                     c,
-                    &capture_settings,
-                    unrecognised_lines,
-                    capture_counts,
+                    crate::capture::health(
+                        c,
+                        &capture_settings,
+                        unrecognised_lines,
+                        capture_counts,
+                    )?,
                 )?,
                 tenant,
             })
@@ -4712,7 +4759,7 @@ impl Service {
     /// [`capture_transcript`](Self::capture_transcript) with the whole report of the pass.
     ///
     /// - refused (`Invalid`, nothing written): an unknown agent or event, a bad id, an offset
-    ///   over [`crate::capture::MAX_OFFSET`], and Codex (no reader until Task 17);
+    ///   over [`crate::capture::MAX_OFFSET`];
     /// - `no_capture=1` is a no-op: nothing is read or written, and the client moves past the
     ///   body's last complete line;
     /// - the project: on a server tenant, the hint (`project_header`, the `X-Alice-Project`
@@ -4734,13 +4781,6 @@ impl Service {
                 q.agent
             ))
         })?;
-        // Controller ruling: nothing reads a Codex rollout yet (Task 17). Accepted, its offset
-        // would never move and the client would send a growing body on every event.
-        if agent == alice_core::capture::AgentKind::Codex {
-            return Err(AliceError::invalid(
-                "Codex transcripts are not captured by this server yet; capture for Codex arrives in a later version",
-            ));
-        }
         crate::capture::check_ids(&q.session, q.subagent.as_deref())?;
         crate::capture::check_event(&q.event)?;
         crate::capture::check_offset(q.offset)?;
@@ -4843,13 +4883,53 @@ impl Service {
         ))
     }
 
+    /// `alice capture distill <session>` (SP2 spec §8.3): the session (or capture source) is due
+    /// for distillation now, whatever its state (a backfilled or failed one too).
+    pub async fn capture_distill_now(&self, session_or_source: &str) -> Result<()> {
+        self.capture_distill(session_or_source).await.map(|_| ())
+    }
+
+    /// [`capture_distill_now`](Self::capture_distill_now) with the uris of the sources it made
+    /// due (`POST /api/v1/capture/distill`). `NotFound` when nothing captured answers to it.
+    pub async fn capture_distill(&self, session_or_source: &str) -> Result<Vec<String>> {
+        let _busy = self.activity.enter();
+        let (distill, id) = (self.distill.clone(), session_or_source.to_string());
+        tokio::task::spawn_blocking(move || distill.mark_due_now(&id))
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Where distillation stands (SP2 spec §8.4): `off`, `ready`, `waiting_judge`,
+    /// `waiting_budget`, `breaker_open` or `no_key`, with what is wrong and what to do.
+    pub async fn distill_status(&self) -> Result<crate::distill::DistillView> {
+        let distill = self.distill.clone();
+        self.read(move |c| distill.view(c)).await
+    }
+
+    /// Tests and diagnosis: the distill worker's last runs, oldest first.
+    #[doc(hidden)]
+    pub fn distill_runs(&self) -> Vec<crate::distill::RunReport> {
+        self.distill.runs()
+    }
+
+    /// Tests: how many times the distill worker's loop has turned (asleep, once a tick).
+    #[doc(hidden)]
+    pub fn distill_rounds(&self) -> u64 {
+        self.distill.rounds()
+    }
+
     /// `GET /api/v1/capture/status`: the capture switch, distillation and the 50 sessions
     /// captured most recently.
     pub async fn capture_status(&self) -> Result<CaptureStatus> {
         let _busy = self.activity.enter();
         let (tenant, settings) = (self.opts.tenant, self.settings());
-        self.read(move |c| crate::capture::status(c, tenant, &settings))
-            .await
+        let distill = self.distill.clone();
+        self.read(move |c| {
+            let mut status = crate::capture::status(c, tenant, &settings)?;
+            status.distill_state = distill.view(c)?.state.into();
+            Ok(status)
+        })
+        .await
     }
 
     /// `POST /api/v1/capture/notify` (SP2 spec §4.2): checks the notification and queues a pass
@@ -4909,6 +4989,7 @@ impl Drop for Service {
             let _ = self.wake_worker.try_send(());
             let _ = self.wake_judge.try_send(());
             self.embedding.signal_stop();
+            self.distill.signal_stop();
             self.writer.send_nowait(WriteOp::Shutdown);
         }
     }
@@ -8618,6 +8699,240 @@ mod tests {
         s.shutdown();
     }
 
+    // ------------------------------------------------- distilled memories (SP2 spec §6.6)
+
+    /// A distilled memory, written as the distiller writes it (SP2 spec §6.5): the service's
+    /// project choice, `origin = distill`.
+    async fn remember_distilled(
+        s: &Service,
+        content: &str,
+        kind: Kind,
+        cwd: &Option<String>,
+    ) -> String {
+        let project = s
+            .choose(remember_req(content, Some(kind), cwd).scope())
+            .await
+            .unwrap();
+        match s
+            .writer
+            .submit(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: content.into(),
+                    kind: Some(kind),
+                    origin: alice_core::model::Origin::Distill,
+                    ..Default::default()
+                },
+                project,
+            })
+            .await
+            .unwrap()
+        {
+            WriteOutcome::Remembered(InsertOutcome::New { id, .. }, _) => id,
+            o => panic!("{o:?}"),
+        }
+    }
+
+    /// `(to_id, type)` of the links from `id`.
+    async fn links_from(s: &Service, id: &str) -> Vec<(String, String)> {
+        let id = id.to_string();
+        s.read(move |c| {
+            let mut st =
+                c.prepare("SELECT to_id, type FROM links WHERE from_id = ?1 ORDER BY type")?;
+            let rows = st
+                .query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_memory_replaces_an_older_distilled_duplicate() {
+        let (d, s) = svc_with_jev(crate::judge_http::ScriptedJev::new(("duplicate", 0.95))).await;
+        let cwd = repo(&d, "proj");
+        let auto = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5432",
+            Kind::Fact,
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let mine = remember_id(
+            &s,
+            "The staging Postgres server listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        // The explicit memory survives, though it is the newer one.
+        assert_eq!(
+            state_of(&s, &mine).await,
+            ("done".to_string(), "active".to_string())
+        );
+        assert_eq!(state_of(&s, &auto).await.1, "trashed");
+        assert_eq!(
+            links_from(&s, &auto).await,
+            [(mine.clone(), "duplicate_of".to_string())]
+        );
+        assert_eq!(
+            memory_of(&s, &auto).await.memory.id,
+            mine,
+            "the survivor answers for the distilled copy"
+        );
+        assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
+        let ev = s
+            .events(EventsRequest {
+                target_id: Some(auto.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| e.action == "memory.merge" && e.actor == "judge:jev"),
+            "{ev:?}"
+        );
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_distilled_memory_never_supersedes_an_agent_memory() {
+        let (d, s) = svc_with_jev(crate::judge_http::ScriptedJev::new(("updates", 0.95))).await;
+        let cwd = repo(&d, "proj");
+        let mine = remember_id(
+            &s,
+            "Staging Postgres listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let auto = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5433 now",
+            Kind::Fact,
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let live = ("done".to_string(), "active".to_string());
+        assert_eq!(state_of(&s, &mine).await.1, "active", "both stay");
+        assert_eq!(state_of(&s, &auto).await, live);
+        assert_eq!(
+            links_from(&s, &auto).await,
+            [(mine.clone(), "relates_to".to_string())]
+        );
+        assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
+        // A distilled update of an older distilled memory supersedes it, as an agent's would.
+        let newer = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5434 now",
+            Kind::Fact,
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        assert_eq!(state_of(&s, &newer).await, live);
+        assert_eq!(state_of(&s, &auto).await.1, "superseded");
+        assert_eq!(state_of(&s, &mine).await.1, "active");
+        assert_eq!(
+            links_from(&s, &newer).await,
+            [
+                (mine.clone(), "relates_to".to_string()),
+                (auto.clone(), "supersedes".to_string()),
+            ]
+        );
+        assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unjudged_distilled_memories_are_hidden_from_recall_and_the_briefing() {
+        // Jev is down, and each request takes a while: a try of the comparison (four requests)
+        // keeps the memory `pending` for 0.8 s. A failed judgement waits in `retry` until the test
+        // queues it again (the retry interval is long here).
+        let t = Arc::new(crate::judge_http::ScriptedJev {
+            relation: ("unrelated", 1.0),
+            status: parking_lot::Mutex::new(Some(503)),
+            delay: Duration::from_millis(200),
+            ..Default::default()
+        });
+        let (d, s) = svc_with_jev(t.clone()).await;
+        let cwd = repo(&d, "proj");
+        // A neighbour, so the judge has a question to ask about the distilled memory.
+        remember_id(
+            &s,
+            "Staging Postgres listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let text = "We release the billing service with blue green deploys";
+        let auto = remember_distilled(&s, text, Kind::Decision, &cwd).await;
+        let recall = || {
+            s.recall(RecallRequest {
+                query: "billing blue green deploys".into(),
+                cwd: cwd.clone(),
+                format: OutputFormat::Json,
+                ..Default::default()
+            })
+        };
+        // Recall and the briefing leave it out, and get finds it, while its judge state is `want`.
+        let hidden = |want: &'static str| {
+            let (s, cwd, auto, recall) = (&s, &cwd, &auto, &recall);
+            async move {
+                assert_eq!(state_of(s, auto).await.0, want);
+                let r = recall().await.unwrap();
+                assert!(
+                    r.results.iter().all(|h| h.id != *auto),
+                    "{want}: {:?}",
+                    r.results
+                );
+                let ctx = context_of(s, cwd).await.text;
+                assert!(!ctx.contains("blue green"), "{want}: {ctx}");
+                assert_eq!(
+                    memory_of(s, auto).await.memory.id,
+                    *auto,
+                    "{want}: get finds it"
+                );
+            }
+        };
+        hidden("pending").await;
+        // The judge cannot answer: the memory waits for it.
+        until("waiting for the judge", || {
+            (futures::executor::block_on(state_of(&s, &auto)).0 == "retry").then_some(())
+        })
+        .await;
+        hidden("retry").await;
+        assert!(t.sent() >= 4, "the comparison was tried");
+        // The judge is back and the memory is queued again: once judged, it is shown, marked.
+        t.set_status(None);
+        s.writer
+            .submit(WriteOp::RequeueJudgeRetries {
+                max_attempts: crate::judge_worker::MAX_ATTEMPTS,
+                now: "9999-12-31T00:00:00.000Z".into(),
+            })
+            .await
+            .unwrap();
+        until("the judgement", || {
+            (futures::executor::block_on(state_of(&s, &auto)).0 == "done").then_some(())
+        })
+        .await;
+        let r = recall().await.unwrap();
+        let hit = r.results.iter().find(|h| h.id == auto).unwrap();
+        assert_eq!(hit.origin.as_deref(), Some("distill"));
+        let ctx = context_of(&s, &cwd).await.text;
+        assert!(
+            ctx.contains(&format!("- [decision] {text} ({auto}) (auto)\n")),
+            "{ctx}"
+        );
+        s.shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn kind_is_set_only_when_the_writer_gave_none() {
         let t = Arc::new(crate::judge_http::ScriptedJev {
@@ -10326,6 +10641,7 @@ mod tests {
             source: None,
             author: None,
             cloud_ok: None,
+            origin: None,
         }
     }
 

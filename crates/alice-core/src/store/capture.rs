@@ -423,6 +423,145 @@ pub fn set_file_key(
     )?)
 }
 
+// ---------------------------------------------------------------------------------------------
+// What the distill worker reads (SP2 Task 12).
+
+/// The subagent sources of `source_id` (those whose parent it is), the oldest first.
+pub fn children(conn: &Connection, source_id: &str) -> Result<Vec<CaptureState>> {
+    many(
+        conn,
+        &format!("{SELECT_STATE} WHERE c.parent_source_id = ?1 ORDER BY c.created_at, c.source_id"),
+        [source_id],
+    )
+}
+
+/// The main sources (no parent) of session `session_id`, of every agent, the oldest first.
+pub fn sessions(conn: &Connection, session_id: &str) -> Result<Vec<CaptureState>> {
+    many(
+        conn,
+        &format!(
+            "{SELECT_STATE} WHERE c.session_id = ?1 AND c.parent_source_id IS NULL
+             ORDER BY c.created_at, c.source_id"
+        ),
+        [session_id],
+    )
+}
+
+/// The ords at which turns of `source_id` start, within `from..=to`: the `first_ord` of its
+/// stored turn keys. Late tails (`tail:…` keys) are left out: a stored tail continues the turn
+/// before it.
+pub fn turn_starts(conn: &Connection, source_id: &str, from: i64, to: i64) -> Result<HashSet<i64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT first_ord FROM capture_turns
+         WHERE source_id = ?1 AND turn_key NOT LIKE 'tail:%' AND first_ord BETWEEN ?2 AND ?3",
+    )?;
+    Ok(stmt
+        .query_map(params![source_id, from, to], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+/// Up to `limit` sources in `state`, the longest-waiting first; with `now`, only those whose
+/// next try has come (none set: at once).
+pub fn in_state(
+    conn: &Connection,
+    state: DistillState,
+    now: Option<&str>,
+    limit: usize,
+) -> Result<Vec<CaptureState>> {
+    many(
+        conn,
+        &format!(
+            "{SELECT_STATE} WHERE c.distill_state = ?1
+                AND (?2 IS NULL OR c.distill_next_try_at IS NULL OR c.distill_next_try_at <= ?2)
+             ORDER BY c.distill_next_try_at, c.created_at, c.source_id LIMIT ?3"
+        ),
+        params![state.as_str(), now, limit as i64],
+    )
+}
+
+/// Up to `limit` main sources (no parent) that are `idle` or `done`, hold chunks not distilled
+/// yet (their own, or a subagent's that is not skipped), have been quiet since `quiet_since`
+/// (neither they nor a subagent of theirs captured anything later), and captured something at
+/// `recent_since` or later (an older backlog is distilled only when asked). `(source_id,
+/// agent)`, the most recently captured first (spec §6.2; Task 12 fix round 1).
+pub fn quiet_undistilled(
+    conn: &Connection,
+    quiet_since: &str,
+    recent_since: &str,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.source_id, c.agent FROM capture_state c
+         WHERE c.parent_source_id IS NULL
+           AND c.distill_state IN ('idle', 'done')
+           AND COALESCE(c.last_capture_at, c.created_at) <= ?1
+           AND NOT EXISTS (SELECT 1 FROM capture_state k
+                           WHERE k.parent_source_id = c.source_id AND k.last_capture_at > ?1)
+           AND (COALESCE(c.last_capture_at, c.created_at) >= ?2
+                OR EXISTS (SELECT 1 FROM capture_state k
+                           WHERE k.parent_source_id = c.source_id AND k.last_capture_at >= ?2))
+           AND (c.next_ord > c.distill_ord
+                OR EXISTS (SELECT 1 FROM capture_state k
+                           WHERE k.parent_source_id = c.source_id AND k.next_ord > k.distill_ord
+                             AND k.distill_state NOT IN ('skipped_cloud', 'skipped_excluded')))
+         ORDER BY COALESCE(c.last_capture_at, c.created_at) DESC, c.source_id DESC LIMIT ?3",
+    )?;
+    Ok(stmt
+        .query_map(params![quiet_since, recent_since, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+/// Up to `limit` sources waiting to be distilled (`due`) whose next try has come at `now` (none
+/// set: at once), the most recently captured first (Task 12 fix round 1: a backlog is drained
+/// newest first).
+pub fn due_newest(conn: &Connection, now: &str, limit: usize) -> Result<Vec<CaptureState>> {
+    many(
+        conn,
+        &format!(
+            "{SELECT_STATE} WHERE c.distill_state = 'due'
+                AND (c.distill_next_try_at IS NULL OR c.distill_next_try_at <= ?1)
+             ORDER BY COALESCE(c.last_capture_at, c.created_at) DESC, c.source_id DESC LIMIT ?2"
+        ),
+        params![now, limit as i64],
+    )
+}
+
+/// Chunks of `source_id` with `from <= ord < until`, at most `limit`, in order: `(id, ord,
+/// text)`. `until` is a cursor's `next_ord`: chunks at or past it belong to a turn whose last
+/// slice is not written yet.
+pub fn chunks_between(
+    conn: &Connection,
+    source_id: &str,
+    from: i64,
+    until: i64,
+    limit: usize,
+) -> Result<Vec<(String, i64, String)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, ord, text FROM chunks WHERE source_id = ?1 AND ord >= ?2 AND ord < ?3
+         ORDER BY ord LIMIT ?4",
+    )?;
+    Ok(stmt
+        .query_map(params![source_id, from, until, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+/// Up to `limit` sources not marked ended that captured nothing since `before` (one that never
+/// captured: registered before it), the stalest first.
+pub fn stale_open(conn: &Connection, before: &str, limit: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT source_id FROM capture_state
+         WHERE ended = 0 AND COALESCE(last_capture_at, created_at) <= ?1
+         ORDER BY COALESCE(last_capture_at, created_at), source_id LIMIT ?2",
+    )?;
+    Ok(stmt
+        .query_map(params![before, limit as i64], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +878,222 @@ mod tests {
         let known = known_turns(&c, "claude-code", &keys).unwrap();
         assert_eq!(known.len(), 600);
         assert!(known.contains("k1198") && !known.contains("k1199"));
+    }
+
+    /// SP2 Task 12: what the distill worker reads. Subagents by parent, main sources by
+    /// session, turn starts without late tails, sources by state and next try, quiet sources
+    /// with undistilled chunks (their own or a subagent's), and stale open sources.
+    #[test]
+    fn distill_worker_reads() {
+        let (_d, c) = conn();
+        let set = |id: &str, col: &str, v: &dyn rusqlite::ToSql| {
+            c.execute(
+                &format!("UPDATE capture_state SET {col} = ?2 WHERE source_id = ?1"),
+                params![id, v],
+            )
+            .unwrap();
+        };
+        for (id, uri, session) in [
+            ("M1", "claude-code:session:m1", "m1"),
+            ("M2", "claude-code:session:m2", "m2"),
+            ("M3", "claude-code:session:m3", "m3"),
+            ("K1", "claude-code:session:m1:agent:k1", "m1"),
+            ("K2", "claude-code:session:m1:agent:k2", "m1"),
+        ] {
+            source(&c, id, uri, Some(session), None);
+            state(&c, id, session);
+        }
+        for (id, created) in [
+            ("M1", "2026-10-16T01:00:00.000Z"),
+            ("M2", "2026-10-16T02:00:00.000Z"),
+            ("M3", "2026-10-16T03:00:00.000Z"),
+            ("K2", "2026-10-16T04:00:00.000Z"),
+            ("K1", "2026-10-16T05:00:00.000Z"),
+        ] {
+            set(id, "created_at", &created);
+        }
+        set("K1", "parent_source_id", &"M1");
+        set("K2", "parent_source_id", &"M1");
+        let ids = |v: Vec<CaptureState>| v.into_iter().map(|s| s.source_id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(children(&c, "M1").unwrap()),
+            ["K2", "K1"],
+            "oldest first"
+        );
+        assert!(children(&c, "M2").unwrap().is_empty());
+        assert_eq!(
+            ids(sessions(&c, "m1").unwrap()),
+            ["M1"],
+            "main sources only"
+        );
+
+        record_turns(
+            &c,
+            "claude-code",
+            "M1",
+            [("a", 0), ("b", 3), ("tail:c", 5), ("d", 9)],
+        )
+        .unwrap();
+        record_turns(&c, "claude-code", "M2", [("e", 4)]).unwrap();
+        assert_eq!(
+            turn_starts(&c, "M1", 0, 8).unwrap(),
+            HashSet::from([0, 3]),
+            "in range, no tail, no other source"
+        );
+
+        set_distill(
+            &c,
+            "M2",
+            DistillState::SkippedCloud,
+            Some("2026-10-16T06:00:00.000Z"),
+            0,
+        )
+        .unwrap();
+        set_distill(&c, "M3", DistillState::SkippedCloud, None, 0).unwrap();
+        assert_eq!(
+            ids(in_state(&c, DistillState::SkippedCloud, None, 10).unwrap()),
+            ["M3", "M2"]
+        );
+        assert_eq!(
+            ids(in_state(
+                &c,
+                DistillState::SkippedCloud,
+                Some("2026-10-16T05:00:00.000Z"),
+                10
+            )
+            .unwrap()),
+            ["M3"],
+            "a next try still to come waits"
+        );
+
+        // Quiet: M1 has undistilled chunks of its own; M2 is skipped_cloud; M3 has nothing.
+        set_distill(&c, "M2", DistillState::Idle, None, 0).unwrap();
+        set_distill(&c, "M3", DistillState::Done, None, 0).unwrap();
+        set("M1", "next_ord", &4);
+        set("M1", "last_capture_at", &"2026-10-16T07:00:00.000Z");
+        set("M2", "last_capture_at", &"2026-10-16T07:00:00.000Z");
+        set("M3", "last_capture_at", &"2026-10-16T07:00:00.000Z");
+        let quiet = |at: &str| -> Vec<String> {
+            quiet_undistilled(&c, at, "2026-10-10T00:00:00.000Z", 10)
+                .unwrap()
+                .into_iter()
+                .map(|(id, agent)| {
+                    assert_eq!(agent, "claude-code");
+                    id
+                })
+                .collect()
+        };
+        assert_eq!(quiet("2026-10-16T08:00:00.000Z"), ["M1"]);
+        assert!(
+            quiet("2026-10-16T06:00:00.000Z").is_empty(),
+            "not quiet yet"
+        );
+        // A subagent that captured later keeps the session from being quiet.
+        set("K1", "last_capture_at", &"2026-10-16T09:00:00.000Z");
+        assert!(quiet("2026-10-16T08:00:00.000Z").is_empty());
+        assert_eq!(quiet("2026-10-16T10:00:00.000Z"), ["M1"]);
+        // Distilled to the end: only a subagent's undistilled chunks make it due again.
+        set_distilled(&c, "M1", 4).unwrap();
+        assert!(quiet("2026-10-16T10:00:00.000Z").is_empty());
+        set("K2", "next_ord", &2);
+        assert_eq!(quiet("2026-10-16T10:00:00.000Z"), ["M1"]);
+        // A skipped subagent's chunks do not count.
+        set_distill(&c, "K2", DistillState::SkippedCloud, None, 0).unwrap();
+        assert!(quiet("2026-10-16T10:00:00.000Z").is_empty());
+        set_distill(&c, "K2", DistillState::Idle, None, 0).unwrap();
+        // Captured before `recent_since` (a week back, say): left for `alice capture distill`.
+        assert!(
+            quiet_undistilled(
+                &c,
+                "2026-10-16T10:00:00.000Z",
+                "2026-10-16T09:30:00.000Z",
+                10
+            )
+            .unwrap()
+            .is_empty(),
+            "neither M1 (07:00) nor its subagents (K1 09:00) captured since 09:30"
+        );
+        assert_eq!(
+            quiet_undistilled(
+                &c,
+                "2026-10-16T10:00:00.000Z",
+                "2026-10-16T08:30:00.000Z",
+                10
+            )
+            .unwrap()
+            .len(),
+            1,
+            "K1 captured at 09:00, so the session is recent"
+        );
+        // A due source is not quiet-triggered again.
+        set_distill(&c, "M1", DistillState::Due, None, 0).unwrap();
+        assert!(quiet("2026-10-16T10:00:00.000Z").is_empty());
+
+        // Stale: open sources by their last capture (or registration).
+        set_ended(&c, "M3").unwrap();
+        assert_eq!(
+            stale_open(&c, "2026-10-16T07:30:00.000Z", 10).unwrap(),
+            ["K2", "M1", "M2"],
+            "K2 never captured (registered 04:00); M1 and M2 at 07:00; M3 ended; K1 later"
+        );
+        assert_eq!(
+            stale_open(&c, "2026-10-16T04:30:00.000Z", 10).unwrap(),
+            ["K2"]
+        );
+    }
+
+    /// Task 12 fix round 1: due sources newest capture first, and chunks bounded by a cursor.
+    #[test]
+    fn due_newest_first_and_chunks_below_a_cursor() {
+        let (_d, c) = conn();
+        for (id, session, at) in [
+            ("A", "a", "2026-10-16T01:00:00.000Z"),
+            ("B", "b", "2026-10-16T03:00:00.000Z"),
+            ("C", "c", "2026-10-16T02:00:00.000Z"),
+        ] {
+            source(
+                &c,
+                id,
+                &format!("claude-code:session:{session}"),
+                Some(session),
+                None,
+            );
+            state(&c, id, session);
+            c.execute(
+                "UPDATE capture_state SET last_capture_at = ?2 WHERE source_id = ?1",
+                params![id, at],
+            )
+            .unwrap();
+            set_distill(&c, id, DistillState::Due, None, 0).unwrap();
+        }
+        set_distill(
+            &c,
+            "C",
+            DistillState::Due,
+            Some("2026-10-16T09:00:00.000Z"),
+            1,
+        )
+        .unwrap();
+        let ids = |v: Vec<CaptureState>| v.into_iter().map(|s| s.source_id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(due_newest(&c, "2026-10-16T08:00:00.000Z", 10).unwrap()),
+            ["B", "A"]
+        );
+        assert_eq!(
+            ids(due_newest(&c, "2026-10-16T10:00:00.000Z", 10).unwrap()),
+            ["B", "C", "A"]
+        );
+        for ord in 0..5 {
+            c.execute(
+                "INSERT INTO chunks (id, source_id, project_id, ord, text, content_hash, created_at)
+                 VALUES (?1, 'A', ?2, ?3, 't', 'h', '2026-10-16T00:00:00.000Z')",
+                params![format!("A{ord}"), GLOBAL_ID, ord],
+            )
+            .unwrap();
+        }
+        let ords = |v: Vec<(String, i64, String)>| v.into_iter().map(|r| r.1).collect::<Vec<_>>();
+        assert_eq!(ords(chunks_between(&c, "A", 1, 4, 10).unwrap()), [1, 2, 3]);
+        assert_eq!(ords(chunks_between(&c, "A", 1, 4, 2).unwrap()), [1, 2]);
+        assert!(chunks_between(&c, "A", 3, 3, 10).unwrap().is_empty());
     }
 }

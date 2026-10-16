@@ -305,6 +305,7 @@ fn mem(
         similarity: sim,
         raw: false,
         status: None,
+        origin: Default::default(),
     }
 }
 

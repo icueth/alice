@@ -73,8 +73,14 @@ fn header(i: usize, h: &Hit) -> String {
         (Some("team"), None) => " · (team)".to_string(),
         _ => String::new(),
     };
+    // A memory distilled from a captured session (SP2 spec §6.6).
+    let auto = if h.origin.as_deref() == Some("distill") {
+        " (auto)"
+    } else {
+        ""
+    };
     format!(
-        "[{}] {} · {} · {} · {}{}{} · matched: {}\n",
+        "[{}] {} · {} · {} · {}{}{} · matched: {}{auto}\n",
         i + 1,
         h.id,
         kind,
@@ -248,6 +254,7 @@ mod tests {
             source: None,
             author: None,
             cloud_ok: None,
+            origin: None,
         }
     }
 
