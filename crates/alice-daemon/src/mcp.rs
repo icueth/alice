@@ -323,11 +323,38 @@ fn json<T: serde::Serialize>(v: &T) -> CallToolResult {
     text(serde_json::to_string_pretty(v).unwrap_or_default())
 }
 
-/// Whether a project name fits the limits: at most `MAX_PROJECT_NAME_CHARS` characters
-/// trimmed, and a slug of at most `MAX_PROJECT_SLUG_CHARS`.
 /// The header a tenant's MCP client may name its project in (after `?project=`, before a root).
+/// UTF-8, or percent-encoded UTF-8 (Node's fetch, behind Claude Code's `headersHelper`, cannot
+/// send other bytes).
 pub const PROJECT_HEADER: &str = "x-alice-project";
 
+/// `%XX` sequences decoded; `None` when the bytes are not UTF-8 afterwards.
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (
+            b[i],
+            b.get(i + 1).copied().and_then(hex),
+            b.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Whether a project name fits the limits: at most `MAX_PROJECT_NAME_CHARS` characters
+/// trimmed, and a slug of at most `MAX_PROJECT_SLUG_CHARS`.
 fn within_project_limits(name: &str) -> bool {
     name.trim().chars().count() <= limits::MAX_PROJECT_NAME_CHARS
         && alice_core::normalize::slugify(name).chars().count() <= limits::MAX_PROJECT_SLUG_CHARS
@@ -403,13 +430,23 @@ impl AliceMcp {
                 .find(|(k, v)| k == "project" && !v.trim().is_empty())
                 .map(|(_, v)| v.into_owned())
         });
-        // UTF-8, so a checkout named in Thai comes through as it is.
-        let header = parts
-            .and_then(|p| p.headers.get(PROJECT_HEADER))
-            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(String::from);
+        // UTF-8 or percent-encoded UTF-8; anything else fails the call rather than falling to
+        // another project.
+        let header = match parts.and_then(|p| p.headers.get(PROJECT_HEADER)) {
+            None => None,
+            Some(v) => {
+                let decoded = std::str::from_utf8(v.as_bytes())
+                    .ok()
+                    .and_then(percent_decode)
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            "the X-Alice-Project header is not UTF-8: send the project name as UTF-8 or percent-encoded UTF-8",
+                            None,
+                        )
+                    })?;
+                Some(decoded.trim().to_string()).filter(|v| !v.is_empty())
+            }
+        };
         let (named, from) = match (queried, header) {
             (Some(q), _) => (Some(q), "?project="),
             (None, Some(h)) => (Some(h), "the X-Alice-Project header"),

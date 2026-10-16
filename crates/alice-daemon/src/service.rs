@@ -4243,7 +4243,10 @@ fn shared_write_error(e: AliceError) -> AliceError {
     match e {
         e if alice_core::redact::is_refusal(&e) => e,
         e @ (AliceError::Invalid(_) | AliceError::NotFound(_)) => e,
-        _ if text.contains("did not answer in time") || text.contains("broke off its answer") => {
+        _ if text.contains("did not answer in time")
+            || text.contains("broke off its answer")
+            || text.contains("sent an answer this daemon cannot read") =>
+        {
             AliceError::Other(format!(
                 "the team memory did not confirm the write ({text}); it may have been saved: recall it before saving it again"
             ))
@@ -10791,6 +10794,11 @@ mod tests {
         ))
         .to_string();
         assert!(late.contains("may have been saved"), "{late}");
+        let garbled = shared_write_error(AliceError::Other(
+            "the team store sent an answer this daemon cannot read: eof".into(),
+        ))
+        .to_string();
+        assert!(garbled.contains("may have been saved"), "{garbled}");
         let down = shared_write_error(AliceError::Other(
             "the team store is unreachable: connection refused".into(),
         ))

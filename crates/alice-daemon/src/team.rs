@@ -212,10 +212,13 @@ impl TeamLink {
             Ok(r) => r,
             Err(e) => {
                 self.forget();
+                // Only a connection that never opened means the request was not sent.
                 let why = if e.is_timeout() {
                     "did not answer in time".to_string()
-                } else {
+                } else if e.is_connect() {
                     format!("is unreachable: {}", e.without_url())
+                } else {
+                    format!("broke off its answer: {}", e.without_url())
                 };
                 return Err(self.fail(team_error(why)));
             }
