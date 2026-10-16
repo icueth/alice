@@ -656,7 +656,7 @@ cmd_upgrade() { # binary (also the first install)
   local new=$1 lib failed still
   no_import_running
   need_avx
-  [ -f "$new" ] && [ -x "$new" ] || die "$new is not an executable file"
+  if [ ! -f "$new" ] || [ ! -x "$new" ]; then die "$new is not an executable file"; fi
   # A build of deploy/server/build-release keeps its ONNX Runtime where the binary's rpath looks: ../lib/alice.
   lib="$(dirname -- "$new")/../lib/alice/$ORT_LIB"
   [ -f "$lib" ] || lib=""
@@ -769,7 +769,7 @@ cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
   fi
   need_tenant "$name"
   if is_team "$name"; then die "$TEAM is the shared team store; adopt a person's database into their own tenant"; fi
-  [ ! -L "$file" ] && [ -f "$file" ] || die "$file is not a regular file"
+  if [ -L "$file" ] || [ ! -f "$file" ]; then die "$file is not a regular file"; fi
   owner=$(file_uid "$file")
   [ "$owner" = "$admin" ] || die "$file belongs to uid $owner; copy it into your own home first (it must be the admin's file, uid $admin)"
   need=$(( 2 * ($(file_bytes "$file") / 1024 + 1) + 2 * 1024 * 1024 ))

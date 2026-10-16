@@ -431,11 +431,11 @@ refuses_to_run_with_empty_roots() {
   mkdir -p "$T/outside"
   echo keep >"$T/outside/file"
   local before
-  before=$(cat "$R/calls.log" | wc -l)
+  before=$(wc -l <"$R/calls.log")
   ALICE_SERVER_SRV_DIR="" run add eve
   [ "$RC" != 0 ] || fail "ran with an empty SRV"
   printf '%s\n' "$OUT" | grep -qF 'SRV' || fail "the error does not name SRV: $OUT"
-  [ "$(cat "$R/calls.log" | wc -l)" = "$before" ] || fail "a command ran despite the empty root"
+  [ "$(wc -l <"$R/calls.log")" = "$before" ] || fail "a command ran despite the empty root"
   [ -f "$T/outside/file" ] || fail "something outside the temp root was touched"
   [ ! -e "$TENANTS/eve.env" ] || fail "a tenant was created"
   ALICE_SERVER_SRV_DIR="" run remove ann --yes
@@ -465,7 +465,7 @@ import_refuses_a_tenant_home() {
   mkdir -p "$SRV/bob"; echo db >"$SRV/bob/chroma.sqlite3"; echo x >"$SRV/bob/marker"   # bob is a real tenant: keep its home
   run import ann "$SRV/bob"
   [ "$RC" != 0 ] || fail "imported another tenant's home"
-  [ -f "$SRV/ann/marker" ] && [ -f "$SRV/bob/marker" ] || fail "a home was moved or deleted"
+  if [ ! -f "$SRV/ann/marker" ] || [ ! -f "$SRV/bob/marker" ]; then fail "a home was moved or deleted"; fi
   run import ann "$SRV"
   [ "$RC" != 0 ] || fail "imported the whole srv"
   rm -f -- "${SRV:?}/ann/chroma.sqlite3" "${SRV:?}/ann/marker"
@@ -479,7 +479,7 @@ import_refuses_root_and_system_dirs() {
     run import ann "$d"
     [ "$RC" != 0 ] || fail "import of $d succeeded"
   done
-  [ -d /usr ] && [ -d /etc ] || fail "unexpected"
+  if [ ! -d /usr ] || [ ! -d /etc ]; then fail "unexpected"; fi
   pass
 }
 
@@ -998,7 +998,9 @@ add_person_after_team_is_provisioned() {
   cmp "$SRV/team/token" "$SRV/hal/team.token" || fail "hal team.token differs"
   l_chown=$(grep -nE 'chown alice-hal:alice-hal .*hal/\.team\.token\.' "$R/calls.log" | head -n 1 | cut -d: -f1 || true)
   l_start=$(grep -n 'systemctl enable --now alice@hal' "$R/calls.log" | head -n 1 | cut -d: -f1)
-  [ -n "$l_chown" ] && [ -n "$l_start" ] && [ "$l_chown" -lt "$l_start" ] || fail "team.token not in place before the first start ($l_chown, $l_start)"
+  if [ -z "$l_chown" ] || [ -z "$l_start" ] || [ "$l_chown" -ge "$l_start" ]; then
+    fail "team.token not in place before the first start ($l_chown, $l_start)"
+  fi
   PERSONAL="ann bob dave hal"
   pass
 }
