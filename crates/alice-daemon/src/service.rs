@@ -4175,6 +4175,65 @@ impl Service {
             .map_err(join_err)?
     }
 
+    /// `GET /api/v1/capture/briefing` (SP2 spec §5.7, §8.2): the SessionStart briefing, the
+    /// `context` text of the session's project cut to [`BRIEFING_MAX_CHARS`] at a line end.
+    /// `None` when `capture.briefing` is off, or when `source` is `resume` or `fork` (the
+    /// session already has its context).
+    ///
+    /// The project: on a server tenant, the hint (`project_header`, the `X-Alice-Project`
+    /// header, else `project`), resolved as a transcript upload's is (an existing slug or alias,
+    /// or the `import:<slug>` placeholder when it is stored); a hint no stored project answers
+    /// to gives the global briefing, because a read creates nothing. On a local daemon, `cwd`.
+    pub async fn capture_briefing(&self, q: BriefingQuery) -> Result<Option<String>> {
+        let _busy = self.activity.enter();
+        if !self.settings().capture.briefing
+            || matches!(q.source.as_deref().map(str::trim), Some("resume" | "fork"))
+        {
+            return Ok(None);
+        }
+        let req = if self.opts.tenant {
+            let nonempty = |s: &Option<String>| s.clone().filter(|v| !v.trim().is_empty());
+            let project = match nonempty(&q.project_header).or_else(|| nonempty(&q.project)) {
+                None => None,
+                Some(hint) => {
+                    let choice = self
+                        .choose(Scope {
+                            project_hint: Some(&hint),
+                            ..Scope::default()
+                        })
+                        .await?;
+                    self.read(move |c| {
+                        Ok(match choice {
+                            ProjectChoice::Slug(slug) => Some(slug),
+                            ProjectChoice::Detected(r) => match projects::detected_for_read(c, &r)?
+                            {
+                                DetectedForRead::Stored(p) | DetectedForRead::Placeholder(p) => {
+                                    Some(p.slug)
+                                }
+                                DetectedForRead::Ambiguous(_) | DetectedForRead::Unstored => None,
+                            },
+                            ProjectChoice::Fallback => None,
+                        })
+                    })
+                    .await?
+                }
+            };
+            ContextRequest {
+                project,
+                ..ContextRequest::default()
+            }
+        } else {
+            ContextRequest {
+                cwd: q.cwd,
+                ..ContextRequest::default()
+            }
+        };
+        let text = self.context(req).await?.text;
+        Ok(Some(
+            crate::capture::cut_at_line_end(&text, BRIEFING_MAX_CHARS).to_string(),
+        ))
+    }
+
     /// `GET /api/v1/capture/status`: the capture switch, distillation and the 50 sessions
     /// captured most recently.
     pub async fn capture_status(&self) -> Result<CaptureStatus> {

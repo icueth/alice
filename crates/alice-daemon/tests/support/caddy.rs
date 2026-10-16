@@ -125,10 +125,27 @@ impl Server {
         Self::start_with(names, true, Some(jev)).await
     }
 
+    /// One tenant `name` whose data directory `home` already exists (an adopted database, say):
+    /// its service starts there in tenant mode. The caller keeps the directory alive.
+    pub async fn start_on(name: &str, home: AliceHome) -> Server {
+        Self::start_inner(&[name], false, None, vec![Some(home)]).await
+    }
+
     async fn start_with(
         names: &[&str],
         with_team: bool,
         jev: Option<Arc<dyn alice_core::judge::jev::JevTransport>>,
+    ) -> Server {
+        Self::start_inner(names, with_team, jev, Vec::new()).await
+    }
+
+    /// `homes[i]`, when given, is tenant `names[i]`'s existing data directory; every other
+    /// tenant gets a throwaway one.
+    async fn start_inner(
+        names: &[&str],
+        with_team: bool,
+        jev: Option<Arc<dyn alice_core::judge::jev::JevTransport>>,
+        homes: Vec<Option<AliceHome>>,
     ) -> Server {
         alice_daemon::install_tls();
         let stop = CancellationToken::new();
@@ -185,8 +202,13 @@ impl Server {
             dirs.push(dir);
         }
         for (i, name) in names.iter().enumerate() {
-            let dir = tempfile::tempdir().unwrap();
-            let home = AliceHome::new(dir.path().to_path_buf());
+            let (home, dir) = match homes.get(i).cloned().flatten() {
+                Some(home) => (home, None),
+                None => {
+                    let dir = tempfile::tempdir().unwrap();
+                    (AliceHome::new(dir.path().to_path_buf()), Some(dir))
+                }
+            };
             home.ensure_dirs().unwrap();
             if let Some(t) = &team {
                 std::fs::write(home.team_token_file(), &t.token).unwrap();
@@ -225,7 +247,7 @@ impl Server {
                 token,
                 port,
             });
-            dirs.push(dir);
+            dirs.extend(dir);
         }
         let app = app.fallback(|| async { not_found() });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -726,8 +726,8 @@ pub struct TranscriptQuery {
     /// A subagent's id, for its own transcript.
     #[serde(default)]
     pub subagent: Option<String>,
-    /// The byte offset of the body's first byte in the transcript.
-    #[serde(default)]
+    /// The byte offset of the body's first byte in the transcript. Required: a missing offset
+    /// is refused, never read as 0.
     pub offset: u64,
     /// `session-start`, `stop`, `subagent-stop`, `pre-compact`, `session-end` or `sweep`.
     pub event: String,
@@ -757,6 +757,13 @@ pub struct TranscriptQuery {
 pub struct TranscriptAnswer {
     /// Where the client's next upload starts: the start of the first incomplete turn, or the
     /// end of the last complete line.
+    ///
+    /// It equals the request's `offset` when the upload took nothing in: the project's rules
+    /// are fail-closed for now (the upload waits, nothing is stored or skipped), a new
+    /// subagent's transcript is still too short to judge as a whole, or the body holds no
+    /// complete turn. The client keeps that offset and does not send again until the file has
+    /// grown (its next hook event). An `oversized_line` answer equals it too, but there the
+    /// client skips the line.
     pub next_offset: u64,
     pub turns_stored: u64,
     /// Turns that were stored already, or not stored by the rules (an excluded project).
@@ -764,6 +771,33 @@ pub struct TranscriptAnswer {
     pub chunks_stored: u64,
     /// The body is a whole pass without a line end: the client skips that line.
     pub oversized_line: bool,
+}
+
+/// The longest SessionStart briefing (`GET /api/v1/capture/briefing`), in characters: Claude
+/// Code's cap on the context a hook adds. A longer one is cut at a line end.
+pub const BRIEFING_MAX_CHARS: usize = 10_000;
+
+/// The query of `GET /api/v1/capture/briefing` (SP2 spec §5.7, §8.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BriefingQuery {
+    /// The SessionStart `source`: `startup`, `clear`, `compact`, `resume` or `fork`. A resumed
+    /// or forked session gets no briefing; any other value, or none, gets one.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Local daemons: the session's working directory, which decides its project. Ignored by a
+    /// server tenant (it cannot see the client's paths).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Server tenants: the project name (a repository's basename), resolved as a transcript
+    /// upload's. A name no stored project has gives the global briefing. Ignored by a local
+    /// daemon.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Server tenants: the `X-Alice-Project` header, which wins over `project`. Set by the
+    /// route from the header; never read from the query string.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_header: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {

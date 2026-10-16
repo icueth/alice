@@ -219,6 +219,23 @@ pub fn check_event(event: &str) -> Result<()> {
     }
 }
 
+/// `text` cut to at most `max` characters, at the end of a line: what is kept is whole lines
+/// (the last one with its `\n`, unless the cut falls right before a `\n`). A first line longer
+/// than `max` is cut at `max` characters. A text within `max` is returned whole.
+pub(crate) fn cut_at_line_end(text: &str, max: usize) -> &str {
+    // `end`: the byte index of character `max`; none when the text has no more than `max`.
+    let Some((end, _)) = text.char_indices().nth(max) else {
+        return text;
+    };
+    if text[end..].starts_with('\n') {
+        return &text[..end];
+    }
+    match text[..end].rfind('\n') {
+        Some(nl) => &text[..=nl],
+        None => &text[..end],
+    }
+}
+
 /// The capture pipeline of one daemon: shared by every pass, holding no thread.
 pub struct CaptureCtl {
     readers: Arc<ReaderPool>,
@@ -943,6 +960,28 @@ pub(crate) fn status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_briefing_is_cut_at_a_line_end() {
+        // Within the limit (and exactly at it): whole.
+        assert_eq!(cut_at_line_end("ab\ncd\n", 6), "ab\ncd\n");
+        assert_eq!(cut_at_line_end("ab\ncd\n", 100), "ab\ncd\n");
+        // The cut falls inside a line: back to the end of the line before.
+        assert_eq!(cut_at_line_end("ab\ncd\nef\n", 7), "ab\ncd\n");
+        assert_eq!(cut_at_line_end("ab\ncd\nef\n", 4), "ab\n");
+        // The cut falls right before a line end: the lines before it, whole.
+        assert_eq!(cut_at_line_end("ab\ncd\nef\n", 5), "ab\ncd");
+        // A first line longer than the limit: cut at the limit.
+        assert_eq!(cut_at_line_end("abcdef\ngh", 3), "abc");
+        // Characters, not bytes: Thai is three bytes a character.
+        let thai = "ร้านค้า\nเปิด\n";
+        assert_eq!(cut_at_line_end(thai, 9), "ร้านค้า\n");
+        assert_eq!(cut_at_line_end(thai, 3), "ร้า");
+        let long = "x\n".repeat(6_000);
+        let cut = cut_at_line_end(&long, alice_core::api::BRIEFING_MAX_CHARS);
+        assert_eq!(cut.chars().count(), alice_core::api::BRIEFING_MAX_CHARS);
+        assert!(cut.ends_with('\n'));
+    }
 
     #[test]
     fn a_withheld_chunk_keeps_its_first_tag() {

@@ -5,7 +5,7 @@ use crate::service::{Scoped, Service};
 use alice_core::api::*;
 use alice_core::error::AliceError;
 use alice_core::settings::SettingError;
-use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::rejection::{BytesRejection, JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -603,6 +603,107 @@ async fn compat_call(
     }
 }
 
+/// The project hint of a capture request, read as the MCP path reads it
+/// (`mcp::project_header`, `mcp::check_project_name`): the `X-Alice-Project` header, which wins
+/// over the `project` query parameter, each refused over the name limits. Only a tenant reads
+/// either, as MCP does; a local daemon takes the project from `cwd` (plan decision P8), so the
+/// header is not read there. Returns the header's name; the query's stays where it is.
+fn capture_hint(
+    svc: &Service,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    if !svc.is_tenant() {
+        return Ok(None);
+    }
+    let header = crate::mcp::project_header(headers)?;
+    match (&header, query.filter(|q| !q.trim().is_empty())) {
+        (Some(h), _) => crate::mcp::check_project_name(h, crate::mcp::FROM_PROJECT_HEADER)?,
+        (None, Some(q)) => crate::mcp::check_project_name(q, crate::mcp::FROM_PROJECT_QUERY)?,
+        (None, None) => {}
+    }
+    Ok(header)
+}
+
+/// `POST /api/v1/capture/transcript` (SP2 spec §5.2): a transcript's bytes from `offset`.
+/// `200` with what was captured; `409 {"next_offset": <cursor>}` when `offset` is below the
+/// source's cursor (nothing read: the client jumps and sends again); `400` for a bad query;
+/// `413` over the route's 8 MiB body limit.
+async fn capture_transcript(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<TranscriptQuery>, QueryRejection>,
+    body: Result<axum::body::Bytes, BytesRejection>,
+) -> Response {
+    let Query(mut q) = match query {
+        Ok(q) => q,
+        Err(r) => {
+            return ApiError(AliceError::Invalid(format!(
+                "{}; use /api/v1/capture/transcript?agent=claude-code&session=<id>&offset=<byte offset of the body>&event=<event>",
+                r.body_text()
+            )))
+            .into_response();
+        }
+    };
+    q.project_header = match capture_hint(&st.svc, &headers, q.project.as_deref()) {
+        Ok(h) => h,
+        Err(e) => return e.into_response(),
+    };
+    let body = match body {
+        Ok(b) => b,
+        Err(r) if r.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return refuse(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                format!(
+                    "the upload is over the 8 MiB limit of a transcript upload; send at most {TRANSCRIPT_BODY_LIMIT} bytes from the offset, and the rest from the next_offset the answer gives"
+                ),
+            );
+        }
+        Err(r) => {
+            return ApiError(AliceError::Invalid(format!(
+                "{}; send the transcript's bytes from the offset as the body",
+                r.body_text()
+            )))
+            .into_response();
+        }
+    };
+    match st.svc.capture_transcript(q, body).await {
+        Ok(Ok(answer)) => Json(answer).into_response(),
+        Ok(Err(cursor)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "next_offset": cursor })),
+        )
+            .into_response(),
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
+/// `GET /api/v1/capture/status`.
+async fn capture_status(State(st): State<AppState>) -> ApiResult<CaptureStatus> {
+    Ok(Json(st.svc.capture_status().await?))
+}
+
+/// `GET /api/v1/capture/briefing` (SP2 spec §5.7): `200 text/plain; charset=utf-8` with the
+/// briefing, or `204` when there is none to give.
+async fn capture_briefing(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<BriefingQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(mut q) = query.map_err(|r| {
+        ApiError(AliceError::Invalid(format!(
+            "{}; use /api/v1/capture/briefing?source=<source>&project=<name> (or cwd=<dir> on a local daemon)",
+            r.body_text()
+        )))
+    })?;
+    q.project_header = capture_hint(&st.svc, &headers, q.project.as_deref())?;
+    Ok(match st.svc.capture_briefing(q).await? {
+        Some(text) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
+}
+
 async fn import_status(State(st): State<AppState>) -> Json<alice_core::import::ImportStatus> {
     Json(st.svc.import_status())
 }
@@ -860,6 +961,13 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/import/mempalace", post(start_import))
         .route("/api/v1/import/status", get(import_status))
         .route("/api/v1/compat/call", post(compat_call))
+        // The route's own limit: one pass's worth of transcript (the router's is for ingests).
+        .route(
+            "/api/v1/capture/transcript",
+            post(capture_transcript).layer(DefaultBodyLimit::max(TRANSCRIPT_BODY_LIMIT)),
+        )
+        .route("/api/v1/capture/status", get(capture_status))
+        .route("/api/v1/capture/briefing", get(capture_briefing))
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         .route("/api/v1/admin/token/rotate", post(rotate_token))
         .with_state(state.clone())

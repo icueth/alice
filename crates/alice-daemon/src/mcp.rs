@@ -360,6 +360,46 @@ fn within_project_limits(name: &str) -> bool {
         && alice_core::normalize::slugify(name).chars().count() <= limits::MAX_PROJECT_SLUG_CHARS
 }
 
+/// Where a project name came from, as [`check_project_name`]'s refusal names it.
+pub(crate) const FROM_PROJECT_HEADER: &str = "the X-Alice-Project header";
+/// See [`FROM_PROJECT_HEADER`].
+pub(crate) const FROM_PROJECT_QUERY: &str = "?project=";
+
+/// The project the `X-Alice-Project` header names: UTF-8 or percent-encoded UTF-8, trimmed;
+/// `None` when the header is absent or blank. Other bytes are refused rather than falling to
+/// another project. The MCP handlers and the capture routes both read the header with this, so
+/// they resolve the same hint the same way.
+pub(crate) fn project_header(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, AliceError> {
+    let Some(v) = headers.get(PROJECT_HEADER) else {
+        return Ok(None);
+    };
+    let decoded = std::str::from_utf8(v.as_bytes())
+        .ok()
+        .and_then(percent_decode)
+        .ok_or_else(|| {
+            AliceError::invalid(
+                "the X-Alice-Project header is not UTF-8: send the project name as UTF-8 or percent-encoded UTF-8",
+            )
+        })?;
+    Ok(Some(decoded.trim().to_string()).filter(|v| !v.is_empty()))
+}
+
+/// Refuses a project name a caller sent over the name or slug limit. The message says where it
+/// came from (`from`: [`FROM_PROJECT_HEADER`] or [`FROM_PROJECT_QUERY`]) and the limit, never
+/// the value.
+pub(crate) fn check_project_name(name: &str, from: &str) -> Result<(), AliceError> {
+    if within_project_limits(name) {
+        return Ok(());
+    }
+    Err(AliceError::invalid(format!(
+        "the project name in {from} is too long: at most {} characters, and its slug at most {}",
+        limits::MAX_PROJECT_NAME_CHARS,
+        limits::MAX_PROJECT_SLUG_CHARS
+    )))
+}
+
 fn resource_err(e: AliceError) -> McpError {
     match e {
         AliceError::Invalid(m) => McpError::invalid_params(m, None),
@@ -430,39 +470,20 @@ impl AliceMcp {
                 .find(|(k, v)| k == "project" && !v.trim().is_empty())
                 .map(|(_, v)| v.into_owned())
         });
-        // UTF-8 or percent-encoded UTF-8; anything else fails the call rather than falling to
-        // another project.
-        let header = match parts.and_then(|p| p.headers.get(PROJECT_HEADER)) {
+        let invalid = |e: AliceError| McpError::invalid_params(e.to_string(), None);
+        let header = match parts {
+            Some(p) => project_header(&p.headers).map_err(invalid)?,
             None => None,
-            Some(v) => {
-                let decoded = std::str::from_utf8(v.as_bytes())
-                    .ok()
-                    .and_then(percent_decode)
-                    .ok_or_else(|| {
-                        McpError::invalid_params(
-                            "the X-Alice-Project header is not UTF-8: send the project name as UTF-8 or percent-encoded UTF-8",
-                            None,
-                        )
-                    })?;
-                Some(decoded.trim().to_string()).filter(|v| !v.is_empty())
-            }
         };
         let (named, from) = match (queried, header) {
-            (Some(q), _) => (Some(q), "?project="),
-            (None, Some(h)) => (Some(h), "the X-Alice-Project header"),
+            (Some(q), _) => (Some(q), FROM_PROJECT_QUERY),
+            (None, Some(h)) => (Some(h), FROM_PROJECT_HEADER),
             (None, None) => (None, ""),
         };
         let hint = match named {
-            Some(q) if within_project_limits(&q) => Some(q),
-            Some(_) => {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "the project name in {from} is too long: at most {} characters, and its slug at most {}",
-                        limits::MAX_PROJECT_NAME_CHARS,
-                        limits::MAX_PROJECT_SLUG_CHARS
-                    ),
-                    None,
-                ));
+            Some(q) => {
+                check_project_name(&q, from).map_err(invalid)?;
+                Some(q)
             }
             None => self
                 .first_root(ctx)
