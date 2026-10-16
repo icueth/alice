@@ -12,6 +12,7 @@ UNIT="$R/etc/systemd/system/alice@.service"
 CADDYFILE="$R/etc/caddy/Caddyfile"; CADDY_D="$R/etc/caddy/alice.d"
 # Caddy's admin API moves from localhost:2019 to this socket; the drop-in has systemd make its directory at every start.
 CADDY_DROPIN="$R/etc/systemd/system/caddy.service.d/alice.conf"; ADMIN_SOCK="$R/run/caddy/admin.sock"
+CADDY_LOG="$R/var/log/caddy/alice-access.log"
 BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
 # The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
 # $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
@@ -37,7 +38,7 @@ if [ -n "$R" ]; then
 fi
 # A broken environment must never turn a removal into rm -rf /...: refuse to run with an empty root.
 : "${ETC:?}" "${TENANTS:?}" "${SRV:?}" "${ARCHIVES:?}" "${CADDY_D:?}" "${UNIT:?}" "${CADDYFILE:?}" "${BIN:?}" "${LOCK:?}"
-: "${LIBDIR:?}" "${MODEL_CACHE:?}" "${SELFTEST_TMP:?}" "${CADDY_DROPIN:?}" "${ADMIN_SOCK:?}"
+: "${LIBDIR:?}" "${MODEL_CACHE:?}" "${SELFTEST_TMP:?}" "${CADDY_DROPIN:?}" "${ADMIN_SOCK:?}" "${CADDY_LOG:?}"
 
 HOST=""
 SELFTEST_WHY=""
@@ -243,6 +244,7 @@ write_caddyfile_checked() {
   local keep="$CADDYFILE.prev-run.$$"
   if [ -f "$CADDYFILE" ]; then cp -p -- "${CADDYFILE:?}" "${keep:?}"; fi
   write_caddyfile
+  prepare_caddy_log
   if ! caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null; then
     if [ -f "$keep" ]; then mv -- "${keep:?}" "${CADDYFILE:?}"; else rm -f -- "${CADDYFILE:?}"; fi
     die "Caddy refused the new Caddyfile; the previous one is back and nothing else was changed"
@@ -254,8 +256,18 @@ write_caddyfile_checked() {
 # socket the managed Caddyfile names and fail, so Caddy is restarted onto it (the drop-in gives it /run/caddy). Once the
 # socket is there, a reload goes through it.
 reload_caddy() {
+  prepare_caddy_log
   caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null || return 1
   if [ -e "$ADMIN_SOCK" ]; then systemctl reload caddy; else systemctl restart caddy; fi
+}
+
+# `caddy validate` runs as root and opens the access log the Caddyfile names: were the file missing, it would be made
+# root's (0600) and Caddy, as the caddy user, could not open it at its next start. So it exists first, Caddy's own.
+prepare_caddy_log() {
+  mkdir -p "$(dirname "$CADDY_LOG")"
+  [ -e "$CADDY_LOG" ] || : >"$CADDY_LOG"
+  chown caddy:caddy "$(dirname "$CADDY_LOG")" "$CADDY_LOG"
+  chmod 0640 "$CADDY_LOG"
 }
 
 write_caddy_dropin() {

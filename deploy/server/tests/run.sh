@@ -185,6 +185,11 @@ add_creates_everything() {
   local d="$R/etc/systemd/system/caddy.service.d/alice.conf"
   has "$d" 'RuntimeDirectory=caddy'
   has "$d" 'RuntimeDirectoryMode=0750'
+  # The access log exists, the caddy user's, before any `caddy validate` (which runs as root) could make it root's.
+  [ -f "$R/var/log/caddy/alice-access.log" ] || fail "no access log before the first validate"
+  has "$R/calls.log" "chown caddy:caddy $R/var/log/caddy $R/var/log/caddy/alice-access.log"
+  [ "$(grep -n 'chown caddy:caddy' "$R/calls.log" | head -n 1 | cut -d: -f1)" -lt "$(grep -n 'caddy validate' "$R/calls.log" | head -n 1 | cut -d: -f1)" ] \
+    || fail "the access log was not handed to caddy before the first validate"
   # The first route moves Caddy off localhost:2019: a restart, since a reload would look for the socket.
   has "$R/calls.log" 'systemctl restart caddy'
   hasnt "$R/calls.log" 'systemctl reload caddy'
