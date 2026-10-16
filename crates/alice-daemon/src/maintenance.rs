@@ -305,6 +305,47 @@ fn text_tokens(title: &str, body: &str) -> TextSet {
     out
 }
 
+/// The numbers of a memory's title and body as written, sorted (a multiset): runs of digits,
+/// joined across `.`, `,`, `:`, `/` and `-` between digits, so a port (`5432`), a version
+/// (`1.4.2`), an amount (`1,000`), a date (`2026-10-16`) and a time (`21:30`) are one token
+/// each. Two memories whose numbers differ are a value update, never a duplicate.
+fn number_tokens(title: &str, body: &str) -> Vec<String> {
+    let text: Vec<char> = format!("{title} {body}").chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if !text[i].is_numeric() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < text.len()
+            && (text[i].is_numeric()
+                || (matches!(text[i], '.' | ',' | ':' | '/' | '-')
+                    && text.get(i + 1).is_some_and(|c| c.is_numeric())
+                    && i > start))
+        {
+            i += 1;
+        }
+        out.push(text[start..i].iter().collect());
+    }
+    out.sort();
+    out
+}
+
+/// What a merge suggestion compares of a memory's text: its words, and its numbers.
+struct MergeText {
+    words: TextSet,
+    numbers: Vec<String>,
+}
+
+fn merge_text(title: &str, body: &str) -> MergeText {
+    MergeText {
+        words: text_tokens(title, body),
+        numbers: number_tokens(title, body),
+    }
+}
+
 /// Jaccard similarity of two token sets (0 when either is empty: no text, no agreement).
 fn jaccard(a: &TextSet, b: &TextSet) -> f64 {
     if a.is_empty() || b.is_empty() {
@@ -1023,7 +1064,7 @@ impl Scheduler {
                     |r| {
                         Ok((
                             r.get::<_, String>(0)?,
-                            text_tokens(&r.get::<_, String>(1)?, &r.get::<_, String>(2)?),
+                            merge_text(&r.get::<_, String>(1)?, &r.get::<_, String>(2)?),
                         ))
                     },
                 )
@@ -1044,7 +1085,7 @@ impl Scheduler {
                 continue;
             }
             // Live, same project, not a diary, not in an open item: (seq, id, vector).
-            let candidates: Vec<(String, Vec<f32>, TextSet)> = self.ctx.readers.with(|c| {
+            let candidates: Vec<(String, Vec<f32>, MergeText)> = self.ctx.readers.with(|c| {
                 let mut out = Vec::new();
                 for o in &near {
                     let Some((oid, oproject, okind, otitle, obody)) = c
@@ -1072,15 +1113,16 @@ impl Scheduler {
                     if let Some((_, ov)) =
                         embeddings::get_many(c, &model, &[VecKey::Memory(*o)])?.pop()
                     {
-                        out.push((oid, ov, text_tokens(&otitle, &obody)));
+                        out.push((oid, ov, merge_text(&otitle, &obody)));
                     }
                 }
                 Ok(out)
             })?;
             // Complete linkage: a candidate joins only when it is alike every member so far, not
-            // just the seed (a chain A~B, B~C is not a group), in vectors and in words, up to
-            // `MERGE_GROUP_MAX`. `lowest` is the least pairwise cosine in the group.
-            let mut members: Vec<(&str, &[f32], &TextSet)> =
+            // just the seed (a chain A~B, B~C is not a group), in vectors and in words, and has
+            // the same numbers (a changed port, version, amount or date is an update, not a
+            // duplicate), up to `MERGE_GROUP_MAX`. `lowest` is the least pairwise cosine.
+            let mut members: Vec<(&str, &[f32], &MergeText)> =
                 vec![(id.as_str(), v.as_slice(), &seed_text)];
             let mut lowest = f64::INFINITY;
             for (cid, cv, ctext) in &candidates {
@@ -1089,9 +1131,10 @@ impl Scheduler {
                 }
                 let sims: Vec<f64> = members.iter().map(|(_, mv, _)| cosine(mv, cv)).collect();
                 if sims.iter().all(|s| *s >= threshold)
-                    && members
-                        .iter()
-                        .all(|(_, _, mt)| jaccard(mt, ctext) >= MERGE_TEXT_JACCARD)
+                    && members.iter().all(|(_, _, mt)| {
+                        mt.numbers == ctext.numbers
+                            && jaccard(&mt.words, &ctext.words) >= MERGE_TEXT_JACCARD
+                    })
                 {
                     lowest = sims.into_iter().fold(lowest, f64::min);
                     members.push((cid.as_str(), cv.as_slice(), ctext));
@@ -2179,10 +2222,28 @@ mod tests {
         assert!(open_groups(&r).is_empty(), "{:?}", open_groups(&r));
     }
 
+    /// Final review B-I2 (ruling): numbers are compared as written, as a multiset. The same
+    /// numbers in other words still group; a different date, time or id does not.
     #[test]
-    fn merge_suggestions_group_texts_that_differ_only_in_numbers_and_ids() {
+    fn merge_suggestions_group_texts_only_when_their_numbers_are_the_same() {
         let r = rig_with(NEAR);
         let [a, b, _] = near3();
+        r.insert_kinded(&[
+            (
+                "note",
+                "Restart nginx on the staging server after a deploy 2026-09-07 21:30 abc1234",
+                a,
+            ),
+            (
+                "note",
+                "Restart nginx on the staging server after the deploy, 21:30 2026-09-07 abc1234",
+                b,
+            ),
+        ]);
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert_eq!(open_groups(&r).len(), 1, "{:?}", open_groups(&r));
+        let r = rig_with(NEAR);
         r.insert_kinded(&[
             (
                 "note",
@@ -2197,7 +2258,40 @@ mod tests {
         ]);
         r.sched
             .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
-        assert_eq!(open_groups(&r).len(), 1, "{:?}", open_groups(&r));
+        assert!(open_groups(&r).is_empty(), "{:?}", open_groups(&r));
+    }
+
+    /// Final review B-I2 (ruling): a value update is never offered as a duplicate: a port
+    /// change and a version change, whose words and vectors agree, are not grouped.
+    #[test]
+    fn merge_suggestions_never_group_a_port_or_a_version_change() {
+        let [a, b, c] = near3();
+        for (old, new) in [
+            ("Staging DB port is 5432", "Staging DB port is 6543"),
+            (
+                "pin the client library to version 1.4 in the lock file",
+                "pin the client library to version 2.0 in the lock file",
+            ),
+            (
+                "the monthly budget is 50 USD",
+                "the monthly budget is 500 USD",
+            ),
+        ] {
+            let r = rig_with(NEAR);
+            r.insert_kinded(&[("fact", old, a), ("fact", new, b), ("fact", old, c)]);
+            r.sched
+                .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+            let groups = open_groups(&r);
+            assert_eq!(groups.len(), 1, "only the two equal ones: {groups:?}");
+            assert_eq!(groups[0].len(), 2, "{old} / {new}: {groups:?}");
+        }
+        assert_eq!(
+            number_tokens(
+                "v1.4.2 on port 5432,",
+                "since 2026-10-16 21:30, 1,000 users"
+            ),
+            ["1,000", "1.4.2", "2026-10-16", "21:30", "5432"]
+        );
     }
 
     #[test]

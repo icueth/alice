@@ -307,7 +307,7 @@ The daemon also makes a daily backup when it is idle, and keeps the newest of ea
 
 On a large database the daemon stays stopped for the length of two copies and a check (minutes at 2.8 GB). Agents' writes are spooled at once meanwhile, and applied afterwards.
 
-Maintenance runs on its own when the daemon has been idle for a minute and gives way as soon as a request arrives: daily backup, integrity check, vector index check, retention, trash purge and history pruning; weekly full-text index merging and merge suggestions (never diaries or status notes; one kind per group; every pair in a group is alike in vectors and in words, token overlap 0.6 with numbers and ids ignored; no memory in two open items, at most 5 per group; the shown probability is the group's lowest pairwise similarity); hourly retry of judgements that failed. `alice maintenance status` shows when each job last ran, and `alice maintenance run <job>` runs one now.
+Maintenance runs on its own when the daemon has been idle for a minute and gives way as soon as a request arrives: daily backup, integrity check, vector index check, retention, trash purge and history pruning; weekly full-text index merging and merge suggestions (never diaries or status notes; one kind per group; every pair in a group is alike in vectors and in words, token overlap 0.6, and the same numbers as written, so a changed port, version, amount or date is never offered as a duplicate; no memory in two open items, at most 5 per group; the shown probability is the group's lowest pairwise similarity); hourly retry of judgements that failed. `alice maintenance status` shows when each job last ran, and `alice maintenance run <job>` runs one now.
 
 ## Health, token and service
 
