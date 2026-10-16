@@ -1977,6 +1977,561 @@ async fn the_tail_of_an_imported_turn_is_skipped_too() {
     );
 }
 
+// ---- Task 18b: the rest of the import-first rule (18a's deferred minors) ----
+
+/// One record line of `t` as written, with no `timestamp` field when `at` is `None` (the
+/// `Transcript` helper always stamps one).
+fn line_at(t: &mut Transcript, mut v: serde_json::Value, at: Option<&str>) {
+    v["isSidechain"] = json!(false);
+    if let Some(at) = at {
+        v["timestamp"] = json!(at);
+    }
+    t.bytes.extend(serde_json::to_vec(&v).unwrap());
+    t.bytes.push(b'\n');
+}
+
+/// A turn of `session` whose two records carry the time `at` (none when `None`).
+fn turn_at(t: &mut Transcript, session: &str, i: usize, marker: &str, at: Option<&str>) {
+    line_at(
+        t,
+        json!({"type": "user", "uuid": format!("{session}-p{i}"),
+            "message": {"role": "user", "content": format!("Question {i} about {marker}.")}}),
+        at,
+    );
+    line_at(
+        t,
+        json!({"type": "assistant", "uuid": format!("{session}-a{i}"),
+            "message": {"id": format!("msg-{session}-a{i}"), "type": "message",
+                "role": "assistant", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": format!("Answer {i}: {marker} is settled.")}]}}),
+        at,
+    );
+}
+
+/// Spec §9.2 end to end: on the first capture of an imported session, a turn whose records carry
+/// no time, or a time that does not parse, is kept; the turns stamped by the import's end are
+/// skipped around them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_without_a_time_or_with_a_junk_time_is_kept_after_an_import() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    import_palace(
+        &svc,
+        d.path(),
+        &mined(
+            "jt1",
+            &[("mined text of jt1", Some("2026-10-16T00:00:04Z"))],
+        ),
+    )
+    .await;
+    // Turn 1 at 00:00:01 and turn 4 at :03 are held by the import; turn 5 at :05 is after it.
+    let mut t = Transcript::default();
+    t.turn("jt1", 1, "first words");
+    turn_at(&mut t, "jt1", 2, "timeless words", None);
+    turn_at(
+        &mut t,
+        "jt1",
+        3,
+        "junk-time words",
+        Some("soon after lunch"),
+    );
+    t.turn("jt1", 4, "fourth words")
+        .turn("jt1", 5, "fifth words");
+    let a = send(&svc, q("jt1", 0, "stop"), &t.bytes).await;
+    assert_eq!(
+        (a.turns_stored, a.turns_skipped, a.next_offset),
+        (3, 2, t.len())
+    );
+    for (marker, n) in [
+        ("first words is settled", 0),
+        ("timeless words is settled", 1),
+        ("junk-time words is settled", 1),
+        ("fourth words is settled", 0),
+        ("fifth words is settled", 1),
+    ] {
+        assert_eq!(chunks_holding(&svc, marker), n, "{marker}");
+    }
+    let keys = known_keys(&svc);
+    for k in ["jt1-p1", "jt1-p2", "jt1-p3", "jt1-p4", "jt1-p5"] {
+        assert!(keys.contains(k), "{k} is recorded: {keys:?}");
+    }
+}
+
+/// Spec §9.2 end to end: an imported transcript whose only end does not parse (and one with no
+/// end) is no evidence of what it holds, so the first capture stores every turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_an_unparseable_imported_end_captures_everything() {
+    use alice_core::store::sources::{ChunkInput, SourceInput};
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    for (file, end) in [("ue1", Some("soon")), ("ue1-b", None)] {
+        svc.ingest(IngestRequest {
+            source: SourceInput {
+                uri: imported_uri(file),
+                session_id: Some("ue1".into()),
+                ended_at: end.map(String::from),
+                ..Default::default()
+            },
+            chunks: vec![ChunkInput {
+                ord: 0,
+                text: format!("an earlier transcript of {file}"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        ended_at_of(&svc, &imported_uri("ue1")).as_deref(),
+        Some("soon"),
+        "stored as the importer wrote it"
+    );
+    let mut t = Transcript::default();
+    t.turn("ue1", 1, "first words")
+        .turn("ue1", 2, "second words");
+    let a = send(&svc, q("ue1", 0, "stop"), &t.bytes).await;
+    assert_eq!((a.turns_stored, a.turns_skipped), (2, 0));
+    assert_eq!(chunks_holding(&svc, "first words is settled"), 1);
+    assert_eq!(chunks_holding(&svc, "second words is settled"), 1);
+}
+
+/// A subagent's transcript of `turns` turns of `session`, long enough to be kept (over 200
+/// characters rendered), each naming `marker` and its number.
+fn subagent_transcript(agent: &str, session: &str, turns: usize, marker: &str) -> Transcript {
+    let mut t = Transcript::subagent(agent);
+    for i in 1..=turns {
+        t.prompt(
+            &format!("{session}-{agent}-p{i}"),
+            &format!("Step {i}: survey the {marker} module."),
+        )
+        .reply(
+            &format!("{session}-{agent}-a{i}"),
+            &format!("Step {i} of {marker}: the module has a reader, a writer and a sweep. ")
+                .repeat(3),
+        );
+    }
+    t
+}
+
+/// The drawers MemPalace filed for the subagent file `<session>/subagents/agent-<agent>.jsonl`,
+/// which M3 imports with the session id `agent-<agent>` (the file's stem).
+fn mined_subagent(
+    session: &str,
+    agent: &str,
+    parts: &[(&str, Option<&str>)],
+) -> Vec<alice_core::import::fixture::DrawerSpec> {
+    let path =
+        format!("/h/.claude/projects/-Users-me-Code-pg-ai/{session}/subagents/agent-{agent}.jsonl");
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, (text, at))| {
+            let mut d = palace::chunk(
+                &format!("{session}_{agent}_{i:03}"),
+                text,
+                "sessions",
+                &path,
+                i as i64,
+            );
+            d.meta.authored_at = at.map(str::to_string);
+            d
+        })
+        .collect()
+}
+
+/// 18a's deferred minor: the import of a session's main transcript says nothing about its
+/// subagents' files (MemPalace files those under their own stems). The first capture of an old
+/// subagent file keeps every turn, whatever the main session's imported end.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_subagent_file_keeps_its_turns_after_its_main_session_was_imported() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    // The main session was mined up to 00:10:00, after every subagent turn below.
+    import_palace(
+        &svc,
+        d.path(),
+        &mined(
+            "os1",
+            &[("mined text of os1", Some("2026-10-16T00:10:00Z"))],
+        ),
+    )
+    .await;
+    let agent = subagent_transcript("x1", "os1", 2, "lantern");
+    let a = send(
+        &svc,
+        TranscriptQuery {
+            subagent: Some("x1".into()),
+            ..q("os1", 0, "subagent-stop")
+        },
+        &agent.bytes,
+    )
+    .await;
+    assert_eq!(
+        (a.turns_stored, a.turns_skipped, a.next_offset),
+        (2, 0, agent.len())
+    );
+    assert_eq!(chunks_holding(&svc, "Step 1 of lantern"), 1);
+    assert_eq!(chunks_holding(&svc, "Step 2 of lantern"), 1);
+    // The main session's own first capture still continues after its import.
+    let mut main = Transcript::default();
+    main.turn("os1", 1, "main words");
+    let m = send(&svc, q("os1", 0, "stop"), &main.bytes).await;
+    assert_eq!((m.turns_stored, m.turns_skipped), (0, 1));
+}
+
+/// When MemPalace mined the subagent's own file, that import holds its turns: the first
+/// capture of the subagent continues after that file's imported end.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mined_subagent_file_continues_after_its_own_import() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    // The subagent's turns start at 00:00:01, :03 and :05; its file was mined up to :04.
+    import_palace(
+        &svc,
+        d.path(),
+        &mined_subagent(
+            "ms1",
+            "x2",
+            &[(
+                "mined text of the x2 subagent",
+                Some("2026-10-16T00:00:04Z"),
+            )],
+        ),
+    )
+    .await;
+    let agent = subagent_transcript("x2", "ms1", 3, "beacon");
+    let a = send(
+        &svc,
+        TranscriptQuery {
+            subagent: Some("x2".into()),
+            ..q("ms1", 0, "subagent-stop")
+        },
+        &agent.bytes,
+    )
+    .await;
+    assert_eq!(
+        (a.turns_stored, a.turns_skipped, a.next_offset),
+        (1, 2, agent.len())
+    );
+    assert_eq!(chunks_holding(&svc, "Step 1 of beacon"), 0);
+    assert_eq!(chunks_holding(&svc, "Step 2 of beacon"), 0);
+    assert_eq!(chunks_holding(&svc, "Step 3 of beacon"), 1);
+    assert_eq!(chunks_holding(&svc, "mined text of the x2 subagent"), 1);
+}
+
+/// Task 18b review, I2: MemPalace files a mined Codex rollout under its file's stem,
+/// `rollout-<time>-<session id>`, never the bare session id. Backfilling that rollout (the local
+/// worker reads it after a `backfill` notice) still continues after the import's end: the turns
+/// the import holds are skipped, not stored a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backfilled_codex_rollout_continues_after_its_mined_copy() {
+    let (d, svc) = local();
+    let id = "0199e4c1-5b2a-7d10-8e3f-4a5b6c7d8e9f";
+    let day = d.path().join(".codex").join("sessions/2026/10/16");
+    std::fs::create_dir_all(&day).unwrap();
+    let path = day.join(format!("rollout-2026-10-16T00-00-00-{id}.jsonl"));
+    // MemPalace mined the rollout up to 00:00:04.
+    let mined = [
+        ("mined text of the first codex turn", "2026-10-16T00:00:03Z"),
+        (
+            "mined text of the second codex turn",
+            "2026-10-16T00:00:04Z",
+        ),
+    ];
+    let specs: Vec<_> = mined
+        .iter()
+        .enumerate()
+        .map(|(i, (text, at))| {
+            let mut s = palace::chunk(
+                &format!("cxm_{i:03}"),
+                text,
+                "sessions",
+                &path.to_string_lossy(),
+                i as i64,
+            );
+            s.meta.authored_at = Some(at.to_string());
+            s
+        })
+        .collect();
+    import_palace(&svc, d.path(), &specs).await;
+    let imported_session: String = db(&svc)
+        .query_row(
+            "SELECT session_id FROM sources WHERE uri = ?1",
+            [format!("file://{}", path.display())],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        imported_session,
+        format!("rollout-2026-10-16T00-00-00-{id}"),
+        "the importer names it by the file's stem"
+    );
+
+    // Prompts at 00:00:02, :04 and :06: the first two are the import's.
+    let mut r = Rollout::default();
+    r.line("session_meta", json!({"id": id}))
+        .prompt("Which harbour crane is broken?")
+        .reply("The north crane, cxone.")
+        .prompt("Since when is it broken?")
+        .reply("Since Monday, cxtwo.")
+        .prompt("Who repairs it?")
+        .reply("The harbour team, cxthree.");
+    std::fs::write(&path, &r.bytes).unwrap();
+    age(&path, Duration::from_secs(3 * 24 * 3600));
+    svc.capture_notify(CaptureNotify {
+        agent: "codex".into(),
+        event: "backfill".into(),
+        session_id: id.into(),
+        transcript_path: path.to_string_lossy().into_owned(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let uri = format!("codex:session:{id}");
+    until("the rollout is read to its end", || {
+        state_of(&svc, &uri).is_some_and(|s| s.byte_offset == r.len())
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "cxone"), 0, "held by the import");
+    assert_eq!(chunks_holding(&svc, "cxtwo"), 0, "held by the import");
+    assert_eq!(chunks_holding(&svc, "cxthree"), 1);
+    assert_eq!(chunks_holding(&svc, "mined text of the"), 2, "the import's");
+}
+
+/// A backfill notice for `session`'s file `path` (a subagent's when `agent` is given, with the
+/// main transcript `main`), as `alice capture backfill` sends it.
+fn backfill_notify(session: &str, main: &Path, agent: Option<(&str, &Path)>) -> CaptureNotify {
+    CaptureNotify {
+        agent_id: agent.map(|(id, _)| id.to_string()),
+        agent_transcript_path: agent.map(|(_, p)| p.to_string_lossy().into_owned()),
+        ..notify(session, main, "backfill")
+    }
+}
+
+/// Task 18b end to end, on the local worker: backfilling an old session MemPalace mined, with
+/// its subagent's file, skips the main turns the import holds and keeps every subagent turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn backfilling_old_files_keeps_a_subagents_turns_after_the_main_import() {
+    let (d, svc) = local();
+    import_palace(
+        &svc,
+        d.path(),
+        &mined(
+            "ob1",
+            &[("mined text of ob1", Some("2026-10-16T00:00:02Z"))],
+        ),
+    )
+    .await;
+    // Main turns at 00:00:01 (mined) and :03 (not); the subagent's at :01 and :03.
+    let dir = d.path().join("projects").join("-w-ob");
+    let main_path = dir.join("ob1.jsonl");
+    let mut main = Transcript::default();
+    main.turn("ob1", 1, "opening words")
+        .turn("ob1", 2, "closing words");
+    std::fs::create_dir_all(dir.join("ob1").join("subagents")).unwrap();
+    std::fs::write(&main_path, &main.bytes).unwrap();
+    let agent_path = dir.join("ob1").join("subagents").join("agent-x3.jsonl");
+    let agent = subagent_transcript("x3", "ob1", 2, "harbour");
+    std::fs::write(&agent_path, &agent.bytes).unwrap();
+    // Old files: idle for days.
+    age(&main_path, Duration::from_secs(3 * 24 * 3600));
+    age(&agent_path, Duration::from_secs(3 * 24 * 3600));
+
+    svc.capture_notify(backfill_notify("ob1", &main_path, None))
+        .await
+        .unwrap();
+    svc.capture_notify(backfill_notify(
+        "ob1",
+        &main_path,
+        Some(("x3", &agent_path)),
+    ))
+    .await
+    .unwrap();
+    let sub_uri = "claude-code:session:ob1:agent:x3";
+    until("both files are read to their ends", || {
+        state_of(&svc, &uri("ob1")).is_some_and(|s| s.byte_offset == main.len())
+            && state_of(&svc, sub_uri).is_some_and(|s| s.byte_offset == agent.len())
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "opening words is settled"), 0);
+    assert_eq!(chunks_holding(&svc, "closing words is settled"), 1);
+    assert_eq!(chunks_holding(&svc, "Step 1 of harbour"), 1);
+    assert_eq!(chunks_holding(&svc, "Step 2 of harbour"), 1);
+    let main_row = state_of(&svc, &uri("ob1")).unwrap();
+    let sub_row = state_of(&svc, sub_uri).unwrap();
+    assert_eq!(
+        sub_row.parent_source_id.as_deref(),
+        Some(main_row.source_id.as_str())
+    );
+    assert!(
+        main_row.ended && sub_row.ended,
+        "old files end with their pass"
+    );
+}
+
+/// The distillation state of the capture source `uri`.
+fn distill_state_of(svc: &Service, uri: &str) -> String {
+    db(svc)
+        .query_row(
+            "SELECT c.distill_state FROM capture_state c JOIN sources s ON s.id = c.source_id
+             WHERE s.uri = ?1",
+            [uri],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// `(distill_state, distill_ord, next_ord)` of the capture source `uri`.
+fn distill_of(svc: &Service, uri: &str) -> (String, i64, i64) {
+    db(svc)
+        .query_row(
+            "SELECT c.distill_state, c.distill_ord, c.next_ord
+             FROM capture_state c JOIN sources s ON s.id = c.source_id WHERE s.uri = ?1",
+            [uri],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+}
+
+/// Task 18b (spec §4.4, ruling R-P1): a source a backfill registers starts `skipped_backfill`,
+/// a subagent's too (review M6), so a first backfill of months of sessions is not distilled
+/// unless asked (`alice capture distill`); backfilling it again leaves it so. A source its hooks
+/// registered first keeps its state, and a backfill notice that meets a hook's pending notice of
+/// a new session leaves it a live session. Review I1: a hook's pass that stores new turns in a
+/// backfilled session (a resumed one) makes it live again from there, and its backfilled
+/// subagent is moved past its chunks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backfill_registers_its_sources_as_skipped_backfill() {
+    let d = tempfile::tempdir().unwrap();
+    // A settle delay long enough that a backfill notice sent right after a hook's always meets it
+    // in the queue.
+    let svc = start_with(
+        &d.path().join("home"),
+        ServiceOptions {
+            capture_settle: Duration::from_millis(800),
+            ..local_options()
+        },
+    );
+    let dir = d.path().join("projects").join("-w-bf");
+    std::fs::create_dir_all(dir.join("bf1").join("subagents")).unwrap();
+    let write = |name: &str, t: &Transcript| {
+        let p = dir.join(name);
+        std::fs::write(&p, &t.bytes).unwrap();
+        p
+    };
+    let read_to_end = |uri: String, len: u64| {
+        let svc = svc.clone();
+        move || state_of(&svc, &uri).is_some_and(|s| s.byte_offset == len)
+    };
+
+    // bf1 is only ever backfilled, with its subagent.
+    let mut t1 = Transcript::default();
+    t1.turn("bf1", 1, "backfilled words");
+    let p1 = write("bf1.jsonl", &t1);
+    let a1 = subagent_transcript("y1", "bf1", 1, "quarry");
+    let pa1 = write("bf1/subagents/agent-y1.jsonl", &a1);
+    // Old files: a backfill closes their turns by their age, as a sweep does.
+    age(&p1, Duration::from_secs(3 * 24 * 3600));
+    age(&pa1, Duration::from_secs(3 * 24 * 3600));
+    svc.capture_notify(backfill_notify("bf1", &p1, None))
+        .await
+        .unwrap();
+    svc.capture_notify(backfill_notify("bf1", &p1, Some(("y1", &pa1))))
+        .await
+        .unwrap();
+    let sub_uri = "claude-code:session:bf1:agent:y1";
+    until("bf1 read", read_to_end(uri("bf1"), t1.len())).await;
+    until("its subagent read", read_to_end(sub_uri.into(), a1.len())).await;
+    assert_eq!(chunks_holding(&svc, "backfilled words is settled"), 1);
+    assert_eq!(distill_state_of(&svc, &uri("bf1")), "skipped_backfill");
+    assert_eq!(distill_state_of(&svc, sub_uri), "skipped_backfill");
+    // Backfilled again after it grew: a backfill's pass never makes it live.
+    t1.turn("bf1", 2, "more backfilled words");
+    write("bf1.jsonl", &t1);
+    age(&p1, Duration::from_secs(3 * 24 * 3600));
+    svc.capture_notify(backfill_notify("bf1", &p1, None))
+        .await
+        .unwrap();
+    until("bf1 read again", read_to_end(uri("bf1"), t1.len())).await;
+    assert_eq!(chunks_holding(&svc, "more backfilled words is settled"), 1);
+    assert_eq!(distill_state_of(&svc, &uri("bf1")), "skipped_backfill");
+
+    // bf2 was captured by its hook first: a backfill of its grown file leaves its state.
+    let mut t2 = Transcript::default();
+    t2.turn("bf2", 1, "hooked words");
+    let p2 = write("bf2.jsonl", &t2);
+    svc.capture_notify(notify("bf2", &p2, "stop"))
+        .await
+        .unwrap();
+    until(
+        "bf2 captured by its hook",
+        read_to_end(uri("bf2"), t2.len()),
+    )
+    .await;
+    t2.turn("bf2", 2, "grown words");
+    write("bf2.jsonl", &t2);
+    age(&p2, Duration::from_secs(10 * 60));
+    svc.capture_notify(notify("bf2", &p2, "backfill"))
+        .await
+        .unwrap();
+    until("bf2 backfilled", read_to_end(uri("bf2"), t2.len())).await;
+    assert_eq!(chunks_holding(&svc, "grown words is settled"), 1);
+    assert_eq!(distill_state_of(&svc, &uri("bf2")), "idle");
+
+    // bf3 is new, and its hook's stop is still settling when a backfill of its file arrives:
+    // the hook's event stays the job's, so the session is registered as a live one.
+    let mut t3 = Transcript::default();
+    t3.turn("bf3", 1, "settling words");
+    let p3 = write("bf3.jsonl", &t3);
+    svc.capture_notify(notify("bf3", &p3, "stop"))
+        .await
+        .unwrap();
+    svc.capture_notify(notify("bf3", &p3, "backfill"))
+        .await
+        .unwrap();
+    until("bf3 captured", read_to_end(uri("bf3"), t3.len())).await;
+    assert_eq!(distill_state_of(&svc, &uri("bf3")), "idle");
+    let last_event: String = db(&svc)
+        .query_row(
+            "SELECT c.last_event FROM capture_state c JOIN sources s ON s.id = c.source_id
+             WHERE s.uri = ?1",
+            [uri("bf3")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(last_event, "stop");
+
+    // bf1 goes on live: `claude --resume` appends to the same file, and its hook's stop stores
+    // the new turn. The session is live again from there: its backfilled chunks, and its
+    // backfilled subagent's, count as distilled; the new turn's do not.
+    let (_, _, backfilled_end) = distill_of(&svc, &uri("bf1"));
+    let (_, _, sub_end) = distill_of(&svc, sub_uri);
+    assert!(backfilled_end > 0 && sub_end > 0);
+    t1.turn("bf1", 3, "resumed words");
+    write("bf1.jsonl", &t1);
+    svc.capture_notify(notify("bf1", &p1, "stop"))
+        .await
+        .unwrap();
+    until("bf1's live turn read", read_to_end(uri("bf1"), t1.len())).await;
+    assert_eq!(chunks_holding(&svc, "resumed words is settled"), 1);
+    let (state, distill_ord, next_ord) = distill_of(&svc, &uri("bf1"));
+    assert_eq!(
+        (state.as_str(), distill_ord),
+        ("idle", backfilled_end),
+        "live from the new turn on"
+    );
+    assert!(
+        next_ord > backfilled_end,
+        "the new turn waits for distillation"
+    );
+    assert_eq!(
+        distill_of(&svc, sub_uri),
+        ("idle".to_string(), sub_end, sub_end),
+        "the backfilled subagent is past its chunks"
+    );
+}
+
 // ---- Task 6b: local capture (the daemon reads the transcript after a notify) ----
 
 /// Local timings short enough for tests: the settle delay and the sweep period. The quiet and

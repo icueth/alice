@@ -449,6 +449,10 @@ pub enum CaptureCmd {
         /// The session id (or a capture source's id or uri, from `alice capture status`).
         session_id: String,
     },
+    /// Capture the transcripts already on disk (sessions from before the hooks): the daemon
+    /// reads each file's complete turns in the background and skips what is stored or was
+    /// imported from MemPalace. Backfilled sessions are not distilled unless --distill.
+    Backfill(crate::backfill::BackfillArgs),
 }
 
 #[derive(Subcommand)]
@@ -1653,6 +1657,16 @@ async fn capture(home: &AliceHome, c: CaptureCmd, json: bool) -> Result<()> {
                     .map(|uri| format!("due for distillation: {uri}\n"))
                     .collect()
             })
+        }
+        CaptureCmd::Backfill(a) => {
+            // The files are found (and `--since` checked) before a daemon is started.
+            let plan = crate::backfill::plan(&a)?;
+            let r = if plan.is_empty() {
+                plan.into_report(a.distill)
+            } else {
+                crate::backfill::send(&client(home).await?, plan, a.distill).await?
+            };
+            print(json, &r, || r.text())
         }
     }
 }

@@ -217,15 +217,30 @@ pub fn captured_session_ids(conn: &Connection) -> Result<HashSet<String>> {
 /// (an importer may write an offset where capture writes `Z`; one that does not parse counts
 /// only when none does), and `None` when none of them has one. `None` when there is no such
 /// source (spec §9.2).
-pub fn imported_session_end(conn: &Connection, session_id: &str) -> Result<Option<Option<String>>> {
+///
+/// With `codex_rollouts` (a Codex session), a source named like one of the session's rollout
+/// files, `rollout-<YYYY-MM-DDTHH-MM-SS>-<session_id>`, counts too: the importer files a
+/// transcript under its file's stem, so a rollout MemPalace mined carries that name, never the
+/// bare session id (Task 18b review, I2).
+pub fn imported_session_end(
+    conn: &Connection,
+    session_id: &str,
+    codex_rollouts: bool,
+) -> Result<Option<Option<String>>> {
+    // `rollout-` (8 characters), the time (19), `-` (the 28th), then the whole id: an id that
+    // only ends another one never matches. The range keeps the scan on the index.
     let mut stmt = conn.prepare_cached(
         "SELECT s.ended_at FROM sources s
-         WHERE s.session_id = ?1 AND s.type = 'session'
+         WHERE (s.session_id = ?1
+                OR (?2 AND s.session_id >= 'rollout-' AND s.session_id < 'rollout.'
+                    AND length(s.session_id) = length(?1) + 28
+                    AND substr(s.session_id, 28, 1) = '-' AND substr(s.session_id, 29) = ?1))
+           AND s.type = 'session'
            AND s.uri NOT LIKE 'claude-code:session:%' AND s.uri NOT LIKE 'codex:session:%'
            AND NOT EXISTS (SELECT 1 FROM capture_state c WHERE c.source_id = s.id)",
     )?;
     let ends: Vec<Option<String>> = stmt
-        .query_map([session_id], |r| r.get(0))?
+        .query_map(params![session_id, codex_rollouts], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     if ends.is_empty() {
         return Ok(None);
@@ -275,6 +290,9 @@ pub struct NewState<'a> {
     pub transcript_path: Option<&'a str>,
     pub file_key: Option<&'a str>,
     pub no_distill: bool,
+    /// Where a new state's distillation starts: `idle`, or `skipped_backfill` for a source a
+    /// backfill registers (spec §4.4). An existing state keeps its own.
+    pub distill_state: DistillState,
 }
 
 /// Create the state of `source_id` if it has none. An existing one keeps its values, except
@@ -284,8 +302,9 @@ pub fn ensure_state(conn: &Connection, source_id: &str, s: &NewState<'_>) -> Res
     let created = conn
         .prepare_cached(
             "INSERT OR IGNORE INTO capture_state
-                (source_id, agent, session_id, parent_source_id, transcript_path, file_key, no_distill, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (source_id, agent, session_id, parent_source_id, transcript_path, file_key, no_distill,
+                 distill_state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?
         .execute(params![
             source_id,
@@ -295,6 +314,7 @@ pub fn ensure_state(conn: &Connection, source_id: &str, s: &NewState<'_>) -> Res
             s.transcript_path,
             s.file_key,
             s.no_distill,
+            s.distill_state.as_str(),
             now_rfc3339()
         ])?;
     if created == 0 && (s.parent_source_id.is_some() || s.no_distill) {
@@ -390,6 +410,31 @@ pub fn set_distilled(conn: &Connection, source_id: &str, distill_ord: i64) -> Re
         "UPDATE capture_state SET distill_ord = MAX(distill_ord, ?2) WHERE source_id = ?1",
         params![source_id, distill_ord],
     )?)
+}
+
+/// A source a backfill registered goes on live (Task 18b review, I1): a hook's pass is about to
+/// capture new turns into it. Its chunks below `from_ord` (the backfilled history) count as
+/// distilled and it is `idle` again, so only what is captured from now on is distilled, never
+/// the backfill as a burst. Its subagents that are still `skipped_backfill` are moved past their
+/// chunks the same way (a subagent's chunks are distilled with its session's). Nothing changes
+/// unless the source is `skipped_backfill`. Returns the rows of the source changed (0: it is not
+/// backfilled, or there is no such source).
+pub fn revive_backfilled(conn: &Connection, source_id: &str, from_ord: i64) -> Result<usize> {
+    let revived = conn.execute(
+        "UPDATE capture_state SET distill_state = 'idle', distill_ord = MAX(distill_ord, ?2),
+            distill_next_try_at = NULL, distill_attempts = 0
+         WHERE source_id = ?1 AND distill_state = 'skipped_backfill'",
+        params![source_id, from_ord],
+    )?;
+    if revived > 0 {
+        conn.execute(
+            "UPDATE capture_state SET distill_state = 'idle', distill_ord = MAX(distill_ord, next_ord),
+                distill_next_try_at = NULL, distill_attempts = 0
+             WHERE parent_source_id = ?1 AND distill_state = 'skipped_backfill'",
+            [source_id],
+        )?;
+    }
+    Ok(revived)
 }
 
 pub fn set_ended(conn: &Connection, source_id: &str) -> Result<usize> {
@@ -663,6 +708,33 @@ mod tests {
         let st = by_source(&c, "S1").unwrap().unwrap();
         assert_eq!(st.parent_source_id.as_deref(), Some("P1"));
         assert!(st.no_distill, "no_distill never turns off");
+
+        // Task 18b: a backfill's first state is `skipped_backfill`; an existing one keeps its own.
+        let backfilled = NewState {
+            agent: "claude-code",
+            session_id: "s1",
+            distill_state: DistillState::SkippedBackfill,
+            ..Default::default()
+        };
+        ensure_state(&c, "S1", &backfilled).unwrap();
+        assert_eq!(
+            by_source(&c, "S1").unwrap().unwrap().distill_state,
+            DistillState::Idle
+        );
+        source(&c, "S2", "claude-code:session:s2", Some("s2"), None);
+        ensure_state(
+            &c,
+            "S2",
+            &NewState {
+                session_id: "s2",
+                ..backfilled
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            by_source(&c, "S2").unwrap().unwrap().distill_state,
+            DistillState::SkippedBackfill
+        );
     }
 
     #[test]
@@ -756,23 +828,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            imported_session_end(&c, "s1").unwrap(),
+            imported_session_end(&c, "s1", false).unwrap(),
             None,
             "captured, not imported"
         );
         assert_eq!(
-            imported_session_end(&c, "s2").unwrap(),
+            imported_session_end(&c, "s2", false).unwrap(),
             Some(Some("2026-10-15T09:00:00.000Z".into())),
             "the newest end of its imported sources"
         );
-        assert_eq!(imported_session_end(&c, "s3").unwrap(), Some(None));
-        assert_eq!(imported_session_end(&c, "s9").unwrap(), None);
+        assert_eq!(imported_session_end(&c, "s3", false).unwrap(), Some(None));
+        assert_eq!(imported_session_end(&c, "s9", false).unwrap(), None);
         assert_eq!(
-            imported_session_end(&c, "s4").unwrap(),
+            imported_session_end(&c, "s4", false).unwrap(),
             Some(Some("2026-10-15T08:00:00.000Z".into())),
             "the latest as a time; one that does not parse loses to one that does"
         );
-        assert_eq!(imported_session_end(&c, "s5").unwrap(), None);
+        assert_eq!(imported_session_end(&c, "s5", false).unwrap(), None);
         // Capture sources of every agent, and nothing else.
         source(&c, "CX", "codex:session:cx1", Some("cx1"), None);
         ensure_state(
@@ -788,6 +860,68 @@ mod tests {
         assert_eq!(
             captured_session_ids(&c).unwrap(),
             HashSet::from(["s1".to_string(), "cx1".to_string()])
+        );
+    }
+
+    /// Task 18b review, I2: MemPalace files a mined Codex rollout under its file's stem,
+    /// `rollout-<time>-<session id>`, so a Codex session asks for that name as well as its id. A
+    /// Claude Code session does not, and a name whose id only ends the session's never matches.
+    #[test]
+    fn a_codex_session_finds_its_rollouts_imported_under_their_names() {
+        let (_d, c) = conn();
+        let id = "0199e4c1-5b2a-7d10-8e3f-4a5b6c7d8e9f";
+        let imported = |src: &str, session: String, end: &str| {
+            source(
+                &c,
+                src,
+                &format!("file:///h/.codex/sessions/2026/10/03/{session}.jsonl"),
+                Some(session.as_str()),
+                Some(end),
+            );
+        };
+        imported(
+            "R1",
+            format!("rollout-2026-10-03T01-57-34-{id}"),
+            "2026-10-03T02:00:00.000Z",
+        );
+        // A later rollout file of the same session (a resumed one).
+        imported(
+            "R2",
+            format!("rollout-2026-10-04T09-00-00-{id}"),
+            "2026-10-04T09:30:00.000Z",
+        );
+        // Not this session's: another id that ends with this one, a name without the time, and
+        // another session's rollout.
+        imported(
+            "X1",
+            format!("rollout-2026-10-05T01-00-00-x-{id}"),
+            "2026-10-05T01:00:00.000Z",
+        );
+        imported("X2", format!("rollout-{id}"), "2026-10-06T01:00:00.000Z");
+        imported(
+            "X3",
+            "rollout-2026-10-07T01-00-00-0199e4c1-0000-7000-8000-000000000000".into(),
+            "2026-10-07T01:00:00.000Z",
+        );
+        assert_eq!(
+            imported_session_end(&c, id, true).unwrap(),
+            Some(Some("2026-10-04T09:30:00.000Z".into())),
+            "the newest end of the session's rollouts"
+        );
+        assert_eq!(
+            imported_session_end(&c, id, false).unwrap(),
+            None,
+            "only a Codex session asks for rollout names"
+        );
+        // The bare id still counts for a Codex session.
+        imported("B1", id.to_string(), "2026-10-08T00:00:00.000Z");
+        assert_eq!(
+            imported_session_end(&c, id, true).unwrap(),
+            Some(Some("2026-10-08T00:00:00.000Z".into()))
+        );
+        assert_eq!(
+            imported_session_end(&c, id, false).unwrap(),
+            Some(Some("2026-10-08T00:00:00.000Z".into()))
         );
     }
 
@@ -878,6 +1012,104 @@ mod tests {
         let known = known_turns(&c, "claude-code", &keys).unwrap();
         assert_eq!(known.len(), 600);
         assert!(known.contains("k1198") && !known.contains("k1199"));
+    }
+
+    /// Task 18b review, I1: a backfilled source that goes on live is `idle` again from where the
+    /// live part starts, its backfilled subagents are moved past their chunks, and a source that
+    /// is not `skipped_backfill` (a live one, or one asked for meanwhile) is left alone.
+    #[test]
+    fn a_backfilled_source_revives_from_where_it_goes_on() {
+        let (_d, c) = conn();
+        let st = |id: &str| by_source(&c, id).unwrap().unwrap();
+        let backfilled = |id: &str, uri: &str, next_ord: i64| {
+            source(&c, id, uri, Some("m1"), None);
+            ensure_state(
+                &c,
+                id,
+                &NewState {
+                    agent: "claude-code",
+                    session_id: "m1",
+                    distill_state: DistillState::SkippedBackfill,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE capture_state SET next_ord = ?2, distill_attempts = 2,
+                    distill_next_try_at = '2026-10-16T00:00:00.000Z' WHERE source_id = ?1",
+                params![id, next_ord],
+            )
+            .unwrap();
+        };
+        backfilled("M1", "claude-code:session:m1", 12);
+        backfilled("K1", "claude-code:session:m1:agent:k1", 5);
+        backfilled("K2", "claude-code:session:m1:agent:k2", 7);
+        // A subagent that ran live already: its chunks are the live part's.
+        source(
+            &c,
+            "K3",
+            "claude-code:session:m1:agent:k3",
+            Some("m1"),
+            None,
+        );
+        state(&c, "K3", "m1");
+        c.execute(
+            "UPDATE capture_state SET next_ord = 4 WHERE source_id = 'K3'",
+            [],
+        )
+        .unwrap();
+        for k in ["K1", "K2", "K3"] {
+            c.execute(
+                "UPDATE capture_state SET parent_source_id = 'M1' WHERE source_id = ?1",
+                [k],
+            )
+            .unwrap();
+        }
+        // K2 went on live first: revived by its own pass, from its own cursor.
+        assert_eq!(revive_backfilled(&c, "K2", 6).unwrap(), 1);
+
+        assert_eq!(revive_backfilled(&c, "M1", 12).unwrap(), 1);
+        let m1 = st("M1");
+        assert_eq!(
+            (m1.distill_state, m1.distill_ord, m1.distill_attempts),
+            (DistillState::Idle, 12, 0)
+        );
+        assert_eq!(m1.distill_next_try_at, None);
+        let k1 = st("K1");
+        assert_eq!(
+            (k1.distill_state, k1.distill_ord),
+            (DistillState::Idle, 5),
+            "a backfilled subagent is past its chunks"
+        );
+        assert_eq!(
+            (st("K2").distill_state, st("K2").distill_ord),
+            (DistillState::Idle, 6),
+            "a subagent revived by its own pass keeps its live part"
+        );
+        assert_eq!(
+            (st("K3").distill_state, st("K3").distill_ord),
+            (DistillState::Idle, 0),
+            "a live subagent keeps every chunk"
+        );
+
+        // Not backfilled (any more): nothing changes, its subagents neither.
+        set_distill(&c, "M1", DistillState::Due, None, 0).unwrap();
+        c.execute(
+            "UPDATE capture_state SET distill_state = 'skipped_backfill', distill_ord = 0
+             WHERE source_id = 'K1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(revive_backfilled(&c, "M1", 20).unwrap(), 0);
+        assert_eq!(
+            (st("M1").distill_state, st("M1").distill_ord),
+            (DistillState::Due, 12)
+        );
+        assert_eq!(
+            (st("K1").distill_state, st("K1").distill_ord),
+            (DistillState::SkippedBackfill, 0)
+        );
+        assert_eq!(revive_backfilled(&c, "NOPE", 1).unwrap(), 0);
     }
 
     /// SP2 Task 12: what the distill worker reads. Subagents by parent, main sources by

@@ -320,7 +320,7 @@ url = "https://<host>/u/<name>/mcp"
 bearer_token_env_var = "ALICE_TOKEN"
 ```
 
-`bearer_token_env_var` names the variable. Codex reads the token from it and sends it as `Authorization: Bearer`. Codex has no per-repository project setting here, so name the project in each request (see below) or append `?project=<slug>` to the `url`.
+`bearer_token_env_var` names the variable. Codex reads the token from it and sends it as `Authorization: Bearer`. This table sends no project, so name the project in each request (see below) or append `?project=<slug>` to the `url`. [setup-server.md](setup-server.md#step-3-codex-only-if-codex-exists) adds `env_http_headers` and a shell wrapper instead, which send the repository's folder name as `X-Alice-Project` and give Codex the token without exporting it.
 
 ### Other agents
 
@@ -438,6 +438,149 @@ It finds your palace itself (`palace_path` in `~/.mempalace/config.json`, else `
 **What is redacted.** The server redacts every text again with its own rules, exactly as `alice import mempalace` does: API keys, tokens, passwords and private keys are removed or, if your privacy mode blocks them, the drawer is held back. The report lists the held-back ones by kind of secret. The uploaded archive is deleted from the server as soon as it is unpacked, and the unpacked copy as soon as the import ends.
 
 If you would rather not run anything, you can still give your palace folder to your admin, who runs `alice-server import` (see above).
+
+## Capture for team members
+
+A person's Claude Code and Codex sessions can be saved to their own tenant as they happen: every finished turn goes into the tenant's raw tier, in the session's project, where `recall` finds it with `include_raw`. On this server, ended sessions are also distilled into a few short memories by Jev. The person installs no Alice binary: capture needs `sh`, `curl` and the agent. What is kept and what never is, and how distillation works, are in [capture.md](capture.md).
+
+### The setup line
+
+The admin gives each person one line, to run on their own machine:
+
+```
+curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>
+```
+
+<!-- TODO(confirm): whether `alice-server add` prints this line (and a command prints it again) is the server lane's interface (SP2 spec §9.5); not in deploy/server/alice-server on this branch. -->
+
+- **Run it after the MCP setup.** [setup-server.md](setup-server.md) (which an agent can run for the person) writes `~/.config/alice/token` and `~/.config/alice/url` first; the setup line then asks nothing. Without those files it asks for the token once, on the terminal with typing hidden, and writes both files (0600, in a 0700 `~/.config/alice`). It never takes the token from the command line or the environment, and never keeps a second copy.
+- **Nothing is written before the token is checked.** The script checks the address (`https://`, or `http://` to `127.0.0.1` or `localhost` for tests) and asks `GET /api/v1/capture/status` whether the token works. A refused token from the file is reported, and the script asks once for a new one. Pointed at a local daemon instead of a tenant, it stops and says so.
+- **Running it again updates everything in place.** It keeps the person's `briefing=off` choice. **The hook script does not update itself:** setup downloads it once, into `~/.config/alice/alice-capture.sh`. After an upgrade that changes the capture scripts, ask everyone to run the same line again. It reuses `~/.config/alice/token` and `~/.config/alice/url` without asking.
+- **Hooks load in new sessions.** The person starts a new Claude Code (or Codex) session afterwards.
+
+`GET /api/v1/capture/setup.sh` and `GET /api/v1/capture/hook.sh` are public, like `/api/v1/ping`: static text compiled into the binary, with no secret and no address, behind the Host and Origin checks but no token.
+
+### What it installs
+
+All under `~/.config/alice` (mode 0700):
+
+| File | Mode | What it is |
+|---|---|---|
+| `token`, `url` | 0600 | The person's token and tenant address, shared with their MCP setup. Read, never changed, when they exist |
+| `capture.conf` | 0600 | One option, `briefing=on` or `briefing=off`; no secret |
+| `alice-capture.sh` | 0700 | The hook script, downloaded from the tenant |
+| `state/` | 0700 | One `<agent>-<session>[-<agent_id>].offset` file per transcript (how far it was sent), and a lock while one is being sent |
+| `capture.log` | 0600 | At most 256 KB: session ids, offsets, sizes, HTTP statuses. Never the token, never transcript text |
+| `paused-until` | 0600 | Present for an hour after the server refused the token |
+| `claude-marketplace/` | 0700 | A local Claude Code plugin marketplace, `alice-local`, holding the plugin `alice-capture` at the tenant's version |
+| `codex-hooks.written` | 0600 | A copy of the Codex `hooks.json` setup wrote, so a re-run or an uninstall never touches a file the person edited |
+
+**Claude Code.** Setup runs `claude plugin marketplace add ~/.config/alice/claude-marketplace` (or `marketplace update alice-local` on a re-run) and `claude plugin install alice-capture@alice-local --scope user`. Claude Code then merges the plugin's hooks itself. When the `claude` command is missing or fails, setup prints the two commands to type inside Claude Code instead: `/plugin marketplace add "<that folder>"` and `/plugin install alice-capture@alice-local`. The plugin runs this on `SessionStart`, `Stop`, `SubagentStop`, `PreCompact` and `SessionEnd`, with a 10-second timeout:
+
+```
+sh "$HOME/.config/alice/alice-capture.sh" hook claude-code || true
+```
+
+`|| true` keeps a missing script (after an uninstall, say) from ever failing an agent's turn.
+
+**Codex.** When `codex` is installed, setup writes `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) with the same five events and `hook codex` (`SessionEnd` gets 3 seconds, Codex's limit). It writes the file only when it does not exist, or is still exactly the one setup wrote before. When the person has a `hooks.json` of their own, or `[hooks]` tables in `config.toml`, it changes nothing and prints the entries to add. Either way, **Codex runs the hooks only after the person trusts them: open Codex, type `/hooks`, and trust the Alice entries.**
+
+### How it works
+
+- **The hook returns at once.** It reads the agent's JSON on standard input, starts a background copy of itself with the session's details (no token among them), and exits 0. Only `SessionStart` waits, at most 2 seconds, for the briefing.
+- **The background copy sends the new bytes.** It waits 2 seconds after a stop-type event (the transcript file can lag), takes a lock for that transcript, and posts the bytes after the last offset to `POST /api/v1/capture/transcript`. Bodies are at most 2 MiB, growing to 8 MiB when a turn is larger. The server keeps the cursor, stores only complete turns, and answers with the next offset; it never reads a path on the person's machine.
+- **Nothing is lost when the server is away.** On a network error or a server error the offset stays, and the next event of that session tries again: the transcript file itself is the queue. Each `SessionStart` also finishes up to five other sessions whose transcripts grew meanwhile.
+- **Nothing is stored twice.** A script that lost its offset is told the server's cursor (`409`) and jumps there; a turn sent again is skipped by its key.
+- **A refused token pauses capture for an hour.** The log says "the token was refused; run the setup command again (capture is paused for an hour)". Running the setup line again ends the pause at once: it checks the token (asking for the new one when the stored one is refused) and clears `paused-until`. A new token written into `~/.config/alice/token` alone is used only when the hour is over.
+- **The token** reaches `curl` only as a config line on its standard input (`curl -q -K -`, written by the shell's `printf`). It is never in a command line, a URL, a child's environment or a log.
+
+### The briefing
+
+When a Claude Code session starts (`source` `startup`, `clear` or `compact`; not `resume` or `fork`, which already hold one), the hook asks `GET /api/v1/capture/briefing` for the project's briefing and prints it as plain text, which Claude Code adds to the session. It is the same briefing as the `context` tool's, at most 10,000 characters.
+
+- **It is bounded:** `curl --connect-timeout 1 --max-time 2`. A slow or unreachable server costs at most 2 seconds at the start of a session, and then nothing is printed; the MCP instructions still ask the agent for `context`. Any answer but `200 text/plain` prints nothing. The hook always exits 0.
+- **Two switches turn it off:** the line `briefing=off` in `~/.config/alice/capture.conf` (no request is made), or the tenant setting `capture.briefing = false` (`alice-server cli <name> config set capture.briefing false`), which makes the server answer `204`.
+- **Codex** gets no briefing from the hook; its MCP instructions cover it.
+
+### Privacy on this path
+
+It matches direct MCP:
+
+- The text arrives inside TLS, unredacted, and the tenant redacts it with its own rules (always on) before anything is stored or logged.
+- **A repository's `.alice.toml` is not mirrored.** The script reads two lines of it, at the git top level (else the session's folder), on the person's machine: `no_capture = true` (nothing of that session is sent, and the script's offset moves past those turns, so they are never sent later either) and `cloud_denied = true` (sent with `no_distill=1`: stored, never distilled). Only plain `key = true` lines are seen, not other TOML forms. A `.alice.toml` the script cannot read skips the event and keeps the offset (fail closed).
+- **The tenant's settings decide the rest:** `capture.excluded_projects` (never captured) and `privacy.cloud_denied_projects` (never sent to Jev), set with `alice-server cli <name> config set …`.
+- **Custom patterns and block mode from a repository's `.alice.toml` do not apply here.** They wait for a client that reads the repository on the person's machine (the deferred `alice remote`). The tenant's own `privacy.custom_patterns` apply.
+
+### Which project a captured session lands in
+
+The script names the project after the folder of the git repository the session runs in (not `$HOME`; outside git it names none, and the session goes to `global`). It sends that name as the `X-Alice-Project` header, percent-encoded so any folder name travels, and the tenant resolves it as it resolves the header over MCP: an existing slug or alias, else a new project of that name. The `alice-mcp-headers` helper and the Codex wrapper of [setup-server.md](setup-server.md) send the same folder name, so a repository's memories and its captured sessions land together.
+
+**An MCP `?project=` pin does not reach capture.** If a repository's `.mcp.json` pins `?project=web` while its folder is `acme-web`, memories go to `web` and transcripts to `acme-web`. Pin the folder's name instead, or make one project a name of the other: `alice-server cli <name> projects merge acme-web web --yes` moves everything of `acme-web` into `web` and makes `acme-web` an alias, so later captures land in `web` too.
+
+### Retention
+
+Captured transcripts are kept **180 days** on every tenant, pinned by the line `ALICE_CAPTURE_RAW_RETENTION=180d` in `/etc/alice/tenants/<name>.env`. The environment wins over the tenant's `config.toml`, so a person's own settings cannot keep them longer; the admin changes the line (`90d` for the heaviest tenant, say) and runs `systemctl restart alice@<name>`. The daily job `capture_retention` deletes only captured chunks: imported MemPalace history and every memory stay, distilled ones included. <!-- TODO(confirm): `alice-server add` writing the line, and `upgrade` adding it where unset, are the server lane's interface (SP2 spec §9.5); not in deploy/server/alice-server on this branch. -->
+
+As an estimate, carrying over the 16.8 KB per imported drawer (with its two backups) that the [Disk budget](#disk-budget) measures to captured chunks, a heavy user (about 1,000 chunks a day) holds about 3.0 GB of captured transcripts at 180 days, and a lighter one (300 a day) about 0.9 GB. Captured chunks have not been measured yet.
+
+### Distillation and the shared Jev key
+
+On this server Jev is on for everyone with the owner's one key (see [jev-key](#jev-key)), and distillation (`distill.provider = jev`) is on for every tenant. The open-source default is off: it is this deployment that turns it on. <!-- TODO(confirm): how `distill.provider = jev` reaches each tenant (`alice-server add` once the key is provisioned, per SP2 spec §9.3); the jev-key section above still says it will join later. -->
+
+- A person never sees or supplies the key. The setup line's summary says whether distillation is on (`distillation: on`), from the tenant's own setting.
+- **Spend is per tenant**, inside its judge budget (`ALICE_JUDGE_DAILY_BUDGET_USD`, 1.00 USD a day by default), of which distillation may use half (`distill.budget_share = 0.5`). **The deployment-wide ceiling** is the number of daemons times that budget: 5.00 USD a day with four people and the team store, of which distillation can be at most 4 × 0.50 = 2.00 USD (the team store captures nothing). Expected spend is far lower, about 0.001-0.003 USD per distilled session.
+- A tenant's `privacy.cloud_denied_projects` are never sent to Jev; their sessions are captured but not distilled.
+- When distillation is first switched on, the sessions captured in the last 7 days are distilled, newest first; older ones only on request (`alice-server cli <name> capture distill <session-id>`).
+
+### Checking and removing
+
+```
+sh ~/.config/alice/alice-capture.sh status
+sh ~/.config/alice/alice-capture.sh uninstall
+```
+
+`status` shows the address, whether the server accepts the token, whether capture and distillation are on, the briefing switch, how many transcripts are followed, the plugin and the Codex hooks. It never prints the token. It also lists transcripts that wait:
+
+- `stopped: <key>`: the server's cursor is past the file's end (the server already holds more of that session than the file has, for example after the file was replaced). Delete `~/.config/alice/state/<key>.offset` to start that transcript again.
+- `waiting: <key>`: the server took nothing at that size (no complete turn yet, or the tenant's rules for that project are not known right now); it is sent again when the file grows. Deleting the state file resets it.
+
+`uninstall` removes the plugin and the marketplace (or prints `/plugin uninstall alice-capture@alice-local` and `/plugin marketplace remove alice-local` to type in Claude Code), removes the Codex `hooks.json` only if it is still exactly the one setup wrote, and then asks before deleting the script, `state/`, `capture.conf`, `capture.log` and `paused-until`. It never deletes `token` or `url`, which the MCP setup uses. Restart open Claude Code and Codex sessions afterwards, so none still runs the removed hooks.
+
+### What the admin's script provides
+
+Capture needs these from `alice-server` (SP2 spec §9.5): <!-- TODO(confirm): none of the four is in deploy/server/alice-server on this branch yet; pane 3 implements them. -->
+
+| Interface | What it does |
+|---|---|
+| Print the setup line | `alice-server add <name>`, and a command to print it again, print the setup line above |
+| Pin capture retention | `add` writes `ALICE_CAPTURE_RAW_RETENTION=180d` into the tenant's file, and `upgrade` adds it where unset |
+| Jev on with the shared key | Once `alice-server jev-key set` has provisioned the key, `add` sets `judge.provider = jev` and `distill.provider = jev` for the tenant |
+| Adoption | `alice-server adopt` moves a database whole, so its capture cursors and turn keys travel with it |
+
+### Moving a local Alice that already captured
+
+If the person ran capture on their machine before you adopt their database (see [adopt](#adopt)):
+
+1. On their machine, they let capture finish (end the open session, or wait a few minutes for the daemon's sweep), and run `alice import mempalace` one last time if MemPalace is still active.
+2. You adopt the database. Its capture cursors and turn keys travel with it.
+3. On their machine, they run `alice hooks uninstall claude` (and `codex`), then the setup line instead.
+
+The script's first upload of a session the machine already captured starts at offset 0; the tenant answers with its cursor (`409`), the script jumps there, and a turn sent again is skipped by its key. Nothing is stored twice. Details: [capture.md](capture.md#when-you-move-to-a-server-tenant).
+
+### Troubleshooting capture
+
+| What you see | Meaning | What to do |
+|---|---|---|
+| Setup prints `/plugin marketplace add …` and `/plugin install alice-capture@alice-local` | The `claude` command is missing or could not install the plugin | Type the two commands inside Claude Code |
+| `… is a local Alice daemon, not a server tenant` | The address points at a local daemon | Use the tenant address `https://<host>/u/<name>`; a local install uses `alice hooks install` |
+| `the server refused that token too … Nothing was changed.` | The token is wrong or was rotated | Ask the admin for the current token |
+| `there is no terminal to ask for the token on` | Setup ran without a terminal and without a token file | Put the token in `~/.config/alice/token` (one line, 0600) and run the line again |
+| `capture.log`: "the token was refused; run the setup command again (capture is paused for an hour)" | `alice-server rotate` replaced the token | Run the setup line again: it asks for the new token and ends the pause. Writing the token file alone waits out the hour |
+| `status` says `server: unreachable` | No connection, or the tenant is down | Nothing is lost; capture resumes at the next event |
+| `capture.log`: "… holds a JSON escape this script does not decode (such as \u); event skipped" | A path or folder name reached the hook in an escaped form | That event is skipped; tell the admin if it repeats |
+| Codex sessions are not captured | The hooks are not trusted yet, or the person has their own `hooks.json` | Trust them in Codex's `/hooks`; add the entries setup printed |
+| No briefing at session start | `briefing=off`, `capture.briefing = false`, a resumed session, or a server slower than 2 s | Check `status`; the agent still calls `context` itself |
+| Memories and transcripts of one repository in two projects | An MCP `?project=` pin differs from the folder name | See [Which project a captured session lands in](#which-project-a-captured-session-lands-in) |
 
 ## Troubleshooting
 
