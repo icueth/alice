@@ -19,7 +19,7 @@
 
 use crate::maintenance::Activity;
 use crate::service::{Active, ActiveSlot, IndexSlot, snapshot};
-use crate::worker::{embed_guarded, nap, split_by_policy};
+use crate::worker::{embed_guarded, nap, split_by_policy, texts_for};
 use crate::writer::{WriteOp, WriteOutcome, WriterHandle};
 pub use alice_core::api::ReembedStatus;
 use alice_core::embed::Embedder;
@@ -226,7 +226,7 @@ fn gated_embed(cfg: &ReembedConfig, items: Vec<PendingItem>) -> Result<Gated, Ha
         if allowed.is_empty() {
             return Ok(out);
         }
-        let texts: Vec<String> = allowed.iter().map(|i| i.text.clone()).collect();
+        let texts = texts_for(&cfg.readers, cfg.policy.as_ref(), remote, &allowed);
         match embed_guarded(cfg.target.as_ref(), &texts) {
             Ok(v) if v.len() == texts.len() => {
                 *cfg.error.write() = None;

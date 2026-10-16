@@ -280,7 +280,7 @@ custom_patterns = [{ name = "internal_id", regex = "ID-[0-9]{8}" }]
 
 **redaction ตัดอะไรบ้าง** ก่อนบันทึกหรือส่งออก memory, chunk ของ transcript, snapshot ในประวัติ, งานเขียนที่รอในคิว หรือคำขอไป Jev Alice จะแทน secret ด้วย `[REDACTED:<type>]` ได้แก่ private key, JWT, key ของ AWS, GitHub, GitLab, Slack, Stripe, SendGrid, Vault, Anthropic และ OpenAI, รหัสผ่านใน URL, การกำหนดค่าแบบ `password=`/`token=` และค่าที่สุ่มสูงยาวๆ ที่ตามหลังชื่อคล้าย key รวมถึง `custom_patterns` ของคุณเอง ถ้าตั้ง `redact_mode = "block"` จะปฏิเสธการเขียนแทน โดย error บอกชื่อ field และ detector (ไม่บอก secret)
 
-**embedding ในเครื่องหรือไม่** ค่าเริ่มต้นคือโมเดลหลายภาษาในเครื่อง provider ผ่าน HTTP (`ollama` ในเครื่องหรือในเครือข่ายของคุณ, `openai` สำหรับ endpoint ที่เข้ากันกับ OpenAI, `voyage`) จะได้รับข้อความเฉพาะโปรเจกต์ที่นโยบาย cloud อนุญาต และ `ollama` บน `localhost` ถือว่าเป็นในเครื่อง รายละเอียด: [docs/benchmarks/m2-embedding.md](docs/benchmarks/m2-embedding.md)
+**embedding ในเครื่องหรือไม่** ค่าเริ่มต้นคือโมเดลหลายภาษาในเครื่อง provider ผ่าน HTTP (`ollama` ในเครื่องหรือในเครือข่ายของคุณ, `openai` สำหรับ endpoint ที่เข้ากันกับ OpenAI, `voyage`) จะได้รับข้อความเฉพาะโปรเจกต์ที่นโยบาย cloud อนุญาต โดย secret ถูกตัดด้วยกฎปัจจุบันเสมอแม้คุณเลือกเก็บข้อความดิบ และ `ollama` บน `localhost` ถือว่าเป็นในเครื่อง รายละเอียด: [docs/benchmarks/m2-embedding.md](docs/benchmarks/m2-embedding.md)
 
 ## Judge, review และ undo
 

@@ -280,7 +280,7 @@ The rules belong to the project, not to one checkout: a worktree or a fresh clon
 
 **What redaction catches.** Before a memory, a transcript chunk, a history snapshot, a queued write or a request to Jev is stored or sent, Alice replaces secrets with `[REDACTED:<type>]`: private keys, JWTs, AWS, GitHub, GitLab, Slack, Stripe, SendGrid, Vault, Anthropic and OpenAI keys, passwords in URLs, `password=`/`token=`-style assignments and long high-entropy values after a key-like name, plus your own `custom_patterns`. With `redact_mode = "block"` the write is refused instead, and the error names the field and the detector (never the secret).
 
-**Local embedding or not.** The default is the local multilingual model. An HTTP provider (`ollama` on this machine or your network, `openai` for any OpenAI-compatible endpoint, `voyage`) receives text only for projects the cloud policy allows, and `ollama` on `localhost` counts as local. Details: [docs/benchmarks/m2-embedding.md](docs/benchmarks/m2-embedding.md).
+**Local embedding or not.** The default is the local multilingual model. An HTTP provider (`ollama` on this machine or your network, `openai` for any OpenAI-compatible endpoint, `voyage`) receives text only for projects the cloud policy allows, with secrets redacted by the current rules even if you store raw text, and `ollama` on `localhost` counts as local. Details: [docs/benchmarks/m2-embedding.md](docs/benchmarks/m2-embedding.md).
 
 ## Judge, review and undo
 
