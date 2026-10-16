@@ -608,7 +608,11 @@ impl Unit {
 //   `import.mempalace.last` marker, so a rerun that finds nothing new writes one small batch.
 // - The dry run only dedupes knowledge drawers against each other: a memory already stored in
 //   Alice that an incoming drawer duplicates is reported by the real run as a warning.
-// - Collapsed raw drawers are recorded at the end of the raw phase (they point at their keeper).
+// - Collapsed raw drawers are recorded in the `collapsed` phase, after `graph` (they point at
+//   their keeper, which may sit on a later page than its repeat).
+// - A raw drawer MemPalace cut into fragments is planned like a knowledge one: at its first
+//   fragment, joined, redacted whole, then sized; its later fragments are skipped where the raw
+//   pass meets them (`Survey::raw_tails`).
 
 /// What the planning passes count.
 #[derive(Default)]
@@ -803,9 +807,14 @@ impl Ctx<'_> {
                 None
             }
             Planned::Collapsed { keeper } => {
-                self.tally.raw_collapsed += 1;
+                // A raw drawer of fragments that repeats an earlier one: each fragment id points
+                // where the keeper went.
+                self.tally.raw_collapsed += 1 + extra;
                 if !self.dry {
-                    self.collapsed.push((key, self.filter.legacy_key(&keeper)));
+                    let keeper = self.filter.legacy_key(&keeper);
+                    self.collapsed.push((key, keeper.clone()));
+                    self.collapsed
+                        .extend(joined.into_iter().map(|j| (j, keeper.clone())));
                 }
                 None
             }
@@ -1132,6 +1141,7 @@ impl Ctx<'_> {
     }
 
     fn raw_pass(&mut self, since: Option<&str>) -> Result<()> {
+        let survey = self.survey;
         let mut after: Option<String> = None;
         loop {
             check_stop(&self.env.stop)?;
@@ -1150,13 +1160,47 @@ impl Ctx<'_> {
             let stored = self.stored(&keys)?;
             let mut units: Vec<Unit> = Vec::new();
             for ((d, tier), key) in raw.iter().zip(&keys) {
-                if stored.contains(key) {
-                    self.tally.already += 1;
+                // A later fragment of a drawer MemPalace cut is handled with its first one.
+                if survey.raw_tails.contains(&d.id) {
+                    continue;
+                }
+                let already = |t: &mut Tally, n: u64| {
+                    t.already += n;
                     if *tier == Tier::RawSession {
-                        self.tally.already_session += 1;
+                        t.already_session += n;
                     } else {
-                        self.tally.already_file += 1;
+                        t.already_file += n;
                     }
+                };
+                if let Some(ids) = survey.fragments.get(&d.id) {
+                    // As for knowledge drawers: imported only when none of its ids is stored
+                    // (a home that holds some of them from a version that stored fragments one
+                    // by one keeps what it has).
+                    let fragment_keys: Vec<String> =
+                        ids.iter().map(|m| self.filter.legacy_key(m)).collect();
+                    let known = self.stored(&fragment_keys)?.len();
+                    if known > 0 {
+                        already(&mut self.tally, ids.len() as u64);
+                        if known < ids.len() {
+                            self.tally.partial_groups += 1;
+                        }
+                        continue;
+                    }
+                    let mut by_id: HashMap<String, Drawer> = self
+                        .reader
+                        .get(&ids[1..])?
+                        .into_iter()
+                        .map(|m| (m.id.clone(), m))
+                        .collect();
+                    let mut members = vec![(*d).clone()];
+                    members.extend(ids[1..].iter().filter_map(|id| by_id.remove(id)));
+                    if let Some(unit) = self.take(&members) {
+                        units.push(unit);
+                    }
+                    continue;
+                }
+                if stored.contains(key) {
+                    already(&mut self.tally, 1);
                     continue;
                 }
                 if let Some(unit) = self.take(std::slice::from_ref(*d)) {
@@ -1434,12 +1478,18 @@ impl Ctx<'_> {
                 }
             }
             self.tally.reviews_created += open;
-            // A link needs both ends among the memories this run would make or an earlier run made.
-            let known: HashSet<String> = self
-                .survey
+            // A link needs both ends among the memories this run would make or an earlier run made
+            // (fragments of knowledge drawers included; checkpoint and raw drawers are chunks).
+            let survey = self.survey;
+            let known: HashSet<String> = survey
                 .knowledge_order
                 .iter()
-                .chain(self.survey.fragments.values().flatten())
+                .flat_map(|head| {
+                    survey
+                        .fragments
+                        .get(head)
+                        .map_or_else(|| std::slice::from_ref(head), Vec::as_slice)
+                })
                 .map(|id| self.filter.legacy_key(id))
                 .collect();
             let ends: Vec<String> = links

@@ -2756,3 +2756,99 @@ async fn a_secret_cut_by_a_fragment_boundary_never_reaches_the_database() {
         assert_eq!(f.tables_holding(needle).await, Vec::<String>::new());
     }
 }
+
+/// One fragment of a drawer MemPalace cut that carries a source file outside the curated rooms:
+/// a raw file chunk.
+fn raw_file_part(base: &str, n: i64, text: &str) -> DrawerSpec {
+    DrawerSpec {
+        id: format!("{base}_chunk_{n:06}"),
+        text: text.into(),
+        meta: DrawerMeta {
+            wing: "devspace".into(),
+            room: "notes".into(),
+            source_file: s("/h/Code/devspace/NOTES.md"),
+            added_by: s("claude"),
+            chunk_index: Some(n),
+            filed_at: s("2026-04-16T11:00:00"),
+            ..Default::default()
+        },
+    }
+}
+
+/// The raw-file variant: the fragments are joined before redaction, so the secret is whole when
+/// the detectors see it, and the drawer is one chunk that every fragment id leads to; a repeat of
+/// the whole drawer in the same file collapses onto it. A rerun plans nothing, and a home that
+/// holds only some of the fragment ids keeps what it has.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secret_cut_by_a_fragment_boundary_of_a_raw_file_drawer_never_reaches_the_database() {
+    let token = concat!("gh", "p_", "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let (a, b) = token.split_at(2);
+    let base = "drawer_devspace_notes_0a1b2c";
+    let repeat = "drawer_devspace_notes_9f8e7d";
+    let specs = vec![
+        raw_file_part(base, 0, &format!("deploy with {a}")),
+        raw_file_part(base, 1, &format!("{b} then restart")),
+        raw_file_part(repeat, 0, &format!("deploy with {a}")),
+        raw_file_part(repeat, 1, &format!("{b} then restart")),
+    ];
+    let f = Flow::with_hook(&specs).await;
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert_eq!((r.fragments_joined, r.fragment_groups), (1, 1));
+    assert_eq!(r.duplicates.raw, 2, "both fragments of the repeat");
+    assert_eq!(r.tiers.raw_file_chunks, 4, "four drawers of the palace");
+    assert!(r.redacted_fields >= 1, "{}", r.redacted_fields);
+    for needle in [token, &token[4..]] {
+        assert_eq!(f.tables_holding(needle).await, Vec::<String>::new());
+    }
+    assert_eq!(f.count("chunks").await, 1);
+    let text: String = f
+        .db()
+        .query_row(
+            "SELECT text FROM chunks WHERE legacy_id = ?1",
+            [format!("{base}_chunk_000000")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(text, "deploy with [REDACTED:github_token] then restart");
+    let head = f.legacy_target(&format!("{base}_chunk_000000")).await;
+    assert!(head.as_deref().is_some_and(|t| t.starts_with("chunk:")));
+    for id in [
+        format!("{base}_chunk_000001"),
+        format!("{repeat}_chunk_000000"),
+        format!("{repeat}_chunk_000001"),
+    ] {
+        assert_eq!(f.legacy_target(&id).await, head, "{id}");
+    }
+
+    let planned = f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed);
+    let again = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(
+        f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed),
+        planned
+    );
+    assert_eq!(again.already_imported, 4);
+    assert_eq!(again.drawers_seen, again.drawers_accounted);
+
+    // An earlier version stored the fragments one by one: a home missing one of the ids keeps
+    // what it has and is told so.
+    f.db()
+        .execute(
+            "DELETE FROM legacy_ids WHERE legacy_id = ?1",
+            [format!("{base}_chunk_000001")],
+        )
+        .unwrap();
+    let partial = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(f.count("chunks").await, 1, "no second copy of its text");
+    assert_eq!(partial.already_imported, 4);
+    assert_eq!(partial.drawers_seen, partial.drawers_accounted);
+    assert!(
+        partial
+            .warnings
+            .iter()
+            .any(|w| w.contains("only partly in Alice")),
+        "{:?}",
+        partial.warnings
+    );
+}

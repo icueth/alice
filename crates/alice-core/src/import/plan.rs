@@ -4,7 +4,7 @@
 //! Safety order inside `Mapper::map`: clean the text, redact the WHOLE text, only then split by
 //! size, and re-check byte sizes after redaction (a marker can be longer than the secret).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use chrono::{FixedOffset, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone};
@@ -650,8 +650,9 @@ pub struct Survey {
     /// The checkpoint diaries, the same way: earliest filed first, one id per drawer.
     pub checkpoint_order: Vec<String>,
     /// First fragment's id -> the ids of all the fragments of that drawer in order (first
-    /// included). Only drawers of two or more fragments are here; this is the one place the
-    /// survey keeps anything per fragment, and it holds ids only.
+    /// included), for knowledge, checkpoint and raw drawers alike. Only drawers of two or more
+    /// fragments are here; with `raw_tails`, this is the one place the survey keeps anything
+    /// per fragment, and it holds ids only.
     pub fragments: HashMap<String, Vec<String>>,
     /// Raw drawer id -> ord inside its source.
     pub ords: HashMap<String, i64>,
@@ -663,6 +664,9 @@ pub struct Survey {
     pub tiers: TierCounts,
     /// Raw drawer id -> source uri.
     pub raw_source_of: HashMap<String, String>,
+    /// The fragments of raw drawers (two or more fragments) other than the first: each is
+    /// planned with its drawer, under the first fragment's id (`fragments` lists them).
+    pub raw_tails: HashSet<String>,
 }
 
 /// What the survey keeps per knowledge or checkpoint drawer (or fragment of one): no text.
@@ -743,6 +747,10 @@ fn survey_paged(
     // (ids and times, no text).
     let mut drawers: HashMap<(String, bool, bool), Vec<Fragment>> = HashMap::new();
     let mut sources: HashMap<String, Vec<RawRow>> = HashMap::new();
+    // Fragments of raw drawers by (drawer id, source uri), with their place in the drawer: ids,
+    // times and hashes only. MemPalace cuts few drawers that carry a source file (79 fragments
+    // on the owner's palace).
+    let mut raw_fragments: HashMap<(String, String), Vec<(Option<i64>, RawRow)>> = HashMap::new();
     let mut after: Option<String> = None;
     loop {
         let page = reader.page(after.as_deref(), page_size, since)?;
@@ -806,6 +814,7 @@ fn survey_paged(
                             span.1 = Some(t);
                         }
                     }
+                    let index = fragment_index(&d.id, &d.meta);
                     let row = RawRow {
                         hash: text_hash(&d.text),
                         chunk_index: d.meta.chunk_index,
@@ -817,6 +826,15 @@ fn survey_paged(
                             .unwrap_or_default(),
                         id: d.id,
                     };
+                    // A fragment of a drawer MemPalace cut waits for the others of its drawer
+                    // (same source): the drawer becomes one row once they are all seen.
+                    if let Some((base, _)) = chunk_suffix(&row.id) {
+                        raw_fragments
+                            .entry((base.to_string(), uri))
+                            .or_default()
+                            .push((index, row));
+                        continue;
+                    }
                     out.raw_source_of.insert(row.id.clone(), uri.clone());
                     sources.entry(uri).or_default().push(row);
                 }
@@ -876,6 +894,46 @@ fn survey_paged(
     };
     out.knowledge_order = order(knowledge);
     out.checkpoint_order = order(checkpoints);
+
+    // A raw drawer of two or more fragments is one row of its source, under its first fragment:
+    // one position, and one hash made of the fragments' hashes in order (a repeat of the whole
+    // drawer collapses onto it). Its text is joined, then redacted whole, by the planner.
+    for ((_, uri), mut members) in raw_fragments {
+        if members.len() == 1 {
+            let (_, row) = members.remove(0);
+            out.raw_source_of.insert(row.id.clone(), uri.clone());
+            sources.entry(uri).or_default().push(row);
+            continue;
+        }
+        members.sort_by(|a, b| {
+            (a.0.unwrap_or(i64::MAX), &a.1.id).cmp(&(b.0.unwrap_or(i64::MAX), &b.1.id))
+        });
+        let mut digest = Sha256::new();
+        digest.update(b"fragments\0");
+        for (_, r) in &members {
+            digest.update(r.hash);
+        }
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(&digest.finalize()[..16]);
+        let filed = members
+            .iter()
+            .map(|(_, r)| r.filed.as_str())
+            .filter(|f| !f.is_empty())
+            .min()
+            .unwrap_or("")
+            .to_string();
+        let ids: Vec<String> = members.iter().map(|(_, r)| r.id.clone()).collect();
+        let head = ids[0].clone();
+        out.raw_tails.extend(ids[1..].iter().cloned());
+        out.raw_source_of.insert(head.clone(), uri.clone());
+        sources.entry(uri).or_default().push(RawRow {
+            id: head.clone(),
+            chunk_index: members[0].1.chunk_index,
+            filed,
+            hash,
+        });
+        out.fragments.insert(head, ids);
+    }
 
     for (uri, mut rows) in sources {
         rows.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
@@ -946,22 +1004,23 @@ impl Planner<'_> {
     /// `Collapsed` when the survey folded this drawer into a keeper, else `Mapper::map` with the
     /// survey's ord and the source's time span.
     pub fn plan(&self, d: &Drawer) -> Planned {
-        if let Some(keeper) = self.survey.collapsed.get(&d.id) {
-            return Planned::Collapsed {
-                keeper: keeper.clone(),
-            };
-        }
         self.plan_members(std::slice::from_ref(d))
     }
 
     /// A drawer MemPalace cut into fragments (`Survey::fragments` lists their ids): `members`
-    /// are all of them, first fragment first. Planned as the one drawer they make up.
+    /// are all of them, first fragment first. Planned as the one drawer they make up (a raw
+    /// one may have collapsed onto an earlier identical drawer).
     pub fn plan_group(&self, members: &[Drawer]) -> Planned {
         self.plan_members(members)
     }
 
     fn plan_members(&self, members: &[Drawer]) -> Planned {
         let d = &members[0];
+        if let Some(keeper) = self.survey.collapsed.get(&d.id) {
+            return Planned::Collapsed {
+                keeper: keeper.clone(),
+            };
+        }
         let tier = classify(&d.id, &d.meta);
         let ord = match self.survey.ords.get(&d.id) {
             Some(o) => *o,
@@ -2365,6 +2424,98 @@ mod tests {
         });
         assert_eq!(sv.ords["diary_h"], 3);
         assert_eq!(sv.ords["diary_g"], 4);
+    }
+
+    fn raw_file_spec(id: &str, text: &str, ci: Option<i64>) -> DrawerSpec {
+        spec(
+            id,
+            text,
+            DrawerMeta {
+                wing: "devspace".into(),
+                room: "notes".into(),
+                source_file: s("/h/notes/todo.md"),
+                added_by: s("claude"),
+                chunk_index: ci,
+                filed_at: s("2026-04-16T11:00:00"),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The members of `head`'s drawer, read back from the palace in the survey's order.
+    fn members_of(r: &dyn PalaceReader, sv: &Survey, head: &str) -> Vec<Drawer> {
+        let ids = &sv.fragments[head];
+        let by_id: std::collections::HashMap<_, _> = r
+            .get(ids)
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.id.clone(), d))
+            .collect();
+        ids.iter().map(|i| by_id[i].clone()).collect()
+    }
+
+    /// A raw-file drawer MemPalace cut into fragments is one row of its source: one position,
+    /// one hash (a repeat of the whole drawer collapses onto it), and the planner joins it
+    /// before anything else, like a knowledge drawer. Single fragments and mined chunks of the
+    /// same file stay rows of their own.
+    #[test]
+    fn raw_file_fragments_are_one_row_of_their_source_and_are_planned_as_one_chunk() {
+        let specs = vec![
+            raw_file_spec("drawer_n_chunk_000001", "second half", Some(1)),
+            raw_file_spec("drawer_n_chunk_000000", "first half, ", Some(0)),
+            // The same text cut the same way, filed again for the same file.
+            raw_file_spec("drawer_r_chunk_000000", "first half, ", Some(0)),
+            raw_file_spec("drawer_r_chunk_000001", "second half", Some(1)),
+            raw_file_spec("drawer_s_chunk_000000", "solo", Some(0)),
+            raw_file_spec("mined_1", "mined text", Some(3)),
+        ];
+        let (_a, _b, r) = open_fixture(&specs, |_| {});
+        let mut wm = wings();
+        let sv = survey(r.as_ref(), None, &mut wm, utc(), &no_reserved).unwrap();
+        assert_eq!((sv.total, sv.tiers.raw_file), (6, 6));
+        let head = "drawer_n_chunk_000000";
+        assert_eq!(
+            sv.fragments[head],
+            vec!["drawer_n_chunk_000000", "drawer_n_chunk_000001"]
+        );
+        assert!(sv.ords.contains_key(head));
+        assert!(!sv.ords.contains_key("drawer_n_chunk_000001"));
+        assert!(sv.raw_tails.contains("drawer_n_chunk_000001"));
+        assert!(!sv.raw_tails.contains(head));
+        assert_eq!(
+            sv.collapsed
+                .get("drawer_r_chunk_000000")
+                .map(String::as_str),
+            Some(head),
+            "a repeat of the whole drawer collapses onto it"
+        );
+        assert!(sv.raw_tails.contains("drawer_r_chunk_000001"));
+        for single in ["drawer_s_chunk_000000", "mined_1"] {
+            assert!(sv.ords.contains_key(single), "{single}");
+        }
+        let ords: Set<i64> = sv.ords.values().copied().collect();
+        assert_eq!(ords.len(), sv.ords.len(), "positions are unique");
+
+        let f = NoFilter;
+        let planner = Planner {
+            mapper: Mapper {
+                wings: &wm,
+                assume: utc(),
+                filter: &f,
+            },
+            survey: &sv,
+        };
+        let Planned::Chunks(c) = planner.plan_group(&members_of(r.as_ref(), &sv, head)) else {
+            panic!("chunks")
+        };
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].chunk.text, "first half, second half");
+        assert_eq!(c[0].legacy_id, head);
+        assert_eq!(c[0].chunk.ord, sv.ords[head]);
+        assert!(matches!(
+            planner.plan_group(&members_of(r.as_ref(), &sv, "drawer_r_chunk_000000")),
+            Planned::Collapsed { keeper } if keeper == head
+        ));
     }
 
     #[test]
