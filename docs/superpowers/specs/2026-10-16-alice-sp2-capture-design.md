@@ -615,10 +615,12 @@ self-update (step 8) compares with it, so the hooks are written down in one plac
    token among them), started with `nohup sh … >/dev/null 2>&1 </dev/null &`. Then `exit 0`, except on `SessionStart`,
    which first prints the briefing (step 5, at most 2 s). The agent never waits on capture.
 3. **In the background:**
-   - Take a per-file lock, a `mkdir` lock holding the holder's `pid` and `at` (refreshed every pass). A live holder is
-     broken only when its `at` is 900 s old, a dead one at 360 s. Without a usable `at` (a holder killed between `mkdir`
-     and writing it, or inside its unlock, or a full disk), the directory's own age stands in: more than 15 minutes for
-     a live pid, more than 6 otherwise.
+   - Take a per-file lock, a `mkdir` lock holding the holder's `pid` and `at` (refreshed every pass). Both are written
+     through a temporary file and `mv`, so a reader never sees them empty, and each write moves the directory's mtime.
+     - A live holder is broken only when its `at` is 900 s old, a dead one at 360 s.
+     - Without a usable `at` (a holder killed between `mkdir` and writing it, or inside its unlock, or a full disk), the
+       directory's own age stands in: more than 15 minutes for a live pid, more than 6 otherwise.
+     - A dead or unknown holder without `at` is also broken after more than 5 tries (a hook waits up to 40 s).
    - Wait 2 s on stop-type events (the transcript may lag).
    - Read the stored offset from `~/.config/alice/state/<agent>-<session>[-<agent_id>].offset`.
    - Loop at most 16 times:
@@ -665,6 +667,12 @@ self-update (step 8) compares with it, so the hooks are written down in one plac
      - pass `sh -n`, and `dash -n` where `dash` exists;
      - pass a smoke run: `sh <download> print-hooks-json claude-code`, with the shell the hook uses, must exit 0 within
        20 s and print JSON. A script that dies as it starts would stop capture and its own updates for good.
+
+     The 20 s (and the 120 s of the `claude` calls below) are enforced by a watchdog, since macOS has no `timeout`: TERM
+     at the limit, then KILL 2 s later when TERM did not end the command (a script's own TERM trap waits for its
+     foreground command). The watchdog sleeps one second at a time. The caller stops it with KILL and kills its sleep,
+     so none outlives the call, and it signals only while a sentinel file the caller removes exists, so never a reused
+     pid. A child the command started can outlive the KILL.
    - **Replacing.** The download is a temporary file beside the script, `chmod 700`, then `mv`. A running worker keeps
      reading the old file. The log says `capture hook updated <old> → <new>`. Any failure (curl, a check, the `mv`) keeps
      the installed script byte for byte and logs one line. No log line holds the token or the script's text. A script

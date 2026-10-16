@@ -3568,6 +3568,201 @@ async fn the_claude_plugin_calls_run_from_home_bounded_and_without_autoupdate() 
     assert_eq!(fresh.len(), 1, "{log}");
 }
 
+// ---- Self-update, fix round 2 ----
+
+/// The hook script without its last line (`main "$@"`), at `<root>/hook-lib.sh`: sourced, it
+/// gives a test the script's functions.
+fn hook_lib(env: &Env) -> PathBuf {
+    let text = read(Path::new(HOOK_SH));
+    let lib = text
+        .strip_suffix("main \"$@\"\n")
+        .expect("the script ends with main");
+    let path = env.root.join("hook-lib.sh");
+    std::fs::write(&path, lib).unwrap();
+    path
+}
+
+/// Runs `script` under the test shell with the hook's functions loaded (the EXIT trap off).
+fn with_hook_lib(env: &Env, script: &str, limit: Duration) -> Run {
+    let lib = hook_lib(env);
+    std::fs::create_dir_all(env.alice().join("state")).unwrap();
+    let mut c = env.command(&env.sh());
+    c.arg("-c")
+        .arg(format!(". '{}'\ntrap - EXIT\n{script}", lib.display()));
+    env.run(c, b"", limit)
+}
+
+/// Fix round 2, finding 1: `at` and `pid` are written through a temporary file and `mv`, so a
+/// waiter never reads an empty `at` while a live holder refreshes it (an empty `at` on an old
+/// lock directory would let the age rule break a live lock). A holder refreshes its lock in a
+/// loop while the reader asks whether it may be broken, 500 times.
+#[test]
+fn a_lock_refresh_never_looks_abandoned() {
+    let env = Env::new();
+    let r = with_hook_lib(
+        &env,
+        r#"
+d=$STATE/race.lock
+mkdir "$d"
+lockdir=$d
+printf '%s\n' "$$" >"$d/pid"
+date +%s >"$d/at"
+touch -t 202601010000 "$d"
+( trap - EXIT; while :; do refresh_lock; done ) &
+holder=$!
+sleep 1
+n=0 hit=0
+while [ "$n" -lt 500 ]; do
+  n=$((n + 1))
+  if lock_stale "$d" 1; then hit=$((hit + 1)); fi
+done
+kill "$holder"
+wait "$holder" 2>/dev/null
+printf 'hits %s of %s\n' "$hit" "$n"
+"#,
+        Duration::from_secs(120),
+    );
+    assert!(r.ok(), "{r}");
+    assert!(r.stdout.contains("hits 0 of 500"), "{r}");
+}
+
+/// Fix round 2, finding 3: `bounded` returns as soon as its command ends (under dash the old
+/// watchdog could miss its TERM and hold the caller for the whole limit), leaves no `sleep`
+/// behind, and still ends a command that outlives the limit. Every `sleep` goes through a shim
+/// that records its pid.
+#[test]
+fn bounded_returns_promptly_and_leaves_no_sleep() {
+    let env = Env::new();
+    let pids = env.home.join("sleep-pids");
+    write_mode(
+        &env.bin.join("sleep"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nexec /bin/sleep \"$@\"\n",
+            pids.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
+    let started = Instant::now();
+    let r = with_hook_lib(
+        &env,
+        r#"
+i=0
+while [ "$i" -lt 20 ]; do
+  i=$((i + 1))
+  bounded 3 true || exit 1
+done
+bounded 1 sleep 30
+printf 'rc %s\n' "$?"
+"#,
+        Duration::from_secs(120),
+    );
+    let elapsed = started.elapsed();
+    assert!(r.ok(), "{r}");
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "20 calls of bounded 3 true and one of bounded 1 sleep 30 took {elapsed:?}"
+    );
+    let rc: i32 = r
+        .stdout
+        .trim()
+        .strip_prefix("rc ")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(rc, 0, "the sleep outlived the limit and was ended");
+    // Every sleep (the watchdogs' and the one ended at the limit) is gone within a second.
+    let alive = || -> Vec<i32> {
+        read(&pids)
+            .lines()
+            .map(|l| l.trim().parse().unwrap())
+            // SAFETY: signal 0 only asks whether the process exists.
+            .filter(|&p: &i32| unsafe { libc::kill(p, 0) } == 0)
+            .collect()
+    };
+    let waited = Instant::now();
+    while !alive().is_empty() && waited.elapsed() < Duration::from_millis(1500) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(alive(), Vec::<i32>::new(), "sleeps left behind");
+}
+
+/// Fix round 2, finding 2: a download whose own TERM trap waits on a foreground command (here a
+/// `sleep 60` right after its traps) is ended by KILL two seconds after the smoke run's TERM, so
+/// the check gives up within the 20 s limit plus the grace, and the installed script stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_stuck_in_a_foreground_command_is_killed() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    let old = std::fs::read(env.script()).unwrap();
+    let text = String::from_utf8(old.clone()).unwrap();
+    let traps = "trap 'exit 143' TERM\n";
+    assert!(text.contains(traps));
+    let stuck = with_version(
+        &text.replacen(traps, &format!("{traps}sleep 60\n"), 1),
+        "57c4570c4570",
+    );
+    s.serve_hook_script(Some(script_answer(stuck)));
+    env.make_update_due();
+    let mut sess = Session::new(&env, "stuck-download", &env.root.join("work"));
+    sess.turn(1, "while the download hangs");
+    let started = Instant::now();
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+    let elapsed = started.elapsed();
+    assert_eq!(std::fs::read(env.script()).unwrap(), old, "{}", env.log());
+    assert!(env.log().contains("fails its smoke run"), "{}", env.log());
+    // 20 s, the 2 s grace, a second of the watchdog's granularity, and the worker's own 2 s
+    // sleep and capture.
+    assert!(
+        elapsed < Duration::from_secs(32),
+        "the worker took {elapsed:?}"
+    );
+    assert_eq!(turns_of(&s.tenant("ann").home, &uri("stuck-download")), 1);
+}
+
+/// Fix round 2, finding 4: a corrupt offset or hold in a state file (a leading 0, which dash
+/// reads as octal and aborts on) counts as none: the worker asks the server where to resume
+/// (one 409), logs one line, and captures on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupt_state_offset_resyncs_instead_of_aborting() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let mut sess = Session::new(&env, "corrupt-offset", &env.root.join("work"));
+    stop_once(&env, &mut sess, 1);
+    let len = sess.tr.len();
+    assert_eq!(env.offset(&sess.key()), Some(len));
+    std::fs::write(
+        env.state_file(&sess.key()),
+        format!(
+            "08 {}\nsession corrupt-offset\ncwd {}\nseen {}\nhold 09\n",
+            sess.path.display(),
+            sess.cwd.display(),
+            now_secs()
+        ),
+    )
+    .unwrap();
+    let logged = env.log().lines().count();
+    stop_once(&env, &mut sess, 2);
+    assert_eq!(
+        env.offset(&sess.key()),
+        Some(sess.tr.len()),
+        "{}",
+        env.log()
+    );
+    assert_eq!(turns_of(&t.home, &uri("corrupt-offset")), 2);
+    let log = env.log();
+    let fresh: Vec<&str> = log
+        .lines()
+        .skip(logged)
+        .filter(|l| l.contains("state file"))
+        .collect();
+    assert_eq!(fresh.len(), 1, "{log}");
+}
+
 // ---- Status and uninstall ----
 
 #[tokio::test(flavor = "multi_thread")]

@@ -51,8 +51,8 @@
 #
 # The token leaves the shell only as a curl config line on curl's stdin (curl -q -K -), written
 # by the printf builtin: never in argv, a URL, a child's environment, a log or an error.
-# POSIX sh; needs curl, sed, head, tail, wc, od, ls, sort, cmp, cp, mkdir, mv and date; git, awk
-# and dash are optional.
+# POSIX sh; needs curl, sed, head, tail, wc, od, ls, sort, cmp, cp, mkdir, mktemp, mv, find, touch
+# and date; git, awk and dash are optional.
 # Never run it with set -x: that would print the token.
 
 set -u
@@ -118,6 +118,13 @@ fsize() {
 epoch_ok() {
   case $1 in '' | 0* | *[!0-9]*) return 1 ;; esac
   [ ${#1} -le 11 ]
+}
+
+# Whether $1 is a byte offset that is safe for arithmetic: 0, or 1 to 16 digits with no leading 0
+# (the server's offsets stop at 2^53).
+offset_ok() {
+  case $1 in 0) return 0 ;; '' | 0* | *[!0-9]*) return 1 ;; esac
+  [ ${#1} -le 16 ]
 }
 
 # One line in capture.log, which is kept under 256 KB. Never the token or transcript text.
@@ -378,9 +385,10 @@ brief() {
 # ---- The background worker ----
 
 # Reads state file $1 into s_off s_path s_session s_sub s_cwd s_seen s_hold s_stopped (1 if
-# absent).
+# absent). A corrupt offset counts as 0 (the server then says where to resume) and a corrupt hold
+# as none; s_corrupt names what was dropped.
 read_state() {
-  s_off=0 s_path= s_session= s_sub= s_cwd= s_seen= s_hold= s_stopped=
+  s_off=0 s_path= s_session= s_sub= s_cwd= s_seen= s_hold= s_stopped= s_corrupt=
   [ -f "$1" ] || return 1
   rs_first=1
   while IFS= read -r rs_line || [ -n "$rs_line" ]; do
@@ -399,8 +407,8 @@ read_state() {
       "stopped "*) s_stopped=${rs_line#stopped } ;;
     esac
   done <"$1"
-  case $s_off in '' | *[!0-9]*) s_off=0 ;; esac
-  case $s_hold in *[!0-9]*) s_hold= ;; esac
+  if ! offset_ok "$s_off"; then s_off=0 s_corrupt="its offset"; fi
+  if [ -n "$s_hold" ] && ! offset_ok "$s_hold"; then s_hold= s_corrupt="${s_corrupt:+$s_corrupt and }its hold"; fi
   epoch_ok "$s_seen" || s_seen=
   return 0
 }
@@ -459,6 +467,13 @@ save_state() {
   write_state "$1"
 }
 
+# Writes the line $2 to file $1 in a lock directory: a temporary file beside it, then mv. So a
+# reader never sees `at` or `pid` empty (an empty `at` on an old directory would make a live lock
+# look abandoned), and the directory's mtime moves with every write.
+lock_put() {
+  { printf '%s\n' "$2" >"$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"; } 2>/dev/null || rm -f "$1.tmp.$$" 2>/dev/null
+}
+
 # Takes the lock of state key $1: a directory holding the owner's pid and `at`. A stale lock is
 # moved aside with one atomic mv (only one breaker wins) and then removed. Waits up to $2
 # seconds for a live holder.
@@ -478,8 +493,8 @@ lock() {
     [ "$lk_tries" -le "$2" ] || return 1
     sleep 1
   done
-  printf '%s\n' "$$" >"$lk_dir/pid"
-  date +%s >"$lk_dir/at"
+  lock_put "$lk_dir/pid" "$$"
+  lock_put "$lk_dir/at" "$(date +%s)"
   lockdir=$lk_dir
   return 0
 }
@@ -492,14 +507,14 @@ own_lock() {
 # Shows life at the start of every pass; 1 when the lock is no longer ours.
 refresh_lock() {
   own_lock || return 1
-  date +%s >"$lockdir/at" 2>/dev/null
+  lock_put "$lockdir/at" "$(date +%s)"
   return 0
 }
 
 # Removes the lock only when this process owns it.
 unlock() {
   if own_lock; then
-    rm -f "$lockdir/at" "$lockdir/pid"
+    rm -f "$lockdir/at" "$lockdir/pid" "$lockdir"/*.tmp.* 2>/dev/null
     rmdir "$lockdir" 2>/dev/null
   fi
   lockdir=
@@ -560,6 +575,9 @@ capture_one() {
     return 0
   fi
   read_state "$co_st" || :
+  if [ -n "$s_corrupt" ]; then
+    log "session $3: the state file held a corrupt value ($s_corrupt); asking the server where to resume"
+  fi
   s_session=$3 s_sub=$4 s_path=$5 s_cwd=$6
   if [ -n "$s_stopped" ]; then
     unlock
@@ -933,28 +951,51 @@ verify_script() {
   [ -z "$vs_why" ]
 }
 
-# Runs command "$2" ... in the background with stdin from /dev/null, and kills it after $1
-# seconds (macOS has no timeout command); returns its status, which is not 0 once killed. Its
-# stdout and stderr are bounded's own.
+# Runs command "$2" ... in the background with stdin from /dev/null, and ends it after $1 seconds
+# (macOS has no timeout command): TERM, then KILL 2 s later when TERM did not end it (a script's
+# own TERM trap waits for its foreground command). Returns the command's status, which is not 0
+# once it was ended. Its stdout and stderr are bounded's own. A child the command started may
+# outlive a KILL.
+#
+# The watchdog is a subshell that sleeps one second at a time and writes each sleep's pid into a
+# sentinel file. The caller, once it has reaped the command, stops the watchdog with KILL (a
+# trapped TERM can be lost), kills its current sleep and removes the sentinel. The watchdog
+# signals the command only while the sentinel exists and the command is still there, so it never
+# signals a pid that was reaped and reused. When the caller is killed, the watchdog still ends the
+# command at the limit, then removes the sentinel and exits.
 bounded() {
   bd_limit=$1
   shift
+  bd_flag=$(mktemp "${TMPDIR:-/tmp}/alice-bounded.XXXXXX" 2>/dev/null) || bd_flag=
   "$@" </dev/null &
   bd_pid=$!
   (
-    trap - EXIT
-    bd_sleep=
-    trap 'kill "$bd_sleep" 2>/dev/null; exit 0' TERM
-    sleep "$bd_limit" &
-    bd_sleep=$!
-    wait "$bd_sleep"
-    kill "$bd_pid" 2>/dev/null
+    trap - EXIT HUP INT TERM
+    bd_n=0
+    while { [ -z "$bd_flag" ] || [ -f "$bd_flag" ]; } && kill -0 "$bd_pid" 2>/dev/null; do
+      if [ "$bd_n" -eq "$bd_limit" ]; then
+        kill -TERM "$bd_pid" 2>/dev/null
+      elif [ "$bd_n" -ge $((bd_limit + 2)) ]; then
+        kill -KILL "$bd_pid" 2>/dev/null
+        break
+      fi
+      sleep 1 &
+      if [ -n "$bd_flag" ]; then printf '%s\n' "$!" >"$bd_flag" 2>/dev/null; fi
+      wait "$!"
+      bd_n=$((bd_n + 1))
+    done
+    if [ -n "$bd_flag" ]; then rm -f "$bd_flag"; fi
   ) </dev/null >/dev/null 2>&1 &
   bd_dog=$!
   wait "$bd_pid"
   bd_rc=$?
-  kill "$bd_dog" 2>/dev/null
+  kill -KILL "$bd_dog" 2>/dev/null
   wait "$bd_dog" 2>/dev/null
+  if [ -n "$bd_flag" ]; then
+    bd_tick=$(cat "$bd_flag" 2>/dev/null)
+    case $bd_tick in '' | *[!0-9]*) ;; *) kill -KILL "$bd_tick" 2>/dev/null ;; esac
+    rm -f "$bd_flag"
+  fi
   return "$bd_rc"
 }
 
