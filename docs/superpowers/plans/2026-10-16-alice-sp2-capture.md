@@ -1491,3 +1491,93 @@ doubling to 6 h, and `distill_attempts` increases. After 5 attempts the state is
   Push, and check that CI is green on ubuntu and macOS.
 - [ ] **Step 7: Commit** `docs(sp2): real-session check aggregates (Task 20)`, then hand over for the final whole-branch
   review.
+
+---
+
+## Re-order (controller priority, 2026-10-16)
+
+The owner is now a server tenant, and Alice must replace MemPalace soon. The tenant path comes first.
+
+**New order:** 1–5 (done or in progress) → **6a → 14 → 15** → 9 → 10 → 11 → 12 → 13 → 16 → **6b** → 7 → 8 → 17 → 18 → 19
+→ 20.
+
+Task 6 is split, and parts of Tasks 7 and 14 move.
+
+### Task 6a: The capture pipeline and the transcript service method (from Tasks 6 and 14)
+
+**Files:**
+- `crates/alice-daemon/src/capture.rs`: the pipeline only, `CaptureCtl::apply(input) -> PassReport`.
+- `crates/alice-daemon/src/service.rs`: `capture_transcript`, `capture_status`, `Health.capture`.
+- `crates/alice-core/src/api.rs`: `TranscriptQuery`, `TranscriptAnswer`, `CaptureStatus`, `CaptureSessionRow`, `CaptureHealth`.
+- `crates/alice-daemon/tests/capture_flow.rs`.
+
+**The pipeline** is Task 6's pass steps 3–7, run on given bytes, with the ledger's rulings:
+- tails keyed `tail:<key>`;
+- `force_close` for session-end and stale-end, `close_trailing` for stop/subagent-stop/pre-compact/quiet;
+- a withheld chunk keeps its tag;
+- `capture_verdict` is asked for every identity of the project;
+- `keys_new` is checked;
+- the last storing slice is flagged for the event;
+- the MemPalace rule is a no-op hook until Task 18;
+- in tenant mode at service start, `UPDATE capture_state SET transcript_path = NULL, file_key = NULL`.
+
+**The service method** is Task 14's `capture_transcript`:
+- the offset protocol (409 below the cursor, a counted gap above it);
+- the project from the `X-Alice-Project` header, else the `project` query, as the in-process hint in tenant mode; from `cwd` locally (P8);
+- the `no_capture`/`no_distill` flags.
+
+**Tests** (service-level, no HTTP):
+- **from Task 6:**
+  - `a_continuation_file_skips_copied_turns`;
+  - `subagent_files_are_their_own_sources`, through an upload with `subagent`;
+  - `an_excluded_project_moves_the_cursor_and_records_keys`;
+  - `a_fail_closed_project_waits_and_keeps_the_cursor`;
+  - `block_mode_withholds_a_chunk_and_keeps_capturing`;
+  - `twenty_sessions_at_once_capture_everything_once_beside_remembers` (uploads);
+  - `a_forty_megabyte_transcript_is_captured_in_bounded_passes` (uploads of at most 8 MiB);
+- **from Task 14:**
+  - `an_upload_captures_complete_turns_and_returns_the_cursor`;
+  - `a_lower_offset_gets_409_with_the_cursor`;
+  - `a_resend_from_zero_stores_nothing_twice`;
+  - `a_forward_gap_is_accepted_and_counted`;
+  - `the_server_redacts_and_never_reads_paths`;
+  - `the_project_hint_shares_the_mcp_placeholder` (header and query);
+  - `no_capture_and_no_distill_flags_are_honoured`;
+- **new:** `a_late_tail_is_stored_once_even_after_a_resend`.
+
+### Task 14 (now): the HTTP routes and the emulator tests
+
+**Routes:**
+- `POST /api/v1/capture/transcript`, with its own `DefaultBodyLimit::max(TRANSCRIPT_BODY_LIMIT)`;
+- `GET /api/v1/capture/status`;
+- `GET /api/v1/capture/briefing`, together with `Service::capture_briefing` and `BriefingQuery`, moved here from Task 7.
+
+**Tests** through `support::caddy::Server`:
+- `the_body_limit_is_eight_mebibytes`;
+- `an_adopted_database_is_not_captured_twice`;
+- `the_tenant_briefing_resolves_the_hint`;
+- `the_briefing_route_answers_204_when_off`;
+- an end-to-end upload through the emulator that honours `X-Alice-Project`.
+
+### Task 15: as written, plus the project hint
+
+The project hint is computed as the owner's MCP `headersHelper` does: the basename of `git -C "$cwd" rev-parse --show-toplevel` when that top-level is not `$HOME`, with `"` and `\` removed; outside git, no hint (the project is `global`). It is sent as the header `X-Alice-Project` (through `curl -K -` lines, never argv) on the transcript and briefing calls. The token and URL come from `~/.config/alice/{token,url}`, per the amendment.
+
+### Task 6b (before Task 7): local capture, reusing 6a's pipeline
+
+**What it adds:**
+- the notify endpoint and the worker thread;
+- file reading, `file_key`, and streaming past an oversized line with a stub;
+- settle, sweep and stale end (local);
+- `SpoolEntry::CaptureNotify`.
+
+**Tests:** the rest of Task 6's list: `a_stop_notify_captures_the_completed_turn`, `repeating_the_notify_stores_nothing_new`,
+`a_kill_between_slices_neither_loses_nor_doubles`, `a_replaced_file_resets_and_skips_stored_turns`,
+`the_trailing_turn_is_closed_by_the_quiet_sweep`, `a_stale_session_is_ended_by_the_sweep`,
+`a_spooled_notify_is_drained_into_a_pass` and `the_tenant_daemon_refuses_notify_and_reads_no_files`.
+
+### Other moves
+
+- **Task 7** loses the briefing route and service method (now in Task 14). It keeps the hook client that calls them.
+- **Task 12** also marks capture sources with no capture for 24 hours as ended (for tenants, which have no sweep) and makes
+  them due.
