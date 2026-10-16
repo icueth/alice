@@ -121,7 +121,18 @@ pub struct ReadOutcome {
     /// back) is not stored twice. Set even when the tail rendered no chunk.
     pub tail_key: Option<String>,
     /// Bytes of the input that are done: up to the start of the first incomplete turn, or to the
-    /// end of the last complete line. Always 0 or just after a `\n`.
+    /// end of the last complete line. 0 or just after a `\n`, with one exception: a Codex pass
+    /// at the file start that begins with the zstd magic (a `.jsonl.zst` rollout, R21) consumes
+    /// the whole pass, because a compressed file has no line structure and the only way to
+    /// "count, not read" it, without offering it again on every event, is to consume it.
+    ///
+    /// The skip covers the first pass only, and a pass is at most [`MAX_PASS_BYTES`]. A zst
+    /// file longer than that has its first 8 MiB skipped; a later pass (`at_file_start` false)
+    /// no longer sees the magic, reads the rest as binary "lines", counts each in
+    /// `stats.invalid`, and offers the bytes after the last `\n` again. So a caller must not
+    /// send a `*.zst` file at all: the tenant script skips it by name (`hook.sh`), and Task 6b's
+    /// local worker and its `find_rollout` must skip `*.zst` by file name before reading. The
+    /// magic check here is only a backstop at offset 0.
     pub consumed: u64,
     /// The input is a whole pass (`MAX_PASS_BYTES`) without a single `\n`: one line is longer
     /// than a pass, and the caller must skip it.
@@ -191,7 +202,9 @@ pub fn turn_key(first_uuid: Option<&str>, timestamp: Option<&str>, first_text: &
 }
 
 /// Reads one pass of a transcript. `input` holds the file's bytes from the cursor; only its first
-/// [`MAX_PASS_BYTES`] are read, and only complete lines (ending in `\n`) are used.
+/// [`MAX_PASS_BYTES`] are read, and only complete lines (ending in `\n`) are used. The one
+/// exception is a Codex zstd rollout at the file start, which is consumed whole (see
+/// [`ReadOutcome::consumed`], which also states the limit of that skip).
 pub fn read(agent: AgentKind, input: &[u8], opts: &ReadOptions) -> ReadOutcome {
     let mut out = ReadOutcome::default();
     let parse: fn(&[u8]) -> claude::LineResult = match agent {
@@ -774,10 +787,16 @@ mod tests {
     }
 
     #[test]
-    fn codex_reads_nothing_until_its_reader_exists() {
+    fn the_codex_reader_takes_nothing_from_a_claude_transcript() {
         let out = read(AgentKind::Codex, TURNS, &opts(true, true));
         assert!(out.turns.is_empty() && out.tail.is_empty());
         assert_eq!(out.consumed, 0);
+        assert!(out.stats.lines > 0);
+        assert_eq!(
+            out.stats.unknown, out.stats.lines,
+            "every Claude line is unknown to the Codex reader: {:?}",
+            out.stats
+        );
     }
 
     #[test]
@@ -1347,7 +1366,7 @@ mod tests {
         let out = read(CODEX, &input, &opts(true, true));
         assert_eq!(out.turns.len(), 1);
         assert_eq!(out.stats.invalid, 3);
-        assert!(out.stats.unknown >= 4, "{:?}", out.stats);
+        assert_eq!(out.stats.unknown, 6, "{:?}", out.stats);
         assert_eq!(turn_text(&out.turns[0]), "[user] Hello there.");
     }
 
@@ -1412,5 +1431,11 @@ mod tests {
             },
         );
         assert!(later.turns.is_empty());
+        // ... each counted as it is (two bad lines and one valid-JSON line of no known shape),
+        // and the bytes after the last `\n` are left to be read again.
+        assert_eq!(later.stats.lines, 4, "{:?}", later.stats);
+        assert_eq!(later.stats.invalid, 3, "{:?}", later.stats);
+        assert_eq!(later.stats.unknown, 1, "{:?}", later.stats);
+        assert!(later.consumed < zst.len() as u64);
     }
 }
