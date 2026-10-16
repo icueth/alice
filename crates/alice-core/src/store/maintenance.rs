@@ -108,18 +108,23 @@ pub fn oldest_chunks(conn: &Connection, limit: usize) -> Result<Vec<(i64, u64)>>
         .collect::<std::result::Result<_, _>>()?)
 }
 
+const CAPTURE_CHUNKS_OLDER_THAN: &str =
+    "SELECT c.seq FROM chunks c JOIN capture_state s ON s.source_id = c.source_id
+     WHERE c.created_at < ?1 AND c.created_at >= (SELECT min(created_at) FROM capture_state)
+     ORDER BY c.created_at, c.seq LIMIT ?2";
+
 /// [`chunks_older_than`] over the chunks of capture sources only (sources with a
 /// `capture_state` row): what `capture.raw_retention` ages out. Walks the `chunks_created`
-/// index and looks each chunk's source up in `capture_state`.
+/// index from the first capture on and looks each chunk's source up in `capture_state`. No
+/// capture chunk is older than the oldest state (capture stamps a source's state before it
+/// stores the first chunk, and states are kept, SP2 R11), so the chunks of an import stored
+/// before capture began are never read.
 pub fn capture_chunks_older_than(
     conn: &Connection,
     cutoff: &str,
     limit: usize,
 ) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT c.seq FROM chunks c JOIN capture_state s ON s.source_id = c.source_id
-         WHERE c.created_at < ?1 ORDER BY c.created_at, c.seq LIMIT ?2",
-    )?;
+    let mut stmt = conn.prepare_cached(CAPTURE_CHUNKS_OLDER_THAN)?;
     Ok(stmt
         .query_map(params![cutoff, limit as i64], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?)
@@ -525,6 +530,67 @@ mod tests {
     /// I-1: what a chunk says about when it was written never makes it old. An import authored
     /// in 2020 and stored today survives a 90-day retention, and `authored_at` values that sort
     /// as "old" text (an epoch, an empty string, a US date) change nothing.
+    /// The capture age query reads the `chunks_created` index from the first capture on (the
+    /// oldest `capture_state.created_at`), never through the older chunks of an import; a captured
+    /// chunk as old as the first state is still found.
+    #[test]
+    fn the_capture_age_query_reads_from_the_first_capture_on() {
+        let (_d, c, p) = setup();
+        let mut st = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {CAPTURE_CHUNKS_OLDER_THAN}"))
+            .unwrap();
+        let unbound = std::iter::repeat_n("x", st.parameter_count());
+        let plan = st
+            .query_map(rusqlite::params_from_iter(unbound), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(|step| step.unwrap())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            plan.contains("USING INDEX chunks_created (created_at>? AND created_at<?)"),
+            "{plan}"
+        );
+        for (id, uri) in [
+            ("IMP", "file:///h/imported.jsonl"),
+            ("CAP", "claude-code:session:s1"),
+        ] {
+            c.execute(
+                "INSERT INTO sources (id, project_id, type, uri, created_at)
+                 VALUES (?1, ?2, 'session', ?3, '2026-01-01T00:00:00.000Z')",
+                params![id, p.id, uri],
+            )
+            .unwrap();
+        }
+        c.execute(
+            "INSERT INTO capture_state (source_id, agent, session_id, created_at)
+             VALUES ('CAP', 'claude-code', 's1', '2026-03-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        for (id, source, ord, created) in [
+            ("I0", "IMP", 0, "2026-01-15T00:00:00.000Z"),
+            ("C0", "CAP", 0, "2026-03-01T00:00:00.000Z"),
+            ("C1", "CAP", 1, "2026-05-01T00:00:00.000Z"),
+        ] {
+            c.execute(
+                "INSERT INTO chunks (id, source_id, project_id, ord, text, content_hash, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'turn', ?1, ?5)",
+                params![id, source, p.id, ord, created],
+            )
+            .unwrap();
+        }
+        let seq_of = |id: &str| -> i64 {
+            c.query_row("SELECT seq FROM chunks WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            capture_chunks_older_than(&c, "2026-04-01T00:00:00.000Z", 10).unwrap(),
+            [seq_of("C0")]
+        );
+    }
+
     #[test]
     fn age_retention_counts_the_time_stored_not_the_time_authored() {
         let (_d, c, p) = setup();
