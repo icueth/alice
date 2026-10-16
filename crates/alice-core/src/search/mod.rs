@@ -8,7 +8,7 @@ pub mod stopwords;
 use crate::api::{Hit, MatchVia, RelatedRef, Tier};
 use crate::embed::Embedder;
 use crate::error::{AliceError, Result};
-use crate::model::{Kind, Memory, Status, limits};
+use crate::model::{Kind, Memory, Origin, Status, limits};
 use crate::normalize::{nfc, normalize_topic};
 use crate::store::embeddings::{self, VecKey};
 use crate::store::projects::GLOBAL_ID;
@@ -463,6 +463,7 @@ impl Scored {
                 snippet: pack::make_snippet(&m.body, terms, SNIPPET_CHARS),
                 status: (m.status != Status::Active && m.status != Status::Pending)
                     .then_some(m.status),
+                origin: (m.origin == Origin::Distill).then(|| m.origin.as_str().to_string()),
                 id: m.id,
                 tier: Tier::Knowledge,
                 kind: Some(m.kind),
@@ -495,6 +496,7 @@ impl Scored {
                     source: None,
                     author: None,
                     cloud_ok: None,
+                    origin: None,
                 }
             }
         }
@@ -763,7 +765,8 @@ struct Filters<'a> {
 }
 
 impl Filters<'_> {
-    /// Fetch the rows, drop trashed and filtered-out items, apply boosts; best first.
+    /// Fetch the rows, drop trashed, unjudged distilled and filtered-out items, apply boosts;
+    /// best first.
     fn score(
         &self,
         conn: &Connection,
@@ -805,8 +808,10 @@ impl Filters<'_> {
                 similarity: s.similarity,
             });
         };
-        for (seq, m) in memories::get_by_seqs(conn, &mem_seqs)? {
-            if m.status == Status::Trashed {
+        let found = memories::get_by_seqs(conn, &mem_seqs)?;
+        let unjudged = unjudged_distilled(conn, &found)?;
+        for (seq, m) in found {
+            if m.status == Status::Trashed || unjudged.contains(&seq) {
                 continue;
             }
             let project_id = id_by_slug.get(m.project.as_str()).copied().unwrap_or("");
@@ -896,6 +901,30 @@ impl Filters<'_> {
     }
 }
 
+/// The seqs among `found` of distilled memories whose judge stage is not over: a recall skips
+/// them until it is, so a near-copy of an explicit memory never shows twice while the judge
+/// works or is unreachable (SP2 spec §6.6). Read only when one of them is distilled, one query
+/// per batch of seqs (as `memories::get_by_seqs` reads them).
+fn unjudged_distilled(conn: &Connection, found: &[(i64, Memory)]) -> Result<HashSet<i64>> {
+    let distilled: Vec<i64> = found
+        .iter()
+        .filter(|(_, m)| m.origin == Origin::Distill)
+        .map(|(s, _)| *s)
+        .collect();
+    let mut out = HashSet::new();
+    for batch in distilled.chunks(memories::IN_BATCH) {
+        let sql = format!(
+            "SELECT seq FROM memories WHERE judge_state <> 'done' AND seq IN ({})",
+            vec!["?"; batch.len()].join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        for seq in stmt.query_map(rusqlite::params_from_iter(batch), |r| r.get(0))? {
+            out.insert(seq?);
+        }
+    }
+    Ok(out)
+}
+
 fn project_slugs(conn: &Connection) -> Result<HashMap<String, String>> {
     let mut stmt = conn.prepare_cached("SELECT id, slug FROM projects")?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -907,7 +936,8 @@ fn related_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, Strin
 }
 
 /// Up to five memories one hop from the top three results, through links or shared entities.
-/// Results themselves and trashed memories are left out.
+/// Results themselves, trashed memories and distilled ones the judge has not finished (SP2 spec
+/// §6.6) are left out.
 pub fn related_for(conn: &Connection, ids: &[String]) -> Result<Vec<RelatedRef>> {
     let exclude: HashSet<&String> = ids.iter().collect();
     let mut out: Vec<RelatedRef> = Vec::new();
@@ -928,6 +958,7 @@ pub fn related_for(conn: &Connection, ids: &[String]) -> Result<Vec<RelatedRef>>
             "SELECT m.id, m.kind, m.title, l.type FROM links l
              JOIN memories m ON m.id = CASE WHEN l.from_id = ?1 THEN l.to_id ELSE l.from_id END
              WHERE (l.from_id = ?1 OR l.to_id = ?1) AND m.status <> 'trashed'
+               AND NOT (m.origin = 'distill' AND m.judge_state <> 'done')
              ORDER BY l.created_at DESC LIMIT 5",
         )?;
         for r in stmt.query_map([id], related_row)? {
@@ -938,6 +969,7 @@ pub fn related_for(conn: &Connection, ids: &[String]) -> Result<Vec<RelatedRef>>
              JOIN mentions b ON a.entity_id = b.entity_id AND b.memory_id <> a.memory_id
              JOIN memories m ON m.id = b.memory_id JOIN entities e ON e.id = a.entity_id
              WHERE a.memory_id = ?1 AND m.status <> 'trashed'
+               AND NOT (m.origin = 'distill' AND m.judge_state <> 'done')
              ORDER BY m.importance DESC, m.updated_at DESC LIMIT 5",
         )?;
         for r in stmt.query_map([id], related_row)? {
@@ -1311,6 +1343,65 @@ mod tests {
             assert!(!out.raw_fallback);
             assert!(out.hits.iter().all(|h| h.tier == Tier::Knowledge));
         }
+    }
+
+    /// SP2 spec §6.6: a distilled memory is found only once its judge stage is over, and then
+    /// says what it is: `origin: "distill"` in JSON, ` (auto)` in text. An explicit hit carries
+    /// no origin at all.
+    #[test]
+    fn recall_json_marks_distilled_hits() {
+        let f = fx();
+        let (agent, _) = f.add(&f.app, Kind::Fact, "the billing worker retries webhooks");
+        let (auto, auto_seq) = f.add_input(
+            &f.app,
+            memories::NewMemoryInput {
+                content: "the billing worker retries webhooks five times".into(),
+                kind: Some(Kind::Fact),
+                origin: Origin::Distill,
+                ..Default::default()
+            },
+        );
+        let p = f.params("billing worker webhooks");
+        for state in ["pending", "retry"] {
+            f.c.execute(
+                "UPDATE memories SET judge_state = ?1 WHERE seq = ?2",
+                rusqlite::params![state, auto_seq],
+            )
+            .unwrap();
+            let out = f.search(&p);
+            let ids: Vec<&str> = out.hits.iter().map(|h| h.id.as_str()).collect();
+            assert_eq!(ids, [agent.as_str()], "{state}");
+            assert!(out.near.iter().all(|n| n.hit.id != auto), "{state}");
+        }
+        f.c.execute(
+            "UPDATE memories SET judge_state = 'done' WHERE seq = ?1",
+            [auto_seq],
+        )
+        .unwrap();
+        let out = f.search(&p);
+        let hit = |id: &str| out.hits.iter().find(|h| h.id == id).unwrap();
+        assert_eq!(hit(&auto).origin.as_deref(), Some("distill"));
+        assert_eq!(hit(&agent).origin, None);
+        let json = serde_json::to_value(pack::pack_json(out.clone(), None, 10_000)).unwrap();
+        let by_id = |id: &str| {
+            json["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id(&auto)["origin"], "distill");
+        assert!(by_id(&agent).get("origin").is_none(), "{json}");
+        let (text, _) = pack::pack_text(&out, Some("app"), 1_500);
+        let header = |id: &str| {
+            text.lines()
+                .find(|l| l.contains(id) && l.contains(" · matched: "))
+                .unwrap_or_else(|| panic!("no header for {id}:\n{text}"))
+        };
+        assert!(header(&auto).ends_with(" (auto)"), "{text}");
+        assert!(!header(&agent).contains("(auto)"), "{text}");
     }
 
     #[test]
@@ -2076,6 +2167,64 @@ mod tests {
             .expect("shared entity");
         assert_eq!(rel.via, "entity:Easypanel");
         assert_eq!(rel.kind, Kind::Warning);
+    }
+
+    /// SP2 spec §6.6: a distilled memory the judge has not finished is not offered as related
+    /// either, through a link or through a shared entity; once judged it is.
+    #[test]
+    fn related_lists_a_distilled_memory_only_once_judged() {
+        let f = fx();
+        let (hit, _) = f.add(&f.app, Kind::Fact, "deploys go to easypanel");
+        let distilled = |text: &str| {
+            f.add_input(
+                &f.app,
+                memories::NewMemoryInput {
+                    content: text.into(),
+                    kind: Some(Kind::Warning),
+                    origin: Origin::Distill,
+                    ..Default::default()
+                },
+            )
+        };
+        // Linked to the hit, and sharing an entity with it.
+        let (linked, linked_seq) = distilled("rotate the panel token monthly");
+        memories::link(&f.c, &linked, &hit, "relates_to", "t").unwrap();
+        let (mentioned, mentioned_seq) = distilled("the staging host restarts nightly");
+        f.c.execute(
+            "INSERT INTO entities (id, name, created_at) VALUES ('E1', 'Easypanel', '2026-10-13T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        for id in [&hit, &mentioned] {
+            f.c.execute(
+                "INSERT INTO mentions (memory_id, entity_id) VALUES (?1, 'E1')",
+                [id],
+            )
+            .unwrap();
+        }
+        let related = || -> Vec<(String, String)> {
+            let out = f.search(&f.params("deploys"));
+            assert_eq!(out.hits.len(), 1, "{:?}", out.hits);
+            out.related.into_iter().map(|r| (r.id, r.via)).collect()
+        };
+        let judged = |seq: i64| {
+            f.c.execute(
+                "UPDATE memories SET judge_state = 'done' WHERE seq = ?1",
+                [seq],
+            )
+            .unwrap();
+        };
+        assert!(related().is_empty(), "{:?}", related());
+        judged(linked_seq);
+        assert_eq!(related(), [(linked.clone(), "relates_to".to_string())]);
+        judged(mentioned_seq);
+        assert_eq!(
+            related(),
+            [
+                (linked, "relates_to".to_string()),
+                (mentioned, "entity:Easypanel".to_string())
+            ]
+        );
     }
 
     // ------------------------------------------------------------------ relevance policy

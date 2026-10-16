@@ -2259,6 +2259,8 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
         }
     }
     let mut reviews = j.reviews.clone();
+    // A distilled memory never asks a person (SP2 spec §6.6).
+    let distilled_newcomer = is_distilled(conn, j.seq)?;
     // The comparisons were made in the project the memory has left.
     let actions: &[JudgeAction] = if moved { &[] } else { &j.actions };
     if moved {
@@ -2272,12 +2274,16 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
             JudgeAction::DuplicateOf { survivor, .. } => survivor,
             JudgeAction::Supersedes { old, .. } => old,
             JudgeAction::Contradicts { other, .. } => other,
+            JudgeAction::RelatesTo { other, .. } => other,
+            JudgeAction::ReplaceDistilled { distilled, .. } => distilled,
         };
         match target_state(conn, &j.seen, target)? {
             Target::Unchanged => {}
             Target::Edited => {
-                // Edited since it was judged: ask instead of acting.
-                if let Some(r) = alice_core::judge::pipeline::as_review(&j.id, a, &j.provider) {
+                // Edited since it was judged: ask instead of acting (a distilled memory drops it).
+                if !distilled_newcomer
+                    && let Some(r) = alice_core::judge::pipeline::as_review(&j.id, a, &j.provider)
+                {
                     reviews.push(r);
                 }
                 continue;
@@ -2321,6 +2327,37 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
                         group: Some(&group),
                     },
                 )?;
+            }
+            JudgeAction::RelatesTo { other, .. } => {
+                let before = snap(conn, &j.id)?;
+                memories::link(conn, &j.id, other, "relates_to", &actor.as_string())?;
+                record(
+                    conn,
+                    st,
+                    EventInput {
+                        actor: &actor,
+                        action: "memory.link",
+                        target_type: "memory",
+                        target_id: &j.id,
+                        before,
+                        after: snap(conn, &j.id)?,
+                        group: Some(&group),
+                    },
+                )?;
+            }
+            // The new memory survives its older distilled duplicate.
+            JudgeAction::ReplaceDistilled { distilled, .. } => {
+                match merge(
+                    conn,
+                    st,
+                    &j.id,
+                    std::slice::from_ref(distilled),
+                    &actor,
+                    Some(&group),
+                ) {
+                    Ok(_) | Err(AliceError::Invalid(_) | AliceError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
     }
@@ -2392,6 +2429,18 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
         )?;
     }
     Ok(WriteOutcome::Done)
+}
+
+/// Whether the memory was distilled from a captured session (SP2 spec §6.5).
+fn is_distilled(conn: &Connection, seq: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT origin = ?1 FROM memories WHERE seq = ?2",
+            rusqlite::params![Origin::Distill.as_str(), seq],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// Pending -> active, and record entity mentions.
@@ -4979,6 +5028,150 @@ mod tests {
         );
     }
 
+    /// SP2 spec §6.6: a distilled newcomer never asks a person. An action whose target changed
+    /// after the judge read it is dropped, not turned into a review item.
+    #[test]
+    fn a_stale_target_of_a_distilled_newcomer_is_dropped() {
+        let f = fixture();
+        let (old, old_seq) = new_id(
+            f.h.submit_blocking(remember("Staging Postgres listens on port 5432"))
+                .unwrap(),
+        );
+        judged(&f, &old, old_seq);
+        let (auto, _) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "Staging Postgres now listens on 5433".into(),
+                    origin: Origin::Distill,
+                    ..Default::default()
+                },
+                project: ProjectChoice::Slug("global".into()),
+            })
+            .unwrap(),
+        );
+        let old_hash = hash_of(&f, &old);
+        // The old memory is edited after the judge read it.
+        f.h.submit_blocking(WriteOp::Update {
+            id: old.clone(),
+            update: MemoryUpdate {
+                body: Some("Staging Postgres listens on 6543".into()),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        let links = |id: &str| -> i64 {
+            f.read(
+                "SELECT count(*) FROM links WHERE from_id = ?1 OR to_id = ?1",
+                [id],
+            )
+        };
+        let before = links(&old);
+        apply_j(
+            &f,
+            Judgement {
+                actions: vec![
+                    JudgeAction::Supersedes {
+                        old: old.clone(),
+                        p: 0.95,
+                    },
+                    JudgeAction::RelatesTo {
+                        other: old.clone(),
+                        p: 0.9,
+                    },
+                    JudgeAction::Contradicts {
+                        other: old.clone(),
+                        p: 0.9,
+                    },
+                    JudgeAction::DuplicateOf {
+                        survivor: old.clone(),
+                        p: 0.95,
+                    },
+                ],
+                seen: vec![(old.clone(), old_hash)],
+                ..judgement(&f, &auto, "jev")
+            },
+        );
+        let reviews: i64 = f.read("SELECT count(*) FROM review_items", []);
+        assert_eq!(reviews, 0, "a distilled newcomer never asks");
+        assert_eq!(links(&old), before, "nothing applied on stale information");
+        assert_eq!(status_of(&f, &old), "active");
+        assert_eq!(status_of(&f, &auto), "active");
+        assert_eq!(judge_state_of(&f, &auto).0, "done", "judged all the same");
+    }
+
+    /// SP2 spec §6.6, R4: an explicit newcomer's replacement of a distilled duplicate that
+    /// changed after the judge read it is not applied; it becomes the merge question, with the
+    /// explicit newcomer as the survivor.
+    #[test]
+    fn a_stale_distilled_duplicate_of_an_explicit_newcomer_is_asked_about() {
+        let f = fixture();
+        let (auto, auto_seq) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "Staging Postgres listens on port 5432".into(),
+                    origin: Origin::Distill,
+                    ..Default::default()
+                },
+                project: ProjectChoice::Slug("global".into()),
+            })
+            .unwrap(),
+        );
+        judged(&f, &auto, auto_seq);
+        let (mine, _) = new_id(
+            f.h.submit_blocking(remember("The staging Postgres server listens on 5432"))
+                .unwrap(),
+        );
+        let auto_hash = hash_of(&f, &auto);
+        // The distilled memory is edited after the judge read it.
+        f.h.submit_blocking(WriteOp::Update {
+            id: auto.clone(),
+            update: MemoryUpdate {
+                body: Some("Staging Postgres listens on port 6543".into()),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        apply_j(
+            &f,
+            Judgement {
+                actions: vec![JudgeAction::ReplaceDistilled {
+                    distilled: auto.clone(),
+                    p: 0.95,
+                }],
+                seen: vec![(auto.clone(), auto_hash)],
+                ..judgement(&f, &mine, "jev")
+            },
+        );
+        assert_eq!(
+            status_of(&f, &auto),
+            "active",
+            "not merged on stale information"
+        );
+        let merged: i64 = f.read(
+            "SELECT count(*) FROM links WHERE type = 'duplicate_of' AND from_id = ?1",
+            [&auto],
+        );
+        assert_eq!(merged, 0);
+        assert_eq!(status_of(&f, &mine), "active");
+        let n: i64 = f.read("SELECT count(*) FROM review_items", []);
+        assert_eq!(n, 1);
+        let (kind, payload): (String, String) = {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.query_row(
+                "SELECT type, payload_json FROM review_items WHERE status = 'open'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(kind, "merge");
+        assert_eq!(payload["survivor"], mine.as_str(), "{payload}");
+        assert_eq!(payload["others"], serde_json::json!([auto]), "{payload}");
+    }
+
     #[test]
     fn a_judgement_is_one_group_of_events_by_the_judge_and_activates_the_memory() {
         let f = fixture();
@@ -5104,6 +5297,7 @@ mod tests {
                 similarity: None,
                 raw: false,
                 status: None,
+                origin: Origin::Agent,
             },
             &[alice_core::judge::Relation {
                 existing_id: a.clone(),
@@ -5112,6 +5306,7 @@ mod tests {
                     ("unrelated".to_string(), 0.1),
                 ]),
                 agreement: None,
+                existing_origin: Origin::Agent,
             }],
             &alice_core::judge::pipeline::Thresholds {
                 auto: 0.85,
@@ -6933,10 +7128,11 @@ mod tests {
         assert_eq!(actor, "user");
     }
 
-    /// SP2 spec §3.5: retention deletes a source with its last chunk and its capture state goes
-    /// with it (`ON DELETE CASCADE`), but the turn keys stay, so the file is not captured again.
+    /// SP2 spec §3.9 and R11: retention that deletes a capture source's last chunk keeps the
+    /// source with its capture state (the cursor) and its turn keys, so the file is not captured
+    /// again and the importer still skips the session.
     #[test]
-    fn deleting_a_sources_chunks_cascades_its_state_but_keeps_turn_keys() {
+    fn deleting_a_sources_chunks_keeps_its_state_and_turn_keys() {
         let f = fixture();
         let mut s = capture_slice("S1", global(), 0..2);
         s.turn_keys = vec![("u-1".into(), 0), ("u-2".into(), 1)];
@@ -6961,15 +7157,15 @@ mod tests {
         assert!(
             capture_store::by_uri(&c, &capture_uri("S1"))
                 .unwrap()
-                .is_none()
+                .is_some()
         );
         let states: i64 = f.read(
             "SELECT count(*) FROM capture_state WHERE source_id = ?1",
             [&source_id],
         );
-        assert_eq!(states, 0, "the state goes with its source");
+        assert_eq!(states, 1, "the state stays with its emptied source");
         let sources: i64 = f.read("SELECT count(*) FROM sources WHERE id = ?1", [&source_id]);
-        assert_eq!(sources, 0);
+        assert_eq!(sources, 1);
         assert_eq!(known(&c, &["u-1", "u-2"]), known_set(&["u-1", "u-2"]));
     }
 

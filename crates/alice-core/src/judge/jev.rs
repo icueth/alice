@@ -1160,6 +1160,7 @@ impl Judge for JevJudge {
                     existing_id: e.id.clone(),
                     probs: Distribution::average(&fwd, &rev),
                     agreement,
+                    existing_origin: crate::model::Origin::default(),
                 }
             })
             .collect())
@@ -1326,6 +1327,7 @@ pub mod scenarios {
             similarity: None,
             raw: false,
             status: None,
+            origin: Default::default(),
         }
     }
 

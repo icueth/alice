@@ -442,7 +442,7 @@ pub fn get_many(conn: &Connection, ids: &[String]) -> Result<Vec<Memory>> {
 }
 
 /// Bound parameters per `IN (...)` query, well under SQLite's limit of 32,766.
-const IN_BATCH: usize = 4_096;
+pub(crate) const IN_BATCH: usize = 4_096;
 
 /// Fetch by internal sequence numbers (search results). Order follows the input (first
 /// occurrence); unknown seqs are skipped. A recall passes up to ~2,000 seqs here, so the rows

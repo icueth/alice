@@ -1,0 +1,566 @@
+{
+  "sessions": [
+    {
+      "file": "s01.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "stored in grams as integers",
+          "kinds": [
+            "fact",
+            "preference"
+          ]
+        },
+        {
+          "phrase": "lock the stock row with SELECT FOR UPDATE",
+          "kinds": [
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "Running alembic downgrade on staging is destructive",
+          "kinds": [
+            "warning"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s02.jsonl",
+      "kind": "nothing",
+      "gold": []
+    },
+    {
+      "file": "s03.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "ราคาทุกตัวให้เก็บเป็นสตางค์แบบ integer",
+          "kinds": [
+            "preference",
+            "decision"
+          ]
+        },
+        {
+          "phrase": "amount ใน payload ของ PromptPay ต้องไม่มี comma",
+          "kinds": [
+            "bugfix",
+            "warning"
+          ]
+        },
+        {
+          "phrase": "pnpm test:e2e --project=th-TH",
+          "kinds": [
+            "howto"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s04.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "pin the runner to macos-15",
+          "kinds": [
+            "decision"
+          ]
+        },
+        {
+          "phrase": "call setup_ci before match",
+          "kinds": [
+            "bugfix",
+            "howto"
+          ]
+        },
+        {
+          "phrase": "never upload a build without running bump_build_number",
+          "kinds": [
+            "warning",
+            "howto"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s05.jsonl",
+      "kind": "already",
+      "gold": [
+        {
+          "phrase": "rust_decimal for parcel weights instead of f64",
+          "kinds": [
+            "decision",
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "cargo xtask gen-carrier",
+          "kinds": [
+            "howto"
+          ]
+        },
+        {
+          "phrase": "sandbox resets every night at 02:00 UTC",
+          "kinds": [
+            "warning",
+            "fact"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s06.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "watch the directory and reopen on CREATE",
+          "kinds": [
+            "bugfix",
+            "warning"
+          ]
+        },
+        {
+          "phrase": "I want table-driven tests in Go, no testify suites",
+          "kinds": [
+            "preference"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s07.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "dayjs.tz(input, 'Asia/Bangkok')",
+          "kinds": [
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "จะไม่เก็บเลขบัตรประชาชนคนไข้ลง database",
+          "kinds": [
+            "decision",
+            "preference"
+          ]
+        },
+        {
+          "phrase": "reply token ใช้ได้ครั้งเดียว",
+          "kinds": [
+            "warning",
+            "fact"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s08.jsonl",
+      "kind": "nothing",
+      "gold": []
+    },
+    {
+      "file": "s09.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "filter object keys to *.csv.gz",
+          "kinds": [
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "dedupe key now includes business_date",
+          "kinds": [
+            "decision",
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "python -m orchard.backfill --date YYYY-MM-DD --dry-run",
+          "kinds": [
+            "howto"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s10.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "write commit messages in the imperative mood",
+          "kinds": [
+            "preference"
+          ]
+        },
+        {
+          "phrase": "idempotent by file checksum",
+          "kinds": [
+            "fact"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s11.jsonl",
+      "kind": "already",
+      "gold": [
+        {
+          "phrase": "ตอบผมเป็นภาษาไทยเสมอ",
+          "kinds": [
+            "preference"
+          ]
+        },
+        {
+          "phrase": "แปลงเวลาเป็นนาทีนับจากเที่ยงคืนด้วย toMinutes()",
+          "kinds": [
+            "bugfix"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s12.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "keyed by file mtime",
+          "kinds": [
+            "warning",
+            "fact"
+          ]
+        },
+        {
+          "phrase": "use markdown-it-container for admonitions",
+          "kinds": [
+            "decision"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s13.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "ใบกำกับภาษีทุกใบต้องแสดงปีเป็น พ.ศ.",
+          "kinds": [
+            "preference",
+            "decision"
+          ]
+        },
+        {
+          "phrase": "บวก 543 ซ้ำสองรอบ",
+          "kinds": [
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "go run ./cmd/etax --sample",
+          "kinds": [
+            "howto"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s14.jsonl",
+      "kind": "nothing",
+      "gold": []
+    },
+    {
+      "file": "s15.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "track presence by user_id, not by socket id",
+          "kinds": [
+            "bugfix",
+            "decision"
+          ]
+        },
+        {
+          "phrase": "Typing events go through PubSub only",
+          "kinds": [
+            "warning",
+            "decision",
+            "bugfix"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s16.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "ignore_changes = [engine_version]",
+          "kinds": [
+            "bugfix",
+            "howto"
+          ]
+        },
+        {
+          "phrase": "separate backends instead of workspaces",
+          "kinds": [
+            "decision"
+          ]
+        },
+        {
+          "phrase": "Prod applies run from CI only",
+          "kinds": [
+            "warning",
+            "fact"
+          ]
+        },
+        {
+          "phrase": "terraform force-unlock <LOCK_ID>",
+          "kinds": [
+            "howto"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s17.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "ใบอนุโมทนาบัตรที่เป็น PDF ต้องใช้เลขอารบิกเสมอ",
+          "kinds": [
+            "preference",
+            "decision"
+          ]
+        },
+        {
+          "phrase": "ฝังฟอนต์ Sarabun ลงใน PDF",
+          "kinds": [
+            "bugfix",
+            "howto"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s18.jsonl",
+      "kind": "already",
+      "gold": [
+        {
+          "phrase": "never run anything that writes to the production warehouse",
+          "kinds": [
+            "preference",
+            "warning"
+          ]
+        },
+        {
+          "phrase": "nightly run moved to 03:30",
+          "kinds": [
+            "decision"
+          ]
+        },
+        {
+          "phrase": "partitioned by business_date",
+          "kinds": [
+            "fact",
+            "warning"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s19.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "the unaccent extension must be installed",
+          "kinds": [
+            "fact",
+            "warning"
+          ]
+        },
+        {
+          "phrase": "select_related('author')",
+          "kinds": [
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "manage.py shell_plus --print-sql",
+          "kinds": [
+            "howto"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s20.jsonl",
+      "kind": "nothing",
+      "gold": []
+    },
+    {
+      "file": "s21.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "ไม่เกินค่า sso.wage_ceiling",
+          "kinds": [
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "ปรับส่วนต่างในเดือนธันวาคมครั้งเดียว",
+          "kinds": [
+            "decision"
+          ]
+        },
+        {
+          "phrase": "ยังเหลือ export ไฟล์ สปส. 1-10",
+          "kinds": [
+            "handoff"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s22.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "gRPC between the router and the label service",
+          "kinds": [
+            "decision"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s23.jsonl",
+      "kind": "nothing",
+      "gold": []
+    },
+    {
+      "file": "s24.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "pnpm harbor index --full",
+          "kinds": [
+            "howto",
+            "warning"
+          ]
+        },
+        {
+          "phrase": "deployed only on tags matching v*",
+          "kinds": [
+            "fact",
+            "warning"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s25.jsonl",
+      "kind": "already",
+      "gold": [
+        {
+          "phrase": "อย่า cache ค่าส่งเกิน 10 นาที",
+          "kinds": [
+            "warning",
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "pnpm i18n:check",
+          "kinds": [
+            "howto"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s26.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "one concern per PR",
+          "kinds": [
+            "preference"
+          ]
+        },
+        {
+          "phrase": "resumes from last_acked_id",
+          "kinds": [
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "mix run bench/fanout.exs --users 2000",
+          "kinds": [
+            "howto",
+            "fact"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s27.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "soft delete ด้วยคอลัมน์ archived_at",
+          "kinds": [
+            "fact",
+            "warning"
+          ]
+        },
+        {
+          "phrase": "ใช้ปีการศึกษาเป็น key ของเทอม",
+          "kinds": [
+            "decision"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s28.jsonl",
+      "kind": "nothing",
+      "gold": []
+    },
+    {
+      "file": "s29.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "client_max_body_size 20m",
+          "kinds": [
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "Thumbnails are generated by the thumbs queue",
+          "kinds": [
+            "decision"
+          ]
+        },
+        {
+          "phrase": "Next: wire the thumbnail URLs into the recipe API",
+          "kinds": [
+            "handoff"
+          ]
+        }
+      ]
+    },
+    {
+      "file": "s30.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "Remaining: the expiry-date report still needs the CSV export",
+          "kinds": [
+            "handoff"
+          ]
+        }
+      ]
+    }
+  ]
+}

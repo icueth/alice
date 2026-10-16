@@ -108,7 +108,52 @@ pub fn oldest_chunks(conn: &Connection, limit: usize) -> Result<Vec<(i64, u64)>>
         .collect::<std::result::Result<_, _>>()?)
 }
 
-/// Delete chunks with their FTS rows, vectors and provenance; sources left empty go too.
+/// [`chunks_older_than`] over the chunks of capture sources only (sources with a
+/// `capture_state` row): what `capture.raw_retention` ages out. Walks the `chunks_created`
+/// index and looks each chunk's source up in `capture_state`.
+pub fn capture_chunks_older_than(
+    conn: &Connection,
+    cutoff: &str,
+    limit: usize,
+) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.seq FROM chunks c JOIN capture_state s ON s.source_id = c.source_id
+         WHERE c.created_at < ?1 ORDER BY c.created_at, c.seq LIMIT ?2",
+    )?;
+    Ok(stmt
+        .query_map(params![cutoff, limit as i64], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+/// [`raw_bytes`] over the chunks of capture sources only (what `capture.raw_retention =
+/// "<size>"` limits).
+pub fn capture_raw_bytes(conn: &Connection) -> Result<u64> {
+    let n: Option<i64> = conn.query_row(
+        "SELECT sum(octet_length(c.text)) FROM chunks c
+         JOIN capture_state s ON s.source_id = c.source_id",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n.unwrap_or(0) as u64)
+}
+
+/// [`oldest_chunks`] over the chunks of capture sources only.
+pub fn oldest_capture_chunks(conn: &Connection, limit: usize) -> Result<Vec<(i64, u64)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.seq, octet_length(c.text) FROM chunks c
+         JOIN capture_state s ON s.source_id = c.source_id ORDER BY c.seq LIMIT ?1",
+    )?;
+    Ok(stmt
+        .query_map([limit as i64], |r| {
+            Ok((r.get(0)?, r.get::<_, i64>(1)? as u64))
+        })?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+/// Delete chunks with their FTS rows, vectors and provenance; sources left empty go too, except
+/// capture sources, which stay with their `capture_state` row (the cursor, and the session the
+/// importer skips) so the transcript is not captured or imported again (SP2 R11). Turn keys
+/// (`capture_turns`) stay either way.
 pub fn delete_chunks(conn: &Connection, seqs: &[i64]) -> Result<usize> {
     if seqs.is_empty() {
         return Ok(0);
@@ -153,7 +198,8 @@ pub fn delete_chunks(conn: &Connection, seqs: &[i64]) -> Result<usize> {
     }
     for s in sources {
         conn.execute(
-            "DELETE FROM sources WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM chunks WHERE source_id = ?1)",
+            "DELETE FROM sources WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM chunks WHERE source_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM capture_state WHERE source_id = ?1)",
             [&s],
         )?;
     }

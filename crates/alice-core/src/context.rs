@@ -1,7 +1,7 @@
 //! Token-budgeted briefing for a project: what an agent should know at the start of a session.
 
 use crate::error::Result;
-use crate::model::Memory;
+use crate::model::{Memory, Origin};
 use crate::normalize::{estimate_tokens, truncate_chars};
 use crate::store::memories::get_by_seqs;
 use crate::store::projects::{GLOBAL_ID, ResolvedProject};
@@ -11,6 +11,9 @@ use rusqlite::{Connection, ToSql};
 /// Memories an agent should see. New memories stay `pending` until the embedding worker
 /// activates them, so they count as live.
 const LIVE: &str = "status IN ('active','pending')";
+/// A distilled memory is shown once its judge stage is over (SP2 spec §6.6): a near-copy of an
+/// explicit memory never shows twice while the judge works or is unreachable.
+const JUDGED: &str = "NOT (origin = 'distill' AND judge_state <> 'done')";
 /// Longest detail, and longest headline taken from the body, of a one-line entry in characters.
 /// A title is never cut.
 const LINE_CHARS: usize = 120;
@@ -31,14 +34,21 @@ const KEY_MEMORIES: Select = (
 );
 /// What stands in for the key memories of a project that has none of importance 4 and up (an
 /// imported project: its runbooks and decisions came in at 3). The recent decisions have a
-/// section of their own.
+/// section of their own. Distilled memories are never key memories (SP2 spec §6.6).
 const FALLBACK_KEY_MEMORIES: Select = (
-    "importance >= 3 AND kind NOT IN ('handoff','diary') AND NOT (kind = 'decision' AND created_at >= ?2)",
+    "importance >= 3 AND kind NOT IN ('handoff','diary') AND NOT (kind = 'decision' AND created_at >= ?2) AND origin <> 'distill'",
     BY_IMPORTANCE,
 );
 /// Most memories the fallback shows.
 const FALLBACK_KEY_CAP: usize = 3;
 const RECENT_DECISIONS: Select = ("kind = 'decision' AND created_at >= ?2", "created_at DESC");
+/// The recent decisions an agent or a person wrote, listed first (SP2 spec §6.6). Distilled ones
+/// fill the places they leave from `RECENT_DECISIONS`: by then every explicit one is picked, so
+/// the rest of it is distilled. Two index-ordered queries, never a sort of the whole window.
+const RECENT_EXPLICIT_DECISIONS: Select = (
+    "kind = 'decision' AND created_at >= ?2 AND origin <> 'distill'",
+    "created_at DESC",
+);
 const PREFERENCES: Select = ("kind = 'preference'", BY_IMPORTANCE);
 /// Live diary entries except auto-save checkpoints (a title ending `: checkpoint`, or the topic).
 const RECENT_DIARY: Select = (
@@ -49,11 +59,12 @@ const RECENT_DIARY: Select = (
 /// More open review items than this are not worth asking the user about at session start.
 const REVIEW_ASK_MAX: u64 = 10;
 
-/// A section's query: `seq` of live memories in display order, `?1` the project, the row limit
-/// bound last. `seq DESC` breaks ties, so the newest of equals wins and the output is stable.
+/// A section's query: `seq` of live (and judged) memories in display order, `?1` the project,
+/// the row limit bound last. `seq DESC` breaks ties, so the newest of equals wins and the output
+/// is stable.
 fn section_sql((filter, order): Select) -> String {
     format!(
-        "SELECT seq FROM memories WHERE project_id = ?1 AND {filter} AND {LIVE} ORDER BY {order}, seq DESC LIMIT ?"
+        "SELECT seq FROM memories WHERE project_id = ?1 AND {filter} AND {LIVE} AND {JUDGED} ORDER BY {order}, seq DESC LIMIT ?"
     )
 }
 
@@ -68,7 +79,16 @@ fn split_first_line(body: &str) -> (&str, &str) {
     (first.trim(), rest.trim())
 }
 
-/// `- [kind] headline — detail (id)`.
+/// ` (auto)` after a memory distilled from a captured session (SP2 spec §6.6).
+fn auto_mark(m: &Memory) -> &'static str {
+    if m.origin == Origin::Distill {
+        " (auto)"
+    } else {
+        ""
+    }
+}
+
+/// `- [kind] headline — detail (id)`, and ` (auto)` for a distilled memory.
 ///
 /// When the body's first line starts with the title (a title derived from that line, cut at 80
 /// characters and maybe mid-word, or a short label for it), the line itself is the headline and
@@ -90,11 +110,16 @@ fn line(m: &Memory) -> String {
         "" => String::new(),
         d => format!(" — {}", truncate_chars(d, LINE_CHARS)),
     };
-    format!("- [{}] {head}{detail} ({})\n", m.kind.as_str(), m.id)
+    format!(
+        "- [{}] {head}{detail} ({}){}\n",
+        m.kind.as_str(),
+        m.id,
+        auto_mark(m)
+    )
 }
 
-/// The latest handoff in full (up to 600 characters): date, author and id on one line, then
-/// the text, preceded by the title unless the text already starts with it.
+/// The latest handoff in full (up to 600 characters): date, author and id (and ` (auto)`) on one
+/// line, then the text, preceded by the title unless the text already starts with it.
 fn handoff(m: &Memory) -> String {
     // Imported memories keep their original timestamp, which need not be RFC 3339.
     let date: String = m.created_at.chars().take(10).collect();
@@ -108,7 +133,7 @@ fn handoff(m: &Memory) -> String {
     } else {
         truncate_chars(&format!("{}\n{body}", m.title), HANDOFF_CHARS)
     };
-    format!("{date}{by} ({})\n{text}\n", m.id)
+    format!("{date}{by} ({}){}\n{text}\n", m.id, auto_mark(m))
 }
 
 struct Briefing<'c> {
@@ -131,24 +156,48 @@ impl Briefing<'_> {
         cap: usize,
         render: fn(&Memory) -> String,
     ) -> Result<()> {
+        self.section_in_turn(title, &[select], args, cap, render)
+    }
+
+    /// [`section`](Self::section) filled from `selects` in turn: each one fills the places the
+    /// ones before it left. They all take `args`.
+    fn section_in_turn(
+        &mut self,
+        title: &str,
+        selects: &[Select],
+        args: &[&dyn ToSql],
+        cap: usize,
+        render: fn(&Memory) -> String,
+    ) -> Result<()> {
         let heading = format!("\n## {title}\n");
         let mut cost = estimate_tokens(&heading);
         if self.used + cost > self.max_tokens {
             return Ok(());
         }
-        // Rows already shown in an earlier section are skipped, so fetch that many more.
+        // Rows already shown in an earlier section are skipped, so fetch that many more. A later
+        // select may return rows an earlier one picked: each of those leaves one place fewer to
+        // fill, so the same limit still reaches the rows that fill the places left.
         let limit = i64::try_from(cap + self.shown.len()).unwrap_or(i64::MAX);
         let mut params = args.to_vec();
         params.push(&limit);
-        let mut stmt = self.conn.prepare_cached(&section_sql(select))?;
-        let found: Vec<i64> = stmt
-            .query_map(params.as_slice(), |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        let fresh: Vec<i64> = found
-            .into_iter()
-            .filter(|s| !self.shown.contains(s))
-            .take(cap)
-            .collect();
+        let mut fresh: Vec<i64> = Vec::new();
+        for select in selects {
+            if fresh.len() == cap {
+                break;
+            }
+            let mut stmt = self.conn.prepare_cached(&section_sql(*select))?;
+            let found: Vec<i64> = stmt
+                .query_map(params.as_slice(), |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            for s in found {
+                if fresh.len() == cap {
+                    break;
+                }
+                if !self.shown.contains(&s) && !fresh.contains(&s) {
+                    fresh.push(s);
+                }
+            }
+        }
         let mut body = String::new();
         for (seq, m) in get_by_seqs(self.conn, &fresh)? {
             let entry = render(&m);
@@ -184,7 +233,7 @@ impl Briefing<'_> {
 /// memory twice, then the five newest diary entries that are not auto-save checkpoints. The whole text stays within `max_tokens` (as `estimate_tokens` counts), except
 /// that the heading line, and for a project without live memories a hint, are always included.
 /// When review items wait for a decision, a last section says how many (and, up to ten, to ask
-/// the user).
+/// the user). A distilled memory is marked `(auto)` and shown only once judged (SP2 spec §6.6).
 pub fn build(
     conn: &Connection,
     project: &ResolvedProject,
@@ -228,9 +277,10 @@ pub fn build(
             line,
         )?;
     }
-    b.section(
+    // Explicit decisions first; distilled ones fill the places left (SP2 spec §6.6).
+    b.section_in_turn(
         "Recent decisions",
-        RECENT_DECISIONS,
+        &[RECENT_EXPLICIT_DECISIONS, RECENT_DECISIONS],
         &[&pid, &since],
         5,
         line,
@@ -789,6 +839,12 @@ mod tests {
                 true,
             ),
             (
+                "recent explicit decisions",
+                section_sql(RECENT_EXPLICIT_DECISIONS),
+                "memories_project_kind",
+                true,
+            ),
+            (
                 "preferences",
                 section_sql(PREFERENCES),
                 "memories_project_kind_importance",
@@ -846,6 +902,10 @@ mod tests {
             ("warnings", section_sql(WARNINGS)),
             ("key memories", section_sql(KEY_MEMORIES)),
             ("recent decisions", section_sql(RECENT_DECISIONS)),
+            (
+                "recent explicit decisions",
+                section_sql(RECENT_EXPLICIT_DECISIONS),
+            ),
             ("preferences", section_sql(PREFERENCES)),
         ] {
             let steps = |p: &projects::ResolvedProject| {
@@ -898,6 +958,197 @@ mod tests {
         // A budget too small for it leaves it out rather than overrun.
         let tiny = build(&c, &app, 30, at(NOW)).unwrap();
         assert!(!tiny.contains("## Review"), "{tiny}");
+    }
+
+    /// A distilled memory (SP2 spec §6.5); `judged`: its judge stage is over.
+    fn distilled(
+        c: &rusqlite::Connection,
+        p: &projects::ResolvedProject,
+        mut i: memories::NewMemoryInput,
+        judged: bool,
+    ) -> String {
+        i.origin = Origin::Distill;
+        let (id, seq) = put(c, p, i);
+        if judged {
+            c.execute(
+                "UPDATE memories SET judge_state = 'done' WHERE seq = ?1",
+                [seq],
+            )
+            .unwrap();
+        }
+        id
+    }
+
+    /// SP2 spec §6.6: explicit decisions come first, distilled ones fill the places left, newest
+    /// first, marked `(auto)`. A distilled memory the judge has not finished is not shown.
+    #[test]
+    fn recent_decisions_list_agent_decisions_first() {
+        let (_d, c, app) = setup("app");
+        let decision = |text: &str, created: &str| {
+            // Importance 2: below the key-memories fallback, so only this section shows it.
+            let mut i = input(Kind::Decision, 2, text);
+            i.created_at = Some(created.into());
+            i
+        };
+        let mut auto = Vec::new();
+        for (n, day) in [(1, "05"), (2, "08"), (3, "11"), (4, "12")] {
+            auto.push(distilled(
+                &c,
+                &app,
+                decision(
+                    &format!("auto decision {n}"),
+                    &format!("2026-10-{day}T09:00:00.000Z"),
+                ),
+                true,
+            ));
+        }
+        distilled(
+            &c,
+            &app,
+            decision("unjudged auto decision", "2026-10-13T09:00:00.000Z"),
+            false,
+        );
+        let (old, _) = put(
+            &c,
+            &app,
+            decision("explicit decision old", "2026-10-02T09:00:00.000Z"),
+        );
+        let (newer, _) = put(
+            &c,
+            &app,
+            decision("explicit decision new", "2026-10-06T09:00:00.000Z"),
+        );
+        let text = build(&c, &app, 2_000, at(NOW)).unwrap();
+        let (_, section) = text.split_once("## Recent decisions\n").unwrap();
+        let lines: Vec<&str> = section
+            .lines()
+            .take_while(|l| l.starts_with("- "))
+            .collect();
+        let want = [
+            format!("- [decision] explicit decision new ({newer})"),
+            format!("- [decision] explicit decision old ({old})"),
+            format!("- [decision] auto decision 4 ({}) (auto)", auto[3]),
+            format!("- [decision] auto decision 3 ({}) (auto)", auto[2]),
+            format!("- [decision] auto decision 2 ({}) (auto)", auto[1]),
+        ];
+        assert_eq!(lines, want, "{text}");
+        assert!(!text.contains("auto decision 1"), "five at most:\n{text}");
+        assert!(!text.contains("unjudged"), "{text}");
+
+        // Explicit decisions that fill the section leave no place for distilled ones.
+        let other = project(&c, "other");
+        distilled(
+            &c,
+            &other,
+            decision("auto decision newest", "2026-10-13T10:00:00.000Z"),
+            true,
+        );
+        for n in 0..5 {
+            put(
+                &c,
+                &other,
+                decision(&format!("explicit {n}"), "2026-10-03T09:00:00.000Z"),
+            );
+        }
+        let text = build(&c, &other, 2_000, at(NOW)).unwrap();
+        assert_eq!(text.matches("- [decision] explicit ").count(), 5, "{text}");
+        assert!(!text.contains("auto decision newest"), "{text}");
+
+        // An explicit decision already shown under Key memories is skipped, by both queries:
+        // the newest decision of all, it uses up a row of each, and the places it leaves are
+        // still filled (the limit counts the rows shown earlier).
+        let third = project(&c, "third");
+        let mut key = decision("key decision", "2026-10-12T09:00:00.000Z");
+        key.importance = Some(5);
+        let (key, _) = put(&c, &third, key);
+        let (e2, _) = put(
+            &c,
+            &third,
+            decision("explicit two", "2026-10-11T09:00:00.000Z"),
+        );
+        let (e1, _) = put(
+            &c,
+            &third,
+            decision("explicit one", "2026-10-10T09:00:00.000Z"),
+        );
+        let mut auto = Vec::new();
+        for (n, day) in [(4, "09"), (3, "08"), (2, "07"), (1, "06")] {
+            auto.push(distilled(
+                &c,
+                &third,
+                decision(
+                    &format!("auto pick {n}"),
+                    &format!("2026-10-0{day}T09:00:00.000Z"),
+                ),
+                true,
+            ));
+        }
+        let text = build(&c, &third, 2_000, at(NOW)).unwrap();
+        let (_, keys) = text.split_once("## Key memories\n").unwrap();
+        assert!(
+            keys.starts_with(&format!("- [decision] key decision ({key})\n")),
+            "{text}"
+        );
+        let (_, section) = text.split_once("## Recent decisions\n").unwrap();
+        let lines: Vec<&str> = section
+            .lines()
+            .take_while(|l| l.starts_with("- "))
+            .collect();
+        let want = [
+            format!("- [decision] explicit two ({e2})"),
+            format!("- [decision] explicit one ({e1})"),
+            format!("- [decision] auto pick 4 ({}) (auto)", auto[0]),
+            format!("- [decision] auto pick 3 ({}) (auto)", auto[1]),
+            format!("- [decision] auto pick 2 ({}) (auto)", auto[2]),
+        ];
+        assert_eq!(lines, want, "{text}");
+        assert_eq!(text.matches(&key).count(), 1, "{text}");
+    }
+
+    /// SP2 spec §6.6: the key-memories fallback (importance 3) is the explicit memories' own;
+    /// every other section shows a judged distilled memory, marked, and hides an unjudged one.
+    #[test]
+    fn the_briefing_marks_distilled_memories_and_hides_unjudged_ones() {
+        let (_d, c, app) = setup("app");
+        let auto_fact = distilled(&c, &app, input(Kind::Fact, 3, "auto fact three"), true);
+        put(&c, &app, input(Kind::Fact, 3, "explicit fact three"));
+        let warning = distilled(
+            &c,
+            &app,
+            input(Kind::Warning, 2, "auto warning\nwhy it matters"),
+            true,
+        );
+        distilled(&c, &app, input(Kind::Warning, 2, "hidden warning"), false);
+        let handoff = distilled(
+            &c,
+            &app,
+            input(Kind::Handoff, 2, "Handoff: auto state\nnext: more"),
+            true,
+        );
+        let text = build(&c, &app, 2_000, at(NOW)).unwrap();
+        let (_, key) = text.split_once("## Key memories").unwrap();
+        let key = key.split("\n## ").next().unwrap();
+        assert!(key.contains("explicit fact three"), "{text}");
+        assert!(!text.contains("auto fact three"), "{text}");
+        assert!(!text.contains(&auto_fact), "{text}");
+        assert!(
+            text.contains(&format!(
+                "- [warning] auto warning — why it matters ({warning}) (auto)\n"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("hidden warning"), "{text}");
+        // The last handoff stays the newest, distilled or not, marked on its first line.
+        assert!(
+            text.contains(&format!("({handoff}) (auto)\nHandoff: auto state")),
+            "{text}"
+        );
+        // A project whose only memory waits for the judge is not empty: it is only not shown.
+        let other = project(&c, "other");
+        distilled(&c, &other, input(Kind::Note, 2, "a waiting note"), false);
+        let text = build(&c, &other, 2_000, at(NOW)).unwrap();
+        assert!(!text.contains("No memories yet"), "{text}");
+        assert!(!text.contains("a waiting note"), "{text}");
     }
 
     fn diary(c: &rusqlite::Connection, p: &projects::ResolvedProject, title: &str, created: &str) {
