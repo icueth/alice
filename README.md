@@ -177,7 +177,7 @@ Agents that cannot use MCP can call the CLI (`alice recall`, `alice remember`, `
 | `query_facts` | Knowledge-graph lookups, `as_of` a date, or as a timeline. |
 | `assert_fact` | Add, supersede or end a fact, with predicate suggestions. |
 
-The server also sends usage instructions, offers `recall` and `remember-session` prompts and the `memory://context` and `memory://m/{id}` resources. An admin toolset (`review_list`, `review_resolve`, `merge_memories`, `stats`) is off by default: switch it on with `alice config set mcp.admin_tools true` (the stdio shim asks the daemon each time it lists tools, so no restart is needed).
+The server also sends usage instructions, offers `recall` and `remember-session` prompts and the `memory://context` and `memory://m/{id}` resources. An admin toolset (`review_list`, `review_resolve`, `merge_memories`, `stats`) is off by default: switch it on with `alice config set mcp.admin_tools true` (the stdio shim asks the daemon each time it lists tools, so no daemon restart is needed; an agent that listed its tools before sees them in its next session).
 
 ## CLI
 
@@ -209,7 +209,7 @@ alice model fetch
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 ```
 
-Every command takes `--json`. Planned: `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3).
+Every command takes `--json` (except `daemon logs`, `config edit` and `model fetch`, which print no JSON document). Planned: `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3).
 
 ## Configuration
 
@@ -288,7 +288,7 @@ When a memory is written it is compared with the memories already stored in its 
 
 - **Heuristic (default, offline, free).** It merges a new memory into an older one only when the text is the same after Unicode normalisation and whitespace collapse (case and punctuation count). It never merges on similarity alone: a probable duplicate, a likely update or a likely better project becomes an item in the review inbox. It sets no kinds.
 - **Jev (optional).** TypeSafe's Jev model answers choice questions with probabilities. Alice asks whether the new memory duplicates, updates, contradicts or is unrelated to each of its nearest neighbours, and which kind and project fit. Above `judge.auto_apply_threshold` the decision is applied; between the two thresholds it becomes a review item; below, nothing happens. Answers are cached by request, calls are rate-limited, and the daily budget is reserved before every call, so the day's spend cannot pass `judge.daily_budget_usd`. If Jev is down, over budget or not allowed for a project, the heuristic decides and the memory is judged again later; a judge problem never fails a write. On the synthetic evaluation in [docs/benchmarks/m2-jev.md](docs/benchmarks/m2-jev.md) it cost **$0.0113 per 1,000 decisions** (a decision is one memory pair compared; input tokens at $0.042 per million), and the live smoke test of one comparison costs about **$0.00004**. That evaluation (216 pairs written for the purpose, one run) put Jev's relation accuracy at 0.917 against 0.287 for the heuristic; read the caveats on that page before relying on the numbers for real traffic.
-- **Review inbox.** `alice review` lists what Alice could not settle (supersede, contradiction, merge, predicate, project, undo); `alice review show <id>` and `alice review resolve <id> <choice>` answer it. The list is paged (`--page`) and ends with the open total by type; `alice review dismiss --type merge --all` closes a whole type at once without changing any memory. The weekly merge job stops suggesting while 50 merge items wait. `context` only asks the user about review items when 10 or fewer are open.
+- **Review inbox.** `alice review` lists what Alice could not settle (supersede, contradiction, merge, predicate, project, undo); `alice review show <id>` and `alice review resolve <id> <choice>` answer it. The list is paged (`--page`) and ends with the open total by type (`--json` gives `{total, by_type, page, limit, items}`); `alice review dismiss --type merge --all` closes a whole type at once without changing any memory (a dismissed merge group is not suggested again). The weekly merge job stops suggesting while 50 merge items wait. `context` only asks the user about review items when 10 or fewer are open.
 - **History and undo.** Every change is an event: `alice history [id]` shows who changed what, `alice undo <event-id>` reverses it, together with the other changes made by the same action (a merge, a supersede). If the target changed since, Alice opens a review item instead of overwriting anything. Memory, fact and predicate changes can be undone; a purged memory cannot come back.
 
 ## Backup and restore

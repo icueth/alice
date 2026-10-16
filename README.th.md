@@ -177,7 +177,7 @@ agent ที่ใช้ MCP ไม่ได้ เรียกผ่าน CLI 
 | `query_facts` | ถาม knowledge graph ได้ทั้งภาพ ณ วันที่ระบุ (`as_of`) และ timeline |
 | `assert_fact` | เพิ่ม แทนที่ หรือปิดอายุ fact พร้อมแนะนำ predicate ที่มีอยู่แล้ว |
 
-server ส่งคำแนะนำการใช้งานให้ agent ด้วย มี prompt `recall` และ `remember-session` และ resource `memory://context` กับ `memory://m/{id}` ส่วนชุด tool สำหรับดูแลระบบ (`review_list`, `review_resolve`, `merge_memories`, `stats`) ปิดอยู่เป็นค่าเริ่มต้น เปิดได้ด้วย `alice config set mcp.admin_tools true` (stdio shim ถาม daemon ทุกครั้งที่แสดงรายการ tool จึงไม่ต้อง restart)
+server ส่งคำแนะนำการใช้งานให้ agent ด้วย มี prompt `recall` และ `remember-session` และ resource `memory://context` กับ `memory://m/{id}` ส่วนชุด tool สำหรับดูแลระบบ (`review_list`, `review_resolve`, `merge_memories`, `stats`) ปิดอยู่เป็นค่าเริ่มต้น เปิดได้ด้วย `alice config set mcp.admin_tools true` (stdio shim ถาม daemon ทุกครั้งที่แสดงรายการ tool จึงไม่ต้อง restart daemon แต่ agent ที่แสดงรายการ tool ไปแล้วจะเห็นใน session ถัดไป)
 
 ## CLI
 
@@ -209,7 +209,7 @@ alice model fetch
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 ```
 
-ทุกคำสั่งใส่ `--json` ได้ ที่วางแผนไว้: `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3)
+ทุกคำสั่งใส่ `--json` ได้ (ยกเว้น `daemon logs`, `config edit` และ `model fetch` ที่ไม่พิมพ์เอกสาร JSON) ที่วางแผนไว้: `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3)
 
 ## การตั้งค่า
 
@@ -288,7 +288,7 @@ custom_patterns = [{ name = "internal_id", regex = "ID-[0-9]{8}" }]
 
 - **Heuristic (ค่าเริ่มต้น ทำงานในเครื่อง ฟรี)** รวม memory ใหม่เข้ากับอันเก่าก็ต่อเมื่อข้อความเหมือนกันหลัง normalize Unicode และยุบช่องว่าง (ตัวพิมพ์เล็กใหญ่และเครื่องหมายวรรคตอนมีผล) ไม่เคยรวมเพราะความคล้ายอย่างเดียว: ถ้าน่าจะซ้ำ น่าจะเป็นการอัปเดต หรือน่าจะอยู่คนละโปรเจกต์ จะกลายเป็นรายการในคิว review และไม่ตั้ง kind ให้
 - **Jev (เลือกเปิด)** โมเดล Jev ของ TypeSafe ตอบคำถามแบบเลือกคำตอบพร้อมความน่าจะเป็น Alice ถามว่า memory ใหม่ซ้ำ, อัปเดต, ขัดแย้ง หรือไม่เกี่ยวกับเพื่อนบ้านที่ใกล้ที่สุดแต่ละอัน และ kind กับโปรเจกต์ไหนเหมาะ ถ้าถึง `judge.auto_apply_threshold` จะลงมือเลย ถ้าอยู่ระหว่างสองเกณฑ์จะเป็นรายการ review ต่ำกว่านั้นไม่ทำอะไร คำตอบถูก cache ตามคำขอ จำกัดอัตราการเรียก และงบรายวันถูกจองไว้ก่อนเรียกทุกครั้ง ยอดใช้ในวันจึงไม่เกิน `judge.daily_budget_usd` ถ้า Jev ล่ม งบหมด หรือโปรเจกต์นั้นไม่ได้รับอนุญาต heuristic จะตัดสินแทนและ memory จะถูกตัดสินใหม่ภายหลัง ปัญหาของ Judge ไม่เคยทำให้การเขียนล้มเหลว จากการประเมินแบบสังเคราะห์ใน [docs/benchmarks/m2-jev.md](docs/benchmarks/m2-jev.md) ค่าใช้จ่ายอยู่ที่ **$0.0113 ต่อ 1,000 การตัดสินใจ** (หนึ่งการตัดสินใจคือเทียบ memory หนึ่งคู่ ราคา input token $0.042 ต่อล้าน token) และ smoke test สดของการเทียบหนึ่งครั้งอยู่ที่ราว **$0.00004** การประเมินนั้น (216 คู่ที่เขียนขึ้นเพื่อการนี้ รันครั้งเดียว) ได้ความแม่นยำของ Jev ในการระบุความสัมพันธ์ 0.917 เทียบกับ heuristic 0.287 ควรอ่านข้อควรระวังในหน้านั้นก่อนเชื่อตัวเลขสำหรับการใช้งานจริง
-- **คิว review** `alice review` แสดงสิ่งที่ Alice ตัดสินเองไม่ได้ (supersede, contradiction, merge, predicate, project, undo) ส่วน `alice review show <id>` กับ `alice review resolve <id> <choice>` ใช้ตอบ รายการแบ่งหน้าได้ (`--page`) และบรรทัดท้ายบอกจำนวนที่ค้างทั้งหมดแยกตามประเภท ส่วน `alice review dismiss --type merge --all` ปิดทั้งประเภทในครั้งเดียวโดยไม่แก้ memory ใดๆ job แนะนำการรวม (merge) รายสัปดาห์จะหยุดเสนอเมื่อมี merge ค้างครบ 50 รายการ และ `context` จะบอกให้ถามผู้ใช้เรื่อง review ก็ต่อเมื่อมีค้างไม่เกิน 10 รายการ
+- **คิว review** `alice review` แสดงสิ่งที่ Alice ตัดสินเองไม่ได้ (supersede, contradiction, merge, predicate, project, undo) ส่วน `alice review show <id>` กับ `alice review resolve <id> <choice>` ใช้ตอบ รายการแบ่งหน้าได้ (`--page`) และบรรทัดท้ายบอกจำนวนที่ค้างทั้งหมดแยกตามประเภท (`--json` ให้ `{total, by_type, page, limit, items}`) ส่วน `alice review dismiss --type merge --all` ปิดทั้งประเภทในครั้งเดียวโดยไม่แก้ memory ใดๆ (กลุ่ม merge ที่ปิดไปแล้วจะไม่ถูกเสนออีก) job แนะนำการรวม (merge) รายสัปดาห์จะหยุดเสนอเมื่อมี merge ค้างครบ 50 รายการ และ `context` จะบอกให้ถามผู้ใช้เรื่อง review ก็ต่อเมื่อมีค้างไม่เกิน 10 รายการ
 - **ประวัติและ undo** ทุกการเปลี่ยนแปลงเป็น event: `alice history [id]` แสดงว่าใครเปลี่ยนอะไร `alice undo <event-id>` ย้อนกลับพร้อมกับการเปลี่ยนอื่นที่เกิดจากการกระทำเดียวกัน (เช่น merge หรือ supersede) ถ้าเป้าหมายเปลี่ยนไปแล้ว Alice จะเปิดรายการ review แทนการเขียนทับ การเปลี่ยนของ memory, fact และ predicate ย้อนได้ ส่วน memory ที่ถูก purge แล้วย้อนกลับมาไม่ได้
 
 ## Backup และ restore
