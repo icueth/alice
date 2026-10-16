@@ -348,6 +348,9 @@ pub enum ConfigCmd {
 pub enum ModelCmd {
     /// Download the embedding model (~136 MB) for offline use.
     Fetch,
+    /// Load the embedding model and embed one short text: proves this machine runs the
+    /// embedding runtime (`alice-server` runs it before it installs a new binary).
+    Check,
 }
 
 #[derive(Args)]
@@ -748,6 +751,47 @@ fn recall_text(r: &RecallResponse) -> String {
     text
 }
 
+/// What `alice model check` reports.
+#[derive(serde::Serialize)]
+struct ModelCheck {
+    model: String,
+    dim: usize,
+    ms: u128,
+}
+
+/// `alice model check`: no daemon; the model is loaded in this process, so a CPU the runtime
+/// cannot run on ends this process (with a signal), which is what a caller checks.
+fn model_check(home: &AliceHome, json: bool) -> Result<()> {
+    use alice_core::embed::Embedder as _;
+    let started = Instant::now();
+    let e = alice_embed::OnnxEmbedder::new(
+        &home.models_dir(),
+        alice_embed::OnnxOptions {
+            idle_unload: None,
+            intra_threads: None,
+        },
+    )?;
+    let v = e.embed_passages(&["Alice checks that this machine can embed a text.".to_string()])?;
+    anyhow::ensure!(
+        v.len() == 1
+            && v[0].len() == e.dim()
+            && v[0].iter().all(|x| x.is_finite())
+            && v[0].iter().any(|x| *x != 0.0),
+        "the embedding model returned an unexpected vector"
+    );
+    let r = ModelCheck {
+        model: e.model_id().to_string(),
+        dim: e.dim(),
+        ms: started.elapsed().as_millis(),
+    };
+    print(json, &r, || {
+        format!(
+            "ok: {} embedded a test text ({} dimensions) in {} ms\n",
+            r.model, r.dim, r.ms
+        )
+    })
+}
+
 fn print<T: serde::Serialize>(json: bool, value: &T, text: impl FnOnce() -> String) -> Result<()> {
     if json {
         out(&format!("{}\n", serde_json::to_string_pretty(value)?))
@@ -788,6 +832,7 @@ pub fn dispatch(command: Command, json: bool) -> Result<()> {
             );
             Ok(())
         }),
+        Command::Model(ModelCmd::Check) => model_check(&home, json),
         Command::Bench(args) => crate::bench::bench(home, args, json),
         // No daemon: the snapshot is a plain read-only copy.
         Command::Import(ImportCmd::Snapshot(a)) => import_snapshot(a, json),

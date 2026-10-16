@@ -904,6 +904,21 @@ fn a_damaged_database_is_named_instead_of_starting_forever() {
     );
 }
 
+/// `alice model check` loads the model in its own process and starts no daemon; without the
+/// model it fails at once and names the next step.
+#[test]
+fn model_check_without_the_model_fails_and_names_fetch() {
+    let e = Env::new();
+    let o = e.run(&["model", "check"]);
+    assert!(!o.status.success());
+    let err = stderr(&o);
+    assert!(err.contains("alice model fetch"), "{err}");
+    assert!(
+        !e.home.join("daemon.pid").exists() && !e.home.join("alice.db").exists(),
+        "no daemon and no store"
+    );
+}
+
 /// Review finding I-1: an offline first run (the model cannot be downloaded) is named too.
 #[test]
 fn a_failed_model_download_is_named_with_the_next_step() {
