@@ -565,6 +565,102 @@ async fn control_characters_in_an_mcp_hint_are_stripped() {
     assert_no_control_in_names(&t.home);
 }
 
+/// Task 15 fix round 1: a client that capped its body says `more=1` (the transcript goes on past
+/// the body). The body's last turn then stays open, so a cut never splits a turn, as for any
+/// pass short of the file's end; a whole 8 MiB pass is still closed when it makes no progress.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capped_body_leaves_its_last_turn_open() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let base = s.url("ann");
+    let mut tr = Transcript::default();
+    tr.turn("cap", 1, "the first whole turn");
+    let second = tr.len();
+    // The second turn's prompt is the last line before the cut.
+    tr.line(json!({"type": "user", "uuid": "cap-p2",
+        "message": {"role": "user", "content": "Question 2, cut before its answer."}}));
+    let with_more = |offset: u64, event: &str| {
+        let mut v = q("cap", offset, event);
+        v.push(("more", "1".into()));
+        v
+    };
+    let a = accepted(
+        upload(
+            &base,
+            Some(&t.token),
+            &with_more(0, "stop"),
+            None,
+            tr.bytes.clone(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(a.next_offset, second, "the cut turn stays open");
+    assert_eq!(a.turns_stored, 1);
+    // The rest arrives: the turn is whole. A session end with `more` neither closes nor ends.
+    tr.line(json!({"type": "assistant", "uuid": "cap-a2",
+        "message": {"id": "msg-cap-a2", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": "Answer 2: whole after all."}],
+            "stop_reason": "end_turn"}}));
+    tr.turn("cap", 3, "the third turn");
+    let third = tr.len() - {
+        let mut t3 = Transcript::default();
+        t3.turn("cap", 3, "the third turn");
+        t3.len()
+    };
+    let a = accepted(
+        upload(
+            &base,
+            Some(&t.token),
+            &with_more(second, "session-end"),
+            None,
+            tr.bytes[second as usize..].to_vec(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!((a.next_offset, a.turns_stored), (third, 1));
+    let ended: i64 = db(&t.home)
+        .query_row(
+            "SELECT c.ended FROM capture_state c JOIN sources s ON s.id = c.source_id
+             WHERE s.uri = ?1",
+            [uri("cap")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ended, 0, "a capped session end does not end the source");
+    // The last part, without `more`: closed and ended as usual.
+    let a = accepted(
+        upload(
+            &base,
+            Some(&t.token),
+            &q("cap", third, "session-end"),
+            None,
+            tr.bytes[third as usize..].to_vec(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!((a.next_offset, a.turns_stored), (tr.len(), 1));
+    assert_eq!(
+        count(&t.home, "SELECT count(*) FROM capture_turns"),
+        3,
+        "three whole turns, none split"
+    );
+    // `more` is a number like the other flags.
+    let r = upload_raw(
+        &base,
+        &t.token,
+        &format!(
+            "agent=claude-code&session=cap&offset={}&event=stop&more=yes",
+            tr.len()
+        ),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lower_offset_answers_409_over_http() {
     let s = Server::start(&["ann"]).await;

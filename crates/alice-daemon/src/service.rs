@@ -4114,7 +4114,8 @@ impl Service {
     ///   alias, else the `import:<slug>` placeholder); on a local daemon, `cwd` (plan decision
     ///   P8). An existing source keeps its own project;
     /// - `session-end` closes the trailing turn whatever it waits for and ends the source;
-    ///   every other event closes it unless its last tool call has no result yet.
+    ///   every other event closes it unless its last tool call has no result yet. With
+    ///   `more=1` (a capped body) the trailing turn stays open and nothing ends.
     pub async fn capture_upload(
         &self,
         q: TranscriptQuery,
@@ -4152,6 +4153,8 @@ impl Service {
             })
             .await?;
         let session_end = q.event == "session-end";
+        // A capped body (`more=1`): the transcript goes on, so its trailing turn stays open.
+        let more = q.more.is_some_and(|v| v != 0);
         let input = PassInput {
             agent,
             session: q.session,
@@ -4164,10 +4167,10 @@ impl Service {
             bytes: body,
             offset: q.offset,
             at_file_start: q.offset == 0,
-            close_trailing: !session_end,
-            force_close: session_end,
+            close_trailing: !session_end && !more,
+            force_close: session_end && !more,
             event: q.event,
-            end: session_end,
+            end: session_end && !more,
         };
         let capture = self.capture.clone();
         tokio::task::spawn_blocking(move || capture.apply(input))

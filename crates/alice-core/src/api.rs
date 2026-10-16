@@ -750,6 +750,13 @@ pub struct TranscriptQuery {
     /// `1`: nothing is captured; the answer only moves the client past the body.
     #[serde(default)]
     pub no_capture: Option<u8>,
+    /// `1`: the body stops before the end of the transcript (the client capped it), so its last
+    /// turn may go on past the body. That turn stays open and the answer stops at its start, as
+    /// for any pass short of the file's end, and `session-end` neither closes it nor ends the
+    /// source. A whole 8 MiB pass that makes no progress is still closed, so no turn pins the
+    /// cursor.
+    #[serde(default)]
+    pub more: Option<u8>,
 }
 
 /// The answer to an accepted transcript upload.
