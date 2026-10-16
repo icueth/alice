@@ -2295,6 +2295,87 @@ async fn a_large_transcript_is_read_in_bounded_passes_that_split_no_turn() {
     assert_eq!(chunks_holding(&svc, "considering the build"), 0);
 }
 
+/// A tool result's line in Claude Code's own field order, which `json!` would sort away: the
+/// result in `message`, then `uuid` and `timestamp`, then the result again in `toolUseResult`,
+/// then the session's fields. With an `echo` over 64 KiB, the uuid is out of the reach of the
+/// too-large stub's scan at both ends of the line.
+fn claude_ordered_tool_result(
+    session: &str,
+    uuid: &str,
+    tool_id: &str,
+    result: &str,
+    echo: &str,
+) -> Vec<u8> {
+    let mut line = String::new();
+    line.push_str(&format!(
+        r#"{{"parentUuid":"{session}-call","isSidechain":false,"promptId":"{session}-prompt","type":"user","#
+    ));
+    line.push_str(&format!(
+        r#""message":{{"role":"user","content":[{{"tool_use_id":"{tool_id}","type":"tool_result","content":"{result}","is_error":false}}]}},"#
+    ));
+    line.push_str(&format!(
+        r#""uuid":"{uuid}","timestamp":"2026-10-16T10:00:00.000Z","#
+    ));
+    line.push_str(&format!(
+        r#""toolUseResult":{{"stdout":"{echo}","stderr":"","interrupted":false,"isImage":false}},"#
+    ));
+    line.push_str(&format!(
+        r#""sourceToolAssistantUUID":"{session}-call","permissionDecision":"allow","userType":"external","entrypoint":"cli","cwd":"/work/repo","sessionId":"{session}","version":"2.0.14","gitBranch":"main"}}"#
+    ));
+    line.push('\n');
+    line.into_bytes()
+}
+
+/// Review fix F4: the stub of a line over a pass whose uuid is not near either end (Claude Code's
+/// order, above) has a key of its own. Two such lines, in two sessions, each get their stub and
+/// keep the reply that follows them; with one constant key the second tail would be skipped as
+/// stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn keyless_oversized_lines_in_two_sessions_keep_both_tails() {
+    let (d, svc) = local();
+    let result = "x".repeat(alice_core::capture::MAX_PASS_BYTES + (512 << 10));
+    let echo = "y".repeat(256 << 10);
+    for s in ["ko1", "ko2"] {
+        let path = d.path().join(format!("{s}.jsonl"));
+        let mut t = Transcript::default();
+        t.prompt(&format!("{s}-p1"), "Dump the whole log.")
+            .tool_use(&format!("{s}-a1"), &format!("toolu_{s}"), "cat all.log");
+        t.bytes.extend(claude_ordered_tool_result(
+            s,
+            &format!("{s}-r1"),
+            &format!("toolu_{s}"),
+            &result,
+            &echo,
+        ));
+        t.reply(
+            &format!("{s}-a1b"),
+            &format!("The reply after {s}'s huge log."),
+        )
+        .turn(s, 2, &format!("{s} goes on"));
+        std::fs::write(&path, &t.bytes).unwrap();
+        svc.capture_notify(notify(s, &path, "stop")).await.unwrap();
+        until("the session's next turn", || {
+            known_keys(&svc).contains(&format!("{s}-p2"))
+        })
+        .await;
+        assert_eq!(state_of(&svc, &uri(s)).unwrap().byte_offset, t.len());
+    }
+    for s in ["ko1", "ko2"] {
+        assert_eq!(
+            chunks_holding(&svc, &format!("The reply after {s}'s huge log.")),
+            1,
+            "{s}'s reply after its oversized line"
+        );
+        assert_eq!(chunks_holding(&svc, &format!("{s} goes on is settled")), 1);
+    }
+    assert_eq!(chunks_holding(&svc, "[record skipped: too large]"), 2);
+    let tails: Vec<String> = known_keys(&svc)
+        .into_iter()
+        .filter(|k| k.starts_with("tail:"))
+        .collect();
+    assert_eq!(tails.len(), 2, "one tail key per stub: {tails:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_subagent_stop_notify_reads_the_agent_file() {
     let (d, svc) = local();

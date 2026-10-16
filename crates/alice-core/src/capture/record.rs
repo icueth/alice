@@ -14,6 +14,8 @@ use super::turn_key;
 /// One transcript line the reader understood.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Record {
+    /// The line's uuid. A line too large to parse has the one found near its ends, else a
+    /// stand-in made from its bytes (see [`Record::too_large`]).
     pub uuid: Option<String>,
     /// The API message id. Several records can share it (one response written as several lines).
     pub message_id: Option<String>,
@@ -156,10 +158,16 @@ impl Record {
 
     /// The stub left by a line too long to parse. The line is not parsed; its `uuid` and
     /// `timestamp` are looked up as plain `"key":"value"` text near both ends (best effort), so
-    /// the stub can still key a head turn and date its chunk.
+    /// the stub can still key a head turn and date its chunk. When no uuid is found there
+    /// (Claude Code writes it mid-line, between two copies of a large tool result), the stub
+    /// takes a stand-in made from the line's bytes ([`stand_in_uuid`]): each such line keys its
+    /// own turn or tail, and the same line read again keys the same. A shared fallback key would
+    /// make every later stub's tail look stored already.
     pub fn too_large(line: &[u8]) -> Record {
         Record {
-            uuid: scan_string_field(line, "uuid").filter(|v| super::valid_id(v)),
+            uuid: scan_string_field(line, "uuid")
+                .filter(|v| super::valid_id(v))
+                .or_else(|| Some(stand_in_uuid(line))),
             message_id: None,
             timestamp: scan_string_field(line, "timestamp").filter(|v| {
                 v.len() <= 40
@@ -230,6 +238,21 @@ fn scan_string_field(line: &[u8], key: &str) -> Option<String> {
         return None;
     }
     std::str::from_utf8(value).ok().map(str::to_owned)
+}
+
+/// The stand-in uuid of a line too large to parse that shows none: `too-large-` and 32 hex
+/// digits of the SHA-256 of the line's length and its first and last `STUB_SCAN_BYTES` (the
+/// bytes the scan looked at). A valid id, so it is the stub's turn key.
+fn stand_in_uuid(line: &[u8]) -> String {
+    let head = &line[..line.len().min(STUB_SCAN_BYTES)];
+    let tail = &line[line.len().saturating_sub(STUB_SCAN_BYTES)..];
+    let mut bytes = Vec::with_capacity(8 + head.len() + tail.len());
+    bytes.extend((line.len() as u64).to_le_bytes());
+    bytes.extend(head);
+    bytes.extend(tail);
+    let mut hash = crate::normalize::sha256_hex(&bytes);
+    hash.truncate(32);
+    format!("too-large-{hash}")
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -470,8 +493,53 @@ mod tests {
         assert_eq!(stub.blocks, [Block::TooLarge]);
         assert!(!stub.starts_turn());
 
+        // Neither is found: no time, and a stand-in uuid made from the line's bytes.
         let bare = Record::too_large(&vec![b'x'; 1000]);
-        assert_eq!((bare.uuid, bare.timestamp), (None, None));
+        assert_eq!(bare.timestamp, None);
+        assert!(
+            bare.uuid
+                .as_deref()
+                .is_some_and(|u| u.starts_with("too-large-") && u.len() == 42),
+            "{:?}",
+            bare.uuid
+        );
+    }
+
+    /// Review fix F4: a line too large to parse whose uuid is out of reach of the scan (Claude
+    /// Code writes it mid-line, between two copies of a large tool result) still keys its own
+    /// turn or tail: different lines get different keys, the same line read again the same.
+    #[test]
+    fn an_oversized_line_without_a_uuid_keys_by_its_bytes() {
+        let line = |session: &str, middle: usize| {
+            let mut l = br#"{"type":"user","message":{"content":""#.to_vec();
+            l.extend(std::iter::repeat_n(b'x', 200_000));
+            l.extend(br#""},"uuid":"u-mid","timestamp":"2026-10-14T09:00:00.000Z","echo":""#);
+            l.extend(std::iter::repeat_n(b'y', middle));
+            l.extend(format!(r#"","sessionId":"{session}"}}"#).into_bytes());
+            l
+        };
+        let key = |l: &[u8]| Record::too_large(l).turn_key();
+        let (a, b) = (line("s-1", 100_000), line("s-2", 100_000));
+        assert_eq!(a.len(), b.len());
+        let stub = Record::too_large(&a);
+        assert_eq!(stub.timestamp, None, "the time is out of reach too");
+        assert_eq!(stub.blocks, [Block::TooLarge]);
+        assert_ne!(key(&a), key(&b), "two lines: two keys");
+        assert_eq!(
+            key(&a),
+            key(&a.clone()),
+            "the same line read again: the same key"
+        );
+        // Only the length differs (the windows at both ends are the same): another key.
+        assert_ne!(key(&a), key(&line("s-1", 100_001)));
+        // Never the constant key of a keyless record with no text.
+        for l in [&a, &b] {
+            assert_ne!(key(l), turn_key(None, None, ""));
+            assert!(super::super::valid_id(&key(l)), "{}", key(l));
+        }
+        let bare = |n| key(&vec![b'x'; n]);
+        assert_ne!(bare(1000), bare(1001));
+        assert_eq!(bare(1000), bare(1000));
     }
 
     #[test]
