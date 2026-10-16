@@ -158,13 +158,28 @@ fn exact_match(query: &str, hit: &alice_core::api::Hit) -> bool {
 const QUERY_HELD_BACK: &str = "this search used word matches only: the cloud policy keeps this project's text away from the embedding provider, so the query was not sent";
 
 /// The cloud decision for a query asked from `choice`'s project: whether it may leave, the
-/// redactor that screens it, and whether the project is a detected one the store never saw.
+/// redactors that screen it, and whether the project is a detected one the store never saw.
 /// A project that was never written to is judged by its working tree's own `.alice.toml` and
-/// the global lists (every identity of it is asked; an empty slug says no).
+/// the global lists (every identity of it is asked; an empty slug says no). A stored project
+/// asked from one of its trees is judged by that tree too, not only by the tree it was last
+/// written from (final re-review N-I1).
 struct QueryCloud {
     allowed: bool,
     redactor: Arc<Redactor>,
+    /// The rules as read in the tree the query comes from, when that is not the stored one.
+    also: Option<Arc<Redactor>>,
     unstored: bool,
+}
+
+impl QueryCloud {
+    /// `text` through every redactor of the decision (redaction is idempotent).
+    fn redact(&self, text: &str) -> String {
+        let once = self.redactor.apply(text).text;
+        match &self.also {
+            Some(r) => r.apply(&once).text,
+            None => once,
+        }
+    }
 }
 
 fn query_cloud(
@@ -177,6 +192,7 @@ fn query_cloud(
     let known = |allowed, redactor| QueryCloud {
         allowed,
         redactor,
+        also: None,
         unstored: false,
     };
     match choice {
@@ -188,7 +204,22 @@ fn query_cloud(
                 .ok()
                 .flatten();
             match stored {
-                Some(p) => known(cloud.cloud_allowed(&p.slug), cloud.redactor(&p.slug)),
+                Some(p) => {
+                    // The tree the query comes from first: its `.alice.toml` may deny what the
+                    // stored tree (a worktree without the file, say) does not. The look lands in
+                    // the project's one entry of kept rules, so the hits' checks and later looks
+                    // from other trees keep what it read.
+                    let tree = r.tree();
+                    let here = tree
+                        .as_ref()
+                        .is_none_or(|t| settings.cloud_allowed(&p.slug, Some(t)));
+                    QueryCloud {
+                        allowed: here && cloud.cloud_allowed(&p.slug),
+                        redactor: cloud.redactor(&p.slug),
+                        also: tree.as_ref().map(|t| redactors.for_root_always_on(Some(t))),
+                        unstored: false,
+                    }
+                }
                 None => {
                     let tree = r.tree();
                     let allowed = !r.slug.trim().is_empty()
@@ -199,6 +230,7 @@ fn query_cloud(
                     QueryCloud {
                         allowed,
                         redactor: redactors.for_root_always_on(tree.as_ref()),
+                        also: None,
                         unstored: true,
                     }
                 }
@@ -218,7 +250,7 @@ fn query_for_remote(
     text: &str,
 ) -> Option<String> {
     let q = query_cloud(cloud, readers, settings, redactors, choice);
-    q.allowed.then(|| q.redactor.apply(text).text)
+    q.allowed.then(|| q.redact(text))
 }
 
 /// What the judge decided for a predicate that is new to the vocabulary.
@@ -1438,8 +1470,15 @@ impl Service {
             let (choice, text) = (choice.clone(), text.clone());
             tokio::task::spawn_blocking(move || {
                 let q = query_cloud(&cloud, &readers, &settings, &redactors, &choice);
-                q.unstored
-                    .then(|| q.allowed.then(|| q.redactor.apply(&text).text))
+                if q.unstored {
+                    Some(q.allowed.then(|| q.redact(&text)))
+                } else if !q.allowed {
+                    // A stored project that a tree of it denies (the one the query comes from):
+                    // no project name is asked of the judge, as for a tree that denies itself.
+                    Some(None)
+                } else {
+                    None
+                }
             })
             .await
             .map_err(join_err)?
@@ -1581,7 +1620,8 @@ impl Service {
     /// inside means its working tree's own file or the global lists deny the cloud (the answer
     /// is the fast one); `Some(text)` is the query redacted with the tree's rules, and the call
     /// then runs under `global`, a project the policy knows, whose gate and redaction apply on
-    /// top.
+    /// top. It is `Some(None)` too for a stored project that the tree the query comes from
+    /// denies.
     async fn rerank(
         &self,
         mut out: SearchOutput,
@@ -7721,6 +7761,85 @@ mod tests {
                 .await
                 .unwrap();
             assert!(text.text.unwrap().contains("word matches only"));
+        }
+        s.shutdown();
+    }
+
+    /// Two checkouts of one repository (same remote), for the tests of a project's trees.
+    fn checkouts(d: &tempfile::TempDir, names: [&str; 2]) -> [std::path::PathBuf; 2] {
+        names.map(|n| {
+            let dir = d.path().join(n);
+            std::fs::create_dir(&dir).unwrap();
+            for args in [
+                &["init", "-q"][..],
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.com/me/client-x.git",
+                ],
+            ] {
+                let ok = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .status()
+                    .is_ok_and(|s| s.success());
+                assert!(ok, "git {args:?}");
+            }
+            dir
+        })
+    }
+
+    /// Final re-review N-I1: a recall from a stored project is judged by the tree it comes
+    /// from too. The project was last written from a worktree without `.alice.toml` and nothing
+    /// is kept for it yet (every project right after the A-C1 build); a precise recall from the
+    /// main checkout, whose file denies the cloud, sends nothing to the judge, and what it read
+    /// is kept: a recall from the worktree is denied as well.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_from_a_tree_whose_file_denies_the_cloud_never_reaches_the_judge() {
+        let grader = KeywordGrader::new("narwhal");
+        let (d, s) = svc_with_grader(grader.clone()).await;
+        let [main, feat] = checkouts(&d, ["client-x", "client-x-feat"]);
+        std::fs::write(main.join(".alice.toml"), "[privacy]\ncloud_denied = true\n").unwrap();
+        let (main, feat) = (
+            Some(main.to_string_lossy().into_owned()),
+            Some(feat.to_string_lossy().into_owned()),
+        );
+        remember_id(
+            &s,
+            "the narwhal tusk is in the vault",
+            Some(Kind::Fact),
+            &feat,
+        )
+        .await;
+        remember_id(
+            &s,
+            "the narwhal migrates north in spring",
+            Some(Kind::Fact),
+            &feat,
+        )
+        .await;
+        wait_settled(&s).await;
+        let before = grader.graded();
+        for (from, cwd) in [("the main checkout", &main), ("the worktree", &feat)] {
+            let r = s
+                .recall(recall_req(
+                    "where is the narwhal tusk",
+                    RecallMode::Precise,
+                    cwd,
+                ))
+                .await
+                .unwrap();
+            assert!(!r.results.is_empty(), "{from}: words still find them");
+            assert!(!r.reranked, "{from}: {:?}", r.notes);
+            assert!(
+                r.notes.iter().any(|n| n == NOTE_DENIED),
+                "{from}: {:?}",
+                r.notes
+            );
+            assert_eq!(grader.graded(), before, "{from}: nothing went to the judge");
         }
         s.shutdown();
     }
