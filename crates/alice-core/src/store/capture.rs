@@ -307,7 +307,8 @@ pub fn record_turns<'a>(
 /// What one capture slice moves on a source's state.
 #[derive(Debug, Clone, Default)]
 pub struct Progress<'a> {
-    /// `(byte_offset, next_ord)` after the slice's last complete turn.
+    /// `(byte_offset, next_ord)` after the slice's last complete turn. `next_ord` never moves
+    /// back; `byte_offset` is set as given.
     pub cursor: Option<(u64, i64)>,
     pub last_event: Option<&'a str>,
     /// The session ended (never cleared here).
@@ -316,6 +317,11 @@ pub struct Progress<'a> {
     pub captured: bool,
 }
 
+/// Move a source's state on after a slice. `next_ord` only grows: a stale slice committed late
+/// must not hand a later pass ords that are taken (their chunks would be dropped by `INSERT OR
+/// IGNORE` while their turn keys are recorded, and the turns lost). `byte_offset` is set as given,
+/// since a replaced file resets it on purpose (`set_file_key`), and a turn read again is skipped
+/// by its key.
 pub fn advance(conn: &Connection, source_id: &str, p: &Progress<'_>) -> Result<()> {
     let (byte_offset, next_ord) = match p.cursor {
         Some((b, o)) => (Some(offset(b)), Some(o)),
@@ -324,7 +330,7 @@ pub fn advance(conn: &Connection, source_id: &str, p: &Progress<'_>) -> Result<(
     let captured_at = p.captured.then(now_rfc3339);
     conn.prepare_cached(
         "UPDATE capture_state SET byte_offset = COALESCE(?2, byte_offset),
-            next_ord = COALESCE(?3, next_ord), last_event = COALESCE(?4, last_event),
+            next_ord = MAX(next_ord, COALESCE(?3, next_ord)), last_event = COALESCE(?4, last_event),
             last_capture_at = COALESCE(?5, last_capture_at), ended = MAX(ended, ?6)
          WHERE source_id = ?1",
     )?

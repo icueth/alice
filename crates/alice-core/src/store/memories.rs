@@ -31,7 +31,7 @@ pub struct NewMemoryInput {
     /// How the memory came to exist. Internal: never taken from a request.
     pub origin: Origin,
     /// The ids of the raw chunks the memory was distilled from, recorded with it in
-    /// `provenance`. Internal: never taken from a request.
+    /// `provenance` (an id with no chunk is not recorded). Internal: never taken from a request.
     pub provenance: Vec<String>,
 }
 
@@ -326,9 +326,10 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
             params![m.id, t],
         )?;
     }
+    // Only chunks that exist: a provenance row must lead to text.
     for chunk in &m.provenance {
         conn.prepare_cached(
-            "INSERT OR IGNORE INTO provenance (memory_id, chunk_id) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO provenance (memory_id, chunk_id) SELECT ?1, id FROM chunks WHERE id = ?2",
         )?
         .execute(params![m.id, chunk])?;
     }
@@ -734,6 +735,45 @@ mod tests {
             content: content.into(),
             ..Default::default()
         }
+    }
+
+    /// Provenance names chunks that exist: an id with no chunk behind it is not recorded, and
+    /// blanks and repeats are dropped before the insert.
+    #[test]
+    fn provenance_records_only_chunks_that_exist() {
+        let (_d, c, p) = setup();
+        c.execute(
+            "INSERT INTO sources (id, project_id, type, uri, created_at)
+             VALUES ('S1', ?1, 'session', 'claude-code:session:s1', '2026-10-16T00:00:00.000Z')",
+            [&p.id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO chunks (id, source_id, project_id, ord, text, content_hash, created_at)
+             VALUES ('C1', 'S1', ?1, 0, 'turn', 'h', '2026-10-16T00:00:00.000Z')",
+            [&p.id],
+        )
+        .unwrap();
+        let mut i = input("We distil only what Jev chose");
+        i.origin = Origin::Distill;
+        i.provenance = vec!["C1".into(), " C1 ".into(), "".into(), "C-MISSING".into()];
+        let m = prepare(i, &p, "h".into()).unwrap();
+        assert_eq!(m.provenance, ["C1", "C-MISSING"]);
+        let InsertOutcome::New { id, .. } = insert(&c, &m).unwrap() else {
+            panic!("expected new")
+        };
+        let rows: Vec<String> = c
+            .prepare("SELECT chunk_id FROM provenance WHERE memory_id = ?1")
+            .unwrap()
+            .query_map([&id], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, ["C1"], "a missing chunk id is not recorded");
+        assert_eq!(
+            get_many(&c, std::slice::from_ref(&id)).unwrap()[0].origin,
+            Origin::Distill
+        );
     }
 
     #[test]
