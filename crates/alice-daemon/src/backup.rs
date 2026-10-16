@@ -55,12 +55,26 @@ pub const KEEP_SPECIAL_DAYS: i64 = 30;
 /// Manual backups kept, newest first, whatever the day: the daily/weekly policy never thins them.
 pub const KEEP_MANUAL: usize = 5;
 
-/// Where backups go: `backup.dir`, or `<home>/backups`.
+/// Where backups go: `<home>/backups`, or, with `backup.dir`, this home's own directory in it
+/// (`<backup.dir>/<home id>/`, see [`home_id`]). A directory that several homes share (one
+/// `ALICE_BACKUP_DIR` for every home of a machine, a server with one daemon per person) then
+/// never mixes them up: each home rotates and restores only its own backups.
 pub fn backup_dir(home: &AliceHome, s: &BackupSettings) -> PathBuf {
-    s.dir
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.backups_dir())
+    match s.dir.as_deref() {
+        Some(d) => PathBuf::from(d).join(home_id(home)),
+        None => home.backups_dir(),
+    }
+}
+
+/// A short name for `home` that tells its backups apart from another home's in a shared
+/// `backup.dir`: `home-` and 12 hex digits of the SHA-256 of its canonical path. The daemon and
+/// the CLI compute the same one for the same home, however `ALICE_HOME` was spelled.
+pub fn home_id(home: &AliceHome) -> String {
+    let root = std::fs::canonicalize(home.root())
+        .or_else(|_| std::path::absolute(home.root()))
+        .unwrap_or_else(|_| home.root().to_path_buf());
+    let hash = alice_core::normalize::sha256_hex(root.to_string_lossy().as_bytes());
+    format!("home-{}", &hash[..12])
 }
 
 fn stamp(now: DateTime<Utc>) -> String {

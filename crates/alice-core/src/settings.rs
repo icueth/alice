@@ -662,7 +662,8 @@ pub struct BackupSettings {
     pub daily: u32,
     /// Weekly backups kept.
     pub weekly: u32,
-    /// Backup directory (default `<data dir>/backups`).
+    /// Backup directory (default `<data dir>/backups`). Backups go to a directory of this
+    /// home's own inside it (`<dir>/home-<id>/`), so homes that share it never mix them up.
     pub dir: Option<String>,
 }
 

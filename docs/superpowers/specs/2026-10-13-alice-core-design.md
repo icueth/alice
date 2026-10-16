@@ -106,7 +106,10 @@ spool/              pending requests (<ulid>.json) written while the daemon was 
 backups/            SQLite snapshots (0600, in a 0700 directory), named
                     alice-<stamp>.db (scheduled), alice-manual-<stamp>.db,
                     alice-pre-migration-v<N>-<stamp>.db and alice-before-restore-<stamp>.db,
-                    <stamp> = UTC yyyymmddThhmmssZ
+                    <stamp> = UTC yyyymmddThhmmssZ; with `backup.dir` they go to
+                    <backup.dir>/home-<12 hex of SHA-256 of the canonical home path>/ instead, so
+                    homes that share a backup directory never rotate or restore each other's
+                    (M2 final review B-I3)
 logs/               daemon logs (rotated, never contain secrets)
 config.toml         user configuration
 secrets.toml        API keys (0600); secrets.toml.lock beside it serialises writers

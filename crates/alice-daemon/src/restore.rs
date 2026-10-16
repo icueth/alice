@@ -927,6 +927,61 @@ mod tests {
         assert!(find_backup(&h, &dir, Some("nope.db")).is_err());
     }
 
+    /// Final review B-I3: two homes that share one `backup.dir` (one `ALICE_BACKUP_DIR` for
+    /// every home of a machine) each rotate and restore only their own backups.
+    #[test]
+    fn homes_that_share_a_backup_dir_never_mix_their_backups() {
+        let (_da, a) = home_with_db();
+        let (_db, b) = home_with_db();
+        let shared = tempfile::tempdir().unwrap();
+        let s = alice_core::settings::BackupSettings {
+            dir: Some(shared.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let (dir_a, dir_b) = (backup::backup_dir(&a, &s), backup::backup_dir(&b, &s));
+        assert_ne!(dir_a, dir_b);
+        assert!(dir_a.starts_with(shared.path()) && dir_b.starts_with(shared.path()));
+        assert_eq!(
+            backup::backup_dir(&AliceHome::new(a.root().join(".")), &s),
+            dir_a,
+            "another spelling of the same home is the same home"
+        );
+        assert_eq!(
+            backup::backup_dir(&a, &Default::default()),
+            a.backups_dir(),
+            "the default stays inside the home"
+        );
+        let now = Utc::now();
+        for i in 0..12 {
+            backup::create(
+                &a.db(),
+                &dir_a,
+                BackupKind::Scheduled,
+                now - chrono::Duration::days(i) - chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        }
+        // The scratch home's one backup, the newest of all.
+        let only_b = backup::create(&b.db(), &dir_b, BackupKind::Scheduled, now).unwrap();
+        backup::rotate(&dir_a, now, 7, 4).unwrap();
+        let kept_a = backup::list(&dir_a).unwrap().len();
+        assert!((7..12).contains(&kept_a), "A's own policy ran: {kept_a}");
+        assert!(only_b.path.exists(), "A's rotation left B's backup alone");
+        let picked = find_backup(&a, &dir_a, None).unwrap();
+        assert_ne!(
+            picked, only_b.path,
+            "A never restores B's database by default"
+        );
+        assert!(picked.starts_with(&dir_a));
+        assert_eq!(find_backup(&b, &dir_b, None).unwrap(), only_b.path);
+        backup::rotate(&dir_b, now, 1, 0).unwrap();
+        assert_eq!(
+            backup::list(&dir_a).unwrap().len(),
+            kept_a,
+            "B's rotation left A's alone"
+        );
+    }
+
     #[test]
     fn a_before_restore_copy_is_a_listed_private_backup_and_never_the_default_pick() {
         let (_d, h) = home_with_db();
