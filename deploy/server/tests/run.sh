@@ -108,6 +108,24 @@ cat >"$R/usr/local/bin/alice" <<'EOF'
 echo "alice $* ALICE_HOME=${ALICE_HOME:-}" >>"$ALICE_SERVER_ROOT/calls.log"
 case "$*" in
   "--version") echo "alice 0.1.0" ;;
+  "--json adopt "*)
+    case "${ADOPT:-ok}" in
+      nonempty) echo "alice: this tenant already holds 3 memories, 0 chunks and 0 facts; adopt needs a fresh tenant" >&2; exit 1 ;;
+      older) echo "alice: the file was made by an older Alice (schema v4; the server runs v5): upgrade the source Alice first" >&2; exit 1 ;;
+      damaged) echo "alice: the file fails SQLite's integrity check (row 3 missing)" >&2; exit 1 ;;
+      notputback) echo "alice: [not put back] adopting failed (disk full), and the tenant's own database could not be put back" >&2; exit 1 ;;
+    esac
+    [ -f "${3:-}" ] && cp -- "$3" "$ALICE_SERVER_ROOT/adopted-copy"
+    printf '{\n  "adopted_from": "%s",\n  "memories": 3,\n  "chunks": 2,\n  "paths_cleared": 3,\n  "redacted_memories": 2,\n  "saved_tenant_db_as": "alice-before-restore-20261016T070000Z.db"\n}\n' "${3:-}"
+    ;;
+  "restore "*) echo "restored" ;;
+  "config set-secret jev_api_key")
+    # As the daemon does: the value from stdin into the tenant's own secrets.toml, 0600.
+    IFS= read -r v
+    ( umask 077; printf 'jev_api_key = "%s"\n' "$v" >"$ALICE_HOME/secrets.toml" )
+    echo "jev_api_key set (****${v: -4})"
+    ;;
+  "config set judge.provider jev") echo jev >"$ALICE_HOME/judge.provider" ;;
   "model fetch")
     if [ "${SELFTEST:-}" = fetchfail ]; then
       i=0; while [ "$i" -lt 2000 ]; do printf '\rmodel_quantized.onnx: %5.1f%%' "$i" >&2; i=$((i + 1)); done
@@ -177,6 +195,8 @@ add_creates_everything() {
   has "$e" 'ALICE_BACKUP_DAILY=2'
   has "$e" 'ALICE_BACKUP_WEEKLY=0'
   has "$e" 'TZ=Asia/Bangkok'
+  has "$e" 'ALICE_JUDGE_JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone'
+  has "$e" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
   hasnt "$e" 'tok-'
   local u="$R/etc/systemd/system/alice@.service"
   has "$u" 'MemoryMax=3G'
@@ -391,6 +411,9 @@ upgrade_rolls_back_on_a_failed_ping() {
   [ "$RC" != 0 ] || fail "upgrade succeeded with a failing ping"
   cmp "$T/alice.saved" "$R/usr/local/bin/alice" || fail "old binary not restored"
   printf '%s\n' "$OUT" | grep -qF 'ann' || fail "failed tenants not named: $OUT"
+  # Still down after the rollback (final review I-3): named, with what to do.
+  printf '%s\n' "$OUT" | grep -qF 'With the previous binary back, these are still down: ann' || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -qF 'cannot start on the old one' || fail "$OUT"
   pass
 }
 
@@ -408,11 +431,11 @@ refuses_to_run_with_empty_roots() {
   mkdir -p "$T/outside"
   echo keep >"$T/outside/file"
   local before
-  before=$(cat "$R/calls.log" | wc -l)
+  before=$(wc -l <"$R/calls.log")
   ALICE_SERVER_SRV_DIR="" run add eve
   [ "$RC" != 0 ] || fail "ran with an empty SRV"
   printf '%s\n' "$OUT" | grep -qF 'SRV' || fail "the error does not name SRV: $OUT"
-  [ "$(cat "$R/calls.log" | wc -l)" = "$before" ] || fail "a command ran despite the empty root"
+  [ "$(wc -l <"$R/calls.log")" = "$before" ] || fail "a command ran despite the empty root"
   [ -f "$T/outside/file" ] || fail "something outside the temp root was touched"
   [ ! -e "$TENANTS/eve.env" ] || fail "a tenant was created"
   ALICE_SERVER_SRV_DIR="" run remove ann --yes
@@ -442,7 +465,7 @@ import_refuses_a_tenant_home() {
   mkdir -p "$SRV/bob"; echo db >"$SRV/bob/chroma.sqlite3"; echo x >"$SRV/bob/marker"   # bob is a real tenant: keep its home
   run import ann "$SRV/bob"
   [ "$RC" != 0 ] || fail "imported another tenant's home"
-  [ -f "$SRV/ann/marker" ] && [ -f "$SRV/bob/marker" ] || fail "a home was moved or deleted"
+  if [ ! -f "$SRV/ann/marker" ] || [ ! -f "$SRV/bob/marker" ]; then fail "a home was moved or deleted"; fi
   run import ann "$SRV"
   [ "$RC" != 0 ] || fail "imported the whole srv"
   rm -f -- "${SRV:?}/ann/chroma.sqlite3" "${SRV:?}/ann/marker"
@@ -456,7 +479,7 @@ import_refuses_root_and_system_dirs() {
     run import ann "$d"
     [ "$RC" != 0 ] || fail "import of $d succeeded"
   done
-  [ -d /usr ] && [ -d /etc ] || fail "unexpected"
+  if [ ! -d /usr ] || [ ! -d /etc ]; then fail "unexpected"; fi
   pass
 }
 
@@ -797,7 +820,122 @@ upgrade_adds_the_time_zone_to_older_tenants() {
   has "$TENANTS/bob.env" 'TZ=Europe/Berlin'
   hasnt "$TENANTS/bob.env" 'TZ=Asia/Bangkok'
   printf '%s\n' "$OUT" | grep -qF 'TZ=Asia/Bangkok added for: ann' || fail "$OUT"
+  # The Jev pins (final review C1) arrive the same way, and a budget the admin changed is kept.
+  grep -v '^ALICE_JUDGE_' "$TENANTS/ann.env" >"$T/ann.env" && cat "$T/ann.env" >"$TENANTS/ann.env"
+  sed 's/^ALICE_JUDGE_DAILY_BUDGET_USD=.*/ALICE_JUDGE_DAILY_BUDGET_USD=0.5/' "$TENANTS/bob.env" >"$T/bob.env"
+  cat "$T/bob.env" >"$TENANTS/bob.env"
+  run upgrade "$R/new-alice"
+  [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
+  has "$TENANTS/ann.env" 'ALICE_JUDGE_JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone'
+  has "$TENANTS/ann.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
+  has "$TENANTS/bob.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=0.5'
+  printf '%s\n' "$OUT" | grep -qF 'the Jev endpoint and budget pinned for: ann' || fail "$OUT"
   run add bob --tz Asia/Bangkok
+  pass
+}
+
+# A person's backup file, as `alice backup now` leaves it on their machine and scp brings it.
+ADOPT_FILE="$T/alice-person.db"
+echo "person's database" >"$ADOPT_FILE"
+adopt() { RC=0; OUT=$(SUDO_UID="$(id -u)" ALICE_SERVER_ROOT="$R" /bin/bash "$SCRIPT" adopt "$@" 2>&1) || RC=$?; }
+
+adopt_installs_and_reports() {
+  local stops starts
+  stops=$(grep -c 'systemctl stop alice@ann' "$R/calls.log" || true)
+  starts=$(grep -c 'systemctl start alice@ann' "$R/calls.log" || true)
+  adopt ann "$ADOPT_FILE"
+  [ "$RC" = 0 ] || fail "adopt exited $RC: $OUT"
+  cmp "$ADOPT_FILE" "$R/adopted-copy" || fail "the tenant was not given the file"
+  has "$R/calls.log" "alice --json adopt $SRV/ann/adopt-inbox/alice.db"
+  [ "$(grep -c 'systemctl stop alice@ann' "$R/calls.log")" = "$((stops + 1))" ] || fail "the unit was not stopped once"
+  [ "$(grep -c 'systemctl start alice@ann' "$R/calls.log")" = "$((starts + 1))" ] || fail "the unit was not started once"
+  printf '%s\n' "$OUT" | grep -qF 'paths_cleared: 3' || fail "no report: $OUT"
+  printf '%s\n' "$OUT" | grep -qF "Delete $ADOPT_FILE now" || fail "$OUT"
+  hasnt "$R/calls.log" 'privacy.cloud_denied_projects'
+  # The person's cloud denials come along when the admin names them (final review I-4).
+  adopt ann "$ADOPT_FILE" --cloud-denied client-x,shop
+  [ "$RC" = 0 ] || fail "adopt --cloud-denied exited $RC: $OUT"
+  has "$R/calls.log" 'alice config set privacy.cloud_denied_projects ["client-x","shop"]'
+  printf '%s\n' "$OUT" | grep -qF 'Kept from the cloud on ann: client-x,shop' || fail "$OUT"
+  adopt ann "$ADOPT_FILE" --cloud-denied 'x;rm'
+  [ "$RC" != 0 ] || fail "a bad slug list was accepted"
+  [ ! -e "$SRV/ann/adopt-inbox" ] || fail "the staged copy was left"
+  [ -f "$ADOPT_FILE" ] || fail "the admin's file was consumed"
+  pass
+}
+
+adopt_refuses_and_leaves_the_tenant_as_it_was() {
+  local why starts
+  for why in nonempty older damaged; do
+    starts=$(grep -c 'systemctl start alice@ann' "$R/calls.log" || true)
+    ADOPT=$why adopt ann "$ADOPT_FILE"
+    [ "$RC" != 0 ] || fail "adopt succeeded with $why"
+    printf '%s\n' "$OUT" | grep -qF "nothing was adopted and ann is as it was" || fail "$why: $OUT"
+    [ "$(grep -c 'systemctl start alice@ann' "$R/calls.log")" = "$((starts + 1))" ] || fail "$why: the unit was not started again"
+    [ ! -e "$SRV/ann/adopt-inbox" ] || fail "$why: the staged copy was left"
+  done
+  printf '%s\n' "$OUT" | grep -qF "integrity check" || fail "$OUT"
+  pass
+}
+
+adopt_refuses_bad_files_before_any_change() {
+  local before
+  before=$(wc -l <"$R/calls.log")
+  ln -sf "$ADOPT_FILE" "$T/alice-link.db"
+  adopt ann "$T/alice-link.db"
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'is not a regular file'; then fail "a symlink was accepted: $OUT"; fi
+  adopt ann "$T/no-such.db"
+  [ "$RC" != 0 ] || fail "a missing file was accepted"
+  RC=0; OUT=$(SUDO_UID=4242 ALICE_SERVER_ROOT="$R" /bin/bash "$SCRIPT" adopt ann "$ADOPT_FILE" 2>&1) || RC=$?
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF "it must be the admin's file, uid 4242"; then fail "another user's file was accepted: $OUT"; fi
+  FREE_KB=1000 adopt ann "$ADOPT_FILE"
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'twice its size plus 2 GB'; then fail "no disk guard: $OUT"; fi
+  adopt nobody "$ADOPT_FILE"
+  [ "$RC" != 0 ] || fail "an unknown tenant was accepted"
+  [ "$(wc -l <"$R/calls.log")" = "$before" ] || fail "a command ran before a refusal"
+  pass
+}
+
+adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back() {
+  local starts
+  starts=$(grep -c 'systemctl start alice@ann' "$R/calls.log" || true)
+  ADOPT=notputback adopt ann "$ADOPT_FILE"
+  [ "$RC" != 0 ] || fail "adopt succeeded"
+  printf '%s\n' "$OUT" | grep -qF 'ann stays stopped' || fail "$OUT"
+  [ "$(grep -c 'systemctl start alice@ann' "$R/calls.log")" = "$starts" ] || fail "the tenant was started on the unscrubbed copy"
+  pass
+}
+
+commands_that_restart_daemons_wait_for_an_import() {
+  mkdir -p "$SRV/ann/import-inbox/20261016T000000Z-1/palace"
+  run upgrade "$R/new-alice"
+  [ "$RC" != 0 ] || fail "upgrade ran during an import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running for: ann' || fail "$OUT"
+  run remove ann --yes
+  [ "$RC" != 0 ] || fail "remove ran during the tenant's import"
+  adopt ann "$ADOPT_FILE"
+  [ "$RC" != 0 ] || fail "adopt ran during the tenant's import"
+  rm -rf -- "${SRV:?}/ann/import-inbox/20261016T000000Z-1"
+  run upgrade "$R/new-alice"
+  [ "$RC" = 0 ] || fail "upgrade after the import exited $RC: $OUT"
+  pass
+}
+
+dry_run_import_checks_the_disk_first() {
+  make_palace
+  FREE_KB=1000 run import ann "$PALACE" --dry-run
+  [ "$RC" != 0 ] || fail "a dry run copied without room"
+  printf '%s\n' "$OUT" | grep -qF 'needs twice its size plus 2 GB' || fail "$OUT"
+  [ -z "$(ls -A "$SRV/ann/import-inbox" 2>/dev/null)" ] || fail "something was copied"
+  pass
+}
+
+adopt_rolls_back_when_the_tenant_does_not_come_back() {
+  PING_FAIL=1 adopt ann "$ADOPT_FILE"
+  [ "$RC" != 0 ] || fail "adopt succeeded although the tenant did not come back"
+  has "$R/calls.log" 'alice restore alice-before-restore-20261016T070000Z.db --yes'
+  printf '%s\n' "$OUT" | grep -qF "its own database (alice-before-restore-20261016T070000Z.db) is back" || fail "$OUT"
+  [ ! -e "$SRV/ann/adopt-inbox" ] || fail "the staged copy was left"
   pass
 }
 
@@ -817,7 +955,9 @@ add_team_writes_no_snippet() {
   has "$R/etc/systemd/system/alice@.service" 'ExecStart=/usr/local/bin/alice daemon run --tenant $ALICE_DAEMON_ARGS'
   hasnt "$TENANTS/bob.env" 'ALICE_DAEMON_ARGS'
   printf '%s\n' "$OUT" | grep -q 'https\?://' && fail "the team output prints a URL: $OUT"
-  [ "$(count_in 'tok-team-0123456789abcdef0123456789abcdef')" = 1 ] || fail "team token not printed exactly once: $OUT"
+  # Nobody needs the team store's token (final review M-9): it is never printed.
+  [ "$(count_in 'tok-team-')" = 0 ] || fail "the team token was printed: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'Its token stays on the server' || fail "$OUT"
   pass
 }
 
@@ -830,7 +970,8 @@ add_team_provisions_existing_tenants() {
     has "$TENANTS/$n.env" "ALICE_TENANT_NAME=$n"
     is_0600 "$SRV/$n/team.token" || fail "$n team.token is not mode 0600"
     cmp "$SRV/team/token" "$SRV/$n/team.token" || fail "$n team.token differs from the team token"
-    grep -qE "chown alice-$n:alice-$n .*$n/team.token" "$R/calls.log" || fail "no chown of $n team.token"
+    # Written through a mktemp file in the home (final review M-5), chowned, then moved into place.
+    grep -qE "chown alice-$n:alice-$n .*$n/\.team\.token\." "$R/calls.log" || fail "no chown of $n team.token"
     has "$R/calls.log" "systemctl restart alice@$n"
   done
   # idempotent: again, with an old tenant file that lacks ALICE_TENANT_NAME
@@ -855,9 +996,11 @@ add_person_after_team_is_provisioned() {
   has "$TENANTS/hal.env" 'ALICE_TENANT_NAME=hal'
   is_0600 "$SRV/hal/team.token" || fail "hal team.token is not mode 0600"
   cmp "$SRV/team/token" "$SRV/hal/team.token" || fail "hal team.token differs"
-  l_chown=$(grep -nE 'chown alice-hal:alice-hal .*hal/team.token' "$R/calls.log" | head -n 1 | cut -d: -f1)
+  l_chown=$(grep -nE 'chown alice-hal:alice-hal .*hal/\.team\.token\.' "$R/calls.log" | head -n 1 | cut -d: -f1 || true)
   l_start=$(grep -n 'systemctl enable --now alice@hal' "$R/calls.log" | head -n 1 | cut -d: -f1)
-  [ -n "$l_chown" ] && [ -n "$l_start" ] && [ "$l_chown" -lt "$l_start" ] || fail "team.token not in place before the first start ($l_chown, $l_start)"
+  if [ -z "$l_chown" ] || [ -z "$l_start" ] || [ "$l_chown" -ge "$l_start" ]; then
+    fail "team.token not in place before the first start ($l_chown, $l_start)"
+  fi
   PERSONAL="ann bob dave hal"
   pass
 }
@@ -867,7 +1010,8 @@ rotate_team_rewrites_every_copy() {
   before=$(grep -c 'systemctl restart' "$R/calls.log" || true)
   run rotate team
   [ "$RC" = 0 ] || fail "rotate team exited $RC: $OUT"
-  [ "$(count_in 'tok-rot2-')" = 1 ] || fail "new team token not printed once: $OUT"
+  [ "$(count_in 'tok-rot2-')" = 0 ] || fail "the team token was printed: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'New team token in place' || fail "$OUT"
   has "$SRV/team/token" 'tok-rot2-'
   for n in $PERSONAL; do
     cmp "$SRV/team/token" "$SRV/$n/team.token" || fail "$n team.token was not rewritten"
@@ -893,6 +1037,86 @@ list_marks_the_team_store() {
   printf '%s\n' "$OUT" | grep -E '^team ' | grep -qF '(team, no URL)' || fail "team row not marked: $OUT"
   printf '%s\n' "$OUT" | grep -E '^team ' | grep -qF 'https://' && fail "team row has a URL"
   printf '%s\n' "$OUT" | grep -E '^hal ' | grep -qF 'https://203.0.113.7/u/hal' || fail "hal row missing"
+  pass
+}
+
+adopt_refuses_the_team_store() {
+  local before
+  before=$(wc -l <"$R/calls.log")
+  adopt team "$ADOPT_FILE"
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'is the shared team store'; then fail "the team store was accepted: $OUT"; fi
+  [ "$(wc -l <"$R/calls.log")" = "$before" ] || fail "a command ran before the refusal"
+  pass
+}
+
+JEV_A="jev-test-0123456789abcdef-A"
+JEV_B="jev-test-fedcba9876543210-B"
+jev_set() { RC=0; OUT=$(printf '%s\n' "$1" | ALICE_SERVER_ROOT="$R" /bin/bash "$SCRIPT" jev-key set 2>&1) || RC=$?; }
+tenant_names() { for f in "$TENANTS"/*.env; do basename "$f" .env; done; }
+# The key is nowhere a person or a log could read it: not in any command line, tenant file or output.
+key_nowhere_else() { # key
+  hasnt "$R/calls.log" "$1"
+  for f in "$TENANTS"/*.env; do hasnt "$f" "$1"; done
+  if printf '%s\n' "$OUT" | grep -qF -- "$1"; then fail "the key was printed"; fi
+  if printf '%s\n' "$OUT" | grep -qF -- "${1: -4}"; then fail "part of the key was printed"; fi
+}
+has_key() { # tenant key
+  [ "$(cat "$SRV/$1/secrets.toml" 2>/dev/null)" = "jev_api_key = \"$2\"" ] || fail "$1 does not hold the key"
+  [ -n "$(find "$SRV/$1/secrets.toml" -perm 600)" ] || fail "$1's secrets.toml is not 0600"
+  [ "$(cat "$SRV/$1/judge.provider" 2>/dev/null)" = jev ] || fail "$1's judge is not jev"
+}
+
+jev_key_set_reaches_every_tenant_and_nothing_else() {
+  local t
+  jev_set "$JEV_A"
+  [ "$RC" = 0 ] || fail "jev-key set exited $RC: $OUT"
+  for t in $(tenant_names); do has_key "$t" "$JEV_A"; done
+  has_key team "$JEV_A"
+  [ "$(cat "$R/etc/alice/jev.key")" = "$JEV_A" ] || fail "the server's copy is wrong"
+  [ -n "$(find "$R/etc/alice/jev.key" -perm 600)" ] || fail "jev.key is not 0600"
+  key_nowhere_else "$JEV_A"
+  pass
+}
+
+jev_key_is_inherited_by_a_new_tenant() {
+  run add jevp
+  [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
+  has_key jevp "$JEV_A"
+  key_nowhere_else "$JEV_A"
+  run remove jevp --yes
+  pass
+}
+
+jev_key_rotation_replaces_it_everywhere() {
+  local t
+  jev_set "$JEV_B"
+  [ "$RC" = 0 ] || fail "rotation exited $RC: $OUT"
+  for t in $(tenant_names); do has_key "$t" "$JEV_B"; done
+  [ "$(cat "$R/etc/alice/jev.key")" = "$JEV_B" ] || fail "the server's copy was not rotated"
+  key_nowhere_else "$JEV_B"
+  pass
+}
+
+jev_key_status_names_tenants_and_never_the_key() {
+  printf 'jev_api_key = "someone-elses-key-0000000000"\n' >"$SRV/ann/secrets.toml"
+  run jev-key status
+  [ "$RC" = 0 ] || fail "status exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'Jev key: set' || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  team +the server.s key$' || fail "team not shown with the key: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  ann +another key$' || fail "ann's other key not shown: $OUT"
+  key_nowhere_else "$JEV_B"
+  if printf '%s\n' "$OUT" | grep -qF 'someone-elses'; then fail "another key was printed"; fi
+  pass
+}
+
+jev_key_refuses_an_empty_or_malformed_key() {
+  local bad
+  for bad in "" "has a space in it 0123456789" "short"; do
+    jev_set "$bad"
+    [ "$RC" != 0 ] || fail "accepted '$bad'"
+    printf '%s\n' "$OUT" | grep -qF 'nothing changed' || fail "$OUT"
+    [ "$(cat "$R/etc/alice/jev.key")" = "$JEV_B" ] || fail "'$bad' replaced the key"
+  done
   pass
 }
 
@@ -953,11 +1177,17 @@ for CURRENT in \
   add_refuses_a_cpu_without_avx upgrade_refuses_a_cpu_without_avx upgrade_accepts_avx_without_avx2 \
   upgrade_refuses_a_binary_that_fails_its_self_test upgrade_installs_the_runtime_library_and_restores_it \
   upgrade_restores_the_library_when_the_binary_cannot_be_installed add_takes_a_time_zone \
-  upgrade_adds_the_time_zone_to_older_tenants \
+  upgrade_adds_the_time_zone_to_older_tenants adopt_installs_and_reports adopt_refuses_and_leaves_the_tenant_as_it_was \
+  adopt_refuses_bad_files_before_any_change adopt_rolls_back_when_the_tenant_does_not_come_back \
+  adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back commands_that_restart_daemons_wait_for_an_import \
+  dry_run_import_checks_the_disk_first \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \
   add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \
-  rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store \
+  rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store adopt_refuses_the_team_store \
+  jev_key_set_reaches_every_tenant_and_nothing_else jev_key_is_inherited_by_a_new_tenant \
+  jev_key_rotation_replaces_it_everywhere jev_key_status_names_tenants_and_never_the_key \
+  jev_key_refuses_an_empty_or_malformed_key \
   remove_person_deletes_the_team_copy remove_team_unprovisions provision_refuses_a_missing_team_token \
   refuses_to_run_with_empty_roots remove_archives_then_deletes \
   add_prints_a_single_quoted_mcp_hint no_remote_set_line; do

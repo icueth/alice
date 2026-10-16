@@ -325,6 +325,9 @@ fn json<T: serde::Serialize>(v: &T) -> CallToolResult {
 
 /// Whether a project name fits the limits: at most `MAX_PROJECT_NAME_CHARS` characters
 /// trimmed, and a slug of at most `MAX_PROJECT_SLUG_CHARS`.
+/// The header a tenant's MCP client may name its project in (after `?project=`, before a root).
+pub const PROJECT_HEADER: &str = "x-alice-project";
+
 fn within_project_limits(name: &str) -> bool {
     name.trim().chars().count() <= limits::MAX_PROJECT_NAME_CHARS
         && alice_core::normalize::slugify(name).chars().count() <= limits::MAX_PROJECT_SLUG_CHARS
@@ -379,11 +382,14 @@ impl AliceMcp {
 
     /// The project identity of a call: `(project_hint, cwd)`. On a server tenant a client's
     /// path means nothing (no git there), so `cwd` is none and the hint is the `?project=` of
-    /// the MCP URL, else the name of the client's first root; the service slugifies it. Locally
-    /// the hint stays empty and `cwd` is as `cwd` says.
+    /// the MCP URL, else the `X-Alice-Project` header (Claude Code sends no roots over HTTP; its
+    /// `headersHelper` can send the checkout's name), else the name of the client's first root;
+    /// the service slugifies it. A tool's own `project` argument beats all three. Locally the
+    /// hint stays empty and `cwd` is as `cwd` says.
     ///
-    /// A `?project=` over the name or slug limit fails the call (the message names the limit,
-    /// never the value); a root basename over either is dropped, so the call falls to `global`.
+    /// A `?project=` or header over the name or slug limit fails the call (the message names the
+    /// limit, never the value); a root basename over either is dropped, so the call falls to
+    /// `global`.
     async fn hint_and_cwd(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -391,21 +397,30 @@ impl AliceMcp {
         if !matches!(&self.backend, Backend::Local(s) if s.is_tenant()) {
             return Ok((None, self.cwd(ctx).await));
         }
-        let queried = ctx
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|p| p.uri.query())
-            .and_then(|q| {
-                url::form_urlencoded::parse(q.as_bytes())
-                    .find(|(k, v)| k == "project" && !v.trim().is_empty())
-                    .map(|(_, v)| v.into_owned())
-            });
-        let hint = match queried {
+        let parts = ctx.extensions.get::<axum::http::request::Parts>();
+        let queried = parts.and_then(|p| p.uri.query()).and_then(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .find(|(k, v)| k == "project" && !v.trim().is_empty())
+                .map(|(_, v)| v.into_owned())
+        });
+        // UTF-8, so a checkout named in Thai comes through as it is.
+        let header = parts
+            .and_then(|p| p.headers.get(PROJECT_HEADER))
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(String::from);
+        let (named, from) = match (queried, header) {
+            (Some(q), _) => (Some(q), "?project="),
+            (None, Some(h)) => (Some(h), "the X-Alice-Project header"),
+            (None, None) => (None, ""),
+        };
+        let hint = match named {
             Some(q) if within_project_limits(&q) => Some(q),
             Some(_) => {
                 return Err(McpError::invalid_params(
                     format!(
-                        "the project name in ?project= is too long: at most {} characters, and its slug at most {}",
+                        "the project name in {from} is too long: at most {} characters, and its slug at most {}",
                         limits::MAX_PROJECT_NAME_CHARS,
                         limits::MAX_PROJECT_SLUG_CHARS
                     ),

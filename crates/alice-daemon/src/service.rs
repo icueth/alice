@@ -30,7 +30,7 @@ use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
 use alice_core::redact::Redactor;
 use alice_core::search::{self, SearchOutput, SearchParams, pack};
-use alice_core::settings::{self, DefaultRecallMode, SettingError, Settings};
+use alice_core::settings::{self, DefaultRecallMode, ProjectTree, SettingError, Settings};
 use alice_core::store::embeddings;
 use alice_core::store::events::{Actor, EventRow};
 use alice_core::store::history::UndoOutcome;
@@ -191,12 +191,12 @@ fn query_cloud(
                 .unwrap_or(DetectedForRead::Unstored);
             // What the working tree itself says (its `.alice.toml` and the global lists), for a
             // project the store does not hold as the detected one.
-            let root = r.root.as_deref();
+            let tree = r.tree();
             let tree_allows = !r.slug.trim().is_empty()
                 && [r.slug.as_str(), r.name.as_str()]
                     .into_iter()
                     .filter(|n| !n.trim().is_empty())
-                    .all(|n| settings.cloud_allowed(n, root));
+                    .all(|n| settings.cloud_allowed(n, tree.as_ref()));
             match found {
                 DetectedForRead::Stored(p) => {
                     known(cloud.cloud_allowed(&p.slug), cloud.redactor(&p.slug))
@@ -206,12 +206,12 @@ fn query_cloud(
                 // file). A tree that denies is judged as an unstored one is: denied.
                 DetectedForRead::Placeholder(p) => QueryCloud {
                     allowed: tree_allows && cloud.cloud_allowed(&p.slug),
-                    redactor: redactors.for_root_always_on(root),
+                    redactor: redactors.for_root_always_on(tree.as_ref()),
                     unstored: !tree_allows,
                 },
                 DetectedForRead::Ambiguous(_) | DetectedForRead::Unstored => QueryCloud {
                     allowed: tree_allows,
-                    redactor: redactors.for_root_always_on(root),
+                    redactor: redactors.for_root_always_on(tree.as_ref()),
                     unstored: true,
                 },
             }
@@ -717,17 +717,13 @@ impl Service {
     }
 }
 
-/// The working-tree root of the project `choice` names.
-fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<PathBuf> {
+/// The working tree of the project `choice` names, keyed by the project.
+fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<ProjectTree> {
     match choice {
-        ProjectChoice::Detected(r) => r.root.clone(),
+        ProjectChoice::Detected(r) => r.tree(),
         // `global` has no working tree: the global privacy settings apply.
         ProjectChoice::Fallback => None,
-        ProjectChoice::Slug(s) => readers
-            .with(|c| projects::root_of(c, s))
-            .ok()
-            .flatten()
-            .map(PathBuf::from),
+        ProjectChoice::Slug(s) => readers.with(|c| projects::tree_of(c, s)).ok().flatten(),
     }
 }
 
@@ -1515,9 +1511,9 @@ impl Service {
         }
     }
 
-    /// The working-tree root of the project a write goes to, if it has one. A named project is
+    /// The working tree of the project a write goes to, if it has one. A named project is
     /// looked up in the database, so call this off the async runtime.
-    pub fn project_root(&self, choice: &ProjectChoice) -> Option<PathBuf> {
+    pub fn project_root(&self, choice: &ProjectChoice) -> Option<ProjectTree> {
         project_root_in(&self.readers, choice)
     }
 
@@ -1530,8 +1526,8 @@ impl Service {
         };
         let (readers, settings) = (self.readers.clone(), self.settings.clone());
         tokio::task::spawn_blocking(move || {
-            let root = project_root_in(&readers, &choice);
-            settings.project_fail_closed(root.as_deref())
+            let tree = project_root_in(&readers, &choice);
+            settings.project_fail_closed(tree.as_ref())
         })
         .await
         .unwrap_or(false)
@@ -1544,8 +1540,8 @@ impl Service {
         let (readers, redactors, choice) =
             (self.readers.clone(), self.redactors.clone(), choice.clone());
         tokio::task::spawn_blocking(move || {
-            let root = project_root_in(&readers, &choice);
-            redactors.for_root(root.as_deref())
+            let tree = project_root_in(&readers, &choice);
+            redactors.for_root(tree.as_ref())
         })
         .await
         .map_err(join_err)
@@ -1556,12 +1552,11 @@ impl Service {
     async fn redactor_for_memory(&self, id: String) -> Result<Arc<Redactor>> {
         let (readers, redactors) = (self.readers.clone(), self.redactors.clone());
         tokio::task::spawn_blocking(move || {
-            let root = readers
-                .with(|c| projects::root_of_memory(c, &id))
+            let tree = readers
+                .with(|c| projects::tree_of_memory(c, &id))
                 .ok()
-                .flatten()
-                .map(PathBuf::from);
-            redactors.for_root(root.as_deref())
+                .flatten();
+            redactors.for_root(tree.as_ref())
         })
         .await
         .map_err(join_err)
@@ -1686,17 +1681,22 @@ impl Service {
         let project = self.choose(req.scope()).await?;
         let req = self.redact_remember_in(&project, req).await?;
         let slug = choice_slug(&project);
+        // Superseding marks the older memory too: only its author may (spec §2.10).
+        let supersedes: Vec<String> = req
+            .supersedes
+            .iter()
+            .map(|id| id.strip_prefix(TEAM_PREFIX).unwrap_or(id).to_string())
+            .collect();
+        for id in &supersedes {
+            self.require_shared_author(id).await?;
+        }
         let body = RememberRequest {
             content: req.content,
             kind: req.kind,
             title: req.title,
             topics: req.topics,
             importance: req.importance,
-            supersedes: req
-                .supersedes
-                .iter()
-                .map(|id| id.strip_prefix(TEAM_PREFIX).unwrap_or(id).to_string())
-                .collect(),
+            supersedes,
             // Keys are per tenant: another tenant's retry key must not return this memory.
             idempotency_key: req.idempotency_key.map(|k| format!("{tenant}:{k}")),
             project_hint: (slug != "global").then_some(slug),
@@ -1712,13 +1712,7 @@ impl Service {
                 SHARED_TIMEOUT,
             )
             .await
-            .map_err(|e| match e {
-                // The team store's own refusal (its redaction rules) is the answer as it is.
-                e if alice_core::redact::is_refusal(&e) => e,
-                e => AliceError::Other(format!(
-                    "the team memory is unreachable ({e}); nothing was saved. Retry, or save it personally without shared"
-                )),
-            })?;
+            .map_err(shared_write_error)?;
         Ok(RememberResponse {
             id: r.id.map(|id| format!("{TEAM_PREFIX}{id}")),
             status: r.status,
@@ -3135,9 +3129,15 @@ impl Service {
 
     fn view_with(
         &self,
-        secrets: BTreeMap<String, SecretStatus>,
+        mut secrets: BTreeMap<String, SecretStatus>,
         mut notes: Vec<String>,
     ) -> SettingsView {
+        // On a server the Jev key is the owner's (addendum 5): a person sees only that it is set.
+        if self.opts.tenant {
+            for s in secrets.values_mut() {
+                s.hint = None;
+            }
+        }
         // The errors before the settings: a reload swaps the settings first and clears the
         // errors second, so an empty list read here is followed by settings that are new.
         let errors = self.settings.errors();
@@ -3619,8 +3619,13 @@ impl Service {
         req = tokio::task::spawn_blocking(move || -> Result<IngestRequest> {
             req.source.uri = redact_field(&r, "source uri", &req.source.uri)?;
             let mut redacted = 0usize;
-            for c in &mut req.chunks {
-                let text = r.check("chunk text", &c.text)?;
+            // In order: a private key cut across chunks is redacted in every one of them.
+            let mut order: Vec<usize> = (0..req.chunks.len()).collect();
+            order.sort_by_key(|&i| req.chunks[i].ord);
+            let mut open = false;
+            for i in order {
+                let c = &mut req.chunks[i];
+                let text = r.check_piece("chunk text", &c.text, &mut open)?;
                 if text != c.text {
                     redacted += 1;
                     c.text = text;
@@ -4184,8 +4189,8 @@ fn screen_resolution(
                 [&m.id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            let root = projects::root_of(c, &target.id)?;
-            let r = redactors.for_root(root.as_deref().map(Path::new));
+            let tree = projects::tree_of(c, &target.id)?;
+            let r = redactors.for_root(tree.as_ref());
             let apply = |field: &str, t: &str| -> Result<(String, bool)> {
                 let red = r.apply(t);
                 if red.found.is_empty() {
@@ -4228,6 +4233,26 @@ fn screen_resolution(
 
 /// The prefix of an id that lives in the team store.
 const TEAM_PREFIX: &str = "team:";
+
+/// What a person is told when a shared write fails. The team store's own answer (its redaction
+/// rules' refusal, an invalid request, a missing memory) is passed on as it is; no answer, or a
+/// broken one, after the request went out means it may have been saved; only a store that could
+/// not be reached means nothing was.
+fn shared_write_error(e: AliceError) -> AliceError {
+    let text = e.to_string();
+    match e {
+        e if alice_core::redact::is_refusal(&e) => e,
+        e @ (AliceError::Invalid(_) | AliceError::NotFound(_)) => e,
+        _ if text.contains("did not answer in time") || text.contains("broke off its answer") => {
+            AliceError::Other(format!(
+                "the team memory did not confirm the write ({text}); it may have been saved: recall it before saving it again"
+            ))
+        }
+        _ => AliceError::Other(format!(
+            "the team memory is unreachable ({text}); nothing was saved. Retry, or save it personally without shared"
+        )),
+    }
+}
 /// The team store's total time to answer a recall or a context, the batch `get` for authors
 /// included (spec §2.10).
 const TEAM_DEADLINE: Duration = Duration::from_millis(800);
@@ -9878,6 +9903,22 @@ mod tests {
         assert!(e.contains("server tenant"), "{e}");
     }
 
+    /// A tenant whose disk always has room: an accept test must not depend on the host's.
+    async fn tenant_svc_with_room() -> (tempfile::TempDir, Arc<Service>) {
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                free_space: Some(Arc::new(|_| Some(u64::MAX / 4))),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        (d, s)
+    }
+
     async fn tenant_svc() -> (tempfile::TempDir, Arc<Service>) {
         let d = tempfile::tempdir().unwrap();
         let s = Service::start(
@@ -10228,7 +10269,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_tenant_imports_only_from_its_import_inbox() {
-        let (d, s) = tenant_svc().await;
+        let (d, s) = tenant_svc_with_room().await;
         let inbox = d.path().join("import-inbox");
         let outside = tempfile::tempdir().unwrap();
         let out_palace = alice_core::import::fixture::synthetic_palace(outside.path(), 20).dir;
@@ -10687,5 +10728,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(w.project, "real-app");
+    }
+
+    /// Final review C1: on a server the Jev endpoint and the judge budget are the admin's, pinned
+    /// in the tenant file (here: the settings environment). A person's PATCH does not move them,
+    /// and the view shows the shared key as set without any hint of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_cannot_move_the_jev_endpoint_or_budget_and_sees_no_key_hint() {
+        let d = tempfile::tempdir().unwrap();
+        let store = MemSecrets::new(Duration::ZERO);
+        let official = "https://api.typesafe.ai/v1/systemone";
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                secrets: Some(store.clone()),
+                settings_env: Some(vec![
+                    ("ALICE_JUDGE_JEV_ENDPOINT".into(), official.into()),
+                    ("ALICE_JUDGE_DAILY_BUDGET_USD".into(), "1.0".into()),
+                ]),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.set_secret_async(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .await
+            .unwrap();
+        let out = s
+            .patch_settings(patch_one(
+                "judge.jev.endpoint",
+                serde_json::json!("https://collector.example/v1"),
+            ))
+            .unwrap();
+        assert!(
+            out.overridden_by_env
+                .iter()
+                .any(|k| k == "judge.jev.endpoint"),
+            "{out:?}"
+        );
+        s.patch_settings(patch_one(
+            "judge.daily_budget_usd",
+            serde_json::json!(500.0),
+        ))
+        .unwrap();
+        let v = s.settings_view_async().await;
+        assert_eq!(v.settings["judge"]["jev"]["endpoint"], official);
+        assert_eq!(v.settings["judge"]["daily_budget_usd"], 1.0);
+        let k = &v.secrets["jev_api_key"];
+        assert!(k.set && k.hint.is_none(), "{k:?}");
+    }
+
+    /// Final review M-3: the team store's own answers pass through; a timeout may have saved.
+    #[test]
+    fn a_shared_write_error_says_what_may_have_happened() {
+        let invalid = shared_write_error(AliceError::invalid("content is empty"));
+        assert!(matches!(&invalid, AliceError::Invalid(m) if m == "content is empty"));
+        let missing = shared_write_error(AliceError::NotFound("memory x".into()));
+        assert!(matches!(missing, AliceError::NotFound(_)));
+        let late = shared_write_error(AliceError::Other(
+            "the team store did not answer in time".into(),
+        ))
+        .to_string();
+        assert!(late.contains("may have been saved"), "{late}");
+        let down = shared_write_error(AliceError::Other(
+            "the team store is unreachable: connection refused".into(),
+        ))
+        .to_string();
+        assert!(down.contains("nothing was saved"), "{down}");
     }
 }

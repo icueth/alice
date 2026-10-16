@@ -227,6 +227,70 @@ async fn every_write_path_redacts_and_nothing_reaches_the_history_the_stream_or_
     assert_eq!(files_holding_a_secret(d.path()), Vec::<String>::new());
 }
 
+/// Final review A-I1: a private key cut by size across the chunks of one ingest (mid-line, in
+/// two and three chunks) leaves nothing of its body in the stored chunks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_private_key_cut_across_ingest_chunks_is_redacted_in_every_chunk() {
+    let (_d, s) = start().await;
+    let body: Vec<String> = (0..24u32)
+        .map(|i| {
+            (0..64u32)
+                .map(|j| {
+                    let n = (i * 37 + j * 11 + (i * j) % 13) % 64;
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[n as usize]
+                        as char
+                })
+                .collect()
+        })
+        .collect();
+    let text = format!(
+        "pasted:\n{}\n{}\n-----END RSA PRIVATE KEY-----\nand then the build passed",
+        concat!("-----BEGIN RSA PRIVATE ", "KEY-----"),
+        body.join("\n")
+    );
+    for (n, uri) in [(2usize, "two"), (3, "three")] {
+        let cuts: Vec<usize> = (0..=n)
+            .map(|k| (text.len() * k / n + 3 * k).min(text.len()))
+            .collect();
+        let chunks = cuts
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| ChunkInput {
+                ord: i as i64,
+                text: text[w[0]..w[1]].to_string(),
+                ..Default::default()
+            })
+            .collect();
+        s.ingest(IngestRequest {
+            source: SourceInput {
+                uri: uri.into(),
+                ..Default::default()
+            },
+            chunks,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let c = alice_core::store::open_reader(&s.home().db()).unwrap();
+    let mut stmt = c.prepare("SELECT text FROM chunks").unwrap();
+    let stored: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(stored.len(), 5);
+    let all = stored.join("\n");
+    let leaked: Vec<&str> = body
+        .iter()
+        .flat_map(|l| (0..=52).map(move |i| &l[i..i + 12]))
+        .filter(|w| all.contains(w))
+        .collect();
+    assert!(leaked.is_empty(), "{leaked:?} in {all}");
+    assert!(all.contains("and then the build passed"));
+    s.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_project_file_can_block_and_a_broken_one_fails_closed_keeping_its_patterns() {
     let (d, s) = start().await;
@@ -665,6 +729,200 @@ async fn a_moved_working_tree_brings_its_project_rules_to_update_and_undo() {
         .await
         .unwrap();
     assert_eq!(edited.memory.body, "see [REDACTED:custom:ticket]");
+    s.shutdown();
+}
+
+/// Final review A-C1: a write from a worktree that has no `.alice.toml` moves the project's
+/// stored root there, but the project's rules (and its cloud denial) stay, also after a restart
+/// and after that worktree is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_without_the_project_file_keeps_the_projects_rules_and_cloud_denial() {
+    use alice_core::settings::ProjectTree;
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git {args:?}");
+    }
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path().join("home");
+    let open = || {
+        Service::start(
+            AliceHome::new(home.clone()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions::default(),
+        )
+        .unwrap()
+    };
+    let (main, feat) = (d.path().join("client-x"), d.path().join("client-x-feat"));
+    for dir in [&main, &feat] {
+        std::fs::create_dir(dir).unwrap();
+        git(dir, &["init", "-q"]);
+        git(
+            dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/me/client-x.git",
+            ],
+        );
+    }
+    std::fs::write(
+        main.join(".alice.toml"),
+        "[privacy]\ncloud_denied = true\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
+    )
+    .unwrap();
+    let remember = |s: &Arc<Service>, dir: &Path, content: &str| {
+        let (s, cwd) = (s.clone(), dir.to_string_lossy().into_owned());
+        let content = content.to_string();
+        async move {
+            s.remember(RememberRequest {
+                content,
+                cwd: Some(cwd),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let key = "example.com/me/client-x";
+    let s = open();
+    remember(&s, &main, "a note from the main checkout").await;
+    let from_feat = remember(&s, &feat, "see TCK-12345 from the worktree").await;
+    let body = |s: &Arc<Service>, id: String| {
+        let s = s.clone();
+        async move {
+            s.get(GetRequest {
+                ids: vec![id],
+                include_provenance: false,
+            })
+            .await
+            .unwrap()
+            .memories[0]
+                .memory
+                .body
+                .clone()
+        }
+    };
+    assert_eq!(
+        body(&s, from_feat.id.clone().unwrap()).await,
+        "see [REDACTED:custom:ticket] from the worktree"
+    );
+    let denied = |s: &Arc<Service>, root: &Path| {
+        !s.settings_handle()
+            .cloud_allowed("client-x", Some(&ProjectTree::new(key, root)))
+    };
+    assert!(
+        denied(&s, &feat),
+        "the worktree has no file, the project is denied"
+    );
+    s.shutdown();
+    drop(s);
+
+    // A restart, then the worktree is removed: still denied, still redacted.
+    let s = open();
+    assert!(denied(&s, &feat));
+    std::fs::remove_dir_all(&feat).unwrap();
+    assert!(denied(&s, &feat), "a removed worktree loosens nothing");
+    let again = remember(&s, &main, "TCK-99999 again").await;
+    assert_eq!(
+        body(&s, again.id.unwrap()).await,
+        "[REDACTED:custom:ticket] again"
+    );
+    s.shutdown();
+}
+
+/// Final review A-I4: a daemon that starts while `config.toml` does not parse keeps the privacy
+/// last applied from a valid file (custom patterns) and blocks secrets; a home that never had a
+/// valid file blocks secrets too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_started_with_a_broken_config_keeps_the_last_privacy_and_blocks_secrets() {
+    let d = tempfile::tempdir().unwrap();
+    let open = |dir: &Path| {
+        Service::start(
+            AliceHome::new(dir.to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions::default(),
+        )
+        .unwrap()
+    };
+    let remember = |s: &Arc<Service>, content: String| {
+        let s = s.clone();
+        async move {
+            s.remember(RememberRequest {
+                content,
+                ..Default::default()
+            })
+            .await
+        }
+    };
+    let home = AliceHome::new(d.path().to_path_buf());
+    std::fs::write(
+        home.config_file(),
+        "[privacy]\ncustom_patterns = [{ name = \"acme\", regex = \"ACME-[0-9]{6}\" }]\n",
+    )
+    .unwrap();
+    let s = open(d.path());
+    remember(&s, "ticket ACME-123456 is open".into())
+        .await
+        .unwrap();
+    s.shutdown();
+    drop(s);
+    // A typo, then a restart.
+    std::fs::write(home.config_file(), "[privacy\ncustom_patterns = [").unwrap();
+    let s = open(d.path());
+    assert!(s.settings_handle().config_degraded());
+    let e = remember(&s, "ticket ACME-654321 again".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, alice_core::error::AliceError::Refused { detectors, .. } if detectors == &["custom:acme"]),
+        "{e:?}"
+    );
+    let e = remember(&s, format!("deploy with {GITHUB}"))
+        .await
+        .unwrap_err();
+    assert!(alice_core::redact::is_refusal(&e), "{e:?}");
+    remember(&s, "nothing secret here".into()).await.unwrap();
+    assert!(
+        s.settings_handle()
+            .warnings()
+            .iter()
+            .any(|w| w.contains("config.toml cannot be used")),
+        "{:?}",
+        s.settings_handle().warnings()
+    );
+    s.shutdown();
+    drop(s);
+    // Fixed: the file applies again (the loosening from block mode waits for its polls).
+    std::fs::write(
+        home.config_file(),
+        "[privacy]\ncustom_patterns = [{ name = \"acme\", regex = \"ACME-[0-9]{6}\" }]\n",
+    )
+    .unwrap();
+    let s = open(d.path());
+    assert!(!s.settings_handle().config_degraded());
+    remember(&s, format!("deploy with {GITHUB}")).await.unwrap();
+    s.shutdown();
+
+    // A fresh home whose first file is broken: nothing kept, secrets blocked all the same.
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::write(
+        AliceHome::new(fresh.path().to_path_buf()).config_file(),
+        "[privacy\n",
+    )
+    .unwrap();
+    let s = open(fresh.path());
+    let e = remember(&s, format!("deploy with {GITHUB}"))
+        .await
+        .unwrap_err();
+    assert!(alice_core::redact::is_refusal(&e), "{e:?}");
     s.shutdown();
 }
 

@@ -9,6 +9,9 @@
   earlier section, that section says so; §2.8 and §2.9 hold the new design. **Addendum 3** (the owner: shared team
   memory) folded in; §2.10 holds it. **The server's CPU has AVX but not AVX2** (controller, 2026-10-16): server builds link
   Microsoft's ONNX Runtime and `alice-server` self-tests every binary before it switches a unit; §2.11 holds it.
+  **Addendum 4** (the owner already runs Alice locally): `alice-server adopt` moves a person's own database onto their
+  fresh tenant; §2.12 holds it. **Addendum 5** (the owner): Jev is on for every tenant with the owner's one key;
+  §2.13 holds it.
 - **Owner:** icueth (vision); technical choices delegated to this lane
 - **Lane:** server mode, worktree `project-alice-srv`, branch `feat/server-mode` (from `feat/m2-judge-settings` b28b99f)
 - **Builds on:** `2026-10-13-alice-core-design.md` (the core spec), the M2 handoff `docs/superpowers/handoff/2026-10-14-m2-handoff.md`
@@ -102,9 +105,8 @@
 
 ### 0.4 Out of scope
 
-Accounts, a web UI, a domain, Docker, encryption at rest, and moving an existing local **Alice** home
-onto a tenant. A person brings their history by importing their MemPalace palace instead (§3.8). Moving an Alice home is
-possible by hand (§10, Q2) but is not built here. (Shared team memory was out of scope here; addendum 3 brings it in,
+Accounts, a web UI, a domain, Docker and encryption at rest. (Moving an existing local Alice home onto a tenant was out
+of scope here; addendum 4 brings it in, §2.12. Shared team memory was out of scope here; addendum 3 brings it in,
 §2.10.)
 
 ---
@@ -419,7 +421,8 @@ last line with the free space on the disk that holds `/srv/alice`, and the size 
 
 ### 2.6 Jev per tenant
 
-Nothing is configured centrally. A person turns Jev on for their own tenant from their own client:
+*(Superseded by addendum 5, §2.13: one shared key set by the admin with `alice-server jev-key set`; the secret's name is
+`jev_api_key`, not `typesafe`.)* Nothing is configured centrally. A person turns Jev on for their own tenant from their own client:
 `alice config set-secret typesafe`, then `alice config set judge.provider jev`. Both go through `PUT /api/v1/secrets/typesafe`
 and `PATCH /api/v1/settings` to that tenant's `secrets.toml` (the `file` backend, 0600, owned by `alice-<name>`). The tenant's
 `judge.daily_budget_usd` caps the spend. Other tenants cannot read the file: separate Unix users, 0700 homes. The default
@@ -558,7 +561,8 @@ Its home gets `team.token` (the team's token; mode 0600, owned by `alice-<name>`
 Both variables join `NON_SETTING_ENV`. No setting, endpoint or answer reads, changes or reveals the team URL or token.
 
 **The link.** The personal daemon's `TeamLink` is built at start from `ALICE_TEAM_URL` and reads `<home>/team.token`.
-- It accepts only `http://127.0.0.1:<port>`, `http://localhost:<port>` or `http://[::1]:<port>`. Anything else disables
+- It accepts only `http://127.0.0.1:<port>` or `http://localhost:<port>` (`alice-server` writes 127.0.0.1; `[::1]` is
+  refused, which fails closed). Anything else disables
   the link, with a warning in the log and in health.
 - It verifies the team daemon's ping proof with the token (the proof check of §3.2, using the answer's instance) before
   the first call, and again after a 401 or a transport error, re-reading the token file.
@@ -641,6 +645,76 @@ The server's CPU is a Xeon E5-2620 (Sandy Bridge): AVX, no AVX2, FMA or F16C, wh
   finds it by vector and words, `alice doctor` clean. Embedding throughput with chunks shaped like the M3 fixture palace's
   (750 characters on average): **5.5 chunks per second** on the 4 vCPUs, so a 121,000-chunk palace takes **about 6 hours** to
   embed. The daemon uses up to 4 ONNX threads, so an import competes with the other tenants for the CPU while it runs.
+
+### 2.12 Adopting a person's local Alice (addendum 4)
+
+The owner already runs Alice on their Mac (3,286 memories, 121,007 chunks, every embedding done, projects cleaned by
+hand, memories that MemPalace does not have). A MemPalace import would lose the cleanups and those memories and take
+about 6 hours to embed. The other people keep the MemPalace import.
+
+- **`alice-server adopt <name> <backup-file> [--cloud-denied <slug,…>]`** (root): the person's `alice backup now` file becomes the tenant's
+  database. It refuses the team store, a file that is not a regular file owned by the admin (`SUDO_UID`), and a disk with
+  less than twice the file plus 2 GB free. It copies the file into `<home>/adopt-inbox/` (the tenant's, 0600), stops the
+  unit, runs `alice --json adopt <copy>` as the tenant, starts the unit and waits for its ping. If the tenant does not
+  come back, it restores the before-restore backup the report names (`alice restore <name> --yes`) and starts it again.
+  The staged copy is always removed; the admin's file is left, with a reminder to delete it.
+- **`alice adopt <file>`** (hidden; `alice_daemon::adopt`), with no daemon running:
+  1. checks the file: `restore::open_ro`, the schema exactly `migrations::CURRENT_VERSION` (older: "upgrade the source
+     Alice first"; newer: "upgrade the server first"), `PRAGMA integrity_check` = ok, then `restore::verify`;
+  2. refuses a tenant whose database holds any memory, chunk or relation;
+  3. swaps the file in with `restore::swap_verified` (the tenant's own database is kept as a before-restore backup; the
+     vector index files are dropped and rebuilt at the next start from the stored embeddings);
+  4. in one transaction with `secure_delete` on: clears `projects.root_path`; rewrites project keys and key aliases that
+     start with `path:` to `adopted:<sha256[..32]>` (R41); rewrites `sources.uri` values that are file paths (`/`, `~`,
+     `file:`, a drive letter, `\\`) to `adopted:<sha256[..32]>/<file name>`; replaces those old values in event
+     snapshots and review payloads; redacts every memory's title and body with the tenant's always-on rules through
+     the ordinary edit (`memory.edit` by `system`, snapshots redacted; a memory whose redacted text equals another
+     memory's is trashed first, R42), every raw chunk in place (FTS re-indexed, its embedding deleted, `embed_state`
+     pending, a `chunk.redact` event that is never undone), and every event snapshot and review payload (R43); deletes
+     the judge cache; then checkpoints the WAL into the file;
+  5. on any failure after the swap, swaps the tenant's own database back, so an unscrubbed copy is never served;
+  6. reports memories, chunks, facts, projects, paths cleared, records rewritten, redactions, duplicates trashed, the
+     saved database and the time.
+- Facts (`relations.object_literal`), entity names and topics are taken as they are: §2.12 redacts memories, raw chunks
+  and history only (final review M-8, parked). After the transaction the file is optimised (the four FTS5 tables merge)
+  and rewritten with `VACUUM`, so no replaced or deleted text stays in its pages (final review I-2); if the swap back
+  fails, `alice adopt` says `[not put back]` and `alice-server` leaves the tenant stopped (M-4).
+- Settings, secrets, the token and the Jev key are not taken from the source: only `alice.db` changes. The person's
+  cloud denials therefore do not come along on their own (final review I-4): `--cloud-denied` (slugs, a-z 0-9 -) sets
+  the tenant's `privacy.cloud_denied_projects` once it answers, and the report's `projects_with_roots` names the
+  projects that had a working tree (whose `.alice.toml` may have denied the cloud).
+- If the source used another embedding model, the existing re-embed path runs at start.
+- Content is not scrubbed: a memory that mentions a file path in its text keeps it (it is what the person wrote). The
+  staging check "no client path in the store" applies to the columns above.
+
+### 2.13 One shared Jev key (addendum 5)
+
+Jev is on for everyone on this server, with the owner's single key, which the owner manages; people never see or
+supply a key.
+
+- **`alice-server jev-key set`** (root): reads the key from `/dev/tty` with echo off, or from stdin when it is not a
+  terminal; never argv or the environment. Refuses an empty key, one with spaces, quotes or backslashes, or one shorter
+  than 16 characters, before any change. Writes it to `/etc/alice/jev.key` (root, 0600, through a temporary file made
+  under `umask 077`), then for every tenant, the team store included, pipes it into `alice config set-secret
+  jev_api_key` and runs `alice config set judge.provider jev` as that tenant (through its running daemon, so it applies
+  at once: the tenant's `secrets.toml` is 0600 and its user's). Their output is discarded (it carries a hint of the
+  key). Tenants that did not take it are named and the command exits non-zero. Re-running it rotates the key
+  everywhere.
+- **`alice-server add`** gives a new tenant the key and the Jev judge when `/etc/alice/jev.key` exists (a failure undoes
+  the add).
+- **`alice-server jev-key status`**: set or not set (with the file's time) and, per tenant, "the server's key",
+  "another key" or "no key", read by root from the tenant's `secrets.toml` and compared in the shell; no value or part
+  of one is printed (R45).
+- **Budget:** each tenant keeps its own `judge.daily_budget_usd` (1.0 by default); `docs/server.md` states the
+  deployment-wide ceiling (tenants × the per-tenant budget) and how to change one tenant's.
+- **Pins (final review C1, R46):** every tenant file carries `ALICE_JUDGE_JEV_ENDPOINT=<Jev's endpoint>` and
+  `ALICE_JUDGE_DAILY_BUDGET_USD=1.0`; the environment wins over a person's `PATCH /api/v1/settings` (reported as
+  overridden), so the owner's key goes nowhere else and the budget holds. `upgrade` adds both where missing and keeps a
+  budget the admin changed. A tenant's settings view shows a secret as set with no hint.
+- **SP2:** `give_jev_key` is the one place a tenant is switched to Jev; `distill.provider = jev` joins it when SP2 lands
+  on this branch.
+- Real check: a **dummy** key on a staging tenant (the judge fails closed with a note); never the owner's key, which the
+  owner sets at handover. The dummy key file is removed afterwards.
 
 ## 3. Client remote mode (deferred by addendum 2)
 
@@ -1055,7 +1129,8 @@ daemon's connection is dropped by the unit's `IPAddressDeny` (R18), and the embe
   - the team store has no route from outside, and its token lives only in each personal home (0600);
   - the team URL and token cannot be read or set through any API;
   - a person can change only the shared memories they wrote;
-  - team texts never go to a person's cloud judge.
+  - a team text reaches a person's cloud judge only when the team store marks it `cloud_ok` and the person's own policy
+    allows its project (revised R35, Task 30).
 - **Import (addendum 1, dropped):** a person's palace never leaves their machine unredacted. The bundle holds only redacted text, and in block mode
   the drawers with secrets are held back. The server reads an uploaded SQLite file read-only with `trusted_schema = OFF`
   after `quick_check`, as the tenant's own Unix user, so a crafted file can only affect the tenant that sent it.
@@ -1156,6 +1231,14 @@ the tests cover the following.
   - (R40) `add` writes `TZ=Asia/Bangkok` by default and `--tz <zone>` when given; an unknown or malformed zone is refused
     before any change; `add <existing> --tz` changes the zone and restarts that tenant; `upgrade` adds the default to a
     tenant file without `TZ` and keeps one set with `--tz`;
+  - (§2.12) `adopt` copies the file to the tenant's inbox, stops, runs `alice --json adopt`, starts and reports; a refusal
+    from `alice adopt` (non-empty tenant, another schema, a damaged file) starts the unit again and changes nothing; a
+    symlink, a missing file, another user's file, a full disk, an unknown tenant and the team store are refused before
+    any command; a tenant that does not come back gets its own database back (`alice restore <saved> --yes`);
+  - (§2.13) `jev-key set` with a key on stdin: every tenant, the team store included, holds it in a 0600
+    `secrets.toml` with `judge.provider = jev`; `/etc/alice/jev.key` is 0600; the key is in no command line (the calls
+    log), tenant file or output, nor its last four characters; `add` after `set` inherits it; a second `set` rotates it
+    everywhere; `status` names each tenant's state and prints no key; an empty, spaced or short key changes nothing;
   - (§2.11) `build-release` refuses a download that fails its SHA-256 (deleted, never unpacked), and links the pinned
     runtime with the rpath and the dist layout above (stubbed `curl`, `cargo`, `sha256sum` and `uname`).
 
@@ -1165,7 +1248,8 @@ the tests cover the following.
    - Install rustup with the toolchain from `rust-toolchain.toml`, check out `feat/server-mode` and run
      `cargo build --release -p alice`.
    - Install the binary. Then remove `target/`, `~/.cargo/registry`, `~/.cargo/git`, the checkout and the toolchain
-     (`rustup self uninstall -y`).
+     (`rustup self uninstall -y`). *(Superseded by R38: the server builds its own binary with `build-release`, so the
+     checkout and the toolchain stay; see docs/server.md's disk budget.)*
    - Record `df -h` again. This happens before any tenant or import exists.
 2. Install `alice-server`, then run `alice-server add t1` and `alice-server add t2`. Diff the managed Caddyfile against
    `Caddyfile.pre-alice`: the IP certificate settings and `default_sni` must be unchanged. Check that a reload works through
@@ -1246,7 +1330,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R22 | **Wings travel as redacted names; no `ClientProject` per wing** | M3's wing map is name-based and imported projects are placeholders; the first `client_project` of the same slug adopts the placeholder and brings its mirror, which is the local behaviour | An imported project's own `.alice.toml` applies only from that project's first remote request on, as locally |
 | R23 | **Backups pinned to 2 scheduled, 0 weekly, no manual** on tenants (environment plus a tenant-mode refusal) | The disk is fixed (§2.7); manual backups are kept apart from the rotation | A person cannot make an extra copy on demand; the admin can |
 | R24 | **Upload guard:** 4 GiB cap, refused below 2 GB free after the upload, one at a time, swept after 1 hour | The import must never be what fills the disk | A palace whose redacted text exceeds 4 GiB cannot be imported in one go; no such palace is known |
-| R25 | After the build, **only the binary stays** (target, caches, checkout and toolchain removed) | About 6 GB back before any data exists | The next build reinstalls the toolchain (minutes) |
+| R25 | *(Superseded by R38: the build area stays.)* After the build, **only the binary stays** (target, caches, checkout and toolchain removed) | About 6 GB back before any data exists | The next build reinstalls the toolchain (minutes) |
 | R26 | The connection's default project is the **query `?project=<slug>`** on the MCP URL (addendum 2 let us pick header or query) | Every MCP client can set a URL; not every one can set custom headers; Caddy keeps the query when it strips the prefix | The slug shows in Caddy's access log (a project name, not a secret) |
 | R27 | An MCP project hint that names no stored project makes a placeholder with the **existing `import:` prefix**, not `mcp:` | The store adopts only `import:%` placeholders; an `mcp:` key would split one project between MCP writes and its import and never be adopted | The key's prefix reads "import" for a project that started over MCP (internal only) |
 | R28 | Tenant mode **forces `privacy.redact` on** for every write and refuses `privacy.redact = false` | Direct MCP sends text unredacted inside TLS; the server is the only place left to redact it | A person cannot store raw secrets on the server |
@@ -1263,6 +1347,12 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R38 | Server builds link **Microsoft's ONNX Runtime 1.24.4** dynamically (pinned SHA-256), with the binary's rpath at `$ORIGIN/../lib/alice` (controller's ruling; §2.11) | The server's CPU has no AVX2; Microsoft's build dispatches its kernels at run time. An rpath needs no environment in the units or the admin's shell | A future ort release that needs a newer ONNX Runtime API means a new pin; the library must travel with the binary (`upgrade` installs both) |
 | R39 | `upgrade` **self-tests** the new binary (`alice model check` in a throwaway home) before it installs anything, and the installed pair before it restarts a unit | `--version` runs even where the runtime cannot; only embedding a text proves it | About 2 to 5 s per self-test, plus a 136 MB model fetched once into `/var/cache/alice-server/models` |
 | R40 | Each tenant's daemon runs in **its person's time zone** (`TZ` in the tenant file; `Asia/Bangkok` by default, `--tz` per person, checked against `/usr/share/zoneinfo`; `upgrade` adds the default where it is missing) (controller's ruling) | The importer reads MemPalace's naive local times with the daemon's local offset; on a UTC server every imported time would be 7 hours off for this team. Stored times stay UTC | Logs and daily schedules also follow the person's zone; a person who moves needs `add <name> --tz` |
+| R41 | `adopt` rewrites project keys made from a folder (`path:<root>`) and file-path source URIs to `adopted:<hash>` (a source keeps its file name) | Addendum 4 keeps keys, but such a key is itself a client path; on a tenant projects are found by slug and alias, never by key | A future client that sends the same checkout's `path:` key would not match the adopted project (it would adopt a placeholder by slug, as for imports) |
+| R42 | A memory whose text, once redacted, equals another memory's is trashed before it is redacted | The unique-content rule would otherwise make the whole adoption fail on one pair of notes that differ only by a secret | The trashed copy stays in the trash; nothing is lost but the duplicate |
+| R43 | `adopt` also redacts event snapshots and review payloads, and deletes the judge cache | History and the inbox hold what the person's machine stored; a tenant's database must hold no unredacted secret | Undo of an older edit restores redacted text, as it does for anything the rules redact |
+| R44 | The server keeps the shared Jev key in `/etc/alice/jev.key` (root, 0600) | `add` needs the value for each new tenant; re-reading a tenant's `secrets.toml` would tie the script to that file's format | One more root-only copy of the key on the server |
+| R45 | `jev-key status` prints no hint of a key (not even its last four characters, which `config set-secret` shows) | Addendum 5: status never prints the value | Telling two keys apart needs `jev-key set` again |
+| R46 | The Jev endpoint and the judge budget are pinned in every tenant file (final review C1) | With one shared key, a person who could change the endpoint could send the owner's key to their own host; one who could raise the budget would spend the owner's money | Changing a tenant's budget means editing its tenant file and restarting it |
 
 ---
 
@@ -1270,8 +1360,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 
 - **Q1 — Trust model:** the admin (the owner) can read every tenant's memory and key; this is documented in `docs/server.md`.
 - **Q2 — History:** importing each person's own MemPalace palace into their own tenant is **in scope** (addendum 1, §3.8).
-  Moving an existing local Alice home stays out of scope (possible by hand: the admin restores a backup into the tenant
-  home, and R3 keeps those projects fail-closed until the owner's client sends each project's identity once).
+  Moving an existing local Alice home was out of scope here; addendum 4 brings it in (`alice-server adopt`, §2.12).
 - **Tenants:** `icue`, `joe-hermes`, `joe` and `petch`, created after the controller's go (§8.3 step 10).
 - **Addendum 2 (the owner, 2026-10-15 20:30):**
   - no Windows;

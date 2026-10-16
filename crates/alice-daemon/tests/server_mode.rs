@@ -40,9 +40,26 @@ impl ClientHandler for Agent {
 type Conn = RunningService<RoleClient, Agent>;
 
 async fn connect(url: &str, token: Option<&str>, root: Option<&Path>) -> Result<Conn, String> {
+    connect_with_header(url, token, root, None).await
+}
+
+/// `connect`, sending `X-Alice-Project: <project>` on every request when one is given (what
+/// Claude Code's `headersHelper` does).
+async fn connect_with_header(
+    url: &str,
+    token: Option<&str>,
+    root: Option<&Path>,
+    project: Option<&str>,
+) -> Result<Conn, String> {
     let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.to_string());
     if let Some(t) = token {
         cfg = cfg.auth_header(t.to_string());
+    }
+    if let Some(p) = project {
+        cfg.custom_headers.insert(
+            axum::http::HeaderName::from_static("x-alice-project"),
+            axum::http::HeaderValue::from_str(p).unwrap(),
+        );
     }
     let uri = root.map(|p| url::Url::from_directory_path(p).unwrap().to_string());
     tokio::time::timeout(
@@ -217,10 +234,58 @@ async fn mcp_project_precedence() {
         .unwrap();
     let out = remember(c, "nothing names the project", serde_json::json!({})).await;
     assert!(out.contains("global"), "{out}");
+    // The X-Alice-Project header beats a root; ?project= beats the header.
+    let c = connect_with_header(
+        &format!("{base}/mcp"),
+        Some(&t.token),
+        Some(root),
+        Some("Header App"),
+    )
+    .await
+    .unwrap();
+    let out = remember(c, "the header wins over the root", serde_json::json!({})).await;
+    assert!(out.contains("header-app"), "{out}");
+    let c = connect_with_header(
+        &format!("{base}/mcp?project=queried"),
+        Some(&t.token),
+        None,
+        Some("Header App"),
+    )
+    .await
+    .unwrap();
+    let out = remember(c, "the query wins over the header", serde_json::json!({})).await;
+    assert!(out.contains("queried"), "{out}");
+    // Over the limit, the header fails the call as the query does.
+    let long = "h".repeat(250);
+    let c = connect_with_header(&format!("{base}/mcp"), Some(&t.token), None, Some(&long))
+        .await
+        .unwrap();
+    let args = serde_json::json!({"content": "never stored"});
+    let e = c
+        .call_tool(
+            CallToolRequestParams::new("remember")
+                .with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    c.cancel().await.ok();
+    assert!(e.contains("the X-Alice-Project header is too long"), "{e}");
 
     let mut slugs: Vec<String> = stored(&t.home).into_iter().map(|r| r.0).collect();
     slugs.sort();
-    assert_eq!(slugs, ["alpha", "alpha", "global", "queried", "root-repo"]);
+    assert_eq!(
+        slugs,
+        [
+            "alpha",
+            "alpha",
+            "global",
+            "header-app",
+            "queried",
+            "queried",
+            "root-repo"
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -546,6 +611,8 @@ async fn an_admin_import_matches_a_local_import() {
             &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
             ServiceOptions {
                 tenant,
+                // An accept test must not depend on the host's free space.
+                free_space: Some(Arc::new(|_| Some(u64::MAX / 4))),
                 ..Default::default()
             },
         )
@@ -823,6 +890,46 @@ async fn a_shared_memory_moves_only_within_the_team_store_and_only_by_its_author
     assert_eq!(stored(team_home), vec![("team-ops".to_string(), None)]);
     assert!(stored(&s.tenant("ann").home).is_empty());
     assert!(stored(&s.tenant("bob").home).is_empty());
+}
+
+/// Final review I-1: superseding marks the older memory, so it is the older memory's author's to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_author_supersedes_a_shared_memory() {
+    let s = Server::start_with_team(&["ann", "bob"]).await;
+    let (ann, bob) = (&s.tenant("ann").svc, &s.tenant("bob").svc);
+    let id = ann
+        .remember(shared("The deploy window is on Friday", Some("cursor")))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let status = |s: &Server, team_id: &str| {
+        let id = team_id.strip_prefix("team:").unwrap().to_string();
+        let svc = s.team.as_ref().unwrap().svc.clone();
+        async move {
+            svc.get(GetRequest {
+                ids: vec![id],
+                include_provenance: false,
+            })
+            .await
+            .unwrap()
+            .memories[0]
+                .memory
+                .status
+        }
+    };
+    let mut by_bob = shared("The deploy window is on Monday", Some("cursor"));
+    by_bob.supersedes = vec![id.clone()];
+    let e = bob.remember(by_bob).await.unwrap_err();
+    assert!(
+        matches!(&e, alice_core::error::AliceError::Invalid(m) if m == SHARED_REFUSAL),
+        "{e:?}"
+    );
+    assert_ne!(status(&s, &id).await, alice_core::model::Status::Superseded);
+    let mut by_ann = shared("The deploy window is on Monday", Some("cursor"));
+    by_ann.supersedes = vec![id.clone()];
+    ann.remember(by_ann).await.unwrap();
+    assert_eq!(status(&s, &id).await, alice_core::model::Status::Superseded);
 }
 
 #[tokio::test(flavor = "multi_thread")]

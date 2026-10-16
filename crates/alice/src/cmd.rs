@@ -751,6 +751,33 @@ fn recall_text(r: &RecallResponse) -> String {
     text
 }
 
+/// `alice adopt <file>`: see `alice_daemon::adopt`.
+fn adopt_command(home: &AliceHome, file: &Path, json: bool) -> Result<()> {
+    let r = alice_daemon::adopt::adopt_now(home, file)?;
+    print(json, &r, || {
+        format!(
+            "Adopted {}: {} memories, {} chunks, {} facts, {} projects.\n\
+             Machine paths cleared: {} (and {} history records rewritten).\n\
+             Redacted again with this tenant's rules: {} memories ({} duplicates trashed), {} chunks, {} history records.\n\
+             The tenant's own database before: {}.\n\
+             Took {:.1} s. The daemon rebuilds its vector index when it starts.\n",
+            r.adopted_from,
+            r.memories,
+            r.chunks,
+            r.facts,
+            r.projects,
+            r.paths_cleared,
+            r.records_rewritten,
+            r.redacted_memories,
+            r.duplicates_trashed,
+            r.redacted_chunks,
+            r.redacted_records,
+            r.saved_tenant_db_as.as_deref().unwrap_or("none"),
+            r.secs
+        )
+    })
+}
+
 /// What `alice model check` reports.
 #[derive(serde::Serialize)]
 struct ModelCheck {
@@ -838,6 +865,8 @@ pub fn dispatch(command: Command, json: bool) -> Result<()> {
         Command::Import(ImportCmd::Snapshot(a)) => import_snapshot(a, json),
         // Not through `client_command`: that would start a daemon, and `restore` must have none.
         Command::Restore { backup, yes } => rt()?.block_on(restore(&home, backup, yes, json)),
+        // No daemon either: the swap needs the daemon lock, and the tenant's unit is stopped.
+        Command::Adopt { file } => adopt_command(&home, &file, json),
         // Neither starts a daemon: `doctor` reports on what is there, `token rotate` and
         // `service` work with none.
         Command::Doctor => rt()?.block_on(doctor_command(&home, json)),
@@ -1144,7 +1173,8 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         | Command::Doctor
         | Command::Token(_)
         | Command::Service(_)
-        | Command::Restore { .. } => {
+        | Command::Restore { .. }
+        | Command::Adopt { .. } => {
             unreachable!("handled in dispatch")
         }
     }

@@ -1057,3 +1057,99 @@ async fn a_batch_larger_than_a_request_is_cut_and_the_policy_asked_before_each_p
     );
     s.shutdown();
 }
+
+/// Final review A-I3: a remote provider gets text redacted with today's always-on rules, also
+/// when the person stores raw text (`privacy.redact = false`), and for a pattern added after the
+/// write (the re-embed of older rows); what is stored stays as the person chose.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remote_provider_gets_text_redacted_with_todays_rules_whatever_was_stored() {
+    let mock = Mock::start();
+    let d = tempfile::tempdir().unwrap();
+    let s = start(
+        d.path(),
+        options(http_factory(true, Arc::default())),
+        "[privacy]\nredact = false\n",
+    );
+    let open = repo(&d, "open-proj");
+    let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let core = "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
+    let first = s
+        .remember(RememberRequest {
+            content: format!("deploy key {token} for the pelican service"),
+            cwd: open.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s.ingest(IngestRequest {
+        source: SourceInput {
+            uri: "s-1".into(),
+            ..Default::default()
+        },
+        chunks: vec![ChunkInput {
+            ord: 0,
+            text: "ticket TCK-12345 about the hamster wheel".into(),
+            ..Default::default()
+        }],
+        cwd: open.clone(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    settled(&s).await;
+    // A pattern added after the writes, then a remote provider: the re-embed sends old rows.
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "privacy.custom_patterns".into(),
+        serde_json::json!([{ "name": "ticket", "regex": "TCK-[0-9]{4,}" }]),
+    );
+    m.insert("embedding.provider".into(), serde_json::json!("openai"));
+    m.insert("embedding.model".into(), serde_json::json!("m"));
+    m.insert("embedding.endpoint".into(), serde_json::json!(mock.base));
+    s.patch_settings(m).unwrap();
+    until("the switch to the provider", 15, || async {
+        s.health().await.unwrap().embedding_model == "openai:m"
+    })
+    .await;
+    assert!(
+        mock.saw("pelican") && mock.saw("hamster"),
+        "{:?}",
+        mock.texts()
+    );
+    for secret in [token, core, "TCK-12345"] {
+        assert!(
+            !mock.saw(secret),
+            "{secret} left the machine: {:?}",
+            mock.texts()
+        );
+    }
+    assert!(mock.saw("[REDACTED:github_token]") && mock.saw("[REDACTED:custom:ticket]"));
+    // A new write is embedded by the worker on the provider: redacted the same way.
+    s.remember(RememberRequest {
+        content: format!("another key {token} for the walrus colony"),
+        cwd: open.clone(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    settled(&s).await;
+    until("the new memory to be sent", 15, || async {
+        mock.saw("walrus")
+    })
+    .await;
+    assert!(!mock.saw(token) && !mock.saw(core));
+    // What is stored is what the person chose to store.
+    let id = first.id.unwrap();
+    let body: String = s
+        .read(move |c| {
+            Ok(
+                c.query_row("SELECT body FROM memories WHERE id = ?1", [&id], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(body.contains(token));
+    s.shutdown();
+}
