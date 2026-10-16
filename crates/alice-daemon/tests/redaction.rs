@@ -1072,6 +1072,43 @@ async fn a_project_whose_carried_rules_cannot_be_read_is_screened_closed() {
     s.shutdown();
 }
 
+/// Final re-review 2, M-3: a merge carries a denial of `from` from the global settings, but
+/// not the one a degraded configuration puts on every project: a typo in `config.toml` must not
+/// keep the survivor from the cloud for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_under_a_degraded_configuration_carries_no_cloud_denial() {
+    let d = tempfile::tempdir().unwrap();
+    let home = AliceHome::new(d.path().to_path_buf());
+    std::fs::write(home.config_file(), "[privacy\n").unwrap();
+    let s = Service::start(
+        home,
+        &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+        ServiceOptions::default(),
+    )
+    .unwrap();
+    assert!(s.settings_handle().config_degraded());
+    for name in ["alpha", "beta"] {
+        s.remember(RememberRequest {
+            content: format!("a note in {name}"),
+            cwd: repo(&d, name),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let done = s
+        .merge_projects(ProjectMergeRequest {
+            from: "alpha".into(),
+            into: "beta".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(done.merged, "{done:?}");
+    assert!(done.rules_carried.is_empty(), "{:?}", done.rules_carried);
+    s.shutdown();
+}
+
 /// A review item the way the judge will leave it (Task 12): written straight into the inbox.
 fn add_review(
     s: &Service,

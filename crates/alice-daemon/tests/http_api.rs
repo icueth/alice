@@ -3010,6 +3010,36 @@ async fn a_merge_is_refused_while_the_rules_of_from_are_not_known() {
     assert!(done.merged && done.rules_carried.is_empty(), "{done:?}");
 }
 
+/// Final re-review 2, M-3: a denial in the settings that reaches `from` only through its
+/// display name (two checkouts named `app`: the second is stored as `app-<hash>`, named `app`)
+/// is carried into the survivor like a denial in `from`'s own file. Lifting the survivor's own
+/// denial later does not open the merged project's rows to the cloud.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_settings_denial_by_display_name_is_carried_by_a_merge() {
+    let s = Srv::start().await;
+    let dirs = projects_in_folders(&s, &["one/app", "two/app", "work", "open"]).await;
+    for (name, dir) in &dirs {
+        note_in(&s, dir, &format!("a note in {name}")).await;
+    }
+    let twin = slugs(&s)
+        .into_iter()
+        .find(|p| p.starts_with("app-"))
+        .expect("a second project named app");
+    deny_in_settings(&s, &["app", "work"]);
+    let done: ProjectMergeResponse = merge_now(&s, &twin, "work", false)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(done.merged, "{done:?}");
+    assert_eq!(done.rules_carried, ["cloud_denied"]);
+    // `work` no longer denied in the settings: the carried denial keeps it from the cloud.
+    deny_in_settings(&s, &["app"]);
+    let r = merge_now(&s, "work", "open", true).await;
+    assert_eq!(r.status(), 400, "work is still kept from the cloud");
+    assert!(r.text().await.unwrap().contains("cloud providers"));
+}
+
 /// `POST /api/v1/projects/merge`: behind the token, a dry run changes nothing, the refusals say
 /// what to do, a merge moves the rows and leaves the old name working, and undo (by the event
 /// the merge answers with) puts every row back where it was.

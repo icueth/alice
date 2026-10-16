@@ -3377,13 +3377,21 @@ impl Service {
         // remote embedder ask (every name of the project, its `.alice.toml`, degraded config).
         // The merge carries `from`'s own denial into `into`, but `into` must be denied already:
         // the person decides that, not the merge.
-        if !self.cloud.cloud_allowed(&plan.from.slug) && self.cloud.cloud_allowed(&plan.into.slug) {
+        let from_denied = !self.cloud.cloud_allowed(&plan.from.slug);
+        if from_denied && self.cloud.cloud_allowed(&plan.into.slug) {
             return Err(AliceError::invalid(format!(
                 "project \"{}\" is kept away from cloud providers and \"{}\" is not: deny \"{}\" first (add it to privacy.cloud_denied_projects or set cloud_denied in its .alice.toml), or remove the denial of \"{}\", then merge",
                 plan.from.slug, plan.into.slug, plan.into.slug, plan.from.slug
             )));
         }
-        let from_rules = from_load.settings;
+        let mut from_rules = from_load.settings;
+        // A denial of `from` that is not in its file (the global list naming its slug, an alias
+        // or its display name, which do not all become names of `into`) is carried too, as the
+        // refusal above treats `from` as denied. Not while the configuration is degraded: that
+        // denies every project, and would be carried for good (final re-review 2, M-3).
+        if from_denied && !self.settings.config_degraded() {
+            from_rules.privacy.cloud_denied = true;
+        }
         let answer = |merged: bool,
                       event_id: Option<String>,
                       c: &project_merge::MergeCounts,
