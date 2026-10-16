@@ -9,6 +9,8 @@
   earlier section, that section says so; §2.8 and §2.9 hold the new design. **Addendum 3** (the owner: shared team
   memory) folded in; §2.10 holds it. **The server's CPU has AVX but not AVX2** (controller, 2026-10-16): server builds link
   Microsoft's ONNX Runtime and `alice-server` self-tests every binary before it switches a unit; §2.11 holds it.
+  **Addendum 4** (the owner already runs Alice locally): `alice-server adopt` moves a person's own database onto their
+  fresh tenant; §2.12 holds it.
 - **Owner:** icueth (vision); technical choices delegated to this lane
 - **Lane:** server mode, worktree `project-alice-srv`, branch `feat/server-mode` (from `feat/m2-judge-settings` b28b99f)
 - **Builds on:** `2026-10-13-alice-core-design.md` (the core spec), the M2 handoff `docs/superpowers/handoff/2026-10-14-m2-handoff.md`
@@ -642,6 +644,40 @@ The server's CPU is a Xeon E5-2620 (Sandy Bridge): AVX, no AVX2, FMA or F16C, wh
   (750 characters on average): **5.5 chunks per second** on the 4 vCPUs, so a 121,000-chunk palace takes **about 6 hours** to
   embed. The daemon uses up to 4 ONNX threads, so an import competes with the other tenants for the CPU while it runs.
 
+### 2.12 Adopting a person's local Alice (addendum 4)
+
+The owner already runs Alice on their Mac (3,286 memories, 121,007 chunks, every embedding done, projects cleaned by
+hand, memories that MemPalace does not have). A MemPalace import would lose the cleanups and those memories and take
+about 6 hours to embed. The other people keep the MemPalace import.
+
+- **`alice-server adopt <name> <backup-file>`** (root): the person's `alice backup now` file becomes the tenant's
+  database. It refuses the team store, a file that is not a regular file owned by the admin (`SUDO_UID`), and a disk with
+  less than twice the file plus 2 GB free. It copies the file into `<home>/adopt-inbox/` (the tenant's, 0600), stops the
+  unit, runs `alice --json adopt <copy>` as the tenant, starts the unit and waits for its ping. If the tenant does not
+  come back, it restores the before-restore backup the report names (`alice restore <name> --yes`) and starts it again.
+  The staged copy is always removed; the admin's file is left, with a reminder to delete it.
+- **`alice adopt <file>`** (hidden; `alice_daemon::adopt`), with no daemon running:
+  1. checks the file: `restore::open_ro`, the schema exactly `migrations::CURRENT_VERSION` (older: "upgrade the source
+     Alice first"; newer: "upgrade the server first"), `PRAGMA integrity_check` = ok, then `restore::verify`;
+  2. refuses a tenant whose database holds any memory, chunk or relation;
+  3. swaps the file in with `restore::swap_verified` (the tenant's own database is kept as a before-restore backup; the
+     vector index files are dropped and rebuilt at the next start from the stored embeddings);
+  4. in one transaction with `secure_delete` on: clears `projects.root_path`; rewrites project keys and key aliases that
+     start with `path:` to `adopted:<sha256[..32]>` (R41); rewrites `sources.uri` values that are file paths (`/`, `~`,
+     `file:`, a drive letter, `\\`) to `adopted:<sha256[..32]>/<file name>`; replaces those old values in event
+     snapshots and review payloads; redacts every memory's title and body with the tenant's always-on rules through
+     the ordinary edit (`memory.edit` by `system`, snapshots redacted; a memory whose redacted text equals another
+     memory's is trashed first, R42), every raw chunk in place (FTS re-indexed, its embedding deleted, `embed_state`
+     pending, a `chunk.redact` event that is never undone), and every event snapshot and review payload (R43); deletes
+     the judge cache; then checkpoints the WAL into the file;
+  5. on any failure after the swap, swaps the tenant's own database back, so an unscrubbed copy is never served;
+  6. reports memories, chunks, facts, projects, paths cleared, records rewritten, redactions, duplicates trashed, the
+     saved database and the time.
+- Settings, secrets, the token and the Jev key are not taken from the source: only `alice.db` changes.
+- If the source used another embedding model, the existing re-embed path runs at start.
+- Content is not scrubbed: a memory that mentions a file path in its text keeps it (it is what the person wrote). The
+  staging check "no client path in the store" applies to the columns above.
+
 ## 3. Client remote mode (deferred by addendum 2)
 
 *Addendum 2 defers this whole section.* The team uses direct MCP (§2.8), and its design is kept here unchanged for a
@@ -1156,6 +1192,10 @@ the tests cover the following.
   - (R40) `add` writes `TZ=Asia/Bangkok` by default and `--tz <zone>` when given; an unknown or malformed zone is refused
     before any change; `add <existing> --tz` changes the zone and restarts that tenant; `upgrade` adds the default to a
     tenant file without `TZ` and keeps one set with `--tz`;
+  - (§2.12) `adopt` copies the file to the tenant's inbox, stops, runs `alice --json adopt`, starts and reports; a refusal
+    from `alice adopt` (non-empty tenant, another schema, a damaged file) starts the unit again and changes nothing; a
+    symlink, a missing file, another user's file, a full disk, an unknown tenant and the team store are refused before
+    any command; a tenant that does not come back gets its own database back (`alice restore <saved> --yes`);
   - (§2.11) `build-release` refuses a download that fails its SHA-256 (deleted, never unpacked), and links the pinned
     runtime with the rpath and the dist layout above (stubbed `curl`, `cargo`, `sha256sum` and `uname`).
 
@@ -1263,6 +1303,9 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R38 | Server builds link **Microsoft's ONNX Runtime 1.24.4** dynamically (pinned SHA-256), with the binary's rpath at `$ORIGIN/../lib/alice` (controller's ruling; §2.11) | The server's CPU has no AVX2; Microsoft's build dispatches its kernels at run time. An rpath needs no environment in the units or the admin's shell | A future ort release that needs a newer ONNX Runtime API means a new pin; the library must travel with the binary (`upgrade` installs both) |
 | R39 | `upgrade` **self-tests** the new binary (`alice model check` in a throwaway home) before it installs anything, and the installed pair before it restarts a unit | `--version` runs even where the runtime cannot; only embedding a text proves it | About 2 to 5 s per self-test, plus a 136 MB model fetched once into `/var/cache/alice-server/models` |
 | R40 | Each tenant's daemon runs in **its person's time zone** (`TZ` in the tenant file; `Asia/Bangkok` by default, `--tz` per person, checked against `/usr/share/zoneinfo`; `upgrade` adds the default where it is missing) (controller's ruling) | The importer reads MemPalace's naive local times with the daemon's local offset; on a UTC server every imported time would be 7 hours off for this team. Stored times stay UTC | Logs and daily schedules also follow the person's zone; a person who moves needs `add <name> --tz` |
+| R41 | `adopt` rewrites project keys made from a folder (`path:<root>`) and file-path source URIs to `adopted:<hash>` (a source keeps its file name) | Addendum 4 keeps keys, but such a key is itself a client path; on a tenant projects are found by slug and alias, never by key | A future client that sends the same checkout's `path:` key would not match the adopted project (it would adopt a placeholder by slug, as for imports) |
+| R42 | A memory whose text, once redacted, equals another memory's is trashed before it is redacted | The unique-content rule would otherwise make the whole adoption fail on one pair of notes that differ only by a secret | The trashed copy stays in the trash; nothing is lost but the duplicate |
+| R43 | `adopt` also redacts event snapshots and review payloads, and deletes the judge cache | History and the inbox hold what the person's machine stored; a tenant's database must hold no unredacted secret | Undo of an older edit restores redacted text, as it does for anything the rules redact |
 
 ---
 

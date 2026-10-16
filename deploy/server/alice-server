@@ -47,6 +47,7 @@ fi
 
 HOST=""
 SELFTEST_WHY=""
+ADOPT_DIR=""
 A_USER=0; A_HOME=0; A_ENV=0; A_UNIT=0; A_SNIP=0; A_RELOADED=0
 IMPORT_DIR=""
 
@@ -64,6 +65,8 @@ usage: alice-server add <name> [--tz <IANA zone>]
        alice-server upgrade <binary>
            (also the first install; a build of deploy/server/build-release brings its ONNX Runtime along)
        alice-server import <name> <palace-dir> [--dry-run]
+       alice-server adopt <name> <backup-file>
+           (a person's own Alice database, from `alice backup now` on their machine, onto their fresh tenant)
            (a real import MOVES and consumes <palace-dir>; --dry-run works on a copy and keeps it)
        alice-server cli <name> <alice arguments...>
 EOF
@@ -684,6 +687,51 @@ cmd_import() { # name palace-dir [--dry-run]
   exit "$rc"
 }
 
+file_uid() { stat -c %u -- "$1" 2>/dev/null || stat -f %u -- "$1"; }
+file_bytes() { stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1"; }
+
+# A person's own Alice database becomes their fresh tenant's (spec section 2.12). `alice adopt`, run as the tenant
+# with its daemon stopped, checks the file, refuses a tenant that holds anything, swaps it in (keeping the tenant's
+# own database as a before-restore backup), clears the machine's paths and redacts with the tenant's rules. If the
+# daemon does not come back, the tenant's own database goes back.
+cmd_adopt() { # name backup-file
+  local name=$1 file=$2 home="$SRV/$1" admin=${SUDO_UID:-0} owner need free_k out saved port
+  need_tenant "$name"
+  if is_team "$name"; then die "$TEAM is the shared team store; adopt a person's database into their own tenant"; fi
+  [ ! -L "$file" ] && [ -f "$file" ] || die "$file is not a regular file"
+  owner=$(file_uid "$file")
+  [ "$owner" = "$admin" ] || die "$file belongs to uid $owner; copy it into your own home first (it must be the admin's file, uid $admin)"
+  need=$(( 2 * ($(file_bytes "$file") / 1024 + 1) + 2 * 1024 * 1024 ))
+  free_k=$(free_kb)
+  [ "$free_k" -ge "$need" ] || die "adopting $file needs twice its size plus 2 GB free; $(gb "$free_k") GB is free"
+  ADOPT_DIR="$home/adopt-inbox"
+  trap 'rm -rf -- "${ADOPT_DIR:?}"' EXIT
+  trap 'exit 1' INT TERM HUP
+  install -d -m 0700 "$ADOPT_DIR"
+  cp -- "$file" "$ADOPT_DIR/alice.db"
+  chmod -- 0600 "$ADOPT_DIR/alice.db"
+  chown -R "alice-$name:alice-$name" -- "$ADOPT_DIR"
+  systemctl stop "alice@$name"
+  if ! out=$(as_tenant "$name" --json adopt "$ADOPT_DIR/alice.db" 2>&1); then
+    systemctl start "alice@$name" || true
+    die "nothing was adopted and $name is as it was: $(printf '%s\n' "$out" | tail -n 1)"
+  fi
+  saved=$(printf '%s\n' "$out" | sed -n 's/.*"saved_tenant_db_as": *"\([^"]*\)".*/\1/p')
+  systemctl start "alice@$name"
+  port=$(port_of "$name")
+  if ! wait_ping "$port" "$PING_ADD"; then
+    systemctl stop "alice@$name" || true
+    if [ -n "$saved" ] && as_tenant "$name" restore "$saved" --yes >/dev/null 2>&1; then
+      systemctl start "alice@$name" || true
+      die "$name did not come back with the adopted database; its own database ($saved) is back"
+    fi
+    die "$name did not come back with the adopted database, and its own could not be put back; restore it with: alice-server cli $name restore ${saved:-<before-restore backup>} --yes"
+  fi
+  say "Adopted into $name:"
+  printf '%s\n' "$out" | sed -n 's/^ *"\([a-z_]*\)": *\(.*\),\{0,1\}$/  \1: \2/p' | sed 's/,$//'
+  say "Delete $file now: it holds what the person's machine stored, unredacted."
+}
+
 cmd_cli() { # name alice-args...
   local name=$1 a seen=0 extra=0
   shift
@@ -742,6 +790,7 @@ main() {
     upgrade) [[ $# -eq 2 ]] || { usage; exit 2; }; take_lock; cmd_upgrade "$2" ;;
     import) [[ $# -ge 3 && $# -le 4 ]] || { usage; exit 2; }; valid_name "$2"; cmd_import "$2" "$3" "${4:-}" ;;
     cli) [[ $# -ge 3 ]] || { usage; exit 2; }; valid_name "$2"; cmd_cli "${@:2}" ;;
+    adopt) [[ $# -eq 3 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_adopt "$2" "$3" ;;
     -h|--help|help) usage ;;
     *) usage; exit 2 ;;
   esac

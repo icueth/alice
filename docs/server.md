@@ -70,6 +70,7 @@ alice-server rotate <name>
 alice-server list
 alice-server upgrade <binary>
 alice-server import <name> <palace-dir> [--dry-run]
+alice-server adopt <name> <backup-file>
 alice-server cli <name> <alice arguments...>
 ```
 
@@ -138,6 +139,20 @@ The script moves the folder into the tenant's `import-inbox/` (owned by the tena
 - It refuses to start when twice the palace's size would leave less than 2 GB free.
 - The tenant daemon accepts a palace only from inside its own `import-inbox/`.
 - Import palaces one at a time, and only with the person's consent. The raw palace exists on the server only while the job runs.
+
+#### adopt
+
+`alice-server adopt <name> <backup-file>` makes a person's own Alice database, from `alice backup now` on their machine, the database of their tenant. Use it for someone who already runs Alice locally: their projects, cleanups and memories come along as they are, with every embedding already done. See [Moving your local Alice to the server](#moving-your-local-alice-to-the-server) for the person's side.
+
+- The tenant must be fresh: `adopt` refuses one that holds any memory, chunk or fact.
+- The file must be a regular file you own (copy it into your home with `scp`), and the disk needs twice its size plus 2 GB free.
+- `adopt` stops the tenant, checks the file (SQLite's `integrity_check`, Alice's tables, and the same schema as the installed binary: an older one says "upgrade the source Alice first", a newer one "upgrade the server first"), keeps the tenant's own database as a before-restore backup in its backups folder, and puts the file in its place.
+- It clears what names the person's machine: project folders (`root_path`), project keys made from a folder path, and transcript paths (a hash and the file name stay). Projects keep their slugs and aliases, so `?project=<slug>` finds them.
+- It redacts every memory, raw chunk and history record again with the tenant's rules, which are always on, and drops the judge cache. A memory whose redacted text equals another one's is moved to the trash.
+- Settings, secrets, the token and the Jev key stay the tenant's own: only the database is replaced.
+- The tenant starts again and rebuilds its vector index from the stored embeddings (no re-embedding, unless the source used another model). If it does not come back, its own database is put back.
+
+It prints a report: memories, chunks, facts and projects, the paths cleared and the redactions. Delete the backup file afterwards: it holds what the person's machine stored, before the server's redaction.
 
 #### cli
 
@@ -322,6 +337,17 @@ alice-server cli <name> config set judge.provider jev
 ```
 
 Send the key over a private channel, never in a chat room or an issue. Without a key, the judge stays on the offline rules.
+
+### Moving your local Alice to the server
+
+If you already run Alice on your Mac, your admin can move your database to your tenant instead of importing MemPalace again: your project cleanups and the memories you wrote to Alice directly come along, and nothing has to be embedded again.
+
+1. On your Mac, stop the agents that write to Alice, then run `alice backup now`. It prints the file it wrote, under `~/.alice/backups/`.
+2. Copy that file to the server, to your admin's home, with `scp`.
+3. Your admin runs `alice-server adopt <name> <file>` on a fresh tenant and checks the report with you.
+4. Point your agents at your tenant's MCP URL (see above) and stop writing to the local Alice. Two stores that both take writes drift apart, and nothing merges them back. Keep the local home as a read-only fallback.
+
+The server clears your machine's folder paths from the projects and transcripts, and redacts everything again with its rules. Your Jev key is set on the tenant separately.
 
 ### Importing your MemPalace
 

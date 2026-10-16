@@ -108,6 +108,16 @@ cat >"$R/usr/local/bin/alice" <<'EOF'
 echo "alice $* ALICE_HOME=${ALICE_HOME:-}" >>"$ALICE_SERVER_ROOT/calls.log"
 case "$*" in
   "--version") echo "alice 0.1.0" ;;
+  "--json adopt "*)
+    case "${ADOPT:-ok}" in
+      nonempty) echo "alice: this tenant already holds 3 memories, 0 chunks and 0 facts; adopt needs a fresh tenant" >&2; exit 1 ;;
+      older) echo "alice: the file was made by an older Alice (schema v4; the server runs v5): upgrade the source Alice first" >&2; exit 1 ;;
+      damaged) echo "alice: the file fails SQLite's integrity check (row 3 missing)" >&2; exit 1 ;;
+    esac
+    [ -f "${3:-}" ] && cp -- "$3" "$ALICE_SERVER_ROOT/adopted-copy"
+    printf '{\n  "adopted_from": "%s",\n  "memories": 3,\n  "chunks": 2,\n  "paths_cleared": 3,\n  "redacted_memories": 2,\n  "saved_tenant_db_as": "alice-before-restore-20261016T070000Z.db"\n}\n' "${3:-}"
+    ;;
+  "restore "*) echo "restored" ;;
   "model fetch")
     if [ "${SELFTEST:-}" = fetchfail ]; then
       i=0; while [ "$i" -lt 2000 ]; do printf '\rmodel_quantized.onnx: %5.1f%%' "$i" >&2; i=$((i + 1)); done
@@ -801,6 +811,69 @@ upgrade_adds_the_time_zone_to_older_tenants() {
   pass
 }
 
+# A person's backup file, as `alice backup now` leaves it on their machine and scp brings it.
+ADOPT_FILE="$T/alice-person.db"
+echo "person's database" >"$ADOPT_FILE"
+adopt() { RC=0; OUT=$(SUDO_UID="$(id -u)" ALICE_SERVER_ROOT="$R" /bin/bash "$SCRIPT" adopt "$@" 2>&1) || RC=$?; }
+
+adopt_installs_and_reports() {
+  local stops starts
+  stops=$(grep -c 'systemctl stop alice@ann' "$R/calls.log" || true)
+  starts=$(grep -c 'systemctl start alice@ann' "$R/calls.log" || true)
+  adopt ann "$ADOPT_FILE"
+  [ "$RC" = 0 ] || fail "adopt exited $RC: $OUT"
+  cmp "$ADOPT_FILE" "$R/adopted-copy" || fail "the tenant was not given the file"
+  has "$R/calls.log" "alice --json adopt $SRV/ann/adopt-inbox/alice.db"
+  [ "$(grep -c 'systemctl stop alice@ann' "$R/calls.log")" = "$((stops + 1))" ] || fail "the unit was not stopped once"
+  [ "$(grep -c 'systemctl start alice@ann' "$R/calls.log")" = "$((starts + 1))" ] || fail "the unit was not started once"
+  printf '%s\n' "$OUT" | grep -qF 'paths_cleared: 3' || fail "no report: $OUT"
+  printf '%s\n' "$OUT" | grep -qF "Delete $ADOPT_FILE now" || fail "$OUT"
+  [ ! -e "$SRV/ann/adopt-inbox" ] || fail "the staged copy was left"
+  [ -f "$ADOPT_FILE" ] || fail "the admin's file was consumed"
+  pass
+}
+
+adopt_refuses_and_leaves_the_tenant_as_it_was() {
+  local why starts
+  for why in nonempty older damaged; do
+    starts=$(grep -c 'systemctl start alice@ann' "$R/calls.log" || true)
+    ADOPT=$why adopt ann "$ADOPT_FILE"
+    [ "$RC" != 0 ] || fail "adopt succeeded with $why"
+    printf '%s\n' "$OUT" | grep -qF "nothing was adopted and ann is as it was" || fail "$why: $OUT"
+    [ "$(grep -c 'systemctl start alice@ann' "$R/calls.log")" = "$((starts + 1))" ] || fail "$why: the unit was not started again"
+    [ ! -e "$SRV/ann/adopt-inbox" ] || fail "$why: the staged copy was left"
+  done
+  printf '%s\n' "$OUT" | grep -qF "integrity check" || fail "$OUT"
+  pass
+}
+
+adopt_refuses_bad_files_before_any_change() {
+  local before
+  before=$(wc -l <"$R/calls.log")
+  ln -sf "$ADOPT_FILE" "$T/alice-link.db"
+  adopt ann "$T/alice-link.db"
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'is not a regular file'; then fail "a symlink was accepted: $OUT"; fi
+  adopt ann "$T/no-such.db"
+  [ "$RC" != 0 ] || fail "a missing file was accepted"
+  RC=0; OUT=$(SUDO_UID=4242 ALICE_SERVER_ROOT="$R" /bin/bash "$SCRIPT" adopt ann "$ADOPT_FILE" 2>&1) || RC=$?
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF "it must be the admin's file, uid 4242"; then fail "another user's file was accepted: $OUT"; fi
+  FREE_KB=1000 adopt ann "$ADOPT_FILE"
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'twice its size plus 2 GB'; then fail "no disk guard: $OUT"; fi
+  adopt nobody "$ADOPT_FILE"
+  [ "$RC" != 0 ] || fail "an unknown tenant was accepted"
+  [ "$(wc -l <"$R/calls.log")" = "$before" ] || fail "a command ran before a refusal"
+  pass
+}
+
+adopt_rolls_back_when_the_tenant_does_not_come_back() {
+  PING_FAIL=1 adopt ann "$ADOPT_FILE"
+  [ "$RC" != 0 ] || fail "adopt succeeded although the tenant did not come back"
+  has "$R/calls.log" 'alice restore alice-before-restore-20261016T070000Z.db --yes'
+  printf '%s\n' "$OUT" | grep -qF "its own database (alice-before-restore-20261016T070000Z.db) is back" || fail "$OUT"
+  [ ! -e "$SRV/ann/adopt-inbox" ] || fail "the staged copy was left"
+  pass
+}
+
 add_team_writes_no_snippet() {
   run add --team bob
   [ "$RC" != 0 ] || fail "--team with another name succeeded"
@@ -896,6 +969,15 @@ list_marks_the_team_store() {
   pass
 }
 
+adopt_refuses_the_team_store() {
+  local before
+  before=$(wc -l <"$R/calls.log")
+  adopt team "$ADOPT_FILE"
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'is the shared team store'; then fail "the team store was accepted: $OUT"; fi
+  [ "$(wc -l <"$R/calls.log")" = "$before" ] || fail "a command ran before the refusal"
+  pass
+}
+
 remove_person_deletes_the_team_copy() {
   local archive
   run remove hal --yes
@@ -953,11 +1035,12 @@ for CURRENT in \
   add_refuses_a_cpu_without_avx upgrade_refuses_a_cpu_without_avx upgrade_accepts_avx_without_avx2 \
   upgrade_refuses_a_binary_that_fails_its_self_test upgrade_installs_the_runtime_library_and_restores_it \
   upgrade_restores_the_library_when_the_binary_cannot_be_installed add_takes_a_time_zone \
-  upgrade_adds_the_time_zone_to_older_tenants \
+  upgrade_adds_the_time_zone_to_older_tenants adopt_installs_and_reports adopt_refuses_and_leaves_the_tenant_as_it_was \
+  adopt_refuses_bad_files_before_any_change adopt_rolls_back_when_the_tenant_does_not_come_back \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \
   add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \
-  rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store \
+  rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store adopt_refuses_the_team_store \
   remove_person_deletes_the_team_copy remove_team_unprovisions provision_refuses_a_missing_team_token \
   refuses_to_run_with_empty_roots remove_archives_then_deletes \
   add_prints_a_single_quoted_mcp_hint no_remote_set_line; do

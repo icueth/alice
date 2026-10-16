@@ -3817,3 +3817,22 @@ impl TeamLink {
   against `/usr/share/zoneinfo`; on an existing tenant it changes the zone and restarts it); `upgrade` adds the default
   where it is missing. Stub scenarios `add_takes_a_time_zone` and `upgrade_adds_the_time_zone_to_older_tenants`; the real
   check re-imports the fixture into a fresh staging tenant and compares a known drawer's `created_at` with a local import.
+
+### Task 33: `alice-server adopt` — a person's local Alice onto their fresh tenant (addendum 4)
+
+**Files:** create `crates/alice-daemon/src/adopt.rs`, `crates/alice-daemon/tests/adopt.rs`; modify
+`crates/alice-daemon/src/lib.rs`, `crates/alice-daemon/src/restore.rs` (`open_ro` crate-visible),
+`crates/alice-core/src/store/history.rs` (`chunk.redact` never undone), `crates/alice/src/main.rs` + `cmd.rs` (hidden
+`alice adopt <file>`), `deploy/server/alice-server` (`adopt`), `deploy/server/tests/run.sh`, `docs/server.md`,
+`README.th.md`, spec §2.12 + §8.2 + R41-R43.
+
+**Steps:** as spec §2.12. Rust tests: `an_adopted_database_loses_the_machines_paths_and_is_redacted_with_the_tenants_rules`
+(a person's home with redaction off, a git-less project, a transcript path, two notes that differ by a key; after
+adoption no root, no `path:` key, no path in any byte of the file, both keys gone, one duplicate trashed, a tenant
+hint finds the project), `adopt_refuses_a_tenant_that_holds_anything_and_leaves_it_as_it_was`,
+`adopt_refuses_another_schema_and_a_damaged_file`. Stub scenarios: `adopt_installs_and_reports`,
+`adopt_refuses_and_leaves_the_tenant_as_it_was`, `adopt_refuses_bad_files_before_any_change`,
+`adopt_rolls_back_when_the_tenant_does_not_come_back`, `adopt_refuses_the_team_store`. Real check on the server: a
+synthetic local home made on this Mac in a throwaway `ALICE_HOME` (never `~/.alice`), adopted into a staging tenant,
+recall over MCP by `?project=`, then cleanup. The real adoption waits for the review's fix wave and the controller's go.
+

@@ -440,6 +440,7 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
    alice-server list                       # รายชื่อ สถานะ พื้นที่ดิสก์
    alice-server upgrade <binary>           # อัปเกรดทุกคน ย้อนกลับเองถ้าไม่ขึ้น
    alice-server import <name> <palace-dir> [--dry-run]
+   alice-server adopt <name> <backup-file>  # ย้ายฐานข้อมูล Alice ในเครื่องของคนนั้น (จาก alice backup now) ขึ้น tenant ใหม่
    alice-server cli <name> <คำสั่ง alice…>
    ```
 

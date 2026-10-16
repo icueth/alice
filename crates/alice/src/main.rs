@@ -68,6 +68,14 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Server admin (`alice-server adopt` runs it): make a person's own Alice database, from
+    /// `alice backup now` on their machine, this fresh tenant's. Their machine paths are cleared
+    /// and the tenant's redaction rules applied again; settings, secrets and the token stay.
+    #[command(hide = true)]
+    Adopt {
+        /// The backup file.
+        file: std::path::PathBuf,
+    },
     /// List projects, or fix a wrong one with `projects merge`.
     Projects {
         #[command(subcommand)]
