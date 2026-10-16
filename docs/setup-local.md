@@ -38,7 +38,8 @@ if a step fails in a way you cannot fix, stop and explain what failed and what t
 
 1. Note the system: `uname -s`, `uname -m`, and `echo "$SHELL"`. Alice runs on macOS with Apple Silicon (`Darwin`,
    `arm64`) and on Linux with glibc (`x86_64` or `aarch64`). On anything else, stop and tell the person it is not
-   supported yet.
+   supported yet: macOS on Intel and Linux with musl have no local embedding model yet, and Windows builds but has not
+   been tried end to end (the README's "Platform support" table has the details).
 2. Which agents exist: `command -v claude` and `command -v codex`. At least one is needed.
 3. Whether Alice is already installed: `command -v alice && alice --version`. If it is, skip to Step 2 (Step 1 then only
    updates it, if the person wants that).
@@ -116,9 +117,10 @@ fi
 codex mcp list
 ```
 
-If a `[mcp_servers.alice]` table already exists, make its `command` and `args` lines match the above, without printing
-the file. `codex mcp list` must list `alice`. If Codex reports a configuration error, restore
-`~/.codex/config.toml.bak-alice` and tell the person.
+If a `[mcp_servers.alice]` table already exists, do not edit it: you may not look at this file. Tell the person to open
+`~/.codex/config.toml` in their editor and make that table's `command` and `args` lines read like the ones above (with
+the path `echo "$ALICE_BIN"` printed), and wait until they say it is done. `codex mcp list` must list `alice`. If Codex
+reports a configuration error, restore `~/.codex/config.toml.bak-alice` and tell the person.
 
 ### Step 4: Capture sessions automatically
 
@@ -135,7 +137,8 @@ alice hooks status claude
 The install adds five hooks to `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`), keeps every other
 hook and setting, and saves the old file as `settings.json.alice-backup-<time>`. If it refuses because the file is not
 valid JSON, tell the person; do not edit the file yourself. Note any hooks it lists under "Other hooks mention alice or
-mempalace": Step 7 deals with them. `status` must say `installed`.
+mempalace": Step 7 deals with them. The first line of `status` must end in `: installed` (not `: not installed`, and
+not `on N of the 5 events only`), and no line under it may say `which does not exist`.
 
 **Codex** (only if `codex` exists):
 
@@ -203,17 +206,24 @@ If none, skip this step. If some exist, ask the person once: **"Stop using MemPa
   1. Back up each file you change (`cp <file> <file>.bak-alice`).
   2. Disable the MemPalace plugin: `claude plugin disable <name>` (or the person types `/plugin` in Claude Code). That
      stops its hooks and its MCP server.
-  3. Remove any other MemPalace MCP server entries (`claude mcp remove <name> -s user`; for Codex, delete only that
-     `[mcp_servers.<name>]` table from `config.toml`).
-  4. Remove the MemPalace hook entries and any old SessionStart script that ran `alice context` or
-     `alice import mempalace` from `~/.claude/settings.json`: only those entries; keep every other hook. The person can
-     also do it with `/hooks` in Claude Code.
+  3. Remove any other MemPalace MCP server entries of Claude Code (`claude mcp remove <name> -s user`). A MemPalace
+     `[mcp_servers.<name>]` table in Codex's `config.toml` is the person's to delete, in their editor: you may not look
+     at that file.
+  4. The MemPalace hook entries, and any old SessionStart script that ran `alice context` or `alice import mempalace`,
+     in `~/.claude/settings.json` (the ones Step 4 listed): ask the person to remove only those, with `/hooks` in
+     Claude Code, keeping every other hook. You may not look at that file, so do not edit it yourself. Wait until they
+     say it is done.
   5. Remove the "MemPalace Protocol" blocks (diaries every few tool uses) from `CLAUDE.md` / `AGENTS.md`. Capture makes
      them redundant.
   6. Keep Alice's MemPalace compatibility on, so old prompts that call `mempalace_*` tools keep working:
      `alice config set compat.mempalace true`. If the person's prompts call tools by their full Claude Code name
-     (`mcp__plugin_mempalace_mempalace__…`), also register Alice under that server name:
-     `claude mcp add --scope user plugin_mempalace_mempalace -- "$ALICE_BIN" mcp`.
+     (`mcp__plugin_mempalace_mempalace__…`), register Alice under that server name **instead of** `alice`. One entry
+     serves Alice's tools and the `mempalace_*` ones; two would list Alice's tools twice:
+
+     ```sh
+     claude mcp remove alice -s user
+     claude mcp add --scope user plugin_mempalace_mempalace -- "$ALICE_BIN" mcp
+     ```
   7. If Step 5 imported MemPalace earlier than this step, run `alice import mempalace` once more now, so nothing it
      caught in between is lost. Alice never stores a session's turns twice.
 - **No:** change nothing; tell the person both systems will run and the agents may use either.
