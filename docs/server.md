@@ -220,7 +220,7 @@ The disk is not grown for Alice, so the budget matters. Plan for these uses:
 | The self-test's model | about 136 MB in `/var/cache/alice-server/models` |
 | The previous version | `alice.prev` and `libonnxruntime.so.1.prev`, about 52 MB |
 | Scheduled backups | one copy of the database each; about 1-1.5 GB for a large tenant |
-| Backups per tenant | 2 daily, no weekly (`ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0`); a tenant cannot make manual backups |
+| Backups per tenant | 2 daily, no weekly (`ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0`); a tenant cannot make manual backups. They stay in the tenant's own `backups` folder: do not set `ALICE_BACKUP_DIR` in a tenant file (a directory outside the home fails that tenant's settings closed) |
 | `remove` archives | a gzip of the removed home without its model, in `/srv/alice/backups` |
 | Schema migrations | one extra copy of each database, kept 30 days |
 

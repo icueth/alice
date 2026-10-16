@@ -1735,15 +1735,18 @@ fn check_tenant_endpoint(e: &mut Vec<SettingError>, key: &str, url: &str) {
 /// `port_from_file`: `server.port` is set in `config.toml` rather than only in the environment.
 pub fn validate_tenant(s: &Settings, home: &Path, port_from_file: bool) -> Vec<SettingError> {
     let mut e = Vec::new();
+    // `~` is refused rather than checked: the daemon expands it to `$HOME`, which this check
+    // cannot see.
     if let Some(dir) = s.backup.dir.as_deref().filter(|d| !d.trim().is_empty())
-        && (Path::new(dir)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && (dir.trim_start().starts_with('~')
+            || Path::new(dir)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
             || !resolves_inside(home, dir))
     {
         e.push(err(
             "backup.dir",
-            "on a server tenant this must be a directory inside the tenant's data directory, written without `..`",
+            "on a server tenant this must be a directory inside the tenant's data directory, written without `..` or `~`",
         ));
     }
     if s.embedding.provider == EmbeddingProvider::Ollama {
@@ -4372,6 +4375,7 @@ mod tests {
         let refused = [
             (format!("[backup]\ndir = \"{}\"\n", outside.display()), "backup.dir"),
             ("[backup]\ndir = \"../outside\"\n".to_string(), "backup.dir"),
+            ("[backup]\ndir = \"~/backups\"\n".to_string(), "backup.dir"),
             ("[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"https://192.168.1.99/v1\"\n".into(), "embedding.endpoint"),
             ("[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"http://127.0.0.1:2019/v1\"\n".into(), "embedding.endpoint"),
             ("[embedding]\nprovider = \"ollama\"\nmodel = \"m\"\n".into(), "embedding.provider"),

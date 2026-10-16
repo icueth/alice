@@ -1469,7 +1469,7 @@ impl Service {
     }
 
     pub async fn remember(&self, req: RememberRequest) -> Result<RememberResponse> {
-        // A shared write touches only the team store: it does not hold back maintenance.
+        // A shared write goes to the team store (`remember_shared` holds the activity guard itself).
         if req.shared {
             return self.remember_shared(req).await;
         }
