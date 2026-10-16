@@ -2100,6 +2100,25 @@ impl ProjectTree {
         }
     }
 
+    /// The tree of a project whose carried rules the store cannot read (a store error, or a
+    /// `project_rules` table another build's migration left out): secrets blocked and no cloud,
+    /// as for a project file that cannot be read, on top of `own` (a checkout's own tree, whose
+    /// file still applies) when there is one. A rule that cannot be read must not loosen
+    /// anything, so a caller never falls back to "no rules" on such an error.
+    pub fn unreadable(key: impl Into<String>, own: Option<ProjectTree>) -> Self {
+        let closed = ProjectSettings::fail_closed();
+        match own {
+            Some(mut t) => {
+                t.carried = Some(match t.carried {
+                    Some(c) => c.stricter(&closed),
+                    None => closed,
+                });
+                t
+            }
+            None => Self::rules_only(key, closed),
+        }
+    }
+
     /// This tree with the rules merges carried into its project (`None`: none).
     pub fn with_carried(mut self, carried: Option<ProjectSettings>) -> Self {
         self.carried = carried;

@@ -326,9 +326,9 @@ impl RedactFilter {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(error = %e, "the project's rules could not be read; its drawers are screened closed");
-                Some(alice_core::settings::ProjectTree::rules_only(
+                Some(alice_core::settings::ProjectTree::unreadable(
                     key.clone(),
-                    alice_core::settings::ProjectSettings::fail_closed(),
+                    None,
                 ))
             }
         };

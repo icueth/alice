@@ -208,6 +208,7 @@ fn query_cloud(
         ProjectChoice::Detected(r) => {
             // The tree the query comes from, with the rules merges carried into the project a
             // write from it would land in (and that project's own tree when it is another one).
+            // A store that cannot say which rules those are judges the tree closed: denied.
             let (found, tree) = readers
                 .with(|c| {
                     Ok((
@@ -215,7 +216,13 @@ fn query_cloud(
                         projects::tree_of_detected(c, r)?,
                     ))
                 })
-                .unwrap_or_else(|_| (DetectedForRead::Unstored, r.tree()));
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "a project's rules could not be read; the query is kept from cloud providers");
+                    (
+                        DetectedForRead::Unstored,
+                        Some(ProjectTree::unreadable(r.key.clone(), r.tree())),
+                    )
+                });
             // What the working tree itself says (its `.alice.toml`, kept per project key, the
             // carried rules, and the global lists), for a project the store does not hold as the
             // detected one.
@@ -711,14 +718,30 @@ impl Service {
 /// whose own tree applies too when that is another project; see
 /// [`projects::tree_of_detected`]).
 fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<ProjectTree> {
-    match choice {
-        // A store that cannot be read leaves the checkout's own rules.
+    project_tree_in(readers, choice).0
+}
+
+/// [`project_root_in`], and whether the store could not say which rules the project carries.
+/// Such a project gets the closed rules (secrets blocked, no cloud; a checkout keeps its own
+/// file on top), never the global ones alone: a rule that cannot be read must not loosen
+/// anything (final re-review 2, I-1).
+fn project_tree_in(readers: &ReaderPool, choice: &ProjectChoice) -> (Option<ProjectTree>, bool) {
+    let looked = match choice {
         ProjectChoice::Detected(r) => readers
             .with(|c| projects::tree_of_detected(c, r))
-            .unwrap_or_else(|_| r.tree()),
+            .map_err(|e| (e, r.key.clone(), r.tree())),
         // `global` has no working tree: the global privacy settings apply.
-        ProjectChoice::Fallback => None,
-        ProjectChoice::Slug(s) => readers.with(|c| projects::tree_of(c, s)).ok().flatten(),
+        ProjectChoice::Fallback => Ok(None),
+        ProjectChoice::Slug(s) => readers
+            .with(|c| projects::tree_of(c, s))
+            .map_err(|e| (e, s.clone(), None)),
+    };
+    match looked {
+        Ok(tree) => (tree, false),
+        Err((e, key, own)) => {
+            tracing::warn!(error = %e, "a project's rules could not be read; its writes are screened closed");
+            (Some(ProjectTree::unreadable(key, own)), true)
+        }
     }
 }
 
@@ -1423,16 +1446,17 @@ impl Service {
     }
 
     /// Whether a write to this project (named, or detected from `cwd`) would be judged under
-    /// fail-closed rules at the moment (see [`SettingsHandle::project_fail_closed`]). The spool
-    /// asks before it discards a request that block mode refused.
+    /// fail-closed rules at the moment (see [`SettingsHandle::project_fail_closed`]; a project
+    /// whose rules the store cannot read is too). The spool asks before it discards a request
+    /// that block mode refused.
     pub async fn rules_fail_closed(&self, project: Option<&str>, cwd: Option<&str>) -> bool {
         let Ok(choice) = self.choose(project, cwd).await else {
             return false;
         };
         let (readers, settings) = (self.readers.clone(), self.settings.clone());
         tokio::task::spawn_blocking(move || {
-            let tree = project_root_in(&readers, &choice);
-            settings.project_fail_closed(tree.as_ref())
+            let (tree, unread) = project_tree_in(&readers, &choice);
+            unread || settings.project_fail_closed(tree.as_ref())
         })
         .await
         .unwrap_or(false)
@@ -1453,14 +1477,17 @@ impl Service {
     }
 
     /// The redactor for the project a memory (an id or legacy id) belongs to; the global rules
-    /// for one that is not there (the writer then reports it as unknown).
+    /// for one that is not there (the writer then reports it as unknown), the closed ones when
+    /// the store cannot say which rules apply.
     async fn redactor_for_memory(&self, id: String) -> Result<Arc<Redactor>> {
         let (readers, redactors) = (self.readers.clone(), self.redactors.clone());
         tokio::task::spawn_blocking(move || {
             let tree = readers
                 .with(|c| projects::tree_of_memory(c, &id))
-                .ok()
-                .flatten();
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "a project's rules could not be read; the edit is screened closed");
+                    Some(ProjectTree::unreadable(id.clone(), None))
+                });
             redactors.for_root(tree.as_ref())
         })
         .await

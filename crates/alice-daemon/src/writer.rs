@@ -489,9 +489,14 @@ pub(crate) type CommitLog = Arc<Mutex<Vec<Vec<&'static str>>>>;
 
 /// The redactor for the project with id `project_id` (`None`: no project), looked up with the
 /// writer's own connection. A project that was never rooted (no working tree) has only the
-/// global rules.
+/// global rules. A project whose rules the store cannot read gets the closed ones.
 fn rules_for(conn: &Connection, redactors: &Redactors, project_id: Option<&str>) -> Arc<Redactor> {
-    let tree = project_id.and_then(|p| projects::tree_of(conn, p).ok().flatten());
+    let tree = project_id.and_then(|p| {
+        projects::tree_of(conn, p).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "a project's rules could not be read; its history is scrubbed with the closed rules");
+            Some(alice_core::settings::ProjectTree::unreadable(p, None))
+        })
+    });
     redactors.for_root(tree.as_ref())
 }
 
@@ -2520,6 +2525,34 @@ mod tests {
             WriteOutcome::Remembered(InsertOutcome::New { id, seq }, _) => (id, seq),
             other => panic!("expected a new memory, got {other:?}"),
         }
+    }
+
+    /// Final re-review 2, I-1: the rules the writer scrubs a project's event snapshots with,
+    /// when the store cannot say which rules merges carried into it (its `project_rules` table
+    /// is missing), are the closed ones, never the global ones alone.
+    #[test]
+    fn a_project_whose_carried_rules_cannot_be_read_is_scrubbed_with_closed_rules() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open(d.path());
+        let p = projects::upsert_project(
+            &c,
+            &ProjectRef {
+                key: "k/app".into(),
+                slug: "app".into(),
+                name: "app".into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        let home = crate::paths::AliceHome::new(d.path().to_path_buf());
+        let redactors = Redactors::new(crate::config::SettingsHandle::load_with_env(
+            &home,
+            Vec::new(),
+        ));
+        assert!(!rules_for(&c, &redactors, Some(&p.id)).blocks());
+        c.execute_batch("DROP TABLE project_rules").unwrap();
+        assert!(rules_for(&c, &redactors, Some(&p.id)).blocks());
     }
 
     /// A heuristic judgement that decides nothing: the memory is activated as it stands.
