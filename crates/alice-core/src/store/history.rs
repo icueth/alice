@@ -497,9 +497,19 @@ fn undo_with(
             return Err(AliceError::invalid(why));
         }
     }
+    // An event that changed nothing its snapshot holds (the survivor of a merge) has nothing to
+    // revert and nothing to compare: a later change of that target neither blocks the undo nor
+    // is overwritten by it.
+    let mut unchanged = HashSet::new();
+    for e in &todo {
+        let (before, after) = states(conn, e)?;
+        if before.is_some() && before == after {
+            unchanged.insert(e.id.clone());
+        }
+    }
     // Each target must look as its newest event in the group left it.
     let mut checked = HashSet::new();
-    for e in &todo {
+    for e in todo.iter().filter(|e| !unchanged.contains(&e.id)) {
         if !checked.insert((e.target_type.as_str(), e.target_id.as_str())) {
             continue;
         }
@@ -551,6 +561,8 @@ fn undo_with(
             ))
         };
         match (target_kind(&e.target_type)?, before) {
+            // Nothing to put back (see `unchanged`); the undo is still recorded for it.
+            _ if unchanged.contains(&e.id) => {}
             (Target::Memory, Some(b)) => {
                 let s: MemorySnapshot = serde_json::from_value(b).map_err(bad)?;
                 restore_memory(conn, &e.target_id, &restorable(conn, &s, redact, true)?, &h)?;
