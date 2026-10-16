@@ -1066,20 +1066,30 @@ fn survey_paged(
 pub const CAPTURED_BY_ALICE_CAPTURE: &str = "captured by alice capture";
 
 /// The sessions a transcript file belongs to: its file stem (what the importer stores as the
-/// source's `session_id`) and, for a Claude Code subagent's file
+/// source's `session_id`); for a Claude Code subagent's file
 /// (`<session>/subagents/<agent>.jsonl`), the main session whose folder holds it (capture files
-/// a subagent's source under its main session's id).
+/// a subagent's source under its main session's id); and for a Codex rollout
+/// (`rollout-<YYYY-MM-DDTHH-MM-SS>-<id>.jsonl`), the session id after the time, which is what
+/// capture stores (Task 18b review, I2).
 fn transcript_sessions(source_file: &str) -> impl Iterator<Item = String> + '_ {
     let path = Path::new(source_file);
-    let stem = path.file_stem();
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
     let main = path
         .parent()
         .filter(|dir| dir.file_name().is_some_and(|n| n == "subagents"))
         .and_then(Path::parent)
-        .and_then(Path::file_name);
-    stem.into_iter()
-        .chain(main)
-        .map(|s| s.to_string_lossy().into_owned())
+        .and_then(Path::file_name)
+        .map(|s| s.to_string_lossy().into_owned());
+    let rollout = stem.as_deref().and_then(rollout_session).map(str::to_owned);
+    stem.into_iter().chain(main).chain(rollout)
+}
+
+/// The session id in a Codex rollout's file stem, `rollout-<YYYY-MM-DDTHH-MM-SS>-<id>`: what
+/// follows the 19-character time and its `-`. `None` for any other name.
+fn rollout_session(stem: &str) -> Option<&str> {
+    let rest = stem.strip_prefix("rollout-")?;
+    let id = rest.get(20..).filter(|id| !id.is_empty())?;
+    (rest.as_bytes()[19] == b'-').then_some(id)
 }
 
 pub struct Planner<'a> {
@@ -2367,6 +2377,65 @@ mod tests {
                 sp.id,
                 plan(sp)
             );
+        }
+    }
+
+    /// Task 18b review, I2: capture stores a Codex session under its bare id, while MemPalace's
+    /// drawers of the rollout name the file `rollout-<time>-<id>.jsonl`. The rollout's drawers
+    /// are skipped when capture holds that id; another session's rollout is imported.
+    #[test]
+    fn the_planner_skips_a_rollout_of_a_captured_codex_session() {
+        let id = "0199e4c1-5b2a-7d10-8e3f-4a5b6c7d8e9f";
+        let day = "/h/.codex/sessions/2026/10/03";
+        let mut held_rollout = chunk_spec("r0", Some(0), "codex words");
+        held_rollout.meta.source_file = s(&format!("{day}/rollout-2026-10-03T01-57-34-{id}.jsonl"));
+        let mut other_rollout = chunk_spec("x0", Some(0), "other codex words");
+        other_rollout.meta.source_file = s(&format!(
+            "{day}/rollout-2026-10-03T02-00-00-0199e4c1-0000-7000-8000-000000000000.jsonl"
+        ));
+        let specs = vec![held_rollout, other_rollout];
+        let mut wm = wings();
+        let sv = run(&specs, None, &mut wm, &no_reserved);
+        let f = NoFilter;
+        let held = HashSet::from([id.to_string()]);
+        let planner = Planner {
+            mapper: Mapper {
+                wings: &wm,
+                assume: utc(),
+                filter: &f,
+            },
+            survey: &sv,
+            captured_sessions: &held,
+        };
+        let plan = |sp: &DrawerSpec| planner.plan(&d(&sp.id, &sp.text, sp.meta.clone()));
+        assert!(
+            matches!(
+                plan(&specs[0]),
+                Planned::Skipped {
+                    reason: CAPTURED_BY_ALICE_CAPTURE
+                }
+            ),
+            "{:?}",
+            plan(&specs[0])
+        );
+        assert!(
+            matches!(plan(&specs[1]), Planned::Chunks(_)),
+            "{:?}",
+            plan(&specs[1])
+        );
+        // The id comes only from a rollout's name: the whole id after the time.
+        assert_eq!(
+            rollout_session(&format!("rollout-2026-10-03T01-57-34-{id}")),
+            Some(id)
+        );
+        for not_a_rollout in [
+            id.to_string(),
+            format!("rollout-{id}"),
+            "rollout-2026-10-03T01-57-34-".to_string(),
+            format!("rollout-2026-10-03T01-57-34x{id}"),
+            format!("agent-{id}"),
+        ] {
+            assert_eq!(rollout_session(&not_a_rollout), None, "{not_a_rollout}");
         }
     }
 
