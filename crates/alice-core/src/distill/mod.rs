@@ -85,11 +85,11 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ),
     (
         "already_saved",
-        "says the same as something already saved in this session",
+        "the same knowledge as an item listed under \"Already saved in this session\", even when worded differently or with more detail",
     ),
     (
         "ephemeral",
-        "progress narration, a plan for the next minutes, a greeting, or a result that matters only right now",
+        "a question, a request or thanks to the assistant, or a pick among choices it offered, with no lasting rule or fact in it; progress narration; a plan for the next minutes; a greeting; or a result that matters only right now",
     ),
     (
         "unclear",
@@ -1169,17 +1169,35 @@ fn units(lines: &[Line]) -> Vec<Unit> {
     out
 }
 
+/// A heading line that is a plain paragraph: one line of at most [`PASSAGE_MIN`] characters that
+/// does not end in `. ! ?` or their full-width forms, such as `Next steps:` (a Thai line, which has
+/// no sentence mark, qualifies whatever it says). Followed by list items, it heads them as a
+/// heading does.
+fn is_lead_line(unit: &Unit) -> bool {
+    let t = unit.text.s.trim();
+    unit.kind == UnitKind::Para
+        && !t.contains('\n')
+        && t.chars().count() <= PASSAGE_MIN
+        && !t.ends_with(['.', '!', '?', '。', '！', '？'])
+}
+
 /// Cuts a block's lines into passages of [`PASSAGE_MIN`] to [`PASSAGE_MAX`] characters (spec
-/// §6.3): paragraphs and list items, a heading leading the unit after it. Short neighbours in a
-/// section join until they reach the minimum; a unit over the maximum is cut at sentence ends,
-/// then spaces, then characters. Long code blocks become `[code]` first.
+/// §6.3): paragraphs and bullet groups, a heading leading the unit after it. A heading line
+/// followed by list items keeps the whole group together (a handoff's done and next items stay
+/// one passage). Short neighbours in a section join until they reach the minimum; a unit over the
+/// maximum is cut at sentence ends, then spaces, then characters. Long code blocks become `[code]`
+/// first.
 fn passages(lines: &[Line]) -> Vec<Text> {
     let lines = replace_code(lines);
     let mut out: Vec<(Text, usize)> = Vec::new();
     let mut cur: Option<(Text, usize)> = None;
     let mut lead: Option<Text> = None;
-    for unit in units(&lines) {
-        if unit.kind == UnitKind::Heading {
+    let mut units = units(&lines).into_iter().peekable();
+    while let Some(unit) = units.next() {
+        let heads_items = units
+            .peek()
+            .is_some_and(|n| n.kind == UnitKind::Item && n.section == unit.section);
+        if unit.kind == UnitKind::Heading || (heads_items && is_lead_line(&unit)) {
             flush(&mut cur, &mut out);
             match &mut lead {
                 Some(l) => l.append("\n", unit.text),
@@ -1188,7 +1206,18 @@ fn passages(lines: &[Line]) -> Vec<Text> {
             continue;
         }
         let sep = if unit.blank_before { "\n\n" } else { "\n" };
+        let unit_section = unit.section;
         let piece = match lead.take() {
+            // A heading line leads its whole bullet group.
+            Some(mut l) if unit.kind == UnitKind::Item => {
+                l.append("\n", unit.text);
+                while let Some(n) =
+                    units.next_if(|n| n.kind == UnitKind::Item && n.section == unit_section)
+                {
+                    l.append(if n.blank_before { "\n\n" } else { "\n" }, n.text);
+                }
+                l
+            }
             Some(mut l) => {
                 l.append("\n", unit.text);
                 l
@@ -1881,7 +1910,6 @@ mod tests {
             [
                 S::Summary,
                 S::Summary,
-                S::Summary,
                 S::Conclusion,
                 S::Conclusion,
                 S::UserStatement,
@@ -1892,17 +1920,17 @@ mod tests {
             p.candidates
         );
         let texts: Vec<&str> = p.candidates.iter().map(|c| c.text.as_str()).collect();
-        // The summary is cut at its headings and bullet groups, a heading leading its group.
+        // The summary is cut at its headings, each heading keeping its whole bullet group.
         assert!(texts[0].starts_with("## Key decisions\n- We chose SQLite WAL"));
-        assert!(texts[1].starts_with("- The embedder runs on its own thread"));
-        assert!(texts[2].starts_with("## Errors and fixes\n- The lease test was flaky"));
+        assert!(texts[0].ends_with("\n- The embedder runs on its own thread, so a slow model never stalls the request path of the daemon."));
+        assert!(texts[1].starts_with("## Errors and fixes\n- The lease test was flaky"));
         // A turn's conclusion is its last assistant block, not the narration before a tool.
-        assert!(texts[3].starts_with("The batch size is now read"));
-        assert!(texts[4].starts_with("The survey is done."));
+        assert!(texts[2].starts_with("The batch size is now read"));
+        assert!(texts[3].starts_with("The survey is done."));
         assert!(!texts.iter().any(|t| t.contains("look at the writer first")));
-        assert!(texts[5].starts_with("Please make the ingest batch size"));
-        assert!(texts[6].starts_with("Now survey the capture module"));
-        assert!(texts[7].starts_with("Report: the capture module reads transcripts"));
+        assert!(texts[4].starts_with("Please make the ingest batch size"));
+        assert!(texts[5].starts_with("Now survey the capture module"));
+        assert!(texts[6].starts_with("Report: the capture module reads transcripts"));
         // Ids, questions and prompts line up.
         assert_eq!(p.questions.len(), p.candidates.len());
         for (i, (c, q)) in p.candidates.iter().zip(&p.questions).enumerate() {
@@ -1910,14 +1938,14 @@ mod tests {
             assert_eq!(q.id, c.qid);
         }
         assert_eq!(
-            p.candidates[3].prompt.as_deref(),
+            p.candidates[2].prompt.as_deref(),
             Some("Please make the ingest batch size configurable through the settings file.")
         );
         assert_eq!(
-            p.candidates[7].prompt.as_deref(),
+            p.candidates[6].prompt.as_deref(),
             Some("Now survey the capture module and report what it does in detail.")
         );
-        assert!(p.candidates[0].prompt.is_none() && p.candidates[5].prompt.is_none());
+        assert!(p.candidates[0].prompt.is_none() && p.candidates[4].prompt.is_none());
     }
 
     #[test]
@@ -1977,6 +2005,74 @@ mod tests {
         };
         assert!(joined("Short note.", &words(100, 6)), "{all}");
         assert!(joined("- Second bullet.", &words(101, 6)), "{all}");
+    }
+
+    /// Task 13 tuning: a heading line keeps its whole bullet group in one passage, so a handoff
+    /// holds what is done and what comes next together. A heading line is a heading, or one line
+    /// of at most 80 characters that does not end in `. ! ?` or their full-width forms (with or
+    /// without a colon; a Thai line has no sentence mark); a sentence before a list does not head
+    /// it.
+    #[test]
+    fn a_heading_line_keeps_its_bullet_group_together() {
+        let [a, b, c, d, e] = [500, 501, 502, 503, 504].map(|s| words(s, 12));
+        let conclusions = |reply: &str| -> Vec<String> {
+            let main = render(&[User("Wrap up the work for today."), Say(reply)]);
+            of(&prepare(&run(main, vec![], true)), S::Conclusion)
+                .iter()
+                .map(|c| c.text.clone())
+                .collect()
+        };
+        let texts = conclusions(&format!(
+            "Status for the next session\n- Done: {a}.\n- Next: {b}.\n- Open: {c}.\n\nThat is all for the list.\n- {d}.\n- {e}."
+        ));
+        assert!(
+            texts.contains(&format!(
+                "Status for the next session\n- Done: {a}.\n- Next: {b}.\n- Open: {c}."
+            )),
+            "{texts:#?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains(&d) && t.contains(&e)),
+            "a sentence does not head the list after it: {texts:#?}"
+        );
+
+        // A Thai line has no sentence mark: it heads the list after it.
+        let thai = "งานที่ค้างอยู่ตอนนี้";
+        let texts = conclusions(&format!("{thai}\n- {a}.\n- {b}."));
+        assert!(
+            texts.contains(&format!("{thai}\n- {a}.\n- {b}.")),
+            "{texts:#?}"
+        );
+
+        // The bound: a line of 80 characters heads its list, one of 81 does not.
+        for (n, leads) in [(80, true), (81, false)] {
+            let line = format!("Heading {}", "x".repeat(n - 8));
+            assert_eq!(line.chars().count(), n);
+            let texts = conclusions(&format!("{line}\n- {a}.\n- {b}."));
+            assert_eq!(
+                texts.iter().any(|t| t.contains(&line) && t.contains(&a)),
+                leads,
+                "a line of {n} characters: {texts:#?}"
+            );
+            if leads {
+                assert!(
+                    texts.contains(&format!("{line}\n- {a}.\n- {b}.")),
+                    "{texts:#?}"
+                );
+            }
+        }
+
+        let summary = format!("## Pending tasks\n- {a}.\n- {b}.\n\n## Current work\n{c}.");
+        let p = prepare(&run(render(&[Compact(&summary)]), vec![], false));
+        let texts: Vec<&str> = of(&p, S::Summary).iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                format!("## Pending tasks\n- {a}.\n- {b}."),
+                format!("## Current work\n{c}.")
+            ],
+            "a heading leads its bullet group, or the paragraph after it"
+        );
     }
 
     #[test]
@@ -2575,11 +2671,11 @@ mod tests {
             ),
             (
                 "already_saved",
-                "says the same as something already saved in this session",
+                "the same knowledge as an item listed under \"Already saved in this session\", even when worded differently or with more detail",
             ),
             (
                 "ephemeral",
-                "progress narration, a plan for the next minutes, a greeting, or a result that matters only right now",
+                "a question, a request or thanks to the assistant, or a pick among choices it offered, with no lasting rule or fact in it; progress narration; a plan for the next minutes; a greeting; or a result that matters only right now",
             ),
             (
                 "unclear",
