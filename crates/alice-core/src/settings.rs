@@ -1558,13 +1558,19 @@ impl Settings {
         }
 
         let y = &self.sync;
+        // A token put where the user name goes is a password too (final review A-m6): only a
+        // plain user name (`git@`, `me@`) may stay in the URL.
         if let Some(remote) = &y.remote
             && let Some(u) = url_parts(remote)
-            && u.userinfo.is_some_and(|i| i.contains(':'))
+            && u.userinfo.is_some_and(|i| {
+                i.contains(':')
+                    || i.len() > 32
+                    || !crate::redact::Redactor::builtin().apply(i).found.is_empty()
+            })
         {
             e.push(err(
                 "sync.remote",
-                "must not contain a password; use git's credential helper",
+                "must not contain a password or token; use git's credential helper",
             ));
         }
         if y.branch.trim().is_empty() || y.branch.chars().any(char::is_whitespace) {
@@ -3066,6 +3072,14 @@ mod tests {
                 "[sync]\nremote = \"https://me:tok@github.com/me/mem.git\"\n",
                 "sync.remote",
             ),
+            // Final review A-m6: a token as the user name.
+            (
+                concat!(
+                    "[sync]\nremote = \"https://gh",
+                    "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789@github.com/me/notes.git\"\n"
+                ),
+                "sync.remote",
+            ),
         ];
         for (file, key) in bad {
             assert!(
@@ -3087,6 +3101,7 @@ mod tests {
             "[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"http://localhost:8000/v1\"\n",
             "[sync]\nremote = \"git@github.com:me/mem.git\"\n",
             "[sync]\nremote = \"ssh://git@github.com/me/mem.git\"\n",
+            "[sync]\nremote = \"https://me@github.com/me/mem.git\"\n",
         ];
         for file in good {
             assert!(
