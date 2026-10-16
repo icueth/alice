@@ -21,6 +21,7 @@ use crate::capture::TAGS;
 use crate::judge::jev::Question;
 use crate::judge::{Choice, Distribution, verbal};
 use crate::model::Kind;
+use crate::search::lexical::in_unspaced_script;
 use crate::settings::DistillSettings;
 
 /// The most candidates, and so questions, in one request (spec R16).
@@ -105,8 +106,10 @@ const STATE_REPLY_CHARS: usize = 600;
 /// A fenced code block of more lines than this is replaced by [`CODE`].
 const CODE_LINES_MAX: usize = 10;
 const CODE: &str = "[code]";
-/// A conclusion's or report's body gains `Context: <prompt>` when the prompt has this many words.
+/// A conclusion's or report's body gains `Context: <prompt>` when the prompt has this many words,
 const CONTEXT_MIN_WORDS: usize = 4;
+/// or this many characters of a script written without spaces (Thai, CJK, …).
+const CONTEXT_MIN_UNSPACED: usize = 12;
 /// A subagent call's description is one line of at most this many characters (Task 3).
 const CALL_CHARS: usize = 300;
 const WITHHELD: &str = "[withheld:";
@@ -136,6 +139,18 @@ pub struct RunChunk {
     pub text: String,
     /// The chunk belongs to one of the session's subagent sources, not to the session itself.
     pub subagent: bool,
+    /// Whether the chunk is the first of a turn: `Some(true)` for a turn's first chunk,
+    /// `Some(false)` for any other, `None` to infer it from the text (a chunk whose first line
+    /// is a `[user]` prompt, not a command line, or a `[summary]`). The text rule misreads a
+    /// mid-turn `[user]` line that starts a chunk, a withheld continuation (it has no
+    /// `(cont.)`), a typed prompt that looks like a command, a turn whose first record renders
+    /// nothing, and the boundary between two subagent sources.
+    ///
+    /// Task 12 fills it from `capture_turns.first_ord` of the chunk's source (`Some(true)` when
+    /// a turn's `first_ord` is this `ord`), leaving out `tail:%` keys because a stored late tail
+    /// continues the previous turn; and it sets `Some(true)` on the first chunk of each subagent
+    /// source in the run, so one source's turn never takes in the next source's text.
+    pub turn_start: Option<bool>,
 }
 
 /// One run of a source (spec §6.2): its chunks from `distill_ord` on, plus new chunks of its
@@ -252,11 +267,7 @@ pub fn prepare(input: &RunInput) -> Prepared {
         .copied()
         .chain(input.chunks.iter().filter(|c| c.subagent))
         .collect();
-    let indexed: Vec<(usize, &str)> = order
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (i, c.text.as_str()))
-        .collect();
+    let indexed: Vec<(usize, &RunChunk)> = order.iter().copied().enumerate().collect();
     let main_turns = parse(&indexed[..covered]);
     let sub_turns = parse(&indexed[covered..]);
 
@@ -451,9 +462,22 @@ impl Block {
     }
 }
 
+/// How a turn's start is known.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Start {
+    /// From the text, or the start of a stream (no flag).
+    #[default]
+    Guessed,
+    /// Flagged `Some(true)`: its first `[user]` block is the prompt record, whatever it looks like.
+    Flagged,
+    /// A stream that starts in the middle of a turn (flagged `Some(false)`): no prompt.
+    Headless,
+}
+
 #[derive(Debug, Default)]
 struct Turn {
     blocks: Vec<Block>,
+    start: Start,
 }
 
 /// A head line's tag, whether it continues a block the renderer cut (`(cont.)`), and the text
@@ -557,15 +581,29 @@ fn inline_join(prev: &str, next: &str) -> Option<&'static str> {
     }
 }
 
-/// Parses one stream of chunks (`(index, text)`, in order) into turns of blocks.
-fn parse(chunks: &[(usize, &str)]) -> Vec<Turn> {
+/// Whether a chunk starts a turn: its flag, else the text rule.
+fn is_turn_start(chunk: &RunChunk) -> bool {
+    chunk.turn_start.unwrap_or_else(|| starts_turn(&chunk.text))
+}
+
+/// Parses one stream of chunks (`(index, chunk)`, in order) into turns of blocks. A turn starts
+/// where [`is_turn_start`] says so, and at the stream's first chunk.
+fn parse(chunks: &[(usize, &RunChunk)]) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
-    for &(idx, text) in chunks {
-        if turns.is_empty() || starts_turn(text) {
-            turns.push(Turn::default());
+    for &(idx, chunk) in chunks {
+        let start = match chunk.turn_start {
+            Some(true) => Some(Start::Flagged),
+            Some(false) => turns.is_empty().then_some(Start::Headless),
+            None => (turns.is_empty() || starts_turn(&chunk.text)).then_some(Start::Guessed),
+        };
+        if let Some(start) = start {
+            turns.push(Turn {
+                blocks: Vec::new(),
+                start,
+            });
         }
         let turn = turns.last_mut().expect("a turn was pushed");
-        for (i, raw) in text.split('\n').enumerate() {
+        for (i, raw) in chunk.text.split('\n').enumerate() {
             let Some((tag, cont, rest)) = parse_head(raw) else {
                 let line = Line {
                     text: body_line(raw, false),
@@ -616,7 +654,7 @@ fn covered(main: &[&RunChunk]) -> usize {
     let (mut turns, mut chars, mut end) = (0, 0, 0);
     while end < main.len() {
         let next = (end + 1..main.len())
-            .find(|&k| starts_turn(&main[k].text))
+            .find(|&k| is_turn_start(main[k]))
             .unwrap_or(main.len());
         let size: usize = main[end..next].iter().map(|c| c.text.chars().count()).sum();
         if turns == RUN_MAX_TURNS || (turns > 0 && chars + size > RUN_MAX_CHARS) {
@@ -641,20 +679,28 @@ fn covered(main: &[&RunChunk]) -> usize {
 }
 
 /// The turn's prompt: the first `[user]` block of real text among those it starts with (not a
-/// command line, a task notification, a media placeholder or withheld text).
+/// command line, a task notification, a media placeholder or withheld text). The first block of
+/// a flagged turn is the prompt record's text even when it looks like a command
+/// (`/health returns 503`); a stream that starts in the middle of a turn has no prompt.
 fn prompt_block(turn: &Turn) -> Option<&Block> {
+    if turn.start == Start::Headless {
+        return None;
+    }
     turn.blocks
         .iter()
         .take_while(|b| b.tag == Tag::User)
-        .find(|b| {
+        .enumerate()
+        .find(|(i, b)| {
             let text = b.text();
             let t = text.trim();
+            let typed = turn.start == Start::Flagged && *i == 0;
             !t.is_empty()
                 && !b.withheld()
-                && !is_command(t)
+                && (typed || !is_command(t))
                 && !t.starts_with("(task notification)")
                 && !PLACEHOLDERS.contains(&t)
         })
+        .map(|(_, b)| b)
 }
 
 /// The lines of the turn's last assistant block that is not thinking, together with the
@@ -1292,9 +1338,9 @@ fn is_mark(c: char) -> bool {
 }
 
 /// The text up to its first sentence end (`.`, `!` or `?` before a space or the end, `。`, `！`,
-/// `？`) or line break.
+/// `？`) or line break, after a leading heading or list marker.
 fn first_sentence(text: &str) -> &str {
-    let text = text.trim();
+    let text = strip_marker(text).trim();
     let mut chars = text.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
         let next = i + c.len_utf8();
@@ -1407,7 +1453,8 @@ fn question(i: usize, c: &Candidate) -> Question {
 }
 
 /// `Context: <prompt>` for a conclusion or a subagent report whose prompt has at least four
-/// words, so the memory stands on its own.
+/// words, or at least twelve characters of a script written without spaces, so the memory stands
+/// on its own.
 fn context_line(source: CandidateSource, prompt: Option<&str>) -> Option<String> {
     if !matches!(
         source,
@@ -1416,7 +1463,10 @@ fn context_line(source: CandidateSource, prompt: Option<&str>) -> Option<String>
         return None;
     }
     let prompt = prompt?;
-    (prompt.split_whitespace().count() >= CONTEXT_MIN_WORDS).then(|| format!("Context: {prompt}"))
+    let words = prompt.split_whitespace().count();
+    let unspaced = prompt.chars().filter(|&c| in_unspaced_script(c)).count();
+    (words >= CONTEXT_MIN_WORDS || unspaced >= CONTEXT_MIN_UNSPACED)
+        .then(|| format!("Context: {prompt}"))
 }
 
 /// The passage within [`BODY_MAX`] characters, and its context line.
@@ -1430,16 +1480,35 @@ fn body_of(c: &Candidate) -> String {
 }
 
 /// The passage's first sentence within [`TITLE_MAX`] characters, cut at a word boundary.
-/// Headings and placeholders are passed over, list markers and bold marks dropped, and a line
-/// that ends with `:` runs on into the next.
+/// Headings, placeholders and code (fence lines and what they enclose) are passed over, list
+/// markers and bold marks dropped, and a line that ends with `:` runs on into the next. A
+/// passage that is only code is titled by its first line of code.
 fn title_of(text: &str) -> String {
-    let lines: Vec<(bool, String)> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !PLACEHOLDERS.contains(l))
-        .map(|l| (l.starts_with('#'), strip_markup(l)))
-        .filter(|(_, l)| !l.is_empty())
-        .collect();
+    let mut prose: Vec<(bool, String)> = Vec::new();
+    let mut code: Vec<(bool, String)> = Vec::new();
+    let mut fence: Option<&str> = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(f) = fence {
+            if line.starts_with(f) {
+                fence = None;
+            } else if !line.is_empty() {
+                code.push((false, line.to_owned()));
+            }
+            continue;
+        }
+        if let Some(f) = fence_of(line) {
+            fence = Some(f);
+            continue;
+        }
+        if line.is_empty() || PLACEHOLDERS.contains(&line) {
+            continue;
+        }
+        let stripped = strip_markup(line);
+        if !stripped.is_empty() {
+            prose.push((line.starts_with('#'), stripped));
+        }
+    }
+    let lines = if prose.is_empty() { code } else { prose };
     let pick = lines.iter().position(|(heading, _)| !heading).unwrap_or(0);
     let Some((_, first)) = lines.get(pick) else {
         return cut_words(text.trim(), TITLE_MAX).to_owned();
@@ -1455,11 +1524,22 @@ fn title_of(text: &str) -> String {
 
 /// A line without its heading marks, list marker and bold marks.
 fn strip_markup(line: &str) -> String {
-    let mut t = line.trim_start_matches('#').trim_start();
-    if let Some(n) = bullet_len(t) {
-        t = &t[n..];
+    strip_marker(line).replace("**", "").trim().to_owned()
+}
+
+/// `text` without a heading's `#`s or a list marker (`1. `, `- `, …) at its start.
+fn strip_marker(text: &str) -> &str {
+    let mut t = text.trim_start();
+    if t.starts_with('#') {
+        let rest = t.trim_start_matches('#');
+        if rest.is_empty() || rest.starts_with(' ') {
+            t = rest.trim_start();
+        }
     }
-    t.replace("**", "").trim().to_owned()
+    match bullet_len(t) {
+        Some(n) => t[n..].trim_start(),
+        None => t,
+    }
 }
 
 #[cfg(test)]
@@ -1601,7 +1681,8 @@ mod tests {
             .collect()
     }
 
-    /// A run over main chunks (ids `m<ord>`) and one subagent source's chunks (ids `s<ord>`).
+    /// A run over main chunks (ids `m<ord>`) and one subagent source's chunks (ids `s<ord>`),
+    /// with no turn-start flags (the text rule).
     fn run(main: Vec<String>, subs: Vec<String>, closes_session: bool) -> RunInput {
         let mut chunks: Vec<RunChunk> = main
             .into_iter()
@@ -1611,6 +1692,7 @@ mod tests {
                 ord: i as i64,
                 text,
                 subagent: false,
+                turn_start: None,
             })
             .collect();
         chunks.extend(subs.into_iter().enumerate().map(|(i, text)| RunChunk {
@@ -1618,12 +1700,71 @@ mod tests {
             ord: i as i64,
             text,
             subagent: true,
+            turn_start: None,
         }));
         RunInput {
             uri: URI.into(),
             project: "alice".into(),
             chunks,
             closes_session,
+        }
+    }
+
+    /// Chunk texts with exact turn-start flags: the first chunk of each turn the reader found.
+    fn render_flagged(
+        steps: &[Step],
+        agent: Option<&str>,
+        opts: &ReadOptions,
+    ) -> Vec<(String, bool)> {
+        read(AgentKind::ClaudeCode, &jsonl(steps, agent), opts)
+            .turns
+            .into_iter()
+            .flat_map(|t| {
+                t.chunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.text, i == 0))
+            })
+            .collect()
+    }
+
+    /// A run as Task 12 builds it: main chunks (ids `m<ord>`, ords from 0) and subagent sources
+    /// one after another (ids `s<k>-<ord>`, ords from each source's first ord), the first chunk
+    /// of each source a turn start. Without `flags` every flag is `None`.
+    fn flagged_run(
+        main: &[(String, bool)],
+        subs: &[(i64, Vec<(String, bool)>)],
+        flags: bool,
+    ) -> RunInput {
+        let flag = |start: bool| flags.then_some(start);
+        let mut chunks: Vec<RunChunk> = main
+            .iter()
+            .enumerate()
+            .map(|(i, (text, start))| RunChunk {
+                id: format!("m{i}"),
+                ord: i as i64,
+                text: text.clone(),
+                subagent: false,
+                turn_start: flag(*start),
+            })
+            .collect();
+        for (k, (first_ord, source)) in subs.iter().enumerate() {
+            chunks.extend(source.iter().enumerate().map(|(i, (text, start))| {
+                let ord = first_ord + i as i64;
+                RunChunk {
+                    id: format!("s{k}-{ord}"),
+                    ord,
+                    text: text.clone(),
+                    subagent: true,
+                    turn_start: flag(*start || i == 0),
+                }
+            }));
+        }
+        RunInput {
+            uri: URI.into(),
+            project: "alice".into(),
+            chunks,
+            closes_session: false,
         }
     }
 
@@ -2263,6 +2404,7 @@ mod tests {
         let glued = format!("{head}ก\u{0E48}{}", thai(6, 150, ""));
         // A hard cut at 1,200 characters would put a mark first in the next piece.
         let marks = format!("ฮ{}{}", "ก\u{0E48}".repeat(600), thai(7, 60, ""));
+        let resume = thai(8, 40, " ");
         assert!(is_mark(marks.chars().nth(PASSAGE_MAX).unwrap()));
         let main = render(&[
             User(prompt),
@@ -2275,6 +2417,8 @@ mod tests {
             Say(&glued),
             User("ข้อความที่มีวรรณยุกต์ทุกตัว"),
             Say(&marks),
+            User("ทำต่อ"),
+            Say(&resume),
         ]);
         assert!(
             main.iter().any(|c| c
@@ -2291,7 +2435,7 @@ mod tests {
             let n = c.text.chars().count();
             assert!((PASSAGE_MIN..=PASSAGE_MAX).contains(&n), "{n}");
             assert!(
-                [&reply, &glued, &marks]
+                [&reply, &glued, &marks, &resume]
                     .iter()
                     .any(|whole| flat(whole).contains(&flat(&c.text))),
                 "a passage is a slice of a reply: {}",
@@ -2344,7 +2488,25 @@ mod tests {
                 m.title
             );
             assert!(m.body.starts_with(&c.text));
+            // An unspaced prompt of 12 or more code points counts as four words; ทำต่อ (five
+            // code points) does not.
+            if c.source == S::Conclusion && c.prompt.as_deref() == Some(prompt) {
+                assert_eq!(m.body, format!("{}\n\nContext: {prompt}", c.text));
+            }
+            if c.prompt.as_deref() == Some("ทำต่อ") {
+                assert_eq!(m.body, c.text, "no context line");
+            }
         }
+        assert!(
+            p.candidates
+                .iter()
+                .any(|c| c.source == S::Conclusion && c.prompt.as_deref() == Some(prompt))
+        );
+        assert!(
+            p.candidates
+                .iter()
+                .any(|c| c.prompt.as_deref() == Some("ทำต่อ"))
+        );
 
         // Statements count characters, not bytes.
         let statements: Vec<&str> = of(&p, S::UserStatement)
@@ -2645,6 +2807,246 @@ mod tests {
         assert!(
             reports.iter().any(|c| c.text.ends_with("\n…")),
             "the cut report ends with an ellipsis: {reports:#?}"
+        );
+    }
+
+    #[test]
+    fn explicit_turn_starts_fix_what_the_text_rule_misreads() {
+        let conclusions_of = |p: &Prepared| -> Vec<(String, Option<String>)> {
+            of(p, S::Conclusion)
+                .iter()
+                .map(|c| (c.text.clone(), c.prompt.clone()))
+                .collect()
+        };
+
+        // 1. A withheld continuation of the prompt: the stub has no `(cont.)`.
+        let first = "Please fix the flaky lease test in the renewal module.";
+        let prompt = format!("{first} {}. {}", words(700, 14), words(701, 10));
+        let reply = format!("The lease test is fixed: {}.", words(702, 15));
+        let mut chunks = render_flagged(&[User(&prompt), Say(&reply)], None, &opts(200));
+        assert!(chunks[0].1 && chunks[0].0.starts_with("[user] Please fix"));
+        assert!(
+            !chunks[1].1 && chunks[1].0.starts_with("[user] (cont.) "),
+            "{chunks:#?}"
+        );
+        assert!(
+            chunks[2..]
+                .iter()
+                .all(|c| !c.1 && c.0.starts_with("[assistant]"))
+        );
+        // A run that starts in the middle of the prompt has no prompt to quote; today's rule
+        // quotes the fragment.
+        let fragment = prompt_sentence(&words(701, 10)).unwrap();
+        let mid = prepare(&flagged_run(&chunks[1..], &[], true));
+        assert_eq!(conclusions_of(&mid), [(reply.clone(), None)]);
+        let mid = prepare(&flagged_run(&chunks[1..], &[], false));
+        assert_eq!(conclusions_of(&mid), [(reply.clone(), Some(fragment))]);
+        chunks[1].0 = "[user] [withheld: github_token]".into();
+        let fixed = prepare(&flagged_run(&chunks, &[], true));
+        assert_eq!(
+            conclusions_of(&fixed),
+            [(reply.clone(), Some(first.into()))]
+        );
+        // Without flags (today's rule) the stub reads as a turn with no prompt.
+        let guessed = prepare(&flagged_run(&chunks, &[], false));
+        assert_eq!(conclusions_of(&guessed), [(reply.clone(), None)]);
+
+        // 2. A typed prompt that looks like a command.
+        let check = "Check the writer first, please.";
+        let first_reply = format!("The writer is fine: {}.", words(703, 14));
+        let typed = "/health returns 503 after the deploy, find out why it fails.";
+        let second_reply = format!("The health route failed because {}.", words(704, 14));
+        let chunks = render_flagged(
+            &[
+                User(check),
+                Say(&first_reply),
+                User(typed),
+                Say(&second_reply),
+            ],
+            None,
+            &opts(2000),
+        );
+        assert_eq!(
+            chunks.iter().filter(|c| c.1).count(),
+            2,
+            "the reader sees two turns"
+        );
+        assert!(chunks[1].0.starts_with("[user] /health returns 503"));
+        let fixed = prepare(&flagged_run(&chunks, &[], true));
+        assert_eq!(
+            conclusions_of(&fixed),
+            [
+                (first_reply.clone(), Some(check.into())),
+                (second_reply.clone(), Some(typed.into()))
+            ]
+        );
+        assert!(of(&fixed, S::UserStatement).iter().any(|c| c.text == typed));
+        let guessed = prepare(&flagged_run(&chunks, &[], false));
+        assert_eq!(
+            conclusions_of(&guessed),
+            [(second_reply.clone(), Some(check.into()))],
+            "today's rule reads the two turns as one"
+        );
+
+        // 3. Two subagent sources; B's run starts in the middle of its turn, at a continuation.
+        let report_a = format!("Report A: {}.", words(705, 16));
+        let a = render_flagged(
+            &[User("Survey the writer and report back."), Say(&report_a)],
+            Some("agent-a"),
+            &opts(2000),
+        );
+        let narration = format!("I will read the module first: {}.", words(706, 40));
+        let report_b = format!("Report B: {}.", words(707, 16));
+        let b_all = render_flagged(
+            &[
+                User("Survey the reader and report back."),
+                Say(&narration),
+                Bash("rg Reader", "src/reader.rs:1"),
+                Say(&report_b),
+            ],
+            Some("agent-b"),
+            &opts(200),
+        );
+        let from = b_all
+            .iter()
+            .position(|c| c.0.starts_with("[assistant] (cont.) "))
+            .unwrap();
+        let b = b_all[from..].to_vec();
+        let main = render_flagged(
+            &[
+                User("Survey both modules with two agents."),
+                Say("Both surveys are back."),
+            ],
+            None,
+            &opts(2000),
+        );
+        let subs = [(0, a), (100 + from as i64, b)];
+        let reports = |p: &Prepared| -> Vec<String> {
+            of(p, S::SubagentReport)
+                .iter()
+                .map(|c| c.text.clone())
+                .collect()
+        };
+        let fixed = prepare(&flagged_run(&main, &subs, true));
+        assert_eq!(reports(&fixed), [report_a.clone(), report_b.clone()]);
+        assert!(
+            !fixed
+                .candidates
+                .iter()
+                .any(|c| c.text.contains("read the module first")),
+            "B's continuation is not glued into A's report"
+        );
+        let guessed = prepare(&flagged_run(&main, &subs, false));
+        assert_eq!(
+            reports(&guessed),
+            [report_b],
+            "today's rule lets A's turn take in B's text"
+        );
+
+        // Where the text rule is right, exact flags change nothing.
+        const TURNS: &[u8] = include_bytes!("../../tests/fixtures/capture/claude/turns.jsonl");
+        for input in [TOOLS, TURNS] {
+            let chunks: Vec<(String, bool)> = read(AgentKind::ClaudeCode, input, &opts(2000))
+                .turns
+                .into_iter()
+                .flat_map(|t| {
+                    t.chunks
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, c)| (c.text, i == 0))
+                })
+                .collect();
+            let with = prepare(&flagged_run(&chunks, &[], true));
+            let without = prepare(&flagged_run(&chunks, &[], false));
+            assert_eq!(with.candidates, without.candidates);
+            assert_eq!(with.state, without.state);
+            assert_eq!(with.consumed_ord, without.consumed_ord);
+        }
+
+        // `covered` counts turns by the flags too.
+        let steps: Vec<RunChunk> = (0..=RUN_MAX_TURNS)
+            .map(|i| RunChunk {
+                id: format!("m{i}"),
+                ord: i as i64,
+                text: format!("[assistant] Step {i} is done."),
+                subagent: false,
+                turn_start: Some(true),
+            })
+            .collect();
+        let refs: Vec<&RunChunk> = steps.iter().collect();
+        assert_eq!(covered(&refs), RUN_MAX_TURNS);
+        let unflagged: Vec<RunChunk> = steps
+            .iter()
+            .cloned()
+            .map(|c| RunChunk {
+                turn_start: None,
+                ..c
+            })
+            .collect();
+        let refs: Vec<&RunChunk> = unflagged.iter().collect();
+        assert_eq!(covered(&refs), RUN_MAX_TURNS + 1, "one guessed turn");
+    }
+
+    #[test]
+    fn titles_skip_code_fences_and_prompts_drop_list_markers() {
+        assert_eq!(
+            title_of(
+                "```sh\ncargo test -p alice-core --lib\n```\nThese two commands are what CI runs before every push."
+            ),
+            "These two commands are what CI runs before every push."
+        );
+        assert_eq!(
+            title_of("Run these to check it:\n\n```sh\ncargo test -p alice-core\n```"),
+            "Run these to check it:"
+        );
+        assert_eq!(
+            title_of("```sh\ncargo test -p alice-core --lib\ncargo fmt --all --check\n```"),
+            "cargo test -p alice-core --lib",
+            "a passage of code alone is titled by its first line"
+        );
+        for p in [
+            "1. Fix the lease test in the renewal module. 2. Then update the docs.",
+            "- Fix the lease test in the renewal module. And more.",
+            "# Fix the lease test in the renewal module. Thanks",
+        ] {
+            assert_eq!(
+                prompt_sentence(p).as_deref(),
+                Some("Fix the lease test in the renewal module."),
+                "{p}"
+            );
+        }
+
+        let reply = format!(
+            "```sh\ncargo test -p alice-core lease\n```\nThe lease test passes again: {}.",
+            words(800, 12)
+        );
+        let main = render(&[
+            User("1. Fix the lease test in the renewal module. 2. Then update the docs page."),
+            Say(&reply),
+        ]);
+        let p = prepare(&run(main, vec![], false));
+        let c = of(&p, S::Conclusion)[0].clone();
+        assert_eq!(c.text, reply);
+        assert_eq!(
+            c.prompt.as_deref(),
+            Some("Fix the lease test in the renewal module.")
+        );
+        let kept = decide(
+            &p,
+            &all_answer(&p, "howto", 0.9),
+            URI,
+            &DistillConfig::default(),
+        );
+        let key = idempotency_key(URI, &c.text);
+        let m = kept.iter().find(|m| m.idempotency_key == key).unwrap();
+        assert!(
+            m.title.starts_with("The lease test passes again: "),
+            "{}",
+            m.title
+        );
+        assert!(
+            m.body
+                .ends_with("\n\nContext: Fix the lease test in the renewal module.")
         );
     }
 }

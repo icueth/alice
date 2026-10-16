@@ -86,7 +86,7 @@ fn pieces(query: &str) -> impl Iterator<Item = &str> {
 /// Whether `c` belongs to a script written without spaces between words: Thai, Lao, Tibetan,
 /// Myanmar, Khmer, the Tai scripts, Balinese, Javanese, Yi, and CJK ideographs and kana.
 /// Korean (Hangul) is written with spaces and is not one.
-fn in_unspaced_script(c: char) -> bool {
+pub(crate) fn in_unspaced_script(c: char) -> bool {
     matches!(
         c as u32,
         0x0E00..=0x0FFF // Thai, Lao, Tibetan
