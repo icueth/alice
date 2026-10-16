@@ -255,6 +255,7 @@ fn judge_memory(m: &Memory, similarity: Option<f32>) -> JudgeMemory {
         created_at: m.created_at.clone(),
         similarity,
         raw: false,
+        status: None,
     }
 }
 

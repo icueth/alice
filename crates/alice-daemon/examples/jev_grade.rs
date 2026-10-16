@@ -86,6 +86,7 @@ fn main() -> anyhow::Result<()> {
         created_at: chrono::Utc::now().to_rfc3339(),
         similarity: None,
         raw: false,
+        status: None,
     };
     let (mut out, mut failed, mut graded) = (serde_json::Map::new(), Vec::new(), 0usize);
     let mut counts = [0usize; 3];

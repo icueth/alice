@@ -425,7 +425,8 @@ pub struct SearchSettings {
     pub default_mode: DefaultRecallMode,
     /// The whole budget, in milliseconds (200 to 30000), of the judge call of a precise recall.
     /// The call is made once, with no retries; past the budget (or while the judge keeps
-    /// failing) the recall answers as fast mode does and says why.
+    /// failing) the recall answers as fast mode does and says why. The CLI and `alice mcp` wait
+    /// for a recall this long plus 2.5 s (and 2 s more with an HTTP embedder), at least 5 s.
     pub precise_timeout_ms: u64,
     /// Token budget of a recall answer when the agent does not ask for one (100 to 50000).
     pub default_max_tokens: usize,
@@ -667,7 +668,9 @@ pub struct BackupSettings {
     pub daily: u32,
     /// Weekly backups kept.
     pub weekly: u32,
-    /// Backup directory (default `<data dir>/backups`).
+    /// Backup directory (default `<data dir>/backups`). Backups go to a directory of this
+    /// home's own inside it (`<dir>/home-<id>/`), so homes that share it never mix them up.
+    /// `~/…` is under your home directory; a relative path is taken inside the data directory.
     pub dir: Option<String>,
 }
 
@@ -1527,10 +1530,12 @@ impl Settings {
                     ),
                 ));
             }
+            // The error never quotes the expression: people write known secrets as patterns
+            // (final review A-m3), and this text reaches the log, the API and `alice doctor`.
             match regex::Regex::new(&c.regex) {
                 Err(x) => e.push(err(
                     "privacy.custom_patterns",
-                    format!("pattern {}: {x}", c.name),
+                    format!("pattern {}: {}", c.name, regex_problem(&x)),
                 )),
                 // Such a pattern would "match" between every two characters.
                 Ok(re) if re.is_match("") => e.push(err(
@@ -1543,9 +1548,12 @@ impl Settings {
                 Ok(_) => {}
             }
         }
-        for a in &p.allowlist {
+        for (i, a) in p.allowlist.iter().enumerate() {
             if let Err(x) = regex::Regex::new(a) {
-                e.push(err("privacy.allowlist", format!("{a}: {x}")));
+                e.push(err(
+                    "privacy.allowlist",
+                    format!("entry {i}: {}", regex_problem(&x)),
+                ));
             }
         }
         if p.cloud_denied_projects.iter().any(|s| s.trim().is_empty()) {
@@ -1556,13 +1564,19 @@ impl Settings {
         }
 
         let y = &self.sync;
+        // A token put where the user name goes is a password too (final review A-m6): only a
+        // plain user name (`git@`, `me@`) may stay in the URL.
         if let Some(remote) = &y.remote
             && let Some(u) = url_parts(remote)
-            && u.userinfo.is_some_and(|i| i.contains(':'))
+            && u.userinfo.is_some_and(|i| {
+                i.contains(':')
+                    || i.len() > 32
+                    || !crate::redact::Redactor::builtin().apply(i).found.is_empty()
+            })
         {
             e.push(err(
                 "sync.remote",
-                "must not contain a password; use git's credential helper",
+                "must not contain a password or token; use git's credential helper",
             ));
         }
         if y.branch.trim().is_empty() || y.branch.chars().any(char::is_whitespace) {
@@ -1866,6 +1880,16 @@ pub fn edit_toml(text: &str, key: &str, value: &serde_json::Value) -> Result<Str
 
 // ---------------------------------------------------------------- loosening
 
+/// Why a regular expression of the privacy settings is refused, without quoting it.
+fn regex_problem(e: &regex::Error) -> &'static str {
+    match e {
+        regex::Error::CompiledTooBig(_) => {
+            "the regular expression is too large once compiled (it is not shown); simplify it"
+        }
+        _ => "not a valid regular expression (it is not shown); check its brackets and escapes",
+    }
+}
+
 /// How many polls in a row must see the same loosening before it applies.
 pub const LOOSEN_POLLS: u32 = 3;
 
@@ -1920,10 +1944,33 @@ pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
                 && old.embedding.provider == new.embedding.provider
                 && old.embedding.remote_destination() != new.embedding.remote_destination(),
         ),
+        // The Jev key goes in the header to whatever host is named (final review A-m2).
+        (
+            "judge.jev.endpoint",
+            new.judge.provider == JudgeProvider::Jev
+                && old.judge.jev.endpoint != new.judge.jev.endpoint,
+        ),
         // The admin tools let an agent resolve reviews and merge memories.
         (
             "mcp.admin_tools",
             !old.mcp.admin_tools && new.mcp.admin_tools,
+        ),
+        // Shorter retention deletes for good (final review B-M9: a half-saved `30` reads `3`).
+        (
+            "maintenance.trash_days",
+            new.maintenance.trash_days < old.maintenance.trash_days,
+        ),
+        (
+            "maintenance.events_days",
+            new.maintenance.events_days < old.maintenance.events_days,
+        ),
+        (
+            "storage.raw_retention",
+            match (old.storage.raw_retention, new.storage.raw_retention) {
+                (Retention::Age(a), Retention::Age(b)) => b < a,
+                (Retention::Size(a), Retention::Size(b)) => b < a,
+                (a, b) => a != b && b != Retention::Forever,
+            },
         ),
     ];
     checks
@@ -3252,6 +3299,14 @@ mod tests {
                 "[sync]\nremote = \"https://me:tok@github.com/me/mem.git\"\n",
                 "sync.remote",
             ),
+            // Final review A-m6: a token as the user name.
+            (
+                concat!(
+                    "[sync]\nremote = \"https://gh",
+                    "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789@github.com/me/notes.git\"\n"
+                ),
+                "sync.remote",
+            ),
         ];
         for (file, key) in bad {
             assert!(
@@ -3273,6 +3328,7 @@ mod tests {
             "[embedding]\nprovider = \"openai\"\nmodel = \"m\"\nendpoint = \"http://localhost:8000/v1\"\n",
             "[sync]\nremote = \"git@github.com:me/mem.git\"\n",
             "[sync]\nremote = \"ssh://git@github.com/me/mem.git\"\n",
+            "[sync]\nremote = \"https://me@github.com/me/mem.git\"\n",
         ];
         for file in good {
             assert!(
@@ -3484,6 +3540,22 @@ mod tests {
                 "privacy.custom_patterns"
             ]
         );
+        // Final review A-m3: a refused expression is never quoted (it may be a known secret).
+        let file = "[privacy]\ncustom_patterns = [{ name = \"pw\", regex = \"hunter2|db-pass-(\" }]\nallowlist = [\"s3cr3t[\"]\n";
+        let (_, dropped) = resolve_salvaging(Some(file), &env(&[]));
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        for e in &dropped {
+            assert!(
+                !e.message.contains("hunter2") && !e.message.contains("s3cr3t"),
+                "{}",
+                e.message
+            );
+            assert!(
+                e.message.contains("not a valid regular expression"),
+                "{}",
+                e.message
+            );
+        }
     }
 
     #[test]
@@ -3611,6 +3683,18 @@ mod tests {
                 Box::new(|s| s.embedding.provider = EmbeddingProvider::Voyage),
             ),
             ("mcp.admin_tools", Box::new(|s| s.mcp.admin_tools = true)),
+            (
+                "maintenance.trash_days",
+                Box::new(|s| s.maintenance.trash_days = 3),
+            ),
+            (
+                "maintenance.events_days",
+                Box::new(|s| s.maintenance.events_days = 36),
+            ),
+            (
+                "storage.raw_retention",
+                Box::new(|s| s.storage.raw_retention = Retention::Age(Duration::from_secs(86_400))),
+            ),
         ];
         for (key, change) in cases {
             let mut looser = base.clone();
@@ -3625,6 +3709,17 @@ mod tests {
         let mut cloud = base.clone();
         cloud.judge.provider = JudgeProvider::Jev;
         assert!(loosened_protections(&cloud, &base).is_empty());
+        // Final review A-m2: Jev pointed at another host loosens; longer retention does not.
+        let mut moved = cloud.clone();
+        moved.judge.jev.endpoint = "https://elsewhere.example/v1/systemone".into();
+        assert_eq!(
+            loosened_protections(&cloud, &moved),
+            vec!["judge.jev.endpoint".to_string()]
+        );
+        let mut longer = base.clone();
+        longer.maintenance.trash_days = 90;
+        longer.storage.raw_retention = Retention::Forever;
+        assert!(loosened_protections(&base, &longer).is_empty());
         // Turning the admin tools off tightens.
         let mut admin = base.clone();
         admin.mcp.admin_tools = true;

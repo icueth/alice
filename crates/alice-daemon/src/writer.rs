@@ -4348,6 +4348,85 @@ mod tests {
         assert_eq!(links, links_before, "no duplicate_of link is left");
     }
 
+    /// Final review B-I1: the merge never changed the survivor, so undoing it neither waits for
+    /// the survivor to be as it was nor puts its old state back: after an edit of the survivor
+    /// (and after it was superseded) the merge is undone, the duplicate is back, and the
+    /// survivor keeps what happened to it since.
+    #[test]
+    fn undoing_a_merge_after_the_survivor_changed_keeps_the_survivor_as_it_is() {
+        let f = fixture();
+        let ids: Vec<String> = ["survivor note", "duplicate note"]
+            .iter()
+            .map(|t| new_id(f.h.submit_blocking(remember(t)).unwrap()).0)
+            .collect();
+        let item = add_review(
+            &f,
+            ReviewType::Merge,
+            serde_json::json!({"survivor": ids[0], "others": [ids[1]]}),
+            "m",
+        );
+        resolve(&f, &item, "merge").unwrap();
+        assert_eq!(status_of(&f, &ids[1]), "trashed");
+        f.h.submit_blocking(WriteOp::Update {
+            id: ids[0].clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                body: Some("survivor note, edited a week later".into()),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        let ev = event_of(&f, "memory.merge", &ids[1]);
+        let out = undo(&f, &ev).unwrap();
+        let WriteOutcome::Undo(UndoOutcome::Undone { reverted, .. }) = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(reverted.len(), 2, "{reverted:?}");
+        assert_eq!(status_of(&f, &ids[1]), "active", "the duplicate is back");
+        let body: String = f.read("SELECT body FROM memories WHERE id = ?1", [&ids[0]]);
+        assert_eq!(body, "survivor note, edited a week later", "the edit stays");
+        let links: i64 = f.read(
+            "SELECT count(*) FROM links WHERE type = 'duplicate_of' AND from_id = ?1",
+            [&ids[1]],
+        );
+        assert_eq!(links, 0);
+
+        // A survivor superseded since: undoing the merge leaves it superseded.
+        let ids: Vec<String> = ["old survivor", "old duplicate"]
+            .iter()
+            .map(|t| new_id(f.h.submit_blocking(remember(t)).unwrap()).0)
+            .collect();
+        let item = add_review(
+            &f,
+            ReviewType::Merge,
+            serde_json::json!({"survivor": ids[0], "others": [ids[1]]}),
+            "m2",
+        );
+        resolve(&f, &item, "merge").unwrap();
+        f.h.submit_blocking(WriteOp::Remember {
+            input: NewMemoryInput {
+                content: "the newer version".into(),
+                supersedes: vec![ids[0].clone()],
+                ..Default::default()
+            },
+            project: ProjectChoice::Fallback,
+        })
+        .unwrap();
+        assert_eq!(status_of(&f, &ids[0]), "superseded");
+        let ev = event_of(&f, "memory.merge", &ids[1]);
+        assert!(matches!(
+            undo(&f, &ev).unwrap(),
+            WriteOutcome::Undo(UndoOutcome::Undone { .. })
+        ));
+        assert_eq!(
+            status_of(&f, &ids[0]),
+            "superseded",
+            "never two current versions"
+        );
+        assert_eq!(status_of(&f, &ids[1]), "active");
+    }
+
     #[test]
     fn a_predicate_mapping_by_review_is_undone_to_the_letter() {
         let f = fixture();
@@ -4620,6 +4699,7 @@ mod tests {
                 created_at: "2026-10-13T00:00:00.000Z".into(),
                 similarity: None,
                 raw: false,
+                status: None,
             },
             &[alice_core::judge::Relation {
                 existing_id: a.clone(),

@@ -95,9 +95,9 @@ pub struct HttpEmbedder {
 const TIMEOUT: Duration = Duration::from_secs(60);
 /// The first request, which only finds the dimension, is shorter: it runs when a model is chosen.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
-/// A search query waits this long for its vector, once. Below every client's recall deadline
-/// (5 s), so a provider that does not answer costs a recall this and not its answer.
-const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// A search query waits this long for its vector, once. A client's recall deadline allows for
+/// it, so a provider that does not answer costs a recall this and not its answer.
+pub const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// After a failed query no query is sent for this long.
 const QUERY_COOLDOWN: Duration = Duration::from_secs(30);
 /// The probe is tried once more at most.

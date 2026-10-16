@@ -97,8 +97,9 @@ const MILLIS_FROM: i64 = 100_000_000_000;
 /// The time a chunk says it was written, as the store keeps it: an ISO 8601 / RFC 3339 time (or
 /// a date) is kept as given; a bare Unix time in seconds or milliseconds becomes an RFC 3339
 /// UTC time; anything else (empty, `10/13/2026`, words) is dropped (`ingest` logs one warning
-/// per request with the count). A value that is kept always sorts as time, so nothing
-/// downstream compares garbage as text.
+/// per request with the count). A value that is kept is always a time, so nothing downstream
+/// compares garbage; but one with an offset (`+07:00`) or a date alone is kept as written and
+/// does not sort against `…Z` values as text (final review B-M8: the comment said it did).
 pub fn normalise_authored(raw: Option<&str>) -> Option<String> {
     let raw = raw?.trim();
     if raw.is_empty() {

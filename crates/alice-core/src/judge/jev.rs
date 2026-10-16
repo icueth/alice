@@ -1185,6 +1185,7 @@ pub mod scenarios {
             created_at: (fixed_now() - chrono::Duration::days(days_ago)).to_rfc3339(),
             similarity: None,
             raw: false,
+            status: None,
         }
     }
 

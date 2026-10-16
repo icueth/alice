@@ -535,17 +535,40 @@ pub fn embed_query(
     embedder: &dyn Embedder,
     text: &str,
 ) -> Option<Vec<f32>> {
-    index?;
-    embedder
-        .embed_query(text)
-        .inspect_err(|e| {
-            if embed_failure_level(e) == tracing::Level::DEBUG {
-                tracing::debug!(error = %e, "query embedding skipped; using word matches only");
-            } else {
-                tracing::warn!(error = %e, "query embedding failed; using word matches only");
+    embed_query_or_why(index, embedder, text).ok()
+}
+
+/// Said when the vector index is being rebuilt and a search uses word matches only.
+pub const INDEX_REBUILDING: &str =
+    "this search used word matches only: the vector index is being rebuilt";
+
+/// [`embed_query`], with why there is no vector: a sentence for the person, saying that the
+/// search used word matches only (the embedder's own text when it says so, as the reload of an
+/// unloaded model does; never a provider's error details).
+pub fn embed_query_or_why(
+    index: Option<&VectorIndex>,
+    embedder: &dyn Embedder,
+    text: &str,
+) -> std::result::Result<Vec<f32>, String> {
+    if index.is_none() {
+        return Err(INDEX_REBUILDING.into());
+    }
+    embedder.embed_query(text).map_err(|e| {
+        if embed_failure_level(&e) == tracing::Level::DEBUG {
+            tracing::debug!(error = %e, "query embedding skipped; using word matches only");
+        } else {
+            tracing::warn!(error = %e, "query embedding failed; using word matches only");
+        }
+        match &e {
+            AliceError::Other(m) if m.starts_with(crate::embed::MODEL_LOADING) => {
+                crate::embed::MODEL_LOADING.to_string()
             }
-        })
-        .ok()
+            AliceError::Unavailable(_) => {
+                "this search used word matches only: the embedding provider is unavailable".into()
+            }
+            _ => "this search used word matches only: the query could not be embedded".into(),
+        }
+    })
 }
 
 /// How a query embedding failure is logged: a model reloading after an idle period is
@@ -962,6 +985,27 @@ mod tests {
         assert_eq!(embed_failure_level(&failed_reload), Level::DEBUG);
         let broken = AliceError::Other("the embedding model failed: bad input".into());
         assert_eq!(embed_failure_level(&broken), Level::WARN);
+    }
+
+    /// Final review C-I2: why a query has no vector is a sentence for the person, never the
+    /// provider's error details.
+    #[test]
+    fn a_query_without_a_vector_says_why() {
+        use crate::embed::{MODEL_LOADING, UnavailableEmbedder};
+        let e = FakeEmbedder::new(8);
+        assert_eq!(
+            embed_query_or_why(None, &e, "x").unwrap_err(),
+            INDEX_REBUILDING
+        );
+        let idx = VectorIndex::new(8).unwrap();
+        assert!(embed_query_or_why(Some(&idx), &e, "x").is_ok());
+        let down = UnavailableEmbedder::new("m", 8, true, "https://secret.example/v1 refused");
+        let why = embed_query_or_why(Some(&idx), &down, "x").unwrap_err();
+        assert!(
+            why.contains("word matches only") && !why.contains("secret.example"),
+            "{why}"
+        );
+        assert!(MODEL_LOADING.contains("word matches only"));
     }
 
     struct Fx {
