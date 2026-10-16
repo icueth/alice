@@ -1998,14 +1998,23 @@ fn apply(
             WriteOutcome::Done
         }
         WriteOp::JudgeCall(c) => {
+            use alice_core::judge::jev::{LEDGER_DISTILL, LEDGER_JUDGE};
+            // One cache for every consumer: an answer is an answer, whoever asked.
             if c.cacheable {
-                judge_store::cache_put(conn, &c.hash, "jev", &c.model, &c.response_json)?;
+                judge_store::cache_put(conn, &c.hash, LEDGER_JUDGE, &c.model, &c.response_json)?;
             }
+            // The consumer's ledger row. Anything but distillation's is billed to the judge's
+            // own row, so no spend lands on a row the day's total does not count.
+            let provider = if c.provider == LEDGER_DISTILL {
+                LEDGER_DISTILL
+            } else {
+                LEDGER_JUDGE
+            };
             judge_store::add_cost(
                 conn,
                 &judge_store::CostDelta {
                     day: c.day,
-                    provider: "jev".into(),
+                    provider: provider.into(),
                     calls: 1,
                     input_tokens: c.input_tokens,
                     output_tokens: c.output_tokens,
@@ -5480,6 +5489,53 @@ mod tests {
         assert_eq!(
             body, "second [REDACTED:x]",
             "the destination's cleaned text is stored with the move"
+        );
+    }
+
+    /// SP2 Task 9: a Jev call is billed to its consumer's ledger row (an unknown row to the
+    /// judge's own, so the day's total still counts it) and cached under one provider, `jev`.
+    #[test]
+    fn a_judge_call_is_billed_to_its_consumers_row_and_cached_as_jev() {
+        use alice_core::judge::jev::{JevCall, LEDGER_DISTILL, LEDGER_JUDGE};
+        let f = fixture();
+        let call = |hash: &str, provider: &str, usd: f64| JevCall {
+            day: "2026-10-16".into(),
+            hash: hash.into(),
+            model: "jev-1.13.0".into(),
+            response_json: "{}".into(),
+            input_tokens: 10,
+            output_tokens: 1,
+            usd,
+            latency_ms: 5,
+            cacheable: true,
+            provider: provider.into(),
+        };
+        for c in [
+            call("h1", LEDGER_JUDGE, 0.25),
+            call("h2", LEDGER_DISTILL, 0.5),
+            call("h3", "bogus", 1.0),
+        ] {
+            f.h.submit_blocking(WriteOp::JudgeCall(c)).unwrap();
+        }
+        let row = |p: &str| -> (i64, f64) {
+            let col = |c: &str| {
+                format!("SELECT {c} FROM cost_ledger WHERE day = '2026-10-16' AND provider = ?1")
+            };
+            (f.read(&col("calls"), [p]), f.read(&col("usd"), [p]))
+        };
+        assert_eq!(row(LEDGER_DISTILL), (1, 0.5));
+        assert_eq!(
+            row(LEDGER_JUDGE),
+            (2, 1.25),
+            "the unknown row went to the judge's"
+        );
+        assert_eq!(f.read::<i64>("SELECT count(*) FROM cost_ledger", []), 2);
+        assert_eq!(
+            f.read::<i64>(
+                "SELECT count(*) FROM judge_cache WHERE provider = 'jev'",
+                []
+            ),
+            3
         );
     }
 

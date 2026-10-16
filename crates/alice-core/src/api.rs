@@ -519,10 +519,19 @@ pub struct Stats {
     pub judge_backlog: u64,
     pub judge_retry: u64,
     pub embed_backlog: u64,
-    /// Judge spend of the current UTC day.
+    /// Judge spend of the current UTC day: the judge's own calls and distillation's.
     pub cost_today_usd: f64,
-    /// Judge spend of the last 7 UTC days, today included.
+    /// Judge spend of the last 7 UTC days, today included (distillation's too).
     pub cost_7d_usd: f64,
+    /// The distillation part of `cost_today_usd`.
+    #[serde(default)]
+    pub distill_cost_today_usd: f64,
+    /// Memories distillation saved in the current UTC day.
+    #[serde(default)]
+    pub distilled_today: u64,
+    /// Distilled proposals dropped in the current UTC day (duplicates and uncertain ones).
+    #[serde(default)]
+    pub distill_dropped_today: u64,
 }
 
 /// When a maintenance job last ran (`alice maintenance status`). Times are RFC 3339 UTC.

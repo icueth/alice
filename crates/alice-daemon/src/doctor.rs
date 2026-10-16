@@ -610,15 +610,21 @@ pub async fn daemon_checks(svc: &Service) -> alice_core::Result<Vec<Check>> {
         ));
     }
     let stats = svc.stats().await?;
+    // `cost_today_usd` is the judge's whole day: its own calls and distillation's.
     if settings.judge.provider == alice_core::settings::JudgeProvider::Jev
         && settings.judge.daily_budget_usd > 0.0
         && stats.cost_today_usd >= 0.8 * settings.judge.daily_budget_usd
     {
+        let distill = if stats.distill_cost_today_usd > 0.0 {
+            format!(" (distillation ${:.4})", stats.distill_cost_today_usd)
+        } else {
+            String::new()
+        };
         out.push(check(
             "judge budget",
             Warn,
             format!(
-                "${:.4} of ${:.2} used today",
+                "${:.4} of ${:.2} used today{distill}",
                 stats.cost_today_usd, settings.judge.daily_budget_usd
             ),
             Some(

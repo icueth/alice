@@ -410,6 +410,22 @@ pub trait Judge: Send + Sync {
     ) -> JudgeResult<Vec<Distribution>> {
         self.grade_relevance(query_project, query, results)
     }
+
+    /// Distillation's way into a model judge (SP2 spec §6.4, §6.7): `questions` about `state`,
+    /// a run of a session of `projects`, answered as one request. A judge that sends text away
+    /// gates and redacts it as it does every call; it bills the call to distillation's own
+    /// ledger row and caps distillation's day at `share` of its daily budget (read at each call,
+    /// so a settings change applies at the next one). Only Jev distils: every other judge
+    /// refuses with [`JudgeError::Denied`], and the distiller checks the provider first.
+    fn ask_distill(
+        &self,
+        _projects: &[&str],
+        _state: &str,
+        _questions: &[jev::Question],
+        _share: f64,
+    ) -> JudgeResult<BTreeMap<String, Distribution>> {
+        Err(JudgeError::Denied)
+    }
 }
 
 #[cfg(test)]

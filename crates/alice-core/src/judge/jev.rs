@@ -8,6 +8,10 @@
 //! `rate_per_sec`, retried only on 429, 5xx and timeouts, and refused once the UTC day's spend
 //! (reserved before the call, settled after) would pass the budget.
 //!
+//! Distillation (SP2) asks through the same client ([`Judge::ask_distill`]): its calls go on
+//! their own ledger row ([`LEDGER_DISTILL`]), count toward the day's total like the judge's, and
+//! are also refused once distillation's own spend would pass its share of the budget.
+//!
 //! One policy decides whether a project's text may leave the machine: [`JevPolicy`], asked once
 //! per call for every project the call covers. The daemon's implementation reads the live
 //! settings and the project's `.alice.toml`; this module keeps no denylist of its own.
@@ -40,6 +44,18 @@ pub const REQUEST_OVERHEAD_TOKENS: f64 = 300.0;
 pub const START_TOKEN_RATIO: f64 = 1.5;
 /// The project that text belonging to no project in particular is attributed to.
 pub const UNSCOPED: &str = "global";
+/// The cost-ledger row of the judge's own calls (memory judging, routing, precise recall).
+pub const LEDGER_JUDGE: &str = "jev";
+/// The cost-ledger row of distillation's calls (SP2 spec §6.7). The judge's day total is both
+/// rows; the cache keeps one provider, `jev`, for both.
+pub const LEDGER_DISTILL: &str = "jev:distill";
+/// Every ledger row of the Jev judge: its day total is their sum wherever it is read (the
+/// reservation, stats, the doctor).
+pub const LEDGER_ROWS: [&str; 2] = [LEDGER_JUDGE, LEDGER_DISTILL];
+
+fn ledger_judge() -> String {
+    LEDGER_JUDGE.into()
+}
 
 #[derive(Debug, Clone)]
 pub struct HttpReply {
@@ -136,12 +152,20 @@ pub struct JevCall {
     /// `false` for a call that was sent but has no usable answer: it is billed in the ledger and
     /// its response is not put in the cache.
     pub cacheable: bool,
+    /// The ledger row the call is billed to: [`LEDGER_JUDGE`] or [`LEDGER_DISTILL`]. (A call
+    /// logged before the field existed was the judge's.)
+    #[serde(default = "ledger_judge")]
+    pub provider: String,
 }
 
 pub trait JevStore: Send + Sync {
     fn cached(&self, hash: &str) -> Option<String>;
-    /// USD spent on `day`; `Err` when it cannot be read (the judge then fails closed).
+    /// USD spent on `day` by every consumer of the judge (both ledger rows); `Err` when it
+    /// cannot be read (the judge then fails closed).
     fn spent(&self, day: &str) -> Result<f64, String>;
+    /// USD spent on `day` on one ledger row (`provider`: [`LEDGER_JUDGE`] or
+    /// [`LEDGER_DISTILL`]); `Err` when it cannot be read.
+    fn spent_by(&self, day: &str, provider: &str) -> Result<f64, String>;
     fn record(&self, call: &JevCall);
 }
 
@@ -168,6 +192,15 @@ impl JevStore for MemoryJevStore {
             .lock()
             .iter()
             .filter(|c| c.day == day)
+            .map(|c| c.usd)
+            .sum())
+    }
+    fn spent_by(&self, day: &str, provider: &str) -> Result<f64, String> {
+        Ok(self
+            .calls
+            .lock()
+            .iter()
+            .filter(|c| c.day == day && c.provider == provider)
             .map(|c| c.usd)
             .sum())
     }
@@ -235,14 +268,33 @@ pub type Sleeper = Arc<dyn Fn(Duration) + Send + Sync>;
 
 struct Budget {
     day: String,
-    /// The day's recorded spend plus what calls in flight reserved.
+    /// The day's recorded spend plus what calls in flight reserved, every consumer together.
     spent: f64,
+    /// The part of `spent` that is distillation's (its ledger row and its calls in flight).
+    distill: f64,
+}
+
+/// Who a call is for: the judge itself, or distillation with its share of the daily budget.
+/// It picks the ledger row and the reservation rule.
+#[derive(Debug, Clone, Copy)]
+enum Consumer {
+    Judge,
+    Distill { share: f64 },
+}
+
+impl Consumer {
+    fn ledger(self) -> &'static str {
+        match self {
+            Self::Judge => LEDGER_JUDGE,
+            Self::Distill { .. } => LEDGER_DISTILL,
+        }
+    }
 }
 
 /// What every `JevJudge` of a daemon shares, however often the judge is rebuilt: the day's
-/// reservations, the learned tokens-per-byte ratio and the request rate slot. A rebuilt judge
-/// with fresh copies of these could overshoot the budget or the rate while the old one still
-/// has calls in flight.
+/// reservations (the total and distillation's part), the learned tokens-per-byte ratio and the
+/// request rate slot. A rebuilt judge with fresh copies of these could overshoot the budget or
+/// the rate while the old one still has calls in flight.
 pub struct JevLimits {
     next_slot: Mutex<Option<Instant>>,
     budget: Mutex<Option<Budget>>,
@@ -612,19 +664,29 @@ impl JevJudge {
         self.now().format("%Y-%m-%d").to_string()
     }
 
-    /// Reserve `estimate` USD of today's budget, or refuse. Failing closed: a spend that cannot
-    /// be read, a budget that is not a number and a reservation that does not fit all refuse.
-    fn reserve(&self, day: &str, estimate: f64) -> JudgeResult<()> {
+    /// Reserve `estimate` USD of today's budget for `consumer`, or refuse. Every call must fit
+    /// in what is left of the day's total; a distillation call must also fit in what is left of
+    /// its share (`share × daily budget`, minus distillation's spend and reservations). Failing
+    /// closed: a spend that cannot be read, a budget or share that is not a number and a
+    /// reservation that does not fit all refuse.
+    fn reserve(&self, consumer: Consumer, day: &str, estimate: f64) -> JudgeResult<()> {
         let mut b = self.limits.budget.lock();
         if b.as_ref().is_none_or(|b| b.day != day) {
             // A spend that cannot be read counts as an exhausted budget (it is read again on
-            // the next call, and the warning shows in health until then).
-            match self.store.spent(day) {
-                Ok(spent) if spent.is_finite() => {
+            // the next call, and the warning shows in health until then). The total and the
+            // distillation row are read together: the day's state is both or neither.
+            let read = self.store.spent(day).and_then(|spent| {
+                self.store
+                    .spent_by(day, LEDGER_DISTILL)
+                    .map(|distill| (spent, distill))
+            });
+            match read {
+                Ok((spent, distill)) if spent.is_finite() && distill.is_finite() => {
                     *self.limits.spend_error.lock() = None;
                     *b = Some(Budget {
                         day: day.into(),
                         spent,
+                        distill,
                     });
                 }
                 other => {
@@ -652,21 +714,43 @@ impl JevJudge {
                 b.spent
             );
             self.stats.lock().budget_stops += 1;
-            *self.limits.budget_stop.lock() =
-                Some((day.into(), format!("Jev is paused for today: {msg}")));
+            // The judge's own warning in health speaks of the judge's calls: a refused
+            // distillation call is reported by the distiller.
+            if let Consumer::Judge = consumer {
+                *self.limits.budget_stop.lock() =
+                    Some((day.into(), format!("Jev is paused for today: {msg}")));
+            }
             return Err(JudgeError::Budget(msg));
         }
-        *self.limits.budget_stop.lock() = None;
+        match consumer {
+            Consumer::Judge => *self.limits.budget_stop.lock() = None,
+            Consumer::Distill { share } => {
+                // A share that is not a number makes the cap `NaN`, which refuses.
+                let cap = share * budget;
+                let fits = b.distill + estimate <= cap;
+                if !fits {
+                    self.stats.lock().budget_stops += 1;
+                    return Err(JudgeError::Budget(format!(
+                        "the distillation share of today's Jev budget is used up (${:.4} of ${cap:.4} spent on {day}); raise distill.budget_share or judge.daily_budget_usd, or wait for the next UTC day",
+                        b.distill
+                    )));
+                }
+                b.distill += estimate;
+            }
+        }
         b.spent += estimate;
         Ok(())
     }
 
-    /// Replace the reservation of `estimate` with what the call really cost.
-    fn settle(&self, day: &str, estimate: f64, actual: f64) {
+    /// Replace `consumer`'s reservation of `estimate` with what the call really cost.
+    fn settle(&self, consumer: Consumer, day: &str, estimate: f64, actual: f64) {
         if let Some(b) = self.limits.budget.lock().as_mut()
             && b.day == day
         {
             b.spent += actual - estimate;
+            if let Consumer::Distill { .. } = consumer {
+                b.distill += actual - estimate;
+            }
         }
     }
 
@@ -698,6 +782,28 @@ impl JevJudge {
         max_retries: u32,
         timeout: Duration,
     ) -> JudgeResult<BTreeMap<String, Distribution>> {
+        self.ask_as(
+            Consumer::Judge,
+            projects,
+            state,
+            questions,
+            max_retries,
+            timeout,
+        )
+    }
+
+    /// The one way a request is made, for either consumer: the gate, redaction, the cache, the
+    /// reservation (by `consumer`'s rule), the rate limit, retries, and the ledger row of
+    /// `consumer`.
+    fn ask_as(
+        &self,
+        consumer: Consumer,
+        projects: &[&str],
+        state: &str,
+        questions: &[Question],
+        max_retries: u32,
+        timeout: Duration,
+    ) -> JudgeResult<BTreeMap<String, Distribution>> {
         self.gate(projects)?;
         let body = self.request_body(projects, state, questions);
         *self.last_request.lock() = Some(body.clone());
@@ -714,7 +820,7 @@ impl JevJudge {
         // overhead Jev adds to every request. The reservation is shared by all judges of the
         // daemon, so the day's spend never passes the budget, rebuilds included.
         let estimate = self.estimate_usd(body.len());
-        self.reserve(&day, estimate)?;
+        self.reserve(consumer, &day, estimate)?;
         // `reserved` is held for the attempt in flight. A timed-out attempt may have been billed:
         // its estimate turns into `charged` (it stays in the day's spend) and a fresh estimate is
         // reserved for the next attempt, so the spend never under-counts.
@@ -726,7 +832,7 @@ impl JevJudge {
                 // A retry can come up to two minutes after the first try: the policy is asked
                 // again, so a denial that lands meanwhile stops it.
                 if let Err(e) = self.gate(projects) {
-                    self.settle_unanswered(&day, &hash, reserved, charged, false);
+                    self.settle_unanswered(consumer, &day, &hash, reserved, charged, false);
                     return Err(e);
                 }
             }
@@ -749,7 +855,7 @@ impl JevJudge {
                             let tokens = loose_usage(&r.body);
                             let usd =
                                 tokens.map_or(reserved, |t| t.0 as f64 * USD_PER_MTOK_INPUT / 1e6);
-                            self.settle(&day, reserved, usd);
+                            self.settle(consumer, &day, reserved, usd);
                             self.store.record(&JevCall {
                                 day: day.clone(),
                                 hash: hash.clone(),
@@ -760,6 +866,7 @@ impl JevJudge {
                                 usd: usd + charged,
                                 latency_ms,
                                 cacheable: false,
+                                provider: consumer.ledger().into(),
                             });
                             self.fail(&e);
                             return Err(e);
@@ -771,7 +878,7 @@ impl JevJudge {
                     } else {
                         reserved
                     };
-                    self.settle(&day, reserved, usd);
+                    self.settle(consumer, &day, reserved, usd);
                     let ratio = usage.input_tokens as f64 / body.len().max(1) as f64;
                     {
                         let mut r = self.limits.token_ratio.lock();
@@ -793,6 +900,7 @@ impl JevJudge {
                         usd: usd + charged,
                         latency_ms,
                         cacheable: true,
+                        provider: consumer.ledger().into(),
                     });
                     let mut s = self.stats.lock();
                     s.calls += 1;
@@ -803,7 +911,7 @@ impl JevJudge {
                     return Ok(d);
                 }
                 Ok(r) if r.status == 401 || r.status == 403 => {
-                    self.settle_unanswered(&day, &hash, reserved, charged, false);
+                    self.settle_unanswered(consumer, &day, &hash, reserved, charged, false);
                     let e = JudgeError::Unavailable(format!(
                         "TypeSafe refused the API key ({}); set a valid one with `alice config set-secret jev_api_key`",
                         r.status
@@ -816,7 +924,7 @@ impl JevJudge {
                     r.retry_after.unwrap_or_else(|| backoff(attempt))
                 }
                 Ok(r) => {
-                    self.settle_unanswered(&day, &hash, reserved, charged, false);
+                    self.settle_unanswered(consumer, &day, &hash, reserved, charged, false);
                     // Only the status: a server's explanation may quote the request.
                     let e = JudgeError::Failed(format!(
                         "Jev refused the request ({}); check judge.jev.model and judge.jev.endpoint",
@@ -831,8 +939,8 @@ impl JevJudge {
                     last = "Jev did not answer in time".into();
                     if attempt < max_retries {
                         // Room for the next attempt as well, or the retries stop here.
-                        if let Err(e) = self.reserve(&day, estimate) {
-                            self.settle_unanswered(&day, &hash, 0.0, charged, false);
+                        if let Err(e) = self.reserve(consumer, &day, estimate) {
+                            self.settle_unanswered(consumer, &day, &hash, 0.0, charged, false);
                             self.fail(&e);
                             return Err(e);
                         }
@@ -843,7 +951,7 @@ impl JevJudge {
                 Err(TransportError::Connect(e)) => {
                     // Spec §5.2: retries only on 429, 5xx and timeouts. Nothing reached Jev: the
                     // heuristic decides now and the judge stage asks again later.
-                    self.settle_unanswered(&day, &hash, reserved, charged, false);
+                    self.settle_unanswered(consumer, &day, &hash, reserved, charged, false);
                     let e = JudgeError::Unavailable(format!(
                         "cannot reach Jev ({e}); will retry later"
                     ));
@@ -852,7 +960,7 @@ impl JevJudge {
                 }
                 Err(TransportError::Lost(e)) => {
                     // Sent, reply lost: not retried (it may have been billed already).
-                    self.settle_unanswered(&day, &hash, reserved, charged, true);
+                    self.settle_unanswered(consumer, &day, &hash, reserved, charged, true);
                     let e = JudgeError::Unavailable(format!(
                         "Jev's reply did not arrive whole ({e}); will retry later"
                     ));
@@ -865,17 +973,18 @@ impl JevJudge {
                 (self.sleep)(delay.min(MAX_RETRY_WAIT));
             }
         }
-        self.settle_unanswered(&day, &hash, reserved, charged, false);
+        self.settle_unanswered(consumer, &day, &hash, reserved, charged, false);
         let e = JudgeError::Unavailable(format!("{last}; will retry later"));
         self.fail(&e);
         Err(e)
     }
 
     /// The end of a call that got no usable answer. `charged` (timed-out attempts) and, when
-    /// `bill_reserved`, the attempt in flight (`reserved`) stay as the cost and go in the ledger
-    /// (never in the cache); the rest of the reservation is released.
+    /// `bill_reserved`, the attempt in flight (`reserved`) stay as the cost and go in the
+    /// consumer's ledger row (never in the cache); the rest of the reservation is released.
     fn settle_unanswered(
         &self,
+        consumer: Consumer,
         day: &str,
         hash: &str,
         reserved: f64,
@@ -886,7 +995,7 @@ impl JevJudge {
         if bill_reserved {
             cost += reserved;
         } else {
-            self.settle(day, reserved, 0.0);
+            self.settle(consumer, day, reserved, 0.0);
         }
         if cost > 0.0 {
             self.store.record(&JevCall {
@@ -899,6 +1008,7 @@ impl JevJudge {
                 usd: cost,
                 latency_ms: 0,
                 cacheable: false,
+                provider: consumer.ledger().into(),
             });
         }
     }
@@ -1107,6 +1217,26 @@ impl Judge for JevJudge {
         budget: Duration,
     ) -> JudgeResult<Vec<Distribution>> {
         self.grade(query_project, query, results, Some(budget))
+    }
+
+    /// [`ask`](JevJudge::ask) for distillation (SP2 spec §6.7): the configured retries and
+    /// timeout, billed to [`LEDGER_DISTILL`], and reserved against the day's total and against
+    /// `share` of the daily budget (both read at each call). A cached answer costs nothing.
+    fn ask_distill(
+        &self,
+        projects: &[&str],
+        state: &str,
+        questions: &[Question],
+        share: f64,
+    ) -> JudgeResult<BTreeMap<String, Distribution>> {
+        self.ask_as(
+            Consumer::Distill { share },
+            projects,
+            state,
+            questions,
+            self.cfg.max_retries,
+            self.cfg.timeout,
+        )
     }
 }
 
@@ -1832,6 +1962,9 @@ mod tests {
                     Ok(0.0)
                 }
             }
+            fn spent_by(&self, day: &str, _: &str) -> Result<f64, String> {
+                self.spent(day)
+            }
             fn record(&self, _: &JevCall) {}
         }
         let broken = Arc::new(FlakySpend(AtomicBool::new(true)));
@@ -1863,6 +1996,9 @@ mod tests {
                 None
             }
             fn spent(&self, _: &str) -> Result<f64, String> {
+                Ok(f64::NAN)
+            }
+            fn spent_by(&self, _: &str, _: &str) -> Result<f64, String> {
                 Ok(f64::NAN)
             }
             fn record(&self, _: &JevCall) {}
@@ -2652,5 +2788,191 @@ mod tests {
             !shown.contains("SERVER-SAID-THIS") && !shown.contains("expected"),
             "{shown}"
         );
+    }
+
+    // ------------------------------------------------------------------ distillation's share
+
+    /// Padding that brings a distill request to about $0.0003 of estimate.
+    const PAD: usize = 4_200;
+
+    /// One distillation question, `c1`, as the distiller asks it.
+    fn distill_q() -> Question {
+        Question {
+            id: "c1".into(),
+            instructions: "Passage 1 from this session: «we chose WAL». What lasting knowledge, if any, does it hold for future work?".into(),
+            options: vec![
+                Choice::new("decision", "a choice that was made, with its reason"),
+                Choice::new("ephemeral", "progress narration or a plan for the next minutes"),
+            ],
+        }
+    }
+
+    /// A reply answering the distill question `c1` and every question of a compare over
+    /// `scenarios::compare_case()`; its usage reports `input_tokens` (0: none, so each call
+    /// costs what it reserved).
+    fn distill_and_compare_ok(input_tokens: u64) -> serde_json::Value {
+        let mut answers = serde_json::Map::new();
+        answers.insert(
+            "c1".into(),
+            serde_json::json!({"choice": "decision", "probabilities": {"decision": 0.9, "ephemeral": 0.1}}),
+        );
+        for k in 1..=2 {
+            for side in ["fwd", "rev"] {
+                answers.insert(
+                    format!("{side}_{k}"),
+                    serde_json::json!({"choice": "unrelated", "probabilities": {"unrelated": 1.0}}),
+                );
+            }
+        }
+        serde_json::json!({"answers": answers, "usage": {"input_tokens": input_tokens, "output_tokens": 2}})
+    }
+
+    /// The state of distill run `run`, padded by `pad` bytes; each run differs, so the cache
+    /// never answers one for another.
+    fn run_state(run: usize, pad: usize) -> String {
+        format!("Project: alice\nRun {run}: {}", "x".repeat(pad))
+    }
+
+    /// What `ask_distill(["alice"], state, [distill_q()])` reserves.
+    fn distill_estimate(j: &JevJudge, state: &str) -> f64 {
+        j.estimate_usd(j.request_body(&["alice"], state, &[distill_q()]).len())
+    }
+
+    fn is_share_stop(e: &JudgeError) -> bool {
+        matches!(e, JudgeError::Budget(m) if m.contains("distillation share"))
+    }
+
+    #[test]
+    fn distill_stops_at_its_share_while_the_judge_goes_on() {
+        let store = Arc::new(MemoryJevStore::default());
+        // Each call is billed 3,500 tokens ($0.000147): under its estimate, and more than a
+        // third of the share.
+        let s = Scripted::new(Vec::new(), distill_and_compare_ok(3_500));
+        let day = Arc::new(PMutex::new(scenarios::fixed_now()));
+        let j = budget_judge(&s, &store, &day, 0.001);
+        let est = distill_estimate(&j, &run_state(1, PAD));
+        assert!(
+            (0.00028..=0.00032).contains(&est),
+            "a body estimated at about $0.0003: {est}"
+        );
+        let ask = |j: &JevJudge, run: usize, share: f64| {
+            j.ask_distill(&["alice"], &run_state(run, PAD), &[distill_q()], share)
+        };
+        let answers = ask(&j, 1, 0.5).unwrap();
+        assert_eq!(answers["c1"].best().unwrap().0, "decision");
+        ask(&j, 2, 0.5).unwrap();
+        let e = ask(&j, 3, 0.5).unwrap_err();
+        assert!(is_share_stop(&e), "{e}");
+        assert_eq!(s.calls.lock().len(), 2, "the refused run sends nothing");
+        assert_eq!(j.warning(), None, "the judge itself is not paused");
+        assert_eq!(j.stats().budget_stops, 1);
+        // The judge goes on: the total has room.
+        let (new, existing) = scenarios::compare_case();
+        j.compare(&new, &existing).unwrap();
+        assert_eq!(s.calls.lock().len(), 3);
+        let rows: Vec<String> = store.calls().into_iter().map(|c| c.provider).collect();
+        assert_eq!(rows, [LEDGER_DISTILL, LEDGER_DISTILL, LEDGER_JUDGE]);
+        let call_usd = 3_500.0 * USD_PER_MTOK_INPUT / 1e6;
+        let day_s = "2026-10-13";
+        assert!((store.spent_by(day_s, LEDGER_DISTILL).unwrap() - 2.0 * call_usd).abs() < 1e-12);
+        assert!((store.spent_by(day_s, LEDGER_JUDGE).unwrap() - call_usd).abs() < 1e-12);
+        assert!(
+            (store.spent(day_s).unwrap() - 3.0 * call_usd).abs() < 1e-12,
+            "spent() is the total of both rows"
+        );
+        // A judge built after a restart reads the distill row and refuses the same way.
+        let fresh = budget_judge(&s, &store, &day, 0.001);
+        assert!(is_share_stop(&ask(&fresh, 4, 0.5).unwrap_err()));
+        assert_eq!(s.calls.lock().len(), 3);
+        // The share is read at each call: a larger one applies at once.
+        ask(&fresh, 4, 1.0).unwrap();
+        assert_eq!(s.calls.lock().len(), 4);
+        // A share that is not a number never lets a call through.
+        assert!(is_share_stop(&ask(&fresh, 5, f64::NAN).unwrap_err()));
+        assert_eq!(s.calls.lock().len(), 4);
+    }
+
+    #[test]
+    fn the_judge_counts_distill_spend_toward_the_total() {
+        let (new, existing) = scenarios::compare_case();
+        let day = Arc::new(PMutex::new(scenarios::fixed_now()));
+        // No usage in the replies: every call costs exactly what it reserved.
+        let s = Scripted::new(Vec::new(), distill_and_compare_ok(0));
+        let probe = budget_judge(&s, &Arc::new(MemoryJevStore::default()), &day, 1.0);
+        probe.compare(&new, &existing).unwrap();
+        let compare_est = probe.estimate_usd(probe.last_request().unwrap().len());
+        let state = run_state(1, PAD);
+        let distill_est = distill_estimate(&probe, &state);
+        // The distill run spends 90 % of the budget.
+        let budget = distill_est / 0.9;
+        assert!(compare_est <= budget, "alone, the compare would fit");
+        assert!(
+            compare_est > budget - distill_est,
+            "the compare does not fit in what distillation left"
+        );
+        let store = Arc::new(MemoryJevStore::default());
+        let j = budget_judge(&s, &store, &day, budget);
+        j.ask_distill(&["alice"], &state, &[distill_q()], 1.0)
+            .unwrap();
+        let sent = s.calls.lock().len();
+        let e = j.compare(&new, &existing).unwrap_err();
+        assert!(
+            matches!(e, JudgeError::Budget(_)) && !is_share_stop(&e),
+            "{e}"
+        );
+        assert_eq!(s.calls.lock().len(), sent, "nothing is sent");
+        assert!(j.warning().is_some(), "the judge is paused for today");
+        // After a restart, the day's total read from the store holds the distill row too.
+        let fresh = budget_judge(&s, &store, &day, budget);
+        assert!(matches!(
+            fresh.compare(&new, &existing),
+            Err(JudgeError::Budget(_))
+        ));
+        assert_eq!(s.calls.lock().len(), sent);
+        // Control: the same compare against an empty ledger goes through.
+        let clean = budget_judge(&s, &Arc::new(MemoryJevStore::default()), &day, budget);
+        clean.compare(&new, &existing).unwrap();
+        assert_eq!(s.calls.lock().len(), sent + 1);
+    }
+
+    #[test]
+    fn a_distill_retry_needs_room_in_the_share_and_its_cost_stays_on_the_distill_row() {
+        let store = Arc::new(MemoryJevStore::default());
+        let s = Scripted::new(
+            vec![Err(TransportError::Timeout)],
+            distill_and_compare_ok(100),
+        );
+        let day = Arc::new(PMutex::new(scenarios::fixed_now()));
+        let j = budget_judge(&s, &store, &day, 1.0);
+        let state = run_state(1, PAD);
+        let est = distill_estimate(&j, &state);
+        // The total has room for both attempts; the share for one only.
+        let e = j
+            .ask_distill(&["alice"], &state, &[distill_q()], 1.5 * est)
+            .unwrap_err();
+        assert!(is_share_stop(&e), "{e}");
+        assert_eq!(s.calls.lock().len(), 1, "the retry is not made");
+        let calls = store.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].provider, LEDGER_DISTILL);
+        assert!(
+            (calls[0].usd - est).abs() < 1e-15,
+            "the timed-out attempt may have been billed"
+        );
+        assert_eq!(store.spent_by("2026-10-13", LEDGER_JUDGE).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn ask_distill_is_gated_like_every_call() {
+        let s = Scripted::new(Vec::new(), distill_and_compare_ok(100));
+        let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
+        for scope in [&["secret-proj"][..], &["alice", "secret-proj"], &[], &[""]] {
+            assert_eq!(
+                j.ask_distill(scope, "Project: x\nstate", &[distill_q()], 0.5),
+                Err(JudgeError::Denied),
+                "{scope:?}"
+            );
+        }
+        assert!(s.calls.lock().is_empty());
     }
 }

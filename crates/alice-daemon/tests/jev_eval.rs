@@ -166,6 +166,16 @@ impl JevStore for LoggedStore {
     fn spent(&self, _day: &str) -> Result<f64, String> {
         Ok(self.fresh.lock().iter().map(|c| c.usd).sum())
     }
+    /// One row of the whole run's fresh spend (see `spent`).
+    fn spent_by(&self, _day: &str, provider: &str) -> Result<f64, String> {
+        Ok(self
+            .fresh
+            .lock()
+            .iter()
+            .filter(|c| c.provider == provider)
+            .map(|c| c.usd)
+            .sum())
+    }
     fn record(&self, call: &JevCall) {
         self.inner.record(call);
         self.fresh.lock().push(call.clone());

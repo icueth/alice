@@ -3406,6 +3406,15 @@ impl Service {
                 .format("%Y-%m-%d")
                 .to_string();
             let costs = alice_core::store::judge::cost_since(c, &week)?;
+            // The judge's spend is every one of its ledger rows: its own and distillation's.
+            use alice_core::judge::jev::{LEDGER_DISTILL, LEDGER_ROWS};
+            let judge_costs = |keep: &dyn Fn(&alice_core::store::judge::CostRow) -> bool| {
+                // From +0.0: an empty f64 `sum()` is -0.0, which would show as `-0.0`.
+                costs
+                    .iter()
+                    .filter(|r| LEDGER_ROWS.contains(&r.provider.as_str()) && keep(r))
+                    .fold(0.0, |usd, r| usd + r.usd)
+            };
             let mut top = c.prepare(
                 "SELECT p.slug, count(*) FROM memories m JOIN projects p ON p.id = m.project_id
                  WHERE m.status <> 'trashed' GROUP BY p.slug ORDER BY 2 DESC, p.slug LIMIT 20",
@@ -3428,8 +3437,14 @@ impl Service {
                 judge_backlog: alice_core::store::judge::judge_backlog(c)?,
                 judge_retry: count("SELECT count(*) FROM memories WHERE judge_state = 'retry'")?,
                 embed_backlog: embeddings::backlog(c)? as u64,
-                cost_today_usd: costs.iter().filter(|r| r.day == today).map(|r| r.usd).sum(),
-                cost_7d_usd: costs.iter().map(|r| r.usd).sum(),
+                cost_today_usd: judge_costs(&|r| r.day == today),
+                cost_7d_usd: judge_costs(&|_| true),
+                distill_cost_today_usd: judge_costs(&|r| {
+                    r.day == today && r.provider == LEDGER_DISTILL
+                }),
+                // Filled by the distiller (SP2 Task 12).
+                distilled_today: 0,
+                distill_dropped_today: 0,
             })
         })
         .await
@@ -8843,6 +8858,230 @@ mod tests {
         );
         assert!(t.mentioned("[REDACTED"), "where the token was");
         assert!(!t.mentioned(token), "the token reached the model");
+        s.shutdown();
+    }
+
+    // ------------------------------------------------------------------ Jev for distillation
+
+    /// One distillation question, `c1`, about `passage`.
+    fn distill_question(passage: &str) -> alice_core::judge::jev::Question {
+        alice_core::judge::jev::Question {
+            id: "c1".into(),
+            instructions: format!(
+                "Passage 1 from this session: «{passage}». What lasting knowledge, if any, does it hold for future work?"
+            ),
+            options: vec![
+                alice_core::judge::Choice::new(
+                    "decision",
+                    "a choice that was made, with its reason",
+                ),
+                alice_core::judge::Choice::new("ephemeral", "progress narration"),
+            ],
+        }
+    }
+
+    /// `ask_distill` on the judge in force, off the async runtime (as the distiller calls it).
+    async fn ask_distill(
+        s: &Service,
+        project: &str,
+        state: &str,
+        passage: &str,
+        share: f64,
+    ) -> alice_core::judge::JudgeResult<BTreeMap<String, alice_core::judge::Distribution>> {
+        let judge = s.judge();
+        let (project, state, q) = (
+            project.to_string(),
+            state.to_string(),
+            distill_question(passage),
+        );
+        tokio::task::spawn_blocking(move || {
+            judge.ask_distill(&[project.as_str()], &state, &[q], share)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distill_calls_are_recorded_in_their_own_ledger_row() {
+        use crate::doctor::{CheckStatus, daemon_checks};
+        use alice_core::judge::jev::{JevStore, LEDGER_DISTILL, LEDGER_JUDGE, scenarios};
+        let t = crate::judge_http::ScriptedJev::new(("unrelated", 1.0));
+        let (d, s) = svc_with_jev(t.clone()).await;
+        remember_id(
+            &s,
+            "proj keeps its notes in WAL mode",
+            Some(Kind::Note),
+            &repo(&d, "proj"),
+        )
+        .await;
+        wait_settled(&s).await;
+        // One call of the judge itself and one of distillation.
+        let judge = s.judge();
+        tokio::task::spawn_blocking(move || {
+            judge.classify_constant(scenarios::CLASSIFY_STATE, scenarios::CLASSIFY_OPTIONS)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let answers = ask_distill(
+            &s,
+            "proj",
+            "Project: proj\nwe chose WAL",
+            "we chose WAL",
+            0.5,
+        )
+        .await
+        .unwrap();
+        assert!(answers.contains_key("c1"), "{answers:?}");
+        // Both rows are written fire-and-forget through the writer.
+        let rows = until("both ledger rows", || {
+            let rows = futures::executor::block_on(
+                s.read(|c| alice_core::store::judge::cost_since(c, "2000-01-01")),
+            )
+            .ok()?;
+            let has = |p: &str| rows.iter().any(|r| r.provider == p);
+            (has(LEDGER_JUDGE) && has(LEDGER_DISTILL)).then_some(rows)
+        })
+        .await;
+        let row = |p: &str| rows.iter().find(|r| r.provider == p).unwrap().clone();
+        let (judge_row, distill_row) = (row(LEDGER_JUDGE), row(LEDGER_DISTILL));
+        assert_eq!(distill_row.calls, 1, "{rows:?}");
+        assert!(judge_row.usd > 0.0 && distill_row.usd > 0.0, "{rows:?}");
+        let total = judge_row.usd + distill_row.usd;
+        let stats = s.stats().await.unwrap();
+        assert!((stats.cost_today_usd - total).abs() < 1e-12, "{stats:?}");
+        assert!((stats.cost_7d_usd - total).abs() < 1e-12, "{stats:?}");
+        assert!(
+            (stats.distill_cost_today_usd - distill_row.usd).abs() < 1e-12,
+            "{stats:?}"
+        );
+        assert_eq!((stats.distilled_today, stats.distill_dropped_today), (0, 0));
+        // The cache keeps one provider: the distill answer is a `jev` entry like any other.
+        let cache: Vec<String> = s
+            .read(|c| {
+                let mut stmt = c.prepare("SELECT provider FROM judge_cache")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<std::result::Result<_, _>>()?)
+            })
+            .await
+            .unwrap();
+        assert!(
+            cache.len() >= 2 && cache.iter().all(|p| p == "jev"),
+            "{cache:?}"
+        );
+        // The judge's store reads the day's total, and each row on its own.
+        let store = crate::judge_http::DaemonJevStore {
+            readers: s.readers.clone(),
+            writer: s.writer.clone(),
+        };
+        let today = judge_row.day.clone();
+        assert!((store.spent(&today).unwrap() - total).abs() < 1e-12);
+        assert!((store.spent_by(&today, LEDGER_DISTILL).unwrap() - distill_row.usd).abs() < 1e-12);
+        assert!((store.spent_by(&today, LEDGER_JUDGE).unwrap() - judge_row.usd).abs() < 1e-12);
+        // The doctor's 80 % warning counts both rows: neither reaches it alone, together they do.
+        let budget = total / 0.85;
+        assert!(judge_row.usd < 0.8 * budget && distill_row.usd < 0.8 * budget);
+        s.patch_settings(patch_one(
+            "judge.daily_budget_usd",
+            serde_json::json!(budget),
+        ))
+        .unwrap();
+        let checks = daemon_checks(&s).await.unwrap();
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "judge budget")
+            .unwrap_or_else(|| panic!("no budget warning: {checks:?}"));
+        assert_eq!(warn.status, CheckStatus::Warn, "{warn:?}");
+        assert!(warn.detail.contains("(distillation $"), "{warn:?}");
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ask_distill_passes_the_cloud_gate_and_redacts() {
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let t = crate::judge_http::ScriptedJev::new(("unrelated", 1.0));
+        let (d, s) = svc_with_jev(t.clone()).await;
+        remember_id(
+            &s,
+            "openproj first note",
+            Some(Kind::Note),
+            &repo(&d, "openproj"),
+        )
+        .await;
+        remember_id(
+            &s,
+            "closedproj first note",
+            Some(Kind::Note),
+            &repo(&d, "closedproj"),
+        )
+        .await;
+        wait_settled(&s).await;
+        s.patch_settings(patch_one(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["closedproj"]),
+        ))
+        .unwrap();
+        let before = t.sent();
+        let e = ask_distill(
+            &s,
+            "closedproj",
+            "Project: closedproj\nthe closed plan",
+            "the closed plan",
+            0.5,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, JudgeError::Denied);
+        assert_eq!(t.sent(), before, "a denied project is never sent");
+        assert!(!t.mentioned("the closed plan"));
+        // An allowed project goes, redacted: the state and the question alike.
+        let state = format!("Project: openproj\nthe deploy token is {token}");
+        let answers = ask_distill(&s, "openproj", &state, &format!("deploy with {token}"), 0.5)
+            .await
+            .unwrap();
+        assert!(answers.contains_key("c1"), "{answers:?}");
+        assert_eq!(t.sent(), before + 1);
+        assert!(t.mentioned("the deploy token is"), "the state was sent");
+        assert!(t.mentioned("[REDACTED"), "where the token was");
+        assert!(!t.mentioned(token), "the token reached the model");
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ask_distill_is_denied_for_the_heuristic() {
+        let d = tempfile::tempdir().unwrap();
+        let t = crate::judge_http::ScriptedJev::new(("unrelated", 1.0));
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                jev_transport: Some(t.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        // A Jev key is stored, but the settings ask for the heuristic.
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        remember_id(&s, "proj first note", Some(Kind::Note), &repo(&d, "proj")).await;
+        wait_settled(&s).await;
+        assert_eq!(s.judge().provider(), "heuristic");
+        let e = ask_distill(
+            &s,
+            "proj",
+            "Project: proj\nwe chose WAL",
+            "we chose WAL",
+            0.5,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, JudgeError::Denied);
+        assert_eq!(t.sent(), 0, "the heuristic sends nothing");
+        // Nothing was spent, and nothing shows as `-0.0` (an empty f64 sum is negative zero).
+        let st = s.stats().await.unwrap();
+        for usd in [st.cost_today_usd, st.cost_7d_usd, st.distill_cost_today_usd] {
+            assert!(usd == 0.0 && usd.is_sign_positive(), "{st:?}");
+        }
         s.shutdown();
     }
 

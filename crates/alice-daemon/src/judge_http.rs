@@ -91,10 +91,17 @@ impl JevStore for DaemonJevStore {
             .flatten()
     }
 
+    /// The judge's day total: its own row and distillation's.
     fn spent(&self, day: &str) -> Result<f64, String> {
         // No fallback to 0: an unreadable spend must stop calls, not allow a full new budget.
         self.readers
-            .with(|c| judge_store::spent(c, day, "jev"))
+            .with(|c| judge_store::judge_spent(c, day))
+            .map_err(|e| e.to_string())
+    }
+
+    fn spent_by(&self, day: &str, provider: &str) -> Result<f64, String> {
+        self.readers
+            .with(|c| judge_store::spent(c, day, provider))
             .map_err(|e| e.to_string())
     }
 

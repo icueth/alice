@@ -5,6 +5,7 @@
 
 use crate::error::{AliceError, Result};
 use crate::ids::now_rfc3339;
+use crate::judge::jev::LEDGER_ROWS;
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,7 @@ pub fn cache_put(
     Ok(())
 }
 
+/// USD of one ledger row (`provider`) on `day`.
 pub fn spent(conn: &Connection, day: &str, provider: &str) -> Result<f64> {
     Ok(conn
         .query_row(
@@ -57,6 +59,17 @@ pub fn spent(conn: &Connection, day: &str, provider: &str) -> Result<f64> {
         )
         .optional()?
         .unwrap_or(0.0))
+}
+
+/// The Jev judge's spend on `day`: the sum of its rows ([`LEDGER_ROWS`]: the judge's own calls
+/// and distillation's). The budget reservation reads this.
+pub fn judge_spent(conn: &Connection, day: &str) -> Result<f64> {
+    let [judge, distill] = LEDGER_ROWS;
+    Ok(conn.query_row(
+        "SELECT coalesce(sum(usd), 0.0) FROM cost_ledger WHERE day = ?1 AND provider IN (?2, ?3)",
+        params![day, judge, distill],
+        |r| r.get(0),
+    )?)
 }
 
 /// Adds a delta to the day's totals. The sums are checked in Rust inside a savepoint: a total
@@ -511,5 +524,33 @@ mod tests {
             (rows.len(), rows[0].calls, rows[0].input_tokens),
             (1, 3, 1_200)
         );
+    }
+
+    #[test]
+    fn the_judges_day_total_sums_its_own_row_and_distillations() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        assert_eq!(judge_spent(&c, "2026-10-13").unwrap(), 0.0, "an empty day");
+        let cost = |day: &str, provider: &str, usd: f64| {
+            add_cost(
+                &c,
+                &CostDelta {
+                    day: day.into(),
+                    provider: provider.into(),
+                    calls: 1,
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    usd,
+                },
+            )
+            .unwrap()
+        };
+        cost("2026-10-13", "jev", 0.25);
+        cost("2026-10-13", "jev:distill", 0.5);
+        cost("2026-10-13", "other", 8.0);
+        cost("2026-10-14", "jev:distill", 2.0);
+        assert_eq!(judge_spent(&c, "2026-10-13").unwrap(), 0.75);
+        assert_eq!(spent(&c, "2026-10-13", "jev:distill").unwrap(), 0.5);
+        assert_eq!(judge_spent(&c, "2026-10-14").unwrap(), 2.0, "distill only");
     }
 }
