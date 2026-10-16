@@ -5,6 +5,7 @@ pub mod bq;
 pub mod capture;
 pub mod codetokens;
 pub mod context;
+pub mod distill;
 pub mod embed;
 pub mod error;
 pub mod ids;

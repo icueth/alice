@@ -1956,7 +1956,11 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     set_progress(&env.status, 0, Some(surveyed.total));
     check_stop(&env.stop)?;
 
-    // 3. plan every drawer that is not stored yet; unless this is a dry run, store what it adds
+    // 3. plan every drawer that is not stored yet; unless this is a dry run, store what it adds.
+    // A session `alice capture` holds keeps its turns there (SP2 §9.2): read once, before planning.
+    let captured = env
+        .readers
+        .with(alice_core::store::capture::captured_session_ids)?;
     let planner = Planner {
         mapper: Mapper {
             wings: &wings,
@@ -1964,6 +1968,7 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
             filter: &filter,
         },
         survey: &surveyed,
+        captured_sessions: &captured,
     };
     // The spellings that point at each project, as stored (a transcript folder is not a wing).
     let mut aliases: HashMap<String, Vec<String>> = HashMap::new();

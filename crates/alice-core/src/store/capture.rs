@@ -201,7 +201,8 @@ pub fn chunks_from(
         .collect::<std::result::Result<_, _>>()?)
 }
 
-/// The session ids of every capture source (a subagent's is its main session's).
+/// The session ids of every capture source, of every agent (rows of `capture_state` only; a
+/// subagent's is its main session's). The MemPalace importer skips their transcripts (§9.2).
 pub fn captured_session_ids(conn: &Connection) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare_cached("SELECT DISTINCT session_id FROM capture_state")?;
     Ok(stmt
@@ -209,19 +210,39 @@ pub fn captured_session_ids(conn: &Connection) -> Result<HashSet<String>> {
         .collect::<std::result::Result<_, _>>()?)
 }
 
-/// `Some(ended_at)` when a source with `session_id` exists that was not captured (an imported
-/// transcript): the newest such `ended_at`, `None` inside when none of them has one. `None` when
-/// there is no such source (spec §9.2).
+/// `Some(ended_at)` when a transcript of `session_id` exists that capture does not hold (an
+/// imported one): a source of type `session` with that session id, no capture state and no
+/// capture uri (spec §3.1). Inside, the latest `ended_at` of those sources, compared as times
+/// (an importer may write an offset where capture writes `Z`; one that does not parse counts
+/// only when none does), and `None` when none of them has one. `None` when there is no such
+/// source (spec §9.2).
 pub fn imported_session_end(conn: &Connection, session_id: &str) -> Result<Option<Option<String>>> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT s.ended_at FROM sources s
-             WHERE s.session_id = ?1
-               AND NOT EXISTS (SELECT 1 FROM capture_state c WHERE c.source_id = s.id)
-             ORDER BY s.ended_at IS NULL, s.ended_at DESC LIMIT 1",
-        )?
-        .query_row([session_id], |r| r.get::<_, Option<String>>(0))
-        .optional()?)
+    let mut stmt = conn.prepare_cached(
+        "SELECT s.ended_at FROM sources s
+         WHERE s.session_id = ?1 AND s.type = 'session'
+           AND s.uri NOT LIKE 'claude-code:session:%' AND s.uri NOT LIKE 'codex:session:%'
+           AND NOT EXISTS (SELECT 1 FROM capture_state c WHERE c.source_id = s.id)",
+    )?;
+    let ends: Vec<Option<String>> = stmt
+        .query_map([session_id], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    if ends.is_empty() {
+        return Ok(None);
+    }
+    let mut latest: Option<(Option<chrono::DateTime<chrono::FixedOffset>>, String)> = None;
+    for end in ends.into_iter().flatten() {
+        let at = chrono::DateTime::parse_from_rfc3339(end.trim()).ok();
+        let later = match (&latest, at) {
+            (None, _) => true,
+            (Some((None, _)), at) => at.is_some(),
+            (Some((Some(best), _)), Some(at)) => at > *best,
+            (Some((Some(_), _)), None) => false,
+        };
+        if later {
+            latest = Some((at, end));
+        }
+    }
+    Ok(Some(latest.map(|(_, end)| end)))
 }
 
 /// The `limit` sources captured most recently (registered and not yet captured: by creation).
@@ -553,6 +574,44 @@ mod tests {
         );
         source(&c, "IMP3", "file:///palace/s2-c.jsonl", Some("s2"), None);
         source(&c, "IMP4", "file:///palace/s3.jsonl", Some("s3"), None);
+        // Compared as times: 10:00+07:00 is 03:00Z, before 08:00Z (as text it sorts after).
+        source(
+            &c,
+            "IMP5",
+            "file:///palace/s4-a.jsonl",
+            Some("s4"),
+            Some("2026-10-15T10:00:00+07:00"),
+        );
+        source(
+            &c,
+            "IMP6",
+            "file:///palace/s4-b.jsonl",
+            Some("s4"),
+            Some("2026-10-15T08:00:00.000Z"),
+        );
+        source(
+            &c,
+            "IMP7",
+            "file:///palace/s4-c.jsonl",
+            Some("s4"),
+            Some("soon"),
+        );
+        // Not transcripts capture would continue: a capture uri without its state (it is the
+        // source capture is about to hold), and a file source carrying the session id.
+        source(
+            &c,
+            "CAP2",
+            "claude-code:session:s5",
+            Some("s5"),
+            Some("2026-10-15T08:00:00.000Z"),
+        );
+        c.execute(
+            "INSERT INTO sources (id, project_id, type, uri, session_id, ended_at, created_at)
+             VALUES ('DOC', ?1, 'file', 'file:///notes/s5.md', 's5', '2026-10-15T08:00:00.000Z',
+                     '2026-10-16T00:00:00.000Z')",
+            [GLOBAL_ID],
+        )
+        .unwrap();
         assert_eq!(
             imported_session_end(&c, "s1").unwrap(),
             None,
@@ -566,8 +625,26 @@ mod tests {
         assert_eq!(imported_session_end(&c, "s3").unwrap(), Some(None));
         assert_eq!(imported_session_end(&c, "s9").unwrap(), None);
         assert_eq!(
+            imported_session_end(&c, "s4").unwrap(),
+            Some(Some("2026-10-15T08:00:00.000Z".into())),
+            "the latest as a time; one that does not parse loses to one that does"
+        );
+        assert_eq!(imported_session_end(&c, "s5").unwrap(), None);
+        // Capture sources of every agent, and nothing else.
+        source(&c, "CX", "codex:session:cx1", Some("cx1"), None);
+        ensure_state(
+            &c,
+            "CX",
+            &NewState {
+                agent: "codex",
+                session_id: "cx1",
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
             captured_session_ids(&c).unwrap(),
-            HashSet::from(["s1".to_string()])
+            HashSet::from(["s1".to_string(), "cx1".to_string()])
         );
     }
 

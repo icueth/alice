@@ -795,7 +795,8 @@ pub struct TranscriptAnswer {
     /// client skips the line.
     pub next_offset: u64,
     pub turns_stored: u64,
-    /// Turns that were stored already, or not stored by the rules (an excluded project).
+    /// Turns that were stored already, or not stored by the rules (an excluded project, or a
+    /// turn an imported transcript of the session holds).
     pub turns_skipped: u64,
     pub chunks_stored: u64,
     /// The body is a whole pass without a line end: the client skips that line.

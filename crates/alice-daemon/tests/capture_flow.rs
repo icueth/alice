@@ -1341,3 +1341,319 @@ async fn a_waiting_pass_records_no_gap() {
     let row = state_of(&svc, &uri("wg")).unwrap();
     assert_eq!((row.gaps, row.byte_offset), (1, t.len()), "counted once");
 }
+
+// ---- Task 18a: import first, then capture (spec §9.2) ----
+
+#[path = "common/palace.rs"]
+mod palace;
+
+/// MemPalace's drawers of `session`'s transcript, one per `(text, authored_at)`: what M3
+/// imports as the source `file://…/<session>.jsonl` whose `ended_at` is the newest time.
+fn mined(
+    session: &str,
+    parts: &[(&str, Option<&str>)],
+) -> Vec<alice_core::import::fixture::DrawerSpec> {
+    let path = format!("/h/.claude/projects/-Users-me-Code-pg-ai/{session}.jsonl");
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, (text, at))| {
+            let mut d = palace::chunk(
+                &format!("{session}_{i:03}"),
+                text,
+                "sessions",
+                &path,
+                i as i64,
+            );
+            d.meta.authored_at = at.map(str::to_string);
+            d
+        })
+        .collect()
+}
+
+/// Imports a palace of `specs`, built under `dir`, and waits for the job.
+async fn import_palace(
+    svc: &Arc<Service>,
+    dir: &Path,
+    specs: &[alice_core::import::fixture::DrawerSpec],
+) -> alice_core::import::report::ImportReport {
+    let palace = dir.join("palace");
+    std::fs::create_dir_all(&palace).unwrap();
+    alice_core::import::fixture::build_sqlite_exact(&palace, specs);
+    svc.start_import(alice_core::import::ImportRequest {
+        palace: Some(palace.display().to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    let t = Instant::now();
+    loop {
+        let st = svc.import_status();
+        if st.state != alice_core::import::ImportState::Running {
+            let r = st.report.expect("the import reports");
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            return r;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "the import did not end"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `ended_at` of the non-capture source `uri`.
+fn ended_at_of(svc: &Service, uri: &str) -> Option<String> {
+    db(svc)
+        .query_row("SELECT ended_at FROM sources WHERE uri = ?1", [uri], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+fn imported_uri(session: &str) -> String {
+    format!("file:///h/.claude/projects/-Users-me-Code-pg-ai/{session}.jsonl")
+}
+
+/// Import first, then capture: the first capture of a session MemPalace mined stores only the
+/// turns that started after the import's end. The earlier turns' keys are recorded as skipped
+/// and the cursor moves past them, so they are never stored again, by any source.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_mempalace_mined_continues_after_the_import() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    // MemPalace mined the session up to 00:00:04: its first two turns.
+    let r = import_palace(
+        &svc,
+        d.path(),
+        &mined(
+            "mm1",
+            &[
+                ("mined text of turn one", Some("2026-10-16T00:00:02Z")),
+                ("mined text of turn two", Some("2026-10-16T00:00:04Z")),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert_eq!(
+        ended_at_of(&svc, &imported_uri("mm1")).as_deref(),
+        Some("2026-10-16T00:00:04.000Z")
+    );
+
+    // Turns start at 00:00:01, :03, :05 and :07.
+    let mut t = Transcript::default();
+    t.turn("mm1", 1, "first words")
+        .turn("mm1", 2, "second words")
+        .turn("mm1", 3, "third words")
+        .turn("mm1", 4, "fourth words");
+    let a = send(&svc, q("mm1", 0, "stop"), &t.bytes).await;
+    assert_eq!((a.turns_stored, a.turns_skipped), (2, 2));
+    assert_eq!(a.next_offset, t.len(), "the cursor moves past every turn");
+    assert_eq!(chunks_holding(&svc, "first words is settled"), 0);
+    assert_eq!(chunks_holding(&svc, "second words is settled"), 0);
+    assert_eq!(chunks_holding(&svc, "third words is settled"), 1);
+    assert_eq!(chunks_holding(&svc, "fourth words is settled"), 1);
+    assert_eq!(
+        chunks_holding(&svc, "mined text of turn"),
+        2,
+        "the import's"
+    );
+    let keys = known_keys(&svc);
+    for k in ["mm1-p1", "mm1-p2", "mm1-p3", "mm1-p4"] {
+        assert!(keys.contains(k), "{k} is recorded: {keys:?}");
+    }
+    let row = state_of(&svc, &uri("mm1")).unwrap();
+    assert_eq!(row.byte_offset, t.len());
+
+    // A re-upload from 0 stores nothing new: the cursor is past it.
+    let again = svc
+        .capture_transcript(q("mm1", 0, "stop"), Bytes::copy_from_slice(&t.bytes))
+        .await
+        .unwrap();
+    assert_eq!(again.unwrap_err(), t.len());
+    // A forked session that copies the records (same uuids) stores none of them: the skipped
+    // turns' keys hold them too.
+    let fork = send(&svc, q("mm1-fork", 0, "stop"), &t.bytes).await;
+    assert_eq!((fork.turns_stored, fork.turns_skipped), (0, 4));
+    assert_eq!(chunks_holding(&svc, "first words is settled"), 0);
+    assert_eq!(chunks_holding(&svc, "third words is settled"), 1);
+}
+
+/// An imported transcript with no end time is no evidence of what it holds: the first capture
+/// stores every turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_imported_source_without_an_end_time_captures_everything() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    import_palace(
+        &svc,
+        d.path(),
+        &mined("ne1", &[("mined text with no time", None)]),
+    )
+    .await;
+    assert!(source_exists(&svc, &imported_uri("ne1")));
+    assert_eq!(ended_at_of(&svc, &imported_uri("ne1")), None);
+
+    let mut t = Transcript::default();
+    t.turn("ne1", 1, "first words")
+        .turn("ne1", 2, "second words");
+    let a = send(&svc, q("ne1", 0, "stop"), &t.bytes).await;
+    assert_eq!((a.turns_stored, a.turns_skipped), (2, 0));
+    assert_eq!(chunks_holding(&svc, "first words is settled"), 1);
+    assert_eq!(chunks_holding(&svc, "second words is settled"), 1);
+}
+
+/// The rule applies while the source is new: once it holds a captured turn, a later pass is not
+/// filtered again, even by a turn whose time is before the import's end. Times are compared as
+/// times: the end here is written with an offset.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_continue_rule_applies_only_to_a_new_source() {
+    use alice_core::store::sources::{ChunkInput, SourceInput};
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    // 07:00:04+07:00 is 00:00:04Z; as text it sorts after every turn time below.
+    svc.ingest(IngestRequest {
+        source: SourceInput {
+            uri: imported_uri("cr1"),
+            session_id: Some("cr1".into()),
+            ended_at: Some("2026-10-16T07:00:04+07:00".into()),
+            ..Default::default()
+        },
+        chunks: vec![ChunkInput {
+            ord: 0,
+            text: "an earlier transcript of cr1".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        ended_at_of(&svc, &imported_uri("cr1")).as_deref(),
+        Some("2026-10-16T07:00:04+07:00")
+    );
+
+    let mut t = Transcript::default();
+    t.turn("cr1", 1, "first words")
+        .turn("cr1", 2, "second words")
+        .turn("cr1", 3, "third words");
+    let a = send(&svc, q("cr1", 0, "stop"), &t.bytes).await;
+    assert_eq!(
+        (a.turns_stored, a.turns_skipped),
+        (1, 2),
+        "turns 1 and 2 started by 00:00:04, turn 3 after"
+    );
+    assert_eq!(chunks_holding(&svc, "third words is settled"), 1);
+
+    // A later turn stamped before the import's end (a clock that went back) is stored: the
+    // source is not new any more.
+    let from = t.len();
+    t.clock = 0;
+    t.turn("cr1", 4, "fourth words");
+    let b = send(&svc, q("cr1", from, "stop"), &t.bytes[from as usize..]).await;
+    assert_eq!((b.turns_stored, b.turns_skipped), (1, 0));
+    assert_eq!(chunks_holding(&svc, "fourth words is settled"), 1);
+}
+
+/// A first capture can take several uploads (each body is capped, and `session-start` may
+/// register the source before any turn is complete). The source stays new until it holds a
+/// captured turn, so every imported turn is skipped, whichever upload holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_capture_in_several_uploads_skips_every_imported_turn() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    import_palace(
+        &svc,
+        d.path(),
+        &mined(
+            "mu1",
+            &[("mined text of mu1", Some("2026-10-16T00:00:06Z"))],
+        ),
+    )
+    .await;
+    // Turns start at 00:00:01, :03, :05 and :07: the first three by the import's end.
+    let mut t = Transcript::default();
+    t.turn("mu1", 1, "first words")
+        .turn("mu1", 2, "second words");
+    let third = t.len();
+    t.turn("mu1", 3, "third words");
+    let fourth = t.len();
+    t.turn("mu1", 4, "fourth words");
+
+    // `session-start` registers the session with nothing complete yet.
+    let a = send(&svc, q("mu1", 0, "session-start"), &t.bytes[..10]).await;
+    assert_eq!((a.next_offset, a.turns_stored), (0, 0));
+    assert!(
+        state_of(&svc, &uri("mu1")).is_some(),
+        "the source is registered"
+    );
+    // A capped body: turns 1 and 2 are complete, turn 3 stays open.
+    let b = send(
+        &svc,
+        TranscriptQuery {
+            more: Some(1),
+            ..q("mu1", 0, "stop")
+        },
+        &t.bytes[..fourth as usize],
+    )
+    .await;
+    assert_eq!(
+        (b.next_offset, b.turns_stored, b.turns_skipped),
+        (third, 0, 2)
+    );
+    // The rest: turn 3 is skipped too, turn 4 is stored.
+    let c = send(&svc, q("mu1", third, "stop"), &t.bytes[third as usize..]).await;
+    assert_eq!(
+        (c.next_offset, c.turns_stored, c.turns_skipped),
+        (t.len(), 1, 1)
+    );
+    for (marker, n) in [
+        ("first words is settled", 0),
+        ("second words is settled", 0),
+        ("third words is settled", 0),
+        ("fourth words is settled", 1),
+    ] {
+        assert_eq!(chunks_holding(&svc, marker), n, "{marker}");
+    }
+    let keys = known_keys(&svc);
+    assert!(
+        ["mu1-p1", "mu1-p2", "mu1-p3"]
+            .iter()
+            .all(|k| keys.contains(*k))
+    );
+}
+
+/// A new source's first upload can start inside a turn (a client that lost its state sends from
+/// beyond the cursor): the late tail of a turn the import holds is skipped too, timed by its
+/// first record.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tail_of_an_imported_turn_is_skipped_too() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), false);
+    import_palace(
+        &svc,
+        d.path(),
+        &mined(
+            "tl1",
+            &[("mined text of tl1", Some("2026-10-16T00:00:04Z"))],
+        ),
+    )
+    .await;
+    // Turn 2's reply is stamped 00:00:04, turn 3 starts at 00:00:05.
+    let mut t = Transcript::default();
+    t.turn("tl1", 1, "first words")
+        .prompt("tl1-p2", "Question 2 about second words.");
+    let reply = t.len();
+    t.reply("tl1-a2", "Answer 2: second words is settled.")
+        .turn("tl1", 3, "third words");
+    let a = send(&svc, q("tl1", reply, "stop"), &t.bytes[reply as usize..]).await;
+    assert_eq!((a.next_offset, a.turns_stored), (t.len(), 1));
+    assert_eq!(state_of(&svc, &uri("tl1")).unwrap().gaps, 1);
+    assert_eq!(chunks_holding(&svc, "second words is settled"), 0);
+    assert_eq!(chunks_holding(&svc, "third words is settled"), 1);
+    assert!(
+        known_keys(&svc).contains("tail:tl1-a2"),
+        "{:?}",
+        known_keys(&svc)
+    );
+}

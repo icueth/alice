@@ -8,7 +8,9 @@
 //!    (the route's `409`), higher is a gap that is counted (spec §5.2);
 //! 2. reads complete turns with [`alice_core::capture::read`];
 //! 3. drops the turns whose key is stored already, in any source (spec §3.5), and applies the
-//!    MemPalace rule (a no-op until Task 18);
+//!    MemPalace rule (spec §9.2): while the source holds no captured turn, a turn that started
+//!    at or before the end of an imported transcript of the session is held by the import, so
+//!    its key is recorded as skipped and the cursor moves past it;
 //! 4. asks the capture verdict for every identity of the source's project (slug, aliases,
 //!    display name): `Wait` stores nothing and keeps the cursor, `Excluded` records the keys and
 //!    moves the cursor, `Capture` goes on (plan decision P1);
@@ -135,7 +137,8 @@ pub struct PassReport {
     pub next_offset: u64,
     /// Turns written (their chunks, or their key alone when they rendered none).
     pub turns_stored: u64,
-    /// Complete turns not written: stored already, or excluded by the rules.
+    /// Complete turns not written: stored already, excluded by the rules, or held by an
+    /// imported transcript of the session (spec §9.2).
     pub turns_skipped: u64,
     /// Chunks the writer inserted.
     pub chunks_stored: u64,
@@ -297,6 +300,9 @@ struct Unit {
     /// A turn (`false`: a tail, which continues the previous turn).
     turn: bool,
     started_at: Option<String>,
+    /// An imported transcript of the session holds it (spec §9.2): it has no chunks, and its key
+    /// is recorded as skipped, like an excluded turn's.
+    imported: bool,
 }
 
 impl CaptureCtl {
@@ -434,7 +440,19 @@ impl CaptureCtl {
         let known = self
             .readers
             .with(|c| store::known_turns(c, input.agent.as_str(), &keys))?;
-        let imported_until = mempalace_imported_until(&input);
+        // Spec §9.2: while the source holds no captured turn (its first capture may take several
+        // uploads), an imported transcript of the session tells where capture continues.
+        let imported_until = if state.as_ref().is_none_or(|s| s.next_ord == 0) {
+            self.readers
+                .with(|c| store::imported_session_end(c, &input.session))?
+                .flatten()
+                .and_then(|end| parse_time(&end))
+        } else {
+            None
+        };
+        let held = |at: Option<&str>| {
+            imported_until.is_some_and(|until| at.and_then(parse_time).is_some_and(|t| t <= until))
+        };
         // Where each turn ends in the transcript: where the next starts, the last at `done`.
         let ends: Vec<u64> = out
             .turns
@@ -453,34 +471,45 @@ impl CaptureCtl {
             && !known.contains(&key)
             && seen.insert(key.clone())
         {
+            // The rest of a turn read by an earlier pass, timed by its first record.
+            let imported = held(out.tail.iter().find_map(|c| c.authored_at.as_deref()));
             units.push(Unit {
                 key,
-                chunks: out.tail,
+                chunks: if imported { Vec::new() } else { out.tail },
                 end: tail_end,
                 turn: false,
                 started_at: None,
+                imported,
             });
         }
         for (turn, end) in out.turns.into_iter().zip(ends) {
-            let imported = imported_until.as_deref().is_some_and(|until| {
-                turn.started_at
-                    .as_deref()
-                    .is_some_and(|started| started <= until)
-            });
-            if known.contains(&turn.key) || imported || !seen.insert(turn.key.clone()) {
+            if known.contains(&turn.key) || !seen.insert(turn.key.clone()) {
                 report.turns_skipped += 1;
                 continue;
             }
+            // A turn with no time is kept.
+            let imported = held(turn.started_at.as_deref());
+            if imported {
+                report.turns_skipped += 1;
+            }
             units.push(Unit {
                 key: turn.key,
-                chunks: turn.chunks,
+                chunks: if imported { Vec::new() } else { turn.chunks },
                 end,
                 turn: true,
                 started_at: turn.started_at,
+                imported,
             });
         }
 
-        let base = self.base_slice(uri, &input, units.iter().find_map(|u| u.started_at.clone()));
+        let base = self.base_slice(
+            uri,
+            &input,
+            units
+                .iter()
+                .filter(|u| !u.imported)
+                .find_map(|u| u.started_at.clone()),
+        );
         if input.offset > cursor {
             let source_id = match &report.source_id {
                 Some(id) => id.clone(),
@@ -509,12 +538,12 @@ impl CaptureCtl {
 
         let next_ord = state.as_ref().map_or(0, |s| s.next_ord);
         let slices = if matches!(verdict, CaptureVerdict::Excluded(_)) {
-            report.turns_skipped += units.iter().filter(|u| u.turn).count() as u64;
+            report.turns_skipped += units.iter().filter(|u| u.turn && !u.imported).count() as u64;
             excluded_slices(&base, &input, units, done, next_ord)
         } else {
             let redactor = self.redactors.for_root(identity.tree.as_ref());
             redact(&redactor, uri, &mut units);
-            report.turns_stored = units.iter().filter(|u| u.turn).count() as u64;
+            report.turns_stored = units.iter().filter(|u| u.turn && !u.imported).count() as u64;
             stored_slices(&base, &input, units, done, next_ord)
         };
         let needed = |s: &CaptureSlice| {
@@ -604,11 +633,9 @@ impl CaptureCtl {
     }
 }
 
-/// The end of an imported transcript of the session (MemPalace, spec §9.2): turns that started
-/// at or before it were captured by the import. Wired in Task 18; until then no turn is
-/// skipped by it.
-fn mempalace_imported_until(_input: &PassInput) -> Option<String> {
-    None
+/// An RFC 3339 time (`Z` or an offset), compared as an instant; `None` when it does not parse.
+fn parse_time(t: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(t.trim()).ok()
 }
 
 /// The slices of an excluded project (spec §3.6): the keys are recorded with no chunk, and the
@@ -643,7 +670,8 @@ fn excluded_slices(
 /// chunks and `INGEST_SLICE_BYTES` per slice. A unit's key goes with the slice holding its last
 /// chunk; every slice carries the cursor after the last unit it completes (or the one before,
 /// so the ords of a turn cut between slices are not given away), and the last one the cursor
-/// after the pass.
+/// after the pass. An imported unit's key is a skipped key of the slice it falls in (at most
+/// `SKIPPED_KEYS_PER_SLICE` per slice), so the cursor never passes it before its key is kept.
 fn stored_slices(
     base: &CaptureSlice,
     input: &PassInput,
@@ -656,6 +684,16 @@ fn stored_slices(
     let mut bytes = 0usize;
     let mut complete = (input.offset, next_ord);
     for unit in units {
+        if unit.imported {
+            if slice.skipped_keys.len() >= SKIPPED_KEYS_PER_SLICE {
+                slice.cursor = Some(complete);
+                slices.push(std::mem::replace(&mut slice, base.clone()));
+                bytes = 0;
+            }
+            slice.skipped_keys.push(unit.key);
+            complete = (unit.end, next_ord);
+            continue;
+        }
         let first_ord = next_ord;
         for chunk in unit.chunks {
             let len = chunk.text.len();
@@ -1102,6 +1140,14 @@ mod tests {
             end,
             turn: true,
             started_at: None,
+            imported: false,
+        }
+    }
+
+    fn imported(key: &str, end: u64) -> Unit {
+        Unit {
+            imported: true,
+            ..unit(key, &[], end)
         }
     }
 
@@ -1196,6 +1242,84 @@ mod tests {
             [50, 50, 20]
         );
         assert!(slices.iter().all(|s| !s.ended));
+    }
+
+    /// Spec §9.2: an imported turn's key is a skipped key of the slice it falls in, with the
+    /// cursor after it and no ord taken; at most `SKIPPED_KEYS_PER_SLICE` per slice.
+    #[test]
+    fn imported_units_are_skipped_keys_in_order_with_the_cursor() {
+        let big = INGEST_SLICE_BYTES / 2 + 1;
+        let units = vec![
+            imported("old-1", 1100),
+            unit("new-1", &[big, big], 1200),
+            imported("old-2", 1250),
+            unit("new-2", &[10], 1300),
+        ];
+        let slices = stored_slices(&base(), &input(1000, false), units, 1300, 3);
+        /// `(ords, turn keys, skipped keys, cursor)` of a slice.
+        type Shape = (
+            Vec<i64>,
+            Vec<(String, i64)>,
+            Vec<String>,
+            Option<(u64, i64)>,
+        );
+        let shape: Vec<Shape> = slices
+            .iter()
+            .map(|s| {
+                (
+                    s.chunks.iter().map(|c| c.ord).collect(),
+                    s.turn_keys.clone(),
+                    s.skipped_keys.clone(),
+                    s.cursor,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (vec![3], vec![], vec!["old-1".into()], Some((1100, 3))),
+                (
+                    vec![4, 5],
+                    vec![("new-1".into(), 3), ("new-2".into(), 5)],
+                    vec!["old-2".into()],
+                    Some((1300, 6))
+                ),
+            ]
+        );
+
+        // Only imported units: no chunk, no ord, and the keys in slices of 500.
+        let units: Vec<Unit> = (0..1_200)
+            .map(|i| imported(&format!("k{i}"), 2000 + i))
+            .collect();
+        let slices = stored_slices(&base(), &input(1000, true), units, 3300, 0);
+        assert_eq!(
+            slices
+                .iter()
+                .map(|s| (s.skipped_keys.len(), s.cursor, s.chunks.len(), s.ended))
+                .collect::<Vec<_>>(),
+            vec![
+                (500, Some((2499, 0)), 0, false),
+                (500, Some((2999, 0)), 0, false),
+                (200, Some((3300, 0)), 0, true),
+            ]
+        );
+        assert!(slices.iter().all(|s| s.turn_keys.is_empty()));
+    }
+
+    /// Times are compared as instants: an offset and `Z` agree, and text that is not a time
+    /// does not parse (the turn is then kept).
+    #[test]
+    fn imported_ends_compare_as_times() {
+        let t = |s: &str| parse_time(s).unwrap();
+        assert_eq!(
+            t("2026-10-16T07:00:04+07:00"),
+            t("2026-10-16T00:00:04.000Z")
+        );
+        assert!(t("2026-10-16T00:00:05.000Z") > t("2026-10-16T07:00:04+07:00"));
+        assert!(t(" 2026-10-16T00:00:01Z ") < t("2026-10-16T00:00:04.000Z"));
+        for bad in ["", "soon", "2026-10-16", "2026-10-16T00:00:04"] {
+            assert_eq!(parse_time(bad), None, "{bad}");
+        }
     }
 
     #[test]

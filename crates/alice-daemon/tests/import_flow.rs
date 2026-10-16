@@ -3069,3 +3069,239 @@ async fn compat_stays_off_after_an_import_that_ended_with_errors() {
     assert!(clean.compat_enabled);
     assert!(f.setting_bool("compat.mempalace").await);
 }
+
+// ------------------------------------- SP2 Task 18a: a session is held by one side (spec §9.2)
+
+/// The reason the import report gives for a transcript drawer whose session capture holds.
+const CAPTURED: &str = "captured by alice capture";
+const HELD: &str = "5f1c0a9e-1d2b-4c2d-9e7a-00000000aa01";
+const OTHER: &str = "5f1c0a9e-1d2b-4c2d-9e7a-00000000bb02";
+
+/// Where Claude Code keeps the transcript of `session` (MemPalace files its drawers under it).
+fn transcript_of(session: &str) -> String {
+    format!("/h/.claude/projects/-Users-me-Code-pg-ai/{session}.jsonl")
+}
+
+/// Captures one turn of `session` (`<marker> is settled`) the way the capture hook does, on
+/// this local daemon.
+async fn capture_one_turn(svc: &Service, session: &str, marker: &str) {
+    use alice_core::api::TranscriptQuery;
+    let lines = [
+        serde_json::json!({"type": "user", "uuid": format!("{session}-p1"),
+            "timestamp": "2026-10-16T09:00:00.000Z", "isSidechain": false,
+            "message": {"role": "user", "content": format!("Question about {marker}.")}}),
+        serde_json::json!({"type": "assistant", "uuid": format!("{session}-a1"),
+            "timestamp": "2026-10-16T09:00:01.000Z", "isSidechain": false,
+            "message": {"id": format!("msg-{session}"), "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": format!("Answer: {marker} is settled.")}],
+                "stop_reason": "end_turn"}}),
+    ];
+    let mut body = Vec::new();
+    for line in lines {
+        body.extend(serde_json::to_vec(&line).unwrap());
+        body.push(b'\n');
+    }
+    let answer = svc
+        .capture_transcript(
+            TranscriptQuery {
+                agent: "claude-code".into(),
+                session: session.into(),
+                offset: 0,
+                event: "stop".into(),
+                ..Default::default()
+            },
+            axum::body::Bytes::from(body),
+        )
+        .await
+        .unwrap()
+        .expect("the upload is accepted");
+    assert_eq!(answer.turns_stored, 1);
+}
+
+/// Chunks (of any source) whose text holds `needle`.
+fn chunks_with(f: &Flow, needle: &str) -> i64 {
+    f.db()
+        .query_row(
+            "SELECT count(*) FROM chunks WHERE instr(text, ?1) > 0",
+            [needle],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// Capture first, then import: the transcript drawers of the session capture holds are skipped
+/// and counted under their reason; the rest of the palace imports as usual.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_importer_skips_sessions_capture_holds() {
+    let held = transcript_of(HELD);
+    let other = transcript_of(OTHER);
+    // Claude Code keeps a subagent's transcript under its main session's folder.
+    let held_subagent =
+        format!("/h/.claude/projects/-Users-me-Code-pg-ai/{HELD}/subagents/agent-a1b2c3.jsonl");
+    let specs = vec![
+        knowledge(
+            "k_note",
+            "a decision about the scheduler",
+            "pg-ai",
+            "decisions",
+        ),
+        chunk("held_000", "held session chunk zero", "sessions", &held, 0),
+        chunk("held_001", "held session chunk one", "sessions", &held, 1),
+        chunk(
+            "held_sub_000",
+            "held subagent chunk zero",
+            "sessions",
+            &held_subagent,
+            0,
+        ),
+        chunk(
+            "other_000",
+            "other session chunk zero",
+            "sessions",
+            &other,
+            0,
+        ),
+        chunk(
+            "other_001",
+            "other session chunk one",
+            "sessions",
+            &other,
+            1,
+        ),
+    ];
+    let f = Flow::with_specs(&specs).await;
+    capture_one_turn(&f.svc, HELD, "the captured words").await;
+
+    let dry = f
+        .run_import(f.request().dry_run(true))
+        .await
+        .report
+        .unwrap();
+    let r = f.run_import(f.request()).await.report.unwrap();
+    for rep in [&dry, &r] {
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+        assert_eq!(
+            rep.drawers_seen, rep.drawers_accounted,
+            "a skipped drawer is accounted"
+        );
+        assert_eq!(
+            rep.skipped.get(CAPTURED),
+            Some(&3),
+            "the held session's two drawers and its subagent's: {:?}",
+            rep.skipped
+        );
+    }
+    assert!(
+        r.render_text().contains(&format!("{CAPTURED}: 3")),
+        "{}",
+        r.render_text()
+    );
+
+    // The held session's drawers are not stored, and no file source is made for it.
+    for id in ["held_000", "held_001", "held_sub_000"] {
+        assert_eq!(f.legacy_target(id).await, None, "{id}");
+    }
+    let uris = f.distinct("sources", "uri").await;
+    assert!(
+        !uris
+            .iter()
+            .any(|u| u.starts_with("file://") && u.contains(HELD)),
+        "{uris:?}"
+    );
+    assert_eq!(chunks_with(&f, "held session chunk"), 0);
+    assert_eq!(chunks_with(&f, "held subagent chunk"), 0);
+    assert_eq!(chunks_with(&f, "the captured words is settled"), 1);
+
+    // The unrelated transcript and the knowledge drawer are imported.
+    assert!(uris.contains(&format!("file://{other}")), "{uris:?}");
+    for id in ["other_000", "other_001"] {
+        assert!(
+            f.legacy_target(id).await.unwrap().starts_with("chunk:"),
+            "{id}"
+        );
+    }
+    assert_eq!(chunks_with(&f, "other session chunk"), 2);
+    assert!(
+        f.legacy_target("k_note")
+            .await
+            .unwrap()
+            .starts_with("memory:")
+    );
+
+    // A rerun skips them again, and the law still holds.
+    let again = f.run_import(f.request()).await.report.unwrap();
+    assert!(again.errors.is_empty(), "{:?}", again.errors);
+    assert_eq!(again.drawers_seen, again.drawers_accounted);
+    assert_eq!(again.skipped.get(CAPTURED), Some(&3));
+    assert_eq!(chunks_with(&f, "held session chunk"), 0);
+}
+
+/// Only transcript drawers are held by capture: a knowledge drawer, a file drawer and a
+/// checkpoint diary are imported even when their file is named after a captured session.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_and_knowledge_drawers_are_not_skipped() {
+    let mut named_knowledge = knowledge(
+        "k_named",
+        "a decision filed from the session notes",
+        "pg-ai",
+        "decisions",
+    );
+    named_knowledge.meta.source_file = s(&format!("/h/Code/pg-ai/notes/{HELD}.md"));
+    let mut named_file = chunk(
+        "f_named",
+        "func held() {}",
+        "devspace",
+        &format!("/h/Code/devspace/{HELD}.go"),
+        0,
+    );
+    named_file.meta.room = "src".into();
+    named_file.meta.ingest_mode = s("projects");
+    named_file.meta.added_by = s("claude");
+    let specs = vec![
+        named_knowledge,
+        named_file,
+        diary_part(
+            "diary_wing_claude_code_20261016_c1",
+            None,
+            "AUTO-SAVE whole otter-cobalt-4410 state",
+            "wing_claude_code",
+            "checkpoint",
+            "2026-10-16T09:30:00",
+        ),
+        diary_part(
+            "diary_wing_claude_code_20261016_d1",
+            None,
+            "A real diary about the capture cut-over",
+            "wing_claude_code",
+            "roadmap",
+            "2026-10-16T15:00:00",
+        ),
+    ];
+    let f = Flow::with_specs(&specs).await;
+    capture_one_turn(&f.svc, HELD, "the captured words").await;
+
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert_eq!(r.skipped.get(CAPTURED), None, "{:?}", r.skipped);
+    assert_eq!(r.tiers.checkpoint_diaries, 1);
+    assert!(
+        f.legacy_target("k_named")
+            .await
+            .unwrap()
+            .starts_with("memory:")
+    );
+    assert!(
+        f.legacy_target("diary_wing_claude_code_20261016_d1")
+            .await
+            .unwrap()
+            .starts_with("memory:")
+    );
+    for id in ["f_named", "diary_wing_claude_code_20261016_c1"] {
+        assert!(
+            f.legacy_target(id).await.unwrap().starts_with("chunk:"),
+            "{id}"
+        );
+    }
+    assert_eq!(chunks_with(&f, "otter-cobalt-4410"), 1);
+}

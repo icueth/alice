@@ -240,8 +240,9 @@ fn adopted(old: &str) -> String {
 }
 
 /// Clear what names the person's machine: project roots, path-made project keys (and the keys of
-/// projects merged into others), and source paths (a hash and the file's own name stay). JSON
-/// snapshots in events and review items that held one of those values get the new one.
+/// projects merged into others), source paths (a hash and the file's own name stay), and the
+/// transcript paths and file identities of captured sessions. JSON snapshots in events and review
+/// items that held one of the renamed values get the new one.
 fn scrub_paths(tx: &Connection, r: &mut AdoptReport) -> Result<()> {
     let mut renamed: HashMap<String, serde_json::Value> = HashMap::new();
     let roots: Vec<(String, String)> = tx
@@ -296,6 +297,9 @@ fn scrub_paths(tx: &Connection, r: &mut AdoptReport) -> Result<()> {
         renamed.insert(uri, serde_json::Value::String(new));
         r.paths_cleared += 1;
     }
+    // A captured session's state (SP2) names its transcript file: cleared here, inside this
+    // transaction, so the VACUUM after it leaves no copy in the file.
+    r.paths_cleared += crate::capture::forget_local_paths(tx)? as u64;
     if renamed.is_empty() {
         return Ok(());
     }
