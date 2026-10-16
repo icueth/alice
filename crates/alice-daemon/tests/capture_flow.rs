@@ -1276,7 +1276,8 @@ fn codex_q(session: &str, offset: u64, event: &str) -> TranscriptQuery {
 }
 
 /// Task 17a: a Codex rollout goes through the same upload path as Claude Code's, under its own
-/// source uri, and a resend or a Claude session of the same id stores nothing twice.
+/// source uri (no `claude-code:` source is made for it), and a resend from behind the cursor
+/// stores nothing twice.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_codex_upload_stores_its_turns_once() {
     let (_d, svc) = tenant();
