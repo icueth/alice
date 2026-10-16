@@ -1246,15 +1246,19 @@ doubling to 6 h, and `distill_attempts` increases. After 5 attempts the state is
 - **`hook.sh`** subcommands: `hook <agent>` (reads stdin), `run <agent> <event> <session> <path> <cwd> [<agent_id> <agent_path>]`
   (the background worker), `status` and `uninstall`.
 - **Files it uses, under `~/.config/alice/`:**
-  - `capture.conf` (`url=`, `token=`, `briefing=on|off`);
+  - `token` and `url` (0600, one line each; installed by the team's setup document or by `setup.sh`; read with `head -n 1`, never written by `hook.sh`);
+  - `capture.conf` (only `briefing=on|off`; no secret);
   - `state/<agent>-<session>[-<agent_id>].offset` (content: `<offset> <path>`);
   - `capture.log` (≤ 256 KB, no token, no transcript text);
   - `paused-until` (a 401 back-off of 1 hour).
 - **`setup.sh <url>`:**
-  - reads the token from `/dev/tty`, or from stdin when `ALICE_SETUP_TOKEN_STDIN=1` (tests: the token never in argv or
-    the environment);
-  - verifies it against `GET <url>/api/v1/capture/status`;
-  - writes the conf and the hook script;
+  - uses `~/.config/alice/url` when it exists (the argument may differ: say so, keep the file), else writes the argument
+    there (0600, directory 0700);
+  - uses `~/.config/alice/token` when it exists and `GET <url>/api/v1/capture/status` accepts it, and never prompts then;
+    it asks only when the file is missing or the token is refused, from `/dev/tty`, or from stdin when
+    `ALICE_SETUP_TOKEN_STDIN=1` (tests), and writes the answer to that same file (0600). The token is never in argv or
+    the environment, and there is no second copy;
+  - writes `capture.conf` (`briefing=on`) and the hook script;
   - writes the marketplace `~/.config/alice/claude-marketplace/.claude-plugin/marketplace.json` (`{"name":"alice-local",…}`)
     and the plugin `alice-capture/` (`.claude-plugin/plugin.json` with the tenant's version, and `hooks/hooks.json` with
     the five events running `sh "$HOME/.config/alice/alice-capture.sh" hook claude-code`);
@@ -1270,15 +1274,20 @@ doubling to 6 h, and `distill_attempts` increases. After 5 attempts the state is
   `PATH` = a temp `bin/` holding a fake `claude` (a script that appends `"$@"` to `$HOME/claude-calls`) plus `/usr/bin:/bin`,
   and the Caddy emulator's `url("ann")`.
   - **`setup_installs_conf_script_and_plugin`:**
-    - `capture.conf` is mode 0600 in a 0700 directory, with `briefing=on`;
+    - `token` and `url` are mode 0600 in a 0700 directory, and `capture.conf` holds only `briefing=on`;
     - `alice-capture.sh` is 0700;
     - `marketplace.json`, `plugin.json` and `hooks.json` parse as JSON;
     - `hooks.json` has the five events;
     - `claude-calls` holds `plugin marketplace add` and `plugin install alice-capture@alice-local --scope user`.
-  - **`setup_rejects_a_wrong_token_and_writes_nothing`.**
+  - **`setup_reuses_an_existing_token_file_without_prompting`:** with `token` and `url` pre-written (as the team's setup
+    document leaves them) and no stdin, setup completes, never prompts, and leaves both files byte-identical.
+  - **`setup_prompts_only_when_the_token_file_is_missing_or_refused`:** a missing file → one prompt, the answer written to
+    `token`; a file holding a refused token → one prompt, the file replaced.
+  - **`setup_rejects_a_wrong_token_and_writes_nothing`** (a wrong token typed at the prompt leaves no `token` file and no
+    plugin).
   - **`the_token_never_appears_in_argv_or_logs`:** a sampler thread runs `ps -axww -o args=` every 5 ms during setup and
-    three hook runs, and asserts the token string is never in its output. It is never in `capture.log`, and it is in
-    `capture.conf` only.
+    three hook runs, and asserts the token string is never in its output. It is never in `capture.log` or
+    `capture.conf`, and it is in `~/.config/alice/token` only.
   - **`a_transcript_grown_in_steps_is_captured_once`:** three hook `stop` runs between appends, then (after the background
     jobs finish, polled on the state file) the tenant holds every turn exactly once.
   - **`a_lost_state_file_resyncs_with_one_409`.**
@@ -1291,8 +1300,9 @@ doubling to 6 h, and `distill_attempts` increases. After 5 attempts the state is
   - **`no_capture_in_alice_toml_skips_and_cloud_denied_sends_no_distill`.**
   - **`hook_script_handles_utf8_and_skips_u_escapes`** (Review Focus 5): a Thai `cwd` and transcript path with spaces work.
     A `transcript_path` holding `ก` is skipped with one log line.
-  - **`uninstall_removes_what_setup_wrote`:** `claude-calls` holds `plugin uninstall`, the marketplace is removed, and
-    `~/.config/alice` is gone after the `yes` answer (`ALICE_SETUP_ASSUME_YES=1` in tests).
+  - **`uninstall_removes_what_setup_wrote`:** `claude-calls` holds `plugin uninstall`, and the marketplace is removed.
+    After the `yes` answer (`ALICE_SETUP_ASSUME_YES=1` in tests) the script, `state/`, `capture.conf`, `capture.log` and
+    `paused-until` are gone, while `token` and `url` are untouched (they belong to the MCP setup).
   - **`the_public_scripts_need_no_token_and_hold_no_secret`** (`http_api.rs`): `GET` without a token gives 200. The bodies
     match `include_str!`, and `grep -c -F -- "$TYPESAFE_API_KEY"` on them gives 0.
 - [ ] **Step 2: Run** `… cargo test -p alice-daemon -j 4 --test capture_scripts`. Expected: FAIL.

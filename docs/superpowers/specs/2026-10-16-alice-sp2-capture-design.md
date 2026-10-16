@@ -545,8 +545,8 @@ transcript file as a sweep (complete turns only).
 The person needs **`sh`, `curl` and Claude Code**, nothing else.
 
 - **The setup script.** One pasted command fetches a setup script from their own tenant. The script:
-  - asks for the token;
-  - writes a 0600 config file;
+  - reuses the token and URL files the team's setup document already installed (`~/.config/alice/token` and
+    `~/.config/alice/url`), and asks for the token only when the file is missing or the token is refused;
   - installs a POSIX shell hook script;
   - writes a tiny Claude Code plugin into a **local marketplace** directory and installs it with `claude plugin`. Claude
     Code then merges the hooks itself.
@@ -639,12 +639,18 @@ curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<h
 path, but the Host and Origin guard still applies. Both are static text compiled into the binary. They hold no secret and
 no address, and they are in the public repository anyway. The setup script:
 
-1. **Checks the URL.** It must be `https://`, or `http://` to `127.0.0.1` or `localhost` (tests only).
-2. **Asks for the token** from `/dev/tty` with echo off. It never takes the token from argv or the environment.
+1. **Finds the URL.** It uses `~/.config/alice/url` when the file exists (the team's setup document writes it, 0600). If
+   the command's argument differs from it, the script says so and keeps the file. Otherwise it takes the argument and
+   writes the file (0600, in a 0700 `~/.config/alice`). The URL must be `https://`, or `http://` to `127.0.0.1` or
+   `localhost` (tests only).
+2. **Finds the token.** It uses `~/.config/alice/token` (0600, the bare token on one line) when the file exists. It asks
+   only when the file is missing, or when step 3 refuses the token. It asks from `/dev/tty` with echo off, and writes the
+   answer to that same file (0600). It never takes the token from argv or the environment, and never keeps a second copy.
 3. **Verifies the token** with `GET <url>/api/v1/capture/status`. The `Authorization` header goes to curl through
-   `-K -` from `printf` (a shell builtin), so the token is never in a process's argv.
-4. **Writes `~/.config/alice/capture.conf`** (0600, in a 0700 directory): `url=`, `token=` and `briefing=on`. The person
-   may change the last one to `off`.
+   `-K -` from `printf` (a shell builtin), so the token is never in a process's argv. A refused token from an existing
+   file is reported, and the script asks once for a new one.
+4. **Writes `~/.config/alice/capture.conf`** (0600), which holds only non-secret options: `briefing=on`. The person may
+   change it to `off`.
 5. **Installs** `alice-capture.sh` from `<url>/api/v1/capture/hook.sh`.
 6. **Writes the local marketplace** `~/.config/alice/claude-marketplace/`, containing
    `.claude-plugin/marketplace.json` (marketplace `alice-local`) and the plugin `alice-capture/`. The plugin holds
@@ -659,13 +665,16 @@ no address, and they are in the public repository anyway. The setup script:
 Re-running the command updates everything in place. `sh ~/.config/alice/alice-capture.sh uninstall`:
 - uninstalls the plugin and removes the marketplace;
 - removes the Codex `hooks.json` only if it is still exactly the one setup wrote;
-- deletes `~/.config/alice/` after asking.
+- deletes the capture files after asking: the script, `state/`, `capture.conf`, `capture.log`, `paused-until` and the
+  marketplace. It never deletes `token` or `url`, which belong to the person's MCP setup.
 
 Whether `alice-server` prints each person's line is the server lane's call. `docs/server.md` documents the line either way.
 
 ### 5.5 The token
 
-- It is kept in `capture.conf` (0600) only. Scripts read it with `sed` into an unexported shell variable.
+- It is kept in `~/.config/alice/token` (0600, the bare token on one line) only. The same file serves the person's MCP
+  setup, so a rotation is one edit (controller's interface, 2026-10-16). Scripts read it with `head -n 1` into an
+  unexported shell variable, and the URL from `~/.config/alice/url` the same way.
 - It reaches curl only through `curl -K -` with `header = "Authorization: Bearer …"` written by `printf`. It is never in
   argv, a URL or the environment of a child process, and never logged.
 - **No ping proof** is checked by the shell. Verifying the HMAC with `openssl` would put the token in argv. TLS with the
@@ -1151,7 +1160,7 @@ SP2 needs these from `deploy/server/alice-server` (pane 3). SP2 does not edit th
 | Settings say capture off, agent off, or project excluded | Nothing stored; the cursor moves past those turns |
 | Block mode and a secret in a turn | That chunk becomes `[withheld: …]` and capture continues |
 | Tenant unreachable | The script keeps its offset and the next hook retries. `SessionStart` sweeps up to 5 unfinished sessions |
-| Tenant token rotated | `401` → the script logs once and pauses 1 h; re-running the setup line fixes it |
+| Tenant token rotated | `401` → the script logs once and pauses 1 h; writing the new token into `~/.config/alice/token` (or re-running the setup line, which asks) fixes it |
 | Tenant slow or down at `SessionStart` | The briefing call gives up after 2 s (1 s to connect) and prints nothing; the session starts without it and the MCP instructions still ask for `context` |
 | Capture retention reached | Old captured chunks are deleted; imported history, cursors, turn keys and memories stay |
 | Owner's database adopted into a tenant | The tenant script's offset-0 upload gets a `409` jump; resent turns are skipped by key; local paths in adopted rows are ignored |
