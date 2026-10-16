@@ -3989,6 +3989,9 @@ fn hook_notifies_and_capture_follows() {
     );
     let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &[]);
     assert_quiet(&o, "stop");
+    // Checked at once: the daemon drains its spool every few seconds, so later a spooled
+    // notice would look delivered too.
+    assert_eq!(spooled(&e), 0, "the daemon took the notice");
     eventually(
         || !raw_hits(&e, "quokkalantern").is_empty(),
         "the turn in the raw tier",
@@ -3998,7 +4001,6 @@ fn hook_notifies_and_capture_follows() {
         hits[0].0, "work",
         "the project of the session's cwd: {hits:?}"
     );
-    assert_eq!(spooled(&e), 0, "the daemon took the notice");
     assert!(hook_log(&e).is_empty(), "{:?}", hook_log(&e));
 }
 
@@ -4203,6 +4205,7 @@ fn hook_passes_a_thai_path_with_spaces_and_quotes() {
     );
     let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &[]);
     assert_quiet(&o, "stop");
+    assert_eq!(spooled(&e), 0, "the daemon took the notice");
     eventually(
         || !raw_hits(&e, "numbatlantern").is_empty(),
         "the turn in the raw tier",

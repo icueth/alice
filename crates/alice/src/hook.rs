@@ -103,7 +103,7 @@ fn hook(home: &AliceHome, args: &HookArgs, log: &Log, started: Instant) {
         .enable_all()
         .build()
     {
-        Ok(rt) => rt.block_on(deliver(home, &n, started, log)),
+        Ok(rt) => taken_unless_it_panics(|| rt.block_on(deliver(home, &n, started, log))),
         Err(e) => {
             log.line(&format!(
                 "cannot start the hook's runtime, so the notice is spooled: {e}"
@@ -114,6 +114,13 @@ fn hook(home: &AliceHome, args: &HookArgs, log: &Log, started: Instant) {
     if !taken {
         spool_and_start(home, n, log);
     }
+}
+
+/// `deliver`'s answer, or `false` when it panics (a bug here or in a library; the panic hook has
+/// logged it): the notice is then spooled, not lost. One that was delivered before the panic is
+/// spooled too, which costs nothing, since the daemon reads from the source's cursor.
+fn taken_unless_it_panics(deliver: impl FnOnce() -> bool) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(deliver)).unwrap_or(false)
 }
 
 /// Stdin to its end, at most [`MAX_INPUT`] bytes, by `deadline`; `Err` says why there is no input
@@ -524,6 +531,13 @@ mod tests {
                 "{why}"
             );
         }
+    }
+
+    #[test]
+    fn a_panic_while_delivering_leaves_the_notice_to_the_spool() {
+        assert!(taken_unless_it_panics(|| true));
+        assert!(!taken_unless_it_panics(|| false));
+        assert!(!taken_unless_it_panics(|| panic!("a bug while delivering")));
     }
 
     #[test]
