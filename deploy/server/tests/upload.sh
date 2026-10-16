@@ -60,7 +60,8 @@ k=$((k + 1))
 echo $k >"$FAKE_DIR/statusn"
 total=$(wc -l <"$FAKE_STATUS_FILE")
 [ "$k" -le "$total" ] || k=$total
-sed -n "${k}p" "$FAKE_STATUS_FILE" >"$out"
+# As the daemon answers: the JSON without a final newline.
+sed -n "${k}p" "$FAKE_STATUS_FILE" | tr -d '\n' >"$out"
 printf '%s' "${FAKE_STATUS_CODE:-200}"
 exit 0
 FAKE
@@ -129,6 +130,8 @@ check "happy: status also uses stdin config" contains "$FAKE_DIR/stdin.2" "Beare
 check "happy: temp removed" tmp_empty
 check "happy: warning without sqlite3" contains "$C/err" 'sqlite3 is not installed'
 check "happy: report project" contains "$C/out" 'alpha: 4 memories, 6 chunks'
+check "happy: the last project ends its line" grep -qx '  beta: 1 memories, 1 chunks' "$C/out"
+check "happy: the backlog note starts its own line" grep -q '^Search by meaning is still being prepared for 42' "$C/out"
 check "happy: report skipped why" contains "$C/out" 'empty content: 2'
 check "happy: report redaction" contains "$C/out" 'github token: 1'
 check "happy: report tier" contains "$C/out" 'Memories (knowledge): 5'

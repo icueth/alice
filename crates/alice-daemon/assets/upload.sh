@@ -335,7 +335,8 @@ print_report() { # status json file
   facts=$(jobj facts <"$j")
   say "  Facts added: $(printf '%s' "$facts" | jnum added)"
   say "By project (memories and chunks):"
-  sed -n 's/.*"projects":{\(.*\)},"wing_map":.*/\1/p' "$j" | head -n 1 | sed 's/},/}\
+  # The daemon's JSON has no final newline; one is added so the last project's line ends too.
+  { cat "$j"; echo; } | sed -n 's/.*"projects":{\(.*\)},"wing_map":.*/\1/p' | head -n 1 | sed 's/},/}\
 /g' | sed -n 's/^"\(.*\)":{"memories":\([0-9]*\),"chunks":\([0-9]*\)}$/  \1: \2 memories, \3 chunks/p'
   skipped=$(jobj skipped <"$j" | sed -n '/"skipped":{/p')
   if [ -n "$skipped" ] && [ "$skipped" != '"skipped":{}' ]; then
