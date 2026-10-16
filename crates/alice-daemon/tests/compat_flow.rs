@@ -463,6 +463,64 @@ async fn the_id_mempalace_answered_for_a_long_entry_gets_updates_and_deletes_it(
     assert!(f.is_forgotten(&id).await);
 }
 
+/// `update_drawer` and `delete_drawer` through the old id of a collapsed duplicate act on the
+/// memory it was merged into, and say so as `get_drawer` does. The ids of a memory's own drawer
+/// (its old id, its fragments, the id MemPalace answered for a drawer it cut) are no merge.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_through_a_merged_old_id_say_which_memory_they_changed() {
+    let f = Flow::imported_with(&specs_with_a_cut_drawer()).await;
+    let up = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": "k_dup_b", "content": "Frames are framed protobuf, v4."}),
+        )
+        .await;
+    assert_eq!(up["success"], true, "{up}");
+    let survivor = up["drawer_id"].as_str().unwrap().to_string();
+    assert!(
+        up["note"]
+            .as_str()
+            .is_some_and(|n| n.contains(&format!("k_dup_b was merged into {survivor}"))),
+        "{up}"
+    );
+    let own = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": "k_dup_a", "room": "decisions"}),
+        )
+        .await;
+    assert_eq!(own["success"], true, "{own}");
+    assert!(own.get("note").is_none(), "{own}");
+    for id in [
+        LOGICAL.to_string(),
+        format!("{LOGICAL}_chunk_000000"),
+        format!("{LOGICAL}_chunk_000001"),
+    ] {
+        let got = f
+            .call("mempalace_get_drawer", json!({"drawer_id": id}))
+            .await;
+        assert!(got.get("note").is_none(), "{id}: {got}");
+    }
+    let cut = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": format!("{LOGICAL}_chunk_000001"), "content": "We picked the framed protobuf layout."}),
+        )
+        .await;
+    assert_eq!(cut["success"], true, "{cut}");
+    assert!(cut.get("note").is_none(), "{cut}");
+    let del = f
+        .call("mempalace_delete_drawer", json!({"drawer_id": "k_dup_b"}))
+        .await;
+    assert_eq!(del["deleted_ids"], json!([survivor]), "{del}");
+    assert!(
+        del["note"].as_str().is_some_and(|n| n
+            .contains(&format!("k_dup_b was merged into {survivor}"))
+            && n.contains("trash")),
+        "{del}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn status_gives_counts_and_the_wing_map_and_stays_small() {
     let f = Flow::imported().await;

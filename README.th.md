@@ -404,7 +404,7 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 
 - `similarity` ในผลค้นหาเป็นค่าสัมพัทธ์: hit ที่ดีที่สุดได้ 1.0 ที่เหลือเทียบกับมัน คะแนนของ Alice ไม่ใช่ระยะ cosine ดังนั้น prompt ที่ตั้งเกณฑ์ตามระยะของ MemPalace จะทำงานต่างไป
 - การเขียนผ่านเส้นทางปกติของ Alice: ปกปิด secret, ผ่าน judge, บันทึกใน `alice history` และ undo ได้ `wing` ที่ไม่ใช่ project ใน Alice จะเก็บ memory ไว้ใน project ปัจจุบัน (คำตอบบอกไว้) agent ไม่สร้าง project ด้วยวิธีนี้
-- id ของ drawer จาก palace ของคุณยังใช้ได้ (`mempalace_get_drawer`, `update_drawer`, `delete_drawer`) รวมถึง id ของ drawer ที่ถูกรวมเข้ากับอันเดิมที่เหมือนกัน และ id ที่ MemPalace ตอบกลับสำหรับ entry ยาวที่มันเก็บเป็นชิ้นๆ
+- id ของ drawer จาก palace ของคุณยังใช้ได้ (`mempalace_get_drawer`, `update_drawer`, `delete_drawer`) รวมถึง id ของ drawer ที่ถูกรวมเข้ากับอันเดิมที่เหมือนกัน และ id ที่ MemPalace ตอบกลับสำหรับ entry ยาวที่มันเก็บเป็นชิ้นๆ การ get, update หรือ delete ผ่าน id ของ drawer ที่ถูกรวมไปแล้วจะทำกับ memory ที่มันถูกรวมเข้าไป และคำตอบจะบอกไว้
 - tool อื่นของ MemPalace (`mine`, `traverse`, tunnel, `check_duplicate` ฯลฯ) ไม่ถูกแสดงในรายการ และถ้าเรียกจะได้ข้อความบอกว่าใน Alice ใช้อะไรแทน ไม่ใช่ error
 
 ## ประสิทธิภาพ

@@ -36,7 +36,7 @@ use alice_core::api::{
     RememberStatus, Tier, UpdateRequest,
 };
 use alice_core::error::Result;
-use alice_core::import::plan::kind_for_room;
+use alice_core::import::plan::{chunk_suffix, kind_for_room};
 use alice_core::model::{Author, Kind, Memory, Status};
 use alice_core::normalize::normalize_topic;
 use alice_core::store::compat::{self as store, CompatDrawer, Overview};
@@ -706,9 +706,7 @@ impl Service {
                     },
                 });
                 let mut notes: Vec<String> = Vec::new();
-                if id != m.id && m.legacy_id.as_deref() != Some(id.as_str()) {
-                    notes.push(format!("{id} was merged into {}", m.id));
-                }
+                notes.extend(self.merged_note(&id, &m));
                 match m.status {
                     Status::Trashed => {
                         out["trashed"] = json!(true);
@@ -833,6 +831,26 @@ impl Service {
         Ok(out)
     }
 
+    /// What an answer says when `asked` named the memory through the old id of another drawer
+    /// (a duplicate the import or the judge merged into it). The ids of the memory's own drawer
+    /// are no merge: its own and its old id, and, for a drawer MemPalace cut into fragments, the
+    /// fragment ids and the id MemPalace answered for it (they share its old id's base).
+    fn merged_note(&self, asked: &str, m: &Memory) -> Option<String> {
+        /// A drawer id without Alice's part suffix (`#2`) and MemPalace's fragment suffix.
+        fn drawer(id: &str) -> &str {
+            let id = match id.rsplit_once('#') {
+                Some((base, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => base,
+                _ => id,
+            };
+            chunk_suffix(id).map_or(id, |(base, _)| base)
+        }
+        let own = asked == m.id
+            || m.legacy_id
+                .as_deref()
+                .is_some_and(|l| l == asked || drawer(l) == drawer(asked));
+        (!own).then(|| format!("{} was merged into {}", self.redact_echo(asked), m.id))
+    }
+
     /// The live-or-not memory a drawer id names; a raw chunk or an unknown id is the caller's
     /// error.
     async fn compat_memory(&self, drawer_id: &str) -> std::result::Result<Memory, String> {
@@ -918,6 +936,9 @@ impl Service {
         if let Some(e) = done.event_id {
             out["event_id"] = json!(e);
         }
+        if let Some(n) = self.merged_note(&drawer_id, &current) {
+            out["note"] = json!(n);
+        }
         Ok(out)
     }
 
@@ -931,6 +952,7 @@ impl Service {
         if current.status == Status::Trashed {
             return Err(TRASHED_REFUSAL.into());
         }
+        let merged = self.merged_note(&drawer_id, &current);
         let id = current.id;
         let done = self
             .update(UpdateRequest {
@@ -949,7 +971,7 @@ impl Service {
             "deleted_ids": [id],
             "chunks_deleted": 1,
             "closets_deleted": 0,
-            "note": "the memory was forgotten (moved to the trash); `alice undo` can bring it back",
+            "note": merged.into_iter().chain(["the memory was forgotten (moved to the trash); `alice undo` can bring it back".to_string()]).collect::<Vec<_>>().join("; "),
         });
         if let Some(e) = done.event_id {
             out["event_id"] = json!(e);

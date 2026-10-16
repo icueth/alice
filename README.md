@@ -404,7 +404,7 @@ Differences to know about:
 
 - `similarity` in search results is relative: 1.0 for the best hit, the others scaled to it. Alice's scores are not cosine distances, so a prompt that thresholds on MemPalace distances will behave differently.
 - Writes go through the normal Alice paths: redacted, judged, recorded in `alice history` and undoable. A `wing` that is not an Alice project files the memory into the current project (the answer says so); an agent never creates a project this way.
-- Drawer ids from your palace keep working (`mempalace_get_drawer`, `update_drawer`, `delete_drawer`), including ids of drawers that were collapsed into an earlier identical one and the id MemPalace answered for a long entry it stored in fragments.
+- Drawer ids from your palace keep working (`mempalace_get_drawer`, `update_drawer`, `delete_drawer`), including ids of drawers that were collapsed into an earlier identical one and the id MemPalace answered for a long entry it stored in fragments. A get, update or delete through a collapsed drawer's id acts on the memory it was merged into, and the answer says so.
 - The other MemPalace tools (`mine`, `traverse`, tunnels, `check_duplicate` and so on) are not listed, and calling one returns a message naming the Alice equivalent instead of an error.
 
 ## Performance
