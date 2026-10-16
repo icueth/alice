@@ -85,6 +85,11 @@ pub struct ReadOptions {
     /// The trailing turn is complete: a settled `Stop`, `SubagentStop`, `PreCompact` or
     /// `SessionEnd`, or a file idle for the sweep (spec §3.3).
     pub close_trailing: bool,
+    /// Close the trailing turn even when its last `tool_use` has no result yet. Plain
+    /// `close_trailing` waits for that result, because a result that arrives later would be
+    /// rendered as a late tail, away from its call. Set it for a session end or a file gone
+    /// stale.
+    pub force_close: bool,
 }
 
 impl Default for ReadOptions {
@@ -97,6 +102,7 @@ impl Default for ReadOptions {
             include_thinking: false,
             at_file_start: true,
             close_trailing: false,
+            force_close: false,
         }
     }
 }
@@ -226,6 +232,7 @@ pub fn read(agent: AgentKind, input: &[u8], opts: &ReadOptions) -> ReadOutcome {
         GroupOptions {
             at_file_start: opts.at_file_start,
             close_trailing: opts.close_trailing,
+            force_close: opts.force_close,
             full_pass,
         },
     );
@@ -692,7 +699,14 @@ mod tests {
     #[test]
     fn a_subagent_files_own_prompt_starts_a_turn() {
         // Every line of a subagent file is a sidechain carrying `agentId`.
-        let out = read(CLAUDE, SAMPLE_AGENT, &opts(true, true));
+        let out = read(
+            CLAUDE,
+            SAMPLE_AGENT,
+            &ReadOptions {
+                force_close: true,
+                ..opts(true, true)
+            },
+        );
         assert_eq!((out.stats.unknown, out.stats.invalid), (0, 0));
         assert_eq!(out.turns[0].key, "0b204206-70cf-d21b-30a5-9e1854da2b43");
         assert!(out.turns[0].prompt.is_some());
@@ -953,5 +967,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn tool_use_line(uuid: &str, message_id: &str, tool_id: &str) -> Vec<u8> {
+        line(json!({
+            "type": "assistant", "uuid": uuid, "isSidechain": false,
+            "timestamp": "2026-10-14T09:00:02.000Z",
+            "message": {"id": message_id, "role": "assistant", "content": [
+                {"type": "tool_use", "id": tool_id, "name": "Bash", "input": {"command": "ls"}}]},
+        }))
+    }
+
+    fn tool_result_line(uuid: &str, tool_id: &str) -> Vec<u8> {
+        line(json!({
+            "type": "user", "uuid": uuid, "isSidechain": false,
+            "timestamp": "2026-10-14T09:00:03.000Z",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": "a.txt"}]},
+            "toolUseResult": {"stdout": "a.txt"},
+        }))
+    }
+
+    #[test]
+    fn a_turn_with_an_unanswered_tool_use_stays_open_until_forced() {
+        let mut input = prompt_line("p-1", "List the files.");
+        input.extend(tool_use_line("a-1", "msg_t", "toolu_1"));
+
+        // close_trailing waits for the result, so the result is never a late tail.
+        let waiting = read(CLAUDE, &input, &opts(true, true));
+        assert!(waiting.turns.is_empty() && waiting.tail.is_empty());
+        assert_eq!(waiting.consumed, 0, "the cursor stays at the turn start");
+
+        let forced = read(
+            CLAUDE,
+            &input,
+            &ReadOptions {
+                force_close: true,
+                ..opts(true, true)
+            },
+        );
+        assert_eq!(keys(&forced), ["p-1"]);
+        assert_eq!(forced.consumed, input.len() as u64);
+        // force_close closes even without close_trailing.
+        let forced_alone = read(
+            CLAUDE,
+            &input,
+            &ReadOptions {
+                force_close: true,
+                ..opts(true, false)
+            },
+        );
+        assert_eq!(keys(&forced_alone), ["p-1"]);
+
+        // Once the result is in, a plain close works, and the result stays with its call.
+        input.extend(tool_result_line("r-1", "toolu_1"));
+        let answered = read(CLAUDE, &input, &opts(true, true));
+        assert_eq!(keys(&answered), ["p-1"]);
+        assert!(turn_text(&answered.turns[0]).contains("[result] a.txt"));
+
+        // A call answered earlier in the turn does not hold the turn open.
+        input.extend(assistant_line("a-2", "msg_done", "Done."));
+        assert_eq!(read(CLAUDE, &input, &opts(true, true)).turns.len(), 1);
     }
 }

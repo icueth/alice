@@ -262,6 +262,8 @@ pub(crate) struct GroupOptions {
     pub at_file_start: bool,
     /// The last turn is complete (a settled `Stop`-class event, or an idle sweep).
     pub close_trailing: bool,
+    /// Close the trailing turn even with an unanswered `tool_use`.
+    pub force_close: bool,
     /// The input is a whole pass (`MAX_PASS_BYTES`), so more of the file follows.
     pub full_pass: bool,
 }
@@ -284,7 +286,8 @@ pub(crate) struct Grouped {
 ///
 /// - A turn starts at a record for which [`Record::starts_turn`] holds and runs until the next
 ///   one. Records that carry no blocks are dropped.
-/// - Every turn but the last is complete. The last is complete when `close_trailing`.
+/// - Every turn but the last is complete. The last is complete when `close_trailing` and its
+///   last `tool_use` has a result, or when `force_close`.
 /// - Records before the first turn form the head (at the file start: a turn of its own) or the
 ///   tail (at a cursor). They are complete when any turn follows them, or when `close_trailing`.
 /// - At the file start nothing is consumed until something is complete, so a later pass still
@@ -311,7 +314,14 @@ pub(crate) fn group(records: Vec<Located>, opts: GroupOptions) -> Grouped {
     }
 
     let progress = turns.iter().any(|t| t.start > 0);
-    let close = opts.close_trailing || (opts.full_pass && !progress);
+    // A trailing turn whose last `tool_use` has no result yet is still running: its result would
+    // otherwise arrive later as a tail, apart from its call.
+    let awaiting_result = opts.close_trailing
+        && !opts.force_close
+        && last_tool_use_unanswered(turns.last().map_or(&head[..], |t| &t.records[..]));
+    let close = opts.force_close
+        || (opts.close_trailing && !awaiting_result)
+        || (opts.full_pass && !progress);
     let head_complete = close || !turns.is_empty();
     let pending = if close { None } else { turns.pop() };
 
@@ -347,6 +357,22 @@ pub(crate) fn group(records: Vec<Located>, opts: GroupOptions) -> Grouped {
     }
     drop_streaming_duplicates(&mut out.tail);
     out
+}
+
+/// Whether the last `tool_use` of `records` has no `tool_result` after it. A call with no id
+/// cannot be matched and does not count.
+fn last_tool_use_unanswered(records: &[Record]) -> bool {
+    let mut last: Option<&str> = None;
+    for block in records.iter().flat_map(|r| &r.blocks) {
+        match block {
+            Block::ToolUse { id, .. } if !id.is_empty() => last = Some(id),
+            Block::ToolResult { tool_use_id, .. } if last == Some(tool_use_id.as_str()) => {
+                last = None;
+            }
+            _ => {}
+        }
+    }
+    last.is_some()
 }
 
 /// Spec §3.3: within a turn, a block identical to one already seen under the same `message.id`
@@ -476,6 +502,7 @@ mod tests {
             GroupOptions {
                 at_file_start: true,
                 close_trailing: true,
+                force_close: false,
                 full_pass: false,
             },
         );
