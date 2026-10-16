@@ -1523,10 +1523,12 @@ impl Settings {
                     ),
                 ));
             }
+            // The error never quotes the expression: people write known secrets as patterns
+            // (final review A-m3), and this text reaches the log, the API and `alice doctor`.
             match regex::Regex::new(&c.regex) {
                 Err(x) => e.push(err(
                     "privacy.custom_patterns",
-                    format!("pattern {}: {x}", c.name),
+                    format!("pattern {}: {}", c.name, regex_problem(&x)),
                 )),
                 // Such a pattern would "match" between every two characters.
                 Ok(re) if re.is_match("") => e.push(err(
@@ -1539,9 +1541,12 @@ impl Settings {
                 Ok(_) => {}
             }
         }
-        for a in &p.allowlist {
+        for (i, a) in p.allowlist.iter().enumerate() {
             if let Err(x) = regex::Regex::new(a) {
-                e.push(err("privacy.allowlist", format!("{a}: {x}")));
+                e.push(err(
+                    "privacy.allowlist",
+                    format!("entry {i}: {}", regex_problem(&x)),
+                ));
             }
         }
         if p.cloud_denied_projects.iter().any(|s| s.trim().is_empty()) {
@@ -1698,6 +1703,16 @@ pub fn edit_toml(text: &str, key: &str, value: &serde_json::Value) -> Result<Str
 
 // ---------------------------------------------------------------- loosening
 
+/// Why a regular expression of the privacy settings is refused, without quoting it.
+fn regex_problem(e: &regex::Error) -> &'static str {
+    match e {
+        regex::Error::CompiledTooBig(_) => {
+            "the regular expression is too large once compiled (it is not shown); simplify it"
+        }
+        _ => "not a valid regular expression (it is not shown); check its brackets and escapes",
+    }
+}
+
 /// How many polls in a row must see the same loosening before it applies.
 pub const LOOSEN_POLLS: u32 = 3;
 
@@ -1752,10 +1767,33 @@ pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
                 && old.embedding.provider == new.embedding.provider
                 && old.embedding.remote_destination() != new.embedding.remote_destination(),
         ),
+        // The Jev key goes in the header to whatever host is named (final review A-m2).
+        (
+            "judge.jev.endpoint",
+            new.judge.provider == JudgeProvider::Jev
+                && old.judge.jev.endpoint != new.judge.jev.endpoint,
+        ),
         // The admin tools let an agent resolve reviews and merge memories.
         (
             "mcp.admin_tools",
             !old.mcp.admin_tools && new.mcp.admin_tools,
+        ),
+        // Shorter retention deletes for good (final review B-M9: a half-saved `30` reads `3`).
+        (
+            "maintenance.trash_days",
+            new.maintenance.trash_days < old.maintenance.trash_days,
+        ),
+        (
+            "maintenance.events_days",
+            new.maintenance.events_days < old.maintenance.events_days,
+        ),
+        (
+            "storage.raw_retention",
+            match (old.storage.raw_retention, new.storage.raw_retention) {
+                (Retention::Age(a), Retention::Age(b)) => b < a,
+                (Retention::Size(a), Retention::Size(b)) => b < a,
+                (a, b) => a != b && b != Retention::Forever,
+            },
         ),
     ];
     checks
@@ -3259,6 +3297,22 @@ mod tests {
                 "privacy.custom_patterns"
             ]
         );
+        // Final review A-m3: a refused expression is never quoted (it may be a known secret).
+        let file = "[privacy]\ncustom_patterns = [{ name = \"pw\", regex = \"hunter2|db-pass-(\" }]\nallowlist = [\"s3cr3t[\"]\n";
+        let (_, dropped) = resolve_salvaging(Some(file), &env(&[]));
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        for e in &dropped {
+            assert!(
+                !e.message.contains("hunter2") && !e.message.contains("s3cr3t"),
+                "{}",
+                e.message
+            );
+            assert!(
+                e.message.contains("not a valid regular expression"),
+                "{}",
+                e.message
+            );
+        }
     }
 
     #[test]
@@ -3386,6 +3440,18 @@ mod tests {
                 Box::new(|s| s.embedding.provider = EmbeddingProvider::Voyage),
             ),
             ("mcp.admin_tools", Box::new(|s| s.mcp.admin_tools = true)),
+            (
+                "maintenance.trash_days",
+                Box::new(|s| s.maintenance.trash_days = 3),
+            ),
+            (
+                "maintenance.events_days",
+                Box::new(|s| s.maintenance.events_days = 36),
+            ),
+            (
+                "storage.raw_retention",
+                Box::new(|s| s.storage.raw_retention = Retention::Age(Duration::from_secs(86_400))),
+            ),
         ];
         for (key, change) in cases {
             let mut looser = base.clone();
@@ -3400,6 +3466,17 @@ mod tests {
         let mut cloud = base.clone();
         cloud.judge.provider = JudgeProvider::Jev;
         assert!(loosened_protections(&cloud, &base).is_empty());
+        // Final review A-m2: Jev pointed at another host loosens; longer retention does not.
+        let mut moved = cloud.clone();
+        moved.judge.jev.endpoint = "https://elsewhere.example/v1/systemone".into();
+        assert_eq!(
+            loosened_protections(&cloud, &moved),
+            vec!["judge.jev.endpoint".to_string()]
+        );
+        let mut longer = base.clone();
+        longer.maintenance.trash_days = 90;
+        longer.storage.raw_retention = Retention::Forever;
+        assert!(loosened_protections(&base, &longer).is_empty());
         // Turning the admin tools off tightens.
         let mut admin = base.clone();
         admin.mcp.admin_tools = true;
