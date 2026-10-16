@@ -82,8 +82,16 @@ ask_token() {
   else
     (exec </dev/tty) 2>/dev/null ||
       die "there is no terminal to ask for the token on; put it in ~/.config/alice/token (one line, mode 0600) and run the command again"
-    printf 'Alice token for %s (typing is hidden): ' "$url" >/dev/tty
-    if stty -echo </dev/tty 2>/dev/null; then ECHO_OFF=1; fi
+    if stty -echo </dev/tty 2>/dev/null; then
+      ECHO_OFF=1
+    else
+      printf 'Warning: this terminal cannot hide what you type; the token will show on the screen.\n' >/dev/tty
+    fi
+    if [ -n "$ECHO_OFF" ]; then
+      printf 'Alice token for %s (typing is hidden): ' "$url" >/dev/tty
+    else
+      printf 'Alice token for %s: ' "$url" >/dev/tty
+    fi
     IFS= read -r token </dev/tty || :
     if [ -n "$ECHO_OFF" ]; then
       stty echo </dev/tty 2>/dev/null
@@ -141,7 +149,9 @@ plugin_json() {
 }
 
 hooks_json() {
-  hj_cmd='sh \"$HOME/.config/alice/alice-capture.sh\" hook claude-code'
+  # `|| true`: a missing script (after uninstall, or deleted by hand) must never fail a hook;
+  # dash exits 2 on a file it cannot open, and exit 2 from Stop blocks the agent.
+  hj_cmd='sh \"$HOME/.config/alice/alice-capture.sh\" hook claude-code || true'
   printf '{\n'
   printf '  "description": "Alice capture: each event hands the new transcript bytes to a background upload; SessionStart prints the briefing.",\n'
   printf '  "hooks": {\n'
@@ -286,7 +296,7 @@ main() {
     plugin_state="type the two /plugin commands above"
     say ""
     say "Finish in Claude Code by typing these two commands (if the plugin is already installed, nothing more is needed):"
-    say "  /plugin marketplace add $MP"
+    say "  /plugin marketplace add \"$MP\""
     say "  /plugin install alice-capture@alice-local"
   fi
 

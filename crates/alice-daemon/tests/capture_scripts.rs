@@ -31,8 +31,9 @@ use support::caddy::Server;
 
 const SETUP_SH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/capture/setup.sh");
 const HOOK_SH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/capture/hook.sh");
-/// The command every hook of the plugin runs, as `hooks.json` must hold it.
-const HOOK_COMMAND: &str = r#"sh "$HOME/.config/alice/alice-capture.sh" hook claude-code"#;
+/// The command every hook of the plugin runs, as `hooks.json` must hold it. `|| true`: a
+/// missing script must never fail the hook (exit 2 from Stop blocks the agent).
+const HOOK_COMMAND: &str = r#"sh "$HOME/.config/alice/alice-capture.sh" hook claude-code || true"#;
 const FIVE_EVENTS: [&str; 5] = [
     "SessionStart",
     "Stop",
@@ -534,6 +535,22 @@ fn uploads(s: &Server, session: &str) -> Vec<HashMap<String, String>> {
         .collect()
 }
 
+/// `(offset, body length)` of every transcript upload for `session`, oldest first.
+fn upload_sizes(s: &Server, session: &str) -> Vec<(u64, usize)> {
+    s.seen("ann")
+        .into_iter()
+        .filter(|(m, pq, _, _)| m == "POST" && pq.starts_with("/api/v1/capture/transcript?"))
+        .filter_map(|(_, pq, _, body)| {
+            let q: HashMap<String, String> =
+                url::form_urlencoded::parse(pq.split_once('?').unwrap().1.as_bytes())
+                    .into_owned()
+                    .collect();
+            (q.get("session").map(String::as_str) == Some(session))
+                .then(|| (q["offset"].parse().unwrap(), body.len()))
+        })
+        .collect()
+}
+
 /// How many briefing requests the emulator received.
 fn briefing_requests(s: &Server) -> usize {
     s.seen("ann")
@@ -836,7 +853,7 @@ async fn setup_prints_the_plugin_commands_when_claude_fails() {
     assert!(r.ok(), "{r}");
     assert!(
         r.stdout.contains(&format!(
-            "/plugin marketplace add {}",
+            "/plugin marketplace add \"{}\"",
             env.marketplace().display()
         )),
         "{r}"
@@ -1275,12 +1292,205 @@ async fn an_oversized_line_is_skipped() {
     env.wait_idle();
     assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
     assert_eq!(turns_of(&t.home, &uri("huge")), 1);
-    let offsets: Vec<String> = uploads(&s, "huge")
-        .into_iter()
-        .map(|q| q["offset"].clone())
-        .collect();
-    assert_eq!(offsets, vec!["0".to_string(), big.len().to_string()]);
+    // 2 MiB, then 4, then 8 (the full body the server calls oversized), then past the line.
+    let sizes = upload_sizes(&s, "huge");
+    assert_eq!(
+        sizes,
+        vec![
+            (0, 2 << 20),
+            (0, 4 << 20),
+            (0, 8 << 20),
+            (big.len() as u64, sess.tr.bytes.len() - big.len()),
+        ]
+    );
     assert!(env.log().contains("oversized"), "{}", env.log());
+}
+
+/// The per-call cap starts at 2 MiB, so a slow link sends a backlog in several bounded calls.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backlog_over_two_mebibytes_drains_in_several_calls() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let mut sess = Session::new(&env, "backlog", &env.root.join("work"));
+    let filler = "a long answer line ".repeat(1000);
+    let mut i = 0;
+    while sess.tr.len() < 5 << 20 {
+        i += 1;
+        let id = sess.id.clone();
+        sess.tr
+            .prompt(
+                &format!("{id}-p{i}"),
+                &format!("Question {i} of the backlog."),
+            )
+            .reply(
+                &format!("{id}-a{i}"),
+                &format!("backlogmarker{i}: {filler}"),
+            );
+    }
+    sess.flush();
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+    let sizes = upload_sizes(&s, "backlog");
+    assert!(sizes.len() >= 3, "{sizes:?}");
+    assert!(sizes.iter().all(|(_, n)| *n <= 2 << 20), "{sizes:?}");
+    // Every capped body says the transcript goes on; the last one, which reaches the end, not.
+    let ups = uploads(&s, "backlog");
+    let (last, capped) = ups.split_last().unwrap();
+    assert!(
+        capped
+            .iter()
+            .all(|q| q.get("more").map(String::as_str) == Some("1"))
+    );
+    assert!(!last.contains_key("more"));
+    assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
+    assert_eq!(turns_of(&t.home, &uri("backlog")), i as i64);
+    assert_eq!(chunks_holding(&t.home, &format!("backlogmarker{i}:")), 1);
+}
+
+/// One turn longer than the cap: the answer takes nothing from a capped body, so the same offset
+/// is sent again with twice the cap, and the turn is captured whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_over_two_mebibytes_escalates_the_cap() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let mut sess = Session::new(&env, "longturn", &env.root.join("work"));
+    sess.tr
+        .prompt("longturn-p1", "Write the long report.")
+        .reply(
+            "longturn-a1",
+            &format!("longturnmarker {}", "word ".repeat(600_000)),
+        );
+    sess.flush();
+    assert!(sess.tr.len() > (2 << 20) + 4096 && sess.tr.len() < 4 << 20);
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+    let sizes = upload_sizes(&s, "longturn");
+    assert_eq!(
+        sizes,
+        vec![(0, 2 << 20), (0, sess.tr.len() as usize)],
+        "2 MiB took nothing; twice the cap holds the whole turn"
+    );
+    assert_eq!(turns_of(&t.home, &uri("longturn")), 1);
+    assert!(chunks_holding(&t.home, "longturnmarker") >= 1);
+    assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
+}
+
+/// The lock of a transcript: a stale one (dead holder, old `at`) is taken over; a live holder
+/// is waited for; a worker refreshes `at` on every pass, and one that lost its lock stops and
+/// never removes the lock it no longer owns.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_lock_is_taken_over_and_a_foreign_lock_is_never_removed() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let state = env.alice().join("state");
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let me = std::process::id().to_string();
+    let plant = |key: &str, at: u64, pid: &str| {
+        let lock = state.join(format!("{key}.lock"));
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(lock.join("at"), format!("{at}\n")).unwrap();
+        std::fs::write(lock.join("pid"), format!("{pid}\n")).unwrap();
+        lock
+    };
+    let cwd = env.root.join("work");
+
+    // Stale: taken over, and nothing of it is left behind.
+    let mut a = Session::new(&env, "lock-stale", &cwd);
+    a.turn(1, "behind a stale lock");
+    let lock_a = plant(&a.key(), now() - 500, "999999");
+    env.hook(&a.input("Stop"));
+    env.wait_idle();
+    assert_eq!(turns_of(&t.home, &uri("lock-stale")), 1);
+    assert!(!lock_a.exists());
+    let leftovers: Vec<String> = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".lock"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // Live: waited for, and the worker goes on once it is released.
+    let mut b = Session::new(&env, "lock-live", &cwd);
+    b.turn(1, "behind a live lock");
+    let lock_b = plant(&b.key(), now(), &me);
+    env.hook(&b.input("Stop"));
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        uploads(&s, "lock-live").is_empty(),
+        "nothing while it is held"
+    );
+    assert_eq!(
+        read(&lock_b.join("pid")).trim(),
+        me,
+        "never broken while fresh"
+    );
+    std::fs::remove_dir_all(&lock_b).unwrap();
+    env.wait_idle();
+    assert_eq!(turns_of(&t.home, &uri("lock-live")), 1);
+
+    // Mid-run: `at` is refreshed every pass; taken over during pass 2, the worker stops at
+    // pass 3 and leaves the new holder's lock alone.
+    let mut c = Session::new(&env, "lock-mid", &cwd);
+    let filler = "a long answer line ".repeat(1000);
+    let mut i = 0;
+    while c.tr.len() < 5 << 20 {
+        i += 1;
+        let id = c.id.clone();
+        c.tr.prompt(&format!("{id}-p{i}"), "Next.")
+            .reply(&format!("{id}-a{i}"), &filler);
+    }
+    c.flush();
+    s.delay_requests(1500);
+    env.hook(&c.input("Stop"));
+    let lock_c = state.join(format!("{}.lock", c.key()));
+    let wait_for = |n: usize| {
+        let start = Instant::now();
+        while uploads(&s, "lock-mid").len() < n {
+            assert!(start.elapsed() < Duration::from_secs(30), "no upload {n}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait_for(1);
+    let at1: u64 = read(&lock_c.join("at")).trim().parse().unwrap();
+    let owner = read(&lock_c.join("pid"));
+    assert_ne!(owner.trim(), me);
+    wait_for(2);
+    let at2: u64 = read(&lock_c.join("at")).trim().parse().unwrap();
+    assert!(
+        at2 > at1,
+        "`at` is refreshed at each pass: {at1} then {at2}"
+    );
+    std::fs::remove_dir_all(&lock_c).unwrap();
+    plant(&c.key(), now(), &me);
+    env.wait_idle();
+    s.delay_requests(0);
+    assert_eq!(
+        uploads(&s, "lock-mid").len(),
+        2,
+        "it stopped once it lost the lock"
+    );
+    assert_eq!(
+        read(&lock_c.join("pid")).trim(),
+        me,
+        "the new holder's lock is left alone"
+    );
+    assert!(env.offset(&c.key()).unwrap() < c.tr.len());
+    std::fs::remove_dir_all(&lock_c).unwrap();
+    env.hook(&c.input("Stop"));
+    env.wait_idle();
+    assert_eq!(env.offset(&c.key()), Some(c.tr.len()));
+    assert_eq!(turns_of(&t.home, &uri("lock-mid")), i as i64);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1295,7 +1505,10 @@ async fn a_refused_token_pauses_capture_for_an_hour() {
     );
     let mut sess = Session::new(&env, "refused", &env.root.join("work"));
     sess.turn(1, "sent with a stale token");
-    env.hook(&sess.input("Stop"));
+    // The briefing's 401 carries a JSON body: only a 200 text/plain answer is printed.
+    let r = env.hook(&sess.input("SessionStart"));
+    assert!(r.stdout.is_empty(), "{r}");
+    assert_eq!(briefing_requests(&s), 1);
     env.wait_idle();
     assert!(
         env.log()
@@ -1451,6 +1664,49 @@ async fn no_capture_in_alice_toml_skips_and_cloud_denied_sends_no_distill() {
             .iter()
             .all(|q| !q.contains_key("no_distill"))
     );
+}
+
+/// Turns written while `no_capture = true` are never uploaded: the skip moves the local offset
+/// to the end of the last complete line, so capture resumes after the line is removed with only
+/// the new turns (the server records a forward gap).
+#[tokio::test(flavor = "multi_thread")]
+async fn no_capture_moves_the_offset_past_the_excluded_turns() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let repo = env.root.join("code/private-for-now");
+    env.git_repo(&repo);
+    std::fs::write(repo.join(".alice.toml"), "no_capture = true\n").unwrap();
+    let mut sess = Session::new(&env, "excluded", &repo);
+    sess.turn(1, "excludedone");
+    sess.turn(2, "excludedtwo");
+    // A trailing line still being written is not passed.
+    let complete = sess.tr.len();
+    sess.tr
+        .bytes
+        .extend(br#"{"type":"user","uuid":"excluded-p3","mess"#);
+    sess.flush();
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+    assert!(uploads(&s, "excluded").is_empty());
+    assert_eq!(env.offset(&sess.key()), Some(complete));
+
+    // The line is removed; the partial line is finished and a new turn written.
+    std::fs::write(repo.join(".alice.toml"), "# capture again\n").unwrap();
+    sess.tr.bytes.truncate(complete as usize);
+    sess.written = sess.tr.bytes.len();
+    std::fs::write(&sess.path, &sess.tr.bytes).unwrap();
+    sess.turn(3, "includedthree");
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+    let ups = uploads(&s, "excluded");
+    assert_eq!(ups.len(), 1, "{ups:?}");
+    assert_eq!(ups[0]["offset"], complete.to_string());
+    assert_eq!(turns_of(&t.home, &uri("excluded")), 1);
+    assert_eq!(chunks_holding(&t.home, "excludedone"), 0);
+    assert_eq!(chunks_holding(&t.home, "excludedtwo"), 0);
+    assert_eq!(chunks_holding(&t.home, "includedthree"), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1617,6 +1873,79 @@ async fn status_reports_the_setup() {
     assert!(r.stdout.contains("token accepted"), "{r}");
     assert!(r.stdout.contains("briefing: on"), "{r}");
     assert!(!r.stdout.contains(&s.tenant("ann").token));
+    // Stopped and held transcripts are listed, with how to reset one.
+    let state = env.alice().join("state");
+    std::fs::write(
+        state.join("claude-code-s-stopped.offset"),
+        "10 /tmp/x.jsonl\nsession s-stopped\ncwd \nstopped 99\n",
+    )
+    .unwrap();
+    std::fs::write(
+        state.join("claude-code-s-held.offset"),
+        "0 /tmp/y.jsonl\nsession s-held\ncwd \nhold 42\n",
+    )
+    .unwrap();
+    let r = env.capture_sh(&["status"], &[]);
+    assert!(r.stdout.contains("stopped: claude-code-s-stopped"), "{r}");
+    assert!(r.stdout.contains("waiting: claude-code-s-held"), "{r}");
+    assert!(
+        r.stdout
+            .contains("~/.config/alice/state/claude-code-s-stopped.offset"),
+        "{r}"
+    );
+}
+
+/// After uninstall (or a failed plugin removal, or files deleted by hand) the plugin's hooks may
+/// still run in open sessions. A missing script must never fail a hook: dash exits 2 on a file
+/// it cannot open, and exit 2 from Stop blocks the agent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_hook_script_never_blocks_a_session() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    let hooks: serde_json::Value = serde_json::from_str(&read(
+        &env.marketplace().join("alice-capture/hooks/hooks.json"),
+    ))
+    .unwrap();
+    let command = hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = env.capture_sh(&["uninstall"], &[("ALICE_SETUP_ASSUME_YES", "1")]);
+    assert!(r.ok(), "{r}");
+    assert!(
+        r.stdout.contains("restart any open Claude Code sessions"),
+        "{r}"
+    );
+    assert!(!env.script().exists());
+    let dash = ["/bin/dash", "/usr/bin/dash"]
+        .into_iter()
+        .find(|p| Path::new(p).exists());
+    let mut shells = vec!["/bin/sh"];
+    shells.extend(dash);
+    let mut sess = Session::new(&env, "after-uninstall", &env.root.join("work"));
+    sess.turn(1, "an open session");
+    for inner in &shells {
+        // The `sh` the command names, found on PATH.
+        let link = env.bin.join("sh");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(inner, &link).unwrap();
+        for outer in &shells {
+            let mut c = env.command(outer);
+            c.arg("-c").arg(&command);
+            let r = env.run(
+                c,
+                &serde_json::to_vec(&sess.input("Stop")).unwrap(),
+                Duration::from_secs(30),
+            );
+            assert_eq!(
+                r.status.code(),
+                Some(0),
+                "{outer} -c with sh = {inner}: {r}"
+            );
+            assert!(r.stdout.is_empty(), "{r}");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1673,6 +2002,12 @@ fn the_scripts_parse_as_posix_sh_and_never_trace() {
     let dash = ["/bin/dash", "/usr/bin/dash"]
         .into_iter()
         .find(|p| Path::new(p).exists());
+    let hook = read(Path::new(HOOK_SH));
+    assert!(
+        hook.contains("--speed-limit 2048 --speed-time 20 --max-time 300"),
+        "uploads give up on a stalled link, not on a slow one"
+    );
+    assert!(hook.contains("--connect-timeout 1 --max-time 2"));
     for path in [SETUP_SH, HOOK_SH] {
         let text = read(Path::new(path));
         let mut shells = vec!["/bin/sh"];

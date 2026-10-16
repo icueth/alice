@@ -17,7 +17,10 @@
 #   token, url         read only, never written here (the team's setup document or setup.sh)
 #   capture.conf       briefing=on|off
 #   state/<agent>-<session>[-<agent_id>].offset
-#                      "<offset> <path>", then session, subagent, cwd, and hold/stopped lines
+#                      "<offset> <path>", then session, subagent, cwd, and hold/stopped lines;
+#                      its mtime is set back to 1971 while work is left, so a sweep sees the
+#                      transcript as newer
+#   state/<key>.lock/  pid and at (refreshed every pass) of the worker sending that transcript
 #   capture.log        at most 256 KB; never the token, never transcript text
 #   paused-until       when the server refused the token: no upload before this time
 #
@@ -39,6 +42,7 @@ PAUSED="$DIR/paused-until"
 TOKEN_FILE="$DIR/token"
 URL_FILE="$DIR/url"
 LOG_MAX=262144
+BODY_START=2097152
 BODY_MAX=8388608
 PASSES=16
 SWEEP_MAX=5
@@ -54,11 +58,7 @@ tmpd=
 lockdir=
 
 cleanup() {
-  if [ -n "$lockdir" ]; then
-    rm -f "$lockdir/at"
-    rmdir "$lockdir" 2>/dev/null
-    lockdir=
-  fi
+  unlock
   if [ -n "$tmpd" ]; then
     rm -rf "$tmpd"
     tmpd=
@@ -289,10 +289,11 @@ brief() {
   load_credentials || return 0
   project_hint "${2:-}"
   make_tmp || return 0
-  if send_headers | curl -q -K - -fsS --connect-timeout 1 --max-time 2 \
-    -o "$tmpd/briefing" "$url/api/v1/capture/briefing$b_query" >/dev/null 2>&1; then
-    cat "$tmpd/briefing" 2>/dev/null
-  fi
+  b_got=$(send_headers | curl -q -K - -sS --connect-timeout 1 --max-time 2 -o "$tmpd/briefing" \
+    -w '%{http_code} %{content_type}' "$url/api/v1/capture/briefing$b_query" 2>/dev/null) || b_got=
+  case $b_got in
+    '200 text/plain'*) cat "$tmpd/briefing" 2>/dev/null ;;
+  esac
   return 0
 }
 
@@ -335,39 +336,84 @@ write_state() {
   } >"$1.tmp.$$" 2>/dev/null && mv -f "$1.tmp.$$" "$1"
 }
 
-# Takes the lock of state key $1 (a mkdir lock, broken when older than 120 s), waiting up to
-# $2 seconds for a live holder.
+# Whether lock directory $1 is stale: its holder last showed life ($1/at, refreshed every
+# pass) more than 120 s ago, or it never wrote `at` while we tried $2 times.
+lock_stale() {
+  ls_at=$(cat "$1/at" 2>/dev/null)
+  case $ls_at in
+    '' | *[!0-9]*) [ "$2" -gt 5 ] ;;
+    *) [ $(($(date +%s) - ls_at)) -gt 120 ] ;;
+  esac
+}
+
+# Takes the lock of state key $1: a directory holding the owner's pid and `at`. A stale lock is
+# moved aside with one atomic mv (only one breaker wins) and then removed. Waits up to $2
+# seconds for a live holder.
 lock() {
   lk_dir="$STATE/$1.lock"
   lk_tries=0
   while ! mkdir "$lk_dir" 2>/dev/null; do
     lk_tries=$((lk_tries + 1))
-    lk_at=$(cat "$lk_dir/at" 2>/dev/null)
-    lk_stale=
-    case $lk_at in
-      '' | *[!0-9]*) if [ "$lk_tries" -gt 5 ]; then lk_stale=1; fi ;;
-      *) if [ $(($(date +%s) - lk_at)) -gt 120 ]; then lk_stale=1; fi ;;
-    esac
-    if [ -n "$lk_stale" ] && [ "$lk_tries" -le 60 ]; then
-      rm -f "$lk_dir/at"
-      rmdir "$lk_dir" 2>/dev/null
-      log "broke a stale lock of $1"
+    if [ "$lk_tries" -le 60 ] && lock_stale "$lk_dir" "$lk_tries"; then
+      rm -rf "$lk_dir.stale.$$"
+      if mv "$lk_dir" "$lk_dir.stale.$$" 2>/dev/null; then
+        rm -rf "$lk_dir.stale.$$"
+        log "broke a stale lock of $1"
+      fi
       continue
     fi
     [ "$lk_tries" -le "$2" ] || return 1
     sleep 1
   done
+  printf '%s\n' "$$" >"$lk_dir/pid"
   date +%s >"$lk_dir/at"
   lockdir=$lk_dir
   return 0
 }
 
+# Whether this process still holds the lock it took (another worker may have broken it).
+own_lock() {
+  [ -n "$lockdir" ] && [ "$(cat "$lockdir/pid" 2>/dev/null)" = "$$" ]
+}
+
+# Shows life at the start of every pass; 1 when the lock is no longer ours.
+refresh_lock() {
+  own_lock || return 1
+  date +%s >"$lockdir/at" 2>/dev/null
+  return 0
+}
+
+# Removes the lock only when this process owns it.
 unlock() {
-  if [ -n "$lockdir" ]; then
-    rm -f "$lockdir/at"
+  if own_lock; then
+    rm -f "$lockdir/at" "$lockdir/pid"
     rmdir "$lockdir" 2>/dev/null
-    lockdir=
   fi
+  lockdir=
+}
+
+# The byte offset just past the last complete line of file $1 (0 when it has none).
+complete_end() {
+  ce_size=$(fsize "$1")
+  if [ "$ce_size" -eq 0 ]; then
+    printf 0
+    return 0
+  fi
+  ce_last=$({ tail -c 1 "$1" | od -An -tx1; } 2>/dev/null | tr -d ' \n')
+  if [ "$ce_last" = 0a ]; then
+    printf '%s' "$ce_size"
+    return 0
+  fi
+  ce_tail=$({ tail -n 1 "$1" | wc -c; } 2>/dev/null)
+  ce_tail=${ce_tail##* }
+  case $ce_tail in '' | *[!0-9]*) ce_tail=$ce_size ;; esac
+  printf '%s' $((ce_size - ce_tail))
+}
+
+# Sets state file $1's mtime back to 1971: work is left, so any transcript looks newer to a
+# sweep. A successful write gives it the current time again.
+mark_pending() {
+  touch -t 197101010000 "$1" 2>/dev/null
 }
 
 # POSTs $tmpd/body to the transcript route with query $1; prints the HTTP status (000 when
@@ -378,11 +424,17 @@ post() {
     send_headers
     printf 'header = "Content-Type: application/x-ndjson"\n'
     printf 'header = "Expect:"\n'
-  } | curl -q -K - -sS --connect-timeout 5 --max-time 30 -o "$tmpd/answer" -w '%{http_code}' \
+  } | curl -q -K - -sS --connect-timeout 5 --speed-limit 2048 --speed-time 20 --max-time 300 \
+    -o "$tmpd/answer" -w '%{http_code}' \
     --data-binary "@$tmpd/body" "$url/api/v1/capture/transcript?$1" 2>/dev/null
 }
 
-# Sends what transcript $5 gained since its stored offset, at most $PASSES uploads of 8 MiB.
+# Sends what transcript $5 gained since its stored offset, in at most $PASSES uploads. Each
+# upload holds at most 2 MiB, and a capped body says more=1 so the server leaves its last turn
+# open (a cut never splits a turn). When an answer takes nothing from a capped body (one turn or
+# one line longer than the cap), the same offset is sent again with twice the cap, up to 8 MiB,
+# where the server closes a pass that makes no progress and calls a line without an end
+# oversized.
 #   capture_one <key> <event> <session> <agent_id or ""> <path> <cwd> <lock wait seconds>
 capture_one() {
   co_key=$1
@@ -409,7 +461,14 @@ capture_one() {
     grep -E -q '^[[:space:]]*no_capture[[:space:]]*=[[:space:]]*true' "$co_toml" 2>/dev/null
     case $? in
       0)
-        log "session $3: .alice.toml says no_capture = true; event skipped"
+        # Never sent, now or later: the offset moves past every complete line (the server
+        # records a forward gap when capture resumes).
+        if [ -f "$s_path" ]; then
+          co_end=$(complete_end "$s_path")
+          if [ "$co_end" -gt "$s_off" ]; then s_off=$co_end s_hold=; fi
+          write_state "$co_st"
+        fi
+        log "session $3: .alice.toml says no_capture = true; event skipped, and its turns so far are never sent"
         unlock
         return 0
         ;;
@@ -424,13 +483,11 @@ capture_one() {
       co_flags="&no_distill=1"
     fi
   fi
-  if [ ! -f "$s_path" ]; then
-    [ -f "$co_st" ] || write_state "$co_st"
-    unlock
-    return 0
+  if [ ! -f "$co_st" ]; then
+    write_state "$co_st"
+    mark_pending "$co_st"
   fi
-  [ -f "$co_st" ] || write_state "$co_st"
-  if ! make_tmp; then
+  if [ ! -f "$s_path" ] || ! make_tmp; then
     unlock
     return 0
   fi
@@ -438,8 +495,16 @@ capture_one() {
   co_bypass=
   if [ "$co_event" = session-end ]; then co_bypass=1; fi
   co_pass=0
+  co_cap=$BODY_START
+  co_pending=
+  co_lost=
   while [ "$co_pass" -lt "$PASSES" ]; do
     co_pass=$((co_pass + 1))
+    if ! refresh_lock; then
+      log "session $3: another worker took over this transcript's lock; stopping here"
+      co_lost=1
+      break
+    fi
     co_size=$(fsize "$s_path")
     if [ "$s_off" -gt "$co_size" ]; then
       log "session $3: the transcript is shorter than the stored offset; asking the server where to resume"
@@ -450,10 +515,12 @@ capture_one() {
       break
     fi
     co_bypass=
-    { tail -c +$((s_off + 1)) "$s_path" | head -c "$BODY_MAX" >"$tmpd/body"; } 2>/dev/null
+    { tail -c +$((s_off + 1)) "$s_path" | head -c "$co_cap" >"$tmpd/body"; } 2>/dev/null
     co_n=$(fsize "$tmpd/body")
     [ "$co_n" -gt 0 ] || break
     co_q="agent=claude-code&session=$3&offset=$s_off&event=$co_event$co_flags"
+    # A capped body: the transcript goes on, so the server keeps the body's last turn open.
+    if [ "$co_n" -ge "$co_cap" ] && [ $((s_off + co_n)) -lt "$co_size" ]; then co_q="$co_q&more=1"; fi
     if [ -n "$4" ]; then co_q="$co_q&subagent=$4"; fi
     co_code=$(post "$co_q")
     co_rc=$?
@@ -480,7 +547,7 @@ capture_one() {
             break
           fi
           log "session $3: skipped an oversized line of $co_len bytes at offset $s_off"
-          s_off=$((s_off + co_len)) s_hold=
+          s_off=$((s_off + co_len)) s_hold= co_cap=$BODY_START
           write_state "$co_st"
           continue
         fi
@@ -490,6 +557,13 @@ capture_one() {
             break
             ;;
         esac
+        if [ "$co_next" -eq "$s_off" ] && [ "$co_n" -ge "$co_cap" ] && [ "$co_cap" -lt "$BODY_MAX" ]; then
+          # A capped body held no whole turn (or no line end): twice the cap, same offset.
+          co_cap=$((co_cap * 2))
+          if [ "$co_cap" -gt "$BODY_MAX" ]; then co_cap=$BODY_MAX; fi
+          log "session $3: nothing complete in $co_n bytes from offset $s_off; sending up to $co_cap bytes"
+          continue
+        fi
         if [ "$co_next" -eq "$s_off" ]; then
           # Nothing taken in (rules pending, a subagent too short, no complete turn): not sent
           # again until the transcript grows past this size.
@@ -502,7 +576,7 @@ capture_one() {
           break
         fi
         log "session $3: sent $co_n bytes from offset $s_off ($co_event); the server's cursor is at $co_next"
-        s_off=$co_next s_hold=
+        s_off=$co_next s_hold= co_cap=$BODY_START
         write_state "$co_st"
         ;;
       409)
@@ -524,6 +598,7 @@ capture_one() {
       401)
         log "the token was refused; run the setup command again (capture is paused for an hour)"
         { printf '%s\n' $(($(date +%s) + 3600)) >"$PAUSED.$$"; } 2>/dev/null && mv -f "$PAUSED.$$" "$PAUSED"
+        co_pending=1
         break
         ;;
       400 | 413)
@@ -534,15 +609,27 @@ capture_one() {
         ;;
       000 | '')
         log "session $3: could not reach the server (curl exit $co_rc); the next event retries"
+        co_pending=1
         break
         ;;
       *)
         log "session $3: the server answered HTTP $co_code; the next event retries"
+        co_pending=1
         break
         ;;
     esac
   done
+  if [ -n "$co_lost" ]; then
+    # The state and the lock are the new holder's now.
+    lockdir=
+    return 0
+  fi
+  if [ -z "$co_pending" ] && [ -z "$s_stopped" ] && [ "$s_off" -lt "$(fsize "$s_path")" ] &&
+    { [ -z "$s_hold" ] || [ "$(fsize "$s_path")" -gt "$s_hold" ]; }; then
+    co_pending=1 # out of passes with bytes left
+  fi
   write_state "$co_st"
+  if [ -n "$co_pending" ]; then mark_pending "$co_st"; fi
   unlock
   return 0
 }
@@ -565,6 +652,8 @@ sweep() {
       if [ -n "$(find "$sw_st" -mtime +7 2>/dev/null)" ]; then rm -f "$sw_st"; fi
       continue
     fi
+    # Untouched since its state was written (and no work left, see mark_pending): skip.
+    [ "$s_path" -nt "$sw_st" ] || continue
     sw_size=$(fsize "$s_path")
     [ "$sw_size" -gt "$s_off" ] || continue
     if [ -n "$s_hold" ] && [ "$sw_size" -le "$s_hold" ]; then continue; fi
@@ -646,10 +735,21 @@ status_main() {
     printf 'briefing: off (~/.config/alice/capture.conf)\n'
   fi
   st_n=0
+  st_lines=
   for st_f in "$STATE"/*.offset; do
-    [ -f "$st_f" ] && st_n=$((st_n + 1))
+    [ -f "$st_f" ] || continue
+    st_n=$((st_n + 1))
+    st_key=${st_f##*/}
+    st_key=${st_key%.offset}
+    read_state "$st_f" || continue
+    if [ -n "$s_stopped" ]; then
+      st_lines="$st_lines$(printf "stopped: %s (the server's cursor is past the file's end); to start it again, delete ~/.config/alice/state/%s.offset" "$st_key" "$st_key")$NL"
+    elif [ -n "$s_hold" ]; then
+      st_lines="$st_lines$(printf 'waiting: %s (the server took nothing at %s bytes; sent again when it grows); to reset it, delete ~/.config/alice/state/%s.offset' "$st_key" "$s_hold" "$st_key")$NL"
+    fi
   done
   printf 'transcripts followed: %s\n' "$st_n"
+  printf '%s' "$st_lines"
   if paused; then
     printf 'paused until: %s (the server refused the token)\n' "$(head -n 1 "$PAUSED")"
   fi
@@ -697,6 +797,7 @@ uninstall_main() {
     printf '  /plugin marketplace remove alice-local\n'
   fi
   rm -rf "${DIR:?}/claude-marketplace"
+  printf 'Now restart any open Claude Code sessions, so none still runs the removed hooks.\n'
   if confirm "Delete the capture files (the hook script, state/, capture.conf, capture.log, paused-until)? The token and url files stay. [y/N] "; then
     rm -rf "${DIR:?}/state"
     rm -f "$DIR/alice-capture.sh" "$CONF" "$LOG" "$PAUSED"
