@@ -12,8 +12,10 @@ use alice_core::import::palace::detect_backend;
 
 /// Entries (files and folders) an upload may hold. A palace is a handful of database files.
 pub const MAX_ENTRIES: u64 = 50_000;
-/// The unpacked size may be this many times the archive's size (and never over the cap).
-pub const UNPACK_RATIO: u64 = 3;
+/// The unpacked size may be this many times the archive's size. A palace's sqlite files pack 3 to
+/// 6 times (more when they are mostly text), so 12 leaves room; what truly bounds the unpacked
+/// total is `import.max_upload_bytes`, which it never exceeds.
+pub const UNPACK_RATIO: u64 = 12;
 /// Name every upload's archive and unpacked folder begin with, inside `import-inbox/`.
 pub const PREFIX: &str = "upload-";
 const KG_FILE: &str = "knowledge_graph.sqlite3";
@@ -118,7 +120,7 @@ fn kind_name(t: tar::EntryType) -> &'static str {
 ///
 /// Regular files and folders only; any link, device, absolute path or `..` refuses the whole
 /// archive (the caller removes `dest`). The unpacked bytes, counted as they are written, stay
-/// within `min(3 x archive_len, cap)`, and the entries within [`MAX_ENTRIES`].
+/// within `min(UNPACK_RATIO x archive_len, cap)`, and the entries within [`MAX_ENTRIES`].
 pub fn unpack(
     archive: &Path,
     dest: &Path,

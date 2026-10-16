@@ -222,7 +222,7 @@ fn gz(raw: &[u8]) -> Vec<u8> {
 }
 
 /// Bytes that do not compress, like the vectors of a real palace (a fixture palace is plain
-/// text, which packs far better than the 3x the unpack limit allows).
+/// text, which packs far better than the 12x the unpack limit allows when it repeats).
 fn noise(n: usize) -> Vec<u8> {
     let mut x = 0x9E37_79B9_7F4A_7C15u64;
     (0..n)
@@ -572,13 +572,84 @@ async fn the_disk_guard_is_checked_again_while_streaming() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unpacked_size_over_three_times_the_archive_is_refused() {
+async fn an_unpacked_size_over_twelve_times_the_archive_is_refused() {
     let s = Srv::tenant().await;
-    // 20 MB of zeros packs to a few KB: far over 3x.
+    // 20 MB of zeros packs to a few KB: far over 12x.
     let body = gz(&raw_tar(&[E::File("palace/zeros", vec![0u8; 20_000_000])]));
-    assert!(body.len() * 3 < 20_000_000);
+    assert!(body.len() * 12 < 20_000_000);
     assert_eq!(s.upload(body).await.status(), 202);
     assert_failed_clean(&s, "too large").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_heavy_palace_that_packs_five_to_ten_times_is_not_refused_for_its_size() {
+    let s = Srv::tenant().await;
+    // One random byte in every ten, the rest zeros: packs well over 3 times, under 12.
+    let raw: Vec<u8> = noise(300_000)
+        .into_iter()
+        .flat_map(|b| [b, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .collect();
+    let body = gz(&raw_tar(&[E::File("palace/sparse", raw.clone())]));
+    let ratio = raw.len() / body.len();
+    assert!((5..12).contains(&ratio), "fixture packs {ratio} times");
+    assert_eq!(s.upload(body).await.status(), 202);
+    let st = s.finished().await;
+    // It fails (there is no palace in it), but not for its size.
+    assert_eq!(st["state"], "failed", "{st}");
+    assert!(!st["error"].as_str().unwrap().contains("too large"), "{st}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_sh_is_public_static_text_in_tenant_mode_only() {
+    let s = Srv::tenant().await;
+    // No token, a good Host.
+    let r = s
+        .http
+        .get(s.url("/api/v1/import/upload.sh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.headers()["content-type"],
+        "text/x-shellscript; charset=utf-8"
+    );
+    let body = r.text().await.unwrap();
+    assert!(
+        body.starts_with("#!/bin/sh"),
+        "{}",
+        &body[..40.min(body.len())]
+    );
+    // No address inside: the only URL-looking words are the documented placeholder.
+    let stripped = body.replace("<tenant-base-url>", "");
+    for (i, _) in stripped.match_indices("http") {
+        let rest = &stripped[i..];
+        assert!(
+            !(rest.starts_with("http://") || rest.starts_with("https://"))
+                || rest.starts_with("https://alice.example"),
+            "an address in the script: {}",
+            &rest[..rest.len().min(40)]
+        );
+    }
+    assert!(!body.contains(&s.token));
+    // A foreign Host is still refused by the guard.
+    let r = s
+        .http
+        .get(s.url("/api/v1/import/upload.sh"))
+        .header("host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error(), "{}", r.status());
+    // A local daemon answers 404 like the rest.
+    let l = Srv::start(Opts::default()).await;
+    let r = l
+        .http
+        .get(l.url("/api/v1/import/upload.sh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
 }
 
 // -------------------------------------------------------------------------- unsafe archives
@@ -750,4 +821,67 @@ async fn a_start_removes_stale_uploads_and_only_those() {
         "the admin's folder stays"
     );
     assert_eq!(s.status().await["state"], "idle");
+}
+
+// ------------------------------------------------------------------------- the real script
+
+/// The shipped script, run by the real sh, curl and tar against the real route: it must finish
+/// with exit 0 and leave the palace imported and its temporary folder gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_sh_runs_end_to_end_against_the_route() {
+    let have = |t: &str| {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {t} >/dev/null")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !have("curl") || !have("tar") || !have("gzip") {
+        eprintln!("skipped: curl, tar or gzip is missing");
+        return;
+    }
+    let s = Srv::tenant().await;
+    let src = tempfile::tempdir().unwrap();
+    let palace = small_palace(src.path());
+    let home = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = home.path().join(".config/alice");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let tok = cfg.join("token");
+    std::fs::write(&tok, format!("{}\n", s.token)).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tok, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/upload.sh");
+    let (base, palace_arg, home_p, tmp_p) = (
+        format!("http://127.0.0.1:{}", s.port),
+        palace.clone(),
+        home.path().to_path_buf(),
+        tmp.path().to_path_buf(),
+    );
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("sh")
+            .arg(script)
+            .arg(base)
+            .arg("--palace")
+            .arg(palace_arg)
+            .env("HOME", home_p)
+            .env("TMPDIR", tmp_p)
+            .env("ALICE_UPLOAD_POLL_SECS", "1")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    println!("{stdout}\n{stderr}");
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("Your MemPalace was imported"), "{stdout}");
+    assert!(!stdout.contains(&s.token) && !stderr.contains(&s.token));
+    assert_eq!(s.status().await["state"], "done");
+    assert!(s.memory_count() > 0);
+    assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+    assert!(s.leftovers().is_empty());
 }

@@ -603,6 +603,25 @@ async fn compat_call(
     }
 }
 
+/// The upload script a person runs on their own machine: static text compiled into the binary,
+/// with no secret and no address in it. Only a server tenant serves it.
+const UPLOAD_SCRIPT: &str = include_str!("../assets/upload.sh");
+
+async fn upload_script(State(st): State<AppState>) -> Response {
+    if !st.svc.is_tenant() {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "not found: the upload script is only served by a server tenant".into(),
+        );
+    }
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        UPLOAD_SCRIPT,
+    )
+        .into_response()
+}
+
 async fn import_status(State(st): State<AppState>) -> Json<alice_core::import::ImportStatus> {
     let mut status = st.svc.import_status();
     // How much of the imported text still waits for a vector (0 when it cannot be read now).
@@ -913,7 +932,7 @@ async fn end_on_rotation(State(st): State<AppState>, req: Request, next: Next) -
     Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
-/// Build the router: the public ping, and everything else (the JSON API and the MCP service
+/// Build the router: the public ping and upload script, and everything else (the JSON API and the MCP service
 /// at `/mcp`) behind the token, Host and Origin guard.
 pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: CancellationToken) -> Router {
     let token: SharedToken = Arc::new(parking_lot::RwLock::new(Arc::from(token)));
@@ -927,6 +946,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
     };
     let public = Router::new()
         .route("/api/v1/ping", get(ping))
+        .route("/api/v1/import/upload.sh", get(upload_script))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(g.clone(), host_guard));
     let private = Router::new()
