@@ -652,6 +652,10 @@ pub struct Health {
     /// Why the link to the team store is off or failing (server mode); never the token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_warning: Option<String>,
+    /// Server mode: this daemon is a tenant of a shared server, kept running by the server's
+    /// systemd unit (`alice@<name>`), not by `alice service install`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tenant: bool,
 }
 
 fn is_false(b: &bool) -> bool {

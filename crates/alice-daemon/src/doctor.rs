@@ -254,7 +254,15 @@ pub(crate) fn local_checks_with(
         }
         None => out.push(not_running(home)),
     }
-    if let Some(root) = dirs::home_dir() {
+    if daemon.is_some_and(|h| h.tenant) {
+        // A server tenant's daemon is the server's own unit: a user unit would only compete with it.
+        out.push(check(
+            "service",
+            CheckStatus::Ok,
+            "run by systemd on this server (alice@<name>; the admin's alice-server manages it)",
+            None,
+        ));
+    } else if let Some(root) = dirs::home_dir() {
         out.extend(service_check(home, &root));
     }
     out
@@ -730,6 +738,33 @@ mod tests {
     }
 
     /// The service check says whose unit it found.
+    /// On a server tenant the daemon is the server's systemd unit: doctor says so and never
+    /// suggests `alice service install` there.
+    #[test]
+    fn a_tenant_daemon_is_run_by_the_server_s_unit() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().join("home"));
+        home.ensure_dirs().unwrap();
+        let mut h = health();
+        h.tenant = true;
+        let checks = local_checks(&home, Some(&h));
+        let s = find(&checks, "service");
+        assert_eq!(s.status, CheckStatus::Ok);
+        assert!(
+            s.detail.starts_with("run by systemd on this server"),
+            "{s:?}"
+        );
+        assert!(s.fix.is_none(), "{s:?}");
+        assert!(
+            !checks
+                .iter()
+                .any(|c| c.line().contains("alice service install")),
+            "{checks:?}"
+        );
+        // The flag is only sent when set: a local daemon's health reads as before.
+        assert!(!serde_json::to_string(&health()).unwrap().contains("tenant"));
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_service_check_tells_a_unit_for_this_home_from_one_for_another() {

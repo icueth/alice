@@ -4540,6 +4540,7 @@ impl Service {
             .or_else(|| self.team.as_ref().and_then(|t| t.problem()));
         let model_loaded = self.embedder().is_loaded();
         let memory_bytes = crate::doctor::self_memory_bytes();
+        let tenant = self.opts.tenant;
         // Read the backup directory, the spool and the database: off the runtime's threads.
         let scheduler = self.scheduler.clone();
         let backup_dir = backup::backup_dir(&self.home, &self.settings().backup);
@@ -4587,6 +4588,7 @@ impl Service {
                 settings_errors,
                 config_degraded,
                 team_warning,
+                tenant,
             })
         })
         .await

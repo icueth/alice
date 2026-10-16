@@ -419,7 +419,10 @@ async fn the_team_store_is_unrouted_and_hidden_from_the_settings() {
         let t = s.tenant(name);
         let link = t.svc.team().expect("the link is built");
         link.ensure_verified().await.unwrap();
-        assert!(t.svc.health().await.unwrap().team_warning.is_none());
+        let h = t.svc.health().await.unwrap();
+        assert!(h.team_warning.is_none());
+        // `alice doctor` reads this to say systemd runs the daemon (no `alice service install`).
+        assert!(h.tenant);
         assert_eq!(t.svc.tenant_name(), Some(name));
         assert!(!format!("{link:?}").contains(&team.token));
     }
