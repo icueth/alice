@@ -275,6 +275,9 @@ pub struct NewState<'a> {
     pub transcript_path: Option<&'a str>,
     pub file_key: Option<&'a str>,
     pub no_distill: bool,
+    /// Where a new state's distillation starts: `idle`, or `skipped_backfill` for a source a
+    /// backfill registers (spec §4.4). An existing state keeps its own.
+    pub distill_state: DistillState,
 }
 
 /// Create the state of `source_id` if it has none. An existing one keeps its values, except
@@ -284,8 +287,9 @@ pub fn ensure_state(conn: &Connection, source_id: &str, s: &NewState<'_>) -> Res
     let created = conn
         .prepare_cached(
             "INSERT OR IGNORE INTO capture_state
-                (source_id, agent, session_id, parent_source_id, transcript_path, file_key, no_distill, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (source_id, agent, session_id, parent_source_id, transcript_path, file_key, no_distill,
+                 distill_state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?
         .execute(params![
             source_id,
@@ -295,6 +299,7 @@ pub fn ensure_state(conn: &Connection, source_id: &str, s: &NewState<'_>) -> Res
             s.transcript_path,
             s.file_key,
             s.no_distill,
+            s.distill_state.as_str(),
             now_rfc3339()
         ])?;
     if created == 0 && (s.parent_source_id.is_some() || s.no_distill) {
@@ -663,6 +668,33 @@ mod tests {
         let st = by_source(&c, "S1").unwrap().unwrap();
         assert_eq!(st.parent_source_id.as_deref(), Some("P1"));
         assert!(st.no_distill, "no_distill never turns off");
+
+        // Task 18b: a backfill's first state is `skipped_backfill`; an existing one keeps its own.
+        let backfilled = NewState {
+            agent: "claude-code",
+            session_id: "s1",
+            distill_state: DistillState::SkippedBackfill,
+            ..Default::default()
+        };
+        ensure_state(&c, "S1", &backfilled).unwrap();
+        assert_eq!(
+            by_source(&c, "S1").unwrap().unwrap().distill_state,
+            DistillState::Idle
+        );
+        source(&c, "S2", "claude-code:session:s2", Some("s2"), None);
+        ensure_state(
+            &c,
+            "S2",
+            &NewState {
+                session_id: "s2",
+                ..backfilled
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            by_source(&c, "S2").unwrap().unwrap().distill_state,
+            DistillState::SkippedBackfill
+        );
     }
 
     #[test]

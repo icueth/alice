@@ -1260,9 +1260,12 @@ mod local {
         }
 
         /// Coalesces `newer`, a later notification of the same source: its event wins unless
-        /// this one ends the session, and closes, ends and waits only grow.
+        /// this one ends the session or `newer` is a backfill's (a hook's event marks a live
+        /// session, which a backfill must not register as backfilled), and closes, ends and
+        /// waits only grow.
         fn merge(&mut self, newer: Job) {
-            if !self.end || newer.end {
+            let backfill_over_hook = newer.event == "backfill" && self.event != "backfill";
+            if (!self.end || newer.end) && !backfill_over_hook {
                 self.event = newer.event;
             }
             self.close = self.close.max(newer.close);
@@ -1788,6 +1791,9 @@ mod local {
                     init: CaptureInit {
                         transcript_path: Some(path.to_string_lossy().into_owned()),
                         file_key: Some(key),
+                        // Spec §4.4: a main source a backfill registers is not distilled unless
+                        // asked. A subagent's stands for its session, whose source decides.
+                        backfill: job.event == "backfill" && job.subagent.is_none(),
                         ..Default::default()
                     },
                     project: project.clone(),

@@ -2153,6 +2153,115 @@ async fn backfilling_old_files_keeps_a_subagents_turns_after_the_main_import() {
     );
 }
 
+/// The distillation state of the capture source `uri`.
+fn distill_state_of(svc: &Service, uri: &str) -> String {
+    db(svc)
+        .query_row(
+            "SELECT c.distill_state FROM capture_state c JOIN sources s ON s.id = c.source_id
+             WHERE s.uri = ?1",
+            [uri],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// Task 18b (spec §4.4, ruling R-P1): a main source a backfill registers starts
+/// `skipped_backfill`, so a first backfill of months of sessions is not distilled unless asked
+/// (`alice capture distill`). A source its hooks registered first keeps its state, a subagent's
+/// source stands for its session (its main source decides), and a backfill notice that meets a
+/// hook's pending notice of a new session leaves it a live session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backfill_registers_its_main_sources_as_skipped_backfill() {
+    let d = tempfile::tempdir().unwrap();
+    // A settle delay long enough that a backfill notice sent right after a hook's always meets it
+    // in the queue.
+    let svc = start_with(
+        &d.path().join("home"),
+        ServiceOptions {
+            capture_settle: Duration::from_millis(800),
+            ..local_options()
+        },
+    );
+    let dir = d.path().join("projects").join("-w-bf");
+    std::fs::create_dir_all(dir.join("bf1").join("subagents")).unwrap();
+    let write = |name: &str, t: &Transcript| {
+        let p = dir.join(name);
+        std::fs::write(&p, &t.bytes).unwrap();
+        p
+    };
+    let read_to_end = |uri: String, len: u64| {
+        let svc = svc.clone();
+        move || state_of(&svc, &uri).is_some_and(|s| s.byte_offset == len)
+    };
+
+    // bf1 is only ever backfilled, with its subagent.
+    let mut t1 = Transcript::default();
+    t1.turn("bf1", 1, "backfilled words");
+    let p1 = write("bf1.jsonl", &t1);
+    let a1 = subagent_transcript("y1", "bf1", 1, "quarry");
+    let pa1 = write("bf1/subagents/agent-y1.jsonl", &a1);
+    // Old files: a backfill closes their turns by their age, as a sweep does.
+    age(&p1, Duration::from_secs(3 * 24 * 3600));
+    age(&pa1, Duration::from_secs(3 * 24 * 3600));
+    svc.capture_notify(backfill_notify("bf1", &p1, None))
+        .await
+        .unwrap();
+    svc.capture_notify(backfill_notify("bf1", &p1, Some(("y1", &pa1))))
+        .await
+        .unwrap();
+    let sub_uri = "claude-code:session:bf1:agent:y1";
+    until("bf1 read", read_to_end(uri("bf1"), t1.len())).await;
+    until("its subagent read", read_to_end(sub_uri.into(), a1.len())).await;
+    assert_eq!(chunks_holding(&svc, "backfilled words is settled"), 1);
+    assert_eq!(distill_state_of(&svc, &uri("bf1")), "skipped_backfill");
+    assert_eq!(distill_state_of(&svc, sub_uri), "idle");
+
+    // bf2 was captured by its hook first: a backfill of its grown file leaves its state.
+    let mut t2 = Transcript::default();
+    t2.turn("bf2", 1, "hooked words");
+    let p2 = write("bf2.jsonl", &t2);
+    svc.capture_notify(notify("bf2", &p2, "stop"))
+        .await
+        .unwrap();
+    until(
+        "bf2 captured by its hook",
+        read_to_end(uri("bf2"), t2.len()),
+    )
+    .await;
+    t2.turn("bf2", 2, "grown words");
+    write("bf2.jsonl", &t2);
+    age(&p2, Duration::from_secs(10 * 60));
+    svc.capture_notify(notify("bf2", &p2, "backfill"))
+        .await
+        .unwrap();
+    until("bf2 backfilled", read_to_end(uri("bf2"), t2.len())).await;
+    assert_eq!(chunks_holding(&svc, "grown words is settled"), 1);
+    assert_eq!(distill_state_of(&svc, &uri("bf2")), "idle");
+
+    // bf3 is new, and its hook's stop is still settling when a backfill of its file arrives:
+    // the hook's event stays the job's, so the session is registered as a live one.
+    let mut t3 = Transcript::default();
+    t3.turn("bf3", 1, "settling words");
+    let p3 = write("bf3.jsonl", &t3);
+    svc.capture_notify(notify("bf3", &p3, "stop"))
+        .await
+        .unwrap();
+    svc.capture_notify(notify("bf3", &p3, "backfill"))
+        .await
+        .unwrap();
+    until("bf3 captured", read_to_end(uri("bf3"), t3.len())).await;
+    assert_eq!(distill_state_of(&svc, &uri("bf3")), "idle");
+    let last_event: String = db(&svc)
+        .query_row(
+            "SELECT c.last_event FROM capture_state c JOIN sources s ON s.id = c.source_id
+             WHERE s.uri = ?1",
+            [uri("bf3")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(last_event, "stop");
+}
+
 // ---- Task 6b: local capture (the daemon reads the transcript after a notify) ----
 
 /// Local timings short enough for tests: the settle delay and the sweep period. The quiet and

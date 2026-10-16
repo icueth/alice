@@ -173,6 +173,9 @@ pub struct CaptureInit {
     pub file_key: Option<String>,
     /// The tenant client's flag. It only ever turns on.
     pub no_distill: bool,
+    /// A backfill registers the source (`alice capture backfill`, spec §4.4): a new source's
+    /// distillation starts `skipped_backfill`. An existing source keeps its state.
+    pub backfill: bool,
 }
 
 /// A change to a capture source's state (`WriteOp::CaptureStateUpdate`).
@@ -1761,6 +1764,11 @@ fn capture_slice(conn: &Connection, slice: Box<CaptureSlice>, st: &mut State) ->
             transcript_path: s.init.transcript_path.as_deref(),
             file_key: s.init.file_key.as_deref(),
             no_distill: s.init.no_distill,
+            distill_state: if s.init.backfill {
+                DistillState::SkippedBackfill
+            } else {
+                DistillState::Idle
+            },
         },
     )?;
     let (agent, stored_next): (String, i64) = conn.query_row(
@@ -6672,6 +6680,7 @@ mod tests {
                 transcript_path: Some(format!("/tmp/t/{session}.jsonl")),
                 file_key: None,
                 no_distill: false,
+                backfill: false,
             },
             chunks: ords
                 .map(|i| ChunkInput {
