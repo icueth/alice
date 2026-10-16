@@ -1426,12 +1426,22 @@ async fn a_tenant_session_silent_for_a_day_is_ended_and_distilled() {
     d.shutdown();
 }
 
-/// Fix round 1 (the Task 6b ruling): locally the capture sweep owns the stale end, with its
-/// final pass that captures the trailing turn, so the distill worker never marks a local source
-/// ended. The quiet session is still distilled, as an open one (no handoff offered).
+/// Fix round 1 (the Task 6b ruling), re-pointed by the merge fix round: locally the capture
+/// sweep owns the stale end. A source it cannot read (an upload on a local daemon has no
+/// transcript path) is ended by the sweep once nothing was captured for a day, without a final
+/// pass. Distillation is off until then, so the order is fixed. Once it is on, the ended session
+/// is distilled as a closed one and offers its handoff. (The distill worker's half of the
+/// ruling, never ending a local source, is `only_the_sweep_ends_a_stale_local_session`.)
 #[tokio::test(flavor = "multi_thread")]
-async fn a_local_session_silent_for_a_day_is_not_marked_ended() {
-    let mut d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+async fn a_local_upload_silent_for_a_day_is_ended_by_the_sweep() {
+    const DISTILL_OFF: &str = "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"off\"\n";
+    let mut d = Daemon::start(
+        Opts {
+            config: DISTILL_OFF,
+            ..Opts::jev()
+        },
+        DistillScript::new(ANSWERS),
+    );
     let mut t = one_decision("sl1");
     t.prompt("sl1-p2", "Where do we stand with the cache work right now?")
         .reply("sl1-a2", HANDOFF);
@@ -1441,14 +1451,29 @@ async fn a_local_session_silent_for_a_day_is_not_marked_ended() {
         hours_ago(30)
     ))
     .await;
-    until("the quiet session is distilled", || {
+    until("the sweep ends the silent upload", || {
+        d.state(&uri("sl1")).ended
+    })
+    .await;
+    let st = d.state(&uri("sl1"));
+    assert_eq!((st.state.as_str(), st.distill_ord), ("idle", 0));
+    assert_eq!(st.byte_offset, t.len() as i64, "no pass moved the cursor");
+    assert_eq!(d.script.distill_calls(), 0);
+
+    d.write_config(JEV, |s| {
+        s.distill.provider == alice_core::settings::DistillProvider::Jev
+    })
+    .await;
+    until("the ended session is distilled", || {
         d.state(&uri("sl1")).state == "done"
     })
     .await;
-    settle().await;
-    assert!(!d.state(&uri("sl1")).ended, "not marked ended locally");
     let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
-    assert_eq!(kinds, ["decision"], "an open session offers no handoff");
+    assert_eq!(
+        kinds,
+        ["decision", "handoff"],
+        "a closed session offers its handoff"
+    );
     d.shutdown();
 }
 
@@ -2421,12 +2446,20 @@ async fn only_the_sweep_ends_a_stale_local_session() {
     })
     .await;
     settle().await;
-    let st = d.state(&uri("sw1"));
+    let open = d.state(&uri("sw1"));
     assert!(
-        !st.ended,
+        !open.ended,
         "the distill worker leaves a local session to the sweep"
     );
-    assert_eq!(st.byte_offset, open_at);
+    assert_eq!(open.byte_offset, open_at);
+    let runs = |d: &Daemon| {
+        d.svc
+            .distill_runs()
+            .iter()
+            .filter(|r| r.uri == uri("sw1"))
+            .count()
+    };
+    let open_runs = runs(&d);
 
     age(&path, Duration::from_secs(25 * 3600));
     until("the sweep ends the stale session", || {
@@ -2444,6 +2477,17 @@ async fn only_the_sweep_ends_a_stale_local_session() {
         1,
         "the final pass closed the trailing turn"
     );
+    // Merge fix round 1, minor 1: the final pass ends the source, so it marks the session due at
+    // once (the quiet trigger would wait 15 minutes after that capture).
+    assert!(
+        st.next_ord > open.next_ord,
+        "the trailing turn is new: {st:?}"
+    );
+    until("the ended session's last turn is distilled", || {
+        let s = d.state(&uri("sw1"));
+        runs(&d) > open_runs && s.state == "done" && s.distill_ord == st.next_ord
+    })
+    .await;
     d.shutdown();
 }
 

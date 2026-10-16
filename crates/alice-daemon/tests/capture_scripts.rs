@@ -1707,6 +1707,65 @@ async fn session_end_sends_once_past_a_hold() {
     assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
 }
 
+/// Merge fix round 1: a `SessionEnd` after a `Stop` that sent the whole file still reaches the
+/// server, as one empty upload at the offset. The source ends and is marked due for distillation.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_end_after_a_stop_that_sent_everything_still_ends_the_session() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    std::fs::write(t.home.config_file(), "[distill]\nprovider = \"jev\"\n").unwrap();
+    let waited = Instant::now();
+    while t.svc.settings().distill.provider != alice_core::settings::DistillProvider::Jev {
+        assert!(
+            waited.elapsed() < Duration::from_secs(30),
+            "the tenant never read distill.provider = jev"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let env = Env::new();
+    env.install(&s);
+    let mut sess = Session::new(&env, "endsall", &env.root.join("work"));
+    sess.turn(1, "everything was sent");
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+    assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
+    let row = |home: &AliceHome| -> (bool, String) {
+        db(home)
+            .query_row(
+                "SELECT c.ended, c.distill_state FROM capture_state c
+                 JOIN sources s ON s.id = c.source_id WHERE s.uri = ?1",
+                [uri("endsall")],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(row(&t.home), (false, "idle".to_string()));
+
+    env.hook(&sess.input("SessionEnd"));
+    env.wait_idle();
+    let ups = uploads(&s, "endsall");
+    assert_eq!(ups.len(), 2, "{ups:?}");
+    assert_eq!(ups[1]["event"], "session-end");
+    assert_eq!(ups[1]["offset"], sess.tr.len().to_string());
+    assert_eq!(
+        upload_sizes(&s, "endsall")[1],
+        (sess.tr.len(), 0),
+        "an empty body at the offset"
+    );
+    let (ended, state) = row(&t.home);
+    assert!(ended, "the session end reached the server");
+    // No Jev judge is set, so the distill worker may already have moved it on to wait for one.
+    assert!(matches!(state.as_str(), "due" | "waiting_judge"), "{state}");
+    assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
+    assert_eq!(turns_of(&t.home, &uri("endsall")), 1);
+
+    // A second SessionEnd (nothing new, already ended) sends the empty end again, harmlessly.
+    env.hook(&sess.input("SessionEnd"));
+    env.wait_idle();
+    assert!(row(&t.home).0);
+    assert_eq!(turns_of(&t.home, &uri("endsall")), 1);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_line_is_skipped() {
     let s = Server::start(&["ann"]).await;

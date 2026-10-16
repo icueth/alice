@@ -512,7 +512,8 @@ pub struct ServiceOptions {
     pub vector_reader_pool: usize,
     /// Maps a working directory to its project (runs git). Tests replace it.
     pub detect_project: fn(&Path) -> ProjectRef,
-    /// Settings to use; `None` loads `config.toml` and `ALICE_*` from the home.
+    /// Settings to use; `None` loads `config.toml` and `ALICE_*` from the home. A handle's
+    /// tenant rules must match [`ServiceOptions::tenant`], or the start is refused.
     pub settings: Option<Arc<SettingsHandle>>,
     /// The `ALICE_*` variables the settings see when `settings` is `None`; `None`: the
     /// process's. The default is an empty list, so a developer's shell cannot change a test;
@@ -1252,6 +1253,16 @@ impl Service {
                 None if opts.tenant => SettingsHandle::load_tenant(&home),
                 None => SettingsHandle::load(&home),
             });
+        // One answer to "is this a server tenant": the local capture worker (and its stale end)
+        // runs when `opts.tenant` is off, the distill worker's stale end when the settings'
+        // tenant rules are on. A handle built with the other flag would run both or neither.
+        if settings.is_tenant() != opts.tenant {
+            return Err(AliceError::Other(format!(
+                "the settings handle's tenant rules are {} but ServiceOptions.tenant is {}; build the handle with the same tenant flag",
+                if settings.is_tenant() { "on" } else { "off" },
+                opts.tenant
+            )));
+        }
         let started_with = settings.get();
         let secrets = opts
             .secrets
@@ -7455,6 +7466,38 @@ mod tests {
         assert!(v.config_degraded);
         assert!(v.errors.iter().any(|e| e.key == "config.toml"));
         s.shutdown();
+    }
+
+    /// Merge fix round 1: the capture worker follows `ServiceOptions::tenant` and the distill
+    /// worker's stale end follows the settings' tenant rules, so a settings handle whose tenant
+    /// rules differ from the flag would run both stale ends or neither. The start refuses it.
+    #[test]
+    fn a_settings_handle_with_other_tenant_rules_refuses_the_start() {
+        for tenant in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let home = AliceHome::new(d.path().to_path_buf());
+            home.ensure_dirs().unwrap();
+            let handle = SettingsHandle::load_with(&home, Vec::new(), !tenant);
+            let started = Service::start(
+                home,
+                &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+                ServiceOptions {
+                    settings: Some(handle),
+                    tenant,
+                    ..quiet()
+                },
+            );
+            match started {
+                Ok(s) => {
+                    s.shutdown();
+                    panic!("tenant = {tenant}: a handle with the other tenant rules was accepted");
+                }
+                Err(e) => assert!(
+                    e.to_string().contains("tenant rules"),
+                    "tenant = {tenant}: {e}"
+                ),
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

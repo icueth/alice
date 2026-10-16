@@ -938,7 +938,8 @@ impl CaptureCtl {
         *self.on_due.lock() = Some(hook);
     }
 
-    /// Spec §6.2: a pass for a session end or a compaction makes its (main) source due for
+    /// Spec §6.2: a pass for a session end or a compaction, or one that ends the source (the
+    /// sweep's final pass of a stale session, spec §10), makes its (main) source due for
     /// distillation, when distillation is on and the source holds chunks not distilled yet (its
     /// own, or a subagent's that is not skipped for its own project's rules). A source due
     /// already keeps its next try, and a backfilled one is distilled only when asked (`alice
@@ -951,7 +952,7 @@ impl CaptureCtl {
     /// session for its end (and offer a handoff from the middle of it).
     fn mark_due(&self, input: &PassInput, report: &PassReport) {
         if input.subagent.is_some()
-            || !matches!(input.event.as_str(), "session-end" | "pre-compact")
+            || !(input.end || matches!(input.event.as_str(), "session-end" | "pre-compact"))
             || !(input.close_trailing || input.force_close)
             || self.settings.get().distill.provider == DistillProvider::Off
         {
@@ -1241,9 +1242,10 @@ mod local {
         }
 
         /// Coalesces `newer`, a later notification of the same source: its event wins unless
-        /// this one ends the session, and closes, ends and waits only grow.
+        /// this one's ranks higher (`session-end`, then `pre-compact`, which mark the session due
+        /// for distillation), and closes, ends and waits only grow.
         fn merge(&mut self, newer: Job) {
-            if !self.end || newer.end {
+            if event_rank(&newer.event) >= event_rank(&self.event) {
                 self.event = newer.event;
             }
             self.close = self.close.max(newer.close);
@@ -1256,6 +1258,15 @@ mod local {
             if newer.cwd.is_some() {
                 self.cwd = newer.cwd;
             }
+        }
+    }
+
+    /// How much a coalesced job keeps an event: a session end, then a compaction, over the rest.
+    fn event_rank(event: &str) -> u8 {
+        match event {
+            "session-end" => 2,
+            "pre-compact" => 1,
+            _ => 0,
         }
     }
 
@@ -1576,17 +1587,17 @@ mod local {
 
         /// Queues a pass of each open source whose transcript changed since its last pass, or
         /// whose idle time asks for a stronger close (a stale one always: its final pass ends
-        /// it). A source with no transcript path (an upload's) or whose file is gone is left
-        /// to its age (Task 12).
+        /// it). A source it cannot read has no final pass: one with no transcript path (an
+        /// upload on a local daemon), or whose file is gone or is no longer a regular file, is
+        /// ended once nothing was captured for `stale` (spec §9.4). Locally the sweep owns the
+        /// stale end; the distill worker's runs on server tenants only.
         fn sweep(&self, seen: &mut HashMap<String, Seen>) -> Result<()> {
             let open = self.readers.with(store::open_sources)?;
             let uris: HashSet<&str> = open.iter().map(|s| s.uri.as_str()).collect();
             seen.retain(|uri, _| uris.contains(uri.as_str()));
             let now = SystemTime::now();
+            let mut unreadable = Vec::new();
             for s in &open {
-                let Some(path) = s.transcript_path.as_deref() else {
-                    continue;
-                };
                 let Some(agent) = AgentKind::parse(&s.agent) else {
                     continue;
                 };
@@ -1597,12 +1608,23 @@ mod local {
                 {
                     continue;
                 }
-                let Ok(meta) = std::fs::metadata(path) else {
+                let Some(path) = s.transcript_path.as_deref() else {
+                    unreadable.push(s);
                     continue;
                 };
-                if !meta.is_file() {
-                    continue;
-                }
+                let meta = match std::fs::metadata(path) {
+                    Ok(m) if m.is_file() => m,
+                    Ok(_) => {
+                        unreadable.push(s);
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        unreadable.push(s);
+                        continue;
+                    }
+                    // Unreadable for another reason (permissions): tried again next sweep.
+                    Err(_) => continue,
+                };
                 let (len, mtime) = (meta.len(), meta.modified().ok());
                 let close = self.close_by_age(mtime, now);
                 let last = seen.get(&s.uri);
@@ -1623,6 +1645,45 @@ mod local {
                         not_before: Instant::now(),
                     });
                 }
+            }
+            if !unreadable.is_empty() {
+                self.end_unreadable(&unreadable, open.len(), seen)?;
+            }
+            Ok(())
+        }
+
+        /// Ends the sources in `unreadable` that captured nothing for `stale` (one that never
+        /// captured: registered before then), out of `open` open sources. There is nothing to
+        /// read, so there is no final pass; the cursor stays where it is.
+        fn end_unreadable(
+            &self,
+            unreadable: &[&store::CaptureState],
+            open: usize,
+            seen: &mut HashMap<String, Seen>,
+        ) -> Result<()> {
+            let stale = chrono::Duration::from_std(self.cfg.stale).unwrap_or(chrono::Duration::MAX);
+            let Some(before) = chrono::Utc::now().checked_sub_signed(stale) else {
+                return Ok(());
+            };
+            let before = before.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let stale: HashSet<String> = self
+                .readers
+                .with(|c| store::stale_open(c, &before, open.max(1)))?
+                .into_iter()
+                .collect();
+            for s in unreadable.iter().filter(|s| stale.contains(&s.source_id)) {
+                if self.stopping() {
+                    break;
+                }
+                self.writer.submit_blocking(WriteOp::CaptureStateUpdate {
+                    source_id: s.source_id.clone(),
+                    change: CaptureChange::Ended,
+                })?;
+                seen.remove(&s.uri);
+                tracing::info!(
+                    uri = s.uri,
+                    "a captured session with no transcript to read had no capture for a day; it is ended"
+                );
             }
             Ok(())
         }
@@ -2021,6 +2082,29 @@ mod local {
             assert!(job("backfill").by_age && job("sweep").by_age);
             let end = job("session-end");
             assert!(end.not_before > Instant::now(), "session-end settles too");
+        }
+
+        /// Merge fix round 1: events rank session-end > pre-compact > the others, so a compaction
+        /// coalesced with a later `stop` keeps its event, and with it its due-mark.
+        #[test]
+        fn a_compaction_coalesced_with_a_later_stop_keeps_its_event() {
+            let mut j = job("pre-compact");
+            j.merge(job("stop"));
+            j.merge(job("sweep"));
+            assert_eq!(
+                (j.event.as_str(), j.close),
+                ("pre-compact", Close::Trailing)
+            );
+            j.merge(job("session-end"));
+            assert_eq!(j.event, "session-end");
+            j.merge(job("pre-compact"));
+            assert_eq!(
+                j.event, "session-end",
+                "a later compaction never hides the end"
+            );
+            let mut k = job("stop");
+            k.merge(job("sweep"));
+            assert_eq!(k.event, "sweep", "between equals the newer still wins");
         }
 
         #[test]

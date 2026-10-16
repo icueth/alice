@@ -568,6 +568,7 @@ capture_one() {
   co_lost=
   while [ "$co_pass" -lt "$PASSES" ]; do
     co_pass=$((co_pass + 1))
+    co_empty=
     if ! refresh_lock; then
       co_lost=1
       break
@@ -577,14 +578,26 @@ capture_one() {
       log "session $3: the transcript is shorter than the stored offset; asking the server where to resume"
       s_off=0 s_hold=
     fi
-    [ "$s_off" -lt "$co_size" ] || break
+    if [ "$s_off" -ge "$co_size" ]; then
+      # SessionEnd with nothing new (a Stop sent the rest): one empty upload at the offset, so
+      # the server still ends the session and marks it for distillation.
+      if [ "$co_event" = session-end ] && [ "$co_pass" -eq 1 ] && [ "$s_off" -gt 0 ]; then
+        co_empty=1
+      else
+        break
+      fi
+    fi
     if [ -n "$s_hold" ] && [ "$co_size" -le "$s_hold" ] && [ -z "$co_bypass" ]; then
       break
     fi
     co_bypass=
-    { tail -c +$((s_off + 1)) "$s_path" | head -c "$co_cap" >"$tmpd/body"; } 2>/dev/null
+    if [ -n "$co_empty" ]; then
+      { : >"$tmpd/body"; } 2>/dev/null
+    else
+      { tail -c +$((s_off + 1)) "$s_path" | head -c "$co_cap" >"$tmpd/body"; } 2>/dev/null
+    fi
     co_n=$(fsize "$tmpd/body")
-    [ "$co_n" -gt 0 ] || break
+    [ "$co_n" -gt 0 ] || [ -n "$co_empty" ] || break
     co_q="agent=$(key_agent "$co_key")&session=$3&offset=$s_off&event=$co_event$co_flags"
     # A capped body (as long as the cap): the transcript may go on, so the server keeps the
     # body's last turn open.
@@ -595,6 +608,10 @@ capture_one() {
     co_next=$(sed -n 's/.*"next_offset"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$tmpd/answer" 2>/dev/null | head -n 1)
     case $co_code in
       200)
+        if [ -n "$co_empty" ]; then
+          log "session $3: nothing new at the session end; the server ended the session at offset $s_off"
+          break
+        fi
         if grep -q '"oversized_line"[[:space:]]*:[[:space:]]*true' "$tmpd/answer" 2>/dev/null; then
           # One line of more than 8 MiB: measure it with awk and skip it (the server counts a gap).
           if ! command -v awk >/dev/null 2>&1; then
