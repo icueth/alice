@@ -253,6 +253,9 @@ events_days = 365                   # history older than this is pruned
 [backup]
 daily = 7
 weekly = 4
+
+[import]
+max_upload_bytes = 4294967296       # server tenant: the largest palace archive a person may upload
 ```
 
 Environment variables:

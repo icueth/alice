@@ -51,6 +51,8 @@ toml = "1.1.8"
 toml_edit = "0.25.17"
 keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
 strsim = "0.11.1"
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4.46", default-features = false }
 
 [profile.release]
 lto = "thin"

@@ -499,7 +499,7 @@ fn user_home() -> Option<std::path::PathBuf> {
 const IMPORT_POLL: Duration = Duration::from_millis(500);
 
 async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) -> Result<()> {
-    use alice_core::import::{ImportRequest, ImportState};
+    use alice_core::import::ImportRequest;
     use std::io::IsTerminal;
     // Everything the CLI can refuse by itself happens before a daemon is started.
     let cwd = std::env::current_dir().context("cannot read the working folder")?;
@@ -544,7 +544,7 @@ async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) 
         }
     };
     loop {
-        if status.state != ImportState::Running {
+        if !status.state.is_active() {
             break;
         }
         if tty {
@@ -603,7 +603,10 @@ fn import_verdict(status: &alice_core::import::ImportStatus) -> Result<()> {
         ImportState::Idle => {
             bail!("no import is running and none has run since the daemon started")
         }
-        ImportState::Running => bail!("the import is still running"),
+        ImportState::Running
+        | ImportState::Receiving
+        | ImportState::Unpacking
+        | ImportState::Importing => bail!("the import is still running"),
     }
 }
 
@@ -614,7 +617,10 @@ async fn import_status(home: &AliceHome, json: bool) -> Result<()> {
         (Some(r), ImportState::Done) if !json => out(&r.render_text()),
         _ => print(json, &s, || match s.state {
             ImportState::Idle => "No import has run since the daemon started.\n".into(),
-            ImportState::Running => format!(
+            ImportState::Running
+            | ImportState::Receiving
+            | ImportState::Unpacking
+            | ImportState::Importing => format!(
                 "Import running: {}, {} of {} drawers.\n",
                 s.phase, s.done, s.total
             ),
