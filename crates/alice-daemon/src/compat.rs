@@ -73,6 +73,10 @@ pub const SUPPORTED: [&str; 15] = [
 pub const OFF_MESSAGE: &str =
     "MemPalace compatibility is off; turn it on with `alice config set compat.mempalace true`";
 
+/// What `alice mcp` answers for a `mempalace_*` call when no daemon answers: the setting cannot
+/// be read, so it is not said to be off.
+pub const UNREACHABLE_MESSAGE: &str = "Alice's daemon is not reachable, so the MemPalace compatibility tools cannot answer; run `alice status`";
+
 pub fn is_compat_name(name: &str) -> bool {
     name.starts_with("mempalace_")
 }

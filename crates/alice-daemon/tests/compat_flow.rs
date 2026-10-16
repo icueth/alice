@@ -2273,9 +2273,21 @@ async fn the_stdio_backend_follows_both_switches_through_the_daemon_and_fails_cl
         f.memory(&id).await.author.agent.as_deref(),
         Some("shim-agent")
     );
-    // The daemon goes away: both switches read off.
+    // The daemon goes away: both switches read off, and a call says the daemon cannot be
+    // reached (the setting is still on: "turn it on" would send the agent to rewrite it).
     s.stop.cancel();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(compat_count(&names(&c).await), 0, "no daemon answers: off");
+    let err = error_text(
+        c.call_tool(tool_call("mempalace_list_wings", json!({})))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        err.contains("not reachable")
+            && err.contains("alice status")
+            && !err.contains("turn it on"),
+        "{err}"
+    );
     c.cancel().await.ok();
 }

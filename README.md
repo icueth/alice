@@ -390,7 +390,7 @@ The layer is the setting `compat.mempalace`. A real (not `--dry-run`) import tur
 alice config set compat.mempalace true     # or false to hide the tools again
 ```
 
-The change applies to running clients within a second, with no restart. When the daemon cannot be reached the tools are hidden.
+The change applies to running clients within a second, with no restart. When the daemon cannot be reached the tools are hidden, and a call to one says the daemon is not reachable (run `alice status`) rather than that the layer is off.
 
 Register `alice mcp` under the server name your prompts expect. Claude Code names a tool `mcp__<server>__<tool>`, so prompts that call `mcp__plugin_mempalace_mempalace__mempalace_search` need the server entry to be called `plugin_mempalace_mempalace`:
 

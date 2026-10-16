@@ -390,7 +390,7 @@ layer นี้คือการตั้งค่า `compat.mempalace` กา
 alice config set compat.mempalace true     # หรือ false เพื่อซ่อน tool อีกครั้ง
 ```
 
-การเปลี่ยนมีผลกับ client ที่เปิดอยู่ภายในหนึ่งวินาที ไม่ต้องรีสตาร์ท ถ้าติดต่อ daemon ไม่ได้ tool เหล่านี้จะถูกซ่อน
+การเปลี่ยนมีผลกับ client ที่เปิดอยู่ภายในหนึ่งวินาที ไม่ต้องรีสตาร์ท ถ้าติดต่อ daemon ไม่ได้ tool เหล่านี้จะถูกซ่อน และการเรียก tool เหล่านี้จะตอบว่าติดต่อ daemon ไม่ได้ (ให้รัน `alice status`) ไม่ใช่บอกว่าปิดอยู่
 
 ลงทะเบียน `alice mcp` ด้วยชื่อ server ที่ prompt ของคุณคาดหวัง Claude Code ตั้งชื่อ tool เป็น `mcp__<server>__<tool>` ดังนั้น prompt ที่เรียก `mcp__plugin_mempalace_mempalace__mempalace_search` ต้องใช้ชื่อ server ว่า `plugin_mempalace_mempalace`:
 
