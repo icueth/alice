@@ -445,22 +445,49 @@ pub fn root_of_memory(conn: &Connection, memory_id: &str) -> Result<Option<Strin
 }
 
 /// The privacy rules `alice projects merge` carried into the project `project_id` (every merge
-/// into it that is not undone; see `project_merge`). `None`: none. A row that does not parse is
-/// read as secrets blocked and no cloud: a rule that cannot be read must not loosen anything.
+/// into it that is not undone; see `project_merge`). `None`: none. A row that does not parse
+/// whole (a later build's extra field, damage) keeps the custom patterns that still read, with
+/// secrets blocked and no cloud ([`ProjectSettings::salvage_json`]): a rule that cannot be read
+/// must not loosen anything. That is logged once per row, never with an expression.
 pub fn carried_rules(conn: &Connection, project_id: &str) -> Result<Option<ProjectSettings>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT rules_json FROM project_rules WHERE project_id = ?1 ORDER BY merge_id",
+        "SELECT merge_id, rules_json FROM project_rules WHERE project_id = ?1 ORDER BY merge_id",
     )?;
     let rows = stmt
-        .query_map([project_id], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
+        .query_map([project_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
     Ok(rows
         .iter()
-        .map(|j| {
-            serde_json::from_str::<ProjectSettings>(j)
-                .unwrap_or_else(|_| ProjectSettings::fail_closed())
+        .map(|(merge_id, j)| {
+            serde_json::from_str::<ProjectSettings>(j).unwrap_or_else(|_| {
+                note_unreadable_rules(project_id, merge_id);
+                ProjectSettings::salvage_json(j)
+            })
         })
         .reduce(|a, b| a.stricter(&b)))
+}
+
+/// Logs that the rules merge `merge_id` carried into `project_id` do not read whole, once per
+/// row in this process (they are read on every write to the project); `true` when it did. Ids
+/// only: the row may hold an expression, and people write known secrets as patterns.
+pub(crate) fn note_unreadable_rules(project_id: &str, merge_id: &str) -> bool {
+    static SEEN: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+    let first = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .insert((project_id.to_string(), merge_id.to_string()));
+    if first {
+        tracing::warn!(
+            project_id,
+            merge_id,
+            "the privacy rules a project merge carried do not read whole; the custom patterns that read are kept, and the project blocks secrets and stays away from cloud providers"
+        );
+    }
+    first
 }
 
 /// The tree of a stored project: its root (if it has one) and the rules merges carried into it.

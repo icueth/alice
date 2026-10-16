@@ -1935,6 +1935,43 @@ impl ProjectSettings {
         Self::default().closed()
     }
 
+    /// What is left of rules stored as JSON (the rules a project merge carried) that do not
+    /// read whole, a later build's extra field or damage: every custom pattern that still reads
+    /// and is valid (a name and an expression that compiles, as a project file needs them),
+    /// with both flags forced on. A rule that cannot be read must not loosen anything, and the
+    /// patterns that can be read must not be dropped with it; one that would not compile is left
+    /// out so it cannot take the others down with it.
+    pub fn salvage_json(text: &str) -> Self {
+        let entries = serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|v| {
+                v.get("privacy")?
+                    .get("custom_patterns")?
+                    .as_array()
+                    .cloned()
+            })
+            .unwrap_or_default();
+        let mut out = Self::fail_closed();
+        for e in entries {
+            let field = |k: &str| e.get(k).and_then(|v| v.as_str()).map(str::to_string);
+            let (Some(name), Some(regex)) = (field("name"), field("regex")) else {
+                continue;
+            };
+            let p = CustomPattern { name, regex };
+            let check = Settings {
+                privacy: PrivacySettings {
+                    custom_patterns: vec![p.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            if check.validate().is_empty() && !out.privacy.custom_patterns.contains(&p) {
+                out.privacy.custom_patterns.push(p);
+            }
+        }
+        out
+    }
+
     /// These settings with the two flags forced on (the custom patterns stay).
     fn closed(mut self) -> Self {
         self.privacy.block_secrets = true;

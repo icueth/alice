@@ -1322,6 +1322,41 @@ mod tests {
         );
     }
 
+    /// Final re-review 2, M-5: a carried row this build cannot read whole (a later build's
+    /// extra field, damage) keeps every custom pattern that still reads, and forces both flags
+    /// on; the patterns are never dropped in silence. Only an entry that does not read (no
+    /// regex) or would not compile is lost, so it cannot take the other patterns down with it.
+    #[test]
+    fn a_carried_row_that_does_not_parse_keeps_its_patterns_and_closes_both_flags() {
+        let t = T::new();
+        let b = t.project("k/b", "b");
+        let later = r#"{"privacy":{"block_secrets":false,"cloud_denied":false,"retention":"short",
+            "custom_patterns":[{"name":"ticket","regex":"TICKET-[0-9]+"},
+            {"name":"acct","regex":"ACCT-[0-9]+","flags":"i"},{"name":"nothing"},
+            {"name":"bad","regex":"("}]}}"#;
+        t.c.execute(
+            "INSERT INTO project_rules (project_id, merge_id, rules_json) VALUES (?1, 'm-later', ?2)",
+            rusqlite::params![b.id, later],
+        )
+        .unwrap();
+        assert_eq!(
+            carried(&t, &b.id),
+            Some(rules(true, true, &["ticket", "acct"]))
+        );
+        carried(&t, &b.id);
+        assert!(
+            !projects::note_unreadable_rules(&b.id, "m-later"),
+            "logged once, on the first read"
+        );
+        // Not JSON at all: closed, with no pattern to keep.
+        t.c.execute(
+            "UPDATE project_rules SET rules_json = 'not json' WHERE merge_id = 'm-later'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(carried(&t, &b.id), Some(rules(true, true, &[])));
+    }
+
     /// A write from the old checkout of a merged project lands in the survivor: its tree keeps
     /// the checkout's own key and root, takes the rules carried into the survivor, and has the
     /// survivor's own tree along. A checkout of the survivor itself has no such second tree.
