@@ -244,6 +244,22 @@ handle_path /u/$1/* {
 	route {
 		@admin path /api/v1/admin/*
 		respond @admin 404
+		# A person's uploaded MemPalace (import.max_upload_bytes, 4 GiB by default): a big body and a long wait.
+		# Every other route keeps Caddy's defaults.
+		@import path /api/v1/import/upload
+		request_body @import {
+			max_size 4GiB
+		}
+		reverse_proxy @import 127.0.0.1:$2 {
+			header_up Host {upstream_hostport}
+			header_up -Origin
+			header_up -X-Forwarded-For
+			flush_interval -1
+			transport http {
+				read_timeout 30m
+				write_timeout 30m
+			}
+		}
 		@alice path /api/v1/* /mcp /mcp/*
 		reverse_proxy @alice 127.0.0.1:$2 {
 			header_up Host {upstream_hostport}
@@ -622,6 +638,18 @@ add_missing_tz() {
   if [ -n "$added" ]; then say "TZ=$DEFAULT_TZ added for:$added"; fi
 }
 
+# A route written by an older version lacks the upload route's body limit and timeouts: write every personal tenant's again
+# and reload Caddy once (a snippet Caddy refuses leaves the running configuration as it was).
+refresh_snippets() {
+  local t n=0
+  for t in $(personal_tenants); do
+    write_snippet "$t" "$(port_of "$t")" && n=$((n + 1))
+  done
+  if [ "$n" -gt 0 ] && ! reload_caddy >/dev/null 2>&1; then
+    printf 'alice-server: WARNING: Caddy could not be reloaded with the new routes; check "caddy validate" and reload it by hand\n' >&2
+  fi
+}
+
 cmd_upgrade() { # binary (also the first install)
   local new=$1 lib failed
   need_avx
@@ -639,6 +667,7 @@ cmd_upgrade() { # binary (also the first install)
   fi
   say "free: $(gb "$(free_kb)") GB (a schema migration copies each tenant's database once)"
   add_missing_tz
+  refresh_snippets
   failed=$(restart_all)
   if [ -n "$failed" ]; then
     restore_prev

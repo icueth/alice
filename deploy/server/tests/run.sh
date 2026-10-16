@@ -221,6 +221,14 @@ add_creates_everything() {
   has "$s" '127.0.0.1:47801'
   has "$s" 'header_up Host {upstream_hostport}'
   has "$s" 'flush_interval -1'
+# Only the upload route takes a big body (the daemon's import.max_upload_bytes default, 4 GiB) and waits up to 30 minutes.
+has "$s" '@import path /api/v1/import/upload'
+has "$s" 'request_body @import {'
+has "$s" 'max_size 4GiB'
+has "$s" 'read_timeout 30m'
+has "$s" 'write_timeout 30m'
+[ "$(grep -c 'max_size' "$s")" = 1 ] || fail "only the import route has a body limit"
+[ "$(grep -c 'read_timeout' "$s")" = 1 ] || fail "only the import route has long timeouts"
   if grep -rqi fail2ban "$R/etc"; then fail "fail2ban under etc"; fi
   if grep -rq 'tok-' "$R/etc"; then fail "a token under etc"; fi
   pass
@@ -418,6 +426,15 @@ upgrade_installs_and_keeps_prev() {
   cmp "$R/new-alice" "$R/usr/local/bin/alice" || fail "new binary not installed"
   cmp "$T/alice.saved" "$R/usr/local/bin/alice.prev" || fail "alice.prev is not the old binary"
   has "$R/calls.log" 'systemctl restart alice@ann'
+  pass
+}
+
+upgrade_gives_an_old_route_the_upload_limits() {
+  printf 'handle_path /u/ann/* {\n\treverse_proxy 127.0.0.1:47801\n}\n' >"$R/etc/caddy/alice.d/ann.caddy"
+  run upgrade "$R/new-alice"
+  [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
+  has "$R/etc/caddy/alice.d/ann.caddy" 'max_size 4GiB'
+  has "$R/etc/caddy/alice.d/ann.caddy" 'write_timeout 30m'
   pass
 }
 
@@ -1109,7 +1126,7 @@ for CURRENT in \
   import_refuses_a_missing_palace import_refuses_an_unknown_tenant dry_run_import_keeps_the_source \
   import_refuses_a_tenant_home import_refuses_root_and_system_dirs import_refuses_a_non_palace \
   add_restores_the_caddyfile_when_validation_fails add_reloads_after_removing_the_snippet test_hooks_are_ignored_without_a_test_root cli_runs_as_the_tenant \
-  cli_refuses_a_secret_in_argv upgrade_rolls_back_on_a_failed_ping upgrade_installs_and_keeps_prev \
+  cli_refuses_a_secret_in_argv upgrade_rolls_back_on_a_failed_ping upgrade_installs_and_keeps_prev upgrade_gives_an_old_route_the_upload_limits \
   add_refuses_a_cpu_without_avx upgrade_refuses_a_cpu_without_avx upgrade_accepts_avx_without_avx2 \
   upgrade_refuses_a_binary_that_fails_its_self_test upgrade_installs_the_runtime_library_and_restores_it \
   upgrade_restores_the_library_when_the_binary_cannot_be_installed add_takes_a_time_zone \
