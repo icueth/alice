@@ -402,6 +402,44 @@ async fn a_resend_from_zero_stores_nothing_twice() {
     assert_eq!(ords, (0..chunks.len() as i64).collect::<Vec<_>>());
 }
 
+/// Spec §11.1 under R11: once retention has deleted a captured session's chunks, its state,
+/// cursor and turn keys stay, so a re-pass stores nothing. A resend from 0 is told the kept
+/// cursor, and sending from there adds no chunk.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_re_pass_after_retention_stores_nothing() {
+    let d = home_with("[capture]\nraw_retention = \"1d\"\n");
+    let svc = start_in(d.path(), true);
+    let mut t = Transcript::default();
+    t.turn("s9", 1, "first").turn("s9", 2, "second");
+    let cursor = send(&svc, q("s9", 0, "stop"), &t.bytes).await.next_offset;
+    assert!(!chunks_of(&svc, &uri("s9")).is_empty());
+    // Two days later (the state was stamped before the first chunk, as capture does).
+    let then = (chrono::Utc::now() - chrono::Duration::days(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let w = alice_core::store::open_writer(&svc.home().db()).unwrap();
+    w.execute("UPDATE chunks SET created_at = ?1", [&then])
+        .unwrap();
+    w.execute("UPDATE capture_state SET created_at = ?1", [&then])
+        .unwrap();
+    let report = svc
+        .run_job(alice_daemon::maintenance::Job::CaptureRetention)
+        .await
+        .unwrap();
+    assert!(chunks_of(&svc, &uri("s9")).is_empty(), "{report:?}");
+    let jump = svc
+        .capture_transcript(q("s9", 0, "stop"), Bytes::from(t.bytes.clone()))
+        .await
+        .unwrap()
+        .expect_err("a resend from 0 is behind the kept cursor");
+    assert_eq!(jump, cursor);
+    let a = send(&svc, q("s9", jump, "stop"), &t.bytes[jump as usize..]).await;
+    assert_eq!((a.turns_stored, a.chunks_stored), (0, 0));
+    assert!(
+        chunks_of(&svc, &uri("s9")).is_empty(),
+        "the re-pass stores nothing"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forward_gap_is_accepted_and_counted() {
     let (_d, svc) = tenant();
