@@ -614,13 +614,18 @@ impl SettingsHandle {
     }
 
     /// The project rules in force for `tree` (its `.alice.toml` as kept for the project, and the
-    /// rules merges carried into it); none for `None`. What a project merge carries.
-    pub fn project_rules(
-        &self,
-        tree: Option<&ProjectTree>,
-    ) -> alice_core::settings::ProjectSettings {
-        tree.map(|t| self.projects.get_tree(t).settings)
-            .unwrap_or_default()
+    /// rules merges carried into it); none for `None`. What a project merge carries, unless the
+    /// load says they are only the closed stand-in (an error) or not in force yet (a loosening
+    /// waiting for its polls).
+    pub fn project_rules(&self, tree: Option<&ProjectTree>) -> alice_core::settings::ProjectLoad {
+        match tree {
+            Some(t) => self.projects.get_tree(t),
+            None => alice_core::settings::ProjectLoad {
+                settings: Default::default(),
+                error: None,
+                loosening_pending: false,
+            },
+        }
     }
 
     /// Whether the privacy rules for `tree` are in a fail-closed state right now rather than

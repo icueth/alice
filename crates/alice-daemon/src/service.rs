@@ -745,6 +745,36 @@ fn project_tree_in(readers: &ReaderPool, choice: &ProjectChoice) -> (Option<Proj
     }
 }
 
+/// Why a project merge cannot carry the rules of the project `slug` (its tree `tree`, its rules
+/// as loaded `load`) right now, said plainly with what to do; `None` when they are its rules.
+/// Never names a pattern or quotes the file (people write known secrets as patterns).
+fn rules_not_known(
+    slug: &str,
+    tree: Option<&ProjectTree>,
+    load: &alice_core::settings::ProjectLoad,
+) -> Option<String> {
+    let root = tree.filter(|t| t.has_root()).map(|t| t.root.clone());
+    if load.error.is_some() {
+        let because = match &root {
+            Some(r) if !r.is_dir() => format!(
+                "its working tree ({}) is gone or cannot be read, and its .alice.toml was never read on this machine. Bring the working tree back at that path (a clone, or an empty folder if the project had no .alice.toml), or write to the project once from another checkout of it, then merge",
+                r.display()
+            ),
+            Some(r) => format!(
+                "its .alice.toml ({}) is invalid or cannot be read. Fix the file, then merge",
+                r.join(".alice.toml").display()
+            ),
+            None => "they cannot be read. Try the merge again; if it is refused again, run `alice doctor`".into(),
+        };
+        return Some(format!(
+            "the privacy rules of project \"{slug}\" are not known, so the merge cannot carry them: {because}"
+        ));
+    }
+    load.loosening_pending.then(|| format!(
+        "the privacy rules of project \"{slug}\" are not in force yet, so the merge cannot carry them: its .alice.toml is blank or now protects less than before, and such a change applies only once it has been read the same three times, 2 seconds apart (each merge attempt reads it). Try the merge again in a few seconds"
+    ))
+}
+
 fn unexpected(o: WriteOutcome) -> AliceError {
     AliceError::Other(format!("unexpected writer outcome {}", o.name()))
 }
@@ -3333,6 +3363,15 @@ impl Service {
                 Ok((plan, tree))
             })
             .await?;
+        // What `from`'s own file puts in force now. While that is only the closed stand-in (its
+        // tree is gone and was never read here, its file is invalid) or not in force yet (a
+        // loosening waiting for its polls), the merge would carry block mode and a cloud denial
+        // `from` never had into `into` for good: refused, with the reason. Asked before the
+        // cloud check, whose "kept away from cloud providers" would not be true.
+        let from_load = self.settings.project_rules(from_tree.as_ref());
+        if let Some(why) = rules_not_known(&plan.from.slug, from_tree.as_ref(), &from_load) {
+            return Err(AliceError::invalid(why));
+        }
         // Privacy first: rows of a project kept away from cloud providers must not become
         // eligible for them by moving into one that is not. The one policy the judge and the
         // remote embedder ask (every name of the project, its `.alice.toml`, degraded config).
@@ -3344,8 +3383,7 @@ impl Service {
                 plan.from.slug, plan.into.slug, plan.into.slug, plan.from.slug
             )));
         }
-        // What `from`'s own file puts in force now (a file that cannot be read counts closed).
-        let from_rules = self.settings.project_rules(from_tree.as_ref());
+        let from_rules = from_load.settings;
         let answer = |merged: bool,
                       event_id: Option<String>,
                       c: &project_merge::MergeCounts,

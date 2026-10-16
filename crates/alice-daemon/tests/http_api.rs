@@ -2944,6 +2944,72 @@ async fn undoing_a_project_merge_restores_the_survivors_previous_rules_exactly()
     );
 }
 
+/// Final re-review 2, M-2: while the rules of `from` are only the closed stand-in (its working
+/// tree is gone and was never read here, its `.alice.toml` is invalid, or blank on its first
+/// look), a merge would carry block mode and a cloud denial `from` never had into the survivor
+/// for good. It is refused with the reason, dry run included, before the cloud check (whose
+/// "kept away from cloud providers" would not be true). Once the rules are known the merge
+/// carries none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_is_refused_while_the_rules_of_from_are_not_known() {
+    let s = Srv::start().await;
+    let dirs = projects_in_folders(&s, &["work", "blank", "broken"]).await;
+    note_in(&s, &dirs["work"], "a note in work").await;
+    for (name, text) in [("blank", ""), ("broken", "[privacy\n")] {
+        std::fs::write(std::path::Path::new(&dirs[name]).join(".alice.toml"), text).unwrap();
+        note_in(&s, &dirs[name], &format!("a note in {name}")).await;
+    }
+    // A project whose working tree is gone and was never read by this daemon.
+    let gone = s._d.path().join("gone");
+    alice_core::store::projects::upsert_project(
+        &alice_core::store::open_writer(&s.home.db()).unwrap(),
+        &alice_core::project::ProjectRef {
+            key: gone.to_string_lossy().into_owned(),
+            slug: "gone".into(),
+            name: "gone".into(),
+            root: Some(gone.clone()),
+            remote: None,
+        },
+    )
+    .unwrap();
+    let refused = |from: &'static str, dry: bool, why: &'static str| {
+        let s = &s;
+        async move {
+            let r = merge_now(s, from, "work", dry).await;
+            assert_eq!(r.status(), 400, "{from}, dry run {dry}");
+            let text = r.text().await.unwrap();
+            assert!(
+                text.contains(&format!("rules of project \\\"{from}\\\""))
+                    && text.contains(why)
+                    && !text.contains("cloud providers"),
+                "{text}"
+            );
+        }
+    };
+    for dry in [true, false] {
+        if !dry {
+            // `work` denied: the merges would go through, carrying the stand-in.
+            deny_in_settings(&s, &["work"]);
+        }
+        refused("gone", dry, "working tree").await;
+        refused("blank", dry, "not in force yet").await;
+        refused("broken", dry, "is invalid").await;
+    }
+    assert_eq!(
+        slugs(&s),
+        ["blank", "broken", "global", "gone", "work"],
+        "nothing merged"
+    );
+    // The working tree back (an empty folder: no rules): known, and nothing to carry.
+    std::fs::create_dir_all(&gone).unwrap();
+    let done: ProjectMergeResponse = merge_now(&s, "gone", "work", false)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(done.merged && done.rules_carried.is_empty(), "{done:?}");
+}
+
 /// `POST /api/v1/projects/merge`: behind the token, a dry run changes nothing, the refusals say
 /// what to do, a merge moves the rows and leaves the old name working, and undo (by the event
 /// the merge answers with) puts every row back where it was.
