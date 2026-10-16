@@ -281,6 +281,117 @@ type QuickCheckHook = Arc<dyn Fn(&rusqlite::Connection) + Send + Sync>;
 const SLICE: usize = 500;
 /// Memories looked at per slice of the merge-suggestion job.
 const MERGE_PAGE: i64 = 200;
+/// The job adds no `merge` item while this many are open, and never more than fit under it, so
+/// one run cannot flood the inbox.
+const MERGE_OPEN_MAX: u64 = 50;
+/// The most memories one `merge` item groups.
+const MERGE_GROUP_MAX: usize = 5;
+
+/// Two memories are only suggested as duplicates when their words agree this much.
+const MERGE_TEXT_JACCARD: f64 = 0.6;
+
+type TextSet = std::collections::HashSet<String>;
+
+/// A letter for text comparison: alphabetic, or a Thai letter, vowel or tone mark (tone marks
+/// are not "alphabetic" to Unicode, and would otherwise cut a Thai word apart).
+fn is_text_letter(c: char) -> bool {
+    c.is_alphabetic() || ((0x0E01..=0x0E4E).contains(&(c as u32)) && c as u32 != 0x0E3F)
+}
+
+fn is_thai(c: char) -> bool {
+    (0x0E00..=0x0E7F).contains(&(c as u32))
+}
+
+/// The comparison set of a memory's title and body: lower-case runs of letters, so numbers,
+/// dates, times, hashes and ids (any run with a digit) are dropped. A run with Thai letters,
+/// which has no word spaces, contributes its character trigrams instead of the run.
+fn text_tokens(title: &str, body: &str) -> TextSet {
+    let mut out = std::collections::HashSet::new();
+    let text = format!("{title} {body}").to_lowercase();
+    // Split at anything that is neither a letter nor a digit; a run holding a digit is dropped
+    // whole (`m3`, `abc1234`, `21`), which is what removes ids and hashes.
+    for run in text.split(|c: char| !(is_text_letter(c) || c.is_numeric())) {
+        if run.is_empty() || run.chars().any(|c| c.is_numeric()) {
+            continue;
+        }
+        if run.chars().any(is_thai) {
+            let chars: Vec<char> = run.chars().collect();
+            if chars.len() < 3 {
+                out.insert(run.to_string());
+            } else {
+                out.extend(chars.windows(3).map(|w| w.iter().collect::<String>()));
+            }
+        } else {
+            out.insert(run.to_string());
+        }
+    }
+    out
+}
+
+/// The numbers of a memory's title and body as written, sorted (a multiset): runs of digits,
+/// joined across `.`, `,`, `:`, `/` and `-` between digits, so a port (`5432`), a version
+/// (`1.4.2`), an amount (`1,000`), a date (`2026-10-16`) and a time (`21:30`) are one token
+/// each. Two memories whose numbers differ are a value update, never a duplicate.
+fn number_tokens(title: &str, body: &str) -> Vec<String> {
+    let text: Vec<char> = format!("{title} {body}").chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if !text[i].is_numeric() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < text.len()
+            && (text[i].is_numeric()
+                || (matches!(text[i], '.' | ',' | ':' | '/' | '-')
+                    && text.get(i + 1).is_some_and(|c| c.is_numeric())
+                    && i > start))
+        {
+            i += 1;
+        }
+        out.push(text[start..i].iter().collect());
+    }
+    out.sort();
+    out
+}
+
+/// What a merge suggestion compares of a memory's text: its words, and its numbers.
+struct MergeText {
+    words: TextSet,
+    numbers: Vec<String>,
+}
+
+fn merge_text(title: &str, body: &str) -> MergeText {
+    MergeText {
+        words: text_tokens(title, body),
+        numbers: number_tokens(title, body),
+    }
+}
+
+/// Jaccard similarity of two token sets (0 when either is empty: no text, no agreement).
+fn jaccard(a: &TextSet, b: &TextSet) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let inter = a.intersection(b).count() as f64;
+    inter / (a.len() as f64 + b.len() as f64 - inter)
+}
+
+/// Cosine similarity of two vectors (0 for a zero vector or sizes that differ).
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
+    let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let d = norm(a) * norm(b);
+    if d == 0.0 { 0.0 } else { dot / d }
+}
 
 enum Step {
     More,
@@ -889,22 +1000,36 @@ impl Scheduler {
         )))
     }
 
-    /// Weekly: groups of live memories in one project whose vectors are at least
-    /// `judge.cluster_similarity` alike become one `merge` review item (asked once).
+    /// Weekly: groups of live memories of one kind in one project whose vectors are at least
+    /// `judge.cluster_similarity` alike and whose texts agree (token Jaccard 0.6) become one
+    /// `merge` review item (asked once), with `p` the group's lowest pairwise cosine.
     fn merge_suggestions(&self, threshold: f64) -> Result<Step> {
         let (active, idx) = snapshot(&self.ctx.active, &self.ctx.index);
         let Some(idx) = idx.filter(|i| i.model() == active.model) else {
             return Ok(Step::Skipped("index not ready".into()));
         };
         let model = active.model.clone();
+        let open = self
+            .ctx
+            .readers
+            .with(|c| reviews::count_open_of(c, reviews::ReviewType::Merge))?;
+        if open >= MERGE_OPEN_MAX {
+            return Ok(Step::Skipped(format!(
+                "skipped: {MERGE_OPEN_MAX} merge reviews already open"
+            )));
+        }
+        let room = (MERGE_OPEN_MAX - open) as usize;
         let cursor: i64 = self
             .meta("maint.merge.cursor")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        // Diaries are session logs and status notes time-stamped snapshots: they share a format
+        // by design, so their vectors sit close without being duplicates. Never clustered.
         let rows: Vec<(i64, String, String)> = self.ctx.readers.with(|c| {
             let mut stmt = c.prepare(
                 "SELECT seq, id, project_id FROM memories
-                 WHERE seq > ?1 AND status IN ('active','pending') ORDER BY seq LIMIT ?2",
+                 WHERE seq > ?1 AND status IN ('active','pending') AND kind NOT IN ('diary','status')
+                 ORDER BY seq LIMIT ?2",
             )?;
             Ok(stmt
                 .query_map(rusqlite::params![cursor, MERGE_PAGE], |r| {
@@ -916,13 +1041,58 @@ impl Scheduler {
             self.set_meta("maint.merge.cursor", "0");
             return Ok(Step::Finished("merge suggestions done".into()));
         }
+        // A memory already in an open merge item is not put in another.
+        let mut claimed: std::collections::HashSet<String> = self.ctx.readers.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT payload_json FROM review_items WHERE type = 'merge' AND status = 'open'",
+            )?;
+            let mut ids = std::collections::HashSet::new();
+            for p in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                let p = p?;
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&p) else {
+                    tracing::warn!(
+                        "merge suggestions: an open merge item has a malformed payload; skipped"
+                    );
+                    continue;
+                };
+                ids.extend(v["survivor"].as_str().map(str::to_string));
+                for o in v["others"].as_array().into_iter().flatten() {
+                    ids.extend(o.as_str().map(str::to_string));
+                }
+            }
+            Ok(ids)
+        })?;
         let mut made = 0;
+        let mut last = cursor;
         for (seq, id, project) in &rows {
+            if made >= room {
+                break;
+            }
+            last = *seq;
+            if claimed.contains(id) {
+                continue;
+            }
             let Some((_, v)) = self
                 .ctx
                 .readers
                 .with(|c| embeddings::get_many(c, &model, &[VecKey::Memory(*seq)]))?
                 .pop()
+            else {
+                continue;
+            };
+            let Some((seed_kind, seed_text)) = self.ctx.readers.with(|c| {
+                Ok(c.query_row(
+                    "SELECT kind, title, body FROM memories WHERE seq = ?1",
+                    [seq],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            merge_text(&r.get::<_, String>(1)?, &r.get::<_, String>(2)?),
+                        ))
+                    },
+                )
+                .optional()?)
+            })?
             else {
                 continue;
             };
@@ -937,31 +1107,66 @@ impl Scheduler {
             if near.is_empty() {
                 continue;
             }
-            let members: Vec<(String, String)> = self.ctx.readers.with(|c| {
+            // Live, same project, not a diary, not in an open item: (seq, id, vector).
+            let candidates: Vec<(String, Vec<f32>, MergeText)> = self.ctx.readers.with(|c| {
                 let mut out = Vec::new();
                 for o in &near {
-                    if let Some(r) = c
+                    let Some((oid, oproject, okind, otitle, obody)) = c
                         .query_row(
-                            "SELECT id, project_id FROM memories WHERE seq = ?1 AND status IN ('active','pending')",
+                            "SELECT id, project_id, kind, title, body FROM memories
+                             WHERE seq = ?1 AND status IN ('active','pending') AND kind NOT IN ('diary','status')",
                             [o],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
+                            |r| {
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, String>(2)?,
+                                    r.get::<_, String>(3)?,
+                                    r.get::<_, String>(4)?,
+                                ))
+                            },
                         )
                         .optional()?
+                    else {
+                        continue;
+                    };
+                    if &oproject != project || okind != seed_kind || claimed.contains(&oid) {
+                        continue;
+                    }
+                    if let Some((_, ov)) =
+                        embeddings::get_many(c, &model, &[VecKey::Memory(*o)])?.pop()
                     {
-                        out.push(r);
+                        out.push((oid, ov, merge_text(&otitle, &obody)));
                     }
                 }
                 Ok(out)
             })?;
-            let mut group: Vec<String> = members
-                .into_iter()
-                .filter(|(_, p)| p == project)
-                .map(|(i, _)| i)
-                .collect();
-            if group.is_empty() {
+            // Complete linkage: a candidate joins only when it is alike every member so far, not
+            // just the seed (a chain A~B, B~C is not a group), in vectors and in words, and has
+            // the same numbers (a changed port, version, amount or date is an update, not a
+            // duplicate), up to `MERGE_GROUP_MAX`. `lowest` is the least pairwise cosine.
+            let mut members: Vec<(&str, &[f32], &MergeText)> =
+                vec![(id.as_str(), v.as_slice(), &seed_text)];
+            let mut lowest = f64::INFINITY;
+            for (cid, cv, ctext) in &candidates {
+                if members.len() >= MERGE_GROUP_MAX {
+                    break;
+                }
+                let sims: Vec<f64> = members.iter().map(|(_, mv, _)| cosine(mv, cv)).collect();
+                if sims.iter().all(|s| *s >= threshold)
+                    && members.iter().all(|(_, _, mt)| {
+                        mt.numbers == ctext.numbers
+                            && jaccard(&mt.words, &ctext.words) >= MERGE_TEXT_JACCARD
+                    })
+                {
+                    lowest = sims.into_iter().fold(lowest, f64::min);
+                    members.push((cid.as_str(), cv.as_slice(), ctext));
+                }
+            }
+            let mut group: Vec<String> = members.iter().map(|(i, _, _)| (*i).to_string()).collect();
+            if group.len() < 2 {
                 continue;
             }
-            group.push(id.clone());
             group.sort();
             group.dedup();
             let key = format!("merge:{}", group.join(":"));
@@ -979,17 +1184,19 @@ impl Scheduler {
                         payload: serde_json::json!({
                             "survivor": survivor,
                             "others": others,
-                            "p": threshold,
+                            "p": lowest,
                             "provider": "cluster",
                         }),
-                        confidence: Some(threshold),
+                        confidence: Some(lowest),
                         dedupe_key: Some(key),
                     }))?
             {
                 made += n;
+                if n > 0 {
+                    claimed.extend(group.iter().cloned());
+                }
             }
         }
-        let last = rows.last().map(|r| r.0).unwrap_or(cursor);
         self.set_meta("maint.merge.cursor", &last.to_string());
         tracing::debug!(suggested = made, up_to_seq = last, "merge suggestions");
         Ok(Step::More)
@@ -1266,6 +1473,24 @@ mod tests {
                 tx.execute(
                     "UPDATE memories SET title = ?1, body = ?1 WHERE seq = ?2",
                     params![name, seq],
+                )
+                .unwrap();
+                embeddings::put(&tx, VecKey::Memory(seq), "fake", v).unwrap();
+                idx.upsert(VecKey::Memory(seq), v).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        /// Live memories of the given kind and text (title and body), each with its vector.
+        fn insert_kinded(&self, items: &[(&str, &str, [f32; 3])]) {
+            let mut c = self.sql();
+            let tx = c.transaction().unwrap();
+            let idx = self.index.read().clone().unwrap();
+            for (i, (kind, text, v)) in items.iter().enumerate() {
+                let seq = self.raw_memory(&tx, i, "active", "2026-10-01T00:00:00.000Z", "done");
+                tx.execute(
+                    "UPDATE memories SET kind = ?1, title = ?2, body = ?2 WHERE seq = ?3",
+                    params![kind, text, seq],
                 )
                 .unwrap();
                 embeddings::put(&tx, VecKey::Memory(seq), "fake", v).unwrap();
@@ -1758,8 +1983,8 @@ mod tests {
     fn merge_suggestions_cluster_near_duplicates_once() {
         let r = rig();
         r.insert_memories_with_vectors(&[
-            ("A", [1.0, 0.0, 0.0]),
-            ("B", [0.99, 0.05, 0.0]),
+            ("deploy the staging server", [1.0, 0.0, 0.0]),
+            ("deploy the staging server", [0.99, 0.05, 0.0]),
             ("C", [0.0, 1.0, 0.0]),
         ]);
         let report = r
@@ -1794,6 +2019,381 @@ mod tests {
             1,
             "rejected: never suggested again"
         );
+    }
+
+    /// `n` clusters of two near-identical vectors, 2 degrees apart from each other (so a high
+    /// `judge.cluster_similarity` pairs only the twins).
+    fn twin_clusters(n: usize) -> Vec<(&'static str, [f32; 3])> {
+        (0..n)
+            .flat_map(|k| {
+                let a = (k as f32 * 2.0).to_radians();
+                let b = a + 0.2_f32.to_radians();
+                [
+                    ("twin", [a.cos(), a.sin(), 0.0]),
+                    ("twin", [b.cos(), b.sin(), 0.0]),
+                ]
+            })
+            .collect()
+    }
+
+    const TWINS: &str = "[judge]\ncluster_similarity = 0.9999\n";
+    const OPEN_MERGES: &str =
+        "SELECT count(*) FROM review_items WHERE type = 'merge' AND status = 'open'";
+
+    #[test]
+    fn merge_suggestions_wait_while_fifty_merge_items_are_open() {
+        let r = rig_with(TWINS);
+        r.insert_memories_with_vectors(&twin_clusters(3));
+        let c = r.sql();
+        for k in 0..50 {
+            alice_core::store::reviews::create(
+                &c,
+                &reviews::NewReview {
+                    kind: reviews::ReviewType::Merge,
+                    payload: serde_json::json!({}),
+                    confidence: Some(0.92),
+                    dedupe_key: Some(format!("open{k}")),
+                },
+            )
+            .unwrap();
+        }
+        let report = r
+            .sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert_eq!(report.outcome, JobOutcome::Skipped, "{report:?}");
+        assert!(
+            report
+                .detail
+                .contains("skipped: 50 merge reviews already open"),
+            "{report:?}"
+        );
+        assert_eq!(r.count(OPEN_MERGES), 50, "none created");
+        // Room again: it resumes where it stopped and makes the suggestions.
+        c.execute(
+            "UPDATE review_items SET status = 'resolved', resolution = 'reject', resolved_at = 'x', resolved_by = 'user' WHERE dedupe_key = 'open0'",
+            [],
+        )
+        .unwrap();
+        let again = r
+            .sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert_eq!(again.outcome, JobOutcome::Skipped, "{again:?}");
+        assert_eq!(
+            r.count(OPEN_MERGES),
+            50,
+            "one slot: one suggestion, then full"
+        );
+    }
+
+    #[test]
+    fn merge_suggestions_create_at_most_fifty_in_one_run() {
+        let r = rig_with(TWINS);
+        r.insert_memories_with_vectors(&twin_clusters(60));
+        let report = r
+            .sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert_eq!(r.count(OPEN_MERGES), 50, "{report:?}");
+        assert!(
+            report.detail.contains("50 merge reviews already open"),
+            "{report:?}"
+        );
+    }
+
+    /// A run of vectors `step_deg` apart in a plane (every pair has the cosine of its angle).
+    fn fan(n: usize, step_deg: f32) -> Vec<(&'static str, [f32; 3])> {
+        (0..n)
+            .map(|k| {
+                let a = (k as f32 * step_deg).to_radians();
+                ("fan", [a.cos(), a.sin(), 0.0])
+            })
+            .collect()
+    }
+
+    /// The memory ids of every open merge item, one list per item.
+    fn open_groups(r: &Rig) -> Vec<Vec<String>> {
+        let c = r.sql();
+        let mut stmt = c
+            .prepare(
+                "SELECT payload_json FROM review_items WHERE type = 'merge' AND status = 'open'",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|p| {
+                let v: serde_json::Value = serde_json::from_str(&p.unwrap()).unwrap();
+                let mut ids = vec![v["survivor"].as_str().unwrap().to_string()];
+                ids.extend(
+                    v["others"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|o| o.as_str().unwrap().to_string()),
+                );
+                ids
+            })
+            .collect()
+    }
+
+    const NEAR: &str = "[judge]\ncluster_similarity = 0.99\n";
+
+    #[test]
+    fn merge_suggestions_never_cluster_diaries() {
+        let r = rig_with(NEAR);
+        r.insert_memories_with_vectors(&fan(4, 0.1));
+        r.sql()
+            .execute("UPDATE memories SET kind = 'diary' WHERE seq IN (SELECT seq FROM memories LIMIT 2)", [])
+            .unwrap();
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        // The two diaries are alike but are session logs, not duplicates; the other two pair.
+        let groups = open_groups(&r);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let diaries: Vec<String> = {
+            let c = r.sql();
+            let mut stmt = c
+                .prepare("SELECT id FROM memories WHERE kind = 'diary'")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+        };
+        assert!(
+            groups[0].iter().all(|id| !diaries.contains(id)),
+            "{groups:?} {diaries:?}"
+        );
+    }
+
+    #[test]
+    fn merge_suggestions_need_every_pair_alike_not_a_chain() {
+        let r = rig_with(NEAR);
+        // 0 and 5 degrees, 5 and 10 degrees are alike (cos 0.996); 0 and 10 are not (0.985).
+        r.insert_memories_with_vectors(&fan(3, 5.0));
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        let groups = open_groups(&r);
+        assert!(!groups.is_empty(), "the near pair is still suggested");
+        assert!(groups.iter().all(|g| g.len() == 2), "{groups:?}");
+    }
+
+    #[test]
+    fn merge_suggestions_never_put_a_memory_in_two_open_items() {
+        let r = rig_with(NEAR);
+        r.insert_memories_with_vectors(&fan(6, 5.0));
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        // A second run, as the weekly job would: nothing already open is taken again.
+        r.sched.run_job(
+            Job::MergeSuggestions,
+            chrono::Utc::now() + chrono::Duration::days(8),
+            true,
+        );
+        let groups = open_groups(&r);
+        assert!(!groups.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for id in groups.iter().flatten() {
+            assert!(seen.insert(id.clone()), "{id} is in two items: {groups:?}");
+        }
+    }
+
+    #[test]
+    fn merge_suggestions_group_at_most_five_memories() {
+        let r = rig_with(NEAR);
+        r.insert_memories_with_vectors(&fan(8, 0.01));
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        let groups = open_groups(&r);
+        assert!(!groups.is_empty());
+        assert!(groups.iter().all(|g| g.len() <= 5), "{groups:?}");
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), 8, "{groups:?}");
+    }
+
+    /// Three near vectors (a few degrees apart: cosine above 0.99 for every pair).
+    fn near3() -> [[f32; 3]; 3] {
+        let v = |deg: f32| {
+            let a = deg.to_radians();
+            [a.cos(), a.sin(), 0.0]
+        };
+        [v(0.0), v(3.0), v(6.0)]
+    }
+
+    #[test]
+    fn merge_suggestions_need_the_texts_to_agree_not_only_the_vectors() {
+        let r = rig_with(NEAR);
+        let [a, b, c] = near3();
+        // Status-shaped notes of one project for different milestones: same template, close
+        // vectors, different content.
+        r.insert_kinded(&[
+            (
+                "note",
+                "STATUS 2026-09-07 21:30: Tailscale CLI TERM fix merged to main 5685ea1",
+                a,
+            ),
+            (
+                "note",
+                "STATUS 2026-09-08 10:05: M3 reconnect lifecycle watcher MERGED to main 9f3c2d1",
+                b,
+            ),
+            (
+                "note",
+                "STATUS 2026-09-09 18:40: M4 Files SFTP browser upload MERGED to main 77aa001",
+                c,
+            ),
+        ]);
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert!(open_groups(&r).is_empty(), "{:?}", open_groups(&r));
+    }
+
+    /// Final review B-I2 (ruling): numbers are compared as written, as a multiset. The same
+    /// numbers in other words still group; a different date, time or id does not.
+    #[test]
+    fn merge_suggestions_group_texts_only_when_their_numbers_are_the_same() {
+        let r = rig_with(NEAR);
+        let [a, b, _] = near3();
+        r.insert_kinded(&[
+            (
+                "note",
+                "Restart nginx on the staging server after a deploy 2026-09-07 21:30 abc1234",
+                a,
+            ),
+            (
+                "note",
+                "Restart nginx on the staging server after the deploy, 21:30 2026-09-07 abc1234",
+                b,
+            ),
+        ]);
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert_eq!(open_groups(&r).len(), 1, "{:?}", open_groups(&r));
+        let r = rig_with(NEAR);
+        r.insert_kinded(&[
+            (
+                "note",
+                "Restart nginx on the staging server after a deploy 2026-09-07 21:30 abc1234",
+                a,
+            ),
+            (
+                "note",
+                "Restart nginx on the staging server after a deploy 2026-10-01 08:15 f00d99",
+                b,
+            ),
+        ]);
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert!(open_groups(&r).is_empty(), "{:?}", open_groups(&r));
+    }
+
+    /// Final review B-I2 (ruling): a value update is never offered as a duplicate: a port
+    /// change and a version change, whose words and vectors agree, are not grouped.
+    #[test]
+    fn merge_suggestions_never_group_a_port_or_a_version_change() {
+        let [a, b, c] = near3();
+        for (old, new) in [
+            ("Staging DB port is 5432", "Staging DB port is 6543"),
+            (
+                "pin the client library to version 1.4 in the lock file",
+                "pin the client library to version 2.0 in the lock file",
+            ),
+            (
+                "the monthly budget is 50 USD",
+                "the monthly budget is 500 USD",
+            ),
+        ] {
+            let r = rig_with(NEAR);
+            r.insert_kinded(&[("fact", old, a), ("fact", new, b), ("fact", old, c)]);
+            r.sched
+                .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+            let groups = open_groups(&r);
+            assert_eq!(groups.len(), 1, "only the two equal ones: {groups:?}");
+            assert_eq!(groups[0].len(), 2, "{old} / {new}: {groups:?}");
+        }
+        assert_eq!(
+            number_tokens(
+                "v1.4.2 on port 5432,",
+                "since 2026-10-16 21:30, 1,000 users"
+            ),
+            ["1,000", "1.4.2", "2026-10-16", "21:30", "5432"]
+        );
+    }
+
+    #[test]
+    fn merge_suggestions_never_group_status_notes() {
+        let r = rig_with(NEAR);
+        let [a, b, _] = near3();
+        r.insert_kinded(&[
+            ("status", "project is on track and building", a),
+            ("status", "project is on track and building", b),
+        ]);
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert!(open_groups(&r).is_empty(), "{:?}", open_groups(&r));
+    }
+
+    #[test]
+    fn merge_suggestions_never_group_different_kinds() {
+        let r = rig_with(NEAR);
+        let [a, b, _] = near3();
+        r.insert_kinded(&[
+            ("note", "use sqlite wal mode for the store", a),
+            ("decision", "use sqlite wal mode for the store", b),
+        ]);
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert!(open_groups(&r).is_empty(), "{:?}", open_groups(&r));
+    }
+
+    #[test]
+    fn merge_suggestion_p_is_the_groups_lowest_pairwise_cosine() {
+        let r = rig_with(NEAR);
+        let [a, b, c] = near3();
+        r.insert_kinded(&[
+            ("note", "use sqlite wal mode for the store", a),
+            ("note", "use sqlite wal mode for the store", b),
+            ("note", "use sqlite wal mode for the store", c),
+        ]);
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        let sizes: Vec<usize> = open_groups(&r).iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![3]);
+        let p: f64 = {
+            let json: String = r
+                .sql()
+                .query_row(
+                    "SELECT payload_json FROM review_items WHERE type = 'merge'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["p"]
+                .as_f64()
+                .unwrap()
+        };
+        let lowest = cosine(&a, &c);
+        // Stored vectors are not bit-exact (quantised), hence the tolerance.
+        assert!((p - lowest).abs() < 1e-4, "p = {p}, lowest = {lowest}");
+        assert!(lowest < 0.9999 && p < cosine(&a, &b), "{p}");
+    }
+
+    #[test]
+    fn merge_suggestions_compare_thai_on_trigrams() {
+        let r = rig_with(NEAR);
+        let [a, b, c] = near3();
+        r.insert_kinded(&[
+            ("note", "ขั้นตอนการติดตั้งเซิร์ฟเวอร์ใหม่บนอูบุนตู", a),
+            ("note", "ขั้นตอนการติดตั้งเซิร์ฟเวอร์ใหม่บนอูบุนตูด้วย", b),
+        ]);
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert_eq!(open_groups(&r).len(), 1, "a Thai near-duplicate is grouped");
+        let r = rig_with(NEAR);
+        r.insert_kinded(&[
+            ("note", "สถานะ ติดตั้งเครื่องแม่ข่ายใหม่เรียบร้อยแล้ว", a),
+            ("note", "สถานะ แก้ไขปัญหาการเชื่อมต่อฐานข้อมูลสำเร็จ", c),
+        ]);
+        r.sched
+            .run_job(Job::MergeSuggestions, chrono::Utc::now(), true);
+        assert!(open_groups(&r).is_empty(), "{:?}", open_groups(&r));
     }
 
     #[test]

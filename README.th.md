@@ -34,7 +34,7 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
 - **ความจำแก้ตัวเองได้** memory ใหม่จะถูกเทียบกับของเดิมที่คล้ายกัน ข้อความที่เหมือนกันเป๊ะจะรวมเข้ากับอันเก่า ถ้าเปิด Judge จะให้ข้อมูลใหม่แทนที่ (supersede) ของเก่าได้ และเรื่องขัดแย้งจะเข้าคิว review (`alice review`) ทุกการเปลี่ยนแปลงถูกบันทึกไว้ (`alice history`) และ undo ได้ (`alice undo`)
 - **มี AI Judge ให้เลือกเปิด** ต่อกับ [TypeSafe Jev](https://typesafe.ai) เพื่อช่วยตัดสินใจ (กันซ้ำ, ระบุ kind, จัดเข้าโปรเจกต์, ให้คะแนนผลค้นหา) ด้วยความน่าจะเป็นที่เชื่อถือได้ ตั้งเกณฑ์ความมั่นใจได้ มี cache และมีงบรายวันที่ใช้เกินไม่ได้ ถ้าไม่เปิด Alice จะใช้กฎที่ทำงานในเครื่อง ซึ่งรวมเฉพาะข้อความที่เหมือนกันทุกตัวอักษร ส่วนที่เหลือทิ้งไว้ให้คุณตรวจ
 - **MCP tool น้อยแต่ตรงจุด** มี tool หลัก 7 ตัว (`recall`, `remember`, `context`, `get_memory`, `update_memory`, `query_facts`, `assert_fact`) แทนที่จะมีหลายสิบตัว ผลลัพธ์กระชับและคุมจำนวน token ได้ มีคำแนะนำการใช้งานในตัว พร้อม slash command และ resource ชุด tool สำหรับดูแลระบบ (review, รวม memory, สถิติ) พร้อมให้เปิดเมื่อต้องการ
-- **ได้สรุปสั้น ไม่ใช่ข้อมูลทั้งก้อน** `context` สรุปสิ่งสำคัญของโปรเจกต์ปัจจุบันให้อยู่ในงบ token ที่กำหนด: memory หลัก, decision ล่าสุด, warning, handoff ล่าสุด และ preference ของคุณ
+- **ได้สรุปสั้น ไม่ใช่ข้อมูลทั้งก้อน** `context` สรุปสิ่งสำคัญของโปรเจกต์ปัจจุบันให้อยู่ในงบ token ที่กำหนด: memory หลัก, decision ล่าสุด, warning, handoff ล่าสุด, preference ของคุณ และ diary ล่าสุด (ไม่รวม checkpoint ที่บันทึกอัตโนมัติ) โปรเจกต์ที่ไม่มี memory ความสำคัญ 4 ขึ้นไปจะได้ memory ที่ดีที่สุด 3 อัน (ความสำคัญ 3) ในส่วน memory หลักแทน
 - **Knowledge graph ที่รู้เรื่องเวลา** เก็บ entity และ relation พร้อมช่วงเวลาที่ข้อมูลยังเป็นจริง ถามย้อนเวลาได้ด้วย `as_of` และดูเป็น timeline ได้ มีพจนานุกรม predicate กันไม่ให้เกิด `has_bug` กับ `had_bug` ปนกัน
 - **เป็นส่วนตัวเป็นค่าเริ่มต้น** ข้อมูลอยู่ในเครื่อง และ server รับเฉพาะการเชื่อมต่อจากเครื่องตัวเอง โดยตรวจ token และ origin ทุกคำขอ secret ในข้อความ (API key, token, รหัสผ่าน, private key) ถูกตัดออกก่อนบันทึก เข้าคิว หรือส่งออกทุกครั้ง API key เก็บในไฟล์ส่วนตัว (`secrets.toml` สิทธิ์ 0600) และเลือกใช้ Keychain ของ OS แทนได้ โปรเจกต์ไหนจะห้ามส่งไปบริการ cloud ใดๆ ก็ได้
 - **ดูแลตัวเองได้** ตอน daemon ว่าง จะสำรองข้อมูลรายวันพร้อมหมุนเวียนไฟล์, ตรวจความสมบูรณ์, เก็บตามนโยบายการเก็บรักษา และล้างถังขยะ `alice doctor` บอกว่าอะไรผิดและควรทำอะไรต่อ `alice service install` ให้ daemon เริ่มเองตอน login และค่าตั้งเปลี่ยนแล้วมีผลทันทีโดยไม่ต้อง restart
@@ -169,7 +169,7 @@ agent ที่ใช้ MCP ไม่ได้ เรียกผ่าน CLI 
 
 | Tool | หน้าที่ |
 |---|---|
-| `recall` | ค้นหา memory กรองตามโปรเจกต์, topic, kind และช่วงวันได้ ใส่ `include_raw` เพื่อค้น transcript ด้วย กำหนดงบ `max_tokens` ได้ เมื่อตั้ง model judge ไว้ (`judge.provider = jev`) recall จะเป็นแบบ **precise** เป็นค่าเริ่มต้น: Judge ให้คะแนนผลอันดับต้น ๆ 20 อันของทุกชั้น รวมถึง chunk ของ transcript และช่วยดึงคำตอบที่ต่ำกว่าเกณฑ์ vector เพียงนิดเดียวกลับมา (ช้ากว่า ราวครึ่งวินาที) `mode: "fast"` ข้าม Judge และ `mode: "precise"` บังคับใช้ ถ้าไม่มี model judge recall เป็นแบบ fast เสมอ ถ้า Judge ช้าหรือล้มเหลว recall เสียเวลาไม่เกิน `search.precise_timeout_ms` (ค่าเริ่มต้น 2.5 วินาที และถ้าล้มเหลวติดกัน 3 ครั้งจะข้าม Judge ไปหนึ่งนาที) แล้วตอบแบบ fast พร้อมหมายเหตุบอกเหตุผล recall จาก repository ที่ยังไม่เคยเขียนอะไรลง Alice จะถูกตัดสินด้วย `.alice.toml` ของ repository นั้นเองและรายการ global เหมือนการ embed query ผ่านผู้ให้บริการภายนอก |
+| `recall` | ค้นหา memory กรองตามโปรเจกต์, topic, kind และช่วงวันได้ ใส่ `include_raw` เพื่อค้น transcript ด้วย กำหนดงบ `max_tokens` ได้ เมื่อตั้ง model judge ไว้ (`judge.provider = jev`) recall จะเป็นแบบ **precise** เป็นค่าเริ่มต้น: Judge ให้คะแนนผลอันดับต้น ๆ 20 อันของทุกชั้น รวมถึง chunk ของ transcript และช่วยดึงคำตอบที่ต่ำกว่าเกณฑ์ vector เพียงนิดเดียวกลับมา (ช้ากว่า ราวครึ่งวินาที) `mode: "fast"` ข้าม Judge และ `mode: "precise"` บังคับใช้ ถ้าไม่มี model judge recall เป็นแบบ fast เสมอ ถ้า Judge ช้าหรือล้มเหลว recall เสียเวลาไม่เกิน `search.precise_timeout_ms` (ค่าเริ่มต้น 2.5 วินาที และถ้าล้มเหลวติดกัน 3 ครั้งจะข้าม Judge ไปหนึ่งนาที) แล้วตอบแบบ fast พร้อมหมายเหตุบอกเหตุผล recall จาก repository ที่ยังไม่เคยเขียนอะไรลง Alice จะถูกตัดสินด้วย `.alice.toml` ของ repository นั้นเองและรายการ global เหมือนการ embed query ผ่านผู้ให้บริการภายนอก ใน JSON ค่า `score` คือคะแนนรวมจากการค้นหาและไม่เรียงตามลำดับที่ Judge จัด ส่วนผลที่ Judge ให้คะแนนจะมี `relevance` (P(relevant) จาก Judge; ไม่มีในโหมด fast) และเมื่อ Judge ให้คะแนนแล้วแต่ไม่มีผลใดตอบคำถามได้ชัด (P(answers) ต่ำกว่า 0.5 ทุกผล) คำตอบจะมีหมายเหตุ "nothing found clearly answers this; the closest matches follow" และ `low_confidence: true` (ยกเว้นเมื่อการค้นใช้แค่การจับคำ เช่นตอนโมเดลกำลังโหลดใหม่หลังว่างนาน ซึ่งคำตอบจะบอกไว้ ในรูปแบบข้อความหมายเหตุอยู่ก่อนผลลัพธ์ และถ้าผลอันดับแรกมีรหัส/ตัวระบุยาว 6 ตัวอักษรขึ้นไปที่มีตัวเลขหรือ `_` หรือทั้งคำค้นตรงตัว (คำค้น 3 คำขึ้นไป) จะไม่ถูกติดธงนี้) คำค้นที่ไม่มีตัวอักษรหรือตัวเลขเลย (เช่น `?`) จะถูกปฏิเสธเหมือนคำค้นว่าง |
 | `remember` | บันทึก memory (`kind`, `title`, `topics`, `importance`, `supersedes`) เรียกซ้ำได้ปลอดภัย |
 | `context` | สรุปของโปรเจกต์ปัจจุบันภายในงบ token |
 | `get_memory` | ดู memory ฉบับเต็ม พร้อม link และแหล่งที่มา ถ้าขอ memory ที่ Judge รวมเข้ากับอันเก่าไปแล้ว จะได้อันเก่ากลับมา |
@@ -177,7 +177,7 @@ agent ที่ใช้ MCP ไม่ได้ เรียกผ่าน CLI 
 | `query_facts` | ถาม knowledge graph ได้ทั้งภาพ ณ วันที่ระบุ (`as_of`) และ timeline |
 | `assert_fact` | เพิ่ม แทนที่ หรือปิดอายุ fact พร้อมแนะนำ predicate ที่มีอยู่แล้ว |
 
-server ส่งคำแนะนำการใช้งานให้ agent ด้วย มี prompt `recall` และ `remember-session` และ resource `memory://context` กับ `memory://m/{id}` ส่วนชุด tool สำหรับดูแลระบบ (`review_list`, `review_resolve`, `merge_memories`, `stats`) ปิดอยู่เป็นค่าเริ่มต้น เปิดได้ด้วย `alice config set mcp.admin_tools true` (stdio shim ถาม daemon ทุกครั้งที่แสดงรายการ tool จึงไม่ต้อง restart)
+server ส่งคำแนะนำการใช้งานให้ agent ด้วย มี prompt `recall` และ `remember-session` และ resource `memory://context` กับ `memory://m/{id}` ส่วนชุด tool สำหรับดูแลระบบ (`review_list`, `review_resolve`, `merge_memories`, `stats`) ปิดอยู่เป็นค่าเริ่มต้น เปิดได้ด้วย `alice config set mcp.admin_tools true` (stdio shim ถาม daemon ทุกครั้งที่แสดงรายการ tool จึงไม่ต้อง restart daemon แต่ agent ที่แสดงรายการ tool ไปแล้วจะเห็นใน session ถัดไป)
 
 ## CLI
 
@@ -194,7 +194,7 @@ alice facts <entity> [--predicate p] [--as-of date] [--timeline]
 alice fact add|supersede|end <subject> <predicate> <object> [--from date]
 alice history [target] [--actor a] [--limit n]       # ใครเปลี่ยนอะไร
 alice undo <event-id>                                 # ย้อนการเปลี่ยนแปลง (ทั้งกลุ่ม)
-alice review [list [--type t] [--all] | show <id> | resolve <id> <choice>]
+alice review [list [--type t] [--all] [--page n] [--limit n] | show <id> | resolve <id> <choice> | dismiss --type t [--provider p] --all [--yes]]
 alice stats                    # จำนวนข้อมูล, review ที่ค้าง, ค่าใช้จ่ายของ judge
 alice backup now | list       alice restore [backup] [--yes]
 alice maintenance status | run <job>
@@ -215,7 +215,7 @@ alice import status
 
 `--action move` รับแค่ `--project` (flag อื่นจะถูกปฏิเสธ และ `--project` คู่กับ action อื่นก็ถูกปฏิเสธเช่นกัน) เหมือนการ merge project คือจะไม่ย้าย memory จาก project ที่ถูกกันไม่ให้ส่งขึ้น cloud ไปยัง project ที่ส่งได้ และจะตรวจข้อความกับกฎความเป็นส่วนตัวของ project ปลายทาง: โหมด `block` ปฏิเสธข้อความที่กฎนั้นจะเปลี่ยน ส่วนโหมดอื่นจะย้ายไปพร้อมข้อความที่ถูกปกปิดตามกฎนั้น
 
-ทุกคำสั่งใส่ `--json` ได้ ที่วางแผนไว้: `sync` (M4), `hook` (SP2), `ui` (SP3)
+ทุกคำสั่งใส่ `--json` ได้ (ยกเว้น `daemon logs`, `config edit` และ `model fetch` ที่ไม่พิมพ์เอกสาร JSON) ที่วางแผนไว้: `sync` (M4), `hook` (SP2), `ui` (SP3)
 
 ## การตั้งค่า
 
@@ -280,11 +280,13 @@ cloud_denied = true       # ห้ามส่งข้อความของ�
 custom_patterns = [{ name = "internal_id", regex = "ID-[0-9]{8}" }]
 ```
 
-**การเปลี่ยนค่าทำอย่างระมัดระวัง** `config.toml` ถูกตรวจทุก 2 วินาที ไฟล์หรือค่าที่ไม่ถูกต้องจะไม่ทับค่าที่ใช้งานได้: ค่าเดิมยังอยู่ และ error แสดงใน `alice config list`, `/api/v1/settings` และ `alice doctor` การเปลี่ยนที่ทำให้การป้องกันอ่อนลง (ปิด redaction, เอาโปรเจกต์ออกจาก `cloud_denied_projects`, เพิ่มงบ, สลับไปใช้ Jev หรือ embedding provider นอกเครื่อง, เปิด admin tools) จะมีผลก็ต่อเมื่ออ่านไฟล์ได้เหมือนกัน 3 ครั้งติดกัน (ราว 6 วินาที) ไฟล์ที่เซฟค้างครึ่งทางจึงปิด redaction แม้ชั่วขณะไม่ได้ ส่วน `alice config set` มีผลทันทีและบอกไว้ในผลลัพธ์ ตราบที่ยังไม่เคยโหลด `config.toml` ที่ถูกต้องสำเร็จ จะไม่ส่งอะไรไปบริการ cloud เลย ค่าเหล่านี้ต้อง restart daemon (`alice daemon stop`): `server.port`, `secrets.backend`, `embedding.idle_unload`, `embedding.batch_size` ส่วนการเปลี่ยน embedding provider หรือโมเดลไม่ต้อง restart: โมเดลใหม่ถูกเติมเบื้องหลังและสลับเข้าแทนแบบ atomic เมื่อครบ
+กฎเป็นของโปรเจกต์ ไม่ใช่ของ checkout ใด checkout หนึ่ง: worktree หรือ clone ใหม่ที่ไม่มีไฟล์นี้ยังใช้กฎที่อ่านได้จาก checkout หลัก (หลัง restart หรือหลังลบ worktree นั้นทิ้งก็ตาม) การลบไฟล์ใน checkout ที่อ่านกฎมา หรือเขียนไฟล์ที่ผ่อนลง จะมีผลหลังอ่านได้เหมือนกัน 3 ครั้ง
+
+**การเปลี่ยนค่าทำอย่างระมัดระวัง** `config.toml` ถูกตรวจทุก 2 วินาที ไฟล์หรือค่าที่ไม่ถูกต้องจะไม่ทับค่าที่ใช้งานได้: ค่าเดิมยังอยู่ และ error แสดงใน `alice config list`, `/api/v1/settings` และ `alice doctor` การเปลี่ยนที่ทำให้การป้องกันอ่อนลง (ปิด redaction, เอาโปรเจกต์ออกจาก `cloud_denied_projects`, เพิ่มงบ, สลับไปใช้ Jev หรือ endpoint อื่นของ Jev หรือ embedding provider นอกเครื่อง, เปิด admin tools, ลดระยะเก็บข้อมูลหรือถังขยะ) จะมีผลก็ต่อเมื่ออ่านไฟล์ได้เหมือนกัน 3 ครั้งติดกัน (ราว 6 วินาที) ไฟล์ที่เซฟค้างครึ่งทางจึงปิด redaction แม้ชั่วขณะไม่ได้ ส่วน `alice config set` มีผลทันทีและบอกไว้ในผลลัพธ์ ตราบที่ยังไม่เคยโหลด `config.toml` ที่ถูกต้องสำเร็จ จะไม่ส่งอะไรไปบริการ cloud เลย และปฏิเสธการเขียนที่มี secret โดยยังใช้ค่า privacy ล่าสุดที่เคยใช้ได้ (รวม custom patterns ของคุณ) ค่าเหล่านี้ต้อง restart daemon (`alice daemon stop`): `server.port`, `secrets.backend`, `embedding.idle_unload`, `embedding.batch_size` ส่วนการเปลี่ยน embedding provider หรือโมเดลไม่ต้อง restart: โมเดลใหม่ถูกเติมเบื้องหลังและสลับเข้าแทนแบบ atomic เมื่อครบ
 
 **redaction ตัดอะไรบ้าง** ก่อนบันทึกหรือส่งออก memory, chunk ของ transcript, snapshot ในประวัติ, งานเขียนที่รอในคิว หรือคำขอไป Jev Alice จะแทน secret ด้วย `[REDACTED:<type>]` ได้แก่ private key, JWT, key ของ AWS, GitHub, GitLab, Slack, Stripe, SendGrid, Vault, Anthropic และ OpenAI, รหัสผ่านใน URL, การกำหนดค่าแบบ `password=`/`token=` และค่าที่สุ่มสูงยาวๆ ที่ตามหลังชื่อคล้าย key รวมถึง `custom_patterns` ของคุณเอง ถ้าตั้ง `redact_mode = "block"` จะปฏิเสธการเขียนแทน โดย error บอกชื่อ field และ detector (ไม่บอก secret)
 
-**embedding ในเครื่องหรือไม่** ค่าเริ่มต้นคือโมเดลหลายภาษาในเครื่อง provider ผ่าน HTTP (`ollama` ในเครื่องหรือในเครือข่ายของคุณ, `openai` สำหรับ endpoint ที่เข้ากันกับ OpenAI, `voyage`) จะได้รับข้อความเฉพาะโปรเจกต์ที่นโยบาย cloud อนุญาต และ `ollama` บน `localhost` ถือว่าเป็นในเครื่อง รายละเอียด: [docs/benchmarks/m2-embedding.md](docs/benchmarks/m2-embedding.md)
+**embedding ในเครื่องหรือไม่** ค่าเริ่มต้นคือโมเดลหลายภาษาในเครื่อง provider ผ่าน HTTP (`ollama` ในเครื่องหรือในเครือข่ายของคุณ, `openai` สำหรับ endpoint ที่เข้ากันกับ OpenAI, `voyage`) จะได้รับข้อความเฉพาะโปรเจกต์ที่นโยบาย cloud อนุญาต โดย secret ถูกตัดด้วยกฎปัจจุบันเสมอแม้คุณเลือกเก็บข้อความดิบ และ `ollama` บน `localhost` ถือว่าเป็นในเครื่อง รายละเอียด: [docs/benchmarks/m2-embedding.md](docs/benchmarks/m2-embedding.md)
 
 ## Judge, review และ undo
 
@@ -292,7 +294,7 @@ custom_patterns = [{ name = "internal_id", regex = "ID-[0-9]{8}" }]
 
 - **Heuristic (ค่าเริ่มต้น ทำงานในเครื่อง ฟรี)** รวม memory ใหม่เข้ากับอันเก่าก็ต่อเมื่อข้อความเหมือนกันหลัง normalize Unicode และยุบช่องว่าง (ตัวพิมพ์เล็กใหญ่และเครื่องหมายวรรคตอนมีผล) ไม่เคยรวมเพราะความคล้ายอย่างเดียว: ถ้าน่าจะซ้ำ น่าจะเป็นการอัปเดต หรือน่าจะอยู่คนละโปรเจกต์ จะกลายเป็นรายการในคิว review และไม่ตั้ง kind ให้
 - **Jev (เลือกเปิด)** โมเดล Jev ของ TypeSafe ตอบคำถามแบบเลือกคำตอบพร้อมความน่าจะเป็น Alice ถามว่า memory ใหม่ซ้ำ, อัปเดต, ขัดแย้ง หรือไม่เกี่ยวกับเพื่อนบ้านที่ใกล้ที่สุดแต่ละอัน และ kind กับโปรเจกต์ไหนเหมาะ ถ้าถึง `judge.auto_apply_threshold` จะลงมือเลย ถ้าอยู่ระหว่างสองเกณฑ์จะเป็นรายการ review ต่ำกว่านั้นไม่ทำอะไร คำตอบถูก cache ตามคำขอ จำกัดอัตราการเรียก และงบรายวันถูกจองไว้ก่อนเรียกทุกครั้ง ยอดใช้ในวันจึงไม่เกิน `judge.daily_budget_usd` ถ้า Jev ล่ม งบหมด หรือโปรเจกต์นั้นไม่ได้รับอนุญาต heuristic จะตัดสินแทนและ memory จะถูกตัดสินใหม่ภายหลัง ปัญหาของ Judge ไม่เคยทำให้การเขียนล้มเหลว จากการประเมินแบบสังเคราะห์ใน [docs/benchmarks/m2-jev.md](docs/benchmarks/m2-jev.md) ค่าใช้จ่ายอยู่ที่ **$0.0113 ต่อ 1,000 การตัดสินใจ** (หนึ่งการตัดสินใจคือเทียบ memory หนึ่งคู่ ราคา input token $0.042 ต่อล้าน token) และ smoke test สดของการเทียบหนึ่งครั้งอยู่ที่ราว **$0.00004** การประเมินนั้น (216 คู่ที่เขียนขึ้นเพื่อการนี้ รันครั้งเดียว) ได้ความแม่นยำของ Jev ในการระบุความสัมพันธ์ 0.917 เทียบกับ heuristic 0.287 ควรอ่านข้อควรระวังในหน้านั้นก่อนเชื่อตัวเลขสำหรับการใช้งานจริง
-- **คิว review** `alice review` แสดงสิ่งที่ Alice ตัดสินเองไม่ได้ (supersede, contradiction, merge, predicate, project, undo) ส่วน `alice review show <id>` กับ `alice review resolve <id> <choice>` ใช้ตอบ
+- **คิว review** `alice review` แสดงสิ่งที่ Alice ตัดสินเองไม่ได้ (supersede, contradiction, merge, predicate, project, undo) ส่วน `alice review show <id>` กับ `alice review resolve <id> <choice>` ใช้ตอบ รายการแบ่งหน้าได้ (`--page`) และบรรทัดท้ายบอกจำนวนที่ค้างทั้งหมดแยกตามประเภท (`--json` ให้ `{total, by_type, page, limit, items}`) ส่วน `alice review dismiss --type merge --all` ปิดทั้งประเภทในครั้งเดียวโดยไม่แก้ memory ใดๆ (กลุ่ม merge ที่ปิดไปแล้วจะไม่ถูกเสนออีก) job แนะนำการรวม (merge) รายสัปดาห์จะหยุดเสนอเมื่อมี merge ค้างครบ 50 รายการ และ `context` จะบอกให้ถามผู้ใช้เรื่อง review ก็ต่อเมื่อมีค้างไม่เกิน 10 รายการ
 - **ประวัติและ undo** ทุกการเปลี่ยนแปลงเป็น event: `alice history [id]` แสดงว่าใครเปลี่ยนอะไร `alice undo <event-id>` ย้อนกลับพร้อมกับการเปลี่ยนอื่นที่เกิดจากการกระทำเดียวกัน (เช่น merge หรือ supersede) ถ้าเป้าหมายเปลี่ยนไปแล้ว Alice จะเปิดรายการ review แทนการเขียนทับ การเปลี่ยนของ memory, fact และ predicate ย้อนได้ ส่วน memory ที่ถูก purge แล้วย้อนกลับมาไม่ได้
 
 ## Backup และ restore
@@ -303,7 +305,7 @@ alice backup list
 alice restore             # backup ล่าสุด หรือ: alice restore <ชื่อหรือ path> [--yes]
 ```
 
-daemon ยังสำรองข้อมูลรายวันเองตอนว่าง โดยเก็บอันล่าสุดของแต่ละวันใน 7 วัน และของแต่ละสัปดาห์ใน 4 สัปดาห์ (`backup.daily`, `backup.weekly`) backup ที่สั่งเองเก็บ 5 อันล่าสุด สำเนาที่ทำก่อน migrate ฐานข้อมูลหรือก่อน restore เก็บ 30 วัน (อันล่าสุดของแต่ละชนิดเก็บไว้เสมอ) backup มีแต่ฐานข้อมูล ไม่มี `secrets.toml` หรือ token
+daemon ยังสำรองข้อมูลรายวันเองตอนว่าง โดยเก็บอันล่าสุดของแต่ละวันใน 7 วัน และของแต่ละสัปดาห์ใน 4 สัปดาห์ (`backup.daily`, `backup.weekly`) backup ที่สั่งเองเก็บ 5 อันล่าสุด สำเนาที่ทำก่อน migrate ฐานข้อมูลหรือก่อน restore เก็บ 30 วัน (อันล่าสุดของแต่ละชนิดเก็บไว้เสมอ) backup มีแต่ฐานข้อมูล ไม่มี `secrets.toml` หรือ token ถ้าตั้ง `backup.dir` แต่ละ home จะเก็บ backup ในโฟลเดอร์ของตัวเองข้างใน (`home-<id>`) home ที่ใช้โฟลเดอร์ backup ร่วมกันจึงไม่หมุนเวียนหรือ restore backup ของกันและกัน
 
 `alice restore` ตรวจ backup ก่อน (ไฟล์ SQLite ที่ผ่าน `quick_check` และ schema ที่ build นี้อ่านได้ ถ้าใหม่กว่าจะปฏิเสธก่อนหยุดอะไรทั้งนั้น) แล้วหยุด daemon เก็บฐานข้อมูลปัจจุบันไว้เป็น `backups/alice-before-restore-<เวลา>.db` สลับ backup เข้าที่ด้วย rename ครั้งเดียว แล้วเริ่ม daemon ใหม่ ซึ่งสร้าง vector index ใหม่และนำงานเขียนที่ agent พักไว้ใน spool มาใช้ `alice.db` เป็นฐานข้อมูลเก่าที่สมบูรณ์หรือฐานข้อมูลที่กู้แล้วที่สมบูรณ์เสมอ ถ้าขั้นใดล้มเหลว ฐานข้อมูลเก่ายังอยู่ backup ที่ schema เก่ากว่าจะถูก migrate ตอนเริ่ม (พร้อม backup ก่อน migrate ของมันเอง) `secrets.toml`, `config.toml` และ spool ไม่ถูกแตะ ต้องมีที่ว่างพอสำหรับสำเนาที่เก็บไว้และไฟล์ที่กู้ ถ้าไม่พอจะปฏิเสธโดยไม่เปลี่ยนอะไร
 
@@ -311,7 +313,7 @@ daemon ยังสำรองข้อมูลรายวันเองต�
 
 กับฐานข้อมูลใหญ่ daemon จะหยุดนานเท่ากับการคัดลอกสองครั้งและการตรวจ (หลายนาทีที่ 2.8 GB) ระหว่างนั้นงานเขียนของ agent ถูกพักใน spool ทันทีและนำมาใช้ภายหลัง
 
-งาน maintenance ทำงานเองเมื่อ daemon ว่างมาหนึ่งนาที และหลีกทางทันทีที่มีคำขอเข้ามา: รายวันคือ backup, ตรวจความสมบูรณ์, ตรวจ vector index, นโยบายการเก็บ raw, ล้างถังขยะ และลบประวัติเก่า รายสัปดาห์คือ merge ของ full-text index และข้อเสนอให้รวม memory ที่คล้ายกัน รายชั่วโมงคือลองตัดสินใหม่กับ memory ที่ judge ล้มเหลว `alice maintenance status` แสดงว่าแต่ละงานรันล่าสุดเมื่อไร และ `alice maintenance run <job>` สั่งรันงานนั้นทันที
+งาน maintenance ทำงานเองเมื่อ daemon ว่างมาหนึ่งนาที และหลีกทางทันทีที่มีคำขอเข้ามา: รายวันคือ backup, ตรวจความสมบูรณ์, ตรวจ vector index, นโยบายการเก็บ raw, ล้างถังขยะ และลบประวัติเก่า รายสัปดาห์คือ merge ของ full-text index และข้อเสนอให้รวม memory ที่คล้ายกัน (ไม่รวม diary และ status, กลุ่มหนึ่งมี kind เดียว, ทุกคู่ในกลุ่มต้องคล้ายกันทั้งเวกเตอร์และถ้อยคำ (คำซ้ำกัน 0.6 และตัวเลขต้องตรงกันทุกตัวตามที่เขียน จึงไม่เสนอให้รวมเมื่อพอร์ต เวอร์ชัน จำนวนเงิน หรือวันที่ต่างกัน; ภาษาไทยเทียบตัวอักษรสามตัว), ค่าความน่าจะเป็นที่แสดงคือความคล้ายต่ำสุดของคู่ในกลุ่ม, memory หนึ่งอยู่ได้แค่หนึ่งรายการที่ค้างอยู่, กลุ่มละไม่เกิน 5) รายชั่วโมงคือลองตัดสินใหม่กับ memory ที่ judge ล้มเหลว `alice maintenance status` แสดงว่าแต่ละงานรันล่าสุดเมื่อไร และ `alice maintenance run <job>` สั่งรันงานนั้นทันที
 
 ## สุขภาพระบบ token และ service
 

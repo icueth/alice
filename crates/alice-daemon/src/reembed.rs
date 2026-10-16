@@ -19,7 +19,7 @@
 
 use crate::maintenance::Activity;
 use crate::service::{Active, ActiveSlot, IndexSlot, snapshot};
-use crate::worker::{embed_guarded, nap, split_by_policy};
+use crate::worker::{embed_guarded, nap, redacted_for, split_by_policy};
 use crate::writer::{WriteOp, WriteOutcome, WriterHandle};
 pub use alice_core::api::ReembedStatus;
 use alice_core::embed::Embedder;
@@ -220,8 +220,9 @@ fn gated_embed(cfg: &ReembedConfig, items: Vec<PendingItem>) -> Result<Gated, Ha
         if cfg.stop.load(Ordering::Relaxed) {
             return Err(Halt::Stopped);
         }
+        let remaining_now = redacted_for(&cfg.readers, cfg.policy.as_ref(), remote, remaining);
         let (allowed, denied) =
-            split_by_policy(&cfg.readers, cfg.policy.as_ref(), remote, remaining);
+            split_by_policy(&cfg.readers, cfg.policy.as_ref(), remote, remaining_now);
         out.denied.extend(denied);
         if allowed.is_empty() {
             return Ok(out);

@@ -23,6 +23,7 @@ use alice_core::judge::pipeline::{Thresholds, decide};
 use alice_core::judge::text::title_similarity;
 use alice_core::judge::{Distribution, Judge, JudgeError, JudgeMemory, ProjectOption, Relation};
 use alice_core::model::{Kind, Memory, Status};
+use alice_core::settings::ProjectTree;
 use alice_core::store::ReaderPool;
 use alice_core::store::embeddings::{self, VecKey};
 use alice_core::store::judge::{PendingJudgement, pending, retry_backoff};
@@ -34,7 +35,6 @@ use alice_core::vector::VectorIndex;
 use crossbeam_channel::Receiver;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -255,6 +255,7 @@ fn judge_memory(m: &Memory, similarity: Option<f32>) -> JudgeMemory {
         created_at: m.created_at.clone(),
         similarity,
         raw: false,
+        status: None,
     }
 }
 
@@ -426,11 +427,11 @@ impl Outcome {
     }
 }
 
-/// Whether moving the memory into the project rooted at `root` would change its text under
-/// that project's privacy rules (a stricter project): such a move is left to a person, whose
-/// answer goes through the same screening as any other move.
-fn rules_would_change(cfg: &JudgeWorkerConfig, root: Option<&str>, m: &Memory) -> bool {
-    let r = cfg.redactors.for_root(root.map(Path::new));
+/// Whether moving the memory into the project in the working tree `tree` would change its text
+/// under that project's privacy rules (a stricter project): such a move is left to a person,
+/// whose answer goes through the same screening as any other move.
+fn rules_would_change(cfg: &JudgeWorkerConfig, tree: Option<&ProjectTree>, m: &Memory) -> bool {
+    let r = cfg.redactors.for_root(tree);
     [&m.title, &m.body]
         .into_iter()
         .chain(m.topics.iter())
@@ -662,13 +663,13 @@ fn route_memory(
         let Some(p) = projects::resolve_slug(c, &slug)? else {
             return Ok(None);
         };
-        Ok(Some(projects::root_of(c, &p.id)?))
+        Ok(Some(projects::tree_of(c, &p.id)?))
     })?;
     let auto_ok = p >= t.auto
         && by != "heuristic"
         && dest_root
             .as_ref()
-            .is_some_and(|root| !rules_would_change(cfg, root.as_deref(), memory));
+            .is_some_and(|tree| !rules_would_change(cfg, tree.as_ref(), memory));
     if auto_ok {
         Ok(Some((slug, p, by, false)))
     } else if p >= t.review {

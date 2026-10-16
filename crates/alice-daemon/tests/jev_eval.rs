@@ -294,6 +294,7 @@ fn mem(
         created_at: (now - chrono::Duration::days(v["days_ago"].as_i64().unwrap())).to_rfc3339(),
         similarity: sim,
         raw: false,
+        status: None,
     }
 }
 

@@ -33,6 +33,14 @@ impl ProjectRef {
             remote: None,
         }
     }
+
+    /// The working tree in use, keyed by the project (its rules are the project's, whatever
+    /// tree they were read in); `None` without one.
+    pub fn tree(&self) -> Option<crate::settings::ProjectTree> {
+        self.root
+            .as_ref()
+            .map(|r| crate::settings::ProjectTree::new(self.key.clone(), r.clone()))
+    }
 }
 
 /// `git@github.com:Me/Repo.git` -> `github.com/me/repo`. Credentials and ports are dropped.

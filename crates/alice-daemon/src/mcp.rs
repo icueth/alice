@@ -442,12 +442,19 @@ impl AliceMcp {
         };
         name.filter(|n| !n.trim().is_empty())
     }
+
+    /// Who an MCP write is recorded as: always the session's client (an `author` in the
+    /// arguments is ignored, so an agent cannot pass itself off as the person or as another
+    /// agent), and `unknown` for a client without a name (final review D-m5).
+    fn author(ctx: &RequestContext<RoleServer>) -> String {
+        Self::agent(ctx).unwrap_or_else(|| "unknown".into())
+    }
 }
 
 #[tool_router]
 impl AliceMcp {
     #[tool(
-        description = "Search long-term memory: decisions, bug fixes, facts, how-tos, preferences and past work. Use before answering about anything done before. By default a configured model judge (judge.provider = jev) grades the top results, so recall is precise (slower, about half a second); pass mode \"fast\" to skip the judge, or mode \"precise\" to force it.",
+        description = "Search long-term memory: decisions, bug fixes, facts, how-tos, preferences and past work. Use before answering about anything done before. By default a configured model judge (judge.provider = jev) grades the top results, so recall is precise (slower, about half a second); pass mode \"fast\" to skip the judge, or mode \"precise\" to force it. In json format each result has `score` (the search's fusion score, which does not follow the judge's order) and, when the judge graded it, `relevance`; `low_confidence` is true when the judge found nothing that clearly answers (a note says so in either format).",
         annotations(read_only_hint = true)
     )]
     async fn recall(
@@ -473,9 +480,7 @@ impl AliceMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         req.cwd = self.cwd(&ctx).await;
-        if req.author.agent.is_none() {
-            req.author.agent = Self::agent(&ctx);
-        }
+        req.author.agent = Some(Self::author(&ctx));
         Ok(match self.backend.remember(req).await {
             Ok(r) => match (r.status, r.id) {
                 (RememberStatus::Spooled, _) => text(queued_text(r.reason.as_deref())),
@@ -534,9 +539,7 @@ impl AliceMcp {
             )));
         }
         // The change is the client's: history records it as `agent:<client name>`.
-        if req.author.agent.is_none() {
-            req.author.agent = Self::agent(&ctx);
-        }
+        req.author.agent = Some(Self::author(&ctx));
         Ok(match self.backend.update(req).await {
             Ok(r) => json(&r),
             Err(e) => tool_err(e),
@@ -565,9 +568,7 @@ impl AliceMcp {
         Parameters(mut req): Parameters<AssertFactRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if req.author.agent.is_none() {
-            req.author.agent = Self::agent(&ctx);
-        }
+        req.author.agent = Some(Self::author(&ctx));
         Ok(match self.backend.assert_fact(req).await {
             Ok(r) => json(&r),
             Err(e) => tool_err(e),

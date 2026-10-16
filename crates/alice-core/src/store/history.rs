@@ -352,8 +352,10 @@ fn restore_memory(conn: &Connection, id: &str, s: &MemorySnapshot, hlc: &str) ->
     fts::index_memory(conn, seq, &s.title, &s.body, &s.topics)?;
     conn.execute("DELETE FROM links WHERE from_id = ?1", [id])?;
     for (to, kind) in &s.links_out {
+        // A link to a memory purged since is not put back (links have no foreign key).
         conn.execute(
-            "INSERT OR IGNORE INTO links (from_id, to_id, type, created_by, created_at) VALUES (?1, ?2, ?3, 'undo', ?4)",
+            "INSERT OR IGNORE INTO links (from_id, to_id, type, created_by, created_at)
+             SELECT ?1, ?2, ?3, 'undo', ?4 WHERE EXISTS (SELECT 1 FROM memories WHERE id = ?2)",
             params![id, to, kind, now_rfc3339()],
         )?;
     }
@@ -535,9 +537,26 @@ fn undo_with(
             project_merge::check_undo_possible(conn, e)?;
         }
     }
+    // An event that changed nothing its snapshot holds, the only one of its target in the group
+    // (the survivor of a merge), has nothing to revert and nothing to compare: a later change of
+    // that target neither blocks the undo nor is overwritten by it. (A target with more events
+    // in the group keeps its newest as the reference: its recorded snapshots are redacted, so
+    // a re-redaction after a move looks unchanged although it changed the text.)
+    let mut unchanged = HashSet::new();
+    for e in &todo {
+        let alone = todo
+            .iter()
+            .filter(|o| o.target_type == e.target_type && o.target_id == e.target_id)
+            .count()
+            == 1;
+        let (before, after) = states(conn, e)?;
+        if alone && before.is_some() && before == after {
+            unchanged.insert(e.id.clone());
+        }
+    }
     // Each target must look as its newest event in the group left it.
     let mut checked = HashSet::new();
-    for e in &todo {
+    for e in todo.iter().filter(|e| !unchanged.contains(&e.id)) {
         if !checked.insert((e.target_type.as_str(), e.target_id.as_str())) {
             continue;
         }
@@ -594,6 +613,8 @@ fn undo_with(
             ))
         };
         match (target_kind(&e.target_type)?, before) {
+            // Nothing to put back (see `unchanged`); the undo is still recorded for it.
+            _ if unchanged.contains(&e.id) => {}
             (Target::Memory, Some(b)) => {
                 let s: MemorySnapshot = serde_json::from_value(b).map_err(bad)?;
                 restore_memory(conn, &e.target_id, &restorable(conn, &s, redact, true)?, &h)?;
@@ -1539,6 +1560,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("purged"), "{err}");
+    }
+
+    /// Final review B-M5: an undo never puts back a link to a memory purged since (a purge
+    /// removes the links to it without an event).
+    #[test]
+    fn an_undo_never_restores_a_link_to_a_purged_memory() {
+        let mut t = T::new();
+        let old = t.remember("the old fact");
+        let (new, _) = t.remember_superseding("the new fact", &[&old]);
+        let ev = t.edit(&new, "the new fact, edited");
+        // The purge of the old memory, as maintenance does it: the row and the links to it.
+        t.c.execute("DELETE FROM links WHERE to_id = ?1", [&old])
+            .unwrap();
+        t.c.execute("DELETE FROM memories WHERE id = ?1", [&old])
+            .unwrap();
+        let out = t.force_undo_with(&ev, Redactor::builtin()).unwrap();
+        assert!(matches!(out, UndoOutcome::Undone { .. }), "{out:?}");
+        assert_eq!(t.body(&new), "the new fact");
+        let dangling: i64 =
+            t.c.query_row("SELECT count(*) FROM links WHERE to_id = ?1", [&old], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dangling, 0);
     }
 
     /// R2: force skips the conflict check only, never the privacy rules.

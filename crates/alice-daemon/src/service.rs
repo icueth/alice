@@ -30,7 +30,7 @@ use alice_core::normalize::normalize_topic;
 use alice_core::project::{ProjectRef, detect_project};
 use alice_core::redact::Redactor;
 use alice_core::search::{self, SearchOutput, SearchParams, pack};
-use alice_core::settings::{self, DefaultRecallMode, SettingError, Settings};
+use alice_core::settings::{self, DefaultRecallMode, ProjectTree, SettingError, Settings};
 use alice_core::store::embeddings;
 use alice_core::store::events::Actor;
 use alice_core::store::history::UndoOutcome;
@@ -107,6 +107,8 @@ const NOTE_BUDGET: &str = "the judge's daily budget is spent; this answer is the
 const NOTE_UNAVAILABLE: &str = "the judge is unavailable; this answer is the fast one";
 const NOTE_UNEXPECTED: &str =
     "the judge's answer did not match the results sent; this answer is the fast one";
+/// The judge graded the results and none clearly answers the query (precise mode).
+const NOTE_NOTHING_ANSWERS: &str = "nothing found clearly answers this; the closest matches follow";
 const NOTE_NO_GRADES: &str = "the judge gave no grade; this answer is the fast one";
 const NOTE_BUSY: &str = "the judge is busy with other recalls; this answer is the fast one";
 const NOTE_SLOW: &str =
@@ -119,6 +121,43 @@ const NEAR_FLOOR_BAND: f32 = 0.03;
 /// probability (`P(answers) >= 0.5`, the relevance rule of the M2 floor evaluation,
 /// `jev_eval.rs`).
 const RESCUE_ANSWERS_MIN: f64 = 0.5;
+
+/// Whether `hay` holds `needle` with no letter, digit or `_` on either side.
+fn contains_bounded(hay: &str, needle: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    hay.match_indices(needle).any(|(i, m)| {
+        !hay[..i].chars().next_back().is_some_and(word)
+            && !hay[i + m.len()..].chars().next().is_some_and(word)
+    })
+}
+
+/// Whether `hit` holds, verbatim (ignoring case) in its title, snippet or body, a distinctive
+/// token of `query` (6 or more characters with a digit or a `_`: a code, id or identifier;
+/// not an ordinary hyphenated word or filename) or the whole `query` as a phrase (3 or more
+/// words; a query without spaces, as in Thai, 12 or more characters). Words and tokens match on
+/// boundaries. Such a hit is no "nothing found".
+fn exact_match(query: &str, hit: &alice_core::api::Hit) -> bool {
+    let hay = format!(
+        "{}\n{}\n{}",
+        hit.title,
+        hit.snippet,
+        hit.body.as_deref().unwrap_or("")
+    )
+    .to_lowercase();
+    let whole = query.trim().to_lowercase();
+    let words = whole.split_whitespace().count();
+    let phrase = if words >= 3 {
+        contains_bounded(&hay, &whole)
+    } else {
+        words == 1 && whole.chars().count() >= 12 && hay.contains(&whole)
+    };
+    phrase
+        || whole
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+            .filter(|t| t.chars().count() >= 6 && t.chars().any(|c| c.is_ascii_digit() || c == '_'))
+            .any(|t| contains_bounded(&hay, t))
+}
 
 /// Said in a recall answer when its query was not sent to a remote embedding provider.
 const QUERY_HELD_BACK: &str = "this search used word matches only: the cloud policy keeps this project's text away from the embedding provider, so the query was not sent";
@@ -152,14 +191,14 @@ fn query_cloud(
             let found = readers
                 .with(|c| projects::detected_for_read(c, r))
                 .unwrap_or(DetectedForRead::Unstored);
-            // What the working tree itself says (its `.alice.toml` and the global lists), for a
-            // project the store does not hold as the detected one.
-            let root = r.root.as_deref();
+            // What the working tree itself says (its `.alice.toml`, kept per project key, and
+            // the global lists), for a project the store does not hold as the detected one.
+            let tree = r.tree();
             let tree_allows = !r.slug.trim().is_empty()
                 && [r.slug.as_str(), r.name.as_str()]
                     .into_iter()
                     .filter(|n| !n.trim().is_empty())
-                    .all(|n| settings.cloud_allowed(n, root));
+                    .all(|n| settings.cloud_allowed(n, tree.as_ref()));
             match found {
                 DetectedForRead::Stored(p) => {
                     known(cloud.cloud_allowed(&p.slug), cloud.redactor(&p.slug))
@@ -169,12 +208,12 @@ fn query_cloud(
                 // file). A tree that denies is judged as an unstored one is: denied.
                 DetectedForRead::Placeholder(p) => QueryCloud {
                     allowed: tree_allows && cloud.cloud_allowed(&p.slug),
-                    redactor: redactors.for_root_always_on(root),
+                    redactor: redactors.for_root_always_on(tree.as_ref()),
                     unstored: !tree_allows,
                 },
                 DetectedForRead::Ambiguous(_) | DetectedForRead::Unstored => QueryCloud {
                     allowed: tree_allows,
-                    redactor: redactors.for_root_always_on(root),
+                    redactor: redactors.for_root_always_on(tree.as_ref()),
                     unstored: true,
                 },
             }
@@ -622,17 +661,13 @@ impl Service {
     }
 }
 
-/// The working-tree root of the project `choice` names.
-fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<PathBuf> {
+/// The working tree of the project `choice` names, keyed by the project.
+fn project_root_in(readers: &ReaderPool, choice: &ProjectChoice) -> Option<ProjectTree> {
     match choice {
-        ProjectChoice::Detected(r) => r.root.clone(),
+        ProjectChoice::Detected(r) => r.tree(),
         // `global` has no working tree: the global privacy settings apply.
         ProjectChoice::Fallback => None,
-        ProjectChoice::Slug(s) => readers
-            .with(|c| projects::root_of(c, s))
-            .ok()
-            .flatten()
-            .map(PathBuf::from),
+        ProjectChoice::Slug(s) => readers.with(|c| projects::tree_of(c, s)).ok().flatten(),
     }
 }
 
@@ -1286,6 +1321,12 @@ impl Service {
 
     pub async fn remember(&self, req: RememberRequest) -> Result<RememberResponse> {
         let _busy = self.activity.enter();
+        self.remember_spooled(req).await
+    }
+
+    /// [`remember`](Self::remember) for a write the spool queued: the drain is the daemon's own
+    /// timer, not a request, so it does not keep maintenance (backups included) from starting.
+    pub async fn remember_spooled(&self, req: RememberRequest) -> Result<RememberResponse> {
         let project = self
             .choose(req.project.as_deref(), req.cwd.as_deref())
             .await?;
@@ -1324,9 +1365,9 @@ impl Service {
         }
     }
 
-    /// The working-tree root of the project a write goes to, if it has one. A named project is
+    /// The working tree of the project a write goes to, if it has one. A named project is
     /// looked up in the database, so call this off the async runtime.
-    pub fn project_root(&self, choice: &ProjectChoice) -> Option<PathBuf> {
+    pub fn project_root(&self, choice: &ProjectChoice) -> Option<ProjectTree> {
         project_root_in(&self.readers, choice)
     }
 
@@ -1339,8 +1380,8 @@ impl Service {
         };
         let (readers, settings) = (self.readers.clone(), self.settings.clone());
         tokio::task::spawn_blocking(move || {
-            let root = project_root_in(&readers, &choice);
-            settings.project_fail_closed(root.as_deref())
+            let tree = project_root_in(&readers, &choice);
+            settings.project_fail_closed(tree.as_ref())
         })
         .await
         .unwrap_or(false)
@@ -1353,8 +1394,8 @@ impl Service {
         let (readers, redactors, choice) =
             (self.readers.clone(), self.redactors.clone(), choice.clone());
         tokio::task::spawn_blocking(move || {
-            let root = project_root_in(&readers, &choice);
-            redactors.for_root(root.as_deref())
+            let tree = project_root_in(&readers, &choice);
+            redactors.for_root(tree.as_ref())
         })
         .await
         .map_err(join_err)
@@ -1365,12 +1406,11 @@ impl Service {
     async fn redactor_for_memory(&self, id: String) -> Result<Arc<Redactor>> {
         let (readers, redactors) = (self.readers.clone(), self.redactors.clone());
         tokio::task::spawn_blocking(move || {
-            let root = readers
-                .with(|c| projects::root_of_memory(c, &id))
+            let tree = readers
+                .with(|c| projects::tree_of_memory(c, &id))
                 .ok()
-                .flatten()
-                .map(PathBuf::from);
-            redactors.for_root(root.as_deref())
+                .flatten();
+            redactors.for_root(tree.as_ref())
         })
         .await
         .map_err(join_err)
@@ -1449,7 +1489,7 @@ impl Service {
         let (active, index) = snapshot(&self.active, &self.index);
         // Embedded before a reader connection is taken: the model is shared with the
         // embedding worker, and a recall waiting for it must not hold a connection.
-        let text = search::query_text(&req.query)?;
+        let text = search::recall_query_text(&req.query)?;
         // The mode: the request's own, else `search.default_mode`; `auto` is precise exactly
         // when the judge in force is a model judge (the heuristic cannot grade).
         let can_grade = self.judge().provider() != "heuristic";
@@ -1504,11 +1544,14 @@ impl Service {
                 match send {
                     Some(q) => {
                         let idx = idx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            search::embed_query(Some(&idx), embedder.as_ref(), &q)
+                        let v = tokio::task::spawn_blocking(move || {
+                            search::embed_query_or_why(Some(&idx), embedder.as_ref(), &q)
                         })
                         .await
-                        .map_err(join_err)?
+                        .map_err(join_err)?;
+                        // A recall that used word matches only says so (the first one after
+                        // the model was unloaded for being idle, a provider that is down).
+                        v.map_err(|why| notes.push(why)).ok()
                     }
                     None => {
                         notes.push(QUERY_HELD_BACK.into());
@@ -1516,8 +1559,13 @@ impl Service {
                     }
                 }
             }
-            _ => None,
+            _ => {
+                notes.push(search::INDEX_REBUILDING.into());
+                None
+            }
         };
+        // Whether meaning-search ran: without it, "nothing answers" would claim too much.
+        let vector_ran = vector.is_some();
         // The raw tier's chunk vector list reads on this pool, beside the main reader's word
         // lists: one connection of each, main first (`ServiceOptions::vector_reader_pool`).
         let vector_readers = self.vector_readers.clone();
@@ -1588,9 +1636,10 @@ impl Service {
             .await?;
         let mut out = out;
         let mut reranked = false;
+        let mut low_confidence = false;
         if precise {
             let why;
-            (out, reranked, why) = self
+            (out, reranked, low_confidence, why) = self
                 .rerank(
                     out,
                     &slug,
@@ -1601,21 +1650,44 @@ impl Service {
                 )
                 .await;
             notes.extend(why);
+            // The judge doubts it, but the top result holds a code or the whole phrase verbatim.
+            if low_confidence
+                && out
+                    .hits
+                    .first()
+                    .is_some_and(|h| exact_match(&judged_query, h))
+            {
+                low_confidence = false;
+            }
+            // Only words were searched: what was not found by meaning may still be there.
+            if !vector_ran {
+                low_confidence = false;
+            }
+            if low_confidence {
+                notes.push(NOTE_NOTHING_ANSWERS.into());
+            }
         }
         let (response, touched) = match format {
             OutputFormat::Text => {
                 let (text, omitted) = pack::pack_text(&out, Some(&slug), max_tokens);
                 let shown = &out.hits[..out.hits.len() - omitted];
                 let touched = returned_memories(out.memory_seqs.clone(), shown);
-                let mut text = text;
+                // The notes come first: a reader going top-down meets the doubt before the results.
+                let mut head = String::new();
                 for n in &notes {
-                    text.push_str(&format!("\n({n})\n"));
+                    head.push_str(&format!("({n})\n"));
                 }
+                let text = if head.is_empty() {
+                    text
+                } else {
+                    format!("{head}\n{text}")
+                };
                 let response = RecallResponse {
                     project: Some(slug),
                     omitted,
                     raw_fallback: out.raw_fallback,
                     reranked,
+                    low_confidence,
                     text: Some(text),
                     notes: notes.clone(),
                     ..Default::default()
@@ -1626,6 +1698,7 @@ impl Service {
                 let seqs = std::mem::take(&mut out.memory_seqs);
                 let mut response = pack::pack_json(out, Some(slug), max_tokens);
                 response.reranked = reranked;
+                response.low_confidence = low_confidence;
                 response.notes = notes.clone();
                 let touched = returned_memories(seqs, &response.results);
                 (response, touched)
@@ -1661,9 +1734,10 @@ impl Service {
         query: &str,
         limit: usize,
         include_raw: bool,
-    ) -> (SearchOutput, bool, Option<String>) {
+    ) -> (SearchOutput, bool, bool, Option<String>) {
         let judge = self.judge();
         let mut reranked = false;
+        let mut low_confidence = false;
         // Why the answer is the fast one, when precise mode could not grade.
         let mut why: Option<String> = None;
         if judge.provider() == "heuristic" {
@@ -1718,6 +1792,7 @@ impl Service {
                 created_at: h.created_at.clone(),
                 similarity: None,
                 raw: h.tier == Tier::Raw,
+                status: h.status,
             };
             let mut shown: Vec<(usize, JudgeMemory)> = Vec::new();
             let mut ordinal = 0;
@@ -1792,8 +1867,34 @@ impl Service {
                                     ));
                                 }
                             }
-                            graded.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                            // Ordered by the grade with the status prior of the search kept
+                            // (`weight^λ`, as in fusion): an outdated fact still "answers", and
+                            // must not lead the memory that replaced it.
+                            let cfg = self.settings();
+                            let all_hits = |i: usize| {
+                                if i < near_start {
+                                    &out.hits[i]
+                                } else {
+                                    &near[i - near_start].hit
+                                }
+                            };
+                            let prior = |i: usize| {
+                                all_hits(i).status.map_or(1.0, |st| {
+                                    search::fusion::status_weight(&cfg.search.weights, st)
+                                        .powf(cfg.search.boost_exponent)
+                                })
+                            };
+                            graded.sort_by(|a, b| {
+                                (b.1 * prior(b.0))
+                                    .total_cmp(&(a.1 * prior(a.0)))
+                                    .then(a.0.cmp(&b.0))
+                            });
                             reranked = !graded.is_empty();
+                            // Graded, and not one of them clearly answers the query.
+                            low_confidence = reranked
+                                && !shown.iter().zip(&grades).any(|(_, d)| {
+                                    !d.0.is_empty() && d.p(RELEVANCE_ANSWERS) >= RESCUE_ANSWERS_MIN
+                                });
                             if graded.is_empty() {
                                 why = Some(NOTE_NO_GRADES.into());
                             }
@@ -1806,6 +1907,9 @@ impl Service {
                                     out.memory_seqs.push(seq);
                                     out.memory_importance.push(importance);
                                 }
+                            }
+                            for (i, p) in &graded {
+                                out.hits[*i].relevance = Some(*p as f32);
                             }
                             // Ungraded results of the top keep their places; the graded ones
                             // (and the rescued) fill the others, best first; the rest follows.
@@ -1886,7 +1990,7 @@ impl Service {
                 out.related = related;
             }
         }
-        (out, reranked, why)
+        (out, reranked, low_confidence, why)
     }
 
     pub async fn context(&self, req: ContextRequest) -> Result<ContextResponse> {
@@ -2026,7 +2130,7 @@ impl Service {
         })?;
         let slug = projects::move_slug(raw)?;
         let (asked, wanted) = (id.to_string(), slug.clone());
-        let (m, content_hash, updated_at, target, root) = self
+        let (m, content_hash, updated_at, target, tree) = self
             .read(move |c| {
                 let own = memories::id_of(c, &asked)?.ok_or_else(|| {
                     AliceError::NotFound(format!(
@@ -2042,11 +2146,11 @@ impl Service {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
                 let target = projects::resolve_move_target(c, &wanted)?;
-                let root = match &target {
-                    Some(t) => projects::root_of(c, &t.id)?,
+                let tree = match &target {
+                    Some(t) => projects::tree_of(c, &t.id)?,
                     None => None,
                 };
-                Ok((m, hash, at, target, root))
+                Ok((m, hash, at, target, tree))
             })
             .await?;
         let (dest, dest_allowed) = match &target {
@@ -2059,7 +2163,7 @@ impl Service {
                 m.project, m.project, m.id
             )));
         }
-        let r = self.redactors.for_root(root.as_deref().map(Path::new));
+        let r = self.redactors.for_root(tree.as_ref());
         let screen = |field: &str, t: &str| -> Result<String> {
             let red = r.apply(t);
             if red.found.is_empty() {
@@ -2323,6 +2427,36 @@ impl Service {
     pub async fn reviews(&self, q: ReviewQuery) -> Result<Vec<ReviewItem>> {
         let _busy = self.activity.enter();
         self.read(move |c| reviews::list(c, &q)).await
+    }
+
+    /// Open items in all and by type, narrowed to a type and provider.
+    pub async fn review_counts(
+        &self,
+        review_type: Option<reviews::ReviewType>,
+        provider: Option<String>,
+    ) -> Result<reviews::ReviewCounts> {
+        let _busy = self.activity.enter();
+        self.read(move |c| reviews::counts_open(c, review_type, provider.as_deref()))
+            .await
+    }
+
+    /// Close every open item of a type (and provider) without changing any memory.
+    pub async fn dismiss_reviews(&self, req: DismissRequest) -> Result<DismissResponse> {
+        let _busy = self.activity.enter();
+        match self
+            .writer
+            .submit(WriteOp::DismissReviews {
+                review_type: req.review_type,
+                provider: req.provider.filter(|p| !p.trim().is_empty()),
+                actor: Actor::from_author(&req.author),
+            })
+            .await?
+        {
+            WriteOutcome::Count(n) => Ok(DismissResponse {
+                dismissed: n as u64,
+            }),
+            other => Err(unexpected(other)),
+        }
     }
 
     pub async fn review(&self, id: String) -> Result<ReviewItem> {
@@ -3041,8 +3175,14 @@ impl Service {
         }
     }
 
-    pub async fn ingest(&self, mut req: IngestRequest) -> Result<IngestOutcome> {
+    pub async fn ingest(&self, req: IngestRequest) -> Result<IngestOutcome> {
         let _busy = self.activity.enter();
+        self.ingest_spooled(req).await
+    }
+
+    /// [`ingest`](Self::ingest) for a request the spool queued (no activity, as
+    /// [`remember_spooled`](Self::remember_spooled)).
+    pub async fn ingest_spooled(&self, mut req: IngestRequest) -> Result<IngestOutcome> {
         // Checked here so an oversized request never reaches (or delays) the writer.
         sources::validate_chunks(&req.chunks)?;
         let project = self
@@ -3054,8 +3194,13 @@ impl Service {
         req = tokio::task::spawn_blocking(move || -> Result<IngestRequest> {
             req.source.uri = redact_field(&r, "source uri", &req.source.uri)?;
             let mut redacted = 0usize;
-            for c in &mut req.chunks {
-                let text = r.check("chunk text", &c.text)?;
+            // In order: a private key cut across chunks is redacted in every one of them.
+            let mut order: Vec<usize> = (0..req.chunks.len()).collect();
+            order.sort_by_key(|&i| req.chunks[i].ord);
+            let mut open = false;
+            for i in order {
+                let c = &mut req.chunks[i];
+                let text = r.check_piece("chunk text", &c.text, &mut open)?;
                 if text != c.text {
                     redacted += 1;
                     c.text = text;
@@ -3573,8 +3718,8 @@ fn screen_resolution(
                 [&m.id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            let root = projects::root_of(c, &target.id)?;
-            let r = redactors.for_root(root.as_deref().map(Path::new));
+            let tree = projects::tree_of(c, &target.id)?;
+            let r = redactors.for_root(tree.as_ref());
             let apply = |field: &str, t: &str| -> Result<(String, bool)> {
                 let red = r.apply(t);
                 if red.found.is_empty() {
@@ -7716,6 +7861,265 @@ mod tests {
         wait_settled(s).await;
     }
 
+    /// Grades a result by the first of `scores` its block holds: `(marker, P(answers))`; other
+    /// questions are answered `unrelated`. Keeps the grading states.
+    struct ScoreGrader {
+        scores: Vec<(&'static str, f64)>,
+        states: Mutex<Vec<String>>,
+    }
+
+    impl alice_core::judge::jev::JevTransport for ScoreGrader {
+        fn post(
+            &self,
+            _endpoint: &str,
+            _key: &str,
+            body: &[u8],
+            _timeout: Duration,
+        ) -> std::result::Result<
+            alice_core::judge::jev::HttpReply,
+            alice_core::judge::jev::TransportError,
+        > {
+            let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let state = req["state"].as_str().unwrap();
+            let mut answers = serde_json::Map::new();
+            for (qid, q) in req["questions"].as_object().unwrap() {
+                let options: Vec<String> =
+                    q["criteria"].as_object().unwrap().keys().cloned().collect();
+                let p = qid.strip_prefix("r_").map(|k| {
+                    let k: usize = k.parse().unwrap();
+                    let block = state
+                        .split(&format!("Result {k} ("))
+                        .nth(1)
+                        .unwrap_or("")
+                        .split("\nResult ")
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    self.scores
+                        .iter()
+                        .find(|(m, _)| block.contains(m))
+                        .map_or(0.02, |(_, p)| *p)
+                });
+                let (choice, probs): (&str, serde_json::Map<String, serde_json::Value>) = match p {
+                    Some(p) => (
+                        if p >= 0.5 { "answers" } else { "unrelated" },
+                        options
+                            .iter()
+                            .map(|o| {
+                                let v = match o.as_str() {
+                                    "answers" => p,
+                                    "unrelated" => 1.0 - p - 0.01,
+                                    _ => 0.01 / (options.len().max(3) - 2) as f64,
+                                };
+                                (o.clone(), serde_json::json!(v))
+                            })
+                            .collect(),
+                    ),
+                    None => (
+                        "unrelated",
+                        options
+                            .iter()
+                            .map(|o| {
+                                let v = if o == "unrelated" {
+                                    0.9
+                                } else {
+                                    0.1 / options.len() as f64
+                                };
+                                (o.clone(), serde_json::json!(v))
+                            })
+                            .collect(),
+                    ),
+                };
+                if p.is_some() {
+                    self.states.lock().push(state.to_string());
+                }
+                answers.insert(
+                    qid.clone(),
+                    serde_json::json!({"type": "choice", "choice": choice, "confidence": 0.9, "probabilities": probs}),
+                );
+            }
+            let resp = serde_json::json!({"model": "jev-1.13.0", "answers": answers,
+                "usage": {"input_tokens": 800, "output_tokens": 0}});
+            Ok(alice_core::judge::jev::HttpReply {
+                status: 200,
+                body: serde_json::to_vec(&resp).unwrap(),
+                retry_after: None,
+            })
+        }
+    }
+
+    /// Final review C-I1: the judge grades an outdated fact as answering too; precise mode tells
+    /// it the memory was superseded and keeps the status prior, so the replacement leads even
+    /// when the old version is graded a little higher.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_mode_keeps_a_replacement_above_the_memory_it_superseded() {
+        let t = Arc::new(ScoreGrader {
+            scores: vec![("5432", 0.93), ("5433", 0.91)],
+            states: Default::default(),
+        });
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                jev_transport: Some(t.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        let cwd = repo(&d, "proj");
+        let old = remember_id(
+            &s,
+            "Postgres in staging listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        s.remember(RememberRequest {
+            supersedes: vec![old.clone()],
+            ..remember_req(
+                "Postgres in staging now listens on port 5433",
+                Some(Kind::Fact),
+                &cwd,
+            )
+        })
+        .await
+        .unwrap();
+        wait_settled(&s).await;
+        assert_eq!(state_of(&s, &old).await.1, "superseded");
+        let r = s
+            .recall(recall_req(
+                "which port does Postgres in staging listen on",
+                RecallMode::Precise,
+                &cwd,
+            ))
+            .await
+            .unwrap();
+        assert!(r.reranked, "{:?}", r.notes);
+        let titles: Vec<&str> = r.results.iter().map(|h| h.title.as_str()).collect();
+        assert!(titles[0].contains("5433"), "{titles:?}");
+        let old_hit = r
+            .results
+            .iter()
+            .find(|h| h.id == old)
+            .expect("the old one is shown");
+        assert!(
+            old_hit.relevance.unwrap() > r.results[0].relevance.unwrap(),
+            "graded higher"
+        );
+        assert!(
+            t.states
+                .lock()
+                .iter()
+                .any(|st| st.contains("status superseded: a newer memory replaced it")),
+            "the judge was told"
+        );
+        s.shutdown();
+    }
+
+    /// A fake embedder whose query embedding fails with `fail` while it is set (a text that
+    /// starts with `MODEL_LOADING` fails as an unloaded model does, any other as a provider
+    /// that is down).
+    struct FlakyQueries {
+        inner: FakeEmbedder,
+        fail: Arc<Mutex<Option<String>>>,
+    }
+
+    impl Embedder for FlakyQueries {
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.inner.embed_passages(texts)
+        }
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            match self.fail.lock().clone() {
+                Some(m) if m.starts_with(alice_core::embed::MODEL_LOADING) => {
+                    Err(AliceError::Other(m))
+                }
+                Some(m) => Err(AliceError::Unavailable(m)),
+                None => self.inner.embed_query(text),
+            }
+        }
+    }
+
+    /// Final review C-I2: a recall whose query was not embedded (the model reloading after an
+    /// idle unload, a provider that is down) says it used word matches only, and is never
+    /// flagged `low_confidence`: meaning-search did not run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_whose_query_was_not_embedded_says_so_and_is_not_low_confidence() {
+        let grader = KeywordGrader::new("WOMBAT");
+        let fail: Arc<Mutex<Option<String>>> = Default::default();
+        let d = tempfile::tempdir().unwrap();
+        let f = fail.clone();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &move || {
+                Ok(Arc::new(FlakyQueries {
+                    inner: FakeEmbedder::new(384),
+                    fail: f.clone(),
+                }) as Arc<dyn Embedder>)
+            },
+            ServiceOptions {
+                jev_transport: Some(grader.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        // With a query vector: graded, nothing answers, and it says so.
+        let r = s
+            .recall(recall_req(VAGUE, RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(r.reranked && r.low_confidence, "{:?}", r.notes);
+        for (why, said) in [
+            (
+                alice_core::embed::MODEL_LOADING.to_string(),
+                alice_core::embed::MODEL_LOADING,
+            ),
+            (
+                "the provider did not answer".to_string(),
+                "this search used word matches only: the embedding provider is unavailable",
+            ),
+        ] {
+            *fail.lock() = Some(why);
+            let r = s
+                .recall(recall_req(VAGUE, RecallMode::Precise, &cwd))
+                .await
+                .unwrap();
+            assert!(!r.results.is_empty(), "words still find them");
+            assert!(r.notes.iter().any(|n| n == said), "{:?}", r.notes);
+            assert!(!r.low_confidence, "{:?}", r.notes);
+            assert!(
+                r.notes.iter().all(|n| n != NOTHING_ANSWERS),
+                "{:?}",
+                r.notes
+            );
+            let text = s
+                .recall(RecallRequest {
+                    format: OutputFormat::Text,
+                    ..recall_req(VAGUE, RecallMode::Fast, &cwd)
+                })
+                .await
+                .unwrap();
+            assert!(text.text.unwrap().contains("word matches only"));
+        }
+        s.shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn precise_mode_reorders_by_the_judges_relevance_and_fast_mode_does_not() {
         let t = KeywordGrader::new("ZEBRA");
@@ -7766,6 +8170,226 @@ mod tests {
             .await
             .unwrap();
         assert!(text.reranked && text.text.unwrap().contains("ZEBRA"));
+    }
+
+    /// A vague two-word question: as a phrase it is too short to count as an exact match.
+    const VAGUE: &str = "deploy notes";
+    const NOTHING_ANSWERS: &str = "nothing found clearly answers this; the closest matches follow";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_precise_recall_where_nothing_answers_says_so_and_one_that_answers_does_not() {
+        // No note contains the keyword: the judge grades every result "unrelated".
+        let none = KeywordGrader::new("WOMBAT");
+        let (d, s) = svc_with_grader(none.clone()).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let r = s
+            .recall(recall_req(VAGUE, RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(r.reranked && !r.results.is_empty(), "{r:?}");
+        assert!(r.low_confidence, "{:?}", r.notes);
+        assert!(
+            r.notes.iter().any(|n| n == NOTHING_ANSWERS),
+            "{:?}",
+            r.notes
+        );
+        let text = s
+            .recall(RecallRequest {
+                format: OutputFormat::Text,
+                ..recall_req(VAGUE, RecallMode::Precise, &cwd)
+            })
+            .await
+            .unwrap();
+        assert!(text.low_confidence, "{:?}", text.notes);
+        assert!(text.text.unwrap().contains(NOTHING_ANSWERS));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["low_confidence"], true, "{json}");
+        // Fast mode never says it: the judge graded nothing.
+        let fast = s
+            .recall(recall_req(VAGUE, RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        assert!(
+            !fast.low_confidence && fast.notes.is_empty(),
+            "{:?}",
+            fast.notes
+        );
+
+        // One result that answers clears the doubt.
+        let some = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(some).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let r = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(r.reranked && !r.low_confidence, "{:?}", r.notes);
+        assert!(r.notes.iter().all(|n| n != NOTHING_ANSWERS));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_verbatim_marker_or_phrase_in_the_top_hit_is_not_low_confidence() {
+        // The judge grades every result "unrelated" (it knows no WOMBAT).
+        let (d, s) = svc_with_grader(KeywordGrader::new("WOMBAT")).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        remember_id(
+            &s,
+            "release marker marmot-cobalt-4417 sits in the vault",
+            Some(Kind::Note),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let vague = s
+            .recall(recall_req(VAGUE, RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(vague.reranked && vague.low_confidence, "{:?}", vague.notes);
+        // A code of 6+ characters with `-`, found verbatim in the top hit.
+        let marker = s
+            .recall(recall_req(
+                "deploy marmot-cobalt-4417 notes",
+                RecallMode::Precise,
+                &cwd,
+            ))
+            .await
+            .unwrap();
+        assert!(marker.reranked, "{marker:?}");
+        assert!(
+            marker.results[0].title.contains("marmot-cobalt-4417")
+                || marker.results[0]
+                    .body
+                    .as_deref()
+                    .is_some_and(|b| b.contains("marmot-cobalt-4417")),
+            "{:?}",
+            marker.results[0]
+        );
+        assert!(!marker.low_confidence, "{:?}", marker.notes);
+        assert!(marker.notes.iter().all(|n| n != NOTHING_ANSWERS));
+    }
+
+    fn hit_with(title: &str, body: &str) -> alice_core::api::Hit {
+        alice_core::api::Hit {
+            id: "x".into(),
+            tier: Tier::Knowledge,
+            kind: None,
+            project: "p".into(),
+            title: title.into(),
+            snippet: String::new(),
+            body: Some(body.into()),
+            created_at: String::new(),
+            score: 0.0,
+            relevance: None,
+            matched: vec![],
+            status: None,
+        }
+    }
+
+    #[test]
+    fn exact_match_needs_a_real_phrase_or_a_distinctive_token() {
+        let h = hit_with(
+            "capital follow-up",
+            "the capital city, readme.md and auto-save; deploy notes here; deploy the staging cluster today; merge_suggestions ran; marmot-cobalt-4417",
+        );
+        // Short queries are no exact match, even when they occur in the text.
+        assert!(!exact_match("api", &h));
+        assert!(!exact_match("deploy notes", &h));
+        assert!(!exact_match("capital", &h));
+        // Ordinary hyphenated words and filenames are not distinctive tokens.
+        assert!(!exact_match("follow-up", &h));
+        assert!(!exact_match("auto-save", &h));
+        assert!(!exact_match("readme.md", &h));
+        // A code with a digit, or an identifier with `_`, is.
+        assert!(exact_match("marmot-cobalt-4417", &h));
+        assert!(exact_match("what is merge_suggestions", &h));
+        // Three words found verbatim, on word boundaries.
+        assert!(exact_match("deploy the staging cluster", &h));
+        assert!(!exact_match("eploy the staging", &h));
+        // No spaces (Thai): 12 characters or more as a substring.
+        let th = hit_with("บันทึก", "ระบบความจำสำหรับเอเจนต์");
+        assert!(exact_match("ความจำสำหรับเอเจนต์", &th));
+        assert!(!exact_match("ความจำ", &th));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_text_format_prints_the_note_before_the_results() {
+        let (d, s) = svc_with_grader(KeywordGrader::new("WOMBAT")).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let text = s
+            .recall(RecallRequest {
+                format: OutputFormat::Text,
+                ..recall_req(VAGUE, RecallMode::Precise, &cwd)
+            })
+            .await
+            .unwrap()
+            .text
+            .unwrap();
+        assert!(
+            text.starts_with(&format!("({NOTHING_ANSWERS})\n")),
+            "{text}"
+        );
+        assert!(text.contains("results"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_query_without_letters_or_digits_is_refused_like_an_empty_one() {
+        let (d, s) = svc_with_grader(KeywordGrader::new("ZEBRA")).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        for q in ["?", "...", "", "  "] {
+            let e = s
+                .recall(recall_req(q, RecallMode::Precise, &cwd))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("query is empty; pass keywords or a question"),
+                "{q:?}: {e}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graded_hits_carry_the_judges_relevance_and_keep_the_search_score() {
+        let t = KeywordGrader::new("ZEBRA");
+        let (d, s) = svc_with_grader(t).await;
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        let fast = s
+            .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
+            .await
+            .unwrap();
+        assert!(fast.results.iter().all(|h| h.relevance.is_none()));
+        let fast_json = serde_json::to_value(&fast).unwrap();
+        assert!(
+            fast_json["results"][0].get("relevance").is_none(),
+            "absent, not null: {fast_json}"
+        );
+        let precise = s
+            .recall(recall_req("deploy notes", RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(precise.reranked);
+        // The display order is the judge's: relevance never rises down the list.
+        let rel: Vec<f32> = precise
+            .results
+            .iter()
+            .map(|h| h.relevance.expect("every result was graded"))
+            .collect();
+        assert!(rel.windows(2).all(|w| w[0] >= w[1]), "{rel:?}");
+        assert!(
+            rel[0] >= 0.5 && precise.results[0].title.contains("ZEBRA"),
+            "{rel:?}"
+        );
+        // `score` stays the search's fusion score, whatever the display order.
+        for h in &precise.results {
+            let before = fast.results.iter().find(|f| f.id == h.id).unwrap();
+            assert_eq!(h.score, before.score, "{}", h.title);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

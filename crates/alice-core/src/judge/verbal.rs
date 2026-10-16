@@ -109,8 +109,14 @@ pub fn memory_block_bounded(
     body_chars: usize,
 ) -> String {
     let body = crate::normalize::truncate_chars(&m.body, body_chars);
+    // An outdated fact still "answers" a question: the judge is told it was replaced.
+    let status = match m.status {
+        Some(crate::model::Status::Superseded) => ", status superseded: a newer memory replaced it",
+        Some(crate::model::Status::Archived) => ", status archived: no longer current",
+        _ => "",
+    };
     format!(
-        "{label} (written {}, kind {}, {}, project {}):\nTitle: {}\n{}\n",
+        "{label} (written {}, kind {}, {}, project {}{status}):\nTitle: {}\n{}\n",
         age(&m.created_at, now),
         m.kind.as_str(),
         importance(m.importance),
@@ -173,6 +179,7 @@ mod tests {
             created_at: (now - chrono::Duration::days(14)).to_rfc3339(),
             similarity: None,
             raw: false,
+            status: None,
         };
         let b = memory_block("Existing memory 1", &m, now);
         assert!(
@@ -203,6 +210,7 @@ mod tests {
             created_at: now.to_rfc3339(),
             similarity: None,
             raw: false,
+            status: None,
         };
         let b = memory_block("Memory", &m, now);
         let body = b.lines().nth(2).unwrap();

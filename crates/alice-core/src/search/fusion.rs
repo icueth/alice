@@ -197,12 +197,18 @@ pub fn boost(w: &Weights, b: &BoostInput) -> f64 {
     // Full usage boost at 1000 accesses.
     let usage_frac = ((1.0 + b.access_count.max(0) as f64).ln() / 1001f64.ln()).min(1.0);
     let usage = 1.0 + w.usage_max * usage_frac;
-    let status = match b.status {
+    let status = status_weight(w, b.status);
+    tier * project * recency * importance * usage * status
+}
+
+/// The multiplier a memory's status gets: superseded and archived memories rank lower than live
+/// ones (the `[search.weights]` `superseded` and `archived`).
+pub fn status_weight(w: &Weights, status: Status) -> f64 {
+    match status {
         Status::Superseded => w.superseded,
         Status::Archived => w.archived,
         _ => 1.0,
-    };
-    tier * project * recency * importance * usage * status
+    }
 }
 
 #[cfg(test)]

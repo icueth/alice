@@ -54,6 +54,8 @@ pub struct DaemonClient {
     http: reqwest::Client,
     base: String,
     token: String,
+    /// How long a recall may take under this home's settings (see `config::recall_wait`).
+    recall_wait: Duration,
     /// The instance that proved the token; `is_live` checks the daemon is still that one.
     instance: String,
 }
@@ -327,6 +329,9 @@ fn review_query_string(q: &ReviewQuery) -> String {
     if let Some(l) = q.limit {
         qs.append_pair("limit", &l.to_string());
     }
+    if let Some(o) = q.offset {
+        qs.append_pair("offset", &o.to_string());
+    }
     qs.finish()
 }
 
@@ -360,6 +365,7 @@ impl DaemonClient {
                 http: http.clone(),
                 base,
                 token,
+                recall_wait: crate::config::recall_wait_for(home),
                 instance: info.instance,
             })
     }
@@ -508,8 +514,10 @@ impl DaemonClient {
         self.call("/api/v1/remember", r, Duration::from_secs(5))
             .await
     }
+    /// Waits as long as a precise recall may legitimately take under this home's settings
+    /// (`search.precise_timeout_ms` and the query embedding on top of the search), at least 5 s.
     pub async fn recall(&self, r: &RecallRequest) -> Result<RecallResponse> {
-        self.call("/api/v1/recall", r, Duration::from_secs(5)).await
+        self.call("/api/v1/recall", r, self.recall_wait).await
     }
     pub async fn context(&self, r: &ContextRequest) -> Result<ContextResponse> {
         self.call("/api/v1/context", r, Duration::from_secs(3))
@@ -564,6 +572,27 @@ impl DaemonClient {
         } else {
             self.get_json(&format!("/api/v1/reviews?{qs}")).await
         }
+    }
+    /// Open items in all and by type, narrowed to a type and provider.
+    pub async fn review_counts(
+        &self,
+        review_type: Option<ReviewType>,
+        provider: Option<&str>,
+    ) -> Result<ReviewCounts> {
+        let mut qs = url::form_urlencoded::Serializer::new(String::new());
+        if let Some(t) = review_type {
+            qs.append_pair("review_type", t.as_str());
+        }
+        if let Some(p) = provider {
+            qs.append_pair("provider", p);
+        }
+        self.get_json(&format!("/api/v1/reviews/counts?{}", qs.finish()))
+            .await
+    }
+    /// Close every open item of a type (and provider) without changing any memory.
+    pub async fn dismiss_reviews(&self, r: &DismissRequest) -> Result<DismissResponse> {
+        self.call("/api/v1/reviews/dismiss", r, Duration::from_secs(60))
+            .await
     }
     pub async fn review(&self, id: &str) -> Result<ReviewItem> {
         self.get_json(&format!("/api/v1/reviews/{}", path_segment(id)))
@@ -809,9 +838,10 @@ fn spool_redactor(home: &AliceHome, project: Option<&str>, cwd: Option<&str>) ->
     let mut global = effective.resolved.settings.privacy;
     if effective.degraded {
         // A leaf of config.toml was left out and may have been a privacy one: fail closed, as
-        // the daemon does, rather than spool with rules that may be weaker than the person's.
-        global.redact = true;
-        global.redact_mode = alice_core::settings::RedactMode::Block;
+        // the daemon does (secrets blocked, the privacy last applied kept), rather than spool
+        // with rules that may be weaker than the person's.
+        global =
+            crate::config::fail_closed_privacy(&global, crate::config::kept_privacy(home).as_ref());
     }
     let named = project.is_some_and(|p| !p.trim().is_empty());
     let root = cwd
@@ -856,8 +886,13 @@ async fn redacted_ingest_for_spool(
     tokio::task::spawn_blocking(move || {
         let r = spool_redactor(&home, req.project.as_deref(), req.cwd.as_deref());
         req.source.uri = r.check("source uri", &req.source.uri)?;
-        for c in &mut req.chunks {
-            c.text = r.check("chunk text", &c.text)?;
+        // In order: a private key cut across chunks is redacted in every one of them.
+        let mut order: Vec<usize> = (0..req.chunks.len()).collect();
+        order.sort_by_key(|&i| req.chunks[i].ord);
+        let mut open = false;
+        for i in order {
+            let c = &mut req.chunks[i];
+            c.text = r.check_piece("chunk text", &c.text, &mut open)?;
         }
         Ok(req)
     })
@@ -1075,6 +1110,67 @@ mod tests {
         });
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         seen
+    }
+
+    /// Final review D-I2: a precise recall may take the judge's budget and more; the client
+    /// waits for it (here a daemon that answers after 5.5 s, with a 6 s judge budget) instead of
+    /// giving up at 5 s with "did not answer in time".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_waits_as_long_as_the_judge_budget_allows() {
+        crate::install_tls();
+        let (_d, home) = home();
+        std::fs::write(home.config_file(), "[search]\nprecise_timeout_ms = 6000\n").unwrap();
+        let token = load_or_create_token(&home).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let instance = "01K7SLOWDAEMON000000000000";
+        write_info(
+            &home,
+            &DaemonInfo {
+                pid: std::process::id(),
+                port,
+                instance: instance.into(),
+                version: "t".into(),
+                started_at: "t".into(),
+            },
+        )
+        .unwrap();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let token = token.clone();
+            async move {
+                if req.uri().path() == "/api/v1/ping" {
+                    let nonce = req
+                        .uri()
+                        .query()
+                        .and_then(|q| q.strip_prefix("nonce="))
+                        .unwrap_or("")
+                        .to_string();
+                    return axum::Json(serde_json::json!({
+                        "service": "alice", "instance": instance, "version": "t",
+                        "proof": ping_proof(&token, &nonce, instance),
+                    }))
+                    .into_response();
+                }
+                tokio::time::sleep(Duration::from_millis(5_500)).await;
+                axum::Json(RecallResponse {
+                    notes: vec!["graded slowly".into()],
+                    ..Default::default()
+                })
+                .into_response()
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = DaemonClient::try_existing(&home)
+            .await
+            .expect("the daemon proves the token");
+        let r = c
+            .recall(&RecallRequest {
+                query: "slow".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.notes, ["graded slowly"]);
     }
 
     fn remember_req(content: &str) -> RememberRequest {
@@ -1532,6 +1628,80 @@ mod tests {
             .unwrap_err();
         assert!(matches!(&e, AliceError::Refused { .. }), "{e:?}");
         assert!(!spool_text(&home).contains(GITHUB));
+    }
+
+    /// Final review A-I1: a private key cut by size across the chunks of one spooled ingest
+    /// leaves nothing of its body in the spool (the chunks may come in any order).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_private_key_cut_across_spooled_chunks_is_redacted_in_every_chunk() {
+        crate::install_tls();
+        let (_d, home) = home();
+        let body: Vec<String> = (0..20u32)
+            .map(|i| {
+                (0..64u32)
+                    .map(|j| {
+                        let n = (i * 131 + j * 17 + (i ^ j) * 7) % 64;
+                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                            [n as usize] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let text = format!(
+            "before\n{}\n{}\n-----END OPENSSH PRIVATE KEY-----\nafter",
+            concat!("-----BEGIN OPENSSH PRIVATE ", "KEY-----"),
+            body.join("\n")
+        );
+        let (a, b) = (text.len() / 3 + 5, 2 * text.len() / 3 + 11);
+        let chunk = |ord: i64, t: &str| ChunkInput {
+            ord,
+            text: t.to_string(),
+            ..Default::default()
+        };
+        let req = IngestRequest {
+            chunks: vec![
+                chunk(2, &text[b..]),
+                chunk(0, &text[..a]),
+                chunk(1, &text[a..b]),
+            ],
+            ..ingest_req(String::new())
+        };
+        ingest_or_spool(&home, &Launcher::None, req).await.unwrap();
+        let spooled = spool_text(&home);
+        let leaked: Vec<&str> = body
+            .iter()
+            .flat_map(|l| (0..=52).map(move |i| &l[i..i + 12]))
+            .filter(|w| spooled.contains(w))
+            .collect();
+        assert!(leaked.is_empty(), "{leaked:?} in {spooled}");
+        assert!(spooled.contains("before") && spooled.contains("after"));
+    }
+
+    /// Final review A-I4: with a `config.toml` that does not parse, the spool keeps the custom
+    /// patterns last applied (and blocks secrets), as the daemon does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_broken_config_keeps_the_last_privacy_in_the_spool() {
+        crate::install_tls();
+        let (_d, home) = home();
+        std::fs::write(
+            home.config_file(),
+            "[privacy]\ncustom_patterns = [{ name = \"acme\", regex = \"ACME-[0-9]{6}\" }]\n",
+        )
+        .unwrap();
+        // A daemon (or any settings handle) applied it once.
+        drop(crate::config::SettingsHandle::load_with_env(
+            &home,
+            Vec::new(),
+        ));
+        std::fs::write(home.config_file(), "[privacy\ncustom_patterns = [").unwrap();
+        let e = remember_or_spool(&home, &Launcher::None, remember_req("ticket ACME-123456"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, AliceError::Refused { detectors, .. } if detectors == &["custom:acme"]),
+            "{e:?}"
+        );
+        assert_eq!(spool::pending_count(&home.spool_dir()), 0);
     }
 
     /// The length is checked on the redacted text (as the daemon does): a request that redaction

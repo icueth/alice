@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use crate::store::events::{EventQuery as EventsRequest, EventRow};
-pub use crate::store::reviews::{ReviewItem, ReviewQuery};
+pub use crate::store::reviews::{ReviewCounts, ReviewItem, ReviewQuery, ReviewType};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -97,7 +97,13 @@ pub struct Hit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     pub created_at: String,
+    /// The search's fusion score. In precise mode the results are in the judge's order, which
+    /// this score does not follow; use `relevance` for that.
     pub score: f64,
+    /// The judge's P(relevant) for this result: P(answers) plus half of P(partly answers).
+    /// Set only for results the judge graded in precise mode, otherwise absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relevance: Option<f32>,
     pub matched: Vec<MatchVia>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<Status>,
@@ -124,6 +130,11 @@ pub struct RecallResponse {
     /// could grade (the heuristic provider, a denied project, an exhausted budget, an outage).
     #[serde(default)]
     pub reranked: bool,
+    /// True when precise mode graded the results and none of them clearly answers the query
+    /// (P(answers) below 0.5 for every graded result); the results are then only the closest
+    /// matches, and `notes` says so. Always false in fast mode.
+    #[serde(default)]
+    pub low_confidence: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     /// Things worth knowing about this answer, such as a search that used word matches only
@@ -324,6 +335,25 @@ pub struct ResolveRequest {
 pub struct ResolveResponse {
     pub review: ReviewItem,
     pub message: String,
+}
+
+/// Close every open review item of a type, without changing any memory (the weekly merge job
+/// can flood the inbox; this clears it).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DismissRequest {
+    pub review_type: ReviewType,
+    /// Only items whose payload names this provider (`cluster` for the merge job).
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub author: Author,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DismissResponse {
+    /// Items closed.
+    pub dismissed: u64,
 }
 
 /// Merge duplicates: the others are trashed and point at the survivor.
@@ -769,6 +799,7 @@ mod tests {
             body: None,
             created_at: "2026-10-13T00:00:00.000Z".into(),
             score: 0.5,
+            relevance: None,
             matched: vec![MatchVia::Words],
             status: None,
         };

@@ -129,6 +129,83 @@ pub fn count_open(conn: &Connection) -> Result<u64> {
     Ok(n as u64)
 }
 
+/// Open items of `t`.
+pub fn count_open_of(conn: &Connection, t: ReviewType) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM review_items WHERE status = 'open' AND type = ?1",
+        [t.as_str()],
+        |r| r.get(0),
+    )?;
+    Ok(n as u64)
+}
+
+/// How many items wait, in all and by type.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewCounts {
+    pub total: u64,
+    pub by_type: std::collections::BTreeMap<String, u64>,
+}
+
+/// Open items, narrowed to a type and to the `provider` their payload names (the judge, or
+/// `cluster` for the weekly merge job).
+pub fn counts_open(
+    conn: &Connection,
+    t: Option<ReviewType>,
+    provider: Option<&str>,
+) -> Result<ReviewCounts> {
+    let mut stmt = conn.prepare(
+        "SELECT type, count(*) FROM review_items
+         WHERE status = 'open' AND (?1 IS NULL OR type = ?1)
+           AND (?2 IS NULL OR json_extract(payload_json, '$.provider') = ?2)
+         GROUP BY type",
+    )?;
+    let rows = stmt.query_map(params![t.map(|t| t.as_str()), provider], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+    })?;
+    let mut counts = ReviewCounts::default();
+    for row in rows {
+        let (kind, n) = row?;
+        counts.total += n;
+        counts.by_type.insert(kind, n);
+    }
+    Ok(counts)
+}
+
+/// The answer that closes an item of type `t` without changing any memory or fact, if the type
+/// has one. It is the answer a person gives to say "leave it" (a rejected merge is not suggested
+/// again).
+fn dismissal(t: ReviewType) -> Option<&'static str> {
+    match t {
+        ReviewType::Merge | ReviewType::Supersede => Some("reject"),
+        ReviewType::Predicate | ReviewType::Project => Some("keep"),
+        ReviewType::Undo => Some("dismiss"),
+        ReviewType::Contradiction | ReviewType::SyncConflict => None,
+    }
+}
+
+/// Close every open item of type `t` (narrowed to `provider`) with the answer that leaves the
+/// memories as they are; returns how many. Types without such an answer are refused.
+pub fn dismiss_open(
+    conn: &Connection,
+    t: ReviewType,
+    provider: Option<&str>,
+    by: &Actor,
+) -> Result<u64> {
+    let choice = dismissal(t).ok_or_else(|| {
+        AliceError::invalid(format!(
+            "{} items cannot be dismissed together (every answer changes something); resolve them one by one with `alice review resolve`",
+            t.as_str()
+        ))
+    })?;
+    let n = conn.execute(
+        "UPDATE review_items SET status = 'resolved', resolved_at = ?1, resolved_by = ?2, resolution = ?3
+         WHERE status = 'open' AND type = ?4
+           AND (?5 IS NULL OR json_extract(payload_json, '$.provider') = ?5)",
+        params![now_rfc3339(), by.as_string(), choice, t.as_str(), provider],
+    )?;
+    Ok(n as u64)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewChoice {
     pub id: String,
@@ -158,7 +235,8 @@ pub struct ReviewItem {
     pub choices: Vec<ReviewChoice>,
 }
 
-/// Open items by default, newest first. `before` is a review id (paging).
+/// Open items by default, newest first. `before` is a review id and `offset` a number of items
+/// to skip (paging); `before` wins when both are given.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewQuery {
     #[serde(default)]
@@ -169,6 +247,8 @@ pub struct ReviewQuery {
     pub limit: Option<usize>,
     #[serde(default)]
     pub before: Option<String>,
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
 
 /// What a person may answer to an item of type `t`.
@@ -335,14 +415,15 @@ pub fn list(conn: &Connection, q: &ReviewQuery) -> Result<Vec<ReviewItem>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM review_items
          WHERE status = ?1 AND (?2 IS NULL OR type = ?2) AND (?3 IS NULL OR rowid < ?3)
-         ORDER BY rowid DESC LIMIT ?4"
+         ORDER BY rowid DESC LIMIT ?4 OFFSET ?5"
     ))?;
     let rows = stmt.query_map(
         params![
             status,
             q.review_type.map(|t| t.as_str()),
             before,
-            q.limit.unwrap_or(50).clamp(1, 500) as i64
+            q.limit.unwrap_or(50).clamp(1, 500) as i64,
+            q.offset.unwrap_or(0) as i64
         ],
         |r| read(conn, r),
     )?;
@@ -595,5 +676,119 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("not a review item id"), "{err}");
+    }
+
+    fn seed(c: &Connection, kind: ReviewType, provider: Option<&str>, key: &str) -> String {
+        create(
+            c,
+            &NewReview {
+                kind,
+                payload: provider.map_or_else(
+                    || serde_json::json!({}),
+                    |p| serde_json::json!({ "provider": p }),
+                ),
+                confidence: Some(0.92),
+                dedupe_key: Some(key.into()),
+            },
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn listing_pages_with_an_offset() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        let ids: Vec<String> = (0..5)
+            .map(|k| seed(&c, ReviewType::Merge, Some("cluster"), &format!("m{k}")))
+            .collect();
+        let page = |offset: usize| {
+            list(
+                &c,
+                &ReviewQuery {
+                    limit: Some(2),
+                    offset: Some(offset),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect::<Vec<_>>()
+        };
+        // Newest first: page 1 is the last two created.
+        assert_eq!(page(0), vec![ids[4].clone(), ids[3].clone()]);
+        assert_eq!(page(2), vec![ids[2].clone(), ids[1].clone()]);
+        assert_eq!(page(4), vec![ids[0].clone()]);
+        assert!(page(6).is_empty());
+    }
+
+    #[test]
+    fn open_counts_are_totals_by_type_and_can_be_narrowed() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        for k in 0..3 {
+            seed(&c, ReviewType::Merge, Some("cluster"), &format!("c{k}"));
+        }
+        seed(&c, ReviewType::Merge, Some("jev"), "j");
+        seed(&c, ReviewType::Predicate, None, "p");
+        let all = counts_open(&c, None, None).unwrap();
+        assert_eq!(all.total, 5);
+        assert_eq!(all.by_type["merge"], 4);
+        assert_eq!(all.by_type["predicate"], 1);
+        let narrowed = counts_open(&c, Some(ReviewType::Merge), Some("cluster")).unwrap();
+        assert_eq!(narrowed.total, 3);
+        assert_eq!(narrowed.by_type.len(), 1);
+    }
+
+    #[test]
+    fn dismissing_closes_only_the_matching_open_items() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        let ours: Vec<String> = (0..3)
+            .map(|k| seed(&c, ReviewType::Merge, Some("cluster"), &format!("c{k}")))
+            .collect();
+        let other_provider = seed(&c, ReviewType::Merge, Some("jev"), "j");
+        let predicate = seed(&c, ReviewType::Predicate, None, "p");
+        let closed = seed(&c, ReviewType::Merge, Some("cluster"), "done");
+        mark_resolved(&c, &closed, "merge", &Actor::User).unwrap();
+
+        let n = dismiss_open(&c, ReviewType::Merge, Some("cluster"), &Actor::User).unwrap();
+        assert_eq!(n, 3);
+        for id in &ours {
+            let item = get(&c, id).unwrap().unwrap();
+            assert_eq!(item.status, ReviewStatus::Resolved);
+            // Merge's "reject" means keep them apart: the job never suggests it again.
+            assert_eq!(item.resolution.as_deref(), Some("reject"));
+            assert_eq!(item.resolved_by.as_deref(), Some("user"));
+        }
+        for id in [&other_provider, &predicate] {
+            assert_eq!(get(&c, id).unwrap().unwrap().status, ReviewStatus::Open);
+        }
+        assert_eq!(
+            get(&c, &closed).unwrap().unwrap().resolution.as_deref(),
+            Some("merge"),
+            "an item resolved earlier keeps its answer"
+        );
+        assert!(was_rejected(&c, "c0").unwrap());
+        // Without a provider every open item of the type goes; nothing is left to close twice.
+        assert_eq!(
+            dismiss_open(&c, ReviewType::Merge, None, &Actor::User).unwrap(),
+            1
+        );
+        assert_eq!(
+            dismiss_open(&c, ReviewType::Merge, None, &Actor::User).unwrap(),
+            0
+        );
+        // Types whose every answer changes something are not closed in bulk.
+        seed(&c, ReviewType::Contradiction, None, "x");
+        let err = dismiss_open(&c, ReviewType::Contradiction, None, &Actor::User)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("contradiction") && err.contains("one by one"),
+            "{err}"
+        );
+        assert_eq!(count_open_of(&c, ReviewType::Contradiction).unwrap(), 1);
     }
 }

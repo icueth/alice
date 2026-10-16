@@ -29,8 +29,25 @@ const KEY_MEMORIES: Select = (
     "importance >= 4 AND kind NOT IN ('handoff','diary')",
     BY_IMPORTANCE,
 );
+/// What stands in for the key memories of a project that has none of importance 4 and up (an
+/// imported project: its runbooks and decisions came in at 3). The recent decisions have a
+/// section of their own.
+const FALLBACK_KEY_MEMORIES: Select = (
+    "importance >= 3 AND kind NOT IN ('handoff','diary') AND NOT (kind = 'decision' AND created_at >= ?2)",
+    BY_IMPORTANCE,
+);
+/// Most memories the fallback shows.
+const FALLBACK_KEY_CAP: usize = 3;
 const RECENT_DECISIONS: Select = ("kind = 'decision' AND created_at >= ?2", "created_at DESC");
 const PREFERENCES: Select = ("kind = 'preference'", BY_IMPORTANCE);
+/// Live diary entries except auto-save checkpoints (a title ending `: checkpoint`, or the topic).
+const RECENT_DIARY: Select = (
+    "kind = 'diary' AND title NOT LIKE '%: checkpoint' AND NOT EXISTS \
+     (SELECT 1 FROM memory_topics t WHERE t.memory_id = memories.id AND t.topic = 'checkpoint')",
+    "created_at DESC",
+);
+/// More open review items than this are not worth asking the user about at session start.
+const REVIEW_ASK_MAX: u64 = 10;
 
 /// A section's query: `seq` of live memories in display order, `?1` the project, the row limit
 /// bound last. `seq DESC` breaks ties, so the newest of equals wins and the output is stable.
@@ -164,9 +181,10 @@ impl Briefing<'_> {
 
 /// Briefing for `project`: the last handoff in full, then warnings, key memories (importance 4
 /// and up), decisions from the last 14 days and the global preferences, one line each, no
-/// memory twice. The whole text stays within `max_tokens` (as `estimate_tokens` counts), except
+/// memory twice, then the five newest diary entries that are not auto-save checkpoints. The whole text stays within `max_tokens` (as `estimate_tokens` counts), except
 /// that the heading line, and for a project without live memories a hint, are always included.
-/// When review items wait for a decision, a last section says how many.
+/// When review items wait for a decision, a last section says how many (and, up to ten, to ask
+/// the user).
 pub fn build(
     conn: &Connection,
     project: &ResolvedProject,
@@ -187,6 +205,7 @@ pub fn build(
             ));
         }
     }
+    let since = (now - Duration::days(RECENT_DAYS)).to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut b = Briefing {
         conn,
         max_tokens,
@@ -194,10 +213,21 @@ pub fn build(
         out,
         shown: Vec::new(),
     };
-    let since = (now - Duration::days(RECENT_DAYS)).to_rfc3339_opts(SecondsFormat::Millis, true);
     b.section("Last handoff", LAST_HANDOFF, &[&pid], 1, handoff)?;
     b.section("Warnings", WARNINGS, &[&pid], 5, line)?;
+    // Key memories that would render empty (none of importance 4 and up, or the warnings took
+    // them all) are replaced by the project's best of importance 3.
+    let before = b.out.len();
     b.section("Key memories", KEY_MEMORIES, &[&pid], 8, line)?;
+    if b.out.len() == before {
+        b.section(
+            "Key memories",
+            FALLBACK_KEY_MEMORIES,
+            &[&pid, &since],
+            FALLBACK_KEY_CAP,
+            line,
+        )?;
+    }
     b.section(
         "Recent decisions",
         RECENT_DECISIONS,
@@ -208,8 +238,14 @@ pub fn build(
     if !is_global {
         b.section("Your preferences", PREFERENCES, &[&GLOBAL_ID], 8, line)?;
     }
+    b.section("Recent diary", RECENT_DIARY, &[&pid], 5, line)?;
     let open = crate::store::reviews::count_open(conn)?;
-    if open > 0 {
+    if open > REVIEW_ASK_MAX {
+        b.text_section(
+            "Review",
+            &format!("{open} decisions wait in `alice review` (handle them when convenient)."),
+        );
+    } else if open > 0 {
         b.text_section(
             "Review",
             &format!(
@@ -413,7 +449,8 @@ mod tests {
             ("decision from 13.5 days ago", "2026-09-30T00:00:00.000Z"),
             ("decision from yesterday", "2026-10-12T12:00:00.000Z"),
         ] {
-            let mut i = input(Kind::Decision, 3, text);
+            // Importance 2: below the key-memories fallback, so only the window decides.
+            let mut i = input(Kind::Decision, 2, text);
             i.created_at = Some(created.into());
             put(&c, &app, i);
         }
@@ -574,6 +611,42 @@ mod tests {
     }
 
     #[test]
+    fn a_project_without_important_memories_shows_its_best_ones_under_key_memories() {
+        let (_d, c, app) = setup("app");
+        put(&c, &app, input(Kind::Howto, 3, "runbook three"));
+        put(&c, &app, input(Kind::Decision, 3, "decision three"));
+        put(&c, &app, input(Kind::Fact, 3, "fact three"));
+        put(&c, &app, input(Kind::Fact, 3, "fact four"));
+        put(&c, &app, input(Kind::Note, 2, "minor note"));
+        put(&c, &app, input(Kind::Diary, 3, "diary three"));
+        let text = build(&c, &app, 2_000, at(NOW)).unwrap();
+        let (_, rest) = text.split_once("## Key memories").unwrap();
+        let key = rest.split("\n## ").next().unwrap();
+        // Up to three, newest first among equals; nothing below importance 3, no diary.
+        assert_eq!(
+            key.lines().filter(|l| l.starts_with("- ")).count(),
+            3,
+            "{text}"
+        );
+        assert!(!text.contains("minor note"), "{text}");
+        assert!(!key.contains("diary three"), "{text}");
+        assert!(
+            key.contains("fact four") && key.contains("fact three"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_project_with_important_memories_keeps_the_usual_key_memories() {
+        let (_d, c, app) = setup("app");
+        put(&c, &app, input(Kind::Fact, 4, "key fact"));
+        put(&c, &app, input(Kind::Howto, 3, "runbook three"));
+        let text = build(&c, &app, 2_000, at(NOW)).unwrap();
+        assert!(text.contains("key fact"), "{text}");
+        assert!(!text.contains("runbook three"), "{text}");
+    }
+
+    #[test]
     fn key_memories_leave_out_handoffs_and_diaries() {
         let (_d, c, app) = setup("app");
         let mut older = input(Kind::Handoff, 5, "older handoff");
@@ -588,7 +661,10 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("older handoff"), "{text}");
-        assert!(!text.contains("diary entry"), "{text}");
+        // The diary has its own section, after the key memories.
+        let (before_diary, in_diary) = text.split_once("## Recent diary").unwrap();
+        assert!(!before_diary.contains("diary entry"), "{text}");
+        assert!(in_diary.contains("diary entry"), "{text}");
     }
 
     #[test]
@@ -822,5 +898,126 @@ mod tests {
         // A budget too small for it leaves it out rather than overrun.
         let tiny = build(&c, &app, 30, at(NOW)).unwrap();
         assert!(!tiny.contains("## Review"), "{tiny}");
+    }
+
+    fn diary(c: &rusqlite::Connection, p: &projects::ResolvedProject, title: &str, created: &str) {
+        let mut i = input(Kind::Diary, 3, &format!("{title}\nwhat happened that day"));
+        i.title = Some(title.into());
+        i.created_at = Some(created.into());
+        put(c, p, i);
+    }
+
+    fn review_items(c: &rusqlite::Connection, prefix: &str, n: usize) {
+        for key in 0..n {
+            crate::store::reviews::create(
+                c,
+                &crate::store::reviews::NewReview {
+                    kind: crate::store::reviews::ReviewType::Merge,
+                    payload: serde_json::json!({}),
+                    confidence: None,
+                    dedupe_key: Some(format!("{prefix}{key}")),
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn recent_diary_lists_the_newest_non_checkpoint_entries() {
+        let (_d, c, app) = setup("app");
+        for day in 1..=7 {
+            diary(
+                &c,
+                &app,
+                &format!("Diary 2026-10-0{day}: topic{day}"),
+                &format!("2026-10-0{day}T09:00:00.000Z"),
+            );
+        }
+        diary(
+            &c,
+            &app,
+            "Diary 2026-10-09: checkpoint",
+            "2026-10-09T09:00:00.000Z",
+        );
+        let mut tagged = input(Kind::Diary, 3, "auto-save body");
+        tagged.title = Some("Diary 2026-10-10: autosave".into());
+        tagged.topics = vec!["checkpoint".into()];
+        tagged.created_at = Some("2026-10-10T09:00:00.000Z".into());
+        put(&c, &app, tagged);
+
+        let text = build(&c, &app, 1_200, at(NOW)).unwrap();
+        let pos = |s: &str| {
+            text.find(s)
+                .unwrap_or_else(|| panic!("missing {s}:\n{text}"))
+        };
+        assert!(pos("## Recent diary") < pos("topic7"), "{text}");
+        assert!(pos("topic7") < pos("topic6"), "newest first:\n{text}");
+        assert!(pos("topic3") > pos("topic4"), "{text}");
+        assert!(
+            !text.contains("topic2") && !text.contains("topic1"),
+            "at most 5:\n{text}"
+        );
+        assert!(!text.contains("checkpoint"), "{text}");
+        assert!(!text.contains("autosave"), "{text}");
+        assert!(text.contains("what happened that day"), "{text}");
+        // Inside the budget it is the first to shrink: a tight budget drops entries, never overruns.
+        let tight = build(&c, &app, 40, at(NOW)).unwrap();
+        assert!(estimate_tokens(&tight) <= 55, "{tight}");
+    }
+
+    #[test]
+    fn recent_diary_comes_after_preferences_and_before_review_and_is_absent_without_diaries() {
+        let (_d, c, app) = setup("app");
+        put(&c, &app, input(Kind::Decision, 5, "Rust single binary"));
+        let none = build(&c, &app, 1_200, at(NOW)).unwrap();
+        assert!(!none.contains("Recent diary"), "{none}");
+        let global = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
+        put(&c, &global, input(Kind::Preference, 4, "Reply in Thai"));
+        diary(
+            &c,
+            &app,
+            "Diary 2026-10-05: wiring",
+            "2026-10-05T09:00:00.000Z",
+        );
+        review_items(&c, "a", 1);
+        let text = build(&c, &app, 1_200, at(NOW)).unwrap();
+        let pos = |s: &str| {
+            text.find(s)
+                .unwrap_or_else(|| panic!("missing {s}:\n{text}"))
+        };
+        assert!(
+            pos("## Your preferences") < pos("## Recent diary"),
+            "{text}"
+        );
+        assert!(pos("## Recent diary") < pos("## Review"), "{text}");
+    }
+
+    #[test]
+    fn only_checkpoint_diaries_give_no_diary_section() {
+        let (_d, c, app) = setup("app");
+        diary(
+            &c,
+            &app,
+            "Diary 2026-10-05: checkpoint",
+            "2026-10-05T09:00:00.000Z",
+        );
+        let text = build(&c, &app, 1_200, at(NOW)).unwrap();
+        assert!(!text.contains("Recent diary"), "{text}");
+    }
+
+    #[test]
+    fn review_line_asks_the_user_only_for_a_handful_of_items() {
+        let (_d, c, app) = setup("app");
+        review_items(&c, "a", 3);
+        let few = build(&c, &app, 1_200, at(NOW)).unwrap();
+        assert!(few.contains("3 item(s) wait for a decision"), "{few}");
+        assert!(few.contains("ask the user"), "{few}");
+        review_items(&c, "b", 11);
+        let many = build(&c, &app, 1_200, at(NOW)).unwrap();
+        assert!(
+            many.contains("14 decisions wait in `alice review` (handle them when convenient)"),
+            "{many}"
+        );
+        assert!(!many.contains("ask the user"), "{many}");
     }
 }

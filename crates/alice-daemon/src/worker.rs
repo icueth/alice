@@ -13,6 +13,7 @@ use crate::writer::{WriteOp, WriteOutcome, WriterHandle};
 use alice_core::embed::Embedder;
 use alice_core::error::AliceError;
 use alice_core::judge::jev::JevPolicy;
+use alice_core::redact::Redactor;
 use alice_core::store::ReaderPool;
 use alice_core::store::embeddings::{self, PendingItem, VecKey};
 use alice_core::vector::VectorIndex;
@@ -177,10 +178,9 @@ pub(crate) fn embed_guarded(
 /// is unavailable (asking again, text by text, would only repeat the failure).
 fn embed_each(
     embedder: &dyn Embedder,
-    items: &[PendingItem],
+    texts: Vec<String>,
     isolate: bool,
 ) -> Vec<Result<Vec<f32>, Failure>> {
-    let texts: Vec<String> = items.iter().map(|i| i.text.clone()).collect();
     let whole = embed_guarded(embedder, &texts).and_then(|v| {
         if v.len() == texts.len() {
             Ok(v)
@@ -194,12 +194,12 @@ fn embed_each(
     });
     match whole {
         Ok(vectors) => vectors.into_iter().map(Ok).collect(),
-        Err(e) if items.len() == 1 || !isolate || matches!(e, AliceError::Unavailable(_)) => {
+        Err(e) if texts.len() == 1 || !isolate || matches!(e, AliceError::Unavailable(_)) => {
             let f = Failure {
                 message: e.to_string(),
                 unavailable: matches!(e, AliceError::Unavailable(_)),
             };
-            items
+            texts
                 .iter()
                 .map(|_| {
                     Err(Failure {
@@ -283,6 +283,37 @@ pub(crate) fn project_allowed(
         .is_some_and(|p| slug_of(readers, project_id).is_some_and(|slug| p.cloud_allowed(&slug)));
     cache.insert(project_id.to_string(), allowed);
     allowed
+}
+
+/// `items` with their texts as the embedder may see them. For a remote one each text is
+/// redacted with its project's always-on rules (the ones a Jev request gets: today's patterns,
+/// whatever `privacy.redact` stored); a local one gets the stored text. Done before
+/// [`split_by_policy`], so the policy is still asked right before the texts are sent (and
+/// redaction is idempotent, so a retry may run it again).
+pub(crate) fn redacted_for(
+    readers: &ReaderPool,
+    policy: Option<&Arc<dyn JevPolicy>>,
+    remote: bool,
+    mut items: Vec<PendingItem>,
+) -> Vec<PendingItem> {
+    if !remote {
+        return items;
+    }
+    let mut rules: HashMap<String, Arc<Redactor>> = HashMap::new();
+    for i in &mut items {
+        let r = rules.entry(i.project_id.clone()).or_insert_with(|| {
+            match (policy, slug_of(readers, &i.project_id)) {
+                (Some(p), Some(slug)) => p.redactor(&slug),
+                // Never sent (no policy, an unknown project); redacted all the same.
+                _ => Arc::new(Redactor::builtin()),
+            }
+        });
+        let out = r.apply(&i.text);
+        if !out.found.is_empty() {
+            i.text = out.text;
+        }
+    }
+    items
 }
 
 /// `items` split into those that may be sent to the embedder and those the cloud policy keeps
@@ -401,7 +432,8 @@ fn run(cfg: WorkerConfig) {
             continue;
         }
 
-        // A remote embedder gets only what the cloud policy lets leave the machine.
+        // A remote embedder gets only what the cloud policy lets leave the machine, redacted.
+        let items = redacted_for(&cfg.readers, cfg.policy.as_ref(), remote, items);
         let (items, held_back) = split_by_policy(&cfg.readers, cfg.policy.as_ref(), remote, items);
         if !held_back.is_empty() {
             tracing::info!(
@@ -420,7 +452,8 @@ fn run(cfg: WorkerConfig) {
         }
 
         let n_items = items.len();
-        let results = embed_each(active.embedder.as_ref(), &items, !remote);
+        let texts = items.iter().map(|i| i.text.clone()).collect();
+        let results = embed_each(active.embedder.as_ref(), texts, !remote);
         let mut done = Vec::new();
         let (mut retry, mut give_up) = (Vec::new(), Vec::new());
         let mut first_error = None;
