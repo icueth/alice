@@ -204,6 +204,11 @@ pub enum DetectedForRead {
 
 /// Resolve a detected project for a read, without creating anything. Uses the matching of
 /// [`upsert_project`]'s adoption, so a read and the first write agree on the project.
+///
+/// One known disagreement: when two placeholders match (only reachable through an alias made by
+/// hand, since a placeholder's slug is unique), the first write adopts the oldest of them while
+/// a read answers `Ambiguous` and guesses none. Left so on purpose: the read stays on the side
+/// of showing nothing rather than another project's memories.
 pub fn detected_for_read(conn: &Connection, p: &ProjectRef) -> Result<DetectedForRead> {
     if let Some(found) = find_by_key(conn, &p.key)? {
         return Ok(DetectedForRead::Stored(found));
