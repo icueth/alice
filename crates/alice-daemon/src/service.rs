@@ -1469,10 +1469,21 @@ impl Service {
     }
 
     pub async fn remember(&self, req: RememberRequest) -> Result<RememberResponse> {
+        // A shared write touches only the team store: it does not hold back maintenance.
         if req.shared {
             return self.remember_shared(req).await;
         }
         let _busy = self.activity.enter();
+        self.remember_spooled(req).await
+    }
+
+    /// [`remember`](Self::remember) for a write the spool queued: the drain is the daemon's own
+    /// timer, not a request, so it does not keep maintenance (backups included) from starting.
+    pub async fn remember_spooled(&self, req: RememberRequest) -> Result<RememberResponse> {
+        // Clients never queue a shared write; one found in the spool still goes to the team.
+        if req.shared {
+            return self.remember_shared(req).await;
+        }
         let project = self.choose(req.scope()).await?;
         // Before anything else touches the text: the writer, the spool and the logs only ever
         // see the redacted request (spec §5.1 step 2).
@@ -1973,11 +1984,14 @@ impl Service {
                 match send {
                     Some(q) => {
                         let idx = idx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            search::embed_query(Some(&idx), embedder.as_ref(), &q)
+                        let v = tokio::task::spawn_blocking(move || {
+                            search::embed_query_or_why(Some(&idx), embedder.as_ref(), &q)
                         })
                         .await
-                        .map_err(join_err)?
+                        .map_err(join_err)?;
+                        // A recall that used word matches only says so (the first one after
+                        // the model was unloaded for being idle, a provider that is down).
+                        v.map_err(|why| notes.push(why)).ok()
                     }
                     None => {
                         notes.push(QUERY_HELD_BACK.into());
@@ -1985,8 +1999,13 @@ impl Service {
                     }
                 }
             }
-            _ => None,
+            _ => {
+                notes.push(search::INDEX_REBUILDING.into());
+                None
+            }
         };
+        // Whether meaning-search ran: without it, "nothing answers" would claim too much.
+        let vector_ran = vector.is_some();
         // The raw tier's chunk vector list reads on this pool, beside the main reader's word
         // lists: one connection of each, main first (`ServiceOptions::vector_reader_pool`).
         let vector_readers = self.vector_readers.clone();
@@ -2106,6 +2125,10 @@ impl Service {
                     .first()
                     .is_some_and(|h| exact_match(&judged_query, h))
             {
+                low_confidence = false;
+            }
+            // Only words were searched: what was not found by meaning may still be there.
+            if !vector_ran {
                 low_confidence = false;
             }
             if low_confidence {
@@ -2274,6 +2297,7 @@ impl Service {
                 created_at: h.created_at.clone(),
                 similarity: None,
                 raw: h.tier == Tier::Raw,
+                status: h.status,
             };
             let mut shown: Vec<(usize, JudgeMemory)> = Vec::new();
             let mut ordinal = 0;
@@ -2348,7 +2372,28 @@ impl Service {
                                     ));
                                 }
                             }
-                            graded.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                            // Ordered by the grade with the status prior of the search kept
+                            // (`weight^λ`, as in fusion): an outdated fact still "answers", and
+                            // must not lead the memory that replaced it.
+                            let cfg = self.settings();
+                            let all_hits = |i: usize| {
+                                if i < near_start {
+                                    &out.hits[i]
+                                } else {
+                                    &near[i - near_start].hit
+                                }
+                            };
+                            let prior = |i: usize| {
+                                all_hits(i).status.map_or(1.0, |st| {
+                                    search::fusion::status_weight(&cfg.search.weights, st)
+                                        .powf(cfg.search.boost_exponent)
+                                })
+                            };
+                            graded.sort_by(|a, b| {
+                                (b.1 * prior(b.0))
+                                    .total_cmp(&(a.1 * prior(a.0)))
+                                    .then(a.0.cmp(&b.0))
+                            });
                             reranked = !graded.is_empty();
                             // Graded, and not one of them clearly answers the query.
                             low_confidence = reranked
@@ -3608,8 +3653,14 @@ impl Service {
         }
     }
 
-    pub async fn ingest(&self, mut req: IngestRequest) -> Result<IngestOutcome> {
+    pub async fn ingest(&self, req: IngestRequest) -> Result<IngestOutcome> {
         let _busy = self.activity.enter();
+        self.ingest_spooled(req).await
+    }
+
+    /// [`ingest`](Self::ingest) for a request the spool queued (no activity, as
+    /// [`remember_spooled`](Self::remember_spooled)).
+    pub async fn ingest_spooled(&self, mut req: IngestRequest) -> Result<IngestOutcome> {
         // Checked here so an oversized request never reaches (or delays) the writer.
         sources::validate_chunks(&req.chunks)?;
         let project = self.choose(req.scope()).await?;
@@ -4243,7 +4294,10 @@ fn shared_write_error(e: AliceError) -> AliceError {
     match e {
         e if alice_core::redact::is_refusal(&e) => e,
         e @ (AliceError::Invalid(_) | AliceError::NotFound(_)) => e,
-        _ if text.contains("did not answer in time") || text.contains("broke off its answer") => {
+        _ if text.contains("did not answer in time")
+            || text.contains("broke off its answer")
+            || text.contains("sent an answer this daemon cannot read") =>
+        {
             AliceError::Other(format!(
                 "the team memory did not confirm the write ({text}); it may have been saved: recall it before saving it again"
             ))
@@ -8553,6 +8607,265 @@ mod tests {
         wait_settled(s).await;
     }
 
+    /// Grades a result by the first of `scores` its block holds: `(marker, P(answers))`; other
+    /// questions are answered `unrelated`. Keeps the grading states.
+    struct ScoreGrader {
+        scores: Vec<(&'static str, f64)>,
+        states: Mutex<Vec<String>>,
+    }
+
+    impl alice_core::judge::jev::JevTransport for ScoreGrader {
+        fn post(
+            &self,
+            _endpoint: &str,
+            _key: &str,
+            body: &[u8],
+            _timeout: Duration,
+        ) -> std::result::Result<
+            alice_core::judge::jev::HttpReply,
+            alice_core::judge::jev::TransportError,
+        > {
+            let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let state = req["state"].as_str().unwrap();
+            let mut answers = serde_json::Map::new();
+            for (qid, q) in req["questions"].as_object().unwrap() {
+                let options: Vec<String> =
+                    q["criteria"].as_object().unwrap().keys().cloned().collect();
+                let p = qid.strip_prefix("r_").map(|k| {
+                    let k: usize = k.parse().unwrap();
+                    let block = state
+                        .split(&format!("Result {k} ("))
+                        .nth(1)
+                        .unwrap_or("")
+                        .split("\nResult ")
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    self.scores
+                        .iter()
+                        .find(|(m, _)| block.contains(m))
+                        .map_or(0.02, |(_, p)| *p)
+                });
+                let (choice, probs): (&str, serde_json::Map<String, serde_json::Value>) = match p {
+                    Some(p) => (
+                        if p >= 0.5 { "answers" } else { "unrelated" },
+                        options
+                            .iter()
+                            .map(|o| {
+                                let v = match o.as_str() {
+                                    "answers" => p,
+                                    "unrelated" => 1.0 - p - 0.01,
+                                    _ => 0.01 / (options.len().max(3) - 2) as f64,
+                                };
+                                (o.clone(), serde_json::json!(v))
+                            })
+                            .collect(),
+                    ),
+                    None => (
+                        "unrelated",
+                        options
+                            .iter()
+                            .map(|o| {
+                                let v = if o == "unrelated" {
+                                    0.9
+                                } else {
+                                    0.1 / options.len() as f64
+                                };
+                                (o.clone(), serde_json::json!(v))
+                            })
+                            .collect(),
+                    ),
+                };
+                if p.is_some() {
+                    self.states.lock().push(state.to_string());
+                }
+                answers.insert(
+                    qid.clone(),
+                    serde_json::json!({"type": "choice", "choice": choice, "confidence": 0.9, "probabilities": probs}),
+                );
+            }
+            let resp = serde_json::json!({"model": "jev-1.13.0", "answers": answers,
+                "usage": {"input_tokens": 800, "output_tokens": 0}});
+            Ok(alice_core::judge::jev::HttpReply {
+                status: 200,
+                body: serde_json::to_vec(&resp).unwrap(),
+                retry_after: None,
+            })
+        }
+    }
+
+    /// Final review C-I1: the judge grades an outdated fact as answering too; precise mode tells
+    /// it the memory was superseded and keeps the status prior, so the replacement leads even
+    /// when the old version is graded a little higher.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn precise_mode_keeps_a_replacement_above_the_memory_it_superseded() {
+        let t = Arc::new(ScoreGrader {
+            scores: vec![("5432", 0.93), ("5433", 0.91)],
+            states: Default::default(),
+        });
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                jev_transport: Some(t.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        let cwd = repo(&d, "proj");
+        let old = remember_id(
+            &s,
+            "Postgres in staging listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        s.remember(RememberRequest {
+            supersedes: vec![old.clone()],
+            ..remember_req(
+                "Postgres in staging now listens on port 5433",
+                Some(Kind::Fact),
+                &cwd,
+            )
+        })
+        .await
+        .unwrap();
+        wait_settled(&s).await;
+        assert_eq!(state_of(&s, &old).await.1, "superseded");
+        let r = s
+            .recall(recall_req(
+                "which port does Postgres in staging listen on",
+                RecallMode::Precise,
+                &cwd,
+            ))
+            .await
+            .unwrap();
+        assert!(r.reranked, "{:?}", r.notes);
+        let titles: Vec<&str> = r.results.iter().map(|h| h.title.as_str()).collect();
+        assert!(titles[0].contains("5433"), "{titles:?}");
+        let old_hit = r
+            .results
+            .iter()
+            .find(|h| h.id == old)
+            .expect("the old one is shown");
+        assert!(
+            old_hit.relevance.unwrap() > r.results[0].relevance.unwrap(),
+            "graded higher"
+        );
+        assert!(
+            t.states
+                .lock()
+                .iter()
+                .any(|st| st.contains("status superseded: a newer memory replaced it")),
+            "the judge was told"
+        );
+        s.shutdown();
+    }
+
+    /// A fake embedder whose query embedding fails with `fail` while it is set (a text that
+    /// starts with `MODEL_LOADING` fails as an unloaded model does, any other as a provider
+    /// that is down).
+    struct FlakyQueries {
+        inner: FakeEmbedder,
+        fail: Arc<Mutex<Option<String>>>,
+    }
+
+    impl Embedder for FlakyQueries {
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.inner.embed_passages(texts)
+        }
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+            match self.fail.lock().clone() {
+                Some(m) if m.starts_with(alice_core::embed::MODEL_LOADING) => {
+                    Err(AliceError::Other(m))
+                }
+                Some(m) => Err(AliceError::Unavailable(m)),
+                None => self.inner.embed_query(text),
+            }
+        }
+    }
+
+    /// Final review C-I2: a recall whose query was not embedded (the model reloading after an
+    /// idle unload, a provider that is down) says it used word matches only, and is never
+    /// flagged `low_confidence`: meaning-search did not run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_whose_query_was_not_embedded_says_so_and_is_not_low_confidence() {
+        let grader = KeywordGrader::new("WOMBAT");
+        let fail: Arc<Mutex<Option<String>>> = Default::default();
+        let d = tempfile::tempdir().unwrap();
+        let f = fail.clone();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &move || {
+                Ok(Arc::new(FlakyQueries {
+                    inner: FakeEmbedder::new(384),
+                    fail: f.clone(),
+                }) as Arc<dyn Embedder>)
+            },
+            ServiceOptions {
+                jev_transport: Some(grader.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        let cwd = repo(&d, "proj");
+        remember_deploy_notes(&s, &cwd).await;
+        // With a query vector: graded, nothing answers, and it says so.
+        let r = s
+            .recall(recall_req(VAGUE, RecallMode::Precise, &cwd))
+            .await
+            .unwrap();
+        assert!(r.reranked && r.low_confidence, "{:?}", r.notes);
+        for (why, said) in [
+            (
+                alice_core::embed::MODEL_LOADING.to_string(),
+                alice_core::embed::MODEL_LOADING,
+            ),
+            (
+                "the provider did not answer".to_string(),
+                "this search used word matches only: the embedding provider is unavailable",
+            ),
+        ] {
+            *fail.lock() = Some(why);
+            let r = s
+                .recall(recall_req(VAGUE, RecallMode::Precise, &cwd))
+                .await
+                .unwrap();
+            assert!(!r.results.is_empty(), "words still find them");
+            assert!(r.notes.iter().any(|n| n == said), "{:?}", r.notes);
+            assert!(!r.low_confidence, "{:?}", r.notes);
+            assert!(
+                r.notes.iter().all(|n| n != NOTHING_ANSWERS),
+                "{:?}",
+                r.notes
+            );
+            let text = s
+                .recall(RecallRequest {
+                    format: OutputFormat::Text,
+                    ..recall_req(VAGUE, RecallMode::Fast, &cwd)
+                })
+                .await
+                .unwrap();
+            assert!(text.text.unwrap().contains("word matches only"));
+        }
+        s.shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn precise_mode_reorders_by_the_judges_relevance_and_fast_mode_does_not() {
         let t = KeywordGrader::new("ZEBRA");
@@ -10791,6 +11104,11 @@ mod tests {
         ))
         .to_string();
         assert!(late.contains("may have been saved"), "{late}");
+        let garbled = shared_write_error(AliceError::Other(
+            "the team store sent an answer this daemon cannot read: eof".into(),
+        ))
+        .to_string();
+        assert!(garbled.contains("may have been saved"), "{garbled}");
         let down = shared_write_error(AliceError::Other(
             "the team store is unreachable: connection refused".into(),
         ))

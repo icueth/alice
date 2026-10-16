@@ -54,6 +54,8 @@ pub struct DaemonClient {
     http: reqwest::Client,
     base: String,
     token: String,
+    /// How long a recall may take under this home's settings (see `config::recall_wait`).
+    recall_wait: Duration,
     /// The instance that proved the token; `is_live` checks the daemon is still that one.
     instance: String,
 }
@@ -380,6 +382,7 @@ impl DaemonClient {
                 http: http.clone(),
                 base,
                 token,
+                recall_wait: crate::config::recall_wait_for(home),
                 instance: info.instance,
             })
     }
@@ -528,8 +531,10 @@ impl DaemonClient {
         self.call("/api/v1/remember", r, Duration::from_secs(5))
             .await
     }
+    /// Waits as long as a precise recall may legitimately take under this home's settings
+    /// (`search.precise_timeout_ms` and the query embedding on top of the search), at least 5 s.
     pub async fn recall(&self, r: &RecallRequest) -> Result<RecallResponse> {
-        self.call("/api/v1/recall", r, Duration::from_secs(5)).await
+        self.call("/api/v1/recall", r, self.recall_wait).await
     }
     pub async fn context(&self, r: &ContextRequest) -> Result<ContextResponse> {
         self.call("/api/v1/context", r, Duration::from_secs(3))
@@ -1143,6 +1148,67 @@ mod tests {
         });
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         seen
+    }
+
+    /// Final review D-I2: a precise recall may take the judge's budget and more; the client
+    /// waits for it (here a daemon that answers after 5.5 s, with a 6 s judge budget) instead of
+    /// giving up at 5 s with "did not answer in time".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_waits_as_long_as_the_judge_budget_allows() {
+        crate::install_tls();
+        let (_d, home) = home();
+        std::fs::write(home.config_file(), "[search]\nprecise_timeout_ms = 6000\n").unwrap();
+        let token = load_or_create_token(&home).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let instance = "01K7SLOWDAEMON000000000000";
+        write_info(
+            &home,
+            &DaemonInfo {
+                pid: std::process::id(),
+                port,
+                instance: instance.into(),
+                version: "t".into(),
+                started_at: "t".into(),
+            },
+        )
+        .unwrap();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let token = token.clone();
+            async move {
+                if req.uri().path() == "/api/v1/ping" {
+                    let nonce = req
+                        .uri()
+                        .query()
+                        .and_then(|q| q.strip_prefix("nonce="))
+                        .unwrap_or("")
+                        .to_string();
+                    return axum::Json(serde_json::json!({
+                        "service": "alice", "instance": instance, "version": "t",
+                        "proof": ping_proof(&token, &nonce, instance),
+                    }))
+                    .into_response();
+                }
+                tokio::time::sleep(Duration::from_millis(5_500)).await;
+                axum::Json(RecallResponse {
+                    notes: vec!["graded slowly".into()],
+                    ..Default::default()
+                })
+                .into_response()
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = DaemonClient::try_existing(&home)
+            .await
+            .expect("the daemon proves the token");
+        let r = c
+            .recall(&RecallRequest {
+                query: "slow".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.notes, ["graded slowly"]);
     }
 
     fn remember_req(content: &str) -> RememberRequest {

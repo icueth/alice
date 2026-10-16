@@ -293,6 +293,32 @@ fn effective(file: &Path, env: &[(String, String)]) -> Effective {
     }
 }
 
+/// The least a client waits for a recall, and the room it leaves for the search itself (and the
+/// judge's own set-up) on top of the judge's budget.
+const RECALL_WAIT_MIN: Duration = Duration::from_secs(5);
+const RECALL_ROOM: Duration = Duration::from_millis(2_500);
+
+/// How long a client (the CLI, `alice mcp`) waits for a recall under `settings`: the judge's
+/// budget (`search.precise_timeout_ms`), the longest an HTTP embedder may take for the query
+/// vector, and room for the search; at least 5 s. A precise recall whose judge is slow then
+/// answers fast with a note, as documented, instead of the client giving up first.
+pub fn recall_wait(settings: &Settings) -> Duration {
+    let judge = Duration::from_millis(settings.search.precise_timeout_ms);
+    let embed = match settings.embedding.provider {
+        settings::EmbeddingProvider::Local => Duration::ZERO,
+        _ => alice_embed::http::QUERY_TIMEOUT,
+    };
+    (judge + embed + RECALL_ROOM).max(RECALL_WAIT_MIN)
+}
+
+/// [`recall_wait`] for the settings of `home` as a client sees them (`config.toml` and the
+/// process's variables; a file that cannot be used gives the defaults), read without logging.
+pub fn recall_wait_for(home: &AliceHome) -> Duration {
+    let env = EnvLayer::new(&process_env());
+    let (resolved, _) = resolve_layers(&read_config(&home.config_file()), &env);
+    recall_wait(&resolved.settings)
+}
+
 /// The global `[privacy]` settings last applied from a valid `config.toml` in `home`, if any.
 pub fn kept_privacy(home: &AliceHome) -> Option<PrivacySettings> {
     let text = std::fs::read_to_string(home.last_privacy_file()).ok()?;
@@ -1899,6 +1925,35 @@ mod tests {
             "back to what is in force: nothing to apply"
         );
         assert!(!s.loosening_waiting());
+    }
+
+    /// Final review D-I2: the client's recall wait covers the judge's budget, a remote query
+    /// embedding and the search, and is never below 5 s.
+    #[test]
+    fn the_recall_wait_covers_the_judge_budget_and_a_remote_query_embedding() {
+        let with = |toml: &str| recall_wait(&settings::resolve(Some(toml), &[]).unwrap().settings);
+        assert_eq!(with(""), Duration::from_secs(5));
+        assert_eq!(
+            with("[search]\nprecise_timeout_ms = 6000\n"),
+            Duration::from_millis(8_500)
+        );
+        assert_eq!(
+            with("[embedding]\nprovider = \"openai\"\nmodel = \"m\"\n"),
+            Duration::from_millis(7_000)
+        );
+        assert_eq!(
+            with("[search]\nprecise_timeout_ms = 200\n"),
+            Duration::from_secs(5)
+        );
+        let (_d, h) = home();
+        write(&h, "[search]\nprecise_timeout_ms = 30000\n");
+        assert_eq!(recall_wait_for(&h), Duration::from_millis(32_500));
+        write(&h, "[search\n");
+        assert_eq!(
+            recall_wait_for(&h),
+            Duration::from_secs(5),
+            "a broken file: the defaults"
+        );
     }
 
     /// A loosening of `config.toml` that is still waiting for its polls counts as a fail-closed

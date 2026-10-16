@@ -16,7 +16,7 @@ Placeholders used below: `<host>` is the server's public name or address, `<name
 
 The server's admin can read every tenant's memory, token and Jev key. The admin owns the machine. What protects a person from the admin is what they choose not to put into Alice. Tenants cannot read each other: each has its own Unix user, a 0700 home directory, its own token and its own loopback port, and the service runs under systemd hardening.
 
-A tenant cannot reach the admin's network. The service unit allows only the public internet and localhost, and tenant mode refuses settings that point at private or loopback addresses. A tenant also cannot change the settings the admin owns: its data directory, its port, its backup location and rotation, its secrets backend (always the private file), and the redaction switch (always on).
+A tenant cannot reach the admin's network. The service unit allows only the public internet and localhost, and tenant mode refuses settings that point at private or loopback addresses. A tenant also cannot change the settings the admin owns: the Jev endpoint, model and daily budget (pinned in its tenant file, because the Jev key is the owner's), its data directory, its port, its backup location and rotation, its secrets backend (always the private file), and the redaction switch (always on).
 
 ## For the admin
 
@@ -80,7 +80,7 @@ A tenant name matches `^[a-z][a-z0-9-]{0,15}$` (a lowercase letter, then up to 1
 
 #### add
 
-`alice-server add <name>` creates the user, the home directory (`/srv/alice/<name>`, mode 0700), a tenant file in `/etc/alice/tenants/` and a port (the lowest free one in 47801-47899). It starts the daemon, waits for it to answer (the first start downloads the model, about about 130 MB), adds the Caddy route and prints the details once:
+`alice-server add <name>` creates the user, the home directory (`/srv/alice/<name>`, mode 0700), a tenant file in `/etc/alice/tenants/` and a port (the lowest free one in 47801-47899). It starts the daemon, waits for it to answer (the first start downloads the model, about 130 MB), adds the Caddy route and prints the details once:
 
 ```
 Created tenant <name>.
@@ -322,8 +322,26 @@ Alice picks the project in this order:
 
 1. the `project` argument of the tool call;
 2. the `?project=<slug>` on the MCP URL (at most 100 characters);
-3. the folder name of the first workspace root the agent offers;
-4. `global`.
+3. the `X-Alice-Project` header (the same limits; UTF-8, or percent-encoded UTF-8);
+4. the folder name of the first workspace root the agent offers;
+5. `global`.
+
+Claude Code sends no workspace roots over HTTP, so without one of the first three every session lands in `global`. Its `headersHelper` can send the header from the folder it runs in. In `~/.claude/settings.json` (or the server's entry of `.mcp.json`):
+
+```json
+"headersHelper": "/path/to/alice-headers.sh"
+```
+
+with `alice-headers.sh` printing the headers as JSON, the token from the environment and the project from the git checkout's folder name, percent-encoded so a Thai folder name comes through (Node cannot send it as it is):
+
+```sh
+#!/bin/sh
+name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
+project=$(printf '%s' "$name" | python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read()))')
+printf '{"Authorization": "Bearer %s", "X-Alice-Project": "%s"}\n' "$ALICE_TOKEN" "$project"
+```
+
+A header that is not UTF-8 after decoding fails the call, rather than putting the memory in another project.
 
 A slug that matches no stored project makes a new, empty project of that name. Memories you write now and an imported palace with the same wing name land together.
 

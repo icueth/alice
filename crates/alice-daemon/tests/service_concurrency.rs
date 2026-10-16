@@ -148,4 +148,16 @@ async fn writes_and_reads_stay_fast_during_bulk_ingest() {
         "no acknowledged write is lost"
     );
     assert!(got.missing.is_empty());
+    // Final review D-m11: zero duplicated writes (spec §10): 500 distinct memories, no more.
+    let distinct: std::collections::HashSet<&String> = all_ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        20 * 25,
+        "every acknowledged write has its own memory"
+    );
+    assert_eq!(
+        svc.health().await.unwrap().memories,
+        all_ids.len() as u64,
+        "no write was stored twice"
+    );
 }

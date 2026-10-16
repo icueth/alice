@@ -38,6 +38,12 @@ pub const CHUNK_REDACT_ACTION: &str = "chunk.redact";
 /// How an error starts when the adopted, unscrubbed database is still in place: `alice-server`
 /// then leaves the tenant stopped.
 pub const NOT_PUT_BACK: &str = "[not put back]";
+/// How an error starts when the tenant's database was never touched (a refusal before the swap).
+pub const UNTOUCHED: &str = "[untouched]";
+/// How an error starts when the tenant's own database is back after a failed adoption.
+pub const PUT_BACK: &str = "[put back]";
+// `alice-server` starts the tenant again only after one of the last two: any other end (a panic,
+// a kill) may have left the unscrubbed copy in place, so it stays stopped.
 
 /// What `alice adopt` did.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -138,12 +144,14 @@ pub fn check_fresh(home: &AliceHome) -> Result<()> {
 /// redaction rules (always on, as on any tenant) and the backups directory.
 pub fn adopt(home: &AliceHome, path: &Path, now: DateTime<Utc>) -> Result<AdoptReport> {
     let started = std::time::Instant::now();
-    let verified = check_source(path)?;
-    check_fresh(home)?;
+    let untouched = |e: AliceError| AliceError::Other(format!("{UNTOUCHED} {e}"));
+    let verified = check_source(path).map_err(untouched)?;
+    check_fresh(home).map_err(untouched)?;
     let settings = SettingsHandle::load_tenant(home);
     let redactor = Redactors::new(settings.clone()).for_root_always_on(None);
     let dir = backup::backup_dir(home, &settings.get().backup);
-    let swapped = restore::swap_verified(home, &dir, &verified, now)?;
+    // A swap that fails leaves `alice.db` as it was (restore's invariant).
+    let swapped = restore::swap_verified(home, &dir, &verified, now).map_err(untouched)?;
     let mut report = match finish(home, &redactor) {
         Ok(r) => r,
         Err(e) => {
@@ -159,7 +167,7 @@ pub fn adopt(home: &AliceHome, path: &Path, now: DateTime<Utc>) -> Result<AdoptR
                         let _ = std::fs::remove_file(dir.join(copy));
                     }
                     AliceError::Other(format!(
-                        "adopting failed, the tenant's own database is back: {e}"
+                        "{PUT_BACK} adopting failed, the tenant's own database is back: {e}"
                     ))
                 }
                 Some(Err(b)) => AliceError::Other(format!(

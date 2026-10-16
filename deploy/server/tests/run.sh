@@ -53,6 +53,8 @@ echo "chown $*" >>"$ALICE_SERVER_ROOT/calls.log"
 EOF
 stub systemctl <<'EOF'
 echo "systemctl $*" >>"$ALICE_SERVER_ROOT/calls.log"
+# LOCK_BIN_ON_RESTART=1: the binary's directory turns read-only at a restart (an unmovable alice.prev).
+if [ "${1:-}" = restart ] && [ -n "${LOCK_BIN_ON_RESTART:-}" ]; then chmod a-w "$ALICE_SERVER_ROOT/usr/local/bin"; fi
 # A restarted Caddy listens on its admin socket (the drop-in gives it /run/caddy).
 if [ "${1:-}" = restart ] && [ "${2:-}" = caddy ]; then
   mkdir -p "$ALICE_SERVER_ROOT/run/caddy"; : >"$ALICE_SERVER_ROOT/run/caddy/admin.sock"
@@ -89,6 +91,8 @@ if [ "${1:-}" = -u ]; then shift 2; fi
 exec "$@"
 EOF
 stub flock <<'EOF'
+echo "flock $*" >>"$ALICE_SERVER_ROOT/flock.log"
+[ -z "${FLOCK_BUSY:-}" ] || exit 1
 exit 0
 EOF
 # GNU timeout: TIMEOUT_EXPIRES=1 makes the wrapped command run out of time (exit 124).
@@ -110,9 +114,11 @@ case "$*" in
   "--version") echo "alice 0.1.0" ;;
   "--json adopt "*)
     case "${ADOPT:-ok}" in
-      nonempty) echo "alice: this tenant already holds 3 memories, 0 chunks and 0 facts; adopt needs a fresh tenant" >&2; exit 1 ;;
-      older) echo "alice: the file was made by an older Alice (schema v4; the server runs v5): upgrade the source Alice first" >&2; exit 1 ;;
-      damaged) echo "alice: the file fails SQLite's integrity check (row 3 missing)" >&2; exit 1 ;;
+      nonempty) echo "alice: [untouched] this tenant already holds 3 memories, 0 chunks and 0 facts; adopt needs a fresh tenant" >&2; exit 1 ;;
+      older) echo "alice: [untouched] the file was made by an older Alice (schema v4; the server runs v5): upgrade the source Alice first" >&2; exit 1 ;;
+      damaged) echo "alice: [untouched] the file fails SQLite's integrity check (row 3 missing)" >&2; exit 1 ;;
+      putback) echo "alice: [put back] adopting failed, the tenant's own database is back: disk full" >&2; exit 1 ;;
+      panic) echo "thread 'main' panicked at crates/alice-daemon/src/adopt.rs:300:9" >&2; exit 101 ;;
       notputback) echo "alice: [not put back] adopting failed (disk full), and the tenant's own database could not be put back" >&2; exit 1 ;;
     esac
     [ -f "${3:-}" ] && cp -- "$3" "$ALICE_SERVER_ROOT/adopted-copy"
@@ -197,6 +203,7 @@ add_creates_everything() {
   has "$e" 'TZ=Asia/Bangkok'
   has "$e" 'ALICE_JUDGE_JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone'
   has "$e" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
+  has "$e" 'ALICE_JUDGE_JEV_MODEL=jev-1.13.0'
   hasnt "$e" 'tok-'
   local u="$R/etc/systemd/system/alice@.service"
   has "$u" 'MemoryMax=3G'
@@ -689,6 +696,20 @@ upgrade_restores_the_library_when_the_binary_cannot_be_installed() {
   pass
 }
 
+upgrade_names_what_it_could_not_put_back() {
+  local lib_before
+  if [ "$(id -u)" = 0 ]; then pass; return; fi   # root writes through a read-only directory
+  make_dist "$T/dist" "lib v8"
+  lib_before=$(cat "$LIB")
+  LOCK_BIN_ON_RESTART=1 PING_FAIL=1 run upgrade "$T/dist/bin/alice"
+  chmod u+w "$R/usr/local/bin"
+  [ "$RC" != 0 ] || fail "upgrade succeeded"
+  printf '%s\n' "$OUT" | grep -qF 'could not be fully put back (the binary: move' || fail "$OUT"
+  [ "$(cat "$LIB")" = "$lib_before" ] || fail "the library was not put back: $(cat "$LIB")"
+  mv -- "${R:?}/usr/local/bin/alice.prev" "${R:?}/usr/local/bin/alice"
+  pass
+}
+
 upgrade_is_also_the_first_install() {
   local rc out first_lib first_prev=no failed_rc left=no
   make_dist "$T/dist" "lib first"
@@ -840,7 +861,7 @@ echo "person's database" >"$ADOPT_FILE"
 adopt() { RC=0; OUT=$(SUDO_UID="$(id -u)" ALICE_SERVER_ROOT="$R" /bin/bash "$SCRIPT" adopt "$@" 2>&1) || RC=$?; }
 
 adopt_installs_and_reports() {
-  local stops starts
+  local stops starts l_set l_stop
   stops=$(grep -c 'systemctl stop alice@ann' "$R/calls.log" || true)
   starts=$(grep -c 'systemctl start alice@ann' "$R/calls.log" || true)
   adopt ann "$ADOPT_FILE"
@@ -857,8 +878,14 @@ adopt_installs_and_reports() {
   [ "$RC" = 0 ] || fail "adopt --cloud-denied exited $RC: $OUT"
   has "$R/calls.log" 'alice config set privacy.cloud_denied_projects ["client-x","shop"]'
   printf '%s\n' "$OUT" | grep -qF 'Kept from the cloud on ann: client-x,shop' || fail "$OUT"
-  adopt ann "$ADOPT_FILE" --cloud-denied 'x;rm'
-  [ "$RC" != 0 ] || fail "a bad slug list was accepted"
+  # Set while the fresh tenant runs, before it stops (final re-review N-1).
+  l_set=$(grep -n 'cloud_denied_projects' "$R/calls.log" | tail -n 1 | cut -d: -f1)
+  l_stop=$(grep -n 'systemctl stop alice@ann' "$R/calls.log" | tail -n 1 | cut -d: -f1)
+  if [ "$l_set" -ge "$l_stop" ]; then fail "the denials were set after the stop ($l_set, $l_stop)"; fi
+  for bad in 'x;rm' ',' 'a,,b' 'Shop'; do
+    adopt ann "$ADOPT_FILE" --cloud-denied "$bad"
+    [ "$RC" != 0 ] || fail "the slug list '$bad' was accepted"
+  done
   [ ! -e "$SRV/ann/adopt-inbox" ] || fail "the staged copy was left"
   [ -f "$ADOPT_FILE" ] || fail "the admin's file was consumed"
   pass
@@ -866,11 +893,11 @@ adopt_installs_and_reports() {
 
 adopt_refuses_and_leaves_the_tenant_as_it_was() {
   local why starts
-  for why in nonempty older damaged; do
+  for why in nonempty older putback damaged; do
     starts=$(grep -c 'systemctl start alice@ann' "$R/calls.log" || true)
     ADOPT=$why adopt ann "$ADOPT_FILE"
     [ "$RC" != 0 ] || fail "adopt succeeded with $why"
-    printf '%s\n' "$OUT" | grep -qF "nothing was adopted and ann is as it was" || fail "$why: $OUT"
+    printf '%s\n' "$OUT" | grep -qF "nothing was adopted; ann's database is as it was" || fail "$why: $OUT"
     [ "$(grep -c 'systemctl start alice@ann' "$R/calls.log")" = "$((starts + 1))" ] || fail "$why: the unit was not started again"
     [ ! -e "$SRV/ann/adopt-inbox" ] || fail "$why: the staged copy was left"
   done
@@ -903,21 +930,27 @@ adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back() {
   [ "$RC" != 0 ] || fail "adopt succeeded"
   printf '%s\n' "$OUT" | grep -qF 'ann stays stopped' || fail "$OUT"
   [ "$(grep -c 'systemctl start alice@ann' "$R/calls.log")" = "$starts" ] || fail "the tenant was started on the unscrubbed copy"
+  # A panic or a kill says neither marker: the tenant stays stopped too (final re-review N-3).
+  ADOPT=panic adopt ann "$ADOPT_FILE"
+  [ "$RC" != 0 ] || fail "adopt succeeded"
+  printf '%s\n' "$OUT" | grep -qF 'ann stays stopped' || fail "$OUT"
+  [ "$(grep -c 'systemctl start alice@ann' "$R/calls.log")" = "$starts" ] || fail "the tenant was started after a panic"
   pass
 }
 
-commands_that_restart_daemons_wait_for_an_import() {
-  mkdir -p "$SRV/ann/import-inbox/20261016T000000Z-1/palace"
-  run upgrade "$R/new-alice"
-  [ "$RC" != 0 ] || fail "upgrade ran during an import"
-  printf '%s\n' "$OUT" | grep -qF 'an import is running for: ann' || fail "$OUT"
-  run remove ann --yes
-  [ "$RC" != 0 ] || fail "remove ran during the tenant's import"
-  adopt ann "$ADOPT_FILE"
-  [ "$RC" != 0 ] || fail "adopt ran during the tenant's import"
-  rm -rf -- "${SRV:?}/ann/import-inbox/20261016T000000Z-1"
-  run upgrade "$R/new-alice"
-  [ "$RC" = 0 ] || fail "upgrade after the import exited $RC: $OUT"
+imports_and_other_commands_never_overlap() {
+  : >"$R/flock.log"
+  make_palace
+  run import ann "$PALACE" --dry-run
+  [ "$RC" = 0 ] || fail "import exited $RC: $OUT"
+  has "$R/flock.log" 'flock -s -n 9'
+  # A held lock: an import refuses while another command runs, and the other way round.
+  FLOCK_BUSY=1 run import ann "$PALACE" --dry-run
+  [ "$RC" != 0 ] || fail "an import ran beside another command"
+  printf '%s\n' "$OUT" | grep -qF 'wait until it ends, then import' || fail "$OUT"
+  FLOCK_BUSY=1 run upgrade "$R/new-alice"
+  [ "$RC" != 0 ] || fail "an upgrade ran beside an import"
+  printf '%s\n' "$OUT" | grep -qF 'or an import, is running' || fail "$OUT"
   pass
 }
 
@@ -970,8 +1003,9 @@ add_team_provisions_existing_tenants() {
     has "$TENANTS/$n.env" "ALICE_TENANT_NAME=$n"
     is_0600 "$SRV/$n/team.token" || fail "$n team.token is not mode 0600"
     cmp "$SRV/team/token" "$SRV/$n/team.token" || fail "$n team.token differs from the team token"
-    # Written through a mktemp file in the home (final review M-5), chowned, then moved into place.
-    grep -qE "chown alice-$n:alice-$n .*$n/\.team\.token\." "$R/calls.log" || fail "no chown of $n team.token"
+    # Written by the tenant's own user (final re-review N-4): root never chowns inside the home.
+    grep -qE "sudo -u alice-$n sh -c .*team\.token" "$R/calls.log" || fail "$n team.token was not written by alice-$n"
+    if grep -qE "chown .*$n/\.?team\.token" "$R/calls.log"; then fail "root chowned $n's team.token"; fi
     has "$R/calls.log" "systemctl restart alice@$n"
   done
   # idempotent: again, with an old tenant file that lacks ALICE_TENANT_NAME
@@ -996,7 +1030,7 @@ add_person_after_team_is_provisioned() {
   has "$TENANTS/hal.env" 'ALICE_TENANT_NAME=hal'
   is_0600 "$SRV/hal/team.token" || fail "hal team.token is not mode 0600"
   cmp "$SRV/team/token" "$SRV/hal/team.token" || fail "hal team.token differs"
-  l_chown=$(grep -nE 'chown alice-hal:alice-hal .*hal/\.team\.token\.' "$R/calls.log" | head -n 1 | cut -d: -f1 || true)
+  l_chown=$(grep -nE 'sudo -u alice-hal sh -c .*team\.token' "$R/calls.log" | head -n 1 | cut -d: -f1 || true)
   l_start=$(grep -n 'systemctl enable --now alice@hal' "$R/calls.log" | head -n 1 | cut -d: -f1)
   if [ -z "$l_chown" ] || [ -z "$l_start" ] || [ "$l_chown" -ge "$l_start" ]; then
     fail "team.token not in place before the first start ($l_chown, $l_start)"
@@ -1068,6 +1102,14 @@ has_key() { # tenant key
 
 jev_key_set_reaches_every_tenant_and_nothing_else() {
   local t
+  # A tenant without the pins gets no key (final re-review N-2), and nothing is written.
+  grep -v '^ALICE_JUDGE_JEV_MODEL=' "$TENANTS/ann.env" >"$T/ann.env" && cat "$T/ann.env" >"$TENANTS/ann.env"
+  jev_set "$JEV_A"
+  [ "$RC" != 0 ] || fail "jev-key set gave the key to an unpinned tenant"
+  printf '%s\n' "$OUT" | grep -qF 'do not pin the Jev endpoint, model and budget yet: ann' || fail "$OUT"
+  [ ! -e "$R/etc/alice/jev.key" ] || fail "the key was kept although a tenant was refused"
+  run upgrade "$R/new-alice"
+  has "$TENANTS/ann.env" 'ALICE_JUDGE_JEV_MODEL=jev-1.13.0'
   jev_set "$JEV_A"
   [ "$RC" = 0 ] || fail "jev-key set exited $RC: $OUT"
   for t in $(tenant_names); do has_key "$t" "$JEV_A"; done
@@ -1176,10 +1218,10 @@ for CURRENT in \
   cli_refuses_a_secret_in_argv upgrade_rolls_back_on_a_failed_ping upgrade_installs_and_keeps_prev \
   add_refuses_a_cpu_without_avx upgrade_refuses_a_cpu_without_avx upgrade_accepts_avx_without_avx2 \
   upgrade_refuses_a_binary_that_fails_its_self_test upgrade_installs_the_runtime_library_and_restores_it \
-  upgrade_restores_the_library_when_the_binary_cannot_be_installed add_takes_a_time_zone \
+  upgrade_restores_the_library_when_the_binary_cannot_be_installed upgrade_names_what_it_could_not_put_back add_takes_a_time_zone \
   upgrade_adds_the_time_zone_to_older_tenants adopt_installs_and_reports adopt_refuses_and_leaves_the_tenant_as_it_was \
   adopt_refuses_bad_files_before_any_change adopt_rolls_back_when_the_tenant_does_not_come_back \
-  adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back commands_that_restart_daemons_wait_for_an_import \
+  adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back imports_and_other_commands_never_overlap \
   dry_run_import_checks_the_disk_first \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \

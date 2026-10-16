@@ -276,6 +276,15 @@ async fn http_mcp_exposes_exactly_seven_tools_and_works() {
         .await
         .unwrap();
     assert_ne!(asserted.is_error, Some(true), "{}", first_text(&asserted));
+    // Final review D-m5: an `author` in the arguments is ignored; the session's client is it.
+    let spoofed = client
+        .call_tool(call(
+            "remember",
+            serde_json::json!({"content": "written as someone else", "author": {"agent": "cli"}}),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(spoofed.is_error, Some(true), "{}", first_text(&spoofed));
     let history = d
         .svc
         .events(alice_core::api::EventsRequest::default())
@@ -289,6 +298,13 @@ async fn http_mcp_exposes_exactly_seven_tools_and_works() {
             .unwrap_or_else(|| panic!("no {action} event in {history:?}"))
     };
     assert_eq!(actor_of("memory.create"), "agent:test-agent");
+    assert!(
+        history
+            .iter()
+            .filter(|e| e.action == "memory.create")
+            .all(|e| e.actor == "agent:test-agent"),
+        "{history:?}"
+    );
     assert_eq!(actor_of("memory.edit"), "agent:test-agent");
     assert_eq!(actor_of("relation.add"), "agent:test-agent");
     assert!(

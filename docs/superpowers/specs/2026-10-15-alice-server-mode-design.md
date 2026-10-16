@@ -54,7 +54,7 @@
    as it would locally, failing closed. Writes spool while the server is unreachable. The connection uses HTTPS, or plain HTTP to
    loopback only.
 4. **The Jev key is per person and optional.** A tenant without a key runs the heuristic judge. One person's key is never shared
-   with another tenant.
+   with another tenant. *(Superseded by addendum 5, §2.13: one shared key, the owner's, for every tenant; R44-R46.)*
 5. **The admin script** `deploy/server/alice-server` has the commands `add`, `remove`, `rotate`, `list` and `upgrade`. It comes with
    `docs/server.md` and a Thai section in `README.th.md`.
 
@@ -487,7 +487,10 @@ checked against its own docs when that file is written):
 The project of a tool call is, in order:
 1. the call's explicit `project` argument;
 2. the connection's default project: the query `?project=<slug>` on the MCP URL (R26);
-3. the basename of the first root the client offers (the MCP server already asks for roots), slugified;
+3. the `X-Alice-Project` header (controller's ruling, 2026-10-16: real Claude Code sends no roots over HTTP; its
+   `headersHelper` sends the checkout's name): UTF-8 or percent-encoded UTF-8, the same limits and error as the query;
+   other bytes fail the call;
+4. the basename of the first root the client offers (the MCP server already asks for roots), slugified;
 4. `global`.
 
 For 2 and 3 the slug resolves to an existing project with that slug or alias. If there is none, it resolves to a
@@ -1331,7 +1334,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R23 | **Backups pinned to 2 scheduled, 0 weekly, no manual** on tenants (environment plus a tenant-mode refusal) | The disk is fixed (§2.7); manual backups are kept apart from the rotation | A person cannot make an extra copy on demand; the admin can |
 | R24 | **Upload guard:** 4 GiB cap, refused below 2 GB free after the upload, one at a time, swept after 1 hour | The import must never be what fills the disk | A palace whose redacted text exceeds 4 GiB cannot be imported in one go; no such palace is known |
 | R25 | *(Superseded by R38: the build area stays.)* After the build, **only the binary stays** (target, caches, checkout and toolchain removed) | About 6 GB back before any data exists | The next build reinstalls the toolchain (minutes) |
-| R26 | The connection's default project is the **query `?project=<slug>`** on the MCP URL (addendum 2 let us pick header or query) | Every MCP client can set a URL; not every one can set custom headers; Caddy keeps the query when it strips the prefix | The slug shows in Caddy's access log (a project name, not a secret) |
+| R26 | The connection's default project is the **query `?project=<slug>`** on the MCP URL, then the `X-Alice-Project` header (2026-10-16) (addendum 2 let us pick header or query) | Every MCP client can set a URL; not every one can set custom headers; Caddy keeps the query when it strips the prefix | The slug shows in Caddy's access log (a project name, not a secret) |
 | R27 | An MCP project hint that names no stored project makes a placeholder with the **existing `import:` prefix**, not `mcp:` | The store adopts only `import:%` placeholders; an `mcp:` key would split one project between MCP writes and its import and never be adopted | The key's prefix reads "import" for a project that started over MCP (internal only) |
 | R28 | Tenant mode **forces `privacy.redact` on** for every write and refuses `privacy.redact = false` | Direct MCP sends text unredacted inside TLS; the server is the only place left to redact it | A person cannot store raw secrets on the server |
 | R29 | Admin import: only a palace strictly inside the tenant's `import-inbox/`; refused when 2 × its size would leave < 2 GB free | The raw palace stays inside the tenant's own 0700 home and only for the job; the import must not be what fills the disk | A palace larger than (free − 2 GB)/2 cannot be imported in one go |

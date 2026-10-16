@@ -49,7 +49,7 @@ async fn connect_with_header(
     url: &str,
     token: Option<&str>,
     root: Option<&Path>,
-    project: Option<&str>,
+    project: Option<&[u8]>,
 ) -> Result<Conn, String> {
     let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.to_string());
     if let Some(t) = token {
@@ -58,7 +58,7 @@ async fn connect_with_header(
     if let Some(p) = project {
         cfg.custom_headers.insert(
             axum::http::HeaderName::from_static("x-alice-project"),
-            axum::http::HeaderValue::from_str(p).unwrap(),
+            axum::http::HeaderValue::from_bytes(p).unwrap(),
         );
     }
     let uri = root.map(|p| url::Url::from_directory_path(p).unwrap().to_string());
@@ -239,7 +239,7 @@ async fn mcp_project_precedence() {
         &format!("{base}/mcp"),
         Some(&t.token),
         Some(root),
-        Some("Header App"),
+        Some(b"Header App".as_slice()),
     )
     .await
     .unwrap();
@@ -249,7 +249,7 @@ async fn mcp_project_precedence() {
         &format!("{base}/mcp?project=queried"),
         Some(&t.token),
         None,
-        Some("Header App"),
+        Some(b"Header App".as_slice()),
     )
     .await
     .unwrap();
@@ -257,9 +257,14 @@ async fn mcp_project_precedence() {
     assert!(out.contains("queried"), "{out}");
     // Over the limit, the header fails the call as the query does.
     let long = "h".repeat(250);
-    let c = connect_with_header(&format!("{base}/mcp"), Some(&t.token), None, Some(&long))
-        .await
-        .unwrap();
+    let c = connect_with_header(
+        &format!("{base}/mcp"),
+        Some(&t.token),
+        None,
+        Some(long.as_bytes()),
+    )
+    .await
+    .unwrap();
     let args = serde_json::json!({"content": "never stored"});
     let e = c
         .call_tool(
@@ -286,6 +291,44 @@ async fn mcp_project_precedence() {
             "root-repo"
         ]
     );
+}
+
+/// Final re-review N-7: the header is UTF-8 or percent-encoded UTF-8 (Node's fetch cannot send
+/// Thai as it is); other bytes fail the call instead of falling to another project.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_project_header_takes_utf8_or_percent_encoding() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let url = format!("{}/mcp", s.url("ann"));
+    // "ร้านค้า" percent-encoded.
+    let encoded = "%E0%B8%A3%E0%B9%89%E0%B8%B2%E0%B8%99%E0%B8%84%E0%B9%89%E0%B8%B2";
+    let c = connect_with_header(&url, Some(&t.token), None, Some(encoded.as_bytes()))
+        .await
+        .unwrap();
+    let r = tool(
+        &c,
+        "remember",
+        serde_json::json!({"content": "a note for the shop"}),
+    )
+    .await;
+    c.cancel().await.ok();
+    assert_ne!(r.is_error, Some(true), "{}", text(&r));
+    assert!(text(&r).contains("ร้านค้า"), "{}", text(&r));
+    // "café" as Latin-1, the way Node sends it: not UTF-8.
+    let c = connect_with_header(&url, Some(&t.token), None, Some(b"caf\xe9"))
+        .await
+        .unwrap();
+    let args = serde_json::json!({"content": "never stored"});
+    let e = c
+        .call_tool(
+            CallToolRequestParams::new("remember")
+                .with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    c.cancel().await.ok();
+    assert!(e.contains("the X-Alice-Project header is not UTF-8"), "{e}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

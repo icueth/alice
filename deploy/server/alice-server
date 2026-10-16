@@ -23,7 +23,7 @@ JEV_KEY_FILE="$R/etc/alice/jev.key"; JEV_SECRET=jev_api_key
 # The shared key goes only to this endpoint, and spends at most this much a day per tenant: both are pinned in the
 # tenant file (the environment wins over a person's settings), so a person can neither redirect the owner's key nor
 # raise the budget. Change one tenant's budget in its tenant file, then restart it.
-JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone; JEV_BUDGET_USD=1.0
+JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone; JEV_MODEL=jev-1.13.0; JEV_BUDGET_USD=1.0
 BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
 # The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
 # $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
@@ -346,15 +346,11 @@ drop_env_line() { # name KEY
   local f="$TENANTS/$1.env"
   { grep -v "^$2=" "$f" || true; } | put "$f" 0644
 }
-write_team_token() { # name token: <home>/team.token, 0600, the tenant's own, through a temporary file
-  local tmp
+write_team_token() { # name token: <home>/team.token, 0600, written by the tenant's own user
   [ -n "$2" ] || { printf 'alice-server: refusing to write an empty team.token for %s\n' "$1" >&2; return 1; }
-  # mktemp makes a new file (never one the tenant placed, nor a link's target) before root writes the token.
-  tmp=$(mktemp "$SRV/$1/.team.token.XXXXXX") || return 1
-  { ( umask 077; printf '%s\n' "$2" >"${tmp:?}" ) \
-    && chown "alice-$1:alice-$1" -- "${tmp:?}" \
-    && chmod -- 0600 "${tmp:?}" \
-    && mv -- "${tmp:?}" "${SRV:?}/${1:?}/team.token"; } || { rm -f -- "${tmp:?}"; return 1; }
+  # Root supplies only the content, on stdin: it never writes, chowns or chmods inside a home its tenant controls.
+  # shellcheck disable=SC2016  # the script is for the tenant's shell, which expands its own variables
+  printf '%s\n' "$2" | sudo -u "alice-$1" sh -c 'umask 077; t=$(mktemp "$1/.team.token.XXXXXX") && cat >"$t" && mv -f -- "$t" "$1/team.token"' sh "$SRV/$1"
 }
 team_token() {
   [ -s "$SRV/$TEAM/token" ] || die "the team store has no token yet"
@@ -404,7 +400,8 @@ EOF
 tenant_env_text() { # name port team(0|1) tz
   printf 'ALICE_HOME=%s/%s\nALICE_SERVER_PORT=%s\nALICE_LOG=info\nALICE_BACKUP_DAILY=2\nALICE_BACKUP_WEEKLY=0\nTZ=%s\n' \
     "$REAL_SRV" "$1" "$2" "$4"
-  printf 'ALICE_JUDGE_JEV_ENDPOINT=%s\nALICE_JUDGE_DAILY_BUDGET_USD=%s\n' "$JEV_ENDPOINT" "$JEV_BUDGET_USD"
+  printf 'ALICE_JUDGE_JEV_ENDPOINT=%s\nALICE_JUDGE_JEV_MODEL=%s\nALICE_JUDGE_DAILY_BUDGET_USD=%s\n' \
+    "$JEV_ENDPOINT" "$JEV_MODEL" "$JEV_BUDGET_USD"
   if [ "$3" = 1 ]; then printf 'ALICE_DAEMON_ARGS=--team-store\n'; else printf 'ALICE_TENANT_NAME=%s\n' "$1"; fi
 }
 
@@ -424,7 +421,6 @@ add_fail() { rollback_add "$1"; die "$2 - undone, nothing is left of $1"; }
 cmd_add() { # name team(0|1) tz tz-given(0|1)
   local name=$1 team=${2:-0} tz=${3:-$DEFAULT_TZ} tz_given=${4:-0} home="$SRV/$1" port token
   need_host
-  if [ "$team" = 1 ]; then no_import_running; fi
   ensure_base
   if tenant_exists "$name" && [ "$tz_given" = 1 ]; then
     set_env_line "$name" TZ "$tz"
@@ -492,7 +488,6 @@ cmd_remove() { # name [--yes]
   local name=$1 flag=${2:-} home="$SRV/$1" ans="" archive was_team=0
   case "$flag" in ""|--yes) ;; *) usage >&2; exit 2 ;; esac
   need_tenant "$name"
-  no_import_running "$name"
   if is_team "$name"; then was_team=1; fi
   if [ "$flag" != --yes ]; then
     printf 'Remove %s? Its home is archived in %s first, then deleted. [y/N] ' "$name" "$ARCHIVES" >&2
@@ -643,6 +638,10 @@ add_missing_tz() {
       set_env_line "$t" ALICE_JUDGE_JEV_ENDPOINT "$JEV_ENDPOINT"
       pinned="$pinned $t"
     fi
+    if ! grep -q '^ALICE_JUDGE_JEV_MODEL=' "$f"; then
+      set_env_line "$t" ALICE_JUDGE_JEV_MODEL "$JEV_MODEL"
+      case " $pinned " in *" $t "*) ;; *) pinned="$pinned $t" ;; esac
+    fi
     if ! grep -q '^ALICE_JUDGE_DAILY_BUDGET_USD=' "$f"; then
       set_env_line "$t" ALICE_JUDGE_DAILY_BUDGET_USD "$JEV_BUDGET_USD"
       case " $pinned " in *" $t "*) ;; *) pinned="$pinned $t" ;; esac
@@ -654,7 +653,6 @@ add_missing_tz() {
 
 cmd_upgrade() { # binary (also the first install)
   local new=$1 lib failed still
-  no_import_running
   need_avx
   if [ ! -f "$new" ] || [ ! -x "$new" ]; then die "$new is not an executable file"; fi
   # A build of deploy/server/build-release keeps its ONNX Runtime where the binary's rpath looks: ../lib/alice.
@@ -684,23 +682,6 @@ cmd_upgrade() { # binary (also the first install)
   else
     say "installed $("$BIN" --version)"
   fi
-}
-
-# An import runs for hours and loses its palace if its daemon restarts: commands that restart daemons wait for it.
-imports_running() { # [name]: the tenants with an import in progress (all tenants without a name)
-  local d t names="" pat=${1:-*}   # a validated name, or every tenant
-  # shellcheck disable=SC2231
-  for d in "$SRV"/$pat/import-inbox/*/; do
-    [ -d "$d" ] || continue
-    t=${d#"$SRV"/}; t=${t%%/*}
-    case " $names " in *" $t "*) ;; *) names="$names $t" ;; esac
-  done
-  printf '%s' "${names# }"
-}
-no_import_running() { # [name]
-  local busy
-  busy=$(imports_running "${1:-}")
-  [ -z "$busy" ] || die "an import is running for: $busy; wait until it ends (it restarts no daemon), then run this again"
 }
 
 canon_dir() { # prints the physical path of a directory; fails when it is not one
@@ -763,9 +744,12 @@ file_bytes() { stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1"; }
 # own database as a before-restore backup), clears the machine's paths and redacts with the tenant's rules. If the
 # daemon does not come back, the tenant's own database goes back.
 cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
-  local name=$1 file=$2 denied=${3:-} home="$SRV/$1" admin=${SUDO_UID:-0} owner need free_k out saved port list s
+  local name=$1 file=$2 denied=${3:-} home="$SRV/$1" admin=${SUDO_UID:-0} owner need free_k out saved port list="" s
   if [ -n "$denied" ]; then
-    case "$denied" in *[!a-z0-9,-]*) die "--cloud-denied takes project slugs separated by commas (a-z, 0-9, -)" ;; esac
+    case ",$denied," in
+      *[!abcdefghijklmnopqrstuvwxyz0123456789,-]*|*,,*) die "--cloud-denied takes project slugs separated by commas (a-z, 0-9, -, none empty); set any other list with: alice-server cli $name config set privacy.cloud_denied_projects '[...]'" ;;
+    esac
+    for s in $(printf '%s' "$denied" | tr ',' ' '); do list="$list${list:+,}\"$s\""; done
   fi
   need_tenant "$name"
   if is_team "$name"; then die "$TEAM is the shared team store; adopt a person's database into their own tenant"; fi
@@ -775,7 +759,15 @@ cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
   need=$(( 2 * ($(file_bytes "$file") / 1024 + 1) + 2 * 1024 * 1024 ))
   free_k=$(free_kb)
   [ "$free_k" -ge "$need" ] || die "adopting $file needs twice its size plus 2 GB free; $(gb "$free_k") GB is free"
-  no_import_running "$name"
+  # The person's cloud denials go first, on the fresh tenant while it runs: the adoption replaces only alice.db, so they
+  # hold from the adopted database's first moment, and a failure here changes nothing else.
+  if [ -n "$list" ]; then
+    as_tenant "$name" config set privacy.cloud_denied_projects "[$list]" >/dev/null \
+      || die "the cloud denials could not be set, so nothing was adopted: alice-server cli $name config set privacy.cloud_denied_projects '[$list]'"
+    say "Kept from the cloud on $name: $denied"
+  fi
+  # Stopped before anything is staged in its home: no process of the tenant's can race root there.
+  systemctl stop "alice@$name"
   ADOPT_DIR="$home/adopt-inbox"
   trap 'rm -rf -- "${ADOPT_DIR:?}"' EXIT
   trap 'exit 1' INT TERM HUP
@@ -784,13 +776,14 @@ cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
   cp -- "$file" "$ADOPT_DIR/alice.db"
   chmod -- 0600 "$ADOPT_DIR/alice.db"
   chown -R "alice-$name:alice-$name" -- "$ADOPT_DIR"
-  systemctl stop "alice@$name"
   if ! out=$(as_tenant "$name" --json adopt "$ADOPT_DIR/alice.db" 2>&1); then
-    if printf '%s\n' "$out" | grep -qF '[not put back]'; then
-      die "the adoption failed and $name's own database could not be put back, so $name stays stopped (it would serve the unscrubbed copy): $(printf '%s\n' "$out" | tail -n 1)"
+    # Started again only when `alice adopt` says the tenant's own database is in place; any other end (a panic, a kill,
+    # a swap back that failed) may have left the unscrubbed copy, so the tenant stays stopped.
+    if printf '%s\n' "$out" | grep -qF -e '[untouched]' -e '[put back]'; then
+      systemctl start "alice@$name" || true
+      die "nothing was adopted; $name's database is as it was: $(printf '%s\n' "$out" | tail -n 1)"
     fi
-    systemctl start "alice@$name" || true
-    die "nothing was adopted and $name is as it was: $(printf '%s\n' "$out" | tail -n 1)"
+    die "the adoption failed and $name's own database may not be in place, so $name stays stopped (it could serve the unscrubbed copy): $(printf '%s\n' "$out" | tail -n 1). Restore its own database (alice-server cli $name restore <the newest alice-before-restore file> --yes), then systemctl start alice@$name"
   fi
   saved=$(printf '%s\n' "$out" | sed -n 's/.*"saved_tenant_db_as": *"\([^"]*\)".*/\1/p')
   systemctl start "alice@$name"
@@ -802,13 +795,6 @@ cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
       die "$name did not come back with the adopted database; its own database ($saved) is back"
     fi
     die "$name did not come back with the adopted database, and its own could not be put back; restore it with: alice-server cli $name restore ${saved:-<before-restore backup>} --yes"
-  fi
-  if [ -n "$denied" ]; then
-    list=""
-    for s in $(printf '%s' "$denied" | tr ',' ' '); do list="$list${list:+,}\"$s\""; done
-    as_tenant "$name" config set privacy.cloud_denied_projects "[$list]" >/dev/null \
-      || die "adopted, but the cloud denials were not set: alice-server cli $name config set privacy.cloud_denied_projects '[$list]'"
-    say "Kept from the cloud on $name: $denied"
   fi
   say "Adopted into $name:"
   printf '%s\n' "$out" | sed -n 's/^ *"\([a-z_]*\)": *\(.*\),\{0,1\}$/  \1: \2/p' | sed 's/,$//'
@@ -840,7 +826,16 @@ give_jev_key() { # name key
 }
 
 cmd_jev_key_set() {
-  local key t f failed="" done=""
+  local key t f failed="" done="" unpinned=""
+  # The key goes only to tenants whose files pin where it is sent, which model it pays for and how much a day.
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    if ! grep -q '^ALICE_JUDGE_JEV_ENDPOINT=' "$f" || ! grep -q '^ALICE_JUDGE_JEV_MODEL=' "$f" \
+      || ! grep -q '^ALICE_JUDGE_DAILY_BUDGET_USD=' "$f"; then
+      unpinned="$unpinned $(basename "$f" .env)"
+    fi
+  done
+  [ -z "$unpinned" ] || die "these tenants do not pin the Jev endpoint, model and budget yet:$unpinned; run alice-server upgrade first (it adds them), then jev-key set"
   key=$(read_key)
   [ -n "$key" ] || die "no key was given; nothing changed"
   case "$key" in *[[:space:]\"\\]*) die "that is not a Jev key (it holds spaces, quotes or backslashes); nothing changed" ;; esac
@@ -895,10 +890,18 @@ cmd_cli() { # name alice-args...
   exec sudo -u "alice-$name" env ALICE_HOME="$SRV/$name" ALICE_NO_AUTOSTART=1 "$BIN" "$@"
 }
 
+# Every command that changes the server takes the lock alone; imports share it, so two imports run together and an
+# import (it can run for hours, and loses its palace if its daemon restarts) never overlaps an upgrade, a restart or a
+# removal. A lock dies with its process: nothing is left to clear by hand.
 take_lock() {
   mkdir -p "$(dirname "$LOCK")"
   exec 9>"$LOCK"
-  flock -n 9 || die "another alice-server is running"
+  flock -n 9 || die "another alice-server command, or an import, is running; wait until it ends, then run this again"
+}
+take_shared_lock() {
+  mkdir -p "$(dirname "$LOCK")"
+  exec 9>"$LOCK"
+  flock -s -n 9 || die "another alice-server command (upgrade, add, remove, adopt, rotate, jev-key) is running; wait until it ends, then import"
 }
 
 main_add() { # add [--team] <name> [--tz <IANA zone>]
@@ -932,7 +935,7 @@ main() {
     rotate) [[ $# -eq 2 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_rotate "$2" ;;
     list) cmd_list ;;
     upgrade) [[ $# -eq 2 ]] || { usage; exit 2; }; take_lock; cmd_upgrade "$2" ;;
-    import) [[ $# -ge 3 && $# -le 4 ]] || { usage; exit 2; }; valid_name "$2"; cmd_import "$2" "$3" "${4:-}" ;;
+    import) [[ $# -ge 3 && $# -le 4 ]] || { usage; exit 2; }; valid_name "$2"; take_shared_lock; cmd_import "$2" "$3" "${4:-}" ;;
     cli) [[ $# -ge 3 ]] || { usage; exit 2; }; valid_name "$2"; cmd_cli "${@:2}" ;;
     adopt)
       if [[ $# -eq 5 && "$4" = --cloud-denied ]]; then valid_name "$2"; take_lock; cmd_adopt "$2" "$3" "$5"
