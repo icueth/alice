@@ -3,11 +3,13 @@
 #
 # Claude Code runs it through the alice-capture plugin on five events:
 #   sh "$HOME/.config/alice/alice-capture.sh" hook claude-code
+# Codex runs it from $CODEX_HOME/hooks.json (setup.sh writes it) on the same five events:
+#   sh "$HOME/.config/alice/alice-capture.sh" hook codex
 # It reads the hook's JSON on stdin, hands the work to a background copy of itself and returns
 # at once. Only SessionStart waits, at most 2 s, for the briefing it prints.
 #
 # Subcommands:
-#   hook <agent>       the hook itself (reads stdin); only claude-code is captured for now
+#   hook <agent>       the hook itself (reads stdin); <agent> is claude-code or codex
 #   run <agent> <event> <session> <path> <cwd> [<agent_id> <agent_path>]
 #                      the background worker (no secret among its arguments)
 #   status             what is set up, and whether the server accepts the token
@@ -16,7 +18,7 @@
 # Files, under ~/.config/alice (0700; every file 0600, this script 0700):
 #   token, url         read only, never written here (the team's setup document or setup.sh)
 #   capture.conf       briefing=on|off
-#   state/<agent>-<session>[-<agent_id>].offset
+#   state/<agent>-<session>[-<agent_id>].offset   (<agent> is claude-code or codex)
 #                      "<offset> <path>", then session, subagent, cwd, seen (when the transcript
 #                      was last there), and hold/stopped lines; its mtime is set back to 1971
 #                      while work is left, so a sweep sees the transcript as newer
@@ -26,7 +28,8 @@
 #
 # The token leaves the shell only as a curl config line on curl's stdin (curl -q -K -), written
 # by the printf builtin: never in argv, a URL, a child's environment, a log or an error.
-# POSIX sh; needs curl, sed, head, tail, wc, od, mkdir, mv and date; git and awk are optional.
+# POSIX sh; needs curl, sed, head, tail, wc, od, ls, sort, cmp, mkdir, mv and date; git and awk are
+# optional.
 # Never run it with set -x: that would print the token.
 
 set -u
@@ -90,6 +93,33 @@ log() {
 valid_id() {
   case $1 in '' | [!A-Za-z0-9]* | *[!A-Za-z0-9._-]*) return 1 ;; esac
   [ ${#1} -le 128 ]
+}
+
+# The Codex rollout of session $1 when the hook gave no transcript_path (it can be null): the
+# newest seven $CODEX_HOME/sessions/YYYY/MM/DD folders are searched for rollout-*-<session>.jsonl
+# (the session id is the end of the file name, and is matched whole). Prints the path (nothing
+# when there is none). A compressed .jsonl.zst rollout is never matched.
+find_rollout() {
+  valid_id "$1" || return 1
+  fr_root="${CODEX_HOME:-$HOME/.codex}/sessions"
+  [ -d "$fr_root" ] || return 1
+  ls -d "$fr_root"/[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9] 2>/dev/null | sort -r | head -n 7 |
+    while IFS= read -r fr_d; do
+      for fr_f in "$fr_d"/rollout-*-"$1".jsonl; do
+        if [ -f "$fr_f" ]; then
+          printf '%s\n' "$fr_f"
+          break 2
+        fi
+      done
+    done | head -n 1
+}
+
+# The agent of state key $1 (claude-code-<session>... or codex-<session>).
+key_agent() {
+  case $1 in
+    codex-*) printf codex ;;
+    *) printf claude-code ;;
+  esac
 }
 
 valid_token() {
@@ -213,11 +243,7 @@ hook_main() {
   h_agent=${1:-}
   input=$(head -c 1048576 | tr '\r\n\t' '   ')
   case $h_agent in
-    claude-code) ;;
-    codex)
-      log "Codex capture arrives in a later version of Alice; a Codex event was ignored"
-      return 0
-      ;;
+    claude-code | codex) ;;
     *)
       log "an event for an unknown agent was ignored"
       return 0
@@ -251,27 +277,39 @@ hook_main() {
     *) return 0 ;;
   esac
   case $h_path in
-    /*) ;;
-    *)
-      log "session $h_session: the hook input names no transcript_path; event skipped"
+    *.zst)
+      log "session $h_session: the transcript is a compressed .zst file, which is not captured in this version; event skipped"
       return 0
       ;;
   esac
+  case $h_path in
+    /*) ;;
+    *)
+      if [ "$h_agent" = codex ]; then
+        # Codex can send a null transcript_path: the background worker searches for the rollout.
+        h_path=
+      else
+        log "session $h_session: the hook input names no transcript_path; event skipped"
+        return 0
+      fi
+      ;;
+  esac
   # A subagent's own transcript is its own source; anything less is the main session's.
-  if [ "$h_event" != subagent-stop ] || ! valid_id "$h_sub"; then
+  if [ "$h_event" != subagent-stop ] || ! valid_id "$h_sub" || [ "$h_agent" = codex ]; then
     h_sub=
   fi
   case $h_subpath in /*) ;; *) h_sub= ;; esac
   if [ -f "$0" ]; then
     if [ -n "$h_sub" ]; then
-      nohup sh "$0" run claude-code "$h_event" "$h_session" "$h_path" "$h_cwd" "$h_sub" "$h_subpath" \
+      nohup sh "$0" run "$h_agent" "$h_event" "$h_session" "$h_path" "$h_cwd" "$h_sub" "$h_subpath" \
         >/dev/null 2>&1 </dev/null &
     else
-      nohup sh "$0" run claude-code "$h_event" "$h_session" "$h_path" "$h_cwd" \
+      nohup sh "$0" run "$h_agent" "$h_event" "$h_session" "$h_path" "$h_cwd" \
         >/dev/null 2>&1 </dev/null &
     fi
   fi
-  if [ "$h_event" = session-start ]; then
+  # The briefing is Claude Code's: its SessionStart hook output becomes session context.
+  if [ "$h_event" = session-start ] && [ "$h_agent" = claude-code ]; then
     brief "$h_source" "$h_cwd"
   fi
   return 0
@@ -547,7 +585,7 @@ capture_one() {
     { tail -c +$((s_off + 1)) "$s_path" | head -c "$co_cap" >"$tmpd/body"; } 2>/dev/null
     co_n=$(fsize "$tmpd/body")
     [ "$co_n" -gt 0 ] || break
-    co_q="agent=claude-code&session=$3&offset=$s_off&event=$co_event$co_flags"
+    co_q="agent=$(key_agent "$co_key")&session=$3&offset=$s_off&event=$co_event$co_flags"
     # A capped body (as long as the cap): the transcript may go on, so the server keeps the
     # body's last turn open.
     if [ "$co_n" -ge "$co_cap" ]; then co_q="$co_q&more=1"; fi
@@ -687,6 +725,9 @@ sweep() {
     [ -z "$s_stopped" ] || continue
     valid_id "$s_session" || continue
     if [ -n "$s_sub" ]; then valid_id "$s_sub" || continue; fi
+    # A Codex state is only ever made for a rollout that was found (run_main returns before
+    # capture_one when the search finds nothing), so a vanished file is not searched for again:
+    # another file would be paired with this file's stored offset.
     if [ ! -f "$s_path" ]; then
       # No transcript (gone, or not written yet): forget it a week after it was last there.
       # The `seen` line decides, not the mtime (which mark_pending sets back).
@@ -707,12 +748,10 @@ sweep() {
 run_main() {
   [ $# -ge 5 ] || return 0
   r_event=$2 r_session=$3 r_path=$4 r_cwd=$5 r_sub=${6:-} r_subpath=${7:-}
-  case $1 in
-    claude-code) ;;
-    *)
-      log "Codex capture arrives in a later version of Alice; a Codex event was ignored"
-      return 0
-      ;;
+  r_agent=$1
+  case $r_agent in
+    claude-code | codex) ;;
+    *) return 0 ;;
   esac
   case $r_event in session-start | stop | subagent-stop | pre-compact | session-end) ;; *) return 0 ;; esac
   valid_id "$r_session" || return 0
@@ -723,18 +762,43 @@ run_main() {
   mkdir -p "$STATE" 2>/dev/null || return 0
   # The transcript may lag the event that names it.
   if [ "$r_event" != session-start ]; then sleep 2; fi
+  if [ "$r_agent" = codex ] && [ -z "$r_path" ]; then
+    r_path=$(find_rollout "$r_session")
+    if [ -z "$r_path" ]; then
+      log "session $r_session: no rollout file for this session in the newest seven day folders under \$CODEX_HOME/sessions; the next event looks again"
+      return 0
+    fi
+  fi
   if [ -n "$r_sub" ]; then
-    capture_one "claude-code-$r_session-$r_sub" "$r_event" "$r_session" "$r_sub" "$r_subpath" "$r_cwd" 40
+    capture_one "$r_agent-$r_session-$r_sub" "$r_event" "$r_session" "$r_sub" "$r_subpath" "$r_cwd" 40
   else
-    capture_one "claude-code-$r_session" "$r_event" "$r_session" "" "$r_path" "$r_cwd" 40
+    capture_one "$r_agent-$r_session" "$r_event" "$r_session" "" "$r_path" "$r_cwd" 40
   fi
   if [ "$r_event" = session-start ]; then
-    sweep "claude-code-$r_session"
+    sweep "$r_agent-$r_session"
   fi
   return 0
 }
 
 # ---- status and uninstall ----
+
+# Where the Codex hooks stand: in $CODEX_HOME/hooks.json (as setup wrote it, or changed), in an
+# inline [hooks] table of config.toml, or not found. Silent when there is no Codex here.
+codex_status() {
+  cst_home="${CODEX_HOME:-$HOME/.codex}"
+  cst_re='alice-capture\.sh.{1,3}hook codex'
+  if [ -f "$cst_home/hooks.json" ] && grep -Eq "$cst_re" "$cst_home/hooks.json" 2>/dev/null; then
+    if [ -f "$DIR/codex-hooks.written" ] && cmp -s "$cst_home/hooks.json" "$DIR/codex-hooks.written"; then
+      printf 'codex hooks: installed (%s/hooks.json); Codex runs them only after you trust them in /hooks\n' "$cst_home"
+    else
+      printf 'codex hooks: in %s/hooks.json (changed since setup wrote it, or added by hand); Codex runs them only after you trust them in /hooks\n' "$cst_home"
+    fi
+  elif grep -Eq "$cst_re" "$cst_home/config.toml" 2>/dev/null; then
+    printf 'codex hooks: in %s/config.toml; Codex runs them only after you trust them in /hooks\n' "$cst_home"
+  elif command -v codex >/dev/null 2>&1 || [ -f "$DIR/codex-hooks.written" ]; then
+    printf 'codex hooks: not found; run the setup command\n'
+  fi
+}
 
 status_main() {
   printf 'Alice capture for a server tenant\n'
@@ -799,6 +863,7 @@ status_main() {
   else
     printf 'plugin: not set up; run the setup command\n'
   fi
+  codex_status
   printf 'log: ~/.config/alice/capture.log\n'
   return 0
 }
@@ -839,6 +904,17 @@ uninstall_main() {
   fi
   rm -rf "${DIR:?}/claude-marketplace"
   printf 'Now restart any open Claude Code sessions, so none still runs the removed hooks.\n'
+  # Codex: remove hooks.json only when it is still exactly the file setup wrote.
+  un_ch="${CODEX_HOME:-$HOME/.codex}"
+  if [ -f "$DIR/codex-hooks.written" ]; then
+    if [ -f "$un_ch/hooks.json" ] && cmp -s "$un_ch/hooks.json" "$DIR/codex-hooks.written"; then
+      rm -f "$un_ch/hooks.json"
+      printf 'Removed %s/hooks.json (restart open Codex sessions).\n' "$un_ch"
+    elif [ -f "$un_ch/hooks.json" ]; then
+      printf '%s/hooks.json has changed since setup wrote it, so it was kept; remove the Alice entries (hook codex) by hand.\n' "$un_ch"
+    fi
+    rm -f "$DIR/codex-hooks.written"
+  fi
   if confirm "Delete the capture files (the hook script, state/, capture.conf, capture.log, paused-until)? The token and url files stay. [y/N] "; then
     rm -rf "${DIR:?}/state"
     rm -f "$DIR/alice-capture.sh" "$CONF" "$LOG" "$PAUSED"

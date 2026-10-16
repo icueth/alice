@@ -1206,29 +1206,158 @@ async fn an_offset_beyond_any_transcript_is_refused_and_leaves_no_state() {
     assert_eq!((row.byte_offset, row.gaps), (cursor, 0));
 }
 
-/// Controller ruling: Codex transcripts are refused until their reader exists (Task 17), so a
-/// client never re-sends a growing body that is never consumed, and no empty source is made.
-#[tokio::test(flavor = "multi_thread")]
-async fn codex_uploads_are_refused_until_their_reader_exists() {
-    let (_d, svc) = tenant();
-    for event in ["session-start", "stop"] {
-        let e = svc
-            .capture_transcript(
-                TranscriptQuery {
-                    agent: "codex".into(),
-                    ..q("cx1", 0, event)
-                },
-                Bytes::from_static(b"{\"type\":\"session_meta\"}\n"),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&e, alice_core::AliceError::Invalid(m) if m.contains("Codex")),
-            "{e}"
-        );
+/// A Codex rollout, built line by line (format: `alice-core/tests/fixtures/capture/codex`).
+#[derive(Default)]
+struct Rollout {
+    bytes: Vec<u8>,
+    clock: u64,
+}
+
+impl Rollout {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
     }
-    assert!(!source_exists(&svc, "codex:session:cx1"));
-    assert!(svc.capture_status().await.unwrap().sessions.is_empty());
+
+    fn line(&mut self, kind: &str, payload: serde_json::Value) -> &mut Self {
+        self.clock += 1;
+        let c = self.clock;
+        let v = json!({
+            "timestamp": format!("2026-10-16T{:02}:{:02}:{:02}.000Z", (c / 3600) % 24, (c / 60) % 60, c % 60),
+            "ordinal": c - 1, "type": kind, "payload": payload,
+        });
+        self.bytes.extend(serde_json::to_vec(&v).unwrap());
+        self.bytes.push(b'\n');
+        self
+    }
+
+    fn message(&mut self, role: &str, kind: &str, text: &str) -> &mut Self {
+        let block = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        self.line(
+            "response_item",
+            json!({"type": "message", "id": format!("m{}", self.clock), "role": role,
+                   "content": [{"type": block, "text": text}],
+                   "internal_chat_message_metadata_passthrough": {"content_item_kinds": [kind]}}),
+        )
+    }
+
+    fn prompt(&mut self, text: &str) -> &mut Self {
+        self.message("user", "user.text", text)
+    }
+
+    fn reply(&mut self, text: &str) -> &mut Self {
+        self.message("assistant", "unknown", text)
+    }
+
+    fn exec(&mut self, call: &str, code: &str) -> &mut Self {
+        self.line(
+            "response_item",
+            json!({"type": "custom_tool_call", "call_id": call, "name": "exec", "status": "completed", "input": code}),
+        )
+    }
+
+    fn output(&mut self, call: &str, text: &str) -> &mut Self {
+        self.line(
+            "response_item",
+            json!({"type": "custom_tool_call_output", "call_id": call,
+                   "output": [{"type": "input_text", "text": text}]}),
+        )
+    }
+}
+
+fn codex_q(session: &str, offset: u64, event: &str) -> TranscriptQuery {
+    TranscriptQuery {
+        agent: "codex".into(),
+        ..q(session, offset, event)
+    }
+}
+
+/// Task 17a: a Codex rollout goes through the same upload path as Claude Code's, under its own
+/// source uri (no `claude-code:` source is made for it), and a resend from behind the cursor
+/// stores nothing twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_upload_stores_its_turns_once() {
+    let (_d, svc) = tenant();
+    let mut r = Rollout::default();
+    r.line(
+        "session_meta",
+        json!({"id": "cx1", "cwd": "/home/user/project-x"}),
+    )
+    .message("developer", "permissions.instructions", "Harness rules.")
+    .message(
+        "user",
+        "environments.environment_context",
+        "<environment_context>x</environment_context>",
+    )
+    .prompt("Where is the quokkabridge config?")
+    .reply("It lives in quokkabridge.toml.")
+    .exec("call_1", "rg quokkabridge")
+    .output("call_1", "quokkabridge.toml:1");
+    let second = r.len();
+    // The second turn ends on a call with no output yet, so a `stop` leaves it open.
+    r.prompt("Thanks, now rename it.")
+        .exec("call_2", "mv quokkabridge.toml quokkabridge.yaml");
+    let mut body = r.bytes.clone();
+    body.extend_from_slice(br#"{"timestamp":"2026-10-16T01:00:00.000Z","type":"respo"#);
+
+    let a = send(&svc, codex_q("cx1", 0, "stop"), &body).await;
+    assert_eq!((a.turns_stored, a.turns_skipped), (1, 0));
+    assert_eq!(
+        a.next_offset, second,
+        "the cursor stops at the second prompt's line"
+    );
+    assert!(a.chunks_stored >= 1);
+
+    let uri = "codex:session:cx1";
+    let text = chunks_of(&svc, uri)
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("[user] Where is the quokkabridge config?"),
+        "{text}"
+    );
+    assert!(text.contains("[tool Bash] rg quokkabridge"), "{text}");
+    assert!(text.contains("[result] quokkabridge.toml:1"), "{text}");
+    assert!(!text.contains("Harness rules") && !text.contains("environment_context"));
+    assert!(!source_exists(&svc, "claude-code:session:cx1"));
+    let row = state_of(&svc, uri).expect("the codex source has its cursor");
+    assert_eq!(row.byte_offset, second);
+    assert_eq!(row.session_id, "cx1");
+
+    // A client that lost its state and resends from zero is told the cursor, stores nothing.
+    let behind = svc
+        .capture_transcript(codex_q("cx1", 0, "stop"), Bytes::from(body.clone()))
+        .await
+        .unwrap()
+        .expect_err("a resend from 0 is behind the cursor");
+    assert_eq!(behind, second);
+    assert_eq!(chunks_holding(&svc, "quokkabridge.toml:1"), 1);
+
+    // The rest of the rollout completes the second turn at the session end.
+    r.output("call_2", "renamed")
+        .reply("Renamed to quokkabridge.yaml.");
+    let a2 = send(
+        &svc,
+        codex_q("cx1", second, "session-end"),
+        &r.bytes[second as usize..],
+    )
+    .await;
+    assert_eq!(a2.turns_stored, 1);
+    assert_eq!(a2.next_offset, r.len());
+    assert_eq!(chunks_holding(&svc, "quokkabridge.yaml"), 1);
+    assert!(state_of(&svc, uri).unwrap().ended);
+
+    // A zstd file is counted, not read: nothing is stored and the cursor moves past it.
+    let mut zst = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x01];
+    zst.extend_from_slice(b"\x00binary");
+    let z = send(&svc, codex_q("cx-zst", 0, "stop"), &zst).await;
+    assert_eq!((z.turns_stored, z.chunks_stored), (0, 0));
+    assert_eq!(z.next_offset, zst.len() as u64);
 }
 
 /// `no_distill=1` turns the flag on for an existing source even when nothing new arrives.
