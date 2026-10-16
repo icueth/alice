@@ -136,10 +136,7 @@ fn response_item(timestamp: Option<String>, mut payload: Map<String, Value>) -> 
             let Some(name) = string(&payload, "name") else {
                 return LineResult::Unknown;
             };
-            let name = match string(&payload, "namespace") {
-                Some(ns) if ns.ends_with("__") => format!("{ns}{name}"),
-                _ => name,
-            };
+            let name = mcp_name(string(&payload, "namespace").as_deref(), name);
             let raw = payload
                 .remove("arguments")
                 .or_else(|| payload.remove("input"))
@@ -314,6 +311,28 @@ fn tool_call(timestamp: Option<String>, id: Option<String>, name: &str, raw: Val
             input,
         }],
     ))
+}
+
+/// The Claude Code form `mcp__<server>__<tool>` of a Codex MCP call, so the renderer finds the
+/// memory tools by their last segment. Codex writes the server as a `namespace` (`alice`,
+/// `alice__` or `mcp__alice__`) or inside the name (`alice__remember`); neither form is in the
+/// fixture, so every one is rebuilt rather than trusted. A bare name with no namespace is a
+/// Codex built-in and stays as it is.
+fn mcp_name(namespace: Option<&str>, name: String) -> String {
+    if name.starts_with("mcp__") {
+        return name;
+    }
+    let server = namespace.map(|ns| {
+        let ns = ns.strip_prefix("mcp__").unwrap_or(ns);
+        ns.strip_suffix("__").unwrap_or(ns)
+    });
+    match server {
+        Some(server) if !server.is_empty() => format!("mcp__{server}__{name}"),
+        _ if name.contains("__") && !name.starts_with("__") && !name.ends_with("__") => {
+            format!("mcp__{name}")
+        }
+        _ => name,
+    }
 }
 
 /// Codex's tools under the names the rendering table knows.
@@ -525,6 +544,60 @@ mod tests {
         // Text that is not JSON stays text.
         let (_, input) = call("clock", json!("lorem"));
         assert_eq!(input, json!("lorem"));
+    }
+
+    #[test]
+    fn mcp_calls_always_take_the_mcp_server_tool_name() {
+        let call = |namespace: Option<&str>, name: &str| {
+            let mut payload = json!({
+                "type": "function_call", "call_id": "c", "name": name, "arguments": "{}",
+            });
+            if let Some(ns) = namespace {
+                payload["namespace"] = json!(ns);
+            }
+            let Block::ToolUse { name, .. } = record_of(item(payload)).blocks[0].clone() else {
+                panic!("tool use")
+            };
+            name
+        };
+        // The three shapes of a qualified name, and the one already in the Claude form.
+        assert_eq!(call(Some("mcp__alice__"), "remember"), "mcp__alice__remember");
+        assert_eq!(call(Some("mcp__alice"), "remember"), "mcp__alice__remember");
+        assert_eq!(call(Some("alice"), "remember"), "mcp__alice__remember");
+        assert_eq!(call(None, "alice__remember"), "mcp__alice__remember");
+        assert_eq!(call(None, "mcp__alice__remember"), "mcp__alice__remember");
+        assert_eq!(call(Some("alice__"), "mcp__alice__remember"), "mcp__alice__remember");
+        // Another server's tool keeps its server, so it is not taken for an Alice tool.
+        assert_eq!(call(Some("github"), "context"), "mcp__github__context");
+        // A bare name stays bare.
+        assert_eq!(call(None, "update_plan"), "TodoWrite");
+        assert_eq!(call(None, "clock"), "clock");
+    }
+
+    #[test]
+    fn a_codex_memory_call_renders_as_a_memory_line_whatever_its_name_shape() {
+        for (namespace, name) in [
+            (None, "alice__remember"),
+            (Some("alice"), "remember"),
+            (Some("mcp__alice__"), "remember"),
+        ] {
+            let Block::ToolUse { name, .. } = ({
+                let mut payload = json!({
+                    "type": "function_call", "call_id": "c", "name": name,
+                    "arguments": "{\"content\":\"secret body\"}",
+                });
+                if let Some(ns) = namespace {
+                    payload["namespace"] = json!(ns);
+                }
+                record_of(item(payload)).blocks[0].clone()
+            }) else {
+                panic!("tool use")
+            };
+            assert!(
+                crate::capture::render::memory_tool(&name).is_some(),
+                "{name} is a memory tool"
+            );
+        }
     }
 
     #[test]
