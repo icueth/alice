@@ -895,7 +895,7 @@ upgrade_adds_the_time_zone_to_older_tenants() {
   has "$TENANTS/ann.env" 'ALICE_JUDGE_JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone'
   has "$TENANTS/ann.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
   has "$TENANTS/bob.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=0.5'
-  printf '%s\n' "$OUT" | grep -qF 'the Jev endpoint and budget pinned for: ann' || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -qF 'the Jev endpoint, model and budget pinned for: ann' || fail "$OUT"
   run add bob --tz Asia/Bangkok
   pass
 }

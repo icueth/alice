@@ -699,7 +699,7 @@ add_missing_tz() {
     fi
   done
   if [ -n "$added" ]; then say "TZ=$DEFAULT_TZ added for:$added"; fi
-  if [ -n "$pinned" ]; then say "the Jev endpoint and budget pinned for:$pinned"; fi
+  if [ -n "$pinned" ]; then say "the Jev endpoint, model and budget pinned for:$pinned"; fi
 }
 
 # A route written by an older version lacks the upload route's body limit and timeouts: write every personal tenant's again
