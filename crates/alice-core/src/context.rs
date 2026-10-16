@@ -3,7 +3,8 @@
 use crate::error::Result;
 use crate::model::{Memory, Origin};
 use crate::normalize::{estimate_tokens, truncate_chars};
-use crate::store::memories::get_by_seqs;
+use crate::search::pack::AUTO_MARK;
+use crate::store::memories::{get_by_seqs, judged_sql};
 use crate::store::projects::{GLOBAL_ID, ResolvedProject};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{Connection, ToSql};
@@ -11,9 +12,6 @@ use rusqlite::{Connection, ToSql};
 /// Memories an agent should see. New memories stay `pending` until the embedding worker
 /// activates them, so they count as live.
 const LIVE: &str = "status IN ('active','pending')";
-/// A distilled memory is shown once its judge stage is over (SP2 spec §6.6): a near-copy of an
-/// explicit memory never shows twice while the judge works or is unreachable.
-const JUDGED: &str = "NOT (origin = 'distill' AND judge_state <> 'done')";
 /// Longest detail, and longest headline taken from the body, of a one-line entry in characters.
 /// A title is never cut.
 const LINE_CHARS: usize = 120;
@@ -61,10 +59,11 @@ const REVIEW_ASK_MAX: u64 = 10;
 
 /// A section's query: `seq` of live (and judged) memories in display order, `?1` the project,
 /// the row limit bound last. `seq DESC` breaks ties, so the newest of equals wins and the output
-/// is stable.
+/// is stable. A distilled memory is shown once its judge stage is over (SP2 spec §6.6).
 fn section_sql((filter, order): Select) -> String {
     format!(
-        "SELECT seq FROM memories WHERE project_id = ?1 AND {filter} AND {LIVE} AND {JUDGED} ORDER BY {order}, seq DESC LIMIT ?"
+        "SELECT seq FROM memories WHERE project_id = ?1 AND {filter} AND {LIVE} AND {} ORDER BY {order}, seq DESC LIMIT ?",
+        judged_sql("")
     )
 }
 
@@ -79,10 +78,10 @@ fn split_first_line(body: &str) -> (&str, &str) {
     (first.trim(), rest.trim())
 }
 
-/// ` (auto)` after a memory distilled from a captured session (SP2 spec §6.6).
+/// [`AUTO_MARK`] after a memory distilled from a captured session (SP2 spec §6.6).
 fn auto_mark(m: &Memory) -> &'static str {
     if m.origin == Origin::Distill {
-        " (auto)"
+        AUTO_MARK
     } else {
         ""
     }
@@ -1078,7 +1077,7 @@ mod tests {
                 &third,
                 decision(
                     &format!("auto pick {n}"),
-                    &format!("2026-10-0{day}T09:00:00.000Z"),
+                    &format!("2026-10-{day}T09:00:00.000Z"),
                 ),
                 true,
             ));
