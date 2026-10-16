@@ -39,7 +39,7 @@
 //! the database refuses writes. Raw capture never waits on any of this. The Jev call runs on
 //! this thread, never on the writer or an async runtime thread.
 
-use crate::config::{CaptureVerdict, SettingsHandle};
+use crate::config::{CaptureVerdict, EXCLUDED_AGENT_OFF, EXCLUDED_CAPTURE_OFF, SettingsHandle};
 use crate::judge_http::JudgeHub;
 use crate::redaction::Redactors;
 use crate::writer::{CaptureChange, ProjectChoice, WriteOp, WriteOutcome, WriterHandle};
@@ -63,7 +63,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -280,6 +280,9 @@ enum Allowance {
     Wait,
     /// The cloud policy keeps the project at home.
     Denied,
+    /// A global capture switch is off (read after the caller's own check): not the project's
+    /// rule, so nothing is skipped for good.
+    Off,
 }
 
 /// The distill worker of one daemon.
@@ -299,6 +302,8 @@ pub struct DistillCtl {
     budget_stop: Mutex<Option<(f64, f64)>>,
     /// When the cloud policy of the `skipped_cloud` sources was last asked again.
     cloud_checked: Mutex<Option<Instant>>,
+    /// Turns of the worker's loop (tests check that it sleeps).
+    rounds: AtomicU64,
 }
 
 impl DistillCtl {
@@ -316,6 +321,7 @@ impl DistillCtl {
             runs: Mutex::new(VecDeque::new()),
             budget_stop: Mutex::new(None),
             cloud_checked: Mutex::new(None),
+            rounds: AtomicU64::new(0),
         })
     }
 
@@ -375,6 +381,11 @@ impl DistillCtl {
         }
     }
 
+    /// How many times the worker's loop has turned (a sleeping worker turns once a tick).
+    pub fn rounds(&self) -> u64 {
+        self.rounds.load(Ordering::Relaxed)
+    }
+
     /// The last runs, oldest first.
     pub fn runs(&self) -> Vec<RunReport> {
         self.runs.lock().iter().cloned().collect()
@@ -390,15 +401,21 @@ impl DistillCtl {
             if self.stopped() {
                 return;
             }
-            if Instant::now() >= housekeeping_at && !self.read_only() {
-                let done =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.housekeeping()));
-                match done {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "the distill worker could not look for quiet or waiting sessions; it tries again later")
+            self.rounds.fetch_add(1, Ordering::Relaxed);
+            if Instant::now() >= housekeeping_at {
+                // Nothing to change while the database refuses writes; the next one is still a
+                // tick away, so the loop keeps sleeping (fix round 2).
+                if !self.read_only() {
+                    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.housekeeping()
+                    }));
+                    match done {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "the distill worker could not look for quiet or waiting sessions; it tries again later")
+                        }
+                        Err(_) => tracing::error!("the distill worker's housekeeping panicked"),
                     }
-                    Err(_) => tracing::error!("the distill worker's housekeeping panicked"),
                 }
                 housekeeping_at = Instant::now() + self.tick;
             }
@@ -485,8 +502,10 @@ impl DistillCtl {
                 Ok(p) => p,
                 Err(e) => return self.read_failed(src, report, &e),
             };
+            // Only a session at rest is woken: a failed, backfilled, skipped or waiting one keeps
+            // its state (`alice capture distill` revives any of them).
             if let Some(p) = p
-                && p.distill_state != DistillState::Due
+                && matches!(p.distill_state, DistillState::Idle | DistillState::Done)
             {
                 self.set(&p.source_id, DistillState::Due, None, 0)?;
             }
@@ -522,6 +541,10 @@ impl DistillCtl {
             Ok(Allowance::Yes(slug)) => slug,
             Ok(Allowance::Excluded) => {
                 return self.leave(src, report, DistillState::SkippedExcluded, None, 0);
+            }
+            // A switch flipped off since the check above: idle, as there.
+            Ok(Allowance::Off) => {
+                return self.leave(src, report, DistillState::Idle, None, src.distill_attempts);
             }
             // The project's rules are unknown right now: try again later, not a failure.
             Ok(Allowance::Wait) => {
@@ -564,6 +587,8 @@ impl DistillCtl {
             Err(e) => return self.read_failed(src, report, &e),
         };
         let mut included: Vec<(CaptureState, String)> = Vec::new();
+        // A subagent whose rules are unknown right now: the session is due again later for it.
+        let mut child_waits = false;
         for k in kids {
             if k.next_ord <= k.distill_ord {
                 continue;
@@ -600,19 +625,28 @@ impl DistillCtl {
                         )?;
                     }
                 }
-                // Asked again at the next run.
-                Allowance::Wait => {}
+                // Asked again when the session is due again (fix round 2).
+                Allowance::Wait | Allowance::Off => child_waits = true,
             }
         }
+        // What `done` becomes while a subagent waits: due again a few minutes later.
+        let rest = |state: DistillState| -> (DistillState, Option<String>) {
+            match state {
+                DistillState::Done if child_waits => (DistillState::Due, Some(after(RETRY_FIRST))),
+                other => (other, None),
+            }
+        };
 
         let mut loaded = match self.load(src, &included) {
             Ok(l) => l,
             Err(e) => return self.read_failed(src, report, &e),
         };
         if loaded.chunks.is_empty() {
-            // Nothing left to read (retention removed it): the cursors move past.
+            // Nothing left to read (retention removed it, or every subagent waits): the cursors
+            // move past what is gone.
             let _ = self.advance(src, &loaded, None)?;
-            return self.leave(src, report, DistillState::Done, None, 0);
+            let (state, next) = rest(DistillState::Done);
+            return self.leave(src, report, state, next, 0);
         }
         // Every project the run covers: the client gates and redacts for each one.
         let mut projects: Vec<&str> = vec![slug.as_str()];
@@ -735,12 +769,12 @@ impl DistillCtl {
                 "distilled a captured session"
             );
         }
-        let state = if more {
-            DistillState::Due
+        let (state, next) = if more {
+            (DistillState::Due, None)
         } else {
-            DistillState::Done
+            rest(DistillState::Done)
         };
-        self.leave(src, report, state, None, 0)
+        self.leave(src, report, state, next, 0)
     }
 
     /// What `src`'s own project rules say: the client's `no_distill`, the project's exclusion
@@ -757,6 +791,7 @@ impl DistillCtl {
             &src.project_id,
         )?;
         match verdict {
+            CaptureVerdict::Excluded(why) if switch_off(why) => return Ok(Allowance::Off),
             CaptureVerdict::Excluded(_) => return Ok(Allowance::Excluded),
             CaptureVerdict::Wait(_) => return Ok(Allowance::Wait),
             CaptureVerdict::Capture => {}
@@ -1301,6 +1336,11 @@ fn page(
     }
 }
 
+/// Whether a capture verdict's exclusion is a global switch (not a project's rule).
+fn switch_off(why: &str) -> bool {
+    why == EXCLUDED_CAPTURE_OFF || why == EXCLUDED_AGENT_OFF
+}
+
 /// Whether the global capture switches are on for `agent` (`capture.enabled` and the agent's).
 fn capture_on(s: &Settings, agent: AgentKind) -> bool {
     s.capture.enabled
@@ -1389,6 +1429,15 @@ mod tests {
         assert_eq!(backoff(10), RETRY_MAX);
         assert_eq!(backoff(1_000), RETRY_MAX);
         assert_eq!(backoff(0), RETRY_FIRST);
+    }
+
+    /// Fix round 2: an exclusion by a global switch is told apart from a project's own rule
+    /// (the switch leaves a session idle; the rule skips it).
+    #[test]
+    fn a_global_switch_is_not_a_project_rule() {
+        assert!(switch_off(EXCLUDED_CAPTURE_OFF) && switch_off(EXCLUDED_AGENT_OFF));
+        assert!(!switch_off("project excluded"));
+        assert!(!switch_off("the project's .alice.toml says no_capture"));
     }
 
     #[test]

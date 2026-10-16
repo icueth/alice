@@ -46,6 +46,8 @@ struct DistillScript {
     outage: Mutex<Outage>,
     /// How long a distillation request takes to answer.
     delay: Mutex<Duration>,
+    /// Distillation requests answered (with a 200).
+    answered: AtomicUsize,
     calls: AtomicUsize,
     distill_calls: AtomicUsize,
     /// The question texts of every distillation request, one list per request.
@@ -64,6 +66,7 @@ impl DistillScript {
             answers: answers.to_vec(),
             outage: Mutex::new(Outage::None),
             delay: Mutex::new(Duration::ZERO),
+            answered: AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
             distill_calls: AtomicUsize::new(0),
             questions: Mutex::new(Vec::new()),
@@ -78,6 +81,11 @@ impl DistillScript {
     /// Every request posted (the judge's and distillation's, retries included).
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Distillation requests answered with a 200.
+    fn answered(&self) -> usize {
+        self.answered.load(Ordering::SeqCst)
     }
 
     /// Distillation requests posted, retries included.
@@ -165,6 +173,9 @@ impl JevTransport for DistillScript {
         }
         let resp = json!({"model": "jev-1.13.0", "answers": answers,
             "usage": {"input_tokens": 500, "output_tokens": 2}});
+        if questions.keys().any(|k| is_distill_question(k)) {
+            self.answered.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(HttpReply {
             status: 200,
             body: serde_json::to_vec(&resp).unwrap(),
@@ -1667,7 +1678,15 @@ async fn a_cloud_denied_subagent_is_never_sent() {
         "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
     )
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    let tools = alice_core::store::projects::tree_of(&d.db(), "tools").unwrap();
+    until("the daemon holds the tools rule", || {
+        !d.svc
+            .settings_handle()
+            .project_privacy(tools.as_ref())
+            .custom_patterns
+            .is_empty()
+    })
+    .await;
     let off = main.len();
     main.prompt("cs1-p3", "Thanks, that is all for today.")
         .reply("cs1-a5", "Glad to help.");
@@ -1723,24 +1742,51 @@ async fn a_cloud_denied_subagent_is_never_sent() {
     d.shutdown();
 }
 
-/// Fix round 1, I1: while the database refuses writes, no run starts, so no paid request is
-/// thrown away.
+/// Fix round 1, I1, and fix round 2: while the database refuses writes, no run starts (a paid
+/// answer could not be kept), and the worker sleeps between its ticks instead of spinning.
 #[tokio::test(flavor = "multi_thread")]
 async fn nothing_is_sent_while_the_database_is_read_only() {
-    let mut d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
-    let t = one_decision("ro1");
-    d.send("shop", "ro1", &t, 0, "stop").await;
-    let soon = (chrono::Utc::now() + chrono::Duration::seconds(3))
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    d.restart_with(&format!(
-        "UPDATE capture_state SET distill_state = 'due', distill_next_try_at = '{soon}'"
-    ))
+    let d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    *d.script.delay.lock() = Duration::from_millis(1_500);
+    d.send(
+        "shop",
+        "ro1",
+        &decision_marked("ro1", "ro1"),
+        0,
+        "session-end",
+    )
     .await;
+    until("the first run asks Jev", || d.script.distill_calls() == 1).await;
+    // While Jev answers, a second session ends, and then the disk fills up.
+    d.send(
+        "shop",
+        "ro2",
+        &decision_marked("ro2", "ro2"),
+        0,
+        "session-end",
+    )
+    .await;
+    assert_eq!(d.state(&uri("ro2")).state, "due");
     d.svc.force_read_only("the disk is full (test)");
-    tokio::time::sleep(Duration::from_millis(4_500)).await;
-    assert_eq!(d.script.distill_calls(), 0, "nothing is sent");
-    let st = d.state(&uri("ro1"));
-    assert_eq!((st.state.as_str(), st.attempts), ("due", 0), "{st:?}");
+    until("the first answer came", || d.script.answered() == 1).await;
+    settle().await;
+    let before = d.svc.distill_rounds();
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let turns = d.svc.distill_rounds() - before;
+    assert!(
+        turns <= 30,
+        "the worker sleeps while read-only (a 100 ms tick): {turns} turns in a second"
+    );
+    assert_eq!(
+        d.script.distill_calls(),
+        1,
+        "the second session is not sent"
+    );
+    assert_eq!(d.state(&uri("ro2")).state, "due");
+    assert!(
+        d.distilled().is_empty(),
+        "the first answer could not be kept"
+    );
     d.shutdown();
 }
 
@@ -1965,5 +2011,131 @@ async fn an_unreadable_source_is_put_off_and_the_others_go_on() {
     let bad = d.state(&uri("bad1"));
     assert_eq!((bad.state.as_str(), bad.attempts), ("due", 1), "{bad:?}");
     assert!(bad.next_try_at.is_some(), "with its back-off: {bad:?}");
+    d.shutdown();
+}
+
+// ---- Fix round 2 ----
+
+/// A session with a subagent in the project `repo`, whose report is about the cache: the main
+/// session `s` is uploaded (`stop`), then the subagent `agent`.
+async fn session_with_subagent(d: &Daemon, s: &str, agent: &str, repo: &str) -> Transcript {
+    let main = one_decision(s);
+    d.send("shop", s, &main, 0, "stop").await;
+    let mut sub = Transcript::subagent(agent);
+    sub.prompt(&format!("{agent}-p"), "Find how the cache service is configured.")
+        .reply(
+            &format!("{agent}-a"),
+            "The cache service listens on port 6380 and keeps its data in /var/lib/cache; the config file is deploy/cache.toml and it restarts at 03:00 UTC.",
+        );
+    let a = d
+        .send_q(
+            TranscriptQuery {
+                agent: "claude-code".into(),
+                session: s.into(),
+                subagent: Some(agent.into()),
+                offset: 0,
+                event: "subagent-stop".into(),
+                cwd: Some(d.repo(repo).to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            &sub.bytes,
+        )
+        .await;
+    assert!(a.turns_stored >= 1, "{a:?}");
+    main
+}
+
+/// Fix round 2: a subagent the cloud policy lets go again wakes its session only when the
+/// session is at rest; a failed one stays failed until `alice capture distill` asks for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subagent_recheck_does_not_revive_a_failed_session() {
+    let config = "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\n\n[privacy]\ncloud_denied_projects = [\"work\"]\n";
+    let mut d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(ANSWERS),
+    );
+    let main = session_with_subagent(&d, "rv1", "agr", "work").await;
+    d.send("shop", "rv1", &main, main.len(), "session-end")
+        .await;
+    let sub_uri = format!("{}:agent:agr", uri("rv1"));
+    until("the session ran, the subagent waits for the policy", || {
+        d.state(&uri("rv1")).state == "done" && d.state(&sub_uri).state == "skipped_cloud"
+    })
+    .await;
+    assert_eq!(d.script.distill_calls(), 1);
+    d.restart_with(
+        "UPDATE capture_state SET distill_state = 'failed', distill_attempts = 5
+         WHERE session_id = 'rv1' AND parent_source_id IS NULL",
+    )
+    .await;
+    // The policy lets `work` go: the subagent's recheck makes it due, which wakes no session.
+    d.write_config(JEV, |s| s.privacy.cloud_denied_projects.is_empty())
+        .await;
+    until("the subagent was rechecked", || {
+        d.state(&sub_uri).state == "idle"
+    })
+    .await;
+    settle().await;
+    assert_eq!(d.state(&uri("rv1")).state, "failed", "not revived");
+    assert_eq!(d.state(&sub_uri).distill_ord, 0);
+    assert_eq!(d.script.distill_calls(), 1);
+    // Asked for, it goes on, with the subagent.
+    d.svc.capture_distill_now("rv1").await.unwrap();
+    until("asked, the session is distilled", || {
+        let sub = d.state(&sub_uri);
+        d.state(&uri("rv1")).state == "done" && sub.distill_ord == sub.next_ord
+    })
+    .await;
+    assert!(d.distilled().iter().any(|m| m.kind == "fact"));
+    d.shutdown();
+}
+
+/// Fix round 2: a subagent whose project rules are unknown right now (a broken `.alice.toml`)
+/// is not sent; the session's own passages are, and the session is due again a few minutes
+/// later for the subagent instead of done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subagent_with_unknown_rules_puts_its_session_off() {
+    let d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    let main = session_with_subagent(&d, "uk1", "agk", "lab").await;
+    std::fs::write(
+        d.repo("lab").join(".alice.toml"),
+        "[privacy\nno_capture = tru",
+    )
+    .unwrap();
+    let lab = alice_core::store::projects::tree_of(&d.db(), "lab").unwrap();
+    until("the daemon sees the broken rules", || {
+        d.svc.settings_handle().project_fail_closed(lab.as_ref())
+    })
+    .await;
+    d.send("shop", "uk1", &main, main.len(), "session-end")
+        .await;
+    until("the session ran", || {
+        let st = d.state(&uri("uk1"));
+        st.distill_ord == st.next_ord && st.next_try_at.is_some()
+    })
+    .await;
+    let st = d.state(&uri("uk1"));
+    assert_eq!(st.state, "due", "{st:?}");
+    let at = chrono::DateTime::parse_from_rfc3339(st.next_try_at.as_deref().unwrap()).unwrap();
+    assert!(
+        at > chrono::Utc::now() + chrono::Duration::minutes(4),
+        "due again in five minutes: {st:?}"
+    );
+    let sub = d.state(&format!("{}:agent:agk", uri("uk1")));
+    assert_eq!(sub.distill_ord, 0, "the subagent's chunks wait");
+    assert!(!d.script.received("port 6380"), "and were not sent");
+    let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, ["decision"]);
+    settle().await;
+    let runs = d
+        .svc
+        .distill_runs()
+        .iter()
+        .filter(|r| r.uri == uri("uk1"))
+        .count();
+    assert_eq!(runs, 1, "not run again every tick");
     d.shutdown();
 }

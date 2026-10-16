@@ -4852,6 +4852,12 @@ impl Service {
         self.distill.runs()
     }
 
+    /// Tests: how many times the distill worker's loop has turned (asleep, once a tick).
+    #[doc(hidden)]
+    pub fn distill_rounds(&self) -> u64 {
+        self.distill.rounds()
+    }
+
     /// `GET /api/v1/capture/status`: the capture switch, distillation and the 50 sessions
     /// captured most recently.
     pub async fn capture_status(&self) -> Result<CaptureStatus> {

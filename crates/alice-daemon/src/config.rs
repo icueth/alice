@@ -48,6 +48,12 @@ pub enum CaptureVerdict {
     Wait(String),
 }
 
+/// [`CaptureVerdict::Excluded`]'s reason when `capture.enabled` is off (a global switch, not a
+/// project's rule: the distiller leaves such a session idle).
+pub const EXCLUDED_CAPTURE_OFF: &str = "capture is off";
+/// [`CaptureVerdict::Excluded`]'s reason when the agent's own capture switch is off.
+pub const EXCLUDED_AGENT_OFF: &str = "this agent's capture is off";
+
 /// How often the daemon polls `config.toml`; a look at a project's `.alice.toml` counts as a
 /// poll at most this often.
 pub const SETTINGS_POLL: Duration = Duration::from_secs(2);
@@ -764,14 +770,14 @@ impl SettingsHandle {
         let settings = self.get();
         let c = &settings.capture;
         if !c.enabled {
-            return CaptureVerdict::Excluded("capture is off");
+            return CaptureVerdict::Excluded(EXCLUDED_CAPTURE_OFF);
         }
         let agent_on = match agent {
             AgentKind::ClaudeCode => c.claude_code,
             AgentKind::Codex => c.codex,
         };
         if !agent_on {
-            return CaptureVerdict::Excluded("this agent's capture is off");
+            return CaptureVerdict::Excluded(EXCLUDED_AGENT_OFF);
         }
         let slug = alice_core::normalize::slugify(project_slug.trim());
         if !slug.is_empty()
