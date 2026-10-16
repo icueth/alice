@@ -1581,3 +1581,32 @@ The project hint is computed as the owner's MCP `headersHelper` does: the basena
 - **Task 7** loses the briefing route and service method (now in Task 14). It keeps the hook client that calls them.
 - **Task 12** also marks capture sources with no capture for 24 hours as ended (for tenants, which have no sweep) and makes
   them due.
+
+### The owner's dual-mode vision (binding, 2026-10-16 17:15)
+
+Alice works **locally and on a server, as the user chooses**. The public repository must let anyone install it locally, with
+no server.
+
+- **The local path ships in this branch.** The tenant-first order stands, but Task 6b, Task 7 and Task 8 are never dropped
+  or deferred past this branch.
+- **Task 19 adds two agent-runnable setup guides,** each a file a person hands to Claude Code or Codex, which then does
+  everything:
+  - **`docs/setup-local.md`:**
+    - build and install from source, then `alice service install`;
+    - the MCP server: `claude mcp add alice -- alice mcp`, and Codex `[mcp_servers.alice]` with `command`;
+    - `alice hooks install claude|codex`;
+    - the MemPalace import;
+    - the Alice block for `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`;
+    - optional MemPalace retirement, never deleting its data.
+  - **`docs/setup-server.md`:**
+    - `<url>` placeholders;
+    - `~/.config/alice/token` (0600) and `~/.config/alice/url`;
+    - the token rules: never displayed, config files never printed, `grep -c` only;
+    - Claude Code through a `headersHelper` script. Claude Code runs helpers from `~/.claude`, so the script reads the
+      session folder from the parent claude process with `lsof`, and it ends with `exit 0`;
+    - Codex through `bearer_token_env_var` and `env_http_headers`, with a zsh/bash wrapper that sets `ALICE_PROJECT`.
+      `codex mcp add` rewrites the whole `config.toml`, so append the table by hand, with a backup;
+    - the self-service MemPalace upload (`/api/v1/import/upload.sh`);
+    - then `setup.sh` for capture.
+  - **A "Choose: local or server" section** in `README.md` and `README.th.md`, in the same commit.
+  - **Source:** the methods come from the controller's private filled-in template. Copy no address and no token from it.
