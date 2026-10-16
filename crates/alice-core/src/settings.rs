@@ -2141,6 +2141,14 @@ pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
                 (a, b) => a != b && b != Retention::Forever,
             },
         ),
+        (
+            "capture.raw_retention",
+            match (oc.raw_retention, nc.raw_retention) {
+                (Retention::Age(a), Retention::Age(b)) => b < a,
+                (Retention::Size(a), Retention::Size(b)) => b < a,
+                (a, b) => a != b && b != Retention::Forever,
+            },
+        ),
     ];
     checks
         .into_iter()
@@ -4218,6 +4226,10 @@ mod tests {
                 "storage.raw_retention",
                 Box::new(|s| s.storage.raw_retention = Retention::Age(Duration::from_secs(86_400))),
             ),
+            (
+                "capture.raw_retention",
+                Box::new(|s| s.capture.raw_retention = Retention::Age(Duration::from_secs(86_400))),
+            ),
         ];
         for (key, change) in cases {
             let mut looser = base.clone();
@@ -4243,6 +4255,25 @@ mod tests {
         longer.maintenance.trash_days = 90;
         longer.storage.raw_retention = Retention::Forever;
         assert!(loosened_protections(&base, &longer).is_empty());
+        // capture.raw_retention the same way: a shorter age or size loosens, forever does not.
+        let mut kept = base.clone();
+        kept.capture.raw_retention = Retention::Age(Duration::from_secs(180 * 86_400));
+        let mut shorter = kept.clone();
+        shorter.capture.raw_retention = Retention::Age(Duration::from_secs(90 * 86_400));
+        assert_eq!(
+            loosened_protections(&kept, &shorter),
+            vec!["capture.raw_retention".to_string()]
+        );
+        assert!(loosened_protections(&shorter, &kept).is_empty());
+        assert!(loosened_protections(&kept, &base).is_empty());
+        let mut sized = base.clone();
+        sized.capture.raw_retention = Retention::Size(10_000_000_000);
+        let mut smaller = sized.clone();
+        smaller.capture.raw_retention = Retention::Size(5_000_000_000);
+        assert_eq!(
+            loosened_protections(&sized, &smaller),
+            vec!["capture.raw_retention".to_string()]
+        );
         // Turning the admin tools off tightens.
         let mut admin = base.clone();
         admin.mcp.admin_tools = true;

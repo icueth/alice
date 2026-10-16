@@ -14,6 +14,9 @@
 //! - **Raw retention** by age counts the time a chunk was *stored in Alice*, not the time it
 //!   claims to have been written: raw data younger than the retention is never deleted. By size
 //!   it counts text bytes of the chunks; neither mode shrinks the file without a `VACUUM`.
+//! - **Capture retention** (`capture.raw_retention`) applies the same rules to the chunks of
+//!   capture sources only. A capture source left without chunks (by either retention) stays,
+//!   with its cursor and turn keys, so its transcript is not captured or imported again.
 //!
 //! Each job keeps the writer's transactions short: deletes go 500 rows per `WriteOp`, FTS merges
 //! 500 pages. Reads (what to delete, the checks, the backup) use the reader pool or their own
@@ -135,6 +138,8 @@ pub enum Job {
     IndexCheck,
     FtsOptimize,
     RawRetention,
+    /// `capture.raw_retention`: ages out the chunks of capture sources only.
+    CaptureRetention,
     TrashPurge,
     JudgeRetry,
     MergeSuggestions,
@@ -144,11 +149,12 @@ pub enum Job {
 }
 
 impl Job {
-    pub const ALL: [Job; 10] = [
+    pub const ALL: [Job; 11] = [
         Job::ModelPurge,
         Job::JudgeRetry,
         Job::TrashPurge,
         Job::RawRetention,
+        Job::CaptureRetention,
         Job::EventsPrune,
         Job::QuickCheck,
         Job::IndexCheck,
@@ -164,6 +170,7 @@ impl Job {
             Job::IndexCheck => "index_check",
             Job::FtsOptimize => "fts_optimize",
             Job::RawRetention => "raw_retention",
+            Job::CaptureRetention => "capture_retention",
             Job::TrashPurge => "trash_purge",
             Job::JudgeRetry => "judge_retry",
             Job::MergeSuggestions => "merge_suggestions",
@@ -568,7 +575,7 @@ impl Scheduler {
             }
         }
         // One history row per run with the totals (not one per slice: a run is hundreds).
-        if job == Job::RawRetention && scratch.deleted > 0 {
+        if matches!(job, Job::RawRetention | Job::CaptureRetention) && scratch.deleted > 0 {
             let recorded = self.ctx.writer.submit_blocking(WriteOp::RecordEvent {
                 actor: alice_core::store::events::Actor::System,
                 action: "raw.retention".into(),
@@ -775,7 +782,91 @@ impl Scheduler {
             Job::ModelPurge => self.model_purge(sc),
             Job::Backup => self.backup(now),
             Job::MergeSuggestions => self.merge_suggestions(s.judge.cluster_similarity),
+            Job::CaptureRetention => self.capture_retention(now, sc),
         }
+    }
+
+    /// `capture.raw_retention`: raw retention's rules over the chunks of capture sources only
+    /// (spec §3.9). Imported transcripts and other raw sources follow `storage.raw_retention`
+    /// alone. A capture source emptied here keeps its cursor and turn keys (`m::delete_chunks`).
+    fn capture_retention(&self, now: DateTime<Utc>, sc: &mut Scratch) -> Result<Step> {
+        let retention = self.ctx.settings.get().capture.raw_retention;
+        // (seq, text bytes) of the chunks to delete in this slice.
+        let take: Vec<(i64, u64)> = match retention {
+            Retention::Forever => {
+                return Ok(Step::Finished("capture retention is forever".into()));
+            }
+            // Age is the time a chunk was stored in Alice (`created_at`).
+            Retention::Age(age) => {
+                let Some(since) = age_cutoff(now, age) else {
+                    return Ok(Step::Finished(
+                        "capture.raw_retention is too large to apply; nothing deleted".into(),
+                    ));
+                };
+                let cutoff = since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                self.ctx
+                    .readers
+                    .with(|c| m::capture_chunks_older_than(c, &cutoff, SLICE))?
+                    .into_iter()
+                    .map(|seq| (seq, 0))
+                    .collect()
+            }
+            Retention::Size(limit) => {
+                // The total is read once per run; slices count down from it.
+                let over = match sc.over_bytes {
+                    Some(o) => o,
+                    None => {
+                        let total = self.ctx.readers.with(m::capture_raw_bytes)?;
+                        total.saturating_sub(limit)
+                    }
+                };
+                sc.over_bytes = Some(over);
+                let mut left = over;
+                let mut take = Vec::new();
+                if over > 0 {
+                    for (seq, bytes) in self
+                        .ctx
+                        .readers
+                        .with(|c| m::oldest_capture_chunks(c, SLICE))?
+                    {
+                        if left == 0 {
+                            break;
+                        }
+                        take.push((seq, bytes));
+                        left = left.saturating_sub(bytes);
+                    }
+                }
+                take
+            }
+        };
+        if take.is_empty() {
+            return Ok(Step::Finished(format!(
+                "captured transcripts within retention; {} chunks deleted",
+                sc.deleted
+            )));
+        }
+        sc.reason = format!("capture: {retention}");
+        let seqs: Vec<i64> = take.iter().map(|(seq, _)| *seq).collect();
+        let WriteOutcome::Purged(done) = self
+            .ctx
+            .writer
+            .submit_blocking(WriteOp::DeleteChunks { seqs })?
+        else {
+            return Ok(Step::More);
+        };
+        sc.deleted += done.len();
+        if let Some(o) = sc.over_bytes {
+            let freed: u64 = take
+                .iter()
+                .filter(|(seq, _)| done.contains(seq))
+                .map(|(_, b)| *b)
+                .sum();
+            sc.over_bytes = Some(o.saturating_sub(freed));
+        }
+        if let Some(idx) = self.ctx.index.read().clone() {
+            idx.remove_chunks(&done)?;
+        }
+        Ok(Step::More)
     }
 
     /// What the result of `PRAGMA quick_check` means. An interrupt (`interrupted`: the daemon is
@@ -1398,6 +1489,23 @@ mod tests {
         }
     }
 
+    /// [`rig_with`] whose settings also read the variables `env` (`ALICE_*`), as the daemon's
+    /// do the process environment (a tenant's env file pins keys this way).
+    fn rig_with_env(config: &str, env: &[(&str, &str)]) -> Rig {
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut pinned = None;
+        let mut r = rig_custom(config, |ctx| {
+            let settings = SettingsHandle::load_with_env(&ctx.home, env);
+            ctx.settings = settings.clone();
+            pinned = Some(settings);
+        });
+        r.settings = pinned.unwrap();
+        r
+    }
+
     impl Rig {
         /// A second connection for setup that needs past timestamps or states.
         fn sql(&self) -> rusqlite::Connection {
@@ -1876,6 +1984,397 @@ mod tests {
             .sched
             .run_job(Job::RawRetention, chrono::Utc::now(), true);
         assert_eq!(report.detail, "retention is forever");
+    }
+
+    impl Rig {
+        /// A transcript source of `session` (type `session`). `capture`: a capture source (uri
+        /// `claude-code:session:<session>`, with its `capture_state` row); otherwise an imported
+        /// transcript (a `file://` uri, no capture state).
+        fn transcript_source(
+            &self,
+            c: &rusqlite::Connection,
+            id: &str,
+            session: &str,
+            capture: bool,
+        ) {
+            let uri = if capture {
+                format!("claude-code:session:{session}")
+            } else {
+                format!("file:///h/.claude/projects/-Users-me-Code-x/{session}.jsonl")
+            };
+            c.execute(
+                "INSERT INTO sources (id, project_id, type, agent, uri, session_id, created_at)
+                 VALUES (?1, ?2, 'session', 'claude-code', ?3, ?4, '2026-01-01T00:00:00.000Z')",
+                params![id, self.global(), uri, session],
+            )
+            .unwrap();
+            if capture {
+                c.execute(
+                    "INSERT INTO capture_state (source_id, agent, session_id, created_at)
+                     VALUES (?1, 'claude-code', ?2, '2026-01-01T00:00:00.000Z')",
+                    params![id, session],
+                )
+                .unwrap();
+            }
+        }
+
+        /// Chunks `ords` of `source`, stored `days` ago, of `bytes` bytes of text each, each with
+        /// a vector (stored and in the index); for a capture source also each turn's key and the
+        /// cursor past it, as capture records them. Returns their seqs.
+        fn transcript_chunks(
+            &self,
+            c: &rusqlite::Connection,
+            source: &str,
+            ords: std::ops::Range<i64>,
+            days: i64,
+            bytes: usize,
+        ) -> Vec<i64> {
+            let created = (chrono::Utc::now() - chrono::Duration::days(days))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let idx = self.index.read().clone().unwrap();
+            let mut seqs = Vec::new();
+            for ord in ords {
+                c.execute(
+                    "INSERT INTO chunks (id, source_id, project_id, ord, text, content_hash, created_at, embed_state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'done')",
+                    params![
+                        format!("{source}-C{ord}"),
+                        source,
+                        self.global(),
+                        ord,
+                        "x".repeat(bytes),
+                        format!("{source}-h{ord}"),
+                        created
+                    ],
+                )
+                .unwrap();
+                let seq = c.last_insert_rowid();
+                embeddings::put(c, VecKey::Chunk(seq), "fake", &[1.0, 0.0, 0.0]).unwrap();
+                idx.upsert(VecKey::Chunk(seq), &[1.0, 0.0, 0.0]).unwrap();
+                c.execute(
+                    "INSERT INTO capture_turns (agent, turn_key, source_id, first_ord)
+                     SELECT agent, ?2, source_id, ?3 FROM capture_state WHERE source_id = ?1",
+                    params![source, format!("{source}-turn{ord}"), ord],
+                )
+                .unwrap();
+                c.execute(
+                    "UPDATE capture_state SET next_ord = ?2, byte_offset = byte_offset + ?3
+                     WHERE source_id = ?1",
+                    params![source, ord + 1, bytes as i64],
+                )
+                .unwrap();
+                seqs.push(seq);
+            }
+            seqs
+        }
+
+        /// The seqs of the chunks of `source` left, in order.
+        fn chunk_seqs(&self, source: &str) -> Vec<i64> {
+            alice_core::store::open_reader(&self.home.db())
+                .unwrap()
+                .prepare("SELECT seq FROM chunks WHERE source_id = ?1 ORDER BY seq")
+                .unwrap()
+                .query_map([source], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        /// The one `raw.retention` history row's totals.
+        fn retention_event(&self) -> serde_json::Value {
+            let after: String = self
+                .sql()
+                .query_row(
+                    "SELECT after_json FROM events WHERE action = 'raw.retention'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&after).unwrap()
+        }
+    }
+
+    /// How the MemPalace importer plans a transcript drawer of `session` (a Claude Code file
+    /// named after it) while capture holds the sessions `captured`.
+    fn plan_transcript_of(
+        session: &str,
+        captured: &std::collections::HashSet<String>,
+    ) -> alice_core::import::plan::Planned {
+        use alice_core::import::palace::{Drawer, DrawerMeta};
+        use alice_core::import::plan::{Mapper, NoFilter, Planner, Survey};
+        use alice_core::import::wings::WingMap;
+        let wings = WingMap::build(&[], &std::collections::BTreeMap::new());
+        let survey = Survey::default();
+        let planner = Planner {
+            mapper: Mapper {
+                wings: &wings,
+                assume: chrono::FixedOffset::east_opt(0).unwrap(),
+                filter: &NoFilter,
+            },
+            survey: &survey,
+            captured_sessions: captured,
+        };
+        planner.plan(&Drawer {
+            id: "drawer-0".into(),
+            text: "a turn of the session".into(),
+            meta: DrawerMeta {
+                wing: "sessions".into(),
+                room: "general".into(),
+                source_file: Some(format!(
+                    "/h/.claude/projects/-Users-me-Code-x/{session}.jsonl"
+                )),
+                ingest_mode: Some("convos".into()),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// SP2 §3.9: `capture.raw_retention` ages out the chunks of capture sources only; imported
+    /// transcripts and other raw sources follow `storage.raw_retention` alone.
+    #[test]
+    fn capture_retention_deletes_only_captured_chunks() {
+        let r = rig_with("[capture]\nraw_retention = \"180d\"\n");
+        let c = r.sql();
+        let now = chrono::Utc::now();
+        r.transcript_source(&c, "IMP", "imported-session", false);
+        r.transcript_source(&c, "CAP", "captured-session", true);
+        let imported = r.transcript_chunks(&c, "IMP", 0..3, 200, 40);
+        r.transcript_chunks(&c, "CAP", 0..3, 200, 40);
+        assert_eq!(r.index_len(), Some(6));
+        let report = r.sched.run_job(Job::CaptureRetention, now, true);
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        assert!(r.chunk_seqs("CAP").is_empty(), "the captured chunks go");
+        assert_eq!(r.chunk_seqs("IMP"), imported, "the imported ones stay");
+        assert_eq!(r.index_len(), Some(3), "the vectors go with their chunks");
+        assert_eq!(
+            r.count("SELECT count(*) FROM embeddings WHERE owner_type = 'chunk'"),
+            3
+        );
+        // One history row for the run, naming the capture setting.
+        assert_eq!(
+            r.count("SELECT count(*) FROM events WHERE action = 'raw.retention'"),
+            1
+        );
+        let after = r.retention_event();
+        assert_eq!(after["deleted"], 3, "{after}");
+        assert_eq!(after["reason"], "capture: 180d", "{after}");
+        // `storage.raw_retention = forever`: the raw tier's own job leaves the rest alone.
+        let report = r.sched.run_job(Job::RawRetention, now, true);
+        assert_eq!(report.detail, "retention is forever");
+        assert_eq!(r.chunk_seqs("IMP"), imported);
+        // Run again: nothing left to delete, and no second history row.
+        let again = r.sched.run_job(Job::CaptureRetention, now, true);
+        assert_eq!(again.outcome, JobOutcome::Done, "{again:?}");
+        assert_eq!(r.chunk_seqs("IMP"), imported);
+        assert_eq!(
+            r.count("SELECT count(*) FROM events WHERE action = 'raw.retention'"),
+            1
+        );
+    }
+
+    /// §3.5: the old chunks of a live session go, while its cursor (`capture_state`, newer chunks
+    /// still there) and the keys of every turn stay, so the file is not captured again.
+    #[test]
+    fn capture_retention_keeps_cursor_and_keys_of_a_live_source() {
+        use alice_core::store::capture;
+        let r = rig_with("[capture]\nraw_retention = \"180d\"\n");
+        let c = r.sql();
+        r.transcript_source(&c, "CAP", "live-session", true);
+        r.transcript_chunks(&c, "CAP", 0..4, 200, 40);
+        let fresh = r.transcript_chunks(&c, "CAP", 4..6, 1, 40);
+        let before = capture::by_source(&c, "CAP").unwrap().unwrap();
+        assert_eq!((before.next_ord, before.byte_offset), (6, 6 * 40));
+        let report = r
+            .sched
+            .run_job(Job::CaptureRetention, chrono::Utc::now(), true);
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        assert_eq!(
+            r.chunk_seqs("CAP"),
+            fresh,
+            "the old chunks go, the new stay"
+        );
+        assert_eq!(
+            capture::by_source(&c, "CAP").unwrap(),
+            Some(before),
+            "the cursor stays where it was"
+        );
+        let keys: Vec<String> = (0..6).map(|ord| format!("CAP-turn{ord}")).collect();
+        assert_eq!(
+            capture::known_turns(&c, "claude-code", &keys)
+                .unwrap()
+                .len(),
+            6,
+            "the keys of the deleted turns stay too"
+        );
+    }
+
+    /// By size, `capture.raw_retention` counts the text of captured chunks only and deletes the
+    /// oldest of them until the rest fit; imported chunks neither count nor go.
+    #[test]
+    fn capture_retention_by_size() {
+        // 10 captured chunks of 300 kB kept at 1 MB: the 7 oldest go. 5 imported chunks of
+        // 300 kB, stored before them (and 1.5 MB on their own), stay.
+        let r = rig_with("[capture]\nraw_retention = \"1MB\"\n");
+        let c = r.sql();
+        r.transcript_source(&c, "IMP", "imported-session", false);
+        r.transcript_source(&c, "CAP", "captured-session", true);
+        let imported = r.transcript_chunks(&c, "IMP", 0..5, 300, 300_000);
+        let captured = r.transcript_chunks(&c, "CAP", 0..10, 2, 300_000);
+        let report = r
+            .sched
+            .run_job(Job::CaptureRetention, chrono::Utc::now(), true);
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        assert_eq!(
+            r.chunk_seqs("CAP"),
+            captured[7..].to_vec(),
+            "the newest stay"
+        );
+        assert_eq!(r.chunk_seqs("IMP"), imported);
+        let after = r.retention_event();
+        assert_eq!(after["deleted"], 7, "{after}");
+        assert_eq!(after["reason"], "capture: 1MB", "{after}");
+        // Forever (the default): nothing happens.
+        let r2 = rig();
+        let c2 = r2.sql();
+        r2.transcript_source(&c2, "CAP", "captured-session", true);
+        let kept = r2.transcript_chunks(&c2, "CAP", 0..3, 400, 40);
+        let report = r2
+            .sched
+            .run_job(Job::CaptureRetention, chrono::Utc::now(), true);
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        assert_eq!(report.detail, "capture retention is forever");
+        assert_eq!(r2.chunk_seqs("CAP"), kept);
+    }
+
+    /// R25: on a tenant `ALICE_CAPTURE_RAW_RETENTION` (in the env file `alice-server` writes)
+    /// pins the retention. A PATCH to `forever` (`SettingsHandle::patch`, what the HTTP PATCH
+    /// runs) is saved, but the answer says the variable overrides it, and the job still deletes.
+    #[test]
+    fn the_env_pin_wins_over_a_patch() {
+        let r = rig_with_env("", &[("ALICE_CAPTURE_RAW_RETENTION", "180d")]);
+        let mut change = serde_json::Map::new();
+        change.insert("capture.raw_retention".into(), serde_json::json!("forever"));
+        let out = r.settings.patch(&change).unwrap();
+        assert_eq!(
+            out.overridden_by_env,
+            vec!["capture.raw_retention".to_string()],
+            "{out:?}"
+        );
+        // The answer's view gives the key's source: the variable, by name.
+        let source =
+            serde_json::to_string(&r.settings.resolved().sources["capture.raw_retention"]).unwrap();
+        assert!(source.contains("ALICE_CAPTURE_RAW_RETENTION"), "{source}");
+        let file = std::fs::read_to_string(r.home.config_file()).unwrap();
+        assert!(file.contains("forever"), "the patch is saved: {file}");
+        assert_eq!(
+            r.settings.get().capture.raw_retention,
+            Retention::Age(Duration::from_secs(180 * 86_400))
+        );
+        let c = r.sql();
+        r.transcript_source(&c, "CAP", "captured-session", true);
+        r.transcript_chunks(&c, "CAP", 0..3, 200, 40);
+        let report = r
+            .sched
+            .run_job(Job::CaptureRetention, chrono::Utc::now(), true);
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        assert!(r.chunk_seqs("CAP").is_empty(), "the pinned 180d applies");
+        assert_eq!(r.retention_event()["reason"], "capture: 180d");
+    }
+
+    /// R11: a capture source whose chunks all aged out stays, with its `capture_state` row (the
+    /// cursor) and its turn keys, so its session still counts as captured and the MemPalace
+    /// importer still skips that session's transcript.
+    #[test]
+    fn capture_retention_keeps_an_emptied_capture_source_and_its_import_skip() {
+        use alice_core::import::plan::{CAPTURED_BY_ALICE_CAPTURE, Planned};
+        use alice_core::store::capture;
+        let r = rig_with("[capture]\nraw_retention = \"180d\"\n");
+        let c = r.sql();
+        let session = "0b9e6a52-5c1d-4f7e-9a01-6d2b8c3e4f50";
+        r.transcript_source(&c, "CAP", session, true);
+        r.transcript_chunks(&c, "CAP", 0..3, 200, 40);
+        let before = capture::by_source(&c, "CAP").unwrap().unwrap();
+        let report = r
+            .sched
+            .run_job(Job::CaptureRetention, chrono::Utc::now(), true);
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        assert!(r.chunk_seqs("CAP").is_empty(), "every chunk aged out");
+        assert_eq!(
+            r.count("SELECT count(*) FROM sources WHERE id = 'CAP'"),
+            1,
+            "the emptied capture source stays"
+        );
+        assert_eq!(
+            capture::by_source(&c, "CAP").unwrap(),
+            Some(before),
+            "with its cursor"
+        );
+        assert_eq!(
+            r.count("SELECT count(*) FROM capture_turns WHERE source_id = 'CAP'"),
+            3,
+            "and its turn keys"
+        );
+        let captured = capture::captured_session_ids(&c).unwrap();
+        assert!(captured.contains(session), "{captured:?}");
+        let planned = plan_transcript_of(session, &captured);
+        assert!(
+            matches!(
+                planned,
+                Planned::Skipped {
+                    reason: CAPTURED_BY_ALICE_CAPTURE
+                }
+            ),
+            "an import of the session's transcript is still skipped: {planned:?}"
+        );
+        // The skip is capture's: with no session held, the same drawer is not skipped for it.
+        let free = plan_transcript_of(session, &Default::default());
+        assert!(
+            !matches!(
+                free,
+                Planned::Skipped {
+                    reason: CAPTURED_BY_ALICE_CAPTURE
+                }
+            ),
+            "{free:?}"
+        );
+    }
+
+    /// R11 through the raw tier's own job: a `storage.raw_retention` that empties a capture
+    /// source keeps it (with its cursor and turn keys); an emptied source of another kind goes,
+    /// as before.
+    #[test]
+    fn raw_retention_keeps_an_emptied_capture_source_and_drops_an_emptied_other_one() {
+        use alice_core::store::capture;
+        let r = rig_with("[storage]\nraw_retention = \"30d\"\n");
+        let c = r.sql();
+        r.transcript_source(&c, "CAP", "captured-session", true);
+        r.transcript_source(&c, "IMP", "imported-session", false);
+        r.transcript_chunks(&c, "CAP", 0..3, 60, 40);
+        r.transcript_chunks(&c, "IMP", 0..3, 60, 40);
+        let before = capture::by_source(&c, "CAP").unwrap().unwrap();
+        let report = r.sched.run_job(Job::RawRetention, chrono::Utc::now(), true);
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        assert_eq!(r.count("SELECT count(*) FROM chunks"), 0);
+        assert_eq!(
+            r.count("SELECT count(*) FROM sources WHERE id = 'CAP'"),
+            1,
+            "the emptied capture source stays"
+        );
+        assert_eq!(capture::by_source(&c, "CAP").unwrap(), Some(before));
+        assert_eq!(
+            r.count("SELECT count(*) FROM capture_turns WHERE source_id = 'CAP'"),
+            3
+        );
+        assert!(
+            capture::captured_session_ids(&c)
+                .unwrap()
+                .contains("captured-session")
+        );
+        assert_eq!(
+            r.count("SELECT count(*) FROM sources WHERE id = 'IMP'"),
+            0,
+            "an emptied source that is not captured goes"
+        );
     }
 
     /// B3: the events retention also prunes the judge cache, by age and by a cap.

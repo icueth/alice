@@ -7127,10 +7127,11 @@ mod tests {
         assert_eq!(actor, "user");
     }
 
-    /// SP2 spec §3.5: retention deletes a source with its last chunk and its capture state goes
-    /// with it (`ON DELETE CASCADE`), but the turn keys stay, so the file is not captured again.
+    /// SP2 spec §3.9 and R11: retention that deletes a capture source's last chunk keeps the
+    /// source with its capture state (the cursor) and its turn keys, so the file is not captured
+    /// again and the importer still skips the session.
     #[test]
-    fn deleting_a_sources_chunks_cascades_its_state_but_keeps_turn_keys() {
+    fn deleting_a_sources_chunks_keeps_its_state_and_turn_keys() {
         let f = fixture();
         let mut s = capture_slice("S1", global(), 0..2);
         s.turn_keys = vec![("u-1".into(), 0), ("u-2".into(), 1)];
@@ -7155,15 +7156,15 @@ mod tests {
         assert!(
             capture_store::by_uri(&c, &capture_uri("S1"))
                 .unwrap()
-                .is_none()
+                .is_some()
         );
         let states: i64 = f.read(
             "SELECT count(*) FROM capture_state WHERE source_id = ?1",
             [&source_id],
         );
-        assert_eq!(states, 0, "the state goes with its source");
+        assert_eq!(states, 1, "the state stays with its emptied source");
         let sources: i64 = f.read("SELECT count(*) FROM sources WHERE id = ?1", [&source_id]);
-        assert_eq!(sources, 0);
+        assert_eq!(sources, 1);
         assert_eq!(known(&c, &["u-1", "u-2"]), known_set(&["u-1", "u-2"]));
     }
 
