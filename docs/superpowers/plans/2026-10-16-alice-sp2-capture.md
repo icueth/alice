@@ -154,7 +154,7 @@ it is wrong.
 | `crates/alice-core/src/capture/render.rs` | new | the rendering table, trimming, chunk cutting |
 | `crates/alice-core/src/distill/mod.rs` | new | `RunInput`, `Candidate`, `candidates()`, `request()`, `decide()`, `DistilledMemory` |
 | `crates/alice-core/src/store/capture.rs` | new | `capture_state` / `capture_turns` SQL |
-| `crates/alice-core/src/store/sql/0006_capture.sql` | new | migration (spec §8.1) |
+| `crates/alice-core/src/store/sql/0007_capture.sql` | new | migration (spec §8.1) |
 
 **`alice-core` (changed):**
 
@@ -475,7 +475,7 @@ it is wrong.
 ## Task 5: Schema, origin, provenance and the capture writer ops
 
 **Files:**
-- Create: `crates/alice-core/src/store/sql/0006_capture.sql` (verbatim from spec §8.1, plus
+- Create: `crates/alice-core/src/store/sql/0007_capture.sql` (verbatim from spec §8.1, plus
   `CREATE INDEX capture_state_parent ON capture_state(parent_source_id)`)
 - Create: `crates/alice-core/src/store/capture.rs`
 - Modify: `crates/alice-core/src/store/mod.rs`, `crates/alice-core/src/model.rs`, `crates/alice-core/src/store/memories.rs`,

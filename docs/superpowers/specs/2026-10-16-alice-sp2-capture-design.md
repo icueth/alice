@@ -951,7 +951,7 @@ local-only notify endpoint is refused in tenant mode instead.
 
 ## 8. Data model, API and CLI changes
 
-### 8.1 Migration (the next free number; `0006_capture.sql` today)
+### 8.1 Migration (the next free number; `0007_capture.sql` today)
 
 ```sql
 CREATE TABLE capture_state(

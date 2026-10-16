@@ -4,7 +4,7 @@
 #![allow(deprecated)] // roots are deprecated by SEP-2577 but current clients still provide them
 
 use crate::client::{DaemonClient, Launcher, Unavailable, WRITE_WAIT, remember_via};
-use crate::compat::{CompatCall, CompatResult, OFF_MESSAGE, is_compat_name};
+use crate::compat::{CompatCall, CompatResult, OFF_MESSAGE, UNREACHABLE_MESSAGE, is_compat_name};
 use crate::paths::AliceHome;
 use crate::service::Service;
 use alice_core::api::*;
@@ -62,6 +62,8 @@ pub struct Switches {
     pub admin_tools: bool,
     /// `compat.mempalace`.
     pub compat_mempalace: bool,
+    /// No daemon answered (the switches above then read off whatever the settings say).
+    pub unreachable: bool,
 }
 
 pub struct RemoteBackend {
@@ -107,9 +109,13 @@ impl RemoteBackend {
         let asked = std::time::Instant::now();
         // The small flags endpoint (no read of the secrets' status, a short timeout), not the
         // whole settings view.
+        let unreachable = Switches {
+            unreachable: true,
+            ..Switches::default()
+        };
         let on = match DaemonClient::try_existing(&self.home).await {
-            Some(c) => c.switches().await.unwrap_or_default(),
-            None => Switches::default(),
+            Some(c) => c.switches().await.unwrap_or(unreachable),
+            None => unreachable,
         };
         *self.switches.lock() = Some((asked, on));
         on
@@ -163,6 +169,7 @@ impl Backend {
                 Switches {
                     admin_tools: settings.mcp.admin_tools,
                     compat_mempalace: settings.compat.mempalace,
+                    unreachable: false,
                 }
             }
             Backend::Remote(b) => b.switches().await,
@@ -182,6 +189,7 @@ impl Backend {
                 Switches {
                     admin_tools: settings.mcp.admin_tools,
                     compat_mempalace: settings.compat.mempalace,
+                    unreachable: false,
                 }
             }
             Backend::Remote(b) => b.switches_cached(),
@@ -865,9 +873,20 @@ impl ServerHandler for AliceMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        // Off: an admin or compat tool answers as a tool that does not exist.
+        // Off: an admin or compat tool answers as a tool that does not exist. A compat call says
+        // why: the setting is off, or no daemon answered (then the setting may well be on, and
+        // "turn it on" would send the agent to rewrite it).
         if !self.tool_allowed(&request.name).await {
-            let why = is_compat_name(&request.name).then(|| serde_json::json!(OFF_MESSAGE));
+            let why = if is_compat_name(&request.name) {
+                let unreachable = self.backend.switches_cached().unreachable;
+                Some(serde_json::json!(if unreachable {
+                    UNREACHABLE_MESSAGE
+                } else {
+                    OFF_MESSAGE
+                }))
+            } else {
+                None
+            };
             return Err(McpError::invalid_params("tool not found", why));
         }
         if is_compat_name(&request.name) {

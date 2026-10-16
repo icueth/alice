@@ -90,6 +90,12 @@ fn opt_text(
     })
 }
 
+/// Text of a column; `None` when it is NULL or not text.
+fn text(r: &rusqlite::Row<'_>, idx: usize) -> Result<Option<String>> {
+    let mut not_text = false;
+    opt_text(r, idx, false, &mut not_text)
+}
+
 /// Reads the copied knowledge graph read-only, resolving entity ids to names. MemPalace triple
 /// ids embed the triple's text, so no warning ever prints one; read-time notes ride on the
 /// triple and are reported by position in the plan.
@@ -118,21 +124,28 @@ pub fn read_kg(path: &Path) -> Result<Kg> {
     let mut kg = Kg::default();
     let mut st = conn.prepare(&sql)?;
     let mut rows = st.query([])?;
+    // Rows whose id, entity id or predicate is missing or not text (a damaged palace: MemPalace
+    // declares them NOT NULL): skipped, counted in one warning, never the whole graph lost.
+    let mut damaged = 0u64;
     while let Some(r) = rows.next()? {
-        let id: String = r.get(0)?;
+        // An empty text is read as it is: the planner reports it with the other empty parts.
+        let (Some(id), Some(subject_id), Some(predicate), Some(object_id)) =
+            (text(r, 0)?, text(r, 1)?, text(r, 3)?, text(r, 4)?)
+        else {
+            damaged += 1;
+            continue;
+        };
         let mut notes = Vec::new();
-        let mut name = |idx: usize, role: &str| -> Result<String> {
-            let ent: String = r.get(idx - 1)?;
-            let resolved: Option<String> = r.get(idx)?;
-            Ok(resolved.unwrap_or_else(|| {
+        let mut name = |idx: usize, ent: String, role: &str| -> Result<String> {
+            Ok(text(r, idx)?.unwrap_or_else(|| {
                 notes.push(format!(
                     "the {role} entity has no entity row; its id is used as the name"
                 ));
                 ent
             }))
         };
-        let subject = name(2, "subject")?;
-        let object = name(5, "object")?;
+        let subject = name(2, subject_id, "subject")?;
+        let object = name(5, object_id, "object")?;
         let mut bad = false;
         let valid_from = opt_text(r, 6, true, &mut bad)?;
         let valid_to = opt_text(r, 7, true, &mut bad)?;
@@ -143,9 +156,9 @@ pub fn read_kg(path: &Path) -> Result<Kg> {
                 .push("a source or extraction column is not text; it is treated as missing".into());
         }
         kg.triples.push(KgTriple {
-            id: id.clone(),
+            id,
             subject,
-            predicate: r.get(3)?,
+            predicate,
             object,
             valid_from,
             valid_to,
@@ -156,6 +169,11 @@ pub fn read_kg(path: &Path) -> Result<Kg> {
     }
     drop(rows);
     drop(st);
+    if damaged > 0 {
+        kg.warnings.push(format!(
+            "{damaged} knowledge graph rows have no readable id, subject, predicate or object and were skipped"
+        ));
+    }
     let isolated: i64 = conn.query_row(
         "SELECT COUNT(*) FROM entities e
          WHERE NOT EXISTS (SELECT 1 FROM triples t WHERE t.subject = e.id OR t.object = e.id)",
@@ -937,6 +955,47 @@ mod tests {
         let plan = plan_kg(&kg, &[], utc(), &NoFilter);
         assert_eq!(plan.warnings.len(), 1);
         assert_eq!(plan.facts[0].end_at, None);
+    }
+
+    /// A damaged row (a non-text id, entity id or predicate) is skipped with one warning, and
+    /// the rest of the graph is read; a non-text entity name reads as a missing entity (its id
+    /// is the name).
+    #[test]
+    fn a_damaged_triple_is_skipped_with_a_warning_and_the_rest_of_the_graph_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = build_kg(
+            dir.path(),
+            &[("e1", "alice"), ("e2", "sqlite"), ("e3", "postgres")],
+            &[
+                t("t1", "e1", "uses", "e2"),
+                t("t2", "e1", "likes", "e2"),
+                t("t3", "e1", "runs", "e3"),
+                t("t4", "e2", "needs", "e3"),
+                t("t5", "e1", "wants", "e3"),
+            ],
+            false,
+        );
+        let conn = Connection::open(&path).unwrap();
+        for sql in [
+            "UPDATE triples SET predicate = x'00ff' WHERE id = 't2'",
+            "UPDATE triples SET subject = x'00ff' WHERE id = 't3'",
+            "UPDATE triples SET id = x'00ff' WHERE id = 't4'",
+            "UPDATE entities SET name = x'00ff' WHERE id = 'e3'",
+        ] {
+            conn.execute(sql, []).unwrap();
+        }
+        drop(conn);
+        let kg = read_kg(&path).unwrap();
+        let ids: Vec<&str> = kg.triples.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["t1", "t5"]);
+        assert_eq!(kg.triples[1].object, "e3");
+        assert_eq!(kg.triples[1].notes.len(), 1);
+        assert_eq!(kg.warnings.len(), 1, "{:?}", kg.warnings);
+        assert!(
+            kg.warnings[0].starts_with("3 knowledge graph rows"),
+            "{:?}",
+            kg.warnings
+        );
     }
 
     #[test]

@@ -1231,6 +1231,111 @@ async fn block_mode_skips_the_drawer_names_the_detector_and_keeps_going() {
     assert_eq!(f.tables_holding(SECRET).await, Vec::<String>::new());
 }
 
+/// Ruling after the M2 merge: an import into a project is screened with that project's rules,
+/// and a wing that names a project merged into another gets the rules the merge carried into
+/// it. Here `strict` (block mode and a ticket pattern) was merged into `loose`: the drawers of
+/// the `strict` wing land in `loose`, and those its rules refuse (a ticket, a secret the global
+/// rules would only have redacted) are held back. A wing of a project without such rules keeps
+/// the ticket text.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_into_a_merged_projects_name_is_screened_with_the_rules_the_merge_carried() {
+    let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let specs = vec![
+        knowledge("k_t", "the ticket TCK-12345 is open", "strict", "decisions"),
+        knowledge("k_s", &format!("the key is {token}"), "strict", "decisions"),
+        knowledge(
+            "k_ok",
+            "a plain decision about the cache",
+            "strict",
+            "decisions",
+        ),
+        chunk(
+            "c_t",
+            "a transcript line about TCK-99999",
+            "strict",
+            "/h/.claude/projects/-Users-me-Code-strict/s9.jsonl",
+            0,
+        ),
+        knowledge(
+            "k_other",
+            "the other ticket TCK-55555",
+            "other",
+            "decisions",
+        ),
+    ];
+    let f = Flow::with_specs(&specs).await;
+    let mut cwd = BTreeMap::new();
+    for name in ["strict", "loose"] {
+        let dir = f._root.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        cwd.insert(name, dir.to_string_lossy().into_owned());
+    }
+    std::fs::write(
+        f._root.path().join("strict").join(".alice.toml"),
+        "[privacy]\nblock_secrets = true\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
+    )
+    .unwrap();
+    for (name, dir) in &cwd {
+        f.svc
+            .remember(alice_core::api::RememberRequest {
+                content: format!("a note in {name}"),
+                cwd: Some(dir.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let merged = f
+        .svc
+        .merge_projects(alice_core::api::ProjectMergeRequest {
+            from: "strict".into(),
+            into: "loose".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(merged.merged, "{merged:?}");
+
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert_eq!(
+        r.blocked_by_redaction.get("custom:ticket"),
+        Some(&2),
+        "{:?}",
+        r.blocked_by_redaction
+    );
+    assert_eq!(
+        r.blocked_by_redaction.get("github_token"),
+        Some(&1),
+        "{:?}",
+        r.blocked_by_redaction
+    );
+    for needle in ["TCK-12345", "TCK-99999", "aBcDeFgHiJkLmNoPqRsTuVwXyZ"] {
+        assert_eq!(
+            f.tables_holding(needle).await,
+            Vec::<String>::new(),
+            "{needle}"
+        );
+    }
+    // A drawer the rules allow is imported, into the survivor.
+    let project: String = f
+        .db()
+        .query_row(
+            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.body = 'a plain decision about the cache'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(project, "loose");
+    assert!(
+        !f.tables_holding("TCK-55555").await.is_empty(),
+        "a project without the pattern keeps the text"
+    );
+}
+
 /// After `alice projects merge`, an import run again names the old project (a wing) and the rows
 /// land in the project it was merged into: no twin project, no rows under the old name. Drawers
 /// that were imported before are not imported again.
@@ -2755,4 +2860,212 @@ async fn a_secret_cut_by_a_fragment_boundary_never_reaches_the_database() {
     for needle in [token, &token[..14]] {
         assert_eq!(f.tables_holding(needle).await, Vec::<String>::new());
     }
+}
+
+/// One fragment of a drawer MemPalace cut that carries a source file outside the curated rooms:
+/// a raw file chunk.
+fn raw_file_part(base: &str, n: i64, text: &str) -> DrawerSpec {
+    DrawerSpec {
+        id: format!("{base}_chunk_{n:06}"),
+        text: text.into(),
+        meta: DrawerMeta {
+            wing: "devspace".into(),
+            room: "notes".into(),
+            source_file: s("/h/Code/devspace/NOTES.md"),
+            added_by: s("claude"),
+            chunk_index: Some(n),
+            filed_at: s("2026-04-16T11:00:00"),
+            ..Default::default()
+        },
+    }
+}
+
+/// The raw-file variant: the fragments are joined before redaction, so the secret is whole when
+/// the detectors see it, and the drawer is one chunk that every fragment id leads to; a repeat of
+/// the whole drawer in the same file collapses onto it. A rerun plans nothing, and a home that
+/// holds only some of the fragment ids keeps what it has.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secret_cut_by_a_fragment_boundary_of_a_raw_file_drawer_never_reaches_the_database() {
+    let token = concat!("gh", "p_", "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let (a, b) = token.split_at(2);
+    let base = "drawer_devspace_notes_0a1b2c";
+    let repeat = "drawer_devspace_notes_9f8e7d";
+    let specs = vec![
+        raw_file_part(base, 0, &format!("deploy with {a}")),
+        raw_file_part(base, 1, &format!("{b} then restart")),
+        raw_file_part(repeat, 0, &format!("deploy with {a}")),
+        raw_file_part(repeat, 1, &format!("{b} then restart")),
+    ];
+    let f = Flow::with_hook(&specs).await;
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert_eq!((r.fragments_joined, r.fragment_groups), (1, 1));
+    assert_eq!(r.duplicates.raw, 2, "both fragments of the repeat");
+    assert_eq!(r.tiers.raw_file_chunks, 4, "four drawers of the palace");
+    assert!(r.redacted_fields >= 1, "{}", r.redacted_fields);
+    for needle in [token, &token[4..]] {
+        assert_eq!(f.tables_holding(needle).await, Vec::<String>::new());
+    }
+    assert_eq!(f.count("chunks").await, 1);
+    let text: String = f
+        .db()
+        .query_row(
+            "SELECT text FROM chunks WHERE legacy_id = ?1",
+            [format!("{base}_chunk_000000")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(text, "deploy with [REDACTED:github_token] then restart");
+    let head = f.legacy_target(&format!("{base}_chunk_000000")).await;
+    assert!(head.as_deref().is_some_and(|t| t.starts_with("chunk:")));
+    for id in [
+        format!("{base}_chunk_000001"),
+        format!("{repeat}_chunk_000000"),
+        format!("{repeat}_chunk_000001"),
+    ] {
+        assert_eq!(f.legacy_target(&id).await, head, "{id}");
+    }
+
+    let planned = f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed);
+    let again = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(
+        f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed),
+        planned
+    );
+    assert_eq!(again.already_imported, 4);
+    assert_eq!(again.drawers_seen, again.drawers_accounted);
+
+    // An earlier version stored the fragments one by one: a home missing one of the ids keeps
+    // what it has and is told so.
+    f.db()
+        .execute(
+            "DELETE FROM legacy_ids WHERE legacy_id = ?1",
+            [format!("{base}_chunk_000001")],
+        )
+        .unwrap();
+    let partial = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(f.count("chunks").await, 1, "no second copy of its text");
+    assert_eq!(partial.already_imported, 4);
+    assert_eq!(partial.drawers_seen, partial.drawers_accounted);
+    assert!(
+        partial
+            .warnings
+            .iter()
+            .any(|w| w.contains("only partly in Alice")),
+        "{:?}",
+        partial.warnings
+    );
+}
+
+/// MemPalace answers a long entry with an id it stores no drawer under (the fragments are
+/// `<id>_chunk_NNNNNN`): the import files that id with the drawer, so it resolves and a fact
+/// naming it keeps its source memory, without counting it as a drawer. A home imported before
+/// gets it filed by the next run, which plans nothing and calls no drawer partial.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_id_mempalace_answered_for_a_cut_drawer_leads_to_it_and_an_older_home_gets_it_next_run()
+{
+    let hook = Arc::new(ImportHook::default());
+    let h = hook.clone();
+    let fact = TripleSpec {
+        id: "t_frag".into(),
+        subject: "alice".into(),
+        predicate: "wrote_about".into(),
+        object: "scheduler".into(),
+        valid_from: s("2026-04-16"),
+        source_drawer_id: s(FRAGMENTED),
+        ..Default::default()
+    };
+    let mut f = Flow::with_graph(&fragmented_specs(), &[fact], move |_| ServiceOptions {
+        import_hook: Some(h),
+        ..Default::default()
+    })
+    .await;
+    f.hook = Some(hook);
+    f.run_import(f.request().dry_run(true)).await;
+    assert_eq!(
+        f.legacy_target(FRAGMENTED).await,
+        None,
+        "a dry run files nothing"
+    );
+
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert_eq!(
+        (r.fragments_joined, r.fragment_groups),
+        (2, 1),
+        "the id is no drawer"
+    );
+    let head = f.legacy_target(&format!("{FRAGMENTED}_chunk_000000")).await;
+    assert!(head.as_deref().is_some_and(|t| t.starts_with("memory:")));
+    assert_eq!(f.legacy_target(FRAGMENTED).await, head);
+    let source: Option<String> = f
+        .db()
+        .query_row(
+            "SELECT source_memory_id FROM relations WHERE predicate LIKE '%wrote%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        source.map(|m| format!("memory:{m}")),
+        head,
+        "the fact keeps its source memory"
+    );
+
+    // A home imported before the id was filed.
+    f.db()
+        .execute("DELETE FROM legacy_ids WHERE legacy_id = ?1", [FRAGMENTED])
+        .unwrap();
+    let planned = f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed);
+    let again = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(
+        f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed),
+        planned
+    );
+    assert_eq!(f.legacy_target(FRAGMENTED).await, head);
+    assert_eq!(again.already_imported, 5);
+    assert_eq!(again.drawers_seen, again.drawers_accounted);
+    assert!(again.errors.is_empty(), "{:?}", again.errors);
+    assert!(
+        again.warnings.iter().all(|w| !w.contains("only partly")),
+        "{:?}",
+        again.warnings
+    );
+    assert_eq!(memory_count(&f).await, 3);
+}
+
+/// An import that ends with errors does not turn the compatibility layer on (its tools would
+/// answer from a partial store) and says so; a clean rerun then does.
+#[tokio::test(flavor = "multi_thread")]
+async fn compat_stays_off_after_an_import_that_ended_with_errors() {
+    let hook = Arc::new(ImportHook::default());
+    hook.refuse.lock().unwrap().extend(["k_dec".to_string()]);
+    let h = hook.clone();
+    let f = Flow::with_options(&fixture_specs(), move |_| ServiceOptions {
+        import_hook: Some(h),
+        ..Default::default()
+    })
+    .await;
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(!r.errors.is_empty());
+    assert!(!r.compat_enabled);
+    assert!(!f.setting_bool("compat.mempalace").await);
+    assert!(f.events_of("import.compat_enabled").await.is_empty());
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("compat.mempalace") && w.contains("errors")),
+        "{:?}",
+        r.warnings
+    );
+
+    hook.refuse.lock().unwrap().clear();
+    let clean = f.run_import(f.request()).await.report.unwrap();
+    assert!(clean.errors.is_empty(), "{:?}", clean.errors);
+    assert!(clean.compat_enabled);
+    assert!(f.setting_bool("compat.mempalace").await);
 }

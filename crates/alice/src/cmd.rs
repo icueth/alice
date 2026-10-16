@@ -499,7 +499,7 @@ fn user_home() -> Option<std::path::PathBuf> {
 const IMPORT_POLL: Duration = Duration::from_millis(500);
 
 async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) -> Result<()> {
-    use alice_core::import::{ImportRequest, ImportState};
+    use alice_core::import::ImportRequest;
     use std::io::IsTerminal;
     // Everything the CLI can refuse by itself happens before a daemon is started.
     let cwd = std::env::current_dir().context("cannot read the working folder")?;
@@ -544,7 +544,7 @@ async fn import_mempalace(home: &AliceHome, a: ImportMempalaceArgs, json: bool) 
         }
     };
     loop {
-        if status.state != ImportState::Running {
+        if !status.state.is_active() {
             break;
         }
         if tty {
@@ -603,7 +603,10 @@ fn import_verdict(status: &alice_core::import::ImportStatus) -> Result<()> {
         ImportState::Idle => {
             bail!("no import is running and none has run since the daemon started")
         }
-        ImportState::Running => bail!("the import is still running"),
+        ImportState::Running
+        | ImportState::Receiving
+        | ImportState::Unpacking
+        | ImportState::Importing => bail!("the import is still running"),
     }
 }
 
@@ -614,7 +617,10 @@ async fn import_status(home: &AliceHome, json: bool) -> Result<()> {
         (Some(r), ImportState::Done) if !json => out(&r.render_text()),
         _ => print(json, &s, || match s.state {
             ImportState::Idle => "No import has run since the daemon started.\n".into(),
-            ImportState::Running => format!(
+            ImportState::Running
+            | ImportState::Receiving
+            | ImportState::Unpacking
+            | ImportState::Importing => format!(
                 "Import running: {}, {} of {} drawers.\n",
                 s.phase, s.done, s.total
             ),
@@ -1008,6 +1014,30 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         }
         Command::Update(a) => {
             let moved = matches!(a.action, ActionArg::Move);
+            // A flag the action does not use would be dropped without a word: refuse it here,
+            // before any daemon is asked (the daemon refuses the same for other clients).
+            if moved {
+                let extra: Vec<&str> = [
+                    ("--title", a.title.is_some()),
+                    ("--body", a.body.is_some()),
+                    ("--kind", a.kind.is_some()),
+                    ("--importance", a.importance.is_some()),
+                    ("--by", a.by.is_some()),
+                ]
+                .into_iter()
+                .filter_map(|(flag, given)| given.then_some(flag))
+                .collect();
+                if !extra.is_empty() {
+                    bail!(
+                        "--action move takes only --project ({} given too); move the memory first, then change it with --action edit",
+                        extra.join(", ")
+                    );
+                }
+            } else if a.project.is_some() {
+                bail!(
+                    "--project is only for --action move; to move the memory run `alice update <id> --action move --project <slug>`"
+                );
+            }
             let action = match a.action {
                 ActionArg::Edit => UpdateAction::Edit,
                 ActionArg::Supersede => UpdateAction::Supersede,
@@ -1025,6 +1055,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
                 importance: a.importance,
                 superseded_by: a.by,
                 project: a.project,
+                screened: None,
             };
             let r = client(&home)
                 .await?

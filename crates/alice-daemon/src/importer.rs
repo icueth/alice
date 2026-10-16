@@ -246,7 +246,14 @@ pub fn preflight(
         }
     };
     detect_backend(&palace)?;
-    if settings.embedding.provider != EmbeddingProvider::Local && !req.allow_remote_embedding {
+    check_remote_embedding(settings, req.allow_remote_embedding)?;
+    Ok(palace)
+}
+
+/// An import queues every chunk for the embedding provider: a remote one is used only when the
+/// caller said so.
+pub fn check_remote_embedding(settings: &Settings, allow_remote: bool) -> Result<()> {
+    if settings.embedding.provider != EmbeddingProvider::Local && !allow_remote {
         let provider = serde_json::to_value(settings.embedding.provider)
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
@@ -255,22 +262,111 @@ pub fn preflight(
             "importing queues every chunk for {provider}, which would send the owner's history to it; pass --allow-remote-embedding if that is what you want"
         )));
     }
-    Ok(palace)
+    Ok(())
 }
 
 // ------------------------------------------------------------------------------------ redaction
 
-/// The detectors as a [`TextFilter`]: always on, `block` mode honoured, changes counted.
+/// The detectors as a [`TextFilter`]: always on, `block` mode honoured, changes counted. With
+/// [`with_project_rules`](Self::with_project_rules), a drawer bound for a project with rules of
+/// its own (its `.alice.toml`, rules a project merge carried into it) is screened with those.
 pub struct RedactFilter {
     redactor: Arc<Redactor>,
     redacted: AtomicU64,
+    projects: Option<ProjectRules>,
 }
+
+/// The rules of the projects drawers go to, looked up by slug as the store resolves it (a slug
+/// or an alias: a project merged into another names the survivor).
+struct ProjectRules {
+    readers: Arc<ReaderPool>,
+    redactors: Arc<Redactors>,
+    /// Slug -> when it was looked up, and the project's redactor when its rules add to the
+    /// import's. Looked up again after [`PROJECT_RULES_FRESH`], like the settings.
+    cache: Mutex<HashMap<String, LookedUp>>,
+}
+
+/// When a project's rules were looked up, and its redactor (`None`: nothing beyond the import's).
+type LookedUp = (Instant, Option<Arc<Redactor>>);
+
+/// How long a project's rules are used before they are looked up again.
+const PROJECT_RULES_FRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl RedactFilter {
     pub fn new(redactor: Arc<Redactor>) -> Self {
         Self {
             redactor,
             redacted: AtomicU64::new(0),
+            projects: None,
+        }
+    }
+
+    /// This filter, screening each drawer with the rules of the project it goes to as well.
+    pub fn with_project_rules(
+        mut self,
+        readers: Arc<ReaderPool>,
+        redactors: Arc<Redactors>,
+    ) -> Self {
+        self.projects = Some(ProjectRules {
+            readers,
+            redactors,
+            cache: Mutex::new(HashMap::new()),
+        });
+        self
+    }
+
+    /// The redactor of the project `slug` names, when its rules add to the import's own; `None`
+    /// when they do not (or no project has the slug yet: a new one has no rules). A store that
+    /// cannot be read gives the closed rules: secrets are held back, never let through.
+    fn project_redactor(&self, slug: &str) -> Option<Arc<Redactor>> {
+        let p = self.projects.as_ref()?;
+        let key = slugify(slug);
+        if let Some((at, r)) = p.cache.lock().get(&key)
+            && at.elapsed() < PROJECT_RULES_FRESH
+        {
+            return r.clone();
+        }
+        let tree = match p
+            .readers
+            .with(|c| alice_core::store::projects::tree_of(c, &key))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "the project's rules could not be read; its drawers are screened closed");
+                Some(alice_core::settings::ProjectTree::unreadable(
+                    key.clone(),
+                    None,
+                ))
+            }
+        };
+        let r = tree.and_then(|t| {
+            let on = |mut privacy: alice_core::settings::PrivacySettings| {
+                privacy.redact = true;
+                privacy
+            };
+            (on(p.redactors.privacy_for(Some(&t))) != on(p.redactors.privacy_for(None)))
+                .then(|| p.redactors.for_root_always_on(Some(&t)))
+        });
+        p.cache.lock().insert(key, (Instant::now(), r.clone()));
+        r
+    }
+
+    /// `text` through `redactor`, counted like [`TextFilter::filter`].
+    fn screen(
+        &self,
+        redactor: &Redactor,
+        field: &str,
+        text: &str,
+    ) -> std::result::Result<String, Vec<String>> {
+        match redactor.check(field, text) {
+            Ok(out) => {
+                if out != text {
+                    self.redacted.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(out)
+            }
+            Err(AliceError::Refused { detectors, .. }) => Err(detectors),
+            Err(_) => Err(vec!["redaction".to_string()]),
         }
     }
 
@@ -342,16 +438,17 @@ fn store_slug(filter: &RedactFilter, slug: &str) -> String {
 
 impl TextFilter for RedactFilter {
     fn filter(&self, field: &str, text: &str) -> std::result::Result<String, Vec<String>> {
-        match self.redactor.check(field, text) {
-            Ok(out) => {
-                if out != text {
-                    self.redacted.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(out)
-            }
-            Err(AliceError::Refused { detectors, .. }) => Err(detectors),
-            Err(_) => Err(vec!["redaction".to_string()]),
-        }
+        self.screen(&self.redactor, field, text)
+    }
+
+    fn for_project(
+        &self,
+        slug: &str,
+        field: &str,
+        text: &str,
+    ) -> Option<std::result::Result<String, Vec<String>>> {
+        let r = self.project_redactor(slug)?;
+        Some(self.screen(&r, field, text))
     }
 }
 
@@ -574,6 +671,8 @@ enum Unit {
         dup: bool,
         /// The keys of the other fragments joined into this drawer.
         joined: Vec<String>,
+        /// The key of the id MemPalace answered for the drawer it cut (no drawer of the palace).
+        logical: Option<String>,
     },
     Chunks {
         slug: String,
@@ -581,18 +680,30 @@ enum Unit {
         chunks: Vec<ChunkInput>,
         /// The keys of the other fragments joined into this drawer.
         joined: Vec<String>,
+        /// As for `Memories`.
+        logical: Option<String>,
     },
 }
 
 impl Unit {
     fn weight(&self) -> (usize, usize) {
         match self {
-            Unit::Memories { items, joined, .. } => (
-                items.len() + joined.len(),
+            Unit::Memories {
+                items,
+                joined,
+                logical,
+                ..
+            } => (
+                items.len() + joined.len() + usize::from(logical.is_some()),
                 items.iter().map(|m| m.content.len() + 64).sum(),
             ),
-            Unit::Chunks { chunks, joined, .. } => (
-                chunks.len() + joined.len(),
+            Unit::Chunks {
+                chunks,
+                joined,
+                logical,
+                ..
+            } => (
+                chunks.len() + joined.len() + usize::from(logical.is_some()),
                 chunks.iter().map(|c| c.text.len() + 64).sum(),
             ),
         }
@@ -608,7 +719,11 @@ impl Unit {
 //   `import.mempalace.last` marker, so a rerun that finds nothing new writes one small batch.
 // - The dry run only dedupes knowledge drawers against each other: a memory already stored in
 //   Alice that an incoming drawer duplicates is reported by the real run as a warning.
-// - Collapsed raw drawers are recorded at the end of the raw phase (they point at their keeper).
+// - Collapsed raw drawers are recorded in the `collapsed` phase, after `graph` (they point at
+//   their keeper, which may sit on a later page than its repeat).
+// - A raw drawer MemPalace cut into fragments is planned like a knowledge one: at its first
+//   fragment, joined, redacted whole, then sized; its later fragments are skipped where the raw
+//   pass meets them (`Survey::raw_tails`).
 
 /// What the planning passes count.
 #[derive(Default)]
@@ -677,6 +792,10 @@ struct Ctx<'a> {
     sent_projects: HashSet<String>,
     /// (collapsed drawer key, keeper key), recorded in the `collapsed` phase.
     collapsed: Vec<(String, String)>,
+    /// (key of the id MemPalace answered for a drawer it cut, key of the drawer's first
+    /// fragment), filed after the `collapsed` phase where the first fragment's id is stored by
+    /// then: drawers an earlier run stored before such ids were filed, and collapsed ones.
+    pending_logical: Vec<(String, String)>,
     /// Batches the writer has taken (nothing was written while this is 0).
     submitted: u64,
     /// Tunnel links and review items wait for the closing batch.
@@ -711,6 +830,12 @@ impl Ctx<'_> {
             .map(|m| self.filter.legacy_key(&m.id))
             .collect();
         let extra = joined.len() as u64;
+        // The id MemPalace answered for a drawer it cut is filed with the drawer; it is no drawer
+        // of the palace, so it is never counted.
+        let logical = (members.len() > 1)
+            .then(|| self.survey.logical_ids.get(&d.id))
+            .flatten()
+            .map(|l| self.filter.legacy_key(l));
         match planned {
             Planned::Memories(parts) => {
                 let first = parts.first()?;
@@ -752,6 +877,7 @@ impl Ctx<'_> {
                     items,
                     dup: duplicate,
                     joined,
+                    logical,
                 })
             }
             Planned::Chunks(parts) => {
@@ -789,6 +915,7 @@ impl Ctx<'_> {
                     source,
                     chunks,
                     joined,
+                    logical,
                 })
             }
             Planned::Skipped { reason } => {
@@ -803,9 +930,18 @@ impl Ctx<'_> {
                 None
             }
             Planned::Collapsed { keeper } => {
-                self.tally.raw_collapsed += 1;
+                // A raw drawer of fragments that repeats an earlier one: each fragment id points
+                // where the keeper went.
+                self.tally.raw_collapsed += 1 + extra;
                 if !self.dry {
-                    self.collapsed.push((key, self.filter.legacy_key(&keeper)));
+                    let keeper = self.filter.legacy_key(&keeper);
+                    self.collapsed.push((key.clone(), keeper.clone()));
+                    self.collapsed
+                        .extend(joined.into_iter().map(|j| (j, keeper.clone())));
+                    // Filed once the drawer's own id points at the keeper.
+                    if let Some(l) = logical {
+                        self.pending_logical.push((l, key));
+                    }
                 }
                 None
             }
@@ -876,6 +1012,7 @@ impl Ctx<'_> {
                     slug,
                     items,
                     joined,
+                    logical,
                     ..
                 } => {
                     slugs.insert(slug.clone());
@@ -883,7 +1020,7 @@ impl Ctx<'_> {
                     if let Some(head) = head {
                         batch
                             .joined
-                            .extend(joined.into_iter().map(|f| (f, head.clone())));
+                            .extend(joined.into_iter().chain(logical).map(|f| (f, head.clone())));
                     }
                     batch
                         .memories
@@ -897,13 +1034,14 @@ impl Ctx<'_> {
                     source,
                     chunks,
                     joined,
+                    logical,
                 } => {
                     slugs.insert(slug.clone());
                     let head = chunks.first().and_then(|c| c.legacy_id.clone());
                     if let Some(head) = head {
                         batch
                             .joined
-                            .extend(joined.into_iter().map(|f| (f, head.clone())));
+                            .extend(joined.into_iter().chain(logical).map(|f| (f, head.clone())));
                     }
                     let k = (
                         slug.clone(),
@@ -1081,13 +1219,18 @@ impl Ctx<'_> {
             // Drawers stored before cost nothing more: no reading, no redaction, no planning.
             let wanted: Vec<(&String, Vec<String>)> =
                 group.iter().map(|id| (id, members_of(id))).collect();
+            // The ids MemPalace answered for drawers it cut are looked up too (never counted).
+            let filter = self.filter;
+            let logical_key =
+                |head: &String| survey.logical_ids.get(head).map(|l| filter.legacy_key(l));
             let keys: Vec<String> = wanted
                 .iter()
                 .flat_map(|(_, ms)| ms.iter().map(|m| self.filter.legacy_key(m)))
+                .chain(wanted.iter().filter_map(|(head, _)| logical_key(head)))
                 .collect();
             let stored = self.stored(&keys)?;
             let mut fresh: Vec<Vec<String>> = Vec::new();
-            for (_, ms) in wanted {
+            for (head, ms) in wanted {
                 let known = ms
                     .iter()
                     .filter(|m| stored.contains(&self.filter.legacy_key(m)))
@@ -1105,6 +1248,9 @@ impl Ctx<'_> {
                 }
                 if known < ms.len() {
                     self.tally.partial_groups += 1;
+                } else if let Some(l) = logical_key(head).filter(|l| !stored.contains(l)) {
+                    // Stored whole by a run from before such ids were filed: file it now.
+                    self.backfill_logical(l, self.filter.legacy_key(head));
                 }
             }
             let ids: Vec<String> = fresh.iter().flatten().cloned().collect();
@@ -1132,6 +1278,7 @@ impl Ctx<'_> {
     }
 
     fn raw_pass(&mut self, since: Option<&str>) -> Result<()> {
+        let survey = self.survey;
         let mut after: Option<String> = None;
         loop {
             check_stop(&self.env.stop)?;
@@ -1150,13 +1297,52 @@ impl Ctx<'_> {
             let stored = self.stored(&keys)?;
             let mut units: Vec<Unit> = Vec::new();
             for ((d, tier), key) in raw.iter().zip(&keys) {
-                if stored.contains(key) {
-                    self.tally.already += 1;
+                // A later fragment of a drawer MemPalace cut is handled with its first one.
+                if survey.raw_tails.contains(&d.id) {
+                    continue;
+                }
+                let already = |t: &mut Tally, n: u64| {
+                    t.already += n;
                     if *tier == Tier::RawSession {
-                        self.tally.already_session += 1;
+                        t.already_session += n;
                     } else {
-                        self.tally.already_file += 1;
+                        t.already_file += n;
                     }
+                };
+                if let Some(ids) = survey.fragments.get(&d.id) {
+                    // As for knowledge drawers: imported only when none of its ids is stored
+                    // (a home that holds some of them from a version that stored fragments one
+                    // by one keeps what it has).
+                    let fragment_keys: Vec<String> =
+                        ids.iter().map(|m| self.filter.legacy_key(m)).collect();
+                    let known = self.stored(&fragment_keys)?.len();
+                    if known > 0 {
+                        already(&mut self.tally, ids.len() as u64);
+                        if known < ids.len() {
+                            self.tally.partial_groups += 1;
+                        } else if let Some(l) = survey.logical_ids.get(&d.id) {
+                            let l = self.filter.legacy_key(l);
+                            if self.stored(std::slice::from_ref(&l))?.is_empty() {
+                                self.backfill_logical(l, key.clone());
+                            }
+                        }
+                        continue;
+                    }
+                    let mut by_id: HashMap<String, Drawer> = self
+                        .reader
+                        .get(&ids[1..])?
+                        .into_iter()
+                        .map(|m| (m.id.clone(), m))
+                        .collect();
+                    let mut members = vec![(*d).clone()];
+                    members.extend(ids[1..].iter().filter_map(|id| by_id.remove(id)));
+                    if let Some(unit) = self.take(&members) {
+                        units.push(unit);
+                    }
+                    continue;
+                }
+                if stored.contains(key) {
+                    already(&mut self.tally, 1);
                     continue;
                 }
                 if let Some(unit) = self.take(std::slice::from_ref(*d)) {
@@ -1171,6 +1357,37 @@ impl Ctx<'_> {
             self.finish_batch()?;
             self.done += raw.len() as u64;
             self.progress();
+        }
+        Ok(())
+    }
+
+    /// Files the id MemPalace answered for a drawer it cut against the drawer's first fragment
+    /// (`head`), after the `collapsed` phase. A dry run files nothing.
+    fn backfill_logical(&mut self, logical: String, head: String) {
+        if !self.dry {
+            self.pending_logical.push((logical, head));
+        }
+    }
+
+    /// After the `collapsed` phase: the ids MemPalace answered for drawers it cut that were not
+    /// filed with their drawer (it was stored by an earlier run, or it collapsed onto another),
+    /// each pointing where the drawer's first fragment went. One whose first fragment is not
+    /// stored (its keeper was held back) waits for the next run.
+    fn logical_pass(&mut self) -> Result<()> {
+        let pairs = std::mem::take(&mut self.pending_logical);
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let heads: Vec<String> = pairs.iter().map(|(_, h)| h.clone()).collect();
+        let stored = self.stored(&heads)?;
+        let ready: Vec<(String, String)> = pairs
+            .into_iter()
+            .filter(|(_, h)| stored.contains(h))
+            .collect();
+        for part in ready.chunks(COLLAPSED_PER_BATCH) {
+            let mut batch = self.batch();
+            batch.joined = part.to_vec();
+            self.submit(batch)?;
         }
         Ok(())
     }
@@ -1434,12 +1651,21 @@ impl Ctx<'_> {
                 }
             }
             self.tally.reviews_created += open;
-            // A link needs both ends among the memories this run would make or an earlier run made.
-            let known: HashSet<String> = self
-                .survey
+            // A link needs both ends among the memories this run would make or an earlier run made
+            // (fragments of knowledge drawers and the ids MemPalace answered for them included;
+            // checkpoint and raw drawers are chunks).
+            let survey = self.survey;
+            let known: HashSet<String> = survey
                 .knowledge_order
                 .iter()
-                .chain(self.survey.fragments.values().flatten())
+                .flat_map(|head| {
+                    survey
+                        .fragments
+                        .get(head)
+                        .map_or_else(|| std::slice::from_ref(head), Vec::as_slice)
+                        .iter()
+                        .chain(survey.logical_ids.get(head))
+                })
                 .map(|id| self.filter.legacy_key(id))
                 .collect();
             let ends: Vec<String> = links
@@ -1606,11 +1832,17 @@ enum Compat {
 }
 
 /// A real run that found `compat.mempalace` at its default turns it on (a value the owner wrote,
-/// even `false`, is left alone). Says what happened.
-fn enable_compat(env: &ImportEnv, job_id: &str) -> Compat {
+/// even `false`, is left alone), unless the run ended with errors (`clean` false): then it is
+/// left off, and the warning says so. Says what happened.
+fn enable_compat(env: &ImportEnv, job_id: &str, clean: bool) -> Compat {
     const KEY: &str = "compat.mempalace";
     if env.settings.resolved().sources.get(KEY) != Some(&Source::Default) {
         return Compat::Left;
+    }
+    if !clean {
+        return Compat::Warning(
+            "the MemPalace compatibility layer was left off because the import ended with errors (its tools would answer from a partial store); run the import again once they are fixed, or turn it on with `alice config set compat.mempalace true`".into(),
+        );
     }
     let mut change = serde_json::Map::new();
     change.insert(KEY.to_string(), serde_json::Value::Bool(true));
@@ -1643,7 +1875,8 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     let started_at = now_rfc3339();
     let settings = env.settings.get();
     let assume = local_offset();
-    let filter = RedactFilter::new(env.redactors.for_root_always_on(None));
+    let filter = RedactFilter::new(env.redactors.for_root_always_on(None))
+        .with_project_rules(env.readers.clone(), env.redactors.clone());
     let mut phases: Vec<PhaseTiming> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let lap = |phases: &mut Vec<PhaseTiming>, name: &str, t: Instant| {
@@ -1759,6 +1992,7 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
         aliases,
         sent_projects: HashSet::new(),
         collapsed: Vec::new(),
+        pending_logical: Vec::new(),
         submitted: 0,
         pending_links: Vec::new(),
         pending_reviews: Vec::new(),
@@ -1781,7 +2015,8 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     }
     if outcome.is_ok() {
         outcome = run_phase(&env.status, &mut phases, "collapsed", || {
-            ctx.collapsed_pass()
+            ctx.collapsed_pass()?;
+            ctx.logical_pass()
         });
     }
     if outcome.is_ok() {
@@ -1951,8 +2186,10 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     report.phases = phases;
     report.peak_rss_mb = peak_rss_mb();
     report.finished_at = Some(finished_at);
+    // Only a clean run turns the layer on: after errors its tools would answer from a partial
+    // store.
     if !req.dry_run {
-        match enable_compat(env, job_id) {
+        match enable_compat(env, job_id, report.errors.is_empty()) {
             Compat::Enabled => report.compat_enabled = true,
             Compat::Warning(w) => report.warnings.push(w),
             Compat::Left => {}
@@ -1978,6 +2215,11 @@ fn thread_main(env: ImportEnv, req: ImportRequest, palace: PathBuf, job_id: Stri
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(&env, &req, &palace, &job_id)
     }));
+    conclude(env, outcome);
+}
+
+/// Ends the status of a job as `Done` or `Failed`, after the activity guard is released.
+fn conclude(env: ImportEnv, outcome: std::thread::Result<Result<ImportReport>>) {
     let ImportEnv { status, guard, .. } = env;
     // The snapshot folder went with `run`'s frame; the guard goes now, before the status says
     // the job is over, so a caller that sees `done` also sees maintenance allowed again.
@@ -2006,6 +2248,65 @@ fn thread_main(env: ImportEnv, req: ImportRequest, palace: PathBuf, job_id: Stri
             );
         }
     }
+}
+
+/// What an upload job works on: the stored archive and the folder it is unpacked into.
+pub struct UploadJob {
+    pub archive: PathBuf,
+    pub archive_len: u64,
+    pub dir: PathBuf,
+    /// `import.max_upload_bytes` when the upload began.
+    pub cap: u64,
+}
+
+/// Starts the thread of an upload job. The status is already `Unpacking`; the thread unpacks,
+/// finds the palace, runs the same import the admin path runs, and in every case removes the
+/// archive and the unpacked folder before the status says the job is over.
+pub fn spawn_upload(
+    env: ImportEnv,
+    req: ImportRequest,
+    job: UploadJob,
+    job_id: String,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("alice-import-upload".into())
+        .spawn(move || upload_main(env, req, job, job_id))
+}
+
+fn upload_main(mut env: ImportEnv, mut req: ImportRequest, job: UploadJob, job_id: String) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        upload_run(&mut env, &mut req, &job, &job_id)
+    }));
+    let _ = std::fs::remove_file(&job.archive);
+    let _ = std::fs::remove_dir_all(&job.dir);
+    conclude(env, outcome);
+}
+
+fn upload_run(
+    env: &mut ImportEnv,
+    req: &mut ImportRequest,
+    job: &UploadJob,
+    job_id: &str,
+) -> Result<ImportReport> {
+    set_phase(&env.status, "unpacking");
+    crate::upload::unpack(&job.archive, &job.dir, job.archive_len, job.cap, &env.stop)?;
+    // The archive has done its work; free its space for the snapshot.
+    let _ = std::fs::remove_file(&job.archive);
+    check_stop(&env.stop)?;
+    let found = crate::upload::locate(&job.dir)?;
+    // The graph may lie outside the palace folder: the snapshot looks in the "MemPalace home".
+    if let Some(kg_dir) = found.kg_dir {
+        env.mempalace_home = Some(kg_dir);
+    }
+    req.palace = Some(found.palace.display().to_string());
+    {
+        let mut s = env.status.lock();
+        s.state = ImportState::Importing;
+        s.phase = "starting".to_string();
+        s.done = 0;
+        s.total = 0;
+    }
+    run(env, req, &found.palace, job_id)
 }
 
 #[cfg(test)]

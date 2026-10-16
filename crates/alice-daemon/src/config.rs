@@ -643,9 +643,10 @@ impl SettingsHandle {
     }
 
     /// The project file for `root`; on a server tenant a root that is not there fails closed,
-    /// because its rules are on a machine this server cannot see.
+    /// because its rules are on a machine this server cannot see. A tree without a root (rules
+    /// a project merge carried, kept in the store) reads as anywhere else.
     fn project_load(&self, tree: &ProjectTree, projects: &ProjectSettingsCache) -> ProjectLoad {
-        if self.tenant.is_some() && !tree.root.is_dir() {
+        if self.tenant.is_some() && tree.has_root() && !tree.root.is_dir() {
             return ProjectLoad {
                 settings: ProjectSettings::fail_closed(),
                 error: Some(SettingError {
@@ -695,6 +696,21 @@ impl SettingsHandle {
                     .privacy
             }
             None => global,
+        }
+    }
+
+    /// The project rules in force for `tree` (its `.alice.toml` as kept for the project, and the
+    /// rules merges carried into it); none for `None`. What a project merge carries, unless the
+    /// load says they are only the closed stand-in (an error) or not in force yet (a loosening
+    /// waiting for its polls).
+    pub fn project_rules(&self, tree: Option<&ProjectTree>) -> alice_core::settings::ProjectLoad {
+        match tree {
+            Some(t) => self.projects.get_tree(t),
+            None => alice_core::settings::ProjectLoad {
+                settings: Default::default(),
+                error: None,
+                loosening_pending: false,
+            },
         }
     }
 
@@ -1057,6 +1073,28 @@ mod tests {
         // never read fails closed for a local daemon too.
         let local = SettingsHandle::load_with_env(&h, Vec::new());
         assert!(!local.cloud_allowed("proj", Some(&gone)));
+        // Rules a project merge carried are in the store, not in a tree (M3's rules-only tree, no
+        // root): a tenant applies them as they are, neither failing them closed nor loosening them.
+        use alice_core::settings::{ProjectPrivacy, ProjectSettings};
+        let carried = ProjectTree::rules_only("path:merged", ProjectSettings::default());
+        assert!(s.cloud_allowed("merged", Some(&carried)));
+        assert!(!s.project_fail_closed(Some(&carried)));
+        let denied = ProjectTree::rules_only(
+            "path:denied",
+            ProjectSettings {
+                privacy: ProjectPrivacy {
+                    cloud_denied: true,
+                    ..Default::default()
+                },
+            },
+        );
+        assert!(!s.cloud_allowed("denied", Some(&denied)));
+        let unread = ProjectTree::unreadable("path:unread", None);
+        assert!(!s.cloud_allowed("unread", Some(&unread)));
+        assert_eq!(
+            s.project_privacy(Some(&unread)).redact_mode,
+            RedactMode::Block
+        );
     }
 
     #[test]

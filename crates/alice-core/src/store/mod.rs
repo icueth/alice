@@ -740,11 +740,12 @@ mod tests {
         assert_eq!(index, 1);
     }
 
-    /// A v5 database migrates to v6 after a backup: imported memories (`judge_state =
-    /// 'skipped'`) get `origin = 'import'`, every other one `agent`, and the capture tables and
-    /// their four indexes exist (SP2 spec §8.1).
+    /// A v6 database (main's `0006_project_rules` applied) migrates to v7 after a backup:
+    /// imported memories (`judge_state = 'skipped'`) get `origin = 'import'`, every other one
+    /// `agent`, the capture tables and their four indexes exist, and M3's project-rules objects
+    /// are untouched (SP2 spec §8.1). The files are applied by name, not by directory listing.
     #[test]
-    fn migration_0006_adds_capture_tables_and_backfills_import_origin() {
+    fn migration_0007_adds_capture_tables_and_backfills_import_origin() {
         let (d, path) = temp_db();
         {
             let mut conn = Connection::open(&path).unwrap();
@@ -756,10 +757,16 @@ mod tests {
                 include_str!("sql/0003_judge.sql"),
                 include_str!("sql/0004_import.sql"),
                 include_str!("sql/0005_project_merge.sql"),
+                include_str!("sql/0006_project_rules.sql"),
             ] {
                 tx.execute_batch(sql).unwrap();
             }
-            for v in 1..=5 {
+            tx.execute(
+                "INSERT INTO project_rules (project_id, merge_id, rules_json) VALUES ('P1', 'MERGE1', '{\"k\":1}')",
+                [],
+            )
+            .unwrap();
+            for v in 1..=6 {
                 tx.execute("INSERT INTO schema_migrations VALUES (?1, 'x')", [v])
                     .unwrap();
             }
@@ -795,6 +802,28 @@ mod tests {
         };
         assert_eq!(count("table", "'capture_state', 'capture_turns'"), 2);
         assert_eq!(
+            count("table", "'project_rules'"),
+            1,
+            "M3's table is untouched"
+        );
+        assert_eq!(count("index", "'project_rules_by_merge'"), 1);
+        let rules: String = conn
+            .query_row(
+                "SELECT rules_json FROM project_rules WHERE project_id = 'P1' AND merge_id = 'MERGE1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rules, "{\"k\":1}", "M3's rows are untouched");
+        let versions: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|v| v.unwrap())
+            .collect();
+        assert_eq!(versions, (1..=7).collect::<Vec<i64>>());
+        assert_eq!(
             count(
                 "index",
                 "'capture_state_distill', 'capture_state_session', 'capture_state_parent', 'sources_session'"
@@ -808,7 +837,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        assert!(name.starts_with("alice-pre-migration-v5-"), "{name}");
+        assert!(name.starts_with("alice-pre-migration-v6-"), "{name}");
     }
 
     #[test]

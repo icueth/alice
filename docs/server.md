@@ -58,7 +58,7 @@ A tenant cannot reach the admin's network. The service unit allows only the publ
 
 `alice-server` manages `/etc/caddy/Caddyfile` from one template. The first time it runs, it copies your existing Caddyfile to `/etc/caddy/Caddyfile.pre-alice` and never overwrites that copy. Compare the two files before the switch. After every change it runs `caddy validate`, then reloads Caddy. If validation fails, it undoes the change and exits with an error. The template also moves Caddy's admin API from `localhost:2019` to a Unix socket, so a tenant cannot reach it.
 
-The script takes a lock, so two runs cannot overlap, and it is safe to run twice: a repeated command leaves the same state and says so. `import` is the exception: it can run for hours, and two may run at once. While one runs, `upgrade`, `add --team`, and `remove` or `adopt` of that tenant refuse to start, because they would restart the daemon the import needs.
+The script takes a lock, so two runs cannot overlap, and it is safe to run twice: a repeated command leaves the same state and says so. `import` is the exception: it can run for hours, and two may run at once. While an import runs, the admin's or a person's own upload over HTTPS, `upgrade`, `add --team`, `add --tz`, and `remove` or `adopt` of that tenant refuse to start, because they would restart or stop the daemon the import runs in. They ask each daemon (`alice import status`), so an upload, which never takes the script's lock, holds them back too.
 
 ### Commands
 
@@ -142,6 +142,16 @@ The script moves the folder into the tenant's `import-inbox/` (owned by the tena
 - The tenant daemon accepts a palace only from inside its own `import-inbox/`.
 - Import palaces one at a time, and only with the person's consent. The raw palace exists on the server only while the job runs.
 
+#### Upload import (the admin's view)
+
+A person can import their own MemPalace with `upload.sh` (see "A person imports their own MemPalace" below); you do nothing per person.
+
+- **The route.** `POST /api/v1/import/upload` on the tenant's own daemon takes the gzip tar as the request body, behind the person's token. It streams the body to `import-inbox/upload-<id>.tar.gz` in the tenant's home (mode 0600), never holding it in memory, then unpacks, imports with the same code and redaction as `alice-server import`, and deletes the archive and the unpacked folder on every path. `GET /api/v1/import/status` shows the progress. `GET /api/v1/import/upload.sh` serves the script (public, static, no secret; Host and Origin checks still apply).
+- **Caddy limits.** `alice-server add` writes the tenant's route with `request_body max_size 4GiB` and read and write timeouts of 30 minutes for the upload path only; every other path keeps Caddy's defaults. Tenants added before this was introduced have the old route: `alice-server upgrade` rewrites every personal tenant's route and reloads Caddy once, so run an upgrade (not just a restart) after installing a new version. A tenant whose limit you want higher or lower sets `import.max_upload_bytes` (also `ALICE_IMPORT_MAX_UPLOAD_BYTES`) in its `config.toml`; keep Caddy's `max_size` at or above it.
+- **One import at a time** per tenant: a second upload (or an `alice-server import`) gets 409 until the running job ends.
+- **Disk guard.** An upload is refused (and a running one stopped) when the free space would fall below about three times the archive's size plus 2 GB, the same 2 GB reserve as `alice-server import`. The unpacked size is also limited to 12 times the archive and never more than the upload limit; an archive with links, devices, absolute or `..` paths, or more than 50,000 entries is refused whole.
+- **Cleanup.** Nothing of an upload stays after it ends. A daemon that is restarted removes any `import-inbox/upload-*` leftovers when it starts; folders you put there for `alice-server import` are never touched.
+
 #### adopt
 
 `alice-server adopt <name> <backup-file> [--cloud-denied <slug,slug...>]` makes a person's own Alice database, from `alice backup now` on their machine, the database of their tenant. Use it for someone who already runs Alice locally: their projects, cleanups and memories come along as they are, with every embedding already done. See [Moving your local Alice to the server](#moving-your-local-alice-to-the-server) for the person's side.
@@ -220,7 +230,7 @@ The disk is not grown for Alice, so the budget matters. Plan for these uses:
 | The self-test's model | about 136 MB in `/var/cache/alice-server/models` |
 | The previous version | `alice.prev` and `libonnxruntime.so.1.prev`, about 52 MB |
 | Scheduled backups | one copy of the database each; about 1-1.5 GB for a large tenant |
-| Backups per tenant | 2 daily, no weekly (`ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0`); a tenant cannot make manual backups |
+| Backups per tenant | 2 daily, no weekly (`ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0`); a tenant cannot make manual backups. They stay in the tenant's own `backups` folder: do not set `ALICE_BACKUP_DIR` in a tenant file (a directory outside the home fails that tenant's settings closed) |
 | `remove` archives | a gzip of the removed home without its model, in `/srv/alice/backups` |
 | Schema migrations | one extra copy of each database, kept 30 days |
 
@@ -390,9 +400,44 @@ If you already run Alice on your Mac, your admin can move your database to your 
 
 The server clears your machine's folder paths from the projects and transcripts, and redacts everything again with its rules. Your Jev key is set on the tenant separately.
 
-### Importing your MemPalace
+### A person imports their own MemPalace
 
-Give your palace folder to your admin. The admin runs `alice-server import` (see above), checks the report with you and deletes the server's copy. Secrets are redacted on import.
+You can upload your MemPalace from your own machine; your admin does not need your files. You need `curl`, `tar` and `gzip` (every Mac and Linux has them) and your token. `sqlite3` is recommended: with it the script takes a consistent copy of your databases while MemPalace is running. Without it, the script warns you and copies the files as they are, so MemPalace and its agents must be idle.
+
+1. Save your token where the script looks for it, readable only by you:
+
+   ```
+   mkdir -p ~/.config/alice
+   (umask 077; read -rs T && printf '%s\n' "$T" > ~/.config/alice/token)    # paste the token, press Enter
+   ```
+
+   The script refuses a token file that other people can read (`chmod 600 ~/.config/alice/token`) or that belongs to another user. The token goes to `curl` on its standard input; it is never put in a command line, a URL or the output.
+
+2. Download the script from your own tenant (it holds no secret and no address):
+
+   ```
+   curl -fsS https://alice.example/u/<name>/api/v1/import/upload.sh -o upload.sh
+   ```
+
+3. Run it with your tenant's address (the MCP URL without `/mcp`):
+
+   ```
+   sh upload.sh https://alice.example/u/<name>
+   ```
+
+It finds your palace itself (`palace_path` in `~/.mempalace/config.json`, else `~/.mempalace/palace`) and your knowledge graph (`~/.mempalace/knowledge_graph.sqlite3`). If yours are elsewhere, add `--palace <folder>` and `--kg <file>`.
+
+**What it does.** It copies a snapshot of the palace into a private temporary folder (mode 0700; symbolic links are skipped and nothing in your palace is changed), packs it into one `.tar.gz`, uploads it to your tenant, and waits while the server unpacks and imports it. It removes its temporary files when it ends, however it ends, including Ctrl-C. It needs about 1.2 times the palace's size free in `$TMPDIR` (default `/tmp`); set `TMPDIR` to a bigger disk if it says there is not enough.
+
+**How long it takes.** The upload depends on your connection. The import on the server can take a good while more for a big palace (minutes to hours; the progress lines show how far it is). Vector search for the imported text is filled in afterwards, in the background.
+
+**Seeing progress.** The script prints the server's state about every 10 seconds (receiving, unpacking, importing, and drawers done out of the total), and at the end a report in plain words: the drawers read, the memories and raw chunks added per tier, the memories per project, what was skipped and why, what was held back because it held a secret, and how many pieces of text still wait for their search vector. Its exit code is 0 only when the import finished. If your terminal closes during the import, the import goes on at the server; run the script again later and it tells you if one is still running, or ask your admin.
+
+**Limits.** The upload may be up to 4 GiB (the admin can change this), and what it unpacks to may not be more than 12 times its size or more than that limit. Only one import runs at a time for your tenant; a second attempt is refused until the first ends. Importing again is safe: drawers already imported are recognized and not added twice.
+
+**What is redacted.** The server redacts every text again with its own rules, exactly as `alice import mempalace` does: API keys, tokens, passwords and private keys are removed or, if your privacy mode blocks them, the drawer is held back. The report lists the held-back ones by kind of secret. The uploaded archive is deleted from the server as soon as it is unpacked, and the unpacked copy as soon as the import ends.
+
+If you would rather not run anything, you can still give your palace folder to your admin, who runs `alice-server import` (see above).
 
 ## Troubleshooting
 
@@ -414,7 +459,8 @@ Give your palace folder to your admin. The admin runs `alice-server import` (see
 | A tenant is not `active` in `list` | The daemon stopped | `journalctl -u alice@<name>`, then `systemctl restart alice@<name>` |
 | `alice-server upgrade` exits with tenant names | Those tenants did not restart | The previous binary was restored; read `journalctl -u alice@<name>` |
 | `… still down: <names> … cannot start on the old one` after an upgrade | The new binary migrated those databases, and the old one cannot read them | Fix the failing tenant (its journal), then run the upgrade again; or restore that tenant's pre-migration backup |
-| `an import is running for: <names>` | An import is still embedding | Wait until it ends, then run the command again |
+| `an import is running on: <names>` | An import (the admin's or a person's upload) is still reading its palace | Wait until `alice-server cli <name> import status` no longer says running, then run the command again |
+| `another alice-server command, or an import, is running` | The script's lock is held | Wait until that command or the admin's `import` ends, then run this again |
 | `the adoption failed … stays stopped` | The adopted database could not be swapped back | Run the `alice restore` command it names with `alice-server cli`, then `systemctl start alice@<name>` |
 | `alice-server: a secret is never passed on the command line` | You put a key after `set-secret` | Run `config set-secret jev_api_key` alone and paste the key at the prompt |
 | `unknown secret name; use one of: jev_api_key, embedding_api_key` | The secret's name is wrong | The Jev key is `jev_api_key` |

@@ -802,6 +802,7 @@ impl DaemonClient {
         Ok(crate::mcp::Switches {
             admin_tools: v["mcp.admin_tools"].as_bool() == Some(true),
             compat_mempalace: v["compat.mempalace"].as_bool() == Some(true),
+            unreachable: false,
         })
     }
     pub async fn shutdown(&self) -> Result<()> {

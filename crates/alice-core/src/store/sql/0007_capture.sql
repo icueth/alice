@@ -1,4 +1,4 @@
--- Alice schema v6: automatic capture of agent transcripts (SP2 spec §8.1).
+-- Alice schema v7: automatic capture of agent transcripts (SP2 spec §8.1).
 CREATE TABLE capture_state(
   source_id        TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
   agent            TEXT NOT NULL,

@@ -125,6 +125,13 @@ case "$*" in
     printf '{\n  "adopted_from": "%s",\n  "memories": 3,\n  "chunks": 2,\n  "paths_cleared": 3,\n  "redacted_memories": 2,\n  "saved_tenant_db_as": "alice-before-restore-20261016T070000Z.db"\n}\n' "${3:-}"
     ;;
   "restore "*) echo "restored" ;;
+  "--json import status")
+    # IMPORT_BUSY: the tenants whose daemon is importing (an admin import or an upload).
+    case " ${IMPORT_BUSY:-} " in
+      *" $(basename "$ALICE_HOME") "*) printf '{\n  "state": "importing",\n  "phase": "drawers"\n}\n' ;;
+      *) printf '{\n  "state": "idle",\n  "phase": ""\n}\n' ;;
+    esac
+    ;;
   "config set-secret jev_api_key")
     # As the daemon does: the value from stdin into the tenant's own secrets.toml, 0600.
     IFS= read -r v
@@ -231,6 +238,14 @@ add_creates_everything() {
   has "$s" '127.0.0.1:47801'
   has "$s" 'header_up Host {upstream_hostport}'
   has "$s" 'flush_interval -1'
+# Only the upload route takes a big body (the daemon's import.max_upload_bytes default, 4 GiB) and waits up to 30 minutes.
+has "$s" '@import path /api/v1/import/upload'
+has "$s" 'request_body @import {'
+has "$s" 'max_size 4GiB'
+has "$s" 'read_timeout 30m'
+has "$s" 'write_timeout 30m'
+[ "$(grep -c 'max_size' "$s")" = 1 ] || fail "only the import route has a body limit"
+[ "$(grep -c 'read_timeout' "$s")" = 1 ] || fail "only the import route has long timeouts"
   if grep -rqi fail2ban "$R/etc"; then fail "fail2ban under etc"; fi
   if grep -rq 'tok-' "$R/etc"; then fail "a token under etc"; fi
   pass
@@ -431,6 +446,15 @@ upgrade_installs_and_keeps_prev() {
   cmp "$R/new-alice" "$R/usr/local/bin/alice" || fail "new binary not installed"
   cmp "$T/alice.saved" "$R/usr/local/bin/alice.prev" || fail "alice.prev is not the old binary"
   has "$R/calls.log" 'systemctl restart alice@ann'
+  pass
+}
+
+upgrade_gives_an_old_route_the_upload_limits() {
+  printf 'handle_path /u/ann/* {\n\treverse_proxy 127.0.0.1:47801\n}\n' >"$R/etc/caddy/alice.d/ann.caddy"
+  run upgrade "$R/new-alice"
+  [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
+  has "$R/etc/caddy/alice.d/ann.caddy" 'max_size 4GiB'
+  has "$R/etc/caddy/alice.d/ann.caddy" 'write_timeout 30m'
   pass
 }
 
@@ -710,6 +734,27 @@ upgrade_names_what_it_could_not_put_back() {
   pass
 }
 
+restarts_wait_for_a_daemon_import() {
+  # An upload runs inside the daemon, outside the lock: every command that restarts or stops a daemon asks it first.
+  IMPORT_BUSY=ann run upgrade "$R/new-alice"
+  [ "$RC" != 0 ] || fail "an upgrade cut off ann's import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running on: ann' || fail "$OUT"
+  IMPORT_BUSY=ann run add ann --tz Europe/Berlin
+  [ "$RC" != 0 ] || fail "a time zone change cut off ann's import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running on: ann' || fail "$OUT"
+  IMPORT_BUSY=ann run remove ann --yes
+  [ "$RC" != 0 ] || fail "remove cut off ann's import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running on: ann' || fail "$OUT"
+  [ -d "$SRV/ann" ] || fail "ann was removed"
+  IMPORT_BUSY=ann adopt ann "$ADOPT_FILE"
+  [ "$RC" != 0 ] || fail "adopt cut off ann's import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running on: ann' || fail "$OUT"
+  # Another tenant's import does not hold up a command about this one; an idle daemon holds up nothing.
+  IMPORT_BUSY=zed run upgrade "$R/new-alice"
+  [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
+  pass
+}
+
 upgrade_is_also_the_first_install() {
   local rc out first_lib first_prev=no failed_rc left=no
   make_dist "$T/dist" "lib first"
@@ -850,7 +895,7 @@ upgrade_adds_the_time_zone_to_older_tenants() {
   has "$TENANTS/ann.env" 'ALICE_JUDGE_JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone'
   has "$TENANTS/ann.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
   has "$TENANTS/bob.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=0.5'
-  printf '%s\n' "$OUT" | grep -qF 'the Jev endpoint and budget pinned for: ann' || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -qF 'the Jev endpoint, model and budget pinned for: ann' || fail "$OUT"
   run add bob --tz Asia/Bangkok
   pass
 }
@@ -1215,13 +1260,14 @@ for CURRENT in \
   import_refuses_a_missing_palace import_refuses_an_unknown_tenant dry_run_import_keeps_the_source \
   import_refuses_a_tenant_home import_refuses_root_and_system_dirs import_refuses_a_non_palace \
   add_restores_the_caddyfile_when_validation_fails add_reloads_after_removing_the_snippet test_hooks_are_ignored_without_a_test_root cli_runs_as_the_tenant \
-  cli_refuses_a_secret_in_argv upgrade_rolls_back_on_a_failed_ping upgrade_installs_and_keeps_prev \
+  cli_refuses_a_secret_in_argv upgrade_rolls_back_on_a_failed_ping upgrade_installs_and_keeps_prev upgrade_gives_an_old_route_the_upload_limits \
   add_refuses_a_cpu_without_avx upgrade_refuses_a_cpu_without_avx upgrade_accepts_avx_without_avx2 \
   upgrade_refuses_a_binary_that_fails_its_self_test upgrade_installs_the_runtime_library_and_restores_it \
   upgrade_restores_the_library_when_the_binary_cannot_be_installed upgrade_names_what_it_could_not_put_back add_takes_a_time_zone \
   upgrade_adds_the_time_zone_to_older_tenants adopt_installs_and_reports adopt_refuses_and_leaves_the_tenant_as_it_was \
   adopt_refuses_bad_files_before_any_change adopt_rolls_back_when_the_tenant_does_not_come_back \
   adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back imports_and_other_commands_never_overlap \
+  restarts_wait_for_a_daemon_import \
   dry_run_import_checks_the_disk_first \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \

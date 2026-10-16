@@ -180,7 +180,9 @@ pub fn fts_merge(conn: &Connection, table: &str, pages: i64) -> Result<bool> {
 /// among them, the rest of that group too (a group may be larger than `limit`: it goes whole,
 /// never split across slices). Eligible: an ungrouped event, or one whose group has no member at
 /// or after `before_ts` (so the history never keeps half of a change; undo reverts a whole
-/// group). Returns the events deleted.
+/// group). The rows a project merge recorded for its undo (`project_merge_rows`) go when no
+/// `project.merge` event names their merge any more, and so do the carried rules of a project
+/// merged away that no such event names. Returns the events deleted.
 pub fn prune_events(conn: &Connection, before_ts: &str, limit: usize) -> Result<usize> {
     let picked: Vec<(i64, Option<String>)> = {
         let mut stmt = conn.prepare_cached(
@@ -206,6 +208,29 @@ pub fn prune_events(conn: &Connection, before_ts: &str, limit: usize) -> Result<
     for g in groups {
         deleted += conn.execute("DELETE FROM events WHERE group_id = ?1", [g])?;
     }
+    // The merge events are few (target type `project`, through its index); the rows are matched
+    // against them in one statement.
+    conn.execute(
+        "DELETE FROM project_merge_rows WHERE merge_id NOT IN (
+           SELECT json_extract(after_json, '$.merge_id') FROM events
+            WHERE target_type = 'project' AND action = 'project.merge'
+              AND json_valid(after_json)
+              AND json_extract(after_json, '$.merge_id') IS NOT NULL)",
+        [],
+    )?;
+    // The rules merges carried into a project that was merged away wait for the undo that
+    // brings it back; once no merge event names it, none can. (Carried rules of a project that
+    // exists are never pruned: they protect its rows.)
+    conn.execute(
+        "DELETE FROM project_rules
+          WHERE project_id NOT IN (SELECT id FROM projects)
+            AND project_id NOT IN (
+              SELECT json_extract(after_json, '$.from_id') FROM events
+               WHERE target_type = 'project' AND action = 'project.merge'
+                 AND json_valid(after_json)
+                 AND json_extract(after_json, '$.from_id') IS NOT NULL)",
+        [],
+    )?;
     Ok(deleted)
 }
 
@@ -523,6 +548,85 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(left, vec!["B1", "B2"]);
+    }
+
+    /// F-7: the rows a project merge recorded for its undo go with its event: once the event is
+    /// pruned they are orphans nothing can use. A live merge keeps its rows.
+    #[test]
+    fn pruning_a_merge_event_takes_the_rows_recorded_for_its_undo() {
+        let (_d, c, _p) = setup();
+        let merge = |id: &str, ts: &str, merge_id: &str| {
+            c.execute(
+                "INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id, before_json, after_json) VALUES (?1, ?2, 'h', 'user', 'project.merge', 'project', 'P', ?3, ?3)",
+                params![id, ts, format!("{{\"merge_id\":\"{merge_id}\"}}")],
+            )
+            .unwrap();
+        };
+        merge("OLD", "2020-01-01T00:00:00.000Z", "M1");
+        merge("NEW", "2026-06-01T00:00:00.000Z", "M2");
+        for (m, row) in [("M1", "a"), ("M1", "b"), ("M2", "c"), ("M3", "d")] {
+            c.execute(
+                "INSERT INTO project_merge_rows (merge_id, kind, row_id) VALUES (?1, 'memory', ?2)",
+                params![m, row],
+            )
+            .unwrap();
+        }
+        let n = prune_events(&c, "2025-01-01T00:00:00.000Z", 500).unwrap();
+        assert_eq!(n, 1, "events are what it counts");
+        let left: Vec<String> = c
+            .prepare("SELECT merge_id || ':' || row_id FROM project_merge_rows ORDER BY 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(left, vec!["M2:c"], "the live merge keeps its rows");
+    }
+
+    /// The rules a merge carried stay with the project that survived it, whatever is pruned
+    /// (they protect its rows; only undo takes them back). The carried rules of a project that
+    /// was merged away wait for the undo that brings it back, and go once its merge event is
+    /// pruned and no undo can.
+    #[test]
+    fn pruning_a_merge_event_keeps_carried_rules_and_drops_those_of_a_project_gone_for_good() {
+        let (_d, c, p) = setup();
+        let merge = |id: &str, ts: &str, from_id: &str| {
+            c.execute(
+                "INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id, before_json, after_json) VALUES (?1, ?2, 'h', 'user', 'project.merge', 'project', ?3, '{}', ?4)",
+                params![id, ts, from_id, format!("{{\"merge_id\":\"M-{id}\",\"from_id\":\"{from_id}\"}}")],
+            )
+            .unwrap();
+        };
+        merge("OLD", "2020-01-01T00:00:00.000Z", "GONE");
+        merge("NEW", "2026-06-01T00:00:00.000Z", "WAITING");
+        // A damaged merge event is skipped, not a reason to stop.
+        c.execute(
+            "INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id, after_json) VALUES ('BAD', '2026-06-01T00:00:00.000Z', 'h', 'user', 'project.merge', 'project', 'X', '{oops')",
+            [],
+        )
+        .unwrap();
+        for (project, merge_id) in [
+            (p.id.as_str(), "M-OLD"),
+            ("GONE", "M-EARLIER"),
+            ("WAITING", "M-EARLIER2"),
+        ] {
+            c.execute(
+                "INSERT INTO project_rules (project_id, merge_id, rules_json) VALUES (?1, ?2, '{}')",
+                params![project, merge_id],
+            )
+            .unwrap();
+        }
+        prune_events(&c, "2025-01-01T00:00:00.000Z", 500).unwrap();
+        let left: Vec<String> = c
+            .prepare("SELECT project_id || ':' || merge_id FROM project_rules ORDER BY 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let mut want = vec![format!("{}:M-OLD", p.id), "WAITING:M-EARLIER2".to_string()];
+        want.sort();
+        assert_eq!(left, want);
     }
 
     /// N-2: a wholly old group larger than the slice goes in one piece, never split.

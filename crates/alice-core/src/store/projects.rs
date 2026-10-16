@@ -4,7 +4,7 @@ use crate::error::{AliceError, Result};
 use crate::ids::{new_id, now_rfc3339};
 use crate::normalize::{sha256_hex, slugify};
 use crate::project::ProjectRef;
-use crate::settings::ProjectTree;
+use crate::settings::{ProjectSettings, ProjectTree};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Keys starting with this belong to projects created by an import before any checkout existed.
@@ -205,6 +205,11 @@ pub enum DetectedForRead {
 
 /// Resolve a detected project for a read, without creating anything. Uses the matching of
 /// [`upsert_project`]'s adoption, so a read and the first write agree on the project.
+///
+/// One known disagreement: when two placeholders match (only reachable through an alias made by
+/// hand, since a placeholder's slug is unique), the first write adopts the oldest of them while
+/// a read answers `Ambiguous` and guesses none. Left so on purpose: the read stays on the side
+/// of showing nothing rather than another project's memories.
 pub fn detected_for_read(conn: &Connection, p: &ProjectRef) -> Result<DetectedForRead> {
     if let Some(found) = find_by_key(conn, &p.key)? {
         return Ok(DetectedForRead::Stored(found));
@@ -439,42 +444,149 @@ pub fn root_of_memory(conn: &Connection, memory_id: &str) -> Result<Option<Strin
     Ok(tree_of_memory(conn, memory_id)?.map(|t| t.root.to_string_lossy().into_owned()))
 }
 
-fn tree_row(key: String, root: Option<String>) -> Option<ProjectTree> {
-    root.map(|r| ProjectTree::new(key, r))
+/// The privacy rules `alice projects merge` carried into the project `project_id` (every merge
+/// into it that is not undone; see `project_merge`). `None`: none. A row that does not parse
+/// whole (a later build's extra field, damage) keeps the custom patterns that still read, with
+/// secrets blocked and no cloud ([`ProjectSettings::salvage_json`]): a rule that cannot be read
+/// must not loosen anything. That is logged once per row, never with an expression.
+pub fn carried_rules(conn: &Connection, project_id: &str) -> Result<Option<ProjectSettings>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT merge_id, rules_json FROM project_rules WHERE project_id = ?1 ORDER BY merge_id",
+    )?;
+    let rows = stmt
+        .query_map([project_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+    Ok(rows
+        .iter()
+        .map(|(merge_id, j)| {
+            serde_json::from_str::<ProjectSettings>(j).unwrap_or_else(|_| {
+                note_unreadable_rules(project_id, merge_id);
+                ProjectSettings::salvage_json(j)
+            })
+        })
+        .reduce(|a, b| a.stricter(&b)))
+}
+
+/// Logs that the rules merge `merge_id` carried into `project_id` do not read whole, once per
+/// row in this process (they are read on every write to the project); `true` when it did. Ids
+/// only: the row may hold an expression, and people write known secrets as patterns.
+pub(crate) fn note_unreadable_rules(project_id: &str, merge_id: &str) -> bool {
+    static SEEN: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+    let first = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .insert((project_id.to_string(), merge_id.to_string()));
+    if first {
+        tracing::warn!(
+            project_id,
+            merge_id,
+            "the privacy rules a project merge carried do not read whole; the custom patterns that read are kept, and the project blocks secrets and stays away from cloud providers"
+        );
+    }
+    first
+}
+
+/// The tree of a stored project: its root (if it has one) and the rules merges carried into it.
+/// `None` for a project with neither (only the global rules apply to it).
+fn tree_row(
+    conn: &Connection,
+    id: &str,
+    key: String,
+    root: Option<String>,
+) -> Result<Option<ProjectTree>> {
+    let carried = carried_rules(conn, id)?;
+    Ok(match (root, carried) {
+        (Some(r), carried) => Some(ProjectTree::new(key, r).with_carried(carried)),
+        (None, Some(c)) => Some(ProjectTree::rules_only(key, c)),
+        (None, None) => None,
+    })
 }
 
 /// The working tree a project (an id, a slug or an alias) was last detected in, keyed by the
-/// project: its privacy rules are kept per project, whatever tree is current.
+/// project: its privacy rules are kept per project, whatever tree is current. It carries the
+/// rules project merges carried into the project, so a project with such rules and no tree
+/// has a tree too (with no root).
 pub fn tree_of(conn: &Connection, project_id_or_slug: &str) -> Result<Option<ProjectTree>> {
-    let by_id = |id: &str| -> Result<Option<Option<ProjectTree>>> {
+    let row = |id: &str| -> Result<Option<(String, String, Option<String>)>> {
         Ok(conn
             .query_row(
-                "SELECT key, root_path FROM projects WHERE id = ?1",
+                "SELECT id, key, root_path FROM projects WHERE id = ?1",
                 [id],
-                |r| Ok(tree_row(r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?)
     };
-    if let Some(tree) = by_id(project_id_or_slug)? {
-        return Ok(tree);
-    }
-    let Some(p) = resolve_slug(conn, project_id_or_slug)? else {
-        return Ok(None);
+    let found = match row(project_id_or_slug)? {
+        Some(f) => Some(f),
+        None => match resolve_slug(conn, project_id_or_slug)? {
+            Some(p) => row(&p.id)?,
+            None => None,
+        },
     };
-    Ok(by_id(&p.id)?.flatten())
+    match found {
+        Some((id, key, root)) => tree_row(conn, &id, key, root),
+        None => Ok(None),
+    }
 }
 
 /// [`tree_of`] the project a memory (named by its id or legacy id) belongs to.
 pub fn tree_of_memory(conn: &Connection, memory_id: &str) -> Result<Option<ProjectTree>> {
-    Ok(conn
+    let found: Option<(String, String, Option<String>)> = conn
         .query_row(
-            "SELECT p.key, p.root_path FROM memories m JOIN projects p ON p.id = m.project_id
+            "SELECT p.id, p.key, p.root_path FROM memories m JOIN projects p ON p.id = m.project_id
              WHERE m.id = ?1 OR m.legacy_id = ?1 ORDER BY m.seq LIMIT 1",
             [memory_id],
-            |r| Ok(tree_row(r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
-        .optional()?
-        .flatten())
+        .optional()?;
+    match found {
+        Some((id, key, root)) => tree_row(conn, &id, key, root),
+        None => Ok(None),
+    }
+}
+
+/// The tree whose rules screen a write from the checkout `p` was detected in: the checkout's own
+/// tree, with the rules carried into the stored project the write lands in (the one
+/// [`detected_for_read`] finds, as the first write would). When that project is another one (the
+/// checkout's project, or the import placeholder it adopts, was merged into it), its own tree
+/// applies too, so the checkout of a merged project never writes into the survivor under looser
+/// rules than the survivor's. `None`: no tree and no carried rules (the global rules apply).
+pub fn tree_of_detected(conn: &Connection, p: &ProjectRef) -> Result<Option<ProjectTree>> {
+    let stored = match detected_for_read(conn, p)? {
+        DetectedForRead::Stored(s) | DetectedForRead::Placeholder(s) => Some(s),
+        DetectedForRead::Ambiguous(_) | DetectedForRead::Unstored => None,
+    };
+    let Some(stored) = stored else {
+        return Ok(p.tree());
+    };
+    let own: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT key, root_path FROM projects WHERE id = ?1",
+            [&stored.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((key, root)) = own else {
+        return Ok(p.tree());
+    };
+    let carried = carried_rules(conn, &stored.id)?;
+    // The stored project's own tree, when it is not this checkout's project: its file's rules
+    // (and only those: the carried rules ride on this tree already).
+    let also = (key != p.key)
+        .then(|| root.map(|r| ProjectTree::new(key.clone(), r)))
+        .flatten();
+    Ok(match p.tree() {
+        Some(t) => Some(t.with_carried(carried).with_also(also)),
+        None => match (carried, also) {
+            (Some(c), also) => Some(ProjectTree::rules_only(key, c).with_also(also)),
+            (None, Some(a)) => Some(a),
+            (None, None) => None,
+        },
+    })
 }
 
 pub fn list_projects(conn: &Connection) -> Result<Vec<ResolvedProject>> {
