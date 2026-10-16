@@ -561,12 +561,18 @@ mod tests {
             name
         };
         // The three shapes of a qualified name, and the one already in the Claude form.
-        assert_eq!(call(Some("mcp__alice__"), "remember"), "mcp__alice__remember");
+        assert_eq!(
+            call(Some("mcp__alice__"), "remember"),
+            "mcp__alice__remember"
+        );
         assert_eq!(call(Some("mcp__alice"), "remember"), "mcp__alice__remember");
         assert_eq!(call(Some("alice"), "remember"), "mcp__alice__remember");
         assert_eq!(call(None, "alice__remember"), "mcp__alice__remember");
         assert_eq!(call(None, "mcp__alice__remember"), "mcp__alice__remember");
-        assert_eq!(call(Some("alice__"), "mcp__alice__remember"), "mcp__alice__remember");
+        assert_eq!(
+            call(Some("alice__"), "mcp__alice__remember"),
+            "mcp__alice__remember"
+        );
         // Another server's tool keeps its server, so it is not taken for an Alice tool.
         assert_eq!(call(Some("github"), "context"), "mcp__github__context");
         // A bare name stays bare.

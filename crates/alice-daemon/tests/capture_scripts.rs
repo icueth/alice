@@ -1123,7 +1123,7 @@ async fn status_reports_the_codex_hooks() {
     assert!(out.contains("/hooks"), "the trust reminder: {out}");
 
     let mut text = read(&hooks);
-    text.push_str("\n");
+    text.push('\n');
     std::fs::write(&hooks, &text).unwrap();
     let out = status(&env);
     assert!(out.contains("codex hooks: in"), "{out}");
