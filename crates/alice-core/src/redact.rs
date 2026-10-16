@@ -125,13 +125,26 @@ fn attribute_access(v: &str) -> bool {
         && !(parts.len() >= 3 && parts.iter().all(|p| *p == parts[0]))
 }
 
-/// A value that is code and not a secret: a call or an index, a dotted attribute access, or a
-/// call to an accessor by name. A plain `snake_case` word is not evidence of code: passphrases
-/// look like that, so redaction errs toward redacting it.
+/// A value that points at a secret kept elsewhere rather than being one, judged on the whole
+/// value: a variable (`$NAME`, `${NAME}`, a shell substitution `$(…)`), a placeholder
+/// (`<name>`, `{name}`, `{{ … }}`), or code that calls, indexes or names a generic type
+/// (`get(…)`, `env[…]`, `Option<…>`). A `$`, a bracket or `<>` inside a value does not make it
+/// one: generated passwords hold them (`Pa$$w0rd`, `Tr0ub4dor&3(x)`).
+fn reference(v: &str) -> bool {
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"^(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(.*|<[^<>]*>?|\{[A-Za-z0-9_.]*\}|\{\{.*|[A-Za-z0-9_.:]+[(\[<].*)$",
+        )
+        .expect("built-in pattern")
+    });
+    RE.is_match(v)
+}
+
+/// A value that is code and not a secret: a reference (see [`reference`]), a dotted attribute
+/// access, or a call to an accessor by name. A plain `snake_case` word is not evidence of code:
+/// passphrases look like that, so redaction errs toward redacting it.
 fn code_like(v: &str) -> bool {
-    v.contains(['(', '['])
-        || attribute_access(v)
-        || ACCESSOR_PREFIXES.iter().any(|a| v.starts_with(a))
+    reference(v) || attribute_access(v) || ACCESSOR_PREFIXES.iter().any(|a| v.starts_with(a))
 }
 
 /// A path segment that reads as a word: path characters only, and not base64-shaped. CamelCase
@@ -170,20 +183,19 @@ const PATH_ENTROPY: f64 = 4.5;
 /// Bits per character from which a long token-shaped value counts as random.
 const HIGH_ENTROPY: f64 = 3.5;
 
-/// A value after `password =` etc. that is a secret, not code or prose: no call, index,
-/// template or path; not an ENV_NAME; and either letters with digits or long and varied.
+/// A value after `password =` etc. that is a secret, not code or prose: not a reference, code
+/// or a path; not an ENV_NAME; and either letters with digits or long and varied.
 fn secret_value(v: &str) -> bool {
-    if v.starts_with("[REDACTED")
-        || v.contains(['(', ')', '[', ']', '{', '}', '<', '>', '$'])
-        || code_like(v)
-        || path_like(v)
-    {
+    if v.starts_with("[REDACTED") || code_like(v) || path_like(v) {
         return false;
     }
-    let env_name = v
+    // An ENV_NAME has no digit (`DATABASE_URL`), or words joined by `_` (`MY_VAR_2`); upper
+    // case with digits and no `_` is how many keys look (`7KQ2M9X4P8R3T6W1`).
+    let upper = v
         .chars()
         .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    if env_name {
+    let inner_underscore = v.trim_matches('_').contains('_');
+    if upper && (!v.chars().any(|c| c.is_ascii_digit()) || inner_underscore) {
         return false;
     }
     let letters = v.chars().any(|c| c.is_alphabetic());
@@ -197,7 +209,13 @@ fn secret_value(v: &str) -> bool {
 /// The value after a command-line flag such as `--password`: anything that is not another
 /// flag, a variable or code.
 fn flag_value(v: &str) -> bool {
-    !v.starts_with(['-', '$']) && !v.starts_with("[REDACTED") && !v.contains(['(', ')', '{', '}'])
+    !v.starts_with('-') && !v.starts_with("[REDACTED") && !reference(v)
+}
+
+/// Base64 lines, not a list of hex digests (a key's body is never hex only).
+fn not_hex_only(v: &str) -> bool {
+    v.chars()
+        .any(|c| !c.is_ascii_hexdigit() && !c.is_whitespace())
 }
 
 fn high_entropy(v: &str) -> bool {
@@ -217,6 +235,16 @@ fn builtin_detectors() -> Vec<Detector> {
             r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)",
             0,
             any,
+        ),
+        // The tail of a key whose `BEGIN` line is in an earlier piece (a chunk cut by size):
+        // the text starts with its base64 lines and ends the key.
+        d("pem_private_key", KEY_TAIL, 0, any),
+        // A key's body cut from both its lines: three or more base64 lines of a key's width.
+        d(
+            "base64_block",
+            r"(?m)(?:^[ \t]*[A-Za-z0-9+/]{60,76}={0,2}[ \t]*\r?(?:\n|\z)){3,}",
+            0,
+            not_hex_only,
         ),
         d(
             "jwt",
@@ -310,6 +338,30 @@ fn builtin_detectors() -> Vec<Detector> {
             high_entropy,
         ),
     ]
+}
+
+/// Base64 lines (and the headers of an encrypted key) at the very start of a text, then the
+/// `END` line of a private key.
+const KEY_TAIL: &str = r"\A\s*(?:(?:Proc-Type|DEK-Info):[^\n]*\n\s*)*(?:[A-Za-z0-9+/=]+[ \t]*\r?\n\s*)*[A-Za-z0-9+/=]*\s*-----END [A-Z ]*PRIVATE KEY-----";
+
+/// What a piece that continues a private key starts with: its base64 lines (and the headers of
+/// an encrypted key), through the key's `END` line when it is there.
+static KEY_CONTINUED: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"\A\s*(?:(?:Proc-Type|DEK-Info):[^\n]*(?:\n\s*|\z))*(?:[A-Za-z0-9+/=]+[ \t]*(?:\r?\n\s*|\z))*(?:-----END [A-Z ]*PRIVATE KEY-----)?")
+        .expect("built-in pattern")
+});
+
+static KEY_LINE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"-----(BEGIN|END) [A-Z ]*PRIVATE KEY-----").expect("built-in pattern")
+});
+
+/// Whether `text` ends inside a private key block: its last `BEGIN … PRIVATE KEY` line has no
+/// `END` line after it.
+pub fn ends_inside_key(text: &str) -> bool {
+    KEY_LINE
+        .captures_iter(text)
+        .last()
+        .is_some_and(|c| &c[1] == "BEGIN")
 }
 
 impl Redactor {
@@ -424,6 +476,62 @@ impl Redactor {
             text: out.into_owned(),
             found,
         }
+    }
+
+    /// [`apply`](Self::apply) for the next of consecutive pieces of one text (the chunks of one
+    /// ingest, in order). `open` says whether the piece before ended inside a private key block
+    /// (see [`ends_inside_key`]); the base64 lines this piece then starts with, through the
+    /// key's `END` line, are the rest of that key and are redacted too. `open` is updated for
+    /// the piece after this one.
+    ///
+    /// ```
+    /// use alice_core::redact::Redactor;
+    ///
+    /// let r = Redactor::builtin();
+    /// let mut open = false;
+    /// let first = r.apply_piece(concat!("key:\n-----BEGIN RSA PRIVATE ", "KEY-----\nMIIE"), &mut open);
+    /// assert!(open && !first.text.contains("MIIE"));
+    /// let second = r.apply_piece("pAIBAAKCAQEA1234\nzzzz\n-----END RSA PRIVATE KEY-----\nafter", &mut open);
+    /// assert_eq!(second.text, "[REDACTED:pem_private_key]\nafter");
+    /// assert!(!open);
+    /// ```
+    pub fn apply_piece(&self, text: &str, open: &mut bool) -> Redaction {
+        if !self.enabled {
+            *open = ends_inside_key(text);
+            return self.apply(text);
+        }
+        let head = if *open {
+            KEY_CONTINUED.find(text).map_or(0, |m| m.end())
+        } else {
+            0
+        };
+        let (key, rest) = text.split_at(head);
+        let whole = head == text.len();
+        *open = (whole && !key.contains("-----END")) || ends_inside_key(rest);
+        let mut out = self.apply(rest);
+        if !key.trim().is_empty() {
+            let name = "pem_private_key".to_string();
+            out.text = format!("[REDACTED:{name}]{}", out.text);
+            if !out.found.contains(&name) {
+                out.found.insert(0, name);
+            }
+        } else {
+            out.text = format!("{key}{}", out.text);
+        }
+        out
+    }
+
+    /// [`check`](Self::check) for the next of consecutive pieces of one text (see
+    /// [`apply_piece`](Self::apply_piece)).
+    pub fn check_piece(&self, field: &str, text: &str, open: &mut bool) -> Result<String> {
+        let r = self.apply_piece(text, open);
+        if self.blocks() && !r.found.is_empty() {
+            return Err(AliceError::Refused {
+                field: field.to_string(),
+                detectors: r.found,
+            });
+        }
+        Ok(r.text)
     }
 
     /// Every string inside `value` redacted (keys are left alone); the detectors that fired.
@@ -742,6 +850,33 @@ mod tests {
             "high_entropy",
             "whsec_9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a",
         ),
+        // Final review A-I2: `$`, brackets and upper-case keys are values too.
+        (
+            "DB_PASSWORD=Pa$$w0rd2024",
+            "password_assignment",
+            "Pa$$w0rd2024",
+        ),
+        (
+            "\"password\": \"Tr0ub4dor&3(x)\"",
+            "password_assignment",
+            "Tr0ub4dor&3(x)",
+        ),
+        (
+            "API_KEY=7KQ2M9X4P8R3T6W1",
+            "password_assignment",
+            "7KQ2M9X4P8R3T6W1",
+        ),
+        (
+            "password: HUNTER2HUNTER2",
+            "password_assignment",
+            "HUNTER2HUNTER2",
+        ),
+        (
+            "mysql --password 'Tr0ub4dor&3(x)'",
+            "password_assignment",
+            "Tr0ub4dor&3(x)",
+        ),
+        ("token = <x7Kq9>Zz!2", "password_assignment", "<x7Kq9>Zz!2"),
     ];
 
     /// Text that must come out unchanged (code and prose that only look like secrets).
@@ -769,7 +904,139 @@ mod tests {
         "secret = process.env.SECRET_KEY",
         "api_key = os.environ",
         "run --password-file ./secrets/pw --token-file ~/.t",
+        "password = $DB_PASSWORD",
+        "token: ${GITHUB_TOKEN}",
+        "API_KEY=$(vault_read api)",
+        "password = <your-password>",
+        "token: Option<Arc<str>>,",
+        "password = {password}",
+        "secret = data[\"secret\"]",
+        "password = MY_VAR_2",
+        "token = client.get_token(scope)",
+        "--password $PGPASSWORD",
+        concat!(
+            "the file must end with -----END RSA PRIVATE ",
+            "KEY----- and a newline"
+        ),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
+         e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
+         e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     ];
+
+    /// A made-up PEM key of `lines` base64 lines of 64 characters, and those lines.
+    fn fake_key(lines: usize) -> (String, Vec<String>) {
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let body: Vec<String> = (0..lines)
+            .map(|_| {
+                (0..64)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        alphabet[(x % 64) as usize] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let text = format!(
+            "{}\n{}\n-----END RSA PRIVATE KEY-----",
+            concat!("-----BEGIN RSA PRIVATE ", "KEY-----"),
+            body.join("\n")
+        );
+        (text, body)
+    }
+
+    /// Any 12 characters in a row of the key's body found in `text`.
+    fn key_leaks(text: &str, body: &[String]) -> Vec<String> {
+        body.iter()
+            .flat_map(|l| (0..=l.len() - 12).map(move |i| &l[i..i + 12]))
+            .filter(|w| text.contains(w))
+            .map(String::from)
+            .collect()
+    }
+
+    /// Final review A-I1: a key cut by size across the chunks of one ingest (even mid-line)
+    /// leaves nothing of its body in any chunk.
+    #[test]
+    fn a_private_key_cut_across_pieces_is_redacted_in_every_piece() {
+        let r = Redactor::builtin();
+        let (key, body) = fake_key(26);
+        let text = format!("notes before\n{key}\nnotes after");
+        let start = text.find(&body[0]).unwrap();
+        let len = body.len() * 65;
+        for pieces in [2usize, 3, 4] {
+            for shift in [0usize, 7, 31, 64] {
+                let mut cuts: Vec<usize> = (1..pieces)
+                    .map(|k| start + len * k / pieces + shift)
+                    .collect();
+                cuts.dedup();
+                let mut parts = Vec::new();
+                let mut from = 0;
+                for c in cuts.iter().copied().chain([text.len()]) {
+                    parts.push(&text[from..c]);
+                    from = c;
+                }
+                let mut open = false;
+                let out: Vec<String> = parts
+                    .iter()
+                    .map(|p| r.apply_piece(p, &mut open).text)
+                    .collect();
+                let all = out.join("|");
+                assert!(
+                    key_leaks(&all, &body).is_empty(),
+                    "{pieces} pieces, shift {shift}: {all}"
+                );
+                assert!(
+                    all.starts_with("notes before") && all.ends_with("notes after"),
+                    "{all}"
+                );
+                assert!(!open, "the key ended");
+            }
+        }
+        // A piece after one that did not end inside a key is redacted as usual.
+        let mut open = false;
+        assert_eq!(r.apply_piece("ZZZZ plain", &mut open).text, "ZZZZ plain");
+        // Text that only mentions a key opens nothing that eats the next piece's prose.
+        let mut open = false;
+        r.apply_piece(
+            concat!("paste the -----BEGIN RSA PRIVATE ", "KEY----- line"),
+            &mut open,
+        );
+        assert!(open);
+        assert_eq!(r.apply_piece("then run it", &mut open).text, "then run it");
+        assert!(!open);
+    }
+
+    /// Final review A-I1: a key's tail (its last base64 lines and its `END` line) and a body cut
+    /// from both its lines are caught in a piece on its own, too.
+    #[test]
+    fn the_tail_and_the_body_of_a_cut_key_are_caught_on_their_own() {
+        let r = Redactor::builtin();
+        let (_, body) = fake_key(26);
+        let middle = body[3..12].join("\n");
+        let out = r.apply(&format!("{middle}\nand prose"));
+        assert_eq!(out.found, ["base64_block"]);
+        assert!(key_leaks(&out.text, &body[3..12]).is_empty() && out.text.ends_with("and prose"));
+        let tail = format!(
+            "{}\n-----END RSA PRIVATE KEY-----\nafter",
+            body[20..].join("\n")
+        );
+        let out = r.apply(&tail);
+        assert!(
+            out.found.contains(&"pem_private_key".to_string()),
+            "{:?}",
+            out.found
+        );
+        assert!(key_leaks(&out.text, &body[20..]).is_empty(), "{}", out.text);
+        assert!(out.text.ends_with("\nafter"));
+        // A tail cut mid-line starts with part of a line.
+        let cut = format!(
+            "{}\n-----END RSA PRIVATE KEY-----",
+            &body.join("\n")[64 * 24 + 30..]
+        );
+        assert!(key_leaks(&r.apply(&cut).text, &body[25..]).is_empty());
+    }
 
     #[test]
     fn every_builtin_detector_fires_and_removes_the_secret() {
@@ -789,6 +1056,35 @@ mod tests {
                 out.text
             );
         }
+    }
+
+    /// Final review A-I2: a value is a reference only when the whole value is one; an upper-case
+    /// value with digits and no `_` is a key, not an ENV_NAME.
+    #[test]
+    fn passwords_with_dollars_brackets_and_upper_case_keys_are_redacted() {
+        let r = Redactor::builtin();
+        for (input, secret) in [
+            ("DB_PASSWORD=Pa$$w0rd2024", "Pa$$w0rd2024"),
+            ("\"password\": \"Tr0ub4dor&3(x)\"", "Tr0ub4dor&3(x)"),
+            ("API_KEY=7KQ2M9X4P8R3T6W1", "7KQ2M9X4P8R3T6W1"),
+            ("password: HUNTER2HUNTER2", "HUNTER2HUNTER2"),
+        ] {
+            let out = r.apply(input);
+            assert_eq!(out.found, ["password_assignment"], "{input}");
+            assert!(!out.text.contains(secret), "{input} -> {}", out.text);
+        }
+        for reference in [
+            "$DB_PASSWORD",
+            "${DB_PASSWORD}",
+            "<your-password>",
+            "{password}",
+            "Option<String>",
+            "env[\"X\"]",
+            "get_secret(x)",
+        ] {
+            assert!(super::code_like(reference), "{reference}");
+        }
+        assert!(!super::code_like("Tr0ub4dor&3(x)") && !super::code_like("Pa$$w0rd2024"));
     }
 
     #[test]

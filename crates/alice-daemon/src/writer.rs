@@ -30,7 +30,6 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 use rusqlite::{Connection, ErrorCode, OptionalExtension};
 use std::collections::VecDeque;
-use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -489,8 +488,8 @@ pub(crate) type CommitLog = Arc<Mutex<Vec<Vec<&'static str>>>>;
 /// writer's own connection. A project that was never rooted (no working tree) has only the
 /// global rules.
 fn rules_for(conn: &Connection, redactors: &Redactors, project_id: Option<&str>) -> Arc<Redactor> {
-    let root = project_id.and_then(|p| projects::root_of(conn, p).ok().flatten());
-    redactors.for_root(root.as_deref().map(Path::new))
+    let tree = project_id.and_then(|p| projects::tree_of(conn, p).ok().flatten());
+    redactors.for_root(tree.as_ref())
 }
 
 /// Record an event in the current transaction; it is broadcast after the batch commits.

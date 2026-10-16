@@ -18,12 +18,11 @@ use alice_core::judge::jev::{
     JevTransport, TransportError,
 };
 use alice_core::redact::Redactor;
-use alice_core::settings::{JudgeProvider, Settings};
+use alice_core::settings::{JudgeProvider, ProjectTree, Settings};
 use alice_core::store::projects;
 use alice_core::store::{ReaderPool, judge as judge_store};
 use alice_embed::net::{BlockingHttp, HttpError};
 use parking_lot::{Mutex, RwLock};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -132,7 +131,7 @@ impl DaemonJevPolicy {
         }
     }
 
-    /// The stored project `slug_or_alias` names: its canonical slug, working-tree root and every
+    /// The stored project `slug_or_alias` names: its canonical slug, working tree and every
     /// name it is known by (slug, each alias, display name, and the name as asked). `None` for
     /// a project that is not stored or cannot be read.
     fn lookup(&self, slug_or_alias: &str) -> Option<Identity> {
@@ -141,7 +140,7 @@ impl DaemonJevPolicy {
                 let Some(p) = projects::resolve_slug(c, slug_or_alias)? else {
                     return Ok(None);
                 };
-                let root = projects::root_of(c, &p.id)?;
+                let tree = projects::tree_of(c, &p.id)?;
                 let mut names = vec![
                     slug_or_alias.trim().to_string(),
                     p.slug.clone(),
@@ -155,7 +154,7 @@ impl DaemonJevPolicy {
                 }
                 Ok(Some(Identity {
                     slug: p.slug,
-                    root,
+                    tree,
                     names,
                 }))
             })
@@ -167,7 +166,7 @@ impl DaemonJevPolicy {
 /// A stored project as the policy sees it.
 struct Identity {
     slug: String,
-    root: Option<String>,
+    tree: Option<ProjectTree>,
     names: Vec<String>,
 }
 
@@ -183,18 +182,17 @@ impl JevPolicy for DaemonJevPolicy {
         let Some(id) = self.lookup(project) else {
             return false;
         };
-        let root = id.root.as_deref().map(Path::new);
+        let tree = id.tree.as_ref();
         id.names
             .iter()
             .filter(|n| !n.trim().is_empty())
-            .all(|n| self.settings.cloud_allowed(n, root))
-            && self.settings.cloud_allowed(&id.slug, root)
+            .all(|n| self.settings.cloud_allowed(n, tree))
+            && self.settings.cloud_allowed(&id.slug, tree)
     }
 
     fn redactor(&self, project: &str) -> Arc<Redactor> {
-        let root = self.lookup(project).and_then(|id| id.root);
-        self.redactors
-            .for_root_always_on(root.as_deref().map(Path::new))
+        let tree = self.lookup(project).and_then(|id| id.tree);
+        self.redactors.for_root_always_on(tree.as_ref())
     }
 }
 
@@ -692,11 +690,11 @@ mod tests {
         }
         {
             let conn = open_writer(&home.db()).unwrap();
-            let mk = |key: &str, slug: &str, root: Option<&Path>| ProjectRef {
+            let mk = |key: &str, slug: &str, root: Option<&std::path::Path>| ProjectRef {
                 key: key.into(),
                 slug: slug.into(),
                 name: slug.into(),
-                root: root.map(Path::to_path_buf),
+                root: root.map(std::path::Path::to_path_buf),
                 remote: None,
             };
             store_projects::upsert_project(&conn, &mk("k/client", "client", Some(repo.path())))

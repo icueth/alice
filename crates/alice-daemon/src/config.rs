@@ -25,8 +25,8 @@
 
 use crate::paths::AliceHome;
 use alice_core::settings::{
-    self, LooseningGate, ProjectLoad, ProjectSettings, ProjectSettingsCache, Resolved,
-    SettingError, Settings, Source, loosened_protections,
+    self, LooseningGate, PrivacySettings, ProjectLoad, ProjectSettings, ProjectSettingsCache,
+    ProjectTree, RedactMode, Resolved, SettingError, Settings, Source, loosened_protections,
 };
 use parking_lot::{Mutex, RwLock};
 use std::hash::{Hash, Hasher};
@@ -281,6 +281,62 @@ fn effective(file: &Path, env: &[(String, String)]) -> Effective {
     }
 }
 
+/// The global `[privacy]` settings last applied from a valid `config.toml` in `home`, if any.
+pub fn kept_privacy(home: &AliceHome) -> Option<PrivacySettings> {
+    let text = std::fs::read_to_string(home.last_privacy_file()).ok()?;
+    match serde_json::from_str(&text) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(
+                line = e.line(),
+                "the privacy settings last applied do not parse; they are not used"
+            );
+            None
+        }
+    }
+}
+
+/// The privacy in force while no valid `config.toml` has loaded: redaction on and secrets
+/// blocked (as the spool does), and never weaker than `kept`, the settings last applied from a
+/// valid file (its patterns and denied projects are added; an allowlist entry stays only when
+/// both have it). A file that does not parse would otherwise drop the person's custom patterns
+/// and block mode for every write.
+pub fn fail_closed_privacy(
+    current: &PrivacySettings,
+    kept: Option<&PrivacySettings>,
+) -> PrivacySettings {
+    let mut p = current.clone();
+    p.redact = true;
+    p.redact_mode = RedactMode::Block;
+    if let Some(k) = kept {
+        for c in &k.custom_patterns {
+            if !p.custom_patterns.contains(c) {
+                p.custom_patterns.push(c.clone());
+            }
+        }
+        for d in &k.cloud_denied_projects {
+            if !p.cloud_denied_projects.contains(d) {
+                p.cloud_denied_projects.push(d.clone());
+            }
+        }
+        p.allowlist.retain(|a| k.allowlist.contains(a));
+    }
+    p
+}
+
+/// What `config.toml` gives while it cannot be used as a whole: its salvaged settings with the
+/// privacy made fail-closed, and a warning that says so.
+fn fail_closed(mut r: Resolved, home: &AliceHome) -> Resolved {
+    let kept = kept_privacy(home);
+    r.settings.privacy = fail_closed_privacy(&r.settings.privacy, kept.as_ref());
+    r.warnings.push(if kept.is_some() {
+        "config.toml cannot be used: the privacy settings last applied stay in force, with redaction on and secrets blocked, until it is fixed".to_string()
+    } else {
+        "config.toml cannot be used: redaction is on and secrets are blocked until it is fixed".to_string()
+    });
+    r
+}
+
 pub(crate) fn changed_keys(a: &Settings, b: &Settings) -> Vec<String> {
     let a = settings::leaves(&serde_json::to_value(a).expect("settings serialise"));
     let b: std::collections::BTreeMap<_, _> =
@@ -380,6 +436,9 @@ impl Snapshot {
 
 pub struct SettingsHandle {
     file: PathBuf,
+    home: AliceHome,
+    /// The privacy last written to `last-privacy.json` (not written again unchanged).
+    kept: Mutex<Option<PrivacySettings>>,
     env: EnvLayer,
     snapshot: RwLock<Snapshot>,
     /// Problems with `config.toml` (cleared by the next good read or patch).
@@ -444,6 +503,11 @@ impl SettingsHandle {
         let env = EnvLayer::new(&env);
         let read = read_config(&file);
         let (resolved, file_errors) = resolve_for(&read, &env, tenant.as_deref());
+        let resolved = if file_errors.is_empty() {
+            resolved
+        } else {
+            fail_closed(resolved, home)
+        };
         log_problems(
             &file_errors
                 .iter()
@@ -453,11 +517,15 @@ impl SettingsHandle {
             &resolved.warnings,
         );
         let (changes, _) = tokio::sync::broadcast::channel(16);
-        Arc::new(Self {
+        let valid = file_errors.is_empty();
+        let privacy = resolved.settings.privacy.clone();
+        let me = Arc::new(Self {
+            home: home.clone(),
+            kept: Mutex::new(kept_privacy(home)),
             seen: Mutex::new(Seen::of(&read)),
             gate: Mutex::new(LooseningGate::default()),
             ever_valid: AtomicBool::new(file_errors.is_empty()),
-            projects: ProjectSettingsCache::new(SETTINGS_POLL),
+            projects: ProjectSettingsCache::with_store(SETTINGS_POLL, home.project_rules_file()),
             file,
             env,
             snapshot: RwLock::new(Snapshot::new(resolved)),
@@ -465,7 +533,26 @@ impl SettingsHandle {
             write: Mutex::new(()),
             tenant,
             changes,
-        })
+        });
+        if valid {
+            me.keep_privacy(&privacy);
+        }
+        me
+    }
+
+    /// Record `privacy` as the last applied from a valid `config.toml` (when it changed).
+    fn keep_privacy(&self, privacy: &PrivacySettings) {
+        let mut kept = self.kept.lock();
+        if kept.as_ref() == Some(privacy) {
+            return;
+        }
+        let text = serde_json::to_string_pretty(privacy).expect("privacy serialises");
+        match settings::write_private(&self.home.last_privacy_file(), &text) {
+            Ok(()) => *kept = Some(privacy.clone()),
+            Err(e) => {
+                tracing::warn!(error = %e, "the privacy settings in force could not be kept for a start with a broken config.toml")
+            }
+        }
     }
 
     /// The settings in effect (cheap: a shared pointer).
@@ -503,7 +590,8 @@ impl SettingsHandle {
     }
 
     /// May content of `project_slug` go to a cloud provider (the Jev judge, an HTTP embedder)?
-    /// `project_root` is the repository's root when the project has one.
+    /// `tree` is the project's working tree when it has one, keyed by the project: its
+    /// `.alice.toml` rules are kept per project, whatever tree is current.
     ///
     /// **Tasks 9 and 16 must use only this helper** to decide, once per call that would leave
     /// the machine; no consumer checks `privacy.cloud_denied_projects`, `.alice.toml` or
@@ -512,24 +600,24 @@ impl SettingsHandle {
     /// project's `.alice.toml` sets `cloud_denied`, or that file is broken, unreadable or blank
     /// on its first look. A project file that would loosen waits for three spaced looks
     /// ([`ProjectSettingsCache`]).
-    pub fn cloud_allowed(&self, project_slug: &str, project_root: Option<&Path>) -> bool {
-        self.cloud_allowed_with(project_slug, project_root, &self.projects)
+    pub fn cloud_allowed(&self, project_slug: &str, tree: Option<&ProjectTree>) -> bool {
+        self.cloud_allowed_with(project_slug, tree, &self.projects)
     }
 
     /// The project file for `root`; on a server tenant a root that is not there fails closed,
     /// because its rules are on a machine this server cannot see.
-    fn project_load(&self, root: &Path, projects: &ProjectSettingsCache) -> ProjectLoad {
-        if self.tenant.is_some() && !root.is_dir() {
+    fn project_load(&self, tree: &ProjectTree, projects: &ProjectSettingsCache) -> ProjectLoad {
+        if self.tenant.is_some() && !tree.root.is_dir() {
             return ProjectLoad {
                 settings: ProjectSettings::fail_closed(),
                 error: Some(SettingError {
-                    key: root.join(".alice.toml").display().to_string(),
+                    key: tree.root.join(".alice.toml").display().to_string(),
                     message: "this project's rules are not on this server; they fail closed until its client sends them again".into(),
                 }),
                 loosening_pending: false,
             };
         }
-        projects.get(root)
+        projects.get_tree(tree)
     }
 
     /// [`cloud_allowed`](Self::cloud_allowed) over a project cache of the caller's (tests with
@@ -538,29 +626,32 @@ impl SettingsHandle {
     pub(crate) fn cloud_allowed_with(
         &self,
         project_slug: &str,
-        project_root: Option<&Path>,
+        tree: Option<&ProjectTree>,
         projects: &ProjectSettingsCache,
     ) -> bool {
         if self.config_degraded() || project_slug.trim().is_empty() {
             return false;
         }
-        let project = project_root.map(|root| self.project_load(root, projects).settings);
+        let project = tree.map(|t| self.project_load(t, projects).settings);
         let effective = project.unwrap_or_default().apply_to(&self.get().privacy);
         !effective.is_cloud_denied(project_slug)
     }
 
     /// The privacy rules for writes to a project: the global ones with the project's
-    /// `.alice.toml` on top (`root`: its working-tree root; `None`: the global ones alone).
+    /// `.alice.toml` on top (`tree`: its working tree; `None`: the global ones alone).
     ///
     /// Read from the one [`ProjectSettingsCache`] this handle owns, so an invalid or unreadable
     /// project file fails closed (`block_secrets` on, the last good custom patterns kept) and a
     /// loosening applies only after three spaced polls, exactly as for
     /// [`cloud_allowed`](Self::cloud_allowed). The daemon never reads `.alice.toml` any other way.
-    pub fn project_privacy(&self, root: Option<&Path>) -> alice_core::settings::PrivacySettings {
+    pub fn project_privacy(
+        &self,
+        tree: Option<&ProjectTree>,
+    ) -> alice_core::settings::PrivacySettings {
         let global = self.get().privacy.clone();
-        match root {
-            Some(root) => {
-                self.project_load(root, &self.projects)
+        match tree {
+            Some(t) => {
+                self.project_load(t, &self.projects)
                     .settings
                     .apply_to(&global)
                     .privacy
@@ -569,15 +660,15 @@ impl SettingsHandle {
         }
     }
 
-    /// Whether the privacy rules for `root` are in a fail-closed state right now rather than
+    /// Whether the privacy rules for `tree` are in a fail-closed state right now rather than
     /// the ones a person configured: `config.toml` is degraded, or the project's `.alice.toml`
     /// is invalid or unreadable, or blank on its first look, or a loosening of it (or of `config.toml`) is
     /// waiting for its polls. A write refused under such rules may be accepted a moment later.
-    pub fn project_fail_closed(&self, root: Option<&Path>) -> bool {
+    pub fn project_fail_closed(&self, tree: Option<&ProjectTree>) -> bool {
         self.config_degraded()
             || self.loosening_waiting()
-            || root.is_some_and(|r| {
-                let l = self.project_load(r, &self.projects);
+            || tree.is_some_and(|t| {
+                let l = self.project_load(t, &self.projects);
                 l.error.is_some() || l.loosening_pending
             })
     }
@@ -599,6 +690,12 @@ impl SettingsHandle {
     }
 
     fn swap(&self, r: Resolved, errors: Vec<SettingError>) -> Vec<String> {
+        let r = if self.config_degraded() {
+            fail_closed(r, &self.home)
+        } else {
+            self.keep_privacy(&r.settings.privacy);
+            r
+        };
         let changed = changed_keys(&self.snapshot.read().settings, &r.settings);
         *self.snapshot.write() = Snapshot::new(r);
         *self.file_errors.write() = errors;
@@ -851,16 +948,17 @@ mod tests {
     fn a_tenant_fails_closed_for_a_project_root_that_is_not_there() {
         let (d, h) = home();
         let s = SettingsHandle::load_with(&h, Vec::new(), true);
-        let gone = d.path().join("never-created");
+        let gone = ProjectTree::new("path:proj", d.path().join("never-created"));
         assert!(!s.cloud_allowed("proj", Some(&gone)));
         assert!(s.project_fail_closed(Some(&gone)));
         assert_eq!(
             s.project_privacy(Some(&gone)).redact_mode,
             RedactMode::Block
         );
-        // A local daemon keeps today's meaning: no file, no project rules.
+        // Since M2's A-C1 a project's rules belong to the project: a tree that is gone and was
+        // never read fails closed for a local daemon too.
         let local = SettingsHandle::load_with_env(&h, Vec::new());
-        assert!(local.cloud_allowed("proj", Some(&gone)));
+        assert!(!local.cloud_allowed("proj", Some(&gone)));
     }
 
     #[test]
@@ -902,10 +1000,14 @@ mod tests {
             "a broken file keeps the valid environment"
         );
         let s = SettingsHandle::load_with_env(&h, vec![("ALICE_NOPE".into(), "1".into())]);
-        assert_eq!(
-            s.warnings().len(),
-            1,
-            "the handle reports ignored variables too"
+        let w = s.warnings();
+        assert!(
+            w.iter().any(|w| w.contains("ALICE_NOPE")),
+            "the handle reports ignored variables too: {w:?}"
+        );
+        assert!(
+            w.iter().any(|w| w.contains("config.toml cannot be used")),
+            "and that the broken file keeps privacy closed: {w:?}"
         );
     }
 
@@ -1493,23 +1595,29 @@ mod tests {
         assert!(!s.cloud_allowed("listed", None), "the global list");
         assert!(!s.cloud_allowed("", None), "no project, no cloud");
         // The project's own file.
-        assert!(s.cloud_allowed("open", Some(repo.path())), "no .alice.toml");
+        assert!(
+            s.cloud_allowed("open", Some(&ProjectTree::alone(repo.path()))),
+            "no .alice.toml"
+        );
         let alice_toml = repo.path().join(".alice.toml");
         std::fs::write(&alice_toml, "[privacy]\ncloud_denied = true\n").unwrap();
-        assert!(!s.cloud_allowed("open", Some(repo.path())));
+        assert!(!s.cloud_allowed("open", Some(&ProjectTree::alone(repo.path()))));
         // A project file that is broken, or blank on the first look: closed.
         let broken = tempfile::tempdir().unwrap();
         std::fs::write(broken.path().join(".alice.toml"), "[privacy\n").unwrap();
-        assert!(!s.cloud_allowed("open", Some(broken.path())));
+        assert!(!s.cloud_allowed("open", Some(&ProjectTree::alone(broken.path()))));
         let blank = tempfile::tempdir().unwrap();
         std::fs::write(blank.path().join(".alice.toml"), "").unwrap();
-        assert!(!s.cloud_allowed("open", Some(blank.path())));
+        assert!(!s.cloud_allowed("open", Some(&ProjectTree::alone(blank.path()))));
         // A degraded configuration allows nothing, whatever the project.
         write(&h, "[privacy]\ncloud_denied_projects = \"listed\"\n");
         let s = SettingsHandle::load_with_env(&h, vec![]);
         assert!(s.config_degraded());
         assert!(!s.cloud_allowed("open", None));
-        assert!(!s.cloud_allowed("open", Some(tempfile::tempdir().unwrap().path())));
+        assert!(!s.cloud_allowed(
+            "open",
+            Some(&ProjectTree::alone(tempfile::tempdir().unwrap().path()))
+        ));
     }
 
     #[test]
@@ -1519,10 +1627,10 @@ mod tests {
         let s = SettingsHandle::load_with_env(&h, vec![]);
         let alice_toml = repo.path().join(".alice.toml");
         std::fs::write(&alice_toml, "[privacy]\ncloud_denied = true\n").unwrap();
-        assert!(!s.cloud_allowed("p", Some(repo.path())));
+        assert!(!s.cloud_allowed("p", Some(&ProjectTree::alone(repo.path()))));
         std::fs::write(&alice_toml, "").unwrap(); // truncated, the writer is not done
         for _ in 0..50 {
-            assert!(!s.cloud_allowed("p", Some(repo.path())));
+            assert!(!s.cloud_allowed("p", Some(&ProjectTree::alone(repo.path()))));
         }
     }
 
