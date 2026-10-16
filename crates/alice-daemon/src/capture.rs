@@ -1581,15 +1581,10 @@ mod local {
             }
         }
 
-        /// The waiting job that is due first, if one is due.
+        /// The waiting job to run next, if one is due (see [`first_due`]).
         fn take_due(&self) -> Option<Job> {
-            let now = Instant::now();
             let mut pending = self.pending.lock();
-            let uri = pending
-                .iter()
-                .filter(|(_, j)| j.not_before <= now)
-                .min_by_key(|(_, j)| j.not_before)
-                .map(|(uri, _)| uri.clone())?;
+            let uri = first_due(&pending, Instant::now())?;
             pending.remove(&uri)
         }
 
@@ -1894,6 +1889,18 @@ mod local {
         }
     }
 
+    /// The uri of the job to run next at `now`: of the jobs due, a hook's or a sweep's before any
+    /// backfill's, then the one due first. A backfill of thousands of files queues them all at
+    /// once, with no settle delay, and a live session's capture must not wait until they are
+    /// read (review M2); the backfill goes on between the live passes.
+    fn first_due(pending: &HashMap<String, Job>, now: Instant) -> Option<String> {
+        pending
+            .iter()
+            .filter(|(_, j)| j.not_before <= now)
+            .min_by_key(|(_, j)| (j.event == "backfill", j.not_before))
+            .map(|(uri, _)| uri.clone())
+    }
+
     /// Opens a transcript read-only; it must be a regular file. Non-blocking, so a FIFO named
     /// like a transcript cannot hold the thread at `open`.
     fn open_transcript(path: &Path) -> std::io::Result<(File, Metadata)> {
@@ -2074,6 +2081,38 @@ mod local {
             assert!(job("backfill").by_age && job("sweep").by_age);
             let end = job("session-end");
             assert!(end.not_before > Instant::now(), "session-end settles too");
+        }
+
+        /// Review M2: a due hook's or sweep's job runs before every backfill job, even those
+        /// queued earlier; backfill jobs run oldest first; a job not due yet waits.
+        #[test]
+        fn live_jobs_go_before_a_backfill() {
+            let t0 = Instant::now();
+            let at = |session: &str, event: &str, ms: u64| {
+                let mut j = job(event);
+                j.session = session.into();
+                j.not_before = t0 + Duration::from_millis(ms);
+                (j.uri(), j)
+            };
+            let mut pending: HashMap<String, Job> = [
+                at("b1", "backfill", 0),
+                at("b2", "backfill", 5),
+                at("live", "stop", 20),
+                at("later", "stop", 500),
+            ]
+            .into_iter()
+            .collect();
+            let now = t0 + Duration::from_millis(30);
+            let mut order = Vec::new();
+            while let Some(uri) = first_due(&pending, now) {
+                order.push(pending.remove(&uri).unwrap().session);
+            }
+            assert_eq!(order, ["live", "b1", "b2"], "`later` is not due yet");
+            pending.extend([at("b3", "backfill", 0), at("sw", "sweep", 10)]);
+            assert_eq!(
+                first_due(&pending, now),
+                Some(AgentKind::ClaudeCode.source_uri("sw", None))
+            );
         }
 
         #[test]
