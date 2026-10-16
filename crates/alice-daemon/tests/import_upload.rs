@@ -105,15 +105,23 @@ impl Srv {
     }
 
     async fn status(&self) -> Value {
-        self.http
-            .get(self.url("/api/v1/import/status"))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap()
+        // The server closes a connection it cut off mid-upload; a pooled one can be stale for
+        // the next request, so a failed send is retried on a fresh connection.
+        let mut last = None;
+        for _ in 0..4 {
+            match self
+                .http
+                .get(self.url("/api/v1/import/status"))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+            {
+                Ok(r) => return r.json().await.unwrap(),
+                Err(e) => last = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("status request failed: {:?}", last);
     }
 
     /// Waits until the job is `done` or `failed`; returns that status.
