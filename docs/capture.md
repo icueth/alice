@@ -25,7 +25,11 @@ complete, which means one of these:
 - the next turn has started;
 - the agent stopped (`Stop`, `SubagentStop`, `PreCompact` or `SessionEnd`) and a short settle delay has passed (1.5 s
   locally, 2 s in the tenant script), because the transcript file can lag behind the event;
-- the file has not changed for 5 minutes.
+- locally, the file has not changed for 5 minutes; on a server tenant, every upload that is not cut at its size cap
+  closes the last turn.
+
+A last turn whose final tool call has no result yet stays open, except at a session end (or, locally, after 24 hours
+without a change).
 
 So capture lags the live session by at most one turn. A compaction summary is a turn of its own.
 
@@ -35,9 +39,8 @@ A Claude Code subagent's own transcript is a source of its own, linked to its se
 was first captured in: a session that later `cd`s into another repository stays in the first one.
 
 **Exactly once.** Every stored turn records a key (the id of its first record). A turn whose key is already stored, in any
-source, is skipped. That covers a hook that fires twice, a daemon killed in the middle of a pass, a resumed or forked
-session that copies its parent's records into a new file, a replaced or truncated file, and a tenant script that lost its
-place.
+source, is skipped. That covers a hook that fires twice, a daemon killed in the middle of a pass, a forked session that
+copies its parent's records into a new file, a replaced or truncated file, and a tenant script that lost its place.
 
 **How a turn is written down.** Each block becomes one line that starts with a tag. The distiller reads these tags back,
 so the format is fixed:
@@ -65,7 +68,7 @@ so the format is fixed:
 | WebFetch, WebSearch | The URL or query and the first 500 characters of the result |
 | A subagent call (Task, Agent) | `[subagent <type>] <description>`, then its final report, at most 2,000 characters |
 | TodoWrite and similar bookkeeping | Dropped |
-| Alice's and MemPalace's own memory tools | `[tool alice remember] <title, at most 120 characters>`, and the result as `[result omitted: memory tool]`. Memory text never comes back into the raw tier |
+| Alice's and MemPalace's own memory tools | `[tool alice remember] <title, at most 120 characters>`, and the result as `[result] [omitted: memory tool]`. Memory text never comes back into the raw tier |
 | Other tools | The input as compact JSON (at most 300 characters) and the output, trimmed |
 | Long runs of base64-like text, or text that is mostly unprintable | `[binary removed]` |
 | Progress lines, file snapshots, titles, system lines, hook output | Dropped |
@@ -75,9 +78,10 @@ so the format is fixed:
 The total is `capture.tool_output_chars` (default 800: the first 500 and the last 300 characters). A rendered turn is cut
 into chunks of about `capture.chunk_chars` characters (default 2,000), at block boundaries where possible.
 
-**Never stored:** thinking, the bytes of images and other attachments, the content of files the agent read or edited,
-the results of memory tools, injected `system-reminder` context, and anything from a project excluded from capture
-(below). Codex rollouts compressed as `.jsonl.zst` are skipped and counted; Alice reads only uncompressed rollouts.
+**Never stored:** the bytes of images and other attachments, the content of files the agent read or edited, the
+results of memory tools, injected `system-reminder` context, and anything from a project excluded from capture (below).
+Thinking is not stored unless you turn on `capture.include_thinking`. Codex rollouts compressed as `.jsonl.zst` are
+skipped and counted; Alice reads only uncompressed rollouts.
 
 **Where it shows up.** Captured chunks are found by `recall` with `include_raw` (CLI: `alice recall --raw`) and by the raw
 fallback when few memories match. They never appear among the knowledge hits or in the `context` briefing.
@@ -157,15 +161,17 @@ gets no SessionStart briefing from the hook: the MCP instructions ask the agent 
    `ALICE_NO_AUTOSTART` is set). Nothing is lost: the daemon reads the transcript from its own cursor when it runs.
 
 It always exits 0, prints nothing else, and writes problems to `$ALICE_HOME/logs/hook.log` (one line each, never the
-transcript's text; rotated to `hook.log.1` past 1 MB). Measured p95 from process start to exit: about 7 ms with the
-daemon up, and 16-22 ms with it down ([benchmarks](benchmarks/sp2.md)); the budget is 100 ms.
+transcript's text; rotated to `hook.log.1` past 1 MB). The budget is 100 ms from process start to exit; the p95
+reported during development is about 7 ms with the daemon up and 16-22 ms with it down ([benchmarks](benchmarks/sp2.md),
+to be measured again for that page). <!-- TODO(confirm): the figures come from Task 7's report, which is not in the
+repository. -->
 
 Turn the briefing off with `alice config set capture.briefing false`.
 
 ### Checking it works
 
 ```bash
-alice capture status              # the newest 50 sessions: chunks, cursor, last capture, distillation state
+alice capture status              # the newest 50 sessions: chunks, last capture, distillation state (--json: the cursor too)
 alice recall --raw "the error we fixed this morning"
 alice doctor                      # the capture hooks, capture and distill lines
 ```
@@ -211,9 +217,10 @@ are recorded (with no text), so a continued session that copies those turns into
 Turning capture back on later does **not** fill in the excluded period.
 
 **Redaction.** Every chunk passes the redactor of its project: the global `privacy.*` rules plus the project's
-`.alice.toml` (custom patterns, block mode). In `block` mode a chunk that holds a secret is replaced by the stub
-`[withheld: <detector names>]`, and capture goes on: one secret never stops a session's capture, and nothing with a
-secret is stored. On a server tenant, redaction is always on.
+`.alice.toml` (custom patterns, block mode). In `block` mode a chunk that holds a secret is replaced by a stub that
+keeps the chunk's first tag and names the detectors, such as `[assistant] [withheld: github_token]`, and capture goes
+on: one secret never stops a session's capture, and nothing with a secret is stored. On a server tenant, redaction is
+always on.
 
 **Cloud denial.** Captured chunks reach a remote embedding provider only for projects the cloud policy allows, as every
 chunk does. Distillation never sends a denied project's text to Jev: its session waits as `skipped_cloud` and is tried
@@ -248,7 +255,8 @@ reads the same three times in a row (about 6 seconds), while `alice config set` 
 
 **What it picks up.** Once it is on, the sessions captured in the last 7 days that still hold undistilled turns are
 distilled, newest first. Older ones, and sessions captured by a backfill, are distilled only when you ask:
-`alice capture distill <session-id>`.
+`alice capture distill <session-id>`. A backfilled session that you resume is distilled from its first new turn on
+([Backfill](#backfill)).
 
 ### What it does
 
@@ -308,7 +316,7 @@ includes it. A run costs about $0.0008 for 40 passages; a typical session takes 
 | `waiting_budget` | Today's share is used up; tried again tomorrow (UTC) |
 | `skipped_cloud` | Its project is kept from the cloud; tried again when the policy allows it |
 | `skipped_excluded` | Its project is excluded from capture, or the tenant script sent `no_distill` |
-| `skipped_backfill` | Captured by a backfill; distilled only with `alice capture distill` |
+| `skipped_backfill` | Captured by a backfill (a subagent's row too); distilled only with `alice capture distill`, or from its first new turn once the session goes on live |
 | `failed` | Five failed attempts; `alice capture distill <session-id>` tries again |
 
 ## Settings
@@ -370,19 +378,42 @@ alice capture backfill claude --project my-app --distill
 ```
 
 `alice capture backfill <claude|codex> [--since YYYY-MM-DD] [--project <slug>] [--distill]` finds the existing
-transcripts and queues each one with the daemon, then prints the files it queued:
+transcripts and queues each one with the local daemon, then prints the files it queued (`--json` prints the whole
+report):
 
-- Claude Code: `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/*/*.jsonl`, and their subagents' files;
-- Codex: `$CODEX_HOME/sessions/**/rollout-*.jsonl` (`.zst` files are skipped);
-- `--since` keeps files changed on or after that date; <!-- TODO(confirm): on, or after? -->
-- `--project <slug>` keeps the sessions of one project. <!-- TODO(confirm): how Task 18b filters by project. -->
+- Claude Code: `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/*/*.jsonl`, and each session's `subagents/` files;
+- Codex: `<CODEX_HOME or ~/.codex>/sessions/**/rollout-*.jsonl`; compressed `.jsonl.zst` rollouts are skipped and
+  counted;
+- `--since` keeps the files modified on or after the date, counted from local midnight (an RFC 3339 time, such as
+  `2026-09-01T09:00:00+07:00`, is taken as written);
+- `--project <slug>` keeps the sessions whose transcript's working directory belongs to that project: the slug a hook's
+  session there would get (the repository's or the folder's name). A transcript that names no working directory counts
+  as `global`. Aliases and merged or renamed projects are not matched, so give the base slug.
 
-Each file is read like a quiet sweep: complete turns only. Turn keys and the MemPalace rule below keep anything already
-stored from coming back, so a backfill is safe to run again.
+Each session is filed under the project of the working directory its transcript records, as a hook's session would be.
+The daemon reads each file as its sweep does, complete turns only: a file idle for 24 hours is read to its end and its
+session marked ended, and one written to in the last 5 minutes keeps its last turn open until the sweep closes it. Live
+sessions' capture goes first; the backfill is read between their passes. Turn keys and the MemPalace rule below (Codex
+rollouts included) keep anything already stored or imported from coming back, so a backfill is safe to run again.
 
-**Backfilled sessions are not distilled** unless you add `--distill`: a first backfill of months of sessions must not turn
-into a burst of memories and spend. They show `skipped_backfill`, and `alice capture distill <session-id>` distils one
-later.
+A backfill is refused while `capture.enabled`, or the agent's `capture.claude_code` / `capture.codex`, is off: the daemon
+would record every turn as not captured, for good. It needs a local daemon: a server tenant cannot read files on your
+machine and refuses it.
+
+**Backfilled sessions are not distilled** unless you ask: a first backfill of months of sessions must not turn into a
+burst of memories and spend. They show `skipped_backfill` (their subagents too), and the quiet trigger leaves them
+alone. To distil them:
+
+- `--distill` marks each session due once the daemon has registered it, and lists any it could not mark yet, with the
+  `alice capture distill <session-id>` to run later. While distillation is off (`distill.provider = off`) it marks
+  nothing: turn distillation on, then run the backfill again with `--distill`.
+- `alice capture distill <session-id>` distils one session later.
+
+**A backfilled session that you resume** becomes live again at its first new turn (`claude --resume` and `codex resume`
+append to the same transcript, and the hooks fire). What is captured from then on is distilled as any session's is; its
+backfilled turns, and its backfilled subagents', stay undistilled. To distil those too, run
+`alice capture distill <session-id>` before you resume it. <!-- TODO(confirm): that current Claude Code and Codex
+versions resume into the same file; Task 20 checks it on a real install. -->
 
 ## Moving over from MemPalace
 
@@ -392,7 +423,8 @@ and the switch never stores a session's turns twice.
 **How duplicates are avoided.** A session is held by one side. When Alice first captures a session that MemPalace already
 mined (`alice import mempalace` brought it in), it stores only the turns after the import's last filing time. When the
 importer meets a session Alice already captures, it skips that session's transcript drawers. Either order gives each turn
-once. MemPalace's checkpoint diaries stay in the raw tier, are never distilled and stop growing.
+once. A Codex rollout, which MemPalace files under its file's name (`rollout-<time>-<session id>`), is matched to its
+session the same way. MemPalace's checkpoint diaries stay in the raw tier, are never distilled and stop growing.
 
 ### Local cut-over, in this order
 
