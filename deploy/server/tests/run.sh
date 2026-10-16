@@ -139,6 +139,7 @@ case "$*" in
     echo "jev_api_key set (****${v: -4})"
     ;;
   "config set judge.provider jev") echo jev >"$ALICE_HOME/judge.provider" ;;
+  "config set distill.provider jev") echo jev >"$ALICE_HOME/distill.provider" ;;
   "model fetch")
     if [ "${SELFTEST:-}" = fetchfail ]; then
       i=0; while [ "$i" -lt 2000 ]; do printf '\rmodel_quantized.onnx: %5.1f%%' "$i" >&2; i=$((i + 1)); done
@@ -211,6 +212,7 @@ add_creates_everything() {
   has "$e" 'ALICE_JUDGE_JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone'
   has "$e" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
   has "$e" 'ALICE_JUDGE_JEV_MODEL=jev-1.13.0'
+  has "$e" 'ALICE_CAPTURE_RAW_RETENTION=180d'
   hasnt "$e" 'tok-'
   local u="$R/etc/systemd/system/alice@.service"
   has "$u" 'MemoryMax=3G'
@@ -887,8 +889,11 @@ upgrade_adds_the_time_zone_to_older_tenants() {
   hasnt "$TENANTS/bob.env" 'TZ=Asia/Bangkok'
   printf '%s\n' "$OUT" | grep -qF 'TZ=Asia/Bangkok added for: ann' || fail "$OUT"
   # The Jev pins (final review C1) arrive the same way, and a budget the admin changed is kept.
-  grep -v '^ALICE_JUDGE_' "$TENANTS/ann.env" >"$T/ann.env" && cat "$T/ann.env" >"$TENANTS/ann.env"
-  sed 's/^ALICE_JUDGE_DAILY_BUDGET_USD=.*/ALICE_JUDGE_DAILY_BUDGET_USD=0.5/' "$TENANTS/bob.env" >"$T/bob.env"
+  # So does the capture retention (SP2 spec §9.5), and a retention the admin changed is kept too.
+  grep -v -e '^ALICE_JUDGE_' -e '^ALICE_CAPTURE_RAW_RETENTION=' "$TENANTS/ann.env" >"$T/ann.env"
+  cat "$T/ann.env" >"$TENANTS/ann.env"
+  sed -e 's/^ALICE_JUDGE_DAILY_BUDGET_USD=.*/ALICE_JUDGE_DAILY_BUDGET_USD=0.5/' \
+    -e 's/^ALICE_CAPTURE_RAW_RETENTION=.*/ALICE_CAPTURE_RAW_RETENTION=90d/' "$TENANTS/bob.env" >"$T/bob.env"
   cat "$T/bob.env" >"$TENANTS/bob.env"
   run upgrade "$R/new-alice"
   [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
@@ -896,6 +901,10 @@ upgrade_adds_the_time_zone_to_older_tenants() {
   has "$TENANTS/ann.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
   has "$TENANTS/bob.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=0.5'
   printf '%s\n' "$OUT" | grep -qF 'the Jev endpoint, model and budget pinned for: ann' || fail "$OUT"
+  has "$TENANTS/ann.env" 'ALICE_CAPTURE_RAW_RETENTION=180d'
+  has "$TENANTS/bob.env" 'ALICE_CAPTURE_RAW_RETENTION=90d'
+  hasnt "$TENANTS/bob.env" 'ALICE_CAPTURE_RAW_RETENTION=180d'
+  printf '%s\n' "$OUT" | grep -qF 'captured transcripts kept 180d for: ann' || fail "$OUT"
   run add bob --tz Asia/Bangkok
   pass
 }
@@ -1143,6 +1152,7 @@ has_key() { # tenant key
   [ "$(cat "$SRV/$1/secrets.toml" 2>/dev/null)" = "jev_api_key = \"$2\"" ] || fail "$1 does not hold the key"
   [ -n "$(find "$SRV/$1/secrets.toml" -perm 600)" ] || fail "$1's secrets.toml is not 0600"
   [ "$(cat "$SRV/$1/judge.provider" 2>/dev/null)" = jev ] || fail "$1's judge is not jev"
+  [ "$(cat "$SRV/$1/distill.provider" 2>/dev/null)" = jev ] || fail "$1's distillation is not jev"
 }
 
 jev_key_set_reaches_every_tenant_and_nothing_else() {

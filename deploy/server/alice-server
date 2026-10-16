@@ -24,6 +24,9 @@ JEV_KEY_FILE="$R/etc/alice/jev.key"; JEV_SECRET=jev_api_key
 # tenant file (the environment wins over a person's settings), so a person can neither redirect the owner's key nor
 # raise the budget. Change one tenant's budget in its tenant file, then restart it.
 JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone; JEV_MODEL=jev-1.13.0; JEV_BUDGET_USD=1.0
+# Captured transcripts age out after this on a tenant (SP2 spec §3.9): pinned in the tenant file, so a person's own
+# settings cannot keep them longer. Change one tenant's in its tenant file, then restart it.
+CAPTURE_RETENTION=180d
 BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
 # The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
 # $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
@@ -443,6 +446,7 @@ tenant_env_text() { # name port team(0|1) tz
     "$REAL_SRV" "$1" "$2" "$4"
   printf 'ALICE_JUDGE_JEV_ENDPOINT=%s\nALICE_JUDGE_JEV_MODEL=%s\nALICE_JUDGE_DAILY_BUDGET_USD=%s\n' \
     "$JEV_ENDPOINT" "$JEV_MODEL" "$JEV_BUDGET_USD"
+  printf 'ALICE_CAPTURE_RAW_RETENTION=%s\n' "$CAPTURE_RETENTION"
   if [ "$3" = 1 ]; then printf 'ALICE_DAEMON_ARGS=--team-store\n'; else printf 'ALICE_TENANT_NAME=%s\n' "$1"; fi
 }
 
@@ -678,9 +682,9 @@ install_new() { # binary library-or-empty: each through a temporary file, the cu
 }
 
 # A tenant made before a pinned line existed gets it: TZ (a zone set with --tz is kept), the Jev endpoint and the
-# judge budget (a budget the admin changed is kept).
+# judge budget (a budget the admin changed is kept), and the capture retention (likewise).
 add_missing_tz() {
-  local f t added="" pinned=""
+  local f t added="" pinned="" kept=""
   for f in "$TENANTS"/*.env; do
     [ -e "$f" ] || continue
     t=$(basename "$f" .env)
@@ -697,9 +701,14 @@ add_missing_tz() {
       set_env_line "$t" ALICE_JUDGE_DAILY_BUDGET_USD "$JEV_BUDGET_USD"
       case " $pinned " in *" $t "*) ;; *) pinned="$pinned $t" ;; esac
     fi
+    if ! grep -q '^ALICE_CAPTURE_RAW_RETENTION=' "$f"; then
+      set_env_line "$t" ALICE_CAPTURE_RAW_RETENTION "$CAPTURE_RETENTION"
+      kept="$kept $t"
+    fi
   done
   if [ -n "$added" ]; then say "TZ=$DEFAULT_TZ added for:$added"; fi
   if [ -n "$pinned" ]; then say "the Jev endpoint, model and budget pinned for:$pinned"; fi
+  if [ -n "$kept" ]; then say "captured transcripts kept $CAPTURE_RETENTION for:$kept"; fi
 }
 
 # A route written by an older version lacks the upload route's body limit and timeouts: write every personal tenant's again
@@ -885,11 +894,12 @@ read_key() {
   printf '%s' "$key"
 }
 
-# One tenant gets the key (through its running daemon, so it applies at once) and the Jev judge. SP2's distillation
-# (`distill.provider = jev`) joins here once it lands on this branch.
+# One tenant gets the key (through its running daemon, so it applies at once), the Jev judge and Jev distillation of
+# its captured sessions (SP2 spec §9.5).
 give_jev_key() { # name key
   printf '%s\n' "$2" | as_tenant "$1" config set-secret "$JEV_SECRET" >/dev/null 2>&1 || return 1
   as_tenant "$1" config set judge.provider jev >/dev/null 2>&1 || return 1
+  as_tenant "$1" config set distill.provider jev >/dev/null 2>&1 || return 1
 }
 
 cmd_jev_key_set() {
@@ -913,7 +923,7 @@ cmd_jev_key_set() {
     t=$(basename "$f" .env)
     if give_jev_key "$t" "$key"; then done="$done $t"; else failed="$failed $t"; fi
   done
-  say "The Jev key is set, and judge.provider = jev, for:${done:- (no tenant yet)}"
+  say "The Jev key is set, with judge.provider = jev and distill.provider = jev, for:${done:- (no tenant yet)}"
   say "New tenants get it when they are added; run this again to rotate it everywhere."
   if [ -n "$failed" ]; then die "these tenants did not take it (is their daemon running?):$failed; run jev-key set again"; fi
 }
