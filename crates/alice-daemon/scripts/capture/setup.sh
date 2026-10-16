@@ -188,6 +188,7 @@ codex_setup() {
   cs_home="${CODEX_HOME:-$HOME/.codex}"
   cs_file="$cs_home/hooks.json"
   cs_new=$(hooks_json codex)
+  cs_sp='[[:space:]]'
   cs_re='alice-capture\.sh.{1,3}hook codex'
   cs_write=
   cs_why=
@@ -203,7 +204,7 @@ codex_setup() {
     fi
   elif [ -e "$cs_file" ]; then
     cs_why="$cs_file exists and is not a file"
-  elif grep -Eq "^[[:space:]]*(\[[[:space:]]*){0,2}[\"']?hooks[\"']?[[:space:]]*[].=]" "$cs_home/config.toml" 2>/dev/null; then
+  elif grep -Eq "^${cs_sp}*(\\[${cs_sp}*){0,2}[\"']?hooks[\"']?${cs_sp}*[].=]" "$cs_home/config.toml" 2>/dev/null; then
     cs_why="$cs_home/config.toml already has [hooks] tables, so hooks.json is not added beside them"
     if grep -Eq "$cs_re" "$cs_home/config.toml" 2>/dev/null; then cs_have=1; fi
   else
