@@ -144,14 +144,14 @@ The script moves the folder into the tenant's `import-inbox/` (owned by the tena
 
 #### adopt
 
-`alice-server adopt <name> <backup-file>` makes a person's own Alice database, from `alice backup now` on their machine, the database of their tenant. Use it for someone who already runs Alice locally: their projects, cleanups and memories come along as they are, with every embedding already done. See [Moving your local Alice to the server](#moving-your-local-alice-to-the-server) for the person's side.
+`alice-server adopt <name> <backup-file> [--cloud-denied <slug,slug...>]` makes a person's own Alice database, from `alice backup now` on their machine, the database of their tenant. Use it for someone who already runs Alice locally: their projects, cleanups and memories come along as they are, with every embedding already done. See [Moving your local Alice to the server](#moving-your-local-alice-to-the-server) for the person's side.
 
 - The tenant must be fresh: `adopt` refuses one that holds any memory, chunk or fact.
 - The file must be a regular file you own (copy it into your home with `scp`), and the disk needs twice its size plus 2 GB free.
 - `adopt` stops the tenant, checks the file (SQLite's `integrity_check`, Alice's tables, and the same schema as the installed binary: an older one says "upgrade the source Alice first", a newer one "upgrade the server first"), keeps the tenant's own database as a before-restore backup in its backups folder, and puts the file in its place.
 - It clears what names the person's machine: project folders (`root_path`), project keys made from a folder path, and transcript paths (a hash and the file name stay). Projects keep their slugs and aliases, so `?project=<slug>` finds them.
 - It redacts every memory, raw chunk and history record again with the tenant's rules, which are always on, and drops the judge cache. A memory whose redacted text equals another one's is moved to the trash.
-- Settings, secrets, the token and the Jev key stay the tenant's own: only the database is replaced.
+- Settings, secrets, the token and the Jev key stay the tenant's own: only the database is replaced. So do the person's cloud rules: the projects they kept from the cloud on their machine (their `privacy.cloud_denied_projects`, and repositories whose `.alice.toml` says `cloud_denied = true`) are not denied on the tenant unless you name them with `--cloud-denied`, which sets the tenant's list once it is up. The report's `projects_with_roots` lists the projects that had a working tree on the machine, the ones to ask about.
 - The tenant starts again and rebuilds its vector index from the stored embeddings (no re-embedding, unless the source used another model). If it does not come back, its own database is put back.
 
 It prints a report: memories, chunks, facts and projects, the paths cleared and the redactions. Delete the backup file afterwards: it holds what the person's machine stored, before the server's redaction.
@@ -167,7 +167,9 @@ sudo alice-server jev-key status
 
 `jev-key set` reads the key from the terminal with echo off, or from standard input; never from the command line or the environment. It keeps it in `/etc/alice/jev.key` (root's only, 0600) and gives it to every tenant, the team store included: into the tenant's own `secrets.toml` (0600, its user's), through its running daemon, with `judge.provider = jev`. It takes effect at once; nothing restarts. `alice-server add` gives every new tenant the key. Run `jev-key set` again to rotate the key everywhere. `jev-key status` says whether a key is set and, for each tenant, whether it holds the server's key, another one or none. It never prints a key or part of one.
 
-**Budget.** Each tenant keeps its own judge budget, `judge.daily_budget_usd`, 1.00 USD a day by default. The deployment-wide ceiling is the number of tenants times that: with four people and the team store, 5.00 USD a day. Change one tenant's with `alice-server cli <name> config set judge.daily_budget_usd 0.5`. When a tenant reaches its budget, precise recall answers with the search order and says so.
+**The key stays the owner's.** Each tenant file pins `ALICE_JUDGE_JEV_ENDPOINT` (Jev's own endpoint) and `ALICE_JUDGE_DAILY_BUDGET_USD`, and the environment wins over a person's settings: a person cannot send the shared key anywhere else or raise the budget, and their settings show the key as set, without any part of it. `upgrade` adds both lines to tenants made before them.
+
+**Budget.** Each tenant's judge budget is 1.00 USD a day by default. The deployment-wide ceiling is the number of tenants times that: with four people and the team store, 5.00 USD a day. To change one tenant's, edit `ALICE_JUDGE_DAILY_BUDGET_USD` in `/etc/alice/tenants/<name>.env`, then `systemctl restart alice@<name>`; `upgrade` keeps it. When a tenant reaches its budget, precise recall answers with the search order and says so.
 
 SP2's distillation (`distill.provider = jev`) will be switched on by the same command once it lands on this branch.
 
@@ -359,10 +361,11 @@ Send such a key over a private channel, never in a chat room or an issue. Withou
 
 If you already run Alice on your Mac, your admin can move your database to your tenant instead of importing MemPalace again: your project cleanups and the memories you wrote to Alice directly come along, and nothing has to be embedded again.
 
-1. On your Mac, stop the agents that write to Alice, then run `alice backup now`. It prints the file it wrote, under `~/.alice/backups/`.
-2. Copy that file to the server, to your admin's home, with `scp`.
-3. Your admin runs `alice-server adopt <name> <file>` on a fresh tenant and checks the report with you.
-4. Point your agents at your tenant's MCP URL (see above) and stop writing to the local Alice. Two stores that both take writes drift apart, and nothing merges them back. Keep the local home as a read-only fallback.
+1. On your Mac, list the projects you keep from the cloud: `alice config get privacy.cloud_denied_projects`, and any repository whose `.alice.toml` says `cloud_denied = true`. Give that list to your admin with the file: the server does not read your repositories, so it applies only what you name.
+2. Stop the agents that write to Alice, then run `alice backup now`. It prints the file it wrote, under `~/.alice/backups/`.
+3. Copy that file to the server, to your admin's home, with `scp`.
+4. Your admin runs `alice-server adopt <name> <file> --cloud-denied <your list>` on a fresh tenant and checks the report with you.
+5. Point your agents at your tenant's MCP URL (see above) and stop writing to the local Alice. Two stores that both take writes drift apart, and nothing merges them back. Keep the local home as a read-only fallback.
 
 The server clears your machine's folder paths from the projects and transcripts, and redacts everything again with its rules. Your Jev key is set on the tenant separately.
 

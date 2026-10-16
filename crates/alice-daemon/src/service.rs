@@ -1686,17 +1686,22 @@ impl Service {
         let project = self.choose(req.scope()).await?;
         let req = self.redact_remember_in(&project, req).await?;
         let slug = choice_slug(&project);
+        // Superseding marks the older memory too: only its author may (spec §2.10).
+        let supersedes: Vec<String> = req
+            .supersedes
+            .iter()
+            .map(|id| id.strip_prefix(TEAM_PREFIX).unwrap_or(id).to_string())
+            .collect();
+        for id in &supersedes {
+            self.require_shared_author(id).await?;
+        }
         let body = RememberRequest {
             content: req.content,
             kind: req.kind,
             title: req.title,
             topics: req.topics,
             importance: req.importance,
-            supersedes: req
-                .supersedes
-                .iter()
-                .map(|id| id.strip_prefix(TEAM_PREFIX).unwrap_or(id).to_string())
-                .collect(),
+            supersedes,
             // Keys are per tenant: another tenant's retry key must not return this memory.
             idempotency_key: req.idempotency_key.map(|k| format!("{tenant}:{k}")),
             project_hint: (slug != "global").then_some(slug),
@@ -3135,9 +3140,15 @@ impl Service {
 
     fn view_with(
         &self,
-        secrets: BTreeMap<String, SecretStatus>,
+        mut secrets: BTreeMap<String, SecretStatus>,
         mut notes: Vec<String>,
     ) -> SettingsView {
+        // On a server the Jev key is the owner's (addendum 5): a person sees only that it is set.
+        if self.opts.tenant {
+            for s in secrets.values_mut() {
+                s.hint = None;
+            }
+        }
         // The errors before the settings: a reload swaps the settings first and clears the
         // errors second, so an empty list read here is followed by settings that are new.
         let errors = self.settings.errors();
@@ -10687,5 +10698,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(w.project, "real-app");
+    }
+
+    /// Final review C1: on a server the Jev endpoint and the judge budget are the admin's, pinned
+    /// in the tenant file (here: the settings environment). A person's PATCH does not move them,
+    /// and the view shows the shared key as set without any hint of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_cannot_move_the_jev_endpoint_or_budget_and_sees_no_key_hint() {
+        let d = tempfile::tempdir().unwrap();
+        let store = MemSecrets::new(Duration::ZERO);
+        let official = "https://api.typesafe.ai/v1/systemone";
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                tenant: true,
+                secrets: Some(store.clone()),
+                settings_env: Some(vec![
+                    ("ALICE_JUDGE_JEV_ENDPOINT".into(), official.into()),
+                    ("ALICE_JUDGE_DAILY_BUDGET_USD".into(), "1.0".into()),
+                ]),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.set_secret_async(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .await
+            .unwrap();
+        let out = s
+            .patch_settings(patch_one(
+                "judge.jev.endpoint",
+                serde_json::json!("https://collector.example/v1"),
+            ))
+            .unwrap();
+        assert!(
+            out.overridden_by_env
+                .iter()
+                .any(|k| k == "judge.jev.endpoint"),
+            "{out:?}"
+        );
+        s.patch_settings(patch_one(
+            "judge.daily_budget_usd",
+            serde_json::json!(500.0),
+        ))
+        .unwrap();
+        let v = s.settings_view_async().await;
+        assert_eq!(v.settings["judge"]["jev"]["endpoint"], official);
+        assert_eq!(v.settings["judge"]["daily_budget_usd"], 1.0);
+        let k = &v.secrets["jev_api_key"];
+        assert!(k.set && k.hint.is_none(), "{k:?}");
     }
 }

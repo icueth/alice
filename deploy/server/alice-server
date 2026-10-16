@@ -20,6 +20,10 @@ ZONEINFO="$R/usr/share/zoneinfo"; DEFAULT_TZ=Asia/Bangkok
 # The owner's one Jev key, which every tenant gets (addendum 5): root's only, 0600. A tenant keeps its copy in its own
 # secrets.toml (0600, its user's), written through its daemon by `alice config set-secret`.
 JEV_KEY_FILE="$R/etc/alice/jev.key"; JEV_SECRET=jev_api_key
+# The shared key goes only to this endpoint, and spends at most this much a day per tenant: both are pinned in the
+# tenant file (the environment wins over a person's settings), so a person can neither redirect the owner's key nor
+# raise the budget. Change one tenant's budget in its tenant file, then restart it.
+JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone; JEV_BUDGET_USD=1.0
 BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
 # The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
 # $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
@@ -68,12 +72,13 @@ usage: alice-server add <name> [--tz <IANA zone>]
        alice-server upgrade <binary>
            (also the first install; a build of deploy/server/build-release brings its ONNX Runtime along)
        alice-server import <name> <palace-dir> [--dry-run]
-       alice-server adopt <name> <backup-file>
+           (a real import MOVES and consumes <palace-dir>; --dry-run works on a copy and keeps it)
+       alice-server adopt <name> <backup-file> [--cloud-denied <slug,slug...>]
+           (a person's own Alice database, from `alice backup now` on their machine, onto their fresh tenant;
+            --cloud-denied carries the projects they kept from the cloud there)
        alice-server jev-key set
            (the owner's Jev key, pasted at the prompt or piped in, for every tenant and every new one)
        alice-server jev-key status
-           (a person's own Alice database, from `alice backup now` on their machine, onto their fresh tenant)
-           (a real import MOVES and consumes <palace-dir>; --dry-run works on a copy and keeps it)
        alice-server cli <name> <alice arguments...>
 EOF
 }
@@ -397,6 +402,7 @@ EOF
 tenant_env_text() { # name port team(0|1) tz
   printf 'ALICE_HOME=%s/%s\nALICE_SERVER_PORT=%s\nALICE_LOG=info\nALICE_BACKUP_DAILY=2\nALICE_BACKUP_WEEKLY=0\nTZ=%s\n' \
     "$REAL_SRV" "$1" "$2" "$4"
+  printf 'ALICE_JUDGE_JEV_ENDPOINT=%s\nALICE_JUDGE_DAILY_BUDGET_USD=%s\n' "$JEV_ENDPOINT" "$JEV_BUDGET_USD"
   if [ "$3" = 1 ]; then printf 'ALICE_DAEMON_ARGS=--team-store\n'; else printf 'ALICE_TENANT_NAME=%s\n' "$1"; fi
 }
 
@@ -611,15 +617,25 @@ install_new() { # binary library-or-empty: each through a temporary file, the cu
   { install -m 0755 "$new" "$BIN.new" && mv -- "${BIN:?}.new" "${BIN:?}"; } || install_failed "could not install $new"
 }
 
-# A tenant made before TZ was written gets the default; a time zone set with --tz is kept.
+# A tenant made before a pinned line existed gets it: TZ (a zone set with --tz is kept), the Jev endpoint and the
+# judge budget (a budget the admin changed is kept).
 add_missing_tz() {
-  local f t added=""
+  local f t added="" pinned=""
   for f in "$TENANTS"/*.env; do
     [ -e "$f" ] || continue
     t=$(basename "$f" .env)
     if ! grep -q '^TZ=' "$f"; then set_env_line "$t" TZ "$DEFAULT_TZ"; added="$added $t"; fi
+    if ! grep -q '^ALICE_JUDGE_JEV_ENDPOINT=' "$f"; then
+      set_env_line "$t" ALICE_JUDGE_JEV_ENDPOINT "$JEV_ENDPOINT"
+      pinned="$pinned $t"
+    fi
+    if ! grep -q '^ALICE_JUDGE_DAILY_BUDGET_USD=' "$f"; then
+      set_env_line "$t" ALICE_JUDGE_DAILY_BUDGET_USD "$JEV_BUDGET_USD"
+      case " $pinned " in *" $t "*) ;; *) pinned="$pinned $t" ;; esac
+    fi
   done
   if [ -n "$added" ]; then say "TZ=$DEFAULT_TZ added for:$added"; fi
+  if [ -n "$pinned" ]; then say "the Jev endpoint and budget pinned for:$pinned"; fi
 }
 
 cmd_upgrade() { # binary (also the first install)
@@ -703,8 +719,11 @@ file_bytes() { stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1"; }
 # with its daemon stopped, checks the file, refuses a tenant that holds anything, swaps it in (keeping the tenant's
 # own database as a before-restore backup), clears the machine's paths and redacts with the tenant's rules. If the
 # daemon does not come back, the tenant's own database goes back.
-cmd_adopt() { # name backup-file
-  local name=$1 file=$2 home="$SRV/$1" admin=${SUDO_UID:-0} owner need free_k out saved port
+cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
+  local name=$1 file=$2 denied=${3:-} home="$SRV/$1" admin=${SUDO_UID:-0} owner need free_k out saved port list s
+  if [ -n "$denied" ]; then
+    case "$denied" in *[!a-z0-9,-]*) die "--cloud-denied takes project slugs separated by commas (a-z, 0-9, -)" ;; esac
+  fi
   need_tenant "$name"
   if is_team "$name"; then die "$TEAM is the shared team store; adopt a person's database into their own tenant"; fi
   [ ! -L "$file" ] && [ -f "$file" ] || die "$file is not a regular file"
@@ -735,6 +754,13 @@ cmd_adopt() { # name backup-file
       die "$name did not come back with the adopted database; its own database ($saved) is back"
     fi
     die "$name did not come back with the adopted database, and its own could not be put back; restore it with: alice-server cli $name restore ${saved:-<before-restore backup>} --yes"
+  fi
+  if [ -n "$denied" ]; then
+    list=""
+    for s in $(printf '%s' "$denied" | tr ',' ' '); do list="$list${list:+,}\"$s\""; done
+    as_tenant "$name" config set privacy.cloud_denied_projects "[$list]" >/dev/null \
+      || die "adopted, but the cloud denials were not set: alice-server cli $name config set privacy.cloud_denied_projects '[$list]'"
+    say "Kept from the cloud on $name: $denied"
   fi
   say "Adopted into $name:"
   printf '%s\n' "$out" | sed -n 's/^ *"\([a-z_]*\)": *\(.*\),\{0,1\}$/  \1: \2/p' | sed 's/,$//'
@@ -860,7 +886,12 @@ main() {
     upgrade) [[ $# -eq 2 ]] || { usage; exit 2; }; take_lock; cmd_upgrade "$2" ;;
     import) [[ $# -ge 3 && $# -le 4 ]] || { usage; exit 2; }; valid_name "$2"; cmd_import "$2" "$3" "${4:-}" ;;
     cli) [[ $# -ge 3 ]] || { usage; exit 2; }; valid_name "$2"; cmd_cli "${@:2}" ;;
-    adopt) [[ $# -eq 3 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_adopt "$2" "$3" ;;
+    adopt)
+      if [[ $# -eq 5 && "$4" = --cloud-denied ]]; then valid_name "$2"; take_lock; cmd_adopt "$2" "$3" "$5"
+      elif [[ $# -eq 3 ]]; then valid_name "$2"; take_lock; cmd_adopt "$2" "$3"
+      else usage; exit 2
+      fi
+      ;;
     jev-key)
       [[ $# -eq 2 ]] || { usage; exit 2; }
       case "$2" in

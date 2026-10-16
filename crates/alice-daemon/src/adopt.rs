@@ -46,6 +46,10 @@ pub struct AdoptReport {
     pub projects: u64,
     /// Project roots, path-made project keys and source paths of the person's machine, cleared.
     pub paths_cleared: u64,
+    /// The projects that had a working tree on the person's machine (comma-separated slugs): the
+    /// ones whose `.alice.toml` may have kept them from the cloud there. Their rules do not come
+    /// along; `alice-server adopt --cloud-denied` carries such a list.
+    pub projects_with_roots: String,
     /// Events and review items whose snapshots named one of those paths, rewritten.
     pub records_rewritten: u64,
     /// Memories and raw chunks the tenant's redaction rules changed (each with an event).
@@ -215,11 +219,16 @@ fn adopted(old: &str) -> String {
 /// snapshots in events and review items that held one of those values get the new one.
 fn scrub_paths(tx: &Connection, r: &mut AdoptReport) -> Result<()> {
     let mut renamed: HashMap<String, serde_json::Value> = HashMap::new();
-    let roots: Vec<String> = tx
-        .prepare("SELECT root_path FROM projects WHERE root_path IS NOT NULL")?
-        .query_map([], |row| row.get(0))?
+    let roots: Vec<(String, String)> = tx
+        .prepare("SELECT slug, root_path FROM projects WHERE root_path IS NOT NULL ORDER BY slug")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    for root in roots {
+    r.projects_with_roots = roots
+        .iter()
+        .map(|(slug, _)| slug.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (_, root) in roots {
         renamed.insert(root, serde_json::Value::Null);
     }
     r.paths_cleared += tx.execute(
