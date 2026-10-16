@@ -189,7 +189,8 @@ pub enum CaptureChange {
         distill_ord: i64,
     },
     Ended,
-    /// A tenant client sent from beyond the cursor: the cursor moves there.
+    /// A pass starts beyond the cursor (a tenant client sent from there, or the local worker
+    /// skipped a line longer than a pass): the cursor moves there and the gap is counted.
     Gap {
         byte_offset: u64,
     },

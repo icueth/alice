@@ -61,6 +61,9 @@ impl Env {
             // directory and service commands are only recorded in `ALICE_SERVICE_ROOT`.
             .env("HOME", &self.user_home)
             .env("XDG_CONFIG_HOME", self.user_home.join(".config"))
+            // Nor the owner's agents: their transcripts and settings are looked for here.
+            .env("CLAUDE_CONFIG_DIR", self.claude_dir())
+            .env("CODEX_HOME", self.user_home.join(".codex"))
             .env("ALICE_SERVICE_ROOT", &self.svc)
             .env("ALICE_EMBEDDER", "fake")
             .env("ALICE_LOG", "warn")
@@ -117,6 +120,11 @@ impl Env {
 
     fn log(&self) -> String {
         std::fs::read_to_string(self.home.join("logs/daemon.log")).unwrap_or_default()
+    }
+
+    /// `CLAUDE_CONFIG_DIR` of every command: a throwaway Claude Code configuration.
+    fn claude_dir(&self) -> PathBuf {
+        self.user_home.join(".claude")
     }
 
     fn daemon_json(&self) -> Option<serde_json::Value> {
@@ -3823,5 +3831,491 @@ fn restore_refuses_when_the_manager_cannot_be_asked_and_never_starts_a_stopped_u
             .stdout
             .starts_with(b"installed"),
         "the unit is still installed"
+    );
+}
+
+// ------------------------------------------------------------------ SP2 Task 7: `alice hook`
+
+/// `alice hook <args>` with `input` on its stdin and `vars` set. The input is written from
+/// another thread, so a write the hook stops reading (it reads at most 1 MiB) is no error.
+fn hook(e: &Env, args: &[&str], input: &[u8], vars: &[(&str, &str)]) -> Output {
+    let mut all = vec!["hook"];
+    all.extend_from_slice(args);
+    let mut child = e
+        .cmd(&all)
+        .envs(vars.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let out = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    out
+}
+
+/// Exit 0 with nothing on stdout or stderr.
+fn assert_quiet(o: &Output, what: &str) {
+    assert!(o.status.success(), "{what}: {}", o.status);
+    assert!(
+        o.stdout.is_empty(),
+        "{what}: stdout {:?}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert!(o.stderr.is_empty(), "{what}: stderr {:?}", stderr(o));
+}
+
+/// The lines of `logs/hook.log`.
+fn hook_log(e: &Env) -> Vec<String> {
+    std::fs::read_to_string(e.home.join("logs/hook.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// Where Claude Code keeps the transcripts of the sessions run in `cwd`.
+fn transcripts_dir(e: &Env, cwd: &std::path::Path) -> PathBuf {
+    let encoded: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    e.claude_dir().join("projects").join(encoded)
+}
+
+/// `<dir>/<session>.jsonl`: a Claude Code transcript holding one finished turn that names
+/// `marker`.
+fn write_transcript(dir: &std::path::Path, session: &str, marker: &str) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let lines = [
+        serde_json::json!({"type": "user", "uuid": format!("{session}-p1"), "sessionId": session,
+            "timestamp": "2026-10-17T01:00:00.000Z", "isSidechain": false,
+            "message": {"role": "user", "content": format!("Which lantern is {marker}?")}}),
+        serde_json::json!({"type": "assistant", "uuid": format!("{session}-a1"),
+            "parentUuid": format!("{session}-p1"), "sessionId": session,
+            "timestamp": "2026-10-17T01:00:01.000Z", "isSidechain": false,
+            "message": {"id": format!("msg-{session}"), "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": format!("The lantern is {marker}.")}],
+                "stop_reason": "end_turn"}}),
+    ];
+    let path = dir.join(format!("{session}.jsonl"));
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// The JSON Claude Code gives a hook on `event` (`Stop`, `SessionStart`, …), with `extra`
+/// fields on top.
+fn hook_input(
+    event: &str,
+    session: &str,
+    transcript: &std::path::Path,
+    cwd: &std::path::Path,
+    extra: serde_json::Value,
+) -> Vec<u8> {
+    let mut v = serde_json::json!({
+        "session_id": session,
+        "transcript_path": transcript,
+        "cwd": cwd,
+        "hook_event_name": event,
+    });
+    if let serde_json::Value::Object(more) = extra {
+        for (k, x) in more {
+            v[k.as_str()] = x;
+        }
+    }
+    serde_json::to_vec(&v).unwrap()
+}
+
+/// `(project, snippet)` of the raw-tier hits of `recall <query>`.
+fn raw_hits(e: &Env, query: &str) -> Vec<(String, String)> {
+    e.json(&["recall", query, "--raw", "--limit", "20"])["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|h| h["tier"] == "raw")
+        .map(|h| {
+            (
+                h["project"].as_str().unwrap_or_default().to_string(),
+                h["snippet"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The one entry in the spool, as JSON.
+fn the_spooled_entry(e: &Env) -> serde_json::Value {
+    let files: Vec<PathBuf> = std::fs::read_dir(e.home.join("spool"))
+        .unwrap()
+        .filter_map(|f| f.ok().map(|f| f.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap()
+}
+
+/// `git <args>` in `dir`, with the test's own home (no git configuration of the owner's).
+fn git(e: &Env, dir: &std::path::Path, args: &[&str]) {
+    let o = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", &e.user_home)
+        .env("XDG_CONFIG_HOME", e.user_home.join(".config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "git {args:?}: {}", stderr(&o));
+}
+
+/// A Stop hook with the daemon up: exit 0, nothing printed, and the daemon reads the finished
+/// turn into the raw tier (SP2 spec §4.1, §4.2).
+#[test]
+fn hook_notifies_and_capture_follows() {
+    let e = Env::new();
+    e.ok(&["daemon", "start"]);
+    let path = write_transcript(&transcripts_dir(&e, &e.work), "s-notify-1", "quokkalantern");
+    let input = hook_input(
+        "Stop",
+        "s-notify-1",
+        &path,
+        &e.work,
+        serde_json::json!({"stop_hook_active": false}),
+    );
+    let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &[]);
+    assert_quiet(&o, "stop");
+    // Checked at once: the daemon drains its spool every few seconds, so later a spooled
+    // notice would look delivered too.
+    assert_eq!(spooled(&e), 0, "the daemon took the notice");
+    eventually(
+        || !raw_hits(&e, "quokkalantern").is_empty(),
+        "the turn in the raw tier",
+    );
+    let hits = raw_hits(&e, "quokkalantern");
+    assert_eq!(
+        hits[0].0, "work",
+        "the project of the session's cwd: {hits:?}"
+    );
+    assert!(hook_log(&e).is_empty(), "{:?}", hook_log(&e));
+}
+
+/// SessionStart with `source` = startup prints the briefing as Claude Code's hook JSON; a
+/// resumed session, Codex and `capture.briefing = false` get nothing printed.
+#[test]
+fn hook_session_start_prints_the_briefing_json() {
+    let e = Env::new();
+    e.ok(&[
+        "remember",
+        "--importance",
+        "5",
+        "The deploy key of work rotates every Monday",
+    ]);
+    let path = transcripts_dir(&e, &e.work).join("s-brief-1.jsonl");
+    let start = |source: &str| {
+        hook_input(
+            "SessionStart",
+            "s-brief-1",
+            &path,
+            &e.work,
+            serde_json::json!({ "source": source }),
+        )
+    };
+    let args = ["session-start", "--agent", "claude-code"];
+    let o = hook(&e, &args, &start("startup"), &[]);
+    assert!(o.status.success() && o.stderr.is_empty(), "{}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout)
+        .unwrap_or_else(|err| panic!("not JSON ({err}): {}", String::from_utf8_lossy(&o.stdout)));
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    let briefing = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(briefing.starts_with("# Context · work"), "{briefing}");
+    assert!(briefing.contains("rotates every Monday"), "{briefing}");
+    // A resumed session already holds its briefing.
+    assert_quiet(&hook(&e, &args, &start("resume"), &[]), "resume");
+    // Codex gets it through the MCP instructions; its transcript path may be null.
+    let codex = serde_json::to_vec(&serde_json::json!({"session_id": "s-codex-1",
+        "transcript_path": null, "cwd": e.work, "hook_event_name": "SessionStart",
+        "source": "startup"}))
+    .unwrap();
+    assert_quiet(
+        &hook(&e, &["session-start", "--agent", "codex"], &codex, &[]),
+        "codex",
+    );
+    e.ok(&["config", "set", "capture.briefing", "false"]);
+    assert_quiet(
+        &hook(&e, &args, &start("startup"), &[]),
+        "capture.briefing = false",
+    );
+    assert!(hook_log(&e).is_empty(), "{:?}", hook_log(&e));
+}
+
+/// With the daemon down and ALICE_NO_AUTOSTART set, the hook spools one `capture_notify` entry,
+/// starts nothing, prints nothing and exits 0; a later `alice daemon start` drains the entry
+/// and the turn is captured.
+#[test]
+fn hook_with_the_daemon_down_spools_and_exits_zero() {
+    let e = Env::new();
+    let dir = transcripts_dir(&e, &e.work);
+    let path = write_transcript(&dir, "s-down-1", "pangolinbeacon");
+    let no_start = [("ALICE_NO_AUTOSTART", "1")];
+    let input = hook_input("Stop", "s-down-1", &path, &e.work, serde_json::json!({}));
+    let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &no_start);
+    assert_quiet(&o, "stop");
+    assert_eq!(spooled(&e), 1);
+    let entry = the_spooled_entry(&e);
+    assert_eq!(entry["op"], "capture_notify", "{entry}");
+    assert_eq!(entry["agent"], "claude-code", "{entry}");
+    assert_eq!(entry["event"], "stop", "{entry}");
+    assert_eq!(entry["session_id"], "s-down-1", "{entry}");
+    assert_eq!(entry["transcript_path"], path.to_str().unwrap(), "{entry}");
+    // No briefing while the daemon is down: the MCP instructions ask the agent for `context`.
+    let start = hook_input(
+        "SessionStart",
+        "s-down-2",
+        &dir.join("s-down-2.jsonl"),
+        &e.work,
+        serde_json::json!({"source": "startup"}),
+    );
+    let o = hook(
+        &e,
+        &["session-start", "--agent", "claude-code"],
+        &start,
+        &no_start,
+    );
+    assert_quiet(&o, "session-start");
+    assert_eq!(spooled(&e), 2);
+    assert!(
+        e.daemon_json().is_none() && e.lock_free(),
+        "no daemon was started"
+    );
+    assert!(hook_log(&e).is_empty(), "{:?}", hook_log(&e));
+    e.ok(&["daemon", "start"]);
+    eventually(|| spooled(&e) == 0, "the spool drained");
+    eventually(
+        || !raw_hits(&e, "pangolinbeacon").is_empty(),
+        "the spooled turn captured",
+    );
+}
+
+/// With the daemon down and autostart allowed, the hook spools the notice, starts the daemon
+/// detached without waiting for it, and the daemon it started captures the turn.
+#[test]
+fn hook_with_the_daemon_down_starts_one_detached() {
+    let e = Env::new();
+    let path = write_transcript(&transcripts_dir(&e, &e.work), "s-auto-1", "axolotlbeacon");
+    let input = hook_input("Stop", "s-auto-1", &path, &e.work, serde_json::json!({}));
+    let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &[]);
+    assert_quiet(&o, "stop");
+    eventually(|| e.daemon_json().is_some(), "the daemon the hook started");
+    eventually(|| spooled(&e) == 0, "the spool drained");
+    eventually(
+        || !raw_hits(&e, "axolotlbeacon").is_empty(),
+        "the turn captured",
+    );
+    assert!(hook_log(&e).is_empty(), "{:?}", hook_log(&e));
+}
+
+/// Garbage on stdin, an empty stdin, 2 MiB of zeros and arguments that are not
+/// `<event> --agent <agent>`: exit 0, nothing printed, one hook.log line each that does not
+/// repeat the input, no spool entry and no daemon.
+#[test]
+fn hook_never_fails_on_garbage_input() {
+    let e = Env::new();
+    let zeros = vec![0u8; 2 << 20];
+    let stop = ["stop", "--agent", "claude-code"];
+    let no_event = br#"{"session_id": "s-g-1", "transcript_path": "/tmp/s-g-1.jsonl"}"#;
+    let cases: [(&str, &[&str], &[u8]); 10] = [
+        ("not json", &stop, b"not json"),
+        ("empty stdin", &stop, b""),
+        ("2 MiB of zeros", &stop, &zeros),
+        ("an array", &stop, b"[1, 2]"),
+        (
+            "no session id",
+            &stop,
+            br#"{"transcript_path": "/tmp/s-g-1.jsonl", "hook_event_name": "Stop"}"#,
+        ),
+        (
+            "fields of the wrong type",
+            &stop,
+            br#"{"session_id": 7, "transcript_path": ["/tmp/s-g-1.jsonl"]}"#,
+        ),
+        (
+            "an unknown event",
+            &["nonsense", "--agent", "claude-code"],
+            no_event,
+        ),
+        (
+            "an unknown agent",
+            &["stop", "--agent", "nonsense"],
+            no_event,
+        ),
+        ("an unknown flag", &["stop", "--bogus"], no_event),
+        ("no event", &[], no_event),
+    ];
+    for (i, (what, args, input)) in cases.iter().enumerate() {
+        let o = hook(&e, args, input, &[]);
+        assert_quiet(&o, what);
+        let log = hook_log(&e);
+        assert_eq!(log.len(), i + 1, "{what}: one line each: {log:?}");
+    }
+    let log = hook_log(&e).join("\n");
+    assert!(
+        !log.contains("not json") && !log.contains('\0'),
+        "the input is not repeated: {log}"
+    );
+    assert_eq!(spooled(&e), 0);
+    assert!(
+        e.daemon_json().is_none() && e.lock_free(),
+        "no daemon was started"
+    );
+}
+
+/// Review Focus 5: a Thai working directory with spaces and quotes reaches the daemon intact:
+/// its project is the repository's (named `งาน-x` by its remote), and the transcript, whose
+/// path has Thai, spaces and quotes too, is read.
+#[test]
+fn hook_passes_a_thai_path_with_spaces_and_quotes() {
+    let e = Env::new();
+    e.ok(&["daemon", "start"]);
+    let cwd = e.work.parent().unwrap().join("งาน \"x\" y");
+    std::fs::create_dir_all(&cwd).unwrap();
+    git(&e, &cwd, &["init", "-q"]);
+    git(
+        &e,
+        &cwd,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/me/งาน-x.git",
+        ],
+    );
+    let dir = e.claude_dir().join("projects").join("งาน \"x\" y sessions");
+    let path = write_transcript(&dir, "s-thai-1", "numbatlantern");
+    let input = hook_input("Stop", "s-thai-1", &path, &cwd, serde_json::json!({}));
+    assert!(
+        String::from_utf8_lossy(&input).contains(r#"งาน \"x\" y"#),
+        "raw UTF-8 with escaped quotes"
+    );
+    let o = hook(&e, &["stop", "--agent", "claude-code"], &input, &[]);
+    assert_quiet(&o, "stop");
+    assert_eq!(spooled(&e), 0, "the daemon took the notice");
+    eventually(
+        || !raw_hits(&e, "numbatlantern").is_empty(),
+        "the turn in the raw tier",
+    );
+    let slug = alice_core::normalize::slugify("งาน-x");
+    let hits = raw_hits(&e, "numbatlantern");
+    assert!(hits.iter().all(|(p, _)| *p == slug), "{slug}: {hits:?}");
+    assert!(hook_log(&e).is_empty(), "{:?}", hook_log(&e));
+}
+
+/// p50, p95 and max of `v`, printed; returns the p95.
+fn hook_latency(name: &str, mut v: Vec<Duration>) -> Duration {
+    v.sort();
+    let at = |q: f64| v[((v.len() as f64 * q).ceil() as usize).clamp(1, v.len()) - 1];
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let (p50, p95, max) = (at(0.50), at(0.95), v[v.len() - 1]);
+    println!(
+        "alice hook {name}: n={} p50={:.1} ms p95={:.1} ms max={:.1} ms",
+        v.len(),
+        ms(p50),
+        ms(p95),
+        ms(max)
+    );
+    p95
+}
+
+/// The hook's budget (SP2 spec §4.1): p95 under 100 ms from process start to exit with the
+/// daemon up (Stop, and SessionStart printing the briefing) and down (the notice spooled, with
+/// ALICE_NO_AUTOSTART so 200 runs start no crowd of daemons). A few runs that start the daemon
+/// detached are timed too. Prints the numbers for docs/benchmarks/sp2.md.
+#[test]
+#[ignore = "latency budget; run in release: cargo test --release -p alice-memory --test cli hook_finishes_under_100ms -- --ignored --nocapture"]
+fn hook_finishes_under_100ms() {
+    const RUNS: usize = 200;
+    const DETACHED_RUNS: usize = 10;
+    let budget = Duration::from_millis(100);
+    let e = Env::new();
+    e.ok(&[
+        "remember",
+        "--importance",
+        "5",
+        "The latency seed is part of the briefing",
+    ]);
+    let dir = transcripts_dir(&e, &e.work);
+    let path = write_transcript(&dir, "s-bench-1", "latencylantern");
+    let stop = hook_input("Stop", "s-bench-1", &path, &e.work, serde_json::json!({}));
+    let start = hook_input(
+        "SessionStart",
+        "s-bench-2",
+        &dir.join("s-bench-2.jsonl"),
+        &e.work,
+        serde_json::json!({"source": "startup"}),
+    );
+    let stop_args = ["stop", "--agent", "claude-code"];
+    let start_args = ["session-start", "--agent", "claude-code"];
+    let no_start = [("ALICE_NO_AUTOSTART", "1")];
+    let timed = |args: &[&str], input: &[u8], vars: &[(&str, &str)]| {
+        let t = Instant::now();
+        let o = hook(&e, args, input, vars);
+        let took = t.elapsed();
+        assert!(o.status.success() && o.stderr.is_empty(), "{}", stderr(&o));
+        (took, o)
+    };
+    for _ in 0..5 {
+        timed(&stop_args, &stop, &[]);
+        timed(&start_args, &start, &[]);
+    }
+    let up_stop: Vec<Duration> = (0..RUNS).map(|_| timed(&stop_args, &stop, &[]).0).collect();
+    let mut briefed = 0;
+    let up_start: Vec<Duration> = (0..RUNS)
+        .map(|_| {
+            let (took, o) = timed(&start_args, &start, &[]);
+            briefed += usize::from(!o.stdout.is_empty());
+            took
+        })
+        .collect();
+    e.ok(&["daemon", "stop"]);
+    let down_stop: Vec<Duration> = (0..RUNS)
+        .map(|_| timed(&stop_args, &stop, &no_start).0)
+        .collect();
+    let down_start: Vec<Duration> = (0..RUNS)
+        .map(|_| timed(&start_args, &start, &no_start).0)
+        .collect();
+    assert_eq!(
+        spooled(&e),
+        2 * RUNS,
+        "every notice with the daemon down was spooled"
+    );
+    let detached: Vec<Duration> = (0..DETACHED_RUNS)
+        .map(|_| {
+            e.ok(&["daemon", "stop"]);
+            let (took, _) = timed(&stop_args, &stop, &[]);
+            eventually(|| e.daemon_json().is_some(), "the daemon the hook started");
+            took
+        })
+        .collect();
+    println!("briefing printed in {briefed} of {RUNS} SessionStart runs with the daemon up");
+    let p95s = [
+        hook_latency("stop, daemon up", up_stop),
+        hook_latency("session-start with the briefing, daemon up", up_start),
+        hook_latency("stop, daemon down (spooled)", down_stop),
+        hook_latency("session-start, daemon down (spooled)", down_start),
+        hook_latency("stop, daemon down (spooled, detached start)", detached),
+    ];
+    assert!(
+        p95s.iter().all(|p| *p < budget),
+        "p95 over 100 ms: {p95s:?}"
+    );
+    assert!(
+        briefed * 100 >= RUNS * 95,
+        "the briefing arrived within the deadline in {briefed} of {RUNS} runs"
     );
 }

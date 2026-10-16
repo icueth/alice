@@ -5,6 +5,7 @@
 
 use crate::backup::{self, BackupInfo, BackupKind};
 use crate::capture::{CaptureCtl, PassInput, PassReport};
+use crate::capture::{CaptureWorker, LocalCaptureConfig, LocalCaptureCounts};
 use crate::config::SettingsHandle;
 use crate::embedding::{self, Builder, EmbeddingCtl};
 use crate::importer::{self, ImportEnv, ImportSlot};
@@ -86,6 +87,8 @@ const JUDGE_STOP_WAIT: Duration = if cfg!(test) {
 const MAINTENANCE_STOP_WAIT: Duration = Duration::from_secs(3);
 /// How long shutdown waits for an import that is inside one long step (a snapshot copy).
 const IMPORT_STOP_WAIT: Duration = Duration::from_secs(30);
+/// How long shutdown waits for the capture worker to finish the pass it is in.
+const CAPTURE_STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a working directory's detected project is reused before git is asked again.
 const DETECT_TTL: Duration = Duration::from_secs(60);
@@ -576,6 +579,23 @@ pub struct ServiceOptions {
     /// Tests: how long a session must be quiet before it is distilled, in place of
     /// `distill.idle_minutes`.
     pub distill_idle_override: Option<Duration>,
+    /// Local capture (SP2 spec §4.2): a pass caused by `stop`, `subagent-stop`, `pre-compact`
+    /// or `session-end` waits this long first, so the agent has finished writing the turn.
+    pub capture_settle: Duration,
+    /// How often the capture worker looks at the open sources (and once at start).
+    pub capture_sweep_every: Duration,
+    /// A transcript idle this long has its trailing turn closed by the sweep.
+    pub capture_quiet: Duration,
+    /// A transcript idle this long gets a final pass, and its source ends (an agent that
+    /// crashed sends no `SessionEnd`).
+    pub capture_stale: Duration,
+    /// Tests only: the capture slice write after this many fails once, as a daemon killed
+    /// between two slices of a pass would leave it.
+    pub capture_fail_after_slices: Option<usize>,
+    /// Codex's home (`$CODEX_HOME`, else `~/.codex`): where a Codex session's rollout is looked
+    /// for when its hook gave no transcript path. `None`: never looked for (the default, so
+    /// tests touch nothing outside their home); [`ServiceOptions::process_env`] sets it.
+    pub codex_home: Option<PathBuf>,
 }
 
 impl Default for ServiceOptions {
@@ -611,6 +631,12 @@ impl Default for ServiceOptions {
             tenant_name: None,
             distill_tick: crate::distill::TICK,
             distill_idle_override: None,
+            capture_settle: Duration::from_millis(1500),
+            capture_sweep_every: Duration::from_secs(60),
+            capture_quiet: Duration::from_secs(5 * 60),
+            capture_stale: Duration::from_secs(24 * 3600),
+            capture_fail_after_slices: None,
+            codex_home: None,
         }
     }
 }
@@ -623,6 +649,10 @@ impl ServiceOptions {
             settings_env: None,
             secret_env: None,
             mempalace_home: dirs::home_dir().map(|h| h.join(".mempalace")),
+            codex_home: std::env::var_os("CODEX_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|h| h.join(".codex"))),
             ..Self::default()
         }
     }
@@ -867,6 +897,9 @@ pub struct Service {
     capture: Arc<CaptureCtl>,
     /// The distill worker (SP2 Task 12): captured sessions into memories.
     distill: Arc<crate::distill::DistillCtl>,
+    /// Local capture: the worker that reads transcript files after a notify (SP2 spec §4.2).
+    /// `None` on a server tenant, which never reads a client's files.
+    capture_worker: Option<Arc<CaptureWorker>>,
     /// The compatibility layer's short-lived overview cache.
     pub(crate) compat: crate::compat::CompatState,
     /// Tests: time added to the age of the shared health reading.
@@ -1473,6 +1506,24 @@ impl Service {
         if let Err(e) = distill.spawn() {
             tracing::error!(error = %e, "cannot start the distill worker; captured sessions are not distilled until the daemon restarts");
         }
+        capture.fail_after_slices(opts.capture_fail_after_slices);
+        let capture_worker = (!opts.tenant).then(|| {
+            let worker = CaptureWorker::new(
+                capture.clone(),
+                readers.clone(),
+                writer.clone(),
+                resolver.clone(),
+                LocalCaptureConfig {
+                    settle: opts.capture_settle,
+                    sweep_every: opts.capture_sweep_every,
+                    quiet: opts.capture_quiet,
+                    stale: opts.capture_stale,
+                    codex_home: opts.codex_home.clone(),
+                },
+            );
+            worker.spawn();
+            worker
+        });
         // The team store never links to itself.
         let (team, team_error) = if opts.team_store {
             (None, None)
@@ -1527,6 +1578,7 @@ impl Service {
             import: Mutex::new(ImportSlot::new()),
             capture,
             distill,
+            capture_worker,
             compat: crate::compat::CompatState::default(),
             #[cfg(test)]
             health_aged: Mutex::new(Duration::ZERO),
@@ -1591,6 +1643,10 @@ impl Service {
         let _ = self.wake_worker.try_send(());
         let _ = self.wake_judge.try_send(());
         self.distill.signal_stop();
+        // The capture worker writes through the writer: it ends its pass before that stops.
+        if let Some(w) = &self.capture_worker {
+            w.stop(CAPTURE_STOP_WAIT);
+        }
         // The import first: it reads and, later, writes through the pieces stopped below.
         let import = self.import.lock().handle.take();
         if let Some(h) = import {
@@ -4864,6 +4920,38 @@ impl Service {
         })
         .await
     }
+
+    /// `POST /api/v1/capture/notify` (SP2 spec §4.2): checks the notification and queues a pass
+    /// of its transcript; the capture worker reads the file later, from the source's cursor.
+    /// Refused (`Invalid`) for a bad notification, and on a server tenant, which cannot read the
+    /// client's files.
+    pub async fn capture_notify(&self, n: CaptureNotify) -> Result<()> {
+        let _busy = self.activity.enter();
+        self.capture_notify_spooled(n)
+    }
+
+    /// [`capture_notify`](Self::capture_notify) for the spool drain, which is not activity.
+    pub(crate) fn capture_notify_spooled(&self, n: CaptureNotify) -> Result<()> {
+        if self.opts.tenant {
+            return Err(AliceError::Invalid(
+                crate::capture::TENANT_NOTIFY_REFUSAL.into(),
+            ));
+        }
+        match &self.capture_worker {
+            Some(w) => w.queue(n),
+            None => Err(AliceError::Other(
+                "the capture worker is not running; restart the daemon".into(),
+            )),
+        }
+    }
+
+    /// What the local capture worker counted since the daemon started (zeros on a tenant).
+    pub fn capture_counts(&self) -> LocalCaptureCounts {
+        self.capture_worker
+            .as_ref()
+            .map(|w| w.counts())
+            .unwrap_or_default()
+    }
 }
 
 /// When the newest scheduled or manual backup was made (RFC 3339), if there is one. The
@@ -4882,6 +4970,9 @@ fn newest_backup_time(dir: &Path) -> Option<String> {
 impl Drop for Service {
     /// Without an explicit `shutdown`, ask both threads to stop but do not wait for them.
     fn drop(&mut self) {
+        if let Some(w) = &self.capture_worker {
+            w.signal_stop();
+        }
         if self.threads.get_mut().is_some() {
             self.stop.store(true, Ordering::SeqCst);
             let _ = self.wake_worker.try_send(());

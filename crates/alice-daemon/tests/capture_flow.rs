@@ -1,5 +1,7 @@
 //! Capture uploads (SP2 Task 6a; spec §3, §5.2, §5.6, §9.4): transcript bytes handed to
-//! `Service::capture_transcript` become chunks, turn keys and a cursor, each exactly once.
+//! `Service::capture_transcript` become chunks, turn keys and a cursor, each exactly once. Local
+//! capture (Task 6b; spec §4.2, §10): `Service::capture_notify` has the daemon's worker read the
+//! transcript file itself, through the same pipeline.
 //!
 //! Every test runs at the service level (no HTTP): the route of Task 14 only maps the answer.
 //! Transcripts are written inline, line by line. Secret-shaped strings are built with `concat!`,
@@ -1785,4 +1787,1018 @@ async fn the_tail_of_an_imported_turn_is_skipped_too() {
         "{:?}",
         known_keys(&svc)
     );
+}
+
+// ---- Task 6b: local capture (the daemon reads the transcript after a notify) ----
+
+/// Local timings short enough for tests: the settle delay and the sweep period. The quiet and
+/// stale ages keep their defaults; tests age a transcript's mtime instead of waiting.
+fn local_options() -> ServiceOptions {
+    ServiceOptions {
+        capture_settle: Duration::from_millis(50),
+        capture_sweep_every: Duration::from_millis(100),
+        ..options(false)
+    }
+}
+
+fn start_with(dir: &Path, opts: ServiceOptions) -> Arc<Service> {
+    Service::start(
+        AliceHome::new(dir.to_path_buf()),
+        &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+        opts,
+    )
+    .unwrap()
+}
+
+/// A local daemon whose home is `<dir>/home`; transcripts and repositories go beside it.
+fn local() -> (tempfile::TempDir, Arc<Service>) {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_with(&d.path().join("home"), local_options());
+    (d, svc)
+}
+
+/// What `alice hook <event>` sends for session `session`, whose transcript is `path`.
+fn notify(session: &str, path: &Path, event: &str) -> CaptureNotify {
+    CaptureNotify {
+        agent: "claude-code".into(),
+        event: event.into(),
+        session_id: session.into(),
+        transcript_path: path.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+}
+
+/// Sets `path`'s modification time to `age` ago (an idle transcript, without waiting).
+fn age(path: &Path, age: Duration) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+}
+
+/// [`until`] with its own time limit, for a test that reads tens of megabytes.
+async fn until_within(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
+    let t = Instant::now();
+    while !cond() {
+        assert!(t.elapsed() < limit, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Passes the local worker has run.
+fn passes(svc: &Service) -> u64 {
+    svc.capture_counts().passes
+}
+
+fn capture_events(svc: &Service, uri: &str) -> i64 {
+    let Some(row) = state_of(svc, uri) else {
+        return 0;
+    };
+    db(svc)
+        .query_row(
+            "SELECT count(*) FROM events WHERE action = 'source.capture' AND target_id = ?1",
+            [&row.source_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_notify_captures_the_completed_turn() {
+    let (d, svc) = local();
+    let repo = d.path().join("notify-repo");
+    std::fs::create_dir(&repo).unwrap();
+    let path = d.path().join("ns1.jsonl");
+    let mut t = Transcript::default();
+    t.turn("ns1", 1, "the first marker")
+        .turn("ns1", 2, "wombatlantern");
+    std::fs::write(&path, &t.bytes).unwrap();
+
+    svc.capture_notify(CaptureNotify {
+        cwd: Some(repo.to_string_lossy().into_owned()),
+        ..notify("ns1", &path, "stop")
+    })
+    .await
+    .unwrap();
+    until("the stop's pass stores turn 2", || {
+        chunks_holding(&svc, "wombatlantern is settled") == 1
+    })
+    .await;
+
+    let st = svc.capture_status().await.unwrap();
+    assert!(!st.tenant);
+    let row = st
+        .sessions
+        .iter()
+        .find(|s| s.uri == uri("ns1"))
+        .expect("the source is listed");
+    assert_eq!(
+        row.byte_offset,
+        t.len(),
+        "the stop closed the trailing turn"
+    );
+    assert_eq!(row.project, "notify-repo", "the project is the cwd's");
+    assert!(!row.ended);
+    assert_eq!(row.gaps, 0);
+    let state = state_of(&svc, &uri("ns1")).unwrap();
+    assert_eq!(
+        state.transcript_path.as_deref(),
+        Some(path.to_string_lossy().as_ref())
+    );
+    let key = state
+        .file_key
+        .expect("a local source keeps its file's identity");
+    let parts: Vec<&str> = key.split(':').collect();
+    assert_eq!(parts.len(), 3, "dev:inode:sha256(first line): {key}");
+    assert_eq!(parts[2].len(), 64);
+    assert_eq!(chunks_holding(&svc, "the first marker is settled"), 1);
+
+    let r = svc
+        .recall(RecallRequest {
+            query: "wombatlantern".into(),
+            include_raw: true,
+            format: OutputFormat::Json,
+            cwd: Some(repo.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        r.results.iter().any(|h| h.tier == Tier::Raw
+            && format!("{} {} {:?}", h.title, h.snippet, h.body).contains("wombatlantern")),
+        "recall finds turn 2: {:?}",
+        r.results
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeating_the_notify_stores_nothing_new() {
+    let (d, svc) = local();
+    let path = d.path().join("rn.jsonl");
+    let mut t = Transcript::default();
+    t.turn("rn", 1, "once only").turn("rn", 2, "twice never");
+    std::fs::write(&path, &t.bytes).unwrap();
+    svc.capture_notify(notify("rn", &path, "stop"))
+        .await
+        .unwrap();
+    until("the first pass", || {
+        state_of(&svc, &uri("rn")).is_some_and(|s| s.byte_offset == t.len()) && passes(&svc) == 1
+    })
+    .await;
+    let chunks = chunks_of(&svc, &uri("rn"));
+    assert!(!chunks.is_empty());
+
+    for _ in 0..3 {
+        let before = passes(&svc);
+        svc.capture_notify(notify("rn", &path, "stop"))
+            .await
+            .unwrap();
+        until("the repeated pass ran", || passes(&svc) > before).await;
+    }
+    assert_eq!(chunks_of(&svc, &uri("rn")), chunks, "nothing new is stored");
+    assert_eq!(capture_events(&svc, &uri("rn")), 1, "one pass stored");
+    assert_eq!(state_of(&svc, &uri("rn")).unwrap().byte_offset, t.len());
+}
+
+/// Spec §10: a pass killed between the slices of one turn neither loses nor doubles a chunk.
+/// The test hook fails the pass after its first slice (of a turn three slices long); the next
+/// pass renders the turn again and `(source, ord)` drops what landed already.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_between_slices_neither_loses_nor_doubles() {
+    // About 75 KB of distinct sentences: some 40 chunks of 2,000 characters, three slices.
+    let long: String = (0..2_200)
+        .map(|i| format!("Sentence {i} of the long answer. "))
+        .collect();
+    let mut t = Transcript::default();
+    t.turn("kb", 1, "a short first turn")
+        .prompt("kb-p2", "Explain everything at length.")
+        .reply("kb-a2", &long)
+        .turn("kb", 3, "a short last turn");
+
+    let clean_dir = tempfile::tempdir().unwrap();
+    let clean = start_with(&clean_dir.path().join("home"), local_options());
+    let clean_path = clean_dir.path().join("kb.jsonl");
+    std::fs::write(&clean_path, &t.bytes).unwrap();
+    clean
+        .capture_notify(notify("kb", &clean_path, "stop"))
+        .await
+        .unwrap();
+    until("the clean capture", || {
+        state_of(&clean, &uri("kb")).is_some_and(|s| s.byte_offset == t.len())
+    })
+    .await;
+    let expected = chunks_of(&clean, &uri("kb"));
+    let distinct: HashSet<&String> = expected.iter().map(|c| &c.1).collect();
+    assert_eq!(distinct.len(), expected.len(), "every chunk text differs");
+
+    // No sweep after the one at start: only the notifies below pass the transcript, so the
+    // state after the failed pass is the one inspected.
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_with(
+        &d.path().join("home"),
+        ServiceOptions {
+            capture_fail_after_slices: Some(1),
+            capture_sweep_every: Duration::from_secs(3_600),
+            ..local_options()
+        },
+    );
+    let path = d.path().join("kb.jsonl");
+    std::fs::write(&path, &t.bytes).unwrap();
+    svc.capture_notify(notify("kb", &path, "stop"))
+        .await
+        .unwrap();
+    until("the first pass ran", || passes(&svc) >= 1).await;
+    let partial = chunks_of(&svc, &uri("kb"));
+    assert!(
+        !partial.is_empty() && partial.len() < expected.len(),
+        "the first slice landed, the rest did not: {} of {}",
+        partial.len(),
+        expected.len()
+    );
+    assert!(
+        !known_keys(&svc).contains("kb-p2"),
+        "the long turn's key waits for its last slice"
+    );
+
+    svc.capture_notify(notify("kb", &path, "stop"))
+        .await
+        .unwrap();
+    until("a later pass completes the turn", || {
+        chunks_of(&svc, &uri("kb")) == expected
+    })
+    .await;
+    assert!(known_keys(&svc).contains("kb-p2"));
+    assert_eq!(state_of(&svc, &uri("kb")).unwrap().byte_offset, t.len());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_file_resets_and_skips_stored_turns() {
+    let (d, svc) = local();
+    let path = d.path().join("rf.jsonl");
+    let mut first = Transcript::default();
+    first
+        .prompt(
+            "rf-p1",
+            &format!(
+                "Question 1 about the original layout. {}",
+                "padding words ".repeat(40)
+            ),
+        )
+        .reply("rf-a1", "Answer 1: the original layout is settled.")
+        .turn("rf", 2, "the second marker");
+    std::fs::write(&path, &first.bytes).unwrap();
+    svc.capture_notify(notify("rf", &path, "stop"))
+        .await
+        .unwrap();
+    until("turns 1 and 2", || {
+        state_of(&svc, &uri("rf")).is_some_and(|s| s.byte_offset == first.len())
+    })
+    .await;
+    let key = state_of(&svc, &uri("rf")).unwrap().file_key;
+
+    // A new file (another inode, another first line) replaces it: turns 1 and 2 written
+    // shorter, then a new turn 3, whose first line the old cursor falls inside.
+    let mut second = Transcript::default();
+    second
+        .prompt("rf-p1", "Question 1 about the original layout.")
+        .reply("rf-a1", "Answer 1: the original layout is settled.")
+        .turn("rf", 2, "the second marker");
+    let p3 = second.len();
+    second.prompt(
+        "rf-p3",
+        &format!(
+            "Question 3 about the replacement. {}",
+            "more words ".repeat(60)
+        ),
+    );
+    let p3_end = second.len();
+    second.reply("rf-a3", "Answer 3: replacementmarker is settled.");
+    assert!(p3 < first.len() && first.len() < p3_end);
+    let tmp = d.path().join("rf.jsonl.tmp");
+    std::fs::write(&tmp, &second.bytes).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    svc.capture_notify(notify("rf", &path, "stop"))
+        .await
+        .unwrap();
+    until("turn 3 is stored as a turn", || {
+        known_keys(&svc).contains("rf-p3")
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "replacementmarker is settled"), 1);
+    assert_eq!(chunks_holding(&svc, "Question 3 about the replacement."), 1);
+    assert_eq!(chunks_holding(&svc, "the original layout is settled"), 1);
+    assert_eq!(chunks_holding(&svc, "the second marker is settled"), 1);
+    let row = state_of(&svc, &uri("rf")).unwrap();
+    assert_eq!(row.byte_offset, second.len());
+    assert_ne!(row.file_key, key, "the new file's identity is kept");
+    assert_eq!(row.gaps, 0);
+
+    // Cut in place to fewer bytes than the cursor (same inode, same first line): turn 1 and a
+    // new turn 4.
+    let mut third = Transcript::default();
+    third
+        .prompt("rf-p1", "Question 1 about the original layout.")
+        .reply("rf-a1", "Answer 1: the original layout is settled.")
+        .turn("rf", 4, "truncatedmarker");
+    assert!(third.len() < second.len());
+    std::fs::write(&path, &third.bytes).unwrap();
+    svc.capture_notify(notify("rf", &path, "stop"))
+        .await
+        .unwrap();
+    until("turn 4", || {
+        chunks_holding(&svc, "truncatedmarker is settled") == 1
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "the original layout is settled"), 1);
+    assert_eq!(state_of(&svc, &uri("rf")).unwrap().byte_offset, third.len());
+}
+
+/// Ruling 1: the sweep closes a trailing turn once its transcript has been quiet for
+/// `capture_quiet` (5 minutes), as a `Stop` would.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_trailing_turn_is_closed_by_the_quiet_sweep() {
+    let (d, svc) = local();
+    let path = d.path().join("qs.jsonl");
+    let mut t = Transcript::default();
+    t.turn("qs", 1, "the opening turn");
+    let second = t.len();
+    t.turn("qs", 2, "quietmarker");
+    std::fs::write(&path, &t.bytes).unwrap();
+    // SessionStart closes nothing: turn 1 is complete because turn 2 follows it.
+    svc.capture_notify(notify("qs", &path, "session-start"))
+        .await
+        .unwrap();
+    until("turn 1", || {
+        state_of(&svc, &uri("qs")).is_some_and(|s| s.byte_offset == second)
+    })
+    .await;
+    // A few sweeps of a fresh transcript leave the trailing turn open.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(chunks_holding(&svc, "quietmarker"), 0);
+
+    age(&path, Duration::from_secs(10 * 60));
+    until("the quiet sweep stores turn 2", || {
+        chunks_holding(&svc, "quietmarker is settled") == 1
+    })
+    .await;
+    let row = state_of(&svc, &uri("qs")).unwrap();
+    assert_eq!(row.byte_offset, t.len());
+    assert!(!row.ended, "quiet is not stale");
+}
+
+/// Ruling 1: a turn whose tool call has no answer stays open through `Stop` and the quiet
+/// sweep; after `capture_stale` (24 hours) without an event the sweep closes it whatever it
+/// waits for and ends the source.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_session_is_ended_by_the_sweep() {
+    let (d, svc) = local();
+    let path = d.path().join("st.jsonl");
+    let mut t = Transcript::default();
+    t.turn("st", 1, "finished before the crash");
+    let second = t.len();
+    t.prompt("st-p2", "Watch the build.")
+        .tool_use("st-a2", "toolu_st", "sleep 999");
+    std::fs::write(&path, &t.bytes).unwrap();
+    svc.capture_notify(notify("st", &path, "stop"))
+        .await
+        .unwrap();
+    until("turn 1", || {
+        state_of(&svc, &uri("st")).is_some_and(|s| s.byte_offset == second)
+    })
+    .await;
+
+    age(&path, Duration::from_secs(10 * 60));
+    let before = passes(&svc);
+    until("the quiet sweep ran", || passes(&svc) > before).await;
+    assert_eq!(
+        chunks_holding(&svc, "sleep 999"),
+        0,
+        "the call without its result keeps the turn open"
+    );
+    assert!(!state_of(&svc, &uri("st")).unwrap().ended);
+
+    age(&path, Duration::from_secs(25 * 3600));
+    until("the stale sweep ends the source", || {
+        state_of(&svc, &uri("st")).unwrap().ended
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "[tool Bash] sleep 999"), 1);
+    assert_eq!(state_of(&svc, &uri("st")).unwrap().byte_offset, t.len());
+    let st = svc.capture_status().await.unwrap();
+    assert!(st.sessions.iter().any(|s| s.uri == uri("st") && s.ended));
+}
+
+/// A pass whose project's rules are unknown (a broken `.alice.toml`) stores nothing and keeps
+/// the cursor; its job is tried again a sweep period later, with no new event, and captures
+/// once the file is fixed. The session-end it carries is not lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_local_pass_is_tried_again_until_the_rules_are_known() {
+    let (d, svc) = local();
+    let repo = d.path().join("waiting-repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join(".alice.toml"), "[privacy\nno_capture = tru").unwrap();
+    let path = d.path().join("wl.jsonl");
+    let mut t = Transcript::default();
+    t.turn("wl", 1, "waiting words one")
+        .turn("wl", 2, "waiting words two");
+    std::fs::write(&path, &t.bytes).unwrap();
+    svc.capture_notify(CaptureNotify {
+        cwd: Some(repo.to_string_lossy().into_owned()),
+        ..notify("wl", &path, "session-end")
+    })
+    .await
+    .unwrap();
+    until("two waiting passes", || passes(&svc) >= 2).await;
+    assert!(state_of(&svc, &uri("wl")).is_none(), "nothing is stored");
+    assert!(known_keys(&svc).is_empty());
+
+    std::fs::write(
+        repo.join(".alice.toml"),
+        "[privacy]\nblock_secrets = false\n",
+    )
+    .unwrap();
+    until_within(
+        "captured once the rules are known",
+        Duration::from_secs(60),
+        || state_of(&svc, &uri("wl")).is_some_and(|s| s.ended),
+    )
+    .await;
+    let row = state_of(&svc, &uri("wl")).unwrap();
+    assert_eq!(
+        (row.byte_offset, row.project_slug.as_str()),
+        (t.len(), "waiting-repo")
+    );
+    assert_eq!(chunks_holding(&svc, "waiting words two is settled"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spooled_notify_is_drained_into_a_pass() {
+    let (d, svc) = local();
+    let path = d.path().join("sp.jsonl");
+    let mut t = Transcript::default();
+    t.turn("sp", 1, "spooledmarker");
+    std::fs::write(&path, &t.bytes).unwrap();
+    let dir = svc.home().spool_dir();
+    alice_daemon::spool::append(
+        &dir,
+        &alice_daemon::spool::SpoolEntry::CaptureNotify(notify("sp", &path, "stop")),
+    )
+    .unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|x| x == "json"))
+                .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["op"], "capture_notify");
+
+    let r = alice_daemon::spool::drain(&dir, &svc).await;
+    assert_eq!((r.processed, r.rejected, r.remaining), (1, 0, 0));
+    until("the drained notify's pass", || {
+        chunks_holding(&svc, "spooledmarker is settled") == 1
+    })
+    .await;
+    assert_eq!(state_of(&svc, &uri("sp")).unwrap().byte_offset, t.len());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tenant_daemon_refuses_notify_and_reads_no_files() {
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path().join("home");
+    let path = d.path().join("tn.jsonl");
+    let mut t = Transcript::default();
+    t.turn("tn", 1, "captured on the laptop");
+    std::fs::write(&path, &t.bytes).unwrap();
+    let laptop = start_with(&home, local_options());
+    laptop
+        .capture_notify(notify("tn", &path, "stop"))
+        .await
+        .unwrap();
+    until("the local capture", || {
+        state_of(&laptop, &uri("tn")).is_some_and(|s| s.byte_offset == t.len())
+    })
+    .await;
+    laptop.shutdown();
+    drop(laptop);
+
+    // The transcript grows and goes stale: a local daemon would pass it and end the source.
+    let cursor = t.len();
+    t.turn("tn", 2, "never read by the server");
+    std::fs::write(&path, &t.bytes).unwrap();
+    age(&path, Duration::from_secs(25 * 3600));
+
+    let svc = start_with(
+        &home,
+        ServiceOptions {
+            tenant: true,
+            ..local_options()
+        },
+    );
+    let e = svc
+        .capture_notify(notify("tn", &path, "stop"))
+        .await
+        .unwrap_err();
+    match e {
+        alice_core::AliceError::Invalid(m) => assert_eq!(
+            m,
+            "this server cannot read files on your machine; use the capture script (docs/capture.md)"
+        ),
+        other => panic!("{other}"),
+    }
+    // A spooled notify is refused the same way.
+    let dir = svc.home().spool_dir();
+    alice_daemon::spool::append(
+        &dir,
+        &alice_daemon::spool::SpoolEntry::CaptureNotify(notify("tn", &path, "stop")),
+    )
+    .unwrap();
+    let r = alice_daemon::spool::drain(&dir, &svc).await;
+    assert_eq!((r.processed, r.rejected), (0, 1));
+
+    // The path is cleared at start; even put back (as a worker would find it), no tenant thread
+    // reads it. Several sweep periods: nothing is read, nothing ends.
+    {
+        let c = rusqlite::Connection::open(AliceHome::new(home.clone()).db()).unwrap();
+        c.execute(
+            "UPDATE capture_state SET transcript_path = ?1",
+            [path.to_string_lossy()],
+        )
+        .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(passes(&svc), 0);
+    assert_eq!(chunks_holding(&svc, "never read by the server"), 0);
+    let row = state_of(&svc, &uri("tn")).unwrap();
+    assert_eq!(row.byte_offset, cursor);
+    assert!(!row.ended);
+    assert_eq!(row.file_key, None);
+}
+
+/// Ruling 2: a line longer than a whole pass (8 MiB) is streamed past. It leaves the stub
+/// `[result] [record skipped: too large]` in its turn (the reader's stub for a line over 4 MiB,
+/// read from the line's last 4 MiB), the cursor lands after its `\n`, and the next turn is
+/// stored. The bytes skipped count one gap, as a tenant client's skip does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_line_becomes_a_stub_and_the_next_turn_is_stored() {
+    let (d, svc) = local();
+    let path = d.path().join("ol.jsonl");
+    let huge = "x".repeat(alice_core::capture::MAX_PASS_BYTES + (1 << 20));
+    let mut t = Transcript::default();
+    t.turn("ol", 1, "before the big line")
+        .prompt("ol-p2", "Read the huge log.")
+        .tool_use("ol-a2", "toolu_big", "cat huge.log")
+        .tool_result("ol-r2", "toolu_big", &huge)
+        .reply("ol-a2b", "The log was too large to show here.")
+        .turn("ol", 3, "after the big line");
+    std::fs::write(&path, &t.bytes).unwrap();
+    svc.capture_notify(notify("ol", &path, "stop"))
+        .await
+        .unwrap();
+    until("turn 3", || known_keys(&svc).contains("ol-p3")).await;
+
+    assert_eq!(
+        chunks_holding(&svc, "[result] [record skipped: too large]"),
+        1
+    );
+    assert_eq!(
+        chunks_holding(&svc, "The log was too large to show here."),
+        1
+    );
+    assert_eq!(chunks_holding(&svc, "after the big line is settled"), 1);
+    assert_eq!(chunks_holding(&svc, "before the big line is settled"), 1);
+    assert_eq!(chunks_holding(&svc, "[tool Bash] cat huge.log"), 1);
+    assert_eq!(chunks_holding(&svc, "xxxxxxxxxxxxxxxx"), 0);
+    let row = state_of(&svc, &uri("ol")).unwrap();
+    assert_eq!(row.byte_offset, t.len());
+    assert_eq!(row.gaps, 1);
+}
+
+/// A transcript longer than eight passes (64 MiB) is read in passes of at most 8 MiB; the job
+/// then goes back in the queue and carries on. A pass that stops short of the end of the file
+/// leaves its last turn open, so no turn is split into a turn and a late tail. The turns have
+/// no tool call (which would hold a cut turn open anyway): a prompt, then a reply whose long
+/// thinking block (not kept) a pass usually ends inside.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_transcript_is_read_in_bounded_passes_that_split_no_turn() {
+    let (d, svc) = local();
+    let path = d.path().join("lg.jsonl");
+    let thinking = "considering the build ".repeat(450);
+    let mut t = Transcript::default();
+    let turns = 6_800;
+    for i in 0..turns {
+        t.prompt(&format!("lg-p{i}"), &format!("Build step {i}."))
+            .line(json!({"type": "assistant", "uuid": format!("lg-a{i}"),
+                "message": {"id": format!("msg-lg-a{i}"), "type": "message", "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": &thinking, "signature": "c2ln"},
+                        {"type": "text", "text": format!("Step {i} is built.")}],
+                    "stop_reason": "end_turn"}}));
+    }
+    assert!(t.len() > 8 * alice_core::capture::MAX_PASS_BYTES as u64);
+    std::fs::write(&path, &t.bytes).unwrap();
+    svc.capture_notify(notify("lg", &path, "stop"))
+        .await
+        .unwrap();
+    until_within("every pass", Duration::from_secs(120), || {
+        state_of(&svc, &uri("lg")).is_some_and(|s| s.byte_offset == t.len())
+    })
+    .await;
+    let keys = known_keys(&svc);
+    for i in 0..turns {
+        assert!(keys.contains(&format!("lg-p{i}")), "turn {i} is captured");
+    }
+    assert!(
+        keys.iter().all(|k| !k.starts_with("tail:")),
+        "no turn was cut at a pass's end"
+    );
+    assert!(passes(&svc) >= 9, "{} passes", passes(&svc));
+    assert_eq!(state_of(&svc, &uri("lg")).unwrap().gaps, 0);
+    assert_eq!(chunks_holding(&svc, "Step 6799 is built."), 1);
+    assert_eq!(chunks_holding(&svc, "considering the build"), 0);
+}
+
+/// A tool result's line in Claude Code's own field order, which `json!` would sort away: the
+/// result in `message`, then `uuid` and `timestamp`, then the result again in `toolUseResult`,
+/// then the session's fields. With an `echo` over 64 KiB, the uuid is out of the reach of the
+/// too-large stub's scan at both ends of the line.
+fn claude_ordered_tool_result(
+    session: &str,
+    uuid: &str,
+    tool_id: &str,
+    result: &str,
+    echo: &str,
+) -> Vec<u8> {
+    let mut line = String::new();
+    line.push_str(&format!(
+        r#"{{"parentUuid":"{session}-call","isSidechain":false,"promptId":"{session}-prompt","type":"user","#
+    ));
+    line.push_str(&format!(
+        r#""message":{{"role":"user","content":[{{"tool_use_id":"{tool_id}","type":"tool_result","content":"{result}","is_error":false}}]}},"#
+    ));
+    line.push_str(&format!(
+        r#""uuid":"{uuid}","timestamp":"2026-10-16T10:00:00.000Z","#
+    ));
+    line.push_str(&format!(
+        r#""toolUseResult":{{"stdout":"{echo}","stderr":"","interrupted":false,"isImage":false}},"#
+    ));
+    line.push_str(&format!(
+        r#""sourceToolAssistantUUID":"{session}-call","permissionDecision":"allow","userType":"external","entrypoint":"cli","cwd":"/work/repo","sessionId":"{session}","version":"2.0.14","gitBranch":"main"}}"#
+    ));
+    line.push('\n');
+    line.into_bytes()
+}
+
+/// Review fix F4: the stub of a line over a pass whose uuid is not near either end (Claude Code's
+/// order, above) has a key of its own. Two such lines, in two sessions, each get their stub and
+/// keep the reply that follows them; with one constant key the second tail would be skipped as
+/// stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn keyless_oversized_lines_in_two_sessions_keep_both_tails() {
+    let (d, svc) = local();
+    let result = "x".repeat(alice_core::capture::MAX_PASS_BYTES + (512 << 10));
+    let echo = "y".repeat(256 << 10);
+    for s in ["ko1", "ko2"] {
+        let path = d.path().join(format!("{s}.jsonl"));
+        let mut t = Transcript::default();
+        t.prompt(&format!("{s}-p1"), "Dump the whole log.")
+            .tool_use(&format!("{s}-a1"), &format!("toolu_{s}"), "cat all.log");
+        t.bytes.extend(claude_ordered_tool_result(
+            s,
+            &format!("{s}-r1"),
+            &format!("toolu_{s}"),
+            &result,
+            &echo,
+        ));
+        t.reply(
+            &format!("{s}-a1b"),
+            &format!("The reply after {s}'s huge log."),
+        )
+        .turn(s, 2, &format!("{s} goes on"));
+        std::fs::write(&path, &t.bytes).unwrap();
+        svc.capture_notify(notify(s, &path, "stop")).await.unwrap();
+        until("the session's next turn", || {
+            known_keys(&svc).contains(&format!("{s}-p2"))
+        })
+        .await;
+        assert_eq!(state_of(&svc, &uri(s)).unwrap().byte_offset, t.len());
+    }
+    for s in ["ko1", "ko2"] {
+        assert_eq!(
+            chunks_holding(&svc, &format!("The reply after {s}'s huge log.")),
+            1,
+            "{s}'s reply after its oversized line"
+        );
+        assert_eq!(chunks_holding(&svc, &format!("{s} goes on is settled")), 1);
+    }
+    assert_eq!(chunks_holding(&svc, "[record skipped: too large]"), 2);
+    let tails: Vec<String> = known_keys(&svc)
+        .into_iter()
+        .filter(|k| k.starts_with("tail:"))
+        .collect();
+    assert_eq!(tails.len(), 2, "one tail key per stub: {tails:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subagent_stop_notify_reads_the_agent_file() {
+    let (d, svc) = local();
+    let main_path = d.path().join("sb.jsonl");
+    let mut main = Transcript::default();
+    main.turn("sb", 1, "the main session");
+    std::fs::write(&main_path, &main.bytes).unwrap();
+    svc.capture_notify(notify("sb", &main_path, "stop"))
+        .await
+        .unwrap();
+    until("the main session", || state_of(&svc, &uri("sb")).is_some()).await;
+
+    let agent_path = d.path().join("agent-sbagent1.jsonl");
+    let mut agent = Transcript::subagent("sbagent1");
+    agent
+        .prompt(
+            "sb-agent1-p",
+            "Survey the repository layout and report back.",
+        )
+        .reply(
+            "sb-agent1-a",
+            &"The repository has a core crate, a daemon crate and a binary package. ".repeat(4),
+        );
+    std::fs::write(&agent_path, &agent.bytes).unwrap();
+    svc.capture_notify(CaptureNotify {
+        agent_id: Some("sbagent1".into()),
+        agent_transcript_path: Some(agent_path.to_string_lossy().into_owned()),
+        ..notify("sb", &main_path, "subagent-stop")
+    })
+    .await
+    .unwrap();
+    let sub_uri = "claude-code:session:sb:agent:sbagent1";
+    until("the subagent's source", || {
+        state_of(&svc, sub_uri).is_some_and(|s| s.byte_offset == agent.len())
+    })
+    .await;
+    let row = state_of(&svc, sub_uri).unwrap();
+    assert_eq!(
+        row.parent_source_id,
+        Some(state_of(&svc, &uri("sb")).unwrap().source_id)
+    );
+    assert_eq!(
+        row.transcript_path.as_deref(),
+        Some(agent_path.to_string_lossy().as_ref())
+    );
+    assert!(chunks_of(&svc, sub_uri)[0].1.contains("core crate"));
+}
+
+/// Ruling 6: a Codex hook may give no transcript path. The worker looks for
+/// `rollout-*<session id>*.jsonl` in the newest 7 date folders of `$CODEX_HOME/sessions`;
+/// compressed rollouts are counted, not read, and a session with no rollout is counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_null_codex_path_is_found_by_session_id() {
+    let d = tempfile::tempdir().unwrap();
+    let codex = d.path().join("codex-home");
+    let day = |y: u32, m: u32, dd: u32| {
+        let dir = codex
+            .join("sessions")
+            .join(format!("{y:04}"))
+            .join(format!("{m:02}"))
+            .join(format!("{dd:02}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    };
+    let new_id = "0199a213-81c0-7800-8aa1-bbab2a035a53";
+    let old_id = "0199a213-81c0-7800-8aa1-000000000002";
+    let zst_id = "0199a213-81c0-7800-8aa1-00000000000f";
+    // Nine date folders across a month end: 2026-09-30 and 2026-10-01 … 10-08.
+    day(2026, 9, 30);
+    for dd in 1..=8 {
+        day(2026, 10, dd);
+    }
+    std::fs::create_dir_all(codex.join("sessions/2026/10/notes")).unwrap();
+    let found = day(2026, 10, 6).join(format!("rollout-2026-10-06T10-00-00-{new_id}.jsonl"));
+    std::fs::write(&found, b"{\"type\":\"session_meta\"}\n").unwrap();
+    // In the eighth newest folder: too old to look at.
+    std::fs::write(
+        day(2026, 10, 1).join(format!("rollout-2026-10-01T09-00-00-{old_id}.jsonl")),
+        b"{}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        day(2026, 10, 8).join(format!("rollout-2026-10-08T09-00-00-{zst_id}.jsonl.zst")),
+        b"compressed",
+    )
+    .unwrap();
+
+    use alice_daemon::capture::find_rollout;
+    assert_eq!(find_rollout(&codex, new_id), Some(found.clone()));
+    assert_eq!(
+        find_rollout(&codex, old_id),
+        None,
+        "beyond the newest 7 folders"
+    );
+    assert_eq!(find_rollout(&codex, zst_id), None, "compressed: not read");
+    assert_eq!(find_rollout(&codex, "0199a213-nothing"), None);
+    assert_eq!(find_rollout(&d.path().join("no-such-home"), new_id), None);
+
+    let svc = start_with(
+        &d.path().join("home"),
+        ServiceOptions {
+            codex_home: Some(codex.clone()),
+            ..local_options()
+        },
+    );
+    let codex_notify = |session: &str| CaptureNotify {
+        agent: "codex".into(),
+        event: "session-start".into(),
+        session_id: session.into(),
+        transcript_path: String::new(),
+        ..Default::default()
+    };
+    svc.capture_notify(codex_notify(new_id)).await.unwrap();
+    let codex_uri = format!("codex:session:{new_id}");
+    until("the rollout is found and registered", || {
+        state_of(&svc, &codex_uri).is_some()
+    })
+    .await;
+    assert_eq!(
+        state_of(&svc, &codex_uri)
+            .unwrap()
+            .transcript_path
+            .as_deref(),
+        Some(found.to_string_lossy().as_ref())
+    );
+
+    svc.capture_notify(codex_notify(old_id)).await.unwrap();
+    until("a missing rollout is counted", || {
+        svc.capture_counts().rollouts_not_found == 1
+    })
+    .await;
+    svc.capture_notify(codex_notify(zst_id)).await.unwrap();
+    until("a compressed rollout is counted", || {
+        svc.capture_counts().rollouts_compressed == 1
+    })
+    .await;
+    assert_eq!(svc.capture_counts().rollouts_not_found, 1);
+    assert!(!source_exists(&svc, &format!("codex:session:{old_id}")));
+    assert!(!source_exists(&svc, &format!("codex:session:{zst_id}")));
+}
+
+/// Review fix F1: a rollout is `rollout-*-<session id>.jsonl` (or `.jsonl.zst`), the whole id at
+/// the end of the name. An id that is part of another session's id, at either end, never finds
+/// that session's rollout, plain or compressed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollout_matches_the_whole_session_id() {
+    let d = tempfile::tempdir().unwrap();
+    let codex = d.path().join("codex-home");
+    let newest = codex.join("sessions/2026/10/08");
+    let older = codex.join("sessions/2026/10/05");
+    std::fs::create_dir_all(&newest).unwrap();
+    std::fs::create_dir_all(&older).unwrap();
+    let file = |dir: &Path, name: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, b"{}\n").unwrap();
+        p
+    };
+    // In the newest folder, rollouts of sessions whose ids hold `abc`, and none of `abc` itself.
+    let xabc = file(&newest, "rollout-2026-10-08T09-00-00-xabc.jsonl");
+    let abc_1 = file(&newest, "rollout-2026-10-08T10-00-00-abc-1.jsonl");
+    file(&newest, "rollout-2026-10-08T11-00-00-xabc.jsonl.zst");
+    file(&newest, "rollout-2026-10-08T12-00-00-abc.jsonl.bak");
+    // `rollout-` and `-abc.jsonl` would have to share the `-`: not a rollout of `abc`.
+    file(&newest, "rollout-abc.jsonl");
+    let abc = file(&older, "rollout-2026-10-05T09-00-00-abc.jsonl");
+
+    use alice_daemon::capture::find_rollout;
+    assert_eq!(find_rollout(&codex, "abc"), Some(abc));
+    assert_eq!(find_rollout(&codex, "xabc"), Some(xabc));
+    assert_eq!(find_rollout(&codex, "abc-1"), Some(abc_1));
+    // Parts of those ids that the name does not delimit with `-` on the left.
+    for part in ["bc", "ab", "c-1", "abc-"] {
+        assert_eq!(find_rollout(&codex, part), None, "{part}");
+    }
+
+    // Through the worker: `bc` has no rollout, and `xabc`'s compressed one is not counted for it.
+    let svc = start_with(
+        &d.path().join("home"),
+        ServiceOptions {
+            codex_home: Some(codex.clone()),
+            ..local_options()
+        },
+    );
+    svc.capture_notify(CaptureNotify {
+        agent: "codex".into(),
+        event: "session-start".into(),
+        session_id: "bc".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    until("the missing rollout is counted", || {
+        svc.capture_counts().rollouts_not_found == 1
+    })
+    .await;
+    assert_eq!(svc.capture_counts().rollouts_compressed, 0);
+    assert!(!source_exists(&svc, "codex:session:bc"));
+}
+
+/// Review fix F2: a compressed rollout named by the hook itself is skipped by its file name,
+/// whatever the source's cursor: it is never opened (no pass runs and the stored identity and
+/// cursor stay), nothing is stored, and it is counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compressed_rollout_is_skipped_by_its_name() {
+    let d = tempfile::tempdir().unwrap();
+    // No periodic sweep: only the notifies below run passes.
+    let svc = start_with(
+        &d.path().join("home"),
+        ServiceOptions {
+            capture_sweep_every: Duration::from_secs(3_600),
+            ..local_options()
+        },
+    );
+    let session = "0199a213-81c0-7800-8aa1-0000000000z1";
+    let plain = d
+        .path()
+        .join(format!("rollout-2026-10-08T09-00-00-{session}.jsonl"));
+    std::fs::write(&plain, "{\"type\":\"session_meta\"}\n".repeat(100)).unwrap();
+    let codex_notify = |path: &Path, event: &str| CaptureNotify {
+        agent: "codex".into(),
+        event: event.into(),
+        session_id: session.into(),
+        transcript_path: path.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    // The session is registered from its plain rollout, then its cursor is put past 0.
+    svc.capture_notify(codex_notify(&plain, "session-start"))
+        .await
+        .unwrap();
+    let codex_uri = format!("codex:session:{session}");
+    until("the session is registered", || {
+        state_of(&svc, &codex_uri).is_some() && passes(&svc) == 1
+    })
+    .await;
+    {
+        let c = rusqlite::Connection::open(svc.home().db()).unwrap();
+        c.execute("UPDATE capture_state SET byte_offset = 1000", [])
+            .unwrap();
+    }
+    let before = state_of(&svc, &codex_uri).unwrap();
+    assert_eq!(before.byte_offset, 1000);
+    let passes_before = passes(&svc);
+
+    let zst = d
+        .path()
+        .join(format!("rollout-2026-10-08T09-00-00-{session}.jsonl.zst"));
+    std::fs::write(&zst, b"\x28\xb5\x2f\xfd compressed frames").unwrap();
+    svc.capture_notify(codex_notify(&zst, "stop"))
+        .await
+        .unwrap();
+    until("the compressed rollout is counted", || {
+        svc.capture_counts().rollouts_compressed == 1
+    })
+    .await;
+    assert_eq!(passes(&svc), passes_before, "no pass read it");
+    let after = state_of(&svc, &codex_uri).unwrap();
+    assert_eq!(after.byte_offset, 1000);
+    assert_eq!(after.file_key, before.file_key, "never opened and keyed");
+    assert_eq!(after.transcript_path, before.transcript_path);
+    assert!(chunks_of(&svc, &codex_uri).is_empty());
+    assert_eq!(svc.capture_counts().rollouts_not_found, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_notify_is_checked_before_it_is_queued() {
+    let (d, svc) = local();
+    let path = d.path().join("ck.jsonl");
+    let bad = [
+        CaptureNotify {
+            agent: "cursor".into(),
+            ..notify("ck", &path, "stop")
+        },
+        notify("ck", &path, "teatime"),
+        notify("../ck", &path, "stop"),
+        notify("ck", Path::new("relative/ck.jsonl"), "stop"),
+        notify("ck", Path::new(""), "stop"),
+        CaptureNotify {
+            agent_transcript_path: Some(path.to_string_lossy().into_owned()),
+            ..notify("ck", &path, "subagent-stop")
+        },
+    ];
+    for n in bad {
+        let e = svc.capture_notify(n.clone()).await.unwrap_err();
+        assert!(
+            matches!(e, alice_core::AliceError::Invalid(_)),
+            "{n:?}: {e}"
+        );
+    }
+    // A path that is not a `.jsonl` transcript is queued, then refused unread.
+    let other = d.path().join("ck.txt");
+    std::fs::write(&other, b"{}\n").unwrap();
+    svc.capture_notify(notify("ck", &other, "session-start"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!source_exists(&svc, &uri("ck")));
 }

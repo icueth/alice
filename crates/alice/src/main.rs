@@ -2,6 +2,7 @@
 
 mod bench;
 mod cmd;
+mod hook;
 
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
@@ -96,6 +97,9 @@ enum Command {
     Daemon(cmd::DaemonCmd),
     /// Run the MCP server on stdio (configure agents to launch `alice mcp`).
     Mcp,
+    /// Agent hook (Claude Code, Codex): tell the daemon a session's transcript grew, and print
+    /// the briefing at SessionStart. Reads the hook's JSON on stdin and always exits 0.
+    Hook(cmd::HookArgs),
     /// Read and change settings (config.toml, applied live) and secrets.
     #[command(subcommand)]
     Config(cmd::ConfigCmd),
@@ -137,6 +141,11 @@ fn log_filter(spec: Option<&str>, is_server: bool) -> tracing_subscriber::EnvFil
 }
 
 fn main() -> std::process::ExitCode {
+    // `alice hook` runs at every turn of an agent, within 100 ms, and never fails: it starts
+    // before the tracing subscriber and the CLI runtime, and parses its own arguments.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "hook") {
+        return hook::main();
+    }
     let cli = Cli::parse();
     alice_daemon::install_tls();
     let is_server = matches!(

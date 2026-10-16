@@ -683,6 +683,20 @@ async fn capture_transcript(
     }
 }
 
+/// `POST /api/v1/capture/notify` (SP2 spec §4.2): `202 {"queued": true}` at once; the daemon
+/// reads the transcript later. `400` for a bad notification, and on a server tenant.
+async fn capture_notify(
+    State(st): State<AppState>,
+    ApiJson(n): ApiJson<CaptureNotify>,
+) -> Result<Response, ApiError> {
+    st.svc.capture_notify(n).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "queued": true })),
+    )
+        .into_response())
+}
+
 /// `GET /api/v1/capture/status`.
 async fn capture_status(State(st): State<AppState>) -> ApiResult<CaptureStatus> {
     Ok(Json(st.svc.capture_status().await?))
@@ -1153,6 +1167,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
             "/api/v1/capture/transcript",
             post(capture_transcript).layer(DefaultBodyLimit::max(TRANSCRIPT_BODY_LIMIT)),
         )
+        .route("/api/v1/capture/notify", post(capture_notify))
         .route("/api/v1/capture/status", get(capture_status))
         .route("/api/v1/capture/distill", post(capture_distill))
         .route("/api/v1/capture/briefing", get(capture_briefing))
@@ -1377,5 +1392,61 @@ mod tests {
             e["error"].as_str().unwrap().contains("the disk is full"),
             "{e}"
         );
+    }
+
+    /// `POST /api/v1/capture/notify` is behind the token and answers `202 {"queued": true}`; a
+    /// server tenant refuses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_capture_notify_route_queues_behind_the_token() {
+        crate::install_tls();
+        for tenant in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let svc = Service::start(
+                AliceHome::new(d.path().join("home")),
+                &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+                ServiceOptions {
+                    tenant,
+                    ..ServiceOptions::default()
+                },
+            )
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = router(svc, "n".repeat(64), port, CancellationToken::new());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("http://127.0.0.1:{port}/api/v1/capture/notify");
+            let body = CaptureNotify {
+                agent: "claude-code".into(),
+                event: "stop".into(),
+                session_id: "hn1".into(),
+                transcript_path: d.path().join("hn1.jsonl").display().to_string(),
+                ..Default::default()
+            };
+            let http = reqwest::Client::new();
+            let r = http.post(&url).json(&body).send().await.unwrap();
+            assert_eq!(r.status(), 401);
+            let r = http
+                .post(&url)
+                .bearer_auth("n".repeat(64))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            if tenant {
+                assert_eq!(r.status(), 400);
+                let e: serde_json::Value = r.json().await.unwrap();
+                assert!(
+                    e["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("cannot read files on your machine"),
+                    "{e}"
+                );
+            } else {
+                assert_eq!(r.status(), 202);
+                let v: serde_json::Value = r.json().await.unwrap();
+                assert_eq!(v, serde_json::json!({ "queued": true }));
+            }
+        }
     }
 }

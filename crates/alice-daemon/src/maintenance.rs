@@ -1287,8 +1287,9 @@ fn age_cutoff(now: DateTime<Utc>, age: Duration) -> Option<DateTime<Utc>> {
         .and_then(|d| now.checked_sub_signed(d))
 }
 
-/// Best effort: below normal priority so maintenance never competes with requests.
-fn lower_priority() {
+/// Best effort: below normal priority so maintenance (and local capture) never competes with
+/// requests.
+pub(crate) fn lower_priority() {
     #[cfg(target_os = "linux")]
     // SAFETY: changes only this thread's nice value.
     unsafe {
