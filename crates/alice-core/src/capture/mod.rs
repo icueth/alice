@@ -4,11 +4,12 @@
 //! the complete turns it holds, the late tail of the previous turn, and how far the cursor may
 //! move. It is pure: no I/O, no clock.
 //!
-//! Lines become records (`claude.rs`), records become turns (`record.rs`), and turns become text.
+//! Lines become records (`claude.rs`, `codex.rs`), records become turns (`record.rs`), and turns become text.
 //! The rendering here is a placeholder (each turn's blocks joined by `\n`, one chunk per turn);
 //! Task 3 replaces it with the rendering contract of spec §3.3.
 
 mod claude;
+mod codex;
 mod record;
 mod render;
 
@@ -195,8 +196,17 @@ pub fn read(agent: AgentKind, input: &[u8], opts: &ReadOptions) -> ReadOutcome {
     let mut out = ReadOutcome::default();
     let parse: fn(&[u8]) -> claude::LineResult = match agent {
         AgentKind::ClaudeCode => claude::parse_line,
-        // The Codex rollout reader is Task 17. Until then nothing is read or consumed.
-        AgentKind::Codex => return out,
+        AgentKind::Codex => {
+            if opts.at_file_start && input.starts_with(&codex::ZSTD_MAGIC) {
+                // A compressed rollout (spec R21) is counted, not read: one invalid line, and
+                // the pass is consumed so the same file is not offered again.
+                out.stats.lines = 1;
+                out.stats.invalid = 1;
+                out.consumed = input.len().min(MAX_PASS_BYTES) as u64;
+                return out;
+            }
+            codex::parse_line
+        }
     };
     let full_pass = input.len() >= MAX_PASS_BYTES;
     let input = &input[..input.len().min(MAX_PASS_BYTES)];
@@ -1079,5 +1089,328 @@ mod tests {
         // A call answered earlier in the turn does not hold the turn open.
         input.extend(assistant_line("a-2", "msg_done", "Done."));
         assert_eq!(read(CLAUDE, &input, &opts(true, true)).turns.len(), 1);
+    }
+
+    // ---- Codex rollouts (Task 17a; format: tests/fixtures/capture/codex/FORMAT.md) ----
+
+    const CODEX: AgentKind = AgentKind::Codex;
+    const CODEX_SAMPLE: &[u8] = include_bytes!("../../tests/fixtures/capture/codex/sample-1.jsonl");
+
+    /// One rollout line: the envelope, then the payload.
+    fn rollout(ts: &str, kind: &str, payload: serde_json::Value) -> Vec<u8> {
+        line(json!({"timestamp": ts, "ordinal": 0, "type": kind, "payload": payload}))
+    }
+
+    fn codex_message(ts: &str, role: &str, kinds: &[&str], text: &str) -> Vec<u8> {
+        let block = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        rollout(
+            ts,
+            "response_item",
+            json!({
+                "type": "message", "id": format!("msg_{ts}"), "role": role,
+                "content": [{"type": block, "text": text}],
+                "internal_chat_message_metadata_passthrough":
+                    {"turn_id": "t-1", "content_item_kinds": kinds},
+            }),
+        )
+    }
+
+    fn codex_typed(ts: &str, text: &str) -> Vec<u8> {
+        codex_message(ts, "user", &["user.text"], text)
+    }
+
+    #[test]
+    fn codex_turns_and_rendering_follow_the_contract() {
+        let mut input = Vec::new();
+        input.extend(rollout(
+            "2026-10-14T09:00:00.000Z",
+            "session_meta",
+            json!({"id": "s-1", "session_id": "s-1", "cwd": "/home/user/project-x"}),
+        ));
+        input.extend(codex_message(
+            "2026-10-14T09:00:00.100Z",
+            "developer",
+            &["permissions.instructions"],
+            "Harness rules.",
+        ));
+        input.extend(codex_message(
+            "2026-10-14T09:00:00.200Z",
+            "user",
+            &["agents_md.instructions", "environments.environment_context"],
+            "<environment_context>cwd</environment_context>",
+        ));
+        input.extend(rollout(
+            "2026-10-14T09:00:00.300Z",
+            "world_state",
+            json!({"full": true}),
+        ));
+        input.extend(codex_typed(
+            "2026-10-14T09:00:01.000Z",
+            "Fix the login bug.",
+        ));
+        // The UI-level copy of the typed prompt adds nothing.
+        input.extend(rollout(
+            "2026-10-14T09:00:01.010Z",
+            "event_msg",
+            json!({"type": "item_completed", "item": {"type": "UserMessage", "content": [{"type": "text", "text": "Fix the login bug."}]}}),
+        ));
+        input.extend(codex_message(
+            "2026-10-14T09:00:02.000Z",
+            "assistant",
+            &["unknown"],
+            "Looking at the handler.",
+        ));
+        input.extend(rollout(
+            "2026-10-14T09:00:03.000Z",
+            "response_item",
+            json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "Private plan."}], "encrypted_content": "ZW5j"}),
+        ));
+        input.extend(rollout(
+            "2026-10-14T09:00:04.000Z",
+            "response_item",
+            json!({"type": "custom_tool_call", "id": "c1", "call_id": "call_1", "name": "exec", "status": "completed", "input": "git status --short"}),
+        ));
+        input.extend(rollout(
+            "2026-10-14T09:00:05.000Z",
+            "response_item",
+            json!({"type": "custom_tool_call_output", "call_id": "call_1", "output": [{"type": "input_text", "text": "On branch main"}]}),
+        ));
+        input.extend(rollout(
+            "2026-10-14T09:00:06.000Z",
+            "response_item",
+            json!({"type": "function_call", "id": "f1", "call_id": "call_2", "name": "shell", "arguments": "{\"command\":[\"bash\",\"-lc\",\"cargo test\"],\"workdir\":\"/x\"}"}),
+        ));
+        input.extend(rollout(
+            "2026-10-14T09:00:07.000Z",
+            "response_item",
+            json!({"type": "function_call_output", "call_id": "call_2", "output": "test result: FAILED"}),
+        ));
+        input.extend(rollout(
+            "2026-10-14T09:00:08.000Z",
+            "response_item",
+            json!({"type": "custom_tool_call", "call_id": "call_3", "name": "apply_patch", "status": "completed",
+                   "input": "*** Begin Patch\n*** Update File: src/login.rs\n@@\n-old\n+new\n*** Add File: src/new.rs\n+x\n*** End Patch"}),
+        ));
+        input.extend(rollout(
+            "2026-10-14T09:00:09.000Z",
+            "response_item",
+            json!({"type": "custom_tool_call_output", "call_id": "call_3", "output": "Success. Updated the following files:\nM src/login.rs"}),
+        ));
+        input.extend(rollout(
+            "2026-10-14T09:00:10.000Z",
+            "response_item",
+            json!({"type": "function_call", "namespace": "mcp__alice__", "call_id": "call_4", "name": "remember", "arguments": "{\"title\":\"Login uses sqlx\",\"content\":\"body\"}"}),
+        ));
+        input.extend(rollout(
+            "2026-10-14T09:00:11.000Z",
+            "response_item",
+            json!({"type": "function_call_output", "call_id": "call_4", "output": "stored mem_1"}),
+        ));
+        input.extend(codex_message(
+            "2026-10-14T09:00:12.000Z",
+            "assistant",
+            &["unknown"],
+            "Fixed.",
+        ));
+        // A compaction is a turn of its own; its replayed history is not read again.
+        input.extend(rollout(
+            "2026-10-14T09:10:00.000Z",
+            "compacted",
+            json!({"message": "Recap: the login bug is fixed.", "replacement_history": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Fix the login bug."}],
+                 "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["user.text"]}}]}),
+        ));
+        input.extend(codex_typed("2026-10-14T09:20:00.000Z", "Now the logout."));
+        input.extend(codex_message(
+            "2026-10-14T09:20:01.000Z",
+            "assistant",
+            &["unknown"],
+            "On it.",
+        ));
+
+        let out = read(CODEX, &input, &opts(true, true));
+        assert_eq!((out.stats.unknown, out.stats.invalid), (0, 0));
+        assert_eq!(out.consumed, input.len() as u64);
+        // The head (session_meta, developer, injected context) carries nothing to capture.
+        assert_eq!(out.turns.len(), 3, "{:#?}", keys(&out));
+        for (turn, prompt) in
+            out.turns
+                .iter()
+                .zip([Some("Fix the login bug."), None, Some("Now the logout.")])
+        {
+            assert_eq!(turn.prompt.as_deref(), prompt);
+        }
+        // Without a uuid on any line the key is the hash of time and first text.
+        assert_eq!(
+            out.turns[0].key,
+            turn_key(None, Some("2026-10-14T09:00:01.000Z"), "Fix the login bug.")
+        );
+        assert_eq!(
+            out.turns[0].started_at.as_deref(),
+            Some("2026-10-14T09:00:01.000Z")
+        );
+
+        let first = turn_text(&out.turns[0]);
+        let want = [
+            "[user] Fix the login bug.",
+            "[assistant] Looking at the handler.",
+            "[tool Bash] git status --short",
+            "[result] On branch main",
+            "[tool Bash] cargo test",
+            "[result] test result: FAILED",
+            "[tool Edit] src/login.rs, src/new.rs",
+            "[tool alice remember] Login uses sqlx",
+            "[result] [omitted: memory tool]",
+            "[assistant] Fixed.",
+        ];
+        let mut at = 0;
+        for tag in want {
+            let found = first[at..]
+                .find(tag)
+                .unwrap_or_else(|| panic!("{tag:?} in order in:\n{first}"));
+            at += found + tag.len();
+        }
+        // Not kept: harness text, reasoning, the patch body, the memory text, the UI duplicate.
+        for gone in [
+            "Harness rules",
+            "environment_context",
+            "Private plan",
+            "-old",
+            "body",
+            "Success. Updated",
+        ] {
+            assert!(!first.contains(gone), "{gone:?} leaked:\n{first}");
+        }
+        assert_eq!(first.matches("Fix the login bug.").count(), 1);
+
+        assert_eq!(
+            turn_text(&out.turns[1]),
+            "[summary] Recap: the login bug is fixed."
+        );
+        assert_eq!(out.turns[1].prompt, None);
+        assert_eq!(
+            turn_text(&out.turns[2]),
+            "[user] Now the logout.\n[assistant] On it."
+        );
+
+        // Every line of the rendering starts with a contract tag.
+        for line in all_text(&out).lines().filter(|l| !l.is_empty()) {
+            assert!(TAGS.iter().any(|t| line.starts_with(t)), "{line:?}");
+        }
+
+        // The turn rule is the Claude one: an open trailing turn waits, a late tail is kept.
+        let open = read(CODEX, &input, &opts(true, false));
+        assert_eq!(open.turns.len(), 2);
+        assert_eq!(open.consumed, line_start(&input, "Now the logout."));
+        let resumed = read(CODEX, &input[open.consumed as usize..], &opts(false, true));
+        assert_eq!(keys(&resumed), [out.turns[2].key.clone()]);
+        let mut late = Vec::new();
+        late.extend(codex_message(
+            "2026-10-14T09:20:05.000Z",
+            "assistant",
+            &["unknown"],
+            "Late note.",
+        ));
+        let tail = read(CODEX, &late, &opts(false, true));
+        assert!(tail.turns.is_empty());
+        assert_eq!(tail.tail.len(), 1);
+        assert_eq!(tail.tail[0].text, "[assistant] Late note.");
+        assert!(
+            tail.tail_key
+                .as_deref()
+                .is_some_and(|k| k.starts_with("tail:"))
+        );
+
+        // Reading the same bytes again gives identical turns (re-render is byte-identical).
+        assert_eq!(read(CODEX, &input, &opts(true, true)).turns, out.turns);
+    }
+
+    #[test]
+    fn codex_tolerates_newer_shapes() {
+        let mut input = Vec::new();
+        input.extend(codex_typed("2026-10-14T09:00:01.000Z", "Hello there."));
+        for v in [
+            json!({"timestamp": "t", "type": "brand_new_line", "payload": {}}),
+            json!({"timestamp": "t", "type": "response_item", "payload": {"type": "hologram"}}),
+            json!({"type": "response_item"}),
+            json!({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": null}}),
+            json!({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [7, {"type": "output_text", "text": null}]}}),
+            json!({"type": "response_item", "payload": {"type": "function_call", "name": 5}}),
+        ] {
+            input.extend(line(v));
+        }
+        input.extend(b"not json\n\xff\xfe\n[1]\n");
+        let out = read(CODEX, &input, &opts(true, true));
+        assert_eq!(out.turns.len(), 1);
+        assert_eq!(out.stats.invalid, 3);
+        assert!(out.stats.unknown >= 4, "{:?}", out.stats);
+        assert_eq!(turn_text(&out.turns[0]), "[user] Hello there.");
+    }
+
+    #[test]
+    fn codex_samples_read_without_unknown_lines() {
+        // The window ends on a call with no output yet, so the close is forced.
+        let forced = ReadOptions {
+            force_close: true,
+            ..opts(true, true)
+        };
+        let out = read(CODEX, CODEX_SAMPLE, &forced);
+        assert_eq!(out.stats.unknown, 0);
+        assert_eq!(out.stats.invalid, 0);
+        assert_eq!(out.stats.lines, 94);
+        assert_eq!(out.consumed, CODEX_SAMPLE.len() as u64);
+        // One typed prompt (the other user messages are injected context) and one compaction
+        // whose summary is empty: a single turn, and no harness text in it.
+        assert_eq!(out.turns.len(), 1, "{:?}", keys(&out));
+        let text = turn_text(&out.turns[0]);
+        assert!(text.starts_with("[user] lorem-2744"), "{text}");
+        assert!(text.contains("[assistant] lorem-2747"));
+        assert!(text.contains("[tool Bash] lorem-2748"));
+        assert!(!text.contains("encrypted"));
+        for chunk in &out.turns[0].chunks {
+            assert!(TAGS.iter().any(|t| chunk.text.starts_with(t)), "{chunk:?}");
+        }
+        // Cut at any line boundary the reader never fails: every prefix reads clean.
+        for (n, _) in CODEX_SAMPLE
+            .iter()
+            .enumerate()
+            .filter(|&(_, &b)| b == b'\n')
+            .step_by(7)
+        {
+            let part = read(CODEX, &CODEX_SAMPLE[..=n], &forced);
+            assert_eq!((part.stats.unknown, part.stats.invalid), (0, 0), "at {n}");
+        }
+    }
+
+    #[test]
+    fn a_zst_rollout_is_counted_not_read() {
+        // A zstd frame starts with 28 b5 2f fd; the rest is binary.
+        let mut zst = vec![0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x0a, 0x91, 0x00];
+        zst.extend(b"\n{\"type\":\"response_item\"}\n");
+        zst.extend((0u8..=255).collect::<Vec<_>>());
+        let out = read(CODEX, &zst, &ReadOptions::default());
+        assert!(out.turns.is_empty());
+        assert!(out.tail.is_empty());
+        assert_eq!(out.stats.invalid, 1, "counted once");
+        assert_eq!(out.stats.unknown, 0);
+        assert_eq!(
+            out.consumed,
+            zst.len() as u64,
+            "nothing is left to read again"
+        );
+        // The magic only matters at the file start: later passes see plain bad lines.
+        let later = read(
+            CODEX,
+            &zst,
+            &ReadOptions {
+                at_file_start: false,
+                ..ReadOptions::default()
+            },
+        );
+        assert!(later.turns.is_empty());
     }
 }
