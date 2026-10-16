@@ -50,6 +50,8 @@ struct DistillScript {
     distill_calls: AtomicUsize,
     /// The question texts of every distillation request, one list per request.
     questions: Mutex<Vec<Vec<String>>>,
+    /// Every request body received (the judge's and distillation's).
+    bodies: Mutex<Vec<String>>,
 }
 
 fn is_distill_question(id: &str) -> bool {
@@ -65,6 +67,7 @@ impl DistillScript {
             calls: AtomicUsize::new(0),
             distill_calls: AtomicUsize::new(0),
             questions: Mutex::new(Vec::new()),
+            bodies: Mutex::new(Vec::new()),
         })
     }
 
@@ -80,6 +83,11 @@ impl DistillScript {
     /// Distillation requests posted, retries included.
     fn distill_calls(&self) -> usize {
         self.distill_calls.load(Ordering::SeqCst)
+    }
+
+    /// Whether any request received so far holds `needle`.
+    fn received(&self, needle: &str) -> bool {
+        self.bodies.lock().iter().any(|b| b.contains(needle))
     }
 
     /// Every distillation question asked so far.
@@ -99,6 +107,9 @@ impl JevTransport for DistillScript {
         assert_eq!(key, KEY, "the configured key is the one sent");
         self.calls.fetch_add(1, Ordering::SeqCst);
         let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+        self.bodies
+            .lock()
+            .push(String::from_utf8_lossy(body).into_owned());
         let questions = req["questions"].as_object().unwrap().clone();
         if questions.keys().any(|k| is_distill_question(k)) {
             self.distill_calls.fetch_add(1, Ordering::SeqCst);
@@ -169,6 +180,8 @@ struct Opts {
     config: &'static str,
     key: bool,
     idle: Option<Duration>,
+    /// A server tenant: sessions name their project by a hint, not a working directory.
+    tenant: bool,
 }
 
 impl Opts {
@@ -177,6 +190,7 @@ impl Opts {
             config: JEV,
             key: true,
             idle: None,
+            tenant: false,
         }
     }
 }
@@ -203,6 +217,7 @@ fn start_service(home: &Path, script: &Arc<DistillScript>, o: &Opts) -> Arc<Serv
             jev_transport: Some(script.clone()),
             distill_tick: Duration::from_millis(100),
             distill_idle_override: o.idle,
+            tenant: o.tenant,
             judge_retry_every: Duration::from_millis(200),
             ..Default::default()
         },
@@ -280,7 +295,8 @@ impl Daemon {
                 session: session.into(),
                 offset,
                 event: event.into(),
-                cwd: Some(self.repo(slug).to_string_lossy().into_owned()),
+                cwd: (!self.opts.tenant).then(|| self.repo(slug).to_string_lossy().into_owned()),
+                project_header: self.opts.tenant.then(|| slug.to_string()),
                 ..Default::default()
             },
             &t.bytes[offset as usize..],
@@ -1319,20 +1335,32 @@ async fn no_distill_and_excluded_projects_are_skipped() {
     d.shutdown();
 }
 
-/// Task 12 supplement, rulings 4 and 5: a session with no capture for 24 h is marked ended
-/// (tenants have no sweep) and distilled as a closed session, so its handoff is offered.
+/// A time `hours` ago, as the store writes times.
+fn hours_ago(hours: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::hours(hours))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Task 12 supplement, rulings 4 and 5: on a server tenant (no sweep), a session with no
+/// capture for 24 h is marked ended and distilled as a closed session, so its handoff is offered.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_session_silent_for_a_day_is_ended_and_distilled() {
-    let mut d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+async fn a_tenant_session_silent_for_a_day_is_ended_and_distilled() {
+    let mut d = Daemon::start(
+        Opts {
+            tenant: true,
+            ..Opts::jev()
+        },
+        DistillScript::new(ANSWERS),
+    );
     let mut t = one_decision("st1");
     t.prompt("st1-p2", "Where do we stand with the cache work right now?")
         .reply("st1-a2", HANDOFF);
     d.send("shop", "st1", &t, 0, "stop").await;
     assert!(!d.state(&uri("st1")).ended);
-    d.restart_with(
-        "UPDATE capture_state SET last_capture_at = '2026-10-01T00:00:00.000Z',
-                                  created_at = '2026-10-01T00:00:00.000Z'",
-    )
+    d.restart_with(&format!(
+        "UPDATE capture_state SET last_capture_at = '{0}', created_at = '{0}'",
+        hours_ago(30)
+    ))
     .await;
     until("the silent session is distilled", || {
         d.state(&uri("st1")).state == "done"
@@ -1341,6 +1369,32 @@ async fn a_session_silent_for_a_day_is_ended_and_distilled() {
     assert!(d.state(&uri("st1")).ended, "marked ended");
     let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
     assert_eq!(kinds, ["decision", "handoff"]);
+    d.shutdown();
+}
+
+/// Fix round 1 (the Task 6b ruling): locally the capture sweep owns the stale end, with its
+/// final pass that captures the trailing turn, so the distill worker never marks a local source
+/// ended. The quiet session is still distilled, as an open one (no handoff offered).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_session_silent_for_a_day_is_not_marked_ended() {
+    let mut d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    let mut t = one_decision("sl1");
+    t.prompt("sl1-p2", "Where do we stand with the cache work right now?")
+        .reply("sl1-a2", HANDOFF);
+    d.send("shop", "sl1", &t, 0, "stop").await;
+    d.restart_with(&format!(
+        "UPDATE capture_state SET last_capture_at = '{0}', created_at = '{0}'",
+        hours_ago(30)
+    ))
+    .await;
+    until("the quiet session is distilled", || {
+        d.state(&uri("sl1")).state == "done"
+    })
+    .await;
+    settle().await;
+    assert!(!d.state(&uri("sl1")).ended, "not marked ended locally");
+    let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, ["decision"], "an open session offers no handoff");
     d.shutdown();
 }
 
@@ -1536,5 +1590,380 @@ async fn a_session_whose_chunks_are_gone_moves_on() {
     })
     .await;
     assert_eq!(d.script.distill_calls(), 1, "nothing to ask about");
+    d.shutdown();
+}
+
+// ---- Fix round 1 ----
+
+/// Fix round 1, C1: a subagent working in another repository is gated by its own project. A
+/// subagent in a cloud-denied project is never sent (its chunks wait, and its state says why);
+/// one in an allowed project is sent, and its memory lands in its own project, not the session's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cloud_denied_subagent_is_never_sent() {
+    let config = "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\n\n[privacy]\ncloud_denied_projects = [\"work\"]\n";
+    let answers: &[(&str, &str)] = &[
+        ("decided to use pnpm workspaces", "decision"),
+        ("The cache service listens on port", "fact"),
+        ("zebra-quartz", "fact"),
+    ];
+    let d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(answers),
+    );
+    let mut main = one_decision("cs1");
+    main.prompt("cs1-p2", "Ask two helpers about the payroll keys and the cache, please.")
+        .tool(
+            "cs1-a2",
+            "tu_w",
+            "Task",
+            json!({"subagent_type": "Explore", "description": "payroll keys", "prompt": "Find when the payroll keys rotate."}),
+        )
+        .tool_result("cs1-r2", "tu_w", "done")
+        .tool(
+            "cs1-a3",
+            "tu_t",
+            "Task",
+            json!({"subagent_type": "Explore", "description": "cache config", "prompt": "Find how the cache service is configured."}),
+        )
+        .tool_result("cs1-r3", "tu_t", "done")
+        .reply("cs1-a4", "Done.");
+    d.send("shop", "cs1", &main, 0, "stop").await;
+    let subagent = |id: &str, repo: &str, prompt: &str, report: &str| {
+        let mut t = Transcript::subagent(id);
+        t.prompt(&format!("{id}-p"), prompt)
+            .reply(&format!("{id}-a"), report);
+        let q = TranscriptQuery {
+            agent: "claude-code".into(),
+            session: "cs1".into(),
+            subagent: Some(id.into()),
+            offset: 0,
+            event: "subagent-stop".into(),
+            cwd: Some(d.repo(repo).to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        (q, t)
+    };
+    let (q, t) = subagent(
+        "agw",
+        "work",
+        "Find when the payroll keys rotate.",
+        "The payroll signing keys rotate every Monday at 02:00 UTC from the vault-west cluster; the rotation job is tagged zebra-quartz-41 in the scheduler.",
+    );
+    assert!(d.send_q(q, &t.bytes).await.turns_stored >= 1);
+    let (q, t) = subagent(
+        "agt",
+        "tools",
+        "Find how the cache service is configured.",
+        "The cache service listens on port 6380 and keeps its data in /var/lib/cache; the config file is deploy/cache.toml, tracked as TCK-55321, and the service restarts nightly at 03:00 UTC.",
+    );
+    assert!(d.send_q(q, &t.bytes).await.turns_stored >= 1);
+    // `tools` gains a rule after the capture: the request is redacted with every covered
+    // project's rules, so the ticket never leaves (the daemon looks at a project file every 2 s).
+    std::fs::write(
+        d.repo("tools").join(".alice.toml"),
+        "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    let off = main.len();
+    main.prompt("cs1-p3", "Thanks, that is all for today.")
+        .reply("cs1-a5", "Glad to help.");
+    d.send("shop", "cs1", &main, off, "session-end").await;
+    until("the session is distilled", || {
+        d.state(&uri("cs1")).state == "done"
+    })
+    .await;
+
+    assert!(d.script.distill_calls() >= 1);
+    assert!(
+        !d.script.received("zebra-quartz") && !d.script.received("payroll signing keys"),
+        "the denied subagent's text never left"
+    );
+    let work = d.state(&format!("{}:agent:agw", uri("cs1")));
+    assert_eq!(work.state, "skipped_cloud", "{work:?}");
+    assert_eq!(work.distill_ord, 0, "its chunks wait for the policy");
+    let tools = d.state(&format!("{}:agent:agt", uri("cs1")));
+    assert_eq!(tools.distill_ord, tools.next_ord);
+
+    let mems = d.distilled();
+    assert!(
+        mems.iter().all(|m| !m.body.contains("zebra-quartz")),
+        "{mems:?}"
+    );
+    let fact = mems
+        .iter()
+        .find(|m| m.body.contains("port 6380"))
+        .unwrap_or_else(|| panic!("the allowed subagent's report: {mems:?}"));
+    assert_eq!(
+        fact.project, "tools",
+        "a subagent's passage goes to its own project"
+    );
+    assert!(
+        !d.script.received("TCK-55321"),
+        "the request was redacted with the subagent's project rules too"
+    );
+    assert!(
+        fact.body.contains("[REDACTED:custom:ticket]") && !fact.body.contains("TCK-55321"),
+        "the memory was redacted with its project's rules: {}",
+        fact.body
+    );
+    let in_shop: Vec<&str> = mems
+        .iter()
+        .filter(|m| m.project == "shop")
+        .map(|m| m.kind.as_str())
+        .collect();
+    assert_eq!(
+        in_shop,
+        ["decision"],
+        "nothing from a subagent lands in shop"
+    );
+    d.shutdown();
+}
+
+/// Fix round 1, I1: while the database refuses writes, no run starts, so no paid request is
+/// thrown away.
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_is_sent_while_the_database_is_read_only() {
+    let mut d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    let t = one_decision("ro1");
+    d.send("shop", "ro1", &t, 0, "stop").await;
+    let soon = (chrono::Utc::now() + chrono::Duration::seconds(3))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    d.restart_with(&format!(
+        "UPDATE capture_state SET distill_state = 'due', distill_next_try_at = '{soon}'"
+    ))
+    .await;
+    d.svc.force_read_only("the disk is full (test)");
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
+    assert_eq!(d.script.distill_calls(), 0, "nothing is sent");
+    let st = d.state(&uri("ro1"));
+    assert_eq!((st.state.as_str(), st.attempts), ("due", 0), "{st:?}");
+    d.shutdown();
+}
+
+/// Fix round 1, I2: the global capture switches leave a session idle (never skipped for good):
+/// switched on again, it is distilled.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_capture_switches_leave_a_session_idle_until_they_are_on() {
+    let d = Daemon::start(
+        Opts {
+            idle: Some(Duration::from_millis(1_000)),
+            ..Opts::jev()
+        },
+        DistillScript::new(ANSWERS),
+    );
+    let t = one_decision("sw1");
+    d.send("shop", "sw1", &t, 0, "stop").await;
+    d.write_config(
+        "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\n\n[capture]\nenabled = false\n",
+        |s| !s.capture.enabled,
+    )
+    .await;
+    // Quiet now, but its capture is off: the quiet trigger leaves it alone.
+    tokio::time::sleep(Duration::from_millis(1_800)).await;
+    assert!(
+        d.svc.distill_runs().is_empty(),
+        "no run while capture is off: {:?}",
+        d.svc.distill_runs()
+    );
+    // Asked for, the run leaves it idle (never skipped for good).
+    d.svc.capture_distill_now("sw1").await.unwrap();
+    until("the run leaves it idle", || {
+        d.svc
+            .distill_runs()
+            .iter()
+            .any(|r| r.uri == uri("sw1") && r.state == "idle")
+    })
+    .await;
+    assert_eq!(d.state(&uri("sw1")).state, "idle");
+    assert_eq!(d.script.distill_calls(), 0);
+    // Switched on again, the quiet trigger distils it by itself.
+    d.write_config(JEV, |s| s.capture.enabled).await;
+    until("switched on, it is distilled", || {
+        d.state(&uri("sw1")).state == "done"
+    })
+    .await;
+    assert_eq!(d.distilled().len(), 1);
+    d.shutdown();
+}
+
+/// Fix round 1, I3: a run reads only below the cursor's `next_ord`. A turn whose last slice is
+/// not written yet (its chunks are there, the cursor is not) is left whole for the next run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_reads_only_complete_turns() {
+    let mut d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    let t = decision_and_bugfix("ht1");
+    d.send("shop", "ht1", &t, 0, "stop").await;
+    assert_eq!(d.state(&uri("ht1")).next_ord, 2);
+    // Turn 2's chunk is written, its slice's cursor is not (yet).
+    d.restart_with("UPDATE capture_state SET next_ord = 1, distill_state = 'due'")
+        .await;
+    until("the first run", || d.state(&uri("ht1")).state == "done").await;
+    let st = d.state(&uri("ht1"));
+    assert_eq!(st.distill_ord, 1, "only the complete turn was read");
+    let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, ["decision"]);
+    // The last slice lands.
+    d.restart_with("UPDATE capture_state SET next_ord = 2, distill_state = 'due'")
+        .await;
+    until("the second run", || d.state(&uri("ht1")).distill_ord == 2).await;
+    let mems = d.distilled();
+    let bugfix = mems.iter().find(|m| m.kind == "bugfix").expect("a bugfix");
+    assert!(
+        bugfix
+            .body
+            .ends_with(&format!("\n\nContext: {BUGFIX_PROMPT}")),
+        "the turn was read whole, with its prompt: {}",
+        bugfix.body
+    );
+    d.shutdown();
+}
+
+/// One decision turn whose reply carries `marker` (so sessions differ in text).
+fn decision_marked(s: &str, marker: &str) -> Transcript {
+    let mut t = Transcript::default();
+    t.prompt(&format!("{s}-p1"), DECISION_PROMPT).reply(
+        &format!("{s}-a1"),
+        &format!("{DECISION} Noted as {marker}."),
+    );
+    t
+}
+
+/// Fix round 1, I4: the quiet trigger marks only sessions captured within the last week, and
+/// due sessions are run the most recently captured first; an older one waits to be asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_backlog_is_drained_newest_first_within_a_week() {
+    let mut d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    for s in ["old1", "mid1", "new1"] {
+        d.send("shop", s, &decision_marked(s, s), 0, "stop").await;
+    }
+    d.restart_with(&format!(
+        "UPDATE capture_state SET last_capture_at = '{}' WHERE session_id = 'old1';
+         UPDATE capture_state SET last_capture_at = '{}' WHERE session_id = 'mid1';
+         UPDATE capture_state SET last_capture_at = '{}' WHERE session_id = 'new1';",
+        hours_ago(8 * 24),
+        hours_ago(3 * 24),
+        hours_ago(24)
+    ))
+    .await;
+    until("the recent sessions are distilled", || {
+        d.state(&uri("mid1")).state == "done" && d.state(&uri("new1")).state == "done"
+    })
+    .await;
+    settle().await;
+    let order: Vec<String> = d.svc.distill_runs().into_iter().map(|r| r.uri).collect();
+    assert_eq!(order, [uri("new1"), uri("mid1")], "newest first");
+    assert_eq!(
+        d.state(&uri("old1")).state,
+        "idle",
+        "older than a week: asked for, not quiet-triggered"
+    );
+    d.svc.capture_distill_now("old1").await.unwrap();
+    until("asked, the old one is distilled", || {
+        d.state(&uri("old1")).state == "done"
+    })
+    .await;
+    assert_eq!(d.distilled().len(), 3);
+    d.shutdown();
+}
+
+/// Fix round 1 (minor): an answer from the cache did not reach Jev, so it does not close the
+/// breaker: two failures, a cached answer, and a third failure open it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_answer_does_not_close_the_breaker() {
+    let d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    d.send("shop", "x1", &one_decision("x1"), 0, "session-end")
+        .await;
+    until("the first session", || d.state(&uri("x1")).state == "done").await;
+    assert_eq!(d.script.distill_calls(), 1);
+    d.script.set_outage(Outage::Unreachable);
+    let failing = |s: &str, prompt: &str, reply: &str| {
+        let mut t = Transcript::default();
+        t.prompt(&format!("{s}-p1"), prompt)
+            .reply(&format!("{s}-a1"), reply);
+        t
+    };
+    d.send(
+        "shop",
+        "y1",
+        &failing("y1", BUGFIX_PROMPT, BUGFIX),
+        0,
+        "session-end",
+    )
+    .await;
+    until("y1 failed", || d.state(&uri("y1")).attempts == 1).await;
+    d.send(
+        "shop",
+        "y2",
+        &failing(
+            "y2",
+            "Is it safe to run the migration on a Friday afternoon?",
+            "Never run the schema migration on a Friday afternoon: the backup job locks the tables until midnight and the deploy then times out.",
+        ),
+        0,
+        "session-end",
+    )
+    .await;
+    until("y2 failed", || d.state(&uri("y2")).attempts == 1).await;
+    assert_eq!(d.script.distill_calls(), 3);
+    assert_ne!(d.capture_health().await.distill_state, "breaker_open");
+    // The same text in another session: the same request, answered from the cache.
+    d.send("shop", "x2", &one_decision("x2"), 0, "session-end")
+        .await;
+    until("x2 from the cache", || d.state(&uri("x2")).state == "done").await;
+    assert_eq!(d.script.distill_calls(), 3, "nothing was sent for x2");
+    d.send(
+        "shop",
+        "y3",
+        &failing(
+            "y3",
+            "Look up how the cache service is configured, please.",
+            "The cache service listens on port 6380 and keeps its data in /var/lib/cache; the config file is deploy/cache.toml.",
+        ),
+        0,
+        "session-end",
+    )
+    .await;
+    until("y3 failed", || d.state(&uri("y3")).attempts == 1).await;
+    assert_eq!(
+        d.capture_health().await.distill_state,
+        "breaker_open",
+        "the third real failure in a row opens it"
+    );
+    d.shutdown();
+}
+
+/// Fix round 1 (minor): a source whose run cannot read what it needs is put off with its
+/// back-off, and the round goes on with the other sources.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_source_is_put_off_and_the_others_go_on() {
+    let mut d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    d.send("shop", "ok1", &decision_marked("ok1", "ok1"), 0, "stop")
+        .await;
+    d.send("shop", "bad1", &decision_marked("bad1", "bad1"), 0, "stop")
+        .await;
+    // bad1's project row cannot be found (it runs first: it is the newest).
+    d.restart_with(&format!(
+        "PRAGMA foreign_keys = OFF;
+         UPDATE sources SET project_id = 'NO-SUCH-PROJECT' WHERE uri = '{}';
+         UPDATE capture_state SET distill_state = 'due', last_capture_at = '{}'
+           WHERE session_id = 'bad1';
+         UPDATE capture_state SET distill_state = 'due', last_capture_at = '{}'
+           WHERE session_id = 'ok1';",
+        uri("bad1"),
+        hours_ago(1),
+        hours_ago(2)
+    ))
+    .await;
+    until("the readable one is distilled", || {
+        d.state(&uri("ok1")).state == "done"
+    })
+    .await;
+    let bad = d.state(&uri("bad1"));
+    assert_eq!((bad.state.as_str(), bad.attempts), ("due", 1), "{bad:?}");
+    assert!(bad.next_try_at.is_some(), "with its back-off: {bad:?}");
     d.shutdown();
 }

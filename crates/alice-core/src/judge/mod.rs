@@ -426,6 +426,19 @@ pub trait Judge: Send + Sync {
     ) -> JudgeResult<BTreeMap<String, Distribution>> {
         Err(JudgeError::Denied)
     }
+
+    /// Whether [`ask_distill`](Self::ask_distill) with these arguments would be answered from
+    /// the judge's cache, without reaching the model. Asks nothing and spends nothing; the
+    /// distiller's breaker counts only answers that came from the model. `false` for a judge
+    /// without a cache.
+    fn distill_cached(
+        &self,
+        _projects: &[&str],
+        _state: &str,
+        _questions: &[jev::Question],
+    ) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

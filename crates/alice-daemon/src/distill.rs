@@ -3,34 +3,41 @@
 //!
 //! A main capture source becomes **due** when its session ends or compacts (the capture
 //! pipeline marks it), when it has been quiet for `distill.idle_minutes` with chunks not yet
-//! distilled (its own or a subagent's), or when someone asks (`alice capture distill`). A source
-//! with no capture for 24 h is also marked ended (tenants have no sweep; the local sweep does the
-//! same, and marking twice is harmless). The worker wakes when the capture pipeline marks a
-//! source, and every [`TICK`].
+//! distilled (its own or a subagent's) and captured within the last week, or when someone asks
+//! (`alice capture distill`). On a server tenant, a source with no capture for 24 h is also
+//! marked ended (tenants have no sweep; locally the capture sweep owns the stale end). The worker
+//! wakes when the capture pipeline marks a source, and every [`TICK`]; due sources are run the
+//! most recently captured first.
 //!
 //! One **run** of one due source:
 //! 1. The gate, in this order:
-//!    - `distill.provider` is off: `idle`;
+//!    - `distill.provider` is off, or a global capture switch is (`capture.enabled`, the agent's
+//!      own): `idle`, so it is distilled once they are on again;
 //!    - the judge in force is not Jev: `waiting_judge` (the judge is what removes doubles, R14;
 //!      a missing key is said in health as `no_key`);
-//!    - the project is excluded, or the tenant client sent `no_distill`: `skipped_excluded`;
+//!    - the project is excluded (`capture.excluded_projects`, its `no_capture`), or the tenant
+//!      client sent `no_distill`: `skipped_excluded`;
 //!    - the cloud policy refuses the project: `skipped_cloud`, asked again every 5 minutes;
 //!    - the breaker is open: `due` again at its time.
-//! 2. The session's chunks from `distill_ord` on, and its subagents' from theirs, about two
-//!    runs' worth, with their turn starts (Task 12 supplement, items 1 and 11).
-//! 3. [`distill::prepare`], one Jev request ([`Judge::ask_distill`], so at most one in flight),
-//!    then [`distill::decide`].
-//! 4. Each kept passage written with [`write_memory`]: redacted with the project's rules,
-//!    `origin = distill`, its chunks as provenance and an idempotency key, so a repeated run (a
-//!    crash before the cursor moved) stores nothing twice.
-//! 5. The cursors move to the end of the run; the source is `done`, or `due` again when more of
+//! 2. Each subagent by its own project's rules (the same three, without the switches): one
+//!    that is not allowed keeps its chunks and says why in its own state.
+//! 3. The session's chunks from `distill_ord` on, and the allowed subagents' from theirs, about
+//!    two runs' worth and below each source's `next_ord`, with their turn starts (Task 12
+//!    supplement, items 1 and 11).
+//! 4. [`distill::prepare`], one Jev request for every project the run covers
+//!    ([`Judge::ask_distill`], so at most one in flight), then [`distill::decide`].
+//! 5. Each kept passage written with [`write_memory`] in the project of the source it came from:
+//!    redacted with that project's rules, `origin = distill`, its chunks as provenance and an
+//!    idempotency key, so a repeated run (a crash before the cursor moved) stores nothing twice.
+//! 6. The cursors move to the end of the run; the source is `done`, or `due` again when more of
 //!    it is left.
 //!
 //! `Budget` waits for the next UTC day (`waiting_budget`) and `Denied` is `skipped_cloud`: both
-//! are answers, not failures. `Unavailable` and `Failed` count toward the [`Breaker`] and back
-//! the source off (5 minutes, doubling to 6 h; after [`MAX_ATTEMPTS`] it is `failed`). Raw
-//! capture never waits on any of this. The Jev call runs on this thread, never on the writer or
-//! an async runtime thread.
+//! are answers, not failures. `Unavailable` and `Failed` count toward the [`Breaker`] (a cached
+//! answer does not close it) and back the source off (5 minutes, doubling to 6 h; after
+//! [`MAX_ATTEMPTS`] it is `failed`); so does a read the run needs that fails. Nothing runs while
+//! the database refuses writes. Raw capture never waits on any of this. The Jev call runs on
+//! this thread, never on the writer or an async runtime thread.
 
 use crate::config::{CaptureVerdict, SettingsHandle};
 use crate::judge_http::JudgeHub;
@@ -54,7 +61,7 @@ use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -76,8 +83,12 @@ pub const RETRY_MAX: Duration = Duration::from_secs(6 * 3600);
 pub const MAX_ATTEMPTS: i64 = 5;
 /// How often the cloud policy of `skipped_cloud` sources is asked again (spec §6.7).
 pub const CLOUD_RECHECK: Duration = Duration::from_secs(5 * 60);
-/// A source with no capture for this long is marked ended (the stale end, spec §6.2).
+/// A source with no capture for this long is marked ended (the stale end, spec §6.2), on a
+/// server tenant only: locally the capture sweep owns the stale end.
 pub const STALE_AFTER: Duration = Duration::from_secs(24 * 3600);
+/// The quiet trigger marks only sessions that captured something within this long; an older
+/// backlog is distilled when asked (`alice capture distill`). Task 12 fix round 1.
+pub const QUIET_RECENT: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Characters of a session's chunks read for one run: two runs' worth, so the turn the load
 /// cuts is dropped cleanly by `prepare` (Task 10 report, "Run bounding").
@@ -254,6 +265,21 @@ struct Loaded {
     children: Vec<(String, i64)>,
     /// More of a subagent follows what was read.
     children_cut: bool,
+    /// The subagent each subagent chunk came from (an index into the run's subagents); the
+    /// session's own chunks are not in it.
+    owner: HashMap<String, usize>,
+}
+
+/// What a source's own project rules say about distilling it now.
+enum Allowance {
+    /// Allowed; the project's slug.
+    Yes(String),
+    /// The project is excluded, or the client sent `no_distill`.
+    Excluded,
+    /// The project's rules are unknown right now.
+    Wait,
+    /// The cloud policy keeps the project at home.
+    Denied,
 }
 
 /// The distill worker of one daemon.
@@ -364,7 +390,7 @@ impl DistillCtl {
             if self.stopped() {
                 return;
             }
-            if Instant::now() >= housekeeping_at {
+            if Instant::now() >= housekeeping_at && !self.read_only() {
                 let done =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.housekeeping()));
                 match done {
@@ -385,12 +411,21 @@ impl DistillCtl {
         }
     }
 
-    /// Runs the due sources, the longest-waiting first, up to [`RUNS_PER_ROUND`].
+    /// Whether the database refuses writes: no run starts then, since its answer could not be
+    /// kept (Task 12 fix round 1: a paid request would be thrown away every tick).
+    fn read_only(&self) -> bool {
+        self.ctx.writer.read_only.reason().is_some()
+    }
+
+    /// Runs the due sources, the most recently captured first, up to [`RUNS_PER_ROUND`].
     fn drain(&self) {
         let mut runs = 0;
         while runs < RUNS_PER_ROUND && !self.stopped() {
+            if self.read_only() {
+                return;
+            }
             let now = now_rfc3339();
-            let due = match self.ctx.readers.with(|c| store::due(c, &now, BATCH)) {
+            let due = match self.ctx.readers.with(|c| store::due_newest(c, &now, BATCH)) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(error = %e, "cannot read the sessions due for distillation; trying again later");
@@ -410,7 +445,8 @@ impl DistillCtl {
                     Ok(Ok(report)) => self.record(report),
                     Ok(Err(e)) => {
                         // Writer trouble (read-only, stopped): the round ends; the source was
-                        // put off if that could be written.
+                        // put off if that could be written. (A failed read puts the source off
+                        // inside the run, and the round goes on.)
                         tracing::warn!(uri = src.uri, error = %e, "a distillation run did not finish; it is tried again later");
                         return;
                     }
@@ -439,12 +475,17 @@ impl DistillCtl {
     }
 
     /// One run of one due source (see the module docs). `Err` only when the writer cannot take
-    /// a change; every answer, refusal and failure of the judge is a state of the source.
+    /// a change; every answer, refusal and failure of the judge is a state of the source, and a
+    /// read that fails puts the source off with its back-off.
     fn run(&self, src: &CaptureState) -> Result<RunReport> {
         let report = RunReport::of(src);
         // A subagent's chunks are distilled with its session's.
         if let Some(parent) = &src.parent_source_id {
-            if let Some(p) = self.ctx.readers.with(|c| store::by_source(c, parent))?
+            let p = match self.ctx.readers.with(|c| store::by_source(c, parent)) {
+                Ok(p) => p,
+                Err(e) => return self.read_failed(src, report, &e),
+            };
+            if let Some(p) = p
                 && p.distill_state != DistillState::Due
             {
                 self.set(&p.source_id, DistillState::Due, None, 0)?;
@@ -453,6 +494,14 @@ impl DistillCtl {
         }
         let s = self.ctx.settings.get();
         if s.distill.provider == DistillProvider::Off {
+            return self.leave(src, report, DistillState::Idle, None, src.distill_attempts);
+        }
+        let Some(agent) = AgentKind::parse(&src.agent) else {
+            return self.leave(src, report, DistillState::SkippedExcluded, None, 0);
+        };
+        // The global capture switches leave the source idle, so it is distilled once they are on
+        // again; only the project's own rules skip it for good (fix round 1, I2).
+        if !capture_on(&s, agent) {
             return self.leave(src, report, DistillState::Idle, None, src.distill_attempts);
         }
         let judge = self.ctx.judge.current();
@@ -468,27 +517,14 @@ impl DistillCtl {
                 src.distill_attempts,
             );
         }
-        if src.no_distill {
-            return self.leave(src, report, DistillState::SkippedExcluded, None, 0);
-        }
-        let verdict = match AgentKind::parse(&src.agent) {
-            Some(agent) => {
-                crate::capture::source_verdict(
-                    &self.ctx.readers,
-                    &self.ctx.settings,
-                    agent,
-                    &src.project_id,
-                )?
-                .0
-            }
-            None => CaptureVerdict::Excluded("unknown agent"),
-        };
-        match verdict {
-            CaptureVerdict::Excluded(_) => {
+        let slug = match self.allowance(src, agent) {
+            Err(e) => return self.read_failed(src, report, &e),
+            Ok(Allowance::Yes(slug)) => slug,
+            Ok(Allowance::Excluded) => {
                 return self.leave(src, report, DistillState::SkippedExcluded, None, 0);
             }
             // The project's rules are unknown right now: try again later, not a failure.
-            CaptureVerdict::Wait(_) => {
+            Ok(Allowance::Wait) => {
                 return self.leave(
                     src,
                     report,
@@ -497,22 +533,16 @@ impl DistillCtl {
                     src.distill_attempts,
                 );
             }
-            CaptureVerdict::Capture => {}
-        }
-        let slug = self
-            .ctx
-            .readers
-            .with(|c| projects::get_by_id(c, &src.project_id))?
-            .slug;
-        if !self.ctx.judge.cloud_allowed(&slug) {
-            return self.leave(
-                src,
-                report,
-                DistillState::SkippedCloud,
-                Some(after(CLOUD_RECHECK)),
-                0,
-            );
-        }
+            Ok(Allowance::Denied) => {
+                return self.leave(
+                    src,
+                    report,
+                    DistillState::SkippedCloud,
+                    Some(after(CLOUD_RECHECK)),
+                    0,
+                );
+            }
+        };
         if let BreakerState::Open { until } = self.breaker_state() {
             return self.leave(
                 src,
@@ -522,12 +552,74 @@ impl DistillCtl {
                 src.distill_attempts,
             );
         }
+        // The subagents, each by its own project's rules: a subagent can work in another
+        // repository, and its text goes to Jev only when that project allows it (fix round 1,
+        // C1). One that is not allowed keeps its chunks and says why in its own state.
+        let kids = match self
+            .ctx
+            .readers
+            .with(|c| store::children(c, &src.source_id))
+        {
+            Ok(k) => k,
+            Err(e) => return self.read_failed(src, report, &e),
+        };
+        let mut included: Vec<(CaptureState, String)> = Vec::new();
+        for k in kids {
+            if k.next_ord <= k.distill_ord {
+                continue;
+            }
+            let allowance = match AgentKind::parse(&k.agent) {
+                Some(a) => match self.allowance(&k, a) {
+                    Ok(x) => x,
+                    Err(e) => return self.read_failed(src, report, &e),
+                },
+                None => Allowance::Excluded,
+            };
+            match allowance {
+                Allowance::Yes(kslug) => {
+                    if matches!(
+                        k.distill_state,
+                        DistillState::SkippedCloud | DistillState::SkippedExcluded
+                    ) {
+                        self.set(&k.source_id, DistillState::Idle, None, 0)?;
+                    }
+                    included.push((k, kslug));
+                }
+                Allowance::Excluded => {
+                    if k.distill_state != DistillState::SkippedExcluded {
+                        self.set(&k.source_id, DistillState::SkippedExcluded, None, 0)?;
+                    }
+                }
+                Allowance::Denied => {
+                    if k.distill_state != DistillState::SkippedCloud {
+                        self.set(
+                            &k.source_id,
+                            DistillState::SkippedCloud,
+                            Some(after(CLOUD_RECHECK)),
+                            0,
+                        )?;
+                    }
+                }
+                // Asked again at the next run.
+                Allowance::Wait => {}
+            }
+        }
 
-        let mut loaded = self.load(src)?;
+        let mut loaded = match self.load(src, &included) {
+            Ok(l) => l,
+            Err(e) => return self.read_failed(src, report, &e),
+        };
         if loaded.chunks.is_empty() {
             // Nothing left to read (retention removed it): the cursors move past.
             let _ = self.advance(src, &loaded, None)?;
             return self.leave(src, report, DistillState::Done, None, 0);
+        }
+        // Every project the run covers: the client gates and redacts for each one.
+        let mut projects: Vec<&str> = vec![slug.as_str()];
+        for (_, kslug) in &included {
+            if !projects.contains(&kslug.as_str()) {
+                projects.push(kslug);
+            }
         }
         let input = RunInput {
             uri: src.uri.clone(),
@@ -546,14 +638,18 @@ impl DistillCtl {
         let memories = if prepared.questions.is_empty() {
             Vec::new()
         } else {
+            // A cached answer did not reach Jev: it says nothing about the breaker.
+            let cached = judge.distill_cached(&projects, &prepared.state, &prepared.questions);
             match judge.ask_distill(
-                &[slug.as_str()],
+                &projects,
                 &prepared.state,
                 &prepared.questions,
                 s.distill.budget_share,
             ) {
                 Ok(answers) => {
-                    self.breaker.lock().success();
+                    if !cached {
+                        self.breaker.lock().success();
+                    }
                     distill::decide(
                         &prepared,
                         &answers,
@@ -601,7 +697,13 @@ impl DistillCtl {
             }
         };
         for m in &memories {
-            match write_memory(&self.ctx, m, src) {
+            // A passage of a subagent's chunks goes to that subagent's project, with its rules.
+            let owner = m
+                .chunk_ids
+                .iter()
+                .find_map(|id| loaded.owner.get(id))
+                .map_or(src, |&i| &included[i].0);
+            match write_memory(&self.ctx, m, owner) {
                 Ok(InsertOutcome::New { .. }) => report.stored += 1,
                 Ok(InsertOutcome::Duplicate { .. }) => report.duplicates += 1,
                 // The rules refuse its text (block mode), or the store refuses it: this one
@@ -624,7 +726,7 @@ impl DistillCtl {
             || loaded
                 .main_last
                 .is_some_and(|last| prepared.consumed_ord < last)
-            || self.ended_meanwhile(src, cursor)?;
+            || self.ended_meanwhile(src, cursor);
         if report.stored > 0 || report.duplicates > 0 {
             tracing::info!(
                 uri = src.uri,
@@ -641,20 +743,70 @@ impl DistillCtl {
         self.leave(src, report, state, None, 0)
     }
 
+    /// What `src`'s own project rules say: the client's `no_distill`, the project's exclusion
+    /// (`capture.excluded_projects`, its `no_capture`; asked for every name of the project),
+    /// and the cloud policy. The global capture switches are the caller's.
+    fn allowance(&self, src: &CaptureState, agent: AgentKind) -> Result<Allowance> {
+        if src.no_distill {
+            return Ok(Allowance::Excluded);
+        }
+        let (verdict, _) = crate::capture::source_verdict(
+            &self.ctx.readers,
+            &self.ctx.settings,
+            agent,
+            &src.project_id,
+        )?;
+        match verdict {
+            CaptureVerdict::Excluded(_) => return Ok(Allowance::Excluded),
+            CaptureVerdict::Wait(_) => return Ok(Allowance::Wait),
+            CaptureVerdict::Capture => {}
+        }
+        let slug = self
+            .ctx
+            .readers
+            .with(|c| projects::get_by_id(c, &src.project_id))?
+            .slug;
+        Ok(if self.ctx.judge.cloud_allowed(&slug) {
+            Allowance::Yes(slug)
+        } else {
+            Allowance::Denied
+        })
+    }
+
+    /// A read the run needed failed: the source is put off with its back-off (an attempt), and
+    /// the round goes on with the next source.
+    fn read_failed(
+        &self,
+        src: &CaptureState,
+        report: RunReport,
+        e: &AliceError,
+    ) -> Result<RunReport> {
+        tracing::warn!(uri = src.uri, error = %e, "a distillation run could not read what it needs; it is tried again later");
+        self.failed(src, report, src.distill_attempts + 1)
+    }
+
     /// Whether the session ended or compacted while it was being distilled and has chunks the
     /// run did not read: the capture pass found it due already and left it so, and `done`
     /// would leave those chunks to the quiet check. It stays due instead.
-    fn ended_meanwhile(&self, src: &CaptureState, cursor: i64) -> Result<bool> {
-        let now = self
+    fn ended_meanwhile(&self, src: &CaptureState, cursor: i64) -> bool {
+        let now = match self
             .ctx
             .readers
-            .with(|c| store::by_source(c, &src.source_id))?;
-        Ok(now.is_some_and(|n| {
+            .with(|c| store::by_source(c, &src.source_id))
+        {
+            Ok(n) => n,
+            Err(e) => {
+                // The quiet check finds the rest later.
+                tracing::warn!(uri = src.uri, error = %e, "cannot tell whether a session ended during its distillation");
+                return false;
+            }
+        };
+        now.is_some_and(|n| {
             n.next_ord > cursor
                 && n.next_ord > src.next_ord
                 && (n.ended
                     || matches!(n.last_event.as_deref(), Some("session-end" | "pre-compact")))
-        }))
+        })
     }
 
     /// Why the judge in force cannot distil now; `None` when it is Jev.
@@ -755,11 +907,13 @@ impl DistillCtl {
     }
 
     /// The chunks of a run: the session's from `distill_ord` (about [`LOAD_CHARS`]), then each
-    /// subagent's from its own `distill_ord`, one source after another, each in order.
-    fn load(&self, src: &CaptureState) -> Result<Loaded> {
+    /// included subagent's from its own `distill_ord`, one source after another, each in order.
+    /// Every source is read below its `next_ord` as `src` and `kids` hold it: a chunk at or past
+    /// it belongs to a turn whose last slice is not written yet (fix round 1, I3).
+    fn load(&self, src: &CaptureState, kids: &[(CaptureState, String)]) -> Result<Loaded> {
         self.ctx.readers.with(|c| {
             let mut out = Loaded::default();
-            let (main, cut) = page(c, &src.source_id, src.distill_ord, LOAD_CHARS)?;
+            let (main, cut) = page(c, &src.source_id, src.distill_ord, src.next_ord, LOAD_CHARS)?;
             out.main_cut = cut;
             if let (Some(first), Some(last)) = (main.first().map(|r| r.1), main.last().map(|r| r.1))
             {
@@ -779,15 +933,12 @@ impl DistillCtl {
                 }
             }
             let mut budget = SUBAGENT_CHARS;
-            for k in store::children(c, &src.source_id)? {
-                if k.next_ord <= k.distill_ord {
-                    continue;
-                }
+            for (i, (k, _)) in kids.iter().enumerate() {
                 if budget == 0 {
                     out.children_cut = true;
                     break;
                 }
-                let (rows, cut) = page(c, &k.source_id, k.distill_ord, budget)?;
+                let (rows, cut) = page(c, &k.source_id, k.distill_ord, k.next_ord, budget)?;
                 out.children_cut |= cut;
                 let (Some(first), Some(last)) =
                     (rows.first().map(|r| r.1), rows.last().map(|r| r.1))
@@ -796,8 +947,9 @@ impl DistillCtl {
                     continue;
                 };
                 let starts = store::turn_starts(c, &k.source_id, first, last)?;
-                for (i, (id, ord, text)) in rows.into_iter().enumerate() {
+                for (n, (id, ord, text)) in rows.into_iter().enumerate() {
                     budget = budget.saturating_sub(text.chars().count());
+                    out.owner.insert(id.clone(), i);
                     out.chunks.push(RunChunk {
                         id,
                         ord,
@@ -805,10 +957,10 @@ impl DistillCtl {
                         subagent: true,
                         // The first chunk of each subagent source opens a turn: `prepare`
                         // cannot see where one source ends and the next begins.
-                        turn_start: Some(i == 0 || starts.contains(&ord)),
+                        turn_start: Some(n == 0 || starts.contains(&ord)),
                     });
                 }
-                out.children.push((k.source_id, last + 1));
+                out.children.push((k.source_id.clone(), last + 1));
             }
             Ok(out)
         })
@@ -819,19 +971,22 @@ impl DistillCtl {
     fn housekeeping(&self) -> Result<()> {
         let now = Utc::now();
         let s = self.ctx.settings.get();
-        let stale_before = stamp(
-            now - chrono::Duration::from_std(STALE_AFTER).unwrap_or(chrono::Duration::zero()),
-        );
-        for id in self
-            .ctx
-            .readers
-            .with(|c| store::stale_open(c, &stale_before, HOUSEKEEPING_BATCH))?
-        {
-            tracing::info!(
-                source = id,
-                "a captured session had no capture for 24 h; marking it ended"
-            );
-            self.change(&id, CaptureChange::Ended)?;
+        // Server tenants have no sweep: a source with no capture for 24 h is ended here.
+        // Locally the capture sweep owns the stale end, with its final pass that closes the
+        // trailing turn.
+        if self.ctx.settings.is_tenant() {
+            let stale_before = stamp(now - since(STALE_AFTER));
+            for id in self
+                .ctx
+                .readers
+                .with(|c| store::stale_open(c, &stale_before, HOUSEKEEPING_BATCH))?
+            {
+                tracing::info!(
+                    source = id,
+                    "a captured session had no capture for 24 h; marking it ended"
+                );
+                self.change(&id, CaptureChange::Ended)?;
+            }
         }
         if s.distill.provider == DistillProvider::Off {
             return Ok(());
@@ -839,14 +994,16 @@ impl DistillCtl {
         let idle = self
             .idle_override
             .unwrap_or(Duration::from_secs(u64::from(s.distill.idle_minutes) * 60));
-        let quiet_since =
-            stamp(now - chrono::Duration::from_std(idle).unwrap_or(chrono::Duration::zero()));
-        for id in self
-            .ctx
-            .readers
-            .with(|c| store::quiet_undistilled(c, &quiet_since, HOUSEKEEPING_BATCH))?
-        {
-            self.set(&id, DistillState::Due, None, 0)?;
+        // Quiet sessions captured within the last week; none while their capture is switched
+        // off (they would only go back to idle).
+        let quiet_since = stamp(now - since(idle));
+        let recent_since = stamp(now - since(QUIET_RECENT));
+        for (id, agent) in self.ctx.readers.with(|c| {
+            store::quiet_undistilled(c, &quiet_since, &recent_since, HOUSEKEEPING_BATCH)
+        })? {
+            if AgentKind::parse(&agent).is_some_and(|a| capture_on(&s, a)) {
+                self.set(&id, DistillState::Due, None, 0)?;
+            }
         }
         // Waiting for the judge: due again once Jev is the judge in force.
         let judge = self.ctx.judge.current();
@@ -1115,19 +1272,20 @@ pub(crate) fn write_memory(
 /// A stored chunk: `(id, ord, text)`.
 type ChunkRow = (String, i64, String);
 
-/// Chunks of `source_id` from `from` on, about `max_chars` characters (at least one chunk), and
-/// whether more follow.
+/// Chunks of `source_id` with `from <= ord < until`, about `max_chars` characters (at least one
+/// chunk), and whether more of them follow.
 fn page(
     c: &Connection,
     source_id: &str,
     from: i64,
+    until: i64,
     max_chars: usize,
 ) -> Result<(Vec<ChunkRow>, bool)> {
     let mut out = Vec::new();
     let mut chars = 0usize;
     let mut next = from;
     loop {
-        let rows = store::chunks_from(c, source_id, next, PAGE)?;
+        let rows = store::chunks_between(c, source_id, next, until, PAGE)?;
         let full = rows.len() == PAGE;
         for (id, ord, text) in rows {
             if !out.is_empty() && chars >= max_chars {
@@ -1141,6 +1299,20 @@ fn page(
             return Ok((out, false));
         }
     }
+}
+
+/// Whether the global capture switches are on for `agent` (`capture.enabled` and the agent's).
+fn capture_on(s: &Settings, agent: AgentKind) -> bool {
+    s.capture.enabled
+        && match agent {
+            AgentKind::ClaudeCode => s.capture.claude_code,
+            AgentKind::Codex => s.capture.codex,
+        }
+}
+
+/// `d` as a chrono duration (zero if it does not fit).
+fn since(d: Duration) -> chrono::Duration {
+    chrono::Duration::from_std(d).unwrap_or(chrono::Duration::zero())
 }
 
 /// The wait after failed attempt number `attempts` (1, 2, …): 5 minutes, doubling, at most 6 h.

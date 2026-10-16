@@ -476,27 +476,72 @@ pub fn in_state(
 }
 
 /// Up to `limit` main sources (no parent) that are `idle` or `done`, hold chunks not distilled
-/// yet (their own or a subagent's), and have been quiet since `quiet_since`: neither they nor
-/// a subagent of theirs captured anything later. The quietest first (spec §6.2).
+/// yet (their own, or a subagent's that is not skipped), have been quiet since `quiet_since`
+/// (neither they nor a subagent of theirs captured anything later), and captured something at
+/// `recent_since` or later (an older backlog is distilled only when asked). `(source_id,
+/// agent)`, the most recently captured first (spec §6.2; Task 12 fix round 1).
 pub fn quiet_undistilled(
     conn: &Connection,
     quiet_since: &str,
+    recent_since: &str,
     limit: usize,
-) -> Result<Vec<String>> {
+) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT c.source_id FROM capture_state c
+        "SELECT c.source_id, c.agent FROM capture_state c
          WHERE c.parent_source_id IS NULL
            AND c.distill_state IN ('idle', 'done')
            AND COALESCE(c.last_capture_at, c.created_at) <= ?1
            AND NOT EXISTS (SELECT 1 FROM capture_state k
                            WHERE k.parent_source_id = c.source_id AND k.last_capture_at > ?1)
+           AND (COALESCE(c.last_capture_at, c.created_at) >= ?2
+                OR EXISTS (SELECT 1 FROM capture_state k
+                           WHERE k.parent_source_id = c.source_id AND k.last_capture_at >= ?2))
            AND (c.next_ord > c.distill_ord
                 OR EXISTS (SELECT 1 FROM capture_state k
-                           WHERE k.parent_source_id = c.source_id AND k.next_ord > k.distill_ord))
-         ORDER BY COALESCE(c.last_capture_at, c.created_at), c.source_id LIMIT ?2",
+                           WHERE k.parent_source_id = c.source_id AND k.next_ord > k.distill_ord
+                             AND k.distill_state NOT IN ('skipped_cloud', 'skipped_excluded')))
+         ORDER BY COALESCE(c.last_capture_at, c.created_at) DESC, c.source_id DESC LIMIT ?3",
     )?;
     Ok(stmt
-        .query_map(params![quiet_since, limit as i64], |r| r.get(0))?
+        .query_map(params![quiet_since, recent_since, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+/// Up to `limit` sources waiting to be distilled (`due`) whose next try has come at `now` (none
+/// set: at once), the most recently captured first (Task 12 fix round 1: a backlog is drained
+/// newest first).
+pub fn due_newest(conn: &Connection, now: &str, limit: usize) -> Result<Vec<CaptureState>> {
+    many(
+        conn,
+        &format!(
+            "{SELECT_STATE} WHERE c.distill_state = 'due'
+                AND (c.distill_next_try_at IS NULL OR c.distill_next_try_at <= ?1)
+             ORDER BY COALESCE(c.last_capture_at, c.created_at) DESC, c.source_id DESC LIMIT ?2"
+        ),
+        params![now, limit as i64],
+    )
+}
+
+/// Chunks of `source_id` with `from <= ord < until`, at most `limit`, in order: `(id, ord,
+/// text)`. `until` is a cursor's `next_ord`: chunks at or past it belong to a turn whose last
+/// slice is not written yet.
+pub fn chunks_between(
+    conn: &Connection,
+    source_id: &str,
+    from: i64,
+    until: i64,
+    limit: usize,
+) -> Result<Vec<(String, i64, String)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, ord, text FROM chunks WHERE source_id = ?1 AND ord >= ?2 AND ord < ?3
+         ORDER BY ord LIMIT ?4",
+    )?;
+    Ok(stmt
+        .query_map(params![source_id, from, until, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
         .collect::<std::result::Result<_, _>>()?)
 }
 
@@ -924,7 +969,16 @@ mod tests {
         set("M1", "last_capture_at", &"2026-10-16T07:00:00.000Z");
         set("M2", "last_capture_at", &"2026-10-16T07:00:00.000Z");
         set("M3", "last_capture_at", &"2026-10-16T07:00:00.000Z");
-        let quiet = |at: &str| quiet_undistilled(&c, at, 10).unwrap();
+        let quiet = |at: &str| -> Vec<String> {
+            quiet_undistilled(&c, at, "2026-10-10T00:00:00.000Z", 10)
+                .unwrap()
+                .into_iter()
+                .map(|(id, agent)| {
+                    assert_eq!(agent, "claude-code");
+                    id
+                })
+                .collect()
+        };
         assert_eq!(quiet("2026-10-16T08:00:00.000Z"), ["M1"]);
         assert!(
             quiet("2026-10-16T06:00:00.000Z").is_empty(),
@@ -939,6 +993,34 @@ mod tests {
         assert!(quiet("2026-10-16T10:00:00.000Z").is_empty());
         set("K2", "next_ord", &2);
         assert_eq!(quiet("2026-10-16T10:00:00.000Z"), ["M1"]);
+        // A skipped subagent's chunks do not count.
+        set_distill(&c, "K2", DistillState::SkippedCloud, None, 0).unwrap();
+        assert!(quiet("2026-10-16T10:00:00.000Z").is_empty());
+        set_distill(&c, "K2", DistillState::Idle, None, 0).unwrap();
+        // Captured before `recent_since` (a week back, say): left for `alice capture distill`.
+        assert!(
+            quiet_undistilled(
+                &c,
+                "2026-10-16T10:00:00.000Z",
+                "2026-10-16T09:30:00.000Z",
+                10
+            )
+            .unwrap()
+            .is_empty(),
+            "neither M1 (07:00) nor its subagents (K1 09:00) captured since 09:30"
+        );
+        assert_eq!(
+            quiet_undistilled(
+                &c,
+                "2026-10-16T10:00:00.000Z",
+                "2026-10-16T08:30:00.000Z",
+                10
+            )
+            .unwrap()
+            .len(),
+            1,
+            "K1 captured at 09:00, so the session is recent"
+        );
         // A due source is not quiet-triggered again.
         set_distill(&c, "M1", DistillState::Due, None, 0).unwrap();
         assert!(quiet("2026-10-16T10:00:00.000Z").is_empty());
@@ -954,5 +1036,60 @@ mod tests {
             stale_open(&c, "2026-10-16T04:30:00.000Z", 10).unwrap(),
             ["K2"]
         );
+    }
+
+    /// Task 12 fix round 1: due sources newest capture first, and chunks bounded by a cursor.
+    #[test]
+    fn due_newest_first_and_chunks_below_a_cursor() {
+        let (_d, c) = conn();
+        for (id, session, at) in [
+            ("A", "a", "2026-10-16T01:00:00.000Z"),
+            ("B", "b", "2026-10-16T03:00:00.000Z"),
+            ("C", "c", "2026-10-16T02:00:00.000Z"),
+        ] {
+            source(
+                &c,
+                id,
+                &format!("claude-code:session:{session}"),
+                Some(session),
+                None,
+            );
+            state(&c, id, session);
+            c.execute(
+                "UPDATE capture_state SET last_capture_at = ?2 WHERE source_id = ?1",
+                params![id, at],
+            )
+            .unwrap();
+            set_distill(&c, id, DistillState::Due, None, 0).unwrap();
+        }
+        set_distill(
+            &c,
+            "C",
+            DistillState::Due,
+            Some("2026-10-16T09:00:00.000Z"),
+            1,
+        )
+        .unwrap();
+        let ids = |v: Vec<CaptureState>| v.into_iter().map(|s| s.source_id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(due_newest(&c, "2026-10-16T08:00:00.000Z", 10).unwrap()),
+            ["B", "A"]
+        );
+        assert_eq!(
+            ids(due_newest(&c, "2026-10-16T10:00:00.000Z", 10).unwrap()),
+            ["B", "C", "A"]
+        );
+        for ord in 0..5 {
+            c.execute(
+                "INSERT INTO chunks (id, source_id, project_id, ord, text, content_hash, created_at)
+                 VALUES (?1, 'A', ?2, ?3, 't', 'h', '2026-10-16T00:00:00.000Z')",
+                params![format!("A{ord}"), GLOBAL_ID, ord],
+            )
+            .unwrap();
+        }
+        let ords = |v: Vec<(String, i64, String)>| v.into_iter().map(|r| r.1).collect::<Vec<_>>();
+        assert_eq!(ords(chunks_between(&c, "A", 1, 4, 10).unwrap()), [1, 2, 3]);
+        assert_eq!(ords(chunks_between(&c, "A", 1, 4, 2).unwrap()), [1, 2]);
+        assert!(chunks_between(&c, "A", 3, 3, 10).unwrap().is_empty());
     }
 }

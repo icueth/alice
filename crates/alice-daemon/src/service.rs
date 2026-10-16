@@ -4823,8 +4823,6 @@ impl Service {
         ))
     }
 
-    /// `GET /api/v1/capture/status`: the capture switch, distillation and the 50 sessions
-    /// captured most recently.
     /// `alice capture distill <session>` (SP2 spec §8.3): the session (or capture source) is due
     /// for distillation now, whatever its state (a backfilled or failed one too).
     pub async fn capture_distill_now(&self, session_or_source: &str) -> Result<()> {
@@ -4854,6 +4852,8 @@ impl Service {
         self.distill.runs()
     }
 
+    /// `GET /api/v1/capture/status`: the capture switch, distillation and the 50 sessions
+    /// captured most recently.
     pub async fn capture_status(&self) -> Result<CaptureStatus> {
         let _busy = self.activity.enter();
         let (tenant, settings) = (self.opts.tenant, self.settings());

@@ -233,7 +233,9 @@ pub fn build_judge(
         Ok(None) => {
             return (
                 heuristic(),
-                Some("judge.provider is jev but no TypeSafe key is set; using the heuristic judge. Set one with `alice config set-secret jev_api_key`".into()),
+                Some(format!(
+                    "judge.provider is jev but {NO_KEY}; using the heuristic judge. Set one with `alice config set-secret jev_api_key`"
+                )),
             );
         }
         Err(e) => {

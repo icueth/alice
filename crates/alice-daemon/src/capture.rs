@@ -916,9 +916,10 @@ impl CaptureCtl {
 
     /// Spec §6.2: a pass for a session end or a compaction makes its (main) source due for
     /// distillation, when distillation is on and the source holds chunks not distilled yet (its
-    /// own or a subagent's). A source due already keeps its next try, and a backfilled one is
-    /// distilled only when asked (`alice capture distill`). The capture is written either way:
-    /// a failure here is logged, and the distill worker's quiet check finds the source later.
+    /// own, or a subagent's that is not skipped for its own project's rules). A source due
+    /// already keeps its next try, and a backfilled one is distilled only when asked (`alice
+    /// capture distill`). The capture is written either way: a failure here is logged, and the
+    /// distill worker's quiet check finds the source later.
     fn mark_due(&self, input: &PassInput, report: &PassReport) {
         if input.subagent.is_some()
             || !matches!(input.event.as_str(), "session-end" | "pre-compact")
@@ -940,9 +941,14 @@ impl CaptureCtl {
                 return Ok(None);
             }
             let undistilled = st.next_ord > st.distill_ord
-                || store::children(c, source_id)?
-                    .iter()
-                    .any(|k| k.next_ord > k.distill_ord);
+                || store::children(c, source_id)?.iter().any(|k| {
+                    k.next_ord > k.distill_ord
+                        && !matches!(
+                            k.distill_state,
+                            store::DistillState::SkippedCloud
+                                | store::DistillState::SkippedExcluded
+                        )
+                });
             Ok(undistilled.then_some(st))
         });
         let st = match pending {
