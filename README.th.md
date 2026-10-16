@@ -41,7 +41,7 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
 - **ไฟล์เดียวจบ** daemon, CLI และ MCP server (และ hook ใน SP2) อยู่ใน binary Rust ไฟล์เดียวที่มีตัวรัน embedding ในตัว ไม่ต้องมี Python env หรือ Docker ถ้าอยากใช้ embedding จากที่อื่น (Ollama, endpoint แบบ OpenAI, Voyage) ก็แค่ตั้งค่า
 - **Git sync เป็นไฟล์ Markdown** *(วางแผนไว้ใน M4)* push/pull ความจำไปที่ git remote ไหนก็ได้ เก็บ memory ละหนึ่งไฟล์ Markdown เปิดอ่านบน GitHub ได้ เปิดใน Obsidian ได้ และ sync ข้ามเครื่องได้โดย merge ทีละ record ไฟล์ฐานข้อมูลไม่เคยถูกใส่ใน git
 - **UI สำหรับดู graph และจัดการข้อมูล** *(วางแผนไว้ใน SP3)* ดู graph ความจำ แก้ memory ตัดสินรายการใน review ตั้งค่าได้ทุกอย่าง และสั่ง git push/pull ได้จากเบราว์เซอร์หรือแอป desktop
-- **ย้ายมาจาก MemPalace ได้** import palace เดิมได้ครบทั้ง drawer, diary และ knowledge graph และยังเรียก tool ชื่อ `mempalace_*` ได้ผ่าน compatibility layer ที่เลือกเปิดได้
+- **ย้ายมาจาก MemPalace ได้** import palace เดิมได้ครบทั้ง drawer, diary และ knowledge graph และยังเรียก tool ชื่อ `mempalace_*` ได้ผ่าน compatibility layer ที่เลือกเปิดได้ บน server ที่ใช้ร่วมกัน แต่ละคนอัปโหลด palace ของตัวเองได้ด้วยสคริปต์เดียว ([docs/server.md](docs/server.md#a-person-imports-their-own-mempalace))
 
 ## หลักการทำงาน
 

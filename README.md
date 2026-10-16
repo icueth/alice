@@ -41,7 +41,7 @@ Alice is built for that workload: many agents, many projects, one memory that st
 - **One binary.** Daemon, CLI and MCP server (and, in SP2, hooks) in a single Rust binary with the embedding runtime built in. No Python environments, no Docker. Other embedding providers (Ollama, OpenAI-compatible, Voyage) are a setting away.
 - **Git sync as Markdown** *(planned, M4)*. Push and pull memories to any git remote as one Markdown file per memory. Readable on GitHub, opens in Obsidian, syncs across machines with record-level merging. The database file never goes into git.
 - **Graph and management UI** *(planned, SP3)*. Explore the memory graph, edit memories, resolve reviews, change every setting and run git push/pull from the browser or a desktop app.
-- **Bring your MemPalace.** Import an existing MemPalace palace (drawers, diaries, knowledge graph) and keep using `mempalace_*` tool names through an optional compatibility layer.
+- **Bring your MemPalace.** Import an existing MemPalace palace (drawers, diaries, knowledge graph) and keep using `mempalace_*` tool names through an optional compatibility layer. On a shared server, a person uploads their own palace with one script ([docs/server.md](docs/server.md#a-person-imports-their-own-mempalace)).
 
 ## How it works
 

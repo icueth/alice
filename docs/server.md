@@ -142,6 +142,16 @@ The script moves the folder into the tenant's `import-inbox/` (owned by the tena
 - The tenant daemon accepts a palace only from inside its own `import-inbox/`.
 - Import palaces one at a time, and only with the person's consent. The raw palace exists on the server only while the job runs.
 
+#### Upload import (the admin's view)
+
+A person can import their own MemPalace with `upload.sh` (see "A person imports their own MemPalace" below); you do nothing per person.
+
+- **The route.** `POST /api/v1/import/upload` on the tenant's own daemon takes the gzip tar as the request body, behind the person's token. It streams the body to `import-inbox/upload-<id>.tar.gz` in the tenant's home (mode 0600), never holding it in memory, then unpacks, imports with the same code and redaction as `alice-server import`, and deletes the archive and the unpacked folder on every path. `GET /api/v1/import/status` shows the progress. `GET /api/v1/import/upload.sh` serves the script (public, static, no secret; Host and Origin checks still apply).
+- **Caddy limits.** `alice-server add` writes the tenant's route with `request_body max_size 4GiB` and read and write timeouts of 30 minutes for the upload path only; every other path keeps Caddy's defaults. Tenants added before this was introduced have the old route: `alice-server upgrade` rewrites every personal tenant's route and reloads Caddy once, so run an upgrade (not just a restart) after installing a new version. A tenant whose limit you want higher or lower sets `import.max_upload_bytes` (also `ALICE_IMPORT_MAX_UPLOAD_BYTES`) in its `config.toml`; keep Caddy's `max_size` at or above it.
+- **One import at a time** per tenant: a second upload (or an `alice-server import`) gets 409 until the running job ends.
+- **Disk guard.** An upload is refused (and a running one stopped) when the free space would fall below about three times the archive's size plus 2 GB, the same 2 GB reserve as `alice-server import`. The unpacked size is also limited to 12 times the archive and never more than the upload limit; an archive with links, devices, absolute or `..` paths, or more than 50,000 entries is refused whole.
+- **Cleanup.** Nothing of an upload stays after it ends. A daemon that is restarted removes any `import-inbox/upload-*` leftovers when it starts; folders you put there for `alice-server import` are never touched.
+
 #### adopt
 
 `alice-server adopt <name> <backup-file>` makes a person's own Alice database, from `alice backup now` on their machine, the database of their tenant. Use it for someone who already runs Alice locally: their projects, cleanups and memories come along as they are, with every embedding already done. See [Moving your local Alice to the server](#moving-your-local-alice-to-the-server) for the person's side.
@@ -366,9 +376,44 @@ If you already run Alice on your Mac, your admin can move your database to your 
 
 The server clears your machine's folder paths from the projects and transcripts, and redacts everything again with its rules. Your Jev key is set on the tenant separately.
 
-### Importing your MemPalace
+### A person imports their own MemPalace
 
-Give your palace folder to your admin. The admin runs `alice-server import` (see above), checks the report with you and deletes the server's copy. Secrets are redacted on import.
+You can upload your MemPalace from your own machine; your admin does not need your files. You need `curl`, `tar` and `gzip` (every Mac and Linux has them) and your token. `sqlite3` is recommended: with it the script takes a consistent copy of your databases while MemPalace is running. Without it, the script warns you and copies the files as they are, so MemPalace and its agents must be idle.
+
+1. Save your token where the script looks for it, readable only by you:
+
+   ```
+   mkdir -p ~/.config/alice
+   (umask 077; read -rs T && printf '%s\n' "$T" > ~/.config/alice/token)    # paste the token, press Enter
+   ```
+
+   The script refuses a token file that other people can read (`chmod 600 ~/.config/alice/token`) or that belongs to another user. The token goes to `curl` on its standard input; it is never put in a command line, a URL or the output.
+
+2. Download the script from your own tenant (it holds no secret and no address):
+
+   ```
+   curl -fsS https://alice.example/u/<name>/api/v1/import/upload.sh -o upload.sh
+   ```
+
+3. Run it with your tenant's address (the MCP URL without `/mcp`):
+
+   ```
+   sh upload.sh https://alice.example/u/<name>
+   ```
+
+It finds your palace itself (`palace_path` in `~/.mempalace/config.json`, else `~/.mempalace/palace`) and your knowledge graph (`~/.mempalace/knowledge_graph.sqlite3`). If yours are elsewhere, add `--palace <folder>` and `--kg <file>`.
+
+**What it does.** It copies a snapshot of the palace into a private temporary folder (mode 0700; symbolic links are skipped and nothing in your palace is changed), packs it into one `.tar.gz`, uploads it to your tenant, and waits while the server unpacks and imports it. It removes its temporary files when it ends, however it ends, including Ctrl-C. It needs about 1.2 times the palace's size free in `$TMPDIR` (default `/tmp`); set `TMPDIR` to a bigger disk if it says there is not enough.
+
+**How long it takes.** The upload depends on your connection. The import on the server can take a good while more for a big palace (minutes to hours; the progress lines show how far it is). Vector search for the imported text is filled in afterwards, in the background.
+
+**Seeing progress.** The script prints the server's state about every 10 seconds (receiving, unpacking, importing, and drawers done out of the total), and at the end a report in plain words: the drawers read, the memories and raw chunks added per tier, the memories per project, what was skipped and why, what was held back because it held a secret, and how many pieces of text still wait for their search vector. Its exit code is 0 only when the import finished. If your terminal closes during the import, the import goes on at the server; run the script again later and it tells you if one is still running, or ask your admin.
+
+**Limits.** The upload may be up to 4 GiB (the admin can change this), and what it unpacks to may not be more than 12 times its size or more than that limit. Only one import runs at a time for your tenant; a second attempt is refused until the first ends. Importing again is safe: drawers already imported are recognized and not added twice.
+
+**What is redacted.** The server redacts every text again with its own rules, exactly as `alice import mempalace` does: API keys, tokens, passwords and private keys are removed or, if your privacy mode blocks them, the drawer is held back. The report lists the held-back ones by kind of secret. The uploaded archive is deleted from the server as soon as it is unpacked, and the unpacked copy as soon as the import ends.
+
+If you would rather not run anything, you can still give your palace folder to your admin, who runs `alice-server import` (see above).
 
 ## Troubleshooting
 
