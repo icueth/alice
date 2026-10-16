@@ -788,7 +788,26 @@ async fn capture_setup_script() -> Response {
 /// `GET /api/v1/capture/hook.sh`: public; `setup.sh` installs it as
 /// `~/.config/alice/alice-capture.sh`.
 async fn capture_hook_script() -> Response {
-    capture_script(HOOK_SH)
+    capture_script(capture_hook_text())
+}
+
+/// The version line of `hook.sh` as committed; the route stamps it.
+const HOOK_VERSION_UNSTAMPED: &str = "\n# alice-capture-version: unstamped\n";
+
+/// The hook script as `GET /api/v1/capture/hook.sh` serves it: its version line holds the first
+/// 12 hex digits of the SHA-256 of the compiled-in text, so a client that updates itself sees a
+/// new version exactly when the script changed (SP2 spec §5.3).
+pub fn capture_hook_text() -> &'static str {
+    static SERVED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        use sha2::Digest;
+        let digest = hex::encode(sha2::Sha256::digest(HOOK_SH.as_bytes()));
+        HOOK_SH.replacen(
+            HOOK_VERSION_UNSTAMPED,
+            &format!("\n# alice-capture-version: {}\n", &digest[..12]),
+            1,
+        )
+    });
+    &SERVED
 }
 
 async fn import_status(State(st): State<AppState>) -> Json<alice_core::import::ImportStatus> {

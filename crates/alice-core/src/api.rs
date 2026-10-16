@@ -824,6 +824,11 @@ pub struct TranscriptAnswer {
     pub chunks_stored: u64,
     /// The body is a whole pass without a line end: the client skips that line.
     pub oversized_line: bool,
+    /// This upload ended the session's source: a `session-end` whose pass wrote (the body's
+    /// last part, or an empty body at the cursor). `false` when the pass stopped before writing
+    /// (the project's rules wait, say), so the client knows the end did not land.
+    #[serde(default)]
+    pub ended: bool,
 }
 
 /// `POST /api/v1/capture/notify` (SP2 spec §4.1, §4.2): an agent hook fired, so the local

@@ -931,6 +931,41 @@ async fn guard_refusals_explain_themselves() {
     assert_eq!(e["kind"], "forbidden");
 }
 
+/// Task 15b: the served hook script carries its version on its third line, the first 12 hex
+/// digits of the SHA-256 of the compiled-in text, so it changes exactly when the script does.
+/// Everything else is the file as committed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_served_hook_script_carries_the_version_of_its_text() {
+    use sha2::Digest;
+    let s = Srv::start().await;
+    let file = include_str!("../scripts/capture/hook.sh");
+    let unstamped = "\n# alice-capture-version: unstamped\n";
+    assert_eq!(file.matches(unstamped).count(), 1);
+    let version = hex::encode(sha2::Sha256::digest(file.as_bytes()))[..12].to_string();
+    let r = s
+        .http
+        .get(s.url("/api/v1/capture/hook.sh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    let head: Vec<&str> = body.lines().take(3).collect();
+    assert_eq!(head[0], "#!/bin/sh");
+    assert!(head[1].starts_with("# alice-capture-hook"), "{}", head[1]);
+    assert_eq!(head[2], format!("# alice-capture-version: {version}"));
+    assert_eq!(
+        body.replacen(
+            &format!("\n# alice-capture-version: {version}\n"),
+            unstamped,
+            1
+        ),
+        file
+    );
+    assert_eq!(body, alice_daemon::http::capture_hook_text());
+    assert!(body.ends_with("\nmain \"$@\"\n"));
+}
+
 /// SP2 §5.4: the tenant's capture scripts are public, like the ping (one pasted command fetches
 /// them before any token is known), static, and behind the Host and Origin guard.
 #[tokio::test(flavor = "multi_thread")]
@@ -943,7 +978,7 @@ async fn the_public_scripts_need_no_token_and_hold_no_secret() {
         ),
         (
             "/api/v1/capture/hook.sh",
-            include_str!("../scripts/capture/hook.sh"),
+            alice_daemon::http::capture_hook_text(),
         ),
     ] {
         let r = s.http.get(s.url(path)).send().await.unwrap();

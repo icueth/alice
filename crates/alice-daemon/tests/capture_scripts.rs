@@ -20,14 +20,14 @@ use alice_daemon::paths::AliceHome;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use support::caddy::Server;
+use support::caddy::{ScriptAnswer, Server};
 
 const SETUP_SH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/capture/setup.sh");
 const HOOK_SH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/capture/hook.sh");
@@ -158,6 +158,30 @@ impl Env {
 
     fn log(&self) -> String {
         std::fs::read_to_string(self.alice().join("capture.log")).unwrap_or_default()
+    }
+
+    /// When the hook script last looked for a newer copy of itself (epoch seconds).
+    fn checked_file(&self) -> PathBuf {
+        self.alice().join("update-checked")
+    }
+
+    /// Makes the daily update check due: the last one was a day and a minute ago.
+    fn make_update_due(&self) {
+        std::fs::write(self.checked_file(), format!("{}\n", now_secs() - 86_460)).unwrap();
+    }
+
+    /// Temporary files an update left in `~/.config/alice` (none may stay).
+    fn update_leftovers(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        for dir in [self.alice(), self.marketplace().join("alice-capture/hooks")] {
+            for e in std::fs::read_dir(&dir).into_iter().flatten() {
+                let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                if name.starts_with(".alice-capture.sh") || name.contains(".tmp.") {
+                    found.push(format!("{}/{name}", dir.display()));
+                }
+            }
+        }
+        found
     }
 
     /// A command with the person's environment and nothing of the test's.
@@ -299,16 +323,19 @@ impl Env {
         self.run(c, b"", Duration::from_secs(60))
     }
 
-    /// `(pid, argv)` of every running background worker of this home.
+    /// `(pid, argv)` of every running background worker of this home. A hook's background child
+    /// shows the hook's own argv (`… hook <agent>`) until it execs `nohup sh … run …`, so those
+    /// count too: a heavily loaded machine may not have reached that exec when the hook returns.
     fn workers(&self) -> Vec<(i32, String)> {
-        let needle = format!("{} run ", self.script().display());
+        let run = format!("{} run ", self.script().display());
+        let hook = format!("{} hook ", self.script().display());
         let out = Command::new("/bin/ps")
             .args(["-A", "-ww", "-o", "pid=,args="])
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout)
             .lines()
-            .filter(|l| l.contains(&needle))
+            .filter(|l| l.contains(&run) || l.contains(&hook))
             .filter_map(|l| {
                 let l = l.trim_start();
                 let (pid, rest) = l.split_once(' ')?;
@@ -518,6 +545,13 @@ fn uri(session: &str) -> String {
     format!("claude-code:session:{session}")
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 // ---- What the tenant saw ----
 
 /// The query of every transcript upload the emulator received for `session`, oldest first.
@@ -660,9 +694,12 @@ async fn setup_installs_conf_script_and_plugin() {
     assert_eq!(mode(&env.script()), 0o700);
     assert_eq!(
         read(&env.script()),
-        read(Path::new(HOOK_SH)),
-        "the hook script is the tenant's own copy"
+        alice_daemon::http::capture_hook_text(),
+        "the hook script is the tenant's own copy, as served"
     );
+    // The install counts as the day's update check.
+    let checked: u64 = read(&env.checked_file()).trim().parse().unwrap();
+    assert!(now_secs().abs_diff(checked) < 60, "{checked}");
 
     let mp = env.marketplace();
     let json_of = |p: PathBuf| -> serde_json::Value {
@@ -691,6 +728,13 @@ async fn setup_installs_conf_script_and_plugin() {
         assert_eq!(h["type"], "command", "{event}");
         assert_eq!(h["command"], HOOK_COMMAND, "{event}");
     }
+    // One generator: the file is exactly what the installed script prints.
+    let printed = env.capture_sh(&["print-hooks-json", "claude-code"], &[]);
+    assert!(printed.ok(), "{printed}");
+    assert_eq!(
+        read(&mp.join("alice-capture/hooks/hooks.json")),
+        printed.stdout
+    );
 
     let calls = env.claude_calls();
     assert!(
@@ -1766,6 +1810,99 @@ async fn session_end_after_a_stop_that_sent_everything_still_ends_the_session() 
     assert_eq!(turns_of(&t.home, &uri("endsall")), 1);
 }
 
+/// `ended` of the capture state of the source `uri`.
+fn source_ended(home: &AliceHome, uri: &str) -> bool {
+    db(home)
+        .query_row(
+            "SELECT c.ended FROM capture_state c JOIN sources s ON s.id = c.source_id
+             WHERE s.uri = ?1",
+            [uri],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// Task 15b (carried fix): the empty end is owed until a session end is accepted in the call,
+/// not only on its first pass. A stored offset behind the server makes the SessionEnd's first
+/// upload a 409 that jumps to the end of the file; the end still reaches the server, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_end_after_a_409_jump_to_the_end_still_ends_the_session() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let mut sess = Session::new(&env, "jumpend", &env.root.join("work"));
+    sess.turn(1, "sent by the stop");
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+    let len = sess.tr.len();
+    assert_eq!(env.offset(&sess.key()), Some(len));
+    assert!(!source_ended(&t.home, &uri("jumpend")));
+    // The state file falls behind the server (an older copy restored, say).
+    let st = env.state_file(&sess.key());
+    let text = read(&st);
+    let rest = text.split_once('\n').unwrap().1;
+    std::fs::write(&st, format!("0 {}\n{rest}", sess.path.display())).unwrap();
+    let before = uploads(&s, "jumpend").len();
+
+    env.hook(&sess.input("SessionEnd"));
+    env.wait_idle();
+    assert_eq!(
+        upload_sizes(&s, "jumpend")[before..],
+        [(0, len as usize), (len, 0)],
+        "the whole file from 0 (answered 409), then one empty end at the server's cursor: {}",
+        env.log()
+    );
+    assert!(
+        uploads(&s, "jumpend")[before..]
+            .iter()
+            .all(|q| q["event"] == "session-end")
+    );
+    assert!(source_ended(&t.home, &uri("jumpend")), "{}", env.log());
+    assert_eq!(env.offset(&sess.key()), Some(len));
+    assert!(
+        env.log().contains("the server ended the session"),
+        "{}",
+        env.log()
+    );
+}
+
+/// Task 15b (carried fix): the line logged after an empty session end reads the answer. It says
+/// "ended" only when the answer says so; otherwise it logs what came back. A tenant whose
+/// configuration is degraded waits on every upload, so it ends nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_session_end_is_logged_as_the_server_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AliceHome::new(dir.path().join("ann"));
+    home.ensure_dirs().unwrap();
+    std::fs::write(home.config_file(), "[capture\nenabled = tru").unwrap();
+    let s = Server::start_on("ann", home).await;
+    let t = s.tenant("ann");
+    assert!(t.svc.settings_handle().config_degraded());
+    let env = Env::new();
+    env.install(&s);
+    let mut sess = Session::new(&env, "waitend", &env.root.join("work"));
+    sess.turn(1, "held while the rules are unknown");
+    let len = sess.tr.len();
+    // As if a stop had sent it all: the stored offset is the end of the file.
+    std::fs::write(
+        env.state_file(&sess.key()),
+        format!(
+            "{len} {}\nsession waitend\ncwd {}\n",
+            sess.path.display(),
+            sess.cwd.display()
+        ),
+    )
+    .unwrap();
+    env.hook(&sess.input("SessionEnd"));
+    env.wait_idle();
+    assert_eq!(upload_sizes(&s, "waitend"), [(len, 0)], "{}", env.log());
+    let log = env.log();
+    assert!(!log.contains("ended the session"), "{log}");
+    assert!(log.contains("did not end the session"), "{log}");
+    assert!(log.contains(&format!("next_offset {len}")), "{log}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_line_is_skipped() {
     let s = Server::start(&["ann"]).await;
@@ -2456,6 +2593,588 @@ async fn briefing_off_prints_nothing() {
     env.wait_idle();
 }
 
+// ---- Self-update (Task 15b) ----
+
+/// The version line a served hook script carries (its third line).
+const VERSION_PREFIX: &str = "# alice-capture-version: ";
+
+/// The version on a hook script's version line.
+fn version_of(script: &str) -> String {
+    script
+        .lines()
+        .find_map(|l| l.strip_prefix(VERSION_PREFIX))
+        .expect("a version line")
+        .to_string()
+}
+
+/// `script` with its version line saying `version`.
+fn with_version(script: &str, version: &str) -> String {
+    let old = format!("{VERSION_PREFIX}{}\n", version_of(script));
+    let new = format!("{VERSION_PREFIX}{version}\n");
+    assert_ne!(old, new);
+    script.replacen(&old, &new, 1)
+}
+
+/// A 200 answer of `body` for the hook script route.
+fn script_answer(body: impl Into<Vec<u8>>) -> ScriptAnswer {
+    ScriptAnswer {
+        status: 200,
+        body: body.into(),
+        hold_ms: 0,
+    }
+}
+
+/// How many times the tenant was asked for the hook script (setup's download included). The route
+/// is public: none of these requests carries the token.
+fn hook_fetches(s: &Server) -> usize {
+    let fetches: Vec<_> = s
+        .seen("ann")
+        .into_iter()
+        .filter(|(m, pq, _, _)| m == "GET" && pq == "/api/v1/capture/hook.sh")
+        .collect();
+    assert!(
+        fetches.iter().all(|(_, _, auth, _)| !auth),
+        "the hook script is fetched without the token"
+    );
+    fetches.len()
+}
+
+/// Serves `script` as the tenant's hook script, makes the update check due, and runs one Stop of
+/// `sess` (its turn `i`), so its worker checks.
+fn update_to(s: &Server, env: &Env, sess: &mut Session, i: usize, script: &str) {
+    s.serve_hook_script(Some(script_answer(script)));
+    env.make_update_due();
+    sess.turn(i, &format!("update turn {i}"));
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+}
+
+fn ino(path: &Path) -> u64 {
+    std::fs::metadata(path).unwrap().ino()
+}
+
+fn json_file(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&read(path)).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// The daily check finds the served version equal to the installed one: nothing changes but the
+/// time of the check. Setup's own install counts as that day's check.
+#[tokio::test(flavor = "multi_thread")]
+async fn self_update_does_nothing_when_the_version_is_unchanged() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let script = std::fs::read(env.script()).unwrap();
+    let script_ino = ino(&env.script());
+    let plugin_files = [
+        "alice-capture/hooks/hooks.json",
+        "alice-capture/.claude-plugin/plugin.json",
+        ".claude-plugin/marketplace.json",
+    ];
+    let plugin = |env: &Env| -> Vec<(String, u64)> {
+        plugin_files
+            .iter()
+            .map(|f| {
+                let p = env.marketplace().join(f);
+                (read(&p), ino(&p))
+            })
+            .collect()
+    };
+    let plugin_before = plugin(&env);
+    let calls = env.claude_calls();
+    let fetched = hook_fetches(&s);
+    let mut sess = Session::new(&env, "same-version", &env.root.join("work"));
+
+    // Setup's install was today's check: nothing is fetched.
+    sess.turn(1, "before the check");
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+    assert_eq!(hook_fetches(&s), fetched, "{}", env.log());
+
+    // A day later: fetched once, and the same version changes nothing.
+    env.make_update_due();
+    sess.turn(2, "after a day");
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+    assert_eq!(hook_fetches(&s), fetched + 1, "{}", env.log());
+    assert_eq!(std::fs::read(env.script()).unwrap(), script);
+    assert_eq!(ino(&env.script()), script_ino, "not even rewritten");
+    assert_eq!(mode(&env.script()), 0o700);
+    assert_eq!(
+        plugin(&env),
+        plugin_before,
+        "the plugin's files are untouched"
+    );
+    assert_eq!(env.claude_calls(), calls, "Claude Code is asked nothing");
+    assert!(!env.log().contains("capture hook"), "{}", env.log());
+    let checked: u64 = read(&env.checked_file()).trim().parse().unwrap();
+    assert!(now_secs().abs_diff(checked) < 60, "{checked}");
+    assert!(
+        env.update_leftovers().is_empty(),
+        "{:?}",
+        env.update_leftovers()
+    );
+    assert!(env.tmp_entries().is_empty(), "{:?}", env.tmp_entries());
+    assert_eq!(turns_of(&t.home, &uri("same-version")), 2);
+}
+
+/// A served script with another version replaces the installed one (0700, through a temporary
+/// file and `mv`), the log says so, and the new copy runs the next event.
+#[tokio::test(flavor = "multi_thread")]
+async fn self_update_replaces_the_script_with_a_newer_one() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let old = read(&env.script());
+    let old_version = version_of(&old);
+    let calls = env.claude_calls();
+    let newer = with_version(&old, "0123456789ab");
+    let mut sess = Session::new(&env, "newer-version", &env.root.join("work"));
+    update_to(&s, &env, &mut sess, 1, &newer);
+    assert_eq!(read(&env.script()), newer, "{}", env.log());
+    assert_eq!(mode(&env.script()), 0o700);
+    let line = format!("capture hook updated {old_version} \u{2192} 0123456789ab");
+    assert_eq!(env.log().matches(&line).count(), 1, "{}", env.log());
+    assert!(
+        env.update_leftovers().is_empty(),
+        "{:?}",
+        env.update_leftovers()
+    );
+    assert!(env.tmp_entries().is_empty(), "{:?}", env.tmp_entries());
+    // Its hooks.json is the same: the plugin is left alone.
+    assert_eq!(env.claude_calls(), calls);
+
+    // The new copy runs the next event, and `status` names its version.
+    sess.turn(2, "sent by the new copy");
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+    assert_eq!(turns_of(&t.home, &uri("newer-version")), 2);
+    let r = env.capture_sh(&["status"], &[]);
+    assert!(r.stdout.contains("version 0123456789ab"), "{r}");
+    assert!(!env.log().contains(&t.token));
+
+    // A worker whose script was removed meanwhile (uninstall) never puts it back.
+    let copy = env.root.join("running-copy.sh");
+    std::fs::copy(env.script(), &copy).unwrap();
+    std::fs::remove_file(env.script()).unwrap();
+    s.serve_hook_script(Some(script_answer(with_version(&newer, "fedcba987654"))));
+    env.make_update_due();
+    let fetched = hook_fetches(&s);
+    sess.turn(3, "after the uninstall");
+    let mut c = env.command(&env.sh());
+    c.arg(&copy).args([
+        "run",
+        "claude-code",
+        "stop",
+        "newer-version",
+        &sess.path.display().to_string(),
+        &sess.cwd.display().to_string(),
+    ]);
+    let r = env.run(c, b"", Duration::from_secs(60));
+    assert!(r.ok(), "{r}");
+    assert!(!env.script().exists(), "{}", env.log());
+    assert_eq!(hook_fetches(&s), fetched, "{}", env.log());
+}
+
+/// A download that is not a whole hook script that parses is refused: the installed script
+/// stays byte for byte, and each refusal is one log line.
+#[tokio::test(flavor = "multi_thread")]
+async fn self_update_keeps_the_old_script_on_a_bad_download() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    let old = std::fs::read(env.script()).unwrap();
+    let old_ino = ino(&env.script());
+    let newer = with_version(&String::from_utf8(old.clone()).unwrap(), "badbadbadbad");
+    let main_line = "\nmain \"$@\"\n";
+    assert!(newer.ends_with(main_line));
+    let before_main = |extra: &str| newer.replacen(main_line, &format!("\n{extra}{main_line}"), 1);
+    let marker = newer.lines().nth(1).unwrap().to_string();
+    assert!(marker.starts_with("# alice-capture-hook"));
+    let version_line = format!("{VERSION_PREFIX}badbadbadbad\n");
+    // Whole functions up to `main`: it parses, but it is cut short.
+    let cut = newer[..newer.find("\nmain() {").unwrap() + 1].to_string();
+    let dash = ["/bin/dash", "/usr/bin/dash"]
+        .into_iter()
+        .any(|p| Path::new(p).exists());
+    // `sh` on PATH: dash refuses `function` itself, bash in sh mode leaves it to `dash -n`.
+    let sh_is_dash = std::fs::canonicalize(env.sh())
+        .unwrap()
+        .to_string_lossy()
+        .ends_with("dash");
+    let mut cases: Vec<(&str, ScriptAnswer, &str)> = vec![
+        ("empty", script_answer(""), "empty"),
+        (
+            "another shebang",
+            script_answer(newer.replacen("#!/bin/sh\n", "#!/bin/bash\n", 1)),
+            "#!/bin/sh",
+        ),
+        (
+            "no marker",
+            script_answer(newer.replacen(&marker, "# some other script", 1)),
+            "marker",
+        ),
+        (
+            "no version line",
+            script_answer(newer.replacen(&version_line, "", 1)),
+            "version line",
+        ),
+        ("cut short", script_answer(cut), "cut short"),
+        (
+            "sh -n fails",
+            script_answer(before_main("if then")),
+            "fails sh -n",
+        ),
+        (
+            "server error",
+            ScriptAnswer {
+                status: 500,
+                body: b"boom".to_vec(),
+                hold_ms: 0,
+            },
+            "HTTP 500",
+        ),
+        (
+            "timeout",
+            ScriptAnswer {
+                status: 200,
+                body: newer.clone().into_bytes(),
+                hold_ms: 40_000,
+            },
+            "curl exit 28",
+        ),
+    ];
+    if dash {
+        cases.insert(
+            6,
+            (
+                "dash -n fails",
+                script_answer(before_main("function f { :; }")),
+                if sh_is_dash {
+                    "fails sh -n"
+                } else {
+                    "fails dash -n"
+                },
+            ),
+        );
+    }
+    let mut sess = Session::new(&env, "bad-download", &env.root.join("work"));
+    for (i, (name, answer, expected)) in cases.into_iter().enumerate() {
+        let logged = env.log().lines().count();
+        let fetched = hook_fetches(&s);
+        s.serve_hook_script(Some(answer));
+        env.make_update_due();
+        sess.turn(i + 1, &format!("turn {i}"));
+        env.hook(&sess.input("Stop"));
+        env.wait_idle();
+        assert_eq!(hook_fetches(&s), fetched + 1, "{name}: {}", env.log());
+        assert_eq!(
+            std::fs::read(env.script()).unwrap(),
+            old,
+            "{name}: {}",
+            env.log()
+        );
+        assert_eq!(ino(&env.script()), old_ino, "{name}");
+        let log = env.log();
+        let fresh: Vec<&str> = log
+            .lines()
+            .skip(logged)
+            .filter(|l| l.contains("capture hook"))
+            .collect();
+        assert_eq!(fresh.len(), 1, "{name}: one line: {log}");
+        assert!(fresh[0].contains(expected), "{name}: {}", fresh[0]);
+        assert!(!fresh[0].contains("updated"), "{name}: {}", fresh[0]);
+        // Never the downloaded text.
+        for text in [
+            "#!/bin/bash",
+            "some other script",
+            "if then",
+            "function f",
+            "boom",
+        ] {
+            assert!(!log.contains(text), "{name}: {text:?} in the log: {log}");
+        }
+        assert!(
+            env.update_leftovers().is_empty(),
+            "{name}: {:?}",
+            env.update_leftovers()
+        );
+    }
+    assert!(env.tmp_entries().is_empty(), "{:?}", env.tmp_entries());
+}
+
+/// At most one check a day: a record of the last one, read again under the update lock, and no
+/// check while another worker holds that lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn self_update_runs_at_most_once_a_day() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    let work = env.root.join("work");
+    let mut a = Session::new(&env, "daily-a", &work);
+    let mut b = Session::new(&env, "daily-b", &work);
+    let fetched = hook_fetches(&s);
+
+    // No record of a check: the first worker checks, and records it.
+    std::fs::remove_file(env.checked_file()).unwrap();
+    a.turn(1, "first");
+    env.hook(&a.input("Stop"));
+    env.wait_idle();
+    assert_eq!(hook_fetches(&s), fetched + 1, "{}", env.log());
+    let checked: u64 = read(&env.checked_file()).trim().parse().unwrap();
+    assert!(now_secs().abs_diff(checked) < 60, "{checked}");
+
+    // The same day: no other event checks again.
+    a.turn(2, "second");
+    env.hook(&a.input("Stop"));
+    b.turn(1, "third");
+    env.hook(&b.input("SessionStart"));
+    env.wait_idle();
+    assert_eq!(hook_fetches(&s), fetched + 1, "{}", env.log());
+
+    // Due, and two workers at once: one check.
+    env.make_update_due();
+    a.turn(3, "fourth");
+    b.turn(2, "fifth");
+    env.hook(&a.input("Stop"));
+    env.hook(&b.input("Stop"));
+    env.wait_idle();
+    assert_eq!(hook_fetches(&s), fetched + 2, "{}", env.log());
+
+    // Due, but a live worker holds the update lock: no check, and its lock is left alone.
+    env.make_update_due();
+    let lock = env.alice().join("state/update.lock");
+    std::fs::create_dir(&lock).unwrap();
+    let me = std::process::id().to_string();
+    std::fs::write(lock.join("pid"), format!("{me}\n")).unwrap();
+    std::fs::write(lock.join("at"), format!("{}\n", now_secs())).unwrap();
+    a.turn(4, "sixth");
+    env.hook(&a.input("Stop"));
+    env.wait_idle();
+    assert_eq!(hook_fetches(&s), fetched + 2, "{}", env.log());
+    assert_eq!(read(&lock.join("pid")).trim(), me);
+    std::fs::remove_dir_all(&lock).unwrap();
+    a.turn(5, "seventh");
+    env.hook(&a.input("Stop"));
+    env.wait_idle();
+    assert_eq!(hook_fetches(&s), fetched + 3, "{}", env.log());
+
+    // A record in the future (the clock was set back since): due.
+    std::fs::write(
+        env.checked_file(),
+        format!("{}\n", now_secs() + 10 * 86_400),
+    )
+    .unwrap();
+    a.turn(6, "eighth");
+    env.hook(&a.input("Stop"));
+    env.wait_idle();
+    assert_eq!(hook_fetches(&s), fetched + 4, "{}", env.log());
+}
+
+/// The plugin's hooks.json follows the installed script's `print-hooks-json`, and is rewritten
+/// only when that differs. Then the plugin's version moves too (a Claude Code that runs plugins
+/// from its cache copies a new version only), and `claude plugin` is asked to reload it in the
+/// background. The Codex hooks.json follows only while it is the file setup wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn self_update_rewrites_hooks_json_only_when_it_changed() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.install(&s);
+    let mp = env.marketplace();
+    let hooks = mp.join("alice-capture/hooks/hooks.json");
+    let plugin = mp.join("alice-capture/.claude-plugin/plugin.json");
+    let market = mp.join(".claude-plugin/marketplace.json");
+    let codex = env.codex_home.join("hooks.json");
+    let record = env.alice().join("codex-hooks.written");
+    assert_eq!(read(&codex), read(&record));
+    let base = read(&env.script());
+    let (hooks0, hooks_ino, plugin0, market0, codex0) = (
+        read(&hooks),
+        ino(&hooks),
+        read(&plugin),
+        read(&market),
+        read(&codex),
+    );
+    let calls0 = env.claude_calls();
+    let mut sess = Session::new(&env, "hooks-sync", &env.root.join("work"));
+
+    // 1. A newer script that prints the same hooks: nothing is rewritten, nothing is asked.
+    let v1 = with_version(&base, "aaaaaaaaaaaa");
+    update_to(&s, &env, &mut sess, 1, &v1);
+    assert_eq!(read(&env.script()), v1, "{}", env.log());
+    assert_eq!((read(&hooks), ino(&hooks)), (hooks0.clone(), hooks_ino));
+    assert_eq!((read(&plugin), read(&market)), (plugin0, market0));
+    assert_eq!(read(&codex), codex0);
+    assert_eq!(env.claude_calls(), calls0);
+
+    // 2. Its Claude Code hooks differ: hooks.json is rewritten, the plugin's version moves, and
+    //    Claude Code is asked to reload it.
+    let desc = "Alice capture: each event hands";
+    assert!(v1.contains(desc));
+    let v2 = with_version(
+        &v1.replacen(desc, "Alice capture (v2): each event hands", 1),
+        "bbbbbbbbbbbb",
+    );
+    update_to(&s, &env, &mut sess, 2, &v2);
+    assert_eq!(read(&env.script()), v2, "{}", env.log());
+    let printed = env.capture_sh(&["print-hooks-json", "claude-code"], &[]);
+    assert!(printed.stdout.contains("(v2)"), "{printed}");
+    assert_eq!(read(&hooks), printed.stdout, "{}", env.log());
+    assert_eq!(mode(&hooks), 0o600);
+    let parsed = json_file(&hooks);
+    for event in FIVE_EVENTS {
+        assert_eq!(
+            parsed["hooks"][event][0]["hooks"][0]["command"], HOOK_COMMAND,
+            "{event}"
+        );
+    }
+    let version = format!("{}+bbbbbbbbbbbb", env!("CARGO_PKG_VERSION"));
+    assert_eq!(json_file(&plugin)["version"], version.as_str());
+    assert_eq!(
+        json_file(&market)["plugins"][0]["version"],
+        version.as_str()
+    );
+    assert_eq!(json_file(&market)["plugins"][0]["name"], "alice-capture");
+    let calls = env.claude_calls();
+    assert_eq!(
+        calls[calls0.len()..].lines().collect::<Vec<_>>(),
+        [
+            "plugin marketplace update alice-local",
+            "plugin update alice-capture@alice-local"
+        ],
+        "{}",
+        env.log()
+    );
+    assert_eq!(read(&codex), codex0, "the Codex hooks print the same");
+    assert!(
+        env.update_leftovers().is_empty(),
+        "{:?}",
+        env.update_leftovers()
+    );
+
+    // 3. Its Codex hooks differ: the hooks.json setup wrote follows, with its record, and the
+    //    log reminds the person to trust the hooks again.
+    let codex_end = "hj_timeout=3;";
+    assert!(v2.contains(codex_end));
+    let v3 = with_version(&v2.replacen(codex_end, "hj_timeout=2;", 1), "cccccccccccc");
+    update_to(&s, &env, &mut sess, 3, &v3);
+    assert_eq!(
+        codex_hooks(&env)["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"],
+        2,
+        "{}",
+        env.log()
+    );
+    assert_eq!(read(&record), read(&codex));
+    assert_eq!(mode(&codex), 0o600);
+    assert_eq!(
+        env.claude_calls(),
+        calls,
+        "the plugin's hooks did not change"
+    );
+    assert!(env.log().contains("/hooks"), "{}", env.log());
+
+    // 4. A Codex hooks.json the person edited is never rewritten.
+    let edited = format!("{}\n", read(&codex));
+    std::fs::write(&codex, &edited).unwrap();
+    let v4 = with_version(
+        &v3.replacen("hj_timeout=2;", "hj_timeout=1;", 1),
+        "dddddddddddd",
+    );
+    update_to(&s, &env, &mut sess, 4, &v4);
+    assert_eq!(read(&env.script()), v4, "{}", env.log());
+    assert_eq!(read(&codex), edited);
+
+    // 5. `claude plugin` fails, or `claude` is missing: one line says to run setup again.
+    write_mode(
+        &env.bin.join("claude"),
+        b"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/claude-calls\"\nexit 1\n",
+        0o755,
+    );
+    for (i, (from, to, version)) in [
+        ("(v2)", "(v5)", "eeeeeeeeeeee"),
+        ("(v5)", "(v6)", "ffffffffffff"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if i == 1 {
+            std::fs::remove_file(env.bin.join("claude")).unwrap();
+        }
+        let script = with_version(&read(&env.script()).replacen(from, to, 1), version);
+        let logged = env.log().lines().count();
+        update_to(&s, &env, &mut sess, 5 + i, &script);
+        assert!(read(&hooks).contains(to), "{}", env.log());
+        let log = env.log();
+        let fresh: Vec<&str> = log
+            .lines()
+            .skip(logged)
+            .filter(|l| l.contains("run the setup command again"))
+            .collect();
+        assert_eq!(fresh.len(), 1, "{log}");
+        assert!(fresh[0].contains("hooks.json"), "{}", fresh[0]);
+    }
+}
+
+/// Setup checks the script it downloads as the update check does: a hook script that is not
+/// whole is refused, and the installed one stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_refuses_a_hook_script_that_is_not_whole() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    let good = std::fs::read(env.script()).unwrap();
+    let text = String::from_utf8(good.clone()).unwrap();
+    let cut = text[..text.find("\nmain() {").unwrap() + 1].to_string();
+    let no_marker = text.replacen(text.lines().nth(1).unwrap(), "# another script", 1);
+    for (body, why) in [(cut, "cut short"), (no_marker, "marker")] {
+        s.serve_hook_script(Some(script_answer(body)));
+        let r = env.setup(&s.url("ann"), "", &[]);
+        assert!(!r.ok(), "{why}: {r}");
+        assert!(
+            r.stderr.contains("not a whole Alice hook script") && r.stderr.contains(why),
+            "{r}"
+        );
+        assert_eq!(std::fs::read(env.script()).unwrap(), good, "{why}");
+        assert!(
+            env.update_leftovers().is_empty(),
+            "{:?}",
+            env.update_leftovers()
+        );
+    }
+}
+
+/// The hook itself never checks: it returns at once, and its background worker does.
+#[tokio::test(flavor = "multi_thread")]
+async fn self_update_never_runs_in_the_fast_path() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    env.make_update_due();
+    // Every request takes 1.5 s: a check made by the hook itself would hold it that long.
+    s.delay_requests(1500);
+    let mut sess = Session::new(&env, "fast-path", &env.root.join("work"));
+    sess.turn(1, "quick");
+    let fetched = hook_fetches(&s);
+    let r = env.hook(&sess.input("Stop"));
+    assert!(
+        r.elapsed < Duration::from_millis(1000),
+        "the hook took {:?}",
+        r.elapsed
+    );
+    assert_eq!(hook_fetches(&s), fetched, "nothing fetched by the hook");
+    assert!(
+        !env.workers().is_empty(),
+        "the worker goes on in the background"
+    );
+    env.wait_idle();
+    assert_eq!(hook_fetches(&s), fetched + 1, "{}", env.log());
+    let checked: u64 = read(&env.checked_file()).trim().parse().unwrap();
+    assert!(now_secs().abs_diff(checked) < 60, "{checked}");
+}
+
 // ---- Status and uninstall ----
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2578,6 +3297,7 @@ async fn uninstall_removes_what_setup_wrote() {
         "capture.conf",
         "capture.log",
         "paused-until",
+        "update-checked",
     ] {
         assert!(!env.alice().join(gone).exists(), "{gone}");
     }
@@ -2604,6 +3324,17 @@ fn the_scripts_parse_as_posix_sh_and_never_trace() {
         "uploads give up on a stalled link, not on a slow one"
     );
     assert!(hook.contains("--connect-timeout 1 --max-time 2"));
+    assert!(
+        hook.contains("curl -q -fsS --connect-timeout 5 --max-time 30 --max-filesize"),
+        "the update download"
+    );
+    let lines: Vec<&str> = hook.lines().take(3).collect();
+    assert!(lines[1].starts_with("# alice-capture-hook"), "{}", lines[1]);
+    assert_eq!(
+        lines[2], "# alice-capture-version: unstamped",
+        "the route stamps the version"
+    );
+    assert!(hook.ends_with("\nmain \"$@\"\n"));
     for path in [SETUP_SH, HOOK_SH] {
         let text = read(Path::new(path));
         let mut shells = vec!["/bin/sh"];

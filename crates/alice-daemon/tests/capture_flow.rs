@@ -1511,6 +1511,51 @@ async fn an_empty_session_end_at_the_cursor_ends_the_source_and_marks_it_due() {
     assert_eq!(chunks_holding(&svc, "said before the end is settled"), 1);
 }
 
+/// Task 15b: the answer says whether the upload ended the source, so the tenant script logs
+/// "ended" only then. A stop, a capped session end (`more=1`) and a session end that waits on
+/// the rules end nothing; the session end's last body does.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_answer_says_whether_the_upload_ended_the_source() {
+    let d = tempfile::tempdir().unwrap();
+    let svc = start_in(&d.path().join("home"), true);
+    let mut t = Transcript::default();
+    t.turn("ae", 1, "before the end");
+    let a = send(&svc, q("ae", 0, "stop"), &t.bytes).await;
+    assert_eq!(a.next_offset, t.len());
+    assert!(!a.ended, "a stop ends nothing");
+    let len = t.len();
+    t.turn("ae", 2, "at the end");
+    let capped = TranscriptQuery {
+        more: Some(1),
+        ..q("ae", len, "session-end")
+    };
+    let a = send(&svc, capped, &t.bytes[len as usize..]).await;
+    assert!(!a.ended, "a capped session end ends nothing");
+    assert!(!state_of(&svc, &uri("ae")).unwrap().ended);
+    let at = a.next_offset;
+    let a = send(&svc, q("ae", at, "session-end"), &t.bytes[at as usize..]).await;
+    assert!(a.ended, "the session end's last body ends the source");
+    assert!(state_of(&svc, &uri("ae")).unwrap().ended);
+    // Again, empty, at the cursor: still an end.
+    let a = send(&svc, q("ae", t.len(), "session-end"), b"").await;
+    assert!(a.ended);
+
+    // A pass that waits (the project's rules are unknown) writes nothing, so it ends nothing.
+    let local = start_in(&d.path().join("local-home"), false);
+    let repo = d.path().join("waiting-repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join(".alice.toml"), "[privacy\nno_capture = tru").unwrap();
+    let mut w = Transcript::default();
+    w.turn("aw", 1, "waits for the rules");
+    let waiting = TranscriptQuery {
+        cwd: Some(repo.to_string_lossy().into_owned()),
+        ..q("aw", 0, "session-end")
+    };
+    let a = send(&local, waiting, &w.bytes).await;
+    assert_eq!(a.next_offset, 0, "the pass waits");
+    assert!(!a.ended, "a waiting session end ends nothing");
+}
+
 /// A pass that waits (the project's rules are unknown) records no gap, even from beyond the
 /// cursor; the gap is counted once, by the pass that captures.
 #[tokio::test(flavor = "multi_thread")]

@@ -145,6 +145,8 @@ pub struct PassReport {
     pub chunks_stored: u64,
     /// `bytes` are a whole pass without a line end: the caller skips that line.
     pub oversized_line: bool,
+    /// The pass ended the source (`input.end`, and the pass wrote): a session end landed.
+    pub ended: bool,
     pub stats: ReadStats,
     /// Writer operations sent (slices and state changes).
     pub writes: u64,
@@ -159,6 +161,7 @@ impl PassReport {
             turns_skipped: self.turns_skipped,
             chunks_stored: self.chunks_stored,
             oversized_line: self.oversized_line,
+            ended: self.ended,
         }
     }
 
@@ -595,6 +598,8 @@ impl CaptureCtl {
                 "another pass stored some of this pass's turns first"
             );
         }
+        // `needed` keeps a slice whenever `input.end`, and the last one carries `ended`.
+        report.ended = input.end;
         self.mark_due(&input, &report);
         report.next_offset = done;
         Ok(report)
