@@ -185,6 +185,18 @@ pub struct HistoryArgs {
     pub limit: usize,
 }
 
+/// `alice hook <event>` (SP2 spec §4.1). Plain strings, so that no value makes clap fail: an
+/// unknown event or agent is logged to hook.log like any other bad input.
+#[derive(Args)]
+pub struct HookArgs {
+    /// session-start, stop, subagent-stop, pre-compact or session-end; the hook_event_name of
+    /// the input, when it names one of them, wins.
+    pub event: String,
+    /// The agent that runs the hook: claude-code or codex.
+    #[arg(long, default_value = "claude-code")]
+    pub agent: String,
+}
+
 #[derive(Subcommand)]
 pub enum ProjectsCmd {
     /// List projects (the default for `alice projects`).
@@ -880,6 +892,11 @@ pub fn dispatch(command: Command, json: bool) -> Result<()> {
             rt()?.block_on(token_rotate(&home, show, json))
         }
         Command::Service(c) => service_command(&home, c, json),
+        // `main` runs `alice hook` before anything else; this is `alice --json hook …`.
+        Command::Hook(a) => {
+            crate::hook::run(a);
+            Ok(())
+        }
         other => rt()?.block_on(client_command(home, other, json)),
     }
 }
@@ -1197,6 +1214,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         Command::Import(ImportCmd::Mempalace(a)) => import_mempalace(&home, a, json).await,
         Command::Import(ImportCmd::Status) => import_status(&home, json).await,
         Command::Daemon(DaemonCmd::Run { .. })
+        | Command::Hook(_)
         | Command::Mcp
         | Command::Model(_)
         | Command::Bench(_)

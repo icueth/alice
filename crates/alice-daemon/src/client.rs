@@ -167,14 +167,21 @@ fn fresh_nonce() -> Option<String> {
     Some(hex::encode(buf))
 }
 
-/// Whether the process at `base` is daemon `instance` and knows `token`. Sends no token.
-async fn proves(http: &reqwest::Client, base: &str, token: &str, instance: &str) -> bool {
+/// Whether the process at `base` is daemon `instance` and knows `token`, answering within
+/// `wait`. Sends no token.
+async fn proves(
+    http: &reqwest::Client,
+    base: &str,
+    token: &str,
+    instance: &str,
+    wait: Duration,
+) -> bool {
     let Some(nonce) = fresh_nonce() else {
         return false;
     };
     let Ok(resp) = http
         .get(format!("{base}/api/v1/ping?nonce={nonce}"))
-        .timeout(PING_TIMEOUT)
+        .timeout(wait)
         .send()
         .await
     else {
@@ -365,6 +372,23 @@ fn daemon_home(home: &AliceHome) -> PathBuf {
     std::path::absolute(home.root()).unwrap_or_else(|_| home.root().to_path_buf())
 }
 
+/// Start `<exe> daemon run` for `home` in the background and return at once, without waiting
+/// for it to serve (`alice hook`, which must exit within its budget). Nothing is started while
+/// `alice restore` swaps the database, or while a live process holds the daemon lock: a daemon
+/// starting, serving without answering in time, or stopping is not given a rival to wait for.
+pub fn start_detached(home: &AliceHome, exe: &Path) -> std::io::Result<()> {
+    if crate::restore::in_progress(home) || startup::lock_holder(home).is_some() {
+        return Ok(());
+    }
+    spawn_detached_with_env(
+        exe,
+        &["daemon", "run"],
+        &home.logs_dir().join("daemon.log"),
+        &[("ALICE_HOME", daemon_home(home).as_os_str())],
+    )
+    .map(|_| ())
+}
+
 impl DaemonClient {
     /// The daemon daemon.json names, if it answers and proves the token.
     pub async fn try_existing(home: &AliceHome) -> Option<DaemonClient> {
@@ -372,11 +396,31 @@ impl DaemonClient {
         Self::verified(home, &http).await
     }
 
+    /// The daemon daemon.json names, for `alice hook` (SP2 spec §4.1): it must prove the token
+    /// within `ping`, none is started, and no settings are read (a hook never recalls, so the
+    /// recall wait is the defaults').
+    pub async fn for_hook(home: &AliceHome, ping: Duration) -> Option<DaemonClient> {
+        let info = read_info(home)?;
+        let token = read_token(home)?;
+        let http = http_client().ok()?;
+        let base = format!("http://127.0.0.1:{}", info.port);
+        let recall_wait = crate::config::recall_wait(&alice_core::settings::Settings::default());
+        proves(&http, &base, &token, &info.instance, ping)
+            .await
+            .then(|| DaemonClient {
+                http,
+                base,
+                token,
+                recall_wait,
+                instance: info.instance,
+            })
+    }
+
     async fn verified(home: &AliceHome, http: &reqwest::Client) -> Option<DaemonClient> {
         let info = read_info(home)?;
         let token = read_token(home)?;
         let base = format!("http://127.0.0.1:{}", info.port);
-        proves(http, &base, &token, &info.instance)
+        proves(http, &base, &token, &info.instance, PING_TIMEOUT)
             .await
             .then(|| DaemonClient {
                 http: http.clone(),
@@ -463,7 +507,14 @@ impl DaemonClient {
 
     /// Whether the daemon this client verified still answers and proves the token.
     pub async fn is_live(&self) -> bool {
-        proves(&self.http, &self.base, &self.token, &self.instance).await
+        proves(
+            &self.http,
+            &self.base,
+            &self.token,
+            &self.instance,
+            PING_TIMEOUT,
+        )
+        .await
     }
 
     async fn call<Req: Serialize + ?Sized, Resp: DeserializeOwned>(
@@ -804,6 +855,51 @@ impl DaemonClient {
             compat_mempalace: v["compat.mempalace"].as_bool() == Some(true),
             unreachable: false,
         })
+    }
+    /// `POST /api/v1/capture/notify` (`alice hook`): the daemon queues a pass of the transcript
+    /// and answers at once; a refused notice is `AliceError::Invalid`.
+    pub async fn capture_notify(&self, n: &CaptureNotify, timeout: Duration) -> Result<()> {
+        let _queued: serde_json::Value = self.call("/api/v1/capture/notify", n, timeout).await?;
+        Ok(())
+    }
+    /// `GET /api/v1/capture/briefing`: the SessionStart briefing, or `None` when there is none to
+    /// give (`204`: `capture.briefing` is off, or the session is resumed or forked).
+    pub async fn capture_briefing(
+        &self,
+        q: &BriefingQuery,
+        timeout: Duration,
+    ) -> Result<Option<String>> {
+        let mut qs = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in [
+            ("source", &q.source),
+            ("cwd", &q.cwd),
+            ("project", &q.project),
+        ] {
+            if let Some(v) = value {
+                qs.append_pair(key, v);
+            }
+        }
+        let resp = self
+            .http
+            .get(format!(
+                "{}/api/v1/capture/briefing?{}",
+                self.base,
+                qs.finish()
+            ))
+            .bearer_auth(&self.token)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(transport)?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        if status.is_success() {
+            return resp.text().await.map(Some).map_err(transport);
+        }
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        Err(error_from(status, &body))
     }
     pub async fn shutdown(&self) -> Result<()> {
         let resp = self
