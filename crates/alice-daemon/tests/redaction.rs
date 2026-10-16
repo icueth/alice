@@ -926,6 +926,82 @@ async fn a_daemon_started_with_a_broken_config_keeps_the_last_privacy_and_blocks
     s.shutdown();
 }
 
+/// Final re-review (with N-m6): a project with no working tree (a server tenant's or an
+/// importer's placeholder, `root_path` NULL) is never taken for a tree that is gone: its writes
+/// are redacted, not refused; the spool does not keep them as fail-closed; it is not kept from
+/// the cloud. A working directory this machine does not have (a client's path) is `global`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_without_a_working_tree_is_never_a_gone_tree() {
+    let d = tempfile::tempdir().unwrap();
+    let home = AliceHome::new(d.path().to_path_buf());
+    home.ensure_dirs().unwrap();
+    {
+        let c = alice_core::store::open_writer(&home.db()).unwrap();
+        alice_core::store::projects::upsert_project(
+            &c,
+            &alice_core::project::ProjectRef {
+                key: "client:tenant-x".into(),
+                slug: "tenant-x".into(),
+                name: "tenant-x".into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+    }
+    let s = Service::start(
+        home.clone(),
+        &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+        ServiceOptions::default(),
+    )
+    .unwrap();
+    {
+        let c = alice_core::store::open_reader(&home.db()).unwrap();
+        assert_eq!(
+            alice_core::store::projects::tree_of(&c, "tenant-x").unwrap(),
+            None,
+            "no tree to look at"
+        );
+    }
+    let r = s
+        .remember(RememberRequest {
+            content: format!("deploy with {GITHUB}"),
+            project: Some("tenant-x".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("redacted, not refused as a gone tree would be");
+    assert_eq!(r.project, "tenant-x");
+    let got = s
+        .get(GetRequest {
+            ids: vec![r.id.unwrap()],
+            include_provenance: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        got.memories[0].memory.body,
+        "deploy with [REDACTED:github_token]"
+    );
+    assert!(!s.rules_fail_closed(Some("tenant-x"), None).await);
+    assert!(s.settings_handle().cloud_allowed("tenant-x", None));
+    // A client's working directory that this machine does not have.
+    let away = s
+        .remember(RememberRequest {
+            content: format!("again {GITHUB}"),
+            cwd: Some("/nonexistent/client/home/code/tenant-x".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("redacted, not refused");
+    assert_eq!(away.project, "global");
+    assert!(
+        !s.rules_fail_closed(None, Some("/nonexistent/client/home/code/tenant-x"))
+            .await
+    );
+    s.shutdown();
+}
+
 /// A review item the way the judge will leave it (Task 12): written straight into the inbox.
 fn add_review(
     s: &Service,

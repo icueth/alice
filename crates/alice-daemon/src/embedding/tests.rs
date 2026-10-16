@@ -1153,3 +1153,88 @@ async fn a_remote_provider_gets_text_redacted_with_todays_rules_whatever_was_sto
     assert!(body.contains(token));
     s.shutdown();
 }
+
+/// Final re-review N-I1: a recall from a stored project's tree whose `.alice.toml` denies the
+/// cloud sends no query to a remote embedder, although the project was last written from a
+/// worktree without the file; and the project's later writes stay at home.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_from_a_tree_whose_file_denies_the_cloud_is_not_sent_to_a_remote_embedder() {
+    let mock = Mock::start();
+    let d = tempfile::tempdir().unwrap();
+    let s = start(
+        d.path(),
+        options(http_factory(true, Arc::default())),
+        &remote_toml(&mock, "m", ""),
+    );
+    until("the provider's embedder to be built", 15, || async {
+        s.model() == "openai:m"
+    })
+    .await;
+    let [main, feat] = ["client-x", "client-x-feat"].map(|n| {
+        let dir = d.path().join(n);
+        std::fs::create_dir(&dir).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/me/client-x.git",
+            ],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "git {args:?}");
+        }
+        Some(dir.to_string_lossy().into_owned())
+    });
+    std::fs::write(
+        std::path::Path::new(main.as_deref().unwrap()).join(".alice.toml"),
+        "[privacy]\ncloud_denied = true\n",
+    )
+    .unwrap();
+    let remember = |cwd: &Option<String>, text: &str| {
+        let (s, cwd, text) = (s.clone(), cwd.clone(), text.to_string());
+        async move {
+            s.remember(RememberRequest {
+                content: text,
+                cwd,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+        }
+    };
+    remember(&feat, "the pelican nests by the harbour").await;
+    settled(&s).await;
+    assert!(mock.saw("pelican"), "nothing said otherwise yet");
+    let sent = mock.texts().len();
+    let r = s
+        .recall(RecallRequest {
+            query: "where does the pelican nest".into(),
+            cwd: main.clone(),
+            format: OutputFormat::Json,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        r.notes.iter().any(|n| n.contains("word matches only")),
+        "{:?}",
+        r.notes
+    );
+    assert_eq!(mock.texts().len(), sent, "the query never left");
+    remember(&feat, "the walrus colony is on the north shore").await;
+    settled(&s).await;
+    assert!(
+        !mock.saw("walrus"),
+        "the project stays at home from every tree"
+    );
+    assert_eq!(state_of(&s, "walrus").await, "skipped_cloud");
+    s.shutdown();
+}
