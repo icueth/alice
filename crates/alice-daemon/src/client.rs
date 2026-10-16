@@ -630,6 +630,15 @@ impl DaemonClient {
     pub async fn stats(&self) -> Result<Stats> {
         self.get_json("/api/v1/stats").await
     }
+    /// The capture switch, distillation and the sessions captured most recently.
+    pub async fn capture_status(&self) -> Result<CaptureStatus> {
+        self.get_json("/api/v1/capture/status").await
+    }
+    /// Make a captured session (or capture source) due for distillation now.
+    pub async fn capture_distill(&self, r: &CaptureDistillRequest) -> Result<CaptureDistillAnswer> {
+        self.call("/api/v1/capture/distill", r, Duration::from_secs(10))
+            .await
+    }
     /// Backups in the backup directory, newest first.
     pub async fn backups(&self) -> Result<Vec<crate::backup::BackupInfo>> {
         self.get_json("/api/v1/backups").await

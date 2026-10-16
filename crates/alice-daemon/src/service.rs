@@ -570,6 +570,12 @@ pub struct ServiceOptions {
     pub team_url: Option<String>,
     /// This tenant's name (`ALICE_TENANT_NAME`), the author the team store records.
     pub tenant_name: Option<String>,
+    /// How often the distill worker looks for sessions to distil when nothing wakes it (SP2
+    /// spec §6.2: 60 s). Tests shorten it.
+    pub distill_tick: Duration,
+    /// Tests: how long a session must be quiet before it is distilled, in place of
+    /// `distill.idle_minutes`.
+    pub distill_idle_override: Option<Duration>,
 }
 
 impl Default for ServiceOptions {
@@ -603,6 +609,8 @@ impl Default for ServiceOptions {
             team_store: false,
             team_url: None,
             tenant_name: None,
+            distill_tick: crate::distill::TICK,
+            distill_idle_override: None,
         }
     }
 }
@@ -857,6 +865,8 @@ pub struct Service {
     import: Mutex<ImportSlot>,
     /// The capture pipeline (SP2): transcript bytes into chunks, turn keys and cursors.
     capture: Arc<CaptureCtl>,
+    /// The distill worker (SP2 Task 12): captured sessions into memories.
+    distill: Arc<crate::distill::DistillCtl>,
     /// The compatibility layer's short-lived overview cache.
     pub(crate) compat: crate::compat::CompatState,
     /// Tests: time added to the age of the shared health reading.
@@ -1441,6 +1451,28 @@ impl Service {
             settings.clone(),
             redactors.clone(),
         );
+        let distill = crate::distill::DistillCtl::new(crate::distill::DistillCfg {
+            ctx: crate::distill::DistillCtx {
+                readers: readers.clone(),
+                writer: writer.clone(),
+                settings: settings.clone(),
+                redactors: redactors.clone(),
+                judge: judge.clone(),
+            },
+            tick: opts.distill_tick,
+            idle_override: opts.distill_idle_override,
+        });
+        {
+            let weak = Arc::downgrade(&distill);
+            capture.set_on_due(Arc::new(move || {
+                if let Some(d) = weak.upgrade() {
+                    d.wake();
+                }
+            }));
+        }
+        if let Err(e) = distill.spawn() {
+            tracing::error!(error = %e, "cannot start the distill worker; captured sessions are not distilled until the daemon restarts");
+        }
         // The team store never links to itself.
         let (team, team_error) = if opts.team_store {
             (None, None)
@@ -1494,6 +1526,7 @@ impl Service {
             scheduler,
             import: Mutex::new(ImportSlot::new()),
             capture,
+            distill,
             compat: crate::compat::CompatState::default(),
             #[cfg(test)]
             health_aged: Mutex::new(Duration::ZERO),
@@ -1557,6 +1590,7 @@ impl Service {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.wake_worker.try_send(());
         let _ = self.wake_judge.try_send(());
+        self.distill.signal_stop();
         // The import first: it reads and, later, writes through the pieces stopped below.
         let import = self.import.lock().handle.take();
         if let Some(h) = import {
@@ -1619,6 +1653,8 @@ impl Service {
         } else if judge.join().is_err() {
             tracing::error!("the judge worker panicked");
         }
+        // It may be waiting for Jev, like the judge worker: a moment, then it is left.
+        self.distill.stop();
         self.writer.send_nowait(WriteOp::Shutdown);
         if writer.join().is_err() {
             tracing::error!("the writer panicked");
@@ -3406,6 +3442,9 @@ impl Service {
                 .format("%Y-%m-%d")
                 .to_string();
             let costs = alice_core::store::judge::cost_since(c, &week)?;
+            // What the distiller stored today, and how much of it was trashed since.
+            let (distilled_today, distill_dropped_today) =
+                crate::distill::distilled_since(c, &format!("{today}T00:00:00.000Z"))?;
             // The judge's spend is every one of its ledger rows: its own and distillation's.
             use alice_core::judge::jev::{LEDGER_DISTILL, LEDGER_ROWS};
             let judge_costs = |keep: &dyn Fn(&alice_core::store::judge::CostRow) -> bool| {
@@ -3442,9 +3481,8 @@ impl Service {
                 distill_cost_today_usd: judge_costs(&|r| {
                     r.day == today && r.provider == LEDGER_DISTILL
                 }),
-                // Filled by the distiller (SP2 Task 12).
-                distilled_today: 0,
-                distill_dropped_today: 0,
+                distilled_today,
+                distill_dropped_today,
             })
         })
         .await
@@ -4577,6 +4615,7 @@ impl Service {
         let model_loaded = self.embedder().is_loaded();
         let memory_bytes = crate::doctor::self_memory_bytes();
         let unrecognised_lines = self.capture.unrecognised_lines_7d();
+        let distill = self.distill.clone();
         let capture_settings = self.settings();
         let tenant = self.opts.tenant;
         // Read the backup directory, the spool and the database: off the runtime's threads.
@@ -4626,7 +4665,10 @@ impl Service {
                 settings_errors,
                 config_degraded,
                 team_warning,
-                capture: crate::capture::health(c, &capture_settings, unrecognised_lines)?,
+                capture: distill.fill_health(
+                    c,
+                    crate::capture::health(c, &capture_settings, unrecognised_lines)?,
+                )?,
                 tenant,
             })
         })
@@ -4783,11 +4825,45 @@ impl Service {
 
     /// `GET /api/v1/capture/status`: the capture switch, distillation and the 50 sessions
     /// captured most recently.
+    /// `alice capture distill <session>` (SP2 spec §8.3): the session (or capture source) is due
+    /// for distillation now, whatever its state (a backfilled or failed one too).
+    pub async fn capture_distill_now(&self, session_or_source: &str) -> Result<()> {
+        self.capture_distill(session_or_source).await.map(|_| ())
+    }
+
+    /// [`capture_distill_now`](Self::capture_distill_now) with the uris of the sources it made
+    /// due (`POST /api/v1/capture/distill`). `NotFound` when nothing captured answers to it.
+    pub async fn capture_distill(&self, session_or_source: &str) -> Result<Vec<String>> {
+        let _busy = self.activity.enter();
+        let (distill, id) = (self.distill.clone(), session_or_source.to_string());
+        tokio::task::spawn_blocking(move || distill.mark_due_now(&id))
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Where distillation stands (SP2 spec §8.4): `off`, `ready`, `waiting_judge`,
+    /// `waiting_budget`, `breaker_open` or `no_key`, with what is wrong and what to do.
+    pub async fn distill_status(&self) -> Result<crate::distill::DistillView> {
+        let distill = self.distill.clone();
+        self.read(move |c| distill.view(c)).await
+    }
+
+    /// Tests and diagnosis: the distill worker's last runs, oldest first.
+    #[doc(hidden)]
+    pub fn distill_runs(&self) -> Vec<crate::distill::RunReport> {
+        self.distill.runs()
+    }
+
     pub async fn capture_status(&self) -> Result<CaptureStatus> {
         let _busy = self.activity.enter();
         let (tenant, settings) = (self.opts.tenant, self.settings());
-        self.read(move |c| crate::capture::status(c, tenant, &settings))
-            .await
+        let distill = self.distill.clone();
+        self.read(move |c| {
+            let mut status = crate::capture::status(c, tenant, &settings)?;
+            status.distill_state = distill.view(c)?.state.into();
+            Ok(status)
+        })
+        .await
     }
 }
 
@@ -4812,6 +4888,7 @@ impl Drop for Service {
             let _ = self.wake_worker.try_send(());
             let _ = self.wake_judge.try_send(());
             self.embedding.signal_stop();
+            self.distill.signal_stop();
             self.writer.send_nowait(WriteOp::Shutdown);
         }
     }

@@ -586,6 +586,38 @@ pub fn settings_checks(view: &SettingsView, loosening_waiting: bool) -> Vec<Chec
     out
 }
 
+/// The `distill` line (SP2 spec §8.4): `off`; OK with how many memories were distilled today;
+/// or a warning (the judge is not Jev, no key, the breaker is open, today's share is used up)
+/// with what to do.
+///
+/// ```
+/// use alice_daemon::distill::DistillView;
+/// use alice_daemon::doctor::{CheckStatus, distill_check};
+/// let ready = DistillView { state: "ready", warning: None, fix: None };
+/// assert_eq!(distill_check(&ready, 3).line(), "OK   distill: jev, 3 distilled today");
+/// let off = DistillView { state: "off", warning: None, fix: None };
+/// assert_eq!(distill_check(&off, 0).line(), "OK   distill: off");
+/// let key = DistillView { state: "no_key", warning: Some("no Jev key is set".into()), fix: Some("`alice config set-secret jev_api_key`".into()) };
+/// assert_eq!(distill_check(&key, 0).status, CheckStatus::Warn);
+/// ```
+pub fn distill_check(v: &crate::distill::DistillView, distilled_today: u64) -> Check {
+    match v.state {
+        "off" => check("distill", CheckStatus::Ok, "off", None),
+        "ready" => check(
+            "distill",
+            CheckStatus::Ok,
+            format!("jev, {distilled_today} distilled today"),
+            None,
+        ),
+        other => check(
+            "distill",
+            CheckStatus::Warn,
+            v.warning.clone().unwrap_or_else(|| other.replace('_', " ")),
+            v.fix.as_deref(),
+        ),
+    }
+}
+
 /// Checks only the daemon can make (it alone opens the database).
 pub async fn daemon_checks(svc: &Service) -> alice_core::Result<Vec<Check>> {
     use CheckStatus::{Fail, Warn};
@@ -632,6 +664,11 @@ pub async fn daemon_checks(svc: &Service) -> alice_core::Result<Vec<Check>> {
             ),
         ));
     }
+    // SP2 §8.4: where distillation stands.
+    out.push(distill_check(
+        &svc.distill_status().await?,
+        stats.distilled_today,
+    ));
     out.extend(settings_checks(
         &view,
         svc.settings_handle().loosening_waiting(),

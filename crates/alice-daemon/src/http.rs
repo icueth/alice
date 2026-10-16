@@ -688,6 +688,26 @@ async fn capture_status(State(st): State<AppState>) -> ApiResult<CaptureStatus> 
     Ok(Json(st.svc.capture_status().await?))
 }
 
+/// `POST /api/v1/capture/distill` (SP2 spec §8.2): `{session_id}` or `{source_id}`; that
+/// session becomes due for distillation now. `404` when nothing captured answers to it.
+async fn capture_distill(
+    State(st): State<AppState>,
+    ApiJson(r): ApiJson<CaptureDistillRequest>,
+) -> ApiResult<CaptureDistillAnswer> {
+    let id = r
+        .source_id
+        .or(r.session_id)
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError(AliceError::invalid(
+                "name the session: send {\"session_id\": \"<id>\"} or {\"source_id\": \"<id>\"}",
+            ))
+        })?;
+    Ok(Json(CaptureDistillAnswer {
+        due: st.svc.capture_distill(&id).await?,
+    }))
+}
+
 /// `GET /api/v1/capture/briefing` (SP2 spec §5.7): `200 text/plain; charset=utf-8` with the
 /// briefing, or `204` when there is none to give.
 async fn capture_briefing(
@@ -1134,6 +1154,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
             post(capture_transcript).layer(DefaultBodyLimit::max(TRANSCRIPT_BODY_LIMIT)),
         )
         .route("/api/v1/capture/status", get(capture_status))
+        .route("/api/v1/capture/distill", post(capture_distill))
         .route("/api/v1/capture/briefing", get(capture_briefing))
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         .route("/api/v1/admin/token/rotate", post(rotate_token))
