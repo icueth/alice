@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod bq;
+pub mod capture;
 pub mod codetokens;
 pub mod context;
 pub mod embed;
