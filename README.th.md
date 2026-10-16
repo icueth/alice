@@ -77,8 +77,11 @@ Alice ทำงานได้ทั้งบนเครื่องของ�
 | เก็บ session อัตโนมัติ | `alice hooks install claude` (หรือ `codex`) | รันบรรทัดเดียวที่แอดมินให้ |
 | ความเป็นส่วนตัว | ข้อความออกนอกเครื่องเฉพาะบริการ cloud ที่คุณเปิดเอง และ `.alice.toml` ของ repo มีผลเต็มที่ | เซิร์ฟเวอร์ปกปิด secret เสมอ แอดมินอ่านความจำของคุณได้ และ `.alice.toml` ไม่มีผลกับ MCP |
 | ความจำส่วนกลางของทีม | ไม่มี | มีให้เลือกใช้ |
-| แพลตฟอร์ม | macOS (Apple Silicon), Linux | agent ใดก็ได้ที่ใช้ MCP ผ่าน HTTP ส่วนการเก็บ session ใช้ได้บน macOS และ Linux |
+| แพลตฟอร์ม | macOS (Apple Silicon), Linux (glibc) | agent ใดก็ได้ที่ใช้ MCP ผ่าน HTTP ส่วนการเก็บ session ใช้ได้บน macOS และ Linux |
 | คู่มือติดตั้ง | [docs/setup-local.md](docs/setup-local.md) | [docs/setup-server.md](docs/setup-server.md) |
+
+<!-- TODO(confirm): `alice hooks` comes from Task 8 (commit 4eaa6a8 on feat/sp2-local-hooks), not yet merged into this
+branch; the same holds for its other mentions below. -->
 
 คู่มือติดตั้งทั้งสองเขียนไว้ให้ agent อ่านแล้วทำตาม: ส่งไฟล์ให้ Claude Code หรือ Codex (เช่น "อ่าน docs/setup-local.md แล้วทำตามทุกขั้นตอน") มันจะติดตั้งและเชื่อมต่อให้ครบ โดยถามคุณเฉพาะเรื่องที่ต้องตัดสินใจเอง (จะ import MemPalace ไหม จะเลิกใช้ MemPalace ไหม จะเปิดการกลั่นความรู้ไหม) จะเริ่มใช้ในเครื่องก่อนแล้วค่อยย้ายขึ้นเซิร์ฟเวอร์ทีหลังก็ได้ แอดมินย้ายฐานข้อมูลในเครื่องของคุณขึ้น tenant ให้ได้ ([docs/server.md](docs/server.md#moving-your-local-alice-to-the-server))
 
@@ -87,7 +90,7 @@ Alice ทำงานได้ทั้งบนเครื่องของ�
 ต้องมี Rust 1.99 ขึ้นไป ([rustup](https://rustup.rs)) และ compiler C/C++ (Xcode Command Line Tools บน macOS, `build-essential` บน Debian/Ubuntu, MSVC Build Tools บน Windows)
 
 ```bash
-cargo install --git https://github.com/icueth/alice alice-memory
+cargo install --git https://github.com/icueth/alice alice-memory --locked
 alice model fetch      # ครั้งเดียวก่อนเริ่มใช้: ดาวน์โหลดโมเดล embedding (~136MB) ไว้ที่ ~/.alice/models
 ```
 
@@ -208,8 +211,8 @@ alice recall --raw "error ตอน migrate เมื่อวาน"
 ```
 
 - **ทุก turn เก็บครั้งเดียว** turn ที่จบแล้วถูกเก็บลงชั้นข้อมูลดิบ ในโปรเจกต์ของ session นั้น hook ที่ทำงานซ้ำ daemon ที่ล่มกลางทาง หรือ session ที่ resume/fork มา ไม่ทำให้ turn ไหนถูกเก็บซ้ำ ค้น transcript ได้ด้วย `recall --raw` (`include_raw`) และมันไม่ไปปนในผลค้นหาความรู้หรือใน briefing
-- **ตัดให้กระชับ ไม่เก็บทั้งก้อน** output ของ tool เก็บเฉพาะส่วนต้นกับส่วนท้าย ส่วนเนื้อหาไฟล์ที่ agent อ่านหรือแก้, thinking, รูปภาพ และผลของ tool ความจำ ไม่ถูกเก็บเลย secret ถูกปกปิด (ในโหมด block chunk ที่มี secret จะถูกกันไว้ แต่การเก็บยังเดินต่อ)
-- **ไม่ขวางการทำงาน** `alice hook` จบภายใน 100ms (ราว 7ms ที่ p95 เมื่อ daemon ทำงานอยู่) exit 0 เสมอ และถ้า daemon ไม่ทำงานก็พักงานไว้ใน spool
+- **ตัดให้กระชับ ไม่เก็บทั้งก้อน** output ของ tool เก็บเฉพาะส่วนต้นกับส่วนท้าย ส่วนเนื้อหาไฟล์ที่ agent อ่านหรือแก้, รูปภาพ และผลของ tool ความจำ ไม่ถูกเก็บเลย ส่วน thinking จะเก็บก็ต่อเมื่อคุณเปิดเอง secret ถูกปกปิด (ในโหมด block chunk ที่มี secret จะถูกกันไว้ แต่การเก็บยังเดินต่อ)
+- **ไม่ขวางการทำงาน** `alice hook` มีงบเวลา 100ms exit 0 เสมอ และถ้า daemon ไม่ทำงานก็พักงานไว้ใน spool
 - **มี briefing ตอนเริ่ม** session ใหม่ของ Claude Code เริ่มด้วย briefing ของโปรเจกต์จาก `context` (ปิดได้ด้วย `capture.briefing = false`)
 - **คุณเลือกเองว่าจะเก็บอะไร** ใช้ `capture.excluded_projects`, ใส่ `no_capture = true` ใน `.alice.toml` ของ repo หรือปิดทั้งหมดด้วย `capture.enabled = false`
 - **กลั่นความรู้ถ้าต้องการ** เมื่อใช้ Judge แบบ Jev คำสั่ง `alice config set distill.provider jev` จะกลั่น session ที่จบแล้วเป็น memory สั้นๆ ไม่กี่อัน ติดป้าย `(auto)` และใช้งบได้แค่ส่วนหนึ่งของงบรายวันของ Judge ค่าเริ่มต้นคือปิด และมันไม่เคยถามอะไรคุณ
@@ -247,7 +250,8 @@ alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # MCP server แบบ stdio สำหรับ agent
 alice hook <session-start|stop|subagent-stop|pre-compact|session-end> [--agent claude-code|codex]
                                # สิ่งที่ hook ของ agent เรียก (รับ JSON ของ hook ทาง stdin); exit 0 เสมอ
-alice hooks install | uninstall | status <claude|codex> [--settings <file>] [--dry-run]
+alice hooks install | uninstall <claude|codex> [--settings <file>] [--dry-run]
+alice hooks status <claude|codex> [--settings <file>]
 alice capture status | distill <session-id>
 alice capture backfill <claude|codex> [--since YYYY-MM-DD] [--project <slug>] [--distill]
 alice model fetch | check      # check: โหลดโมเดลแล้วลองสร้าง embedding หนึ่งข้อความ (ไม่เปิด daemon)
@@ -561,7 +565,7 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 | **SP1 · M2** | Judge (กฎในเครื่อง + Jev), คิว review, undo, ตัด secret, backup และ restore, maintenance, settings ที่มีผลทันที, doctor, service install, embedding provider ผ่าน HTTP, build บน Windows, เป้าหน่วยความจำ 800MB | เสร็จแล้ว (alpha) |
 | **SP1 · M3** | ตัว import จาก MemPalace และ compatibility layer | สร้างเสร็จแล้ว รอ review สุดท้าย (alpha) |
 | **SP1 · M4** | Git sync | วางแผนแล้ว |
-| **SP2** | เก็บ session ของ Claude Code และ Codex อัตโนมัติ (hook ในเครื่องและสคริปต์สำหรับ tenant บนเซิร์ฟเวอร์), กลั่นความรู้ด้วย Jev, การย้ายจาก MemPalace และ backfill, คู่มือติดตั้งที่ agent ทำตามได้ | สร้างเสร็จแล้ว (alpha) |
+| **SP2** | เก็บ session ของ Claude Code และ Codex อัตโนมัติ (hook ในเครื่องและสคริปต์สำหรับ tenant บนเซิร์ฟเวอร์), กลั่นความรู้ด้วย Jev, การย้ายจาก MemPalace และ backfill, คู่มือติดตั้งที่ agent ทำตามได้ | กำลังทำ (alpha) |
 | **SP3** | Web UI (graph, จัดการ memory, review, settings, sync, สุขภาพระบบ) แล้วตามด้วยแอป desktop | วางแผนแล้ว |
 
 การเก็บ session ของ Cursor, Windsurf, OpenCode และ Gemini CLI จะตามมาภายหลัง สวิตช์ `capture.*` ของ agent เหล่านี้มีไว้แล้ว

@@ -77,8 +77,11 @@ Alice runs where you choose: on your own machine, or as your own space (a "tenan
 | Automatic capture | `alice hooks install claude` (or `codex`) | One setup line from your admin |
 | Privacy | Text leaves the machine only for the cloud services you turn on; a repository's `.alice.toml` applies in full | The server always redacts secrets, the admin can read your memory, and `.alice.toml` does not apply over MCP |
 | Shared team memory | No | Optional |
-| Platforms | macOS (Apple Silicon), Linux | Any agent that speaks MCP over HTTP; capture on macOS and Linux |
+| Platforms | macOS (Apple Silicon), Linux (glibc) | Any agent that speaks MCP over HTTP; capture on macOS and Linux |
 | Setup guide | [docs/setup-local.md](docs/setup-local.md) | [docs/setup-server.md](docs/setup-server.md) |
+
+<!-- TODO(confirm): `alice hooks` comes from Task 8 (commit 4eaa6a8 on feat/sp2-local-hooks), not yet merged into this
+branch; the same holds for its other mentions below. -->
 
 Both setup guides are written for an agent: hand the file to Claude Code or Codex ("Read docs/setup-local.md and follow every step") and it installs and connects everything, asking you only about your choices (importing MemPalace, retiring it, turning distillation on). You can start locally and move later: your admin can adopt your local database into a tenant ([docs/server.md](docs/server.md#moving-your-local-alice-to-the-server)).
 
@@ -87,7 +90,7 @@ Both setup guides are written for an agent: hand the file to Claude Code or Code
 You need Rust 1.99 or newer ([rustup](https://rustup.rs)) and a C/C++ compiler (Xcode Command Line Tools on macOS, `build-essential` on Debian/Ubuntu, the MSVC Build Tools on Windows).
 
 ```bash
-cargo install --git https://github.com/icueth/alice alice-memory
+cargo install --git https://github.com/icueth/alice alice-memory --locked
 alice model fetch      # once, before first use: the embedding model (~136 MB) into ~/.alice/models
 ```
 
@@ -208,8 +211,8 @@ alice recall --raw "the migration error from yesterday"
 ```
 
 - **Every turn, once.** Each finished turn is stored in the raw tier, in the session's project. Hooks that fire twice, a crash, or a resumed or forked session never store a turn twice. Transcripts are found with `recall --raw` (`include_raw`) and never fill the knowledge hits or the briefing.
-- **Trimmed, not dumped.** Tool output keeps its head and tail; file contents read or edited, thinking, images and memory-tool results are never stored; secrets are redacted (in block mode a chunk with a secret is withheld and capture goes on).
-- **Never in the way.** `alice hook` ends within 100 ms (about 7 ms at p95 with the daemon up), always exits 0, and spools when the daemon is down.
+- **Trimmed, not dumped.** Tool output keeps its head and tail; file contents read or edited, images and memory-tool results are never stored, and thinking only if you turn it on; secrets are redacted (in block mode a chunk with a secret is withheld and capture goes on).
+- **Never in the way.** `alice hook` has a budget of 100 ms, always exits 0, and spools when the daemon is down.
 - **A briefing at the start.** Each new Claude Code session starts with the project's `context` briefing (`capture.briefing = false` turns it off).
 - **You decide what is kept.** `capture.excluded_projects`, `no_capture = true` in a repository's `.alice.toml`, or `capture.enabled = false`.
 - **Distillation, if you want it.** With the Jev judge, `alice config set distill.provider jev` turns ended sessions into a few short memories, marked `(auto)`, within a share of the judge's daily budget. It is off by default, and it never asks you anything.
@@ -247,7 +250,8 @@ alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # stdio MCP server for agents
 alice hook <session-start|stop|subagent-stop|pre-compact|session-end> [--agent claude-code|codex]
                                # what agents' hooks run (the hook's JSON on stdin); always exits 0
-alice hooks install | uninstall | status <claude|codex> [--settings <file>] [--dry-run]
+alice hooks install | uninstall <claude|codex> [--settings <file>] [--dry-run]
+alice hooks status <claude|codex> [--settings <file>]
 alice capture status | distill <session-id>
 alice capture backfill <claude|codex> [--since YYYY-MM-DD] [--project <slug>] [--distill]
 alice model fetch | check      # check: load the model and embed one text (no daemon)
@@ -478,7 +482,10 @@ M1 missed the memory budget (about 1.4 GB projected with the model). M2 meets it
 
 A small team can share one Linux server. Each person gets their own Alice daemon behind `https://<host>/u/<name>`, and agents (Claude Code, Codex and others) connect straight to the MCP endpoint `https://<host>/u/<name>/mcp` with a bearer token. No client binary is needed, so this also works on Windows. An optional shared team memory lets a person tell their agent "save this to the shared memory"; every team member can read it, and only its author or the admin can change it. The server's admin can read every person's memory, and a repository's `.alice.toml` does not apply over direct MCP. The server needs an x86-64 CPU with AVX (AVX2 is not needed: `deploy/server/build-release` builds the server binary with Microsoft's ONNX Runtime).
 
-The admin guide (setup, `alice-server`, disk budget, backups, privacy), the setup for each agent and capture for team members are in [docs/server.md](docs/server.md). A person can hand [docs/setup-server.md](docs/setup-server.md) to their agent, which connects everything.
+The admin guide (setup, `alice-server`, disk budget, backups, privacy), the setup for each agent and capture for team members are in [docs/server.md](docs/server.md). For a person:
+
+- **Let an agent set it up:** hand [docs/setup-server.md](docs/setup-server.md) to Claude Code or Codex. It connects everything, automatic capture included, without showing the token.
+- **Automatic capture:** run the one line the admin gives, `curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>`. It reuses `~/.config/alice/token` and `~/.config/alice/url` (asking once for the token when they are missing) and installs the hook script and a Claude Code plugin (and Codex's hooks when Codex is installed). The script does not update itself: after the admin upgrades the server, run the same line again. `sh ~/.config/alice/alice-capture.sh status` shows the capture and `sh ~/.config/alice/alice-capture.sh uninstall` removes it; details in "Capture for team members" of [docs/server.md](docs/server.md#capture-for-team-members).
 
 ## Roadmap
 
@@ -488,7 +495,7 @@ The admin guide (setup, `alice-server`, disk budget, backups, privacy), the setu
 | **SP1 · M2** | Judge (heuristic + Jev), review inbox, undo, redaction, backups and restore, maintenance, live settings, doctor, service install, HTTP embedding providers, Windows build, the 800 MB memory budget | Done (alpha) |
 | **SP1 · M3** | MemPalace importer and compatibility layer | Built, in final review (alpha) |
 | **SP1 · M4** | Git sync | Planned |
-| **SP2** | Automatic capture of Claude Code and Codex sessions (local hooks and server-tenant scripts), distillation with Jev, MemPalace cut-over and backfill, agent-runnable setup guides | Built (alpha) |
+| **SP2** | Automatic capture of Claude Code and Codex sessions (local hooks and server-tenant scripts), distillation with Jev, MemPalace cut-over and backfill, agent-runnable setup guides | In progress (alpha) |
 | **SP3** | Web UI (graph, memory manager, reviews, settings, sync, health), then a desktop app | Planned |
 
 Capture for Cursor, Windsurf, OpenCode and Gemini CLI comes later; their `capture.*` switches already exist.
