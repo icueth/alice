@@ -403,8 +403,8 @@ async fn a_resend_from_zero_stores_nothing_twice() {
 }
 
 /// Spec §11.1 under R11: once retention has deleted a captured session's chunks, its state,
-/// cursor and turn keys stay, so a re-pass stores nothing. A resend from 0 is told the kept
-/// cursor, and sending from there adds no chunk.
+/// cursor and turn keys stay, so a re-pass stores nothing again. A resend from 0 is told the
+/// kept cursor, and sending from there stores the new turn only.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_re_pass_after_retention_stores_nothing() {
     let d = home_with("[capture]\nraw_retention = \"1d\"\n");
@@ -413,7 +413,7 @@ async fn a_re_pass_after_retention_stores_nothing() {
     t.turn("s9", 1, "first").turn("s9", 2, "second");
     let cursor = send(&svc, q("s9", 0, "stop"), &t.bytes).await.next_offset;
     assert!(!chunks_of(&svc, &uri("s9")).is_empty());
-    // Two days later (the state was stamped before the first chunk, as capture does).
+    // Two days later, for the chunks and the state alike.
     let then = (chrono::Utc::now() - chrono::Duration::days(2))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let w = alice_core::store::open_writer(&svc.home().db()).unwrap();
@@ -426,6 +426,8 @@ async fn a_re_pass_after_retention_stores_nothing() {
         .await
         .unwrap();
     assert!(chunks_of(&svc, &uri("s9")).is_empty(), "{report:?}");
+    // The session goes on: the whole transcript is sent again, with one new turn.
+    t.turn("s9", 3, "third");
     let jump = svc
         .capture_transcript(q("s9", 0, "stop"), Bytes::from(t.bytes.clone()))
         .await
@@ -433,11 +435,17 @@ async fn a_re_pass_after_retention_stores_nothing() {
         .expect_err("a resend from 0 is behind the kept cursor");
     assert_eq!(jump, cursor);
     let a = send(&svc, q("s9", jump, "stop"), &t.bytes[jump as usize..]).await;
-    assert_eq!((a.turns_stored, a.chunks_stored), (0, 0));
-    assert!(
-        chunks_of(&svc, &uri("s9")).is_empty(),
-        "the re-pass stores nothing"
-    );
+    assert_eq!(a.turns_stored, 1, "{a:?}");
+    let chunks = chunks_of(&svc, &uri("s9"));
+    assert_eq!(chunks.len(), a.chunks_stored as usize);
+    assert_eq!(chunks_holding(&svc, "third is settled"), 1, "the new turn");
+    for marker in ["first", "second"] {
+        assert_eq!(
+            chunks_holding(&svc, &format!("{marker} is settled")),
+            0,
+            "{marker} is not stored again"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

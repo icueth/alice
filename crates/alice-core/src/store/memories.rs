@@ -296,10 +296,11 @@ pub fn link(conn: &Connection, from: &str, to: &str, kind: &str, by: &str) -> Re
 }
 
 /// An explicit memory beats a distilled one, exact copies included (SP2 final review M1): when
-/// `id` is a live distilled memory and its exact copy at hand is not distilled, the memory
-/// becomes the copy's: its origin, author and `kind_explicit`, with `updated_at` and `hlc`
-/// moved. A distilled copy changes nothing. No history row is recorded here (the writer records
-/// events).
+/// `id` is a distilled memory that exact dedupe found (any status but trashed: active, pending,
+/// superseded or archived) and its exact copy at hand is not distilled, the memory becomes the
+/// copy's: its origin, author and `kind_explicit`, with `updated_at` and `hlc` moved. Its status
+/// stays as it is. A distilled copy changes nothing. No history row is recorded here (the writer
+/// records events).
 fn promote_distilled(
     conn: &Connection,
     id: &str,
