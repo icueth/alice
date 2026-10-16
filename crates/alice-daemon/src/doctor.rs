@@ -135,13 +135,12 @@ fn mode(path: &Path) -> Option<u32> {
 pub fn local_checks(home: &AliceHome, daemon: Option<&Health>) -> Vec<Check> {
     let fake_embedder = std::env::var("ALICE_EMBEDDER").is_ok_and(|v| v == "fake");
     let mut out = local_checks_with(home, daemon, fake_embedder);
-    // The agents' hooks are on this machine; a server tenant's are on its person's.
-    if !daemon.is_some_and(|h| h.tenant) {
-        out.extend(capture_checks(
-            daemon,
-            &|k| std::env::var_os(k),
-            chrono::Utc::now(),
-        ));
+    let now = chrono::Utc::now();
+    match daemon {
+        // A server tenant's hooks are on its person's machine: only the capture line, which the
+        // uploads feed, is checked (without the quiet-week rule, which needs the hooks).
+        Some(h) if h.tenant => out.extend(capture_check(h, false, now)),
+        _ => out.extend(capture_checks(daemon, &|k| std::env::var_os(k), now)),
     }
     out
 }
@@ -421,31 +420,35 @@ pub(crate) fn capture_check(
             "if Codex keeps its sessions elsewhere, start the daemon with the same CODEX_HOME",
         );
     }
-    if c.rollouts_compressed > 0 {
-        problems.push(format!(
+    // Mentioned, not warned about: there is nothing to do (Alice reads only uncompressed ones).
+    let compressed = (c.rollouts_compressed > 0).then(|| {
+        format!(
             "{} Codex rollouts are compressed (.jsonl.zst) and were skipped since the daemon started",
             c.rollouts_compressed
-        ));
-        fixes.push(
-            "nothing to do in Alice: it reads only uncompressed rollouts, so those sessions are not captured",
-        );
-    }
+        )
+    });
     Some(if problems.is_empty() {
         let last = c
             .last_capture_at
             .as_deref()
             .map(|t| format!("; last at {t}"))
             .unwrap_or_default();
+        let detail = format!(
+            "{} sessions and {} chunks captured in the last 24 hours{last}",
+            c.sessions_24h, c.chunks_24h
+        );
         check(
             "capture",
             CheckStatus::Ok,
-            format!(
-                "{} sessions and {} chunks captured in the last 24 hours{last}",
-                c.sessions_24h, c.chunks_24h
-            ),
+            [Some(detail), compressed]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; "),
             None,
         )
     } else {
+        problems.extend(compressed);
         check(
             "capture",
             CheckStatus::Warn,
@@ -919,6 +922,25 @@ mod tests {
         );
         // The flag is only sent when set: a local daemon's health reads as before.
         assert!(!serde_json::to_string(&health()).unwrap().contains("tenant"));
+        // Task 8 review: the capture line, which the uploads feed, is kept; the hooks check,
+        // which would read this server's agent files, is not made, nor is the quiet-week rule
+        // that needs it.
+        h.capture = Some(Box::new(alice_core::api::CaptureHealth {
+            last_capture_at: Some("2026-01-01T00:00:00.000Z".into()),
+            unrecognised_lines_7d: 4,
+            ..Default::default()
+        }));
+        let checks = local_checks(&home, Some(&h));
+        let c = find(&checks, "capture");
+        assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+        assert!(
+            c.detail.contains("4 transcript lines") && !c.detail.contains("nothing was captured"),
+            "{c:?}"
+        );
+        assert!(
+            !checks.iter().any(|c| c.name == "capture hooks"),
+            "{checks:?}"
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1250,17 +1272,26 @@ mod tests {
                     .contains("the agent's transcript format may have changed"),
             "{c:?}"
         );
+        // Compressed Codex rollouts are mentioned, but leave nothing to do: no warning.
         let cap = h.capture.as_mut().unwrap();
         cap.unrecognised_lines_7d = 0;
-        cap.rollouts_not_found = 3;
         cap.rollouts_compressed = 2;
+        let c = capture_check(&h, true, now).unwrap();
+        assert_eq!(c.status, CheckStatus::Ok, "{c:?}");
+        assert!(
+            c.detail.contains("4 sessions") && c.detail.contains("2 Codex rollouts"),
+            "{c:?}"
+        );
+        assert!(c.fix.is_none(), "{c:?}");
+        // Rollouts not found are a warning, and the line still names the compressed ones.
+        h.capture.as_mut().unwrap().rollouts_not_found = 3;
         let c = capture_check(&h, true, now).unwrap();
         assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
         assert!(
             c.detail.contains("3 Codex sessions") && c.detail.contains("2 Codex rollouts"),
             "{c:?}"
         );
-        assert!(c.fix.is_some(), "{c:?}");
+        assert!(c.fix.as_deref().unwrap().contains("CODEX_HOME"), "{c:?}");
         // The counts are sent only when set: a daemon's health reads as before.
         let json = serde_json::to_string(&CaptureHealth::default()).unwrap();
         assert!(!json.contains("rollouts"), "{json}");

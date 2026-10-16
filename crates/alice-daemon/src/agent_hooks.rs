@@ -9,7 +9,8 @@
 //!   `hook <event> --agent <agent>`, with or without that prefix and that suffix, whatever the
 //!   path. Install removes them all, then adds fresh ones: it is idempotent and repairs hooks of
 //!   a moved binary. Uninstall removes them, and the groups, lists and `hooks` object they leave
-//!   empty.
+//!   empty (spec: "and arrays left empty"). An empty list the person had before the install is
+//!   one of those: Alice cannot tell it from one she made.
 //! - **The file** is edited through [`json`], which keeps key order; the rest of it stays as it
 //!   is. A missing file starts from `{}`; one that is not strict JSON is refused untouched. A
 //!   file that would not change is not written. Otherwise the new text is checked against
@@ -37,7 +38,8 @@ pub const CLAUDE_EVENTS: &[(&str, &str)] = &[
     ("SessionEnd", "session-end"),
 ];
 
-/// The last line of a Codex install: Codex runs a hook only once the person trusts it.
+/// The last line of a Codex install: Codex runs a hook only once the person trusts it (see
+/// [`install_notes`]).
 pub const CODEX_TRUST: &str = "Codex runs a hook only after you trust it: open /hooks in Codex once and trust the Alice entries.";
 
 /// A hook's time limit in seconds: a guard, as the hook itself ends within 100 ms.
@@ -354,11 +356,19 @@ pub fn install_report(t: &HookTarget, c: &HookChange, dry_run: bool, undo: &str)
             "Hooks load in new sessions. To remove them: {undo}\n"
         ));
     }
-    if t.agent == HookAgent::Codex {
-        s.push_str(CODEX_TRUST);
+    for note in install_notes(t.agent) {
+        s.push_str(note);
         s.push('\n');
     }
     s
+}
+
+/// What the person still has to do after an install: for Codex, trust the hooks.
+pub fn install_notes(agent: HookAgent) -> Vec<&'static str> {
+    match agent {
+        HookAgent::Claude => Vec::new(),
+        HookAgent::Codex => vec![CODEX_TRUST],
+    }
 }
 
 /// What `alice hooks uninstall` prints.
@@ -486,7 +496,7 @@ fn load(file: &Path) -> Result<(Option<String>, JValue)> {
         Err(e) if e.kind() == ErrorKind::NotFound => None,
         Err(e) => {
             return Err(AliceError::Other(format!(
-                "cannot read {}: {e}",
+                "cannot read {}: {e}; nothing was changed",
                 file.display()
             )));
         }
@@ -541,15 +551,31 @@ fn commands(root: &JValue) -> Vec<(&str, &str)> {
 fn others(root: &JValue, agent: HookAgent) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (_, c) in commands(root) {
-        let lower = c.to_lowercase();
-        if (lower.contains("alice") || lower.contains("mempalace"))
-            && alice_program(c, agent).is_none()
-            && !out.iter().any(|o| o == c)
-        {
+        if mentions_memory(c) && alice_program(c, agent).is_none() && !out.iter().any(|o| o == c) {
             out.push(c.to_string());
         }
     }
     out
+}
+
+/// Whether a word of `command` names something of Alice's or MemPalace's: its last path
+/// component starts with `alice` or `mempalace`, whatever the case (`alice-session-start`,
+/// `mempalace.hooks`). A folder on the way (`/home/alice/…`) does not count.
+fn mentions_memory(command: &str) -> bool {
+    let words: Vec<String> = match tokens(command) {
+        Some(tokens) => tokens
+            .into_iter()
+            .filter_map(|t| match t {
+                Token::Word(w) => Some(w),
+                Token::Op(_) => None,
+            })
+            .collect(),
+        None => command.split_whitespace().map(String::from).collect(),
+    };
+    words.iter().any(|w| {
+        let last = w.rsplit('/').next().unwrap_or_default().to_lowercase();
+        last.starts_with("alice") || last.starts_with("mempalace")
+    })
 }
 
 /// Removes Alice's entries for `agent`, and the groups they leave empty; returns how many. An
@@ -1346,6 +1372,41 @@ mod tests {
             assert_eq!(read(&t.file), other);
         }
         assert!(backups_of(&t.file).is_empty());
+        // A file that is not UTF-8: refused the same way, and the error says so.
+        let latin1 = b"{\"model\": \"caf\xe9\"}\n";
+        std::fs::write(&t.file, latin1).unwrap();
+        for e in [install(&t, false).unwrap_err(), status(&t).unwrap_err()] {
+            let e = e.to_string();
+            assert!(
+                e.contains(&t.file.display().to_string()) && e.contains("nothing was changed"),
+                "{e}"
+            );
+        }
+        assert_eq!(std::fs::read(&t.file).unwrap(), latin1);
+        assert!(backups_of(&t.file).is_empty());
+    }
+
+    /// Spec §4.3: uninstall removes Alice's entries "and arrays left empty". It cannot tell an
+    /// empty list (or `hooks` object) the person had before the install from one Alice made,
+    /// so that one goes too; an empty one Alice never filled stays.
+    #[test]
+    fn uninstall_drops_the_empty_lists_it_leaves_even_ones_the_person_made() {
+        let m = Machine::new();
+        let t = m.target(HookAgent::Claude);
+        write(
+            &t.file,
+            "{\n  \"hooks\": {\n    \"Stop\": [],\n    \"Notification\": []\n  }\n}\n",
+        );
+        install(&t, false).unwrap();
+        uninstall(&t, false).unwrap();
+        assert_eq!(
+            read(&t.file),
+            "{\n  \"hooks\": {\n    \"Notification\": []\n  }\n}\n"
+        );
+        write(&t.file, "{\n  \"model\": \"opus\",\n  \"hooks\": {}\n}\n");
+        install(&t, false).unwrap();
+        uninstall(&t, false).unwrap();
+        assert_eq!(read(&t.file), "{\n  \"model\": \"opus\"\n}\n");
     }
 
     /// Plan decision P5: a text `serde_json` would not read back as the value meant is never
@@ -1422,15 +1483,29 @@ mod tests {
   "SessionStart": [{"hooks": [{"type": "command", "command": "~/.local/bin/alice-session-start"}]}],
   "Stop": [
     {"hooks": [{"type": "command", "command": "afplay x.aiff"}]},
+    {"hooks": [{"type": "command", "command": "/Users/alice/bin/notify.sh done"}]},
+    {"hooks": [{"type": "command", "command": "cd /home/alice/src && make"}]},
     {"hooks": [{"type": "command", "command": "mempalace hook stop"}]}
   ],
-  "PreCompact": [{"hooks": [{"type": "command", "command": "/x/alice hook pre-compact --agent claude-code"}]}]
+  "PreCompact": [{"hooks": [{"type": "command", "command": "/x/alice hook pre-compact --agent claude-code"}]}],
+  "SubagentStop": [{"hooks": [
+    {"type": "command", "command": "python3 -m mempalace.hooks stop"},
+    {"type": "command", "command": "/opt/Alice-tools/run.sh"},
+    {"type": "command", "command": "\"/opt/x/ALICE Session.sh\" --quiet"}
+  ]}]
 }}"#,
         );
         let c = install(&t, false).unwrap();
+        // A word whose last path component starts with alice or mempalace, whatever the case;
+        // not a home directory named alice. Alice's own entry is replaced, not listed.
         assert_eq!(
             c.others,
-            ["~/.local/bin/alice-session-start", "mempalace hook stop"],
+            [
+                "~/.local/bin/alice-session-start",
+                "mempalace hook stop",
+                "python3 -m mempalace.hooks stop",
+                "\"/opt/x/ALICE Session.sh\" --quiet"
+            ],
             "{c:?}"
         );
         assert_eq!(c.removed, 1);
@@ -1609,27 +1684,25 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_settings_file_stays_a_link() {
-        #[cfg(unix)]
-        {
-            let m = Machine::new();
-            let t = m.target(HookAgent::Claude);
-            let real = m.root.join("dotfiles/settings.json");
-            write(&real, OWN);
-            std::fs::create_dir_all(t.file.parent().unwrap()).unwrap();
-            std::os::unix::fs::symlink(&real, &t.file).unwrap();
-            let c = install(&t, false).unwrap();
-            assert!(
-                std::fs::symlink_metadata(&t.file)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
-            assert_eq!(read(&real), c.text);
-            // The backup is next to the link, not in the folder the link points into.
-            assert_eq!(c.backup.unwrap().parent(), t.file.parent());
-        }
+        let m = Machine::new();
+        let t = m.target(HookAgent::Claude);
+        let real = m.root.join("dotfiles/settings.json");
+        write(&real, OWN);
+        std::fs::create_dir_all(t.file.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &t.file).unwrap();
+        let c = install(&t, false).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&t.file)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(read(&real), c.text);
+        // The backup is next to the link, not in the folder the link points into.
+        assert_eq!(c.backup.unwrap().parent(), t.file.parent());
     }
 
     #[test]

@@ -19,8 +19,9 @@ pub enum JValue {
     Obj(Vec<(String, JValue)>),
 }
 
-/// How deep arrays and objects may nest (serde_json's limit too).
-const MAX_DEPTH: usize = 128;
+/// How deep arrays and objects may nest: serde_json's limit (it refuses the 128th level), so
+/// that a file this parser takes is one the P5 check can read back.
+const MAX_DEPTH: usize = 127;
 
 impl JValue {
     /// The value of `key`, for an object that has it.
@@ -460,10 +461,13 @@ mod tests {
             let e = parse(bad).expect_err(bad);
             assert!(e.contains(want), "{bad:?}: {e}");
         }
-        let deep = "[".repeat(MAX_DEPTH + 1) + &"]".repeat(MAX_DEPTH + 1);
-        assert!(parse(&deep).unwrap_err().contains("deep"));
-        let ok = "[".repeat(MAX_DEPTH) + &"]".repeat(MAX_DEPTH);
-        assert!(parse(&ok).is_ok());
+        // The depth serde_json takes, and not one level more (else the P5 check would refuse a
+        // file this parser took).
+        let nested = |n: usize| "[".repeat(n) + &"]".repeat(n);
+        assert!(parse(&nested(MAX_DEPTH)).is_ok());
+        assert!(serde_json::from_str::<serde_json::Value>(&nested(MAX_DEPTH)).is_ok());
+        assert!(parse(&nested(MAX_DEPTH + 1)).unwrap_err().contains("deep"));
+        assert!(serde_json::from_str::<serde_json::Value>(&nested(MAX_DEPTH + 1)).is_err());
         // A number serde_json cannot hold parses here, and is refused on the way to it.
         assert!(parse("[1e400]").unwrap().to_serde().is_err());
     }

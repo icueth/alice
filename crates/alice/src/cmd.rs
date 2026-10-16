@@ -2964,16 +2964,21 @@ fn hooks_command(home: &AliceHome, c: HooksCmd, json: bool) -> Result<()> {
                     .map(|_| format!(" --settings {}", ah::shell_quote(&t.file.to_string_lossy())))
                     .unwrap_or_default()
             );
-            print(json, &hooks_change_json(&t, &change, a.dry_run)?, || {
-                ah::install_report(&t, &change, a.dry_run, &undo)
-            })
+            let notes = ah::install_notes(t.agent);
+            print(
+                json,
+                &hooks_change_json(&t, &change, a.dry_run, &notes)?,
+                || ah::install_report(&t, &change, a.dry_run, &undo),
+            )
         }
         HooksCmd::Uninstall(a) => {
             let t = HookTarget::locate(a.agent.into(), a.settings.as_deref(), &env)?;
             let change = ah::uninstall(&t, a.dry_run)?;
-            print(json, &hooks_change_json(&t, &change, a.dry_run)?, || {
-                ah::uninstall_report(&t, &change, a.dry_run)
-            })
+            print(
+                json,
+                &hooks_change_json(&t, &change, a.dry_run, &[])?,
+                || ah::uninstall_report(&t, &change, a.dry_run),
+            )
         }
         HooksCmd::Status(a) => {
             let t = HookTarget::locate(a.agent.into(), a.settings.as_deref(), &env)?;
@@ -3024,16 +3029,18 @@ fn hooks_command(home: &AliceHome, c: HooksCmd, json: bool) -> Result<()> {
     }
 }
 
-/// An install's or an uninstall's `--json`: the change (never the file's text), its agent and
-/// whether it was a dry run.
+/// An install's or an uninstall's `--json`: the change (never the file's text), its agent,
+/// whether it was a dry run, and what the person still has to do (`notes`).
 fn hooks_change_json(
     t: &alice_daemon::agent_hooks::HookTarget,
     change: &alice_daemon::agent_hooks::HookChange,
     dry_run: bool,
+    notes: &[&str],
 ) -> Result<serde_json::Value> {
     let mut v = serde_json::to_value(change)?;
     v["agent"] = t.agent.name().into();
     v["dry_run"] = dry_run.into();
+    v["notes"] = notes.into();
     Ok(v)
 }
 

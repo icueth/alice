@@ -4373,6 +4373,7 @@ fn alice_hooks_cli_round_trip() {
         again.get("text").is_none(),
         "the file is never printed: {again}"
     );
+    assert_eq!(again["notes"], serde_json::json!([]), "{again}");
     let before = std::fs::read(&settings).unwrap();
     let dry = e.json(&["hooks", "uninstall", "claude", "--dry-run"]);
     assert_eq!(
@@ -4410,6 +4411,15 @@ fn alice_hooks_cli_round_trip() {
             .as_str()
             .unwrap()
             .ends_with(" hook stop --agent codex || true")
+    );
+    // `--json` carries the trust step too.
+    let dry = e.json(&["hooks", "install", "codex", "--dry-run"]);
+    assert_eq!(
+        dry["notes"],
+        serde_json::json!([
+            "Codex runs a hook only after you trust it: open /hooks in Codex once and trust the Alice entries."
+        ]),
+        "{dry}"
     );
     let s = e.json(&["hooks", "status", "codex"]);
     assert_eq!(
