@@ -179,40 +179,67 @@ hooks_json() {
 # Codex (spec section 5.4 step 8). hooks.json is written only when it does not exist, or is
 # still exactly the file this script wrote earlier (then it is updated in place); a file of the
 # person's own, or inline [hooks] tables in config.toml, are never edited: the entries are
-# printed instead.
+# printed instead (or, when they are in the file already, said to be there).
+#
+# The record of what was written ($DIR/codex-hooks.written) is staged first, so a record that
+# cannot be written leaves hooks.json untouched, and is reported as that.
 codex_setup() {
   command -v codex >/dev/null 2>&1 || return 0
   cs_home="${CODEX_HOME:-$HOME/.codex}"
   cs_file="$cs_home/hooks.json"
   cs_new=$(hooks_json codex)
+  cs_re='alice-capture\.sh.{1,3}hook codex'
   cs_write=
   cs_why=
+  cs_have=
+  cs_existed=
   if [ -f "$cs_file" ]; then
+    cs_existed=1
     if [ -f "$DIR/codex-hooks.written" ] && cmp -s "$cs_file" "$DIR/codex-hooks.written"; then
       cs_write=1
     else
       cs_why="$cs_file already exists"
+      if grep -Eq "$cs_re" "$cs_file" 2>/dev/null; then cs_have=1; fi
     fi
   elif [ -e "$cs_file" ]; then
     cs_why="$cs_file exists and is not a file"
-  elif grep -q '^[[:space:]]*\[\[\{0,1\}hooks[].]' "$cs_home/config.toml" 2>/dev/null; then
+  elif grep -Eq "^[[:space:]]*(\[[[:space:]]*){0,2}[\"']?hooks[\"']?[[:space:]]*[].=]" "$cs_home/config.toml" 2>/dev/null; then
     cs_why="$cs_home/config.toml already has [hooks] tables, so hooks.json is not added beside them"
+    if grep -Eq "$cs_re" "$cs_home/config.toml" 2>/dev/null; then cs_have=1; fi
   else
     cs_write=1
   fi
   say ""
   if [ -n "$cs_write" ]; then
-    mkdir -p "$cs_home" 2>/dev/null &&
-      { printf '%s\n' "$cs_new" >"$cs_file.tmp.$$" && mv -f "$cs_file.tmp.$$" "$cs_file"; } 2>/dev/null &&
-      { printf '%s\n' "$cs_new" >"$DIR/codex-hooks.written"; } 2>/dev/null || {
-      rm -f "$cs_file.tmp.$$" 2>/dev/null
+    cs_stage="$DIR/codex-hooks.written.new"
+    rm -f "$cs_stage" 2>/dev/null
+    if ! { printf '%s\n' "$cs_new" >"$cs_stage"; } 2>/dev/null; then
+      rm -f "$cs_stage" 2>/dev/null
+      say "Codex: could not write the record $DIR/codex-hooks.written, so $cs_file was not written and was not changed; add these entries to your hooks yourself:"
+      say "$cs_new"
+      cs_state="not written"
+      return 0
+    fi
+    if ! { mkdir -p "$cs_home" && printf '%s\n' "$cs_new" >"$cs_file.tmp.$$" && mv -f "$cs_file.tmp.$$" "$cs_file"; } 2>/dev/null; then
+      rm -f "$cs_file.tmp.$$" "$cs_stage" 2>/dev/null
       say "Codex: could not write $cs_file; add these entries to it yourself:"
       say "$cs_new"
       cs_state="not written"
       return 0
-    }
+    fi
+    if ! mv -f "$cs_stage" "$DIR/codex-hooks.written" 2>/dev/null; then
+      rm -f "$cs_stage" 2>/dev/null
+      if [ -z "$cs_existed" ]; then rm -f "$cs_file" 2>/dev/null; fi
+      say "Codex: could not write the record $DIR/codex-hooks.written, so $cs_file was not left as written; add these entries to your hooks yourself:"
+      say "$cs_new"
+      cs_state="not written"
+      return 0
+    fi
     say "Codex: wrote $cs_file with the five Alice capture hooks."
     cs_state="installed"
+  elif [ -n "$cs_have" ]; then
+    say "Codex: $cs_why and already has the Alice capture entries; it was left as it is."
+    cs_state="entries present"
   else
     say "Codex: $cs_why; it was left as it is. Add these hook entries to your hooks:"
     say "$cs_new"

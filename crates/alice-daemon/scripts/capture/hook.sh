@@ -28,7 +28,7 @@
 #
 # The token leaves the shell only as a curl config line on curl's stdin (curl -q -K -), written
 # by the printf builtin: never in argv, a URL, a child's environment, a log or an error.
-# POSIX sh; needs curl, sed, head, tail, wc, od, ls, sort, mkdir, mv and date; git and awk are
+# POSIX sh; needs curl, sed, head, tail, wc, od, ls, sort, cmp, mkdir, mv and date; git and awk are
 # optional.
 # Never run it with set -x: that would print the token.
 
@@ -96,15 +96,16 @@ valid_id() {
 }
 
 # The Codex rollout of session $1 when the hook gave no transcript_path (it can be null): the
-# newest seven $CODEX_HOME/sessions/YYYY/MM/DD folders are searched for rollout-*<session>*.jsonl.
-# Prints the path (nothing when there is none). A compressed .jsonl.zst rollout is never matched.
+# newest seven $CODEX_HOME/sessions/YYYY/MM/DD folders are searched for rollout-*-<session>.jsonl
+# (the session id is the end of the file name, and is matched whole). Prints the path (nothing
+# when there is none). A compressed .jsonl.zst rollout is never matched.
 find_rollout() {
   valid_id "$1" || return 1
   fr_root="${CODEX_HOME:-$HOME/.codex}/sessions"
   [ -d "$fr_root" ] || return 1
   ls -d "$fr_root"/[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9] 2>/dev/null | sort -r | head -n 7 |
     while IFS= read -r fr_d; do
-      for fr_f in "$fr_d"/rollout-*"$1"*.jsonl; do
+      for fr_f in "$fr_d"/rollout-*-"$1".jsonl; do
         if [ -f "$fr_f" ]; then
           printf '%s\n' "$fr_f"
           break 2
@@ -724,11 +725,9 @@ sweep() {
     [ -z "$s_stopped" ] || continue
     valid_id "$s_session" || continue
     if [ -n "$s_sub" ]; then valid_id "$s_sub" || continue; fi
-    if [ ! -f "$s_path" ] && [ "$(key_agent "$sw_key")" = codex ]; then
-      # A Codex state made without a transcript_path: the rollout may exist by now.
-      sw_found=$(find_rollout "$s_session")
-      if [ -n "$sw_found" ]; then s_path=$sw_found; fi
-    fi
+    # A Codex state is only ever made for a rollout that was found (run_main returns before
+    # capture_one when the search finds nothing), so a vanished file is not searched for again:
+    # another file would be paired with this file's stored offset.
     if [ ! -f "$s_path" ]; then
       # No transcript (gone, or not written yet): forget it a week after it was last there.
       # The `seen` line decides, not the mtime (which mark_pending sets back).
@@ -782,6 +781,24 @@ run_main() {
 }
 
 # ---- status and uninstall ----
+
+# Where the Codex hooks stand: in $CODEX_HOME/hooks.json (as setup wrote it, or changed), in an
+# inline [hooks] table of config.toml, or not found. Silent when there is no Codex here.
+codex_status() {
+  cst_home="${CODEX_HOME:-$HOME/.codex}"
+  cst_re='alice-capture\.sh.{1,3}hook codex'
+  if [ -f "$cst_home/hooks.json" ] && grep -Eq "$cst_re" "$cst_home/hooks.json" 2>/dev/null; then
+    if [ -f "$DIR/codex-hooks.written" ] && cmp -s "$cst_home/hooks.json" "$DIR/codex-hooks.written"; then
+      printf 'codex hooks: installed (%s/hooks.json); Codex runs them only after you trust them in /hooks\n' "$cst_home"
+    else
+      printf 'codex hooks: in %s/hooks.json (changed since setup wrote it, or added by hand); Codex runs them only after you trust them in /hooks\n' "$cst_home"
+    fi
+  elif grep -Eq "$cst_re" "$cst_home/config.toml" 2>/dev/null; then
+    printf 'codex hooks: in %s/config.toml; Codex runs them only after you trust them in /hooks\n' "$cst_home"
+  elif command -v codex >/dev/null 2>&1 || [ -f "$DIR/codex-hooks.written" ]; then
+    printf 'codex hooks: not found; run the setup command\n'
+  fi
+}
 
 status_main() {
   printf 'Alice capture for a server tenant\n'
@@ -846,6 +863,7 @@ status_main() {
   else
     printf 'plugin: not set up; run the setup command\n'
   fi
+  codex_status
   printf 'log: ~/.config/alice/capture.log\n'
   return 0
 }
