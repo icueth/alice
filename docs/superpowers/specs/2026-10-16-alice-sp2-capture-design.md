@@ -615,7 +615,10 @@ self-update (step 8) compares with it, so the hooks are written down in one plac
    token among them), started with `nohup sh … >/dev/null 2>&1 </dev/null &`. Then `exit 0`, except on `SessionStart`,
    which first prints the briefing (step 5, at most 2 s). The agent never waits on capture.
 3. **In the background:**
-   - Take a per-file lock, a `mkdir` lock that is broken when older than 120 s.
+   - Take a per-file lock, a `mkdir` lock holding the holder's `pid` and `at` (refreshed every pass). A live holder is
+     broken only when its `at` is 900 s old, a dead one at 360 s. Without a usable `at` (a holder killed between `mkdir`
+     and writing it, or inside its unlock, or a full disk), the directory's own age stands in: more than 15 minutes for
+     a live pid, more than 6 otherwise.
    - Wait 2 s on stop-type events (the transcript may lag).
    - Read the stored offset from `~/.config/alice/state/<agent>-<session>[-<agent_id>].offset`.
    - Loop at most 16 times:
@@ -638,18 +641,30 @@ self-update (step 8) compares with it, so the hooks are written down in one plac
 7. **Log.** `~/.config/alice/capture.log`, kept under 256 KB, never holds the token or transcript text.
 8. **Self-update (Task 15b).** The script updates itself, so a fix reaches every machine without anyone re-running
    setup.
-   - **When.** At the end of a background worker's run, never in the hook itself, and at most once a day.
-     `~/.config/alice/update-checked` records when the last check started. Setup writes it too, so its install counts
-     as that day's check. A record in the future counts as due. The check runs under a `mkdir` lock,
-     `state/update.lock`, with the capture locks' stale rules, and reads the record again under it. While another worker
-     holds the lock, nothing is checked.
+   - **When.** At the start of a background worker's run, before its capture work, so a release whose capture path
+     fails can still fetch its fix. Never in the hook itself, and at most once a day.
+     - `~/.config/alice/update-checked` records when the last check started. Setup writes it too, so its install counts
+       as that day's check.
+     - A record in the future, or a garbled one (a leading 0, more than 11 digits), counts as due.
+     - The check runs under a `mkdir` lock, `state/update.lock`, with the stale rules of step 3 (an `at`, else the
+       directory's age, so a lock left by a killed run never wedges the check), and reads the record again under it.
+       While another worker holds the lock, nothing is checked.
+     - It writes the record before fetching and reads it back. When the record cannot be written, nothing is fetched,
+       or every event would fetch.
+     - Under the lock it also removes temporary files a killed run left, once they are more than 10 minutes old.
    - **The fetch.** `curl -q -fsS --connect-timeout 5 --max-time 30 --max-filesize 1048576` of
-     `<url>/api/v1/capture/hook.sh`, the person's own tenant, under the URL rule of setup (`https://`, loopback `http://`
-     for tests). The route is public, so no token is sent.
+     `<url>/api/v1/capture/hook.sh`, the person's own tenant. The route is public, so no token is sent.
+     - **`https://` only** (controller's ruling). With a loopback `http://` URL, capture works but the check is skipped,
+       with one log line a day. The test-only switch `ALICE_CAPTURE_TEST_UPDATE_HTTP=1` lets the tests use the
+       emulator.
+     - Any answer other than 200 is refused, and every refusal line names the HTTP status.
    - **Deciding.** It replaces the script only when the served version line differs from the installed one.
-   - **Checks before replacing.** The download must be non-empty, start with `#!/bin/sh`, carry the marker and version
-     lines, end with `main "$@"` (so a cut-short download is refused), and pass `sh -n`, and `dash -n` where `dash`
-     exists.
+   - **Checks before replacing.** The download must:
+     - be non-empty, start with `#!/bin/sh`, and carry the marker and version lines;
+     - end with `main "$@"`, so a cut-short download is refused;
+     - pass `sh -n`, and `dash -n` where `dash` exists;
+     - pass a smoke run: `sh <download> print-hooks-json claude-code`, with the shell the hook uses, must exit 0 within
+       20 s and print JSON. A script that dies as it starts would stop capture and its own updates for good.
    - **Replacing.** The download is a temporary file beside the script, `chmod 700`, then `mv`. A running worker keeps
      reading the old file. The log says `capture hook updated <old> → <new>`. Any failure (curl, a check, the `mv`) keeps
      the installed script byte for byte and logs one line. No log line holds the token or the script's text. A script
@@ -659,15 +674,21 @@ self-update (step 8) compares with it, so the hooks are written down in one plac
      1. the plugin's version moves to `<its version>+<script version>` in `plugin.json` and `marketplace.json`, before
         `hooks.json` is rewritten (atomically);
      2. `claude plugin marketplace update alice-local` and `claude plugin update alice-capture@alice-local` run in the
-        background with stdin from `/dev/null`;
+        background: from `$HOME`, with stdin from `/dev/null` and `DISABLE_AUTOUPDATER=1`, each killed after 120 s
+        (a watchdog subshell, since macOS has no `timeout`);
      3. when `claude` is missing or those commands fail, one log line says to re-run the setup command.
 
      Claude Code 2.1 reads a local-directory plugin from its own folder at each session start (checked under a throwaway
      `HOME`). A Claude Code that runs plugins from its cache copies only a new version, which is why the version moves.
      The Codex `hooks.json` follows only while it is still byte for byte the file setup wrote (`codex-hooks.written`). It
      is rewritten with its record, and the log reminds the person to trust the hooks again in `/hooks`.
+   - **Across versions.** After an update, a hook of the old version starts the new file's `run`. So the `run`
+     arguments, the state file's format, the lock layout, the `update-checked` record and the `print-hooks-json` output
+     stay compatible for at least one version. The script's header says so.
    - **Repair.** Re-running the setup command is still how to repair an install, for example one whose token was
      refused or whose plugin files were removed. Local installs need none of this: the `alice` binary is the hook.
+   - **Future work.** The script is not signed yet. The server now delivers code to every machine daily, so signing is
+     planned: a key held off the server, and `ssh-keygen -Y verify` on the download before it may replace the script.
 
 ### 5.4 The setup command (the one copy-paste step)
 

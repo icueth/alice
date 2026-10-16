@@ -3,8 +3,19 @@
 # alice-capture-version: unstamped
 #
 # The tenant stamps the version line when it serves this script (a hash of its text). Once a day
-# a background worker fetches the tenant's copy and, when its version differs and it passes the
-# checks in verify_script, replaces this file with it (spec section 5.3 step 8).
+# a background worker fetches the tenant's copy over https:// and, when its version differs and it
+# passes the checks in verify_script, replaces this file with it (spec section 5.3 step 8).
+#
+# The contract across versions. After an update, a hook of the old version (a session started
+# before it) starts the new file's `run`, and a worker of the new version meets what the old one
+# left. So these stay compatible for at least one version: the `run` arguments, the state file's
+# format, the lock layout (state/<key>.lock/ with pid and at, state/update.lock/), the
+# update-checked record, and what `print-hooks-json` prints (the plugin's hooks.json and the Codex
+# one are compared with it byte for byte).
+#
+# Test-only switches (environment): ALICE_CAPTURE_TEST_UPDATE_HTTP=1 lets self-update use a
+# loopback http:// tenant; ALICE_CAPTURE_TEST_CLAUDE_LIMIT=<seconds> shortens the 120 s limit of
+# the background `claude plugin` calls.
 #
 # Claude Code runs it through the alice-capture plugin on five events:
 #   sh "$HOME/.config/alice/alice-capture.sh" hook claude-code
@@ -102,6 +113,13 @@ fsize() {
   printf '%s' "$fs_n"
 }
 
+# Whether $1 is an epoch in seconds that is safe for arithmetic: 1 to 11 digits, no leading 0
+# (dash aborts on a number it reads as octal, and on one too large).
+epoch_ok() {
+  case $1 in '' | 0* | *[!0-9]*) return 1 ;; esac
+  [ ${#1} -le 11 ]
+}
+
 # One line in capture.log, which is kept under 256 KB. Never the token or transcript text.
 log() {
   [ -d "$DIR" ] || return 0
@@ -190,7 +208,7 @@ load_credentials() {
 paused() {
   [ -f "$PAUSED" ] || return 1
   pu_until=$(head -n 1 "$PAUSED" 2>/dev/null)
-  case $pu_until in '' | *[!0-9]*) return 1 ;; esac
+  epoch_ok "$pu_until" || return 1
   [ "$(date +%s)" -lt "$pu_until" ]
 }
 
@@ -383,7 +401,7 @@ read_state() {
   done <"$1"
   case $s_off in '' | *[!0-9]*) s_off=0 ;; esac
   case $s_hold in *[!0-9]*) s_hold= ;; esac
-  case $s_seen in *[!0-9]*) s_seen= ;; esac
+  epoch_ok "$s_seen" || s_seen=
   return 0
 }
 
@@ -402,12 +420,14 @@ write_state() {
   } >"$1.tmp.$$" 2>/dev/null && mv -f "$1.tmp.$$" "$1"
 }
 
-# Whether lock directory $1 may be broken (we tried $2 times). Its holder refreshes `at` at
-# the start of every pass, and one pass (one upload) may take 5 + 300 s.
+# Whether lock directory $1 may be broken (we tried $2 times). Its holder writes `pid`, then `at`,
+# and refreshes `at` at the start of every pass; one pass (one upload) may take 5 + 300 s.
 # - A live holder (kill -0 on its pid) is never broken until its `at` is 900 s old, a guard
 #   against a pid reused by another process.
 # - A dead or unknown holder is broken once its `at` is 360 s old.
-# - A dead or unknown holder that never wrote `at` is broken after 5 tries.
+# - Without a usable `at` (a holder killed between mkdir and writing it, or inside unlock, or a
+#   full disk), the directory's own age stands in for it: more than 15 minutes for a live pid,
+#   more than 6 otherwise. A dead or unknown holder is also broken after 5 tries.
 lock_stale() {
   ls_at=$(cat "$1/at" 2>/dev/null)
   ls_pid=$(cat "$1/pid" 2>/dev/null)
@@ -416,12 +436,14 @@ lock_stale() {
     '' | *[!0-9]*) ;;
     *) if kill -0 "$ls_pid" 2>/dev/null; then ls_alive=1; fi ;;
   esac
-  case $ls_at in
-    '' | *[!0-9]*)
-      [ -z "$ls_alive" ] && [ "$2" -gt 5 ]
-      return
-      ;;
-  esac
+  if ! epoch_ok "$ls_at"; then
+    if [ -n "$ls_alive" ]; then
+      [ -n "$(find "$1" -prune -mmin +15 2>/dev/null)" ]
+    else
+      [ "$2" -gt 5 ] || [ -n "$(find "$1" -prune -mmin +6 2>/dev/null)" ]
+    fi
+    return
+  fi
   ls_age=$(($(date +%s) - ls_at))
   if [ -n "$ls_alive" ]; then
     [ "$ls_age" -gt 900 ]
@@ -814,13 +836,14 @@ run_main() {
   paused && return 0
   load_credentials || return 0
   mkdir -p "$STATE" 2>/dev/null || return 0
+  # Before the capture work, so a release whose capture path fails can still fetch its fix.
+  self_update
   # The transcript may lag the event that names it.
   if [ "$r_event" != session-start ]; then sleep 2; fi
   if [ "$r_agent" = codex ] && [ -z "$r_path" ]; then
     r_path=$(find_rollout "$r_session")
     if [ -z "$r_path" ]; then
       log "session $r_session: no rollout file for this session in the newest seven day folders under \$CODEX_HOME/sessions; the next event looks again"
-      self_update
       return 0
     fi
   fi
@@ -832,7 +855,6 @@ run_main() {
   if [ "$r_event" = session-start ]; then
     sweep "$r_agent-$r_session"
   fi
-  self_update
   return 0
 }
 
@@ -872,18 +894,22 @@ script_version() {
     sed -n 's/^# alice-capture-version: \([A-Za-z0-9._+-]\{1,64\}\)$/\1/p' | head -n 1
 }
 
-# Whether the daily update check is due: no usable record of the last one, a record a day old,
-# or one in the future (the clock was set back since).
+# Whether the daily update check is due: no usable record of the last one (missing, or garbled:
+# a leading 0, more than 11 digits), a record a day old, or one in the future (the clock was set
+# back since).
 update_due() {
   ud_at=$(head -n 1 "$CHECKED" 2>/dev/null)
-  case $ud_at in '' | *[!0-9]*) return 0 ;; esac
+  epoch_ok "$ud_at" || return 0
   ud_now=$(date +%s)
   [ "$ud_at" -gt "$ud_now" ] || [ $((ud_now - ud_at)) -ge "$UPDATE_EVERY" ]
 }
 
 # Whether downloaded file $1 may replace the installed script. 1, with the reason in vs_why, when
 # it is empty, does not start with #!/bin/sh, lacks the marker or the version line, is cut short
-# (its last line is not `main "$@"`), or fails sh -n (or dash -n where dash exists).
+# (its last line is not `main "$@"`), fails sh -n (or dash -n where dash exists), or fails its
+# smoke run: `sh $1 print-hooks-json claude-code`, with the shell the hook uses, must exit 0
+# within 20 s and print JSON (a script that dies as it starts would stop capture and its own
+# updates for good).
 verify_script() {
   vs_why=
   if [ ! -s "$1" ]; then
@@ -900,8 +926,47 @@ verify_script() {
     vs_why="the download fails sh -n"
   elif command -v dash >/dev/null 2>&1 && ! dash -n "$1" >/dev/null 2>&1; then
     vs_why="the download fails dash -n"
+  elif ! bounded 20 sh "$1" print-hooks-json claude-code >"$tmpd/smoke" 2>/dev/null ||
+    [ "$(head -c 1 "$tmpd/smoke")" != '{' ]; then
+    vs_why="the download fails its smoke run (print-hooks-json claude-code)"
   fi
   [ -z "$vs_why" ]
+}
+
+# Runs command "$2" ... in the background with stdin from /dev/null, and kills it after $1
+# seconds (macOS has no timeout command); returns its status, which is not 0 once killed. Its
+# stdout and stderr are bounded's own.
+bounded() {
+  bd_limit=$1
+  shift
+  "$@" </dev/null &
+  bd_pid=$!
+  (
+    trap - EXIT
+    bd_sleep=
+    trap 'kill "$bd_sleep" 2>/dev/null; exit 0' TERM
+    sleep "$bd_limit" &
+    bd_sleep=$!
+    wait "$bd_sleep"
+    kill "$bd_pid" 2>/dev/null
+  ) </dev/null >/dev/null 2>&1 &
+  bd_dog=$!
+  wait "$bd_pid"
+  bd_rc=$?
+  kill "$bd_dog" 2>/dev/null
+  wait "$bd_dog" 2>/dev/null
+  return "$bd_rc"
+}
+
+# Temporary files of an update (or a setup) that was killed: removed under the update lock once
+# they are more than 10 minutes old, so a run going on now keeps its own.
+clean_stale_temps() {
+  for ct_f in "$DIR"/.alice-capture.sh.new.* "$CHECKED".* "$MP"/alice-capture/hooks/hooks.json.tmp.* \
+    "$MP"/alice-capture/.claude-plugin/plugin.json.tmp.* "$MP"/.claude-plugin/marketplace.json.tmp.* \
+    "${CODEX_HOME:-$HOME/.codex}"/hooks.json.tmp.[0-9]* "$DIR"/codex-hooks.written.new; do
+    [ -f "$ct_f" ] || continue
+    if [ -n "$(find "$ct_f" -prune -mmin +10 2>/dev/null)" ]; then rm -f "$ct_f"; fi
+  done
 }
 
 # Rewrites file $1 with the bytes of file $2 (a temporary file beside it, then mv); 1, leaving $1
@@ -956,13 +1021,18 @@ sync_plugin() {
     log "the plugin's hooks.json changed, and there is no claude command to reload it with; run the setup command again (a new Claude Code session may load it anyway)"
     return 0
   fi
+  # From $HOME (a project's directory could change what `claude plugin` reads), without Claude
+  # Code's own self-update, and each call killed after 120 s.
   (
     trap - EXIT HUP INT TERM
-    if claude plugin marketplace update alice-local </dev/null >/dev/null 2>&1 &&
-      claude plugin update alice-capture@alice-local </dev/null >/dev/null 2>&1; then
+    cd "$HOME" 2>/dev/null || exit 0
+    sp_limit=${ALICE_CAPTURE_TEST_CLAUDE_LIMIT:-120}
+    case $sp_limit in '' | 0* | *[!0-9]* | ?????*) sp_limit=120 ;; esac
+    if bounded "$sp_limit" env DISABLE_AUTOUPDATER=1 claude plugin marketplace update alice-local >/dev/null 2>&1 &&
+      bounded "$sp_limit" env DISABLE_AUTOUPDATER=1 claude plugin update alice-capture@alice-local >/dev/null 2>&1; then
       log "claude plugin took the new hooks.json; new Claude Code sessions load it"
     else
-      log "the plugin's hooks.json changed, and claude plugin update failed; run the setup command again so Claude Code loads the new hooks"
+      log "the plugin's hooks.json changed, and claude plugin update failed or did not finish within $sp_limit s; run the setup command again so Claude Code loads the new hooks"
     fi
   ) </dev/null >/dev/null 2>&1 &
 }
@@ -1007,12 +1077,13 @@ sync_hooks() {
   fi
 }
 
-# The daily update check, from a background worker (never the hook itself), under the update
-# lock. It fetches the tenant's hook script (a public route: no token is sent) and, when its
-# version differs from the installed one and it passes verify_script, replaces the installed
-# script: a temporary file beside it, 0700, then mv (a running worker keeps reading the old
-# file). Then the hooks files follow the installed script. Any failure keeps the installed script
-# byte for byte and logs one line, which never holds the token or the script's text.
+# The daily update check, at the start of a background worker (never the hook itself, and before
+# the capture work), under the update lock. It fetches the tenant's hook script over https:// (a
+# public route: no token is sent) and, when its version differs from the installed one and it
+# passes verify_script, replaces the installed script: a temporary file beside it, 0700, then mv
+# (a running worker keeps reading the old file). Then the hooks files follow the installed
+# script. Any failure keeps the installed script byte for byte and logs one line, which never
+# holds the token or the script's text.
 self_update() {
   [ -f "$SCRIPT" ] || return 0
   update_due || return 0
@@ -1022,7 +1093,30 @@ self_update() {
     unlock
     return 0
   fi
-  { date +%s >"$CHECKED.$$" && mv -f "$CHECKED.$$" "$CHECKED"; } 2>/dev/null
+  # The record first: no fetch without it, or every event would fetch.
+  su_now=$(date +%s)
+  { printf '%s\n' "$su_now" >"$CHECKED.$$" && mv -f "$CHECKED.$$" "$CHECKED"; } 2>/dev/null
+  rm -f "$CHECKED.$$" 2>/dev/null
+  if [ "$(head -n 1 "$CHECKED" 2>/dev/null)" != "$su_now" ]; then
+    log "capture hook update check skipped: ~/.config/alice/update-checked cannot be written, and without it every event would check"
+    unlock
+    return 0
+  fi
+  clean_stale_temps
+  case $url in
+    https://*) ;;
+    *)
+      if [ "${ALICE_CAPTURE_TEST_UPDATE_HTTP:-}" != 1 ]; then
+        log "capture hook update skipped: it runs over https:// only, and ~/.config/alice/url is not https:// (asked again in a day)"
+        unlock
+        return 0
+      fi
+      ;;
+  esac
+  if ! make_tmp; then
+    unlock
+    return 0
+  fi
   su_old=$(script_version "$SCRIPT")
   upd_tmp="$DIR/.alice-capture.sh.new.$$"
   rm -f "$upd_tmp"
@@ -1031,8 +1125,10 @@ self_update() {
   su_rc=$?
   if [ "$su_rc" -ne 0 ]; then
     log "capture hook update check failed (curl exit $su_rc, HTTP ${su_code:-000}); the installed script stays"
+  elif [ "$su_code" != 200 ]; then
+    log "capture hook update refused (HTTP $su_code, not 200); the installed script stays"
   elif ! verify_script "$upd_tmp"; then
-    log "capture hook update refused: $vs_why; the installed script stays"
+    log "capture hook update refused (HTTP $su_code): $vs_why; the installed script stays"
   else
     su_new=$(script_version "$upd_tmp")
     if [ "$su_new" = "$su_old" ]; then
@@ -1113,14 +1209,13 @@ status_main() {
     st_v=$(script_version "$SCRIPT")
     printf 'hook script: ~/.config/alice/alice-capture.sh (version %s; it updates itself from the server once a day' "${st_v:-unknown}"
     st_at=$(head -n 1 "$CHECKED" 2>/dev/null)
-    case $st_at in
-      '' | *[!0-9]*) printf ')\n' ;;
-      *)
-        st_h=$((($(date +%s) - st_at) / 3600))
-        if [ "$st_h" -lt 0 ]; then st_h=0; fi
-        printf '; last check %s h ago)\n' "$st_h"
-        ;;
-    esac
+    if epoch_ok "$st_at"; then
+      st_h=$((($(date +%s) - st_at) / 3600))
+      if [ "$st_h" -lt 0 ]; then st_h=0; fi
+      printf '; last check %s h ago)\n' "$st_h"
+    else
+      printf ')\n'
+    fi
   else
     printf 'hook script: missing (~/.config/alice/alice-capture.sh); run the setup command\n'
   fi

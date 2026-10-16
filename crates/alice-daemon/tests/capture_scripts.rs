@@ -81,6 +81,9 @@ struct Env {
     bin: PathBuf,
     tmp: PathBuf,
     codex_home: PathBuf,
+    /// Extra variables of every command. By default `ALICE_CAPTURE_TEST_UPDATE_HTTP=1`: the
+    /// emulator is a loopback `http://` server, which self-update skips without that switch.
+    vars: std::cell::RefCell<Vec<(String, String)>>,
 }
 
 fn write_mode(path: &Path, content: &[u8], mode: u32) {
@@ -116,6 +119,10 @@ impl Env {
             codex_home: root.join("codex-home"),
             root,
             _dir: dir,
+            vars: std::cell::RefCell::new(vec![(
+                "ALICE_CAPTURE_TEST_UPDATE_HTTP".into(),
+                "1".into(),
+            )]),
         };
         for d in [
             &env.home,
@@ -202,7 +209,19 @@ impl Env {
             // `git` never looks above the temp dir, wherever the test runs.
             .env("GIT_CEILING_DIRECTORIES", ceiling)
             .current_dir(&self.home);
+        for (k, v) in self.vars.borrow().iter() {
+            c.env(k, v);
+        }
         c
+    }
+
+    /// Sets `key` (or, with `None`, leaves it out) for every later command.
+    fn set_var(&self, key: &str, value: Option<&str>) {
+        let mut vars = self.vars.borrow_mut();
+        vars.retain(|(k, _)| k != key);
+        if let Some(v) = value {
+            vars.push((key.into(), v.into()));
+        }
     }
 
     /// Runs `c` with `stdin`, in a session of its own, within `limit`. Its stdout must close
@@ -2823,6 +2842,26 @@ async fn self_update_keeps_the_old_script_on_a_bad_download() {
         ),
         ("cut short", script_answer(cut), "cut short"),
         (
+            "dies at startup",
+            script_answer(newer.replacen(
+                "\nset -u\n",
+                "\nset -u\n: \"$alice_no_such_variable\"\n",
+                1,
+            )),
+            "smoke run",
+        ),
+        (
+            // A whole script under another status (a proxy's answer, say) is refused for the
+            // status alone.
+            "a redirect",
+            ScriptAnswer {
+                status: 301,
+                body: newer.clone().into_bytes(),
+                hold_ms: 0,
+            },
+            "HTTP 301, not 200",
+        ),
+        (
             "sh -n fails",
             script_answer(before_main("if then")),
             "fails sh -n",
@@ -2885,6 +2924,7 @@ async fn self_update_keeps_the_old_script_on_a_bad_download() {
             .collect();
         assert_eq!(fresh.len(), 1, "{name}: one line: {log}");
         assert!(fresh[0].contains(expected), "{name}: {}", fresh[0]);
+        assert!(fresh[0].contains("HTTP "), "{name}: {}", fresh[0]);
         assert!(!fresh[0].contains("updated"), "{name}: {}", fresh[0]);
         // Never the downloaded text.
         for text in [
@@ -2893,6 +2933,7 @@ async fn self_update_keeps_the_old_script_on_a_bad_download() {
             "if then",
             "function f",
             "boom",
+            "alice_no_such_variable",
         ] {
             assert!(!log.contains(text), "{name}: {text:?} in the log: {log}");
         }
@@ -3164,7 +3205,9 @@ async fn self_update_never_runs_in_the_fast_path() {
         "the hook took {:?}",
         r.elapsed
     );
-    assert_eq!(hook_fetches(&s), fetched, "nothing fetched by the hook");
+    // The worker starts the check at once (before its capture work), so a fetch may already be
+    // on its way; the hook did not wait for it, which the time above shows (the fetch takes
+    // 1.5 s).
     assert!(
         !env.workers().is_empty(),
         "the worker goes on in the background"
@@ -3173,6 +3216,356 @@ async fn self_update_never_runs_in_the_fast_path() {
     assert_eq!(hook_fetches(&s), fetched + 1, "{}", env.log());
     let checked: u64 = read(&env.checked_file()).trim().parse().unwrap();
     assert!(now_secs().abs_diff(checked) < 60, "{checked}");
+}
+
+// ---- Self-update, fix round 1 ----
+
+/// Sets `path`'s modification time to 2026-01-01, months ago.
+fn make_old(path: &Path) {
+    let st = Command::new("/usr/bin/touch")
+        .args(["-t", "202601010000"])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(st.success(), "{}", path.display());
+}
+
+/// A pid no process has: a child of the test, already reaped.
+fn dead_pid() -> u32 {
+    let mut c = Command::new("/usr/bin/true").spawn().unwrap();
+    let pid = c.id();
+    c.wait().unwrap();
+    pid
+}
+
+/// Turn `i` of `sess`, then its Stop, and waits for the worker.
+fn stop_once(env: &Env, sess: &mut Session, i: usize) {
+    sess.turn(i, &format!("turn {i}"));
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+}
+
+/// Important 1: a run killed at the wrong moment (between `mkdir` and writing `at`, inside
+/// `unlock`, on a full disk) leaves a lock directory without its `at`. Such a lock is judged by
+/// the directory's own age, so it never wedges the update check, or a sweep, for good. The
+/// temporary files a killed run left are removed once they are old.
+#[tokio::test(flavor = "multi_thread")]
+async fn self_update_recovers_from_a_killed_run() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let work = env.root.join("work");
+    let lock = env.alice().join("state/update.lock");
+    let mut sess = Session::new(&env, "killed-run", &work);
+    let fetched = hook_fetches(&s);
+
+    // 1. An empty lock directory, old: broken by its age.
+    env.make_update_due();
+    std::fs::create_dir(&lock).unwrap();
+    make_old(&lock);
+    stop_once(&env, &mut sess, 1);
+    assert_eq!(hook_fetches(&s), fetched + 1, "{}", env.log());
+    assert!(!lock.exists());
+
+    // 2. A dead holder's pid and no `at`, old.
+    env.make_update_due();
+    std::fs::create_dir(&lock).unwrap();
+    std::fs::write(lock.join("pid"), format!("{}\n", dead_pid())).unwrap();
+    make_old(&lock);
+    stop_once(&env, &mut sess, 2);
+    assert_eq!(hook_fetches(&s), fetched + 2, "{}", env.log());
+
+    // 3. A live pid and no `at`, older than a live holder's cap: a reused pid, broken too.
+    env.make_update_due();
+    std::fs::create_dir(&lock).unwrap();
+    std::fs::write(lock.join("pid"), format!("{}\n", std::process::id())).unwrap();
+    make_old(&lock);
+    stop_once(&env, &mut sess, 3);
+    assert_eq!(hook_fetches(&s), fetched + 3, "{}", env.log());
+
+    // 4. A fresh lock without `at` (its holder may be writing it right now) is respected.
+    env.make_update_due();
+    std::fs::create_dir(&lock).unwrap();
+    stop_once(&env, &mut sess, 4);
+    assert_eq!(hook_fetches(&s), fetched + 3, "{}", env.log());
+    assert!(lock.exists());
+    std::fs::remove_dir(&lock).unwrap();
+
+    // 5. Old temporary files of a killed run are removed; a fresh one (a run going on now) stays.
+    let hooks_dir = env.marketplace().join("alice-capture/hooks");
+    let old_temps = [
+        env.alice().join(".alice-capture.sh.new.4242"),
+        env.alice().join("update-checked.4242"),
+        hooks_dir.join("hooks.json.tmp.4242"),
+    ];
+    for p in &old_temps {
+        std::fs::write(p, "left by a killed run").unwrap();
+        make_old(p);
+    }
+    let fresh = env.alice().join(".alice-capture.sh.new.4343");
+    std::fs::write(&fresh, "being written").unwrap();
+    env.make_update_due();
+    stop_once(&env, &mut sess, 5);
+    assert_eq!(hook_fetches(&s), fetched + 4, "{}", env.log());
+    for p in &old_temps {
+        assert!(!p.exists(), "{}", p.display());
+    }
+    assert!(fresh.exists());
+    std::fs::remove_file(&fresh).unwrap();
+    assert_eq!(turns_of(&t.home, &uri("killed-run")), 5);
+
+    // 6. A capture lock left the same way does not stop a sweep, which never waits.
+    let mut left = Session::new(&env, "killed-capture", &work);
+    left.turn(1, "left behind by a killed worker");
+    let st = env.state_file(&left.key());
+    std::fs::write(
+        &st,
+        format!(
+            "0 {}\nsession killed-capture\ncwd {}\nseen {}\n",
+            left.path.display(),
+            work.display(),
+            now_secs()
+        ),
+    )
+    .unwrap();
+    let stale = Command::new("/usr/bin/touch")
+        .args(["-t", "197101010000"])
+        .arg(&st)
+        .status()
+        .unwrap();
+    assert!(stale.success());
+    let capture_lock = env.alice().join(format!("state/{}.lock", left.key()));
+    std::fs::create_dir(&capture_lock).unwrap();
+    make_old(&capture_lock);
+    let starter = Session::new(&env, "killed-sweeper", &work);
+    env.hook(&starter.input("SessionStart"));
+    env.wait_idle();
+    assert_eq!(
+        turns_of(&t.home, &uri("killed-capture")),
+        1,
+        "{}",
+        env.log()
+    );
+    assert!(!capture_lock.exists());
+}
+
+/// Important 2: the update check runs before the capture work, so a release whose capture path
+/// aborts the shell still fetches its own fix the next day.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_whose_capture_aborts_still_fetches_its_fix() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let base = read(&env.script());
+    // A release whose worker aborts (`set -u`) as soon as it captures. It passes every check: it
+    // parses, and it prints its hooks.
+    let anchor = "capture_one() {\n  co_key=$1\n";
+    assert!(base.contains(anchor));
+    let broken = with_version(
+        &base.replacen(
+            anchor,
+            "capture_one() {\n  : \"$alice_no_such_variable\"\n  co_key=$1\n",
+            1,
+        ),
+        "b10ce0000001",
+    );
+    let mut sess = Session::new(&env, "aborting-release", &env.root.join("work"));
+    update_to(&s, &env, &mut sess, 1, &broken);
+    assert_eq!(read(&env.script()), broken, "{}", env.log());
+    let captured = env.offset(&sess.key());
+    stop_once(&env, &mut sess, 2);
+    assert_eq!(
+        env.offset(&sess.key()),
+        captured,
+        "the broken release captures nothing"
+    );
+
+    // The next day: the broken release's own worker installs the fix.
+    let fixed = with_version(&base, "f1xf1xf1xf1x");
+    update_to(&s, &env, &mut sess, 3, &fixed);
+    assert_eq!(read(&env.script()), fixed, "{}", env.log());
+    stop_once(&env, &mut sess, 4);
+    assert_eq!(
+        env.offset(&sess.key()),
+        Some(sess.tr.len()),
+        "{}",
+        env.log()
+    );
+    assert_eq!(turns_of(&t.home, &uri("aborting-release")), 4);
+}
+
+/// Minor 3: a garbled record (a leading 0, or more digits than an epoch has) counts as due, under
+/// sh and under dash, where arithmetic on it would abort the shell; `status` reads it too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_garbled_check_record_counts_as_due() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    let mut sess = Session::new(&env, "garbled-record", &env.root.join("work"));
+    for (i, record) in [
+        "0800000000",
+        "08",
+        "99999999999999999999999",
+        "00000000000000000000001",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(env.checked_file(), format!("{record}\n")).unwrap();
+        let r = env.capture_sh(&["status"], &[]);
+        assert!(r.ok(), "{record}: {r}");
+        assert!(
+            r.stdout.contains("log: ~/.config/alice/capture.log"),
+            "{record}: status ran to its end: {r}"
+        );
+        let fetched = hook_fetches(&s);
+        stop_once(&env, &mut sess, i + 1);
+        assert_eq!(hook_fetches(&s), fetched + 1, "{record}: {}", env.log());
+        let checked: u64 = read(&env.checked_file()).trim().parse().unwrap();
+        assert!(now_secs().abs_diff(checked) < 60, "{record}: {checked}");
+    }
+}
+
+/// Minor 6: when the record cannot be written, nothing is fetched (a fetch on every event would
+/// break "at most once a day").
+#[tokio::test(flavor = "multi_thread")]
+async fn self_update_fetches_nothing_when_its_record_cannot_be_written() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    std::fs::remove_file(env.checked_file()).unwrap();
+    std::fs::create_dir(env.checked_file()).unwrap();
+    let fetched = hook_fetches(&s);
+    let mut sess = Session::new(&env, "no-record", &env.root.join("work"));
+    stop_once(&env, &mut sess, 1);
+    stop_once(&env, &mut sess, 2);
+    assert_eq!(hook_fetches(&s), fetched, "{}", env.log());
+    assert!(
+        env.log().contains("update-checked cannot be written"),
+        "{}",
+        env.log()
+    );
+}
+
+/// Ruling: self-update runs over `https://` only. With a loopback `http://` tenant and without the
+/// test switch, nothing is fetched, and one line a day says why; capture goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn self_update_skips_a_plain_http_server() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    env.set_var("ALICE_CAPTURE_TEST_UPDATE_HTTP", None);
+    env.make_update_due();
+    let fetched = hook_fetches(&s);
+    let mut sess = Session::new(&env, "plain-http", &env.root.join("work"));
+    stop_once(&env, &mut sess, 1);
+    stop_once(&env, &mut sess, 2);
+    assert_eq!(hook_fetches(&s), fetched, "{}", env.log());
+    assert_eq!(
+        env.log().matches("https:// only").count(),
+        1,
+        "{}",
+        env.log()
+    );
+    assert_eq!(turns_of(&t.home, &uri("plain-http")), 2);
+    // With the switch, the next due check fetches.
+    env.set_var("ALICE_CAPTURE_TEST_UPDATE_HTTP", Some("1"));
+    env.make_update_due();
+    stop_once(&env, &mut sess, 3);
+    assert_eq!(hook_fetches(&s), fetched + 1, "{}", env.log());
+}
+
+/// Minor 7: the background `claude plugin` calls run from `$HOME` with `DISABLE_AUTOUPDATER=1`,
+/// and are killed after a time limit (120 s; `ALICE_CAPTURE_TEST_CLAUDE_LIMIT` shortens it for
+/// tests), so a hanging `claude` never stays behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_claude_plugin_calls_run_from_home_bounded_and_without_autoupdate() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    let record = env.home.join("claude-env");
+    write_mode(
+        &env.bin.join("claude"),
+        b"#!/bin/sh\nprintf '%s|%s|%s\\n' \"${DISABLE_AUTOUPDATER:-unset}\" \"$(pwd)\" \"$*\" >> \"$HOME/claude-env\"\nexit 0\n",
+        0o755,
+    );
+    let work = env.root.join("work");
+    let mut sess = Session::new(&env, "claude-calls", &work);
+    // Claude Code runs a hook in the project's directory, not in $HOME.
+    let stop_in_work = |env: &Env, sess: &mut Session, i: usize| {
+        sess.turn(i, &format!("turn {i}"));
+        let mut c = env.command(&env.sh());
+        c.arg("-c").arg(HOOK_COMMAND).current_dir(&work);
+        let r = env.run(
+            c,
+            &serde_json::to_vec(&sess.input("Stop")).unwrap(),
+            Duration::from_secs(30),
+        );
+        assert!(r.ok(), "{r}");
+        env.wait_idle();
+    };
+    let base = read(&env.script());
+    let desc = "Alice capture: each event hands";
+    let v1 = with_version(
+        &base.replacen(desc, "Alice capture (v1): each event hands", 1),
+        "aaaaaaaaaaaa",
+    );
+    s.serve_hook_script(Some(script_answer(v1.clone())));
+    env.make_update_due();
+    stop_in_work(&env, &mut sess, 1);
+    assert_eq!(read(&env.script()), v1, "{}", env.log());
+    let home = env.home.display().to_string();
+    assert_eq!(
+        read(&record).lines().collect::<Vec<_>>(),
+        [
+            format!("1|{home}|plugin marketplace update alice-local"),
+            format!("1|{home}|plugin update alice-capture@alice-local"),
+        ],
+        "{}",
+        env.log()
+    );
+
+    // A `claude` that hangs is killed at the limit, and the log says to run setup again.
+    let pid_file = env.home.join("claude-pid");
+    write_mode(
+        &env.bin.join("claude"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec sleep 300\n",
+            pid_file.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
+    env.set_var("ALICE_CAPTURE_TEST_CLAUDE_LIMIT", Some("2"));
+    let v2 = with_version(&v1.replacen("(v1)", "(v2)", 1), "bbbbbbbbbbbb");
+    s.serve_hook_script(Some(script_answer(v2.clone())));
+    env.make_update_due();
+    let logged = env.log().lines().count();
+    let started = Instant::now();
+    stop_in_work(&env, &mut sess, 2);
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(read(&env.script()), v2, "{}", env.log());
+    let pid: i32 = read(&pid_file).trim().parse().unwrap();
+    // SAFETY: signal 0 only asks whether the process exists.
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the hanging claude was killed"
+    );
+    let log = env.log();
+    let fresh: Vec<&str> = log
+        .lines()
+        .skip(logged)
+        .filter(|l| l.contains("run the setup command again"))
+        .collect();
+    assert_eq!(fresh.len(), 1, "{log}");
 }
 
 // ---- Status and uninstall ----
