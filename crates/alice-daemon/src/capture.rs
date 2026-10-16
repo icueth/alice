@@ -460,8 +460,9 @@ impl CaptureCtl {
         // Spec §9.2: while the source holds no captured turn (its first capture may take several
         // uploads), an imported transcript of the session tells where capture continues.
         let imported_until = if state.as_ref().is_none_or(|s| s.next_ord == 0) {
+            let imported_as = imported_session(&input);
             self.readers
-                .with(|c| store::imported_session_end(c, &input.session))?
+                .with(|c| store::imported_session_end(c, &imported_as))?
                 .flatten()
                 .and_then(|end| parse_time(&end))
         } else {
@@ -662,6 +663,24 @@ impl CaptureCtl {
             ))),
         }
     }
+}
+
+/// The session id an imported copy of the pass's transcript carries (spec §9.2): M3 files a
+/// transcript under its file's stem. A main session's is its id. A Claude Code subagent's file
+/// is `<session>/subagents/agent-<id>.jsonl`, imported under its own stem, so a subagent asks
+/// for that (its local file's stem when there is one), never its main session's: the main
+/// transcript's import holds none of the subagent's turns (Task 18b).
+fn imported_session(input: &PassInput) -> String {
+    let Some(agent) = &input.subagent else {
+        return input.session.clone();
+    };
+    input
+        .init
+        .transcript_path
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("agent-{agent}"))
 }
 
 /// An RFC 3339 time (`Z` or an offset), compared as an instant; `None` when it does not parse.
