@@ -664,6 +664,7 @@ pub struct BackupSettings {
     pub weekly: u32,
     /// Backup directory (default `<data dir>/backups`). Backups go to a directory of this
     /// home's own inside it (`<dir>/home-<id>/`), so homes that share it never mix them up.
+    /// `~/…` is under your home directory; a relative path is taken inside the data directory.
     pub dir: Option<String>,
 }
 

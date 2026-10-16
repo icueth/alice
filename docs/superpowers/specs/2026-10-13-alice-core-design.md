@@ -109,7 +109,8 @@ backups/            SQLite snapshots (0600, in a 0700 directory), named
                     <stamp> = UTC yyyymmddThhmmssZ; with `backup.dir` they go to
                     <backup.dir>/home-<12 hex of SHA-256 of the canonical home path>/ instead, so
                     homes that share a backup directory never rotate or restore each other's
-                    (M2 final review B-I3)
+                    (M2 final review B-I3); `~/…` is under the user's home directory and a
+                    relative backup.dir is inside ALICE_HOME (B-M2)
 logs/               daemon logs (never contain secrets; *as built (M2):* not rotated yet, final review D-m9)
 config.toml         user configuration
 secrets.toml        API keys (0600); secrets.toml.lock beside it serialises writers
