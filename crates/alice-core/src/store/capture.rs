@@ -217,15 +217,30 @@ pub fn captured_session_ids(conn: &Connection) -> Result<HashSet<String>> {
 /// (an importer may write an offset where capture writes `Z`; one that does not parse counts
 /// only when none does), and `None` when none of them has one. `None` when there is no such
 /// source (spec §9.2).
-pub fn imported_session_end(conn: &Connection, session_id: &str) -> Result<Option<Option<String>>> {
+///
+/// With `codex_rollouts` (a Codex session), a source named like one of the session's rollout
+/// files, `rollout-<YYYY-MM-DDTHH-MM-SS>-<session_id>`, counts too: the importer files a
+/// transcript under its file's stem, so a rollout MemPalace mined carries that name, never the
+/// bare session id (Task 18b review, I2).
+pub fn imported_session_end(
+    conn: &Connection,
+    session_id: &str,
+    codex_rollouts: bool,
+) -> Result<Option<Option<String>>> {
+    // `rollout-` (8 characters), the time (19), `-` (the 28th), then the whole id: an id that
+    // only ends another one never matches. The range keeps the scan on the index.
     let mut stmt = conn.prepare_cached(
         "SELECT s.ended_at FROM sources s
-         WHERE s.session_id = ?1 AND s.type = 'session'
+         WHERE (s.session_id = ?1
+                OR (?2 AND s.session_id >= 'rollout-' AND s.session_id < 'rollout.'
+                    AND length(s.session_id) = length(?1) + 28
+                    AND substr(s.session_id, 28, 1) = '-' AND substr(s.session_id, 29) = ?1))
+           AND s.type = 'session'
            AND s.uri NOT LIKE 'claude-code:session:%' AND s.uri NOT LIKE 'codex:session:%'
            AND NOT EXISTS (SELECT 1 FROM capture_state c WHERE c.source_id = s.id)",
     )?;
     let ends: Vec<Option<String>> = stmt
-        .query_map([session_id], |r| r.get(0))?
+        .query_map(params![session_id, codex_rollouts], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     if ends.is_empty() {
         return Ok(None);
@@ -788,23 +803,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            imported_session_end(&c, "s1").unwrap(),
+            imported_session_end(&c, "s1", false).unwrap(),
             None,
             "captured, not imported"
         );
         assert_eq!(
-            imported_session_end(&c, "s2").unwrap(),
+            imported_session_end(&c, "s2", false).unwrap(),
             Some(Some("2026-10-15T09:00:00.000Z".into())),
             "the newest end of its imported sources"
         );
-        assert_eq!(imported_session_end(&c, "s3").unwrap(), Some(None));
-        assert_eq!(imported_session_end(&c, "s9").unwrap(), None);
+        assert_eq!(imported_session_end(&c, "s3", false).unwrap(), Some(None));
+        assert_eq!(imported_session_end(&c, "s9", false).unwrap(), None);
         assert_eq!(
-            imported_session_end(&c, "s4").unwrap(),
+            imported_session_end(&c, "s4", false).unwrap(),
             Some(Some("2026-10-15T08:00:00.000Z".into())),
             "the latest as a time; one that does not parse loses to one that does"
         );
-        assert_eq!(imported_session_end(&c, "s5").unwrap(), None);
+        assert_eq!(imported_session_end(&c, "s5", false).unwrap(), None);
         // Capture sources of every agent, and nothing else.
         source(&c, "CX", "codex:session:cx1", Some("cx1"), None);
         ensure_state(
@@ -820,6 +835,68 @@ mod tests {
         assert_eq!(
             captured_session_ids(&c).unwrap(),
             HashSet::from(["s1".to_string(), "cx1".to_string()])
+        );
+    }
+
+    /// Task 18b review, I2: MemPalace files a mined Codex rollout under its file's stem,
+    /// `rollout-<time>-<session id>`, so a Codex session asks for that name as well as its id. A
+    /// Claude Code session does not, and a name whose id only ends the session's never matches.
+    #[test]
+    fn a_codex_session_finds_its_rollouts_imported_under_their_names() {
+        let (_d, c) = conn();
+        let id = "0199e4c1-5b2a-7d10-8e3f-4a5b6c7d8e9f";
+        let imported = |src: &str, session: String, end: &str| {
+            source(
+                &c,
+                src,
+                &format!("file:///h/.codex/sessions/2026/10/03/{session}.jsonl"),
+                Some(session.as_str()),
+                Some(end),
+            );
+        };
+        imported(
+            "R1",
+            format!("rollout-2026-10-03T01-57-34-{id}"),
+            "2026-10-03T02:00:00.000Z",
+        );
+        // A later rollout file of the same session (a resumed one).
+        imported(
+            "R2",
+            format!("rollout-2026-10-04T09-00-00-{id}"),
+            "2026-10-04T09:30:00.000Z",
+        );
+        // Not this session's: another id that ends with this one, a name without the time, and
+        // another session's rollout.
+        imported(
+            "X1",
+            format!("rollout-2026-10-05T01-00-00-x-{id}"),
+            "2026-10-05T01:00:00.000Z",
+        );
+        imported("X2", format!("rollout-{id}"), "2026-10-06T01:00:00.000Z");
+        imported(
+            "X3",
+            "rollout-2026-10-07T01-00-00-0199e4c1-0000-7000-8000-000000000000".into(),
+            "2026-10-07T01:00:00.000Z",
+        );
+        assert_eq!(
+            imported_session_end(&c, id, true).unwrap(),
+            Some(Some("2026-10-04T09:30:00.000Z".into())),
+            "the newest end of the session's rollouts"
+        );
+        assert_eq!(
+            imported_session_end(&c, id, false).unwrap(),
+            None,
+            "only a Codex session asks for rollout names"
+        );
+        // The bare id still counts for a Codex session.
+        imported("B1", id.to_string(), "2026-10-08T00:00:00.000Z");
+        assert_eq!(
+            imported_session_end(&c, id, true).unwrap(),
+            Some(Some("2026-10-08T00:00:00.000Z".into()))
+        );
+        assert_eq!(
+            imported_session_end(&c, id, false).unwrap(),
+            Some(Some("2026-10-08T00:00:00.000Z".into()))
         );
     }
 

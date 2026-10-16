@@ -10,8 +10,9 @@
 //! 2. reads complete turns with [`alice_core::capture::read`];
 //! 3. drops the turns whose key is stored already, in any source (spec §3.5), and applies the
 //!    MemPalace rule (spec §9.2): while the source holds no captured turn, a turn that started
-//!    at or before the end of an imported transcript of the session is held by the import, so
-//!    its key is recorded as skipped and the cursor moves past it;
+//!    at or before the end of an imported transcript of the session (for Codex, also one
+//!    imported under a rollout file's name) is held by the import, so its key is recorded as
+//!    skipped and the cursor moves past it;
 //! 4. asks the capture verdict for every identity of the source's project (slug, aliases,
 //!    display name): `Wait` stores nothing and keeps the cursor, `Excluded` records the keys and
 //!    moves the cursor, `Capture` goes on (plan decision P1);
@@ -461,8 +462,10 @@ impl CaptureCtl {
         // uploads), an imported transcript of the session tells where capture continues.
         let imported_until = if state.as_ref().is_none_or(|s| s.next_ord == 0) {
             let imported_as = imported_session(&input);
+            // A Codex rollout is imported under its file's stem, `rollout-<time>-<id>`.
+            let rollouts = input.agent == AgentKind::Codex && input.subagent.is_none();
             self.readers
-                .with(|c| store::imported_session_end(c, &imported_as))?
+                .with(|c| store::imported_session_end(c, &imported_as, rollouts))?
                 .flatten()
                 .and_then(|end| parse_time(&end))
         } else {
@@ -666,7 +669,8 @@ impl CaptureCtl {
 }
 
 /// The session id an imported copy of the pass's transcript carries (spec §9.2): M3 files a
-/// transcript under its file's stem. A main session's is its id. A Claude Code subagent's file
+/// transcript under its file's stem. A main session's is its id (a Codex session's rollout is
+/// `rollout-<time>-<id>`, which the lookup also asks for). A Claude Code subagent's file
 /// is `<session>/subagents/agent-<id>.jsonl`, imported under its own stem, so a subagent asks
 /// for that (its local file's stem when there is one), never its main session's: the main
 /// transcript's import holds none of the subagent's turns (Task 18b).

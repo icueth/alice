@@ -2082,6 +2082,85 @@ async fn a_mined_subagent_file_continues_after_its_own_import() {
     assert_eq!(chunks_holding(&svc, "mined text of the x2 subagent"), 1);
 }
 
+/// Task 18b review, I2: MemPalace files a mined Codex rollout under its file's stem,
+/// `rollout-<time>-<session id>`, never the bare session id. Backfilling that rollout (the local
+/// worker reads it after a `backfill` notice) still continues after the import's end: the turns
+/// the import holds are skipped, not stored a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backfilled_codex_rollout_continues_after_its_mined_copy() {
+    let (d, svc) = local();
+    let id = "0199e4c1-5b2a-7d10-8e3f-4a5b6c7d8e9f";
+    let day = d.path().join(".codex").join("sessions/2026/10/16");
+    std::fs::create_dir_all(&day).unwrap();
+    let path = day.join(format!("rollout-2026-10-16T00-00-00-{id}.jsonl"));
+    // MemPalace mined the rollout up to 00:00:04.
+    let mined = [
+        ("mined text of the first codex turn", "2026-10-16T00:00:03Z"),
+        (
+            "mined text of the second codex turn",
+            "2026-10-16T00:00:04Z",
+        ),
+    ];
+    let specs: Vec<_> = mined
+        .iter()
+        .enumerate()
+        .map(|(i, (text, at))| {
+            let mut s = palace::chunk(
+                &format!("cxm_{i:03}"),
+                text,
+                "sessions",
+                &path.to_string_lossy(),
+                i as i64,
+            );
+            s.meta.authored_at = Some(at.to_string());
+            s
+        })
+        .collect();
+    import_palace(&svc, d.path(), &specs).await;
+    let imported_session: String = db(&svc)
+        .query_row(
+            "SELECT session_id FROM sources WHERE uri = ?1",
+            [format!("file://{}", path.display())],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        imported_session,
+        format!("rollout-2026-10-16T00-00-00-{id}"),
+        "the importer names it by the file's stem"
+    );
+
+    // Prompts at 00:00:02, :04 and :06: the first two are the import's.
+    let mut r = Rollout::default();
+    r.line("session_meta", json!({"id": id}))
+        .prompt("Which harbour crane is broken?")
+        .reply("The north crane, cxone.")
+        .prompt("Since when is it broken?")
+        .reply("Since Monday, cxtwo.")
+        .prompt("Who repairs it?")
+        .reply("The harbour team, cxthree.");
+    std::fs::write(&path, &r.bytes).unwrap();
+    age(&path, Duration::from_secs(3 * 24 * 3600));
+    svc.capture_notify(CaptureNotify {
+        agent: "codex".into(),
+        event: "backfill".into(),
+        session_id: id.into(),
+        transcript_path: path.to_string_lossy().into_owned(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let uri = format!("codex:session:{id}");
+    until("the rollout is read to its end", || {
+        state_of(&svc, &uri).is_some_and(|s| s.byte_offset == r.len())
+    })
+    .await;
+    assert_eq!(chunks_holding(&svc, "cxone"), 0, "held by the import");
+    assert_eq!(chunks_holding(&svc, "cxtwo"), 0, "held by the import");
+    assert_eq!(chunks_holding(&svc, "cxthree"), 1);
+    assert_eq!(chunks_holding(&svc, "mined text of the"), 2, "the import's");
+}
+
 /// A backfill notice for `session`'s file `path` (a subagent's when `agent` is given, with the
 /// main transcript `main`), as `alice capture backfill` sends it.
 fn backfill_notify(session: &str, main: &Path, agent: Option<(&str, &Path)>) -> CaptureNotify {
