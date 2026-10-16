@@ -2,6 +2,10 @@
 //! runs with the fake embedder, plus unrelated queries that must take the raw fallback. It
 //! reports MRR, the rank of every gold query, the cosine similarity of relevant and unrelated
 //! query–memory pairs, and a sweep of `relevance_floor` values; it asserts the default floor.
+//! On top of the shared gold set it has queries that share no word with their memory
+//! (`VECTOR_ONLY`: a Thai query for an English memory and the reverse, and English paraphrases),
+//! which only the vector list can find: they test the floor's lower edge, since a result below
+//! the floor without a lexical match is not returned at all.
 //!
 //! Run with (reads the model, never downloads it; `alice model fetch` puts it in ~/.alice/models):
 //!   ALICE_MODELS_DIR=~/.alice/models cargo test -p alice-embed --release \
@@ -11,11 +15,16 @@
 use alice_core::embed::{Embedder, cosine, memory_embed_text};
 use alice_core::model::Kind;
 use alice_core::project::ProjectRef;
-use alice_core::search::{DEFAULT_RELEVANCE_FLOOR, SearchParams, fusion::Weights, run};
+use alice_core::search::{
+    CHUNK_RELEVANCE_FLOOR, DEFAULT_RELEVANCE_FLOOR, DEFAULT_RELEVANCE_MARGIN,
+    DEFAULT_RELEVANCE_SURE, SearchParams,
+    fusion::{Fusion, Weights},
+    run,
+};
 use alice_core::store::embeddings::VecKey;
 use alice_core::store::{memories, open_writer, projects, sources};
 use alice_core::vector::{KeyFilter, VectorIndex};
-use alice_embed::FastEmbedder;
+use alice_embed::{OnnxEmbedder, OnnxOptions};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -40,6 +49,113 @@ const UNRELATED: &[(&str, &str)] = &[
     ),
     ("ราคาทองคำวันนี้", "ราคาทองคำวันนี้ขึ้นอีกสองร้อยบาท"),
 ];
+
+/// A gold query that shares no word with its memory (checked: the hit's only match is the
+/// vector list), with what retrieval does with it at the default floor today.
+struct VectorOnly {
+    what: &'static str,
+    query: &'static str,
+    /// Memory id from the gold file.
+    want: &'static str,
+    /// Measured with the default policy (rescue floor 0.805, sure floor 0.825, margin 0.015) and the exact cosine of the stored vectors on Apple Silicon: in the
+    /// top 3 (true) or not returned at all (false: no lexical match, similarity below the floor).
+    /// A change to the floor policy or to the model changes this column, and
+    /// docs/benchmarks/m2.md with it. Rows within `PIN_MARGIN` of the floor are not pinned.
+    returned_at_default_floor: bool,
+}
+
+const VECTOR_ONLY: &[VectorOnly] = &[
+    VectorOnly {
+        what: "Thai for English",
+        query: "เราดีพลอยระบบจริงไปไว้ที่ไหน",
+        want: "deploy",
+        returned_at_default_floor: false,
+    },
+    VectorOnly {
+        what: "Thai for English",
+        query: "ควรตอบเจ้าของด้วยภาษาอะไร",
+        want: "pref-thai",
+        returned_at_default_floor: true,
+    },
+    VectorOnly {
+        what: "Thai for English",
+        query: "เก็บจำนวนเงินเป็นสตริงเพื่อไม่ให้ปัดเศษผิด",
+        want: "money",
+        returned_at_default_floor: true,
+    },
+    VectorOnly {
+        what: "Thai for English",
+        query: "ทำไมบันทึกไดอารี่ถึงหมดเวลา",
+        want: "lease",
+        returned_at_default_floor: false,
+    },
+    VectorOnly {
+        what: "English for Thai",
+        query: "agents' memory has to search Thai text that has no spaces between words",
+        want: "thai-mem",
+        returned_at_default_floor: true,
+    },
+    VectorOnly {
+        what: "paraphrase",
+        query: "a lone dedicated committer keeps lookups from stalling",
+        want: "wal",
+        returned_at_default_floor: false,
+    },
+    VectorOnly {
+        what: "paraphrase",
+        query: "the connection retried endlessly once the laptop woke up",
+        want: "reconnect",
+        returned_at_default_floor: true,
+    },
+    VectorOnly {
+        what: "paraphrase",
+        query: "currency amounts travel as text so decimals stay exact",
+        want: "money",
+        returned_at_default_floor: true,
+    },
+    VectorOnly {
+        what: "paraphrase",
+        query: "binary envelopes are mandatory; a text payload cannot be decoded",
+        want: "proto",
+        returned_at_default_floor: true,
+    },
+    VectorOnly {
+        what: "paraphrase",
+        query: "which host serves our live site",
+        want: "deploy",
+        returned_at_default_floor: false,
+    },
+];
+
+/// With every vector candidate let through (floor −1), at least this many of `VECTOR_ONLY` rank
+/// in the top 3: the ranking itself, whatever the floor decides.
+const VECTOR_ONLY_TOP3_UNFLOORED: usize = 8;
+
+/// The same model gives slightly different vectors on another CPU: ONNX Runtime's int8 kernels
+/// differ between x86-64 and ARM, and on windows-latest the vector-only similarities moved by up
+/// to 0.02 against Apple Silicon (`docs/benchmarks/m2.md`, Windows). A vector-only row this close
+/// to the floor can land on either side of it, so its outcome is reported, not pinned; if it is
+/// returned it must still be in the top 3.
+const PIN_MARGIN: f32 = 0.02;
+
+/// A row the policy decides is pinned only when its similarity is at least this far from both
+/// floors: closer, the 0.002 that separates Apple Silicon from x86-64 on this model decides it.
+const DECIDED_EDGE: f32 = 0.005;
+
+/// The fusion settings of the run: the defaults, or `ALICE_EVAL_FUSION=<rrf_k>,<boost_exponent>`
+/// (a ranking comparison, `docs/benchmarks/m2.md`, Task 19).
+fn eval_fusion() -> Fusion {
+    let Ok(v) = std::env::var("ALICE_EVAL_FUSION") else {
+        return Fusion::default();
+    };
+    let (k, l) = v
+        .split_once(',')
+        .expect("ALICE_EVAL_FUSION=<rrf_k>,<boost_exponent>");
+    Fusion {
+        rrf_k: k.trim().parse().unwrap(),
+        boost_exponent: l.trim().parse().unwrap(),
+    }
+}
 
 fn models_dir() -> PathBuf {
     std::env::var_os("ALICE_MODELS_DIR")
@@ -69,7 +185,7 @@ fn stats(v: &mut [f32]) -> String {
 }
 
 struct Outcome {
-    /// Rank (1-based) of the wanted memory per gold query.
+    /// Rank (1-based) of the wanted memory per gold query (the shared ones, then `VECTOR_ONLY`).
     ranks: Vec<Option<usize>>,
     /// Per unrelated query: knowledge results that counted as relevant, and whether the raw
     /// fallback fired.
@@ -85,7 +201,7 @@ fn real_model_gold_set_and_relevance_floor() {
         "no model in {}; run `alice model fetch` or set ALICE_MODELS_DIR",
         dir.display()
     );
-    let e = FastEmbedder::new(&dir).unwrap();
+    let e = OnnxEmbedder::new(&dir, OnnxOptions::default()).unwrap();
     let d = tempfile::tempdir().unwrap();
     let c = open_writer(&d.path().join("a.db")).unwrap();
     let p = projects::upsert_project(
@@ -99,7 +215,9 @@ fn real_model_gold_set_and_relevance_floor() {
         },
     )
     .unwrap();
-    let idx = VectorIndex::new(e.dim()).unwrap();
+    // As the daemon has it: the index knows the model, so recall rescores memory candidates with
+    // the exact stored vectors (below), and the floors are compared on that exact scale.
+    let idx = VectorIndex::for_model(e.model_id(), e.dim()).unwrap();
 
     let mut ids: HashMap<String, String> = HashMap::new();
     let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
@@ -128,6 +246,8 @@ fn real_model_gold_set_and_relevance_floor() {
                 .unwrap()
                 .remove(0);
             idx.upsert(VecKey::Memory(seq), &vector).unwrap();
+            alice_core::store::embeddings::put(&c, VecKey::Memory(seq), e.model_id(), &vector)
+                .unwrap();
             let key = v["id"].as_str().unwrap().to_string();
             vectors.insert(key.clone(), vector);
             ids.insert(key, id);
@@ -138,6 +258,12 @@ fn real_model_gold_set_and_relevance_floor() {
             ));
         }
     }
+    let shared_gold = gold.len();
+    gold.extend(
+        VECTOR_ONLY
+            .iter()
+            .map(|v| (v.query.to_string(), v.want.to_string())),
+    );
     for (i, (_, chunk)) in UNRELATED.iter().enumerate() {
         let out = sources::ingest(
             &c,
@@ -156,8 +282,9 @@ fn real_model_gold_set_and_relevance_floor() {
         assert_eq!(out.inserted, 1);
     }
 
-    // Similarity of every query against every memory: exact cosine, and as the int8 index
-    // reports it (what the relevance floor is compared with at run time).
+    // Similarity of every query against every memory on the exact scale (the cosine of the
+    // stored f16 vectors), which is what recall compares the floors with. The int8 index's
+    // own figure is only shown for the vector-only rows.
     let seq_of_key: HashMap<String, VecKey> = ids
         .iter()
         .map(|(key, id)| {
@@ -171,78 +298,92 @@ fn real_model_gold_set_and_relevance_floor() {
             .into_iter()
             .collect()
     };
-    let (mut relevant, mut irrelevant, mut unrelated_sims) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut relevant_i8, mut irrelevant_i8, mut unrelated_i8) =
+    // The shared gold pairs (as M1 measured them) and the vector-only pairs, kept apart.
+    let (mut relevant_exact, mut irrelevant_exact, mut unrelated_exact) =
         (Vec::new(), Vec::new(), Vec::new());
-    for (q, want) in &gold {
+    // (exact, int8 index) per `VECTOR_ONLY` entry, in order.
+    let mut vector_only_sims: Vec<(f32, f32)> = Vec::new();
+    for (n, (q, want)) in gold.iter().enumerate() {
         let qv = e.embed_query(q).unwrap();
         let by_index = index_sims(&qv);
         for (key, mv) in &vectors {
             let (exact, i8) = (cosine(&qv, mv), by_index[&seq_of_key[key]]);
-            if key == want {
-                relevant.push(exact);
-                relevant_i8.push(i8);
-            } else {
-                irrelevant.push(exact);
-                irrelevant_i8.push(i8);
+            match (key == want, n < shared_gold) {
+                (true, true) => relevant_exact.push(exact),
+                (true, false) => vector_only_sims.push((exact, i8)),
+                (false, true) => irrelevant_exact.push(exact),
+                (false, false) => {}
             }
         }
     }
+    let vector_only_exact: Vec<f32> = vector_only_sims.iter().map(|(exact, _)| *exact).collect();
     for (q, _) in UNRELATED {
         let qv = e.embed_query(q).unwrap();
-        unrelated_sims.extend(vectors.values().map(|mv| cosine(&qv, mv)));
-        unrelated_i8.extend(index_sims(&qv).into_values());
+        unrelated_exact.extend(vectors.values().map(|mv| cosine(&qv, mv)));
     }
-    println!("similarity, query vs memory (model {}):", e.model_id());
-    println!("  exact cosine");
-    println!("    gold query vs its memory     {}", stats(&mut relevant));
     println!(
-        "    gold query vs other memories {}",
-        stats(&mut irrelevant)
+        "similarity, query vs memory, exact cosine (model {}):",
+        e.model_id()
     );
-    println!(
-        "    unrelated query vs memories  {}",
-        stats(&mut unrelated_sims)
-    );
-    println!("  int8 index");
     println!(
         "    gold query vs its memory     {}",
-        stats(&mut relevant_i8)
+        stats(&mut relevant_exact)
     );
     println!(
         "    gold query vs other memories {}",
-        stats(&mut irrelevant_i8)
+        stats(&mut irrelevant_exact)
     );
     println!(
         "    unrelated query vs memories  {}",
-        stats(&mut unrelated_i8)
+        stats(&mut unrelated_exact)
     );
+    println!("  queries sharing no word with their memory (exact / int8 index)");
+    for ((exact, i8), v) in vector_only_sims.iter().zip(VECTOR_ONLY) {
+        println!(
+            "    {exact:.3} / {i8:.3}  {:<16} {:<10} {}",
+            v.what, v.want, v.query
+        );
+    }
     let above = |v: &[f32], floor: f32| v.iter().filter(|s| **s >= floor).count();
+    let params = |q: &str, floor: f32| SearchParams {
+        query: q.to_string(),
+        current_project_id: Some(p.id.clone()),
+        limit: 10,
+        relevance_floor: floor,
+        // The shipped policy is the rescue floor (swept here), the sure floor and the margin;
+        // "no floor" (a negative one) lets every candidate through, chunks included.
+        relevance_sure: (floor >= 0.0).then_some(DEFAULT_RELEVANCE_SURE.max(floor)),
+        relevance_margin: if floor < 0.0 {
+            0.0
+        } else {
+            DEFAULT_RELEVANCE_MARGIN
+        },
+        chunk_floor: Some(if floor < 0.0 {
+            floor
+        } else {
+            CHUNK_RELEVANCE_FLOOR
+        }),
+        raw_min_results: 3,
+        fusion: eval_fusion(),
+        ..Default::default()
+    };
+    let search = |q: &str, floor: f32| {
+        run(
+            &c,
+            Some(&idx),
+            &e,
+            &Weights::default(),
+            &params(q, floor),
+            chrono::Utc::now(),
+        )
+        .unwrap()
+    };
 
     let evaluate = |floor: f32| -> Outcome {
-        let params = |q: &str| SearchParams {
-            query: q.to_string(),
-            current_project_id: Some(p.id.clone()),
-            limit: 10,
-            relevance_floor: floor,
-            raw_min_results: 3,
-            ..Default::default()
-        };
-        let search = |q: &str| {
-            run(
-                &c,
-                Some(&idx),
-                &e,
-                &Weights::default(),
-                &params(q),
-                chrono::Utc::now(),
-            )
-            .unwrap()
-        };
         let ranks = gold
             .iter()
             .map(|(q, want)| {
-                search(q)
+                search(q, floor)
                     .hits
                     .iter()
                     .position(|h| h.id == ids[want])
@@ -252,7 +393,7 @@ fn real_model_gold_set_and_relevance_floor() {
         let unrelated = UNRELATED
             .iter()
             .map(|(q, _)| {
-                let out = search(q);
+                let out = search(q, floor);
                 let knowledge = out
                     .hits
                     .iter()
@@ -263,48 +404,189 @@ fn real_model_gold_set_and_relevance_floor() {
             .collect();
         Outcome { ranks, unrelated }
     };
-    let mrr = |o: &Outcome| {
-        o.ranks
+    let mrr = |ranks: &[Option<usize>]| {
+        ranks
             .iter()
             .map(|r| r.map(|r| 1.0 / r as f64).unwrap_or(0.0))
             .sum::<f64>()
-            / o.ranks.len() as f64
+            / ranks.len() as f64
     };
+    let top3 = |ranks: &[Option<usize>]| ranks.iter().filter(|r| r.is_some_and(|r| r <= 3)).count();
 
     println!(
-        "\nfloor  pairs >= floor (int8): gold  other  unrelated   gold in top 3  MRR    fallback fired (knowledge results per unrelated query)"
+        "\nfloor  pairs >= floor (exact): gold  other  unrelated  no shared word   in top 3: gold  no shared word   MRR (gold)  fallback fired (knowledge results per unrelated query)"
     );
     for step in 0..=20 {
-        let floor = 0.75 + step as f32 * 0.01;
+        let floor = 0.70 + step as f32 * 0.01;
         let o = evaluate(floor);
-        let top3 = o.ranks.iter().filter(|r| r.is_some_and(|r| r <= 3)).count();
+        let (shared, vector_only) = o.ranks.split_at(shared_gold);
         let fired = o.unrelated.iter().filter(|(_, f)| *f).count();
         let knowledge: Vec<usize> = o.unrelated.iter().map(|(k, _)| *k).collect();
         println!(
-            "{floor:.2}                          {:>2}/{}  {:>3}/{}  {:>2}/{}       {top3:>2}/{}          {:.3}  {fired}/{}  {knowledge:?}",
-            above(&relevant_i8, floor),
-            relevant_i8.len(),
-            above(&irrelevant_i8, floor),
-            irrelevant_i8.len(),
-            above(&unrelated_i8, floor),
-            unrelated_i8.len(),
-            o.ranks.len(),
-            mrr(&o),
+            "{floor:.2}                          {:>2}/{}  {:>3}/{}  {:>2}/{}      {:>2}/{}             {:>2}/{}  {:>2}/{}            {:.3}       {fired}/{}  {knowledge:?}",
+            above(&relevant_exact, floor),
+            relevant_exact.len(),
+            above(&irrelevant_exact, floor),
+            irrelevant_exact.len(),
+            above(&unrelated_exact, floor),
+            unrelated_exact.len(),
+            above(&vector_only_exact, floor),
+            vector_only_exact.len(),
+            top3(shared),
+            shared.len(),
+            top3(vector_only),
+            vector_only.len(),
+            mrr(shared),
             o.unrelated.len()
         );
     }
 
-    let o = evaluate(DEFAULT_RELEVANCE_FLOOR);
-    println!("\nat the default floor {DEFAULT_RELEVANCE_FLOOR}:");
+    let floor = DEFAULT_RELEVANCE_FLOOR;
+    let o = evaluate(floor);
+    let (shared, vector_only) = o.ranks.split_at(shared_gold);
+    println!("\nat the default floor {floor}:");
     for ((q, want), rank) in gold.iter().zip(&o.ranks) {
         println!("  {rank:?}\t{want}\t{q}");
     }
-    println!("  MRR {:.3} over {} queries", mrr(&o), o.ranks.len());
-    for ((q, want), rank) in gold.iter().zip(&o.ranks) {
+    println!(
+        "  MRR {:.3} over the {} gold queries",
+        mrr(shared),
+        shared.len()
+    );
+    for ((q, want), rank) in gold.iter().zip(shared) {
         assert!(
             rank.is_some_and(|r| r <= 3),
             "{q:?}: expected {want} in the top 3, got {rank:?}"
         );
+    }
+    // Fixture check (not a retrieval check: with ten memories and floor −1 every memory is
+    // returned): each vector-only query reaches its memory through the vector list alone, so it
+    // really shares no word with it.
+    for v in VECTOR_ONLY {
+        let out = search(v.query, -1.0);
+        let hit = out.hits.iter().find(|h| h.id == ids[v.want]);
+        assert_eq!(
+            hit.map(|h| h.matched.clone()),
+            Some(vec![alice_core::api::MatchVia::Vector]),
+            "{:?} must reach {} through the vector list only",
+            v.query,
+            v.want
+        );
+    }
+    // The ranking, whatever the floor: with every candidate let through, most vector-only
+    // queries put their memory in the top 3.
+    let unfloored = evaluate(-1.0);
+    let unfloored_top3 = top3(&unfloored.ranks[shared_gold..]);
+    println!(
+        "  vector-only queries in the top 3 with no floor: {unfloored_top3} of {}",
+        VECTOR_ONLY.len()
+    );
+    assert!(
+        unfloored_top3 >= VECTOR_ONLY_TOP3_UNFLOORED,
+        "only {unfloored_top3} vector-only queries rank their memory in the top 3 without a floor"
+    );
+    // The floor's lower edge, pinned row by row: the rows marked returned are in the top 3, the
+    // others are not returned at all. A change in either direction must update VECTOR_ONLY and
+    // docs/benchmarks/m2.md. Rows within PIN_MARGIN of the floor are only reported.
+    let mut below = Vec::new();
+    for ((v, rank), sim) in VECTOR_ONLY.iter().zip(vector_only).zip(&vector_only_exact) {
+        if (sim - floor).abs() < PIN_MARGIN || (sim - DEFAULT_RELEVANCE_SURE).abs() < PIN_MARGIN {
+            println!(
+                "  near the floor, not pinned: {sim:.3} {}: {} -> {rank:?}",
+                v.what, v.query
+            );
+            assert!(
+                rank.is_none_or(|r| r <= 3),
+                "{:?} ({sim:.3}) is returned but not in the top 3: {rank:?}",
+                v.query
+            );
+            if rank.is_none() {
+                below.push(format!("{sim:.3} {}: {}", v.what, v.query));
+            }
+            continue;
+        }
+        if v.returned_at_default_floor {
+            assert!(
+                rank.is_some_and(|r| r <= 3),
+                "{:?} ({sim:.3}) should rank {} in the top 3 at the default floor, got {rank:?}",
+                v.query,
+                v.want
+            );
+        } else {
+            assert_eq!(
+                *rank, None,
+                "{:?} ({sim:.3}) now returns {}: update VECTOR_ONLY and docs/benchmarks/m2.md",
+                v.query, v.want
+            );
+            below.push(format!("{sim:.3} {}: {}", v.what, v.query));
+        }
+    }
+    // The three rows the policy decides (exact scale), pinned by name: the sure floor 0.825 and
+    // the rescue floor 0.805 are what separate them, so a change of either shows here. A row
+    // within `DECIDED_EDGE` of either floor sits on a knife edge that the same model moves
+    // across on another CPU family (x86-64 scores the Thai lease query 0.806 where Apple
+    // Silicon scores 0.804, the rescue floor being 0.805): its outcome is reported, and if it is
+    // returned it must still be in the top 3.
+    let decided = [
+        ("เก็บจำนวนเงินเป็นสตริงเพื่อไม่ให้ปัดเศษผิด", 0.819, true),
+        ("ทำไมบันทึกไดอารี่ถึงหมดเวลา", 0.804, false),
+        (
+            "binary envelopes are mandatory; a text payload cannot be decoded",
+            0.831,
+            true,
+        ),
+    ];
+    for (query, expected_sim, admitted) in decided {
+        let i = VECTOR_ONLY.iter().position(|v| v.query == query).unwrap();
+        let sim = vector_only_exact[i];
+        assert!(
+            (sim - expected_sim).abs() < PIN_MARGIN,
+            "{query:?} scores {sim:.3}, not about {expected_sim}: update the pins and m2.md"
+        );
+        let rank = vector_only[i];
+        if (sim - DEFAULT_RELEVANCE_FLOOR).abs() < DECIDED_EDGE
+            || (sim - DEFAULT_RELEVANCE_SURE).abs() < DECIDED_EDGE
+        {
+            println!("  on a floor's edge, not pinned: {sim:.3} {query} -> {rank:?}");
+            assert!(
+                rank.is_none_or(|r| r <= 3),
+                "{query:?} ({sim:.3}) is returned but not in the top 3: {rank:?}"
+            );
+            continue;
+        }
+        assert_eq!(
+            rank.is_some_and(|r| r <= 3),
+            admitted,
+            "{query:?} ({sim:.3}) with the rescue floor {DEFAULT_RELEVANCE_FLOOR} and the sure floor {DEFAULT_RELEVANCE_SURE}"
+        );
+    }
+    // Headroom: the rescue floor clears the highest unrelated similarity by the cross-CPU drift
+    // it was chosen to allow for. The floor was fixed against Apple Silicon, where the highest
+    // unrelated pair scores 0.786 (0.019 of headroom, 0.015 wanted). On x86-64 the same model
+    // scores that pair 0.792, so the drift took 0.006 of the allowance and 0.013 is left: still
+    // no unrelated pair reaches the floor, which is what the floor is for, so other CPU
+    // families are held to 0.010.
+    let unrelated_max = unrelated_exact.iter().cloned().fold(f32::MIN, f32::max);
+    let headroom = DEFAULT_RELEVANCE_FLOOR - unrelated_max;
+    let wanted = if cfg!(target_arch = "aarch64") {
+        0.015
+    } else {
+        0.010
+    };
+    println!(
+        "  headroom below the rescue floor: {headroom:.3} (the highest unrelated pair is {unrelated_max:.3}; {wanted:.3} wanted on this CPU family)"
+    );
+    assert!(
+        headroom >= wanted - 1e-6,
+        "an unrelated pair at {unrelated_max:.3} leaves {headroom:.3} below the rescue floor, less than the {wanted:.3} wanted"
+    );
+    println!(
+        "  vector-only pairs not returned at the floor {floor}: {} of {}",
+        below.len(),
+        VECTOR_ONLY.len()
+    );
+    for b in &below {
+        println!("    {b}");
     }
     for ((q, _), (knowledge, fired)) in UNRELATED.iter().zip(&o.unrelated) {
         assert!(
@@ -312,17 +594,16 @@ fn real_model_gold_set_and_relevance_floor() {
             "{q:?}: the raw fallback did not fire ({knowledge} knowledge results counted as relevant)"
         );
     }
-    assert!(mrr(&o) >= 0.9, "MRR {:.3} below 0.9", mrr(&o));
+    assert!(mrr(shared) >= 0.9, "MRR {:.3} below 0.9", mrr(shared));
     // The floor separates the two populations as the index sees them: every gold memory would
     // count as relevant on similarity alone, no memory counts for an unrelated query.
-    let floor = DEFAULT_RELEVANCE_FLOOR;
     assert_eq!(
-        above(&relevant_i8, floor),
-        relevant_i8.len(),
+        above(&relevant_exact, floor),
+        relevant_exact.len(),
         "a gold pair below {floor}"
     );
     assert_eq!(
-        above(&unrelated_i8, floor),
+        above(&unrelated_exact, floor),
         0,
         "an unrelated pair at or above {floor}"
     );

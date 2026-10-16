@@ -25,6 +25,9 @@ pub struct NewMemoryInput {
     pub legacy_id: Option<String>,
     /// Import only: keep the original creation time.
     pub created_at: Option<String>,
+    /// The project is `global` only because nothing named one (no project, no working
+    /// directory): the judge may route the memory to a project later.
+    pub project_defaulted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +47,10 @@ pub struct PreparedMemory {
     pub created_at: String,
     pub hlc: String,
     pub legacy_id: Option<String>,
+    /// The writer gave a kind (0 in the database when `kind` defaulted to `note`: the judge may
+    /// classify it).
+    pub kind_explicit: bool,
+    pub project_defaulted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +170,8 @@ pub fn prepare(
         created_at: input.created_at.unwrap_or_else(now_rfc3339),
         hlc,
         legacy_id: input.legacy_id,
+        kind_explicit: input.kind.is_some(),
+        project_defaulted: input.project_defaulted,
     })
 }
 
@@ -170,6 +179,17 @@ pub fn seq_of(conn: &Connection, id: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
             "SELECT seq FROM memories WHERE id = ?1 OR legacy_id = ?1 ORDER BY seq LIMIT 1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// The id of the memory `id` names (its id or a legacy id, as `seq_of` resolves it).
+pub fn id_of(conn: &Connection, id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM memories WHERE id = ?1 OR legacy_id = ?1 ORDER BY seq LIMIT 1",
             [id],
             |r| r.get(0),
         )
@@ -191,7 +211,12 @@ fn set_status(conn: &Connection, seq: i64, status: Status, hlc: Option<&str>) ->
 
 /// The dedup index (`project_id`, `content_hash`) skips trashed rows, so a row that edits its
 /// text or leaves the trash must not take the content of another live memory.
-fn ensure_unique_content(conn: &Connection, seq: i64, project_id: &str, hash: &str) -> Result<()> {
+pub(crate) fn ensure_unique_content(
+    conn: &Connection,
+    seq: i64,
+    project_id: &str,
+    hash: &str,
+) -> Result<()> {
     let other: Option<String> = conn
         .query_row(
             "SELECT id FROM memories WHERE project_id = ?1 AND content_hash = ?2 AND status <> 'trashed' AND seq <> ?3",
@@ -207,7 +232,9 @@ fn ensure_unique_content(conn: &Connection, seq: i64, project_id: &str, hash: &s
     }
 }
 
-fn add_link(conn: &Connection, from: &str, to: &str, kind: &str, by: &str) -> Result<()> {
+/// Add a link `from` → `to` of type `kind` (`supersedes`, `duplicate_of`, `contradicts`, ...),
+/// made by `by`. An existing identical link is left as it is.
+pub fn link(conn: &Connection, from: &str, to: &str, kind: &str, by: &str) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO links (from_id, to_id, type, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![from, to, kind, by, now_rfc3339()],
@@ -244,8 +271,9 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
     let now = now_rfc3339();
     conn.execute(
         "INSERT INTO memories (id, project_id, kind, title, body, importance, status, content_hash,
-            author_agent, author_model, author_session, idempotency_key, created_at, updated_at, hlc, legacy_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            author_agent, author_model, author_session, idempotency_key, created_at, updated_at, hlc, legacy_id,
+            kind_explicit, project_defaulted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             m.id,
             m.project_id,
@@ -261,7 +289,9 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
             m.created_at,
             now,
             m.hlc,
-            m.legacy_id
+            m.legacy_id,
+            m.kind_explicit,
+            m.project_defaulted
         ],
     )?;
     let seq = conn.last_insert_rowid();
@@ -286,7 +316,7 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
         if old_status != Status::Trashed.as_str() {
             set_status(conn, old_seq, Status::Superseded, Some(&m.hlc))?;
         }
-        add_link(conn, &m.id, &old_id, "supersedes", &by)?;
+        link(conn, &m.id, &old_id, "supersedes", &by)?;
     }
     Ok(InsertOutcome::New {
         id: m.id.clone(),
@@ -407,6 +437,105 @@ pub fn touch_access(conn: &Connection, seqs: &[i64]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveOutcome {
+    Moved,
+    /// The target project already holds this text in a live memory (its id).
+    DuplicateOf(String),
+}
+
+/// `others` become trashed duplicates of `survivor`: each gets a `duplicate_of` link to it and
+/// the survivor gains their provenance. The survivor itself and unknown ids are skipped, and so
+/// is an id already trashed. Returns the ids that were merged. (Provenance is not part of an
+/// event's snapshot: undoing a merge restores status and links, and the provenance rows copied
+/// to the survivor stay there, which is harmless.)
+pub fn merge_into(
+    conn: &Connection,
+    survivor_id: &str,
+    others: &[String],
+    hlc: &str,
+) -> Result<Vec<String>> {
+    let survivor_seq = seq_of(conn, survivor_id)?.ok_or_else(|| {
+        AliceError::NotFound(format!("memory {survivor_id} (survivor); check the id"))
+    })?;
+    let (survivor, survivor_status): (String, String) = conn.query_row(
+        "SELECT id, status FROM memories WHERE seq = ?1",
+        [survivor_seq],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if survivor_status == Status::Trashed.as_str() {
+        return Err(AliceError::invalid(format!(
+            "memory {survivor} is in the trash and cannot be the survivor of a merge; restore it first or pick another"
+        )));
+    }
+    let mut merged = Vec::new();
+    for o in others {
+        let Some(seq) = seq_of(conn, o)?.filter(|s| *s != survivor_seq) else {
+            continue;
+        };
+        let (id, status): (String, String) = conn.query_row(
+            "SELECT id, status FROM memories WHERE seq = ?1",
+            [seq],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if status == Status::Trashed.as_str() || merged.contains(&id) {
+            continue;
+        }
+        set_status(conn, seq, Status::Trashed, Some(hlc))?;
+        link(conn, &id, &survivor, "duplicate_of", "merge")?;
+        conn.execute(
+            "INSERT OR IGNORE INTO provenance (memory_id, chunk_id) SELECT ?1, chunk_id FROM provenance WHERE memory_id = ?2",
+            params![survivor, id],
+        )?;
+        merged.push(id);
+    }
+    Ok(merged)
+}
+
+/// Move a memory to another project, unless that project already holds the same text.
+pub fn move_to_project(
+    conn: &Connection,
+    id: &str,
+    project_id: &str,
+    hlc: &str,
+) -> Result<MoveOutcome> {
+    let seq = seq_of(conn, id)?.ok_or_else(|| AliceError::NotFound(format!("memory {id}")))?;
+    let (kind, title, body): (String, String, String) = conn.query_row(
+        "SELECT kind, title, body FROM memories WHERE seq = ?1",
+        [seq],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let slug: String = conn
+        .query_row(
+            "SELECT slug FROM projects WHERE id = ?1",
+            [project_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| AliceError::NotFound(format!("project {project_id}")))?;
+    let hash = content_hash(
+        &slug,
+        Kind::parse(&kind).unwrap_or(Kind::Note),
+        &title,
+        &body,
+    );
+    if let Some(other) = conn
+        .query_row(
+            "SELECT id FROM memories WHERE project_id = ?1 AND content_hash = ?2 AND status <> 'trashed' AND seq <> ?3",
+            params![project_id, hash, seq],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(MoveOutcome::DuplicateOf(other));
+    }
+    conn.execute(
+        "UPDATE memories SET project_id = ?1, content_hash = ?2, updated_at = ?3, hlc = ?4, project_defaulted = 0 WHERE seq = ?5",
+        params![project_id, hash, now_rfc3339(), hlc, seq],
+    )?;
+    Ok(MoveOutcome::Moved)
+}
+
 /// Apply an edit or status change and return the updated memory.
 /// Everything is validated before the first write.
 pub fn apply_update(conn: &Connection, id: &str, u: &MemoryUpdate, hlc: String) -> Result<Memory> {
@@ -460,8 +589,9 @@ pub fn apply_update(conn: &Connection, id: &str, u: &MemoryUpdate, hlc: String) 
             let text_changed = title != current.title || body != current.body;
             conn.execute(
                 "UPDATE memories SET title=?1, body=?2, kind=?3, importance=?4, content_hash=?5, updated_at=?6, hlc=?7,
-                    embed_state = CASE WHEN ?8 THEN 'pending' ELSE embed_state END WHERE seq=?9",
-                params![title, body, kind.as_str(), importance, hash, now_rfc3339(), hlc, text_changed, seq],
+                    embed_state = CASE WHEN ?8 THEN 'pending' ELSE embed_state END,
+                    kind_explicit = CASE WHEN ?10 THEN 1 ELSE kind_explicit END WHERE seq=?9",
+                params![title, body, kind.as_str(), importance, hash, now_rfc3339(), hlc, text_changed, seq, u.kind.is_some()],
             )?;
             if let Some(topics) = &new_topics {
                 conn.execute(
@@ -500,11 +630,18 @@ pub fn apply_update(conn: &Connection, id: &str, u: &MemoryUpdate, hlc: String) 
                     r.get(0)
                 })?;
             status_change(Status::Superseded)?;
-            add_link(conn, &by_id, &current.id, "supersedes", "user")?;
+            link(conn, &by_id, &current.id, "supersedes", "user")?;
         }
         UpdateAction::Archive => status_change(Status::Archived)?,
         UpdateAction::Forget => status_change(Status::Trashed)?,
-        UpdateAction::Restore => status_change(Status::Active)?,
+        UpdateAction::Restore => {
+            status_change(Status::Active)?;
+            // Restored by hand, it is no longer a merged duplicate: `get` stops redirecting.
+            conn.execute(
+                "DELETE FROM links WHERE from_id = ?1 AND type = 'duplicate_of'",
+                [&current.id],
+            )?;
+        }
     }
     let (_, updated) = get_by_seqs(conn, &[seq])?
         .pop()
@@ -571,6 +708,88 @@ mod tests {
         );
         assert_eq!(got.project, "app");
         assert_eq!(got.author.agent.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn the_judge_flags_record_whether_the_kind_and_the_project_were_given() {
+        let (_d, c, p) = setup();
+        let flags = |c: &rusqlite::Connection, id: &str| -> (i64, i64) {
+            c.query_row(
+                "SELECT kind_explicit, project_defaulted FROM memories WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let mut given = input("a decision with a kind");
+        given.kind = Some(Kind::Decision);
+        let mut defaulted = input("a note without a kind");
+        defaulted.project_defaulted = true;
+        let ids: Vec<String> = [given, defaulted]
+            .into_iter()
+            .map(
+                |i| match insert(&c, &prepare(i, &p, "h".into()).unwrap()).unwrap() {
+                    InsertOutcome::New { id, .. } => id,
+                    other => panic!("{other:?}"),
+                },
+            )
+            .collect();
+        assert_eq!(
+            flags(&c, &ids[0]),
+            (1, 0),
+            "an explicit kind, a known project"
+        );
+        assert_eq!(
+            flags(&c, &ids[1]),
+            (0, 1),
+            "no kind given, no project known"
+        );
+    }
+
+    #[test]
+    fn a_chosen_kind_or_project_is_never_the_judges_to_change() {
+        let (_d, c, p) = setup();
+        let mut i = input("kind and project were not given");
+        i.project_defaulted = true;
+        let InsertOutcome::New { id, seq } =
+            insert(&c, &prepare(i, &p, "h".into()).unwrap()).unwrap()
+        else {
+            panic!()
+        };
+        let flags = |c: &rusqlite::Connection| -> (i64, i64) {
+            c.query_row(
+                "SELECT kind_explicit, project_defaulted FROM memories WHERE seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(flags(&c), (0, 1));
+        // An edit that does not name a kind leaves the flag alone; one that does makes it explicit.
+        let edit = |kind| MemoryUpdate {
+            action: UpdateAction::Edit,
+            importance: Some(4),
+            kind,
+            ..Default::default()
+        };
+        apply_update(&c, &id, &edit(None), "h".into()).unwrap();
+        assert_eq!(flags(&c), (0, 1));
+        apply_update(&c, &id, &edit(Some(Kind::Decision)), "h".into()).unwrap();
+        assert_eq!(flags(&c), (1, 1));
+        // Moving it anywhere is a choice about the project.
+        let other = projects::upsert_project(
+            &c,
+            &ProjectRef {
+                key: "k2".into(),
+                slug: "other".into(),
+                name: "other".into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        move_to_project(&c, &id, &other.id, "h").unwrap();
+        assert_eq!(flags(&c), (1, 0));
     }
 
     #[test]
@@ -972,8 +1191,11 @@ mod tests {
             .into_iter()
             .map(|m| m.id)
             .collect();
-        assert_eq!(ids, vec![b.clone(), a]);
+        assert_eq!(ids, vec![b.clone(), a.clone()]);
         assert_eq!(seq_of(&c, "drawer_42").unwrap(), Some(sb));
+        assert_eq!(id_of(&c, "drawer_42").unwrap(), Some(b.clone()));
+        assert_eq!(id_of(&c, &a).unwrap(), Some(a));
+        assert_eq!(id_of(&c, "missing").unwrap(), None);
         touch_access(&c, &[sb, sb]).unwrap();
         assert_eq!(get_many(&c, &[b]).unwrap()[0].access_count, 2);
     }
@@ -1017,5 +1239,96 @@ mod tests {
         }
         assert!(get_by_seqs(&c, &[]).unwrap().is_empty());
         assert!(get_by_seqs(&c, &[1_000_000]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_trashes_the_others_with_links_and_moves_provenance() {
+        let (_d, c, p) = setup();
+        let ins = |t: &str| match insert(&c, &prepare(input(t), &p, "h".into()).unwrap()).unwrap() {
+            InsertOutcome::New { id, .. } => id,
+            o => panic!("{o:?}"),
+        };
+        let (s, a, b) = (ins("survivor text"), ins("dup one"), ins("dup two"));
+        c.execute(
+            "INSERT INTO provenance (memory_id, chunk_id) VALUES (?1, 'CH1')",
+            [&a],
+        )
+        .unwrap();
+        let merged = merge_into(&c, &s, &[a.clone(), b.clone(), s.clone()], "h2").unwrap();
+        assert_eq!(
+            merged,
+            vec![a.clone(), b.clone()],
+            "the survivor is never merged into itself"
+        );
+        for id in [&a, &b] {
+            let st: String = c
+                .query_row("SELECT status FROM memories WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(st, "trashed");
+            let n: i64 = c.query_row("SELECT count(*) FROM links WHERE from_id = ?1 AND to_id = ?2 AND type = 'duplicate_of'", [id, &s], |r| r.get(0)).unwrap();
+            assert_eq!(n, 1);
+        }
+        let prov: i64 = c
+            .query_row(
+                "SELECT count(*) FROM provenance WHERE memory_id = ?1 AND chunk_id = 'CH1'",
+                [&s],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prov, 1);
+        // Merging again changes nothing; a trashed survivor is refused.
+        assert!(
+            merge_into(&c, &s, std::slice::from_ref(&a), "h3")
+                .unwrap()
+                .is_empty()
+        );
+        let err = merge_into(&c, &a, std::slice::from_ref(&s), "h4")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("trash"), "{err}");
+        assert!(matches!(
+            merge_into(&c, "nope", &[s], "h5"),
+            Err(AliceError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn moving_to_a_project_that_holds_the_same_text_reports_the_duplicate() {
+        let (_d, c, p) = setup();
+        let other = crate::store::projects::upsert_project(
+            &c,
+            &crate::project::ProjectRef {
+                key: "k2".into(),
+                slug: "other".into(),
+                name: "other".into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        let m1 = prepare(input("same text"), &p, "h".into()).unwrap();
+        let InsertOutcome::New { id: a, .. } = insert(&c, &m1).unwrap() else {
+            panic!()
+        };
+        let m2 = prepare(input("same text"), &other, "h".into()).unwrap();
+        let InsertOutcome::New { id: b, .. } = insert(&c, &m2).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            move_to_project(&c, &a, &other.id, "h3").unwrap(),
+            MoveOutcome::DuplicateOf(b)
+        );
+        let m3 = prepare(input("unique text"), &p, "h".into()).unwrap();
+        let InsertOutcome::New { id: u, .. } = insert(&c, &m3).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            move_to_project(&c, &u, &other.id, "h4").unwrap(),
+            MoveOutcome::Moved
+        );
+        let slug: String = c.query_row("SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1", [&u], |r| r.get(0)).unwrap();
+        assert_eq!(slug, "other");
     }
 }

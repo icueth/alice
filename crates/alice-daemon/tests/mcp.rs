@@ -258,6 +258,61 @@ async fn http_mcp_exposes_exactly_seven_tools_and_works() {
         .unwrap();
     assert_eq!(missing.is_error, Some(true));
 
+    // Spec §8.1: update_memory answers with the event id; changes are the client's (actor).
+    let updated = client
+        .call_tool(call(
+            "update_memory",
+            serde_json::json!({"id": id, "action": "edit", "importance": 5}),
+        ))
+        .await
+        .unwrap();
+    let updated: serde_json::Value = serde_json::from_str(&first_text(&updated)).unwrap();
+    let event = updated["event_id"].as_str().expect("event_id").to_string();
+    let asserted = client
+        .call_tool(call(
+            "assert_fact",
+            serde_json::json!({"subject": "alice", "predicate": "speaks", "object": "MCP"}),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(asserted.is_error, Some(true), "{}", first_text(&asserted));
+    // Final review D-m5: an `author` in the arguments is ignored; the session's client is it.
+    let spoofed = client
+        .call_tool(call(
+            "remember",
+            serde_json::json!({"content": "written as someone else", "author": {"agent": "cli"}}),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(spoofed.is_error, Some(true), "{}", first_text(&spoofed));
+    let history = d
+        .svc
+        .events(alice_core::api::EventsRequest::default())
+        .await
+        .unwrap();
+    let actor_of = |action: &str| {
+        history
+            .iter()
+            .find(|e| e.action == action)
+            .map(|e| e.actor.clone())
+            .unwrap_or_else(|| panic!("no {action} event in {history:?}"))
+    };
+    assert_eq!(actor_of("memory.create"), "agent:test-agent");
+    assert!(
+        history
+            .iter()
+            .filter(|e| e.action == "memory.create")
+            .all(|e| e.actor == "agent:test-agent"),
+        "{history:?}"
+    );
+    assert_eq!(actor_of("memory.edit"), "agent:test-agent");
+    assert_eq!(actor_of("relation.add"), "agent:test-agent");
+    assert!(
+        history
+            .iter()
+            .any(|e| e.id == event && e.action == "memory.edit")
+    );
+
     let mut prompts: Vec<String> = client
         .list_all_prompts()
         .await
@@ -838,4 +893,324 @@ async fn a_root_answer_that_predates_list_changed_is_not_kept() {
     assert!(saved.contains("in newside"), "{saved}");
     assert_eq!(agent.asked(), 2);
     client.cancel().await.unwrap();
+}
+
+/// A secret that `block` mode refuses reaches an MCP client as a tool error naming the detector.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_secret_is_a_tool_error_naming_the_detector() {
+    let (_d, _home, d) = daemon().await;
+    let mut change = serde_json::Map::new();
+    change.insert("privacy.redact_mode".into(), serde_json::json!("block"));
+    d.svc.settings_handle().patch(&change).unwrap();
+    let client = TestClient.serve(http_transport(&d)).await.unwrap();
+    let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let r = client
+        .call_tool(call(
+            "remember",
+            serde_json::json!({"content": format!("key {token}")}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.is_error, Some(true));
+    let text = first_text(&r);
+    assert!(
+        text.contains("github_token") && !text.contains(token),
+        "{text}"
+    );
+    client.cancel().await.ok();
+    d.stop().await;
+}
+
+const ADMIN: [&str; 4] = ["merge_memories", "review_list", "review_resolve", "stats"];
+
+async fn tool_names<C: ClientHandler>(
+    client: &rmcp::service::RunningService<RoleClient, C>,
+) -> Vec<String> {
+    let mut names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+fn set_admin(d: &Daemon, on: bool) {
+    let mut change = serde_json::Map::new();
+    change.insert("mcp.admin_tools".into(), serde_json::json!(on));
+    d.svc.settings_handle().patch(&change).unwrap();
+}
+
+/// R3: the switch is read at every request. Off: the four tools are neither listed nor
+/// callable (a call answers as for a tool that does not exist); on or off again takes effect
+/// in a session that is already open, without a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_tools_follow_the_setting_live_in_both_directions() {
+    let (_d, _home, d) = daemon().await;
+    let client = TestClient.serve(http_transport(&d)).await.unwrap();
+    assert_eq!(tool_names(&client).await.len(), 7, "off by default");
+    for name in ADMIN {
+        let err = client
+            .call_tool(call(name, serde_json::json!({})))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tool not found"), "{name}: {err}");
+    }
+
+    set_admin(&d, true);
+    let mut names = tool_names(&client).await;
+    assert_eq!(names.len(), 11, "{names:?}");
+    names.retain(|n| ADMIN.contains(&n.as_str()));
+    assert_eq!(names, ADMIN);
+    let stats = client
+        .call_tool(call("stats", serde_json::json!({})))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first_text(&stats)).unwrap();
+    assert_eq!(v["reviews_open"], 0, "{v}");
+    assert_eq!(v["judge_provider"], "heuristic");
+    // A new session sees them too.
+    let second = TestClient.serve(http_transport(&d)).await.unwrap();
+    assert_eq!(tool_names(&second).await.len(), 11);
+
+    set_admin(&d, false);
+    assert_eq!(
+        tool_names(&client).await.len(),
+        7,
+        "the open session loses them"
+    );
+    assert_eq!(tool_names(&second).await.len(), 7);
+    let err = client
+        .call_tool(call("stats", serde_json::json!({})))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tool not found"), "{err}");
+    // The seven core tools keep working throughout.
+    let r = client
+        .call_tool(call("context", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_ne!(r.is_error, Some(true));
+    client.cancel().await.ok();
+    second.cancel().await.ok();
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_admin_tools_list_resolve_merge_and_report() {
+    let (_d, _home, d) = daemon().await;
+    set_admin(&d, true);
+    let client = TestClient.serve(http_transport(&d)).await.unwrap();
+    // A conflicting undo puts an item in the inbox.
+    let r = d
+        .svc
+        .remember(alice_core::api::RememberRequest {
+            content: "first text".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let id = r.id.unwrap();
+    let edit = |body: &str| alice_core::api::UpdateRequest {
+        id: id.clone(),
+        update: alice_core::store::memories::MemoryUpdate {
+            body: Some(body.into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let first = d.svc.update(edit("second text")).await.unwrap();
+    d.svc.update(edit("third text")).await.unwrap();
+    let u = d
+        .svc
+        .undo(alice_core::api::UndoRequest {
+            event_id: first.event_id.unwrap(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let review = u.review_id.unwrap();
+
+    let listed = client
+        .call_tool(call("review_list", serde_json::json!({})))
+        .await
+        .unwrap();
+    let items: serde_json::Value = serde_json::from_str(&first_text(&listed)).unwrap();
+    assert_eq!(items[0]["id"], review.as_str(), "{items}");
+    assert_eq!(items[0]["choices"][0]["id"], "apply");
+    let bad = client
+        .call_tool(call(
+            "review_resolve",
+            serde_json::json!({"id": review, "choice": "merge"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad.is_error, Some(true));
+    assert!(
+        first_text(&bad).contains("apply, dismiss"),
+        "{}",
+        first_text(&bad)
+    );
+    let ok = client
+        .call_tool(call(
+            "review_resolve",
+            serde_json::json!({"id": review, "choice": "dismiss"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_text(&ok), "Resolved: dismiss.");
+    let evs = d
+        .svc
+        .events(alice_core::api::EventsRequest {
+            target_id: Some(review.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(evs[0].actor, "agent:test-agent", "the client is the author");
+
+    let mut ids = Vec::new();
+    for t in ["keep this", "duplicate of it"] {
+        let r = d
+            .svc
+            .remember(alice_core::api::RememberRequest {
+                content: t.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        ids.push(r.id.unwrap());
+    }
+    let merged = client
+        .call_tool(call(
+            "merge_memories",
+            serde_json::json!({"survivor": ids[0], "others": [ids[1]]}),
+        ))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first_text(&merged)).unwrap();
+    assert_eq!(v["merged"][0], ids[1].as_str(), "{v}");
+    let stats = client
+        .call_tool(call("stats", serde_json::json!({})))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first_text(&stats)).unwrap();
+    assert_eq!(
+        (
+            v["reviews_open"].as_u64(),
+            v["memories_by_status"]["trashed"].as_u64()
+        ),
+        (Some(0), Some(1)),
+        "{v}"
+    );
+    client.cancel().await.ok();
+    d.stop().await;
+}
+
+/// `alice mcp` asks the daemon for the switch (its ratchet and audit apply), follows a change in
+/// both directions, and fails closed when no daemon answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stdio_server_asks_the_daemon_for_the_admin_tools_and_fails_closed() {
+    let (_dir, home, d) = daemon().await;
+    let stdio = |home: AliceHome| {
+        let server = AliceMcp::new(Backend::Remote(Arc::new(
+            RemoteBackend::new(home, Launcher::None, None).with_admin_ttl(Duration::ZERO),
+        )));
+        async move {
+            let (a, b) = tokio::io::duplex(1 << 16);
+            tokio::spawn(async move { server.serve(a).await.unwrap().waiting().await });
+            TestClient.serve(b).await.unwrap()
+        }
+    };
+    let client = stdio(home.clone()).await;
+    assert_eq!(tool_names(&client).await.len(), 7);
+    let err = client
+        .call_tool(call("stats", serde_json::json!({})))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tool not found"), "{err}");
+
+    set_admin(&d, true);
+    assert_eq!(tool_names(&client).await.len(), 11);
+    let stats = client
+        .call_tool(call("stats", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_ne!(stats.is_error, Some(true), "{}", first_text(&stats));
+    assert!(first_text(&stats).contains("reviews_open"));
+
+    set_admin(&d, false);
+    assert_eq!(tool_names(&client).await.len(), 7);
+
+    // On, then the daemon goes away: the tools disappear with it.
+    set_admin(&d, true);
+    assert_eq!(tool_names(&client).await.len(), 11);
+    d.stop().await;
+    assert_eq!(tool_names(&client).await.len(), 7, "no daemon answers: off");
+    let err = client
+        .call_tool(call("review_list", serde_json::json!({})))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tool not found"), "{err}");
+    client.cancel().await.ok();
+}
+
+/// A stdio server over `home` whose answer about the admin tools is trusted for `ttl`.
+async fn stdio_with_ttl(
+    home: &AliceHome,
+    ttl: Duration,
+) -> rmcp::service::RunningService<rmcp::RoleClient, TestClient> {
+    let server = AliceMcp::new(Backend::Remote(Arc::new(
+        RemoteBackend::new(home.clone(), Launcher::None, None).with_admin_ttl(ttl),
+    )));
+    let (a, b) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move { server.serve(a).await.unwrap().waiting().await });
+    TestClient.serve(b).await.unwrap()
+}
+
+/// Inside its TTL `alice mcp` uses the daemon's last answer (a busy session does not ask on
+/// every request). The TTL is an hour, so the hit cannot be skipped by a slow machine.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stdio_server_uses_the_daemons_last_answer_inside_its_ttl() {
+    let (_dir, home, d) = daemon().await;
+    let client = stdio_with_ttl(&home, Duration::from_secs(3_600)).await;
+    assert_eq!(tool_names(&client).await.len(), 7, "asked: off");
+    set_admin(&d, true);
+    for _ in 0..3 {
+        assert_eq!(tool_names(&client).await.len(), 7, "a hit inside the TTL");
+    }
+    client.cancel().await.ok();
+    d.stop().await;
+}
+
+/// After its TTL the daemon is asked again. Polled to a deadline, not a fixed sleep.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stdio_server_asks_the_daemon_again_after_its_ttl() {
+    let (_dir, home, d) = daemon().await;
+    let ttl = Duration::from_secs(2);
+    let client = stdio_with_ttl(&home, ttl).await;
+    let asked = std::time::Instant::now();
+    assert_eq!(tool_names(&client).await.len(), 7, "asked: off");
+    set_admin(&d, true);
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    while tool_names(&client).await.len() != 11 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon was never asked again"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        asked.elapsed() >= ttl,
+        "seen before the TTL ran out: {:?}",
+        asked.elapsed()
+    );
+    client.cancel().await.ok();
+    d.stop().await;
 }

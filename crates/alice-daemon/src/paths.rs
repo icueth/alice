@@ -29,9 +29,45 @@ impl AliceHome {
         self.root.join("alice.db")
     }
     /// Base path of the vector index for `model`; the index itself is two files next to it
-    /// (`<model>.memories.usearch`, `<model>.chunks.usearch`).
+    /// (`<model>.memories.usearch`, an int8 HNSW, and `<model>.chunks.bq`, sign bits).
+    ///
+    /// A model id such as `ollama:nomic-embed-text` is not a file name: every character outside
+    /// `[A-Za-z0-9._-]` becomes `_`. When that changed the name, a short hash of the original id
+    /// is added, so two ids that differ only in such characters never share files (one model's
+    /// purge must not delete another's index).
+    ///
+    /// ```
+    /// use alice_daemon::paths::AliceHome;
+    /// let home = AliceHome::new("/h".into());
+    /// let plain = home.vector_file("multilingual-e5-small-q8");
+    /// assert!(plain.ends_with("vectors/multilingual-e5-small-q8.usearch"));
+    /// let remote = home.vector_file("ollama:nomic-embed-text");
+    /// let name = remote.file_name().unwrap().to_string_lossy().into_owned();
+    /// assert!(name.starts_with("ollama_nomic-embed-text-") && name.ends_with(".usearch"));
+    /// assert_ne!(remote, home.vector_file("ollama/nomic-embed-text"));
+    /// ```
     pub fn vector_file(&self, model: &str) -> PathBuf {
-        self.root.join("vectors").join(format!("{model}.usearch"))
+        let safe: String = model
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let name = if safe == model {
+            safe
+        } else {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in model.bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            format!("{safe}-{:08x}", h >> 32)
+        };
+        self.root.join("vectors").join(format!("{name}.usearch"))
     }
     pub fn models_dir(&self) -> PathBuf {
         self.root.join("models")
@@ -48,11 +84,30 @@ impl AliceHome {
     pub fn config_file(&self) -> PathBuf {
         self.root.join("config.toml")
     }
+    /// API keys when `secrets.backend = "file"` (the default); private to its owner (0600).
+    pub fn secrets_file(&self) -> PathBuf {
+        self.root.join("secrets.toml")
+    }
+    /// The `.alice.toml` rules in force per project and the tree each was read in, so a
+    /// restart, a new worktree or a removed checkout never loses them (0600).
+    pub fn project_rules_file(&self) -> PathBuf {
+        self.root.join("project-rules.json")
+    }
+    /// The global `[privacy]` settings last applied from a valid `config.toml`: a daemon that
+    /// starts while the file cannot be used keeps them in force (0600).
+    pub fn last_privacy_file(&self) -> PathBuf {
+        self.root.join("last-privacy.json")
+    }
     pub fn daemon_json(&self) -> PathBuf {
         self.root.join("daemon.json")
     }
     pub fn lock_file(&self) -> PathBuf {
         self.root.join("daemon.lock")
+    }
+    /// The pid and start time of the daemon that holds the lock, in a file anyone can read
+    /// (Windows locks are mandatory: the lock file itself cannot be read while held).
+    pub fn daemon_pid(&self) -> PathBuf {
+        self.root.join("daemon.pid")
     }
     /// Why the last daemon start failed (see `startup`).
     pub fn daemon_error(&self) -> PathBuf {
@@ -81,7 +136,10 @@ impl AliceHome {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
+            // Backups hold every memory: private even in a home an older build created.
+            for dir in [&self.root, &self.backups_dir()] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
         }
         Ok(())
     }
@@ -100,6 +158,21 @@ mod tests {
             home.vector_file("multilingual-e5-small"),
             d.path().join("home/vectors/multilingual-e5-small.usearch")
         );
+        // A model id with a colon is a legal file name on every platform.
+        let remote = home.vector_file("ollama:nomic-embed-text");
+        let name = remote.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("ollama_nomic-embed-text-") && name.ends_with(".usearch"),
+            "{name}"
+        );
+        assert!(!name.contains(':'));
+        assert_ne!(remote, home.vector_file("ollama_nomic-embed-text"));
+        assert_ne!(remote, home.vector_file("ollama/nomic-embed-text"));
+        assert_eq!(
+            remote,
+            home.vector_file("ollama:nomic-embed-text"),
+            "stable"
+        );
         home.ensure_dirs().unwrap();
         home.ensure_dirs().unwrap();
         for dir in [
@@ -113,14 +186,17 @@ mod tests {
         }
         for file in [
             home.config_file(),
+            home.secrets_file(),
             home.daemon_json(),
             home.lock_file(),
+            home.daemon_pid(),
             home.token_file(),
             home.daemon_error(),
             home.daemon_starting(),
         ] {
             assert_eq!(file.parent(), Some(home.root()));
         }
+        // Unix file modes (0700); Windows has no mode bits.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

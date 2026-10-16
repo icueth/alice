@@ -1,0 +1,75 @@
+{
+  "recorded": true,
+  "request": {
+    "model": "jev-1.13.0",
+    "questions": {
+      "r_1": {
+        "criteria": {
+          "answers": "the result answers the query",
+          "partially": "the result is about the query's subject but does not answer it",
+          "unrelated": "the result is not about the query"
+        },
+        "instructions": "How well does result 1 answer the query?",
+        "type": "choice"
+      },
+      "r_2": {
+        "criteria": {
+          "answers": "the result answers the query",
+          "partially": "the result is about the query's subject but does not answer it",
+          "unrelated": "the result is not about the query"
+        },
+        "instructions": "How well does result 2 answer the query?",
+        "type": "choice"
+      },
+      "r_3": {
+        "criteria": {
+          "answers": "the result answers the query",
+          "partially": "the result is about the query's subject but does not answer it",
+          "unrelated": "the result is not about the query"
+        },
+        "instructions": "How well does result 3 answer the query?",
+        "type": "choice"
+      }
+    },
+    "state": "Query: why did diary writes time out?\n\nResult 1 (written yesterday, kind note, importance normal, project alice):\nTitle: Writer lease held during mining\nSymptom: diary writes timed out after 120 s. Cause: the hub held the writer lease while mining. Fix: mining now runs off the writer.\n\nResult 2 (written three days ago, kind fact, importance normal, project alice):\nTitle: Spool directory\nWrites go to ~/.alice/spool when the daemon is down.\n\nResult 3 (written a week ago, kind preference, importance normal, project alice):\nTitle: Answer in Thai\nThe user wants answers in Thai.\n"
+  },
+  "response": {
+    "answers": {
+      "r_1": {
+        "choice": "answers",
+        "confidence": 1.0,
+        "probabilities": {
+          "answers": 1.0,
+          "partially": 0.0,
+          "unrelated": 0.0
+        },
+        "type": "choice"
+      },
+      "r_2": {
+        "choice": "unrelated",
+        "confidence": 0.62,
+        "probabilities": {
+          "answers": 0.0,
+          "partially": 0.25,
+          "unrelated": 0.75
+        },
+        "type": "choice"
+      },
+      "r_3": {
+        "choice": "unrelated",
+        "confidence": 1.0,
+        "probabilities": {
+          "answers": 0.0,
+          "partially": 0.0,
+          "unrelated": 1.0
+        },
+        "type": "choice"
+      }
+    },
+    "model": "jev-1.13.0",
+    "usage": {
+      "input_tokens": 664,
+      "output_tokens": 130
+    }
+  }
+}

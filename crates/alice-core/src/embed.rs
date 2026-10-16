@@ -3,12 +3,84 @@
 use crate::error::Result;
 use crate::normalize::{nfc, truncate_chars};
 
+/// Why a query was not embedded: a local model unloaded after an idle period is loading again
+/// (search then uses word matches). Embedders put it at the start of that error's text.
+pub const MODEL_LOADING: &str =
+    "the embedding model is loading after an idle period; this search used word matches only";
+
 pub trait Embedder: Send + Sync {
     /// Identifier stored with each vector, e.g. `multilingual-e5-small`.
     fn model_id(&self) -> &str;
     fn dim(&self) -> usize;
     fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     fn embed_query(&self, text: &str) -> Result<Vec<f32>>;
+    /// False while a model that was unloaded after an idle period is being loaded again.
+    fn is_loaded(&self) -> bool {
+        true
+    }
+    /// Most texts one `embed_passages` call may be given. A remote embedder sends one request
+    /// per call, and the caller asks the cloud policy once before each call, so every caller
+    /// cuts its batches to this.
+    fn max_batch(&self) -> usize {
+        usize::MAX
+    }
+    /// True when texts leave this machine to be embedded (an HTTP provider whose endpoint is
+    /// not the local host). The daemon then sends a text only if the cloud policy allows its
+    /// project (`SettingsHandle::cloud_allowed`); a local embedder never asks.
+    fn is_remote(&self) -> bool {
+        false
+    }
+    /// Why this embedder cannot work right now, if it cannot (a stand-in for a provider that
+    /// was unreachable at start); shown in the daemon's health.
+    fn problem(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Stands in for the embedder of a model whose provider could not be reached when the daemon
+/// started: the model's vectors and index stay in use for search, every embedding fails as
+/// "unavailable" (texts stay queued, queries use word matches), and the daemon replaces it as
+/// soon as the real embedder can be built.
+pub struct UnavailableEmbedder {
+    id: String,
+    dim: usize,
+    remote: bool,
+    reason: String,
+}
+
+impl UnavailableEmbedder {
+    pub fn new(id: impl Into<String>, dim: usize, remote: bool, reason: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            dim,
+            remote,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl Embedder for UnavailableEmbedder {
+    fn model_id(&self) -> &str {
+        &self.id
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn embed_passages(&self, _: &[String]) -> Result<Vec<Vec<f32>>> {
+        Err(crate::error::AliceError::Unavailable(self.reason.clone()))
+    }
+    fn embed_query(&self, _: &str) -> Result<Vec<f32>> {
+        Err(crate::error::AliceError::Unavailable(format!(
+            "{}; this search used word matches only",
+            self.reason
+        )))
+    }
+    fn is_remote(&self) -> bool {
+        self.remote
+    }
+    fn problem(&self) -> Option<String> {
+        Some(self.reason.clone())
+    }
 }
 
 /// Text embedded for a memory: title and body, bounded so the model's 512-token window is not exceeded badly.
@@ -31,11 +103,17 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// Texts that share many trigrams get high cosine similarity. No model download.
 pub struct FakeEmbedder {
     dim: usize,
+    id: String,
 }
 
 impl FakeEmbedder {
     pub fn new(dim: usize) -> Self {
-        Self { dim }
+        Self::named("fake", dim)
+    }
+
+    /// A fake whose vectors are stored under the model id `id` (tests of a model switch).
+    pub fn named(id: impl Into<String>, dim: usize) -> Self {
+        Self { dim, id: id.into() }
     }
 
     fn vector(&self, text: &str) -> Vec<f32> {
@@ -72,7 +150,7 @@ impl FakeEmbedder {
 
 impl Embedder for FakeEmbedder {
     fn model_id(&self) -> &str {
-        "fake"
+        &self.id
     }
     fn dim(&self) -> usize {
         self.dim
@@ -122,5 +200,27 @@ mod tests {
         let t = memory_embed_text("title", &"x".repeat(10_000));
         assert!(t.chars().count() <= 2_001);
         assert!(t.starts_with("title\n"));
+    }
+    #[test]
+    fn a_named_fake_stores_its_vectors_under_its_own_id() {
+        let e = FakeEmbedder::named("ollama:nomic-embed-text", 64);
+        assert_eq!((e.model_id(), e.dim()), ("ollama:nomic-embed-text", 64));
+        assert_eq!(FakeEmbedder::new(8).model_id(), "fake");
+        assert!(!e.is_remote() && e.problem().is_none());
+    }
+
+    #[test]
+    fn a_stand_in_embedder_fails_as_unavailable_and_says_why() {
+        let e = UnavailableEmbedder::new("openai:m", 3, true, "cannot reach the provider");
+        assert_eq!(
+            (e.model_id(), e.dim(), e.is_remote()),
+            ("openai:m", 3, true)
+        );
+        assert_eq!(e.problem().as_deref(), Some("cannot reach the provider"));
+        use crate::error::AliceError;
+        let err = e.embed_passages(&["x".into()]).unwrap_err();
+        assert!(matches!(&err, AliceError::Unavailable(m) if m.contains("cannot reach")));
+        let err = e.embed_query("x").unwrap_err();
+        assert!(matches!(&err, AliceError::Unavailable(m) if m.contains("word matches only")));
     }
 }

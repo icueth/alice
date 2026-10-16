@@ -1,5 +1,6 @@
 //! `alice daemon run`: single instance, token, discovery file, HTTP server, spool drain, clean shutdown.
 
+use crate::config::SettingsHandle;
 use crate::discovery::{DaemonInfo, load_or_create_token, read_info, remove_info_if, write_info};
 use crate::paths::AliceHome;
 use crate::service::{Service, ServiceOptions};
@@ -29,13 +30,15 @@ const GRACE: Duration = Duration::from_secs(2);
 const DRAIN_EVERY: Duration = Duration::from_secs(5);
 /// Download progress is written to daemon.starting at most this often.
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(1);
-
 #[derive(Debug, Clone, Default)]
 pub struct DaemonOptions {
-    /// 0 = pick a free port.
+    /// 0 = the `server.port` setting (itself 0 = pick a free port).
     pub port: u16,
     /// Tests and CI: deterministic embeddings, no model download (`ALICE_EMBEDDER=fake`).
     pub fake_embedder: bool,
+    /// The `ALICE_*` variables the settings see; `None`: the process's. Tests pass an empty
+    /// list so a developer's shell cannot change them.
+    pub settings_env: Option<Vec<(String, String)>>,
 }
 
 /// The single-instance lock, or `None` when another daemon holds it.
@@ -65,21 +68,53 @@ fn acquire_lock(home: &AliceHome) -> std::io::Result<Option<File>> {
     }
 }
 
-pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
-    crate::install_tls();
-    home.ensure_dirs()?;
-    let Some(mut lock) = acquire_lock(&home)? else {
-        eprintln!(
-            "alice daemon is already running for {}",
-            home.root().display()
-        );
-        return Ok(());
+/// The single-instance lock if it is free right now (no waiting); `None` when a daemon holds
+/// it. `alice restore` holds it while it swaps `alice.db`, so no daemon can start meanwhile.
+pub fn try_lock_home(home: &AliceHome) -> std::io::Result<Option<File>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.lock_file())?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Take the lock and announce it at once: the pid into the lock file and `daemon.pid` (replacing
+/// a stale one), before any slow step of starting. Where a held lock file cannot be read
+/// (Windows) a client finds a starting daemon through `daemon.pid`, so it must not wait for the
+/// sweep or the model.
+fn take_and_announce(home: &AliceHome) -> anyhow::Result<Option<File>> {
+    let Some(mut lock) = acquire_lock(home)? else {
+        return Ok(None);
     };
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
     // Whatever daemon.json exists now is stale (its writer no longer holds the lock): drop it
     // before the slow part of starting, so no client pings a port that may be someone else's.
     let _ = std::fs::remove_file(home.daemon_json());
+    if let Err(e) = startup::write_pid_file(home) {
+        tracing::warn!(error = %e, "cannot write daemon.pid; clients may not see this daemon while it starts");
+    }
+    Ok(Some(lock))
+}
+
+pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
+    crate::install_tls();
+    home.ensure_dirs()?;
+    let Some(lock) = take_and_announce(&home)? else {
+        eprintln!(
+            "alice daemon is already running for {}",
+            home.root().display()
+        );
+        return Ok(());
+    };
+    // A killed `alice restore` may have left its staged files; none runs while we hold the lock.
+    crate::restore::sweep_staged(&home);
     // A new attempt: the last failed start's reason no longer applies.
     startup::clear_error(&home);
     // Always printed (not subject to ALICE_LOG): process tests count this line to prove a single instance.
@@ -102,6 +137,7 @@ pub fn run(home: AliceHome, opts: DaemonOptions) -> anyhow::Result<()> {
             tracing::warn!(error = %w, "cannot write daemon.error");
         }
     }
+    startup::clear_pid_file(&home);
     drop(lock);
     result
 }
@@ -174,26 +210,66 @@ fn start_and_serve(
         .enable_all()
         .build()?;
     let models = home.models_dir();
-    if !opts.fake_embedder && !alice_embed::is_model_present(&models) {
-        fetch_model(home, &runtime)?;
-    }
     let _ = startup::write_progress(
         home,
         &startup::StartProgress::step("opening the database and loading the embedding model"),
     );
+    // The settings come first: the model's idle unload and the port are read from them.
+    let settings = match &opts.settings_env {
+        Some(env) => SettingsHandle::load_with_env(home, env.clone()),
+        None => SettingsHandle::load(home),
+    };
+    let started = settings.get();
+    // The local model is downloaded when it is the one asked for (a remote provider needs none).
+    if !opts.fake_embedder
+        && started.embedding.provider == alice_core::settings::EmbeddingProvider::Local
+        && !alice_embed::is_model_present(&models)
+    {
+        fetch_model(home, &runtime)?;
+    }
+    // `embedding.idle_unload` (0 keeps the local model loaded) reaches the model through the
+    // factory; queries use word matches while a model unloaded for being idle reloads.
+    let port = if opts.port != 0 {
+        opts.port
+    } else {
+        started.server.port
+    };
     let fake = opts.fake_embedder;
-    let make = move || -> alice_core::Result<Arc<dyn Embedder>> {
-        if fake {
-            Ok(Arc::new(FakeEmbedder::new(384)))
-        } else {
-            Ok(Arc::new(alice_embed::FastEmbedder::new(&models)?))
+    // The factory builds embedders from `[embedding]`: the local model or an HTTP provider.
+    // Without it (the fake embedder) nothing switches.
+    let factory = (!fake).then(|| alice_embed::factory(models.clone()));
+    // What `Service::start` falls back to when the model in force cannot be built: the
+    // built-in model (or the fake one).
+    let make = {
+        let factory = factory.clone();
+        let embedding = started.embedding.clone();
+        move || -> alice_core::Result<Arc<dyn Embedder>> {
+            match &factory {
+                None => Ok(Arc::new(FakeEmbedder::new(384))),
+                Some(f) => {
+                    let mut s = embedding.clone();
+                    s.provider = alice_core::settings::EmbeddingProvider::Local;
+                    s.model = alice_embed::MODEL_ID.to_string();
+                    s.endpoint = None;
+                    f(&s, None)
+                }
+            }
         }
     };
-    let svc = Service::start(home.clone(), &make, ServiceOptions::default())
-        .map_err(|e| start_error(home, e))?;
+    let svc = Service::start(
+        home.clone(),
+        &make,
+        ServiceOptions {
+            settings: Some(settings),
+            embedder_factory: factory,
+            // The daemon reads the real environment (the secrets' status shows a variable).
+            ..ServiceOptions::process_env()
+        },
+    )
+    .map_err(|e| start_error(home, e))?;
 
     let ct = CancellationToken::new();
-    let served = runtime.block_on(serve(home, &svc, token, opts.port, ct.clone(), published));
+    let served = runtime.block_on(serve(home, &svc, token, port, ct.clone(), published));
     ct.cancel();
     // Drop whatever still runs (a request past the grace period, a drain in progress) so that
     // nothing reaches the writer after it stops; such a client sees a closed connection and
@@ -303,4 +379,40 @@ async fn stop_on_signal(ct: CancellationToken) {
     #[cfg(not(unix))]
     interrupted().await;
     ct.cancel();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A starting daemon is visible through `daemon.pid` as soon as it holds the lock, before the
+    /// sweep of a killed restore's files (the first slow step of starting) has run.
+    #[test]
+    fn a_daemon_announces_itself_before_its_first_slow_step() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        home.ensure_dirs().unwrap();
+        // A pid file left by a daemon that was killed, and a file a killed restore left.
+        std::fs::write(
+            home.daemon_pid(),
+            serde_json::json!({"pid": 999_999, "unix_ms": 1}).to_string(),
+        )
+        .unwrap();
+        let staged = home.root().join(".alice-restore.tmp");
+        std::fs::write(&staged, b"x").unwrap();
+        std::fs::write(home.daemon_json(), b"{\"stale\": true}").unwrap();
+        let lock = take_and_announce(&home).unwrap().expect("the lock is free");
+        assert!(
+            !home.daemon_json().exists(),
+            "a stale daemon.json is dropped first"
+        );
+        let rec = startup::read_pid_file(&home).unwrap();
+        assert_eq!(rec.pid, std::process::id(), "the stale record is replaced");
+        assert!(rec.unix_ms > 1);
+        assert_eq!(startup::lock_pid(&home), Some(std::process::id()));
+        assert!(staged.exists(), "announced before the sweep ran");
+        // A second daemon does not take it, and leaves the record alone.
+        assert!(try_lock_home(&home).unwrap().is_none());
+        drop(lock);
+    }
 }

@@ -23,16 +23,18 @@ hex = "0.4.3"
 unicode-normalization = "0.1.25"
 regex = "1.13.1"
 parking_lot = "0.12.5"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 tracing = "0.1.44"
 tempfile = "3.27.0"
 half = "2.7.1"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "fs", "io-util"] }
 fastembed = { version = "7.1.1", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "api-24", "download-binaries", "tls-rustls"] }
+spm_precompiled = "0.1.4"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "stream", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures = "0.3.34"
-usearch = "2.26.4"
+usearch = { version = "2.26.4", default-features = false }
 crossbeam-channel = "0.5.17"
 dirs = "7.0.0"
 axum = "0.8.9"
@@ -42,8 +44,13 @@ hmac = "0.13.0"
 rmcp = { version = "3.5.1", features = ["server", "macros", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
 url = "2.5.8"
 libc = "0.2.190"
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_System_Threading"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+toml = "1.1.8"
+toml_edit = "0.25.17"
+keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
+strsim = "0.11.1"
 
 [profile.release]
 lto = "thin"

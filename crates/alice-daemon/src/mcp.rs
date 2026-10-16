@@ -8,13 +8,15 @@ use crate::paths::AliceHome;
 use crate::service::Service;
 use alice_core::api::*;
 use alice_core::error::AliceError;
+use alice_core::model::Author;
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ListResourcesResult, PaginatedRequestParams,
-    PromptMessage, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, Role, ServerCapabilities, ServerConfig,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+    Implementation, ListResourcesResult, ListToolsResult, PaginatedRequestParams, PromptMessage,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResultType, Role, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::streamable_http_server::{
@@ -44,6 +46,10 @@ pub const INSTRUCTIONS: &str = "Alice is your long-term memory, shared with the 
 
 /// How long a read waits for a daemon that is starting.
 const READ_WAIT: Duration = Duration::from_secs(5);
+/// The tools that are offered only while `mcp.admin_tools` is on.
+const ADMIN_TOOLS: [&str; 4] = ["review_list", "review_resolve", "merge_memories", "stats"];
+/// How long `alice mcp` trusts the daemon's last answer about the admin-tools switch.
+const ADMIN_SWITCH_TTL: Duration = Duration::from_secs(1);
 /// How long the client gets to answer `roots/list`.
 const ROOTS_TIMEOUT: Duration = Duration::from_millis(300);
 
@@ -52,6 +58,10 @@ pub struct RemoteBackend {
     launcher: Launcher,
     cwd: Option<String>,
     client: tokio::sync::Mutex<Option<DaemonClient>>,
+    /// The daemon's last answer about `mcp.admin_tools`, and when it came.
+    admin_switch: parking_lot::Mutex<Option<(std::time::Instant, bool)>>,
+    /// How long that answer is trusted.
+    admin_ttl: Duration,
 }
 
 impl RemoteBackend {
@@ -61,7 +71,42 @@ impl RemoteBackend {
             launcher,
             cwd,
             client: tokio::sync::Mutex::new(None),
+            admin_switch: parking_lot::Mutex::new(None),
+            admin_ttl: ADMIN_SWITCH_TTL,
         }
+    }
+
+    /// Trust the daemon's answer about the admin tools for `ttl` (tests use zero).
+    pub fn with_admin_ttl(mut self, ttl: Duration) -> Self {
+        self.admin_ttl = ttl;
+        self
+    }
+
+    /// `mcp.admin_tools` as the running daemon has it (its ratchet and its audit apply), asked
+    /// at most once per `admin_ttl`. No daemon, or one that does not answer: off. This never
+    /// starts a daemon.
+    async fn admin_tools(&self) -> bool {
+        if let Some((at, on)) = *self.admin_switch.lock()
+            && at.elapsed() < self.admin_ttl
+        {
+            return on;
+        }
+        // The answer is as old as the moment the question was asked, not the moment it came
+        // back: a slow answer must not look fresh for a whole `admin_ttl` more.
+        let asked = std::time::Instant::now();
+        // The small flags endpoint (no read of the secrets' status, a short timeout), not the
+        // whole settings view.
+        let on = match DaemonClient::try_existing(&self.home).await {
+            Some(c) => c.admin_tools_flag().await.unwrap_or(false),
+            None => false,
+        };
+        *self.admin_switch.lock() = Some((asked, on));
+        on
+    }
+
+    /// The last answer, without asking again (off before the first).
+    fn admin_tools_cached(&self) -> bool {
+        self.admin_switch.lock().is_some_and(|(_, on)| on)
     }
 
     /// Connect lazily (keeps `alice mcp` start-up fast). A cached client is re-checked with
@@ -96,6 +141,45 @@ impl Backend {
         match self {
             Backend::Local(_) => None,
             Backend::Remote(r) => r.cwd.clone(),
+        }
+    }
+    /// Whether the admin tools are on right now: the daemon's live setting, which `alice mcp`
+    /// asks the daemon for (off when none answers). Asked per request.
+    async fn admin_tools(&self) -> bool {
+        match self {
+            Backend::Local(s) => s.settings().mcp.admin_tools,
+            Backend::Remote(b) => b.admin_tools().await,
+        }
+    }
+    /// [`admin_tools`](Self::admin_tools) without waiting for an answer (`get_tool` is not async).
+    fn admin_tools_cached(&self) -> bool {
+        match self {
+            Backend::Local(s) => s.settings().mcp.admin_tools,
+            Backend::Remote(b) => b.admin_tools_cached(),
+        }
+    }
+    async fn reviews(&self, q: ReviewQuery) -> AliceResult<Vec<ReviewItem>> {
+        match self {
+            Backend::Local(s) => s.reviews(q).await,
+            Backend::Remote(b) => b.client(READ_WAIT).await?.reviews(&q).await,
+        }
+    }
+    async fn resolve_review(&self, r: ResolveRequest) -> AliceResult<ResolveResponse> {
+        match self {
+            Backend::Local(s) => s.resolve_review(r).await,
+            Backend::Remote(b) => b.client(READ_WAIT).await?.resolve_review(&r).await,
+        }
+    }
+    async fn merge(&self, r: MergeRequest) -> AliceResult<MergeResponse> {
+        match self {
+            Backend::Local(s) => s.merge(r).await,
+            Backend::Remote(b) => b.client(READ_WAIT).await?.merge(&r).await,
+        }
+    }
+    async fn stats(&self) -> AliceResult<Stats> {
+        match self {
+            Backend::Local(s) => s.stats().await,
+            Backend::Remote(b) => b.client(READ_WAIT).await?.stats().await,
         }
     }
     async fn recall(&self, r: RecallRequest) -> AliceResult<RecallResponse> {
@@ -221,10 +305,19 @@ impl AliceMcp {
     pub fn new(backend: Backend) -> Self {
         Self {
             backend,
-            tool_router: Self::tool_router(),
+            // Every tool is routed; the admin ones are listed and callable only while the
+            // setting is on (see `admin_visible`).
+            tool_router: Self::tool_router() + Self::admin_tool_router(),
             prompt_router: Self::prompt_router(),
             roots: Default::default(),
         }
+    }
+
+    /// Whether `tool` may be called now: every tool but the admin ones always; those only while
+    /// `mcp.admin_tools` is on, read at each request so a change applies to connections that
+    /// are already open.
+    async fn tool_allowed(&self, tool: &str) -> bool {
+        !ADMIN_TOOLS.contains(&tool) || self.backend.admin_tools().await
     }
 
     /// Working directory for project detection (spec §8.1): the client's first root when it
@@ -282,12 +375,19 @@ impl AliceMcp {
         };
         name.filter(|n| !n.trim().is_empty())
     }
+
+    /// Who an MCP write is recorded as: always the session's client (an `author` in the
+    /// arguments is ignored, so an agent cannot pass itself off as the person or as another
+    /// agent), and `unknown` for a client without a name (final review D-m5).
+    fn author(ctx: &RequestContext<RoleServer>) -> String {
+        Self::agent(ctx).unwrap_or_else(|| "unknown".into())
+    }
 }
 
 #[tool_router]
 impl AliceMcp {
     #[tool(
-        description = "Search long-term memory: decisions, bug fixes, facts, how-tos, preferences and past work. Use before answering about anything done before.",
+        description = "Search long-term memory: decisions, bug fixes, facts, how-tos, preferences and past work. Use before answering about anything done before. By default a configured model judge (judge.provider = jev) grades the top results, so recall is precise (slower, about half a second); pass mode \"fast\" to skip the judge, or mode \"precise\" to force it. In json format each result has `score` (the search's fusion score, which does not follow the judge's order) and, when the judge graded it, `relevance`; `low_confidence` is true when the judge found nothing that clearly answers (a note says so in either format).",
         annotations(read_only_hint = true)
     )]
     async fn recall(
@@ -313,9 +413,7 @@ impl AliceMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         req.cwd = self.cwd(&ctx).await;
-        if req.author.agent.is_none() {
-            req.author.agent = Self::agent(&ctx);
-        }
+        req.author.agent = Some(Self::author(&ctx));
         Ok(match self.backend.remember(req).await {
             Ok(r) => match (r.status, r.id) {
                 (RememberStatus::Spooled, _) => text(queued_text(r.reason.as_deref())),
@@ -364,8 +462,11 @@ impl AliceMcp {
     )]
     async fn update_memory(
         &self,
-        Parameters(req): Parameters<UpdateRequest>,
+        Parameters(mut req): Parameters<UpdateRequest>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // The change is the client's: history records it as `agent:<client name>`.
+        req.author.agent = Some(Self::author(&ctx));
         Ok(match self.backend.update(req).await {
             Ok(r) => json(&r),
             Err(e) => tool_err(e),
@@ -391,9 +492,112 @@ impl AliceMcp {
     )]
     async fn assert_fact(
         &self,
-        Parameters(req): Parameters<AssertFactRequest>,
+        Parameters(mut req): Parameters<AssertFactRequest>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        req.author.agent = Some(Self::author(&ctx));
         Ok(match self.backend.assert_fact(req).await {
+            Ok(r) => json(&r),
+            Err(e) => tool_err(e),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResolveArgs {
+    /// The review item's id (from `review_list`).
+    pub id: String,
+    /// One of the item's `choices`.
+    pub choice: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MergeArgs {
+    /// The memory that stays.
+    pub survivor: String,
+    /// Memories that become its duplicates.
+    pub others: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct NoArgs {}
+
+#[tool_router(router = admin_tool_router)]
+impl AliceMcp {
+    #[tool(
+        description = "List review items Alice could not decide alone (duplicates, updates, contradictions), with their choices. Items span all projects.",
+        annotations(read_only_hint = true)
+    )]
+    async fn review_list(
+        &self,
+        Parameters(q): Parameters<ReviewQuery>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(match self.backend.reviews(q).await {
+            Ok(r) => json(&r),
+            Err(e) => tool_err(e),
+        })
+    }
+
+    #[tool(description = "Resolve a review item with one of its choices.")]
+    async fn review_resolve(
+        &self,
+        Parameters(a): Parameters<ResolveArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let author = Author {
+            agent: Self::agent(&ctx),
+            ..Default::default()
+        };
+        Ok(
+            match self
+                .backend
+                .resolve_review(ResolveRequest {
+                    id: a.id,
+                    choice: a.choice,
+                    author,
+                })
+                .await
+            {
+                Ok(r) => text(r.message),
+                Err(e) => tool_err(e),
+            },
+        )
+    }
+
+    #[tool(
+        description = "Merge duplicate memories into one survivor; the others are trashed and point to it."
+    )]
+    async fn merge_memories(
+        &self,
+        Parameters(a): Parameters<MergeArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let author = Author {
+            agent: Self::agent(&ctx),
+            ..Default::default()
+        };
+        Ok(
+            match self
+                .backend
+                .merge(MergeRequest {
+                    survivor: a.survivor,
+                    others: a.others,
+                    author,
+                })
+                .await
+            {
+                Ok(r) => json(&r),
+                Err(e) => tool_err(e),
+            },
+        )
+    }
+
+    #[tool(
+        description = "Memory counts, review backlog, judge backlog and costs.",
+        annotations(read_only_hint = true)
+    )]
+    async fn stats(&self, Parameters(_): Parameters<NoArgs>) -> Result<CallToolResult, McpError> {
+        Ok(match self.backend.stats().await {
             Ok(r) => json(&r),
             Err(e) => tool_err(e),
         })
@@ -441,6 +645,51 @@ impl ServerHandler for AliceMcp {
         )
         .with_server_info(Implementation::new("alice", env!("CARGO_PKG_VERSION")))
         .with_instructions(INSTRUCTIONS)
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        // Off: an admin tool answers as a tool that does not exist.
+        if !self.tool_allowed(&request.name).await {
+            return Err(McpError::invalid_params("tool not found", None));
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let cache_hints = context
+            .protocol_version()
+            .is_some_and(|v| v >= ProtocolVersion::V_2026_07_28);
+        let admin = self.backend.admin_tools().await;
+        let tools = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|t| admin || !ADMIN_TOOLS.contains(&t.name.as_ref()))
+            .collect();
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: cache_hints.then_some(0),
+            cache_scope: cache_hints.then_some(CacheScope::Public),
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        if ADMIN_TOOLS.contains(&name) && !self.backend.admin_tools_cached() {
+            return None;
+        }
+        self.tool_router.get(name).cloned()
     }
 
     async fn list_resources(

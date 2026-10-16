@@ -13,9 +13,12 @@ use crate::spool::{self, SpoolEntry};
 use crate::startup;
 use alice_core::api::*;
 use alice_core::error::{AliceError, Result};
+use alice_core::redact::Redactor;
+use alice_core::settings::{ProjectSettings, load_project};
 use alice_core::store::kg::FactOutcome;
 use alice_core::store::memories::{self, NewMemoryInput};
 use alice_core::store::projects::ResolvedProject;
+use alice_core::store::reviews::ReviewStatus;
 use alice_core::store::sources::IngestOutcome;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -24,8 +27,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// How long a maintenance job or a backup requested by hand may take.
+const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(3 * 3_600);
 /// A daemon that does not answer the ping this fast counts as absent.
 const PING_TIMEOUT: Duration = Duration::from_millis(300);
+/// How long `alice mcp` waits for the daemon's answer about the admin-tools switch.
+const FLAGS_TIMEOUT: Duration = Duration::from_millis(800);
 /// How long a write waits for a starting daemon before it is spooled.
 pub(crate) const WRITE_WAIT: Duration = Duration::from_millis(1_500);
 /// How often `connect` looks for the daemon it started.
@@ -47,6 +54,8 @@ pub struct DaemonClient {
     http: reqwest::Client,
     base: String,
     token: String,
+    /// How long a recall may take under this home's settings (see `config::recall_wait`).
+    recall_wait: Duration,
     /// The instance that proved the token; `is_live` checks the daemon is still that one.
     instance: String,
 }
@@ -210,11 +219,30 @@ fn error_from(status: reqwest::StatusCode, body: &serde_json::Value) -> AliceErr
     }
 }
 
+/// A name that goes into a URL path (a secret, a provider): letters, digits, `_` and `-` only.
+fn path_word(word: &str) -> Result<&str> {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        Ok(word)
+    } else {
+        // Not echoed: it may be a secret typed where the name goes.
+        Err(AliceError::invalid(
+            "that is not a name; use letters, digits, _ and - only (see `alice config list`)",
+        ))
+    }
+}
+
 /// Detach so the daemon survives the caller (agent hooks, shims, terminals).
 pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> std::io::Result<u32> {
     spawn_detached_with_env(exe, args, log, &[])
 }
 
+// `MallocLargeCache=0` (macOS) is deliberately not set for the daemon, here or in the service files:
+// it frees ~216 MB while loaded but halves the bulk embedding rate (docs/benchmarks/m2.md,
+// "macOS MallocLargeCache=0"), and the 800 MB budget is met without it.
 fn spawn_detached_with_env(
     exe: &Path,
     args: &[&str],
@@ -258,13 +286,60 @@ fn spawn_detached_with_env(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
-    let mut child = cmd.spawn()?;
+    // A program written a moment ago can be "busy" (ETXTBSY) while another thread's fork still
+    // holds a copy of its write handle; that ends at the fork's exec, so retry briefly.
+    let mut child = {
+        let mut tries = 0;
+        loop {
+            match cmd.spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 40 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                other => break other?,
+            }
+        }
+    };
     let pid = child.id();
     // Reap it if it exits while we are alive (no zombie); does not keep it attached.
     std::thread::spawn(move || {
         let _ = child.wait();
     });
     Ok(pid)
+}
+
+/// The query string of `GET /api/v1/reviews` for `q` (empty when `q` sets nothing).
+fn review_query_string(q: &ReviewQuery) -> String {
+    let mut qs = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(s) = q.status {
+        qs.append_pair(
+            "status",
+            match s {
+                ReviewStatus::Open => "open",
+                ReviewStatus::Resolved => "resolved",
+            },
+        );
+    }
+    if let Some(t) = q.review_type {
+        qs.append_pair("review_type", t.as_str());
+    }
+    if let Some(b) = &q.before {
+        qs.append_pair("before", b);
+    }
+    if let Some(l) = q.limit {
+        qs.append_pair("limit", &l.to_string());
+    }
+    if let Some(o) = q.offset {
+        qs.append_pair("offset", &o.to_string());
+    }
+    qs.finish()
+}
+
+/// `id` as one URL path segment.
+fn path_segment(id: &str) -> String {
+    url::form_urlencoded::byte_serialize(id.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20")
 }
 
 /// `ALICE_HOME` for a daemon this client starts. The daemon runs from `/`, so a relative home
@@ -290,6 +365,7 @@ impl DaemonClient {
                 http: http.clone(),
                 base,
                 token,
+                recall_wait: crate::config::recall_wait_for(home),
                 instance: info.instance,
             })
     }
@@ -318,6 +394,13 @@ impl DaemonClient {
         let Launcher::Exe(exe) = launcher else {
             return Err(Unavailable::NotRunning);
         };
+        // `alice restore` holds the daemon lock for the swap: a daemon started now would only
+        // wait for it. Writes spool at once instead of waiting for one.
+        if crate::restore::in_progress(home) {
+            return Err(Unavailable::Starting(Some(
+                "being replaced by `alice restore`".into(),
+            )));
+        }
         let since = startup::unix_ms();
         // The daemon reads its home from ALICE_HOME: make it serve the one we wait on.
         let child = spawn_detached_with_env(
@@ -349,10 +432,13 @@ impl DaemonClient {
             }
             if Instant::now() >= deadline {
                 return Err(match failed {
-                    Some(e) => Unavailable::StartFailed(e.error),
-                    None => {
-                        Unavailable::Starting(startup::read_progress(home).map(|p| p.describe()))
+                    // An error from before this call belongs to an earlier daemon. While a live
+                    // process holds the lock, that one is starting (slowly): say what it does,
+                    // not why its predecessor failed.
+                    Some(e) if startup::lock_holder(home).is_none() => {
+                        Unavailable::StartFailed(e.error)
                     }
+                    _ => Unavailable::Starting(startup::read_progress(home).map(|p| p.describe())),
                 });
             }
         }
@@ -419,8 +505,10 @@ impl DaemonClient {
         self.call("/api/v1/remember", r, Duration::from_secs(5))
             .await
     }
+    /// Waits as long as a precise recall may legitimately take under this home's settings
+    /// (`search.precise_timeout_ms` and the query embedding on top of the search), at least 5 s.
     pub async fn recall(&self, r: &RecallRequest) -> Result<RecallResponse> {
-        self.call("/api/v1/recall", r, Duration::from_secs(5)).await
+        self.call("/api/v1/recall", r, self.recall_wait).await
     }
     pub async fn context(&self, r: &ContextRequest) -> Result<ContextResponse> {
         self.call("/api/v1/context", r, Duration::from_secs(3))
@@ -443,6 +531,228 @@ impl DaemonClient {
     pub async fn ingest(&self, r: &IngestRequest) -> Result<IngestOutcome> {
         self.call("/api/v1/ingest", r, Duration::from_secs(30))
             .await
+    }
+    /// Recorded changes, newest first.
+    pub async fn events(&self, q: &EventsRequest) -> Result<Vec<EventRow>> {
+        let mut qs = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in [
+            ("target_id", q.target_id.clone()),
+            ("actor", q.actor.clone()),
+            ("before", q.before.clone()),
+            ("limit", q.limit.map(|l| l.to_string())),
+        ] {
+            if let Some(v) = value {
+                qs.append_pair(key, &v);
+            }
+        }
+        let qs = qs.finish();
+        if qs.is_empty() {
+            self.get_json("/api/v1/events").await
+        } else {
+            self.get_json(&format!("/api/v1/events?{qs}")).await
+        }
+    }
+    pub async fn undo(&self, r: &UndoRequest) -> Result<UndoResponse> {
+        self.call("/api/v1/undo", r, Duration::from_secs(10)).await
+    }
+    /// Review items, newest first (open ones unless the query says otherwise).
+    pub async fn reviews(&self, q: &ReviewQuery) -> Result<Vec<ReviewItem>> {
+        let qs = review_query_string(q);
+        if qs.is_empty() {
+            self.get_json("/api/v1/reviews").await
+        } else {
+            self.get_json(&format!("/api/v1/reviews?{qs}")).await
+        }
+    }
+    /// Open items in all and by type, narrowed to a type and provider.
+    pub async fn review_counts(
+        &self,
+        review_type: Option<ReviewType>,
+        provider: Option<&str>,
+    ) -> Result<ReviewCounts> {
+        let mut qs = url::form_urlencoded::Serializer::new(String::new());
+        if let Some(t) = review_type {
+            qs.append_pair("review_type", t.as_str());
+        }
+        if let Some(p) = provider {
+            qs.append_pair("provider", p);
+        }
+        self.get_json(&format!("/api/v1/reviews/counts?{}", qs.finish()))
+            .await
+    }
+    /// Close every open item of a type (and provider) without changing any memory.
+    pub async fn dismiss_reviews(&self, r: &DismissRequest) -> Result<DismissResponse> {
+        self.call("/api/v1/reviews/dismiss", r, Duration::from_secs(60))
+            .await
+    }
+    pub async fn review(&self, id: &str) -> Result<ReviewItem> {
+        self.get_json(&format!("/api/v1/reviews/{}", path_segment(id)))
+            .await
+    }
+    pub async fn resolve_review(&self, r: &ResolveRequest) -> Result<ResolveResponse> {
+        self.call(
+            &format!("/api/v1/reviews/{}/resolve", path_segment(&r.id)),
+            &serde_json::json!({"choice": r.choice, "author": r.author}),
+            Duration::from_secs(10),
+        )
+        .await
+    }
+    pub async fn merge(&self, r: &MergeRequest) -> Result<MergeResponse> {
+        self.call("/api/v1/memories/merge", r, Duration::from_secs(10))
+            .await
+    }
+    pub async fn stats(&self) -> Result<Stats> {
+        self.get_json("/api/v1/stats").await
+    }
+    /// Backups in the backup directory, newest first.
+    pub async fn backups(&self) -> Result<Vec<crate::backup::BackupInfo>> {
+        self.get_json("/api/v1/backups").await
+    }
+    /// Copy the database into the backup directory now (a copy of a large database takes minutes).
+    pub async fn backup_now(&self) -> Result<crate::backup::BackupInfo> {
+        self.call(
+            "/api/v1/backups",
+            &serde_json::json!({}),
+            MAINTENANCE_TIMEOUT,
+        )
+        .await
+    }
+    /// When each maintenance job last ran.
+    pub async fn maintenance_status(&self) -> Result<Vec<JobStatus>> {
+        self.get_json("/api/v1/maintenance").await
+    }
+    /// Run one maintenance job now, to its end (a job on a large database takes minutes).
+    pub async fn run_job(
+        &self,
+        job: crate::maintenance::Job,
+    ) -> Result<crate::maintenance::JobReport> {
+        self.call(
+            "/api/v1/maintenance/run",
+            &serde_json::json!({ "job": job.name() }),
+            MAINTENANCE_TIMEOUT,
+        )
+        .await
+    }
+    /// Every setting with its source, the problems, the secrets' status (never a value).
+    pub async fn settings(&self) -> Result<SettingsView> {
+        self.get_json("/api/v1/settings").await
+    }
+    /// The JSON Schema of the settings.
+    pub async fn settings_schema(&self) -> Result<serde_json::Value> {
+        self.get_json("/api/v1/settings/schema").await
+    }
+    /// Change settings (`null` removes a key). Validation failures come back as
+    /// `AliceError::Invalid` with every `key: message` on its own line.
+    pub async fn patch_settings(
+        &self,
+        changes: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<PatchResponse> {
+        let resp = self
+            .http
+            .patch(format!("{}/api/v1/settings", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(10))
+            .json(changes)
+            .send()
+            .await
+            .map_err(transport)?;
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let lines: Vec<String> = body["errors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|e| {
+                    format!(
+                        "{}: {}",
+                        e["key"].as_str().unwrap_or("?"),
+                        e["message"].as_str().unwrap_or("")
+                    )
+                })
+                .collect();
+            return Err(AliceError::Invalid(if lines.is_empty() {
+                body["error"].as_str().unwrap_or("invalid settings").into()
+            } else {
+                lines.join("\n")
+            }));
+        }
+        Self::decode(resp).await
+    }
+    pub async fn set_secret(&self, name: &str, value: &str) -> Result<SecretStatus> {
+        let name = path_word(name)?;
+        let resp = self
+            .http
+            .put(format!("{}/api/v1/secrets/{name}", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(15))
+            .json(&SecretRequest {
+                value: value.into(),
+            })
+            .send()
+            .await
+            .map_err(transport)?;
+        Self::decode(resp).await
+    }
+    /// `true` when there was a secret to delete.
+    pub async fn delete_secret(&self, name: &str) -> Result<bool> {
+        let name = path_word(name)?;
+        let resp = self
+            .http
+            .delete(format!("{}/api/v1/secrets/{name}", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(transport)?;
+        let v: serde_json::Value = Self::decode(resp).await?;
+        Ok(v["deleted"].as_bool().unwrap_or(false))
+    }
+    pub async fn test_provider(&self, which: &str) -> Result<ProviderTest> {
+        let which = path_word(which)?;
+        self.call(
+            &format!("/api/v1/settings/test/{which}"),
+            &serde_json::json!({}),
+            Duration::from_secs(30),
+        )
+        .await
+    }
+    /// The checks only the daemon can make (`alice doctor` adds its own).
+    pub async fn doctor(&self) -> Result<crate::doctor::DoctorReport> {
+        self.get_json("/api/v1/doctor").await
+    }
+    /// Replace the API token. The daemon writes the new one to the token file and refuses the
+    /// old one from the next request on, so this client (which holds the old one) must
+    /// reconnect afterwards (`DaemonClient::try_existing`). Nothing is returned: the token
+    /// never travels.
+    pub async fn rotate_token(&self) -> Result<()> {
+        let v: serde_json::Value = self
+            .call(
+                "/api/v1/admin/token/rotate",
+                &serde_json::json!({}),
+                Duration::from_secs(10),
+            )
+            .await?;
+        if v["rotated"].as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err(AliceError::Other(
+                "the memory daemon did not confirm the token rotation; it may be an older version. Run \"alice daemon stop\", then retry".into(),
+            ))
+        }
+    }
+    /// Whether `mcp.admin_tools` is on, asked of the small flags endpoint (no secrets' status)
+    /// with a short timeout.
+    pub async fn admin_tools_flag(&self) -> Result<bool> {
+        let resp = self
+            .http
+            .get(format!("{}/api/v1/settings/flags", self.base))
+            .bearer_auth(&self.token)
+            .timeout(FLAGS_TIMEOUT)
+            .send()
+            .await
+            .map_err(transport)?;
+        let v: serde_json::Value = Self::decode(resp).await?;
+        Ok(v["mcp.admin_tools"].as_bool() == Some(true))
     }
     pub async fn shutdown(&self) -> Result<()> {
         let resp = self
@@ -477,6 +787,83 @@ fn check_remember(req: &RememberRequest) -> Result<()> {
         name: String::new(),
     };
     memories::prepare(input, &somewhere, String::new()).map(|_| ())
+}
+
+/// The redactor for a write that is spooled because the daemon is away (so its settings and
+/// project rules are not at hand): `config.toml` and the `ALICE_*` variables through the same
+/// rule the daemon loads them by, and, when the project root can be found the way the daemon
+/// finds it (from `cwd`, unless the caller named a project), that project's `.alice.toml`. A
+/// project file that is invalid or unreadable counts as `block_secrets` on, as in the daemon, and
+/// so does a `config.toml` that is degraded.
+/// A named project has no root to find without the database, so only the global rules apply
+/// to it here; the daemon applies the project's own rules again when it drains the spool.
+///
+/// Runs git and reads files: call it on the blocking pool.
+fn spool_redactor(home: &AliceHome, project: Option<&str>, cwd: Option<&str>) -> Redactor {
+    let effective = crate::config::load_effective(home);
+    let mut global = effective.resolved.settings.privacy;
+    if effective.degraded {
+        // A leaf of config.toml was left out and may have been a privacy one: fail closed, as
+        // the daemon does (secrets blocked, the privacy last applied kept), rather than spool
+        // with rules that may be weaker than the person's.
+        global =
+            crate::config::fail_closed_privacy(&global, crate::config::kept_privacy(home).as_ref());
+    }
+    let named = project.is_some_and(|p| !p.trim().is_empty());
+    let root = cwd
+        .filter(|_| !named)
+        .and_then(|c| alice_core::project::detect_project(Path::new(c)).root);
+    let privacy = match root {
+        Some(root) => match load_project(&root) {
+            Ok(p) => p.apply_to(&global).privacy,
+            Err(_) => ProjectSettings::fail_closed().apply_to(&global).privacy,
+        },
+        None => global,
+    };
+    Redactor::new(&privacy).unwrap_or_else(|_| Redactor::fallback(&privacy))
+}
+
+/// `req` ready for the spool: secrets redacted, or an error naming the detector in `block` mode.
+async fn redacted_for_spool(home: &AliceHome, mut req: RememberRequest) -> Result<RememberRequest> {
+    let home = home.clone();
+    tokio::task::spawn_blocking(move || {
+        let r = spool_redactor(&home, req.project.as_deref(), req.cwd.as_deref());
+        req.content = r.check("content", &req.content)?;
+        if let Some(t) = &req.title {
+            req.title = Some(r.check("title", t)?);
+        }
+        req.topics = req
+            .topics
+            .iter()
+            .map(|t| r.check("topic", t))
+            .collect::<Result<_>>()?;
+        Ok(req)
+    })
+    .await
+    .map_err(|e| AliceError::Other(format!("redaction stopped: {e}")))?
+}
+
+/// The same for an ingest: the source uri and every chunk.
+async fn redacted_ingest_for_spool(
+    home: &AliceHome,
+    mut req: IngestRequest,
+) -> Result<IngestRequest> {
+    let home = home.clone();
+    tokio::task::spawn_blocking(move || {
+        let r = spool_redactor(&home, req.project.as_deref(), req.cwd.as_deref());
+        req.source.uri = r.check("source uri", &req.source.uri)?;
+        // In order: a private key cut across chunks is redacted in every one of them.
+        let mut order: Vec<usize> = (0..req.chunks.len()).collect();
+        order.sort_by_key(|&i| req.chunks[i].ord);
+        let mut open = false;
+        for i in order {
+            let c = &mut req.chunks[i];
+            c.text = r.check_piece("chunk text", &c.text, &mut open)?;
+        }
+        Ok(req)
+    })
+    .await
+    .map_err(|e| AliceError::Other(format!("redaction stopped: {e}")))?
 }
 
 /// Queue a write for the daemon to apply when it is back; if even that fails, say both.
@@ -524,6 +911,8 @@ pub(crate) async fn remember_via(
         },
         Err(u) => (u.to_string(), u.queued_note()),
     };
+    // Redacted first: the daemon checks the length of the redacted text, and so does this.
+    let req = redacted_for_spool(home, req).await?;
     check_remember(&req)?;
     spool_entry(home, SpoolEntry::Remember(req), &cause).await?;
     Ok(RememberResponse {
@@ -561,6 +950,8 @@ pub async fn ingest_or_spool(
         },
         Err(u) => u.to_string(),
     };
+    let req = redacted_ingest_for_spool(home, req).await?;
+    alice_core::store::sources::validate_chunks(&req.chunks)?;
     spool_entry(home, SpoolEntry::Ingest(req), &cause).await?;
     Ok(IngestOutcome {
         source_id: String::new(),
@@ -685,6 +1076,67 @@ mod tests {
         });
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         seen
+    }
+
+    /// Final review D-I2: a precise recall may take the judge's budget and more; the client
+    /// waits for it (here a daemon that answers after 5.5 s, with a 6 s judge budget) instead of
+    /// giving up at 5 s with "did not answer in time".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_waits_as_long_as_the_judge_budget_allows() {
+        crate::install_tls();
+        let (_d, home) = home();
+        std::fs::write(home.config_file(), "[search]\nprecise_timeout_ms = 6000\n").unwrap();
+        let token = load_or_create_token(&home).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let instance = "01K7SLOWDAEMON000000000000";
+        write_info(
+            &home,
+            &DaemonInfo {
+                pid: std::process::id(),
+                port,
+                instance: instance.into(),
+                version: "t".into(),
+                started_at: "t".into(),
+            },
+        )
+        .unwrap();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let token = token.clone();
+            async move {
+                if req.uri().path() == "/api/v1/ping" {
+                    let nonce = req
+                        .uri()
+                        .query()
+                        .and_then(|q| q.strip_prefix("nonce="))
+                        .unwrap_or("")
+                        .to_string();
+                    return axum::Json(serde_json::json!({
+                        "service": "alice", "instance": instance, "version": "t",
+                        "proof": ping_proof(&token, &nonce, instance),
+                    }))
+                    .into_response();
+                }
+                tokio::time::sleep(Duration::from_millis(5_500)).await;
+                axum::Json(RecallResponse {
+                    notes: vec!["graded slowly".into()],
+                    ..Default::default()
+                })
+                .into_response()
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = DaemonClient::try_existing(&home)
+            .await
+            .expect("the daemon proves the token");
+        let r = c
+            .recall(&RecallRequest {
+                query: "slow".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.notes, ["graded slowly"]);
     }
 
     fn remember_req(content: &str) -> RememberRequest {
@@ -835,9 +1287,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.memories.len(), 1);
-        let update: UpdateRequest =
+        let mut update: UpdateRequest =
             serde_json::from_value(serde_json::json!({"id": id, "action": "archive"})).unwrap();
-        assert_eq!(c.update(&update).await.unwrap().memory.id, id);
+        update.author.agent = Some("my agent/2".into());
+        let updated = c.update(&update).await.unwrap();
+        assert_eq!(updated.memory.id, id);
+        let event = updated.event_id.expect("the update's event");
+        // Filters that need escaping in a query string arrive intact.
+        let mine = c
+            .events(&EventsRequest {
+                target_id: Some(id.clone()),
+                actor: Some("agent:my agent/2".into()),
+                before: None,
+                limit: Some(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            mine.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            [event.as_str()]
+        );
+        let all = c.events(&EventsRequest::default()).await.unwrap();
+        assert_eq!(all[0].id, event, "newest first");
+        let undone = c
+            .undo(&UndoRequest {
+                event_id: event.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            undone.undone && undone.reverted == [event.clone()],
+            "{undone:?}"
+        );
+        let again = c
+            .undo(&UndoRequest {
+                event_id: event,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&again, AliceError::Invalid(m) if m.contains("already undone")),
+            "{again}"
+        );
         let fact: AssertFactRequest = serde_json::from_value(
             serde_json::json!({"subject": "alice", "predicate": "written in", "object": "rust"}),
         )
@@ -1014,6 +1507,206 @@ mod tests {
         assert_eq!((drained.processed, drained.rejected), (2, 0));
     }
 
+    /// All the bytes of the files in a directory, as one string (lossy).
+    fn spool_text(home: &AliceHome) -> String {
+        std::fs::read_dir(home.spool_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| String::from_utf8_lossy(&std::fs::read(e.path()).unwrap()).into_owned())
+            .collect()
+    }
+
+    const GITHUB: &str = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+
+    /// The daemon is away: what is queued holds no secret (redacted with the settings read from
+    /// the home), `block` mode refuses instead of queueing, and so does a project file, found
+    /// from the working directory, that is broken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_spooled_without_a_daemon_is_redacted_or_refused_in_block_mode() {
+        crate::install_tls();
+        let (d, home) = home();
+        let r = remember_or_spool(
+            &home,
+            &Launcher::None,
+            RememberRequest {
+                title: Some(format!("key {GITHUB}")),
+                topics: vec![GITHUB.into()],
+                ..remember_req(&format!("deploy with {GITHUB}"))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.status, RememberStatus::Spooled);
+        let o = ingest_or_spool(
+            &home,
+            &Launcher::None,
+            ingest_req(format!("export TOKEN={GITHUB}")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(o.inserted, 0);
+        let text = spool_text(&home);
+        assert!(!text.contains(GITHUB) && !text.contains("aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"));
+        assert!(text.contains("[REDACTED:github_token]"), "{text}");
+        assert_eq!(spool::pending_count(&home.spool_dir()), 2);
+
+        // The project file of the working directory applies to a write without a named project.
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join(".alice.toml"), "[privacy\nblock_secrets = tru").unwrap();
+        let cwd = Some(work.to_string_lossy().into_owned());
+        let e = remember_or_spool(
+            &home,
+            &Launcher::None,
+            RememberRequest {
+                cwd: cwd.clone(),
+                ..remember_req(&format!("again {GITHUB}"))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&e, AliceError::Refused { detectors, .. } if detectors == &["github_token"])
+                && !e.to_string().contains(GITHUB),
+            "{e:?}"
+        );
+        let e = ingest_or_spool(
+            &home,
+            &Launcher::None,
+            IngestRequest {
+                cwd,
+                ..ingest_req(format!("again {GITHUB}"))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(&e, AliceError::Refused { .. }), "{e:?}");
+        assert_eq!(
+            spool::pending_count(&home.spool_dir()),
+            2,
+            "nothing more was queued"
+        );
+
+        // `block` in config.toml refuses everywhere.
+        std::fs::write(home.config_file(), "[privacy]\nredact_mode = \"block\"\n").unwrap();
+        let e = remember_or_spool(&home, &Launcher::None, remember_req(&format!("x {GITHUB}")))
+            .await
+            .unwrap_err();
+        assert!(matches!(&e, AliceError::Refused { .. }), "{e:?}");
+        assert!(!spool_text(&home).contains(GITHUB));
+    }
+
+    /// Final review A-I1: a private key cut by size across the chunks of one spooled ingest
+    /// leaves nothing of its body in the spool (the chunks may come in any order).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_private_key_cut_across_spooled_chunks_is_redacted_in_every_chunk() {
+        crate::install_tls();
+        let (_d, home) = home();
+        let body: Vec<String> = (0..20u32)
+            .map(|i| {
+                (0..64u32)
+                    .map(|j| {
+                        let n = (i * 131 + j * 17 + (i ^ j) * 7) % 64;
+                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                            [n as usize] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let text = format!(
+            "before\n{}\n{}\n-----END OPENSSH PRIVATE KEY-----\nafter",
+            concat!("-----BEGIN OPENSSH PRIVATE ", "KEY-----"),
+            body.join("\n")
+        );
+        let (a, b) = (text.len() / 3 + 5, 2 * text.len() / 3 + 11);
+        let chunk = |ord: i64, t: &str| ChunkInput {
+            ord,
+            text: t.to_string(),
+            ..Default::default()
+        };
+        let req = IngestRequest {
+            chunks: vec![
+                chunk(2, &text[b..]),
+                chunk(0, &text[..a]),
+                chunk(1, &text[a..b]),
+            ],
+            ..ingest_req(String::new())
+        };
+        ingest_or_spool(&home, &Launcher::None, req).await.unwrap();
+        let spooled = spool_text(&home);
+        let leaked: Vec<&str> = body
+            .iter()
+            .flat_map(|l| (0..=52).map(move |i| &l[i..i + 12]))
+            .filter(|w| spooled.contains(w))
+            .collect();
+        assert!(leaked.is_empty(), "{leaked:?} in {spooled}");
+        assert!(spooled.contains("before") && spooled.contains("after"));
+    }
+
+    /// Final review A-I4: with a `config.toml` that does not parse, the spool keeps the custom
+    /// patterns last applied (and blocks secrets), as the daemon does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_broken_config_keeps_the_last_privacy_in_the_spool() {
+        crate::install_tls();
+        let (_d, home) = home();
+        std::fs::write(
+            home.config_file(),
+            "[privacy]\ncustom_patterns = [{ name = \"acme\", regex = \"ACME-[0-9]{6}\" }]\n",
+        )
+        .unwrap();
+        // A daemon (or any settings handle) applied it once.
+        drop(crate::config::SettingsHandle::load_with_env(
+            &home,
+            Vec::new(),
+        ));
+        std::fs::write(home.config_file(), "[privacy\ncustom_patterns = [").unwrap();
+        let e = remember_or_spool(&home, &Launcher::None, remember_req("ticket ACME-123456"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, AliceError::Refused { detectors, .. } if detectors == &["custom:acme"]),
+            "{e:?}"
+        );
+        assert_eq!(spool::pending_count(&home.spool_dir()), 0);
+    }
+
+    /// The length is checked on the redacted text (as the daemon does): a request that redaction
+    /// makes too long is refused now, not queued and rejected at the drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_spool_checks_the_length_after_redaction() {
+        crate::install_tls();
+        let (_d, home) = home();
+        let key = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let content = vec![key; 3_000].join(" ");
+        assert!(content.len() < 65_536);
+        let e = remember_or_spool(&home, &Launcher::None, remember_req(&content))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, AliceError::Invalid(_)), "{e:?}");
+        assert_eq!(spool::pending_count(&home.spool_dir()), 0);
+    }
+
+    /// A `config.toml` with a bad leaf may have lost a privacy setting: the client then blocks
+    /// secrets instead of spooling with rules that may be weaker than the person's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_degraded_config_blocks_secrets_in_the_spool() {
+        crate::install_tls();
+        let (_d, home) = home();
+        std::fs::write(
+            home.config_file(),
+            "[privacy]\nredact = true\n[search]\nrelevance_floor = \"x\"\n",
+        )
+        .unwrap();
+        let e = remember_or_spool(&home, &Launcher::None, remember_req(&format!("k {GITHUB}")))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, AliceError::Refused { .. }), "{e:?}");
+        let ok = remember_or_spool(&home, &Launcher::None, remember_req("no secret"))
+            .await
+            .unwrap();
+        assert_eq!(ok.status, RememberStatus::Spooled);
+    }
+
     /// The daemon runs from `/`: a relative home must reach it as the same directory.
     #[test]
     fn the_started_daemon_gets_this_home_as_an_absolute_path() {
@@ -1059,6 +1752,8 @@ mod tests {
         }
     }
 
+    // Unix only (M1 ruling R3): the stand-in for the `alice` binary is a `#!/bin/sh` script,
+    // which Windows cannot run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_starts_a_daemon_for_this_home_and_waits_until_it_serves() {
@@ -1089,6 +1784,8 @@ mod tests {
         assert!(home.logs_dir().join("daemon.log").exists());
     }
 
+    // Unix only (M1 ruling R3): the stand-in for the `alice` binary is a `#!/bin/sh` script,
+    // which Windows cannot run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_gives_up_after_the_wait_and_says_what_to_do() {
@@ -1137,6 +1834,8 @@ mod tests {
     /// Review finding I-1: the daemon this client started fails and leaves its reason in
     /// daemon.error; `connect` reports that reason at once instead of waiting out the wait and
     /// saying "starting". A write is still queued, and its reply says why.
+    // Unix only (M1 ruling R3): the stand-in for the `alice` binary is a `#!/bin/sh` script,
+    // which Windows cannot run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_reports_why_the_started_daemon_failed() {
@@ -1152,11 +1851,12 @@ mod tests {
             ),
         );
         let t = Instant::now();
-        let e = DaemonClient::connect(&home, &Launcher::Exe(exe.clone()), Duration::from_secs(5))
+        let e = DaemonClient::connect(&home, &Launcher::Exe(exe.clone()), Duration::from_secs(30))
             .await
             .unwrap_err();
+        // At once, not after the 30 s wait.
         assert!(
-            t.elapsed() < Duration::from_secs(3),
+            t.elapsed() < Duration::from_secs(15),
             "waited {:?}",
             t.elapsed()
         );
@@ -1173,8 +1873,66 @@ mod tests {
         assert_eq!(spool::pending_count(&home.spool_dir()), 1);
     }
 
+    /// An error left by an earlier daemon is not the cause of a slow start: while a live process
+    /// holds the lock the answer is "starting"; with no holder, the last failure is the answer.
+    // Unix only: the stand-in for the `alice` binary is a `#!/bin/sh` script.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_older_failure_is_not_blamed_while_a_live_process_holds_the_lock() {
+        use std::io::Write;
+        crate::install_tls();
+        let (_d, home) = home();
+        let tools = tempfile::tempdir().unwrap();
+        // A failure from long ago (unix_ms 1) by a daemon that is gone.
+        std::fs::write(
+            home.daemon_error(),
+            r#"{"pid": 999999, "at": "t", "unix_ms": 1, "error": "alice.db is not a usable database"}"#,
+        )
+        .unwrap();
+        // This process holds the daemon lock, as a daemon that is slow to start would.
+        let mut lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(home.lock_file())
+            .unwrap();
+        lock.try_lock().unwrap();
+        lock.set_len(0).unwrap();
+        writeln!(lock, "{}", std::process::id()).unwrap();
+        let exe = script_exe(tools.path(), "exit 0");
+        let e = DaemonClient::connect(
+            &home,
+            &Launcher::Exe(exe.clone()),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.starts_with("memory daemon is starting") && !e.contains("alice.db"),
+            "{e}"
+        );
+        // The holder lets go: nothing runs, and the last failure is the answer.
+        drop(lock);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !startup::lock_free(&home) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let e = DaemonClient::connect(&home, &Launcher::Exe(exe), Duration::from_millis(500))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "memory daemon could not start: alice.db is not a usable database"
+        );
+    }
+
     /// Review finding I-1: when the wait runs out while the daemon downloads the model, the
     /// error (and a queued write's reason) says so.
+    // Unix only (M1 ruling R3): the stand-in for the `alice` binary is a `#!/bin/sh` script,
+    // which Windows cannot run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_says_when_the_daemon_is_still_downloading_the_model() {
@@ -1194,11 +1952,21 @@ mod tests {
                 .as_i64()
                 .unwrap() as libc::pid_t
         };
-        // The first run of a new executable can take a second on macOS (a one-off OS check).
-        let e = DaemonClient::connect(&home, &Launcher::Exe(exe.clone()), Duration::from_secs(3))
-            .await
-            .unwrap_err()
-            .to_string();
+        // The stand-in can be slow to start on a loaded machine (a one-off OS check on the first
+        // run of a new executable on macOS, a starved process elsewhere): ask again until it
+        // has announced itself.
+        let mut tries = 0;
+        let e = loop {
+            tries += 1;
+            let e =
+                DaemonClient::connect(&home, &Launcher::Exe(exe.clone()), Duration::from_secs(3))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+            if e.contains("downloading") || tries >= 10 {
+                break e;
+            }
+        };
         let first = announced();
         assert!(
             e.starts_with("memory daemon is starting")
@@ -1217,6 +1985,7 @@ mod tests {
         }
     }
 
+    // Unix only: checks the setsid session (a Windows process has none) and kills with signals.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn spawn_detached_runs_in_its_own_session_with_output_in_the_log() {

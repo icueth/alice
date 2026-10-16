@@ -1,0 +1,53 @@
+{
+  "recorded": true,
+  "request": {
+    "model": "jev-1.13.0",
+    "questions": {
+      "q": {
+        "criteria": {
+          "bugfix": "a bug: its symptom, cause and fix",
+          "decision": "a decision that was made, ideally with its reason",
+          "diary": "a journal entry about what happened in a session",
+          "fact": "a fact about code, a system or the world",
+          "handoff": "what is done, what is next and open questions, for the next session",
+          "howto": "steps or commands that achieve something",
+          "note": "anything else worth keeping",
+          "preference": "how the user wants things done",
+          "status": "the current state of some work",
+          "summary": "a summary of a longer discussion or document",
+          "warning": "a danger, or something to avoid"
+        },
+        "instructions": "Choose the option that fits best.",
+        "type": "choice"
+      }
+    },
+    "state": "Which kind of memory is this?\n\nMemory (written yesterday, kind note, importance normal, project alice):\nTitle: Writer lease held during mining\nSymptom: diary writes timed out after 120 s. Cause: the hub held the writer lease while mining. Fix: mining now runs off the writer.\n"
+  },
+  "response": {
+    "answers": {
+      "q": {
+        "choice": "bugfix",
+        "confidence": 0.99,
+        "probabilities": {
+          "bugfix": 0.99,
+          "decision": 0.0,
+          "diary": 0.01,
+          "fact": 0.0,
+          "handoff": 0.0,
+          "howto": 0.0,
+          "note": 0.0,
+          "preference": 0.0,
+          "status": 0.0,
+          "summary": 0.0,
+          "warning": 0.0
+        },
+        "type": "choice"
+      }
+    },
+    "model": "jev-1.13.0",
+    "usage": {
+      "input_tokens": 564,
+      "output_tokens": 101
+    }
+  }
+}

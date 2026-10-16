@@ -2,7 +2,7 @@
 #![cfg(feature = "local")]
 
 use alice_core::embed::{Embedder, cosine};
-use alice_embed::{FastEmbedder, fetch_model};
+use alice_embed::{OnnxEmbedder, OnnxOptions, fetch_model};
 use std::path::PathBuf;
 
 #[tokio::test]
@@ -13,7 +13,7 @@ async fn real_model_ranks_the_thai_match_first() {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("alice-models"));
     fetch_model(&dir, &|_, _, _| {}).await.unwrap();
-    let e = FastEmbedder::new(&dir).unwrap();
+    let e = OnnxEmbedder::new(&dir, OnnxOptions::default()).unwrap();
     let passages = vec![
         "ระบบความจำสำหรับเอเจนต์เขียนโค้ด".to_string(),
         "The deploy target is Easypanel".to_string(),
@@ -36,7 +36,7 @@ fn passage_batches_respect_the_token_budget_for_dense_text() {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".alice/models")))
         .unwrap();
-    let e = FastEmbedder::new(&dir).unwrap();
+    let e = OnnxEmbedder::new(&dir, OnnxOptions::default()).unwrap();
     let hex = |i: usize, n: usize| -> String {
         (0..n)
             .map(|j| format!("{:032x}", (i * 7919 + j) as u128 * 0x9e37_79b9_7f4a_7c15))
@@ -94,4 +94,96 @@ fn passage_batches_respect_the_token_budget_for_dense_text() {
     assert!(overran, "the estimate-based plan stayed within the budget");
     let vectors = e.embed_passages(&texts).unwrap();
     assert_eq!(vectors.len(), texts.len());
+}
+
+/// Resident memory of this process in MB, as `ps` reports it.
+#[cfg(unix)]
+fn rss_mb() -> f64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .unwrap_or(0.0)
+        / 1024.0
+}
+
+/// No `ps` on Windows: the figures print as NaN there (they are only printed).
+#[cfg(not(unix))]
+fn rss_mb() -> f64 {
+    f64::NAN
+}
+
+/// Idle unload with the real model: the session is dropped after the idle time, a query
+/// then fails at once with `MODEL_LOADING` (search uses word matches) and starts a reload in
+/// the background, passages wait for the model, and the reloaded model gives the same vectors.
+#[test]
+#[ignore = "needs the real model in ALICE_MODELS_DIR or ~/.alice/models"]
+fn the_real_model_is_unloaded_when_idle_and_reloaded_on_demand() {
+    use alice_embed::onnx::MODEL_LOADING;
+    use std::time::{Duration, Instant};
+    let dir = std::env::var_os("ALICE_MODELS_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".alice/models")))
+        .unwrap();
+    let base = rss_mb();
+    let e = OnnxEmbedder::new(
+        &dir,
+        OnnxOptions {
+            idle_unload: Some(Duration::from_millis(500)),
+            intra_threads: None,
+        },
+    )
+    .unwrap();
+    let before = e.embed_query("writer lease timeout").unwrap();
+    let p = e
+        .embed_passages(&["writer lease held during mining".into()])
+        .unwrap();
+    let loaded = rss_mb();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while e.is_loaded() {
+        assert!(Instant::now() < deadline, "not unloaded after 10 s");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let unloaded = rss_mb();
+    let t = Instant::now();
+    let err = e
+        .embed_query("writer lease timeout")
+        .unwrap_err()
+        .to_string();
+    assert!(err.starts_with(MODEL_LOADING), "{err}");
+    assert!(
+        t.elapsed() < Duration::from_millis(100),
+        "the query waited {:?}",
+        t.elapsed()
+    );
+    let reload = Instant::now();
+    while !e.is_loaded() {
+        assert!(
+            reload.elapsed() < Duration::from_secs(30),
+            "no background reload"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let reload_ms = reload.elapsed().as_millis();
+    assert_eq!(e.embed_query("writer lease timeout").unwrap(), before);
+    // Passages wait for a load instead of failing.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while e.is_loaded() {
+        assert!(Instant::now() < deadline, "not unloaded again after 10 s");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let t = Instant::now();
+    assert_eq!(
+        e.embed_passages(&["writer lease held during mining".into()])
+            .unwrap(),
+        p
+    );
+    println!(
+        "RSS: {base:.0} MB before, {loaded:.0} MB loaded, {unloaded:.0} MB unloaded; \
+         background reload {reload_ms} ms; passages after an unload {} ms (load included)",
+        t.elapsed().as_millis()
+    );
 }

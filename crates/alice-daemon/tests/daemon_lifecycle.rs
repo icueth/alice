@@ -21,6 +21,7 @@ fn spawn(home: &AliceHome) -> Running {
             DaemonOptions {
                 port: 0,
                 fake_embedder: true,
+                settings_env: Some(Vec::new()),
             },
         )
     })
@@ -343,4 +344,49 @@ async fn a_failed_start_leaves_its_reason_and_a_good_start_clears_it() {
     assert!(!home.root().join("daemon.starting").exists());
     daemon.shutdown().await;
     finished(running, Duration::from_secs(15)).await.unwrap();
+}
+
+/// With no port asked for, the daemon listens on the `server.port` setting.
+///
+/// A free port is found by binding port 0 and letting go, and in that moment another test's
+/// daemon (or any program) can take it. The test therefore tries again with another port when
+/// the daemon could not listen, instead of failing on a collision it cannot prevent.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_port_setting_picks_the_port() {
+    let (_d, home) = home();
+    home.ensure_dirs().unwrap();
+    for attempt in 1..=8 {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        std::fs::write(home.config_file(), format!("[server]\nport = {port}\n")).unwrap();
+        let running = spawn(&home);
+        // Until it serves, or ends because it could not listen on that port.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if read_info(&home).is_some() || running.is_finished() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon neither served nor ended"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if running.is_finished() {
+            let err = running.join().expect("daemon thread panicked").unwrap_err();
+            assert!(
+                err.to_string().contains("cannot listen"),
+                "it ended for another reason than the port: {err:#}"
+            );
+            assert!(attempt < 8, "no free port in 8 tries");
+            continue;
+        }
+        let daemon = Daemon::connect(&home).await;
+        assert_eq!(daemon.info.port, port);
+        daemon.shutdown().await;
+        finished(running, Duration::from_secs(20)).await.unwrap();
+        return;
+    }
 }

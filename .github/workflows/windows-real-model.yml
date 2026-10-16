@@ -1,0 +1,46 @@
+name: windows-real-model
+# The real embedding model on Windows, which the per-push CI never loads: its model tests are
+# #[ignore] because they need the model (~136 MB from Hugging Face). Start it by hand:
+#   gh workflow run windows-real-model.yml --ref <branch>
+# It also runs on a push to main that changes the embedding crate, the dependency lock or this
+# file, so a change that could break the real model on Windows is noticed after it merges.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-real-model.yml"
+      - "crates/alice-embed/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+permissions:
+  contents: read
+jobs:
+  real-model:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99"
+      - uses: Swatinem/rust-cache@v2
+      # A data directory whose path is not ASCII, as under a Thai user name.
+      - name: Temporary ALICE_HOME
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "ผู้ใช้ ทดสอบ\alice"
+          "ALICE_HOME=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ALICE_MODELS_DIR=$dir\models" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - run: cargo build --locked --release -p alice-memory
+      - name: alice model fetch
+        shell: pwsh
+        run: |
+          & .\target\release\alice.exe model fetch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem -LiteralPath $env:ALICE_MODELS_DIR -Recurse | Select-Object FullName, Length
+      - name: Real-model tests (embedding, idle unload, M1 equivalence, gold set)
+        run: >-
+          cargo test --locked --release -p alice-embed
+          --test real_model --test onnx_equivalence --test real_search_quality
+          -- --ignored --nocapture

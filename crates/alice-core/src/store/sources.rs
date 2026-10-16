@@ -90,6 +90,42 @@ pub fn validate_chunks(chunks: &[ChunkInput]) -> Result<()> {
     Ok(())
 }
 
+/// Seconds since the epoch at or above which a bare number is read as milliseconds (year 5138
+/// in seconds, 1973 in milliseconds).
+const MILLIS_FROM: i64 = 100_000_000_000;
+
+/// The time a chunk says it was written, as the store keeps it: an ISO 8601 / RFC 3339 time (or
+/// a date) is kept as given; a bare Unix time in seconds or milliseconds becomes an RFC 3339
+/// UTC time; anything else (empty, `10/13/2026`, words) is dropped (`ingest` logs one warning
+/// per request with the count). A value that is kept is always a time, so nothing downstream
+/// compares garbage; but one with an offset (`+07:00`) or a date alone is kept as written and
+/// does not sort against `…Z` values as text (final review B-M8: the comment said it did).
+pub fn normalise_authored(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let iso = chrono::DateTime::parse_from_rfc3339(raw).is_ok()
+        || chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
+        || chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").is_ok();
+    if iso {
+        return Some(raw.to_string());
+    }
+    if let Ok(n) = raw.parse::<i64>()
+        && n > 0
+    {
+        let millis = if n >= MILLIS_FROM {
+            n
+        } else {
+            n.saturating_mul(1000)
+        };
+        if let Some(t) = chrono::DateTime::from_timestamp_millis(millis) {
+            return Some(t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        }
+    }
+    None
+}
+
 /// Create the source if new (identified by type + uri) and insert chunks whose `ord` is not stored yet.
 pub fn ingest(
     conn: &Connection,
@@ -142,8 +178,17 @@ pub fn ingest(
     let mut inserted = 0;
     let mut skipped = 0;
     let now = now_rfc3339();
+    let mut dropped_times = 0usize;
     for c in chunks {
         let text = nfc(&c.text);
+        let authored_at = normalise_authored(c.authored_at.as_deref());
+        if authored_at.is_none()
+            && c.authored_at
+                .as_deref()
+                .is_some_and(|a| !a.trim().is_empty())
+        {
+            dropped_times += 1;
+        }
         let changed = conn.execute(
             "INSERT OR IGNORE INTO chunks (id, source_id, project_id, ord, text, content_hash, authored_at, created_at, legacy_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -154,7 +199,7 @@ pub fn ingest(
                 c.ord,
                 text,
                 sha256_hex(text.as_bytes()),
-                c.authored_at,
+                authored_at,
                 now,
                 c.legacy_id
             ],
@@ -165,6 +210,12 @@ pub fn ingest(
         } else {
             skipped += 1;
         }
+    }
+    if dropped_times > 0 {
+        tracing::warn!(
+            chunks = dropped_times,
+            "chunks whose authored_at is not an ISO 8601 or Unix time were stored without one"
+        );
     }
     Ok(IngestOutcome {
         source_id,
@@ -216,6 +267,49 @@ mod tests {
         let c = open_writer(&d.path().join("a.db")).unwrap();
         let p = projects::upsert_project(&c, &ProjectRef::global()).unwrap();
         (d, c, p)
+    }
+
+    /// I-1: `authored_at` is kept when it is ISO 8601, converted when it is a Unix time, and
+    /// dropped (with a warning) when it is anything else, so no stored value sorts wrongly.
+    #[test]
+    fn authored_at_is_normalised_at_ingest() {
+        let cases: [(&str, Option<&str>); 9] = [
+            ("2026-01-02T03:04:05.678Z", Some("2026-01-02T03:04:05.678Z")),
+            (
+                "2026-01-02T03:04:05+07:00",
+                Some("2026-01-02T03:04:05+07:00"),
+            ),
+            ("2026-01-02", Some("2026-01-02")),
+            ("1767323045", Some("2026-01-02T03:04:05.000Z")),
+            ("1767323045678", Some("2026-01-02T03:04:05.678Z")),
+            ("", None),
+            ("   ", None),
+            ("10/13/2026", None),
+            ("yesterday", None),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(normalise_authored(Some(raw)).as_deref(), want, "{raw:?}");
+        }
+        assert_eq!(normalise_authored(None), None);
+        assert_eq!(normalise_authored(Some("0")), None);
+        assert_eq!(normalise_authored(Some("-5")), None);
+        let (_d, c, p) = setup();
+        let mut a = chunk(0, "epoch chunk");
+        a.authored_at = Some("1767323045".into());
+        let mut b = chunk(1, "us date chunk");
+        b.authored_at = Some("10/13/2026".into());
+        ingest(&c, &p, &src(), &[a, b]).unwrap();
+        let stored: Vec<Option<String>> = c
+            .prepare("SELECT authored_at FROM chunks ORDER BY ord")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            stored,
+            vec![Some("2026-01-02T03:04:05.000Z".to_string()), None]
+        );
     }
 
     fn src() -> SourceInput {

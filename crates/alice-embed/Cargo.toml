@@ -9,11 +9,14 @@ description = "Embedding providers for Alice"
 
 [features]
 default = ["local"]
-local = ["dep:fastembed"]
+local = ["dep:ort", "dep:spm_precompiled"]
 
 [dependencies]
 alice-core = { path = "../alice-core" }
-fastembed = { workspace = true, optional = true }
+ort = { workspace = true, optional = true }
+spm_precompiled = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 reqwest.workspace = true
 rustls.workspace = true
 futures.workspace = true
@@ -25,5 +28,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-serde_json.workspace = true
 chrono.workspace = true
+# Equivalence tests only (tests/onnx_equivalence.rs): the M1 embedder the vectors are checked against.
+fastembed.workspace = true

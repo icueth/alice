@@ -4,6 +4,7 @@ use crate::error::{AliceError, Result};
 use crate::ids::{new_id, now_rfc3339};
 use crate::normalize::{sha256_hex, slugify};
 use crate::project::ProjectRef;
+use crate::settings::ProjectTree;
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub const GLOBAL_ID: &str = "00000000000000000000GLOBAL";
@@ -58,6 +59,15 @@ fn slug_taken(conn: &Connection, s: &str) -> Result<bool> {
 /// A slug already in use gets a suffix from the key's hash, lengthened until it is free.
 pub fn upsert_project(conn: &Connection, p: &ProjectRef) -> Result<ResolvedProject> {
     if let Some(found) = find_by_key(conn, &p.key)? {
+        // The working tree may have moved (a re-clone, a new worktree): the rules of its
+        // `.alice.toml` are read from the live root, so a root that exists replaces the stored one.
+        if let Some(root) = p.root.as_ref().filter(|r| r.exists()) {
+            let root = root.to_string_lossy();
+            conn.execute(
+                "UPDATE projects SET root_path = ?1 WHERE id = ?2 AND root_path IS NOT ?1",
+                params![root, found.id],
+            )?;
+        }
         return Ok(found);
     }
     let base = slugify(&p.slug);
@@ -157,6 +167,75 @@ pub fn find_by_key(conn: &Connection, key: &str) -> Result<Option<ResolvedProjec
             row,
         )
         .optional()?)
+}
+
+/// The working-tree root a project was detected from, if it has one. `project_id_or_slug` is
+/// an id, a slug or an alias.
+pub fn root_of(conn: &Connection, project_id_or_slug: &str) -> Result<Option<String>> {
+    let by_id: Option<Option<String>> = conn
+        .query_row(
+            "SELECT root_path FROM projects WHERE id = ?1",
+            [project_id_or_slug],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(root) = by_id {
+        return Ok(root);
+    }
+    let Some(p) = resolve_slug(conn, project_id_or_slug)? else {
+        return Ok(None);
+    };
+    Ok(conn
+        .query_row(
+            "SELECT root_path FROM projects WHERE id = ?1",
+            [&p.id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// The root of the project a memory (named by its id or legacy id) belongs to.
+pub fn root_of_memory(conn: &Connection, memory_id: &str) -> Result<Option<String>> {
+    Ok(tree_of_memory(conn, memory_id)?.map(|t| t.root.to_string_lossy().into_owned()))
+}
+
+fn tree_row(key: String, root: Option<String>) -> Option<ProjectTree> {
+    root.map(|r| ProjectTree::new(key, r))
+}
+
+/// The working tree a project (an id, a slug or an alias) was last detected in, keyed by the
+/// project: its privacy rules are kept per project, whatever tree is current.
+pub fn tree_of(conn: &Connection, project_id_or_slug: &str) -> Result<Option<ProjectTree>> {
+    let by_id = |id: &str| -> Result<Option<Option<ProjectTree>>> {
+        Ok(conn
+            .query_row(
+                "SELECT key, root_path FROM projects WHERE id = ?1",
+                [id],
+                |r| Ok(tree_row(r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    };
+    if let Some(tree) = by_id(project_id_or_slug)? {
+        return Ok(tree);
+    }
+    let Some(p) = resolve_slug(conn, project_id_or_slug)? else {
+        return Ok(None);
+    };
+    Ok(by_id(&p.id)?.flatten())
+}
+
+/// [`tree_of`] the project a memory (named by its id or legacy id) belongs to.
+pub fn tree_of_memory(conn: &Connection, memory_id: &str) -> Result<Option<ProjectTree>> {
+    Ok(conn
+        .query_row(
+            "SELECT p.key, p.root_path FROM memories m JOIN projects p ON p.id = m.project_id
+             WHERE m.id = ?1 OR m.legacy_id = ?1 ORDER BY m.seq LIMIT 1",
+            [memory_id],
+            |r| Ok(tree_row(r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .flatten())
 }
 
 pub fn list_projects(conn: &Connection) -> Result<Vec<ResolvedProject>> {
@@ -326,5 +405,40 @@ mod tests {
             .map(|p| p.slug)
             .collect();
         assert_eq!(slugs, ["app", "global", "zeta"]);
+    }
+
+    #[test]
+    fn root_of_finds_a_root_by_id_slug_or_alias() {
+        let (_d, c) = conn();
+        let mut with_root = pref("k/one", "one");
+        with_root.root = Some(PathBuf::from("/work/one"));
+        let one = upsert_project(&c, &with_root).unwrap();
+        let none = upsert_project(&c, &pref("k/two", "two")).unwrap();
+        add_alias(&c, "uno", &one.id).unwrap();
+        for name in [one.id.as_str(), "one", "uno", "UNO"] {
+            assert_eq!(root_of(&c, name).unwrap().as_deref(), Some("/work/one"));
+        }
+        assert_eq!(root_of(&c, &none.slug).unwrap(), None);
+        assert_eq!(root_of(&c, "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn a_moved_root_replaces_the_stored_one_when_it_exists() {
+        let (d, c) = conn();
+        let old = d.path().join("old");
+        let new = d.path().join("new");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&new).unwrap();
+        let mut r = pref("k/app", "app");
+        r.root = Some(old.clone());
+        let p = upsert_project(&c, &r).unwrap();
+        assert_eq!(root_of(&c, &p.id).unwrap().as_deref(), old.to_str());
+        r.root = Some(new.clone());
+        upsert_project(&c, &r).unwrap();
+        assert_eq!(root_of(&c, &p.id).unwrap().as_deref(), new.to_str());
+        // A root that is not there does not replace a good one.
+        r.root = Some(d.path().join("gone"));
+        upsert_project(&c, &r).unwrap();
+        assert_eq!(root_of(&c, &p.id).unwrap().as_deref(), new.to_str());
     }
 }

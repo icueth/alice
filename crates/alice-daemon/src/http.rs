@@ -1,34 +1,46 @@
 //! JSON API over loopback HTTP. The guard (token + Host + Origin) is the code verified in the spike.
 
+use crate::secrets::SecretName;
 use crate::service::Service;
 use alice_core::api::*;
 use alice_core::error::AliceError;
+use alice_core::settings::SettingError;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, FromRequest, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 
 /// Largest request body. An ingest at its limits (1,000 chunks of 32 KB) is about 32 MB of JSON.
 const BODY_LIMIT: usize = 40 * 1024 * 1024;
+/// A comment line on an idle event stream, so proxies and clients keep it open.
+const SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// The API token, switchable while the daemon runs (`alice token rotate`): the guard and the
+/// ping proof both read the current value for every request.
+pub type SharedToken = Arc<parking_lot::RwLock<Arc<str>>>;
 
 #[derive(Clone)]
 pub struct Guard {
-    token: Arc<str>,
+    token: SharedToken,
     allowed_hosts: Arc<[String; 2]>,
     allowed_origin: Arc<str>,
 }
 
 impl Guard {
-    pub fn new(token: impl Into<Arc<str>>, port: u16) -> Self {
+    pub fn new(token: SharedToken, port: u16) -> Self {
         Self {
-            token: token.into(),
+            token,
             allowed_hosts: Arc::new([format!("127.0.0.1:{port}"), format!("localhost:{port}")]),
             allowed_origin: format!("http://127.0.0.1:{port}").into(),
         }
@@ -94,8 +106,10 @@ pub async fn guard(State(g): State<Guard>, req: Request, next: Next) -> Response
     if let Some(r) = host_or_origin_refusal(&g, &req) {
         return r;
     }
+    // The current token, copied out so the lock is not held across the handler.
+    let current = g.token.read().clone();
     match bearer(req.headers()) {
-        Some(t) if ct_eq(t.as_bytes(), g.token.as_bytes()) => next.run(req).await,
+        Some(t) if ct_eq(t.as_bytes(), current.as_bytes()) => next.run(req).await,
         _ => {
             let mut r = refuse(
                 StatusCode::UNAUTHORIZED,
@@ -148,7 +162,9 @@ impl From<JsonRejection> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, kind) = match &self.0 {
-            AliceError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid"),
+            AliceError::Invalid(_) | AliceError::Refused { .. } => {
+                (StatusCode::BAD_REQUEST, "invalid")
+            }
             AliceError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             AliceError::ReadOnly(_) => (StatusCode::SERVICE_UNAVAILABLE, "read_only"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
@@ -179,8 +195,13 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 struct AppState {
     svc: Arc<Service>,
     shutdown: CancellationToken,
-    /// For the ping proof only; the guard keeps its own copy.
-    token: Arc<str>,
+    /// The same token the guard checks (the ping proof signs with it).
+    token: SharedToken,
+    /// One rotation at a time, so the file and the token in memory end up the same.
+    rotating: Arc<tokio::sync::Mutex<()>>,
+    /// Ends every event stream opened under the current token: cancelled on a rotation (and a
+    /// child of `shutdown`, so a stopping daemon ends them too).
+    streams: Arc<parking_lot::Mutex<CancellationToken>>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -216,11 +237,10 @@ async fn ping(
     })?;
     let proof = match q.nonce {
         None => None,
-        Some(n) if valid_nonce(&n) => Some(crate::discovery::ping_proof(
-            &st.token,
-            &n,
-            st.svc.instance(),
-        )),
+        Some(n) if valid_nonce(&n) => {
+            let token = st.token.read().clone();
+            Some(crate::discovery::ping_proof(&token, &n, st.svc.instance()))
+        }
         Some(_) => {
             return Err(ApiError(AliceError::invalid(
                 "the nonce must be 16 to 64 hex characters; send a fresh random one",
@@ -236,6 +256,12 @@ async fn ping(
 }
 async fn health(State(st): State<AppState>) -> ApiResult<Health> {
     Ok(Json(st.svc.health().await?))
+}
+/// What `alice doctor` asks the daemon: the checks only it can make.
+async fn doctor(State(st): State<AppState>) -> ApiResult<crate::doctor::DoctorReport> {
+    Ok(Json(crate::doctor::DoctorReport {
+        checks: crate::doctor::daemon_checks(&st.svc).await?,
+    }))
 }
 async fn projects(
     State(st): State<AppState>,
@@ -301,15 +327,357 @@ async fn admin_shutdown(State(st): State<AppState>) -> StatusCode {
     StatusCode::ACCEPTED
 }
 
+/// Replace the API token: the new one goes to the token file (privately, atomically) and takes
+/// effect at once, so the old one is refused from the next request on. The new token is never
+/// returned; clients read it from `token` (they find out through the ping proof, which the old
+/// token can no longer make).
+async fn rotate_token(State(st): State<AppState>) -> ApiResult<serde_json::Value> {
+    let _one_at_a_time = st.rotating.lock().await;
+    let home = st.svc.home().clone();
+    let file = home.token_file();
+    let new = tokio::task::spawn_blocking(move || crate::discovery::rotate_token(&home))
+        .await
+        .map_err(|e| AliceError::Other(format!("the token rotation task failed: {e}")))?
+        .map_err(|e| {
+            AliceError::Other(format!(
+                "cannot write the new token to {}: {e}; the old token stays in force. Check the permissions of the Alice home directory",
+                file.display()
+            ))
+        })?;
+    *st.token.write() = Arc::from(new);
+    // A stream opened with the old token must not outlive it.
+    let fresh = st.shutdown.child_token();
+    std::mem::replace(&mut *st.streams.lock(), fresh).cancel();
+    st.svc.record_token_rotation();
+    Ok(Json(serde_json::json!({ "rotated": true })))
+}
+async fn events(
+    State(st): State<AppState>,
+    query: Result<Query<EventsRequest>, QueryRejection>,
+) -> ApiResult<Vec<EventRow>> {
+    let Query(q) = query.map_err(|r| {
+        ApiError(AliceError::Invalid(format!(
+            "{}; use /api/v1/events?target_id=<id>&actor=<actor>&before=<event id>&limit=<1-500>",
+            r.body_text()
+        )))
+    })?;
+    Ok(Json(st.svc.events(q).await?))
+}
+async fn undo(
+    State(st): State<AppState>,
+    ApiJson(req): ApiJson<UndoRequest>,
+) -> ApiResult<UndoResponse> {
+    Ok(Json(st.svc.undo(req).await?))
+}
+
+async fn list_reviews(
+    State(st): State<AppState>,
+    query: Result<Query<alice_core::store::reviews::ReviewQuery>, QueryRejection>,
+) -> ApiResult<Vec<alice_core::store::reviews::ReviewItem>> {
+    let Query(q) = query.map_err(|r| {
+        ApiError(AliceError::Invalid(format!(
+            "{}; use /api/v1/reviews?status=<open|resolved>&review_type=<type>&before=<review id>&limit=<1-500>",
+            r.body_text()
+        )))
+    })?;
+    Ok(Json(st.svc.reviews(q).await?))
+}
+/// The query of `GET /api/v1/reviews/counts`.
+#[derive(serde::Deserialize)]
+struct ReviewCountsQuery {
+    review_type: Option<alice_core::store::reviews::ReviewType>,
+    provider: Option<String>,
+}
+
+async fn review_counts(
+    State(st): State<AppState>,
+    query: Result<Query<ReviewCountsQuery>, QueryRejection>,
+) -> ApiResult<alice_core::store::reviews::ReviewCounts> {
+    let Query(q) = query.map_err(|r| {
+        ApiError(AliceError::Invalid(format!(
+            "{}; use /api/v1/reviews/counts?review_type=<type>&provider=<provider>",
+            r.body_text()
+        )))
+    })?;
+    Ok(Json(st.svc.review_counts(q.review_type, q.provider).await?))
+}
+async fn dismiss_reviews(
+    State(st): State<AppState>,
+    ApiJson(req): ApiJson<DismissRequest>,
+) -> ApiResult<DismissResponse> {
+    Ok(Json(st.svc.dismiss_reviews(req).await?))
+}
+async fn get_review(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<alice_core::store::reviews::ReviewItem> {
+    Ok(Json(st.svc.review(id).await?))
+}
+
+/// The body of `POST /api/v1/reviews/{id}/resolve`; the id comes from the path.
+#[derive(serde::Deserialize)]
+struct ResolveBody {
+    choice: String,
+    #[serde(default)]
+    author: alice_core::model::Author,
+}
+
+async fn resolve_review(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<ResolveBody>,
+) -> ApiResult<ResolveResponse> {
+    Ok(Json(
+        st.svc
+            .resolve_review(ResolveRequest {
+                id,
+                choice: body.choice,
+                author: body.author,
+            })
+            .await?,
+    ))
+}
+async fn merge(
+    State(st): State<AppState>,
+    ApiJson(req): ApiJson<MergeRequest>,
+) -> ApiResult<MergeResponse> {
+    Ok(Json(st.svc.merge(req).await?))
+}
+async fn stats(State(st): State<AppState>) -> ApiResult<Stats> {
+    Ok(Json(st.svc.stats().await?))
+}
+
+async fn list_backups(State(st): State<AppState>) -> ApiResult<Vec<crate::backup::BackupInfo>> {
+    Ok(Json(st.svc.backups().await?))
+}
+async fn make_backup(State(st): State<AppState>) -> ApiResult<crate::backup::BackupInfo> {
+    Ok(Json(st.svc.backup_now().await?))
+}
+async fn maintenance_status(State(st): State<AppState>) -> ApiResult<Vec<JobStatus>> {
+    Ok(Json(st.svc.maintenance_status().await?))
+}
+
+/// The body of `POST /api/v1/maintenance/run`.
+#[derive(serde::Deserialize)]
+struct RunJobBody {
+    job: String,
+}
+
+async fn run_maintenance(
+    State(st): State<AppState>,
+    ApiJson(body): ApiJson<RunJobBody>,
+) -> ApiResult<crate::maintenance::JobReport> {
+    let job = crate::maintenance::Job::parse_or_err(&body.job)?;
+    Ok(Json(st.svc.run_job(job).await?))
+}
+
+/// A refused settings change: the first problem as `error` (like every refusal), and all of
+/// them as `errors`, each with the key it is about.
+#[derive(Serialize)]
+struct SettingsErrors {
+    error: String,
+    kind: &'static str,
+    errors: Vec<SettingError>,
+}
+
+async fn get_settings(State(st): State<AppState>) -> Json<SettingsView> {
+    Json(st.svc.settings_view_async().await)
+}
+
+async fn patch_settings(
+    State(st): State<AppState>,
+    ApiJson(body): ApiJson<serde_json::Map<String, serde_json::Value>>,
+) -> Response {
+    match st.svc.patch_settings_async(body).await {
+        Ok(r) => Json(r).into_response(),
+        Err(errors) => (
+            StatusCode::BAD_REQUEST,
+            Json(SettingsErrors {
+                error: errors
+                    .first()
+                    .map(|e| format!("{}: {}", e.key, e.message))
+                    .unwrap_or_default(),
+                kind: "invalid",
+                errors,
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// The switches other processes read often (`alice mcp` asks before each tool listing): small,
+/// and without the secrets' status, which may wait on a keychain prompt.
+async fn settings_flags(State(st): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "mcp.admin_tools": st.svc.settings().mcp.admin_tools }))
+}
+
+/// The JSON Schema of the settings: the web UI renders its forms and help from it.
+async fn settings_schema() -> Json<serde_json::Value> {
+    Json(
+        serde_json::to_value(schemars::schema_for!(alice_core::settings::Settings))
+            .unwrap_or_default(),
+    )
+}
+
+fn secret_name(name: &str) -> Result<SecretName, ApiError> {
+    SecretName::parse(name).ok_or_else(|| {
+        // The name is not echoed: a secret pasted by mistake where the name goes would be.
+        ApiError(AliceError::invalid(format!(
+            "unknown secret name; use one of: {}",
+            SecretName::ALL
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    })
+}
+
+/// The body is read as plain JSON, not as a typed request: a type error from serde would quote
+/// the value it found, and the value is a secret.
+async fn put_secret(
+    State(st): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    ApiJson(body): ApiJson<serde_json::Value>,
+) -> ApiResult<SecretStatus> {
+    let name = secret_name(&name)?;
+    let Some(value) = body.get("value").and_then(|v| v.as_str()) else {
+        return Err(ApiError(AliceError::invalid(
+            "send a JSON body like {\"value\": \"<the secret>\"} with the secret as text",
+        )));
+    };
+    Ok(Json(
+        st.svc.set_secret_async(name, value.to_string()).await?,
+    ))
+}
+
+async fn delete_secret(
+    State(st): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let deleted = st.svc.delete_secret_async(secret_name(&name)?).await?;
+    Ok(Json(serde_json::json!({ "deleted": deleted })))
+}
+
+async fn test_provider(
+    State(st): State<AppState>,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+) -> ApiResult<ProviderTest> {
+    Ok(Json(st.svc.test_provider(&provider).await?))
+}
+
+/// What the event stream reads between messages.
+struct Feed {
+    rx: tokio::sync::broadcast::Receiver<StreamItem>,
+    svc: Arc<Service>,
+    tick: tokio::time::Interval,
+    /// The health last sent, without the fields that change on every reading.
+    last: Option<serde_json::Value>,
+    /// The last health reading failed (logged once until it works again).
+    health_failing: bool,
+    shutdown: CancellationToken,
+}
+
+/// The items of one event-stream client: committed changes as they are broadcast, `Lagged`
+/// when it fell too far behind to get them all, and the health on connect and whenever it
+/// changes (checked every `health_tick`, one reading shared by every client). It ends when
+/// `shutdown` is cancelled.
+pub(crate) fn feed(
+    svc: Arc<Service>,
+    shutdown: CancellationToken,
+) -> impl futures::Stream<Item = StreamItem> {
+    let mut tick = tokio::time::interval(svc.health_tick());
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick fires at once: the stream opens with the current health.
+    let feed = Feed {
+        rx: svc.subscribe(),
+        svc,
+        tick,
+        last: None,
+        health_failing: false,
+        shutdown,
+    };
+    futures::stream::unfold(feed, |mut f| async move {
+        loop {
+            tokio::select! {
+                _ = f.shutdown.cancelled() => return None,
+                item = f.rx.recv() => match item {
+                    Ok(item) => return Some((item, f)),
+                    // The oldest items were dropped for this client; it can list them again.
+                    Err(RecvError::Lagged(missed)) => {
+                        return Some((StreamItem::Lagged { missed }, f));
+                    }
+                    Err(RecvError::Closed) => return None,
+                },
+                _ = f.tick.tick() => {
+                    let health = match f.svc.stream_health().await {
+                        Ok(h) => {
+                            if f.health_failing {
+                                tracing::info!("the event stream reads the health again");
+                                f.health_failing = false;
+                            }
+                            h
+                        }
+                        Err(e) => {
+                            if !f.health_failing {
+                                tracing::warn!(error = %e, "the event stream cannot read the health; it is sent again once it can be read");
+                                f.health_failing = true;
+                            }
+                            continue;
+                        }
+                    };
+                    // Memory use changes on every reading; it alone is not a change.
+                    let mut key = serde_json::to_value(&health).unwrap_or_default();
+                    if let Some(o) = key.as_object_mut() {
+                        o.remove("memory_bytes");
+                    }
+                    if f.last.as_ref() != Some(&key) {
+                        f.last = Some(key);
+                        return Some((StreamItem::Health { health }, f));
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn sse_event(item: &StreamItem) -> Event {
+    Event::default().data(serde_json::to_string(item).unwrap_or_default())
+}
+
+/// Server-sent events: `feed`, one JSON `StreamItem` per message. The stream ends when the
+/// daemon stops, so a graceful shutdown never waits for a client that stays connected.
+async fn stream(
+    State(st): State<AppState>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    use futures::StreamExt;
+    let ends = st.streams.lock().clone();
+    let s = feed(st.svc.clone(), ends).map(|item| Ok(sse_event(&item)));
+    Sse::new(s).keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE))
+}
+
+/// Ends a response body (an MCP session's event stream) when the token it was opened with is
+/// rotated. A request is checked against the token before it gets here; this cuts the ones that
+/// were already open.
+async fn end_on_rotation(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    use futures::StreamExt;
+    let ends = st.streams.lock().clone();
+    let (parts, body) = next.run(req).await.into_parts();
+    let stream = body.into_data_stream().take_until(ends.cancelled_owned());
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
+}
+
 /// Build the router: the public ping, and everything else (the JSON API and the MCP service
 /// at `/mcp`) behind the token, Host and Origin guard.
 pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: CancellationToken) -> Router {
-    let token: Arc<str> = token.into();
+    let token: SharedToken = Arc::new(parking_lot::RwLock::new(Arc::from(token)));
     let g = Guard::new(token.clone(), port);
     let state = AppState {
         svc,
+        streams: Arc::new(parking_lot::Mutex::new(shutdown.child_token())),
         shutdown,
         token,
+        rotating: Arc::new(tokio::sync::Mutex::new(())),
     };
     let public = Router::new()
         .route("/api/v1/ping", get(ping))
@@ -317,6 +685,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .layer(middleware::from_fn_with_state(g.clone(), host_guard));
     let private = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/doctor", get(doctor))
         .route("/api/v1/projects", get(projects))
         .route("/api/v1/remember", post(remember))
         .route("/api/v1/recall", post(recall))
@@ -326,13 +695,39 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/facts/query", post(facts))
         .route("/api/v1/facts/assert", post(assert_fact))
         .route("/api/v1/ingest", post(ingest))
-        .route("/api/v1/admin/shutdown", post(admin_shutdown))
-        // Before the guard layer, so `/mcp` is covered by it.
-        .nest_service(
-            "/mcp",
-            crate::mcp::http_service(state.svc.clone(), port, state.shutdown.clone()),
+        .route("/api/v1/events", get(events))
+        .route("/api/v1/undo", post(undo))
+        .route("/api/v1/reviews", get(list_reviews))
+        .route("/api/v1/reviews/counts", get(review_counts))
+        .route("/api/v1/reviews/dismiss", post(dismiss_reviews))
+        .route("/api/v1/reviews/{id}", get(get_review))
+        .route("/api/v1/reviews/{id}/resolve", post(resolve_review))
+        .route("/api/v1/memories/merge", post(merge))
+        .route("/api/v1/stats", get(stats))
+        .route("/api/v1/backups", get(list_backups).post(make_backup))
+        .route("/api/v1/maintenance", get(maintenance_status))
+        .route("/api/v1/maintenance/run", post(run_maintenance))
+        .route("/api/v1/events/stream", get(stream))
+        .route("/api/v1/settings", get(get_settings).patch(patch_settings))
+        .route("/api/v1/settings/schema", get(settings_schema))
+        .route("/api/v1/settings/flags", get(settings_flags))
+        .route("/api/v1/settings/test/{provider}", post(test_provider))
+        .route(
+            "/api/v1/secrets/{name}",
+            put(put_secret).delete(delete_secret),
         )
-        .with_state(state)
+        .route("/api/v1/admin/shutdown", post(admin_shutdown))
+        .route("/api/v1/admin/token/rotate", post(rotate_token))
+        .with_state(state.clone())
+        // Before the guard layer, so `/mcp` is covered by it. Its streams end on a rotation too.
+        .merge(
+            Router::new()
+                .nest_service(
+                    "/mcp",
+                    crate::mcp::http_service(state.svc.clone(), port, state.shutdown.clone()),
+                )
+                .layer(middleware::from_fn_with_state(state, end_on_rotation)),
+        )
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn_with_state(g, guard));
     public.merge(private)
@@ -344,6 +739,42 @@ mod tests {
     use crate::paths::AliceHome;
     use crate::service::ServiceOptions;
     use alice_core::embed::{Embedder, FakeEmbedder};
+
+    /// A client that falls more than the stream's capacity behind is told how many items it
+    /// missed (it can list `/api/v1/events` again), instead of a silent gap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lagging_client_is_told_how_many_items_it_missed() {
+        use futures::StreamExt;
+        let d = tempfile::tempdir().unwrap();
+        let svc = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                health_tick: std::time::Duration::from_secs(3_600),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut items = Box::pin(feed(svc.clone(), CancellationToken::new()));
+        assert!(matches!(
+            items.next().await,
+            Some(StreamItem::Health { .. })
+        ));
+        let writes = (0..300).map(|i| {
+            svc.remember(RememberRequest {
+                content: format!("burst {i}"),
+                ..Default::default()
+            })
+        });
+        for r in futures::future::join_all(writes).await {
+            r.unwrap();
+        }
+        match items.next().await {
+            Some(StreamItem::Lagged { missed }) => assert_eq!(missed, 300 - 256),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(items.next().await, Some(StreamItem::Event { .. })));
+    }
 
     /// Review focus #3 (lose no writes): a read-only database spools `remember` and says so.
     #[tokio::test(flavor = "multi_thread")]

@@ -4,6 +4,7 @@
 
 use crate::error::{AliceError, Result};
 use crate::ids::{new_id, now_rfc3339};
+use crate::model::Author;
 use crate::normalize::{nfc, truncate_chars};
 use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -45,6 +46,10 @@ pub struct AssertFact {
     pub action: FactAction,
     #[serde(default)]
     pub source_memory_id: Option<String>,
+    /// Who asserts it (filled by the daemon: the MCP client, or the CLI); history only.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub author: Author,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -150,7 +155,10 @@ fn given(field: &Option<String>) -> Option<&str> {
 }
 
 /// A caller's time in the stored form (RFC 3339, UTC, milliseconds). A bare date is midnight UTC.
+/// The year must have four digits (1 to 9999): text order is time order only then. A leap
+/// second (`:60`) is kept as the last millisecond of the minute, so intervals stay ordered.
 fn stored_time(field: &str, raw: &str) -> Result<String> {
+    use chrono::{Datelike, Timelike};
     let s = raw.trim();
     let utc = if let Ok(t) = DateTime::parse_from_rfc3339(s) {
         t.with_timezone(&Utc)
@@ -158,9 +166,20 @@ fn stored_time(field: &str, raw: &str) -> Result<String> {
         day.and_time(NaiveTime::MIN).and_utc()
     } else {
         return Err(AliceError::invalid(format!(
-            "{field} \"{}\" is not a time; use RFC 3339 such as 2026-10-13T09:44:23.391Z or a date such as 2026-10-13",
+            "{field} \"{}\" is not a time; use RFC 3339 with a four-digit year such as 2026-10-13T09:44:23.391Z, or a date such as 2026-10-13",
             truncate_chars(s, 40)
         )));
+    };
+    if !(1..=9999).contains(&utc.year()) {
+        return Err(AliceError::invalid(format!(
+            "{field} \"{}\" has a year outside 1 to 9999; use a four-digit year such as 2026-10-13",
+            truncate_chars(s, 40)
+        )));
+    }
+    let utc = if utc.nanosecond() >= 1_000_000_000 {
+        utc.with_nanosecond(999_000_000).unwrap_or(utc)
+    } else {
+        utc
     };
     Ok(utc.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
@@ -193,6 +212,22 @@ fn ensure_predicate(conn: &Connection, p: &str) -> Result<String> {
     }
     conn.execute("INSERT INTO predicates (name) VALUES (?1)", [p])?;
     Ok(p.to_string())
+}
+
+/// Whether `name` is a predicate of the vocabulary, as written or as an alias of one.
+pub fn predicate_exists(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(canonical_predicate(conn, &normalize_predicate(name))?.is_some())
+}
+
+/// Canonical predicate names, most used first (ties by name).
+pub fn predicate_names(conn: &Connection, limit: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT p.name FROM predicates p LEFT JOIN relations r ON r.predicate = p.name
+         WHERE p.canonical IS NULL GROUP BY p.name ORDER BY count(r.id) DESC, p.name LIMIT ?1",
+    )?;
+    Ok(stmt
+        .query_map([limit as i64], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?)
 }
 
 /// `valid_to` for a relation closed at `?3`. A close time before the relation's start would
@@ -283,6 +318,156 @@ pub fn assert_fact(conn: &Connection, f: &AssertFact, hlc: String) -> Result<Fac
         predicate,
         suggestion: None,
     })
+}
+
+/// The part of the vocabulary a predicate mapping touches, as events record it so a mapping
+/// can be undone: the names involved, their `predicates` rows (a name without a row did not
+/// exist), and the predicate each affected relation carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredicateSnapshot {
+    pub names: Vec<String>,
+    /// `(name, canonical)` of the names that have a row, sorted by name.
+    pub rows: Vec<(String, Option<String>)>,
+    /// `(relation id, predicate)`, sorted by id.
+    pub relations: Vec<(String, String)>,
+}
+
+/// The snapshot of `names` and the relations `ids` as they are now.
+pub fn snapshot_predicates(
+    conn: &Connection,
+    names: &[String],
+    ids: &[String],
+) -> Result<PredicateSnapshot> {
+    let mut rows = Vec::new();
+    for n in names {
+        if let Some(c) = conn
+            .query_row(
+                "SELECT canonical FROM predicates WHERE name = ?1",
+                [n],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+        {
+            rows.push((n.clone(), c));
+        }
+    }
+    rows.sort();
+    let mut relations = Vec::new();
+    for id in ids {
+        if let Some(p) = conn
+            .query_row("SELECT predicate FROM relations WHERE id = ?1", [id], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+        {
+            relations.push((id.clone(), p));
+        }
+    }
+    relations.sort();
+    Ok(PredicateSnapshot {
+        names: names.to_vec(),
+        rows,
+        relations,
+    })
+}
+
+/// Put the vocabulary and the relations back as `s` says: the rows of its names are replaced
+/// by its rows, and each relation it lists gets its predicate back.
+pub fn restore_predicates(conn: &Connection, s: &PredicateSnapshot, hlc: &str) -> Result<()> {
+    for n in &s.names {
+        conn.execute("DELETE FROM predicates WHERE name = ?1", [n])?;
+    }
+    for (n, c) in &s.rows {
+        conn.execute(
+            "INSERT INTO predicates (name, canonical) VALUES (?1, ?2)",
+            params![n, c],
+        )?;
+    }
+    for (id, p) in &s.relations {
+        conn.execute(
+            "UPDATE relations SET predicate = ?1, hlc = ?2 WHERE id = ?3",
+            params![p, hlc, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// From now on `name` means `canonical`: existing relations are renamed and later asserts with
+/// `name` use `canonical`. Returns how many relations were renamed.
+pub fn map_predicate(conn: &Connection, name: &str, canonical: &str, hlc: &str) -> Result<usize> {
+    Ok(map_predicate_recorded(conn, name, canonical, hlc)?
+        .0
+        .relations
+        .len())
+}
+
+/// [`map_predicate`], also returning the snapshots (before, after) of everything it touched,
+/// for the event that makes the mapping undoable.
+pub fn map_predicate_recorded(
+    conn: &Connection,
+    name: &str,
+    canonical: &str,
+    hlc: &str,
+) -> Result<(PredicateSnapshot, PredicateSnapshot)> {
+    let name = predicate_key(name)?;
+    let wanted = predicate_key(canonical)?;
+    let target = canonical_predicate(conn, &wanted)?
+        .ok_or_else(|| AliceError::NotFound(format!("predicate {canonical}")))?;
+    if name == target || name == wanted {
+        return Err(AliceError::invalid(format!(
+            "{name} cannot map to itself; pick a different predicate"
+        )));
+    }
+    let mut names = vec![name.clone()];
+    {
+        let mut stmt =
+            conn.prepare("SELECT name FROM predicates WHERE canonical = ?1 ORDER BY name")?;
+        for n in stmt.query_map([&name], |r| r.get::<_, String>(0))? {
+            names.push(n?);
+        }
+    }
+    let ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM relations WHERE predicate = ?1 ORDER BY id")?;
+        stmt.query_map([&name], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    let before = snapshot_predicates(conn, &names, &ids)?;
+    conn.execute(
+        "INSERT INTO predicates (name, canonical) VALUES (?1, ?2) ON CONFLICT(name) DO UPDATE SET canonical = excluded.canonical",
+        params![name, target],
+    )?;
+    // Names that pointed at `name` follow it.
+    conn.execute(
+        "UPDATE predicates SET canonical = ?1 WHERE canonical = ?2",
+        params![target, name],
+    )?;
+    conn.execute(
+        "UPDATE relations SET predicate = ?1, hlc = ?2 WHERE predicate = ?3",
+        params![target, hlc, name],
+    )?;
+    let after = snapshot_predicates(conn, &names, &ids)?;
+    Ok((before, after))
+}
+
+/// Ids of the open relations of `subject` and `predicate` (resolved as `assert_fact` resolves
+/// them), sorted: every relation an `assert_fact` for them can close. Empty when the subject
+/// or the predicate is unknown; names are looked up, never created.
+pub fn open_relation_ids(conn: &Connection, subject: &str, predicate: &str) -> Result<Vec<String>> {
+    let p = normalize_predicate(predicate);
+    if p.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (Some((subject_id, _)), Some(p)) =
+        (find_entity(conn, subject)?, canonical_predicate(conn, &p)?)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM relations WHERE subject_id = ?1 AND predicate = ?2 AND valid_to IS NULL ORDER BY id",
+    )?;
+    Ok(stmt
+        .query_map(params![subject_id, p], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?)
 }
 
 /// Close the current relations for subject, predicate and object. Names are looked up, never
@@ -443,7 +628,8 @@ mod tests {
             object_kind: ObjectKind::Auto,
             valid_from: Some(from.into()),
             action,
-            source_memory_id: None,
+            // Later fields keep their defaults, so adding one does not touch this helper.
+            ..Default::default()
         }
     }
 
@@ -1197,6 +1383,53 @@ mod tests {
         assert_eq!(count(&c, "mentions"), 2);
     }
 
+    /// What history snapshots before a fact is asserted: the subject's open relations for the
+    /// predicate, found the way `assert_fact` finds them (aliases, predicate synonyms), and
+    /// nothing created by looking.
+    #[test]
+    fn open_relation_ids_are_the_relations_an_assert_can_close() {
+        let (_d, c) = conn();
+        assert!(open_relation_ids(&c, "api", "uses").unwrap().is_empty());
+        let n_entities = |c: &Connection| -> i64 {
+            c.query_row("SELECT count(*) FROM entities", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(n_entities(&c), 0, "looking up creates nothing");
+        let a = assert_fact(
+            &c,
+            &fact("api", "uses", "SQLite", FactAction::Add, T1),
+            "h".into(),
+        )
+        .unwrap()
+        .relation_id
+        .unwrap();
+        let b = assert_fact(
+            &c,
+            &fact("api", "uses", "Redis", FactAction::Add, T1),
+            "h".into(),
+        )
+        .unwrap()
+        .relation_id
+        .unwrap();
+        assert_fact(
+            &c,
+            &fact("api", "runs_on", "port 8080", FactAction::Add, T1),
+            "h".into(),
+        )
+        .unwrap();
+        let mut want = vec![a.clone(), b];
+        want.sort();
+        assert_eq!(open_relation_ids(&c, " API ", "Uses").unwrap(), want);
+        assert_fact(
+            &c,
+            &fact("api", "uses", "SQLite", FactAction::End, T2),
+            "h".into(),
+        )
+        .unwrap();
+        assert!(!open_relation_ids(&c, "api", "uses").unwrap().contains(&a));
+        assert!(open_relation_ids(&c, "api", "  ").unwrap().is_empty());
+    }
+
     #[test]
     fn source_memory_is_recorded() {
         let (_d, c) = conn();
@@ -1225,5 +1458,142 @@ mod tests {
         assert_eq!(f.object_kind, ObjectKind::Literal);
         let q: FactsQuery = serde_json::from_str(r#"{"entity":"a"}"#).unwrap();
         assert!(!q.timeline && q.as_of.is_none() && q.predicate.is_none());
+    }
+
+    #[test]
+    fn mapping_a_predicate_renames_its_relations_and_future_asserts() {
+        let (_d, c) = conn();
+        for (p, o) in [("uses", "SQLite"), ("use", "Rust")] {
+            assert_fact(
+                &c,
+                &AssertFact {
+                    subject: "alice".into(),
+                    predicate: p.into(),
+                    object: o.into(),
+                    ..Default::default()
+                },
+                "h".into(),
+            )
+            .unwrap();
+        }
+        assert_eq!(map_predicate(&c, "uses", "use", "h2").unwrap(), 1);
+        let facts = query_facts(
+            &c,
+            &FactsQuery {
+                entity: "alice".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(facts.iter().all(|f| f.predicate == "use"), "{facts:?}");
+        let out = assert_fact(
+            &c,
+            &AssertFact {
+                subject: "alice".into(),
+                predicate: "uses".into(),
+                object: "Tokio".into(),
+                ..Default::default()
+            },
+            "h3".into(),
+        )
+        .unwrap();
+        assert_eq!(out.predicate, "use");
+        assert!(
+            map_predicate(&c, "uses", "uses", "h4").is_err(),
+            "a predicate cannot map to itself"
+        );
+        assert!(matches!(
+            map_predicate(&c, "uses", "unknown_verb", "h5"),
+            Err(AliceError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn fact_times_outside_four_digit_years_are_refused_and_leap_seconds_are_clamped() {
+        let (_d, c) = conn();
+        let put = |from: &str| {
+            assert_fact(
+                &c,
+                &AssertFact {
+                    subject: "a".into(),
+                    predicate: "p".into(),
+                    object: "o".into(),
+                    valid_from: Some(from.into()),
+                    ..Default::default()
+                },
+                "h".into(),
+            )
+        };
+        // "10000-01-01T00:00:00Z" fails RFC 3339 parsing (five-digit year) and reaches the
+        // "not a time" branch; the others parse and hit the year guard. Both messages name the fix.
+        for bad in [
+            "+10000-01-01",
+            "10000-01-01T00:00:00Z",
+            "-0001-06-01",
+            "0000-01-01",
+        ] {
+            let e = put(bad).unwrap_err();
+            assert!(e.to_string().contains("four-digit year"), "{bad}: {e}");
+        }
+        assert_eq!(count(&c, "relations"), 0, "nothing was written");
+        let out = put("2026-06-30T23:59:60Z").unwrap();
+        let from: String = c
+            .query_row(
+                "SELECT valid_from FROM relations WHERE id = ?1",
+                [out.relation_id.unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(from, "2026-06-30T23:59:59.999Z");
+    }
+
+    #[test]
+    fn a_leap_second_close_keeps_the_interval_visible() {
+        let (_d, c) = conn();
+        add(&c, "api", "runs_on", "k8s", "2026-06-30T23:59:60Z");
+        let ended = assert_fact(
+            &c,
+            &fact(
+                "api",
+                "runs_on",
+                "k8s",
+                FactAction::End,
+                "2026-06-30T23:59:60Z",
+            ),
+            "h2".into(),
+        )
+        .unwrap();
+        assert_eq!(ended.ended, 1);
+        let t = timeline(&c, "api");
+        assert!(
+            t[0].valid_to.as_deref() > Some(t[0].valid_from.as_str()),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn predicate_names_are_canonical_and_most_used_first() {
+        let (_d, c) = conn();
+        for (p, o) in [
+            ("uses", "SQLite"),
+            ("uses", "Rust"),
+            ("deployed_on", "Coolify"),
+        ] {
+            add(&c, "alice", p, o, "2026-01-01");
+        }
+        assert!(predicate_exists(&c, "Uses").unwrap());
+        assert!(predicate_exists(&c, "deployed on").unwrap());
+        assert!(!predicate_exists(&c, "owns").unwrap());
+        map_predicate(&c, "hosted_on", "deployed_on", "h").unwrap();
+        assert!(
+            predicate_exists(&c, "hosted_on").unwrap(),
+            "an alias counts as known"
+        );
+        assert_eq!(
+            predicate_names(&c, 10).unwrap(),
+            ["uses", "deployed_on"],
+            "aliases are not listed; most used first"
+        );
+        assert_eq!(predicate_names(&c, 1).unwrap(), ["uses"]);
     }
 }

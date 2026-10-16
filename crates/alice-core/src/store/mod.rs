@@ -1,11 +1,16 @@
 //! SQLite storage. Only the daemon opens the database.
 
 pub mod embeddings;
+pub mod events;
 pub mod fts;
+pub mod history;
+pub mod judge;
 pub mod kg;
+pub mod maintenance;
 pub mod memories;
 pub mod migrations;
 pub mod projects;
+pub mod reviews;
 pub mod sources;
 
 use crate::error::Result;
@@ -45,18 +50,24 @@ fn configure_sqlite_once() {
     });
 }
 
+/// How long a connection waits for a lock before it reports `SQLITE_BUSY`.
+pub const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
+
 /// Page cache of the writer connection, in KiB.
 const WRITER_CACHE_KIB: i64 = 64 * 1024;
 /// Page cache of each reader connection, in KiB. Readers are pooled (8 in the daemon), so
 /// this times the pool size bounds their memory; the OS file cache serves the rest.
 const READER_CACHE_KIB: i64 = 16 * 1024;
+/// Page cache of each connection in the small pool that reads chunk vectors for rescoring
+/// (a few hundred primary-key reads per raw-tier recall), in KiB.
+pub const VECTOR_READER_CACHE_KIB: i64 = 4 * 1024;
 
 /// No memory map: every connection would map the database separately and each map's touched
 /// pages count towards the daemon's RSS (with a 2.7 GB database at 1M chunks, eight readers
 /// mapping 256 MB each reached gigabytes). Reads through the OS file cache measured the same
 /// speed for Alice's queries.
 fn configure_common(conn: &Connection, cache_kib: i64) -> Result<()> {
-    conn.busy_timeout(Duration::from_millis(5_000))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.execute_batch(&format!(
         "PRAGMA foreign_keys = ON;
          PRAGMA temp_store = MEMORY;
@@ -77,11 +88,20 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
     configure_common(&conn, WRITER_CACHE_KIB)?;
     migrations::migrate(&mut conn, path)?;
+    // Migration 3 creates these; a database that migrated before they were added gets them once.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS chunks_created ON chunks(created_at);
+         CREATE INDEX IF NOT EXISTS judge_cache_created ON judge_cache(created_at);",
+    )?;
     Ok(conn)
 }
 
 /// Open a read-only connection for queries.
 pub fn open_reader(path: &Path) -> Result<Connection> {
+    open_reader_with_cache(path, READER_CACHE_KIB)
+}
+
+fn open_reader_with_cache(path: &Path, cache_kib: i64) -> Result<Connection> {
     configure_sqlite_once();
     let conn = Connection::open_with_flags(
         path,
@@ -89,16 +109,44 @@ pub fn open_reader(path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI,
     )?;
-    configure_common(&conn, READER_CACHE_KIB)?;
+    configure_common(&conn, cache_kib)?;
     Ok(conn)
 }
 
-/// Consistent snapshot of a live database.
+/// Consistent snapshot of a live database. The copy is private to its owner (0600 on Unix): it
+/// holds every memory.
 pub fn backup_into(conn: &Connection, dest: &Path) -> Result<()> {
     if dest.exists() {
         std::fs::remove_file(dest)?;
     }
     conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])?;
+    make_private(dest)?;
+    Ok(())
+}
+
+/// Create `dir` and any missing parents. What is created here is private to its owner (0700 on
+/// Unix); a directory that exists already keeps its mode.
+pub fn create_private_dir(dir: &Path) -> Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)?;
+    Ok(())
+}
+
+/// Make `path` readable and writable by its owner only (0600 on Unix; Windows has no mode bits).
+pub fn make_private(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -110,6 +158,8 @@ pub fn backup_into(conn: &Connection, dest: &Path) -> Result<()> {
 pub struct ReaderPool {
     path: PathBuf,
     max: usize,
+    /// Page cache of each connection, in KiB.
+    cache_kib: i64,
     state: Mutex<PoolState>,
     returned: Condvar,
 }
@@ -132,7 +182,18 @@ impl Drop for Lease<'_> {
         let mut st = self.pool.state.lock();
         match conn {
             // A panic may have left a statement or transaction open: do not reuse that one.
-            Some(c) if !std::thread::panicking() => st.idle.push(c),
+            // Neither may a connection that comes back inside a transaction or with a statement
+            // half-read: its read snapshot would pin the write-ahead log, and with it every
+            // restart of the log, for as long as the connection idles in the pool.
+            Some(c) if !std::thread::panicking() && c.is_autocommit() && !c.is_busy() => {
+                st.idle.push(c)
+            }
+            Some(_) if !std::thread::panicking() => {
+                tracing::warn!(
+                    "a pooled reader came back inside a transaction or mid-statement; closed"
+                );
+                st.open -= 1;
+            }
             _ => st.open -= 1,
         }
         drop(st);
@@ -142,9 +203,15 @@ impl Drop for Lease<'_> {
 
 impl ReaderPool {
     pub fn new(path: PathBuf, max: usize) -> Self {
+        Self::with_cache(path, max, READER_CACHE_KIB)
+    }
+
+    /// A pool whose connections have a page cache of `cache_kib` KiB each.
+    pub fn with_cache(path: PathBuf, max: usize, cache_kib: i64) -> Self {
         Self {
             path,
             max: max.max(1),
+            cache_kib,
             state: Mutex::new(PoolState {
                 idle: Vec::new(),
                 open: 0,
@@ -175,7 +242,7 @@ impl ReaderPool {
             self.returned.wait(&mut st);
         }
         drop(st);
-        match open_reader(&self.path) {
+        match open_reader_with_cache(&self.path, self.cache_kib) {
             Ok(conn) => Ok(Lease {
                 pool: self,
                 conn: Some(conn),
@@ -280,6 +347,25 @@ mod tests {
         assert_eq!(pragma(&r, "cache_size"), -READER_CACHE_KIB);
     }
 
+    /// The chunk vector list reads on its own small pool: same read-only connections, a 4 MiB
+    /// page cache each.
+    #[test]
+    fn a_reader_pool_can_give_its_connections_a_smaller_cache() {
+        let (_d, path) = temp_db();
+        drop(open_writer(&path).unwrap());
+        let pool = ReaderPool::with_cache(path, 2, VECTOR_READER_CACHE_KIB);
+        let cache: i64 = pool
+            .with(|c| Ok(c.query_row("PRAGMA cache_size", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(cache, -VECTOR_READER_CACHE_KIB);
+        assert_eq!(VECTOR_READER_CACHE_KIB, 4 * 1024);
+        assert!(
+            pool.with(|c| Ok(c.execute("INSERT INTO meta(key, value) VALUES ('x','y')", [])?))
+                .is_err(),
+            "read-only like every reader"
+        );
+    }
+
     #[test]
     fn reader_pool_never_opens_more_than_max_and_waiters_are_served() {
         use std::sync::Arc;
@@ -324,6 +410,55 @@ mod tests {
         assert_eq!(pool.state.lock().idle.len(), 3);
     }
 
+    /// A reader that keeps a read snapshot while it idles would stop the writer from ever
+    /// restarting the log (Task 20), so such a connection is closed, not pooled.
+    #[test]
+    fn a_connection_returned_inside_a_transaction_or_mid_statement_is_not_reused() {
+        let (_d, path) = temp_db();
+        let w = open_writer(&path).unwrap();
+        w.execute_batch("INSERT INTO meta (key, value) VALUES ('a', '1'), ('b', '2')")
+            .unwrap();
+        let pool = ReaderPool::new(path, 1);
+        // Back to back, as clients do: each reader sees an idle connection, no snapshot held.
+        pool.with(|c| {
+            assert!(c.is_autocommit() && !c.is_busy());
+            Ok(())
+        })
+        .unwrap();
+        pool.with(|c| {
+            c.execute_batch("BEGIN")?;
+            c.query_row("SELECT count(*) FROM meta", [], |r| r.get::<_, i64>(0))?;
+            Ok(())
+        })
+        .unwrap();
+        pool.with(|c| {
+            assert!(c.is_autocommit(), "the open transaction was not handed on");
+            Ok(())
+        })
+        .unwrap();
+        // A statement stepped once and then left: its snapshot is open too. The statement is
+        // leaked on purpose (a dropped one would be reset), so SQLite cannot close this
+        // connection: the pool discards it and it stays allocated for the life of the test.
+        // Only the transaction case above is actually closed.
+        let half = pool.lease().unwrap();
+        {
+            let c = half.conn.as_ref().unwrap();
+            let mut stmt = c.prepare("SELECT key FROM meta").unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            assert!(rows.next().unwrap().is_some());
+            assert!(c.is_busy());
+            std::mem::forget(rows);
+            std::mem::forget(stmt);
+        }
+        // Hand the busy connection back through the pool's own path.
+        drop(half);
+        pool.with(|c| {
+            assert!(!c.is_busy(), "a half-read statement was not handed on");
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn reader_pool_recovers_the_slot_of_a_panicking_caller_and_a_failed_open() {
         use std::sync::Arc;
@@ -355,15 +490,17 @@ mod tests {
         assert_eq!(missing.state.lock().open, 0);
     }
 
+    /// Pre-migration backups live in `<dir>/backups/`, named `alice-pre-migration-v<from>-<stamp>.db`.
     fn pre_migration_backups(dir: &Path) -> Vec<PathBuf> {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
+        let Ok(rd) = std::fs::read_dir(dir.join("backups")) else {
+            return Vec::new();
+        };
+        rd.map(|e| e.unwrap().path())
             .filter(|p| {
                 p.file_name()
                     .unwrap()
                     .to_string_lossy()
-                    .starts_with("alice.pre-migration-")
+                    .starts_with("alice-pre-migration-")
             })
             .collect()
     }
@@ -418,6 +555,188 @@ mod tests {
     }
 
     #[test]
+    fn a_v1_database_migrates_to_v2_after_a_backup() {
+        let (d, path) = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)").unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(include_str!("sql/0001_init.sql")).unwrap();
+            tx.execute("INSERT INTO schema_migrations VALUES (1, 'x')", [])
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let conn = open_writer(&path).unwrap();
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('events')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(cols.contains(&"group_id".to_string()));
+        let backups = pre_migration_backups(d.path());
+        assert_eq!(backups.len(), 1, "a backup was taken before migrating");
+        let name = backups[0].file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("alice-pre-migration-v1-"), "{name}");
+        assert!(name.ends_with(".db"), "{name}");
+        // It holds every memory: private to its owner, in a private directory.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&backups[0]), 0o600);
+            assert_eq!(mode(&d.path().join("backups")), 0o700);
+        }
+    }
+
+    /// An M1 database with data keeps every row through migration 2, gains the new columns
+    /// and indexes, and the dedupe index allows one open review item per key.
+    #[test]
+    fn migration_2_keeps_m1_rows_and_adds_the_indexes() {
+        let (_d, path) = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)").unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(include_str!("sql/0001_init.sql")).unwrap();
+            tx.execute("INSERT INTO schema_migrations VALUES (1, 'x')", [])
+                .unwrap();
+            tx.execute(
+                "INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id)
+                 VALUES ('E1', '2026-10-13T00:00:00.000Z', 'h', 'user', 'memory.edit', 'memory', 'M1')",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO review_items (id, type, payload_json, status, created_at)
+                 VALUES ('R1', 'merge', '{}', 'open', '2026-10-13T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let conn = open_writer(&path).unwrap();
+        let (events, reviews): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM events WHERE group_id IS NULL),
+                        (SELECT count(*) FROM review_items WHERE dedupe_key IS NULL)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (events, reviews),
+            (1, 1),
+            "M1 rows survive with NULL in the new columns"
+        );
+        let indexes: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('events_actor', 'events_target', 'events_ts', 'events_group', 'review_open_dedupe', 'review_status') ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            indexes,
+            [
+                "events_actor",
+                "events_group",
+                "events_target",
+                "events_ts",
+                "review_open_dedupe",
+                "review_status"
+            ]
+        );
+        let add = |id: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO review_items (id, type, payload_json, status, created_at, dedupe_key)
+                 VALUES (?1, 'undo', '{}', ?2, '2026-10-13T00:00:00.000Z', 'undo:E1')",
+                [id, status],
+            )
+        };
+        add("R2", "open").unwrap();
+        assert!(add("R3", "open").is_err(), "one open item per dedupe key");
+        add("R4", "resolved").unwrap();
+    }
+
+    /// A v2 database migrates to v3: live memories that were never judged are marked done
+    /// (they are not judged after the fact), a memory still waiting for its embedding stays
+    /// pending, and imported (`skipped`) and `retry` rows keep their state.
+    #[test]
+    fn migration_3_marks_live_unjudged_memories_done_and_leaves_the_rest() {
+        let (_d, path) = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)").unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(include_str!("sql/0001_init.sql")).unwrap();
+            tx.execute_batch(include_str!("sql/0002_events_reviews.sql"))
+                .unwrap();
+            tx.execute("INSERT INTO schema_migrations VALUES (1, 'x')", [])
+                .unwrap();
+            tx.execute("INSERT INTO schema_migrations VALUES (2, 'x')", [])
+                .unwrap();
+            for (id, status, judge) in [
+                ("M-ACTIVE", "active", "pending"),
+                ("M-PENDING", "pending", "pending"),
+                ("M-SKIPPED", "active", "skipped"),
+                ("M-RETRY", "active", "retry"),
+            ] {
+                tx.execute(
+                    "INSERT INTO memories (id, project_id, kind, title, body, status, content_hash, created_at, updated_at, hlc, judge_state)
+                     VALUES (?1, '00000000000000000000GLOBAL', 'note', 't', 'b', ?2, ?1,
+                             '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z', 'h', ?3)",
+                    [id, status, judge],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let conn = open_writer(&path).unwrap();
+        let state = |id: &str| -> String {
+            conn.query_row(
+                "SELECT judge_state FROM memories WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            state("M-ACTIVE"),
+            "done",
+            "an M1-era live memory is not judged after the fact"
+        );
+        assert_eq!(
+            state("M-PENDING"),
+            "pending",
+            "a memory still waiting is judged"
+        );
+        assert_eq!(state("M-SKIPPED"), "skipped", "imports are never judged");
+        assert_eq!(state("M-RETRY"), "retry");
+        let (explicit, defaulted, attempts): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT kind_explicit, project_defaulted, judge_attempts FROM memories WHERE id = 'M-ACTIVE'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (explicit, defaulted, attempts),
+            (1, 0, 0),
+            "old rows count as explicit"
+        );
+        let index: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'memories_judge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+    }
+
+    #[test]
     fn backup_into_produces_a_readable_copy() {
         let (d, path) = temp_db();
         let conn = open_writer(&path).unwrap();
@@ -465,7 +784,9 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<_, _>>()
             .unwrap();
-        assert_eq!(versions, vec![migrations::CURRENT_VERSION, newer]);
+        let mut expected: Vec<i64> = (1..=migrations::CURRENT_VERSION).collect();
+        expected.push(newer);
+        assert_eq!(versions, expected);
     }
 
     #[test]

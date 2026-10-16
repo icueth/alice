@@ -1,15 +1,19 @@
 //! Alice core: domain model, storage and search.
 
 pub mod api;
+pub mod bq;
 pub mod codetokens;
 pub mod context;
 pub mod embed;
 pub mod error;
 pub mod ids;
+pub mod judge;
 pub mod model;
 pub mod normalize;
 pub mod project;
+pub mod redact;
 pub mod search;
+pub mod settings;
 pub mod store;
 pub mod vector;
 

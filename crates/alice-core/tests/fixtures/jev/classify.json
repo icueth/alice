@@ -1,0 +1,35 @@
+{
+  "recorded": true,
+  "request": {
+    "model": "jev-1.13.0",
+    "questions": {
+      "q": {
+        "criteria": {
+          "no": "this is not a test",
+          "yes": "this is a test"
+        },
+        "instructions": "Choose the option that fits best.",
+        "type": "choice"
+      }
+    },
+    "state": "This is a connection test from Alice. Answer yes."
+  },
+  "response": {
+    "answers": {
+      "q": {
+        "choice": "yes",
+        "confidence": 0.96,
+        "probabilities": {
+          "no": 0.02,
+          "yes": 0.98
+        },
+        "type": "choice"
+      }
+    },
+    "model": "jev-1.13.0",
+    "usage": {
+      "input_tokens": 325,
+      "output_tokens": 31
+    }
+  }
+}

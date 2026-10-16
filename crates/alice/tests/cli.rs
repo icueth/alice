@@ -1,5 +1,8 @@
 //! Real processes: auto-start, start races, kill -9, stale discovery files, stop then start,
 //! every subcommand, and the stdio MCP shim (review focus #3).
+// Unix only (M1 ruling R3): these tests probe, stop and kill the daemons they start with Unix
+// signals (`libc::kill`) and read the pid from the held lock file (Windows reads `daemon.pid`
+// instead; the Windows parts are unit-tested in `startup` and `service_install`).
 #![cfg(unix)]
 
 use std::io::{Read, Write};
@@ -15,6 +18,10 @@ struct Env {
     _dir: tempfile::TempDir,
     home: PathBuf,
     work: PathBuf,
+    /// The user's home directory as the commands see it (`HOME`), where a service unit would be
+    /// looked for; and the sandbox that records service commands instead of running them.
+    user_home: PathBuf,
+    svc: PathBuf,
 }
 
 impl Env {
@@ -24,21 +31,40 @@ impl Env {
         let work = dir.path().join("work");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&work).unwrap();
+        let user_home = dir.path().join("user-home");
+        let svc = dir.path().join("service-root");
+        std::fs::create_dir_all(&user_home).unwrap();
+        std::fs::create_dir_all(&svc).unwrap();
         Env {
             _dir: dir,
             home,
             work,
+            user_home,
+            svc,
         }
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(BIN);
+        // Nothing of the developer's shell reaches the daemon: no `ALICE_*` setting or key
+        // (a `TYPESAFE_API_KEY` too); only what a test sets.
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("ALICE_") {
+                c.env_remove(&k);
+            }
+        }
         c.args(args)
             .current_dir(&self.work)
             .env("ALICE_HOME", &self.home)
+            // No command of any test can reach the owner's launchd, systemd or Task Scheduler,
+            // or read the owner's `~/Library/LaunchAgents`: the user's home is a temporary
+            // directory and service commands are only recorded in `ALICE_SERVICE_ROOT`.
+            .env("HOME", &self.user_home)
+            .env("XDG_CONFIG_HOME", self.user_home.join(".config"))
+            .env("ALICE_SERVICE_ROOT", &self.svc)
             .env("ALICE_EMBEDDER", "fake")
             .env("ALICE_LOG", "warn")
-            .env_remove("ALICE_AGENT");
+            .env_remove("TYPESAFE_API_KEY");
         c
     }
 
@@ -560,9 +586,11 @@ fn every_subcommand_round_trips() {
             .contains("not found: ")
     );
 
-    assert_eq!(
-        e.ok(&["update", &id, "--action", "archive"]),
-        format!("{id} is now archived\n")
+    let archived = e.ok(&["update", &id, "--action", "archive"]);
+    assert!(
+        archived.starts_with(&format!("{id} is now archived (event "))
+            && archived.contains("undo with `alice undo "),
+        "{archived}"
     );
     assert_eq!(
         e.json(&["update", &id, "--action", "restore"])["memory"]["status"],
@@ -627,6 +655,36 @@ fn every_subcommand_round_trips() {
         e.json(&["get", anon])["memories"][0]["memory"]["author"]["agent"],
         "cli"
     );
+
+    // History: who changed what, with the event ids undo takes.
+    let history = e.json(&["history", other]);
+    let created = &history[0];
+    assert_eq!(created["action"], "memory.create", "{history}");
+    assert_eq!(created["target_id"], other);
+    assert_eq!(created["actor"], "agent:codex");
+    let event = created["id"].as_str().unwrap().to_string();
+    let listed = e.ok(&["history", "--actor", "codex", "--limit", "1"]);
+    assert!(
+        listed.contains(&event) && listed.contains("memory.create") && listed.lines().count() == 1,
+        "{listed}"
+    );
+    assert_eq!(e.ok(&["undo", &event]), "Undone: 1 change(s) reverted.\n");
+    let found = e.json(&["recall", "a note by another agent", "--limit", "20"]);
+    assert!(
+        found["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["id"] != other),
+        "the undone memory is in the trash: {found}"
+    );
+    let undone_by = &e.json(&["history", other])[0];
+    assert_eq!(undone_by["action"], "undo:memory.create");
+    assert_eq!(undone_by["actor"], "user", "the CLI acts for the user");
+    let twice = e.run(&["undo", &event]);
+    assert!(!twice.status.success());
+    let err = String::from_utf8_lossy(&twice.stderr);
+    assert!(err.contains("already undone"), "{err}");
 }
 
 /// The pending entries in the spool.
@@ -663,8 +721,9 @@ fn a_damaged_database_is_named_instead_of_starting_forever() {
             && err.contains("move it aside"),
         "{err}"
     );
+    // Named at once: far below the minute a silent lock holder is waited for.
     assert!(
-        t.elapsed() < Duration::from_secs(8),
+        t.elapsed() < Duration::from_secs(40),
         "took {:?}",
         t.elapsed()
     );
@@ -702,12 +761,24 @@ fn a_damaged_database_is_named_instead_of_starting_forever() {
 fn a_failed_model_download_is_named_with_the_next_step() {
     let e = Env::new();
     let real = |args: &[&str]| {
-        e.cmd(args)
-            .env_remove("ALICE_EMBEDDER")
+        let mut c = e.cmd(args);
+        c.env_remove("ALICE_EMBEDDER")
             // Nothing listens on port 9 (discard): the download fails at once.
             .env("HF_ENDPOINT", "http://127.0.0.1:9")
-            .output()
-            .unwrap()
+            // A developer's proxy must not stand between the daemon and that closed port.
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost");
+        for var in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            c.env_remove(var);
+        }
+        c.output().unwrap()
     };
     let t = Instant::now();
     let o = real(&["daemon", "start"]);
@@ -719,7 +790,7 @@ fn a_failed_model_download_is_named_with_the_next_step() {
         "{err}"
     );
     assert!(
-        t.elapsed() < Duration::from_secs(8),
+        t.elapsed() < Duration::from_secs(40),
         "took {:?}",
         t.elapsed()
     );
@@ -770,16 +841,44 @@ fn daemon_start_waits_while_a_live_process_holds_the_lock() {
     .unwrap();
 
     let started = Instant::now();
-    let child = e
+    let mut child = e
         .cmd(&["daemon", "start"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_secs(6));
+    // Read what it says while it waits, and hold on until it has said what the process holds
+    // the lock for AND at least 6 s have passed (longer than a daemon it started waits for the
+    // lock): a condition, not a guess at how long a loaded machine needs to start the command.
+    let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let reader = {
+        let said = said.clone();
+        let mut err = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while let Ok(n) = err.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                said.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !said.lock().unwrap().contains("50%") || started.elapsed() < Duration::from_secs(6) {
+        assert!(
+            Instant::now() < deadline,
+            "daemon start never said what the holder does: {}",
+            said.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     std::fs::remove_file(e.home.join("daemon.starting")).unwrap();
     drop(lock);
     let o = child.wait_with_output().unwrap();
+    reader.join().unwrap();
     assert!(o.status.success(), "{}", stderr(&o));
     assert!(
         String::from_utf8_lossy(&o.stdout).starts_with("running (pid "),
@@ -787,7 +886,7 @@ fn daemon_start_waits_while_a_live_process_holds_the_lock() {
         String::from_utf8_lossy(&o.stdout)
     );
     assert!(started.elapsed() >= Duration::from_secs(6));
-    let err = stderr(&o);
+    let err = said.lock().unwrap().clone();
     assert!(
         err.contains("downloading the embedding model") && err.contains("50%"),
         "{err}"
@@ -1067,6 +1166,24 @@ fn bench_runs_on_throwaway_data_and_cleans_up() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // --prefill-vectors only makes sense with the real model, and its data is its own kind.
+    let mut prefill = small.to_vec();
+    prefill.push("--prefill-vectors");
+    let out = bench(&prefill);
+    assert!(!out.status.success(), "--prefill-vectors needs --real");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--real"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    prefill.push("--real");
+    let out = bench(&prefill);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("for the fake embedder"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Every file under `dir` with its contents, to prove a refused run changed nothing.
@@ -1149,5 +1266,1513 @@ fn bench_refuses_a_dir_that_is_not_bench_data_or_is_in_use() {
     assert!(
         bench(&kept).status.success(),
         "free again once the lock is released"
+    );
+}
+
+// ------------------------------------------------------------------ Task 6: alice config
+
+#[test]
+fn config_set_get_secret_and_live_reload() {
+    let env = Env::new();
+    env.ok(&["remember", "seed"]);
+    env.ok(&["config", "set", "judge.review_threshold", "0.6"]);
+    assert_eq!(
+        env.json(&["config", "get", "judge.review_threshold"]),
+        serde_json::json!(0.6)
+    );
+    let bad = env.run(&["config", "set", "judge.review_threshold", "0.99"]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("judge.review_threshold"));
+    let key = concat!("sk-cli-", "secret-98765");
+    let out = env.run_with_stdin(
+        &["config", "set-secret", "embedding_api_key"],
+        &format!("{key}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let list = env.ok(&["config", "list"]);
+    assert!(
+        list.contains("embedding_api_key: set ••••8765") && !list.contains("sk-cli-secret"),
+        "{list}"
+    );
+    // A direct edit of config.toml applies without a restart.
+    std::fs::write(env.home.join("config.toml"), "[mcp]\nadmin_tools = true\n").unwrap();
+    eventually(
+        || env.json(&["config", "get", "mcp.admin_tools"]) == serde_json::json!(true),
+        "live reload",
+    );
+    let log = env.log();
+    assert!(
+        !log.contains("sk-cli-secret"),
+        "the secret never reaches the log"
+    );
+}
+
+/// `list` shows every key with its source, the problems, what waits for a restart and the
+/// secrets; `unset` takes a key out of config.toml; the secret is deleted on request.
+#[test]
+fn config_list_unset_delete_secret_and_the_problems_shown() {
+    let env = Env::new();
+    env.ok(&["remember", "seed"]);
+    env.ok(&["config", "set", "search.relevance_floor", "0.7"]);
+    env.ok(&["config", "set", "embedding.idle_unload", "5m"]);
+    let list = env.ok(&["config", "list"]);
+    assert!(
+        list.contains("search.relevance_floor = 0.7 (config.toml)"),
+        "{list}"
+    );
+    assert!(
+        list.contains("judge.provider = \"heuristic\"")
+            || list.contains("judge.provider = heuristic"),
+        "{list}"
+    );
+    assert!(list.contains("RESTART embedding.idle_unload"), "{list}");
+    assert!(list.contains("secret jev_api_key: not set"), "{list}");
+    // Unset: back to the default, and gone from the file.
+    let out = env.ok(&["config", "unset", "search.relevance_floor"]);
+    assert!(out.contains("applied"), "{out}");
+    assert!(
+        !std::fs::read_to_string(env.home.join("config.toml"))
+            .unwrap()
+            .contains("relevance_floor")
+    );
+    assert_eq!(
+        env.json(&["config", "get", "search.relevance_floor"]),
+        serde_json::json!(0.805)
+    );
+    let missing = env.run(&["config", "get", "no.such.key"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("alice config list"));
+    // A broken edit: the previous value stays, and `list` shows the problem.
+    std::fs::write(
+        env.home.join("config.toml"),
+        "[judge]\nreview_threshold = 0.9\nauto_apply_threshold = 0.6\n",
+    )
+    .unwrap();
+    eventually(
+        || {
+            env.ok(&["config", "list"])
+                .contains("PROBLEM judge.review_threshold")
+        },
+        "the problem in the list",
+    );
+    assert_eq!(
+        env.json(&["config", "get", "judge.review_threshold"]),
+        serde_json::json!(0.5)
+    );
+    // Secrets: set from stdin, deleted on request.
+    let key = concat!("tp_cli-", "secret-abcdefgh1234");
+    let out = env.run_with_stdin(
+        &["config", "set-secret", "jev_api_key"],
+        &format!("{key}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("cli-secret"));
+    let del = env.ok(&["config", "delete-secret", "jev_api_key"]);
+    assert!(del.contains("deleted"), "{del}");
+    let again = env.ok(&["config", "delete-secret", "jev_api_key"]);
+    assert!(again.contains("was not set"), "{again}");
+    assert!(
+        !env.run(&["config", "set-secret", "github"])
+            .status
+            .success()
+    );
+    assert!(!env.run(&["config", "test", "dropbox"]).status.success());
+    assert!(env.ok(&["config", "test", "embedding"]).starts_with("OK"));
+}
+
+/// A variable that is not a setting is ignored with a warning in `alice status` and
+/// `alice config list`; it never sends the other settings back to their defaults.
+#[test]
+fn an_ignored_variable_is_a_warning_and_changes_nothing_else() {
+    let env = Env::new();
+    std::fs::write(
+        env.home.join("config.toml"),
+        "[judge]\nreview_threshold = 0.6\n",
+    )
+    .unwrap();
+    let out = env
+        .cmd(&["remember", "seed"])
+        .env("ALICE_JUDGE_REVIEW_TRESHOLD", "0.7")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let status = env.ok(&["status"]);
+    assert!(
+        status.contains("warning:") && status.contains("ALICE_JUDGE_REVIEW_TRESHOLD"),
+        "{status}"
+    );
+    let list = env.ok(&["config", "list"]);
+    assert!(list.contains("ALICE_JUDGE_REVIEW_TRESHOLD"), "{list}");
+    assert_eq!(
+        env.json(&["config", "get", "judge.review_threshold"]),
+        serde_json::json!(0.6),
+        "the file still applies"
+    );
+}
+
+/// Every file under `dir` (database and WAL, spool, logs, vector files) whose bytes hold any of
+/// `needles`.
+fn files_holding(dir: &std::path::Path, needles: &[&str]) -> Vec<String> {
+    let mut bad = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let bytes = std::fs::read(&p).unwrap_or_default();
+            if needles
+                .iter()
+                .any(|n| bytes.windows(n.len()).any(|w| w == n.as_bytes()))
+            {
+                bad.push(p.display().to_string());
+            }
+        }
+    }
+    bad
+}
+
+/// A secret passed to `alice remember` reaches neither the database (nor its WAL), the spool,
+/// nor `daemon.log`, with the daemon running, with it away, and after the spool is applied.
+/// The daemon logs at debug level here, so a line that echoed a request would show.
+#[test]
+fn a_planted_secret_reaches_neither_the_database_the_spool_nor_the_log() {
+    let e = Env::new();
+    let token = concat!("gh", "p_PlantedSecretToken0123456789abcdefABCD");
+    // The part without the provider prefix: a scan for the whole token alone would miss a
+    // log line that cut it.
+    let core = "PlantedSecretToken0123456789abcdefABCD";
+    let needles = [token, core];
+    let verbose = |args: &[&str]| e.cmd(args).env("ALICE_LOG", "debug").output().unwrap();
+
+    let o = verbose(&["remember", &format!("ci uses {token} for releases")]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    e.ok(&["daemon", "stop"]);
+    assert!(
+        files_holding(&e.home, &needles).is_empty(),
+        "running: {:?}",
+        files_holding(&e.home, &needles)
+    );
+
+    // While the daemon is down (and may not be started) the CLI queues; the spool is clean too.
+    let o = e
+        .cmd(&["remember", &format!("second one with {token}")])
+        .env("ALICE_NO_AUTOSTART", "1")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stdout).starts_with("Queued: "),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(spooled(&e), 1);
+    assert!(
+        files_holding(&e.home, &needles).is_empty(),
+        "spooled: {:?}",
+        files_holding(&e.home, &needles)
+    );
+
+    // The daemon applies the spool; the second memory is stored redacted.
+    let o = verbose(&["daemon", "start"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    eventually(
+        || e.recall_count("second one with") == 1,
+        "the queued write",
+    );
+    let found = e.json(&["recall", "second one with"]);
+    assert!(
+        found.to_string().contains("[REDACTED:github_token]"),
+        "{found}"
+    );
+    e.ok(&["daemon", "stop"]);
+    assert!(
+        files_holding(&e.home, &needles).is_empty(),
+        "after the drain: {:?}",
+        files_holding(&e.home, &needles)
+    );
+    assert!(
+        e.log().contains("listening"),
+        "the log was written and scanned"
+    );
+}
+
+/// Task 11: the same conflict as over HTTP, through the CLI: `alice undo` answers with a review
+/// item, `alice review` shows it, `alice review resolve` settles it, `alice stats` counts.
+#[test]
+fn review_inbox_and_stats_through_the_cli() {
+    let e = Env::new();
+    let r = e.json(&["remember", "first text"]);
+    let id = r["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        e.ok(&["review"]),
+        "Nothing waits for a decision.\n",
+        "an empty inbox says so"
+    );
+    let edit = |body: &str| {
+        e.json(&["update", &id, "--action", "edit", "--body", body])["event_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let first = edit("second text");
+    edit("third text");
+    let undo = e.ok(&["undo", &first]);
+    assert!(undo.starts_with("Not undone: "), "{undo}");
+    // `alice history` shows the edits the undo ran into.
+    assert!(e.ok(&["history", &id]).contains("memory.edit"));
+
+    let list = e.ok(&["review", "list"]);
+    let item_id = list.split_whitespace().next().unwrap().to_string();
+    assert!(
+        list.contains("undo  p=-")
+            && list.contains(&format!("[{id}]"))
+            && list.contains("choices: apply | dismiss")
+            && list.contains("undo blocked: "),
+        "{list}"
+    );
+    let typed = e.ok(&["review", "list", "--type", "undo"]);
+    // The memory may be activated between the two calls: compare without its status.
+    let unstatus = |t: &str| t.replace("(pending)", "(active)");
+    assert_eq!(unstatus(&typed), unstatus(&list));
+    assert!(
+        e.ok(&["review", "list", "--type", "merge"])
+            .starts_with("Nothing waits")
+    );
+    let bad = e.run(&["review", "list", "--type", "nonsense"]);
+    assert!(!bad.status.success());
+    let err = stderr(&bad);
+    assert!(
+        err.contains("unknown review type") && err.contains("sync_conflict"),
+        "{err}"
+    );
+    let shown = e.ok(&["review", "show", &item_id]);
+    assert!(
+        shown.contains("apply - undo anyway") && shown.contains("dismiss - keep the current state"),
+        "{shown}"
+    );
+    let js = e.json(&["review", "show", &item_id]);
+    assert_eq!(js["review_type"], "undo");
+
+    let stats = e.json(&["stats"]);
+    assert_eq!(stats["reviews_open"], 1, "{stats}");
+    assert_eq!(stats["judge_provider"], "heuristic");
+    let text = e.ok(&["stats"]);
+    assert!(
+        text.contains("reviews waiting: 1") && text.contains("judge: heuristic"),
+        "{text}"
+    );
+    let ctx = e.ok(&["context"]);
+    assert!(ctx.contains("1 item(s) wait for a decision"), "{ctx}");
+
+    let wrong = e.run(&["review", "resolve", &item_id, "maybe"]);
+    assert!(!wrong.status.success());
+    assert!(
+        stderr(&wrong).contains("apply, dismiss"),
+        "{}",
+        stderr(&wrong)
+    );
+    assert_eq!(
+        e.ok(&["review", "resolve", &item_id, "dismiss"]),
+        "Resolved: dismiss.\n"
+    );
+    let twice = e.run(&["review", "resolve", &item_id, "dismiss"]);
+    assert!(!twice.status.success());
+    assert!(
+        stderr(&twice).contains("already resolved"),
+        "{}",
+        stderr(&twice)
+    );
+    assert!(e.ok(&["review"]).starts_with("Nothing waits"));
+    let all = e.ok(&["review", "list", "--all"]);
+    assert!(all.contains("resolved: dismiss by user"), "{all}");
+    // Dismissing changed nothing.
+    assert!(e.ok(&["get", &id]).contains("third text"));
+    assert_eq!(e.json(&["stats"])["reviews_open"], 0);
+
+    // The same again, this time applying the undo over the later change.
+    let fourth = edit("fourth text");
+    edit("fifth text");
+    e.ok(&["undo", &fourth]);
+    let second_item = e
+        .ok(&["review"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    e.ok(&["review", "resolve", &second_item, "apply"]);
+    assert!(e.ok(&["get", &id]).contains("third text"));
+}
+
+/// Task 23: a flooded inbox through the CLI: the total by type, pages, and a bulk dismissal that
+/// asks first, closes only what matches and leaves the memories alone.
+#[test]
+fn a_flooded_review_inbox_pages_and_is_dismissed_in_bulk() {
+    use alice_core::store::reviews::{NewReview, ReviewType, create};
+    let e = Env::new();
+    {
+        // Written before the first command starts the daemon.
+        let c = alice_core::store::open_writer(&e.home.join("alice.db")).unwrap();
+        for (kind, provider, n) in [
+            (ReviewType::Merge, "cluster", 7),
+            (ReviewType::Merge, "jev", 1),
+            (ReviewType::Predicate, "judge", 2),
+        ] {
+            for k in 0..n {
+                create(
+                    &c,
+                    &NewReview {
+                        kind,
+                        payload: serde_json::json!({"provider": provider}),
+                        confidence: Some(0.92),
+                        dedupe_key: Some(format!("{provider}{k}")),
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+    let kept = e.json(&["remember", "a memory the bulk dismissal leaves alone"]);
+    let kept = kept["id"].as_str().unwrap().to_string();
+
+    let page1 = e.json(&["review", "list", "--limit", "4"]);
+    assert_eq!(page1["total"], 10, "{page1}");
+    assert_eq!(page1["by_type"]["merge"], 8, "{page1}");
+    assert_eq!(page1["by_type"]["predicate"], 2, "{page1}");
+    assert_eq!(page1["items"].as_array().unwrap().len(), 4);
+    let page3 = e.json(&["review", "list", "--limit", "4", "--page", "3"]);
+    assert_eq!(page3["items"].as_array().unwrap().len(), 2, "{page3}");
+    assert_ne!(page1["items"][0]["id"], page3["items"][0]["id"]);
+    let text = e.ok(&["review", "list", "--limit", "4"]);
+    assert!(
+        text.contains("10 open: merge 8, predicate 2")
+            && text.contains("Showing 1-4")
+            && text.contains("--page 2"),
+        "{text}"
+    );
+    let last = e.ok(&["review", "list", "--limit", "4", "--page", "3"]);
+    assert!(
+        last.contains("Showing 9-10") && !last.contains("--page 4"),
+        "{last}"
+    );
+
+    // Nothing is dismissed without --all, nor (away from a terminal) without --yes.
+    let no_all = e.run(&["review", "dismiss", "--type", "merge"]);
+    assert!(!no_all.status.success());
+    assert!(stderr(&no_all).contains("--all"), "{}", stderr(&no_all));
+    let no_yes = e.run(&["review", "dismiss", "--type", "merge", "--all"]);
+    assert!(!no_yes.status.success());
+    assert!(stderr(&no_yes).contains("--yes"), "{}", stderr(&no_yes));
+    assert_eq!(e.json(&["review", "list"])["total"], 10);
+
+    let out = e.ok(&[
+        "review",
+        "dismiss",
+        "--type",
+        "merge",
+        "--provider",
+        "cluster",
+        "--all",
+        "--yes",
+    ]);
+    assert_eq!(out, "Dismissed 7 merge items.\n");
+    let after = e.json(&["review", "list"]);
+    assert_eq!(
+        (after["total"].clone(), after["by_type"]["merge"].clone()),
+        (3.into(), 1.into()),
+        "{after}"
+    );
+    let json = e.json(&["review", "dismiss", "--type", "merge", "--all", "--yes"]);
+    assert_eq!(json["dismissed"], 1, "{json}");
+    assert_eq!(e.json(&["review", "list"])["by_type"]["predicate"], 2);
+    assert!(
+        e.ok(&["get", &kept])
+            .contains("a memory the bulk dismissal leaves alone")
+    );
+    let bad = e.run(&["review", "dismiss", "--type", "nonsense", "--all", "--yes"]);
+    assert!(
+        stderr(&bad).contains("unknown review type"),
+        "{}",
+        stderr(&bad)
+    );
+}
+
+/// Task 14: `alice backup now|list` and `alice maintenance status|run <job>` through real
+/// processes.
+#[test]
+fn backups_and_maintenance_jobs_through_the_cli() {
+    use alice_daemon::maintenance::Job;
+    let e = Env::new();
+    e.ok(&["remember", "a memory worth a backup"]);
+    assert!(
+        e.ok(&["backup", "list"]).starts_with("No backups yet"),
+        "an empty list says so"
+    );
+    let made = e.ok(&["backup", "now"]);
+    assert!(made.starts_with("Backed up to "), "{made}");
+    let list = e.json(&["backup", "list"]);
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 1, "{list:?}");
+    let kind = list[0]["kind"].as_str().unwrap();
+    assert!(kind == "manual" || kind == "scheduled", "{kind}");
+    let file = PathBuf::from(list[0]["path"].as_str().unwrap());
+    assert!(file.exists(), "{}", file.display());
+    assert!(file.starts_with(e.home.join("backups")));
+    // The copy is a SQLite database that holds the memory's text, and is private to its owner.
+    let bytes = std::fs::read(&file).unwrap();
+    assert!(bytes.starts_with(b"SQLite format 3\0"));
+    assert!(
+        bytes.windows(23).any(|w| w == b"a memory worth a backup"),
+        "the backup holds the memory"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&e.home.join("backups")), 0o700);
+    }
+    assert!(e.ok(&["backup", "list"]).contains("bytes"));
+
+    let ran = e.ok(&["maintenance", "run", "trash_purge"]);
+    assert!(ran.starts_with("done"), "{ran}");
+    let report = e.json(&["maintenance", "run", "judge_retry"]);
+    assert_eq!(report["outcome"], "done", "{report}");
+    let bad = e.run(&["maintenance", "run", "nope"]);
+    assert!(!bad.status.success());
+    let err = stderr(&bad);
+    assert!(
+        err.contains("unknown maintenance job \"nope\"")
+            && Job::names().iter().all(|j| err.contains(j)),
+        "{err}"
+    );
+
+    let status = e.json(&["maintenance", "status"]);
+    let jobs: Vec<&str> = status
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["job"].as_str().unwrap())
+        .collect();
+    assert_eq!(jobs, Job::names(), "every job is listed");
+    let purge = status
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["job"] == "trash_purge")
+        .unwrap();
+    assert!(purge["last_run"].is_string() && purge["last_ok"].is_string());
+    assert_eq!(purge["every_secs"], 86_400);
+    let text = e.ok(&["maintenance", "status"]);
+    assert!(
+        text.contains("trash_purge") && text.contains("every 1d"),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("backup") && l.ends_with("never")),
+        "{text}"
+    );
+}
+
+#[test]
+fn recall_precise_reaches_the_daemon() {
+    let e = Env::new();
+    e.ok(&["remember", "precise flag check about lease timeouts"]);
+    eventually(
+        || e.recall_count("lease timeouts") > 0,
+        "the memory to be found",
+    );
+    let fast = e.json(&["recall", "lease timeouts"]);
+    assert_eq!(fast["reranked"], false, "fast mode never re-ranks");
+    // The offline judge cannot grade: precise mode answers as fast mode does, and says so.
+    let precise = e.json(&["recall", "lease timeouts", "--precise"]);
+    assert_eq!(precise["reranked"], false, "{precise}");
+    assert_eq!(
+        precise["results"].as_array().unwrap().len(),
+        fast["results"].as_array().unwrap().len()
+    );
+    let text = e.ok(&["recall", "lease timeouts", "--precise"]);
+    assert!(text.contains("lease timeouts"), "{text}");
+    assert!(!text.contains("re-ranked by the judge"), "{text}");
+    let help = e.run(&["recall", "--help"]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.contains("--precise") && help.contains("--fast"),
+        "{help}"
+    );
+    // Task 21: `--fast` forces the local search, and the two flags exclude each other.
+    let forced = e.json(&["recall", "lease timeouts", "--fast"]);
+    assert_eq!(forced["reranked"], false, "{forced}");
+    assert!(
+        !e.run(&["recall", "x", "--fast", "--precise"])
+            .status
+            .success()
+    );
+}
+
+/// Task 15: `alice restore` through real processes. The backup comes back, a write made while
+/// the daemon was down is applied afterwards, the replaced database is kept, and a bad file is
+/// refused before the daemon is touched.
+#[test]
+fn restore_round_trip_brings_back_the_backup_and_keeps_writes_made_meanwhile() {
+    let env = Env::new();
+    env.ok(&["remember", "alpha before the backup"]);
+    let b = env.json(&["backup", "now"]);
+    let name = b["name"].as_str().unwrap().to_string();
+    env.ok(&["remember", "bravo after the backup"]);
+    // Keys and settings are not part of a restore.
+    let secrets = "[keys]\nsomething = \"kept\"\n";
+    std::fs::write(env.home.join("secrets.toml"), secrets).unwrap();
+    env.ok(&["daemon", "stop"]);
+    // Written while the daemon is down (as during a restore): spooled, applied after it.
+    let out = env
+        .cmd(&["remember", "charlie during the restore"])
+        .env("ALICE_NO_AUTOSTART", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(spooled(&env), 1);
+    // `env.json` parses the whole stdout as one JSON value: stop's own output would break it.
+    let r = env.json(&["restore", &name, "--yes"]);
+    assert_eq!(r["restored_from"], name);
+    assert!(
+        r["caveats"].as_str().unwrap().contains("purged"),
+        "the report says what a restore does not undo: {r}"
+    );
+    eventually(
+        || env.recall_count("charlie") == 1,
+        "the spooled write drained into the restored database",
+    );
+    assert_eq!(env.recall_count("alpha"), 1);
+    assert_eq!(
+        env.recall_count("bravo"),
+        0,
+        "written after the backup: gone with the restore"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.home.join("secrets.toml")).unwrap(),
+        secrets
+    );
+    let list = env.json(&["backup", "list"]);
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["kind"] == "before_restore")
+    );
+    let status = env.json(&["status"]);
+    assert_eq!(status["index_ready"], true);
+    // A bad file is refused before anything changes, and before the daemon is stopped.
+    let pid = env.daemon_pid().expect("the restored daemon runs");
+    std::fs::write(
+        env.home.join("backups/alice-20200101T000000Z.db"),
+        b"garbage",
+    )
+    .unwrap();
+    let bad = env.run(&["restore", "alice-20200101T000000Z.db", "--yes"]);
+    assert!(!bad.status.success());
+    assert!(
+        stderr(&bad).contains("not an Alice backup"),
+        "{}",
+        stderr(&bad)
+    );
+    assert_eq!(env.recall_count("alpha"), 1, "nothing was swapped");
+    assert_eq!(env.daemon_pid(), Some(pid), "the daemon was left running");
+}
+
+/// Task 15: restore needs a yes on a pipe, says what it does not undo in words, and works with
+/// no daemon (and no database) at all.
+#[test]
+fn restore_asks_for_a_yes_and_prints_what_it_does_not_undo() {
+    let env = Env::new();
+    env.ok(&["remember", "delta kept in the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let no = env.run(&["restore", &name]);
+    assert!(!no.status.success());
+    assert!(stderr(&no).contains("--yes"), "{}", stderr(&no));
+    let none = env.run(&["restore", "nope.db", "--yes"]);
+    assert!(!none.status.success());
+    assert!(
+        stderr(&none).contains("alice backup list"),
+        "{}",
+        stderr(&none)
+    );
+
+    env.ok(&["daemon", "stop"]);
+    std::fs::remove_file(env.home.join("alice.db")).unwrap();
+    // The default is the newest backup.
+    let text = env.ok(&["restore", "--yes"]);
+    assert!(text.starts_with("Restored alice-manual-"), "{text}");
+    assert!(
+        text.contains("purged after the backup") && text.contains("redaction"),
+        "{text}"
+    );
+    assert_eq!(env.recall_count("delta"), 1);
+}
+
+fn lock_file(path: &std::path::Path) -> std::fs::File {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    f.try_lock().expect("free");
+    f
+}
+
+/// Task 15 (R4): while a restore holds the daemon lock and its marker, a write with autostart ON
+/// is spooled at once (no daemon is started, no 10 s wait) and applied after the restore.
+#[test]
+fn a_write_during_a_restore_is_spooled_at_once_and_applied_afterwards() {
+    let env = Env::new();
+    env.ok(&["remember", "echo before the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["daemon", "stop"]);
+    let (daemon_lock, marker) = (
+        lock_file(&env.home.join("daemon.lock")),
+        lock_file(&env.home.join("restore.lock")),
+    );
+    let t = Instant::now();
+    let out = env.ok(&["remember", "foxtrot during the swap"]);
+    assert!(out.starts_with("Queued: "), "{out}");
+    assert!(
+        t.elapsed() < Duration::from_secs(6),
+        "spooled at once, took {:?}",
+        t.elapsed()
+    );
+    assert_eq!(spooled(&env), 1);
+    assert!(env.daemon_json().is_none(), "no daemon was started");
+    drop((daemon_lock, marker));
+    env.ok(&["restore", &name, "--yes"]);
+    eventually(
+        || env.recall_count("foxtrot") == 1,
+        "the spooled write drained after the restore",
+    );
+}
+
+/// Without the marker (the daemon lock alone) a write still ends up in the spool.
+#[test]
+fn a_write_while_the_daemon_lock_is_held_is_spooled_not_lost() {
+    let env = Env::new();
+    env.ok(&["remember", "golf before"]);
+    env.ok(&["daemon", "stop"]);
+    let held = lock_file(&env.home.join("daemon.lock"));
+    let out = env.ok(&["remember", "hotel while the lock is held"]);
+    assert!(out.starts_with("Queued: "), "{out}");
+    assert_eq!(spooled(&env), 1);
+    drop(held);
+    eventually(
+        || env.recall_count("hotel") == 1,
+        "the spooled write drained",
+    );
+}
+
+/// Task 15: a second `alice restore` is refused at once and leaves the daemon alone.
+#[test]
+fn a_second_restore_is_refused_at_once() {
+    let env = Env::new();
+    env.ok(&["remember", "india"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid = env.daemon_pid().unwrap();
+    let marker = lock_file(&env.home.join("restore.lock"));
+    let t = Instant::now();
+    let o = env.run(&["restore", &name, "--yes"]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("already running"), "{}", stderr(&o));
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert_eq!(env.daemon_pid(), Some(pid));
+    drop(marker);
+}
+
+/// Task 15 (R3): a backup from a newer schema is refused through the CLI, with the daemon left
+/// running and the data untouched.
+#[test]
+fn a_backup_from_a_newer_schema_is_refused_before_the_daemon_is_stopped() {
+    let env = Env::new();
+    env.ok(&["remember", "juliet kept"]);
+    let b = env.json(&["backup", "now"]);
+    let newer = env.work.join("newer.db");
+    std::fs::copy(b["path"].as_str().unwrap(), &newer).unwrap();
+    rusqlite::Connection::open(&newer)
+        .unwrap()
+        .execute("INSERT INTO schema_migrations VALUES (99, 'x')", [])
+        .unwrap();
+    let pid = env.daemon_pid().unwrap();
+    let o = env.run(&["restore", newer.to_str().unwrap(), "--yes"]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("newer"), "{}", stderr(&o));
+    assert_eq!(env.daemon_pid(), Some(pid), "the daemon was not stopped");
+    assert_eq!(env.recall_count("juliet"), 1);
+}
+
+/// Task 15: the output says what leaves the active database and how to undo it, and undoing
+/// works.
+#[test]
+fn restore_says_where_the_lost_memories_went_and_undo_brings_them_back() {
+    let env = Env::new();
+    env.ok(&["remember", "kilo in the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["remember", "lima after the backup"]);
+    let text = env.ok(&["restore", &name, "--yes"]);
+    assert!(
+        text.contains("no longer in the active database")
+            && text.contains("alice-before-restore-")
+            && text.contains("To undo: alice restore alice-before-restore-")
+            && text.contains("at least 30 days"),
+        "{text}"
+    );
+    assert_eq!(env.recall_count("lima"), 0);
+    let kept = env
+        .json(&["backup", "list"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["kind"] == "before_restore")
+        .unwrap()["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["restore", &kept, "--yes"]);
+    assert_eq!(env.recall_count("lima"), 1, "undone");
+}
+
+// ------------------------------------------------------------------ Task 17
+
+/// `alice service install` writes only under the directory it is given, and runs no command; a
+/// dry run writes nothing at all.
+#[test]
+fn service_install_writes_only_under_the_target_dir_and_dry_run_writes_nothing() {
+    let env = Env::new();
+    let target = env.home.parent().unwrap().join("svc-root");
+    let t = target.to_str().unwrap();
+    let dry = env.ok(&["service", "install", "--dry-run", "--target-dir", t]);
+    assert!(dry.contains("daemon") && !target.exists(), "{dry}");
+    let out = env.ok(&["service", "install", "--target-dir", t]);
+    assert!(out.contains("not run"), "{out}");
+    let installed = if cfg!(target_os = "macos") {
+        target.join("Library/LaunchAgents/dev.alice.daemon.plist")
+    } else {
+        target.join(".config/systemd/user/alice.service")
+    };
+    let unit = std::fs::read_to_string(&installed).unwrap();
+    assert!(unit.contains(&env.home.display().to_string()), "{unit}");
+    assert!(unit.contains("daemon") && unit.contains("run"), "{unit}");
+    // No secret, no token, no address of the owner's.
+    for word in ["token", "secret", "@"] {
+        assert!(!unit.to_ascii_lowercase().contains(word), "{word}: {unit}");
+    }
+    assert!(
+        !target.join("service-commands.log").exists(),
+        "--target-dir runs nothing"
+    );
+    let dry = env.ok(&["service", "uninstall", "--dry-run", "--target-dir", t]);
+    assert!(
+        dry.contains(&format!("Would remove {}", installed.display())),
+        "{dry}"
+    );
+    assert!(installed.exists(), "a dry run removes nothing");
+    env.ok(&["service", "uninstall", "--target-dir", t]);
+    assert!(!installed.exists());
+    // The JSON of a dry run is the plan.
+    let plan = env.json(&["service", "install", "--dry-run", "--target-dir", t]);
+    assert_eq!(plan["dry_run"], true);
+    assert!(
+        plan["plan"]["files"]
+            .as_array()
+            .is_some_and(|f| f.len() <= 1)
+    );
+    assert!(!installed.exists(), "the JSON dry run wrote nothing either");
+}
+
+/// `alice doctor` reports the checks, and exits non-zero when one fails.
+#[test]
+fn doctor_reports_and_exits_non_zero_on_failure() {
+    let env = Env::new();
+    env.ok(&["remember", "doctor seed"]);
+    let report = env.json(&["doctor"]);
+    let checks = report["checks"].as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["name"] == "database" && c["status"] == "ok"),
+        "{checks:?}"
+    );
+    // The CLI tests run with ALICE_EMBEDDER=fake and no model: a warning, not a failure.
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["name"] == "embedding model" && c["status"] == "warn"),
+        "{checks:?}"
+    );
+    // The text form: one line per check.
+    let text = env.ok(&["doctor"]);
+    assert!(
+        text.contains("OK   database:") && text.contains("WARN embedding model:"),
+        "{text}"
+    );
+    std::fs::write(
+        env.home.join("config.toml"),
+        "[judge]\nreview_threshold = 5\n",
+    )
+    .unwrap();
+    let o = env.run(&["doctor"]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("FAIL config"));
+    assert!(stderr(&o).contains("failed"), "{}", stderr(&o));
+}
+
+/// With no daemon, `alice doctor` starts none and says so; a home directory others can read is
+/// a failure that names the command to fix it.
+#[test]
+fn doctor_does_not_start_a_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    // The test made the home with the default mode (0755): a daemon would make it 0700.
+    let o = env.run(&["--json", "doctor"]);
+    assert!(!o.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let perm = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "home permissions")
+        .unwrap();
+    assert_eq!(perm["status"], "fail");
+    assert!(
+        perm["fix"].as_str().unwrap().starts_with("chmod 700 "),
+        "{perm}"
+    );
+    std::fs::set_permissions(&env.home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let report = env.json(&["doctor"]);
+    let daemon = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "daemon")
+        .unwrap();
+    assert_eq!(daemon["status"], "warn");
+    assert!(
+        daemon["fix"]
+            .as_str()
+            .unwrap()
+            .contains("alice daemon start")
+    );
+    assert!(env.daemon_json().is_none() && !env.home.join("daemon.lock").exists());
+}
+
+/// The status of a raw `GET /api/v1/health` with `token` (no HTTP client library in this crate).
+fn health_status(port: u64, token: &str) -> u16 {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        s,
+        "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut reply = String::new();
+    s.read_to_string(&mut reply).unwrap();
+    reply
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {reply:?}"))
+}
+
+fn token_of(env: &Env) -> String {
+    std::fs::read_to_string(env.home.join("token"))
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+/// `alice token rotate` with a running daemon: it switches at once, the old token is refused,
+/// the file is private, the token is not printed unless asked, and the CLI keeps working.
+#[test]
+fn token_rotate_switches_a_running_daemon_at_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    env.ok(&["remember", "before the rotation"]);
+    let port = env.daemon_json().unwrap()["port"].as_u64().unwrap();
+    let old = token_of(&env);
+    assert_eq!(health_status(port, &old), 200);
+    let out = env.ok(&["token", "rotate"]);
+    assert!(out.starts_with("Token rotated."), "{out}");
+    let new = token_of(&env);
+    assert_ne!(new, old);
+    assert!(
+        !out.contains(&new) && !out.contains(&old),
+        "the token is not printed: {out}"
+    );
+    assert_eq!(
+        health_status(port, &old),
+        401,
+        "the old token is refused at once"
+    );
+    assert_eq!(health_status(port, &new), 200);
+    assert_eq!(
+        std::fs::metadata(env.home.join("token"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    // The same daemon, found again with the new token.
+    assert!(env.ok(&["status"]).starts_with("running"));
+    assert_eq!(env.recall_count("rotation"), 1);
+    // `--show` prints it, once; the JSON form says only that it rotated unless asked.
+    let shown = env.ok(&["token", "rotate", "--show"]);
+    let newer = token_of(&env);
+    assert!(shown.contains(&newer) && newer != new, "{shown}");
+    let json = env.json(&["token", "rotate"]);
+    assert_eq!(json, serde_json::json!({ "rotated": true }));
+}
+
+/// With no daemon the file is replaced under the daemon lock; the next daemon starts with it.
+#[test]
+fn token_rotate_without_a_daemon_replaces_the_file_and_the_next_start_uses_it() {
+    let env = Env::new();
+    env.ok(&["remember", "seed"]);
+    env.ok(&["daemon", "stop"]);
+    let old = token_of(&env);
+    let out = env.ok(&["token", "rotate"]);
+    assert!(out.starts_with("Token rotated."), "{out}");
+    let new = token_of(&env);
+    assert_ne!(new, old);
+    assert!(env.daemon_json().is_none(), "no daemon was started");
+    assert!(env.ok(&["daemon", "start"]).starts_with("running (pid "));
+    let port = env.daemon_json().unwrap()["port"].as_u64().unwrap();
+    assert_eq!(health_status(port, &new), 200);
+    assert_eq!(health_status(port, &old), 401);
+}
+
+/// A process that holds the lock but does not answer (a daemon still starting) is not rotated
+/// under: nothing changes and the message says why.
+#[test]
+fn token_rotate_refuses_while_a_daemon_that_does_not_answer_holds_the_lock() {
+    let env = Env::new();
+    env.ok(&["remember", "seed"]);
+    env.ok(&["daemon", "stop"]);
+    let old = token_of(&env);
+    let lock = lock_file(&env.home.join("daemon.lock"));
+    let o = env.run(&["token", "rotate"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("does not answer") && stderr(&o).contains("nothing was changed"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(token_of(&env), old);
+    drop(lock);
+}
+
+/// `alice status` says a holder that has been running for a long time and announces nothing is
+/// "running (not answering)", where a young one is "starting".
+#[test]
+fn status_tells_a_silent_old_holder_from_a_starting_one() {
+    use std::io::Write as _;
+    let env = Env::new();
+    let mut lock = lock_file(&env.home.join("daemon.lock"));
+    lock.set_len(0).unwrap();
+    writeln!(lock, "{}", std::process::id()).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let write_pid = |age_ms: u64| {
+        std::fs::write(
+            env.home.join("daemon.pid"),
+            serde_json::json!({ "pid": std::process::id(), "unix_ms": now_ms - age_ms })
+                .to_string(),
+        )
+        .unwrap();
+    };
+    write_pid(1_000);
+    let young = env.ok(&["status"]);
+    assert!(young.starts_with("starting (pid "), "{young}");
+    write_pid(5 * 60_000);
+    let old = env.ok(&["status"]);
+    assert!(
+        old.starts_with("running (pid ") && old.contains("not answering"),
+        "{old}"
+    );
+    let j = env.json(&["status"]);
+    assert_eq!(j["not_answering"], std::process::id());
+    assert!(j["starting"].is_null(), "{j}");
+    // With a download announced it is still starting, however long it has run.
+    std::fs::write(
+        env.home.join("daemon.starting"),
+        serde_json::json!({"pid": std::process::id(), "unix_ms": now_ms, "step": "downloading the embedding model"}).to_string(),
+    )
+    .unwrap();
+    assert!(env.ok(&["status"]).starts_with("starting (pid "));
+    drop(lock);
+}
+
+/// `alice status` shows the judge, the reviews, the last backup and the memory in use.
+#[test]
+fn status_shows_the_judge_the_last_backup_and_the_memory() {
+    let env = Env::new();
+    env.ok(&["remember", "status seed"]);
+    env.ok(&["backup", "now"]);
+    let text = env.ok(&["status"]);
+    assert!(text.contains("judge: heuristic (backlog "), "{text}");
+    assert!(text.contains("last backup: 20"), "{text}");
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert!(text.contains("memory in use: "), "{text}");
+    }
+    let j = env.json(&["status"]);
+    assert!(j["last_backup"].as_str().is_some() && j["reviews_open"].is_number());
+}
+
+/// What the recording runner of the service sandbox saw, one command per line.
+fn service_commands(root: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(root.join("service-commands.log"))
+        .unwrap_or_default()
+        .lines()
+        // The questions asked of the manager (is it loaded?) are not actions.
+        .filter(|l| {
+            !["launchctl print", "show -p", "/Query"]
+                .iter()
+                .any(|p| l.contains(p))
+        })
+        .map(String::from)
+        .collect()
+}
+
+/// `alice restore` stops an installed service unit before the swap and starts it afterwards (a
+/// unit that restarts its daemon would start one mid-restore); with no unit it runs no command.
+/// The service manager is never called: `ALICE_SERVICE_ROOT` records the commands instead.
+#[test]
+fn restore_stops_the_installed_service_unit_and_starts_it_again() {
+    let env = Env::new();
+    let root = env.svc.clone();
+    let with_root = |args: &[&str]| env.run(args);
+    env.ok(&["remember", "kept in the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No unit: restore runs no service command.
+    let o = with_root(&["restore", &name, "--yes"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        service_commands(&root).is_empty(),
+        "{:?}",
+        service_commands(&root)
+    );
+
+    // Installed (the sandbox writes the unit and records the commands).
+    let o = with_root(&["service", "install"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let after_install = service_commands(&root).len();
+    assert!(after_install >= 1);
+    let o = with_root(&["restore", &name, "--yes"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let all = service_commands(&root);
+    let (stop, start) = if cfg!(target_os = "macos") {
+        ("launchctl bootout gui/", "launchctl bootstrap gui/")
+    } else {
+        (
+            "systemctl --user stop alice.service",
+            "systemctl --user start alice.service",
+        )
+    };
+    let during = &all[after_install..];
+    assert_eq!(during.len(), 2, "{during:?}");
+    assert!(during[0].starts_with(stop), "{during:?}");
+    assert!(during[1].starts_with(start), "{during:?}");
+    assert_eq!(env.recall_count("backup"), 1, "the restore itself worked");
+}
+
+/// Scripted answers of the sandbox's service manager (`service-responses`): the probe says the
+/// unit is stopped (launchd: not found, 113; systemd: `inactive`), or cannot be asked.
+fn script_probe(svc: &std::path::Path, answer: &str) {
+    let line = match (cfg!(target_os = "macos"), answer) {
+        (true, "stopped") => "launchctl print\t113\t",
+        (true, _) => "launchctl print\t5\t",
+        (false, "stopped") => "show -p\t0\tinactive\\ndead\\n",
+        (false, _) => "show -p\t1\t",
+    };
+    std::fs::write(svc.join("service-responses"), format!("{line}\n")).unwrap();
+}
+
+/// The service command words that stop and start the unit on this platform.
+fn stop_start_words() -> (&'static str, &'static str) {
+    if cfg!(target_os = "macos") {
+        ("bootout", "bootstrap")
+    } else {
+        ("--user stop", "--user start")
+    }
+}
+
+/// A restore of one data directory never touches a unit that serves another (the owner's
+/// production daemon, say): no service command is run for it.
+#[test]
+fn restore_leaves_a_unit_for_another_home_alone() {
+    let env = Env::new();
+    // A unit for `env.home` is installed (recorded, not run).
+    env.ok(&["service", "install"]);
+    let installed = service_commands(&env.svc);
+    assert!(!installed.is_empty());
+    // Restore a different data directory with the same user home and service root.
+    let other = env.home.parent().unwrap().join("other-home");
+    std::fs::create_dir_all(&other).unwrap();
+    let run = |args: &[&str]| {
+        let mut c = env.cmd(args);
+        c.env("ALICE_HOME", &other);
+        c.output().unwrap()
+    };
+    assert!(
+        run(&["remember", "kept in the other home"])
+            .status
+            .success()
+    );
+    let b = run(&["--json", "backup", "now"]);
+    let name = serde_json::from_slice::<serde_json::Value>(&b.stdout).unwrap()["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let o = run(&["restore", &name, "--yes"]);
+    run(&["daemon", "stop"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        service_commands(&env.svc),
+        installed,
+        "no service command was run for another home's restore"
+    );
+}
+
+/// `alice service install` creates the home and its log directory, which the unit's output
+/// goes to; without it launchd and systemd fail the job at start.
+#[test]
+fn service_install_creates_the_log_directory_of_the_home() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    assert!(!env.home.join("logs").exists());
+    env.ok(&["service", "install"]);
+    assert!(env.home.join("logs").is_dir());
+    assert_eq!(
+        std::fs::metadata(&env.home).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let logs = std::fs::metadata(env.home.join("logs"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        logs & 0o700,
+        0o700,
+        "the owner can write the log directory: {logs:o}"
+    );
+    // A dry run creates nothing.
+    let fresh = Env::new();
+    fresh.ok(&["service", "install", "--dry-run"]);
+    assert!(!fresh.home.join("logs").exists());
+}
+
+/// A loaded unit that cannot be stopped refuses the restore with nothing changed; one that is not
+/// loaded is left alone and the restore goes ahead.
+#[test]
+fn restore_is_refused_when_the_unit_cannot_be_stopped_and_a_daemon_runs() {
+    let env = Env::new();
+    let (stop, start) = stop_start_words();
+    env.ok(&["service", "install"]);
+    env.ok(&["remember", "alpha before the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["remember", "beta after the backup"]);
+    let before = service_commands(&env.svc).len();
+    let mut c = env.cmd(&["restore", &name, "--yes"]);
+    c.env("ALICE_SERVICE_FAIL", stop);
+    let o = c.output().unwrap();
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("could not be stopped") && stderr(&o).contains("nothing was changed"),
+        "{}",
+        stderr(&o)
+    );
+    let log = service_commands(&env.svc);
+    assert_eq!(log.len(), before + 1, "only the failed stop: {log:?}");
+    assert!(!log[before..].iter().any(|l| l.contains(start)), "{log:?}");
+    assert_eq!(env.recall_count("beta"), 1, "nothing was restored");
+    // A unit the manager does not have loaded (the probe fails, whatever the language): nothing
+    // to stop, whether a daemon runs or not; the restore goes on and starts nothing afterwards.
+    let before = service_commands(&env.svc).len();
+    let mut c = env.cmd(&["restore", &name, "--yes"]);
+    script_probe(&env.svc, "stopped");
+    let o = c.output().unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        service_commands(&env.svc).len(),
+        before,
+        "an unloaded unit is neither stopped nor started"
+    );
+}
+
+/// A restore whose swap fails still starts the unit again, and when that fails too both errors
+/// are shown with the command to start the service.
+#[test]
+fn a_failed_swap_still_resumes_the_unit_and_a_failed_resume_is_reported() {
+    let env = Env::new();
+    let (_, start) = stop_start_words();
+    env.ok(&["service", "install"]);
+    env.ok(&["remember", "alpha"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["daemon", "stop"]);
+    // The staged file's name is taken by a directory: the swap cannot stage the backup.
+    let staged = env.home.join(".alice-restore.tmp");
+    std::fs::create_dir(&staged).unwrap();
+    std::fs::write(staged.join("keep"), b"x").unwrap();
+    let before = service_commands(&env.svc).len();
+    let o = env.run(&["restore", &name, "--yes"]);
+    assert!(
+        !o.status.success(),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    let log = service_commands(&env.svc);
+    assert!(
+        log[before..].iter().any(|l| l.contains(start)),
+        "the unit was started again after the failed swap: {log:?}"
+    );
+    // And when the start fails too, the error says both.
+    let mut c = env.cmd(&["restore", &name, "--yes"]);
+    c.env("ALICE_SERVICE_FAIL", start);
+    let o = c.output().unwrap();
+    assert!(!o.status.success());
+    let err = stderr(&o);
+    assert!(
+        err.contains("could not be started again") && err.contains("alice service install"),
+        "{err}"
+    );
+}
+
+/// The terminal's echo is back on after `config set-secret` is killed in the middle of the
+/// prompt, by SIGTERM and by SIGINT.
+#[test]
+fn a_killed_secret_prompt_puts_the_terminal_echo_back() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::ExitStatusExt;
+    let env = Env::new();
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        // A pseudo-terminal pair; the child's stdin is the slave side.
+        // SAFETY: plain libc calls; the descriptors are owned by the OwnedFds from then on.
+        let (master, slave) = unsafe {
+            let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(m >= 0 && libc::grantpt(m) == 0 && libc::unlockpt(m) == 0);
+            let name = libc::ptsname(m);
+            assert!(!name.is_null());
+            let s = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+            assert!(s >= 0);
+            (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s))
+        };
+        let echo_on = |fd: &OwnedFd| unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(fd.as_raw_fd(), &mut t), 0);
+            t.c_lflag & libc::ECHO != 0
+        };
+        assert!(echo_on(&slave), "a new terminal echoes");
+        let mut child = env
+            .cmd(&["config", "set-secret", "jev_api_key"])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // The prompt is up when echo goes off (the command starts a daemon first).
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while echo_on(&slave) {
+            assert!(
+                Instant::now() < deadline,
+                "the prompt never turned echo off"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the command ended early"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: signalling the child this test started.
+        unsafe { libc::kill(child.id() as i32, sig) };
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(sig), "ended by the signal: {status}");
+        assert!(echo_on(&slave), "echo is back after signal {sig}");
+        drop(master);
+    }
+    // And after a normal answer.
+    // SAFETY: as above.
+    let (master, slave) = unsafe {
+        let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(m >= 0 && libc::grantpt(m) == 0 && libc::unlockpt(m) == 0);
+        let s = libc::open(libc::ptsname(m), libc::O_RDWR | libc::O_NOCTTY);
+        (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s))
+    };
+    let echo_on = |fd: &OwnedFd| unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        assert_eq!(libc::tcgetattr(fd.as_raw_fd(), &mut t), 0);
+        t.c_lflag & libc::ECHO != 0
+    };
+    let mut child = env
+        .cmd(&["config", "set-secret", "jev_api_key"])
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while echo_on(&slave) {
+        assert!(
+            Instant::now() < deadline,
+            "the prompt never turned echo off"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let answer = concat!("ts_", "pty_secret_value\n");
+    // SAFETY: writing to the master side we own.
+    let wrote = unsafe { libc::write(master.as_raw_fd(), answer.as_ptr().cast(), answer.len()) };
+    assert_eq!(wrote as usize, answer.len());
+    assert!(child.wait().unwrap().success());
+    assert!(echo_on(&slave), "echo is back after the answer");
+}
+
+/// In sandbox mode (`ALICE_SERVICE_ROOT`) `service` and `restore` say that nothing is run.
+#[test]
+fn the_service_sandbox_says_so_on_stderr() {
+    let env = Env::new();
+    let o = env.run(&["service", "install"]);
+    assert!(o.status.success());
+    let want = format!(
+        "service commands are recorded in {}, not run (ALICE_SERVICE_ROOT is set)",
+        env.svc.display()
+    );
+    assert_eq!(stderr(&o).matches(&want).count(), 1, "{}", stderr(&o));
+    env.ok(&["remember", "x"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let o = env.run(&["restore", &name, "--yes"]);
+    assert!(o.status.success());
+    assert!(stderr(&o).contains(&want), "{}", stderr(&o));
+    // And an autostarted daemon does not call the variable a typo.
+    let log = std::fs::read_to_string(env.home.join("logs/daemon.log")).unwrap_or_default();
+    assert!(!log.contains("ALICE_SERVICE_ROOT"), "{log}");
+}
+
+/// `alice service status` names the home the unit serves, and says when it is another one.
+#[test]
+fn service_status_names_the_home_the_unit_serves() {
+    let env = Env::new();
+    assert_eq!(env.ok(&["service", "status"]).trim(), "not installed");
+    env.ok(&["service", "install"]);
+    let text = env.ok(&["service", "status"]);
+    assert!(
+        text.starts_with("installed (") && text.contains(&format!("for {}", env.home.display())),
+        "{text}"
+    );
+    let other = env.home.parent().unwrap().join("elsewhere");
+    let o = env
+        .cmd(&["service", "status"])
+        .env("ALICE_HOME", &other)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        text.contains("serves") && text.contains("not this data directory"),
+        "{text}"
+    );
+    let j = env.json(&["service", "status"]);
+    assert_eq!(j["serves_this_home"], true);
+}
+
+/// `--target-dir` still prepares the home's own directories, not the target's.
+#[test]
+fn service_install_with_a_target_dir_creates_the_homes_logs_not_the_targets() {
+    let env = Env::new();
+    let target = env.home.parent().unwrap().join("elsewhere-root");
+    env.ok(&[
+        "service",
+        "install",
+        "--target-dir",
+        target.to_str().unwrap(),
+    ]);
+    assert!(env.home.join("logs").is_dir());
+    assert!(!target.join("logs").exists());
+}
+
+/// A manager that cannot be asked (no user bus, no gui domain) refuses the restore with nothing
+/// changed and no command but the probe; a stopped unit is neither stopped nor started.
+#[test]
+fn restore_refuses_when_the_manager_cannot_be_asked_and_never_starts_a_stopped_unit() {
+    let env = Env::new();
+    env.ok(&["service", "install"]);
+    env.ok(&["remember", "alpha before the backup"]);
+    let name = env.json(&["backup", "now"])["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.ok(&["remember", "beta after the backup"]);
+    let before = service_commands(&env.svc).len();
+    script_probe(&env.svc, "unknown");
+    let o = env.run(&["restore", &name, "--yes"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("by hand") && stderr(&o).contains("nothing was changed"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        service_commands(&env.svc).len(),
+        before,
+        "no command but the probe"
+    );
+    assert_eq!(env.recall_count("beta"), 1, "nothing was restored");
+    // Stopped: the restore goes ahead, with no service command at all.
+    script_probe(&env.svc, "stopped");
+    let o = env.run(&["restore", &name, "--yes"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(service_commands(&env.svc).len(), before);
+    // Uninstall with a manager that cannot be asked: refused, the unit file stays.
+    script_probe(&env.svc, "unknown");
+    let o = env.run(&["service", "uninstall"]);
+    assert!(!o.status.success());
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("Service removed"));
+    assert!(
+        env.run(&["service", "status"])
+            .stdout
+            .starts_with(b"installed"),
+        "the unit is still installed"
     );
 }
