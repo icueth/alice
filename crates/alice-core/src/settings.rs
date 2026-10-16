@@ -419,7 +419,8 @@ pub struct SearchSettings {
     pub default_mode: DefaultRecallMode,
     /// The whole budget, in milliseconds (200 to 30000), of the judge call of a precise recall.
     /// The call is made once, with no retries; past the budget (or while the judge keeps
-    /// failing) the recall answers as fast mode does and says why.
+    /// failing) the recall answers as fast mode does and says why. The CLI and `alice mcp` wait
+    /// for a recall this long plus 2.5 s (and 2 s more with an HTTP embedder), at least 5 s.
     pub precise_timeout_ms: u64,
     /// Token budget of a recall answer when the agent does not ask for one (100 to 50000).
     pub default_max_tokens: usize,

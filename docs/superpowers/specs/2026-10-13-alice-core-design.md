@@ -422,7 +422,7 @@ Runs in a low-priority worker when the daemon has been idle for `maintenance.idl
 | Judge fails / over budget | Heuristic fallback; `judge_state = retry`. |
 | Vector index missing or inconsistent | Rebuild on a background thread; lexical search only meanwhile (`health.index_ready = false`). |
 | Disk full, DB corruption while running | Read-only mode. Writes go to the spool, and the reply says why. Agents receive: `memory is read-only: <reason>. See "alice status" and the daemon log ("alice daemon logs") for the cause.` (*As built (M2):* the text still points at `alice status` and the log; `alice doctor` shows the read-only reason with what to do next.) |
-| Client timeouts | `recall` 5 s, `context` 3 s; writes acknowledge immediately. No 120 s waits. |
+| Client timeouts | `recall` 5 s, `context` 3 s; writes acknowledge immediately. No 120 s waits. *M2 final review (D-I2):* a client's (the CLI's, `alice mcp`'s) `recall` waits `search.precise_timeout_ms` + the query-embedding bound of an HTTP embedder (2 s) + 2.5 s, at least 5 s, so a slow judge gives the fast answer with a note instead of a client timeout. |
 
 All MCP and CLI errors state what happened and what to do next, in one or two sentences.
 
