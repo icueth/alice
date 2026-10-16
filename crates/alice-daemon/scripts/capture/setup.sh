@@ -1,5 +1,5 @@
 #!/bin/sh
-# Alice: capture this machine's Claude Code sessions into your Alice server tenant
+# Alice: capture this machine's Claude Code (and Codex) sessions into your Alice server tenant
 # (SP2 spec section 5.4). Run the one line your admin gave you:
 #
 #   curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>
@@ -9,6 +9,9 @@
 # refuses it. Then it installs the hook script (~/.config/alice/alice-capture.sh) and a small
 # Claude Code plugin from a local marketplace (~/.config/alice/claude-marketplace). Running it
 # again updates everything in place; `sh ~/.config/alice/alice-capture.sh uninstall` removes it.
+# When `codex` is installed it also writes $CODEX_HOME/hooks.json (default ~/.codex/hooks.json)
+# if that file does not exist, and otherwise prints the entries to add; Codex runs a hook only
+# after the person trusts it in /hooks.
 #
 # The token is read from the terminal with echo off, never from argv or the environment
 # (ALICE_SETUP_TOKEN_STDIN=1 reads it from stdin instead, for tests). It is checked with the
@@ -148,23 +151,74 @@ plugin_json() {
   printf '}\n'
 }
 
+# The hooks file for agent $1 (claude-code: the plugin's hooks.json; codex: $CODEX_HOME/hooks.json).
 hooks_json() {
   # `|| true`: a missing script (after uninstall, or deleted by hand) must never fail a hook;
   # dash exits 2 on a file it cannot open, and exit 2 from Stop blocks the agent.
-  hj_cmd='sh \"$HOME/.config/alice/alice-capture.sh\" hook claude-code || true'
+  hj_cmd='sh \"$HOME/.config/alice/alice-capture.sh\" hook '$1' || true'
   printf '{\n'
-  printf '  "description": "Alice capture: each event hands the new transcript bytes to a background upload; SessionStart prints the briefing.",\n'
+  if [ "$1" = claude-code ]; then
+    printf '  "description": "Alice capture: each event hands the new transcript bytes to a background upload; SessionStart prints the briefing.",\n'
+  fi
   printf '  "hooks": {\n'
   hj_sep=
   for hj_event in SessionStart Stop SubagentStop PreCompact SessionEnd; do
+    hj_timeout=10
+    # Codex gives SessionEnd at most 3 s.
+    if [ "$1" = codex ] && [ "$hj_event" = SessionEnd ]; then hj_timeout=3; fi
     printf '%s    "%s": [\n' "$hj_sep" "$hj_event"
-    printf '      { "hooks": [ { "type": "command", "command": "%s", "timeout": 10 } ] }\n' "$hj_cmd"
+    printf '      { "hooks": [ { "type": "command", "command": "%s", "timeout": %s } ] }\n' "$hj_cmd" "$hj_timeout"
     printf '    ]'
     hj_sep=',
 '
   done
   printf '\n  }\n'
   printf '}\n'
+}
+
+# Codex (spec section 5.4 step 8). hooks.json is written only when it does not exist, or is
+# still exactly the file this script wrote earlier (then it is updated in place); a file of the
+# person's own, or inline [hooks] tables in config.toml, are never edited: the entries are
+# printed instead.
+codex_setup() {
+  command -v codex >/dev/null 2>&1 || return 0
+  cs_home="${CODEX_HOME:-$HOME/.codex}"
+  cs_file="$cs_home/hooks.json"
+  cs_new=$(hooks_json codex)
+  cs_write=
+  cs_why=
+  if [ -f "$cs_file" ]; then
+    if [ -f "$DIR/codex-hooks.written" ] && cmp -s "$cs_file" "$DIR/codex-hooks.written"; then
+      cs_write=1
+    else
+      cs_why="$cs_file already exists"
+    fi
+  elif [ -e "$cs_file" ]; then
+    cs_why="$cs_file exists and is not a file"
+  elif grep -q '^[[:space:]]*\[\[\{0,1\}hooks[].]' "$cs_home/config.toml" 2>/dev/null; then
+    cs_why="$cs_home/config.toml already has [hooks] tables, so hooks.json is not added beside them"
+  else
+    cs_write=1
+  fi
+  say ""
+  if [ -n "$cs_write" ]; then
+    mkdir -p "$cs_home" 2>/dev/null &&
+      { printf '%s\n' "$cs_new" >"$cs_file.tmp.$$" && mv -f "$cs_file.tmp.$$" "$cs_file"; } 2>/dev/null &&
+      { printf '%s\n' "$cs_new" >"$DIR/codex-hooks.written"; } 2>/dev/null || {
+      rm -f "$cs_file.tmp.$$" 2>/dev/null
+      say "Codex: could not write $cs_file; add these entries to it yourself:"
+      say "$cs_new"
+      cs_state="not written"
+      return 0
+    }
+    say "Codex: wrote $cs_file with the five Alice capture hooks."
+    cs_state="installed"
+  else
+    say "Codex: $cs_why; it was left as it is. Add these hook entries to your hooks:"
+    say "$cs_new"
+    cs_state="entries printed"
+  fi
+  say "Codex runs a hook only after you trust it: open Codex, type /hooks, review the Alice capture hooks and trust them."
 }
 
 main() {
@@ -278,7 +332,7 @@ main() {
     die "cannot create $MP"
   write_file "$MP/.claude-plugin/marketplace.json" "$(marketplace_json)"
   write_file "$MP/alice-capture/.claude-plugin/plugin.json" "$(plugin_json)"
-  write_file "$MP/alice-capture/hooks/hooks.json" "$(hooks_json)"
+  write_file "$MP/alice-capture/hooks/hooks.json" "$(hooks_json claude-code)"
 
   # 7. The plugin, through the claude command when it works.
   plugin=
@@ -300,11 +354,9 @@ main() {
     say "  /plugin install alice-capture@alice-local"
   fi
 
-  # 8. Codex (plan decision P10): not captured by the server yet.
-  if command -v codex >/dev/null 2>&1; then
-    say ""
-    say "Codex: Codex capture arrives in a later version of Alice; nothing was installed for it."
-  fi
+  # 8. Codex: its own hooks.json.
+  cs_state=
+  codex_setup
 
   # 9. What was done.
   distill=on
@@ -324,9 +376,14 @@ main() {
   say "  briefing: $briefing (briefing=off in ~/.config/alice/capture.conf turns it off)"
   say "  capture on the server: $enabled"
   say "  distillation: $distill (the server's setting)"
+  if [ -n "$cs_state" ]; then say "  codex hooks: $cs_state"; fi
   say "Check:  sh ~/.config/alice/alice-capture.sh status"
   say "Remove: sh ~/.config/alice/alice-capture.sh uninstall"
-  say "Start a new Claude Code session for the hooks to load."
+  if [ -n "$cs_state" ]; then
+    say "Start a new Claude Code (or Codex) session for the hooks to load."
+  else
+    say "Start a new Claude Code session for the hooks to load."
+  fi
   return 0
 }
 
