@@ -141,6 +141,10 @@ pub struct RelatedRef {
     pub title: String,
     /// How it is related: a link type or `entity:<name>`.
     pub via: String,
+    /// `distill` for a memory distilled from a captured session (the text format marks it
+    /// `(auto)`); absent for any other (SP2 spec §6.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

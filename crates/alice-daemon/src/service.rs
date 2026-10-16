@@ -8678,16 +8678,58 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unjudged_distilled_memories_are_hidden_from_recall_and_the_briefing() {
-        // Jev is down, and each request takes a while: a try of the comparison (four requests)
-        // keeps the memory `pending` for 0.8 s. A failed judgement waits in `retry` until the test
-        // queues it again (the retry interval is long here).
-        let t = Arc::new(crate::judge_http::ScriptedJev {
-            relation: ("unrelated", 1.0),
-            status: parking_lot::Mutex::new(Some(503)),
-            delay: Duration::from_millis(200),
-            ..Default::default()
+        /// Jev behind a gate: a request waits until the test opens it, then gets `inner`'s
+        /// answer. `waiting` counts the requests that reached the gate.
+        struct Gated {
+            inner: Arc<crate::judge_http::ScriptedJev>,
+            open: parking_lot::Mutex<bool>,
+            opened: parking_lot::Condvar,
+            waiting: std::sync::atomic::AtomicUsize,
+        }
+        impl alice_core::judge::jev::JevTransport for Gated {
+            fn post(
+                &self,
+                endpoint: &str,
+                key: &str,
+                body: &[u8],
+                timeout: Duration,
+            ) -> std::result::Result<
+                alice_core::judge::jev::HttpReply,
+                alice_core::judge::jev::TransportError,
+            > {
+                self.waiting
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut open = self.open.lock();
+                while !*open {
+                    self.opened.wait(&mut open);
+                }
+                drop(open);
+                self.inner.post(endpoint, key, body, timeout)
+            }
+        }
+        // Jev is down; a failed judgement waits in `retry` until the test queues it again (the
+        // retry interval is long here).
+        let t = crate::judge_http::ScriptedJev::failing(503);
+        let gate = Arc::new(Gated {
+            inner: t.clone(),
+            open: parking_lot::Mutex::new(false),
+            opened: parking_lot::Condvar::new(),
+            waiting: Default::default(),
         });
-        let (d, s) = svc_with_jev(t.clone()).await;
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                jev_transport: Some(gate.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
         let cwd = repo(&d, "proj");
         // A neighbour, so the judge has a question to ask about the distilled memory.
         remember_id(
@@ -8728,8 +8770,15 @@ mod tests {
                 );
             }
         };
+        // The judge is asking Jev about it, and the answer is held at the gate.
+        until("the judge's question", || {
+            (gate.waiting.load(std::sync::atomic::Ordering::SeqCst) > 0).then_some(())
+        })
+        .await;
         hidden("pending").await;
-        // The judge cannot answer: the memory waits for it.
+        // The answer: Jev cannot answer, and the memory waits for the judge.
+        *gate.open.lock() = true;
+        gate.opened.notify_all();
         until("waiting for the judge", || {
             (futures::executor::block_on(state_of(&s, &auto)).0 == "retry").then_some(())
         })
