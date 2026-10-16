@@ -2137,14 +2137,8 @@ impl Service {
                         "memory {asked}; check the id returned by recall or remember"
                     ))
                 })?;
-                let m = memories::get_many(c, std::slice::from_ref(&own))?
-                    .pop()
+                let (m, hash, at) = stamped_memory(c, &own)?
                     .ok_or_else(|| AliceError::NotFound(format!("memory {asked}")))?;
-                let (hash, at): (String, String) = c.query_row(
-                    "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
-                    [&own],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
                 let target = projects::resolve_move_target(c, &wanted)?;
                 let tree = match &target {
                     Some(t) => projects::tree_of(c, &t.id)?,
@@ -3674,6 +3668,41 @@ fn follow_merges(c: &Connection, m: &alice_core::model::Memory) -> Result<Option
     }))
 }
 
+/// The memory `id` (or legacy id) with the `(content_hash, updated_at)` stamp a guarded write (a
+/// move) is checked against. `None`: no memory has this id.
+///
+/// The stamp is read before the text, as the judge worker reads its items: two autocommit reads
+/// are two snapshots, and an edit landing between them must leave the writer a stamp older than
+/// the text (it refuses the move), never the edit's stamp with the text from before it (the move
+/// would put that old text back over the edit).
+fn stamped_memory(
+    c: &Connection,
+    id: &str,
+) -> Result<Option<(alice_core::model::Memory, String, String)>> {
+    let Some((own, hash, at)) = c
+        .query_row(
+            "SELECT id, content_hash, updated_at FROM memories WHERE id = ?1 OR legacy_id = ?1 ORDER BY seq LIMIT 1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    tests::between_stamp_and_text();
+    let Some(m) = memories::get_many(c, &[own])?.pop() else {
+        return Ok(None);
+    };
+    Ok(Some((m, hash, at)))
+}
+
 /// What the privacy rules say about the text a review resolution writes, before it is sent to
 /// the writer (which does not scan content). `Predicate`/`map`: the two names, redacted (or
 /// refused in `block` mode). `Project`/`move`: the memory arrives in a project whose rules may
@@ -3709,15 +3738,11 @@ fn screen_resolution(
             let Some(target) = projects::resolve_slug(c, &text("to"))? else {
                 return Ok(None); // the writer says the project is gone
             };
-            let Some(m) = memories::get_many(c, &[text("memory_id")])?.pop() else {
+            // The hash and time of the memory screened below: the writer refuses the move if
+            // either changed.
+            let Some((m, content_hash, updated_at)) = stamped_memory(c, &text("memory_id"))? else {
                 return Ok(None);
             };
-            // The hash and time of the memory screened below: the writer refuses the move if either changed.
-            let (content_hash, updated_at): (String, String) = c.query_row(
-                "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
-                [&m.id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
             let tree = projects::tree_of(c, &target.id)?;
             let r = redactors.for_root(tree.as_ref());
             let apply = |field: &str, t: &str| -> Result<(String, bool)> {
@@ -3839,6 +3864,92 @@ mod tests {
         let repo = d.path().join(name);
         std::fs::create_dir(&repo).unwrap();
         Some(repo.to_string_lossy().into_owned())
+    }
+
+    thread_local! {
+        /// Run by [`stamped_memory`] between its two reads (tests only).
+        static BETWEEN_STAMP_AND_TEXT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn between_stamp_and_text() {
+        BETWEEN_STAMP_AND_TEXT.with(|b| {
+            if let Some(f) = b.borrow_mut().as_mut() {
+                f()
+            }
+        });
+    }
+
+    /// A move is screened from the memory's text and checked by the writer against the stamp
+    /// read with it. An edit that lands between the two reads must leave the writer a stamp
+    /// older than the text (it then refuses the move), never the edit's stamp with the text from
+    /// before it (the move would then put the old text back over the edit). `screen_move` and
+    /// the review move both read through `stamped_memory`.
+    #[test]
+    fn an_edit_between_the_reads_of_a_move_leaves_a_stamp_the_writer_refuses() {
+        use alice_core::project::ProjectRef;
+        use alice_core::store::memories::{InsertOutcome, NewMemoryInput};
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("a.db");
+        let c = alice_core::store::open_writer(&db).unwrap();
+        let p = projects::upsert_project(
+            &c,
+            &ProjectRef {
+                key: "k/app".into(),
+                slug: "app".into(),
+                name: "app".into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        let m = memories::prepare(
+            NewMemoryInput {
+                content: "the deploy runs on fridays".into(),
+                kind: Some(Kind::Fact),
+                ..Default::default()
+            },
+            &p,
+            "0000000001000-0000-dev".into(),
+        )
+        .unwrap();
+        let InsertOutcome::New { id, .. } = memories::insert(&c, &m).unwrap() else {
+            panic!("duplicate")
+        };
+        let stamp = |c: &Connection| -> (String, String) {
+            c.query_row(
+                "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let before = stamp(&c);
+        // Another writer edits the memory while the move reads it.
+        let other = rusqlite::Connection::open(&db).unwrap();
+        let edit_id = id.clone();
+        BETWEEN_STAMP_AND_TEXT.with(|b| {
+            *b.borrow_mut() = Some(Box::new(move || {
+                other
+                    .execute(
+                        "UPDATE memories SET body = 'the deploy runs on mondays', content_hash = 'edited', updated_at = '2999-01-01T00:00:00Z' WHERE id = ?1",
+                        [&edit_id],
+                    )
+                    .unwrap();
+            }))
+        });
+        let (read, hash, at) = stamped_memory(&c, &id).unwrap().unwrap();
+        BETWEEN_STAMP_AND_TEXT.with(|b| *b.borrow_mut() = None);
+        assert_ne!(stamp(&c), before, "the edit landed");
+        assert_eq!(
+            (hash, at),
+            before,
+            "the stamp is the one from before the edit, so the writer refuses the move"
+        );
+        assert!(
+            read.body.contains("mondays"),
+            "the text read is the edited one"
+        );
     }
 
     /// A `remember` queued because the database is read-only holds no secret, and in `block`
