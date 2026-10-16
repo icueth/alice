@@ -479,10 +479,29 @@ impl Default for SearchSettings {
     }
 }
 
-/// Per-agent capture switches (used by SP2).
+/// Capture of agent transcripts (SP2): the master switch, per-agent switches and what is kept.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureSettings {
+    /// Capture agent sessions at all; `false` stops every agent.
+    pub enabled: bool,
+    /// Project slugs whose sessions are never captured.
+    pub excluded_projects: Vec<String>,
+    /// Keep the turns of subagents (sidechains) too.
+    pub include_subagents: bool,
+    /// Keep the agent's thinking blocks (off: they are dropped).
+    pub include_thinking: bool,
+    /// Keep at most this many characters of each tool result (0 to 8000; 0 drops them).
+    pub tool_output_chars: usize,
+    /// Target size of a captured chunk, in characters (500 to 8000).
+    pub chunk_chars: usize,
+    /// Give a new session a short briefing from Alice's memories.
+    pub briefing: bool,
+    /// How long captured transcripts are kept: `forever`, an age such as `90d` (at least
+    /// `1d`), or a total size such as `10GB` (at least `1MB`); the same rules as
+    /// `storage.raw_retention`, applied to captured chunks only.
+    #[schemars(with = "String")]
+    pub raw_retention: Retention,
     /// Capture Claude Code sessions.
     pub claude_code: bool,
     /// Capture Codex sessions.
@@ -500,6 +519,14 @@ pub struct CaptureSettings {
 impl Default for CaptureSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
+            excluded_projects: Vec::new(),
+            include_subagents: true,
+            include_thinking: false,
+            tool_output_chars: 800,
+            chunk_chars: 2000,
+            briefing: true,
+            raw_retention: Retention::Forever,
             claude_code: true,
             codex: true,
             cursor: true,
@@ -575,14 +602,48 @@ impl Default for JudgeSettings {
     }
 }
 
-/// Distillation (used by SP2).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DistillProvider {
+    /// No distillation.
+    #[default]
+    Off,
+    /// TypeSafe Jev (needs `jev_api_key`).
+    Jev,
+}
+
+/// Distillation of captured sessions into memories (SP2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct DistillSettings {
-    /// Who turns sessions into memories (SP2).
-    pub provider: Option<String>,
-    /// The model the distill provider uses (SP2).
+    /// Who turns sessions into memories: `off` or `jev`.
+    pub provider: DistillProvider,
+    /// Reserved and ignored: the model comes from `judge.jev.model`.
     pub model: Option<String>,
+    /// Proposals below this confidence are dropped (0.5 to 0.99).
+    pub min_confidence: f64,
+    /// Most memories kept from one session run (1 to 50).
+    pub max_per_run: usize,
+    /// Minutes a session must be quiet before it is distilled (1 to 1440).
+    pub idle_minutes: u32,
+    /// Importance given to distilled memories (1 to 3).
+    pub importance: u8,
+    /// Share of the judge's daily budget distillation may use (0.05 to 1).
+    pub budget_share: f64,
+}
+
+impl Default for DistillSettings {
+    fn default() -> Self {
+        Self {
+            provider: DistillProvider::Off,
+            model: None,
+            min_confidence: 0.7,
+            max_per_run: 8,
+            idle_minutes: 15,
+            importance: 2,
+            budget_share: 0.5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
@@ -1222,7 +1283,7 @@ fn env_safe(
         "embedding.idle_unload" => {
             format!("{var} must be a duration such as 90d, 12h, 15m or 30s")
         }
-        "storage.raw_retention" => format!(
+        "storage.raw_retention" | "capture.raw_retention" => format!(
             "{var} must be forever, an age of at least 1d such as 90d, or a size of at least 1MB such as 10GB"
         ),
         _ => match e.message.split_once(", expected ") {
@@ -1393,18 +1454,64 @@ impl Settings {
             }
         };
 
-        let st = &self.storage;
-        match st.raw_retention {
-            Retention::Age(d) if d < Duration::from_secs(86_400) => e.push(err(
-                "storage.raw_retention",
-                "an age must be at least 1d (did you mean days, such as 90d?)",
-            )),
-            Retention::Size(b) if b < 1_000_000 => e.push(err(
-                "storage.raw_retention",
-                "a size must be at least 1MB (write the unit, such as 10GB)",
-            )),
-            _ => {}
+        for (key, r) in [
+            ("storage.raw_retention", self.storage.raw_retention),
+            ("capture.raw_retention", self.capture.raw_retention),
+        ] {
+            match r {
+                Retention::Age(d) if d < Duration::from_secs(86_400) => e.push(err(
+                    key,
+                    "an age must be at least 1d (did you mean days, such as 90d?)",
+                )),
+                Retention::Size(b) if b < 1_000_000 => e.push(err(
+                    key,
+                    "a size must be at least 1MB (write the unit, such as 10GB)",
+                )),
+                _ => {}
+            }
         }
+
+        let (c, d) = (&self.capture, &self.distill);
+        let mut range = |key: &str, ok: bool, msg: &str| {
+            if !ok {
+                e.push(err(key, msg));
+            }
+        };
+        range(
+            "capture.tool_output_chars",
+            c.tool_output_chars <= 8000,
+            "must be 0 to 8000",
+        );
+        range(
+            "capture.chunk_chars",
+            (500..=8000).contains(&c.chunk_chars),
+            "must be 500 to 8000",
+        );
+        range(
+            "distill.min_confidence",
+            (0.5..=0.99).contains(&d.min_confidence),
+            "must be 0.5 to 0.99",
+        );
+        range(
+            "distill.max_per_run",
+            (1..=50).contains(&d.max_per_run),
+            "must be 1 to 50",
+        );
+        range(
+            "distill.idle_minutes",
+            (1..=1440).contains(&d.idle_minutes),
+            "must be 1 to 1440",
+        );
+        range(
+            "distill.importance",
+            (1..=3).contains(&d.importance),
+            "must be 1 to 3",
+        );
+        range(
+            "distill.budget_share",
+            (0.05..=1.0).contains(&d.budget_share),
+            "must be 0.05 to 1",
+        );
 
         let j = &self.judge;
         unit(&mut e, "judge.auto_apply_threshold", j.auto_apply_threshold);
@@ -1879,6 +1986,7 @@ pub const LOOSEN_POLLS: u32 = 3;
 /// loosens everything; see [`LooseningGate`].
 pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
     let (o, n) = (&old.privacy, &new.privacy);
+    let (oc, nc) = (&old.capture, &new.capture);
     let checks = [
         ("privacy.redact", o.redact && !n.redact),
         (
@@ -1924,6 +2032,36 @@ pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
         (
             "mcp.admin_tools",
             !old.mcp.admin_tools && new.mcp.admin_tools,
+        ),
+        // More of a session is captured, or sent to a cloud judge.
+        (
+            "capture.enabled",
+            !old.capture.enabled && new.capture.enabled,
+        ),
+        ("capture.claude_code", !oc.claude_code && nc.claude_code),
+        ("capture.codex", !oc.codex && nc.codex),
+        ("capture.cursor", !oc.cursor && nc.cursor),
+        ("capture.windsurf", !oc.windsurf && nc.windsurf),
+        ("capture.opencode", !oc.opencode && nc.opencode),
+        ("capture.gemini", !oc.gemini && nc.gemini),
+        (
+            "capture.excluded_projects",
+            oc.excluded_projects
+                .iter()
+                .any(|p| !nc.excluded_projects.contains(p)),
+        ),
+        (
+            "capture.include_thinking",
+            !oc.include_thinking && nc.include_thinking,
+        ),
+        (
+            "distill.provider",
+            old.distill.provider != DistillProvider::Jev
+                && new.distill.provider == DistillProvider::Jev,
+        ),
+        (
+            "distill.budget_share",
+            new.distill.budget_share > old.distill.budget_share,
         ),
     ];
     checks
@@ -2003,6 +2141,8 @@ pub struct ProjectPrivacy {
     pub custom_patterns: Vec<CustomPattern>,
     /// Never send this project's memories to a cloud judge or embedding provider.
     pub cloud_denied: bool,
+    /// Never capture this project's agent sessions.
+    pub no_capture: bool,
 }
 
 /// The privacy in force for one project: the global settings with the project's file on top,
@@ -2014,6 +2154,8 @@ pub struct EffectivePrivacy {
     pub privacy: PrivacySettings,
     /// `cloud_denied` from the project's `.alice.toml`.
     pub cloud_denied: bool,
+    /// `no_capture` from the project's `.alice.toml`.
+    pub no_capture: bool,
 }
 
 impl EffectivePrivacy {
@@ -2050,6 +2192,7 @@ impl ProjectSettings {
         EffectivePrivacy {
             privacy: p,
             cloud_denied: self.privacy.cloud_denied,
+            no_capture: self.privacy.no_capture,
         }
     }
 
@@ -2058,10 +2201,11 @@ impl ProjectSettings {
         Self::default().closed()
     }
 
-    /// These settings with the two flags forced on (the custom patterns stay).
+    /// These settings with the three flags forced on (the custom patterns stay).
     fn closed(mut self) -> Self {
         self.privacy.block_secrets = true;
         self.privacy.cloud_denied = true;
+        self.privacy.no_capture = true;
         self
     }
 
@@ -2070,6 +2214,7 @@ impl ProjectSettings {
         let (o, n) = (&self.privacy, &new.privacy);
         (o.block_secrets && !n.block_secrets)
             || (o.cloud_denied && !n.cloud_denied)
+            || (o.no_capture && !n.no_capture)
             || o.custom_patterns
                 .iter()
                 .any(|p| !n.custom_patterns.contains(p))
@@ -2116,7 +2261,7 @@ pub fn parse_project(name: &str, text: &str) -> Result<ProjectSettings, SettingE
         err(
             name,
             format!(
-                "{}; a project file accepts only [privacy] block_secrets, custom_patterns and cloud_denied",
+                "{}; a project file accepts only [privacy] block_secrets, custom_patterns, cloud_denied and no_capture",
                 toml_error(text, e.message(), e.span())
             ),
         )
@@ -3370,6 +3515,146 @@ mod tests {
     }
 
     #[test]
+    fn capture_and_distill_defaults_match_the_spec() {
+        let s = Settings::default();
+        assert!(s.validate().is_empty(), "{:?}", s.validate());
+        let c = &s.capture;
+        assert!(c.enabled && c.include_subagents && c.briefing);
+        assert!(!c.include_thinking);
+        assert!(c.excluded_projects.is_empty());
+        assert_eq!((c.tool_output_chars, c.chunk_chars), (800, 2000));
+        assert_eq!(c.raw_retention, Retention::Forever);
+        let d = &s.distill;
+        assert_eq!(d.provider, DistillProvider::Off);
+        assert_eq!(d.model, None);
+        assert_eq!((d.min_confidence, d.max_per_run), (0.7, 8));
+        assert_eq!((d.idle_minutes, d.importance), (15, 2));
+        assert_eq!(d.budget_share, 0.5);
+        let r = resolve(Some("[distill]\nprovider = \"jev\"\n"), &[]).unwrap();
+        assert_eq!(r.settings.distill.provider, DistillProvider::Jev);
+        assert_eq!(
+            error_keys("[distill]\nprovider = \"maybe\"\n", &[]),
+            vec!["distill.provider".to_string()]
+        );
+    }
+
+    #[test]
+    fn capture_ranges_are_validated() {
+        for (file, key) in [
+            (
+                "[capture]\ntool_output_chars = 9000\n",
+                "capture.tool_output_chars",
+            ),
+            ("[capture]\nchunk_chars = 100\n", "capture.chunk_chars"),
+            (
+                "[distill]\nmin_confidence = 0.4\n",
+                "distill.min_confidence",
+            ),
+            ("[distill]\nmax_per_run = 0\n", "distill.max_per_run"),
+            ("[distill]\nimportance = 4\n", "distill.importance"),
+            ("[distill]\nbudget_share = 0\n", "distill.budget_share"),
+        ] {
+            assert_eq!(error_keys(file, &[]), vec![key.to_string()], "{file}");
+            let (kept, left_out) = resolve_salvaging(Some(file), &[]);
+            assert_eq!(left_out.len(), 1, "{file}");
+            assert_eq!(left_out[0].key, key);
+            assert_eq!(
+                get_key(&kept.settings, key),
+                get_key(&Settings::default(), key),
+                "{key} keeps its previous value"
+            );
+        }
+        for ok in [
+            "[capture]\ntool_output_chars = 0\nchunk_chars = 8000\n",
+            "[distill]\nmin_confidence = 0.99\nmax_per_run = 50\nidle_minutes = 1440\nimportance = 3\nbudget_share = 1.0\n",
+        ] {
+            assert!(error_keys(ok, &[]).is_empty(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn capture_raw_retention_parses_like_storage_retention() {
+        for good in ["180d", "1MB", "forever"] {
+            let file = format!("[capture]\nraw_retention = \"{good}\"\n");
+            assert!(error_keys(&file, &[]).is_empty(), "{good}");
+        }
+        for bad in ["0", "12h"] {
+            let file = format!("[capture]\nraw_retention = \"{bad}\"\n");
+            assert_eq!(
+                error_keys(&file, &[]),
+                vec!["capture.raw_retention".to_string()],
+                "{bad}"
+            );
+        }
+        let r = resolve(
+            Some("[capture]\nraw_retention = \"30d\"\n"),
+            &env(&[("ALICE_CAPTURE_RAW_RETENTION", "180d")]),
+        )
+        .unwrap();
+        assert_eq!(
+            r.settings.capture.raw_retention,
+            Retention::Age(std::time::Duration::from_secs(180 * 86_400))
+        );
+    }
+
+    #[test]
+    fn new_loosening_keys_are_named() {
+        let mut tight = Settings::default();
+        tight.capture.enabled = false;
+        tight.capture.codex = false;
+        tight.capture.excluded_projects = vec!["client".into()];
+        tight.capture.include_thinking = false;
+        tight.distill.provider = DistillProvider::Off;
+        tight.distill.budget_share = 0.5;
+        let mut loose = tight.clone();
+        loose.capture.enabled = true;
+        loose.capture.codex = true;
+        loose.capture.excluded_projects.clear();
+        loose.capture.include_thinking = true;
+        loose.distill.provider = DistillProvider::Jev;
+        loose.distill.budget_share = 0.8;
+        let mut got = loosened_protections(&tight, &loose);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "capture.codex",
+                "capture.enabled",
+                "capture.excluded_projects",
+                "capture.include_thinking",
+                "distill.budget_share",
+                "distill.provider",
+            ]
+        );
+        assert!(loosened_protections(&loose, &tight).is_empty());
+    }
+
+    #[test]
+    fn project_no_capture_parses_and_fails_closed() {
+        let p = parse_project("f", "[privacy]\nno_capture = true\n").unwrap();
+        assert!(p.privacy.no_capture);
+        assert!(p.apply_to(&PrivacySettings::default()).no_capture);
+        assert!(ProjectSettings::fail_closed().privacy.no_capture);
+        let e = parse_project("f", "[privacy]\nbogus = 1\n").unwrap_err();
+        assert!(e.message.contains("no_capture"), "{}", e.message);
+        let off = ProjectSettings::default();
+        assert!(p.loosened_by(&off), "removing no_capture loosens");
+        assert!(!off.loosened_by(&p));
+        let d = tempfile::tempdir().unwrap();
+        let (cache, now) = clocked();
+        write_project(d.path(), "[privacy]\nno_capture = true\n");
+        assert!(cache.get(d.path()).settings.privacy.no_capture);
+        write_project(d.path(), "[privacy]\nblock_secrets = true\n");
+        for _ in 0..2 {
+            tick(&now);
+            let l = cache.get(d.path());
+            assert!(l.settings.privacy.no_capture && l.loosening_pending);
+        }
+        tick(&now);
+        assert!(!cache.get(d.path()).settings.privacy.no_capture);
+    }
+
+    #[test]
     fn every_key_has_an_env_var_and_restart_keys_are_listed() {
         let keys = key_infos();
         assert!(
@@ -3802,6 +4087,7 @@ mod tests {
             ProjectPrivacy {
                 block_secrets: true,
                 cloud_denied: true,
+                no_capture: true,
                 custom_patterns: vec![]
             }
         );

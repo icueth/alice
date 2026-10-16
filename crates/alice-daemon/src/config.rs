@@ -24,6 +24,7 @@
 //! logged or shown here.
 
 use crate::paths::AliceHome;
+use alice_core::capture::AgentKind;
 use alice_core::settings::{
     self, LooseningGate, PrivacySettings, ProjectLoad, ProjectSettings, ProjectSettingsCache,
     ProjectTree, RedactMode, Resolved, SettingError, Settings, Source, loosened_protections,
@@ -35,6 +36,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// What [`SettingsHandle::capture_verdict`] decided for one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureVerdict {
+    /// Store the turns.
+    Capture,
+    /// Skip the turns, advance the cursor and record the keys; the reason is shown to people.
+    Excluded(&'static str),
+    /// The rules are unknown right now: store nothing and keep the cursor.
+    Wait(String),
+}
 
 /// How often the daemon polls `config.toml`; a look at a project's `.alice.toml` counts as a
 /// poll at most this often.
@@ -671,6 +683,60 @@ impl SettingsHandle {
                 let l = self.project_load(t, &self.projects);
                 l.error.is_some() || l.loosening_pending
             })
+    }
+
+    /// Whether a session of `agent` in `project_slug` (its working tree `root`, when it has
+    /// one) is captured. The one answer the capture paths use; none of them reads
+    /// `capture.*` or `.alice.toml` itself. In this order: `Wait` while the rules are unknown
+    /// (the configuration is degraded, or a loosening or a broken project file is not settled),
+    /// then `Excluded` for the master switch, the agent's switch, `capture.excluded_projects`
+    /// (slugified on both sides, as the cloud list is) and the project's `no_capture`.
+    pub fn capture_verdict(
+        &self,
+        agent: AgentKind,
+        project_slug: &str,
+        root: Option<&Path>,
+    ) -> CaptureVerdict {
+        let tree = root.map(ProjectTree::alone);
+        if self.config_degraded() {
+            return CaptureVerdict::Wait("the configuration is degraded".into());
+        }
+        if self.project_fail_closed(tree.as_ref()) {
+            return CaptureVerdict::Wait(
+                "the privacy rules are not settled (a broken .alice.toml or a pending loosening)"
+                    .into(),
+            );
+        }
+        let settings = self.get();
+        let c = &settings.capture;
+        if !c.enabled {
+            return CaptureVerdict::Excluded("capture is off");
+        }
+        let agent_on = match agent {
+            AgentKind::ClaudeCode => c.claude_code,
+            AgentKind::Codex => c.codex,
+        };
+        if !agent_on {
+            return CaptureVerdict::Excluded("this agent's capture is off");
+        }
+        let slug = alice_core::normalize::slugify(project_slug.trim());
+        if !slug.is_empty()
+            && c.excluded_projects
+                .iter()
+                .any(|p| alice_core::normalize::slugify(p.trim()) == slug)
+        {
+            return CaptureVerdict::Excluded("project excluded");
+        }
+        let no_capture = tree.is_some_and(|t| {
+            self.project_load(&t, &self.projects)
+                .settings
+                .apply_to(&settings.privacy)
+                .no_capture
+        });
+        if no_capture {
+            return CaptureVerdict::Excluded("the project's .alice.toml says no_capture");
+        }
+        CaptureVerdict::Capture
     }
 
     /// A loosening in `config.toml` (a protection switched off, say) was read and is waiting to
@@ -1635,6 +1701,70 @@ mod tests {
     }
 
     // ------------------------------------------------------------ Task 6
+
+    #[test]
+    fn capture_verdict_orders_wait_before_exclusion() {
+        use alice_core::capture::AgentKind::{ClaudeCode, Codex};
+        let (_d, h) = home();
+        let repo = tempfile::tempdir().unwrap();
+        let root = Some(repo.path());
+        // A degraded configuration waits, whatever else it says.
+        write(
+            &h,
+            "[capture]\nenabled = false\nexcluded_projects = \"x\"\n",
+        );
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert!(s.config_degraded());
+        assert!(matches!(
+            s.capture_verdict(ClaudeCode, "p", None),
+            CaptureVerdict::Wait(_)
+        ));
+        // A valid configuration: the exclusions in order.
+        write(
+            &h,
+            "[capture]\nexcluded_projects = [\"Client X\"]\ncodex = false\n",
+        );
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "p", root),
+            CaptureVerdict::Capture
+        );
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "p", None),
+            CaptureVerdict::Capture
+        );
+        assert_eq!(
+            s.capture_verdict(Codex, "p", root),
+            CaptureVerdict::Excluded("this agent's capture is off")
+        );
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "client-x", root),
+            CaptureVerdict::Excluded("project excluded")
+        );
+        write(&h, "[capture]\nenabled = false\n");
+        let s2 = SettingsHandle::load_with_env(&h, vec![]);
+        assert_eq!(
+            s2.capture_verdict(ClaudeCode, "p", root),
+            CaptureVerdict::Excluded("capture is off")
+        );
+        // The project's own file.
+        let nc = tempfile::tempdir().unwrap();
+        std::fs::write(
+            nc.path().join(".alice.toml"),
+            "[privacy]\nno_capture = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "p", Some(nc.path())),
+            CaptureVerdict::Excluded("the project's .alice.toml says no_capture")
+        );
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join(".alice.toml"), "[privacy\n").unwrap();
+        assert!(matches!(
+            s.capture_verdict(ClaudeCode, "p", Some(broken.path())),
+            CaptureVerdict::Wait(_)
+        ));
+    }
 
     /// A slug with stray whitespace is still the project the denylist names.
     #[test]
