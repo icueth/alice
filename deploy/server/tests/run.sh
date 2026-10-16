@@ -125,6 +125,13 @@ case "$*" in
     printf '{\n  "adopted_from": "%s",\n  "memories": 3,\n  "chunks": 2,\n  "paths_cleared": 3,\n  "redacted_memories": 2,\n  "saved_tenant_db_as": "alice-before-restore-20261016T070000Z.db"\n}\n' "${3:-}"
     ;;
   "restore "*) echo "restored" ;;
+  "--json import status")
+    # IMPORT_BUSY: the tenants whose daemon is importing (an admin import or an upload).
+    case " ${IMPORT_BUSY:-} " in
+      *" $(basename "$ALICE_HOME") "*) printf '{\n  "state": "importing",\n  "phase": "drawers"\n}\n' ;;
+      *) printf '{\n  "state": "idle",\n  "phase": ""\n}\n' ;;
+    esac
+    ;;
   "config set-secret jev_api_key")
     # As the daemon does: the value from stdin into the tenant's own secrets.toml, 0600.
     IFS= read -r v
@@ -727,6 +734,27 @@ upgrade_names_what_it_could_not_put_back() {
   pass
 }
 
+restarts_wait_for_a_daemon_import() {
+  # An upload runs inside the daemon, outside the lock: every command that restarts or stops a daemon asks it first.
+  IMPORT_BUSY=ann run upgrade "$R/new-alice"
+  [ "$RC" != 0 ] || fail "an upgrade cut off ann's import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running on: ann' || fail "$OUT"
+  IMPORT_BUSY=ann run add ann --tz Europe/Berlin
+  [ "$RC" != 0 ] || fail "a time zone change cut off ann's import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running on: ann' || fail "$OUT"
+  IMPORT_BUSY=ann run remove ann --yes
+  [ "$RC" != 0 ] || fail "remove cut off ann's import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running on: ann' || fail "$OUT"
+  [ -d "$SRV/ann" ] || fail "ann was removed"
+  IMPORT_BUSY=ann adopt ann "$ADOPT_FILE"
+  [ "$RC" != 0 ] || fail "adopt cut off ann's import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running on: ann' || fail "$OUT"
+  # Another tenant's import does not hold up a command about this one; an idle daemon holds up nothing.
+  IMPORT_BUSY=zed run upgrade "$R/new-alice"
+  [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
+  pass
+}
+
 upgrade_is_also_the_first_install() {
   local rc out first_lib first_prev=no failed_rc left=no
   make_dist "$T/dist" "lib first"
@@ -1239,6 +1267,7 @@ for CURRENT in \
   upgrade_adds_the_time_zone_to_older_tenants adopt_installs_and_reports adopt_refuses_and_leaves_the_tenant_as_it_was \
   adopt_refuses_bad_files_before_any_change adopt_rolls_back_when_the_tenant_does_not_come_back \
   adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back imports_and_other_commands_never_overlap \
+  restarts_wait_for_a_daemon_import \
   dry_run_import_checks_the_disk_first \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \

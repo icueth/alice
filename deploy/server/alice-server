@@ -346,6 +346,12 @@ as_tenant() { # name args...
 }
 
 # --- team federation (spec 2.10) ---------------------------------------------------------------------------------
+all_tenants() { # names of every tenant, one per line
+  local f
+  for f in "$TENANTS"/*.env; do
+    if [ -e "$f" ]; then basename "$f" .env; fi
+  done
+}
 personal_tenants() { # names of the tenants that are not the team store, one per line
   local f n
   for f in "$TENANTS"/*.env; do
@@ -380,6 +386,25 @@ provision_files() { # name: the env lines and the token copy; no restart
   tok=$(team_token) || return 1
   [ -n "$tok" ] || { printf 'alice-server: the team token is empty; %s was not linked\n' "$1" >&2; return 1; }
   write_team_token "$1" "$tok"
+}
+# An import runs inside the tenant's daemon (an admin's import or a person's upload over HTTPS) and is cut off when that
+# daemon restarts or stops. The lock covers only admin commands, so these ask the daemons themselves. A daemon that does
+# not answer runs no import.
+daemon_imports() { # names...: those whose daemon is importing right now
+  local t busy=""
+  for t in "$@"; do
+    [ -n "$t" ] || continue
+    systemctl is-active --quiet "alice@$t" || continue
+    if as_tenant "$t" --json import status 2>/dev/null | grep -qE '"state": *"(running|receiving|unpacking|importing)"'; then
+      busy="$busy $t"
+    fi
+  done
+  printf '%s' "${busy# }"
+}
+no_daemon_import() { # names...
+  local busy
+  busy=$(daemon_imports "$@")
+  [ -z "$busy" ] || die "an import is running on: $busy; this would restart its daemon and cut it off. Wait until 'alice-server cli <name> import status' no longer says running, then run this again"
 }
 restart_one() { # name: restart and wait for the ping; true on success
   systemctl restart "alice@$1" && wait_ping "$(port_of "$1")" "$PING_UPGRADE"
@@ -438,7 +463,12 @@ cmd_add() { # name team(0|1) tz tz-given(0|1)
   local name=$1 team=${2:-0} tz=${3:-$DEFAULT_TZ} tz_given=${4:-0} home="$SRV/$1" port token
   need_host
   ensure_base
+  if [ "$team" = 1 ]; then
+    # shellcheck disable=SC2046  # one name per word
+    no_daemon_import $(personal_tenants)   # linking restarts every personal tenant
+  fi
   if tenant_exists "$name" && [ "$tz_given" = 1 ]; then
+    no_daemon_import "$name"
     set_env_line "$name" TZ "$tz"
     restart_one "$name" || die "$name did not come back after its time zone changed; journalctl -u alice@$name"
     say "$name now runs in $tz"
@@ -504,7 +534,12 @@ cmd_remove() { # name [--yes]
   local name=$1 flag=${2:-} home="$SRV/$1" ans="" archive was_team=0
   case "$flag" in ""|--yes) ;; *) usage >&2; exit 2 ;; esac
   need_tenant "$name"
-  if is_team "$name"; then was_team=1; fi
+  if is_team "$name"; then
+    was_team=1
+    # shellcheck disable=SC2046  # one name per word
+    no_daemon_import $(personal_tenants)   # unlinking restarts every personal tenant
+  fi
+  no_daemon_import "$name"
   if [ "$flag" != --yes ]; then
     printf 'Remove %s? Its home is archived in %s first, then deleted. [y/N] ' "$name" "$ARCHIVES" >&2
     read -r ans || ans=""
@@ -683,6 +718,8 @@ cmd_upgrade() { # binary (also the first install)
   local new=$1 lib failed still
   need_avx
   if [ ! -f "$new" ] || [ ! -x "$new" ]; then die "$new is not an executable file"; fi
+  # shellcheck disable=SC2046  # one name per word
+  no_daemon_import $(all_tenants)
   # A build of deploy/server/build-release keeps its ONNX Runtime where the binary's rpath looks: ../lib/alice.
   lib="$(dirname -- "$new")/../lib/alice/$ORT_LIB"
   [ -f "$lib" ] || lib=""
@@ -788,6 +825,7 @@ cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
   need=$(( 2 * ($(file_bytes "$file") / 1024 + 1) + 2 * 1024 * 1024 ))
   free_k=$(free_kb)
   [ "$free_k" -ge "$need" ] || die "adopting $file needs twice its size plus 2 GB free; $(gb "$free_k") GB is free"
+  no_daemon_import "$name"   # adopting stops the daemon
   # The person's cloud denials go first, on the fresh tenant while it runs: the adoption replaces only alice.db, so they
   # hold from the adopted database's first moment, and a failure here changes nothing else.
   if [ -n "$list" ]; then

@@ -58,7 +58,7 @@ A tenant cannot reach the admin's network. The service unit allows only the publ
 
 `alice-server` manages `/etc/caddy/Caddyfile` from one template. The first time it runs, it copies your existing Caddyfile to `/etc/caddy/Caddyfile.pre-alice` and never overwrites that copy. Compare the two files before the switch. After every change it runs `caddy validate`, then reloads Caddy. If validation fails, it undoes the change and exits with an error. The template also moves Caddy's admin API from `localhost:2019` to a Unix socket, so a tenant cannot reach it.
 
-The script takes a lock, so two runs cannot overlap, and it is safe to run twice: a repeated command leaves the same state and says so. `import` is the exception: it can run for hours, and two may run at once. While one runs, `upgrade`, `add --team`, and `remove` or `adopt` of that tenant refuse to start, because they would restart the daemon the import needs.
+The script takes a lock, so two runs cannot overlap, and it is safe to run twice: a repeated command leaves the same state and says so. `import` is the exception: it can run for hours, and two may run at once. While an import runs, the admin's or a person's own upload over HTTPS, `upgrade`, `add --team`, `add --tz`, and `remove` or `adopt` of that tenant refuse to start, because they would restart or stop the daemon the import runs in. They ask each daemon (`alice import status`), so an upload, which never takes the script's lock, holds them back too.
 
 ### Commands
 
@@ -459,7 +459,8 @@ If you would rather not run anything, you can still give your palace folder to y
 | A tenant is not `active` in `list` | The daemon stopped | `journalctl -u alice@<name>`, then `systemctl restart alice@<name>` |
 | `alice-server upgrade` exits with tenant names | Those tenants did not restart | The previous binary was restored; read `journalctl -u alice@<name>` |
 | `… still down: <names> … cannot start on the old one` after an upgrade | The new binary migrated those databases, and the old one cannot read them | Fix the failing tenant (its journal), then run the upgrade again; or restore that tenant's pre-migration backup |
-| `an import is running for: <names>` | An import is still embedding | Wait until it ends, then run the command again |
+| `an import is running on: <names>` | An import (the admin's or a person's upload) is still reading its palace | Wait until `alice-server cli <name> import status` no longer says running, then run the command again |
+| `another alice-server command, or an import, is running` | The script's lock is held | Wait until that command or the admin's `import` ends, then run this again |
 | `the adoption failed … stays stopped` | The adopted database could not be swapped back | Run the `alice restore` command it names with `alice-server cli`, then `systemctl start alice@<name>` |
 | `alice-server: a secret is never passed on the command line` | You put a key after `set-secret` | Run `config set-secret jev_api_key` alone and paste the key at the prompt |
 | `unknown secret name; use one of: jev_api_key, embedding_api_key` | The secret's name is wrong | The Jev key is `jev_api_key` |
