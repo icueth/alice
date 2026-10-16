@@ -10,7 +10,7 @@
 //!   path. Install removes them all, then adds fresh ones: it is idempotent and repairs hooks of
 //!   a moved binary. Uninstall removes them, and the groups, lists and `hooks` object they leave
 //!   empty (spec: "and arrays left empty"). An empty list the person had before the install is
-//!   one of those: Alice cannot tell it from one she made.
+//!   one of those: Alice cannot tell it from one it made.
 //! - **The file** is edited through [`json`], which keeps key order; the rest of it stays as it
 //!   is. A missing file starts from `{}`; one that is not strict JSON is refused untouched. A
 //!   file that would not change is not written. Otherwise the new text is checked against
