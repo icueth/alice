@@ -726,7 +726,10 @@ pub struct CaptureSessionRow {
     pub last_capture_at: Option<String>,
     pub ended: bool,
     pub distill_state: String,
-    /// Uploads accepted from beyond the cursor (server tenants).
+    /// Times bytes past the cursor were skipped, never read. On a server tenant: an upload
+    /// accepted from beyond the cursor (a client that skipped a line, or a server copy older
+    /// than the client's, after a restore). On a local daemon: a line longer than a pass
+    /// (8 MiB), whose turn keeps a `[record skipped: too large]` stub; not a restore.
     pub gaps: i64,
 }
 

@@ -73,6 +73,7 @@ pub struct CaptureState {
     pub last_capture_at: Option<String>,
     pub ended: bool,
     pub no_distill: bool,
+    /// Times the cursor jumped forward over bytes never read (see [`record_gap`]).
     pub gaps: i64,
     pub distill_ord: i64,
     pub distill_state: DistillState,
@@ -398,7 +399,10 @@ pub fn set_ended(conn: &Connection, source_id: &str) -> Result<usize> {
     )?)
 }
 
-/// A tenant client sent from beyond the cursor: the cursor moves there and the gap is counted.
+/// A pass starts beyond the cursor: the cursor moves there and the gap is counted. On a tenant,
+/// a client sent from beyond the cursor (it skipped a line, or the server's copy is older than
+/// the client's); on a local daemon, the worker skipped a line longer than a pass. Bytes in a
+/// gap are never read.
 pub fn record_gap(conn: &Connection, source_id: &str, byte_offset: u64) -> Result<usize> {
     Ok(conn.execute(
         "UPDATE capture_state SET byte_offset = ?2, gaps = gaps + 1 WHERE source_id = ?1",

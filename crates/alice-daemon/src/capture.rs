@@ -1801,9 +1801,10 @@ mod local {
     }
 
     /// Ruling 6: the rollout of the Codex session `session_id`, for a hook that gave no
-    /// transcript path. It is `rollout-*<session_id>*.jsonl` in one of the newest 7
+    /// transcript path. It is `rollout-*-<session_id>.jsonl`, the whole id at the end of the
+    /// name (an id that is part of another's never matches), in one of the newest 7
     /// `sessions/YYYY/MM/DD` folders under `codex_home`, the newest folder first. A compressed
-    /// rollout (`.jsonl.zst`) is not read.
+    /// rollout (`rollout-*-<session_id>.jsonl.zst`) is not read.
     pub fn find_rollout(codex_home: &Path, session_id: &str) -> Option<PathBuf> {
         search_rollouts(codex_home, session_id).path
     }
@@ -1813,23 +1814,31 @@ mod local {
         if !capture::valid_id(session_id) {
             return out;
         }
+        let plain = format!("-{session_id}.jsonl");
+        let compressed = format!("{plain}.zst");
+        // `rollout-`, then the rest ending `-<id>.jsonl[.zst]`: the two never share the `-`.
+        let rollout_of = |name: &str, end: &str| {
+            name.len() >= "rollout-".len() + end.len()
+                && name.starts_with("rollout-")
+                && name.ends_with(end)
+        };
         for dir in newest_days(&codex_home.join("sessions"), ROLLOUT_DAYS) {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            let mut names: Vec<String> = entries
+            let mut found: Vec<String> = entries
                 .flatten()
                 .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.starts_with("rollout-") && n.contains(session_id))
+                .filter(|n| rollout_of(n.as_str(), &plain) || rollout_of(n.as_str(), &compressed))
                 .collect();
             // The newest first: a rollout's name starts with its time.
-            names.sort_unstable_by(|a, b| b.cmp(a));
-            for name in names {
-                if name.ends_with(".jsonl") {
+            found.sort_unstable_by(|a, b| b.cmp(a));
+            for name in found {
+                if rollout_of(&name, &plain) {
                     out.path = Some(dir.join(name));
                     return out;
                 }
-                out.compressed |= name.ends_with(".jsonl.zst");
+                out.compressed = true;
             }
         }
         out

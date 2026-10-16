@@ -2436,6 +2436,128 @@ async fn a_null_codex_path_is_found_by_session_id() {
     assert!(!source_exists(&svc, &format!("codex:session:{zst_id}")));
 }
 
+/// Review fix F1: a rollout is `rollout-*-<session id>.jsonl` (or `.jsonl.zst`), the whole id at
+/// the end of the name. An id that is part of another session's id, at either end, never finds
+/// that session's rollout, plain or compressed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollout_matches_the_whole_session_id() {
+    let d = tempfile::tempdir().unwrap();
+    let codex = d.path().join("codex-home");
+    let newest = codex.join("sessions/2026/10/08");
+    let older = codex.join("sessions/2026/10/05");
+    std::fs::create_dir_all(&newest).unwrap();
+    std::fs::create_dir_all(&older).unwrap();
+    let file = |dir: &Path, name: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, b"{}\n").unwrap();
+        p
+    };
+    // In the newest folder, rollouts of sessions whose ids hold `abc`, and none of `abc` itself.
+    let xabc = file(&newest, "rollout-2026-10-08T09-00-00-xabc.jsonl");
+    let abc_1 = file(&newest, "rollout-2026-10-08T10-00-00-abc-1.jsonl");
+    file(&newest, "rollout-2026-10-08T11-00-00-xabc.jsonl.zst");
+    file(&newest, "rollout-2026-10-08T12-00-00-abc.jsonl.bak");
+    // `rollout-` and `-abc.jsonl` would have to share the `-`: not a rollout of `abc`.
+    file(&newest, "rollout-abc.jsonl");
+    let abc = file(&older, "rollout-2026-10-05T09-00-00-abc.jsonl");
+
+    use alice_daemon::capture::find_rollout;
+    assert_eq!(find_rollout(&codex, "abc"), Some(abc));
+    assert_eq!(find_rollout(&codex, "xabc"), Some(xabc));
+    assert_eq!(find_rollout(&codex, "abc-1"), Some(abc_1));
+    // Parts of those ids that the name does not delimit with `-` on the left.
+    for part in ["bc", "ab", "c-1", "abc-"] {
+        assert_eq!(find_rollout(&codex, part), None, "{part}");
+    }
+
+    // Through the worker: `bc` has no rollout, and `xabc`'s compressed one is not counted for it.
+    let svc = start_with(
+        &d.path().join("home"),
+        ServiceOptions {
+            codex_home: Some(codex.clone()),
+            ..local_options()
+        },
+    );
+    svc.capture_notify(CaptureNotify {
+        agent: "codex".into(),
+        event: "session-start".into(),
+        session_id: "bc".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    until("the missing rollout is counted", || {
+        svc.capture_counts().rollouts_not_found == 1
+    })
+    .await;
+    assert_eq!(svc.capture_counts().rollouts_compressed, 0);
+    assert!(!source_exists(&svc, "codex:session:bc"));
+}
+
+/// Review fix F2: a compressed rollout named by the hook itself is skipped by its file name,
+/// whatever the source's cursor: it is never opened (no pass runs and the stored identity and
+/// cursor stay), nothing is stored, and it is counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compressed_rollout_is_skipped_by_its_name() {
+    let d = tempfile::tempdir().unwrap();
+    // No periodic sweep: only the notifies below run passes.
+    let svc = start_with(
+        &d.path().join("home"),
+        ServiceOptions {
+            capture_sweep_every: Duration::from_secs(3_600),
+            ..local_options()
+        },
+    );
+    let session = "0199a213-81c0-7800-8aa1-0000000000z1";
+    let plain = d
+        .path()
+        .join(format!("rollout-2026-10-08T09-00-00-{session}.jsonl"));
+    std::fs::write(&plain, "{\"type\":\"session_meta\"}\n".repeat(100)).unwrap();
+    let codex_notify = |path: &Path, event: &str| CaptureNotify {
+        agent: "codex".into(),
+        event: event.into(),
+        session_id: session.into(),
+        transcript_path: path.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    // The session is registered from its plain rollout, then its cursor is put past 0.
+    svc.capture_notify(codex_notify(&plain, "session-start"))
+        .await
+        .unwrap();
+    let codex_uri = format!("codex:session:{session}");
+    until("the session is registered", || {
+        state_of(&svc, &codex_uri).is_some() && passes(&svc) == 1
+    })
+    .await;
+    {
+        let c = rusqlite::Connection::open(svc.home().db()).unwrap();
+        c.execute("UPDATE capture_state SET byte_offset = 1000", [])
+            .unwrap();
+    }
+    let before = state_of(&svc, &codex_uri).unwrap();
+    assert_eq!(before.byte_offset, 1000);
+    let passes_before = passes(&svc);
+
+    let zst = d
+        .path()
+        .join(format!("rollout-2026-10-08T09-00-00-{session}.jsonl.zst"));
+    std::fs::write(&zst, b"\x28\xb5\x2f\xfd compressed frames").unwrap();
+    svc.capture_notify(codex_notify(&zst, "stop"))
+        .await
+        .unwrap();
+    until("the compressed rollout is counted", || {
+        svc.capture_counts().rollouts_compressed == 1
+    })
+    .await;
+    assert_eq!(passes(&svc), passes_before, "no pass read it");
+    let after = state_of(&svc, &codex_uri).unwrap();
+    assert_eq!(after.byte_offset, 1000);
+    assert_eq!(after.file_key, before.file_key, "never opened and keyed");
+    assert_eq!(after.transcript_path, before.transcript_path);
+    assert!(chunks_of(&svc, &codex_uri).is_empty());
+    assert_eq!(svc.capture_counts().rollouts_not_found, 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_notify_is_checked_before_it_is_queued() {
     let (d, svc) = local();
