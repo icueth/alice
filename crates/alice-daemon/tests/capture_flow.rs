@@ -2289,7 +2289,11 @@ async fn a_large_transcript_is_read_in_bounded_passes_that_split_no_turn() {
         keys.iter().all(|k| !k.starts_with("tail:")),
         "no turn was cut at a pass's end"
     );
-    assert!(passes(&svc) >= 9, "{} passes", passes(&svc));
+    // The count is bumped just after a pass commits its cursor, so it can lag the cursor by one pass.
+    until_within("the last pass counted", Duration::from_secs(10), || {
+        passes(&svc) >= 9
+    })
+    .await;
     assert_eq!(state_of(&svc, &uri("lg")).unwrap().gaps, 0);
     assert_eq!(chunks_holding(&svc, "Step 6799 is built."), 1);
     assert_eq!(chunks_holding(&svc, "considering the build"), 0);
