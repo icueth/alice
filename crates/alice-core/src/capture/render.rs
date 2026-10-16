@@ -730,7 +730,7 @@ fn cut_point(window: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{AgentKind, ReadOptions, read};
+    use super::super::{AgentKind, CapturedTurn, ReadOptions, read};
     use super::*;
 
     const TOOLS: &[u8] = include_bytes!("../../tests/fixtures/capture/claude/tools.jsonl");
@@ -1125,7 +1125,13 @@ mod tests {
                 ..closed()
             },
         );
-        assert_eq!(again.turns[0], second.turns[1]);
+        // `start` is an offset into each input: shifted by where the second read began, the
+        // turn is the same, byte for byte.
+        let shifted = CapturedTurn {
+            start: again.turns[0].start + start as u64,
+            ..again.turns[0].clone()
+        };
+        assert_eq!(shifted, second.turns[1]);
     }
 
     #[test]

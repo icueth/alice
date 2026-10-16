@@ -47,12 +47,12 @@ const STREAM_CAPACITY: usize = 256;
 /// `remember` can wait behind during an import: 200 chunks / 64 KiB gave a p95 of 117 ms with
 /// 20 clients at a 100k-chunk import, 50 chunks / 32 KiB about 58 ms (`docs/benchmarks/m2.md`,
 /// Task 20); the import took 16 % longer.
-const INGEST_SLICE: usize = 50;
+pub(crate) const INGEST_SLICE: usize = 50;
 /// Chunk text written per batch, at most (FTS work grows with text, not with chunk count). It
 /// must be at least one largest chunk ([`alice_core::model::limits::MAX_CHUNK_BYTES`]): a
 /// chunk is deferred when it does not fit what is left of a slice, and only a slice with
 /// all of this budget left takes one regardless (see `slice_len`).
-const INGEST_SLICE_BYTES: usize = alice_core::model::limits::MAX_CHUNK_BYTES;
+pub(crate) const INGEST_SLICE_BYTES: usize = alice_core::model::limits::MAX_CHUNK_BYTES;
 
 #[derive(Debug, Clone)]
 pub enum ProjectChoice {

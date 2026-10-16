@@ -647,6 +647,123 @@ pub struct Health {
     /// Why the link to the team store is off or failing (server mode); never the token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_warning: Option<String>,
+    /// Automatic capture of agent sessions (SP2 spec §8.4); absent while capture never ran.
+    /// Boxed: it would make every stream item as large as itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<Box<CaptureHealth>>,
+}
+
+/// The capture line of [`Health`] (SP2 spec §8.4). The distill fields keep their defaults until
+/// distillation exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CaptureHealth {
+    /// Sessions that captured something in the last 24 hours.
+    pub sessions_24h: u64,
+    /// Chunks captured in the last 24 hours.
+    pub chunks_24h: u64,
+    /// When something was last captured (RFC 3339).
+    pub last_capture_at: Option<String>,
+    /// Sessions not yet marked ended.
+    pub open_sessions: u64,
+    /// `off` or `jev` (`distill.provider`).
+    pub distill_provider: String,
+    /// `off`, `ready`, `waiting_judge`, `waiting_budget`, `breaker_open` or `no_key`.
+    pub distill_state: String,
+    /// Sessions waiting to be distilled.
+    pub distill_due: u64,
+    pub distilled_24h: u64,
+    /// Proposals dropped in the last 24 hours (duplicates and uncertain ones).
+    pub distill_dropped_24h: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distill_warning: Option<String>,
+    /// Transcript lines of a shape the reader did not recognise in the last 7 days (a hint that
+    /// an agent's format changed). Counted in memory: it starts from zero with the daemon.
+    pub unrecognised_lines_7d: u64,
+}
+
+/// `GET /api/v1/capture/status`: the capture switch, distillation and the recent sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CaptureStatus {
+    /// The daemon runs as a server tenant (the setup script checks its token with this).
+    pub tenant: bool,
+    /// `capture.enabled`.
+    pub enabled: bool,
+    pub distill_provider: String,
+    pub distill_state: String,
+    /// The 50 sessions captured most recently, newest first.
+    pub sessions: Vec<CaptureSessionRow>,
+}
+
+/// One captured session in [`CaptureStatus`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CaptureSessionRow {
+    /// `<agent>:session:<id>[:agent:<id>]`.
+    pub uri: String,
+    /// The slug of the session's project.
+    pub project: String,
+    /// Chunks stored for the session.
+    pub chunks: u64,
+    /// The cursor: the byte offset in the transcript where the next pass reads.
+    pub byte_offset: u64,
+    pub last_capture_at: Option<String>,
+    pub ended: bool,
+    pub distill_state: String,
+    /// Uploads accepted from beyond the cursor (server tenants).
+    pub gaps: i64,
+}
+
+/// The largest transcript upload (`POST /api/v1/capture/transcript`): one pass's worth.
+pub const TRANSCRIPT_BODY_LIMIT: usize = 8 << 20;
+
+/// The query of a transcript upload (SP2 spec §5.2). The body is the transcript's bytes from
+/// `offset`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TranscriptQuery {
+    /// `claude-code` or `codex`.
+    pub agent: String,
+    /// The session id.
+    pub session: String,
+    /// A subagent's id, for its own transcript.
+    #[serde(default)]
+    pub subagent: Option<String>,
+    /// The byte offset of the body's first byte in the transcript.
+    #[serde(default)]
+    pub offset: u64,
+    /// `session-start`, `stop`, `subagent-stop`, `pre-compact`, `session-end` or `sweep`.
+    pub event: String,
+    /// Server tenants: the project name (a repository's basename), slugified and resolved on
+    /// the server as a direct MCP caller's hint is. Ignored by a local daemon.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Server tenants: the `X-Alice-Project` header, which wins over `project`. Set by the
+    /// route from the header; never read from the query string.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_header: Option<String>,
+    /// Local daemons: the session's working directory, which decides its project. Ignored by a
+    /// server tenant (it cannot see the client's paths).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// `1`: the session is captured but never distilled (the client's `.alice.toml`).
+    #[serde(default)]
+    pub no_distill: Option<u8>,
+    /// `1`: nothing is captured; the answer only moves the client past the body.
+    #[serde(default)]
+    pub no_capture: Option<u8>,
+}
+
+/// The answer to an accepted transcript upload.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TranscriptAnswer {
+    /// Where the client's next upload starts: the start of the first incomplete turn, or the
+    /// end of the last complete line.
+    pub next_offset: u64,
+    pub turns_stored: u64,
+    /// Turns that were stored already, or not stored by the rules (an excluded project).
+    pub turns_skipped: u64,
+    pub chunks_stored: u64,
+    /// The body is a whole pass without a line end: the client skips that line.
+    pub oversized_line: bool,
 }
 
 fn is_false(b: &bool) -> bool {

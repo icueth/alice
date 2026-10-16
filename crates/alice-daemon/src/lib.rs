@@ -2,6 +2,7 @@
 
 pub mod adopt;
 pub mod backup;
+pub mod capture;
 pub mod client;
 pub mod client_projects;
 pub mod compat;

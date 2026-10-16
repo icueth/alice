@@ -4,6 +4,7 @@
 //! `spawn_blocking`, so neither ever waits for the other (spec §4.1).
 
 use crate::backup::{self, BackupInfo, BackupKind};
+use crate::capture::{CaptureCtl, PassInput, PassReport};
 use crate::config::SettingsHandle;
 use crate::embedding::{self, Builder, EmbeddingCtl};
 use crate::importer::{self, ImportEnv, ImportSlot};
@@ -17,7 +18,7 @@ use crate::secrets::{self, SecretName, SecretStore};
 use crate::spool;
 use crate::worker::{SAVE_EVERY, WorkerConfig, spawn_worker};
 use crate::writer::{
-    ProjectChoice, ResolveText, WriteOp, WriteOutcome, WriterHandle, spawn_writer_with,
+    CaptureInit, ProjectChoice, ResolveText, WriteOp, WriteOutcome, WriterHandle, spawn_writer_with,
 };
 use alice_core::api::*;
 use alice_core::embed::Embedder;
@@ -665,6 +666,8 @@ pub struct Service {
     scheduler: Arc<Scheduler>,
     /// The one import job (a running one, or the last one's outcome).
     import: Mutex<ImportSlot>,
+    /// The capture pipeline (SP2): transcript bytes into chunks, turn keys and cursors.
+    capture: Arc<CaptureCtl>,
     /// The compatibility layer's short-lived overview cache.
     pub(crate) compat: crate::compat::CompatState,
     /// Tests: time added to the age of the shared health reading.
@@ -937,6 +940,17 @@ impl Service {
             .unwrap_or_else(|| Arc::new(|var: &str| std::env::var(var).ok()));
         let conn = open_writer(&home.db())?;
         let device = device_id(&conn)?;
+        // A tenant keeps no path of the person's machine (SP2 spec §9.4): an adopted database's
+        // transcript paths and file identities are cleared before anything reads them.
+        if opts.tenant {
+            let cleared = crate::capture::forget_local_paths(&conn)?;
+            if cleared > 0 {
+                tracing::info!(
+                    sources = cleared,
+                    "cleared local transcript paths from an adopted database"
+                );
+            }
+        }
         let readers = Arc::new(ReaderPool::new(home.db(), opts.reader_pool));
         let vector_readers = Arc::new(ReaderPool::with_cache(
             home.db(),
@@ -1141,6 +1155,12 @@ impl Service {
         let watcher = settings.spawn_watcher(opts.settings_poll, stop.clone());
         let resolver = ProjectResolver::new(opts.detect_project);
         let precise_gate = crate::precise_gate::PreciseGate::new(opts.precise_clock.clone());
+        let capture = CaptureCtl::new(
+            readers.clone(),
+            writer.clone(),
+            settings.clone(),
+            redactors.clone(),
+        );
         // The team store never links to itself.
         let (team, team_error) = if opts.team_store {
             (None, None)
@@ -1193,6 +1213,7 @@ impl Service {
             precise_gate,
             scheduler,
             import: Mutex::new(ImportSlot::new()),
+            capture,
             compat: crate::compat::CompatState::default(),
             #[cfg(test)]
             health_aged: Mutex::new(Duration::ZERO),
@@ -4013,6 +4034,8 @@ impl Service {
             .or_else(|| self.team.as_ref().and_then(|t| t.problem()));
         let model_loaded = self.embedder().is_loaded();
         let memory_bytes = crate::doctor::self_memory_bytes();
+        let unrecognised_lines = self.capture.unrecognised_lines_7d();
+        let capture_settings = self.settings();
         // Read the backup directory, the spool and the database: off the runtime's threads.
         let scheduler = self.scheduler.clone();
         let backup_dir = backup::backup_dir(&self.home, &self.settings().backup);
@@ -4060,9 +4083,95 @@ impl Service {
                 settings_errors,
                 config_degraded,
                 team_warning,
+                capture: crate::capture::health(c, &capture_settings, unrecognised_lines)?,
             })
         })
         .await
+    }
+
+    /// A transcript upload (SP2 spec §5.2): `Err(cursor)` when `q.offset` is below the source's
+    /// cursor (the route answers `409 {"next_offset": cursor}`), else what was captured.
+    pub async fn capture_transcript(
+        &self,
+        q: TranscriptQuery,
+        body: axum::body::Bytes,
+    ) -> Result<std::result::Result<TranscriptAnswer, u64>> {
+        let report = self.capture_upload(q, body).await?;
+        Ok(match report.behind {
+            Some(cursor) => Err(cursor),
+            None => Ok(report.answer()),
+        })
+    }
+
+    /// [`capture_transcript`](Self::capture_transcript) with the whole report of the pass.
+    ///
+    /// - `no_capture=1` is a no-op: nothing is read or written, and the client moves past the
+    ///   body's last complete line;
+    /// - the project: on a server tenant, the hint (`project_header`, the `X-Alice-Project`
+    ///   header, else `project`), resolved as a direct MCP caller's is (an existing slug or
+    ///   alias, else the `import:<slug>` placeholder); on a local daemon, `cwd` (plan decision
+    ///   P8). An existing source keeps its own project;
+    /// - `session-end` closes the trailing turn whatever it waits for and ends the source;
+    ///   every other event closes it unless its last tool call has no result yet.
+    pub async fn capture_upload(
+        &self,
+        q: TranscriptQuery,
+        body: axum::body::Bytes,
+    ) -> Result<PassReport> {
+        let _busy = self.activity.enter();
+        let agent = alice_core::capture::AgentKind::parse(&q.agent).ok_or_else(|| {
+            AliceError::invalid(format!(
+                "unknown agent \"{}\"; use claude-code or codex",
+                q.agent
+            ))
+        })?;
+        crate::capture::check_ids(&q.session, q.subagent.as_deref())?;
+        crate::capture::check_event(&q.event)?;
+        if q.no_capture.is_some_and(|v| v != 0) {
+            let uri = agent.source_uri(&q.session, q.subagent.as_deref());
+            return Ok(PassReport::not_captured(uri, q.offset, &body));
+        }
+        let nonempty = |s: &Option<String>| s.clone().filter(|v| !v.trim().is_empty());
+        let hint = nonempty(&q.project_header).or_else(|| nonempty(&q.project));
+        let project = self
+            .choose(Scope {
+                project: None,
+                cwd: q.cwd.as_deref(),
+                client_project: None,
+                project_hint: hint.as_deref(),
+            })
+            .await?;
+        let session_end = q.event == "session-end";
+        let input = PassInput {
+            agent,
+            session: q.session,
+            subagent: q.subagent,
+            init: CaptureInit {
+                no_distill: q.no_distill.is_some_and(|v| v != 0),
+                ..Default::default()
+            },
+            project,
+            bytes: body,
+            offset: q.offset,
+            at_file_start: q.offset == 0,
+            close_trailing: !session_end,
+            force_close: session_end,
+            event: q.event,
+            end: session_end,
+        };
+        let capture = self.capture.clone();
+        tokio::task::spawn_blocking(move || capture.apply(input))
+            .await
+            .map_err(join_err)?
+    }
+
+    /// `GET /api/v1/capture/status`: the capture switch, distillation and the 50 sessions
+    /// captured most recently.
+    pub async fn capture_status(&self) -> Result<CaptureStatus> {
+        let _busy = self.activity.enter();
+        let (tenant, settings) = (self.opts.tenant, self.settings());
+        self.read(move |c| crate::capture::status(c, tenant, &settings))
+            .await
     }
 }
 

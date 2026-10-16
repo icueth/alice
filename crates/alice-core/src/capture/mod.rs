@@ -115,6 +115,10 @@ pub struct ReadOutcome {
     /// Continuation chunks of the source's previous turn: records found at a cursor > 0 before
     /// any turn starts (spec §3.3, late records). Empty at the file start.
     pub tail: Vec<RenderedChunk>,
+    /// The tail's turn key, `tail:<key of its first record>` ([`turn_key`]'s rule), when there
+    /// is a tail. It is stored like a turn key, so a tail read again (a resend, a cursor put
+    /// back) is not stored twice. Set even when the tail rendered no chunk.
+    pub tail_key: Option<String>,
     /// Bytes of the input that are done: up to the start of the first incomplete turn, or to the
     /// end of the last complete line. Always 0 or just after a `\n`.
     pub consumed: u64,
@@ -129,6 +133,10 @@ pub struct ReadOutcome {
 pub struct CapturedTurn {
     /// The turn key (spec §3.5); see [`turn_key`].
     pub key: String,
+    /// The byte offset in the input of the turn's first line (0 for a head turn). A turn ends
+    /// where the next one starts, the last one at [`ReadOutcome::consumed`], so a caller can
+    /// move a cursor turn by turn.
+    pub start: u64,
     /// The first timestamped record's time.
     pub started_at: Option<String>,
     /// The first sentence of the turn's prompt, at most 200 characters, without harness markup.
@@ -248,10 +256,15 @@ pub fn read(agent: AgentKind, input: &[u8], opts: &ReadOptions) -> ReadOutcome {
                 .and_then(Record::real_prompt)
                 .and_then(|text| first_sentence(&text, PROMPT_CHARS)),
             chunks: render::turn(&turn, opts),
+            start: turn.start as u64,
             key: turn.key,
         })
         .collect();
     out.tail = render::records(&grouped.tail, opts);
+    out.tail_key = grouped
+        .tail
+        .first()
+        .map(|first| format!("tail:{}", first.turn_key()));
     out
 }
 
@@ -478,6 +491,44 @@ mod tests {
         assert_eq!(keys(&head), [id("a7", 1), id("a7", 3)]);
         assert_eq!(head.turns[0].prompt, None);
         assert!(turn_text(&head.turns[0]).contains("test result: ok"));
+    }
+
+    /// Ruling (Task 6a): a late tail is keyed `tail:<key of its first record>`, so a tail read
+    /// again (a resend, a cursor put back) is not stored twice; each turn says where it starts,
+    /// so a writer can move the cursor turn by turn.
+    #[test]
+    fn the_tail_is_keyed_and_turns_know_their_start() {
+        let out = read(CLAUDE, LATE_TAIL, &opts(false, true));
+        assert_eq!(out.tail_key, Some(format!("tail:{}", id("a7", 1))));
+        assert_eq!(out.turns[0].start, line_start(LATE_TAIL, "Ship it."));
+        // No tail at the file start, and none while the tail waits.
+        assert_eq!(read(CLAUDE, LATE_TAIL, &opts(true, true)).tail_key, None);
+        let head_only = &LATE_TAIL[..line_start(LATE_TAIL, "Ship it.") as usize];
+        assert_eq!(read(CLAUDE, head_only, &opts(false, false)).tail_key, None);
+        // A tail record without a usable uuid is keyed by the hash rule.
+        let mut odd = assistant_line("not a valid id!", "msg_odd", "late words");
+        odd.extend(prompt_line("p-next", "Next."));
+        let out = read(CLAUDE, &odd, &opts(false, true));
+        let key = out.tail_key.expect("the tail is keyed");
+        assert!(
+            key.starts_with("tail:") && key.len() == "tail:".len() + 32,
+            "{key}"
+        );
+
+        let out = read(CLAUDE, TURNS, &opts(true, true));
+        assert_eq!(
+            out.turns[0].start,
+            line_start(TURNS, "Please list the files"),
+            "bookkeeping lines before the first prompt start no turn"
+        );
+        for (turn, next) in out.turns.iter().zip(out.turns.iter().skip(1)) {
+            assert!(turn.start < next.start);
+            assert_eq!(
+                TURNS[next.start as usize - 1],
+                b'\n',
+                "a turn starts on a line"
+            );
+        }
     }
 
     #[test]
