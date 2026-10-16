@@ -3861,7 +3861,7 @@ fn stamped_memory(
         return Ok(None);
     };
     #[cfg(test)]
-    tests::between_stamp_and_text();
+    tests::between_stamp_and_text(&own);
     let Some(m) = memories::get_many(c, &[own])?.pop() else {
         return Ok(None);
     };
@@ -4031,18 +4031,34 @@ mod tests {
         Some(repo.to_string_lossy().into_owned())
     }
 
-    thread_local! {
-        /// Run by [`stamped_memory`] between its two reads (tests only).
-        static BETWEEN_STAMP_AND_TEXT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
-            const { std::cell::RefCell::new(None) };
+    /// Run by [`stamped_memory`] between its two reads of the memory with that id (tests only).
+    /// Keyed by id: the reads run on the reader pool's threads, beside other tests.
+    static BETWEEN_STAMP_AND_TEXT: std::sync::LazyLock<
+        parking_lot::Mutex<HashMap<String, Box<dyn FnMut() + Send>>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    pub(super) fn between_stamp_and_text(id: &str) {
+        if let Some(f) = BETWEEN_STAMP_AND_TEXT.lock().get_mut(id) {
+            f()
+        }
     }
 
-    pub(super) fn between_stamp_and_text() {
-        BETWEEN_STAMP_AND_TEXT.with(|b| {
-            if let Some(f) = b.borrow_mut().as_mut() {
-                f()
-            }
-        });
+    /// From now on (until its entry is removed), another connection to `db` edits memory `id`
+    /// between the two reads of [`stamped_memory`].
+    fn edit_between_the_reads(db: &std::path::Path, id: &str) {
+        let other = rusqlite::Connection::open(db).unwrap();
+        let edit_id = id.to_string();
+        let edit = move || {
+            other
+                .execute(
+                    "UPDATE memories SET body = 'the deploy runs on mondays', content_hash = 'edited', updated_at = '2999-01-01T00:00:00Z' WHERE id = ?1",
+                    [&edit_id],
+                )
+                .unwrap();
+        };
+        BETWEEN_STAMP_AND_TEXT
+            .lock()
+            .insert(id.to_string(), Box::new(edit));
     }
 
     /// A move is screened from the memory's text and checked by the writer against the stamp
@@ -4091,20 +4107,9 @@ mod tests {
         };
         let before = stamp(&c);
         // Another writer edits the memory while the move reads it.
-        let other = rusqlite::Connection::open(&db).unwrap();
-        let edit_id = id.clone();
-        BETWEEN_STAMP_AND_TEXT.with(|b| {
-            *b.borrow_mut() = Some(Box::new(move || {
-                other
-                    .execute(
-                        "UPDATE memories SET body = 'the deploy runs on mondays', content_hash = 'edited', updated_at = '2999-01-01T00:00:00Z' WHERE id = ?1",
-                        [&edit_id],
-                    )
-                    .unwrap();
-            }))
-        });
+        edit_between_the_reads(&db, &id);
         let (read, hash, at) = stamped_memory(&c, &id).unwrap().unwrap();
-        BETWEEN_STAMP_AND_TEXT.with(|b| *b.borrow_mut() = None);
+        BETWEEN_STAMP_AND_TEXT.lock().remove(&id);
         assert_ne!(stamp(&c), before, "the edit landed");
         assert_eq!(
             (hash, at),
@@ -4114,6 +4119,50 @@ mod tests {
         assert!(
             read.body.contains("mondays"),
             "the text read is the edited one"
+        );
+    }
+
+    /// Final re-review 2, M-6: the same through `update`, which pins `screen_move` to
+    /// [`stamped_memory`]: the writer refuses the move, and the edit stays where it was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_screened_across_an_edit_is_refused_and_the_edit_stays() {
+        let (d, s) = svc().await;
+        let mut ids = Vec::new();
+        for (content, dir) in [("the deploy runs on fridays", "a"), ("a note in b", "b")] {
+            let (content, cwd) = (content.into(), repo(&d, dir));
+            let r = s.remember(RememberRequest {
+                content,
+                cwd,
+                ..Default::default()
+            });
+            ids.push(r.await.unwrap().id.unwrap());
+        }
+        wait_settled(&s).await;
+        let id = ids.swap_remove(0);
+        edit_between_the_reads(&s.home().db(), &id);
+        let (action, project) = (UpdateAction::Move, Some("b".into()));
+        let update = MemoryUpdate {
+            action,
+            project,
+            ..Default::default()
+        };
+        let moved = s.update(UpdateRequest {
+            id: id.clone(),
+            update,
+            ..Default::default()
+        });
+        let moved = moved.await;
+        BETWEEN_STAMP_AND_TEXT.lock().remove(&id);
+        let e = moved.expect_err("the writer refuses the move").to_string();
+        assert!(e.contains("was edited while its move"), "{e}");
+        let got = s.get(GetRequest {
+            ids: vec![id],
+            include_provenance: false,
+        });
+        let m = got.await.unwrap().memories.remove(0).memory;
+        assert_eq!(
+            (m.project.as_str(), m.body.as_str()),
+            ("a", "the deploy runs on mondays")
         );
     }
 
