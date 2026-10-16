@@ -268,6 +268,12 @@ async fn projects(
 ) -> ApiResult<Vec<alice_core::store::projects::ResolvedProject>> {
     Ok(Json(st.svc.projects().await?))
 }
+async fn merge_projects(
+    State(st): State<AppState>,
+    ApiJson(req): ApiJson<alice_core::api::ProjectMergeRequest>,
+) -> ApiResult<alice_core::api::ProjectMergeResponse> {
+    Ok(Json(st.svc.merge_projects(req).await?))
+}
 /// A read-only database never loses a `remember`: it is spooled (202) and applied after repair.
 async fn remember(
     State(st): State<AppState>,
@@ -471,6 +477,42 @@ async fn run_maintenance(
     Ok(Json(st.svc.run_job(job).await?))
 }
 
+/// Starts an import; the answer is its first status (poll `/api/v1/import/status`).
+async fn start_import(
+    State(st): State<AppState>,
+    ApiJson(req): ApiJson<alice_core::import::ImportRequest>,
+) -> Result<(StatusCode, Json<alice_core::import::ImportStatus>), ApiError> {
+    let svc = st.svc.clone();
+    // The folder checks touch the disk: off the runtime threads.
+    let status = tokio::task::spawn_blocking(move || svc.start_import(req))
+        .await
+        .map_err(|e| ApiError(AliceError::Other(format!("internal task failed: {e}"))))??;
+    Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+/// A `mempalace_*` tool call. While `compat.mempalace` is off the answer is 409 with the way
+/// to turn it on (the MCP adapter says the same).
+async fn compat_call(
+    State(st): State<AppState>,
+    ApiJson(call): ApiJson<crate::compat::CompatCall>,
+) -> Response {
+    if !st.svc.settings().compat.mempalace {
+        return refuse(
+            StatusCode::CONFLICT,
+            "conflict",
+            crate::compat::OFF_MESSAGE.to_string(),
+        );
+    }
+    match st.svc.compat_call(call).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
+async fn import_status(State(st): State<AppState>) -> Json<alice_core::import::ImportStatus> {
+    Json(st.svc.import_status())
+}
+
 /// A refused settings change: the first problem as `error` (like every refusal), and all of
 /// them as `errors`, each with the key it is about.
 #[derive(Serialize)]
@@ -508,7 +550,11 @@ async fn patch_settings(
 /// The switches other processes read often (`alice mcp` asks before each tool listing): small,
 /// and without the secrets' status, which may wait on a keychain prompt.
 async fn settings_flags(State(st): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "mcp.admin_tools": st.svc.settings().mcp.admin_tools }))
+    let settings = st.svc.settings();
+    Json(serde_json::json!({
+        "mcp.admin_tools": settings.mcp.admin_tools,
+        "compat.mempalace": settings.compat.mempalace,
+    }))
 }
 
 /// The JSON Schema of the settings: the web UI renders its forms and help from it.
@@ -687,6 +733,7 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
         .route("/api/v1/health", get(health))
         .route("/api/v1/doctor", get(doctor))
         .route("/api/v1/projects", get(projects))
+        .route("/api/v1/projects/merge", post(merge_projects))
         .route("/api/v1/remember", post(remember))
         .route("/api/v1/recall", post(recall))
         .route("/api/v1/context", post(context))
@@ -716,6 +763,9 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
             "/api/v1/secrets/{name}",
             put(put_secret).delete(delete_secret),
         )
+        .route("/api/v1/import/mempalace", post(start_import))
+        .route("/api/v1/import/status", get(import_status))
+        .route("/api/v1/compat/call", post(compat_call))
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         .route("/api/v1/admin/token/rotate", post(rotate_token))
         .with_state(state.clone())

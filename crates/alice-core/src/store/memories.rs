@@ -5,7 +5,7 @@ use crate::ids::{new_id, now_rfc3339};
 use crate::model::{Author, Kind, Memory, Status, limits};
 use crate::normalize::{content_hash, derive_title, nfc, normalize_topic};
 use crate::store::fts;
-use crate::store::projects::ResolvedProject;
+use crate::store::projects::{self, ResolvedProject};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,9 @@ pub enum UpdateAction {
     Archive,
     Forget,
     Restore,
+    /// Move to another project (`project`). Not offered over MCP: the schema leaves it out.
+    #[schemars(skip)]
+    Move,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -86,6 +89,28 @@ pub struct MemoryUpdate {
     /// For `supersede`: the id of the memory that replaces this one.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// For `move`: the slug (or alias) of the project the memory goes to. Not offered over MCP.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub project: Option<String>,
+    /// For `move`: the memory's text as the destination's privacy rules leave it, set by the
+    /// daemon after it screened the text (never by a caller: not part of any request). The
+    /// writer refuses the move if the memory changed since, and stores this text with it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub screened: Option<ScreenedMove>,
+}
+
+/// A memory's text screened with the privacy rules of the project it is moving to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenedMove {
+    /// `content_hash` and `updated_at` of the memory that was screened: topics and importance
+    /// are not in the hash.
+    pub content_hash: String,
+    pub updated_at: String,
+    pub title: String,
+    pub body: String,
+    pub topics: Vec<String>,
 }
 
 fn normalize_topics(raw: &[String]) -> Result<Vec<String>> {
@@ -198,6 +223,17 @@ pub fn id_of(conn: &Connection, id: &str) -> Result<Option<String>> {
 
 pub fn set_status_by_seq(conn: &Connection, seq: i64, status: Status) -> Result<()> {
     set_status(conn, seq, status, None)
+}
+
+/// A `pending` memory becomes `active`: the end of its write path, not a change to it (undo's
+/// comparison holds the two states equal too). `updated_at` and `hlc` stay as the write left
+/// them, so a move screened while the memory was pending is not refused as an edit.
+pub fn activate_pending(conn: &Connection, seq: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE memories SET status = 'active' WHERE seq = ?1 AND status = 'pending'",
+        [seq],
+    )?;
+    Ok(())
 }
 
 /// Status change; `hlc` stamps it for sync when the change comes from a user or agent action.
@@ -641,6 +677,24 @@ pub fn apply_update(conn: &Connection, id: &str, u: &MemoryUpdate, hlc: String) 
                 "DELETE FROM links WHERE from_id = ?1 AND type = 'duplicate_of'",
                 [&current.id],
             )?;
+        }
+        UpdateAction::Move => {
+            let raw = u.project.as_deref().ok_or_else(|| {
+                AliceError::invalid("move needs project: the slug of the project to move it to")
+            })?;
+            let slug = projects::move_slug(raw)?;
+            let target = projects::resolve_move_target(conn, &slug)?.ok_or_else(|| {
+                AliceError::NotFound(format!("project {slug}; moving into it creates it"))
+            })?;
+            match move_to_project(conn, &current.id, &target.id, &hlc)? {
+                MoveOutcome::Moved => {}
+                MoveOutcome::DuplicateOf(other) => {
+                    return Err(AliceError::invalid(format!(
+                        "project {} already holds the same text as memory {other}; nothing was moved",
+                        target.slug
+                    )));
+                }
+            }
         }
     }
     let (_, updated) = get_by_seqs(conn, &[seq])?

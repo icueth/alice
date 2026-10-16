@@ -4,11 +4,13 @@
 #![allow(deprecated)] // roots are deprecated by SEP-2577 but current clients still provide them
 
 use crate::client::{DaemonClient, Launcher, Unavailable, WRITE_WAIT, remember_via};
+use crate::compat::{CompatCall, CompatResult, OFF_MESSAGE, UNREACHABLE_MESSAGE, is_compat_name};
 use crate::paths::AliceHome;
 use crate::service::Service;
 use alice_core::api::*;
 use alice_core::error::AliceError;
 use alice_core::model::Author;
+use alice_core::store::memories::UpdateAction;
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -48,18 +50,29 @@ pub const INSTRUCTIONS: &str = "Alice is your long-term memory, shared with the 
 const READ_WAIT: Duration = Duration::from_secs(5);
 /// The tools that are offered only while `mcp.admin_tools` is on.
 const ADMIN_TOOLS: [&str; 4] = ["review_list", "review_resolve", "merge_memories", "stats"];
-/// How long `alice mcp` trusts the daemon's last answer about the admin-tools switch.
+/// How long `alice mcp` trusts the daemon's last answer about the switches.
 const ADMIN_SWITCH_TTL: Duration = Duration::from_secs(1);
 /// How long the client gets to answer `roots/list`.
 const ROOTS_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// The switches that decide which tools `alice mcp` offers, as the daemon has them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Switches {
+    /// `mcp.admin_tools`.
+    pub admin_tools: bool,
+    /// `compat.mempalace`.
+    pub compat_mempalace: bool,
+    /// No daemon answered (the switches above then read off whatever the settings say).
+    pub unreachable: bool,
+}
 
 pub struct RemoteBackend {
     home: AliceHome,
     launcher: Launcher,
     cwd: Option<String>,
     client: tokio::sync::Mutex<Option<DaemonClient>>,
-    /// The daemon's last answer about `mcp.admin_tools`, and when it came.
-    admin_switch: parking_lot::Mutex<Option<(std::time::Instant, bool)>>,
+    /// The daemon's last answer about the switches, and when it was asked.
+    switches: parking_lot::Mutex<Option<(std::time::Instant, Switches)>>,
     /// How long that answer is trusted.
     admin_ttl: Duration,
 }
@@ -71,7 +84,7 @@ impl RemoteBackend {
             launcher,
             cwd,
             client: tokio::sync::Mutex::new(None),
-            admin_switch: parking_lot::Mutex::new(None),
+            switches: parking_lot::Mutex::new(None),
             admin_ttl: ADMIN_SWITCH_TTL,
         }
     }
@@ -82,11 +95,11 @@ impl RemoteBackend {
         self
     }
 
-    /// `mcp.admin_tools` as the running daemon has it (its ratchet and its audit apply), asked
-    /// at most once per `admin_ttl`. No daemon, or one that does not answer: off. This never
-    /// starts a daemon.
-    async fn admin_tools(&self) -> bool {
-        if let Some((at, on)) = *self.admin_switch.lock()
+    /// The switches as the running daemon has them (its ratchet and its audit apply), asked at
+    /// most once per `admin_ttl`, both in one question. No daemon, or one that does not answer:
+    /// all off. This never starts a daemon.
+    async fn switches(&self) -> Switches {
+        if let Some((at, on)) = *self.switches.lock()
             && at.elapsed() < self.admin_ttl
         {
             return on;
@@ -96,17 +109,21 @@ impl RemoteBackend {
         let asked = std::time::Instant::now();
         // The small flags endpoint (no read of the secrets' status, a short timeout), not the
         // whole settings view.
-        let on = match DaemonClient::try_existing(&self.home).await {
-            Some(c) => c.admin_tools_flag().await.unwrap_or(false),
-            None => false,
+        let unreachable = Switches {
+            unreachable: true,
+            ..Switches::default()
         };
-        *self.admin_switch.lock() = Some((asked, on));
+        let on = match DaemonClient::try_existing(&self.home).await {
+            Some(c) => c.switches().await.unwrap_or(unreachable),
+            None => unreachable,
+        };
+        *self.switches.lock() = Some((asked, on));
         on
     }
 
-    /// The last answer, without asking again (off before the first).
-    fn admin_tools_cached(&self) -> bool {
-        self.admin_switch.lock().is_some_and(|(_, on)| on)
+    /// The last answer, without asking again (all off before the first).
+    fn switches_cached(&self) -> Switches {
+        self.switches.lock().map(|(_, on)| on).unwrap_or_default()
     }
 
     /// Connect lazily (keeps `alice mcp` start-up fast). A cached client is re-checked with
@@ -143,19 +160,46 @@ impl Backend {
             Backend::Remote(r) => r.cwd.clone(),
         }
     }
-    /// Whether the admin tools are on right now: the daemon's live setting, which `alice mcp`
-    /// asks the daemon for (off when none answers). Asked per request.
-    async fn admin_tools(&self) -> bool {
+    /// The switches right now: the daemon's live settings, which `alice mcp` asks the daemon
+    /// for (all off when none answers). Asked per request, cached for a moment.
+    async fn switches(&self) -> Switches {
         match self {
-            Backend::Local(s) => s.settings().mcp.admin_tools,
-            Backend::Remote(b) => b.admin_tools().await,
+            Backend::Local(s) => {
+                let settings = s.settings();
+                Switches {
+                    admin_tools: settings.mcp.admin_tools,
+                    compat_mempalace: settings.compat.mempalace,
+                    unreachable: false,
+                }
+            }
+            Backend::Remote(b) => b.switches().await,
         }
     }
-    /// [`admin_tools`](Self::admin_tools) without waiting for an answer (`get_tool` is not async).
-    fn admin_tools_cached(&self) -> bool {
+    async fn admin_tools(&self) -> bool {
+        self.switches().await.admin_tools
+    }
+    async fn compat_mempalace(&self) -> bool {
+        self.switches().await.compat_mempalace
+    }
+    /// [`switches`](Self::switches) without waiting for an answer (`get_tool` is not async).
+    fn switches_cached(&self) -> Switches {
         match self {
-            Backend::Local(s) => s.settings().mcp.admin_tools,
-            Backend::Remote(b) => b.admin_tools_cached(),
+            Backend::Local(s) => {
+                let settings = s.settings();
+                Switches {
+                    admin_tools: settings.mcp.admin_tools,
+                    compat_mempalace: settings.compat.mempalace,
+                    unreachable: false,
+                }
+            }
+            Backend::Remote(b) => b.switches_cached(),
+        }
+    }
+    /// One `mempalace_*` call, answered by the daemon's compatibility layer.
+    async fn compat_call(&self, call: CompatCall) -> AliceResult<CompatResult> {
+        match self {
+            Backend::Local(s) => s.compat_call(call).await,
+            Backend::Remote(b) => b.client(READ_WAIT).await?.compat_call(&call).await,
         }
     }
     async fn reviews(&self, q: ReviewQuery) -> AliceResult<Vec<ReviewItem>> {
@@ -313,11 +357,15 @@ impl AliceMcp {
         }
     }
 
-    /// Whether `tool` may be called now: every tool but the admin ones always; those only while
-    /// `mcp.admin_tools` is on, read at each request so a change applies to connections that
-    /// are already open.
+    /// Whether `tool` may be called now: the `mempalace_*` tools only while `compat.mempalace`
+    /// is on; the admin tools only while `mcp.admin_tools` is on; every other tool always. Read
+    /// at each request so a change applies to connections that are already open.
     async fn tool_allowed(&self, tool: &str) -> bool {
-        !ADMIN_TOOLS.contains(&tool) || self.backend.admin_tools().await
+        if is_compat_name(tool) {
+            self.backend.compat_mempalace().await
+        } else {
+            !ADMIN_TOOLS.contains(&tool) || self.backend.admin_tools().await
+        }
     }
 
     /// Working directory for project detection (spec §8.1): the client's first root when it
@@ -363,6 +411,25 @@ impl AliceMcp {
             cache.first = Some(first.clone());
         }
         first
+    }
+
+    /// One `mempalace_*` call: the arguments as the client sent them, with the caller's
+    /// working directory and name. An `{"error": ...}` answer is a normal result, as MemPalace's.
+    async fn compat(
+        &self,
+        request: CallToolRequestParams,
+        ctx: &RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let call = CompatCall {
+            tool: request.name.to_string(),
+            arguments: serde_json::Value::Object(request.arguments.unwrap_or_default()),
+            cwd: self.cwd(ctx).await,
+            agent: Self::agent(ctx),
+        };
+        match self.backend.compat_call(call).await {
+            Ok(r) => text(serde_json::to_string(&r.value).unwrap_or_default()),
+            Err(e) => tool_err(e),
+        }
     }
 
     /// The client's name, recorded as the memory's author.
@@ -465,6 +532,12 @@ impl AliceMcp {
         Parameters(mut req): Parameters<UpdateRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // Moving between projects is for the CLI and the HTTP API; the tool never offers it.
+        if req.update.action == UpdateAction::Move || req.update.project.is_some() {
+            return Ok(tool_err(AliceError::invalid(
+                "update_memory cannot move a memory between projects; use `alice update <id> --action move --project <slug>`",
+            )));
+        }
         // The change is the client's: history records it as `agent:<client name>`.
         req.author.agent = Some(Self::author(&ctx));
         Ok(match self.backend.update(req).await {
@@ -652,9 +725,24 @@ impl ServerHandler for AliceMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        // Off: an admin tool answers as a tool that does not exist.
+        // Off: an admin or compat tool answers as a tool that does not exist. A compat call says
+        // why: the setting is off, or no daemon answered (then the setting may well be on, and
+        // "turn it on" would send the agent to rewrite it).
         if !self.tool_allowed(&request.name).await {
-            return Err(McpError::invalid_params("tool not found", None));
+            let why = if is_compat_name(&request.name) {
+                let unreachable = self.backend.switches_cached().unreachable;
+                Some(serde_json::json!(if unreachable {
+                    UNREACHABLE_MESSAGE
+                } else {
+                    OFF_MESSAGE
+                }))
+            } else {
+                None
+            };
+            return Err(McpError::invalid_params("tool not found", why));
+        }
+        if is_compat_name(&request.name) {
+            return Ok(self.compat(request, &context).await.into());
         }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
@@ -668,13 +756,16 @@ impl ServerHandler for AliceMcp {
         let cache_hints = context
             .protocol_version()
             .is_some_and(|v| v >= ProtocolVersion::V_2026_07_28);
-        let admin = self.backend.admin_tools().await;
-        let tools = self
+        let switches = self.backend.switches().await;
+        let mut tools: Vec<Tool> = self
             .tool_router
             .list_all()
             .into_iter()
-            .filter(|t| admin || !ADMIN_TOOLS.contains(&t.name.as_ref()))
+            .filter(|t| switches.admin_tools || !ADMIN_TOOLS.contains(&t.name.as_ref()))
             .collect();
+        if switches.compat_mempalace {
+            tools.extend(crate::compat_schema::tools());
+        }
         Ok(ListToolsResult {
             result_type: Some(ResultType::COMPLETE),
             tools,
@@ -686,7 +777,14 @@ impl ServerHandler for AliceMcp {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        if ADMIN_TOOLS.contains(&name) && !self.backend.admin_tools_cached() {
+        let switches = self.backend.switches_cached();
+        if is_compat_name(name) {
+            return switches
+                .compat_mempalace
+                .then(|| crate::compat_schema::tool(name))
+                .flatten();
+        }
+        if ADMIN_TOOLS.contains(&name) && !switches.admin_tools {
             return None;
         }
         self.tool_router.get(name).cloned()

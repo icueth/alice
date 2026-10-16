@@ -15,12 +15,14 @@ use alice_core::redact::Redactor;
 use alice_core::store::embeddings::{self, VecKey};
 use alice_core::store::events::{self, Actor, EventInput};
 use alice_core::store::history::{self, UndoOutcome};
+use alice_core::store::import::{self, BatchOutcome, ImportBatch};
 use alice_core::store::judge as judge_store;
 use alice_core::store::kg::{self, AssertFact, EntityMatcher, FactOutcome};
 use alice_core::store::maintenance;
 use alice_core::store::memories::{
     self, InsertOutcome, MemoryUpdate, NewMemoryInput, UpdateAction,
 };
+use alice_core::store::project_merge;
 use alice_core::store::projects::{self, ResolvedProject};
 use alice_core::store::reviews::{self, NewReview, ReviewItem, ReviewType};
 use alice_core::store::sources::{self, ChunkInput, IngestOutcome, SourceInput};
@@ -281,6 +283,21 @@ pub enum WriteOp {
     /// Add a review item (the weekly merge suggestions); announced on the stream. Answers
     /// `Count` of 1, or 0 when an open item asks the same question already.
     CreateReview(NewReview),
+    /// One bounded, atomic, idempotent batch of imported records (the importer and nothing
+    /// else). It takes a group commit of its own: it runs only when no ingest slice or import
+    /// batch has written in the commit yet, and nothing of that kind joins it. Records one
+    /// `import.batch` event; answers `Imported`.
+    ImportBatch(Box<ImportBatch>),
+    /// `alice projects merge`: move everything of `from` into `into` and record the event that
+    /// undo reverses (see `store::project_merge`). One transaction, and a commit of its own.
+    /// `rules`: what `from`'s own `.alice.toml` puts in force (the merge carries them, and what
+    /// earlier merges carried into `from`, into `into`).
+    MergeProjects {
+        from: String,
+        into: String,
+        actor: Actor,
+        rules: Box<alice_core::settings::ProjectSettings>,
+    },
     Shutdown,
 }
 
@@ -304,6 +321,9 @@ pub enum WriteOutcome {
     Count(usize),
     /// Whether a maintenance step still had work to do.
     Flag(bool),
+    Imported(BatchOutcome),
+    /// A project merge: what moved, and the event that recorded it.
+    ProjectMerged(Box<(project_merge::MergeDone, String)>),
     Done,
 }
 
@@ -323,6 +343,8 @@ impl WriteOutcome {
             WriteOutcome::Purged(_) => "Purged",
             WriteOutcome::Count(_) => "Count",
             WriteOutcome::Flag(_) => "Flag",
+            WriteOutcome::Imported(_) => "Imported",
+            WriteOutcome::ProjectMerged(_) => "ProjectMerged",
             WriteOutcome::Done => "Done",
         }
     }
@@ -455,13 +477,26 @@ pub(crate) struct State {
     stream: Vec<StreamItem>,
     /// The privacy rules of every project, for what the writer itself derives from stored rows.
     redactors: Arc<Redactors>,
+    /// Tests: bulk work written in the current commit, and where each commit's list goes.
+    #[cfg(test)]
+    applied: Vec<&'static str>,
+    #[cfg(test)]
+    commit_log: Option<CommitLog>,
 }
+
+#[cfg(test)]
+pub(crate) type CommitLog = Arc<Mutex<Vec<Vec<&'static str>>>>;
 
 /// The redactor for the project with id `project_id` (`None`: no project), looked up with the
 /// writer's own connection. A project that was never rooted (no working tree) has only the
-/// global rules.
+/// global rules. A project whose rules the store cannot read gets the closed ones.
 fn rules_for(conn: &Connection, redactors: &Redactors, project_id: Option<&str>) -> Arc<Redactor> {
-    let tree = project_id.and_then(|p| projects::tree_of(conn, p).ok().flatten());
+    let tree = project_id.and_then(|p| {
+        projects::tree_of(conn, p).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "a project's rules could not be read; its history is scrubbed with the closed rules");
+            Some(alice_core::settings::ProjectTree::unreadable(p, None))
+        })
+    });
     redactors.for_root(tree.as_ref())
 }
 
@@ -518,6 +553,7 @@ fn update_action(a: UpdateAction) -> &'static str {
         UpdateAction::Archive => "memory.archive",
         UpdateAction::Forget => "memory.forget",
         UpdateAction::Restore => "memory.restore",
+        UpdateAction::Move => "memory.move",
     }
 }
 
@@ -606,9 +642,85 @@ fn update(
         Some(b) => snap(conn, b)?,
         None => None,
     };
-    let m = memories::apply_update(conn, id, update, st.hlc.tick())?;
+    // A move into a slug no project has creates its placeholder first, in this transaction;
+    // the event that records it shares the group with the move, so undo reverses both.
+    let mut group = None;
+    if update.action == UpdateAction::Move {
+        let own = memories::id_of(conn, id)?.ok_or_else(|| {
+            AliceError::NotFound(format!(
+                "memory {id}; check the id returned by recall or remember"
+            ))
+        })?;
+        let slug = projects::move_slug(update.project.as_deref().ok_or_else(|| {
+            AliceError::invalid("move needs project: the slug of the project to move it to")
+        })?)?;
+        // The text screened with the destination's rules must be the text that moves: an edit
+        // that landed since is refused, never stored unscreened.
+        if let Some(s) = &update.screened {
+            let now: (String, String) = conn.query_row(
+                "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
+                [&own],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if now != (s.content_hash.clone(), s.updated_at.clone()) {
+                return Err(AliceError::invalid(format!(
+                    "memory {id} was edited while its move was being checked against the privacy rules of project {slug}; nothing was changed, try again"
+                )));
+            }
+        }
+        match projects::resolve_move_target(conn, &slug)? {
+            Some(target) => {
+                let current: String = conn.query_row(
+                    "SELECT project_id FROM memories WHERE id = ?1",
+                    [&own],
+                    |r| r.get(0),
+                )?;
+                if current == target.id {
+                    // Already there: nothing to change, nothing to undo.
+                    let m = memories::get_many(conn, std::slice::from_ref(&own))?
+                        .pop()
+                        .ok_or_else(|| AliceError::NotFound(format!("memory {id}")))?;
+                    return Ok(WriteOutcome::Updated(m, None));
+                }
+            }
+            None => {
+                let g = new_id();
+                let spec = projects::create_placeholder(conn, &slug)?;
+                record(
+                    conn,
+                    st,
+                    EventInput {
+                        actor,
+                        action: projects::PLACEHOLDER_ACTION,
+                        target_type: projects::PLACEHOLDER_TARGET,
+                        target_id: &spec.id,
+                        before: None,
+                        after: Some(serde_json::to_value(&spec).map_err(|e| {
+                            AliceError::Other(format!("placeholder snapshot: {e}"))
+                        })?),
+                        group: Some(&g),
+                    },
+                )?;
+                group = Some(g);
+            }
+        }
+    }
+    let mut m = memories::apply_update(conn, id, update, st.hlc.tick())?;
     st.inserted = true; // edits may need re-embedding
-    let group = by.is_some().then(new_id);
+    // A moved memory whose text the destination's rules clean is stored cleaned, as an edit in
+    // the same group (undo of the move reverses both), as the review move does.
+    let cleaned = match &update.screened {
+        Some(s)
+            if update.action == UpdateAction::Move
+                && (m.title != s.title || m.body != s.body || m.topics != s.topics) =>
+        {
+            Some(s)
+        }
+        _ => None,
+    };
+    let group = group
+        .or_else(|| by.is_some().then(new_id))
+        .or_else(|| cleaned.is_some().then(new_id));
     let after = snap(conn, &m.id)?;
     let event = record(
         conn,
@@ -623,6 +735,34 @@ fn update(
             group: group.as_deref(),
         },
     )?;
+    if let Some(s) = cleaned {
+        let before = snap(conn, &m.id)?;
+        m = memories::apply_update(
+            conn,
+            &m.id,
+            &MemoryUpdate {
+                action: UpdateAction::Edit,
+                title: Some(s.title.clone()),
+                body: Some(s.body.clone()),
+                topics: Some(s.topics.clone()),
+                ..Default::default()
+            },
+            st.hlc.tick(),
+        )?;
+        record(
+            conn,
+            st,
+            EventInput {
+                actor,
+                action: "memory.edit",
+                target_type: "memory",
+                target_id: &m.id,
+                before,
+                after: snap(conn, &m.id)?,
+                group: group.as_deref(),
+            },
+        )?;
+    }
     if let Some(by) = &by {
         let after_by = snap(conn, by)?;
         if after_by != before_by {
@@ -1242,6 +1382,8 @@ fn ingest_slice(
         return Ok(Applied::More(op, progress));
     }
     let rest = chunks.split_off(take);
+    #[cfg(test)]
+    st.applied.push("Ingest");
     let p = resolve(conn, &project)?;
     let out = sources::ingest(conn, &p, &source, &chunks)?;
     st.chunk_budget -= take;
@@ -1316,6 +1458,116 @@ fn record_ingest(
         },
     )?;
     Ok(())
+}
+
+/// `WriteOp::ImportBatch`. The batch takes the commit to itself: with any bulk work already
+/// written in this commit (budget touched) it waits for the next one, and it spends the whole
+/// budget so no ingest slice joins it. Alone in a fresh commit it always runs, however heavy.
+fn import_batch(conn: &Connection, batch: Box<ImportBatch>, st: &mut State) -> Result<Applied> {
+    let fresh = st.chunk_budget == INGEST_SLICE && st.byte_budget == INGEST_SLICE_BYTES;
+    if !fresh {
+        return Ok(Applied::More(WriteOp::ImportBatch(batch), None));
+    }
+    let (records, bytes) = batch.weight();
+    if records > INGEST_SLICE || bytes > INGEST_SLICE_BYTES {
+        tracing::warn!(
+            records,
+            bytes,
+            "an import batch is heavier than one commit's budget; the importer should send smaller ones"
+        );
+    }
+    // Charged in full, whatever the batch weighs (`ImportBatch::weight` is at most what a
+    // fresh commit holds for the importer's batch sizes): nothing else of its kind joins it.
+    st.chunk_budget = 0;
+    st.byte_budget = 0;
+    #[cfg(test)]
+    st.applied.push("ImportBatch");
+    let hlc = &mut st.hlc;
+    let out = import::apply_batch(conn, &batch, &mut || hlc.tick())?;
+    // Entities and mentions may have changed.
+    st.matcher = None;
+    if out.memories_new > 0 || out.chunks_inserted > 0 {
+        st.inserted = true;
+    }
+    record(
+        conn,
+        st,
+        EventInput {
+            actor: &Actor::Import,
+            action: "import.batch",
+            target_type: "import",
+            target_id: &batch.job_id,
+            before: None,
+            after: Some(serde_json::json!({
+                "memories_new": out.memories_new,
+                "memories_duplicate": out.memories_duplicate,
+                "chunks_inserted": out.chunks_inserted,
+                "chunks_skipped": out.chunks_skipped,
+                "sources": out.sources,
+                "facts_added": out.facts_added,
+                "facts_ended": out.facts_ended,
+                "facts_skipped": out.facts_skipped,
+                "links_made": out.links_made,
+                "links_dropped": out.links_dropped,
+                "reviews_created": out.reviews_created,
+                "reviews_skipped": out.reviews_skipped,
+                "collapsed_recorded": out.collapsed_recorded,
+                "joined_recorded": out.joined_recorded,
+                "projects_created": out.projects_created,
+                "mentions_linked": out.mentions_linked,
+                "errors": out.errors.len(),
+            })),
+            group: None,
+        },
+    )?;
+    Ok(Applied::Done(WriteOutcome::Imported(out)))
+}
+
+/// `WriteOp::MergeProjects`: takes a commit to itself, like an import batch (it can update
+/// every row a project holds), and records one `project.merge` event.
+fn merge_projects(
+    conn: &Connection,
+    from: String,
+    into: String,
+    actor: Actor,
+    rules: Box<alice_core::settings::ProjectSettings>,
+    st: &mut State,
+) -> Result<Applied> {
+    let fresh = st.chunk_budget == INGEST_SLICE && st.byte_budget == INGEST_SLICE_BYTES;
+    if !fresh {
+        return Ok(Applied::More(
+            WriteOp::MergeProjects {
+                from,
+                into,
+                actor,
+                rules,
+            },
+            None,
+        ));
+    }
+    st.chunk_budget = 0;
+    st.byte_budget = 0;
+    #[cfg(test)]
+    st.applied.push("MergeProjects");
+    let hlc = st.hlc.tick();
+    let done = project_merge::merge(conn, &from, &into, &hlc, &rules)?;
+    let event = record(
+        conn,
+        st,
+        EventInput {
+            actor: &actor,
+            action: project_merge::MERGE_ACTION,
+            target_type: project_merge::MERGE_TARGET,
+            target_id: &done.from.id,
+            before: Some(done.before.clone()),
+            after: Some(done.after.clone()),
+            group: None,
+        },
+    )?;
+    // Moved text is searched and embedded as before; only the project of the rows changed.
+    Ok(Applied::Done(WriteOutcome::ProjectMerged(Box::new((
+        done, event,
+    )))))
 }
 
 fn apply(
@@ -1506,6 +1758,15 @@ fn apply(
             }
             None => WriteOutcome::Count(0),
         },
+        WriteOp::ImportBatch(batch) => return import_batch(conn, batch, st),
+        WriteOp::MergeProjects {
+            from,
+            into,
+            actor,
+            rules,
+        } => {
+            return merge_projects(conn, from, into, actor, rules, st);
+        }
         WriteOp::Shutdown => WriteOutcome::Done,
     };
     Ok(Applied::Done(outcome))
@@ -1852,7 +2113,7 @@ fn activate(conn: &Connection, seq: i64, matcher: &EntityMatcher) -> Result<()> 
         return Ok(());
     };
     if status == Status::Pending.as_str() {
-        memories::set_status_by_seq(conn, seq, Status::Active)?;
+        memories::activate_pending(conn, seq)?;
     }
     let ids = matcher.find_in(&format!("{title}\n{body}"));
     if !ids.is_empty() {
@@ -1971,7 +2232,34 @@ pub(crate) fn spawn_writer(
     wake_worker: Sender<()>,
 ) -> (WriterHandle, JoinHandle<()>) {
     let redactors = Redactors::fixed(alice_core::settings::PrivacySettings::default());
-    spawn_writer_with(conn, device, wake_worker, redactors)
+    spawn_writer_inner(
+        conn,
+        device,
+        wake_worker,
+        redactors,
+        WalPolicy::default(),
+        None,
+    )
+}
+
+/// [`spawn_writer`] that also lists, per commit, the bulk work (ingest slices, import batches)
+/// it wrote.
+#[cfg(test)]
+pub(crate) fn spawn_writer_logged(
+    conn: Connection,
+    device: String,
+    wake_worker: Sender<()>,
+    log: CommitLog,
+) -> (WriterHandle, JoinHandle<()>) {
+    let redactors = Redactors::fixed(alice_core::settings::PrivacySettings::default());
+    spawn_writer_inner(
+        conn,
+        device,
+        wake_worker,
+        redactors,
+        WalPolicy::default(),
+        Some(log),
+    )
 }
 
 /// [`spawn_writer`] with the privacy rules the writer applies to the history it records and to
@@ -1987,11 +2275,27 @@ pub fn spawn_writer_with(
 
 /// [`spawn_writer_with`] with an explicit [`WalPolicy`] (tests use small limits).
 pub fn spawn_writer_tuned(
+    conn: Connection,
+    device: String,
+    wake_worker: Sender<()>,
+    redactors: Arc<Redactors>,
+    wal_policy: WalPolicy,
+) -> (WriterHandle, JoinHandle<()>) {
+    spawn_writer_inner(conn, device, wake_worker, redactors, wal_policy, None)
+}
+
+#[cfg(test)]
+type LogArg = Option<CommitLog>;
+#[cfg(not(test))]
+type LogArg = Option<()>;
+
+fn spawn_writer_inner(
     mut conn: Connection,
     device: String,
     wake_worker: Sender<()>,
     redactors: Arc<Redactors>,
     wal_policy: WalPolicy,
+    #[cfg_attr(not(test), allow(unused_variables))] log: LogArg,
 ) -> (WriterHandle, JoinHandle<()>) {
     let (tx, rx): (Sender<Job>, Receiver<Job>) = unbounded();
     let read_only = Arc::new(ReadOnlyState::default());
@@ -2016,6 +2320,10 @@ pub fn spawn_writer_tuned(
                 byte_budget: INGEST_SLICE_BYTES,
                 stream: Vec::new(),
                 redactors,
+                #[cfg(test)]
+                applied: Vec::new(),
+                #[cfg(test)]
+                commit_log: log,
             };
             let mut carry: VecDeque<Job> = VecDeque::new();
             let mut stopping = false;
@@ -2069,6 +2377,16 @@ pub fn spawn_writer_tuned(
                 st.chunk_budget = INGEST_SLICE;
                 st.byte_budget = INGEST_SLICE_BYTES;
                 let out = run_batch(&mut conn, batch, &mut st, &ro);
+                #[cfg(test)]
+                {
+                    let applied = std::mem::take(&mut st.applied);
+                    if out.commit.is_ok()
+                        && !applied.is_empty()
+                        && let Some(log) = &st.commit_log
+                    {
+                        log.lock().push(applied);
+                    }
+                }
                 match out.commit {
                     Ok(()) => {
                         // Wake before replying: once a caller has its reply, the wake for its
@@ -2209,6 +2527,34 @@ mod tests {
         }
     }
 
+    /// Final re-review 2, I-1: the rules the writer scrubs a project's event snapshots with,
+    /// when the store cannot say which rules merges carried into it (its `project_rules` table
+    /// is missing), are the closed ones, never the global ones alone.
+    #[test]
+    fn a_project_whose_carried_rules_cannot_be_read_is_scrubbed_with_closed_rules() {
+        let d = tempfile::tempdir().unwrap();
+        let c = open(d.path());
+        let p = projects::upsert_project(
+            &c,
+            &ProjectRef {
+                key: "k/app".into(),
+                slug: "app".into(),
+                name: "app".into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        let home = crate::paths::AliceHome::new(d.path().to_path_buf());
+        let redactors = Redactors::new(crate::config::SettingsHandle::load_with_env(
+            &home,
+            Vec::new(),
+        ));
+        assert!(!rules_for(&c, &redactors, Some(&p.id)).blocks());
+        c.execute_batch("DROP TABLE project_rules").unwrap();
+        assert!(rules_for(&c, &redactors, Some(&p.id)).blocks());
+    }
+
     /// A heuristic judgement that decides nothing: the memory is activated as it stands.
     fn judged(f: &Fixture, id: &str, seq: i64) {
         let stamp: String = f.read("SELECT content_hash FROM memories WHERE seq = ?1", [seq]);
@@ -2264,6 +2610,188 @@ mod tests {
     fn blocking_submit_works_outside_the_runtime() {
         let (_d, h, _w) = writer();
         assert!(h.submit_blocking(remember("from a plain thread")).is_ok());
+    }
+
+    fn import_memory(i: usize) -> alice_core::store::import::ImportMemory {
+        alice_core::store::import::ImportMemory {
+            project_slug: "pg-ai".into(),
+            input: NewMemoryInput {
+                content: format!("imported body number {i}"),
+                legacy_id: Some(format!("d{i}")),
+                created_at: Some("2025-01-02T03:04:05.000Z".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn sample_import(memories: usize) -> ImportBatch {
+        ImportBatch {
+            projects: vec![alice_core::store::import::ImportProject {
+                slug: "pg-ai".into(),
+                aliases: vec![],
+            }],
+            memories: (0..memories).map(import_memory).collect(),
+            job_id: "job-1".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_import_op_goes_through_the_writer_records_one_event_and_wakes_embedding() {
+        let f = fixture();
+        let out =
+            f.h.submit_blocking(WriteOp::ImportBatch(Box::new(sample_import(2))));
+        let Ok(WriteOutcome::Imported(out)) = out else {
+            panic!("expected an import outcome, got {out:?}")
+        };
+        assert_eq!(out.memories_new, 2);
+        let n: i64 = f.read("SELECT count(*) FROM events", []);
+        assert_eq!(n, 1, "one event for the whole batch");
+        let (action, actor, target, after): (String, String, String, String) = {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            c.query_row(
+                "SELECT action, actor, target_id, after_json FROM events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            (action.as_str(), actor.as_str(), target.as_str()),
+            ("import.batch", "import", "job-1")
+        );
+        assert!(!after.contains("imported body"), "{after}");
+        assert!(f.wake.try_recv().is_ok(), "embedding is woken");
+        let live: i64 = f.read(
+            "SELECT count(*) FROM memories WHERE status = 'active' AND judge_state = 'skipped'",
+            [],
+        );
+        assert_eq!(live, 2);
+    }
+
+    #[tokio::test]
+    async fn an_import_batch_and_an_ingest_slice_never_share_one_group_commit() {
+        for import_first in [false, true] {
+            never_share(import_first).await;
+        }
+    }
+
+    async fn never_share(import_first: bool) {
+        let d = tempfile::tempdir().unwrap();
+        let conn = open(d.path());
+        let (wake_tx, _wake_rx) = crossbeam_channel::unbounded();
+        let log: CommitLog = Arc::new(Mutex::new(Vec::new()));
+        let (h, _t) = spawn_writer_logged(conn, "dev".into(), wake_tx, log.clone());
+        let ing = h.submit(ingest("many", 200, |i| format!("short {i}")));
+        let imp = h.submit(WriteOp::ImportBatch(Box::new(sample_import(200))));
+        let (a, b) = if import_first {
+            let (b, a) = tokio::join!(imp, ing);
+            (a, b)
+        } else {
+            tokio::join!(ing, imp)
+        };
+        assert_eq!(ingested(a).inserted, 200);
+        assert!(matches!(b, Ok(WriteOutcome::Imported(ref o)) if o.memories_new == 200));
+        let log = log.lock();
+        assert!(log.iter().any(|c| c.contains(&"ImportBatch")), "{log:?}");
+        assert!(log.iter().any(|c| c.contains(&"Ingest")), "{log:?}");
+        assert!(
+            log.iter()
+                .all(|c| !(c.contains(&"Ingest") && c.contains(&"ImportBatch"))),
+            "shared a commit: {log:?}"
+        );
+    }
+
+    /// A project merge can update every row of a project: it takes a commit to itself, one
+    /// event records it, and one that is refused writes nothing.
+    #[tokio::test]
+    async fn a_project_merge_never_shares_a_group_commit_and_a_refused_one_writes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let conn = open(d.path());
+        for (key, slug) in [("k/a", "a"), ("k/b", "b")] {
+            projects::upsert_project(
+                &conn,
+                &alice_core::project::ProjectRef {
+                    key: key.into(),
+                    slug: slug.into(),
+                    name: slug.into(),
+                    root: None,
+                    remote: None,
+                },
+            )
+            .unwrap();
+        }
+        let (wake_tx, _wake_rx) = crossbeam_channel::unbounded();
+        let log: CommitLog = Arc::new(Mutex::new(Vec::new()));
+        let (h, _t) = spawn_writer_logged(conn, "dev".into(), wake_tx, log.clone());
+        let ing = h.submit(WriteOp::Ingest {
+            project: ProjectChoice::Slug("a".into()),
+            source: SourceInput {
+                uri: "many".into(),
+                ..Default::default()
+            },
+            chunks: (0..200)
+                .map(|i| ChunkInput {
+                    ord: i,
+                    text: format!("short {i}"),
+                    ..Default::default()
+                })
+                .collect(),
+        });
+        let merge = |from: &str, into: &str| {
+            h.submit(WriteOp::MergeProjects {
+                from: from.into(),
+                into: into.into(),
+                actor: Actor::User,
+                rules: Default::default(),
+            })
+        };
+        let refused = merge("global", "b");
+        let ok = merge("a", "b");
+        let (ing, refused, ok) = tokio::join!(ing, refused, ok);
+        assert_eq!(ingested(ing).inserted, 200);
+        let msg = refused.unwrap_err().to_string();
+        assert!(msg.contains("global"), "{msg}");
+        let Ok(WriteOutcome::ProjectMerged(done)) = ok else {
+            panic!("merge failed")
+        };
+        let (done, event) = *done;
+        assert_eq!(done.counts.chunks, 200, "the ingest ahead of it was moved");
+        {
+            let log = log.lock();
+            assert!(log.iter().any(|c| c.contains(&"MergeProjects")), "{log:?}");
+            assert!(
+                log.iter()
+                    .all(|c| !(c.contains(&"Ingest") && c.contains(&"MergeProjects"))),
+                "shared a commit: {log:?}"
+            );
+        }
+        let c = open(d.path());
+        let merges: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE action = 'project.merge' AND id = ?1",
+                [&event],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(merges, 1);
+        let all: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE action = 'project.merge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(all, 1, "the refused merge recorded nothing");
+    }
+
+    #[test]
+    fn an_import_batch_is_refused_while_the_database_is_read_only() {
+        let f = fixture();
+        f.h.read_only.set("disk full".into());
+        let err =
+            f.h.submit_blocking(WriteOp::ImportBatch(Box::new(sample_import(1))));
+        assert!(matches!(err, Err(AliceError::ReadOnly(_))), "{err:?}");
     }
 
     /// A failing job rolls back everything it wrote, including a project it created on the way.
@@ -5168,5 +5696,405 @@ mod tests {
         f.h.submit_blocking(remember("and one more")).unwrap();
         let n: i64 = f.read("SELECT count(*) FROM memories", []);
         assert_eq!(n, 8);
+    }
+
+    // ---- `update` action move ----
+
+    fn pref(key: &str, slug: &str) -> ProjectRef {
+        ProjectRef {
+            key: key.into(),
+            slug: slug.into(),
+            name: slug.into(),
+            root: None,
+            remote: None,
+        }
+    }
+
+    fn remember_in(text: &str, slug: &str) -> WriteOp {
+        WriteOp::Remember {
+            input: NewMemoryInput {
+                content: text.into(),
+                ..Default::default()
+            },
+            project: ProjectChoice::Slug(slug.into()),
+        }
+    }
+
+    fn mv(id: &str, project: Option<&str>) -> WriteOp {
+        WriteOp::Update {
+            id: id.into(),
+            update: MemoryUpdate {
+                action: UpdateAction::Move,
+                project: project.map(String::from),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        }
+    }
+
+    fn project_of(f: &Fixture, id: &str) -> String {
+        f.read(
+            "SELECT p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.id = ?1",
+            [id],
+        )
+    }
+
+    fn placeholders(f: &Fixture, slug: &str) -> i64 {
+        f.read(
+            "SELECT count(*) FROM projects WHERE key = ?1 AND root_path IS NULL",
+            [format!("import:{slug}")],
+        )
+    }
+
+    fn with_project(f: &Fixture, key: &str, slug: &str) -> ResolvedProject {
+        projects::upsert_project(&open(f.dir.path()), &pref(key, slug)).unwrap()
+    }
+
+    #[test]
+    fn a_move_into_an_existing_project_follows_its_slug_and_its_aliases() {
+        let f = fixture();
+        let other = with_project(&f, "k-other", "other");
+        projects::add_alias(&open(f.dir.path()), "second-name", &other.id).unwrap();
+        let (a, _) = new_id(f.h.submit_blocking(remember("move me to other")).unwrap());
+        let (b, _) = new_id(f.h.submit_blocking(remember("move me by alias")).unwrap());
+        let WriteOutcome::Updated(m, Some(ev)) =
+            f.h.submit_blocking(mv(&a, Some("Other"))).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(m.project, "other");
+        assert_eq!(project_of(&f, &a), "other");
+        f.h.submit_blocking(mv(&b, Some("second-name"))).unwrap();
+        assert_eq!(project_of(&f, &b), "other");
+        let action: String = f.read("SELECT action FROM events WHERE id = ?1", [&ev]);
+        assert_eq!(action, "memory.move");
+        let created: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'project.create'",
+            [],
+        );
+        assert_eq!(created, 0, "an existing project is not created");
+        let projects_now: i64 = f.read("SELECT count(*) FROM projects", []);
+        assert_eq!(projects_now, 2, "global and other");
+    }
+
+    #[test]
+    fn a_move_into_an_unknown_slug_creates_one_placeholder_and_reuses_it() {
+        let f = fixture();
+        let (a, _) = new_id(f.h.submit_blocking(remember("first to move")).unwrap());
+        let (b, _) = new_id(f.h.submit_blocking(remember("second to move")).unwrap());
+        f.h.submit_blocking(mv(&a, Some("Fresh Start"))).unwrap();
+        assert_eq!(project_of(&f, &a), "fresh-start");
+        assert_eq!(placeholders(&f, "fresh-start"), 1);
+        let name: String = f.read(
+            "SELECT name FROM projects WHERE key = 'import:fresh-start'",
+            [],
+        );
+        assert_eq!(name, "fresh-start");
+        let remote: Option<String> = f.read(
+            "SELECT git_remote FROM projects WHERE key = 'import:fresh-start'",
+            [],
+        );
+        assert_eq!(remote, None);
+        f.h.submit_blocking(mv(&b, Some("fresh-start"))).unwrap();
+        assert_eq!(project_of(&f, &b), "fresh-start");
+        assert_eq!(
+            placeholders(&f, "fresh-start"),
+            1,
+            "the second move reuses it"
+        );
+        let created: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'project.create'",
+            [],
+        );
+        assert_eq!(created, 1);
+    }
+
+    /// A move the daemon screened carries the text it screened: an edit that landed since
+    /// refuses the move (nothing is created); a text the destination's rules cleaned is stored
+    /// with the move, as an edit in its group, and undo of the move brings back both.
+    #[test]
+    fn a_screened_move_refuses_a_changed_memory_and_stores_the_cleaned_text_with_the_move() {
+        let f = fixture();
+        let (a, _) = new_id(f.h.submit_blocking(remember("see TCK-12345 here")).unwrap());
+        let home = project_of(&f, &a);
+        let hash: String = f.read("SELECT content_hash FROM memories WHERE id = ?1", [&a]);
+        let at: String = f.read("SELECT updated_at FROM memories WHERE id = ?1", [&a]);
+        let clean = "see [REDACTED:custom:ticket] here";
+        let op = |hash: &str| WriteOp::Update {
+            id: a.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Move,
+                project: Some("strict".into()),
+                screened: Some(alice_core::store::memories::ScreenedMove {
+                    content_hash: hash.into(),
+                    updated_at: at.clone(),
+                    title: clean.into(),
+                    body: clean.into(),
+                    topics: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        };
+        let err = f.h.submit_blocking(op("stale")).unwrap_err().to_string();
+        assert!(
+            err.contains("was edited while its move was being checked"),
+            "{err}"
+        );
+        assert_eq!(project_of(&f, &a), home);
+        assert_eq!(
+            placeholders(&f, "strict"),
+            0,
+            "a refused move makes nothing"
+        );
+
+        f.h.submit_blocking(op(&hash)).unwrap();
+        assert_eq!(project_of(&f, &a), "strict");
+        let (title, body): (String, String) = (
+            f.read("SELECT title FROM memories WHERE id = ?1", [&a]),
+            f.read("SELECT body FROM memories WHERE id = ?1", [&a]),
+        );
+        assert_eq!((title.as_str(), body.as_str()), (clean, clean));
+        let actions: String = f.read(
+            "SELECT group_concat(action, ',') FROM (SELECT action FROM events WHERE group_id = (SELECT group_id FROM events WHERE action = 'memory.move') ORDER BY rowid)",
+            [],
+        );
+        assert_eq!(actions, "project.create,memory.move,memory.edit");
+        undo(&f, &event_of(&f, "memory.move", &a)).unwrap();
+        assert_eq!(project_of(&f, &a), home);
+        let body: String = f.read("SELECT body FROM memories WHERE id = ?1", [&a]);
+        assert_eq!(body, "see TCK-12345 here");
+        assert_eq!(placeholders(&f, "strict"), 0);
+    }
+
+    /// Activation ends a memory's write path; it is not an edit. A move screened while the
+    /// memory was still `pending` goes through when the judge's verdict (or, for an import,
+    /// the embedder's) activated it in between: nothing it screened changed.
+    #[test]
+    fn a_move_screened_while_pending_goes_through_after_the_memory_is_activated() {
+        let f = fixture();
+        let (judged, judged_seq) =
+            new_id(f.h.submit_blocking(remember("judged then moved")).unwrap());
+        let (imported, imported_seq) = new_id(
+            f.h.submit_blocking(remember("imported then moved"))
+                .unwrap(),
+        );
+        let w = open(f.dir.path());
+        w.execute(
+            "UPDATE memories SET judge_state = 'skipped' WHERE seq = ?1",
+            [imported_seq],
+        )
+        .unwrap();
+        // Written a while ago (so the clock has moved on by the time it is activated).
+        w.execute(
+            "UPDATE memories SET updated_at = '2020-01-01T00:00:00.000Z' WHERE seq IN (?1, ?2)",
+            [judged_seq, imported_seq],
+        )
+        .unwrap();
+        drop(w);
+        let screened = |id: &str| alice_core::store::memories::ScreenedMove {
+            content_hash: hash_of(&f, id),
+            updated_at: f.read("SELECT updated_at FROM memories WHERE id = ?1", [id]),
+            title: f.read("SELECT title FROM memories WHERE id = ?1", [id]),
+            body: f.read("SELECT body FROM memories WHERE id = ?1", [id]),
+            topics: Vec::new(),
+        };
+        let (judged_screen, imported_screen) = (screened(&judged), screened(&imported));
+        assert_eq!(status_of(&f, &judged), "pending");
+        apply_j(&f, judgement(&f, &judged, "heuristic"));
+        let stamp = hash_of(&f, &imported);
+        f.h.submit_blocking(WriteOp::EmbedSkipped {
+            keys: vec![(VecKey::Memory(imported_seq), stamp)],
+        })
+        .unwrap();
+        for (id, s) in [(&judged, judged_screen), (&imported, imported_screen)] {
+            assert_eq!(status_of(&f, id), "active", "activated in between");
+            f.h.submit_blocking(WriteOp::Update {
+                id: id.clone(),
+                update: MemoryUpdate {
+                    action: UpdateAction::Move,
+                    project: Some("elsewhere".into()),
+                    screened: Some(s),
+                    ..Default::default()
+                },
+                actor: Actor::User,
+            })
+            .unwrap_or_else(|e| panic!("the move of {id} was refused: {e}"));
+            assert_eq!(project_of(&f, id), "elsewhere");
+        }
+    }
+
+    #[test]
+    fn a_read_from_an_unstored_checkout_finds_the_placeholder_and_a_write_adopts_it() {
+        let f = fixture();
+        let (a, _) = new_id(
+            f.h.submit_blocking(remember("lives in a placeholder"))
+                .unwrap(),
+        );
+        f.h.submit_blocking(mv(&a, Some("newproj"))).unwrap();
+        let placeholder: String = f.read("SELECT id FROM projects WHERE slug = 'newproj'", []);
+        let checkout = pref("git:newproj-checkout", "newproj");
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        assert_eq!(
+            projects::detected_for_read(&c, &checkout).unwrap(),
+            projects::DetectedForRead::Placeholder(ResolvedProject {
+                id: placeholder.clone(),
+                slug: "newproj".into(),
+                name: "newproj".into(),
+            })
+        );
+        let (b, _) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "first real write".into(),
+                    ..Default::default()
+                },
+                project: ProjectChoice::Detected(checkout),
+            })
+            .unwrap(),
+        );
+        let (id_b, key): (String, String) = (
+            f.read("SELECT project_id FROM memories WHERE id = ?1", [&b]),
+            f.read("SELECT key FROM projects WHERE id = ?1", [&placeholder]),
+        );
+        assert_eq!(id_b, placeholder, "the write adopted the placeholder");
+        assert_eq!(key, "git:newproj-checkout");
+        assert_eq!(project_of(&f, &a), "newproj");
+    }
+
+    #[test]
+    fn undoing_a_move_restores_the_project_and_removes_the_empty_placeholder_it_made() {
+        let f = fixture();
+        let (a, _) = new_id(f.h.submit_blocking(remember("will come back")).unwrap());
+        f.h.submit_blocking(mv(&a, Some("gone-again"))).unwrap();
+        assert_eq!(placeholders(&f, "gone-again"), 1);
+        let placeholder: String = f.read("SELECT id FROM projects WHERE slug = 'gone-again'", []);
+        let WriteOutcome::Undo(UndoOutcome::Undone { reverted, .. }) =
+            undo(&f, &event_of(&f, "memory.move", &a)).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(reverted.len(), 2, "the move and the placeholder's creation");
+        assert_eq!(project_of(&f, &a), "global");
+        assert_eq!(placeholders(&f, "gone-again"), 0);
+        // Undoing the undo puts both back.
+        undo(&f, &event_of(&f, "undo:memory.move", &a)).unwrap();
+        assert_eq!(project_of(&f, &a), "gone-again");
+        let again: String = f.read("SELECT id FROM projects WHERE slug = 'gone-again'", []);
+        assert_eq!(again, placeholder);
+    }
+
+    #[test]
+    fn undoing_a_move_leaves_a_placeholder_that_has_since_received_other_memories() {
+        let f = fixture();
+        let (a, _) = new_id(
+            f.h.submit_blocking(remember("made the placeholder"))
+                .unwrap(),
+        );
+        let (b, _) = new_id(f.h.submit_blocking(remember("arrived later")).unwrap());
+        f.h.submit_blocking(mv(&a, Some("busy"))).unwrap();
+        f.h.submit_blocking(mv(&b, Some("busy"))).unwrap();
+        undo(&f, &event_of(&f, "memory.move", &a)).unwrap();
+        assert_eq!(project_of(&f, &a), "global");
+        assert_eq!(project_of(&f, &b), "busy");
+        assert_eq!(placeholders(&f, "busy"), 1, "it still holds a memory");
+    }
+
+    #[test]
+    fn undoing_a_move_leaves_a_placeholder_that_a_checkout_adopted() {
+        let f = fixture();
+        let (a, _) = new_id(f.h.submit_blocking(remember("adopted soon")).unwrap());
+        f.h.submit_blocking(mv(&a, Some("adoptee"))).unwrap();
+        f.h.submit_blocking(WriteOp::Remember {
+            input: NewMemoryInput {
+                content: "a real write".into(),
+                ..Default::default()
+            },
+            project: ProjectChoice::Detected(pref("git:adoptee", "adoptee")),
+        })
+        .unwrap();
+        undo(&f, &event_of(&f, "memory.move", &a)).unwrap();
+        assert_eq!(project_of(&f, &a), "global");
+        let n: i64 = f.read("SELECT count(*) FROM projects WHERE slug = 'adoptee'", []);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn a_move_that_would_duplicate_text_in_the_target_is_refused_and_creates_nothing() {
+        let f = fixture();
+        with_project(&f, "k-other", "other");
+        let (a, _) = new_id(
+            f.h.submit_blocking(remember("identical text here"))
+                .unwrap(),
+        );
+        f.h.submit_blocking(remember_in("identical text here", "other"))
+            .unwrap();
+        let err = f.h.submit_blocking(mv(&a, Some("other"))).unwrap_err();
+        assert!(err.to_string().contains("same text"), "{err}");
+        assert_eq!(project_of(&f, &a), "global");
+        let moves: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'memory.move'",
+            [],
+        );
+        assert_eq!(moves, 0);
+    }
+
+    #[test]
+    fn moves_into_and_out_of_global_follow_the_store_rules_only() {
+        let f = fixture();
+        with_project(&f, "k-other", "other");
+        let (a, _) = new_id(
+            f.h.submit_blocking(remember_in("project notes", "other"))
+                .unwrap(),
+        );
+        f.h.submit_blocking(mv(&a, Some("global"))).unwrap();
+        assert_eq!(project_of(&f, &a), "global");
+        f.h.submit_blocking(mv(&a, Some("other"))).unwrap();
+        assert_eq!(project_of(&f, &a), "other");
+        assert_eq!(placeholders(&f, "global"), 0);
+        // Into global where the same text already is: the store's same-text check.
+        f.h.submit_blocking(remember("project notes")).unwrap();
+        let err = f.h.submit_blocking(mv(&a, Some("global"))).unwrap_err();
+        assert!(err.to_string().contains("same text"), "{err}");
+    }
+
+    #[test]
+    fn a_move_to_where_the_memory_already_is_changes_and_records_nothing() {
+        let f = fixture();
+        let (a, _) = new_id(f.h.submit_blocking(remember("stay put")).unwrap());
+        let WriteOutcome::Updated(_, event) = f.h.submit_blocking(mv(&a, Some("global"))).unwrap()
+        else {
+            panic!()
+        };
+        assert!(event.is_none());
+        let n: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'memory.move'",
+            [],
+        );
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn a_move_names_an_unknown_memory_a_missing_project_and_a_bad_slug_in_one_sentence() {
+        let f = fixture();
+        let (a, _) = new_id(
+            f.h.submit_blocking(remember("target of bad moves"))
+                .unwrap(),
+        );
+        let cases = [
+            (mv("01K7NOSUCHMEMORY0000000000", Some("x")), "memory"),
+            (mv(&a, None), "needs project"),
+            (mv(&a, Some("   ")), "empty"),
+            (mv(&a, Some("a/b")), "not a project slug"),
+            (mv(&a, Some("..\\x")), "not a project slug"),
+        ];
+        for (op, needle) in cases {
+            let e = f.h.submit_blocking(op).unwrap_err().to_string();
+            assert!(e.contains(needle), "{e}");
+            assert!(!e.trim_end().contains('\n'), "one sentence: {e}");
+        }
+        let n: i64 = f.read("SELECT count(*) FROM projects", []);
+        assert_eq!(n, 1, "no placeholder came of a refused move");
+        assert_eq!(project_of(&f, &a), "global");
     }
 }

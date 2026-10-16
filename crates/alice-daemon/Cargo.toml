@@ -48,4 +48,5 @@ libc.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
+alice-core = { path = "../alice-core", features = ["fixtures"] }
 tempfile.workspace = true

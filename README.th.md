@@ -41,7 +41,7 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
 - **ไฟล์เดียวจบ** daemon, CLI และ MCP server (และ hook ใน SP2) อยู่ใน binary Rust ไฟล์เดียวที่มีตัวรัน embedding ในตัว ไม่ต้องมี Python env หรือ Docker ถ้าอยากใช้ embedding จากที่อื่น (Ollama, endpoint แบบ OpenAI, Voyage) ก็แค่ตั้งค่า
 - **Git sync เป็นไฟล์ Markdown** *(วางแผนไว้ใน M4)* push/pull ความจำไปที่ git remote ไหนก็ได้ เก็บ memory ละหนึ่งไฟล์ Markdown เปิดอ่านบน GitHub ได้ เปิดใน Obsidian ได้ และ sync ข้ามเครื่องได้โดย merge ทีละ record ไฟล์ฐานข้อมูลไม่เคยถูกใส่ใน git
 - **UI สำหรับดู graph และจัดการข้อมูล** *(วางแผนไว้ใน SP3)* ดู graph ความจำ แก้ memory ตัดสินรายการใน review ตั้งค่าได้ทุกอย่าง และสั่ง git push/pull ได้จากเบราว์เซอร์หรือแอป desktop
-- **ย้ายมาจาก MemPalace ได้** *(วางแผนไว้ใน M3)* import palace เดิมได้ครบทั้ง drawer, diary และ knowledge graph และยังเรียก tool ชื่อ `mempalace_*` ได้ผ่าน compatibility layer ที่เลือกเปิดได้
+- **ย้ายมาจาก MemPalace ได้** import palace เดิมได้ครบทั้ง drawer, diary และ knowledge graph และยังเรียก tool ชื่อ `mempalace_*` ได้ผ่าน compatibility layer ที่เลือกเปิดได้
 
 ## หลักการทำงาน
 
@@ -115,7 +115,7 @@ alice status                   # daemon, จำนวนข้อมูล, ค�
 alice doctor                   # ถ้ามีอะไรผิด จะบอกว่าผิดตรงไหนและควรทำอะไรต่อ
 ```
 
-โปรเจกต์ตรวจหาจาก directory ที่ทำงานอยู่ (git remote หรือชื่อ directory) memory ที่เขียนนอกโปรเจกต์ใดๆ จะเข้า `global` ที่วางแผนไว้: `alice setup` ต่อ agent ทุกตัวในเครื่องให้อัตโนมัติ (SP2), `alice import mempalace` (M3) และ `alice ui` (SP3)
+โปรเจกต์ตรวจหาจาก directory ที่ทำงานอยู่ (git remote หรือชื่อ directory) memory ที่เขียนนอกโปรเจกต์ใดๆ จะเข้า `global` `alice import mempalace` ย้าย MemPalace เดิมเข้ามา ([รายละเอียด](#import-จาก-mempalace)) ที่วางแผนไว้: `alice setup` ต่อ agent ทุกตัวในเครื่องให้อัตโนมัติ (SP2) และ `alice ui` (SP3)
 
 ## การเชื่อมต่อ agent
 
@@ -189,6 +189,7 @@ alice remember [--kind k] [--title t] [--topic t]... [--project p] [--importance
 alice context [--project p] [--max-tokens n]
 alice get <id>... [--provenance]
 alice update <id> --action edit|supersede|archive|forget|restore [--title t] [--body b] [--by id]
+alice update <id> --action move --project <slug>   (CLI and HTTP only, not MCP; undoable)
 alice facts <entity> [--predicate p] [--as-of date] [--timeline]
 alice fact add|supersede|end <subject> <predicate> <object> [--from date]
 alice history [target] [--actor a] [--limit n]       # ใครเปลี่ยนอะไร
@@ -199,7 +200,7 @@ alice backup now | list       alice restore [backup] [--yes]
 alice maintenance status | run <job>
 alice config list | get <key> | set <key> <value> | unset <key> | edit
              | set-secret <name> | delete-secret <name> | test <provider>
-alice projects | status
+alice projects [merge <from> <into> [--yes]] | status
 alice doctor                   # ตรวจพร้อมบอกว่าควรทำอะไรต่อ; exit 1 เมื่อมีข้อที่ไม่ผ่าน
 alice daemon start | stop | status | logs | run
 alice token rotate [--show]
@@ -207,9 +208,14 @@ alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # MCP server แบบ stdio สำหรับ agent
 alice model fetch
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
+alice import mempalace [--palace dir] [--dry-run] [--since date] [--map-wing wing=project]...
+                       [--collection name] [--allow-remote-embedding]
+alice import status
 ```
 
-ทุกคำสั่งใส่ `--json` ได้ (ยกเว้น `daemon logs`, `config edit` และ `model fetch` ที่ไม่พิมพ์เอกสาร JSON) ที่วางแผนไว้: `import mempalace` (M3), `sync` (M4), `hook` (SP2), `ui` (SP3)
+`--action move` รับแค่ `--project` (flag อื่นจะถูกปฏิเสธ และ `--project` คู่กับ action อื่นก็ถูกปฏิเสธเช่นกัน) เหมือนการ merge project คือจะไม่ย้าย memory จาก project ที่ถูกกันไม่ให้ส่งขึ้น cloud ไปยัง project ที่ส่งได้ และจะตรวจข้อความกับกฎความเป็นส่วนตัวของ project ปลายทาง: โหมด `block` ปฏิเสธข้อความที่กฎนั้นจะเปลี่ยน ส่วนโหมดอื่นจะย้ายไปพร้อมข้อความที่ถูกปกปิดตามกฎนั้น
+
+ทุกคำสั่งใส่ `--json` ได้ (ยกเว้น `daemon logs`, `config edit` และ `model fetch` ที่ไม่พิมพ์เอกสาร JSON) ที่วางแผนไว้: `sync` (M4), `hook` (SP2), `ui` (SP3)
 
 ## การตั้งค่า
 
@@ -334,14 +340,9 @@ alice sync pull
 
 memory แต่ละอันกลายเป็นไฟล์ `<project>/<kind>/<year>/<id>-<slug>.md` ที่มี YAML frontmatter ส่วน knowledge graph เก็บเป็น JSONL ที่เรียงลำดับแล้ว Alice merge ทีละ record สองเครื่องจึงแก้ memory คนละอันได้โดยไม่ชนกัน ถ้าแก้ memory อันเดียวกัน ฉบับที่ใหม่กว่าชนะ และอีกฉบับเข้าคิว review **ควรใช้ private repo** เพราะ memory อาจมีรายละเอียดของโปรเจกต์ที่อ่อนไหว แม้จะตัด secret ออกแล้วก็ตาม
 
-## ย้ายมาจาก MemPalace *(ตัว import วางแผนไว้ใน M3)*
+## ย้ายมาจาก MemPalace
 
-Alice ได้แรงบันดาลใจจาก [MemPalace](https://github.com/MemPalace/mempalace) และจะ import palace ของ MemPalace ได้:
-
-```bash
-alice import mempalace --dry-run   # ดูก่อนว่า wing ไหนจะกลายเป็น project ไหน
-alice import mempalace
-```
+Alice ได้แรงบันดาลใจจาก [MemPalace](https://github.com/MemPalace/mempalace) และ import palace ของ MemPalace ได้ ความต่างหลักๆ:
 
 | | MemPalace | Alice |
 |---|---|---|
@@ -353,7 +354,61 @@ alice import mempalace
 | MCP tools | ~45 | หลัก 7 ตัว + ชุด admin และ compat ที่เลือกเปิดได้ |
 | การแชร์ | shared-brain hub | git เป็น Markdown พร้อม merge ทีละ record |
 
-drawer ที่ mine มาจาก transcript และไฟล์กลายเป็น source ดิบ ส่วน diary และ drawer ที่ agent เขียนเองกลายเป็น memory wing กลายเป็น project (ชื่อที่เขียนต่างกันรวมเป็นอันเดียว) room กลายเป็น topic และ knowledge graph ย้ายมาครบ ถ้ายังอยากเรียก tool `mempalace_*` ให้เปิด `compat.mempalace`
+## Import จาก MemPalace
+
+```bash
+alice import mempalace --dry-run   # รายงานว่าจะ import อะไรบ้าง ไม่เปลี่ยนแปลงอะไร
+alice import mempalace             # import จริง (ถ้า daemon ยังไม่ทำงานจะถูกเปิดให้)
+alice import status                # ความคืบหน้าของ import ที่กำลังรัน หรือรายงานครั้งล่าสุด
+```
+
+- **รันซ้ำได้อย่างปลอดภัย** drawer ทุกอันเก็บ id เดิมจาก MemPalace ไว้ รันซ้ำจึง import เฉพาะของใหม่ (`--since 2026-04-16` จำกัดเฉพาะ drawer ที่ใหม่กว่าวันที่ระบุ) ถ้า import หยุดกลางทาง หรือคุณกด Ctrl-C (daemon ยังทำงานต่อ) ก็รันคำสั่งเดิมอีกครั้งเพื่อทำต่อ
+- **ไม่มี undo** การ import ไม่ใช่การเปลี่ยนแปลงที่ `alice undo` ย้อนได้ (ประวัติบันทึกแค่จำนวน ไม่ได้บันทึกแถว) ถ้าต้องการย้อนกลับ ให้ restore backup ที่ทำไว้ก่อน import (`alice backup now` สร้างให้ได้) หรือเริ่มใหม่ด้วย `ALICE_HOME` ใหม่
+- **ไม่ต้องปิด MemPalace** Alice คัดลอก palace ผ่าน backup API ของ SQLite ไปไว้ในโฟลเดอร์ชั่วคราวส่วนตัวแล้วอ่านจากสำเนานั้น ไฟล์ palace ของคุณถูกเปิดแบบอ่านอย่างเดียวและไม่ถูกแก้ไข สำเนาใช้พื้นที่ดิสก์ว่างราวขนาดของ palace และถูกลบเมื่อเสร็จ
+- **หา palace จากที่ไหน** `--palace <โฟลเดอร์>` หรือ `$MEMPALACE_PALACE_PATH` หรือ `$MEMPAL_PALACE_PATH` หรือ `palace_path` ใน `~/.mempalace/config.json` อ่านได้ทั้ง backend `sqlite_exact` และ `chroma` ใช้ `--collection <ชื่อ>` ถ้าไม่ใช่ collection `mempalace_drawers`
+- **อะไรไปอยู่ที่ไหน**
+  - drawer จาก transcript ของ session (`*.jsonl`, wing `sessions`) และจากไฟล์ที่ mine ไว้ กลายเป็นชั้นข้อมูลดิบ: หนึ่ง source ต่อหนึ่ง transcript หรือไฟล์ และ drawer เป็น chunk เรียงลำดับ ข้อความที่ซ้ำกันเป๊ะใน source เดียวกันจะรวมเป็นอันเดียว
+  - diary และ drawer ที่ agent เขียนเอง (ไม่มีไฟล์ต้นทาง หรืออยู่ใน room ที่คัดมาแล้ว เช่น `decisions`, `runbook`) กลายเป็น memory โดยดู kind จากชื่อ room (`decisions` เป็น decision, `bug-classes` เป็น bugfix และอื่นๆ) บันทึกเป็นสถานะ active และไม่ผ่าน judge
+  - wing กลายเป็น project (`wing_pg_ai` กับ `pg_ai` เป็น project เดียวกัน) wing ของ agent เช่น `wing_claude_code` ไปอยู่ที่ `global` โดยมี agent เป็นผู้เขียน เว้นแต่ข้อความระบุชื่อ project `--map-wing wing_project_alice=alice` (ใส่ซ้ำได้) แก้ project ของ wing ตอน import ครั้งแรก ส่วน `alice projects merge <from> <into>` แก้ภายหลัง (ดู "แก้ project ที่ผิด" ด้านล่าง) การ import ซ้ำจะเพิ่มเฉพาะของใหม่ และไม่ย้าย memory ที่ import ไปแล้วไปไว้ project อื่น: ถ้าจะย้ายให้ใช้ `alice projects merge` หรือ import เข้า home ใหม่
+  - diary เลือก project ตามกฎเหล่านี้ ข้อแรกที่ตรงชนะ (`--map-wing` ชนะเสมอ): topic ของ diary เท่ากับชื่อ project ที่รู้จัก หรือขึ้นต้นด้วย `<project>-` (เว้นแต่ project ของ wing เองมีชื่อนั้นอยู่ในตัว เช่น `alice` ใน `project-alice`) wing แบบ project ระบุ project ของมัน wing ของ agent ที่ชื่อลงท้ายด้วย project ที่รู้จัก (`wing_claude_code_pgai`) ระบุ project นั้น จากนั้นดูโฟลเดอร์ของ transcript แล้วดู project ที่ข้อความระบุ แล้วจึง `global` ไม่มีการเดา `test` จาก diary
+  - diary auto-save ของ MemPalace (topic `checkpoint`) ไม่ใช่ memory แต่เป็น transcript ที่ปลอมตัวมา จึง import เป็น raw chunk ของ session แยก source ตาม wing และวัน (`mempalace-checkpoint:<wing>:<yyyy-mm-dd>`, agent `mempalace checkpoint`) เรียงตามเวลาที่บันทึก และใช้ project ตามกฎของ diary ด้านบน ค้นเจอด้วย `recall --raw` (และผ่าน raw fallback เมื่อ memory ตรงน้อย) แต่ไม่โผล่ในผลค้นหา knowledge หรือใน briefing diary อื่นคง importance 2
+  - MemPalace หั่น drawer ยาว (รวมถึง diary และ drawer ที่มี source file) เป็นชิ้นละ 800 ตัวอักษร id ลงท้ายด้วย `_chunk_000000`, `_chunk_000001` ฯลฯ การ import ต่อชิ้นของ drawer เดียวกันกลับเป็น memory เดียว (หรือ raw chunk เดียวสำหรับ checkpoint และ drawer ที่มี source file) ก่อนทำอย่างอื่น secret ที่ถูกตัดตรงรอยต่อจึงครบทั้งก้อนตอนตรวจหา: ชื่อเดียว ข้อความครบ เวลาที่บันทึกเร็วที่สุด และ topic ของทุกชิ้น id ของทุกชิ้นยังชี้มาที่มัน รวมถึง id ที่ MemPalace ตอบกลับสำหรับทั้ง drawer (ซึ่ง MemPalace ไม่ได้เก็บ drawer ไว้ใต้ id นั้น) home ที่ import ไว้ก่อนจะได้ id นี้ในการรันครั้งถัดไป และรายงานนับ `fragments joined` ไว้ drawer จะถูกรวมก็ต่อเมื่อไม่มี id ของชิ้นไหนถูกเก็บแล้ว drawer ที่เวอร์ชันก่อนเก็บทีละชิ้นไว้ (รวมถึงชิ้นของ raw file) จะคงเดิม (รายงานเตือนเมื่อขาดบางชิ้น) ถ้าต้องการให้ชิ้นเก่าถูกรวม ให้ import เข้า `ALICE_HOME` ใหม่
+  - room กลายเป็น topic ส่วน closet ถูกทิ้ง (Alice สร้าง index เอง)
+  - knowledge graph (`knowledge_graph.sqlite3` ในโฟลเดอร์ palace หรือไม่ก็ `~/.mempalace/`) กลายเป็น fact พร้อมช่วงเวลาที่ใช้ได้ ชื่อ predicate ที่คล้ายกันจะกลายเป็นรายการให้ review แทนการรวมเอง entity ที่ไม่มี fact ไม่ถูก import tunnel ที่ระบุ drawer สองอันที่ import ได้จะกลายเป็น link `relates_to`
+- **แก้ project ที่ผิด** ถ้า wing ไปอยู่ผิด project หรือสอง project จริงๆ แล้วเป็นอันเดียวกัน (เช่น repository นี้โผล่เป็นทั้ง `alice` และ `project-alice`) ให้รัน `alice projects merge alice project-alice` คำสั่งนี้ย้าย memory, chunk, source และ fact ทั้งหมดของ project แรกไปไว้ใน project ที่สอง (fact ตามไปกับ memory ที่มันมาจาก) และทำให้ slug, key และ alias ของ project แรกกลายเป็นชื่อของ project ที่สอง การเขียนจาก checkout เดิมและการ import wing นั้นในภายหลังจึงไปลงใน project ที่คุณเก็บไว้ คำสั่งจะแสดงสิ่งที่จะย้ายและถาม `[y/N]` บน terminal สคริปต์ใช้ `--yes` และถ้าไม่มี terminal กับไม่มี `--yes` คำสั่งจะปฏิเสธ `global` ใช้เป็นต้นทางหรือปลายทางของการ merge ไม่ได้ และ project ที่ถูกกันไม่ให้ส่งขึ้น cloud จะ merge เข้า project ที่ส่งได้ไม่ได้ (ให้กัน project ปลายทางด้วย หรือยกเลิกการกันก่อน) `alice projects` แสดง slug ทั้งหมด การ merge ยังนำกฎความเป็นส่วนตัวของ project แรกไปไว้ที่ project ที่สองด้วย ได้แก่ `block_secrets`, `cloud_denied` และ custom pattern ใน `.alice.toml` ของมัน รวมถึงกฎที่การ merge ครั้งก่อนนำมาไว้ที่มัน และถ้า `privacy.cloud_denied_projects` กัน project แรกไว้ (ด้วย slug, alias หรือชื่อของมัน) ก็นำไปเป็น `cloud_denied` ด้วย ระหว่างที่ยังไม่รู้กฎของ project แรก (working tree ของมันหายไปและ Alice ไม่เคยอ่าน `.alice.toml` ของมันบนเครื่องนี้ ไฟล์ไม่ถูกต้อง หรือการแก้ที่ทำให้กฎหลวมลงยังไม่มีผล) การ merge จะถูกปฏิเสธพร้อมบอกเหตุผล ให้นำ working tree กลับมา แก้ไฟล์ หรือลองใหม่ในอีกไม่กี่วินาที นับจากนั้น project ที่คุณเก็บไว้จะใช้กฎที่เข้มกว่าของทั้งสองเสมอ ไม่ว่า `.alice.toml` ของมันเองจะว่าอย่างไร ทั้งกับการเขียนจาก checkout ใดก็ตามของทั้งสอง การเขียนในชื่อใดก็ตามของทั้งสอง และการ import ในภายหลัง คำสั่งจะบอกชื่อกฎที่นำไป (ไม่แสดง expression ของ pattern) การ merge เป็นหนึ่ง event: `alice undo <event-id>` (คำสั่งพิมพ์ให้ และดูได้ใน `alice history`) คืน project, ชื่อของมัน และแถวที่ย้ายไปเป๊ะๆ และเอากฎที่การ merge ครั้งนั้นนำไปออกเป๊ะๆ (กฎที่การ merge ครั้งหลังนำมายังอยู่) ใช้ได้ทาง CLI และ HTTP API (`POST /api/v1/projects/merge`) ไม่มีเป็นเครื่องมือ MCP เพื่อไม่ให้ agent จัด project ของคุณใหม่เอง
+- **เป็นส่วนตัวโดยการออกแบบ** ทุกอย่างที่ import เขียนลงไปถูกปกปิด secret เสมอ ไม่ว่า `privacy.redact` จะตั้งไว้อย่างไร ไม่มีอะไรออกจากเครื่องและไม่มี judge ทำงาน เมื่อ import แล้ว memory เหล่านี้ก็เป็น memory ปกติ การ import ตรวจด้วยกฎส่วนกลาง และถ้า drawer จะไปลง project ที่มีกฎของตัวเอง (custom pattern และโหมด block ใน `.alice.toml` ของมัน หรือกฎที่การ merge project นำมาไว้) ก็ตรวจด้วยกฎนั้นด้วย drawer ที่กฎนั้นปฏิเสธจะไม่ถูก import และนับเป็น blocked (ชื่อไฟล์ของ source แบบ raw ตรวจด้วยกฎส่วนกลางอย่างเดียว เพราะใช้ระบุตำแหน่งของ chunk) ข้อความที่ `alice projects merge` ย้ายไปคงการตรวจแบบที่เก็บไว้ตอนแรก: การ merge ย้ายแถว ไม่ได้เขียนข้อความใหม่ เวลาที่ MemPalace เก็บโดยไม่มี timezone จะถูกอ่านด้วย UTC offset ของเครื่องนี้ (รายงานแสดง offset ที่ใช้)
+- **รายงาน** นับ drawer ทุกอัน: `drawers_seen` ต้องเท่ากับจำนวนที่ import, รวมเป็นอันเดียว, ข้าม หรือมีอยู่แล้ว ถ้าไม่เท่ากันจะนับเป็น error และจบด้วย exit code ที่ไม่ใช่ 0 รายงานยังแสดงแผนที่ wing ไป project, รายการที่รอ review และสิ่งที่ข้ามพร้อมเหตุผล
+- **embedding คำนวณเบื้องหลัง** ด้วยโมเดลของ Alice เอง (ไม่ใช้ vector ของ MemPalace) ค้นหาด้วยคำได้ทันทีที่ import จบ ส่วนการค้นตามความหมายในชั้นข้อมูลดิบจะค่อยๆ ครบเมื่อ chunk ถูก embed
+- **embedding provider ระยะไกล** ถ้า `embedding.provider` ไม่ใช่โมเดลในเครื่อง import จะไม่เริ่มทำงาน เพราะทุก chunk ของประวัติคุณจะถูกส่งไปยัง provider นั้น ใส่ `--allow-remote-embedding` เพื่อยืนยันว่ายอมรับได้
+
+palace ขนาด 122,000 drawer import เสร็จในราว 2 นาที (ใช้หน่วยความจำสูงสุดไม่ถึง 200 MB) เมื่อไม่รวมการ embed และราว 4 นาทีเมื่อใช้โมเดลจริง ซึ่งตอนนั้นชั้นความรู้ embed เสร็จแล้ว ส่วน raw chunk อีกราว 116,000 อันจะ embed ต่อด้วยความเร็วราว 34 อันต่อวินาที การ import palace ที่ใหญ่มากในขณะที่มี agent ทำงานหนักอยู่หลายตัวอาจทำให้ `recall` ช้าลงจนกว่า import จะจบ ดู [docs/benchmarks/m3.md](docs/benchmarks/m3.md)
+
+## ความเข้ากันได้กับ MemPalace
+
+prompt และ hook ที่เขียนไว้สำหรับ MemPalace เรียก tool ชื่อ `mempalace_*` Alice ตอบ 15 ตัวจากข้อมูลของตัวเองในรูปแบบเดียวกับที่ MemPalace ส่งกลับ ได้แก่ `status`, `search`, `add_drawer`, `get_drawer`, `update_drawer`, `delete_drawer`, `diary_write`, `diary_read`, `kg_query`, `kg_add`, `kg_invalidate`, `kg_supersede`, `kg_timeline`, `list_wings` และ `list_rooms`
+
+layer นี้คือการตั้งค่า `compat.mempalace` การ import จริง (ไม่ใช่ `--dry-run`) ที่จบโดยไม่มี error จะเปิดให้เองถ้าคุณไม่เคยตั้งค่านี้ (ถ้ามี error จะยังปิดอยู่ และรายงานจะบอกไว้) มิฉะนั้นใช้:
+
+```bash
+alice config set compat.mempalace true     # หรือ false เพื่อซ่อน tool อีกครั้ง
+```
+
+การเปลี่ยนมีผลกับ client ที่เปิดอยู่ภายในหนึ่งวินาที ไม่ต้องรีสตาร์ท ถ้าติดต่อ daemon ไม่ได้ tool เหล่านี้จะถูกซ่อน และการเรียก tool เหล่านี้จะตอบว่าติดต่อ daemon ไม่ได้ (ให้รัน `alice status`) ไม่ใช่บอกว่าปิดอยู่
+
+ลงทะเบียน `alice mcp` ด้วยชื่อ server ที่ prompt ของคุณคาดหวัง Claude Code ตั้งชื่อ tool เป็น `mcp__<server>__<tool>` ดังนั้น prompt ที่เรียก `mcp__plugin_mempalace_mempalace__mempalace_search` ต้องใช้ชื่อ server ว่า `plugin_mempalace_mempalace`:
+
+```bash
+claude mcp add --scope user plugin_mempalace_mempalace -- alice mcp
+```
+
+client อื่นให้ใช้ชื่อเดียวกันในไฟล์ตั้งค่าของมัน (`mcp_servers.plugin_mempalace_mempalace` ใน Codex เป็นต้น) ปิด plugin MemPalace ตัวจริงก่อน ไม่เช่นนั้นจะมีสอง server ใช้ชื่อเดียวกัน ลงทะเบียนอันเดียวก็พอ: มันให้ tool หลักของ Alice 7 ตัว และเมื่อเปิด layer ไว้ก็ให้ tool `mempalace_*` อีก 15 ตัว
+
+สิ่งที่ควรรู้:
+
+- `similarity` ในผลค้นหาเป็นค่าสัมพัทธ์: hit ที่ดีที่สุดได้ 1.0 ที่เหลือเทียบกับมัน คะแนนของ Alice ไม่ใช่ระยะ cosine ดังนั้น prompt ที่ตั้งเกณฑ์ตามระยะของ MemPalace จะทำงานต่างไป
+- การเขียนผ่านเส้นทางปกติของ Alice: ปกปิด secret, ผ่าน judge, บันทึกใน `alice history` และ undo ได้ `wing` ที่ไม่ใช่ project ใน Alice จะเก็บ memory ไว้ใน project ปัจจุบัน (คำตอบบอกไว้) agent ไม่สร้าง project ด้วยวิธีนี้
+- id ของ drawer จาก palace ของคุณยังใช้ได้ (`mempalace_get_drawer`, `update_drawer`, `delete_drawer`) รวมถึง id ของ drawer ที่ถูกรวมเข้ากับอันเดิมที่เหมือนกัน และ id ที่ MemPalace ตอบกลับสำหรับ entry ยาวที่มันเก็บเป็นชิ้นๆ การ get, update หรือ delete ผ่าน id ของ drawer ที่ถูกรวมไปแล้วจะทำกับ memory ที่มันถูกรวมเข้าไป และคำตอบจะบอกไว้
+- tool อื่นของ MemPalace (`mine`, `traverse`, tunnel, `check_duplicate` ฯลฯ) ไม่ถูกแสดงในรายการ และถ้าเรียกจะได้ข้อความบอกว่าใน Alice ใช้อะไรแทน ไม่ใช่ error
 
 ## ประสิทธิภาพ
 
@@ -377,7 +432,7 @@ drawer ที่ mine มาจาก transcript และไฟล์กลา�
 |---|---|---|
 | **SP1 · M1** | ที่เก็บข้อมูล, การค้นหาแบบผสม, daemon, MCP, CLI, HTTP API | เสร็จแล้ว (alpha) |
 | **SP1 · M2** | Judge (กฎในเครื่อง + Jev), คิว review, undo, ตัด secret, backup และ restore, maintenance, settings ที่มีผลทันที, doctor, service install, embedding provider ผ่าน HTTP, build บน Windows, เป้าหน่วยความจำ 800MB | เสร็จแล้ว (alpha) |
-| **SP1 · M3** | ตัว import จาก MemPalace และ compatibility layer | ลำดับถัดไป |
+| **SP1 · M3** | ตัว import จาก MemPalace และ compatibility layer | สร้างเสร็จแล้ว รอ review สุดท้าย (alpha) |
 | **SP1 · M4** | Git sync | วางแผนแล้ว |
 | **SP2** | เก็บและกลั่นความรู้อัตโนมัติ, `alice setup`, hook/plugin สำหรับทุก agent ที่รองรับ | วางแผนแล้ว |
 | **SP3** | Web UI (graph, จัดการ memory, review, settings, sync, สุขภาพระบบ) แล้วตามด้วยแอป desktop | วางแผนแล้ว |

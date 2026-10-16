@@ -7,6 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Core model, storage and search for Alice, long-term memory for AI coding agents"
 
+[features]
+# Builders for synthetic MemPalace palaces, for tests in other crates.
+fixtures = []
+
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true

@@ -68,8 +68,11 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// List projects.
-    Projects,
+    /// List projects, or fix a wrong one with `projects merge`.
+    Projects {
+        #[command(subcommand)]
+        cmd: Option<cmd::ProjectsCmd>,
+    },
     /// Daemon status and counts.
     Status,
     /// Check the installation, the daemon and the data, with what to do about each problem.
@@ -88,6 +91,9 @@ enum Command {
     /// Read and change settings (config.toml, applied live) and secrets.
     #[command(subcommand)]
     Config(cmd::ConfigCmd),
+    /// Bring memories in from another system (MemPalace).
+    #[command(subcommand)]
+    Import(cmd::ImportCmd),
     /// Embedding model management.
     #[command(subcommand)]
     Model(cmd::ModelCmd),

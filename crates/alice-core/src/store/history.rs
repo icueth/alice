@@ -8,7 +8,7 @@ use crate::normalize::content_hash;
 use crate::redact::Redactor;
 use crate::store::events::{self, Actor, EventInput, EventRow};
 use crate::store::reviews::{self, NewReview, ReviewType};
-use crate::store::{fts, kg, memories};
+use crate::store::{fts, kg, memories, project_merge, projects};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -131,6 +131,10 @@ enum Target {
     Relation,
     /// A predicate mapping: the vocabulary rows and relations it touched.
     Predicate,
+    /// A project merge (`project.merge`): see [`project_merge`].
+    Project,
+    /// The placeholder project a move created: see [`projects::PlaceholderState`].
+    Placeholder,
 }
 
 /// Undo knows memories and relations; any other target type is refused as such.
@@ -139,8 +143,10 @@ fn target_kind(target_type: &str) -> Result<Target> {
         "memory" => Ok(Target::Memory),
         "relation" => Ok(Target::Relation),
         "predicate" => Ok(Target::Predicate),
+        project_merge::MERGE_TARGET => Ok(Target::Project),
+        projects::PLACEHOLDER_TARGET => Ok(Target::Placeholder),
         other => Err(AliceError::invalid(format!(
-            "changes to a {other} cannot be undone; only memory, fact and predicate changes can"
+            "changes to a {other} cannot be undone; only memory, fact, predicate and project-merge changes can"
         ))),
     }
 }
@@ -157,6 +163,18 @@ fn current(
     match target_kind(target_type)? {
         Target::Memory => snapshot_memory(conn, id)?.map(to_json).transpose(),
         Target::Relation => snapshot_relation(conn, id)?.map(to_json).transpose(),
+        Target::Project => {
+            let Some(spec) = spec else { return Ok(None) };
+            project_merge::current_state(conn, spec).map(Some)
+        }
+        Target::Placeholder => {
+            let Some(spec) = spec else { return Ok(None) };
+            let spec: projects::PlaceholderState =
+                serde_json::from_value(spec.clone()).map_err(|e| {
+                    AliceError::invalid(format!("the recorded placeholder is unreadable ({e})"))
+                })?;
+            to_json(projects::placeholder_now(conn, &spec)?).map(Some)
+        }
         Target::Predicate => {
             let Some(spec) = spec else { return Ok(None) };
             let spec: kg::PredicateSnapshot =
@@ -269,14 +287,25 @@ pub fn scrub_snapshots(
 fn restore_memory(conn: &Connection, id: &str, s: &MemorySnapshot, hlc: &str) -> Result<()> {
     let seq =
         memories::seq_of(conn, id)?.ok_or_else(|| AliceError::NotFound(format!("memory {id}")))?;
-    let slug: String = conn.query_row(
-        "SELECT slug FROM projects WHERE id = ?1",
-        [&s.project_id],
-        |r| r.get(0),
-    )?;
+    // A project merged into another is gone: its memories are in the other one now.
+    let found: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, slug FROM projects WHERE id = ?1",
+            [&s.project_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (project_id, slug) = match found {
+        Some(p) => p,
+        None => conn.query_row(
+            "SELECT p.id, p.slug FROM memories m JOIN projects p ON p.id = m.project_id WHERE m.seq = ?1",
+            [seq],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?,
+    };
     let hash = content_hash(&slug, s.kind, &s.title, &s.body);
     if s.status != Status::Trashed {
-        memories::ensure_unique_content(conn, seq, &s.project_id, &hash).map_err(|e| match e {
+        memories::ensure_unique_content(conn, seq, &project_id, &hash).map_err(|e| match e {
             AliceError::Invalid(m) => AliceError::invalid(format!("cannot undo: {m}")),
             e => e,
         })?;
@@ -304,7 +333,7 @@ fn restore_memory(conn: &Connection, id: &str, s: &MemorySnapshot, hlc: &str) ->
             s.title,
             s.body,
             s.importance,
-            s.project_id,
+            project_id,
             hash,
             now_rfc3339(),
             hlc,
@@ -388,11 +417,15 @@ fn undoable(action: &str) -> bool {
         action,
         "undo"
             | "source.ingest"
+            | "import.batch"
+            | "import.compat_enabled"
             | "memory.purge"
             | "raw.retention"
             | "settings.change"
             | "secret.set"
             | "secret.delete"
+            // Undoing an undo would have to merge again: run `alice projects merge` instead.
+            | "undo:project.merge"
     )
 }
 
@@ -499,6 +532,11 @@ fn undo_with(
             return Err(AliceError::invalid(why));
         }
     }
+    for e in &todo {
+        if e.action == project_merge::MERGE_ACTION {
+            project_merge::check_undo_possible(conn, e)?;
+        }
+    }
     // An event that changed nothing its snapshot holds, the only one of its target in the group
     // (the survivor of a merge), has nothing to revert and nothing to compare: a later change of
     // that target neither blocks the undo nor is overwritten by it. (A target with more events
@@ -520,6 +558,11 @@ fn undo_with(
     let mut checked = HashSet::new();
     for e in todo.iter().filter(|e| !unchanged.contains(&e.id)) {
         if !checked.insert((e.target_type.as_str(), e.target_id.as_str())) {
+            continue;
+        }
+        // A placeholder is only ever removed while empty and put back when absent: whatever
+        // happened to it since, undoing the move around it is not in conflict.
+        if e.target_type == projects::PLACEHOLDER_TARGET {
             continue;
         }
         let (_, after) = states(conn, e)?;
@@ -603,6 +646,28 @@ fn undo_with(
             (Target::Predicate, Some(b)) => {
                 let s: kg::PredicateSnapshot = serde_json::from_value(b).map_err(bad)?;
                 kg::restore_predicates(conn, &s, &h)?;
+            }
+            (Target::Project, Some(b)) => project_merge::unmerge(conn, &b, &h)?,
+            // Undoing the creation (nothing before it) removes the placeholder if it is still
+            // empty; undoing a removal puts it back.
+            (Target::Placeholder, None) => {
+                let spec: projects::PlaceholderState =
+                    serde_json::from_value(after.clone().unwrap_or_default()).map_err(bad)?;
+                projects::remove_empty_placeholder(conn, &spec)?;
+            }
+            (Target::Placeholder, Some(b)) => {
+                let spec: projects::PlaceholderState = serde_json::from_value(b).map_err(bad)?;
+                if spec.present {
+                    projects::recreate_placeholder(conn, &spec)?;
+                } else {
+                    projects::remove_empty_placeholder(conn, &spec)?;
+                }
+            }
+            (Target::Project, None) => {
+                return Err(AliceError::invalid(format!(
+                    "event {} ({}) records no before-state for project {}; it cannot be undone",
+                    e.id, e.action, e.target_id
+                )));
             }
             (Target::Predicate, None) => {
                 return Err(AliceError::invalid(format!(
@@ -1160,6 +1225,30 @@ mod tests {
                 "{action}: {err}"
             );
         }
+    }
+
+    /// An import is bulk evidence with legacy ids behind it: nothing in it is undone, and a
+    /// refusal opens no review item.
+    #[test]
+    fn import_events_are_never_undoable() {
+        let mut t = T::new();
+        for action in ["import.batch", "import.compat_enabled"] {
+            let ev = t.record(
+                EventInput {
+                    actor: &Actor::Import,
+                    action,
+                    target_type: "import",
+                    target_id: "J1",
+                    before: None,
+                    after: Some(serde_json::json!({"memories_new": 2})),
+                    group: None,
+                },
+                "h",
+            );
+            let err = t.undo(&ev).unwrap_err().to_string();
+            assert!(err.contains("cannot be undone"), "{action}: {err}");
+        }
+        assert_eq!(reviews::count_open(&t.c).unwrap(), 0);
     }
 
     #[test]

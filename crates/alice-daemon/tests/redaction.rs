@@ -1002,6 +1002,113 @@ async fn a_project_without_a_working_tree_is_never_a_gone_tree() {
     s.shutdown();
 }
 
+/// Final re-review 2, I-1: when the store cannot say which rules merges carried into a project
+/// (its `project_rules` table is missing: another branch's migration took the number), the
+/// project is screened closed, as the importer screens it, never with the global rules alone. A
+/// write naming it, a write from its checkout and an edit of one of its memories are refused in
+/// block mode, and the spool hears that the refusal may pass later.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_whose_carried_rules_cannot_be_read_is_screened_closed() {
+    let (d, s) = start().await;
+    let checkout = repo(&d, "checkout");
+    alice_core::store::projects::upsert_project(
+        &alice_core::store::open_writer(&s.home().db()).unwrap(),
+        &alice_core::project::ProjectRef {
+            key: "client:tenant-x".into(),
+            slug: "tenant-x".into(),
+            name: "tenant-x".into(),
+            root: None,
+            remote: None,
+        },
+    )
+    .unwrap();
+    let write = |project: Option<&str>, cwd: &Option<String>, content: String| {
+        let req = RememberRequest {
+            content,
+            project: project.map(str::to_string),
+            cwd: cwd.clone(),
+            ..Default::default()
+        };
+        let s = s.clone();
+        async move { s.remember(req).await }
+    };
+    let named = write(Some("tenant-x"), &None, "a tenant note".into())
+        .await
+        .unwrap();
+    write(None, &checkout, "a checkout note".into())
+        .await
+        .unwrap();
+    write(Some("tenant-x"), &None, format!("deploy with {GITHUB}"))
+        .await
+        .expect("redacted, not refused, while the rules can be read");
+
+    rusqlite::Connection::open(s.home().db())
+        .unwrap()
+        .execute_batch("DROP TABLE project_rules")
+        .unwrap();
+    for (project, cwd) in [(Some("tenant-x"), None), (None, checkout.clone())] {
+        let e = write(project, &cwd, format!("again {GITHUB}"))
+            .await
+            .unwrap_err();
+        assert!(alice_core::redact::is_refusal(&e), "{project:?}: {e:?}");
+        assert!(
+            s.rules_fail_closed(project, cwd.as_deref()).await,
+            "{project:?}: a refusal the spool may retry"
+        );
+    }
+    let e = s
+        .update(UpdateRequest {
+            id: named.id.unwrap(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                body: Some(format!("now {GITHUB}")),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(alice_core::redact::is_refusal(&e), "{e:?}");
+    s.shutdown();
+}
+
+/// Final re-review 2, M-3: a merge carries a denial of `from` from the global settings, but
+/// not the one a degraded configuration puts on every project: a typo in `config.toml` must not
+/// keep the survivor from the cloud for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_under_a_degraded_configuration_carries_no_cloud_denial() {
+    let d = tempfile::tempdir().unwrap();
+    let home = AliceHome::new(d.path().to_path_buf());
+    std::fs::write(home.config_file(), "[privacy\n").unwrap();
+    let s = Service::start(
+        home,
+        &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+        ServiceOptions::default(),
+    )
+    .unwrap();
+    assert!(s.settings_handle().config_degraded());
+    for name in ["alpha", "beta"] {
+        s.remember(RememberRequest {
+            content: format!("a note in {name}"),
+            cwd: repo(&d, name),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let done = s
+        .merge_projects(ProjectMergeRequest {
+            from: "alpha".into(),
+            into: "beta".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(done.merged, "{done:?}");
+    assert!(done.rules_carried.is_empty(), "{:?}", done.rules_carried);
+    s.shutdown();
+}
+
 /// A review item the way the judge will leave it (Task 12): written straight into the inbox.
 fn add_review(
     s: &Service,

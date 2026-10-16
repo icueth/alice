@@ -501,6 +501,15 @@ impl DaemonClient {
     pub async fn projects(&self) -> Result<Vec<ResolvedProject>> {
         self.get_json("/api/v1/projects").await
     }
+    /// Merge one project into another (`dry_run`: only count what would move).
+    pub async fn merge_projects(
+        &self,
+        r: &alice_core::api::ProjectMergeRequest,
+    ) -> Result<alice_core::api::ProjectMergeResponse> {
+        // A palace import can mean hundreds of thousands of rows to move.
+        self.call("/api/v1/projects/merge", r, Duration::from_secs(600))
+            .await
+    }
     pub async fn remember(&self, r: &RememberRequest) -> Result<RememberResponse> {
         self.call("/api/v1/remember", r, Duration::from_secs(5))
             .await
@@ -633,6 +642,26 @@ impl DaemonClient {
         )
         .await
     }
+    /// Start importing a MemPalace palace; the answer is the job's first status.
+    pub async fn start_import(
+        &self,
+        r: &alice_core::import::ImportRequest,
+    ) -> Result<alice_core::import::ImportStatus> {
+        self.call("/api/v1/import/mempalace", r, Duration::from_secs(30))
+            .await
+    }
+    /// One `mempalace_*` tool call (HTTP 409 while `compat.mempalace` is off).
+    pub async fn compat_call(
+        &self,
+        r: &crate::compat::CompatCall,
+    ) -> Result<crate::compat::CompatResult> {
+        self.call("/api/v1/compat/call", r, Duration::from_secs(10))
+            .await
+    }
+    /// The running import's progress, or the last one's outcome.
+    pub async fn import_status(&self) -> Result<alice_core::import::ImportStatus> {
+        self.get_json("/api/v1/import/status").await
+    }
     /// Every setting with its source, the problems, the secrets' status (never a value).
     pub async fn settings(&self) -> Result<SettingsView> {
         self.get_json("/api/v1/settings").await
@@ -740,9 +769,10 @@ impl DaemonClient {
             ))
         }
     }
-    /// Whether `mcp.admin_tools` is on, asked of the small flags endpoint (no secrets' status)
-    /// with a short timeout.
-    pub async fn admin_tools_flag(&self) -> Result<bool> {
+    /// The switches `alice mcp` obeys (`mcp.admin_tools`, `compat.mempalace`), asked of the
+    /// small flags endpoint (no secrets' status) with a short timeout. A key the daemon does not
+    /// send reads as off.
+    pub async fn switches(&self) -> Result<crate::mcp::Switches> {
         let resp = self
             .http
             .get(format!("{}/api/v1/settings/flags", self.base))
@@ -752,7 +782,11 @@ impl DaemonClient {
             .await
             .map_err(transport)?;
         let v: serde_json::Value = Self::decode(resp).await?;
-        Ok(v["mcp.admin_tools"].as_bool() == Some(true))
+        Ok(crate::mcp::Switches {
+            admin_tools: v["mcp.admin_tools"].as_bool() == Some(true),
+            compat_mempalace: v["compat.mempalace"].as_bool() == Some(true),
+            unreachable: false,
+        })
     }
     pub async fn shutdown(&self) -> Result<()> {
         let resp = self

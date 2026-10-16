@@ -75,6 +75,10 @@ impl AliceHome {
     pub fn spool_dir(&self) -> PathBuf {
         self.root.join("spool")
     }
+    /// Where an import keeps its snapshot of the palace; emptied at every daemon start.
+    pub fn import_tmp(&self) -> PathBuf {
+        self.root.join("import-tmp")
+    }
     pub fn backups_dir(&self) -> PathBuf {
         self.root.join("backups")
     }

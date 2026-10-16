@@ -54,6 +54,17 @@ impl Drop for ActivityGuard<'_> {
     }
 }
 
+/// An [`ActivityGuard`] that owns its share of the activity record, for a job that runs on its
+/// own thread (an import) and so cannot borrow it.
+pub struct OwnedActivityGuard(Arc<Activity>);
+
+impl Drop for OwnedActivityGuard {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::SeqCst);
+        self.0.touch();
+    }
+}
+
 impl Activity {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -73,6 +84,18 @@ impl Activity {
         self.inflight.fetch_add(1, Ordering::SeqCst);
         self.touch();
         ActivityGuard(self)
+    }
+
+    /// Like [`enter`](Self::enter), for a guard that moves to another thread.
+    pub fn enter_owned(self: &Arc<Self>) -> OwnedActivityGuard {
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+        self.touch();
+        OwnedActivityGuard(self.clone())
+    }
+
+    /// A guard is held right now (a request or a long job is running).
+    pub fn is_busy(&self) -> bool {
+        self.inflight.load(Ordering::SeqCst) > 0
     }
 
     /// How long nothing has happened (zero while a guard is held).
