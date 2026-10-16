@@ -214,6 +214,8 @@ struct StateRow {
     file_key: Option<String>,
     project_slug: String,
     project_key: String,
+    distill_state: String,
+    last_event: Option<String>,
 }
 
 fn state_of(svc: &Service, uri: &str) -> Option<StateRow> {
@@ -221,7 +223,8 @@ fn state_of(svc: &Service, uri: &str) -> Option<StateRow> {
     db(svc)
         .query_row(
             "SELECT c.source_id, c.session_id, c.byte_offset, c.gaps, c.ended, c.no_distill,
-                    c.parent_source_id, c.transcript_path, c.file_key, p.slug, p.key
+                    c.parent_source_id, c.transcript_path, c.file_key, p.slug, p.key,
+                    c.distill_state, c.last_event
              FROM capture_state c JOIN sources s ON s.id = c.source_id
              JOIN projects p ON p.id = s.project_id WHERE s.uri = ?1",
             [uri],
@@ -238,6 +241,8 @@ fn state_of(svc: &Service, uri: &str) -> Option<StateRow> {
                     file_key: r.get(8)?,
                     project_slug: r.get(9)?,
                     project_key: r.get(10)?,
+                    distill_state: r.get(11)?,
+                    last_event: r.get(12)?,
                 })
             },
         )
@@ -402,6 +407,52 @@ async fn a_resend_from_zero_stores_nothing_twice() {
     }
     let ords: Vec<i64> = chunks.iter().map(|c| c.0).collect();
     assert_eq!(ords, (0..chunks.len() as i64).collect::<Vec<_>>());
+}
+
+/// Spec §11.1 under R11: once retention has deleted a captured session's chunks, its state,
+/// cursor and turn keys stay, so a re-pass stores nothing again. A resend from 0 is told the
+/// kept cursor, and sending from there stores the new turn only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_re_pass_after_retention_stores_nothing() {
+    let d = home_with("[capture]\nraw_retention = \"1d\"\n");
+    let svc = start_in(d.path(), true);
+    let mut t = Transcript::default();
+    t.turn("s9", 1, "first").turn("s9", 2, "second");
+    let cursor = send(&svc, q("s9", 0, "stop"), &t.bytes).await.next_offset;
+    assert!(!chunks_of(&svc, &uri("s9")).is_empty());
+    // Two days later, for the chunks and the state alike.
+    let then = (chrono::Utc::now() - chrono::Duration::days(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let w = alice_core::store::open_writer(&svc.home().db()).unwrap();
+    w.execute("UPDATE chunks SET created_at = ?1", [&then])
+        .unwrap();
+    w.execute("UPDATE capture_state SET created_at = ?1", [&then])
+        .unwrap();
+    let report = svc
+        .run_job(alice_daemon::maintenance::Job::CaptureRetention)
+        .await
+        .unwrap();
+    assert!(chunks_of(&svc, &uri("s9")).is_empty(), "{report:?}");
+    // The session goes on: the whole transcript is sent again, with one new turn.
+    t.turn("s9", 3, "third");
+    let jump = svc
+        .capture_transcript(q("s9", 0, "stop"), Bytes::from(t.bytes.clone()))
+        .await
+        .unwrap()
+        .expect_err("a resend from 0 is behind the kept cursor");
+    assert_eq!(jump, cursor);
+    let a = send(&svc, q("s9", jump, "stop"), &t.bytes[jump as usize..]).await;
+    assert_eq!(a.turns_stored, 1, "{a:?}");
+    let chunks = chunks_of(&svc, &uri("s9"));
+    assert_eq!(chunks.len(), a.chunks_stored as usize);
+    assert_eq!(chunks_holding(&svc, "third is settled"), 1, "the new turn");
+    for marker in ["first", "second"] {
+        assert_eq!(
+            chunks_holding(&svc, &format!("{marker} is settled")),
+            0,
+            "{marker} is not stored again"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1416,6 +1467,48 @@ async fn session_start_registers_a_session_with_nothing_complete() {
     )
     .await;
     assert!(!source_exists(&svc, &uri("ss2")));
+}
+
+/// Merge fix round 1: a `SessionEnd` that finds nothing new (a `Stop` already sent the whole file)
+/// is sent as an empty body at the cursor. The server applies the end for it: the source ends
+/// and is marked due for distillation. An empty `stop` body at the cursor changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_session_end_at_the_cursor_ends_the_source_and_marks_it_due() {
+    let d = home_with("[distill]\nprovider = \"jev\"\n");
+    let svc = start_in(d.path(), true);
+    let mut t = Transcript::default();
+    t.turn("ee1", 1, "said before the end");
+    let a = send(&svc, q("ee1", 0, "stop"), &t.bytes).await;
+    assert_eq!(a.next_offset, t.len(), "the stop sent the whole file");
+    let events = capture_events(&svc, &uri("ee1"));
+
+    let a = send(&svc, q("ee1", t.len(), "stop"), b"").await;
+    assert_eq!(
+        (a.next_offset, a.turns_stored, a.chunks_stored),
+        (t.len(), 0, 0)
+    );
+    let row = state_of(&svc, &uri("ee1")).unwrap();
+    assert_eq!((row.byte_offset, row.ended), (t.len(), false));
+    assert_eq!(row.distill_state, "idle", "an empty stop marks nothing");
+    assert_eq!(row.last_event.as_deref(), Some("stop"));
+    assert_eq!(capture_events(&svc, &uri("ee1")), events, "nothing written");
+
+    let a = send(&svc, q("ee1", t.len(), "session-end"), b"").await;
+    assert_eq!(
+        (a.next_offset, a.turns_stored, a.chunks_stored),
+        (t.len(), 0, 0)
+    );
+    let row = state_of(&svc, &uri("ee1")).unwrap();
+    assert!(row.ended, "the empty session end ends the source");
+    assert_eq!(row.byte_offset, t.len());
+    assert_eq!(row.last_event.as_deref(), Some("session-end"));
+    // No Jev judge is set, so the distill worker may already have moved it on to wait for one.
+    assert!(
+        matches!(row.distill_state.as_str(), "due" | "waiting_judge"),
+        "marked due: {}",
+        row.distill_state
+    );
+    assert_eq!(chunks_holding(&svc, "said before the end is settled"), 1);
 }
 
 /// A pass that waits (the project's rules are unknown) records no gap, even from beyond the
@@ -2793,6 +2886,143 @@ async fn a_stale_session_is_ended_by_the_sweep() {
     assert_eq!(state_of(&svc, &uri("st")).unwrap().byte_offset, t.len());
     let st = svc.capture_status().await.unwrap();
     assert!(st.sessions.iter().any(|s| s.uri == uri("st") && s.ended));
+}
+
+/// Stops `svc` (as a crash between two writes would leave it), runs `sql` on its database, and
+/// starts a local daemon again in `home`.
+async fn restart_local(svc: Arc<Service>, home: &Path, sql: &str) -> Arc<Service> {
+    let s = svc.clone();
+    tokio::task::spawn_blocking(move || s.shutdown())
+        .await
+        .unwrap();
+    drop(svc);
+    {
+        let c = rusqlite::Connection::open(AliceHome::new(home.to_path_buf()).db()).unwrap();
+        c.execute_batch(sql).unwrap();
+    }
+    start_with(home, local_options())
+}
+
+fn hours_ago(hours: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::hours(hours))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// `capture_state` rows of the sessions `sessions` (by session id) last captured `hours` ago.
+fn captured_hours_ago(sessions: &[&str], hours: i64) -> String {
+    let ids: Vec<String> = sessions.iter().map(|s| format!("'{s}'")).collect();
+    format!(
+        "UPDATE capture_state SET last_capture_at = '{0}', created_at = '{0}'
+         WHERE session_id IN ({1});",
+        hours_ago(hours),
+        ids.join(", ")
+    )
+}
+
+/// Merge fix round 1: a local source the sweep cannot read because it has no transcript path (an
+/// upload on a local daemon, plan decision P8) is ended by the sweep once nothing was captured for
+/// `capture_stale` (24 hours). There is no final pass, so the cursor stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweep_ends_a_source_with_no_path_once_stale() {
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path().join("home");
+    let svc = start_with(&home, local_options());
+    let repo = d.path().join("np-repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut t = Transcript::default();
+    t.turn("np1", 1, "uploaded to a local daemon");
+    send(
+        &svc,
+        TranscriptQuery {
+            cwd: Some(repo.to_string_lossy().into_owned()),
+            ..q("np1", 0, "stop")
+        },
+        &t.bytes,
+    )
+    .await;
+    let row = state_of(&svc, &uri("np1")).unwrap();
+    assert!(row.transcript_path.is_none() && !row.ended);
+
+    let svc = restart_local(svc, &home, &captured_hours_ago(&["np1"], 30)).await;
+    until("the sweep ends the source with no path", || {
+        state_of(&svc, &uri("np1")).unwrap().ended
+    })
+    .await;
+    assert_eq!(state_of(&svc, &uri("np1")).unwrap().byte_offset, t.len());
+    assert_eq!(passes(&svc), 0, "no pass: there is no file to read");
+}
+
+/// Merge fix round 1: a local source whose transcript is gone (deleted, or its path no longer a
+/// regular file) is ended by the sweep once its last capture is a day old.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweep_ends_a_source_whose_file_is_gone_once_stale() {
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path().join("home");
+    let svc = start_with(&home, local_options());
+    let mut ends = Vec::new();
+    for s in ["gn1", "gd1"] {
+        let path = d.path().join(format!("{s}.jsonl"));
+        let mut t = Transcript::default();
+        t.turn(s, 1, "captured before the file went");
+        std::fs::write(&path, &t.bytes).unwrap();
+        svc.capture_notify(notify(s, &path, "stop")).await.unwrap();
+        until("the turn is captured", || {
+            state_of(&svc, &uri(s)).is_some_and(|r| r.byte_offset == t.len())
+        })
+        .await;
+        ends.push(t.len());
+    }
+    // gn1's file is deleted; gd1's path now names a directory.
+    std::fs::remove_file(d.path().join("gn1.jsonl")).unwrap();
+    std::fs::remove_file(d.path().join("gd1.jsonl")).unwrap();
+    std::fs::create_dir(d.path().join("gd1.jsonl")).unwrap();
+
+    let svc = restart_local(svc, &home, &captured_hours_ago(&["gn1", "gd1"], 30)).await;
+    until("the sweep ends both sources", || {
+        ["gn1", "gd1"]
+            .iter()
+            .all(|s| state_of(&svc, &uri(s)).unwrap().ended)
+    })
+    .await;
+    for (s, end) in ["gn1", "gd1"].iter().zip(ends) {
+        assert_eq!(state_of(&svc, &uri(s)).unwrap().byte_offset, end, "{s}");
+    }
+}
+
+/// Merge fix round 1: a source whose file is gone but whose last capture is an hour old stays
+/// open: the end waits for `capture_stale`. A day-old one, seen by the same sweep, is ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_whose_file_is_gone_stays_open_within_a_day() {
+    let d = tempfile::tempdir().unwrap();
+    let home = d.path().join("home");
+    let svc = start_with(&home, local_options());
+    for s in ["gr1", "gc1"] {
+        let path = d.path().join(format!("{s}.jsonl"));
+        let mut t = Transcript::default();
+        t.turn(s, 1, "captured, then deleted");
+        std::fs::write(&path, &t.bytes).unwrap();
+        svc.capture_notify(notify(s, &path, "stop")).await.unwrap();
+        until("the turn is captured", || {
+            state_of(&svc, &uri(s)).is_some_and(|r| r.byte_offset == t.len())
+        })
+        .await;
+        std::fs::remove_file(&path).unwrap();
+    }
+    let sql = format!(
+        "{}{}",
+        captured_hours_ago(&["gr1"], 1),
+        captured_hours_ago(&["gc1"], 30)
+    );
+    let svc = restart_local(svc, &home, &sql).await;
+    until("the day-old source is ended", || {
+        state_of(&svc, &uri("gc1")).unwrap().ended
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !state_of(&svc, &uri("gr1")).unwrap().ended,
+        "an hour-old source stays open"
+    );
 }
 
 /// A pass whose project's rules are unknown (a broken `.alice.toml`) stores nothing and keeps

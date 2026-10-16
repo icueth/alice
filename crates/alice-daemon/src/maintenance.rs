@@ -416,7 +416,8 @@ struct Scratch {
     over_bytes: Option<u64>,
     deleted: usize,
     deleted_other: usize,
-    /// Raw retention: the setting that applied, for the run's event.
+    /// Raw and capture retention: the setting that applied, for the run's event
+    /// (`RawScope::reason`).
     reason: String,
 }
 
@@ -452,6 +453,40 @@ impl RawScope {
         match self {
             RawScope::All => m::oldest_chunks(c, SLICE),
             RawScope::Capture => m::oldest_capture_chunks(c, SLICE),
+        }
+    }
+
+    /// The run's detail when the retention is `forever`.
+    fn forever(self) -> &'static str {
+        match self {
+            RawScope::All => "retention is forever",
+            RawScope::Capture => "capture retention is forever",
+        }
+    }
+
+    /// The run's detail when the retention age does not convert to a cutoff.
+    fn too_large(self) -> &'static str {
+        match self {
+            RawScope::All => "raw_retention is too large to apply; nothing deleted",
+            RawScope::Capture => "capture.raw_retention is too large to apply; nothing deleted",
+        }
+    }
+
+    /// The run's detail when nothing is left to delete, after `deleted` chunks.
+    fn within(self, deleted: usize) -> String {
+        match self {
+            RawScope::All => format!("raw tier within retention; {deleted} chunks deleted"),
+            RawScope::Capture => {
+                format!("captured transcripts within retention; {deleted} chunks deleted")
+            }
+        }
+    }
+
+    /// The setting that applied, as the run's event names it.
+    fn reason(self, retention: Retention) -> String {
+        match self {
+            RawScope::All => retention.to_string(),
+            RawScope::Capture => format!("capture: {retention}"),
         }
     }
 }
@@ -762,30 +797,14 @@ impl Scheduler {
     ) -> Result<Step> {
         // (seq, text bytes) of the chunks to delete in this slice.
         let take: Vec<(i64, u64)> = match retention {
-            Retention::Forever => {
-                return Ok(Step::Finished(
-                    match scope {
-                        RawScope::All => "retention is forever",
-                        RawScope::Capture => "capture retention is forever",
-                    }
-                    .into(),
-                ));
-            }
+            Retention::Forever => return Ok(Step::Finished(scope.forever().into())),
             // Age is the time a chunk was stored in Alice (`created_at`), never the
             // time it says it was written.
             Retention::Age(age) => {
                 // An age that does not convert (the settings refuse anything over 100
                 // years, but a stale value must never turn into zero): delete nothing.
                 let Some(since) = age_cutoff(now, age) else {
-                    return Ok(Step::Finished(
-                        match scope {
-                            RawScope::All => "raw_retention is too large to apply; nothing deleted",
-                            RawScope::Capture => {
-                                "capture.raw_retention is too large to apply; nothing deleted"
-                            }
-                        }
-                        .into(),
-                    ));
+                    return Ok(Step::Finished(scope.too_large().into()));
                 };
                 let cutoff = since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 self.ctx
@@ -820,20 +839,9 @@ impl Scheduler {
             }
         };
         if take.is_empty() {
-            return Ok(Step::Finished(match scope {
-                RawScope::All => {
-                    format!("raw tier within retention; {} chunks deleted", sc.deleted)
-                }
-                RawScope::Capture => format!(
-                    "captured transcripts within retention; {} chunks deleted",
-                    sc.deleted
-                ),
-            }));
+            return Ok(Step::Finished(scope.within(sc.deleted)));
         }
-        sc.reason = match scope {
-            RawScope::All => retention.to_string(),
-            RawScope::Capture => format!("capture: {retention}"),
-        };
+        sc.reason = scope.reason(retention);
         let seqs: Vec<i64> = take.iter().map(|(seq, _)| *seq).collect();
         let WriteOutcome::Purged(done) = self
             .ctx
@@ -1977,8 +1985,9 @@ mod tests {
 
     impl Rig {
         /// A transcript source of `session` (type `session`). `capture`: a capture source (uri
-        /// `claude-code:session:<session>`, with its `capture_state` row); otherwise an imported
-        /// transcript (a `file://` uri, no capture state).
+        /// `claude-code:session:<session>`, with its `capture_state` row, stamped now and moved
+        /// back to its oldest chunk by `transcript_chunks`); otherwise an imported transcript (a
+        /// `file://` uri, no capture state).
         fn transcript_source(
             &self,
             c: &rusqlite::Connection,
@@ -1998,10 +2007,11 @@ mod tests {
             )
             .unwrap();
             if capture {
+                let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 c.execute(
                     "INSERT INTO capture_state (source_id, agent, session_id, created_at)
-                     VALUES (?1, 'claude-code', ?2, '2026-01-01T00:00:00.000Z')",
-                    params![id, session],
+                     VALUES (?1, 'claude-code', ?2, ?3)",
+                    params![id, session, now],
                 )
                 .unwrap();
             }
@@ -2009,7 +2019,10 @@ mod tests {
 
         /// Chunks `ords` of `source`, stored `days` ago, of `bytes` bytes of text each, each with
         /// a vector (stored and in the index); for a capture source also each turn's key and the
-        /// cursor past it, as capture records them. Returns their seqs.
+        /// cursor past it, as capture records them, and a state no newer than its oldest chunk
+        /// (the writer stores a source's first chunks moments before it creates the state; here
+        /// they are as old as each other, well within the age walk's day of margin). Returns
+        /// their seqs.
         fn transcript_chunks(
             &self,
             c: &rusqlite::Connection,
@@ -2047,9 +2060,10 @@ mod tests {
                 )
                 .unwrap();
                 c.execute(
-                    "UPDATE capture_state SET next_ord = ?2, byte_offset = byte_offset + ?3
+                    "UPDATE capture_state SET next_ord = ?2, byte_offset = byte_offset + ?3,
+                        created_at = min(created_at, ?4)
                      WHERE source_id = ?1",
-                    params![source, ord + 1, bytes as i64],
+                    params![source, ord + 1, bytes as i64, created],
                 )
                 .unwrap();
                 seqs.push(seq);
@@ -2159,6 +2173,45 @@ mod tests {
             r.count("SELECT count(*) FROM events WHERE action = 'raw.retention'"),
             1
         );
+    }
+
+    /// The age walk starts a day before the first capture (the oldest `capture_state`): imported
+    /// chunks stored before that are skipped, a captured chunk just past the cutoff (and as old as
+    /// its state) still goes, and one just inside the cutoff stays.
+    #[test]
+    fn capture_retention_by_age_starts_at_the_first_capture() {
+        let r = rig_with("[capture]\nraw_retention = \"180d\"\n");
+        let c = r.sql();
+        r.transcript_source(&c, "IMP", "imported-session", false);
+        r.transcript_source(&c, "CAP", "captured-session", true);
+        let imported = r.transcript_chunks(&c, "IMP", 0..3, 400, 40);
+        r.transcript_chunks(&c, "CAP", 0..1, 181, 40);
+        let kept = r.transcript_chunks(&c, "CAP", 1..2, 179, 40);
+        let first: String = c
+            .query_row("SELECT min(created_at) FROM capture_state", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let oldest: (String, String) = c
+            .query_row(
+                "SELECT (SELECT min(created_at) FROM chunks WHERE source_id = 'CAP'),
+                        (SELECT max(created_at) FROM chunks WHERE source_id = 'IMP')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first, oldest.0, "the state is as old as its oldest chunk");
+        assert!(
+            oldest.1 < first,
+            "the imported chunks are older than any capture"
+        );
+        let report = r
+            .sched
+            .run_job(Job::CaptureRetention, chrono::Utc::now(), true);
+        assert_eq!(report.outcome, JobOutcome::Done, "{report:?}");
+        assert_eq!(r.chunk_seqs("CAP"), kept, "the chunk past the cutoff goes");
+        assert_eq!(r.chunk_seqs("IMP"), imported);
+        assert_eq!(r.retention_event()["deleted"], 1);
     }
 
     /// §3.5: the old chunks of a live session go, while its cursor (`capture_state`, newer chunks
