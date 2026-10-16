@@ -95,6 +95,30 @@ enum Command {
     Bench(cmd::BenchArgs),
 }
 
+/// Libraries under the MCP and HTTP layers that log whole requests at debug (an MCP call's
+/// arguments, before any redaction): kept at info unless `ALICE_LOG` names them.
+const QUIET_TARGETS: [&str; 4] = ["rmcp", "hyper", "h2", "reqwest"];
+
+/// The log filter for `ALICE_LOG` (`spec`), or the default when it is unset or invalid. A plain
+/// `debug` or `trace` does not reach [`QUIET_TARGETS`] (final review A-m4); `rmcp=debug` does.
+fn log_filter(spec: Option<&str>, is_server: bool) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    let Some(f) = spec.and_then(|s| EnvFilter::try_new(s).ok()) else {
+        return EnvFilter::new(if is_server { "info" } else { "warn" });
+    };
+    let spec = spec.unwrap_or_default().to_ascii_lowercase();
+    if !(spec.contains("debug") || spec.contains("trace")) {
+        return f;
+    }
+    let named = |t: &str| spec.split(',').any(|d| d.trim().starts_with(t));
+    QUIET_TARGETS
+        .into_iter()
+        .filter(|t| !named(t))
+        .fold(f, |f, t| {
+            f.add_directive(format!("{t}=info").parse().expect("a valid directive"))
+        })
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     alice_daemon::install_tls();
@@ -104,9 +128,7 @@ fn main() -> std::process::ExitCode {
     );
     // Logs go to stderr: on stdio MCP, stdout is the protocol channel. The daemon's stderr is
     // its log file, so colours only when a person watches.
-    let filter = tracing_subscriber::EnvFilter::try_from_env("ALICE_LOG").unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(if is_server { "info" } else { "warn" })
-    });
+    let filter = log_filter(std::env::var("ALICE_LOG").ok().as_deref(), is_server);
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -122,5 +144,30 @@ fn main() -> std::process::ExitCode {
             eprintln!("alice: {e:#}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Final review A-m4: `ALICE_LOG=debug` never writes an MCP call's arguments (rmcp logs the
+    /// request at debug); naming the target still turns it on.
+    #[test]
+    fn a_plain_debug_log_keeps_the_request_logging_libraries_at_info() {
+        let f = log_filter(Some("debug"), true).to_string();
+        for t in QUIET_TARGETS {
+            assert!(f.contains(&format!("{t}=info")), "{f}");
+        }
+        let f = log_filter(Some("debug,rmcp=debug"), true).to_string();
+        assert!(f.contains("rmcp=debug") && !f.contains("rmcp=info"), "{f}");
+        assert!(
+            !log_filter(Some("alice_daemon=debug,warn"), true)
+                .to_string()
+                .contains("alice_daemon=info")
+        );
+        assert_eq!(log_filter(Some("warn"), true).to_string(), "warn");
+        assert_eq!(log_filter(None, true).to_string(), "info");
+        assert_eq!(log_filter(Some("not a [filter"), false).to_string(), "warn");
     }
 }
