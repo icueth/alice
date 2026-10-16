@@ -213,6 +213,7 @@ pub fn prune_events(conn: &Connection, before_ts: &str, limit: usize) -> Result<
         "DELETE FROM project_merge_rows WHERE merge_id NOT IN (
            SELECT json_extract(after_json, '$.merge_id') FROM events
             WHERE target_type = 'project' AND action = 'project.merge'
+              AND json_valid(after_json)
               AND json_extract(after_json, '$.merge_id') IS NOT NULL)",
         [],
     )?;
