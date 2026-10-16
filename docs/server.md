@@ -23,14 +23,29 @@ A tenant cannot reach the admin's network. The service unit allows only the publ
 ### Requirements
 
 - A Linux server with systemd, root access, and `caddy` installed.
-- An **x86-64 CPU with AVX2.** The embedding runtime stops with "Illegal instruction" without it. `alice-server` checks for AVX and AVX2 before `add` and before `upgrade`, and refuses to go on if they are missing.
-- On Proxmox, set the VM's CPU type to `host` (or `x86-64-v3`). Then shut the VM down and start it again. A reboot from inside the guest does not apply a CPU type change. Proxmox's default "QEMU Virtual CPU" has no AVX.
+- An **x86-64 CPU with AVX** (AVX2 is not needed). The embedding runtime stops with "Illegal instruction" without it. `alice-server` checks for AVX before `add` and before `upgrade`, and refuses to go on if it is missing. Before it installs a binary, `upgrade` also has it embed a test text (see [upgrade](#upgrade)), so a runtime this CPU cannot run is never switched in.
+- On Proxmox, set the VM's CPU type to `host`. Then shut the VM down and start it again. A reboot from inside the guest does not apply a CPU type change. Proxmox's default "QEMU Virtual CPU" has no AVX.
+- Build the server binary on the server with `deploy/server/build-release` (below). A plain `cargo build` links an ONNX Runtime that needs AVX2.
+- Speed: on 4 vCPUs of a Xeon E5-2620 (2012, AVX without AVX2) Alice embeds about 5.5 chunks a second, so importing a palace of 121,000 chunks takes about 6 hours. While an import embeds, the other tenants share the CPU with it.
 - Memory: each tenant daemon is capped at 3 GB (`MemoryMax=3G`); the measured use is about 800 MB. Disk: see [Disk budget](#disk-budget).
 
 ### One-time setup
 
-1. Build or copy the `alice` binary to `/usr/local/bin/alice`.
-2. Install the script `deploy/server/alice-server` as `/usr/local/sbin/alice-server`.
+1. Install the script `deploy/server/alice-server` as `/usr/local/sbin/alice-server`.
+2. As the admin user (not root), in a checkout of the repository, build the binary:
+
+   ```
+   deploy/server/build-release
+   ```
+
+   It downloads Microsoft's ONNX Runtime 1.24.4 for Linux x86-64 once (checked against a pinned SHA-256), builds `alice` linked to it, and leaves `target/server-dist/bin/alice` with the library in `target/server-dist/lib/alice`. Then install both:
+
+   ```
+   sudo alice-server upgrade target/server-dist/bin/alice
+   ```
+
+   `upgrade` is also the first install. It puts the binary in `/usr/local/bin/alice` and the library in `/usr/local/lib/alice`, where the binary finds it by itself.
+
 3. Write the public host to `/etc/alice/server.env`:
 
    ```
@@ -102,7 +117,7 @@ free: 19.0 GB on /; remove archives: 0 MB
 
 #### upgrade
 
-`alice-server upgrade <binary>` checks that the new binary runs, keeps the current one as `/usr/local/bin/alice.prev`, installs the new one, restarts every tenant and waits for each to answer. If any tenant does not come back, it restores the previous binary, restarts everything again and exits with an error that names the tenants that failed. It prints the free space first, because a schema migration copies each tenant's database once.
+`alice-server upgrade <binary>` checks that the new binary runs, then runs its self-test: `alice model check` in a throwaway home under `/tmp` loads the embedding model and embeds one text. The model is kept in `/var/cache/alice-server/models` (about 136 MB, downloaded the first time). If the self-test dies (an "Illegal instruction" is named as such), fails or takes longer than 5 minutes, nothing is installed. Otherwise it keeps the current binary as `/usr/local/bin/alice.prev` and the current ONNX Runtime as `/usr/local/lib/alice/libonnxruntime.so.1.prev`, installs the new ones (the library when the binary comes from `build-release`, from `../lib/alice` beside it), and self-tests the installed binary. Then it restarts every tenant and waits for each to answer. If the installed binary fails its self-test, or any tenant does not come back, it restores the previous binary and library, restarts everything again and exits with an error (naming the tenants that failed). It prints the free space before the restarts, because a schema migration copies each tenant's database once. On a server with no binary yet it is the first install.
 
 #### import
 
@@ -314,7 +329,9 @@ Give your palace folder to your admin. The admin runs `alice-server import` (see
 
 | What you see | Meaning | What to do |
 |---|---|---|
-| `alice-server: this CPU lacks AVX/AVX2` | The VM's CPU type has no AVX2 | Set the CPU type to `host` or `x86-64-v3`, shut the VM down, start it again |
+| `alice-server: this CPU lacks AVX` | The VM's CPU type has no AVX | Set the CPU type to `host`, shut the VM down, start it again |
+| `the new binary failed its self-test (killed by SIGILL: …)` | This binary's ONNX Runtime needs instructions the CPU lacks; nothing was installed | Build it with `deploy/server/build-release` on the server; a plain `cargo build` needs AVX2 |
+| `the new binary failed its self-test (exit …; last output: …)` | It could not load or run the model (often no network for the first model download) | Read the last output; check that the server reaches huggingface.co, then run `upgrade` again |
 | `write ALICE_PUBLIC_HOST=<the server's public IP or name> to /etc/alice/server.env first` | `/etc/alice/server.env` does not exist | Create it with `ALICE_PUBLIC_HOST=<host>` |
 | `ALICE_PUBLIC_HOST is empty in /etc/alice/server.env` | The file exists but the host is empty | Write `ALICE_PUBLIC_HOST=<host>` to it |
 | HTTP 401 from the MCP URL | The token is wrong or was rotated | Check `ALICE_TOKEN`; ask the admin for a new token |

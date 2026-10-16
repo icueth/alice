@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# build-release - build the server's `alice` linked to Microsoft's official ONNX Runtime for Linux x86-64.
+# The ONNX Runtime that ort downloads by default is built for AVX2 and dies with "Illegal instruction" on older CPUs;
+# Microsoft's release picks its SIMD kernels at run time. Run it as the admin user (not root) in a checkout of the
+# repository; install the result with `sudo alice-server upgrade <dist>/bin/alice`, which self-tests it first.
+# Spec: docs/superpowers/specs/2026-10-15-alice-server-mode-design.md section 2.11. Local and macOS builds are unchanged.
+set -euo pipefail
+umask 022
+
+# Matches ort's `api-24`. The SHA-256 is the one GitHub publishes for the release asset; the download is checked
+# against it before it is unpacked.
+ORT_VERSION=1.24.4
+ORT_SHA256=3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747
+ORT_NAME="onnxruntime-linux-x64-$ORT_VERSION"
+ORT_URL="https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/$ORT_NAME.tgz"
+
+die() { printf 'build-release: %s\n' "$*" >&2; exit 1; }
+
+REPO="$(cd "$(dirname "$0")/../.." && pwd -P)"
+CACHE="${ALICE_ORT_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/alice-ort}"
+TARGET="${CARGO_TARGET_DIR:-$REPO/target}"
+DIST="$TARGET/server-dist"
+: "${REPO:?}" "${CACHE:?}" "${TARGET:?}" "${DIST:?}"
+
+[ "$(id -u)" != 0 ] || die "run this as the admin user, not root (sudo is only for alice-server upgrade)"
+[ "$(uname -s)/$(uname -m)" = Linux/x86_64 ] || die "this builds the Linux x86-64 server binary; build elsewhere with cargo as usual"
+command -v cargo >/dev/null || die "cargo was not found; install Rust with rustup first"
+
+mkdir -p -- "$CACHE"
+tgz="$CACHE/$ORT_NAME.tgz"
+if [ ! -f "$tgz" ]; then
+  curl -fsSL --retry 3 -o "$tgz.part" "$ORT_URL" || die "could not download $ORT_URL"
+  mv -- "$tgz.part" "$tgz"
+fi
+if ! printf '%s  %s\n' "$ORT_SHA256" "$tgz" | sha256sum -c --status -; then
+  rm -f -- "${tgz:?}"
+  die "$ORT_NAME.tgz does not match its pinned SHA-256; it was deleted (run again to download it again)"
+fi
+rm -rf -- "${CACHE:?}/${ORT_NAME:?}"
+tar -xzf "$tgz" -C "$CACHE"
+lib="$CACHE/$ORT_NAME/lib"
+[ -f "$lib/libonnxruntime.so.$ORT_VERSION" ] || die "$tgz has no lib/libonnxruntime.so.$ORT_VERSION"
+
+# ort links this library instead of downloading its own, dynamically; the binary looks for it in ../lib/alice next to
+# itself ($ORIGIN is for the dynamic loader, not the shell), so neither the units nor a shell need LD_LIBRARY_PATH.
+cd -- "$REPO"
+# shellcheck disable=SC2016
+ORT_LIB_LOCATION="$lib" ORT_PREFER_DYNAMIC_LINK=1 RUSTFLAGS='-C link-arg=-Wl,-rpath,$ORIGIN/../lib/alice' \
+  nice -n 10 cargo build --release --locked -p alice-memory
+
+rm -rf -- "${DIST:?}"
+install -d -m 0755 "$DIST/bin" "$DIST/lib/alice"
+install -m 0755 "$TARGET/release/alice" "$DIST/bin/alice"
+install -m 0644 "$lib/libonnxruntime.so.$ORT_VERSION" "$DIST/lib/alice/libonnxruntime.so.1"
+printf 'built %s with ONNX Runtime %s (%s)\n' "$DIST/bin/alice" "$ORT_VERSION" "$DIST/lib/alice/libonnxruntime.so.1"
+printf 'install it: sudo alice-server upgrade %s\n' "$DIST/bin/alice"

@@ -206,7 +206,7 @@ alice daemon start | stop | status | logs | run
 alice token rotate [--show]
 alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # stdio MCP server for agents
-alice model fetch
+alice model fetch | check      # check: load the model and embed one text (no daemon)
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 alice import mempalace [--palace dir] [--dry-run] [--since date] [--map-wing wing=project]...
                        [--collection name] [--allow-remote-embedding]
@@ -423,7 +423,7 @@ M1 missed the memory budget (about 1.4 GB projected with the model). M2 meets it
 
 ## Use Alice from a server
 
-A small team can share one Linux server. Each person gets their own Alice daemon behind `https://<host>/u/<name>`, and agents (Claude Code, Codex and others) connect straight to the MCP endpoint `https://<host>/u/<name>/mcp` with a bearer token. No client binary is needed, so this also works on Windows. An optional shared team memory lets a person tell their agent "save this to the shared memory"; every team member can read it, and only its author or the admin can change it. The server's admin can read every person's memory, and a repository's `.alice.toml` does not apply over direct MCP. The server needs an x86-64 CPU with AVX2.
+A small team can share one Linux server. Each person gets their own Alice daemon behind `https://<host>/u/<name>`, and agents (Claude Code, Codex and others) connect straight to the MCP endpoint `https://<host>/u/<name>/mcp` with a bearer token. No client binary is needed, so this also works on Windows. An optional shared team memory lets a person tell their agent "save this to the shared memory"; every team member can read it, and only its author or the admin can change it. The server's admin can read every person's memory, and a repository's `.alice.toml` does not apply over direct MCP. The server needs an x86-64 CPU with AVX (AVX2 is not needed: `deploy/server/build-release` builds the server binary with Microsoft's ONNX Runtime).
 
 The admin guide (setup, `alice-server`, disk budget, backups, privacy) and the setup for each agent are in [docs/server.md](docs/server.md).
 

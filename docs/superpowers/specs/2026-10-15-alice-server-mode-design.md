@@ -7,7 +7,8 @@
   a client-made bundle, a fixed disk) folded in, with `feat/m3-import` 3dbfa31 merged; **addendum 2** (the owner,
   2026-10-15 20:30: no Windows, the team goes through the server's MCP endpoint) folded in. Where addendum 2 changes an
   earlier section, that section says so; §2.8 and §2.9 hold the new design. **Addendum 3** (the owner: shared team
-  memory) folded in; §2.10 holds it.
+  memory) folded in; §2.10 holds it. **The server's CPU has AVX but not AVX2** (controller, 2026-10-16): server builds link
+  Microsoft's ONNX Runtime and `alice-server` self-tests every binary before it switches a unit; §2.11 holds it.
 - **Owner:** icueth (vision); technical choices delegated to this lane
 - **Lane:** server mode, worktree `project-alice-srv`, branch `feat/server-mode` (from `feat/m2-judge-settings` b28b99f)
 - **Builds on:** `2026-10-13-alice-core-design.md` (the core spec), the M2 handoff `docs/superpowers/handoff/2026-10-14-m2-handoff.md`
@@ -400,12 +401,16 @@ One row per tenant: name, port, unit state, the version the ping reports, URL an
 last line with the free space on the disk that holds `/srv/alice`, and the size of the `remove` archives in
 `/srv/alice/backups`. It prints a warning line when less than 3 GB is free (§2.7). No token.
 
-**`upgrade <binary>`**
-1. Checks that `<binary> --version` runs.
-2. Copies the current binary to `alice.prev`. Installs the new one through a temporary file and `mv`.
-3. Restarts every `alice@*` unit and waits up to 120 s for each ping.
-4. If any tenant fails to come back: restores `alice.prev`, restarts everything again, and exits non-zero with the names that
-   failed.
+**`upgrade <binary>`** (also the first install; §2.11)
+1. Checks the CPU flags for AVX, and that `<binary> --version` runs.
+2. Self-tests `<binary>` where it stands (§2.11). A failure stops here and changes nothing.
+3. Copies the current binary to `alice.prev` and, when `<binary>/../../lib/alice/libonnxruntime.so.1` exists (a
+   `build-release` build), the current library to `libonnxruntime.so.1.prev`. Installs the new ones through temporary files
+   and `mv`, into `/usr/local/bin` and `/usr/local/lib/alice`.
+4. Self-tests the installed binary, as the units will run it. A failure restores both and stops, before any unit restarts.
+5. Restarts every `alice@*` unit and waits up to 120 s for each ping.
+6. If any tenant fails to come back: restores the binary and the library, restarts everything again, and exits non-zero with
+   the names that failed.
 
 ### 2.6 Jev per tenant
 
@@ -603,6 +608,34 @@ project** (`cloud_ok`, R35).
 
 **Out of scope (v1):** sharing knowledge-graph facts directly (the team daemon's own judge derives facts from its
 memories), per-person tokens on the team store, partial teams, and a spool for shared writes.
+
+### 2.11 ONNX Runtime on a CPU without AVX2 (controller, 2026-10-16)
+
+The server's CPU is a Xeon E5-2620 (Sandy Bridge): AVX, no AVX2, FMA or F16C, whatever the VM's CPU type. ort's default
+`download-binaries` ONNX Runtime (pyke's build) has an AVX2 baseline, so the daemon dies there.
+
+- **Server builds link Microsoft's official ONNX Runtime** for Linux x86-64, at a pinned version that matches ort's `api-24`
+  (1.24.4) and a pinned SHA-256, checked before the tarball is unpacked. `deploy/server/build-release`, run as the admin user
+  in a checkout, downloads it once into `~/.cache/alice-ort`, builds `alice-memory` with `ORT_LIB_LOCATION=<its lib>` and
+  `ORT_PREFER_DYNAMIC_LINK=1` (ort then links it dynamically instead of downloading its own), and sets the binary's rpath to
+  `$ORIGIN/../lib/alice`. It lays the result out as `target/server-dist/bin/alice` and
+  `target/server-dist/lib/alice/libonnxruntime.so.1`. Microsoft's build chooses its SIMD kernels at run time. No unit and no
+  shell needs `LD_LIBRARY_PATH`: the installed `/usr/local/bin/alice` finds `/usr/local/lib/alice/libonnxruntime.so.1`, and
+  the built one finds the library beside it. macOS and local builds keep pyke's binaries; the only product change is the `alice model check` command below.
+- **The preflight checks what the shipped runtime needs.** `add` and `upgrade` refuse a CPU without `avx` (a whole word on
+  the `flags` line) with "this CPU lacks AVX, which Alice's embedding runtime needs (it would die with 'Illegal
+  instruction'); on Proxmox set the VM's CPU type to host, then shut the VM down and start it again (a reboot from inside
+  the guest does not apply a CPU type change)". AVX2 is no longer required.
+- **A real self-test** proves it before any unit is switched: `alice model check` (new; it loads the local model and
+  embeds one short text, no daemon) runs with `ALICE_HOME` set to a throwaway directory under `/tmp`, whose `models` points at
+  `/var/cache/alice-server/models` (fetched by the binary the first time, about 136 MB, and checked on every run). Each step
+  has `timeout 300`. A non-zero exit, a signal (SIGILL is named as "this CPU cannot run its ONNX Runtime") or the timeout
+  refuses the step. `upgrade` runs it on the new binary before it installs anything, and again on the installed pair before
+  it restarts a unit.
+- **Measured on the server** (2026-10-16, a throwaway `ALICE_HOME` under `/tmp`): daemon start, `remember`, a `recall` that
+  finds it by vector and words, `alice doctor` clean. Embedding throughput with chunks shaped like the M3 fixture palace's
+  (750 characters on average): **5.5 chunks per second** on the 4 vCPUs, so a 121,000-chunk palace takes **about 6 hours** to
+  embed. The daemon uses up to 4 ONNX threads, so an import competes with the other tenants for the CPU while it runs.
 
 ## 3. Client remote mode (deferred by addendum 2)
 
@@ -1108,7 +1141,13 @@ the tests cover the following.
   - `list` prints the free disk and the archive size;
   - `remove` archives before it deletes;
   - `upgrade` rolls back when a stubbed ping fails;
-  - a bad name is refused.
+  - a bad name is refused;
+  - (§2.11) a CPU with `avx` and no `avx2` passes the flag check, one without `avx` is refused before any change (`add` and
+    `upgrade`); a self-test that dies of SIGILL, exits non-zero or times out refuses the upgrade and changes nothing; the
+    installed pair failing its self-test restores the binary and the library before any restart; a failed ping restores
+    both; `upgrade` is also the first install and a failed first install leaves nothing behind;
+  - (§2.11) `build-release` refuses a download that fails its SHA-256 (deleted, never unpacked), and links the pinned
+    runtime with the rpath and the dist layout above (stubbed `curl`, `cargo`, `sha256sum` and `uname`).
 
 ### 8.3 Deployment task (the only time the server is touched)
 
@@ -1211,6 +1250,8 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R35 | (Revised by the controller.) In precise mode, the person's judge grades the merged top **including team hits the team store marked `cloud_ok`**: the team store's own cloud policy for that hit's project, fail-closed. Team hits not `cloud_ok` follow the graded hits, by fusion score | Grading shared knowledge keeps precise mode's quality; the team store's mark keeps its cloud policy in force (addendum 3 rule 6) | A team store that allows the cloud for a project lets its texts reach a person's judge, which is that policy's meaning |
 | R36 | Team hits are deduplicated against personal hits by the content hash of title plus snippet | `Hit` carries no content hash and snippets are deterministic; no search change | Two memories with the same title and snippet start but different bodies collapse into one (rare) |
 | R37 | `context` appends a "Team memory" section within a third of the budget | Keeps the person's own briefing first | A large team context is cut harder than the personal one |
+| R38 | Server builds link **Microsoft's ONNX Runtime 1.24.4** dynamically (pinned SHA-256), with the binary's rpath at `$ORIGIN/../lib/alice` (controller's ruling; §2.11) | The server's CPU has no AVX2; Microsoft's build dispatches its kernels at run time. An rpath needs no environment in the units or the admin's shell | A future ort release that needs a newer ONNX Runtime API means a new pin; the library must travel with the binary (`upgrade` installs both) |
+| R39 | `upgrade` **self-tests** the new binary (`alice model check` in a throwaway home) before it installs anything, and the installed pair before it restarts a unit | `--version` runs even where the runtime cannot; only embedding a text proves it | About 2 to 5 s per self-test, plus a 136 MB model fetched once into `/var/cache/alice-server/models` |
 
 ---
 

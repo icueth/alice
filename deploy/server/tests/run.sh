@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for deploy/server/alice-server. Every system command (useradd, systemctl, caddy, ...) is a stub
+# Tests for deploy/server/alice-server and deploy/server/build-release. Every system command (useradd, systemctl, caddy, ...) is a stub
 # on PATH, and ALICE_SERVER_ROOT points every written path into a temporary directory.
 # Run: bash deploy/server/tests/run.sh
 set -euo pipefail
@@ -85,6 +85,13 @@ EOF
 stub flock <<'EOF'
 exit 0
 EOF
+# GNU timeout: TIMEOUT_EXPIRES=1 makes the wrapped command run out of time (exit 124).
+stub timeout <<'EOF'
+echo "timeout $*" >>"$ALICE_SERVER_ROOT/calls.log"
+[ -z "${TIMEOUT_EXPIRES:-}" ] || exit 124
+shift
+exec "$@"
+EOF
 stub df <<'EOF'
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
 printf '/dev/stub 28000000 8000000 %s 30%% /\n' "${FREE_KB:-20000000}"
@@ -95,6 +102,18 @@ cat >"$R/usr/local/bin/alice" <<'EOF'
 echo "alice $* ALICE_HOME=${ALICE_HOME:-}" >>"$ALICE_SERVER_ROOT/calls.log"
 case "$*" in
   "--version") echo "alice 0.1.0" ;;
+  "model fetch") mkdir -p "$ALICE_HOME/models/test-model" ;;
+  "model check")
+    # SELFTEST=sigill|fail breaks every binary; SELFTEST_INSTALLED=fail only the installed one.
+    if [ "$0" = "$ALICE_SERVER_ROOT/usr/local/bin/alice" ] && [ -n "${SELFTEST_INSTALLED:-}" ]; then
+      echo "the model could not be loaded" >&2; exit 1
+    fi
+    case "${SELFTEST:-ok}" in
+      sigill) kill -ILL $$ ;;
+      fail) echo "the model could not be loaded" >&2; exit 1 ;;
+    esac
+    echo "ok: test-model embedded a test text (384 dimensions) in 5 ms"
+    ;;
   "token rotate --show")
     n=$(($(cat "$ALICE_SERVER_ROOT/rotn" 2>/dev/null || echo 0) + 1))
     echo "$n" >"$ALICE_SERVER_ROOT/rotn"
@@ -476,22 +495,22 @@ is_0600() { [ -n "$(find "$1" -maxdepth 0 -perm 600)" ]; }
 team_port() { sed -n 's/^ALICE_SERVER_PORT=//p' "$TENANTS/team.env"; }
 PERSONAL="ann bob dave"
 
-add_refuses_a_cpu_without_avx2() {
+add_refuses_a_cpu_without_avx() {
   local before
   cp "$R/proc/cpuinfo" "$T/cpuinfo.good"
-  # avx is present, avx2 is not (avx512f must not count as either)
-  printf 'processor\t: 0\nflags\t\t: fpu sse4_2 avx avx512f\n' >"$R/proc/cpuinfo"
+  # avx2 and avx512f are there, avx is not: neither counts as avx
+  printf 'processor\t: 0\nflags\t\t: fpu sse4_2 avx2 avx512f\n' >"$R/proc/cpuinfo"
   before=$(wc -l <"$R/calls.log")
   run add zoe
   cp "$T/cpuinfo.good" "$R/proc/cpuinfo"
-  [ "$RC" != 0 ] || fail "add succeeded on a CPU without AVX2"
-  printf '%s\n' "$OUT" | grep -qF "this CPU lacks AVX/AVX2, which Alice's embedding runtime needs (it would die with 'Illegal instruction'); on Proxmox set the VM's CPU type to host (or x86-64-v3), then shut the VM down and start it again (a reboot from inside the guest does not apply a CPU type change)" || fail "no CPU message: $OUT"
+  [ "$RC" != 0 ] || fail "add succeeded on a CPU without AVX"
+  printf '%s\n' "$OUT" | grep -qF "this CPU lacks AVX, which Alice's embedding runtime needs (it would die with 'Illegal instruction'); on Proxmox set the VM's CPU type to host, then shut the VM down and start it again (a reboot from inside the guest does not apply a CPU type change)" || fail "no CPU message: $OUT"
   [ "$(wc -l <"$R/calls.log")" = "$before" ] || fail "a command ran before the CPU refusal"
   [ ! -e "$TENANTS/zoe.env" ] || fail "a tenant was created"
   pass
 }
 
-upgrade_refuses_a_cpu_without_avx2() {
+upgrade_refuses_a_cpu_without_avx() {
   local before
   cp "$R/proc/cpuinfo" "$T/cpuinfo.good"
   printf 'processor\t: 0\nflags\t\t: fpu sse4_2 avx2\n' >"$R/proc/cpuinfo"   # avx2 without avx still refuses
@@ -500,9 +519,185 @@ upgrade_refuses_a_cpu_without_avx2() {
   run upgrade "$R/new-alice"
   cp "$T/cpuinfo.good" "$R/proc/cpuinfo"
   [ "$RC" != 0 ] || fail "upgrade succeeded on a CPU without AVX"
-  printf '%s\n' "$OUT" | grep -qF 'this CPU lacks AVX/AVX2' || fail "no CPU message: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'this CPU lacks AVX,' || fail "no CPU message: $OUT"
   [ "$(wc -l <"$R/calls.log")" = "$before" ] || fail "a command ran before the CPU refusal"
   cmp "$T/alice.saved" "$R/usr/local/bin/alice" || fail "the binary changed"
+  pass
+}
+
+LIB="$R/usr/local/lib/alice/libonnxruntime.so.1"
+
+# A server build: bin/alice with its ONNX Runtime in ../lib/alice, as deploy/server/build-release lays it out.
+make_dist() { # dir library-content
+  rm -rf -- "${1:?}"
+  mkdir -p "$1/bin" "$1/lib/alice"
+  { cat "$R/usr/local/bin/alice"; echo "# build $2"; } >"$1/bin/alice"
+  chmod +x "$1/bin/alice"
+  printf '%s\n' "$2" >"$1/lib/alice/libonnxruntime.so.1"
+}
+
+no_selftest_home_left() {
+  [ -z "$(ls -A "$R/tmp" 2>/dev/null)" ] || fail "a self-test home was left: $(ls -A "$R/tmp")"
+}
+
+upgrade_accepts_avx_without_avx2() {
+  cp "$R/proc/cpuinfo" "$T/cpuinfo.good"
+  printf 'processor\t: 0\nflags\t\t: fpu sse4_2 popcnt aes avx\n' >"$R/proc/cpuinfo"   # Sandy Bridge
+  run upgrade "$R/new-alice"
+  cp "$T/cpuinfo.good" "$R/proc/cpuinfo"
+  [ "$RC" = 0 ] || fail "upgrade refused a CPU with AVX and no AVX2: $OUT"
+  cmp "$R/new-alice" "$R/usr/local/bin/alice" || fail "new binary not installed"
+  has "$R/calls.log" 'model check'
+  no_selftest_home_left
+  pass
+}
+
+# Shared by the refusals below: nothing installed, kept or restarted.
+refused_unchanged() { # what
+  [ "$RC" != 0 ] || fail "upgrade succeeded although $1"
+  cmp "$T/alice.saved" "$R/usr/local/bin/alice" || fail "the binary changed"
+  cmp "$T/prev.saved" "$R/usr/local/bin/alice.prev" || fail "alice.prev changed"
+  [ "$(grep -c 'systemctl restart' "$R/calls.log")" = "$RESTARTS" ] || fail "a tenant was restarted"
+  no_selftest_home_left
+}
+
+upgrade_refuses_a_binary_that_fails_its_self_test() {
+  make_dist "$T/dist" "lib v0"
+  cp -p "$R/usr/local/bin/alice" "$T/alice.saved"
+  cp -p "$R/usr/local/bin/alice.prev" "$T/prev.saved"
+  RESTARTS=$(grep -c 'systemctl restart' "$R/calls.log" || true)
+  SELFTEST=sigill run upgrade "$T/dist/bin/alice"
+  refused_unchanged "the self-test died of SIGILL"
+  printf '%s\n' "$OUT" | grep -qF 'failed its self-test (killed by SIGILL: this CPU cannot run its ONNX Runtime' || fail "no SIGILL reason: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'nothing was installed' || fail "$OUT"
+  [ ! -e "$LIB" ] || fail "the library was installed"
+  SELFTEST=fail run upgrade "$T/dist/bin/alice"
+  refused_unchanged "the self-test exited 1"
+  printf '%s\n' "$OUT" | grep -qF 'exit 1; last output: the model could not be loaded' || fail "no exit reason: $OUT"
+  TIMEOUT_EXPIRES=1 run upgrade "$T/dist/bin/alice"
+  refused_unchanged "the self-test timed out"
+  printf '%s\n' "$OUT" | grep -qF 'no answer within 300 s' || fail "no timeout reason: $OUT"
+  [ ! -e "$LIB" ] || fail "the library was installed"
+  pass
+}
+
+upgrade_installs_the_runtime_library_and_restores_it() {
+  make_dist "$T/dist" "lib v1"
+  run upgrade "$T/dist/bin/alice"
+  [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
+  cmp "$T/dist/bin/alice" "$R/usr/local/bin/alice" || fail "binary not installed"
+  [ "$(cat "$LIB")" = "lib v1" ] || fail "library not installed"
+  [ -z "$(find "$LIB" -perm -o+w)" ] || fail "the library is world-writable"
+  make_dist "$T/dist" "lib v2"
+  run upgrade "$T/dist/bin/alice"
+  [ "$RC" = 0 ] || fail "second upgrade exited $RC: $OUT"
+  { [ "$(cat "$LIB")" = "lib v2" ] && [ "$(cat "$LIB.prev")" = "lib v1" ]; } || fail "library not replaced and kept"
+  cp -p "$R/usr/local/bin/alice" "$T/alice.v2"
+  # A tenant that does not come back: the binary and the library both go back.
+  make_dist "$T/dist" "lib v3"
+  PING_FAIL=1 run upgrade "$T/dist/bin/alice"
+  [ "$RC" != 0 ] || fail "upgrade succeeded with a failing ping"
+  cmp "$T/alice.v2" "$R/usr/local/bin/alice" || fail "binary not restored"
+  [ "$(cat "$LIB")" = "lib v2" ] || fail "library not restored: $(cat "$LIB")"
+  # The installed pair fails its self-test: both go back before any tenant restarts.
+  RESTARTS=$(grep -c 'systemctl restart' "$R/calls.log" || true)
+  SELFTEST_INSTALLED=fail run upgrade "$T/dist/bin/alice"
+  [ "$RC" != 0 ] || fail "upgrade succeeded although the installed binary failed its self-test"
+  printf '%s\n' "$OUT" | grep -qF 'the installed binary failed its self-test' || fail "$OUT"
+  cmp "$T/alice.v2" "$R/usr/local/bin/alice" || fail "binary not restored"
+  [ "$(cat "$LIB")" = "lib v2" ] || fail "library not restored: $(cat "$LIB")"
+  [ "$(grep -c 'systemctl restart' "$R/calls.log")" = "$RESTARTS" ] || fail "a tenant was restarted"
+  no_selftest_home_left
+  pass
+}
+
+upgrade_is_also_the_first_install() {
+  local rc out first_lib first_prev=no failed_rc left=no
+  make_dist "$T/dist" "lib first"
+  mkdir -p "$T/installed"
+  mv "$R/usr/local/bin/alice" "$T/installed/"
+  rm -f -- "${R:?}/usr/local/bin/alice.prev"
+  mv "$R/usr/local/lib/alice" "$T/installed/lib"
+  run upgrade "$T/dist/bin/alice"
+  rc=$RC; out=$OUT
+  first_lib=$(cat "$LIB" 2>/dev/null || true)
+  [ -e "$R/usr/local/bin/alice.prev" ] && first_prev=yes
+  # A first install that fails leaves nothing behind.
+  rm -rf -- "${R:?}/usr/local/lib/alice"; rm -f -- "${R:?}/usr/local/bin/alice"
+  SELFTEST_INSTALLED=fail run upgrade "$T/dist/bin/alice"
+  failed_rc=$RC
+  { [ -e "$R/usr/local/bin/alice" ] || [ -e "$LIB" ]; } && left=yes
+  mv "$T/installed/alice" "$R/usr/local/bin/"
+  rm -rf -- "${R:?}/usr/local/lib/alice"; mv "$T/installed/lib" "$R/usr/local/lib/alice"
+  [ "$rc" = 0 ] || fail "first install exited $rc: $out"
+  printf '%s\n' "$out" | grep -qF 'installed alice 0.1.0' || fail "$out"
+  [ "$first_lib" = "lib first" ] || fail "library not installed: $first_lib"
+  [ "$first_prev" = no ] || fail "a first install made a .prev"
+  [ "$failed_rc" != 0 ] || fail "a failed first install succeeded"
+  [ "$left" = no ] || fail "a failed first install left files behind"
+  pass
+}
+
+BUILD="$(cd "$HERE/.." && pwd)/build-release"
+B="$T/bstubs"
+
+# build-release with its own stubs: Linux x86-64, a curl that serves a small tarball, a cargo that writes a binary
+# and records the variables it was given, and sha256sum that says what SHA_FAIL asks.
+build_setup() {
+  rm -rf -- "${B:?}" "${T:?}/ortsrc" "${T:?}/bcache" "${T:?}/btarget"
+  mkdir -p "$B" "$T/ortsrc/onnxruntime-linux-x64-1.24.4/lib"
+  echo "ort 1.24.4" >"$T/ortsrc/onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so.1.24.4"
+  tar -czf "$T/ort.tgz" -C "$T/ortsrc" onnxruntime-linux-x64-1.24.4
+  cat >"$B/uname" <<'EOF'
+#!/bin/bash
+case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; *) echo Linux ;; esac
+EOF
+  cat >"$B/curl" <<EOF
+#!/bin/bash
+echo "curl \$*" >>"$T/build.log"
+prev=""; for a in "\$@"; do [ "\$prev" = -o ] && cp "$T/ort.tgz" "\$a"; prev="\$a"; done
+EOF
+  cat >"$B/sha256sum" <<'EOF'
+#!/bin/bash
+cat >/dev/null
+exit "${SHA_FAIL:-0}"
+EOF
+  cat >"$B/cargo" <<'EOF'
+#!/bin/bash
+echo "cargo $* ORT_LIB_LOCATION=$ORT_LIB_LOCATION ORT_PREFER_DYNAMIC_LINK=$ORT_PREFER_DYNAMIC_LINK RUSTFLAGS=$RUSTFLAGS" >>"$BUILD_LOG"
+mkdir -p "$CARGO_TARGET_DIR/release"
+printf '#!/bin/sh\necho alice\n' >"$CARGO_TARGET_DIR/release/alice"
+chmod +x "$CARGO_TARGET_DIR/release/alice"
+EOF
+  chmod +x "$B"/*
+  : >"$T/build.log"
+}
+build() { RC=0; OUT=$(PATH="$B:$PATH" BUILD_LOG="$T/build.log" ALICE_ORT_CACHE="$T/bcache" CARGO_TARGET_DIR="$T/btarget" /bin/bash "$BUILD" 2>&1) || RC=$?; }
+
+build_release_refuses_a_download_that_fails_its_checksum() {
+  build_setup
+  SHA_FAIL=1 build
+  [ "$RC" != 0 ] || fail "a bad checksum was accepted"
+  printf '%s\n' "$OUT" | grep -qF 'does not match its pinned SHA-256' || fail "$OUT"
+  [ ! -e "$T/bcache/onnxruntime-linux-x64-1.24.4.tgz" ] || fail "the bad download was kept"
+  [ ! -e "$T/bcache/onnxruntime-linux-x64-1.24.4" ] || fail "the bad download was unpacked"
+  hasnt "$T/build.log" 'cargo '
+  pass
+}
+
+build_release_links_the_pinned_runtime_and_lays_out_the_dist() {
+  build_setup
+  build
+  [ "$RC" = 0 ] || fail "build exited $RC: $OUT"
+  has "$T/build.log" 'releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz'
+  has "$T/build.log" "cargo build --release --locked -p alice-memory ORT_LIB_LOCATION=$T/bcache/onnxruntime-linux-x64-1.24.4/lib ORT_PREFER_DYNAMIC_LINK=1 RUSTFLAGS=-C link-arg=-Wl,-rpath,\$ORIGIN/../lib/alice"
+  [ -x "$T/btarget/server-dist/bin/alice" ] || fail "no dist binary"
+  [ "$(cat "$T/btarget/server-dist/lib/alice/libonnxruntime.so.1")" = "ort 1.24.4" ] || fail "no dist library"
+  printf '%s\n' "$OUT" | grep -qF "sudo alice-server upgrade $T/btarget/server-dist/bin/alice" || fail "$OUT"
+  # A second run uses the cached download.
+  build
+  [ "$RC" = 0 ] || fail "second build exited $RC: $OUT"
+  [ "$(grep -c '^curl ' "$T/build.log")" = 1 ] || fail "the cached tarball was downloaded again"
   pass
 }
 
@@ -655,7 +850,10 @@ for CURRENT in \
   import_refuses_a_tenant_home import_refuses_root_and_system_dirs import_refuses_a_non_palace \
   add_restores_the_caddyfile_when_validation_fails add_reloads_after_removing_the_snippet test_hooks_are_ignored_without_a_test_root cli_runs_as_the_tenant \
   cli_refuses_a_secret_in_argv upgrade_rolls_back_on_a_failed_ping upgrade_installs_and_keeps_prev \
-  add_refuses_a_cpu_without_avx2 upgrade_refuses_a_cpu_without_avx2 \
+  add_refuses_a_cpu_without_avx upgrade_refuses_a_cpu_without_avx upgrade_accepts_avx_without_avx2 \
+  upgrade_refuses_a_binary_that_fails_its_self_test upgrade_installs_the_runtime_library_and_restores_it \
+  upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
+  build_release_links_the_pinned_runtime_and_lays_out_the_dist \
   add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \
   rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store \
   remove_person_deletes_the_team_copy remove_team_unprovisions provision_refuses_a_missing_team_token \

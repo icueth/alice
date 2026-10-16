@@ -206,7 +206,7 @@ alice daemon start | stop | status | logs | run
 alice token rotate [--show]
 alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # MCP server แบบ stdio สำหรับ agent
-alice model fetch
+alice model fetch | check      # check: โหลดโมเดลแล้วลองสร้าง embedding หนึ่งข้อความ (ไม่เปิด daemon)
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 alice import mempalace [--palace dir] [--dry-run] [--since date] [--map-wing wing=project]...
                        [--collection name] [--allow-remote-embedding]
@@ -423,7 +423,7 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 
 ## ใช้ Alice ผ่านเซิร์ฟเวอร์
 
-ทีมเล็ก ๆ ใช้เซิร์ฟเวอร์ Linux เครื่องเดียวร่วมกันได้ แต่ละคนมี Alice daemon ของตัวเองที่ `https://<host>/u/<name>` และ agent (Claude Code, Codex ฯลฯ) เชื่อมต่อกับ MCP endpoint `https://<host>/u/<name>/mcp` ได้โดยตรงด้วย bearer token ไม่ต้องติดตั้งโปรแกรมฝั่งผู้ใช้ จึงใช้บน Windows ได้ด้วย และมี "ความจำส่วนกลาง" ของทีมให้เลือกใช้: สั่ง agent ว่า "บันทึกลงความจำส่วนกลางด้วย" ทุกคนในทีมอ่านได้ แต่เจ้าของเรื่องหรือแอดมินเท่านั้นที่แก้ได้ แอดมินของเซิร์ฟเวอร์อ่านความจำของทุกคนได้ และไฟล์ `.alice.toml` ของ repo ไม่มีผลเมื่อเชื่อมต่อ MCP ตรง เซิร์ฟเวอร์ต้องใช้ CPU x86-64 ที่มี AVX2
+ทีมเล็ก ๆ ใช้เซิร์ฟเวอร์ Linux เครื่องเดียวร่วมกันได้ แต่ละคนมี Alice daemon ของตัวเองที่ `https://<host>/u/<name>` และ agent (Claude Code, Codex ฯลฯ) เชื่อมต่อกับ MCP endpoint `https://<host>/u/<name>/mcp` ได้โดยตรงด้วย bearer token ไม่ต้องติดตั้งโปรแกรมฝั่งผู้ใช้ จึงใช้บน Windows ได้ด้วย และมี "ความจำส่วนกลาง" ของทีมให้เลือกใช้: สั่ง agent ว่า "บันทึกลงความจำส่วนกลางด้วย" ทุกคนในทีมอ่านได้ แต่เจ้าของเรื่องหรือแอดมินเท่านั้นที่แก้ได้ แอดมินของเซิร์ฟเวอร์อ่านความจำของทุกคนได้ และไฟล์ `.alice.toml` ของ repo ไม่มีผลเมื่อเชื่อมต่อ MCP ตรง เซิร์ฟเวอร์ต้องใช้ CPU x86-64 ที่มี AVX (ไม่ต้องมี AVX2 เพราะ `deploy/server/build-release` สร้างโปรแกรมฝั่งเซิร์ฟเวอร์ด้วย ONNX Runtime ของ Microsoft)
 
 คู่มือฉบับเต็มอยู่ที่ [docs/server.md](docs/server.md) (ภาษาอังกฤษ) ด้านล่างเป็นสรุปภาษาไทยในลำดับเดียวกัน
 
@@ -443,7 +443,7 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
    alice-server cli <name> <คำสั่ง alice…>
    ```
 
-3. CPU ต้องมี AVX2 บน Proxmox ให้ตั้งชนิด CPU ของ VM เป็น `host` (หรือ `x86-64-v3`) แล้ว **ปิด VM แล้วเปิดใหม่** การ reboot จากในเครื่องไม่ทำให้ค่านี้มีผล `alice-server` ตรวจเรื่องนี้ก่อน `add` และ `upgrade`
+3. CPU ต้องมี AVX (ไม่ต้องมี AVX2) บน Proxmox ให้ตั้งชนิด CPU ของ VM เป็น `host` แล้ว **ปิด VM แล้วเปิดใหม่** การ reboot จากในเครื่องไม่ทำให้ค่านี้มีผล `alice-server` ตรวจเรื่องนี้ก่อน `add` และ `upgrade` สร้างโปรแกรมบนเซิร์ฟเวอร์ด้วย `deploy/server/build-release` (รันเป็นผู้ใช้แอดมิน ไม่ใช่ root) แล้วติดตั้งด้วย `sudo alice-server upgrade target/server-dist/bin/alice` ซึ่งเป็นการติดตั้งครั้งแรกด้วย ก่อนติดตั้ง `upgrade` จะให้โปรแกรมใหม่ลองสร้าง embedding หนึ่งข้อความ ถ้าไม่ผ่านจะไม่ติดตั้งอะไรเลย
 4. การ import: คนที่ไม่มีโปรแกรม `alice` ส่ง palace ให้แอดมิน แอดมินรัน `alice-server import <name> <palace-dir>` (ลอง `--dry-run` ก่อนได้ ซึ่งทำงานบนสำเนาและไม่แตะโฟลเดอร์เดิม) การ import จริงจะ **ย้ายและใช้โฟลเดอร์นั้นหมด** และลบสำเนาในเซิร์ฟเวอร์เมื่อจบงาน
 5. ตั้งค่าและ key ของ Jev: ใช้ `alice-server cli <name> config set-secret typesafe` แล้ววาง key เมื่อถูกถาม หรือส่งผ่าน stdin ห้ามใส่ key เป็นอาร์กิวเมนต์ในบรรทัดคำสั่ง จากนั้น `alice-server cli <name> config set judge.provider jev`
 6. ความเป็นส่วนตัว: เซิร์ฟเวอร์ปิดบัง secret (redact) เสมอ `.alice.toml` ของ repo ไม่มีผลทาง MCP ตรง การห้ามส่งโปรเจกต์ขึ้น cloud ตั้งที่รายการ `privacy.cloud_denied_projects` ของผู้ใช้ เช่น `alice-server cli <name> config set privacy.cloud_denied_projects '["my-secret-app"]'`
@@ -493,7 +493,7 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 
 ### ข้อควรรู้
 
-- **ความต้องการของเซิร์ฟเวอร์:** CPU x86-64 ที่มี AVX2 แต่ละ daemon จำกัดหน่วยความจำที่ 3 GB (ใช้จริงราว 800 MB) และควรมีพื้นที่ดิสก์ว่างอย่างน้อย 3 GB รายละเอียดอยู่ในหัวข้อ Requirements และ Disk budget ของ [docs/server.md](docs/server.md)
+- **ความต้องการของเซิร์ฟเวอร์:** CPU x86-64 ที่มี AVX (บน Xeon E5-2620 4 vCPU ทำ embedding ได้ราว 5.5 chunk ต่อวินาที palace ขนาด 121,000 chunk ใช้เวลาราว 6 ชั่วโมง) แต่ละ daemon จำกัดหน่วยความจำที่ 3 GB (ใช้จริงราว 800 MB) และควรมีพื้นที่ดิสก์ว่างอย่างน้อย 3 GB รายละเอียดอยู่ในหัวข้อ Requirements และ Disk budget ของ [docs/server.md](docs/server.md)
 - **สิ่งที่ผู้ใช้แต่ละคนเปลี่ยนเองไม่ได้:** โฟลเดอร์ข้อมูล พอร์ต ตำแหน่งและรอบของ backup, ที่เก็บ secret และสวิตช์ปกปิด secret (เปิดตลอด) นอกจากนี้ daemon ของผู้ใช้เข้าถึงเครือข่ายภายใน (LAN) ของแอดมินไม่ได้ และปฏิเสธค่าตั้งที่ชี้ไปยังที่อยู่ภายในหรือ loopback
 - **ความจำส่วนกลาง:** ผู้เขียนหรือแอดมินเท่านั้นที่แก้หรือลบความจำส่วนกลางได้
 - **ปัญหาที่พบบ่อย:** ข้อความที่เจอพร้อมวิธีแก้อยู่ในตาราง Troubleshooting ของ [docs/server.md](docs/server.md) (ภาษาอังกฤษ)

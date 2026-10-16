@@ -11,6 +11,12 @@ ARCHIVES="$SRV/backups"
 UNIT="$R/etc/systemd/system/alice@.service"
 CADDYFILE="$R/etc/caddy/Caddyfile"; CADDY_D="$R/etc/caddy/alice.d"
 BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
+# The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
+# $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
+LIBDIR="$R/usr/local/lib/alice"; ORT_LIB=libonnxruntime.so.1
+# The self-test's model (fetched once, reused by every later self-test) and its throwaway homes.
+MODEL_CACHE="$R/var/cache/alice-server/models"; SELFTEST_TMP="$R/tmp"
+SELFTEST_TIMEOUT=300
 # The real paths below go INSIDE the files this script writes; the prefix above never does.
 REAL_SRV=/srv/alice
 PORT_MIN=47801; PORT_MAX=47899
@@ -29,8 +35,10 @@ if [ -n "$R" ]; then
 fi
 # A broken environment must never turn a removal into rm -rf /...: refuse to run with an empty root.
 : "${ETC:?}" "${TENANTS:?}" "${SRV:?}" "${ARCHIVES:?}" "${CADDY_D:?}" "${UNIT:?}" "${CADDYFILE:?}" "${BIN:?}" "${LOCK:?}"
+: "${LIBDIR:?}" "${MODEL_CACHE:?}" "${SELFTEST_TMP:?}"
 
 HOST=""
+SELFTEST_WHY=""
 A_USER=0; A_HOME=0; A_ENV=0; A_UNIT=0; A_SNIP=0; A_RELOADED=0
 IMPORT_DIR=""
 
@@ -45,6 +53,7 @@ usage: alice-server add <name>
        alice-server rotate <name>
        alice-server list
        alice-server upgrade <binary>
+           (also the first install; a build of deploy/server/build-release brings its ONNX Runtime along)
        alice-server import <name> <palace-dir> [--dry-run]
            (a real import MOVES and consumes <palace-dir>; --dry-run works on a copy and keeps it)
        alice-server cli <name> <alice arguments...>
@@ -75,16 +84,37 @@ put() { # path mode ; the content comes on stdin. Written through a temporary fi
   cat >"${tmp:?}" && chmod -- "$2" "${tmp:?}" && mv -- "${tmp:?}" "${1:?}"
 }
 
-# Refuses a CPU without AVX and AVX2: the prebuilt ONNX Runtime in the binary dies with "Illegal instruction" there.
-# Reads $R/proc/cpuinfo (the real /proc/cpuinfo on the server); both flags must be whole words on a flags line.
+# Refuses a CPU without AVX: the ONNX Runtime a server build links (Microsoft's release, which picks its SIMD kernels
+# at run time) needs AVX, not AVX2. Reads $R/proc/cpuinfo (the real /proc/cpuinfo on the server); the flag must be a
+# whole word on a flags line. What the shipped runtime really runs is proven by self_test.
 need_avx() {
   local flags
   flags=$(grep -E '^flags[[:space:]]*:' "$R/proc/cpuinfo" 2>/dev/null | head -n 1 || true)
-  if printf '%s\n' "$flags" | grep -Eq '(^|[[:space:]])avx([[:space:]]|$)' \
-    && printf '%s\n' "$flags" | grep -Eq '(^|[[:space:]])avx2([[:space:]]|$)'; then
+  if printf '%s\n' "$flags" | grep -Eq '(^|[[:space:]])avx([[:space:]]|$)'; then
     return 0
   fi
-  die "this CPU lacks AVX/AVX2, which Alice's embedding runtime needs (it would die with 'Illegal instruction'); on Proxmox set the VM's CPU type to host (or x86-64-v3), then shut the VM down and start it again (a reboot from inside the guest does not apply a CPU type change)"
+  die "this CPU lacks AVX, which Alice's embedding runtime needs (it would die with 'Illegal instruction'); on Proxmox set the VM's CPU type to host, then shut the VM down and start it again (a reboot from inside the guest does not apply a CPU type change)"
+}
+
+# Runs `<binary> model check` in a throwaway home: the binary loads the embedding model and embeds one text. True when
+# it did; otherwise SELFTEST_WHY says why (a signal such as an illegal instruction, an exit code, or the timeout). The
+# model comes from MODEL_CACHE, fetched by the binary the first time (about 136 MB) and checked on every run.
+self_test() { # binary
+  local bin=$1 home rc=0 out
+  install -d -m 0755 "$MODEL_CACHE" "$SELFTEST_TMP"
+  home=$(mktemp -d "$SELFTEST_TMP/alice-selftest.XXXXXX") || { SELFTEST_WHY="no temporary directory"; return 1; }
+  ln -s -- "$MODEL_CACHE" "$home/models"
+  out=$( { ALICE_HOME="$home" ALICE_NO_AUTOSTART=1 timeout "$SELFTEST_TIMEOUT" "$bin" model fetch \
+    && ALICE_HOME="$home" ALICE_NO_AUTOSTART=1 timeout "$SELFTEST_TIMEOUT" "$bin" model check; } 2>&1 ) || rc=$?
+  rm -rf -- "${home:?}"
+  [ "$rc" = 0 ] && return 0
+  if [ "$rc" = 124 ]; then SELFTEST_WHY="no answer within $SELFTEST_TIMEOUT s"
+  elif [ "$rc" = 132 ]; then SELFTEST_WHY="killed by SIGILL: this CPU cannot run its ONNX Runtime"
+  elif [ "$rc" -gt 128 ]; then SELFTEST_WHY="killed by signal $((rc - 128))"
+  else SELFTEST_WHY="exit $rc"
+  fi
+  SELFTEST_WHY="$SELFTEST_WHY; last output: $(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ')"
+  return 1
 }
 
 free_port() {
@@ -471,23 +501,56 @@ restart_all() { # progress goes to stderr; the failed tenants, space separated, 
   printf '%s\n' "${failed# }"
 }
 
-cmd_upgrade() { # binary
-  local new=$1 failed
+# Puts back what install_new replaced: the previous binary and library, or nothing at all after a first install.
+restore_prev() {
+  if [ -f "$BIN.prev" ]; then mv -- "${BIN:?}.prev" "${BIN:?}"; else rm -f -- "${BIN:?}"; fi
+  if [ -f "$LIBDIR/$ORT_LIB.prev" ]; then mv -- "${LIBDIR:?}/$ORT_LIB.prev" "${LIBDIR:?}/$ORT_LIB"
+  elif [ "$NEW_LIB" = 1 ]; then rm -f -- "${LIBDIR:?}/${ORT_LIB:?}"
+  fi
+}
+
+NEW_LIB=0
+install_new() { # binary library-or-empty: each through a temporary file, the current one kept as .prev
+  local new=$1 lib=$2
+  rm -f -- "${BIN:?}.prev" "${LIBDIR:?}/${ORT_LIB:?}.prev"
+  if [ -n "$lib" ]; then
+    install -d -m 0755 "$LIBDIR"
+    if [ -f "$LIBDIR/$ORT_LIB" ]; then cp -p -- "${LIBDIR:?}/$ORT_LIB" "${LIBDIR:?}/$ORT_LIB.prev"; else NEW_LIB=1; fi
+    install -m 0644 "$lib" "$LIBDIR/$ORT_LIB.new" || die "could not copy $lib"
+    mv -- "${LIBDIR:?}/$ORT_LIB.new" "${LIBDIR:?}/$ORT_LIB"
+  fi
+  if [ -f "$BIN" ]; then cp -p -- "${BIN:?}" "${BIN:?}.prev"; fi
+  if ! install -m 0755 "$new" "$BIN.new"; then restore_prev; die "could not copy $new"; fi
+  mv -- "${BIN:?}.new" "${BIN:?}"
+}
+
+cmd_upgrade() { # binary (also the first install)
+  local new=$1 lib failed
   need_avx
   [ -f "$new" ] && [ -x "$new" ] || die "$new is not an executable file"
+  # A build of deploy/server/build-release keeps its ONNX Runtime where the binary's rpath looks: ../lib/alice.
+  lib="$(dirname -- "$new")/../lib/alice/$ORT_LIB"
+  [ -f "$lib" ] || lib=""
   "$new" --version >/dev/null 2>&1 || die "$new --version failed; the new binary was not installed"
-  [ -f "$BIN" ] || die "$BIN is not installed; copy the binary there once by hand"
-  cp -p -- "${BIN:?}" "${BIN:?}.prev"
-  if ! install -m 0755 "$new" "$BIN.new"; then die "could not copy $new"; fi
-  mv -- "${BIN:?}.new" "${BIN:?}"
+  self_test "$new" || die "the new binary failed its self-test ($SELFTEST_WHY); nothing was installed"
+  install_new "$new" "$lib"
+  # The installed pair, found through the rpath as the units will run it, before any unit is switched.
+  if ! self_test "$BIN"; then
+    restore_prev
+    die "the installed binary failed its self-test ($SELFTEST_WHY); the previous version is restored"
+  fi
   say "free: $(gb "$(free_kb)") GB (a schema migration copies each tenant's database once)"
   failed=$(restart_all)
   if [ -n "$failed" ]; then
-    mv -- "${BIN:?}.prev" "${BIN:?}"
+    restore_prev
     restart_all >/dev/null || true
     die "these tenants did not come back: $failed; the previous binary is restored"
   fi
-  say "upgraded to $("$BIN" --version); the previous binary is $BIN.prev"
+  if [ -f "$BIN.prev" ]; then
+    say "upgraded to $("$BIN" --version); the previous binary is $BIN.prev"
+  else
+    say "installed $("$BIN" --version)"
+  fi
 }
 
 canon_dir() { # prints the physical path of a directory; fails when it is not one

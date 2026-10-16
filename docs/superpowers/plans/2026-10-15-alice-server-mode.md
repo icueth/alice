@@ -76,6 +76,7 @@ task numbering:
 | 10 | **29**: `alice-server add --team` and provisioning (addendum 3) | new |
 | 11 | **18**: documentation, as amended below (plus the team memory) | amended |
 | 12 | **19**: merge both heads, run the gates (no Windows), the opus review | unchanged |
+| 12a | **32**: ONNX Runtime on a CPU without AVX2 — Microsoft's runtime, the AVX-only check, the self-test (controller, 2026-10-16); the staging pass of Task 20's checks may follow | new |
 | 13 | **20**: deployment, as amended below (the team store first) — STOP for the controller's go | amended |
 | — | 7–12 | **deferred**, the remote client; only if the owner asks |
 | — | 13–16 | **dropped**, the import bundle; Task 24 and the amended Task 17 replace it |
@@ -3185,8 +3186,8 @@ git commit -m "docs: server mode — admin and person guides, disk budget, trust
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
-**CPU requirement (controller's server finding):** `docs/server.md` lists the server's requirements, among them an
-**x86-64 CPU with AVX2**. The embedding runtime dies with "Illegal instruction" without it. On Proxmox, set the VM's CPU
+**CPU requirement (controller's server finding; superseded by Task 32: AVX, not AVX2):** `docs/server.md` lists the
+server's requirements, among them an **x86-64 CPU with AVX2**. The embedding runtime dies with "Illegal instruction" without it. On Proxmox, set the VM's CPU
 type to `host` (or `x86-64-v3`), then shut the VM down and start it again (a reboot from inside the guest does not
 apply a CPU type change); Proxmox's default "QEMU Virtual CPU" lacks AVX. Say that `alice-server` checks this
 before `add` and `upgrade`.
@@ -3753,8 +3754,8 @@ impl TeamLink {
   - `list_marks_the_team_store`.
 
   Every rm/mv stays guarded; the script stays bash 3.2 compatible and shellcheck clean.
-- **CPU preflight** (controller's server finding: the prebuilt ONNX Runtime in the binary dies with "Illegal
-  instruction" on a CPU without AVX/AVX2, such as Proxmox's default "QEMU Virtual CPU"; no product code changes).
+- **CPU preflight** (superseded by Task 32, which checks AVX only and self-tests the binary; controller's server
+  finding: the prebuilt ONNX Runtime in the binary dies with "Illegal instruction" on a CPU without AVX/AVX2, such as Proxmox's default "QEMU Virtual CPU"; no product code changes).
   `add` and `upgrade` first read `$R/proc/cpuinfo`. The test root prefixes it, so the stubs provide one. Its `flags`
   line must contain both `avx` and `avx2` as whole words. Otherwise refuse before any change, with: "this CPU lacks
   AVX/AVX2, which Alice's embedding runtime needs (it would die with 'Illegal instruction'); on Proxmox set the VM's
@@ -3763,3 +3764,47 @@ impl TeamLink {
   `upgrade_refuses_a_cpu_without_avx2` (each leaves nothing changed); the existing scenarios' stub `cpuinfo` carries
   `avx avx2`.
 - **Commit:** `feat(deploy): alice-server add --team and team provisioning (addendum 3)`.
+
+### Task 32: ONNX Runtime on a CPU without AVX2 (controller-ordered, 2026-10-16)
+
+**Why:** the server's CPU is a Xeon E5-2620 (Sandy Bridge): AVX, no AVX2. pyke's prebuilt ONNX Runtime (ort's
+`download-binaries`) has an AVX2 baseline, so the daemon dies there. Spec §2.11, R38, R39. Brief:
+`ort-no-avx2-brief.md` in the controller's lane directory.
+
+**Files:**
+- Create: `deploy/server/build-release`
+- Modify: `deploy/server/alice-server` (`need_avx`, `self_test`, `install_new`, `restore_prev`, `cmd_upgrade`)
+- Modify: `deploy/server/tests/run.sh`
+- Modify: `crates/alice/src/cmd.rs` (`alice model check`), `crates/alice/tests/cli.rs`
+- Modify: `docs/server.md`, `README.md`, `README.th.md`, the spec (§2.5 `upgrade`, §2.11, §8.2, R38, R39), the core
+  spec's CLI list
+
+**Steps:**
+- `alice model check`: no daemon; loads the local model from `$ALICE_HOME/models`, embeds one short passage, checks one
+  finite non-zero vector of the model's dimension, prints `ok: <model> embedded a test text (<dim> dimensions) in <ms> ms`
+  (`--json`: `{model, dim, ms}`). Without the model it fails and names `alice model fetch`. CLI test:
+  `model_check_without_the_model_fails_and_names_fetch`.
+- `build-release` (admin user, not root; Linux x86-64): Microsoft's `onnxruntime-linux-x64-1.24.4.tgz`, SHA-256
+  `3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747` checked before unpacking (a mismatch deletes the
+  download), cached in `${ALICE_ORT_CACHE:-~/.cache/alice-ort}`; `cargo build --release --locked -p alice-memory` with
+  `ORT_LIB_LOCATION=<its lib>`, `ORT_PREFER_DYNAMIC_LINK=1` and `RUSTFLAGS='-C link-arg=-Wl,-rpath,$ORIGIN/../lib/alice'`;
+  the result in `target/server-dist/bin/alice` and `target/server-dist/lib/alice/libonnxruntime.so.1`.
+- `alice-server`: `need_avx` requires `avx` only, with the message in spec §2.11. `upgrade <binary>`: the flag check,
+  `--version`, then `self_test <binary>` (`model fetch` then `model check`, each under `timeout 300`, in a `mktemp -d`
+  home under `/tmp` whose `models` links `/var/cache/alice-server/models`; exit 124 is "no answer within 300 s", 132
+  "killed by SIGILL: this CPU cannot run its ONNX Runtime", other signals and exits by number, plus the last output);
+  a failure installs nothing. Then the library (from `<binary>/../../lib/alice/libonnxruntime.so.1`, when present) and
+  the binary are installed with `.prev` copies, the installed binary is self-tested (failure: both restored, no
+  restart), and the tenants restart (a failed ping restores both). With no binary installed, `upgrade` is the first
+  install (no `.prev`; a failure leaves nothing).
+- Stub scenarios (RED against the old script): `add_refuses_a_cpu_without_avx`, `upgrade_refuses_a_cpu_without_avx`,
+  `upgrade_accepts_avx_without_avx2`, `upgrade_refuses_a_binary_that_fails_its_self_test` (SIGILL, exit 1, timeout),
+  `upgrade_installs_the_runtime_library_and_restores_it`, `upgrade_is_also_the_first_install`,
+  `build_release_refuses_a_download_that_fails_its_checksum`,
+  `build_release_links_the_pinned_runtime_and_lays_out_the_dist`. A `timeout` stub joins the others.
+- Verify on the server in a throwaway `ALICE_HOME` under `/tmp` (never a tenant home): daemon start, `remember`, a
+  `recall` that finds it, `alice doctor`; time the embedding of fixture-sized chunks and estimate a 121,000-chunk palace;
+  remove the throwaway home. If Microsoft's build also dies of SIGILL: stop and report before building ONNX Runtime from
+  source.
+- Gates: fmt, both clippy runs with `-D warnings`, workspace tests, `bash deploy/server/tests/run.sh`, `shellcheck` of
+  both scripts; push; ubuntu and macOS CI.
