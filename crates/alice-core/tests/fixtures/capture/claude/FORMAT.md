@@ -44,15 +44,20 @@ full sessions (the fixtures hold windows of them):
 | `user` | a human prompt, a tool result, an injected meta message, or the compaction summary | yes / yes / yes |
 | `assistant` | one content block of a model response (see "message.id splits") | yes / yes / yes |
 | `attachment` | harness-injected context (hooks, environment, file reads, tool lists, reminders) | yes / yes / yes |
-| `system/turn_duration` | end-of-turn timing, `isMeta: true` | yes / yes / yes |
+| `system/turn_duration` | end-of-turn timing, `isMeta: false` in all seen | yes / yes / yes |
 | `system/stop_hook_summary` | result of Stop hooks | yes / yes / yes |
 | `system/compact_boundary` | marks a compaction | yes / `null` (plus `logicalParentUuid`) / yes |
-| `system/informational` | notice text, `isMeta: true` | yes / yes / yes |
+| `system/informational` | notice text, `isMeta: false` in all seen | yes / yes / yes |
 | `queue-operation` | prompt queue event (`enqueue`, `dequeue`, `remove`) | no / no / yes |
 | `file-history-snapshot` | file backup index | no / no / only inside `snapshot` |
 | `file-history-delta` | one tracked-file backup | no / no / yes |
 | `last-prompt`, `mode`, `permission-mode`, `ai-title`, `atis-latch` | per-session bookkeeping, re-appended many times (about once per turn); each carries `sessionId` and one value field | no / no / no |
 | `api-request-shape`, `api-request`, `api-request-blob` | raw API request logging (present in these builds; large) | no / no / partly |
+
+**Dispatch on the line `type` first.** `api-request-blob` lines carry a `message` object with `role` `user`,
+`assistant` or `system` and `tool_use`, `tool_result`, `thinking` and `text` blocks, i.e. they look like
+conversation messages. They are request-log copies. A parser that keys on `message.role` or scans for content
+blocks without checking `type` will double count (or count system prompts as turns).
 
 The bookkeeping and `api-request*` lines are not conversation. A capture parser should read only `user`,
 `assistant`, `system/compact_boundary` and, optionally, `attachment`, and skip everything else without failing.
@@ -371,10 +376,10 @@ tool_use.input for Bash : `command`: string, `description`: string
 tool_use.input for Read : `file_path`: string, `limit`: integer, `offset`: integer
 tool_use.input for Skill : `skill`: string
 tool_use.input for ToolSearch : `max_results`: integer, `query`: string
-tool_use.input for mcp__browser-for-ai__page_eval : `expression`: string, `screenshot`: boolean?, `timeoutMs`: integer?
+tool_use.input for mcp__server-a__page_eval : `expression`: string, `screenshot`: boolean?, `timeoutMs`: integer?
 tool_use.input for mcp__plugin_mempalace_mempalace__mempalace_diary_write : `agent_name`: string, `entry`: string, `topic`: string, `wing`: string
 tool_use.input for mcp__plugin_mempalace_mempalace__mempalace_search : `limit`: integer, `query`: string
-tool_use.input for mcp__plugin_mempalace_mempalace__mempalace_status : 
+tool_use.input for mcp__plugin_mempalace_mempalace__mempalace_status : (no fields)
 user.message: `content`: array/string, `role`: string
 user block tool_result : `content`: array/string, `is_error`: boolean?, `tool_use_id`: string, `type`: string
 user block text : `text`: string, `type`: string
@@ -388,7 +393,7 @@ toolUseResult object shapes: 5
   toolUseResult{ `commandName`: string, `success`: boolean } x 2
   toolUseResult{ `agentId`: string, `canContinueAgent`: boolean, `canReadOutputFile`: boolean, `description`: string, `isAsync`: boolean, `outputFile`: string, `prompt`: string, `resolvedModel`: string, `status`: string } x 1
   toolUseResult{ `file`: object, `type`: string } x 1
-toolUseResult non-object: Counter({'array': 7, 'string': 4})
+toolUseResult when not an object: array (7), string (4)
 attachment agent_listing_delta : `addedLines`: array, `addedTypes`: array, `builtInTypes`: array, `isInitial`: boolean, `removedTypes`: array, `showConcurrencyNote`: boolean, `type`: string
 attachment auto_mode : `autoModeConsentFlow`: boolean, `bashFirst`: boolean, `bashFirstSteer`: string, `bypass`: boolean, `steerOnly`: boolean, `type`: string
 attachment command_permissions : `allowedTools`: array, `type`: string
@@ -416,7 +421,7 @@ compactMetadata: `cumulativeDroppedTokens`: integer, `durationMs`: integer, `pos
   preservedSegment: `anchorUuid`: string, `headUuid`: string, `tailUuid`: string
   preservedMessages: `allUuids`: array, `anchorUuid`: string, `uuids`: array
 file-history-snapshot .snapshot: `messageId`: string, `timestamp`: string, `trackedFileBackups`: object
-file-history-delta .backup: 
+file-history-delta .backup: (no such line in the fixtures; fields are listed under "Other line types")
 api-request .params: `betas`: array, `context_management`: object, `max_tokens`: integer, `model`: string, `output_config`: object, `thinking`: object
 api-request-blob .message: `content`: array, `output_config`: object?, `role`: string
 api-request-shape .shape: `system`: array, `tools`: array
@@ -530,10 +535,10 @@ Attachments carry no conversation text a capture needs; skip them.
 
 ## Other line types
 
-- `system/turn_duration`: `durationMs`, `messageCount`, `pendingBackgroundAgentCount?`, `isMeta: true`.
+- `system/turn_duration`: `durationMs`, `messageCount`, `pendingBackgroundAgentCount?`, `isMeta` (false in all seen).
 - `system/stop_hook_summary`: `hookCount`, `hookInfos[{command, durationMs}]`, `hookErrors[]`,
   `hookAdditionalContext[]`, `hasOutput`, `preventedContinuation`, `stopReason`, `toolUseID`, `level`.
-- `system/informational`: `content` string, `level`.
+- `system/informational`: `content` string, `level`, `isMeta` (false in all seen).
 - `queue-operation`: `operation` (`enqueue`, `dequeue`, `remove`), `content?`, `commandUuid?`, `deliveryId?`,
   `reason?` (`absorbed_mid_turn`), `sessionId`, `timestamp`.
 - `file-history-snapshot`: `messageId`, `isSnapshotUpdate`, `snapshot {messageId, timestamp, trackedFileBackups}`;
@@ -553,9 +558,44 @@ no `is_error: true` with an array `content`, and no `file-history-delta` with a 
 `isMeta`, `isCompactSummary` and `compact_boundary` are present in both main fixtures; `isSidechain: true` is in
 `sample-1-agent-1.jsonl`; an image block is in `sample-2.jsonl`.
 
+## Windows (what the fixtures keep of the source sessions)
+
+Each fixture is the concatenation of windows of 1-based source line numbers; the first column is the fixture line
+range. Everything between two windows was dropped.
+
+| fixture | fixture lines | source lines |
+|---|---|---|
+| `sample-1.jsonl` | 1-100 | 1-100 |
+| | 101-111 | 185-195 |
+| | 112-120 | 1190-1198 |
+| | 121-189 | 1985-2053 (holds the compaction, fixture lines 168-169) |
+| `sample-1-agent-1.jsonl` | 1-60 | 1-60 (whole subagent file starts here) |
+| `sample-2.jsonl` | 1-100 | 1-100 |
+| | 101-116 | 410-425 (holds an image result) |
+| | 117-157 | 1320-1360 (holds the compaction, fixture lines 142-143) |
+
+These effects are **artifacts of the windows, not features of the format**:
+
+- At or just after the start of a window (windows start at `sample-1.jsonl` lines 101, 112 and 121, and at
+  `sample-2.jsonl` lines 101 and 117) a line can have a `parentUuid` that points at a line that is not in the
+  fixture (unresolved links are at `sample-1.jsonl` lines 101, 113, 122 and `sample-2.jsonl` lines 104, 117). In the
+  whole session checked, every `parentUuid` resolved (the only `null`s were the first line and the compaction
+  boundary).
+- A `tool_use` at the end of one window can have its `tool_result` missing, and a `tool_result` at the start of a
+  window can have no `tool_use` in the fixture.
+- `compactMetadata.preservedSegment` and `preservedMessages` name uuids of earlier lines that were kept in the
+  model context; not all of those lines are inside the fixture windows.
+- `message.id` groups, `turnPosition` indexes and `apiBlockIndex` runs can be cut mid-group at a window edge.
+- Repeated bookkeeping lines (`last-prompt`, `mode`, ...) appear fewer times than in a whole session.
+- Strings are capped at 300 characters, arrays at 12 items and objects at 40 keys, which also shortens things like
+  `preservedMessages.allUuids`, `addedNames` and `trackedFileBackups`.
+- Timestamps are shifted into the past by one fixed offset (same offset for every fixture, so gaps are real)
+  and are all before 2026-10-16.
+
 ## Parser checklist
 
-1. Read line by line; skip a line that is not valid JSON; ignore unknown `type`.
+1. Read line by line; skip a line that is not valid JSON; dispatch on `type` first and ignore unknown `type`
+   (never on `message.role` alone).
 2. Conversation lines: `user`, `assistant`. Drop `isMeta: true`, `isCompactSummary: true`, `isSidechain: true` (main
    files should have none) and `tool_result` lines when you want typed prompts only.
 3. Group `assistant` lines by `message.id`; take usage once.

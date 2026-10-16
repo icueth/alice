@@ -81,7 +81,7 @@ simplest source for "what the human typed" and "what the assistant said". `Agent
 ## Tool calls and results
 
 `call_id` pairs a `function_call` / `custom_tool_call` with its `*_output` line (822 of 822 calls had exactly one
-output in this rollout). `function_call.arguments` is JSON text; it parsed as JSON in all 209 cases. The shell is
+output in this rollout). In the source `function_call.arguments` is JSON text (it parsed as JSON in all 209 cases); in this fixture the scrub replaced it with filler, so it no longer parses as JSON. The shell is
 reached through the custom tool `exec` (its `input` is a string of code) and shows up again as
 `CommandExecution` events; `output` of a custom-tool result is an array of `input_text` blocks (or one
 `input_text` plus an `input_image` for screenshots), or a plain string.
@@ -94,6 +94,34 @@ before was a `token_usage_record`, the line after a `world_state`, then a `turn_
 object; `guardian_history[]` is a long array (about 130 entries); `retained_context` carries the user messages
 kept. An `event_msg.item_completed` with `item.type: "ContextCompaction"` accompanies it. Earlier lines stay in
 the file, so a parser that wants each turn once should not re-read `replacement_history` as new conversation.
+
+## Windows (what the fixture keeps of the source rollout)
+
+| fixture lines | source lines |
+|---|---|
+| 1-60 | 1-60 |
+| 61-71 | 330-340 |
+| 72-87 | 565-580 (holds the first `compacted` line, fixture line 77) |
+| 88-94 | 2254-2260 (starts with the second `compacted` line, fixture line 88) |
+
+These are **artifacts of the windows, not features of the format**:
+
+- `ordinal` jumps at fixture lines 61, 72 and 88 (the source values are kept). In a whole rollout it starts at 0
+  and increases by one per line.
+- The line before the `compacted` line at fixture line 88 is a window cut (source line 580), not a
+  `token_usage_record`. The `compacted` line at fixture line 77 does have the `token_usage_record` before it, as
+  in the source.
+- Calls and outputs, and `turn_id` groups, can be cut at a window edge (a `call_id` can be unpaired).
+- Arrays are cut to 12 items (so `guardian_history` and `replacement_history` are far shorter than in the source),
+  strings to 300 characters.
+- Timestamps and payload times are shifted into the past by one fixed offset, all before 2026-10-16.
+
+## Not in the fixture
+
+Seen in the source rollout but absent from the fixture windows: `event_msg.item_completed` items of type
+`FileChange`, `Extension` and `ImageView`; `event_msg` `task_complete`; `custom_tool_call_output` with an
+`input_image` block; `namespace` on `function_call` (the one fixture `function_call` has none); `compacted`
+payload `replacement_history` entries other than the ones kept.
 
 ## Parser checklist
 
