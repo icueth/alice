@@ -1177,6 +1177,12 @@ impl Service {
 
     pub async fn remember(&self, req: RememberRequest) -> Result<RememberResponse> {
         let _busy = self.activity.enter();
+        self.remember_spooled(req).await
+    }
+
+    /// [`remember`](Self::remember) for a write the spool queued: the drain is the daemon's own
+    /// timer, not a request, so it does not keep maintenance (backups included) from starting.
+    pub async fn remember_spooled(&self, req: RememberRequest) -> Result<RememberResponse> {
         let project = self
             .choose(req.project.as_deref(), req.cwd.as_deref())
             .await?;
@@ -2907,8 +2913,14 @@ impl Service {
         }
     }
 
-    pub async fn ingest(&self, mut req: IngestRequest) -> Result<IngestOutcome> {
+    pub async fn ingest(&self, req: IngestRequest) -> Result<IngestOutcome> {
         let _busy = self.activity.enter();
+        self.ingest_spooled(req).await
+    }
+
+    /// [`ingest`](Self::ingest) for a request the spool queued (no activity, as
+    /// [`remember_spooled`](Self::remember_spooled)).
+    pub async fn ingest_spooled(&self, mut req: IngestRequest) -> Result<IngestOutcome> {
         // Checked here so an oversized request never reaches (or delays) the writer.
         sources::validate_chunks(&req.chunks)?;
         let project = self

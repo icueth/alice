@@ -6,8 +6,10 @@ use alice_core::api::{IngestRequest, RememberRequest};
 use alice_core::error::AliceError;
 use alice_core::ids::new_id;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -116,20 +118,121 @@ fn withhold(dir: &Path, file: &Path, why: &str) {
     }
 }
 
-/// Apply spooled requests oldest first. Invalid requests move to `spool/rejected/`;
-/// a transient failure stops the drain so the order is kept for the next attempt.
+/// What the drain asks of the service: the daemon's [`Service`] (tests script it).
+pub(crate) trait Applier {
+    /// Apply one queued request.
+    async fn apply(&self, entry: SpoolEntry) -> Result<(), AliceError>;
+    /// Whether a write to this project would be judged under fail-closed rules right now.
+    async fn fail_closed(&self, project: Option<&str>, cwd: Option<&str>) -> bool;
+}
+
+impl Applier for Service {
+    async fn apply(&self, entry: SpoolEntry) -> Result<(), AliceError> {
+        match entry {
+            SpoolEntry::Remember(r) => self.remember_spooled(r).await.map(|_| ()),
+            SpoolEntry::Ingest(r) => self.ingest_spooled(r).await.map(|_| ()),
+        }
+    }
+
+    async fn fail_closed(&self, project: Option<&str>, cwd: Option<&str>) -> bool {
+        self.rules_fail_closed(project, cwd).await
+    }
+}
+
+/// The first wait before an entry that could not be applied is tried again; it doubles with
+/// every failure up to [`MAX_RETRY`].
+const FIRST_RETRY: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(15)
+};
+const MAX_RETRY: Duration = Duration::from_secs(600);
+/// An entry that fails this many times in a row with the same error (not a refusal, not a
+/// transient state the drain can see) is moved to `rejected/`, so it cannot hold back the
+/// entries queued after it for ever.
+const MAX_SAME_FAILURES: u32 = 6;
+
+/// An entry that could not be applied: how often in a row, with what error, when to try again,
+/// and whether the entries after it wait for it (a failure keeps the order; an entry kept under
+/// fail-closed rules does not hold the others back).
+struct Retry {
+    failures: u32,
+    last: String,
+    next: Instant,
+    holds: bool,
+}
+
+static RETRY: std::sync::LazyLock<parking_lot::Mutex<HashMap<PathBuf, Retry>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Count a failure of `file` with `error`; the number of failures in a row with that error.
+fn failed(file: &Path, error: &str, holds: bool, now: Instant) -> u32 {
+    let mut all = RETRY.lock();
+    let r = all.entry(file.to_path_buf()).or_insert(Retry {
+        failures: 0,
+        last: String::new(),
+        next: now,
+        holds,
+    });
+    if r.last != error || r.holds != holds {
+        r.failures = 0;
+        r.last = error.to_string();
+        r.holds = holds;
+    }
+    r.failures += 1;
+    r.next = now + retry_wait(FIRST_RETRY, r.failures);
+    r.failures
+}
+
+/// The wait after the `failures`-th failure in a row: `first`, doubling, at most [`MAX_RETRY`].
+fn retry_wait(first: Duration, failures: u32) -> Duration {
+    first
+        .saturating_mul(2u32.saturating_pow(failures.saturating_sub(1).min(16)))
+        .min(MAX_RETRY)
+}
+
+/// Apply spooled requests oldest first. Invalid requests move to `spool/rejected/`; a failure
+/// stops the drain so the order is kept for the next attempt, and is tried again after a
+/// growing wait (an entry that keeps failing the same way is moved to `rejected/` after
+/// [`MAX_SAME_FAILURES`] tries). An entry refused only because its rules are in a fail-closed
+/// state stays queued and is tried again after a growing wait, without holding the others back.
+/// The drain is not activity: it never keeps maintenance from starting.
 ///
 /// Delivery is at-least-once: an entry applied just before a crash is applied again on the
 /// next drain, which is harmless because `remember` and `ingest` both skip content they
 /// already hold.
 pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
+    drain_with(dir, svc).await
+}
+
+pub(crate) async fn drain_with<A: Applier>(dir: &Path, svc: &A) -> DrainReport {
     let mut report = DrainReport::default();
     let files = entries(dir);
+    let now = Instant::now();
     // Forget entries that are gone, so a new one with the same name would be reported again.
     REPORTED
         .lock()
         .retain(|p| p.parent() != Some(dir) || files.contains(p));
+    RETRY
+        .lock()
+        .retain(|p, _| p.parent() != Some(dir) || files.contains(p));
     for (i, file) in files.iter().enumerate() {
+        let waiting = RETRY
+            .lock()
+            .get(file)
+            .filter(|r| r.next > now)
+            .map(|r| r.holds);
+        match waiting {
+            Some(true) => {
+                report.remaining = files.len() - i;
+                return report;
+            }
+            Some(false) => {
+                report.remaining += 1;
+                continue;
+            }
+            None => {}
+        }
         let parsed: Result<SpoolEntry, String> = std::fs::read(file)
             .map_err(|e| e.to_string())
             .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()));
@@ -145,13 +248,11 @@ pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
             SpoolEntry::Remember(r) => (r.project.clone(), r.cwd.clone()),
             SpoolEntry::Ingest(r) => (r.project.clone(), r.cwd.clone()),
         };
-        let result = match entry {
-            SpoolEntry::Remember(r) => svc.remember(r).await.map(|_| ()),
-            SpoolEntry::Ingest(r) => svc.ingest(r).await.map(|_| ()),
-        };
+        let result = svc.apply(entry).await;
         match result {
             Ok(()) => {
                 let _ = std::fs::remove_file(file);
+                RETRY.lock().remove(file);
                 report.processed += 1;
             }
             // A request that block mode refuses held a secret: only the reason is kept.
@@ -159,9 +260,10 @@ pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
                 // Refused only because the project's rules are in a fail-closed state (a
                 // half-written `.alice.toml`, say): keep the entry for the next drain.
                 if svc
-                    .rules_fail_closed(scope.0.as_deref(), scope.1.as_deref())
+                    .fail_closed(scope.0.as_deref(), scope.1.as_deref())
                     .await
                 {
+                    failed(file, "fail-closed", false, now);
                     if REPORTED.lock().insert(file.clone()) {
                         tracing::warn!(
                             entry = %file.display(),
@@ -179,7 +281,22 @@ pub async fn drain(dir: &Path, svc: &Service) -> DrainReport {
                 report.rejected += 1;
             }
             Err(e) => {
-                tracing::warn!(error = %e, "spool drain paused");
+                let why = e.to_string();
+                let n = failed(file, &why, true, now);
+                if n >= MAX_SAME_FAILURES {
+                    tracing::warn!(error = %e, entry = %file.display(), failures = n, "a spooled request keeps failing the same way; moved to spool/rejected so the requests after it go ahead");
+                    reject(
+                        dir,
+                        file,
+                        &format!(
+                            "{why}\nIt failed {n} times in a row the same way and was moved aside so the requests after it could be applied; queue it again once the cause is fixed."
+                        ),
+                    );
+                    RETRY.lock().remove(file);
+                    report.rejected += 1;
+                    continue;
+                }
+                tracing::warn!(error = %e, failures = n, "spool drain paused; the request is tried again later");
                 report.remaining = files.len() - i;
                 return report;
             }
@@ -405,6 +522,115 @@ mod tests {
                 .any(|e| e.path().extension().is_some_and(|x| x == "json")),
             "the refused request itself is gone"
         );
+    }
+
+    /// Final review D-I1: a request the store keeps refusing the same way holds the queue only
+    /// for a few tries: then it is moved to `rejected/` (with the reason) and the requests after
+    /// it are applied, in order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_entry_that_keeps_failing_the_same_way_is_moved_aside_and_the_rest_go_ahead() {
+        struct Script {
+            applied: parking_lot::Mutex<Vec<String>>,
+        }
+        impl Applier for Script {
+            async fn apply(&self, entry: SpoolEntry) -> Result<(), AliceError> {
+                let SpoolEntry::Remember(r) = entry else {
+                    unreachable!()
+                };
+                if r.content == "poison" {
+                    return Err(AliceError::Other("the store said no".into()));
+                }
+                self.applied.lock().push(r.content);
+                Ok(())
+            }
+            async fn fail_closed(&self, _: Option<&str>, _: Option<&str>) -> bool {
+                false
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("spool");
+        for c in ["first", "poison", "second", "third"] {
+            append(&dir, &remember(c)).unwrap();
+        }
+        let svc = Script {
+            applied: Default::default(),
+        };
+        for n in 1..MAX_SAME_FAILURES {
+            let r = drain_with(&dir, &svc).await;
+            assert_eq!((r.rejected, r.remaining), (0, 3), "drain {n}: {r:?}");
+        }
+        assert_eq!(
+            *svc.applied.lock(),
+            ["first"],
+            "the order is kept meanwhile"
+        );
+        let r = drain_with(&dir, &svc).await;
+        assert_eq!((r.processed, r.rejected, r.remaining), (2, 1, 0), "{r:?}");
+        assert_eq!(*svc.applied.lock(), ["first", "second", "third"]);
+        let why: String = std::fs::read_dir(dir.join("rejected"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "err"))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(
+            why.contains("the store said no") && why.contains("times in a row"),
+            "{why}"
+        );
+        assert!(
+            std::fs::read_dir(dir.join("rejected"))
+                .unwrap()
+                .flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "json")),
+            "the request itself is kept"
+        );
+    }
+
+    /// Final review D-I1: retrying a request that is kept or failing waits longer each time.
+    #[test]
+    fn a_failing_entry_waits_longer_each_time_up_to_ten_minutes() {
+        let first = Duration::from_secs(15);
+        let waits: Vec<u64> = (1..=8).map(|n| retry_wait(first, n).as_secs()).collect();
+        assert_eq!(waits, [15, 30, 60, 120, 240, 480, 600, 600]);
+        assert_eq!(retry_wait(first, 1_000), MAX_RETRY);
+    }
+
+    /// Final review D-I1: a spooled request kept under fail-closed rules is not activity: it
+    /// never keeps maintenance (the daily backup included) from starting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kept_spool_entry_does_not_count_as_activity() {
+        let d = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(d.path().to_path_buf());
+        let svc = start(&home);
+        let dir = home.spool_dir();
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join(".alice.toml"), "[privacy\nblock_secrets = tru").unwrap();
+        append(
+            &dir,
+            &SpoolEntry::Remember(RememberRequest {
+                content: format!("kept with {GITHUB}"),
+                cwd: Some(work.to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        for _ in 0..3 {
+            let before = svc.activity().idle_for();
+            assert_eq!(drain(&dir, &svc).await.remaining, 1);
+            assert!(
+                svc.activity().idle_for() >= before,
+                "the drain counted as a request"
+            );
+        }
+        assert!(svc.activity().idle_for() >= Duration::from_millis(150));
+        // An applied entry is not activity either.
+        append(&dir, &remember("plain")).unwrap();
+        let before = svc.activity().idle_for();
+        assert_eq!(drain(&dir, &svc).await.processed, 1);
+        assert!(svc.activity().idle_for() >= before);
+        svc.shutdown();
     }
 
     /// A refusal that comes from a fail-closed state (a half-written `.alice.toml`) keeps the
