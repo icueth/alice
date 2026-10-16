@@ -384,7 +384,7 @@ palace ขนาด 122,000 drawer import เสร็จในราว 2 น�
 
 prompt และ hook ที่เขียนไว้สำหรับ MemPalace เรียก tool ชื่อ `mempalace_*` Alice ตอบ 15 ตัวจากข้อมูลของตัวเองในรูปแบบเดียวกับที่ MemPalace ส่งกลับ ได้แก่ `status`, `search`, `add_drawer`, `get_drawer`, `update_drawer`, `delete_drawer`, `diary_write`, `diary_read`, `kg_query`, `kg_add`, `kg_invalidate`, `kg_supersede`, `kg_timeline`, `list_wings` และ `list_rooms`
 
-layer นี้คือการตั้งค่า `compat.mempalace` การ import จริง (ไม่ใช่ `--dry-run`) จะเปิดให้เองถ้าคุณไม่เคยตั้งค่านี้ มิฉะนั้นใช้:
+layer นี้คือการตั้งค่า `compat.mempalace` การ import จริง (ไม่ใช่ `--dry-run`) ที่จบโดยไม่มี error จะเปิดให้เองถ้าคุณไม่เคยตั้งค่านี้ (ถ้ามี error จะยังปิดอยู่ และรายงานจะบอกไว้) มิฉะนั้นใช้:
 
 ```bash
 alice config set compat.mempalace true     # หรือ false เพื่อซ่อน tool อีกครั้ง

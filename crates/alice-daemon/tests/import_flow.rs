@@ -2930,3 +2930,37 @@ async fn the_id_mempalace_answered_for_a_cut_drawer_leads_to_it_and_an_older_hom
     );
     assert_eq!(memory_count(&f).await, 3);
 }
+
+/// An import that ends with errors does not turn the compatibility layer on (its tools would
+/// answer from a partial store) and says so; a clean rerun then does.
+#[tokio::test(flavor = "multi_thread")]
+async fn compat_stays_off_after_an_import_that_ended_with_errors() {
+    let hook = Arc::new(ImportHook::default());
+    hook.refuse.lock().unwrap().extend(["k_dec".to_string()]);
+    let h = hook.clone();
+    let f = Flow::with_options(&fixture_specs(), move |_| ServiceOptions {
+        import_hook: Some(h),
+        ..Default::default()
+    })
+    .await;
+    let st = f.run_import(f.request()).await;
+    assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
+    let r = st.report.unwrap();
+    assert!(!r.errors.is_empty());
+    assert!(!r.compat_enabled);
+    assert!(!f.setting_bool("compat.mempalace").await);
+    assert!(f.events_of("import.compat_enabled").await.is_empty());
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("compat.mempalace") && w.contains("errors")),
+        "{:?}",
+        r.warnings
+    );
+
+    hook.refuse.lock().unwrap().clear();
+    let clean = f.run_import(f.request()).await.report.unwrap();
+    assert!(clean.errors.is_empty(), "{:?}", clean.errors);
+    assert!(clean.compat_enabled);
+    assert!(f.setting_bool("compat.mempalace").await);
+}

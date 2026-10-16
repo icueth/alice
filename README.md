@@ -384,7 +384,7 @@ One 122,000-drawer palace imported in about two minutes (peak memory under 200 M
 
 Prompts and hooks written for MemPalace call tools named `mempalace_*`. Alice answers fifteen of them from its own data, in the shape MemPalace returns: `status`, `search`, `add_drawer`, `get_drawer`, `update_drawer`, `delete_drawer`, `diary_write`, `diary_read`, `kg_query`, `kg_add`, `kg_invalidate`, `kg_supersede`, `kg_timeline`, `list_wings` and `list_rooms`.
 
-The layer is the setting `compat.mempalace`. A real (not `--dry-run`) import turns it on if you never set it yourself; otherwise:
+The layer is the setting `compat.mempalace`. A real (not `--dry-run`) import that ends without errors turns it on if you never set it yourself (after errors it stays off, and the report says so); otherwise:
 
 ```bash
 alice config set compat.mempalace true     # or false to hide the tools again

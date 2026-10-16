@@ -1735,11 +1735,17 @@ enum Compat {
 }
 
 /// A real run that found `compat.mempalace` at its default turns it on (a value the owner wrote,
-/// even `false`, is left alone). Says what happened.
-fn enable_compat(env: &ImportEnv, job_id: &str) -> Compat {
+/// even `false`, is left alone), unless the run ended with errors (`clean` false): then it is
+/// left off, and the warning says so. Says what happened.
+fn enable_compat(env: &ImportEnv, job_id: &str, clean: bool) -> Compat {
     const KEY: &str = "compat.mempalace";
     if env.settings.resolved().sources.get(KEY) != Some(&Source::Default) {
         return Compat::Left;
+    }
+    if !clean {
+        return Compat::Warning(
+            "the MemPalace compatibility layer was left off because the import ended with errors (its tools would answer from a partial store); run the import again once they are fixed, or turn it on with `alice config set compat.mempalace true`".into(),
+        );
     }
     let mut change = serde_json::Map::new();
     change.insert(KEY.to_string(), serde_json::Value::Bool(true));
@@ -2082,8 +2088,10 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     report.phases = phases;
     report.peak_rss_mb = peak_rss_mb();
     report.finished_at = Some(finished_at);
+    // Only a clean run turns the layer on: after errors its tools would answer from a partial
+    // store.
     if !req.dry_run {
-        match enable_compat(env, job_id) {
+        match enable_compat(env, job_id, report.errors.is_empty()) {
             Compat::Enabled => report.compat_enabled = true,
             Compat::Warning(w) => report.warnings.push(w),
             Compat::Left => {}
