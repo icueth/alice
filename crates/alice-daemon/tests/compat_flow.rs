@@ -42,11 +42,16 @@ struct Flow {
 impl Flow {
     /// A service whose store holds the imported fixture palace.
     async fn imported() -> Flow {
+        Self::imported_with(&fixture_specs()).await
+    }
+
+    /// A service whose store holds a palace of these drawers, imported.
+    async fn imported_with(specs: &[alice_core::import::fixture::DrawerSpec]) -> Flow {
         let root = tempfile::tempdir().unwrap();
         let palace_root = tempfile::tempdir().unwrap();
         let palace = palace_root.path().join("palace");
         std::fs::create_dir_all(&palace).unwrap();
-        build_sqlite_exact(&palace, &fixture_specs());
+        build_sqlite_exact(&palace, specs);
         let home = AliceHome::new(root.path().join("alice"));
         let svc = Service::start(
             home,
@@ -400,6 +405,62 @@ async fn get_drawer_resolves_alice_ids_old_ids_collapsed_ids_and_raw_chunks() {
         missing["error"].as_str().unwrap().contains("not found"),
         "{missing}"
     );
+}
+
+/// The id of a long entry, as MemPalace answered it (`<id>`; it stores only the fragments
+/// `<id>_chunk_NNNNNN`, each naming it as `parent_drawer_id`).
+const LOGICAL: &str = "drawer_pg_ai_decisions_5f3a9c";
+
+/// The fixture palace plus one decision MemPalace cut into two fragments.
+fn specs_with_a_cut_drawer() -> Vec<alice_core::import::fixture::DrawerSpec> {
+    let mut specs = fixture_specs();
+    for (n, text) in [
+        (0, "We picked the framed proto"),
+        (1, "buf layout for v4 frames."),
+    ] {
+        let mut d = palace::knowledge(
+            &format!("{LOGICAL}_chunk_{n:06}"),
+            text,
+            "pg-ai",
+            "decisions",
+        );
+        d.meta.chunk_index = Some(n);
+        d.meta.parent_drawer_id = Some(LOGICAL.into());
+        specs.push(d);
+    }
+    specs
+}
+
+/// The id MemPalace answered for a long entry still gets, updates and deletes it after the
+/// import, as MemPalace's own tools did.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_id_mempalace_answered_for_a_long_entry_gets_updates_and_deletes_it() {
+    let f = Flow::imported_with(&specs_with_a_cut_drawer()).await;
+    let got = f
+        .call("mempalace_get_drawer", json!({"drawer_id": LOGICAL}))
+        .await;
+    assert_eq!(
+        got["content"], "We picked the framed protobuf layout for v4 frames.",
+        "{got}"
+    );
+    let id = got["drawer_id"].as_str().unwrap().to_string();
+    let up = f
+        .call(
+            "mempalace_update_drawer",
+            json!({"drawer_id": LOGICAL, "content": "We picked the framed protobuf layout."}),
+        )
+        .await;
+    assert_eq!(up["success"], true, "{up}");
+    assert_eq!(up["drawer_id"], id.as_str(), "{up}");
+    assert_eq!(
+        f.memory(&id).await.body,
+        "We picked the framed protobuf layout."
+    );
+    let del = f
+        .call("mempalace_delete_drawer", json!({"drawer_id": LOGICAL}))
+        .await;
+    assert_eq!(del["success"], true, "{del}");
+    assert!(f.is_forgotten(&id).await);
 }
 
 #[tokio::test(flavor = "multi_thread")]

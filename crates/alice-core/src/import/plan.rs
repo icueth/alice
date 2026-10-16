@@ -667,6 +667,10 @@ pub struct Survey {
     /// The fragments of raw drawers (two or more fragments) other than the first: each is
     /// planned with its drawer, under the first fragment's id (`fragments` lists them).
     pub raw_tails: HashSet<String>,
+    /// First fragment's id -> the id MemPalace answered for the drawer it cut (its fragments'
+    /// `parent_drawer_id`, else the id they share), which its get, update and delete accept.
+    /// Only drawers of two or more fragments whose id is not a drawer of its own.
+    pub logical_ids: HashMap<String, String>,
 }
 
 /// What the survey keeps per knowledge or checkpoint drawer (or fragment of one): no text.
@@ -678,6 +682,16 @@ struct Fragment {
     filed: String,
     /// A checkpoint's source uri.
     uri: Option<String>,
+    /// `parent_drawer_id`: the id MemPalace answered for the drawer this fragment is part of.
+    parent: Option<String>,
+}
+
+/// What the survey keeps per fragment of a raw drawer: its row, its place in the drawer and the
+/// id MemPalace answered for the drawer (`parent_drawer_id`).
+struct RawFragment {
+    index: Option<i64>,
+    parent: Option<String>,
+    row: RawRow,
 }
 
 /// What the survey keeps per raw drawer: no text.
@@ -750,7 +764,7 @@ fn survey_paged(
     // Fragments of raw drawers by (drawer id, source uri), with their place in the drawer: ids,
     // times and hashes only. MemPalace cuts few drawers that carry a source file (79 fragments
     // on the owner's palace).
-    let mut raw_fragments: HashMap<(String, String), Vec<(Option<i64>, RawRow)>> = HashMap::new();
+    let mut raw_fragments: HashMap<(String, String), Vec<RawFragment>> = HashMap::new();
     let mut after: Option<String> = None;
     loop {
         let page = reader.page(after.as_deref(), page_size, since)?;
@@ -778,6 +792,7 @@ fn survey_paged(
                         index: fragment_index(&d.id, &d.meta),
                         uri: checkpoint.then(|| checkpoint_uri(&d.meta)),
                         filed,
+                        parent: d.meta.parent_drawer_id.clone(),
                         id: d.id,
                     };
                     // Fragments are gathered under their drawer's id; anything else is a drawer of its own.
@@ -815,6 +830,7 @@ fn survey_paged(
                         }
                     }
                     let index = fragment_index(&d.id, &d.meta);
+                    let parent = d.meta.parent_drawer_id.clone();
                     let row = RawRow {
                         hash: text_hash(&d.text),
                         chunk_index: d.meta.chunk_index,
@@ -832,7 +848,7 @@ fn survey_paged(
                         raw_fragments
                             .entry((base.to_string(), uri))
                             .or_default()
-                            .push((index, row));
+                            .push(RawFragment { index, parent, row });
                         continue;
                     }
                     out.raw_source_of.insert(row.id.clone(), uri.clone());
@@ -845,9 +861,24 @@ fn survey_paged(
     counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out.wing_counts = counts;
 
+    // The id MemPalace answered for a drawer it cut is filed with the drawer unless the palace
+    // holds a drawer of that id in its own right (that drawer keeps its id).
+    let own_ids: HashSet<String> = drawers
+        .keys()
+        .filter(|(_, _, fragment)| !fragment)
+        .map(|(id, _, _)| id.clone())
+        .collect();
+    let mut out_logical: HashMap<String, String> = HashMap::new();
+    let mut logical =
+        |head: &str, parent: Option<&String>, base: &str, raw_ids: &HashMap<String, String>| {
+            let id = parent.map_or(base, String::as_str);
+            if !id.is_empty() && !own_ids.contains(id) && !raw_ids.contains_key(id) {
+                out_logical.insert(head.to_string(), id.to_string());
+            }
+        };
     let mut knowledge: Vec<(String, String)> = Vec::new();
     let mut checkpoints: Vec<(String, String)> = Vec::new();
-    for ((_, checkpoint, _), mut members) in drawers {
+    for ((base, checkpoint, _), mut members) in drawers {
         members.sort_by(|a, b| {
             (a.index.unwrap_or(i64::MAX), &a.id).cmp(&(b.index.unwrap_or(i64::MAX), &b.id))
         });
@@ -884,6 +915,7 @@ fn survey_paged(
             knowledge.push((filed, head.clone()));
         }
         if members.len() > 1 {
+            logical(&head, members[0].parent.as_ref(), &base, &out.raw_source_of);
             out.fragments
                 .insert(head, members.into_iter().map(|m| m.id).collect());
         }
@@ -898,42 +930,44 @@ fn survey_paged(
     // A raw drawer of two or more fragments is one row of its source, under its first fragment:
     // one position, and one hash made of the fragments' hashes in order (a repeat of the whole
     // drawer collapses onto it). Its text is joined, then redacted whole, by the planner.
-    for ((_, uri), mut members) in raw_fragments {
+    for ((base, uri), mut members) in raw_fragments {
         if members.len() == 1 {
-            let (_, row) = members.remove(0);
+            let row = members.remove(0).row;
             out.raw_source_of.insert(row.id.clone(), uri.clone());
             sources.entry(uri).or_default().push(row);
             continue;
         }
         members.sort_by(|a, b| {
-            (a.0.unwrap_or(i64::MAX), &a.1.id).cmp(&(b.0.unwrap_or(i64::MAX), &b.1.id))
+            (a.index.unwrap_or(i64::MAX), &a.row.id).cmp(&(b.index.unwrap_or(i64::MAX), &b.row.id))
         });
         let mut digest = Sha256::new();
         digest.update(b"fragments\0");
-        for (_, r) in &members {
-            digest.update(r.hash);
+        for m in &members {
+            digest.update(m.row.hash);
         }
         let mut hash = [0u8; 16];
         hash.copy_from_slice(&digest.finalize()[..16]);
         let filed = members
             .iter()
-            .map(|(_, r)| r.filed.as_str())
+            .map(|m| m.row.filed.as_str())
             .filter(|f| !f.is_empty())
             .min()
             .unwrap_or("")
             .to_string();
-        let ids: Vec<String> = members.iter().map(|(_, r)| r.id.clone()).collect();
+        let ids: Vec<String> = members.iter().map(|m| m.row.id.clone()).collect();
         let head = ids[0].clone();
+        logical(&head, members[0].parent.as_ref(), &base, &out.raw_source_of);
         out.raw_tails.extend(ids[1..].iter().cloned());
         out.raw_source_of.insert(head.clone(), uri.clone());
         sources.entry(uri).or_default().push(RawRow {
             id: head.clone(),
-            chunk_index: members[0].1.chunk_index,
+            chunk_index: members[0].row.chunk_index,
             filed,
             hash,
         });
         out.fragments.insert(head, ids);
     }
+    out.logical_ids = out_logical;
 
     for (uri, mut rows) in sources {
         rows.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
@@ -2516,6 +2550,47 @@ mod tests {
             planner.plan_group(&members_of(r.as_ref(), &sv, "drawer_r_chunk_000000")),
             Planned::Collapsed { keeper } if keeper == head
         ));
+    }
+
+    /// The id MemPalace answered for a drawer it cut (the fragments' `parent_drawer_id`, else
+    /// the id they share) is kept for the drawer, so the import can file it with it. A drawer
+    /// that was never cut has none, a lone fragment has none, and neither has a drawer whose
+    /// shared id is a drawer of the palace in its own right.
+    #[test]
+    fn the_survey_keeps_the_id_mempalace_answered_for_a_drawer_it_cut() {
+        let t = "2026-04-16T11:00:00";
+        let parented = |id: &str, ci: i64| {
+            let mut sp = diary_spec(id, id, "setup", Some(ci), t);
+            sp.meta.parent_drawer_id = s("diary_p_logical");
+            sp
+        };
+        let specs = vec![
+            diary_spec("diary_a_chunk_000000", "a", "setup", Some(0), t),
+            diary_spec("diary_a_chunk_000001", "b", "setup", Some(1), t),
+            parented("diary_p_chunk_000000", 0),
+            parented("diary_p_chunk_000001", 1),
+            diary_spec("diary_x", "x itself", "setup", None, t),
+            diary_spec("diary_x_chunk_000000", "x0", "setup", Some(0), t),
+            diary_spec("diary_x_chunk_000001", "x1", "setup", Some(1), t),
+            diary_spec("diary_c", "never cut", "setup", None, t),
+            diary_spec("diary_d_chunk_000000", "solo", "setup", Some(0), t),
+            diary_spec("diary_e_chunk_000000", "cp1", "checkpoint", Some(0), t),
+            diary_spec("diary_e_chunk_000001", "cp2", "checkpoint", Some(1), t),
+            raw_file_spec("drawer_n_chunk_000000", "first half, ", Some(0)),
+            raw_file_spec("drawer_n_chunk_000001", "second half", Some(1)),
+        ];
+        let mut wm = wings();
+        let sv = run(&specs, None, &mut wm, &no_reserved);
+        let want: std::collections::HashMap<String, String> = [
+            ("diary_a_chunk_000000", "diary_a"),
+            ("diary_p_chunk_000000", "diary_p_logical"),
+            ("diary_e_chunk_000000", "diary_e"),
+            ("drawer_n_chunk_000000", "drawer_n"),
+        ]
+        .into_iter()
+        .map(|(h, l)| (h.to_string(), l.to_string()))
+        .collect();
+        assert_eq!(sv.logical_ids, want);
     }
 
     #[test]

@@ -574,6 +574,8 @@ enum Unit {
         dup: bool,
         /// The keys of the other fragments joined into this drawer.
         joined: Vec<String>,
+        /// The key of the id MemPalace answered for the drawer it cut (no drawer of the palace).
+        logical: Option<String>,
     },
     Chunks {
         slug: String,
@@ -581,18 +583,30 @@ enum Unit {
         chunks: Vec<ChunkInput>,
         /// The keys of the other fragments joined into this drawer.
         joined: Vec<String>,
+        /// As for `Memories`.
+        logical: Option<String>,
     },
 }
 
 impl Unit {
     fn weight(&self) -> (usize, usize) {
         match self {
-            Unit::Memories { items, joined, .. } => (
-                items.len() + joined.len(),
+            Unit::Memories {
+                items,
+                joined,
+                logical,
+                ..
+            } => (
+                items.len() + joined.len() + usize::from(logical.is_some()),
                 items.iter().map(|m| m.content.len() + 64).sum(),
             ),
-            Unit::Chunks { chunks, joined, .. } => (
-                chunks.len() + joined.len(),
+            Unit::Chunks {
+                chunks,
+                joined,
+                logical,
+                ..
+            } => (
+                chunks.len() + joined.len() + usize::from(logical.is_some()),
                 chunks.iter().map(|c| c.text.len() + 64).sum(),
             ),
         }
@@ -681,6 +695,10 @@ struct Ctx<'a> {
     sent_projects: HashSet<String>,
     /// (collapsed drawer key, keeper key), recorded in the `collapsed` phase.
     collapsed: Vec<(String, String)>,
+    /// (key of the id MemPalace answered for a drawer it cut, key of the drawer's first
+    /// fragment), filed after the `collapsed` phase where the first fragment's id is stored by
+    /// then: drawers an earlier run stored before such ids were filed, and collapsed ones.
+    pending_logical: Vec<(String, String)>,
     /// Batches the writer has taken (nothing was written while this is 0).
     submitted: u64,
     /// Tunnel links and review items wait for the closing batch.
@@ -715,6 +733,12 @@ impl Ctx<'_> {
             .map(|m| self.filter.legacy_key(&m.id))
             .collect();
         let extra = joined.len() as u64;
+        // The id MemPalace answered for a drawer it cut is filed with the drawer; it is no drawer
+        // of the palace, so it is never counted.
+        let logical = (members.len() > 1)
+            .then(|| self.survey.logical_ids.get(&d.id))
+            .flatten()
+            .map(|l| self.filter.legacy_key(l));
         match planned {
             Planned::Memories(parts) => {
                 let first = parts.first()?;
@@ -756,6 +780,7 @@ impl Ctx<'_> {
                     items,
                     dup: duplicate,
                     joined,
+                    logical,
                 })
             }
             Planned::Chunks(parts) => {
@@ -793,6 +818,7 @@ impl Ctx<'_> {
                     source,
                     chunks,
                     joined,
+                    logical,
                 })
             }
             Planned::Skipped { reason } => {
@@ -812,9 +838,13 @@ impl Ctx<'_> {
                 self.tally.raw_collapsed += 1 + extra;
                 if !self.dry {
                     let keeper = self.filter.legacy_key(&keeper);
-                    self.collapsed.push((key, keeper.clone()));
+                    self.collapsed.push((key.clone(), keeper.clone()));
                     self.collapsed
                         .extend(joined.into_iter().map(|j| (j, keeper.clone())));
+                    // Filed once the drawer's own id points at the keeper.
+                    if let Some(l) = logical {
+                        self.pending_logical.push((l, key));
+                    }
                 }
                 None
             }
@@ -885,6 +915,7 @@ impl Ctx<'_> {
                     slug,
                     items,
                     joined,
+                    logical,
                     ..
                 } => {
                     slugs.insert(slug.clone());
@@ -892,7 +923,7 @@ impl Ctx<'_> {
                     if let Some(head) = head {
                         batch
                             .joined
-                            .extend(joined.into_iter().map(|f| (f, head.clone())));
+                            .extend(joined.into_iter().chain(logical).map(|f| (f, head.clone())));
                     }
                     batch
                         .memories
@@ -906,13 +937,14 @@ impl Ctx<'_> {
                     source,
                     chunks,
                     joined,
+                    logical,
                 } => {
                     slugs.insert(slug.clone());
                     let head = chunks.first().and_then(|c| c.legacy_id.clone());
                     if let Some(head) = head {
                         batch
                             .joined
-                            .extend(joined.into_iter().map(|f| (f, head.clone())));
+                            .extend(joined.into_iter().chain(logical).map(|f| (f, head.clone())));
                     }
                     let k = (
                         slug.clone(),
@@ -1090,13 +1122,18 @@ impl Ctx<'_> {
             // Drawers stored before cost nothing more: no reading, no redaction, no planning.
             let wanted: Vec<(&String, Vec<String>)> =
                 group.iter().map(|id| (id, members_of(id))).collect();
+            // The ids MemPalace answered for drawers it cut are looked up too (never counted).
+            let filter = self.filter;
+            let logical_key =
+                |head: &String| survey.logical_ids.get(head).map(|l| filter.legacy_key(l));
             let keys: Vec<String> = wanted
                 .iter()
                 .flat_map(|(_, ms)| ms.iter().map(|m| self.filter.legacy_key(m)))
+                .chain(wanted.iter().filter_map(|(head, _)| logical_key(head)))
                 .collect();
             let stored = self.stored(&keys)?;
             let mut fresh: Vec<Vec<String>> = Vec::new();
-            for (_, ms) in wanted {
+            for (head, ms) in wanted {
                 let known = ms
                     .iter()
                     .filter(|m| stored.contains(&self.filter.legacy_key(m)))
@@ -1114,6 +1151,9 @@ impl Ctx<'_> {
                 }
                 if known < ms.len() {
                     self.tally.partial_groups += 1;
+                } else if let Some(l) = logical_key(head).filter(|l| !stored.contains(l)) {
+                    // Stored whole by a run from before such ids were filed: file it now.
+                    self.backfill_logical(l, self.filter.legacy_key(head));
                 }
             }
             let ids: Vec<String> = fresh.iter().flatten().cloned().collect();
@@ -1183,6 +1223,11 @@ impl Ctx<'_> {
                         already(&mut self.tally, ids.len() as u64);
                         if known < ids.len() {
                             self.tally.partial_groups += 1;
+                        } else if let Some(l) = survey.logical_ids.get(&d.id) {
+                            let l = self.filter.legacy_key(l);
+                            if self.stored(std::slice::from_ref(&l))?.is_empty() {
+                                self.backfill_logical(l, key.clone());
+                            }
                         }
                         continue;
                     }
@@ -1215,6 +1260,37 @@ impl Ctx<'_> {
             self.finish_batch()?;
             self.done += raw.len() as u64;
             self.progress();
+        }
+        Ok(())
+    }
+
+    /// Files the id MemPalace answered for a drawer it cut against the drawer's first fragment
+    /// (`head`), after the `collapsed` phase. A dry run files nothing.
+    fn backfill_logical(&mut self, logical: String, head: String) {
+        if !self.dry {
+            self.pending_logical.push((logical, head));
+        }
+    }
+
+    /// After the `collapsed` phase: the ids MemPalace answered for drawers it cut that were not
+    /// filed with their drawer (it was stored by an earlier run, or it collapsed onto another),
+    /// each pointing where the drawer's first fragment went. One whose first fragment is not
+    /// stored (its keeper was held back) waits for the next run.
+    fn logical_pass(&mut self) -> Result<()> {
+        let pairs = std::mem::take(&mut self.pending_logical);
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let heads: Vec<String> = pairs.iter().map(|(_, h)| h.clone()).collect();
+        let stored = self.stored(&heads)?;
+        let ready: Vec<(String, String)> = pairs
+            .into_iter()
+            .filter(|(_, h)| stored.contains(h))
+            .collect();
+        for part in ready.chunks(COLLAPSED_PER_BATCH) {
+            let mut batch = self.batch();
+            batch.joined = part.to_vec();
+            self.submit(batch)?;
         }
         Ok(())
     }
@@ -1479,7 +1555,8 @@ impl Ctx<'_> {
             }
             self.tally.reviews_created += open;
             // A link needs both ends among the memories this run would make or an earlier run made
-            // (fragments of knowledge drawers included; checkpoint and raw drawers are chunks).
+            // (fragments of knowledge drawers and the ids MemPalace answered for them included;
+            // checkpoint and raw drawers are chunks).
             let survey = self.survey;
             let known: HashSet<String> = survey
                 .knowledge_order
@@ -1489,6 +1566,8 @@ impl Ctx<'_> {
                         .fragments
                         .get(head)
                         .map_or_else(|| std::slice::from_ref(head), Vec::as_slice)
+                        .iter()
+                        .chain(survey.logical_ids.get(head))
                 })
                 .map(|id| self.filter.legacy_key(id))
                 .collect();
@@ -1809,6 +1888,7 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
         aliases,
         sent_projects: HashSet::new(),
         collapsed: Vec::new(),
+        pending_logical: Vec::new(),
         submitted: 0,
         pending_links: Vec::new(),
         pending_reviews: Vec::new(),
@@ -1831,7 +1911,8 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     }
     if outcome.is_ok() {
         outcome = run_phase(&env.status, &mut phases, "collapsed", || {
-            ctx.collapsed_pass()
+            ctx.collapsed_pass()?;
+            ctx.logical_pass()
         });
     }
     if outcome.is_ok() {

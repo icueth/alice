@@ -2852,3 +2852,81 @@ async fn a_secret_cut_by_a_fragment_boundary_of_a_raw_file_drawer_never_reaches_
         partial.warnings
     );
 }
+
+/// MemPalace answers a long entry with an id it stores no drawer under (the fragments are
+/// `<id>_chunk_NNNNNN`): the import files that id with the drawer, so it resolves and a fact
+/// naming it keeps its source memory, without counting it as a drawer. A home imported before
+/// gets it filed by the next run, which plans nothing and calls no drawer partial.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_id_mempalace_answered_for_a_cut_drawer_leads_to_it_and_an_older_home_gets_it_next_run()
+{
+    let hook = Arc::new(ImportHook::default());
+    let h = hook.clone();
+    let fact = TripleSpec {
+        id: "t_frag".into(),
+        subject: "alice".into(),
+        predicate: "wrote_about".into(),
+        object: "scheduler".into(),
+        valid_from: s("2026-04-16"),
+        source_drawer_id: s(FRAGMENTED),
+        ..Default::default()
+    };
+    let mut f = Flow::with_graph(&fragmented_specs(), &[fact], move |_| ServiceOptions {
+        import_hook: Some(h),
+        ..Default::default()
+    })
+    .await;
+    f.hook = Some(hook);
+    f.run_import(f.request().dry_run(true)).await;
+    assert_eq!(
+        f.legacy_target(FRAGMENTED).await,
+        None,
+        "a dry run files nothing"
+    );
+
+    let r = f.run_import(f.request()).await.report.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.drawers_seen, r.drawers_accounted);
+    assert_eq!(
+        (r.fragments_joined, r.fragment_groups),
+        (2, 1),
+        "the id is no drawer"
+    );
+    let head = f.legacy_target(&format!("{FRAGMENTED}_chunk_000000")).await;
+    assert!(head.as_deref().is_some_and(|t| t.starts_with("memory:")));
+    assert_eq!(f.legacy_target(FRAGMENTED).await, head);
+    let source: Option<String> = f
+        .db()
+        .query_row(
+            "SELECT source_memory_id FROM relations WHERE predicate LIKE '%wrote%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        source.map(|m| format!("memory:{m}")),
+        head,
+        "the fact keeps its source memory"
+    );
+
+    // A home imported before the id was filed.
+    f.db()
+        .execute("DELETE FROM legacy_ids WHERE legacy_id = ?1", [FRAGMENTED])
+        .unwrap();
+    let planned = f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed);
+    let again = f.run_import(f.request()).await.report.unwrap();
+    assert_eq!(
+        f.hook.as_ref().unwrap().planned.load(Ordering::Relaxed),
+        planned
+    );
+    assert_eq!(f.legacy_target(FRAGMENTED).await, head);
+    assert_eq!(again.already_imported, 5);
+    assert_eq!(again.drawers_seen, again.drawers_accounted);
+    assert!(again.errors.is_empty(), "{:?}", again.errors);
+    assert!(
+        again.warnings.iter().all(|w| !w.contains("only partly")),
+        "{:?}",
+        again.warnings
+    );
+    assert_eq!(memory_count(&f).await, 3);
+}
