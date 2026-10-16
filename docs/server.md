@@ -320,7 +320,7 @@ url = "https://<host>/u/<name>/mcp"
 bearer_token_env_var = "ALICE_TOKEN"
 ```
 
-`bearer_token_env_var` names the variable. Codex reads the token from it and sends it as `Authorization: Bearer`. Codex has no per-repository project setting here, so name the project in each request (see below) or append `?project=<slug>` to the `url`.
+`bearer_token_env_var` names the variable. Codex reads the token from it and sends it as `Authorization: Bearer`. This table sends no project, so name the project in each request (see below) or append `?project=<slug>` to the `url`. [setup-server.md](setup-server.md#step-3-codex-only-if-codex-exists) adds `env_http_headers` and a shell wrapper instead, which send the repository's folder name as `X-Alice-Project` and give Codex the token without exporting it.
 
 ### Other agents
 
@@ -491,7 +491,7 @@ sh "$HOME/.config/alice/alice-capture.sh" hook claude-code || true
 - **The background copy sends the new bytes.** It waits 2 seconds after a stop-type event (the transcript file can lag), takes a lock for that transcript, and posts the bytes after the last offset to `POST /api/v1/capture/transcript`. Bodies are at most 2 MiB, growing to 8 MiB when a turn is larger. The server keeps the cursor, stores only complete turns, and answers with the next offset; it never reads a path on the person's machine.
 - **Nothing is lost when the server is away.** On a network error or a server error the offset stays, and the next event of that session tries again: the transcript file itself is the queue. Each `SessionStart` also finishes up to five other sessions whose transcripts grew meanwhile.
 - **Nothing is stored twice.** A script that lost its offset is told the server's cursor (`409`) and jumps there; a turn sent again is skipped by its key.
-- **A refused token pauses capture for an hour.** The log says "the token was refused; run the setup command again (capture is paused for an hour)". Writing the new token into `~/.config/alice/token`, or running the setup line again, ends the pause.
+- **A refused token pauses capture for an hour.** The log says "the token was refused; run the setup command again (capture is paused for an hour)". Running the setup line again ends the pause at once: it checks the token (asking for the new one when the stored one is refused) and clears `paused-until`. A new token written into `~/.config/alice/token` alone is used only when the hour is over.
 - **The token** reaches `curl` only as a config line on its standard input (`curl -q -K -`, written by the shell's `printf`). It is never in a command line, a URL, a child's environment or a log.
 
 ### The briefing
@@ -521,7 +521,7 @@ The script names the project after the folder of the git repository the session 
 
 Captured transcripts are kept **180 days** on every tenant, pinned by the line `ALICE_CAPTURE_RAW_RETENTION=180d` in `/etc/alice/tenants/<name>.env`. The environment wins over the tenant's `config.toml`, so a person's own settings cannot keep them longer; the admin changes the line (`90d` for the heaviest tenant, say) and runs `systemctl restart alice@<name>`. The daily job `capture_retention` deletes only captured chunks: imported MemPalace history and every memory stay, distilled ones included. <!-- TODO(confirm): `alice-server add` writing the line, and `upgrade` adding it where unset, are the server lane's interface (SP2 spec §9.5); not in deploy/server/alice-server on this branch. -->
 
-At about 16.8 KB per chunk with two backups, a heavy user (about 1,000 chunks a day) holds about 3.0 GB of captured transcripts at 180 days, and a lighter one (300 a day) about 0.9 GB. See [Disk budget](#disk-budget).
+As an estimate, carrying over the 16.8 KB per imported drawer (with its two backups) that the [Disk budget](#disk-budget) measures to captured chunks, a heavy user (about 1,000 chunks a day) holds about 3.0 GB of captured transcripts at 180 days, and a lighter one (300 a day) about 0.9 GB. Captured chunks have not been measured yet.
 
 ### Distillation and the shared Jev key
 
@@ -575,7 +575,7 @@ The script's first upload of a session the machine already captured starts at of
 | `… is a local Alice daemon, not a server tenant` | The address points at a local daemon | Use the tenant address `https://<host>/u/<name>`; a local install uses `alice hooks install` |
 | `the server refused that token too … Nothing was changed.` | The token is wrong or was rotated | Ask the admin for the current token |
 | `there is no terminal to ask for the token on` | Setup ran without a terminal and without a token file | Put the token in `~/.config/alice/token` (one line, 0600) and run the line again |
-| `capture.log`: "the token was refused; run the setup command again (capture is paused for an hour)" | `alice-server rotate` replaced the token | Write the new token into `~/.config/alice/token`, or run the setup line again |
+| `capture.log`: "the token was refused; run the setup command again (capture is paused for an hour)" | `alice-server rotate` replaced the token | Run the setup line again: it asks for the new token and ends the pause. Writing the token file alone waits out the hour |
 | `status` says `server: unreachable` | No connection, or the tenant is down | Nothing is lost; capture resumes at the next event |
 | `capture.log`: "… holds a JSON escape this script does not decode (such as \u); event skipped" | A path or folder name reached the hook in an escaped form | That event is skipped; tell the admin if it repeats |
 | Codex sessions are not captured | The hooks are not trusted yet, or the person has their own `hooks.json` | Trust them in Codex's `/hooks`; add the entries setup printed |
