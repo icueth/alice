@@ -21,7 +21,9 @@ printf 'ALICE_PUBLIC_HOST=203.0.113.7\n' >"$R/etc/alice/server.env"
 : >"$R/users"
 : >"$R/listening"
 : >"$R/calls.log"
-mkdir -p "$R/proc"
+mkdir -p "$R/proc" "$R/usr/share/zoneinfo/Asia" "$R/usr/share/zoneinfo/Europe"
+: >"$R/usr/share/zoneinfo/Asia/Bangkok"
+: >"$R/usr/share/zoneinfo/Europe/Berlin"
 printf 'processor\t: 0\nflags\t\t: fpu vme sse4_2 avx avx2 bmi2 avx512f\n' >"$R/proc/cpuinfo"
 
 stub() { # name ; body on stdin
@@ -174,6 +176,7 @@ add_creates_everything() {
   has "$e" 'ALICE_SERVER_PORT=47801'
   has "$e" 'ALICE_BACKUP_DAILY=2'
   has "$e" 'ALICE_BACKUP_WEEKLY=0'
+  has "$e" 'TZ=Asia/Bangkok'
   hasnt "$e" 'tok-'
   local u="$R/etc/systemd/system/alice@.service"
   has "$u" 'MemoryMax=3G'
@@ -760,6 +763,44 @@ build_release_links_the_pinned_runtime_and_lays_out_the_dist() {
   pass
 }
 
+add_takes_a_time_zone() {
+  local before
+  run add tzp --tz Europe/Berlin
+  [ "$RC" = 0 ] || fail "add --tz exited $RC: $OUT"
+  has "$TENANTS/tzp.env" 'TZ=Europe/Berlin'
+  hasnt "$TENANTS/tzp.env" 'TZ=Asia/Bangkok'
+  for bad in Mars/Olympus ../../../etc/passwd Asia/ "Asia/Bangkok;id" ""; do
+    before=$(wc -l <"$R/calls.log")
+    run add tzq --tz "$bad"
+    [ "$RC" != 0 ] || fail "add accepted the time zone '$bad'"
+    [ ! -e "$TENANTS/tzq.env" ] || fail "a tenant was created with the time zone '$bad'"
+    [ "$(wc -l <"$R/calls.log")" = "$before" ] || fail "a command ran before the time zone '$bad' was refused"
+  done
+  # On an existing tenant, --tz changes its zone and restarts it.
+  run add tzp --tz Asia/Bangkok
+  [ "$RC" = 0 ] || fail "add --tz on an existing tenant exited $RC: $OUT"
+  has "$TENANTS/tzp.env" 'TZ=Asia/Bangkok'
+  [ "$(grep -c '^TZ=' "$TENANTS/tzp.env")" = 1 ] || fail "two TZ lines"
+  has "$R/calls.log" 'systemctl restart alice@tzp'
+  run remove tzp --yes
+  [ "$RC" = 0 ] || fail "remove tzp exited $RC: $OUT"
+  pass
+}
+
+upgrade_adds_the_time_zone_to_older_tenants() {
+  grep -v '^TZ=' "$TENANTS/ann.env" >"$T/ann.env" && cat "$T/ann.env" >"$TENANTS/ann.env"   # made before TZ existed
+  run add bob --tz Europe/Berlin
+  [ "$RC" = 0 ] || fail "add bob --tz exited $RC: $OUT"
+  run upgrade "$R/new-alice"
+  [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
+  has "$TENANTS/ann.env" 'TZ=Asia/Bangkok'
+  has "$TENANTS/bob.env" 'TZ=Europe/Berlin'
+  hasnt "$TENANTS/bob.env" 'TZ=Asia/Bangkok'
+  printf '%s\n' "$OUT" | grep -qF 'TZ=Asia/Bangkok added for: ann' || fail "$OUT"
+  run add bob --tz Asia/Bangkok
+  pass
+}
+
 add_team_writes_no_snippet() {
   run add --team bob
   [ "$RC" != 0 ] || fail "--team with another name succeeded"
@@ -911,7 +952,8 @@ for CURRENT in \
   cli_refuses_a_secret_in_argv upgrade_rolls_back_on_a_failed_ping upgrade_installs_and_keeps_prev \
   add_refuses_a_cpu_without_avx upgrade_refuses_a_cpu_without_avx upgrade_accepts_avx_without_avx2 \
   upgrade_refuses_a_binary_that_fails_its_self_test upgrade_installs_the_runtime_library_and_restores_it \
-  upgrade_restores_the_library_when_the_binary_cannot_be_installed \
+  upgrade_restores_the_library_when_the_binary_cannot_be_installed add_takes_a_time_zone \
+  upgrade_adds_the_time_zone_to_older_tenants \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \
   add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \

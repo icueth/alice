@@ -3808,3 +3808,12 @@ impl TeamLink {
   source.
 - Gates: fmt, both clippy runs with `-D warnings`, workspace tests, `bash deploy/server/tests/run.sh`, `shellcheck` of
   both scripts; push; ubuntu and macOS CI.
+
+**Task 32 amendments from the staging pass (2026-10-16):**
+- Caddy's admin socket: `ensure_base` writes `/etc/systemd/system/caddy.service.d/alice.conf` (`RuntimeDirectory=caddy`,
+  0750); `reload_caddy` restarts Caddy while the socket is missing (the first switch from `localhost:2019`) and reloads
+  through it afterwards; `prepare_caddy_log` makes the access log the caddy user's before any `caddy validate`.
+- Time zone (controller's ruling, R40): `add <name> [--tz <IANA zone>]` writes `TZ` (default `Asia/Bangkok`, checked
+  against `/usr/share/zoneinfo`; on an existing tenant it changes the zone and restarts it); `upgrade` adds the default
+  where it is missing. Stub scenarios `add_takes_a_time_zone` and `upgrade_adds_the_time_zone_to_older_tenants`; the real
+  check re-imports the fixture into a fresh staging tenant and compares a known drawer's `created_at` with a local import.

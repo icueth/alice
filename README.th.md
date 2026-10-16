@@ -433,7 +433,7 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 2. คำสั่ง:
 
    ```
-   alice-server add <name>                 # สร้างผู้ใช้ใหม่ แสดง URL และ token ครั้งเดียว
+   alice-server add <name> [--tz <zone>]   # สร้างผู้ใช้ใหม่ แสดง URL และ token ครั้งเดียว (เขตเวลา ค่าเริ่มต้น Asia/Bangkok ใช้ตอน import)
    alice-server add --team team            # สร้างความจำส่วนกลาง (ไม่มี URL ของตัวเอง)
    alice-server remove <name> [--yes]      # เก็บ archive แล้วลบ
    alice-server rotate <name>              # ออก token ใหม่

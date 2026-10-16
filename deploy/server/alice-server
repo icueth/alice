@@ -13,6 +13,10 @@ CADDYFILE="$R/etc/caddy/Caddyfile"; CADDY_D="$R/etc/caddy/alice.d"
 # Caddy's admin API moves from localhost:2019 to this socket; the drop-in has systemd make its directory at every start.
 CADDY_DROPIN="$R/etc/systemd/system/caddy.service.d/alice.conf"; ADMIN_SOCK="$R/run/caddy/admin.sock"
 CADDY_LOG="$R/var/log/caddy/alice-access.log"
+# Each daemon runs in its person's time zone (TZ in the tenant file), so an import reads MemPalace's naive local times
+# with the offset of the person's own machine, as it would on a Mac; stored times stay UTC. This deployment's people
+# are in Thailand; `add <name> --tz <IANA zone>` sets another.
+ZONEINFO="$R/usr/share/zoneinfo"; DEFAULT_TZ=Asia/Bangkok
 BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
 # The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
 # $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
@@ -39,6 +43,7 @@ fi
 # A broken environment must never turn a removal into rm -rf /...: refuse to run with an empty root.
 : "${ETC:?}" "${TENANTS:?}" "${SRV:?}" "${ARCHIVES:?}" "${CADDY_D:?}" "${UNIT:?}" "${CADDYFILE:?}" "${BIN:?}" "${LOCK:?}"
 : "${LIBDIR:?}" "${MODEL_CACHE:?}" "${SELFTEST_TMP:?}" "${CADDY_DROPIN:?}" "${ADMIN_SOCK:?}" "${CADDY_LOG:?}"
+: "${ZONEINFO:?}"
 
 HOST=""
 SELFTEST_WHY=""
@@ -49,7 +54,8 @@ die() { printf 'alice-server: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
 usage() {
   cat <<'EOF'
-usage: alice-server add <name>
+usage: alice-server add <name> [--tz <IANA zone>]
+           (the daemon's time zone, for imports: default Asia/Bangkok; on an existing tenant it changes it)
        alice-server add --team team
            (the shared team store: a daemon with no URL; every personal tenant is linked to it)
        alice-server remove <name> [--yes]
@@ -66,6 +72,10 @@ valid_name() {
   [[ "$1" =~ $NAME_RE ]] || die "\"$1\" is not a tenant name: lower-case letters, digits and -, starting with a letter, at most 16 characters"
 }
 tenant_exists() { [ -f "$TENANTS/$1.env" ]; }
+valid_tz() { # an IANA name with a zone file under /usr/share/zoneinfo
+  if [[ "$1" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] && [ -f "$ZONEINFO/$1" ]; then return 0; fi
+  die "\"$1\" is not a time zone in /usr/share/zoneinfo; use an IANA name such as Asia/Bangkok"
+}
 # The team store is the tenant named team whose file carries ALICE_DAEMON_ARGS=--team-store.
 TEAM=team
 is_team() { grep -qx 'ALICE_DAEMON_ARGS=--team-store' "$TENANTS/$1.env" 2>/dev/null; }
@@ -375,8 +385,9 @@ EOF
   [ -z "$failed" ] || printf 'alice-server: WARNING: these tenants did not come back after the unlink:%s\n' "$failed" >&2
 }
 
-tenant_env_text() { # name port team(0|1)
-  printf 'ALICE_HOME=%s/%s\nALICE_SERVER_PORT=%s\nALICE_LOG=info\nALICE_BACKUP_DAILY=2\nALICE_BACKUP_WEEKLY=0\n' "$REAL_SRV" "$1" "$2"
+tenant_env_text() { # name port team(0|1) tz
+  printf 'ALICE_HOME=%s/%s\nALICE_SERVER_PORT=%s\nALICE_LOG=info\nALICE_BACKUP_DAILY=2\nALICE_BACKUP_WEEKLY=0\nTZ=%s\n' \
+    "$REAL_SRV" "$1" "$2" "$4"
   if [ "$3" = 1 ]; then printf 'ALICE_DAEMON_ARGS=--team-store\n'; else printf 'ALICE_TENANT_NAME=%s\n' "$1"; fi
 }
 
@@ -393,10 +404,16 @@ rollback_add() { # name: undo what add created, in reverse order
 }
 add_fail() { rollback_add "$1"; die "$2 - undone, nothing is left of $1"; }
 
-cmd_add() { # name [team: 1 for the team store]
-  local name=$1 team=${2:-0} home="$SRV/$1" port token
+cmd_add() { # name team(0|1) tz tz-given(0|1)
+  local name=$1 team=${2:-0} tz=${3:-$DEFAULT_TZ} tz_given=${4:-0} home="$SRV/$1" port token
   need_host
   ensure_base
+  if tenant_exists "$name" && [ "$tz_given" = 1 ]; then
+    set_env_line "$name" TZ "$tz"
+    restart_one "$name" || die "$name did not come back after its time zone changed; journalctl -u alice@$name"
+    say "$name now runs in $tz"
+    return 0
+  fi
   if tenant_exists "$name"; then
     if [ "$team" = 1 ]; then
       say "the team store exists (alice-server rotate $name gives a new token); linking the personal tenants again"
@@ -419,7 +436,7 @@ cmd_add() { # name [team: 1 for the team store]
   { mkdir -p "$home" && chmod -- 0700 "$home" && chown "alice-$name:alice-$name" -- "$home"; } \
     || add_fail "$name" "could not create the home"
   A_ENV=1
-  tenant_env_text "$name" "$port" "$team" | put "$TENANTS/$name.env" 0644 || add_fail "$name" "could not write the tenant file"
+  tenant_env_text "$name" "$port" "$team" "$tz" | put "$TENANTS/$name.env" 0644 || add_fail "$name" "could not write the tenant file"
   if [ "$team" = 0 ] && team_exists; then # linked before the first start, so the daemon starts with the link
     provision_files "$name" || add_fail "$name" "could not link the tenant to the team store"
   fi
@@ -582,6 +599,17 @@ install_new() { # binary library-or-empty: each through a temporary file, the cu
   { install -m 0755 "$new" "$BIN.new" && mv -- "${BIN:?}.new" "${BIN:?}"; } || install_failed "could not install $new"
 }
 
+# A tenant made before TZ was written gets the default; a time zone set with --tz is kept.
+add_missing_tz() {
+  local f t added=""
+  for f in "$TENANTS"/*.env; do
+    [ -e "$f" ] || continue
+    t=$(basename "$f" .env)
+    if ! grep -q '^TZ=' "$f"; then set_env_line "$t" TZ "$DEFAULT_TZ"; added="$added $t"; fi
+  done
+  if [ -n "$added" ]; then say "TZ=$DEFAULT_TZ added for:$added"; fi
+}
+
 cmd_upgrade() { # binary (also the first install)
   local new=$1 lib failed
   need_avx
@@ -598,6 +626,7 @@ cmd_upgrade() { # binary (also the first install)
     die "the installed binary failed its self-test ($SELFTEST_WHY); the previous version is restored"
   fi
   say "free: $(gb "$(free_kb)") GB (a schema migration copies each tenant's database once)"
+  add_missing_tz
   failed=$(restart_all)
   if [ -n "$failed" ]; then
     restore_prev
@@ -680,18 +709,27 @@ take_lock() {
   flock -n 9 || die "another alice-server is running"
 }
 
-main_add() { # add <name> | add --team team
-  local team=0 name
+main_add() { # add [--team] <name> [--tz <IANA zone>]
+  local team=0 name="" tz="" tz_given=0
   shift
-  if [ "${1:-}" = --team ]; then team=1; shift; fi
-  [[ $# -eq 1 ]] || { usage; exit 2; }
-  name=$1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --team) team=1 ;;
+      --tz) [ $# -ge 2 ] || { usage; exit 2; }; tz=$2; tz_given=1; shift ;;
+      -*) usage; exit 2 ;;
+      *) [ -z "$name" ] || { usage; exit 2; }; name=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || { usage; exit 2; }
   valid_name "$name"
   if [ "$team" = 1 ] && [ "$name" != "$TEAM" ]; then die "the team store is named $TEAM: alice-server add --team $TEAM"; fi
   if [ "$team" = 0 ] && [ "$name" = "$TEAM" ]; then die "$TEAM is the shared team store: run alice-server add --team $TEAM"; fi
+  if [ "$tz_given" = 0 ]; then tz=$DEFAULT_TZ; fi
+  valid_tz "$tz"
   need_avx
   take_lock
-  cmd_add "$name" "$team"
+  cmd_add "$name" "$team" "$tz" "$tz_given"
 }
 
 main() {

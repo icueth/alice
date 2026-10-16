@@ -63,7 +63,7 @@ The script takes a lock, so two runs cannot overlap, and it is safe to run twice
 ### Commands
 
 ```
-alice-server add <name>
+alice-server add <name> [--tz <IANA zone>]
 alice-server add --team team
 alice-server remove <name> [--yes]
 alice-server rotate <name>
@@ -94,7 +94,9 @@ The token is shown once. Hand it to the person over a private channel. If the te
 
 The `claude mcp add` line keeps `${ALICE_TOKEN}` literal, in single quotes, so the token never lands in a saved configuration. The person sets `ALICE_TOKEN` in their shell.
 
-The tenant file holds no secret. It sets `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALICE_LOG=info`, `ALICE_BACKUP_DAILY=2` and `ALICE_BACKUP_WEEKLY=0`.
+The tenant file holds no secret. It sets `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALICE_LOG=info`, `ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0` and `TZ`.
+
+`TZ` is the person's time zone, `Asia/Bangkok` unless `--tz` names another IANA zone (it must exist under `/usr/share/zoneinfo`). The daemon runs in it, so an import reads MemPalace's local times with the offset of the person's own machine, as it would on their Mac; stored times stay UTC. Run `alice-server add <name> --tz <zone>` on an existing tenant to change its zone (it restarts that daemon). `upgrade` gives `TZ=Asia/Bangkok` to a tenant made before this line existed and keeps a zone set with `--tz`.
 
 #### remove
 

@@ -374,10 +374,15 @@ as `/usr/local/sbin/alice-server`. The unit and the Caddy template live inside i
 is the single source. The public host comes from `/etc/alice/server.env` (`ALICE_PUBLIC_HOST=<server-ip>`), so the IP is
 not hard-coded. Each command below is followed by what it does.
 
-**`add <name>`**
-1. Makes sure the base exists: directories, the unit, and the Caddyfile with its import and admin socket.
+**`add <name> [--tz <IANA zone>]`**
+1. Makes sure the base exists: directories, the unit, the Caddyfile with its import and admin socket, and Caddy's drop-in
+   (`RuntimeDirectory=caddy`, so `/run/caddy` exists for the socket at every start). The first route moves Caddy from
+   `localhost:2019` to the socket with a restart; later changes reload through the socket. The access log is made the caddy
+   user's before any `caddy validate`, which runs as root.
 2. If the tenant exists, prints its URL (not the token) and stops: "exists; `alice-server rotate <name>` gives a new token".
-3. Picks a port. Creates the user and the home (0700). Writes the tenant file.
+   With `--tz` it sets that tenant's `TZ` and restarts it instead (R40).
+3. Picks a port. Creates the user and the home (0700). Writes the tenant file, `TZ` included (default `Asia/Bangkok`; a
+   `--tz` must name a file under `/usr/share/zoneinfo`).
 4. Runs `systemctl enable --now alice@<name>` and waits up to 180 s for `GET http://127.0.0.1:<port>/api/v1/ping` (with
    `Host: 127.0.0.1:<port>`). The first start downloads the model.
 5. Writes the Caddy snippet, then validates and reloads Caddy.
@@ -1148,6 +1153,9 @@ the tests cover the following.
     both, and so does a binary that cannot be installed after the library was (a `.prev` is only ever a complete copy);
     a failed model download's progress line is dropped from the reason; `upgrade` is also the first install and a failed
     first install leaves nothing behind;
+  - (R40) `add` writes `TZ=Asia/Bangkok` by default and `--tz <zone>` when given; an unknown or malformed zone is refused
+    before any change; `add <existing> --tz` changes the zone and restarts that tenant; `upgrade` adds the default to a
+    tenant file without `TZ` and keeps one set with `--tz`;
   - (§2.11) `build-release` refuses a download that fails its SHA-256 (deleted, never unpacked), and links the pinned
     runtime with the rpath and the dist layout above (stubbed `curl`, `cargo`, `sha256sum` and `uname`).
 
@@ -1254,6 +1262,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R37 | `context` appends a "Team memory" section within a third of the budget | Keeps the person's own briefing first | A large team context is cut harder than the personal one |
 | R38 | Server builds link **Microsoft's ONNX Runtime 1.24.4** dynamically (pinned SHA-256), with the binary's rpath at `$ORIGIN/../lib/alice` (controller's ruling; §2.11) | The server's CPU has no AVX2; Microsoft's build dispatches its kernels at run time. An rpath needs no environment in the units or the admin's shell | A future ort release that needs a newer ONNX Runtime API means a new pin; the library must travel with the binary (`upgrade` installs both) |
 | R39 | `upgrade` **self-tests** the new binary (`alice model check` in a throwaway home) before it installs anything, and the installed pair before it restarts a unit | `--version` runs even where the runtime cannot; only embedding a text proves it | About 2 to 5 s per self-test, plus a 136 MB model fetched once into `/var/cache/alice-server/models` |
+| R40 | Each tenant's daemon runs in **its person's time zone** (`TZ` in the tenant file; `Asia/Bangkok` by default, `--tz` per person, checked against `/usr/share/zoneinfo`; `upgrade` adds the default where it is missing) (controller's ruling) | The importer reads MemPalace's naive local times with the daemon's local offset; on a UTC server every imported time would be 7 hours off for this team. Stored times stay UTC | Logs and daily schedules also follow the person's zone; a person who moves needs `add <name> --tz` |
 
 ---
 
