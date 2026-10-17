@@ -202,13 +202,15 @@ fn run(cfg: JudgeWorkerConfig) {
                     *n += 1;
                     tracing::warn!(error = %e, id = %item.id, strikes = *n, "judging failed; it is tried again");
                     if *n >= STRIKES {
-                        // Never stuck `pending`: activated without a judgement.
+                        // Never stuck `pending`: activated without a judgement (a distilled one
+                        // then keeps its session's best set at its size, as a judged one does).
                         strikes.remove(&item.seq);
-                        let _ = cfg.writer.submit_blocking(WriteOp::ApplyJudgement(plain(
-                            &item,
-                            "heuristic",
-                            false,
-                        )));
+                        let _ = cfg
+                            .writer
+                            .submit_blocking(WriteOp::ApplyJudgement(Judgement {
+                                distill: Some(cfg.settings.get().distill.clone()),
+                                ..plain(&item, "heuristic", false)
+                            }));
                     }
                 }
             }
@@ -653,6 +655,7 @@ pub fn judge_one(cfg: &JudgeWorkerConfig, item: &PendingJudgement) -> Result<Opt
         unavailable: outcome.retry && !outcome.counted,
         retry_wait: retry_backoff(cfg.retry_base, item.attempts + item.unavailable + 1),
         seen: found.into_iter().map(|n| (n.memory.id, n.hash)).collect(),
+        distill: Some(settings.distill.clone()),
     };
     if !cfg.applies {
         j.actions.clear();

@@ -628,7 +628,8 @@ pub struct DistillSettings {
     /// Most memories kept from one session run (1 to 50).
     pub max_per_run: usize,
     /// The size of a session's best set of distilled memories, its subagents' included (2 to
-    /// 200): a better passage replaces the weakest. Subagent reports keep at most half of it.
+    /// 200): a better passage replaces the weakest once the judge keeps it. Subagent reports keep
+    /// at most half of it.
     pub max_per_session: usize,
     /// Most memories kept from subagent reports in one run (0 to 50).
     pub max_per_subagent_run: usize,

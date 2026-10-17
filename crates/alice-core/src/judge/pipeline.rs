@@ -263,9 +263,14 @@ fn passage(body: &str) -> &str {
     body.rfind("\n\nContext: ").map_or(body, |i| &body[..i])
 }
 
-/// The number tokens of `text`: runs of digits that start a word, with `.`, `,` or `:` between
-/// digits (`6380`, `0.9`, `1,200`, `04:00`, `10.0.0.2`); a unit may follow (`20m`). Digits inside
-/// a word (`sha256`, a commit id) and a list item's number (`1. `) are not values.
+/// The number tokens of `text`: runs of ASCII digits that start a word (no letter or digit just
+/// before), with `.`, `,` or `:` between digits (`6380`, `0.9`, `1,200`, `04:00`, `10.0.0.2`); a
+/// unit may follow (`20m`). Incidental numbers count too: the leading digit run of an id that
+/// starts with a digit (`6b48f31` gives `6`), counts, line references (`main.rs:467` gives `467`),
+/// issue numbers (`#123`), percentages and dates (`2026-10-17` gives `2026`, `10` and `17`).
+/// Digits after a letter (`sha256`, `v1`, an id such as `a1b2`) and a list item's number (`1. `)
+/// are not tokens, nor are Thai digits or a number right after Thai letters: a copy whose only new
+/// number is one of those is trashed as before, which fails safe.
 fn numbers(text: &str) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     for line in text.lines() {

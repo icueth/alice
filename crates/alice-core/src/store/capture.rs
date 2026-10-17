@@ -638,23 +638,26 @@ pub fn stale_open(conn: &Connection, before: &str, limit: usize) -> Result<Vec<S
 /// explicit copy promoted is no longer `distill`, so it is not one of them. Uses the partial
 /// index `memories_distill_session` (migration 0008).
 ///
-/// The last column says whether a person or an agent touched it since it was distilled (the
+/// The sixth column says whether a person or an agent touched it since it was distilled (the
 /// Task 12c addendum), which the cap never replaces:
-/// - an event on it by `user` or `agent:*` (an edit, a move, an archive, a restore, an undo, a
-///   merge into it, its use as the newer of a supersede): its history, not `updated_at`, which
-///   the judge and distillation move too and which does not say who;
+/// - `touched_at` is set: an event on it by `user` or `agent:*` (an edit, a move, an archive, a
+///   restore, an undo, a merge into it, its use as the newer of a supersede), which
+///   `events::record` marks on the row (review Minor 5: it outlives the history). Not
+///   `updated_at`, which the judge and distillation move too and which does not say who;
 /// - a link to it that the judge or distillation did not make (`created_by` not `judge:*`,
 ///   `distill:*` or `merge`; a merge's link is decided by its `memory.merge_into` event's actor);
-/// - a fact that cites it (`relations.source_memory_id`: `assert_fact` by a person or an agent).
+/// - a fact that cites it (`relations.source_memory_id`: `assert_fact` by a person or an agent),
+///   through the partial index `relations_source_memory` (review Minor 1).
+///
+/// The seventh says whether the judge has yet to settle it (`pending` or `retry`).
 pub const SESSION_HELD: &str =
     "SELECT m.id, m.kind, m.distill_p, m.distill_tier, coalesce(m.idempotency_key, ''),
-            EXISTS (SELECT 1 FROM events e
-                     WHERE e.target_type = 'memory' AND e.target_id = m.id
-                       AND (e.actor = 'user' OR e.actor LIKE 'agent:%'))
+            m.touched_at IS NOT NULL
             OR EXISTS (SELECT 1 FROM links l
                         WHERE l.to_id = m.id AND l.created_by NOT LIKE 'judge:%'
                           AND l.created_by NOT LIKE 'distill:%' AND l.created_by <> 'merge')
-            OR m.id IN (SELECT source_memory_id FROM relations WHERE source_memory_id IS NOT NULL)
+            OR EXISTS (SELECT 1 FROM relations r WHERE r.source_memory_id = m.id),
+            m.judge_state IN ('pending', 'retry')
      FROM memories m
      WHERE m.origin = 'distill' AND m.author_session = ?1 AND m.author_agent = ?2
        AND m.status NOT IN ('trashed', 'superseded')
@@ -677,12 +680,13 @@ pub fn session_held(
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, bool>(5)?,
+                r.get::<_, bool>(6)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows
         .into_iter()
-        .filter_map(|(id, kind, p, tier, key, protected)| {
+        .filter_map(|(id, kind, p, tier, key, protected, unjudged)| {
             Some(crate::distill::Held {
                 id,
                 kind: crate::model::Kind::parse(&kind)?,
@@ -690,6 +694,7 @@ pub fn session_held(
                 subagent: tier.map(|t| t == "subagent"),
                 idempotency_key: key,
                 protected,
+                unjudged,
             })
         })
         .collect())
@@ -784,6 +789,26 @@ mod tests {
         );
         assert_eq!(held[1].kind, crate::model::Kind::Decision);
         assert_eq!(held[0].idempotency_key, "distill:A");
+        c.execute(
+            "UPDATE memories SET judge_state = 'done' WHERE id IN ('A', 'C')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE memories SET judge_state = 'retry' WHERE id = 'C'",
+            [],
+        )
+        .unwrap();
+        let unjudged: Vec<bool> = session_held(&c, "claude-code", "S1")
+            .unwrap()
+            .iter()
+            .map(|h| h.unjudged)
+            .collect();
+        assert_eq!(
+            unjudged,
+            [false, true, true],
+            "pending and retry are unjudged"
+        );
         assert!(session_held(&c, "codex", "S1").unwrap().is_empty());
         let plan: Vec<String> = c
             .prepare(&format!("EXPLAIN QUERY PLAN {SESSION_HELD}"))
@@ -795,6 +820,16 @@ mod tests {
         assert!(
             plan.iter()
                 .any(|d| d.contains("USING INDEX memories_distill_session")),
+            "{plan:?}"
+        );
+        // Review Minor 1: the fact clause reads the index, never the whole `relations` table.
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("INDEX relations_source_memory (source_memory_id=?)")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|d| d.contains("SCAN relations")),
             "{plan:?}"
         );
     }
@@ -829,9 +864,10 @@ mod tests {
 
     /// The Task 12c addendum: the best set marks the rows the cap never replaces: one a person or
     /// an agent changed after it was distilled (an event on it by `user` or `agent:*`: an edit, a
-    /// move, a restore, an undo), one a person or an agent links to, and one a fact cites. The
-    /// judge's, distillation's and maintenance's own events and links protect nothing. A row an
-    /// explicit copy promoted (`origin` no longer `distill`) is not in the set at all.
+    /// move, a restore, an undo; review Minor 5: kept as `touched_at`, so it outlives the
+    /// history), one a person or an agent links to, and one a fact cites. The judge's,
+    /// distillation's and maintenance's own events and links protect nothing. A row an explicit
+    /// copy promoted (`origin` no longer `distill`) is not in the set at all.
     #[test]
     fn a_sessions_best_set_marks_the_rows_the_cap_never_replaces() {
         let (_d, c) = conn();
@@ -854,21 +890,29 @@ mod tests {
                 params![id, GLOBAL_ID, origin],
             )
             .unwrap();
-            c.execute(
-                "INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id)
-                 VALUES (?1 || '-c', '2026-10-17T00:00:00.000Z', 'h', 'distill:jev', 'memory.create', 'memory', ?1)",
-                [id],
-            )
-            .unwrap();
         }
+        // Recorded as the writer records them: `events::record` marks the memory touched.
         let event = |id: &str, actor: &str, action: &str| {
-            c.execute(
-                "INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id)
-                 VALUES (?1 || ?3, '2026-10-17T01:00:00.000Z', 'h', ?2, ?3, 'memory', ?1)",
-                params![id, actor, action],
+            crate::store::events::record(
+                &c,
+                &crate::store::events::EventInput {
+                    actor: &crate::store::events::Actor::parse(actor),
+                    action,
+                    target_type: "memory",
+                    target_id: id,
+                    before: None,
+                    after: None,
+                    group: None,
+                },
+                "h",
             )
             .unwrap();
         };
+        for id in [
+            "EDITED", "UNDONE", "LINKED", "JUDGED", "MERGED", "CITED", "PLAIN",
+        ] {
+            event(id, "distill:jev", "memory.create");
+        }
         event("EDITED", "agent:claude-code", "memory.edit");
         event("UNDONE", "user", "undo:memory.forget");
         event("JUDGED", "judge:jev", "memory.edit");
@@ -896,19 +940,30 @@ mod tests {
                      '2026-10-17T00:00:00.000Z', 'h');",
         )
         .unwrap();
-        let held = session_held(&c, "claude-code", "S1").unwrap();
-        let got: Vec<(&str, bool)> = held.iter().map(|h| (h.id.as_str(), h.protected)).collect();
+        let want = [
+            ("EDITED", true),
+            ("UNDONE", true),
+            ("LINKED", true),
+            ("JUDGED", false),
+            ("MERGED", false),
+            ("CITED", true),
+            ("PLAIN", false),
+        ];
+        let protected = || -> Vec<(String, bool)> {
+            session_held(&c, "claude-code", "S1")
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.id, h.protected))
+                .collect()
+        };
+        let want: Vec<(String, bool)> = want.iter().map(|(i, p)| (i.to_string(), *p)).collect();
+        assert_eq!(protected(), want);
+        // Review Minor 5: the mark outlives the history (events go after `events_days`).
+        c.execute("DELETE FROM events", []).unwrap();
         assert_eq!(
-            got,
-            [
-                ("EDITED", true),
-                ("UNDONE", true),
-                ("LINKED", true),
-                ("JUDGED", false),
-                ("MERGED", false),
-                ("CITED", true),
-                ("PLAIN", false)
-            ]
+            protected(),
+            want,
+            "a protection lasts when its event is pruned"
         );
     }
 

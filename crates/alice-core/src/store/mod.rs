@@ -846,7 +846,9 @@ mod tests {
     /// Task 12c: a v7 database (0007 applied, as on live tenants) migrates to v8 after a backup:
     /// `memories` gains the distill rank inputs `distill_p` and `distill_tier`, `NULL` for every
     /// memory written before, and the partial index `memories_distill_session` on
-    /// `(author_session, author_agent) WHERE origin = 'distill'`.
+    /// `(author_session, author_agent) WHERE origin = 'distill'`. Review Minors 1 and 5: the partial
+    /// index `relations_source_memory`, and `touched_at`, backfilled for a distilled memory from
+    /// its latest event by `user` or `agent:*`.
     #[test]
     fn migration_0008_adds_the_distill_rank_inputs_and_the_session_index() {
         let (d, path) = temp_db();
@@ -878,6 +880,21 @@ mod tests {
                 [],
             )
             .unwrap();
+            // Review Minor 5: the history before v8 marks what a person or an agent touched.
+            tx.execute_batch(
+                "INSERT INTO memories (id, project_id, kind, title, body, status, content_hash, created_at,
+                                       updated_at, hlc, judge_state, origin, author_agent, author_session)
+                 VALUES ('M-JUDGED', '00000000000000000000GLOBAL', 'fact', 't2', 'b2', 'active', 'h2',
+                         '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z', 'h', 'done', 'distill',
+                         'claude-code', 'S1');
+                 INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id) VALUES
+                   ('E1', '2026-10-14T00:00:00.000Z', 'h', 'distill:jev', 'memory.create', 'memory', 'M-OLD'),
+                   ('E2', '2026-10-14T01:00:00.000Z', 'h', 'user', 'memory.edit', 'memory', 'M-OLD'),
+                   ('E3', '2026-10-14T02:00:00.000Z', 'h', 'agent:codex', 'memory.move', 'memory', 'M-OLD'),
+                   ('E4', '2026-10-14T03:00:00.000Z', 'h', 'judge:jev', 'memory.edit', 'memory', 'M-JUDGED'),
+                   ('E5', '2026-10-14T04:00:00.000Z', 'h', 'system', 'memory.edit', 'memory', 'M-JUDGED');",
+            )
+            .unwrap();
             tx.commit().unwrap();
         }
         let conn = open_writer(&path).unwrap();
@@ -906,8 +923,42 @@ mod tests {
             "{index}"
         );
         let held = super::capture::session_held(&conn, "claude-code", "S1").unwrap();
-        assert_eq!(held.len(), 1);
+        assert_eq!(held.len(), 2);
         assert_eq!((held[0].p, held[0].subagent), (None, None));
+        let touched: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id, touched_at FROM memories ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            touched,
+            [
+                ("M-JUDGED".to_string(), None),
+                (
+                    "M-OLD".to_string(),
+                    Some("2026-10-14T02:00:00.000Z".to_string())
+                )
+            ],
+            "backfilled from the latest user or agent event"
+        );
+        assert_eq!(
+            held.iter().map(|h| h.protected).collect::<Vec<_>>(),
+            [true, false]
+        );
+        let index: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'relations_source_memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            index.contains("(source_memory_id)")
+                && index.contains("WHERE source_memory_id IS NOT NULL"),
+            "{index}"
+        );
         let versions: Vec<i64> = conn
             .prepare("SELECT version FROM schema_migrations ORDER BY version")
             .unwrap()

@@ -30,13 +30,15 @@
 //!    session whose best set is full is asked as any other (Task 12c), within
 //!    `distill.budget_share`.
 //! 5. The kept passages fitted into the session's best set ([`distill::place`]: at most
-//!    `distill.max_per_session` live distilled memories, the best by rank; a better passage
-//!    replaces the weakest that may go, trashed by `distill:cap`, never a handoff nor a memory a
-//!    person or an agent touched; with none to replace it is not stored, and the run counts it
-//!    in `capped`), then each written with [`write_memory`] in
-//!    the project of the source it came from: redacted with that project's rules,
-//!    `origin = distill`, its rank inputs, its chunks as provenance and an idempotency key, so a
-//!    repeated run (a crash before the cursor moved) stores nothing twice.
+//!    `distill.max_per_session` live distilled memories, the best by rank; a passage better than
+//!    the weakest that may go is stored, never in place of a handoff nor of a memory a person or
+//!    an agent touched; with none to outrank it is not stored, and the run counts it in
+//!    `capped`), then each written with [`write_memory`] in the project of the source it came
+//!    from: redacted with that project's rules, `origin = distill`, its rank inputs, its chunks
+//!    as provenance and an idempotency key, so a repeated run (a crash before the cursor moved)
+//!    stores nothing twice. Nothing is evicted here: once the judge finds a newcomer live in a
+//!    full set, the writer trashes the set's weakest member that may go, by `distill:cap` (Task
+//!    12c review I1, option b).
 //! 6. The cursors move to the end of the run; the source is `done`, or `due` again when more of
 //!    it is left.
 //!
@@ -205,8 +207,6 @@ pub struct RunReport {
     pub duplicates: usize,
     /// Kept passages not stored because the privacy rules refused their text.
     pub refused: usize,
-    /// Memories of the session's best set that a stored one replaced (trashed by `distill:cap`).
-    pub replaced: usize,
     /// Kept passages not stored: the session's set is full, and every member they may replace is
     /// protected (a handoff, or one a person or an agent touched) or none of them is weaker.
     pub capped: usize,
@@ -224,7 +224,6 @@ impl RunReport {
             stored: 0,
             duplicates: 0,
             refused: 0,
-            replaced: 0,
             capped: 0,
             at: String::new(),
         }
@@ -787,21 +786,9 @@ impl DistillCtl {
                 .iter()
                 .find_map(|id| loaded.owner.get(id))
                 .map_or(src, |&i| &included[i].0);
-            match write_memory(&self.ctx, m, owner, pl.replaces.as_deref()) {
-                Ok(Some(InsertOutcome::New { .. })) => {
-                    report.stored += 1;
-                    report.replaced += usize::from(pl.replaces.is_some());
-                }
-                Ok(Some(InsertOutcome::Duplicate { .. })) => report.duplicates += 1,
-                // The member it was to replace was touched since the set was read: it keeps its
-                // slot, and this one is not stored.
-                Ok(None) => {
-                    report.capped += 1;
-                    tracing::info!(
-                        uri = src.uri,
-                        "a distilled passage was not stored: the member it was to replace is protected now"
-                    );
-                }
+            match write_memory(&self.ctx, m, owner) {
+                Ok(InsertOutcome::New { .. }) => report.stored += 1,
+                Ok(InsertOutcome::Duplicate { .. }) => report.duplicates += 1,
                 // The rules refuse its text (block mode), or the store refuses it: this one
                 // passage is left out.
                 Err(e @ (AliceError::Refused { .. } | AliceError::Invalid(_))) => {
@@ -1333,15 +1320,13 @@ pub(crate) fn distilled_since(conn: &Connection, since: &str) -> Result<(u64, u6
 /// closed), then `remember` with `origin = distill`, its chunks as provenance, its idempotency
 /// key, `distill.importance`, its rank inputs, and the source's agent and session as the author,
 /// in the source's project (or `global` for a preference of the user's). When it takes the place
-/// of `replaces` in its session's best set, that memory is trashed by `distill:cap` in the same
-/// writer op (Task 12c). `None`: nothing was written, as `replaces` became a member the cap never
-/// replaces since the set was read (the Task 12c addendum).
+/// of a member in its session's best set, that member leaves once the judge finds this one live
+/// (Task 12c review I1, option b: the writer's `ApplyJudgement`), not here.
 pub(crate) fn write_memory(
     ctx: &DistillCtx,
     m: &DistilledMemory,
     src: &CaptureState,
-    replaces: Option<&str>,
-) -> Result<Option<InsertOutcome>> {
+) -> Result<InsertOutcome> {
     let (slug, tree) = ctx.readers.with(|c| {
         let slug = projects::get_by_id(c, &src.project_id)?.slug;
         let tree = projects::tree_of(c, &src.project_id);
@@ -1375,10 +1360,8 @@ pub(crate) fn write_memory(
         project,
         p: m.p,
         subagent: m.subagent,
-        replaces: replaces.map(str::to_owned),
     })? {
-        WriteOutcome::Remembered(out, _) => Ok(Some(out)),
-        WriteOutcome::Done => Ok(None),
+        WriteOutcome::Remembered(out, _) => Ok(out),
         other => Err(AliceError::Other(format!(
             "unexpected writer outcome {}",
             other.name()

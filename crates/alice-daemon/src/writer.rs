@@ -114,6 +114,10 @@ pub struct Judgement {
     pub unavailable: bool,
     /// How long a memory that failed waits before it is judged again.
     pub retry_wait: Duration,
+    /// The distillation settings, for a distilled memory's session best set: a newcomer judged
+    /// live into a full set evicts its weakest member that may go (Task 12c review I1, option b).
+    /// `None`: nothing is evicted.
+    pub distill: Option<alice_core::settings::DistillSettings>,
     /// `(id, content_hash)` of every existing memory the judge saw, read together with its
     /// text. An action on one that has changed since becomes a review item instead (nothing is
     /// applied on stale information).
@@ -224,18 +228,14 @@ pub enum WriteOp {
         project: ProjectChoice,
     },
     /// A distilled memory (SP2 spec §6.4, §6.5; Task 12c): `remember`, with its rank inputs (`p`,
-    /// and whether it is a subagent's report) stored, and when it takes the place of `replaces`
-    /// in its session's best set, that memory trashed in the same transaction (a
-    /// `memory.forget` by `distill:cap`, undoable like any trash). A duplicate (the passage was
-    /// stored already) replaces nothing, nor does a `replaces` that is no longer in the set. A
-    /// `replaces` that became a handoff or protected since the set was read (the Task 12c
-    /// addendum) keeps its slot: nothing is written, and the outcome is `Done`.
+    /// and whether it is a subagent's report) stored. It evicts nothing: when it is stored into a
+    /// full best set, a member leaves only once the judge finds it live (`ApplyJudgement`; review
+    /// I1, option b).
     Distilled {
         input: NewMemoryInput,
         project: ProjectChoice,
         p: f64,
         subagent: bool,
-        replaces: Option<String>,
     },
     /// Validated as a whole before anything is written, then written `INGEST_SLICE` chunks per
     /// transaction. If a later slice fails, the earlier ones stay; ingest is incremental by `ord`,
@@ -759,28 +759,17 @@ fn remember(
 /// The actor of a trash that makes room in a session's best set (Task 12c): `distill:cap`.
 const DISTILL_CAP: &str = "cap";
 
-/// A distilled memory (`WriteOp::Distilled`): [`remember`]; then, when it is new, its rank inputs,
-/// and the memory it replaces in its session's best set trashed by `distill:cap` if it is still a
-/// member that may go. The set is read again here, as the worker's read may be stale (the Task
-/// 12c addendum): a member that became one the cap never replaces keeps its slot, so nothing is
-/// written (`Done`); one that left the set (trashed, superseded, promoted by an explicit copy)
-/// left its slot free.
+/// A distilled memory (`WriteOp::Distilled`): [`remember`]; then, when it is new, its rank inputs.
+/// It evicts nothing: a member of a full set leaves only once the judge finds the newcomer live
+/// ([`evict_over_cap`]; the controller's ruling on Task 12c review I1, option b).
 fn distilled(
     conn: &Connection,
     input: NewMemoryInput,
     project: &ProjectChoice,
     p: f64,
     subagent: bool,
-    replaces: Option<&str>,
     st: &mut State,
 ) -> Result<WriteOutcome> {
-    let replaced = match replaces {
-        Some(old) => match held_member(conn, old)? {
-            Some(h) if !h.replaceable() => return Ok(WriteOutcome::Done),
-            member => member.map(|h| h.id),
-        },
-        None => None,
-    };
     let out = remember(conn, input, project, st)?;
     if let WriteOutcome::Remembered(InsertOutcome::New { id, .. }, _) = &out {
         let tier = if subagent { "subagent" } else { "main" };
@@ -788,35 +777,54 @@ fn distilled(
             "UPDATE memories SET distill_p = ?1, distill_tier = ?2 WHERE id = ?3",
             rusqlite::params![p, tier, id],
         )?;
-        if let Some(old) = replaced {
-            let forget = MemoryUpdate {
-                action: UpdateAction::Forget,
-                ..Default::default()
-            };
-            update(conn, &old, &forget, &Actor::Distill(DISTILL_CAP.into()), st)?;
-        }
     }
     Ok(out)
 }
 
-/// The memory `id` as a member of its session's best set (`store::capture::session_held`, by its
-/// own author), or `None` when it is not one (any more).
-fn held_member(conn: &Connection, id: &str) -> Result<Option<alice_core::distill::Held>> {
-    let author: Option<(Option<String>, Option<String>)> = conn
+/// The author of the distilled memory `id`, as its session's best set is read by
+/// (`store::capture::session_held`): `None` for a memory that is not distilled or has none.
+fn distilled_author(conn: &Connection, id: &str) -> Result<Option<(String, String)>> {
+    Ok(conn
         .query_row(
-            "SELECT author_agent, author_session FROM memories WHERE id = ?1",
+            "SELECT author_agent, author_session FROM memories WHERE id = ?1 AND origin = 'distill'",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
         )
-        .optional()?;
-    let Some((Some(agent), Some(session))) = author else {
-        return Ok(None);
+        .optional()?
+        .and_then(|(a, s)| a.zip(s)))
+}
+
+/// After the judgement of the distilled newcomer `id` left it live: when its session's best set
+/// is now over its size, or over its subagents' share, the weakest member that may go is trashed
+/// by `distill:cap`, in the judgement's op (spec §6.4; Task 12c review I1, option b). It may be
+/// the newcomer itself; never a handoff or a protected member ([`alice_core::distill::evictee`]).
+fn evict_over_cap(
+    conn: &Connection,
+    st: &mut State,
+    id: &str,
+    settings: &alice_core::settings::DistillSettings,
+) -> Result<()> {
+    let Some((agent, session)) = distilled_author(conn, id)? else {
+        return Ok(());
     };
-    Ok(
-        alice_core::store::capture::session_held(conn, &agent, &session)?
-            .into_iter()
-            .find(|h| h.id == id),
-    )
+    let held = alice_core::store::capture::session_held(conn, &agent, &session)?;
+    if !held.iter().any(|h| h.id == id) {
+        return Ok(()); // no longer live
+    }
+    if let Some(out) = alice_core::distill::evictee(&held, settings) {
+        let forget = MemoryUpdate {
+            action: UpdateAction::Forget,
+            ..Default::default()
+        };
+        update(
+            conn,
+            &out.id,
+            &forget,
+            &Actor::Distill(DISTILL_CAP.into()),
+            st,
+        )?;
+    }
+    Ok(())
 }
 
 /// `update`: the change and its `memory.<action>` event, whose id it returns. A supersede also
@@ -1979,8 +1987,7 @@ fn apply(
             project,
             p,
             subagent,
-            replaces,
-        } => distilled(conn, input, &project, p, subagent, replaces.as_deref(), st)?,
+        } => distilled(conn, input, &project, p, subagent, st)?,
         WriteOp::Ingest {
             project,
             source,
@@ -2378,6 +2385,9 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
     let distilled_newcomer = is_distilled(conn, j.seq)?;
     // The comparisons were made in the project the memory has left.
     let actions: &[JudgeAction] = if moved { &[] } else { &j.actions };
+    // A distilled newcomer that superseded a member of its own session's best set took that
+    // member's slot: it evicts nothing (review I1, option b).
+    let mut took_a_slot = false;
     if moved {
         reviews.retain(|r| r.kind == ReviewType::Project);
     }
@@ -2421,8 +2431,13 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
                 }
             }
             JudgeAction::Supersedes { old, .. } => {
+                let member = distilled_newcomer && {
+                    let theirs = distilled_author(conn, old)?;
+                    theirs.is_some() && theirs == distilled_author(conn, &j.id)?
+                };
                 match supersede(conn, st, old, &j.id, &actor, Some(&group)) {
-                    Ok(()) | Err(AliceError::Invalid(_) | AliceError::NotFound(_)) => {}
+                    Ok(()) => took_a_slot |= member,
+                    Err(AliceError::Invalid(_) | AliceError::NotFound(_)) => {}
                     Err(e) => return Err(e),
                 }
             }
@@ -2542,6 +2557,15 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
                 judge_next_try_at = NULL WHERE seq = ?1",
             [j.seq],
         )?;
+        // Judged live into its session's best set: the set keeps its size (Task 12c review I1,
+        // option b). A newcomer the judge trashed, or that took a member's slot, evicts nothing.
+        if distilled_newcomer
+            && !trashed
+            && !took_a_slot
+            && let Some(settings) = &j.distill
+        {
+            evict_over_cap(conn, st, &j.id, settings)?;
+        }
     }
     Ok(WriteOutcome::Done)
 }
@@ -7245,51 +7269,111 @@ mod tests {
         assert_eq!(actor, "user");
     }
 
-    /// The Task 12c addendum: the set the worker read may be stale by the time its op runs. A
-    /// memory that a person or an agent touched since, or a handoff, is never trashed by
-    /// `distill:cap`, and the newcomer that was to replace it is not stored either (its slot is
-    /// still taken). One an explicit copy promoted meanwhile is not a member any more: its slot
-    /// is free, so the newcomer is stored and the promoted memory is left as it is.
-    #[test]
-    fn a_distilled_memory_never_replaces_one_the_cap_may_not_replace() {
-        let f = fixture();
-        let input = |text: &str, key: &str, kind: Kind, origin: Origin| NewMemoryInput {
-            content: text.into(),
-            kind: Some(kind),
-            idempotency_key: Some(key.into()),
-            author: alice_core::model::Author {
-                agent: Some(CAPTURE_AGENT.into()),
-                session: Some("S1".into()),
-                model: None,
+    /// A distilled memory of session `session`, written as the distill worker writes it.
+    fn distilled_op(text: &str, key: &str, kind: Kind, p: f64, session: &str) -> WriteOp {
+        WriteOp::Distilled {
+            input: NewMemoryInput {
+                content: text.into(),
+                kind: Some(kind),
+                idempotency_key: Some(key.into()),
+                author: alice_core::model::Author {
+                    agent: Some(CAPTURE_AGENT.into()),
+                    session: Some(session.into()),
+                    model: None,
+                },
+                origin: Origin::Distill,
+                ..Default::default()
             },
-            origin,
+            project: global(),
+            p,
+            subagent: false,
+        }
+    }
+
+    /// The judge's verdict on memory `id`, applied as the judge worker applies it, with the
+    /// distillation settings `cap` (`max_per_session` 3 when `Some`).
+    fn verdict(f: &Fixture, id: &str, actions: Vec<JudgeAction>, retry: bool, cap: bool) {
+        let seq: i64 = f.read("SELECT seq FROM memories WHERE id = ?1", [id]);
+        let stamp: String = f.read("SELECT content_hash FROM memories WHERE id = ?1", [id]);
+        let updated_at: String = f.read("SELECT updated_at FROM memories WHERE id = ?1", [id]);
+        // The judge read each memory it acts on as it is now.
+        let seen = actions
+            .iter()
+            .map(|a| {
+                let other = match a {
+                    JudgeAction::DuplicateOf { survivor, .. } => survivor,
+                    JudgeAction::Supersedes { old, .. } => old,
+                    JudgeAction::Contradicts { other, .. }
+                    | JudgeAction::RelatesTo { other, .. } => other,
+                    JudgeAction::ReplaceDistilled { distilled, .. } => distilled,
+                };
+                let hash: String =
+                    f.read("SELECT content_hash FROM memories WHERE id = ?1", [other]);
+                (other.clone(), hash)
+            })
+            .collect();
+        f.h.submit_blocking(WriteOp::ApplyJudgement(Judgement {
+            seq,
+            id: id.into(),
+            stamp,
+            updated_at,
+            provider: "jev".into(),
+            actions,
+            retry,
+            seen,
+            distill: cap.then(|| alice_core::settings::DistillSettings {
+                max_per_session: 3,
+                ..Default::default()
+            }),
             ..Default::default()
-        };
-        let distilled =
-            |text: &str, key: &str, kind: Kind, replaces: Option<&str>| WriteOp::Distilled {
-                input: input(text, key, kind, Origin::Distill),
-                project: global(),
-                p: 0.9,
-                subagent: false,
-                replaces: replaces.map(str::to_owned),
-            };
-        let status =
-            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
-        let stored = |key: &str| -> i64 {
-            f.read(
-                "SELECT count(*) FROM memories WHERE idempotency_key = ?1",
-                [key],
-            )
-        };
-        // Edited by an agent after it was distilled.
-        let (edited, _) = new_id(
-            f.h.submit_blocking(distilled(
-                "The cache keeps its data in memory only",
-                "distill:edited",
-                Kind::Fact,
-                None,
-            ))
-            .unwrap(),
+        }))
+        .unwrap();
+    }
+
+    /// A distilled memory of session S1, judged live without a cap: a member of its best set.
+    fn member(f: &Fixture, text: &str, key: &str, kind: Kind, p: f64) -> String {
+        let (id, _) = new_id(
+            f.h.submit_blocking(distilled_op(text, key, kind, p, "S1"))
+                .unwrap(),
+        );
+        verdict(f, &id, Vec::new(), false, false);
+        id
+    }
+
+    fn cap_forgets(f: &Fixture) -> i64 {
+        f.read(
+            "SELECT count(*) FROM events WHERE action = 'memory.forget' AND actor = 'distill:cap'",
+            [],
+        )
+    }
+
+    /// Task 12c (spec §6.4) and its review's I1, option b: a distilled memory is written with its
+    /// rank inputs and evicts nothing. Once the judge finds it live in a full best set (three
+    /// here), the weakest member that may go is trashed in the judgement's op: a `memory.forget`
+    /// by `distill:cap`, undoable like any trash. Never a handoff, nor a member an agent edited.
+    #[test]
+    fn a_newcomer_judged_live_into_a_full_set_evicts_the_weakest_that_may_go() {
+        let f = fixture();
+        let handoff = member(
+            &f,
+            "Where things stand: the cache is set up, next the restart",
+            "distill:h",
+            Kind::Handoff,
+            0.71,
+        );
+        let edited = member(
+            &f,
+            "The cache keeps its data in memory only",
+            "distill:g",
+            Kind::Fact,
+            0.70,
+        );
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
         );
         f.h.submit_blocking(WriteOp::Update {
             id: edited.clone(),
@@ -7301,175 +7385,34 @@ mod tests {
             actor: Actor::Agent(CAPTURE_AGENT.into()),
         })
         .unwrap();
-        let out =
-            f.h.submit_blocking(distilled(
-                "The cache service listens on port 6380",
-                "distill:n1",
+        let (new, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The cache service listens on its own port",
+                "distill:new",
                 Kind::Fact,
-                Some(&edited),
-            ))
-            .unwrap();
-        assert!(matches!(out, WriteOutcome::Done), "{}", out.name());
-        assert_ne!(status(&edited), "trashed");
-        assert_eq!(stored("distill:n1"), 0, "the newcomer is not stored");
-        // The session's handoff.
-        let (handoff, _) = new_id(
-            f.h.submit_blocking(distilled(
-                "Where things stand: the cache is set up, next the restart",
-                "distill:handoff",
-                Kind::Handoff,
-                None,
-            ))
-            .unwrap(),
-        );
-        let out =
-            f.h.submit_blocking(distilled(
-                "Where things stand now: the restart moved to 04:00",
-                "distill:n2",
-                Kind::Handoff,
-                Some(&handoff),
-            ))
-            .unwrap();
-        assert!(matches!(out, WriteOutcome::Done), "{}", out.name());
-        assert_ne!(status(&handoff), "trashed");
-        assert_eq!(stored("distill:n2"), 0);
-        // Promoted by an explicit copy: no longer distilled, so its slot is free.
-        let (promoted, _) = new_id(
-            f.h.submit_blocking(distilled(
-                "The queue drains every five minutes",
-                "distill:promoted",
-                Kind::Fact,
-                None,
-            ))
-            .unwrap(),
-        );
-        f.h.submit_blocking(WriteOp::Remember {
-            input: NewMemoryInput {
-                idempotency_key: None,
-                ..input(
-                    "The queue drains every five minutes",
-                    "",
-                    Kind::Fact,
-                    Origin::Agent,
-                )
-            },
-            project: global(),
-        })
-        .unwrap();
-        let origin: String = f.read("SELECT origin FROM memories WHERE id = ?1", [&promoted]);
-        assert_eq!(origin, "agent");
-        let before = status(&promoted);
-        new_id(
-            f.h.submit_blocking(distilled(
-                "The queue service restarts on deploy",
-                "distill:n3",
-                Kind::Fact,
-                Some(&promoted),
-            ))
-            .unwrap(),
-        );
-        assert_eq!(status(&promoted), before, "left as it is");
-        let forgets: i64 = f.read(
-            "SELECT count(*) FROM events WHERE action = 'memory.forget' AND actor = 'distill:cap'",
-            [],
-        );
-        assert_eq!(forgets, 0);
-    }
-
-    /// Task 12c (spec §6.4): a distilled memory is written with its rank inputs and, when it takes
-    /// the place of a weaker one in its session's best set, that one is trashed in the same op:
-    /// a `memory.forget` by `distill:cap`, undoable like any trash. A duplicate replaces nothing,
-    /// and neither does a memory that is no longer live.
-    #[test]
-    fn a_distilled_memory_replaces_its_sessions_weakest_in_one_op() {
-        let f = fixture();
-        let distilled = |text: &str, key: &str, p: f64, subagent: bool, replaces: Option<&str>| {
-            WriteOp::Distilled {
-                input: NewMemoryInput {
-                    content: text.into(),
-                    kind: Some(Kind::Fact),
-                    idempotency_key: Some(key.into()),
-                    author: alice_core::model::Author {
-                        agent: Some(CAPTURE_AGENT.into()),
-                        session: Some("S1".into()),
-                        model: None,
-                    },
-                    origin: Origin::Distill,
-                    ..Default::default()
-                },
-                project: global(),
-                p,
-                subagent,
-                replaces: replaces.map(str::to_owned),
-            }
-        };
-        let (weak, _) = new_id(
-            f.h.submit_blocking(distilled(
-                "The cache keeps its data in memory only",
-                "distill:weak",
-                0.72,
-                true,
-                None,
+                0.95,
+                "S1",
             ))
             .unwrap(),
         );
         let (p, tier): (f64, String) = (
-            f.read("SELECT distill_p FROM memories WHERE id = ?1", [&weak]),
-            f.read("SELECT distill_tier FROM memories WHERE id = ?1", [&weak]),
+            f.read("SELECT distill_p FROM memories WHERE id = ?1", [&new]),
+            f.read("SELECT distill_tier FROM memories WHERE id = ?1", [&new]),
         );
-        assert_eq!((p, tier.as_str()), (0.72, "subagent"));
-        let (best, _) = new_id(
-            f.h.submit_blocking(distilled(
-                "The cache service listens on port 6380 and restarts nightly",
-                "distill:best",
-                0.97,
-                false,
-                Some(&weak),
-            ))
-            .unwrap(),
-        );
+        assert_eq!((p, tier.as_str()), (0.95, "main"));
         let status =
             |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        assert_eq!(cap_forgets(&f), 0, "written, nothing evicted");
+        verdict(&f, &new, Vec::new(), false, true);
         assert_eq!(status(&weak), "trashed");
-        assert_ne!(status(&best), "trashed");
-        let tier: String = f.read("SELECT distill_tier FROM memories WHERE id = ?1", [&best]);
-        assert_eq!(tier, "main");
-        let (event, actor): (String, String) = (
-            f.read(
-                "SELECT id FROM events WHERE action = 'memory.forget' AND target_id = ?1",
-                [&weak],
-            ),
-            f.read(
-                "SELECT actor FROM events WHERE action = 'memory.forget' AND target_id = ?1",
-                [&weak],
-            ),
+        for id in [&handoff, &edited, &new] {
+            assert_ne!(status(id), "trashed");
+        }
+        let event: String = f.read(
+            "SELECT id FROM events WHERE action = 'memory.forget' AND actor = 'distill:cap' AND target_id = ?1",
+            [&weak],
         );
-        assert_eq!(actor, "distill:cap", "the trash's reason");
-        // A duplicate of the best replaces nothing.
-        let (other, _) = new_id(
-            f.h.submit_blocking(distilled(
-                "Another fact entirely, about the queue",
-                "distill:other",
-                0.9,
-                false,
-                None,
-            ))
-            .unwrap(),
-        );
-        let again =
-            f.h.submit_blocking(distilled(
-                "The cache service listens on port 6380 and restarts nightly",
-                "distill:best",
-                0.97,
-                false,
-                Some(&other),
-            ))
-            .unwrap();
-        assert!(matches!(
-            again,
-            WriteOutcome::Remembered(InsertOutcome::Duplicate { .. }, _)
-        ));
-        assert_ne!(status(&other), "trashed");
+        assert_eq!(cap_forgets(&f), 1);
         // The trash is undone like any other.
         f.h.submit_blocking(WriteOp::Undo {
             event_id: event,
@@ -7477,32 +7420,213 @@ mod tests {
         })
         .unwrap();
         assert_ne!(status(&weak), "trashed");
-        // A replaced memory that is no longer live is left as it is.
-        f.h.submit_blocking(WriteOp::Update {
-            id: weak.clone(),
-            update: MemoryUpdate {
-                action: UpdateAction::Forget,
-                ..Default::default()
-            },
-            actor: Actor::User,
-        })
-        .unwrap();
-        let forgets = || -> i64 {
-            f.read(
-                "SELECT count(*) FROM events WHERE action = 'memory.forget' AND target_id = ?1",
-                [&weak],
-            )
-        };
-        let before = forgets();
-        f.h.submit_blocking(distilled(
-            "A third fact, about the backups",
-            "distill:third",
-            0.95,
+    }
+
+    /// Review I1, option b: a newcomer the judge trashes as a duplicate evicts nothing, so the
+    /// full set's unique weakest member stays.
+    #[test]
+    fn a_newcomer_the_judge_trashes_as_a_duplicate_evicts_nothing() {
+        let f = fixture();
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        member(
+            &f,
+            "The cache keeps its data in memory only",
+            "distill:y",
+            Kind::Fact,
+            0.9,
+        );
+        member(
+            &f,
+            "Invoices go out on Fridays",
+            "distill:z",
+            Kind::Fact,
+            0.85,
+        );
+        let (saved, _) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "The berth tracker cache is warmed by the night job".into(),
+                    kind: Some(Kind::Fact),
+                    origin: Origin::Agent,
+                    ..Default::default()
+                },
+                project: global(),
+            })
+            .unwrap(),
+        );
+        let (dup, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The berth tracker cache is warmed by the night job, as said",
+                "distill:dup",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &dup,
+            vec![JudgeAction::DuplicateOf {
+                survivor: saved,
+                p: 0.95,
+            }],
             false,
-            Some(&weak),
-        ))
-        .unwrap();
-        assert_eq!(forgets(), before);
+            true,
+        );
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        assert_eq!(status(&dup), "trashed");
+        assert_ne!(status(&weak), "trashed", "the unique member stays");
+        assert_eq!(cap_forgets(&f), 0);
+    }
+
+    /// Review I1, option b: a newcomer that supersedes a member of its own session's set took that
+    /// member's slot and evicts nothing, even over a set already past its size (three of four
+    /// here, as after a lowered `max_per_session`). One that supersedes another session's memory
+    /// takes a new slot: the weakest member that may go leaves.
+    #[test]
+    fn a_newcomer_that_supersedes_a_member_evicts_nothing() {
+        let f = fixture();
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        let old = member(
+            &f,
+            "The berth planner reads the tide table",
+            "distill:y",
+            Kind::Fact,
+            0.9,
+        );
+        member(
+            &f,
+            "Invoices go out on Fridays",
+            "distill:z",
+            Kind::Fact,
+            0.85,
+        );
+        member(
+            &f,
+            "The north crane is the fastest",
+            "distill:w",
+            Kind::Fact,
+            0.8,
+        );
+        let (sup, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The berth planner reads the tide table before each shift",
+                "distill:sup",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &sup,
+            vec![JudgeAction::Supersedes {
+                old: old.clone(),
+                p: 0.95,
+            }],
+            false,
+            true,
+        );
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        assert_eq!(status(&old), "superseded");
+        assert_ne!(status(&sup), "trashed");
+        assert_ne!(status(&weak), "trashed");
+        assert_eq!(cap_forgets(&f), 0);
+        // Another session's memory superseded: the newcomer takes a slot of its own.
+        let (theirs, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The gate opens at dawn",
+                "distill:o",
+                Kind::Fact,
+                0.9,
+                "S2",
+            ))
+            .unwrap(),
+        );
+        verdict(&f, &theirs, Vec::new(), false, false);
+        let (next, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The gate opens at dawn and closes at dusk",
+                "distill:next",
+                Kind::Fact,
+                0.96,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &next,
+            vec![JudgeAction::Supersedes {
+                old: theirs,
+                p: 0.95,
+            }],
+            false,
+            true,
+        );
+        assert_eq!(status(&weak), "trashed");
+        assert_eq!(cap_forgets(&f), 1);
+    }
+
+    /// Review I1, option b: a newcomer waiting for the judge (`pending`, or `retry` after an
+    /// outage) evicts nothing yet, and does not count toward the set.
+    #[test]
+    fn a_newcomer_waiting_for_the_judge_evicts_nothing_yet() {
+        let f = fixture();
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        member(
+            &f,
+            "The cache keeps its data in memory only",
+            "distill:y",
+            Kind::Fact,
+            0.9,
+        );
+        member(
+            &f,
+            "Invoices go out on Fridays",
+            "distill:z",
+            Kind::Fact,
+            0.85,
+        );
+        let (new, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The cache service listens on its own port",
+                "distill:new",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        assert_eq!(cap_forgets(&f), 0, "pending");
+        verdict(&f, &new, Vec::new(), true, true);
+        let state: String = f.read("SELECT judge_state FROM memories WHERE id = ?1", [&new]);
+        assert_eq!(state, "retry");
+        assert_eq!(cap_forgets(&f), 0, "retry");
+        let status: String = f.read("SELECT status FROM memories WHERE id = ?1", [&weak]);
+        assert_ne!(status, "trashed");
     }
 
     /// SP2 spec §3.9 and R11: retention that deletes a capture source's last chunk keeps the

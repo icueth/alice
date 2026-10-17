@@ -324,6 +324,8 @@ pub struct Held {
     /// A person or an agent changed it, or links to it, since it was distilled: it is never
     /// replaced (Task 12c addendum), though it counts toward the set's size.
     pub protected: bool,
+    /// The judge has not settled it yet (`judge_state` `pending` or `retry`).
+    pub unjudged: bool,
 }
 
 impl Held {
@@ -347,8 +349,35 @@ impl Held {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Placement {
     pub memory: DistilledMemory,
-    /// The held memory it replaces (trashed as `distill:cap`), when the set is full.
+    /// The held memory it would replace, when the set is full. Nothing is trashed when it is
+    /// written: [`evictee`] chooses again once the judge finds it live.
     pub replaces: Option<String>,
+}
+
+/// The member that leaves a session's best set once a newcomer is judged live (spec §6.4; the
+/// controller's ruling on review I1, option b: eviction waits for the judge, so a newcomer the
+/// judge trashes evicts nothing). `held` is the set as `store::capture::session_held` reads it,
+/// the newcomer in it. Members the judge has yet to settle neither count nor go. With more
+/// subagent reports among the settled members than half of `max_per_session` (rounded down),
+/// the weakest report that may go ([`Held::replaceable`]) goes; otherwise, with more settled
+/// members than `max_per_session`, the weakest member that may go, the newcomer perhaps. `None`:
+/// nothing is over, or nothing may go.
+pub fn evictee<'a>(held: &'a [Held], s: &DistillSettings) -> Option<&'a Held> {
+    let subagent = |h: &Held| h.idempotency_key.starts_with(SUBAGENT_KEY_PREFIX);
+    let settled = || held.iter().filter(|h| !h.unjudged);
+    let weakest = |only_reports: bool| {
+        settled()
+            .filter(|h| h.replaceable() && (!only_reports || subagent(h)))
+            .max_by(|a, b| a.rank(s).order(&b.rank(s)))
+    };
+    if settled().filter(|h| subagent(h)).count() > s.max_per_session / 2
+        && let Some(h) = weakest(true)
+    {
+        return Some(h);
+    }
+    (settled().count() > s.max_per_session)
+        .then(|| weakest(false))
+        .flatten()
 }
 
 /// Places a run's kept memories into the session's best set (spec §6.4; the controller's ruling
@@ -366,7 +395,9 @@ pub struct Placement {
 ///
 /// So the set never grows past its size, and, but for the members it may not replace, it is the
 /// best `max_per_session` by [`Rank`] of all the passages ever kept, whatever their order. The
-/// placements come in `kept`'s order.
+/// placements come in `kept`'s order. They say which kept memories are stored; the members they
+/// would replace leave only once the judge finds each newcomer live ([`evictee`]; Task 12c review
+/// I1, option b).
 pub fn place(held: &[Held], kept: Vec<DistilledMemory>, s: &DistillSettings) -> Vec<Placement> {
     struct Member {
         id: Option<String>,
@@ -3796,6 +3827,7 @@ mod tests {
             subagent: Some(m.subagent),
             idempotency_key: m.idempotency_key.clone(),
             protected: false,
+            unjudged: false,
         }
     }
 
@@ -4074,6 +4106,84 @@ mod tests {
         assert_eq!(ids, ["distill:d1", "distill:h1", "distill:h2"]);
     }
 
+    /// The controller's ruling on I1 (option b, Task 12c review): eviction waits for the judge.
+    /// Once a newcomer is judged live and the settled members are more than `max_per_session`, or
+    /// their subagent reports more than half of it, the weakest member that may go leaves: the
+    /// newcomer itself when it is the weakest, a subagent report when those are over their share.
+    /// A member the judge has not settled neither counts nor goes; a handoff and a protected
+    /// member never go.
+    #[test]
+    fn a_newcomer_judged_live_evicts_the_weakest_that_may_go() {
+        let s = caps(8, 4, 2);
+        let m = |name: &str, kind: Kind, p: f64, sub: bool| held_of(&kept_mem(name, kind, p, sub));
+        let guard = |h: Held| Held {
+            protected: true,
+            ..h
+        };
+        let id = |h: Option<&Held>| h.map(|h| h.id.clone());
+        let h = m("h", Kind::Handoff, 0.71, false);
+        let guarded = guard(m("guarded", Kind::Fact, 0.70, false));
+        let weak = m("weak", Kind::Fact, 0.72, false);
+        let a = m("a", Kind::Decision, 0.95, false);
+        let new = m("new", Kind::Fact, 0.9, false);
+        let set = [
+            h.clone(),
+            guarded.clone(),
+            weak.clone(),
+            a.clone(),
+            new.clone(),
+        ];
+        assert_eq!(id(evictee(&set, &s)), Some("distill:weak".into()));
+        assert_eq!(
+            evictee(&set[1..], &s),
+            None,
+            "four of four: nothing is over"
+        );
+        let waiting = Held {
+            unjudged: true,
+            ..m("waiting", Kind::Fact, 0.6, false)
+        };
+        let set = [h.clone(), guarded.clone(), a.clone(), new.clone(), waiting];
+        assert_eq!(
+            evictee(&set, &s),
+            None,
+            "an unsettled member does not count"
+        );
+        let low = m("low", Kind::Fact, 0.71, false);
+        let set = [h.clone(), guarded.clone(), a.clone(), new.clone(), low];
+        assert_eq!(
+            id(evictee(&set, &s)),
+            Some("distill:low".into()),
+            "the newcomer itself"
+        );
+        let set = [
+            h.clone(),
+            guarded.clone(),
+            guard(a.clone()),
+            guard(new.clone()),
+            guard(weak.clone()),
+        ];
+        assert_eq!(evictee(&set, &s), None, "nothing may go");
+        // Four of four, but three subagent reports of two: the weakest report goes.
+        let set = [
+            weak.clone(),
+            m("s1", Kind::Fact, 0.95, true),
+            m("s3", Kind::Fact, 0.85, true),
+            m("s2", Kind::Fact, 0.9, true),
+        ];
+        assert_eq!(
+            id(evictee(&set, &s)),
+            Some(format!("{SUBAGENT_KEY_PREFIX}s3"))
+        );
+        let set = [
+            weak,
+            guard(m("s1", Kind::Fact, 0.95, true)),
+            guard(m("s3", Kind::Fact, 0.85, true)),
+            guard(m("s2", Kind::Fact, 0.9, true)),
+        ];
+        assert_eq!(evictee(&set, &s), None, "no report may go");
+    }
+
     /// The Task 12c addendum: `distill:cap` never replaces the session's handoff, nor a protected
     /// memory (one a person or an agent changed or links to). They still count toward the set's
     /// size. When every member is protected, or none that may go is weaker, the newcomer is not
@@ -4145,6 +4255,7 @@ mod tests {
             subagent: None,
             idempotency_key: "distill:old".into(),
             protected: false,
+            unjudged: false,
         };
         assert_eq!(
             old.rank(&s),
