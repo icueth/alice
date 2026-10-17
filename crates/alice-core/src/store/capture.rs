@@ -353,7 +353,7 @@ pub struct Progress<'a> {
     /// back; `byte_offset` is set as given.
     pub cursor: Option<(u64, i64)>,
     pub last_event: Option<&'a str>,
-    /// The session ended (never cleared here).
+    /// The session ended with this slice.
     pub ended: bool,
     /// The slice captured something (`last_capture_at` becomes now).
     pub captured: bool,
@@ -363,7 +363,10 @@ pub struct Progress<'a> {
 /// must not hand a later pass ords that are taken (their chunks would be dropped by `INSERT OR
 /// IGNORE` while their turn keys are recorded, and the turns lost). `byte_offset` is set as given,
 /// since a replaced file resets it on purpose (`set_file_key`), and a turn read again is skipped
-/// by its key.
+/// by its key. A slice that ends the session marks it `ended`; one that captured something
+/// without ending it clears `ended` (final review B-I2): a session resumed after its end (or its
+/// stale end) is open again, so its later quiet runs are not closing runs, and its next end, or
+/// stale end, closes it again. A slice that captured nothing leaves `ended` as it is.
 pub fn advance(conn: &Connection, source_id: &str, p: &Progress<'_>) -> Result<()> {
     let (byte_offset, next_ord) = match p.cursor {
         Some((b, o)) => (Some(offset(b)), Some(o)),
@@ -373,7 +376,8 @@ pub fn advance(conn: &Connection, source_id: &str, p: &Progress<'_>) -> Result<(
     conn.prepare_cached(
         "UPDATE capture_state SET byte_offset = COALESCE(?2, byte_offset),
             next_ord = MAX(next_ord, COALESCE(?3, next_ord)), last_event = COALESCE(?4, last_event),
-            last_capture_at = COALESCE(?5, last_capture_at), ended = MAX(ended, ?6)
+            last_capture_at = COALESCE(?5, last_capture_at),
+            ended = CASE WHEN ?6 THEN 1 WHEN ?5 IS NOT NULL THEN 0 ELSE ended END
          WHERE source_id = ?1",
     )?
     .execute(params![
@@ -662,6 +666,22 @@ pub const SESSION_HELD: &str =
      WHERE m.origin = 'distill' AND m.author_session = ?1 AND m.author_agent = ?2
        AND m.status NOT IN ('trashed', 'superseded')
      ORDER BY m.seq";
+
+/// The captured turns of a session: the turn keys (`capture_turns`) its sources stored first, its
+/// main source's and its subagents' together (a subagent's source carries its session's agent
+/// and id). Kept when retention deletes the chunks, so the count never shrinks. Uses
+/// `capture_state_session` and `capture_turns_source` (migration 0008).
+pub const SESSION_TURNS: &str = "SELECT count(*) FROM capture_turns
+     WHERE source_id IN (SELECT source_id FROM capture_state WHERE agent = ?1 AND session_id = ?2)";
+
+/// The captured turns of the session `session` of `agent` ([`SESSION_TURNS`]): what its best
+/// set's room grows with (SP2 spec §6.4, Task 12d).
+pub fn session_turns(conn: &Connection, agent: &str, session: &str) -> Result<usize> {
+    let n: i64 = conn
+        .prepare_cached(SESSION_TURNS)?
+        .query_row(params![agent, session], |r| r.get(0))?;
+    Ok(n.max(0) as usize)
+}
 
 /// The best set of the session `session` of `agent` as [`SESSION_HELD`] reads it. A memory of an
 /// unknown kind (a later build's) is left out.
@@ -964,6 +984,59 @@ mod tests {
             protected(),
             want,
             "a protection lasts when its event is pruned"
+        );
+    }
+
+    /// Task 12d: a session's captured turns are its turn keys (`capture_turns`) of its main
+    /// source and its subagents' sources together; another session's or agent's are not.
+    #[test]
+    fn a_sessions_turns_count_its_main_and_subagent_turn_keys() {
+        let (_d, c) = conn();
+        for (id, agent, session, parent) in [
+            ("MAIN", "claude-code", "S1", None),
+            ("SUB", "claude-code", "S1", Some("MAIN")),
+            ("OTHER", "claude-code", "S2", None),
+            ("CODEX", "codex", "S1", None),
+        ] {
+            source(
+                &c,
+                id,
+                &format!("{agent}:session:{id}"),
+                Some(session),
+                None,
+            );
+            c.execute(
+                "INSERT INTO capture_state (source_id, agent, session_id, parent_source_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, '2026-10-17T00:00:00.000Z')",
+                params![id, agent, session, parent],
+            )
+            .unwrap();
+        }
+        let turns = |source: &str, agent: &str, n: usize| {
+            for i in 0..n {
+                c.execute(
+                    "INSERT INTO capture_turns (agent, turn_key, source_id, first_ord) VALUES (?1, ?2, ?3, ?4)",
+                    params![agent, format!("{source}-{i}"), source, i as i64],
+                )
+                .unwrap();
+            }
+        };
+        turns("MAIN", "claude-code", 70);
+        turns("SUB", "claude-code", 31);
+        turns("OTHER", "claude-code", 500);
+        turns("CODEX", "codex", 500);
+        assert_eq!(session_turns(&c, "claude-code", "S1").unwrap(), 101);
+        assert_eq!(session_turns(&c, "claude-code", "S9").unwrap(), 0);
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {SESSION_TURNS}"))
+            .unwrap()
+            .query_map(params!["claude-code", "S1"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter().any(|d| d.contains("capture_turns_source")),
+            "{plan:?}"
         );
     }
 

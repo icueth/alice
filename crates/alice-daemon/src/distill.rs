@@ -29,16 +29,19 @@
 //!    covers ([`Judge::ask_distill`], so at most one in flight), then [`distill::decide`]. A
 //!    session whose best set is full is asked as any other (Task 12c), within
 //!    `distill.budget_share`.
-//! 5. The kept passages fitted into the session's best set ([`distill::place`]: at most
-//!    `distill.max_per_session` live distilled memories, the best by rank; a passage better than
-//!    the weakest that may go is stored, never in place of a handoff nor of a memory a person or
-//!    an agent touched; with none to outrank it is not stored, and the run counts it in
-//!    `capped`), then each written with [`write_memory`] in the project of the source it came
-//!    from: redacted with that project's rules, `origin = distill`, its rank inputs, its chunks
-//!    as provenance and an idempotency key, so a repeated run (a crash before the cursor moved)
-//!    stores nothing twice. Nothing is evicted here: once the judge finds a newcomer live in a
-//!    full set, the writer trashes the set's weakest member that may go, by `distill:cap` (Task
-//!    12c review I1, option b).
+//! 5. The kept passages fitted into the session's best set ([`distill::place`]: at most its room
+//!    of live distilled memories, the best by rank; the room is [`distill::room`] of the
+//!    session's captured turns, `distill.max_per_session` for the first 100 and growing up to
+//!    `distill.max_per_session_cap`, Task 12d; a passage better than the weakest that may go is
+//!    stored, never in place of a memory a person or an agent touched; with none to outrank it
+//!    is not stored, and the run counts it in `capped`; a handoff is outside the room, always
+//!    stored, and the writer keeps the session's newest one only, final review B-I2), then each
+//!    written with [`write_memory`] in the project of the source it came from: redacted with
+//!    that project's rules, `origin = distill`, its rank inputs, its chunks as provenance and an
+//!    idempotency key, so a repeated run (a crash before the cursor moved) stores nothing twice.
+//!    Nothing is evicted here: once the judge finds a newcomer live in a full set, the writer
+//!    trashes a member that may go, by `distill:cap` (Task 12c review I1, option b): one the
+//!    judge related the newcomer to first, otherwise the weakest (Task 12d).
 //! 6. The cursors move to the end of the run; the source is `done`, or `due` again when more of
 //!    it is left.
 //!
@@ -684,6 +687,8 @@ impl DistillCtl {
             uri: src.uri.clone(),
             project: slug.clone(),
             project_names,
+            // `ended` holds only until a resumed session stores a new turn (final review B-I2),
+            // so a resumed session's quiet runs are not closing runs.
             closes_session: !loaded.main_cut
                 && (src.ended
                     || matches!(
@@ -756,16 +761,18 @@ impl DistillCtl {
         let placements = if memories.is_empty() {
             Vec::new()
         } else {
-            let held = match self
-                .ctx
-                .readers
-                .with(|c| store::session_held(c, &src.agent, &src.session_id))
-            {
+            let (held, turns) = match self.ctx.readers.with(|c| {
+                Ok((
+                    store::session_held(c, &src.agent, &src.session_id)?,
+                    store::session_turns(c, &src.agent, &src.session_id)?,
+                ))
+            }) {
                 Ok(h) => h,
                 Err(e) => return self.read_failed(src, report, &e),
             };
             let n = memories.len();
-            let placements = distill::place(&held, memories, &s.distill);
+            let room = distill::room(&s.distill, turns);
+            let placements = distill::place(&held, memories, room, &s.distill);
             report.capped = n - placements.len();
             if report.capped > 0 {
                 tracing::info!(
@@ -1301,7 +1308,9 @@ impl DistillCtl {
 }
 
 /// `(distilled, dropped)`: memories distillation stored since `since`, and distilled memories
-/// trashed since then (duplicates the judge merged, and the like).
+/// trashed since then (duplicates the judge merged, and the like: spec §8.4's "duplicates and
+/// uncertain ones"). A member a session's full best set evicted (a `memory.forget` by
+/// `distill:cap`) is no drop (final review B M6).
 pub(crate) fn distilled_since(conn: &Connection, since: &str) -> Result<(u64, u64)> {
     let count = |sql: &str| -> Result<u64> {
         Ok(conn.query_row(sql, [since], |r| r.get::<_, i64>(0))? as u64)
@@ -1309,8 +1318,11 @@ pub(crate) fn distilled_since(conn: &Connection, since: &str) -> Result<(u64, u6
     Ok((
         count("SELECT count(*) FROM memories WHERE origin = 'distill' AND created_at >= ?1")?,
         count(
-            "SELECT count(*) FROM memories
-             WHERE origin = 'distill' AND status = 'trashed' AND updated_at >= ?1",
+            "SELECT count(*) FROM memories m
+             WHERE m.origin = 'distill' AND m.status = 'trashed' AND m.updated_at >= ?1
+               AND NOT EXISTS (SELECT 1 FROM events e
+                                WHERE e.target_type = 'memory' AND e.target_id = m.id
+                                  AND e.action = 'memory.forget' AND e.actor = 'distill:cap')",
         )?,
     ))
 }
@@ -1337,8 +1349,9 @@ pub(crate) fn write_memory(
         Some(ProjectTree::unreadable(slug.clone(), None))
     });
     let r = ctx.redactors.for_root(tree.as_ref());
-    let title = r.check("title", &m.title)?;
     let body = r.check("content", &m.body)?;
+    // A rule added since the capture may redact the title: it never keeps a marker (Task 12d).
+    let title = distill::clean_title(&r.check("title", &m.title)?, &body);
     let input = NewMemoryInput {
         content: body,
         kind: Some(m.kind),

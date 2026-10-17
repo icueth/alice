@@ -3,6 +3,7 @@
     {
       "file": "l01.jsonl",
       "kind": "gold",
+      "distill": "max_per_session_cap = 16",
       "gold": [
         {
           "phrase": "keep berth bookings in PostgreSQL with an exclusion constraint",

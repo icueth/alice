@@ -59,9 +59,9 @@ struct DistillScript {
     bodies: Mutex<Vec<String>>,
     /// The probability of a distillation answer's option (1.0); the rest goes to `ephemeral`.
     top: Mutex<f64>,
-    /// `(phrase, relation)`: the judge's comparison of a new memory with an existing one that
-    /// both hold `phrase` is answered with `relation` (all the probability on it).
-    relations: Mutex<Vec<(&'static str, &'static str)>>,
+    /// `(phrase, relation, p)`: the judge's comparison of a new memory with an existing one
+    /// that both hold `phrase` is answered with `relation` at `p`, the rest on `unrelated`.
+    relations: Mutex<Vec<(&'static str, &'static str, f64)>>,
     /// The judge's requests are answered with 503 (distillation's are not).
     judge_down: std::sync::atomic::AtomicBool,
     /// `(phrase, p)`: the probability of the option for a passage that holds `phrase`, in place
@@ -94,13 +94,19 @@ impl DistillScript {
     /// The judge compares a new memory with an existing one that both hold `phrase`: they are
     /// `relation` (`duplicate`, `updates`, `contradicts`).
     fn relate(&self, phrase: &'static str, relation: &'static str) {
-        self.relations.lock().push((phrase, relation));
+        self.relate_p(phrase, relation, 1.0);
     }
 
-    /// The scripted relation for the judge's question `qid` (`fwd_<k>` or `rev_<k>`) of a
-    /// comparison whose state is `state`: the one whose phrase both the new memory and existing
-    /// memory `k` hold, as the reversed question words it.
-    fn relation(&self, qid: &str, state: &str) -> Option<&'static str> {
+    /// [`DistillScript::relate`] at probability `p`, the rest on `unrelated` (a judge in the
+    /// band between `judge.review_threshold` and `judge.auto_apply_threshold`).
+    fn relate_p(&self, phrase: &'static str, relation: &'static str, p: f64) {
+        self.relations.lock().push((phrase, relation, p));
+    }
+
+    /// The scripted relation and its probability for the judge's question `qid` (`fwd_<k>` or
+    /// `rev_<k>`) of a comparison whose state is `state`: the one whose phrase both the new
+    /// memory and existing memory `k` hold, as the reversed question words it.
+    fn relation(&self, qid: &str, state: &str) -> Option<(&'static str, f64)> {
         let (k, reversed) = match (qid.strip_prefix("fwd_"), qid.strip_prefix("rev_")) {
             (Some(k), _) => (k, false),
             (_, Some(k)) => (k, true),
@@ -110,17 +116,20 @@ impl DistillScript {
         let new = blocks.next()?;
         let existing =
             blocks.find(|b| b.strip_prefix(k).is_some_and(|rest| rest.starts_with(" (")))?;
-        let relation = self
+        let (relation, p) = self
             .relations
             .lock()
             .iter()
-            .find(|(phrase, _)| new.contains(phrase) && existing.contains(phrase))
-            .map(|(_, r)| *r)?;
-        Some(if reversed && relation == "updates" {
-            "outdated_by"
-        } else {
-            relation
-        })
+            .find(|(phrase, _, _)| new.contains(phrase) && existing.contains(phrase))
+            .map(|(_, r, p)| (*r, *p))?;
+        Some((
+            if reversed && relation == "updates" {
+                "outdated_by"
+            } else {
+                relation
+            },
+            p,
+        ))
     }
 
     fn set_outage(&self, o: Outage) {
@@ -208,6 +217,8 @@ impl JevTransport for DistillScript {
             let options: Vec<String> = q["criteria"].as_object().unwrap().keys().cloned().collect();
             let offered = |o: &str| options.iter().any(|x| x == o);
             let text = q["instructions"].as_str().unwrap_or_default();
+            // The probability of a scripted relation (all of it unless the test says).
+            let mut related = None;
             let choice: String = if is_distill_question(qid) {
                 let want = self
                     .answers
@@ -215,10 +226,11 @@ impl JevTransport for DistillScript {
                     .find(|(phrase, _)| text.contains(phrase))
                     .map_or("ephemeral", |(_, o)| *o);
                 if offered(want) { want } else { "ephemeral" }.to_string()
-            } else if let Some(r) = self
+            } else if let Some((r, p)) = self
                 .relation(qid, req["state"].as_str().unwrap_or_default())
-                .filter(|r| offered(r))
+                .filter(|(r, _)| offered(r))
             {
+                related = Some(p);
                 r.to_string()
             } else {
                 // The judge's own questions: nothing to act on.
@@ -234,14 +246,20 @@ impl JevTransport for DistillScript {
                     .find(|(phrase, _)| text.contains(phrase))
                     .map_or(*self.top.lock(), |(_, p)| *p)
             } else {
-                1.0
+                related.unwrap_or(1.0)
+            };
+            // Where the rest of the probability goes.
+            let rest = if is_distill_question(qid) {
+                "ephemeral"
+            } else {
+                "unrelated"
             };
             let probs: serde_json::Map<String, serde_json::Value> = options
                 .iter()
                 .map(|o| {
                     let p = if *o == choice {
                         top
-                    } else if o == "ephemeral" {
+                    } else if o == rest {
                         1.0 - top
                     } else {
                         0.0
@@ -1369,6 +1387,114 @@ async fn the_quiet_trigger_distills_an_open_session() {
     settle().await;
     assert_eq!(d.script.distill_calls(), 1);
     assert_eq!(d.state(&uri("q1")).state, "done");
+    d.shutdown();
+}
+
+/// Final review B-I2: a session resumed after its end (`claude --resume` writes on in the same
+/// file) is open again, so its quiet pauses are not closing runs: no handoff is offered while it
+/// works, however its last reply reads. Its next end offers one again, and the session keeps
+/// that newest handoff only: the first one is superseded by it. Neither handoff takes the slot
+/// of a durable memory: the room of 2 holds both facts, and nothing is evicted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_session_keeps_one_handoff_and_every_fact() {
+    let config =
+        "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 2\n";
+    let d = Daemon::start(
+        Opts {
+            config,
+            idle: Some(Duration::from_millis(400)),
+            ..Opts::jev()
+        },
+        DistillScript::new(&[
+            ("Alpha note", "fact"),
+            ("Beta note", "fact"),
+            ("Where things stand:", "handoff"),
+        ]),
+    );
+    let handoffs = |d: &Daemon| -> Vec<(String, String)> {
+        d.distilled()
+            .into_iter()
+            .filter(|m| m.kind == "handoff")
+            .map(|m| (m.body, m.status))
+            .collect()
+    };
+    let mut t = Transcript::default();
+    t.prompt("rs-p1", "Where does the crane schedule live?")
+        .reply(
+            "rs-a1",
+            "Alpha note: the harbour crane schedule lives in the ops folder and changes every week.",
+        )
+        .prompt("rs-p2", "Where do we stand?")
+        .reply(
+            "rs-a2",
+            "Where things stand: the crane schedule is written down, and next we wire up the berth planner.",
+        );
+    d.send("shop", "rs1", &t, 0, "session-end").await;
+    until("the ended session is distilled and judged", || {
+        d.state(&uri("rs1")).state == "done" && d.distilled().len() == 2 && settled(&d)
+    })
+    .await;
+    assert!(d.state(&uri("rs1")).ended);
+    assert_eq!(handoffs(&d).len(), 1, "{:?}", d.distilled());
+
+    // Resumed: two quiet pauses whose last reply reads as a handoff.
+    for (step, fact) in [(3, true), (5, false)] {
+        let off = t.len();
+        let calls = d.script.distill_calls();
+        if fact {
+            t.prompt("rs-p3", "How does the berth planner work?").reply(
+                "rs-a3",
+                "Beta note: the berth planner reads the tide table from the shared drive before each shift.",
+            );
+        }
+        t.prompt(&format!("rs-p{}", step + 1), "Where do we stand now?")
+            .reply(
+                &format!("rs-a{}", step + 1),
+                &format!(
+                    "Where things stand: step {step} is done, and next we try the planner on the north quay."
+                ),
+            );
+        d.send("shop", "rs1", &t, off, "stop").await;
+        assert!(
+            !d.state(&uri("rs1")).ended,
+            "new turns after the end reopen the session"
+        );
+        until("the quiet pause is distilled and judged", || {
+            let st = d.state(&uri("rs1"));
+            d.script.distill_calls() > calls
+                && st.state == "done"
+                && st.distill_ord == st.next_ord
+                && settled(&d)
+        })
+        .await;
+        assert!(
+            last_distill_options(&d.script)
+                .iter()
+                .all(|o| !o.iter().any(|x| x == "handoff")),
+            "a quiet pause offers no handoff (step {step})"
+        );
+        assert_eq!(handoffs(&d).len(), 1, "step {step}: {:?}", d.distilled());
+    }
+
+    // Its next end offers one again: the newest replaces the first, and no fact leaves.
+    let off = t.len();
+    t.prompt("rs-p7", "Wrap up for today?").reply(
+        "rs-a7",
+        "Where things stand: the planner runs on the north quay, and next we add the south quay.",
+    );
+    d.send("shop", "rs1", &t, off, "session-end").await;
+    until("the second end is distilled and judged", || {
+        handoffs(&d).len() == 2 && settled(&d)
+    })
+    .await;
+    let h = handoffs(&d);
+    assert_eq!(h[0].1, "superseded", "{h:?}");
+    assert!(h[0].0.contains("crane schedule is written down"), "{h:?}");
+    assert_eq!(h[1].1, "active", "{h:?}");
+    assert!(h[1].0.contains("north quay, and next we add"), "{h:?}");
+    assert_eq!(status_of(&d, "Alpha note"), "active");
+    assert_eq!(status_of(&d, "Beta note"), "active");
+    assert_eq!(cap_trashes(&d), 0, "a handoff evicts no fact");
     d.shutdown();
 }
 
@@ -2918,7 +3044,8 @@ fn last_distill_options(script: &DistillScript) -> Vec<Vec<String>> {
 /// Task 12c, the controller's ruling P1 and M1: `max_per_session` (4 here) is the size of the
 /// session's best set. A full session is still asked about each run; a better later passage
 /// replaces the weakest held memory (trashed by `distill:cap`); a worse one is not stored; the
-/// handoff of a compaction always enters; and a superseded memory holds no slot.
+/// handoff of a compaction always enters, outside the room (final review B-I2), so it replaces
+/// nothing; and a superseded memory holds no slot.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_session_keeps_its_best_memories() {
     let config =
@@ -3013,7 +3140,8 @@ async fn a_full_session_keeps_its_best_memories() {
         ]
     );
 
-    // A compaction: its handoff always enters, and a better fact replaces the last weak one.
+    // A compaction: its handoff always enters, beside the set (it replaces nothing), and a
+    // better fact replaces one of the weak ones.
     let off = t.len();
     add(&mut t, "Extra fact");
     t.prompt("bn-hp", "Where are we?").reply("bn-ha", HANDOFF);
@@ -3024,7 +3152,13 @@ async fn a_full_session_keeps_its_best_memories() {
     .await;
     assert_eq!(
         live(&d),
-        ["Extra fact", "Strong fact", "Strong fact", "Where things"]
+        [
+            "Extra fact",
+            "Strong fact",
+            "Strong fact",
+            "Weak fact",
+            "Where things"
+        ]
     );
     assert!(
         d.distilled()
@@ -3052,16 +3186,24 @@ async fn a_full_session_keeps_its_best_memories() {
     assert_eq!((run.stored, run.capped), (1, 0), "{run:?}");
     assert_eq!(
         live(&d),
-        ["Strong fact", "Strong fact", "Weaker fact", "Where things"]
+        [
+            "Strong fact",
+            "Strong fact",
+            "Weak fact",
+            "Weaker fact",
+            "Where things"
+        ]
     );
-    assert_eq!(cap_trashes(&d), 4, "nothing more was evicted");
+    assert_eq!(cap_trashes(&d), 3, "nothing more was evicted");
     d.shutdown();
 }
 
 /// The Task 12c addendum (pane 4): `distill:cap` never replaces a memory a person or an agent
-/// touched, nor the session's handoff; those still hold their slots. A memory an explicit exact
-/// copy promoted is no longer distilled: it holds no slot. When no member that may go is weaker
-/// (here: every one is protected), the newcomer is not stored, and the run's record counts it.
+/// touched; those still hold their slots. A memory an explicit exact copy promoted is no longer
+/// distilled: it holds no slot. When no member that may go is weaker (here: every one is
+/// protected), the newcomer is not stored, and the run's record counts it. A handoff is outside
+/// the room (final review B-I2): it enters the full set without replacing anything, and one the
+/// agent touched stays beside a newer one.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_cap_never_replaces_what_a_person_or_an_agent_touched() {
     let config =
@@ -3195,7 +3337,7 @@ async fn the_cap_never_replaces_what_a_person_or_an_agent_touched() {
     assert_ne!((origin.as_str(), status.as_str()), ("distill", "trashed"));
     assert_ne!(status, "trashed");
 
-    // A compaction: its handoff enters in place of a strong passage nobody touched.
+    // A compaction: its handoff enters beside the full set; no strong passage leaves.
     let off = t.len();
     t.prompt("pt-hp", "Where are we?").reply("pt-ha", HANDOFF);
     d.send("shop", "pt1", &t, off, "pre-compact").await;
@@ -3204,34 +3346,41 @@ async fn the_cap_never_replaces_what_a_person_or_an_agent_touched() {
     })
     .await;
     let held = live(&d);
-    assert_eq!(held.len(), 4);
+    assert_eq!(held.len(), 5);
     let handoff = held
         .iter()
         .find(|m| m.kind == "handoff")
         .unwrap()
         .id
         .clone();
-    let strong = held
+    let strong: Vec<String> = held
         .iter()
-        .find(|m| m.body.starts_with("Strong fact"))
-        .unwrap()
-        .id
-        .clone();
-    d.svc
-        .update(UpdateRequest {
-            id: strong.clone(),
-            update: MemoryUpdate {
-                action: UpdateAction::Edit,
-                title: Some("Strong fact, checked".into()),
-                ..Default::default()
-            },
-            author: agent(),
-        })
-        .await
-        .unwrap();
+        .filter(|m| m.body.starts_with("Strong fact"))
+        .map(|m| m.id.clone())
+        .collect();
+    assert_eq!(strong.len(), 2);
+    for (id, title) in [
+        (&strong[0], "Strong fact, checked"),
+        (&strong[1], "Strong fact, checked too"),
+        (&handoff, "Where things stand, checked"),
+    ] {
+        d.svc
+            .update(UpdateRequest {
+                id: id.clone(),
+                update: MemoryUpdate {
+                    action: UpdateAction::Edit,
+                    title: Some(title.into()),
+                    ..Default::default()
+                },
+                author: agent(),
+            })
+            .await
+            .unwrap();
+    }
+    until("the edits are judged", || settled(&d)).await;
 
-    // Every member is protected now: a later compaction's handoff does not replace the
-    // session's, and a better fact replaces nothing. Neither is stored; the run counts them.
+    // Every member is protected now: a better fact replaces nothing and is not stored (the run
+    // counts it). A later compaction's handoff is stored, and the one the agent touched stays.
     let trashed_before = d
         .distilled()
         .iter()
@@ -3247,9 +3396,23 @@ async fn the_cap_never_replaces_what_a_person_or_an_agent_touched() {
     until("the last run is over", || d.svc.distill_runs().len() == 4).await;
     let run = d.svc.distill_runs()[3].clone();
     assert!(run.questions > 0, "{run:?}");
-    assert_eq!((run.stored, run.capped), (0, 2), "{run:?}");
+    assert_eq!((run.stored, run.capped), (1, 1), "{run:?}");
+    until("the newer handoff is judged", || settled(&d)).await;
+    let newer = d
+        .distilled()
+        .into_iter()
+        .find(|m| m.body.starts_with("Where we are now"))
+        .unwrap()
+        .id;
     let mut after = ids(live(&d));
-    let mut want = vec![weak[0].id.clone(), weak[1].id.clone(), strong, handoff];
+    let mut want = vec![
+        weak[0].id.clone(),
+        weak[1].id.clone(),
+        strong[0].clone(),
+        strong[1].clone(),
+        handoff,
+        newer,
+    ];
     after.sort();
     want.sort();
     assert_eq!(after, want);
@@ -3362,6 +3525,11 @@ async fn a_newcomer_the_judge_trashes_or_that_supersedes_a_member_evicts_nothing
         "the unique member stays"
     );
     assert_eq!(cap_trashes(&d), 0);
+    assert_eq!(
+        d.capture_health().await.distill_dropped_24h,
+        1,
+        "a duplicate is a drop"
+    );
 
     // A refinement of a member supersedes it: the set is back to its size, nothing is evicted.
     let off = t.len();
@@ -3495,6 +3663,9 @@ async fn a_live_newcomer_evicts_the_weakest_unprotected_member_once_judged() {
         .unwrap();
     assert_eq!(actor, "distill:cap");
     assert_eq!(cap_trashes(&d), 1);
+    // Final review B M6: a cap eviction is no drop (spec §8.4: duplicates and uncertain ones).
+    assert_eq!(d.capture_health().await.distill_dropped_24h, 0);
+    assert_eq!(d.svc.stats().await.unwrap().distill_dropped_today, 0);
     d.shutdown();
 }
 
@@ -3521,6 +3692,91 @@ fn status_of(d: &Daemon, phrase: &str) -> String {
         .find(|m| m.body.starts_with(phrase))
         .unwrap_or_else(|| panic!("no distilled memory starts with {phrase}"))
         .status
+}
+
+/// Task 12d: a session's room grows with its captured turns. With a base of 2, a cap of 10 and
+/// 101 turns the room is 10, so four kept passages all stay, through the run's placement and
+/// the judge's eviction alike; at 100 turns the room would be 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_sessions_room_grows_with_its_turns() {
+    let config = "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 2\nmax_per_session_cap = 10\n";
+    let d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(&[("Main fact", "fact")]),
+    );
+    let mut t = Transcript::default();
+    for i in 0..101u64 {
+        let reply = if i < 4 {
+            format!("Main fact {i}: {}.", words(600 + i, 18))
+        } else {
+            "Done.".to_string()
+        };
+        t.prompt(&format!("rg-p{i}"), &format!("Go on {i}."))
+            .reply(&format!("rg-a{i}"), &reply);
+    }
+    d.send("shop", "rg1", &t, 0, "stop").await;
+    d.svc.capture_distill_now("rg1").await.unwrap();
+    until("the session is distilled and judged", || {
+        d.state(&uri("rg1")).state == "done" && d.distilled().len() == 4 && settled(&d)
+    })
+    .await;
+    let turns: i64 = d
+        .db()
+        .query_row("SELECT count(*) FROM capture_turns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(turns, 101);
+    let live = d
+        .distilled()
+        .iter()
+        .filter(|m| m.status != "trashed" && m.status != "superseded")
+        .count();
+    assert_eq!(live, 4, "{:?}", d.distilled());
+    assert_eq!(cap_trashes(&d), 0);
+    d.shutdown();
+}
+
+/// Task 12d, from re-check 2: a distilled title never holds a redaction marker, even when the
+/// project gained a rule after the capture. The passage's first sentence names the ticket, so the
+/// title is redacted when the memory is written: the title becomes the passage's first sentence
+/// without a marker, and the body keeps its marker.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_distilled_title_never_holds_a_redaction_marker() {
+    let d = Daemon::start(
+        Opts::jev(),
+        DistillScript::new(&[("rotation ticket", "fact")]),
+    );
+    let mut t = Transcript::default();
+    t.prompt("rd-p1", "Where is the key rotation tracked?").reply(
+        "rd-a1",
+        "The key rotation ticket TCK-48213 tracks the vault move for the deploy tokens. It closes after the release.",
+    );
+    d.send("shop", "rd1", &t, 0, "stop").await;
+    std::fs::write(
+        d.repo("shop").join(".alice.toml"),
+        "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
+    )
+    .unwrap();
+    let shop = alice_core::store::projects::tree_of(&d.db(), "shop").unwrap();
+    until("the daemon holds the shop rule", || {
+        !d.svc
+            .settings_handle()
+            .project_privacy(shop.as_ref())
+            .custom_patterns
+            .is_empty()
+    })
+    .await;
+    d.svc.capture_distill_now("rd1").await.unwrap();
+    until("the passage is distilled", || d.distilled().len() == 1).await;
+    let m = d.distilled().remove(0);
+    assert!(
+        m.body.contains("[REDACTED:custom:ticket]") && !m.body.contains("TCK-48213"),
+        "{m:?}"
+    );
+    assert_eq!(m.title, "It closes after the release.");
+    d.shutdown();
 }
 
 /// Task 12b review, M3: a session's kept memories are counted by their author (the session and
@@ -3782,6 +4038,99 @@ async fn a_users_preference_the_agent_saved_in_the_project_is_trashed_as_its_dup
             .unwrap();
         assert_eq!(&to, survivor, "{m:?}");
     }
+    let live: i64 = c
+        .query_row(
+            "SELECT count(*) FROM memories WHERE origin = 'agent' AND status = 'active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 2, "the agent's memories stay");
+    let reviews: i64 = c
+        .query_row("SELECT count(*) FROM review_items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(reviews, 0, "nothing is asked");
+    d.shutdown();
+}
+
+/// Final review B-I1 (spec §6.6, R19), the order §11.3's doubles never measure: a session is
+/// distilled first, and then the agent saves the same lessons in its own words. Jev, unsure,
+/// calls the agent's decision a duplicate of the distilled one at 0.6 and its bugfix an update
+/// of the distilled one at 0.7, both between `judge.review_threshold` and
+/// `judge.auto_apply_threshold`. The agent's memories win, and nobody is asked: the distilled
+/// decision goes to the trash as the agent's duplicate, the distilled bugfix is superseded by
+/// the agent's, and no review item is opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_memory_saved_after_distilling_wins_without_a_question() {
+    const PNPM: &str = "pnpm workspaces";
+    const CLOCK: &str = "clock mock";
+    let d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    d.script.relate_p(PNPM, "duplicate", 0.6);
+    d.script.relate_p(CLOCK, "updates", 0.7);
+    let t = decision_and_bugfix("xa1");
+    d.send("shop", "xa1", &t, 0, "session-end").await;
+    until("both distilled memories are judged", || {
+        d.distilled().len() == 2 && settled(&d)
+    })
+    .await;
+    assert!(d.distilled().iter().all(|m| m.status == "active"));
+
+    let mut saved = Vec::new();
+    for (title, content, kind) in [
+        (
+            "Use pnpm workspaces",
+            "The workspace uses pnpm workspaces for every package, since npm hoisting broke the lockfile.",
+            alice_core::model::Kind::Decision,
+        ),
+        (
+            "Reset the clock mock",
+            "The lease renewal test needs the clock mock reset in the shared setup hook, or its expiry check reads a stale time.",
+            alice_core::model::Kind::Bugfix,
+        ),
+    ] {
+        let m = d
+            .svc
+            .remember(RememberRequest {
+                content: content.into(),
+                title: Some(title.into()),
+                kind: Some(kind),
+                cwd: Some(d.repo("shop").to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        saved.push(m.id.expect("a new memory"));
+    }
+    let judged = |id: &str| -> bool {
+        d.db()
+            .query_row(
+                "SELECT judge_state = 'done' FROM memories WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    until("the agent's memories are judged", || {
+        saved.iter().all(|id| judged(id))
+    })
+    .await;
+
+    let c = d.db();
+    let link = |from: &str, to: &str, kind: &str| -> i64 {
+        c.query_row(
+            "SELECT count(*) FROM links WHERE from_id = ?1 AND to_id = ?2 AND type = ?3",
+            [from, to, kind],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let mems = d.distilled();
+    let decision = mems.iter().find(|m| m.body.contains(PNPM)).unwrap();
+    let bugfix = mems.iter().find(|m| m.body.contains(CLOCK)).unwrap();
+    assert_eq!(decision.status, "trashed", "{decision:?}");
+    assert_eq!(link(&decision.id, &saved[0], "duplicate_of"), 1);
+    assert_eq!(bugfix.status, "superseded", "{bugfix:?}");
+    assert_eq!(link(&saved[1], &bugfix.id, "supersedes"), 1);
     let live: i64 = c
         .query_row(
             "SELECT count(*) FROM memories WHERE origin = 'agent' AND status = 'active'",

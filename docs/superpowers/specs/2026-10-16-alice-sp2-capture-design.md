@@ -820,7 +820,10 @@ A distilled memory is **a passage of the session**, chosen and classified by Jev
 A **run** covers the source's chunks from `distill_ord` on, plus the new chunks of its subagent sources. A source becomes
 **due** when:
 
-- the session ended (`SessionEnd`, or swept as stale after 24 h). The stale end is the local sweep's, with a final pass
+- the session ended (`SessionEnd`, or swept as stale after 24 h). An end lasts until the session is resumed (final review
+  B-I2): a capture slice that stores a new turn without ending the session clears `ended` (`claude --resume` and `codex
+  resume` write on in the same file), so a resumed session's quiet pauses are not closing runs, and its next end, or
+  stale end, closes it again. The stale end is the local sweep's, with a final pass
   that closes the trailing turn, or without one for a source it cannot read (no transcript path, or the file is gone),
   and on a server tenant the distill worker's. Any stale end makes the session due only when it, or a subagent of it,
   captured within the last 7 days plus the stale age (8 days by default; for a final pass, the session's last capture
@@ -916,12 +919,14 @@ no lesson.
 
 - **Keeping a candidate:** it is kept when its most probable option is a knowledge option with probability ≥
   `distill.min_confidence` (default 0.7).
-- **Ranking (Task 12c, the controller's ruling P2; replaces Task 12b's "priority before p").** The candidates kept by
-  that rule are ranked by one key, which also orders the session's best set (below):
+- **Ranking (Task 12c, the controller's ruling P2, and round 2's (a), Task 12d; replaces Task 12b's "priority before
+  p").** The candidates kept by that rule are ranked by one key, which also orders the session's best set (below):
   1. a handoff first: there is at most one per run, offered at the session's end, a compaction or the 24-hour stale
-     end, and it is what continuing the work needs most, so the caps never crowd it out (it still counts toward them);
-  2. a main-session passage before a subagent report;
-  3. the p band: 0.9 and above, 0.8 and above, below;
+     end, and it is what continuing the work needs most, so the caps never crowd it out (it still counts toward the
+     run's caps, not toward the session's room: final review B-I2);
+  2. the p band: 0.9 and above, 0.8 and above, below;
+  3. a main-session passage before a subagent report, a tie-break inside the band (Task 12d: above the band it let no
+     subagent report into a set full of main-session memories, 0 of 103 on re-check 2);
   4. the kind: decision, bugfix, warning, fact, howto, preference;
   5. p, highest first;
   6. the memory's idempotency key (a hash of its source and passage), the last tie-break. It stands where the review's
@@ -929,14 +934,23 @@ no lesson.
      never depends on which run, or in what order, a passage came, so the session's set does not either.
 
   So a fact at 0.98 outranks a decision at 0.75, a decision at 0.92 outranks a fact at 0.97 (one band: the kind breaks
-  the tie), and a verdict Jev scores 0.99 never displaces a fact of the main session.
+  the tie), a subagent's fact at 0.95 outranks a main-session decision at 0.85, and a main-session fact at 0.91
+  outranks a subagent's decision at 0.99 (one band: the main session first).
 - **Caps per run.** One run keeps at most `distill.max_per_run` (default 8), and at most one `handoff`. Of them, at most
   `distill.max_per_subagent_run` (default 2) are subagent reports. A run asks about subagent reports only when that
   setting is above 0.
-- **The session's best set (Task 12c, the controller's ruling P1; replaces Task 12b's first-come cap).**
-  `distill.max_per_session` (default 16) is the size of the session's best set: its main source and its subagent sources
-  together, over all its runs.
-  - **What it holds.** The session's live distilled memories: `origin = distill`, neither trashed nor superseded (M1:
+- **The session's best set (Task 12c, the controller's ruling P1; replaces Task 12b's first-come cap).** Its size, the
+  session's **room**, is its main source and its subagent sources together, over all its runs. The room grows with the
+  session (Task 12d): `distill.max_per_session` (default 16) for its first 100 captured turns, 8 more for each further
+  100 (`ROOM_STEP` per `ROOM_TURNS`, documented constants), at most `distill.max_per_session_cap` (default 48, at
+  most 400; a cap below `max_per_session` is the base, so the room does not grow, and is not refused: final review B,
+  12d concern 4): room = base + 8 × ⌊(turns − 1) / 100⌋, capped. So 16 at 100
+  turns, 24 at 101, 48 from 401. The turns are the session's turn keys in `capture_turns`, its main source's and its
+  subagents' together (`store::capture::SESSION_TURNS`, through the 0008 index `capture_turns_source`). They are kept
+  when retention deletes the chunks, so the room never shrinks. A run and a judgement read them again, so the room in
+  force is the one when the newcomer is placed and when it is judged.
+  - **What it holds.** The session's live distilled memories but its handoffs (below): `origin = distill`, neither
+    trashed nor superseded (M1:
     a decision refined inside a session costs one slot, not two). They are found by their author: `write_memory` sets
     the author's agent and session from the source, and a subagent's source carries its session's agent and id, so the
     set holds the subagents' memories too, and raw retention, which deletes provenance with the chunks, cannot empty
@@ -952,8 +966,8 @@ no lesson.
     run report counts it `capped`, and the worker logs it).
   - **Eviction waits for the judge (Task 12c review I1, the controller's ruling: option b).** The newcomer is written
     pending and evicts nothing. When its judgement leaves it live (not trashed, not superseded) and the set's settled
-    members (those the judge has judged: not `pending`, not `retry`) are more than `max_per_session`, or their
-    subagent reports more than the share, the weakest settled member that may go is trashed, in the judgement's op (a
+    members (those the judge has judged: not `pending`, not `retry`) are more than the room, or their subagent reports
+    more than the share, the weakest settled member that may go is trashed, in the judgement's op (a
     `memory.forget` by `distill:cap`, undoable like any trash; its passage stays in the raw capture). That may be the
     newcomer itself, and with the share over it is a subagent report. A newcomer the judge trashes (a duplicate) evicts
     nothing, so no unique member is lost to a restatement; nor does one that superseded a member of its own session's
@@ -962,12 +976,20 @@ no lesson.
     give-up path (the worker's, after repeated failures on that one memory, and the bulk one after `MAX_ATTEMPTS`
     counted failures, `RequeueJudgeRetries`; review 2, N1). Every op that settles a distilled newcomer carries the
     distillation settings, and a debug build stops on one that does not (review 2, N2). So the set keeps its size, and,
-    but for the members the cap may not replace, it is the best `max_per_session` of all the passages ever kept by the
+    but for the members the cap may not replace, it is the best room-full of all the passages ever kept by the
     rank above, whatever their order (with the per-run caps as the only exception, since they bound what one run
     brings). **Exceptions a person makes (review Minor 6):** an undo of a `distill:cap` trash brings the member back,
     protected, past the size; a restore between the worker's read and the newcomer's judgement can leave one more; and a
     lowered `max_per_session` never shrinks a set already held. Each newcomer judged live evicts one member, so such a
     set stays past its size.
+  - **Related first (Task 12d, round 2's (c)).** When the room is over, a newcomer judged live that the judge related
+    to a settled member of its set goes in place of that member, whatever its rank: the older of two related memories
+    leaves (re-check 2 once kept a stale memory and evicted its newer replacement). "Related" is the judge's verdict on
+    the pair as applied: an update or a duplicate it linked `relates_to` (the 12c guard, or an update of a distilled
+    memory below `judge.auto_apply_threshold`), or `contradicts`. Of several related members, the weakest goes. A
+    related member that may not go (a handoff, a protected member) stays, and the weakest member that may go leaves
+    instead; with the subagents over their share, only a related subagent report goes first. An update at or above
+    the threshold supersedes the member instead, and the newcomer takes its slot.
   - **What the cap never replaces (Task 12c addendum, pane 4).** `distill:cap` never trashes the session's handoff,
     nor a member a person or an agent touched since it was distilled. Such members still count toward the size (and a
     subagent one toward the share), but are never the one that goes; when every member is one of them, or none that
@@ -984,14 +1006,19 @@ no lesson.
       the partial index `relations_source_memory` (0008, review Minor 1).
     The set is read again in the judgement's op that evicts, so a member touched since the worker's read is never
     the one that goes.
-  - **The subagents' share.** Subagent reports (by the `distill:sub:` key) keep at most half of
-    `distill.max_per_session`, rounded down (8 of 16), so the main session always has room. With the share full, a
-    subagent report may replace only a subagent memory, even when the set has room.
-  - **The handoff.** It ranks first, so it enters, replacing the weakest memory that may go when the set is full; it
-    is not stored only when none may go (above). A later closing run's handoff enters too, but never in place of the
-    session's earlier handoff: "the latest handoff replaces the first" is for the backlog, so a session can hold two.
-    Task 12b's reserved handoff slot is gone: under replacement it would only keep one slot idle until a handoff came,
-    which then takes its place by replacement anyway.
+  - **The subagents' share.** Subagent reports (by the `distill:sub:` key) keep at most half of the room, rounded down
+    (8 of 16, 24 of 48), so the main session always has room. With the share full, a subagent report may replace only
+    a subagent memory, even when the set has room.
+  - **The handoff (final review B-I2: outside the room, the newest only).** A handoff takes no slot: it neither
+    counts toward the room nor the share, a kept one is always stored and replaces nothing, and the cap never trashes
+    one. So a handoff never costs a durable memory its slot (Task 12c's "never replaced" had made every extra handoff
+    evict a fact for good). A session keeps one: when a distilled handoff settles live (judged, or given up on), each
+    older settled handoff of the session that no person or agent touched is superseded by the newest, by
+    `distill:handoff`, in the judgement's op ("the latest handoff replaces the first"). An older handoff still waiting
+    for the judge is left to its own settling, which supersedes it by the newer one if it stays live; a touched one
+    stays. A handoff is offered by a closing run only (§6.2: an end, a compaction, the stale end), and a resumed session
+    is open again, so a session gets at most one handoff per end or compaction, and holds its latest. Task 12b's
+    reserved handoff slot is gone.
   - **Memories distilled before 0008** have no stored rank inputs: they rank as main-session passages at
     `distill.min_confidence`.
 - **Cost:** about 20,000 input tokens for a 40-candidate request, about $0.0008. A typical session costs one or two runs.
@@ -1005,7 +1032,7 @@ apply:
 |---|---|
 | `kind` | from the option. `kind_explicit = 1`, so the judge never reclassifies it |
 | `project` | the source's project, or `global` for `preference_user`. **Routing guard (Task 12b):** a `preference_user` passage that names the project stays in it: its slug, its name or its working tree's folder name as a whole word (in any case, names of three or more characters), or a path under that folder |
-| `title` | the passage's first sentence, at most 120 characters (cut at a word boundary). When that is a table header, or 25 characters or fewer (a bare heading, a label), the title is the passage's first sentence after its head lines (headings, table rows, short lines that end no sentence), run on into the next sentence of its line while it has 25 characters or fewer, at most 80 characters, cut at a word with `…`; a passage that is only a table is titled by its first row. A heading longer than 25 characters that is not a table header stays the title |
+| `title` | the passage's first sentence, at most 120 characters (cut at a word boundary). When that is a table header, or 25 characters or fewer (a bare heading, a label), the title is the passage's first sentence after its head lines (headings, table rows, short lines that end no sentence), run on into the next sentence of its line while it has 25 characters or fewer, at most 80 characters, cut at a word with `…`; a passage that is only a table is titled by its first row. A heading longer than 25 characters that is not a table header stays the title. **Task 12d, from re-check 2:** a sentence never ends inside a backtick code span (a shell `!` in a span is not an end; an unpaired backtick opens no span), and a title never holds a redaction marker (`[REDACTED:…]`): it is then the passage's first sentence that has none (more than 25 characters, after the head lines), or, when every sentence has one, the title with its markers taken out. The writer applies the same rule to a title its rules redact when the memory is written (a rule added since the capture) |
 | `body` | the passage, at most 1,200 characters. For conclusions and subagent reports, a last line `Context: <first sentence of the turn's prompt>` is added when that prompt has 4 or more words, so the memory stands on its own |
 | `importance` | `distill.importance` (default 2, allowed 1–3). Distilled memories never reach the briefing's key-memory sections, which need 4, and rank below explicit memories, which default to 3 |
 | `topics` | none |
@@ -1097,7 +1124,23 @@ the guard.
 
 **An explicit memory beats a distilled one.** An agent's or person's newcomer that duplicates an **older distilled**
 memory survives, and the distilled one is trashed as its duplicate. This reverses today's "older survives" for that pair,
-so explicit memories are never lost to machine copies.
+so explicit memories are never lost to machine copies. **Nobody is asked about it (final review B-I1):** the explicit
+newcomer settles each distilled match from `judge.review_threshold` on, in any band, so the two never both stay live and
+the review inbox never gets a question about a machine copy (the order of §0.5's anti-goal: a session is distilled at a
+quiet pause, then the agent saves the same lesson in its own words):
+
+| Judge result for a distilled match | Today, for an explicit match | For the explicit newcomer's distilled match |
+|---|---|---|
+| duplicate ≥ review | ≥ auto: the newcomer is trashed; below: a `merge` review | the distilled one is trashed as the newcomer's duplicate |
+| updates ≥ review | ≥ auto: supersedes; below: a `supersede` review | the newcomer supersedes the distilled one |
+| contradicts ≥ review | link plus `contradiction` review | the newcomer supersedes the distilled one (the explicit memory is right) |
+| heuristic | the same text applies; near twins and updates are review items | the same text replaces it; anything else is left as it is |
+| heuristic stand-in (Jev unreachable) | review-only suggestions | nothing about a distilled match; the newcomer is judged again (R2) |
+
+A confident duplicate of an **explicit** older memory still settles the newcomer first (it goes to the trash, and its
+distilled matches are left as they are: each was judged against that explicit memory when it came). An action on a
+distilled match that changed after the judge read it is dropped, not asked about. Its explicit matches are asked about as
+before.
 
 **Maintenance and the briefing:**
 - `merge_suggestions` skips distilled memories, as it skips diaries.
@@ -1164,10 +1207,13 @@ provider = "off"            # "off" | "jev"   (the existing string becomes an en
 # model                     # existing optional string, reserved for later providers; ignored with "jev" (judge.jev.model is used)
 min_confidence = 0.7        # 0.5–0.99
 max_per_run = 8             # 1–50
-max_per_session = 16        # 2–200: the size of a session's best set, its subagents included; subagents keep at most
-                            # half; a better passage replaces the weakest (Task 12c)
+max_per_session = 16        # 2–200: the size of a session's best set (its room) for its first 100 turns, its
+                            # subagents included; subagents keep at most half; a better passage replaces the
+                            # weakest once the judge keeps it (Task 12c)
+max_per_session_cap = 48    # at most 400: the room grows by 8 for each further 100 turns, up to this (below max_per_session: no growth)
+                            # (Task 12d)
 max_per_subagent_run = 2    # 0–50: subagent reports kept in one run
-                            # effective: min(this, max_per_run); the session's share is half of max_per_session
+                            # effective: min(this, max_per_run); the session's share is half of its room
 idle_minutes = 15           # 1–1,440
 importance = 2              # 1–3
 budget_share = 0.5          # 0.05–1.0 of judge.daily_budget_usd
@@ -1278,7 +1324,8 @@ alice capture distill <session-id>
   - `sessions_24h`, `chunks_24h`, `last_capture_at`, `open_sessions`;
   - `distill_provider`;
   - `distill_state`: `off`, `ready`, `waiting_judge`, `waiting_budget`, `breaker_open` or `no_key`;
-  - `distill_due`, `distilled_24h`, `distill_dropped_24h` (duplicates and uncertain ones);
+  - `distill_due`, `distilled_24h`, `distill_dropped_24h` (duplicates and uncertain ones; a member a full best set
+    evicted by `distill:cap` is not counted, final review B M6);
   - `distill_warning`.
 - **`alice doctor`** gains two lines, pushed in `health_checks` and `daemon_checks` as the existing lines are:
   - **`capture`:** OK with the last capture time. Warn if installed hooks point at a missing binary, if hooks are
@@ -1525,7 +1572,8 @@ hand-written ones). They cover:
 - `waiting_judge` when the judge is not Jev;
 - every row of §6.6's judge table;
 - a distilled memory hidden from recall and the briefing until its judge stage is over;
-- an explicit newcomer surviving over a distilled duplicate;
+- an explicit newcomer surviving over a distilled duplicate, and settling a distilled match in the middle band without a
+  review item, saved after the session was distilled (`distill_flow`, final review B-I1);
 - `merge_suggestions` skipping distilled memories;
 - the briefing's `(auto)` marks and section rules.
 
@@ -1613,10 +1661,10 @@ a caveat the results state, as `m2-jev.md` does.
 | R13 | (Overruled by the controller.) **Tenants get the SessionStart briefing, bounded:** `curl --connect-timeout 1 --max-time 2`, plain stdout, nothing on any failure, exit 0; `capture.briefing` or `briefing=off` in `capture.conf` turns it off | The team uses only the server; without it they never get the briefing local users get | Up to 2 s at the start of a session when the server is slow or down |
 | R14 | **Distillation requires `judge.provider = jev`** | The judge is what removes duplicates of explicit memories; without it, near-copies would be stored or become review items | A person without the Jev judge gets raw capture only |
 | R15 | **`distill.provider` defaults to `off`** | Sending session text to a cloud model is opt-in in an open-source product; the owner turns it on in one command | New users get raw capture only until they opt in |
-| R16 | **At most 40 candidates per request and `max_per_run` (8) kept**, by priority (summaries, conclusions, user statements, subagent reports). Task 12c: the kept are ranked handoff first, then main session before subagents, then the p band (≥ 0.9, ≥ 0.8, below), then decision, bugfix, warning, fact, howto, preference, then p; `max_per_session` (16) is the size of the session's best set over all its runs and subagents, every run is asked, and a better passage replaces the weakest held one that may go once the judge finds it live (trashed by `distill:cap` in the judgement's op; never a handoff, nor a memory a person or an agent edited, linked or cited after it was distilled; a newcomer the judge trashes, or that supersedes a member, evicts nothing); `max_per_subagent_run` (2) subagent reports per run and half of `max_per_session` per session; a `preference_user` passage that names the project (its slug, name, folder or a path in it) stays in the project instead of `global`; a title is the first sentence, passing over `#` headings, and only when that is a table header, or 25 characters or fewer (a short heading or label), the first sentence after it that says more, at most 80 characters (§6.4, §6.5) | Bounded cost and no floods; compaction summaries and turn conclusions carry most lasting knowledge | A very long quiet-free stretch loses its lowest-priority candidates. A full session costs a request every run (within `distill.budget_share`), and a kept passage that does not outrank the set's weakest that may go is not stored; a session whose set is all protected stores nothing more |
+| R16 | **At most 40 candidates per request and `max_per_run` (8) kept**, by priority (summaries, conclusions, user statements, subagent reports). Task 12c: the kept are ranked handoff first, then the p band (≥ 0.9, ≥ 0.8, below), then main session before subagents inside the band (Task 12d), then decision, bugfix, warning, fact, howto, preference, then p; `max_per_session` (16) is the size of the session's best set (its room) over all its runs and subagents for its first 100 turns, 8 more per further 100 turns up to `max_per_session_cap` (48) (Task 12d), every run is asked, and a better passage replaces the weakest held one that may go once the judge finds it live (trashed by `distill:cap` in the judgement's op; never a handoff, nor a memory a person or an agent edited, linked or cited after it was distilled; a newcomer the judge trashes, or that supersedes a member, evicts nothing; one related to a member evicts that member first, Task 12d); a handoff is outside the room and the session keeps its newest one, which supersedes the older ones (final review B-I2); `max_per_subagent_run` (2) subagent reports per run and half of the room per session; a `preference_user` passage that names the project (its slug, name, folder or a path in it) stays in the project instead of `global`; a title is the first sentence, passing over `#` headings, and only when that is a table header, or 25 characters or fewer (a short heading or label), the first sentence after it that says more, at most 80 characters (§6.4, §6.5) | Bounded cost and no floods; compaction summaries and turn conclusions carry most lasting knowledge | A very long quiet-free stretch loses its lowest-priority candidates. A full session costs a request every run (within `distill.budget_share`), and a kept passage that does not outrank the set's weakest that may go is not stored; a session whose set is all protected stores nothing more |
 | R17 | **Extractive distillation with `choice` questions only**, through the existing client | Jev has no text type; the client's cache, budget, redaction and gate are reused unchanged | Passages that need the conversation are dropped (lower recall); the eval measures it |
 | R18 | **A session already mined by MemPalace continues after the import's end time; the importer skips sessions SP2 holds** | MemPalace's chunks cannot be aligned with turns; a session must be held by one side | Sessions active during the cut-over may have a gap or overlap of a few minutes at the boundary |
-| R19 | **Distilled memories never open review items; an explicit memory beats a distilled duplicate; distilled ones never supersede explicit ones** | The review inbox is for what people and agents wrote; machine copies must never cost a person's attention or an explicit memory | An uncertain but real update of a distilled memory stays as two linked memories instead of a question; a distilled update of an explicit memory is trashed as its duplicate (Task 11b), and its passage stays in the raw capture, unless it holds more: more than twice its match's characters between the review and auto thresholds, or a number its match does not state at any probability, which keeps it, linked `relates_to` (Task 12c) |
+| R19 | **Distilled memories never open review items; an explicit memory beats a distilled duplicate (and supersedes a distilled memory it updates or contradicts, in any band from the review threshold, without a review item: final review B-I1); distilled ones never supersede explicit ones** | The review inbox is for what people and agents wrote; machine copies must never cost a person's attention or an explicit memory | An uncertain but real update of a distilled memory stays as two linked memories instead of a question; a distilled update of an explicit memory is trashed as its duplicate (Task 11b), and its passage stays in the raw capture, unless it holds more: more than twice its match's characters between the review and auto thresholds, or a number its match does not state at any probability, which keeps it, linked `relates_to` (Task 12c) |
 | R20 | **The installer keeps `settings.json` key order as far as practical**, chosen in the plan without changing JSON output elsewhere | A person's settings file should not be reshuffled; enabling `serde_json/preserve_order` workspace-wide would change other JSON output | If not practical, keys are re-serialised (a backup exists and the output says so) |
 | R21 | **Codex rollouts read tolerantly; `.zst` files skipped in v1** | The format is documented as unstable; a zstd dependency is not justified before it is seen in use | Compressed Codex sessions are not captured until a later version |
 | R22 | **No request compression for tenant uploads** | It needs a new dependency; the upload runs in the background | More upstream bandwidth for large transcripts |

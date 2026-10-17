@@ -1,14 +1,15 @@
 # Distillation evaluation (SP2, Task 13)
 
 Measured on 2026-10-17. Runs 1 and 2 ran on `feat/sp2-eval` (based on e254f6e); run 3 ran on `feat/sp2-flood`
-(a19faa6), and run 4 on `feat/sp2-flood` (3a431ba).
+(a19faa6), run 4 on `feat/sp2-flood` (3a431ba), and run 5 on `feat/sp2-flood` (6ee8da5).
 
 - **Runs:**
   - Run 1 came before, and run 2 after, the single tuning round that spec §11.3 allows.
   - Run 3 re-recorded the evaluation after two product fixes (Tasks 12b and 11b) that followed the owner's
     real-session check.
   - Run 4 re-checked it after a third (Task 12c), which followed the real-session re-check.
-  - Neither run 3 nor run 4 is a second tuning round.
+  - Run 5 re-ran it live after a fourth (Task 12d), which followed the second real-session re-check.
+  - None of runs 3 to 5 is a second tuning round.
   - Each live run is a single execution; nothing was repeated or averaged.
 - **The set:** synthetic. It was written for this evaluation by the engineer, not taken from users, holds no real user
   data, and its labels are **one author's** judgement.
@@ -20,7 +21,7 @@ Measured on 2026-10-17. Runs 1 and 2 ran on `feat/sp2-eval` (based on e254f6e); 
 | Distiller and judge | TypeSafe Jev `jev-1.13.0` (`https://api.typesafe.ai/v1/systemone`), the real pipeline through `Service`: capture, the distill worker, the judge worker |
 | Test home | `judge.provider = "jev"`, `judge.daily_budget_usd = 1.0`, `judge.timeout_ms = 60000`, `distill.provider = "jev"`, `distill.budget_share = 1.0`, `distill.min_confidence = 0.7` (the default) |
 | Embedder | the tests' `FakeEmbedder` (hashed words and trigrams); it only decides which older memories the judge compares |
-| Test | `crates/alice-daemon/tests/distill_eval.rs`; the set in `tests/fixtures/distill/` (checked by `distill_fixtures.rs`); the recorded answers of run 3 in `tests/fixtures/distill/recorded.jsonl`; the flood set (Task 12b) and its recorded answers in `tests/fixtures/distill/flood/`; the long-session set (Task 12c) and its recorded answers in `tests/fixtures/distill/long/` |
+| Test | `crates/alice-daemon/tests/distill_eval.rs`; the set in `tests/fixtures/distill/` (checked by `distill_fixtures.rs`); the recorded answers of run 5 in `tests/fixtures/distill/recorded.jsonl`; the flood set (Task 12b) and its recorded answers in `tests/fixtures/distill/flood/`; the long-session set (Task 12c) and its recorded answers in `tests/fixtures/distill/long/` (all three recorded in run 5) |
 
 ```
 # free: a scripted Jev; the pipeline runs twice and must send the same request bodies
@@ -89,76 +90,77 @@ Per kind, precision goes by the memory's kind and recall by the item's first kin
 
 ## Results
 
-| Metric | Threshold | Run 1 | Run 2 (after tuning) | Run 3 (after Tasks 12b and 11b) | Run 4 (after Task 12c) |
-|---|---|---|---|---|---|
-| Precision, all 30 sessions | ≥ 0.80 | **0.70** (40/57; 95% Wilson 0.57–0.80): fails | **0.90** (35/39; 0.76–0.96) | **0.90** (36/40; 0.77–0.96) | **0.90** (36/40; 0.77–0.96) |
-| Precision, the 20 gold sessions | — | 0.73 (36/49) | 0.92 (35/38) | 0.92 (36/39) | 0.92 (36/39) |
-| Recall | ≥ 0.60 | 0.72 (36/50; 0.58–0.83) | 0.70 (35/50; 0.56–0.81) | 0.72 (36/50; 0.58–0.83) | 0.72 (36/50; 0.58–0.83) |
-| Doubles | ≤ 10 % (1 of 10) | **4**: fails | 0 | 0 | 0 |
-| Flood | ≤ 2 | **3**: fails | 1 | 1 | 1 |
-| Spend | < $0.10 | $0.0068 (73 requests) | $0.0059 (53 requests) | $0.0065 (55 requests) | nothing new: run 3's 55 answers replay |
-| Distilled memories / trashed by the judge | — | 63 / 6 | 40 / 1 | 42 / 2 | 42 / 2 |
-| Jev latency, median / max | — | 312 / 682 ms | 323 / 694 ms | 349 / 1,247 ms | — |
+| Metric | Threshold | Run 1 | Run 2 (after tuning) | Run 3 (after Tasks 12b and 11b) | Run 4 (after Task 12c) | Run 5 (after Task 12d) |
+|---|---|---|---|---|---|---|
+| Precision, all 30 sessions | ≥ 0.80 | **0.70** (40/57; 95% Wilson 0.57–0.80): fails | **0.90** (35/39; 0.76–0.96) | **0.90** (36/40; 0.77–0.96) | **0.90** (36/40; 0.77–0.96) | **0.90** (37/41; 0.77–0.96) |
+| Precision, the 20 gold sessions | — | 0.73 (36/49) | 0.92 (35/38) | 0.92 (36/39) | 0.92 (36/39) | 0.93 (37/40) |
+| Recall | ≥ 0.60 | 0.72 (36/50; 0.58–0.83) | 0.70 (35/50; 0.56–0.81) | 0.72 (36/50; 0.58–0.83) | 0.72 (36/50; 0.58–0.83) | 0.74 (37/50; 0.60–0.84) |
+| Doubles | ≤ 10 % (1 of 10) | **4**: fails | 0 | 0 | 0 | 0 |
+| Flood | ≤ 2 | **3**: fails | 1 | 1 | 1 | 1 |
+| Spend | < $0.10 | $0.0068 (73 requests) | $0.0059 (53 requests) | $0.0065 (55 requests) | nothing new: run 3's 55 answers replay | $0.0066 (56 requests) |
+| Distilled memories / trashed by the judge | — | 63 / 6 | 40 / 1 | 42 / 2 | 42 / 2 | 43 / 2 |
+| Jev latency, median / max | — | 312 / 682 ms | 323 / 694 ms | 349 / 1,247 ms | — | 328 / 720 ms |
 
-Runs 2, 3 and 4 meet every threshold, and the CI replay pins run 4. The main set's requests did not change in run 4, so it
-replays run 3's answers (see "Run 4"). Recall passes as a point estimate, but its interval does not rule out a recall
-under 0.60.
+Runs 2 to 5 meet every threshold, and the CI replay pins run 5, a live run of all three sets (see "Run 5"). Recall passes
+as a point estimate; in run 5 the lower end of its interval is at 0.60, and in the earlier runs it did not rule out a
+recall under 0.60.
 
 **Per kind** (precision by the memory's kind; recall by the item's first kind):
 
-| Kind | Run 1 precision | Run 1 recall | Run 2 precision | Run 2 recall | Run 3 precision | Run 3 recall |
-|---|---|---|---|---|---|---|
-| bugfix | 0.73 (11/15) | 0.71 (10/14) | 0.82 (9/11) | 0.64 (9/14) | 0.90 (9/10) | 0.64 (9/14) |
-| decision | 0.82 (9/11) | 1.00 (9/9) | 0.89 (8/9) | 0.89 (8/9) | 0.89 (8/9) | 0.89 (8/9) |
-| fact | 0.57 (4/7) | 0.60 (3/5) | 0.75 (3/4) | 0.60 (3/5) | 0.75 (3/4) | 0.60 (3/5) |
-| handoff | 0.50 (2/4) | 0.67 (2/3) | 1.00 (3/3) | 1.00 (3/3) | 1.00 (3/3) | 1.00 (3/3) |
-| howto | 0.60 (6/10) | 0.86 (6/7) | 1.00 (6/6) | 0.86 (6/7) | 1.00 (6/6) | 0.86 (6/7) |
-| preference | 1.00 (5/5) | 0.50 (3/6) | 1.00 (3/3) | 0.50 (3/6) | 0.80 (4/5) | 0.67 (4/6) |
-| warning | 0.60 (3/5) | 0.50 (3/6) | 1.00 (3/3) | 0.50 (3/6) | 1.00 (3/3) | 0.50 (3/6) |
+| Kind | Run 1 precision | Run 1 recall | Run 2 precision | Run 2 recall | Run 3 precision | Run 3 recall | Run 5 precision | Run 5 recall |
+|---|---|---|---|---|---|---|---|---|
+| bugfix | 0.73 (11/15) | 0.71 (10/14) | 0.82 (9/11) | 0.64 (9/14) | 0.90 (9/10) | 0.64 (9/14) | 0.91 (10/11) | 0.71 (10/14) |
+| decision | 0.82 (9/11) | 1.00 (9/9) | 0.89 (8/9) | 0.89 (8/9) | 0.89 (8/9) | 0.89 (8/9) | 0.89 (8/9) | 0.89 (8/9) |
+| fact | 0.57 (4/7) | 0.60 (3/5) | 0.75 (3/4) | 0.60 (3/5) | 0.75 (3/4) | 0.60 (3/5) | 0.75 (3/4) | 0.60 (3/5) |
+| handoff | 0.50 (2/4) | 0.67 (2/3) | 1.00 (3/3) | 1.00 (3/3) | 1.00 (3/3) | 1.00 (3/3) | 1.00 (3/3) | 1.00 (3/3) |
+| howto | 0.60 (6/10) | 0.86 (6/7) | 1.00 (6/6) | 0.86 (6/7) | 1.00 (6/6) | 0.86 (6/7) | 1.00 (6/6) | 0.86 (6/7) |
+| preference | 1.00 (5/5) | 0.50 (3/6) | 1.00 (3/3) | 0.50 (3/6) | 0.80 (4/5) | 0.67 (4/6) | 0.80 (4/5) | 0.67 (4/6) |
+| warning | 0.60 (3/5) | 0.50 (3/6) | 1.00 (3/3) | 0.50 (3/6) | 1.00 (3/3) | 0.50 (3/6) | 1.00 (3/3) | 0.50 (3/6) |
 
 **Per language:**
 
-| Language | Sessions | Run 1 precision | Run 1 recall | Run 1 doubles, flood | Run 2 precision | Run 2 recall | Run 2 doubles, flood | Run 3 precision | Run 3 recall | Run 3 doubles, flood |
-|---|---|---|---|---|---|---|---|---|---|---|
-| English | 20 | 0.73 (27/37) | 0.74 (25/34) | 2, 1 | 0.92 (24/26) | 0.71 (24/34) | 0, 0 | 0.93 (25/27) | 0.74 (25/34) | 0, 0 |
-| Thai or mixed | 10 | 0.65 (13/20) | 0.69 (11/16) | 2, 2 | 0.85 (11/13) | 0.69 (11/16) | 0, 1 | 0.85 (11/13) | 0.69 (11/16) | 0, 1 |
+| Language | Sessions | Run 1 precision | Run 1 recall | Run 1 doubles, flood | Run 2 precision | Run 2 recall | Run 2 doubles, flood | Run 3 precision | Run 3 recall | Run 3 doubles, flood | Run 5 precision | Run 5 recall | Run 5 doubles, flood |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| English | 20 | 0.73 (27/37) | 0.74 (25/34) | 2, 1 | 0.92 (24/26) | 0.71 (24/34) | 0, 0 | 0.93 (25/27) | 0.74 (25/34) | 0, 0 | 0.93 (25/27) | 0.74 (25/34) | 0, 0 |
+| Thai or mixed | 10 | 0.65 (13/20) | 0.69 (11/16) | 2, 2 | 0.85 (11/13) | 0.69 (11/16) | 0, 1 | 0.85 (11/13) | 0.69 (11/16) | 0, 1 | 0.86 (12/14) | 0.75 (12/16) | 0, 1 |
 
 **Per session.** Each run's cell gives questions asked, live memories (trashed in brackets), matching memories, and
 items found. Items found are gold items matched, or, in an already session, doubles. No memory of this set was
-superseded in run 2 or run 3; the replays check it, and run 1 came before that check.
+superseded in runs 2, 3 or 5; the replays check it, and run 1 came before that check. Run 4 replayed run 3's answers, so
+its column would be run 3's.
 
-| Session | Set | Language | Items | Run 1 | Run 2 | Run 3 |
-|---|---|---|---|---|---|---|
-| s01 | gold | English | 3 | 11, 3 (0), 3, 3 | 11, 3 (0), 3, 3 | 11, 3 (0), 3, 3 |
-| s02 | nothing | English | 0 | 6, 0 (0), 0, 0 | 6, 0 (0), 0, 0 | 6, 0 (0), 0, 0 |
-| s03 | gold | Thai or mixed | 3 | 6, 4 (0), 2, 2 | 6, 2 (0), 2, 2 | 6, 1 (0), 1, 1 |
-| s04 | gold | English | 3 | 13, 2 (0), 2, 2 | 13, 2 (0), 2, 2 | 12, 2 (0), 2, 2 |
-| s05 | already | English | 3 | 9, 0 (2), 0, 0 | 9, 0 (0), 0, 0 | 9, 0 (0), 0, 0 |
-| s06 | gold | English | 2 | 8, 1 (0), 1, 1 | 8, 1 (0), 1, 1 | 8, 1 (0), 1, 1 |
-| s07 | gold | Thai or mixed | 3 | 7, 4 (0), 3, 3 | 7, 3 (0), 3, 3 | 7, 3 (0), 3, 3 |
-| s08 | nothing | Thai or mixed | 0 | 5, 2 (0), 0, 0 | 5, 1 (0), 0, 0 | 5, 1 (0), 0, 0 |
-| s09 | gold | English | 3 | 12, 4 (0), 3, 3 | 12, 2 (0), 2, 2 | 11, 2 (0), 2, 2 |
-| s10 | gold | English | 2 | 5, 2 (0), 2, 2 | 5, 2 (0), 2, 2 | 5, 2 (0), 2, 2 |
-| s11 | already | Thai or mixed | 2 | 5, 2 (1), 2, 2 | 5, 0 (0), 0, 0 | 5, 0 (1), 0, 0 |
-| s12 | gold | English | 2 | 9, 2 (0), 1, 1 | 9, 1 (0), 1, 1 | 9, 1 (0), 1, 1 |
-| s13 | gold | Thai or mixed | 3 | 6, 3 (0), 2, 2 | 6, 2 (0), 2, 2 | 6, 3 (0), 3, 3 |
-| s14 | nothing | English | 0 | 7, 0 (0), 0, 0 | 7, 0 (0), 0, 0 | 7, 0 (0), 0, 0 |
-| s15 | gold | English | 2 | 7, 1 (0), 0, 0 | 7, 1 (0), 0, 0 | 7, 1 (0), 0, 0 |
-| s16 | gold | English | 4 | 13, 3 (0), 3, 3 | 13, 3 (0), 3, 3 | 12, 3 (0), 3, 3 |
-| s17 | gold | Thai or mixed | 2 | 5, 1 (0), 1, 1 | 5, 1 (0), 1, 1 | 5, 1 (0), 1, 1 |
-| s18 | already | English | 3 | 6, 3 (1), 2, 2 | 6, 0 (0), 0, 0 | 6, 0 (0), 0, 0 |
-| s19 | gold | English | 3 | 8, 2 (0), 2, 2 | 8, 2 (0), 2, 2 | 8, 2 (0), 2, 2 |
-| s20 | nothing | English | 0 | 4, 0 (0), 0, 0 | 4, 0 (0), 0, 0 | 4, 0 (0), 0, 0 |
-| s21 | gold | Thai or mixed | 3 | 13, 3 (0), 2, 2 | 12, 3 (0), 2, 2 | 11, 3 (0), 2, 2 |
-| s22 | gold | English | 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 |
-| s23 | nothing | Thai or mixed | 0 | 6, 0 (0), 0, 0 | 5, 0 (0), 0, 0 | 5, 0 (0), 0, 0 |
-| s24 | gold | English | 2 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 |
-| s25 | already | Thai or mixed | 2 | 7, 0 (1), 0, 0 | 7, 0 (1), 0, 0 | 7, 0 (1), 0, 0 |
-| s26 | gold | English | 3 | 7, 4 (0), 3, 3 | 7, 3 (0), 3, 3 | 7, 3 (0), 3, 3 |
-| s27 | gold | Thai or mixed | 2 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 |
-| s28 | nothing | English | 0 | 4, 1 (0), 0, 0 | 4, 0 (0), 0, 0 | 4, 0 (0), 0, 0 |
-| s29 | gold | English | 3 | 17, 6 (1), 2, 2 | 15, 3 (0), 2, 2 | 13, 4 (0), 3, 3 |
-| s30 | gold | English | 1 | 8, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 |
+| Session | Set | Language | Items | Run 1 | Run 2 | Run 3 | Run 5 |
+|---|---|---|---|---|---|---|---|
+| s01 | gold | English | 3 | 11, 3 (0), 3, 3 | 11, 3 (0), 3, 3 | 11, 3 (0), 3, 3 | 11, 3 (0), 3, 3 |
+| s02 | nothing | English | 0 | 6, 0 (0), 0, 0 | 6, 0 (0), 0, 0 | 6, 0 (0), 0, 0 | 6, 0 (0), 0, 0 |
+| s03 | gold | Thai or mixed | 3 | 6, 4 (0), 2, 2 | 6, 2 (0), 2, 2 | 6, 1 (0), 1, 1 | 6, 2 (0), 2, 2 |
+| s04 | gold | English | 3 | 13, 2 (0), 2, 2 | 13, 2 (0), 2, 2 | 12, 2 (0), 2, 2 | 12, 2 (0), 2, 2 |
+| s05 | already | English | 3 | 9, 0 (2), 0, 0 | 9, 0 (0), 0, 0 | 9, 0 (0), 0, 0 | 9, 0 (0), 0, 0 |
+| s06 | gold | English | 2 | 8, 1 (0), 1, 1 | 8, 1 (0), 1, 1 | 8, 1 (0), 1, 1 | 8, 1 (0), 1, 1 |
+| s07 | gold | Thai or mixed | 3 | 7, 4 (0), 3, 3 | 7, 3 (0), 3, 3 | 7, 3 (0), 3, 3 | 7, 3 (0), 3, 3 |
+| s08 | nothing | Thai or mixed | 0 | 5, 2 (0), 0, 0 | 5, 1 (0), 0, 0 | 5, 1 (0), 0, 0 | 5, 1 (0), 0, 0 |
+| s09 | gold | English | 3 | 12, 4 (0), 3, 3 | 12, 2 (0), 2, 2 | 11, 2 (0), 2, 2 | 11, 2 (0), 2, 2 |
+| s10 | gold | English | 2 | 5, 2 (0), 2, 2 | 5, 2 (0), 2, 2 | 5, 2 (0), 2, 2 | 5, 2 (0), 2, 2 |
+| s11 | already | Thai or mixed | 2 | 5, 2 (1), 2, 2 | 5, 0 (0), 0, 0 | 5, 0 (1), 0, 0 | 5, 0 (1), 0, 0 |
+| s12 | gold | English | 2 | 9, 2 (0), 1, 1 | 9, 1 (0), 1, 1 | 9, 1 (0), 1, 1 | 9, 1 (0), 1, 1 |
+| s13 | gold | Thai or mixed | 3 | 6, 3 (0), 2, 2 | 6, 2 (0), 2, 2 | 6, 3 (0), 3, 3 | 6, 3 (0), 3, 3 |
+| s14 | nothing | English | 0 | 7, 0 (0), 0, 0 | 7, 0 (0), 0, 0 | 7, 0 (0), 0, 0 | 7, 0 (0), 0, 0 |
+| s15 | gold | English | 2 | 7, 1 (0), 0, 0 | 7, 1 (0), 0, 0 | 7, 1 (0), 0, 0 | 7, 1 (0), 0, 0 |
+| s16 | gold | English | 4 | 13, 3 (0), 3, 3 | 13, 3 (0), 3, 3 | 12, 3 (0), 3, 3 | 12, 3 (0), 3, 3 |
+| s17 | gold | Thai or mixed | 2 | 5, 1 (0), 1, 1 | 5, 1 (0), 1, 1 | 5, 1 (0), 1, 1 | 5, 1 (0), 1, 1 |
+| s18 | already | English | 3 | 6, 3 (1), 2, 2 | 6, 0 (0), 0, 0 | 6, 0 (0), 0, 0 | 6, 0 (0), 0, 0 |
+| s19 | gold | English | 3 | 8, 2 (0), 2, 2 | 8, 2 (0), 2, 2 | 8, 2 (0), 2, 2 | 8, 2 (0), 2, 2 |
+| s20 | nothing | English | 0 | 4, 0 (0), 0, 0 | 4, 0 (0), 0, 0 | 4, 0 (0), 0, 0 | 4, 0 (0), 0, 0 |
+| s21 | gold | Thai or mixed | 3 | 13, 3 (0), 2, 2 | 12, 3 (0), 2, 2 | 11, 3 (0), 2, 2 | 11, 3 (0), 2, 2 |
+| s22 | gold | English | 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 |
+| s23 | nothing | Thai or mixed | 0 | 6, 0 (0), 0, 0 | 5, 0 (0), 0, 0 | 5, 0 (0), 0, 0 | 5, 0 (0), 0, 0 |
+| s24 | gold | English | 2 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 |
+| s25 | already | Thai or mixed | 2 | 7, 0 (1), 0, 0 | 7, 0 (1), 0, 0 | 7, 0 (1), 0, 0 | 7, 0 (1), 0, 0 |
+| s26 | gold | English | 3 | 7, 4 (0), 3, 3 | 7, 3 (0), 3, 3 | 7, 3 (0), 3, 3 | 7, 3 (0), 3, 3 |
+| s27 | gold | Thai or mixed | 2 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 |
+| s28 | nothing | English | 0 | 4, 1 (0), 0, 0 | 4, 0 (0), 0, 0 | 4, 0 (0), 0, 0 | 4, 0 (0), 0, 0 |
+| s29 | gold | English | 3 | 17, 6 (1), 2, 2 | 15, 3 (0), 2, 2 | 13, 4 (0), 3, 3 | 13, 4 (0), 3, 3 |
+| s30 | gold | English | 1 | 8, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 | 6, 1 (0), 1, 1 |
 
 ## Run 1: what failed
 
@@ -235,6 +237,7 @@ the explicit memory when that `updates` is at or above the review threshold (0.5
 | 2 | — | none | — | 6 of the 10 items answered `already_saved`. s11's preference (0.56), s11's bugfix (0.62) and s18's fact (0.66) were answered with knowledge but below 0.70. s25's howto (0.87) was kept and then trashed as a duplicate (reverse 0.84) |
 | 3 | — | none | — | 6 of the 10 items answered `already_saved`. s11's bugfix (0.58) and s18's fact (0.59) were answered with knowledge below 0.70, so they were never kept. s11's preference was kept as `preference_user` (0.73) and routed to `global`; Task 11b's comparison with the source project found the agent's copy (duplicate, forward 0.80, reverse 0.79) and trashed it. That is cause (a), now caught. s25's howto (0.91) was kept and then trashed as a duplicate (forward 0.55, reverse 0.78) |
 | 4 | — | none | — | The same answers and the same judgements as run 3: Task 11b's comparison with the source project caught s11's preference, and s25's howto was trashed as a duplicate. Task 12c's "holds more" guard (twice the length, between review and auto) and its number rule (a newer value) linked nothing in this set, so they caused no double |
+| 5 | — | none | — | The same pattern as run 3, on new answers. 6 of the 10 items answered `already_saved`. s11's bugfix (0.56) and s18's fact (0.55) were answered with knowledge below 0.70, so they were never kept. s11's preference was kept as `preference_user` (0.74), routed to `global`, and trashed by the judge as a duplicate of the agent's copy in the source project, cause (a) caught again. s25's howto (0.92) was kept and then trashed as a duplicate. Task 12d acts only on a full session set, which no session of this set reaches |
 
 **What the judge caught.** In run 1 it trashed 6 distilled memories as duplicates of older ones:
 
@@ -408,17 +411,83 @@ This is the p-band policy at work. A late fact enters when Jev is more sure of i
 its position in the session. The free dry run's script answers every labelled passage at p 1.0, so in that run the late
 facts win more of the ties.
 
+## Run 5: re-run live after Task 12d
+
+Run 5 runs the evaluation live again after a fourth **product fix**, Task 12d. It follows the second real-session
+re-check, which kept only 5 of the 60 good facts. It is not a tuning round: the set, the labels and the thresholds are
+unchanged, and nothing was changed after run 5. Task 12d (the controller's round-2 rulings):
+
+- **The p band before the tier.** The rank is now: the handoff first, the p band (≥ 0.9, ≥ 0.8, below), then the main
+  session before subagents inside the band, then kind, then p. So a subagent report in a higher band can enter a set full
+  of main-session memories.
+- **A room that grows with the session.** A session's best set holds `distill.max_per_session` (16) memories for its
+  first 100 captured turns, 8 more for each further 100, at most the new `distill.max_per_session_cap` (48).
+- **Related first.** When the room is over, a newcomer the judge finds live and links to a member of its set (an update
+  or a duplicate that holds more, or a contradiction) evicts that member, the older of the two, before the weakest.
+- **Titles** never hold a redaction marker and never end inside a backtick code span.
+
+**What the free checks showed first.** Task 12d acts after Jev answers, and no session of Task 13's set or of the flood
+set fills its set, so the request bodies did not change: run 4's recordings still replayed under this code with no miss
+and no unused answer, and the dry runs sent 76, 3 and 22 bodies, the same both times, as under run 4's code. Run 5 is a
+live run of all three sets all the same, so the replays pin Jev's current answers to this code.
+
+**Task 13's set** (the thresholds pass): precision 0.90 (37/41), recall 0.74 (37/50), doubles 0, flood 1, $0.0066 for 56
+requests.
+
+- **One change from run 3, all from Jev's answers:** s03's «amount ใน payload ของ PromptPay ต้องไม่มี comma» was answered
+  bugfix 0.74 (0.69 in run 3), so it is found now. Every other session's line is run 3's.
+- **The 4 unmatched memories are run 3's:** s08's fix narration (the flood of 1), s15's fix taken as a project rule, s21's
+  user pick with its reason and s29's "Key Technical Concepts" section.
+- **Doubles by cause:** see the table above. The judge again trashed two distilled memories, s11's preference (cause
+  (a), caught) and s25's howto.
+
+**The flood set:**
+
+| | Run 5 | Threshold |
+|---|---|---|
+| Verdicts that reached Jev | 20 of 20 | at least 18 |
+| Verdicts answered `ephemeral` (dropped) | 19 of 20 | more than half |
+| Verdicts kept | 0 | at most 5 |
+| Lessons kept | 3 of 3 | all 3 |
+| Distilled / live memories | 4 / 3 (1 superseded) | — |
+| Questions / Jev requests / spend | 28 / 4 / $0.0007 | — |
+
+The verdict run 3 kept, the task 5 code review that reports one fixed finding, was answered bugfix 0.69 this time (0.72
+in run 3), so it was not kept. The user question kept as a decision was superseded by the decision that answers it, as in
+run 3.
+
+**The long-session set.** Its 136 turns would earn a room of 24 under Task 12d, more than the 19 to 21 memories it
+distils, so the set would never fill and the checks declared for it in Task 12c would no longer test a full set. Its
+`labels.json` therefore pins `distill.max_per_session_cap = 16` for this session alone (the free dry run without the pin
+keeps all 21 it distils, and none is replaced). With the pin:
+
+| | Run 5 (live) | Run 4 (live) |
+|---|---|---|
+| Requests (distillation / the judge's) | 21 (3 / 18) | 21 (3 / 18) |
+| Questions | 38 | 38 |
+| Distilled, then kept (live) | 19, kept 16 | 19, kept 16 |
+| Late facts kept | 5 of 10 | 5 of 10 |
+| Early facts kept | 11 of 14 | 11 of 14 |
+| Replaced (`distill:cap`) | 3 | 3 |
+| Verdicts kept | 0 of 12 | 0 of 12 |
+| Spend | $0.0023 | $0.0023 |
+
+The same memories as run 4, and all of Task 12c's checks pass. The session has no subagent passage and the judge linked
+no pair in it, so the two eviction rulings change nothing here; the unit, writer and flow tests cover them, and the
+real-session re-check is where they show.
+
 ## Spend
 
-| | Run 1 | Run 2 | Run 3 | Run 3, flood set | Run 4, long-session set |
-|---|---|---|---|---|---|
-| Requests, distillation and the judge's | 73 | 53 | 55 | 5 | 21 |
-| Spend, from Jev's reported input tokens (the cost ledgers agree) | $0.0068 | $0.0059 | $0.0065 | $0.0008 | $0.0023 |
-| The free dry run's upper bound (1.41 tokens per byte, plus 300 per request) | $0.0307 | $0.0329 | $0.0356 | $0.0031 | $0.0116 |
+| | Run 1 | Run 2 | Run 3 | Run 3, flood set | Run 4, long-session set | Run 5 | Run 5, flood set | Run 5, long-session set |
+|---|---|---|---|---|---|---|---|---|
+| Requests, distillation and the judge's | 73 | 53 | 55 | 5 | 21 | 56 | 4 | 21 |
+| Spend, from Jev's reported input tokens (the cost ledgers agree) | $0.0068 | $0.0059 | $0.0065 | $0.0008 | $0.0023 | $0.0066 | $0.0007 | $0.0023 |
+| The free dry run's upper bound (1.41 tokens per byte, plus 300 per request) | $0.0307 | $0.0329 | $0.0356 | $0.0031 | $0.0116 | $0.0356 | $0.0031 | $0.0116 |
 
 Run 3's two live runs shared one $0.10 stop: the flood run was given $0.093, what the first left. They cost $0.0072
-together. Run 4 recorded only the long-session set, with a $0.10 stop: the other two sets replay run 3's answers. All
-runs together cost $0.0223.
+together. Run 4 recorded only the long-session set, with a $0.10 stop: the other two sets replay run 3's answers. Run 5's
+three live runs shared one $0.10 stop ($0.093 for the flood set and $0.092 for the long session, what the earlier runs
+left) and cost $0.0096 together. All runs together cost $0.0319.
 
 ## Determinism
 
@@ -455,18 +524,25 @@ replay.
 - **Replays, run 4:** each of the three sets was replayed twice in a row, and all six passed.
   - Task 13's set and the flood set reproduced run 3's outputs byte for byte, on run 3's recordings.
   - The long-session set reproduced its live run's output.
+- **Dry runs, run 5 code:** Task 13's set, the same 76 request bodies twice; the flood set, the same 3 twice; the
+  long-session set, the same 22 twice, as many as under run 4's code. Run 4's recordings also replayed under run 5's
+  code with no miss and no unused answer: given the same answers, this code sends run 4's requests byte for byte.
+- **Replays, run 5:** the three sets were replayed twice in a row, and all six passed. The main replay's report and its
+  30 per-session lines are the live run's, line for line; the flood and long-session replays print the live runs'
+  answers and memories.
 - **What the replay requires:** every request must have a recorded answer, and every recorded answer must be asked for.
 
-`recorded.jsonl` holds run 3's 55 requests (595 KB), `flood/recorded.jsonl` the flood run's 5 (74 KB), and
-`long/recorded.jsonl` run 4's 21 (232 KB), bodies only. Each live test rewrites its file, so runs 1 and 2 are kept here
-as numbers only.
+`recorded.jsonl` holds run 5's 56 requests (599 KB), `flood/recorded.jsonl` run 5's 4 (68 KB), and
+`long/recorded.jsonl` run 5's 21 (233 KB), bodies only; the key check (`grep -c -F` of the key) prints 0 on all three.
+Each live test rewrites its file, so runs 1 to 4 are kept here as numbers only.
 
 ## Caveats
 
 - **Labels and set.** The labels are one author's, the same person who wrote the transcripts, and the set is synthetic.
   The labels also miss some plausible knowledge: run 1's s29 warning counted against precision.
 - **Small samples.** There are 50 gold items, 10 already items and 6 nothing sessions, so the intervals are wide. The
-  recall intervals of run 2 (0.56–0.81) and run 3 (0.58–0.83) do not rule out a recall under 0.60. The flood set and the
+  recall intervals of run 2 (0.56–0.81) and run 3 (0.58–0.83) do not rule out a recall under 0.60; run 5's is
+  0.60–0.84. The flood set and the
   long-session set are one session each.
 - **Not an independent test.** Run 2 was tuned on the set it is scored on: one round, chosen after reading run 1's
   errors. Run 3 keeps that tuning; its own changes came from the real sessions and from run 1's doubles, not from this

@@ -157,7 +157,8 @@ pub struct CaptureSlice {
     pub cursor: Option<(u64, i64)>,
     /// The hook event behind the pass.
     pub last_event: Option<String>,
-    /// The session ended (an ended source stays ended).
+    /// The session ended. A slice that stores a new turn without ending the session opens an
+    /// ended source again (a resumed session, final review B-I2).
     pub ended: bool,
     /// Record the pass's `source.capture` event with this slice, if it stored a chunk.
     pub record_event: bool,
@@ -782,6 +783,10 @@ fn remember(
 /// The actor of a trash that makes room in a session's best set (Task 12c): `distill:cap`.
 const DISTILL_CAP: &str = "cap";
 
+/// The actor of the supersede that keeps a session's newest handoff only (final review B-I2):
+/// `distill:handoff`.
+const DISTILL_HANDOFF: &str = "handoff";
+
 /// A distilled memory (`WriteOp::Distilled`): [`remember`]; then, when it is new, its rank inputs.
 /// It evicts nothing: a member of a full set leaves only once the judge finds the newcomer live
 /// ([`evict_over_cap`]; the controller's ruling on Task 12c review I1, option b).
@@ -818,21 +823,22 @@ fn distilled_author(conn: &Connection, id: &str) -> Result<Option<(String, Strin
 }
 
 /// The distilled newcomer `id` settled live, judged or given up on: its session's best set keeps
-/// its size ([`evict_over_cap`]). `settings` come with the op. Without them eviction would be
-/// skipped in silence (Task 12c review 2, N2): a debug build stops, a release build warns and
-/// evicts nothing.
+/// its size ([`evict_over_cap`]), a member the judge related it to going first (`related`).
+/// `settings` come with the op. Without them eviction would be skipped in silence (Task 12c
+/// review 2, N2): a debug build stops, a release build warns and evicts nothing.
 fn settle_distilled(
     conn: &Connection,
     st: &mut State,
     id: &str,
     settings: Option<&alice_core::settings::DistillSettings>,
+    related: &[String],
 ) -> Result<()> {
     debug_assert!(
         settings.is_some(),
         "a judgement of a distilled newcomer carries the distillation settings ({id})"
     );
     match settings {
-        Some(s) => evict_over_cap(conn, st, id, s),
+        Some(s) => evict_over_cap(conn, st, id, s, related),
         None => {
             tracing::warn!(
                 id,
@@ -852,6 +858,7 @@ fn evict_over_cap(
     st: &mut State,
     id: &str,
     settings: &alice_core::settings::DistillSettings,
+    related: &[String],
 ) -> Result<()> {
     let Some((agent, session)) = distilled_author(conn, id)? else {
         return Ok(());
@@ -860,7 +867,10 @@ fn evict_over_cap(
     if !held.iter().any(|h| h.id == id) {
         return Ok(()); // no longer live
     }
-    if let Some(out) = alice_core::distill::evictee(&held, settings) {
+    keep_newest_handoff(conn, st, &held)?;
+    let turns = alice_core::store::capture::session_turns(conn, &agent, &session)?;
+    let room = alice_core::distill::room(settings, turns);
+    if let Some(out) = alice_core::distill::evictee(&held, room, settings, related) {
         let forget = MemoryUpdate {
             action: UpdateAction::Forget,
             ..Default::default()
@@ -872,6 +882,35 @@ fn evict_over_cap(
             &Actor::Distill(DISTILL_CAP.into()),
             st,
         )?;
+    }
+    Ok(())
+}
+
+/// A session keeps one distilled handoff, its newest settled one (final review B-I2): "the latest
+/// handoff replaces the first". A handoff is outside the session's room, so without this every
+/// closing run (each end of a resumed session, each compaction) would leave one more. `held` is
+/// the set as `store::capture::session_held` reads it, oldest first. Each older settled handoff
+/// that no person or agent touched is superseded by the newest, by `distill:handoff`; one still
+/// waiting for the judge is left for its own settling (it may yet be trashed), and a touched one
+/// stays.
+fn keep_newest_handoff(
+    conn: &Connection,
+    st: &mut State,
+    held: &[alice_core::distill::Held],
+) -> Result<()> {
+    let settled: Vec<&alice_core::distill::Held> = held
+        .iter()
+        .filter(|h| h.kind == Kind::Handoff && !h.unjudged)
+        .collect();
+    let Some((newest, older)) = settled.split_last() else {
+        return Ok(());
+    };
+    let actor = Actor::Distill(DISTILL_HANDOFF.into());
+    for h in older.iter().filter(|h| !h.protected) {
+        match supersede(conn, st, &h.id, &newest.id, &actor, None) {
+            Ok(()) | Err(AliceError::Invalid(_) | AliceError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -2137,7 +2176,7 @@ fn apply(
             let settling = judge_store::distilled_giving_up(conn, max_attempts)?;
             let (requeued, given_up) = judge_store::requeue_retries(conn, max_attempts, &now)?;
             for id in &settling {
-                settle_distilled(conn, st, id, distill.as_ref())?;
+                settle_distilled(conn, st, id, distill.as_ref(), &[])?;
             }
             if requeued + given_up > 0 {
                 tracing::info!(requeued, given_up, "memories with a failed judgement");
@@ -2438,6 +2477,9 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
     // A distilled newcomer that superseded a member of its own session's best set took that
     // member's slot: it evicts nothing (review I1, option b).
     let mut took_a_slot = false;
+    // The memories the judge linked the newcomer to: a member of its set among them leaves
+    // first when the set is over its room (Task 12d's (c)).
+    let mut related: Vec<String> = Vec::new();
     if moved {
         reviews.retain(|r| r.kind == ReviewType::Project);
     }
@@ -2455,8 +2497,11 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
         match target_state(conn, &j.seen, target)? {
             Target::Unchanged => {}
             Target::Edited => {
-                // Edited since it was judged: ask instead of acting (a distilled memory drops it).
+                // Edited since it was judged: ask instead of acting. A distilled newcomer drops
+                // it, and so does an explicit one acting on a distilled memory (final review
+                // B-I1): a distilled memory never asks a person.
                 if !distilled_newcomer
+                    && !is_distilled_id(conn, target)?
                     && let Some(r) = alice_core::judge::pipeline::as_review(&j.id, a, &j.provider)
                 {
                     reviews.push(r);
@@ -2494,6 +2539,7 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
             JudgeAction::Contradicts { other, .. } => {
                 let before = snap(conn, &j.id)?;
                 memories::link(conn, &j.id, other, "contradicts", &actor.as_string())?;
+                related.push(other.clone());
                 record(
                     conn,
                     st,
@@ -2511,6 +2557,7 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
             JudgeAction::RelatesTo { other, .. } => {
                 let before = snap(conn, &j.id)?;
                 memories::link(conn, &j.id, other, "relates_to", &actor.as_string())?;
+                related.push(other.clone());
                 record(
                     conn,
                     st,
@@ -2616,7 +2663,7 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
                 j.id
             );
             if !trashed && !took_a_slot {
-                settle_distilled(conn, st, &j.id, j.distill.as_ref())?;
+                settle_distilled(conn, st, &j.id, j.distill.as_ref(), &related)?;
             }
         }
     }
@@ -2629,6 +2676,18 @@ fn is_distilled(conn: &Connection, seq: i64) -> Result<bool> {
         .query_row(
             "SELECT origin = ?1 FROM memories WHERE seq = ?2",
             rusqlite::params![Origin::Distill.as_str(), seq],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// Whether the memory `id` was distilled from a captured session (SP2 spec §6.5).
+fn is_distilled_id(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT origin = ?1 FROM memories WHERE id = ?2",
+            rusqlite::params![Origin::Distill.as_str(), id],
             |r| r.get(0),
         )
         .optional()?
@@ -5296,76 +5355,75 @@ mod tests {
         assert_eq!(judge_state_of(&f, &auto).0, "done", "judged all the same");
     }
 
-    /// SP2 spec §6.6, R4: an explicit newcomer's replacement of a distilled duplicate that
-    /// changed after the judge read it is not applied; it becomes the merge question, with the
-    /// explicit newcomer as the survivor.
+    /// SP2 spec §6.6, R4, R19 (final review B-I1): an explicit newcomer's action on a distilled
+    /// match that changed after the judge read it (its replacement as a duplicate, or its
+    /// supersede) is not applied, and it is dropped: a distilled memory never costs a person a
+    /// question.
     #[test]
-    fn a_stale_distilled_duplicate_of_an_explicit_newcomer_is_asked_about() {
-        let f = fixture();
-        let (auto, auto_seq) = new_id(
-            f.h.submit_blocking(WriteOp::Remember {
-                input: NewMemoryInput {
-                    content: "Staging Postgres listens on port 5432".into(),
-                    origin: Origin::Distill,
+    fn a_stale_action_of_an_explicit_newcomer_on_a_distilled_match_is_dropped() {
+        for supersede in [false, true] {
+            let f = fixture();
+            let (auto, auto_seq) = new_id(
+                f.h.submit_blocking(WriteOp::Remember {
+                    input: NewMemoryInput {
+                        content: "Staging Postgres listens on port 5432".into(),
+                        origin: Origin::Distill,
+                        ..Default::default()
+                    },
+                    project: ProjectChoice::Slug("global".into()),
+                })
+                .unwrap(),
+            );
+            judged(&f, &auto, auto_seq);
+            let (mine, _) = new_id(
+                f.h.submit_blocking(remember("The staging Postgres server listens on 5432"))
+                    .unwrap(),
+            );
+            let auto_hash = hash_of(&f, &auto);
+            // The distilled memory is edited after the judge read it.
+            f.h.submit_blocking(WriteOp::Update {
+                id: auto.clone(),
+                update: MemoryUpdate {
+                    body: Some("Staging Postgres listens on port 6543".into()),
                     ..Default::default()
                 },
-                project: ProjectChoice::Slug("global".into()),
+                actor: Actor::User,
             })
-            .unwrap(),
-        );
-        judged(&f, &auto, auto_seq);
-        let (mine, _) = new_id(
-            f.h.submit_blocking(remember("The staging Postgres server listens on 5432"))
-                .unwrap(),
-        );
-        let auto_hash = hash_of(&f, &auto);
-        // The distilled memory is edited after the judge read it.
-        f.h.submit_blocking(WriteOp::Update {
-            id: auto.clone(),
-            update: MemoryUpdate {
-                body: Some("Staging Postgres listens on port 6543".into()),
-                ..Default::default()
-            },
-            actor: Actor::User,
-        })
-        .unwrap();
-        apply_j(
-            &f,
-            Judgement {
-                actions: vec![JudgeAction::ReplaceDistilled {
+            .unwrap();
+            let action = if supersede {
+                JudgeAction::Supersedes {
+                    old: auto.clone(),
+                    p: 0.6,
+                }
+            } else {
+                JudgeAction::ReplaceDistilled {
                     distilled: auto.clone(),
                     p: 0.95,
-                }],
-                seen: vec![(auto.clone(), auto_hash)],
-                ..judgement(&f, &mine, "jev")
-            },
-        );
-        assert_eq!(
-            status_of(&f, &auto),
-            "active",
-            "not merged on stale information"
-        );
-        let merged: i64 = f.read(
-            "SELECT count(*) FROM links WHERE type = 'duplicate_of' AND from_id = ?1",
-            [&auto],
-        );
-        assert_eq!(merged, 0);
-        assert_eq!(status_of(&f, &mine), "active");
-        let n: i64 = f.read("SELECT count(*) FROM review_items", []);
-        assert_eq!(n, 1);
-        let (kind, payload): (String, String) = {
-            let c = alice_core::store::open_reader(&f.db()).unwrap();
-            c.query_row(
-                "SELECT type, payload_json FROM review_items WHERE status = 'open'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap()
-        };
-        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(kind, "merge");
-        assert_eq!(payload["survivor"], mine.as_str(), "{payload}");
-        assert_eq!(payload["others"], serde_json::json!([auto]), "{payload}");
+                }
+            };
+            apply_j(
+                &f,
+                Judgement {
+                    actions: vec![action],
+                    seen: vec![(auto.clone(), auto_hash)],
+                    ..judgement(&f, &mine, "jev")
+                },
+            );
+            assert_eq!(
+                status_of(&f, &auto),
+                "active",
+                "not applied on stale information (supersede: {supersede})"
+            );
+            let linked: i64 = f.read(
+                "SELECT count(*) FROM links WHERE from_id = ?1 OR to_id = ?1",
+                [&auto],
+            );
+            assert_eq!(linked, 0, "supersede: {supersede}");
+            assert_eq!(status_of(&f, &mine), "active");
+            let n: i64 = f.read("SELECT count(*) FROM review_items", []);
+            assert_eq!(n, 0, "nobody is asked (supersede: {supersede})");
+            assert_eq!(judge_state_of(&f, &mine).0, "done");
+        }
     }
 
     #[test]
@@ -6954,6 +7012,84 @@ mod tests {
         capture_store::known_turns(c, CAPTURE_AGENT, &turn_keys(k)).unwrap()
     }
 
+    /// Final review B-I2: an ended source is open again once a slice that does not end it stores
+    /// a new turn (a resumed session: `claude --resume` and `codex resume` write on in the same
+    /// file), so its later quiet runs are not closing runs. A slice that stores nothing new (a
+    /// repeat, a resume's `SessionStart`) leaves it ended; a later end ends it again; and a stale
+    /// end is reopened the same way.
+    #[test]
+    fn a_slice_that_stores_a_new_turn_reopens_an_ended_source() {
+        let f = fixture();
+        let ended = |f: &Fixture| {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            capture_store::by_uri(&c, &capture_uri("R1"))
+                .unwrap()
+                .expect("the source has a capture state")
+                .ended
+        };
+        let mut s = capture_slice("R1", global(), 0..2);
+        s.turn_keys = vec![("r-1".into(), 0)];
+        s.cursor = Some((100, 2));
+        s.last_event = Some("session-end".into());
+        s.ended = true;
+        let (source_id, _) = captured(f.h.submit_blocking(capture(&s)));
+        assert!(ended(&f), "the session end ends it");
+        // The same slice again (nothing new), then the resume's start (no turn): still ended.
+        let again = CaptureSlice {
+            ended: false,
+            last_event: Some("stop".into()),
+            ..s.clone()
+        };
+        assert_eq!(captured_full(f.h.submit_blocking(capture(&again))).1, 0);
+        assert!(ended(&f), "a repeat stores nothing new");
+        let start = CaptureSlice {
+            chunks: Vec::new(),
+            turn_keys: Vec::new(),
+            ended: false,
+            last_event: Some("session-start".into()),
+            ..s.clone()
+        };
+        captured(f.h.submit_blocking(capture(&start)));
+        assert!(ended(&f), "a slice with no turn reopens nothing");
+        // The resumed session's first new turn reopens it.
+        let mut resumed = capture_slice("R1", global(), 2..4);
+        resumed.turn_keys = vec![("r-2".into(), 2)];
+        resumed.cursor = Some((200, 4));
+        captured(f.h.submit_blocking(capture(&resumed)));
+        assert!(!ended(&f), "new turns after an end reopen the source");
+        // Its next end ends it again, and a stale end is reopened the same way.
+        let mut end2 = capture_slice("R1", global(), 4..5);
+        end2.turn_keys = vec![("r-3".into(), 4)];
+        end2.cursor = Some((300, 5));
+        end2.ended = true;
+        captured(f.h.submit_blocking(capture(&end2)));
+        assert!(ended(&f));
+        f.h.submit_blocking(WriteOp::CaptureStateUpdate {
+            source_id: source_id.clone(),
+            change: CaptureChange::Distilled { distill_ord: 5 },
+        })
+        .unwrap();
+        let mut later = capture_slice("R1", global(), 5..6);
+        later.turn_keys = vec![("r-4".into(), 5)];
+        later.cursor = Some((400, 6));
+        captured(f.h.submit_blocking(capture(&later)));
+        assert!(!ended(&f));
+        f.h.submit_blocking(WriteOp::CaptureStateUpdate {
+            source_id: source_id.clone(),
+            change: CaptureChange::StaleEnd { due_since: None },
+        })
+        .unwrap();
+        assert!(ended(&f), "the stale end");
+        let mut after_stale = capture_slice("R1", global(), 6..7);
+        after_stale.turn_keys = vec![("r-5".into(), 6)];
+        after_stale.cursor = Some((500, 7));
+        captured(f.h.submit_blocking(capture(&after_stale)));
+        assert!(
+            !ended(&f),
+            "a stale-ended session that resumes is open again"
+        );
+    }
+
     /// SP2 spec §3.8: one slice writes its chunks, its turn keys and the cursor in one
     /// transaction. Repeating it stores nothing and leaves the cursor where it was; a slice that
     /// is refused writes nothing at all.
@@ -7430,9 +7566,10 @@ mod tests {
     }
 
     /// Task 12c (spec §6.4) and its review's I1, option b: a distilled memory is written with its
-    /// rank inputs and evicts nothing. Once the judge finds it live in a full best set (three
-    /// here), the weakest member that may go is trashed in the judgement's op: a `memory.forget`
-    /// by `distill:cap`, undoable like any trash. Never a handoff, nor a member an agent edited.
+    /// rank inputs and evicts nothing. Once the judge finds it live in a full best set (two
+    /// here: the handoff is outside the room, final review B-I2), the weakest member that may go
+    /// is trashed in the judgement's op: a `memory.forget` by `distill:cap`, undoable like any
+    /// trash. Never a handoff, nor a member an agent edited.
     #[test]
     fn a_newcomer_judged_live_into_a_full_set_evicts_the_weakest_that_may_go() {
         let f = fixture();
@@ -7485,7 +7622,7 @@ mod tests {
         let status =
             |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
         assert_eq!(cap_forgets(&f), 0, "written, nothing evicted");
-        verdict(&f, &new, Vec::new(), false, 3);
+        verdict(&f, &new, Vec::new(), false, 2);
         assert_eq!(status(&weak), "trashed");
         for id in [&handoff, &edited, &new] {
             assert_ne!(status(id), "trashed");
@@ -7502,6 +7639,107 @@ mod tests {
         })
         .unwrap();
         assert_ne!(status(&weak), "trashed");
+    }
+
+    /// Final review B-I2: a handoff is outside the room, and a session keeps its newest settled
+    /// handoff only. Once a newer one is judged live, each older settled one that no person or
+    /// agent touched is superseded by it (by `distill:handoff`, in the judgement's op), and no
+    /// durable member is evicted for it, even in a full set. An older handoff the judge settles
+    /// after a newer one is superseded by the newer one; one still waiting for the judge, or
+    /// touched by an agent, stays.
+    #[test]
+    fn a_session_keeps_its_newest_handoff_only() {
+        let f = fixture();
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        let supersedes = |newer: &str, older: &str| -> i64 {
+            f.read(
+                "SELECT count(*) FROM links WHERE from_id = ?1 AND to_id = ?2 AND type = 'supersedes'",
+                [newer, older],
+            )
+        };
+        let fact = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        let h1 = member(
+            &f,
+            "Where things stand: the cache is set up, next the restart",
+            "distill:h1",
+            Kind::Handoff,
+            0.8,
+        );
+        let handoff = |text: &str, key: &str, session: &str| -> String {
+            new_id(
+                f.h.submit_blocking(distilled_op(text, key, Kind::Handoff, 0.75, session))
+                    .unwrap(),
+            )
+            .0
+        };
+        let h2 = handoff(
+            "Where things stand: the restart moved to 04:00, next the alerts",
+            "distill:h2",
+            "S1",
+        );
+        // A room of one, held by the fact: the handoff evicts nothing.
+        verdict(&f, &h2, Vec::new(), false, 1);
+        assert_eq!(status(&h1), "superseded");
+        assert_eq!(supersedes(&h2, &h1), 1);
+        let actor: String = f.read(
+            "SELECT actor FROM events WHERE action = 'memory.supersede' AND target_id = ?1",
+            [&h1],
+        );
+        assert_eq!(actor, "distill:handoff");
+        assert_eq!(
+            (status(&h2), status(&fact)),
+            ("active".into(), "active".into())
+        );
+        assert_eq!(cap_forgets(&f), 0);
+        // One an agent touched stays beside the newer one.
+        f.h.submit_blocking(WriteOp::Update {
+            id: h2.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                title: Some("Restart at 04:00".into()),
+                ..Default::default()
+            },
+            actor: Actor::Agent(CAPTURE_AGENT.into()),
+        })
+        .unwrap();
+        // Judged again after the edit, as the worker would.
+        verdict(&f, &h2, Vec::new(), false, 1);
+        let touched: bool = f.read(
+            "SELECT touched_at IS NOT NULL AND judge_state = 'done' FROM memories WHERE id = ?1",
+            [&h2],
+        );
+        assert!(touched, "settled and touched");
+        let h3 = handoff(
+            "Where things stand: the alerts are wired, next the dashboards",
+            "distill:h3",
+            "S1",
+        );
+        verdict(&f, &h3, Vec::new(), false, 1);
+        assert_eq!(
+            (status(&h2), status(&h3)),
+            ("active".into(), "active".into())
+        );
+        // Settled out of order (session S2): the older one, judged last, goes to the newer one;
+        // one still waiting for the judge stays until it is settled.
+        let a = handoff("Where things stand: step one is done", "distill:a", "S2");
+        let b = handoff("Where things stand: step two is done", "distill:b", "S2");
+        verdict(&f, &b, Vec::new(), false, 16);
+        assert_eq!(
+            (status(&a), status(&b)),
+            ("pending".into(), "active".into())
+        );
+        verdict(&f, &a, Vec::new(), false, 16);
+        assert_eq!(status(&a), "superseded");
+        assert_eq!(supersedes(&b, &a), 1);
+        assert_eq!(status(&b), "active");
+        assert_eq!(cap_forgets(&f), 0);
     }
 
     /// Review I1, option b: a newcomer the judge trashes as a duplicate evicts nothing, so the
@@ -7664,6 +7902,102 @@ mod tests {
         );
         assert_eq!(status(&weak), "trashed");
         assert_eq!(cap_forgets(&f), 1);
+    }
+
+    /// Task 12d (c): a newcomer judged live into a full set that the judge linked to a member
+    /// (`relates_to`: an update or a duplicate that holds more; or `contradicts`) evicts that
+    /// member, the older of the two, not the set's weakest. A related member an agent edited is
+    /// protected: the weakest member that may go leaves instead.
+    #[test]
+    fn a_live_newcomer_related_to_a_member_evicts_that_member() {
+        let f = fixture();
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        let old = member(
+            &f,
+            "The berth planner reads the tide table at noon",
+            "distill:old",
+            Kind::Fact,
+            0.9,
+        );
+        member(
+            &f,
+            "Invoices go out on Fridays",
+            "distill:z",
+            Kind::Fact,
+            0.85,
+        );
+        let (new, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The berth planner reads the tide table at dawn now",
+                "distill:new",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &new,
+            vec![JudgeAction::RelatesTo {
+                other: old.clone(),
+                p: 0.8,
+            }],
+            false,
+            3,
+        );
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        assert_eq!(status(&old), "trashed", "the related member goes");
+        assert_ne!(status(&weak), "trashed");
+        assert_ne!(status(&new), "trashed");
+        // A contradiction counts too; an edited member is protected.
+        let edited = member(
+            &f,
+            "The gate opens at dawn",
+            "distill:edited",
+            Kind::Fact,
+            0.9,
+        );
+        f.h.submit_blocking(WriteOp::Update {
+            id: edited.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                title: Some("The gate".into()),
+                ..Default::default()
+            },
+            actor: Actor::Agent(CAPTURE_AGENT.into()),
+        })
+        .unwrap();
+        let (next, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The gate opens at noon, not at dawn",
+                "distill:next",
+                Kind::Fact,
+                0.96,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &next,
+            vec![JudgeAction::Contradicts {
+                other: edited.clone(),
+                p: 0.8,
+            }],
+            false,
+            3,
+        );
+        assert_ne!(status(&edited), "trashed", "protected");
+        assert_eq!(status(&weak), "trashed", "the weakest that may go instead");
+        assert_eq!(cap_forgets(&f), 2);
     }
 
     /// Task 12c review 2, N1: a distilled newcomer the judge gives up on in bulk

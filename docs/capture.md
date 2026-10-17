@@ -303,7 +303,8 @@ policy again, for every project a request covers, and redacts the text with each
 
 - **When.** A session is distilled when it ends (`SessionEnd`, or 24 hours without any event when it captured something
   in the last 8 days; an older one waits for you to ask), when it is compacted (`PreCompact`), when it has been quiet
-  for `distill.idle_minutes` (default 15), or when you run `alice capture distill <session-id>`.
+  for `distill.idle_minutes` (default 15), or when you run `alice capture distill <session-id>`. A session you resume
+  after it ended is open again from its first new turn: its quiet pauses do not count as ends, and its next end does.
 - **Extractive.** Jev answers choice questions only, so a distilled memory is **a passage of your session**, chosen and
   classified by Jev, never new text. Alice proposes up to 40 passages per run: compaction summaries first, then each
   turn's concluding text, then statements you made, then subagent reports. Passages that hold `[withheld:`, are mostly a
@@ -312,25 +313,28 @@ policy again, for every project a request covers, and redacts the text with each
   preference of yours (filed under `global`, unless it names this project: its name, its folder or a path in it), a
   convention of this project, a fact, a handoff, or is it already saved, ephemeral or unclear? A passage is kept when
   its best answer is a kind of knowledge with probability at least `distill.min_confidence` (default 0.7). What is kept
-  is ranked: a handoff first, your session before its subagents, then by Jev's confidence in bands (0.9 and above, 0.8
-  and above, below), then by kind (decision, bugfix, warning, fact, how-to, preference). At most `distill.max_per_run`
-  (default 8) are kept per run, at most one handoff, and at most `distill.max_per_subagent_run` (default 2) subagent
-  reports. A subagent's report is never the session's handoff.
-- **A session keeps its best.** `distill.max_per_session` (default 16) is the size of a session's best set, its runs
-  and its subagents together, subagent reports at most half of it. Every run is asked about, a full session's too, so a
-  better passage later in the session replaces the weakest one kept, once the judge has kept the new one (a
-  restatement the judge trashes as a duplicate replaces nothing); the replaced memory goes to the trash (by
-  `distill:cap`, and you can restore it like any other), and its passage stays in the raw capture. A handoff gets in
-  in place of the weakest. The cap never replaces the session's handoff, nor a distilled memory that you or an agent
-  edited, moved, restored, linked to or cited in a fact after it was distilled; those keep their slots. When no
-  memory that may go is weaker, the new passage is not stored. A distilled memory you saved again word for word is
-  yours: it leaves the set and frees its slot.
+  is ranked: a handoff first, then by Jev's confidence in bands (0.9 and above, 0.8 and above, below), then your session
+  before its subagents within a band, then by kind (decision, bugfix, warning, fact, how-to, preference). At most
+  `distill.max_per_run` (default 8) are kept per run, at most one handoff, and at most `distill.max_per_subagent_run`
+  (default 2) subagent reports. A subagent's report is never the session's handoff.
+- **A session keeps its best.** A session's best set, its runs and its subagents together, holds
+  `distill.max_per_session` (default 16) memories for its first 100 turns and 8 more for each further 100 turns, up to
+  `distill.max_per_session_cap` (default 48); subagent reports take at most half of it. Every run is asked about, a
+  full session's too, so a better passage later in the session replaces the weakest one kept, once the judge has kept
+  the new one (a restatement the judge trashes as a duplicate replaces nothing; one the judge relates to a kept memory,
+  such as a newer value of it, replaces that memory first); the replaced memory goes to the trash (by
+  `distill:cap`, and you can restore it like any other), and its passage stays in the raw capture. A handoff takes no
+  slot: the session keeps only its newest one (a newer handoff supersedes the older one), and it never pushes out a
+  kept memory. The cap never replaces a distilled memory that you or an agent edited, moved, restored, linked to or
+  cited in a fact after it was distilled; those keep their slots. When no memory that may go is weaker, the new passage
+  is not stored. A distilled memory you saved again word for word is yours: it leaves the set and frees its slot.
 - **The memory.** The passage (at most 1,200 characters), titled with its first sentence, passing over `#` headings;
   when that is a table header, or 25 characters or fewer (a short heading or label), with the first sentence after it
-  that says more (at most 80 characters). It gets a last line `Context: <your prompt's first sentence>` when it needs
-  one to stand on its own. Importance `distill.importance` (default 2), no topics, the session as author, and
-  provenance links to the chunks it came from. It is written through the normal `remember` path: redacted,
-  deduplicated and judged.
+  that says more (at most 80 characters). A title never holds a `[REDACTED:…]` marker (the first sentence without one is
+  taken instead) and never ends inside a backtick code span. It gets a last line
+  `Context: <your prompt's first sentence>` when it needs one to stand on its own. Importance `distill.importance`
+  (default 2), no topics, the session as author, and provenance links to the chunks it came from. It is written through
+  the normal `remember` path: redacted, deduplicated and judged.
 
 ### `(auto)`, and why it never asks you
 
@@ -341,10 +345,13 @@ machine-extracted: rely on it as you would on a note you did not write.
   as a duplicate; an uncertain update of another distilled memory, or a contradiction, becomes a link between the two
   memories, without a question.
 - **Your memories win.** A distilled memory never replaces one an agent or you wrote. When the judge finds that the two
-  say the same thing, yours stays and the distilled one goes to the trash, whichever came first; so does a distilled
-  memory that only updates yours. One that holds more than yours (more than twice the text, when the judge is not
-  sure, or a number yours does not state) is kept and linked to yours instead. A preference of yours filed under `global` is compared with the memories of the
-  session's project too, where your agent may have saved it (unless the cloud policy keeps that project at home).
+  say the same thing, yours stays and the distilled one goes to the trash, whichever came first, even when the judge
+  is unsure; so does a distilled memory that only updates yours. A distilled one that holds more than yours (more than
+  twice the text, when the judge is not sure, or a number yours does not state) is kept and linked to yours instead.
+  When yours came later and updates or contradicts a distilled memory, yours replaces it (the distilled one is
+  superseded). None of this asks you anything. A preference of yours filed under `global` is compared with the
+  memories of the session's project too, where your agent may have saved it (unless the cloud policy keeps that
+  project at home).
 - **Hidden until judged.** Recall and the briefing skip a distilled memory until the judge has looked at it, so a near
   copy of something already saved never shows twice. `get_memory` by id still returns it.
 - **It stays out of the way.** Importance 2 keeps distilled memories out of the briefing's key memories, and below
@@ -399,7 +406,8 @@ provider = "off"            # "off" | "jev"
 # model                     # reserved; ignored with "jev" (judge.jev.model is used)
 min_confidence = 0.7        # 0.5-0.99
 max_per_run = 8             # 1-50
-max_per_session = 16        # 2-200: the size of a session's best set, its subagents included
+max_per_session = 16        # 2-200: the size of a session's best set for its first 100 turns, subagents included
+max_per_session_cap = 48    # at most 400: the set grows by 8 per further 100 turns, up to this (below max_per_session: no growth)
 max_per_subagent_run = 2    # 0-50: subagent reports kept in one run
 idle_minutes = 15           # 1-1,440
 importance = 2              # 1-3

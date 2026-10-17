@@ -137,6 +137,8 @@ struct Session {
     /// The flood set: the opening words of each verdict or status report, which should end
     /// `ephemeral`.
     verdicts: Vec<String>,
+    /// Lines added to the `[distill]` table of its daemon's config (`labels.json`'s `distill`).
+    distill: String,
 }
 
 impl Session {
@@ -231,6 +233,7 @@ fn load_set_in(dir: &Path) -> Vec<Session> {
                     .flatten()
                     .map(|v| v.as_str().unwrap().to_owned())
                     .collect(),
+                distill: s["distill"].as_str().unwrap_or_default().to_owned(),
                 bytes,
                 file,
             }
@@ -670,7 +673,11 @@ async fn run_session(t: &Arc<EvalTransport>, s: &Session, key: &str, limit: Dura
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(AliceHome::new(home.clone()).config_file(), CONFIG).unwrap();
+    std::fs::write(
+        AliceHome::new(home.clone()).config_file(),
+        format!("{CONFIG}{}\n", s.distill),
+    )
+    .unwrap();
     let repo = dir.path().join(&s.repo);
     std::fs::create_dir_all(&repo).unwrap();
     let cwd = repo.to_string_lossy().into_owned();
@@ -1465,8 +1472,10 @@ fn asked_passages(t: &EvalTransport) -> Vec<Vec<String>> {
 /// The long-session set's checks (Task 12c, declared before any run; §11.3's set and thresholds
 /// are not touched): the session is asked about in every run (three); its best set never holds
 /// more than `distill.max_per_session` (16); the late compaction summary's sections are asked
-/// about. Its own figures are printed: kept, the late items kept, replaced (`distill:cap`), and
-/// the verdict or status lines kept.
+/// about. Its 136 turns would earn a room of 24 (Task 12d), more than it distils, so its
+/// `labels.json` pins `distill.max_per_session_cap = 16`: the set still fills, and the checks
+/// declared before any run still hold. Its own figures are printed: kept, the late items kept,
+/// replaced (`distill:cap`), and the verdict or status lines kept.
 fn assert_long(set: &[Session], outcomes: &[Outcome], t: &EvalTransport) {
     let (s, o) = (&set[0], &outcomes[0]);
     let live: Vec<&Mem> = o.memories.iter().filter(|m| m.live()).collect();
