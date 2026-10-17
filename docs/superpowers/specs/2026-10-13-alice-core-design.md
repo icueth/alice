@@ -372,6 +372,13 @@ SP2 adds `ollama`, `claude-cli`, `codex-cli` and `openai-compatible` providers.
     (judging, precise recall, distillation), the input of a remote embedder (and its query), and a `shared: true` memory on
     its way to the team store, which also redacts every write itself. A secret may be stored and recalled; it never
     reaches Jev or any other provider.
+  - *Re-review (N1-N4):* the always-on rules ignore the allowlist for the built-in detectors
+    (`Redactor::for_egress`: an allowlist exempts a value from storage, never from egress), and on a server tenant the
+    allowlist is the admin's pin alone (`ALICE_PRIVACY_ALLOWLIST`; a file or PATCH that sets one is refused). The
+    detectors also say where each secret is (`Redactor::spans`: a match whole, with its keyword, scheme or `BEGIN` line),
+    and capture asks them in every mode so that no trim or cut falls inside one (SP2 spec §3.7); a title derived from a
+    text that is cut is cut from the text redacted with the built-in detectors. The line-anchored detectors
+    (`base64_block`, a key's tail) also match after a rendered chunk's tag (`[user] (cont.) `), which they keep.
   - **Whole texts first.** Redaction runs on a whole text before anything cuts it for a request: a memory block's title
     (200 characters) and body (700, or 2,000 for a raw chunk in precise recall), the 2,000-character embedding passage, and
     distillation's excerpts and passages (the run's chunks are redacted when they are loaded). A key cut first would leave

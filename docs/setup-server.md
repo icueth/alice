@@ -279,6 +279,9 @@ in place of the last one:
 Otherwise (`0`, or the command fails) keep the block as it is. The server's MCP instructions switch the same way.
 Either way the shared team memory always redacts, and nothing sent to Jev carries a secret.
 
+This block is written once: it does not follow the switch by itself, while the MCP instructions always do (they are the
+live source). If the admin later runs `alice-server secrets keep|redact` for this tenant, run this step again.
+
 ### Step 6: Capture sessions automatically
 
 This saves every Claude Code and Codex session to the person's tenant as it happens (each finished turn, in the

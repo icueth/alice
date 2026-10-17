@@ -221,6 +221,10 @@ The last line follows the person's choice about secrets. Run `alice config get p
 Alice's MCP instructions switch the same way. Whatever the setting, nothing Alice sends to Jev or another cloud service
 carries a secret. Secrets that were redacted before the setting changed stay redacted: redaction cannot be undone.
 
+This block is written once: it does not follow the setting by itself, while the MCP instructions always do (`alice mcp`
+asks the running daemon, so they are the live source). If the person changes `privacy.redact` later, run this step
+again.
+
 ### Step 7: Retire MemPalace (optional)
 
 Check whether MemPalace is still wired in, without printing any file:

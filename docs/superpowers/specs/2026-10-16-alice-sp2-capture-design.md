@@ -386,6 +386,15 @@ This one rule covers everything that could duplicate:
   chunk cut prefers a paragraph, a sentence or a line end, else the start of the token the limit falls in; a token longer
   than a whole chunk is replaced by the trim marker. A key stored as written therefore never reaches a chunk, and so the
   cloud, as a fragment its detector no longer knows.
+- *Re-review N1 (binding):* no cut falls inside a secret either, in every mode. Before a trim, clip or cut, the
+  detectors of the source's project find each secret in the text being cut (`Redactor::spans`: the match whole, with the
+  keyword, the URL's scheme and user or the key's `BEGIN` line its detector needs; switch and allowlist ignored). A trim's
+  head that would end inside one keeps it whole, and a tail that would start inside one starts at its start, when that
+  keeps at most 8,192 more characters; else it is left out whole. A chunk cut moves to the secret's start; a secret that
+  starts a chunk and is longer than one stays whole in it, over `chunk_chars` (a private key is never split across
+  chunks), and one larger than a chunk's 32 KB is replaced by the trim marker. A tool title's first line and a prompt's
+  first sentence end before a secret they would cut. Every cloud request redacts the stored chunks one by one, so a
+  secret kept whole in a chunk is one its detector finds there.
 - In `block` mode a chunk with a secret is replaced by the stub `[withheld: <detector names>]`, and its turn still counts
   as captured. One secret must not stop a session's capture, and nothing with a secret is stored.
 - Paths in `capture_state.transcript_path` are not redacted. They exist only locally, are needed to read the file, and are
