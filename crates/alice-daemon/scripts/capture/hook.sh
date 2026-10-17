@@ -575,9 +575,6 @@ capture_one() {
     return 0
   fi
   read_state "$co_st" || :
-  if [ -n "$s_corrupt" ]; then
-    log "session $3: the state file held a corrupt value ($s_corrupt); asking the server where to resume"
-  fi
   s_session=$3 s_sub=$4 s_path=$5 s_cwd=$6
   if [ -n "$s_stopped" ]; then
     unlock
@@ -620,6 +617,12 @@ capture_one() {
   if [ ! -f "$s_path" ] || ! make_tmp; then
     unlock
     return 0
+  fi
+  # Said only here, where the uploads follow and the state is written again at the end: a
+  # stopped session (or a skipped event) neither asks the server nor repairs the file, so it
+  # would say it again on every event.
+  if [ -n "$s_corrupt" ]; then
+    log "session $3: the state file held a corrupt value ($s_corrupt); asking the server where to resume"
   fi
   # SessionEnd closes a trailing turn the server waited on, so it may send once past a hold.
   co_bypass=
@@ -958,21 +961,25 @@ verify_script() {
 # outlive a KILL.
 #
 # The watchdog is a subshell that sleeps one second at a time and writes each sleep's pid into a
-# sentinel file. The caller, once it has reaped the command, stops the watchdog with KILL (a
-# trapped TERM can be lost), kills its current sleep and removes the sentinel. The watchdog
-# signals the command only while the sentinel exists and the command is still there, so it never
-# signals a pid that was reaped and reused. When the caller is killed, the watchdog still ends the
-# command at the limit, then removes the sentinel and exits.
+# tick file in this worker's temporary directory (cleanup removes it with the directory, so a
+# caller that a TERM ends together with its watchdog leaves nothing in $TMPDIR). The caller, right
+# after it has reaped the command, stops the watchdog with KILL (a trapped TERM can be lost), then
+# kills the sleep the tick file names. That KILL is the only guard against signalling a reaped
+# pid that was reused: the watchdog signals the command while `kill -0` finds it, so only the
+# instant between the reap and the KILL is open. A sleep the watchdog forked but had not recorded
+# yet when it was killed outlives the call by under a second. When the caller is killed, the
+# watchdog still ends the command at the limit, then exits.
 bounded() {
   bd_limit=$1
   shift
-  bd_flag=$(mktemp "${TMPDIR:-/tmp}/alice-bounded.XXXXXX" 2>/dev/null) || bd_flag=
+  bd_tick=
+  if [ -n "$tmpd" ] && { : >"$tmpd/bounded"; } 2>/dev/null; then bd_tick="$tmpd/bounded"; fi
   "$@" </dev/null &
   bd_pid=$!
   (
     trap - EXIT HUP INT TERM
     bd_n=0
-    while { [ -z "$bd_flag" ] || [ -f "$bd_flag" ]; } && kill -0 "$bd_pid" 2>/dev/null; do
+    while kill -0 "$bd_pid" 2>/dev/null; do
       if [ "$bd_n" -eq "$bd_limit" ]; then
         kill -TERM "$bd_pid" 2>/dev/null
       elif [ "$bd_n" -ge $((bd_limit + 2)) ]; then
@@ -980,21 +987,22 @@ bounded() {
         break
       fi
       sleep 1 &
-      if [ -n "$bd_flag" ]; then printf '%s\n' "$!" >"$bd_flag" 2>/dev/null; fi
+      # Only into the file the caller made: once cleanup has removed the directory, nothing is
+      # written back into it.
+      if [ -n "$bd_tick" ] && [ -f "$bd_tick" ]; then printf '%s\n' "$!" >"$bd_tick"; fi
       wait "$!"
       bd_n=$((bd_n + 1))
     done
-    if [ -n "$bd_flag" ]; then rm -f "$bd_flag"; fi
   ) </dev/null >/dev/null 2>&1 &
   bd_dog=$!
   wait "$bd_pid"
   bd_rc=$?
   kill -KILL "$bd_dog" 2>/dev/null
   wait "$bd_dog" 2>/dev/null
-  if [ -n "$bd_flag" ]; then
-    bd_tick=$(cat "$bd_flag" 2>/dev/null)
-    case $bd_tick in '' | *[!0-9]*) ;; *) kill -KILL "$bd_tick" 2>/dev/null ;; esac
-    rm -f "$bd_flag"
+  if [ -n "$bd_tick" ]; then
+    bd_sleep=$(cat "$bd_tick" 2>/dev/null)
+    case $bd_sleep in '' | *[!0-9]*) ;; *) kill -KILL "$bd_sleep" 2>/dev/null ;; esac
+    rm -f "$bd_tick"
   fi
   return "$bd_rc"
 }

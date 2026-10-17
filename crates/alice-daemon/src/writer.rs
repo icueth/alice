@@ -566,6 +566,26 @@ impl WriterHandle {
     }
 }
 
+/// The ledger row a judge call names: its own when it is one of `LEDGER_ROWS`, else the judge's,
+/// so no spend lands on a row the day's total does not count. An unknown name is a consumer that
+/// was never given a row: a debug build stops on it, and a release build warns, so it cannot be
+/// billed to the judge unnoticed.
+fn ledger_row(provider: &str) -> &'static str {
+    use alice_core::judge::jev::{LEDGER_JUDGE, LEDGER_ROWS};
+    let row = LEDGER_ROWS.into_iter().find(|r| *r == provider);
+    if row.is_none() {
+        tracing::warn!(
+            provider,
+            "a judge call names a ledger row the day's total does not count; it is billed to the judge's row"
+        );
+    }
+    debug_assert!(
+        row.is_some(),
+        "unknown ledger row {provider:?}: give the consumer a row in LEDGER_ROWS"
+    );
+    row.unwrap_or(LEDGER_JUDGE)
+}
+
 fn resolve(conn: &Connection, choice: &ProjectChoice) -> Result<ResolvedProject> {
     match choice {
         ProjectChoice::Slug(s) => projects::resolve_slug(conn, s)?.ok_or_else(|| {
@@ -2030,23 +2050,16 @@ fn apply(
             WriteOutcome::Done
         }
         WriteOp::JudgeCall(c) => {
-            use alice_core::judge::jev::{LEDGER_DISTILL, LEDGER_JUDGE};
+            use alice_core::judge::jev::LEDGER_JUDGE;
             // One cache for every consumer: an answer is an answer, whoever asked.
             if c.cacheable {
                 judge_store::cache_put(conn, &c.hash, LEDGER_JUDGE, &c.model, &c.response_json)?;
             }
-            // The consumer's ledger row. Anything but distillation's is billed to the judge's
-            // own row, so no spend lands on a row the day's total does not count.
-            let provider = if c.provider == LEDGER_DISTILL {
-                LEDGER_DISTILL
-            } else {
-                LEDGER_JUDGE
-            };
             judge_store::add_cost(
                 conn,
                 &judge_store::CostDelta {
                     day: c.day,
-                    provider: provider.into(),
+                    provider: ledger_row(&c.provider).into(),
                     calls: 1,
                     input_tokens: c.input_tokens,
                     output_tokens: c.output_tokens,
@@ -5740,7 +5753,7 @@ mod tests {
         for c in [
             call("h1", LEDGER_JUDGE, 0.25),
             call("h2", LEDGER_DISTILL, 0.5),
-            call("h3", "bogus", 1.0),
+            call("h3", LEDGER_JUDGE, 1.0),
         ] {
             f.h.submit_blocking(WriteOp::JudgeCall(c)).unwrap();
         }
@@ -5751,11 +5764,7 @@ mod tests {
             (f.read(&col("calls"), [p]), f.read(&col("usd"), [p]))
         };
         assert_eq!(row(LEDGER_DISTILL), (1, 0.5));
-        assert_eq!(
-            row(LEDGER_JUDGE),
-            (2, 1.25),
-            "the unknown row went to the judge's"
-        );
+        assert_eq!(row(LEDGER_JUDGE), (2, 1.25));
         assert_eq!(f.read::<i64>("SELECT count(*) FROM cost_ledger", []), 2);
         assert_eq!(
             f.read::<i64>(
@@ -5764,6 +5773,25 @@ mod tests {
             ),
             3
         );
+    }
+
+    /// Task 9 minor (pre-final wave): each known row bills itself. An unknown one (a consumer
+    /// never given a row) still goes to the judge's row in a release build, with a warning; a
+    /// debug build, which every test runs, stops on it.
+    #[test]
+    fn a_ledger_row_bills_itself_and_an_unknown_one_is_not_silent() {
+        use alice_core::judge::jev::{LEDGER_JUDGE, LEDGER_ROWS};
+        for r in LEDGER_ROWS {
+            assert_eq!(ledger_row(r), r);
+        }
+        let unknown = std::panic::catch_unwind(|| ledger_row("bogus"));
+        if cfg!(debug_assertions) {
+            let e = unknown.expect_err("a debug build stops on an unknown row");
+            let msg = e.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(msg.contains("unknown ledger row \"bogus\""), "{msg}");
+        } else {
+            assert_eq!(unknown.unwrap(), LEDGER_JUDGE);
+        }
     }
 
     /// Task 14: `SetMeta` upserts, `PurgeMemories` takes only trashed memories (the others are

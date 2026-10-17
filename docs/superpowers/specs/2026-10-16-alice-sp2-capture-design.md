@@ -672,9 +672,13 @@ self-update (step 8) compares with it, so the hooks are written down in one plac
 
      The 20 s (and the 120 s of the `claude` calls below) are enforced by a watchdog, since macOS has no `timeout`: TERM
      at the limit, then KILL 2 s later when TERM did not end the command (a script's own TERM trap waits for its
-     foreground command). The watchdog sleeps one second at a time. The caller stops it with KILL and kills its sleep,
-     so none outlives the call, and it signals only while a sentinel file the caller removes exists, so never a reused
-     pid. A child the command started can outlive the KILL.
+     foreground command). The watchdog sleeps one second at a time and records each sleep's pid in a file in the
+     worker's temporary directory, which the worker's cleanup removes, so a worker that a TERM ends together with its
+     watchdog leaves nothing in `$TMPDIR` (a KILL, which no trap sees, leaves that directory). Right after the caller
+     reaps the command, it stops the watchdog with KILL and kills the recorded sleep. That KILL is the guard against
+     signalling a reused pid: only the instant between the reap and the KILL is open. One `sleep 1` the watchdog had not
+     recorded yet can outlive the call by under a second. A worker killed mid-wait leaves its watchdog to end the
+     command at the limit. A child the command started can outlive the KILL.
    - **Replacing.** The download is a temporary file beside the script, `chmod 700`, then `mv`. A running worker keeps
      reading the old file. The log says `capture hook updated <old> → <new>`. Any failure (curl, a check, the `mv`) keeps
      the installed script byte for byte and logs one line. No log line holds the token or the script's text. A script

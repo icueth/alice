@@ -3650,7 +3650,8 @@ printf 'hits %s of %s\n' "$hit" "$n"
 /// Fix round 2, finding 3: `bounded` returns as soon as its command ends (under dash the old
 /// watchdog could miss its TERM and hold the caller for the whole limit), leaves no `sleep`
 /// behind, and still ends a command that outlives the limit. Every `sleep` goes through a shim
-/// that records its pid.
+/// that records its pid. The calls run, as in the worker, with its temporary directory, where
+/// the watchdog keeps its tick file.
 #[test]
 fn bounded_returns_promptly_and_leaves_no_sleep() {
     let env = Env::new();
@@ -3668,6 +3669,7 @@ fn bounded_returns_promptly_and_leaves_no_sleep() {
     let r = with_hook_lib(
         &env,
         r#"
+make_tmp || exit 1
 i=0
 while [ "$i" -lt 20 ]; do
   i=$((i + 1))
@@ -3782,6 +3784,132 @@ async fn a_corrupt_state_offset_resyncs_instead_of_aborting() {
         .filter(|l| l.contains("state file"))
         .collect();
     assert_eq!(fresh.len(), 1, "{log}");
+}
+
+// ---- Pre-final wave: the parked minors of the second re-review ----
+
+/// A stopped session whose state file holds a corrupt offset sends nothing and repairs nothing,
+/// so the corrupt-value line (which says the server is asked) must not come back on every
+/// event: it is said at most once, where the uploads follow.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_session_with_a_corrupt_offset_logs_at_most_once() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let mut sess = Session::new(&env, "corrupt-stopped", &env.root.join("work"));
+    stop_once(&env, &mut sess, 1);
+    assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
+    let state = format!(
+        "08 {}\nsession corrupt-stopped\ncwd {}\nseen {}\nstopped 99999999\n",
+        sess.path.display(),
+        sess.cwd.display(),
+        now_secs()
+    );
+    std::fs::write(env.state_file(&sess.key()), &state).unwrap();
+    let sent = uploads(&s, "corrupt-stopped").len();
+    let logged = env.log().lines().count();
+    stop_once(&env, &mut sess, 2);
+    stop_once(&env, &mut sess, 3);
+    let log = env.log();
+    let fresh: Vec<&str> = log
+        .lines()
+        .skip(logged)
+        .filter(|l| l.contains("state file"))
+        .collect();
+    assert!(fresh.len() <= 1, "{log}");
+    // Stopped: nothing was sent, and the state stays as it was.
+    assert_eq!(uploads(&s, "corrupt-stopped").len(), sent, "{log}");
+    assert_eq!(turns_of(&t.home, &uri("corrupt-stopped")), 1);
+    assert!(
+        read(&env.state_file(&sess.key())).contains("stopped 99999999"),
+        "{log}"
+    );
+}
+
+/// `bounded` keeps its watchdog's tick file in the worker's own temporary directory, so a worker
+/// that one TERM to its process group ends together with its watchdog (as when the agent's hook
+/// process group is killed) leaves nothing in `$TMPDIR`: its cleanup removes the directory, tick
+/// file and all. The old sentinel, `alice-bounded.*` in `$TMPDIR` itself, was left behind.
+#[test]
+fn a_worker_ended_with_its_watchdog_leaves_nothing_in_tmpdir() {
+    let env = Env::new();
+    let pids = env.home.join("sleep-pids");
+    write_mode(
+        &env.bin.join("sleep"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nexec /bin/sleep \"$@\"\n",
+            pids.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
+    let lib = hook_lib(&env);
+    std::fs::create_dir_all(env.alice().join("state")).unwrap();
+    let named = env.home.join("tmpd");
+    // The hook's own traps stay: TERM exits 143, and EXIT runs cleanup.
+    let mut c = env.command(&env.sh());
+    c.arg("-c")
+        .arg(format!(
+            ". '{}'\nmake_tmp || exit 1\nprintf '%s\\n' \"$tmpd\" >'{}'\nbounded 30 sleep 30\n",
+            lib.display(),
+            named.display()
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and touches no memory of the parent.
+    unsafe {
+        c.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = c.spawn().unwrap();
+    let group = child.id() as i32;
+    let sleeps = || -> Vec<i32> {
+        std::fs::read_to_string(&pids)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    };
+    // The command's `sleep 30` and the watchdog's first `sleep 1` are running.
+    let started = Instant::now();
+    while sleeps().len() < 2 {
+        if started.elapsed() > Duration::from_secs(20) {
+            // SAFETY: a plain signal to the process group this test started.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+            panic!("bounded did not start its command and its watchdog");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let tmpd = PathBuf::from(read(&named).trim());
+    let during = env.tmp_entries();
+    let tick = tmpd.join("bounded").exists();
+    // SAFETY: one signal to the process group of the child this test started.
+    unsafe { libc::kill(-group, libc::SIGTERM) };
+    let ended = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if ended.elapsed() > Duration::from_secs(10) {
+            // SAFETY: as above.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+            panic!("the worker outlived its TERM");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Anything of the group still there (nothing, when the TERM did its work).
+    // SAFETY: as above.
+    unsafe { libc::kill(-group, libc::SIGKILL) };
+    assert!(!status.success(), "{status:?}");
+    assert_eq!(env.tmp_entries(), Vec::<String>::new(), "left in $TMPDIR");
+    // While it ran, the worker's directory was all it had in $TMPDIR, the tick file inside it.
+    let name = tmpd.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(during, vec![name], "in $TMPDIR while bounded ran");
+    assert!(tick, "the tick file is in the worker's directory");
 }
 
 // ---- Status and uninstall ----
