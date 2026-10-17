@@ -260,9 +260,9 @@ distilled, newest first. Older ones, and sessions captured by a backfill, are di
 
 ### What it does
 
-- **When.** A session is distilled when it ends (`SessionEnd`, or 24 hours without any event), when it is compacted
-  (`PreCompact`), when it has been quiet for `distill.idle_minutes` (default 15), or when you run
-  `alice capture distill <session-id>`.
+- **When.** A session is distilled when it ends (`SessionEnd`, or 24 hours without any event when it captured something
+  in the last 8 days; an older one waits for you to ask), when it is compacted (`PreCompact`), when it has been quiet
+  for `distill.idle_minutes` (default 15), or when you run `alice capture distill <session-id>`.
 - **Extractive.** Jev answers choice questions only, so a distilled memory is **a passage of your session**, chosen and
   classified by Jev, never new text. Alice proposes up to 40 passages per run: compaction summaries first, then each
   turn's concluding text, then statements you made, then subagent reports. Passages that hold `[withheld:`, are mostly a

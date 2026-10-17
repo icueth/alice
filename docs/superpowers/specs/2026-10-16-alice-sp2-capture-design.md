@@ -804,9 +804,10 @@ A **run** covers the source's chunks from `distill_ord` on, plus the new chunks 
 
 - the session ended (`SessionEnd`, or swept as stale after 24 h). The stale end is the local sweep's, with a final pass
   that closes the trailing turn, or without one for a source it cannot read (no transcript path, or the file is gone),
-  and on a server tenant the distill worker's. Without a final pass, the end makes the session due only when it, or a
-  subagent of it, captured within the 7 days before it went stale (Task 11b): an older one waits for `alice capture
-  distill`, so turning distillation on (or adopting a database) makes no backlog;
+  and on a server tenant the distill worker's. Any stale end makes the session due only when it, or a subagent of it,
+  captured within the last 7 days plus the stale age (8 days by default; for a final pass, the session's last capture
+  before that pass counts). An older one waits for `alice capture distill`, so a long downtime, a restored backup,
+  turning distillation on or adopting a database makes no backlog (Task 11b and its review);
 - a `PreCompact` arrived;
 - it has been quiet for `distill.idle_minutes` (default 15) and holds at least one undistilled complete turn; or
 - someone runs `alice capture distill <session>`.
@@ -975,6 +976,11 @@ five nearest plus title matches, older and active), and the newcomer's relations
 - **A denied source project is left out.** None of its memories is read into the comparison, so none is sent, and the
   comparison with `global`'s memories still goes to Jev. Comparing them through the heuristic only would decide nothing
   either: it compares memories of one project only.
+- **Across projects, a match only ever settles as a duplicate or a link** (Task 11b review). A duplicate of a source
+  project's memory, or an update of an explicit one there, trashes the `global` newcomer as its duplicate, so a
+  user-wide preference the project already holds lives on in the project only. An update of a distilled memory there
+  is linked `relates_to` and never supersedes it: a user-wide memory never retires a project's own rule, and the
+  outcome does not depend on which of the two came first (a project's newcomer never meets `global`).
 - An agent's or a person's memory in `global` meets `global`'s memories only, as before.
 
 **Hidden until judged.** Today `pending` and `active` are one state for search and the briefing. A distilled memory is
@@ -990,7 +996,7 @@ and `get_memory` by id still returns it.
 |---|---|---|
 | duplicate ≥ auto | newcomer trashed as `duplicate_of` the older | the same |
 | duplicate between review and auto (would be a `merge` review) | review item | newcomer trashed as `duplicate_of`, no review item |
-| updates ≥ auto | newcomer supersedes the older | the same if the older one is also distilled. If the older one was written by an agent or a person (or imported), the newcomer is trashed as `duplicate_of` it, no review item (Task 11b) |
+| updates ≥ auto | newcomer supersedes the older | the same if the older one is also distilled and in the same project (in another project, a `relates_to` link). If the older one was written by an agent or a person (or imported), the newcomer is trashed as `duplicate_of` it, no review item (Task 11b) |
 | updates between review and auto | `supersede` review | of a distilled memory: `relates_to` link, no review item. Of an agent's or a person's: trashed as `duplicate_of` it, no review item (Task 11b) |
 | contradicts ≥ review | link plus `contradiction` review | `contradicts` link, no review item |
 | heuristic stand-in (Jev unreachable) | review-only suggestions | nothing; the memory waits for the judge's retry |
@@ -999,7 +1005,8 @@ Only the strongest relation to each memory counts (an update that a contradictio
 link), and the best match settles it: the newcomer goes to the trash as the duplicate of the memory it duplicates, or of
 the explicit memory it updates, with the highest probability at or above `judge.review_threshold`, and nothing else is
 applied. **A distilled update of an explicit memory is its duplicate (Task 11b).** It is a near-copy of what an agent or
-a person saved, with more detail at most, and a distilled memory never replaces an explicit one (R19). Such updates,
+a person saved, with more detail or a newer value; the explicit memory is kept, and the passage stays in the raw
+capture: a distilled memory never replaces an explicit one (R19). Such updates,
 kept as linked pairs, and preferences filed under `global` were the two ways the Task 13 evaluation found for a
 distilled copy of a saved memory to stay live. The heuristic and its stand-in still apply no update (Task 11's R2): the
 heuristic applies only the same text, and a stand-in nothing.
@@ -1309,7 +1316,7 @@ SP2 needs these from `deploy/server/alice-server` (pane 3). SP2 does not edit th
 | Daemon down when a hook fires | The notify is spooled and the daemon is started detached. The hook exits 0 within its budget, and the drained notify triggers a pass from the cursor |
 | Daemon killed mid-pass | The cursor and turn keys commit with each turn's last slice. The next pass re-renders the open turn identically, and `(source, ord)` drops the repeats |
 | Transcript lags at `Stop` | 1.5 s settle (2 s in the tenant script). A message that still arrives late is captured at the next pass |
-| Agent crashes (no `SessionEnd`) | The sweep marks the source ended after 24 h, makes a final pass and makes it due for distillation. A source it cannot read (no transcript path, or the file is gone) is ended without a final pass, as a server tenant's distill worker ends a source with no capture for 24 h; that end makes the session due when it captured within the 7 days before it went stale, and an older one waits for `alice capture distill` (Task 11b) |
+| Agent crashes (no `SessionEnd`) | The sweep marks the source ended after 24 h and makes a final pass. A source it cannot read (no transcript path, or the file is gone) is ended without a final pass, as a server tenant's distill worker ends a source with no capture for 24 h. Any of these stale ends makes the session due for distillation when it captured within the last 7 days plus the stale age (8 days by default); an older one waits for `alice capture distill`, so a long downtime or a restored backup makes no backlog (Task 11b and its review) |
 | Unknown or malformed line | Skipped and counted. A turn with only skipped lines leaves no chunk. `alice doctor` warns when a reader skipped a large share of a file (format drift) |
 | Line over 4 MiB | Skipped with a stub in its turn |
 | Transcript file replaced or truncated | The cursor resets to 0; turn dedupe skips stored turns |

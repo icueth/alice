@@ -3390,6 +3390,72 @@ async fn the_tenant_stale_end_makes_a_recent_session_due() {
     a_stale_end_makes_a_recent_session_due(true).await;
 }
 
+/// Task 11b review (M1): the sweep's final pass of a stale transcript is windowed too. It makes
+/// the session due only when the session captured within the last 7 days plus the stale age (8
+/// days by default), so a long downtime or a restored backup makes no backlog. A session last
+/// captured 2 days ago is distilled as a closed one; one last captured 30 days ago is ended by
+/// the same final pass but not marked. The quiet trigger is held off (a year of quiet).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweeps_final_pass_makes_only_a_recent_session_due() {
+    let mut d = Daemon::start(
+        Opts {
+            idle: Some(Duration::from_secs(365 * 24 * 3600)),
+            ..Opts::jev()
+        },
+        DistillScript::new(ANSWERS),
+    );
+    let mut paths = Vec::new();
+    for s in ["fr1", "fo1"] {
+        let mut t = one_decision(s);
+        t.prompt(
+            &format!("{s}-p2"),
+            "Where do we stand with the cache work right now?",
+        )
+        .reply(&format!("{s}-a2"), HANDOFF);
+        let path = d.write_transcript(s, &t);
+        d.notify("shop", s, &path, "stop").await;
+        until("the session is captured", || {
+            d.has_state(&uri(s)) && d.state(&uri(s)).byte_offset == t.len() as i64
+        })
+        .await;
+        paths.push(path);
+    }
+    d.restart_with(&format!(
+        "UPDATE capture_state SET last_capture_at = '{0}', created_at = '{0}' WHERE session_id = 'fr1';
+         UPDATE capture_state SET last_capture_at = '{1}', created_at = '{1}' WHERE session_id = 'fo1';",
+        hours_ago(48),
+        hours_ago(30 * 24)
+    ))
+    .await;
+    // The transcripts go stale: the sweep makes a final pass of each and ends it.
+    age(&paths[0], Duration::from_secs(48 * 3600));
+    age(&paths[1], Duration::from_secs(30 * 24 * 3600));
+    until("the sweep ends both sessions", || {
+        d.state(&uri("fr1")).ended && d.state(&uri("fo1")).ended
+    })
+    .await;
+    settle().await;
+    let recent = d.state(&uri("fr1"));
+    assert!(
+        matches!(recent.state.as_str(), "due" | "done"),
+        "the final pass made the recent session due: {recent:?}"
+    );
+    until("the recent session is distilled", || {
+        d.state(&uri("fr1")).state == "done"
+    })
+    .await;
+    let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, ["decision", "handoff"]);
+    let old = d.state(&uri("fo1"));
+    assert_eq!(
+        (old.state.as_str(), old.distill_ord),
+        ("idle", 0),
+        "a month-old session waits to be asked: {old:?}"
+    );
+    assert_eq!(d.script.distill_calls(), 1, "one run, the recent session's");
+    d.shutdown();
+}
+
 /// Task 11b (pane 2's note): `alice capture distill` on a backfilled session distils its
 /// subagents with it, and they leave `skipped_backfill` as the session does, so `alice capture
 /// status` no longer shows them waiting to be asked.

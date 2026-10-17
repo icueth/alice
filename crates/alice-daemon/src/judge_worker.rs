@@ -20,7 +20,7 @@ use crate::writer::{Judgement, WriteOp, WriterHandle};
 use alice_core::embed::cosine;
 use alice_core::error::Result;
 use alice_core::judge::heuristic::HeuristicJudge;
-use alice_core::judge::pipeline::{Thresholds, decide};
+use alice_core::judge::pipeline::{JudgeAction, Thresholds, decide};
 use alice_core::judge::text::title_similarity;
 use alice_core::judge::{Distribution, Judge, JudgeError, JudgeMemory, ProjectOption, Relation};
 use alice_core::model::{Kind, Memory, Origin, Status};
@@ -587,6 +587,22 @@ pub fn judge_one(cfg: &JudgeWorkerConfig, item: &PendingJudgement) -> Result<Opt
     // A heuristic that answers because the judge could not is only trusted to suggest.
     let review_only = provider == "heuristic" && outcome.retry;
     let mut decided = decide(&me, &relations, &t, &provider, review_only);
+    // Task 11b review (I1): a match in another project (a distilled memory in `global` meets its
+    // source project's) only ever settles as a duplicate or a link. An update never supersedes
+    // across projects: a user-wide memory never retires a project's own, and which came first
+    // would decide it (a project's newcomer never meets `global`).
+    for a in &mut decided.actions {
+        if let JudgeAction::Supersedes { old, p } = a
+            && existing
+                .iter()
+                .any(|e| e.id == *old && e.project != me.project)
+        {
+            *a = JudgeAction::RelatesTo {
+                other: std::mem::take(old),
+                p: *p,
+            };
+        }
+    }
 
     let kind = (!item.kind_explicit && model && !outcome.model_down)
         .then(|| classify(&judge, &me, &t, &mut outcome, &item.id))
@@ -1148,50 +1164,64 @@ mod tests {
         }
     }
 
-    /// Task 11b (a): a distilled memory routed to `global` (a preference of the user's) is also
-    /// compared with the older live memories of its source project, the project of its
-    /// provenance chunks, or once raw retention removed them, of its author session's capture
-    /// source. A source project the cloud policy denies is left out: none of its memories is
-    /// read into the comparison or sent, and the comparison with the `global` ones still goes to
-    /// Jev. An agent's memory in `global` meets no other project.
-    #[test]
-    fn a_global_distilled_memory_meets_its_source_project_unless_denied() {
-        use alice_core::project::ProjectRef;
-        let dir = tempfile::tempdir().unwrap();
-        let home = AliceHome::new(dir.path().to_path_buf());
-        home.ensure_dirs().unwrap();
-        let conn = alice_core::store::open_writer(&home.db()).unwrap();
-        let shop = projects::upsert_project(
-            &conn,
-            &ProjectRef {
-                key: "k/shop".into(),
-                slug: "shop".into(),
-                name: "shop".into(),
-                root: None,
-                remote: None,
-            },
-        )
-        .unwrap();
-        // The session the memory was distilled from: a capture source of `shop` and one chunk.
-        let now = now_rfc3339();
-        conn.execute_batch(&format!(
-            "INSERT INTO sources (id, project_id, type, agent, uri, session_id, created_at)
-               VALUES ('SRC1', '{p}', 'session', 'claude-code', 'claude-code:session:S1', 'S1', '{now}');
-             INSERT INTO capture_state (source_id, agent, session_id, created_at)
-               VALUES ('SRC1', 'claude-code', 'S1', '{now}');
-             INSERT INTO chunks (id, source_id, project_id, ord, text, content_hash, created_at, embed_state)
-               VALUES ('CH1', 'SRC1', '{p}', 0, '[assistant] British English from now on', 'h1', '{now}', 'done');",
-            p = shop.id
-        ))
-        .unwrap();
-        let (wake_tx, _wake_rx) = crossbeam_channel::bounded(1);
-        let (writer, _t) = spawn_writer(conn, "dev".into(), wake_tx);
-        let settings = SettingsHandle::load_with_env(&home, Vec::new());
-        let readers = Arc::new(ReaderPool::new(home.db(), 2));
-        let index = Arc::new(VectorIndex::new(16).unwrap());
-        let remember = |text: &str, project: &str, origin: Origin| {
+    /// Task 11b: a store with a project `shop` and a captured session `S1` of it holding one
+    /// chunk, and a live vector index in which every memory has the same vector.
+    struct ShopFixture {
+        _dir: tempfile::TempDir,
+        home: AliceHome,
+        writer: WriterHandle,
+        settings: Arc<SettingsHandle>,
+        readers: Arc<ReaderPool>,
+        index: Arc<VectorIndex>,
+    }
+
+    impl ShopFixture {
+        fn new() -> Self {
+            use alice_core::project::ProjectRef;
+            let dir = tempfile::tempdir().unwrap();
+            let home = AliceHome::new(dir.path().to_path_buf());
+            home.ensure_dirs().unwrap();
+            let conn = alice_core::store::open_writer(&home.db()).unwrap();
+            let shop = projects::upsert_project(
+                &conn,
+                &ProjectRef {
+                    key: "k/shop".into(),
+                    slug: "shop".into(),
+                    name: "shop".into(),
+                    root: None,
+                    remote: None,
+                },
+            )
+            .unwrap();
+            let now = now_rfc3339();
+            conn.execute_batch(&format!(
+                "INSERT INTO sources (id, project_id, type, agent, uri, session_id, created_at)
+                   VALUES ('SRC1', '{p}', 'session', 'claude-code', 'claude-code:session:S1', 'S1', '{now}');
+                 INSERT INTO capture_state (source_id, agent, session_id, created_at)
+                   VALUES ('SRC1', 'claude-code', 'S1', '{now}');
+                 INSERT INTO chunks (id, source_id, project_id, ord, text, content_hash, created_at, embed_state)
+                   VALUES ('CH1', 'SRC1', '{p}', 0, '[assistant] a preference', 'h1', '{now}', 'done');",
+                p = shop.id
+            ))
+            .unwrap();
+            let (wake_tx, _wake_rx) = crossbeam_channel::bounded(1);
+            let (writer, _t) = spawn_writer(conn, "dev".into(), wake_tx);
+            ShopFixture {
+                settings: SettingsHandle::load_with_env(&home, Vec::new()),
+                readers: Arc::new(ReaderPool::new(home.db(), 2)),
+                index: Arc::new(VectorIndex::new(16).unwrap()),
+                writer,
+                home,
+                _dir: dir,
+            }
+        }
+
+        /// A preference in `project`, written by session `S1`'s agent; a distilled one has the
+        /// session's chunk as its provenance.
+        fn remember(&self, text: &str, project: &str, origin: Origin) -> (String, i64) {
             let distilled = origin == Origin::Distill;
-            match writer
+            match self
+                .writer
                 .submit_blocking(WriteOp::Remember {
                     input: NewMemoryInput {
                         content: text.into(),
@@ -1216,16 +1246,18 @@ mod tests {
                 WriteOutcome::Remembered(InsertOutcome::New { id, seq }, _) => (id, seq),
                 other => panic!("{other:?}"),
             }
-        };
-        // Every memory gets the same vector, in the store and in the live index.
-        let embed_all = || {
-            let items = readers
+        }
+
+        /// Every memory waiting gets the same vector, in the store and in the live index.
+        fn embed_all(&self) {
+            let items = self
+                .readers
                 .with(|c| alice_core::store::embeddings::pending(c, 10))
                 .unwrap();
             for i in &items {
-                index.upsert(i.key, &[1.0; 16]).unwrap();
+                self.index.upsert(i.key, &[1.0; 16]).unwrap();
             }
-            writer
+            self.writer
                 .submit_blocking(WriteOp::StoreEmbeddings {
                     model: "m".into(),
                     items: items
@@ -1234,9 +1266,12 @@ mod tests {
                         .collect(),
                 })
                 .unwrap();
-        };
-        let activate = |id: &str, seq: i64| {
-            let (stamp, updated_at) = readers
+        }
+
+        /// The memory becomes live, as a judgement that decides nothing leaves it.
+        fn activate(&self, id: &str, seq: i64) {
+            let (stamp, updated_at) = self
+                .readers
                 .with(|c| {
                     Ok(c.query_row(
                         "SELECT content_hash, updated_at FROM memories WHERE seq = ?1",
@@ -1245,7 +1280,7 @@ mod tests {
                     )?)
                 })
                 .unwrap();
-            writer
+            self.writer
                 .submit_blocking(WriteOp::ApplyJudgement(Judgement {
                     seq,
                     id: id.into(),
@@ -1255,40 +1290,26 @@ mod tests {
                     ..Default::default()
                 }))
                 .unwrap();
-        };
-        let older = [
-            remember(
-                "Dates are written as YYYY-MM-DD everywhere.",
-                "global",
-                Origin::Agent,
-            ),
-            remember(
-                "Always answer in British English (the agent's own copy).",
-                "shop",
-                Origin::Agent,
-            ),
-        ];
-        embed_all();
-        for (id, seq) in &older {
-            activate(id, *seq);
         }
-        let (in_global, in_shop) = (older[0].0.clone(), older[1].0.clone());
-        let (_, new_seq) = remember(
-            "From now on I will always answer in British English in every project.",
-            "global",
-            Origin::Distill,
-        );
-        let (_, agent_seq) = remember(
-            "Commit messages are written in the imperative mood.",
-            "global",
-            Origin::Agent,
-        );
-        embed_all();
-        let items = readers.with(|c| pending(c, BATCH)).unwrap();
-        let item = |seq: i64| items.iter().find(|i| i.seq == seq).unwrap().clone();
 
-        let cfg = |denied: Vec<&'static str>| {
-            let transport = crate::judge_http::ScriptedJev::new(("unrelated", 1.0));
+        /// The judge queue's entry for memory `seq`.
+        fn item(&self, seq: i64) -> PendingJudgement {
+            self.readers
+                .with(|c| pending(c, BATCH))
+                .unwrap()
+                .into_iter()
+                .find(|i| i.seq == seq)
+                .unwrap()
+        }
+
+        /// The worker with Jev answering `relation` to every comparison, behind a cloud policy
+        /// that denies the projects in `denied`; and Jev's transport.
+        fn cfg(
+            &self,
+            relation: (&'static str, f64),
+            denied: Vec<&'static str>,
+        ) -> (JudgeWorkerConfig, Arc<crate::judge_http::ScriptedJev>) {
+            let transport = crate::judge_http::ScriptedJev::new(relation);
             let jev = alice_core::judge::jev::JevJudge::new(
                 alice_core::judge::jev::JevConfig {
                     endpoint: "https://api.typesafe.ai/v1/systemone".into(),
@@ -1312,13 +1333,13 @@ mod tests {
                 ),
             )
             .with_sleeper(Arc::new(|_| {}));
-            let index = index.clone();
+            let index = self.index.clone();
             let cfg = JudgeWorkerConfig {
-                readers: readers.clone(),
-                writer: writer.clone(),
+                readers: self.readers.clone(),
+                writer: self.writer.clone(),
                 index: Arc::new(parking_lot::RwLock::new(Some(index.clone()))),
                 judge: Arc::new(Denying(Arc::new(jev), denied)),
-                settings: settings.clone(),
+                settings: self.settings.clone(),
                 redactors: Redactors::fixed(Default::default()),
                 model: Arc::new(move || ("m".to_string(), Some(index.clone()))),
                 wake: crossbeam_channel::never(),
@@ -1328,7 +1349,53 @@ mod tests {
                 applies: true,
             };
             (cfg, transport)
-        };
+        }
+    }
+
+    impl Drop for ShopFixture {
+        fn drop(&mut self) {
+            self.writer.send_nowait(WriteOp::Shutdown);
+        }
+    }
+
+    /// Task 11b (a): a distilled memory routed to `global` (a preference of the user's) is also
+    /// compared with the older live memories of its source project, the project of its
+    /// provenance chunks, or once raw retention removed them, of its author session's capture
+    /// source. A source project the cloud policy denies is left out: none of its memories is
+    /// read into the comparison or sent, and the comparison with the `global` ones still goes to
+    /// Jev. An agent's memory in `global` meets no other project.
+    #[test]
+    fn a_global_distilled_memory_meets_its_source_project_unless_denied() {
+        let f = ShopFixture::new();
+        let older = [
+            f.remember(
+                "Dates are written as YYYY-MM-DD everywhere.",
+                "global",
+                Origin::Agent,
+            ),
+            f.remember(
+                "Always answer in British English (the agent's own copy).",
+                "shop",
+                Origin::Agent,
+            ),
+        ];
+        f.embed_all();
+        for (id, seq) in &older {
+            f.activate(id, *seq);
+        }
+        let (in_global, in_shop) = (older[0].0.clone(), older[1].0.clone());
+        let (_, new_seq) = f.remember(
+            "From now on I will always answer in British English in every project.",
+            "global",
+            Origin::Distill,
+        );
+        let (_, agent_seq) = f.remember(
+            "Commit messages are written in the imperative mood.",
+            "global",
+            Origin::Agent,
+        );
+        f.embed_all();
+        let unrelated = ("unrelated", 1.0);
         let seen = |j: &Judgement| -> Vec<String> {
             let mut ids: Vec<String> = j.seen.iter().map(|(id, _)| id.clone()).collect();
             ids.sort();
@@ -1341,22 +1408,22 @@ mod tests {
         };
 
         // Allowed: the source project's memory is compared too, and sent.
-        let (allowed, sent) = cfg(vec![]);
-        let j = judge_one(&allowed, &item(new_seq)).unwrap().unwrap();
+        let (allowed, sent) = f.cfg(unrelated, vec![]);
+        let j = judge_one(&allowed, &f.item(new_seq)).unwrap().unwrap();
         assert_eq!(seen(&j), both, "{j:?}");
         assert!(sent.mentioned("the agent's own copy") && sent.mentioned("project shop"));
 
         // Denied: nothing of `shop` is read into the comparison or sent; `global` still is.
-        let (denied, sent) = cfg(vec!["shop"]);
-        let j = judge_one(&denied, &item(new_seq)).unwrap().unwrap();
+        let (denied, sent) = f.cfg(unrelated, vec!["shop"]);
+        let j = judge_one(&denied, &f.item(new_seq)).unwrap().unwrap();
         assert_eq!(seen(&j), std::slice::from_ref(&in_global), "{j:?}");
         assert!(!j.retry, "nothing failed: {j:?}");
         assert_eq!(sent.sent(), 1, "the comparison with `global` went to Jev");
         assert!(!sent.mentioned("the agent's own copy") && !sent.mentioned("project shop"));
 
         // An agent's memory in `global` stays in `global`.
-        let (allowed, _) = cfg(vec![]);
-        let j = judge_one(&allowed, &item(agent_seq)).unwrap().unwrap();
+        let (allowed, _) = f.cfg(unrelated, vec![]);
+        let j = judge_one(&allowed, &f.item(agent_seq)).unwrap().unwrap();
         assert_eq!(
             seen(&j),
             std::slice::from_ref(&in_global),
@@ -1365,14 +1432,102 @@ mod tests {
 
         // Raw retention removed the chunks (and their provenance): the author session's capture
         // source still names the project.
-        alice_core::store::open_writer(&home.db())
+        alice_core::store::open_writer(&f.home.db())
             .unwrap()
             .execute_batch("DELETE FROM provenance; DELETE FROM chunks;")
             .unwrap();
-        let (allowed, sent) = cfg(vec![]);
-        let j = judge_one(&allowed, &item(new_seq)).unwrap().unwrap();
+        let (allowed, sent) = f.cfg(unrelated, vec![]);
+        let j = judge_one(&allowed, &f.item(new_seq)).unwrap().unwrap();
         assert_eq!(seen(&j), both, "{j:?}");
         assert!(sent.mentioned("the agent's own copy"));
-        writer.send_nowait(WriteOp::Shutdown);
+    }
+
+    /// Task 11b review (I1): across projects a match only ever settles as a duplicate or a link.
+    /// A distilled memory in `global` that updates an older distilled memory of its source
+    /// project at the auto threshold does not supersede it: both stay, linked `relates_to`, and
+    /// nothing is asked. The same update of an older distilled memory in `global` still
+    /// supersedes it (Task 11).
+    #[test]
+    fn a_global_distilled_memory_never_supersedes_across_projects() {
+        let f = ShopFixture::new();
+        let (in_shop, shop_seq) = f.remember(
+            "Use npm in this repository: CI caches its store (the project's own rule).",
+            "shop",
+            Origin::Distill,
+        );
+        let (in_global, global_seq) = f.remember(
+            "The owner prefers npm for new projects.",
+            "global",
+            Origin::Distill,
+        );
+        f.embed_all();
+        f.activate(&in_shop, shop_seq);
+        f.activate(&in_global, global_seq);
+        let (new_id, new_seq) = f.remember(
+            "I prefer pnpm everywhere, in every project.",
+            "global",
+            Origin::Distill,
+        );
+        f.embed_all();
+        let (cfg, _) = f.cfg(("updates", 0.95), vec![]);
+        let j = judge_one(&cfg, &f.item(new_seq)).unwrap().unwrap();
+        let actions: Vec<(&str, &str)> = j
+            .actions
+            .iter()
+            .map(|a| match a {
+                JudgeAction::Supersedes { old, .. } => ("supersedes", old.as_str()),
+                JudgeAction::RelatesTo { other, .. } => ("relates_to", other.as_str()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                ("supersedes", in_global.as_str()),
+                ("relates_to", in_shop.as_str())
+            ],
+            "{j:?}"
+        );
+        assert!(j.reviews.is_empty(), "{j:?}");
+
+        f.writer
+            .submit_blocking(WriteOp::ApplyJudgement(j))
+            .unwrap();
+        // `(id, status)` of every memory, `(to, type)` of the newcomer's links, review items.
+        type Pairs = Vec<(String, String)>;
+        let (statuses, links, reviews): (Pairs, Pairs, i64) = f
+            .readers
+            .with(|c| {
+                let mut st = c.prepare("SELECT id, status FROM memories ORDER BY seq")?;
+                let statuses = st
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<std::result::Result<_, _>>()?;
+                let mut st =
+                    c.prepare("SELECT to_id, type FROM links WHERE from_id = ?1 ORDER BY type")?;
+                let links = st
+                    .query_map([&new_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<std::result::Result<_, _>>()?;
+                let reviews = c.query_row("SELECT count(*) FROM review_items", [], |r| r.get(0))?;
+                Ok((statuses, links, reviews))
+            })
+            .unwrap();
+        let status = |id: &str| -> &str {
+            statuses
+                .iter()
+                .find(|(i, _)| i == id)
+                .map(|(_, s)| s.as_str())
+                .unwrap()
+        };
+        assert_eq!(status(&in_shop), "active", "the project's own rule stays");
+        assert_eq!(status(&new_id), "active");
+        assert_eq!(status(&in_global), "superseded");
+        assert_eq!(
+            links,
+            [
+                (in_shop.clone(), "relates_to".to_string()),
+                (in_global.clone(), "supersedes".to_string()),
+            ]
+        );
+        assert_eq!(reviews, 0);
     }
 }

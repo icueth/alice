@@ -176,8 +176,10 @@ pub fn decide(
 /// [`decide`] for a distilled newcomer (SP2 spec §6.6): nothing is ever asked. Its best match at
 /// the review threshold settles it (it goes to the trash as its duplicate): a duplicate, or an
 /// explicit memory it updates (Task 11b: a near-copy of what an agent or a person saved, with
-/// more detail at most, never replaces it). An older distilled memory it updates is superseded
-/// from the auto threshold and linked `relates_to` below it; a contradiction is linked.
+/// more detail or a newer value, never replaces it; the explicit memory is kept, and the
+/// passage stays in the raw capture). An older distilled memory it updates is superseded
+/// from the auto threshold and linked `relates_to` below it (the judge worker links one of
+/// another project instead of superseding it); a contradiction is linked.
 /// The heuristic applies the same text only (never an update), and a heuristic standing in for
 /// the judge decides nothing: the memory waits for the judge's retry.
 fn decide_distilled(

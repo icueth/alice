@@ -5,8 +5,8 @@
 //! pipeline marks it), when it has been quiet for `distill.idle_minutes` with chunks not yet
 //! distilled (its own or a subagent's) and captured within the last week, or when someone asks
 //! (`alice capture distill`). On a server tenant, a source with no capture for 24 h is also
-//! marked ended, and due when it captured within the week before (tenants have no sweep; locally
-//! the capture sweep owns the stale end, Task 11b). The worker
+//! marked ended, and due when it captured within the last 7 days plus those 24 h (tenants have
+//! no sweep; locally the capture sweep owns the stale end, Task 11b). The worker
 //! wakes when the capture pipeline marks a source, and every [`TICK`]; due sources are run the
 //! most recently captured first.
 //!
@@ -93,8 +93,9 @@ pub const CLOUD_RECHECK: Duration = Duration::from_secs(5 * 60);
 /// server tenant only: locally the capture sweep owns the stale end.
 pub const STALE_AFTER: Duration = Duration::from_secs(24 * 3600);
 /// The quiet trigger marks only sessions that captured something within this long; an older
-/// backlog is distilled when asked (`alice capture distill`). Task 12 fix round 1. The stale end
-/// marks a session due only when it captured within this long before it went stale (Task 11b).
+/// backlog is distilled when asked (`alice capture distill`). Task 12 fix round 1. A stale end
+/// marks a session due only when it captured within this long plus the stale age (8 days by
+/// default), counted back from the end (Task 11b).
 pub const QUIET_RECENT: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Characters of a session's chunks read for one run: two runs' worth, so the turn the load
@@ -1052,11 +1053,12 @@ impl DistillCtl {
         let now = Utc::now();
         let s = self.ctx.settings.get();
         // Server tenants have no sweep: a source with no capture for 24 h is ended here, and the
-        // end makes its session due (spec §6.2, §10; Task 11b) when distillation is on and it
-        // captured within `QUIET_RECENT` before going stale: an older one is distilled only when
-        // asked, so turning distillation on makes no backlog. Locally the capture sweep owns the
-        // stale end: a final pass that closes the trailing turn and marks the session due, or for
-        // a source it cannot read, the same end as here.
+        // end makes its session due (spec §6.2, §10; Task 11b) when distillation is on and it,
+        // or a subagent of it, captured within the last 7 days (`QUIET_RECENT`) plus the stale
+        // age (8 days in all): an older one is distilled only when asked, so turning distillation
+        // on makes no backlog. Locally the capture sweep owns the stale end, with the same window:
+        // a final pass that closes the trailing turn and marks the session due, or for a source it
+        // cannot read, the same end as here.
         if self.ctx.settings.is_tenant() {
             let stale_at = now - since(STALE_AFTER);
             let stale_before = stamp(stale_at);
