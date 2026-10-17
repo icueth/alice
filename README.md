@@ -80,7 +80,7 @@ Alice runs where you choose: on your own machine, or as your own space (a "tenan
 | Platforms | macOS (Apple Silicon), Linux (glibc) | Any agent that speaks MCP over HTTP; capture on macOS and Linux |
 | Setup guide | [docs/setup-local.md](docs/setup-local.md) | [docs/setup-server.md](docs/setup-server.md) |
 
-Both setup guides are written for an agent: hand the file to Claude Code or Codex ("Read docs/setup-local.md and follow every step") and it installs and connects everything, asking you only about your choices (importing MemPalace, retiring it, turning distillation on). You can start locally and move later: your admin can adopt your local database into a tenant ([docs/server.md](docs/server.md#moving-your-local-alice-to-the-server)).
+Both setup guides are written for an agent: hand the file to Claude Code or Codex ("Read docs/setup-local.md and follow every step") and it installs and connects everything, asking you only about your choices (importing MemPalace, retiring it, turning on Jev for precise recall and distillation). You can start locally and move later: your admin can adopt your local database into a tenant ([docs/server.md](docs/server.md#moving-your-local-alice-to-the-server)).
 
 ## Install from source
 

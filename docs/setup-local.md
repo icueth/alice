@@ -7,7 +7,7 @@ server. Your memory stays in `~/.alice`.
 2. Type: `Read docs/setup-local.md from the Alice repository (https://github.com/icueth/alice) and follow every step.`
    If you have a copy of this file, give its path instead.
 3. The agent asks you a few questions (whether to install Rust, whether to import MemPalace, whether to retire it, and
-   whether to turn on distillation) and does the rest.
+   whether to turn on Jev, a cloud model, for precise recall and distillation) and does the rest.
 4. When it says it is done, restart Claude Code and Codex, so the new MCP server, hooks and instructions load.
 
 To use a team server instead, see [setup-server.md](setup-server.md). To choose, see "Choose: local or server" in the
@@ -248,13 +248,24 @@ If none, skip this step. If some exist, ask the person once: **"Stop using MemPa
 
 **Never delete the palace directory, `~/.mempalace`, or any MemPalace data.**
 
-### Step 8: Distillation (optional)
+### Step 8: Jev: precise recall and distillation (optional)
 
-Distillation turns ended sessions into a few short memories (decisions, fixes, how-tos and so on) with TypeSafe's Jev
-model. It sends session text, with secrets removed and only for projects the person allows, to that cloud service. It
-costs about 0.1 to 0.3 US cents per session, and never more than half of the judge's daily budget (1 USD a day by
-default). It is off unless the person turns it on. Ask: **"Turn on distillation with Jev? You need a TypeSafe API
-key."**
+This step turns on two things that send text to TypeSafe's Jev model, a cloud service:
+
+- **The Jev judge.** Every new memory is sent with its closest memories, to find duplicates and updates. Recall becomes
+  precise by default: each recall sends its query and its top results, captured transcript passages included, and
+  takes about half a second longer.
+- **Distillation.** Each ended session's captured text is sent, and comes back as a few short memories (decisions,
+  fixes, how-tos and so on).
+
+Everything is redacted (secrets removed) before it is sent. Every project is sent unless it is kept at home: listed in
+`privacy.cloud_denied_projects`, or with `cloud_denied = true` in its repository's `.alice.toml`. Measured on real
+sessions, a session costs 0.12 to 2.24 US cents ([benchmarks/sp2.md](benchmarks/sp2.md)); the judge may spend up to
+the daily budget (1 USD a day by default), and distillation at most half of it. It is all off unless the person turns
+it on. Ask: **"Turn on Jev? It sends each new memory, each recall's query and top results (transcripts included) and
+each ended session's text to TypeSafe's cloud, redacted, for every project you do not keep at home. Recall gets about
+half a second slower. You need a TypeSafe API key."** If yes, also ask which projects must never be sent (`alice
+projects` lists them) and whether recall should stay fast (Jev then only distills and judges new memories).
 
 If yes, ask the person to run this **themselves, in their own terminal** (not through you), and paste the key at the
 prompt, which hides it:
@@ -263,7 +274,16 @@ prompt, which hides it:
 alice config set-secret jev_api_key
 ```
 
-When they say it is done:
+When they say it is done, first keep the projects they named at home (their slugs, from `alice projects`; skip this
+line when they named none) and, only if they want recall to stay fast, set its mode, so nothing is sent before these
+apply:
+
+```sh
+alice config set privacy.cloud_denied_projects '["<slug>", "<slug>"]'
+alice config set search.default_mode fast
+```
+
+Then:
 
 ```sh
 alice config set judge.provider jev
@@ -293,7 +313,7 @@ Say briefly:
 - which agents were connected, and that capture is installed for them;
 - the import's counts, or why it was skipped;
 - what changed in MemPalace, and that its data was kept;
-- whether distillation is on;
+- whether Jev (the judge and distillation) is on, which projects are kept at home, and whether recall stays fast;
 - that they must **restart Claude Code and Codex** so the MCP server, the hooks and the instructions load, and, for
   Codex, **trust the Alice hooks in `/hooks`**;
 - how to use it: work as usual; the agents recall and save by themselves, and every session is captured.

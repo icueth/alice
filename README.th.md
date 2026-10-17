@@ -80,7 +80,7 @@ Alice ทำงานได้ทั้งบนเครื่องของ�
 | แพลตฟอร์ม | macOS (Apple Silicon), Linux (glibc) | agent ใดก็ได้ที่ใช้ MCP ผ่าน HTTP ส่วนการเก็บ session ใช้ได้บน macOS และ Linux |
 | คู่มือติดตั้ง | [docs/setup-local.md](docs/setup-local.md) | [docs/setup-server.md](docs/setup-server.md) |
 
-คู่มือติดตั้งทั้งสองเขียนไว้ให้ agent อ่านแล้วทำตาม: ส่งไฟล์ให้ Claude Code หรือ Codex (เช่น "อ่าน docs/setup-local.md แล้วทำตามทุกขั้นตอน") มันจะติดตั้งและเชื่อมต่อให้ครบ โดยถามคุณเฉพาะเรื่องที่ต้องตัดสินใจเอง (จะ import MemPalace ไหม จะเลิกใช้ MemPalace ไหม จะเปิดการกลั่นความรู้ไหม) จะเริ่มใช้ในเครื่องก่อนแล้วค่อยย้ายขึ้นเซิร์ฟเวอร์ทีหลังก็ได้ แอดมินย้ายฐานข้อมูลในเครื่องของคุณขึ้น tenant ให้ได้ ([docs/server.md](docs/server.md#moving-your-local-alice-to-the-server))
+คู่มือติดตั้งทั้งสองเขียนไว้ให้ agent อ่านแล้วทำตาม: ส่งไฟล์ให้ Claude Code หรือ Codex (เช่น "อ่าน docs/setup-local.md แล้วทำตามทุกขั้นตอน") มันจะติดตั้งและเชื่อมต่อให้ครบ โดยถามคุณเฉพาะเรื่องที่ต้องตัดสินใจเอง (จะ import MemPalace ไหม จะเลิกใช้ MemPalace ไหม จะเปิด Jev สำหรับการค้นแบบแม่นยำและการกลั่นความรู้ไหม) จะเริ่มใช้ในเครื่องก่อนแล้วค่อยย้ายขึ้นเซิร์ฟเวอร์ทีหลังก็ได้ แอดมินย้ายฐานข้อมูลในเครื่องของคุณขึ้น tenant ให้ได้ ([docs/server.md](docs/server.md#moving-your-local-alice-to-the-server))
 
 ## ติดตั้งจาก source
 
