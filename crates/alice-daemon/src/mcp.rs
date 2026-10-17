@@ -95,6 +95,10 @@ pub struct Switches {
     pub admin_tools: bool,
     /// `compat.mempalace`.
     pub compat_mempalace: bool,
+    /// Whether the store redacts what it stores, as the daemon has it (its environment, where
+    /// an admin pins the switch, and its ratchet apply; the team store always does). `None`
+    /// when no daemon answered or it did not say.
+    pub redacts: Option<bool>,
     /// No daemon answered (the switches above then read off whatever the settings say).
     pub unreachable: bool,
 }
@@ -126,6 +130,15 @@ impl RemoteBackend {
     pub fn with_admin_ttl(mut self, ttl: Duration) -> Self {
         self.admin_ttl = ttl;
         self
+    }
+
+    /// Ask the running daemon for the switches once, before the client's `initialize`: the
+    /// instructions given then say whether credentials may be stored, and the daemon's own
+    /// `privacy.redact` decides that (re-review N4), not `config.toml` and this process's
+    /// environment, which miss an admin's pin and a loosening still waiting for its polls.
+    /// Never starts a daemon; without one the instructions read off the settings.
+    pub async fn prime(&self) {
+        let _ = self.switches().await;
     }
 
     /// The switches as the running daemon has them (its ratchet and its audit apply), asked at
@@ -180,6 +193,17 @@ impl RemoteBackend {
     }
 }
 
+/// The switches of a daemon this process runs.
+fn local_switches(s: &Service) -> Switches {
+    let settings = s.settings();
+    Switches {
+        admin_tools: settings.mcp.admin_tools,
+        compat_mempalace: settings.compat.mempalace,
+        redacts: Some(settings.privacy.redact || s.is_team_store()),
+        unreachable: false,
+    }
+}
+
 #[derive(Clone)]
 pub enum Backend {
     Local(Arc<Service>),
@@ -197,14 +221,7 @@ impl Backend {
     /// for (all off when none answers). Asked per request, cached for a moment.
     async fn switches(&self) -> Switches {
         match self {
-            Backend::Local(s) => {
-                let settings = s.settings();
-                Switches {
-                    admin_tools: settings.mcp.admin_tools,
-                    compat_mempalace: settings.compat.mempalace,
-                    unreachable: false,
-                }
-            }
+            Backend::Local(s) => local_switches(s),
             Backend::Remote(b) => b.switches().await,
         }
     }
@@ -216,28 +233,25 @@ impl Backend {
     }
     /// Whether the store behind this server keeps secrets as written: the effective
     /// `privacy.redact` is off (never for the team store, which always redacts). `alice mcp`
-    /// reads it the way the daemon loads it (`config.toml` and the `ALICE_*` variables); a
+    /// takes the daemon's last answer ([`RemoteBackend::prime`]); with none, it reads the
+    /// switch the way the daemon loads it (`config.toml` and the `ALICE_*` variables), and a
     /// configuration it cannot fully read counts as redacting.
     fn keeps_secrets(&self) -> bool {
         match self {
             Backend::Local(s) => !s.is_team_store() && !s.settings().privacy.redact,
-            Backend::Remote(b) => {
-                let e = crate::config::load_effective(&b.home);
-                !e.degraded && !e.resolved.settings.privacy.redact
-            }
+            Backend::Remote(b) => match b.switches_cached().redacts {
+                Some(redacts) => !redacts,
+                None => {
+                    let e = crate::config::load_effective(&b.home);
+                    !e.degraded && !e.resolved.settings.privacy.redact
+                }
+            },
         }
     }
     /// [`switches`](Self::switches) without waiting for an answer (`get_tool` is not async).
     fn switches_cached(&self) -> Switches {
         match self {
-            Backend::Local(s) => {
-                let settings = s.settings();
-                Switches {
-                    admin_tools: settings.mcp.admin_tools,
-                    compat_mempalace: settings.compat.mempalace,
-                    unreachable: false,
-                }
-            }
+            Backend::Local(s) => local_switches(s),
             Backend::Remote(b) => b.switches_cached(),
         }
     }
@@ -1069,9 +1083,9 @@ pub async fn run_stdio(home: AliceHome, launcher: Launcher) -> anyhow::Result<()
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
-    let server = AliceMcp::new(Backend::Remote(Arc::new(RemoteBackend::new(
-        home, launcher, cwd,
-    ))));
+    let backend = Arc::new(RemoteBackend::new(home, launcher, cwd));
+    backend.prime().await;
+    let server = AliceMcp::new(Backend::Remote(backend));
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())

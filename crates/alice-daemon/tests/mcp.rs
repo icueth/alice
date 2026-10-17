@@ -3,7 +3,9 @@
 use alice_core::embed::{Embedder, FakeEmbedder};
 use alice_daemon::client::Launcher;
 use alice_daemon::discovery::{DaemonInfo, write_info};
-use alice_daemon::mcp::{AliceMcp, Backend, INSTRUCTIONS, RemoteBackend};
+use alice_daemon::mcp::{
+    AliceMcp, Backend, INSTRUCTIONS, INSTRUCTIONS_KEEPING_SECRETS, RemoteBackend,
+};
 use alice_daemon::paths::AliceHome;
 use alice_daemon::service::{Service, ServiceOptions};
 use rmcp::model::{
@@ -78,11 +80,15 @@ struct Daemon {
 
 impl Daemon {
     async fn start(home: &AliceHome) -> Daemon {
+        Self::start_with(home, ServiceOptions::default()).await
+    }
+
+    async fn start_with(home: &AliceHome, options: ServiceOptions) -> Daemon {
         alice_daemon::install_tls();
         let svc = Service::start(
             home.clone(),
             &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
-            ServiceOptions::default(),
+            options,
         )
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1308,4 +1314,62 @@ async fn the_stdio_server_asks_the_daemon_again_after_its_ttl() {
     );
     client.cancel().await.ok();
     d.stop().await;
+}
+
+/// Re-review N4: `alice mcp` takes the secrets line of its instructions from the daemon's own
+/// switch. Only the daemon has the admin's pin here (in its environment, which `alice mcp` does
+/// not share), so read off `config.toml` the instructions would say the opposite.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stdio_server_takes_the_secrets_line_from_the_daemon() {
+    for (file, pin, told) in [
+        ("", "false", INSTRUCTIONS_KEEPING_SECRETS),
+        ("[privacy]\nredact = false\n", "true", INSTRUCTIONS),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(home.root()).unwrap();
+        std::fs::write(home.config_file(), file).unwrap();
+        let d = Daemon::start_with(
+            &home,
+            ServiceOptions {
+                settings_env: Some(vec![("ALICE_PRIVACY_REDACT".into(), pin.into())]),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(d.svc.settings().privacy.redact, pin == "true");
+        let instructions = |primed: bool| {
+            let home = home.clone();
+            async move {
+                let backend = Arc::new(RemoteBackend::new(home, Launcher::None, None));
+                if primed {
+                    backend.prime().await;
+                }
+                let server = AliceMcp::new(Backend::Remote(backend));
+                let (a, b) = tokio::io::duplex(1 << 16);
+                tokio::spawn(async move { server.serve(a).await.unwrap().waiting().await });
+                let client = TestClient.serve(b).await.unwrap();
+                let got = client.peer_info().unwrap().instructions.clone();
+                client.cancel().await.ok();
+                got
+            }
+        };
+        assert_ne!(
+            instructions(false).await.as_deref(),
+            Some(told),
+            "{pin}: the file says otherwise"
+        );
+        assert_eq!(
+            instructions(true).await.as_deref(),
+            Some(told),
+            "{pin}: the daemon's switch"
+        );
+        d.stop().await;
+        // No daemon answers: the file decides again.
+        assert_ne!(
+            instructions(true).await.as_deref(),
+            Some(told),
+            "{pin}: no daemon"
+        );
+    }
 }
