@@ -1016,8 +1016,8 @@ closed, which here means no capture.
 
 **Defaults.**
 - `distill.provider` defaults to `off`, because sending session text to a cloud model is opt-in for an open-source tool
-  (R15). The owner turns it on (`alice config set distill.provider jev`), and this deployment turns it on for every tenant
-  (§9.3).
+  (R15). The owner turns it on (`alice config set distill.provider jev`); on a server the admin turns it on per tenant
+  (`alice-server distill on <name>|--all`, §9.3).
 - `capture.enabled` defaults to on, because installing the hooks is the opt-in.
 
 **Tenants.** No new setting names a URL or a path, so tenant validation (server spec §2.2 item 6) gains no entry. The
@@ -1163,10 +1163,15 @@ by one side**:
 - A team member's palace is imported by the admin (server spec §2.9). The importer's skip rule above applies there too.
 - They have no MemPalace hooks to remove, only the setup line to run.
 - **Jev is on for every tenant, with one shared key the owner manages** (the owner's decision, 2026-10-16).
-  - The product default in the open-source code stays `distill.provider = off` (R15). It is **this deployment** that turns
-    distillation on.
-  - When the admin has provisioned the shared key (server lane: `alice-server jev-key set`, server-mode addendum 5),
-    `alice-server add` gives each tenant `judge.provider = jev` and `distill.provider = jev`.
+  - The product default in the open-source code stays `distill.provider = off` (R15). On this deployment the admin turns
+    distillation on, **per tenant** (controller ruling, 2026-10-17, R28):
+    - `alice-server jev-key set` (and a rotation) changes **only the key**; it never touches a tenant's `judge.provider`
+      or `distill.provider`.
+    - Once the key is provisioned (server-mode addendum 5), `alice-server add` gives each new tenant `judge.provider = jev`
+      and takes `distill.provider` from `/etc/alice/distill.default` (one line, `on` or `off`; `off` when the file is
+      missing; any other content is refused before anything is created).
+    - `alice-server distill on|off <name>|--all` switches a tenant's distillation, and `alice-server distill status`
+      shows each tenant's setting and the default.
   - How the key reaches each daemon is that lane's design. SP2 only needs the judge's existing key lookup
     (`jev_api_key`) to find it.
   - A person never sees or supplies the key. The setup script never asks for one. Its last lines say whether
@@ -1216,7 +1221,7 @@ SP2 needs these from `deploy/server/alice-server` (pane 3). SP2 does not edit th
 |---|---|
 | Print the setup line | `alice-server add <name>` (and a command to print it again) prints `curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh \| sh -s -- https://<host>/u/<name>` |
 | Pin capture retention | `add` writes `ALICE_CAPTURE_RAW_RETENTION=180d` into the tenant's env file, and `upgrade` adds it where unset. The environment wins over `config.toml`, as `ALICE_BACKUP_DAILY` does (server spec §2.7), so a tenant's own patch cannot loosen it; the admin changes the line |
-| Jev on with the shared key | When `alice-server jev-key set` has provisioned the key, `add` sets `judge.provider = jev` and `distill.provider = jev` for the tenant (server-mode addendum 5) |
+| Jev on with the shared key | When `alice-server jev-key set` has provisioned the key, `add` sets `judge.provider = jev` for the tenant and `distill.provider` from `/etc/alice/distill.default` (`off` without it); `alice-server distill on\|off <name>\|--all` and `distill status` switch and show it; `jev-key set` changes only the key (R28) |
 | Adoption | `alice-server adopt` (addendum 4) moves the database whole, so `capture_state` and `capture_turns` travel with it (§9.4) |
 
 ---
@@ -1448,6 +1453,7 @@ a caveat the results state, as `m2-jev.md` does.
 | R25 | (Controller's ruling.) **`capture.raw_retention` ages out captured transcripts only**: a second pass of the `raw_retention` job over capture sources. Default `forever`; 180 days on tenants, pinned by `ALICE_CAPTURE_RAW_RETENTION` in the tenant's env file (written by `alice-server`) | The server disk is not grown, and the owner's own volume (~365k chunks a year at ~16.8 KB each with two backups) would fill it within a year; imported history must never age out by it | Transcripts older than 180 days are gone on tenants; distilled and explicit memories stay |
 | R26 | (Controller's ruling.) **The owner becomes a tenant by adoption**; then the tenant setup line replaces `alice hooks install claude`, and the local hooks are removed | One memory for the owner, on the server like the team's | Sessions open during the move may finish capturing a little late (24 h stale end) |
 | R27 | (The owner's decision.) **On this deployment Jev is on for every tenant with one shared key the owner manages**; the product default stays `distill.provider = off` | The owner wants the same quality for the whole team and manages one key | The owner pays for every tenant's Jev use, capped at 5 × each tenant's `judge.daily_budget_usd` ($5.00 a day at the default) |
+| R28 | (Controller's ruling, 2026-10-17.) **On a server, distillation is a per-tenant switch**: `alice-server jev-key set` and rotations change only the key; `add` takes `distill.provider` from `/etc/alice/distill.default` (`off` without it); `alice-server distill on\|off <name>\|--all` and `distill status` switch and show it | A key rotation must never turn distillation on everywhere or undo an admin's per-tenant choice; distillation stays off until the flood fix (Task 12b) is accepted | The admin runs one more command per tenant to turn distillation on |
 
 ---
 
@@ -1458,7 +1464,7 @@ The controller's review (2026-10-16) settled every open point, and the owner set
 | Point | Outcome |
 |---|---|
 | Transcript samples | **Permission granted with conditions** (§11.1): at most two Claude Code transcripts and one Codex rollout, structure-only fixtures, a 16-character overlap check and a key check before committing, and copies deleted. If there is no Codex rollout on the machine, Codex stays seam-only (the reader trait and the installer's refusal path) until a sample exists |
-| R15 | Accepted (product default `off`). On this deployment the owner turns distillation on for themselves and for every tenant with one shared key (R27, §9.3) |
+| R15 | Accepted (product default `off`). On this deployment Jev is on for every tenant with one shared key (R27); the admin turns distillation on per tenant (R28, §9.3) |
 | R19 | Accepted: machine-made memories never ask a person |
 | R13 | Overruled: tenants get a bounded SessionStart briefing (§5.7) |
 | Retention | A capture-scoped retention, 180 days on tenants (R25, §3.9) |
