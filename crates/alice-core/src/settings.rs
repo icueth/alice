@@ -1905,6 +1905,10 @@ pub struct TenantFile {
     /// `ALICE_PRIVACY_REDACT`), so the file can never turn redaction off: on a tenant without
     /// the pin, a person's PATCH would otherwise do it.
     pub turns_redaction_off: bool,
+    /// `privacy.allowlist` holds an entry in the file. An allowlist exempts matches from
+    /// redaction, so on a tenant it is the admin's too (re-review N3): the pinned
+    /// `ALICE_PRIVACY_ALLOWLIST` sets it, and a person's PATCH or file cannot.
+    pub sets_allowlist: bool,
 }
 
 impl TenantFile {
@@ -1915,8 +1919,10 @@ impl TenantFile {
     /// use alice_core::settings::TenantFile;
     ///
     /// let f = TenantFile::of("[privacy]\nredact = false\n[server]\nport = 47801\n");
-    /// assert!(f.sets_port && f.turns_redaction_off);
+    /// assert!(f.sets_port && f.turns_redaction_off && !f.sets_allowlist);
     /// assert_eq!(TenantFile::of("[privacy]\nredact = true\n"), TenantFile::default());
+    /// assert!(TenantFile::of("[privacy]\nallowlist = [\"(?s).*\"]\n").sets_allowlist);
+    /// assert!(!TenantFile::of("[privacy]\nallowlist = []\n").sets_allowlist);
     /// ```
     pub fn of(text: &str) -> Self {
         let v = toml::from_str::<toml::Table>(text).ok();
@@ -1929,6 +1935,8 @@ impl TenantFile {
         Self {
             sets_port: at("server", "port").is_some(),
             turns_redaction_off: at("privacy", "redact").and_then(|r| r.as_bool()) == Some(false),
+            sets_allowlist: at("privacy", "allowlist")
+                .is_some_and(|a| a.as_array().is_none_or(|a| !a.is_empty())),
         }
     }
 }
@@ -1985,6 +1993,12 @@ pub fn validate_tenant(s: &Settings, home: &Path, file: TenantFile) -> Vec<Setti
         e.push(err(
             "privacy.redact",
             "on a server tenant the admin decides whether secrets are kept as written (alice-server secrets keep|redact); config.toml cannot turn redaction off",
+        ));
+    }
+    if file.sets_allowlist {
+        e.push(err(
+            "privacy.allowlist",
+            "on a server tenant only the admin sets exceptions to redaction (ALICE_PRIVACY_ALLOWLIST in the tenant file); config.toml cannot",
         ));
     }
     if s.secrets.backend == SecretsBackend::Keychain {
@@ -5371,6 +5385,27 @@ custom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]+\" }]
             validate_tenant(&both.settings, home, TenantFile::of(off))
                 .iter()
                 .any(|e| e.key == "privacy.redact")
+        );
+    }
+
+    /// Re-review N3: an allowlist is an exception to redaction, so on a tenant only the admin's
+    /// pin sets one; a file (and so a person's PATCH) that does is refused.
+    #[test]
+    fn a_tenant_takes_its_allowlist_from_the_admins_pin_only() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        let all = "[privacy]\nallowlist = [\"(?s).*\"]\n";
+        assert_eq!(tenant_errors(all, home, false), ["privacy.allowlist"]);
+        assert!(tenant_errors("[privacy]\nallowlist = []\n", home, false).is_empty());
+        let env = [(
+            "ALICE_PRIVACY_ALLOWLIST".to_string(),
+            r#"["^ok-value$"]"#.to_string(),
+        )];
+        let pinned = resolve(None, &env).unwrap();
+        assert_eq!(pinned.settings.privacy.allowlist, ["^ok-value$"]);
+        assert!(
+            validate_tenant(&pinned.settings, home, TenantFile::of("")).is_empty(),
+            "the admin's pin is allowed"
         );
     }
 }

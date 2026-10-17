@@ -11,7 +11,9 @@
 //! store, a server tenant's included (where the admin pins the switch), keeps secrets as written
 //! when `privacy.redact` is off, and [`Redactors::for_root`] then lets them through. Text that
 //! leaves for a cloud service takes [`Redactors::for_root_always_on`] whatever the switch says,
-//! and the shared team store redacts every write ([`Redactors::for_team_store`]): everyone reads it.
+//! and whatever the allowlist says of a built-in detector's match (re-review N3: an allowlist is
+//! an exception for storage, never a way out for a key), and the shared team store redacts every
+//! write ([`Redactors::for_team_store`]): everyone reads it.
 
 use crate::config::SettingsHandle;
 use alice_core::redact::Redactor;
@@ -92,10 +94,11 @@ impl Redactors {
     }
 
     /// [`for_root`](Self::for_root) with the `privacy.redact` switch forced on, whatever it
-    /// says: for text that leaves for a cloud service (the Jev judge's and distillation's
-    /// requests, a remote embedder's input) or for the team store, which is redacted even when
-    /// the person stores secrets as written. The mode does not matter to the caller, which
-    /// applies the redactor and never asks it to refuse.
+    /// says, and an allowlist that exempts no built-in detector's match
+    /// ([`Redactor::for_egress`]): for text that leaves for a cloud service (the Jev judge's and
+    /// distillation's requests, a remote embedder's input) or for the team store, which is
+    /// redacted even when the person stores secrets as written. The mode does not matter to the
+    /// caller, which applies the redactor and never asks it to refuse.
     pub fn for_root_always_on(&self, tree: Option<&ProjectTree>) -> Arc<Redactor> {
         self.cached(tree, true)
     }
@@ -114,7 +117,7 @@ impl Redactors {
                 {
                     return r.clone();
                 }
-                let r = Self::build(&privacy);
+                let r = Self::build(&privacy, always_on);
                 if cache.len() >= MAX_ROOTS {
                     cache.clear();
                 }
@@ -128,19 +131,20 @@ impl Redactors {
                 {
                     return r.clone();
                 }
-                let r = Self::build(&privacy);
+                let r = Self::build(&privacy, always_on);
                 g[always_on as usize] = Some((privacy, r.clone()));
                 r
             }
         }
     }
 
-    fn build(privacy: &PrivacySettings) -> Arc<Redactor> {
-        Arc::new(Redactor::new(privacy).unwrap_or_else(|e| {
+    fn build(privacy: &PrivacySettings, egress: bool) -> Arc<Redactor> {
+        let r = Redactor::new(privacy).unwrap_or_else(|e| {
             // The error names the setting, never the pattern.
             tracing::warn!(error = %e, "privacy settings do not compile; using the built-in detectors only");
             Redactor::fallback(privacy)
-        }))
+        });
+        Arc::new(if egress { r.for_egress() } else { r })
     }
 }
 
@@ -221,6 +225,38 @@ mod tests {
                 .apply(text)
                 .found
                 .is_empty()
+        );
+    }
+
+    /// Re-review N3: an allowlist (even one that allows everything) exempts nothing a built-in
+    /// detector finds in text that leaves for the cloud; it still exempts a custom pattern's
+    /// match there, and storage follows it as before.
+    #[test]
+    fn egress_ignores_the_allowlist_for_the_built_in_detectors() {
+        let r = Redactors::fixed(PrivacySettings {
+            allowlist: vec!["(?s).*".into()],
+            custom_patterns: vec![CustomPattern {
+                name: "ticket".into(),
+                regex: "TCK-[0-9]{4,}".into(),
+            }],
+            ..Default::default()
+        });
+        let text = concat!(
+            "token gh",
+            "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 for TCK-1234"
+        );
+        assert_eq!(r.for_root(None).apply(text).text, text, "storage: allowed");
+        let out = r.for_root_always_on(None).apply(text);
+        assert_eq!(out.found, ["github_token"]);
+        assert!(
+            out.text.contains("TCK-1234"),
+            "a custom pattern's exception holds"
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let tree = ProjectTree::alone(repo.path());
+        assert_eq!(
+            r.for_root_always_on(Some(&tree)).apply(text).found,
+            ["github_token"]
         );
     }
 

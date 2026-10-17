@@ -1098,6 +1098,37 @@ mod tests {
         assert!(!local.get().privacy.redact);
     }
 
+    /// Re-review N3: on a tenant a person cannot allowlist their way out of redaction, by PATCH
+    /// or by hand; the admin's pin is the only allowlist. A local home keeps the choice.
+    #[test]
+    fn a_tenant_refuses_an_allowlist_from_the_person() {
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with(&h, Vec::new(), true);
+        let e = s
+            .patch(&one("privacy.allowlist", serde_json::json!(["(?s).*"])))
+            .unwrap_err();
+        assert!(e.iter().any(|e| e.key == "privacy.allowlist"), "{e:?}");
+        assert!(s.get().privacy.allowlist.is_empty());
+        let (_d, h) = home();
+        std::fs::write(h.config_file(), "[privacy]\nallowlist = [\"(?s).*\"]\n").unwrap();
+        let s = SettingsHandle::load_with(&h, Vec::new(), true);
+        assert!(s.get().privacy.allowlist.is_empty());
+        assert!(s.errors().iter().any(|e| e.key == "privacy.allowlist"));
+        let pin = vec![(
+            "ALICE_PRIVACY_ALLOWLIST".to_string(),
+            r#"["^ok-value$"]"#.to_string(),
+        )];
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with(&h, pin, true);
+        assert_eq!(s.get().privacy.allowlist, ["^ok-value$"], "the admin's pin");
+        let (_d, h) = home();
+        let local = SettingsHandle::load_with(&h, Vec::new(), false);
+        local
+            .patch(&one("privacy.allowlist", serde_json::json!(["^ok$"])))
+            .unwrap();
+        assert_eq!(local.get().privacy.allowlist, ["^ok$"]);
+    }
+
     #[test]
     fn a_tenant_fails_closed_for_a_project_root_that_is_not_there() {
         let (d, h) = home();
