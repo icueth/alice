@@ -202,7 +202,7 @@ Alice can keep every Claude Code and Codex session as it happens, without the ag
 
 ```bash
 alice hooks install claude      # Claude Code: five hooks in ~/.claude/settings.json (backed up; other hooks kept)
-alice hooks install codex       # Codex: ~/.codex/hooks.json; then trust the hooks once in Codex's /hooks
+alice hooks install codex       # Codex: ~/.codex/hooks.json (or a marked block in config.toml when it has hooks); then "Trust all and continue" in Codex
 alice capture status            # captured sessions, how far each was read, where its distillation stands
 alice recall --raw "the migration error from yesterday"
 ```

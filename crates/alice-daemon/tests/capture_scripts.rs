@@ -410,6 +410,32 @@ impl Env {
         assert!(out.status.success(), "{out:?}");
     }
 
+    /// A `python3` with `tomllib` first on `PATH`, for the edit of Codex's `config.toml`. False,
+    /// and the test is skipped, on a machine that has none (never in CI).
+    fn with_python(&self) -> bool {
+        let Some(py) = tomllib_python() else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI needs a python3 with tomllib (Python 3.11 or later)"
+            );
+            eprintln!("skipped: no python3 with tomllib here");
+            return false;
+        };
+        let wrapper = format!("#!/bin/sh\nexec '{}' \"$@\"\n", py.display());
+        write_mode(&self.bin.join("python3"), wrapper.as_bytes(), 0o755);
+        true
+    }
+
+    /// A `python3` first on `PATH` that has no TOML reader: it ends as the hook script's TOML
+    /// edit ends then (exit 13), so the edit is never made.
+    fn without_toml_reader(&self) {
+        write_mode(&self.bin.join("python3"), b"#!/bin/sh\nexit 13\n", 0o755);
+    }
+
+    fn codex_config(&self) -> PathBuf {
+        self.codex_home.join("config.toml")
+    }
+
     /// Files under `$TMPDIR` (every script cleans its temporary directory up).
     fn tmp_entries(&self) -> Vec<String> {
         std::fs::read_dir(&self.tmp)
@@ -423,6 +449,32 @@ impl Drop for Env {
     fn drop(&mut self) {
         self.kill_workers();
     }
+}
+
+/// A `python3` of this machine that has `tomllib`: the one on `PATH`, else the usual places.
+fn tomllib_python() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("python3"))
+                .collect()
+        })
+        .unwrap_or_default();
+    candidates.extend(
+        [
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "/usr/bin/python3",
+        ]
+        .map(PathBuf::from),
+    );
+    candidates.into_iter().find(|p| {
+        p.is_file()
+            && Command::new(p)
+                .args(["-I", "-c", "import tomllib"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+    })
 }
 
 // ---- Transcripts ----
@@ -1007,21 +1059,17 @@ async fn setup_handles_codex_hooks_json() {
     assert_eq!(read(&hooks), own);
 
     // Inline `[hooks]` tables in config.toml are the person's format for this layer: hooks.json
-    // is not written beside them.
+    // is not written beside them. Without a TOML reader to check the edit, config.toml is left
+    // as it is and Alice's block is printed.
     std::fs::remove_file(&hooks).unwrap();
-    std::fs::write(
-        env.codex_home.join("config.toml"),
-        "model = \"x\"\n\n[hooks]\n",
-    )
-    .unwrap();
+    env.without_toml_reader();
+    std::fs::write(env.codex_config(), "model = \"x\"\n\n[hooks]\n").unwrap();
     let r = env.setup(&s.url("ann"), "", &[]);
     assert!(r.ok(), "{r}");
     assert!(!hooks.exists(), "{r}");
-    assert!(
-        r.stdout
-            .contains(r#"alice-capture.sh\" hook codex || true"#),
-        "{r}"
-    );
+    assert_eq!(read(&env.codex_config()), "model = \"x\"\n\n[hooks]\n");
+    assert!(r.stdout.contains(&codex_block()), "{r}");
+    std::fs::remove_file(env.bin.join("python3")).unwrap();
 
     // No `codex` command on PATH: Codex is not mentioned and nothing is written.
     std::fs::remove_file(env.codex_home.join("config.toml")).unwrap();
@@ -1141,6 +1189,8 @@ async fn setup_finds_every_toml_form_of_inline_hooks() {
     let hooks = env.codex_home.join("hooks.json");
     let copy = env.alice().join("codex-hooks.written");
     let config = env.codex_home.join("config.toml");
+    // Only the choice is looked at here: without a TOML reader nothing is written either way.
+    env.without_toml_reader();
     let forms: [(&str, bool); 19] = [
         ("[hooks]\n", true),
         ("[ hooks ]\n", true),
@@ -1211,6 +1261,322 @@ async fn status_reports_the_codex_hooks() {
     std::fs::remove_file(&hooks).unwrap();
     let out = status(&env);
     assert!(out.contains("codex hooks: not found"), "{out}");
+}
+
+// ---- Codex's config.toml ----
+
+/// A Codex `config.toml` as OpenRig leaves it: its hooks in `[[hooks.<Event>]]` tables of its
+/// own marked block, the features switch, an MCP server and one of Codex's trust records.
+const OPENRIG_TOML: &str = r#"model = "gpt-5"
+
+[features]
+hooks = true
+
+[mcp_servers.exa]
+command = "npx"
+args = ["-y", "exa-mcp"]
+
+# BEGIN OPENRIG MANAGED ACTIVITY HOOKS
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = 'node "/opt/openrig/relay.js"'
+timeout = 5
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'node "/opt/openrig/relay.js"'
+timeout = 5
+# END OPENRIG MANAGED ACTIVITY HOOKS
+
+[hooks.state."/home/ann/.codex/config.toml:session_start:0:0"]
+trusted_hash = "sha256:abc"
+"#;
+
+/// Alice's block for config.toml, as setup appends it: the five hooks of `hooks.json`, the same
+/// command and timeouts, between the marker lines.
+fn codex_block() -> String {
+    let mut b = String::from(
+        "# >>> alice capture (Codex) >>>\n# Alice capture hooks; sh ~/.config/alice/alice-capture.sh uninstall removes this block.\n",
+    );
+    for (i, event) in FIVE_EVENTS.iter().enumerate() {
+        if i > 0 {
+            b.push('\n');
+        }
+        let timeout = if *event == "SessionEnd" { 3 } else { 10 };
+        b.push_str(&format!(
+            "[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = '{CODEX_HOOK_COMMAND}'\ntimeout = {timeout}\n"
+        ));
+    }
+    b.push_str("# <<< alice capture (Codex) <<<\n");
+    b
+}
+
+/// One of Codex's trust records, where its TOML editor may put it: inside Alice's block, before
+/// the last line.
+const TRUST_RECORD: &str = "[hooks.state.\"/home/ann/.codex/config.toml:session_end:0:0\"]\ntrusted_hash = \"sha256:def\"\n";
+
+/// What the person is told to do about Codex's trust prompt, in setup's summary.
+const TRUST_LINE: &str = "Codex: the next time you open Codex it asks 'Hooks need review' \u{2014} choose Trust all and continue (or review the Alice entries with /hooks).";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_appends_codex_hooks_to_a_config_toml_with_hook_tables() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    if !env.with_python() {
+        return;
+    }
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.write_credentials(&s.url("ann"), &s.tenant("ann").token);
+    let config = env.codex_config();
+    let backup = env.codex_home.join("config.toml.bak-alice");
+    let hooks = env.codex_home.join("hooks.json");
+    write_mode(&config, OPENRIG_TOML.as_bytes(), 0o644);
+
+    // Appended after every byte of the person's file, after a backup; no hooks.json beside it.
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&config), format!("{OPENRIG_TOML}{}", codex_block()));
+    assert_eq!(mode(&config), 0o644, "the file keeps its mode");
+    assert_eq!(read(&backup), OPENRIG_TOML);
+    assert_eq!(mode(&backup), 0o600);
+    assert!(!hooks.exists(), "{r}");
+    assert!(r.stdout.contains("marked block at its end"), "{r}");
+    assert!(
+        r.stdout
+            .contains(&format!("{}.bak-alice", config.display())),
+        "{r}"
+    );
+    assert!(r.stdout.contains(TRUST_LINE), "{r}");
+    assert!(
+        r.stdout
+            .contains(&format!("codex hooks: installed ({})", config.display())),
+        "{r}"
+    );
+    // Codex reads the five next to the person's own, which keep their places (Codex keys its
+    // trust by them).
+    let v: toml::Table = toml::from_str(&read(&config)).unwrap();
+    let start = v["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(start.len(), 2);
+    assert_eq!(
+        start[0]["hooks"][0]["command"].as_str(),
+        Some(r#"node "/opt/openrig/relay.js""#)
+    );
+    for event in FIVE_EVENTS {
+        let groups = v["hooks"][event].as_array().unwrap();
+        let hook = &groups.last().unwrap()["hooks"][0];
+        assert_eq!(
+            hook["command"].as_str(),
+            Some(CODEX_HOOK_COMMAND),
+            "{event}"
+        );
+        let timeout = if event == "SessionEnd" { 3 } else { 10 };
+        assert_eq!(hook["timeout"].as_integer(), Some(timeout), "{event}");
+    }
+    let out = env.capture_sh(&["status"], &[]).stdout;
+    assert!(
+        out.contains("codex hooks: installed (Alice's block in"),
+        "{out}"
+    );
+
+    // Again: already Alice's block, so the file is not even rewritten.
+    make_old(&config);
+    let before = std::fs::metadata(&config).unwrap().modified().unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert!(r.stdout.contains("already has Alice's block"), "{r}");
+    assert_eq!(read(&config), format!("{OPENRIG_TOML}{}", codex_block()));
+    assert_eq!(
+        std::fs::metadata(&config).unwrap().modified().unwrap(),
+        before
+    );
+
+    // Uninstall takes exactly the block out: the person's bytes and mode come back.
+    let r = env.capture_sh(&["uninstall"], &[("ALICE_SETUP_ASSUME_YES", "1")]);
+    assert!(r.ok(), "{r}");
+    assert!(
+        r.stdout.contains("Removed Alice's block of Codex hooks"),
+        "{r}"
+    );
+    assert_eq!(read(&config), OPENRIG_TOML);
+    assert_eq!(mode(&config), 0o644);
+    assert_eq!(read(&backup), format!("{OPENRIG_TOML}{}", codex_block()));
+
+    // Once Codex has trusted the hooks, its record may sit inside the block: a re-run leaves the
+    // block as it is, and uninstall leaves the record.
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    let trusted = read(&config).replace(
+        "# <<< alice capture (Codex) <<<\n",
+        &format!("{TRUST_RECORD}# <<< alice capture (Codex) <<<\n"),
+    );
+    std::fs::write(&config, &trusted).unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&config), trusted, "{r}");
+    let r = env.capture_sh(&["uninstall"], &[("ALICE_SETUP_ASSUME_YES", "1")]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(
+        read(&config),
+        format!("{OPENRIG_TOML}{TRUST_RECORD}"),
+        "{r}"
+    );
+    assert!(env.codex_home.read_dir().unwrap().all(|e| {
+        let n = e.unwrap().file_name().to_string_lossy().into_owned();
+        !n.contains(".tmp")
+    }));
+}
+
+/// Without a TOML reader to check the edit, config.toml is never changed: the block is printed,
+/// and once the person has added it, uninstall still takes it out (it needs no python3 for a
+/// block that is exactly Alice's).
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_toml_reader_setup_prints_the_block_and_uninstall_still_removes_it() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.without_toml_reader();
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.write_credentials(&s.url("ann"), &s.tenant("ann").token);
+    let config = env.codex_config();
+    std::fs::write(&config, OPENRIG_TOML).unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&config), OPENRIG_TOML);
+    assert!(!env.codex_home.join("config.toml.bak-alice").exists());
+    assert!(!env.codex_home.join("hooks.json").exists());
+    assert!(r.stdout.contains("Python 3.11"), "{r}");
+    assert!(r.stdout.contains(&codex_block()), "{r}");
+    assert!(r.stdout.contains("codex hooks: entries printed"), "{r}");
+    // The person appends it; a re-run says it is there, and never prints it for a second copy.
+    std::fs::write(&config, format!("{OPENRIG_TOML}{}", codex_block())).unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert!(
+        r.stdout.contains("already has the Alice capture entries"),
+        "{r}"
+    );
+    assert!(!r.stdout.contains("# >>> alice capture (Codex) >>>"), "{r}");
+    assert_eq!(read(&config), format!("{OPENRIG_TOML}{}", codex_block()));
+    let r = env.capture_sh(&["uninstall"], &[("ALICE_SETUP_ASSUME_YES", "1")]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&config), OPENRIG_TOML, "{r}");
+    // A block that is not exactly Alice's needs the reader: kept, and the person told so.
+    let trusted = format!("{OPENRIG_TOML}{}", codex_block()).replace(
+        "# <<< alice capture (Codex) <<<\n",
+        &format!("{TRUST_RECORD}# <<< alice capture (Codex) <<<\n"),
+    );
+    std::fs::write(&config, &trusted).unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    let r = env.capture_sh(&["uninstall"], &[("ALICE_SETUP_ASSUME_YES", "1")]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&config), trusted);
+    assert!(
+        r.stdout.contains("still has Alice's block") && r.stdout.contains("Python 3.11"),
+        "{r}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_leaves_a_config_toml_it_cannot_add_to_and_prints_the_block() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    if !env.with_python() {
+        return;
+    }
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.write_credentials(&s.url("ann"), &s.tenant("ann").token);
+    let config = env.codex_config();
+    // A static list cannot take [[hooks.Stop]] tables.
+    let own = "model = \"x\"\nhooks.Stop = [ { hooks = [] } ]\n";
+    std::fs::write(&config, own).unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&config), own);
+    assert!(!env.codex_home.join("config.toml.bak-alice").exists());
+    assert!(!env.codex_home.join("hooks.json").exists());
+    assert!(
+        r.stdout.contains("could not add its hooks to it safely"),
+        "{r}"
+    );
+    assert!(r.stdout.contains("not valid TOML (line"), "{r}");
+    assert!(
+        !r.stdout.contains("hooks = []"),
+        "never a line of the file: {r}"
+    );
+    assert!(r.stdout.contains(&codex_block()), "{r}");
+    // Entries added by hand, outside a block: left as they are, and said to be there.
+    let by_hand: String = codex_block()
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&config, format!("{OPENRIG_TOML}{by_hand}")).unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&config), format!("{OPENRIG_TOML}{by_hand}"));
+    assert!(
+        r.stdout.contains("already has the Alice capture entries"),
+        "{r}"
+    );
+    assert!(r.stdout.contains("codex hooks: entries present"), "{r}");
+}
+
+/// A config.toml without hooks of its own: hooks.json as before, config.toml untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_config_toml_without_hooks_keeps_hooks_json() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    if !env.with_python() {
+        return;
+    }
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.write_credentials(&s.url("ann"), &s.tenant("ann").token);
+    let config = env.codex_config();
+    let own = "model = \"x\"\n\n[features]\nhooks = true\n\n[mcp_servers.alice]\nurl = \"https://h/u/ann/mcp\"\n";
+    std::fs::write(&config, own).unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    assert_eq!(read(&config), own);
+    assert!(!env.codex_home.join("config.toml.bak-alice").exists());
+    assert!(r.stdout.contains("Codex: wrote"), "{r}");
+    assert_eq!(
+        codex_hooks(&env)["hooks"]["Stop"][0]["hooks"][0]["command"],
+        CODEX_HOOK_COMMAND
+    );
+    assert!(r.stdout.contains(TRUST_LINE), "{r}");
+}
+
+/// A config.toml that is a link (dotfiles) stays a link: the file it points to is edited, and
+/// uninstall brings its bytes back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linked_config_toml_stays_a_link() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    if !env.with_python() {
+        return;
+    }
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.write_credentials(&s.url("ann"), &s.tenant("ann").token);
+    let real = env.root.join("dotfiles/config.toml");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, OPENRIG_TOML).unwrap();
+    std::os::unix::fs::symlink(&real, env.codex_config()).unwrap();
+    let r = env.setup(&s.url("ann"), "", &[]);
+    assert!(r.ok(), "{r}");
+    let is_link = || {
+        std::fs::symlink_metadata(env.codex_config())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    };
+    assert!(is_link());
+    assert_eq!(read(&real), format!("{OPENRIG_TOML}{}", codex_block()));
+    let r = env.capture_sh(&["uninstall"], &[("ALICE_SETUP_ASSUME_YES", "1")]);
+    assert!(r.ok(), "{r}");
+    assert!(is_link());
+    assert_eq!(read(&real), OPENRIG_TOML, "{r}");
 }
 
 /// A Codex rollout of `turns` question/answer pairs, in the shape of the sampled format.

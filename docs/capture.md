@@ -147,10 +147,31 @@ This writes `$CODEX_HOME/hooks.json`, else `~/.codex/hooks.json`, with the same 
 `--agent codex` (Codex allows `SessionEnd` at most 3 seconds, so that hook's timeout is 3). Two Codex rules apply:
 
 - **One format per layer.** If `$CODEX_HOME/config.toml` (else `~/.codex/config.toml`) already holds hooks of its own
-  (`[hooks]` tables or `[[hooks.<Event>]]` arrays), the install is refused and nothing changes. Move those hooks into
-  `hooks.json`, or remove them, and run it again.
-- **Trust.** Codex runs a hook only after you trust it. The install's last line says so: open Codex, type `/hooks`
-  once, and trust the Alice entries.
+  (`[hooks]` tables or `[[hooks.<Event>]]` arrays, such as OpenRig's), the five hooks go into that file instead, as
+  `[[hooks.<Event>]]` tables in a marked block at its end:
+
+  ```toml
+  # >>> alice capture (Codex) >>>
+  # Alice capture hooks; `alice hooks uninstall codex` removes this block.
+  [[hooks.SessionStart]]
+  [[hooks.SessionStart.hooks]]
+  type = "command"
+  command = "'/path/to/alice' hook session-start --agent codex || true"
+  timeout = 10
+  …
+  # <<< alice capture (Codex) <<<
+  ```
+
+  The old file is saved as `config.toml.bak-alice` first. No other line changes, and the new file is written only if
+  it reads back as TOML that means what the old one meant plus Alice's five hooks; otherwise the install is refused
+  and nothing changes (for example when `hooks.<Event>` is a list written inline, which no table can extend). A block
+  that is already Alice's is left byte for byte, so Codex keeps trusting it; one that differs (a moved `alice`) is
+  replaced where it is. Tables Codex adds inside the block (its `[hooks.state."…"]` trust records) are kept. While
+  `hooks.json` already holds Alice's hooks, they stay there. `alice hooks uninstall codex` removes exactly the block
+  (and Alice's entries in `hooks.json`); `--settings <file>` still refuses while `config.toml` holds hooks.
+- **Trust.** Codex runs a new hook only after you trust it, and Alice never does that for you. The install's last line
+  says so: the next time you open Codex it asks "Hooks need review"; choose **Trust all and continue** (or review the
+  Alice entries with `/hooks`).
 
 Codex sometimes gives no transcript path. The daemon then looks for the session's rollout file in the newest seven date
 folders of `$CODEX_HOME/sessions` (the daemon's `CODEX_HOME`, so start the daemon with the same one Codex uses). Codex
@@ -564,8 +585,8 @@ Other things you may see:
 | A line in `hook.log` | The hook ignored an input or could not reach the daemon (it spooled the notice) | Usually nothing; the daemon reads the transcript when it runs |
 | A session's last turn is missing | The trailing turn waits for the next turn, a stop event or 5 quiet minutes | Wait; it arrives |
 | `alice hooks install` refuses a file | `settings.json` (or `hooks.json`) is not valid JSON | Fix the file; nothing was changed |
-| `alice hooks install codex` refuses | Codex's `config.toml` has hooks of its own | Move them into `hooks.json`, or remove them |
-| Codex captures nothing | The hooks are not trusted yet | Open `/hooks` in Codex and trust the Alice entries |
+| `alice hooks install codex` refuses: "could not change … config.toml safely" | Codex's `config.toml` has hooks of its own in a form no table can extend (an inline list), or Alice entries added by hand | Fix what the message names, or add the hooks by hand; nothing was changed |
+| Codex captures nothing | The hooks are not trusted yet | Start Codex and choose **Trust all and continue** at "Hooks need review" (or trust the Alice entries in `/hooks`) |
 | "this server cannot read files on your machine; use the capture script" | `alice hook` points at a server tenant | Use the tenant setup line instead ([server.md](server.md#capture-for-team-members)) |
 | A project's sessions are not captured | It is excluded, has `no_capture = true`, or its `.alice.toml` is broken (fails closed) | Fix the repository's `.alice.toml`; capture then resumes from where it stopped |
 

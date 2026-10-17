@@ -19,7 +19,8 @@
 #
 # Claude Code runs it through the alice-capture plugin on five events:
 #   sh "$HOME/.config/alice/alice-capture.sh" hook claude-code
-# Codex runs it from $CODEX_HOME/hooks.json (setup.sh writes it) on the same five events:
+# Codex runs it from $CODEX_HOME/hooks.json (setup.sh writes it), or, when config.toml has hooks
+# of its own, from Alice's marked block in config.toml, on the same five events:
 #   sh "$HOME/.config/alice/alice-capture.sh" hook codex
 # It reads the hook's JSON on stdin, hands the work to a background copy of itself and returns
 # at once. Only SessionStart waits, at most 2 s, for the briefing it prints.
@@ -32,8 +33,13 @@
 #   print-hooks-json <agent>
 #                      the hooks file setup.sh writes for <agent> (the plugin's hooks.json, or
 #                      $CODEX_HOME/hooks.json); the one place the hooks are written down
+#   print-hooks-toml   the same Codex hooks as Alice's block for $CODEX_HOME/config.toml
+#   codex-config install
+#                      appends that block to config.toml (setup.sh, when the file has hooks of its
+#                      own); see codex_config_py
 #   status             what is set up, and whether the server accepts the token
-#   uninstall          removes the plugin and, after asking, the capture files
+#   uninstall          removes the plugin, the Codex hooks setup wrote and, after asking, the
+#                      capture files
 #
 # Files, under ~/.config/alice (0700; every file 0600, this script 0700):
 #   token, url         read only, never written here (the team's setup document or setup.sh)
@@ -52,7 +58,8 @@
 # The token leaves the shell only as a curl config line on curl's stdin (curl -q -K -), written
 # by the printf builtin: never in argv, a URL, a child's environment, a log or an error.
 # POSIX sh; needs curl, sed, head, tail, wc, od, ls, sort, cmp, cp, mkdir, mktemp, mv, find, touch
-# and date; git, awk and dash are optional.
+# and date; git, awk and dash are optional, and so is python3 (3.11 or later, or with tomli): it
+# checks an edit of Codex's config.toml, which is never made without it.
 # Never run it with set -x: that would print the token.
 
 set -u
@@ -83,6 +90,10 @@ SWEEP_MAX=5
 NL='
 '
 SOH=$(printf '\001')
+# The first and last lines of Alice's block in Codex's config.toml (alice hooks install codex
+# writes the same markers).
+TOML_BEGIN='# >>> alice capture (Codex) >>>'
+TOML_END='# <<< alice capture (Codex) <<<'
 
 token=
 url=
@@ -1020,7 +1031,8 @@ bounded() {
 clean_stale_temps() {
   for ct_f in "$DIR"/.alice-capture.sh.new.* "$CHECKED".* "$MP"/alice-capture/hooks/hooks.json.tmp.* \
     "$MP"/alice-capture/.claude-plugin/plugin.json.tmp.* "$MP"/.claude-plugin/marketplace.json.tmp.* \
-    "${CODEX_HOME:-$HOME/.codex}"/hooks.json.tmp.[0-9]* "$DIR"/codex-hooks.written.new; do
+    "${CODEX_HOME:-$HOME/.codex}"/hooks.json.tmp.[0-9]* "$DIR"/codex-hooks.written.new \
+    "${CODEX_HOME:-$HOME/.codex}"/config.toml.tmp.[0-9]* "${CODEX_HOME:-$HOME/.codex}"/config.toml.bak-alice.tmp.[0-9]*; do
     [ -f "$ct_f" ] || continue
     if [ -n "$(find "$ct_f" -prune -mmin +10 2>/dev/null)" ]; then rm -f "$ct_f"; fi
   done
@@ -1118,7 +1130,7 @@ sync_codex() {
     log "the Codex hooks were not updated: the record ~/.config/alice/codex-hooks.written could not be written; run the setup command again"
     return 0
   fi
-  log "updated $2 with the hook script; Codex runs the changed hooks only after you trust them again: open Codex, type /hooks and trust the Alice capture hooks"
+  log "updated $2 with the hook script; Codex runs the changed hooks only after you trust them again: the next time you open Codex, choose Trust all and continue at Hooks need review (or trust them in /hooks)"
 }
 
 # Brings the plugin's hooks.json, and the Codex hooks.json while it is still the file setup wrote,
@@ -1211,21 +1223,353 @@ self_update() {
   return 0
 }
 
+# ---- Codex's config.toml ----
+
+# Alice's block for $CODEX_HOME/config.toml, for a config.toml that has hooks of its own (Codex
+# reads hooks from one format per layer): the five hooks print_hooks_json codex prints, the same
+# command and timeouts, as [[hooks.<Event>]] tables between the marker lines.
+print_hooks_toml() {
+  ht_cmd='sh "$HOME/.config/alice/alice-capture.sh" hook codex || true'
+  printf '%s\n' "$TOML_BEGIN"
+  printf '%s\n' '# Alice capture hooks; sh ~/.config/alice/alice-capture.sh uninstall removes this block.'
+  ht_sep=
+  for ht_event in SessionStart Stop SubagentStop PreCompact SessionEnd; do
+    ht_timeout=10
+    # Codex gives SessionEnd at most 3 s.
+    if [ "$ht_event" = SessionEnd ]; then ht_timeout=3; fi
+    # The brackets go in as arguments: no `[[` in the code (the POSIX check reads it as bash's).
+    printf '%s%s%shooks.%s]]\n%s%shooks.%s.hooks]]\ntype = "command"\n' "$ht_sep" '[' '[' "$ht_event" '[' '[' "$ht_event"
+    printf "command = '%s'\\n" "$ht_cmd"
+    printf 'timeout = %s\n' "$ht_timeout"
+    ht_sep=$NL
+  done
+  printf '%s\n' "$TOML_END"
+}
+
+# The edit of Alice's block in config.toml $2 ($1: install, with the block $3; or uninstall),
+# under python3's TOML reader (tomllib, or tomli): it is written only when the result reads back
+# as TOML that means exactly what the file meant plus Alice's five hooks (install) or minus them
+# (uninstall), after a copy of the old file to config.toml.bak-alice (0600). The rules are those
+# of `alice hooks install codex` (agent_hooks/codex_toml.rs):
+# - install appends the block at the end of the file (after a newline when its last line has
+#   none); a block whose own lines are already the block (blank lines aside) is left byte for
+#   byte; another one is replaced in place;
+# - other tables inside the block (Codex's [hooks.state."…"] trust records) are not Alice's: a
+#   replace puts them just below the block, a removal leaves them where they are;
+# - Alice's entries outside a block (added by hand) are left to the person.
+# Exit 10: written ("appended", "replaced" or "removed" on stdout); 11: nothing to do; 12:
+# refused, the reason on stdout (never a line of the file); 13: no TOML reader; 14: Alice's
+# entries are in the file outside a block; anything else: python3 failed.
+codex_config_py() {
+  python3 -I - "$@" 2>/dev/null <<'PY'
+import os
+import re
+import sys
+
+WRITTEN, NOTHING, REFUSED, NO_READER, OUTSIDE = 10, 11, 12, 13, 14
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        sys.exit(NO_READER)
+
+BEGIN = "# >>> alice capture (Codex) >>>"
+END = "# <<< alice capture (Codex) <<<"
+EVENTS = ("SessionStart", "Stop", "SubagentStop", "PreCompact", "SessionEnd")
+ALICE = re.compile(r"alice-capture\.sh.{1,3}hook codex")
+HEADER = re.compile(r"\[\[\s*hooks\s*\.\s*([A-Za-z]+)\s*(\.\s*hooks\s*)?\]\]\s*(#.*)?")
+
+
+class Refused(Exception):
+    pass
+
+
+def parse(text, what):
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        m = re.search(r"line (\d+)", str(e))
+        raise Refused(what + " is not valid TOML" + (" (line %s)" % m.group(1) if m else ""))
+
+
+def alice_hook(h):
+    return (isinstance(h, dict) and set(h) <= {"type", "command", "timeout"}
+            and isinstance(h.get("command"), str) and ALICE.search(h["command"]) is not None)
+
+
+def alice_group(g):
+    return (isinstance(g, dict) and set(g) == {"hooks"} and isinstance(g["hooks"], list)
+            and len(g["hooks"]) == 1 and alice_hook(g["hooks"][0]))
+
+
+def split(v):
+    """The value without Alice's groups (nor the lists and hooks table left empty), and those."""
+    rest = dict(v)
+    mine = {}
+    hooks = v.get("hooks")
+    if isinstance(hooks, dict):
+        kept = {}
+        for event, groups in hooks.items():
+            if not isinstance(groups, list):
+                kept[event] = groups
+                continue
+            own = [g for g in groups if alice_group(g)]
+            other = [g for g in groups if not alice_group(g)]
+            if own:
+                mine[event] = own
+            if other:
+                kept[event] = other
+        if kept:
+            rest["hooks"] = kept
+        else:
+            del rest["hooks"]
+    return rest, mine
+
+
+def lines_of(text):
+    parts = text.split("\n")
+    lines = [p + "\n" for p in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def blank_or_comment(line):
+    s = line.strip()
+    return s == "" or s.startswith("#")
+
+
+def alice_chunk(chunk):
+    m = HEADER.fullmatch(chunk[0].strip())
+    if m is None or m.group(1) not in EVENTS:
+        return False
+    if m.group(2) is None:
+        return all(blank_or_comment(line) for line in chunk[1:])
+    try:
+        return alice_hook(tomllib.loads("".join(chunk[1:])))
+    except tomllib.TOMLDecodeError:
+        return False
+
+
+def solid(text):
+    return [line for line in text.split("\n") if line.strip()]
+
+
+def rebuild(text, block):
+    """None without a block; else (the text with block in its place, whether it was intact)."""
+    lines = lines_of(text)
+    begins = [i for i, line in enumerate(lines) if line.rstrip() == BEGIN]
+    ends = [i for i, line in enumerate(lines) if line.rstrip() == END]
+    if not begins and not ends:
+        return None
+    if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0]:
+        raise Refused("its Alice block is broken (a marker line is missing, doubled or out of order)")
+    b, e = begins[0], ends[0]
+    parts = [list()]
+    for line in lines[b + 1:e]:
+        if line.lstrip().startswith("["):
+            parts.append([line])
+        else:
+            parts[-1].append(line)
+    if not all(blank_or_comment(line) for line in parts[0]):
+        raise Refused("a key of another table sits inside its Alice block")
+    mine, other = [], []
+    for chunk in parts[1:]:
+        (mine if alice_chunk(chunk) else other).extend(chunk)
+    current = "".join([lines[b]] + parts[0] + mine + [lines[e]])
+    new = "".join(lines[:b]) + block + "".join(other) + "".join(lines[e + 1:])
+    return new, block != "" and solid(current) == solid(block)
+
+
+def verify(old, new_text, want):
+    old_rest = split(old)[0]
+    new_rest, mine = split(parse(new_text, "the result"))
+    if new_rest != old_rest:
+        raise Refused("the edit would change more than Alice's hooks")
+    if mine != want:
+        raise Refused("Alice's hooks would not come out as written "
+                      "(are some of Alice's entries outside its marked block?)")
+
+
+def put(path, data, mode):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(path, mode)
+
+
+def write(path, raw, new):
+    real = os.path.realpath(path)
+    mode = os.stat(real).st_mode & 0o7777
+    backup = path + ".bak-alice"
+    tmp_backup = "%s.tmp.%d" % (backup, os.getpid())
+    tmp = "%s.tmp.%d" % (real, os.getpid())
+    try:
+        put(tmp_backup, raw, 0o600)
+        put(tmp, new.encode("utf-8"), mode)
+        with open(real, "rb") as f:
+            if f.read() != raw:
+                raise Refused("it changed while Alice was editing it; run the command again")
+        os.replace(tmp_backup, backup)
+        os.replace(tmp, real)
+    finally:
+        for p in (tmp_backup, tmp):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def main():
+    mode, path = sys.argv[1], sys.argv[2]
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        if mode == "install":
+            raise Refused("it does not exist")
+        return NOTHING
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused("it is not UTF-8")
+    if mode == "install":
+        block = sys.argv[3].rstrip("\n") + "\n"
+        old = parse(text, "it")
+        want = split(parse(block, "Alice's block"))[1]
+        r = rebuild(text, block)
+        if r is None:
+            if split(old)[1] or ALICE.search(text):
+                return OUTSIDE
+            new = text + ("" if text == "" or text.endswith("\n") else "\n") + block
+            how = "appended"
+        else:
+            new, intact = r
+            if intact:
+                return NOTHING
+            how = "replaced"
+        verify(old, new, want)
+    elif mode == "uninstall":
+        r = rebuild(text, "")
+        if r is None:
+            return NOTHING
+        new = r[0]
+        verify(parse(text, "it"), new, {})
+        how = "removed"
+    else:
+        raise Refused("unknown mode")
+    write(path, raw, new)
+    print(how)
+    return WRITTEN
+
+
+try:
+    code = main()
+except Refused as e:
+    print(e)
+    code = REFUSED
+except OSError as e:
+    print("it could not be written (%s)" % (e.strerror or "error"))
+    code = REFUSED
+sys.exit(code)
+PY
+}
+
+# `codex-config install`: Alice's block in $CODEX_HOME/config.toml, through codex_config_py
+# (exit 13 without python3). Its line and its exit status are codex_config_py's.
+codex_config_install() {
+  command -v python3 >/dev/null 2>&1 || return 13
+  codex_config_py install "${CODEX_HOME:-$HOME/.codex}/config.toml" "$(print_hooks_toml)"
+}
+
+# The numbers of the lines of file $1 that are the marker $2 (trailing blanks aside).
+marker_lines() {
+  sed -n "s/[[:space:]]*\$//
+/^$2\$/=" "$1" 2>/dev/null
+}
+
+# Takes Alice's block out of config.toml $1 when it is exactly what print_hooks_toml prints
+# (lines for lines), with sed: no python3 is needed, and the file comes back as it was before the
+# block was appended. 1 when it is not exactly that block (or $1 is a link); otherwise
+# codex_config_py's codes (10: removed; 12: refused, the reason on stdout).
+codex_config_exact_remove() {
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  ce_snap="$1.bak-alice.tmp.$$"
+  ce_new="$1.tmp.$$"
+  rm -f "$ce_snap" "$ce_new"
+  if ! cp "$1" "$ce_snap" 2>/dev/null; then
+    rm -f "$ce_snap"
+    return 1
+  fi
+  ce_b=$(marker_lines "$ce_snap" "$TOML_BEGIN")
+  ce_e=$(marker_lines "$ce_snap" "$TOML_END")
+  case $ce_b in '' | *[!0-9]*) ce_b= ;; esac
+  case $ce_e in '' | *[!0-9]*) ce_e= ;; esac
+  if [ -z "$ce_b" ] || [ -z "$ce_e" ] || [ "$ce_b" -ge "$ce_e" ] ||
+    ! sed -n "${ce_b},${ce_e}p" "$ce_snap" >"$ce_new" 2>/dev/null ||
+    ! print_hooks_toml | cmp -s - "$ce_new"; then
+    rm -f "$ce_snap" "$ce_new"
+    return 1
+  fi
+  # The new file starts as a copy of the old one, so it keeps its mode.
+  if ! { cp -p "$1" "$ce_new" && sed "${ce_b},${ce_e}d" "$ce_snap" >"$ce_new"; } 2>/dev/null; then
+    rm -f "$ce_snap" "$ce_new"
+    printf 'it could not be written\n'
+    return 12
+  fi
+  if ! cmp -s "$1" "$ce_snap"; then
+    rm -f "$ce_snap" "$ce_new"
+    printf 'it changed while Alice was editing it; run the command again\n'
+    return 12
+  fi
+  if ! mv -f "$ce_snap" "$1.bak-alice" 2>/dev/null || ! mv -f "$ce_new" "$1" 2>/dev/null; then
+    rm -f "$ce_snap" "$ce_new"
+    printf 'it could not be written\n'
+    return 12
+  fi
+  printf 'removed\n'
+  return 10
+}
+
+# Takes Alice's block out of config.toml $1: by sed when it is exactly the block, else through
+# codex_config_py (13 without python3). codex_config_py's codes and line.
+codex_config_remove() {
+  codex_config_exact_remove "$1"
+  cr_rc=$?
+  [ "$cr_rc" -eq 1 ] || return "$cr_rc"
+  command -v python3 >/dev/null 2>&1 || return 13
+  codex_config_py uninstall "$1"
+}
+
 # ---- status and uninstall ----
 
-# Where the Codex hooks stand: in $CODEX_HOME/hooks.json (as setup wrote it, or changed), in an
-# inline [hooks] table of config.toml, or not found. Silent when there is no Codex here.
+# Where the Codex hooks stand: in $CODEX_HOME/hooks.json (as setup wrote it, or changed), in
+# Alice's block of config.toml, in another table of config.toml, or not found. Silent when there
+# is no Codex here.
 codex_status() {
   cst_home="${CODEX_HOME:-$HOME/.codex}"
   cst_re='alice-capture\.sh.{1,3}hook codex'
+  cst_trust="Codex runs them only after you trust them (Trust all and continue, or /hooks)"
   if [ -f "$cst_home/hooks.json" ] && grep -Eq "$cst_re" "$cst_home/hooks.json" 2>/dev/null; then
     if [ -f "$DIR/codex-hooks.written" ] && cmp -s "$cst_home/hooks.json" "$DIR/codex-hooks.written"; then
-      printf 'codex hooks: installed (%s/hooks.json); Codex runs them only after you trust them in /hooks\n' "$cst_home"
+      printf 'codex hooks: installed (%s/hooks.json); %s\n' "$cst_home" "$cst_trust"
     else
-      printf 'codex hooks: in %s/hooks.json (changed since setup wrote it, or added by hand); Codex runs them only after you trust them in /hooks\n' "$cst_home"
+      printf 'codex hooks: in %s/hooks.json (changed since setup wrote it, or added by hand); %s\n' "$cst_home" "$cst_trust"
     fi
   elif grep -Eq "$cst_re" "$cst_home/config.toml" 2>/dev/null; then
-    printf 'codex hooks: in %s/config.toml; Codex runs them only after you trust them in /hooks\n' "$cst_home"
+    if grep -qF "$TOML_BEGIN" "$cst_home/config.toml" 2>/dev/null; then
+      printf "codex hooks: installed (Alice's block in %s/config.toml); %s\n" "$cst_home" "$cst_trust"
+    else
+      printf 'codex hooks: in %s/config.toml (added by hand); %s\n' "$cst_home" "$cst_trust"
+    fi
   elif command -v codex >/dev/null 2>&1 || [ -f "$DIR/codex-hooks.written" ]; then
     printf 'codex hooks: not found; run the setup command\n'
   fi
@@ -1360,6 +1704,24 @@ uninstall_main() {
     fi
     rm -f "$DIR/codex-hooks.written"
   fi
+  # Codex: Alice's block in config.toml, and only that block.
+  un_cfg="$un_ch/config.toml"
+  if [ -f "$un_cfg" ] && grep -qF "$TOML_BEGIN" "$un_cfg" 2>/dev/null; then
+    un_why=$(codex_config_remove "$un_cfg")
+    un_rc=$?
+    case $un_rc in
+      10) printf "Removed Alice's block of Codex hooks from %s; the previous file is %s.bak-alice (restart open Codex sessions).\n" "$un_cfg" "$un_cfg" ;;
+      11) ;;
+      *)
+        case $un_rc in
+          12) ;;
+          13) un_why="there is no python3 with a TOML reader (Python 3.11 or later) to check the edit" ;;
+          *) un_why="python3 failed while checking the edit" ;;
+        esac
+        printf "%s still has Alice's block of Codex hooks (%s); remove the lines from '%s' to '%s' yourself.\n" "$un_cfg" "$un_why" "$TOML_BEGIN" "$TOML_END"
+        ;;
+    esac
+  fi
   if confirm "Delete the capture files (the hook script, state/, capture.conf, capture.log, paused-until, update-checked)? The token and url files stay. [y/N] "; then
     rm -rf "${DIR:?}/state"
     rm -f "$SCRIPT" "$CONF" "$LOG" "$PAUSED" "$CHECKED"
@@ -1386,6 +1748,16 @@ main() {
       shift
       print_hooks_json "$@"
       return
+      ;;
+    print-hooks-toml) print_hooks_toml ;;
+    codex-config)
+      case ${2:-} in
+        install) codex_config_install ;;
+        *)
+          printf 'usage: sh ~/.config/alice/alice-capture.sh codex-config install\n' >&2
+          return 2
+          ;;
+      esac
       ;;
     status) status_main ;;
     uninstall) uninstall_main ;;

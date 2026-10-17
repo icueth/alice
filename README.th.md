@@ -202,7 +202,7 @@ Alice เก็บทุก session ของ Claude Code และ Codex ไว
 
 ```bash
 alice hooks install claude      # Claude Code: เพิ่ม hook 5 ตัวใน ~/.claude/settings.json (สำรองไฟล์เดิมไว้ hook อื่นอยู่ครบ)
-alice hooks install codex       # Codex: ~/.codex/hooks.json แล้ว trust hook ครั้งเดียวที่ /hooks ใน Codex
+alice hooks install codex       # Codex: ~/.codex/hooks.json (หรือบล็อกที่มีเครื่องหมายใน config.toml ถ้ามี hook อยู่แล้ว) แล้วเลือก "Trust all and continue" ใน Codex
 alice capture status            # session ที่เก็บไว้ อ่านไปถึงไหนแล้ว และการกลั่นความรู้ไปถึงไหน
 alice recall --raw "error ตอน migrate เมื่อวาน"
 ```

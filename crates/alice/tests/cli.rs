@@ -4745,8 +4745,9 @@ fn alice_hooks_cli_round_trip() {
     let hooks_json = e.user_home.join(".codex/hooks.json");
     let out = e.ok(&["hooks", "install", "codex"]);
     assert!(
-        out.trim_end()
-            .ends_with("open /hooks in Codex once and trust the Alice entries."),
+        out.trim_end().ends_with(
+            "Codex: the next time you open Codex it asks 'Hooks need review' \u{2014} choose Trust all and continue (or review the Alice entries with /hooks)."
+        ),
         "{out}"
     );
     let v: serde_json::Value =
@@ -4764,7 +4765,7 @@ fn alice_hooks_cli_round_trip() {
     assert_eq!(
         dry["notes"],
         serde_json::json!([
-            "Codex runs a hook only after you trust it: open /hooks in Codex once and trust the Alice entries."
+            "Codex: the next time you open Codex it asks 'Hooks need review' \u{2014} choose Trust all and continue (or review the Alice entries with /hooks)."
         ]),
         "{dry}"
     );
@@ -4775,17 +4776,49 @@ fn alice_hooks_cli_round_trip() {
         "{s}"
     );
     assert_eq!(s["file"], hooks_json.display().to_string());
-    // Codex's inline hooks in config.toml stop an install.
-    std::fs::write(e.user_home.join(".codex/config.toml"), "[hooks]\n").unwrap();
-    let o = e.run(&["hooks", "install", "codex"]);
-    assert!(!o.status.success());
-    assert!(
-        stderr(&o).contains("one format per layer"),
-        "{}",
-        stderr(&o)
-    );
-    std::fs::remove_file(e.user_home.join(".codex/config.toml")).unwrap();
+    // Hooks of its own in config.toml while hooks.json holds Alice's: hooks.json keeps them, and
+    // config.toml is not touched.
+    let config = e.user_home.join(".codex/config.toml");
+    let own = "model = \"o3\"\n\n# BEGIN OPENRIG MANAGED ACTIVITY HOOKS\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = 'node \"/opt/relay.js\"'\ntimeout = 5\n# END OPENRIG MANAGED ACTIVITY HOOKS\n";
+    std::fs::write(&config, own).unwrap();
+    let again = e.json(&["hooks", "install", "codex"]);
+    assert_eq!(again["changed"], false, "{again}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), own);
     assert_eq!(e.json(&["hooks", "uninstall", "codex"])["removed"], 5);
+    // Without them in hooks.json: Alice's block at the end of config.toml, after a backup.
+    let out = e.ok(&["hooks", "install", "codex"]);
+    assert!(out.contains("# >>> alice capture (Codex) >>>"), "{out}");
+    assert!(out.contains("Trust all and continue"), "{out}");
+    let with_block = std::fs::read_to_string(&config).unwrap();
+    assert!(with_block.starts_with(own), "{with_block}");
+    assert!(
+        with_block.ends_with("timeout = 3\n# <<< alice capture (Codex) <<<\n"),
+        "{with_block}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(e.user_home.join(".codex/config.toml.bak-alice")).unwrap(),
+        own
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks_json).unwrap()).unwrap();
+    assert!(v.get("hooks").is_none(), "nothing in hooks.json: {v}");
+    let s = e.json(&["hooks", "status", "codex"]);
+    assert_eq!(s["installed"], true, "{s}");
+    assert_eq!(s["file"], config.display().to_string(), "{s}");
+    let again = e.json(&["hooks", "install", "codex"]);
+    assert_eq!(
+        (&again["changed"], &again["codex_block"]),
+        (&serde_json::json!(false), &serde_json::json!(true)),
+        "{again}"
+    );
+    let gone = e.json(&["hooks", "uninstall", "codex"]);
+    assert_eq!(
+        (&gone["removed"], &gone["codex_block"]),
+        (&serde_json::json!(5), &serde_json::json!(true)),
+        "{gone}"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), own);
+    std::fs::remove_file(&config).unwrap();
 
     // `--settings` names another file.
     let other = e.user_home.join("elsewhere/settings.json");

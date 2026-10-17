@@ -16,6 +16,7 @@ keychain = ["dep:keyring"]
 [dependencies]
 keyring = { workspace = true, optional = true }
 toml.workspace = true
+toml_edit.workspace = true
 alice-core = { path = "../alice-core" }
 alice-embed = { path = "../alice-embed" }
 axum.workspace = true

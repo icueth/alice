@@ -16,9 +16,13 @@
 //!   file that would not change is not written. Otherwise the new text is checked against
 //!   `serde_json`, the old file is copied to `<file>.alice-backup-<stamp>` (0600; the newest
 //!   five are kept) and the new one replaces it atomically.
-//! - **Codex** takes hooks from one format per layer: an install is refused while its
-//!   `config.toml` holds hooks of its own.
+//! - **Codex** takes hooks from one format per layer: while its `config.toml` holds hooks of
+//!   its own (`[[hooks.<Event>]]` tables, such as OpenRig's), the hooks go into a marked block at
+//!   the end of that file instead ([`codex_toml`]), after a backup to `config.toml.bak-alice`,
+//!   unless `hooks.json` already holds Alice's. Uninstall takes them out of either. Codex runs a
+//!   new hook only after the person trusts it ([`CODEX_TRUST`]); Alice never writes that trust.
 
+pub mod codex_toml;
 pub mod json;
 
 use self::json::JValue;
@@ -39,8 +43,13 @@ pub const CLAUDE_EVENTS: &[(&str, &str)] = &[
 ];
 
 /// The last line of a Codex install: Codex runs a hook only once the person trusts it (see
-/// [`install_notes`]).
-pub const CODEX_TRUST: &str = "Codex runs a hook only after you trust it: open /hooks in Codex once and trust the Alice entries.";
+/// [`install_notes`]). The trust is the person's decision: Alice never writes it for them.
+pub const CODEX_TRUST: &str = "Codex: the next time you open Codex it asks 'Hooks need review' \u{2014} choose Trust all and continue (or review the Alice entries with /hooks).";
+/// The comment line of Alice's block in Codex's `config.toml`.
+const CODEX_BLOCK_HINT: &str =
+    "Alice capture hooks; `alice hooks uninstall codex` removes this block.";
+/// The backup of Codex's `config.toml` before Alice changes it (the setup guides use it too).
+const CODEX_CONFIG_BACKUP: &str = "config.toml.bak-alice";
 
 /// A hook's time limit in seconds: a guard, as the hook itself ends within 100 ms.
 const TIMEOUT_SECS: u32 = 10;
@@ -101,8 +110,11 @@ pub struct HookTarget {
     pub alice: PathBuf,
     /// `ALICE_HOME` for the hooks, when it is not the default `~/.alice`.
     pub alice_home: Option<PathBuf>,
-    /// Codex's `config.toml`, which must not hold hooks of its own (`None` for Claude Code).
+    /// Codex's `config.toml`, whose hooks of its own take Alice's in a marked block (`None` for
+    /// Claude Code).
     pub codex_config: Option<PathBuf>,
+    /// `file` was named with `--settings`: only that file is used.
+    pub explicit_file: bool,
 }
 
 impl HookTarget {
@@ -158,6 +170,7 @@ impl HookTarget {
             alice,
             alice_home,
             codex_config,
+            explicit_file: settings_override.is_some(),
         })
     }
 }
@@ -193,6 +206,13 @@ pub struct HookChange {
     /// may hold the person's keys.
     #[serde(skip)]
     pub text: String,
+    /// Codex: `file` is its `config.toml`, and the hooks are in Alice's marked block there.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub codex_block: bool,
+    /// Another file the command changed too: an uninstall that found Alice's Codex hooks both
+    /// in the block and in `hooks.json`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<HookChange>,
 }
 
 /// Whether Alice's hooks are in an agent's file.
@@ -211,10 +231,18 @@ pub struct HookStatus {
     pub missing: Vec<String>,
 }
 
-/// Adds Alice's hooks for the five events, after removing those already there.
+/// Adds Alice's hooks for the five events, after removing those already there. For Codex, into
+/// Alice's block of `config.toml` while that file holds hooks of its own and `hooks.json` holds
+/// none of Alice's.
 pub fn install(t: &HookTarget, dry_run: bool) -> Result<HookChange> {
     if let Some(config) = &t.codex_config {
-        check_codex_config(config, &t.file)?;
+        if t.explicit_file {
+            check_codex_config(config, &t.file)?;
+        } else if let Some(text) = codex_config_with_hooks(config)?
+            && !holds_alice(t)?
+        {
+            return install_codex_block(t, config, &text, dry_run);
+        }
     }
     let (old, before) = load(&t.file)?;
     let mut after = before.clone();
@@ -230,12 +258,41 @@ pub fn install(t: &HookTarget, dry_run: bool) -> Result<HookChange> {
         others: others(&before, t.agent),
         changed: old.is_none() || after != before,
         text: String::new(),
+        codex_block: false,
+        also: Vec::new(),
     };
     finish(change, old, &after, dry_run)
 }
 
-/// Removes exactly Alice's hooks, and the groups, lists and `hooks` object they leave empty.
+/// Removes exactly Alice's hooks, and the groups, lists and `hooks` object they leave empty. For
+/// Codex also Alice's block of `config.toml`, which is then the change reported first.
 pub fn uninstall(t: &HookTarget, dry_run: bool) -> Result<HookChange> {
+    let config = t.codex_config.as_ref().filter(|_| !t.explicit_file);
+    let Some(config) = config else {
+        return uninstall_file(t, dry_run);
+    };
+    // hooks.json is read (and refused when it is not JSON) before config.toml is written.
+    let json = uninstall_file(t, true)?;
+    let Some(mut block) = uninstall_codex_block(t, config, dry_run)? else {
+        return if dry_run {
+            Ok(json)
+        } else {
+            uninstall_file(t, false)
+        };
+    };
+    let json = if dry_run {
+        json
+    } else {
+        uninstall_file(t, false)?
+    };
+    if json.changed {
+        block.also.push(json);
+    }
+    Ok(block)
+}
+
+/// Removes Alice's hooks from `t.file`.
+fn uninstall_file(t: &HookTarget, dry_run: bool) -> Result<HookChange> {
     let (old, before) = load(&t.file)?;
     let mut after = before.clone();
     let removed = remove_alice(&mut after, t.agent, &[]);
@@ -247,16 +304,40 @@ pub fn uninstall(t: &HookTarget, dry_run: bool) -> Result<HookChange> {
         others: others(&before, t.agent),
         changed: after != before,
         text: String::new(),
+        codex_block: false,
+        also: Vec::new(),
     };
     finish(change, old, &after, dry_run)
 }
 
-/// Which events hold Alice's hooks and whether the programs they run exist. Reads only.
+/// Which events hold Alice's hooks and whether the programs they run exist. Reads only. For
+/// Codex, its `config.toml` counts too (when it reads as TOML), and is the file named when only it
+/// holds Alice's hooks.
 pub fn status(t: &HookTarget) -> Result<HookStatus> {
     let (_, root) = load(&t.file)?;
+    let mut all: Vec<(String, String)> = commands(&root)
+        .into_iter()
+        .map(|(e, c)| (e.to_owned(), c.to_owned()))
+        .collect();
+    let mut file = t.file.clone();
+    if let Some(config) = t.codex_config.as_ref().filter(|_| !t.explicit_file)
+        && let Ok(text) = std::fs::read_to_string(config)
+        && let Ok(table) = codex_toml::parse(&text, "it")
+    {
+        let mine = |cmds: &[(String, String)]| {
+            cmds.iter()
+                .any(|(_, c)| alice_program(c, t.agent).is_some())
+        };
+        let more = codex_toml::commands(&table);
+        if !mine(&all) && mine(&more) {
+            file = config.clone();
+        }
+        all.extend(more);
+    }
     let mut events: Vec<String> = Vec::new();
     let mut binaries: Vec<String> = Vec::new();
-    for (event, command) in commands(&root) {
+    for (event, command) in &all {
+        let (event, command) = (event.as_str(), command.as_str());
         let Some(program) = alice_program(command, t.agent) else {
             continue;
         };
@@ -273,7 +354,7 @@ pub fn status(t: &HookTarget) -> Result<HookStatus> {
         .cloned()
         .collect();
     Ok(HookStatus {
-        file: t.file.clone(),
+        file,
         installed: CLAUDE_EVENTS
             .iter()
             .all(|(e, _)| events.iter().any(|x| x == e)),
@@ -328,6 +409,13 @@ pub fn install_report(t: &HookTarget, c: &HookChange, dry_run: bool, undo: &str)
         s.push_str(&format!(
             "{label}: {verb} Alice's capture hooks to {file}:\n"
         ));
+        if c.codex_block {
+            s.push_str(&format!(
+                "It has hooks of its own, and Codex reads one format per layer, so they are in a marked block there ({} \u{2026} {}).\n",
+                codex_toml::BEGIN,
+                codex_toml::END
+            ));
+        }
         for a in &c.added {
             s.push_str(&format!("  {a}\n"));
         }
@@ -387,6 +475,19 @@ pub fn uninstall_report(t: &HookTarget, c: &HookChange, dry_run: bool) -> String
     };
     if let Some(b) = &c.backup {
         s.push_str(&format!("The previous file is saved as {}.\n", b.display()));
+    }
+    for more in &c.also {
+        let mut one = uninstall_report(t, more, dry_run);
+        // The closing line once, below.
+        for tail in [
+            "Dry run: nothing was written.\n",
+            "Sessions started from now on run without them.\n",
+        ] {
+            if let Some(cut) = one.strip_suffix(tail) {
+                one = cut.to_owned();
+            }
+        }
+        s.push_str(&one);
     }
     if dry_run {
         s.push_str("Dry run: nothing was written.\n");
@@ -551,8 +652,16 @@ fn commands(root: &JValue) -> Vec<(&str, &str)> {
 /// The other hooks whose commands mention `alice` or `mempalace`, each once, in file order, as
 /// [`other_label`]s.
 fn others(root: &JValue, agent: HookAgent) -> Vec<String> {
+    others_of(commands(root), agent)
+}
+
+/// [`others`] of any list of `(event, command)`.
+fn others_of<'a>(
+    commands: impl IntoIterator<Item = (&'a str, &'a str)>,
+    agent: HookAgent,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for (event, c) in commands(root) {
+    for (event, c) in commands {
         if mentions_memory(c) && alice_program(c, agent).is_none() {
             let label = other_label(event, c);
             if !out.contains(&label) {
@@ -718,6 +827,18 @@ fn finish(
 /// Puts `text` in place of `file` atomically, after a backup of `old` (when there is a file). A
 /// link stays a link: the file it points to is replaced, and the backup sits next to the link.
 fn write(file: &Path, old: Option<&str>, text: &str) -> Result<Option<PathBuf>> {
+    let backup = write_with(file, old, text, &|o| backup(file, o))?;
+    prune_backups(file);
+    Ok(backup)
+}
+
+/// [`write`], with the backup `keep` makes of the old text.
+fn write_with(
+    file: &Path,
+    old: Option<&str>,
+    text: &str,
+    keep: &dyn Fn(&str) -> Result<PathBuf>,
+) -> Result<Option<PathBuf>> {
     let fail = |e: std::io::Error| {
         AliceError::Other(format!(
             "cannot write {}: {e}; it is unchanged",
@@ -757,7 +878,7 @@ fn write(file: &Path, old: Option<&str>, text: &str) -> Result<Option<PathBuf>> 
                 file.display()
             )));
         }
-        let backup = old.map(|o| backup(file, o)).transpose()?;
+        let backup = old.map(keep).transpose()?;
         std::fs::rename(&tmp, &target).map_err(fail)?;
         #[cfg(unix)]
         if let Some(dir) = target.parent().and_then(|d| std::fs::File::open(d).ok()) {
@@ -768,9 +889,32 @@ fn write(file: &Path, old: Option<&str>, text: &str) -> Result<Option<PathBuf>> 
     if done.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    let backup = done?;
-    prune_backups(file);
-    Ok(backup)
+    done
+}
+
+/// Copies `old` to `<dir of file>/config.toml.bak-alice` (private), in place of an older one.
+fn codex_config_backup(file: &Path, old: &str) -> Result<PathBuf> {
+    let path = file.with_file_name(CODEX_CONFIG_BACKUP);
+    let tmp = file.with_file_name(format!(
+        ".{CODEX_CONFIG_BACKUP}.{}.tmp",
+        alice_core::ids::new_id()
+    ));
+    let done = (|| {
+        let mut f = create_private(&tmp)?;
+        f.write_all(old.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &path)
+    })();
+    if let Err(e) = done {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(AliceError::Other(format!(
+            "cannot back up {} to {}: {e}; it is unchanged",
+            file.display(),
+            path.display()
+        )));
+    }
+    Ok(path)
 }
 
 fn file_name(p: &Path) -> String {
@@ -886,10 +1030,167 @@ fn program_exists(program: &str) -> bool {
         .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(p).is_file()))
 }
 
-/// Codex takes hooks from one format per layer: while its `config.toml` holds hooks of its own,
-/// a top-level `hooks` key (`[hooks]` tables, `[[hooks.<Event>]]` arrays, `hooks.<Event> = …`
-/// before the first table), no `hooks.json` is written beside them. `[features] hooks = true`
-/// is no such key. The tenant's `setup.sh` (`codex_inline_hooks`) keeps the same rule.
+/// Codex's `config.toml` text when it holds hooks of its own ([`codex_toml::has_hooks`]); `None`
+/// when it is missing or holds none. One that is not TOML is refused by its line.
+fn codex_config_with_hooks(config: &Path) -> Result<Option<String>> {
+    let text = match std::fs::read_to_string(config) {
+        Ok(t) => t,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(AliceError::Other(format!(
+                "cannot read {}: {e}; nothing was changed",
+                config.display()
+            )));
+        }
+    };
+    let table = codex_toml::parse(&text, &config.display().to_string()).map_err(|why| {
+        AliceError::invalid(format!(
+            "{why}; fix it, then run the command again. Nothing was changed."
+        ))
+    })?;
+    Ok(codex_toml::has_hooks(&table).then_some(text))
+}
+
+/// Whether `t.file` holds an Alice entry for `t.agent`.
+fn holds_alice(t: &HookTarget) -> Result<bool> {
+    let (_, root) = load(&t.file)?;
+    Ok(commands(&root)
+        .iter()
+        .any(|(_, c)| alice_program(c, t.agent).is_some()))
+}
+
+/// The five Codex hooks as Alice's block of `config.toml`.
+fn codex_block(t: &HookTarget) -> Result<(String, Vec<String>)> {
+    let mut entries = Vec::new();
+    for &(event, arg) in CLAUDE_EVENTS {
+        entries.push(codex_toml::Entry {
+            event,
+            command: command(t, arg)?,
+            timeout: t.agent.timeout(event),
+        });
+    }
+    let added = entries.iter().map(|e| e.command.clone()).collect();
+    Ok((codex_toml::block(CODEX_BLOCK_HINT, &entries), added))
+}
+
+fn is_codex_alice(c: &str) -> bool {
+    alice_program(c, HookAgent::Codex).is_some()
+}
+
+/// An edit of `config.toml` that cannot be made safely: refused, the file untouched.
+fn codex_refused(config: &Path, why: &str) -> AliceError {
+    AliceError::invalid(format!(
+        "Alice could not change {} safely ({why}), so it is unchanged. Add the hooks by hand, or fix what is named, then run `alice hooks install codex` again.",
+        config.display()
+    ))
+}
+
+/// Alice's block in `config.toml` (`text`), which holds hooks of its own.
+fn install_codex_block(
+    t: &HookTarget,
+    config: &Path,
+    text: &str,
+    dry_run: bool,
+) -> Result<HookChange> {
+    let (block, added) = codex_block(t)?;
+    let edit = codex_toml::install(text, &block, &is_codex_alice)
+        .map_err(|why| codex_refused(config, &why))?;
+    let table = codex_toml::parse(text, "it").map_err(|why| codex_refused(config, &why))?;
+    let cmds = codex_toml::commands(&table);
+    let mut change = HookChange {
+        file: config.to_path_buf(),
+        backup: None,
+        added,
+        removed: 0,
+        others: others_of(cmds.iter().map(|(e, c)| (e.as_str(), c.as_str())), t.agent),
+        changed: false,
+        text: text.to_owned(),
+        codex_block: true,
+        also: Vec::new(),
+    };
+    match edit {
+        codex_toml::Edit::Changed { text: new, removed } => {
+            change.changed = true;
+            change.removed = removed;
+            if !dry_run {
+                change.backup = write_with(config, Some(text), &new, &|o| {
+                    codex_config_backup(config, o)
+                })?;
+            }
+            change.text = new;
+        }
+        codex_toml::Edit::Unchanged { removed } => change.removed = removed,
+        codex_toml::Edit::Outside { same: true } => {}
+        codex_toml::Edit::Outside { same: false } | codex_toml::Edit::Absent => {
+            return Err(AliceError::invalid(format!(
+                "{} holds Alice capture hooks outside Alice's marked block (added by hand?) that differ from the ones it would write; remove them, then run `alice hooks install codex` again. Nothing was changed.",
+                config.display()
+            )));
+        }
+    }
+    Ok(change)
+}
+
+/// Takes Alice's block out of `config.toml`; `None` when there is no such file or block.
+fn uninstall_codex_block(
+    t: &HookTarget,
+    config: &Path,
+    dry_run: bool,
+) -> Result<Option<HookChange>> {
+    let text = match std::fs::read_to_string(config) {
+        Ok(t) => t,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(AliceError::Other(format!(
+                "cannot read {}: {e}; nothing was changed",
+                config.display()
+            )));
+        }
+    };
+    let refused = |why: String| {
+        AliceError::invalid(format!(
+            "Alice could not take its block out of {} safely ({why}), so nothing was changed. Remove the lines from `{}` to `{}` by hand.",
+            config.display(),
+            codex_toml::BEGIN,
+            codex_toml::END
+        ))
+    };
+    let codex_toml::Edit::Changed { text: new, removed } =
+        codex_toml::uninstall(&text, &is_codex_alice).map_err(refused)?
+    else {
+        return Ok(None);
+    };
+    let others = codex_toml::parse(&new, "it")
+        .map(|table| {
+            let cmds = codex_toml::commands(&table);
+            others_of(cmds.iter().map(|(e, c)| (e.as_str(), c.as_str())), t.agent)
+        })
+        .unwrap_or_default();
+    let backup = if dry_run {
+        None
+    } else {
+        write_with(config, Some(&text), &new, &|o| {
+            codex_config_backup(config, o)
+        })?
+    };
+    Ok(Some(HookChange {
+        file: config.to_path_buf(),
+        backup,
+        added: Vec::new(),
+        removed,
+        others,
+        changed: true,
+        text: new,
+        codex_block: true,
+        also: Vec::new(),
+    }))
+}
+
+/// With `--settings`, Codex's one-format-per-layer rule as before: while its `config.toml` holds
+/// hooks of its own, a top-level `hooks` key (`[hooks]` tables, `[[hooks.<Event>]]` arrays,
+/// `hooks.<Event> = …` before the first table), no other file is written beside them. `[features]
+/// hooks = true` is no such key. The tenant's `setup.sh` (`codex_inline_hooks`) keeps the same
+/// rule for choosing `config.toml` over `hooks.json`.
 fn check_codex_config(config: &Path, file: &Path) -> Result<()> {
     let text = match std::fs::read_to_string(config) {
         Ok(t) => t,
@@ -1690,55 +1991,293 @@ mod tests {
         }
         let report = install_report(&t, &c, false, "alice hooks uninstall codex");
         assert!(report.ends_with(&format!("{CODEX_TRUST}\n")), "{report}");
-        assert!(report.contains("open /hooks in Codex once and trust the Alice entries"));
+        assert!(
+            report.contains("'Hooks need review'") && report.contains("Trust all and continue")
+        );
+        assert!(!c.codex_block && c.file == t.file, "{c:?}");
         // A Claude Code install says nothing of it.
         let t = m.target(HookAgent::Claude);
         let c = install(&t, false).unwrap();
         assert!(!install_report(&t, &c, false, "x").contains("/hooks"));
     }
 
+    /// A Codex `config.toml` as OpenRig leaves it: its own marked block of `[[hooks.<Event>]]`
+    /// tables, the features switch, an MCP server and a trust record.
+    const OPENRIG: &str = r#"model = "gpt-5"
+
+[features]
+hooks = true
+
+[mcp_servers.exa]
+command = "npx"
+
+# BEGIN OPENRIG MANAGED ACTIVITY HOOKS
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = 'node "/opt/openrig/relay.js"'
+timeout = 5
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'node "/opt/openrig/relay.js"'
+timeout = 5
+# END OPENRIG MANAGED ACTIVITY HOOKS
+
+[hooks.state."/home/u/.codex/config.toml:session_start:0:0"]
+trusted_hash = "sha256:abc"
+"#;
+
+    /// The block Alice appends for `m`'s `alice`.
+    fn codex_block_of(m: &Machine) -> String {
+        let mut b = format!("{}\n# {CODEX_BLOCK_HINT}\n", codex_toml::BEGIN);
+        for (i, (event, arg)) in CLAUDE_EVENTS.iter().enumerate() {
+            if i > 0 {
+                b.push('\n');
+            }
+            let timeout = if *event == "SessionEnd" { 3 } else { 10 };
+            b.push_str(&format!(
+                "[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = \"{}\"\ntimeout = {timeout}\n",
+                m.command(arg, "codex")
+            ));
+        }
+        b.push_str(codex_toml::END);
+        b.push('\n');
+        b
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn install_codex_refuses_inline_config_hooks() {
+    fn install_codex_appends_a_block_to_a_config_toml_with_hooks_of_its_own() {
+        use std::os::unix::fs::PermissionsExt;
         let m = Machine::new();
         let t = m.target(HookAgent::Codex);
         let config = t.codex_config.clone().unwrap();
-        for inline in [
-            "model = \"o3\"\n\n[hooks]\nfoo = 1\n",
-            "[[hooks.Stop]]\ncommand = \"echo\"\n",
-            "hooks.Stop = []\n",
+        let backup = config.with_file_name("config.toml.bak-alice");
+        write(&config, OPENRIG);
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let c = install(&t, false).unwrap();
+        assert!(c.changed && c.codex_block && c.removed == 0, "{c:?}");
+        assert_eq!(c.file, config);
+        // Every byte of the person's file, then Alice's block; no hooks.json beside it.
+        assert_eq!(read(&config), format!("{OPENRIG}{}", codex_block_of(&m)));
+        assert!(!t.file.exists());
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(c.backup.as_deref(), Some(backup.as_path()));
+        assert_eq!(read(&backup), OPENRIG);
+        assert_eq!(
+            std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(c.added.len(), 5);
+        let report = install_report(&t, &c, false, "alice hooks uninstall codex");
+        assert!(
+            report.contains(&config.display().to_string())
+                && report.contains(codex_toml::BEGIN)
+                && report.contains(&backup.display().to_string()),
+            "{report}"
+        );
+        assert!(report.ends_with(&format!("{CODEX_TRUST}\n")), "{report}");
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["codex_block"], true, "{json}");
+        // Status finds them there, and the program they run.
+        let s = status(&t).unwrap();
+        assert!(s.installed && s.binary_exists && s.file == config, "{s:?}");
+
+        // Again: the block is already Alice's, so nothing is written (the trust stays).
+        age(&config);
+        let before = mtime(&config);
+        let again = install(&t, false).unwrap();
+        assert!(
+            !again.changed && again.backup.is_none() && again.removed == 5,
+            "{again:?}"
+        );
+        assert_eq!(mtime(&config), before);
+        assert_eq!(read(&backup), OPENRIG);
+        // A dry run of an uninstall writes nothing; the real one restores the bytes.
+        let dry = uninstall(&t, true).unwrap();
+        assert!(
+            dry.changed && dry.codex_block && dry.removed == 5,
+            "{dry:?}"
+        );
+        assert_eq!(dry.text, OPENRIG);
+        assert_eq!(mtime(&config), before);
+        let gone = uninstall(&t, false).unwrap();
+        assert!(
+            gone.changed && gone.removed == 5 && gone.also.is_empty(),
+            "{gone:?}"
+        );
+        assert_eq!(read(&config), OPENRIG);
+        assert_eq!(read(&backup), format!("{OPENRIG}{}", codex_block_of(&m)));
+        assert!(uninstall_report(&t, &gone, false).contains(&config.display().to_string()));
+        assert!(!status(&t).unwrap().installed);
+        assert!(!t.file.exists());
+        // Nothing left to remove.
+        assert!(!uninstall(&t, false).unwrap().changed);
+    }
+
+    #[test]
+    fn install_codex_repairs_its_block_in_place_and_keeps_codex_s_trust_records() {
+        let m = Machine::new();
+        let t = m.target(HookAgent::Codex);
+        let config = t.codex_config.clone().unwrap();
+        let moved = HookTarget {
+            alice: m.root.join("gone/alice"),
+            ..t.clone()
+        };
+        write(&config, OPENRIG);
+        install(&moved, false).unwrap();
+        let s = status(&t).unwrap();
+        assert!(s.installed && !s.binary_exists, "{s:?}");
+        // Codex's trust record inside the block, then a hook added after it.
+        let trust =
+            "[hooks.state.\"/x/config.toml:session_end:0:0\"]\ntrusted_hash = \"sha256:d\"\n";
+        let later =
+            "[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"later\"\n";
+        let text = read(&config).replace(
+            &format!("{}\n", codex_toml::END),
+            &format!("{trust}{}\n{later}", codex_toml::END),
+        );
+        write(&config, &text);
+        let c = install(&t, false).unwrap();
+        assert!(c.changed && c.removed == 5, "{c:?}");
+        // In place, the record just below the block, the later hook after it as before.
+        assert_eq!(
+            read(&config),
+            format!("{OPENRIG}{}{trust}{later}", codex_block_of(&m))
+        );
+        let s = status(&t).unwrap();
+        assert!(s.installed && s.binary_exists, "{s:?}");
+    }
+
+    #[test]
+    fn install_codex_refuses_a_config_toml_it_cannot_add_to_safely() {
+        let m = Machine::new();
+        let t = m.target(HookAgent::Codex);
+        let config = t.codex_config.clone().unwrap();
+        let backup = config.with_file_name("config.toml.bak-alice");
+        for (text, why) in [
+            // A static list cannot take a [[hooks.Stop]] table.
+            ("model = \"o3\"\nhooks.Stop = []\n", "not valid TOML"),
+            ("[hooks]\nStop = [{ hooks = [] }]\n", "not valid TOML"),
+            ("[hooks.Stop]\nmatcher = \"x\"\n", "not valid TOML"),
         ] {
-            write(&config, inline);
-            // No hooks.json: none is made.
-            let e = install(&t, false).unwrap_err().to_string();
-            assert!(e.contains(&config.display().to_string()), "{inline}: {e}");
-            assert!(e.contains("one format"), "{inline}: {e}");
-            assert!(!t.file.exists());
-            // An existing one is left as it is, with no backup.
-            write(&t.file, "{}\n");
-            age(&t.file);
-            let before = mtime(&t.file);
-            assert!(install(&t, false).is_err());
-            assert!(install(&t, true).is_err());
-            assert_eq!(read(&t.file), "{}\n");
-            assert_eq!(mtime(&t.file), before);
-            assert!(backups_of(&t.file).is_empty());
-            std::fs::remove_file(&t.file).unwrap();
+            write(&config, text);
+            age(&config);
+            let before = mtime(&config);
+            for dry_run in [false, true] {
+                let e = install(&t, dry_run).unwrap_err().to_string();
+                assert!(
+                    e.contains(&config.display().to_string()) && e.contains(why),
+                    "{text:?}: {e}"
+                );
+                assert!(!e.contains("Stop = ") && !e.contains("matcher"), "{e}");
+            }
+            assert_eq!(read(&config), text);
+            assert_eq!(mtime(&config), before);
+            assert!(!backup.exists() && !t.file.exists());
         }
         // A config.toml that is not TOML is refused by its line, never its text.
         write(&config, "model = \"o3\"\nkey = \"unfinished\n");
         let e = install(&t, false).unwrap_err().to_string();
         assert!(e.contains("line 2") && !e.contains("unfinished"), "{e}");
         // Hooks of a table inside another one are not Codex's hooks layer, nor is the
-        // `[features] hooks = true` switch (the tenant's setup.sh has the same rule).
-        write(
-            &config,
-            "model = \"o3\"\n[features]\nhooks = true\n[mcp_servers.alice]\ncommand = \"alice\"\nhooks = 1\n",
-        );
-        install(&t, false).unwrap();
+        // `[features] hooks = true` switch (the tenant's setup.sh has the same rule): hooks.json.
+        let plain = "model = \"o3\"\n[features]\nhooks = true\n[mcp_servers.alice]\ncommand = \"alice\"\nhooks = 1\n";
+        write(&config, plain);
+        let c = install(&t, false).unwrap();
+        assert!(!c.codex_block && c.file == t.file, "{c:?}");
+        assert_eq!(read(&config), plain);
         assert!(status(&t).unwrap().installed);
+        // Hooks of its own added later: hooks.json keeps Alice's (one place, never two).
+        write(&config, OPENRIG);
+        let again = install(&t, false).unwrap();
+        assert!(!again.changed && !again.codex_block, "{again:?}");
+        assert_eq!(read(&config), OPENRIG);
         // Uninstall never needs the check.
         write(&config, "[hooks]\n");
         assert_eq!(uninstall(&t, false).unwrap().removed, 5);
+        assert_eq!(read(&config), "[hooks]\n");
+    }
+
+    #[test]
+    fn install_codex_with_settings_keeps_the_one_format_rule() {
+        let m = Machine::new();
+        let other = m.root.join("other/hooks.json");
+        let mut t =
+            HookTarget::locate(HookAgent::Codex, Some(&other), &m.env_without(&[])).unwrap();
+        t.alice = m.alice();
+        assert!(t.explicit_file);
+        let config = t.codex_config.clone().unwrap();
+        write(&config, OPENRIG);
+        let e = install(&t, false).unwrap_err().to_string();
+        assert!(e.contains("one format"), "{e}");
+        assert!(!other.exists());
+        assert_eq!(read(&config), OPENRIG);
+    }
+
+    #[test]
+    fn hand_added_codex_entries_in_config_toml_are_left_alone() {
+        let m = Machine::new();
+        let t = m.target(HookAgent::Codex);
+        let config = t.codex_config.clone().unwrap();
+        // The five as the block would hold them, without the markers.
+        let by_hand: String = codex_block_of(&m)
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        write(&config, &format!("{OPENRIG}{by_hand}"));
+        let c = install(&t, false).unwrap();
+        assert!(!c.changed && c.codex_block, "{c:?}");
+        assert!(status(&t).unwrap().installed);
+        // Others (a moved binary): refused, nothing written.
+        let stale = by_hand.replace(&m.alice().display().to_string(), "/gone/alice");
+        write(&config, &format!("{OPENRIG}{stale}"));
+        let e = install(&t, false).unwrap_err().to_string();
+        assert!(e.contains("outside Alice's marked block"), "{e}");
+        assert_eq!(read(&config), format!("{OPENRIG}{stale}"));
+        // Uninstall finds no block: nothing changes.
+        assert!(!uninstall(&t, false).unwrap().changed);
+        assert_eq!(read(&config), format!("{OPENRIG}{stale}"));
+    }
+
+    #[test]
+    fn uninstall_codex_takes_alices_hooks_out_of_both_files() {
+        let m = Machine::new();
+        let t = m.target(HookAgent::Codex);
+        let config = t.codex_config.clone().unwrap();
+        install(&t, false).unwrap();
+        write(&config, &format!("{OPENRIG}{}", codex_block_of(&m)));
+        let c = uninstall(&t, false).unwrap();
+        assert!(c.codex_block && c.removed == 5 && c.file == config, "{c:?}");
+        assert_eq!(c.also.len(), 1, "{c:?}");
+        assert_eq!(
+            (c.also[0].file.clone(), c.also[0].removed),
+            (t.file.clone(), 5)
+        );
+        assert_eq!(read(&config), OPENRIG);
+        assert!(value(&t.file).get("hooks").is_none());
+        let report = uninstall_report(&t, &c, false);
+        assert!(
+            report.contains(&config.display().to_string())
+                && report.contains(&t.file.display().to_string()),
+            "{report}"
+        );
+        assert_eq!(
+            report.matches("Sessions started from now on").count(),
+            1,
+            "{report}"
+        );
+        // A hooks.json that is not JSON stops it before config.toml is written.
+        write(&config, &format!("{OPENRIG}{}", codex_block_of(&m)));
+        write(&t.file, "{,");
+        assert!(uninstall(&t, false).is_err());
+        assert_eq!(read(&config), format!("{OPENRIG}{}", codex_block_of(&m)));
     }
 
     #[test]

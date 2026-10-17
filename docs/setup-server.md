@@ -17,7 +17,8 @@ Then:
    `Read docs/setup-server.md from the Alice repository (https://github.com/icueth/alice) and follow every step. My
    address is https://…/u/<name> and my token file is ~/Downloads/alice-token.`
 3. The agent asks you one or two questions and does the rest.
-4. When it says it is done, restart Claude Code and Codex (and open a new terminal for Codex).
+4. When it says it is done, restart Claude Code and Codex (and open a new terminal for Codex). The next time you open
+   Codex it asks "Hooks need review": choose **Trust all and continue** (or review the Alice entries with `/hooks`).
 
 To run Alice on your own machine instead, see [setup-local.md](setup-local.md).
 
@@ -305,9 +306,21 @@ sh ~/.config/alice/alice-capture.sh status
 
 - If setup printed two `/plugin …` commands instead of installing the plugin, tell the person to type them inside Claude
   Code.
-- If Codex is installed, setup wrote `~/.codex/hooks.json` (or printed the entries to add, when the file already
-  existed: add them without disturbing the rest, after a backup). Tell the person that **Codex runs the hooks only after
-  they trust them: open Codex, type `/hooks`, and trust the Alice entries.**
+- If Codex is installed, setup wrote `~/.codex/hooks.json`, or, when `~/.codex/config.toml` already has hooks of its
+  own (such as OpenRig's `[[hooks.<Event>]]` tables; Codex reads one format per layer), added the five hooks to
+  `config.toml` in a marked block at its end (`# >>> alice capture (Codex) >>>` … `# <<< alice capture (Codex) <<<`),
+  after a backup to `~/.codex/config.toml.bak-alice`. Then `codex mcp list` must still list `alice`; if Codex reports a
+  configuration error, restore `~/.codex/config.toml.bak-alice` and tell the person.
+  - If setup printed `hooks.json` entries instead (the person's own `hooks.json` exists), add them without disturbing
+    the rest, after a backup.
+  - If it printed the block because there is no `python3` 3.11 or later to check the edit: back up
+    `~/.codex/config.toml` (`cp ~/.codex/config.toml ~/.codex/config.toml.bak-alice`), append exactly the printed block
+    (from its `# >>>` line to its `# <<<` line) with `>>`, as in Step 3, without displaying the file, and check with
+    `codex mcp list` as above.
+  - If it printed the block because Alice "could not add its hooks to it safely", do not edit the file: tell the person
+    what setup said, and that their own hooks in `config.toml` are written in a form Codex's tables cannot extend.
+  - Whatever happened, **never trust the hooks for the person** (no `trusted_hash`, no
+    `--dangerously-bypass-hook-trust`): that is their security decision. Step 9 tells them what to choose.
 - If setup says the token was refused, go back to Step 1. If it says the address is "a local Alice daemon, not a server
   tenant", the address is wrong.
 - **Updates.** The tenant hook script updates itself from your Alice server once a day, over https, and updates the
@@ -318,8 +331,9 @@ sh ~/.config/alice/alice-capture.sh status
   …`; [capture.md](capture.md#server-tenants) lists them). An address on plain `http://` (only for a test server on
   `127.0.0.1` or `localhost`) never updates itself.
 - **Codex after an update.** When an update changes Codex's hooks, the script rewrites `~/.codex/hooks.json` (only
-  while it is still the file setup wrote), and Codex runs the changed hooks only after the person trusts them again in
-  `/hooks`. The log says so.
+  while it is still the file setup wrote), and Codex runs the changed hooks only after the person trusts them again
+  (Trust all and continue, or `/hooks`). The log says so. Updates never touch the block in `config.toml`; a re-run of
+  the setup line repairs it.
 
 Details of what it installed and how to remove it: [server.md, "Capture for team members"](server.md#capture-for-team-members).
 
@@ -364,7 +378,10 @@ Say briefly:
 - the import's counts, or why it was skipped;
 - what changed in MemPalace, and that its data was kept;
 - that they must **restart Claude Code and Codex** (and open a new terminal for Codex, started from that terminal) so
-  the new MCP server, hooks and instructions load, and **trust the Alice hooks in Codex's `/hooks`**;
+  the new MCP server, hooks and instructions load;
+- if Codex is installed, in the person's language: "Codex: the next time you open Codex it asks 'Hooks need review' —
+  choose **Trust all and continue** (or review the Alice entries with `/hooks`)." Keep the two quoted labels in English:
+  they are what Codex shows;
 - how to use it: work as usual; the agents recall and save by themselves. To share something with the team, say "save
   this to shared memory";
 - that `sh ~/.config/alice/alice-capture.sh status` shows the capture, and `sh ~/.config/alice/alice-capture.sh

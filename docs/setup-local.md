@@ -8,7 +8,9 @@ server. Your memory stays in `~/.alice`.
    If you have a copy of this file, give its path instead.
 3. The agent asks you a few questions (whether to install Rust, whether to import MemPalace, whether to retire it, and
    whether to turn on Jev, a cloud model, for precise recall and distillation) and does the rest.
-4. When it says it is done, restart Claude Code and Codex, so the new MCP server, hooks and instructions load.
+4. When it says it is done, restart Claude Code and Codex, so the new MCP server, hooks and instructions load. The next
+   time you open Codex it asks "Hooks need review": choose **Trust all and continue** (or review the Alice entries with
+   `/hooks`).
 
 To use a team server instead, see [setup-server.md](setup-server.md). To choose, see "Choose: local or server" in the
 [README](../README.md).
@@ -168,9 +170,13 @@ alice hooks install codex
 alice hooks status codex
 ```
 
-If it refuses because `~/.codex/config.toml` has hooks of its own, tell the person: Codex accepts hooks in one format
-per layer, so those hooks must move into `~/.codex/hooks.json` first. Otherwise tell the person that **Codex runs the
-hooks only after they trust them: open Codex, type `/hooks`, and trust the Alice entries.**
+It writes `~/.codex/hooks.json`, or, when `~/.codex/config.toml` already has hooks of its own (such as OpenRig's
+`[[hooks.<Event>]]` tables; Codex accepts hooks in one format per layer), adds the five hooks to `config.toml` in a
+marked block at its end (`# >>> alice capture (Codex) >>>` … `# <<< alice capture (Codex) <<<`), after a backup to
+`~/.codex/config.toml.bak-alice`; its report says which. Then `codex mcp list` must still list `alice`; if Codex
+reports a configuration error, restore `~/.codex/config.toml.bak-alice` and tell the person. If the install refuses
+because it "could not change … config.toml safely", do not edit the file: tell the person what it said. Never trust the
+hooks for the person (no `trusted_hash`, no `--dangerously-bypass-hook-trust`): Step 10 tells them what to choose.
 
 What this does: every finished turn of every session is stored in Alice's raw tier, in its project, and each new Claude
 Code session starts with a short briefing of the project's memories. Details: [capture.md](capture.md).
@@ -333,8 +339,10 @@ Say briefly:
 - the import's counts, or why it was skipped;
 - what changed in MemPalace, and that its data was kept;
 - whether Jev (the judge and distillation) is on, which projects are kept at home, and whether recall stays fast;
-- that they must **restart Claude Code and Codex** so the MCP server, the hooks and the instructions load, and, for
-  Codex, **trust the Alice hooks in `/hooks`**;
+- that they must **restart Claude Code and Codex** so the MCP server, the hooks and the instructions load;
+- if Codex is installed, in the person's language: "Codex: the next time you open Codex it asks 'Hooks need review' —
+  choose **Trust all and continue** (or review the Alice entries with `/hooks`)." Keep the two quoted labels in English:
+  they are what Codex shows;
 - how to use it: work as usual; the agents recall and save by themselves, and every session is captured.
   `alice recall --raw "<words>"` searches the captured transcripts, and `alice hooks uninstall claude` (or `codex`)
   removes capture again.
