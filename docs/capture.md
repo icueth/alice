@@ -289,9 +289,12 @@ A distilled memory is marked **`(auto)`** in the briefing and in text recall, an
 machine-extracted: rely on it as you would on a note you did not write.
 
 - **It never asks you anything.** A distilled memory never opens a review item. A probable duplicate is put in the trash
-  as a duplicate; an uncertain update or a contradiction becomes a link between the two memories, without a question.
+  as a duplicate; an uncertain update of another distilled memory, or a contradiction, becomes a link between the two
+  memories, without a question.
 - **Your memories win.** A distilled memory never replaces one an agent or you wrote. When the judge finds that the two
-  say the same thing, yours stays and the distilled one goes to the trash, whichever came first.
+  say the same thing, yours stays and the distilled one goes to the trash, whichever came first; so does a distilled
+  memory that only updates yours. A preference of yours filed under `global` is compared with the memories of the
+  session's project too, where your agent may have saved it (unless the cloud policy keeps that project at home).
 - **Hidden until judged.** Recall and the briefing skip a distilled memory until the judge has looked at it, so a near
   copy of something already saved never shows twice. `get_memory` by id still returns it.
 - **It stays out of the way.** Importance 2 keeps distilled memories out of the briefing's key memories, and below

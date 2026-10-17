@@ -1,5 +1,6 @@
 //! The judge stage of the write path (spec §5.1 step 5): for each memory whose embedding step is
-//! over, compare it with its nearest memories in the project, set its kind or project when asked,
+//! over, compare it with its nearest memories in the project (a distilled one in `global` also
+//! with those of the project it was distilled from, Task 11b), set its kind or project when asked,
 //! decide with the thresholds, and hand the judgement to the writer, which applies it and
 //! activates the memory. Network calls (Jev) happen here, never on the writer.
 //!
@@ -283,7 +284,8 @@ fn active_in_project(
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// Up to `NEIGHBOURS` nearest memories of the same project by vector, plus up to
+/// Up to `NEIGHBOURS` nearest memories of project `project_id` (the memory's own, or the source
+/// project of a distilled one in `global`, see [`source_projects`]) by vector, plus up to
 /// `TITLE_CANDIDATES` more of the same kind whose titles are nearly the same. Only OLDER
 /// memories that are `active` count (so "the older one survives" holds, a pair judged in one
 /// batch meets once, and a retry compares as the first try did). Similarities are the exact
@@ -293,6 +295,7 @@ fn neighbours(
     c: &Connection,
     item: &PendingJudgement,
     me: &JudgeMemory,
+    project_id: &str,
 ) -> Result<Vec<Neighbour>> {
     let (model, live_index) = (cfg.model)();
     let my_vec = embeddings::get_many(c, &model, &[VecKey::Memory(item.seq)])?
@@ -311,7 +314,7 @@ fn neighbours(
                     _ => None,
                 })
                 .collect();
-            let mut live = active_in_project(c, &item.project_id, &older)?;
+            let mut live = active_in_project(c, project_id, &older)?;
             chosen = older
                 .into_iter()
                 .filter_map(|s| live.remove(&s).map(|h| (s, h)))
@@ -329,7 +332,7 @@ fn neighbours(
     )?;
     let same_kind: Vec<(i64, String, String)> = stmt
         .query_map(
-            rusqlite::params![item.project_id, me.kind.as_str(), item.seq],
+            rusqlite::params![project_id, me.kind.as_str(), item.seq],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?
         .collect::<std::result::Result<_, _>>()?;
@@ -365,6 +368,34 @@ fn neighbours(
         });
     }
     Ok(out)
+}
+
+/// `(id, slug)` of the projects a distilled memory in `global` came from (Task 11b): those of
+/// the chunks in its provenance, or, once raw retention removed them, the project of its author
+/// session's capture source. A preference of the user's is stored in `global` (SP2 spec §6.4),
+/// so without them the judge would never meet the agent's own copy in the session's project.
+fn source_projects(c: &Connection, m: &Memory) -> Result<Vec<(String, String)>> {
+    let mut stmt = c.prepare_cached(
+        "SELECT DISTINCT p.id, p.slug FROM provenance v
+           JOIN chunks ch ON ch.id = v.chunk_id JOIN projects p ON p.id = ch.project_id
+         WHERE v.memory_id = ?1 AND p.slug <> 'global' ORDER BY p.slug",
+    )?;
+    let found: Vec<(String, String)> = stmt
+        .query_map([&m.id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let (Some(agent), Some(session), true) = (&m.author.agent, &m.author.session, found.is_empty())
+    else {
+        return Ok(found);
+    };
+    let mut stmt = c.prepare_cached(
+        "SELECT DISTINCT p.id, p.slug FROM capture_state cs
+           JOIN sources s ON s.id = cs.source_id JOIN projects p ON p.id = s.project_id
+         WHERE cs.agent = ?1 AND cs.session_id = ?2 AND cs.parent_source_id IS NULL
+           AND p.slug <> 'global' ORDER BY p.slug",
+    )?;
+    Ok(stmt
+        .query_map([agent, session], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?)
 }
 
 /// The projects a router may choose from (all but `global`), with a few recent titles each.
@@ -446,9 +477,13 @@ struct Read {
     found: Vec<Neighbour>,
 }
 
-/// `None` when the memory is not the text (and time) the queue entry was made from.
+/// `None` when the memory is not the text (and time) the queue entry was made from. A distilled
+/// memory in `global` also meets the memories of its source projects (Task 11b), as many and as
+/// chosen as its own project's; a project the cloud policy denies is left out, so none of its
+/// memories is sent to a model (the heuristic, which compares within one project only, could
+/// decide nothing about them either).
 fn read_item(cfg: &JudgeWorkerConfig, item: &PendingJudgement) -> Result<Option<Read>> {
-    cfg.readers.with(|c| {
+    let read = cfg.readers.with(|c| {
         // The stamp before the text: an edit in between makes the writer refuse the result.
         let stamp: Option<(String, String)> = c
             .query_row(
@@ -466,9 +501,33 @@ fn read_item(cfg: &JudgeWorkerConfig, item: &PendingJudgement) -> Result<Option<
             return Ok(None);
         };
         let me = judge_memory(&memory, None);
-        let found = neighbours(cfg, c, item, &me)?;
-        Ok(Some(Read { memory, me, found }))
-    })
+        let found = neighbours(cfg, c, item, &me, &item.project_id)?;
+        let sources = if me.origin == Origin::Distill && item.project_slug == "global" {
+            source_projects(c, &memory)?
+        } else {
+            Vec::new()
+        };
+        Ok(Some((Read { memory, me, found }, sources)))
+    })?;
+    let Some((mut read, sources)) = read else {
+        return Ok(None);
+    };
+    // The policy is asked outside the reader: it may need one of its own.
+    for (project_id, slug) in sources {
+        if !cfg.judge.cloud_allowed(&slug) {
+            tracing::debug!(id = %item.id, project = slug, "a distilled memory's source project is kept from the cloud; it is not compared with its memories");
+            continue;
+        }
+        let more = cfg
+            .readers
+            .with(|c| neighbours(cfg, c, item, &read.me, &project_id))?;
+        for n in more {
+            if !read.found.iter().any(|f| f.memory.id == n.memory.id) {
+                read.found.push(n);
+            }
+        }
+    }
+    Ok(Some(read))
 }
 
 /// Judge one memory: the configured judge, the heuristic where it may not or cannot answer.
@@ -1071,6 +1130,249 @@ mod tests {
         let waiting = ("retry".to_string(), "active".to_string());
         assert_eq!(states, [waiting.clone(), waiting]);
         assert_eq!(reviews, 0);
+        writer.send_nowait(WriteOp::Shutdown);
+    }
+
+    /// A judge source whose cloud policy denies the projects in its list.
+    struct Denying(Arc<dyn Judge>, Vec<&'static str>);
+
+    impl JudgeSource for Denying {
+        fn current(&self) -> Arc<dyn Judge> {
+            self.0.clone()
+        }
+        fn cloud_allowed(&self, project: &str) -> bool {
+            !self.1.contains(&project)
+        }
+        fn stand_in(&self) -> bool {
+            false
+        }
+    }
+
+    /// Task 11b (a): a distilled memory routed to `global` (a preference of the user's) is also
+    /// compared with the older live memories of its source project, the project of its
+    /// provenance chunks, or once raw retention removed them, of its author session's capture
+    /// source. A source project the cloud policy denies is left out: none of its memories is
+    /// read into the comparison or sent, and the comparison with the `global` ones still goes to
+    /// Jev. An agent's memory in `global` meets no other project.
+    #[test]
+    fn a_global_distilled_memory_meets_its_source_project_unless_denied() {
+        use alice_core::project::ProjectRef;
+        let dir = tempfile::tempdir().unwrap();
+        let home = AliceHome::new(dir.path().to_path_buf());
+        home.ensure_dirs().unwrap();
+        let conn = alice_core::store::open_writer(&home.db()).unwrap();
+        let shop = projects::upsert_project(
+            &conn,
+            &ProjectRef {
+                key: "k/shop".into(),
+                slug: "shop".into(),
+                name: "shop".into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        // The session the memory was distilled from: a capture source of `shop` and one chunk.
+        let now = now_rfc3339();
+        conn.execute_batch(&format!(
+            "INSERT INTO sources (id, project_id, type, agent, uri, session_id, created_at)
+               VALUES ('SRC1', '{p}', 'session', 'claude-code', 'claude-code:session:S1', 'S1', '{now}');
+             INSERT INTO capture_state (source_id, agent, session_id, created_at)
+               VALUES ('SRC1', 'claude-code', 'S1', '{now}');
+             INSERT INTO chunks (id, source_id, project_id, ord, text, content_hash, created_at, embed_state)
+               VALUES ('CH1', 'SRC1', '{p}', 0, '[assistant] British English from now on', 'h1', '{now}', 'done');",
+            p = shop.id
+        ))
+        .unwrap();
+        let (wake_tx, _wake_rx) = crossbeam_channel::bounded(1);
+        let (writer, _t) = spawn_writer(conn, "dev".into(), wake_tx);
+        let settings = SettingsHandle::load_with_env(&home, Vec::new());
+        let readers = Arc::new(ReaderPool::new(home.db(), 2));
+        let index = Arc::new(VectorIndex::new(16).unwrap());
+        let remember = |text: &str, project: &str, origin: Origin| {
+            let distilled = origin == Origin::Distill;
+            match writer
+                .submit_blocking(WriteOp::Remember {
+                    input: NewMemoryInput {
+                        content: text.into(),
+                        kind: Some(Kind::Preference),
+                        origin,
+                        author: alice_core::model::Author {
+                            agent: Some("claude-code".into()),
+                            session: Some("S1".into()),
+                            model: None,
+                        },
+                        provenance: if distilled {
+                            vec!["CH1".into()]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                    project: ProjectChoice::Slug(project.into()),
+                })
+                .unwrap()
+            {
+                WriteOutcome::Remembered(InsertOutcome::New { id, seq }, _) => (id, seq),
+                other => panic!("{other:?}"),
+            }
+        };
+        // Every memory gets the same vector, in the store and in the live index.
+        let embed_all = || {
+            let items = readers
+                .with(|c| alice_core::store::embeddings::pending(c, 10))
+                .unwrap();
+            for i in &items {
+                index.upsert(i.key, &[1.0; 16]).unwrap();
+            }
+            writer
+                .submit_blocking(WriteOp::StoreEmbeddings {
+                    model: "m".into(),
+                    items: items
+                        .into_iter()
+                        .map(|i| (i.key, i.stamp, vec![1.0; 16]))
+                        .collect(),
+                })
+                .unwrap();
+        };
+        let activate = |id: &str, seq: i64| {
+            let (stamp, updated_at) = readers
+                .with(|c| {
+                    Ok(c.query_row(
+                        "SELECT content_hash, updated_at FROM memories WHERE seq = ?1",
+                        [seq],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?)
+                })
+                .unwrap();
+            writer
+                .submit_blocking(WriteOp::ApplyJudgement(Judgement {
+                    seq,
+                    id: id.into(),
+                    stamp,
+                    updated_at,
+                    provider: "heuristic".into(),
+                    ..Default::default()
+                }))
+                .unwrap();
+        };
+        let older = [
+            remember(
+                "Dates are written as YYYY-MM-DD everywhere.",
+                "global",
+                Origin::Agent,
+            ),
+            remember(
+                "Always answer in British English (the agent's own copy).",
+                "shop",
+                Origin::Agent,
+            ),
+        ];
+        embed_all();
+        for (id, seq) in &older {
+            activate(id, *seq);
+        }
+        let (in_global, in_shop) = (older[0].0.clone(), older[1].0.clone());
+        let (_, new_seq) = remember(
+            "From now on I will always answer in British English in every project.",
+            "global",
+            Origin::Distill,
+        );
+        let (_, agent_seq) = remember(
+            "Commit messages are written in the imperative mood.",
+            "global",
+            Origin::Agent,
+        );
+        embed_all();
+        let items = readers.with(|c| pending(c, BATCH)).unwrap();
+        let item = |seq: i64| items.iter().find(|i| i.seq == seq).unwrap().clone();
+
+        let cfg = |denied: Vec<&'static str>| {
+            let transport = crate::judge_http::ScriptedJev::new(("unrelated", 1.0));
+            let jev = alice_core::judge::jev::JevJudge::new(
+                alice_core::judge::jev::JevConfig {
+                    endpoint: "https://api.typesafe.ai/v1/systemone".into(),
+                    model: "jev-1.13.0".into(),
+                    api_key: alice_core::settings::SecretValue::new(concat!(
+                        "ts_",
+                        "live_worker_test_key_02"
+                    )),
+                    rate_per_sec: 1_000.0,
+                    timeout: Duration::from_secs(5),
+                    daily_budget_usd: 1.0,
+                    max_retries: 0,
+                },
+                transport.clone(),
+                Arc::new(alice_core::judge::jev::MemoryJevStore::default()),
+                Arc::new(
+                    alice_core::judge::jev::FixedPolicy::allow_all(
+                        alice_core::redact::Redactor::builtin(),
+                    )
+                    .denying(&denied),
+                ),
+            )
+            .with_sleeper(Arc::new(|_| {}));
+            let index = index.clone();
+            let cfg = JudgeWorkerConfig {
+                readers: readers.clone(),
+                writer: writer.clone(),
+                index: Arc::new(parking_lot::RwLock::new(Some(index.clone()))),
+                judge: Arc::new(Denying(Arc::new(jev), denied)),
+                settings: settings.clone(),
+                redactors: Redactors::fixed(Default::default()),
+                model: Arc::new(move || ("m".to_string(), Some(index.clone()))),
+                wake: crossbeam_channel::never(),
+                stop: Arc::new(AtomicBool::new(false)),
+                retry_every: Duration::from_secs(3600),
+                retry_base: Duration::from_secs(3600),
+                applies: true,
+            };
+            (cfg, transport)
+        };
+        let seen = |j: &Judgement| -> Vec<String> {
+            let mut ids: Vec<String> = j.seen.iter().map(|(id, _)| id.clone()).collect();
+            ids.sort();
+            ids
+        };
+        let both = {
+            let mut v = vec![in_global.clone(), in_shop.clone()];
+            v.sort();
+            v
+        };
+
+        // Allowed: the source project's memory is compared too, and sent.
+        let (allowed, sent) = cfg(vec![]);
+        let j = judge_one(&allowed, &item(new_seq)).unwrap().unwrap();
+        assert_eq!(seen(&j), both, "{j:?}");
+        assert!(sent.mentioned("the agent's own copy") && sent.mentioned("project shop"));
+
+        // Denied: nothing of `shop` is read into the comparison or sent; `global` still is.
+        let (denied, sent) = cfg(vec!["shop"]);
+        let j = judge_one(&denied, &item(new_seq)).unwrap().unwrap();
+        assert_eq!(seen(&j), std::slice::from_ref(&in_global), "{j:?}");
+        assert!(!j.retry, "nothing failed: {j:?}");
+        assert_eq!(sent.sent(), 1, "the comparison with `global` went to Jev");
+        assert!(!sent.mentioned("the agent's own copy") && !sent.mentioned("project shop"));
+
+        // An agent's memory in `global` stays in `global`.
+        let (allowed, _) = cfg(vec![]);
+        let j = judge_one(&allowed, &item(agent_seq)).unwrap().unwrap();
+        assert_eq!(
+            seen(&j),
+            std::slice::from_ref(&in_global),
+            "an agent's memory meets its own project only: {j:?}"
+        );
+
+        // Raw retention removed the chunks (and their provenance): the author session's capture
+        // source still names the project.
+        alice_core::store::open_writer(&home.db())
+            .unwrap()
+            .execute_batch("DELETE FROM provenance; DELETE FROM chunks;")
+            .unwrap();
+        let (allowed, sent) = cfg(vec![]);
+        let j = judge_one(&allowed, &item(new_seq)).unwrap().unwrap();
+        assert_eq!(seen(&j), both, "{j:?}");
+        assert!(sent.mentioned("the agent's own copy"));
         writer.send_nowait(WriteOp::Shutdown);
     }
 }

@@ -444,6 +444,32 @@ pub fn set_ended(conn: &Connection, source_id: &str) -> Result<usize> {
     )?)
 }
 
+/// The stale end makes the session due (spec §6.2, §10; Task 11b), as a session end does: main
+/// source `source_id` becomes `due` when it holds chunks not distilled yet (its own, or a
+/// subagent's that is not skipped for its project's rules) and it or a subagent captured
+/// something at `recent_since` or later. An older one is distilled only when asked, so turning
+/// distillation on makes no backlog. A source due already keeps its next try, and a backfilled
+/// one waits to be asked. Returns the rows changed (0 or 1).
+pub fn due_after_stale_end(
+    conn: &Connection,
+    source_id: &str,
+    recent_since: &str,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE capture_state SET distill_state = 'due', distill_next_try_at = NULL, distill_attempts = 0
+         WHERE source_id = ?1 AND parent_source_id IS NULL
+           AND distill_state NOT IN ('due', 'skipped_backfill')
+           AND (COALESCE(last_capture_at, created_at) >= ?2
+                OR EXISTS (SELECT 1 FROM capture_state k
+                           WHERE k.parent_source_id = ?1 AND k.last_capture_at >= ?2))
+           AND (next_ord > distill_ord
+                OR EXISTS (SELECT 1 FROM capture_state k
+                           WHERE k.parent_source_id = ?1 AND k.next_ord > k.distill_ord
+                             AND k.distill_state NOT IN ('skipped_cloud', 'skipped_excluded')))",
+        params![source_id, recent_since],
+    )?)
+}
+
 /// A pass starts beyond the cursor: the cursor moves there and the gap is counted. On a tenant,
 /// a client sent from beyond the cursor (it skipped a line, or the server's copy is older than
 /// the client's); on a local daemon, the worker skipped a line longer than a pass. Bytes in a
@@ -1272,6 +1298,93 @@ mod tests {
             stale_open(&c, "2026-10-16T04:30:00.000Z", 10).unwrap(),
             ["K2"]
         );
+    }
+
+    /// Task 11b (c), spec §6.2 and §10: the stale end makes a main source due when it holds
+    /// chunks not distilled yet (its own, or a subagent's that is not skipped) and it or a
+    /// subagent captured at `recent_since` or later. A due source keeps its next try, a
+    /// backfilled one waits to be asked, and a subagent is never marked itself.
+    #[test]
+    fn the_stale_end_makes_a_recent_main_source_due() {
+        let (_d, c) = conn();
+        let set = |id: &str, col: &str, v: &dyn rusqlite::ToSql| {
+            c.execute(
+                &format!("UPDATE capture_state SET {col} = ?2 WHERE source_id = ?1"),
+                params![id, v],
+            )
+            .unwrap();
+        };
+        for (id, uri, session) in [
+            ("R", "claude-code:session:r", "r"),
+            ("O", "claude-code:session:o", "o"),
+            ("K", "claude-code:session:o:agent:k", "o"),
+        ] {
+            source(&c, id, uri, Some(session), None);
+            state(&c, id, session);
+            set(id, "created_at", &"2026-09-01T00:00:00.000Z");
+        }
+        set("K", "parent_source_id", &"O");
+        let since = "2026-10-08T00:00:00.000Z";
+        let st = |id: &str| by_source(&c, id).unwrap().unwrap();
+        let due = |id: &str| due_after_stale_end(&c, id, since).unwrap();
+
+        // Captured two days before the end, three chunks undistilled: due, at once.
+        set("R", "next_ord", &3);
+        set("R", "last_capture_at", &"2026-10-14T00:00:00.000Z");
+        set_distill(
+            &c,
+            "R",
+            DistillState::Failed,
+            Some("2026-10-20T00:00:00.000Z"),
+            5,
+        )
+        .unwrap();
+        assert_eq!(due("R"), 1);
+        let r = st("R");
+        assert_eq!(
+            (r.distill_state, r.distill_next_try_at, r.distill_attempts),
+            (DistillState::Due, None, 0)
+        );
+        // Due already: it keeps its next try.
+        set_distill(
+            &c,
+            "R",
+            DistillState::Due,
+            Some("2026-10-20T00:00:00.000Z"),
+            2,
+        )
+        .unwrap();
+        assert_eq!(due("R"), 0);
+        assert_eq!(st("R").distill_attempts, 2);
+        // Backfilled: it waits to be asked.
+        set_distill(&c, "R", DistillState::SkippedBackfill, None, 0).unwrap();
+        assert_eq!(due("R"), 0);
+        // Distilled to the end: nothing to do.
+        set_distill(&c, "R", DistillState::Done, None, 0).unwrap();
+        set_distilled(&c, "R", 3).unwrap();
+        assert_eq!(due("R"), 0);
+
+        // Captured a month before: not marked, so turning distillation on makes no backlog.
+        set("O", "next_ord", &3);
+        set("O", "last_capture_at", &"2026-09-16T00:00:00.000Z");
+        assert_eq!(due("O"), 0);
+        assert_eq!(st("O").distill_state, DistillState::Idle);
+        // A subagent that captured within the week makes the session recent; the subagent itself
+        // is never marked.
+        set("K", "last_capture_at", &"2026-10-14T00:00:00.000Z");
+        assert_eq!(due("K"), 0);
+        assert_eq!(due("O"), 1);
+        assert_eq!(st("K").distill_state, DistillState::Idle);
+        // Only a subagent's undistilled chunks: due, unless the subagent is skipped.
+        set_distilled(&c, "O", 3).unwrap();
+        set_distill(&c, "O", DistillState::Idle, None, 0).unwrap();
+        assert_eq!(due("O"), 0, "nothing undistilled");
+        set("K", "next_ord", &2);
+        set_distill(&c, "K", DistillState::SkippedExcluded, None, 0).unwrap();
+        assert_eq!(due("O"), 0, "a skipped subagent's chunks do not count");
+        set_distill(&c, "K", DistillState::Idle, None, 0).unwrap();
+        assert_eq!(due("O"), 1);
+        assert_eq!(due("NOPE"), 0);
     }
 
     /// Task 12 fix round 1: due sources newest capture first, and chunks bounded by a cursor.

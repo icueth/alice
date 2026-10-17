@@ -5,8 +5,9 @@
 //! Every test runs a local daemon (`Service`, no HTTP unless the route is the subject) with its
 //! own scripted Jev transport, [`DistillScript`]: it answers each distillation question (`c<n>`)
 //! from a phrase → option map (all the probability on that option) and every other question
-//! (the judge's own) with a neutral answer, counts its calls, and can be switched to answer 500
-//! or to be unreachable. Nothing touches the network. Transcripts are written inline, line by
+//! (the judge's own) with a neutral answer, unless a test scripts a relation between memories
+//! that hold the same phrase ([`DistillScript::relate`]); it counts its calls, and can be
+//! switched to answer 500 or to be unreachable. Nothing touches the network. Transcripts are written inline, line by
 //! line, and uploaded through `Service::capture_transcript` with a `cwd` naming the project.
 
 use alice_core::api::*;
@@ -56,6 +57,9 @@ struct DistillScript {
     bodies: Mutex<Vec<String>>,
     /// The probability of a distillation answer's option (1.0); the rest goes to `ephemeral`.
     top: Mutex<f64>,
+    /// `(phrase, relation)`: the judge's comparison of a new memory with an existing one that
+    /// both hold `phrase` is answered with `relation` (all the probability on it).
+    relations: Mutex<Vec<(&'static str, &'static str)>>,
 }
 
 fn is_distill_question(id: &str) -> bool {
@@ -74,6 +78,39 @@ impl DistillScript {
             questions: Mutex::new(Vec::new()),
             bodies: Mutex::new(Vec::new()),
             top: Mutex::new(1.0),
+            relations: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The judge compares a new memory with an existing one that both hold `phrase`: they are
+    /// `relation` (`duplicate`, `updates`, `contradicts`).
+    fn relate(&self, phrase: &'static str, relation: &'static str) {
+        self.relations.lock().push((phrase, relation));
+    }
+
+    /// The scripted relation for the judge's question `qid` (`fwd_<k>` or `rev_<k>`) of a
+    /// comparison whose state is `state`: the one whose phrase both the new memory and existing
+    /// memory `k` hold, as the reversed question words it.
+    fn relation(&self, qid: &str, state: &str) -> Option<&'static str> {
+        let (k, reversed) = match (qid.strip_prefix("fwd_"), qid.strip_prefix("rev_")) {
+            (Some(k), _) => (k, false),
+            (_, Some(k)) => (k, true),
+            _ => return None,
+        };
+        let mut blocks = state.split("Existing memory ");
+        let new = blocks.next()?;
+        let existing =
+            blocks.find(|b| b.strip_prefix(k).is_some_and(|rest| rest.starts_with(" (")))?;
+        let relation = self
+            .relations
+            .lock()
+            .iter()
+            .find(|(phrase, _)| new.contains(phrase) && existing.contains(phrase))
+            .map(|(_, r)| *r)?;
+        Some(if reversed && relation == "updates" {
+            "outdated_by"
+        } else {
+            relation
         })
     }
 
@@ -158,6 +195,11 @@ impl JevTransport for DistillScript {
                     .find(|(phrase, _)| text.contains(phrase))
                     .map_or("ephemeral", |(_, o)| *o);
                 if offered(want) { want } else { "ephemeral" }.to_string()
+            } else if let Some(r) = self
+                .relation(qid, req["state"].as_str().unwrap_or_default())
+                .filter(|r| offered(r))
+            {
+                r.to_string()
             } else {
                 // The judge's own questions: nothing to act on.
                 ["unrelated", "none", "note", "global"]
@@ -3168,5 +3210,214 @@ async fn a_remembered_handoff_is_not_distilled_again() {
         d.distilled()
     );
     assert_eq!(d.state(&uri("rh1")).state, "done");
+    d.shutdown();
+}
+
+// ---- Task 11b ----
+
+/// Task 11b (a) and (b): the agent saved two user-wide preferences in the session's project
+/// (`shop`), and the same preferences were distilled as `preference_user` into `global` (the
+/// local filter and `already_saved` did not catch them, as three such items in the Task 13
+/// evaluation were not). The judge compares each one with its source project's memories too and
+/// trashes it as a duplicate of the agent's copy: one the judge calls a duplicate, one it calls
+/// an update (a distilled memory never replaces an explicit one). The agent's memories stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_users_preference_the_agent_saved_in_the_project_is_trashed_as_its_duplicate() {
+    const BRITISH: &str = "always answer in British English";
+    const TABS: &str = "always use tabs for indentation";
+    let d = Daemon::start(
+        Opts::jev(),
+        DistillScript::new(&[(BRITISH, "preference_user"), (TABS, "preference_user")]),
+    );
+    d.script.relate(BRITISH, "duplicate");
+    d.script.relate(TABS, "updates");
+    let mut saved = Vec::new();
+    for (title, phrase) in [
+        ("Answer in British English", BRITISH),
+        ("Indent with tabs", TABS),
+    ] {
+        let m = d
+            .svc
+            .remember(RememberRequest {
+                content: format!("The owner wants me to {phrase}, in every project."),
+                title: Some(title.into()),
+                kind: Some(alice_core::model::Kind::Preference),
+                cwd: Some(d.repo("shop").to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        saved.push((phrase, m.id.expect("a new memory")));
+    }
+    let judged = |id: &str| -> bool {
+        d.db()
+            .query_row(
+                "SELECT judge_state = 'done' FROM memories WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    until("the agent's memories are judged", || {
+        saved.iter().all(|(_, id)| judged(id))
+    })
+    .await;
+
+    let mut t = Transcript::default();
+    t.prompt(
+        "pd-p1",
+        "Please keep the wording consistent everywhere you write.",
+    )
+    .reply(
+        "pd-a1",
+        "Understood: from now on I will always answer in British English in every project, including code comments and commit messages.",
+    )
+    .prompt("pd-p2", "And the indentation, how should new files look?")
+    .reply(
+        "pd-a2",
+        "Noted: I will always use tabs for indentation in every project, with a tab width of four where an editor asks.",
+    );
+    d.send("shop", "pd1", &t, 0, "session-end").await;
+    until("both distilled preferences are judged", || {
+        let m = d.distilled();
+        m.len() == 2 && m.iter().all(|m| m.judge_state == "done")
+    })
+    .await;
+    let c = d.db();
+    for m in d.distilled() {
+        assert_eq!(
+            (m.kind.as_str(), m.project.as_str(), m.status.as_str()),
+            ("preference", "global", "trashed"),
+            "{m:?}"
+        );
+        let (_, survivor) = saved
+            .iter()
+            .find(|(phrase, _)| m.body.contains(phrase))
+            .unwrap_or_else(|| panic!("a distilled copy of a saved preference: {m:?}"));
+        let to: String = c
+            .query_row(
+                "SELECT to_id FROM links WHERE from_id = ?1 AND type = 'duplicate_of'",
+                [&m.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(&to, survivor, "{m:?}");
+    }
+    let live: i64 = c
+        .query_row(
+            "SELECT count(*) FROM memories WHERE origin = 'agent' AND status = 'active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 2, "the agent's memories stay");
+    let reviews: i64 = c
+        .query_row("SELECT count(*) FROM review_items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(reviews, 0, "nothing is asked");
+    d.shutdown();
+}
+
+/// Task 11b (c), spec §6.2 and §10: a stale end makes the session due, as a session end does,
+/// when it captured within the last week before going stale. One captured 2 days ago is
+/// distilled as a closed session (its handoff is offered); one captured 30 days ago is ended but
+/// not marked, so turning capture or distillation on makes no backlog. The quiet trigger is held
+/// off (a year of quiet), so only the stale end can mark them. `tenant`: the distill worker's
+/// stale end on a server tenant; otherwise the local sweep's end of a source it cannot read (an
+/// upload on a local daemon has no transcript path, so there is no final pass).
+async fn a_stale_end_makes_a_recent_session_due(tenant: bool) {
+    let mut d = Daemon::start(
+        Opts {
+            tenant,
+            idle: Some(Duration::from_secs(365 * 24 * 3600)),
+            ..Opts::jev()
+        },
+        DistillScript::new(ANSWERS),
+    );
+    for s in ["sr1", "so1"] {
+        let mut t = one_decision(s);
+        t.prompt(
+            &format!("{s}-p2"),
+            "Where do we stand with the cache work right now?",
+        )
+        .reply(&format!("{s}-a2"), HANDOFF);
+        d.send("shop", s, &t, 0, "stop").await;
+    }
+    d.restart_with(&format!(
+        "UPDATE capture_state SET last_capture_at = '{0}', created_at = '{0}' WHERE session_id = 'sr1';
+         UPDATE capture_state SET last_capture_at = '{1}', created_at = '{1}' WHERE session_id = 'so1';",
+        hours_ago(48),
+        hours_ago(30 * 24)
+    ))
+    .await;
+    until("both silent sessions are ended", || {
+        d.state(&uri("sr1")).ended && d.state(&uri("so1")).ended
+    })
+    .await;
+    settle().await;
+    let recent = d.state(&uri("sr1"));
+    assert!(
+        matches!(recent.state.as_str(), "due" | "done"),
+        "the stale end made the recent session due: {recent:?}"
+    );
+    until("the recent session is distilled", || {
+        d.state(&uri("sr1")).state == "done"
+    })
+    .await;
+    let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    assert_eq!(
+        kinds,
+        ["decision", "handoff"],
+        "a closed session offers its handoff"
+    );
+    let old = d.state(&uri("so1"));
+    assert_eq!(
+        (old.state.as_str(), old.distill_ord),
+        ("idle", 0),
+        "a month-old session waits to be asked: {old:?}"
+    );
+    assert_eq!(d.script.distill_calls(), 1, "one run, the recent session's");
+    d.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweeps_stale_end_makes_a_recent_session_due() {
+    a_stale_end_makes_a_recent_session_due(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tenant_stale_end_makes_a_recent_session_due() {
+    a_stale_end_makes_a_recent_session_due(true).await;
+}
+
+/// Task 11b (pane 2's note): `alice capture distill` on a backfilled session distils its
+/// subagents with it, and they leave `skipped_backfill` as the session does, so `alice capture
+/// status` no longer shows them waiting to be asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn asking_for_a_backfilled_session_revives_its_subagents_too() {
+    let mut d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    session_with_subagent(&d, "bs1", "agb", "shop").await;
+    let sub_uri = format!("{}:agent:agb", uri("bs1"));
+    // As a backfill registers them (Task 18b).
+    d.restart_with("UPDATE capture_state SET distill_state = 'skipped_backfill'")
+        .await;
+    settle().await;
+    assert_eq!(d.state(&sub_uri).state, "skipped_backfill");
+    assert_eq!(d.script.distill_calls(), 0);
+
+    d.svc.capture_distill_now("bs1").await.unwrap();
+    until("asked, the session is distilled with its subagent", || {
+        let sub = d.state(&sub_uri);
+        d.state(&uri("bs1")).state == "done" && sub.distill_ord == sub.next_ord
+    })
+    .await;
+    assert_eq!(
+        d.state(&sub_uri).state,
+        "idle",
+        "the subagent is no longer backfilled"
+    );
+    let mut kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    kinds.sort();
+    assert_eq!(kinds, ["decision", "fact"]);
     d.shutdown();
 }
