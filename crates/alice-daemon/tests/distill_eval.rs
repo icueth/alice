@@ -27,11 +27,12 @@
 //! - **Seeding:** an `already` session's `remember` calls are stored first, as the agent's own
 //!   memories in the session's project, and are judged. Then the transcript is uploaded as a
 //!   session end, and everything is distilled and judged before any result is read.
-//! - **Matching:** a distilled memory counts while it is active; one the judge trashed does not,
-//!   and any other status fails the test. A memory matches a labelled item of its own session
-//!   when its body, without the `Context:` line, holds the item's phrase and its kind is one of
-//!   the item's kinds. Each memory is matched on its own; s29's summary is cut into two chunks,
-//!   and memories are never joined across that cut.
+//! - **Matching:** a distilled memory counts while it is active; one the judge trashed (a
+//!   duplicate) or superseded (by a newer distilled memory) does not, and any other status fails
+//!   the test. A memory matches a labelled item of its own session when its body, without the
+//!   `Context:` line, holds the item's phrase and its kind is one of the item's kinds. Each memory
+//!   is matched on its own; s29's summary is cut into two chunks, and memories are never joined
+//!   across that cut.
 //!
 //! **Clocks.** The distillation request holds no clock: `alice_core::distill` is pure. The judge's
 //! comparison gives each memory's age (`age(created_at, now)`). The writer's clock and the judge's
@@ -549,8 +550,9 @@ struct Mem {
 }
 
 impl Mem {
-    /// Stored and counted: `active`. A judged distilled memory is either that or `trashed`
-    /// (`run_session` fails on any other status, so a superseded copy is never scored silently).
+    /// Stored and counted: `active`. A judged distilled memory is that, `trashed` (a duplicate of
+    /// an older memory) or `superseded` (a newer distilled memory updates it, Task 11); recall
+    /// hides the last two. `run_session` fails on any other status, and the report counts each.
     fn live(&self) -> bool {
         self.status == "active"
     }
@@ -576,6 +578,13 @@ struct Outcome {
     /// The cost ledger of the session's daemon: USD and calls (the judge's and distillation's).
     spend_usd: f64,
     calls: i64,
+}
+
+impl Outcome {
+    /// The distilled memories the judge left with `status`.
+    fn count(&self, status: &str) -> usize {
+        self.memories.iter().filter(|m| m.status == status).count()
+    }
 }
 
 fn start(home: &Path, t: &Arc<EvalTransport>, key: &str) -> Arc<Service> {
@@ -794,8 +803,8 @@ async fn run_session(t: &Arc<EvalTransport>, s: &Session, key: &str, limit: Dura
     }
     for (m, _) in &rows {
         assert!(
-            m.status == "active" || m.status == "trashed",
-            "{}: the distilled {} «{}» is {}; the evaluation scores only active and trashed memories",
+            ["active", "trashed", "superseded"].contains(&m.status.as_str()),
+            "{}: the distilled {} «{}» is {}; the evaluation scores only active, trashed and superseded memories",
             s.file,
             m.kind,
             m.title,
@@ -834,12 +843,14 @@ async fn run_all(
         let started = Instant::now();
         let o = run_session(t, s, key, limit).await;
         println!(
-            "{} ({}): {} questions, {} distilled, {} live, {} Jev calls, ${:.5}, {:.1} s",
+            "{} ({}): {} questions, {} distilled, {} live, {} trashed, {} superseded, {} Jev calls, ${:.5}, {:.1} s",
             s.file,
             s.kind,
             o.questions,
             o.memories.len(),
             o.memories.iter().filter(|m| m.live()).count(),
+            o.count("trashed"),
+            o.count("superseded"),
             o.calls,
             o.spend_usd,
             started.elapsed().as_secs_f64()
@@ -889,6 +900,8 @@ struct Metrics {
     recalled: usize,
     /// Distilled memories the judge trashed (duplicates of an older memory).
     trashed: usize,
+    /// Distilled memories a newer distilled memory superseded.
+    superseded: usize,
     /// Precision by the memory's kind; recall by the item's first kind.
     by_kind: BTreeMap<String, Tally>,
     by_language: BTreeMap<&'static str, Tally>,
@@ -903,7 +916,8 @@ fn metrics(set: &[Session], outcomes: &[Outcome]) -> Metrics {
     for (s, o) in set.iter().zip(outcomes) {
         m.spend_usd += o.spend_usd;
         m.jev_calls += o.calls;
-        m.trashed += o.memories.iter().filter(|x| !x.live()).count();
+        m.trashed += o.count("trashed");
+        m.superseded += o.count("superseded");
         let live: Vec<&Mem> = o.memories.iter().filter(|x| x.live()).collect();
         for mem in &live {
             let hit = s.items.iter().any(|i| mem.matches(i));
@@ -999,8 +1013,9 @@ fn report(set: &[Session], outcomes: &[Outcome], m: &Metrics) -> String {
     .unwrap();
     writeln!(
         w,
-        "\nDistilled memories the judge trashed as duplicates: {}.",
-        m.trashed
+        "\nDistilled memories the judge trashed as duplicates: {}; superseded by a newer distilled memory: {}.",
+        m.trashed,
+        m.superseded
     )
     .unwrap();
 
@@ -1040,7 +1055,7 @@ fn report(set: &[Session], outcomes: &[Outcome], m: &Metrics) -> String {
 
     writeln!(
         w,
-        "\n| Session | Set | Language | Items | Questions | Live | Trashed | Matched | Items found |\n|---|---|---|---|---|---|---|---|---|"
+        "\n| Session | Set | Language | Items | Questions | Live | Trashed | Superseded | Matched | Items found |\n|---|---|---|---|---|---|---|---|---|---|"
     )
     .unwrap();
     let mut missed = Vec::new();
@@ -1058,14 +1073,15 @@ fn report(set: &[Session], outcomes: &[Outcome], m: &Metrics) -> String {
             .count();
         writeln!(
             w,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             s.file,
             s.kind,
             s.language(),
             s.items.len(),
             o.questions,
             live.len(),
-            o.memories.len() - live.len(),
+            o.count("trashed"),
+            o.count("superseded"),
             matched,
             found
         )
