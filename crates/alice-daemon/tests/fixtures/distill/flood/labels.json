@@ -1,0 +1,52 @@
+{
+  "sessions": [
+    {
+      "file": "f01.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "Never run `sqlx migrate revert` against the shared staging database",
+          "kinds": [
+            "warning"
+          ]
+        },
+        {
+          "phrase": "the payout worker must lock the account row",
+          "kinds": [
+            "warning",
+            "bugfix",
+            "fact"
+          ]
+        },
+        {
+          "phrase": "retry failed payouts with exponential backoff capped at six attempts",
+          "kinds": [
+            "decision"
+          ]
+        }
+      ],
+      "verdicts": [
+        "Task 1 is done: added the `payout_attempts` tabl",
+        "Spec compliance review for task 1: all four requ",
+        "Code quality review, task 1: no blocking finding",
+        "Task 2 done. The retry scheduler enqueues one jo",
+        "Spec review (task 2): ✅ requirement 1 addressed,",
+        "Review of task 2: two minor findings (a long fun",
+        "Fixed both nits from the task 2 review: renamed ",
+        "Re-review of task 2: both findings are addressed",
+        "Task 3 is complete: the backoff schedule lives i",
+        "Spec compliance for task 3: everything the plan ",
+        "Task 4 finished. Added the admin endpoint that l",
+        "Spec review, task 4: requirements 1 to 5 address",
+        "Code quality review for task 4: no findings. Err",
+        "Task 5 done: the payout CSV export now streams i",
+        "Spec compliance (task 5): ✅ all addressed. Check",
+        "Task 5 code review: one important finding (an un",
+        "Re-review of task 5: the important finding is ad",
+        "Final whole-branch review: all 5 tasks reviewed ",
+        "Docs updated for the retry plan (the README sect",
+        "Status check: CI on feat/payout-retries is green"
+      ]
+    }
+  ]
+}

@@ -5,8 +5,9 @@
 //! Every test runs a local daemon (`Service`, no HTTP unless the route is the subject) with its
 //! own scripted Jev transport, [`DistillScript`]: it answers each distillation question (`c<n>`)
 //! from a phrase → option map (all the probability on that option) and every other question
-//! (the judge's own) with a neutral answer, counts its calls, and can be switched to answer 500
-//! or to be unreachable. Nothing touches the network. Transcripts are written inline, line by
+//! (the judge's own) with a neutral answer, unless a test scripts a relation between memories
+//! that hold the same phrase ([`DistillScript::relate`]); it counts its calls, and can be
+//! switched to answer 500 or to be unreachable. Nothing touches the network. Transcripts are written inline, line by
 //! line, and uploaded through `Service::capture_transcript` with a `cwd` naming the project.
 
 use alice_core::api::*;
@@ -54,6 +55,11 @@ struct DistillScript {
     questions: Mutex<Vec<Vec<String>>>,
     /// Every request body received (the judge's and distillation's).
     bodies: Mutex<Vec<String>>,
+    /// The probability of a distillation answer's option (1.0); the rest goes to `ephemeral`.
+    top: Mutex<f64>,
+    /// `(phrase, relation)`: the judge's comparison of a new memory with an existing one that
+    /// both hold `phrase` is answered with `relation` (all the probability on it).
+    relations: Mutex<Vec<(&'static str, &'static str)>>,
 }
 
 fn is_distill_question(id: &str) -> bool {
@@ -71,6 +77,40 @@ impl DistillScript {
             distill_calls: AtomicUsize::new(0),
             questions: Mutex::new(Vec::new()),
             bodies: Mutex::new(Vec::new()),
+            top: Mutex::new(1.0),
+            relations: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The judge compares a new memory with an existing one that both hold `phrase`: they are
+    /// `relation` (`duplicate`, `updates`, `contradicts`).
+    fn relate(&self, phrase: &'static str, relation: &'static str) {
+        self.relations.lock().push((phrase, relation));
+    }
+
+    /// The scripted relation for the judge's question `qid` (`fwd_<k>` or `rev_<k>`) of a
+    /// comparison whose state is `state`: the one whose phrase both the new memory and existing
+    /// memory `k` hold, as the reversed question words it.
+    fn relation(&self, qid: &str, state: &str) -> Option<&'static str> {
+        let (k, reversed) = match (qid.strip_prefix("fwd_"), qid.strip_prefix("rev_")) {
+            (Some(k), _) => (k, false),
+            (_, Some(k)) => (k, true),
+            _ => return None,
+        };
+        let mut blocks = state.split("Existing memory ");
+        let new = blocks.next()?;
+        let existing =
+            blocks.find(|b| b.strip_prefix(k).is_some_and(|rest| rest.starts_with(" (")))?;
+        let relation = self
+            .relations
+            .lock()
+            .iter()
+            .find(|(phrase, _)| new.contains(phrase) && existing.contains(phrase))
+            .map(|(_, r)| *r)?;
+        Some(if reversed && relation == "updates" {
+            "outdated_by"
+        } else {
+            relation
         })
     }
 
@@ -155,6 +195,11 @@ impl JevTransport for DistillScript {
                     .find(|(phrase, _)| text.contains(phrase))
                     .map_or("ephemeral", |(_, o)| *o);
                 if offered(want) { want } else { "ephemeral" }.to_string()
+            } else if let Some(r) = self
+                .relation(qid, req["state"].as_str().unwrap_or_default())
+                .filter(|r| offered(r))
+            {
+                r.to_string()
             } else {
                 // The judge's own questions: nothing to act on.
                 ["unrelated", "none", "note", "global"]
@@ -162,13 +207,27 @@ impl JevTransport for DistillScript {
                     .find(|o| offered(o))
                     .map_or_else(|| options[0].clone(), str::to_string)
             };
+            let top = if is_distill_question(qid) && choice != "ephemeral" {
+                *self.top.lock()
+            } else {
+                1.0
+            };
             let probs: serde_json::Map<String, serde_json::Value> = options
                 .iter()
-                .map(|o| (o.clone(), json!(if *o == choice { 1.0 } else { 0.0 })))
+                .map(|o| {
+                    let p = if *o == choice {
+                        top
+                    } else if o == "ephemeral" {
+                        1.0 - top
+                    } else {
+                        0.0
+                    };
+                    (o.clone(), json!(p))
+                })
                 .collect();
             answers.insert(
                 qid.clone(),
-                json!({"type": "choice", "choice": choice, "confidence": 1.0, "probabilities": probs}),
+                json!({"type": "choice", "choice": choice, "confidence": top, "probabilities": probs}),
             );
         }
         let resp = json!({"model": "jev-1.13.0", "answers": answers,
@@ -2633,5 +2692,798 @@ async fn an_emptied_capture_source_settles_done_without_a_request() {
         .count();
     assert_eq!(runs, 1, "one run, then it rests");
     assert!(d.distilled().is_empty());
+    d.shutdown();
+}
+
+/// `n` pseudo-words of random syllables, so generated passages share few trigrams.
+fn words(seed: u64, n: usize) -> String {
+    const C: [&str; 17] = [
+        "b", "d", "f", "g", "k", "l", "m", "n", "p", "r", "s", "t", "v", "z", "ch", "sh", "th",
+    ];
+    const V: [&str; 6] = ["a", "e", "i", "o", "u", "ai"];
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+    let mut next = || {
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (x >> 33) as usize
+    };
+    (0..n)
+        .map(|_| {
+            (0..2 + next() % 2)
+                .map(|_| format!("{}{}", C[next() % C.len()], V[next() % V.len()]))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Task 12b, the brief's flow: one session of three main runs and twelve subagent sources, every
+/// passage answered at p 0.95 as knowledge. `distill.max_per_subagent_run = 4` here, so the
+/// subagents' share of the session (8 of 16) is what stops them. The session keeps 15 in all (one
+/// slot of the 16 waits for a handoff that never comes: no run here closes the session), 8 of
+/// them from subagents; its third run still keeps main-session memories and asks nothing about
+/// the subagents' passages; and once it is capped, a further due-mark sends nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_session_with_many_subagents_keeps_at_most_its_cap() {
+    let config =
+        "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_subagent_run = 4\n";
+    let d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(&[("Main fact", "fact"), ("Review finding", "decision")]),
+    );
+    *d.script.top.lock() = 0.95;
+    let cwd = d.repo("shop").to_string_lossy().into_owned();
+    let mut main = Transcript::default();
+    let mut sent = 0;
+    let mut agents = 0;
+    // (main turns, subagents) per run; then a fourth due-mark after the cap.
+    for (run, turns, subagents) in [(1u64, 3, 4), (2, 3, 4), (3, 4, 4), (4, 2, 1)] {
+        for i in 0..turns {
+            main.prompt(&format!("fl-p{run}-{i}"), &format!("Go on {run}.{i}."))
+                .reply(
+                    &format!("fl-a{run}-{i}"),
+                    &format!("Main fact {run}.{i}: {}.", words(100 * run + i, 18)),
+                );
+        }
+        d.send("shop", "fl1", &main, sent, "stop").await;
+        sent = main.len();
+        for _ in 0..subagents {
+            agents += 1;
+            let id = format!("ag{agents}");
+            let mut sub = Transcript::subagent(&id);
+            sub.prompt(
+                &format!("{id}-p"),
+                "Review this part of the change and report back.",
+            )
+            .reply(
+                &format!("{id}-a"),
+                &format!("Review finding {agents}: {}.", words(5_000 + agents, 30)),
+            );
+            let a = d
+                .send_q(
+                    TranscriptQuery {
+                        agent: "claude-code".into(),
+                        session: "fl1".into(),
+                        subagent: Some(id.clone()),
+                        offset: 0,
+                        event: "subagent-stop".into(),
+                        cwd: Some(cwd.clone()),
+                        ..Default::default()
+                    },
+                    &sub.bytes,
+                )
+                .await;
+            assert!(a.turns_stored >= 1, "{a:?}");
+        }
+        let calls = d.script.distill_calls();
+        d.svc.capture_distill_now("fl1").await.unwrap();
+        until("the run is over", || {
+            let runs = d.svc.distill_runs();
+            runs.len() as u64 == run && d.state(&uri("fl1")).state == "done"
+        })
+        .await;
+        let got = d.svc.distill_runs().last().cloned().unwrap();
+        let mems = d.distilled();
+        let sub_keys = mems
+            .iter()
+            .filter(|m| {
+                let key: String = d
+                    .db()
+                    .query_row(
+                        "SELECT idempotency_key FROM memories WHERE id = ?1",
+                        [&m.id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                key.starts_with("distill:sub:")
+            })
+            .count();
+        let in_subagents = mems
+            .iter()
+            .filter(|m| {
+                d.db()
+                    .query_row(
+                        "SELECT count(*) FROM provenance p JOIN chunks ch ON ch.id = p.chunk_id
+                         JOIN capture_state s ON s.source_id = ch.source_id
+                         WHERE p.memory_id = ?1 AND s.parent_source_id IS NOT NULL",
+                        [&m.id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap()
+                    > 0
+            })
+            .count();
+        assert_eq!(sub_keys, in_subagents, "run {run}: {mems:#?}");
+        let main_mems = mems.len() - in_subagents;
+        match run {
+            1 => assert_eq!((got.stored, mems.len(), in_subagents), (7, 7, 4), "{got:?}"),
+            2 => assert_eq!(
+                (got.stored, mems.len(), in_subagents),
+                (7, 14, 8),
+                "{got:?}"
+            ),
+            3 => {
+                assert_eq!(
+                    (got.stored, mems.len(), in_subagents),
+                    (1, 15, 8),
+                    "{got:?}"
+                );
+                assert_eq!(
+                    main_mems, 7,
+                    "the third run still keeps main-session memories"
+                );
+                let asked = d.script.questions.lock().last().cloned().unwrap();
+                assert_eq!(asked.len(), 4, "the main passages only: {asked:#?}");
+                assert!(asked.iter().all(|q| !q.contains("Review finding")));
+            }
+            _ => {
+                assert_eq!(
+                    d.script.distill_calls(),
+                    calls,
+                    "a capped session sends nothing"
+                );
+                assert_eq!(
+                    (got.questions, got.stored, got.state.as_str()),
+                    (0, 0, "done")
+                );
+                assert_eq!((mems.len(), in_subagents), (15, 8));
+            }
+        }
+        assert!(
+            mems.iter()
+                .all(|m| m.status == "active" || m.judge_state != "done")
+        );
+    }
+    // The cursors moved over what the capped run did not ask about.
+    let st = d.state(&uri("fl1"));
+    assert_eq!(st.distill_ord, st.next_ord);
+    let last = d.state(&format!("{}:agent:ag{agents}", uri("fl1")));
+    assert_eq!(last.distill_ord, last.next_ord);
+    // A further due-mark: still nothing sent.
+    let calls = d.script.distill_calls();
+    d.svc.capture_distill_now("fl1").await.unwrap();
+    until("the fifth run is over", || d.svc.distill_runs().len() == 5).await;
+    settle().await;
+    assert_eq!(d.script.distill_calls(), calls);
+    assert_eq!(d.distilled().len(), 15);
+    d.shutdown();
+}
+
+/// The options offered in the last distillation request, per question in id order.
+fn last_distill_options(script: &DistillScript) -> Vec<Vec<String>> {
+    let bodies = script.bodies.lock();
+    let body = bodies
+        .iter()
+        .rev()
+        .find(|b| {
+            serde_json::from_str::<serde_json::Value>(b).unwrap()["questions"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|k| is_distill_question(k))
+        })
+        .expect("a distillation request");
+    let req: serde_json::Value = serde_json::from_str(body).unwrap();
+    let mut questions: Vec<(&String, &serde_json::Value)> =
+        req["questions"].as_object().unwrap().iter().collect();
+    questions.sort_by_key(|(id, _)| id[1..].parse::<u32>().unwrap());
+    questions
+        .into_iter()
+        .map(|(_, q)| {
+            let mut options: Vec<String> =
+                q["criteria"].as_object().unwrap().keys().cloned().collect();
+            options.sort();
+            options
+        })
+        .collect()
+}
+
+/// Task 12b review, M2 (the controller's ruling): one slot of `max_per_session` is kept for a
+/// handoff. A session whose other room is used up still gets its handoff at its close: one small
+/// request over the last two turns, `handoff` the only knowledge option. A second close, with
+/// the slot held, sends nothing, and the session never keeps more than its cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capped_session_still_keeps_its_closing_handoff() {
+    let config =
+        "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 4\n";
+    let d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(&[("Main fact", "fact"), ("Where things stand:", "handoff")]),
+    );
+    let mut t = Transcript::default();
+    for i in 0..4u64 {
+        t.prompt(&format!("ho-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("ho-a{i}"),
+            &format!("Main fact {i}: {}.", words(300 + i, 18)),
+        );
+    }
+    d.send("shop", "ho1", &t, 0, "stop").await;
+    d.svc.capture_distill_now("ho1").await.unwrap();
+    until("the first run is over", || d.svc.distill_runs().len() == 1).await;
+    assert_eq!(d.distilled().len(), 3, "the fourth slot is the handoff's");
+
+    // The compaction: one small request for the handoff.
+    let off = t.len();
+    t.prompt("ho-p4", "Go on 4.")
+        .reply("ho-a4", &format!("Main fact 4: {}.", words(304, 18)))
+        .prompt("ho-p5", "Where are we?")
+        .reply("ho-a5", HANDOFF);
+    d.send("shop", "ho1", &t, off, "pre-compact").await;
+    until("the closing run is over", || {
+        d.svc.distill_runs().len() == 2
+    })
+    .await;
+    assert_eq!(d.script.distill_calls(), 2);
+    let options = last_distill_options(&d.script);
+    assert_eq!(options.len(), 2, "the last two turns");
+    for o in &options {
+        assert_eq!(o, &["already_saved", "ephemeral", "handoff", "unclear"]);
+    }
+    let mems = d.distilled();
+    assert_eq!(mems.len(), 4, "{mems:?}");
+    assert_eq!(mems.iter().filter(|m| m.kind == "handoff").count(), 1);
+    assert_eq!(d.state(&uri("ho1")).state, "done");
+
+    // The session ends: the slot is held, so nothing is sent.
+    let off = t.len();
+    t.prompt("ho-p6", "Go on 6.")
+        .reply("ho-a6", &format!("Main fact 6: {}.", words(306, 18)))
+        .prompt("ho-p7", "And now?")
+        .reply(
+            "ho-a7",
+            "Where things stand: the cache work is merged, and next we write the release notes.",
+        );
+    d.send("shop", "ho1", &t, off, "session-end").await;
+    until("the last run is over", || d.svc.distill_runs().len() == 3).await;
+    settle().await;
+    assert_eq!(
+        d.script.distill_calls(),
+        2,
+        "a capped close with its handoff sends nothing"
+    );
+    assert_eq!(d.distilled().len(), 4);
+    let st = d.state(&uri("ho1"));
+    assert_eq!((st.state.as_str(), st.distill_ord), ("done", st.next_ord));
+
+    // A session whose handoff came early (a compaction with room): the handoff holds the slot,
+    // and the other kinds still fill the rest, up to the cap and no further.
+    let mut t = Transcript::default();
+    for i in 0..2u64 {
+        t.prompt(&format!("hp-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("hp-a{i}"),
+            &format!("Main fact 2.{i}: {}.", words(500 + i, 18)),
+        );
+    }
+    t.prompt("hp-p2", "Where are we?").reply(
+        "hp-a2",
+        "Where things stand: the parser work is merged, and next we profile the importer.",
+    );
+    d.send("shop", "ho2", &t, 0, "pre-compact").await;
+    until("the early compaction is distilled", || {
+        d.svc
+            .distill_runs()
+            .iter()
+            .filter(|r| r.uri == uri("ho2"))
+            .count()
+            == 1
+    })
+    .await;
+    let of_ho2 = |d: &Daemon| -> Vec<String> {
+        d.distilled()
+            .into_iter()
+            .filter(|m| m.session.as_deref() == Some("ho2"))
+            .map(|m| m.kind)
+            .collect()
+    };
+    assert_eq!(of_ho2(&d), ["fact", "fact", "handoff"]);
+    let off = t.len();
+    for i in 3..6u64 {
+        t.prompt(&format!("hp-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("hp-a{i}"),
+            &format!("Main fact 2.{i}: {}.", words(500 + i, 18)),
+        );
+    }
+    d.send("shop", "ho2", &t, off, "stop").await;
+    d.svc.capture_distill_now("ho2").await.unwrap();
+    until("the second run is over", || {
+        d.svc
+            .distill_runs()
+            .iter()
+            .filter(|r| r.uri == uri("ho2"))
+            .count()
+            == 2
+    })
+    .await;
+    assert_eq!(
+        of_ho2(&d),
+        ["fact", "fact", "handoff", "fact"],
+        "one more fact fills the session's last other slot"
+    );
+    d.shutdown();
+}
+
+/// Task 12b review, M3: a session's kept memories are counted by their author (the session and
+/// the agent, which a subagent's memories share with their session), not by provenance, so raw
+/// retention deleting the session's chunks does not give a capped session fresh room.
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_retention_does_not_reset_a_sessions_cap() {
+    let config = "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 3\n\n[capture]\nraw_retention = \"30d\"\n";
+    let mut d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(&[("Main fact", "fact")]),
+    );
+    let mut t = Transcript::default();
+    for i in 0..3u64 {
+        t.prompt(&format!("rr-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("rr-a{i}"),
+            &format!("Main fact {i}: {}.", words(400 + i, 18)),
+        );
+    }
+    d.send("shop", "rr1", &t, 0, "stop").await;
+    d.svc.capture_distill_now("rr1").await.unwrap();
+    until("the first run is over", || d.svc.distill_runs().len() == 1).await;
+    assert_eq!(d.distilled().len(), 2, "two, and the handoff's slot");
+    // The session's chunks age out, and their provenance with them.
+    d.restart_with(&format!(
+        "UPDATE chunks SET created_at = '{0}'
+           WHERE source_id IN (SELECT source_id FROM capture_state);
+         UPDATE capture_state SET created_at = '{1}';",
+        hours_ago(40 * 24),
+        hours_ago(41 * 24)
+    ))
+    .await;
+    d.svc
+        .run_job(alice_daemon::maintenance::Job::CaptureRetention)
+        .await
+        .unwrap();
+    until("retention empties the session", || {
+        d.chunks_with(&uri("rr1"), "").is_empty()
+    })
+    .await;
+    let provenance: i64 = d
+        .db()
+        .query_row("SELECT count(*) FROM provenance", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(provenance, 0, "the memories lost their provenance");
+
+    let off = t.len();
+    for i in 3..6u64 {
+        t.prompt(&format!("rr-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("rr-a{i}"),
+            &format!("Main fact {i}: {}.", words(400 + i, 18)),
+        );
+    }
+    d.send("shop", "rr1", &t, off, "stop").await;
+    let calls = d.script.distill_calls();
+    let runs = d.svc.distill_runs().len();
+    d.svc.capture_distill_now("rr1").await.unwrap();
+    until("the next run is over", || d.svc.distill_runs().len() > runs).await;
+    settle().await;
+    assert_eq!(
+        d.script.distill_calls(),
+        calls,
+        "still capped: nothing is sent"
+    );
+    assert_eq!(d.distilled().len(), 2);
+    d.shutdown();
+}
+
+/// Task 12b, ruling F4: the worker hands the project's names to the routing guard. A preference
+/// of the user's that names the repository's folder (`Shop_Front`, whose slug is not that) stays
+/// in the project; one that names nothing of it goes to `global`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_users_preference_that_names_the_repository_stays_in_it() {
+    let d = Daemon::start(
+        Opts::jev(),
+        DistillScript::new(&[
+            ("Shop_Front changelog", "preference_user"),
+            ("always answer in British English", "preference_user"),
+        ]),
+    );
+    let mut t = Transcript::default();
+    t.prompt("pr-p1", "Go on.")
+        .reply(
+            "pr-a1",
+            "Noted: keep the Shop_Front changelog in English and Thai, and update both in the same commit.",
+        )
+        .prompt("pr-p2", "And one more.")
+        .reply(
+            "pr-a2",
+            "Understood: from now on I will always answer in British English in every project, including code comments and commit messages.",
+        );
+    d.send("Shop_Front", "pr1", &t, 0, "session-end").await;
+    until("the session is distilled", || {
+        d.state(&uri("pr1")).state == "done"
+    })
+    .await;
+    let mems = d.distilled();
+    assert_eq!(mems.len(), 2, "{mems:?}");
+    let project = |needle: &str| -> String {
+        mems.iter()
+            .find(|m| m.body.contains(needle))
+            .unwrap_or_else(|| panic!("{needle}: {mems:?}"))
+            .project
+            .clone()
+    };
+    assert_ne!(project("Shop_Front changelog"), "global", "{mems:?}");
+    assert!(
+        !project("Shop_Front changelog").contains('_'),
+        "the slug is not the folder's name"
+    );
+    assert_eq!(project("British English"), "global");
+    d.shutdown();
+}
+
+/// Task 12b review 2: the handoff-only request keeps `already_saved`, so a capped session whose
+/// last turns hold a handoff the agent already saved (`remember`) is offered it, and a distilled
+/// copy never takes the slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remembered_handoff_is_not_distilled_again() {
+    let config =
+        "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 4\n";
+    let d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(&[
+            ("Main fact", "fact"),
+            ("Where things stand:", "already_saved"),
+        ]),
+    );
+    let mut t = Transcript::default();
+    for i in 0..4u64 {
+        t.prompt(&format!("rh-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("rh-a{i}"),
+            &format!("Main fact {i}: {}.", words(600 + i, 18)),
+        );
+    }
+    d.send("shop", "rh1", &t, 0, "stop").await;
+    d.svc.capture_distill_now("rh1").await.unwrap();
+    until("the first run is over", || d.svc.distill_runs().len() == 1).await;
+    assert_eq!(d.distilled().len(), 3);
+
+    let off = t.len();
+    t.prompt("rh-p4", "Go on 4.")
+        .reply("rh-a4", &format!("Main fact 4: {}.", words(604, 18)))
+        .prompt("rh-p5", "Save where we are, please.")
+        .tool(
+            "rh-t5",
+            "toolu_rh5",
+            "mcp__alice__remember",
+            json!({"title": "Cache work: config written down, restart moves next", "content": HANDOFF, "kind": "handoff"}),
+        )
+        .tool_result("rh-r5", "toolu_rh5", "saved")
+        .reply("rh-a5", HANDOFF);
+    d.send("shop", "rh1", &t, off, "pre-compact").await;
+    until("the closing run is over", || {
+        d.svc.distill_runs().len() == 2
+    })
+    .await;
+    assert_eq!(d.script.distill_calls(), 2);
+    let options = last_distill_options(&d.script);
+    assert!(!options.is_empty());
+    for o in &options {
+        assert_eq!(o, &["already_saved", "ephemeral", "handoff", "unclear"]);
+    }
+    assert!(
+        d.script
+            .questions()
+            .iter()
+            .any(|q| q.contains("Where things stand:")),
+        "the handoff passage was asked about"
+    );
+    assert_eq!(
+        d.distilled().len(),
+        3,
+        "nothing is kept: {:?}",
+        d.distilled()
+    );
+    assert_eq!(d.state(&uri("rh1")).state, "done");
+    d.shutdown();
+}
+
+// ---- Task 11b ----
+
+/// Task 11b (a) and (b): the agent saved two user-wide preferences in the session's project
+/// (`shop`), and the same preferences were distilled as `preference_user` into `global` (the
+/// local filter and `already_saved` did not catch them, as three such items in the Task 13
+/// evaluation were not). The judge compares each one with its source project's memories too and
+/// trashes it as a duplicate of the agent's copy: one the judge calls a duplicate, one it calls
+/// an update (a distilled memory never replaces an explicit one). The agent's memories stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_users_preference_the_agent_saved_in_the_project_is_trashed_as_its_duplicate() {
+    const BRITISH: &str = "always answer in British English";
+    const TABS: &str = "always use tabs for indentation";
+    let d = Daemon::start(
+        Opts::jev(),
+        DistillScript::new(&[(BRITISH, "preference_user"), (TABS, "preference_user")]),
+    );
+    d.script.relate(BRITISH, "duplicate");
+    d.script.relate(TABS, "updates");
+    let mut saved = Vec::new();
+    for (title, phrase) in [
+        ("Answer in British English", BRITISH),
+        ("Indent with tabs", TABS),
+    ] {
+        let m = d
+            .svc
+            .remember(RememberRequest {
+                content: format!("The owner wants me to {phrase}, in every project."),
+                title: Some(title.into()),
+                kind: Some(alice_core::model::Kind::Preference),
+                cwd: Some(d.repo("shop").to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        saved.push((phrase, m.id.expect("a new memory")));
+    }
+    let judged = |id: &str| -> bool {
+        d.db()
+            .query_row(
+                "SELECT judge_state = 'done' FROM memories WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    until("the agent's memories are judged", || {
+        saved.iter().all(|(_, id)| judged(id))
+    })
+    .await;
+
+    let mut t = Transcript::default();
+    t.prompt(
+        "pd-p1",
+        "Please keep the wording consistent everywhere you write.",
+    )
+    .reply(
+        "pd-a1",
+        "Understood: from now on I will always answer in British English in every project, including code comments and commit messages.",
+    )
+    .prompt("pd-p2", "And the indentation, how should new files look?")
+    .reply(
+        "pd-a2",
+        "Noted: I will always use tabs for indentation in every project, with a tab width of four where an editor asks.",
+    );
+    d.send("shop", "pd1", &t, 0, "session-end").await;
+    until("both distilled preferences are judged", || {
+        let m = d.distilled();
+        m.len() == 2 && m.iter().all(|m| m.judge_state == "done")
+    })
+    .await;
+    let c = d.db();
+    for m in d.distilled() {
+        assert_eq!(
+            (m.kind.as_str(), m.project.as_str(), m.status.as_str()),
+            ("preference", "global", "trashed"),
+            "{m:?}"
+        );
+        let (_, survivor) = saved
+            .iter()
+            .find(|(phrase, _)| m.body.contains(phrase))
+            .unwrap_or_else(|| panic!("a distilled copy of a saved preference: {m:?}"));
+        let to: String = c
+            .query_row(
+                "SELECT to_id FROM links WHERE from_id = ?1 AND type = 'duplicate_of'",
+                [&m.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(&to, survivor, "{m:?}");
+    }
+    let live: i64 = c
+        .query_row(
+            "SELECT count(*) FROM memories WHERE origin = 'agent' AND status = 'active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 2, "the agent's memories stay");
+    let reviews: i64 = c
+        .query_row("SELECT count(*) FROM review_items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(reviews, 0, "nothing is asked");
+    d.shutdown();
+}
+
+/// Task 11b (c), spec §6.2 and §10: a stale end makes the session due, as a session end does,
+/// when it captured within the last 7 days plus the stale age. One captured 2 days ago is
+/// distilled as a closed session (its handoff is offered); one captured 30 days ago is ended but
+/// not marked, so turning capture or distillation on makes no backlog. The quiet trigger is held
+/// off (a year of quiet), so only the stale end can mark them. `tenant`: the distill worker's
+/// stale end on a server tenant; otherwise the local sweep's end of a source it cannot read (an
+/// upload on a local daemon has no transcript path, so there is no final pass).
+async fn a_stale_end_makes_a_recent_session_due(tenant: bool) {
+    let mut d = Daemon::start(
+        Opts {
+            tenant,
+            idle: Some(Duration::from_secs(365 * 24 * 3600)),
+            ..Opts::jev()
+        },
+        DistillScript::new(ANSWERS),
+    );
+    for s in ["sr1", "so1"] {
+        let mut t = one_decision(s);
+        t.prompt(
+            &format!("{s}-p2"),
+            "Where do we stand with the cache work right now?",
+        )
+        .reply(&format!("{s}-a2"), HANDOFF);
+        d.send("shop", s, &t, 0, "stop").await;
+    }
+    d.restart_with(&format!(
+        "UPDATE capture_state SET last_capture_at = '{0}', created_at = '{0}' WHERE session_id = 'sr1';
+         UPDATE capture_state SET last_capture_at = '{1}', created_at = '{1}' WHERE session_id = 'so1';",
+        hours_ago(48),
+        hours_ago(30 * 24)
+    ))
+    .await;
+    until("both silent sessions are ended", || {
+        d.state(&uri("sr1")).ended && d.state(&uri("so1")).ended
+    })
+    .await;
+    settle().await;
+    let recent = d.state(&uri("sr1"));
+    assert!(
+        matches!(recent.state.as_str(), "due" | "done"),
+        "the stale end made the recent session due: {recent:?}"
+    );
+    until("the recent session is distilled", || {
+        d.state(&uri("sr1")).state == "done"
+    })
+    .await;
+    let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    assert_eq!(
+        kinds,
+        ["decision", "handoff"],
+        "a closed session offers its handoff"
+    );
+    let old = d.state(&uri("so1"));
+    assert_eq!(
+        (old.state.as_str(), old.distill_ord),
+        ("idle", 0),
+        "a month-old session waits to be asked: {old:?}"
+    );
+    assert_eq!(d.script.distill_calls(), 1, "one run, the recent session's");
+    d.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweeps_stale_end_makes_a_recent_session_due() {
+    a_stale_end_makes_a_recent_session_due(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tenant_stale_end_makes_a_recent_session_due() {
+    a_stale_end_makes_a_recent_session_due(true).await;
+}
+
+/// Task 11b review (M1): the sweep's final pass of a stale transcript is windowed too. It makes
+/// the session due only when the session captured within the last 7 days plus the stale age (8
+/// days by default), so a long downtime or a restored backup makes no backlog. A session last
+/// captured 2 days ago is distilled as a closed one; one last captured 30 days ago is ended by
+/// the same final pass but not marked. The quiet trigger is held off (a year of quiet).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweeps_final_pass_makes_only_a_recent_session_due() {
+    let mut d = Daemon::start(
+        Opts {
+            idle: Some(Duration::from_secs(365 * 24 * 3600)),
+            ..Opts::jev()
+        },
+        DistillScript::new(ANSWERS),
+    );
+    let mut paths = Vec::new();
+    for s in ["fr1", "fo1"] {
+        let mut t = one_decision(s);
+        t.prompt(
+            &format!("{s}-p2"),
+            "Where do we stand with the cache work right now?",
+        )
+        .reply(&format!("{s}-a2"), HANDOFF);
+        let path = d.write_transcript(s, &t);
+        d.notify("shop", s, &path, "stop").await;
+        until("the session is captured", || {
+            d.has_state(&uri(s)) && d.state(&uri(s)).byte_offset == t.len() as i64
+        })
+        .await;
+        paths.push(path);
+    }
+    d.restart_with(&format!(
+        "UPDATE capture_state SET last_capture_at = '{0}', created_at = '{0}' WHERE session_id = 'fr1';
+         UPDATE capture_state SET last_capture_at = '{1}', created_at = '{1}' WHERE session_id = 'fo1';",
+        hours_ago(48),
+        hours_ago(30 * 24)
+    ))
+    .await;
+    // The transcripts go stale: the sweep makes a final pass of each and ends it.
+    age(&paths[0], Duration::from_secs(48 * 3600));
+    age(&paths[1], Duration::from_secs(30 * 24 * 3600));
+    until("the sweep ends both sessions", || {
+        d.state(&uri("fr1")).ended && d.state(&uri("fo1")).ended
+    })
+    .await;
+    settle().await;
+    let recent = d.state(&uri("fr1"));
+    assert!(
+        matches!(recent.state.as_str(), "due" | "done"),
+        "the final pass made the recent session due: {recent:?}"
+    );
+    until("the recent session is distilled", || {
+        d.state(&uri("fr1")).state == "done"
+    })
+    .await;
+    let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, ["decision", "handoff"]);
+    let old = d.state(&uri("fo1"));
+    assert_eq!(
+        (old.state.as_str(), old.distill_ord),
+        ("idle", 0),
+        "a month-old session waits to be asked: {old:?}"
+    );
+    assert_eq!(d.script.distill_calls(), 1, "one run, the recent session's");
+    d.shutdown();
+}
+
+/// Task 11b (pane 2's note): `alice capture distill` on a backfilled session distils its
+/// subagents with it, and they leave `skipped_backfill` as the session does, so `alice capture
+/// status` no longer shows them waiting to be asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn asking_for_a_backfilled_session_revives_its_subagents_too() {
+    let mut d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    session_with_subagent(&d, "bs1", "agb", "shop").await;
+    let sub_uri = format!("{}:agent:agb", uri("bs1"));
+    // As a backfill registers them (Task 18b).
+    d.restart_with("UPDATE capture_state SET distill_state = 'skipped_backfill'")
+        .await;
+    settle().await;
+    assert_eq!(d.state(&sub_uri).state, "skipped_backfill");
+    assert_eq!(d.script.distill_calls(), 0);
+
+    d.svc.capture_distill_now("bs1").await.unwrap();
+    until("asked, the session is distilled with its subagent", || {
+        let sub = d.state(&sub_uri);
+        d.state(&uri("bs1")).state == "done" && sub.distill_ord == sub.next_ord
+    })
+    .await;
+    assert_eq!(
+        d.state(&sub_uri).state,
+        "idle",
+        "the subagent is no longer backfilled"
+    );
+    let mut kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    kinds.sort();
+    assert_eq!(kinds, ["decision", "fact"]);
     d.shutdown();
 }

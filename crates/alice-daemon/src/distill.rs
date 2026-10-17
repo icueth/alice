@@ -5,7 +5,8 @@
 //! pipeline marks it), when it has been quiet for `distill.idle_minutes` with chunks not yet
 //! distilled (its own or a subagent's) and captured within the last week, or when someone asks
 //! (`alice capture distill`). On a server tenant, a source with no capture for 24 h is also
-//! marked ended (tenants have no sweep; locally the capture sweep owns the stale end). The worker
+//! marked ended, and due when it captured within the last 7 days plus those 24 h (tenants have
+//! no sweep; locally the capture sweep owns the stale end, Task 11b). The worker
 //! wakes when the capture pipeline marks a source, and every [`TICK`]; due sources are run the
 //! most recently captured first.
 //!
@@ -21,15 +22,20 @@
 //!    - the breaker is open: `due` again at its time.
 //! 2. Each subagent by its own project's rules (the same three, without the switches): one
 //!    that is not allowed keeps its chunks and says why in its own state.
-//! 3. The session's chunks from `distill_ord` on, and the allowed subagents' from theirs, about
+//! 3. The session's caps (Task 12b, spec §6.4): what the session's earlier runs kept
+//!    ([`session_kept`]) sets this run's room under `distill.max_per_session` (one slot of it
+//!    kept for a handoff) and the subagents' share. A session with no room left sends nothing:
+//!    its cursors move to the end of what is written, and it is `done`. One with only the
+//!    handoff slot left asks about its handoff alone, in a run that closes the session.
+//! 4. The session's chunks from `distill_ord` on, and the allowed subagents' from theirs, about
 //!    two runs' worth and below each source's `next_ord`, with their turn starts (Task 12
 //!    supplement, items 1 and 11).
-//! 4. [`distill::prepare`], one Jev request for every project the run covers
-//!    ([`Judge::ask_distill`], so at most one in flight), then [`distill::decide`].
-//! 5. Each kept passage written with [`write_memory`] in the project of the source it came from:
+//! 5. [`distill::prepare`] within the run's caps, one Jev request for every project the run
+//!    covers ([`Judge::ask_distill`], so at most one in flight), then [`distill::decide`].
+//! 6. Each kept passage written with [`write_memory`] in the project of the source it came from:
 //!    redacted with that project's rules, `origin = distill`, its chunks as provenance and an
 //!    idempotency key, so a repeated run (a crash before the cursor moved) stores nothing twice.
-//! 6. The cursors move to the end of the run; the source is `done`, or `due` again when more of
+//! 7. The cursors move to the end of the run; the source is `done`, or `due` again when more of
 //!    it is left.
 //!
 //! `Budget` waits for the next UTC day (`waiting_budget`) and `Denied` is `skipped_cloud`: both
@@ -45,7 +51,7 @@ use crate::redaction::Redactors;
 use crate::writer::{CaptureChange, ProjectChoice, WriteOp, WriteOutcome, WriterHandle};
 use alice_core::capture::AgentKind;
 use alice_core::distill::{
-    self, DistillConfig, DistilledMemory, RUN_MAX_CHARS, RunChunk, RunInput,
+    self, DistillConfig, DistilledMemory, RUN_MAX_CHARS, RunChunk, RunInput, SessionKept,
 };
 use alice_core::ids::now_rfc3339;
 use alice_core::judge::{Judge, JudgeError};
@@ -87,7 +93,9 @@ pub const CLOUD_RECHECK: Duration = Duration::from_secs(5 * 60);
 /// server tenant only: locally the capture sweep owns the stale end.
 pub const STALE_AFTER: Duration = Duration::from_secs(24 * 3600);
 /// The quiet trigger marks only sessions that captured something within this long; an older
-/// backlog is distilled when asked (`alice capture distill`). Task 12 fix round 1.
+/// backlog is distilled when asked (`alice capture distill`). Task 12 fix round 1. A stale end
+/// marks a session due only when it captured within this long plus the stale age (8 days by
+/// default), counted back from the end (Task 11b).
 pub const QUIET_RECENT: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Characters of a session's chunks read for one run: two runs' worth, so the turn the load
@@ -601,10 +609,14 @@ impl DistillCtl {
                 None => Allowance::Excluded,
             };
             match allowance {
+                // A backfilled subagent is distilled with its session once the session is asked
+                // for (`alice capture distill`), so it leaves `skipped_backfill` too (Task 11b).
                 Allowance::Yes(kslug) => {
                     if matches!(
                         k.distill_state,
-                        DistillState::SkippedCloud | DistillState::SkippedExcluded
+                        DistillState::SkippedCloud
+                            | DistillState::SkippedExcluded
+                            | DistillState::SkippedBackfill
                     ) {
                         self.set(&k.source_id, DistillState::Idle, None, 0)?;
                     }
@@ -636,6 +648,44 @@ impl DistillCtl {
                 other => (other, None),
             }
         };
+        // The session's caps (Task 12b): what its earlier runs kept bounds this one. A session
+        // with no room left, its handoff slot held too, asks Jev nothing more: its cursors move
+        // to the end of what is written, and it is done. One with only the handoff slot left asks
+        // about its handoff alone, and only in a run that closes it (`Prepared::within`).
+        let kept = match self.ctx.readers.with(|c| session_kept(c, src)) {
+            Ok(k) => k,
+            Err(e) => return self.read_failed(src, report, &e),
+        };
+        let cfg = DistillConfig::for_session(&s.distill, kept);
+        if !cfg.keeps_any() {
+            if src.next_ord > src.distill_ord {
+                self.change(
+                    &src.source_id,
+                    CaptureChange::Distilled {
+                        distill_ord: src.next_ord,
+                    },
+                )?;
+            }
+            for (k, _) in &included {
+                self.change(
+                    &k.source_id,
+                    CaptureChange::Distilled {
+                        distill_ord: k.next_ord,
+                    },
+                )?;
+            }
+            tracing::info!(
+                uri = src.uri,
+                kept = kept.all,
+                "the session has used up its distill.max_per_session memories; the rest of it is not sent to Jev"
+            );
+            let (state, next) = rest(DistillState::Done);
+            return self.leave(src, report, state, next, 0);
+        }
+        let project_names = match self.ctx.readers.with(|c| project_names(c, &src.project_id)) {
+            Ok(n) => n,
+            Err(e) => return self.read_failed(src, report, &e),
+        };
 
         let mut loaded = match self.load(src, &included) {
             Ok(l) => l,
@@ -658,6 +708,7 @@ impl DistillCtl {
         let input = RunInput {
             uri: src.uri.clone(),
             project: slug.clone(),
+            project_names,
             closes_session: !loaded.main_cut
                 && (src.ended
                     || matches!(
@@ -666,7 +717,7 @@ impl DistillCtl {
                     )),
             chunks: std::mem::take(&mut loaded.chunks),
         };
-        let prepared = distill::prepare(&input);
+        let prepared = distill::prepare(&input).within(&cfg);
         let mut report = report;
         report.questions = prepared.questions.len();
         let memories = if prepared.questions.is_empty() {
@@ -684,12 +735,7 @@ impl DistillCtl {
                     if !cached {
                         self.breaker.lock().success();
                     }
-                    distill::decide(
-                        &prepared,
-                        &answers,
-                        &src.uri,
-                        &DistillConfig::from(&s.distill),
-                    )
+                    distill::decide(&prepared, &answers, &src.uri, &cfg)
                 }
                 // Our own words: the judge error's wraps the share stop in the judge's budget.
                 Err(JudgeError::Budget(_)) => {
@@ -1006,11 +1052,18 @@ impl DistillCtl {
     fn housekeeping(&self) -> Result<()> {
         let now = Utc::now();
         let s = self.ctx.settings.get();
-        // Server tenants have no sweep: a source with no capture for 24 h is ended here.
-        // Locally the capture sweep owns the stale end, with its final pass that closes the
-        // trailing turn.
+        // Server tenants have no sweep: a source with no capture for 24 h is ended here, and the
+        // end makes its session due (spec §6.2, §10; Task 11b) when distillation is on and it,
+        // or a subagent of it, captured within the last 7 days (`QUIET_RECENT`) plus the stale
+        // age (8 days in all): an older one is distilled only when asked, so turning distillation
+        // on makes no backlog. Locally the capture sweep owns the stale end, with the same window:
+        // a final pass that closes the trailing turn and marks the session due, or for a source it
+        // cannot read, the same end as here.
         if self.ctx.settings.is_tenant() {
-            let stale_before = stamp(now - since(STALE_AFTER));
+            let stale_at = now - since(STALE_AFTER);
+            let stale_before = stamp(stale_at);
+            let due_since = (s.distill.provider != DistillProvider::Off)
+                .then(|| stamp(stale_at - since(QUIET_RECENT)));
             for id in self
                 .ctx
                 .readers
@@ -1020,7 +1073,12 @@ impl DistillCtl {
                     source = id,
                     "a captured session had no capture for 24 h; marking it ended"
                 );
-                self.change(&id, CaptureChange::Ended)?;
+                self.change(
+                    &id,
+                    CaptureChange::StaleEnd {
+                        due_since: due_since.clone(),
+                    },
+                )?;
             }
         }
         if s.distill.provider == DistillProvider::Off {
@@ -1302,6 +1360,45 @@ pub(crate) fn write_memory(
             other.name()
         ))),
     }
+}
+
+/// What the session of `src` has kept so far (spec §6.4): its live (`origin = distill`, not
+/// trashed) memories, and of them those kept from a subagent report (their key starts with
+/// [`distill::SUBAGENT_KEY_PREFIX`]) and the handoffs. They are found by their author:
+/// [`write_memory`] sets it from the source, and a subagent's source carries its session's agent
+/// and id, so the session's memories are its subagents' too. Provenance would not do: raw
+/// retention deletes it with the chunks, which would give a capped session fresh room (Task 12b
+/// review, M3).
+fn session_kept(c: &Connection, src: &CaptureState) -> Result<SessionKept> {
+    let prefix = distill::SUBAGENT_KEY_PREFIX;
+    let (all, subagent, handoff): (i64, i64, i64) = c.query_row(
+        "SELECT count(*), coalesce(sum(substr(idempotency_key, 1, ?3) = ?4), 0),
+                coalesce(sum(kind = 'handoff'), 0)
+         FROM memories
+         WHERE origin = 'distill' AND status <> 'trashed'
+           AND author_agent = ?1 AND author_session = ?2",
+        rusqlite::params![src.agent, src.session_id, prefix.len() as i64, prefix],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let n = |v: i64| usize::try_from(v).unwrap_or(0);
+    Ok(SessionKept {
+        all: n(all),
+        subagent: n(subagent),
+        handoff: n(handoff),
+    })
+}
+
+/// The other names of project `project_id` for distillation's routing guard (spec §6.5): its
+/// name, and the folder and path of its working tree when it has one.
+fn project_names(c: &Connection, project_id: &str) -> Result<Vec<String>> {
+    let mut names = vec![projects::get_by_id(c, project_id)?.name];
+    if let Some(root) = projects::root_of(c, project_id)? {
+        if let Some(folder) = std::path::Path::new(&root).file_name() {
+            names.push(folder.to_string_lossy().into_owned());
+        }
+        names.push(root);
+    }
+    Ok(names)
 }
 
 /// A stored chunk: `(id, ord, text)`.

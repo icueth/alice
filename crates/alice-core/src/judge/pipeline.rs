@@ -8,7 +8,8 @@
 //! stands in for the judge asked for, or answers because that judge failed, only suggests.
 //!
 //! A distilled newcomer (SP2 spec §6.6) never asks a person and never replaces an explicit
-//! memory; an explicit newcomer replaces its older distilled duplicates. See `decide_distilled`.
+//! memory: one it duplicates or updates is what it duplicates (Task 11b). An explicit newcomer
+//! replaces its older distilled duplicates. See `decide_distilled`.
 
 use super::{JudgeMemory, Relation};
 use crate::model::Origin;
@@ -29,8 +30,8 @@ pub enum JudgeAction {
     Supersedes { old: String, p: f64 },
     /// A `contradicts` link (a review item asks which is right).
     Contradicts { other: String, p: f64 },
-    /// A `relates_to` link: what a distilled newcomer gets where an explicit one would update
-    /// the other memory or be asked about it (SP2 spec §6.6).
+    /// A `relates_to` link: what a distilled newcomer gets where an explicit one would be asked
+    /// whether it updates an older distilled memory (SP2 spec §6.6).
     RelatesTo { other: String, p: f64 },
     /// The new memory, an explicit one, replaces its older `distilled` duplicate: the distilled
     /// one is trashed and points to it (SP2 spec §6.6).
@@ -172,11 +173,15 @@ pub fn decide(
     out
 }
 
-/// [`decide`] for a distilled newcomer (SP2 spec §6.6): nothing is ever asked. Its best duplicate
-/// at the review threshold settles it (it goes to the trash); it supersedes only an older
-/// distilled memory and is linked `relates_to` where it would otherwise supersede or ask; a
-/// contradiction is linked. The heuristic applies the same text only, and a heuristic standing
-/// in for the judge decides nothing: the memory waits for the judge's retry.
+/// [`decide`] for a distilled newcomer (SP2 spec §6.6): nothing is ever asked. Its best match at
+/// the review threshold settles it (it goes to the trash as its duplicate): a duplicate, or an
+/// explicit memory it updates (Task 11b: a near-copy of what an agent or a person saved, with
+/// more detail or a newer value, never replaces it; the explicit memory is kept, and the
+/// passage stays in the raw capture). An older distilled memory it updates is superseded
+/// from the auto threshold and linked `relates_to` below it (the judge worker links one of
+/// another project instead of superseding it); a contradiction is linked.
+/// The heuristic applies the same text only (never an update), and a heuristic standing in for
+/// the judge decides nothing: the memory waits for the judge's retry.
 fn decide_distilled(
     relations: &[Relation],
     t: &Thresholds,
@@ -188,13 +193,17 @@ fn decide_distilled(
         return out;
     }
     let heuristic = provider == "heuristic";
+    // Whether the strongest relation `k` makes the newcomer a duplicate of `r`'s memory.
+    let settles = |r: &Relation, k: &str| match k {
+        "duplicate" => !heuristic || r.agreement == Some(true),
+        "updates" => !heuristic && r.existing_origin != Origin::Distill,
+        _ => false,
+    };
     if let Some((r, p)) = relations
         .iter()
         .filter_map(|r| {
             strongest(r)
-                .filter(|(k, p)| {
-                    *k == "duplicate" && *p >= t.review && (!heuristic || r.agreement == Some(true))
-                })
+                .filter(|(k, p)| *p >= t.review && settles(r, k))
                 .map(|(_, p)| (r, p))
         })
         .max_by(|a, b| a.1.total_cmp(&b.1))
@@ -486,18 +495,18 @@ mod tests {
                 }],
             ),
             (
-                "updates >= auto of an agent's memory: both stay, linked",
+                "updates >= auto of an agent's memory: trashed as its duplicate (Task 11b)",
                 rel("OLD", &[("updates", 0.9), ("unrelated", 0.1)]),
                 "jev",
                 false,
-                vec![relates(0.9)],
+                vec![dup(0.9)],
             ),
             (
-                "updates between review and auto: linked, not asked",
+                "updates between review and auto of an agent's memory: trashed, not asked",
                 rel("OLD", &[("updates", 0.6), ("unrelated", 0.4)]),
                 "jev",
                 false,
-                vec![relates(0.6)],
+                vec![dup(0.6)],
             ),
             (
                 "updates between review and auto of a distilled memory: linked too",
@@ -606,6 +615,173 @@ mod tests {
             }]
         );
         assert!(d.reviews.is_empty());
+    }
+
+    /// Task 11b (spec §6.6): a distilled newcomer whose strongest relation to an explicit memory
+    /// (an agent's or a person's) is `updates` at the review threshold or above is a near-copy of
+    /// it: it goes to the trash as its duplicate, with no review item, and never replaces it
+    /// (R19). Updates of a distilled memory and contradictions keep Task 11's rules, and the
+    /// heuristic and a stand-in still apply no updates (R2).
+    #[test]
+    fn a_distilled_update_of_an_explicit_memory_is_its_duplicate() {
+        let dup = |survivor: &str, p: f64| {
+            vec![JudgeAction::DuplicateOf {
+                survivor: survivor.into(),
+                p,
+            }]
+        };
+        let import = |id: &str, pairs: &[(&str, f64)]| Relation {
+            existing_origin: Origin::Import,
+            ..rel(id, pairs)
+        };
+        // (what, relations, provider, review_only, actions wanted)
+        type Case = (
+            &'static str,
+            Vec<Relation>,
+            &'static str,
+            bool,
+            Vec<JudgeAction>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "updates 0.55 of an agent's memory",
+                vec![rel("OLD", &[("updates", 0.55), ("unrelated", 0.45)])],
+                "jev",
+                false,
+                dup("OLD", 0.55),
+            ),
+            (
+                "updates 0.845 (just under auto) of an agent's memory",
+                vec![rel("OLD", &[("updates", 0.845), ("unrelated", 0.155)])],
+                "jev",
+                false,
+                dup("OLD", 0.845),
+            ),
+            (
+                "updates at the review threshold exactly",
+                vec![rel("OLD", &[("updates", 0.5), ("unrelated", 0.5)])],
+                "jev",
+                false,
+                dup("OLD", 0.5),
+            ),
+            (
+                "updates of an imported memory (saved by an agent or a person)",
+                vec![import("OLD", &[("updates", 0.7), ("unrelated", 0.3)])],
+                "jev",
+                false,
+                dup("OLD", 0.7),
+            ),
+            (
+                "updates 0.4 of an agent's memory: nothing",
+                vec![rel("OLD", &[("updates", 0.4), ("unrelated", 0.6)])],
+                "jev",
+                false,
+                vec![],
+            ),
+            (
+                "updates 0.6 of a distilled memory: Task 11's link",
+                vec![rel_distilled(
+                    "OLD",
+                    &[("updates", 0.6), ("unrelated", 0.4)],
+                )],
+                "jev",
+                false,
+                vec![JudgeAction::RelatesTo {
+                    other: "OLD".into(),
+                    p: 0.6,
+                }],
+            ),
+            (
+                "updates 0.9 of a distilled memory: Task 11's supersede",
+                vec![rel_distilled(
+                    "OLD",
+                    &[("updates", 0.9), ("unrelated", 0.1)],
+                )],
+                "jev",
+                false,
+                vec![JudgeAction::Supersedes {
+                    old: "OLD".into(),
+                    p: 0.9,
+                }],
+            ),
+            (
+                // Weights 0.6 and 0.8, normalised to 3/7 and 4/7.
+                "the strongest relation is a contradiction: Task 11's link",
+                vec![rel("OLD", &[("updates", 0.6), ("contradicts", 0.8)])],
+                "jev",
+                false,
+                vec![JudgeAction::Contradicts {
+                    other: "OLD".into(),
+                    p: 0.8 / 1.4,
+                }],
+            ),
+            (
+                "the heuristic's updates of an agent's memory: nothing",
+                vec![rel("OLD", &[("updates", 0.7), ("unrelated", 0.3)])],
+                "heuristic",
+                false,
+                vec![],
+            ),
+            (
+                "a stand-in's updates of an agent's memory: nothing",
+                vec![rel("OLD", &[("updates", 0.9), ("unrelated", 0.1)])],
+                "heuristic",
+                true,
+                vec![],
+            ),
+            (
+                "the best match settles it: an explicit update over a distilled duplicate",
+                vec![
+                    rel_distilled("D", &[("duplicate", 0.7), ("unrelated", 0.3)]),
+                    rel("A", &[("updates", 0.8), ("unrelated", 0.2)]),
+                    rel("C", &[("contradicts", 0.9), ("unrelated", 0.1)]),
+                ],
+                "jev",
+                false,
+                dup("A", 0.8),
+            ),
+            (
+                "the best match settles it: a duplicate over an explicit update",
+                vec![
+                    rel("A", &[("updates", 0.6), ("unrelated", 0.4)]),
+                    rel("B", &[("duplicate", 0.9), ("unrelated", 0.1)]),
+                ],
+                "jev",
+                false,
+                dup("B", 0.9),
+            ),
+        ];
+        for (what, relations, provider, review_only, want) in cases {
+            let d = decide(&distilled(), &relations, &T, provider, review_only);
+            assert!(d.reviews.is_empty(), "{what}: {:?}", d.reviews);
+            assert_eq!(d.actions, want, "{what}");
+        }
+        // Only the strongest relation counts: with a lower review threshold an update over it
+        // that a contradiction outweighs is still Task 11's contradiction link.
+        let low = Thresholds {
+            auto: 0.85,
+            review: 0.3,
+        };
+        let d = decide(
+            &distilled(),
+            &[rel("OLD", &[("updates", 0.4), ("contradicts", 0.6)])],
+            &low,
+            "jev",
+            false,
+        );
+        assert_eq!(
+            d.actions,
+            vec![JudgeAction::Contradicts {
+                other: "OLD".into(),
+                p: 0.6,
+            }]
+        );
+        // An explicit newcomer's update is unchanged: it supersedes, or asks between the
+        // thresholds.
+        let r = [rel("OLD", &[("updates", 0.6), ("unrelated", 0.4)])];
+        let d = decide(&new(), &r, &T, "jev", false);
+        assert!(d.actions.is_empty());
+        assert_eq!(d.reviews[0].kind, ReviewType::Supersede);
     }
 
     /// SP2 spec §6.6: an explicit newcomer that duplicates an older distilled memory survives,

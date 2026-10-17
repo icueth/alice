@@ -199,6 +199,12 @@ pub enum CaptureChange {
         from_ord: i64,
     },
     Ended,
+    /// The stale end (spec §6.2, §10; Task 11b): the source is ended and, with `due_since`
+    /// (distillation is on), a main session that captured at or after it and holds chunks not
+    /// distilled yet becomes due (`store::capture::due_after_stale_end`), in one transaction.
+    StaleEnd {
+        due_since: Option<String>,
+    },
     /// A pass starts beyond the cursor (a tenant client sent from there, or the local worker
     /// skipped a line longer than a pass): the cursor moves there and the gap is counted.
     Gap {
@@ -1866,6 +1872,13 @@ fn capture_state_update(
             capture_store::revive_backfilled(conn, source_id, *from_ord)
         }
         CaptureChange::Ended => capture_store::set_ended(conn, source_id),
+        CaptureChange::StaleEnd { due_since } => {
+            let ended = capture_store::set_ended(conn, source_id)?;
+            if let Some(since) = due_since {
+                capture_store::due_after_stale_end(conn, source_id, since)?;
+            }
+            Ok(ended)
+        }
         CaptureChange::Gap { byte_offset } => {
             capture_store::record_gap(conn, source_id, *byte_offset)
         }

@@ -297,22 +297,28 @@ policy again, for every project a request covers, and redacts the text with each
 
 ### What it does
 
-- **When.** A session is distilled when it ends (`SessionEnd`, or 24 hours without any event), when it is compacted
-  (`PreCompact`), when it has been quiet for `distill.idle_minutes` (default 15), or when you run
-  `alice capture distill <session-id>`.
+- **When.** A session is distilled when it ends (`SessionEnd`, or 24 hours without any event when it captured something
+  in the last 8 days; an older one waits for you to ask), when it is compacted (`PreCompact`), when it has been quiet
+  for `distill.idle_minutes` (default 15), or when you run `alice capture distill <session-id>`.
 - **Extractive.** Jev answers choice questions only, so a distilled memory is **a passage of your session**, chosen and
   classified by Jev, never new text. Alice proposes up to 40 passages per run: compaction summaries first, then each
   turn's concluding text, then statements you made, then subagent reports. Passages that hold `[withheld:`, are mostly a
   tool line, or repeat what the session already saved with `remember` are dropped first.
 - **One request per run.** Jev gets one question per passage: does it hold a decision, a bugfix, a how-to, a warning, a
-  preference of yours (filed under `global`), a convention of this project, a fact, a handoff, or is it already saved,
-  ephemeral or unclear? A passage is kept when its best answer is a kind of knowledge with probability at least
-  `distill.min_confidence` (default 0.7). At most `distill.max_per_run` (default 8) are kept per run, and at most one
-  handoff.
-- **The memory.** The passage (at most 1,200 characters), titled with its first sentence, with a last line
-  `Context: <your prompt's first sentence>` when it needs one to stand on its own. Importance `distill.importance`
-  (default 2), no topics, the session as author, and provenance links to the chunks it came from. It is written through
-  the normal `remember` path: redacted, deduplicated and judged.
+  preference of yours (filed under `global`, unless it names this project: its name, its folder or a path in it), a
+  convention of this project, a fact, a handoff, or is it already saved, ephemeral or unclear? A passage is kept when
+  its best answer is a kind of knowledge with probability at least `distill.min_confidence` (default 0.7). At most
+  `distill.max_per_run` (default 8) are kept per run, and at most one handoff; at most `distill.max_per_session`
+  (default 16) per session, its runs and its subagents together, one of them kept for a handoff at the session's end
+  (`SessionEnd`, a compaction, or the 24-hour stale end); and at most `distill.max_per_subagent_run` (default 2)
+  subagent reports per run, and half of `distill.max_per_session` per session. A subagent's report is never the
+  session's handoff.
+- **The memory.** The passage (at most 1,200 characters), titled with its first sentence, passing over `#` headings;
+  when that is a table header, or 25 characters or fewer (a short heading or label), with the first sentence after it
+  that says more (at most 80 characters). It gets a last line `Context: <your prompt's first sentence>` when it needs
+  one to stand on its own. Importance `distill.importance` (default 2), no topics, the session as author, and
+  provenance links to the chunks it came from. It is written through the normal `remember` path: redacted,
+  deduplicated and judged.
 
 ### `(auto)`, and why it never asks you
 
@@ -320,9 +326,12 @@ A distilled memory is marked **`(auto)`** in the briefing and in text recall, an
 machine-extracted: rely on it as you would on a note you did not write.
 
 - **It never asks you anything.** A distilled memory never opens a review item. A probable duplicate is put in the trash
-  as a duplicate; an uncertain update or a contradiction becomes a link between the two memories, without a question.
+  as a duplicate; an uncertain update of another distilled memory, or a contradiction, becomes a link between the two
+  memories, without a question.
 - **Your memories win.** A distilled memory never replaces one an agent or you wrote. When the judge finds that the two
-  say the same thing, yours stays and the distilled one goes to the trash, whichever came first.
+  say the same thing, yours stays and the distilled one goes to the trash, whichever came first; so does a distilled
+  memory that only updates yours. A preference of yours filed under `global` is compared with the memories of the
+  session's project too, where your agent may have saved it (unless the cloud policy keeps that project at home).
 - **Hidden until judged.** Recall and the briefing skip a distilled memory until the judge has looked at it, so a near
   copy of something already saved never shows twice. `get_memory` by id still returns it.
 - **It stays out of the way.** Importance 2 keeps distilled memories out of the briefing's key memories, and below
@@ -377,6 +386,8 @@ provider = "off"            # "off" | "jev"
 # model                     # reserved; ignored with "jev" (judge.jev.model is used)
 min_confidence = 0.7        # 0.5-0.99
 max_per_run = 8             # 1-50
+max_per_session = 16        # 2-200: one session over all its runs, its subagents included
+max_per_subagent_run = 2    # 0-50: subagent reports kept in one run
 idle_minutes = 15           # 1-1,440
 importance = 2              # 1-3
 budget_share = 0.5          # 0.05-1.0 of judge.daily_budget_usd

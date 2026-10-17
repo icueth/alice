@@ -627,6 +627,11 @@ pub struct DistillSettings {
     pub min_confidence: f64,
     /// Most memories kept from one session run (1 to 50).
     pub max_per_run: usize,
+    /// Most memories kept from one session over all its runs, its subagents' included (2 to
+    /// 200). One of them is kept for a handoff; subagent reports together keep at most half.
+    pub max_per_session: usize,
+    /// Most memories kept from subagent reports in one run (0 to 50).
+    pub max_per_subagent_run: usize,
     /// Minutes a session must be quiet before it is distilled (1 to 1440).
     pub idle_minutes: u32,
     /// Importance given to distilled memories (1 to 3).
@@ -642,6 +647,8 @@ impl Default for DistillSettings {
             model: None,
             min_confidence: 0.7,
             max_per_run: 8,
+            max_per_session: 16,
+            max_per_subagent_run: 2,
             idle_minutes: 15,
             importance: 2,
             budget_share: 0.5,
@@ -1521,6 +1528,16 @@ impl Settings {
             "distill.max_per_run",
             (1..=50).contains(&d.max_per_run),
             "must be 1 to 50",
+        );
+        range(
+            "distill.max_per_session",
+            (2..=200).contains(&d.max_per_session),
+            "must be 2 to 200",
+        );
+        range(
+            "distill.max_per_subagent_run",
+            d.max_per_subagent_run <= 50,
+            "must be 0 to 50",
         );
         range(
             "distill.idle_minutes",
@@ -3842,6 +3859,94 @@ mod tests {
         ] {
             assert!(error_keys(ok, &[]).is_empty(), "{ok}");
         }
+    }
+
+    /// Task 12b: `distill.max_per_session` (16, 2 to 200) and `distill.max_per_subagent_run`
+    /// (2, 0 to 50): defaults, ranges, the error that names the range, and the environment.
+    #[test]
+    fn distill_session_and_subagent_caps_have_defaults_and_ranges() {
+        let s = Settings::default();
+        assert_eq!(
+            get_key(&s, "distill.max_per_session"),
+            Some(serde_json::json!(16))
+        );
+        assert_eq!(
+            get_key(&s, "distill.max_per_subagent_run"),
+            Some(serde_json::json!(2))
+        );
+        for (file, key, range) in [
+            (
+                "[distill]\nmax_per_session = 0\n",
+                "distill.max_per_session",
+                "must be 2 to 200",
+            ),
+            (
+                // Task 12b review 2: one would keep a handoff alone.
+                "[distill]\nmax_per_session = 1\n",
+                "distill.max_per_session",
+                "must be 2 to 200",
+            ),
+            (
+                "[distill]\nmax_per_session = 201\n",
+                "distill.max_per_session",
+                "must be 2 to 200",
+            ),
+            (
+                "[distill]\nmax_per_subagent_run = 51\n",
+                "distill.max_per_subagent_run",
+                "must be 0 to 50",
+            ),
+        ] {
+            let errs = resolve(Some(file), &[]).unwrap_err();
+            assert_eq!(errs.len(), 1, "{file}: {errs:?}");
+            assert_eq!(errs[0].key, key, "{file}");
+            assert!(errs[0].message.contains(range), "{file}: {errs:?}");
+            let (kept, left_out) = resolve_salvaging(Some(file), &[]);
+            assert_eq!(left_out.len(), 1, "{file}");
+            assert_eq!(
+                get_key(&kept.settings, key),
+                get_key(&Settings::default(), key),
+                "{key} keeps its previous value"
+            );
+        }
+        for (file, session, subagent) in [
+            (
+                "[distill]\nmax_per_session = 2\nmax_per_subagent_run = 0\n",
+                2,
+                0,
+            ),
+            (
+                "[distill]\nmax_per_session = 200\nmax_per_subagent_run = 50\n",
+                200,
+                50,
+            ),
+        ] {
+            let r = resolve(Some(file), &[]).unwrap();
+            assert_eq!(
+                get_key(&r.settings, "distill.max_per_session"),
+                Some(serde_json::json!(session))
+            );
+            assert_eq!(
+                get_key(&r.settings, "distill.max_per_subagent_run"),
+                Some(serde_json::json!(subagent))
+            );
+        }
+        let r = resolve(
+            None,
+            &env(&[
+                ("ALICE_DISTILL_MAX_PER_SESSION", "40"),
+                ("ALICE_DISTILL_MAX_PER_SUBAGENT_RUN", "0"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            get_key(&r.settings, "distill.max_per_session"),
+            Some(serde_json::json!(40))
+        );
+        assert_eq!(
+            get_key(&r.settings, "distill.max_per_subagent_run"),
+            Some(serde_json::json!(0))
+        );
     }
 
     #[test]

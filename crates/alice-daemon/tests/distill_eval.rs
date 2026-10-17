@@ -9,10 +9,17 @@
 //!   §11.3 declares.
 //! - `distill_eval_live` (ignored): the real Jev, through `ReqwestTransport` and the key in
 //!   `TYPESAFE_API_KEY`. It writes `recorded.jsonl` with bodies only (no header, so no key),
-//!   prints the metrics and the spend, and stops once the spend passes $0.10:
+//!   prints the metrics and the spend, and stops once the spend passes $0.10, or
+//!   `ALICE_DISTILL_EVAL_STOP_USD` when that is set (Task 12b review: one re-record runs both
+//!   live tests, which share $0.10 in all, so give the second what the first left):
 //!   `cargo test -p alice-daemon --test distill_eval distill_eval_live -- --ignored --nocapture`.
 //!   With `ALICE_DISTILL_EVAL_DRY=1` nothing is sent: a scripted Jev answers, and the pipeline runs
 //!   twice and must send the same bodies both times. This is the free check before a live run.
+//! - `distill_eval_flood_replay` and `distill_eval_flood_live` (Task 12b): the same two for the
+//!   flood set in `fixtures/distill/flood/` (twenty reviewer verdicts next to three lessons), with
+//!   its own `recorded.jsonl` and thresholds; Task 13's set and thresholds are not touched. Record
+//!   it with `cargo test -p alice-daemon --test distill_eval distill_eval_flood_live -- --ignored
+//!   --nocapture` (`ALICE_DISTILL_EVAL_DRY=1` for the free check first).
 //!
 //! How the set is run:
 //! - **Isolation:** each session gets its own daemon, so what the judge compares never depends on
@@ -20,11 +27,12 @@
 //! - **Seeding:** an `already` session's `remember` calls are stored first, as the agent's own
 //!   memories in the session's project, and are judged. Then the transcript is uploaded as a
 //!   session end, and everything is distilled and judged before any result is read.
-//! - **Matching:** a distilled memory counts while it is active; one the judge trashed does not,
-//!   and any other status fails the test. A memory matches a labelled item of its own session
-//!   when its body, without the `Context:` line, holds the item's phrase and its kind is one of
-//!   the item's kinds. Each memory is matched on its own; s29's summary is cut into two chunks,
-//!   and memories are never joined across that cut.
+//! - **Matching:** a distilled memory counts while it is active; one the judge trashed (a
+//!   duplicate) or superseded (by a newer distilled memory) does not, and any other status fails
+//!   the test. A memory matches a labelled item of its own session when its body, without the
+//!   `Context:` line, holds the item's phrase and its kind is one of the item's kinds. Each memory
+//!   is matched on its own; s29's summary is cut into two chunks, and memories are never joined
+//!   across that cut.
 //!
 //! **Clocks.** The distillation request holds no clock: `alice_core::distill` is pure. The judge's
 //! comparison gives each memory's age (`age(created_at, now)`). The writer's clock and the judge's
@@ -56,8 +64,20 @@ const FAKE_KEY: &str = concat!("ts_", "replay_distill_eval_key_0001");
 /// The test home: Jev judges and distils, the whole $1 day is this run's (spec §11.3 asks for less
 /// than $0.10), and a request may take a minute, so a 40-question request is not cut short.
 const CONFIG: &str = "[judge]\nprovider = \"jev\"\ndaily_budget_usd = 1.0\ntimeout_ms = 60000\n\n[distill]\nprovider = \"jev\"\nbudget_share = 1.0\n";
-/// The live run stops once its spend passes this.
+/// A live run stops once its spend passes this, unless [`STOP_ENV`] says otherwise; it is also
+/// §11.3's spend threshold.
 const SPEND_STOP_USD: f64 = 0.10;
+/// The live runs' spend stop in USD, so the two live runs of one re-record can share $0.10.
+const STOP_ENV: &str = "ALICE_DISTILL_EVAL_STOP_USD";
+
+/// The live runs' spend stop: `value` (of [`STOP_ENV`]) when it is a positive number, else
+/// [`SPEND_STOP_USD`].
+fn spend_stop(value: Option<&str>) -> f64 {
+    value
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(SPEND_STOP_USD)
+}
 /// Set to run the dry check instead of the live run.
 const DRY_ENV: &str = "ALICE_DISTILL_EVAL_DRY";
 const REMEMBER: &str = "mcp__alice__remember";
@@ -69,6 +89,11 @@ fn dir() -> PathBuf {
 
 fn recorded_path() -> PathBuf {
     dir().join("recorded.jsonl")
+}
+
+/// The flood set (Task 12b): one session of reviewer verdicts next to three lessons.
+fn flood_dir() -> PathBuf {
+    dir().join("flood")
 }
 
 // ---- The set ----
@@ -99,6 +124,9 @@ struct Session {
     /// Written in Thai, or in Thai and English.
     thai: bool,
     remembered: Vec<Remembered>,
+    /// The flood set: the opening words of each verdict or status report, which should end
+    /// `ephemeral`.
+    verdicts: Vec<String>,
 }
 
 impl Session {
@@ -112,7 +140,11 @@ impl Session {
 }
 
 fn load_set() -> Vec<Session> {
-    let text = std::fs::read_to_string(dir().join("labels.json")).unwrap();
+    load_set_in(&dir())
+}
+
+fn load_set_in(dir: &Path) -> Vec<Session> {
+    let text = std::fs::read_to_string(dir.join("labels.json")).unwrap();
     let labels: Value = serde_json::from_str(&text).unwrap();
     let opts = ReadOptions {
         at_file_start: true,
@@ -125,7 +157,7 @@ fn load_set() -> Vec<Session> {
         .iter()
         .map(|s| {
             let file = s["file"].as_str().unwrap().to_owned();
-            let bytes = std::fs::read(dir().join("sessions").join(&file)).unwrap();
+            let bytes = std::fs::read(dir.join("sessions").join(&file)).unwrap();
             let (mut id, mut cwd, mut remembered) = (None, None, Vec::new());
             for line in std::str::from_utf8(&bytes).unwrap().lines() {
                 let v: Value = serde_json::from_str(line).unwrap();
@@ -182,6 +214,12 @@ fn load_set() -> Vec<Session> {
                     .iter()
                     .any(|t| t.chars().any(|c| ('\u{0E00}'..='\u{0E7F}').contains(&c))),
                 remembered,
+                verdicts: s["verdicts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.as_str().unwrap().to_owned())
+                    .collect(),
                 bytes,
                 file,
             }
@@ -191,7 +229,11 @@ fn load_set() -> Vec<Session> {
 
 /// `recorded.jsonl`: the response body of each request body, by the request body's SHA-256.
 fn load_recorded() -> HashMap<String, Vec<u8>> {
-    let text = std::fs::read_to_string(recorded_path()).unwrap_or_else(|e| {
+    load_recorded_from(&recorded_path())
+}
+
+fn load_recorded_from(path: &Path) -> HashMap<String, Vec<u8>> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
         panic!(
             "no recorded answers ({e}); record them once with the live run (see the module docs)"
         )
@@ -236,7 +278,10 @@ struct EvalTransport {
     ages: Mutex<Vec<String>>,
     /// What Jev's answers say was spent (input tokens at Jev's price).
     spent: Mutex<f64>,
-    /// The spend passed [`SPEND_STOP_USD`]: nothing more is sent.
+    /// Nothing more is sent once the spend passes this: [`spend_stop`] in a live run,
+    /// [`SPEND_STOP_USD`] otherwise.
+    stop_usd: f64,
+    /// The spend passed `stop_usd`: nothing more is sent.
     stopped: AtomicBool,
     /// Live: how long each request took.
     latencies_ms: Mutex<Vec<u64>>,
@@ -244,7 +289,12 @@ struct EvalTransport {
 
 impl EvalTransport {
     fn new(mode: Mode) -> Arc<Self> {
+        let stop_usd = match mode {
+            Mode::Live(_) => spend_stop(std::env::var(STOP_ENV).ok().as_deref()),
+            _ => SPEND_STOP_USD,
+        };
         Arc::new(Self {
+            stop_usd,
             mode,
             items: Mutex::new(Vec::new()),
             answered: Mutex::new(Vec::new()),
@@ -274,7 +324,8 @@ impl EvalTransport {
         );
         assert!(
             !self.stopped.load(Ordering::SeqCst),
-            "{what}: the spend passed ${SPEND_STOP_USD}; the run stops"
+            "{what}: the spend passed ${}; the run stops",
+            self.stop_usd
         );
     }
 
@@ -343,7 +394,7 @@ impl JevTransport for EvalTransport {
         if reply.status == 200 {
             let mut spent = self.spent.lock();
             *spent += usage_usd(&reply.body);
-            if *spent > SPEND_STOP_USD {
+            if *spent > self.stop_usd {
                 self.stopped.store(true, Ordering::SeqCst);
             }
             self.answered
@@ -450,6 +501,8 @@ fn dry_answer(body: &str, items: &[Item]) -> Vec<u8> {
 struct Recorder {
     t: Arc<EvalTransport>,
     key: String,
+    /// Where it writes: `recorded.jsonl` of the set it ran.
+    path: PathBuf,
 }
 
 impl Drop for Recorder {
@@ -474,7 +527,7 @@ impl Drop for Recorder {
             eprintln!("recorded.jsonl is not written: a body holds the key or a header");
             return;
         }
-        match std::fs::write(recorded_path(), &text) {
+        match std::fs::write(&self.path, &text) {
             Ok(()) => println!(
                 "recorded.jsonl: {} requests, {} bytes",
                 seen.len(),
@@ -497,8 +550,9 @@ struct Mem {
 }
 
 impl Mem {
-    /// Stored and counted: `active`. A judged distilled memory is either that or `trashed`
-    /// (`run_session` fails on any other status, so a superseded copy is never scored silently).
+    /// Stored and counted: `active`. A judged distilled memory is that, `trashed` (a duplicate of
+    /// an older memory) or `superseded` (a newer distilled memory updates it, Task 11); recall
+    /// hides the last two. `run_session` fails on any other status, and the report counts each.
     fn live(&self) -> bool {
         self.status == "active"
     }
@@ -524,6 +578,13 @@ struct Outcome {
     /// The cost ledger of the session's daemon: USD and calls (the judge's and distillation's).
     spend_usd: f64,
     calls: i64,
+}
+
+impl Outcome {
+    /// The distilled memories the judge left with `status`.
+    fn count(&self, status: &str) -> usize {
+        self.memories.iter().filter(|m| m.status == status).count()
+    }
 }
 
 fn start(home: &Path, t: &Arc<EvalTransport>, key: &str) -> Arc<Service> {
@@ -742,8 +803,8 @@ async fn run_session(t: &Arc<EvalTransport>, s: &Session, key: &str, limit: Dura
     }
     for (m, _) in &rows {
         assert!(
-            m.status == "active" || m.status == "trashed",
-            "{}: the distilled {} «{}» is {}; the evaluation scores only active and trashed memories",
+            ["active", "trashed", "superseded"].contains(&m.status.as_str()),
+            "{}: the distilled {} «{}» is {}; the evaluation scores only active, trashed and superseded memories",
             s.file,
             m.kind,
             m.title,
@@ -782,12 +843,14 @@ async fn run_all(
         let started = Instant::now();
         let o = run_session(t, s, key, limit).await;
         println!(
-            "{} ({}): {} questions, {} distilled, {} live, {} Jev calls, ${:.5}, {:.1} s",
+            "{} ({}): {} questions, {} distilled, {} live, {} trashed, {} superseded, {} Jev calls, ${:.5}, {:.1} s",
             s.file,
             s.kind,
             o.questions,
             o.memories.len(),
             o.memories.iter().filter(|m| m.live()).count(),
+            o.count("trashed"),
+            o.count("superseded"),
             o.calls,
             o.spend_usd,
             started.elapsed().as_secs_f64()
@@ -837,6 +900,8 @@ struct Metrics {
     recalled: usize,
     /// Distilled memories the judge trashed (duplicates of an older memory).
     trashed: usize,
+    /// Distilled memories a newer distilled memory superseded.
+    superseded: usize,
     /// Precision by the memory's kind; recall by the item's first kind.
     by_kind: BTreeMap<String, Tally>,
     by_language: BTreeMap<&'static str, Tally>,
@@ -851,7 +916,8 @@ fn metrics(set: &[Session], outcomes: &[Outcome]) -> Metrics {
     for (s, o) in set.iter().zip(outcomes) {
         m.spend_usd += o.spend_usd;
         m.jev_calls += o.calls;
-        m.trashed += o.memories.iter().filter(|x| !x.live()).count();
+        m.trashed += o.count("trashed");
+        m.superseded += o.count("superseded");
         let live: Vec<&Mem> = o.memories.iter().filter(|x| x.live()).collect();
         for mem in &live {
             let hit = s.items.iter().any(|i| mem.matches(i));
@@ -947,8 +1013,9 @@ fn report(set: &[Session], outcomes: &[Outcome], m: &Metrics) -> String {
     .unwrap();
     writeln!(
         w,
-        "\nDistilled memories the judge trashed as duplicates: {}.",
-        m.trashed
+        "\nDistilled memories the judge trashed as duplicates: {}; superseded by a newer distilled memory: {}.",
+        m.trashed,
+        m.superseded
     )
     .unwrap();
 
@@ -988,7 +1055,7 @@ fn report(set: &[Session], outcomes: &[Outcome], m: &Metrics) -> String {
 
     writeln!(
         w,
-        "\n| Session | Set | Language | Items | Questions | Live | Trashed | Matched | Items found |\n|---|---|---|---|---|---|---|---|---|"
+        "\n| Session | Set | Language | Items | Questions | Live | Trashed | Superseded | Matched | Items found |\n|---|---|---|---|---|---|---|---|---|---|"
     )
     .unwrap();
     let mut missed = Vec::new();
@@ -1006,14 +1073,15 @@ fn report(set: &[Session], outcomes: &[Outcome], m: &Metrics) -> String {
             .count();
         writeln!(
             w,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             s.file,
             s.kind,
             s.language(),
             s.items.len(),
             o.questions,
             live.len(),
-            o.memories.len() - live.len(),
+            o.count("trashed"),
+            o.count("superseded"),
             matched,
             found
         )
@@ -1110,7 +1178,8 @@ async fn distill_eval_replays_the_recorded_answers() {
 async fn distill_eval_live() {
     let set = load_set();
     if std::env::var_os(DRY_ENV).is_some() {
-        return dry_run(&set).await;
+        dry_run(&set).await;
+        return;
     }
     // Never printed: an unset or non-UTF-8 value names only the variable.
     let key = std::env::var("TYPESAFE_API_KEY")
@@ -1123,6 +1192,7 @@ async fn distill_eval_live() {
         let _recorder = Recorder {
             t: t.clone(),
             key: key.clone(),
+            path: recorded_path(),
         };
         run_all(&t, &set, &key, Duration::from_secs(300)).await
     };
@@ -1146,9 +1216,10 @@ async fn distill_eval_live() {
 /// The free check before a live run: a scripted Jev, the whole pipeline twice, and the same
 /// request bodies both times. It prints the metrics the script gets (the passages it keeps are the
 /// labelled ones, so its recall is what candidate extraction allows) and an upper bound on the
-/// spend.
-async fn dry_run(set: &[Session]) {
+/// spend. Returns the second run.
+async fn dry_run(set: &[Session]) -> (Arc<EvalTransport>, Vec<Outcome>) {
     let mut runs = Vec::new();
+    let mut last = None;
     for n in 1..=2 {
         let t = EvalTransport::new(Mode::Dry);
         let outcomes = run_all(&t, set, FAKE_KEY, Duration::from_secs(60)).await;
@@ -1170,6 +1241,7 @@ async fn dry_run(set: &[Session]) {
             m.spend_usd
         );
         runs.push(hashes);
+        last = Some((t, outcomes));
     }
     let same_order = runs[0] == runs[1];
     for r in &mut runs {
@@ -1183,4 +1255,162 @@ async fn dry_run(set: &[Session]) {
         "dry runs: the same {} request bodies both times (same order: {same_order})",
         runs[0].len()
     );
+    last.expect("two runs")
+}
+
+/// Task 12b review, M9: the live runs' spend stop is `ALICE_DISTILL_EVAL_STOP_USD` when it is a
+/// positive number, else $0.10.
+#[test]
+fn the_live_spend_stop_reads_its_variable() {
+    assert_eq!(spend_stop(None), 0.10);
+    assert_eq!(spend_stop(Some("0.06")), 0.06);
+    assert_eq!(spend_stop(Some(" 0.035 ")), 0.035);
+    for bad in ["", "abc", "0", "-1", "NaN", "inf"] {
+        assert_eq!(spend_stop(Some(bad)), 0.10, "{bad}");
+    }
+}
+
+// ---- The flood set (Task 12b) ----
+
+/// What Jev answered about each verdict of the flood set that it was asked about: the verdict's
+/// opening words and the option it found most probable.
+fn verdict_answers(t: &EvalTransport, s: &Session) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (request, response) in t.answered.lock().iter() {
+        let (Ok(req), Ok(resp)) = (
+            serde_json::from_slice::<Value>(request),
+            serde_json::from_slice::<Value>(response),
+        ) else {
+            continue;
+        };
+        for (qid, q) in req["questions"].as_object().into_iter().flatten() {
+            if !is_distill_question(qid) {
+                continue;
+            }
+            let passage = quoted_passage(q["instructions"].as_str().unwrap_or_default());
+            let Some(v) = s.verdicts.iter().find(|v| passage.contains(v.as_str())) else {
+                continue;
+            };
+            let best = resp["answers"][qid]["probabilities"]
+                .as_object()
+                .and_then(|p| {
+                    p.iter()
+                        .max_by(|a, b| {
+                            let p = |x: &Value| x.as_f64().unwrap_or(0.0);
+                            p(a.1).total_cmp(&p(b.1))
+                        })
+                        .map(|(o, _)| o.clone())
+                })
+                .unwrap_or_default();
+            out.push((v.clone(), best));
+        }
+    }
+    out
+}
+
+/// The flood set's thresholds (Task 12b, declared before any run): nearly all of the twenty
+/// verdicts reach Jev; most of them end `ephemeral`; at most five are kept, as in the real-session
+/// check; and the three lessons are kept, the one stated inside a reviewer's verdict too.
+fn assert_flood(set: &[Session], outcomes: &[Outcome], t: &EvalTransport) {
+    let (s, o) = (&set[0], &outcomes[0]);
+    let answers = verdict_answers(t, s);
+    let asked: HashSet<&str> = answers.iter().map(|(v, _)| v.as_str()).collect();
+    let ephemeral = answers.iter().filter(|(_, a)| a == "ephemeral").count();
+    let live: Vec<&Mem> = o.memories.iter().filter(|m| m.live()).collect();
+    let kept_verdicts: Vec<&&Mem> = live
+        .iter()
+        .filter(|m| s.verdicts.iter().any(|v| m.passage().contains(v.as_str())))
+        .collect();
+    println!(
+        "flood: {} of {} verdicts asked, {ephemeral} answered ephemeral, {} kept; {} live memories, {} questions",
+        asked.len(),
+        s.verdicts.len(),
+        kept_verdicts.len(),
+        live.len(),
+        o.questions
+    );
+    for (v, a) in &answers {
+        println!("- {a}: {v}");
+    }
+    for m in &live {
+        println!("+ {} «{}»", m.kind, m.title);
+    }
+    assert!(
+        asked.len() + 2 >= s.verdicts.len(),
+        "the verdicts reach Jev: {answers:?}"
+    );
+    assert!(
+        ephemeral * 2 > answers.len(),
+        "most verdicts end ephemeral: {answers:?}"
+    );
+    assert!(kept_verdicts.len() <= 5, "{kept_verdicts:#?}");
+    for item in &s.items {
+        assert!(
+            live.iter().any(|m| m.matches(item)),
+            "the lesson «{}» ({}) is kept: {live:#?}",
+            item.phrase,
+            item.kinds.join("|")
+        );
+    }
+}
+
+/// The flood set replayed (Task 12b): one session whose plan ran through twenty reviewer
+/// subagents, each answering with a one-task verdict or status report, next to three lessons.
+/// Every request is answered from `fixtures/distill/flood/recorded.jsonl`, as in
+/// [`distill_eval_replays_the_recorded_answers`], and the flood's thresholds are asserted. Task
+/// 13's set and thresholds are not touched. Until the live run records the file, every request
+/// misses and the test fails on that alone (ruling F8).
+#[tokio::test(flavor = "multi_thread")]
+async fn distill_eval_flood_replay() {
+    let set = load_set_in(&flood_dir());
+    let recorded = load_recorded_from(&flood_dir().join("recorded.jsonl"));
+    let keys: HashSet<String> = recorded.keys().cloned().collect();
+    let t = EvalTransport::new(Mode::Replay(recorded));
+    let outcomes = run_all(&t, &set, FAKE_KEY, Duration::from_secs(60)).await;
+    t.check("after the flood session");
+    let asked: HashSet<String> = t.hashes().into_iter().collect();
+    let mut unused: Vec<&String> = keys.difference(&asked).collect();
+    unused.sort();
+    assert!(
+        unused.is_empty(),
+        "recorded answers no request asked for, so the pipeline no longer sends what \
+         flood/recorded.jsonl holds (record it again with the live run): {unused:?}"
+    );
+    assert_flood(&set, &outcomes, &t);
+}
+
+/// The flood set with the real Jev, once (Task 12b): it writes `fixtures/distill/flood/recorded.jsonl`
+/// and stops once its spend passes $0.10, or `ALICE_DISTILL_EVAL_STOP_USD`:
+/// `cargo test -p alice-daemon --test distill_eval distill_eval_flood_live -- --ignored --nocapture`.
+/// With `ALICE_DISTILL_EVAL_DRY=1`, the free dry check instead.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "network: the real Jev, with TYPESAFE_API_KEY; rewrites fixtures/distill/flood/recorded.jsonl"]
+async fn distill_eval_flood_live() {
+    let set = load_set_in(&flood_dir());
+    if std::env::var_os(DRY_ENV).is_some() {
+        let (t, outcomes) = dry_run(&set).await;
+        assert_flood(&set, &outcomes, &t);
+        return;
+    }
+    // Never printed: an unset or non-UTF-8 value names only the variable.
+    let key = std::env::var("TYPESAFE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .unwrap_or_else(|| panic!("set TYPESAFE_API_KEY (the key is never printed)"));
+    let t = EvalTransport::new(Mode::Live(ReqwestTransport::new().unwrap()));
+    let outcomes = {
+        let _recorder = Recorder {
+            t: t.clone(),
+            key: key.clone(),
+            path: flood_dir().join("recorded.jsonl"),
+        };
+        run_all(&t, &set, &key, Duration::from_secs(300)).await
+    };
+    t.check("after the flood session");
+    println!(
+        "Jev requests sent: {}; spend by Jev's usage ${:.4}",
+        t.latencies_ms.lock().len(),
+        *t.spent.lock()
+    );
+    assert_flood(&set, &outcomes, &t);
 }

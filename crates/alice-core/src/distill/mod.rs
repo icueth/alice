@@ -33,12 +33,22 @@ pub const STATE_CHARS: usize = 12_000;
 pub const PASSAGE_MIN: usize = 80;
 /// ...and at most this many.
 pub const PASSAGE_MAX: usize = 1_200;
+/// Text before a compaction summary's first heading of at most this many characters is its
+/// preamble, not a candidate...
+const PREAMBLE_MAX: usize = 300;
+/// ...and so is text that opens as Claude Code's summaries do.
+const PREAMBLE: &str = "This session is being continued from a previous conversation";
 /// A user prompt is a candidate when it has at least this many characters...
 pub const USER_MIN: usize = 20;
 /// ...and at most this many.
 pub const USER_MAX: usize = 800;
 /// The most characters of a memory's title.
 pub const TITLE_MAX: usize = 120;
+/// A title of at most this many characters says too little (a bare heading, a label): the
+/// passage's first sentence is the title instead (Task 12b)...
+pub const TITLE_BARE: usize = 25;
+/// ...with at most this many characters.
+pub const SENTENCE_TITLE_MAX: usize = 80;
 /// The most characters of a memory's passage (its context line comes on top).
 pub const BODY_MAX: usize = 1_200;
 /// A run covers at most this many turns of the main session...
@@ -72,9 +82,12 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ),
     (
         "preference_user",
-        "how the user wants things done in every project (style, language, tools, workflow)",
+        "a preference of this person that holds in every project (tools, style, language)",
     ),
-    ("preference_project", "a convention for this project only"),
+    (
+        "preference_project",
+        "a rule or convention for this repository only",
+    ),
     (
         "fact",
         "a lasting fact about the project, its systems or its environment",
@@ -89,7 +102,7 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ),
     (
         "ephemeral",
-        "a question, a request or thanks to the assistant, or a pick among choices it offered, with no lasting rule or fact in it; progress narration; a plan for the next minutes; a greeting; or a result that matters only right now",
+        "a question, a request or thanks to the assistant, or a pick among choices it offered, with no lasting rule or fact in it; progress narration; a plan for the next minutes; a greeting; a verdict or status report on one task (a review's \"approved\", \"addressed\" or \"no findings\", a checkmark, a count of passing or failing tests, a \"done\", \"fixed\" or \"pushed\" note) that states no lesson for later work; or a result that matters only right now",
     ),
     (
         "unclear",
@@ -160,6 +173,9 @@ pub struct RunInput {
     pub uri: String,
     /// The source's project slug (the state's `Project:` line).
     pub project: String,
+    /// The project's other names, for the routing guard (spec §6.5): its name, its working
+    /// tree's folder and that folder's path. Empty when it has none.
+    pub project_names: Vec<String>,
     /// Main chunks in any order (they are taken by `ord`), subagent chunks in source order.
     pub chunks: Vec<RunChunk>,
     /// The run ends with the session or a compaction, so `handoff` may be offered.
@@ -195,7 +211,8 @@ pub struct Candidate {
     /// line, in session order.
     pub chunk_ids: Vec<String>,
     /// `handoff` is offered: the passage is from the last two turns of a run that closes the
-    /// session.
+    /// session, and is not a subagent's report (Task 12b review 2: a report is never the
+    /// session's handoff).
     pub handoff_ok: bool,
     /// Session order (main chunks by `ord`, then subagent chunks): [`decide`]'s tie-break.
     pub pos: usize,
@@ -215,6 +232,9 @@ pub struct Prepared {
     /// The last main `ord` this run covers (the caller sets `distill_ord` to this plus one), or
     /// -1 when it covers no main chunk.
     pub consumed_ord: i64,
+    /// What names the source's project in a passage (spec §6.5): its slug and
+    /// [`RunInput::project_names`].
+    pub project_names: Vec<String>,
 }
 
 /// What [`decide`] keeps.
@@ -222,8 +242,60 @@ pub struct Prepared {
 pub struct DistillConfig {
     /// `distill.min_confidence`.
     pub min_confidence: f64,
-    /// `distill.max_per_run`.
+    /// The most memories this run keeps: `distill.max_per_run`, or what the session has left.
     pub max_per_run: usize,
+    /// The most of them that are not a `handoff`.
+    pub max_other: usize,
+    /// The most of them from subagent reports: `distill.max_per_subagent_run`, or what the
+    /// session's subagent share has left.
+    pub max_subagent: usize,
+}
+
+/// What a session's earlier runs kept: its live distilled memories (spec §6.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionKept {
+    /// All of them, the subagents' included.
+    pub all: usize,
+    /// Those from subagent reports.
+    pub subagent: usize,
+    /// Those that are a `handoff`.
+    pub handoff: usize,
+}
+
+impl DistillConfig {
+    /// The caps of a run of a session that has kept `kept` so far (spec §6.4). One slot of
+    /// `max_per_session` is the handoff's (the controller's ruling, Task 12b review): the first
+    /// live handoff holds it, and every other memory (a further handoff too) shares the rest. A
+    /// run keeps at most `max_per_run` and what is left of the session (the free slot included,
+    /// never past `max_per_session` in all); of them, at most what is left of the rest are not a
+    /// handoff, and at most `max_per_subagent_run` and what is left of the subagents' share (half
+    /// of `max_per_session`, rounded down) are subagent reports.
+    pub fn for_session(s: &DistillSettings, kept: SessionKept) -> Self {
+        let held = kept.handoff.min(1);
+        let others_left = s
+            .max_per_session
+            .saturating_sub(1)
+            .saturating_sub(kept.all.saturating_sub(held));
+        let share_left = (s.max_per_session / 2).saturating_sub(kept.subagent);
+        let max_other = s.max_per_run.min(others_left);
+        let left = s.max_per_session.saturating_sub(kept.all);
+        Self {
+            min_confidence: s.min_confidence,
+            max_per_run: s.max_per_run.min(others_left + 1 - held).min(left),
+            max_other,
+            max_subagent: s.max_per_subagent_run.min(share_left).min(max_other),
+        }
+    }
+
+    /// Whether the run may keep anything. A run that may not asks Jev nothing.
+    pub fn keeps_any(&self) -> bool {
+        self.max_per_run > 0
+    }
+
+    /// Whether only the handoff slot is left: the run asks about its handoff alone.
+    pub fn handoff_only(&self) -> bool {
+        self.keeps_any() && self.max_other == 0
+    }
 }
 
 impl Default for DistillConfig {
@@ -234,10 +306,7 @@ impl Default for DistillConfig {
 
 impl From<&DistillSettings> for DistillConfig {
     fn from(s: &DistillSettings) -> Self {
-        Self {
-            min_confidence: s.min_confidence,
-            max_per_run: s.max_per_run,
-        }
+        Self::for_session(s, SessionKept::default())
     }
 }
 
@@ -317,19 +386,62 @@ pub fn prepare(input: &RunInput) -> Prepared {
         .map(|(i, c)| question(i, c))
         .collect();
     let state = state(&input.project, &main_turns, &already_saved);
+    let mut project_names = vec![input.project.clone()];
+    project_names.extend(input.project_names.iter().cloned());
     Prepared {
         candidates,
         already_saved,
         state,
         questions,
         consumed_ord,
+        project_names,
+    }
+}
+
+impl Prepared {
+    /// The run as Jev is asked about it under `cfg`'s caps (spec §6.4): no candidate when the run
+    /// may keep nothing, and no subagent report when it may keep none of those, so Jev is never
+    /// paid for a passage that could not be kept. When only the handoff slot is left
+    /// ([`DistillConfig::handoff_only`]), only the passages that may be a handoff (the last two
+    /// turns of a run that closes the session) are asked about, with `handoff` as the only
+    /// knowledge option. The rest keep their order and are numbered again; the state and the
+    /// cursor stay.
+    pub fn within(mut self, cfg: &DistillConfig) -> Prepared {
+        let only = cfg.handoff_only();
+        let before = self.candidates.len();
+        self.candidates.retain(|c| {
+            cfg.keeps_any() && (cfg.max_subagent > 0 || !c.subagent()) && (!only || c.handoff_ok)
+        });
+        if self.candidates.len() < before || only {
+            for (i, c) in self.candidates.iter_mut().enumerate() {
+                c.qid = format!("c{}", i + 1);
+            }
+            self.questions = self
+                .candidates
+                .iter()
+                .enumerate()
+                .map(|(i, c)| question_of(i, c, only))
+                .collect();
+        }
+        self
+    }
+}
+
+impl Candidate {
+    /// A subagent's report, whether the main session's copy of it or the subagent's own: it
+    /// ranks below the main session's passages and counts toward the subagent caps (spec §6.4).
+    pub fn subagent(&self) -> bool {
+        self.source == CandidateSource::SubagentReport
     }
 }
 
 /// Maps Jev's answers to memories (spec §6.4 and §6.5). A candidate is kept when its most
-/// probable option is a knowledge option with at least `min_confidence`; at most `max_per_run`
-/// are kept, by probability and then session order, with at most one `handoff`. The memories
-/// come in session order.
+/// probable option is a knowledge option with at least `min_confidence`. The kept are ranked by
+/// priority, then probability, then session order: the main session's passages before subagent
+/// reports, and among equals handoff, decision, bugfix, warning, fact, howto, preference. From
+/// the top of that order at most `max_per_run` are kept, of them at most `max_other` that are not
+/// a `handoff`, at most `max_subagent` subagent reports and one `handoff`. A `preference_user`
+/// passage that names the project stays in it. The memories come in session order.
 pub fn decide(
     p: &Prepared,
     answers: &BTreeMap<String, Distribution>,
@@ -352,37 +464,66 @@ pub fn decide(
             kept.push((c, kind, to_global, prob));
         }
     }
-    kept.sort_by(|a, b| b.3.total_cmp(&a.3).then(a.0.pos.cmp(&b.0.pos)));
+    kept.sort_by(|a, b| {
+        (a.0.subagent(), kind_rank(a.1))
+            .cmp(&(b.0.subagent(), kind_rank(b.1)))
+            .then(b.3.total_cmp(&a.3))
+            .then(a.0.pos.cmp(&b.0.pos))
+    });
     let mut out: Vec<(&Candidate, Kind, bool, f64)> = Vec::new();
-    let mut handoff = false;
+    let (mut subagent, mut others, mut handoff) = (0, 0, false);
     for k in kept {
         if out.len() >= cfg.max_per_run {
             break;
         }
-        if k.1 == Kind::Handoff {
-            if handoff {
-                continue;
-            }
-            handoff = true;
+        let (sub, hand) = (k.0.subagent(), k.1 == Kind::Handoff);
+        if (sub && subagent >= cfg.max_subagent)
+            || (hand && handoff)
+            || (!hand && others >= cfg.max_other)
+        {
+            continue;
         }
+        subagent += usize::from(sub);
+        others += usize::from(!hand);
+        handoff |= hand;
         out.push(k);
     }
     out.sort_by_key(|k| k.0.pos);
     out.into_iter()
         .map(|(c, kind, to_global, prob)| DistilledMemory {
             kind,
-            to_global,
+            to_global: to_global && !names_project(&c.text, &p.project_names),
             title: title_of(&c.text),
             body: body_of(c),
             chunk_ids: c.chunk_ids.clone(),
-            idempotency_key: idempotency_key(uri, &c.text),
+            idempotency_key: if c.subagent() {
+                subagent_key(uri, &c.text)
+            } else {
+                idempotency_key(uri, &c.text)
+            },
             p: prob,
         })
         .collect()
 }
 
+/// A knowledge kind's place in the ranking (the controller's rulings in Task 12b). A `handoff`
+/// comes first: one at most, offered at the session's end, it is what continuing needs most, so
+/// the caps never crowd it out (it still counts toward them).
+fn kind_rank(kind: Kind) -> u8 {
+    match kind {
+        Kind::Handoff => 0,
+        Kind::Decision => 1,
+        Kind::Bugfix => 2,
+        Kind::Warning => 3,
+        Kind::Fact => 4,
+        Kind::Howto => 5,
+        Kind::Preference => 6,
+        _ => 7,
+    }
+}
+
 /// `distill:` and the first 32 hex digits of `sha256(uri ‖ 0x1f ‖ passage)`, so a re-run of the
-/// same passage returns the first memory.
+/// same passage returns the first memory. A subagent report's key is [`subagent_key`] instead.
 pub fn idempotency_key(uri: &str, passage: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(uri.as_bytes());
@@ -390,6 +531,39 @@ pub fn idempotency_key(uri: &str, passage: &str) -> String {
     hasher.update(passage.as_bytes());
     let hex = hex::encode(hasher.finalize());
     format!("distill:{}", &hex[..32])
+}
+
+/// The key prefix of a memory kept from a subagent report, the main session's copy of it or the
+/// subagent's own (spec §6.4, §6.5): the only mark a stored memory carries of where it came from,
+/// so the worker counts a session's subagent memories by it among those whose provenance is in
+/// the session's sources (Task 12b; no column, no migration).
+pub const SUBAGENT_KEY_PREFIX: &str = "distill:sub:";
+
+/// [`idempotency_key`] for a subagent report: [`SUBAGENT_KEY_PREFIX`] in place of `distill:`,
+/// then the same 32 hex digits.
+pub fn subagent_key(uri: &str, passage: &str) -> String {
+    let key = idempotency_key(uri, passage);
+    format!("{SUBAGENT_KEY_PREFIX}{}", &key["distill:".len()..])
+}
+
+/// Whether `text` names the project (Task 12b, ruling F4): one of `names` (its slug, its name,
+/// its folder) as a whole word in any case, or a path under its folder. A name of fewer than
+/// three characters is not looked for.
+fn names_project(text: &str, names: &[String]) -> bool {
+    let lower = text.to_lowercase();
+    let word = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    names.iter().any(|name| {
+        let name = name.trim().to_lowercase();
+        if name.chars().count() < 3 || name == "global" {
+            return false;
+        }
+        let path = name.contains('/');
+        lower.match_indices(&name).any(|(i, m)| {
+            let before = lower[..i].chars().next_back();
+            let after = lower[i + m.len()..].chars().next();
+            (path || !before.is_some_and(word)) && !after.is_some_and(word)
+        })
+    })
 }
 
 /// The memory kind of a knowledge option, and whether it goes to `global`.
@@ -429,6 +603,10 @@ enum Tag {
 struct Line {
     text: String,
     chunks: Vec<usize>,
+    /// The renderer cut the block in front of this line, and its indentation went with the cut
+    /// (`<tag> (cont.) ` starts the next chunk at the line's first word): how deep it was in a
+    /// list is not known.
+    cut: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -608,6 +786,7 @@ fn parse(chunks: &[(usize, &RunChunk)]) -> Vec<Turn> {
                 let line = Line {
                     text: body_line(raw, false),
                     chunks: vec![idx],
+                    cut: false,
                 };
                 match turn.blocks.last_mut() {
                     Some(block) => block.lines.push(line),
@@ -631,6 +810,7 @@ fn parse(chunks: &[(usize, &RunChunk)]) -> Vec<Turn> {
                         None => prev.lines.push(Line {
                             text,
                             chunks: vec![idx],
+                            cut: true,
                         }),
                     }
                 }
@@ -639,6 +819,7 @@ fn parse(chunks: &[(usize, &RunChunk)]) -> Vec<Turn> {
                     lines: vec![Line {
                         text,
                         chunks: vec![idx],
+                        cut: false,
                     }],
                 }),
             }
@@ -724,6 +905,7 @@ fn conclusion_lines(turn: &Turn) -> Option<Vec<Line>> {
             lines.push(Line {
                 text: String::new(),
                 chunks: Vec::new(),
+                cut: false,
             });
         }
         lines.extend(block.lines.iter().cloned());
@@ -788,7 +970,8 @@ struct Draft {
 
 /// The drafts of one turn: its prompt as a statement, its summaries, its subagent reports and
 /// its conclusion. A subagent source's turn gives only reports: its prompt is the parent
-/// agent's, not the user's, and its last assistant block is its final report.
+/// agent's, not the user's, and its last assistant block is its final report. A subagent report
+/// is never offered `handoff`, whatever `handoff_ok` says of the turn.
 fn turn_drafts(turn: &Turn, from_subagent: bool, handoff_ok: bool, out: &mut Vec<Draft>) {
     let prompt_block = prompt_block(turn);
     let prompt = prompt_block.and_then(|b| prompt_sentence(&b.text()));
@@ -800,7 +983,7 @@ fn turn_drafts(turn: &Turn, from_subagent: bool, handoff_ok: bool, out: &mut Vec
             text: text.s,
             prompt,
             prompt_chunks: prompt_chunks.clone(),
-            handoff_ok,
+            handoff_ok: handoff_ok && source != CandidateSource::SubagentReport,
             from_subagent,
             pos: out.len(),
         });
@@ -813,7 +996,7 @@ fn turn_drafts(turn: &Turn, from_subagent: bool, handoff_ok: bool, out: &mut Vec
             }
         }
         for block in turn.blocks.iter().filter(|b| b.tag == Tag::Summary) {
-            for text in passages(&block.lines) {
+            for text in summary_passages(&block.lines) {
                 push(CandidateSource::Summary, text, None);
             }
         }
@@ -1034,6 +1217,7 @@ fn replace_code(lines: &[Line]) -> Vec<Line> {
             out.push(Line {
                 text: format!("{indent}{CODE}"),
                 chunks: chunks.into_iter().collect(),
+                cut: lines[i].cut,
             });
         } else {
             out.extend(lines[i..=end].iter().cloned());
@@ -1059,15 +1243,18 @@ fn numbered_len(t: &str) -> Option<usize> {
         .then_some(digits + 2)
 }
 
-/// A heading: `# …`, a numbered section head such as `4. Errors and fixes:` (not indented), or
-/// a bold line such as `**Key decisions**`.
+/// A heading: `# …`, a numbered section head such as `4. Errors and fixes:` or, as Claude Code's
+/// compaction summaries write it today, `4. **Errors and fixes:**` (not indented), or a bold
+/// line such as `**Key decisions**`.
 fn is_heading(t: &str, indent: usize) -> bool {
     if let Some(rest) = t.strip_prefix('#') {
         let rest = rest.trim_start_matches('#');
         return rest.is_empty() || rest.starts_with(' ');
     }
     let short = t.chars().count() <= PASSAGE_MIN;
-    let numbered = indent == 0 && numbered_len(t).is_some() && t.ends_with(':');
+    let numbered = indent == 0
+        && numbered_len(t)
+            .is_some_and(|n| t.ends_with(':') || (t[n..].starts_with("**") && t.ends_with(":**")));
     let bold = t.len() > 4 && t.starts_with("**") && (t.ends_with("**") || t.ends_with("**:"));
     short && (numbered || bold)
 }
@@ -1100,7 +1287,10 @@ impl Unit {
 }
 
 /// Cuts lines into units. A blank line ends a unit, a heading starts a section, a list item at
-/// the list's indentation starts a unit, and a kept code block is never cut.
+/// the list's indentation starts a unit, and a kept code block is never cut. A line the renderer
+/// cut in front of ([`Line::cut`]) lost its indentation: in an indented list it continues the
+/// item it was cut from, and a list item it starts takes the indentation of the list that
+/// follows it.
 fn units(lines: &[Line]) -> Vec<Unit> {
     let mut out = Vec::new();
     let mut cur: Option<Unit> = None;
@@ -1108,7 +1298,7 @@ fn units(lines: &[Line]) -> Vec<Unit> {
     let mut section = 0;
     let mut list_indent = 0;
     let mut fence: Option<&str> = None;
-    for line in lines {
+    for (k, line) in lines.iter().enumerate() {
         let raw = line.text.trim_end();
         let t = raw.trim_start();
         if let Some(f) = fence {
@@ -1145,14 +1335,20 @@ fn units(lines: &[Line]) -> Vec<Unit> {
         }
         let item = bullet_len(t).is_some();
         let continues = match &cur {
-            Some(u) if u.kind == UnitKind::Item => indent > list_indent,
+            Some(u) if u.kind == UnitKind::Item => {
+                indent > list_indent || (line.cut && list_indent > 0)
+            }
             Some(u) => u.kind == UnitKind::Para && !item,
             None => false,
         };
         if !continues {
             out.extend(cur.take());
             let kind = if item {
-                list_indent = indent;
+                list_indent = if line.cut {
+                    list_indent_after(&lines[k + 1..])
+                } else {
+                    indent
+                };
                 UnitKind::Item
             } else {
                 UnitKind::Para
@@ -1169,6 +1365,23 @@ fn units(lines: &[Line]) -> Vec<Unit> {
     out
 }
 
+/// The indentation of the list that `lines` go on with: the least of their list items' up to the
+/// next heading or blank line, those the renderer cut in front of left out; 0 when there is none.
+fn list_indent_after(lines: &[Line]) -> usize {
+    lines
+        .iter()
+        .map(|l| l.text.trim_end())
+        .zip(lines.iter().map(|l| l.cut))
+        .take_while(|(raw, _)| {
+            let t = raw.trim_start();
+            !t.is_empty() && !is_heading(t, raw.len() - t.len())
+        })
+        .filter(|(raw, cut)| !cut && bullet_len(raw.trim_start()).is_some())
+        .map(|(raw, _)| raw.len() - raw.trim_start().len())
+        .min()
+        .unwrap_or(0)
+}
+
 /// A heading line that is a plain paragraph: one line of at most [`PASSAGE_MIN`] characters that
 /// does not end in `. ! ?` or their full-width forms, such as `Next steps:` (a Thai line, which has
 /// no sentence mark, qualifies whatever it says). Followed by list items, it heads them as a
@@ -1182,22 +1395,31 @@ fn is_lead_line(unit: &Unit) -> bool {
 }
 
 /// Cuts a block's lines into passages of [`PASSAGE_MIN`] to [`PASSAGE_MAX`] characters (spec
-/// §6.3): paragraphs and bullet groups, a heading leading the unit after it. A heading line
-/// followed by list items keeps the whole group together (a handoff's done and next items stay
-/// one passage). Short neighbours in a section join until they reach the minimum; a unit over the
-/// maximum is cut at sentence ends, then spaces, then characters. Long code blocks become `[code]`
-/// first.
-fn passages(lines: &[Line]) -> Vec<Text> {
+/// §6.3), each with its section (0 before the first heading): paragraphs and bullet groups, a
+/// heading leading the unit after it. A heading line followed by list items keeps the whole
+/// group together (a handoff's done and next items stay one passage); with `whole_sections` it
+/// keeps every unit up to the next heading; a group over the maximum is cut between its units
+/// ([`group_items`]). Short neighbours in a section join until they reach the minimum; a unit
+/// over the maximum is cut at sentence ends, then spaces, then characters. Long code blocks
+/// become `[code]` first.
+fn sectioned(lines: &[Line], whole_sections: bool) -> Vec<(Text, usize)> {
     let lines = replace_code(lines);
     let mut out: Vec<(Text, usize)> = Vec::new();
     let mut cur: Option<(Text, usize)> = None;
     let mut lead: Option<Text> = None;
-    let mut units = units(&lines).into_iter().peekable();
-    while let Some(unit) = units.next() {
-        let heads_items = units
-            .peek()
-            .is_some_and(|n| n.kind == UnitKind::Item && n.section == unit.section);
-        if unit.kind == UnitKind::Heading || (heads_items && is_lead_line(&unit)) {
+    let all = units(&lines);
+    // Whether each unit is a heading line that heads the list items after it.
+    let leads: Vec<bool> = (0..all.len())
+        .map(|i| {
+            is_lead_line(&all[i])
+                && all
+                    .get(i + 1)
+                    .is_some_and(|n| n.kind == UnitKind::Item && n.section == all[i].section)
+        })
+        .collect();
+    let mut units = all.into_iter().zip(leads).peekable();
+    while let Some((unit, leads_items)) = units.next() {
+        if unit.kind == UnitKind::Heading || leads_items {
             flush(&mut cur, &mut out);
             match &mut lead {
                 Some(l) => l.append("\n", unit.text),
@@ -1207,48 +1429,109 @@ fn passages(lines: &[Line]) -> Vec<Text> {
         }
         let sep = if unit.blank_before { "\n\n" } else { "\n" };
         let unit_section = unit.section;
-        let piece = match lead.take() {
-            // A heading line leads its whole bullet group.
-            Some(mut l) if unit.kind == UnitKind::Item => {
-                l.append("\n", unit.text);
-                while let Some(n) =
-                    units.next_if(|n| n.kind == UnitKind::Item && n.section == unit_section)
-                {
-                    l.append(if n.blank_before { "\n\n" } else { "\n" }, n.text);
+        let pieces = match lead.take() {
+            // A heading line leads its whole bullet group (in a summary, its whole section up
+            // to the next heading line that leads items of its own).
+            Some(l) if unit.kind == UnitKind::Item || whole_sections => {
+                let mut items = vec![("\n", unit.text)];
+                while let Some((n, _)) = units.next_if(|(n, leads_items)| {
+                    n.section == unit_section
+                        && (n.kind == UnitKind::Item || (whole_sections && !leads_items))
+                }) {
+                    items.push((if n.blank_before { "\n\n" } else { "\n" }, n.text));
                 }
-                l
+                group_items(l, items)
             }
             Some(mut l) => {
                 l.append("\n", unit.text);
-                l
+                vec![l]
             }
-            None => unit.text,
+            None => vec![unit.text],
         };
-        if piece.chars() > PASSAGE_MAX {
-            flush(&mut cur, &mut out);
-            for r in cut_ranges(&piece.s, PASSAGE_MAX) {
-                out.push((piece.slice(r), unit.section));
-            }
-            continue;
-        }
-        match &mut cur {
-            Some((c, section))
-                if *section == unit.section
-                    && c.chars() < PASSAGE_MIN
-                    && c.chars() + sep.len() + piece.chars() <= PASSAGE_MAX =>
-            {
-                c.append(sep, piece);
-            }
-            _ => {
+        for piece in pieces {
+            if piece.chars() > PASSAGE_MAX {
                 flush(&mut cur, &mut out);
-                cur = Some((piece, unit.section));
+                for r in cut_ranges(&piece.s, PASSAGE_MAX) {
+                    out.push((piece.slice(r), unit.section));
+                }
+                continue;
+            }
+            match &mut cur {
+                Some((c, section))
+                    if *section == unit.section
+                        && c.chars() < PASSAGE_MIN
+                        && c.chars() + sep.len() + piece.chars() <= PASSAGE_MAX =>
+                {
+                    c.append(sep, piece);
+                }
+                _ => {
+                    flush(&mut cur, &mut out);
+                    cur = Some((piece, unit.section));
+                }
             }
         }
     }
     flush(&mut cur, &mut out);
     out.into_iter()
-        .map(|(t, _)| trim_text(t))
-        .filter(|t| (PASSAGE_MIN..=PASSAGE_MAX).contains(&t.chars()))
+        .map(|(t, section)| (trim_text(t), section))
+        .filter(|(t, _)| (PASSAGE_MIN..=PASSAGE_MAX).contains(&t.chars()))
+        .collect()
+}
+
+/// A heading and the units it leads (`items`, each with the separator before it): one piece when
+/// they fit in [`PASSAGE_MAX`]; otherwise cut between units, as many whole units in each piece
+/// as fit, the heading leading each one (Task 12b: a long section of a compaction summary).
+fn group_items(lead: Text, items: Vec<(&'static str, Text)>) -> Vec<Text> {
+    let total = lead.chars()
+        + items
+            .iter()
+            .map(|(sep, t)| sep.len() + t.chars())
+            .sum::<usize>();
+    let mut out = Vec::new();
+    let mut cur = lead.clone();
+    let mut filled = false;
+    for (sep, item) in items {
+        let sep = if filled { sep } else { "\n" };
+        if total > PASSAGE_MAX && filled && cur.chars() + sep.len() + item.chars() > PASSAGE_MAX {
+            out.push(std::mem::replace(&mut cur, lead.clone()));
+            cur.append("\n", item);
+        } else {
+            cur.append(sep, item);
+        }
+        filled = true;
+    }
+    out.push(cur);
+    out
+}
+
+/// The passages of a compaction summary. One with headings gives each section whole, led by its
+/// heading, or cut between its paragraphs and bullet groups when it is longer than
+/// [`PASSAGE_MAX`]; what comes before its first heading is left out when it is its preamble:
+/// at most [`PREAMBLE_MAX`] characters, or Claude Code's opening ([`PREAMBLE`]). One without
+/// headings is cut as any block is.
+fn summary_passages(lines: &[Line]) -> Vec<Text> {
+    let code = replace_code(lines);
+    let headed = units(&code).iter().any(|u| u.kind == UnitKind::Heading);
+    let all = sectioned(lines, headed);
+    let head: Vec<&Text> = all
+        .iter()
+        .filter(|(_, section)| *section == 0)
+        .map(|(t, _)| t)
+        .collect();
+    let preamble = headed
+        && (head.iter().map(|t| t.chars()).sum::<usize>() <= PREAMBLE_MAX
+            || head.first().is_some_and(|t| t.s.starts_with(PREAMBLE)));
+    all.into_iter()
+        .filter(|(_, section)| !preamble || *section > 0)
+        .map(|(t, _)| t)
+        .collect()
+}
+
+/// A block's passages ([`sectioned`]), a heading leading its bullet group.
+fn passages(lines: &[Line]) -> Vec<Text> {
+    sectioned(lines, false)
+        .into_iter()
+        .map(|(t, _)| t)
         .collect()
 }
 
@@ -1461,6 +1744,15 @@ fn one_line(text: &str, max: usize) -> String {
 
 /// The question about candidate `i` (spec §6.4); its number is in words.
 fn question(i: usize, c: &Candidate) -> Question {
+    question_of(i, c, false)
+}
+
+/// The options of a question that asks about the handoff alone: `already_saved` stays, so a
+/// handoff the agent saved itself is not stored again.
+const HANDOFF_ONLY: &[&str] = &["handoff", "already_saved", "ephemeral", "unclear"];
+
+/// [`question`], with `handoff_only` offering only the [`HANDOFF_ONLY`] options.
+fn question_of(i: usize, c: &Candidate, handoff_only: bool) -> Question {
     let n = verbal::number(i as u64 + 1);
     let asked = c
         .prompt
@@ -1476,6 +1768,7 @@ fn question(i: usize, c: &Candidate) -> Question {
         options: OPTIONS
             .iter()
             .filter(|(id, _)| *id != "handoff" || c.handoff_ok)
+            .filter(|(id, _)| !handoff_only || HANDOFF_ONLY.contains(id))
             .map(|(id, description)| Choice::new(id, description))
             .collect(),
     }
@@ -1508,20 +1801,31 @@ fn body_of(c: &Candidate) -> String {
     body
 }
 
-/// The passage's first sentence within [`TITLE_MAX`] characters, cut at a word boundary.
-/// Headings, placeholders and code (fence lines and what they enclose) are passed over, list
-/// markers and bold marks dropped, and a line that ends with `:` runs on into the next. A
-/// passage that is only code is titled by its first line of code.
+/// The memory's title (spec §6.5): [`heading_title`], unless that says too little: a table
+/// header, or [`TITLE_BARE`] characters or fewer (a bare heading, a label). Then it is the
+/// passage's first sentence after its head lines ([`sentence_title`]); a passage that is only a
+/// table is titled by its first row.
 fn title_of(text: &str) -> String {
-    let mut prose: Vec<(bool, String)> = Vec::new();
-    let mut code: Vec<(bool, String)> = Vec::new();
+    let title = heading_title(text);
+    if !title.starts_with('|') && title.chars().count() > TITLE_BARE {
+        return title;
+    }
+    sentence_title(text)
+        .or_else(|| first_row(text))
+        .unwrap_or(title)
+}
+
+/// The passage's lines of prose, trimmed, with code (fence lines and what they enclose) and
+/// placeholders left out; and its lines of code.
+fn prose_and_code(text: &str) -> (Vec<&str>, Vec<&str>) {
+    let (mut prose, mut code) = (Vec::new(), Vec::new());
     let mut fence: Option<&str> = None;
     for line in text.lines().map(str::trim) {
         if let Some(f) = fence {
             if line.starts_with(f) {
                 fence = None;
             } else if !line.is_empty() {
-                code.push((false, line.to_owned()));
+                code.push(line);
             }
             continue;
         }
@@ -1529,14 +1833,95 @@ fn title_of(text: &str) -> String {
             fence = Some(f);
             continue;
         }
-        if line.is_empty() || PLACEHOLDERS.contains(&line) {
-            continue;
-        }
-        let stripped = strip_markup(line);
-        if !stripped.is_empty() {
-            prose.push((line.starts_with('#'), stripped));
+        if !line.is_empty() && !PLACEHOLDERS.contains(&line) {
+            prose.push(line);
         }
     }
+    (prose, code)
+}
+
+/// A line that labels what follows rather than saying something: a heading, a table row, or a
+/// line of at most [`TITLE_BARE`] characters that does not end a sentence.
+fn label_line(line: &str) -> bool {
+    line.starts_with('|')
+        || is_heading(line, 0)
+        || (line.chars().count() <= TITLE_BARE
+            && !line.ends_with(['.', '!', '?', '。', '！', '？']))
+}
+
+/// The first sentence of the passage after its head lines ([`label_line`]) that says more than
+/// [`TITLE_BARE`] characters: a line's first sentence runs on into its next ones while it is that
+/// short, and a line that is still that short (`Done.`) or empty (only markup) is passed over.
+/// At most [`SENTENCE_TITLE_MAX`] characters, cut at a word with `…`.
+fn sentence_title(text: &str) -> Option<String> {
+    let (prose, _) = prose_and_code(text);
+    let sentence = prose
+        .into_iter()
+        .filter(|l| !label_line(l))
+        .map(|l| {
+            let line = strip_markup(l);
+            let mut end = 0;
+            while end < line.len() {
+                end += first_sentence_end(&line[end..]);
+                if line[..end].trim().chars().count() > TITLE_BARE {
+                    break;
+                }
+            }
+            line[..end].trim().to_owned()
+        })
+        .find(|s| s.chars().count() > TITLE_BARE)?;
+    if sentence.chars().count() <= SENTENCE_TITLE_MAX {
+        Some(sentence)
+    } else {
+        Some(format!("{}…", cut_words(&sentence, SENTENCE_TITLE_MAX - 1)))
+    }
+}
+
+/// The byte length of `text` up to and with its first sentence end (`.`, `!` or `?` before a
+/// space or the end, `。`, `！`, `？`), or all of it.
+fn first_sentence_end(text: &str) -> usize {
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let next = i + c.len_utf8();
+        if matches!(c, '。' | '！' | '？')
+            || (matches!(c, '.' | '!' | '?')
+                && chars.peek().is_none_or(|&(_, n)| n.is_whitespace()))
+        {
+            return next;
+        }
+    }
+    text.len()
+}
+
+/// The first row of a table under its header, its cells joined by `, `.
+fn first_row(text: &str) -> Option<String> {
+    let (prose, _) = prose_and_code(text);
+    let rule = |l: &str| l.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '));
+    let row = prose
+        .into_iter()
+        .filter(|l| l.starts_with('|') && !rule(l))
+        .nth(1)?;
+    let cells: Vec<&str> = row
+        .split('|')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    let joined = strip_markup(&cells.join(", "));
+    (!joined.is_empty()).then(|| cut_words(&joined, TITLE_MAX).to_owned())
+}
+
+/// The passage's first sentence within [`TITLE_MAX`] characters, cut at a word boundary.
+/// Headings, placeholders and code (fence lines and what they enclose) are passed over, list
+/// markers and bold marks dropped, and a line that ends with `:` runs on into the next. A
+/// passage that is only code is titled by its first line of code.
+fn heading_title(text: &str) -> String {
+    let (prose, code) = prose_and_code(text);
+    let prose: Vec<(bool, String)> = prose
+        .into_iter()
+        .map(|l| (l.starts_with('#'), strip_markup(l)))
+        .filter(|(_, s)| !s.is_empty())
+        .collect();
+    let code: Vec<(bool, String)> = code.into_iter().map(|l| (false, l.to_owned())).collect();
     let lines = if prose.is_empty() { code } else { prose };
     let pick = lines.iter().position(|(heading, _)| !heading).unwrap_or(0);
     let Some((_, first)) = lines.get(pick) else {
@@ -1734,6 +2119,7 @@ mod tests {
         RunInput {
             uri: URI.into(),
             project: "alice".into(),
+            project_names: Vec::new(),
             chunks,
             closes_session,
         }
@@ -1792,6 +2178,7 @@ mod tests {
         RunInput {
             uri: URI.into(),
             project: "alice".into(),
+            project_names: Vec::new(),
             chunks,
             closes_session: false,
         }
@@ -2347,6 +2734,8 @@ mod tests {
         let low = DistillConfig {
             min_confidence: 0.6,
             max_per_run: 8,
+            max_other: 8,
+            max_subagent: 8,
         };
         let kept = decide(&p, &few, URI, &low);
         assert_eq!(kept.len(), 2);
@@ -2412,6 +2801,8 @@ mod tests {
         let cfg = DistillConfig {
             min_confidence: 0.7,
             max_per_run: 50,
+            max_other: 50,
+            max_subagent: 50,
         };
         let answers = all_answer(&p, "decision", 0.9);
         let kept = decide(&p, &answers, URI, &cfg);
@@ -2422,7 +2813,11 @@ mod tests {
                 .iter()
                 .find(|c| c.text.starts_with(start))
                 .unwrap_or_else(|| panic!("{start}: {:#?}", p.candidates));
-            let key = idempotency_key(URI, &c.text);
+            let key = if c.subagent() {
+                subagent_key(URI, &c.text)
+            } else {
+                idempotency_key(URI, &c.text)
+            };
             (c, kept.iter().find(|m| m.idempotency_key == key).unwrap())
         };
 
@@ -2469,6 +2864,12 @@ mod tests {
             format!("{report}\n\nContext: Write down how the lease works and report back to me.")
         );
         assert_eq!(m.chunk_ids, ["m4", "m5"]);
+        assert!(
+            m.idempotency_key.starts_with(SUBAGENT_KEY_PREFIX),
+            "{}",
+            m.idempotency_key
+        );
+        assert_eq!(m.idempotency_key.len(), SUBAGENT_KEY_PREFIX.len() + 32);
         assert_eq!(
             m.title,
             "Report: the lease is renewed every ten seconds by its holder, and a lease that misses three renewals in a row is taken"
@@ -2570,6 +2971,8 @@ mod tests {
             &DistillConfig {
                 min_confidence: 0.7,
                 max_per_run: 50,
+                max_other: 50,
+                max_subagent: 50,
             },
         );
         assert_eq!(kept.len(), p.candidates.len());
@@ -2658,9 +3061,12 @@ mod tests {
             ),
             (
                 "preference_user",
-                "how the user wants things done in every project (style, language, tools, workflow)",
+                "a preference of this person that holds in every project (tools, style, language)",
             ),
-            ("preference_project", "a convention for this project only"),
+            (
+                "preference_project",
+                "a rule or convention for this repository only",
+            ),
             (
                 "fact",
                 "a lasting fact about the project, its systems or its environment",
@@ -2675,7 +3081,7 @@ mod tests {
             ),
             (
                 "ephemeral",
-                "a question, a request or thanks to the assistant, or a pick among choices it offered, with no lasting rule or fact in it; progress narration; a plan for the next minutes; a greeting; or a result that matters only right now",
+                "a question, a request or thanks to the assistant, or a pick among choices it offered, with no lasting rule or fact in it; progress narration; a plan for the next minutes; a greeting; a verdict or status report on one task (a review's \"approved\", \"addressed\" or \"no findings\", a checkmark, a count of passing or failing tests, a \"done\", \"fixed\" or \"pushed\" note) that states no lesson for later work; or a result that matters only right now",
             ),
             (
                 "unclear",
@@ -2684,6 +3090,14 @@ mod tests {
         ] {
             assert_eq!(described(id), text);
         }
+        // Task 12b: verdicts and status reports are ephemeral; Task 13's tuned words stay as they
+        // were, and a lesson stated in a report is not dropped.
+        let ephemeral = described("ephemeral");
+        assert!(ephemeral.starts_with("a question, a request or thanks to the assistant, or a pick among choices it offered, with no lasting rule or fact in it; progress narration; a plan for the next minutes; a greeting; "));
+        assert!(
+            ephemeral.contains("verdict or status report on one task")
+                && ephemeral.contains("that states no lesson for later work")
+        );
 
         let main = render(&[
             User("Why does the writer batch its slices?"),
@@ -3143,6 +3557,849 @@ mod tests {
         assert!(
             m.body
                 .ends_with("\n\nContext: Fix the lease test in the renewal module.")
+        );
+    }
+
+    // ---- Task 12b: a session is bounded, verdicts drop, titles say something ----
+
+    /// A session's settings with `max_per_run`, `max_per_session` and `max_per_subagent_run`.
+    fn caps(run: usize, session: usize, subagent: usize) -> DistillSettings {
+        DistillSettings {
+            max_per_run: run,
+            max_per_session: session,
+            max_per_subagent_run: subagent,
+            ..DistillSettings::default()
+        }
+    }
+
+    /// A run of `main` conclusions (one turn each) and one subagent source whose report is
+    /// `reports` paragraphs, each its own passage.
+    fn mixed_run(main: usize, reports: usize, seed: u64) -> RunInput {
+        let prompts: Vec<String> = (0..main).map(|i| format!("Go {i}.")).collect();
+        let replies: Vec<String> = (0..main)
+            .map(|i| format!("Reply {i}: {}.", words(seed + i as u64, 16)))
+            .collect();
+        let steps: Vec<Step> = (0..main)
+            .flat_map(|i| [User(&prompts[i]), Say(&replies[i])])
+            .collect();
+        let report = (0..reports)
+            .map(|i| format!("Finding {i}: {}.", words(seed + 500 + i as u64, 16)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let sub = if reports == 0 {
+            Vec::new()
+        } else {
+            render_with(
+                &[User("Review the change and report back."), Say(&report)],
+                Some("agent-r"),
+                &opts(2000),
+            )
+        };
+        let main_chunks = if main == 0 {
+            Vec::new()
+        } else {
+            render(&steps)
+        };
+        run(main_chunks, sub, false)
+    }
+
+    /// The brief, with the controller's handoff slot (Task 12b review, M2): one slot of
+    /// `max_per_session` is kept for a handoff, so the other kinds have `max_per_session - 1`. A
+    /// run with room for three more of them keeps three, and a closing run keeps its handoff on
+    /// top; `max_per_run` still bounds a run with more room.
+    #[test]
+    fn a_run_with_room_for_three_keeps_three() {
+        let s = caps(8, 16, 2);
+        let twelve = SessionKept {
+            all: 12,
+            subagent: 0,
+            handoff: 0,
+        };
+        let cfg = DistillConfig::for_session(&s, twelve);
+        assert_eq!((cfg.max_other, cfg.max_per_run), (3, 4));
+        let p = conclusions_run(16, false);
+        assert_eq!(
+            decide(&p, &all_answer(&p, "decision", 0.9), URI, &cfg).len(),
+            3
+        );
+        let closing = conclusions_run(16, true);
+        let mut answers = all_answer(&closing, "decision", 0.9);
+        answers.insert("c16".into(), answer("handoff", 0.8));
+        let kept = decide(&closing, &answers, URI, &cfg);
+        let kinds: Vec<Kind> = kept.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                Kind::Decision,
+                Kind::Decision,
+                Kind::Decision,
+                Kind::Handoff
+            ]
+        );
+        let four = SessionKept {
+            all: 4,
+            subagent: 0,
+            handoff: 0,
+        };
+        let cfg = DistillConfig::for_session(&s, four);
+        assert_eq!(cfg.max_per_run, 8, "min(max_per_run, 11 left and the slot)");
+        assert_eq!(
+            decide(&p, &all_answer(&p, "decision", 0.9), URI, &cfg).len(),
+            8
+        );
+    }
+
+    /// The brief and the handoff slot: a session whose other room is used up keeps nothing more
+    /// and asks Jev nothing, unless the run closes the session while the slot is free
+    /// (`a_capped_closing_run_asks_only_for_its_handoff`); once a handoff holds the slot,
+    /// nothing at all. The run still covers its chunks, so the cursor moves.
+    #[test]
+    fn a_run_with_no_room_keeps_none_and_asks_nothing() {
+        let input = mixed_run(5, 3, 900);
+        let full = prepare(&input);
+        assert!(!full.questions.is_empty());
+        for (kept, any) in [
+            (
+                SessionKept {
+                    all: 15,
+                    subagent: 0,
+                    handoff: 0,
+                },
+                true,
+            ),
+            (
+                SessionKept {
+                    all: 16,
+                    subagent: 8,
+                    handoff: 1,
+                },
+                false,
+            ),
+            (
+                SessionKept {
+                    all: 20,
+                    subagent: 8,
+                    handoff: 2,
+                },
+                false,
+            ),
+        ] {
+            let cfg = DistillConfig::for_session(&caps(8, 16, 2), kept);
+            assert_eq!(cfg.max_other, 0, "{kept:?}");
+            assert_eq!(cfg.keeps_any(), any, "{kept:?}");
+            let p = prepare(&input).within(&cfg);
+            assert!(
+                p.questions.is_empty() && p.candidates.is_empty(),
+                "{kept:?}"
+            );
+            assert_eq!(p.consumed_ord, full.consumed_ord);
+            let answers = all_answer(&full, "decision", 0.95);
+            assert!(decide(&full, &answers, URI, &cfg).is_empty());
+        }
+    }
+
+    /// The controller's ruling (Task 12b review, M2): a closing run of a session that has no
+    /// other room but a free handoff slot asks one small question set, over its last two turns,
+    /// with `handoff` as the only knowledge option (`ephemeral` and `unclear` stay), and keeps at
+    /// most one. Once a handoff holds the slot it asks nothing. The total never passes the cap.
+    #[test]
+    fn a_capped_closing_run_asks_only_for_its_handoff() {
+        let s = caps(8, 16, 2);
+        let p = conclusions_run(6, true);
+        let slot = SessionKept {
+            all: 15,
+            subagent: 0,
+            handoff: 0,
+        };
+        let cfg = DistillConfig::for_session(&s, slot);
+        assert_eq!(
+            (cfg.max_per_run, cfg.max_other, cfg.max_subagent),
+            (1, 0, 0)
+        );
+        let asked = p.clone().within(&cfg);
+        assert_eq!(asked.candidates.len(), 2, "the last two turns");
+        assert_eq!(asked.questions.len(), 2);
+        for (i, (c, q)) in asked.candidates.iter().zip(&asked.questions).enumerate() {
+            assert!(c.handoff_ok);
+            assert_eq!(c.qid, format!("c{}", i + 1));
+            assert_eq!(q.id, c.qid);
+            let options: Vec<&str> = q.options.iter().map(|o| o.id.as_str()).collect();
+            assert_eq!(
+                options,
+                ["handoff", "already_saved", "ephemeral", "unclear"]
+            );
+        }
+        let kept = decide(&asked, &all_answer(&asked, "handoff", 0.9), URI, &cfg);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].kind, Kind::Handoff);
+        assert!(decide(&asked, &all_answer(&asked, "decision", 0.9), URI, &cfg).is_empty());
+        // A session's subagent reports are not asked about there either.
+        let mut mixed = mixed_run(2, 2, 7_000);
+        mixed.closes_session = true;
+        let asked = prepare(&mixed).within(&cfg);
+        assert_eq!(asked.candidates.len(), 2);
+        assert!(
+            asked
+                .candidates
+                .iter()
+                .all(|c| !c.subagent() && c.handoff_ok)
+        );
+        // The slot is held: nothing is asked.
+        let held = DistillConfig::for_session(
+            &s,
+            SessionKept {
+                all: 16,
+                subagent: 0,
+                handoff: 1,
+            },
+        );
+        assert!(!held.keeps_any());
+        assert!(p.clone().within(&held).questions.is_empty());
+        // A second handoff, kept while the session had room, takes a slot like any memory.
+        let second = DistillConfig::for_session(
+            &s,
+            SessionKept {
+                all: 10,
+                subagent: 0,
+                handoff: 2,
+            },
+        );
+        assert_eq!((second.max_per_run, second.max_other), (6, 6));
+        // Whatever was kept, a run never takes the session past its cap.
+        for all in 0..=20 {
+            for handoff in 0..=2.min(all) {
+                let kept = SessionKept {
+                    all,
+                    subagent: 0,
+                    handoff,
+                };
+                let cfg = DistillConfig::for_session(&s, kept);
+                assert!(cfg.max_per_run <= 16usize.saturating_sub(all), "{kept:?}");
+                assert!(cfg.max_other <= cfg.max_per_run, "{kept:?}");
+                assert!(
+                    all - handoff.min(1) + cfg.max_other <= 15 || cfg.max_other == 0,
+                    "{kept:?}"
+                );
+            }
+        }
+    }
+
+    /// The brief: a run keeps at most `max_per_subagent_run` (2) subagent passages, after the
+    /// main session's; a subagent passage's key says so; with no subagent room left, subagent
+    /// passages are not asked about.
+    #[test]
+    fn a_subagent_run_keeps_at_most_two() {
+        let p = prepare(&mixed_run(3, 5, 1_000));
+        assert_eq!(of(&p, S::Conclusion).len(), 3);
+        assert_eq!(of(&p, S::SubagentReport).len(), 5);
+        let cfg = DistillConfig::from(&caps(8, 16, 2));
+        let kept = decide(&p, &all_answer(&p, "decision", 0.95), URI, &cfg);
+        let sub: Vec<&DistilledMemory> = kept
+            .iter()
+            .filter(|m| m.idempotency_key.starts_with("distill:sub:"))
+            .collect();
+        assert_eq!((kept.len(), sub.len()), (5, 2), "{kept:#?}");
+        for c in of(&p, S::Conclusion) {
+            let key = idempotency_key(URI, &c.text);
+            assert!(kept.iter().any(|m| m.idempotency_key == key));
+        }
+        // A run of the subagent alone (its session had nothing new) keeps two as well.
+        let alone = prepare(&mixed_run(0, 5, 1_000));
+        assert_eq!(of(&alone, S::SubagentReport).len(), 5);
+        let kept = decide(&alone, &all_answer(&alone, "fact", 0.99), URI, &cfg);
+        assert_eq!(kept.len(), 2);
+        // `max_per_subagent_run = 0`: the subagent's passages are not even asked about.
+        let cfg = DistillConfig::from(&caps(8, 16, 0));
+        let asked = prepare(&mixed_run(3, 5, 1_000)).within(&cfg);
+        assert_eq!(sources(&asked), [S::Conclusion; 3]);
+        assert_eq!(asked.questions.len(), 3);
+        for (i, (c, q)) in asked.candidates.iter().zip(&asked.questions).enumerate() {
+            assert_eq!(
+                (c.qid.as_str(), q.id.as_str()),
+                (format!("c{}", i + 1).as_str(), c.qid.as_str())
+            );
+        }
+    }
+
+    /// The brief: across ten subagent runs, the subagents of a session keep at most half of
+    /// `max_per_session` (8 of 16), and once that share is used up their passages cost nothing.
+    #[test]
+    fn the_session_share_holds_across_ten_subagent_runs() {
+        let s = caps(8, 16, 2);
+        let mut kept = SessionKept::default();
+        let mut per_run = Vec::new();
+        for r in 0..10u64 {
+            let cfg = DistillConfig::for_session(&s, kept);
+            let p = prepare(&mixed_run(0, 4, 2_000 + 100 * r)).within(&cfg);
+            let got = decide(&p, &all_answer(&p, "decision", 0.95), URI, &cfg);
+            assert!(got.len() <= 2, "run {r}: {}", got.len());
+            if kept.subagent >= 8 {
+                assert!(
+                    p.questions.is_empty(),
+                    "run {r} asks nothing once the share is used up"
+                );
+            }
+            kept.all += got.len();
+            kept.subagent += got.len();
+            per_run.push(got.len());
+        }
+        assert_eq!(per_run, [2, 2, 2, 2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(kept.subagent, 8);
+        // The main session still has its room.
+        let cfg = DistillConfig::for_session(&s, kept);
+        assert_eq!((cfg.max_per_run, cfg.max_subagent), (8, 0));
+        let p = prepare(&mixed_run(4, 3, 3_000)).within(&cfg);
+        let got = decide(&p, &all_answer(&p, "decision", 0.95), URI, &cfg);
+        assert_eq!(got.len(), 4);
+        assert!(
+            got.iter()
+                .all(|m| !m.idempotency_key.starts_with("distill:sub:"))
+        );
+        // An odd session cap rounds the share down.
+        let cfg = DistillConfig::for_session(
+            &caps(8, 5, 2),
+            SessionKept {
+                all: 2,
+                subagent: 2,
+                handoff: 0,
+            },
+        );
+        assert_eq!((cfg.max_per_run, cfg.max_subagent), (3, 0));
+    }
+
+    /// The controller's ruling: kept passages are ranked by priority, then p. A main-session
+    /// passage beats a subagent's; among equals, decision > bugfix > warning > fact > howto >
+    /// preference; then p; and every cap takes from the top of that order.
+    #[test]
+    fn kept_passages_rank_by_priority_then_p() {
+        let p = prepare(&mixed_run(7, 1, 4_000));
+        assert_eq!(
+            sources(&p),
+            [
+                S::Conclusion,
+                S::Conclusion,
+                S::Conclusion,
+                S::Conclusion,
+                S::Conclusion,
+                S::Conclusion,
+                S::Conclusion,
+                S::SubagentReport
+            ]
+        );
+        let answers: BTreeMap<String, Distribution> = [
+            ("c1", "howto", 0.99),
+            ("c2", "preference_project", 0.99),
+            ("c3", "fact", 0.71),
+            ("c4", "warning", 0.72),
+            ("c5", "bugfix", 0.75),
+            ("c6", "decision", 0.80),
+            ("c7", "decision", 0.90),
+            ("c8", "decision", 1.0),
+        ]
+        .into_iter()
+        .map(|(q, o, pr)| (q.to_owned(), answer(o, pr)))
+        .collect();
+        let kept_of = |run: usize, subagent: usize| -> Vec<String> {
+            let cfg = DistillConfig {
+                min_confidence: 0.7,
+                max_per_run: run,
+                max_other: run,
+                max_subagent: subagent,
+            };
+            let kept = decide(&p, &answers, URI, &cfg);
+            p.candidates
+                .iter()
+                .filter(|c| {
+                    kept.iter()
+                        .any(|m| m.chunk_ids == c.chunk_ids && m.body.starts_with(&c.text))
+                })
+                .map(|c| c.qid.clone())
+                .collect()
+        };
+        assert_eq!(kept_of(1, 2), ["c7"], "the more probable of two decisions");
+        assert_eq!(kept_of(2, 2), ["c6", "c7"]);
+        assert_eq!(
+            kept_of(5, 2),
+            ["c3", "c4", "c5", "c6", "c7"],
+            "decision, bugfix, warning, fact"
+        );
+        assert_eq!(
+            kept_of(6, 2),
+            ["c1", "c3", "c4", "c5", "c6", "c7"],
+            "then howto"
+        );
+        assert_eq!(
+            kept_of(7, 2),
+            ["c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+            "then preference; the subagent's decision at 1.0 still waits"
+        );
+        assert_eq!(kept_of(8, 2).len(), 8);
+        assert_eq!(kept_of(8, 0).len(), 7, "no subagent room");
+    }
+
+    /// The controller's ruling on Task 12b: a `handoff` ranks first, before a decision, so the
+    /// caps never crowd out the session's one handoff; it still counts toward them.
+    #[test]
+    fn a_handoff_ranks_first_and_counts_toward_the_cap() {
+        let p = conclusions_run(10, true);
+        assert!(p.candidates[8].handoff_ok && p.candidates[9].handoff_ok);
+        let mut answers: BTreeMap<String, Distribution> = (1..=9)
+            .map(|i| (format!("c{i}"), answer("decision", 0.99)))
+            .collect();
+        answers.insert("c10".into(), answer("handoff", 0.71));
+        let kept = decide(&p, &answers, URI, &DistillConfig::from(&caps(8, 16, 2)));
+        assert_eq!(kept.len(), 8);
+        assert_eq!(
+            kept.iter().filter(|m| m.kind == Kind::Handoff).count(),
+            1,
+            "{kept:#?}"
+        );
+        assert_eq!(kept.last().unwrap().body, p.candidates[9].text);
+        // A run with room for one keeps the handoff.
+        let cfg = DistillConfig::for_session(
+            &caps(8, 16, 2),
+            SessionKept {
+                all: 15,
+                subagent: 0,
+                handoff: 0,
+            },
+        );
+        let kept = decide(&p, &answers, URI, &cfg);
+        assert_eq!(
+            kept.iter().map(|m| m.kind).collect::<Vec<_>>(),
+            [Kind::Handoff]
+        );
+    }
+
+    /// The brief: a title that is a heading, a table header or 25 characters or fewer becomes the
+    /// passage's first sentence (at most 80 characters, cut at a word with an ellipsis); a heading
+    /// that says something is kept.
+    #[test]
+    fn titles_say_something() {
+        let long = "We chose SQLite WAL mode for the store, because readers must never block the single writer thread.";
+        let t = title_of(&format!("**Key decisions**\n{long}"));
+        assert!(t.chars().count() <= 80 && t.ends_with('…'), "{t}");
+        let head = t.trim_end_matches('…');
+        assert!(
+            long.starts_with(head) && long[head.len()..].starts_with(' '),
+            "{t}"
+        );
+        assert_eq!(
+            title_of(
+                "## Results\n| Check | Result |\n|---|---|\n| fmt | ok |\n\nThe format check passes on every crate of the workspace."
+            ),
+            "The format check passes on every crate of the workspace."
+        );
+        assert_eq!(
+            title_of(
+                "| Setting | Default |\n|---|---|\n| distill.max_per_run | 8 |\n\nThe per-run cap bounds one run of one source, not a whole session."
+            ),
+            "The per-run cap bounds one run of one source, not a whole session."
+        );
+        assert_eq!(
+            title_of(
+                "| Setting | Default |\n|---|---|\n| distill.max_per_session | 16 |\n| distill.max_per_subagent_run | 2 |"
+            ),
+            "distill.max_per_session, 16",
+            "a table alone: its first row"
+        );
+        let twenty = "Writer batching note";
+        assert_eq!(twenty.chars().count(), 20);
+        assert_eq!(
+            title_of(&format!(
+                "{twenty}\nThe writer batches at most fifty chunks per slice, so remember stays fast."
+            )),
+            "The writer batches at most fifty chunks per slice, so remember stays fast."
+        );
+        assert_eq!(
+            title_of("Fixed. The parser now keeps the trailing quote of a value."),
+            "Fixed. The parser now keeps the trailing quote of a value.",
+            "a short first sentence runs on into the next"
+        );
+        assert_eq!(
+            title_of(
+                "**Why the writer thread never blocks on the network**\nIt holds the only connection, and embedding runs on its own thread."
+            ),
+            "Why the writer thread never blocks on the network",
+            "a heading that says something stays"
+        );
+        assert_eq!(
+            title_of(
+                "1. **Errors and fixes:**\n   - Uploads over 1 MB failed with 413 because nginx had no body size setting."
+            ),
+            "Errors and fixes: Uploads over 1 MB failed with 413 because nginx had no body size setting."
+        );
+        // Through `decide`: the memory's title.
+        let main = render(&[
+            User("Explain the writer batching to me."),
+            Say(
+                "**Batching**\n\nThe writer batches at most fifty chunks per slice, so one big ingest never holds the lock for long.",
+            ),
+        ]);
+        let p = prepare(&run(main, vec![], false));
+        let kept = decide(
+            &p,
+            &all_answer(&p, "fact", 0.9),
+            URI,
+            &DistillConfig::default(),
+        );
+        assert!(
+            kept.iter().any(|m| m.title
+                == "The writer batches at most fifty chunks per slice, so one big ingest never…"),
+            "{kept:#?}"
+        );
+    }
+
+    const COMPACT: &[u8] =
+        include_bytes!("../../tests/fixtures/capture/claude/compact_summary.jsonl");
+
+    /// A section head of the compaction summary's real shape: `N. **Heading words:**`.
+    fn section_head(line: &str) -> bool {
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && line[digits..].starts_with(". **") && line.ends_with(":**")
+    }
+
+    /// Ruling F5: a compaction summary as Claude Code writes it today (a `user` record with
+    /// `isCompactSummary`, its content one string: a preamble, `Summary:`, then nine
+    /// `N. **Heading:**` sections with sub-bullets indented three spaces and nested deeper) is cut
+    /// into its sections, never kept whole: each section is a candidate of its own, led by its
+    /// heading; a section over 1,200 characters is cut between its sub-bullet groups; the
+    /// preamble is no candidate. At several chunk sizes, so the renderer's cuts fall in different
+    /// places.
+    #[test]
+    fn a_compaction_summary_in_the_real_shape_is_cut_into_its_sections() {
+        let record = std::str::from_utf8(COMPACT)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["isCompactSummary"] == json!(true))
+            .unwrap();
+        assert_eq!(record["isVisibleInTranscriptOnly"], json!(true));
+        let summary = record["message"]["content"].as_str().unwrap().to_owned();
+        assert!(!summary.lines().any(|l| l.starts_with('#')));
+        let heads: Vec<&str> = summary.lines().filter(|l| section_head(l)).collect();
+        assert_eq!(heads.len(), 9);
+        // The sub-bullet groups: a line at three spaces and the deeper lines under it.
+        let mut groups: Vec<Vec<&str>> = Vec::new();
+        for line in summary.lines() {
+            let indent = line.len() - line.trim_start().len();
+            if indent == 3 && line.trim_start().starts_with("- ") {
+                groups.push(vec![line.trim()]);
+            } else if indent > 3 && !line.trim().is_empty() {
+                if let Some(g) = groups.last_mut() {
+                    g.push(line.trim());
+                }
+            } else if indent == 0 {
+                groups.push(Vec::new());
+            }
+        }
+        groups.retain(|g| !g.is_empty());
+        assert!(groups.len() > 60, "{}", groups.len());
+
+        for chunk_chars in [2_000, 1_000, 700] {
+            let main = render_bytes(COMPACT, &opts(chunk_chars));
+            let first = main
+                .iter()
+                .position(|c| c.starts_with("[summary] "))
+                .unwrap();
+            assert!(
+                main[first].starts_with(
+                    "[summary] This session is being continued from a previous conversation"
+                ),
+                "the reader keeps the summary's text: {}",
+                main[first]
+            );
+            assert!(main.iter().any(|c| c.starts_with("[summary] (cont.) ")));
+            let p = prepare(&run(main, vec![], false));
+            let texts: Vec<&str> = of(&p, S::Summary).iter().map(|c| c.text.as_str()).collect();
+            for t in &texts {
+                let n = t.chars().count();
+                assert!(
+                    (PASSAGE_MIN..=PASSAGE_MAX).contains(&n),
+                    "{chunk_chars}: {n}: {t}"
+                );
+                assert!(
+                    !t.contains("This session is being continued") && !t.starts_with("Summary:"),
+                    "{t}"
+                );
+                let first_line = t.lines().next().unwrap();
+                assert!(
+                    section_head(first_line),
+                    "{chunk_chars}: led by its heading: {t}"
+                );
+                assert_eq!(
+                    t.lines().filter(|l| section_head(l)).count(),
+                    1,
+                    "{chunk_chars}: one section: {t}"
+                );
+            }
+            for head in &heads {
+                assert!(
+                    texts.iter().any(|t| t.starts_with(head)),
+                    "{chunk_chars}: {head}"
+                );
+            }
+            let files = texts
+                .iter()
+                .filter(|t| t.starts_with("3. **Files and Code Sections:**"))
+                .count();
+            assert!(
+                files >= 6,
+                "{chunk_chars}: the long section is cut: {files}"
+            );
+            // Every sub-bullet group stays whole in one passage.
+            for g in &groups {
+                assert!(
+                    texts.iter().any(|t| g.iter().all(|l| t.contains(l))),
+                    "{chunk_chars}: a sub-bullet group is cut apart: {g:#?}"
+                );
+            }
+        }
+    }
+
+    /// The renderer trims a cut line's indentation (`[summary] (cont.) - lib/a.ex`): in an
+    /// indented list the line continues the item it was cut from, and an item it starts takes
+    /// the indentation of the list after it, so it neither swallows its siblings nor loses its
+    /// own nested lines.
+    #[test]
+    fn a_line_cut_by_the_renderer_keeps_its_place_in_the_list() {
+        let line = |text: &str, cut: bool| Line {
+            text: text.into(),
+            chunks: vec![0],
+            cut,
+        };
+        let items = |lines: &[Line]| -> Vec<String> {
+            units(lines)
+                .into_iter()
+                .filter(|u| u.kind == UnitKind::Item)
+                .map(|u| u.text.s)
+                .collect()
+        };
+        // Cut right after the heading: the item takes the list's indentation (3).
+        let after_heading = [
+            line("1. **Files:**", false),
+            line("- lib/a.ex", true),
+            line("     - what a does", false),
+            line("   - lib/b.ex", false),
+            line("     - what b does", false),
+        ];
+        assert_eq!(
+            items(&after_heading),
+            [
+                "- lib/a.ex\n     - what a does",
+                "   - lib/b.ex\n     - what b does"
+            ]
+        );
+        // Cut inside an item: the line stays in it, whatever its depth was.
+        let inside = [
+            line("1. **Files:**", false),
+            line("   - lib/a.ex", false),
+            line("- what a does", true),
+            line("   - lib/b.ex", false),
+        ];
+        assert_eq!(
+            items(&inside),
+            ["   - lib/a.ex\n- what a does", "   - lib/b.ex"]
+        );
+        // A list at the margin is read as before: a cut item is a sibling.
+        let margin = [
+            line("- one", false),
+            line("- two", true),
+            line("- three", false),
+        ];
+        assert_eq!(items(&margin), ["- one", "- two", "- three"]);
+    }
+
+    /// Task 12b review 2: a subagent's report is never the session's handoff, in a closing run as
+    /// in one that asks about the handoff alone: `handoff` is not offered for it, and an answer
+    /// naming it is not kept.
+    #[test]
+    fn a_subagent_report_is_never_the_handoff() {
+        let report = format!(
+            "Where things stand: the review is done, and the release notes come next: {}.",
+            words(950, 12)
+        );
+        let main = render(&[
+            User("Get the change reviewed, then tell me where we are."),
+            Agent("Review the change", &report),
+            Say(&format!("Where things stand: {}.", words(951, 16))),
+        ]);
+        let p = prepare(&run(main, vec![], true));
+        let sub = of(&p, S::SubagentReport);
+        assert_eq!(sub.len(), 1, "{:#?}", p.candidates);
+        assert!(!sub[0].handoff_ok);
+        let conclusion = of(&p, S::Conclusion);
+        assert!(
+            conclusion[0].handoff_ok,
+            "the main session's text may be one"
+        );
+        for (c, q) in p.candidates.iter().zip(&p.questions) {
+            let offered = q.options.iter().any(|o| o.id == "handoff");
+            match c.source {
+                S::SubagentReport => assert!(!offered, "{}", c.text),
+                S::Conclusion => assert!(offered, "{}", c.text),
+                _ => {}
+            }
+        }
+        // The report and the conclusion both answered `handoff`: only the conclusion is kept.
+        let answers: BTreeMap<String, Distribution> = p
+            .candidates
+            .iter()
+            .filter(|c| c.source != S::UserStatement)
+            .map(|c| (c.qid.clone(), answer("handoff", 0.9)))
+            .collect();
+        let kept = decide(&p, &answers, URI, &DistillConfig::default());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].kind, Kind::Handoff);
+        assert!(
+            kept[0].body.starts_with(&conclusion[0].text),
+            "{}",
+            kept[0].body
+        );
+    }
+
+    /// Task 12b review, M4 (a): a summary's label line (`Pending tasks:`) leads its own items,
+    /// with headings or without; it is never folded under the label before it.
+    #[test]
+    fn a_summary_keeps_each_label_with_its_own_items() {
+        let [a, b, c, d] = [900, 901, 902, 903].map(|s| words(s, 12));
+        let texts = |summary: &str| -> Vec<String> {
+            let p = prepare(&run(render(&[Compact(summary)]), vec![], false));
+            of(&p, S::Summary).iter().map(|c| c.text.clone()).collect()
+        };
+        let labels = format!("Key decisions:\n- {a}.\n- {b}.\nPending tasks:\n- {c}.\n- {d}.");
+        for summary in [labels.clone(), format!("## Work so far\n{labels}")] {
+            let got = texts(&summary);
+            assert!(
+                !got.iter()
+                    .any(|t| t.contains("Key decisions:") && t.contains("Pending tasks:")),
+                "{got:#?}"
+            );
+            assert!(
+                got.iter()
+                    .any(|t| t.ends_with(&format!("Pending tasks:\n- {c}.\n- {d}."))),
+                "{got:#?}"
+            );
+            assert!(
+                got.iter()
+                    .any(|t| t.contains(&format!("Key decisions:\n- {a}.\n- {b}."))),
+                "{got:#?}"
+            );
+        }
+    }
+
+    /// Task 12b review, M4 (b): what comes before a summary's first heading is dropped only when
+    /// it is short or Claude Code's known preamble; real text there stays a candidate.
+    #[test]
+    fn a_summary_keeps_real_text_before_its_first_heading() {
+        let body = format!(
+            "## Key decisions\n- {}.\n- {}.",
+            words(910, 14),
+            words(911, 14)
+        );
+        let texts = |summary: &str| -> Vec<String> {
+            let p = prepare(&run(render(&[Compact(summary)]), vec![], false));
+            of(&p, S::Summary).iter().map(|c| c.text.clone()).collect()
+        };
+        let real = format!("{}.", words(912, 60));
+        assert!(real.chars().count() > 300);
+        let got = texts(&format!("{real}\n\n{body}"));
+        assert!(got.contains(&real), "{got:#?}");
+        let boilerplate = format!(
+            "This session is being continued from a previous conversation that ran out of context. {real}"
+        );
+        let got = texts(&format!("{boilerplate}\n\n{body}"));
+        assert!(!got.iter().any(|t| t.contains(&real)), "{got:#?}");
+        let short =
+            "A short note before the sections: the work below covers the parser and the writer.";
+        assert!((PASSAGE_MIN..=300).contains(&short.chars().count()));
+        let got = texts(&format!("{short}\n\n{body}"));
+        assert!(!got.iter().any(|t| t.contains(short)), "{got:#?}");
+        assert!(
+            got.iter().all(|t| t.starts_with("## Key decisions")),
+            "{got:#?}"
+        );
+    }
+
+    /// Task 12b review, M5: the title moves past a first sentence that still says too little
+    /// ("Done.") and past a line that is only markup; with nothing better it keeps the heading.
+    #[test]
+    fn titles_move_past_short_sentences_and_bare_markup() {
+        assert_eq!(
+            title_of("**Status**\nDone.\nThe parser now keeps the trailing quote of a value."),
+            "The parser now keeps the trailing quote of a value."
+        );
+        assert_eq!(
+            title_of(
+                "**Status**\n- ******************************\nThe writer batches at most fifty chunks per slice."
+            ),
+            "The writer batches at most fifty chunks per slice."
+        );
+        assert_eq!(title_of("**Status**\nDone.\nPushed."), "Status");
+    }
+
+    /// Ruling F4: a `preference_user` passage that names the session's project (its slug, its
+    /// name, its folder, or a path under that folder) stays in the project; one that does not
+    /// goes to `global`. `preference_project` always stays.
+    #[test]
+    fn a_preference_that_names_the_project_stays_in_the_project() {
+        let replies = [
+            "Always run mix format before committing in tidepool-app, since CI rejects files that are not formatted.",
+            "Keep /home/user/code/tidepool-app/CHANGELOG.md in English and Thai, and update both in the same commit.",
+            "In Tidepool the booking emails are written in British English, with dates as 5 October 2026.",
+            "I prefer short commit messages in the imperative mood, whatever the repository, and no emoji in them.",
+            "Name test files after the module they test, and keep tidepools of fixtures small and readable.",
+        ];
+        let prompts: Vec<String> = (0..replies.len()).map(|i| format!("Go {i}.")).collect();
+        let steps: Vec<Step> = (0..replies.len())
+            .flat_map(|i| [User(&prompts[i]), Say(replies[i])])
+            .collect();
+        let input = RunInput {
+            project: "tidepool".into(),
+            project_names: vec![
+                "Tidepool".into(),
+                "tidepool-app".into(),
+                "/home/user/code/tidepool-app".into(),
+            ],
+            ..run(render(&steps), vec![], false)
+        };
+        let p = prepare(&input);
+        assert_eq!(p.candidates.len(), 5);
+        let global = |option: &str| -> Vec<bool> {
+            let kept = decide(
+                &p,
+                &all_answer(&p, option, 0.9),
+                URI,
+                &DistillConfig::default(),
+            );
+            p.candidates
+                .iter()
+                .map(|c| {
+                    kept.iter()
+                        .find(|m| m.body.starts_with(&c.text))
+                        .unwrap()
+                        .to_global
+                })
+                .collect()
+        };
+        assert_eq!(global("preference_user"), [false, false, false, true, true]);
+        assert_eq!(global("preference_project"), [false; 5]);
+        // A project with no other names: the slug alone.
+        let bare = prepare(&RunInput {
+            project_names: Vec::new(),
+            ..input.clone()
+        });
+        let kept = decide(
+            &bare,
+            &all_answer(&bare, "preference_user", 0.9),
+            URI,
+            &DistillConfig::default(),
+        );
+        let to_global: Vec<bool> = kept.iter().map(|m| m.to_global).collect();
+        assert_eq!(
+            to_global,
+            [true, true, false, true, true],
+            "tidepool-app is not the slug tidepool"
         );
     }
 }

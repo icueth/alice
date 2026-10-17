@@ -8841,6 +8841,8 @@ mod tests {
         s.shutdown();
     }
 
+    /// R19, and Task 11b: a distilled update of an agent's memory never supersedes it; it is a
+    /// near-copy of it and goes to the trash as its duplicate, with no review item.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_distilled_memory_never_supersedes_an_agent_memory() {
         let (d, s) = svc_with_jev(crate::judge_http::ScriptedJev::new(("updates", 0.95))).await;
@@ -8862,31 +8864,41 @@ mod tests {
         .await;
         wait_settled(&s).await;
         let live = ("done".to_string(), "active".to_string());
-        assert_eq!(state_of(&s, &mine).await.1, "active", "both stay");
-        assert_eq!(state_of(&s, &auto).await, live);
+        assert_eq!(state_of(&s, &mine).await, live, "the agent's memory stays");
+        assert_eq!(
+            state_of(&s, &auto).await,
+            ("done".to_string(), "trashed".to_string())
+        );
         assert_eq!(
             links_from(&s, &auto).await,
-            [(mine.clone(), "relates_to".to_string())]
+            [(mine.clone(), "duplicate_of".to_string())]
         );
         assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
-        // A distilled update of an older distilled memory supersedes it, as an agent's would.
-        let newer = remember_distilled(
+        // A distilled update of an older distilled memory supersedes it, as an agent's would
+        // (in a project without the agent's memory).
+        let other = repo(&d, "other");
+        let first = remember_distilled(
             &s,
             "Staging Postgres listens on port 5434 now",
             Kind::Fact,
-            &cwd,
+            &other,
+        )
+        .await;
+        wait_settled(&s).await;
+        let newer = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5435 now",
+            Kind::Fact,
+            &other,
         )
         .await;
         wait_settled(&s).await;
         assert_eq!(state_of(&s, &newer).await, live);
-        assert_eq!(state_of(&s, &auto).await.1, "superseded");
+        assert_eq!(state_of(&s, &first).await.1, "superseded");
         assert_eq!(state_of(&s, &mine).await.1, "active");
         assert_eq!(
             links_from(&s, &newer).await,
-            [
-                (mine.clone(), "relates_to".to_string()),
-                (auto.clone(), "supersedes".to_string()),
-            ]
+            [(first.clone(), "supersedes".to_string())]
         );
         assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
         s.shutdown();

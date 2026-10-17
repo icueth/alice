@@ -26,6 +26,7 @@
 //! `WriterHandle::submit_blocking`): call it from a blocking thread.
 
 use crate::config::{CaptureVerdict, SettingsHandle};
+use crate::distill::QUIET_RECENT;
 use crate::redaction::Redactors;
 use crate::writer::{
     CaptureChange, CaptureInit, CaptureSlice, INGEST_SLICE, INGEST_SLICE_BYTES, ProjectChoice,
@@ -258,6 +259,10 @@ pub struct CaptureCtl {
     unknown: Mutex<VecDeque<(chrono::NaiveDate, u64)>>,
     /// Called when a pass makes its source due for distillation (wakes the distill worker).
     on_due: Mutex<Option<DueHook>>,
+    /// The local worker's stale age (`LocalCaptureConfig::stale`), set when it is made: the
+    /// sweep's final pass of a stale transcript makes a session due only within the last
+    /// [`QUIET_RECENT`] plus it (Task 11b review, M1). `None` on a server tenant (no sweep).
+    sweep_stale: Mutex<Option<Duration>>,
     /// Tests only (`ServiceOptions::capture_fail_after_slices`): slices left before a write
     /// fails as a kill between slices would; `None`: never.
     fail_after_slices: Mutex<Option<usize>>,
@@ -333,6 +338,7 @@ impl CaptureCtl {
             locks: SourceLocks::default(),
             unknown: Mutex::new(VecDeque::new()),
             on_due: Mutex::new(None),
+            sweep_stale: Mutex::new(None),
             fail_after_slices: Mutex::new(None),
         })
     }
@@ -625,7 +631,8 @@ impl CaptureCtl {
         }
         // `needed` keeps a slice whenever `input.end`, and the last one carries `ended`.
         report.ended = input.end;
-        self.mark_due(&input, &report);
+        let captured_before = state.as_ref().and_then(|s| s.last_capture_at.as_deref());
+        self.mark_due(&input, &report, captured_before);
         report.next_offset = done;
         Ok(report)
     }
@@ -1000,7 +1007,15 @@ impl CaptureCtl {
     /// leaves it open (a capped upload, `more=1`; a local pass short of the end of the file) is
     /// followed by the rest of the session, and a run before that would take part of the
     /// session for its end (and offer a handoff from the middle of it).
-    fn mark_due(&self, input: &PassInput, report: &PassReport) {
+    ///
+    /// The sweep's final pass of a stale transcript (an end that is no session end: only
+    /// `session-end` sets `end` otherwise, and a coalesced job keeps that event) makes the
+    /// session due only when it, or a subagent of it, captured within the last 7 days plus the
+    /// stale age (8 days by default), as an end without a final pass does
+    /// (`store::capture::due_after_stale_end`): a long downtime or a restored backup makes no
+    /// backlog (Task 11b review, M1). The pass itself may have captured just now, so the
+    /// source's last capture before it (`captured_before`, or its registration) counts.
+    fn mark_due(&self, input: &PassInput, report: &PassReport, captured_before: Option<&str>) {
         if input.subagent.is_some()
             || !(input.end || matches!(input.event.as_str(), "session-end" | "pre-compact"))
             || !(input.close_trailing || input.force_close)
@@ -1011,6 +1026,13 @@ impl CaptureCtl {
         let Some(source_id) = report.source_id.as_deref() else {
             return;
         };
+        let since = (input.end && input.event != "session-end")
+            .then(|| *self.sweep_stale.lock())
+            .flatten()
+            .and_then(|stale| stale.checked_add(QUIET_RECENT))
+            .and_then(|window| chrono::Duration::from_std(window).ok())
+            .and_then(|window| chrono::Utc::now().checked_sub_signed(window))
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
         let pending = self.readers.with(|c| {
             let Some(st) = store::by_source(c, source_id)? else {
                 return Ok(None);
@@ -1021,8 +1043,9 @@ impl CaptureCtl {
             ) {
                 return Ok(None);
             }
+            let kids = store::children(c, source_id)?;
             let undistilled = st.next_ord > st.distill_ord
-                || store::children(c, source_id)?.iter().any(|k| {
+                || kids.iter().any(|k| {
                     k.next_ord > k.distill_ord
                         && !matches!(
                             k.distill_state,
@@ -1030,7 +1053,21 @@ impl CaptureCtl {
                                 | store::DistillState::SkippedExcluded
                         )
                 });
-            Ok(undistilled.then_some(st))
+            let recent = match since.as_deref() {
+                None => true,
+                Some(since) => {
+                    let registered: String = c.query_row(
+                        "SELECT created_at FROM capture_state WHERE source_id = ?1",
+                        [source_id],
+                        |r| r.get(0),
+                    )?;
+                    captured_before.unwrap_or(&registered) >= since
+                        || kids
+                            .iter()
+                            .any(|k| k.last_capture_at.as_deref().is_some_and(|t| t >= since))
+                }
+            };
+            Ok((undistilled && recent).then_some(st))
         });
         let st = match pending {
             Ok(Some(st)) => st,
@@ -1212,10 +1249,12 @@ pub use local::{
 mod local {
     use super::{CaptureCtl, PassInput, check_ids};
     use crate::config::CaptureVerdict;
+    use crate::distill::QUIET_RECENT;
     use crate::service::ProjectResolver;
     use crate::writer::{CaptureChange, CaptureInit, WriteOp, WriterHandle};
     use alice_core::api::CaptureNotify;
     use alice_core::capture::{self, AgentKind, MAX_LINE_BYTES, MAX_PASS_BYTES};
+    use alice_core::settings::DistillProvider;
     use alice_core::store::ReaderPool;
     use alice_core::store::capture as store;
     use alice_core::{AliceError, Result};
@@ -1489,6 +1528,8 @@ mod local {
             cfg: LocalCaptureConfig,
         ) -> Arc<Self> {
             let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+            // The sweep's final pass is windowed by the stale age (Task 11b review, M1).
+            *ctl.sweep_stale.lock() = Some(cfg.stale);
             Arc::new(Self {
                 ctl,
                 readers,
@@ -1710,7 +1751,11 @@ mod local {
 
         /// Ends the sources in `unreadable` that captured nothing for `stale` (one that never
         /// captured: registered before then), out of `open` open sources. There is nothing to
-        /// read, so there is no final pass; the cursor stays where it is.
+        /// read, so there is no final pass; the cursor stays where it is. As a final pass would,
+        /// the end makes a session due for distillation (spec §6.2, §10; Task 11b) when
+        /// distillation is on and it, or a subagent of it, captured within the last 7 days
+        /// ([`QUIET_RECENT`]) plus the stale age (8 days by default); an older one is distilled
+        /// only when asked.
         fn end_unreadable(
             &self,
             unreadable: &[&store::CaptureState],
@@ -1721,25 +1766,45 @@ mod local {
             let Some(before) = chrono::Utc::now().checked_sub_signed(stale) else {
                 return Ok(());
             };
-            let before = before.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let stamp = |t: chrono::DateTime<chrono::Utc>| {
+                t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            };
+            let due_since = (self.ctl.settings.get().distill.provider != DistillProvider::Off)
+                .then(|| chrono::Duration::from_std(QUIET_RECENT).ok())
+                .flatten()
+                .and_then(|week| before.checked_sub_signed(week))
+                .map(stamp);
+            let before = stamp(before);
             let stale: HashSet<String> = self
                 .readers
                 .with(|c| store::stale_open(c, &before, open.max(1)))?
                 .into_iter()
                 .collect();
+            let mut ended = false;
             for s in unreadable.iter().filter(|s| stale.contains(&s.source_id)) {
                 if self.stopping() {
                     break;
                 }
                 self.writer.submit_blocking(WriteOp::CaptureStateUpdate {
                     source_id: s.source_id.clone(),
-                    change: CaptureChange::Ended,
+                    change: CaptureChange::StaleEnd {
+                        due_since: due_since.clone(),
+                    },
                 })?;
+                ended = true;
                 seen.remove(&s.uri);
                 tracing::info!(
                     uri = s.uri,
                     "a captured session with no transcript to read had no capture for a day; it is ended"
                 );
+            }
+            // Wakes the distill worker for the sessions the end made due (none: it looks and
+            // sleeps again).
+            if ended && due_since.is_some() {
+                let hook = self.ctl.on_due.lock().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
             }
             Ok(())
         }
