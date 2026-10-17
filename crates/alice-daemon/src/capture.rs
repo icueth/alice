@@ -1470,7 +1470,8 @@ mod local {
     /// What the worker counted since the daemon started (for `alice doctor`).
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct LocalCaptureCounts {
-        /// Passes run, each over at most `MAX_PASS_BYTES` of one transcript.
+        /// Passes run, each over at most `MAX_PASS_BYTES` of one transcript; counted after its
+        /// writes are visible.
         pub passes: u64,
         /// Codex sessions whose hook gave no transcript path and whose rollout was not found.
         pub rollouts_not_found: u64,
@@ -1967,6 +1968,9 @@ mod local {
                     event: job.event.clone(),
                     end: !more && end,
                 });
+                // Counted once `apply` has returned, so a count means the pass's writes are
+                // visible (tests wait on it for that). The cursor the pass committed is visible a
+                // moment before its count: a reader of both waits for the count.
                 self.passes.fetch_add(1, Ordering::Relaxed);
                 let report = report?;
                 if report.behind.is_some() {

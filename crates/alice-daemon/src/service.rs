@@ -10820,6 +10820,14 @@ mod tests {
         let (d, s) = svc_with_grader(t).await;
         let cwd = repo(&d, "proj");
         remember_deploy_notes(&s, &cwd).await;
+        // Each recall bumps its results' access counts with a fire-and-forget write, which the
+        // next recall may or may not see yet; without the usage boost the count leaves the
+        // score alone, so the two searches below score alike whenever that write lands.
+        s.patch_settings(patch_one(
+            "search.weights.usage_max",
+            serde_json::json!(0.0),
+        ))
+        .unwrap();
         let fast = s
             .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
             .await

@@ -3317,6 +3317,7 @@ async fn a_large_transcript_is_read_in_bounded_passes_that_split_no_turn() {
         "no turn was cut at a pass's end"
     );
     // The count is bumped just after a pass commits its cursor, so it can lag the cursor by one pass.
+    // It stays so: a count means a pass's writes are visible, which other tests wait on.
     until_within("the last pass counted", Duration::from_secs(10), || {
         passes(&svc) >= 9
     })
