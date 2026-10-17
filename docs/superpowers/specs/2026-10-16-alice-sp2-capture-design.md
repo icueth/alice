@@ -304,7 +304,7 @@ a line that starts with its tag:
 | WebFetch / WebSearch | the URL or query, plus the result's first 500 characters |
 | Task / Agent (subagent call) | `[subagent <type>] <description>`, plus the subagent's final report up to 2,000 characters |
 | TodoWrite and similar bookkeeping tools | Dropped |
-| Alice's and MemPalace's own tools (`recall`, `context`, `mempalace_search`, `remember`, `mempalace_add_drawer`, …) | `[tool alice remember] <title or first line, ≤ 120 chars>`. Results become `[result omitted: memory tool]`. Memory text never re-enters the raw tier, and the distiller reads these lines as "already saved" (§6.3) |
+| Alice's and MemPalace's own tools (`recall`, `context`, `mempalace_search`, `remember`, `mempalace_add_drawer`, …) | `[tool alice remember] <title or first line, ≤ 120 chars>`. Results become `[result] [omitted: memory tool]`. Memory text never re-enters the raw tier, and the distiller reads these lines as "already saved" (§6.3) |
 | Other tools | `[tool <name>] <input as compact JSON, ≤ 300 chars>`, plus the result trimmed to *N* |
 | Errors (`is_error`) | `[result error]`, trimmed to *N* |
 | Runs of 200 or more base64-like characters, or text over 30 % unprintable | `[binary removed]` |
@@ -357,7 +357,8 @@ This one rule covers everything that could duplicate:
 
 - **Locally:** the hook's `cwd` goes through the daemon's existing detection (git root, then normalised remote, then
   slug), as for a `remember` with a `cwd`.
-- **On a tenant:** the script sends the basename of the git top-level, or of `cwd`, as a project hint. The server
+- **On a tenant:** the script sends the basename of the git top-level as a project hint, and no hint outside git or at
+  `$HOME` (as the MCP headersHelper does; amended by the final review, A-M8). The server
   slugifies it and resolves it exactly as the direct-MCP path does (server spec §2.8 step 3): an existing slug or alias,
   else the `import:<slug>` placeholder. The person's MCP writes and captured transcripts of one repository therefore land
   in one project.
@@ -502,7 +503,8 @@ The capture worker is a daemon thread, `alice-capture`, at low priority.
 - **Backup:** before any write the file is copied to `settings.json.alice-backup-<UTC stamp>` (0600). The newest 5 such
   backups are kept.
 - **What it writes:** for SessionStart (no matcher), Stop, SubagentStop, PreCompact and SessionEnd, one entry
-  `{"hooks":[{"type":"command","command":"'<abs alice>' hook <event> --agent claude-code","timeout":10}]}`.
+  `{"hooks":[{"type":"command","command":"'<abs alice>' hook <event> --agent claude-code || true","timeout":10}]}`
+  (` || true`: a moved or missing binary never fails the agent's turn).
   - `<abs alice>` is the canonical path of the running binary.
   - The command starts with `ALICE_HOME='<home>' ` when the install ran with a non-default `ALICE_HOME`, so tests and
     second homes capture into the right place.
@@ -639,7 +641,8 @@ self-update (step 8) compares with it, so the hooks are written down in one plac
 5. **Briefing on `SessionStart`.** Before exiting, the foreground part prints the briefing as §5.7 says. It is the one
    synchronous network call, bounded to 2 s, and the capture work has already been sent to the background.
 6. **Project and privacy.**
-   - The project hint is the basename of `git -C <cwd> rev-parse --show-toplevel`, else of `cwd`.
+   - The project hint is the basename of `git -C <cwd> rev-parse --show-toplevel`; outside git, or when that top-level
+     is `$HOME`, no hint is sent (final review A-M8).
    - If that top-level (or `cwd`) has a `.alice.toml` with a line `no_capture = true`, the event is skipped entirely. A
      line `cloud_denied = true` sends `no_distill=1`.
    - If the file exists but cannot be read, the event is skipped (fail closed).
