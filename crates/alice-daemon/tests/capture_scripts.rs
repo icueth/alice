@@ -3790,9 +3790,9 @@ async fn a_corrupt_state_offset_resyncs_instead_of_aborting() {
 
 /// A stopped session whose state file holds a corrupt offset sends nothing and repairs nothing,
 /// so the corrupt-value line (which says the server is asked) must not come back on every
-/// event: it is said at most once, where the uploads follow.
+/// event. It is said only where the uploads follow, so a stopped session never says it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stopped_session_with_a_corrupt_offset_logs_at_most_once() {
+async fn a_stopped_session_with_a_corrupt_offset_never_logs_it() {
     let s = Server::start(&["ann"]).await;
     let t = s.tenant("ann");
     let env = Env::new();
@@ -3817,7 +3817,7 @@ async fn a_stopped_session_with_a_corrupt_offset_logs_at_most_once() {
         .skip(logged)
         .filter(|l| l.contains("state file"))
         .collect();
-    assert!(fresh.len() <= 1, "{log}");
+    assert_eq!(fresh.len(), 0, "{log}");
     // Stopped: nothing was sent, and the state stays as it was.
     assert_eq!(uploads(&s, "corrupt-stopped").len(), sent, "{log}");
     assert_eq!(turns_of(&t.home, &uri("corrupt-stopped")), 1);
@@ -3910,6 +3910,58 @@ fn a_worker_ended_with_its_watchdog_leaves_nothing_in_tmpdir() {
     let name = tmpd.file_name().unwrap().to_string_lossy().into_owned();
     assert_eq!(during, vec![name], "in $TMPDIR while bounded ran");
     assert!(tick, "the tick file is in the worker's directory");
+}
+
+/// Fix round 1: `sync_plugin`'s background `claude plugin` calls outlive the worker, whose
+/// cleanup removes its temporary directory meanwhile. They use no temporary directory, so their
+/// `bounded` never makes a tick file in the worker's one (one made while `rm -rf` runs would leave
+/// the directory behind). The worker here waits for the background calls before it ends, and a
+/// fake `claude` lists every tick file under `$TMPDIR` while it runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_background_claude_calls_make_no_tick_file_in_the_workers_directory() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    let ticks = env.home.join("ticks");
+    write_mode(
+        &env.bin.join("claude"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/claude-calls\"\nfind \"$TMPDIR\" -name bounded >> '{}' 2>/dev/null\nexit 0\n",
+            ticks.display()
+        )
+        .as_bytes(),
+        0o755,
+    );
+    let calls = env.claude_calls();
+    let r = with_hook_lib(
+        &env,
+        r#"
+make_tmp || exit 1
+printf '{}\n' >"$tmpd/new-hooks"
+sync_plugin "$tmpd/new-hooks" "$MP/alice-capture/hooks/hooks.json"
+wait
+[ -d "$tmpd" ] && printf 'tmpd kept\n'
+"#,
+        Duration::from_secs(60),
+    );
+    assert!(r.ok(), "{r}");
+    assert!(r.stdout.contains("tmpd kept"), "{r}");
+    let new_calls = env.claude_calls()[calls.len()..].to_string();
+    assert!(
+        new_calls.contains("plugin marketplace update alice-local")
+            && new_calls.contains("plugin update alice-capture@alice-local"),
+        "{new_calls}"
+    );
+    assert!(
+        env.log().contains("claude plugin took the new hooks.json"),
+        "{}",
+        env.log()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ticks).unwrap_or_default(),
+        "",
+        "tick files seen while claude ran"
+    );
 }
 
 // ---- Status and uninstall ----

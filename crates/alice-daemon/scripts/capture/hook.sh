@@ -969,6 +969,11 @@ verify_script() {
 # instant between the reap and the KILL is open. A sleep the watchdog forked but had not recorded
 # yet when it was killed outlives the call by under a second. When the caller is killed, the
 # watchdog still ends the command at the limit, then exits.
+#
+# With $tmpd empty there is no tick file, and the watchdog's last sleep may outlive each call by
+# under a second. A caller that may outlive the worker's directory clears $tmpd first (the
+# background `claude plugin` calls of sync_plugin): a tick file made while cleanup runs `rm -rf`
+# on that directory would leave it behind.
 bounded() {
   bd_limit=$1
   shift
@@ -1071,9 +1076,12 @@ sync_plugin() {
     return 0
   fi
   # From $HOME (a project's directory could change what `claude plugin` reads), without Claude
-  # Code's own self-update, and each call killed after 120 s.
+  # Code's own self-update, and each call killed after 120 s. The subshell outlives the worker,
+  # whose cleanup removes $tmpd meanwhile: it uses no temporary directory (bounded then keeps no
+  # tick file), so it never writes into one being removed.
   (
     trap - EXIT HUP INT TERM
+    tmpd=
     cd "$HOME" 2>/dev/null || exit 0
     sp_limit=${ALICE_CAPTURE_TEST_CLAUDE_LIMIT:-120}
     case $sp_limit in '' | 0* | *[!0-9]* | ?????*) sp_limit=120 ;; esac
