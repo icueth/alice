@@ -268,15 +268,18 @@ distilled, newest first. Older ones, and sessions captured by a backfill, are di
   turn's concluding text, then statements you made, then subagent reports. Passages that hold `[withheld:`, are mostly a
   tool line, or repeat what the session already saved with `remember` are dropped first.
 - **One request per run.** Jev gets one question per passage: does it hold a decision, a bugfix, a how-to, a warning, a
-  preference of yours (filed under `global`), a convention of this project, a fact, a handoff, or is it already saved,
-  ephemeral or unclear? A passage is kept when its best answer is a kind of knowledge with probability at least
-  `distill.min_confidence` (default 0.7). At most `distill.max_per_run` (default 8) are kept per run, and at most one
-  handoff; at most `distill.max_per_session` (default 16) per session, one of them kept for a handoff; and at most
-  `distill.max_per_subagent_run` (default 2) subagent reports per run.
-- **The memory.** The passage (at most 1,200 characters), titled with its first sentence, with a last line
-  `Context: <your prompt's first sentence>` when it needs one to stand on its own. Importance `distill.importance`
-  (default 2), no topics, the session as author, and provenance links to the chunks it came from. It is written through
-  the normal `remember` path: redacted, deduplicated and judged.
+  preference of yours (filed under `global`, unless it names this project: its name, its folder or a path in it), a
+  convention of this project, a fact, a handoff, or is it already saved, ephemeral or unclear? A passage is kept when
+  its best answer is a kind of knowledge with probability at least `distill.min_confidence` (default 0.7). At most
+  `distill.max_per_run` (default 8) are kept per run, and at most one handoff; at most `distill.max_per_session`
+  (default 16) per session, its runs and its subagents together, one of them kept for a handoff at the session's end;
+  and at most `distill.max_per_subagent_run` (default 2) subagent reports per run, and half of
+  `distill.max_per_session` per session.
+- **The memory.** The passage (at most 1,200 characters), titled with its first sentence; when that is only a heading
+  or a table header, or 25 characters or fewer, with the first sentence after it (at most 80 characters). It gets a
+  last line `Context: <your prompt's first sentence>` when it needs one to stand on its own. Importance
+  `distill.importance` (default 2), no topics, the session as author, and provenance links to the chunks it came from.
+  It is written through the normal `remember` path: redacted, deduplicated and judged.
 
 ### `(auto)`, and why it never asks you
 
