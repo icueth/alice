@@ -7695,7 +7695,9 @@ mod tests {
 
     /// Task 12c review 2, N2: a judgement of a distilled newcomer that does not carry the
     /// distillation settings would skip eviction in silence; a debug build stops on it (a
-    /// release build warns). Applied on this thread: the writer's own would die with it.
+    /// release build warns). Applied on this thread: the writer's own would die with it. Debug
+    /// builds only: under `cargo test --release` the assert is off and nothing panics.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "carries the distillation settings")]
     fn a_judgement_of_a_distilled_newcomer_needs_the_distillation_settings() {

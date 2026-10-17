@@ -1,11 +1,15 @@
 # Distillation evaluation (SP2, Task 13)
 
 Measured on 2026-10-17. Runs 1 and 2 ran on `feat/sp2-eval` (based on e254f6e); run 3 ran on `feat/sp2-flood`
-(a19faa6).
+(a19faa6), and run 4 on `feat/sp2-flood` (3a431ba).
 
-- **Runs:** three live runs. Run 1 came before, and run 2 after, the single tuning round that spec §11.3 allows. Run 3
-  re-recorded the evaluation after two product fixes (Tasks 12b and 11b) that followed the owner's real-session check; it
-  is not a second tuning round. Each run is a single execution; nothing was repeated or averaged.
+- **Runs:**
+  - Run 1 came before, and run 2 after, the single tuning round that spec §11.3 allows.
+  - Run 3 re-recorded the evaluation after two product fixes (Tasks 12b and 11b) that followed the owner's
+    real-session check.
+  - Run 4 re-checked it after a third (Task 12c), which followed the real-session re-check.
+  - Neither run 3 nor run 4 is a second tuning round.
+  - Each live run is a single execution; nothing was repeated or averaged.
 - **The set:** synthetic. It was written for this evaluation by the engineer, not taken from users, holds no real user
   data, and its labels are **one author's** judgement.
 - **Thresholds:** declared in spec §11.3 before the first run, and unchanged since.
@@ -16,7 +20,7 @@ Measured on 2026-10-17. Runs 1 and 2 ran on `feat/sp2-eval` (based on e254f6e); 
 | Distiller and judge | TypeSafe Jev `jev-1.13.0` (`https://api.typesafe.ai/v1/systemone`), the real pipeline through `Service`: capture, the distill worker, the judge worker |
 | Test home | `judge.provider = "jev"`, `judge.daily_budget_usd = 1.0`, `judge.timeout_ms = 60000`, `distill.provider = "jev"`, `distill.budget_share = 1.0`, `distill.min_confidence = 0.7` (the default) |
 | Embedder | the tests' `FakeEmbedder` (hashed words and trigrams); it only decides which older memories the judge compares |
-| Test | `crates/alice-daemon/tests/distill_eval.rs`; the set in `tests/fixtures/distill/` (checked by `distill_fixtures.rs`); the recorded answers of run 3 in `tests/fixtures/distill/recorded.jsonl`; the flood set (Task 12b) and its recorded answers in `tests/fixtures/distill/flood/` |
+| Test | `crates/alice-daemon/tests/distill_eval.rs`; the set in `tests/fixtures/distill/` (checked by `distill_fixtures.rs`); the recorded answers of run 3 in `tests/fixtures/distill/recorded.jsonl`; the flood set (Task 12b) and its recorded answers in `tests/fixtures/distill/flood/`; the long-session set (Task 12c) and its recorded answers in `tests/fixtures/distill/long/` |
 
 ```
 # free: a scripted Jev; the pipeline runs twice and must send the same request bodies
@@ -29,6 +33,9 @@ cargo test -p alice-daemon --test distill_eval
 # ALICE_DISTILL_EVAL_STOP_USD gives the second what the first left)
 ALICE_DISTILL_EVAL_DRY=1 cargo test -p alice-daemon --test distill_eval distill_eval_flood_live -- --ignored --nocapture
 ALICE_DISTILL_EVAL_STOP_USD=0.093 cargo test -p alice-daemon --test distill_eval distill_eval_flood_live -- --ignored --nocapture
+# the long-session set (Task 12c): the same pair
+ALICE_DISTILL_EVAL_DRY=1 cargo test -p alice-daemon --test distill_eval distill_eval_long_session_live -- --ignored --nocapture
+ALICE_DISTILL_EVAL_STOP_USD=0.10 cargo test -p alice-daemon --test distill_eval distill_eval_long_session_live -- --ignored --nocapture
 ```
 
 ## The set
@@ -82,19 +89,20 @@ Per kind, precision goes by the memory's kind and recall by the item's first kin
 
 ## Results
 
-| Metric | Threshold | Run 1 | Run 2 (after tuning) | Run 3 (after Tasks 12b and 11b) |
-|---|---|---|---|---|
-| Precision, all 30 sessions | ≥ 0.80 | **0.70** (40/57; 95% Wilson 0.57–0.80): fails | **0.90** (35/39; 0.76–0.96) | **0.90** (36/40; 0.77–0.96) |
-| Precision, the 20 gold sessions | — | 0.73 (36/49) | 0.92 (35/38) | 0.92 (36/39) |
-| Recall | ≥ 0.60 | 0.72 (36/50; 0.58–0.83) | 0.70 (35/50; 0.56–0.81) | 0.72 (36/50; 0.58–0.83) |
-| Doubles | ≤ 10 % (1 of 10) | **4**: fails | 0 | 0 |
-| Flood | ≤ 2 | **3**: fails | 1 | 1 |
-| Spend | < $0.10 | $0.0068 (73 requests) | $0.0059 (53 requests) | $0.0065 (55 requests) |
-| Distilled memories / trashed by the judge | — | 63 / 6 | 40 / 1 | 42 / 2 |
-| Jev latency, median / max | — | 312 / 682 ms | 323 / 694 ms | 349 / 1,247 ms |
+| Metric | Threshold | Run 1 | Run 2 (after tuning) | Run 3 (after Tasks 12b and 11b) | Run 4 (after Task 12c) |
+|---|---|---|---|---|---|
+| Precision, all 30 sessions | ≥ 0.80 | **0.70** (40/57; 95% Wilson 0.57–0.80): fails | **0.90** (35/39; 0.76–0.96) | **0.90** (36/40; 0.77–0.96) | **0.90** (36/40; 0.77–0.96) |
+| Precision, the 20 gold sessions | — | 0.73 (36/49) | 0.92 (35/38) | 0.92 (36/39) | 0.92 (36/39) |
+| Recall | ≥ 0.60 | 0.72 (36/50; 0.58–0.83) | 0.70 (35/50; 0.56–0.81) | 0.72 (36/50; 0.58–0.83) | 0.72 (36/50; 0.58–0.83) |
+| Doubles | ≤ 10 % (1 of 10) | **4**: fails | 0 | 0 | 0 |
+| Flood | ≤ 2 | **3**: fails | 1 | 1 | 1 |
+| Spend | < $0.10 | $0.0068 (73 requests) | $0.0059 (53 requests) | $0.0065 (55 requests) | nothing new: run 3's 55 answers replay |
+| Distilled memories / trashed by the judge | — | 63 / 6 | 40 / 1 | 42 / 2 | 42 / 2 |
+| Jev latency, median / max | — | 312 / 682 ms | 323 / 694 ms | 349 / 1,247 ms | — |
 
-Runs 2 and 3 meet every threshold, and the CI replay pins run 3. Recall passes as a point estimate, but its interval does
-not rule out a recall under 0.60.
+Runs 2, 3 and 4 meet every threshold, and the CI replay pins run 4. The main set's requests did not change in run 4, so it
+replays run 3's answers (see "Run 4"). Recall passes as a point estimate, but its interval does not rule out a recall
+under 0.60.
 
 **Per kind** (precision by the memory's kind; recall by the item's first kind):
 
@@ -226,6 +234,7 @@ the explicit memory when that `updates` is at or above the review threshold (0.5
 | 1 | s18 | «partitioned by business_date» (fact) | (b) | kept as fact (0.84). The judge read `updates` (forward 0.64, reverse about 0.5), so it was linked and stayed live |
 | 2 | — | none | — | 6 of the 10 items answered `already_saved`. s11's preference (0.56), s11's bugfix (0.62) and s18's fact (0.66) were answered with knowledge but below 0.70. s25's howto (0.87) was kept and then trashed as a duplicate (reverse 0.84) |
 | 3 | — | none | — | 6 of the 10 items answered `already_saved`. s11's bugfix (0.58) and s18's fact (0.59) were answered with knowledge below 0.70, so they were never kept. s11's preference was kept as `preference_user` (0.73) and routed to `global`; Task 11b's comparison with the source project found the agent's copy (duplicate, forward 0.80, reverse 0.79) and trashed it. That is cause (a), now caught. s25's howto (0.91) was kept and then trashed as a duplicate (forward 0.55, reverse 0.78) |
+| 4 | — | none | — | The same answers and the same judgements as run 3: Task 11b's comparison with the source project caught s11's preference, and s25's howto was trashed as a duplicate. Task 12c's "holds more" guard (twice the length, between review and auto) and its number rule (a newer value) linked nothing in this set, so they caused no double |
 
 **What the judge caught.** In run 1 it trashed 6 distilled memories as duplicates of older ones:
 
@@ -326,16 +335,90 @@ any run.
   `decision` at 0.95 (`ephemeral` 0.05), although run 2's `ephemeral` wording covers questions. The judge cleaned it up
   here only because the answering decision came later in the same session.
 
+## Run 4: re-checked after Task 12c
+
+Run 4 checks the evaluation again after a third **product fix**, Task 12c. It follows the real-session re-check after
+Tasks 12b and 11b, which found that a session kept its first memories rather than its best. It is not a tuning round:
+the set, the labels and the thresholds are unchanged, and nothing was changed after run 4. Task 12c:
+
+- **Best set, with replacement.** A session keeps its best `distill.max_per_session` (16) distilled memories. Migration
+  0008 stores each memory's p and tier. Once the set is full, a better newcomer that the judge has found live replaces
+  the session's weakest member, which is trashed with reason `distill:cap`. A handoff, a promoted row, an edited memory
+  and a linked memory are never replaced.
+- **Ranking by p bands:** the handoff first, the main session before subagents, the band (p ≥ 0.9, ≥ 0.8, below), then
+  kind, then p.
+- **The "holds more" guard in the judge:** a distilled newcomer is linked to its match, not trashed, in two cases:
+  - it is more than twice its match's length, at a confidence between review and auto;
+  - it states a number its match lacks (a newer value), at any confidence.
+- **The cap counts live memories only:** those neither trashed nor superseded.
+- **A capped long-session fixture**, as a separate test.
+
+**Task 13's set and the flood set.** Their requests did not change, so they were not recorded again:
+
+- **No drift:** under Task 12c's code, run 3's two recordings replay with no misses and no unused answers.
+- **The same outcomes:** the main report and its 30 per-session lines are byte for byte run 3's, and the flood's output
+  is unchanged too.
+- **So run 4's figures are run 3's:** precision 0.90 (36/40), recall 0.72 (36/50), doubles 0, flood 1. The per-kind,
+  per-language and per-session tables above hold for run 4 row for row.
+- **Doubles by cause:** the same as run 3. Task 11b's comparison with the source project caught s11's preference, and
+  s25's howto was trashed as a duplicate. The "holds more" guard and the number rule changed no judgement in this set:
+  they linked nothing that run 3 trashed, so they caused no double.
+- **The flood set:** still 20 of 20 verdicts asked, 19 ephemeral, 1 kept, and 3 of 3 lessons kept; 5 distilled, 4 live,
+  1 superseded.
+
+**The long-session set** (Task 12c's separate test, `distill_eval_long_session_replay`; §11.3's set and thresholds are
+untouched). One session on a harbour-operations project is long enough to fill its best set over three runs. It holds
+24 labelled facts: 14 early and in the middle, and 10 late, among them a late compaction summary. Between them are 12
+verdict or status lines. Its checks were declared in Task 12c before any run:
+
+- one request per run (three);
+- the best set never above 16;
+- the late summary's sections asked about.
+
+| | Run 4 (live) | The free dry run's script |
+|---|---|---|
+| Requests (distillation / the judge's) | 21 (3 / 18) | 22 (3 / 19) |
+| Questions | 38 | 38 |
+| Distilled, then kept (live) | 19, kept 16 | 20, kept 16 |
+| Late facts kept | **5 of 10** | 8 of 10 |
+| Early facts kept | 11 of 14 | 8 of 14 |
+| Replaced (`distill:cap`) | **3** | 4 |
+| Verdicts kept | **0 of 12** | 0 of 12 |
+| Spend | $0.0023 | at most $0.0116 |
+
+All of Task 12c's checks pass.
+
+**How the best set filled:**
+
+- **Run 1** kept 7 memories, all at p ≥ 0.9.
+- **Run 2** kept its maximum of 8: five at p ≥ 0.9 and three in the 0.8 band (a decision at 0.86, a bugfix at 0.87, a
+  fact at 0.85). That made 15.
+- **Run 3** had four memories at p ≥ 0.9. One took the free slot, and three replaced the three 0.8-band memories: the
+  berth 12 fact (0.85), the late summary's weather-alerts decision (0.86) and its problem-solving bugfix (0.87). That
+  leaves 16, all at p ≥ 0.9.
+
+**Why 5 late facts were not kept:**
+
+- 2 were answered under 0.70 (0.48 and 0.37).
+- 3 were out-ranked by the full set: the 0.86 decision, the 0.87 answer (whose kind the item does not accept) and a fact
+  at 0.80.
+- 3 early facts were lost the same way: answered at 0.50 and 0.57, or replaced at 0.85.
+
+This is the p-band policy at work. A late fact enters when Jev is more sure of it than of the weakest member, whatever
+its position in the session. The free dry run's script answers every labelled passage at p 1.0, so in that run the late
+facts win more of the ties.
+
 ## Spend
 
-| | Run 1 | Run 2 | Run 3 | Run 3, flood set |
-|---|---|---|---|---|
-| Requests, distillation and the judge's | 73 | 53 | 55 | 5 |
-| Spend, from Jev's reported input tokens (the cost ledgers agree) | $0.0068 | $0.0059 | $0.0065 | $0.0008 |
-| The free dry run's upper bound (1.41 tokens per byte, plus 300 per request) | $0.0307 | $0.0329 | $0.0356 | $0.0031 |
+| | Run 1 | Run 2 | Run 3 | Run 3, flood set | Run 4, long-session set |
+|---|---|---|---|---|---|
+| Requests, distillation and the judge's | 73 | 53 | 55 | 5 | 21 |
+| Spend, from Jev's reported input tokens (the cost ledgers agree) | $0.0068 | $0.0059 | $0.0065 | $0.0008 | $0.0023 |
+| The free dry run's upper bound (1.41 tokens per byte, plus 300 per request) | $0.0307 | $0.0329 | $0.0356 | $0.0031 | $0.0116 |
 
 Run 3's two live runs shared one $0.10 stop: the flood run was given $0.093, what the first left. They cost $0.0072
-together, and all runs together cost $0.0200.
+together. Run 4 recorded only the long-session set, with a $0.10 stop: the other two sets replay run 3's answers. All
+runs together cost $0.0223.
 
 ## Determinism
 
@@ -365,18 +448,26 @@ replay.
   every session. Both flood replays printed the same verdict answers and memories as the replay of the live recording.
   The flood live run itself stopped at the evaluation's old status check, which then knew only active and trashed, after
   every request had been recorded. The ruling to score `superseded` as not live came next, with no new live run.
+- **Dry runs, run 4 code:**
+  - Task 13's set: the same 76 request bodies twice, still extracting 50/50 gold;
+  - the flood set: the same 3 bodies twice;
+  - the long-session set: the same 22 bodies twice.
+- **Replays, run 4:** each of the three sets was replayed twice in a row, and all six passed.
+  - Task 13's set and the flood set reproduced run 3's outputs byte for byte, on run 3's recordings.
+  - The long-session set reproduced its live run's output.
 - **What the replay requires:** every request must have a recorded answer, and every recorded answer must be asked for.
 
-`recorded.jsonl` holds run 3's 55 requests (595 KB), and `flood/recorded.jsonl` the flood run's 5 (74 KB), bodies only.
-Each live test rewrites its file, so runs 1 and 2 are kept here as numbers only.
+`recorded.jsonl` holds run 3's 55 requests (595 KB), `flood/recorded.jsonl` the flood run's 5 (74 KB), and
+`long/recorded.jsonl` run 4's 21 (232 KB), bodies only. Each live test rewrites its file, so runs 1 and 2 are kept here
+as numbers only.
 
 ## Caveats
 
 - **Labels and set.** The labels are one author's, the same person who wrote the transcripts, and the set is synthetic.
   The labels also miss some plausible knowledge: run 1's s29 warning counted against precision.
 - **Small samples.** There are 50 gold items, 10 already items and 6 nothing sessions, so the intervals are wide. The
-  recall intervals of run 2 (0.56–0.81) and run 3 (0.58–0.83) do not rule out a recall under 0.60. The flood set is one
-  session.
+  recall intervals of run 2 (0.56–0.81) and run 3 (0.58–0.83) do not rule out a recall under 0.60. The flood set and the
+  long-session set are one session each.
 - **Not an independent test.** Run 2 was tuned on the set it is scored on: one round, chosen after reading run 1's
   errors. Run 3 keeps that tuning; its own changes came from the real sessions and from run 1's doubles, not from this
   set's misses. The owner's real sessions (§11.4) are the independent check.
