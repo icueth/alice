@@ -38,6 +38,13 @@ DISTILL_DEFAULT_FILE="$R/etc/alice/distill.default"
 # other cloud service carries a secret.
 SECRETS_DEFAULT_FILE="$R/etc/alice/secrets.default"
 BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
+# A schema migration first copies a tenant's database to alice-pre-migration-v<N>-<UTC time>.db in its backups
+# folder. `prune` keeps such a copy only until a daily backup newer than it exists for that tenant, and at most the
+# newest one in any case: it runs at the end of `upgrade` and once a day from this timer, which `add` and `upgrade`
+# install.
+PRUNE_SERVICE="$R/etc/systemd/system/alice-server-prune.service"
+PRUNE_TIMER="$R/etc/systemd/system/alice-server-prune.timer"
+REAL_SCRIPT=/usr/local/sbin/alice-server
 # The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
 # $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
 LIBDIR="$R/usr/local/lib/alice"; ORT_LIB=libonnxruntime.so.1
@@ -63,7 +70,7 @@ fi
 # A broken environment must never turn a removal into rm -rf /...: refuse to run with an empty root.
 : "${ETC:?}" "${TENANTS:?}" "${SRV:?}" "${ARCHIVES:?}" "${CADDY_D:?}" "${UNIT:?}" "${CADDYFILE:?}" "${BIN:?}" "${LOCK:?}"
 : "${LIBDIR:?}" "${MODEL_CACHE:?}" "${SELFTEST_TMP:?}" "${CADDY_DROPIN:?}" "${ADMIN_SOCK:?}" "${CADDY_LOG:?}"
-: "${ZONEINFO:?}" "${JEV_KEY_FILE:?}"
+: "${ZONEINFO:?}" "${JEV_KEY_FILE:?}" "${PRUNE_SERVICE:?}" "${PRUNE_TIMER:?}"
 
 HOST=""
 SELFTEST_WHY=""
@@ -86,6 +93,9 @@ usage: alice-server add <name> [--tz <IANA zone>]
        alice-server list
        alice-server upgrade <binary>
            (also the first install; a build of deploy/server/build-release brings its ONNX Runtime along)
+       alice-server prune
+           (removes the pre-migration copies a newer daily backup has replaced, and all but the newest of a tenant's;
+            upgrade runs it at its end and a daily timer runs it too)
        alice-server import <name> <palace-dir> [--dry-run]
            (a real import MOVES and consumes <palace-dir>; --dry-run works on a copy and keeps it)
        alice-server adopt <name> <backup-file> [--cloud-denied <slug,slug...>]
@@ -237,6 +247,31 @@ WantedBy=multi-user.target
 EOF
 }
 
+# The daily prune of pre-migration copies (see prune_tenant). It takes the lock shared, like an import: a run during an
+# upgrade, add or other change skips that day (the upgrade prunes at its end).
+write_prune_timer() {
+  put "$PRUNE_SERVICE" 0644 <<EOF
+[Unit]
+Description=Alice: remove the pre-migration copies a newer daily backup has replaced
+
+[Service]
+Type=oneshot
+ExecStart=$REAL_SCRIPT prune
+EOF
+  put "$PRUNE_TIMER" 0644 <<'EOF'
+[Unit]
+Description=Daily prune of Alice's pre-migration copies
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 write_caddyfile() {
   # The first time, keep the controller's own file so the deployment task can diff it.
   if [ -f "$CADDYFILE" ] && [ ! -e "$CADDYFILE.pre-alice" ]; then
@@ -352,10 +387,13 @@ ensure_base() {
   chmod 0755 "$ETC" "$TENANTS" "$SRV" "$CADDY_D"
   chmod 0700 "$ARCHIVES"
   write_unit
+  write_prune_timer
   mkdir -p "$(dirname "$CADDY_DROPIN")"
   write_caddy_dropin
   write_caddyfile_checked
   systemctl daemon-reload
+  systemctl enable --now alice-server-prune.timer >/dev/null 2>&1 \
+    || printf 'alice-server: WARNING: the daily prune timer could not be started; run: systemctl enable --now alice-server-prune.timer\n' >&2
 }
 
 free_kb() { # on the disk that holds $SRV (before the first add, its nearest existing parent)
@@ -808,6 +846,97 @@ cmd_upgrade() { # binary (also the first install)
   else
     say "installed $("$BIN" --version)"
   fi
+  # Every tenant came back: the copy a migration made now is the newest, kept until a newer daily backup exists; the
+  # older ones go. A server set up before the prune existed gets its timer here.
+  prune_all || printf 'alice-server: WARNING: some pre-migration copies could not be removed (see above); run alice-server prune\n' >&2
+  { write_prune_timer && systemctl daemon-reload && systemctl enable --now alice-server-prune.timer >/dev/null 2>&1; } \
+    || printf 'alice-server: WARNING: the daily prune timer could not be installed; run: systemctl enable --now alice-server-prune.timer\n' >&2
+}
+
+# --- pre-migration copies -----------------------------------------------------------------------------------------
+# A schema migration copies the tenant's database before it changes it: alice-pre-migration-v<N>-<UTC time>.db in the
+# tenant's backups folder. The daemon keeps each copy 30 days and the newest for ever, so every upgrade with a migration
+# left one more full copy per tenant, and they filled the disk. A copy is the way back from a migration that went wrong;
+# once a daily backup newer than it exists, the tenant has run on the migrated database since and that backup is a newer
+# restore point. So a copy is kept only until a daily backup newer than it exists for its tenant, and at most the newest
+# one per tenant in any case. Daily backups are alice-<UTC time>.db; one being written has a name that starts with a dot.
+
+stamp_digits() { # file-name daily|pre: the backup's UTC time as 14 digits, or nothing when it is no backup of that kind
+  local re
+  case "$2" in
+    daily) re='^alice-([0-9]{8})T([0-9]{6})Z\.db$' ;;
+    *) re='^alice-pre-migration-v[0-9]+-([0-9]{8})T([0-9]{6})Z\.db$' ;;
+  esac
+  if [[ "$1" =~ $re ]]; then printf '%s%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; fi
+}
+
+PRUNED=0; PRUNED_BYTES=0
+prune_tenant() { # name: removes, as the tenant's own user, the copies the rule does not keep, and prints each one
+  local n=$1 dir="$SRV/$1/backups" f b t daily="" keep="" keep_t="" why bytes failed=0
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/alice-*.db; do
+    [ -f "$f" ] || continue
+    t=$(stamp_digits "$(basename -- "$f")" daily)
+    if [ -n "$t" ] && { [ -z "$daily" ] || [ "$((10#$t))" -gt "$((10#$daily))" ]; }; then daily=$t; fi
+  done
+  # The newest copy (the later name when two share a time) is the one that may stay.
+  for f in "$dir"/alice-pre-migration-v*.db; do
+    [ -f "$f" ] || continue
+    b=$(basename -- "$f")
+    t=$(stamp_digits "$b" pre)
+    [ -n "$t" ] || continue
+    if [ -z "$keep" ] || [ "$((10#$t))" -gt "$((10#$keep_t))" ] \
+      || { [ "$t" = "$keep_t" ] && [[ "$b" > "$(basename -- "$keep")" ]]; }; then
+      keep=$f; keep_t=$t
+    fi
+  done
+  [ -n "$keep" ] || return 0
+  if [ -n "$daily" ] && [ "$((10#$daily))" -gt "$((10#$keep_t))" ]; then keep=""; fi
+  for f in "$dir"/alice-pre-migration-v*.db; do
+    if [ ! -f "$f" ] || [ "$f" = "$keep" ]; then continue; fi
+    b=$(basename -- "$f")
+    t=$(stamp_digits "$b" pre)
+    [ -n "$t" ] || continue
+    if [ -n "$daily" ] && [ "$((10#$daily))" -gt "$((10#$t))" ]; then
+      why="a newer daily backup exists"
+    else
+      why="a newer pre-migration copy is kept"
+    fi
+    bytes=$(file_bytes "$f") || bytes=0
+    # The tenant's own user removes it: root never deletes inside a home its tenant controls.
+    if sudo -u "alice-$n" rm -f -- "$f" && [ ! -e "$f" ]; then
+      say "removed $n's $b ($(gb "$((bytes / 1024))") GB: $why)"
+      PRUNED=$((PRUNED + 1)); PRUNED_BYTES=$((PRUNED_BYTES + bytes))
+    else
+      printf 'alice-server: WARNING: could not remove %s\n' "$f" >&2
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+prune_all() { # every tenant, the team store included; false when a copy could not be removed
+  local t failed=0
+  PRUNED=0; PRUNED_BYTES=0
+  for t in $(all_tenants); do
+    prune_tenant "$t" || failed=1
+  done
+  if [ "$PRUNED" = 1 ]; then
+    say "pruned 1 pre-migration copy, $(gb "$((PRUNED_BYTES / 1024))") GB freed"
+  elif [ "$PRUNED" -gt 1 ]; then
+    say "pruned $PRUNED pre-migration copies, $(gb "$((PRUNED_BYTES / 1024))") GB freed"
+  else
+    say "no pre-migration copy to prune"
+  fi
+  return "$failed"
+}
+
+cmd_prune() {
+  if ! take_prune_lock; then
+    say "skipped: another alice-server command is running (an upgrade prunes at its end; the timer runs again tomorrow)"
+    return 0
+  fi
+  prune_all
 }
 
 canon_dir() { # prints the physical path of a directory; fails when it is not one
@@ -1156,6 +1285,12 @@ take_shared_lock() {
   flock -s -n 9 || die "another alice-server command (upgrade, add, remove, adopt, rotate, jev-key) is running; wait until it ends, then import"
 }
 
+take_prune_lock() { # shared, like an import, and never waiting: false while a command that changes the server runs
+  mkdir -p "$(dirname "$LOCK")"
+  exec 9>"$LOCK"
+  flock -s -n 9
+}
+
 main_add() { # add [--team] <name> [--tz <IANA zone>]
   local team=0 name="" tz="" tz_given=0
   shift
@@ -1188,6 +1323,7 @@ main() {
     list) cmd_list ;;
     setup-line) [[ $# -eq 2 ]] || { usage; exit 2; }; valid_name "$2"; cmd_setup_line "$2" ;;
     upgrade) [[ $# -eq 2 ]] || { usage; exit 2; }; take_lock; cmd_upgrade "$2" ;;
+    prune) [[ $# -eq 1 ]] || { usage; exit 2; }; cmd_prune ;;
     import) [[ $# -ge 3 && $# -le 4 ]] || { usage; exit 2; }; valid_name "$2"; take_shared_lock; cmd_import "$2" "$3" "${4:-}" ;;
     cli) [[ $# -ge 3 ]] || { usage; exit 2; }; valid_name "$2"; cmd_cli "${@:2}" ;;
     adopt)

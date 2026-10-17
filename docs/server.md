@@ -70,6 +70,7 @@ alice-server rotate <name>
 alice-server setup-line <name>
 alice-server list
 alice-server upgrade <binary>
+alice-server prune
 alice-server import <name> <palace-dir> [--dry-run]
 alice-server adopt <name> <backup-file> [--cloud-denied <slug,slug...>]
 alice-server jev-key set
@@ -135,7 +136,18 @@ free: 19.0 GB on /; remove archives: 0 MB
 
 First install this release's `deploy/server/alice-server` as `/usr/local/sbin/alice-server`, as in the one-time setup: an older script misses what the new release needs (the retention pin, `setup-line`, `distill`).
 
-`alice-server upgrade <binary>` checks that the new binary runs, then runs its self-test: `alice model check` in a throwaway home under `/tmp` loads the embedding model and embeds one text. The model is kept in `/var/cache/alice-server/models` (about 136 MB, downloaded the first time). If the self-test dies (an "Illegal instruction" is named as such), fails or takes longer than 5 minutes, nothing is installed. Otherwise it keeps the current binary as `/usr/local/bin/alice.prev` and the current ONNX Runtime as `/usr/local/lib/alice/libonnxruntime.so.1.prev`, installs the new ones (the library when the binary comes from `build-release`, from `../lib/alice` beside it), and self-tests the installed binary. Then it restarts every tenant and waits for each to answer. If the installed binary fails its self-test, or any tenant does not come back, it restores the previous binary and library, restarts everything again and exits with an error (naming the tenants that failed). It prints the free space before the restarts, because a schema migration copies each tenant's database once. On a server with no binary yet it is the first install.
+`alice-server upgrade <binary>` checks that the new binary runs, then runs its self-test: `alice model check` in a throwaway home under `/tmp` loads the embedding model and embeds one text. The model is kept in `/var/cache/alice-server/models` (about 136 MB, downloaded the first time). If the self-test dies (an "Illegal instruction" is named as such), fails or takes longer than 5 minutes, nothing is installed. Otherwise it keeps the current binary as `/usr/local/bin/alice.prev` and the current ONNX Runtime as `/usr/local/lib/alice/libonnxruntime.so.1.prev`, installs the new ones (the library when the binary comes from `build-release`, from `../lib/alice` beside it), and self-tests the installed binary. Then it restarts every tenant and waits for each to answer. If the installed binary fails its self-test, or any tenant does not come back, it restores the previous binary and library, restarts everything again and exits with an error (naming the tenants that failed). It prints the free space before the restarts, because a schema migration copies each tenant's database once. When every tenant is back it runs [prune](#prune), and it installs the daily prune timer on a server set up before it existed. On a server with no binary yet it is the first install.
+
+#### prune
+
+A schema migration first copies the tenant's database to `alice-pre-migration-v<N>-<UTC time>.db` in its `backups` folder, the way back if the migration goes wrong. The daemon alone keeps each copy for 30 days and the newest for ever, so every upgrade with a migration left one more full copy per tenant, enough to fill the disk. `alice-server prune` keeps a copy only until a daily backup newer than it exists for that tenant (the tenant has run on the migrated database since, and that backup is a newer restore point), and at most the newest copy per tenant in any case. It prints each copy it removes, its size and why, then the total:
+
+```
+removed ann's alice-pre-migration-v8-20261015T090000Z.db (1.2 GB: a newer daily backup exists)
+pruned 1 pre-migration copy, 1.2 GB freed
+```
+
+It runs by itself at the end of every `upgrade` (only when every tenant came back: a failed upgrade keeps the copies) and once a day from the systemd timer `alice-server-prune.timer`, which `add` and `upgrade` install and which runs `/usr/local/sbin/alice-server prune`. Each tenant's own user removes its files. It never touches daily, manual or before-restore backups. While another `alice-server` command runs (an upgrade, `add`, `remove` and the like) it skips that day and says so; imports do not stop it. Check the timer with `systemctl list-timers alice-server-prune.timer` and its last run with `journalctl -u alice-server-prune`.
 
 #### import
 
@@ -287,7 +299,7 @@ The disk is not grown for Alice, so the budget matters. Plan for these uses:
 | Backups per tenant | 2 daily, no weekly (`ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0`); a tenant cannot make manual backups. They stay in the tenant's own `backups` folder: do not set `ALICE_BACKUP_DIR` in a tenant file (a directory outside the home fails that tenant's settings closed) |
 | `remove` archives | a gzip of the removed home without its model, in `/srv/alice/backups` |
 | Captured transcripts | about 16.8 KB per chunk with its two backups, as for a drawer: at the owner's measured pace (about 1,060 to 2,100 chunks a day, [benchmarks/sp2.md](benchmarks/sp2.md)) 3.2 to 6.4 GB at the 180-day retention |
-| Schema migrations | one copy of each database per migration: the newest is kept until the next one, older ones 30 days. After the SP2 upgrade a tenant holds two (from 0007 and 0008), 1 to 1.5 GB each for a large tenant |
+| Schema migrations | one copy of each database per migration, 1 to 1.5 GB for a large tenant: [prune](#prune) keeps it only until a newer daily backup exists, and at most the newest per tenant, so a tenant holds one for about a day after an upgrade with a migration |
 
 Rough totals: a large tenant uses about 4.4 GB with its two backups, before captured transcripts (up to about 6 GB more at 180 days, at the owner's pace). Three smaller tenants use about 1.1 GB each. If four large tenants share one 28 GB disk, they do not fit with a 3 GB reserve.
 
@@ -301,6 +313,7 @@ The guards act in this order:
 **When free space is under 3 GB:**
 
 - Delete old `remove` archives in `/srv/alice/backups` that you no longer need.
+- Run `alice-server prune` to remove the pre-migration copies a newer daily backup has replaced.
 - Set `ALICE_BACKUP_DAILY=1` in that tenant's file under `/etc/alice/tenants/`, then restart the tenant: `systemctl restart alice@<name>`.
 - Copy anything you want to keep off the machine first.
 
