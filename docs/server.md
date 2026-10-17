@@ -532,6 +532,8 @@ All under `~/.config/alice` (mode 0700):
 | `claude-marketplace/` | 0700 | A local Claude Code plugin marketplace, `alice-local`, holding the plugin `alice-capture` at the tenant's version |
 | `codex-hooks.written` | 0600 | A copy of the Codex `hooks.json` setup wrote, so a re-run or an uninstall never touches a file the person edited |
 
+Beside Codex's `config.toml`, when setup or uninstall changed it: `config.toml.bak-alice` (0600), the file as it was just before.
+
 **Claude Code.** Setup runs `claude plugin marketplace add ~/.config/alice/claude-marketplace` (or `marketplace update alice-local` on a re-run) and `claude plugin install alice-capture@alice-local --scope user`. Claude Code then merges the plugin's hooks itself. When the `claude` command is missing or fails, setup prints the two commands to type inside Claude Code instead: `/plugin marketplace add "<that folder>"` and `/plugin install alice-capture@alice-local`. The plugin runs this on `SessionStart`, `Stop`, `SubagentStop`, `PreCompact` and `SessionEnd`, with a 10-second timeout:
 
 ```
@@ -540,7 +542,11 @@ sh "$HOME/.config/alice/alice-capture.sh" hook claude-code || true
 
 `|| true` keeps a missing script (after an uninstall, say) from ever failing an agent's turn.
 
-**Codex.** When `codex` is installed, setup writes `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) with the same five events and `hook codex` (`SessionEnd` gets 3 seconds, Codex's limit). It writes the file only when it does not exist, or is still exactly the one setup wrote before. When the person has a `hooks.json` of their own, or `[hooks]` tables in `config.toml`, it changes nothing and prints the entries to add. Either way, **Codex runs the hooks only after the person trusts them: open Codex, type `/hooks`, and trust the Alice entries.**
+**Codex.** When `codex` is installed, setup writes `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) with the same five events and `hook codex` (`SessionEnd` gets 3 seconds, Codex's limit). It writes the file only when it does not exist, or is still exactly the one setup wrote before. When the person has a `hooks.json` of their own, it changes nothing and prints the entries to add.
+
+When `config.toml` already has hooks of its own (`[[hooks.<Event>]]` tables, such as OpenRig's), Codex reads one format per layer, so setup puts the same five hooks there instead: `[[hooks.<Event>]]` tables in a marked block (`# >>> alice capture (Codex) >>>` … `# <<< alice capture (Codex) <<<`) at the end of the file, after a copy of the old file to `config.toml.bak-alice`. No other line changes. The edit is checked with `python3`'s TOML reader (Python 3.11 or later, or `tomli`): the new file is written only if it reads back as what the old one meant plus Alice's five hooks. A block that is already Alice's is left byte for byte (so Codex keeps trusting it), and tables Codex puts inside it (its `[hooks.state."…"]` trust records) are kept. Without such a `python3`, or when the file cannot take the tables (an inline `hooks.<Event> = [...]` list), setup changes nothing and prints the block to add. Updates of the hook script do not touch the block; a re-run of setup repairs it.
+
+Either way, **Codex runs a new hook only after the person trusts it**, and setup never does that for them: the next time they open Codex it asks "Hooks need review", and they choose **Trust all and continue** (or review the Alice entries with `/hooks`). Setup's summary ends with that line.
 
 ### How it works
 
@@ -602,7 +608,7 @@ sh ~/.config/alice/alice-capture.sh uninstall
 - `stopped: <key>`: the server's cursor is past the file's end (the server already holds more of that session than the file has, for example after the file was replaced). Delete `~/.config/alice/state/<key>.offset` to start that transcript again.
 - `waiting: <key>`: the server took nothing at that size (no complete turn yet, or the tenant's rules for that project are not known right now); it is sent again when the file grows. Deleting the state file resets it.
 
-`uninstall` removes the plugin and the marketplace (or prints `/plugin uninstall alice-capture@alice-local` and `/plugin marketplace remove alice-local` to type in Claude Code), removes the Codex `hooks.json` only if it is still exactly the one setup wrote, and then asks before deleting the script, `state/`, `capture.conf`, `capture.log`, `paused-until` and `update-checked`. It never deletes `token` or `url`, which the MCP setup uses. Restart open Claude Code and Codex sessions afterwards, so none still runs the removed hooks.
+`uninstall` removes the plugin and the marketplace (or prints `/plugin uninstall alice-capture@alice-local` and `/plugin marketplace remove alice-local` to type in Claude Code), removes the Codex `hooks.json` only if it is still exactly the one setup wrote, takes Alice's block out of `config.toml` (exactly that block: other tables inside it, such as Codex's trust records, stay; the old file is kept as `config.toml.bak-alice`; a block that is not exactly Alice's needs `python3` 3.11 or later, or it is left and the person told to remove it), and then asks before deleting the script, `state/`, `capture.conf`, `capture.log`, `paused-until` and `update-checked`. It never deletes `token` or `url`, which the MCP setup uses. Restart open Claude Code and Codex sessions afterwards, so none still runs the removed hooks.
 
 ### What the admin's script provides
 
@@ -636,12 +642,12 @@ The script's first upload of a session the machine already captured starts at of
 | `capture.log`: "the token was refused; run the setup command again (capture is paused for an hour)" | `alice-server rotate` replaced the token | Run the setup line again: it asks for the new token and ends the pause. Writing the token file alone waits out the hour |
 | `status` says `server: unreachable` | No connection, or the tenant is down | Nothing is lost; capture resumes at the next event |
 | `capture.log`: "… holds a JSON escape this script does not decode (such as \u); event skipped" | A path or folder name reached the hook in an escaped form | That event is skipped; tell the admin if it repeats |
-| Codex sessions are not captured | The hooks are not trusted yet, or the person has their own `hooks.json` | Trust them in Codex's `/hooks`; add the entries setup printed |
+| Codex sessions are not captured | The hooks are not trusted yet, or the person has their own `hooks.json` (or a `config.toml` setup could not add to) | Start Codex and choose **Trust all and continue** at "Hooks need review" (or trust them in `/hooks`); add the entries setup printed |
 | No briefing at session start | `briefing=off`, `capture.briefing = false`, a resumed session, or a server slower than 2 s | Check `status`; the agent still calls `context` itself |
 | Memories and transcripts of one repository in two projects | An MCP `?project=` pin differs from the folder name | See [Which project a captured session lands in](#which-project-a-captured-session-lands-in) |
 | `capture.log`: "capture hook update refused …" or "capture hook update check failed …" | The day's update check got no usable script; the installed one stays | Nothing: it tries again a day later. If it repeats, run the setup line again |
 | `capture.log`: "the plugin's hooks.json changed, and claude plugin update failed …" | An update changed the plugin's hooks, and the `claude` command did not reload them | Run the setup line again |
-| `capture.log`: "updated … hooks.json with the hook script; Codex runs the changed hooks only after you trust them again …" | An update changed the Codex hooks | Open Codex, type `/hooks`, and trust the Alice entries again |
+| `capture.log`: "updated … hooks.json with the hook script; Codex runs the changed hooks only after you trust them again …" | An update changed the Codex hooks | Open Codex and choose **Trust all and continue** at "Hooks need review" (or trust the Alice entries in `/hooks`) |
 
 ## Troubleshooting
 
