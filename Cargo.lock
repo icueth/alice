@@ -99,6 +99,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit",
  "tracing",
  "url",
  "windows-sys 0.61.2",
