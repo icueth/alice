@@ -86,8 +86,9 @@ skipped and counted; Alice reads only uncompressed rollouts.
 **Where it shows up.** Captured chunks are found by `recall` with `include_raw` (CLI: `alice recall --raw`) and by the raw
 fallback when few memories match. They never appear among the knowledge hits or in the `context` briefing.
 
-**Volume.** A turn renders to about 1-3 KB, about one chunk. Twenty sessions a day of about 50 turns each is roughly 1,000
-chunks a day.
+**Volume.** A turn with tool calls renders to many chunks: measured on the owner's real sessions, about 19 chunks per
+turn (801 for 43 turns, 3,403 for 182), 83 % of them from subagents, about 2,100 chunks a day of session time
+([benchmarks/sp2.md](benchmarks/sp2.md)).
 
 ## Local install and removal
 
@@ -194,7 +195,8 @@ It reuses `~/.config/alice/token` and `~/.config/alice/url`, installs the hook s
 a local marketplace, writes Codex's `hooks.json` when Codex is installed, and prints how to check and remove it.
 
 The tenant hook script updates itself from your Alice server once a day, over https, and updates the plugin's
-`hooks.json` when that changes. Re-run the setup line only to repair an install, and once after this release.
+`hooks.json` when that changes. Re-run the setup line only to repair an install, or once if `status` shows no
+`hook script:` line (a script from before self-updates).
 
 The check runs in the hook's background worker (never in the hook itself), at the first event a day or more after the
 last check and before that event's upload. It writes one line to `~/.config/alice/capture.log` when something happens:
@@ -225,7 +227,7 @@ Capture follows Alice's privacy rules, plus three of its own.
 
 ```toml
 [privacy]
-no_capture = true     # never capture agent sessions in this repository
+no_capture = true     # never capture agent sessions started in this repository
 ```
 
 Like the other keys of that file it can only tighten. A project file that is broken or cannot be read **fails closed**:

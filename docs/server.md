@@ -96,7 +96,7 @@ they open Claude Code or Codex and say:
   Read docs/setup-server.md from the Alice repository (https://github.com/icueth/alice) and follow every step.
   My address is https://<host>/u/<name> and my token file is ~/Downloads/alice-token.
 That keeps the token in ~/.config/alice/token (0600), connects the MCP and sets up capture. To set up capture
-alone, or again after an upgrade (alice-server setup-line <name> prints it again):
+alone, or to repair it (alice-server setup-line <name> prints it again):
   curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>
 ```
 
@@ -130,6 +130,8 @@ free: 19.0 GB on /; remove archives: 0 MB
 `list` shows one row per tenant, then the free space on the disk that holds `/srv/alice` and the size of the `remove` archives. Below 3 GB free it prints a warning. It never prints a token.
 
 #### upgrade
+
+First install this release's `deploy/server/alice-server` as `/usr/local/sbin/alice-server`, as in the one-time setup: an older script misses what the new release needs (the retention pin, `setup-line`, `distill`).
 
 `alice-server upgrade <binary>` checks that the new binary runs, then runs its self-test: `alice model check` in a throwaway home under `/tmp` loads the embedding model and embeds one text. The model is kept in `/var/cache/alice-server/models` (about 136 MB, downloaded the first time). If the self-test dies (an "Illegal instruction" is named as such), fails or takes longer than 5 minutes, nothing is installed. Otherwise it keeps the current binary as `/usr/local/bin/alice.prev` and the current ONNX Runtime as `/usr/local/lib/alice/libonnxruntime.so.1.prev`, installs the new ones (the library when the binary comes from `build-release`, from `../lib/alice` beside it), and self-tests the installed binary. Then it restarts every tenant and waits for each to answer. If the installed binary fails its self-test, or any tenant does not come back, it restores the previous binary and library, restarts everything again and exits with an error (naming the tenants that failed). It prints the free space before the restarts, because a schema migration copies each tenant's database once. On a server with no binary yet it is the first install.
 
@@ -258,9 +260,10 @@ The disk is not grown for Alice, so the budget matters. Plan for these uses:
 | Scheduled backups | one copy of the database each; about 1-1.5 GB for a large tenant |
 | Backups per tenant | 2 daily, no weekly (`ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0`); a tenant cannot make manual backups. They stay in the tenant's own `backups` folder: do not set `ALICE_BACKUP_DIR` in a tenant file (a directory outside the home fails that tenant's settings closed) |
 | `remove` archives | a gzip of the removed home without its model, in `/srv/alice/backups` |
-| Schema migrations | one extra copy of each database, kept 30 days |
+| Captured transcripts | about 16.8 KB per chunk with its two backups, as for a drawer: at the owner's measured pace (about 1,060 to 2,100 chunks a day, [benchmarks/sp2.md](benchmarks/sp2.md)) 3.2 to 6.4 GB at the 180-day retention |
+| Schema migrations | one copy of each database per migration: the newest is kept until the next one, older ones 30 days. After the SP2 upgrade a tenant holds two (from 0007 and 0008), 1 to 1.5 GB each for a large tenant |
 
-Rough totals: a large tenant uses about 4.4 GB with its two backups. Three smaller tenants use about 1.1 GB each. If four large tenants share one 28 GB disk, they do not fit with a 3 GB reserve.
+Rough totals: a large tenant uses about 4.4 GB with its two backups, before captured transcripts (up to about 6 GB more at 180 days, at the owner's pace). Three smaller tenants use about 1.1 GB each. If four large tenants share one 28 GB disk, they do not fit with a 3 GB reserve.
 
 The guards act in this order:
 
@@ -469,7 +472,7 @@ curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<h
 
 - **Run it after the MCP setup.** [setup-server.md](setup-server.md) (which an agent can run for the person) writes `~/.config/alice/token` and `~/.config/alice/url` first; the setup line then asks nothing. Without those files it asks for the token once, on the terminal with typing hidden, and writes both files (0600, in a 0700 `~/.config/alice`). It never takes the token from the command line or the environment, and never keeps a second copy.
 - **Nothing is written before the token is checked.** The script checks the address (`https://`, or `http://` to `127.0.0.1` or `localhost` for tests) and asks `GET /api/v1/capture/status` whether the token works. A refused token from the file is reported, and the script asks once for a new one. Pointed at a local daemon instead of a tenant, it stops and says so.
-- **Updates.** The tenant hook script updates itself from your Alice server once a day, over https, and updates the plugin's `hooks.json` when that changes. Re-run the setup line only to repair an install, and once after this release. So after an `alice-server upgrade` that changes the capture scripts, nobody has to do anything: each machine picks the new script up within a day, at its next agent event. A re-run of the line updates everything in place, keeps the person's `briefing=off` choice, and reuses `~/.config/alice/token` and `~/.config/alice/url` without asking.
+- **Updates.** The tenant hook script updates itself from your Alice server once a day, over https, and updates the plugin's `hooks.json` when that changes. Re-run the setup line only to repair an install, or once if `status` shows no `hook script:` line (a script from before self-updates). So after an `alice-server upgrade` that changes the capture scripts, nobody has to do anything: each machine picks the new script up within a day, at its next agent event. A re-run of the line updates everything in place, keeps the person's `briefing=off` choice, and reuses `~/.config/alice/token` and `~/.config/alice/url` without asking.
 - **Hooks load in new sessions.** The person starts a new Claude Code (or Codex) session afterwards.
 
 `GET /api/v1/capture/setup.sh` and `GET /api/v1/capture/hook.sh` are public, like `/api/v1/ping`: static text compiled into the binary, with no secret and no address, behind the Host and Origin checks but no token. The hook script is served with its version line filled in: the first 12 hex digits of the SHA-256 of the script as built into the server, before that line is filled in, so a machine sees a new version exactly when the script changed.
@@ -535,16 +538,16 @@ The script names the project after the folder of the git repository the session 
 
 ### Retention
 
-Captured transcripts are kept **180 days** on every tenant, pinned by the line `ALICE_CAPTURE_RAW_RETENTION=180d` in `/etc/alice/tenants/<name>.env`. The environment wins over the tenant's `config.toml`, so a person's own settings cannot keep them longer; the admin changes the line (`90d` for the heaviest tenant, say) and runs `systemctl restart alice@<name>`. The daily job `capture_retention` deletes only captured chunks: imported MemPalace history and every memory stay, distilled ones included. `alice-server add` writes the line, and `upgrade` adds it to tenants made before it (keeping one the admin changed) and prints `captured transcripts kept 180d for: <names>`. Without the line, the open-source default applies: captured transcripts are kept forever (`capture.raw_retention = "forever"`).
+Captured transcripts are kept **180 days** on every tenant, pinned by the line `ALICE_CAPTURE_RAW_RETENTION=180d` in `/etc/alice/tenants/<name>.env`. The environment wins over the tenant's `config.toml`, so a person's own settings cannot keep them longer; the admin changes the line (`90d` for the heaviest tenant, say) and runs `systemctl restart alice@<name>`. The daily job `capture_retention` deletes only captured chunks: imported MemPalace history and every memory stay, distilled ones included. `alice-server add` writes the line, and `upgrade` adds it to tenants made before it (keeping one the admin changed) and prints `captured transcripts kept 180d for: <names>`. To keep a tenant's transcripts for good, set the line to `ALICE_CAPTURE_RAW_RETENTION=forever`; do not delete it, because `upgrade` adds `180d` back to a tenant without the line.
 
-As an estimate, carrying over the 16.8 KB per imported drawer (with its two backups) that the [Disk budget](#disk-budget) measures to captured chunks, a heavy user (about 1,000 chunks a day) holds about 3.0 GB of captured transcripts at 180 days, and a lighter one (300 a day) about 0.9 GB. Captured chunks have not been measured yet.
+As an estimate, carrying over the 16.8 KB per imported drawer (with its two backups) that the [Disk budget](#disk-budget) measures to captured chunks, the owner's measured pace (about 1,060 to 2,100 chunks a day, [benchmarks/sp2.md](benchmarks/sp2.md)) holds 3.2 to 6.4 GB of captured transcripts at 180 days, and a lighter user (300 a day) about 0.9 GB.
 
 ### Distillation and the shared Jev key
 
-On this server Jev is on for everyone with the owner's one key (see [jev-key](#jev-key)): once `alice-server jev-key set` has provisioned it, `add` sets `judge.provider = jev` for each new tenant, and `jev-key set` (a rotation too) changes only the key. Distillation (`distill.provider = jev`) is a per-tenant choice the admin makes with `alice-server distill on|off <name>|--all`; `alice-server distill status` shows each tenant's setting. New tenants follow `/etc/alice/distill.default` (one line, `on` or `off`; `off` when the file is missing), see [distill](#distill). The open-source default is off, and without a server key distillation cannot run.
+On this server Jev is on for everyone with the owner's one key (see [jev-key](#jev-key)): once `alice-server jev-key set` has provisioned it, `add` sets `judge.provider = jev` for each new tenant, and `jev-key set` (a rotation too) changes only the key. Distillation (`distill.provider = jev`) is a per-tenant choice the admin makes with `alice-server distill on|off <name>|--all`; `alice-server distill status` shows each tenant's setting. New tenants follow `/etc/alice/distill.default` (one line, `on` or `off`; `off` when the file is missing), see [distill](#distill). A tenant added before the key was set stays on the offline judge, and its distillation waits: set its judge with `alice-server cli <name> config set judge.provider jev`. The open-source default is off, and without a server key distillation cannot run.
 
 - A person never sees or supplies the key. The setup line's summary says whether distillation is on (`distillation: on`), from the tenant's own setting.
-- **Spend is per tenant**, inside its judge budget (`ALICE_JUDGE_DAILY_BUDGET_USD`, 1.00 USD a day by default), of which distillation may use half (`distill.budget_share = 0.5`). **The deployment-wide ceiling** is the number of daemons times that budget: 5.00 USD a day with four people and the team store, of which distillation can be at most 4 × 0.50 = 2.00 USD (the team store captures nothing). Expected spend is far lower, about 0.001-0.003 USD per distilled session.
+- **Spend is per tenant**, inside its judge budget (`ALICE_JUDGE_DAILY_BUDGET_USD`, 1.00 USD a day by default), of which distillation may use half (`distill.budget_share = 0.5`). **The deployment-wide ceiling** is the number of daemons times that budget: 5.00 USD a day with four people and the team store, of which distillation can be at most 4 × 0.50 = 2.00 USD (the team store captures nothing). Expected spend is far lower: 0.0012 to 0.0224 USD per distilled session, measured on three real sessions ([benchmarks/sp2.md](benchmarks/sp2.md)).
 - A tenant's `privacy.cloud_denied_projects` are never sent to Jev; their sessions are captured but not distilled.
 - When distillation is first switched on, the sessions captured in the last 7 days are distilled, newest first; older ones only on request (`alice-server cli <name> capture distill <session-id>`).
 

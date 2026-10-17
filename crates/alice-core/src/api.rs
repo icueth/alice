@@ -679,8 +679,7 @@ pub struct Health {
     pub tenant: bool,
 }
 
-/// The capture line of [`Health`] (SP2 spec §8.4). The distill fields keep their defaults until
-/// distillation exists.
+/// The capture line of [`Health`] (SP2 spec §8.4), with distillation's state and counts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CaptureHealth {
     /// Sessions that captured something in the last 24 hours.

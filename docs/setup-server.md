@@ -100,7 +100,9 @@ printf 'header = "Authorization: Bearer %s"\n' "$(cat ~/.config/alice/token)" \
   | curl -q -fsS -K - "$(head -n 1 ~/.config/alice/url)/api/v1/stats" -o /dev/null -w '%{http_code}\n'
 ```
 
-The last command must print `200`. If it prints `401`, the token is wrong: stop and tell the person to ask the admin.
+The last command must print `200`. If it prints `401` and the person named a token file (a rotated token, say), install
+that file over the old token with the `install -m 600` line above and check again; if it still prints `401`, or they
+named none, the token is wrong: stop and tell the person to ask the admin.
 If you installed it from a file, ask the person whether to delete that file now (the installed copy is the one in use),
 and run `rm "<token file>"` only if they say yes.
 
@@ -170,7 +172,9 @@ If a `[mcp_servers.alice]` table already exists, do not edit it: you may not loo
 in `url`), and wait until they say it is done. Codex reads the token from `ALICE_TOKEN` and the project from
 `ALICE_PROJECT`; the wrapper below sets both for Codex alone.
 
-Add this marked block to the person's shell profile (`~/.zshrc` for zsh, `~/.bashrc` for bash; create it if missing). If
+Add this marked block to the person's shell profile (`~/.zshrc` for zsh, `~/.bashrc` for bash on Linux,
+`~/.bash_profile` for bash on macOS, whose Terminal starts login shells that do not read `~/.bashrc`; create it if
+missing). If
 `grep -c '# >>> alice >>>'` finds an old block, replace everything between the markers (an older block exported
 `ALICE_TOKEN`; this one does not); otherwise append it with a leading newline:
 
@@ -199,7 +203,8 @@ default (its `shell_environment_policy`). The wrapper exists only in a shell tha
 some other way, such as from an editor, gets neither the token nor the project, so tell the person to start Codex from a
 terminal.
 
-Check with a fresh shell, without printing values: `zsh -ic 'type codex | head -1'` (or `bash -ic` for bash) must say
+Check with a fresh shell, without printing values: `zsh -ic 'type codex | head -1'` (or `bash -lc` on macOS, `bash -ic`
+on Linux) must say
 that `codex` is a shell function. Then `codex mcp list` must list `alice`. If Codex reports a configuration error,
 restore `~/.codex/config.toml.bak-alice` and tell the person.
 
@@ -285,8 +290,8 @@ sh ~/.config/alice/alice-capture.sh status
 - If setup says the token was refused, go back to Step 1. If it says the address is "a local Alice daemon, not a server
   tenant", the address is wrong.
 - **Updates.** The tenant hook script updates itself from your Alice server once a day, over https, and updates the
-  plugin's `hooks.json` when that changes. Re-run the setup line only to repair an install, and once after this
-  release. A re-run is safe: it reuses `~/.config/alice/token` and `~/.config/alice/url` without asking, keeps the
+  plugin's `hooks.json` when that changes. Re-run the setup line only to repair an install, or once if `status`
+  shows no `hook script:` line (a script from before self-updates). A re-run is safe: it reuses `~/.config/alice/token` and `~/.config/alice/url` without asking, keeps the
   person's briefing choice, and replaces the script and the plugin with the server's current ones. Each update, or
   refused update, is one line in `~/.config/alice/capture.log` (`capture hook updated …`, `capture hook update refused
   …`; [capture.md](capture.md#server-tenants) lists them). An address on plain `http://` (only for a test server on

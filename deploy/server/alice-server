@@ -553,7 +553,7 @@ cmd_add() { # name team(0|1) tz tz-given(0|1)
   say "  Read docs/setup-server.md from the Alice repository (https://github.com/icueth/alice) and follow every step."
   say "  My address is $(url "$name") and my token file is ~/Downloads/alice-token."
   say "That keeps the token in ~/.config/alice/token (0600), connects the MCP and sets up capture. To set up capture"
-  say "alone, or again after an upgrade (alice-server setup-line $name prints it again):"
+  say "alone, or to repair it (alice-server setup-line $name prints it again):"
   say "  $(setup_line "$name")"
 }
 

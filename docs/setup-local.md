@@ -67,23 +67,27 @@ rustup update stable
 ### Step 1: Build and install
 
 ```sh
-cargo install --git https://github.com/icueth/alice alice-memory --locked
+cargo install --git https://github.com/icueth/alice alice-memory --locked --target-dir ~/.cache/alice-build
 ```
 
-This takes several minutes. It installs the `alice` binary into `~/.cargo/bin`. (From a checkout of the repository,
-`cargo install --path crates/alice --locked` does the same.) Then:
+This takes several minutes, more than a shell call's usual 2-minute timeout: run it in the background or with a timeout
+of 15 minutes. The `--target-dir` keeps what was built, so a retry resumes instead of starting over. It installs the
+`alice` binary into `~/.cargo/bin`. (From a checkout of the repository, `cargo install --path crates/alice --locked`
+does the same.) Then:
 
 ```sh
 ALICE_BIN=$(command -v alice) && echo "$ALICE_BIN"
 alice --version
 alice model fetch
+alice model check
 ```
 
 `ALICE_BIN` must be an absolute path (normally `~/.cargo/bin/alice`). If `command -v alice` finds nothing, add
 `~/.cargo/bin` to `PATH` for this shell (`. "$HOME/.cargo/env"`) and try again. Your shell variables may not survive
 from one command to the next, so every block below that uses it starts with `ALICE_BIN=$(command -v alice) || exit 1`
 (it stops there, rather than writing an empty path, when `alice` is not on `PATH`).
-`alice model fetch` downloads the embedding model (about 136 MB) into `~/.alice/models` once.
+`alice model fetch` downloads the embedding model (about 136 MB) into `~/.alice/models` once, and `alice model check`
+loads it: if it fails (on Linux x86-64, a CPU without AVX2 cannot run it), stop and report what it says.
 
 ### Step 2: Run the daemon at login
 
