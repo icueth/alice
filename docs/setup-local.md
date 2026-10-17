@@ -73,7 +73,8 @@ alice model fetch
 
 `ALICE_BIN` must be an absolute path (normally `~/.cargo/bin/alice`). If `command -v alice` finds nothing, add
 `~/.cargo/bin` to `PATH` for this shell (`. "$HOME/.cargo/env"`) and try again. Your shell variables may not survive
-from one command to the next: set `ALICE_BIN=$(command -v alice)` again in every command below that uses it.
+from one command to the next, so every block below that uses it starts with `ALICE_BIN=$(command -v alice) || exit 1`
+(it stops there, rather than writing an empty path, when `alice` is not on `PATH`).
 `alice model fetch` downloads the embedding model (about 136 MB) into `~/.alice/models` once.
 
 ### Step 2: Run the daemon at login
@@ -99,6 +100,7 @@ claude mcp list 2>/dev/null | grep -c '^alice:'
 If that prints `0`:
 
 ```sh
+ALICE_BIN=$(command -v alice) || exit 1
 claude mcp add --scope user alice -- "$ALICE_BIN" mcp
 ```
 
@@ -109,6 +111,7 @@ it still fails, report the exact status line. Do not run `claude mcp get alice`.
 drops comments and blocks other tools manage. Back the file up and append one table:
 
 ```sh
+ALICE_BIN=$(command -v alice) || exit 1
 mkdir -p ~/.codex && touch ~/.codex/config.toml
 cp ~/.codex/config.toml ~/.codex/config.toml.bak-alice
 if [ "$(grep -c '^\[mcp_servers\.alice\]' ~/.codex/config.toml)" = 0 ]; then
@@ -219,6 +222,7 @@ If none, skip this step. If some exist, ask the person once: **"Stop using MemPa
      serves Alice's tools and the `mempalace_*` ones; two would list Alice's tools twice:
 
      ```sh
+     ALICE_BIN=$(command -v alice) || exit 1
      claude mcp remove alice -s user
      claude mcp add --scope user plugin_mempalace_mempalace -- "$ALICE_BIN" mcp
      ```
@@ -251,8 +255,9 @@ alice config set distill.provider jev
 alice doctor
 ```
 
-The `distill` line of `alice doctor` must say `jev`. If it says no key is set, the key step did not work; ask the person
-to run it again.
+The `distill` line of `alice doctor` must say `jev`. If `alice doctor` says distillation waits for the Jev judge to
+start, run it again after a few seconds. If it says no key is set, the key step did not work; ask the person to run it
+again.
 
 ### Step 9: Check it works
 

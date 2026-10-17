@@ -112,8 +112,8 @@ names another file). For each of `SessionStart`, `Stop`, `SubagentStop`, `PreCom
 '<path to alice>' hook <event> --agent claude-code || true
 ```
 
-with a 10-second timeout as a guard. The path is the full path of the `alice` you ran the install with, in single
-quotes. The command starts with `ALICE_HOME='<home>' ` when your data directory is not `~/.alice`. `|| true` means a
+with a 10-second timeout as a guard. The path is the full path of the `alice` you ran the install with (symlinks
+resolved), in single quotes. The command starts with `ALICE_HOME='<home>' ` when your data directory is not `~/.alice`. `|| true` means a
 missing `alice` binary never fails a turn. The install prints the five commands it added and ends with
 `Hooks load in new sessions. To remove them: alice hooks uninstall claude`.
 
@@ -198,12 +198,12 @@ The check runs in the hook's background worker (never in the hook itself), at th
 last check and before that event's upload. It writes one line to `~/.config/alice/capture.log` when something happens:
 
 - an update: `capture hook updated <old> → <new>`, where a version is the first 12 hex digits of the SHA-256 of the
-  script the server serves (`unversioned` for a script from before this release);
-- a refusal, which keeps the installed script byte for byte: `capture hook update refused (HTTP <code>, not 200); the
-  installed script stays`, or `capture hook update refused (HTTP 200): <why>; the installed script stays`, where `<why>`
-  is a check the download failed (it is empty, cut short, fails `sh -n`, or fails a trial run, for example);
-- a server it could not reach: `capture hook update check failed (curl exit <n>, HTTP <code>); the installed script
-  stays`. Either way it asks again a day later.
+  hook script as built into the server, before its version line is filled in;
+- a refusal, which keeps the installed script byte for byte: `capture hook update refused (HTTP 200): <why>; the
+  installed script stays`, where `<why>` is a check the download failed (it is empty, cut short, fails `sh -n`, or fails
+  a trial run, for example), or `capture hook update refused (HTTP <code>, not 200); …` for another 2xx or 3xx answer;
+- a server it could not reach, or one that answered with an HTTP error (400 or higher): `capture hook update check
+  failed (curl exit <n>, HTTP <code>); the installed script stays`. Either way it asks again a day later.
 
 A tenant address on plain `http://` (only `127.0.0.1` or `localhost` is accepted, for tests) never updates itself: the
 log says `capture hook update skipped: it runs over https:// only, …`. Details:
@@ -285,10 +285,10 @@ Before each run the distiller checks, in this order:
    Distillation needs the Jev judge because the judge is what removes doubles.
 3. **The project's capture rules.** The project is excluded (`capture.excluded_projects`, or its `.alice.toml` says
    `no_capture = true`), or the tenant script sent `no_distill`: `skipped_excluded`. While the project's rules cannot be
-   known (a broken `.alice.toml`), the session is due again in 5 minutes.
-4. **The cloud policy.** The project is in `privacy.cloud_denied_projects`, its `.alice.toml` says `cloud_denied = true`
-   or cannot be read (it fails closed), or no valid `config.toml` has loaded since the daemon started: `skipped_cloud`,
-   asked again every 5 minutes.
+   known (a broken or unreadable `.alice.toml`, no valid `config.toml` loaded since the daemon started, or a loosening
+   of either still waiting for its three looks), the session is due again in 5 minutes.
+4. **The cloud policy.** The project, under any of its names, is in `privacy.cloud_denied_projects`, or its
+   `.alice.toml` says `cloud_denied = true`: `skipped_cloud`, asked again every 5 minutes.
 5. **The breaker.** Three Jev requests in a row failed: the session is due again when the breaker closes.
 
 Each subagent transcript is checked against its own project's rules (3 and 4): a subagent that is not allowed keeps its
@@ -350,7 +350,7 @@ synthetic evaluation, 30 sessions cost $0.0059 in all, judge included ([benchmar
 | `idle` | Nothing to distil now (or distillation is off) |
 | `due` | Waiting for its run |
 | `done` | Distilled up to its last captured turn |
-| `waiting_judge` | The judge is not Jev, or no Jev key is set |
+| `waiting_judge` | The judge is not Jev, no Jev key is set, or the Jev judge is still starting |
 | `waiting_budget` | Today's share is used up; tried again tomorrow (UTC) |
 | `skipped_cloud` | Its project is kept from the cloud; the policy is asked again every 5 minutes |
 | `skipped_excluded` | Its project is excluded from capture, or the tenant script sent `no_distill` |
