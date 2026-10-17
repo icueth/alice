@@ -211,7 +211,8 @@ pub struct Candidate {
     /// line, in session order.
     pub chunk_ids: Vec<String>,
     /// `handoff` is offered: the passage is from the last two turns of a run that closes the
-    /// session.
+    /// session, and is not a subagent's report (Task 12b review 2: a report is never the
+    /// session's handoff).
     pub handoff_ok: bool,
     /// Session order (main chunks by `ord`, then subagent chunks): [`decide`]'s tie-break.
     pub pos: usize,
@@ -969,7 +970,8 @@ struct Draft {
 
 /// The drafts of one turn: its prompt as a statement, its summaries, its subagent reports and
 /// its conclusion. A subagent source's turn gives only reports: its prompt is the parent
-/// agent's, not the user's, and its last assistant block is its final report.
+/// agent's, not the user's, and its last assistant block is its final report. A subagent report
+/// is never offered `handoff`, whatever `handoff_ok` says of the turn.
 fn turn_drafts(turn: &Turn, from_subagent: bool, handoff_ok: bool, out: &mut Vec<Draft>) {
     let prompt_block = prompt_block(turn);
     let prompt = prompt_block.and_then(|b| prompt_sentence(&b.text()));
@@ -981,7 +983,7 @@ fn turn_drafts(turn: &Turn, from_subagent: bool, handoff_ok: bool, out: &mut Vec
             text: text.s,
             prompt,
             prompt_chunks: prompt_chunks.clone(),
-            handoff_ok,
+            handoff_ok: handoff_ok && source != CandidateSource::SubagentReport,
             from_subagent,
             pos: out.len(),
         });
@@ -1745,8 +1747,9 @@ fn question(i: usize, c: &Candidate) -> Question {
     question_of(i, c, false)
 }
 
-/// The options of a question that asks about the handoff alone.
-const HANDOFF_ONLY: &[&str] = &["handoff", "ephemeral", "unclear"];
+/// The options of a question that asks about the handoff alone: `already_saved` stays, so a
+/// handoff the agent saved itself is not stored again.
+const HANDOFF_ONLY: &[&str] = &["handoff", "already_saved", "ephemeral", "unclear"];
 
 /// [`question`], with `handoff_only` offering only the [`HANDOFF_ONLY`] options.
 fn question_of(i: usize, c: &Candidate, handoff_only: bool) -> Question {
@@ -3721,7 +3724,10 @@ mod tests {
             assert_eq!(c.qid, format!("c{}", i + 1));
             assert_eq!(q.id, c.qid);
             let options: Vec<&str> = q.options.iter().map(|o| o.id.as_str()).collect();
-            assert_eq!(options, ["handoff", "ephemeral", "unclear"]);
+            assert_eq!(
+                options,
+                ["handoff", "already_saved", "ephemeral", "unclear"]
+            );
         }
         let kept = decide(&asked, &all_answer(&asked, "handoff", 0.9), URI, &cfg);
         assert_eq!(kept.len(), 1);
@@ -4202,6 +4208,54 @@ mod tests {
             line("- three", false),
         ];
         assert_eq!(items(&margin), ["- one", "- two", "- three"]);
+    }
+
+    /// Task 12b review 2: a subagent's report is never the session's handoff, in a closing run as
+    /// in one that asks about the handoff alone: `handoff` is not offered for it, and an answer
+    /// naming it is not kept.
+    #[test]
+    fn a_subagent_report_is_never_the_handoff() {
+        let report = format!(
+            "Where things stand: the review is done, and the release notes come next: {}.",
+            words(950, 12)
+        );
+        let main = render(&[
+            User("Get the change reviewed, then tell me where we are."),
+            Agent("Review the change", &report),
+            Say(&format!("Where things stand: {}.", words(951, 16))),
+        ]);
+        let p = prepare(&run(main, vec![], true));
+        let sub = of(&p, S::SubagentReport);
+        assert_eq!(sub.len(), 1, "{:#?}", p.candidates);
+        assert!(!sub[0].handoff_ok);
+        let conclusion = of(&p, S::Conclusion);
+        assert!(
+            conclusion[0].handoff_ok,
+            "the main session's text may be one"
+        );
+        for (c, q) in p.candidates.iter().zip(&p.questions) {
+            let offered = q.options.iter().any(|o| o.id == "handoff");
+            match c.source {
+                S::SubagentReport => assert!(!offered, "{}", c.text),
+                S::Conclusion => assert!(offered, "{}", c.text),
+                _ => {}
+            }
+        }
+        // The report and the conclusion both answered `handoff`: only the conclusion is kept.
+        let answers: BTreeMap<String, Distribution> = p
+            .candidates
+            .iter()
+            .filter(|c| c.source != S::UserStatement)
+            .map(|c| (c.qid.clone(), answer("handoff", 0.9)))
+            .collect();
+        let kept = decide(&p, &answers, URI, &DistillConfig::default());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].kind, Kind::Handoff);
+        assert!(
+            kept[0].body.starts_with(&conclusion[0].text),
+            "{}",
+            kept[0].body
+        );
     }
 
     /// Task 12b review, M4 (a): a summary's label line (`Pending tasks:`) leads its own items,

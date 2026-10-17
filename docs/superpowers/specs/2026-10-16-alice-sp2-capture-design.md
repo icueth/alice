@@ -843,7 +843,8 @@ The distiller parses the run's chunks by their tags (§3.3) and proposes candida
    from.
 4. **Subagent reports:** `[subagent …]` final reports, cut like conclusions. The main session's copy of a report (the
    subagent tool's result) and the subagent's own last text are both subagent reports: they rank below the main
-   session's passages and count toward the subagent caps (§6.4).
+   session's passages and count toward the subagent caps (§6.4). A subagent report is never offered `handoff`: the
+   session's handoff is the main session's own text (Task 12b review 2).
 
 Three local filters run before Jev is asked:
 
@@ -877,7 +878,7 @@ the redaction of every covered project, caching by body hash, the rate limit and
 | `preference_user` | a preference of this person that holds in every project (tools, style, language) | kind `preference`, project `global` (but see the routing guard, §6.5) |
 | `preference_project` | a rule or convention for this repository only | kind `preference`, this project |
 | `fact` | a lasting fact about the project, its systems or its environment | kind `fact` |
-| `handoff` | where the work stands: what is done and what comes next (offered only for the last two turns of a run that ends with the session or a compaction) | kind `handoff` |
+| `handoff` | where the work stands: what is done and what comes next (offered only for the last two turns of a run that ends with the session, by `session-end`, a compaction or the 24-hour stale end, and never for a subagent report) | kind `handoff` |
 | `already_saved` | the same knowledge as an item listed under "Already saved in this session", even when worded differently or with more detail | dropped |
 | `ephemeral` | a question, a request or thanks to the assistant, or a pick among choices it offered, with no lasting rule or fact in it; progress narration; a plan for the next minutes; a greeting; a verdict or status report on one task (a review's "approved", "addressed" or "no findings", a checkmark, a count of passing or failing tests, a "done", "fixed" or "pushed" note) that states no lesson for later work; or a result that matters only right now | dropped |
 | `unclear` | cannot be understood without the surrounding conversation | dropped |
@@ -893,8 +894,8 @@ no lesson.
   order: a main-session passage before a subagent report; among equals, handoff, decision, bugfix, warning, fact,
   howto, then preference. Every cap below takes from the top of that order, so a verdict that Jev scores 0.99 never
   displaces a fact of the main session. The handoff comes first because there is at most one per run, offered at the
-  session's end or a compaction, and it is what continuing the work needs most: within a run the caps never crowd it
-  out, across runs it has its own slot (below), and it still counts toward the caps.
+  session's end, a compaction or the 24-hour stale end, and it is what continuing the work needs most: within a run the
+  caps never crowd it out, across runs it has its own slot (below), and it still counts toward the caps.
 - **Caps.** One run keeps at most `distill.max_per_run` (default 8), and at most one `handoff`. Of them, at most
   `distill.max_per_subagent_run` (default 2) are subagent reports.
 - **The session's caps (Task 12b).** One session keeps at most `distill.max_per_session` (default 16) memories over all
@@ -919,11 +920,12 @@ no lesson.
   - A run whose session has no room left, its handoff slot held too, makes no Jev call: its cursors move to the end of
     what is written, the run is recorded, and the source settles `done` (a later due-mark does the same).
   - A run whose session has no room left but a free handoff slot asks about its handoff alone. Only a closing run
-    (`session-end` or `pre-compact`) has candidates for it: it makes one small request over its last two turns, with
-    `handoff` as the only knowledge option (`ephemeral` and `unclear` stay), and keeps at most one. Any other run of
-    that session makes no call. Once a live distilled handoff of the session holds the slot, its capped closing runs
-    make no call either.
-  A run whose subagents' share is used up does not ask about subagent reports.
+    (`session-end`, `pre-compact`, or the 24-hour stale end, which marks the source ended) has candidates for it: it
+    makes one small request over its last two turns, main-session passages only, with `handoff` as the only knowledge
+    option (`already_saved`, `ephemeral` and `unclear` stay, so a handoff the agent already saved is not stored
+    again), and keeps at most one. Any other run of that session makes no call. Once a live distilled handoff of the
+    session holds the slot, its capped closing runs make no call either.
+  - A run whose subagents' share is used up does not ask about subagent reports.
 - **Cost:** about 20,000 input tokens for a 40-candidate request, about $0.0008. A typical session costs one or two runs.
 
 ### 6.5 From an answer to a memory
@@ -1044,7 +1046,7 @@ provider = "off"            # "off" | "jev"   (the existing string becomes an en
 # model                     # existing optional string, reserved for later providers; ignored with "jev" (judge.jev.model is used)
 min_confidence = 0.7        # 0.5–0.99
 max_per_run = 8             # 1–50
-max_per_session = 16        # 1–200: all runs of one session, its subagents included; subagents keep at most half
+max_per_session = 16        # 2–200: all runs of one session, its subagents included; subagents keep at most half
                             # effective per run: min(max_per_run, what is left of it); one slot is a handoff's
 max_per_subagent_run = 2    # 0–50: subagent reports kept in one run
                             # effective: min(this, max_per_run, what is left of max_per_session / 2)
@@ -1488,7 +1490,7 @@ a caveat the results state, as `m2-jev.md` does.
 | R13 | (Overruled by the controller.) **Tenants get the SessionStart briefing, bounded:** `curl --connect-timeout 1 --max-time 2`, plain stdout, nothing on any failure, exit 0; `capture.briefing` or `briefing=off` in `capture.conf` turns it off | The team uses only the server; without it they never get the briefing local users get | Up to 2 s at the start of a session when the server is slow or down |
 | R14 | **Distillation requires `judge.provider = jev`** | The judge is what removes duplicates of explicit memories; without it, near-copies would be stored or become review items | A person without the Jev judge gets raw capture only |
 | R15 | **`distill.provider` defaults to `off`** | Sending session text to a cloud model is opt-in in an open-source product; the owner turns it on in one command | New users get raw capture only until they opt in |
-| R16 | **At most 40 candidates per request and `max_per_run` (8) kept**, by priority (summaries, conclusions, user statements, subagent reports). Task 12b: the kept are ranked main session before subagents, then handoff, decision, bugfix, warning, fact, howto, preference, then p; `max_per_session` (16) per session over all its runs and subagents, one slot of it kept for a handoff at the session's end; `max_per_subagent_run` (2) subagent reports per run and half of `max_per_session` per session; a `preference_user` passage that names the project (its slug, name, folder or a path in it) stays in the project instead of `global`; a title falls back to the first sentence after a heading or table header only when that is bare or 25 characters or fewer (§6.4, §6.5) | Bounded cost and no floods; compaction summaries and turn conclusions carry most lasting knowledge | A very long quiet-free stretch loses its lowest-priority candidates |
+| R16 | **At most 40 candidates per request and `max_per_run` (8) kept**, by priority (summaries, conclusions, user statements, subagent reports). Task 12b: the kept are ranked main session before subagents, then handoff, decision, bugfix, warning, fact, howto, preference, then p; `max_per_session` (16) per session over all its runs and subagents, one slot of it kept for a handoff at the session's end (`session-end`, a compaction or the 24-hour stale end); `max_per_subagent_run` (2) subagent reports per run and half of `max_per_session` per session; a `preference_user` passage that names the project (its slug, name, folder or a path in it) stays in the project instead of `global`; a title falls back to the first sentence after a heading or table header only when that is bare or 25 characters or fewer (§6.4, §6.5) | Bounded cost and no floods; compaction summaries and turn conclusions carry most lasting knowledge | A very long quiet-free stretch loses its lowest-priority candidates |
 | R17 | **Extractive distillation with `choice` questions only**, through the existing client | Jev has no text type; the client's cache, budget, redaction and gate are reused unchanged | Passages that need the conversation are dropped (lower recall); the eval measures it |
 | R18 | **A session already mined by MemPalace continues after the import's end time; the importer skips sessions SP2 holds** | MemPalace's chunks cannot be aligned with turns; a session must be held by one side | Sessions active during the cut-over may have a gap or overlap of a few minutes at the boundary |
 | R19 | **Distilled memories never open review items; an explicit memory beats a distilled duplicate; distilled ones never supersede explicit ones** | The review inbox is for what people and agents wrote; machine copies must never cost a person's attention or an explicit memory | An uncertain but real update stays as two linked memories instead of a question |

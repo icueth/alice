@@ -2902,7 +2902,7 @@ async fn a_capped_session_still_keeps_its_closing_handoff() {
     let options = last_distill_options(&d.script);
     assert_eq!(options.len(), 2, "the last two turns");
     for o in &options {
-        assert_eq!(o, &["ephemeral", "handoff", "unclear"]);
+        assert_eq!(o, &["already_saved", "ephemeral", "handoff", "unclear"]);
     }
     let mems = d.distilled();
     assert_eq!(mems.len(), 4, "{mems:?}");
@@ -3099,5 +3099,74 @@ async fn a_users_preference_that_names_the_repository_stays_in_it() {
         "the slug is not the folder's name"
     );
     assert_eq!(project("British English"), "global");
+    d.shutdown();
+}
+
+/// Task 12b review 2: the handoff-only request keeps `already_saved`, so a capped session whose
+/// last turns hold a handoff the agent already saved (`remember`) is offered it, and a distilled
+/// copy never takes the slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remembered_handoff_is_not_distilled_again() {
+    let config =
+        "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 4\n";
+    let d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(&[
+            ("Main fact", "fact"),
+            ("Where things stand:", "already_saved"),
+        ]),
+    );
+    let mut t = Transcript::default();
+    for i in 0..4u64 {
+        t.prompt(&format!("rh-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("rh-a{i}"),
+            &format!("Main fact {i}: {}.", words(600 + i, 18)),
+        );
+    }
+    d.send("shop", "rh1", &t, 0, "stop").await;
+    d.svc.capture_distill_now("rh1").await.unwrap();
+    until("the first run is over", || d.svc.distill_runs().len() == 1).await;
+    assert_eq!(d.distilled().len(), 3);
+
+    let off = t.len();
+    t.prompt("rh-p4", "Go on 4.")
+        .reply("rh-a4", &format!("Main fact 4: {}.", words(604, 18)))
+        .prompt("rh-p5", "Save where we are, please.")
+        .tool(
+            "rh-t5",
+            "toolu_rh5",
+            "mcp__alice__remember",
+            json!({"title": "Cache work: config written down, restart moves next", "content": HANDOFF, "kind": "handoff"}),
+        )
+        .tool_result("rh-r5", "toolu_rh5", "saved")
+        .reply("rh-a5", HANDOFF);
+    d.send("shop", "rh1", &t, off, "pre-compact").await;
+    until("the closing run is over", || {
+        d.svc.distill_runs().len() == 2
+    })
+    .await;
+    assert_eq!(d.script.distill_calls(), 2);
+    let options = last_distill_options(&d.script);
+    assert!(!options.is_empty());
+    for o in &options {
+        assert_eq!(o, &["already_saved", "ephemeral", "handoff", "unclear"]);
+    }
+    assert!(
+        d.script
+            .questions()
+            .iter()
+            .any(|q| q.contains("Where things stand:")),
+        "the handoff passage was asked about"
+    );
+    assert_eq!(
+        d.distilled().len(),
+        3,
+        "nothing is kept: {:?}",
+        d.distilled()
+    );
+    assert_eq!(d.state(&uri("rh1")).state, "done");
     d.shutdown();
 }

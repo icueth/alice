@@ -627,8 +627,8 @@ pub struct DistillSettings {
     pub min_confidence: f64,
     /// Most memories kept from one session run (1 to 50).
     pub max_per_run: usize,
-    /// Most memories kept from one session over all its runs, its subagents' included (1 to
-    /// 200). Subagent reports together keep at most half of it.
+    /// Most memories kept from one session over all its runs, its subagents' included (2 to
+    /// 200). One of them is kept for a handoff; subagent reports together keep at most half.
     pub max_per_session: usize,
     /// Most memories kept from subagent reports in one run (0 to 50).
     pub max_per_subagent_run: usize,
@@ -1531,8 +1531,8 @@ impl Settings {
         );
         range(
             "distill.max_per_session",
-            (1..=200).contains(&d.max_per_session),
-            "must be 1 to 200",
+            (2..=200).contains(&d.max_per_session),
+            "must be 2 to 200",
         );
         range(
             "distill.max_per_subagent_run",
@@ -3878,12 +3878,18 @@ mod tests {
             (
                 "[distill]\nmax_per_session = 0\n",
                 "distill.max_per_session",
-                "must be 1 to 200",
+                "must be 2 to 200",
+            ),
+            (
+                // Task 12b review 2: one would keep a handoff alone.
+                "[distill]\nmax_per_session = 1\n",
+                "distill.max_per_session",
+                "must be 2 to 200",
             ),
             (
                 "[distill]\nmax_per_session = 201\n",
                 "distill.max_per_session",
-                "must be 1 to 200",
+                "must be 2 to 200",
             ),
             (
                 "[distill]\nmax_per_subagent_run = 51\n",
@@ -3905,8 +3911,8 @@ mod tests {
         }
         for (file, session, subagent) in [
             (
-                "[distill]\nmax_per_session = 1\nmax_per_subagent_run = 0\n",
-                1,
+                "[distill]\nmax_per_session = 2\nmax_per_subagent_run = 0\n",
+                2,
                 0,
             ),
             (

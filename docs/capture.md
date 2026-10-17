@@ -272,14 +272,15 @@ distilled, newest first. Older ones, and sessions captured by a backfill, are di
   convention of this project, a fact, a handoff, or is it already saved, ephemeral or unclear? A passage is kept when
   its best answer is a kind of knowledge with probability at least `distill.min_confidence` (default 0.7). At most
   `distill.max_per_run` (default 8) are kept per run, and at most one handoff; at most `distill.max_per_session`
-  (default 16) per session, its runs and its subagents together, one of them kept for a handoff at the session's end;
-  and at most `distill.max_per_subagent_run` (default 2) subagent reports per run, and half of
-  `distill.max_per_session` per session.
-- **The memory.** The passage (at most 1,200 characters), titled with its first sentence; when that is only a heading
-  or a table header, or 25 characters or fewer, with the first sentence after it (at most 80 characters). It gets a
-  last line `Context: <your prompt's first sentence>` when it needs one to stand on its own. Importance
-  `distill.importance` (default 2), no topics, the session as author, and provenance links to the chunks it came from.
-  It is written through the normal `remember` path: redacted, deduplicated and judged.
+  (default 16) per session, its runs and its subagents together, one of them kept for a handoff at the session's end
+  (`SessionEnd`, a compaction, or the 24-hour stale end); and at most `distill.max_per_subagent_run` (default 2)
+  subagent reports per run, and half of `distill.max_per_session` per session. A subagent's report is never the
+  session's handoff.
+- **The memory.** The passage (at most 1,200 characters), titled with its first sentence; when that is a heading or
+  table header of 25 characters or fewer, or one that is bare, with the first sentence after it (at most 80
+  characters). It gets a last line `Context: <your prompt's first sentence>` when it needs one to stand on its own.
+  Importance `distill.importance` (default 2), no topics, the session as author, and provenance links to the chunks it
+  came from. It is written through the normal `remember` path: redacted, deduplicated and judged.
 
 ### `(auto)`, and why it never asks you
 
@@ -343,7 +344,7 @@ provider = "off"            # "off" | "jev"
 # model                     # reserved; ignored with "jev" (judge.jev.model is used)
 min_confidence = 0.7        # 0.5-0.99
 max_per_run = 8             # 1-50
-max_per_session = 16        # 1-200: one session over all its runs, its subagents included
+max_per_session = 16        # 2-200: one session over all its runs, its subagents included
 max_per_subagent_run = 2    # 0-50: subagent reports kept in one run
 idle_minutes = 15           # 1-1,440
 importance = 2              # 1-3
