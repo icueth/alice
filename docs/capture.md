@@ -112,24 +112,27 @@ names another file). For each of `SessionStart`, `Stop`, `SubagentStop`, `PreCom
 '<path to alice>' hook <event> --agent claude-code || true
 ```
 
-with a 10-second timeout as a guard. The command starts with `ALICE_HOME='<home>' ` when your data directory is not
-`~/.alice`. `|| true` means a missing `alice` binary never fails a turn. <!-- TODO(confirm): the command form, the
-timeouts and the output text come from the Task 8 commit 4eaa6a8, not yet merged into feat/sp2-capture. -->
+with a 10-second timeout as a guard. The path is the full path of the `alice` you ran the install with, in single
+quotes. The command starts with `ALICE_HOME='<home>' ` when your data directory is not `~/.alice`. `|| true` means a
+missing `alice` binary never fails a turn. The install prints the five commands it added and ends with
+`Hooks load in new sessions. To remove them: alice hooks uninstall claude`.
 
 - **It is careful with your file.** A missing file starts empty. A file that is not valid JSON is refused, and nothing
-  changes. Other hooks and other settings stay exactly as they are, in their order. Before writing, the old file is
-  copied to `settings.json.alice-backup-<time>` (mode 0600; the newest five are kept), and the new one replaces it in one
-  step.
-- **It is idempotent.** Running it again changes nothing. If you move the `alice` binary, run it again: it replaces the
-  hooks that point at the old path.
-- **It lists other memory hooks.** Hooks whose command mentions `alice` or `mempalace` (a MemPalace plugin's hooks, or an
-  older SessionStart script that printed `alice context`) are listed, so you can remove them yourself. Alice's capture
-  replaces them.
+  changes. Other hooks and other settings stay exactly as they are, in their order. A file that would not change is not
+  written. Otherwise the old file is copied to `settings.json.alice-backup-<time>` (mode 0600; the newest five are
+  kept), and the new one replaces it in one step. If the file changed while Alice was editing it, nothing is written
+  and you run the command again.
+- **It is idempotent.** Running it again changes nothing and says so (`Alice's capture hooks are already in …; nothing
+  changed.`). If you move the `alice` binary, run it again: it replaces the hooks that point at the old path.
+- **It lists other memory hooks.** Hook commands that run something named `alice…` or `mempalace…` (a MemPalace plugin's
+  hooks, or an older SessionStart script such as `alice-session-start` that printed `alice context`) are listed under
+  "Other hooks mention alice or mempalace", so you can remove them yourself. Alice's capture replaces them.
 - **Hooks load in new sessions.** Start a new Claude Code session afterwards.
 
-`alice hooks uninstall claude` removes exactly Alice's entries (and the lists they leave empty), with a backup.
-`alice hooks status claude` says whether the hooks are installed, whether the `alice` they run exists, and when something
-was last captured.
+`alice hooks uninstall claude` removes exactly Alice's entries (and the groups and lists they leave empty), with a
+backup. `alice hooks status claude` prints the file and `installed`, `not installed`, or `on N of the 5 events only`;
+then each `alice` the hooks run (with `which does not exist` when it is gone), and the last capture (`unknown` while the
+daemon is not running; `status` never starts it). `--json` works for all three commands; it never prints the file.
 
 ### Codex
 
@@ -140,9 +143,11 @@ alice hooks install codex
 This writes `$CODEX_HOME/hooks.json`, else `~/.codex/hooks.json`, with the same five events and
 `--agent codex` (Codex allows `SessionEnd` at most 3 seconds, so that hook's timeout is 3). Two Codex rules apply:
 
-- **One format per layer.** If `~/.codex/config.toml` already holds hooks of its own (`[hooks]` tables), the install is
-  refused and nothing changes. Move those hooks into `hooks.json`, or remove them, and run it again.
-- **Trust.** Codex runs a hook only after you trust it. Open Codex, type `/hooks` once, and trust the Alice entries.
+- **One format per layer.** If `$CODEX_HOME/config.toml` (else `~/.codex/config.toml`) already holds hooks of its own
+  (`[hooks]` tables or `[[hooks.<Event>]]` arrays), the install is refused and nothing changes. Move those hooks into
+  `hooks.json`, or remove them, and run it again.
+- **Trust.** Codex runs a hook only after you trust it. The install's last line says so: open Codex, type `/hooks`
+  once, and trust the Alice entries.
 
 Codex sometimes gives no transcript path. The daemon then looks for the session's rollout file in the newest seven date
 folders of `$CODEX_HOME/sessions` (the daemon's `CODEX_HOME`, so start the daemon with the same one Codex uses). Codex
@@ -161,10 +166,9 @@ gets no SessionStart briefing from the hook: the MCP instructions ask the agent 
    `ALICE_NO_AUTOSTART` is set). Nothing is lost: the daemon reads the transcript from its own cursor when it runs.
 
 It always exits 0, prints nothing else, and writes problems to `$ALICE_HOME/logs/hook.log` (one line each, never the
-transcript's text; rotated to `hook.log.1` past 1 MB). The budget is 100 ms from process start to exit; the p95
-reported during development is about 7 ms with the daemon up and 16-22 ms with it down ([benchmarks](benchmarks/sp2.md),
-to be measured again for that page). <!-- TODO(confirm): the figures come from Task 7's report, which is not in the
-repository. -->
+transcript's text; rotated to `hook.log.1` past 1 MB). The budget is 100 ms from process start to exit; the measured
+p95 is under 10 ms with the daemon up, about 15 ms with it down, and about 22 ms when the hook also starts the daemon
+([benchmarks](benchmarks/sp2.md); release build, macOS).
 
 Turn the briefing off with `alice config set capture.briefing false`.
 
@@ -187,9 +191,22 @@ curl -fsSL https://alice.example/u/<name>/api/v1/capture/setup.sh | sh -s -- htt
 It reuses `~/.config/alice/token` and `~/.config/alice/url`, installs the hook script and the `alice-capture` plugin from
 a local marketplace, writes Codex's `hooks.json` when Codex is installed, and prints how to check and remove it.
 
-The hook script does not update itself: setup downloads it once, into `~/.config/alice/alice-capture.sh`. After a server
-upgrade that changes the capture scripts, run the same setup line again to get the new one. It is idempotent, and it
-reuses `~/.config/alice/token` and `~/.config/alice/url` without asking. Details:
+The tenant hook script updates itself from your Alice server once a day, over https, and updates the plugin's
+`hooks.json` when that changes. Re-run the setup line only to repair an install, and once after this release.
+
+The check runs in the hook's background worker (never in the hook itself), at the first event a day or more after the
+last check and before that event's upload. It writes one line to `~/.config/alice/capture.log` when something happens:
+
+- an update: `capture hook updated <old> → <new>`, where a version is the first 12 hex digits of the SHA-256 of the
+  script the server serves (`unversioned` for a script from before this release);
+- a refusal, which keeps the installed script byte for byte: `capture hook update refused (HTTP <code>, not 200); the
+  installed script stays`, or `capture hook update refused (HTTP 200): <why>; the installed script stays`, where `<why>`
+  is a check the download failed (it is empty, cut short, fails `sh -n`, or fails a trial run, for example);
+- a server it could not reach: `capture hook update check failed (curl exit <n>, HTTP <code>); the installed script
+  stays`. Either way it asks again a day later.
+
+A tenant address on plain `http://` (only `127.0.0.1` or `localhost` is accepted, for tests) never updates itself: the
+log says `capture hook update skipped: it runs over https:// only, …`. Details:
 [server.md, "Capture for team members"](server.md#capture-for-team-members).
 
 ## Privacy
@@ -223,10 +240,10 @@ on: one secret never stops a session's capture, and nothing with a secret is sto
 always on.
 
 **Cloud denial.** Captured chunks reach a remote embedding provider only for projects the cloud policy allows, as every
-chunk does. Distillation never sends a denied project's text to Jev: its session waits as `skipped_cloud` and is tried
-again when the policy allows it. A subagent working in a denied repository is gated by its own project, even when its
-session is allowed. A subagent's final report that its parent received is part of the parent's transcript and follows the
-parent's project.
+chunk does. Distillation never sends a denied project's text to Jev: its session waits as `skipped_cloud`, and the
+policy is asked again every 5 minutes ([the gates](#the-gates)). A subagent working in a denied repository is gated by
+its own project, even when its session is allowed. A subagent's final report that its parent received is part of the
+parent's transcript and follows the parent's project.
 
 **On a server tenant** the repository's `.alice.toml` is not mirrored. The capture script reads two lines of it on your
 machine: `no_capture = true` (nothing of that session is sent) and `cloud_denied = true` (sent, but never distilled). A
@@ -257,6 +274,26 @@ reads the same three times in a row (about 6 seconds), while `alice config set` 
 distilled, newest first. Older ones, and sessions captured by a backfill, are distilled only when you ask:
 `alice capture distill <session-id>`. A backfilled session that you resume is distilled from its first new turn on
 ([Backfill](#backfill)).
+
+### The gates
+
+Before each run the distiller checks, in this order:
+
+1. **The switches.** `distill.provider = off`, or capture is off (`capture.enabled`, or the agent's own flag): the session
+   stays `idle` and is distilled once they are on again.
+2. **The judge.** `judge.provider` is not `jev`, no Jev key is set, or the Jev judge is still starting: `waiting_judge`.
+   Distillation needs the Jev judge because the judge is what removes doubles.
+3. **The project's capture rules.** The project is excluded (`capture.excluded_projects`, or its `.alice.toml` says
+   `no_capture = true`), or the tenant script sent `no_distill`: `skipped_excluded`. While the project's rules cannot be
+   known (a broken `.alice.toml`), the session is due again in 5 minutes.
+4. **The cloud policy.** The project is in `privacy.cloud_denied_projects`, its `.alice.toml` says `cloud_denied = true`
+   or cannot be read (it fails closed), or no valid `config.toml` has loaded since the daemon started: `skipped_cloud`,
+   asked again every 5 minutes.
+5. **The breaker.** Three Jev requests in a row failed: the session is due again when the breaker closes.
+
+Each subagent transcript is checked against its own project's rules (3 and 4): a subagent that is not allowed keeps its
+chunks and shows why in its own state, while the rest of the session is distilled. The Jev client checks the cloud
+policy again, for every project a request covers, and redacts the text with each project's rules before it is sent.
 
 ### What it does
 
@@ -297,7 +334,8 @@ machine-extracted: rely on it as you would on a note you did not write.
 Distillation spends from the judge's own daily budget, `judge.daily_budget_usd`, and may use at most
 `distill.budget_share` of it (default 0.5), so it never starves the judge's other work. Its calls are counted on a ledger
 row of their own (`jev:distill`); `alice stats` shows "distilled today: N kept, M dropped, $x", and the day's judge total
-includes it. A run costs about $0.0008 for 40 passages; a typical session takes one or two runs.
+includes it. A 40-passage request is estimated at about $0.0008, and a typical session takes one or two runs. In the
+synthetic evaluation, 30 sessions cost $0.0059 in all, judge included ([benchmarks](benchmarks/sp2-distill.md)).
 
 - When the share is used up, sessions wait for the next UTC day (`waiting_budget`). This is not an error.
 - Three failed Jev calls in a row open a breaker for 15 minutes, doubling each time it opens again, up to 6 hours. Raw
@@ -314,7 +352,7 @@ includes it. A run costs about $0.0008 for 40 passages; a typical session takes 
 | `done` | Distilled up to its last captured turn |
 | `waiting_judge` | The judge is not Jev, or no Jev key is set |
 | `waiting_budget` | Today's share is used up; tried again tomorrow (UTC) |
-| `skipped_cloud` | Its project is kept from the cloud; tried again when the policy allows it |
+| `skipped_cloud` | Its project is kept from the cloud; the policy is asked again every 5 minutes |
 | `skipped_excluded` | Its project is excluded from capture, or the tenant script sent `no_distill` |
 | `skipped_backfill` | Captured by a backfill (a subagent's row too); distilled only with `alice capture distill`, or from its first new turn once the session goes on live |
 | `failed` | Five failed attempts; `alice capture distill <session-id>` tries again |
@@ -409,11 +447,15 @@ alone. To distil them:
   nothing: turn distillation on, then run the backfill again with `--distill`.
 - `alice capture distill <session-id>` distils one session later.
 
-**A backfilled session that you resume** becomes live again at its first new turn (`claude --resume` and `codex resume`
-append to the same transcript, and the hooks fire). What is captured from then on is distilled as any session's is; its
-backfilled turns, and its backfilled subagents', stay undistilled. To distil those too, run
-`alice capture distill <session-id>` before you resume it. <!-- TODO(confirm): that current Claude Code and Codex
-versions resume into the same file; Task 20 checks it on a real install. -->
+**A backfilled session that you resume** is captured either way the agent resumes it:
+
+- If the agent appends to the same transcript, the hook's first pass that stores a new turn makes the session live
+  again. What is captured from then on is distilled as any session's is; its backfilled turns, and its backfilled
+  subagents', stay undistilled.
+- If the agent starts a new transcript that copies the old records first, the copied turns are skipped by their keys,
+  and the new transcript is an ordinary live session; the backfilled one keeps `skipped_backfill`.
+
+To distil the backfilled turns too, run `alice capture distill <session-id>` before you resume the session.
 
 ## Moving over from MemPalace
 
@@ -458,20 +500,23 @@ stored twice. A session left open by the move is closed after 24 hours without e
 
 ## Troubleshooting
 
-`alice doctor` has three capture lines: <!-- TODO(confirm): `capture hooks` and `capture` come from the unmerged Task 8
-commit 4eaa6a8; their texts may change in its review. -->
+`alice doctor` has three capture lines. `capture hooks` is always there (a server tenant's doctor leaves it out: the
+hooks are on the person's machine); `capture` appears once the daemon has captured something, and `distill` while the
+daemon runs.
 
 | Line | What it says | What to do |
 |---|---|---|
 | `capture hooks` | `not installed` (optional) | `alice hooks install claude` (or `codex`) |
-| `capture hooks` | the hooks run an `alice` that does not exist | `alice hooks install claude` (or `codex`) again, from the `alice` you use now |
+| `capture hooks` | `installed for Claude Code` (and/or `Codex`) | nothing |
+| `capture hooks` | the hooks in a file run an `alice` that does not exist, so those sessions are not captured | `alice hooks install claude` (or `codex`) again, from the `alice` you use now |
 | `capture` | sessions and chunks captured in the last 24 hours, and the last capture | nothing |
 | `capture` | nothing was captured for 7 days, with hooks installed | `alice hooks status claude` and `alice daemon logs`; start a new session |
 | `capture` | transcript lines of a shape Alice does not know were skipped | the agent's transcript format may have changed: update Alice |
 | `capture` | Codex sessions gave no transcript path and no rollout was found | start the daemon with the `CODEX_HOME` Codex uses |
 | `capture` | Codex rollouts are compressed (`.jsonl.zst`) | those sessions are not captured in this version |
 | `distill` | `off`, or `jev, N distilled today` | nothing |
-| `distill` | distillation waits for the Jev judge | `alice config set judge.provider jev` |
+| `distill` | distillation waits for the Jev judge (`judge.provider` is not `jev`) | `alice config set judge.provider jev` |
+| `distill` | distillation waits for the Jev judge to start | nothing while it starts; otherwise see the `judge` line |
 | `distill` | no Jev key is set | `alice config set-secret jev_api_key` |
 | `distill` | Jev failed 3 times; tried again at a time | nothing: raw capture goes on, and distillation resumes by itself |
 | `distill` | today's distillation share is used up | raise `distill.budget_share` or `judge.daily_budget_usd`, or wait for the next UTC day |
@@ -505,33 +550,53 @@ except the two public scripts.
 
 ### Uploading a transcript
 
-`POST <url>/api/v1/capture/transcript?<query>`, with the file's raw bytes from `offset` as the body (at most 8,388,608
-bytes; `Content-Type: application/x-ndjson`).
+`POST <url>/api/v1/capture/transcript?<query>`, with the file's raw bytes from `offset` as the body, at most 8 MiB
+(8,388,608 bytes). The tenant script sends `Content-Type: application/x-ndjson`. The server keeps the cursor of each
+transcript (its source), and one upload is read as one pass.
 
 | Query | Required | Value |
 |---|---|---|
 | `agent` | yes | `claude-code` or `codex` |
 | `session` | yes | The session id (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`) |
-| `offset` | yes | The byte offset of the body's first byte in the file |
+| `offset` | yes | The byte offset of the body's first byte in the file (a missing offset is refused, never read as 0) |
 | `event` | yes | `session-start`, `stop`, `subagent-stop`, `pre-compact`, `session-end` or `sweep` |
 | `subagent` | no | A subagent's id, for its own transcript |
 | `project` | no | The repository's folder name, when no `X-Alice-Project` header is sent |
-| `more` | no | `1`: the transcript goes on past this body (it was cut at a size cap), so its last turn stays open, and a `session-end` neither closes the turn nor ends the session |
-| `no_distill` | no | `1`: store, but never distil |
-| `no_capture` | no | `1`: store nothing; the cursor moves past the body |
+| `more` | no | `1`: the body was cut at a size cap and the transcript goes on past it. Its last turn stays open, and the answer stops at that turn's start; a `session-end` with `more=1` neither closes the turn nor ends the session |
+| `no_distill` | no | `1`: store, but never distil (the session shows `skipped_excluded`) |
+| `no_capture` | no | `1`: nothing is read or stored, and `next_offset` moves past the body's last complete line |
 
 The optional header `X-Alice-Project` (UTF-8, or percent-encoded UTF-8) names the project and wins over `project`. A local
 daemon ignores both and takes the project from a `cwd` query parameter.
 
+**How the offset meets the cursor:**
+
+- **At the cursor:** the body is read. Only complete turns are stored; a turn is complete when the next one starts, or
+  at the end of a body without `more=1` (unless its last tool call has no result yet). `session-end` closes the last
+  turn whatever it waits for and ends the session.
+- **Below the cursor:** nothing is read. The answer is `409 {"next_offset": <cursor>}`: continue from there. This is how
+  a client that lost its place, or a first upload from offset 0 after a move, finds the server's cursor.
+- **Beyond the cursor (a gap):** the upload is accepted. The cursor jumps to `offset`, the bytes in between are never
+  read, and the session's `gaps` count in `GET /api/v1/capture/status` goes up. A client causes one when it skips an
+  oversized line (below).
+- **An empty `session-end` at the cursor:** when a `stop` already sent everything, send `event=session-end` with an
+  empty body at the cursor. The server still ends the session, which makes it due for distillation.
+
 Answers:
 
-- `200 {"next_offset", "turns_stored", "turns_skipped", "chunks_stored", "oversized_line"}`. Keep `next_offset`. When it
-  equals the request's `offset`, nothing was taken in yet (no complete turn, or the project's rules are not known right
-  now): wait until the file grows. `"oversized_line": true` means the body is one line of 8 MiB with no end: skip that
-  line and go on after it.
-- `409 {"next_offset": N}`: the server's cursor is elsewhere (the client lost its place). Continue from `N`.
-- `400` (a bad query), `401` (the token), `413` (over 8 MiB). On `5xx`, keep the offset and try again at the next event:
-  the file itself is the queue.
+- `200 {"next_offset", "turns_stored", "turns_skipped", "chunks_stored", "oversized_line", "ended"}`. Keep
+  `next_offset`: the start of the first incomplete turn, or the end of the last complete line. When it equals the
+  request's `offset`, nothing was taken in yet (no complete turn, a new subagent transcript still too short to judge, or
+  the project's rules are not known right now): wait until the file grows. `"oversized_line": true` means the body is
+  one 8 MiB pass with no line end: skip that line and go on after it (a gap). `"ended": true` means this upload ended
+  the session; `false` after a `session-end` means the end did not land (the project's rules waited, say), so send it
+  again later. A client should treat a missing `ended` as `false`: servers before this release do not send it.
+- `409 {"next_offset": N}`: the server's cursor is ahead of `offset`. Continue from `N`. A cursor beyond the end of the
+  local file means the server already holds more of the session than the file has; the tenant script stops that
+  session (`status` lists it as `stopped`).
+- `400` (a bad query, such as an unknown agent or event or an invalid id), `401` (the token), `413` (a body over 8 MiB:
+  send at most 8,388,608 bytes, and the rest from the answer's `next_offset`). On `5xx` or no answer, keep the offset
+  and try again at the next event: the file itself is the queue.
 
-The tenant script sends at most 2 MiB at a time, doubles the size (up to 8 MiB) when a capped body held no complete turn,
-and adds `more=1` whenever a body is as long as its cap.
+The tenant script sends at most 2 MiB at a time, doubles the size (up to 8 MiB) when a capped body held no complete
+turn, adds `more=1` whenever a body is as long as its cap, and sends the empty `session-end` at most once per event.

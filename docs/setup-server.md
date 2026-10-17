@@ -133,10 +133,8 @@ claude mcp list | grep '^alice:'
 
 The last line must show `alice` as connected. If it does not, retry once after 10 seconds; if it still fails, report
 the exact status line. On Linux without `lsof` the helper still works, but no project is sent, so every session files
-its memories under `global`; installing `lsof` fixes that. <!-- TODO(confirm): the percent-encoding lines are new
-beside the proven helper (ASCII names are sent as before). The server's `project_header` decodes any %xx, in either
-case, and requires UTF-8, for MCP and capture alike, and the review ran the lines under sh, dash, bash and zsh with
-the same result; not yet tried end to end with a real Claude Code and a Thai folder. -->
+its memories under `global`; installing `lsof` fixes that. A folder name that is not plain ASCII (a Thai name, say), or
+holds `%`, is sent percent-encoded; the server decodes it and requires UTF-8, for MCP and capture alike.
 
 ### Step 3: Codex (only if `codex` exists)
 
@@ -188,9 +186,7 @@ terminal.
 
 Check with a fresh shell, without printing values: `zsh -ic 'type codex | head -1'` (or `bash -ic` for bash) must say
 that `codex` is a shell function. Then `codex mcp list` must list `alice`. If Codex reports a configuration error,
-restore `~/.codex/config.toml.bak-alice` and tell the person. <!-- TODO(confirm): the percent-encoding lines are new
-beside the proven wrapper; the review ran them under sh, dash, bash and zsh, not yet with a real Codex and a Thai
-folder. -->
+restore `~/.codex/config.toml.bak-alice` and tell the person.
 
 ### Step 4: Upload the person's MemPalace (their old memories)
 
@@ -263,7 +259,8 @@ into a new private temporary folder that is removed afterwards:
 sh ~/.config/alice/alice-capture.sh status
 ```
 
-`status` must say `server: reachable, token accepted` and list the plugin `alice-capture@alice-local`.
+`status` must say `server: reachable, token accepted` and list the plugin `alice-capture@alice-local`. Its
+`hook script:` line shows the script's version and when it last checked for an update.
 
 - If setup printed two `/plugin …` commands instead of installing the plugin, tell the person to type them inside Claude
   Code.
@@ -272,10 +269,16 @@ sh ~/.config/alice/alice-capture.sh status
   they trust them: open Codex, type `/hooks`, and trust the Alice entries.**
 - If setup says the token was refused, go back to Step 1. If it says the address is "a local Alice daemon, not a server
   tenant", the address is wrong.
-- **The hook script does not update itself.** Setup downloads it once, into `~/.config/alice/alice-capture.sh`. When the
-  admin upgrades the server with changed capture scripts, the person runs the same setup line again (or asks an agent to
-  repeat this step). It is safe to repeat: it reuses `~/.config/alice/token` and `~/.config/alice/url` without asking,
-  keeps their briefing choice, and replaces the script and the plugin with the server's current ones.
+- **Updates.** The tenant hook script updates itself from your Alice server once a day, over https, and updates the
+  plugin's `hooks.json` when that changes. Re-run the setup line only to repair an install, and once after this
+  release. A re-run is safe: it reuses `~/.config/alice/token` and `~/.config/alice/url` without asking, keeps the
+  person's briefing choice, and replaces the script and the plugin with the server's current ones. Each update, or
+  refused update, is one line in `~/.config/alice/capture.log` (`capture hook updated …`, `capture hook update refused
+  …`; [capture.md](capture.md#server-tenants) lists them). An address on plain `http://` (only for a test server on
+  `127.0.0.1` or `localhost`) never updates itself.
+- **Codex after an update.** When an update changes Codex's hooks, the script rewrites `~/.codex/hooks.json` (only
+  while it is still the file setup wrote), and Codex runs the changed hooks only after the person trusts them again in
+  `/hooks`. The log says so.
 
 Details of what it installed and how to remove it: [server.md, "Capture for team members"](server.md#capture-for-team-members).
 
@@ -325,7 +328,7 @@ Say briefly:
   this to shared memory";
 - that `sh ~/.config/alice/alice-capture.sh status` shows the capture, and `sh ~/.config/alice/alice-capture.sh
   uninstall` removes it (the token and address stay);
-- that the capture script does not update itself: after the admin announces a server upgrade, they run the setup line of
-  Step 6 again (it asks nothing).
+- that the capture script updates itself from the server once a day; they run the setup line of Step 6 again (it asks
+  nothing) only to repair the install.
 
 Do not show the token or any file's contents.

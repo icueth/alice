@@ -16,7 +16,7 @@
 </p>
 
 > [!IMPORTANT]
-> **สถานะ: M2 เสร็จแล้ว — รุ่น alpha** ที่เก็บข้อมูล, การค้นหาแบบผสม (ไทย อังกฤษ และชื่อในโค้ด), daemon, MCP tool ทั้ง 7 ตัว, CLI และ HTTP API (M1) ตอนนี้มีเส้นทางการเขียนที่ดูแลตัวเองได้ครบ: ตัด secret ออกก่อนบันทึก, Judge ที่ทำงานในเครื่องพร้อม TypeSafe Jev เป็นตัวเลือก, คิว review, ประวัติและ undo, backup และ restore, ค่าตั้งที่มีผลทันทีพร้อมไฟล์ secret ส่วนตัว, `alice doctor`, `alice service install` และ embedding provider ผ่าน HTTP (M2) CI build และทดสอบทั้งหมดนี้บน macOS, Linux และ Windows ส่วนบน Windows การทดสอบ CLI และ process ของ daemon รันเฉพาะบน Unix (ดู[แพลตฟอร์มที่รองรับ](#แพลตฟอร์มที่รองรับ)) ยังไม่มี release แบบแพ็กเกจ ให้[ติดตั้งจาก source](#ติดตั้งจาก-source) ความสามารถที่มีป้าย *(วางแผนไว้)* จะตามมาใน milestone ถัดไป ดูได้ที่ [roadmap](#roadmap) ก่อนถึง 1.0 อาจมีการเปลี่ยนที่ไม่เข้ากับของเดิม
+> **สถานะ: รุ่น alpha — M1, M2, M3 และ SP2 สร้างเสร็จแล้ว** ที่เก็บข้อมูล, การค้นหาแบบผสม (ไทย อังกฤษ และชื่อในโค้ด), daemon, MCP tool ทั้ง 7 ตัว, CLI และ HTTP API (M1) มาพร้อมเส้นทางการเขียนที่ดูแลตัวเองได้ครบ: ตัด secret ออกก่อนบันทึก, Judge ที่ทำงานในเครื่องพร้อม TypeSafe Jev เป็นตัวเลือก, คิว review, ประวัติและ undo, backup และ restore, ค่าตั้งที่มีผลทันทีพร้อมไฟล์ secret ส่วนตัว, `alice doctor`, `alice service install` และ embedding provider ผ่าน HTTP (M2) นอกจากนี้ยังมีตัว import จาก MemPalace (M3), โหมดเซิร์ฟเวอร์สำหรับทีมเล็ก และการเก็บ session ของ Claude Code และ Codex อัตโนมัติ (SP2) ส่วนการกลั่น session เป็นความจำปิดไว้เป็นค่าเริ่มต้น CI build และทดสอบทั้งหมดนี้บน macOS, Linux และ Windows ส่วนบน Windows การทดสอบ CLI และ process ของ daemon รันเฉพาะบน Unix (ดู[แพลตฟอร์มที่รองรับ](#แพลตฟอร์มที่รองรับ)) ยังไม่มี release แบบแพ็กเกจ ให้[ติดตั้งจาก source](#ติดตั้งจาก-source) ความสามารถที่มีป้าย *(วางแผนไว้)* จะตามมาใน milestone ถัดไป ดูได้ที่ [roadmap](#roadmap) ก่อนถึง 1.0 อาจมีการเปลี่ยนที่ไม่เข้ากับของเดิม
 
 ---
 
@@ -79,9 +79,6 @@ Alice ทำงานได้ทั้งบนเครื่องของ�
 | ความจำส่วนกลางของทีม | ไม่มี | มีให้เลือกใช้ |
 | แพลตฟอร์ม | macOS (Apple Silicon), Linux (glibc) | agent ใดก็ได้ที่ใช้ MCP ผ่าน HTTP ส่วนการเก็บ session ใช้ได้บน macOS และ Linux |
 | คู่มือติดตั้ง | [docs/setup-local.md](docs/setup-local.md) | [docs/setup-server.md](docs/setup-server.md) |
-
-<!-- TODO(confirm): `alice hooks` comes from Task 8 (commit 4eaa6a8 on feat/sp2-local-hooks), not yet merged into this
-branch; the same holds for its other mentions below. -->
 
 คู่มือติดตั้งทั้งสองเขียนไว้ให้ agent อ่านแล้วทำตาม: ส่งไฟล์ให้ Claude Code หรือ Codex (เช่น "อ่าน docs/setup-local.md แล้วทำตามทุกขั้นตอน") มันจะติดตั้งและเชื่อมต่อให้ครบ โดยถามคุณเฉพาะเรื่องที่ต้องตัดสินใจเอง (จะ import MemPalace ไหม จะเลิกใช้ MemPalace ไหม จะเปิดการกลั่นความรู้ไหม) จะเริ่มใช้ในเครื่องก่อนแล้วค่อยย้ายขึ้นเซิร์ฟเวอร์ทีหลังก็ได้ แอดมินย้ายฐานข้อมูลในเครื่องของคุณขึ้น tenant ให้ได้ ([docs/server.md](docs/server.md#moving-your-local-alice-to-the-server))
 
@@ -500,52 +497,40 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 
 3. CPU ต้องมี AVX (ไม่ต้องมี AVX2) บน Proxmox ให้ตั้งชนิด CPU ของ VM เป็น `host` แล้ว **ปิด VM แล้วเปิดใหม่** การ reboot จากในเครื่องไม่ทำให้ค่านี้มีผล `alice-server` ตรวจเรื่องนี้ก่อน `add` และ `upgrade` สร้างโปรแกรมบนเซิร์ฟเวอร์ด้วย `deploy/server/build-release` (รันเป็นผู้ใช้แอดมิน ไม่ใช่ root) แล้วติดตั้งด้วย `sudo alice-server upgrade target/server-dist/bin/alice` ซึ่งเป็นการติดตั้งครั้งแรกด้วย ก่อนติดตั้ง `upgrade` จะให้โปรแกรมใหม่ลองสร้าง embedding หนึ่งข้อความ ถ้าไม่ผ่านจะไม่ติดตั้งอะไรเลย
 4. การ import: คนที่ไม่มีโปรแกรม `alice` ส่ง palace ให้แอดมิน แอดมินรัน `alice-server import <name> <palace-dir>` (ลอง `--dry-run` ก่อนได้ ซึ่งทำงานบนสำเนาและไม่แตะโฟลเดอร์เดิม) การ import จริงจะ **ย้ายและใช้โฟลเดอร์นั้นหมด** และลบสำเนาในเซิร์ฟเวอร์เมื่อจบงาน
-5. key ของ Jev: เซิร์ฟเวอร์นี้ใช้ key ของเจ้าของเพียงอันเดียวให้ทุกคน ใช้ `sudo alice-server jev-key set` แล้ววาง key เมื่อถูกถาม (ไม่แสดงบนจอ) หรือส่งผ่าน stdin ห้ามใส่ key เป็นอาร์กิวเมนต์ ทุก tenant (รวม team) ได้ key และ `judge.provider = jev` ทันที คนที่เพิ่มทีหลังก็ได้ด้วย สั่งซ้ำเพื่อเปลี่ยน key ทุกที่ `jev-key status` บอกว่าใครมี key แต่ไม่แสดง key ไฟล์ของแต่ละ tenant ตรึง endpoint ของ Jev และงบ `ALICE_JUDGE_DAILY_BUDGET_USD` (ค่าเริ่มต้น 1 USD ต่อวันต่อคน) ผู้ใช้จึงส่ง key ไปที่อื่นหรือเพิ่มงบเองไม่ได้ และเห็นแค่ว่า key ตั้งไว้แล้ว
+5. key ของ Jev: เซิร์ฟเวอร์นี้ใช้ key ของเจ้าของเพียงอันเดียวให้ทุกคน ใช้ `sudo alice-server jev-key set` แล้ววาง key เมื่อถูกถาม (ไม่แสดงบนจอ) หรือส่งผ่าน stdin ห้ามใส่ key เป็นอาร์กิวเมนต์ ทุก tenant (รวม team) ได้ key พร้อม `judge.provider = jev` และ `distill.provider = jev` (เปิดการกลั่น session ที่เก็บไว้เป็นความจำ) ทันที คนที่เพิ่มทีหลังก็ได้ด้วย สั่งซ้ำเพื่อเปลี่ยน key ทุกที่ `jev-key status` บอกว่าใครมี key แต่ไม่แสดง key ไฟล์ของแต่ละ tenant ตรึง endpoint ของ Jev และงบ `ALICE_JUDGE_DAILY_BUDGET_USD` (ค่าเริ่มต้น 1 USD ต่อวันต่อคน) ผู้ใช้จึงส่ง key ไปที่อื่นหรือเพิ่มงบเองไม่ได้ และเห็นแค่ว่า key ตั้งไว้แล้ว
 6. ความเป็นส่วนตัว: เซิร์ฟเวอร์ปิดบัง secret (redact) เสมอ `.alice.toml` ของ repo ไม่มีผลทาง MCP ตรง การห้ามส่งโปรเจกต์ขึ้น cloud ตั้งที่รายการ `privacy.cloud_denied_projects` ของผู้ใช้ เช่น `alice-server cli <name> config set privacy.cloud_denied_projects '["my-secret-app"]'`
 7. ดิสก์: แต่ละคนมี backup ตามกำหนด 2 ชุด (ทำเองไม่ได้) `alice-server list` เตือนเมื่อพื้นที่ว่างต่ำกว่า 3 GB ให้ลบ archive เก่าของ `remove` หรือตั้ง `ALICE_BACKUP_DAILY=1` ในไฟล์ของผู้ใช้นั้นแล้วรีสตาร์ท การเก็บสำเนานอกเครื่องเป็นหน้าที่ของแอดมิน
 8. ไม่แบนตาม IP เพราะ NAT ทำให้ทุกการเชื่อมต่อมาจาก IP เดียว ตัวอย่าง filter fail2ban (ปิดไว้) อยู่ใน `docs/server.md` สำหรับแอดมินที่ NAT ส่งต่อ IP จริง
 
 ### สำหรับผู้ใช้
 
-เก็บ token ไว้ในตัวแปรสภาพแวดล้อม `ALICE_TOKEN` ห้ามใส่ใน URL หรือ commit ลง repo
+แอดมินจะให้ที่อยู่ของคุณ `https://<host>/u/<name>` (MCP endpoint คือที่อยู่นี้ต่อท้ายด้วย `/mcp`) และ token ซึ่งมักให้มาเป็นไฟล์ token คือกุญแจเข้าความจำของคุณ อย่าใส่ใน URL, แชต, commit หรือไฟล์ profile ของ shell
 
-- **Claude Code:** สร้าง `.mcp.json` ใน repo (ไม่มี secret จึง commit ได้):
-
-  ```json
-  {
-    "mcpServers": {
-      "alice": {
-        "type": "http",
-        "url": "${ALICE_URL}?project=<slug>",
-        "headers": { "Authorization": "Bearer ${ALICE_TOKEN}" }
-      }
-    }
-  }
-  ```
-
-  หรือใช้คำสั่ง (ใส่เครื่องหมายคำพูดเดี่ยวเพื่อไม่ให้ shell แทนค่า token):
+- **ให้ agent ตั้งค่าให้ (แนะนำ):** ส่ง [docs/setup-server.md](docs/setup-server.md) ให้ Claude Code หรือ Codex มันจะติดตั้ง token และที่อยู่ เชื่อม agent ทั้งสองตัว อัปโหลด MemPalace ถ้าคุณต้องการ และตั้งการเก็บ session อัตโนมัติให้ โดยไม่แสดง token บนจอ ข้อต่อไปนี้คือสิ่งที่มันตั้งให้ เผื่ออยากทำเองหรือใช้กับ agent อื่น
+- **token และที่อยู่:** อยู่ใน `~/.config/alice/token` และ `~/.config/alice/url` ไฟล์ละหนึ่งบรรทัด สิทธิ์ 0600 ในโฟลเดอร์ 0700 ตัวช่วยของ MCP, สคริปต์เก็บ session และการอัปโหลด MemPalace อ่านจากไฟล์นี้ทุกครั้งที่ใช้ ไม่มีการ export token เข้า shell จึงไม่โผล่ในผลของ `env` ห้ามแสดงเนื้อหาไฟล์ ถ้าจะตรวจให้ใช้ `test -s` หรือ `grep -c`
+- **Claude Code:** รับ header จากสคริปต์ `headersHelper` ชื่อ `~/.local/bin/alice-mcp-headers` (ขั้นที่ 2 ของ setup-server.md) ซึ่งอ่าน token จากไฟล์ และเมื่ออยู่ใน git repo จะส่งชื่อโฟลเดอร์ของ repo เป็น header `X-Alice-Project` เพราะ Claude Code รันตัวช่วยจาก `~/.claude` สคริปต์จึงหาโฟลเดอร์ของ session จาก process แม่ด้วย `lsof` จากนั้นเพิ่ม entry ที่ใช้กับทุกโปรเจกต์:
 
   ```bash
-  claude mcp add --transport http --scope project alice \
-    'https://<host>/u/<name>/mcp?project=<slug>' \
-    --header 'Authorization: Bearer ${ALICE_TOKEN}'
+  claude mcp add-json alice "{\"type\":\"http\",\"url\":\"$(head -n 1 ~/.config/alice/url)/mcp\",\"headersHelper\":\"$HOME/.local/bin/alice-mcp-headers\"}" -s user
   ```
 
-- **Codex** (`~/.codex/config.toml`):
+- **Codex:** เพิ่มตารางนี้ใน `~/.codex/config.toml` เอง หลังสำรองไฟล์ไว้ก่อน (อย่าใช้ `codex mcp add` เพราะมันเขียนทับทั้งไฟล์):
 
   ```toml
   [mcp_servers.alice]
   url = "https://<host>/u/<name>/mcp"
   bearer_token_env_var = "ALICE_TOKEN"
+  env_http_headers = { "X-Alice-Project" = "ALICE_PROJECT" }
   ```
 
-- **โปรเจกต์ที่ใช้:** ลำดับคือ argument `project` ของ tool, แล้ว `?project=<slug>` ใน URL (ยาวไม่เกิน 100 ตัวอักษร), แล้วชื่อโฟลเดอร์ของ root แรกที่ agent ส่งมา, สุดท้ายคือ `global`
+  อย่า export ตัวแปรทั้งสองใน profile ของ shell ขั้นที่ 3 ของ setup-server.md เพิ่มฟังก์ชัน `codex` ที่ตั้งค่าทั้งสองให้ Codex เท่านั้น โดยอ่าน token จากไฟล์ทุกครั้งที่เปิด Codex และใช้ชื่อโฟลเดอร์ของ git repo เป็นโปรเจกต์
+- **โปรเจกต์ที่ใช้:** ลำดับคือ argument `project` ของ tool, แล้ว `?project=<slug>` ใน URL (ยาวไม่เกิน 100 ตัวอักษร), แล้ว header `X-Alice-Project`, แล้วชื่อโฟลเดอร์ของ root แรกที่ agent ส่งมา, สุดท้ายคือ `global` ชื่อโฟลเดอร์ภาษาไทยถูกส่งแบบ percent-encoding และเซิร์ฟเวอร์ถอดกลับให้
 - **ความจำส่วนกลาง:** บอก agent ว่า "บันทึกอันนี้ลงความจำส่วนกลางด้วย" ความจำนั้นไปอยู่ที่ส่วนกลางที่เดียว ไม่มีสำเนาส่วนตัว ทุกคนอ่านได้ ผลค้นหาของ `recall` และ `context` จะรวมความจำส่วนกลางและบอกชื่อเจ้าของ แก้ ลบ หรือ undo ได้เฉพาะเรื่องที่ตัวเองเขียน (หรือผ่านแอดมิน) ถ้าส่วนกลางไม่ตอบ การบันทึกส่วนกลางจะล้มเหลวโดยบอกชัดเจน และการค้นหาจะได้ผลส่วนตัวพร้อมหมายเหตุ ส่วนกลางไม่มี URL ของตัวเอง
 - **โมเดลตัดสิน (judge) กับความจำส่วนกลาง:** ในโหมด precise ความจำส่วนกลางจะถูกส่งให้ judge ของคุณให้คะแนนก็ต่อเมื่อนโยบาย cloud ของส่วนกลางสำหรับโปรเจกต์นั้น **และ** นโยบาย cloud ของคุณสำหรับโปรเจกต์นั้นอนุญาตทั้งคู่ ถ้าฝ่ายใดห้าม จะไม่ถูกส่งให้ judge เลย และจะแสดงต่อท้ายผลที่ให้คะแนนแล้ว
 - **Jev และการตั้งค่า:** ขอให้แอดมินรัน `alice-server cli` ให้ (ดูด้านบน) ส่ง key ผ่านช่องทางส่วนตัวเท่านั้น
-- **Import MemPalace:** ส่งโฟลเดอร์ palace ให้แอดมินเป็นคนรัน `alice-server import`
+- **Import MemPalace:** อัปโหลดเองจากเครื่องของคุณด้วย `upload.sh` (ขั้นที่ 4 ของ setup-server.md) หรือส่งโฟลเดอร์ palace ให้แอดมินเป็นคนรัน `alice-server import`
 - **ให้ agent ตั้งค่าให้:** ส่ง [docs/setup-server.md](docs/setup-server.md) ให้ Claude Code หรือ Codex แล้วมันจะเชื่อมต่อทุกอย่างให้ รวมถึงการเก็บ session อัตโนมัติ โดยไม่แสดง token บนจอ
-- **เก็บ session อัตโนมัติ:** รันบรรทัดเดียวที่แอดมินให้ `curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>` มันใช้ `~/.config/alice/token` และ `~/.config/alice/url` ที่มีอยู่แล้ว (ถ้ายังไม่มีจะถามหา token ครั้งเดียว) แล้วติดตั้งสคริปต์และ plugin ของ Claude Code (และ hook ของ Codex ถ้ามี Codex) สคริปต์ไม่อัปเดตตัวเอง หลังแอดมินอัปเกรดเซิร์ฟเวอร์ให้รันบรรทัดเดิมซ้ำ ดูสถานะด้วย `sh ~/.config/alice/alice-capture.sh status` และถอดออกด้วย `sh ~/.config/alice/alice-capture.sh uninstall` รายละเอียดอยู่ในหัวข้อ "Capture for team members" ของ [docs/server.md](docs/server.md#capture-for-team-members)
+- **เก็บ session อัตโนมัติ:** รันบรรทัดเดียวที่แอดมินให้ `curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>` มันใช้ `~/.config/alice/token` และ `~/.config/alice/url` ที่มีอยู่แล้ว (ถ้ายังไม่มีจะถามหา token ครั้งเดียว) แล้วติดตั้งสคริปต์และ plugin ของ Claude Code (และ hook ของ Codex ถ้ามี Codex) สคริปต์ hook อัปเดตตัวเองจากเซิร์ฟเวอร์ Alice ของคุณวันละครั้งผ่าน https และอัปเดต `hooks.json` ของ plugin ให้ด้วยเมื่อมีการเปลี่ยน รันบรรทัดนี้ซ้ำเฉพาะเมื่อต้องซ่อมการติดตั้ง และอีกครั้งหลังรุ่นนี้ ดูสถานะด้วย `sh ~/.config/alice/alice-capture.sh status` และถอดออกด้วย `sh ~/.config/alice/alice-capture.sh uninstall` รายละเอียดอยู่ในหัวข้อ "Capture for team members" ของ [docs/server.md](docs/server.md#capture-for-team-members)
 - **แพลตฟอร์ม:** โปรแกรม `alice` ใช้ได้บน macOS และ Linux ส่วน Windows หรือเครื่องที่ไม่มีโปรแกรม ให้เชื่อม agent เข้ากับ MCP endpoint ของเซิร์ฟเวอร์
 
 ### ข้อควรรู้
@@ -563,9 +548,9 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 |---|---|---|
 | **SP1 · M1** | ที่เก็บข้อมูล, การค้นหาแบบผสม, daemon, MCP, CLI, HTTP API | เสร็จแล้ว (alpha) |
 | **SP1 · M2** | Judge (กฎในเครื่อง + Jev), คิว review, undo, ตัด secret, backup และ restore, maintenance, settings ที่มีผลทันที, doctor, service install, embedding provider ผ่าน HTTP, build บน Windows, เป้าหน่วยความจำ 800MB | เสร็จแล้ว (alpha) |
-| **SP1 · M3** | ตัว import จาก MemPalace และ compatibility layer | สร้างเสร็จแล้ว รอ review สุดท้าย (alpha) |
+| **SP1 · M3** | ตัว import จาก MemPalace และ compatibility layer | เสร็จแล้ว (alpha) |
 | **SP1 · M4** | Git sync | วางแผนแล้ว |
-| **SP2** | เก็บ session ของ Claude Code และ Codex อัตโนมัติ (hook ในเครื่องและสคริปต์สำหรับ tenant บนเซิร์ฟเวอร์), กลั่นความรู้ด้วย Jev, การย้ายจาก MemPalace และ backfill, คู่มือติดตั้งที่ agent ทำตามได้ | กำลังทำ (alpha) |
+| **SP2** | เก็บ session ของ Claude Code และ Codex อัตโนมัติ (hook ในเครื่องและสคริปต์สำหรับ tenant บนเซิร์ฟเวอร์), กลั่นความรู้ด้วย Jev (ปิดไว้เป็นค่าเริ่มต้น), การย้ายจาก MemPalace และ backfill, คู่มือติดตั้งที่ agent ทำตามได้ | สร้างเสร็จแล้ว (alpha) |
 | **SP3** | Web UI (graph, จัดการ memory, review, settings, sync, สุขภาพระบบ) แล้วตามด้วยแอป desktop | วางแผนแล้ว |
 
 การเก็บ session ของ Cursor, Windsurf, OpenCode และ Gemini CLI จะตามมาภายหลัง สวิตช์ `capture.*` ของ agent เหล่านี้มีไว้แล้ว

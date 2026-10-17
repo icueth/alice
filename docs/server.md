@@ -95,9 +95,9 @@ The .mcp.json form is in docs/server.md.
 
 The token is shown once. Hand it to the person over a private channel. If the tenant already exists, `add` prints its URL (not the token) and stops. If anything fails, it undoes what it created.
 
-The `claude mcp add` line keeps `${ALICE_TOKEN}` literal, in single quotes, so the token never lands in a saved configuration. The person sets `ALICE_TOKEN` in their shell.
+The `claude mcp add` line keeps `${ALICE_TOKEN}` literal, in single quotes, so the token never lands in a saved configuration. The recommended setup for a person's machine is [setup-server.md](setup-server.md) instead: it keeps the token in `~/.config/alice/token` and never in the environment, and connects Claude Code through a `headersHelper` script (see [For a person](#for-a-person)).
 
-The tenant file holds no secret. It sets `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALICE_LOG=info`, `ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0` and `TZ`.
+The tenant file holds no secret. It sets `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALICE_LOG=info`, `ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0` and `TZ`, the Jev pins below, and `ALICE_CAPTURE_RAW_RETENTION=180d`: captured transcripts (SP2 capture) age out after 180 days, while imported history and memories stay. The environment wins over the person's settings, so they cannot keep transcripts longer. To change one tenant's, edit that line, then `systemctl restart alice@<name>`; `upgrade` adds the line to tenants made before it and keeps one the admin changed.
 
 `TZ` is the person's time zone, `Asia/Bangkok` unless `--tz` names another IANA zone (it must exist under `/usr/share/zoneinfo`). The daemon runs in it, so an import reads MemPalace's local times with the offset of the person's own machine, as it would on their Mac; stored times stay UTC. Run `alice-server add <name> --tz <zone>` on an existing tenant to change its zone (it restarts that daemon). `upgrade` gives `TZ=Asia/Bangkok` to a tenant made before this line existed and keeps a zone set with `--tz`.
 
@@ -107,7 +107,7 @@ The tenant file holds no secret. It sets `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALI
 
 #### rotate
 
-`alice-server rotate <name>` replaces the token and prints the new one once, as `add` does. The daemon refuses the old token at once. Hand the new token to the person; their agent configuration keeps working as soon as `ALICE_TOKEN` holds the new value.
+`alice-server rotate <name>` replaces the token and prints the new one once, as `add` does. The daemon refuses the old token at once. Hand the new token to the person. Their agents keep working as soon as `~/.config/alice/token` holds the new value: the Claude Code helper reads the file when it connects, and the Codex function when Codex starts. Capture pauses for an hour after the server first refuses the old token; running the capture setup line again ends the pause at once (it asks for the new token).
 
 #### list
 
@@ -175,13 +175,12 @@ sudo alice-server jev-key set        # paste the key at the prompt (it is not sh
 sudo alice-server jev-key status
 ```
 
-`jev-key set` reads the key from the terminal with echo off, or from standard input; never from the command line or the environment. It keeps it in `/etc/alice/jev.key` (root's only, 0600) and gives it to every tenant, the team store included: into the tenant's own `secrets.toml` (0600, its user's), through its running daemon, with `judge.provider = jev`. It takes effect at once; nothing restarts. `alice-server add` gives every new tenant the key. Run `jev-key set` again to rotate the key everywhere. `jev-key status` says whether a key is set and, for each tenant, whether it holds the server's key, another one or none. It never prints a key or part of one.
+`jev-key set` reads the key from the terminal with echo off, or from standard input; never from the command line or the environment. It keeps it in `/etc/alice/jev.key` (root's only, 0600) and gives it to every tenant, the team store included: into the tenant's own `secrets.toml` (0600, its user's), through its running daemon, with `judge.provider = jev` and `distill.provider = jev` (SP2: captured sessions are distilled into memories with the same key and budget). It takes effect at once; nothing restarts. `alice-server add` gives every new tenant the key. Run `jev-key set` again to rotate the key everywhere. `jev-key status` says whether a key is set and, for each tenant, whether it holds the server's key, another one or none. It never prints a key or part of one.
 
 **The key stays the owner's.** Each tenant file pins `ALICE_JUDGE_JEV_ENDPOINT` (Jev's own endpoint) and `ALICE_JUDGE_DAILY_BUDGET_USD`, and the environment wins over a person's settings: a person cannot send the shared key anywhere else or raise the budget, and their settings show the key as set, without any part of it. `upgrade` adds both lines to tenants made before them.
 
 **Budget.** Each tenant's judge budget is 1.00 USD a day by default. The deployment-wide ceiling is the number of tenants times that: with four people and the team store, 5.00 USD a day. To change one tenant's, edit `ALICE_JUDGE_DAILY_BUDGET_USD` in `/etc/alice/tenants/<name>.env`, then `systemctl restart alice@<name>`; `upgrade` keeps it. When a tenant reaches its budget, precise recall answers with the search order and says so.
 
-SP2's distillation (`distill.provider = jev`) will be switched on by the same command once it lands on this branch.
 
 #### cli
 
@@ -272,59 +271,62 @@ For each tenant Caddy exposes `/api/v1/*` and `/mcp`, except `/api/v1/admin/*` (
 
 ## For a person
 
-Your admin gives you three things: the MCP URL `https://<host>/u/<name>/mcp`, your token, and a project name for each repository (a short slug such as `my-app`).
+Your admin gives you two things: your tenant address, `https://<host>/u/<name>` (the MCP endpoint is that address with `/mcp`), and your token, usually as a file. The token is the key to your memory: keep it out of chats, commits, URLs and shell profiles.
 
-Keep the token in an environment variable named `ALICE_TOKEN`. Set it in your shell profile or a secrets manager, not in a file you commit. Do not put the token in a URL.
+**The easy way:** hand [setup-server.md](setup-server.md) to Claude Code or Codex. It installs the token and the address, connects both agents, uploads your MemPalace if you want, and sets up automatic capture, without ever showing the token. The rest of this section is what it sets up, for reference and for other agents.
+
+### The token and the address
+
+Both live in `~/.config/alice` (mode 0700): the token in `token` and the address in `url`, one line each, mode 0600. The MCP helpers below, the capture script and the MemPalace upload read them each time they need them. To write them yourself:
 
 ```bash
-read -rs ALICE_TOKEN && export ALICE_TOKEN    # paste the token, press Enter
+mkdir -p ~/.config/alice && chmod 700 ~/.config/alice
+(umask 077; read -rs T && printf '%s\n' "$T" > ~/.config/alice/token)    # paste the token, press Enter
+(umask 077; printf '%s\n' 'https://<host>/u/<name>' > ~/.config/alice/url)
 ```
+
+Nothing exports the token into your shell, so an environment dump (`env`, a tool's error report) never shows it. Never print these files; check them with `test -s` or `grep -c`.
 
 ### Claude Code
 
-For one repository, write a `.mcp.json` in its root. It holds no secret, so you can commit it. Claude Code expands `${VAR}` in `url` and `headers`:
+Claude Code takes its headers from a `headersHelper` script, so the token never sits in Claude Code's configuration. [setup-server.md](setup-server.md#step-2-claude-code-only-if-claude-exists) (Step 2) writes the helper, `~/.local/bin/alice-mcp-headers`. It prints the `Authorization` header with the token from `~/.config/alice/token` and, inside a git repository, an `X-Alice-Project` header with the repository's folder name. Claude Code runs helpers from `~/.claude`, so the helper finds the session's folder through its parent process with `lsof`. Then the entry, for every project:
+
+```bash
+claude mcp add-json alice "{\"type\":\"http\",\"url\":\"$(head -n 1 ~/.config/alice/url)/mcp\",\"headersHelper\":\"$HOME/.local/bin/alice-mcp-headers\"}" -s user
+```
+
+**The `.mcp.json` form**, for one repository: the same entry in the repository's `.mcp.json`, with `?project=<slug>` on the URL to pin its project.
 
 ```json
 {
   "mcpServers": {
     "alice": {
       "type": "http",
-      "url": "${ALICE_URL}?project=<slug>",
-      "headers": {
-        "Authorization": "Bearer ${ALICE_TOKEN}"
-      }
+      "url": "https://<host>/u/<name>/mcp?project=<slug>",
+      "headersHelper": "/home/<you>/.local/bin/alice-mcp-headers"
     }
   }
 }
 ```
 
-Set `ALICE_URL` to `https://<host>/u/<name>/mcp` in your environment, next to `ALICE_TOKEN`.
-
-You can add the server from the command line instead. Use `--scope project` so it is written to `.mcp.json`, and single quotes so the shell does not expand the token:
-
-```bash
-claude mcp add --transport http --scope project alice \
-  'https://<host>/u/<name>/mcp?project=<slug>' \
-  --header 'Authorization: Bearer ${ALICE_TOKEN}'
-```
-
-With double quotes, your shell would put the real token into the saved configuration.
+It holds no token. The helper is named by its absolute path on your machine, so commit the file only if everyone who uses the repository keeps the helper at that path. A `?project=` pin does not reach capture: see [Which project a captured session lands in](#which-project-a-captured-session-lands-in).
 
 ### Codex
 
-Add this to `~/.codex/config.toml`:
+Codex sends the token from an environment variable and the project from another:
 
 ```toml
 [mcp_servers.alice]
 url = "https://<host>/u/<name>/mcp"
 bearer_token_env_var = "ALICE_TOKEN"
+env_http_headers = { "X-Alice-Project" = "ALICE_PROJECT" }
 ```
 
-`bearer_token_env_var` names the variable. Codex reads the token from it and sends it as `Authorization: Bearer`. This table sends no project, so name the project in each request (see below) or append `?project=<slug>` to the `url`. [setup-server.md](setup-server.md#step-3-codex-only-if-codex-exists) adds `env_http_headers` and a shell wrapper instead, which send the repository's folder name as `X-Alice-Project` and give Codex the token without exporting it.
+`bearer_token_env_var` names the variable Codex reads the token from, and sends as `Authorization: Bearer`; `env_http_headers` sends `X-Alice-Project` from `ALICE_PROJECT`. Do not export either in your shell profile. [setup-server.md](setup-server.md#step-3-codex-only-if-codex-exists) (Step 3) adds a small `codex` shell function that sets both for Codex alone: the token read from `~/.config/alice/token` each time Codex starts, and the project from the git repository's folder name. Append the table to `~/.codex/config.toml` by hand, after a backup: `codex mcp add` rewrites the whole file.
 
 ### Other agents
 
-Any client that speaks MCP over streamable HTTP works. Give it the URL and the header `Authorization: Bearer <token>`, with the token read from the environment.
+Any client that speaks MCP over streamable HTTP works. Give it the MCP URL and the header `Authorization: Bearer <token>`, with the token read from `~/.config/alice/token` when it connects (a headers helper, a wrapper, a secrets manager), never typed into a saved configuration.
 
 ### Which project a memory goes to
 
@@ -336,22 +338,7 @@ Alice picks the project in this order:
 4. the folder name of the first workspace root the agent offers;
 5. `global`.
 
-Claude Code sends no workspace roots over HTTP, so without one of the first three every session lands in `global`. Its `headersHelper` can send the header from the folder it runs in. In `~/.claude/settings.json` (or the server's entry of `.mcp.json`):
-
-```json
-"headersHelper": "/path/to/alice-headers.sh"
-```
-
-with `alice-headers.sh` printing the headers as JSON, the token from the environment and the project from the git checkout's folder name, percent-encoded so a Thai folder name comes through (Node cannot send it as it is):
-
-```sh
-#!/bin/sh
-name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
-project=$(printf '%s' "$name" | python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read()))')
-printf '{"Authorization": "Bearer %s", "X-Alice-Project": "%s"}\n' "$ALICE_TOKEN" "$project"
-```
-
-A header that is not UTF-8 after decoding fails the call, rather than putting the memory in another project.
+Claude Code sends no workspace roots over HTTP, so without one of the first three every session lands in `global`. The `alice-mcp-headers` helper sends the header from the session's git repository, and the Codex function does the same. A folder name that is not plain ASCII (a Thai name, say) is sent percent-encoded, because Node cannot send it as it is; the server decodes it. A header that is not UTF-8 after decoding fails the call, rather than putting the memory in another project.
 
 A slug that matches no stored project makes a new, empty project of that name. Memories you write now and an imported palace with the same wing name land together.
 
@@ -441,7 +428,7 @@ If you would rather not run anything, you can still give your palace folder to y
 
 ## Capture for team members
 
-A person's Claude Code and Codex sessions can be saved to their own tenant as they happen: every finished turn goes into the tenant's raw tier, in the session's project, where `recall` finds it with `include_raw`. On this server, ended sessions are also distilled into a few short memories by Jev. The person installs no Alice binary: capture needs `sh`, `curl` and the agent. What is kept and what never is, and how distillation works, are in [capture.md](capture.md).
+A person's Claude Code and Codex sessions can be saved to their own tenant as they happen: every finished turn goes into the tenant's raw tier, in the session's project, where `recall` finds it with `include_raw`. Where distillation is on (`alice-server jev-key set` turns it on, see [below](#distillation-and-the-shared-jev-key)), ended sessions are also distilled into a few short memories by Jev. The person installs no Alice binary: capture needs `sh`, `curl` and the agent. What is kept and what never is, and how distillation works, are in [capture.md](capture.md).
 
 ### The setup line
 
@@ -451,14 +438,14 @@ The admin gives each person one line, to run on their own machine:
 curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>
 ```
 
-<!-- TODO(confirm): whether `alice-server add` prints this line (and a command prints it again) is the server lane's interface (SP2 spec §9.5); not in deploy/server/alice-server on this branch. -->
+`alice-server` does not print this line: write it from the person's tenant address, the URL `add` printed, which appears twice in it.
 
 - **Run it after the MCP setup.** [setup-server.md](setup-server.md) (which an agent can run for the person) writes `~/.config/alice/token` and `~/.config/alice/url` first; the setup line then asks nothing. Without those files it asks for the token once, on the terminal with typing hidden, and writes both files (0600, in a 0700 `~/.config/alice`). It never takes the token from the command line or the environment, and never keeps a second copy.
 - **Nothing is written before the token is checked.** The script checks the address (`https://`, or `http://` to `127.0.0.1` or `localhost` for tests) and asks `GET /api/v1/capture/status` whether the token works. A refused token from the file is reported, and the script asks once for a new one. Pointed at a local daemon instead of a tenant, it stops and says so.
-- **Running it again updates everything in place.** It keeps the person's `briefing=off` choice. **The hook script does not update itself:** setup downloads it once, into `~/.config/alice/alice-capture.sh`. After an upgrade that changes the capture scripts, ask everyone to run the same line again. It reuses `~/.config/alice/token` and `~/.config/alice/url` without asking.
+- **Updates.** The tenant hook script updates itself from your Alice server once a day, over https, and updates the plugin's `hooks.json` when that changes. Re-run the setup line only to repair an install, and once after this release. So after an `alice-server upgrade` that changes the capture scripts, nobody has to do anything: each machine picks the new script up within a day, at its next agent event. A re-run of the line updates everything in place, keeps the person's `briefing=off` choice, and reuses `~/.config/alice/token` and `~/.config/alice/url` without asking.
 - **Hooks load in new sessions.** The person starts a new Claude Code (or Codex) session afterwards.
 
-`GET /api/v1/capture/setup.sh` and `GET /api/v1/capture/hook.sh` are public, like `/api/v1/ping`: static text compiled into the binary, with no secret and no address, behind the Host and Origin checks but no token.
+`GET /api/v1/capture/setup.sh` and `GET /api/v1/capture/hook.sh` are public, like `/api/v1/ping`: static text compiled into the binary, with no secret and no address, behind the Host and Origin checks but no token. The hook script is served with its version line filled in: the first 12 hex digits of the SHA-256 of its text, so a machine sees a new version exactly when the script changed.
 
 ### What it installs
 
@@ -468,8 +455,9 @@ All under `~/.config/alice` (mode 0700):
 |---|---|---|
 | `token`, `url` | 0600 | The person's token and tenant address, shared with their MCP setup. Read, never changed, when they exist |
 | `capture.conf` | 0600 | One option, `briefing=on` or `briefing=off`; no secret |
-| `alice-capture.sh` | 0700 | The hook script, downloaded from the tenant |
-| `state/` | 0700 | One `<agent>-<session>[-<agent_id>].offset` file per transcript (how far it was sent), and a lock while one is being sent |
+| `alice-capture.sh` | 0700 | The hook script, downloaded from the tenant; it replaces itself with the tenant's newer version, at most once a day |
+| `update-checked` | 0600 | When the last update check started (setup writes it too, so the first check comes a day after setup) |
+| `state/` | 0700 | One `<agent>-<session>[-<agent_id>].offset` file per transcript (how far it was sent), a lock while one is being sent, and `update.lock/` while an update check runs |
 | `capture.log` | 0600 | At most 256 KB: session ids, offsets, sizes, HTTP statuses. Never the token, never transcript text |
 | `paused-until` | 0600 | Present for an hour after the server refused the token |
 | `claude-marketplace/` | 0700 | A local Claude Code plugin marketplace, `alice-local`, holding the plugin `alice-capture` at the tenant's version |
@@ -492,6 +480,7 @@ sh "$HOME/.config/alice/alice-capture.sh" hook claude-code || true
 - **Nothing is lost when the server is away.** On a network error or a server error the offset stays, and the next event of that session tries again: the transcript file itself is the queue. Each `SessionStart` also finishes up to five other sessions whose transcripts grew meanwhile.
 - **Nothing is stored twice.** A script that lost its offset is told the server's cursor (`409`) and jumps there; a turn sent again is skipped by its key.
 - **A refused token pauses capture for an hour.** The log says "the token was refused; run the setup command again (capture is paused for an hour)". Running the setup line again ends the pause at once: it checks the token (asking for the new one when the stored one is refused) and clears `paused-until`. A new token written into `~/.config/alice/token` alone is used only when the hour is over.
+- **It updates itself once a day.** The first background copy a day or more after the last check fetches `GET /api/v1/capture/hook.sh` over https (no token is sent), before it uploads anything. When the version differs and the download passes its checks (it starts with `#!/bin/sh`, holds the marker and version lines, ends with `main "$@"`, passes `sh -n`, and `dash -n` where dash exists, and a trial run prints its hooks file within 20 seconds), it replaces the script in one step; otherwise the installed script stays byte for byte. Then the plugin's `hooks.json`, and Codex's `hooks.json` while it is still the one setup wrote, follow the new script when they differ: Claude Code reloads the plugin with `claude plugin update` in the background (at most 120 seconds), and Codex runs changed hooks only after the person trusts them again in `/hooks`. `capture.log` shows `capture hook updated <old> → <new>` for an update, `capture hook update refused (HTTP <code>…); the installed script stays` for a refusal, and `capture hook update check failed (curl exit <n>, …)` when the server could not be reached; the next check is a day later either way. A tenant address on plain `http://` (only `127.0.0.1` or `localhost`, for tests) never updates: `capture hook update skipped: it runs over https:// only, …`.
 - **The token** reaches `curl` only as a config line on its standard input (`curl -q -K -`, written by the shell's `printf`). It is never in a command line, a URL, a child's environment or a log.
 
 ### The briefing
@@ -519,13 +508,13 @@ The script names the project after the folder of the git repository the session 
 
 ### Retention
 
-Captured transcripts are kept **180 days** on every tenant, pinned by the line `ALICE_CAPTURE_RAW_RETENTION=180d` in `/etc/alice/tenants/<name>.env`. The environment wins over the tenant's `config.toml`, so a person's own settings cannot keep them longer; the admin changes the line (`90d` for the heaviest tenant, say) and runs `systemctl restart alice@<name>`. The daily job `capture_retention` deletes only captured chunks: imported MemPalace history and every memory stay, distilled ones included. <!-- TODO(confirm): `alice-server add` writing the line, and `upgrade` adding it where unset, are the server lane's interface (SP2 spec §9.5); not in deploy/server/alice-server on this branch. -->
+Captured transcripts are kept **180 days** on every tenant (the open-source default is `forever`), pinned by the line `ALICE_CAPTURE_RAW_RETENTION=180d` in `/etc/alice/tenants/<name>.env`. `alice-server add` writes the line, and `upgrade` adds it to tenants made before it (saying `captured transcripts kept 180d for: <names>`) and keeps a value the admin changed. The environment wins over the tenant's `config.toml`, so a person's own settings cannot keep them longer; the admin changes the line (`90d` for the heaviest tenant, say) and runs `systemctl restart alice@<name>`. The daily job `capture_retention` deletes only captured chunks: imported MemPalace history and every memory stay, distilled ones included.
 
 As an estimate, carrying over the 16.8 KB per imported drawer (with its two backups) that the [Disk budget](#disk-budget) measures to captured chunks, a heavy user (about 1,000 chunks a day) holds about 3.0 GB of captured transcripts at 180 days, and a lighter one (300 a day) about 0.9 GB. Captured chunks have not been measured yet.
 
 ### Distillation and the shared Jev key
 
-On this server Jev is on for everyone with the owner's one key (see [jev-key](#jev-key)), and distillation (`distill.provider = jev`) is on for every tenant. The open-source default is off: it is this deployment that turns it on. <!-- TODO(confirm): how `distill.provider = jev` reaches each tenant (`alice-server add` once the key is provisioned, per SP2 spec §9.3); the jev-key section above still says it will join later. -->
+Distillation is off by default (`distill.provider = off`), on a tenant as anywhere: the admin turns it on. `alice-server jev-key set` gives every tenant the owner's Jev key with `judge.provider = jev` and `distill.provider = jev` (see [jev-key](#jev-key)), and `alice-server add` does the same for a tenant added once the key is set. Without a server key, distillation stays off. To keep one tenant's off, run `alice-server cli <name> config set distill.provider off`, again after every `jev-key set`, which turns it back on.
 
 - A person never sees or supplies the key. The setup line's summary says whether distillation is on (`distillation: on`), from the tenant's own setting.
 - **Spend is per tenant**, inside its judge budget (`ALICE_JUDGE_DAILY_BUDGET_USD`, 1.00 USD a day by default), of which distillation may use half (`distill.budget_share = 0.5`). **The deployment-wide ceiling** is the number of daemons times that budget: 5.00 USD a day with four people and the team store, of which distillation can be at most 4 × 0.50 = 2.00 USD (the team store captures nothing). Expected spend is far lower, about 0.001-0.003 USD per distilled session.
@@ -539,23 +528,23 @@ sh ~/.config/alice/alice-capture.sh status
 sh ~/.config/alice/alice-capture.sh uninstall
 ```
 
-`status` shows the address, whether the server accepts the token, whether capture and distillation are on, the briefing switch, how many transcripts are followed, the plugin and the Codex hooks. It never prints the token. It also lists transcripts that wait:
+`status` shows the address, whether the server accepts the token, whether capture and distillation are on, the hook script's version and how long ago it last checked for an update, the briefing switch, how many transcripts are followed, the plugin and the Codex hooks. It never prints the token. It also lists transcripts that wait:
 
 - `stopped: <key>`: the server's cursor is past the file's end (the server already holds more of that session than the file has, for example after the file was replaced). Delete `~/.config/alice/state/<key>.offset` to start that transcript again.
 - `waiting: <key>`: the server took nothing at that size (no complete turn yet, or the tenant's rules for that project are not known right now); it is sent again when the file grows. Deleting the state file resets it.
 
-`uninstall` removes the plugin and the marketplace (or prints `/plugin uninstall alice-capture@alice-local` and `/plugin marketplace remove alice-local` to type in Claude Code), removes the Codex `hooks.json` only if it is still exactly the one setup wrote, and then asks before deleting the script, `state/`, `capture.conf`, `capture.log` and `paused-until`. It never deletes `token` or `url`, which the MCP setup uses. Restart open Claude Code and Codex sessions afterwards, so none still runs the removed hooks.
+`uninstall` removes the plugin and the marketplace (or prints `/plugin uninstall alice-capture@alice-local` and `/plugin marketplace remove alice-local` to type in Claude Code), removes the Codex `hooks.json` only if it is still exactly the one setup wrote, and then asks before deleting the script, `state/`, `capture.conf`, `capture.log`, `paused-until` and `update-checked`. It never deletes `token` or `url`, which the MCP setup uses. Restart open Claude Code and Codex sessions afterwards, so none still runs the removed hooks.
 
 ### What the admin's script provides
 
-Capture needs these from `alice-server` (SP2 spec §9.5): <!-- TODO(confirm): none of the four is in deploy/server/alice-server on this branch yet; pane 3 implements them. -->
+What capture takes from `alice-server` (SP2 spec §9.5):
 
-| Interface | What it does |
+| Interface | What `alice-server` does |
 |---|---|
-| Print the setup line | `alice-server add <name>`, and a command to print it again, print the setup line above |
-| Pin capture retention | `add` writes `ALICE_CAPTURE_RAW_RETENTION=180d` into the tenant's file, and `upgrade` adds it where unset |
-| Jev on with the shared key | Once `alice-server jev-key set` has provisioned the key, `add` sets `judge.provider = jev` and `distill.provider = jev` for the tenant |
-| Adoption | `alice-server adopt` moves a database whole, so its capture cursors and turn keys travel with it |
+| The setup line | Nothing: it does not print the line. Write it from the tenant's URL (see [The setup line](#the-setup-line)) |
+| Capture retention | `add` writes `ALICE_CAPTURE_RAW_RETENTION=180d` into the tenant's file; `upgrade` adds it where it is missing and keeps a value the admin changed |
+| Distillation with the shared key | `jev-key set` gives every tenant the key with `judge.provider = jev` and `distill.provider = jev`; `add` does the same for a new tenant once the key is set |
+| Adoption | `adopt` moves a database whole, so its capture cursors and turn keys travel with it; it clears the captured sessions' transcript paths and file identities, which a tenant never reads |
 
 ### Moving a local Alice that already captured
 
@@ -581,6 +570,9 @@ The script's first upload of a session the machine already captured starts at of
 | Codex sessions are not captured | The hooks are not trusted yet, or the person has their own `hooks.json` | Trust them in Codex's `/hooks`; add the entries setup printed |
 | No briefing at session start | `briefing=off`, `capture.briefing = false`, a resumed session, or a server slower than 2 s | Check `status`; the agent still calls `context` itself |
 | Memories and transcripts of one repository in two projects | An MCP `?project=` pin differs from the folder name | See [Which project a captured session lands in](#which-project-a-captured-session-lands-in) |
+| `capture.log`: "capture hook update refused …" or "capture hook update check failed …" | The day's update check got no usable script; the installed one stays | Nothing: it tries again a day later. If it repeats, run the setup line again |
+| `capture.log`: "the plugin's hooks.json changed, and claude plugin update failed …" | An update changed the plugin's hooks, and the `claude` command did not reload them | Run the setup line again |
+| `capture.log`: "updated … hooks.json with the hook script; Codex runs the changed hooks only after you trust them again …" | An update changed the Codex hooks | Open Codex, type `/hooks`, and trust the Alice entries again |
 
 ## Troubleshooting
 
@@ -591,9 +583,9 @@ The script's first upload of a session the machine already captured starts at of
 | `the new binary failed its self-test (exit …; last output: …)` | It could not load or run the model (often no network for the first model download) | Read the last output; check that the server reaches huggingface.co, then run `upgrade` again |
 | `write ALICE_PUBLIC_HOST=<the server's public IP or name> to /etc/alice/server.env first` | `/etc/alice/server.env` does not exist | Create it with `ALICE_PUBLIC_HOST=<host>` |
 | `ALICE_PUBLIC_HOST is empty in /etc/alice/server.env` | The file exists but the host is empty | Write `ALICE_PUBLIC_HOST=<host>` to it |
-| HTTP 401 from the MCP URL | The token is wrong or was rotated | Check `ALICE_TOKEN`; ask the admin for a new token |
+| HTTP 401 from the MCP URL | The token is wrong or was rotated | Check that `~/.config/alice/token` holds the current token (the check in [setup-server.md](setup-server.md) Step 1 prints `200`); ask the admin for a new token |
 | HTTP 404 from the MCP URL | The tenant name is wrong or was removed; `/u/team/` never exists | Check the URL with the admin |
-| The agent cannot start the server entry | `ALICE_URL` or `ALICE_TOKEN` is not set in the agent's environment | Set them in the shell that starts the agent, then restart it |
+| The agent cannot connect to the server entry | Claude Code: the helper `~/.local/bin/alice-mcp-headers` is missing, not executable, or cannot read `~/.config/alice/token`. Codex: it was not started through the `codex` shell function, so it has no token | Run Step 2 or Step 3 of [setup-server.md](setup-server.md) again; start Codex from a new terminal |
 | "memory daemon is starting (downloading the embedding model …)" | A new tenant is fetching its model | Wait a few minutes and try again |
 | A shared write fails | No team store, or it did not answer | Ask the admin whether `alice-server add --team team` was run, and check `alice-server list` |
 | "only the author or the admin can change a shared memory" | The memory was written by someone else | Ask the author, or the admin |

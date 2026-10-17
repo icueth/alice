@@ -132,8 +132,6 @@ alice hooks install claude
 alice hooks status claude
 ```
 
-<!-- TODO(confirm): `alice hooks` comes from Task 8 (commit 4eaa6a8, not yet merged into feat/sp2-capture). -->
-
 The install adds five hooks to `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`), keeps every other
 hook and setting, and saves the old file as `settings.json.alice-backup-<time>`. If it refuses because the file is not
 valid JSON, tell the person; do not edit the file yourself. Note any hooks it lists under "Other hooks mention alice or

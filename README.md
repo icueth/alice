@@ -16,7 +16,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Status: M2 complete — alpha.** The store, hybrid search (Thai, English and code identifiers), the daemon, the seven MCP tools, the CLI and the HTTP API (M1) now come with a write path that looks after itself: secret redaction, an offline judge with TypeSafe Jev as an option, a review inbox, history and undo, backups and restore, live settings with a private secrets file, `alice doctor`, `alice service install` and HTTP embedding providers (M2). CI builds and tests all of it on macOS, Linux and Windows; on Windows the CLI and daemon process tests run on Unix only (see [platform support](#platform-support)). There are no packaged releases yet: [install from source](#install-from-source). Features marked *(planned)* arrive in later milestones; see the [roadmap](#roadmap). Expect breaking changes before 1.0.
+> **Status: alpha — M1, M2, M3 and SP2 built.** The store, hybrid search (Thai, English and code identifiers), the daemon, the seven MCP tools, the CLI and the HTTP API (M1) come with a write path that looks after itself: secret redaction, an offline judge with TypeSafe Jev as an option, a review inbox, history and undo, backups and restore, live settings with a private secrets file, `alice doctor`, `alice service install` and HTTP embedding providers (M2). The MemPalace importer (M3), a server mode for a small team, and automatic capture of Claude Code and Codex sessions (SP2) are built too; distilling captured sessions into memories is off by default. CI builds and tests all of it on macOS, Linux and Windows; on Windows the CLI and daemon process tests run on Unix only (see [platform support](#platform-support)). There are no packaged releases yet: [install from source](#install-from-source). Features marked *(planned)* arrive in later milestones; see the [roadmap](#roadmap). Expect breaking changes before 1.0.
 
 ---
 
@@ -79,9 +79,6 @@ Alice runs where you choose: on your own machine, or as your own space (a "tenan
 | Shared team memory | No | Optional |
 | Platforms | macOS (Apple Silicon), Linux (glibc) | Any agent that speaks MCP over HTTP; capture on macOS and Linux |
 | Setup guide | [docs/setup-local.md](docs/setup-local.md) | [docs/setup-server.md](docs/setup-server.md) |
-
-<!-- TODO(confirm): `alice hooks` comes from Task 8 (commit 4eaa6a8 on feat/sp2-local-hooks), not yet merged into this
-branch; the same holds for its other mentions below. -->
 
 Both setup guides are written for an agent: hand the file to Claude Code or Codex ("Read docs/setup-local.md and follow every step") and it installs and connects everything, asking you only about your choices (importing MemPalace, retiring it, turning distillation on). You can start locally and move later: your admin can adopt your local database into a tenant ([docs/server.md](docs/server.md#moving-your-local-alice-to-the-server)).
 
@@ -485,7 +482,7 @@ A small team can share one Linux server. Each person gets their own Alice daemon
 The admin guide (setup, `alice-server`, disk budget, backups, privacy), the setup for each agent and capture for team members are in [docs/server.md](docs/server.md). For a person:
 
 - **Let an agent set it up:** hand [docs/setup-server.md](docs/setup-server.md) to Claude Code or Codex. It connects everything, automatic capture included, without showing the token.
-- **Automatic capture:** run the one line the admin gives, `curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>`. It reuses `~/.config/alice/token` and `~/.config/alice/url` (asking once for the token when they are missing) and installs the hook script and a Claude Code plugin (and Codex's hooks when Codex is installed). The script does not update itself: after the admin upgrades the server, run the same line again. `sh ~/.config/alice/alice-capture.sh status` shows the capture and `sh ~/.config/alice/alice-capture.sh uninstall` removes it; details in "Capture for team members" of [docs/server.md](docs/server.md#capture-for-team-members).
+- **Automatic capture:** run the one line the admin gives, `curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>`. It reuses `~/.config/alice/token` and `~/.config/alice/url` (asking once for the token when they are missing) and installs the hook script and a Claude Code plugin (and Codex's hooks when Codex is installed). The hook script updates itself from your Alice server once a day, over https, and updates the plugin's `hooks.json` when that changes. Re-run the setup line only to repair an install, and once after this release. `sh ~/.config/alice/alice-capture.sh status` shows the capture and `sh ~/.config/alice/alice-capture.sh uninstall` removes it; details in "Capture for team members" of [docs/server.md](docs/server.md#capture-for-team-members).
 
 ## Roadmap
 
@@ -493,9 +490,9 @@ The admin guide (setup, `alice-server`, disk budget, backups, privacy), the setu
 |---|---|---|
 | **SP1 · M1** | Store, hybrid search, daemon, MCP, CLI, HTTP API | Done (alpha) |
 | **SP1 · M2** | Judge (heuristic + Jev), review inbox, undo, redaction, backups and restore, maintenance, live settings, doctor, service install, HTTP embedding providers, Windows build, the 800 MB memory budget | Done (alpha) |
-| **SP1 · M3** | MemPalace importer and compatibility layer | Built, in final review (alpha) |
+| **SP1 · M3** | MemPalace importer and compatibility layer | Done (alpha) |
 | **SP1 · M4** | Git sync | Planned |
-| **SP2** | Automatic capture of Claude Code and Codex sessions (local hooks and server-tenant scripts), distillation with Jev, MemPalace cut-over and backfill, agent-runnable setup guides | In progress (alpha) |
+| **SP2** | Automatic capture of Claude Code and Codex sessions (local hooks and server-tenant scripts), distillation with Jev (off by default), MemPalace cut-over and backfill, agent-runnable setup guides | Built (alpha) |
 | **SP3** | Web UI (graph, memory manager, reviews, settings, sync, health), then a desktop app | Planned |
 
 Capture for Cursor, Windsurf, OpenCode and Gemini CLI comes later; their `capture.*` switches already exist.
