@@ -742,6 +742,7 @@ impl Scheduler {
                 w.submit_blocking(WriteOp::RequeueJudgeRetries {
                     max_attempts: crate::judge_worker::MAX_ATTEMPTS,
                     now: ts(now),
+                    distill: Some(self.ctx.settings.get().distill.clone()),
                 })?;
                 let _ = self.ctx.judge_wake.try_send(());
                 Ok(Step::Finished("judge retries queued".into()))

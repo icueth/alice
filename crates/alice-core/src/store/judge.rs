@@ -197,6 +197,19 @@ pub fn retry_backoff(base: std::time::Duration, failures: u32) -> std::time::Dur
 /// The default `base` of [`retry_backoff`].
 pub const RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// The distilled memories [`requeue_retries`] gives up on with `max_attempts`, oldest first: the
+/// writer keeps each one's session best set at its size once they settle (SP2 Task 12c review
+/// 2, N1).
+pub fn distilled_giving_up(conn: &Connection, max_attempts: u32) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM memories WHERE judge_state <> 'done' AND judge_state = 'retry'
+           AND judge_attempts >= ?1 AND origin = 'distill' ORDER BY seq",
+    )?;
+    Ok(stmt
+        .query_map([max_attempts], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
 /// `retry` memories whose time has come (`judge_next_try_at` passed, `now` is an RFC 3339
 /// string) become `pending` for another try; those that failed `max_attempts` times stop
 /// (`done`). Only `retry` rows change. Returns (requeued, given up).

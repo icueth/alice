@@ -142,12 +142,13 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
 /// Insert an event; returns its id. Call inside the transaction that made the change.
 pub fn record(conn: &Connection, e: &EventInput<'_>, hlc: &str) -> Result<String> {
     let id = new_id();
+    let ts = now_rfc3339();
     conn.prepare_cached(&format!(
         "INSERT INTO events ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
     ))?
     .execute(params![
         id,
-        now_rfc3339(),
+        ts,
         hlc,
         e.actor.as_string(),
         e.action,
@@ -157,6 +158,14 @@ pub fn record(conn: &Connection, e: &EventInput<'_>, hlc: &str) -> Result<String
         e.after.as_ref().map(|v| v.to_string()),
         e.group,
     ])?;
+    // A person's or an agent's change to a distilled memory marks it touched: the distill cap
+    // never replaces it (SP2 Task 12c addendum), however long the history keeps this event.
+    if e.target_type == "memory" && matches!(e.actor, Actor::User | Actor::Agent(_)) {
+        conn.prepare_cached(
+            "UPDATE memories SET touched_at = ?2 WHERE id = ?1 AND origin = 'distill'",
+        )?
+        .execute(params![e.target_id, ts])?;
+    }
     Ok(id)
 }
 

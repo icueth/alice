@@ -1,0 +1,183 @@
+{
+  "sessions": [
+    {
+      "file": "l01.jsonl",
+      "kind": "gold",
+      "gold": [
+        {
+          "phrase": "keep berth bookings in PostgreSQL with an exclusion constraint",
+          "kinds": [
+            "decision"
+          ]
+        },
+        {
+          "phrase": "the tide table importer read times as local time",
+          "kinds": [
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "Never run the berth migration on a Friday",
+          "kinds": [
+            "warning"
+          ]
+        },
+        {
+          "phrase": "The vessel tracking feed comes from AIS through the aisstream relay",
+          "kinds": [
+            "fact"
+          ]
+        },
+        {
+          "phrase": "harbour replay --date",
+          "kinds": [
+            "howto"
+          ]
+        },
+        {
+          "phrase": "every SQL migration gets a matching down migration",
+          "kinds": [
+            "preference",
+            "decision"
+          ]
+        },
+        {
+          "phrase": "Pilot boarding requests go to the pilots' cooperative",
+          "kinds": [
+            "fact"
+          ]
+        },
+        {
+          "phrase": "send crane assignments as server-sent events instead of polling",
+          "kinds": [
+            "decision"
+          ]
+        },
+        {
+          "phrase": "The demurrage report double-counted vessels that shifted berths",
+          "kinds": [
+            "bugfix"
+          ]
+        },
+        {
+          "phrase": "The customs API rate-limits to 60 requests a minute per token",
+          "kinds": [
+            "warning",
+            "fact"
+          ]
+        },
+        {
+          "phrase": "Berth 12 is the only berth with shore power",
+          "kinds": [
+            "fact"
+          ]
+        },
+        {
+          "phrase": "a booking older than 72 hours without a confirmed ETA is released",
+          "kinds": [
+            "decision"
+          ]
+        },
+        {
+          "phrase": "harbour gate reissue --pass",
+          "kinds": [
+            "howto"
+          ]
+        },
+        {
+          "phrase": "Tug availability comes from the tug operator's CSV drop",
+          "kinds": [
+            "fact",
+            "warning"
+          ]
+        },
+        {
+          "phrase": "sends a comment line every 15 seconds so the proxy flushes",
+          "kinds": [
+            "bugfix"
+          ],
+          "late": true
+        },
+        {
+          "phrase": "Weather alerts use the met office's warnings API, not scraping",
+          "kinds": [
+            "decision"
+          ],
+          "late": true
+        },
+        {
+          "phrase": "writes a draft first and commits only on save",
+          "kinds": [
+            "fact",
+            "decision"
+          ],
+          "late": true
+        },
+        {
+          "phrase": "report their status over MQTT on topic cranes/<id>/status",
+          "kinds": [
+            "fact"
+          ],
+          "late": true
+        },
+        {
+          "phrase": "its API sends positions as GeoJSON with coordinates in longitude-latitude order",
+          "kinds": [
+            "fact",
+            "warning"
+          ],
+          "late": true
+        },
+        {
+          "phrase": "The ETA predictor drifted for vessels crossing the date line",
+          "kinds": [
+            "bugfix"
+          ],
+          "late": true
+        },
+        {
+          "phrase": "keep two years of AIS history in TimescaleDB",
+          "kinds": [
+            "decision"
+          ],
+          "late": true
+        },
+        {
+          "phrase": "Do not restart the queue workers during a vessel's berthing window",
+          "kinds": [
+            "warning"
+          ],
+          "late": true
+        },
+        {
+          "phrase": "harbour seed-operator",
+          "kinds": [
+            "howto"
+          ],
+          "late": true
+        },
+        {
+          "phrase": "The harbour master signs off the daily berth plan at 06:00 local time",
+          "kinds": [
+            "fact"
+          ],
+          "late": true
+        }
+      ],
+      "verdicts": [
+        "Done. The berth list now sorts by arrival time; ",
+        "Fixed the typo in the gate pass email and redepl",
+        "Reviewed the pull request for the tug CSV parser",
+        "All green: 318 tests passed, 0 failed, lint clea",
+        "The planner change is merged and deployed. Nothi",
+        "Re-ran the flaky booking test ten times and it p",
+        "Pushed the renamed variables. Tests: 321 passed,",
+        "Checked the nightly export after the change: it ",
+        "Done with the berth colour change. Screenshots a",
+        "The hotfix is live on production as of 14:20 and",
+        "Merged after the second review: no findings left",
+        "Status: the tide chart fix is deployed, verified"
+      ]
+    }
+  ]
+}

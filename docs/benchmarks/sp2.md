@@ -116,13 +116,21 @@ distilled in a throwaway home, and the copies deleted afterwards.
 | Turns captured, per session | s1 43 (32 main, 11 subagent), s2 2, s3 182 (108 main, 74 subagent) |
 | Chunks, per session | s1 801, s2 35, s3 3,403 (4,239 in all; 83 % from subagents) |
 | Chunks per day, extrapolated to the owner's usual week | About 2,100 per day of session time (4,239 chunks over the 1.97 days the sessions span; per session 731, 650 and 4,126). About 1,060 per calendar day (over the 4 days the sessions touch). With one such session at a time, that is about 7,400 to 15,000 a week. (estimate in the spec: ~1,000) |
-| Candidates asked about, per session | s1 81, s2 26, s3 127 (234 in all). Once a session's cap of 16 was full, the rest of it was not sent to Jev: about half of the s1 and s3 main transcripts, and nearly all of their subagent text |
-| Memories kept, per session, by kind | s1 15: warning 6, fact 4, bugfix 3, decision 1, preference 1 (user-wide). s2 6: fact 3, howto 1, decision 1, warning 1. s3 16: fact 6, decision 6, warning 3, handoff 1 (37 in all) |
-| Judge actions | 1 merge, 1 supersede, 1 link (s1, s3). On a manual read, the merge and the supersede were wrong (a long list trashed against a one-line note; an open item hidden), and the link left a stale decision live. 0 reviews |
-| Jev spend, total and per session | 0.0122 USD in all: s1 0.0047, s2 0.0012, s3 0.0063. About 60 % distillation, 40 % judge (estimate: 0.001-0.003 USD per session) |
-| Capture pass latency, p50 / p95 | 39 ms / 128 ms over 107 uploads (bodies up to 8 MiB, loopback, release build; max 192 ms) |
+| Candidates asked about, per session | s1 153, s2 26, s3 675 (854 in all). Every run is asked, even when the session's set is full |
+| Memories kept, per session, by kind | s1 16: warning 7, fact 4, bugfix 3, decision 1, howto 1. s2 6: fact 3, howto 1, decision 1, warning 1. s3 16: decision 7, fact 6, warning 1, bugfix 1, howto 1. 38 live in all, every one from a main session; 52 were stored, and the cap replaced 14. On a manual read, 4 of those replacements removed good facts |
+| Judge actions | 11 links (10 related, 1 contradicts), 0 merges, 0 supersedes, 0 reviews. On a manual read, 7 were right and 1 partly right; 3 were missed updates that leave a stale statement live. None was destructive |
+| Jev spend, total and per session | 0.0308 USD in all: s1 0.0072, s2 0.0012, s3 0.0224. About 76 % distillation, 24 % judge (estimate: 0.001-0.003 USD per session) |
+| Capture pass latency, p50 / p95 | 40 ms / 147 ms over 107 uploads (bodies up to 8 MiB, loopback, release build; max 192 ms) |
 
-Baseline before Tasks 12b/11b (Part B): 163 kept (s1 23, s2 5, s3 135), 2 duplicates, $0.0419. Of the 60 good candidates the old per-run cap cut, 6 are now kept. Status narration kept: 5 on a manual read (3 status reports, 2 mixed), at the ≤ 5 limit. Part B's title pattern counts 0, because the new title rule makes it undercount. Titles of 25 characters or fewer: 1.
+Baseline before Tasks 12b/11b (Part B): 163 kept (s1 23, s2 5, s3 135), 2 duplicates, $0.0419.
+
+Re-check 1, after Tasks 12b/11b: 37 kept, 6 of 60, $0.0122.
+
+Acceptance, after Task 12c:
+- (1) Status narration kept: 5 on a manual read (2 status reports, 3 mixed), at the ≤ 5 limit; Part B's title pattern counts 0.
+- (2) Titles of 25 characters or fewer: 1.
+- (3) Jev: 0.0308 USD, under 0.10.
+- (4) Of the 60 good candidates Part B's per-run cap cut, 5 are kept. The target was most of them, so it is missed. 58 were asked and 33 cleared the bar, but no subagent passage can enter a set full of main-session passages.
 
 ## Budgets that still hold
 

@@ -227,6 +227,7 @@ impl Judge for HeuristicJudge {
                     probs,
                     agreement: exact,
                     existing_origin: crate::model::Origin::default(),
+                    existing_body: String::new(),
                 }
             })
             .collect())

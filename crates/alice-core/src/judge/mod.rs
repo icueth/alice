@@ -188,6 +188,9 @@ pub struct Relation {
     /// How the existing memory came to exist. A judge leaves the default (`agent`); the caller
     /// fills it in from the memories it read (SP2 spec §6.6).
     pub existing_origin: Origin,
+    /// The existing memory's body, for the "holds more" guard (Task 12c). A judge leaves it
+    /// empty (the guard then does not apply); the caller fills it in from the memories it read.
+    pub existing_body: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

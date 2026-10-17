@@ -149,6 +149,7 @@ fn run(cfg: JudgeWorkerConfig) {
             if let Err(e) = cfg.writer.submit_blocking(WriteOp::RequeueJudgeRetries {
                 max_attempts: MAX_ATTEMPTS,
                 now: now_rfc3339(),
+                distill: Some(cfg.settings.get().distill.clone()),
             }) {
                 tracing::warn!(error = %e, "queueing failed judgements again failed");
             }
@@ -202,13 +203,15 @@ fn run(cfg: JudgeWorkerConfig) {
                     *n += 1;
                     tracing::warn!(error = %e, id = %item.id, strikes = *n, "judging failed; it is tried again");
                     if *n >= STRIKES {
-                        // Never stuck `pending`: activated without a judgement.
+                        // Never stuck `pending`: activated without a judgement (a distilled one
+                        // then keeps its session's best set at its size, as a judged one does).
                         strikes.remove(&item.seq);
-                        let _ = cfg.writer.submit_blocking(WriteOp::ApplyJudgement(plain(
-                            &item,
-                            "heuristic",
-                            false,
-                        )));
+                        let _ = cfg
+                            .writer
+                            .submit_blocking(WriteOp::ApplyJudgement(Judgement {
+                                distill: Some(cfg.settings.get().distill.clone()),
+                                ..plain(&item, "heuristic", false)
+                            }));
                     }
                 }
             }
@@ -578,10 +581,12 @@ pub fn judge_one(cfg: &JudgeWorkerConfig, item: &PendingJudgement) -> Result<Opt
         &mut outcome,
         &item.id,
     );
-    // A judge does not say how the memories it compared came to exist; the neighbours do.
+    // A judge does not say how the memories it compared came to exist, nor what they hold (for
+    // the "holds more" guard, Task 12c); the neighbours do.
     for r in &mut relations {
         if let Some(e) = existing.iter().find(|e| e.id == r.existing_id) {
             r.existing_origin = e.origin;
+            r.existing_body.clone_from(&e.body);
         }
     }
     // A heuristic that answers because the judge could not is only trusted to suggest.
@@ -651,6 +656,7 @@ pub fn judge_one(cfg: &JudgeWorkerConfig, item: &PendingJudgement) -> Result<Opt
         unavailable: outcome.retry && !outcome.counted,
         retry_wait: retry_backoff(cfg.retry_base, item.attempts + item.unavailable + 1),
         seen: found.into_iter().map(|n| (n.memory.id, n.hash)).collect(),
+        distill: Some(settings.distill.clone()),
     };
     if !cfg.applies {
         j.actions.clear();
@@ -1287,6 +1293,8 @@ mod tests {
                     stamp,
                     updated_at,
                     provider: "heuristic".into(),
+                    // As the worker sends it (review 2, N2).
+                    distill: Some(Default::default()),
                     ..Default::default()
                 }))
                 .unwrap();

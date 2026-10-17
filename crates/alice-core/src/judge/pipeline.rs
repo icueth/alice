@@ -93,7 +93,7 @@ pub fn decide(
     review_only: bool,
 ) -> Decided {
     if new.origin == Origin::Distill {
-        return decide_distilled(relations, t, provider, review_only);
+        return decide_distilled(new, relations, t, provider, review_only);
     }
     let heuristic = provider == "heuristic";
     // May this relation be applied without asking? The heuristic is sure of the same text only.
@@ -175,14 +175,16 @@ pub fn decide(
 
 /// [`decide`] for a distilled newcomer (SP2 spec §6.6): nothing is ever asked. Its best match at
 /// the review threshold settles it (it goes to the trash as its duplicate): a duplicate, or an
-/// explicit memory it updates (Task 11b: a near-copy of what an agent or a person saved, with
-/// more detail or a newer value, never replaces it; the explicit memory is kept, and the
-/// passage stays in the raw capture). An older distilled memory it updates is superseded
-/// from the auto threshold and linked `relates_to` below it (the judge worker links one of
-/// another project instead of superseding it); a contradiction is linked.
+/// explicit memory it updates (Task 11b: a near-copy of what an agent or a person saved never
+/// replaces it; the explicit memory is kept, and the passage stays in the raw capture). A
+/// match the newcomer holds more than ([`holds_more`]: Task 12c's guard) does not settle it: it
+/// is linked `relates_to` instead. An older distilled memory it updates is superseded from the
+/// auto threshold and linked `relates_to` below it (the judge worker links one of another
+/// project instead of superseding it); a contradiction is linked.
 /// The heuristic applies the same text only (never an update), and a heuristic standing in for
 /// the judge decides nothing: the memory waits for the judge's retry.
 fn decide_distilled(
+    new: &JudgeMemory,
     relations: &[Relation],
     t: &Thresholds,
     provider: &str,
@@ -203,7 +205,7 @@ fn decide_distilled(
         .iter()
         .filter_map(|r| {
             strongest(r)
-                .filter(|(k, p)| *p >= t.review && settles(r, k))
+                .filter(|(k, p)| *p >= t.review && settles(r, k) && !holds_more(new, r, *p, t))
                 .map(|(_, p)| (r, p))
         })
         .max_by(|a, b| a.1.total_cmp(&b.1))
@@ -229,9 +231,75 @@ fn decide_distilled(
             "updates" if p >= t.auto && r.existing_origin == Origin::Distill => {
                 out.actions.push(JudgeAction::Supersedes { old: other, p });
             }
-            "updates" => out.actions.push(JudgeAction::RelatesTo { other, p }),
+            // A duplicate that did not settle it: the newcomer holds more than its match.
+            "updates" | "duplicate" => out.actions.push(JudgeAction::RelatesTo { other, p }),
             "contradicts" => out.actions.push(JudgeAction::Contradicts { other, p }),
             _ => {}
+        }
+    }
+    out
+}
+
+/// The "holds more" guard (the controller's ruling P3, Task 12c): a distilled newcomer that holds
+/// more than its match `r` at probability `p` is linked to it, not trashed as its duplicate.
+/// That is (i) more than twice the characters of its match, between the review and the auto
+/// thresholds (from auto it is still a duplicate), or (ii) a number its match does not state (a
+/// newer value), at any probability. Both compare the passages without distillation's `Context:`
+/// line, and neither applies when the match's text is unknown.
+fn holds_more(new: &JudgeMemory, r: &Relation, p: f64, t: &Thresholds) -> bool {
+    let theirs = passage(&r.existing_body);
+    if theirs.trim().is_empty() {
+        return false;
+    }
+    let mine = passage(&new.body);
+    let longer = mine.chars().count() > 2 * theirs.chars().count();
+    let known = numbers(theirs);
+    let newer = numbers(mine).iter().any(|n| !known.contains(n));
+    newer || (longer && p < t.auto)
+}
+
+/// A memory's body without the `Context:` line distillation adds (SP2 spec §6.5).
+fn passage(body: &str) -> &str {
+    body.rfind("\n\nContext: ").map_or(body, |i| &body[..i])
+}
+
+/// The number tokens of `text`: runs of ASCII digits that start a word (no letter or digit just
+/// before), with `.`, `,` or `:` between digits (`6380`, `0.9`, `1,200`, `04:00`, `10.0.0.2`); a
+/// unit may follow (`20m`). Incidental numbers count too: the leading digit run of an id that
+/// starts with a digit (`6b48f31` gives `6`), counts, line references (`main.rs:467` gives `467`),
+/// issue numbers (`#123`), percentages and dates (`2026-10-17` gives `2026`, `10` and `17`).
+/// Digits after a letter (`sha256`, `v1`, an id such as `a1b2`) and a list item's number (`1. `)
+/// are not tokens, nor are Thai digits or a number right after Thai letters: a copy whose only new
+/// number is one of those is trashed as before, which fails safe.
+fn numbers(text: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        let line = if digits > 0
+            && (line[digits..].starts_with(". ") || line[digits..].starts_with(") "))
+        {
+            &line[digits + 2..]
+        } else {
+            line
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let starts_word = i == 0 || !chars[i - 1].is_alphanumeric();
+            if !(chars[i].is_ascii_digit() && starts_word) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < chars.len()
+                && (chars[i].is_ascii_digit()
+                    || (matches!(chars[i], '.' | ',' | ':')
+                        && chars.get(i + 1).is_some_and(char::is_ascii_digit)))
+            {
+                i += 1;
+            }
+            out.insert(chars[start..i].iter().collect());
         }
     }
     out
@@ -283,6 +351,7 @@ mod tests {
             probs: Distribution::from_pairs(pairs.iter().map(|(k, v)| (k.to_string(), *v))),
             agreement: None,
             existing_origin: Origin::Agent,
+            existing_body: String::new(),
         }
     }
 
@@ -919,6 +988,155 @@ mod tests {
                 "jev"
             )
             .is_none()
+        );
+    }
+
+    /// The controller's ruling P3 (Task 12c): a distilled newcomer that holds more than its match
+    /// (a duplicate, or an update of an explicit memory) is linked to it, not trashed: (i) more
+    /// than twice its characters, between the review and the auto thresholds only; (ii) a number
+    /// its match does not state (a newer value), at any confidence.
+    #[test]
+    fn a_distilled_copy_that_holds_more_is_linked() {
+        let short = "Deploys go through the staging cluster first, then production.";
+        let long = format!(
+            "{short} The pipeline waits for the smoke tests on staging, promotes the same image to production only when they pass, and pages the person on call when one fails."
+        );
+        assert!(long.chars().count() * 2 > short.chars().count() * 5);
+        let me = |body: &str| JudgeMemory {
+            body: format!("{body}\n\nContext: Explain how deploys work in this repository."),
+            ..distilled()
+        };
+        let with = |r: Relation, body: &str| Relation {
+            existing_body: body.into(),
+            ..r
+        };
+        let link = |p: f64| {
+            vec![JudgeAction::RelatesTo {
+                other: "OLD".into(),
+                p,
+            }]
+        };
+        let dup = |p: f64| {
+            vec![JudgeAction::DuplicateOf {
+                survivor: "OLD".into(),
+                p,
+            }]
+        };
+        let port = |n: &str| {
+            format!("The cache service listens on port {n} and keeps its data on the local disk.")
+        };
+        let duplicate = |p: f64| rel("OLD", &[("duplicate", p), ("unrelated", 1.0 - p)]);
+        let updates = |p: f64| rel("OLD", &[("updates", p), ("unrelated", 1.0 - p)]);
+        // (what, newcomer's body, relations, actions wanted)
+        let cases: Vec<(&str, String, Vec<Relation>, Vec<JudgeAction>)> = vec![
+            (
+                "2.5x longer duplicate between review and auto",
+                long.clone(),
+                vec![with(duplicate(0.6), short)],
+                link(0.6),
+            ),
+            (
+                "2.5x longer update of an explicit memory between review and auto",
+                long.clone(),
+                vec![with(updates(0.7), short)],
+                link(0.7),
+            ),
+            (
+                "2.5x longer duplicate at auto: still trashed",
+                long.clone(),
+                vec![with(duplicate(0.9), short)],
+                dup(0.9),
+            ),
+            (
+                "a different number between review and auto",
+                port("6381"),
+                vec![with(duplicate(0.6), &port("6380"))],
+                link(0.6),
+            ),
+            (
+                "a different number at auto: still linked",
+                port("6381"),
+                vec![with(duplicate(0.95), &port("6380"))],
+                link(0.95),
+            ),
+            (
+                "an update of an explicit memory with a newer value at auto",
+                port("6381"),
+                vec![with(updates(0.9), &port("6380"))],
+                link(0.9),
+            ),
+            (
+                "same size, same numbers: trashed",
+                port("6380"),
+                vec![with(duplicate(0.7), &port("6380"))],
+                dup(0.7),
+            ),
+            (
+                "its match states more numbers than it does: trashed",
+                port("6380"),
+                vec![with(
+                    duplicate(0.7),
+                    "The cache service listens on port 6380 on host 10.0.0.2 and keeps its data on the local disk.",
+                )],
+                dup(0.7),
+            ),
+            (
+                "a list's numbering is no value",
+                "1. Deploys go through the staging cluster first, then production.".into(),
+                vec![with(duplicate(0.7), short)],
+                dup(0.7),
+            ),
+            (
+                "the match's text is unknown: no guard",
+                long.clone(),
+                vec![duplicate(0.6)],
+                dup(0.6),
+            ),
+        ];
+        for (what, body, relations, want) in cases {
+            let d = decide(&me(&body), &relations, &T, "jev", false);
+            assert_eq!(d.actions, want, "{what}");
+            assert!(d.reviews.is_empty(), "{what}");
+        }
+        // A plain duplicate of another memory still settles it.
+        let d = decide(
+            &me(&long),
+            &[
+                with(duplicate(0.7), short),
+                Relation {
+                    existing_id: "TWIN".into(),
+                    existing_body: long.clone(),
+                    ..duplicate(0.6)
+                },
+            ],
+            &T,
+            "jev",
+            false,
+        );
+        assert_eq!(
+            d.actions,
+            vec![JudgeAction::DuplicateOf {
+                survivor: "TWIN".into(),
+                p: 0.6
+            }]
+        );
+        // An explicit newcomer is unaffected.
+        let d = decide(
+            &JudgeMemory {
+                body: long.clone(),
+                ..new()
+            },
+            &[with(duplicate(0.9), short)],
+            &T,
+            "jev",
+            false,
+        );
+        assert_eq!(
+            d.actions,
+            vec![JudgeAction::DuplicateOf {
+                survivor: "OLD".into(),
+                p: 0.9
+            }]
         );
     }
 }

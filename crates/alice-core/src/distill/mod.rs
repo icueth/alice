@@ -12,6 +12,7 @@
 //! renderer cut, and every other line belongs to the current block. A turn starts at a chunk
 //! whose first line is a `[user]` prompt or a `[summary]`.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Range;
 
@@ -237,65 +238,15 @@ pub struct Prepared {
     pub project_names: Vec<String>,
 }
 
-/// What [`decide`] keeps.
+/// What [`decide`] keeps of one run.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DistillConfig {
     /// `distill.min_confidence`.
     pub min_confidence: f64,
-    /// The most memories this run keeps: `distill.max_per_run`, or what the session has left.
+    /// `distill.max_per_run`.
     pub max_per_run: usize,
-    /// The most of them that are not a `handoff`.
-    pub max_other: usize,
-    /// The most of them from subagent reports: `distill.max_per_subagent_run`, or what the
-    /// session's subagent share has left.
+    /// The most of them from subagent reports: `distill.max_per_subagent_run`.
     pub max_subagent: usize,
-}
-
-/// What a session's earlier runs kept: its live distilled memories (spec §6.4).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SessionKept {
-    /// All of them, the subagents' included.
-    pub all: usize,
-    /// Those from subagent reports.
-    pub subagent: usize,
-    /// Those that are a `handoff`.
-    pub handoff: usize,
-}
-
-impl DistillConfig {
-    /// The caps of a run of a session that has kept `kept` so far (spec §6.4). One slot of
-    /// `max_per_session` is the handoff's (the controller's ruling, Task 12b review): the first
-    /// live handoff holds it, and every other memory (a further handoff too) shares the rest. A
-    /// run keeps at most `max_per_run` and what is left of the session (the free slot included,
-    /// never past `max_per_session` in all); of them, at most what is left of the rest are not a
-    /// handoff, and at most `max_per_subagent_run` and what is left of the subagents' share (half
-    /// of `max_per_session`, rounded down) are subagent reports.
-    pub fn for_session(s: &DistillSettings, kept: SessionKept) -> Self {
-        let held = kept.handoff.min(1);
-        let others_left = s
-            .max_per_session
-            .saturating_sub(1)
-            .saturating_sub(kept.all.saturating_sub(held));
-        let share_left = (s.max_per_session / 2).saturating_sub(kept.subagent);
-        let max_other = s.max_per_run.min(others_left);
-        let left = s.max_per_session.saturating_sub(kept.all);
-        Self {
-            min_confidence: s.min_confidence,
-            max_per_run: s.max_per_run.min(others_left + 1 - held).min(left),
-            max_other,
-            max_subagent: s.max_per_subagent_run.min(share_left).min(max_other),
-        }
-    }
-
-    /// Whether the run may keep anything. A run that may not asks Jev nothing.
-    pub fn keeps_any(&self) -> bool {
-        self.max_per_run > 0
-    }
-
-    /// Whether only the handoff slot is left: the run asks about its handoff alone.
-    pub fn handoff_only(&self) -> bool {
-        self.keeps_any() && self.max_other == 0
-    }
 }
 
 impl Default for DistillConfig {
@@ -306,8 +257,213 @@ impl Default for DistillConfig {
 
 impl From<&DistillSettings> for DistillConfig {
     fn from(s: &DistillSettings) -> Self {
-        Self::for_session(s, SessionKept::default())
+        Self {
+            min_confidence: s.min_confidence,
+            max_per_run: s.max_per_run,
+            max_subagent: s.max_per_subagent_run.min(s.max_per_run),
+        }
     }
+}
+
+/// What orders a run's kept passages and a session's best set, by one key (spec §6.4; the
+/// controller's ruling P2, Task 12c): a handoff first; the main session before subagents; the p
+/// band (from 0.9, from 0.8, below); the kind (decision, bugfix, warning, fact, howto,
+/// preference); p; and last the memory's idempotency key, a hash of its source and passage, so
+/// the order never depends on when or in which run a passage came.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rank {
+    pub kind: Kind,
+    /// The probability Jev gave the kind.
+    pub p: f64,
+    /// A subagent's report.
+    pub subagent: bool,
+    /// The memory's idempotency key.
+    pub key: String,
+}
+
+impl Rank {
+    /// `Less` when `self` ranks above `other`.
+    pub fn order(&self, other: &Rank) -> Ordering {
+        let head = |r: &Rank| {
+            (
+                r.kind != Kind::Handoff,
+                r.subagent,
+                band(r.p),
+                kind_rank(r.kind),
+            )
+        };
+        head(self)
+            .cmp(&head(other))
+            .then(other.p.total_cmp(&self.p))
+            .then(self.key.cmp(&other.key))
+    }
+}
+
+/// The p band of a rank: 0 from 0.9, 1 from 0.8, 2 below (a probability that normalising left a
+/// hair under a bound is in the band above it).
+fn band(p: f64) -> u8 {
+    const EPS: f64 = 1e-9;
+    if p >= 0.9 - EPS {
+        0
+    } else if p >= 0.8 - EPS {
+        1
+    } else {
+        2
+    }
+}
+
+/// One live distilled memory of a session, as its best set holds it (spec §6.4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Held {
+    pub id: String,
+    pub kind: Kind,
+    /// Its rank inputs, `None` for a memory distilled before they were stored (migration 0008).
+    pub p: Option<f64>,
+    pub subagent: Option<bool>,
+    pub idempotency_key: String,
+    /// A person or an agent changed it, or links to it, since it was distilled: it is never
+    /// replaced (Task 12c addendum), though it counts toward the set's size.
+    pub protected: bool,
+    /// The judge has not settled it yet (`judge_state` `pending` or `retry`).
+    pub unjudged: bool,
+}
+
+impl Held {
+    /// Whether `distill:cap` may replace it: not a handoff, and not protected.
+    pub fn replaceable(&self) -> bool {
+        !self.protected && self.kind != Kind::Handoff
+    }
+
+    /// Its rank.
+    pub fn rank(&self, s: &DistillSettings) -> Rank {
+        Rank {
+            kind: self.kind,
+            p: self.p.unwrap_or(s.min_confidence),
+            subagent: self.subagent.unwrap_or(false),
+            key: self.idempotency_key.clone(),
+        }
+    }
+}
+
+/// A kept memory and where it goes in its session's best set (spec §6.4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Placement {
+    pub memory: DistilledMemory,
+    /// The held memory it would replace, when the set is full. Nothing is trashed when it is
+    /// written: [`evictee`] chooses again once the judge finds it live.
+    pub replaces: Option<String>,
+}
+
+/// The member that leaves a session's best set once a newcomer is judged live (spec §6.4; the
+/// controller's ruling on review I1, option b: eviction waits for the judge, so a newcomer the
+/// judge trashes evicts nothing). `held` is the set as `store::capture::session_held` reads it,
+/// the newcomer in it. Members the judge has yet to settle neither count nor go. With more
+/// subagent reports among the settled members than half of `max_per_session` (rounded down),
+/// the weakest report that may go ([`Held::replaceable`]) goes; otherwise, with more settled
+/// members than `max_per_session`, the weakest member that may go, the newcomer perhaps. `None`:
+/// nothing is over, or nothing may go.
+pub fn evictee<'a>(held: &'a [Held], s: &DistillSettings) -> Option<&'a Held> {
+    let subagent = |h: &Held| h.idempotency_key.starts_with(SUBAGENT_KEY_PREFIX);
+    let settled = || held.iter().filter(|h| !h.unjudged);
+    let weakest = |only_reports: bool| {
+        settled()
+            .filter(|h| h.replaceable() && (!only_reports || subagent(h)))
+            .max_by(|a, b| a.rank(s).order(&b.rank(s)))
+    };
+    if settled().filter(|h| subagent(h)).count() > s.max_per_session / 2
+        && let Some(h) = weakest(true)
+    {
+        return Some(h);
+    }
+    (settled().count() > s.max_per_session)
+        .then(|| weakest(false))
+        .flatten()
+}
+
+/// Places a run's kept memories into the session's best set (spec §6.4; the controller's ruling
+/// P1, Task 12c). `held` is the set: the session's live distilled memories. Its size is
+/// `distill.max_per_session`, of which subagent reports (by their key) take at most half,
+/// rounded down. Taken best first, a kept memory:
+/// - that the set holds already is written again (it comes back a duplicate) and replaces
+///   nothing;
+/// - with room for it (a free slot, and for a subagent report a free share) is added;
+/// - otherwise replaces the weakest member it may replace, when it outranks it: any member, or
+///   with the subagents' share full and itself a subagent report, a subagent memory only. A
+///   handoff and a [`Held::protected`] memory are never replaced (the Task 12c addendum), though
+///   they count toward the size and the share;
+/// - otherwise is not stored: every member it may replace is protected, or none is weaker.
+///
+/// So the set never grows past its size, and, but for the members it may not replace, it is the
+/// best `max_per_session` by [`Rank`] of all the passages ever kept, whatever their order. The
+/// placements come in `kept`'s order. They say which kept memories are stored; the members they
+/// would replace leave only once the judge finds each newcomer live ([`evictee`]; Task 12c review
+/// I1, option b).
+pub fn place(held: &[Held], kept: Vec<DistilledMemory>, s: &DistillSettings) -> Vec<Placement> {
+    struct Member {
+        id: Option<String>,
+        rank: Rank,
+        subagent: bool,
+        /// Never replaced.
+        fixed: bool,
+    }
+    let share = s.max_per_session / 2;
+    let mut set: Vec<Member> = held
+        .iter()
+        .map(|h| Member {
+            id: Some(h.id.clone()),
+            rank: h.rank(s),
+            subagent: h.idempotency_key.starts_with(SUBAGENT_KEY_PREFIX),
+            fixed: !h.replaceable(),
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..kept.len()).collect();
+    order.sort_by(|&a, &b| kept[a].rank().order(&kept[b].rank()));
+    let mut placed: Vec<Option<Option<String>>> = vec![None; kept.len()];
+    for i in order {
+        let m = &kept[i];
+        let rank = m.rank();
+        if set.iter().any(|x| x.rank.key == rank.key) {
+            placed[i] = Some(None);
+            continue;
+        }
+        let subs = set.iter().filter(|x| x.subagent).count();
+        let share_full = m.subagent && subs >= share;
+        let fixed = m.kind == Kind::Handoff;
+        if set.len() < s.max_per_session && !share_full {
+            set.push(Member {
+                id: None,
+                rank,
+                subagent: m.subagent,
+                fixed,
+            });
+            placed[i] = Some(None);
+            continue;
+        }
+        let weakest = set
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| !x.fixed && (!share_full || x.subagent))
+            .max_by(|(_, a), (_, b)| a.rank.order(&b.rank))
+            .map(|(k, _)| k);
+        if let Some(k) = weakest
+            && rank.order(&set[k].rank) == Ordering::Less
+        {
+            // Taken best first, a member of this run outranks every later one: what it replaces
+            // is always a held memory.
+            let out = set.swap_remove(k);
+            set.push(Member {
+                id: None,
+                rank,
+                subagent: m.subagent,
+                fixed,
+            });
+            placed[i] = Some(out.id);
+        }
+    }
+    kept.into_iter()
+        .zip(placed)
+        .filter_map(|(memory, p)| p.map(|replaces| Placement { memory, replaces }))
+        .collect()
 }
 
 /// A memory to write through the `remember` path (spec §6.5).
@@ -323,6 +479,20 @@ pub struct DistilledMemory {
     pub idempotency_key: String,
     /// The probability Jev gave the chosen option.
     pub p: f64,
+    /// From a subagent's report.
+    pub subagent: bool,
+}
+
+impl DistilledMemory {
+    /// Its rank (spec §6.4).
+    pub fn rank(&self) -> Rank {
+        Rank {
+            kind: self.kind,
+            p: self.p,
+            subagent: self.subagent,
+            key: self.idempotency_key.clone(),
+        }
+    }
 }
 
 /// Parses a run into candidates, the state and one question per candidate.
@@ -399,20 +569,16 @@ pub fn prepare(input: &RunInput) -> Prepared {
 }
 
 impl Prepared {
-    /// The run as Jev is asked about it under `cfg`'s caps (spec §6.4): no candidate when the run
-    /// may keep nothing, and no subagent report when it may keep none of those, so Jev is never
-    /// paid for a passage that could not be kept. When only the handoff slot is left
-    /// ([`DistillConfig::handoff_only`]), only the passages that may be a handoff (the last two
-    /// turns of a run that closes the session) are asked about, with `handoff` as the only
-    /// knowledge option. The rest keep their order and are numbered again; the state and the
-    /// cursor stay.
+    /// The run as Jev is asked about it under `cfg`'s caps (spec §6.4): no subagent report when
+    /// the run may keep none of those (`distill.max_per_subagent_run = 0`), so Jev is never paid
+    /// for a passage that could not be kept. A session's best set never stops a run from asking:
+    /// a better passage replaces a weaker one ([`place`]). The rest keep their order and are
+    /// numbered again; the state and the cursor stay.
     pub fn within(mut self, cfg: &DistillConfig) -> Prepared {
-        let only = cfg.handoff_only();
         let before = self.candidates.len();
-        self.candidates.retain(|c| {
-            cfg.keeps_any() && (cfg.max_subagent > 0 || !c.subagent()) && (!only || c.handoff_ok)
-        });
-        if self.candidates.len() < before || only {
+        self.candidates
+            .retain(|c| cfg.max_subagent > 0 || !c.subagent());
+        if self.candidates.len() < before {
             for (i, c) in self.candidates.iter_mut().enumerate() {
                 c.qid = format!("c{}", i + 1);
             }
@@ -420,7 +586,7 @@ impl Prepared {
                 .candidates
                 .iter()
                 .enumerate()
-                .map(|(i, c)| question_of(i, c, only))
+                .map(|(i, c)| question(i, c))
                 .collect();
         }
         self
@@ -437,11 +603,10 @@ impl Candidate {
 
 /// Maps Jev's answers to memories (spec §6.4 and §6.5). A candidate is kept when its most
 /// probable option is a knowledge option with at least `min_confidence`. The kept are ranked by
-/// priority, then probability, then session order: the main session's passages before subagent
-/// reports, and among equals handoff, decision, bugfix, warning, fact, howto, preference. From
-/// the top of that order at most `max_per_run` are kept, of them at most `max_other` that are not
-/// a `handoff`, at most `max_subagent` subagent reports and one `handoff`. A `preference_user`
-/// passage that names the project stays in it. The memories come in session order.
+/// [`Rank`]; from the top of that order at most `max_per_run` are kept, of them at most
+/// `max_subagent` subagent reports and one `handoff`. A `preference_user` passage that names the
+/// project stays in it. The memories come in session order; [`place`] then fits them into the
+/// session's best set.
 pub fn decide(
     p: &Prepared,
     answers: &BTreeMap<String, Distribution>,
@@ -464,27 +629,24 @@ pub fn decide(
             kept.push((c, kind, to_global, prob));
         }
     }
-    kept.sort_by(|a, b| {
-        (a.0.subagent(), kind_rank(a.1))
-            .cmp(&(b.0.subagent(), kind_rank(b.1)))
-            .then(b.3.total_cmp(&a.3))
-            .then(a.0.pos.cmp(&b.0.pos))
-    });
+    let rank = |k: &(&Candidate, Kind, bool, f64)| Rank {
+        kind: k.1,
+        p: k.3,
+        subagent: k.0.subagent(),
+        key: key_of(uri, k.0),
+    };
+    kept.sort_by(|a, b| rank(a).order(&rank(b)));
     let mut out: Vec<(&Candidate, Kind, bool, f64)> = Vec::new();
-    let (mut subagent, mut others, mut handoff) = (0, 0, false);
+    let (mut subagent, mut handoff) = (0, false);
     for k in kept {
         if out.len() >= cfg.max_per_run {
             break;
         }
         let (sub, hand) = (k.0.subagent(), k.1 == Kind::Handoff);
-        if (sub && subagent >= cfg.max_subagent)
-            || (hand && handoff)
-            || (!hand && others >= cfg.max_other)
-        {
+        if (sub && subagent >= cfg.max_subagent) || (hand && handoff) {
             continue;
         }
         subagent += usize::from(sub);
-        others += usize::from(!hand);
         handoff |= hand;
         out.push(k);
     }
@@ -496,19 +658,25 @@ pub fn decide(
             title: title_of(&c.text),
             body: body_of(c),
             chunk_ids: c.chunk_ids.clone(),
-            idempotency_key: if c.subagent() {
-                subagent_key(uri, &c.text)
-            } else {
-                idempotency_key(uri, &c.text)
-            },
+            idempotency_key: key_of(uri, c),
             p: prob,
+            subagent: c.subagent(),
         })
         .collect()
 }
 
-/// A knowledge kind's place in the ranking (the controller's rulings in Task 12b). A `handoff`
-/// comes first: one at most, offered at the session's end, it is what continuing needs most, so
-/// the caps never crowd it out (it still counts toward them).
+/// A candidate's idempotency key: [`subagent_key`] for a subagent report, else
+/// [`idempotency_key`].
+fn key_of(uri: &str, c: &Candidate) -> String {
+    if c.subagent() {
+        subagent_key(uri, &c.text)
+    } else {
+        idempotency_key(uri, &c.text)
+    }
+}
+
+/// A knowledge kind's place in [`Rank`], inside a p band. A `handoff` ranks before every band
+/// (the controller's ruling on Task 12b): the session's continuation, it is never crowded out.
 fn kind_rank(kind: Kind) -> u8 {
     match kind {
         Kind::Handoff => 0,
@@ -534,9 +702,8 @@ pub fn idempotency_key(uri: &str, passage: &str) -> String {
 }
 
 /// The key prefix of a memory kept from a subagent report, the main session's copy of it or the
-/// subagent's own (spec §6.4, §6.5): the only mark a stored memory carries of where it came from,
-/// so the worker counts a session's subagent memories by it among those whose provenance is in
-/// the session's sources (Task 12b; no column, no migration).
+/// subagent's own (spec §6.4, §6.5): [`place`] counts the session's subagent share by it (a
+/// memory distilled before migration 0008 has no stored tier, but has its key).
 pub const SUBAGENT_KEY_PREFIX: &str = "distill:sub:";
 
 /// [`idempotency_key`] for a subagent report: [`SUBAGENT_KEY_PREFIX`] in place of `distill:`,
@@ -1744,15 +1911,6 @@ fn one_line(text: &str, max: usize) -> String {
 
 /// The question about candidate `i` (spec §6.4); its number is in words.
 fn question(i: usize, c: &Candidate) -> Question {
-    question_of(i, c, false)
-}
-
-/// The options of a question that asks about the handoff alone: `already_saved` stays, so a
-/// handoff the agent saved itself is not stored again.
-const HANDOFF_ONLY: &[&str] = &["handoff", "already_saved", "ephemeral", "unclear"];
-
-/// [`question`], with `handoff_only` offering only the [`HANDOFF_ONLY`] options.
-fn question_of(i: usize, c: &Candidate, handoff_only: bool) -> Question {
     let n = verbal::number(i as u64 + 1);
     let asked = c
         .prompt
@@ -1768,7 +1926,6 @@ fn question_of(i: usize, c: &Candidate, handoff_only: bool) -> Question {
         options: OPTIONS
             .iter()
             .filter(|(id, _)| *id != "handoff" || c.handoff_ok)
-            .filter(|(id, _)| !handoff_only || HANDOFF_ONLY.contains(id))
             .map(|(id, description)| Choice::new(id, description))
             .collect(),
     }
@@ -2712,7 +2869,8 @@ mod tests {
             assert!((m.p - (0.80 + 0.01 * f64::from(i))).abs() < 1e-9, "{}", m.p);
         }
 
-        // Equal answers: session order breaks the tie.
+        // Equal answers: the passage's key breaks the tie (Task 12c: never its arrival), and the
+        // kept come in session order.
         let tied: BTreeMap<String, Distribution> = (1..=12)
             .map(|i| (format!("c{i}"), answer("decision", 0.9)))
             .collect();
@@ -2720,7 +2878,11 @@ mod tests {
             .into_iter()
             .map(|m| m.body)
             .collect();
-        let want: Vec<String> = p.candidates[..8].iter().map(|c| c.text.clone()).collect();
+        let mut by_key: Vec<&Candidate> = p.candidates[..12].iter().collect();
+        by_key.sort_by_key(|c| idempotency_key(URI, &c.text));
+        let mut want: Vec<&Candidate> = by_key[..8].to_vec();
+        want.sort_by_key(|c| c.pos);
+        let want: Vec<String> = want.iter().map(|c| c.text.clone()).collect();
         assert_eq!(got, want);
 
         // A fact at 0.65 is dropped below 0.7 even with room under the cap, and kept below 0.6.
@@ -2734,7 +2896,6 @@ mod tests {
         let low = DistillConfig {
             min_confidence: 0.6,
             max_per_run: 8,
-            max_other: 8,
             max_subagent: 8,
         };
         let kept = decide(&p, &few, URI, &low);
@@ -2801,7 +2962,6 @@ mod tests {
         let cfg = DistillConfig {
             min_confidence: 0.7,
             max_per_run: 50,
-            max_other: 50,
             max_subagent: 50,
         };
         let answers = all_answer(&p, "decision", 0.9);
@@ -2971,7 +3131,6 @@ mod tests {
             &DistillConfig {
                 min_confidence: 0.7,
                 max_per_run: 50,
-                max_other: 50,
                 max_subagent: 50,
             },
         );
@@ -3603,187 +3762,6 @@ mod tests {
         run(main_chunks, sub, false)
     }
 
-    /// The brief, with the controller's handoff slot (Task 12b review, M2): one slot of
-    /// `max_per_session` is kept for a handoff, so the other kinds have `max_per_session - 1`. A
-    /// run with room for three more of them keeps three, and a closing run keeps its handoff on
-    /// top; `max_per_run` still bounds a run with more room.
-    #[test]
-    fn a_run_with_room_for_three_keeps_three() {
-        let s = caps(8, 16, 2);
-        let twelve = SessionKept {
-            all: 12,
-            subagent: 0,
-            handoff: 0,
-        };
-        let cfg = DistillConfig::for_session(&s, twelve);
-        assert_eq!((cfg.max_other, cfg.max_per_run), (3, 4));
-        let p = conclusions_run(16, false);
-        assert_eq!(
-            decide(&p, &all_answer(&p, "decision", 0.9), URI, &cfg).len(),
-            3
-        );
-        let closing = conclusions_run(16, true);
-        let mut answers = all_answer(&closing, "decision", 0.9);
-        answers.insert("c16".into(), answer("handoff", 0.8));
-        let kept = decide(&closing, &answers, URI, &cfg);
-        let kinds: Vec<Kind> = kept.iter().map(|m| m.kind).collect();
-        assert_eq!(
-            kinds,
-            [
-                Kind::Decision,
-                Kind::Decision,
-                Kind::Decision,
-                Kind::Handoff
-            ]
-        );
-        let four = SessionKept {
-            all: 4,
-            subagent: 0,
-            handoff: 0,
-        };
-        let cfg = DistillConfig::for_session(&s, four);
-        assert_eq!(cfg.max_per_run, 8, "min(max_per_run, 11 left and the slot)");
-        assert_eq!(
-            decide(&p, &all_answer(&p, "decision", 0.9), URI, &cfg).len(),
-            8
-        );
-    }
-
-    /// The brief and the handoff slot: a session whose other room is used up keeps nothing more
-    /// and asks Jev nothing, unless the run closes the session while the slot is free
-    /// (`a_capped_closing_run_asks_only_for_its_handoff`); once a handoff holds the slot,
-    /// nothing at all. The run still covers its chunks, so the cursor moves.
-    #[test]
-    fn a_run_with_no_room_keeps_none_and_asks_nothing() {
-        let input = mixed_run(5, 3, 900);
-        let full = prepare(&input);
-        assert!(!full.questions.is_empty());
-        for (kept, any) in [
-            (
-                SessionKept {
-                    all: 15,
-                    subagent: 0,
-                    handoff: 0,
-                },
-                true,
-            ),
-            (
-                SessionKept {
-                    all: 16,
-                    subagent: 8,
-                    handoff: 1,
-                },
-                false,
-            ),
-            (
-                SessionKept {
-                    all: 20,
-                    subagent: 8,
-                    handoff: 2,
-                },
-                false,
-            ),
-        ] {
-            let cfg = DistillConfig::for_session(&caps(8, 16, 2), kept);
-            assert_eq!(cfg.max_other, 0, "{kept:?}");
-            assert_eq!(cfg.keeps_any(), any, "{kept:?}");
-            let p = prepare(&input).within(&cfg);
-            assert!(
-                p.questions.is_empty() && p.candidates.is_empty(),
-                "{kept:?}"
-            );
-            assert_eq!(p.consumed_ord, full.consumed_ord);
-            let answers = all_answer(&full, "decision", 0.95);
-            assert!(decide(&full, &answers, URI, &cfg).is_empty());
-        }
-    }
-
-    /// The controller's ruling (Task 12b review, M2): a closing run of a session that has no
-    /// other room but a free handoff slot asks one small question set, over its last two turns,
-    /// with `handoff` as the only knowledge option (`ephemeral` and `unclear` stay), and keeps at
-    /// most one. Once a handoff holds the slot it asks nothing. The total never passes the cap.
-    #[test]
-    fn a_capped_closing_run_asks_only_for_its_handoff() {
-        let s = caps(8, 16, 2);
-        let p = conclusions_run(6, true);
-        let slot = SessionKept {
-            all: 15,
-            subagent: 0,
-            handoff: 0,
-        };
-        let cfg = DistillConfig::for_session(&s, slot);
-        assert_eq!(
-            (cfg.max_per_run, cfg.max_other, cfg.max_subagent),
-            (1, 0, 0)
-        );
-        let asked = p.clone().within(&cfg);
-        assert_eq!(asked.candidates.len(), 2, "the last two turns");
-        assert_eq!(asked.questions.len(), 2);
-        for (i, (c, q)) in asked.candidates.iter().zip(&asked.questions).enumerate() {
-            assert!(c.handoff_ok);
-            assert_eq!(c.qid, format!("c{}", i + 1));
-            assert_eq!(q.id, c.qid);
-            let options: Vec<&str> = q.options.iter().map(|o| o.id.as_str()).collect();
-            assert_eq!(
-                options,
-                ["handoff", "already_saved", "ephemeral", "unclear"]
-            );
-        }
-        let kept = decide(&asked, &all_answer(&asked, "handoff", 0.9), URI, &cfg);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].kind, Kind::Handoff);
-        assert!(decide(&asked, &all_answer(&asked, "decision", 0.9), URI, &cfg).is_empty());
-        // A session's subagent reports are not asked about there either.
-        let mut mixed = mixed_run(2, 2, 7_000);
-        mixed.closes_session = true;
-        let asked = prepare(&mixed).within(&cfg);
-        assert_eq!(asked.candidates.len(), 2);
-        assert!(
-            asked
-                .candidates
-                .iter()
-                .all(|c| !c.subagent() && c.handoff_ok)
-        );
-        // The slot is held: nothing is asked.
-        let held = DistillConfig::for_session(
-            &s,
-            SessionKept {
-                all: 16,
-                subagent: 0,
-                handoff: 1,
-            },
-        );
-        assert!(!held.keeps_any());
-        assert!(p.clone().within(&held).questions.is_empty());
-        // A second handoff, kept while the session had room, takes a slot like any memory.
-        let second = DistillConfig::for_session(
-            &s,
-            SessionKept {
-                all: 10,
-                subagent: 0,
-                handoff: 2,
-            },
-        );
-        assert_eq!((second.max_per_run, second.max_other), (6, 6));
-        // Whatever was kept, a run never takes the session past its cap.
-        for all in 0..=20 {
-            for handoff in 0..=2.min(all) {
-                let kept = SessionKept {
-                    all,
-                    subagent: 0,
-                    handoff,
-                };
-                let cfg = DistillConfig::for_session(&s, kept);
-                assert!(cfg.max_per_run <= 16usize.saturating_sub(all), "{kept:?}");
-                assert!(cfg.max_other <= cfg.max_per_run, "{kept:?}");
-                assert!(
-                    all - handoff.min(1) + cfg.max_other <= 15 || cfg.max_other == 0,
-                    "{kept:?}"
-                );
-            }
-        }
-    }
-
     /// The brief: a run keeps at most `max_per_subagent_run` (2) subagent passages, after the
     /// main session's; a subagent passage's key says so; with no subagent room left, subagent
     /// passages are not asked about.
@@ -3821,153 +3799,484 @@ mod tests {
         }
     }
 
-    /// The brief: across ten subagent runs, the subagents of a session keep at most half of
-    /// `max_per_session` (8 of 16), and once that share is used up their passages cost nothing.
-    #[test]
-    fn the_session_share_holds_across_ten_subagent_runs() {
-        let s = caps(8, 16, 2);
-        let mut kept = SessionKept::default();
-        let mut per_run = Vec::new();
-        for r in 0..10u64 {
-            let cfg = DistillConfig::for_session(&s, kept);
-            let p = prepare(&mixed_run(0, 4, 2_000 + 100 * r)).within(&cfg);
-            let got = decide(&p, &all_answer(&p, "decision", 0.95), URI, &cfg);
-            assert!(got.len() <= 2, "run {r}: {}", got.len());
-            if kept.subagent >= 8 {
-                assert!(
-                    p.questions.is_empty(),
-                    "run {r} asks nothing once the share is used up"
-                );
-            }
-            kept.all += got.len();
-            kept.subagent += got.len();
-            per_run.push(got.len());
+    /// A kept memory of `kind` at `p`, as `decide` gives it; `name` stands for its passage.
+    fn kept_mem(name: &str, kind: Kind, p: f64, subagent: bool) -> DistilledMemory {
+        let prefix = if subagent {
+            SUBAGENT_KEY_PREFIX
+        } else {
+            "distill:"
+        };
+        DistilledMemory {
+            kind,
+            to_global: false,
+            title: name.into(),
+            body: name.into(),
+            chunk_ids: Vec::new(),
+            idempotency_key: format!("{prefix}{name}"),
+            p,
+            subagent,
         }
-        assert_eq!(per_run, [2, 2, 2, 2, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(kept.subagent, 8);
-        // The main session still has its room.
-        let cfg = DistillConfig::for_session(&s, kept);
-        assert_eq!((cfg.max_per_run, cfg.max_subagent), (8, 0));
-        let p = prepare(&mixed_run(4, 3, 3_000)).within(&cfg);
-        let got = decide(&p, &all_answer(&p, "decision", 0.95), URI, &cfg);
-        assert_eq!(got.len(), 4);
-        assert!(
-            got.iter()
-                .all(|m| !m.idempotency_key.starts_with("distill:sub:"))
-        );
-        // An odd session cap rounds the share down.
-        let cfg = DistillConfig::for_session(
-            &caps(8, 5, 2),
-            SessionKept {
-                all: 2,
-                subagent: 2,
-                handoff: 0,
-            },
-        );
-        assert_eq!((cfg.max_per_run, cfg.max_subagent), (3, 0));
     }
 
-    /// The controller's ruling: kept passages are ranked by priority, then p. A main-session
-    /// passage beats a subagent's; among equals, decision > bugfix > warning > fact > howto >
-    /// preference; then p; and every cap takes from the top of that order.
+    /// `m` as the best set holds it once written (its id is its key).
+    fn held_of(m: &DistilledMemory) -> Held {
+        Held {
+            id: m.idempotency_key.clone(),
+            kind: m.kind,
+            p: Some(m.p),
+            subagent: Some(m.subagent),
+            idempotency_key: m.idempotency_key.clone(),
+            protected: false,
+            unjudged: false,
+        }
+    }
+
+    /// Runs `batches` into an empty best set one after another, as the worker does: each kept
+    /// memory placed, each replaced one taken out. The set's ids, sorted, and how many were
+    /// replaced.
+    fn fill(batches: &[Vec<DistilledMemory>], s: &DistillSettings) -> (Vec<String>, usize) {
+        let mut held: Vec<Held> = Vec::new();
+        let mut replaced = 0;
+        for b in batches {
+            for pl in place(&held, b.clone(), s) {
+                if let Some(id) = &pl.replaces {
+                    held.retain(|h| &h.id != id);
+                    replaced += 1;
+                }
+                if !held.iter().any(|h| h.id == pl.memory.idempotency_key) {
+                    held.push(held_of(&pl.memory));
+                }
+            }
+        }
+        let mut ids: Vec<String> = held.into_iter().map(|h| h.id).collect();
+        ids.sort();
+        (ids, replaced)
+    }
+
+    /// The controller's ruling P2 (Task 12c): kept passages rank by p bands. The handoff first;
+    /// the main session before subagents; then the band (p ≥ 0.9, ≥ 0.8, below); then the kind;
+    /// then p.
     #[test]
-    fn kept_passages_rank_by_priority_then_p() {
-        let p = prepare(&mixed_run(7, 1, 4_000));
-        assert_eq!(
-            sources(&p),
-            [
-                S::Conclusion,
-                S::Conclusion,
-                S::Conclusion,
-                S::Conclusion,
-                S::Conclusion,
-                S::Conclusion,
-                S::Conclusion,
-                S::SubagentReport
-            ]
-        );
-        let answers: BTreeMap<String, Distribution> = [
-            ("c1", "howto", 0.99),
-            ("c2", "preference_project", 0.99),
-            ("c3", "fact", 0.71),
-            ("c4", "warning", 0.72),
-            ("c5", "bugfix", 0.75),
-            ("c6", "decision", 0.80),
-            ("c7", "decision", 0.90),
-            ("c8", "decision", 1.0),
-        ]
-        .into_iter()
-        .map(|(q, o, pr)| (q.to_owned(), answer(o, pr)))
-        .collect();
-        let kept_of = |run: usize, subagent: usize| -> Vec<String> {
-            let cfg = DistillConfig {
-                min_confidence: 0.7,
-                max_per_run: run,
-                max_other: run,
-                max_subagent: subagent,
-            };
-            let kept = decide(&p, &answers, URI, &cfg);
-            p.candidates
+    fn kept_passages_rank_by_p_bands() {
+        let one = DistillConfig {
+            min_confidence: 0.7,
+            max_per_run: 1,
+            max_subagent: 1,
+        };
+        let p = conclusions_run(3, true);
+        let pick = |p: &Prepared, answers: &[(&str, &str, f64)]| -> Vec<(Kind, f64)> {
+            let answers: BTreeMap<String, Distribution> = answers
                 .iter()
-                .filter(|c| {
-                    kept.iter()
-                        .any(|m| m.chunk_ids == c.chunk_ids && m.body.starts_with(&c.text))
-                })
-                .map(|c| c.qid.clone())
+                .map(|(q, o, pr)| (q.to_string(), answer(o, *pr)))
+                .collect();
+            decide(p, &answers, URI, &one)
+                .into_iter()
+                .map(|m| (m.kind, (m.p * 100.0).round() / 100.0))
                 .collect()
         };
-        assert_eq!(kept_of(1, 2), ["c7"], "the more probable of two decisions");
-        assert_eq!(kept_of(2, 2), ["c6", "c7"]);
         assert_eq!(
-            kept_of(5, 2),
-            ["c3", "c4", "c5", "c6", "c7"],
-            "decision, bugfix, warning, fact"
+            pick(&p, &[("c1", "decision", 0.75), ("c2", "fact", 0.98)]),
+            [(Kind::Fact, 0.98)],
+            "a fact at 0.98 beats a decision at 0.75"
         );
         assert_eq!(
-            kept_of(6, 2),
-            ["c1", "c3", "c4", "c5", "c6", "c7"],
-            "then howto"
+            pick(&p, &[("c1", "fact", 0.97), ("c2", "decision", 0.92)]),
+            [(Kind::Decision, 0.92)],
+            "in one band the kind breaks the tie"
         );
         assert_eq!(
-            kept_of(7, 2),
-            ["c1", "c2", "c3", "c4", "c5", "c6", "c7"],
-            "then preference; the subagent's decision at 1.0 still waits"
+            pick(&p, &[("c1", "decision", 0.99), ("c3", "handoff", 0.71)]),
+            [(Kind::Handoff, 0.71)],
+            "a handoff stays first"
         );
-        assert_eq!(kept_of(8, 2).len(), 8);
-        assert_eq!(kept_of(8, 0).len(), 7, "no subagent room");
+        assert_eq!(
+            pick(&p, &[("c1", "fact", 0.95), ("c2", "fact", 0.99)]),
+            [(Kind::Fact, 0.99)]
+        );
+        assert_eq!(
+            pick(&p, &[("c1", "decision", 0.79), ("c2", "fact", 0.80)]),
+            [(Kind::Fact, 0.80)],
+            "0.80 is the second band, 0.79 the third"
+        );
+        assert_eq!(
+            pick(&p, &[("c1", "decision", 0.89), ("c2", "fact", 0.90)]),
+            [(Kind::Fact, 0.90)],
+            "0.90 is the first band"
+        );
+        let mixed = prepare(&mixed_run(1, 1, 4_100));
+        assert_eq!(sources(&mixed), [S::Conclusion, S::SubagentReport]);
+        assert_eq!(
+            pick(&mixed, &[("c1", "fact", 0.71), ("c2", "decision", 1.0)]),
+            [(Kind::Fact, 0.71)],
+            "the main session before subagents"
+        );
+        // The same key orders a held memory.
+        let a = kept_mem("a", Kind::Fact, 0.98, false).rank();
+        let b = kept_mem("b", Kind::Decision, 0.75, false).rank();
+        assert_eq!(a.order(&b), Ordering::Less);
+        let h = kept_mem("h", Kind::Handoff, 0.71, true).rank();
+        assert_eq!(h.order(&a), Ordering::Less, "a handoff, even a subagent's");
     }
 
-    /// The controller's ruling on Task 12b: a `handoff` ranks first, before a decision, so the
-    /// caps never crowd out the session's one handoff; it still counts toward them.
+    /// The controller's ruling P1 (Task 12c): `max_per_session` is the size of the session's best
+    /// set. When it is full, a kept passage that outranks the weakest held memory replaces it; one
+    /// that does not is not stored. With room, nothing is replaced.
     #[test]
-    fn a_handoff_ranks_first_and_counts_toward_the_cap() {
-        let p = conclusions_run(10, true);
-        assert!(p.candidates[8].handoff_ok && p.candidates[9].handoff_ok);
-        let mut answers: BTreeMap<String, Distribution> = (1..=9)
-            .map(|i| (format!("c{i}"), answer("decision", 0.99)))
+    fn a_full_session_keeps_its_best_n() {
+        let s = caps(8, 3, 2);
+        let weak = kept_mem("weak", Kind::Fact, 0.75, false);
+        let mid = kept_mem("mid", Kind::Decision, 0.85, false);
+        let top = kept_mem("top", Kind::Fact, 0.95, false);
+        let held: Vec<Held> = [&weak, &mid, &top].map(held_of).to_vec();
+        let late = kept_mem("late", Kind::Fact, 0.98, false);
+        let worse = kept_mem("worse", Kind::Decision, 0.72, false);
+        assert_eq!(
+            place(&held, vec![worse.clone(), late.clone()], &s),
+            [Placement {
+                memory: late.clone(),
+                replaces: Some(weak.idempotency_key.clone()),
+            }],
+            "the better late passage replaces the weakest; the worse one is not stored"
+        );
+        assert_eq!(
+            place(&held[..2], vec![worse.clone()], &s),
+            [Placement {
+                memory: worse.clone(),
+                replaces: None,
+            }],
+            "with room, it is added"
+        );
+        assert_eq!(
+            place(&held, vec![top.clone()], &s),
+            [Placement {
+                memory: top.clone(),
+                replaces: None,
+            }],
+            "a passage held already is written again (a duplicate) and replaces nothing"
+        );
+        // Two better passages in one run replace the two weakest, never one twice.
+        let late2 = kept_mem("late2", Kind::Bugfix, 0.97, false);
+        let got = place(&held, vec![late.clone(), late2.clone()], &s);
+        let replaced: Vec<&str> = got.iter().filter_map(|p| p.replaces.as_deref()).collect();
+        assert_eq!(replaced.len(), 2);
+        assert!(replaced.contains(&weak.idempotency_key.as_str()));
+        assert!(replaced.contains(&mid.idempotency_key.as_str()));
+        // The cap never overshoots.
+        let (ids, n) = fill(
+            &[
+                vec![weak.clone(), mid.clone(), top.clone()],
+                vec![late.clone(), worse.clone(), late2.clone()],
+            ],
+            &s,
+        );
+        assert_eq!(ids.len(), 3);
+        assert_eq!(n, 2);
+    }
+
+    /// The controller's ruling P1: the set does not depend on the order the passages arrive in.
+    /// Fed in three orders, the same passages give the same set, which is the best `N` by the
+    /// rank under the subagents' share.
+    #[test]
+    fn the_best_set_does_not_depend_on_arrival_order() {
+        let s = caps(8, 6, 2);
+        let kinds = [Kind::Fact, Kind::Decision, Kind::Bugfix, Kind::Howto];
+        let ps = [0.71, 0.95, 0.83, 0.95, 0.99, 0.88, 0.71, 0.92];
+        let all: Vec<DistilledMemory> = (0..16)
+            .map(|i| {
+                let kind = if i == 11 { Kind::Handoff } else { kinds[i % 4] };
+                kept_mem(&format!("m{i:02}"), kind, ps[i % 8], i % 3 == 0)
+            })
             .collect();
-        answers.insert("c10".into(), answer("handoff", 0.71));
-        let kept = decide(&p, &answers, URI, &DistillConfig::from(&caps(8, 16, 2)));
-        assert_eq!(kept.len(), 8);
+        let batches = |order: &[usize]| -> Vec<Vec<DistilledMemory>> {
+            order
+                .chunks(4)
+                .map(|c| c.iter().map(|&i| all[i].clone()).collect())
+                .collect()
+        };
+        let forward: Vec<usize> = (0..16).collect();
+        let backward: Vec<usize> = (0..16).rev().collect();
+        let mixed: Vec<usize> = (0..16).map(|i| (i * 7) % 16).collect();
+        let (a, _) = fill(&batches(&forward), &s);
+        let (b, _) = fill(&batches(&backward), &s);
+        let (c, _) = fill(&batches(&mixed), &s);
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        // The best 6 by rank, at most 3 of them subagent reports.
+        let mut sorted = all.clone();
+        sorted.sort_by(|x, y| x.rank().order(&y.rank()));
+        let mut want = Vec::new();
+        let mut subs = 0;
+        for m in &sorted {
+            if want.len() == 6 {
+                break;
+            }
+            if m.subagent && subs == 3 {
+                continue;
+            }
+            subs += usize::from(m.subagent);
+            want.push(m.idempotency_key.clone());
+        }
+        want.sort();
+        assert_eq!(a, want);
+        assert!(a.contains(&"distill:m11".to_string()), "the handoff is in");
+    }
+
+    /// The subagents' share holds under replacement (lane 12b fix 3): with it full, a subagent
+    /// passage may replace only a subagent memory, even when the set has room; across ten
+    /// subagent runs it never passes half of the set.
+    #[test]
+    fn the_subagent_share_holds_under_replacement() {
+        let s = caps(8, 4, 2);
+        let sa = kept_mem("sa", Kind::Fact, 0.95, true);
+        let sb = kept_mem("sb", Kind::Fact, 0.85, true);
+        let held = vec![held_of(&sa), held_of(&sb)];
+        let sc = kept_mem("sc", Kind::Fact, 0.99, true);
         assert_eq!(
-            kept.iter().filter(|m| m.kind == Kind::Handoff).count(),
-            1,
-            "{kept:#?}"
+            place(&held, vec![sc.clone()], &s),
+            [Placement {
+                memory: sc,
+                replaces: Some(sb.idempotency_key.clone()),
+            }],
+            "the share is full: it replaces the weaker subagent memory, not a free slot"
         );
-        assert_eq!(kept.last().unwrap().body, p.candidates[9].text);
-        // A run with room for one keeps the handoff.
-        let cfg = DistillConfig::for_session(
-            &caps(8, 16, 2),
-            SessionKept {
-                all: 15,
-                subagent: 0,
-                handoff: 0,
-            },
+        let sd = kept_mem("sd", Kind::Fact, 0.80, true);
+        assert!(
+            place(&held, vec![sd], &s).is_empty(),
+            "a worse one is not stored"
         );
-        let kept = decide(&p, &answers, URI, &cfg);
+        let m = kept_mem("m", Kind::Fact, 0.75, false);
         assert_eq!(
-            kept.iter().map(|m| m.kind).collect::<Vec<_>>(),
-            [Kind::Handoff]
+            place(&held, vec![m.clone()], &s),
+            [Placement {
+                memory: m,
+                replaces: None,
+            }]
+        );
+        let batches: Vec<Vec<DistilledMemory>> = (0..10)
+            .map(|r| {
+                (0..2)
+                    .map(|i| {
+                        let k = r * 2 + i;
+                        kept_mem(
+                            &format!("s{k:02}"),
+                            Kind::Fact,
+                            0.70 + 0.01 * k as f64,
+                            true,
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let (ids, replaced) = fill(&batches, &caps(8, 16, 2));
+        assert_eq!(ids.len(), 8, "half of 16: {ids:?}");
+        assert_eq!(replaced, 12);
+        assert!(
+            ids.iter().all(|id| id.as_str() >= "distill:sub:s12"),
+            "the best 8: {ids:?}"
+        );
+    }
+
+    /// The handoff ranks first, so it always enters a full set, replacing the weakest other
+    /// memory. A later handoff enters too (a "latest replaces the first" rule is for the
+    /// backlog).
+    #[test]
+    fn a_handoff_always_enters_a_full_set() {
+        let s = caps(8, 3, 2);
+        let ds: Vec<DistilledMemory> = (1..=3)
+            .map(|i| kept_mem(&format!("d{i}"), Kind::Decision, 0.99, false))
+            .collect();
+        let held: Vec<Held> = ds.iter().map(held_of).collect();
+        let h = kept_mem("h1", Kind::Handoff, 0.71, false);
+        assert_eq!(
+            place(&held, vec![h.clone()], &s),
+            [Placement {
+                memory: h.clone(),
+                replaces: Some("distill:d3".into()),
+            }],
+            "equal decisions: the key breaks the tie"
+        );
+        let (ids, _) = fill(
+            &[
+                ds.clone(),
+                vec![h],
+                vec![kept_mem("h2", Kind::Handoff, 0.75, false)],
+            ],
+            &s,
+        );
+        assert_eq!(ids, ["distill:d1", "distill:h1", "distill:h2"]);
+    }
+
+    /// The controller's ruling on I1 (option b, Task 12c review): eviction waits for the judge.
+    /// Once a newcomer is judged live and the settled members are more than `max_per_session`, or
+    /// their subagent reports more than half of it, the weakest member that may go leaves: the
+    /// newcomer itself when it is the weakest, a subagent report when those are over their share.
+    /// A member the judge has not settled neither counts nor goes; a handoff and a protected
+    /// member never go.
+    #[test]
+    fn a_newcomer_judged_live_evicts_the_weakest_that_may_go() {
+        let s = caps(8, 4, 2);
+        let m = |name: &str, kind: Kind, p: f64, sub: bool| held_of(&kept_mem(name, kind, p, sub));
+        let guard = |h: Held| Held {
+            protected: true,
+            ..h
+        };
+        let id = |h: Option<&Held>| h.map(|h| h.id.clone());
+        let h = m("h", Kind::Handoff, 0.71, false);
+        let guarded = guard(m("guarded", Kind::Fact, 0.70, false));
+        let weak = m("weak", Kind::Fact, 0.72, false);
+        let a = m("a", Kind::Decision, 0.95, false);
+        let new = m("new", Kind::Fact, 0.9, false);
+        let set = [
+            h.clone(),
+            guarded.clone(),
+            weak.clone(),
+            a.clone(),
+            new.clone(),
+        ];
+        assert_eq!(id(evictee(&set, &s)), Some("distill:weak".into()));
+        assert_eq!(
+            evictee(&set[1..], &s),
+            None,
+            "four of four: nothing is over"
+        );
+        let waiting = Held {
+            unjudged: true,
+            ..m("waiting", Kind::Fact, 0.6, false)
+        };
+        let set = [h.clone(), guarded.clone(), a.clone(), new.clone(), waiting];
+        assert_eq!(
+            evictee(&set, &s),
+            None,
+            "an unsettled member does not count"
+        );
+        let low = m("low", Kind::Fact, 0.71, false);
+        let set = [h.clone(), guarded.clone(), a.clone(), new.clone(), low];
+        assert_eq!(
+            id(evictee(&set, &s)),
+            Some("distill:low".into()),
+            "the newcomer itself"
+        );
+        let set = [
+            h.clone(),
+            guarded.clone(),
+            guard(a.clone()),
+            guard(new.clone()),
+            guard(weak.clone()),
+        ];
+        assert_eq!(evictee(&set, &s), None, "nothing may go");
+        // Four of four, but three subagent reports of two: the weakest report goes.
+        let set = [
+            weak.clone(),
+            m("s1", Kind::Fact, 0.95, true),
+            m("s3", Kind::Fact, 0.85, true),
+            m("s2", Kind::Fact, 0.9, true),
+        ];
+        assert_eq!(
+            id(evictee(&set, &s)),
+            Some(format!("{SUBAGENT_KEY_PREFIX}s3"))
+        );
+        let set = [
+            weak,
+            guard(m("s1", Kind::Fact, 0.95, true)),
+            guard(m("s3", Kind::Fact, 0.85, true)),
+            guard(m("s2", Kind::Fact, 0.9, true)),
+        ];
+        assert_eq!(evictee(&set, &s), None, "no report may go");
+    }
+
+    /// The Task 12c addendum: `distill:cap` never replaces the session's handoff, nor a protected
+    /// memory (one a person or an agent changed or links to). They still count toward the set's
+    /// size. When every member is protected, or none that may go is weaker, the newcomer is not
+    /// stored.
+    #[test]
+    fn the_cap_never_replaces_a_protected_memory() {
+        let s = caps(8, 3, 2);
+        let h = held_of(&kept_mem("h", Kind::Handoff, 0.71, false));
+        let protected = |m: DistilledMemory| Held {
+            protected: true,
+            ..held_of(&m)
+        };
+        let f1 = protected(kept_mem("f1", Kind::Fact, 0.72, false));
+        let f2 = held_of(&kept_mem("f2", Kind::Fact, 0.80, false));
+        let better = kept_mem("better", Kind::Fact, 0.95, false);
+        assert_eq!(
+            place(
+                &[h.clone(), f1.clone(), f2.clone()],
+                vec![better.clone()],
+                &s
+            ),
+            [Placement {
+                memory: better.clone(),
+                replaces: Some(f2.id.clone()),
+            }],
+            "the weakest that may go, not the protected weaker one"
+        );
+        // Two handoffs and a protected fact: nothing may go, so the newcomer is not stored.
+        let h2 = held_of(&kept_mem("h2", Kind::Handoff, 0.9, false));
+        assert!(
+            place(
+                &[h.clone(), h2.clone(), f1.clone()],
+                vec![better.clone()],
+                &s
+            )
+            .is_empty()
+        );
+        // A later handoff does not replace the session's handoff either, even a weaker one.
+        let later = kept_mem("later", Kind::Handoff, 0.95, false);
+        assert!(place(&[h.clone(), h2, f1.clone()], vec![later], &s).is_empty());
+        // A protected memory counts toward the size: with one free slot there is room for one.
+        let got = place(
+            &[h.clone(), f1.clone()],
+            vec![better.clone(), kept_mem("next", Kind::Fact, 0.9, false)],
+            &s,
+        );
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert_eq!(
+            (
+                got[0].memory.idempotency_key.as_str(),
+                got[0].replaces.as_deref()
+            ),
+            ("distill:better", None)
+        );
+        // None that may go is weaker.
+        let strong = held_of(&kept_mem("strong", Kind::Decision, 0.99, false));
+        assert!(place(&[h, f1, strong], vec![better], &s).is_empty());
+    }
+
+    /// The brief: a memory distilled before migration 0008 has no stored rank inputs; it ranks
+    /// as a main-session passage at `distill.min_confidence`.
+    #[test]
+    fn a_memory_without_rank_inputs_ranks_as_main_at_min_confidence() {
+        let s = caps(8, 2, 2);
+        let old = Held {
+            id: "OLD".into(),
+            kind: Kind::Decision,
+            p: None,
+            subagent: None,
+            idempotency_key: "distill:old".into(),
+            protected: false,
+            unjudged: false,
+        };
+        assert_eq!(
+            old.rank(&s),
+            Rank {
+                kind: Kind::Decision,
+                p: 0.7,
+                subagent: false,
+                key: "distill:old".into(),
+            }
+        );
+        let other = held_of(&kept_mem("other", Kind::Fact, 0.99, false));
+        let held = [old, other];
+        assert!(
+            place(&held, vec![kept_mem("f75", Kind::Fact, 0.75, false)], &s).is_empty(),
+            "same band below 0.8: the decision ranks above a fact"
+        );
+        assert_eq!(
+            place(&held, vec![kept_mem("f85", Kind::Fact, 0.85, false)], &s)[0]
+                .replaces
+                .as_deref(),
+            Some("OLD")
         );
     }
 

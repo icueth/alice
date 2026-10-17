@@ -627,8 +627,9 @@ pub struct DistillSettings {
     pub min_confidence: f64,
     /// Most memories kept from one session run (1 to 50).
     pub max_per_run: usize,
-    /// Most memories kept from one session over all its runs, its subagents' included (2 to
-    /// 200). One of them is kept for a handoff; subagent reports together keep at most half.
+    /// The size of a session's best set of distilled memories, its subagents' included (2 to
+    /// 200): a better passage replaces the weakest once the judge keeps it. Subagent reports keep
+    /// at most half of it.
     pub max_per_session: usize,
     /// Most memories kept from subagent reports in one run (0 to 50).
     pub max_per_subagent_run: usize,
