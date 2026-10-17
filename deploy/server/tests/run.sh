@@ -139,6 +139,7 @@ case "$*" in
     echo "jev_api_key set (****${v: -4})"
     ;;
   "config set judge.provider jev") echo jev >"$ALICE_HOME/judge.provider" ;;
+  "config set distill.provider jev") echo jev >"$ALICE_HOME/distill.provider" ;;
   "model fetch")
     if [ "${SELFTEST:-}" = fetchfail ]; then
       i=0; while [ "$i" -lt 2000 ]; do printf '\rmodel_quantized.onnx: %5.1f%%' "$i" >&2; i=$((i + 1)); done
@@ -211,6 +212,7 @@ add_creates_everything() {
   has "$e" 'ALICE_JUDGE_JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone'
   has "$e" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
   has "$e" 'ALICE_JUDGE_JEV_MODEL=jev-1.13.0'
+  has "$e" 'ALICE_CAPTURE_RAW_RETENTION=180d'
   hasnt "$e" 'tok-'
   local u="$R/etc/systemd/system/alice@.service"
   has "$u" 'MemoryMax=3G'
@@ -307,24 +309,24 @@ add_prints_the_mcp_url() {
   run add dave
   [ "$RC" = 0 ] || fail "add dave exited $RC: $OUT"
   printf '%s\n' "$OUT" | grep -qF 'https://203.0.113.7/u/dave/mcp' || fail "no MCP URL"
-  # shellcheck disable=SC2016  # the literal text ${ALICE_TOKEN} is what must be printed
-  printf '%s\n' "$OUT" | grep -qF 'Authorization: Bearer ${ALICE_TOKEN}' || fail "no literal \${ALICE_TOKEN} example"
   [ "$(count_in 'tok-dave-')" = 1 ] || fail "token not printed once"
   pass
 }
 
-add_prints_a_single_quoted_mcp_hint() {
+GUS_SETUP='curl -fsSL https://203.0.113.7/u/gus/api/v1/capture/setup.sh | sh -s -- https://203.0.113.7/u/gus'
+add_prints_the_handover_and_the_setup_line() {
   run add gus
   [ "$RC" = 0 ] || fail "add gus exited $RC: $OUT"
-  local hint
-  hint=$(printf '%s\n' "$OUT" | grep -F 'claude mcp add' || true)
-  [ -n "$hint" ] || fail "no claude mcp add line: $OUT"
-  # shellcheck disable=SC2016  # the literal text ${ALICE_TOKEN} is what must be printed
-  printf '%s\n' "$hint" | grep -qF "'Authorization: Bearer \${ALICE_TOKEN}'" || fail "hint lacks the single-quoted header: $hint"
-  printf '%s\n' "$hint" | grep -qF "'https://203.0.113.7/u/gus/mcp'" || fail "hint lacks the quoted URL: $hint"
-  printf '%s\n' "$hint" | grep -qF '"Authorization' && fail "double-quoted Authorization: $hint"
-  printf '%s\n' "$OUT" | grep -qF 'docs/server.md' || fail "no pointer to docs/server.md"
   [ "$(count_in 'tok-gus-')" = 1 ] || fail "token not printed once"
+  # The person's agent follows docs/setup-server.md: the token goes into ~/.config/alice/token, never ALICE_TOKEN.
+  printf '%s\n' "$OUT" | grep -qF 'docs/setup-server.md' || fail "no pointer to docs/setup-server.md: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'My address is https://203.0.113.7/u/gus and my token file is ~/Downloads/alice-token.' \
+    || fail "no handover sentence: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'ALICE_TOKEN' && fail "still tells the admin to use ALICE_TOKEN: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'claude mcp add' && fail "still prints a claude mcp add line: $OUT"
+  # The capture setup line (SP2 spec §9.5), exactly once, with no token in it.
+  [ "$(count_in "$GUS_SETUP")" = 1 ] || fail "setup line not printed once: $OUT"
+  printf '%s\n' "$OUT" | grep -F 'setup.sh' | grep -qF 'tok-' && fail "a token in the setup line: $OUT"
   pass
 }
 
@@ -343,6 +345,10 @@ rotate_prints_a_new_token() {
   [ "$RC" = 0 ] || fail "rotate exited $RC: $OUT"
   [ "$(count_in 'tok-rot1-')" = 1 ] || fail "new token not printed once: $OUT"
   printf '%s\n' "$OUT" | grep -qF "$FIRST_TOKEN" && fail "old token printed"
+  # Re-running the setup line takes the new token into ~/.config/alice/token; no ALICE_TOKEN to update.
+  [ "$(count_in 'curl -fsSL https://203.0.113.7/u/ann/api/v1/capture/setup.sh | sh -s -- https://203.0.113.7/u/ann')" = 1 ] \
+    || fail "rotate does not print the setup line: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'ALICE_TOKEN' && fail "rotate still mentions ALICE_TOKEN: $OUT"
   has "$R/calls.log" 'sudo -u alice-ann env ALICE_HOME='
   pass
 }
@@ -887,8 +893,11 @@ upgrade_adds_the_time_zone_to_older_tenants() {
   hasnt "$TENANTS/bob.env" 'TZ=Asia/Bangkok'
   printf '%s\n' "$OUT" | grep -qF 'TZ=Asia/Bangkok added for: ann' || fail "$OUT"
   # The Jev pins (final review C1) arrive the same way, and a budget the admin changed is kept.
-  grep -v '^ALICE_JUDGE_' "$TENANTS/ann.env" >"$T/ann.env" && cat "$T/ann.env" >"$TENANTS/ann.env"
-  sed 's/^ALICE_JUDGE_DAILY_BUDGET_USD=.*/ALICE_JUDGE_DAILY_BUDGET_USD=0.5/' "$TENANTS/bob.env" >"$T/bob.env"
+  # So does the capture retention (SP2 spec §9.5), and a retention the admin changed is kept too.
+  grep -v -e '^ALICE_JUDGE_' -e '^ALICE_CAPTURE_RAW_RETENTION=' "$TENANTS/ann.env" >"$T/ann.env"
+  cat "$T/ann.env" >"$TENANTS/ann.env"
+  sed -e 's/^ALICE_JUDGE_DAILY_BUDGET_USD=.*/ALICE_JUDGE_DAILY_BUDGET_USD=0.5/' \
+    -e 's/^ALICE_CAPTURE_RAW_RETENTION=.*/ALICE_CAPTURE_RAW_RETENTION=90d/' "$TENANTS/bob.env" >"$T/bob.env"
   cat "$T/bob.env" >"$TENANTS/bob.env"
   run upgrade "$R/new-alice"
   [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
@@ -896,6 +905,10 @@ upgrade_adds_the_time_zone_to_older_tenants() {
   has "$TENANTS/ann.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
   has "$TENANTS/bob.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=0.5'
   printf '%s\n' "$OUT" | grep -qF 'the Jev endpoint, model and budget pinned for: ann' || fail "$OUT"
+  has "$TENANTS/ann.env" 'ALICE_CAPTURE_RAW_RETENTION=180d'
+  has "$TENANTS/bob.env" 'ALICE_CAPTURE_RAW_RETENTION=90d'
+  hasnt "$TENANTS/bob.env" 'ALICE_CAPTURE_RAW_RETENTION=180d'
+  printf '%s\n' "$OUT" | grep -qF 'captured transcripts kept 180d for: ann' || fail "$OUT"
   run add bob --tz Asia/Bangkok
   pass
 }
@@ -1119,6 +1132,21 @@ list_marks_the_team_store() {
   pass
 }
 
+setup_line_prints_it_again_without_a_token() {
+  run setup-line gus
+  [ "$RC" = 0 ] || fail "setup-line gus exited $RC: $OUT"
+  [ "$OUT" = "$GUS_SETUP" ] || fail "setup-line printed: $OUT"
+  run setup-line nobody
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'no tenant named nobody'; then fail "setup-line accepted an unknown tenant: $OUT"; fi
+  run setup-line Bad_Name
+  [ "$RC" != 0 ] || fail "setup-line accepted a bad name: $OUT"
+  pass
+}
+setup_line_refuses_the_team_store() {
+  run setup-line team
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'shared team store'; then fail "setup-line accepted the team store: $OUT"; fi
+  pass
+}
 adopt_refuses_the_team_store() {
   local before
   before=$(wc -l <"$R/calls.log")
@@ -1143,6 +1171,7 @@ has_key() { # tenant key
   [ "$(cat "$SRV/$1/secrets.toml" 2>/dev/null)" = "jev_api_key = \"$2\"" ] || fail "$1 does not hold the key"
   [ -n "$(find "$SRV/$1/secrets.toml" -perm 600)" ] || fail "$1's secrets.toml is not 0600"
   [ "$(cat "$SRV/$1/judge.provider" 2>/dev/null)" = jev ] || fail "$1's judge is not jev"
+  [ "$(cat "$SRV/$1/distill.provider" 2>/dev/null)" = jev ] || fail "$1's distillation is not jev"
 }
 
 jev_key_set_reaches_every_tenant_and_nothing_else() {
@@ -1272,13 +1301,13 @@ for CURRENT in \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \
   add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \
-  rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store adopt_refuses_the_team_store \
+  rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store adopt_refuses_the_team_store setup_line_refuses_the_team_store \
   jev_key_set_reaches_every_tenant_and_nothing_else jev_key_is_inherited_by_a_new_tenant \
   jev_key_rotation_replaces_it_everywhere jev_key_status_names_tenants_and_never_the_key \
   jev_key_refuses_an_empty_or_malformed_key \
   remove_person_deletes_the_team_copy remove_team_unprovisions provision_refuses_a_missing_team_token \
   refuses_to_run_with_empty_roots remove_archives_then_deletes \
-  add_prints_a_single_quoted_mcp_hint no_remote_set_line; do
+  add_prints_the_handover_and_the_setup_line setup_line_prints_it_again_without_a_token no_remote_set_line; do
   "$CURRENT"
 done
 echo "all $COUNT scenarios passed"
