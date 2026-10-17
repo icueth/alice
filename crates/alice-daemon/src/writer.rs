@@ -798,21 +798,22 @@ fn distilled_author(conn: &Connection, id: &str) -> Result<Option<(String, Strin
 }
 
 /// The distilled newcomer `id` settled live, judged or given up on: its session's best set keeps
-/// its size ([`evict_over_cap`]). `settings` come with the op. Without them eviction would be
-/// skipped in silence (Task 12c review 2, N2): a debug build stops, a release build warns and
-/// evicts nothing.
+/// its size ([`evict_over_cap`]), a member the judge related it to going first (`related`).
+/// `settings` come with the op. Without them eviction would be skipped in silence (Task 12c
+/// review 2, N2): a debug build stops, a release build warns and evicts nothing.
 fn settle_distilled(
     conn: &Connection,
     st: &mut State,
     id: &str,
     settings: Option<&alice_core::settings::DistillSettings>,
+    related: &[String],
 ) -> Result<()> {
     debug_assert!(
         settings.is_some(),
         "a judgement of a distilled newcomer carries the distillation settings ({id})"
     );
     match settings {
-        Some(s) => evict_over_cap(conn, st, id, s),
+        Some(s) => evict_over_cap(conn, st, id, s, related),
         None => {
             tracing::warn!(
                 id,
@@ -832,6 +833,7 @@ fn evict_over_cap(
     st: &mut State,
     id: &str,
     settings: &alice_core::settings::DistillSettings,
+    related: &[String],
 ) -> Result<()> {
     let Some((agent, session)) = distilled_author(conn, id)? else {
         return Ok(());
@@ -840,7 +842,9 @@ fn evict_over_cap(
     if !held.iter().any(|h| h.id == id) {
         return Ok(()); // no longer live
     }
-    if let Some(out) = alice_core::distill::evictee(&held, settings) {
+    let turns = alice_core::store::capture::session_turns(conn, &agent, &session)?;
+    let room = alice_core::distill::room(settings, turns);
+    if let Some(out) = alice_core::distill::evictee(&held, room, settings, related) {
         let forget = MemoryUpdate {
             action: UpdateAction::Forget,
             ..Default::default()
@@ -2117,7 +2121,7 @@ fn apply(
             let settling = judge_store::distilled_giving_up(conn, max_attempts)?;
             let (requeued, given_up) = judge_store::requeue_retries(conn, max_attempts, &now)?;
             for id in &settling {
-                settle_distilled(conn, st, id, distill.as_ref())?;
+                settle_distilled(conn, st, id, distill.as_ref(), &[])?;
             }
             if requeued + given_up > 0 {
                 tracing::info!(requeued, given_up, "memories with a failed judgement");
@@ -2425,6 +2429,9 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
     // A distilled newcomer that superseded a member of its own session's best set took that
     // member's slot: it evicts nothing (review I1, option b).
     let mut took_a_slot = false;
+    // The memories the judge linked the newcomer to: a member of its set among them leaves
+    // first when the set is over its room (Task 12d's (c)).
+    let mut related: Vec<String> = Vec::new();
     if moved {
         reviews.retain(|r| r.kind == ReviewType::Project);
     }
@@ -2481,6 +2488,7 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
             JudgeAction::Contradicts { other, .. } => {
                 let before = snap(conn, &j.id)?;
                 memories::link(conn, &j.id, other, "contradicts", &actor.as_string())?;
+                related.push(other.clone());
                 record(
                     conn,
                     st,
@@ -2498,6 +2506,7 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
             JudgeAction::RelatesTo { other, .. } => {
                 let before = snap(conn, &j.id)?;
                 memories::link(conn, &j.id, other, "relates_to", &actor.as_string())?;
+                related.push(other.clone());
                 record(
                     conn,
                     st,
@@ -2603,7 +2612,7 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
                 j.id
             );
             if !trashed && !took_a_slot {
-                settle_distilled(conn, st, &j.id, j.distill.as_ref())?;
+                settle_distilled(conn, st, &j.id, j.distill.as_ref(), &related)?;
             }
         }
     }
@@ -7636,6 +7645,102 @@ mod tests {
         );
         assert_eq!(status(&weak), "trashed");
         assert_eq!(cap_forgets(&f), 1);
+    }
+
+    /// Task 12d (c): a newcomer judged live into a full set that the judge linked to a member
+    /// (`relates_to`: an update or a duplicate that holds more; or `contradicts`) evicts that
+    /// member, the older of the two, not the set's weakest. A related member an agent edited is
+    /// protected: the weakest member that may go leaves instead.
+    #[test]
+    fn a_live_newcomer_related_to_a_member_evicts_that_member() {
+        let f = fixture();
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        let old = member(
+            &f,
+            "The berth planner reads the tide table at noon",
+            "distill:old",
+            Kind::Fact,
+            0.9,
+        );
+        member(
+            &f,
+            "Invoices go out on Fridays",
+            "distill:z",
+            Kind::Fact,
+            0.85,
+        );
+        let (new, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The berth planner reads the tide table at dawn now",
+                "distill:new",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &new,
+            vec![JudgeAction::RelatesTo {
+                other: old.clone(),
+                p: 0.8,
+            }],
+            false,
+            3,
+        );
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        assert_eq!(status(&old), "trashed", "the related member goes");
+        assert_ne!(status(&weak), "trashed");
+        assert_ne!(status(&new), "trashed");
+        // A contradiction counts too; an edited member is protected.
+        let edited = member(
+            &f,
+            "The gate opens at dawn",
+            "distill:edited",
+            Kind::Fact,
+            0.9,
+        );
+        f.h.submit_blocking(WriteOp::Update {
+            id: edited.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                title: Some("The gate".into()),
+                ..Default::default()
+            },
+            actor: Actor::Agent(CAPTURE_AGENT.into()),
+        })
+        .unwrap();
+        let (next, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The gate opens at noon, not at dawn",
+                "distill:next",
+                Kind::Fact,
+                0.96,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &next,
+            vec![JudgeAction::Contradicts {
+                other: edited.clone(),
+                p: 0.8,
+            }],
+            false,
+            3,
+        );
+        assert_ne!(status(&edited), "trashed", "protected");
+        assert_eq!(status(&weak), "trashed", "the weakest that may go instead");
+        assert_eq!(cap_forgets(&f), 2);
     }
 
     /// Task 12c review 2, N1: a distilled newcomer the judge gives up on in bulk

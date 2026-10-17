@@ -18,3 +18,5 @@ UPDATE memories SET touched_at = (
 -- The facts that cite a memory, read for each member of a session's best set.
 CREATE INDEX relations_source_memory ON relations(source_memory_id)
   WHERE source_memory_id IS NOT NULL;
+-- A session's captured turns, which its best set's room grows with (Task 12d).
+CREATE INDEX capture_turns_source ON capture_turns(source_id);

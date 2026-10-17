@@ -355,36 +355,63 @@ pub struct Placement {
     pub replaces: Option<String>,
 }
 
+/// How many more memories a session's best set holds for each further [`ROOM_TURNS`] captured
+/// turns (Task 12d).
+pub const ROOM_STEP: usize = 8;
+
+/// The captured turns (main session and subagents together) that earn a session
+/// [`ROOM_STEP`] more memories (Task 12d).
+pub const ROOM_TURNS: usize = 100;
+
+/// The size of a session's best set after `turns` captured turns, main and subagents together
+/// (spec §6.4; the controller's round-2 ruling, Task 12d): `distill.max_per_session` for its
+/// first [`ROOM_TURNS`] turns, [`ROOM_STEP`] more for each further [`ROOM_TURNS`], at most
+/// `distill.max_per_session_cap` (never below the base). Its subagents' share is half of it,
+/// rounded down.
+pub fn room(s: &DistillSettings, turns: usize) -> usize {
+    let grown = s.max_per_session + ROOM_STEP * (turns.saturating_sub(1) / ROOM_TURNS);
+    grown.min(s.max_per_session_cap.max(s.max_per_session))
+}
+
 /// The member that leaves a session's best set once a newcomer is judged live (spec §6.4; the
 /// controller's ruling on review I1, option b: eviction waits for the judge, so a newcomer the
 /// judge trashes evicts nothing). `held` is the set as `store::capture::session_held` reads it,
-/// the newcomer in it. Members the judge has yet to settle neither count nor go. With more
-/// subagent reports among the settled members than half of `max_per_session` (rounded down),
-/// the weakest report that may go ([`Held::replaceable`]) goes; otherwise, with more settled
-/// members than `max_per_session`, the weakest member that may go, the newcomer perhaps. `None`:
-/// nothing is over, or nothing may go.
-pub fn evictee<'a>(held: &'a [Held], s: &DistillSettings) -> Option<&'a Held> {
+/// the newcomer in it, and `room` its size ([`room`]). Members the judge has yet to settle
+/// neither count nor go. With more subagent reports among the settled members than half the
+/// room (rounded down), a report that may go ([`Held::replaceable`]) goes; otherwise, with more
+/// settled members than the room, a member that may go, the newcomer perhaps. Which one: a member
+/// in `related` (the ids the judge linked the newcomer to: Task 12d's (c), the older of two
+/// related memories goes), the weakest of them by [`Rank`]; with none of those, the weakest.
+/// `None`: nothing is over, or nothing may go.
+pub fn evictee<'a>(
+    held: &'a [Held],
+    room: usize,
+    s: &DistillSettings,
+    related: &[String],
+) -> Option<&'a Held> {
     let subagent = |h: &Held| h.idempotency_key.starts_with(SUBAGENT_KEY_PREFIX);
     let settled = || held.iter().filter(|h| !h.unjudged);
     let weakest = |only_reports: bool| {
+        let may_go = |h: &&Held| h.replaceable() && (!only_reports || subagent(h));
+        let by_rank = |a: &&Held, b: &&Held| a.rank(s).order(&b.rank(s));
         settled()
-            .filter(|h| h.replaceable() && (!only_reports || subagent(h)))
-            .max_by(|a, b| a.rank(s).order(&b.rank(s)))
+            .filter(may_go)
+            .filter(|h| related.contains(&h.id))
+            .max_by(by_rank)
+            .or_else(|| settled().filter(may_go).max_by(by_rank))
     };
-    if settled().filter(|h| subagent(h)).count() > s.max_per_session / 2
+    if settled().filter(|h| subagent(h)).count() > room / 2
         && let Some(h) = weakest(true)
     {
         return Some(h);
     }
-    (settled().count() > s.max_per_session)
-        .then(|| weakest(false))
-        .flatten()
+    (settled().count() > room).then(|| weakest(false)).flatten()
 }
 
 /// Places a run's kept memories into the session's best set (spec §6.4; the controller's ruling
-/// P1, Task 12c). `held` is the set: the session's live distilled memories. Its size is
-/// `distill.max_per_session`, of which subagent reports (by their key) take at most half,
-/// rounded down. Taken best first, a kept memory:
+/// P1, Task 12c). `held` is the set: the session's live distilled memories. Its size is `room`
+/// ([`room`]: it grows with the session, Task 12d), of which subagent reports (by their key)
+/// take at most half, rounded down. Taken best first, a kept memory:
 /// - that the set holds already is written again (it comes back a duplicate) and replaces
 ///   nothing;
 /// - with room for it (a free slot, and for a subagent report a free share) is added;
@@ -395,11 +422,16 @@ pub fn evictee<'a>(held: &'a [Held], s: &DistillSettings) -> Option<&'a Held> {
 /// - otherwise is not stored: every member it may replace is protected, or none is weaker.
 ///
 /// So the set never grows past its size, and, but for the members it may not replace, it is the
-/// best `max_per_session` by [`Rank`] of all the passages ever kept, whatever their order. The
+/// best `room` by [`Rank`] of all the passages ever kept, whatever their order. The
 /// placements come in `kept`'s order. They say which kept memories are stored; the members they
 /// would replace leave only once the judge finds each newcomer live ([`evictee`]; Task 12c review
 /// I1, option b).
-pub fn place(held: &[Held], kept: Vec<DistilledMemory>, s: &DistillSettings) -> Vec<Placement> {
+pub fn place(
+    held: &[Held],
+    kept: Vec<DistilledMemory>,
+    room: usize,
+    s: &DistillSettings,
+) -> Vec<Placement> {
     struct Member {
         id: Option<String>,
         rank: Rank,
@@ -407,7 +439,7 @@ pub fn place(held: &[Held], kept: Vec<DistilledMemory>, s: &DistillSettings) -> 
         /// Never replaced.
         fixed: bool,
     }
-    let share = s.max_per_session / 2;
+    let share = room / 2;
     let mut set: Vec<Member> = held
         .iter()
         .map(|h| Member {
@@ -430,7 +462,7 @@ pub fn place(held: &[Held], kept: Vec<DistilledMemory>, s: &DistillSettings) -> 
         let subs = set.iter().filter(|x| x.subagent).count();
         let share_full = m.subagent && subs >= share;
         let fixed = m.kind == Kind::Handoff;
-        if set.len() < s.max_per_session && !share_full {
+        if set.len() < room && !share_full {
             set.push(Member {
                 id: None,
                 rank,
@@ -3950,7 +3982,7 @@ mod tests {
         let mut held: Vec<Held> = Vec::new();
         let mut replaced = 0;
         for b in batches {
-            for pl in place(&held, b.clone(), s) {
+            for pl in place(&held, b.clone(), s.max_per_session, s) {
                 if let Some(id) = &pl.replaces {
                     held.retain(|h| &h.id != id);
                     replaced += 1;
@@ -4035,6 +4067,131 @@ mod tests {
         assert_eq!(h.order(&a), Ordering::Less, "a handoff, even a subagent's");
     }
 
+    /// Task 12d (c): when the room is over, a live newcomer that the judge related to a member of
+    /// its set (an update or a duplicate it linked, or a contradiction) evicts that member first,
+    /// whatever its rank; of several, the weakest. A protected or handoff member never goes: the
+    /// weakest member that may go goes instead. A related memory outside the set changes nothing.
+    #[test]
+    fn a_live_newcomer_evicts_a_related_member_first() {
+        let s = caps(8, 4, 2);
+        let m = |name: &str, kind: Kind, p: f64| held_of(&kept_mem(name, kind, p, false));
+        let id = |h: Option<&Held>| h.map(|h| h.id.clone());
+        let h = m("h", Kind::Handoff, 0.71);
+        let old = m("old", Kind::Decision, 0.95);
+        let other = m("other", Kind::Fact, 0.9);
+        let weak = m("weak", Kind::Fact, 0.72);
+        let new = m("new", Kind::Decision, 0.96);
+        let set = [
+            h.clone(),
+            old.clone(),
+            other.clone(),
+            weak.clone(),
+            new.clone(),
+        ];
+        let rel =
+            |ids: &[&str]| -> Vec<String> { ids.iter().map(|i| format!("distill:{i}")).collect() };
+        assert_eq!(
+            id(evictee(&set, 4, &s, &rel(&["old"]))),
+            Some("distill:old".into())
+        );
+        assert_eq!(
+            id(evictee(&set, 4, &s, &rel(&["old", "other"]))),
+            Some("distill:other".into()),
+            "of several, the weakest"
+        );
+        assert_eq!(
+            id(evictee(&set, 4, &s, &rel(&["elsewhere"]))),
+            Some("distill:weak".into())
+        );
+        assert_eq!(
+            evictee(&set, 5, &s, &rel(&["old"])),
+            None,
+            "the room is not over"
+        );
+        let guarded = Held {
+            protected: true,
+            ..old.clone()
+        };
+        let set = [h.clone(), guarded, other.clone(), weak.clone(), new.clone()];
+        assert_eq!(
+            id(evictee(&set, 4, &s, &rel(&["old"]))),
+            Some("distill:weak".into()),
+            "a protected related member stays"
+        );
+        assert_eq!(
+            id(evictee(
+                &[h.clone(), old, other, weak, new],
+                4,
+                &s,
+                &rel(&["h"])
+            )),
+            Some("distill:weak".into()),
+            "a handoff stays"
+        );
+    }
+
+    /// Task 12d: a session's room is `distill.max_per_session` (16) for its first 100 captured
+    /// turns, 8 more for each further 100, at most `distill.max_per_session_cap` (48).
+    #[test]
+    fn a_sessions_room_grows_with_its_turns() {
+        let s = DistillSettings::default();
+        for (turns, want) in [
+            (0, 16),
+            (1, 16),
+            (100, 16),
+            (101, 24),
+            (200, 24),
+            (201, 32),
+            (450, 48),
+            (2_000, 48),
+        ] {
+            assert_eq!(room(&s, turns), want, "{turns} turns");
+        }
+        let low = DistillSettings {
+            max_per_session_cap: 30,
+            ..DistillSettings::default()
+        };
+        assert_eq!(room(&low, 450), 30, "the cap is respected");
+        let flat = DistillSettings {
+            max_per_session: 20,
+            max_per_session_cap: 20,
+            ..DistillSettings::default()
+        };
+        assert_eq!(room(&flat, 2_000), 20);
+    }
+
+    /// Task 12d: the subagents' share is half the room, so it grows with the session.
+    #[test]
+    fn the_subagent_share_follows_the_room() {
+        let s = caps(8, 16, 2);
+        let mut held: Vec<Held> = (0..4)
+            .map(|i| held_of(&kept_mem(&format!("m{i}"), Kind::Fact, 0.85, false)))
+            .collect();
+        held.extend((0..8).map(|i| held_of(&kept_mem(&format!("s{i}"), Kind::Fact, 0.85, true))));
+        let report = kept_mem("r", Kind::Fact, 0.95, true);
+        assert_eq!(
+            place(&held, vec![report.clone()], 24, &s),
+            [Placement {
+                memory: report.clone(),
+                replaces: None,
+            }],
+            "room 24: a share of 12 has room"
+        );
+        assert!(
+            place(&held, vec![report.clone()], 16, &s)[0]
+                .replaces
+                .as_deref()
+                .is_some_and(|r| r.starts_with(SUBAGENT_KEY_PREFIX)),
+            "room 16: a share of 8 is full, so a report replaces a report"
+        );
+        held.push(held_of(&report));
+        assert_eq!(evictee(&held, 24, &s, &[]), None);
+        assert!(
+            evictee(&held, 16, &s, &[])
+                .is_some_and(|h| h.idempotency_key.starts_with(SUBAGENT_KEY_PREFIX))
+        );
+    }
+
     /// Task 12d (a): a subagent report at 0.95 enters a set full of main-session memories in the
     /// 0.8 band, in place of the weakest; a subagent decision at 0.89, in their band, does not (the
     /// main session first inside the band, before the kind).
@@ -4048,7 +4205,7 @@ mod tests {
             .collect();
         let report = kept_mem("r", Kind::Fact, 0.95, true);
         assert_eq!(
-            place(&held, vec![report.clone()], &s),
+            place(&held, vec![report.clone()], s.max_per_session, &s),
             [Placement {
                 memory: report,
                 replaces: Some("distill:m1".into()),
@@ -4056,7 +4213,7 @@ mod tests {
         );
         let level = kept_mem("level", Kind::Decision, 0.89, true);
         assert!(
-            place(&held, vec![level], &s).is_empty(),
+            place(&held, vec![level], s.max_per_session, &s).is_empty(),
             "same band: main first"
         );
     }
@@ -4074,7 +4231,12 @@ mod tests {
         let late = kept_mem("late", Kind::Fact, 0.98, false);
         let worse = kept_mem("worse", Kind::Decision, 0.72, false);
         assert_eq!(
-            place(&held, vec![worse.clone(), late.clone()], &s),
+            place(
+                &held,
+                vec![worse.clone(), late.clone()],
+                s.max_per_session,
+                &s
+            ),
             [Placement {
                 memory: late.clone(),
                 replaces: Some(weak.idempotency_key.clone()),
@@ -4082,7 +4244,7 @@ mod tests {
             "the better late passage replaces the weakest; the worse one is not stored"
         );
         assert_eq!(
-            place(&held[..2], vec![worse.clone()], &s),
+            place(&held[..2], vec![worse.clone()], s.max_per_session, &s),
             [Placement {
                 memory: worse.clone(),
                 replaces: None,
@@ -4090,7 +4252,7 @@ mod tests {
             "with room, it is added"
         );
         assert_eq!(
-            place(&held, vec![top.clone()], &s),
+            place(&held, vec![top.clone()], s.max_per_session, &s),
             [Placement {
                 memory: top.clone(),
                 replaces: None,
@@ -4099,7 +4261,12 @@ mod tests {
         );
         // Two better passages in one run replace the two weakest, never one twice.
         let late2 = kept_mem("late2", Kind::Bugfix, 0.97, false);
-        let got = place(&held, vec![late.clone(), late2.clone()], &s);
+        let got = place(
+            &held,
+            vec![late.clone(), late2.clone()],
+            s.max_per_session,
+            &s,
+        );
         let replaced: Vec<&str> = got.iter().filter_map(|p| p.replaces.as_deref()).collect();
         assert_eq!(replaced.len(), 2);
         assert!(replaced.contains(&weak.idempotency_key.as_str()));
@@ -4175,7 +4342,7 @@ mod tests {
         let held = vec![held_of(&sa), held_of(&sb)];
         let sc = kept_mem("sc", Kind::Fact, 0.99, true);
         assert_eq!(
-            place(&held, vec![sc.clone()], &s),
+            place(&held, vec![sc.clone()], s.max_per_session, &s),
             [Placement {
                 memory: sc,
                 replaces: Some(sb.idempotency_key.clone()),
@@ -4184,12 +4351,12 @@ mod tests {
         );
         let sd = kept_mem("sd", Kind::Fact, 0.80, true);
         assert!(
-            place(&held, vec![sd], &s).is_empty(),
+            place(&held, vec![sd], s.max_per_session, &s).is_empty(),
             "a worse one is not stored"
         );
         let m = kept_mem("m", Kind::Fact, 0.75, false);
         assert_eq!(
-            place(&held, vec![m.clone()], &s),
+            place(&held, vec![m.clone()], s.max_per_session, &s),
             [Placement {
                 memory: m,
                 replaces: None,
@@ -4231,7 +4398,7 @@ mod tests {
         let held: Vec<Held> = ds.iter().map(held_of).collect();
         let h = kept_mem("h1", Kind::Handoff, 0.71, false);
         assert_eq!(
-            place(&held, vec![h.clone()], &s),
+            place(&held, vec![h.clone()], s.max_per_session, &s),
             [Placement {
                 memory: h.clone(),
                 replaces: Some("distill:d3".into()),
@@ -4276,9 +4443,12 @@ mod tests {
             a.clone(),
             new.clone(),
         ];
-        assert_eq!(id(evictee(&set, &s)), Some("distill:weak".into()));
         assert_eq!(
-            evictee(&set[1..], &s),
+            id(evictee(&set, s.max_per_session, &s, &[])),
+            Some("distill:weak".into())
+        );
+        assert_eq!(
+            evictee(&set[1..], s.max_per_session, &s, &[]),
             None,
             "four of four: nothing is over"
         );
@@ -4288,14 +4458,14 @@ mod tests {
         };
         let set = [h.clone(), guarded.clone(), a.clone(), new.clone(), waiting];
         assert_eq!(
-            evictee(&set, &s),
+            evictee(&set, s.max_per_session, &s, &[]),
             None,
             "an unsettled member does not count"
         );
         let low = m("low", Kind::Fact, 0.71, false);
         let set = [h.clone(), guarded.clone(), a.clone(), new.clone(), low];
         assert_eq!(
-            id(evictee(&set, &s)),
+            id(evictee(&set, s.max_per_session, &s, &[])),
             Some("distill:low".into()),
             "the newcomer itself"
         );
@@ -4306,7 +4476,11 @@ mod tests {
             guard(new.clone()),
             guard(weak.clone()),
         ];
-        assert_eq!(evictee(&set, &s), None, "nothing may go");
+        assert_eq!(
+            evictee(&set, s.max_per_session, &s, &[]),
+            None,
+            "nothing may go"
+        );
         // Four of four, but three subagent reports of two: the weakest report goes.
         let set = [
             weak.clone(),
@@ -4315,7 +4489,7 @@ mod tests {
             m("s2", Kind::Fact, 0.9, true),
         ];
         assert_eq!(
-            id(evictee(&set, &s)),
+            id(evictee(&set, s.max_per_session, &s, &[])),
             Some(format!("{SUBAGENT_KEY_PREFIX}s3"))
         );
         let set = [
@@ -4324,7 +4498,11 @@ mod tests {
             guard(m("s3", Kind::Fact, 0.85, true)),
             guard(m("s2", Kind::Fact, 0.9, true)),
         ];
-        assert_eq!(evictee(&set, &s), None, "no report may go");
+        assert_eq!(
+            evictee(&set, s.max_per_session, &s, &[]),
+            None,
+            "no report may go"
+        );
     }
 
     /// The Task 12c addendum: `distill:cap` never replaces the session's handoff, nor a protected
@@ -4346,6 +4524,7 @@ mod tests {
             place(
                 &[h.clone(), f1.clone(), f2.clone()],
                 vec![better.clone()],
+                s.max_per_session,
                 &s
             ),
             [Placement {
@@ -4360,17 +4539,27 @@ mod tests {
             place(
                 &[h.clone(), h2.clone(), f1.clone()],
                 vec![better.clone()],
+                s.max_per_session,
                 &s
             )
             .is_empty()
         );
         // A later handoff does not replace the session's handoff either, even a weaker one.
         let later = kept_mem("later", Kind::Handoff, 0.95, false);
-        assert!(place(&[h.clone(), h2, f1.clone()], vec![later], &s).is_empty());
+        assert!(
+            place(
+                &[h.clone(), h2, f1.clone()],
+                vec![later],
+                s.max_per_session,
+                &s
+            )
+            .is_empty()
+        );
         // A protected memory counts toward the size: with one free slot there is room for one.
         let got = place(
             &[h.clone(), f1.clone()],
             vec![better.clone(), kept_mem("next", Kind::Fact, 0.9, false)],
+            s.max_per_session,
             &s,
         );
         assert_eq!(got.len(), 1, "{got:#?}");
@@ -4383,7 +4572,7 @@ mod tests {
         );
         // None that may go is weaker.
         let strong = held_of(&kept_mem("strong", Kind::Decision, 0.99, false));
-        assert!(place(&[h, f1, strong], vec![better], &s).is_empty());
+        assert!(place(&[h, f1, strong], vec![better], s.max_per_session, &s).is_empty());
     }
 
     /// The brief: a memory distilled before migration 0008 has no stored rank inputs; it ranks
@@ -4412,13 +4601,24 @@ mod tests {
         let other = held_of(&kept_mem("other", Kind::Fact, 0.99, false));
         let held = [old, other];
         assert!(
-            place(&held, vec![kept_mem("f75", Kind::Fact, 0.75, false)], &s).is_empty(),
+            place(
+                &held,
+                vec![kept_mem("f75", Kind::Fact, 0.75, false)],
+                s.max_per_session,
+                &s
+            )
+            .is_empty(),
             "same band below 0.8: the decision ranks above a fact"
         );
         assert_eq!(
-            place(&held, vec![kept_mem("f85", Kind::Fact, 0.85, false)], &s)[0]
-                .replaces
-                .as_deref(),
+            place(
+                &held,
+                vec![kept_mem("f85", Kind::Fact, 0.85, false)],
+                s.max_per_session,
+                &s
+            )[0]
+            .replaces
+            .as_deref(),
             Some("OLD")
         );
     }

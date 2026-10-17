@@ -627,10 +627,14 @@ pub struct DistillSettings {
     pub min_confidence: f64,
     /// Most memories kept from one session run (1 to 50).
     pub max_per_run: usize,
-    /// The size of a session's best set of distilled memories, its subagents' included (2 to
-    /// 200): a better passage replaces the weakest once the judge keeps it. Subagent reports keep
-    /// at most half of it.
+    /// The size of a session's best set of distilled memories for its first 100 captured turns,
+    /// its subagents' included (2 to 200): a better passage replaces the weakest once the judge
+    /// keeps it. Subagent reports keep at most half of it. The set grows by 8 for each further
+    /// 100 turns, up to `max_per_session_cap`.
     pub max_per_session: usize,
+    /// The largest a session's best set grows with the session's length (`max_per_session` to
+    /// 400).
+    pub max_per_session_cap: usize,
     /// Most memories kept from subagent reports in one run (0 to 50).
     pub max_per_subagent_run: usize,
     /// Minutes a session must be quiet before it is distilled (1 to 1440).
@@ -649,6 +653,7 @@ impl Default for DistillSettings {
             min_confidence: 0.7,
             max_per_run: 8,
             max_per_session: 16,
+            max_per_session_cap: 48,
             max_per_subagent_run: 2,
             idle_minutes: 15,
             importance: 2,
@@ -1534,6 +1539,20 @@ impl Settings {
             "distill.max_per_session",
             (2..=200).contains(&d.max_per_session),
             "must be 2 to 200",
+        );
+        range(
+            "distill.max_per_session_cap",
+            d.max_per_session_cap <= 400,
+            "must be at most 400",
+        );
+        // Against a base in its range only: a base out of it is that key's error alone.
+        range(
+            "distill.max_per_session_cap",
+            d.max_per_session_cap >= d.max_per_session || !(2..=200).contains(&d.max_per_session),
+            &format!(
+                "{} is below distill.max_per_session ({}); the cap must not be lower",
+                d.max_per_session_cap, d.max_per_session
+            ),
         );
         range(
             "distill.max_per_subagent_run",
@@ -3917,7 +3936,7 @@ mod tests {
                 0,
             ),
             (
-                "[distill]\nmax_per_session = 200\nmax_per_subagent_run = 50\n",
+                "[distill]\nmax_per_session = 200\nmax_per_session_cap = 200\nmax_per_subagent_run = 50\n",
                 200,
                 50,
             ),
@@ -3947,6 +3966,50 @@ mod tests {
         assert_eq!(
             get_key(&r.settings, "distill.max_per_subagent_run"),
             Some(serde_json::json!(0))
+        );
+    }
+
+    /// Task 12d: `distill.max_per_session_cap` (48, `max_per_session` to 400), the largest a
+    /// session's room grows; a cap below the base is refused.
+    #[test]
+    fn distill_session_cap_has_a_default_and_stays_at_or_above_the_base() {
+        assert_eq!(
+            get_key(&Settings::default(), "distill.max_per_session_cap"),
+            Some(serde_json::json!(48))
+        );
+        for (file, says) in [
+            (
+                "[distill]\nmax_per_session_cap = 10\n",
+                "below distill.max_per_session",
+            ),
+            ("[distill]\nmax_per_session_cap = 401\n", "at most 400"),
+            (
+                "[distill]\nmax_per_session = 60\n",
+                "below distill.max_per_session",
+            ),
+        ] {
+            let errs = resolve(Some(file), &[]).unwrap_err();
+            assert_eq!(errs.len(), 1, "{file}: {errs:?}");
+            assert_eq!(errs[0].key, "distill.max_per_session_cap", "{file}");
+            assert!(errs[0].message.contains(says), "{file}: {errs:?}");
+        }
+        for (file, cap) in [
+            (
+                "[distill]\nmax_per_session = 20\nmax_per_session_cap = 20\n",
+                20,
+            ),
+            ("[distill]\nmax_per_session_cap = 400\n", 400),
+        ] {
+            let r = resolve(Some(file), &[]).unwrap();
+            assert_eq!(
+                get_key(&r.settings, "distill.max_per_session_cap"),
+                Some(serde_json::json!(cap))
+            );
+        }
+        let r = resolve(None, &env(&[("ALICE_DISTILL_MAX_PER_SESSION_CAP", "64")])).unwrap();
+        assert_eq!(
+            get_key(&r.settings, "distill.max_per_session_cap"),
+            Some(serde_json::json!(64))
         );
     }
 

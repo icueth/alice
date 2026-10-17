@@ -3523,6 +3523,50 @@ fn status_of(d: &Daemon, phrase: &str) -> String {
         .status
 }
 
+/// Task 12d: a session's room grows with its captured turns. With a base of 2, a cap of 10 and
+/// 101 turns the room is 10, so four kept passages all stay, through the run's placement and
+/// the judge's eviction alike; at 100 turns the room would be 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_sessions_room_grows_with_its_turns() {
+    let config = "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 2\nmax_per_session_cap = 10\n";
+    let d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(&[("Main fact", "fact")]),
+    );
+    let mut t = Transcript::default();
+    for i in 0..101u64 {
+        let reply = if i < 4 {
+            format!("Main fact {i}: {}.", words(600 + i, 18))
+        } else {
+            "Done.".to_string()
+        };
+        t.prompt(&format!("rg-p{i}"), &format!("Go on {i}."))
+            .reply(&format!("rg-a{i}"), &reply);
+    }
+    d.send("shop", "rg1", &t, 0, "stop").await;
+    d.svc.capture_distill_now("rg1").await.unwrap();
+    until("the session is distilled and judged", || {
+        d.state(&uri("rg1")).state == "done" && d.distilled().len() == 4 && settled(&d)
+    })
+    .await;
+    let turns: i64 = d
+        .db()
+        .query_row("SELECT count(*) FROM capture_turns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(turns, 101);
+    let live = d
+        .distilled()
+        .iter()
+        .filter(|m| m.status != "trashed" && m.status != "superseded")
+        .count();
+    assert_eq!(live, 4, "{:?}", d.distilled());
+    assert_eq!(cap_trashes(&d), 0);
+    d.shutdown();
+}
+
 /// Task 12d, from re-check 2: a distilled title never holds a redaction marker, even when the
 /// project gained a rule after the capture. The passage's first sentence names the ticket, so the
 /// title is redacted when the memory is written: the title becomes the passage's first sentence

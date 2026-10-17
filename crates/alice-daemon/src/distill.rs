@@ -756,16 +756,18 @@ impl DistillCtl {
         let placements = if memories.is_empty() {
             Vec::new()
         } else {
-            let held = match self
-                .ctx
-                .readers
-                .with(|c| store::session_held(c, &src.agent, &src.session_id))
-            {
+            let (held, turns) = match self.ctx.readers.with(|c| {
+                Ok((
+                    store::session_held(c, &src.agent, &src.session_id)?,
+                    store::session_turns(c, &src.agent, &src.session_id)?,
+                ))
+            }) {
                 Ok(h) => h,
                 Err(e) => return self.read_failed(src, report, &e),
             };
             let n = memories.len();
-            let placements = distill::place(&held, memories, &s.distill);
+            let room = distill::room(&s.distill, turns);
+            let placements = distill::place(&held, memories, room, &s.distill);
             report.capped = n - placements.len();
             if report.capped > 0 {
                 tracing::info!(
