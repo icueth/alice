@@ -67,6 +67,7 @@ alice-server add <name> [--tz <IANA zone>]
 alice-server add --team team
 alice-server remove <name> [--yes]
 alice-server rotate <name>
+alice-server setup-line <name>
 alice-server list
 alice-server upgrade <binary>
 alice-server import <name> <palace-dir> [--dry-run]
@@ -88,14 +89,16 @@ URL:    https://<host>/u/<name>
 MCP:    https://<host>/u/<name>/mcp
 Token (shown once, hand it over now; alice-server rotate <name> gives a new one):
   <token>
-Claude Code, with the token in the environment variable ALICE_TOKEN:
-  claude mcp add --transport http alice 'https://<host>/u/<name>/mcp' --header 'Authorization: Bearer ${ALICE_TOKEN}'
-The .mcp.json form is in docs/server.md.
+Hand <name> the URL and the token over a private channel, the token as a file named alice-token. On their machine
+they open Claude Code or Codex and say:
+  Read docs/setup-server.md from the Alice repository (https://github.com/icueth/alice) and follow every step.
+  My address is https://<host>/u/<name> and my token file is ~/Downloads/alice-token.
+That keeps the token in ~/.config/alice/token (0600), connects the MCP and sets up capture. To set up capture
+alone, or again after an upgrade (alice-server setup-line <name> prints it again):
+  curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>
 ```
 
-The token is shown once. Hand it to the person over a private channel. If the tenant already exists, `add` prints its URL (not the token) and stops. If anything fails, it undoes what it created.
-
-The `claude mcp add` line keeps `${ALICE_TOKEN}` literal, in single quotes, so the token never lands in a saved configuration. The person sets `ALICE_TOKEN` in their shell.
+The token is shown once. Hand it to the person over a private channel, as a file named `alice-token`: [setup-server.md](setup-server.md) has their agent keep it in `~/.config/alice/token` (0600), where the MCP helper, the Codex wrapper and capture read it, so it never sits in an environment variable or a saved configuration. If the tenant already exists, `add` prints its URL (not the token) and stops. If anything fails, it undoes what it created.
 
 The tenant file holds no secret. It sets `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALICE_LOG=info`, `ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0` and `TZ`, the Jev pins below, and `ALICE_CAPTURE_RAW_RETENTION=180d`: captured transcripts (SP2 capture) age out after 180 days, while imported history and memories stay. The environment wins over the person's settings, so they cannot keep transcripts longer. To change one tenant's, edit that line, then `systemctl restart alice@<name>`; `upgrade` adds the line to tenants made before it and keeps one the admin changed.
 
@@ -107,7 +110,11 @@ The tenant file holds no secret. It sets `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALI
 
 #### rotate
 
-`alice-server rotate <name>` replaces the token and prints the new one once, as `add` does. The daemon refuses the old token at once. Hand the new token to the person; their agent configuration keeps working as soon as `ALICE_TOKEN` holds the new value.
+`alice-server rotate <name>` replaces the token and prints the new one once, as `add` does, with the setup line. The daemon refuses the old token at once. Hand the new token to the person; on their machine the setup line finds the stored token refused, asks for the new one and keeps it in `~/.config/alice/token`, where their MCP setup and capture read it.
+
+#### setup-line
+
+`alice-server setup-line <name>` prints the person's capture setup line again (below, "The setup line"). It holds no token. The team store has no address, so it has no setup line.
 
 #### list
 
@@ -450,7 +457,7 @@ The admin gives each person one line, to run on their own machine:
 curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>
 ```
 
-<!-- TODO(confirm): whether `alice-server add` prints this line (and a command prints it again) is the server lane's interface (SP2 spec §9.5); not in deploy/server/alice-server on this branch. -->
+`alice-server add <name>` and `alice-server rotate <name>` print it; `alice-server setup-line <name>` prints it again.
 
 - **Run it after the MCP setup.** [setup-server.md](setup-server.md) (which an agent can run for the person) writes `~/.config/alice/token` and `~/.config/alice/url` first; the setup line then asks nothing. Without those files it asks for the token once, on the terminal with typing hidden, and writes both files (0600, in a 0700 `~/.config/alice`). It never takes the token from the command line or the environment, and never keeps a second copy.
 - **Nothing is written before the token is checked.** The script checks the address (`https://`, or `http://` to `127.0.0.1` or `localhost` for tests) and asks `GET /api/v1/capture/status` whether the token works. A refused token from the file is reported, and the script asks once for a new one. Pointed at a local daemon instead of a tenant, it stops and says so.
@@ -518,13 +525,13 @@ The script names the project after the folder of the git repository the session 
 
 ### Retention
 
-Captured transcripts are kept **180 days** on every tenant, pinned by the line `ALICE_CAPTURE_RAW_RETENTION=180d` in `/etc/alice/tenants/<name>.env`. The environment wins over the tenant's `config.toml`, so a person's own settings cannot keep them longer; the admin changes the line (`90d` for the heaviest tenant, say) and runs `systemctl restart alice@<name>`. The daily job `capture_retention` deletes only captured chunks: imported MemPalace history and every memory stay, distilled ones included. <!-- TODO(confirm): `alice-server add` writing the line, and `upgrade` adding it where unset, are the server lane's interface (SP2 spec §9.5); not in deploy/server/alice-server on this branch. -->
+Captured transcripts are kept **180 days** on every tenant, pinned by the line `ALICE_CAPTURE_RAW_RETENTION=180d` in `/etc/alice/tenants/<name>.env`. The environment wins over the tenant's `config.toml`, so a person's own settings cannot keep them longer; the admin changes the line (`90d` for the heaviest tenant, say) and runs `systemctl restart alice@<name>`. The daily job `capture_retention` deletes only captured chunks: imported MemPalace history and every memory stay, distilled ones included. `alice-server add` writes the line, and `upgrade` adds it to tenants made before it (keeping one the admin changed).
 
 As an estimate, carrying over the 16.8 KB per imported drawer (with its two backups) that the [Disk budget](#disk-budget) measures to captured chunks, a heavy user (about 1,000 chunks a day) holds about 3.0 GB of captured transcripts at 180 days, and a lighter one (300 a day) about 0.9 GB. Captured chunks have not been measured yet.
 
 ### Distillation and the shared Jev key
 
-On this server Jev is on for everyone with the owner's one key (see [jev-key](#jev-key)), and distillation (`distill.provider = jev`) is on for every tenant. The open-source default is off: it is this deployment that turns it on. <!-- TODO(confirm): how `distill.provider = jev` reaches each tenant (`alice-server add` once the key is provisioned, per SP2 spec §9.3); the jev-key section above still says it will join later. -->
+On this server Jev is on for everyone with the owner's one key (see [jev-key](#jev-key)), and distillation (`distill.provider = jev`) is on for every tenant. The open-source default is off: it is this deployment that turns it on. `alice-server jev-key set` sets it for every tenant beside `judge.provider = jev`, and `add` for a new tenant once the key is provisioned.
 
 - A person never sees or supplies the key. The setup line's summary says whether distillation is on (`distillation: on`), from the tenant's own setting.
 - **Spend is per tenant**, inside its judge budget (`ALICE_JUDGE_DAILY_BUDGET_USD`, 1.00 USD a day by default), of which distillation may use half (`distill.budget_share = 0.5`). **The deployment-wide ceiling** is the number of daemons times that budget: 5.00 USD a day with four people and the team store, of which distillation can be at most 4 × 0.50 = 2.00 USD (the team store captures nothing). Expected spend is far lower, about 0.001-0.003 USD per distilled session.
@@ -547,11 +554,11 @@ sh ~/.config/alice/alice-capture.sh uninstall
 
 ### What the admin's script provides
 
-Capture needs these from `alice-server` (SP2 spec §9.5): <!-- TODO(confirm): none of the four is in deploy/server/alice-server on this branch yet; pane 3 implements them. -->
+Capture needs these from `alice-server` (SP2 spec §9.5):
 
 | Interface | What it does |
 |---|---|
-| Print the setup line | `alice-server add <name>`, and a command to print it again, print the setup line above |
+| Print the setup line | `alice-server add <name>` and `rotate <name>` print the setup line above; `alice-server setup-line <name>` prints it again |
 | Pin capture retention | `add` writes `ALICE_CAPTURE_RAW_RETENTION=180d` into the tenant's file, and `upgrade` adds it where unset |
 | Jev on with the shared key | Once `alice-server jev-key set` has provisioned the key, `add` sets `judge.provider = jev` and `distill.provider = jev` for the tenant |
 | Adoption | `alice-server adopt` moves a database whole, so its capture cursors and turn keys travel with it |

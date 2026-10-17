@@ -71,6 +71,8 @@ usage: alice-server add <name> [--tz <IANA zone>]
            (the shared team store: a daemon with no URL; every personal tenant is linked to it)
        alice-server remove <name> [--yes]
        alice-server rotate <name>
+       alice-server setup-line <name>
+           (the capture setup line a person runs on their machine; add and rotate print it too)
        alice-server list
        alice-server upgrade <binary>
            (also the first install; a build of deploy/server/build-release brings its ONNX Runtime along)
@@ -107,6 +109,9 @@ public_host() { # from /etc/alice/server.env
 }
 need_host() { HOST=$(public_host); }
 url() { printf 'https://%s/u/%s' "$HOST" "$1"; }
+# The one line a person runs on their own machine to capture their sessions (SP2 spec §9.5). It carries no secret: the
+# script reuses ~/.config/alice/token, or asks for the token on the terminal.
+setup_line() { printf 'curl -fsSL %s/api/v1/capture/setup.sh | sh -s -- %s' "$(url "$1")" "$(url "$1")"; }
 port_of() { sed -n 's/^ALICE_SERVER_PORT=//p' "$TENANTS/$1.env"; }
 
 put() { # path mode ; the content comes on stdin. Written through a temporary file, so a reader never sees half of it.
@@ -529,9 +534,21 @@ cmd_add() { # name team(0|1) tz tz-given(0|1)
   say "MCP:    $(url "$name")/mcp"
   say "Token (shown once, hand it over now; alice-server rotate $name gives a new one):"
   say "  $token"
-  say "Claude Code, with the token in the environment variable ALICE_TOKEN:"
-  say "  claude mcp add --transport http alice '$(url "$name")/mcp' --header 'Authorization: Bearer \${ALICE_TOKEN}'"
-  say "The .mcp.json form is in docs/server.md."
+  say "Hand $name the URL and the token over a private channel, the token as a file named alice-token. On their machine"
+  say "they open Claude Code or Codex and say:"
+  say "  Read docs/setup-server.md from the Alice repository (https://github.com/icueth/alice) and follow every step."
+  say "  My address is $(url "$name") and my token file is ~/Downloads/alice-token."
+  say "That keeps the token in ~/.config/alice/token (0600), connects the MCP and sets up capture. To set up capture"
+  say "alone, or again after an upgrade (alice-server setup-line $name prints it again):"
+  say "  $(setup_line "$name")"
+}
+
+cmd_setup_line() { # name: the capture setup line again (no token in it)
+  need_tenant "$1"
+  if is_team "$1"; then die "$TEAM is the shared team store: it has no address, so nobody runs a setup line for it"; fi
+  need_host
+  setup_line "$1"
+  printf '\n'
 }
 
 cmd_remove() { # name [--yes]
@@ -579,6 +596,9 @@ cmd_rotate() {
   if ! is_team "$name"; then
     say "New token for $name (shown once; the old one no longer works):"
     say "  $token"
+    say "Hand it over as before. On their machine, the setup line asks for it (the old one is refused) and keeps it"
+    say "in ~/.config/alice/token, where the MCP setup and capture read it:"
+    say "  $(setup_line "$name")"
   fi
   if is_team "$name"; then
     say "New team token in place (it stays on the server)."
@@ -1011,6 +1031,7 @@ main() {
     remove) [[ $# -ge 2 && $# -le 3 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_remove "$2" "${3:-}" ;;
     rotate) [[ $# -eq 2 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_rotate "$2" ;;
     list) cmd_list ;;
+    setup-line) [[ $# -eq 2 ]] || { usage; exit 2; }; valid_name "$2"; cmd_setup_line "$2" ;;
     upgrade) [[ $# -eq 2 ]] || { usage; exit 2; }; take_lock; cmd_upgrade "$2" ;;
     import) [[ $# -ge 3 && $# -le 4 ]] || { usage; exit 2; }; valid_name "$2"; take_shared_lock; cmd_import "$2" "$3" "${4:-}" ;;
     cli) [[ $# -ge 3 ]] || { usage; exit 2; }; valid_name "$2"; cmd_cli "${@:2}" ;;
