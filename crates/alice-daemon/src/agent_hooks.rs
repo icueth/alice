@@ -184,7 +184,8 @@ pub struct HookChange {
     pub added: Vec<String>,
     /// Alice's entries removed (an install replaces them).
     pub removed: usize,
-    /// Other hook commands that mention `mempalace` or `alice`, for the person to look at.
+    /// Other hooks that mention `mempalace` or `alice`, for the person to look at, each as
+    /// `<event>: <word> …` ([`other_label`]), never as its whole command.
     pub others: Vec<String>,
     /// Whether the file changes.
     pub changed: bool,
@@ -547,22 +548,42 @@ fn commands(root: &JValue) -> Vec<(&str, &str)> {
     out
 }
 
-/// The other hook commands that mention `alice` or `mempalace`, each once, in file order.
+/// The other hooks whose commands mention `alice` or `mempalace`, each once, in file order, as
+/// [`other_label`]s.
 fn others(root: &JValue, agent: HookAgent) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for (_, c) in commands(root) {
-        if mentions_memory(c) && alice_program(c, agent).is_none() && !out.iter().any(|o| o == c) {
-            out.push(c.to_string());
+    for (event, c) in commands(root) {
+        if mentions_memory(c) && alice_program(c, agent).is_none() {
+            let label = other_label(event, c);
+            if !out.contains(&label) {
+                out.push(label);
+            }
         }
     }
     out
 }
 
-/// Whether a word of `command` names something of Alice's or MemPalace's: its last path
-/// component starts with `alice` or `mempalace`, whatever the case (`alice-session-start`,
-/// `mempalace.hooks`). A folder on the way (`/home/alice/…`) does not count.
-fn mentions_memory(command: &str) -> bool {
-    let words: Vec<String> = match tokens(command) {
+/// How a report names another hook (final review A-M6): its event and the file name of the
+/// word that mentions Alice or MemPalace, a variable by its name only, redacted, and `…` when
+/// the command has more: `SessionStart: alice-session-start …`. Never the whole command: it may
+/// hold a key, and an agent that runs the install reads the report into its transcript.
+fn other_label(event: &str, command: &str) -> String {
+    let words = words(command);
+    let Some(word) = words.iter().find(|w| names_memory(w)) else {
+        return format!("{event}: …");
+    };
+    let name = match word.split_once('=') {
+        Some((var, _)) => format!("{var}=…"),
+        None => word.rsplit('/').next().unwrap_or_default().to_owned(),
+    };
+    let name = alice_core::redact::Redactor::builtin().apply(&name).text;
+    let more = if words.len() > 1 { " …" } else { "" };
+    format!("{event}: {name}{more}")
+}
+
+/// The words of a command (a shell's split, else its whitespace's).
+fn words(command: &str) -> Vec<String> {
+    match tokens(command) {
         Some(tokens) => tokens
             .into_iter()
             .filter_map(|t| match t {
@@ -571,11 +592,20 @@ fn mentions_memory(command: &str) -> bool {
             })
             .collect(),
         None => command.split_whitespace().map(String::from).collect(),
-    };
-    words.iter().any(|w| {
-        let last = w.rsplit('/').next().unwrap_or_default().to_lowercase();
-        last.starts_with("alice") || last.starts_with("mempalace")
-    })
+    }
+}
+
+/// Whether a word names something of Alice's or MemPalace's: its last path component starts
+/// with `alice` or `mempalace`, whatever the case (`alice-session-start`, `mempalace.hooks`).
+/// A folder on the way (`/home/alice/…`) does not count.
+fn names_memory(word: &str) -> bool {
+    let last = word.rsplit('/').next().unwrap_or_default().to_lowercase();
+    last.starts_with("alice") || last.starts_with("mempalace")
+}
+
+/// Whether a word of `command` names something of Alice's or MemPalace's ([`names_memory`]).
+fn mentions_memory(command: &str) -> bool {
+    words(command).iter().any(|w| names_memory(w))
 }
 
 /// Removes Alice's entries for `agent`, and the groups they leave empty; returns how many. An
@@ -1498,13 +1528,14 @@ mod tests {
         let c = install(&t, false).unwrap();
         // A word whose last path component starts with alice or mempalace, whatever the case;
         // not a home directory named alice. Alice's own entry is replaced, not listed.
+        // Each is named by its event and that word's file name, never by its whole command.
         assert_eq!(
             c.others,
             [
-                "~/.local/bin/alice-session-start",
-                "mempalace hook stop",
-                "python3 -m mempalace.hooks stop",
-                "\"/opt/x/ALICE Session.sh\" --quiet"
+                "SessionStart: alice-session-start",
+                "Stop: mempalace …",
+                "SubagentStop: mempalace.hooks …",
+                "SubagentStop: ALICE Session.sh …"
             ],
             "{c:?}"
         );
@@ -1514,8 +1545,8 @@ mod tests {
         assert!(text.contains("alice-session-start") && text.contains("mempalace hook stop"));
         let report = install_report(&t, &c, false, "alice hooks uninstall claude");
         assert!(
-            report.contains("  ~/.local/bin/alice-session-start\n")
-                && report.contains("  mempalace hook stop\n"),
+            report.contains("  SessionStart: alice-session-start\n")
+                && report.contains("  Stop: mempalace …\n"),
             "{report}"
         );
         assert!(report.contains("alice hooks uninstall claude"), "{report}");
@@ -1524,6 +1555,50 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("new sessions"), "{report}");
+    }
+
+    /// Final review A-M6: the install's report (and its `--json`), which an agent running the
+    /// install reads into its transcript, never holds another hook's whole command: a command
+    /// with a key inline would put the key there.
+    #[test]
+    fn other_hooks_are_named_without_their_commands() {
+        let m = Machine::new();
+        let t = m.target(HookAgent::Claude);
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        write(
+            &t.file,
+            &format!(
+                r#"{{"hooks": {{
+  "SessionStart": [{{"hooks": [
+    {{"type": "command", "command": "TOKEN={token} ~/bin/alice-session-start --url https://h/x"}},
+    {{"type": "command", "command": "ALICE_TOKEN={token} /opt/notify.sh"}},
+    {{"type": "command", "command": "/opt/mempalace-{token}/run"}}
+  ]}}]
+}}}}"#
+            ),
+        );
+        let c = install(&t, true).unwrap();
+        assert_eq!(
+            c.others,
+            [
+                "SessionStart: alice-session-start …",
+                "SessionStart: ALICE_TOKEN=… …",
+            ],
+            "{c:?}"
+        );
+        let report = install_report(&t, &c, true, "alice hooks uninstall claude");
+        let json = serde_json::to_string(&c).unwrap();
+        for out in [&report, &json] {
+            assert!(
+                !out.contains("aBcDeFgHiJ") && !out.contains("https://h/x"),
+                "{out}"
+            );
+        }
+        // A word that holds a secret itself is redacted.
+        assert_eq!(
+            other_label("Stop", &format!("alice-{token}")),
+            "Stop: alice-[REDACTED:github_token]"
+        );
     }
 
     #[test]

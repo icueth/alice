@@ -126,7 +126,9 @@ missing `alice` binary never fails a turn. The install prints the five commands 
   changed.`). If you move the `alice` binary, run it again: it replaces the hooks that point at the old path.
 - **It lists other memory hooks.** Hook commands that run something named `alice…` or `mempalace…` (a MemPalace plugin's
   hooks, or an older SessionStart script such as `alice-session-start` that printed `alice context`) are listed under
-  "Other hooks mention alice or mempalace", so you can remove them yourself. Alice's capture replaces them.
+  "Other hooks mention alice or mempalace", so you can remove them yourself. Alice's capture replaces them. Each is named
+  by its event and that program's name (`SessionStart: alice-session-start …`), never by its whole command, which may
+  hold a key.
 - **Hooks load in new sessions.** Start a new Claude Code session afterwards.
 
 `alice hooks uninstall claude` removes exactly Alice's entries (and the groups and lists they leave empty), with a

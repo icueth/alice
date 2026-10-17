@@ -514,7 +514,8 @@ The capture worker is a daemon thread, `alice-capture`, at low priority.
   (R20).
 - **Output:** what changed, the backup path, the uninstall command, and that hooks load in new sessions. It also lists
   other hooks whose command mentions `mempalace` or `alice` (for example the stopgap `alice-session-start`), so the person
-  sees what to remove (§9).
+  sees what to remove (§9): each by its event and that word's file name (`SessionStart: alice-session-start …`), never
+  the whole command, which may hold a key (final review A-M6).
 - **`uninstall claude`** removes exactly Alice's entries (and arrays left empty), with a backup.
 - **`status`** shows whether the hooks are installed, whether their binary exists, and the last capture.
 
