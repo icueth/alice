@@ -1536,6 +1536,45 @@ async fn the_token_never_appears_in_argv_or_logs() {
     assert!(env.tmp_entries().is_empty(), "{:?}", env.tmp_entries());
 }
 
+/// Final review C-M5: the Codex wrapper of setup-server.md starts Codex with `ALICE_TOKEN` and
+/// `ALICE_PROJECT` in its environment, and Codex may hand that on to its hooks. The hook script
+/// drops both before it starts anything, so no child (git, curl, the worker) inherits them.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_hook_passes_no_token_variable_to_its_children() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    let token = s.tenant("ann").token.clone();
+    let repo = env.root.join("code/envcheck");
+    env.git_repo(&repo);
+    // `curl` and `git` record the environment they get, then run the real program.
+    let seen = env.home.join("child-env.txt");
+    for program in ["curl", "git"] {
+        let real = ["/usr/bin", "/bin"]
+            .iter()
+            .map(|d| Path::new(d).join(program))
+            .find(|p| p.is_file())
+            .unwrap();
+        let stub = format!(
+            "#!/bin/sh\nenv >> '{}'\nexec '{}' \"$@\"\n",
+            seen.display(),
+            real.display()
+        );
+        write_mode(&env.bin.join(program), stub.as_bytes(), 0o755);
+    }
+    env.set_var("ALICE_TOKEN", Some(&token));
+    env.set_var("ALICE_PROJECT", Some("from-the-wrapper"));
+    let mut sess = Session::new(&env, "env-check", &repo);
+    sess.turn(1, "nothing secret here");
+    env.hook(&sess.input("Stop"));
+    env.wait_idle();
+    assert_eq!(turns_of(&s.tenant("ann").home, &uri("env-check")), 1);
+    let dump = read(&seen);
+    assert!(dump.contains("HOME="), "the stubs ran: {dump}");
+    assert!(!dump.contains("ALICE_TOKEN=") && !dump.contains("ALICE_PROJECT="));
+    assert!(!dump.contains(&token), "a child saw the token");
+}
+
 // ---- Capture ----
 
 #[tokio::test(flavor = "multi_thread")]

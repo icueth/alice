@@ -59,6 +59,9 @@ set -u
 umask 077
 LC_ALL=C
 export LC_ALL
+# The Codex wrapper of setup-server.md starts Codex with these set, and Codex may hand its
+# environment to hooks: drop them, so no child of this script (git, curl, the worker) has them.
+unset ALICE_TOKEN ALICE_PROJECT
 
 DIR="${HOME:?}/.config/alice"
 STATE="$DIR/state"
