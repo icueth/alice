@@ -9,7 +9,9 @@
 //!   §11.3 declares.
 //! - `distill_eval_live` (ignored): the real Jev, through `ReqwestTransport` and the key in
 //!   `TYPESAFE_API_KEY`. It writes `recorded.jsonl` with bodies only (no header, so no key),
-//!   prints the metrics and the spend, and stops once the spend passes $0.10:
+//!   prints the metrics and the spend, and stops once the spend passes $0.10, or
+//!   `ALICE_DISTILL_EVAL_STOP_USD` when that is set (Task 12b review: one re-record runs both
+//!   live tests, which share $0.10 in all, so give the second what the first left):
 //!   `cargo test -p alice-daemon --test distill_eval distill_eval_live -- --ignored --nocapture`.
 //!   With `ALICE_DISTILL_EVAL_DRY=1` nothing is sent: a scripted Jev answers, and the pipeline runs
 //!   twice and must send the same bodies both times. This is the free check before a live run.
@@ -61,8 +63,20 @@ const FAKE_KEY: &str = concat!("ts_", "replay_distill_eval_key_0001");
 /// The test home: Jev judges and distils, the whole $1 day is this run's (spec §11.3 asks for less
 /// than $0.10), and a request may take a minute, so a 40-question request is not cut short.
 const CONFIG: &str = "[judge]\nprovider = \"jev\"\ndaily_budget_usd = 1.0\ntimeout_ms = 60000\n\n[distill]\nprovider = \"jev\"\nbudget_share = 1.0\n";
-/// The live run stops once its spend passes this.
+/// A live run stops once its spend passes this, unless [`STOP_ENV`] says otherwise; it is also
+/// §11.3's spend threshold.
 const SPEND_STOP_USD: f64 = 0.10;
+/// The live runs' spend stop in USD, so the two live runs of one re-record can share $0.10.
+const STOP_ENV: &str = "ALICE_DISTILL_EVAL_STOP_USD";
+
+/// The live runs' spend stop: `value` (of [`STOP_ENV`]) when it is a positive number, else
+/// [`SPEND_STOP_USD`].
+fn spend_stop(value: Option<&str>) -> f64 {
+    value
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(SPEND_STOP_USD)
+}
 /// Set to run the dry check instead of the live run.
 const DRY_ENV: &str = "ALICE_DISTILL_EVAL_DRY";
 const REMEMBER: &str = "mcp__alice__remember";
@@ -263,7 +277,10 @@ struct EvalTransport {
     ages: Mutex<Vec<String>>,
     /// What Jev's answers say was spent (input tokens at Jev's price).
     spent: Mutex<f64>,
-    /// The spend passed [`SPEND_STOP_USD`]: nothing more is sent.
+    /// Nothing more is sent once the spend passes this: [`spend_stop`] in a live run,
+    /// [`SPEND_STOP_USD`] otherwise.
+    stop_usd: f64,
+    /// The spend passed `stop_usd`: nothing more is sent.
     stopped: AtomicBool,
     /// Live: how long each request took.
     latencies_ms: Mutex<Vec<u64>>,
@@ -271,7 +288,12 @@ struct EvalTransport {
 
 impl EvalTransport {
     fn new(mode: Mode) -> Arc<Self> {
+        let stop_usd = match mode {
+            Mode::Live(_) => spend_stop(std::env::var(STOP_ENV).ok().as_deref()),
+            _ => SPEND_STOP_USD,
+        };
         Arc::new(Self {
+            stop_usd,
             mode,
             items: Mutex::new(Vec::new()),
             answered: Mutex::new(Vec::new()),
@@ -301,7 +323,8 @@ impl EvalTransport {
         );
         assert!(
             !self.stopped.load(Ordering::SeqCst),
-            "{what}: the spend passed ${SPEND_STOP_USD}; the run stops"
+            "{what}: the spend passed ${}; the run stops",
+            self.stop_usd
         );
     }
 
@@ -370,7 +393,7 @@ impl JevTransport for EvalTransport {
         if reply.status == 200 {
             let mut spent = self.spent.lock();
             *spent += usage_usd(&reply.body);
-            if *spent > SPEND_STOP_USD {
+            if *spent > self.stop_usd {
                 self.stopped.store(true, Ordering::SeqCst);
             }
             self.answered
@@ -1219,6 +1242,18 @@ async fn dry_run(set: &[Session]) -> (Arc<EvalTransport>, Vec<Outcome>) {
     last.expect("two runs")
 }
 
+/// Task 12b review, M9: the live runs' spend stop is `ALICE_DISTILL_EVAL_STOP_USD` when it is a
+/// positive number, else $0.10.
+#[test]
+fn the_live_spend_stop_reads_its_variable() {
+    assert_eq!(spend_stop(None), 0.10);
+    assert_eq!(spend_stop(Some("0.06")), 0.06);
+    assert_eq!(spend_stop(Some(" 0.035 ")), 0.035);
+    for bad in ["", "abc", "0", "-1", "NaN", "inf"] {
+        assert_eq!(spend_stop(Some(bad)), 0.10, "{bad}");
+    }
+}
+
 // ---- The flood set (Task 12b) ----
 
 /// What Jev answered about each verdict of the flood set that it was asked about: the verdict's
@@ -1329,7 +1364,7 @@ async fn distill_eval_flood_replay() {
 }
 
 /// The flood set with the real Jev, once (Task 12b): it writes `fixtures/distill/flood/recorded.jsonl`
-/// and stops once its spend passes $0.10:
+/// and stops once its spend passes $0.10, or `ALICE_DISTILL_EVAL_STOP_USD`:
 /// `cargo test -p alice-daemon --test distill_eval distill_eval_flood_live -- --ignored --nocapture`.
 /// With `ALICE_DISTILL_EVAL_DRY=1`, the free dry check instead.
 #[tokio::test(flavor = "multi_thread")]

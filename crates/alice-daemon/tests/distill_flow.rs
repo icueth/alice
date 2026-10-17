@@ -2678,9 +2678,10 @@ fn words(seed: u64, n: usize) -> String {
 
 /// Task 12b, the brief's flow: one session of three main runs and twelve subagent sources, every
 /// passage answered at p 0.95 as knowledge. `distill.max_per_subagent_run = 4` here, so the
-/// subagents' share of the session (8 of 16) is what stops them. The session keeps 16 in all, 8
-/// of them from subagents; its third run still keeps main-session memories and asks nothing
-/// about the subagents' passages; and once it is capped, a further due-mark sends nothing.
+/// subagents' share of the session (8 of 16) is what stops them. The session keeps 15 in all (one
+/// slot of the 16 waits for a handoff that never comes: no run here closes the session), 8 of
+/// them from subagents; its third run still keeps main-session memories and asks nothing about
+/// the subagents' passages; and once it is capped, a further due-mark sends nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_long_session_with_many_subagents_keeps_at_most_its_cap() {
     let config =
@@ -2786,11 +2787,11 @@ async fn a_long_session_with_many_subagents_keeps_at_most_its_cap() {
             3 => {
                 assert_eq!(
                     (got.stored, mems.len(), in_subagents),
-                    (2, 16, 8),
+                    (1, 15, 8),
                     "{got:?}"
                 );
                 assert_eq!(
-                    main_mems, 8,
+                    main_mems, 7,
                     "the third run still keeps main-session memories"
                 );
                 let asked = d.script.questions.lock().last().cloned().unwrap();
@@ -2807,7 +2808,7 @@ async fn a_long_session_with_many_subagents_keeps_at_most_its_cap() {
                     (got.questions, got.stored, got.state.as_str()),
                     (0, 0, "done")
                 );
-                assert_eq!((mems.len(), in_subagents), (16, 8));
+                assert_eq!((mems.len(), in_subagents), (15, 8));
             }
         }
         assert!(
@@ -2826,7 +2827,232 @@ async fn a_long_session_with_many_subagents_keeps_at_most_its_cap() {
     until("the fifth run is over", || d.svc.distill_runs().len() == 5).await;
     settle().await;
     assert_eq!(d.script.distill_calls(), calls);
-    assert_eq!(d.distilled().len(), 16);
+    assert_eq!(d.distilled().len(), 15);
+    d.shutdown();
+}
+
+/// The options offered in the last distillation request, per question in id order.
+fn last_distill_options(script: &DistillScript) -> Vec<Vec<String>> {
+    let bodies = script.bodies.lock();
+    let body = bodies
+        .iter()
+        .rev()
+        .find(|b| {
+            serde_json::from_str::<serde_json::Value>(b).unwrap()["questions"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|k| is_distill_question(k))
+        })
+        .expect("a distillation request");
+    let req: serde_json::Value = serde_json::from_str(body).unwrap();
+    let mut questions: Vec<(&String, &serde_json::Value)> =
+        req["questions"].as_object().unwrap().iter().collect();
+    questions.sort_by_key(|(id, _)| id[1..].parse::<u32>().unwrap());
+    questions
+        .into_iter()
+        .map(|(_, q)| {
+            let mut options: Vec<String> =
+                q["criteria"].as_object().unwrap().keys().cloned().collect();
+            options.sort();
+            options
+        })
+        .collect()
+}
+
+/// Task 12b review, M2 (the controller's ruling): one slot of `max_per_session` is kept for a
+/// handoff. A session whose other room is used up still gets its handoff at its close: one small
+/// request over the last two turns, `handoff` the only knowledge option. A second close, with
+/// the slot held, sends nothing, and the session never keeps more than its cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capped_session_still_keeps_its_closing_handoff() {
+    let config =
+        "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 4\n";
+    let d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(&[("Main fact", "fact"), ("Where things stand:", "handoff")]),
+    );
+    let mut t = Transcript::default();
+    for i in 0..4u64 {
+        t.prompt(&format!("ho-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("ho-a{i}"),
+            &format!("Main fact {i}: {}.", words(300 + i, 18)),
+        );
+    }
+    d.send("shop", "ho1", &t, 0, "stop").await;
+    d.svc.capture_distill_now("ho1").await.unwrap();
+    until("the first run is over", || d.svc.distill_runs().len() == 1).await;
+    assert_eq!(d.distilled().len(), 3, "the fourth slot is the handoff's");
+
+    // The compaction: one small request for the handoff.
+    let off = t.len();
+    t.prompt("ho-p4", "Go on 4.")
+        .reply("ho-a4", &format!("Main fact 4: {}.", words(304, 18)))
+        .prompt("ho-p5", "Where are we?")
+        .reply("ho-a5", HANDOFF);
+    d.send("shop", "ho1", &t, off, "pre-compact").await;
+    until("the closing run is over", || {
+        d.svc.distill_runs().len() == 2
+    })
+    .await;
+    assert_eq!(d.script.distill_calls(), 2);
+    let options = last_distill_options(&d.script);
+    assert_eq!(options.len(), 2, "the last two turns");
+    for o in &options {
+        assert_eq!(o, &["ephemeral", "handoff", "unclear"]);
+    }
+    let mems = d.distilled();
+    assert_eq!(mems.len(), 4, "{mems:?}");
+    assert_eq!(mems.iter().filter(|m| m.kind == "handoff").count(), 1);
+    assert_eq!(d.state(&uri("ho1")).state, "done");
+
+    // The session ends: the slot is held, so nothing is sent.
+    let off = t.len();
+    t.prompt("ho-p6", "Go on 6.")
+        .reply("ho-a6", &format!("Main fact 6: {}.", words(306, 18)))
+        .prompt("ho-p7", "And now?")
+        .reply(
+            "ho-a7",
+            "Where things stand: the cache work is merged, and next we write the release notes.",
+        );
+    d.send("shop", "ho1", &t, off, "session-end").await;
+    until("the last run is over", || d.svc.distill_runs().len() == 3).await;
+    settle().await;
+    assert_eq!(
+        d.script.distill_calls(),
+        2,
+        "a capped close with its handoff sends nothing"
+    );
+    assert_eq!(d.distilled().len(), 4);
+    let st = d.state(&uri("ho1"));
+    assert_eq!((st.state.as_str(), st.distill_ord), ("done", st.next_ord));
+
+    // A session whose handoff came early (a compaction with room): the handoff holds the slot,
+    // and the other kinds still fill the rest, up to the cap and no further.
+    let mut t = Transcript::default();
+    for i in 0..2u64 {
+        t.prompt(&format!("hp-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("hp-a{i}"),
+            &format!("Main fact 2.{i}: {}.", words(500 + i, 18)),
+        );
+    }
+    t.prompt("hp-p2", "Where are we?").reply(
+        "hp-a2",
+        "Where things stand: the parser work is merged, and next we profile the importer.",
+    );
+    d.send("shop", "ho2", &t, 0, "pre-compact").await;
+    until("the early compaction is distilled", || {
+        d.svc
+            .distill_runs()
+            .iter()
+            .filter(|r| r.uri == uri("ho2"))
+            .count()
+            == 1
+    })
+    .await;
+    let of_ho2 = |d: &Daemon| -> Vec<String> {
+        d.distilled()
+            .into_iter()
+            .filter(|m| m.session.as_deref() == Some("ho2"))
+            .map(|m| m.kind)
+            .collect()
+    };
+    assert_eq!(of_ho2(&d), ["fact", "fact", "handoff"]);
+    let off = t.len();
+    for i in 3..6u64 {
+        t.prompt(&format!("hp-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("hp-a{i}"),
+            &format!("Main fact 2.{i}: {}.", words(500 + i, 18)),
+        );
+    }
+    d.send("shop", "ho2", &t, off, "stop").await;
+    d.svc.capture_distill_now("ho2").await.unwrap();
+    until("the second run is over", || {
+        d.svc
+            .distill_runs()
+            .iter()
+            .filter(|r| r.uri == uri("ho2"))
+            .count()
+            == 2
+    })
+    .await;
+    assert_eq!(
+        of_ho2(&d),
+        ["fact", "fact", "handoff", "fact"],
+        "one more fact fills the session's last other slot"
+    );
+    d.shutdown();
+}
+
+/// Task 12b review, M3: a session's kept memories are counted by their author (the session and
+/// the agent, which a subagent's memories share with their session), not by provenance, so raw
+/// retention deleting the session's chunks does not give a capped session fresh room.
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_retention_does_not_reset_a_sessions_cap() {
+    let config = "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 3\n\n[capture]\nraw_retention = \"30d\"\n";
+    let mut d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(&[("Main fact", "fact")]),
+    );
+    let mut t = Transcript::default();
+    for i in 0..3u64 {
+        t.prompt(&format!("rr-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("rr-a{i}"),
+            &format!("Main fact {i}: {}.", words(400 + i, 18)),
+        );
+    }
+    d.send("shop", "rr1", &t, 0, "stop").await;
+    d.svc.capture_distill_now("rr1").await.unwrap();
+    until("the first run is over", || d.svc.distill_runs().len() == 1).await;
+    assert_eq!(d.distilled().len(), 2, "two, and the handoff's slot");
+    // The session's chunks age out, and their provenance with them.
+    d.restart_with(&format!(
+        "UPDATE chunks SET created_at = '{0}'
+           WHERE source_id IN (SELECT source_id FROM capture_state);
+         UPDATE capture_state SET created_at = '{1}';",
+        hours_ago(40 * 24),
+        hours_ago(41 * 24)
+    ))
+    .await;
+    d.svc
+        .run_job(alice_daemon::maintenance::Job::CaptureRetention)
+        .await
+        .unwrap();
+    until("retention empties the session", || {
+        d.chunks_with(&uri("rr1"), "").is_empty()
+    })
+    .await;
+    let provenance: i64 = d
+        .db()
+        .query_row("SELECT count(*) FROM provenance", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(provenance, 0, "the memories lost their provenance");
+
+    let off = t.len();
+    for i in 3..6u64 {
+        t.prompt(&format!("rr-p{i}"), &format!("Go on {i}.")).reply(
+            &format!("rr-a{i}"),
+            &format!("Main fact {i}: {}.", words(400 + i, 18)),
+        );
+    }
+    d.send("shop", "rr1", &t, off, "stop").await;
+    let calls = d.script.distill_calls();
+    let runs = d.svc.distill_runs().len();
+    d.svc.capture_distill_now("rr1").await.unwrap();
+    until("the next run is over", || d.svc.distill_runs().len() > runs).await;
+    settle().await;
+    assert_eq!(
+        d.script.distill_calls(),
+        calls,
+        "still capped: nothing is sent"
+    );
+    assert_eq!(d.distilled().len(), 2);
     d.shutdown();
 }
 

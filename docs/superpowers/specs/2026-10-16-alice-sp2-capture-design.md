@@ -831,8 +831,11 @@ The distiller parses the run's chunks by their tags (§3.3) and proposes candida
    deeper. A heading is `# …`, a bold line, `N. Heading:` or `N. **Heading:**` (Task 12b: the last form was not read
    as a heading, so a real summary went out as blind 1,200-character windows across its sections). Each section is a
    candidate of its own, led by its heading; a section over 1,200 characters is cut between its paragraphs and
-   sub-bullet groups, as many whole groups in each part as fit, each part led by the heading again. What comes
-   before the first heading (the preamble, `Summary:`) is no candidate. Where the renderer cut a summary into chunks
+   sub-bullet groups, as many whole groups in each part as fit, each part led by the heading again, and a label line
+   in it that heads list items of its own (`Pending tasks:`) leads those items instead. What comes before the first
+   heading is no candidate when it is the preamble: at most 300 characters (`Summary:` and a sentence or two), or text
+   that opens "This session is being continued from a previous conversation". Longer text there is a candidate, and a
+   summary without headings is cut as any block is. Where the renderer cut a summary into chunks
    it trimmed the next line's indentation (§3.3); in an indented list such a line stays in the item it was cut from.
 2. **Turn conclusions:** the last `[assistant]` block of each turn, cut into paragraphs or bullet groups of 80–1,200
    characters. Code blocks of more than 10 lines are cut out and replaced by `[code]`.
@@ -889,20 +892,37 @@ no lesson.
 - **Ranking (Task 12b).** The candidates kept by that rule are ranked by priority, then probability, then session
   order: a main-session passage before a subagent report; among equals, handoff, decision, bugfix, warning, fact,
   howto, then preference. Every cap below takes from the top of that order, so a verdict that Jev scores 0.99 never
-  displaces a fact of the main session. The handoff comes first because there is at most one, offered at the session's
-  end, and it is what continuing the work needs most: the caps never crowd it out, and it still counts toward them.
+  displaces a fact of the main session. The handoff comes first because there is at most one per run, offered at the
+  session's end or a compaction, and it is what continuing the work needs most: within a run the caps never crowd it
+  out, across runs it has its own slot (below), and it still counts toward the caps.
 - **Caps.** One run keeps at most `distill.max_per_run` (default 8), and at most one `handoff`. Of them, at most
   `distill.max_per_subagent_run` (default 2) are subagent reports.
 - **The session's caps (Task 12b).** One session keeps at most `distill.max_per_session` (default 16) memories over all
-  its runs: its main source and its subagent sources together. The worker counts the live (`origin = distill`, not
-  trashed) memories whose provenance chunks belong to any of the session's sources; those whose idempotency key starts
-  with `distill:sub:` came from subagent reports (the main session's copy of a report or the subagent's own; the
-  prefix is the only mark a stored memory carries of that, so there is no new column and no migration; §6.5). Subagent reports of the whole session keep at most half of
-  `distill.max_per_session`, rounded down (8 of 16), so the main session always has room. A run keeps at most
-  `min(max_per_run, what the session has left)`, and of them at most `min(max_per_subagent_run, what the subagents'
-  share has left)` subagent reports.
-- **Nothing is paid for what cannot be kept.** A run whose session has nothing left makes no Jev call: its cursors move
-  to the end of what is written, the run is recorded, and the source settles `done` (a later due-mark does the same).
+  its runs: its main source and its subagent sources together.
+  - **Counting.** The worker counts the session's live (`origin = distill`, not trashed) memories by their author:
+    `write_memory` sets the author's agent and session from the source, and a subagent's source carries its session's
+    agent and id, so the count holds the subagents' memories too. Provenance is not used: raw retention deletes it with
+    the chunks, which would give a capped session fresh room. Among them, those whose idempotency key starts with
+    `distill:sub:` came from subagent reports (the main session's copy of a report or the subagent's own; the prefix is
+    the only mark a stored memory carries of that, so there is no new column and no migration; §6.5), and those of kind
+    `handoff` are handoffs.
+  - **The handoff slot (the controller's ruling, Task 12b review).** One slot of `max_per_session` is kept for a
+    handoff: memories that are not a handoff fill at most `max_per_session − 1`. The session's first live handoff
+    holds the slot; a further handoff, kept while the session had room, takes a slot like any other memory. The total
+    never passes `max_per_session`.
+  - **The subagents' share.** Subagent reports of the whole session keep at most half of `distill.max_per_session`,
+    rounded down (8 of 16), so the main session always has room.
+  - **One run** keeps at most `min(max_per_run, what the session has left)`, the free handoff slot included; of them,
+    at most `min(max_per_run, what is left of the max_per_session − 1)` are not a handoff, and at most
+    `min(max_per_subagent_run, what the subagents' share has left)` are subagent reports.
+- **Nothing is paid for what cannot be kept.**
+  - A run whose session has no room left, its handoff slot held too, makes no Jev call: its cursors move to the end of
+    what is written, the run is recorded, and the source settles `done` (a later due-mark does the same).
+  - A run whose session has no room left but a free handoff slot asks about its handoff alone. Only a closing run
+    (`session-end` or `pre-compact`) has candidates for it: it makes one small request over its last two turns, with
+    `handoff` as the only knowledge option (`ephemeral` and `unclear` stay), and keeps at most one. Any other run of
+    that session makes no call. Once a live distilled handoff of the session holds the slot, its capped closing runs
+    make no call either.
   A run whose subagents' share is used up does not ask about subagent reports.
 - **Cost:** about 20,000 input tokens for a 40-candidate request, about $0.0008. A typical session costs one or two runs.
 
@@ -926,7 +946,10 @@ apply:
 | event actor | `distill:jev` (a new `Actor` variant) |
 
 After the memories are written, `distill_ord` moves to the end of the run. A crash in between repeats the run. The Jev
-call then hits the cache (same body) and the memories come back as duplicates through their idempotency keys.
+call then hits the cache (same body) and the memories come back as duplicates through their idempotency keys, unless
+the memories written before the crash changed the session's caps (§6.4): then the request can differ (subagent reports
+or all but the handoff are no longer asked about) and one more request is paid, or none is sent when the session is
+full; the memories still come back as duplicates.
 
 ### 6.6 No floods and no doubles: what changes in the judge and the briefing
 
@@ -1022,7 +1045,9 @@ provider = "off"            # "off" | "jev"   (the existing string becomes an en
 min_confidence = 0.7        # 0.5–0.99
 max_per_run = 8             # 1–50
 max_per_session = 16        # 1–200: all runs of one session, its subagents included; subagents keep at most half
+                            # effective per run: min(max_per_run, what is left of it); one slot is a handoff's
 max_per_subagent_run = 2    # 0–50: subagent reports kept in one run
+                            # effective: min(this, max_per_run, what is left of max_per_session / 2)
 idle_minutes = 15           # 1–1,440
 importance = 2              # 1–3
 budget_share = 0.5          # 0.05–1.0 of judge.daily_budget_usd
@@ -1463,7 +1488,7 @@ a caveat the results state, as `m2-jev.md` does.
 | R13 | (Overruled by the controller.) **Tenants get the SessionStart briefing, bounded:** `curl --connect-timeout 1 --max-time 2`, plain stdout, nothing on any failure, exit 0; `capture.briefing` or `briefing=off` in `capture.conf` turns it off | The team uses only the server; without it they never get the briefing local users get | Up to 2 s at the start of a session when the server is slow or down |
 | R14 | **Distillation requires `judge.provider = jev`** | The judge is what removes duplicates of explicit memories; without it, near-copies would be stored or become review items | A person without the Jev judge gets raw capture only |
 | R15 | **`distill.provider` defaults to `off`** | Sending session text to a cloud model is opt-in in an open-source product; the owner turns it on in one command | New users get raw capture only until they opt in |
-| R16 | **At most 40 candidates per request and `max_per_run` (8) kept**, by priority (summaries, conclusions, user statements, subagent reports) | Bounded cost and no floods; compaction summaries and turn conclusions carry most lasting knowledge | A very long quiet-free stretch loses its lowest-priority candidates |
+| R16 | **At most 40 candidates per request and `max_per_run` (8) kept**, by priority (summaries, conclusions, user statements, subagent reports); Task 12b adds `max_per_session` (16) per session, one slot of it a handoff's, and `max_per_subagent_run` (2) subagent reports per run | Bounded cost and no floods; compaction summaries and turn conclusions carry most lasting knowledge | A very long quiet-free stretch loses its lowest-priority candidates |
 | R17 | **Extractive distillation with `choice` questions only**, through the existing client | Jev has no text type; the client's cache, budget, redaction and gate are reused unchanged | Passages that need the conversation are dropped (lower recall); the eval measures it |
 | R18 | **A session already mined by MemPalace continues after the import's end time; the importer skips sessions SP2 holds** | MemPalace's chunks cannot be aligned with turns; a session must be held by one side | Sessions active during the cut-over may have a gap or overlap of a few minutes at the boundary |
 | R19 | **Distilled memories never open review items; an explicit memory beats a distilled duplicate; distilled ones never supersede explicit ones** | The review inbox is for what people and agents wrote; machine copies must never cost a person's attention or an explicit memory | An uncertain but real update stays as two linked memories instead of a question |

@@ -271,7 +271,8 @@ distilled, newest first. Older ones, and sessions captured by a backfill, are di
   preference of yours (filed under `global`), a convention of this project, a fact, a handoff, or is it already saved,
   ephemeral or unclear? A passage is kept when its best answer is a kind of knowledge with probability at least
   `distill.min_confidence` (default 0.7). At most `distill.max_per_run` (default 8) are kept per run, and at most one
-  handoff.
+  handoff; at most `distill.max_per_session` (default 16) per session, one of them kept for a handoff; and at most
+  `distill.max_per_subagent_run` (default 2) subagent reports per run.
 - **The memory.** The passage (at most 1,200 characters), titled with its first sentence, with a last line
   `Context: <your prompt's first sentence>` when it needs one to stand on its own. Importance `distill.importance`
   (default 2), no topics, the session as author, and provenance links to the chunks it came from. It is written through

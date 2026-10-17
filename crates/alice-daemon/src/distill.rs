@@ -22,9 +22,10 @@
 //! 2. Each subagent by its own project's rules (the same three, without the switches): one
 //!    that is not allowed keeps its chunks and says why in its own state.
 //! 3. The session's caps (Task 12b, spec §6.4): what the session's earlier runs kept
-//!    ([`session_kept`]) sets this run's room under `distill.max_per_session` and the
-//!    subagents' share. A session with no room left sends nothing: its cursors move to the end
-//!    of what is written, and it is `done`.
+//!    ([`session_kept`]) sets this run's room under `distill.max_per_session` (one slot of it
+//!    kept for a handoff) and the subagents' share. A session with no room left sends nothing:
+//!    its cursors move to the end of what is written, and it is `done`. One with only the
+//!    handoff slot left asks about its handoff alone, in a run that closes the session.
 //! 4. The session's chunks from `distill_ord` on, and the allowed subagents' from theirs, about
 //!    two runs' worth and below each source's `next_ord`, with their turn starts (Task 12
 //!    supplement, items 1 and 11).
@@ -641,9 +642,10 @@ impl DistillCtl {
             }
         };
         // The session's caps (Task 12b): what its earlier runs kept bounds this one. A session
-        // that has kept `distill.max_per_session` asks Jev nothing more: its cursors move to the
-        // end of what is written, and it is done.
-        let kept = match self.ctx.readers.with(|c| session_kept(c, &src.source_id)) {
+        // with no room left, its handoff slot held too, asks Jev nothing more: its cursors move
+        // to the end of what is written, and it is done. One with only the handoff slot left asks
+        // about its handoff alone, and only in a run that closes it (`Prepared::within`).
+        let kept = match self.ctx.readers.with(|c| session_kept(c, src)) {
             Ok(k) => k,
             Err(e) => return self.read_failed(src, report, &e),
         };
@@ -668,7 +670,7 @@ impl DistillCtl {
             tracing::info!(
                 uri = src.uri,
                 kept = kept.all,
-                "the session has kept distill.max_per_session memories; the rest of it is not sent to Jev"
+                "the session has used up its distill.max_per_session memories; the rest of it is not sent to Jev"
             );
             let (state, next) = rest(DistillState::Done);
             return self.leave(src, report, state, next, 0);
@@ -1341,26 +1343,29 @@ pub(crate) fn write_memory(
     }
 }
 
-/// What the session of the main source `source_id` has kept so far (spec §6.4): its live
-/// (`origin = distill`, not trashed) memories, found by their provenance in any of its sources,
-/// the subagents' included, and of them those kept from a subagent report (their key starts with
-/// [`distill::SUBAGENT_KEY_PREFIX`]).
-fn session_kept(c: &Connection, source_id: &str) -> Result<SessionKept> {
+/// What the session of `src` has kept so far (spec §6.4): its live (`origin = distill`, not
+/// trashed) memories, and of them those kept from a subagent report (their key starts with
+/// [`distill::SUBAGENT_KEY_PREFIX`]) and the handoffs. They are found by their author:
+/// [`write_memory`] sets it from the source, and a subagent's source carries its session's agent
+/// and id, so the session's memories are its subagents' too. Provenance would not do: raw
+/// retention deletes it with the chunks, which would give a capped session fresh room (Task 12b
+/// review, M3).
+fn session_kept(c: &Connection, src: &CaptureState) -> Result<SessionKept> {
     let prefix = distill::SUBAGENT_KEY_PREFIX;
-    let (all, subagent): (i64, i64) = c.query_row(
-        "SELECT count(*), coalesce(sum(substr(m.idempotency_key, 1, ?2) = ?3), 0)
-         FROM memories m
-         WHERE m.origin = 'distill' AND m.status <> 'trashed'
-           AND m.id IN (SELECT p.memory_id FROM capture_state s
-                        JOIN chunks ch ON ch.source_id = s.source_id
-                        JOIN provenance p ON p.chunk_id = ch.id
-                        WHERE s.source_id = ?1 OR s.parent_source_id = ?1)",
-        rusqlite::params![source_id, prefix.len() as i64, prefix],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+    let (all, subagent, handoff): (i64, i64, i64) = c.query_row(
+        "SELECT count(*), coalesce(sum(substr(idempotency_key, 1, ?3) = ?4), 0),
+                coalesce(sum(kind = 'handoff'), 0)
+         FROM memories
+         WHERE origin = 'distill' AND status <> 'trashed'
+           AND author_agent = ?1 AND author_session = ?2",
+        rusqlite::params![src.agent, src.session_id, prefix.len() as i64, prefix],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    let n = |v: i64| usize::try_from(v).unwrap_or(0);
     Ok(SessionKept {
-        all: usize::try_from(all).unwrap_or(0),
-        subagent: usize::try_from(subagent).unwrap_or(0),
+        all: n(all),
+        subagent: n(subagent),
+        handoff: n(handoff),
     })
 }
 
