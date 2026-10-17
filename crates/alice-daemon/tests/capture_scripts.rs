@@ -1538,7 +1538,12 @@ async fn a_transcript_grown_in_steps_is_captured_once() {
         .enumerate()
     {
         sess.turn(i + 1, marker);
-        env.hook(&sess.input("Stop"));
+        let r = env.hook(&sess.input("Stop"));
+        println!(
+            "tenant hook: stop {} returned in {:.0} ms (the upload runs in the background)",
+            i + 1,
+            r.elapsed.as_secs_f64() * 1e3
+        );
     }
     env.wait_idle();
     assert_eq!(env.offset(&sess.key()), Some(sess.tr.len()));
@@ -1976,9 +1981,17 @@ async fn a_backlog_over_two_mebibytes_drains_in_several_calls() {
             );
     }
     sess.flush();
+    let started = Instant::now();
     env.hook(&sess.input("Stop"));
     env.wait_idle();
+    let drained = started.elapsed();
     let sizes = upload_sizes(&s, "backlog");
+    println!(
+        "tenant backlog: {} bytes in {} uploads, drained {:.2} s after the stop hook (2 s of it the settle wait)",
+        sess.tr.len(),
+        sizes.len(),
+        drained.as_secs_f64()
+    );
     assert!(sizes.len() >= 3, "{sizes:?}");
     assert!(sizes.iter().all(|(_, n)| *n <= 2 << 20), "{sizes:?}");
     // Every capped body says the transcript goes on; the last one, which reaches the end, not.
@@ -2542,6 +2555,10 @@ async fn session_start_prints_the_briefing_as_plain_text() {
     env.git_repo(&repo);
     let sess = Session::new(&env, "brief", &repo);
     let r = env.hook(&sess.input("SessionStart"));
+    println!(
+        "tenant hook: session-start with the briefing printed took {:.0} ms",
+        r.elapsed.as_secs_f64() * 1e3
+    );
     assert!(
         r.stdout.starts_with("# Context · repo-one\n"),
         "the repository's briefing, as plain text: {r}"
@@ -2568,6 +2585,10 @@ async fn the_briefing_gives_up_within_two_seconds() {
     s.stall(true);
     let r = env.hook(&sess.input("SessionStart"));
     s.stall(false);
+    println!(
+        "tenant hook: session-start with a stalled server took {:.0} ms",
+        r.elapsed.as_secs_f64() * 1e3
+    );
     assert!(
         r.elapsed < Duration::from_millis(2500),
         "the hook took {:?}",

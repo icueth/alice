@@ -968,6 +968,7 @@ fn p95(mut v: Vec<Duration>) -> Duration {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn twenty_sessions_at_once_capture_everything_once_beside_remembers() {
     let (_d, svc) = tenant();
+    let started = Instant::now();
     let mut uploads = Vec::new();
     for s in 0..20 {
         let svc = svc.clone();
@@ -1012,10 +1013,17 @@ async fn twenty_sessions_at_once_capture_everything_once_beside_remembers() {
     for u in uploads {
         stored += u.await.unwrap();
     }
+    let captured_in = started.elapsed();
     let mut took = Vec::new();
     for w in writers {
         took.extend(w.await.unwrap());
     }
+    println!(
+        "20 sessions at once: all captured in {:.0} ms; remember p95 {:.1} ms over {} remembers",
+        captured_in.as_secs_f64() * 1e3,
+        p95(took.clone()).as_secs_f64() * 1e3,
+        took.len()
+    );
     assert_eq!(stored, 100, "every turn stored by exactly one pass");
     let keys = known_keys(&svc);
     for s in 0..20 {
@@ -1046,6 +1054,7 @@ async fn a_forty_megabyte_transcript_is_captured_in_bounded_passes() {
     assert!(t.len() >= 40_000_000, "{} bytes", t.len());
 
     // A body larger than a pass is read only up to `MAX_PASS_BYTES`.
+    let started = Instant::now();
     let report = svc
         .capture_upload(q("big", 0, "sweep"), Bytes::from(t.bytes.clone()))
         .await
@@ -1056,6 +1065,7 @@ async fn a_forty_megabyte_transcript_is_captured_in_bounded_passes() {
     );
     assert!(report.next_offset > 0 && report.next_offset <= report.bytes_read);
     let (mut offset, mut passes) = (report.next_offset, 1);
+    let mut chunks = report.chunks_stored;
     while offset < t.len() {
         let end = (offset as usize + TRANSCRIPT_BODY_LIMIT).min(t.bytes.len());
         let body = Bytes::copy_from_slice(&t.bytes[offset as usize..end]);
@@ -1071,9 +1081,17 @@ async fn a_forty_megabyte_transcript_is_captured_in_bounded_passes() {
         );
         assert!(report.next_offset > offset, "every pass makes progress");
         offset = report.next_offset;
+        chunks += report.chunks_stored;
         passes += 1;
         assert!(passes < 50, "too many passes");
     }
+    let took = started.elapsed();
+    println!(
+        "40 MB capture: {} bytes, {chunks} chunks, {passes} passes, {:.2} s, {:.1} MB/s",
+        t.len(),
+        took.as_secs_f64(),
+        t.len() as f64 / 1e6 / took.as_secs_f64()
+    );
     assert!(passes >= 5, "{passes} passes");
     let keys = known_keys(&svc);
     for i in 0..4_000 {
