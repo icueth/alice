@@ -3523,6 +3523,47 @@ fn status_of(d: &Daemon, phrase: &str) -> String {
         .status
 }
 
+/// Task 12d, from re-check 2: a distilled title never holds a redaction marker, even when the
+/// project gained a rule after the capture. The passage's first sentence names the ticket, so the
+/// title is redacted when the memory is written: the title becomes the passage's first sentence
+/// without a marker, and the body keeps its marker.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_distilled_title_never_holds_a_redaction_marker() {
+    let d = Daemon::start(
+        Opts::jev(),
+        DistillScript::new(&[("rotation ticket", "fact")]),
+    );
+    let mut t = Transcript::default();
+    t.prompt("rd-p1", "Where is the key rotation tracked?").reply(
+        "rd-a1",
+        "The key rotation ticket TCK-48213 tracks the vault move for the deploy tokens. It closes after the release.",
+    );
+    d.send("shop", "rd1", &t, 0, "stop").await;
+    std::fs::write(
+        d.repo("shop").join(".alice.toml"),
+        "[privacy]\ncustom_patterns = [{ name = \"ticket\", regex = \"TCK-[0-9]{4,}\" }]\n",
+    )
+    .unwrap();
+    let shop = alice_core::store::projects::tree_of(&d.db(), "shop").unwrap();
+    until("the daemon holds the shop rule", || {
+        !d.svc
+            .settings_handle()
+            .project_privacy(shop.as_ref())
+            .custom_patterns
+            .is_empty()
+    })
+    .await;
+    d.svc.capture_distill_now("rd1").await.unwrap();
+    until("the passage is distilled", || d.distilled().len() == 1).await;
+    let m = d.distilled().remove(0);
+    assert!(
+        m.body.contains("[REDACTED:custom:ticket]") && !m.body.contains("TCK-48213"),
+        "{m:?}"
+    );
+    assert_eq!(m.title, "It closes after the release.");
+    d.shutdown();
+}
+
 /// Task 12b review, M3: a session's kept memories are counted by their author (the session and
 /// the agent, which a subagent's memories share with their session), not by provenance, so raw
 /// retention deleting the session's chunks does not give a full session fresh room: its next

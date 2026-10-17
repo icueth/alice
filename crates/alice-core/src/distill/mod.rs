@@ -1817,14 +1817,19 @@ fn is_mark(c: char) -> bool {
 }
 
 /// The text up to its first sentence end (`.`, `!` or `?` before a space or the end, `。`, `！`,
-/// `？`) or line break, after a leading heading or list marker.
+/// `？`, never inside a code span: [`CodeSpans`]) or line break, after a leading heading or list
+/// marker.
 fn first_sentence(text: &str) -> &str {
     let text = strip_marker(text).trim();
+    let mut spans = CodeSpans::new(text);
     let mut chars = text.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
         let next = i + c.len_utf8();
         if c == '\n' {
             return text[..i].trim_end();
+        }
+        if spans.inside(c) {
+            continue;
         }
         if matches!(c, '。' | '！' | '？')
             || (matches!(c, '.' | '!' | '?')
@@ -1962,7 +1967,26 @@ fn body_of(c: &Candidate) -> String {
 /// header, or [`TITLE_BARE`] characters or fewer (a bare heading, a label). Then it is the
 /// passage's first sentence after its head lines ([`sentence_title`]); a passage that is only a
 /// table is titled by its first row.
+///
+/// A title never holds a redaction marker ([`clean_title`]; Task 12d, from re-check 2).
 fn title_of(text: &str) -> String {
+    clean_title(&title_as_written(text), text)
+}
+
+/// `title` when it holds no redaction marker. Otherwise the first sentence of `body` (without
+/// distillation's `Context:` line) that has none ([`clean_sentence`]), or, when every sentence
+/// has one, `title` with its markers taken out ([`without_markers`]) (Task 12d, from re-check 2).
+/// The writer applies it again to a title its rules redacted.
+pub fn clean_title(title: &str, body: &str) -> String {
+    if !title.contains(MARKER) {
+        return title.to_owned();
+    }
+    let passage = body.rfind("\n\nContext: ").map_or(body, |i| &body[..i]);
+    clean_sentence(passage).unwrap_or_else(|| without_markers(title))
+}
+
+/// [`title_of`] before redaction markers are looked at.
+fn title_as_written(text: &str) -> String {
     let title = heading_title(text);
     if !title.starts_with('|') && title.chars().count() > TITLE_BARE {
         return title;
@@ -1970,6 +1994,31 @@ fn title_of(text: &str) -> String {
     sentence_title(text)
         .or_else(|| first_row(text))
         .unwrap_or(title)
+}
+
+/// How a redaction marker starts: `[REDACTED:<detector>]` (`crate::redact`).
+const MARKER: &str = "[REDACTED";
+
+/// The passage's first sentence, in its lines of prose after the labels ([`label_line`]), that
+/// has no redaction marker and says more than [`TITLE_BARE`] characters, within [`TITLE_MAX`].
+fn clean_sentence(text: &str) -> Option<String> {
+    let (prose, _) = prose_and_code(text);
+    prose
+        .into_iter()
+        .filter(|l| !label_line(l))
+        .flat_map(|l| {
+            let line = strip_markup(l);
+            let mut out = Vec::new();
+            let mut at = 0;
+            while at < line.len() {
+                let end = at + first_sentence_end(&line[at..]);
+                out.push(line[at..end].trim().to_owned());
+                at = end;
+            }
+            out
+        })
+        .find(|s| !s.contains(MARKER) && s.chars().count() > TITLE_BARE)
+        .map(|s| cut_words(&s, TITLE_MAX).to_owned())
 }
 
 /// The passage's lines of prose, trimmed, with code (fence lines and what they enclose) and
@@ -2035,11 +2084,15 @@ fn sentence_title(text: &str) -> Option<String> {
 }
 
 /// The byte length of `text` up to and with its first sentence end (`.`, `!` or `?` before a
-/// space or the end, `。`, `！`, `？`), or all of it.
+/// space or the end, `。`, `！`, `？`, never inside a code span: [`CodeSpans`]), or all of it.
 fn first_sentence_end(text: &str) -> usize {
+    let mut spans = CodeSpans::new(text);
     let mut chars = text.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
         let next = i + c.len_utf8();
+        if spans.inside(c) {
+            continue;
+        }
         if matches!(c, '。' | '！' | '？')
             || (matches!(c, '.' | '!' | '?')
                 && chars.peek().is_none_or(|&(_, n)| n.is_whitespace()))
@@ -2048,6 +2101,35 @@ fn first_sentence_end(text: &str) -> usize {
         }
     }
     text.len()
+}
+
+/// Inline code spans, met one character at a time (Task 12d, from re-check 2: a shell `!` in a
+/// span ended a title's sentence). A backtick opens a span only when another follows it in the
+/// text, so an unpaired one opens nothing; the next backtick closes it.
+struct CodeSpans {
+    ticks: usize,
+    seen: usize,
+    open: bool,
+}
+
+impl CodeSpans {
+    fn new(text: &str) -> Self {
+        CodeSpans {
+            ticks: text.matches('`').count(),
+            seen: 0,
+            open: false,
+        }
+    }
+
+    /// Whether `c`, the text's next character, is in a code span (a backtick counts as in one).
+    fn inside(&mut self, c: char) -> bool {
+        if c == '`' {
+            self.seen += 1;
+            self.open = !self.open && self.seen < self.ticks;
+            return true;
+        }
+        self.open
+    }
 }
 
 /// The first row of a table under its header, its cells joined by `, `.
@@ -2091,6 +2173,35 @@ fn heading_title(text: &str) -> String {
         line = format!("{line} {next}");
     }
     cut_words(first_sentence(&line), TITLE_MAX).to_owned()
+}
+
+/// `text` without its redaction markers (`[REDACTED:…]`), its spaces collapsed and none left
+/// before the punctuation a marker stood in front of; `text` as it is when it has none (Task
+/// 12d: no title holds a marker).
+pub fn without_markers(text: &str) -> String {
+    if !text.contains(MARKER) {
+        return text.to_owned();
+    }
+    let mut kept = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(MARKER) {
+        kept.push_str(&rest[..i]);
+        rest = rest[i..].find(']').map_or("", |j| &rest[i + j + 1..]);
+    }
+    kept.push_str(rest);
+    let mut out = String::new();
+    for c in kept
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+    {
+        if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')') && out.ends_with(' ') {
+            out.pop();
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// A line without its heading marks, list marker and bold marks.
@@ -4645,6 +4756,53 @@ mod tests {
             "The writer batches at most fifty chunks per slice."
         );
         assert_eq!(title_of("**Status**\nDone.\nPushed."), "Status");
+    }
+
+    /// Task 12d, from re-check 2: a title never holds a redaction marker. It is the passage's
+    /// first sentence without one; when every sentence has one, the sentence with the marker
+    /// taken out.
+    #[test]
+    fn a_title_never_holds_a_redaction_marker() {
+        assert_eq!(
+            title_of(
+                "The deploy token [REDACTED:github_token] lives in the vault now. Rotate the deploy token every month, before the release."
+            ),
+            "Rotate the deploy token every month, before the release."
+        );
+        assert_eq!(
+            title_of(
+                "Set the API key to [REDACTED:api_key] in the deploy config before the release."
+            ),
+            "Set the API key to in the deploy config before the release."
+        );
+        assert_eq!(
+            title_of("## Keys\nThe staging password is [REDACTED:custom:pw] for now."),
+            "The staging password is for now."
+        );
+        assert_eq!(without_markers("Use [REDACTED:pem_private_key]."), "Use.");
+    }
+
+    /// Task 12d, from re-check 2: a sentence never ends inside a backtick code span, so a shell
+    /// `!` in a span does not cut the title.
+    #[test]
+    fn a_title_is_never_cut_inside_a_code_span() {
+        assert_eq!(
+            title_of(
+                "Disable history expansion with `set +H`, since `echo done! now` fails in bash otherwise. Then rerun."
+            ),
+            "Disable history expansion with `set +H`, since `echo done! now` fails in bash otherwise."
+        );
+        assert_eq!(
+            title_of(
+                "**Note**\nOK.\nRun `git log --oneline | head -1 ! ok` to check the release tag first. Then push."
+            ),
+            "Run `git log --oneline | head -1 ! ok` to check the release tag first."
+        );
+        // An unpaired backtick opens no span.
+        assert_eq!(
+            title_of("The ` key is dead on this keyboard layout! Use the compose key instead."),
+            "The ` key is dead on this keyboard layout!"
+        );
     }
 
     /// Ruling F4: a `preference_user` passage that names the session's project (its slug, its

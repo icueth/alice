@@ -1337,8 +1337,9 @@ pub(crate) fn write_memory(
         Some(ProjectTree::unreadable(slug.clone(), None))
     });
     let r = ctx.redactors.for_root(tree.as_ref());
-    let title = r.check("title", &m.title)?;
     let body = r.check("content", &m.body)?;
+    // A rule added since the capture may redact the title: it never keeps a marker (Task 12d).
+    let title = distill::clean_title(&r.check("title", &m.title)?, &body);
     let input = NewMemoryInput {
         content: body,
         kind: Some(m.kind),
