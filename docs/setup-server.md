@@ -68,6 +68,19 @@ change it: `cp <file> <file>.bak-alice`.
    ```
 
 5. The server answers: `curl -fsS "<url>/api/v1/ping"` must succeed. It needs no token.
+6. **A planned move.** If the admin is moving the person's local Alice database to this tenant (`alice-server adopt`)
+   and has not said it is done, stop here until they do: a tenant that has captured anything is no longer fresh, and the
+   move refuses it.
+7. **A local Alice on this machine.** If `command -v alice` succeeds, check its capture hooks without printing any file:
+   `alice hooks status claude | head -n 1` (if `claude` exists) and `alice hooks status codex | head -n 1` (if `codex`
+   exists). Anything but `…: not installed` means the local Alice captures that agent's sessions; beside the server's
+   capture, every session would be stored twice and start with two briefings. A machine uses one Alice, so ask once:
+   **"Stop your local Alice and use the team server from now on (recommended)? Its data stays on this machine."** If
+   no, stop: the person must choose one ([setup-local.md](setup-local.md) is the local setup). If yes, ask them to end
+   their running agent sessions first (so the last turns are captured locally), then run `alice hooks uninstall claude`
+   and/or `alice hooks uninstall codex`. If `alice config get distill.provider` prints anything but `off`, also run
+   `alice config set distill.provider off`, so the local daemon stops sending sessions to Jev. Step 2 then points the
+   `alice` MCP entry at the server, and nothing writes to the local Alice any more.
 
 ### Step 1: Install the token and the address
 
@@ -98,8 +111,10 @@ Alice learns which project (git repository) each session is in. Claude Code runs
 session's folder, so the helper reads the session's folder from its parent process (Claude Code) with `lsof`.
 
 First, if `claude mcp list 2>/dev/null | grep -c '^alice:'` prints more than `0`, an `alice` entry already exists (it may
-be a local Alice). Ask the person once: **"Replace your current `alice` MCP entry with the team server?"** If no, skip
-this step. Then write the helper exactly as below (an existing helper is kept as `alice-mcp-headers.bak-alice`):
+be a local Alice). Unless the person chose the server in Step 0, ask once: **"Replace your current `alice` MCP entry
+with the team server?"** If no, stop: the server would get the transcripts and the other Alice the memories, so the
+person must choose one. Then write the helper exactly as below (an existing helper is kept as
+`alice-mcp-headers.bak-alice`):
 
 ```sh
 mkdir -p ~/.local/bin

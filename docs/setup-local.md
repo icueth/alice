@@ -31,8 +31,8 @@ if a step fails in a way you cannot fix, stop and explain what failed and what t
   them to paste it into this conversation, and never put one on a command line.
 - **Back up before you edit** a file the person owns: `cp <file> <file>.bak-alice`.
 - **Never delete MemPalace data**: not the palace directory, not `~/.mempalace`, nothing in it.
-- **Ask before:** installing Rust, importing MemPalace, retiring MemPalace, and turning on distillation. Everything else,
-  just do.
+- **Ask before:** installing Rust, importing MemPalace, retiring MemPalace, switching a machine from a team server to
+  this local setup, and turning on Jev (Step 8). Everything else, just do.
 
 ### Step 0: Preflight
 
@@ -46,6 +46,14 @@ if a step fails in a way you cannot fix, stop and explain what failed and what t
 4. Whether Rust is installed: `command -v cargo && cargo --version`. Alice needs Rust 1.99 or newer.
 5. A C/C++ compiler: on macOS `xcode-select -p` (if it fails, the person runs `xcode-select --install` and confirms the
    dialog); on Debian or Ubuntu `command -v cc` (else `sudo apt install build-essential`, which the person runs).
+6. Whether this machine already uses a team server (an Alice tenant): `test -e ~/.config/alice/alice-capture.sh && echo
+   server-capture`, and, if `claude` exists, `claude mcp list 2>/dev/null | grep -c -E '^alice: https?://'` (a count
+   above `0` means Claude Code's `alice` entry is a server). If either says so, a local Alice beside it would store the
+   sessions here and the memories there. A machine uses one Alice, so ask once: **"This machine is connected to your
+   team's Alice server. Switch it to a local Alice instead?"** If no, stop: this guide does not apply
+   ([setup-server.md](setup-server.md) repairs the server setup). If yes, run `sh ~/.config/alice/alice-capture.sh
+   uninstall` when that file exists (it removes the server's capture and keeps the token and address files), and
+   replace the server's `alice` entries in Step 3.
 
 If Rust is missing or older than 1.99, ask the person: **"Alice is built from source with Rust. Install Rust with
 rustup now?"** If yes:
@@ -97,12 +105,16 @@ unless they run `loginctl enable-linger "$USER"` once.
 claude mcp list 2>/dev/null | grep -c '^alice:'
 ```
 
-If that prints `0`:
+If that prints `0`, or the entry is the team server's and the person chose local in Step 0 (then first
+`claude mcp remove alice -s user`):
 
 ```sh
 ALICE_BIN=$(command -v alice) || exit 1
 claude mcp add --scope user alice -- "$ALICE_BIN" mcp
 ```
+
+An `alice` entry that points at a server (`claude mcp list 2>/dev/null | grep -c -E '^alice: https?://'` prints more
+than `0`) is never kept beside local hooks: if the person did not choose local in Step 0, stop and ask them to choose.
 
 Then `claude mcp list | grep '^alice:'` must show `alice` as connected. If it does not, retry once after 10 seconds; if
 it still fails, report the exact status line. Do not run `claude mcp get alice`.
@@ -122,7 +134,11 @@ codex mcp list
 
 If a `[mcp_servers.alice]` table already exists, do not edit it: you may not look at this file. Tell the person to open
 `~/.codex/config.toml` in their editor and make that table's `command` and `args` lines read like the ones above (with
-the path `echo "$ALICE_BIN"` printed), and wait until they say it is done. `codex mcp list` must list `alice`. If Codex
+the path `echo "$ALICE_BIN"` printed), and wait until they say it is done. A team server's table
+(`grep -c 'bearer_token_env_var = "ALICE_TOKEN"' ~/.codex/config.toml` prints more than `0`) must become exactly those
+two lines, without its `url`, `bearer_token_env_var` and `env_http_headers`, and the person also deletes the
+`# >>> alice >>>` … `# <<< alice <<<` block (the server's Codex wrapper) from their shell profile; if they did not
+choose local in Step 0, stop and ask them to choose. `codex mcp list` must list `alice`. If Codex
 reports a configuration error, restore `~/.codex/config.toml.bak-alice` and tell the person.
 
 ### Step 4: Capture sessions automatically

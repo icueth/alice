@@ -410,7 +410,7 @@ If you already run Alice on your Mac, your admin can move your database to your 
 2. Stop the agents that write to Alice, then run `alice backup now`. It prints the file it wrote, under `~/.alice/backups/`.
 3. Copy that file to the server, to your admin's home, with `scp`.
 4. Your admin runs `alice-server adopt <name> <file> --cloud-denied <your list>` on a fresh tenant and checks the report with you.
-5. Point your agents at your tenant's MCP URL (see above) and stop writing to the local Alice. Two stores that both take writes drift apart, and nothing merges them back. Keep the local home as a read-only fallback.
+5. Only after step 4, connect your machine to your tenant with [setup-server.md](setup-server.md) (a tenant that has captured anything is no longer fresh, and `adopt` refuses it). It stops the local Alice taking writes: it removes the local capture hooks (`alice hooks uninstall claude`, and `codex`; otherwise every session is captured twice and starts with two briefings), turns local distillation off (`alice config set distill.provider off`), and points the `alice` MCP entry at your tenant. Two stores that both take writes drift apart, and nothing merges them back. Keep the local home as a read-only fallback.
 
 The server clears your machine's folder paths from the projects and transcripts, and redacts everything again with its rules. Your Jev key is set on the tenant separately.
 
