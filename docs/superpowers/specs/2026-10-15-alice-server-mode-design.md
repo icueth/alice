@@ -508,8 +508,11 @@ the request handler.
 **Privacy on this path.**
 - Text arrives inside TLS **unredacted** and is redacted on the server, with the tenant's rules, before anything is
   stored or logged.
-- In tenant mode `privacy.redact` is forced on for every write (`Redactors`), and tenant validation refuses
-  `privacy.redact = false` (R28). This is the R6 principle moved to the server.
+- In tenant mode `privacy.redact` is the admin's switch (R28, amended 2026-10-17): `ALICE_PRIVACY_REDACT` pinned in the
+  tenant file by `alice-server secrets keep|redact` (§2.14), where the environment wins, and tenant validation refuses a
+  `config.toml` that sets `privacy.redact = false`, so a person's PATCH can never loosen it. A tenant without the pin
+  redacts. Whatever it stores, everything it sends to a cloud service is redacted with the always-on rules (core spec
+  §5.3), and the team store (`--team-store`) redacts every write whatever its settings say.
 - A repository's own `.alice.toml` is **not** available on this path (no client reads it). Per-project cloud denial is
   the tenant's `privacy.cloud_denied_projects` list. `docs/server.md` says this plainly.
 
@@ -531,8 +534,10 @@ The team has no client binary, so a palace reaches the server through the admin.
 4. It prints the report.
 5. It **deletes the copy** at the end, success or failure (a trap).
 
-M3's importer always redacts and holds back block-mode drawers, so what is stored is redacted. The raw palace exists on
-the server only while the job runs (the admin can read everything anyway, Q1).
+M3's importer always redacts and holds back block-mode drawers, so what is stored is redacted. *(Amended 2026-10-17:
+the importer follows the tenant's `privacy.redact`, §2.14; a tenant that keeps secrets stores the palace's as written,
+names of wings, rooms and projects still redacted.)* The raw palace exists on the server only while the job runs (the
+admin can read everything anyway, Q1).
 
 **Tenant mode** allows an import only of a palace that resolves strictly inside that tenant's `import-inbox/`
 (canonical paths). Every other path keeps the refusal of §2.2 item 7. It also refuses up front when twice the palace's
@@ -670,7 +675,9 @@ about 6 hours to embed. The other people keep the MemPalace import.
   4. in one transaction with `secure_delete` on: clears `projects.root_path`; rewrites project keys and key aliases that
      start with `path:` to `adopted:<sha256[..32]>` (R41); rewrites `sources.uri` values that are file paths (`/`, `~`,
      `file:`, a drive letter, `\\`) to `adopted:<sha256[..32]>/<file name>`; replaces those old values in event
-     snapshots and review payloads; redacts every memory's title and body with the tenant's always-on rules through
+     snapshots and review payloads; redacts every memory's title and body with the tenant's rules (*amended 2026-10-17:* its
+     own `privacy.redact`, §2.14, which `alice-server adopt` hands to `alice adopt`; a tenant that keeps secrets keeps the
+     adopted ones) through
      the ordinary edit (`memory.edit` by `system`, snapshots redacted; a memory whose redacted text equals another
      memory's is trashed first, R42), every raw chunk in place (FTS re-indexed, its embedding deleted, `embed_state`
      pending, a `chunk.redact` event that is never undone), and every event snapshot and review payload (R43); deletes
@@ -718,6 +725,28 @@ supply a key.
   on this branch.
 - Real check: a **dummy** key on a staging tenant (the judge fails closed with a note); never the owner's key, which the
   owner sets at handover. The dummy key file is removed afterwards.
+
+### 2.14 Secrets at rest (owner's decision, 2026-10-17)
+
+The owner works with many servers and wants Alice to remember everything, credentials included, so an agent can recall
+a password, a token or a connection string without anyone digging for it. Binding:
+
+1. **Every person's tenant may keep secrets as written.** `alice-server secrets keep <name>|--all` pins
+   `ALICE_PRIVACY_REDACT=false` in the tenant file and restarts that daemon; `secrets redact <name>|--all` pins `true`;
+   `secrets status` shows the default and each tenant. `add` takes the default from `/etc/alice/secrets.default` (`keep`
+   or `redact`, one line; absent: `redact`; anything else refuses the add before it creates anything). The environment
+   wins over the person's settings and tenant validation refuses `privacy.redact = false` in `config.toml`, so a
+   person's PATCH can never loosen the pin. A tenant file without the pin (made before it existed) redacts.
+2. **The team store always redacts.** `keep` is refused for it (`keep --all` skips it), its tenant file pins `true`,
+   and its daemon forces redaction on for every write (`Redactors::for_team_store`). A personal daemon redacts a
+   `shared: true` write (and a shared edit) with its always-on rules before it leaves.
+3. **Everything sent to the cloud is redacted first**, whatever the tenant keeps: the Jev judge (precise recall
+   included), distillation and a remote embedder (core spec §5.3). Redaction runs on whole texts before any cut.
+4. **Writes follow the switch.** MCP and HTTP writes, capture, the admin's import, a person's upload and `adopt` (which
+   runs outside the daemon and is handed the pin by `alice-server adopt`) all store what the switch says.
+5. **Already-redacted data stays redacted**: redaction is destructive. New writes keep secrets.
+6. The agents' MCP instructions follow the tenant's effective switch (core spec §5.3), and the setup guide
+   (`docs/setup-server.md`) writes the matching line into `CLAUDE.md` / `AGENTS.md`.
 
 ## 3. Client remote mode (deferred by addendum 2)
 
@@ -1336,7 +1365,7 @@ rules), plus §8.2. The documents: `docs/server.md` (EN; admin and person instru
 | R25 | *(Superseded by R38: the build area stays.)* After the build, **only the binary stays** (target, caches, checkout and toolchain removed) | About 6 GB back before any data exists | The next build reinstalls the toolchain (minutes) |
 | R26 | The connection's default project is the **query `?project=<slug>`** on the MCP URL, then the `X-Alice-Project` header (2026-10-16) (addendum 2 let us pick header or query) | Every MCP client can set a URL; not every one can set custom headers; Caddy keeps the query when it strips the prefix | The slug shows in Caddy's access log (a project name, not a secret) |
 | R27 | An MCP project hint that names no stored project makes a placeholder with the **existing `import:` prefix**, not `mcp:` | The store adopts only `import:%` placeholders; an `mcp:` key would split one project between MCP writes and its import and never be adopted | The key's prefix reads "import" for a project that started over MCP (internal only) |
-| R28 | Tenant mode **forces `privacy.redact` on** for every write and refuses `privacy.redact = false` | Direct MCP sends text unredacted inside TLS; the server is the only place left to redact it | A person cannot store raw secrets on the server |
+| R28 | Tenant mode **forces `privacy.redact` on** for every write and refuses `privacy.redact = false` *(amended 2026-10-17, owner's decision: the switch is the admin's, pinned as `ALICE_PRIVACY_REDACT` by `alice-server secrets keep\|redact`; `config.toml` may never turn it off; the team store always redacts; cloud egress is always redacted)* | Direct MCP sends text unredacted inside TLS; the server is the only place left to redact it | A person cannot store raw secrets on the server *(lifted: the owner wants agents to recall credentials; the admin keeps the switch, and the team store and every cloud request stay redacted)* |
 | R29 | Admin import: only a palace strictly inside the tenant's `import-inbox/`; refused when 2 × its size would leave < 2 GB free | The raw palace stays inside the tenant's own 0700 home and only for the job; the import must not be what fills the disk | A palace larger than (free − 2 GB)/2 cannot be imported in one go |
 | R30 | **Windows dropped** from CI and from this lane (addendum 2); existing Windows code stays, untested | The owner's decision; the team uses MCP, not the binary | A Windows regression in the binary goes unnoticed (the manual `windows-real-model.yml` stays) |
 | R31 | `alice-server cli <name> <args…>` runs the `alice` CLI as the tenant's user | With no client binary, the admin needs a way to set a person's key and settings | The admin types a person's Jev key (the admin can read it anyway, Q1) |

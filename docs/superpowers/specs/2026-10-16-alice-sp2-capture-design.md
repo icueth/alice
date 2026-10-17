@@ -377,7 +377,15 @@ This one rule covers everything that could duplicate:
 ### 3.7 Redaction
 
 - Every rendered chunk passes the redactor of its source's project (`Redactors::for_root`: the global `privacy.*` plus
-  the project's `.alice.toml`; on a tenant, redaction is forced on, server spec R28).
+  the project's `.alice.toml`; on a tenant, the admin's `ALICE_PRIVACY_REDACT` pin, server spec §2.14). *Owner's decision
+  2026-10-17:* storage follows `privacy.redact`, so a store that keeps secrets stores captured ones as written; egress
+  never does. Distillation redacts the run's chunks with the always-on rules of every project it covers when it loads
+  them, before any excerpt or passage is cut, and every Jev request is redacted again whole (core spec §5.3). A distilled
+  memory therefore never holds a secret.
+- No cut falls inside a token-like run (letters, digits and `_ - . + / =`): a trim or clip drops such a token whole, a
+  chunk cut prefers a paragraph, a sentence or a line end, else the start of the token the limit falls in; a token longer
+  than a whole chunk is replaced by the trim marker. A key stored as written therefore never reaches a chunk, and so the
+  cloud, as a fragment its detector no longer knows.
 - In `block` mode a chunk with a secret is replaced by the stub `[withheld: <detector names>]`, and its turn still counts
   as captured. One secret must not stop a session's capture, and nothing with a secret is stored.
 - Paths in `capture_state.transcript_path` are not redacted. They exist only locally, are needed to read the file, and are
@@ -774,8 +782,9 @@ Whether `alice-server` prints each person's line is the server lane's call. `doc
 
 It matches the direct-MCP path (server spec §2.8):
 
-- The text arrives unredacted inside TLS. The tenant redacts it with forced redaction and its own rules before anything
-  is stored or logged.
+- The text arrives unredacted inside TLS. The tenant redacts it with its own rules before anything is stored or logged,
+  unless the admin set it to keep secrets (server spec §2.14, owner's decision 2026-10-17); either way distillation
+  sends Jev only redacted text (§3.7).
 - A repository's `.alice.toml` is not mirrored. The script honours its `no_capture` and `cloud_denied` lines as client-side
   flags (§5.3 step 5), and the tenant's `capture.excluded_projects` and `privacy.cloud_denied_projects` decide the rest.
 - Full `.alice.toml` rules (custom patterns, block mode) on a tenant wait for the deferred `alice remote` client. This is

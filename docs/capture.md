@@ -240,8 +240,11 @@ Turning capture back on later does **not** fill in the excluded period.
 **Redaction.** Every chunk passes the redactor of its project: the global `privacy.*` rules plus the project's
 `.alice.toml` (custom patterns, block mode). In `block` mode a chunk that holds a secret is replaced by a stub that
 keeps the chunk's first tag and names the detectors, such as `[assistant] [withheld: github_token]`, and capture goes
-on: one secret never stops a session's capture, and nothing with a secret is stored. On a server tenant, redaction is
-always on.
+on: one secret never stops a session's capture, and nothing with a secret is stored. With `privacy.redact = false` (on
+a server tenant, the admin's `alice-server secrets keep`) captured secrets are stored as written; distillation still
+redacts every chunk it reads before it cuts anything from it, so Jev never sees a secret and a distilled memory never
+holds one. A chunk is never cut inside a token-like run (a key, a hash, base64): a token too long for a chunk is
+replaced by the trim marker.
 
 **Cloud denial.** Captured chunks reach a remote embedding provider only for projects the cloud policy allows, as every
 chunk does. Distillation never sends a denied project's text to Jev: its session waits as `skipped_cloud`, and the

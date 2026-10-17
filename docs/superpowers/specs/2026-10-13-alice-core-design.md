@@ -361,6 +361,28 @@ SP2 adds `ollama`, `claude-cli`, `codex-cli` and `openai-compatible` providers.
 - Matches are replaced with `[REDACTED:<type>]`; text that is already redacted is left as it is. Mode `block` rejects the write instead, with a message naming the field and the detectors (never the secret): over HTTP the answer is 400.
 - User-defined patterns (`{name, regex}`, shown as `[REDACTED:custom:<name>]`) and allowlists (regular expressions; a match that one of them matches completely is kept) in config. A project's `.alice.toml` may add patterns and switch on block mode (§6) but never weaken the global rules.
 - *As built (M2):* redaction runs in the service layer before every write operation (the writer does not scan again); a write queued in the spool is redacted before it is written there; the before/after snapshots that events store are redacted, and an undo restores through the same check (block mode refuses a restore that holds a secret, redact mode cleans it); a Jev request body is redacted with the rules of every project it covers; purging a memory scrubs the snapshots of the events that target it. The daemon logs no memory text. Sync exports (M4) will apply it too.
+- *Owner's decision 2026-10-17 (binding): storage follows `privacy.redact`, egress never does.*
+  - **Storage.** `privacy.redact` (default `true`, the open-source default) decides what a person's store keeps. Off, the
+    store keeps credentials and connection details as written and recalls them to that person's own agents, on every write
+    path: `remember`, `update`, ingest, capture, the MemPalace import (whose wing, room and project names stay redacted)
+    and `adopt`. It is an explicit choice: per home (`config.toml`, `ALICE_PRIVACY_REDACT`), and on a server tenant the
+    admin's alone (server spec §2.9). A project's `.alice.toml` can still only tighten.
+  - **Egress.** Whatever a store keeps, text that leaves for a cloud service is redacted first with the always-on rules
+    (`Redactors::for_root_always_on`: the global and project patterns with the switch forced on): every Jev request
+    (judging, precise recall, distillation), the input of a remote embedder (and its query), and a `shared: true` memory on
+    its way to the team store, which also redacts every write itself. A secret may be stored and recalled; it never
+    reaches Jev or any other provider.
+  - **Whole texts first.** Redaction runs on a whole text before anything cuts it for a request: a memory block's title
+    (200 characters) and body (700, or 2,000 for a raw chunk in precise recall), the 2,000-character embedding passage, and
+    distillation's excerpts and passages (the run's chunks are redacted when they are loaded). A key cut first would leave
+    a fragment no detector knows. Capture's chunk cuts never fall inside a token-like run (SP2 spec §3.7).
+  - **Destructive.** Redaction cannot be undone: text redacted before the switch was turned off keeps its
+    `[REDACTED:…]` markers; only new writes keep secrets. Turning the switch on again leaves what was kept in the store
+    until it is edited or deleted.
+  - **Agents are told.** The MCP instructions follow the effective switch: with redaction on they say "Never store
+    secrets."; off, that credentials the person shares may be stored with `remember` (kind `fact` or `howto`), stay private
+    to this person and never go into `shared: true` memories (`mcp::instructions`). `GET /api/v1/settings/flags` carries
+    `privacy.redact` for the setup guides.
 
 ### 5.4 Review inbox
 
