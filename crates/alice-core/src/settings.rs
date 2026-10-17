@@ -632,8 +632,8 @@ pub struct DistillSettings {
     /// keeps it. Subagent reports keep at most half of it. The set grows by 8 for each further
     /// 100 turns, up to `max_per_session_cap`.
     pub max_per_session: usize,
-    /// The largest a session's best set grows with the session's length (`max_per_session` to
-    /// 400).
+    /// The largest a session's best set grows with the session's length (at most 400). Below
+    /// `max_per_session` it is the base: the set does not grow.
     pub max_per_session_cap: usize,
     /// Most memories kept from subagent reports in one run (0 to 50).
     pub max_per_subagent_run: usize,
@@ -1545,15 +1545,9 @@ impl Settings {
             d.max_per_session_cap <= 400,
             "must be at most 400",
         );
-        // Against a base in its range only: a base out of it is that key's error alone.
-        range(
-            "distill.max_per_session_cap",
-            d.max_per_session_cap >= d.max_per_session || !(2..=200).contains(&d.max_per_session),
-            &format!(
-                "{} is below distill.max_per_session ({}); the cap must not be lower",
-                d.max_per_session_cap, d.max_per_session
-            ),
-        );
+        // A cap below `max_per_session` is no error: the room never goes below the base
+        // (`distill::room` clamps it), so a base above the default cap still loads (final review
+        // B, 12d concern 4).
         range(
             "distill.max_per_subagent_run",
             d.max_per_subagent_run <= 50,
@@ -3969,36 +3963,29 @@ mod tests {
         );
     }
 
-    /// Task 12d: `distill.max_per_session_cap` (48, `max_per_session` to 400), the largest a
-    /// session's room grows; a cap below the base is refused.
+    /// Task 12d: `distill.max_per_session_cap` (48, at most 400), the largest a session's room
+    /// grows. A cap below the base is not an error (final review B, 12d concern 4): the room
+    /// never goes below `max_per_session` (`distill::room` clamps it), so a config that sets
+    /// `max_per_session` above 48 and no cap still loads, instead of leaving a key out at start-up
+    /// (which made capture wait and closed the cloud gate).
     #[test]
-    fn distill_session_cap_has_a_default_and_stays_at_or_above_the_base() {
+    fn distill_session_cap_has_a_default_and_never_refuses_a_base_above_it() {
         assert_eq!(
             get_key(&Settings::default(), "distill.max_per_session_cap"),
             Some(serde_json::json!(48))
         );
-        for (file, says) in [
-            (
-                "[distill]\nmax_per_session_cap = 10\n",
-                "below distill.max_per_session",
-            ),
-            ("[distill]\nmax_per_session_cap = 401\n", "at most 400"),
-            (
-                "[distill]\nmax_per_session = 60\n",
-                "below distill.max_per_session",
-            ),
-        ] {
-            let errs = resolve(Some(file), &[]).unwrap_err();
-            assert_eq!(errs.len(), 1, "{file}: {errs:?}");
-            assert_eq!(errs[0].key, "distill.max_per_session_cap", "{file}");
-            assert!(errs[0].message.contains(says), "{file}: {errs:?}");
-        }
+        let errs = resolve(Some("[distill]\nmax_per_session_cap = 401\n"), &[]).unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].key, "distill.max_per_session_cap");
+        assert!(errs[0].message.contains("at most 400"), "{errs:?}");
         for (file, cap) in [
             (
                 "[distill]\nmax_per_session = 20\nmax_per_session_cap = 20\n",
                 20,
             ),
             ("[distill]\nmax_per_session_cap = 400\n", 400),
+            ("[distill]\nmax_per_session_cap = 10\n", 10),
+            ("[distill]\nmax_per_session = 60\n", 48),
         ] {
             let r = resolve(Some(file), &[]).unwrap();
             assert_eq!(

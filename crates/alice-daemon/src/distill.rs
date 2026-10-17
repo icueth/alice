@@ -1308,7 +1308,9 @@ impl DistillCtl {
 }
 
 /// `(distilled, dropped)`: memories distillation stored since `since`, and distilled memories
-/// trashed since then (duplicates the judge merged, and the like).
+/// trashed since then (duplicates the judge merged, and the like: spec §8.4's "duplicates and
+/// uncertain ones"). A member a session's full best set evicted (a `memory.forget` by
+/// `distill:cap`) is no drop (final review B M6).
 pub(crate) fn distilled_since(conn: &Connection, since: &str) -> Result<(u64, u64)> {
     let count = |sql: &str| -> Result<u64> {
         Ok(conn.query_row(sql, [since], |r| r.get::<_, i64>(0))? as u64)
@@ -1316,8 +1318,11 @@ pub(crate) fn distilled_since(conn: &Connection, since: &str) -> Result<(u64, u6
     Ok((
         count("SELECT count(*) FROM memories WHERE origin = 'distill' AND created_at >= ?1")?,
         count(
-            "SELECT count(*) FROM memories
-             WHERE origin = 'distill' AND status = 'trashed' AND updated_at >= ?1",
+            "SELECT count(*) FROM memories m
+             WHERE m.origin = 'distill' AND m.status = 'trashed' AND m.updated_at >= ?1
+               AND NOT EXISTS (SELECT 1 FROM events e
+                                WHERE e.target_type = 'memory' AND e.target_id = m.id
+                                  AND e.action = 'memory.forget' AND e.actor = 'distill:cap')",
         )?,
     ))
 }

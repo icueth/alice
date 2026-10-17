@@ -924,8 +924,9 @@ no lesson.
 - **The session's best set (Task 12c, the controller's ruling P1; replaces Task 12b's first-come cap).** Its size, the
   session's **room**, is its main source and its subagent sources together, over all its runs. The room grows with the
   session (Task 12d): `distill.max_per_session` (default 16) for its first 100 captured turns, 8 more for each further
-  100 (`ROOM_STEP` per `ROOM_TURNS`, documented constants), at most `distill.max_per_session_cap` (default 48, from
-  `max_per_session` to 400; a lower cap is refused): room = base + 8 × ⌊(turns − 1) / 100⌋, capped. So 16 at 100
+  100 (`ROOM_STEP` per `ROOM_TURNS`, documented constants), at most `distill.max_per_session_cap` (default 48, at
+  most 400; a cap below `max_per_session` is the base, so the room does not grow, and is not refused: final review B,
+  12d concern 4): room = base + 8 × ⌊(turns − 1) / 100⌋, capped. So 16 at 100
   turns, 24 at 101, 48 from 401. The turns are the session's turn keys in `capture_turns`, its main source's and its
   subagents' together (`store::capture::SESSION_TURNS`, through the 0008 index `capture_turns_source`). They are kept
   when retention deletes the chunks, so the room never shrinks. A run and a judgement read them again, so the room in
@@ -1191,7 +1192,7 @@ max_per_run = 8             # 1–50
 max_per_session = 16        # 2–200: the size of a session's best set (its room) for its first 100 turns, its
                             # subagents included; subagents keep at most half; a better passage replaces the
                             # weakest once the judge keeps it (Task 12c)
-max_per_session_cap = 48    # max_per_session–400: the room grows by 8 for each further 100 turns, up to this
+max_per_session_cap = 48    # at most 400: the room grows by 8 for each further 100 turns, up to this (below max_per_session: no growth)
                             # (Task 12d)
 max_per_subagent_run = 2    # 0–50: subagent reports kept in one run
                             # effective: min(this, max_per_run); the session's share is half of its room
@@ -1305,7 +1306,8 @@ alice capture distill <session-id>
   - `sessions_24h`, `chunks_24h`, `last_capture_at`, `open_sessions`;
   - `distill_provider`;
   - `distill_state`: `off`, `ready`, `waiting_judge`, `waiting_budget`, `breaker_open` or `no_key`;
-  - `distill_due`, `distilled_24h`, `distill_dropped_24h` (duplicates and uncertain ones);
+  - `distill_due`, `distilled_24h`, `distill_dropped_24h` (duplicates and uncertain ones; a member a full best set
+    evicted by `distill:cap` is not counted, final review B M6);
   - `distill_warning`.
 - **`alice doctor`** gains two lines, pushed in `health_checks` and `daemon_checks` as the existing lines are:
   - **`capture`:** OK with the last capture time. Warn if installed hooks point at a missing binary, if hooks are

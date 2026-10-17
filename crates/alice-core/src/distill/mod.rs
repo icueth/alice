@@ -4168,6 +4168,12 @@ mod tests {
             ..DistillSettings::default()
         };
         assert_eq!(room(&flat, 2_000), 20);
+        // A cap below the base is the base (final review B, 12d concern 4): no growth.
+        let above = DistillSettings {
+            max_per_session: 60,
+            ..DistillSettings::default()
+        };
+        assert_eq!((room(&above, 1), room(&above, 2_000)), (60, 60));
     }
 
     /// Task 12d: the subagents' share is half the room, so it grows with the session.

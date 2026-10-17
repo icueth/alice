@@ -3525,6 +3525,11 @@ async fn a_newcomer_the_judge_trashes_or_that_supersedes_a_member_evicts_nothing
         "the unique member stays"
     );
     assert_eq!(cap_trashes(&d), 0);
+    assert_eq!(
+        d.capture_health().await.distill_dropped_24h,
+        1,
+        "a duplicate is a drop"
+    );
 
     // A refinement of a member supersedes it: the set is back to its size, nothing is evicted.
     let off = t.len();
@@ -3658,6 +3663,9 @@ async fn a_live_newcomer_evicts_the_weakest_unprotected_member_once_judged() {
         .unwrap();
     assert_eq!(actor, "distill:cap");
     assert_eq!(cap_trashes(&d), 1);
+    // Final review B M6: a cap eviction is no drop (spec §8.4: duplicates and uncertain ones).
+    assert_eq!(d.capture_health().await.distill_dropped_24h, 0);
+    assert_eq!(d.svc.stats().await.unwrap().distill_dropped_today, 0);
     d.shutdown();
 }
 
