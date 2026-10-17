@@ -12,8 +12,12 @@
 # changes. Running this again repairs an install in place;
 # `sh ~/.config/alice/alice-capture.sh uninstall` removes it.
 # When `codex` is installed it also writes $CODEX_HOME/hooks.json (default ~/.codex/hooks.json)
-# if that file does not exist, and otherwise prints the entries to add; Codex runs a hook only
-# after the person trusts it in /hooks.
+# if that file does not exist. When $CODEX_HOME/config.toml has hooks of its own (Codex reads
+# hooks from one format per layer), the hooks go into a marked block at the end of config.toml
+# instead, after a backup to config.toml.bak-alice, when python3 can check the edit; otherwise
+# the entries are printed. Codex runs a new hook only after the person trusts it: the next time
+# Codex opens it asks "Hooks need review", and the person chooses "Trust all and continue". That
+# trust is the person's decision; this script never writes it.
 #
 # The token is read from the terminal with echo off, never from argv or the environment
 # (ALICE_SETUP_TOKEN_STDIN=1 reads it from stdin instead, for tests). It is checked with the
@@ -182,7 +186,7 @@ hooks_json() {
 }
 
 # Whether config.toml ($1) has hooks of its own: a top-level `hooks` key, the one rule of
-# `alice hooks install codex` (agent_hooks.rs, check_codex_config). That is a `[hooks…]` or
+# `alice hooks install codex` (agent_hooks/codex_toml.rs, has_hooks). That is a `[hooks…]` or
 # `[[hooks…]]` table header, or a `hooks = …` / `hooks.… = …` key before the first header.
 # `[features] hooks = true` is not one (final review A-M7).
 codex_inline_hooks() {
@@ -193,8 +197,9 @@ codex_inline_hooks() {
 
 # Codex (spec section 5.4 step 8). hooks.json is written only when it does not exist, or is
 # still exactly the file this script wrote earlier (then it is updated in place); a file of the
-# person's own, or inline [hooks] tables in config.toml, are never edited: the entries are
-# printed instead (or, when they are in the file already, said to be there).
+# person's own is never edited: the entries are printed instead (or, when they are in the file
+# already, said to be there). When config.toml has hooks of its own, the hooks go there instead
+# (codex_toml_setup).
 #
 # The record of what was written ($DIR/codex-hooks.written) is staged first, so a record that
 # cannot be written leaves hooks.json untouched, and is reported as that.
@@ -228,8 +233,9 @@ codex_setup() {
   elif [ -e "$cs_file" ]; then
     cs_why="$cs_file exists and is not a file"
   elif codex_inline_hooks "$cs_home/config.toml"; then
-    cs_why="$cs_home/config.toml already has [hooks] tables, so hooks.json is not added beside them"
-    if grep -Eq "$cs_re" "$cs_home/config.toml" 2>/dev/null; then cs_have=1; fi
+    say ""
+    codex_toml_setup "$cs_home/config.toml"
+    return 0
   else
     cs_write=1
   fi
@@ -269,7 +275,64 @@ codex_setup() {
     say "$cs_new"
     cs_state="entries printed"
   fi
-  say "Codex runs a hook only after you trust it: open Codex, type /hooks, review the Alice capture hooks and trust them."
+}
+
+# Codex's config.toml ($1) has hooks of its own (Codex reads hooks from one format per layer, so
+# no hooks.json is added beside them): the hook script appends Alice's block to it (codex-config
+# install; a block already there is left as it is, or repaired in place), after a backup to
+# config.toml.bak-alice. When it cannot check the edit (no python3 with a TOML reader), or the
+# result would not read back as meant, config.toml is left as it is and the block is printed.
+codex_toml_setup() {
+  ct_how=$(sh "$DIR/alice-capture.sh" codex-config install </dev/null 2>/dev/null)
+  ct_rc=$?
+  case $ct_rc in
+    10)
+      if [ "$ct_how" = replaced ]; then
+        say "Codex: repaired Alice's block of capture hooks in $1. The previous file is $1.bak-alice."
+      else
+        say "Codex: $1 has hooks of its own (Codex reads one format per layer), so the five Alice capture hooks were added to it, in a marked block at its end. The previous file is $1.bak-alice."
+      fi
+      cs_state="installed ($1)"
+      return 0
+      ;;
+    11)
+      say "Codex: $1 already has Alice's block of capture hooks; it was left as it is."
+      cs_state="installed ($1)"
+      return 0
+      ;;
+    14)
+      say "Codex: $1 has hooks of its own and already has the Alice capture entries; it was left as it is."
+      cs_state="entries present"
+      return 0
+      ;;
+    12) ct_why="Alice could not add its hooks to it safely ($ct_how)" ;;
+    *)
+      # Nothing could check the file: entries already in it (a block added by hand, say) are
+      # never printed again for a second copy.
+      if grep -Eq "$cs_re" "$1" 2>/dev/null; then
+        say "Codex: $1 has hooks of its own and already has the Alice capture entries; it was left as it is."
+        cs_state="entries present"
+        return 0
+      fi
+      if [ "$ct_rc" -eq 13 ]; then
+        ct_why="there is no python3 with a TOML reader (Python 3.11 or later) to check the edit"
+      else
+        ct_why="python3 failed while checking the edit"
+      fi
+      ;;
+  esac
+  ct_block=$(sh "$DIR/alice-capture.sh" print-hooks-toml </dev/null 2>/dev/null)
+  case $ct_block in
+    "# >>> alice capture"*) ;;
+    *)
+      say "Codex: $1 has hooks of its own, and the hook script printed no block for it, so nothing was written for Codex; run the command again."
+      cs_state="not written"
+      return 0
+      ;;
+  esac
+  say "Codex: $1 has hooks of its own (Codex reads one format per layer), and $ct_why, so it was left as it is. After a backup, add this block at its end:"
+  say "$ct_block"
+  cs_state="entries printed"
 }
 
 main() {
@@ -439,6 +502,7 @@ main() {
   say "Remove: sh ~/.config/alice/alice-capture.sh uninstall"
   if [ -n "$cs_state" ]; then
     say "Start a new Claude Code (or Codex) session for the hooks to load."
+    say "Codex: the next time you open Codex it asks 'Hooks need review' $(printf '\342\200\224') choose Trust all and continue (or review the Alice entries with /hooks)."
   else
     say "Start a new Claude Code session for the hooks to load."
   fi
