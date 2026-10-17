@@ -169,7 +169,18 @@ impl Server {
     /// One tenant `name` whose data directory `home` already exists (an adopted database, say):
     /// its service starts there in tenant mode. The caller keeps the directory alive.
     pub async fn start_on(name: &str, home: AliceHome) -> Server {
-        Self::start_inner(&[name], false, None, vec![Some(home)]).await
+        Self::start_inner(&[name], false, None, vec![Some(home)], None).await
+    }
+
+    /// Like [`Server::start_with_team`], with `env` as the `ALICE_*` variables of every daemon,
+    /// the team store's included (what the tenant files pin, such as `ALICE_PRIVACY_REDACT`), in
+    /// place of the process's.
+    pub async fn start_with_team_and_env(names: &[&str], env: &[(&str, &str)]) -> Server {
+        let env = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Self::start_inner(names, true, None, Vec::new(), Some(env)).await
     }
 
     async fn start_with(
@@ -177,16 +188,18 @@ impl Server {
         with_team: bool,
         jev: Option<Arc<dyn alice_core::judge::jev::JevTransport>>,
     ) -> Server {
-        Self::start_inner(names, with_team, jev, Vec::new()).await
+        Self::start_inner(names, with_team, jev, Vec::new(), None).await
     }
 
     /// `homes[i]`, when given, is tenant `names[i]`'s existing data directory; every other
-    /// tenant gets a throwaway one.
+    /// tenant gets a throwaway one. `env`, when given, replaces the process's `ALICE_*` variables
+    /// for every daemon.
     async fn start_inner(
         names: &[&str],
         with_team: bool,
         jev: Option<Arc<dyn alice_core::judge::jev::JevTransport>>,
         homes: Vec<Option<AliceHome>>,
+        env: Option<Vec<(String, String)>>,
     ) -> Server {
         alice_daemon::install_tls();
         let stop = CancellationToken::new();
@@ -211,6 +224,7 @@ impl Server {
                 ServiceOptions {
                     tenant: true,
                     team_store: true,
+                    settings_env: env.clone(),
                     ..ServiceOptions::default()
                 },
             )
@@ -265,6 +279,7 @@ impl Server {
                     team_url: team_url.clone(),
                     tenant_name: Some(name.to_string()),
                     jev_transport: jev.clone(),
+                    settings_env: env.clone(),
                     ..ServiceOptions::default()
                 },
             )

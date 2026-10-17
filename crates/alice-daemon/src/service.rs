@@ -1376,7 +1376,12 @@ impl Service {
 
         // bounded(1): repeated wake-ups coalesce.
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
-        let redactors = Redactors::new(settings.clone());
+        // The team store redacts every write, whatever its settings say: every tenant reads it.
+        let redactors = if opts.team_store {
+            Redactors::for_team_store(settings.clone())
+        } else {
+            Redactors::new(settings.clone())
+        };
         let (writer, writer_thread) =
             spawn_writer_with(conn, device, wake_tx.clone(), redactors.clone());
         let stop = Arc::new(AtomicBool::new(false));
@@ -1981,24 +1986,45 @@ impl Service {
         .map_err(join_err)
     }
 
+    /// [`redactor`](Self::redactor) with `privacy.redact` forced on: for text bound for the
+    /// shared team store, which everyone reads, so it never holds a secret whatever this
+    /// person's own store keeps.
+    async fn redactor_always_on(&self, choice: &ProjectChoice) -> Result<Arc<Redactor>> {
+        let (readers, redactors, choice) =
+            (self.readers.clone(), self.redactors.clone(), choice.clone());
+        tokio::task::spawn_blocking(move || {
+            let tree = project_root_in(&readers, &choice);
+            redactors.for_root_always_on(tree.as_ref())
+        })
+        .await
+        .map_err(join_err)
+    }
+
     async fn redact_remember_in(
         &self,
         choice: &ProjectChoice,
-        mut req: RememberRequest,
+        req: RememberRequest,
     ) -> Result<RememberRequest> {
         let r = self.redactor(choice).await?;
-        req.content = redact_field(&r, "content", &req.content)?;
-        if let Some(t) = &req.title {
-            req.title = Some(redact_field(&r, "title", t)?);
-        }
-        req.topics = req
-            .topics
-            .iter()
-            .map(|t| redact_field(&r, "topic", t))
-            .collect::<Result<_>>()?;
-        Ok(req)
+        redact_remember_with(&r, req)
     }
+}
 
+/// `req`'s content, title and topics through `r` (redacted, or refused in `block` mode).
+fn redact_remember_with(r: &Redactor, mut req: RememberRequest) -> Result<RememberRequest> {
+    req.content = redact_field(r, "content", &req.content)?;
+    if let Some(t) = &req.title {
+        req.title = Some(redact_field(r, "title", t)?);
+    }
+    req.topics = req
+        .topics
+        .iter()
+        .map(|t| redact_field(r, "topic", t))
+        .collect::<Result<_>>()?;
+    Ok(req)
+}
+
+impl Service {
     /// `req` with secrets redacted, or an error naming the detector in `block` mode. Idempotent:
     /// text that is redacted already comes back as it is. What a request is spooled as.
     pub async fn redact_remember(&self, req: RememberRequest) -> Result<RememberRequest> {
@@ -2092,13 +2118,14 @@ impl Service {
             .await
     }
 
-    /// `remember` with `shared: true`: redacted with this person's rules, then written to the
-    /// team store only, as this tenant (spec §2.10). It is never spooled and never saved here.
+    /// `remember` with `shared: true`: redacted with this person's rules, switched on whatever
+    /// their own store keeps (everyone reads the team store), then written to the team store
+    /// only, as this tenant (spec §2.10). It is never spooled and never saved here.
     async fn remember_shared(&self, req: RememberRequest) -> Result<RememberResponse> {
         let (team, tenant) = self.team_parts()?;
         let _busy = self.activity.enter();
         let project = self.choose(req.scope()).await?;
-        let req = self.redact_remember_in(&project, req).await?;
+        let req = redact_remember_with(&*self.redactor_always_on(&project).await?, req)?;
         let slug = choice_slug(&project);
         // Superseding marks the older memory too: only its author may (spec §2.10).
         let supersedes: Vec<String> = req
@@ -2168,7 +2195,8 @@ impl Service {
         let id = req.id[TEAM_PREFIX.len()..].to_string();
         self.require_shared_author(&id).await?;
         if req.update.title.is_some() || req.update.body.is_some() || req.update.topics.is_some() {
-            let r = self.redactor(&ProjectChoice::Fallback).await?;
+            // Switched on, as for `remember_shared`: the team store never holds a secret.
+            let r = self.redactor_always_on(&ProjectChoice::Fallback).await?;
             let u = &mut req.update;
             if let Some(t) = &u.title {
                 u.title = Some(redact_field(&r, "title", t)?);

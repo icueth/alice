@@ -228,14 +228,6 @@ fn resolve_layers(read: &Read, env: &EnvLayer) -> (Resolved, Vec<SettingError>) 
     }
 }
 
-/// Whether the `config.toml` text sets `server.port` (the admin owns the port on a tenant, so
-/// the file may not, whatever the environment says).
-fn text_sets_port(text: &str) -> bool {
-    toml::from_str::<toml::Value>(text)
-        .ok()
-        .is_some_and(|v| v.get("server").and_then(|s| s.get("port")).is_some())
-}
-
 /// `resolve_layers`, then the tenant rules: a file that breaks one is not applied at all, and
 /// its violations are reported with the file's errors.
 fn resolve_for(
@@ -247,8 +239,13 @@ fn resolve_for(
     let Some(home) = tenant else {
         return (resolved, errors);
     };
-    let port_from_file = matches!(read, Ok(Some(text)) if text_sets_port(text));
-    let violations = settings::validate_tenant(&resolved.settings, home, port_from_file);
+    // The admin owns the port and the choice to keep secrets on a tenant: the file may set
+    // neither, whatever the environment says.
+    let file = match read {
+        Ok(Some(text)) => settings::TenantFile::of(text),
+        _ => settings::TenantFile::default(),
+    };
+    let violations = settings::validate_tenant(&resolved.settings, home, file);
     if violations.is_empty() {
         return (resolved, errors);
     }
@@ -922,7 +919,8 @@ impl SettingsHandle {
         }
         let r = settings::resolve(Some(&text), &self.env.vars)?;
         if let Some(home) = &self.tenant {
-            let violations = settings::validate_tenant(&r.settings, home, text_sets_port(&text));
+            let violations =
+                settings::validate_tenant(&r.settings, home, settings::TenantFile::of(&text));
             if !violations.is_empty() {
                 return Err(violations);
             }
@@ -1062,6 +1060,42 @@ mod tests {
             .patch(&one("server.port", serde_json::json!(47802)))
             .unwrap_err();
         assert!(e.iter().any(|e| e.key == "server.port"), "{e:?}");
+    }
+
+    /// Owner's decision 2026-10-17: a tenant keeps secrets as written only when the admin pinned
+    /// `ALICE_PRIVACY_REDACT=false` (`alice-server secrets keep`); a person's PATCH can neither
+    /// turn redaction off nor undo the admin's pin either way.
+    #[test]
+    fn a_tenant_keeps_secrets_by_the_admins_pin_and_a_patch_cannot_loosen_it() {
+        let pin = |v: &str| vec![("ALICE_PRIVACY_REDACT".to_string(), v.to_string())];
+        let (_d, h) = home();
+        let kept = SettingsHandle::load_with(&h, pin("false"), true);
+        assert!(!kept.get().privacy.redact, "the admin's keep applies");
+        assert!(kept.errors().is_empty(), "{:?}", kept.errors());
+        assert!(!kept.config_degraded() && kept.get().privacy.redact_mode != RedactMode::Block);
+
+        for env in [pin("true"), Vec::new()] {
+            let (_d, h) = home();
+            let s = SettingsHandle::load_with(&h, env.clone(), true);
+            assert!(s.get().privacy.redact);
+            let e = s
+                .patch(&one("privacy.redact", serde_json::json!(false)))
+                .unwrap_err();
+            assert!(
+                e.iter().any(|e| e.key == "privacy.redact"),
+                "{env:?}: {e:?}"
+            );
+            assert!(s.get().privacy.redact, "{env:?}: still redacting");
+        }
+        // A file someone wrote by hand is not applied either.
+        let (_d, h) = home();
+        std::fs::write(h.config_file(), "[privacy]\nredact = false\n").unwrap();
+        let s = SettingsHandle::load_with(&h, Vec::new(), true);
+        assert!(s.get().privacy.redact);
+        assert!(s.errors().iter().any(|e| e.key == "privacy.redact"));
+        // The same file on a local home is the person's own choice.
+        let local = SettingsHandle::load_with(&h, Vec::new(), false);
+        assert!(!local.get().privacy.redact);
     }
 
     #[test]

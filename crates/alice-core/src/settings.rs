@@ -1881,10 +1881,52 @@ fn check_tenant_endpoint(e: &mut Vec<SettingError>, key: &str, url: &str) {
     }
 }
 
+/// What a tenant's `config.toml` sets itself, beside what the settings resolve to: the keys the
+/// server's admin pins in the tenant's environment may not come from the file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TenantFile {
+    /// `server.port` is set in the file (the admin owns the port).
+    pub sets_port: bool,
+    /// `privacy.redact = false` is in the file. Whether a person's store keeps secrets as
+    /// written is the admin's choice (`alice-server secrets keep|redact`, the pinned
+    /// `ALICE_PRIVACY_REDACT`), so the file can never turn redaction off: on a tenant without
+    /// the pin, a person's PATCH would otherwise do it.
+    pub turns_redaction_off: bool,
+}
+
+impl TenantFile {
+    /// What `text` (a `config.toml`) sets of those keys. Text that does not parse sets none of
+    /// them (it is refused for its own errors).
+    ///
+    /// ```
+    /// use alice_core::settings::TenantFile;
+    ///
+    /// let f = TenantFile::of("[privacy]\nredact = false\n[server]\nport = 47801\n");
+    /// assert!(f.sets_port && f.turns_redaction_off);
+    /// assert_eq!(TenantFile::of("[privacy]\nredact = true\n"), TenantFile::default());
+    /// ```
+    pub fn of(text: &str) -> Self {
+        let v = toml::from_str::<toml::Table>(text).ok();
+        let at = |table: &str, key: &str| {
+            v.as_ref()
+                .and_then(|v| v.get(table))
+                .and_then(|t| t.get(key))
+                .cloned()
+        };
+        Self {
+            sets_port: at("server", "port").is_some(),
+            turns_redaction_off: at("privacy", "redact").and_then(|r| r.as_bool()) == Some(false),
+        }
+    }
+}
+
 /// The extra rules a server tenant's settings follow (spec §2.2 item 6, R18): no path outside
-/// `home`, no URL into the machine or the LAN, nothing the server's admin owns.
-/// `port_from_file`: `server.port` is set in `config.toml` rather than only in the environment.
-pub fn validate_tenant(s: &Settings, home: &Path, port_from_file: bool) -> Vec<SettingError> {
+/// `home`, no URL into the machine or the LAN, nothing the server's admin owns. `file`: what
+/// `config.toml` itself sets of the admin's keys (see [`TenantFile`]).
+///
+/// `privacy.redact = false` from the environment is allowed: it is the admin's pin (server
+/// spec §2.9). The team store's daemon redacts whatever its settings say.
+pub fn validate_tenant(s: &Settings, home: &Path, file: TenantFile) -> Vec<SettingError> {
     let mut e = Vec::new();
     // `~` is refused rather than checked: the daemon expands it to `$HOME`, which this check
     // cannot see.
@@ -1920,16 +1962,16 @@ pub fn validate_tenant(s: &Settings, home: &Path, port_from_file: bool) -> Vec<S
             "sync is not available on a server tenant yet",
         ));
     }
-    if port_from_file && s.server.port != 0 {
+    if file.sets_port && s.server.port != 0 {
         e.push(err(
             "server.port",
             "the server's admin sets the port of a server tenant",
         ));
     }
-    if !s.privacy.redact {
+    if file.turns_redaction_off {
         e.push(err(
             "privacy.redact",
-            "a server tenant always redacts secrets before storing them",
+            "on a server tenant the admin decides whether secrets are kept as written (alice-server secrets keep|redact); config.toml cannot turn redaction off",
         ));
     }
     if s.secrets.backend == SecretsBackend::Keychain {
@@ -5126,7 +5168,11 @@ custom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]+\" }]
 
     fn tenant_errors(toml: &str, home: &Path, port_from_file: bool) -> Vec<String> {
         let r = resolve(Some(toml), &[]).unwrap();
-        validate_tenant(&r.settings, home, port_from_file)
+        let file = TenantFile {
+            sets_port: port_from_file,
+            ..TenantFile::of(toml)
+        };
+        validate_tenant(&r.settings, home, file)
             .into_iter()
             .map(|e| e.key)
             .collect()
@@ -5197,7 +5243,7 @@ custom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]+\" }]
                 let toml = format!("{sect} = \"https://{host}/v1\"\n");
                 let r = resolve(Some(&toml), &[]).unwrap_or_else(|e| panic!("{host}: {e:?}"));
                 assert!(
-                    validate_tenant(&r.settings, &home, false)
+                    validate_tenant(&r.settings, &home, TenantFile::default())
                         .iter()
                         .any(|e| e.key == key),
                     "{host} {key}"
@@ -5220,7 +5266,7 @@ custom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]+\" }]
         .settings;
         plain_http.embedding.endpoint = Some("http://api.openai.com/v1".into());
         assert!(
-            validate_tenant(&plain_http, &home, false)
+            validate_tenant(&plain_http, &home, TenantFile::default())
                 .iter()
                 .any(|e| e.key == "embedding.endpoint")
         );
@@ -5248,5 +5294,33 @@ custom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]+\" }]
         for toml in &allowed {
             assert!(tenant_errors(toml, &home, false).is_empty(), "{toml}");
         }
+    }
+
+    /// Owner's decision 2026-10-17: whether a tenant keeps secrets as written is the admin's pin
+    /// in the environment; the file can tighten (`redact = true`) but never loosen.
+    #[test]
+    fn a_tenant_keeps_secrets_only_by_the_admins_pin() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        let env = [("ALICE_PRIVACY_REDACT".to_string(), "false".to_string())];
+        let pinned = resolve(None, &env).unwrap();
+        assert!(!pinned.settings.privacy.redact);
+        assert!(
+            validate_tenant(&pinned.settings, home, TenantFile::of("")).is_empty(),
+            "the admin's pin is allowed"
+        );
+        assert!(
+            tenant_errors("[privacy]\nredact = true\n", home, false).is_empty(),
+            "the file may ask for redaction"
+        );
+        let off = "[privacy]\nredact = false\n";
+        assert_eq!(tenant_errors(off, home, false), ["privacy.redact"]);
+        // Refused even where the pin already says the same: the switch is the admin's alone.
+        let both = resolve(Some(off), &env).unwrap();
+        assert!(
+            validate_tenant(&both.settings, home, TenantFile::of(off))
+                .iter()
+                .any(|e| e.key == "privacy.redact")
+        );
     }
 }
