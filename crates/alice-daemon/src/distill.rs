@@ -29,16 +29,18 @@
 //!    covers ([`Judge::ask_distill`], so at most one in flight), then [`distill::decide`]. A
 //!    session whose best set is full is asked as any other (Task 12c), within
 //!    `distill.budget_share`.
-//! 5. The kept passages fitted into the session's best set ([`distill::place`]: at most
-//!    `distill.max_per_session` live distilled memories, the best by rank; a passage better than
-//!    the weakest that may go is stored, never in place of a handoff nor of a memory a person or
-//!    an agent touched; with none to outrank it is not stored, and the run counts it in
-//!    `capped`), then each written with [`write_memory`] in the project of the source it came
-//!    from: redacted with that project's rules, `origin = distill`, its rank inputs, its chunks
-//!    as provenance and an idempotency key, so a repeated run (a crash before the cursor moved)
-//!    stores nothing twice. Nothing is evicted here: once the judge finds a newcomer live in a
-//!    full set, the writer trashes the set's weakest member that may go, by `distill:cap` (Task
-//!    12c review I1, option b).
+//! 5. The kept passages fitted into the session's best set ([`distill::place`]: at most its room
+//!    of live distilled memories, the best by rank; the room is [`distill::room`] of the
+//!    session's captured turns, `distill.max_per_session` for the first 100 and growing up to
+//!    `distill.max_per_session_cap`, Task 12d; a passage better than the weakest that may go is
+//!    stored, never in place of a handoff nor of a memory a person or an agent touched; with
+//!    none to outrank it is not stored, and the run counts it in `capped`), then each written
+//!    with [`write_memory`] in the project of the source it came from: redacted with that
+//!    project's rules, `origin = distill`, its rank inputs, its chunks as provenance and an
+//!    idempotency key, so a repeated run (a crash before the cursor moved) stores nothing twice.
+//!    Nothing is evicted here: once the judge finds a newcomer live in a full set, the writer
+//!    trashes a member that may go, by `distill:cap` (Task 12c review I1, option b): one the
+//!    judge related the newcomer to first, otherwise the weakest (Task 12d).
 //! 6. The cursors move to the end of the run; the source is `done`, or `due` again when more of
 //!    it is left.
 //!
