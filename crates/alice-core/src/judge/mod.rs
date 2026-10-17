@@ -10,7 +10,7 @@ pub mod pipeline;
 pub mod text;
 pub mod verbal;
 
-use crate::model::Kind;
+use crate::model::{Kind, Origin};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -170,6 +170,9 @@ pub struct JudgeMemory {
     /// The memory's status when the question depends on it (a precise recall): a superseded
     /// or archived memory says so in its header. `None`: not stated.
     pub status: Option<crate::model::Status>,
+    /// How the memory came to exist: a distilled newcomer is never reviewed and never replaces
+    /// an explicit memory (SP2 spec §6.6).
+    pub origin: Origin,
 }
 
 /// How a new memory relates to one existing memory: P over `RelationKind` names.
@@ -182,6 +185,12 @@ pub struct Relation {
     /// heuristic result `pipeline::decide` applies without asking, and `Some(false)` a near
     /// twin by vector only.
     pub agreement: Option<bool>,
+    /// How the existing memory came to exist. A judge leaves the default (`agent`); the caller
+    /// fills it in from the memories it read (SP2 spec §6.6).
+    pub existing_origin: Origin,
+    /// The existing memory's body, for the "holds more" guard (Task 12c). A judge leaves it
+    /// empty (the guard then does not apply); the caller fills it in from the memories it read.
+    pub existing_body: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -409,6 +418,45 @@ pub trait Judge: Send + Sync {
         _budget: std::time::Duration,
     ) -> JudgeResult<Vec<Distribution>> {
         self.grade_relevance(query_project, query, results)
+    }
+
+    /// `text` as this judge would let it leave for `projects`: redacted with the always-on
+    /// rules of every one of them when the judge sends text away (Jev), as it is otherwise.
+    /// For a caller that cuts text before it asks (distillation's excerpts and passages): a
+    /// store that keeps secrets as written holds keys whole, and a key cut first would leave a
+    /// fragment no detector knows (owner's decision 2026-10-17). Redaction is idempotent, so
+    /// the request's own redaction changes nothing more.
+    fn redact_for(&self, _projects: &[&str], text: &str) -> String {
+        text.to_string()
+    }
+
+    /// Distillation's way into a model judge (SP2 spec §6.4, §6.7): `questions` about `state`,
+    /// a run of a session of `projects`, answered as one request. A judge that sends text away
+    /// gates and redacts it as it does every call; it bills the call to distillation's own
+    /// ledger row and caps distillation's day at `share` of its daily budget (read at each call,
+    /// so a settings change applies at the next one). Only Jev distils: every other judge
+    /// refuses with [`JudgeError::Denied`], and the distiller checks the provider first.
+    fn ask_distill(
+        &self,
+        _projects: &[&str],
+        _state: &str,
+        _questions: &[jev::Question],
+        _share: f64,
+    ) -> JudgeResult<BTreeMap<String, Distribution>> {
+        Err(JudgeError::Denied)
+    }
+
+    /// Whether [`ask_distill`](Self::ask_distill) with these arguments would be answered from
+    /// the judge's cache, without reaching the model. Asks nothing and spends nothing; the
+    /// distiller's breaker counts only answers that came from the model. `false` for a judge
+    /// without a cache.
+    fn distill_cached(
+        &self,
+        _projects: &[&str],
+        _state: &str,
+        _questions: &[jev::Question],
+    ) -> bool {
+        false
     }
 }
 

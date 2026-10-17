@@ -1,5 +1,6 @@
 //! SQLite storage. Only the daemon opens the database.
 
+pub mod capture;
 pub mod compat;
 pub mod embeddings;
 pub mod events;
@@ -737,6 +738,244 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index, 1);
+    }
+
+    /// A v6 database (main's `0006_project_rules` applied) migrates to v7 after a backup:
+    /// imported memories (`judge_state = 'skipped'`) get `origin = 'import'`, every other one
+    /// `agent`, the capture tables and their four indexes exist, and M3's project-rules objects
+    /// are untouched (SP2 spec §8.1). The files are applied by name, not by directory listing.
+    #[test]
+    fn migration_0007_adds_capture_tables_and_backfills_import_origin() {
+        let (d, path) = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)").unwrap();
+            let tx = conn.transaction().unwrap();
+            for sql in [
+                include_str!("sql/0001_init.sql"),
+                include_str!("sql/0002_events_reviews.sql"),
+                include_str!("sql/0003_judge.sql"),
+                include_str!("sql/0004_import.sql"),
+                include_str!("sql/0005_project_merge.sql"),
+                include_str!("sql/0006_project_rules.sql"),
+            ] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.execute(
+                "INSERT INTO project_rules (project_id, merge_id, rules_json) VALUES ('P1', 'MERGE1', '{\"k\":1}')",
+                [],
+            )
+            .unwrap();
+            for v in 1..=6 {
+                tx.execute("INSERT INTO schema_migrations VALUES (?1, 'x')", [v])
+                    .unwrap();
+            }
+            for (id, judge) in [("M-IMPORTED", "skipped"), ("M-AGENT", "done")] {
+                tx.execute(
+                    "INSERT INTO memories (id, project_id, kind, title, body, status, content_hash, created_at, updated_at, hlc, judge_state)
+                     VALUES (?1, '00000000000000000000GLOBAL', 'note', 't', 'b', 'active', ?1,
+                             '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z', 'h', ?2)",
+                    [id, judge],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let conn = open_writer(&path).unwrap();
+        let origin = |id: &str| -> String {
+            conn.query_row("SELECT origin FROM memories WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(origin("M-IMPORTED"), "import", "M3 imports are backfilled");
+        assert_eq!(origin("M-AGENT"), "agent");
+        let count = |kind: &str, names: &str| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM sqlite_master WHERE type = ?1 AND name IN ({names})"
+                ),
+                [kind],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("table", "'capture_state', 'capture_turns'"), 2);
+        assert_eq!(
+            count("table", "'project_rules'"),
+            1,
+            "M3's table is untouched"
+        );
+        assert_eq!(count("index", "'project_rules_by_merge'"), 1);
+        let rules: String = conn
+            .query_row(
+                "SELECT rules_json FROM project_rules WHERE project_id = 'P1' AND merge_id = 'MERGE1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rules, "{\"k\":1}", "M3's rows are untouched");
+        let versions: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|v| v.unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            (1..=migrations::CURRENT_VERSION).collect::<Vec<i64>>()
+        );
+        assert_eq!(
+            count(
+                "index",
+                "'capture_state_distill', 'capture_state_session', 'capture_state_parent', 'sources_session'"
+            ),
+            4
+        );
+        let backups = pre_migration_backups(d.path());
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        let name = backups[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(name.starts_with("alice-pre-migration-v6-"), "{name}");
+    }
+
+    /// Task 12c: a v7 database (0007 applied, as on live tenants) migrates to v8 after a backup:
+    /// `memories` gains the distill rank inputs `distill_p` and `distill_tier`, `NULL` for every
+    /// memory written before, and the partial index `memories_distill_session` on
+    /// `(author_session, author_agent) WHERE origin = 'distill'`. Review Minors 1 and 5: the partial
+    /// index `relations_source_memory`, and `touched_at`, backfilled for a distilled memory from
+    /// its latest event by `user` or `agent:*`.
+    #[test]
+    fn migration_0008_adds_the_distill_rank_inputs_and_the_session_index() {
+        let (d, path) = temp_db();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)").unwrap();
+            let tx = conn.transaction().unwrap();
+            for sql in [
+                include_str!("sql/0001_init.sql"),
+                include_str!("sql/0002_events_reviews.sql"),
+                include_str!("sql/0003_judge.sql"),
+                include_str!("sql/0004_import.sql"),
+                include_str!("sql/0005_project_merge.sql"),
+                include_str!("sql/0006_project_rules.sql"),
+                include_str!("sql/0007_capture.sql"),
+            ] {
+                tx.execute_batch(sql).unwrap();
+            }
+            for v in 1..=7 {
+                tx.execute("INSERT INTO schema_migrations VALUES (?1, 'x')", [v])
+                    .unwrap();
+            }
+            tx.execute(
+                "INSERT INTO memories (id, project_id, kind, title, body, status, content_hash, created_at,
+                                       updated_at, hlc, judge_state, origin, author_agent, author_session)
+                 VALUES ('M-OLD', '00000000000000000000GLOBAL', 'fact', 't', 'b', 'active', 'h1',
+                         '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z', 'h', 'done', 'distill',
+                         'claude-code', 'S1')",
+                [],
+            )
+            .unwrap();
+            // Review Minor 5: the history before v8 marks what a person or an agent touched.
+            tx.execute_batch(
+                "INSERT INTO memories (id, project_id, kind, title, body, status, content_hash, created_at,
+                                       updated_at, hlc, judge_state, origin, author_agent, author_session)
+                 VALUES ('M-JUDGED', '00000000000000000000GLOBAL', 'fact', 't2', 'b2', 'active', 'h2',
+                         '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z', 'h', 'done', 'distill',
+                         'claude-code', 'S1');
+                 INSERT INTO events (id, ts, hlc, actor, action, target_type, target_id) VALUES
+                   ('E1', '2026-10-14T00:00:00.000Z', 'h', 'distill:jev', 'memory.create', 'memory', 'M-OLD'),
+                   ('E2', '2026-10-14T01:00:00.000Z', 'h', 'user', 'memory.edit', 'memory', 'M-OLD'),
+                   ('E3', '2026-10-14T02:00:00.000Z', 'h', 'agent:codex', 'memory.move', 'memory', 'M-OLD'),
+                   ('E4', '2026-10-14T03:00:00.000Z', 'h', 'judge:jev', 'memory.edit', 'memory', 'M-JUDGED'),
+                   ('E5', '2026-10-14T04:00:00.000Z', 'h', 'system', 'memory.edit', 'memory', 'M-JUDGED');",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let conn = open_writer(&path).unwrap();
+        let (p, tier): (Option<f64>, Option<String>) = conn
+            .query_row(
+                "SELECT distill_p, distill_tier FROM memories WHERE id = 'M-OLD'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (p, tier),
+            (None, None),
+            "a memory from before 0008 has no rank inputs"
+        );
+        let index: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'memories_distill_session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            index.contains("(author_session, author_agent)")
+                && index.contains("WHERE origin = 'distill'"),
+            "{index}"
+        );
+        let held = super::capture::session_held(&conn, "claude-code", "S1").unwrap();
+        assert_eq!(held.len(), 2);
+        assert_eq!((held[0].p, held[0].subagent), (None, None));
+        let touched: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id, touched_at FROM memories ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            touched,
+            [
+                ("M-JUDGED".to_string(), None),
+                (
+                    "M-OLD".to_string(),
+                    Some("2026-10-14T02:00:00.000Z".to_string())
+                )
+            ],
+            "backfilled from the latest user or agent event"
+        );
+        assert_eq!(
+            held.iter().map(|h| h.protected).collect::<Vec<_>>(),
+            [true, false]
+        );
+        let index: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'relations_source_memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            index.contains("(source_memory_id)")
+                && index.contains("WHERE source_memory_id IS NOT NULL"),
+            "{index}"
+        );
+        let versions: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|v| v.unwrap())
+            .collect();
+        assert_eq!(versions, (1..=8).collect::<Vec<i64>>());
+        let backups = pre_migration_backups(d.path());
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert!(
+            backups[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("alice-pre-migration-v7-")
+        );
     }
 
     #[test]

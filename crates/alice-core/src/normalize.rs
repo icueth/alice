@@ -121,14 +121,45 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// The most characters of a derived title ([`derive_title`]).
+pub const DERIVED_TITLE_CHARS: usize = 80;
+
 /// Title for a memory saved without one: its first non-empty line, at most 80 characters.
+///
+/// A title that is a cut of the text (a first line of several, or a line longer than 80
+/// characters) is cut from the text redacted with the built-in detectors (re-review N2): a store
+/// that keeps secrets as written holds them whole in the body, and a cut through one would leave
+/// a fragment in the title that no detector knows, which every Jev request about the memory
+/// would carry. A title that is the whole text is the text as written; the cloud requests
+/// redact it whole.
+///
+/// ```
+/// use alice_core::normalize::derive_title;
+///
+/// let key = concat!("sk-", "proj-", "jD4XP_qW9yLWXUgo5RApWBKupwr-wVenptzp2muJRWt1wEklnUn27KT1A");
+/// let title = derive_title(&format!("The CI bot authenticates to the model API with {key}"));
+/// assert!(!title.contains("jD4XP") && title.contains("[REDACTED:openai_key]"));
+/// assert_eq!(derive_title("password = hunter22x"), "password = hunter22x");
+/// ```
 pub fn derive_title(content: &str) -> String {
-    let line = content
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    line.chars().take(80).collect()
+    let first = |text: &str| -> String {
+        text.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(DERIVED_TITLE_CHARS)
+            .collect()
+    };
+    let title = first(content);
+    if title == content.trim() {
+        return title;
+    }
+    first(
+        &crate::redact::Redactor::builtin_shared()
+            .apply(content)
+            .text,
+    )
 }
 
 #[cfg(test)]
@@ -206,6 +237,30 @@ mod tests {
         assert_eq!(derive_title("  first line\nsecond"), "first line");
         let long = "ก".repeat(300);
         assert_eq!(derive_title(&long).chars().count(), 80);
+    }
+
+    /// Re-review N2: a title cut from a text that keeps secrets as written holds no piece of
+    /// one, whatever the cut falls in: a key across the 80th character, a password whose
+    /// keyword is on the title's line, a private key whose first line is all the title gets.
+    #[test]
+    fn a_derived_title_never_holds_a_piece_of_a_secret() {
+        let key = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let across = format!("{} {key} for the deploy bot", "w".repeat(59));
+        assert_eq!(&across[60..63], &key[..3]);
+        let t = derive_title(&across);
+        assert!(!t.contains(&key[..6]) && t.contains("[REDACTED:"), "{t}");
+
+        let pem = concat!(
+            "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun\n",
+            "VTLw7onLRnrq0/IzW7yWR7QkrmBL7jTKEn5u+qKhbwKfBstIs+bMY2Zkp18gnTxK\n",
+            "LxoS2tFczGkPLPgizskuemMghRniWaoLcyehkd3qqGElvW/VDL5AaWTg0nLVkjRo\n",
+        );
+        let t = derive_title(pem);
+        assert!(!t.contains("MIIEow"), "{t}");
+
+        // A text that is its own title is kept as written.
+        let one = concat!("the db password is Thai", "land-2026");
+        assert_eq!(derive_title(one), one);
     }
 
     #[test]

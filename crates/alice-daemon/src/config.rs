@@ -24,6 +24,7 @@
 //! logged or shown here.
 
 use crate::paths::AliceHome;
+use alice_core::capture::AgentKind;
 use alice_core::settings::{
     self, LooseningGate, PrivacySettings, ProjectLoad, ProjectSettings, ProjectSettingsCache,
     ProjectTree, RedactMode, Resolved, SettingError, Settings, Source, loosened_protections,
@@ -35,6 +36,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// What [`SettingsHandle::capture_verdict`] decided for one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureVerdict {
+    /// Store the turns.
+    Capture,
+    /// Skip the turns, advance the cursor and record the keys; the reason is shown to people.
+    Excluded(&'static str),
+    /// The rules are unknown right now: store nothing and keep the cursor.
+    Wait(String),
+}
+
+/// [`CaptureVerdict::Excluded`]'s reason when `capture.enabled` is off (a global switch, not a
+/// project's rule: the distiller leaves such a session idle).
+pub const EXCLUDED_CAPTURE_OFF: &str = "capture is off";
+/// [`CaptureVerdict::Excluded`]'s reason when the agent's own capture switch is off.
+pub const EXCLUDED_AGENT_OFF: &str = "this agent's capture is off";
 
 /// How often the daemon polls `config.toml`; a look at a project's `.alice.toml` counts as a
 /// poll at most this often.
@@ -210,14 +228,6 @@ fn resolve_layers(read: &Read, env: &EnvLayer) -> (Resolved, Vec<SettingError>) 
     }
 }
 
-/// Whether the `config.toml` text sets `server.port` (the admin owns the port on a tenant, so
-/// the file may not, whatever the environment says).
-fn text_sets_port(text: &str) -> bool {
-    toml::from_str::<toml::Value>(text)
-        .ok()
-        .is_some_and(|v| v.get("server").and_then(|s| s.get("port")).is_some())
-}
-
 /// `resolve_layers`, then the tenant rules: a file that breaks one is not applied at all, and
 /// its violations are reported with the file's errors.
 fn resolve_for(
@@ -229,8 +239,13 @@ fn resolve_for(
     let Some(home) = tenant else {
         return (resolved, errors);
     };
-    let port_from_file = matches!(read, Ok(Some(text)) if text_sets_port(text));
-    let violations = settings::validate_tenant(&resolved.settings, home, port_from_file);
+    // The admin owns the port and the choice to keep secrets on a tenant: the file may set
+    // neither, whatever the environment says.
+    let file = match read {
+        Ok(Some(text)) => settings::TenantFile::of(text),
+        _ => settings::TenantFile::default(),
+    };
+    let violations = settings::validate_tenant(&resolved.settings, home, file);
     if violations.is_empty() {
         return (resolved, errors);
     }
@@ -715,6 +730,66 @@ impl SettingsHandle {
             })
     }
 
+    /// Whether a session of `agent` in `project_slug` (its working tree `tree`, when it has
+    /// one) is captured. The one answer the capture paths use; none of them reads
+    /// `capture.*` or `.alice.toml` itself. In this order: `Wait` while the rules are unknown
+    /// (the configuration is degraded or has a loosening waiting, or the project file is broken
+    /// or has a loosening waiting), then `Excluded` for the master switch, the agent's switch,
+    /// `capture.excluded_projects` (slugified on both sides, as the cloud list is) and the
+    /// project's `no_capture`.
+    ///
+    /// `tree` is keyed by the project, so worktrees share its rules, as for
+    /// [`cloud_allowed`](Self::cloud_allowed). Like that path, a caller that knows several
+    /// identities of a project (slug, aliases, display name) asks about each one: the
+    /// `excluded_projects` entry matches only the name it is written as.
+    pub fn capture_verdict(
+        &self,
+        agent: AgentKind,
+        project_slug: &str,
+        tree: Option<&ProjectTree>,
+    ) -> CaptureVerdict {
+        if self.config_degraded() {
+            return CaptureVerdict::Wait("the configuration is degraded".into());
+        }
+        if self.loosening_waiting() {
+            return CaptureVerdict::Wait("a change to config.toml is waiting to settle".into());
+        }
+        // One load of the project file: a second read could meet a half-written save and turn
+        // a Wait into a permanent exclusion.
+        let project = tree.map(|t| self.project_load(t, &self.projects));
+        if let Some(l) = &project
+            && (l.error.is_some() || l.loosening_pending)
+        {
+            return CaptureVerdict::Wait(
+                "the project's .alice.toml is broken or has a change waiting to settle".into(),
+            );
+        }
+        let settings = self.get();
+        let c = &settings.capture;
+        if !c.enabled {
+            return CaptureVerdict::Excluded(EXCLUDED_CAPTURE_OFF);
+        }
+        let agent_on = match agent {
+            AgentKind::ClaudeCode => c.claude_code,
+            AgentKind::Codex => c.codex,
+        };
+        if !agent_on {
+            return CaptureVerdict::Excluded(EXCLUDED_AGENT_OFF);
+        }
+        let slug = alice_core::normalize::slugify(project_slug.trim());
+        if !slug.is_empty()
+            && c.excluded_projects
+                .iter()
+                .any(|p| alice_core::normalize::slugify(p.trim()) == slug)
+        {
+            return CaptureVerdict::Excluded("project excluded");
+        }
+        if project.is_some_and(|l| l.settings.privacy.no_capture) {
+            return CaptureVerdict::Excluded("the project's .alice.toml says no_capture");
+        }
+        CaptureVerdict::Capture
+    }
+
     /// A loosening in `config.toml` (a protection switched off, say) was read and is waiting to
     /// be read the same on three polls in a row before it applies; the settings view says so.
     pub fn loosening_waiting(&self) -> bool {
@@ -844,7 +919,8 @@ impl SettingsHandle {
         }
         let r = settings::resolve(Some(&text), &self.env.vars)?;
         if let Some(home) = &self.tenant {
-            let violations = settings::validate_tenant(&r.settings, home, text_sets_port(&text));
+            let violations =
+                settings::validate_tenant(&r.settings, home, settings::TenantFile::of(&text));
             if !violations.is_empty() {
                 return Err(violations);
             }
@@ -984,6 +1060,73 @@ mod tests {
             .patch(&one("server.port", serde_json::json!(47802)))
             .unwrap_err();
         assert!(e.iter().any(|e| e.key == "server.port"), "{e:?}");
+    }
+
+    /// Owner's decision 2026-10-17: a tenant keeps secrets as written only when the admin pinned
+    /// `ALICE_PRIVACY_REDACT=false` (`alice-server secrets keep`); a person's PATCH can neither
+    /// turn redaction off nor undo the admin's pin either way.
+    #[test]
+    fn a_tenant_keeps_secrets_by_the_admins_pin_and_a_patch_cannot_loosen_it() {
+        let pin = |v: &str| vec![("ALICE_PRIVACY_REDACT".to_string(), v.to_string())];
+        let (_d, h) = home();
+        let kept = SettingsHandle::load_with(&h, pin("false"), true);
+        assert!(!kept.get().privacy.redact, "the admin's keep applies");
+        assert!(kept.errors().is_empty(), "{:?}", kept.errors());
+        assert!(!kept.config_degraded() && kept.get().privacy.redact_mode != RedactMode::Block);
+
+        for env in [pin("true"), Vec::new()] {
+            let (_d, h) = home();
+            let s = SettingsHandle::load_with(&h, env.clone(), true);
+            assert!(s.get().privacy.redact);
+            let e = s
+                .patch(&one("privacy.redact", serde_json::json!(false)))
+                .unwrap_err();
+            assert!(
+                e.iter().any(|e| e.key == "privacy.redact"),
+                "{env:?}: {e:?}"
+            );
+            assert!(s.get().privacy.redact, "{env:?}: still redacting");
+        }
+        // A file someone wrote by hand is not applied either.
+        let (_d, h) = home();
+        std::fs::write(h.config_file(), "[privacy]\nredact = false\n").unwrap();
+        let s = SettingsHandle::load_with(&h, Vec::new(), true);
+        assert!(s.get().privacy.redact);
+        assert!(s.errors().iter().any(|e| e.key == "privacy.redact"));
+        // The same file on a local home is the person's own choice.
+        let local = SettingsHandle::load_with(&h, Vec::new(), false);
+        assert!(!local.get().privacy.redact);
+    }
+
+    /// Re-review N3: on a tenant a person cannot allowlist their way out of redaction, by PATCH
+    /// or by hand; the admin's pin is the only allowlist. A local home keeps the choice.
+    #[test]
+    fn a_tenant_refuses_an_allowlist_from_the_person() {
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with(&h, Vec::new(), true);
+        let e = s
+            .patch(&one("privacy.allowlist", serde_json::json!(["(?s).*"])))
+            .unwrap_err();
+        assert!(e.iter().any(|e| e.key == "privacy.allowlist"), "{e:?}");
+        assert!(s.get().privacy.allowlist.is_empty());
+        let (_d, h) = home();
+        std::fs::write(h.config_file(), "[privacy]\nallowlist = [\"(?s).*\"]\n").unwrap();
+        let s = SettingsHandle::load_with(&h, Vec::new(), true);
+        assert!(s.get().privacy.allowlist.is_empty());
+        assert!(s.errors().iter().any(|e| e.key == "privacy.allowlist"));
+        let pin = vec![(
+            "ALICE_PRIVACY_ALLOWLIST".to_string(),
+            r#"["^ok-value$"]"#.to_string(),
+        )];
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with(&h, pin, true);
+        assert_eq!(s.get().privacy.allowlist, ["^ok-value$"], "the admin's pin");
+        let (_d, h) = home();
+        let local = SettingsHandle::load_with(&h, Vec::new(), false);
+        local
+            .patch(&one("privacy.allowlist", serde_json::json!(["^ok$"])))
+            .unwrap();
+        assert_eq!(local.get().privacy.allowlist, ["^ok$"]);
     }
 
     #[test]
@@ -1699,6 +1842,130 @@ mod tests {
     }
 
     // ------------------------------------------------------------ Task 6
+
+    #[test]
+    fn capture_verdict_orders_wait_before_exclusion() {
+        use alice_core::capture::AgentKind::{ClaudeCode, Codex};
+        let (_d, h) = home();
+        let repo = tempfile::tempdir().unwrap();
+        let tree = ProjectTree::new("proj", repo.path());
+        let root = Some(&tree);
+        // A degraded configuration waits, whatever else it says.
+        write(
+            &h,
+            "[capture]\nenabled = false\nexcluded_projects = \"x\"\n",
+        );
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert!(s.config_degraded());
+        assert!(matches!(
+            s.capture_verdict(ClaudeCode, "p", None),
+            CaptureVerdict::Wait(_)
+        ));
+        // A valid configuration: the exclusions in order.
+        write(
+            &h,
+            "[capture]\nexcluded_projects = [\"Client X\", \"codex-only\"]\ncodex = false\n",
+        );
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "p", root),
+            CaptureVerdict::Capture
+        );
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "p", None),
+            CaptureVerdict::Capture
+        );
+        assert_eq!(
+            s.capture_verdict(Codex, "p", root),
+            CaptureVerdict::Excluded("this agent's capture is off")
+        );
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "client-x", root),
+            CaptureVerdict::Excluded("project excluded")
+        );
+        assert_eq!(
+            s.capture_verdict(Codex, "client-x", root),
+            CaptureVerdict::Excluded("this agent's capture is off"),
+            "the agent flag is answered before the project list"
+        );
+        write(&h, "[capture]\nenabled = false\n");
+        let off = SettingsHandle::load_with_env(&h, vec![]);
+        assert_eq!(
+            off.capture_verdict(ClaudeCode, "p", root),
+            CaptureVerdict::Excluded("capture is off")
+        );
+        // The project's own file.
+        let nc = tempfile::tempdir().unwrap();
+        std::fs::write(
+            nc.path().join(".alice.toml"),
+            "[privacy]\nno_capture = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "p", Some(&ProjectTree::new("nc", nc.path()))),
+            CaptureVerdict::Excluded("the project's .alice.toml says no_capture")
+        );
+        // A broken file waits, and never reads as no_capture (the fail-closed settings set it).
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join(".alice.toml"), "[privacy\n").unwrap();
+        let bt = ProjectTree::new("broken", broken.path());
+        for _ in 0..3 {
+            assert!(matches!(
+                s.capture_verdict(ClaudeCode, "p", Some(&bt)),
+                CaptureVerdict::Wait(_)
+            ));
+        }
+    }
+
+    /// The project's rules belong to the project: a worktree whose file is only in the main tree.
+    #[test]
+    fn capture_verdict_uses_the_projects_rules_in_a_worktree() {
+        use alice_core::capture::AgentKind::ClaudeCode;
+        let (_d, h) = home();
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        let (main, wt) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(
+            main.path().join(".alice.toml"),
+            "[privacy]\nno_capture = true\n",
+        )
+        .unwrap();
+        let main_tree = ProjectTree::new("proj", main.path());
+        let verdict = CaptureVerdict::Excluded("the project's .alice.toml says no_capture");
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "p", Some(&main_tree)),
+            verdict
+        );
+        let wt_tree = ProjectTree::new("proj", wt.path());
+        assert_eq!(s.capture_verdict(ClaudeCode, "p", Some(&wt_tree)), verdict);
+        // Another project's worktree is not affected.
+        let other = ProjectTree::new("other", wt.path());
+        assert_eq!(
+            s.capture_verdict(ClaudeCode, "p", Some(&other)),
+            CaptureVerdict::Capture
+        );
+    }
+
+    #[test]
+    fn capture_verdict_waits_for_a_pending_loosening_of_either_file() {
+        use alice_core::capture::AgentKind::ClaudeCode;
+        let (_d, h) = home();
+        let repo = tempfile::tempdir().unwrap();
+        let tree = ProjectTree::new("proj", repo.path());
+        let toml = repo.path().join(".alice.toml");
+        std::fs::write(&toml, "[privacy]\nno_capture = true\n").unwrap();
+        write(&h, "[capture]\nenabled = false\n");
+        let s = SettingsHandle::load_with_env(&h, vec![]);
+        assert!(matches!(
+            s.capture_verdict(ClaudeCode, "p", Some(&tree)),
+            CaptureVerdict::Excluded(_)
+        ));
+        // Removing no_capture loosens: the first looks wait.
+        std::fs::write(&toml, "[privacy]\nblock_secrets = true\n").unwrap();
+        assert!(matches!(
+            s.capture_verdict(ClaudeCode, "p", Some(&tree)),
+            CaptureVerdict::Wait(_)
+        ));
+    }
 
     /// A slug with stray whitespace is still the project the denylist names.
     #[test]

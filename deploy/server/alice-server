@@ -24,6 +24,19 @@ JEV_KEY_FILE="$R/etc/alice/jev.key"; JEV_SECRET=jev_api_key
 # tenant file (the environment wins over a person's settings), so a person can neither redirect the owner's key nor
 # raise the budget. Change one tenant's budget in its tenant file, then restart it.
 JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone; JEV_MODEL=jev-1.13.0; JEV_BUDGET_USD=1.0
+# Captured transcripts age out after this on a tenant (SP2 spec §3.9): pinned in the tenant file, so a person's own
+# settings cannot keep them longer. Change one tenant's in its tenant file, then restart it.
+CAPTURE_RETENTION=180d
+# Whether a NEW tenant's captured sessions are distilled into memories (by Jev, with the shared key): the deployment's
+# default, one line `on` or `off` (no file: off). `alice-server distill on|off` changes existing tenants; neither
+# `jev-key set` nor `upgrade` ever touches a tenant's choice.
+DISTILL_DEFAULT_FILE="$R/etc/alice/distill.default"
+# Whether a NEW person's tenant keeps the credentials they share as written, or redacts them before storing (the owner's
+# decision, 2026-10-17): one line `keep` or `redact` (no file: redact). It is pinned as ALICE_PRIVACY_REDACT in the
+# tenant file, where the environment wins over a person's settings, so only `alice-server secrets keep|redact` changes
+# it. The team store always redacts (everyone reads it), and whatever a tenant keeps, nothing it sends to Jev or any
+# other cloud service carries a secret.
+SECRETS_DEFAULT_FILE="$R/etc/alice/secrets.default"
 BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
 # The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
 # $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
@@ -68,6 +81,8 @@ usage: alice-server add <name> [--tz <IANA zone>]
            (the shared team store: a daemon with no URL; every personal tenant is linked to it)
        alice-server remove <name> [--yes]
        alice-server rotate <name>
+       alice-server setup-line <name>
+           (the capture setup line a person runs on their machine; add and rotate print it too)
        alice-server list
        alice-server upgrade <binary>
            (also the first install; a build of deploy/server/build-release brings its ONNX Runtime along)
@@ -77,8 +92,16 @@ usage: alice-server add <name> [--tz <IANA zone>]
            (a person's own Alice database, from `alice backup now` on their machine, onto their fresh tenant;
             --cloud-denied carries the projects they kept from the cloud there)
        alice-server jev-key set
-           (the owner's Jev key, pasted at the prompt or piped in, for every tenant and every new one)
+           (the owner's Jev key, pasted at the prompt or piped in, for every tenant and every new one; only the key:
+            a tenant's judge and distillation stay as they are)
        alice-server jev-key status
+       alice-server distill on|off <name>|--all
+           (Jev distillation of captured sessions, per tenant; new tenants follow /etc/alice/distill.default, on or off)
+       alice-server distill status
+       alice-server secrets keep|redact <name>|--all
+           (whether a person's tenant keeps the credentials they share as written or redacts them; the team store
+            always redacts; new tenants follow /etc/alice/secrets.default, keep or redact; restarts the daemon)
+       alice-server secrets status
        alice-server cli <name> <alice arguments...>
 EOF
 }
@@ -104,6 +127,9 @@ public_host() { # from /etc/alice/server.env
 }
 need_host() { HOST=$(public_host); }
 url() { printf 'https://%s/u/%s' "$HOST" "$1"; }
+# The one line a person runs on their own machine to capture their sessions (SP2 spec §9.5). It carries no secret: the
+# script reuses ~/.config/alice/token, or asks for the token on the terminal.
+setup_line() { printf 'curl -fsSL %s/api/v1/capture/setup.sh | sh -s -- %s' "$(url "$1")" "$(url "$1")"; }
 port_of() { sed -n 's/^ALICE_SERVER_PORT=//p' "$TENANTS/$1.env"; }
 
 put() { # path mode ; the content comes on stdin. Written through a temporary file, so a reader never sees half of it.
@@ -438,11 +464,14 @@ EOF
   [ -z "$failed" ] || printf 'alice-server: WARNING: these tenants did not come back after the unlink:%s\n' "$failed" >&2
 }
 
-tenant_env_text() { # name port team(0|1) tz
+tenant_env_text() { # name port team(0|1) tz redact(true|false)
   printf 'ALICE_HOME=%s/%s\nALICE_SERVER_PORT=%s\nALICE_LOG=info\nALICE_BACKUP_DAILY=2\nALICE_BACKUP_WEEKLY=0\nTZ=%s\n' \
     "$REAL_SRV" "$1" "$2" "$4"
+  # The team store always redacts, whatever the default says.
+  if [ "$3" = 1 ]; then printf 'ALICE_PRIVACY_REDACT=true\n'; else printf 'ALICE_PRIVACY_REDACT=%s\n' "$5"; fi
   printf 'ALICE_JUDGE_JEV_ENDPOINT=%s\nALICE_JUDGE_JEV_MODEL=%s\nALICE_JUDGE_DAILY_BUDGET_USD=%s\n' \
     "$JEV_ENDPOINT" "$JEV_MODEL" "$JEV_BUDGET_USD"
+  printf 'ALICE_CAPTURE_RAW_RETENTION=%s\n' "$CAPTURE_RETENTION"
   if [ "$3" = 1 ]; then printf 'ALICE_DAEMON_ARGS=--team-store\n'; else printf 'ALICE_TENANT_NAME=%s\n' "$1"; fi
 }
 
@@ -467,6 +496,9 @@ cmd_add() { # name team(0|1) tz tz-given(0|1)
     # shellcheck disable=SC2046  # one name per word
     no_daemon_import $(personal_tenants)   # linking restarts every personal tenant
   fi
+  local distill secrets
+  distill=$(distill_default) || die "$DISTILL_DEFAULT_FILE must hold one line, on or off; nothing was created"
+  secrets=$(secrets_default) || die "$SECRETS_DEFAULT_FILE must hold one line, keep or redact; nothing was created"
   if tenant_exists "$name" && [ "$tz_given" = 1 ]; then
     no_daemon_import "$name"
     set_env_line "$name" TZ "$tz"
@@ -496,7 +528,8 @@ cmd_add() { # name team(0|1) tz tz-given(0|1)
   { mkdir -p "$home" && chmod -- 0700 "$home" && chown "alice-$name:alice-$name" -- "$home"; } \
     || add_fail "$name" "could not create the home"
   A_ENV=1
-  tenant_env_text "$name" "$port" "$team" "$tz" | put "$TENANTS/$name.env" 0644 || add_fail "$name" "could not write the tenant file"
+  tenant_env_text "$name" "$port" "$team" "$tz" "$(redact_value "$secrets")" | put "$TENANTS/$name.env" 0644 \
+    || add_fail "$name" "could not write the tenant file"
   if [ "$team" = 0 ] && team_exists; then # linked before the first start, so the daemon starts with the link
     provision_files "$name" || add_fail "$name" "could not link the tenant to the team store"
   fi
@@ -510,6 +543,10 @@ cmd_add() { # name team(0|1) tz tz-given(0|1)
   fi
   if [ -s "$JEV_KEY_FILE" ]; then
     give_jev_key "$name" "$(head -n 1 "$JEV_KEY_FILE")" || add_fail "$name" "could not give $name the server's Jev key"
+    as_tenant "$name" config set judge.provider jev >/dev/null 2>&1 || add_fail "$name" "could not set $name's judge to jev"
+  fi
+  if [ "$distill" = on ]; then
+    set_distill "$name" on || add_fail "$name" "could not turn on $name's distillation (the deployment default is on)"
   fi
   [ -s "$home/token" ] || add_fail "$name" "the daemon wrote no token"
   token=$(head -n 1 "$home/token")
@@ -521,13 +558,28 @@ cmd_add() { # name team(0|1) tz tz-given(0|1)
     return 0
   fi
   say "Created tenant $name."
+  if [ "$secrets" = keep ]; then
+    say "Secrets: kept as written ($SECRETS_DEFAULT_FILE; alice-server secrets redact $name changes it)."
+  fi
   say "URL:    $(url "$name")"
   say "MCP:    $(url "$name")/mcp"
   say "Token (shown once, hand it over now; alice-server rotate $name gives a new one):"
   say "  $token"
-  say "Claude Code, with the token in the environment variable ALICE_TOKEN:"
-  say "  claude mcp add --transport http alice '$(url "$name")/mcp' --header 'Authorization: Bearer \${ALICE_TOKEN}'"
-  say "The .mcp.json form is in docs/server.md."
+  say "Hand $name the URL and the token over a private channel, the token as a file named alice-token. On their machine"
+  say "they open Claude Code or Codex and say:"
+  say "  Read docs/setup-server.md from the Alice repository (https://github.com/icueth/alice) and follow every step."
+  say "  My address is $(url "$name") and my token file is ~/Downloads/alice-token."
+  say "That keeps the token in ~/.config/alice/token (0600), connects the MCP and sets up capture. To set up capture"
+  say "alone, or to repair it (alice-server setup-line $name prints it again):"
+  say "  $(setup_line "$name")"
+}
+
+cmd_setup_line() { # name: the capture setup line again (no token in it)
+  need_tenant "$1"
+  if is_team "$1"; then die "$TEAM is the shared team store: it has no address, so nobody runs a setup line for it"; fi
+  need_host
+  setup_line "$1"
+  printf '\n'
 }
 
 cmd_remove() { # name [--yes]
@@ -575,6 +627,9 @@ cmd_rotate() {
   if ! is_team "$name"; then
     say "New token for $name (shown once; the old one no longer works):"
     say "  $token"
+    say "Hand it over as before. On their machine, the setup line asks for it (the old one is refused) and keeps it"
+    say "in ~/.config/alice/token, where the MCP setup and capture read it:"
+    say "  $(setup_line "$name")"
   fi
   if is_team "$name"; then
     say "New team token in place (it stays on the server)."
@@ -678,9 +733,9 @@ install_new() { # binary library-or-empty: each through a temporary file, the cu
 }
 
 # A tenant made before a pinned line existed gets it: TZ (a zone set with --tz is kept), the Jev endpoint and the
-# judge budget (a budget the admin changed is kept).
+# judge budget (a budget the admin changed is kept), and the capture retention (likewise).
 add_missing_tz() {
-  local f t added="" pinned=""
+  local f t added="" pinned="" kept=""
   for f in "$TENANTS"/*.env; do
     [ -e "$f" ] || continue
     t=$(basename "$f" .env)
@@ -697,9 +752,14 @@ add_missing_tz() {
       set_env_line "$t" ALICE_JUDGE_DAILY_BUDGET_USD "$JEV_BUDGET_USD"
       case " $pinned " in *" $t "*) ;; *) pinned="$pinned $t" ;; esac
     fi
+    if ! grep -q '^ALICE_CAPTURE_RAW_RETENTION=' "$f"; then
+      set_env_line "$t" ALICE_CAPTURE_RAW_RETENTION "$CAPTURE_RETENTION"
+      kept="$kept $t"
+    fi
   done
   if [ -n "$added" ]; then say "TZ=$DEFAULT_TZ added for:$added"; fi
   if [ -n "$pinned" ]; then say "the Jev endpoint, model and budget pinned for:$pinned"; fi
+  if [ -n "$kept" ]; then say "captured transcripts kept $CAPTURE_RETENTION for:$kept"; fi
 }
 
 # A route written by an older version lacks the upload route's body limit and timeouts: write every personal tenant's again
@@ -807,8 +867,8 @@ file_bytes() { stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1"; }
 
 # A person's own Alice database becomes their fresh tenant's (spec section 2.12). `alice adopt`, run as the tenant
 # with its daemon stopped, checks the file, refuses a tenant that holds anything, swaps it in (keeping the tenant's
-# own database as a before-restore backup), clears the machine's paths and redacts with the tenant's rules. If the
-# daemon does not come back, the tenant's own database goes back.
+# own database as a before-restore backup), clears the machine's paths and redacts with the tenant's rules (unless the
+# tenant keeps secrets: alice-server secrets keep). If the daemon does not come back, the tenant's own database goes back.
 cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
   local name=$1 file=$2 denied=${3:-} home="$SRV/$1" admin=${SUDO_UID:-0} owner need free_k out saved port list="" s
   if [ -n "$denied" ]; then
@@ -843,7 +903,10 @@ cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
   cp -- "$file" "$ADOPT_DIR/alice.db"
   chmod -- 0600 "$ADOPT_DIR/alice.db"
   chown -R "alice-$name:alice-$name" -- "$ADOPT_DIR"
-  if ! out=$(as_tenant "$name" --json adopt "$ADOPT_DIR/alice.db" 2>&1); then
+  # `alice adopt` runs outside the daemon, so it gets the tenant's pin here: a tenant that keeps secrets keeps the
+  # adopted ones as written, any other has them redacted.
+  if ! out=$(sudo -u "alice-$name" env ALICE_HOME="$SRV/$name" ALICE_NO_AUTOSTART=1 \
+    ALICE_PRIVACY_REDACT="$(tenant_redacts "$name")" "$BIN" --json adopt "$ADOPT_DIR/alice.db" 2>&1); then
     # Started again only when `alice adopt` says the tenant's own database is in place; any other end (a panic, a kill,
     # a swap back that failed) may have left the unscrubbed copy, so the tenant stays stopped.
     if printf '%s\n' "$out" | grep -qF -e '[untouched]' -e '[put back]'; then
@@ -868,6 +931,77 @@ cmd_adopt() { # name backup-file [cloud-denied slugs, comma-separated]
   say "Delete $file now: it holds what the person's machine stored, unredacted."
 }
 
+# --- secrets at rest (owner's decision 2026-10-17) -------------------------------------------------------------------
+# The deployment's default for new tenants, `keep` or `redact`; fails on anything else.
+secrets_default() {
+  local v=redact
+  if [ -e "$SECRETS_DEFAULT_FILE" ]; then v=$(head -n 1 "$SECRETS_DEFAULT_FILE" | tr -d '[:space:]'); fi
+  case "${v:-redact}" in keep|redact) printf '%s' "${v:-redact}" ;; *) return 1 ;; esac
+}
+redact_value() { if [ "$1" = keep ]; then printf false; else printf true; fi; } # keep|redact -> ALICE_PRIVACY_REDACT
+# What a tenant's file pins: `false` (keeps secrets) or `true`. A file without the pin (made before it existed) redacts:
+# a tenant's own config.toml can never turn redaction off.
+tenant_redacts() {
+  local v
+  v=$(sed -n 's/^ALICE_PRIVACY_REDACT=//p' "$TENANTS/$1.env" | tail -n 1)
+  if [ "$v" = false ] && ! is_team "$1"; then printf false; else printf true; fi
+}
+
+cmd_secrets() { # keep|redact <name>|--all: pins ALICE_PRIVACY_REDACT and restarts the daemon (it reads the pin at start)
+  local mode=$1 target=$2 want t list="" changed="" same="" failed="" skipped=""
+  want=$(redact_value "$mode")
+  if [ "$target" = --all ]; then
+    for t in $(all_tenants); do
+      if [ "$mode" = keep ] && is_team "$t"; then skipped=$t; else list="$list $t"; fi
+    done
+  else
+    valid_name "$target"
+    need_tenant "$target"
+    if [ "$mode" = keep ] && is_team "$target"; then
+      die "$TEAM is the shared team store: everyone reads it, so it always redacts; nothing changed"
+    fi
+    list=$target
+  fi
+  for t in $list; do
+    if grep -qx "ALICE_PRIVACY_REDACT=$want" "$TENANTS/$t.env"; then same="$same $t"; else changed="$changed $t"; fi
+  done
+  # shellcheck disable=SC2086  # one name per word
+  no_daemon_import $changed   # the pin is read at start: each changed daemon restarts
+  local done=""
+  for t in $changed; do
+    if set_env_line "$t" ALICE_PRIVACY_REDACT "$want" && restart_one "$t"; then done="$done $t"; else failed="$failed $t"; fi
+  done
+  if [ "$mode" = keep ]; then
+    say "secrets kept as written for:${done:- (none)}${same:+ (already:$same)}"
+    if [ -n "$skipped" ]; then say "the team store ($skipped) always redacts: everyone reads it"; fi
+    if [ -n "$done" ]; then
+      say "New writes keep the credentials a person shares; what was redacted before stays redacted (it cannot be"
+      say "restored). Nothing sent to Jev or any other cloud service carries a secret, and shared memories are redacted."
+    fi
+  else
+    say "secrets redacted for:${done:- (none)}${same:+ (already:$same)}"
+    if [ -n "$done" ]; then
+      say "New writes are redacted; what was kept as written before stays in the store (delete or edit it there)."
+    fi
+  fi
+  if [ -n "$failed" ]; then die "these tenants did not come back after the change (journalctl -u alice@<name>):$failed"; fi
+}
+
+cmd_secrets_status() {
+  local t dflt
+  dflt=$(secrets_default) || dflt="invalid ($SECRETS_DEFAULT_FILE must hold keep or redact)"
+  say "secrets for new tenants: $dflt ($SECRETS_DEFAULT_FILE)"
+  for t in $(all_tenants); do
+    if is_team "$t"; then
+      printf '  %-16s %s\n' "$t" "redact (the team store always redacts)"
+    elif [ "$(tenant_redacts "$t")" = false ]; then
+      printf '  %-16s %s\n' "$t" keep
+    else
+      printf '  %-16s %s\n' "$t" redact
+    fi
+  done
+}
+
 # Reads a key from the terminal with echo off, or from stdin when it is not a terminal; never from argv or the
 # environment. Prints it on stdout for the caller's variable only.
 read_key() {
@@ -885,11 +1019,61 @@ read_key() {
   printf '%s' "$key"
 }
 
-# One tenant gets the key (through its running daemon, so it applies at once) and the Jev judge. SP2's distillation
-# (`distill.provider = jev`) joins here once it lands on this branch.
+# One tenant gets the key, through its running daemon, so it applies at once. Only the key: its judge and its
+# distillation are its own settings (`add` sets the judge; `alice-server distill` the distillation).
 give_jev_key() { # name key
-  printf '%s\n' "$2" | as_tenant "$1" config set-secret "$JEV_SECRET" >/dev/null 2>&1 || return 1
-  as_tenant "$1" config set judge.provider jev >/dev/null 2>&1 || return 1
+  printf '%s\n' "$2" | as_tenant "$1" config set-secret "$JEV_SECRET" >/dev/null 2>&1
+}
+
+# The deployment's default for new tenants, `on` or `off`; fails on anything else.
+distill_default() {
+  local v=off
+  if [ -e "$DISTILL_DEFAULT_FILE" ]; then v=$(head -n 1 "$DISTILL_DEFAULT_FILE" | tr -d '[:space:]'); fi
+  case "${v:-off}" in on|off) printf '%s' "${v:-off}" ;; *) return 1 ;; esac
+}
+
+set_distill() { # name on|off: through the tenant's running daemon, so it applies at once
+  local v=off
+  [ "$2" = on ] && v=jev
+  as_tenant "$1" config set distill.provider "$v" >/dev/null 2>&1
+}
+
+tenant_setting() { # name key: the value its daemon reports, or nothing when it does not answer (never fails)
+  as_tenant "$1" config get "$2" 2>/dev/null | tail -n 1 || true
+}
+
+cmd_distill() { # on|off <name>|--all
+  local mode=$1 target=$2 t list done="" failed="" waits=""
+  if [ "$target" = --all ]; then
+    list=$(all_tenants)
+  else
+    valid_name "$target"
+    need_tenant "$target"
+    list=$target
+  fi
+  for t in $list; do
+    if set_distill "$t" "$mode"; then
+      done="$done $t"
+      if [ "$mode" = on ] && [ "$(tenant_setting "$t" judge.provider)" != jev ]; then waits="$waits $t"; fi
+    else
+      failed="$failed $t"
+    fi
+  done
+  say "distillation $mode for:${done:- (none)}"
+  if [ -n "$waits" ]; then say "their judge is not jev, so their distillation waits until it is:$waits"; fi
+  if [ -n "$failed" ]; then die "these tenants did not take it (is their daemon running?):$failed; run the command again"; fi
+}
+
+cmd_distill_status() {
+  local t d j dflt
+  dflt=$(distill_default) || dflt="invalid ($DISTILL_DEFAULT_FILE must hold on or off)"
+  say "distillation for new tenants: $dflt ($DISTILL_DEFAULT_FILE)"
+  for t in $(all_tenants); do
+    d=$(tenant_setting "$t" distill.provider)
+    j=$(tenant_setting "$t" judge.provider)
+    case "$d" in jev) d=on ;; off) ;; *) d="unknown" ;; esac
+    printf '  %-16s %-8s judge %s\n' "$t" "$d" "${j:-unknown (the daemon did not answer)}"
+  done
 }
 
 cmd_jev_key_set() {
@@ -913,8 +1097,9 @@ cmd_jev_key_set() {
     t=$(basename "$f" .env)
     if give_jev_key "$t" "$key"; then done="$done $t"; else failed="$failed $t"; fi
   done
-  say "The Jev key is set, and judge.provider = jev, for:${done:- (no tenant yet)}"
-  say "New tenants get it when they are added; run this again to rotate it everywhere."
+  say "The Jev key is set for:${done:- (no tenant yet)}"
+  say "Only the key changed: each tenant's judge and distillation stay as they were (alice-server distill status)."
+  say "New tenants get the key, and judge.provider = jev, when they are added; run this again to rotate it everywhere."
   if [ -n "$failed" ]; then die "these tenants did not take it (is their daemon running?):$failed; run jev-key set again"; fi
 }
 
@@ -1001,6 +1186,7 @@ main() {
     remove) [[ $# -ge 2 && $# -le 3 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_remove "$2" "${3:-}" ;;
     rotate) [[ $# -eq 2 ]] || { usage; exit 2; }; valid_name "$2"; take_lock; cmd_rotate "$2" ;;
     list) cmd_list ;;
+    setup-line) [[ $# -eq 2 ]] || { usage; exit 2; }; valid_name "$2"; cmd_setup_line "$2" ;;
     upgrade) [[ $# -eq 2 ]] || { usage; exit 2; }; take_lock; cmd_upgrade "$2" ;;
     import) [[ $# -ge 3 && $# -le 4 ]] || { usage; exit 2; }; valid_name "$2"; take_shared_lock; cmd_import "$2" "$3" "${4:-}" ;;
     cli) [[ $# -ge 3 ]] || { usage; exit 2; }; valid_name "$2"; cmd_cli "${@:2}" ;;
@@ -1015,6 +1201,20 @@ main() {
       case "$2" in
         set) take_lock; cmd_jev_key_set ;;
         status) cmd_jev_key_status ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    distill)
+      case "${2:-}" in
+        status) [[ $# -eq 2 ]] || { usage; exit 2; }; cmd_distill_status ;;
+        on|off) [[ $# -eq 3 ]] || { usage; exit 2; }; take_lock; cmd_distill "$2" "$3" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    secrets)
+      case "${2:-}" in
+        status) [[ $# -eq 2 ]] || { usage; exit 2; }; cmd_secrets_status ;;
+        keep|redact) [[ $# -eq 3 ]] || { usage; exit 2; }; take_lock; cmd_secrets "$2" "$3" ;;
         *) usage; exit 2 ;;
       esac
       ;;

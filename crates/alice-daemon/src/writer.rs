@@ -9,9 +9,10 @@ use alice_core::api::StreamItem;
 use alice_core::error::{AliceError, Result};
 use alice_core::ids::{Hlc, new_id};
 use alice_core::judge::pipeline::JudgeAction;
-use alice_core::model::{Kind, Memory, Status};
+use alice_core::model::{Kind, Memory, Origin, SourceType, Status};
 use alice_core::project::ProjectRef;
 use alice_core::redact::Redactor;
+use alice_core::store::capture::{self as capture_store, DistillState};
 use alice_core::store::embeddings::{self, VecKey};
 use alice_core::store::events::{self, Actor, EventInput};
 use alice_core::store::history::{self, UndoOutcome};
@@ -46,12 +47,12 @@ const STREAM_CAPACITY: usize = 256;
 /// `remember` can wait behind during an import: 200 chunks / 64 KiB gave a p95 of 117 ms with
 /// 20 clients at a 100k-chunk import, 50 chunks / 32 KiB about 58 ms (`docs/benchmarks/m2.md`,
 /// Task 20); the import took 16 % longer.
-const INGEST_SLICE: usize = 50;
+pub(crate) const INGEST_SLICE: usize = 50;
 /// Chunk text written per batch, at most (FTS work grows with text, not with chunk count). It
 /// must be at least one largest chunk ([`alice_core::model::limits::MAX_CHUNK_BYTES`]): a
 /// chunk is deferred when it does not fit what is left of a slice, and only a slice with
 /// all of this budget left takes one regardless (see `slice_len`).
-const INGEST_SLICE_BYTES: usize = alice_core::model::limits::MAX_CHUNK_BYTES;
+pub(crate) const INGEST_SLICE_BYTES: usize = alice_core::model::limits::MAX_CHUNK_BYTES;
 
 #[derive(Debug, Clone)]
 pub enum ProjectChoice {
@@ -113,10 +114,112 @@ pub struct Judgement {
     pub unavailable: bool,
     /// How long a memory that failed waits before it is judged again.
     pub retry_wait: Duration,
+    /// The distillation settings, for a distilled memory's session best set: a newcomer judged
+    /// live into a full set evicts its weakest member that may go (Task 12c review I1, option b).
+    /// `None`: nothing is evicted.
+    pub distill: Option<alice_core::settings::DistillSettings>,
     /// `(id, content_hash)` of every existing memory the judge saw, read together with its
     /// text. An action on one that has changed since becomes a review item instead (nothing is
     /// applied on stale information).
     pub seen: Vec<(String, String)>,
+}
+
+/// The provider that distils memories from captured sessions; their events carry the actor
+/// `distill:<provider>` (SP2 spec §6.5).
+const DISTILL_PROVIDER: &str = "jev";
+
+/// One slice of a capture pass (SP2 spec §3.8), written in one transaction. At most
+/// [`INGEST_SLICE`] chunks and [`INGEST_SLICE_BYTES`] of text: a larger slice is refused.
+///
+/// **A source's slices are sent one at a time, each awaited** before the next is built from the
+/// state it left. Two slices of one source in flight together may commit in either order; the
+/// writer keeps `next_ord` from moving back, but the second slice's ords would still be stale.
+#[derive(Debug, Clone)]
+pub struct CaptureSlice {
+    /// The transcript's source: type `session`, uri `<agent>:session:<id>[:agent:<id>]`. Its
+    /// `agent` and `session_id` are taken from `init` (whatever this says), and its time span
+    /// from the chunks' `authored_at`: `ended_at` here is ignored, and `started_at` is used only
+    /// when the source is created.
+    pub source: SourceInput,
+    /// The project of a new source. An existing source keeps its own (spec §3.1).
+    pub project: ProjectChoice,
+    /// The capture state of a new source.
+    pub init: CaptureInit,
+    /// At most [`INGEST_SLICE`] chunks and [`INGEST_SLICE_BYTES`] of text in all.
+    pub chunks: Vec<ChunkInput>,
+    /// `(turn key, first ord)` of the turns that end in this slice. A turn that rendered no
+    /// chunk names the ord the next chunk would get.
+    pub turn_keys: Vec<(String, i64)>,
+    /// Keys of turns that are not stored (an excluded project, spec §3.6). Recorded with the ord
+    /// the next chunk would get.
+    pub skipped_keys: Vec<String>,
+    /// `(byte_offset, next_ord)` after the slice's last complete turn.
+    pub cursor: Option<(u64, i64)>,
+    /// The hook event behind the pass.
+    pub last_event: Option<String>,
+    /// The session ended. A slice that stores a new turn without ending the session opens an
+    /// ended source again (a resumed session, final review B-I2).
+    pub ended: bool,
+    /// Record the pass's `source.capture` event with this slice, if it stored a chunk.
+    pub record_event: bool,
+}
+
+/// What a new capture source's state starts with. `agent` and `session_id` are also the
+/// source's own (they override `CaptureSlice::source`).
+#[derive(Debug, Clone, Default)]
+pub struct CaptureInit {
+    pub agent: String,
+    pub session_id: String,
+    /// A subagent's main session; its source id is stored when that source exists.
+    pub parent_uri: Option<String>,
+    /// Local only.
+    pub transcript_path: Option<String>,
+    /// Local only: `dev:inode:sha256(first line)`.
+    pub file_key: Option<String>,
+    /// The tenant client's flag. It only ever turns on.
+    pub no_distill: bool,
+    /// A backfill registers the source (`alice capture backfill`, spec §4.4): a new source's
+    /// distillation starts `skipped_backfill`, a subagent's too. An existing source keeps its
+    /// state.
+    pub backfill: bool,
+}
+
+/// A change to a capture source's state (`WriteOp::CaptureStateUpdate`).
+#[derive(Debug, Clone)]
+pub enum CaptureChange {
+    /// Where its distillation stands, when it is tried next, and how often it failed.
+    Distill {
+        state: DistillState,
+        next_try_at: Option<String>,
+        attempts: i64,
+    },
+    /// Its chunks below `distill_ord` are distilled (it never moves back).
+    Distilled {
+        distill_ord: i64,
+    },
+    /// A source a backfill registered goes on live (`store::capture::revive_backfilled`): its
+    /// chunks below `from_ord` stay undistilled for good, and it is `idle` again. Only a
+    /// `skipped_backfill` source changes.
+    LiveAfterBackfill {
+        from_ord: i64,
+    },
+    Ended,
+    /// The stale end (spec §6.2, §10; Task 11b): the source is ended and, with `due_since`
+    /// (distillation is on), a main session that captured at or after it and holds chunks not
+    /// distilled yet becomes due (`store::capture::due_after_stale_end`), in one transaction.
+    StaleEnd {
+        due_since: Option<String>,
+    },
+    /// A pass starts beyond the cursor (a tenant client sent from there, or the local worker
+    /// skipped a line longer than a pass): the cursor moves there and the gap is counted.
+    Gap {
+        byte_offset: u64,
+    },
+    /// The local file is new or was replaced: its identity and where reading goes on.
+    FileKey {
+        file_key: String,
+        byte_offset: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -124,6 +227,16 @@ pub enum WriteOp {
     Remember {
         input: NewMemoryInput,
         project: ProjectChoice,
+    },
+    /// A distilled memory (SP2 spec §6.4, §6.5; Task 12c): `remember`, with its rank inputs (`p`,
+    /// and whether it is a subagent's report) stored. It evicts nothing: when it is stored into a
+    /// full best set, a member leaves only once the judge finds it live (`ApplyJudgement`; review
+    /// I1, option b).
+    Distilled {
+        input: NewMemoryInput,
+        project: ProjectChoice,
+        p: f64,
+        subagent: bool,
     },
     /// Validated as a whole before anything is written, then written `INGEST_SLICE` chunks per
     /// transaction. If a later slice fails, the earlier ones stay; ingest is incremental by `ord`,
@@ -221,10 +334,13 @@ pub enum WriteOp {
     /// group, after which the memory is active. Ignored if the memory's text changed since it
     /// was judged, or if it is not waiting for the judge.
     ApplyJudgement(Judgement),
-    /// `retry` memories go back to `pending` (up to `max_attempts` in all); the rest give up.
+    /// `retry` memories go back to `pending` (up to `max_attempts` in all); the rest give up. A
+    /// distilled memory given up on settles live, so it evicts from its session's best set as a
+    /// judged one does (Task 12c review 2, N1), with the distillation settings `distill`.
     RequeueJudgeRetries {
         max_attempts: u32,
         now: String,
+        distill: Option<alice_core::settings::DistillSettings>,
     },
     TouchAccess(Vec<i64>),
     /// A change that is not to a memory or a fact (settings, secrets): one history row, and for
@@ -298,6 +414,18 @@ pub enum WriteOp {
         actor: Actor,
         rules: Box<alice_core::settings::ProjectSettings>,
     },
+    /// One slice of a capture pass (SP2 spec §3.8): the source and its capture state (created
+    /// if new), the chunks, the turn keys and the cursor, in one transaction. It is written
+    /// whole and counts against the ingest slice budget: it joins a group commit only if it
+    /// fits what is left, and a fresh commit always takes it. A slice over the budget itself is
+    /// refused. Send a source's slices one at a time (see [`CaptureSlice`]). Answers `Captured`.
+    CaptureSlice(Box<CaptureSlice>),
+    /// A change to a capture source's state. Answers `Count`: 0 when the source has no capture
+    /// state (retention deleted it).
+    CaptureStateUpdate {
+        source_id: String,
+        change: CaptureChange,
+    },
     Shutdown,
 }
 
@@ -324,6 +452,14 @@ pub enum WriteOutcome {
     Imported(BatchOutcome),
     /// A project merge: what moved, and the event that recorded it.
     ProjectMerged(Box<(project_merge::MergeDone, String)>),
+    /// A capture slice: its source, the chunks it stored and the turn keys that were new to
+    /// `capture_turns` (repeats count in neither). A key the slice sent that was not new was
+    /// stored by another source first.
+    Captured {
+        source_id: String,
+        inserted: usize,
+        keys_new: usize,
+    },
     Done,
 }
 
@@ -345,6 +481,7 @@ impl WriteOutcome {
             WriteOutcome::Flag(_) => "Flag",
             WriteOutcome::Imported(_) => "Imported",
             WriteOutcome::ProjectMerged(_) => "ProjectMerged",
+            WriteOutcome::Captured { .. } => "Captured",
             WriteOutcome::Done => "Done",
         }
     }
@@ -445,6 +582,26 @@ impl WriterHandle {
             })
             .is_ok()
     }
+}
+
+/// The ledger row a judge call names: its own when it is one of `LEDGER_ROWS`, else the judge's,
+/// so no spend lands on a row the day's total does not count. An unknown name is a consumer that
+/// was never given a row: a debug build stops on it, and a release build warns, so it cannot be
+/// billed to the judge unnoticed.
+fn ledger_row(provider: &str) -> &'static str {
+    use alice_core::judge::jev::{LEDGER_JUDGE, LEDGER_ROWS};
+    let row = LEDGER_ROWS.into_iter().find(|r| *r == provider);
+    if row.is_none() {
+        tracing::warn!(
+            provider,
+            "a judge call names a ledger row the day's total does not count; it is billed to the judge's row"
+        );
+    }
+    debug_assert!(
+        row.is_some(),
+        "unknown ledger row {provider:?}: give the consumer a row in LEDGER_ROWS"
+    );
+    row.unwrap_or(LEDGER_JUDGE)
 }
 
 fn resolve(conn: &Connection, choice: &ProjectChoice) -> Result<ResolvedProject> {
@@ -582,7 +739,10 @@ fn remember(
     let out = memories::insert(conn, &prepared)?;
     if let InsertOutcome::New { id, .. } = &out {
         st.inserted = true;
-        let actor = Actor::from_author(&prepared.author);
+        let actor = match prepared.origin {
+            Origin::Distill => Actor::Distill(DISTILL_PROVIDER.into()),
+            Origin::Agent | Origin::Import => Actor::from_author(&prepared.author),
+        };
         let group = (!prepared.supersedes.is_empty()).then(new_id);
         let after = snap(conn, id)?;
         record(
@@ -618,6 +778,141 @@ fn remember(
         }
     }
     Ok(WriteOutcome::Remembered(out, p))
+}
+
+/// The actor of a trash that makes room in a session's best set (Task 12c): `distill:cap`.
+const DISTILL_CAP: &str = "cap";
+
+/// The actor of the supersede that keeps a session's newest handoff only (final review B-I2):
+/// `distill:handoff`.
+const DISTILL_HANDOFF: &str = "handoff";
+
+/// A distilled memory (`WriteOp::Distilled`): [`remember`]; then, when it is new, its rank inputs.
+/// It evicts nothing: a member of a full set leaves only once the judge finds the newcomer live
+/// ([`evict_over_cap`]; the controller's ruling on Task 12c review I1, option b).
+fn distilled(
+    conn: &Connection,
+    input: NewMemoryInput,
+    project: &ProjectChoice,
+    p: f64,
+    subagent: bool,
+    st: &mut State,
+) -> Result<WriteOutcome> {
+    let out = remember(conn, input, project, st)?;
+    if let WriteOutcome::Remembered(InsertOutcome::New { id, .. }, _) = &out {
+        let tier = if subagent { "subagent" } else { "main" };
+        conn.execute(
+            "UPDATE memories SET distill_p = ?1, distill_tier = ?2 WHERE id = ?3",
+            rusqlite::params![p, tier, id],
+        )?;
+    }
+    Ok(out)
+}
+
+/// The author of the distilled memory `id`, as its session's best set is read by
+/// (`store::capture::session_held`): `None` for a memory that is not distilled or has none.
+fn distilled_author(conn: &Connection, id: &str) -> Result<Option<(String, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT author_agent, author_session FROM memories WHERE id = ?1 AND origin = 'distill'",
+            [id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+        .and_then(|(a, s)| a.zip(s)))
+}
+
+/// The distilled newcomer `id` settled live, judged or given up on: its session's best set keeps
+/// its size ([`evict_over_cap`]), a member the judge related it to going first (`related`).
+/// `settings` come with the op. Without them eviction would be skipped in silence (Task 12c
+/// review 2, N2): a debug build stops, a release build warns and evicts nothing.
+fn settle_distilled(
+    conn: &Connection,
+    st: &mut State,
+    id: &str,
+    settings: Option<&alice_core::settings::DistillSettings>,
+    related: &[String],
+) -> Result<()> {
+    debug_assert!(
+        settings.is_some(),
+        "a judgement of a distilled newcomer carries the distillation settings ({id})"
+    );
+    match settings {
+        Some(s) => evict_over_cap(conn, st, id, s, related),
+        None => {
+            tracing::warn!(
+                id,
+                "a distilled memory settled without the distillation settings: its session's best set may stay past its size"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// After the judgement of the distilled newcomer `id` left it live: when its session's best set
+/// is now over its size, or over its subagents' share, the weakest member that may go is trashed
+/// by `distill:cap`, in the judgement's op (spec §6.4; Task 12c review I1, option b). It may be
+/// the newcomer itself; never a handoff or a protected member ([`alice_core::distill::evictee`]).
+fn evict_over_cap(
+    conn: &Connection,
+    st: &mut State,
+    id: &str,
+    settings: &alice_core::settings::DistillSettings,
+    related: &[String],
+) -> Result<()> {
+    let Some((agent, session)) = distilled_author(conn, id)? else {
+        return Ok(());
+    };
+    let held = alice_core::store::capture::session_held(conn, &agent, &session)?;
+    if !held.iter().any(|h| h.id == id) {
+        return Ok(()); // no longer live
+    }
+    keep_newest_handoff(conn, st, &held)?;
+    let turns = alice_core::store::capture::session_turns(conn, &agent, &session)?;
+    let room = alice_core::distill::room(settings, turns);
+    if let Some(out) = alice_core::distill::evictee(&held, room, settings, related) {
+        let forget = MemoryUpdate {
+            action: UpdateAction::Forget,
+            ..Default::default()
+        };
+        update(
+            conn,
+            &out.id,
+            &forget,
+            &Actor::Distill(DISTILL_CAP.into()),
+            st,
+        )?;
+    }
+    Ok(())
+}
+
+/// A session keeps one distilled handoff, its newest settled one (final review B-I2): "the latest
+/// handoff replaces the first". A handoff is outside the session's room, so without this every
+/// closing run (each end of a resumed session, each compaction) would leave one more. `held` is
+/// the set as `store::capture::session_held` reads it, oldest first. Each older settled handoff
+/// that no person or agent touched is superseded by the newest, by `distill:handoff`; one still
+/// waiting for the judge is left for its own settling (it may yet be trashed), and a touched one
+/// stays.
+fn keep_newest_handoff(
+    conn: &Connection,
+    st: &mut State,
+    held: &[alice_core::distill::Held],
+) -> Result<()> {
+    let settled: Vec<&alice_core::distill::Held> = held
+        .iter()
+        .filter(|h| h.kind == Kind::Handoff && !h.unjudged)
+        .collect();
+    let Some((newest, older)) = settled.split_last() else {
+        return Ok(());
+    };
+    let actor = Actor::Distill(DISTILL_HANDOFF.into());
+    for h in older.iter().filter(|h| !h.protected) {
+        match supersede(conn, st, &h.id, &newest.id, &actor, None) {
+            Ok(()) | Err(AliceError::Invalid(_) | AliceError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// `update`: the change and its `memory.<action>` event, whose id it returns. A supersede also
@@ -1570,6 +1865,203 @@ fn merge_projects(
     )))))
 }
 
+/// `WriteOp::CaptureSlice`. Everything is checked before anything is written; a failure rolls
+/// back the whole slice (its savepoint), so chunks, keys and cursor land together or not at all.
+fn capture_slice(conn: &Connection, slice: Box<CaptureSlice>, st: &mut State) -> Result<Applied> {
+    let bytes: usize = slice.chunks.iter().map(|c| c.text.len()).sum();
+    if slice.chunks.len() > INGEST_SLICE || bytes > INGEST_SLICE_BYTES {
+        return Err(AliceError::invalid(format!(
+            "a capture slice holds {} chunks and {bytes} bytes of text; send at most {INGEST_SLICE} chunks and {INGEST_SLICE_BYTES} bytes per slice",
+            slice.chunks.len()
+        )));
+    }
+    let fresh = st.chunk_budget == INGEST_SLICE && st.byte_budget == INGEST_SLICE_BYTES;
+    if !fresh && (slice.chunks.len() > st.chunk_budget || bytes > st.byte_budget) {
+        return Ok(Applied::More(WriteOp::CaptureSlice(slice), None));
+    }
+    let s = *slice;
+    if s.source.source_type != SourceType::Session {
+        return Err(AliceError::invalid(
+            "a captured transcript must be a source of type session",
+        ));
+    }
+    if s.turn_keys
+        .iter()
+        .map(|(k, _)| k)
+        .chain(&s.skipped_keys)
+        .any(|k| k.is_empty())
+    {
+        return Err(AliceError::invalid(
+            "a capture turn key is empty; every captured turn needs its key",
+        ));
+    }
+    sources::validate_chunks(&s.chunks)?;
+    st.chunk_budget = st.chunk_budget.saturating_sub(s.chunks.len());
+    st.byte_budget = st.byte_budget.saturating_sub(bytes);
+    #[cfg(test)]
+    st.applied.push("CaptureSlice");
+    // The source owns its project (spec §3.1): only a new source takes the one the slice
+    // names, so a later slice neither moves it nor creates the project it named.
+    let owner: Option<String> = conn
+        .query_row(
+            "SELECT project_id FROM sources WHERE type = ?1 AND uri = ?2",
+            rusqlite::params![s.source.source_type.as_str(), s.source.uri],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let project = match owner {
+        Some(id) => projects::get_by_id(conn, &id)?,
+        None => resolve(conn, &s.project)?,
+    };
+    // The source's identity comes from `init`; its span from the records (below), never from
+    // the input's `ended_at`, which `ingest` would otherwise write over a later end.
+    let source = SourceInput {
+        agent: Some(s.init.agent.clone()),
+        session_id: Some(s.init.session_id.clone()),
+        ended_at: None,
+        ..s.source.clone()
+    };
+    let out = sources::ingest(conn, &project, &source, &s.chunks)?;
+    // The source spans its first and its newest captured record.
+    let times: Vec<String> = s
+        .chunks
+        .iter()
+        .filter_map(|c| sources::normalise_authored(c.authored_at.as_deref()))
+        .collect();
+    if let (Some(first), Some(newest)) = (times.iter().min(), times.iter().max()) {
+        conn.execute(
+            "UPDATE sources SET started_at = COALESCE(started_at, ?2),
+                ended_at = CASE WHEN ended_at IS NULL OR ended_at < ?3 THEN ?3 ELSE ended_at END
+             WHERE id = ?1",
+            rusqlite::params![out.source_id, first, newest],
+        )?;
+    }
+    let parent = match &s.init.parent_uri {
+        Some(uri) => capture_store::source_id_by_uri(conn, uri)?,
+        None => None,
+    };
+    capture_store::ensure_state(
+        conn,
+        &out.source_id,
+        &capture_store::NewState {
+            agent: &s.init.agent,
+            session_id: &s.init.session_id,
+            parent_source_id: parent.as_deref(),
+            transcript_path: s.init.transcript_path.as_deref(),
+            file_key: s.init.file_key.as_deref(),
+            no_distill: s.init.no_distill,
+            distill_state: if s.init.backfill {
+                DistillState::SkippedBackfill
+            } else {
+                DistillState::Idle
+            },
+        },
+    )?;
+    let (agent, stored_next): (String, i64) = conn.query_row(
+        "SELECT agent, next_ord FROM capture_state WHERE source_id = ?1",
+        [&out.source_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let next_ord = match s.cursor {
+        Some((_, ord)) => ord,
+        None => s
+            .chunks
+            .iter()
+            .map(|c| c.ord + 1)
+            .fold(stored_next, i64::max),
+    };
+    let keys = s
+        .turn_keys
+        .iter()
+        .map(|(k, ord)| (k.as_str(), *ord))
+        .chain(s.skipped_keys.iter().map(|k| (k.as_str(), next_ord)));
+    let new_keys = capture_store::record_turns(conn, &agent, &out.source_id, keys)?;
+    capture_store::advance(
+        conn,
+        &out.source_id,
+        &capture_store::Progress {
+            cursor: s.cursor,
+            last_event: s.last_event.as_deref(),
+            ended: s.ended,
+            captured: out.inserted > 0 || new_keys > 0,
+        },
+    )?;
+    if out.inserted > 0 {
+        st.inserted = true;
+    }
+    // One history row per pass, like `source.ingest`: never per chunk, and not undoable.
+    if s.record_event && out.inserted > 0 {
+        let actor = Actor::from_author(&alice_core::model::Author {
+            agent: Some(agent.clone()),
+            ..Default::default()
+        });
+        record(
+            conn,
+            st,
+            EventInput {
+                actor: &actor,
+                action: "source.capture",
+                target_type: "source",
+                target_id: &out.source_id,
+                before: None,
+                after: Some(serde_json::json!({
+                    "source_id": out.source_id,
+                    "uri": source.uri,
+                    "agent": agent,
+                    "session_id": s.init.session_id,
+                    "inserted": out.inserted,
+                    "skipped": out.skipped,
+                    "turns": s.turn_keys.len(),
+                    "turns_skipped": s.skipped_keys.len(),
+                    "bytes": bytes,
+                })),
+                group: None,
+            },
+        )?;
+    }
+    Ok(Applied::Done(WriteOutcome::Captured {
+        source_id: out.source_id,
+        inserted: out.inserted,
+        keys_new: new_keys,
+    }))
+}
+
+/// `WriteOp::CaptureStateUpdate`: the rows changed (0: no such capture source).
+fn capture_state_update(
+    conn: &Connection,
+    source_id: &str,
+    change: &CaptureChange,
+) -> Result<usize> {
+    match change {
+        CaptureChange::Distill {
+            state,
+            next_try_at,
+            attempts,
+        } => capture_store::set_distill(conn, source_id, *state, next_try_at.as_deref(), *attempts),
+        CaptureChange::Distilled { distill_ord } => {
+            capture_store::set_distilled(conn, source_id, *distill_ord)
+        }
+        CaptureChange::LiveAfterBackfill { from_ord } => {
+            capture_store::revive_backfilled(conn, source_id, *from_ord)
+        }
+        CaptureChange::Ended => capture_store::set_ended(conn, source_id),
+        CaptureChange::StaleEnd { due_since } => {
+            let ended = capture_store::set_ended(conn, source_id)?;
+            if let Some(since) = due_since {
+                capture_store::due_after_stale_end(conn, source_id, since)?;
+            }
+            Ok(ended)
+        }
+        CaptureChange::Gap { byte_offset } => {
+            capture_store::record_gap(conn, source_id, *byte_offset)
+        }
+        CaptureChange::FileKey {
+            file_key,
+            byte_offset,
+        } => capture_store::set_file_key(conn, source_id, file_key, *byte_offset),
+    }
+}
+
 fn apply(
     conn: &Connection,
     op: WriteOp,
@@ -1578,6 +2070,12 @@ fn apply(
 ) -> Result<Applied> {
     let outcome = match op {
         WriteOp::Remember { input, project } => remember(conn, input, &project, st)?,
+        WriteOp::Distilled {
+            input,
+            project,
+            p,
+            subagent,
+        } => distilled(conn, input, &project, p, subagent, st)?,
         WriteOp::Ingest {
             project,
             source,
@@ -1670,8 +2168,16 @@ fn apply(
             WriteOutcome::Done
         }
         WriteOp::ApplyJudgement(j) => apply_judgement(conn, st, j)?,
-        WriteOp::RequeueJudgeRetries { max_attempts, now } => {
+        WriteOp::RequeueJudgeRetries {
+            max_attempts,
+            now,
+            distill,
+        } => {
+            let settling = judge_store::distilled_giving_up(conn, max_attempts)?;
             let (requeued, given_up) = judge_store::requeue_retries(conn, max_attempts, &now)?;
+            for id in &settling {
+                settle_distilled(conn, st, id, distill.as_ref(), &[])?;
+            }
             if requeued + given_up > 0 {
                 tracing::info!(requeued, given_up, "memories with a failed judgement");
             }
@@ -1711,14 +2217,16 @@ fn apply(
             WriteOutcome::Done
         }
         WriteOp::JudgeCall(c) => {
+            use alice_core::judge::jev::LEDGER_JUDGE;
+            // One cache for every consumer: an answer is an answer, whoever asked.
             if c.cacheable {
-                judge_store::cache_put(conn, &c.hash, "jev", &c.model, &c.response_json)?;
+                judge_store::cache_put(conn, &c.hash, LEDGER_JUDGE, &c.model, &c.response_json)?;
             }
             judge_store::add_cost(
                 conn,
                 &judge_store::CostDelta {
                     day: c.day,
-                    provider: "jev".into(),
+                    provider: ledger_row(&c.provider).into(),
                     calls: 1,
                     input_tokens: c.input_tokens,
                     output_tokens: c.output_tokens,
@@ -1766,6 +2274,10 @@ fn apply(
             rules,
         } => {
             return merge_projects(conn, from, into, actor, rules, st);
+        }
+        WriteOp::CaptureSlice(slice) => return capture_slice(conn, slice, st),
+        WriteOp::CaptureStateUpdate { source_id, change } => {
+            WriteOutcome::Count(capture_state_update(conn, &source_id, &change)?)
         }
         WriteOp::Shutdown => WriteOutcome::Done,
     };
@@ -1958,8 +2470,16 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
         }
     }
     let mut reviews = j.reviews.clone();
+    // A distilled memory never asks a person (SP2 spec §6.6).
+    let distilled_newcomer = is_distilled(conn, j.seq)?;
     // The comparisons were made in the project the memory has left.
     let actions: &[JudgeAction] = if moved { &[] } else { &j.actions };
+    // A distilled newcomer that superseded a member of its own session's best set took that
+    // member's slot: it evicts nothing (review I1, option b).
+    let mut took_a_slot = false;
+    // The memories the judge linked the newcomer to: a member of its set among them leaves
+    // first when the set is over its room (Task 12d's (c)).
+    let mut related: Vec<String> = Vec::new();
     if moved {
         reviews.retain(|r| r.kind == ReviewType::Project);
     }
@@ -1971,12 +2491,19 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
             JudgeAction::DuplicateOf { survivor, .. } => survivor,
             JudgeAction::Supersedes { old, .. } => old,
             JudgeAction::Contradicts { other, .. } => other,
+            JudgeAction::RelatesTo { other, .. } => other,
+            JudgeAction::ReplaceDistilled { distilled, .. } => distilled,
         };
         match target_state(conn, &j.seen, target)? {
             Target::Unchanged => {}
             Target::Edited => {
-                // Edited since it was judged: ask instead of acting.
-                if let Some(r) = alice_core::judge::pipeline::as_review(&j.id, a, &j.provider) {
+                // Edited since it was judged: ask instead of acting. A distilled newcomer drops
+                // it, and so does an explicit one acting on a distilled memory (final review
+                // B-I1): a distilled memory never asks a person.
+                if !distilled_newcomer
+                    && !is_distilled_id(conn, target)?
+                    && let Some(r) = alice_core::judge::pipeline::as_review(&j.id, a, &j.provider)
+                {
                     reviews.push(r);
                 }
                 continue;
@@ -1999,14 +2526,20 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
                 }
             }
             JudgeAction::Supersedes { old, .. } => {
+                let member = distilled_newcomer && {
+                    let theirs = distilled_author(conn, old)?;
+                    theirs.is_some() && theirs == distilled_author(conn, &j.id)?
+                };
                 match supersede(conn, st, old, &j.id, &actor, Some(&group)) {
-                    Ok(()) | Err(AliceError::Invalid(_) | AliceError::NotFound(_)) => {}
+                    Ok(()) => took_a_slot |= member,
+                    Err(AliceError::Invalid(_) | AliceError::NotFound(_)) => {}
                     Err(e) => return Err(e),
                 }
             }
             JudgeAction::Contradicts { other, .. } => {
                 let before = snap(conn, &j.id)?;
                 memories::link(conn, &j.id, other, "contradicts", &actor.as_string())?;
+                related.push(other.clone());
                 record(
                     conn,
                     st,
@@ -2020,6 +2553,38 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
                         group: Some(&group),
                     },
                 )?;
+            }
+            JudgeAction::RelatesTo { other, .. } => {
+                let before = snap(conn, &j.id)?;
+                memories::link(conn, &j.id, other, "relates_to", &actor.as_string())?;
+                related.push(other.clone());
+                record(
+                    conn,
+                    st,
+                    EventInput {
+                        actor: &actor,
+                        action: "memory.link",
+                        target_type: "memory",
+                        target_id: &j.id,
+                        before,
+                        after: snap(conn, &j.id)?,
+                        group: Some(&group),
+                    },
+                )?;
+            }
+            // The new memory survives its older distilled duplicate.
+            JudgeAction::ReplaceDistilled { distilled, .. } => {
+                match merge(
+                    conn,
+                    st,
+                    &j.id,
+                    std::slice::from_ref(distilled),
+                    &actor,
+                    Some(&group),
+                ) {
+                    Ok(_) | Err(AliceError::Invalid(_) | AliceError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
     }
@@ -2089,8 +2654,44 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
                 judge_next_try_at = NULL WHERE seq = ?1",
             [j.seq],
         )?;
+        // Judged live into its session's best set: the set keeps its size (Task 12c review I1,
+        // option b). A newcomer the judge trashed, or that took a member's slot, evicts nothing.
+        if distilled_newcomer {
+            debug_assert!(
+                j.distill.is_some(),
+                "a judgement of a distilled newcomer carries the distillation settings ({})",
+                j.id
+            );
+            if !trashed && !took_a_slot {
+                settle_distilled(conn, st, &j.id, j.distill.as_ref(), &related)?;
+            }
+        }
     }
     Ok(WriteOutcome::Done)
+}
+
+/// Whether the memory was distilled from a captured session (SP2 spec §6.5).
+fn is_distilled(conn: &Connection, seq: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT origin = ?1 FROM memories WHERE seq = ?2",
+            rusqlite::params![Origin::Distill.as_str(), seq],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// Whether the memory `id` was distilled from a captured session (SP2 spec §6.5).
+fn is_distilled_id(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT origin = ?1 FROM memories WHERE id = ?2",
+            rusqlite::params![Origin::Distill.as_str(), id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// Pending -> active, and record entity mentions.
@@ -2565,6 +3166,8 @@ mod tests {
             stamp,
             updated_at,
             provider: "heuristic".into(),
+            // As the judge worker sends it (Task 12c review 2, N2).
+            distill: Some(Default::default()),
             ..Default::default()
         }))
         .unwrap();
@@ -4595,6 +5198,8 @@ mod tests {
             stamp: hash_of(f, id),
             updated_at: f.read("SELECT updated_at FROM memories WHERE id = ?1", [id]),
             provider: provider.into(),
+            // As the judge worker sends it (Task 12c review 2, N2).
+            distill: Some(Default::default()),
             ..Default::default()
         }
     }
@@ -4676,6 +5281,149 @@ mod tests {
             "active",
             "the new memory is judged all the same"
         );
+    }
+
+    /// SP2 spec §6.6: a distilled newcomer never asks a person. An action whose target changed
+    /// after the judge read it is dropped, not turned into a review item.
+    #[test]
+    fn a_stale_target_of_a_distilled_newcomer_is_dropped() {
+        let f = fixture();
+        let (old, old_seq) = new_id(
+            f.h.submit_blocking(remember("Staging Postgres listens on port 5432"))
+                .unwrap(),
+        );
+        judged(&f, &old, old_seq);
+        let (auto, _) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "Staging Postgres now listens on 5433".into(),
+                    origin: Origin::Distill,
+                    ..Default::default()
+                },
+                project: ProjectChoice::Slug("global".into()),
+            })
+            .unwrap(),
+        );
+        let old_hash = hash_of(&f, &old);
+        // The old memory is edited after the judge read it.
+        f.h.submit_blocking(WriteOp::Update {
+            id: old.clone(),
+            update: MemoryUpdate {
+                body: Some("Staging Postgres listens on 6543".into()),
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        let links = |id: &str| -> i64 {
+            f.read(
+                "SELECT count(*) FROM links WHERE from_id = ?1 OR to_id = ?1",
+                [id],
+            )
+        };
+        let before = links(&old);
+        apply_j(
+            &f,
+            Judgement {
+                actions: vec![
+                    JudgeAction::Supersedes {
+                        old: old.clone(),
+                        p: 0.95,
+                    },
+                    JudgeAction::RelatesTo {
+                        other: old.clone(),
+                        p: 0.9,
+                    },
+                    JudgeAction::Contradicts {
+                        other: old.clone(),
+                        p: 0.9,
+                    },
+                    JudgeAction::DuplicateOf {
+                        survivor: old.clone(),
+                        p: 0.95,
+                    },
+                ],
+                seen: vec![(old.clone(), old_hash)],
+                ..judgement(&f, &auto, "jev")
+            },
+        );
+        let reviews: i64 = f.read("SELECT count(*) FROM review_items", []);
+        assert_eq!(reviews, 0, "a distilled newcomer never asks");
+        assert_eq!(links(&old), before, "nothing applied on stale information");
+        assert_eq!(status_of(&f, &old), "active");
+        assert_eq!(status_of(&f, &auto), "active");
+        assert_eq!(judge_state_of(&f, &auto).0, "done", "judged all the same");
+    }
+
+    /// SP2 spec §6.6, R4, R19 (final review B-I1): an explicit newcomer's action on a distilled
+    /// match that changed after the judge read it (its replacement as a duplicate, or its
+    /// supersede) is not applied, and it is dropped: a distilled memory never costs a person a
+    /// question.
+    #[test]
+    fn a_stale_action_of_an_explicit_newcomer_on_a_distilled_match_is_dropped() {
+        for supersede in [false, true] {
+            let f = fixture();
+            let (auto, auto_seq) = new_id(
+                f.h.submit_blocking(WriteOp::Remember {
+                    input: NewMemoryInput {
+                        content: "Staging Postgres listens on port 5432".into(),
+                        origin: Origin::Distill,
+                        ..Default::default()
+                    },
+                    project: ProjectChoice::Slug("global".into()),
+                })
+                .unwrap(),
+            );
+            judged(&f, &auto, auto_seq);
+            let (mine, _) = new_id(
+                f.h.submit_blocking(remember("The staging Postgres server listens on 5432"))
+                    .unwrap(),
+            );
+            let auto_hash = hash_of(&f, &auto);
+            // The distilled memory is edited after the judge read it.
+            f.h.submit_blocking(WriteOp::Update {
+                id: auto.clone(),
+                update: MemoryUpdate {
+                    body: Some("Staging Postgres listens on port 6543".into()),
+                    ..Default::default()
+                },
+                actor: Actor::User,
+            })
+            .unwrap();
+            let action = if supersede {
+                JudgeAction::Supersedes {
+                    old: auto.clone(),
+                    p: 0.6,
+                }
+            } else {
+                JudgeAction::ReplaceDistilled {
+                    distilled: auto.clone(),
+                    p: 0.95,
+                }
+            };
+            apply_j(
+                &f,
+                Judgement {
+                    actions: vec![action],
+                    seen: vec![(auto.clone(), auto_hash)],
+                    ..judgement(&f, &mine, "jev")
+                },
+            );
+            assert_eq!(
+                status_of(&f, &auto),
+                "active",
+                "not applied on stale information (supersede: {supersede})"
+            );
+            let linked: i64 = f.read(
+                "SELECT count(*) FROM links WHERE from_id = ?1 OR to_id = ?1",
+                [&auto],
+            );
+            assert_eq!(linked, 0, "supersede: {supersede}");
+            assert_eq!(status_of(&f, &mine), "active");
+            let n: i64 = f.read("SELECT count(*) FROM review_items", []);
+            assert_eq!(n, 0, "nobody is asked (supersede: {supersede})");
+            assert_eq!(judge_state_of(&f, &mine).0, "done");
+        }
     }
 
     #[test]
@@ -4803,6 +5551,7 @@ mod tests {
                 similarity: None,
                 raw: false,
                 status: None,
+                origin: Origin::Agent,
             },
             &[alice_core::judge::Relation {
                 existing_id: a.clone(),
@@ -4811,6 +5560,8 @@ mod tests {
                     ("unrelated".to_string(), 0.1),
                 ]),
                 agreement: None,
+                existing_origin: Origin::Agent,
+                existing_body: String::new(),
             }],
             &alice_core::judge::pipeline::Thresholds {
                 auto: 0.85,
@@ -4962,6 +5713,7 @@ mod tests {
         f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
             max_attempts: 2,
             now: "2099-01-01T00:00:00.000Z".into(),
+            distill: None,
         })
         .unwrap();
         assert_eq!(judge_state_of(&f, &id), ("pending".to_string(), 1));
@@ -4976,6 +5728,7 @@ mod tests {
         f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
             max_attempts: 2,
             now: "2099-01-01T00:00:00.000Z".into(),
+            distill: None,
         })
         .unwrap();
         assert_eq!(
@@ -5190,6 +5943,68 @@ mod tests {
             body, "second [REDACTED:x]",
             "the destination's cleaned text is stored with the move"
         );
+    }
+
+    /// SP2 Task 9: a Jev call is billed to its consumer's ledger row (an unknown row to the
+    /// judge's own, so the day's total still counts it) and cached under one provider, `jev`.
+    #[test]
+    fn a_judge_call_is_billed_to_its_consumers_row_and_cached_as_jev() {
+        use alice_core::judge::jev::{JevCall, LEDGER_DISTILL, LEDGER_JUDGE};
+        let f = fixture();
+        let call = |hash: &str, provider: &str, usd: f64| JevCall {
+            day: "2026-10-16".into(),
+            hash: hash.into(),
+            model: "jev-1.13.0".into(),
+            response_json: "{}".into(),
+            input_tokens: 10,
+            output_tokens: 1,
+            usd,
+            latency_ms: 5,
+            cacheable: true,
+            provider: provider.into(),
+        };
+        for c in [
+            call("h1", LEDGER_JUDGE, 0.25),
+            call("h2", LEDGER_DISTILL, 0.5),
+            call("h3", LEDGER_JUDGE, 1.0),
+        ] {
+            f.h.submit_blocking(WriteOp::JudgeCall(c)).unwrap();
+        }
+        let row = |p: &str| -> (i64, f64) {
+            let col = |c: &str| {
+                format!("SELECT {c} FROM cost_ledger WHERE day = '2026-10-16' AND provider = ?1")
+            };
+            (f.read(&col("calls"), [p]), f.read(&col("usd"), [p]))
+        };
+        assert_eq!(row(LEDGER_DISTILL), (1, 0.5));
+        assert_eq!(row(LEDGER_JUDGE), (2, 1.25));
+        assert_eq!(f.read::<i64>("SELECT count(*) FROM cost_ledger", []), 2);
+        assert_eq!(
+            f.read::<i64>(
+                "SELECT count(*) FROM judge_cache WHERE provider = 'jev'",
+                []
+            ),
+            3
+        );
+    }
+
+    /// Task 9 minor (pre-final wave): each known row bills itself. An unknown one (a consumer
+    /// never given a row) still goes to the judge's row in a release build, with a warning; a
+    /// debug build, which every test runs, stops on it.
+    #[test]
+    fn a_ledger_row_bills_itself_and_an_unknown_one_is_not_silent() {
+        use alice_core::judge::jev::{LEDGER_JUDGE, LEDGER_ROWS};
+        for r in LEDGER_ROWS {
+            assert_eq!(ledger_row(r), r);
+        }
+        let unknown = std::panic::catch_unwind(|| ledger_row("bogus"));
+        if cfg!(debug_assertions) {
+            let e = unknown.expect_err("a debug build stops on an unknown row");
+            let msg = e.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(msg.contains("unknown ledger row \"bogus\""), "{msg}");
+        } else {
+            assert_eq!(unknown.unwrap(), LEDGER_JUDGE);
+        }
     }
 
     /// Task 14: `SetMeta` upserts, `PurgeMemories` takes only trashed memories (the others are
@@ -5524,6 +6339,7 @@ mod tests {
         f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
             max_attempts: 1,
             now: alice_core::ids::now_rfc3339(),
+            distill: None,
         })
         .unwrap();
         assert_eq!(judge_state_of(&f, &id).0, "retry");
@@ -5531,6 +6347,7 @@ mod tests {
         f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
             max_attempts: 1,
             now: "2099-01-01T00:00:00.000Z".into(),
+            distill: None,
         })
         .unwrap();
         assert_eq!(judge_state_of(&f, &id).0, "pending");
@@ -6096,5 +6913,1404 @@ mod tests {
         let n: i64 = f.read("SELECT count(*) FROM projects", []);
         assert_eq!(n, 1, "no placeholder came of a refused move");
         assert_eq!(project_of(&f, &a), "global");
+    }
+
+    // ---- SP2 capture (Task 5) ----
+
+    const CAPTURE_AGENT: &str = "claude-code";
+
+    fn capture_uri(session: &str) -> String {
+        format!("{CAPTURE_AGENT}:session:{session}")
+    }
+
+    /// A capture slice of `session` holding the chunks `ords` (authored one second apart), with
+    /// no turn keys and no cursor.
+    fn capture_slice(
+        session: &str,
+        project: ProjectChoice,
+        ords: std::ops::Range<i64>,
+    ) -> CaptureSlice {
+        CaptureSlice {
+            source: SourceInput {
+                source_type: alice_core::model::SourceType::Session,
+                uri: capture_uri(session),
+                agent: Some(CAPTURE_AGENT.into()),
+                session_id: Some(session.into()),
+                ..Default::default()
+            },
+            project,
+            init: CaptureInit {
+                agent: CAPTURE_AGENT.into(),
+                session_id: session.into(),
+                parent_uri: None,
+                transcript_path: Some(format!("/tmp/t/{session}.jsonl")),
+                file_key: None,
+                no_distill: false,
+                backfill: false,
+            },
+            chunks: ords
+                .map(|i| ChunkInput {
+                    ord: i,
+                    text: format!("captured turn text {session} {i}"),
+                    authored_at: Some(format!("2026-10-16T10:00:{i:02}.000Z")),
+                    ..Default::default()
+                })
+                .collect(),
+            turn_keys: Vec::new(),
+            skipped_keys: Vec::new(),
+            cursor: None,
+            last_event: Some("stop".into()),
+            ended: false,
+            record_event: true,
+        }
+    }
+
+    fn global() -> ProjectChoice {
+        ProjectChoice::Slug("global".into())
+    }
+
+    fn capture(s: &CaptureSlice) -> WriteOp {
+        WriteOp::CaptureSlice(Box::new(s.clone()))
+    }
+
+    /// `(source_id, inserted, keys_new)` of a `Captured` outcome.
+    fn captured_full(o: Result<WriteOutcome>) -> (String, usize, usize) {
+        match o {
+            Ok(WriteOutcome::Captured {
+                source_id,
+                inserted,
+                keys_new,
+            }) => (source_id, inserted, keys_new),
+            other => panic!("expected Captured, got {other:?}"),
+        }
+    }
+
+    fn captured(o: Result<WriteOutcome>) -> (String, usize) {
+        let (source_id, inserted, _) = captured_full(o);
+        (source_id, inserted)
+    }
+
+    fn capture_cursor(c: &Connection, session: &str) -> (u64, i64) {
+        let st = capture_store::by_uri(c, &capture_uri(session))
+            .unwrap()
+            .expect("the source has a capture state");
+        (st.byte_offset, st.next_ord)
+    }
+
+    fn first_ord(f: &Fixture, key: &str) -> i64 {
+        f.read(
+            "SELECT first_ord FROM capture_turns WHERE turn_key = ?1",
+            [key],
+        )
+    }
+
+    fn turn_keys(k: &[&str]) -> Vec<String> {
+        k.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn known(c: &Connection, k: &[&str]) -> std::collections::HashSet<String> {
+        capture_store::known_turns(c, CAPTURE_AGENT, &turn_keys(k)).unwrap()
+    }
+
+    /// Final review B-I2: an ended source is open again once a slice that does not end it stores
+    /// a new turn (a resumed session: `claude --resume` and `codex resume` write on in the same
+    /// file), so its later quiet runs are not closing runs. A slice that stores nothing new (a
+    /// repeat, a resume's `SessionStart`) leaves it ended; a later end ends it again; and a stale
+    /// end is reopened the same way.
+    #[test]
+    fn a_slice_that_stores_a_new_turn_reopens_an_ended_source() {
+        let f = fixture();
+        let ended = |f: &Fixture| {
+            let c = alice_core::store::open_reader(&f.db()).unwrap();
+            capture_store::by_uri(&c, &capture_uri("R1"))
+                .unwrap()
+                .expect("the source has a capture state")
+                .ended
+        };
+        let mut s = capture_slice("R1", global(), 0..2);
+        s.turn_keys = vec![("r-1".into(), 0)];
+        s.cursor = Some((100, 2));
+        s.last_event = Some("session-end".into());
+        s.ended = true;
+        let (source_id, _) = captured(f.h.submit_blocking(capture(&s)));
+        assert!(ended(&f), "the session end ends it");
+        // The same slice again (nothing new), then the resume's start (no turn): still ended.
+        let again = CaptureSlice {
+            ended: false,
+            last_event: Some("stop".into()),
+            ..s.clone()
+        };
+        assert_eq!(captured_full(f.h.submit_blocking(capture(&again))).1, 0);
+        assert!(ended(&f), "a repeat stores nothing new");
+        let start = CaptureSlice {
+            chunks: Vec::new(),
+            turn_keys: Vec::new(),
+            ended: false,
+            last_event: Some("session-start".into()),
+            ..s.clone()
+        };
+        captured(f.h.submit_blocking(capture(&start)));
+        assert!(ended(&f), "a slice with no turn reopens nothing");
+        // The resumed session's first new turn reopens it.
+        let mut resumed = capture_slice("R1", global(), 2..4);
+        resumed.turn_keys = vec![("r-2".into(), 2)];
+        resumed.cursor = Some((200, 4));
+        captured(f.h.submit_blocking(capture(&resumed)));
+        assert!(!ended(&f), "new turns after an end reopen the source");
+        // Its next end ends it again, and a stale end is reopened the same way.
+        let mut end2 = capture_slice("R1", global(), 4..5);
+        end2.turn_keys = vec![("r-3".into(), 4)];
+        end2.cursor = Some((300, 5));
+        end2.ended = true;
+        captured(f.h.submit_blocking(capture(&end2)));
+        assert!(ended(&f));
+        f.h.submit_blocking(WriteOp::CaptureStateUpdate {
+            source_id: source_id.clone(),
+            change: CaptureChange::Distilled { distill_ord: 5 },
+        })
+        .unwrap();
+        let mut later = capture_slice("R1", global(), 5..6);
+        later.turn_keys = vec![("r-4".into(), 5)];
+        later.cursor = Some((400, 6));
+        captured(f.h.submit_blocking(capture(&later)));
+        assert!(!ended(&f));
+        f.h.submit_blocking(WriteOp::CaptureStateUpdate {
+            source_id: source_id.clone(),
+            change: CaptureChange::StaleEnd { due_since: None },
+        })
+        .unwrap();
+        assert!(ended(&f), "the stale end");
+        let mut after_stale = capture_slice("R1", global(), 6..7);
+        after_stale.turn_keys = vec![("r-5".into(), 6)];
+        after_stale.cursor = Some((500, 7));
+        captured(f.h.submit_blocking(capture(&after_stale)));
+        assert!(
+            !ended(&f),
+            "a stale-ended session that resumes is open again"
+        );
+    }
+
+    /// SP2 spec §3.8: one slice writes its chunks, its turn keys and the cursor in one
+    /// transaction. Repeating it stores nothing and leaves the cursor where it was; a slice that
+    /// is refused writes nothing at all.
+    #[test]
+    fn capture_slice_writes_chunks_keys_and_cursor_atomically() {
+        let f = fixture();
+        let mut s = capture_slice("S1", global(), 0..3);
+        s.turn_keys = vec![("u-1".into(), 0), ("u-2".into(), 2)];
+        s.cursor = Some((4096, 3));
+        let (source_id, inserted, keys_new) = captured_full(f.h.submit_blocking(capture(&s)));
+        assert_eq!((inserted, keys_new), (3, 2));
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        assert_eq!(
+            known(&c, &["u-1", "u-2", "u-3"]),
+            known_set(&["u-1", "u-2"])
+        );
+        assert!(
+            capture_store::known_turns(&c, "codex", &turn_keys(&["u-1"]))
+                .unwrap()
+                .is_empty(),
+            "turn keys are per agent"
+        );
+        let st = capture_store::by_uri(&c, &capture_uri("S1"))
+            .unwrap()
+            .expect("the source has a capture state");
+        assert_eq!((st.byte_offset, st.next_ord), (4096, 3));
+        assert_eq!(st.source_id, source_id);
+        assert_eq!(
+            (st.agent.as_str(), st.session_id.as_str()),
+            (CAPTURE_AGENT, "S1")
+        );
+        assert_eq!(st.transcript_path.as_deref(), Some("/tmp/t/S1.jsonl"));
+        assert_eq!(st.last_event.as_deref(), Some("stop"));
+        assert!(st.last_capture_at.is_some());
+        assert_eq!(st.distill_state, DistillState::Idle);
+        assert!(!st.ended && !st.no_distill);
+        assert_eq!(st.project_id, projects::GLOBAL_ID);
+        let first_ord: i64 = f.read(
+            "SELECT first_ord FROM capture_turns WHERE turn_key = 'u-2'",
+            [],
+        );
+        assert_eq!(first_ord, 2);
+        let started: String = f.read("SELECT started_at FROM sources WHERE id = ?1", [&source_id]);
+        let ended: String = f.read("SELECT ended_at FROM sources WHERE id = ?1", [&source_id]);
+        assert_eq!(
+            (started.as_str(), ended.as_str()),
+            ("2026-10-16T10:00:00.000Z", "2026-10-16T10:00:02.000Z"),
+            "the source spans its first and newest captured record"
+        );
+        let events = || -> i64 {
+            f.read(
+                "SELECT count(*) FROM events WHERE action = 'source.capture' AND target_id = ?1",
+                [&source_id],
+            )
+        };
+        assert_eq!(events(), 1);
+        let actor: String = f.read(
+            "SELECT actor FROM events WHERE action = 'source.capture'",
+            [],
+        );
+        assert_eq!(actor, "agent:claude-code");
+
+        // The same slice again: a hook that fired twice, or a pass repeated after a crash.
+        let (again_id, again, keys_again) = captured_full(f.h.submit_blocking(capture(&s)));
+        assert_eq!(
+            (again_id.as_str(), again, keys_again),
+            (source_id.as_str(), 0, 0)
+        );
+        let st = capture_store::by_uri(&c, &capture_uri("S1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((st.byte_offset, st.next_ord), (4096, 3));
+        let chunks: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(chunks, 3);
+        assert_eq!(events(), 1, "a slice that stored nothing records no event");
+
+        // A refused slice (an empty turn key after its chunks) writes nothing.
+        let mut bad = capture_slice("S2", global(), 0..2);
+        bad.turn_keys = vec![("u-9".into(), 0), (String::new(), 1)];
+        bad.cursor = Some((100, 2));
+        let err = f.h.submit_blocking(capture(&bad)).unwrap_err().to_string();
+        assert!(err.contains("turn key"), "{err}");
+        assert!(
+            capture_store::by_uri(&c, &capture_uri("S2"))
+                .unwrap()
+                .is_none()
+        );
+        let sources: i64 = f.read(
+            "SELECT count(*) FROM sources WHERE uri = ?1",
+            [capture_uri("S2")],
+        );
+        assert_eq!(sources, 0);
+        assert!(known(&c, &["u-9"]).is_empty());
+        let chunks: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(chunks, 3);
+    }
+
+    fn known_set(k: &[&str]) -> std::collections::HashSet<String> {
+        turn_keys(k).into_iter().collect()
+    }
+
+    /// SP2 spec §3.1: the source owns its project. A later slice that names another project
+    /// stores its chunks under the first one, and the project it named is not created.
+    #[test]
+    fn a_capture_source_keeps_its_first_project() {
+        let f = fixture();
+        let detected = |slug: &str| {
+            ProjectChoice::Detected(alice_core::project::ProjectRef {
+                key: format!("path:/work/{slug}"),
+                slug: slug.into(),
+                name: slug.into(),
+                root: None,
+                remote: None,
+            })
+        };
+        let (source_id, first) =
+            captured(f.h.submit_blocking(capture(&capture_slice("S1", detected("alpha"), 0..2))));
+        let (again, second) =
+            captured(f.h.submit_blocking(capture(&capture_slice("S1", detected("beta"), 2..4))));
+        assert_eq!((first, second), (2, 2));
+        assert_eq!(again, source_id);
+        let alpha: String = f.read("SELECT id FROM projects WHERE slug = 'alpha'", []);
+        let owner: String = f.read("SELECT project_id FROM sources WHERE id = ?1", [&source_id]);
+        assert_eq!(owner, alpha);
+        let theirs: i64 = f.read(
+            "SELECT count(*) FROM chunks WHERE source_id = ?1 AND project_id = ?2",
+            [&source_id, &alpha],
+        );
+        assert_eq!(theirs, 4, "the second slice's chunks follow the source");
+        let beta: i64 = f.read("SELECT count(*) FROM projects WHERE slug = 'beta'", []);
+        assert_eq!(beta, 0, "the project the later slice named is not created");
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        let st = capture_store::by_source(&c, &source_id).unwrap().unwrap();
+        assert_eq!(st.project_id, alpha);
+    }
+
+    /// SP2 spec §3.6: an excluded project's turns store nothing, but their keys are recorded and
+    /// the cursor moves past them. A skipped key is recorded at the cursor's next ord, or without
+    /// a cursor at the stored one.
+    #[test]
+    fn skipped_keys_are_recorded_without_chunks() {
+        let f = fixture();
+        let mut s = capture_slice("S1", global(), 0..0);
+        s.skipped_keys = turn_keys(&["x-1", "x-2"]);
+        s.cursor = Some((2048, 7));
+        let (source_id, inserted, keys_new) = captured_full(f.h.submit_blocking(capture(&s)));
+        assert_eq!((inserted, keys_new), (0, 2));
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        assert_eq!(known(&c, &["x-1", "x-2"]), known_set(&["x-1", "x-2"]));
+        let rows: i64 = f.read(
+            "SELECT count(*) FROM capture_turns WHERE source_id = ?1 AND first_ord = 7",
+            [&source_id],
+        );
+        assert_eq!(rows, 2, "recorded at the cursor's next ord");
+        let chunks: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(chunks, 0);
+        assert_eq!(capture_cursor(&c, "S1"), (2048, 7));
+        // No cursor: the stored next ord.
+        let mut s = capture_slice("S1", global(), 0..0);
+        s.skipped_keys = turn_keys(&["x-3"]);
+        captured(f.h.submit_blocking(capture(&s)));
+        assert_eq!(first_ord(&f, "x-3"), 7);
+        assert_eq!(capture_cursor(&c, "S1"), (2048, 7));
+        let events: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'source.capture'",
+            [],
+        );
+        assert_eq!(events, 0);
+    }
+
+    /// A turn that rendered no chunk still records its key on the `turn_keys` path, at the ord
+    /// the next chunk would get, beside a turn with chunks and alone.
+    #[test]
+    fn a_turn_key_without_chunks_is_recorded() {
+        let f = fixture();
+        let mut s = capture_slice("S1", global(), 0..2);
+        s.turn_keys = vec![("t-1".into(), 0), ("t-empty".into(), 2)];
+        s.cursor = Some((300, 2));
+        let (_, inserted, keys_new) = captured_full(f.h.submit_blocking(capture(&s)));
+        assert_eq!((inserted, keys_new), (2, 2));
+        let mut solo = capture_slice("S1", global(), 0..0);
+        solo.turn_keys = vec![("t-solo".into(), 2)];
+        solo.cursor = Some((420, 2));
+        let (_, inserted, keys_new) = captured_full(f.h.submit_blocking(capture(&solo)));
+        assert_eq!((inserted, keys_new), (0, 1));
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        assert_eq!(
+            known(&c, &["t-1", "t-empty", "t-solo"]),
+            known_set(&["t-1", "t-empty", "t-solo"])
+        );
+        assert_eq!(
+            (
+                first_ord(&f, "t-1"),
+                first_ord(&f, "t-empty"),
+                first_ord(&f, "t-solo")
+            ),
+            (0, 2, 2)
+        );
+        let chunks: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(chunks, 2);
+        assert_eq!(capture_cursor(&c, "S1"), (420, 2));
+    }
+
+    /// Review fix: a stale slice (an older pass's, committed late) never moves `next_ord` back,
+    /// so a later pass cannot reuse stored ords and lose its turns to `INSERT OR IGNORE`.
+    #[test]
+    fn a_stale_slice_never_moves_next_ord_back() {
+        let f = fixture();
+        let mut s = capture_slice("S1", global(), 0..3);
+        s.cursor = Some((4096, 3));
+        captured(f.h.submit_blocking(capture(&s)));
+        let mut stale = capture_slice("S1", global(), 0..1);
+        stale.cursor = Some((1024, 1));
+        captured(f.h.submit_blocking(capture(&stale)));
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        assert_eq!(capture_cursor(&c, "S1").1, 3);
+    }
+
+    /// A slice over the writer's slice limits is a caller bug: refused whole, naming the limits,
+    /// even when a fresh commit would have room for it.
+    #[test]
+    fn an_oversized_capture_slice_is_refused() {
+        let f = fixture();
+        let many = capture_slice("S1", global(), 0..51);
+        let mut wide = capture_slice("S2", global(), 0..2);
+        for c in &mut wide.chunks {
+            c.text = "w".repeat(20_000);
+        }
+        for (s, session) in [(many, "S1"), (wide, "S2")] {
+            let err = f.h.submit_blocking(capture(&s)).unwrap_err();
+            assert!(matches!(err, AliceError::Invalid(_)), "{err:?}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("50 chunks") && msg.contains("32768 bytes"),
+                "{msg}"
+            );
+            let sources: i64 = f.read(
+                "SELECT count(*) FROM sources WHERE uri = ?1",
+                [capture_uri(session)],
+            );
+            assert_eq!(sources, 0);
+        }
+        let chunks: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(chunks, 0);
+    }
+
+    /// Atomicity, proved: a slice that fails after its chunks and keys are written (a trigger
+    /// refuses the cursor update) leaves no chunk, no key and no cursor change behind, and the
+    /// same slice goes through once the trigger is gone.
+    #[test]
+    fn a_capture_slice_that_fails_mid_apply_leaves_nothing() {
+        let f = fixture();
+        let mut first = capture_slice("S1", global(), 0..2);
+        first.turn_keys = vec![("a-1".into(), 0)];
+        first.cursor = Some((100, 2));
+        captured(f.h.submit_blocking(capture(&first)));
+        let side = rusqlite::Connection::open(f.db()).unwrap();
+        side.execute_batch(
+            "CREATE TRIGGER refuse_cursor BEFORE UPDATE ON capture_state
+             BEGIN SELECT RAISE(ABORT, 'cursor refused by the test'); END;",
+        )
+        .unwrap();
+        let mut next = capture_slice("S1", global(), 2..5);
+        next.turn_keys = vec![("a-2".into(), 2), ("a-3".into(), 4)];
+        next.cursor = Some((900, 5));
+        let err = f.h.submit_blocking(capture(&next)).unwrap_err().to_string();
+        assert!(err.contains("cursor refused"), "{err}");
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        let chunks: i64 = f.read("SELECT count(*) FROM chunks", []);
+        assert_eq!(chunks, 2, "the failed slice's chunks are rolled back");
+        assert!(known(&c, &["a-2", "a-3"]).is_empty(), "and its keys");
+        assert_eq!(capture_cursor(&c, "S1"), (100, 2), "and the cursor stays");
+        side.execute_batch("DROP TRIGGER refuse_cursor").unwrap();
+        let (_, inserted, keys_new) = captured_full(f.h.submit_blocking(capture(&next)));
+        assert_eq!((inserted, keys_new), (3, 2));
+        assert_eq!(capture_cursor(&c, "S1"), (900, 5));
+    }
+
+    /// The source's agent and session come from `init`, and its time span from the captured
+    /// records: `SourceInput`'s own `ended_at` is ignored and the end never moves back.
+    #[test]
+    fn a_capture_source_takes_its_identity_from_init_and_its_span_from_records() {
+        let f = fixture();
+        let mut s = capture_slice("S1", global(), 3..5);
+        s.source.agent = Some("someone-else".into());
+        s.source.session_id = Some("not-the-session".into());
+        s.source.ended_at = Some("2030-01-01T00:00:00.000Z".into());
+        let (source_id, _) = captured(f.h.submit_blocking(capture(&s)));
+        let col = |name: &str| -> Option<String> {
+            f.read(
+                &format!("SELECT {name} FROM sources WHERE id = ?1"),
+                [&source_id],
+            )
+        };
+        assert_eq!(col("agent").as_deref(), Some(CAPTURE_AGENT));
+        assert_eq!(col("session_id").as_deref(), Some("S1"));
+        assert_eq!(col("ended_at").as_deref(), Some("2026-10-16T10:00:04.000Z"));
+        assert_eq!(
+            col("started_at").as_deref(),
+            Some("2026-10-16T10:00:03.000Z")
+        );
+        // A later slice of older records, whose input claims an earlier span, changes neither:
+        // the end only moves forward and the start is set once.
+        let mut older = capture_slice("S1", global(), 0..2);
+        older.source.ended_at = Some("2020-01-01T00:00:00.000Z".into());
+        older.source.started_at = Some("2020-01-01T00:00:00.000Z".into());
+        captured(f.h.submit_blocking(capture(&older)));
+        assert_eq!(col("ended_at").as_deref(), Some("2026-10-16T10:00:04.000Z"));
+        assert_eq!(
+            col("started_at").as_deref(),
+            Some("2026-10-16T10:00:03.000Z")
+        );
+        // A new source takes `started_at` from its input when it has one.
+        let mut given = capture_slice("S2", global(), 0..1);
+        given.source.started_at = Some("2026-10-16T09:00:00.000Z".into());
+        let (s2, _) = captured(f.h.submit_blocking(capture(&given)));
+        let started: String = f.read("SELECT started_at FROM sources WHERE id = ?1", [&s2]);
+        assert_eq!(started, "2026-10-16T09:00:00.000Z");
+    }
+
+    /// SP2 spec §6.5: a distilled memory carries its provenance (inserted with it) and the actor
+    /// `distill:jev`. A re-run returns the first memory by its idempotency key and adds no
+    /// provenance, even when it names one more chunk.
+    #[test]
+    fn a_distilled_remember_records_provenance_and_its_actor() {
+        let f = fixture();
+        let (source_id, _) =
+            captured(f.h.submit_blocking(capture(&capture_slice("S1", global(), 0..3))));
+        let chunk = |ord: i64| -> String {
+            f.read(
+                "SELECT id FROM chunks WHERE source_id = ?1 AND ord = ?2",
+                rusqlite::params![source_id, ord],
+            )
+        };
+        let (c1, c2, c3) = (chunk(0), chunk(1), chunk(2));
+        let distilled = |provenance: Vec<String>| WriteOp::Remember {
+            input: NewMemoryInput {
+                content: "We pin the toolchain to Rust 1.99 so CI and laptops agree".into(),
+                kind: Some(Kind::Decision),
+                idempotency_key: Some("distill:0123456789abcdef0123456789abcdef".into()),
+                author: alice_core::model::Author {
+                    agent: Some(CAPTURE_AGENT.into()),
+                    session: Some("S1".into()),
+                    model: None,
+                },
+                origin: Origin::Distill,
+                provenance,
+                ..Default::default()
+            },
+            project: global(),
+        };
+        let (id, _) = new_id(
+            f.h.submit_blocking(distilled(vec![c1.clone(), c2.clone()]))
+                .unwrap(),
+        );
+        let rows = || -> i64 { f.read("SELECT count(*) FROM provenance", []) };
+        assert_eq!(rows(), 2);
+        let mine: i64 = f.read(
+            "SELECT count(*) FROM provenance WHERE memory_id = ?1 AND chunk_id IN (?2, ?3)",
+            [&id, &c1, &c2],
+        );
+        assert_eq!(mine, 2);
+        let actor: String = f.read(
+            "SELECT actor FROM events WHERE action = 'memory.create' AND target_id = ?1",
+            [&id],
+        );
+        assert_eq!(actor, "distill:jev");
+        let origin: String = f.read("SELECT origin FROM memories WHERE id = ?1", [&id]);
+        assert_eq!(origin, "distill");
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        let m = memories::get_many(&c, std::slice::from_ref(&id)).unwrap();
+        assert_eq!(m[0].origin, Origin::Distill);
+
+        let again = f.h.submit_blocking(distilled(vec![c1, c2, c3])).unwrap();
+        assert!(
+            matches!(&again, WriteOutcome::Remembered(InsertOutcome::Duplicate { id: d }, _) if *d == id),
+            "{again:?}"
+        );
+        assert_eq!(rows(), 2, "a duplicate inserts no provenance");
+
+        // An agent's memory keeps the agent's actor and origin.
+        let (plain, _) = new_id(f.h.submit_blocking(remember("an ordinary memory")).unwrap());
+        let origin: String = f.read("SELECT origin FROM memories WHERE id = ?1", [&plain]);
+        assert_eq!(origin, "agent");
+        let actor: String = f.read(
+            "SELECT actor FROM events WHERE action = 'memory.create' AND target_id = ?1",
+            [&plain],
+        );
+        assert_eq!(actor, "user");
+    }
+
+    /// A distilled memory of session `session`, written as the distill worker writes it.
+    fn distilled_op(text: &str, key: &str, kind: Kind, p: f64, session: &str) -> WriteOp {
+        WriteOp::Distilled {
+            input: NewMemoryInput {
+                content: text.into(),
+                kind: Some(kind),
+                idempotency_key: Some(key.into()),
+                author: alice_core::model::Author {
+                    agent: Some(CAPTURE_AGENT.into()),
+                    session: Some(session.into()),
+                    model: None,
+                },
+                origin: Origin::Distill,
+                ..Default::default()
+            },
+            project: global(),
+            p,
+            subagent: false,
+        }
+    }
+
+    /// The judge's verdict on memory `id`, applied as the judge worker applies it, with the
+    /// distillation settings at `max_per_session = n`.
+    fn verdict(f: &Fixture, id: &str, actions: Vec<JudgeAction>, retry: bool, n: usize) {
+        let seq: i64 = f.read("SELECT seq FROM memories WHERE id = ?1", [id]);
+        let stamp: String = f.read("SELECT content_hash FROM memories WHERE id = ?1", [id]);
+        let updated_at: String = f.read("SELECT updated_at FROM memories WHERE id = ?1", [id]);
+        // The judge read each memory it acts on as it is now.
+        let seen = actions
+            .iter()
+            .map(|a| {
+                let other = match a {
+                    JudgeAction::DuplicateOf { survivor, .. } => survivor,
+                    JudgeAction::Supersedes { old, .. } => old,
+                    JudgeAction::Contradicts { other, .. }
+                    | JudgeAction::RelatesTo { other, .. } => other,
+                    JudgeAction::ReplaceDistilled { distilled, .. } => distilled,
+                };
+                let hash: String =
+                    f.read("SELECT content_hash FROM memories WHERE id = ?1", [other]);
+                (other.clone(), hash)
+            })
+            .collect();
+        f.h.submit_blocking(WriteOp::ApplyJudgement(Judgement {
+            seq,
+            id: id.into(),
+            stamp,
+            updated_at,
+            provider: "jev".into(),
+            actions,
+            retry,
+            seen,
+            distill: Some(cap_of(n)),
+            ..Default::default()
+        }))
+        .unwrap();
+    }
+
+    /// The distillation settings with a best set of `n`.
+    fn cap_of(n: usize) -> alice_core::settings::DistillSettings {
+        alice_core::settings::DistillSettings {
+            max_per_session: n,
+            ..Default::default()
+        }
+    }
+
+    /// A distilled memory of session S1, judged live under a set large enough that nothing goes:
+    /// a member of its best set.
+    fn member(f: &Fixture, text: &str, key: &str, kind: Kind, p: f64) -> String {
+        let (id, _) = new_id(
+            f.h.submit_blocking(distilled_op(text, key, kind, p, "S1"))
+                .unwrap(),
+        );
+        verdict(f, &id, Vec::new(), false, 200);
+        id
+    }
+
+    fn cap_forgets(f: &Fixture) -> i64 {
+        f.read(
+            "SELECT count(*) FROM events WHERE action = 'memory.forget' AND actor = 'distill:cap'",
+            [],
+        )
+    }
+
+    /// Task 12c (spec §6.4) and its review's I1, option b: a distilled memory is written with its
+    /// rank inputs and evicts nothing. Once the judge finds it live in a full best set (two
+    /// here: the handoff is outside the room, final review B-I2), the weakest member that may go
+    /// is trashed in the judgement's op: a `memory.forget` by `distill:cap`, undoable like any
+    /// trash. Never a handoff, nor a member an agent edited.
+    #[test]
+    fn a_newcomer_judged_live_into_a_full_set_evicts_the_weakest_that_may_go() {
+        let f = fixture();
+        let handoff = member(
+            &f,
+            "Where things stand: the cache is set up, next the restart",
+            "distill:h",
+            Kind::Handoff,
+            0.71,
+        );
+        let edited = member(
+            &f,
+            "The cache keeps its data in memory only",
+            "distill:g",
+            Kind::Fact,
+            0.70,
+        );
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        f.h.submit_blocking(WriteOp::Update {
+            id: edited.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                title: Some("The cache is in memory".into()),
+                ..Default::default()
+            },
+            actor: Actor::Agent(CAPTURE_AGENT.into()),
+        })
+        .unwrap();
+        let (new, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The cache service listens on its own port",
+                "distill:new",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        let (p, tier): (f64, String) = (
+            f.read("SELECT distill_p FROM memories WHERE id = ?1", [&new]),
+            f.read("SELECT distill_tier FROM memories WHERE id = ?1", [&new]),
+        );
+        assert_eq!((p, tier.as_str()), (0.95, "main"));
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        assert_eq!(cap_forgets(&f), 0, "written, nothing evicted");
+        verdict(&f, &new, Vec::new(), false, 2);
+        assert_eq!(status(&weak), "trashed");
+        for id in [&handoff, &edited, &new] {
+            assert_ne!(status(id), "trashed");
+        }
+        let event: String = f.read(
+            "SELECT id FROM events WHERE action = 'memory.forget' AND actor = 'distill:cap' AND target_id = ?1",
+            [&weak],
+        );
+        assert_eq!(cap_forgets(&f), 1);
+        // The trash is undone like any other.
+        f.h.submit_blocking(WriteOp::Undo {
+            event_id: event,
+            actor: Actor::User,
+        })
+        .unwrap();
+        assert_ne!(status(&weak), "trashed");
+    }
+
+    /// Final review B-I2: a handoff is outside the room, and a session keeps its newest settled
+    /// handoff only. Once a newer one is judged live, each older settled one that no person or
+    /// agent touched is superseded by it (by `distill:handoff`, in the judgement's op), and no
+    /// durable member is evicted for it, even in a full set. An older handoff the judge settles
+    /// after a newer one is superseded by the newer one; one still waiting for the judge, or
+    /// touched by an agent, stays.
+    #[test]
+    fn a_session_keeps_its_newest_handoff_only() {
+        let f = fixture();
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        let supersedes = |newer: &str, older: &str| -> i64 {
+            f.read(
+                "SELECT count(*) FROM links WHERE from_id = ?1 AND to_id = ?2 AND type = 'supersedes'",
+                [newer, older],
+            )
+        };
+        let fact = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        let h1 = member(
+            &f,
+            "Where things stand: the cache is set up, next the restart",
+            "distill:h1",
+            Kind::Handoff,
+            0.8,
+        );
+        let handoff = |text: &str, key: &str, session: &str| -> String {
+            new_id(
+                f.h.submit_blocking(distilled_op(text, key, Kind::Handoff, 0.75, session))
+                    .unwrap(),
+            )
+            .0
+        };
+        let h2 = handoff(
+            "Where things stand: the restart moved to 04:00, next the alerts",
+            "distill:h2",
+            "S1",
+        );
+        // A room of one, held by the fact: the handoff evicts nothing.
+        verdict(&f, &h2, Vec::new(), false, 1);
+        assert_eq!(status(&h1), "superseded");
+        assert_eq!(supersedes(&h2, &h1), 1);
+        let actor: String = f.read(
+            "SELECT actor FROM events WHERE action = 'memory.supersede' AND target_id = ?1",
+            [&h1],
+        );
+        assert_eq!(actor, "distill:handoff");
+        assert_eq!(
+            (status(&h2), status(&fact)),
+            ("active".into(), "active".into())
+        );
+        assert_eq!(cap_forgets(&f), 0);
+        // One an agent touched stays beside the newer one.
+        f.h.submit_blocking(WriteOp::Update {
+            id: h2.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                title: Some("Restart at 04:00".into()),
+                ..Default::default()
+            },
+            actor: Actor::Agent(CAPTURE_AGENT.into()),
+        })
+        .unwrap();
+        // Judged again after the edit, as the worker would.
+        verdict(&f, &h2, Vec::new(), false, 1);
+        let touched: bool = f.read(
+            "SELECT touched_at IS NOT NULL AND judge_state = 'done' FROM memories WHERE id = ?1",
+            [&h2],
+        );
+        assert!(touched, "settled and touched");
+        let h3 = handoff(
+            "Where things stand: the alerts are wired, next the dashboards",
+            "distill:h3",
+            "S1",
+        );
+        verdict(&f, &h3, Vec::new(), false, 1);
+        assert_eq!(
+            (status(&h2), status(&h3)),
+            ("active".into(), "active".into())
+        );
+        // Settled out of order (session S2): the older one, judged last, goes to the newer one;
+        // one still waiting for the judge stays until it is settled.
+        let a = handoff("Where things stand: step one is done", "distill:a", "S2");
+        let b = handoff("Where things stand: step two is done", "distill:b", "S2");
+        verdict(&f, &b, Vec::new(), false, 16);
+        assert_eq!(
+            (status(&a), status(&b)),
+            ("pending".into(), "active".into())
+        );
+        verdict(&f, &a, Vec::new(), false, 16);
+        assert_eq!(status(&a), "superseded");
+        assert_eq!(supersedes(&b, &a), 1);
+        assert_eq!(status(&b), "active");
+        assert_eq!(cap_forgets(&f), 0);
+    }
+
+    /// Review I1, option b: a newcomer the judge trashes as a duplicate evicts nothing, so the
+    /// full set's unique weakest member stays.
+    #[test]
+    fn a_newcomer_the_judge_trashes_as_a_duplicate_evicts_nothing() {
+        let f = fixture();
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        member(
+            &f,
+            "The cache keeps its data in memory only",
+            "distill:y",
+            Kind::Fact,
+            0.9,
+        );
+        member(
+            &f,
+            "Invoices go out on Fridays",
+            "distill:z",
+            Kind::Fact,
+            0.85,
+        );
+        let (saved, _) = new_id(
+            f.h.submit_blocking(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: "The berth tracker cache is warmed by the night job".into(),
+                    kind: Some(Kind::Fact),
+                    origin: Origin::Agent,
+                    ..Default::default()
+                },
+                project: global(),
+            })
+            .unwrap(),
+        );
+        let (dup, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The berth tracker cache is warmed by the night job, as said",
+                "distill:dup",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &dup,
+            vec![JudgeAction::DuplicateOf {
+                survivor: saved,
+                p: 0.95,
+            }],
+            false,
+            3,
+        );
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        assert_eq!(status(&dup), "trashed");
+        assert_ne!(status(&weak), "trashed", "the unique member stays");
+        assert_eq!(cap_forgets(&f), 0);
+    }
+
+    /// Review I1, option b: a newcomer that supersedes a member of its own session's set took that
+    /// member's slot and evicts nothing, even over a set already past its size (three of four
+    /// here, as after a lowered `max_per_session`). One that supersedes another session's memory
+    /// takes a new slot: the weakest member that may go leaves.
+    #[test]
+    fn a_newcomer_that_supersedes_a_member_evicts_nothing() {
+        let f = fixture();
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        let old = member(
+            &f,
+            "The berth planner reads the tide table",
+            "distill:y",
+            Kind::Fact,
+            0.9,
+        );
+        member(
+            &f,
+            "Invoices go out on Fridays",
+            "distill:z",
+            Kind::Fact,
+            0.85,
+        );
+        member(
+            &f,
+            "The north crane is the fastest",
+            "distill:w",
+            Kind::Fact,
+            0.8,
+        );
+        let (sup, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The berth planner reads the tide table before each shift",
+                "distill:sup",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &sup,
+            vec![JudgeAction::Supersedes {
+                old: old.clone(),
+                p: 0.95,
+            }],
+            false,
+            3,
+        );
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        assert_eq!(status(&old), "superseded");
+        assert_ne!(status(&sup), "trashed");
+        assert_ne!(status(&weak), "trashed");
+        assert_eq!(cap_forgets(&f), 0);
+        // Another session's memory superseded: the newcomer takes a slot of its own.
+        let (theirs, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The gate opens at dawn",
+                "distill:o",
+                Kind::Fact,
+                0.9,
+                "S2",
+            ))
+            .unwrap(),
+        );
+        verdict(&f, &theirs, Vec::new(), false, 200);
+        let (next, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The gate opens at dawn and closes at dusk",
+                "distill:next",
+                Kind::Fact,
+                0.96,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &next,
+            vec![JudgeAction::Supersedes {
+                old: theirs,
+                p: 0.95,
+            }],
+            false,
+            3,
+        );
+        assert_eq!(status(&weak), "trashed");
+        assert_eq!(cap_forgets(&f), 1);
+    }
+
+    /// Task 12d (c): a newcomer judged live into a full set that the judge linked to a member
+    /// (`relates_to`: an update or a duplicate that holds more; or `contradicts`) evicts that
+    /// member, the older of the two, not the set's weakest. A related member an agent edited is
+    /// protected: the weakest member that may go leaves instead.
+    #[test]
+    fn a_live_newcomer_related_to_a_member_evicts_that_member() {
+        let f = fixture();
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        let old = member(
+            &f,
+            "The berth planner reads the tide table at noon",
+            "distill:old",
+            Kind::Fact,
+            0.9,
+        );
+        member(
+            &f,
+            "Invoices go out on Fridays",
+            "distill:z",
+            Kind::Fact,
+            0.85,
+        );
+        let (new, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The berth planner reads the tide table at dawn now",
+                "distill:new",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &new,
+            vec![JudgeAction::RelatesTo {
+                other: old.clone(),
+                p: 0.8,
+            }],
+            false,
+            3,
+        );
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        assert_eq!(status(&old), "trashed", "the related member goes");
+        assert_ne!(status(&weak), "trashed");
+        assert_ne!(status(&new), "trashed");
+        // A contradiction counts too; an edited member is protected.
+        let edited = member(
+            &f,
+            "The gate opens at dawn",
+            "distill:edited",
+            Kind::Fact,
+            0.9,
+        );
+        f.h.submit_blocking(WriteOp::Update {
+            id: edited.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                title: Some("The gate".into()),
+                ..Default::default()
+            },
+            actor: Actor::Agent(CAPTURE_AGENT.into()),
+        })
+        .unwrap();
+        let (next, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The gate opens at noon, not at dawn",
+                "distill:next",
+                Kind::Fact,
+                0.96,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(
+            &f,
+            &next,
+            vec![JudgeAction::Contradicts {
+                other: edited.clone(),
+                p: 0.8,
+            }],
+            false,
+            3,
+        );
+        assert_ne!(status(&edited), "trashed", "protected");
+        assert_eq!(status(&weak), "trashed", "the weakest that may go instead");
+        assert_eq!(cap_forgets(&f), 2);
+    }
+
+    /// Task 12c review 2, N1: a distilled newcomer the judge gives up on in bulk
+    /// (`RequeueJudgeRetries`, after `max_attempts` counted failures) settles live, so it evicts
+    /// as a judged one does, in the same op: its session's set keeps its size.
+    #[test]
+    fn a_distilled_newcomer_the_judge_gives_up_on_evicts_too() {
+        let f = fixture();
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        member(
+            &f,
+            "The cache keeps its data in memory only",
+            "distill:y",
+            Kind::Fact,
+            0.9,
+        );
+        member(
+            &f,
+            "Invoices go out on Fridays",
+            "distill:z",
+            Kind::Fact,
+            0.85,
+        );
+        let (new, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The cache service listens on its own port",
+                "distill:new",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(&f, &new, Vec::new(), true, 3);
+        assert_eq!(cap_forgets(&f), 0, "retry");
+        f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
+            max_attempts: 1,
+            now: "2099-01-01T00:00:00.000Z".into(),
+            distill: Some(cap_of(3)),
+        })
+        .unwrap();
+        let (state, status): (String, String) = (
+            f.read("SELECT judge_state FROM memories WHERE id = ?1", [&new]),
+            f.read("SELECT status FROM memories WHERE id = ?1", [&new]),
+        );
+        assert_eq!((state.as_str(), status.as_str()), ("done", "active"));
+        let weak_status: String = f.read("SELECT status FROM memories WHERE id = ?1", [&weak]);
+        assert_eq!(weak_status, "trashed");
+        assert_eq!(cap_forgets(&f), 1);
+    }
+
+    /// Task 12c review 2, N2: a judgement of a distilled newcomer that does not carry the
+    /// distillation settings would skip eviction in silence; a debug build stops on it (a
+    /// release build warns). Applied on this thread: the writer's own would die with it. Debug
+    /// builds only: under `cargo test --release` the assert is off and nothing panics.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "carries the distillation settings")]
+    fn a_judgement_of_a_distilled_newcomer_needs_the_distillation_settings() {
+        let d = tempfile::tempdir().unwrap();
+        let conn = alice_core::store::open_writer(&d.path().join("a.db")).unwrap();
+        let mut st = State {
+            hlc: Hlc::new("test"),
+            matcher: None,
+            inserted: false,
+            reembed_target: None,
+            chunk_budget: INGEST_SLICE,
+            byte_budget: INGEST_SLICE_BYTES,
+            stream: Vec::new(),
+            redactors: Redactors::fixed(alice_core::settings::PrivacySettings::default()),
+            applied: Vec::new(),
+            commit_log: None,
+        };
+        let WriteOp::Distilled {
+            input,
+            project,
+            p,
+            subagent,
+        } = distilled_op(
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.9,
+            "S1",
+        )
+        else {
+            unreachable!()
+        };
+        let (id, seq) = new_id(distilled(&conn, input, &project, p, subagent, &mut st).unwrap());
+        let (stamp, updated_at): (String, String) = conn
+            .query_row(
+                "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        apply_judgement(
+            &conn,
+            &mut st,
+            Judgement {
+                seq,
+                id,
+                stamp,
+                updated_at,
+                provider: "jev".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    /// Review I1, option b: a newcomer waiting for the judge (`pending`, or `retry` after an
+    /// outage) evicts nothing yet, and does not count toward the set.
+    #[test]
+    fn a_newcomer_waiting_for_the_judge_evicts_nothing_yet() {
+        let f = fixture();
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        member(
+            &f,
+            "The cache keeps its data in memory only",
+            "distill:y",
+            Kind::Fact,
+            0.9,
+        );
+        member(
+            &f,
+            "Invoices go out on Fridays",
+            "distill:z",
+            Kind::Fact,
+            0.85,
+        );
+        let (new, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The cache service listens on its own port",
+                "distill:new",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        assert_eq!(cap_forgets(&f), 0, "pending");
+        verdict(&f, &new, Vec::new(), true, 3);
+        let state: String = f.read("SELECT judge_state FROM memories WHERE id = ?1", [&new]);
+        assert_eq!(state, "retry");
+        assert_eq!(cap_forgets(&f), 0, "retry");
+        let status: String = f.read("SELECT status FROM memories WHERE id = ?1", [&weak]);
+        assert_ne!(status, "trashed");
+    }
+
+    /// SP2 spec §3.9 and R11: retention that deletes a capture source's last chunk keeps the
+    /// source with its capture state (the cursor) and its turn keys, so the file is not captured
+    /// again and the importer still skips the session.
+    #[test]
+    fn deleting_a_sources_chunks_keeps_its_state_and_turn_keys() {
+        let f = fixture();
+        let mut s = capture_slice("S1", global(), 0..2);
+        s.turn_keys = vec![("u-1".into(), 0), ("u-2".into(), 1)];
+        s.cursor = Some((900, 2));
+        let (source_id, _) = captured(f.h.submit_blocking(capture(&s)));
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        let seqs: Vec<i64> = c
+            .prepare("SELECT seq FROM chunks WHERE source_id = ?1 ORDER BY seq")
+            .unwrap()
+            .query_map([&source_id], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(seqs.len(), 2);
+        let WriteOutcome::Purged(done) =
+            f.h.submit_blocking(WriteOp::DeleteChunks { seqs: seqs.clone() })
+                .unwrap()
+        else {
+            panic!("expected Purged")
+        };
+        assert_eq!(done, seqs);
+        assert!(
+            capture_store::by_uri(&c, &capture_uri("S1"))
+                .unwrap()
+                .is_some()
+        );
+        let states: i64 = f.read(
+            "SELECT count(*) FROM capture_state WHERE source_id = ?1",
+            [&source_id],
+        );
+        assert_eq!(states, 1, "the state stays with its emptied source");
+        let sources: i64 = f.read("SELECT count(*) FROM sources WHERE id = ?1", [&source_id]);
+        assert_eq!(sources, 1);
+        assert_eq!(known(&c, &["u-1", "u-2"]), known_set(&["u-1", "u-2"]));
+    }
+
+    /// `CaptureStateUpdate`: each change sets its own fields; `due` lists a due source once its
+    /// next try has come; an unknown source changes nothing.
+    #[test]
+    fn capture_state_updates_change_their_fields_and_due_follows_them() {
+        let f = fixture();
+        let mut s = capture_slice("S1", global(), 0..2);
+        s.cursor = Some((500, 2));
+        let (source_id, _) = captured(f.h.submit_blocking(capture(&s)));
+        let update = |id: &str, change: CaptureChange| -> usize {
+            match f.h.submit_blocking(WriteOp::CaptureStateUpdate {
+                source_id: id.into(),
+                change,
+            }) {
+                Ok(WriteOutcome::Count(n)) => n,
+                other => panic!("expected Count, got {other:?}"),
+            }
+        };
+        let c = alice_core::store::open_reader(&f.db()).unwrap();
+        let state = || capture_store::by_source(&c, &source_id).unwrap().unwrap();
+
+        let at = "2026-10-16T12:00:00.000Z";
+        let changed = update(
+            &source_id,
+            CaptureChange::Distill {
+                state: DistillState::Due,
+                next_try_at: Some(at.into()),
+                attempts: 2,
+            },
+        );
+        assert_eq!(changed, 1);
+        let st = state();
+        assert_eq!(
+            (
+                st.distill_state,
+                st.distill_next_try_at.as_deref(),
+                st.distill_attempts
+            ),
+            (DistillState::Due, Some(at), 2)
+        );
+        assert!(
+            capture_store::due(&c, "2026-10-16T11:59:59.999Z", 10)
+                .unwrap()
+                .is_empty(),
+            "not before its next try"
+        );
+        let due = capture_store::due(&c, at, 10).unwrap();
+        assert_eq!(
+            due.iter().map(|d| d.source_id.as_str()).collect::<Vec<_>>(),
+            [source_id.as_str()]
+        );
+
+        update(&source_id, CaptureChange::Distilled { distill_ord: 2 });
+        assert_eq!(state().distill_ord, 2);
+        update(&source_id, CaptureChange::Gap { byte_offset: 9000 });
+        let st = state();
+        assert_eq!((st.byte_offset, st.gaps), (9000, 1));
+        update(
+            &source_id,
+            CaptureChange::FileKey {
+                file_key: "1:2:abc".into(),
+                byte_offset: 0,
+            },
+        );
+        let st = state();
+        assert_eq!(
+            (st.file_key.as_deref(), st.byte_offset, st.next_ord),
+            (Some("1:2:abc"), 0, 2),
+            "a replaced file resets the offset, not the ords"
+        );
+        let open = |c: &Connection| -> bool {
+            capture_store::open_sources(c)
+                .unwrap()
+                .iter()
+                .any(|o| o.source_id == source_id)
+        };
+        assert!(open(&c));
+        update(&source_id, CaptureChange::Ended);
+        assert!(state().ended);
+        assert!(!open(&c));
+        assert_eq!(
+            update("01K7NOSUCHSOURCE0000000000", CaptureChange::Ended),
+            0
+        );
+    }
+
+    /// A capture slice is written whole, within the ingest slice budget: it joins a commit only
+    /// when it fits what is left of it, so two 30-chunk slices never share one.
+    #[tokio::test]
+    async fn capture_slices_share_the_ingest_budget_and_are_never_split() {
+        let d = tempfile::tempdir().unwrap();
+        let conn = open(d.path());
+        let (wake_tx, _wake_rx) = crossbeam_channel::unbounded();
+        let log: CommitLog = Arc::new(Mutex::new(Vec::new()));
+        let (h, _t) = spawn_writer_logged(conn, "dev".into(), wake_tx, log.clone());
+        let ing = h.submit(ingest("many", 120, |i| format!("short {i}")));
+        let a = h.submit(capture(&capture_slice("A", global(), 0..30)));
+        let b = h.submit(capture(&capture_slice("B", global(), 0..30)));
+        let (ing, a, b) = tokio::join!(ing, a, b);
+        assert_eq!(ingested(ing).inserted, 120);
+        assert_eq!((captured(a).1, captured(b).1), (30, 30));
+        let log = log.lock();
+        let slices: usize = log
+            .iter()
+            .map(|c| c.iter().filter(|n| **n == "CaptureSlice").count())
+            .sum();
+        assert_eq!(slices, 2, "each slice is written once, whole: {log:?}");
+        assert!(
+            log.iter()
+                .all(|c| c.iter().filter(|n| **n == "CaptureSlice").count() <= 1),
+            "two slices shared a commit: {log:?}"
+        );
     }
 }

@@ -22,6 +22,9 @@ struct Detector {
     group: usize,
     /// Extra test on the replaced text (false = not a secret).
     check: fn(&str) -> bool,
+    /// A built-in detector, not a custom pattern: text that leaves for a cloud service is
+    /// redacted by it whatever the allowlist says ([`Redactor::for_egress`]).
+    builtin: bool,
 }
 
 /// A compiled set of detectors. Build it once and share it; compiling costs milliseconds.
@@ -30,6 +33,8 @@ pub struct Redactor {
     mode: RedactMode,
     detectors: Vec<Detector>,
     allow: Vec<Regex>,
+    /// Whether the allowlist exempts a built-in detector's match (not for egress).
+    allow_builtin: bool,
 }
 
 impl std::fmt::Debug for Redactor {
@@ -228,6 +233,7 @@ fn builtin_detectors() -> Vec<Detector> {
         re: Regex::new(re).expect("built-in pattern"),
         group,
         check,
+        builtin: true,
     };
     vec![
         d(
@@ -237,13 +243,16 @@ fn builtin_detectors() -> Vec<Detector> {
             any,
         ),
         // The tail of a key whose `BEGIN` line is in an earlier piece (a chunk cut by size):
-        // the text starts with its base64 lines and ends the key.
-        d("pem_private_key", KEY_TAIL, 0, any),
+        // the text starts with its base64 lines and ends the key. A rendered chunk's tag
+        // (`[user] (cont.) `) may come first; it is kept.
+        d("pem_private_key", KEY_TAIL, 1, any),
         // A key's body cut from both its lines: three or more base64 lines of a key's width.
+        // The first may follow a rendered chunk's tag (`[user] `, `[user] (cont.) `), which is
+        // kept: a chunk that starts with a key's lines would otherwise send its first line.
         d(
             "base64_block",
-            r"(?m)(?:^[ \t]*[A-Za-z0-9+/]{60,76}={0,2}[ \t]*\r?(?:\n|\z)){3,}",
-            0,
+            r"(?m)^(?:\[[^\]\n]+\] (?:\(cont\.\) )?)?((?:[ \t]*[A-Za-z0-9+/]{60,76}={0,2}[ \t]*\r?(?:\n|\z)){3,})",
+            1,
             not_hex_only,
         ),
         d(
@@ -340,15 +349,26 @@ fn builtin_detectors() -> Vec<Detector> {
     ]
 }
 
-/// Base64 lines (and the headers of an encrypted key) at the very start of a text, then the
-/// `END` line of a private key.
-const KEY_TAIL: &str = r"\A\s*(?:(?:Proc-Type|DEK-Info):[^\n]*\n\s*)*(?:[A-Za-z0-9+/=]+[ \t]*\r?\n\s*)*[A-Za-z0-9+/=]*\s*-----END [A-Z ]*PRIVATE KEY-----";
+/// Base64 lines (and the headers of an encrypted key) at the very start of a text, after the
+/// tag of a rendered chunk if it has one, then the `END` line of a private key (group 1).
+const KEY_TAIL: &str = r"\A(?:\[[^\]\n]+\] (?:\(cont\.\) )?)?(\s*(?:(?:Proc-Type|DEK-Info):[^\n]*\n\s*)*(?:[A-Za-z0-9+/=]+[ \t]*\r?\n\s*)*[A-Za-z0-9+/=]*\s*-----END [A-Z ]*PRIVATE KEY-----)";
 
-/// What a piece that continues a private key starts with: its base64 lines (and the headers of
-/// an encrypted key), through the key's `END` line when it is there.
+/// What a piece that continues a private key starts with: the tag of a rendered chunk if it has
+/// one (group 1, kept), then the key's base64 lines (and the headers of an encrypted key),
+/// through its `END` line when it is there.
 static KEY_CONTINUED: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(r"\A\s*(?:(?:Proc-Type|DEK-Info):[^\n]*(?:\n\s*|\z))*(?:[A-Za-z0-9+/=]+[ \t]*(?:\r?\n\s*|\z))*(?:-----END [A-Z ]*PRIVATE KEY-----)?")
+    Regex::new(r"\A((?:\[[^\]\n]+\] (?:\(cont\.\) )?)?)\s*(?:(?:Proc-Type|DEK-Info):[^\n]*(?:\n\s*|\z))*(?:[A-Za-z0-9+/=]+[ \t]*(?:\r?\n\s*|\z))*(?:-----END [A-Z ]*PRIVATE KEY-----)?")
         .expect("built-in pattern")
+});
+
+/// The key lines after a private key's `BEGIN` marker: the rest of its line, then every line
+/// that holds base64 only (or an encrypted key's header, or nothing). Where a key with no `END`
+/// line ends for [`Redactor::spans`].
+static KEY_LINES: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(
+        r"(?m)\A[^\n]*(?:\n[ \t]*(?:(?:Proc-Type|DEK-Info):[^\n]*|[A-Za-z0-9+/=]*[ \t]*\r?)$)*",
+    )
+    .expect("built-in pattern")
 });
 
 static KEY_LINE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
@@ -379,7 +399,43 @@ impl Redactor {
             mode: p.redact_mode,
             detectors: builtin_detectors(),
             allow: Vec::new(),
+            allow_builtin: true,
         }
+    }
+
+    /// The built-in detectors with the default settings, compiled once for the process: what
+    /// finds secrets where no project's rules are at hand (a derived title, a capture read
+    /// without a redactor).
+    pub fn builtin_shared() -> &'static Self {
+        static BUILTIN: std::sync::LazyLock<Redactor> = std::sync::LazyLock::new(Redactor::builtin);
+        &BUILTIN
+    }
+
+    /// This redactor for text that leaves for a cloud service (re-review N3): switched on
+    /// whatever `privacy.redact` says, and its allowlist no longer exempts a built-in
+    /// detector's match (it still exempts a custom pattern's). A person who keeps secrets as
+    /// written, or who allowlisted every value, still sends no key, password or private key of
+    /// a kind Alice knows.
+    ///
+    /// ```
+    /// use alice_core::redact::Redactor;
+    /// use alice_core::settings::PrivacySettings;
+    ///
+    /// let p = PrivacySettings {
+    ///     redact: false,
+    ///     allowlist: vec!["(?s).*".into()],
+    ///     ..Default::default()
+    /// };
+    /// let text = "password = hunter22x";
+    /// assert_eq!(Redactor::new(&p).unwrap().apply(text).text, text);
+    /// let egress = Redactor::new(&p).unwrap().for_egress();
+    /// assert_eq!(egress.apply(text).text, "password = [REDACTED:password_assignment]");
+    /// ```
+    #[must_use]
+    pub fn for_egress(mut self) -> Self {
+        self.enabled = true;
+        self.allow_builtin = false;
+        self
     }
 
     /// The detectors for `p`: the built-in ones, then its custom patterns. A custom pattern
@@ -396,6 +452,7 @@ impl Redactor {
                     re,
                     group: 0,
                     check: any,
+                    builtin: false,
                 }),
                 Ok(_) => tracing::warn!(
                     pattern = %c.name,
@@ -427,6 +484,7 @@ impl Redactor {
             mode: p.redact_mode,
             detectors,
             allow,
+            allow_builtin: true,
         })
     }
 
@@ -453,10 +511,7 @@ impl Redactor {
             for caps in d.re.captures_iter(&out) {
                 let Some(m) = caps.get(d.group) else { continue };
                 let value = m.as_str();
-                if value.is_empty()
-                    || !(d.check)(value)
-                    || self.allow.iter().any(|a| a.is_match(value))
-                {
+                if value.is_empty() || !(d.check)(value) || self.allowed(d, value) {
                     continue;
                 }
                 let r = result.get_or_insert_with(|| String::with_capacity(out.len()));
@@ -476,6 +531,67 @@ impl Redactor {
             text: out.into_owned(),
             found,
         }
+    }
+
+    /// Whether the allowlist exempts `value`, a match of `d`.
+    fn allowed(&self, d: &Detector, value: &str) -> bool {
+        (self.allow_builtin || !d.builtin) && self.allow.iter().any(|a| a.is_match(value))
+    }
+
+    /// The byte ranges of `text` that hold a secret, as the detectors find it in this text:
+    /// each match whole (a keyword or a URL's scheme and user name with the value they
+    /// introduce, a private key from its `BEGIN` line), sorted, overlapping ones merged. A key
+    /// with no `END` line spans its `BEGIN` line and the key lines after it, not the rest of
+    /// the text.
+    ///
+    /// It ignores the switch and the allowlist. Capture asks it in every mode, so that no trim
+    /// or cut falls inside a secret (re-review N1): a cut that separates a value from the
+    /// context its detector needs (`:Thailand-2026@db.internal` without its `postgres://ops`)
+    /// leaves text no detector knows, and a cloud request redacts each stored chunk on its own.
+    ///
+    /// ```
+    /// use alice_core::redact::Redactor;
+    ///
+    /// let text = concat!("url postgres://ops:Thai", "land-2026@db.internal:5432/app ok");
+    /// let spans = Redactor::builtin().spans(text);
+    /// assert_eq!(spans.len(), 1);
+    /// assert_eq!(&text[spans[0].clone()], concat!("postgres://ops:Thai", "land-2026@"));
+    /// ```
+    pub fn spans(&self, text: &str) -> Vec<std::ops::Range<usize>> {
+        let mut found: Vec<std::ops::Range<usize>> = Vec::new();
+        for d in &self.detectors {
+            for caps in d.re.captures_iter(text) {
+                let (Some(whole), Some(value)) = (caps.get(0), caps.get(d.group)) else {
+                    continue;
+                };
+                if value.as_str().is_empty() || !(d.check)(value.as_str()) {
+                    continue;
+                }
+                let mut range = whole.range();
+                let matched = whole.as_str();
+                if matched.starts_with("-----BEGIN")
+                    && !matched.contains("-----END")
+                    && let Some(marker) = KEY_LINE.find_at(text, range.start)
+                {
+                    let after = &text[marker.end()..];
+                    let lines = KEY_LINES.find(after).map_or(0, |m| m.end());
+                    let lines = after[..lines].trim_end().len();
+                    range.end = range.end.min(marker.end() + lines).max(marker.end());
+                }
+                if !range.is_empty() {
+                    found.push(range);
+                }
+            }
+        }
+        found.sort_by_key(|r| (r.start, r.end));
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(found.len());
+        for r in found {
+            match merged.last_mut() {
+                Some(last) if r.start < last.end => last.end = last.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        merged
     }
 
     /// [`apply`](Self::apply) for the next of consecutive pieces of one text (the chunks of one
@@ -500,23 +616,31 @@ impl Redactor {
             *open = ends_inside_key(text);
             return self.apply(text);
         }
-        let head = if *open {
-            KEY_CONTINUED.find(text).map_or(0, |m| m.end())
+        // A rendered chunk's tag (`[user] (cont.) `) is kept in front of the key's rest.
+        let continued = if *open {
+            KEY_CONTINUED.captures(text)
         } else {
-            0
+            None
         };
-        let (key, rest) = text.split_at(head);
+        let (lead, head) = match continued {
+            Some(c) => (
+                c.get(1).map_or(0, |m| m.end()),
+                c.get(0).map_or(0, |m| m.end()),
+            ),
+            None => (0, 0),
+        };
+        let (tag, key, rest) = (&text[..lead], &text[lead..head], &text[head..]);
         let whole = head == text.len();
         *open = (whole && !key.contains("-----END")) || ends_inside_key(rest);
         let mut out = self.apply(rest);
         if !key.trim().is_empty() {
             let name = "pem_private_key".to_string();
-            out.text = format!("[REDACTED:{name}]{}", out.text);
+            out.text = format!("{tag}[REDACTED:{name}]{}", out.text);
             if !out.found.contains(&name) {
                 out.found.insert(0, name);
             }
         } else {
-            out.text = format!("{key}{}", out.text);
+            out.text = format!("{tag}{key}{}", out.text);
         }
         out
     }
@@ -1036,6 +1160,88 @@ mod tests {
             &body.join("\n")[64 * 24 + 30..]
         );
         assert!(key_leaks(&r.apply(&cut).text, &body[25..]).is_empty());
+    }
+
+    /// Re-review N1: a stored chunk starts with its tag (`[user] `, `[user] (cont.) `), which
+    /// used to hide a key's first line from the line-anchored detectors. The tag is kept.
+    #[test]
+    fn a_chunk_tag_in_front_of_a_key_hides_none_of_it() {
+        let r = Redactor::builtin();
+        let (_, body) = fake_key(26);
+        for tag in ["[user] ", "[user] (cont.) ", "[result] (cont.) "] {
+            let lines = format!("{tag}{}\nand prose", body[3..6].join("\n"));
+            let out = r.apply(&lines);
+            assert_eq!(out.found, ["base64_block"], "{tag}");
+            assert!(key_leaks(&out.text, &body[3..6]).is_empty(), "{}", out.text);
+            assert!(out.text.starts_with(tag) && out.text.ends_with("and prose"));
+
+            let tail = format!(
+                "{tag}{}\n-----END RSA PRIVATE KEY-----\nafter",
+                body[22..].join("\n")
+            );
+            let out = r.apply(&tail);
+            assert!(key_leaks(&out.text, &body[22..]).is_empty(), "{}", out.text);
+            assert!(
+                out.text
+                    .starts_with(&format!("{tag}[REDACTED:pem_private_key]"))
+            );
+
+            // As the next of two pieces, after one that ends inside the key.
+            let mut open = true;
+            let out = r.apply_piece(&format!("{tag}{}", body[24..].join("\n")), &mut open);
+            assert!(key_leaks(&out.text, &body[24..]).is_empty(), "{}", out.text);
+            assert_eq!(out.text, format!("{tag}[REDACTED:pem_private_key]"));
+            assert!(open, "the key goes on");
+        }
+    }
+
+    #[test]
+    fn spans_cover_each_secret_with_its_context() {
+        let r = Redactor::builtin();
+        let text = concat!(
+            "db postgres://ops:Thai",
+            "land-2026@db.internal and\n  password: VGhh",
+            "aWxhbmQtMjAy\nkey -----BEGIN RSA PRIVATE ",
+            "KEY-----\nMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun\n",
+            "-----END RSA PRIVATE KEY----- done"
+        );
+        let got: Vec<&str> = r.spans(text).into_iter().map(|s| &text[s]).collect();
+        assert_eq!(got.len(), 3, "{got:#?}");
+        assert!(got[0].starts_with("postgres://ops:") && got[0].ends_with('@'));
+        assert!(got[1].starts_with("password: ") && got[1].ends_with("MjAy"));
+        assert!(got[2].starts_with("-----BEGIN") && got[2].ends_with("PRIVATE KEY-----"));
+        // The switch and the allowlist do not hide a secret from the cuts.
+        let off = Redactor::new(&PrivacySettings {
+            redact: false,
+            allowlist: vec!["(?s).*".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(off.spans(text), r.spans(text));
+        // Code and prose hold none.
+        assert!(
+            r.spans("let password = get_password(); see /usr/lib/x")
+                .is_empty()
+        );
+    }
+
+    /// Re-review N3: the allowlist is an exception for storage; egress keeps a built-in
+    /// detector's match redacted and only a custom pattern's exception.
+    #[test]
+    fn egress_keeps_the_allowlist_for_custom_patterns_only() {
+        let p = PrivacySettings {
+            allowlist: vec!["(?s).*".into()],
+            custom_patterns: vec![CustomPattern {
+                name: "ticket".into(),
+                regex: "TCK-[0-9]{4,}".into(),
+            }],
+            ..Default::default()
+        };
+        let text = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 TCK-1234");
+        assert_eq!(Redactor::new(&p).unwrap().apply(text).text, text);
+        let out = Redactor::new(&p).unwrap().for_egress().apply(text);
+        assert_eq!(out.found, ["github_token"]);
+        assert!(out.text.ends_with(" TCK-1234"));
     }
 
     #[test]

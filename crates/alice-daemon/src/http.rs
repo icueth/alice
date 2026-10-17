@@ -5,7 +5,7 @@ use crate::service::{Scoped, Service};
 use alice_core::api::*;
 use alice_core::error::AliceError;
 use alice_core::settings::SettingError;
-use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::rejection::{BytesRejection, JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -603,6 +603,163 @@ async fn compat_call(
     }
 }
 
+/// The project hint of a capture request, read as the MCP path reads it
+/// (`mcp::project_header`, `mcp::check_project_name`): the `X-Alice-Project` header, which wins
+/// over the `project` query parameter, each refused over the name limits and each with its
+/// control characters removed (`query` is cleaned in place). Only a tenant reads either, as MCP
+/// does; a local daemon takes the project from `cwd` (plan decision P8), so the header is not
+/// read there. Returns the header's name; the query's stays where it is.
+fn capture_hint(
+    svc: &Service,
+    headers: &HeaderMap,
+    query: &mut Option<String>,
+) -> Result<Option<String>, ApiError> {
+    if !svc.is_tenant() {
+        return Ok(None);
+    }
+    if let Some(q) = query.as_mut() {
+        *q = crate::mcp::strip_controls(q);
+    }
+    let header = crate::mcp::project_header(headers)?;
+    match (&header, query.as_deref().filter(|q| !q.trim().is_empty())) {
+        (Some(h), _) => crate::mcp::check_project_name(h, crate::mcp::FROM_PROJECT_HEADER)?,
+        (None, Some(q)) => crate::mcp::check_project_name(q, crate::mcp::FROM_PROJECT_QUERY)?,
+        (None, None) => {}
+    }
+    Ok(header)
+}
+
+/// `POST /api/v1/capture/transcript` (SP2 spec §5.2): a transcript's bytes from `offset`.
+/// `200` with what was captured; `409 {"next_offset": <cursor>}` when `offset` is below the
+/// source's cursor (nothing read: the client jumps and sends again); `400` for a bad query;
+/// `413` over the route's 8 MiB body limit.
+async fn capture_transcript(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<TranscriptQuery>, QueryRejection>,
+    body: Result<axum::body::Bytes, BytesRejection>,
+) -> Response {
+    let Query(mut q) = match query {
+        Ok(q) => q,
+        Err(r) => {
+            return ApiError(AliceError::Invalid(format!(
+                "{}; use /api/v1/capture/transcript?agent=claude-code&session=<id>&offset=<byte offset of the body>&event=<event>",
+                r.body_text()
+            )))
+            .into_response();
+        }
+    };
+    q.project_header = match capture_hint(&st.svc, &headers, &mut q.project) {
+        Ok(h) => h,
+        Err(e) => return e.into_response(),
+    };
+    let body = match body {
+        Ok(b) => b,
+        Err(r) if r.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return refuse(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                format!(
+                    "the upload is over the 8 MiB limit of a transcript upload; send at most {TRANSCRIPT_BODY_LIMIT} bytes from the offset, and the rest from the next_offset the answer gives"
+                ),
+            );
+        }
+        Err(r) => {
+            return ApiError(AliceError::Invalid(format!(
+                "{}; send the transcript's bytes from the offset as the body",
+                r.body_text()
+            )))
+            .into_response();
+        }
+    };
+    match st.svc.capture_transcript(q, body).await {
+        Ok(Ok(answer)) => Json(answer).into_response(),
+        Ok(Err(cursor)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "next_offset": cursor })),
+        )
+            .into_response(),
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
+/// `POST /api/v1/capture/notify` (SP2 spec §4.2): `202 {"queued": true}` at once; the daemon
+/// reads the transcript later. `400` for a bad notification, and on a server tenant.
+async fn capture_notify(
+    State(st): State<AppState>,
+    ApiJson(n): ApiJson<CaptureNotify>,
+) -> Result<Response, ApiError> {
+    st.svc.capture_notify(n).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "queued": true })),
+    )
+        .into_response())
+}
+
+/// `GET /api/v1/capture/status`.
+async fn capture_status(State(st): State<AppState>) -> ApiResult<CaptureStatus> {
+    Ok(Json(st.svc.capture_status().await?))
+}
+
+/// `POST /api/v1/capture/distill` (SP2 spec §8.2): `{session_id}` or `{source_id}`; that
+/// session becomes due for distillation now. `404` when nothing captured answers to it.
+async fn capture_distill(
+    State(st): State<AppState>,
+    ApiJson(r): ApiJson<CaptureDistillRequest>,
+) -> ApiResult<CaptureDistillAnswer> {
+    let id = r
+        .source_id
+        .or(r.session_id)
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError(AliceError::invalid(
+                "name the session: send {\"session_id\": \"<id>\"} or {\"source_id\": \"<id>\"}",
+            ))
+        })?;
+    Ok(Json(CaptureDistillAnswer {
+        due: st.svc.capture_distill(&id).await?,
+    }))
+}
+
+/// `GET /api/v1/capture/briefing` (SP2 spec §5.7): `200 text/plain; charset=utf-8` with the
+/// briefing, or `204` when there is none to give.
+async fn capture_briefing(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<BriefingQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(mut q) = query.map_err(|r| {
+        ApiError(AliceError::Invalid(format!(
+            "{}; use /api/v1/capture/briefing?source=<source>&project=<name> (or cwd=<dir> on a local daemon)",
+            r.body_text()
+        )))
+    })?;
+    q.project_header = capture_hint(&st.svc, &headers, &mut q.project)?;
+    Ok(match st.svc.capture_briefing(q).await? {
+        Some(text) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
+}
+
+/// The tenant capture scripts (SP2 spec §5.3, §5.4), compiled in. They hold no secret and no
+/// address: the setup script takes the tenant's URL as its argument and the token from a file
+/// or the terminal.
+const SETUP_SH: &str = include_str!("../scripts/capture/setup.sh");
+const HOOK_SH: &str = include_str!("../scripts/capture/hook.sh");
+
+/// A capture script as plain text, never cached (a re-run of setup must get this version's).
+fn capture_script(text: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        text,
+    )
+        .into_response()
+}
+
 /// The upload script a person runs on their own machine: static text compiled into the binary,
 /// with no secret and no address in it. Only a server tenant serves it.
 const UPLOAD_SCRIPT: &str = include_str!("../assets/upload.sh");
@@ -620,6 +777,37 @@ async fn upload_script(State(st): State<AppState>) -> Response {
         UPLOAD_SCRIPT,
     )
         .into_response()
+}
+
+/// `GET /api/v1/capture/setup.sh`: public, like the ping (the one pasted command fetches it
+/// before any token is known), behind the Host and Origin guard.
+async fn capture_setup_script() -> Response {
+    capture_script(SETUP_SH)
+}
+
+/// `GET /api/v1/capture/hook.sh`: public; `setup.sh` installs it as
+/// `~/.config/alice/alice-capture.sh`.
+async fn capture_hook_script() -> Response {
+    capture_script(capture_hook_text())
+}
+
+/// The version line of `hook.sh` as committed; the route stamps it.
+const HOOK_VERSION_UNSTAMPED: &str = "\n# alice-capture-version: unstamped\n";
+
+/// The hook script as `GET /api/v1/capture/hook.sh` serves it: its version line holds the first
+/// 12 hex digits of the SHA-256 of the compiled-in text, so a client that updates itself sees a
+/// new version exactly when the script changed (SP2 spec §5.3).
+pub fn capture_hook_text() -> &'static str {
+    static SERVED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        use sha2::Digest;
+        let digest = hex::encode(sha2::Sha256::digest(HOOK_SH.as_bytes()));
+        HOOK_SH.replacen(
+            HOOK_VERSION_UNSTAMPED,
+            &format!("\n# alice-capture-version: {}\n", &digest[..12]),
+            1,
+        )
+    });
+    &SERVED
 }
 
 async fn import_status(State(st): State<AppState>) -> Json<alice_core::import::ImportStatus> {
@@ -773,6 +961,9 @@ async fn settings_flags(State(st): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "mcp.admin_tools": settings.mcp.admin_tools,
         "compat.mempalace": settings.compat.mempalace,
+        // Whether this store redacts what it stores (the team store always does): the setup
+        // guides write the matching secrets line into the agents' instructions.
+        "privacy.redact": settings.privacy.redact || st.svc.is_team_store(),
     }))
 }
 
@@ -932,8 +1123,8 @@ async fn end_on_rotation(State(st): State<AppState>, req: Request, next: Next) -
     Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
-/// Build the router: the public ping and upload script, and everything else (the JSON API and the MCP service
-/// at `/mcp`) behind the token, Host and Origin guard.
+/// Build the router: the public ping, upload script and capture scripts, and everything else (the JSON API
+/// and the MCP service at `/mcp`) behind the token, Host and Origin guard.
 pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: CancellationToken) -> Router {
     let token: SharedToken = Arc::new(parking_lot::RwLock::new(Arc::from(token)));
     let g = Guard::new(token.clone(), port);
@@ -946,6 +1137,8 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
     };
     let public = Router::new()
         .route("/api/v1/ping", get(ping))
+        .route("/api/v1/capture/setup.sh", get(capture_setup_script))
+        .route("/api/v1/capture/hook.sh", get(capture_hook_script))
         .route("/api/v1/import/upload.sh", get(upload_script))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(g.clone(), host_guard));
@@ -991,6 +1184,15 @@ pub fn router(svc: Arc<Service>, token: String, port: u16, shutdown: Cancellatio
             post(upload_import).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/v1/compat/call", post(compat_call))
+        // The route's own limit: one pass's worth of transcript (the router's is for ingests).
+        .route(
+            "/api/v1/capture/transcript",
+            post(capture_transcript).layer(DefaultBodyLimit::max(TRANSCRIPT_BODY_LIMIT)),
+        )
+        .route("/api/v1/capture/notify", post(capture_notify))
+        .route("/api/v1/capture/status", get(capture_status))
+        .route("/api/v1/capture/distill", post(capture_distill))
+        .route("/api/v1/capture/briefing", get(capture_briefing))
         .route("/api/v1/admin/shutdown", post(admin_shutdown))
         .route("/api/v1/admin/token/rotate", post(rotate_token))
         .with_state(state.clone())
@@ -1212,5 +1414,61 @@ mod tests {
             e["error"].as_str().unwrap().contains("the disk is full"),
             "{e}"
         );
+    }
+
+    /// `POST /api/v1/capture/notify` is behind the token and answers `202 {"queued": true}`; a
+    /// server tenant refuses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_capture_notify_route_queues_behind_the_token() {
+        crate::install_tls();
+        for tenant in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let svc = Service::start(
+                AliceHome::new(d.path().join("home")),
+                &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+                ServiceOptions {
+                    tenant,
+                    ..ServiceOptions::default()
+                },
+            )
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = router(svc, "n".repeat(64), port, CancellationToken::new());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("http://127.0.0.1:{port}/api/v1/capture/notify");
+            let body = CaptureNotify {
+                agent: "claude-code".into(),
+                event: "stop".into(),
+                session_id: "hn1".into(),
+                transcript_path: d.path().join("hn1.jsonl").display().to_string(),
+                ..Default::default()
+            };
+            let http = reqwest::Client::new();
+            let r = http.post(&url).json(&body).send().await.unwrap();
+            assert_eq!(r.status(), 401);
+            let r = http
+                .post(&url)
+                .bearer_auth("n".repeat(64))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            if tenant {
+                assert_eq!(r.status(), 400);
+                let e: serde_json::Value = r.json().await.unwrap();
+                assert!(
+                    e["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("cannot read files on your machine"),
+                    "{e}"
+                );
+            } else {
+                assert_eq!(r.status(), 202);
+                let v: serde_json::Value = r.json().await.unwrap();
+                assert_eq!(v, serde_json::json!({ "queued": true }));
+            }
+        }
     }
 }

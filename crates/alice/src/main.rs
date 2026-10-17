@@ -1,7 +1,9 @@
 //! `alice`: long-term memory for AI coding agents.
 
+mod backfill;
 mod bench;
 mod cmd;
+mod hook;
 
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
@@ -96,12 +98,22 @@ enum Command {
     Daemon(cmd::DaemonCmd),
     /// Run the MCP server on stdio (configure agents to launch `alice mcp`).
     Mcp,
+    /// Agent hook (Claude Code, Codex): tell the daemon a session's transcript grew, and print
+    /// the briefing at SessionStart. Reads the hook's JSON on stdin and always exits 0.
+    Hook(cmd::HookArgs),
+    /// Capture hooks: add, remove or check Alice's entries in Claude Code's settings.json or
+    /// Codex's hooks.json (`alice hooks install claude`).
+    #[command(subcommand)]
+    Hooks(cmd::HooksCmd),
     /// Read and change settings (config.toml, applied live) and secrets.
     #[command(subcommand)]
     Config(cmd::ConfigCmd),
     /// Bring memories in from another system (MemPalace).
     #[command(subcommand)]
     Import(cmd::ImportCmd),
+    /// Captured agent sessions: their status, and distilling one now.
+    #[command(subcommand)]
+    Capture(cmd::CaptureCmd),
     /// Embedding model management.
     #[command(subcommand)]
     Model(cmd::ModelCmd),
@@ -134,6 +146,11 @@ fn log_filter(spec: Option<&str>, is_server: bool) -> tracing_subscriber::EnvFil
 }
 
 fn main() -> std::process::ExitCode {
+    // `alice hook` runs at every turn of an agent, within 100 ms, and never fails: it starts
+    // before the tracing subscriber and the CLI runtime, and parses its own arguments.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "hook") {
+        return hook::main();
+    }
     let cli = Cli::parse();
     alice_daemon::install_tls();
     let is_server = matches!(

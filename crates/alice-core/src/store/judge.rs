@@ -5,6 +5,7 @@
 
 use crate::error::{AliceError, Result};
 use crate::ids::now_rfc3339;
+use crate::judge::jev::LEDGER_ROWS;
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,7 @@ pub fn cache_put(
     Ok(())
 }
 
+/// USD of one ledger row (`provider`) on `day`.
 pub fn spent(conn: &Connection, day: &str, provider: &str) -> Result<f64> {
     Ok(conn
         .query_row(
@@ -57,6 +59,17 @@ pub fn spent(conn: &Connection, day: &str, provider: &str) -> Result<f64> {
         )
         .optional()?
         .unwrap_or(0.0))
+}
+
+/// The Jev judge's spend on `day`: the sum of its rows ([`LEDGER_ROWS`]: the judge's own calls
+/// and distillation's). The budget reservation reads this.
+pub fn judge_spent(conn: &Connection, day: &str) -> Result<f64> {
+    let [judge, distill] = LEDGER_ROWS;
+    Ok(conn.query_row(
+        "SELECT coalesce(sum(usd), 0.0) FROM cost_ledger WHERE day = ?1 AND provider IN (?2, ?3)",
+        params![day, judge, distill],
+        |r| r.get(0),
+    )?)
 }
 
 /// Adds a delta to the day's totals. The sums are checked in Rust inside a savepoint: a total
@@ -183,6 +196,19 @@ pub fn retry_backoff(base: std::time::Duration, failures: u32) -> std::time::Dur
 
 /// The default `base` of [`retry_backoff`].
 pub const RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The distilled memories [`requeue_retries`] gives up on with `max_attempts`, oldest first: the
+/// writer keeps each one's session best set at its size once they settle (SP2 Task 12c review
+/// 2, N1).
+pub fn distilled_giving_up(conn: &Connection, max_attempts: u32) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM memories WHERE judge_state <> 'done' AND judge_state = 'retry'
+           AND judge_attempts >= ?1 AND origin = 'distill' ORDER BY seq",
+    )?;
+    Ok(stmt
+        .query_map([max_attempts], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?)
+}
 
 /// `retry` memories whose time has come (`judge_next_try_at` passed, `now` is an RFC 3339
 /// string) become `pending` for another try; those that failed `max_attempts` times stop
@@ -511,5 +537,33 @@ mod tests {
             (rows.len(), rows[0].calls, rows[0].input_tokens),
             (1, 3, 1_200)
         );
+    }
+
+    #[test]
+    fn the_judges_day_total_sums_its_own_row_and_distillations() {
+        let d = tempfile::tempdir().unwrap();
+        let c = crate::store::open_writer(&d.path().join("a.db")).unwrap();
+        assert_eq!(judge_spent(&c, "2026-10-13").unwrap(), 0.0, "an empty day");
+        let cost = |day: &str, provider: &str, usd: f64| {
+            add_cost(
+                &c,
+                &CostDelta {
+                    day: day.into(),
+                    provider: provider.into(),
+                    calls: 1,
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    usd,
+                },
+            )
+            .unwrap()
+        };
+        cost("2026-10-13", "jev", 0.25);
+        cost("2026-10-13", "jev:distill", 0.5);
+        cost("2026-10-13", "other", 8.0);
+        cost("2026-10-14", "jev:distill", 2.0);
+        assert_eq!(judge_spent(&c, "2026-10-13").unwrap(), 0.75);
+        assert_eq!(spent(&c, "2026-10-13", "jev:distill").unwrap(), 0.5);
+        assert_eq!(judge_spent(&c, "2026-10-14").unwrap(), 2.0, "distill only");
     }
 }

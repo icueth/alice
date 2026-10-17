@@ -482,10 +482,29 @@ impl Default for SearchSettings {
     }
 }
 
-/// Per-agent capture switches (used by SP2).
+/// Capture of agent transcripts (SP2): the master switch, per-agent switches and what is kept.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureSettings {
+    /// Capture agent sessions at all; `false` stops every agent.
+    pub enabled: bool,
+    /// Project slugs whose sessions are never captured.
+    pub excluded_projects: Vec<String>,
+    /// Keep the turns of subagents (sidechains) too.
+    pub include_subagents: bool,
+    /// Keep the agent's thinking blocks (off: they are dropped).
+    pub include_thinking: bool,
+    /// Keep at most this many characters of each tool result (0 to 8000; 0 drops them).
+    pub tool_output_chars: usize,
+    /// Target size of a captured chunk, in characters (500 to 8000).
+    pub chunk_chars: usize,
+    /// Give a new session a short briefing from Alice's memories.
+    pub briefing: bool,
+    /// How long captured transcripts are kept: `forever`, an age such as `90d` (at least
+    /// `1d`), or a total size such as `10GB` (at least `1MB`); the same rules as
+    /// `storage.raw_retention`, applied to captured chunks only.
+    #[schemars(with = "String")]
+    pub raw_retention: Retention,
     /// Capture Claude Code sessions.
     pub claude_code: bool,
     /// Capture Codex sessions.
@@ -503,6 +522,14 @@ pub struct CaptureSettings {
 impl Default for CaptureSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
+            excluded_projects: Vec::new(),
+            include_subagents: true,
+            include_thinking: false,
+            tool_output_chars: 800,
+            chunk_chars: 2000,
+            briefing: true,
+            raw_retention: Retention::Forever,
             claude_code: true,
             codex: true,
             cursor: true,
@@ -578,14 +605,61 @@ impl Default for JudgeSettings {
     }
 }
 
-/// Distillation (used by SP2).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DistillProvider {
+    /// No distillation.
+    #[default]
+    Off,
+    /// TypeSafe Jev (needs `jev_api_key`).
+    Jev,
+}
+
+/// Distillation of captured sessions into memories (SP2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct DistillSettings {
-    /// Who turns sessions into memories (SP2).
-    pub provider: Option<String>,
-    /// The model the distill provider uses (SP2).
+    /// Who turns sessions into memories: `off` or `jev`.
+    pub provider: DistillProvider,
+    /// Reserved and ignored: the model comes from `judge.jev.model`.
     pub model: Option<String>,
+    /// Proposals below this confidence are dropped (0.5 to 0.99).
+    pub min_confidence: f64,
+    /// Most memories kept from one session run (1 to 50).
+    pub max_per_run: usize,
+    /// The size of a session's best set of distilled memories for its first 100 captured turns,
+    /// its subagents' included (2 to 200): a better passage replaces the weakest once the judge
+    /// keeps it. Subagent reports keep at most half of it. The set grows by 8 for each further
+    /// 100 turns, up to `max_per_session_cap`.
+    pub max_per_session: usize,
+    /// The largest a session's best set grows with the session's length (at most 400). Below
+    /// `max_per_session` it is the base: the set does not grow.
+    pub max_per_session_cap: usize,
+    /// Most memories kept from subagent reports in one run (0 to 50).
+    pub max_per_subagent_run: usize,
+    /// Minutes a session must be quiet before it is distilled (1 to 1440).
+    pub idle_minutes: u32,
+    /// Importance given to distilled memories (1 to 3).
+    pub importance: u8,
+    /// Share of the judge's daily budget distillation may use (0.05 to 1).
+    pub budget_share: f64,
+}
+
+impl Default for DistillSettings {
+    fn default() -> Self {
+        Self {
+            provider: DistillProvider::Off,
+            model: None,
+            min_confidence: 0.7,
+            max_per_run: 8,
+            max_per_session: 16,
+            max_per_session_cap: 48,
+            max_per_subagent_run: 2,
+            idle_minutes: 15,
+            importance: 2,
+            budget_share: 0.5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
@@ -1247,7 +1321,7 @@ fn env_safe(
         "embedding.idle_unload" => {
             format!("{var} must be a duration such as 90d, 12h, 15m or 30s")
         }
-        "storage.raw_retention" => format!(
+        "storage.raw_retention" | "capture.raw_retention" => format!(
             "{var} must be forever, an age of at least 1d such as 90d, or a size of at least 1MB such as 10GB"
         ),
         _ => match e.message.split_once(", expected ") {
@@ -1418,18 +1492,82 @@ impl Settings {
             }
         };
 
-        let st = &self.storage;
-        match st.raw_retention {
-            Retention::Age(d) if d < Duration::from_secs(86_400) => e.push(err(
-                "storage.raw_retention",
-                "an age must be at least 1d (did you mean days, such as 90d?)",
-            )),
-            Retention::Size(b) if b < 1_000_000 => e.push(err(
-                "storage.raw_retention",
-                "a size must be at least 1MB (write the unit, such as 10GB)",
-            )),
-            _ => {}
+        for (key, r) in [
+            ("storage.raw_retention", self.storage.raw_retention),
+            ("capture.raw_retention", self.capture.raw_retention),
+        ] {
+            match r {
+                Retention::Age(d) if d < Duration::from_secs(86_400) => e.push(err(
+                    key,
+                    "an age must be at least 1d (did you mean days, such as 90d?)",
+                )),
+                Retention::Size(b) if b < 1_000_000 => e.push(err(
+                    key,
+                    "a size must be at least 1MB (write the unit, such as 10GB)",
+                )),
+                _ => {}
+            }
         }
+
+        let (c, d) = (&self.capture, &self.distill);
+        let mut range = |key: &str, ok: bool, msg: &str| {
+            if !ok {
+                e.push(err(key, msg));
+            }
+        };
+        range(
+            "capture.tool_output_chars",
+            c.tool_output_chars <= 8000,
+            "must be 0 to 8000",
+        );
+        range(
+            "capture.chunk_chars",
+            (500..=8000).contains(&c.chunk_chars),
+            "must be 500 to 8000",
+        );
+        range(
+            "distill.min_confidence",
+            (0.5..=0.99).contains(&d.min_confidence),
+            "must be 0.5 to 0.99",
+        );
+        range(
+            "distill.max_per_run",
+            (1..=50).contains(&d.max_per_run),
+            "must be 1 to 50",
+        );
+        range(
+            "distill.max_per_session",
+            (2..=200).contains(&d.max_per_session),
+            "must be 2 to 200",
+        );
+        range(
+            "distill.max_per_session_cap",
+            d.max_per_session_cap <= 400,
+            "must be at most 400",
+        );
+        // A cap below `max_per_session` is no error: the room never goes below the base
+        // (`distill::room` clamps it), so a base above the default cap still loads (final review
+        // B, 12d concern 4).
+        range(
+            "distill.max_per_subagent_run",
+            d.max_per_subagent_run <= 50,
+            "must be 0 to 50",
+        );
+        range(
+            "distill.idle_minutes",
+            (1..=1440).contains(&d.idle_minutes),
+            "must be 1 to 1440",
+        );
+        range(
+            "distill.importance",
+            (1..=3).contains(&d.importance),
+            "must be 1 to 3",
+        );
+        range(
+            "distill.budget_share",
+            (0.05..=1.0).contains(&d.budget_share),
+            "must be 0.05 to 1",
+        );
 
         let j = &self.judge;
         unit(&mut e, "judge.auto_apply_threshold", j.auto_apply_threshold);
@@ -1756,10 +1894,60 @@ fn check_tenant_endpoint(e: &mut Vec<SettingError>, key: &str, url: &str) {
     }
 }
 
+/// What a tenant's `config.toml` sets itself, beside what the settings resolve to: the keys the
+/// server's admin pins in the tenant's environment may not come from the file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TenantFile {
+    /// `server.port` is set in the file (the admin owns the port).
+    pub sets_port: bool,
+    /// `privacy.redact = false` is in the file. Whether a person's store keeps secrets as
+    /// written is the admin's choice (`alice-server secrets keep|redact`, the pinned
+    /// `ALICE_PRIVACY_REDACT`), so the file can never turn redaction off: on a tenant without
+    /// the pin, a person's PATCH would otherwise do it.
+    pub turns_redaction_off: bool,
+    /// `privacy.allowlist` holds an entry in the file. An allowlist exempts matches from
+    /// redaction, so on a tenant it is the admin's too (re-review N3): the pinned
+    /// `ALICE_PRIVACY_ALLOWLIST` sets it, and a person's PATCH or file cannot.
+    pub sets_allowlist: bool,
+}
+
+impl TenantFile {
+    /// What `text` (a `config.toml`) sets of those keys. Text that does not parse sets none of
+    /// them (it is refused for its own errors).
+    ///
+    /// ```
+    /// use alice_core::settings::TenantFile;
+    ///
+    /// let f = TenantFile::of("[privacy]\nredact = false\n[server]\nport = 47801\n");
+    /// assert!(f.sets_port && f.turns_redaction_off && !f.sets_allowlist);
+    /// assert_eq!(TenantFile::of("[privacy]\nredact = true\n"), TenantFile::default());
+    /// assert!(TenantFile::of("[privacy]\nallowlist = [\"(?s).*\"]\n").sets_allowlist);
+    /// assert!(!TenantFile::of("[privacy]\nallowlist = []\n").sets_allowlist);
+    /// ```
+    pub fn of(text: &str) -> Self {
+        let v = toml::from_str::<toml::Table>(text).ok();
+        let at = |table: &str, key: &str| {
+            v.as_ref()
+                .and_then(|v| v.get(table))
+                .and_then(|t| t.get(key))
+                .cloned()
+        };
+        Self {
+            sets_port: at("server", "port").is_some(),
+            turns_redaction_off: at("privacy", "redact").and_then(|r| r.as_bool()) == Some(false),
+            sets_allowlist: at("privacy", "allowlist")
+                .is_some_and(|a| a.as_array().is_none_or(|a| !a.is_empty())),
+        }
+    }
+}
+
 /// The extra rules a server tenant's settings follow (spec §2.2 item 6, R18): no path outside
-/// `home`, no URL into the machine or the LAN, nothing the server's admin owns.
-/// `port_from_file`: `server.port` is set in `config.toml` rather than only in the environment.
-pub fn validate_tenant(s: &Settings, home: &Path, port_from_file: bool) -> Vec<SettingError> {
+/// `home`, no URL into the machine or the LAN, nothing the server's admin owns. `file`: what
+/// `config.toml` itself sets of the admin's keys (see [`TenantFile`]).
+///
+/// `privacy.redact = false` from the environment is allowed: it is the admin's pin (server
+/// spec §2.9). The team store's daemon redacts whatever its settings say.
+pub fn validate_tenant(s: &Settings, home: &Path, file: TenantFile) -> Vec<SettingError> {
     let mut e = Vec::new();
     // `~` is refused rather than checked: the daemon expands it to `$HOME`, which this check
     // cannot see.
@@ -1795,16 +1983,22 @@ pub fn validate_tenant(s: &Settings, home: &Path, port_from_file: bool) -> Vec<S
             "sync is not available on a server tenant yet",
         ));
     }
-    if port_from_file && s.server.port != 0 {
+    if file.sets_port && s.server.port != 0 {
         e.push(err(
             "server.port",
             "the server's admin sets the port of a server tenant",
         ));
     }
-    if !s.privacy.redact {
+    if file.turns_redaction_off {
         e.push(err(
             "privacy.redact",
-            "a server tenant always redacts secrets before storing them",
+            "on a server tenant the admin decides whether secrets are kept as written (alice-server secrets keep|redact); config.toml cannot turn redaction off",
+        ));
+    }
+    if file.sets_allowlist {
+        e.push(err(
+            "privacy.allowlist",
+            "on a server tenant only the admin sets exceptions to redaction (ALICE_PRIVACY_ALLOWLIST in the tenant file); config.toml cannot",
         ));
     }
     if s.secrets.backend == SecretsBackend::Keychain {
@@ -1926,12 +2120,15 @@ pub const LOOSEN_POLLS: u32 = 3;
 /// redaction off, `block` mode back to `redact`, an entry gone from the cloud denylist or the
 /// custom patterns, a longer allowlist, a higher daily judge budget, or a switch to a cloud
 /// judge, to an embedding provider or endpoint that is not on this machine (or to another remote
-/// host than before), or the admin MCP tools switched on.
+/// host than before), the admin MCP tools switched on, or more captured or distilled: capture
+/// switched on (the master switch or an agent's), an entry gone from `capture.excluded_projects`,
+/// thinking kept, distillation switched to a cloud judge or given a larger budget share.
 ///
 /// A half-written `config.toml` (an editor truncating then writing) reads as a file that
 /// loosens everything; see [`LooseningGate`].
 pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
     let (o, n) = (&old.privacy, &new.privacy);
+    let (oc, nc) = (&old.capture, &new.capture);
     let checks = [
         ("privacy.redact", o.redact && !n.redact),
         (
@@ -1984,6 +2181,36 @@ pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
             "mcp.admin_tools",
             !old.mcp.admin_tools && new.mcp.admin_tools,
         ),
+        // More of a session is captured, or sent to a cloud judge.
+        (
+            "capture.enabled",
+            !old.capture.enabled && new.capture.enabled,
+        ),
+        ("capture.claude_code", !oc.claude_code && nc.claude_code),
+        ("capture.codex", !oc.codex && nc.codex),
+        ("capture.cursor", !oc.cursor && nc.cursor),
+        ("capture.windsurf", !oc.windsurf && nc.windsurf),
+        ("capture.opencode", !oc.opencode && nc.opencode),
+        ("capture.gemini", !oc.gemini && nc.gemini),
+        (
+            "capture.excluded_projects",
+            oc.excluded_projects
+                .iter()
+                .any(|p| !nc.excluded_projects.contains(p)),
+        ),
+        (
+            "capture.include_thinking",
+            !oc.include_thinking && nc.include_thinking,
+        ),
+        (
+            "distill.provider",
+            old.distill.provider != DistillProvider::Jev
+                && new.distill.provider == DistillProvider::Jev,
+        ),
+        (
+            "distill.budget_share",
+            new.distill.budget_share > old.distill.budget_share,
+        ),
         // Shorter retention deletes for good (final review B-M9: a half-saved `30` reads `3`).
         (
             "maintenance.trash_days",
@@ -1996,6 +2223,14 @@ pub fn loosened_protections(old: &Settings, new: &Settings) -> Vec<String> {
         (
             "storage.raw_retention",
             match (old.storage.raw_retention, new.storage.raw_retention) {
+                (Retention::Age(a), Retention::Age(b)) => b < a,
+                (Retention::Size(a), Retention::Size(b)) => b < a,
+                (a, b) => a != b && b != Retention::Forever,
+            },
+        ),
+        (
+            "capture.raw_retention",
+            match (oc.raw_retention, nc.raw_retention) {
                 (Retention::Age(a), Retention::Age(b)) => b < a,
                 (Retention::Size(a), Retention::Size(b)) => b < a,
                 (a, b) => a != b && b != Retention::Forever,
@@ -2079,6 +2314,8 @@ pub struct ProjectPrivacy {
     pub custom_patterns: Vec<CustomPattern>,
     /// Never send this project's memories to a cloud judge or embedding provider.
     pub cloud_denied: bool,
+    /// Never capture this project's agent sessions.
+    pub no_capture: bool,
 }
 
 /// The privacy in force for one project: the global settings with the project's file on top,
@@ -2090,6 +2327,8 @@ pub struct EffectivePrivacy {
     pub privacy: PrivacySettings,
     /// `cloud_denied` from the project's `.alice.toml`.
     pub cloud_denied: bool,
+    /// `no_capture` from the project's `.alice.toml`.
+    pub no_capture: bool,
 }
 
 impl EffectivePrivacy {
@@ -2126,10 +2365,11 @@ impl ProjectSettings {
         EffectivePrivacy {
             privacy: p,
             cloud_denied: self.privacy.cloud_denied,
+            no_capture: self.privacy.no_capture,
         }
     }
 
-    /// What a project whose file cannot be read gets: secrets blocked and no cloud.
+    /// What a project whose file cannot be read gets: secrets blocked, no cloud and no capture.
     pub fn fail_closed() -> Self {
         Self::default().closed()
     }
@@ -2137,7 +2377,8 @@ impl ProjectSettings {
     /// What is left of rules stored as JSON (the rules a project merge carried) that do not
     /// read whole, a later build's extra field or damage: every custom pattern that still reads
     /// and is valid (a name and an expression that compiles, as a project file needs them),
-    /// with both flags forced on. A rule that cannot be read must not loosen anything, and the
+    /// with `block_secrets` and `cloud_denied` forced on (carried rules have no `no_capture`: a
+    /// merge never carries one, so it stays off here). A rule that cannot be read must not loosen anything, and the
     /// patterns that can be read must not be dropped with it; one that would not compile is left
     /// out so it cannot take the others down with it.
     pub fn salvage_json(text: &str) -> Self {
@@ -2151,6 +2392,7 @@ impl ProjectSettings {
             })
             .unwrap_or_default();
         let mut out = Self::fail_closed();
+        out.privacy.no_capture = false;
         for e in entries {
             let field = |k: &str| e.get(k).and_then(|v| v.as_str()).map(str::to_string);
             let (Some(name), Some(regex)) = (field("name"), field("regex")) else {
@@ -2171,10 +2413,11 @@ impl ProjectSettings {
         out
     }
 
-    /// These settings with the two flags forced on (the custom patterns stay).
+    /// These settings with the three flags forced on (the custom patterns stay).
     fn closed(mut self) -> Self {
         self.privacy.block_secrets = true;
         self.privacy.cloud_denied = true;
+        self.privacy.no_capture = true;
         self
     }
 
@@ -2183,6 +2426,7 @@ impl ProjectSettings {
         let (o, n) = (&self.privacy, &new.privacy);
         (o.block_secrets && !n.block_secrets)
             || (o.cloud_denied && !n.cloud_denied)
+            || (o.no_capture && !n.no_capture)
             || o.custom_patterns
                 .iter()
                 .any(|p| !n.custom_patterns.contains(p))
@@ -2264,7 +2508,7 @@ pub fn parse_project(name: &str, text: &str) -> Result<ProjectSettings, SettingE
         err(
             name,
             format!(
-                "{}; a project file accepts only [privacy] block_secrets, custom_patterns and cloud_denied",
+                "{}; a project file accepts only [privacy] block_secrets, custom_patterns, cloud_denied and no_capture",
                 toml_error(text, e.message(), e.span())
             ),
         )
@@ -2398,7 +2642,7 @@ impl ProjectTree {
 
 /// Per-project `.alice.toml` settings that fail closed.
 ///
-/// - a file that is invalid or cannot be read gives `block_secrets` and `cloud_denied` on (and
+/// - a file that is invalid or cannot be read gives `block_secrets`, `cloud_denied` and `no_capture` on (and
 ///   the last good custom patterns), plus the error, until it is valid again;
 /// - a file that loosens the last good settings (a flag off, a pattern removed, an emptied or
 ///   deleted file) applies only when the same content is read on [`LOOSEN_POLLS`] polls in a
@@ -3630,6 +3874,301 @@ mod tests {
     }
 
     #[test]
+    fn capture_and_distill_defaults_match_the_spec() {
+        let s = Settings::default();
+        assert!(s.validate().is_empty(), "{:?}", s.validate());
+        let c = &s.capture;
+        assert!(c.enabled && c.include_subagents && c.briefing);
+        assert!(!c.include_thinking);
+        assert!(c.excluded_projects.is_empty());
+        assert_eq!((c.tool_output_chars, c.chunk_chars), (800, 2000));
+        assert_eq!(c.raw_retention, Retention::Forever);
+        let d = &s.distill;
+        assert_eq!(d.provider, DistillProvider::Off);
+        assert_eq!(d.model, None);
+        assert_eq!((d.min_confidence, d.max_per_run), (0.7, 8));
+        assert_eq!((d.idle_minutes, d.importance), (15, 2));
+        assert_eq!(d.budget_share, 0.5);
+        let r = resolve(Some("[distill]\nprovider = \"jev\"\n"), &[]).unwrap();
+        assert_eq!(r.settings.distill.provider, DistillProvider::Jev);
+        assert_eq!(
+            error_keys("[distill]\nprovider = \"maybe\"\n", &[]),
+            vec!["distill.provider".to_string()]
+        );
+    }
+
+    #[test]
+    fn capture_ranges_are_validated() {
+        for (file, key) in [
+            (
+                "[capture]\ntool_output_chars = 9000\n",
+                "capture.tool_output_chars",
+            ),
+            ("[capture]\nchunk_chars = 100\n", "capture.chunk_chars"),
+            (
+                "[distill]\nmin_confidence = 0.4\n",
+                "distill.min_confidence",
+            ),
+            ("[distill]\nmax_per_run = 0\n", "distill.max_per_run"),
+            ("[distill]\nimportance = 4\n", "distill.importance"),
+            ("[distill]\nbudget_share = 0\n", "distill.budget_share"),
+        ] {
+            assert_eq!(error_keys(file, &[]), vec![key.to_string()], "{file}");
+            let (kept, left_out) = resolve_salvaging(Some(file), &[]);
+            assert_eq!(left_out.len(), 1, "{file}");
+            assert_eq!(left_out[0].key, key);
+            assert_eq!(
+                get_key(&kept.settings, key),
+                get_key(&Settings::default(), key),
+                "{key} keeps its previous value"
+            );
+        }
+        for ok in [
+            "[capture]\ntool_output_chars = 0\nchunk_chars = 8000\n",
+            "[distill]\nmin_confidence = 0.99\nmax_per_run = 50\nidle_minutes = 1440\nimportance = 3\nbudget_share = 1.0\n",
+        ] {
+            assert!(error_keys(ok, &[]).is_empty(), "{ok}");
+        }
+    }
+
+    /// Task 12b: `distill.max_per_session` (16, 2 to 200) and `distill.max_per_subagent_run`
+    /// (2, 0 to 50): defaults, ranges, the error that names the range, and the environment.
+    #[test]
+    fn distill_session_and_subagent_caps_have_defaults_and_ranges() {
+        let s = Settings::default();
+        assert_eq!(
+            get_key(&s, "distill.max_per_session"),
+            Some(serde_json::json!(16))
+        );
+        assert_eq!(
+            get_key(&s, "distill.max_per_subagent_run"),
+            Some(serde_json::json!(2))
+        );
+        for (file, key, range) in [
+            (
+                "[distill]\nmax_per_session = 0\n",
+                "distill.max_per_session",
+                "must be 2 to 200",
+            ),
+            (
+                // Task 12b review 2: one would keep a handoff alone.
+                "[distill]\nmax_per_session = 1\n",
+                "distill.max_per_session",
+                "must be 2 to 200",
+            ),
+            (
+                "[distill]\nmax_per_session = 201\n",
+                "distill.max_per_session",
+                "must be 2 to 200",
+            ),
+            (
+                "[distill]\nmax_per_subagent_run = 51\n",
+                "distill.max_per_subagent_run",
+                "must be 0 to 50",
+            ),
+        ] {
+            let errs = resolve(Some(file), &[]).unwrap_err();
+            assert_eq!(errs.len(), 1, "{file}: {errs:?}");
+            assert_eq!(errs[0].key, key, "{file}");
+            assert!(errs[0].message.contains(range), "{file}: {errs:?}");
+            let (kept, left_out) = resolve_salvaging(Some(file), &[]);
+            assert_eq!(left_out.len(), 1, "{file}");
+            assert_eq!(
+                get_key(&kept.settings, key),
+                get_key(&Settings::default(), key),
+                "{key} keeps its previous value"
+            );
+        }
+        for (file, session, subagent) in [
+            (
+                "[distill]\nmax_per_session = 2\nmax_per_subagent_run = 0\n",
+                2,
+                0,
+            ),
+            (
+                "[distill]\nmax_per_session = 200\nmax_per_session_cap = 200\nmax_per_subagent_run = 50\n",
+                200,
+                50,
+            ),
+        ] {
+            let r = resolve(Some(file), &[]).unwrap();
+            assert_eq!(
+                get_key(&r.settings, "distill.max_per_session"),
+                Some(serde_json::json!(session))
+            );
+            assert_eq!(
+                get_key(&r.settings, "distill.max_per_subagent_run"),
+                Some(serde_json::json!(subagent))
+            );
+        }
+        let r = resolve(
+            None,
+            &env(&[
+                ("ALICE_DISTILL_MAX_PER_SESSION", "40"),
+                ("ALICE_DISTILL_MAX_PER_SUBAGENT_RUN", "0"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            get_key(&r.settings, "distill.max_per_session"),
+            Some(serde_json::json!(40))
+        );
+        assert_eq!(
+            get_key(&r.settings, "distill.max_per_subagent_run"),
+            Some(serde_json::json!(0))
+        );
+    }
+
+    /// Task 12d: `distill.max_per_session_cap` (48, at most 400), the largest a session's room
+    /// grows. A cap below the base is not an error (final review B, 12d concern 4): the room
+    /// never goes below `max_per_session` (`distill::room` clamps it), so a config that sets
+    /// `max_per_session` above 48 and no cap still loads, instead of leaving a key out at start-up
+    /// (which made capture wait and closed the cloud gate).
+    #[test]
+    fn distill_session_cap_has_a_default_and_never_refuses_a_base_above_it() {
+        assert_eq!(
+            get_key(&Settings::default(), "distill.max_per_session_cap"),
+            Some(serde_json::json!(48))
+        );
+        let errs = resolve(Some("[distill]\nmax_per_session_cap = 401\n"), &[]).unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].key, "distill.max_per_session_cap");
+        assert!(errs[0].message.contains("at most 400"), "{errs:?}");
+        for (file, cap) in [
+            (
+                "[distill]\nmax_per_session = 20\nmax_per_session_cap = 20\n",
+                20,
+            ),
+            ("[distill]\nmax_per_session_cap = 400\n", 400),
+            ("[distill]\nmax_per_session_cap = 10\n", 10),
+            ("[distill]\nmax_per_session = 60\n", 48),
+        ] {
+            let r = resolve(Some(file), &[]).unwrap();
+            assert_eq!(
+                get_key(&r.settings, "distill.max_per_session_cap"),
+                Some(serde_json::json!(cap))
+            );
+        }
+        let r = resolve(None, &env(&[("ALICE_DISTILL_MAX_PER_SESSION_CAP", "64")])).unwrap();
+        assert_eq!(
+            get_key(&r.settings, "distill.max_per_session_cap"),
+            Some(serde_json::json!(64))
+        );
+    }
+
+    #[test]
+    fn capture_raw_retention_parses_like_storage_retention() {
+        for good in ["180d", "1MB", "forever"] {
+            let file = format!("[capture]\nraw_retention = \"{good}\"\n");
+            assert!(error_keys(&file, &[]).is_empty(), "{good}");
+        }
+        for bad in ["0", "12h"] {
+            let file = format!("[capture]\nraw_retention = \"{bad}\"\n");
+            assert_eq!(
+                error_keys(&file, &[]),
+                vec!["capture.raw_retention".to_string()],
+                "{bad}"
+            );
+        }
+        let r = resolve(
+            Some("[capture]\nraw_retention = \"30d\"\n"),
+            &env(&[("ALICE_CAPTURE_RAW_RETENTION", "180d")]),
+        )
+        .unwrap();
+        assert_eq!(
+            r.settings.capture.raw_retention,
+            Retention::Age(std::time::Duration::from_secs(180 * 86_400))
+        );
+    }
+
+    #[test]
+    fn new_loosening_keys_are_named() {
+        let mut tight = Settings::default();
+        tight.capture.enabled = false;
+        tight.capture.codex = false;
+        tight.capture.excluded_projects = vec!["client".into()];
+        tight.capture.include_thinking = false;
+        tight.distill.provider = DistillProvider::Off;
+        tight.distill.budget_share = 0.5;
+        let mut loose = tight.clone();
+        loose.capture.enabled = true;
+        loose.capture.codex = true;
+        loose.capture.excluded_projects.clear();
+        loose.capture.include_thinking = true;
+        loose.distill.provider = DistillProvider::Jev;
+        loose.distill.budget_share = 0.8;
+        let mut got = loosened_protections(&tight, &loose);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "capture.codex",
+                "capture.enabled",
+                "capture.excluded_projects",
+                "capture.include_thinking",
+                "distill.budget_share",
+                "distill.provider",
+            ]
+        );
+        assert!(loosened_protections(&loose, &tight).is_empty());
+    }
+
+    #[test]
+    fn the_other_agent_flags_and_idle_minutes_are_covered() {
+        for (flag, set) in [
+            (
+                "capture.cursor",
+                (|s: &mut Settings| s.capture.cursor = true) as fn(&mut Settings),
+            ),
+            ("capture.windsurf", |s| s.capture.windsurf = true),
+            ("capture.opencode", |s| s.capture.opencode = true),
+            ("capture.gemini", |s| s.capture.gemini = true),
+        ] {
+            let mut tight = Settings::default();
+            tight.capture.cursor = false;
+            tight.capture.windsurf = false;
+            tight.capture.opencode = false;
+            tight.capture.gemini = false;
+            let mut loose = tight.clone();
+            set(&mut loose);
+            assert_eq!(loosened_protections(&tight, &loose), vec![flag]);
+            assert!(loosened_protections(&loose, &tight).is_empty());
+        }
+        for bad in ["0", "1441"] {
+            let file = format!("[distill]\nidle_minutes = {bad}\n");
+            assert_eq!(
+                error_keys(&file, &[]),
+                vec!["distill.idle_minutes".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn project_no_capture_parses_and_fails_closed() {
+        let p = parse_project("f", "[privacy]\nno_capture = true\n").unwrap();
+        assert!(p.privacy.no_capture);
+        assert!(p.apply_to(&PrivacySettings::default()).no_capture);
+        assert!(ProjectSettings::fail_closed().privacy.no_capture);
+        let e = parse_project("f", "[privacy]\nbogus = 1\n").unwrap_err();
+        assert!(e.message.contains("no_capture"), "{}", e.message);
+        let off = ProjectSettings::default();
+        assert!(p.loosened_by(&off), "removing no_capture loosens");
+        assert!(!off.loosened_by(&p));
+        let d = tempfile::tempdir().unwrap();
+        let (cache, now) = clocked();
+        write_project(d.path(), "[privacy]\nno_capture = true\n");
+        assert!(cache.get(d.path()).settings.privacy.no_capture);
+        write_project(d.path(), "[privacy]\nblock_secrets = true\n");
+        for _ in 0..2 {
+            tick(&now);
+            let l = cache.get(d.path());
+            assert!(l.settings.privacy.no_capture && l.loosening_pending);
+        }
+        tick(&now);
+        assert!(!cache.get(d.path()).settings.privacy.no_capture);
+    }
+
+    #[test]
     fn every_key_has_an_env_var_and_restart_keys_are_listed() {
         let keys = key_infos();
         assert!(
@@ -3899,6 +4438,10 @@ mod tests {
                 "storage.raw_retention",
                 Box::new(|s| s.storage.raw_retention = Retention::Age(Duration::from_secs(86_400))),
             ),
+            (
+                "capture.raw_retention",
+                Box::new(|s| s.capture.raw_retention = Retention::Age(Duration::from_secs(86_400))),
+            ),
         ];
         for (key, change) in cases {
             let mut looser = base.clone();
@@ -3924,6 +4467,25 @@ mod tests {
         longer.maintenance.trash_days = 90;
         longer.storage.raw_retention = Retention::Forever;
         assert!(loosened_protections(&base, &longer).is_empty());
+        // capture.raw_retention the same way: a shorter age or size loosens, forever does not.
+        let mut kept = base.clone();
+        kept.capture.raw_retention = Retention::Age(Duration::from_secs(180 * 86_400));
+        let mut shorter = kept.clone();
+        shorter.capture.raw_retention = Retention::Age(Duration::from_secs(90 * 86_400));
+        assert_eq!(
+            loosened_protections(&kept, &shorter),
+            vec!["capture.raw_retention".to_string()]
+        );
+        assert!(loosened_protections(&shorter, &kept).is_empty());
+        assert!(loosened_protections(&kept, &base).is_empty());
+        let mut sized = base.clone();
+        sized.capture.raw_retention = Retention::Size(10_000_000_000);
+        let mut smaller = sized.clone();
+        smaller.capture.raw_retention = Retention::Size(5_000_000_000);
+        assert_eq!(
+            loosened_protections(&sized, &smaller),
+            vec!["capture.raw_retention".to_string()]
+        );
         // Turning the admin tools off tightens.
         let mut admin = base.clone();
         admin.mcp.admin_tools = true;
@@ -4101,6 +4663,7 @@ mod tests {
             ProjectPrivacy {
                 block_secrets: true,
                 cloud_denied: true,
+                no_capture: true,
                 custom_patterns: vec![]
             }
         );
@@ -4669,7 +5232,11 @@ custom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]+\" }]
 
     fn tenant_errors(toml: &str, home: &Path, port_from_file: bool) -> Vec<String> {
         let r = resolve(Some(toml), &[]).unwrap();
-        validate_tenant(&r.settings, home, port_from_file)
+        let file = TenantFile {
+            sets_port: port_from_file,
+            ..TenantFile::of(toml)
+        };
+        validate_tenant(&r.settings, home, file)
             .into_iter()
             .map(|e| e.key)
             .collect()
@@ -4740,7 +5307,7 @@ custom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]+\" }]
                 let toml = format!("{sect} = \"https://{host}/v1\"\n");
                 let r = resolve(Some(&toml), &[]).unwrap_or_else(|e| panic!("{host}: {e:?}"));
                 assert!(
-                    validate_tenant(&r.settings, &home, false)
+                    validate_tenant(&r.settings, &home, TenantFile::default())
                         .iter()
                         .any(|e| e.key == key),
                     "{host} {key}"
@@ -4763,7 +5330,7 @@ custom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]+\" }]
         .settings;
         plain_http.embedding.endpoint = Some("http://api.openai.com/v1".into());
         assert!(
-            validate_tenant(&plain_http, &home, false)
+            validate_tenant(&plain_http, &home, TenantFile::default())
                 .iter()
                 .any(|e| e.key == "embedding.endpoint")
         );
@@ -4791,5 +5358,54 @@ custom_patterns = [{ name = \"acct\", regex = \"ACCT-[0-9]+\" }]
         for toml in &allowed {
             assert!(tenant_errors(toml, &home, false).is_empty(), "{toml}");
         }
+    }
+
+    /// Owner's decision 2026-10-17: whether a tenant keeps secrets as written is the admin's pin
+    /// in the environment; the file can tighten (`redact = true`) but never loosen.
+    #[test]
+    fn a_tenant_keeps_secrets_only_by_the_admins_pin() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        let env = [("ALICE_PRIVACY_REDACT".to_string(), "false".to_string())];
+        let pinned = resolve(None, &env).unwrap();
+        assert!(!pinned.settings.privacy.redact);
+        assert!(
+            validate_tenant(&pinned.settings, home, TenantFile::of("")).is_empty(),
+            "the admin's pin is allowed"
+        );
+        assert!(
+            tenant_errors("[privacy]\nredact = true\n", home, false).is_empty(),
+            "the file may ask for redaction"
+        );
+        let off = "[privacy]\nredact = false\n";
+        assert_eq!(tenant_errors(off, home, false), ["privacy.redact"]);
+        // Refused even where the pin already says the same: the switch is the admin's alone.
+        let both = resolve(Some(off), &env).unwrap();
+        assert!(
+            validate_tenant(&both.settings, home, TenantFile::of(off))
+                .iter()
+                .any(|e| e.key == "privacy.redact")
+        );
+    }
+
+    /// Re-review N3: an allowlist is an exception to redaction, so on a tenant only the admin's
+    /// pin sets one; a file (and so a person's PATCH) that does is refused.
+    #[test]
+    fn a_tenant_takes_its_allowlist_from_the_admins_pin_only() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        let all = "[privacy]\nallowlist = [\"(?s).*\"]\n";
+        assert_eq!(tenant_errors(all, home, false), ["privacy.allowlist"]);
+        assert!(tenant_errors("[privacy]\nallowlist = []\n", home, false).is_empty());
+        let env = [(
+            "ALICE_PRIVACY_ALLOWLIST".to_string(),
+            r#"["^ok-value$"]"#.to_string(),
+        )];
+        let pinned = resolve(None, &env).unwrap();
+        assert_eq!(pinned.settings.privacy.allowlist, ["^ok-value$"]);
+        assert!(
+            validate_tenant(&pinned.settings, home, TenantFile::of("")).is_empty(),
+            "the admin's pin is allowed"
+        );
     }
 }

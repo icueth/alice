@@ -20,6 +20,16 @@ use tokio_util::sync::CancellationToken;
 /// present, and the body.
 pub type Seen = (String, String, bool, Vec<u8>);
 
+/// What the emulator answers for `GET /api/v1/capture/hook.sh` in place of the tenant (the hook
+/// script's self-update tests): `status` and `body`, after holding the request `hold_ms` (longer
+/// than the client's limit makes a timeout).
+#[derive(Clone, Debug, Default)]
+pub struct ScriptAnswer {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub hold_ms: u64,
+}
+
 pub struct Tenant {
     pub name: String,
     pub home: AliceHome,
@@ -35,6 +45,11 @@ pub struct Server {
     pub team: Option<Tenant>,
     recorders: Vec<(String, Arc<Mutex<Vec<Seen>>>)>,
     paused: Arc<AtomicBool>,
+    stalled: Arc<AtomicBool>,
+    /// Milliseconds every routed request waits before it is forwarded.
+    request_delay_ms: Arc<AtomicU64>,
+    /// Served for `GET /api/v1/capture/hook.sh` instead of the tenant's script, while set.
+    hook_script: Arc<Mutex<Option<ScriptAnswer>>>,
     /// Milliseconds the team store waits before it answers `/api/v1/recall`.
     team_recall_delay_ms: Arc<AtomicU64>,
     stop: CancellationToken,
@@ -47,7 +62,13 @@ struct Front {
     port: u16,
     recorder: Arc<Mutex<Vec<Seen>>>,
     paused: Arc<AtomicBool>,
+    stalled: Arc<AtomicBool>,
+    request_delay_ms: Arc<AtomicU64>,
+    hook_script: Arc<Mutex<Option<ScriptAnswer>>>,
 }
+
+/// The longest a stalled request is held (a test that forgets to release it still ends).
+const STALL_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn not_found() -> Response {
     (
@@ -80,6 +101,26 @@ async fn front(State(f): State<Front>, req: Request, next: Next) -> Response {
         || path.starts_with("/mcp/");
     if !routed {
         return not_found();
+    }
+    let delay = f.request_delay_ms.load(Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+    let script = f.hook_script.lock().clone();
+    if path == "/api/v1/capture/hook.sh"
+        && let Some(a) = script
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(a.hold_ms)).await;
+        return (
+            StatusCode::from_u16(a.status).unwrap(),
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            a.body,
+        )
+            .into_response();
+    }
+    let held = std::time::Instant::now();
+    while f.stalled.load(Ordering::SeqCst) && held.elapsed() < STALL_CAP {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     if f.paused.load(Ordering::SeqCst) {
         return StatusCode::BAD_GATEWAY.into_response();
@@ -125,14 +166,47 @@ impl Server {
         Self::start_with(names, true, Some(jev)).await
     }
 
+    /// One tenant `name` whose data directory `home` already exists (an adopted database, say):
+    /// its service starts there in tenant mode. The caller keeps the directory alive.
+    pub async fn start_on(name: &str, home: AliceHome) -> Server {
+        Self::start_inner(&[name], false, None, vec![Some(home)], None).await
+    }
+
+    /// Like [`Server::start_with_team`], with `env` as the `ALICE_*` variables of every daemon,
+    /// the team store's included (what the tenant files pin, such as `ALICE_PRIVACY_REDACT`), in
+    /// place of the process's.
+    pub async fn start_with_team_and_env(names: &[&str], env: &[(&str, &str)]) -> Server {
+        let env = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Self::start_inner(names, true, None, Vec::new(), Some(env)).await
+    }
+
     async fn start_with(
         names: &[&str],
         with_team: bool,
         jev: Option<Arc<dyn alice_core::judge::jev::JevTransport>>,
     ) -> Server {
+        Self::start_inner(names, with_team, jev, Vec::new(), None).await
+    }
+
+    /// `homes[i]`, when given, is tenant `names[i]`'s existing data directory; every other
+    /// tenant gets a throwaway one. `env`, when given, replaces the process's `ALICE_*` variables
+    /// for every daemon.
+    async fn start_inner(
+        names: &[&str],
+        with_team: bool,
+        jev: Option<Arc<dyn alice_core::judge::jev::JevTransport>>,
+        homes: Vec<Option<AliceHome>>,
+        env: Option<Vec<(String, String)>>,
+    ) -> Server {
         alice_daemon::install_tls();
         let stop = CancellationToken::new();
         let paused = Arc::new(AtomicBool::new(false));
+        let stalled = Arc::new(AtomicBool::new(false));
+        let request_delay_ms = Arc::new(AtomicU64::new(0));
+        let hook_script = Arc::new(Mutex::new(None));
         let mut app = Router::new();
         let mut tenants = Vec::new();
         let mut recorders = Vec::new();
@@ -150,6 +224,7 @@ impl Server {
                 ServiceOptions {
                     tenant: true,
                     team_store: true,
+                    settings_env: env.clone(),
                     ..ServiceOptions::default()
                 },
             )
@@ -185,8 +260,13 @@ impl Server {
             dirs.push(dir);
         }
         for (i, name) in names.iter().enumerate() {
-            let dir = tempfile::tempdir().unwrap();
-            let home = AliceHome::new(dir.path().to_path_buf());
+            let (home, dir) = match homes.get(i).cloned().flatten() {
+                Some(home) => (home, None),
+                None => {
+                    let dir = tempfile::tempdir().unwrap();
+                    (AliceHome::new(dir.path().to_path_buf()), Some(dir))
+                }
+            };
             home.ensure_dirs().unwrap();
             if let Some(t) = &team {
                 std::fs::write(home.team_token_file(), &t.token).unwrap();
@@ -199,6 +279,7 @@ impl Server {
                     team_url: team_url.clone(),
                     tenant_name: Some(name.to_string()),
                     jev_transport: jev.clone(),
+                    settings_env: env.clone(),
                     ..ServiceOptions::default()
                 },
             )
@@ -212,6 +293,9 @@ impl Server {
                 port,
                 recorder: recorder.clone(),
                 paused: paused.clone(),
+                stalled: stalled.clone(),
+                request_delay_ms: request_delay_ms.clone(),
+                hook_script: hook_script.clone(),
             };
             app = app.nest(
                 &format!("/u/{name}"),
@@ -225,7 +309,7 @@ impl Server {
                 token,
                 port,
             });
-            dirs.push(dir);
+            dirs.extend(dir);
         }
         let app = app.fallback(|| async { not_found() });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -243,6 +327,9 @@ impl Server {
             team,
             recorders,
             paused,
+            stalled,
+            request_delay_ms,
+            hook_script,
             team_recall_delay_ms,
             stop,
             team_stop,
@@ -283,6 +370,25 @@ impl Server {
     /// While paused, routed requests get a 502, as when a tenant's daemon is down.
     pub fn pause(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
+    }
+
+    /// While stalled, routed requests are held (the connection stays open and nothing is
+    /// answered), as when a tenant's daemon hangs; released, they go on as usual. A request is
+    /// held at most a minute.
+    pub fn stall(&self, stalled: bool) {
+        self.stalled.store(stalled, Ordering::SeqCst);
+    }
+
+    /// Makes every routed request wait `ms` milliseconds before it is forwarded (0: no wait),
+    /// as a slow link does: each client process then lives at least that long.
+    pub fn delay_requests(&self, ms: u64) {
+        self.request_delay_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// While `Some`, `GET /api/v1/capture/hook.sh` gets that answer instead of the tenant's own
+    /// script (every tenant); `None` serves the tenant's script again.
+    pub fn serve_hook_script(&self, answer: Option<ScriptAnswer>) {
+        *self.hook_script.lock() = answer;
     }
 }
 

@@ -9,8 +9,10 @@
 //! only counts.
 //!
 //! Redaction is this module's contract: the writer stores what it is given. Everything that is
-//! planned goes through [`RedactFilter`], which always redacts (whatever `privacy.redact`
-//! says) and, in `block` mode, holds back the drawers that contain a secret.
+//! planned goes through [`RedactFilter`], which follows `privacy.redact` like every other write
+//! (owner's decision 2026-10-17: a store that keeps secrets keeps the palace's as written) and,
+//! in `block` mode, holds back the drawers that contain a secret. Names (wings, rooms, projects,
+//! drawer ids, the palace's path) are always redacted: they travel into slugs, ids and reports.
 //!
 //! Never log a drawer, a planned record or a knowledge-graph value with `{:?}`: they hold raw text.
 
@@ -267,11 +269,14 @@ pub fn check_remote_embedding(settings: &Settings, allow_remote: bool) -> Result
 
 // ------------------------------------------------------------------------------------ redaction
 
-/// The detectors as a [`TextFilter`]: always on, `block` mode honoured, changes counted. With
-/// [`with_project_rules`](Self::with_project_rules), a drawer bound for a project with rules of
-/// its own (its `.alice.toml`, rules a project merge carried into it) is screened with those.
+/// The detectors as a [`TextFilter`]: the storage rules (`privacy.redact` decides), `block` mode
+/// honoured, changes counted. With [`with_project_rules`](Self::with_project_rules), a drawer
+/// bound for a project with rules of its own (its `.alice.toml`, rules a project merge carried
+/// into it) is screened with those. Names go through [`quiet`](Self::quiet), always on.
 pub struct RedactFilter {
     redactor: Arc<Redactor>,
+    /// For names ([`quiet`](Self::quiet)): always on.
+    names: Arc<Redactor>,
     redacted: AtomicU64,
     projects: Option<ProjectRules>,
 }
@@ -293,12 +298,21 @@ type LookedUp = (Instant, Option<Arc<Redactor>>);
 const PROJECT_RULES_FRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl RedactFilter {
+    /// A filter whose text and names both go through `redactor`.
     pub fn new(redactor: Arc<Redactor>) -> Self {
         Self {
+            names: redactor.clone(),
             redactor,
             redacted: AtomicU64::new(0),
             projects: None,
         }
+    }
+
+    /// This filter, with names redacted by `names` (the always-on rules) rather than by the
+    /// storage rules.
+    pub fn with_names(mut self, names: Arc<Redactor>) -> Self {
+        self.names = names;
+        self
     }
 
     /// This filter, screening each drawer with the rules of the project it goes to as well.
@@ -340,12 +354,8 @@ impl RedactFilter {
             }
         };
         let r = tree.and_then(|t| {
-            let on = |mut privacy: alice_core::settings::PrivacySettings| {
-                privacy.redact = true;
-                privacy
-            };
-            (on(p.redactors.privacy_for(Some(&t))) != on(p.redactors.privacy_for(None)))
-                .then(|| p.redactors.for_root_always_on(Some(&t)))
+            (p.redactors.privacy_for(Some(&t)) != p.redactors.privacy_for(None))
+                .then(|| p.redactors.for_root(Some(&t)))
         });
         p.cache.lock().insert(key, (Instant::now(), r.clone()));
         r
@@ -381,11 +391,11 @@ impl RedactFilter {
     /// A second pass starts again after every `_`: the detectors need a word boundary before a
     /// key prefix, and `wing_sk-...` or `diary_ghp_...` has none (the tail alone does).
     pub fn quiet(&self, text: &str) -> String {
-        let mut out = self.redactor.apply(text).text;
+        let mut out = self.names.apply(text).text;
         let mut from = 0;
         while let Some(off) = out[from..].find('_') {
             let cut = from + off + 1;
-            let tail = self.redactor.apply(&out[cut..]).text;
+            let tail = self.names.apply(&out[cut..]).text;
             if tail != out[cut..] {
                 out.truncate(cut);
                 out.push_str(&tail);
@@ -1875,7 +1885,9 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     let started_at = now_rfc3339();
     let settings = env.settings.get();
     let assume = local_offset();
-    let filter = RedactFilter::new(env.redactors.for_root_always_on(None))
+    // Text as the store keeps it (`privacy.redact` decides); names always redacted.
+    let filter = RedactFilter::new(env.redactors.for_root(None))
+        .with_names(env.redactors.for_root_always_on(None))
         .with_project_rules(env.readers.clone(), env.redactors.clone());
     let mut phases: Vec<PhaseTiming> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -1956,7 +1968,11 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
     set_progress(&env.status, 0, Some(surveyed.total));
     check_stop(&env.stop)?;
 
-    // 3. plan every drawer that is not stored yet; unless this is a dry run, store what it adds
+    // 3. plan every drawer that is not stored yet; unless this is a dry run, store what it adds.
+    // A session `alice capture` holds keeps its turns there (SP2 §9.2): read once, before planning.
+    let captured = env
+        .readers
+        .with(alice_core::store::capture::captured_session_ids)?;
     let planner = Planner {
         mapper: Mapper {
             wings: &wings,
@@ -1964,6 +1980,7 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
             filter: &filter,
         },
         survey: &surveyed,
+        captured_sessions: &captured,
     };
     // The spellings that point at each project, as stored (a transcript folder is not a wing).
     let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
@@ -2171,8 +2188,9 @@ fn run(env: &ImportEnv, req: &ImportRequest, palace: &Path, job_id: &str) -> Res
         },
         blocked_by_redaction: tally.blocked,
         redacted_fields: filter.redacted_fields(),
-        redaction_note: (!settings.privacy.redact)
-            .then(|| "privacy.redact is off: Alice redacted anyway".to_string()),
+        redaction_note: (!settings.privacy.redact).then(|| {
+            "privacy.redact is off: secrets were imported as written; names were redacted, and nothing sent to a cloud service carries a secret".to_string()
+        }),
         warnings,
         ..Default::default()
     };
@@ -2329,6 +2347,22 @@ mod tests {
         assert_eq!(f.redacted_fields(), 1);
         assert!(!f.quiet(secret).contains("ghp_"));
         assert_eq!(f.redacted_fields(), 1, "quiet does not count");
+    }
+
+    /// Owner's decision 2026-10-17: with redaction off the text is kept as written, the names
+    /// still redacted.
+    #[test]
+    fn with_redaction_off_text_is_kept_and_names_are_still_redacted() {
+        let r = Redactors::fixed(PrivacySettings {
+            redact: false,
+            ..Default::default()
+        });
+        let f = RedactFilter::new(r.for_root(None)).with_names(r.for_root_always_on(None));
+        let secret = concat!("token gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 here");
+        assert_eq!(f.filter("chunk", secret).unwrap(), secret);
+        assert_eq!(f.redacted_fields(), 0);
+        assert!(!f.quiet(secret).contains("ghp_"));
+        assert_ne!(f.legacy_key(secret), secret);
     }
 
     #[test]

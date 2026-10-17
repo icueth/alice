@@ -18,6 +18,9 @@ use rusqlite::Connection;
 const SECRET: &str = concat!("AKIA", "Q7ZX3P9LMN2BV4KD");
 const OTHER_SECRET: &str = concat!("AKIA", "J4WQ8RT2ZX6NB1LM");
 const TRANSCRIPT: &str = "/Users/someone/.claude/projects/-Users-someone-Code-shop/s1.jsonl";
+/// A session the person's own Alice captured: its transcript and file identity on their machine.
+const CAPTURED: &str = "/Users/someone/.claude/projects/-Users-someone-Code-shop/c1.jsonl";
+const FILE_KEY: &str = "16777220:4242:5f2b9c0e7a1d3e8b";
 
 fn start(home: &AliceHome, tenant: bool) -> Arc<Service> {
     Service::start(
@@ -142,6 +145,12 @@ async fn an_adopted_database_loses_the_machines_paths_and_is_redacted_with_the_t
     let (source, checkout, backup) = person(d.path()).await;
     {
         let c = Connection::open(&backup).unwrap();
+        c.execute(
+            "INSERT INTO capture_state (source_id, agent, session_id, transcript_path, file_key, created_at)
+             SELECT id, 'claude-code', 's1', ?1, ?2, '2026-10-16T00:00:00Z' FROM sources WHERE uri = ?3",
+            [CAPTURED, FILE_KEY, TRANSCRIPT],
+        )
+        .unwrap();
         c.execute_batch(&format!(
             "PRAGMA secure_delete = OFF; CREATE TABLE gone (t TEXT); INSERT INTO gone VALUES ('{}'); DROP TABLE gone;",
             DELETED_ON_THE_MAC.repeat(40)
@@ -155,6 +164,7 @@ async fn an_adopted_database_loses_the_machines_paths_and_is_redacted_with_the_t
         "the backup carries free pages"
     );
     assert!(contains(&src, &checkout.display().to_string()));
+    assert!(contains(&src, CAPTURED) && contains(&src, FILE_KEY));
     let tenant = fresh_tenant(d.path(), "tenant");
 
     let r = adopt::adopt_now(&tenant, &backup).unwrap();
@@ -165,7 +175,10 @@ async fn an_adopted_database_loses_the_machines_paths_and_is_redacted_with_the_t
         "the two notes become one text: {r:?}"
     );
     assert_eq!(r.redacted_chunks, 1, "{r:?}");
-    assert!(r.paths_cleared >= 3, "root, key and transcript: {r:?}");
+    assert!(
+        r.paths_cleared >= 4,
+        "root, key, transcript and its capture state: {r:?}"
+    );
     assert!(r.saved_tenant_db_as.is_some(), "{r:?}");
 
     let c = Connection::open(tenant.db()).unwrap();
@@ -189,6 +202,11 @@ async fn an_adopted_database_loses_the_machines_paths_and_is_redacted_with_the_t
         uri.starts_with("adopted:") && uri.ends_with("/s1.jsonl"),
         "{uri}"
     );
+    assert_eq!(
+        n("SELECT count(*) FROM capture_state WHERE transcript_path IS NULL AND file_key IS NULL"),
+        1,
+        "the capture state stays, without the machine's path"
+    );
     assert_eq!(n("SELECT count(*) FROM judge_cache"), 0);
     // Embedded again: the vectors of the old text are gone or pending.
     assert_eq!(
@@ -207,6 +225,8 @@ async fn an_adopted_database_loses_the_machines_paths_and_is_redacted_with_the_t
         OTHER_SECRET,
         &checkout.display().to_string()[..],
         TRANSCRIPT,
+        CAPTURED,
+        FILE_KEY,
         "/Users/someone",
         DELETED_ON_THE_MAC,
     ] {
@@ -265,6 +285,27 @@ async fn an_adopted_database_loses_the_machines_paths_and_is_redacted_with_the_t
     );
     s.shutdown();
     drop(source);
+}
+
+/// Owner's decision 2026-10-17: a tenant whose admin pinned `ALICE_PRIVACY_REDACT=false`
+/// (`alice-server secrets keep`, which `alice-server adopt` hands to `alice adopt`) keeps the
+/// person's secrets as written; the machine's paths are cleared all the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_that_keeps_secrets_adopts_them_as_written() {
+    let d = tempfile::tempdir().unwrap();
+    let (_source, checkout, backup) = person(d.path()).await;
+    let tenant = fresh_tenant(d.path(), "tenant");
+    let keep = vec![("ALICE_PRIVACY_REDACT".to_string(), "false".to_string())];
+    let r = adopt::adopt_with_env(&tenant, &backup, chrono::Utc::now(), keep).unwrap();
+    assert_eq!((r.memories, r.chunks), (3, 2), "{r:?}");
+    assert_eq!((r.redacted_memories, r.redacted_chunks), (0, 0), "{r:?}");
+    assert_eq!(r.duplicates_trashed, 0, "{r:?}");
+    let text = db_text(&tenant);
+    assert!(contains(&text, SECRET) && contains(&text, OTHER_SECRET));
+    assert!(
+        !contains(&text, &checkout.display().to_string()),
+        "paths cleared"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

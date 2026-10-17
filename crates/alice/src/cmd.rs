@@ -185,6 +185,65 @@ pub struct HistoryArgs {
     pub limit: usize,
 }
 
+/// `alice hook <event>` (SP2 spec §4.1). Plain strings, so that no value makes clap fail: an
+/// unknown event or agent is logged to hook.log like any other bad input.
+#[derive(Args)]
+pub struct HookArgs {
+    /// session-start, stop, subagent-stop, pre-compact or session-end; the hook_event_name of
+    /// the input, when it names one of them, wins.
+    pub event: String,
+    /// The agent that runs the hook: claude-code or codex.
+    #[arg(long, default_value = "claude-code")]
+    pub agent: String,
+}
+
+/// `alice hooks …` (SP2 spec §4.3).
+#[derive(Subcommand)]
+pub enum HooksCmd {
+    /// Add Alice's capture hooks to the agent's settings (Claude Code: settings.json; Codex:
+    /// hooks.json). Run it again to repair hooks of a moved alice.
+    Install(HooksArgs),
+    /// Remove exactly Alice's capture hooks.
+    Uninstall(HooksArgs),
+    /// Whether the hooks are installed, whether the alice they run exists, and the last capture.
+    Status(HooksStatusArgs),
+}
+
+#[derive(Args)]
+pub struct HooksArgs {
+    pub agent: HooksAgent,
+    /// The file to edit instead of the agent's own settings.json or hooks.json.
+    #[arg(long)]
+    pub settings: Option<std::path::PathBuf>,
+    /// Print the change; write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args)]
+pub struct HooksStatusArgs {
+    pub agent: HooksAgent,
+    /// The file to read instead of the agent's own settings.json or hooks.json.
+    #[arg(long)]
+    pub settings: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum HooksAgent {
+    /// Claude Code.
+    Claude,
+    Codex,
+}
+
+impl From<HooksAgent> for alice_daemon::agent_hooks::HookAgent {
+    fn from(a: HooksAgent) -> Self {
+        match a {
+            HooksAgent::Claude => Self::Claude,
+            HooksAgent::Codex => Self::Codex,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum ProjectsCmd {
     /// List projects (the default for `alice projects`).
@@ -258,7 +317,8 @@ pub enum MaintenanceCmd {
     /// When each job last ran.
     Status,
     /// Run one job now, to its end: backup, quick_check, index_check, fts_optimize,
-    /// raw_retention, trash_purge, judge_retry, merge_suggestions or events_prune.
+    /// raw_retention, capture_retention, trash_purge, judge_retry, merge_suggestions,
+    /// events_prune or model_purge.
     Run { job: String },
 }
 
@@ -378,6 +438,21 @@ pub struct BenchArgs {
     /// already holds the requested data. Never point it at a real ALICE_HOME.
     #[arg(long)]
     pub dir: Option<std::path::PathBuf>,
+}
+
+#[derive(Subcommand)]
+pub enum CaptureCmd {
+    /// Captured sessions: their cursors, chunks and where each one's distillation stands.
+    Status,
+    /// Distil a captured session now (also one skipped as a backfill, or one that failed).
+    Distill {
+        /// The session id (or a capture source's id or uri, from `alice capture status`).
+        session_id: String,
+    },
+    /// Capture the transcripts already on disk (sessions from before the hooks): the daemon
+    /// reads each file's complete turns in the background and skips what is stored or was
+    /// imported from MemPalace. Backfilled sessions are not distilled unless --distill.
+    Backfill(crate::backfill::BackfillArgs),
 }
 
 #[derive(Subcommand)]
@@ -880,6 +955,13 @@ pub fn dispatch(command: Command, json: bool) -> Result<()> {
             rt()?.block_on(token_rotate(&home, show, json))
         }
         Command::Service(c) => service_command(&home, c, json),
+        // `main` runs `alice hook` before anything else; this is `alice --json hook …`.
+        Command::Hook(a) => {
+            crate::hook::run(a);
+            Ok(())
+        }
+        // No daemon: the agents' files are edited here, and `status` only asks one that runs.
+        Command::Hooks(c) => hooks_command(&home, c, json),
         other => rt()?.block_on(client_command(home, other, json)),
     }
 }
@@ -1196,7 +1278,10 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         Command::Config(c) => config(&home, c, json).await,
         Command::Import(ImportCmd::Mempalace(a)) => import_mempalace(&home, a, json).await,
         Command::Import(ImportCmd::Status) => import_status(&home, json).await,
+        Command::Capture(c) => capture(&home, c, json).await,
         Command::Daemon(DaemonCmd::Run { .. })
+        | Command::Hook(_)
+        | Command::Hooks(_)
         | Command::Mcp
         | Command::Model(_)
         | Command::Bench(_)
@@ -1552,6 +1637,64 @@ async fn backup(home: &AliceHome, c: BackupCmd, json: bool) -> Result<()> {
     }
 }
 
+async fn capture(home: &AliceHome, c: CaptureCmd, json: bool) -> Result<()> {
+    match c {
+        CaptureCmd::Status => {
+            let st = client(home).await?.capture_status().await?;
+            print(json, &st, || capture_status_text(&st))
+        }
+        CaptureCmd::Distill { session_id } => {
+            let r = client(home)
+                .await?
+                .capture_distill(&CaptureDistillRequest {
+                    session_id: Some(session_id),
+                    source_id: None,
+                })
+                .await?;
+            print(json, &r, || {
+                r.due
+                    .iter()
+                    .map(|uri| format!("due for distillation: {uri}\n"))
+                    .collect()
+            })
+        }
+        CaptureCmd::Backfill(a) => {
+            // The files are found (and `--since` checked) before a daemon is started.
+            let plan = crate::backfill::plan(&a)?;
+            let r = if plan.is_empty() {
+                plan.into_report(a.distill)
+            } else {
+                crate::backfill::send(&client(home).await?, plan, a.distill).await?
+            };
+            print(json, &r, || r.text())
+        }
+    }
+}
+
+fn capture_status_text(st: &CaptureStatus) -> String {
+    let mut t = format!(
+        "capture: {}; distillation: {} ({})\n",
+        if st.enabled { "on" } else { "off" },
+        st.distill_provider,
+        st.distill_state.replace('_', " ")
+    );
+    if st.sessions.is_empty() {
+        t.push_str("no captured sessions yet\n");
+    }
+    for s in &st.sessions {
+        t.push_str(&format!(
+            "{}  {}  {} chunks  {}{}  last capture {}\n",
+            s.uri,
+            s.project,
+            s.chunks,
+            s.distill_state,
+            if s.ended { "  ended" } else { "" },
+            s.last_capture_at.as_deref().unwrap_or("never")
+        ));
+    }
+    t
+}
+
 async fn maintenance(home: &AliceHome, c: MaintenanceCmd, json: bool) -> Result<()> {
     use alice_daemon::maintenance::Job;
     match c {
@@ -1645,6 +1788,10 @@ fn stats_text(s: &Stats) -> String {
     if let Some(w) = &s.judge_warning {
         t.push_str(&format!("judge warning: {w}\n"));
     }
+    t.push_str(&format!(
+        "distilled today: {} kept, {} dropped, ${:.4}\n",
+        s.distilled_today, s.distill_dropped_today, s.distill_cost_today_usd
+    ));
     t
 }
 
@@ -2877,6 +3024,105 @@ fn plan_text(plan: &svcinst::InstallPlan, write: &str, run: &str) -> String {
     t
 }
 
+// ---------------------------------------------------------------------------- hooks
+
+/// `alice hooks install | uninstall | status <agent>`: Alice's capture hooks in the agent's own
+/// settings. Nothing starts a daemon; `status` asks one that runs for the last capture.
+fn hooks_command(home: &AliceHome, c: HooksCmd, json: bool) -> Result<()> {
+    use alice_daemon::agent_hooks::{self as ah, HookTarget};
+    let env = |k: &str| std::env::var_os(k);
+    match c {
+        HooksCmd::Install(a) => {
+            let t = HookTarget::locate(a.agent.into(), a.settings.as_deref(), &env)?;
+            let change = ah::install(&t, a.dry_run)?;
+            let undo = format!(
+                "alice hooks uninstall {}{}",
+                t.agent.name(),
+                a.settings
+                    .as_ref()
+                    .map(|_| format!(" --settings {}", ah::shell_quote(&t.file.to_string_lossy())))
+                    .unwrap_or_default()
+            );
+            let notes = ah::install_notes(t.agent);
+            print(
+                json,
+                &hooks_change_json(&t, &change, a.dry_run, &notes)?,
+                || ah::install_report(&t, &change, a.dry_run, &undo),
+            )
+        }
+        HooksCmd::Uninstall(a) => {
+            let t = HookTarget::locate(a.agent.into(), a.settings.as_deref(), &env)?;
+            let change = ah::uninstall(&t, a.dry_run)?;
+            print(
+                json,
+                &hooks_change_json(&t, &change, a.dry_run, &[])?,
+                || ah::uninstall_report(&t, &change, a.dry_run),
+            )
+        }
+        HooksCmd::Status(a) => {
+            let t = HookTarget::locate(a.agent.into(), a.settings.as_deref(), &env)?;
+            let s = ah::status(&t)?;
+            let health = rt()?.block_on(async {
+                match DaemonClient::try_existing(home).await {
+                    Some(c) => c.health().await.ok(),
+                    None => None,
+                }
+            });
+            let last = health
+                .as_ref()
+                .and_then(|h| h.capture.as_ref())
+                .and_then(|c| c.last_capture_at.clone());
+            let mut v = serde_json::to_value(&s)?;
+            v["agent"] = t.agent.name().into();
+            v["daemon_running"] = health.is_some().into();
+            v["last_capture_at"] = last.clone().into();
+            print(json, &v, || {
+                let mut out = format!("{} ({}): ", t.agent.label(), s.file.display());
+                let repair = format!("run `alice hooks install {}`", t.agent.name());
+                if s.installed {
+                    out.push_str("installed\n");
+                } else if s.events.is_empty() {
+                    out.push_str("not installed\n");
+                } else {
+                    out.push_str(&format!(
+                        "on {} of the 5 events only ({}); {repair}\n",
+                        s.events.len(),
+                        s.events.join(", ")
+                    ));
+                }
+                for b in &s.binaries {
+                    if s.missing.contains(b) {
+                        out.push_str(&format!("  runs {b}, which does not exist; {repair}\n"));
+                    } else {
+                        out.push_str(&format!("  runs {b}\n"));
+                    }
+                }
+                out.push_str(&match (&health, &last) {
+                    (None, _) => "  last capture: unknown (the daemon is not running)\n".into(),
+                    (Some(_), None) => "  last capture: none yet\n".into(),
+                    (Some(_), Some(at)) => format!("  last capture: {at}\n"),
+                });
+                out
+            })
+        }
+    }
+}
+
+/// An install's or an uninstall's `--json`: the change (never the file's text), its agent,
+/// whether it was a dry run, and what the person still has to do (`notes`).
+fn hooks_change_json(
+    t: &alice_daemon::agent_hooks::HookTarget,
+    change: &alice_daemon::agent_hooks::HookChange,
+    dry_run: bool,
+    notes: &[&str],
+) -> Result<serde_json::Value> {
+    let mut v = serde_json::to_value(change)?;
+    v["agent"] = t.agent.name().into();
+    v["dry_run"] = dry_run.into();
+    v["notes"] = notes.into();
+    Ok(v)
+}
+
 /// Ctrl-C as a thing to wait for. On Unix the handler is installed when it is created, so one
 /// created before the daemon starts catches an interrupt at any later point.
 #[cfg(unix)]
@@ -2910,6 +3156,29 @@ impl Interrupt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `alice maintenance run --help` names every job the daemon runs (the merge boundary found
+    /// `capture_retention` and `model_purge` missing from the hand-written list).
+    #[test]
+    fn the_maintenance_run_help_names_every_job() {
+        let cmd = MaintenanceCmd::augment_subcommands(clap::Command::new("maintenance"));
+        let run = cmd
+            .find_subcommand("run")
+            .expect("`maintenance run` exists");
+        let help = format!(
+            "{} {}",
+            run.get_about().map(ToString::to_string).unwrap_or_default(),
+            run.get_long_about()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        );
+        let words: Vec<&str> = help
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .collect();
+        for job in alice_daemon::maintenance::Job::names() {
+            assert!(words.contains(&job), "the help names {job}: {help}");
+        }
+    }
 
     fn confirm(yes: bool, tty: bool, typed: &str) -> (Result<()>, String) {
         let mut asked = Vec::new();
@@ -3129,6 +3398,50 @@ mod tests {
                 && notes.contains("7 rows held back by the cloud policy")
                 && notes.contains("WARNING: openai:m is unreachable"),
             "{notes}"
+        );
+    }
+
+    /// SP2 Task 12 (ruling 6): `alice stats` shows distillation's part of the day, and
+    /// `alice capture status` lists the sessions with their distillation states.
+    #[test]
+    fn stats_and_capture_status_show_distillation() {
+        let stats = Stats {
+            judge_provider: "jev".into(),
+            distilled_today: 7,
+            distill_dropped_today: 2,
+            distill_cost_today_usd: 0.0012,
+            ..Default::default()
+        };
+        let text = stats_text(&stats);
+        assert!(
+            text.contains("distilled today: 7 kept, 2 dropped, $0.0012"),
+            "{text}"
+        );
+        let st = CaptureStatus {
+            tenant: false,
+            enabled: true,
+            distill_provider: "jev".into(),
+            distill_state: "waiting_budget".into(),
+            sessions: vec![CaptureSessionRow {
+                uri: "claude-code:session:s1".into(),
+                project: "shop".into(),
+                chunks: 4,
+                ended: true,
+                distill_state: "done".into(),
+                last_capture_at: Some("2026-10-17T01:02:03.000Z".into()),
+                ..Default::default()
+            }],
+        };
+        let text = capture_status_text(&st);
+        assert!(
+            text.starts_with("capture: on; distillation: jev (waiting budget)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "claude-code:session:s1  shop  4 chunks  done  ended  last capture 2026-10-17T01:02:03.000Z"
+            ),
+            "{text}"
         );
     }
 }

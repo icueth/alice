@@ -2,6 +2,7 @@
 
 use super::SearchOutput;
 use crate::api::{Hit, MatchVia, RecallResponse, Tier};
+use crate::model::Origin;
 use crate::normalize::{estimate_tokens, truncate_chars};
 
 /// Longest body shown for one result.
@@ -9,6 +10,18 @@ const FULL_BODY_CHARS: usize = 2_000;
 /// Rough JSON overhead per result (keys, id, dates, score), in tokens.
 const JSON_HIT_OVERHEAD: usize = 30;
 const RAW_NOTE: &str = "(Few saved memories matched, so raw session excerpts are included.)\n";
+/// What ends the line of a memory distilled from a captured session, in recall's text and in
+/// the briefing (SP2 spec §6.6).
+pub const AUTO_MARK: &str = " (auto)";
+
+/// [`AUTO_MARK`] for an `origin` of a hit or a related memory, or nothing.
+fn auto_mark(origin: Option<&str>) -> &'static str {
+    if origin == Some(Origin::Distill.as_str()) {
+        AUTO_MARK
+    } else {
+        ""
+    }
+}
 
 fn omitted_note(n: usize) -> String {
     format!("({n} more results omitted; raise max_tokens or narrow the query.)\n")
@@ -73,8 +86,9 @@ fn header(i: usize, h: &Hit) -> String {
         (Some("team"), None) => " · (team)".to_string(),
         _ => String::new(),
     };
+    let auto = auto_mark(h.origin.as_deref());
     format!(
-        "[{}] {} · {} · {} · {}{}{} · matched: {}\n",
+        "[{}] {} · {} · {} · {}{}{} · matched: {}{auto}\n",
         i + 1,
         h.id,
         kind,
@@ -169,11 +183,12 @@ pub fn pack_text(out: &SearchOutput, project: Option<&str>, max_tokens: usize) -
         let mut rel = String::from("related:\n");
         for r in &out.related {
             rel.push_str(&format!(
-                "- {} ({}) {} [{}]\n",
+                "- {} ({}) {} [{}]{}\n",
                 r.id,
                 r.kind.as_str(),
                 r.title,
-                r.via
+                r.via,
+                auto_mark(r.origin.as_deref())
             ));
         }
         if used + estimate_tokens(&rel) <= budget {
@@ -248,6 +263,7 @@ mod tests {
             source: None,
             author: None,
             cloud_ok: None,
+            origin: None,
         }
     }
 
@@ -276,6 +292,7 @@ mod tests {
             kind: Kind::Fact,
             title: "related title".into(),
             via: "supersedes".into(),
+            origin: None,
         }];
         for budget in [120, 300, 777, 1500] {
             let (text, omitted) = pack_text(&out, Some("app"), budget);

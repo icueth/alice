@@ -290,17 +290,24 @@ pub(crate) fn project_allowed(
 /// whatever `privacy.redact` stored); a local one gets the stored text. Done before
 /// [`split_by_policy`], so the policy is still asked right before the texts are sent (and
 /// redaction is idempotent, so a retry may run it again).
+///
+/// A memory's passage is cut to [`MEMORY_EMBED_CHARS`](alice_core::embed::MEMORY_EMBED_CHARS)
+/// characters: when it was, it is built again from the title and body redacted whole, so a key
+/// the cut would split never leaves as a fragment no detector knows (a store that keeps secrets
+/// holds them whole; owner's decision 2026-10-17). A memory that changed since it was read is
+/// left out: it is queued again with its new text.
 pub(crate) fn redacted_for(
     readers: &ReaderPool,
     policy: Option<&Arc<dyn JevPolicy>>,
     remote: bool,
-    mut items: Vec<PendingItem>,
+    items: Vec<PendingItem>,
 ) -> Vec<PendingItem> {
     if !remote {
         return items;
     }
     let mut rules: HashMap<String, Arc<Redactor>> = HashMap::new();
-    for i in &mut items {
+    let mut out = Vec::with_capacity(items.len());
+    for mut i in items {
         let r = rules.entry(i.project_id.clone()).or_insert_with(|| {
             match (policy, slug_of(readers, &i.project_id)) {
                 (Some(p), Some(slug)) => p.redactor(&slug),
@@ -308,12 +315,32 @@ pub(crate) fn redacted_for(
                 _ => Arc::new(Redactor::builtin()),
             }
         });
-        let out = r.apply(&i.text);
-        if !out.found.is_empty() {
-            i.text = out.text;
+        if let VecKey::Memory(seq) = i.key {
+            match readers.with(|c| embeddings::memory_fields_if_current(c, seq, &i.stamp)) {
+                Ok(Some((title, body))) => {
+                    if alice_core::embed::memory_embed_text_is_cut(&title, &body) {
+                        i.text = alice_core::embed::memory_embed_text(
+                            &r.apply(&title).text,
+                            &r.apply(&body).text,
+                        );
+                    }
+                }
+                // Changed or gone: its new text is queued (or there is nothing to embed).
+                Ok(None) => continue,
+                // Not readable now: not sent this round.
+                Err(e) => {
+                    tracing::warn!(error = %e, "a memory's text could not be read again; it waits for the next round");
+                    continue;
+                }
+            }
         }
+        let red = r.apply(&i.text);
+        if !red.found.is_empty() {
+            i.text = red.text;
+        }
+        out.push(i);
     }
-    items
+    out
 }
 
 /// `items` split into those that may be sent to the embedder and those the cloud policy keeps

@@ -6,6 +6,8 @@ use chrono::{DateTime, Utc};
 
 /// Characters of a memory body sent to a judge.
 pub const BODY_CHARS: usize = 700;
+/// Characters of a memory title sent to a judge.
+pub const TITLE_CHARS: usize = 200;
 /// Characters of a raw transcript chunk sent to a judge when grading a recall (Task 21):
 /// grading on the whole chunk differs from grading on its first 700 characters.
 pub const RAW_BODY_CHARS: usize = 2_000;
@@ -121,7 +123,7 @@ pub fn memory_block_bounded(
         m.kind.as_str(),
         importance(m.importance),
         m.project,
-        crate::normalize::truncate_chars(&m.title, 200),
+        crate::normalize::truncate_chars(&m.title, TITLE_CHARS),
         body
     )
 }
@@ -180,6 +182,7 @@ mod tests {
             similarity: None,
             raw: false,
             status: None,
+            origin: Default::default(),
         };
         let b = memory_block("Existing memory 1", &m, now);
         assert!(
@@ -211,6 +214,7 @@ mod tests {
             similarity: None,
             raw: false,
             status: None,
+            origin: Default::default(),
         };
         let b = memory_block("Memory", &m, now);
         let body = b.lines().nth(2).unwrap();

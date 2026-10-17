@@ -15,6 +15,8 @@ pub enum Actor {
     Agent(String),
     User,
     Judge(String),
+    /// A memory distilled from a captured session, by the provider that chose it (SP2 spec §6.5).
+    Distill(String),
     Sync,
     Import,
     /// Maintenance jobs (purges, retention).
@@ -27,6 +29,7 @@ impl Actor {
             Actor::Agent(a) => format!("agent:{a}"),
             Actor::User => "user".into(),
             Actor::Judge(p) => format!("judge:{p}"),
+            Actor::Distill(p) => format!("distill:{p}"),
             Actor::Sync => "sync".into(),
             Actor::Import => "import".into(),
             Actor::System => "system".into(),
@@ -42,6 +45,7 @@ impl Actor {
             _ => match s.split_once(':') {
                 Some(("agent", a)) => Actor::Agent(a.into()),
                 Some(("judge", p)) => Actor::Judge(p.into()),
+                Some(("distill", p)) => Actor::Distill(p.into()),
                 _ => Actor::Agent(s.into()),
             },
         }
@@ -85,7 +89,8 @@ pub struct EventRow {
     pub id: String,
     pub ts: String,
     pub hlc: String,
-    /// `agent:<name>`, `user`, `judge:<provider>`, `sync`, `import` or `system`.
+    /// `agent:<name>`, `user`, `judge:<provider>`, `distill:<provider>`, `sync`, `import` or
+    /// `system`.
     pub actor: String,
     pub action: String,
     pub target_type: String,
@@ -137,12 +142,13 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
 /// Insert an event; returns its id. Call inside the transaction that made the change.
 pub fn record(conn: &Connection, e: &EventInput<'_>, hlc: &str) -> Result<String> {
     let id = new_id();
+    let ts = now_rfc3339();
     conn.prepare_cached(&format!(
         "INSERT INTO events ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
     ))?
     .execute(params![
         id,
-        now_rfc3339(),
+        ts,
         hlc,
         e.actor.as_string(),
         e.action,
@@ -152,6 +158,14 @@ pub fn record(conn: &Connection, e: &EventInput<'_>, hlc: &str) -> Result<String
         e.after.as_ref().map(|v| v.to_string()),
         e.group,
     ])?;
+    // A person's or an agent's change to a distilled memory marks it touched: the distill cap
+    // never replaces it (SP2 Task 12c addendum), however long the history keeps this event.
+    if e.target_type == "memory" && matches!(e.actor, Actor::User | Actor::Agent(_)) {
+        conn.prepare_cached(
+            "UPDATE memories SET touched_at = ?2 WHERE id = ?1 AND origin = 'distill'",
+        )?
+        .execute(params![e.target_id, ts])?;
+    }
     Ok(id)
 }
 
@@ -260,6 +274,7 @@ mod tests {
             Actor::Agent("claude-code".into()),
             Actor::User,
             Actor::Judge("jev".into()),
+            Actor::Distill("jev".into()),
             Actor::Sync,
             Actor::Import,
             Actor::System,
@@ -271,6 +286,7 @@ mod tests {
                 serde_json::Value::String(s)
             );
         }
+        assert_eq!(Actor::Distill("jev".into()).as_string(), "distill:jev");
         use crate::model::Author;
         assert_eq!(Actor::from_author(&Author::default()), Actor::User);
         assert_eq!(

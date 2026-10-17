@@ -152,6 +152,33 @@ impl SourceType {
     }
 }
 
+/// How a memory came to exist (SP2 spec §8.1): written by an agent or a person, distilled from a
+/// captured session, or imported (MemPalace).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    #[default]
+    Agent,
+    Distill,
+    Import,
+}
+
+impl Origin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Agent => "agent",
+            Origin::Distill => "distill",
+            Origin::Import => "import",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Origin> {
+        [Origin::Agent, Origin::Distill, Origin::Import]
+            .into_iter()
+            .find(|o| o.as_str() == s)
+    }
+}
+
 /// Who wrote a memory. Metadata only; never a container.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Author {
@@ -180,6 +207,8 @@ pub struct Memory {
     pub access_count: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_id: Option<String>,
+    #[serde(default)]
+    pub origin: Origin,
 }
 
 #[cfg(test)]
@@ -202,6 +231,25 @@ mod tests {
         }
         assert_eq!(Kind::parse(" Bugfix "), Some(Kind::Bugfix));
         assert_eq!(Kind::parse("nope"), None);
+    }
+
+    #[test]
+    fn origin_strings_round_trip_and_a_memory_without_one_is_an_agents() {
+        for o in [Origin::Agent, Origin::Distill, Origin::Import] {
+            assert_eq!(Origin::parse(o.as_str()), Some(o));
+            assert_eq!(serde_name(o), o.as_str());
+        }
+        assert_eq!(Origin::default(), Origin::Agent);
+        assert_eq!(Origin::parse("palace"), None);
+        // A memory serialised before origin existed reads as an agent's.
+        let json = serde_json::json!({
+            "id": "M1", "project": "global", "kind": "note", "title": "t", "body": "b",
+            "topics": [], "importance": 3, "status": "active", "author": {},
+            "created_at": "2026-10-16T00:00:00.000Z", "updated_at": "2026-10-16T00:00:00.000Z",
+            "access_count": 0
+        });
+        let m: Memory = serde_json::from_value(json).unwrap();
+        assert_eq!(m.origin, Origin::Agent);
     }
 
     #[test]

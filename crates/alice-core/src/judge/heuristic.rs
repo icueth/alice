@@ -226,6 +226,8 @@ impl Judge for HeuristicJudge {
                     existing_id: e.id.clone(),
                     probs,
                     agreement: exact,
+                    existing_origin: crate::model::Origin::default(),
+                    existing_body: String::new(),
                 }
             })
             .collect())
@@ -315,6 +317,7 @@ mod tests {
             similarity: sim,
             raw: false,
             status: None,
+            origin: Default::default(),
         }
     }
 

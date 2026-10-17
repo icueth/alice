@@ -3,6 +3,7 @@
 
 use crate::error::{AliceError, Result};
 use crate::ids::now_rfc3339;
+use crate::model::Origin;
 use crate::project::ProjectRef;
 use crate::store::kg::{self, AssertFact, EntityMatcher, FactAction};
 use crate::store::memories::{self, InsertOutcome, NewMemoryInput};
@@ -319,7 +320,11 @@ fn apply_inner(
             continue;
         }
         let project = project_of(conn, &m.project_slug)?;
-        let prepared = memories::prepare(m.input.clone(), &project, hlc())?;
+        let input = NewMemoryInput {
+            origin: Origin::Import,
+            ..m.input.clone()
+        };
+        let prepared = memories::prepare(input, &project, hlc())?;
         match memories::insert(conn, &prepared)? {
             InsertOutcome::New { id, .. } => {
                 legacy_put(conn, &legacy, "memory", &id)?;
@@ -627,6 +632,14 @@ mod tests {
             ("skipped".into(), "active".into()),
             "live at once, never judged"
         );
+        let origin: String = conn
+            .query_row(
+                "SELECT origin FROM memories WHERE legacy_id='d1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(origin, "import", "SP2 spec §8.1: the importer sets origin");
         assert!(
             legacy_get(&conn, "d1").unwrap().is_some()
                 && legacy_get(&conn, "c2").unwrap().is_some()

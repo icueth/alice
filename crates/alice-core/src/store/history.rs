@@ -417,6 +417,8 @@ fn undoable(action: &str) -> bool {
         action,
         "undo"
             | "source.ingest"
+            // A capture pass (SP2): raw chunks are evidence, like an ingest.
+            | "source.capture"
             | "import.batch"
             | "import.compat_enabled"
             | "memory.purge"
@@ -1209,7 +1211,11 @@ mod tests {
     #[test]
     fn events_on_other_targets_are_refused_as_such() {
         let mut t = T::new();
-        for (action, target_type) in [("widget.change", "widget"), ("source.ingest", "source")] {
+        for (action, target_type) in [
+            ("widget.change", "widget"),
+            ("source.ingest", "source"),
+            ("source.capture", "source"),
+        ] {
             let ev = t.record(
                 EventInput {
                     actor: &Actor::User,

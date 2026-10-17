@@ -28,5 +28,10 @@ jobs:
       # The server's admin scripts: their stub scenarios (no root, no system change) and shellcheck.
       - if: runner.os == 'Linux'
         run: shellcheck deploy/server/alice-server deploy/server/build-release deploy/server/tests/run.sh
+      # The tenant capture scripts every member downloads (POSIX sh). SC1007 (`VAR= cmd`), SC2088
+      # (a literal `~` in a message) and SC3013 (`test -nt`: in POSIX 2024, dash and bash, flagged
+      # by the runner's older shellcheck) are intended; notes below warning level are not gated.
+      - if: runner.os == 'Linux'
+        run: shellcheck -s sh -S warning -e SC1007,SC2088,SC3013 crates/alice-daemon/scripts/capture/hook.sh crates/alice-daemon/scripts/capture/setup.sh
       - if: runner.os == 'Linux'
         run: bash deploy/server/tests/run.sh

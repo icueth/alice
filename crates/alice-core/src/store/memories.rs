@@ -2,7 +2,7 @@
 
 use crate::error::{AliceError, Result};
 use crate::ids::{new_id, now_rfc3339};
-use crate::model::{Author, Kind, Memory, Status, limits};
+use crate::model::{Author, Kind, Memory, Origin, Status, limits};
 use crate::normalize::{content_hash, derive_title, nfc, normalize_topic};
 use crate::store::fts;
 use crate::store::projects::{self, ResolvedProject};
@@ -28,6 +28,11 @@ pub struct NewMemoryInput {
     /// The project is `global` only because nothing named one (no project, no working
     /// directory): the judge may route the memory to a project later.
     pub project_defaulted: bool,
+    /// How the memory came to exist. Internal: never taken from a request.
+    pub origin: Origin,
+    /// The ids of the raw chunks the memory was distilled from, recorded with it in
+    /// `provenance` (an id with no chunk is not recorded). Internal: never taken from a request.
+    pub provenance: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +56,9 @@ pub struct PreparedMemory {
     /// classify it).
     pub kind_explicit: bool,
     pub project_defaulted: bool,
+    pub origin: Origin,
+    /// Chunk ids, without blanks or repeats.
+    pub provenance: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +187,13 @@ pub fn prepare(
     let topics = normalize_topics(&input.topics)?;
     let importance = check_importance(input.importance)?;
     let hash = content_hash(&project.slug, kind, &title, &content);
+    let mut provenance: Vec<String> = Vec::with_capacity(input.provenance.len());
+    for c in input.provenance {
+        let c = c.trim();
+        if !c.is_empty() && !provenance.iter().any(|p| p == c) {
+            provenance.push(c.to_string());
+        }
+    }
     Ok(PreparedMemory {
         id: new_id(),
         project_id: project.id.clone(),
@@ -197,6 +212,8 @@ pub fn prepare(
         legacy_id: input.legacy_id,
         kind_explicit: input.kind.is_some(),
         project_defaulted: input.project_defaulted,
+        origin: input.origin,
+        provenance,
     })
 }
 
@@ -278,8 +295,44 @@ pub fn link(conn: &Connection, from: &str, to: &str, kind: &str, by: &str) -> Re
     Ok(())
 }
 
-/// Insert a prepared memory (status `pending`) with its topics and FTS rows.
-/// Exact duplicates and repeated idempotency keys return the existing id.
+/// An explicit memory beats a distilled one, exact copies included (SP2 final review M1): when
+/// `id` is a distilled memory that exact dedupe found (any status but trashed: active, pending,
+/// superseded or archived) and its exact copy at hand is not distilled, the memory becomes the
+/// copy's: its origin, author and `kind_explicit`, with `updated_at` and `hlc` moved. Its status
+/// stays as it is. A distilled copy changes nothing. No history row is recorded here (the writer
+/// records events).
+fn promote_distilled(
+    conn: &Connection,
+    id: &str,
+    origin: Origin,
+    author: &Author,
+    kind_explicit: bool,
+    hlc: &str,
+) -> Result<()> {
+    if origin == Origin::Distill {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE memories SET origin = ?2, author_agent = ?3, author_model = ?4, author_session = ?5,
+            kind_explicit = ?6, updated_at = ?7, hlc = ?8
+         WHERE id = ?1 AND origin = 'distill'",
+        params![
+            id,
+            origin.as_str(),
+            author.agent,
+            author.model,
+            author.session,
+            kind_explicit,
+            now_rfc3339(),
+            hlc
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert a prepared memory (status `pending`) with its topics, provenance and FTS rows.
+/// Exact duplicates and repeated idempotency keys return the existing id and write nothing,
+/// except that an explicit copy of a distilled memory makes it explicit (`promote_distilled`).
 /// Each id in `supersedes` gets a `supersedes` link and becomes `superseded`; unknown ids are
 /// skipped and trashed memories keep their status. Call inside a transaction (the writer does).
 pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
@@ -302,14 +355,15 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
         )
         .optional()?
     {
+        promote_distilled(conn, &id, m.origin, &m.author, m.kind_explicit, &m.hlc)?;
         return Ok(InsertOutcome::Duplicate { id });
     }
     let now = now_rfc3339();
     conn.execute(
         "INSERT INTO memories (id, project_id, kind, title, body, importance, status, content_hash,
             author_agent, author_model, author_session, idempotency_key, created_at, updated_at, hlc, legacy_id,
-            kind_explicit, project_defaulted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            kind_explicit, project_defaulted, origin)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             m.id,
             m.project_id,
@@ -327,7 +381,8 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
             m.hlc,
             m.legacy_id,
             m.kind_explicit,
-            m.project_defaulted
+            m.project_defaulted,
+            m.origin.as_str()
         ],
     )?;
     let seq = conn.last_insert_rowid();
@@ -336,6 +391,13 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
             "INSERT OR IGNORE INTO memory_topics (memory_id, topic) VALUES (?1, ?2)",
             params![m.id, t],
         )?;
+    }
+    // Only chunks that exist: a provenance row must lead to text.
+    for chunk in &m.provenance {
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO provenance (memory_id, chunk_id) SELECT ?1, id FROM chunks WHERE id = ?2",
+        )?
+        .execute(params![m.id, chunk])?;
     }
     fts::index_memory(conn, seq, &m.title, &m.body, &m.topics)?;
     let by = m.author.agent.clone().unwrap_or_else(|| "user".into());
@@ -361,12 +423,14 @@ pub fn insert(conn: &Connection, m: &PreparedMemory) -> Result<InsertOutcome> {
 }
 
 const SELECT_MEMORY: &str = "SELECT m.seq, m.id, p.slug, m.kind, m.title, m.body, m.importance, m.status,
-    m.author_agent, m.author_model, m.author_session, m.created_at, m.updated_at, m.access_count, m.legacy_id
+    m.author_agent, m.author_model, m.author_session, m.created_at, m.updated_at, m.access_count, m.legacy_id,
+    m.origin
     FROM memories m JOIN projects p ON p.id = m.project_id";
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Memory)> {
     let kind: String = r.get(3)?;
     let status: String = r.get(7)?;
+    let origin: String = r.get(15)?;
     Ok((
         r.get(0)?,
         Memory {
@@ -387,6 +451,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Memory)> {
             updated_at: r.get(12)?,
             access_count: r.get(13)?,
             legacy_id: r.get(14)?,
+            origin: Origin::parse(&origin).unwrap_or_default(),
         },
     ))
 }
@@ -413,8 +478,15 @@ pub fn get_many(conn: &Connection, ids: &[String]) -> Result<Vec<Memory>> {
     Ok(out)
 }
 
+/// SQL that holds for every memory but a distilled one whose judge stage is not over: recall and
+/// the briefing show only the memories it holds for (SP2 spec §6.6). `table` qualifies the
+/// columns: `"m."`, or `""` for the bare table.
+pub fn judged_sql(table: &str) -> String {
+    format!("NOT ({table}origin = 'distill' AND {table}judge_state <> 'done')")
+}
+
 /// Bound parameters per `IN (...)` query, well under SQLite's limit of 32,766.
-const IN_BATCH: usize = 4_096;
+pub(crate) const IN_BATCH: usize = 4_096;
 
 /// Fetch by internal sequence numbers (search results). Order follows the input (first
 /// occurrence); unknown seqs are skipped. A recall passes up to ~2,000 seqs here, so the rows
@@ -563,6 +635,31 @@ pub fn move_to_project(
         )
         .optional()?
     {
+        // The mover's owner takes over an exact distilled copy (the caller merges into it).
+        let (origin, agent, model, session, kind_explicit): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+        ) = conn.query_row(
+            "SELECT origin, author_agent, author_model, author_session, kind_explicit
+             FROM memories WHERE seq = ?1",
+            [seq],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        promote_distilled(
+            conn,
+            &other,
+            Origin::parse(&origin).unwrap_or_default(),
+            &Author {
+                agent,
+                model,
+                session,
+            },
+            kind_explicit,
+            hlc,
+        )?;
         return Ok(MoveOutcome::DuplicateOf(other));
     }
     conn.execute(
@@ -736,6 +833,245 @@ mod tests {
             content: content.into(),
             ..Default::default()
         }
+    }
+
+    /// Provenance names chunks that exist: an id with no chunk behind it is not recorded, and
+    /// blanks and repeats are dropped before the insert.
+    #[test]
+    fn provenance_records_only_chunks_that_exist() {
+        let (_d, c, p) = setup();
+        c.execute(
+            "INSERT INTO sources (id, project_id, type, uri, created_at)
+             VALUES ('S1', ?1, 'session', 'claude-code:session:s1', '2026-10-16T00:00:00.000Z')",
+            [&p.id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO chunks (id, source_id, project_id, ord, text, content_hash, created_at)
+             VALUES ('C1', 'S1', ?1, 0, 'turn', 'h', '2026-10-16T00:00:00.000Z')",
+            [&p.id],
+        )
+        .unwrap();
+        let mut i = input("We distil only what Jev chose");
+        i.origin = Origin::Distill;
+        i.provenance = vec!["C1".into(), " C1 ".into(), "".into(), "C-MISSING".into()];
+        let m = prepare(i, &p, "h".into()).unwrap();
+        assert_eq!(m.provenance, ["C1", "C-MISSING"]);
+        let InsertOutcome::New { id, .. } = insert(&c, &m).unwrap() else {
+            panic!("expected new")
+        };
+        let rows: Vec<String> = c
+            .prepare("SELECT chunk_id FROM provenance WHERE memory_id = ?1")
+            .unwrap()
+            .query_map([&id], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, ["C1"], "a missing chunk id is not recorded");
+        assert_eq!(
+            get_many(&c, std::slice::from_ref(&id)).unwrap()[0].origin,
+            Origin::Distill
+        );
+    }
+
+    /// `(origin, author agent, model, session, kind_explicit, updated_at, hlc)` of a memory.
+    type Owner = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+        String,
+        String,
+    );
+
+    fn owner(c: &rusqlite::Connection, id: &str) -> Owner {
+        c.query_row(
+            "SELECT origin, author_agent, author_model, author_session, kind_explicit, updated_at, hlc
+             FROM memories WHERE id = ?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    fn distilled_input(content: &str) -> NewMemoryInput {
+        let mut i = input(content);
+        i.kind = Some(Kind::Note);
+        i.origin = Origin::Distill;
+        i.author = Author {
+            agent: Some("claude-code".into()),
+            session: Some("S1".into()),
+            model: None,
+        };
+        i
+    }
+
+    fn explicit_input(content: &str) -> NewMemoryInput {
+        let mut i = input(content);
+        i.author = Author {
+            agent: Some("codex".into()),
+            model: Some("gpt-x".into()),
+            session: Some("S2".into()),
+        };
+        i
+    }
+
+    /// SP2 final M1: an explicit memory beats a distilled one, exact copies included. An
+    /// explicit write of the text a live distilled memory holds returns that memory as the
+    /// duplicate and makes it the writer's: origin, author and `kind_explicit` become the
+    /// newcomer's, and `updated_at` and `hlc` move. A distilled write of an explicit memory's
+    /// text, or of another distilled memory's, changes nothing.
+    #[test]
+    fn an_explicit_copy_promotes_a_distilled_memory_and_not_the_other_way() {
+        let (_d, c, p) = setup();
+        let text = "Deploys run blue green on Fridays";
+        let InsertOutcome::New { id, .. } = insert(
+            &c,
+            &prepare(distilled_input(text), &p, "h1".into()).unwrap(),
+        )
+        .unwrap() else {
+            panic!("expected new")
+        };
+        let before = owner(&c, &id);
+        assert_eq!((before.0.as_str(), before.4), ("distill", true));
+        // A distilled copy of a distilled memory: nothing changes.
+        let again = insert(
+            &c,
+            &prepare(distilled_input(text), &p, "h2".into()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again, InsertOutcome::Duplicate { id: id.clone() });
+        assert_eq!(owner(&c, &id), before);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // The same text and kind, written by an agent that gave no kind (`note` by default).
+        let out = insert(&c, &prepare(explicit_input(text), &p, "h3".into()).unwrap()).unwrap();
+        assert_eq!(out, InsertOutcome::Duplicate { id: id.clone() });
+        let after = owner(&c, &id);
+        assert_eq!(
+            (
+                after.0.as_str(),
+                after.1.as_deref(),
+                after.2.as_deref(),
+                after.3.as_deref(),
+                after.4,
+                after.6.as_str()
+            ),
+            (
+                "agent",
+                Some("codex"),
+                Some("gpt-x"),
+                Some("S2"),
+                false,
+                "h3"
+            )
+        );
+        assert_ne!(after.5, before.5, "updated_at moves");
+        let rows: i64 = c
+            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        // The other way round: a distilled copy of an explicit memory changes nothing.
+        let InsertOutcome::New { id: mine, .. } = insert(
+            &c,
+            &prepare(
+                explicit_input("Releases are tagged from main"),
+                &p,
+                "h4".into(),
+            )
+            .unwrap(),
+        )
+        .unwrap() else {
+            panic!("expected new")
+        };
+        let kept = owner(&c, &mine);
+        let copy = insert(
+            &c,
+            &prepare(
+                distilled_input("Releases are tagged from main"),
+                &p,
+                "h5".into(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(copy, InsertOutcome::Duplicate { id: mine.clone() });
+        assert_eq!(owner(&c, &mine), kept);
+    }
+
+    /// SP2 final M1 on the move path: an explicit memory moved into a project that holds its
+    /// exact distilled copy makes that copy the writer's (the mover then merges into it); a
+    /// distilled memory moved onto an explicit copy changes nothing.
+    #[test]
+    fn moving_an_explicit_memory_onto_a_distilled_copy_promotes_the_copy() {
+        let (_d, c, app) = setup();
+        let lib = projects::upsert_project(
+            &c,
+            &ProjectRef {
+                key: "k/lib".into(),
+                slug: "lib".into(),
+                name: "lib".into(),
+                root: None,
+                remote: None,
+            },
+        )
+        .unwrap();
+        let new_in = |p: &projects::ResolvedProject, i: NewMemoryInput, hlc: &str| -> String {
+            match insert(&c, &prepare(i, p, hlc.into()).unwrap()).unwrap() {
+                InsertOutcome::New { id, .. } => id,
+                other => panic!("expected new, got {other:?}"),
+            }
+        };
+        let text = "The cache is write-through";
+        let copy = new_in(&lib, distilled_input(text), "h1");
+        let mut mine = explicit_input(text);
+        mine.kind = Some(Kind::Note);
+        let mine = new_in(&app, mine, "h2");
+        assert_eq!(
+            move_to_project(&c, &mine, &lib.id, "h3").unwrap(),
+            MoveOutcome::DuplicateOf(copy.clone())
+        );
+        let promoted = owner(&c, &copy);
+        assert_eq!(
+            (
+                promoted.0.as_str(),
+                promoted.1.as_deref(),
+                promoted.2.as_deref(),
+                promoted.3.as_deref(),
+                promoted.4,
+                promoted.6.as_str()
+            ),
+            (
+                "agent",
+                Some("codex"),
+                Some("gpt-x"),
+                Some("S2"),
+                true,
+                "h3"
+            )
+        );
+        // The other way round: nothing changes.
+        let text = "The queue is at-least-once";
+        let mut theirs = explicit_input(text);
+        theirs.kind = Some(Kind::Note);
+        let theirs = new_in(&lib, theirs, "h4");
+        let kept = owner(&c, &theirs);
+        let auto = new_in(&app, distilled_input(text), "h5");
+        assert_eq!(
+            move_to_project(&c, &auto, &lib.id, "h6").unwrap(),
+            MoveOutcome::DuplicateOf(theirs.clone())
+        );
+        assert_eq!(owner(&c, &theirs), kept);
     }
 
     #[test]

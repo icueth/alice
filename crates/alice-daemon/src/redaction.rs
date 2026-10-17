@@ -6,6 +6,14 @@
 //! The project rules come from [`SettingsHandle::project_privacy`], i.e. from the one
 //! [`alice_core::settings::ProjectSettingsCache`] of the daemon: an invalid project file fails
 //! closed, and a loosening waits for three polls. Nothing here reads `.alice.toml` itself.
+//!
+//! Storage follows `privacy.redact`; egress never does (owner's decision 2026-10-17). A person's
+//! store, a server tenant's included (where the admin pins the switch), keeps secrets as written
+//! when `privacy.redact` is off, and [`Redactors::for_root`] then lets them through. Text that
+//! leaves for a cloud service takes [`Redactors::for_root_always_on`] whatever the switch says,
+//! and whatever the allowlist says of a built-in detector's match (re-review N3: an allowlist is
+//! an exception for storage, never a way out for a key), and the shared team store redacts every
+//! write ([`Redactors::for_team_store`]): everyone reads it.
 
 use crate::config::SettingsHandle;
 use alice_core::redact::Redactor;
@@ -30,6 +38,8 @@ enum Source {
 
 pub struct Redactors {
     source: Source,
+    /// The team store: `privacy.redact` is on for every write, whatever the settings say.
+    forced: bool,
     /// Indexed by `always_on` (see [`Redactors::for_root_always_on`]).
     global: Mutex<[Option<Entry>; 2]>,
     projects: Mutex<HashMap<(PathBuf, bool), Entry>>,
@@ -41,6 +51,15 @@ impl Redactors {
         Arc::new(Self::with(Source::Live(settings)))
     }
 
+    /// The team store's redactors: the live settings with `privacy.redact` forced on for every
+    /// write, since every tenant reads what it holds.
+    pub fn for_team_store(settings: Arc<SettingsHandle>) -> Arc<Self> {
+        Arc::new(Self {
+            forced: true,
+            ..Self::with(Source::Live(settings))
+        })
+    }
+
     /// Redactors for fixed privacy settings, without project files.
     pub fn fixed(privacy: PrivacySettings) -> Arc<Self> {
         Arc::new(Self::with(Source::Fixed(privacy)))
@@ -49,6 +68,7 @@ impl Redactors {
     fn with(source: Source) -> Self {
         Self {
             source,
+            forced: false,
             global: Mutex::new([None, None]),
             projects: Mutex::new(HashMap::new()),
         }
@@ -63,27 +83,29 @@ impl Redactors {
         }
     }
 
-    /// The redactor for a project in the working tree `tree` (`None`: no project). Never fails and never
-    /// falls back to "no redaction": if the effective settings do not compile (a pattern that
-    /// settings validation should have refused), the built-in detectors run with the configured
-    /// switch and mode, and a warning names no pattern.
+    /// The redactor for storing text of a project in the working tree `tree` (`None`: no
+    /// project): it follows `privacy.redact`, so a store that keeps secrets as written gets one
+    /// that lets them through (the team store's never does). Never fails and never falls back to
+    /// "no redaction": if the effective settings do not compile (a pattern that settings
+    /// validation should have refused), the built-in detectors run with the configured switch
+    /// and mode, and a warning names no pattern.
     pub fn for_root(&self, tree: Option<&ProjectTree>) -> Arc<Redactor> {
         self.cached(tree, false)
     }
 
     /// [`for_root`](Self::for_root) with the `privacy.redact` switch forced on, whatever it
-    /// says: for text that leaves the machine (the Jev judge's requests), which is redacted
-    /// even when the person stores raw text. The mode does not matter to the caller, which
-    /// applies the redactor and never asks it to refuse.
+    /// says, and an allowlist that exempts no built-in detector's match
+    /// ([`Redactor::for_egress`]): for text that leaves for a cloud service (the Jev judge's and
+    /// distillation's requests, a remote embedder's input) or for the team store, which is
+    /// redacted even when the person stores secrets as written. The mode does not matter to the
+    /// caller, which applies the redactor and never asks it to refuse.
     pub fn for_root_always_on(&self, tree: Option<&ProjectTree>) -> Arc<Redactor> {
         self.cached(tree, true)
     }
 
     fn cached(&self, tree: Option<&ProjectTree>, always_on: bool) -> Arc<Redactor> {
         let mut privacy = self.privacy_for(tree);
-        // A server tenant always redacts: whatever the settings snapshot says.
-        let tenant = matches!(&self.source, Source::Live(s) if s.is_tenant());
-        if always_on || tenant {
+        if always_on || self.forced {
             privacy.redact = true;
         }
         match tree {
@@ -95,7 +117,7 @@ impl Redactors {
                 {
                     return r.clone();
                 }
-                let r = Self::build(&privacy);
+                let r = Self::build(&privacy, always_on);
                 if cache.len() >= MAX_ROOTS {
                     cache.clear();
                 }
@@ -109,19 +131,20 @@ impl Redactors {
                 {
                     return r.clone();
                 }
-                let r = Self::build(&privacy);
+                let r = Self::build(&privacy, always_on);
                 g[always_on as usize] = Some((privacy, r.clone()));
                 r
             }
         }
     }
 
-    fn build(privacy: &PrivacySettings) -> Arc<Redactor> {
-        Arc::new(Redactor::new(privacy).unwrap_or_else(|e| {
+    fn build(privacy: &PrivacySettings, egress: bool) -> Arc<Redactor> {
+        let r = Redactor::new(privacy).unwrap_or_else(|e| {
             // The error names the setting, never the pattern.
             tracing::warn!(error = %e, "privacy settings do not compile; using the built-in detectors only");
             Redactor::fallback(privacy)
-        }))
+        });
+        Arc::new(if egress { r.for_egress() } else { r })
     }
 }
 
@@ -205,6 +228,38 @@ mod tests {
         );
     }
 
+    /// Re-review N3: an allowlist (even one that allows everything) exempts nothing a built-in
+    /// detector finds in text that leaves for the cloud; it still exempts a custom pattern's
+    /// match there, and storage follows it as before.
+    #[test]
+    fn egress_ignores_the_allowlist_for_the_built_in_detectors() {
+        let r = Redactors::fixed(PrivacySettings {
+            allowlist: vec!["(?s).*".into()],
+            custom_patterns: vec![CustomPattern {
+                name: "ticket".into(),
+                regex: "TCK-[0-9]{4,}".into(),
+            }],
+            ..Default::default()
+        });
+        let text = concat!(
+            "token gh",
+            "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 for TCK-1234"
+        );
+        assert_eq!(r.for_root(None).apply(text).text, text, "storage: allowed");
+        let out = r.for_root_always_on(None).apply(text);
+        assert_eq!(out.found, ["github_token"]);
+        assert!(
+            out.text.contains("TCK-1234"),
+            "a custom pattern's exception holds"
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let tree = ProjectTree::alone(repo.path());
+        assert_eq!(
+            r.for_root_always_on(Some(&tree)).apply(text).found,
+            ["github_token"]
+        );
+    }
+
     #[test]
     fn settings_that_do_not_compile_still_redact() {
         let r = Redactors::fixed(PrivacySettings {
@@ -219,33 +274,47 @@ mod tests {
         assert!(red.check("content", "password = hunter2").is_err());
     }
 
+    /// Owner's decision 2026-10-17: a tenant whose admin pinned `ALICE_PRIVACY_REDACT=false`
+    /// stores secrets as written, like a local home that turned redaction off; what leaves for
+    /// the cloud is redacted all the same, and the team store redacts every write.
     #[test]
-    fn a_tenant_redacts_even_when_the_settings_say_redaction_is_off() {
-        // The environment is the one layer a tenant's rules do not replace with defaults, so a
-        // variable can leave `privacy.redact` off in the snapshot; the redactors still redact.
+    fn a_tenant_follows_the_admins_pin_and_the_team_store_always_redacts() {
         let d = tempfile::tempdir().unwrap();
         let home = AliceHome::new(d.path().to_path_buf());
         let env = vec![("ALICE_PRIVACY_REDACT".to_string(), "false".to_string())];
         let s = SettingsHandle::load_with(&home, env.clone(), true);
         assert!(s.is_tenant());
-        // Since M2's A-I4 the refused variable makes the snapshot fail closed (redaction on);
-        // whatever it says, the redactors of a tenant redact.
         let text = concat!("token gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 here");
-        let r = Redactors::new(s);
-        assert_eq!(r.for_root(None).apply(text).found, ["github_token"]);
-        assert_eq!(
-            r.for_root_always_on(None).apply(text).found,
-            ["github_token"]
-        );
         let repo = tempfile::tempdir().unwrap();
+        let tree = ProjectTree::alone(repo.path());
+
+        let kept = Redactors::new(s.clone());
         assert_eq!(
-            r.for_root(Some(&ProjectTree::alone(repo.path())))
-                .apply(text)
-                .found,
+            kept.for_root(None).apply(text).text,
+            text,
+            "stored as written"
+        );
+        assert_eq!(kept.for_root(Some(&tree)).apply(text).text, text);
+        assert_eq!(
+            kept.for_root_always_on(None).apply(text).found,
+            ["github_token"],
+            "egress is redacted"
+        );
+
+        let team = Redactors::for_team_store(s);
+        assert_eq!(team.for_root(None).apply(text).found, ["github_token"]);
+        assert_eq!(
+            team.for_root(Some(&tree)).apply(text).found,
             ["github_token"]
         );
-        // A local daemon with the same variable stores the text as it is.
-        let local = Redactors::new(SettingsHandle::load_with(&home, env, false));
-        assert!(local.for_root(None).apply(text).found.is_empty());
+
+        // Without the pin a tenant redacts, as the defaults say.
+        let d2 = tempfile::tempdir().unwrap();
+        let plain =
+            SettingsHandle::load_with(&AliceHome::new(d2.path().to_path_buf()), Vec::new(), true);
+        assert_eq!(
+            Redactors::new(plain).for_root(None).apply(text).found,
+            ["github_token"]
+        );
     }
 }

@@ -121,6 +121,7 @@ case "$*" in
       panic) echo "thread 'main' panicked at crates/alice-daemon/src/adopt.rs:300:9" >&2; exit 101 ;;
       notputback) echo "alice: [not put back] adopting failed (disk full), and the tenant's own database could not be put back" >&2; exit 1 ;;
     esac
+    echo "adopt ran with ALICE_PRIVACY_REDACT=${ALICE_PRIVACY_REDACT:-unset}" >>"$ALICE_SERVER_ROOT/calls.log"
     [ -f "${3:-}" ] && cp -- "$3" "$ALICE_SERVER_ROOT/adopted-copy"
     printf '{\n  "adopted_from": "%s",\n  "memories": 3,\n  "chunks": 2,\n  "paths_cleared": 3,\n  "redacted_memories": 2,\n  "saved_tenant_db_as": "alice-before-restore-20261016T070000Z.db"\n}\n' "${3:-}"
     ;;
@@ -139,6 +140,15 @@ case "$*" in
     echo "jev_api_key set (****${v: -4})"
     ;;
   "config set judge.provider jev") echo jev >"$ALICE_HOME/judge.provider" ;;
+  "config set distill.provider "*|"config get distill.provider"|"config get judge.provider")
+    # CONFIG_FAIL: the tenants whose daemon does not answer.
+    case " ${CONFIG_FAIL:-} " in *" $(basename "$ALICE_HOME") "*) echo "alice: the daemon is not running" >&2; exit 1 ;; esac
+    case "$*" in
+      "config set distill.provider "*) echo "$4" >"$ALICE_HOME/distill.provider" ;;
+      "config get distill.provider") cat "$ALICE_HOME/distill.provider" 2>/dev/null || echo off ;;
+      *) cat "$ALICE_HOME/judge.provider" 2>/dev/null || echo heuristic ;;
+    esac
+    ;;
   "model fetch")
     if [ "${SELFTEST:-}" = fetchfail ]; then
       i=0; while [ "$i" -lt 2000 ]; do printf '\rmodel_quantized.onnx: %5.1f%%' "$i" >&2; i=$((i + 1)); done
@@ -211,6 +221,9 @@ add_creates_everything() {
   has "$e" 'ALICE_JUDGE_JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone'
   has "$e" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
   has "$e" 'ALICE_JUDGE_JEV_MODEL=jev-1.13.0'
+  has "$e" 'ALICE_CAPTURE_RAW_RETENTION=180d'
+  # No /etc/alice/secrets.default: a new tenant redacts, pinned so a person's settings cannot loosen it.
+  has "$e" 'ALICE_PRIVACY_REDACT=true'
   hasnt "$e" 'tok-'
   local u="$R/etc/systemd/system/alice@.service"
   has "$u" 'MemoryMax=3G'
@@ -307,24 +320,24 @@ add_prints_the_mcp_url() {
   run add dave
   [ "$RC" = 0 ] || fail "add dave exited $RC: $OUT"
   printf '%s\n' "$OUT" | grep -qF 'https://203.0.113.7/u/dave/mcp' || fail "no MCP URL"
-  # shellcheck disable=SC2016  # the literal text ${ALICE_TOKEN} is what must be printed
-  printf '%s\n' "$OUT" | grep -qF 'Authorization: Bearer ${ALICE_TOKEN}' || fail "no literal \${ALICE_TOKEN} example"
   [ "$(count_in 'tok-dave-')" = 1 ] || fail "token not printed once"
   pass
 }
 
-add_prints_a_single_quoted_mcp_hint() {
+GUS_SETUP='curl -fsSL https://203.0.113.7/u/gus/api/v1/capture/setup.sh | sh -s -- https://203.0.113.7/u/gus'
+add_prints_the_handover_and_the_setup_line() {
   run add gus
   [ "$RC" = 0 ] || fail "add gus exited $RC: $OUT"
-  local hint
-  hint=$(printf '%s\n' "$OUT" | grep -F 'claude mcp add' || true)
-  [ -n "$hint" ] || fail "no claude mcp add line: $OUT"
-  # shellcheck disable=SC2016  # the literal text ${ALICE_TOKEN} is what must be printed
-  printf '%s\n' "$hint" | grep -qF "'Authorization: Bearer \${ALICE_TOKEN}'" || fail "hint lacks the single-quoted header: $hint"
-  printf '%s\n' "$hint" | grep -qF "'https://203.0.113.7/u/gus/mcp'" || fail "hint lacks the quoted URL: $hint"
-  printf '%s\n' "$hint" | grep -qF '"Authorization' && fail "double-quoted Authorization: $hint"
-  printf '%s\n' "$OUT" | grep -qF 'docs/server.md' || fail "no pointer to docs/server.md"
   [ "$(count_in 'tok-gus-')" = 1 ] || fail "token not printed once"
+  # The person's agent follows docs/setup-server.md: the token goes into ~/.config/alice/token, never ALICE_TOKEN.
+  printf '%s\n' "$OUT" | grep -qF 'docs/setup-server.md' || fail "no pointer to docs/setup-server.md: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'My address is https://203.0.113.7/u/gus and my token file is ~/Downloads/alice-token.' \
+    || fail "no handover sentence: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'ALICE_TOKEN' && fail "still tells the admin to use ALICE_TOKEN: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'claude mcp add' && fail "still prints a claude mcp add line: $OUT"
+  # The capture setup line (SP2 spec §9.5), exactly once, with no token in it.
+  [ "$(count_in "$GUS_SETUP")" = 1 ] || fail "setup line not printed once: $OUT"
+  printf '%s\n' "$OUT" | grep -F 'setup.sh' | grep -qF 'tok-' && fail "a token in the setup line: $OUT"
   pass
 }
 
@@ -343,6 +356,10 @@ rotate_prints_a_new_token() {
   [ "$RC" = 0 ] || fail "rotate exited $RC: $OUT"
   [ "$(count_in 'tok-rot1-')" = 1 ] || fail "new token not printed once: $OUT"
   printf '%s\n' "$OUT" | grep -qF "$FIRST_TOKEN" && fail "old token printed"
+  # Re-running the setup line takes the new token into ~/.config/alice/token; no ALICE_TOKEN to update.
+  [ "$(count_in 'curl -fsSL https://203.0.113.7/u/ann/api/v1/capture/setup.sh | sh -s -- https://203.0.113.7/u/ann')" = 1 ] \
+    || fail "rotate does not print the setup line: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'ALICE_TOKEN' && fail "rotate still mentions ALICE_TOKEN: $OUT"
   has "$R/calls.log" 'sudo -u alice-ann env ALICE_HOME='
   pass
 }
@@ -887,8 +904,11 @@ upgrade_adds_the_time_zone_to_older_tenants() {
   hasnt "$TENANTS/bob.env" 'TZ=Asia/Bangkok'
   printf '%s\n' "$OUT" | grep -qF 'TZ=Asia/Bangkok added for: ann' || fail "$OUT"
   # The Jev pins (final review C1) arrive the same way, and a budget the admin changed is kept.
-  grep -v '^ALICE_JUDGE_' "$TENANTS/ann.env" >"$T/ann.env" && cat "$T/ann.env" >"$TENANTS/ann.env"
-  sed 's/^ALICE_JUDGE_DAILY_BUDGET_USD=.*/ALICE_JUDGE_DAILY_BUDGET_USD=0.5/' "$TENANTS/bob.env" >"$T/bob.env"
+  # So does the capture retention (SP2 spec §9.5), and a retention the admin changed is kept too.
+  grep -v -e '^ALICE_JUDGE_' -e '^ALICE_CAPTURE_RAW_RETENTION=' "$TENANTS/ann.env" >"$T/ann.env"
+  cat "$T/ann.env" >"$TENANTS/ann.env"
+  sed -e 's/^ALICE_JUDGE_DAILY_BUDGET_USD=.*/ALICE_JUDGE_DAILY_BUDGET_USD=0.5/' \
+    -e 's/^ALICE_CAPTURE_RAW_RETENTION=.*/ALICE_CAPTURE_RAW_RETENTION=90d/' "$TENANTS/bob.env" >"$T/bob.env"
   cat "$T/bob.env" >"$TENANTS/bob.env"
   run upgrade "$R/new-alice"
   [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
@@ -896,6 +916,10 @@ upgrade_adds_the_time_zone_to_older_tenants() {
   has "$TENANTS/ann.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
   has "$TENANTS/bob.env" 'ALICE_JUDGE_DAILY_BUDGET_USD=0.5'
   printf '%s\n' "$OUT" | grep -qF 'the Jev endpoint, model and budget pinned for: ann' || fail "$OUT"
+  has "$TENANTS/ann.env" 'ALICE_CAPTURE_RAW_RETENTION=180d'
+  has "$TENANTS/bob.env" 'ALICE_CAPTURE_RAW_RETENTION=90d'
+  hasnt "$TENANTS/bob.env" 'ALICE_CAPTURE_RAW_RETENTION=180d'
+  printf '%s\n' "$OUT" | grep -qF 'captured transcripts kept 180d for: ann' || fail "$OUT"
   run add bob --tz Asia/Bangkok
   pass
 }
@@ -933,6 +957,21 @@ adopt_installs_and_reports() {
   done
   [ ! -e "$SRV/ann/adopt-inbox" ] || fail "the staged copy was left"
   [ -f "$ADOPT_FILE" ] || fail "the admin's file was consumed"
+  pass
+}
+
+adopt_follows_the_tenants_secrets_pin() {
+  # `alice adopt` runs outside the daemon: it is handed the tenant's pin.
+  adopt ann "$ADOPT_FILE"
+  [ "$RC" = 0 ] || fail "adopt exited $RC: $OUT"
+  [ "$(grep 'adopt ran with' "$R/calls.log" | tail -n 1)" = "adopt ran with ALICE_PRIVACY_REDACT=true" ] || fail "not redacting"
+  run secrets keep ann
+  [ "$RC" = 0 ] || fail "secrets keep exited $RC: $OUT"
+  adopt ann "$ADOPT_FILE"
+  [ "$RC" = 0 ] || fail "adopt exited $RC: $OUT"
+  [ "$(grep 'adopt ran with' "$R/calls.log" | tail -n 1)" = "adopt ran with ALICE_PRIVACY_REDACT=false" ] || fail "the keep pin was not passed"
+  run secrets redact ann
+  [ "$RC" = 0 ] || fail "secrets redact exited $RC: $OUT"
   pass
 }
 
@@ -1027,6 +1066,7 @@ add_team_writes_no_snippet() {
   [ "$RC" = 0 ] || fail "add --team exited $RC: $OUT"
   [ ! -e "$R/etc/caddy/alice.d/team.caddy" ] || fail "the team store got a Caddy snippet"
   has "$TENANTS/team.env" 'ALICE_DAEMON_ARGS=--team-store'
+  has "$TENANTS/team.env" 'ALICE_PRIVACY_REDACT=true'
   hasnt "$TENANTS/team.env" 'ALICE_TENANT_NAME'
   hasnt "$TENANTS/team.env" 'ALICE_TEAM_URL'
   # shellcheck disable=SC2016  # the literal text $ALICE_DAEMON_ARGS is what the unit must hold
@@ -1119,6 +1159,21 @@ list_marks_the_team_store() {
   pass
 }
 
+setup_line_prints_it_again_without_a_token() {
+  run setup-line gus
+  [ "$RC" = 0 ] || fail "setup-line gus exited $RC: $OUT"
+  [ "$OUT" = "$GUS_SETUP" ] || fail "setup-line printed: $OUT"
+  run setup-line nobody
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'no tenant named nobody'; then fail "setup-line accepted an unknown tenant: $OUT"; fi
+  run setup-line Bad_Name
+  [ "$RC" != 0 ] || fail "setup-line accepted a bad name: $OUT"
+  pass
+}
+setup_line_refuses_the_team_store() {
+  run setup-line team
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'shared team store'; then fail "setup-line accepted the team store: $OUT"; fi
+  pass
+}
 adopt_refuses_the_team_store() {
   local before
   before=$(wc -l <"$R/calls.log")
@@ -1142,8 +1197,9 @@ key_nowhere_else() { # key
 has_key() { # tenant key
   [ "$(cat "$SRV/$1/secrets.toml" 2>/dev/null)" = "jev_api_key = \"$2\"" ] || fail "$1 does not hold the key"
   [ -n "$(find "$SRV/$1/secrets.toml" -perm 600)" ] || fail "$1's secrets.toml is not 0600"
-  [ "$(cat "$SRV/$1/judge.provider" 2>/dev/null)" = jev ] || fail "$1's judge is not jev"
 }
+setting_of() { cat "$SRV/$1/$2" 2>/dev/null || echo unset; } # tenant judge.provider|distill.provider (the fake's files)
+DISTILL_DEFAULT="$R/etc/alice/distill.default"
 
 jev_key_set_reaches_every_tenant_and_nothing_else() {
   local t
@@ -1157,8 +1213,14 @@ jev_key_set_reaches_every_tenant_and_nothing_else() {
   has "$TENANTS/ann.env" 'ALICE_JUDGE_JEV_MODEL=jev-1.13.0'
   jev_set "$JEV_A"
   [ "$RC" = 0 ] || fail "jev-key set exited $RC: $OUT"
-  for t in $(tenant_names); do has_key "$t" "$JEV_A"; done
+  for t in $(tenant_names); do
+    has_key "$t" "$JEV_A"
+    # Only the key: no tenant's judge or distillation is set by it.
+    [ "$(setting_of "$t" judge.provider)" = unset ] || fail "jev-key set changed $t's judge"
+    [ "$(setting_of "$t" distill.provider)" = unset ] || fail "jev-key set changed $t's distillation"
+  done
   has_key team "$JEV_A"
+  printf '%s\n' "$OUT" | grep -qF 'Only the key changed' || fail "$OUT"
   [ "$(cat "$R/etc/alice/jev.key")" = "$JEV_A" ] || fail "the server's copy is wrong"
   [ -n "$(find "$R/etc/alice/jev.key" -perm 600)" ] || fail "jev.key is not 0600"
   key_nowhere_else "$JEV_A"
@@ -1166,19 +1228,51 @@ jev_key_set_reaches_every_tenant_and_nothing_else() {
 }
 
 jev_key_is_inherited_by_a_new_tenant() {
+  rm -f -- "$DISTILL_DEFAULT"
   run add jevp
   [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
   has_key jevp "$JEV_A"
+  [ "$(setting_of jevp judge.provider)" = jev ] || fail "a new tenant's judge is not jev"
+  # No default file: distillation stays off (nothing is set).
+  [ "$(setting_of jevp distill.provider)" = unset ] || fail "distillation was set without a default"
   key_nowhere_else "$JEV_A"
   run remove jevp --yes
   pass
 }
 
+add_follows_the_distill_default() {
+  printf 'on\n' >"$DISTILL_DEFAULT"
+  run add dison
+  [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
+  [ "$(setting_of dison distill.provider)" = jev ] || fail "the default 'on' did not reach a new tenant"
+  printf 'off\n' >"$DISTILL_DEFAULT"
+  run add disoff
+  [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
+  [ "$(setting_of disoff distill.provider)" = unset ] || fail "the default 'off' turned something on"
+  # A default that is neither on nor off is refused before anything is created.
+  printf 'maybe\n' >"$DISTILL_DEFAULT"
+  run add disbad
+  [ "$RC" != 0 ] || fail "add accepted a bad default: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'must hold one line, on or off; nothing was created' || fail "$OUT"
+  if [ -e "$TENANTS/disbad.env" ] || [ -e "$SRV/disbad" ]; then fail "add created disbad anyway"; fi
+  rm -f -- "$DISTILL_DEFAULT"
+  run remove dison --yes
+  run remove disoff --yes
+  pass
+}
+
 jev_key_rotation_replaces_it_everywhere() {
   local t
+  # An admin's per-tenant choices survive a rotation.
+  echo heuristic >"$SRV/ann/judge.provider"
+  echo jev >"$SRV/ann/distill.provider"
+  echo off >"$SRV/team/distill.provider"
   jev_set "$JEV_B"
   [ "$RC" = 0 ] || fail "rotation exited $RC: $OUT"
   for t in $(tenant_names); do has_key "$t" "$JEV_B"; done
+  [ "$(setting_of ann judge.provider)" = heuristic ] || fail "rotation changed ann's judge"
+  [ "$(setting_of ann distill.provider)" = jev ] || fail "rotation changed ann's distillation"
+  [ "$(setting_of team distill.provider)" = off ] || fail "rotation changed team's distillation"
   [ "$(cat "$R/etc/alice/jev.key")" = "$JEV_B" ] || fail "the server's copy was not rotated"
   key_nowhere_else "$JEV_B"
   pass
@@ -1193,6 +1287,151 @@ jev_key_status_names_tenants_and_never_the_key() {
   printf '%s\n' "$OUT" | grep -qE '^  ann +another key$' || fail "ann's other key not shown: $OUT"
   key_nowhere_else "$JEV_B"
   if printf '%s\n' "$OUT" | grep -qF 'someone-elses'; then fail "another key was printed"; fi
+  pass
+}
+
+distill_turns_one_or_every_tenant_on_and_off() {
+  local t
+  for t in $(tenant_names); do rm -f -- "$SRV/$t/distill.provider" "$SRV/$t/judge.provider"; done
+  run distill on ann
+  [ "$RC" = 0 ] || fail "distill on ann exited $RC: $OUT"
+  [ "$(setting_of ann distill.provider)" = jev ] || fail "ann's distillation is not on"
+  [ "$(setting_of team distill.provider)" = unset ] || fail "distill on ann touched team"
+  # ann's judge is not jev, so the command says its distillation waits.
+  printf '%s\n' "$OUT" | grep -qF 'their distillation waits until it is: ann' || fail "no waiting note: $OUT"
+  echo jev >"$SRV/ann/judge.provider"
+  run distill on ann
+  printf '%s\n' "$OUT" | grep -qF 'waits' && fail "a waiting note with the judge on jev: $OUT"
+  run distill off --all
+  [ "$RC" = 0 ] || fail "distill off --all exited $RC: $OUT"
+  for t in $(tenant_names); do [ "$(setting_of "$t" distill.provider)" = off ] || fail "$t's distillation is not off"; done
+  # A daemon that does not answer is named, and the command fails.
+  CONFIG_FAIL=team run distill on --all
+  [ "$RC" != 0 ] || fail "a tenant that did not take it was not reported"
+  printf '%s\n' "$OUT" | grep -qF 'did not take it (is their daemon running?): team' || fail "$OUT"
+  [ "$(setting_of ann distill.provider)" = jev ] || fail "the other tenants were not turned on"
+  run distill off --all
+  run distill on nobody
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'no tenant named nobody'; then fail "accepted nobody: $OUT"; fi
+  run distill on
+  [ "$RC" = 2 ] || fail "distill on with no tenant exited $RC"
+  run distill maybe ann
+  [ "$RC" = 2 ] || fail "distill maybe exited $RC"
+  run distill on Bad_Name
+  [ "$RC" != 0 ] || fail "accepted a bad name"
+  pass
+}
+
+distill_status_names_every_tenant_and_never_a_secret() {
+  echo jev >"$SRV/ann/distill.provider"
+  printf 'on\n' >"$DISTILL_DEFAULT"
+  CONFIG_FAIL=team run distill status
+  [ "$RC" = 0 ] || fail "distill status exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'distillation for new tenants: on' || fail "no default line: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  ann +on +judge jev$' || fail "ann not shown on: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  team +unknown +judge unknown' || fail "team's silent daemon not shown: $OUT"
+  key_nowhere_else "$JEV_B"
+  rm -f -- "$DISTILL_DEFAULT" "$SRV/ann/distill.provider"
+  pass
+}
+
+SECRETS_DEFAULT="$R/etc/alice/secrets.default"
+pin_of() { sed -n 's/^ALICE_PRIVACY_REDACT=//p' "$TENANTS/$1.env"; }
+
+add_follows_the_secrets_default() {
+  printf 'keep\n' >"$SECRETS_DEFAULT"
+  run add seck
+  [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
+  [ "$(pin_of seck)" = false ] || fail "the default 'keep' did not reach a new tenant"
+  printf '%s\n' "$OUT" | grep -qF 'Secrets: kept as written' || fail "$OUT"
+  printf 'redact\n' >"$SECRETS_DEFAULT"
+  run add secr
+  [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
+  [ "$(pin_of secr)" = true ] || fail "the default 'redact' did not reach a new tenant"
+  if printf '%s\n' "$OUT" | grep -qF 'Secrets:'; then fail "a redacting tenant was announced as keeping: $OUT"; fi
+  # A default that is neither keep nor redact is refused before anything is created.
+  printf 'maybe\n' >"$SECRETS_DEFAULT"
+  run add secbad
+  [ "$RC" != 0 ] || fail "add accepted a bad default: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'must hold one line, keep or redact; nothing was created' || fail "$OUT"
+  if [ -e "$TENANTS/secbad.env" ] || [ -e "$SRV/secbad" ]; then fail "add created secbad anyway"; fi
+  rm -f -- "$SECRETS_DEFAULT"
+  run remove seck --yes
+  run remove secr --yes
+  pass
+}
+
+secrets_keep_and_redact_pin_one_or_every_tenant() {
+  local t restarts
+  restarts=$(grep -c 'systemctl restart alice@ann' "$R/calls.log" || true)
+  run secrets keep ann
+  [ "$RC" = 0 ] || fail "secrets keep ann exited $RC: $OUT"
+  [ "$(pin_of ann)" = false ] || fail "ann does not keep secrets"
+  [ "$(grep -c '^ALICE_PRIVACY_REDACT=' "$TENANTS/ann.env")" = 1 ] || fail "not exactly one pin"
+  [ "$(grep -c 'systemctl restart alice@ann' "$R/calls.log")" = "$((restarts + 1))" ] || fail "ann was not restarted once"
+  printf '%s\n' "$OUT" | grep -qF 'secrets kept as written for: ann' || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -qF 'what was redacted before stays redacted' || fail "$OUT"
+  # Unchanged: no restart.
+  run secrets keep ann
+  [ "$RC" = 0 ] || fail "again exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -qF '(already: ann)' || fail "$OUT"
+  [ "$(grep -c 'systemctl restart alice@ann' "$R/calls.log")" = "$((restarts + 1))" ] || fail "an unchanged pin restarted ann"
+  # The team store always redacts.
+  run secrets keep team
+  [ "$RC" != 0 ] || fail "the team store was set to keep secrets"
+  printf '%s\n' "$OUT" | grep -qF 'everyone reads it, so it always redacts; nothing changed' || fail "$OUT"
+  [ "$(pin_of team)" = true ] || fail "team's pin changed"
+  run secrets keep --all
+  [ "$RC" = 0 ] || fail "secrets keep --all exited $RC: $OUT"
+  for t in $(tenant_names); do
+    if [ "$t" = team ]; then
+      [ "$(pin_of team)" = true ] || fail "keep --all reached the team store"
+    else
+      [ "$(pin_of "$t")" = false ] || fail "$t does not keep secrets"
+    fi
+  done
+  printf '%s\n' "$OUT" | grep -qF 'the team store (team) always redacts' || fail "$OUT"
+  # A running import is never cut off by the restart.
+  IMPORT_BUSY=ann run secrets redact ann
+  [ "$RC" != 0 ] || fail "the restart went ahead during an import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running on: ann' || fail "$OUT"
+  [ "$(pin_of ann)" = false ] || fail "the pin changed although nothing restarted"
+  # A daemon that does not come back is named.
+  PING_FAIL=7 run secrets redact ann
+  [ "$RC" != 0 ] || fail "a tenant that did not come back was not reported"
+  printf '%s\n' "$OUT" | grep -qF 'did not come back after the change' || fail "$OUT"
+  run secrets redact --all
+  [ "$RC" = 0 ] || fail "secrets redact --all exited $RC: $OUT"
+  for t in $(tenant_names); do [ "$(pin_of "$t")" = true ] || fail "$t does not redact"; done
+  printf '%s\n' "$OUT" | grep -qF 'New writes are redacted' || fail "$OUT"
+  run secrets keep nobody
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'no tenant named nobody'; then fail "accepted nobody: $OUT"; fi
+  run secrets keep
+  [ "$RC" = 2 ] || fail "secrets keep with no tenant exited $RC"
+  run secrets maybe ann
+  [ "$RC" = 2 ] || fail "secrets maybe exited $RC"
+  run secrets keep Bad_Name
+  [ "$RC" != 0 ] || fail "accepted a bad name"
+  pass
+}
+
+secrets_status_names_every_tenant() {
+  printf 'keep\n' >"$SECRETS_DEFAULT"
+  run secrets keep ann
+  # A tenant file from before the pin redacts: a person's config.toml can never turn redaction off.
+  grep -v '^ALICE_PRIVACY_REDACT=' "$TENANTS/bob.env" >"$T/bob.env" && cat "$T/bob.env" >"$TENANTS/bob.env"
+  run secrets status
+  [ "$RC" = 0 ] || fail "secrets status exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'secrets for new tenants: keep' || fail "no default line: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  ann +keep$' || fail "ann not shown keeping: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  bob +redact$' || fail "an unpinned tenant not shown redacting: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  team +redact \(the team store always redacts\)$' || fail "team not shown: $OUT"
+  printf 'sometimes\n' >"$SECRETS_DEFAULT"
+  run secrets status
+  printf '%s\n' "$OUT" | grep -qF 'secrets for new tenants: invalid' || fail "a bad default not named: $OUT"
+  rm -f -- "$SECRETS_DEFAULT"
+  run secrets redact ann
+  printf 'ALICE_PRIVACY_REDACT=true\n' >>"$TENANTS/bob.env"
   pass
 }
 
@@ -1236,8 +1475,12 @@ remove_team_unprovisions() {
 }
 
 provision_refuses_a_missing_team_token() {
+  # The deployment keeps secrets for new people; the team store redacts all the same.
+  printf 'keep\n' >"$SECRETS_DEFAULT"
   run add --team team
   [ "$RC" = 0 ] || fail "add --team exited $RC: $OUT"
+  [ "$(pin_of team)" = true ] || fail "the team store keeps secrets"
+  rm -f -- "$SECRETS_DEFAULT"
   : >"$SRV/team/token"
   run add ivy
   [ "$RC" != 0 ] || fail "add ivy succeeded with an empty team token"
@@ -1266,19 +1509,22 @@ for CURRENT in \
   upgrade_restores_the_library_when_the_binary_cannot_be_installed upgrade_names_what_it_could_not_put_back add_takes_a_time_zone \
   upgrade_adds_the_time_zone_to_older_tenants adopt_installs_and_reports adopt_refuses_and_leaves_the_tenant_as_it_was \
   adopt_refuses_bad_files_before_any_change adopt_rolls_back_when_the_tenant_does_not_come_back \
-  adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back imports_and_other_commands_never_overlap \
+  adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back adopt_follows_the_tenants_secrets_pin \
+  imports_and_other_commands_never_overlap \
   restarts_wait_for_a_daemon_import \
   dry_run_import_checks_the_disk_first \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \
   add_team_writes_no_snippet add_team_provisions_existing_tenants add_person_after_team_is_provisioned \
-  rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store adopt_refuses_the_team_store \
+  rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store adopt_refuses_the_team_store setup_line_refuses_the_team_store \
   jev_key_set_reaches_every_tenant_and_nothing_else jev_key_is_inherited_by_a_new_tenant \
   jev_key_rotation_replaces_it_everywhere jev_key_status_names_tenants_and_never_the_key \
-  jev_key_refuses_an_empty_or_malformed_key \
+  jev_key_refuses_an_empty_or_malformed_key add_follows_the_distill_default distill_turns_one_or_every_tenant_on_and_off \
+  distill_status_names_every_tenant_and_never_a_secret \
+  add_follows_the_secrets_default secrets_keep_and_redact_pin_one_or_every_tenant secrets_status_names_every_tenant \
   remove_person_deletes_the_team_copy remove_team_unprovisions provision_refuses_a_missing_team_token \
   refuses_to_run_with_empty_roots remove_archives_then_deletes \
-  add_prints_a_single_quoted_mcp_hint no_remote_set_line; do
+  add_prints_the_handover_and_the_setup_line setup_line_prints_it_again_without_a_token no_remote_set_line; do
   "$CURRENT"
 done
 echo "all $COUNT scenarios passed"

@@ -37,14 +37,47 @@ use tokio_util::sync::CancellationToken;
 /// Not imported as `Result`: the rmcp handler macros expand to an unqualified `Result<_, McpError>`.
 type AliceResult<T> = alice_core::error::Result<T>;
 
-pub const INSTRUCTIONS: &str = "Alice is your long-term memory, shared with the user's other agents and sessions.\n\
+/// The instructions' lines that do not depend on the settings.
+macro_rules! instructions_head {
+    () => {
+        "Alice is your long-term memory, shared with the user's other agents and sessions.\n\
 - When you start work on a project, call `context` unless a memory briefing is already in the conversation.\n\
 - Before answering about past work, decisions, bugs or preferences, call `recall`.\n\
 - Call `remember` for decisions (with the reason), bug fixes (symptom, cause, fix), facts, how-tos, warnings and user preferences. One idea per memory; set `kind`.\n\
 - When a new memory replaces an old one, pass the old id in `supersedes`.\n\
 - Before ending a long task, `remember` a `handoff`: what is done, what is next, open questions.\n\
-- Use `assert_fact` and `query_facts` for stable relationships (X uses Y, service runs on host).\n\
-- Never store secrets.";
+- Use `assert_fact` and `query_facts` for stable relationships (X uses Y, service runs on host).\n"
+    };
+}
+
+/// The server's instructions to agents while the store redacts secrets (`privacy.redact`, the
+/// default).
+pub const INSTRUCTIONS: &str = concat!(instructions_head!(), "- Never store secrets.");
+
+/// The instructions while the person's store keeps secrets as written (`privacy.redact = false`;
+/// on a server tenant, the admin's `alice-server secrets keep`): credentials may be remembered
+/// for this person, never shared (owner's decision 2026-10-17).
+pub const INSTRUCTIONS_KEEPING_SECRETS: &str = concat!(
+    instructions_head!(),
+    "- Credentials and connection details the person shares may be stored with `remember` (kind `fact` or `howto`); they stay private to this person — never put them in `shared: true` memories."
+);
+
+/// The instructions for a store that keeps secrets as written (`keeps_secrets`) or redacts them.
+///
+/// ```
+/// use alice_daemon::mcp::{INSTRUCTIONS, instructions};
+///
+/// assert_eq!(instructions(false), INSTRUCTIONS);
+/// assert!(instructions(false).ends_with("- Never store secrets."));
+/// assert!(instructions(true).contains("never put them in `shared: true` memories"));
+/// ```
+pub fn instructions(keeps_secrets: bool) -> &'static str {
+    if keeps_secrets {
+        INSTRUCTIONS_KEEPING_SECRETS
+    } else {
+        INSTRUCTIONS
+    }
+}
 
 /// How long a read waits for a daemon that is starting.
 const READ_WAIT: Duration = Duration::from_secs(5);
@@ -62,6 +95,10 @@ pub struct Switches {
     pub admin_tools: bool,
     /// `compat.mempalace`.
     pub compat_mempalace: bool,
+    /// Whether the store redacts what it stores, as the daemon has it (its environment, where
+    /// an admin pins the switch, and its ratchet apply; the team store always does). `None`
+    /// when no daemon answered or it did not say.
+    pub redacts: Option<bool>,
     /// No daemon answered (the switches above then read off whatever the settings say).
     pub unreachable: bool,
 }
@@ -93,6 +130,15 @@ impl RemoteBackend {
     pub fn with_admin_ttl(mut self, ttl: Duration) -> Self {
         self.admin_ttl = ttl;
         self
+    }
+
+    /// Ask the running daemon for the switches once, before the client's `initialize`: the
+    /// instructions given then say whether credentials may be stored, and the daemon's own
+    /// `privacy.redact` decides that (re-review N4), not `config.toml` and this process's
+    /// environment, which miss an admin's pin and a loosening still waiting for its polls.
+    /// Never starts a daemon; without one the instructions read off the settings.
+    pub async fn prime(&self) {
+        let _ = self.switches().await;
     }
 
     /// The switches as the running daemon has them (its ratchet and its audit apply), asked at
@@ -147,6 +193,17 @@ impl RemoteBackend {
     }
 }
 
+/// The switches of a daemon this process runs.
+fn local_switches(s: &Service) -> Switches {
+    let settings = s.settings();
+    Switches {
+        admin_tools: settings.mcp.admin_tools,
+        compat_mempalace: settings.compat.mempalace,
+        redacts: Some(settings.privacy.redact || s.is_team_store()),
+        unreachable: false,
+    }
+}
+
 #[derive(Clone)]
 pub enum Backend {
     Local(Arc<Service>),
@@ -164,14 +221,7 @@ impl Backend {
     /// for (all off when none answers). Asked per request, cached for a moment.
     async fn switches(&self) -> Switches {
         match self {
-            Backend::Local(s) => {
-                let settings = s.settings();
-                Switches {
-                    admin_tools: settings.mcp.admin_tools,
-                    compat_mempalace: settings.compat.mempalace,
-                    unreachable: false,
-                }
-            }
+            Backend::Local(s) => local_switches(s),
             Backend::Remote(b) => b.switches().await,
         }
     }
@@ -181,17 +231,27 @@ impl Backend {
     async fn compat_mempalace(&self) -> bool {
         self.switches().await.compat_mempalace
     }
+    /// Whether the store behind this server keeps secrets as written: the effective
+    /// `privacy.redact` is off (never for the team store, which always redacts). `alice mcp`
+    /// takes the daemon's last answer ([`RemoteBackend::prime`]); with none, it reads the
+    /// switch the way the daemon loads it (`config.toml` and the `ALICE_*` variables), and a
+    /// configuration it cannot fully read counts as redacting.
+    fn keeps_secrets(&self) -> bool {
+        match self {
+            Backend::Local(s) => !s.is_team_store() && !s.settings().privacy.redact,
+            Backend::Remote(b) => match b.switches_cached().redacts {
+                Some(redacts) => !redacts,
+                None => {
+                    let e = crate::config::load_effective(&b.home);
+                    !e.degraded && !e.resolved.settings.privacy.redact
+                }
+            },
+        }
+    }
     /// [`switches`](Self::switches) without waiting for an answer (`get_tool` is not async).
     fn switches_cached(&self) -> Switches {
         match self {
-            Backend::Local(s) => {
-                let settings = s.settings();
-                Switches {
-                    admin_tools: settings.mcp.admin_tools,
-                    compat_mempalace: settings.compat.mempalace,
-                    unreachable: false,
-                }
-            }
+            Backend::Local(s) => local_switches(s),
             Backend::Remote(b) => b.switches_cached(),
         }
     }
@@ -368,6 +428,54 @@ fn within_project_limits(name: &str) -> bool {
         && alice_core::normalize::slugify(name).chars().count() <= limits::MAX_PROJECT_SLUG_CHARS
 }
 
+/// Where a project name came from, as [`check_project_name`]'s refusal names it.
+pub(crate) const FROM_PROJECT_HEADER: &str = "the X-Alice-Project header";
+/// See [`FROM_PROJECT_HEADER`].
+pub(crate) const FROM_PROJECT_QUERY: &str = "?project=";
+
+/// A project hint a client sent, with its control characters (a newline, an escape, a tab,
+/// percent-encoded or not) removed, so none reaches a stored project name. Applied wherever a
+/// hint is decoded: the `X-Alice-Project` header, MCP's `?project=` and root name, and the
+/// capture routes' `project` query.
+pub(crate) fn strip_controls(hint: &str) -> String {
+    hint.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// The project the `X-Alice-Project` header names: UTF-8 or percent-encoded UTF-8, control
+/// characters removed, trimmed; `None` when the header is absent or blank. Other bytes are
+/// refused rather than falling to another project. The MCP handlers and the capture routes both
+/// read the header with this, so they resolve the same hint the same way.
+pub(crate) fn project_header(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, AliceError> {
+    let Some(v) = headers.get(PROJECT_HEADER) else {
+        return Ok(None);
+    };
+    let decoded = std::str::from_utf8(v.as_bytes())
+        .ok()
+        .and_then(percent_decode)
+        .ok_or_else(|| {
+            AliceError::invalid(
+                "the X-Alice-Project header is not UTF-8: send the project name as UTF-8 or percent-encoded UTF-8",
+            )
+        })?;
+    Ok(Some(strip_controls(&decoded).trim().to_string()).filter(|v| !v.is_empty()))
+}
+
+/// Refuses a project name a caller sent over the name or slug limit. The message says where it
+/// came from (`from`: [`FROM_PROJECT_HEADER`] or [`FROM_PROJECT_QUERY`]) and the limit, never
+/// the value.
+pub(crate) fn check_project_name(name: &str, from: &str) -> Result<(), AliceError> {
+    if within_project_limits(name) {
+        return Ok(());
+    }
+    Err(AliceError::invalid(format!(
+        "the project name in {from} is too long: at most {} characters, and its slug at most {}",
+        limits::MAX_PROJECT_NAME_CHARS,
+        limits::MAX_PROJECT_SLUG_CHARS
+    )))
+}
+
 fn resource_err(e: AliceError) -> McpError {
     match e {
         AliceError::Invalid(m) => McpError::invalid_params(m, None),
@@ -435,42 +543,23 @@ impl AliceMcp {
         let parts = ctx.extensions.get::<axum::http::request::Parts>();
         let queried = parts.and_then(|p| p.uri.query()).and_then(|q| {
             url::form_urlencoded::parse(q.as_bytes())
-                .find(|(k, v)| k == "project" && !v.trim().is_empty())
-                .map(|(_, v)| v.into_owned())
+                .find(|(k, v)| k == "project" && !strip_controls(v).trim().is_empty())
+                .map(|(_, v)| strip_controls(&v))
         });
-        // UTF-8 or percent-encoded UTF-8; anything else fails the call rather than falling to
-        // another project.
-        let header = match parts.and_then(|p| p.headers.get(PROJECT_HEADER)) {
+        let invalid = |e: AliceError| McpError::invalid_params(e.to_string(), None);
+        let header = match parts {
+            Some(p) => project_header(&p.headers).map_err(invalid)?,
             None => None,
-            Some(v) => {
-                let decoded = std::str::from_utf8(v.as_bytes())
-                    .ok()
-                    .and_then(percent_decode)
-                    .ok_or_else(|| {
-                        McpError::invalid_params(
-                            "the X-Alice-Project header is not UTF-8: send the project name as UTF-8 or percent-encoded UTF-8",
-                            None,
-                        )
-                    })?;
-                Some(decoded.trim().to_string()).filter(|v| !v.is_empty())
-            }
         };
         let (named, from) = match (queried, header) {
-            (Some(q), _) => (Some(q), "?project="),
-            (None, Some(h)) => (Some(h), "the X-Alice-Project header"),
+            (Some(q), _) => (Some(q), FROM_PROJECT_QUERY),
+            (None, Some(h)) => (Some(h), FROM_PROJECT_HEADER),
             (None, None) => (None, ""),
         };
         let hint = match named {
-            Some(q) if within_project_limits(&q) => Some(q),
-            Some(_) => {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "the project name in {from} is too long: at most {} characters, and its slug at most {}",
-                        limits::MAX_PROJECT_NAME_CHARS,
-                        limits::MAX_PROJECT_SLUG_CHARS
-                    ),
-                    None,
-                ));
+            Some(q) => {
+                check_project_name(&q, from).map_err(invalid)?;
+                Some(q)
             }
             None => self
                 .first_root(ctx)
@@ -478,8 +567,9 @@ impl AliceMcp {
                 .and_then(|root| {
                     std::path::Path::new(&root)
                         .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
+                        .map(|n| strip_controls(&n.to_string_lossy()))
                 })
+                .filter(|n| !n.trim().is_empty())
                 .filter(|n| within_project_limits(n)),
         };
         Ok((hint, None))
@@ -835,7 +925,8 @@ impl ServerHandler for AliceMcp {
                 .build(),
         )
         .with_server_info(Implementation::new("alice", env!("CARGO_PKG_VERSION")))
-        .with_instructions(INSTRUCTIONS)
+        // The secrets line follows the store's own setting (owner's decision 2026-10-17).
+        .with_instructions(instructions(self.backend.keeps_secrets()))
     }
 
     async fn call_tool(
@@ -992,9 +1083,9 @@ pub async fn run_stdio(home: AliceHome, launcher: Launcher) -> anyhow::Result<()
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
-    let server = AliceMcp::new(Backend::Remote(Arc::new(RemoteBackend::new(
-        home, launcher, cwd,
-    ))));
+    let backend = Arc::new(RemoteBackend::new(home, launcher, cwd));
+    backend.prime().await;
+    let server = AliceMcp::new(Backend::Remote(backend));
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())

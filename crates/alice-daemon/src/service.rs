@@ -4,6 +4,8 @@
 //! `spawn_blocking`, so neither ever waits for the other (spec §4.1).
 
 use crate::backup::{self, BackupInfo, BackupKind};
+use crate::capture::{CaptureCtl, PassInput, PassReport};
+use crate::capture::{CaptureWorker, LocalCaptureConfig, LocalCaptureCounts};
 use crate::config::SettingsHandle;
 use crate::embedding::{self, Builder, EmbeddingCtl};
 use crate::importer::{self, ImportEnv, ImportSlot};
@@ -17,7 +19,7 @@ use crate::secrets::{self, SecretName, SecretStore};
 use crate::spool;
 use crate::worker::{SAVE_EVERY, WorkerConfig, spawn_worker};
 use crate::writer::{
-    ProjectChoice, ResolveText, WriteOp, WriteOutcome, WriterHandle, spawn_writer_with,
+    CaptureInit, ProjectChoice, ResolveText, WriteOp, WriteOutcome, WriterHandle, spawn_writer_with,
 };
 use alice_core::api::*;
 use alice_core::embed::Embedder;
@@ -85,6 +87,8 @@ const JUDGE_STOP_WAIT: Duration = if cfg!(test) {
 const MAINTENANCE_STOP_WAIT: Duration = Duration::from_secs(3);
 /// How long shutdown waits for an import that is inside one long step (a snapshot copy).
 const IMPORT_STOP_WAIT: Duration = Duration::from_secs(30);
+/// How long shutdown waits for the capture worker to finish the pass it is in.
+const CAPTURE_STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a working directory's detected project is reused before git is asked again.
 const DETECT_TTL: Duration = Duration::from_secs(60);
@@ -508,7 +512,8 @@ pub struct ServiceOptions {
     pub vector_reader_pool: usize,
     /// Maps a working directory to its project (runs git). Tests replace it.
     pub detect_project: fn(&Path) -> ProjectRef,
-    /// Settings to use; `None` loads `config.toml` and `ALICE_*` from the home.
+    /// Settings to use; `None` loads `config.toml` and `ALICE_*` from the home. A handle's
+    /// tenant rules must match [`ServiceOptions::tenant`], or the start is refused.
     pub settings: Option<Arc<SettingsHandle>>,
     /// The `ALICE_*` variables the settings see when `settings` is `None`; `None`: the
     /// process's. The default is an empty list, so a developer's shell cannot change a test;
@@ -569,6 +574,29 @@ pub struct ServiceOptions {
     pub team_url: Option<String>,
     /// This tenant's name (`ALICE_TENANT_NAME`), the author the team store records.
     pub tenant_name: Option<String>,
+    /// How often the distill worker looks for sessions to distil when nothing wakes it (SP2
+    /// spec §6.2: 60 s). Tests shorten it.
+    pub distill_tick: Duration,
+    /// Tests: how long a session must be quiet before it is distilled, in place of
+    /// `distill.idle_minutes`.
+    pub distill_idle_override: Option<Duration>,
+    /// Local capture (SP2 spec §4.2): a pass caused by `stop`, `subagent-stop`, `pre-compact`
+    /// or `session-end` waits this long first, so the agent has finished writing the turn.
+    pub capture_settle: Duration,
+    /// How often the capture worker looks at the open sources (and once at start).
+    pub capture_sweep_every: Duration,
+    /// A transcript idle this long has its trailing turn closed by the sweep.
+    pub capture_quiet: Duration,
+    /// A transcript idle this long gets a final pass, and its source ends (an agent that
+    /// crashed sends no `SessionEnd`).
+    pub capture_stale: Duration,
+    /// Tests only: the capture slice write after this many fails once, as a daemon killed
+    /// between two slices of a pass would leave it.
+    pub capture_fail_after_slices: Option<usize>,
+    /// Codex's home (`$CODEX_HOME`, else `~/.codex`): where a Codex session's rollout is looked
+    /// for when its hook gave no transcript path. `None`: never looked for (the default, so
+    /// tests touch nothing outside their home); [`ServiceOptions::process_env`] sets it.
+    pub codex_home: Option<PathBuf>,
 }
 
 impl Default for ServiceOptions {
@@ -602,6 +630,14 @@ impl Default for ServiceOptions {
             team_store: false,
             team_url: None,
             tenant_name: None,
+            distill_tick: crate::distill::TICK,
+            distill_idle_override: None,
+            capture_settle: Duration::from_millis(1500),
+            capture_sweep_every: Duration::from_secs(60),
+            capture_quiet: Duration::from_secs(5 * 60),
+            capture_stale: Duration::from_secs(24 * 3600),
+            capture_fail_after_slices: None,
+            codex_home: None,
         }
     }
 }
@@ -614,6 +650,10 @@ impl ServiceOptions {
             settings_env: None,
             secret_env: None,
             mempalace_home: dirs::home_dir().map(|h| h.join(".mempalace")),
+            codex_home: std::env::var_os("CODEX_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|h| h.join(".codex"))),
             ..Self::default()
         }
     }
@@ -854,6 +894,13 @@ pub struct Service {
     scheduler: Arc<Scheduler>,
     /// The one import job (a running one, or the last one's outcome).
     import: Mutex<ImportSlot>,
+    /// The capture pipeline (SP2): transcript bytes into chunks, turn keys and cursors.
+    capture: Arc<CaptureCtl>,
+    /// The distill worker (SP2 Task 12): captured sessions into memories.
+    distill: Arc<crate::distill::DistillCtl>,
+    /// Local capture: the worker that reads transcript files after a notify (SP2 spec §4.2).
+    /// `None` on a server tenant, which never reads a client's files.
+    capture_worker: Option<Arc<CaptureWorker>>,
     /// The compatibility layer's short-lived overview cache.
     pub(crate) compat: crate::compat::CompatState,
     /// Tests: time added to the age of the shared health reading.
@@ -1206,6 +1253,16 @@ impl Service {
                 None if opts.tenant => SettingsHandle::load_tenant(&home),
                 None => SettingsHandle::load(&home),
             });
+        // One answer to "is this a server tenant": the local capture worker (and its stale end)
+        // runs when `opts.tenant` is off, the distill worker's stale end when the settings'
+        // tenant rules are on. A handle built with the other flag would run both or neither.
+        if settings.is_tenant() != opts.tenant {
+            return Err(AliceError::Other(format!(
+                "the settings handle's tenant rules are {} but ServiceOptions.tenant is {}; build the handle with the same tenant flag",
+                if settings.is_tenant() { "on" } else { "off" },
+                opts.tenant
+            )));
+        }
         let started_with = settings.get();
         let secrets = opts
             .secrets
@@ -1217,6 +1274,17 @@ impl Service {
             .unwrap_or_else(|| Arc::new(|var: &str| std::env::var(var).ok()));
         let conn = open_writer(&home.db())?;
         let device = device_id(&conn)?;
+        // A tenant keeps no path of the person's machine (SP2 spec §9.4): an adopted database's
+        // transcript paths and file identities are cleared before anything reads them.
+        if opts.tenant {
+            let cleared = crate::capture::forget_local_paths(&conn)?;
+            if cleared > 0 {
+                tracing::info!(
+                    sources = cleared,
+                    "cleared local transcript paths from an adopted database"
+                );
+            }
+        }
         let readers = Arc::new(ReaderPool::new(home.db(), opts.reader_pool));
         let vector_readers = Arc::new(ReaderPool::with_cache(
             home.db(),
@@ -1308,7 +1376,12 @@ impl Service {
 
         // bounded(1): repeated wake-ups coalesce.
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
-        let redactors = Redactors::new(settings.clone());
+        // The team store redacts every write, whatever its settings say: every tenant reads it.
+        let redactors = if opts.team_store {
+            Redactors::for_team_store(settings.clone())
+        } else {
+            Redactors::new(settings.clone())
+        };
         let (writer, writer_thread) =
             spawn_writer_with(conn, device, wake_tx.clone(), redactors.clone());
         let stop = Arc::new(AtomicBool::new(false));
@@ -1421,6 +1494,52 @@ impl Service {
         let watcher = settings.spawn_watcher(opts.settings_poll, stop.clone());
         let resolver = ProjectResolver::new(opts.detect_project);
         let precise_gate = crate::precise_gate::PreciseGate::new(opts.precise_clock.clone());
+        let capture = CaptureCtl::new(
+            readers.clone(),
+            writer.clone(),
+            settings.clone(),
+            redactors.clone(),
+        );
+        let distill = crate::distill::DistillCtl::new(crate::distill::DistillCfg {
+            ctx: crate::distill::DistillCtx {
+                readers: readers.clone(),
+                writer: writer.clone(),
+                settings: settings.clone(),
+                redactors: redactors.clone(),
+                judge: judge.clone(),
+            },
+            tick: opts.distill_tick,
+            idle_override: opts.distill_idle_override,
+        });
+        {
+            let weak = Arc::downgrade(&distill);
+            capture.set_on_due(Arc::new(move || {
+                if let Some(d) = weak.upgrade() {
+                    d.wake();
+                }
+            }));
+        }
+        if let Err(e) = distill.spawn() {
+            tracing::error!(error = %e, "cannot start the distill worker; captured sessions are not distilled until the daemon restarts");
+        }
+        capture.fail_after_slices(opts.capture_fail_after_slices);
+        let capture_worker = (!opts.tenant).then(|| {
+            let worker = CaptureWorker::new(
+                capture.clone(),
+                readers.clone(),
+                writer.clone(),
+                resolver.clone(),
+                LocalCaptureConfig {
+                    settle: opts.capture_settle,
+                    sweep_every: opts.capture_sweep_every,
+                    quiet: opts.capture_quiet,
+                    stale: opts.capture_stale,
+                    codex_home: opts.codex_home.clone(),
+                },
+            );
+            worker.spawn();
+            worker
+        });
         // The team store never links to itself.
         let (team, team_error) = if opts.team_store {
             (None, None)
@@ -1473,6 +1592,9 @@ impl Service {
             precise_gate,
             scheduler,
             import: Mutex::new(ImportSlot::new()),
+            capture,
+            distill,
+            capture_worker,
             compat: crate::compat::CompatState::default(),
             #[cfg(test)]
             health_aged: Mutex::new(Duration::ZERO),
@@ -1536,6 +1658,11 @@ impl Service {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.wake_worker.try_send(());
         let _ = self.wake_judge.try_send(());
+        self.distill.signal_stop();
+        // The capture worker writes through the writer: it ends its pass before that stops.
+        if let Some(w) = &self.capture_worker {
+            w.stop(CAPTURE_STOP_WAIT);
+        }
         // The import first: it reads and, later, writes through the pieces stopped below.
         let import = self.import.lock().handle.take();
         if let Some(h) = import {
@@ -1598,6 +1725,8 @@ impl Service {
         } else if judge.join().is_err() {
             tracing::error!("the judge worker panicked");
         }
+        // It may be waiting for Jev, like the judge worker: a moment, then it is left.
+        self.distill.stop();
         self.writer.send_nowait(WriteOp::Shutdown);
         if writer.join().is_err() {
             tracing::error!("the writer panicked");
@@ -1857,24 +1986,45 @@ impl Service {
         .map_err(join_err)
     }
 
+    /// [`redactor`](Self::redactor) with `privacy.redact` forced on: for text bound for the
+    /// shared team store, which everyone reads, so it never holds a secret whatever this
+    /// person's own store keeps.
+    async fn redactor_always_on(&self, choice: &ProjectChoice) -> Result<Arc<Redactor>> {
+        let (readers, redactors, choice) =
+            (self.readers.clone(), self.redactors.clone(), choice.clone());
+        tokio::task::spawn_blocking(move || {
+            let tree = project_root_in(&readers, &choice);
+            redactors.for_root_always_on(tree.as_ref())
+        })
+        .await
+        .map_err(join_err)
+    }
+
     async fn redact_remember_in(
         &self,
         choice: &ProjectChoice,
-        mut req: RememberRequest,
+        req: RememberRequest,
     ) -> Result<RememberRequest> {
         let r = self.redactor(choice).await?;
-        req.content = redact_field(&r, "content", &req.content)?;
-        if let Some(t) = &req.title {
-            req.title = Some(redact_field(&r, "title", t)?);
-        }
-        req.topics = req
-            .topics
-            .iter()
-            .map(|t| redact_field(&r, "topic", t))
-            .collect::<Result<_>>()?;
-        Ok(req)
+        redact_remember_with(&r, req)
     }
+}
 
+/// `req`'s content, title and topics through `r` (redacted, or refused in `block` mode).
+fn redact_remember_with(r: &Redactor, mut req: RememberRequest) -> Result<RememberRequest> {
+    req.content = redact_field(r, "content", &req.content)?;
+    if let Some(t) = &req.title {
+        req.title = Some(redact_field(r, "title", t)?);
+    }
+    req.topics = req
+        .topics
+        .iter()
+        .map(|t| redact_field(r, "topic", t))
+        .collect::<Result<_>>()?;
+    Ok(req)
+}
+
+impl Service {
     /// `req` with secrets redacted, or an error naming the detector in `block` mode. Idempotent:
     /// text that is redacted already comes back as it is. What a request is spooled as.
     pub async fn redact_remember(&self, req: RememberRequest) -> Result<RememberRequest> {
@@ -1968,13 +2118,14 @@ impl Service {
             .await
     }
 
-    /// `remember` with `shared: true`: redacted with this person's rules, then written to the
-    /// team store only, as this tenant (spec §2.10). It is never spooled and never saved here.
+    /// `remember` with `shared: true`: redacted with this person's rules, switched on whatever
+    /// their own store keeps (everyone reads the team store), then written to the team store
+    /// only, as this tenant (spec §2.10). It is never spooled and never saved here.
     async fn remember_shared(&self, req: RememberRequest) -> Result<RememberResponse> {
         let (team, tenant) = self.team_parts()?;
         let _busy = self.activity.enter();
         let project = self.choose(req.scope()).await?;
-        let req = self.redact_remember_in(&project, req).await?;
+        let req = redact_remember_with(&*self.redactor_always_on(&project).await?, req)?;
         let slug = choice_slug(&project);
         // Superseding marks the older memory too: only its author may (spec §2.10).
         let supersedes: Vec<String> = req
@@ -2044,7 +2195,8 @@ impl Service {
         let id = req.id[TEAM_PREFIX.len()..].to_string();
         self.require_shared_author(&id).await?;
         if req.update.title.is_some() || req.update.body.is_some() || req.update.topics.is_some() {
-            let r = self.redactor(&ProjectChoice::Fallback).await?;
+            // Switched on, as for `remember_shared`: the team store never holds a secret.
+            let r = self.redactor_always_on(&ProjectChoice::Fallback).await?;
             let u = &mut req.update;
             if let Some(t) = &u.title {
                 u.title = Some(redact_field(&r, "title", t)?);
@@ -2590,6 +2742,11 @@ impl Service {
                 similarity: None,
                 raw: h.tier == Tier::Raw,
                 status: h.status,
+                origin: h
+                    .origin
+                    .as_deref()
+                    .and_then(alice_core::model::Origin::parse)
+                    .unwrap_or_default(),
             };
             let mut shown: Vec<(usize, JudgeMemory)> = Vec::new();
             let mut ordinal = 0;
@@ -3385,6 +3542,18 @@ impl Service {
                 .format("%Y-%m-%d")
                 .to_string();
             let costs = alice_core::store::judge::cost_since(c, &week)?;
+            // What the distiller stored today, and how much of it was trashed since.
+            let (distilled_today, distill_dropped_today) =
+                crate::distill::distilled_since(c, &format!("{today}T00:00:00.000Z"))?;
+            // The judge's spend is every one of its ledger rows: its own and distillation's.
+            use alice_core::judge::jev::{LEDGER_DISTILL, LEDGER_ROWS};
+            let judge_costs = |keep: &dyn Fn(&alice_core::store::judge::CostRow) -> bool| {
+                // From +0.0: an empty f64 `sum()` is -0.0, which would show as `-0.0`.
+                costs
+                    .iter()
+                    .filter(|r| LEDGER_ROWS.contains(&r.provider.as_str()) && keep(r))
+                    .fold(0.0, |usd, r| usd + r.usd)
+            };
             let mut top = c.prepare(
                 "SELECT p.slug, count(*) FROM memories m JOIN projects p ON p.id = m.project_id
                  WHERE m.status <> 'trashed' GROUP BY p.slug ORDER BY 2 DESC, p.slug LIMIT 20",
@@ -3407,8 +3576,13 @@ impl Service {
                 judge_backlog: alice_core::store::judge::judge_backlog(c)?,
                 judge_retry: count("SELECT count(*) FROM memories WHERE judge_state = 'retry'")?,
                 embed_backlog: embeddings::backlog(c)? as u64,
-                cost_today_usd: costs.iter().filter(|r| r.day == today).map(|r| r.usd).sum(),
-                cost_7d_usd: costs.iter().map(|r| r.usd).sum(),
+                cost_today_usd: judge_costs(&|r| r.day == today),
+                cost_7d_usd: judge_costs(&|_| true),
+                distill_cost_today_usd: judge_costs(&|r| {
+                    r.day == today && r.provider == LEDGER_DISTILL
+                }),
+                distilled_today,
+                distill_dropped_today,
             })
         })
         .await
@@ -4540,6 +4714,10 @@ impl Service {
             .or_else(|| self.team.as_ref().and_then(|t| t.problem()));
         let model_loaded = self.embedder().is_loaded();
         let memory_bytes = crate::doctor::self_memory_bytes();
+        let unrecognised_lines = self.capture.unrecognised_lines_7d();
+        let distill = self.distill.clone();
+        let capture_counts = self.capture_counts();
+        let capture_settings = self.settings();
         let tenant = self.opts.tenant;
         // Read the backup directory, the spool and the database: off the runtime's threads.
         let scheduler = self.scheduler.clone();
@@ -4588,10 +4766,241 @@ impl Service {
                 settings_errors,
                 config_degraded,
                 team_warning,
+                capture: distill.fill_health(
+                    c,
+                    crate::capture::health(
+                        c,
+                        &capture_settings,
+                        unrecognised_lines,
+                        capture_counts,
+                    )?,
+                )?,
                 tenant,
             })
         })
         .await
+    }
+
+    /// A transcript upload (SP2 spec §5.2): `Err(cursor)` when `q.offset` is below the source's
+    /// cursor (the route answers `409 {"next_offset": cursor}`), else what was captured.
+    pub async fn capture_transcript(
+        &self,
+        q: TranscriptQuery,
+        body: axum::body::Bytes,
+    ) -> Result<std::result::Result<TranscriptAnswer, u64>> {
+        let report = self.capture_upload(q, body).await?;
+        Ok(match report.behind {
+            Some(cursor) => Err(cursor),
+            None => Ok(report.answer()),
+        })
+    }
+
+    /// [`capture_transcript`](Self::capture_transcript) with the whole report of the pass.
+    ///
+    /// - refused (`Invalid`, nothing written): an unknown agent or event, a bad id, an offset
+    ///   over [`crate::capture::MAX_OFFSET`];
+    /// - `no_capture=1` is a no-op: nothing is read or written, and the client moves past the
+    ///   body's last complete line;
+    /// - the project: on a server tenant, the hint (`project_header`, the `X-Alice-Project`
+    ///   header, else `project`), resolved as a direct MCP caller's is (an existing slug or
+    ///   alias, else the `import:<slug>` placeholder); on a local daemon, `cwd` (plan decision
+    ///   P8). An existing source keeps its own project;
+    /// - `session-end` closes the trailing turn whatever it waits for and ends the source;
+    ///   every other event closes it unless its last tool call has no result yet. With
+    ///   `more=1` (a capped body) the trailing turn stays open and nothing ends.
+    pub async fn capture_upload(
+        &self,
+        q: TranscriptQuery,
+        body: axum::body::Bytes,
+    ) -> Result<PassReport> {
+        let _busy = self.activity.enter();
+        let agent = alice_core::capture::AgentKind::parse(&q.agent).ok_or_else(|| {
+            AliceError::invalid(format!(
+                "unknown agent \"{}\"; use claude-code or codex",
+                q.agent
+            ))
+        })?;
+        crate::capture::check_ids(&q.session, q.subagent.as_deref())?;
+        crate::capture::check_event(&q.event)?;
+        crate::capture::check_offset(q.offset)?;
+        if q.no_capture.is_some_and(|v| v != 0) {
+            let uri = agent.source_uri(&q.session, q.subagent.as_deref());
+            return PassReport::not_captured(uri, q.offset, &body);
+        }
+        let nonempty = |s: &Option<String>| s.clone().filter(|v| !v.trim().is_empty());
+        let hint = nonempty(&q.project_header).or_else(|| nonempty(&q.project));
+        let project = self
+            .choose(Scope {
+                project: None,
+                cwd: q.cwd.as_deref(),
+                client_project: None,
+                project_hint: hint.as_deref(),
+            })
+            .await?;
+        let session_end = q.event == "session-end";
+        // A capped body (`more=1`): the transcript goes on, so its trailing turn stays open.
+        let more = q.more.is_some_and(|v| v != 0);
+        let input = PassInput {
+            agent,
+            session: q.session,
+            subagent: q.subagent,
+            init: CaptureInit {
+                no_distill: q.no_distill.is_some_and(|v| v != 0),
+                ..Default::default()
+            },
+            project,
+            bytes: body,
+            offset: q.offset,
+            at_file_start: q.offset == 0,
+            close_trailing: !session_end && !more,
+            force_close: session_end && !more,
+            event: q.event,
+            end: session_end && !more,
+        };
+        let capture = self.capture.clone();
+        tokio::task::spawn_blocking(move || capture.apply(input))
+            .await
+            .map_err(join_err)?
+    }
+
+    /// `GET /api/v1/capture/briefing` (SP2 spec §5.7, §8.2): the SessionStart briefing, the
+    /// `context` text of the session's project cut to [`BRIEFING_MAX_CHARS`] at a line end.
+    /// `None` when `capture.briefing` is off, or when `source` is `resume` or `fork` (the
+    /// session already has its context).
+    ///
+    /// The project: on a server tenant, the hint (`project_header`, the `X-Alice-Project`
+    /// header, else `project`), resolved as a transcript upload's is (an existing slug or alias,
+    /// or the `import:<slug>` placeholder when it is stored); a hint no stored project answers
+    /// to gives the global briefing, because a read creates nothing. On a local daemon, `cwd`.
+    pub async fn capture_briefing(&self, q: BriefingQuery) -> Result<Option<String>> {
+        let _busy = self.activity.enter();
+        if !self.settings().capture.briefing
+            || matches!(q.source.as_deref().map(str::trim), Some("resume" | "fork"))
+        {
+            return Ok(None);
+        }
+        let req = if self.opts.tenant {
+            let nonempty = |s: &Option<String>| s.clone().filter(|v| !v.trim().is_empty());
+            let project = match nonempty(&q.project_header).or_else(|| nonempty(&q.project)) {
+                None => None,
+                Some(hint) => {
+                    let choice = self
+                        .choose(Scope {
+                            project_hint: Some(&hint),
+                            ..Scope::default()
+                        })
+                        .await?;
+                    self.read(move |c| {
+                        Ok(match choice {
+                            ProjectChoice::Slug(slug) => Some(slug),
+                            ProjectChoice::Detected(r) => match projects::detected_for_read(c, &r)?
+                            {
+                                DetectedForRead::Stored(p) | DetectedForRead::Placeholder(p) => {
+                                    Some(p.slug)
+                                }
+                                DetectedForRead::Ambiguous(_) | DetectedForRead::Unstored => None,
+                            },
+                            ProjectChoice::Fallback => None,
+                        })
+                    })
+                    .await?
+                }
+            };
+            ContextRequest {
+                project,
+                ..ContextRequest::default()
+            }
+        } else {
+            ContextRequest {
+                cwd: q.cwd,
+                ..ContextRequest::default()
+            }
+        };
+        let text = self.context(req).await?.text;
+        Ok(Some(
+            crate::capture::cut_at_line_end(&text, BRIEFING_MAX_CHARS).to_string(),
+        ))
+    }
+
+    /// `alice capture distill <session>` (SP2 spec §8.3): the session (or capture source) is due
+    /// for distillation now, whatever its state (a backfilled or failed one too).
+    pub async fn capture_distill_now(&self, session_or_source: &str) -> Result<()> {
+        self.capture_distill(session_or_source).await.map(|_| ())
+    }
+
+    /// [`capture_distill_now`](Self::capture_distill_now) with the uris of the sources it made
+    /// due (`POST /api/v1/capture/distill`). `NotFound` when nothing captured answers to it.
+    pub async fn capture_distill(&self, session_or_source: &str) -> Result<Vec<String>> {
+        let _busy = self.activity.enter();
+        let (distill, id) = (self.distill.clone(), session_or_source.to_string());
+        tokio::task::spawn_blocking(move || distill.mark_due_now(&id))
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Where distillation stands (SP2 spec §8.4): `off`, `ready`, `waiting_judge`,
+    /// `waiting_budget`, `breaker_open` or `no_key`, with what is wrong and what to do.
+    pub async fn distill_status(&self) -> Result<crate::distill::DistillView> {
+        let distill = self.distill.clone();
+        self.read(move |c| distill.view(c)).await
+    }
+
+    /// Tests and diagnosis: the distill worker's last runs, oldest first.
+    #[doc(hidden)]
+    pub fn distill_runs(&self) -> Vec<crate::distill::RunReport> {
+        self.distill.runs()
+    }
+
+    /// Tests: how many times the distill worker's loop has turned (asleep, once a tick).
+    #[doc(hidden)]
+    pub fn distill_rounds(&self) -> u64 {
+        self.distill.rounds()
+    }
+
+    /// `GET /api/v1/capture/status`: the capture switch, distillation and the 50 sessions
+    /// captured most recently.
+    pub async fn capture_status(&self) -> Result<CaptureStatus> {
+        let _busy = self.activity.enter();
+        let (tenant, settings) = (self.opts.tenant, self.settings());
+        let distill = self.distill.clone();
+        self.read(move |c| {
+            let mut status = crate::capture::status(c, tenant, &settings)?;
+            status.distill_state = distill.view(c)?.state.into();
+            Ok(status)
+        })
+        .await
+    }
+
+    /// `POST /api/v1/capture/notify` (SP2 spec §4.2): checks the notification and queues a pass
+    /// of its transcript; the capture worker reads the file later, from the source's cursor.
+    /// Refused (`Invalid`) for a bad notification, and on a server tenant, which cannot read the
+    /// client's files.
+    pub async fn capture_notify(&self, n: CaptureNotify) -> Result<()> {
+        let _busy = self.activity.enter();
+        self.capture_notify_spooled(n)
+    }
+
+    /// [`capture_notify`](Self::capture_notify) for the spool drain, which is not activity.
+    pub(crate) fn capture_notify_spooled(&self, n: CaptureNotify) -> Result<()> {
+        if self.opts.tenant {
+            return Err(AliceError::Invalid(
+                crate::capture::TENANT_NOTIFY_REFUSAL.into(),
+            ));
+        }
+        match &self.capture_worker {
+            Some(w) => w.queue(n),
+            None => Err(AliceError::Other(
+                "the capture worker is not running; restart the daemon".into(),
+            )),
+        }
+    }
+
+    /// What the local capture worker counted since the daemon started (zeros on a tenant).
+    pub fn capture_counts(&self) -> LocalCaptureCounts {
+        self.capture_worker
+            .as_ref()
+            .map(|w| w.counts())
+            .unwrap_or_default()
     }
 }
 
@@ -4611,11 +5020,15 @@ fn newest_backup_time(dir: &Path) -> Option<String> {
 impl Drop for Service {
     /// Without an explicit `shutdown`, ask both threads to stop but do not wait for them.
     fn drop(&mut self) {
+        if let Some(w) = &self.capture_worker {
+            w.signal_stop();
+        }
         if self.threads.get_mut().is_some() {
             self.stop.store(true, Ordering::SeqCst);
             let _ = self.wake_worker.try_send(());
             let _ = self.wake_judge.try_send(());
             self.embedding.signal_stop();
+            self.distill.signal_stop();
             self.writer.send_nowait(WriteOp::Shutdown);
         }
     }
@@ -7089,6 +7502,38 @@ mod tests {
         s.shutdown();
     }
 
+    /// Merge fix round 1: the capture worker follows `ServiceOptions::tenant` and the distill
+    /// worker's stale end follows the settings' tenant rules, so a settings handle whose tenant
+    /// rules differ from the flag would run both stale ends or neither. The start refuses it.
+    #[test]
+    fn a_settings_handle_with_other_tenant_rules_refuses_the_start() {
+        for tenant in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let home = AliceHome::new(d.path().to_path_buf());
+            home.ensure_dirs().unwrap();
+            let handle = SettingsHandle::load_with(&home, Vec::new(), !tenant);
+            let started = Service::start(
+                home,
+                &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+                ServiceOptions {
+                    settings: Some(handle),
+                    tenant,
+                    ..quiet()
+                },
+            );
+            match started {
+                Ok(s) => {
+                    s.shutdown();
+                    panic!("tenant = {tenant}: a handle with the other tenant rules was accepted");
+                }
+                Err(e) => assert!(
+                    e.to_string().contains("tenant rules"),
+                    "tenant = {tenant}: {e}"
+                ),
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn ignored_variables_show_in_health_and_the_settings_view() {
         let d = tempfile::tempdir().unwrap();
@@ -8325,6 +8770,319 @@ mod tests {
         s.shutdown();
     }
 
+    // ------------------------------------------------- distilled memories (SP2 spec §6.6)
+
+    /// A distilled memory, written as the distiller writes it (SP2 spec §6.5): the service's
+    /// project choice, `origin = distill`.
+    async fn remember_distilled(
+        s: &Service,
+        content: &str,
+        kind: Kind,
+        cwd: &Option<String>,
+    ) -> String {
+        let project = s
+            .choose(remember_req(content, Some(kind), cwd).scope())
+            .await
+            .unwrap();
+        match s
+            .writer
+            .submit(WriteOp::Remember {
+                input: NewMemoryInput {
+                    content: content.into(),
+                    kind: Some(kind),
+                    origin: alice_core::model::Origin::Distill,
+                    ..Default::default()
+                },
+                project,
+            })
+            .await
+            .unwrap()
+        {
+            WriteOutcome::Remembered(InsertOutcome::New { id, .. }, _) => id,
+            o => panic!("{o:?}"),
+        }
+    }
+
+    /// `(to_id, type)` of the links from `id`.
+    async fn links_from(s: &Service, id: &str) -> Vec<(String, String)> {
+        let id = id.to_string();
+        s.read(move |c| {
+            let mut st =
+                c.prepare("SELECT to_id, type FROM links WHERE from_id = ?1 ORDER BY type")?;
+            let rows = st
+                .query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_memory_replaces_an_older_distilled_duplicate() {
+        let (d, s) = svc_with_jev(crate::judge_http::ScriptedJev::new(("duplicate", 0.95))).await;
+        let cwd = repo(&d, "proj");
+        let auto = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5432",
+            Kind::Fact,
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let mine = remember_id(
+            &s,
+            "The staging Postgres server listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        // The explicit memory survives, though it is the newer one.
+        assert_eq!(
+            state_of(&s, &mine).await,
+            ("done".to_string(), "active".to_string())
+        );
+        assert_eq!(state_of(&s, &auto).await.1, "trashed");
+        assert_eq!(
+            links_from(&s, &auto).await,
+            [(mine.clone(), "duplicate_of".to_string())]
+        );
+        assert_eq!(
+            memory_of(&s, &auto).await.memory.id,
+            mine,
+            "the survivor answers for the distilled copy"
+        );
+        assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
+        let ev = s
+            .events(EventsRequest {
+                target_id: Some(auto.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| e.action == "memory.merge" && e.actor == "judge:jev"),
+            "{ev:?}"
+        );
+        s.shutdown();
+    }
+
+    /// R19, and Task 11b: a distilled update of an agent's memory never supersedes it; it is a
+    /// near-copy of it and goes to the trash as its duplicate, with no review item, unless it
+    /// holds more (Task 12c: here a newer value), when it stays, linked `relates_to`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_distilled_memory_never_supersedes_an_agent_memory() {
+        let (d, s) = svc_with_jev(crate::judge_http::ScriptedJev::new(("updates", 0.95))).await;
+        let cwd = repo(&d, "proj");
+        let mine = remember_id(
+            &s,
+            "Staging Postgres listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let auto = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5433 now",
+            Kind::Fact,
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let live = ("done".to_string(), "active".to_string());
+        assert_eq!(state_of(&s, &mine).await, live, "the agent's memory stays");
+        // Task 12c's guard: a newer value (5433, which the agent's memory does not state) is
+        // never trashed as a duplicate; it stays, linked to the agent's memory.
+        assert_eq!(state_of(&s, &auto).await, live);
+        assert_eq!(
+            links_from(&s, &auto).await,
+            [(mine.clone(), "relates_to".to_string())]
+        );
+        // Task 11b: a distilled update that states nothing new is the agent's memory's duplicate.
+        let same = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5432 for the app",
+            Kind::Fact,
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        assert_eq!(
+            state_of(&s, &same).await,
+            ("done".to_string(), "trashed".to_string())
+        );
+        assert_eq!(
+            links_from(&s, &same).await,
+            [(mine.clone(), "duplicate_of".to_string())]
+        );
+        assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
+        // A distilled update of an older distilled memory supersedes it, as an agent's would
+        // (in a project without the agent's memory).
+        let other = repo(&d, "other");
+        let first = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5434 now",
+            Kind::Fact,
+            &other,
+        )
+        .await;
+        wait_settled(&s).await;
+        let newer = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5435 now",
+            Kind::Fact,
+            &other,
+        )
+        .await;
+        wait_settled(&s).await;
+        assert_eq!(state_of(&s, &newer).await, live);
+        assert_eq!(state_of(&s, &first).await.1, "superseded");
+        assert_eq!(state_of(&s, &mine).await.1, "active");
+        assert_eq!(
+            links_from(&s, &newer).await,
+            [(first.clone(), "supersedes".to_string())]
+        );
+        assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unjudged_distilled_memories_are_hidden_from_recall_and_the_briefing() {
+        /// Jev behind a gate: a request waits until the test opens it, then gets `inner`'s
+        /// answer. `waiting` counts the requests that reached the gate.
+        struct Gated {
+            inner: Arc<crate::judge_http::ScriptedJev>,
+            open: parking_lot::Mutex<bool>,
+            opened: parking_lot::Condvar,
+            waiting: std::sync::atomic::AtomicUsize,
+        }
+        impl alice_core::judge::jev::JevTransport for Gated {
+            fn post(
+                &self,
+                endpoint: &str,
+                key: &str,
+                body: &[u8],
+                timeout: Duration,
+            ) -> std::result::Result<
+                alice_core::judge::jev::HttpReply,
+                alice_core::judge::jev::TransportError,
+            > {
+                self.waiting
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut open = self.open.lock();
+                while !*open {
+                    self.opened.wait(&mut open);
+                }
+                drop(open);
+                self.inner.post(endpoint, key, body, timeout)
+            }
+        }
+        // Jev is down; a failed judgement waits in `retry` until the test queues it again (the
+        // retry interval is long here).
+        let t = crate::judge_http::ScriptedJev::failing(503);
+        let gate = Arc::new(Gated {
+            inner: t.clone(),
+            open: parking_lot::Mutex::new(false),
+            opened: parking_lot::Condvar::new(),
+            waiting: Default::default(),
+        });
+        let d = tempfile::tempdir().unwrap();
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                jev_transport: Some(gate.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        s.patch_settings(patch_one("judge.provider", serde_json::json!("jev")))
+            .unwrap();
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        let cwd = repo(&d, "proj");
+        // A neighbour, so the judge has a question to ask about the distilled memory.
+        remember_id(
+            &s,
+            "Staging Postgres listens on port 5432",
+            Some(Kind::Fact),
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        let text = "We release the billing service with blue green deploys";
+        let auto = remember_distilled(&s, text, Kind::Decision, &cwd).await;
+        let recall = || {
+            s.recall(RecallRequest {
+                query: "billing blue green deploys".into(),
+                cwd: cwd.clone(),
+                format: OutputFormat::Json,
+                ..Default::default()
+            })
+        };
+        // Recall and the briefing leave it out, and get finds it, while its judge state is `want`.
+        let hidden = |want: &'static str| {
+            let (s, cwd, auto, recall) = (&s, &cwd, &auto, &recall);
+            async move {
+                assert_eq!(state_of(s, auto).await.0, want);
+                let r = recall().await.unwrap();
+                assert!(
+                    r.results.iter().all(|h| h.id != *auto),
+                    "{want}: {:?}",
+                    r.results
+                );
+                let ctx = context_of(s, cwd).await.text;
+                assert!(!ctx.contains("blue green"), "{want}: {ctx}");
+                assert_eq!(
+                    memory_of(s, auto).await.memory.id,
+                    *auto,
+                    "{want}: get finds it"
+                );
+            }
+        };
+        // The judge is asking Jev about it, and the answer is held at the gate.
+        until("the judge's question", || {
+            (gate.waiting.load(std::sync::atomic::Ordering::SeqCst) > 0).then_some(())
+        })
+        .await;
+        hidden("pending").await;
+        // The answer: Jev cannot answer, and the memory waits for the judge.
+        *gate.open.lock() = true;
+        gate.opened.notify_all();
+        until("waiting for the judge", || {
+            (futures::executor::block_on(state_of(&s, &auto)).0 == "retry").then_some(())
+        })
+        .await;
+        hidden("retry").await;
+        assert!(t.sent() >= 4, "the comparison was tried");
+        // The judge is back and the memory is queued again: once judged, it is shown, marked.
+        t.set_status(None);
+        s.writer
+            .submit(WriteOp::RequeueJudgeRetries {
+                max_attempts: crate::judge_worker::MAX_ATTEMPTS,
+                now: "9999-12-31T00:00:00.000Z".into(),
+                distill: Some(s.settings().distill.clone()),
+            })
+            .await
+            .unwrap();
+        until("the judgement", || {
+            (futures::executor::block_on(state_of(&s, &auto)).0 == "done").then_some(())
+        })
+        .await;
+        let r = recall().await.unwrap();
+        let hit = r.results.iter().find(|h| h.id == auto).unwrap();
+        assert_eq!(hit.origin.as_deref(), Some("distill"));
+        let ctx = context_of(&s, &cwd).await.text;
+        assert!(
+            ctx.contains(&format!("- [decision] {text} ({auto}) (auto)\n")),
+            "{ctx}"
+        );
+        s.shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn kind_is_set_only_when_the_writer_gave_none() {
         let t = Arc::new(crate::judge_http::ScriptedJev {
@@ -8662,6 +9420,230 @@ mod tests {
         );
         assert!(t.mentioned("[REDACTED"), "where the token was");
         assert!(!t.mentioned(token), "the token reached the model");
+        s.shutdown();
+    }
+
+    // ------------------------------------------------------------------ Jev for distillation
+
+    /// One distillation question, `c1`, about `passage`.
+    fn distill_question(passage: &str) -> alice_core::judge::jev::Question {
+        alice_core::judge::jev::Question {
+            id: "c1".into(),
+            instructions: format!(
+                "Passage 1 from this session: «{passage}». What lasting knowledge, if any, does it hold for future work?"
+            ),
+            options: vec![
+                alice_core::judge::Choice::new(
+                    "decision",
+                    "a choice that was made, with its reason",
+                ),
+                alice_core::judge::Choice::new("ephemeral", "progress narration"),
+            ],
+        }
+    }
+
+    /// `ask_distill` on the judge in force, off the async runtime (as the distiller calls it).
+    async fn ask_distill(
+        s: &Service,
+        project: &str,
+        state: &str,
+        passage: &str,
+        share: f64,
+    ) -> alice_core::judge::JudgeResult<BTreeMap<String, alice_core::judge::Distribution>> {
+        let judge = s.judge();
+        let (project, state, q) = (
+            project.to_string(),
+            state.to_string(),
+            distill_question(passage),
+        );
+        tokio::task::spawn_blocking(move || {
+            judge.ask_distill(&[project.as_str()], &state, &[q], share)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distill_calls_are_recorded_in_their_own_ledger_row() {
+        use crate::doctor::{CheckStatus, daemon_checks};
+        use alice_core::judge::jev::{JevStore, LEDGER_DISTILL, LEDGER_JUDGE, scenarios};
+        let t = crate::judge_http::ScriptedJev::new(("unrelated", 1.0));
+        let (d, s) = svc_with_jev(t.clone()).await;
+        remember_id(
+            &s,
+            "proj keeps its notes in WAL mode",
+            Some(Kind::Note),
+            &repo(&d, "proj"),
+        )
+        .await;
+        wait_settled(&s).await;
+        // One call of the judge itself and one of distillation.
+        let judge = s.judge();
+        tokio::task::spawn_blocking(move || {
+            judge.classify_constant(scenarios::CLASSIFY_STATE, scenarios::CLASSIFY_OPTIONS)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let answers = ask_distill(
+            &s,
+            "proj",
+            "Project: proj\nwe chose WAL",
+            "we chose WAL",
+            0.5,
+        )
+        .await
+        .unwrap();
+        assert!(answers.contains_key("c1"), "{answers:?}");
+        // Both rows are written fire-and-forget through the writer.
+        let rows = until("both ledger rows", || {
+            let rows = futures::executor::block_on(
+                s.read(|c| alice_core::store::judge::cost_since(c, "2000-01-01")),
+            )
+            .ok()?;
+            let has = |p: &str| rows.iter().any(|r| r.provider == p);
+            (has(LEDGER_JUDGE) && has(LEDGER_DISTILL)).then_some(rows)
+        })
+        .await;
+        let row = |p: &str| rows.iter().find(|r| r.provider == p).unwrap().clone();
+        let (judge_row, distill_row) = (row(LEDGER_JUDGE), row(LEDGER_DISTILL));
+        assert_eq!(distill_row.calls, 1, "{rows:?}");
+        assert!(judge_row.usd > 0.0 && distill_row.usd > 0.0, "{rows:?}");
+        let total = judge_row.usd + distill_row.usd;
+        let stats = s.stats().await.unwrap();
+        assert!((stats.cost_today_usd - total).abs() < 1e-12, "{stats:?}");
+        assert!((stats.cost_7d_usd - total).abs() < 1e-12, "{stats:?}");
+        assert!(
+            (stats.distill_cost_today_usd - distill_row.usd).abs() < 1e-12,
+            "{stats:?}"
+        );
+        assert_eq!((stats.distilled_today, stats.distill_dropped_today), (0, 0));
+        // The cache keeps one provider: the distill answer is a `jev` entry like any other.
+        let cache: Vec<String> = s
+            .read(|c| {
+                let mut stmt = c.prepare("SELECT provider FROM judge_cache")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<std::result::Result<_, _>>()?)
+            })
+            .await
+            .unwrap();
+        assert!(
+            cache.len() >= 2 && cache.iter().all(|p| p == "jev"),
+            "{cache:?}"
+        );
+        // The judge's store reads the day's total, and each row on its own.
+        let store = crate::judge_http::DaemonJevStore {
+            readers: s.readers.clone(),
+            writer: s.writer.clone(),
+        };
+        let today = judge_row.day.clone();
+        assert!((store.spent(&today).unwrap() - total).abs() < 1e-12);
+        assert!((store.spent_by(&today, LEDGER_DISTILL).unwrap() - distill_row.usd).abs() < 1e-12);
+        assert!((store.spent_by(&today, LEDGER_JUDGE).unwrap() - judge_row.usd).abs() < 1e-12);
+        // The doctor's 80 % warning counts both rows: neither reaches it alone, together they do.
+        let budget = total / 0.85;
+        assert!(judge_row.usd < 0.8 * budget && distill_row.usd < 0.8 * budget);
+        s.patch_settings(patch_one(
+            "judge.daily_budget_usd",
+            serde_json::json!(budget),
+        ))
+        .unwrap();
+        let checks = daemon_checks(&s).await.unwrap();
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "judge budget")
+            .unwrap_or_else(|| panic!("no budget warning: {checks:?}"));
+        assert_eq!(warn.status, CheckStatus::Warn, "{warn:?}");
+        assert!(warn.detail.contains("(distillation $"), "{warn:?}");
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ask_distill_passes_the_cloud_gate_and_redacts() {
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let t = crate::judge_http::ScriptedJev::new(("unrelated", 1.0));
+        let (d, s) = svc_with_jev(t.clone()).await;
+        remember_id(
+            &s,
+            "openproj first note",
+            Some(Kind::Note),
+            &repo(&d, "openproj"),
+        )
+        .await;
+        remember_id(
+            &s,
+            "closedproj first note",
+            Some(Kind::Note),
+            &repo(&d, "closedproj"),
+        )
+        .await;
+        wait_settled(&s).await;
+        s.patch_settings(patch_one(
+            "privacy.cloud_denied_projects",
+            serde_json::json!(["closedproj"]),
+        ))
+        .unwrap();
+        let before = t.sent();
+        let e = ask_distill(
+            &s,
+            "closedproj",
+            "Project: closedproj\nthe closed plan",
+            "the closed plan",
+            0.5,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, JudgeError::Denied);
+        assert_eq!(t.sent(), before, "a denied project is never sent");
+        assert!(!t.mentioned("the closed plan"));
+        // An allowed project goes, redacted: the state and the question alike.
+        let state = format!("Project: openproj\nthe deploy token is {token}");
+        let answers = ask_distill(&s, "openproj", &state, &format!("deploy with {token}"), 0.5)
+            .await
+            .unwrap();
+        assert!(answers.contains_key("c1"), "{answers:?}");
+        assert_eq!(t.sent(), before + 1);
+        assert!(t.mentioned("the deploy token is"), "the state was sent");
+        assert!(t.mentioned("[REDACTED"), "where the token was");
+        assert!(!t.mentioned(token), "the token reached the model");
+        s.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ask_distill_is_denied_for_the_heuristic() {
+        let d = tempfile::tempdir().unwrap();
+        let t = crate::judge_http::ScriptedJev::new(("unrelated", 1.0));
+        let s = Service::start(
+            AliceHome::new(d.path().to_path_buf()),
+            &|| Ok(Arc::new(FakeEmbedder::new(384)) as Arc<dyn Embedder>),
+            ServiceOptions {
+                jev_transport: Some(t.clone()),
+                ..quiet()
+            },
+        )
+        .unwrap();
+        // A Jev key is stored, but the settings ask for the heuristic.
+        s.set_secret(SecretName::JevApiKey, JEV_TEST_KEY.into())
+            .unwrap();
+        remember_id(&s, "proj first note", Some(Kind::Note), &repo(&d, "proj")).await;
+        wait_settled(&s).await;
+        assert_eq!(s.judge().provider(), "heuristic");
+        let e = ask_distill(
+            &s,
+            "proj",
+            "Project: proj\nwe chose WAL",
+            "we chose WAL",
+            0.5,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, JudgeError::Denied);
+        assert_eq!(t.sent(), 0, "the heuristic sends nothing");
+        // Nothing was spent, and nothing shows as `-0.0` (an empty f64 sum is negative zero).
+        let st = s.stats().await.unwrap();
+        for usd in [st.cost_today_usd, st.cost_7d_usd, st.distill_cost_today_usd] {
+            assert!(usd == 0.0 && usd.is_sign_positive(), "{st:?}");
+        }
         s.shutdown();
     }
 
@@ -9809,6 +10791,7 @@ mod tests {
             source: None,
             author: None,
             cloud_ok: None,
+            origin: None,
         }
     }
 
@@ -9883,6 +10866,14 @@ mod tests {
         let (d, s) = svc_with_grader(t).await;
         let cwd = repo(&d, "proj");
         remember_deploy_notes(&s, &cwd).await;
+        // Each recall bumps its results' access counts with a fire-and-forget write, which the
+        // next recall may or may not see yet; without the usage boost the count leaves the
+        // score alone, so the two searches below score alike whenever that write lands.
+        s.patch_settings(patch_one(
+            "search.weights.usage_max",
+            serde_json::json!(0.0),
+        ))
+        .unwrap();
         let fast = s
             .recall(recall_req("deploy notes", RecallMode::Fast, &cwd))
             .await

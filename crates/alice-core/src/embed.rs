@@ -83,9 +83,17 @@ impl Embedder for UnavailableEmbedder {
     }
 }
 
+/// Characters of a memory's title and body embedded (see [`memory_embed_text`]).
+pub const MEMORY_EMBED_CHARS: usize = 2_000;
+
 /// Text embedded for a memory: title and body, bounded so the model's 512-token window is not exceeded badly.
 pub fn memory_embed_text(title: &str, body: &str) -> String {
-    truncate_chars(&format!("{title}\n{body}"), 2_000)
+    truncate_chars(&format!("{title}\n{body}"), MEMORY_EMBED_CHARS)
+}
+
+/// Whether [`memory_embed_text`] cuts this title and body.
+pub fn memory_embed_text_is_cut(title: &str, body: &str) -> bool {
+    title.chars().count() + 1 + body.chars().count() > MEMORY_EMBED_CHARS
 }
 
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
