@@ -18,6 +18,11 @@
 //! out whole; a chunk cut puts it whole at the start of the next chunk, and one longer than a
 //! chunk stays whole in a chunk over the limit. Every cloud request redacts the stored chunks
 //! one by one, so a secret whole in a chunk is a secret its detector finds there.
+//!
+//! A field rendered on one line (a command, a subagent's prompt, a tool's input) is searched
+//! as it came, with its line breaks, and a secret written over several lines keeps them, with
+//! the breaks on either side ([`one_line`], follow-up M1): the body of a key with no `BEGIN`
+//! line is a secret to `base64_block` by its lines only, there and at egress.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -183,10 +188,34 @@ pub(super) struct Cuts<'t> {
 
 impl<'t> Cuts<'t> {
     pub(super) fn new(text: &'t str, det: &Redactor) -> Self {
-        Self {
-            text,
-            spans: secret_spans(text, det),
+        Self::with(text, det, Vec::new())
+    }
+
+    /// [`new`](Self::new), and `known`: secrets found where `text` came from, before it was
+    /// put on one line ([`one_line`]), which its detectors may no longer see in it (follow-up
+    /// M1: a key's body is known by its lines).
+    fn with(text: &'t str, det: &Redactor, known: Vec<Range<usize>>) -> Self {
+        let mut found = known;
+        found.extend(secret_spans(text, det));
+        found.sort_by_key(|s| (s.start, s.end));
+        let mut spans: Vec<Range<usize>> = Vec::with_capacity(found.len());
+        for s in found {
+            match spans.last_mut() {
+                Some(last) if s.start < last.end => last.end = last.end.max(s.end),
+                _ => spans.push(s),
+            }
         }
+        Self { text, spans }
+    }
+
+    /// Whether a kept text that ends at `at` ends with a secret written over several lines,
+    /// whose last line must end before anything follows it: `base64_block` knows a key's body
+    /// by whole lines, at egress too, and a `…` right after the last one would hide that line
+    /// from it.
+    fn ends_a_secret_of_lines(&self, at: usize) -> bool {
+        self.spans
+            .iter()
+            .any(|s| s.end == at && self.text[s.clone()].contains('\n'))
     }
 
     /// The secret `at` (a byte offset on a character boundary) falls strictly inside.
@@ -339,7 +368,8 @@ impl Scrub<'_> {
     }
 
     /// A tool's input, a command or a title, on one line: redacted, binary removed (review
-    /// A-M5), then clipped to `n` characters.
+    /// A-M5), then clipped to `n` characters. A secret the redactor kept (it is off, or the
+    /// allowlist exempts it) keeps its lines ([`one_line`]).
     fn line(&mut self, text: &str, n: usize) -> String {
         let text = self.text(text);
         clip(&strip_binary(&text), n, self.det)
@@ -369,7 +399,8 @@ fn byte_of_char(text: &str, n: usize) -> usize {
 
 /// At most `n` characters, with `…` when something was cut, never inside a token or a secret
 /// (one the cut falls inside is kept whole, see [`Cuts::head_end`]). Line breaks become spaces,
-/// so a title stays on one line.
+/// so a title stays on one line, except in and around a secret written over several lines
+/// ([`one_line`]).
 fn clip(text: &str, n: usize, det: &Redactor) -> String {
     clip_with(text, n, Some(det))
 }
@@ -382,20 +413,96 @@ fn clip_name(text: &str, n: usize) -> String {
 
 /// `det`: cut at whole tokens and secrets; `None`: cut anywhere.
 fn clip_with(text: &str, n: usize, det: Option<&Redactor>) -> String {
-    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= n {
-        return one_line;
-    }
-    let mut end = byte_of_char(&one_line, n.saturating_sub(1));
-    if let Some(det) = det {
-        end = Cuts::new(&one_line, det).head_end(end);
-        if end >= one_line.len() {
-            return one_line;
+    let Some(det) = det else {
+        let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.chars().count() <= n {
+            return line;
         }
+        let mut out = line[..byte_of_char(&line, n.saturating_sub(1))]
+            .trim_end()
+            .to_owned();
+        out.push('…');
+        return out;
+    };
+    let (line, known) = one_line(text, det);
+    if line.chars().count() <= n {
+        return line;
     }
-    let mut out = one_line[..end].trim_end().to_owned();
+    let cuts = Cuts::with(&line, det, known);
+    let end = cuts.head_end(byte_of_char(&line, n.saturating_sub(1)));
+    if end >= line.len() {
+        return line;
+    }
+    let kept = line[..end].trim_end();
+    let mut out = kept.to_owned();
+    if cuts.ends_a_secret_of_lines(kept.len()) {
+        out.push('\n');
+    }
     out.push('…');
     out
+}
+
+/// `text` on one line (a tool's input, a command, a title): each run of white space becomes one
+/// space and the ends are trimmed, except that a secret is kept as written, and the white space
+/// on either side of one written over several lines too (follow-up M1). The detectors run on
+/// `text` as it came, with its line breaks: `base64_block` knows a key's body by its lines, so
+/// the body of a key with no `BEGIN` line, pasted into a command, is a secret only there. Kept
+/// with its lines, it is one in the stored chunk as well, where every cloud request finds and
+/// redacts it; joined, it would leave in clear from a store that keeps secrets as written.
+/// Returns the line and where those secrets are in it.
+///
+/// No join falls inside a secret: what it holds between its first and last character is never
+/// touched.
+fn one_line(text: &str, det: &Redactor) -> (String, Vec<Range<usize>>) {
+    let found = secret_spans(text, det);
+    let mut line = String::with_capacity(text.len());
+    let mut spans = Vec::with_capacity(found.len());
+    let mut from = 0;
+    // Whether the secret before the current gap is written over several lines (`None`: the
+    // gap starts the text).
+    let mut before: Option<bool> = None;
+    for s in found {
+        let lines = text[s.clone()].contains('\n');
+        push_gap(&mut line, &text[from..s.start], before, Some(lines));
+        let start = line.len();
+        line.push_str(&text[s.clone()]);
+        spans.push(start..line.len());
+        before = Some(lines);
+        from = s.end;
+    }
+    push_gap(&mut line, &text[from..], before, None);
+    (line, spans)
+}
+
+/// Appends the text between two secrets (or an end of the text and a secret) to `line`, its
+/// white space joined ([`one_line`]). `before` and `after` say whether the secret on that side
+/// is written over several lines (`None`: that side is an end of the text, where white space is
+/// trimmed). The white space next to such a secret is kept as written: the secret's first
+/// line starts a line and its last one ends one.
+fn push_gap(line: &mut String, gap: &str, before: Option<bool>, after: Option<bool>) {
+    let words = gap.split_whitespace().collect::<Vec<_>>().join(" ");
+    if words.is_empty() {
+        // White space only, between two secrets (at an end of the text it is trimmed).
+        if let (Some(b), Some(a)) = (before, after)
+            && !gap.is_empty()
+        {
+            line.push_str(if b || a { gap } else { " " });
+        }
+        return;
+    }
+    let lead = &gap[..gap.len() - gap.trim_start().len()];
+    let trail = &gap[gap.trim_end().len()..];
+    match before {
+        Some(true) => line.push_str(lead),
+        Some(false) if !lead.is_empty() => line.push(' '),
+        _ => {}
+    }
+    line.push_str(&words);
+    match after {
+        Some(true) => line.push_str(trail),
+        Some(false) if !trail.is_empty() => line.push(' '),
+        _ => {}
+    }
 }
 
 /// The memory tool a tool name is, as the name that renders (`remember`, `mempalace_search`).
@@ -771,10 +878,12 @@ fn wrapper_lines(text: &str, scrub: &mut Scrub) -> Vec<(String, String)> {
         rest = &rest[after..];
     }
     if let Some(name) = name.filter(|n| !n.is_empty()) {
+        // The arguments start a line, as typed: the first line of a key's body there is one
+        // to `base64_block` (the break becomes a space on the rendered line, see [`one_line`]).
         let line = if args.is_empty() {
             name
         } else {
-            format!("{name} {args}")
+            format!("{name}\n{args}")
         };
         out.insert(0, ("[user]".to_owned(), scrub.line(&line, TOOL_LINE_CHARS)));
     }
@@ -889,11 +998,15 @@ fn cut_chars(text: &str, n: usize, det: &Redactor) -> String {
     if text.chars().count() <= n {
         return text.to_owned();
     }
-    let end = Cuts::new(text, det).head_end(byte_of_char(text, n.saturating_sub(1)));
+    let cuts = Cuts::new(text, det);
+    let end = cuts.head_end(byte_of_char(text, n.saturating_sub(1)));
     if end >= text.len() {
         return text.to_owned();
     }
     let mut out = text[..end].to_owned();
+    if cuts.ends_a_secret_of_lines(end) {
+        out.push('\n');
+    }
     out.push('…');
     out
 }
@@ -2245,6 +2358,144 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Follow-up M1: the body of a private key with no `BEGIN` or `END` line is a secret by its
+    /// lines only (`base64_block`). Pasted into a field that renders on one line (a command, a
+    /// subagent's prompt, a slash command's arguments, a tool's input), a store that keeps
+    /// secrets as written keeps it with its lines, where every cloud request's redaction finds
+    /// it, and the join never touches it; a store that redacts holds none of it.
+    #[test]
+    fn a_key_body_in_a_one_line_field_keeps_its_lines_and_never_leaves() {
+        use crate::settings::PrivacySettings;
+        use context_secrets::pem_lines;
+        let lines: Vec<String> = pem_lines()[..4].to_vec();
+        let body = lines.join("\n");
+        let leak = |text: &str| -> Option<String> {
+            lines.iter().find_map(|l| {
+                (0..=l.len() - 16)
+                    .map(|i| &l[i..i + 16])
+                    .find(|w| text.contains(w))
+                    .map(String::from)
+            })
+        };
+        let call = |name: &str, input: serde_json::Value| {
+            let mut b = user_line(1, serde_json::json!("Set up the ops key."));
+            b.extend(assistant_blocks(
+                2,
+                serde_json::json!([{"type": "tool_use", "id": "t1", "name": name, "input": input}]),
+            ));
+            b.extend(user_line(3, result_block("t1", "done")));
+            b.extend(assistant_blocks(
+                4,
+                serde_json::json!([{"type": "text", "text": "Done."}]),
+            ));
+            b
+        };
+        let heredoc = format!("cat > /tmp/ops.key <<'EOF'\n{body}\nEOF");
+        let long = format!("set -euo pipefail\numask 077\n{heredoc}\nchmod 600 /tmp/ops.key");
+        // The 300-character clip falls inside the body: kept whole, and its last line ends its
+        // line before the `…`.
+        let at = byte_of_char(&long, TOOL_LINE_CHARS - 1);
+        let in_body = long.find(&body).unwrap();
+        assert!(in_body < at && at < in_body + body.len());
+        let prompt = format!("Install this key body:\n{body}\nThen restart the agent.");
+        let cases: Vec<(&str, Vec<u8>, String)> = vec![
+            (
+                "a command",
+                call("Bash", serde_json::json!({"command": heredoc})),
+                format!("<<'EOF'\n{body}\nEOF"),
+            ),
+            (
+                "a clipped command",
+                call("Bash", serde_json::json!({"command": long})),
+                format!("<<'EOF'\n{body}\n…"),
+            ),
+            (
+                "a subagent's prompt",
+                call(
+                    "Task",
+                    serde_json::json!({"subagent_type": "ops", "prompt": prompt}),
+                ),
+                format!("body:\n{body}\nThen"),
+            ),
+            (
+                "a slash command's arguments",
+                user_line(
+                    1,
+                    serde_json::json!(format!(
+                        "<command-name>/install-key</command-name>\n<command-message>install-key</command-message>\n<command-args>{body}</command-args>"
+                    )),
+                ),
+                format!("/install-key\n{body}"),
+            ),
+            (
+                "a tool's input",
+                call(
+                    "mcp__vault__put",
+                    serde_json::json!({"path": "ops/key", "value": body}),
+                ),
+                lines.join("\\n"),
+            ),
+        ];
+        let keep = Redactor::new(&PrivacySettings {
+            redact: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let egress = Redactor::builtin().for_egress();
+        for (case, input, whole) in &cases {
+            for (mode, out) in [
+                ("keep", read_redacted(CLAUDE, input, &closed(), &keep)),
+                ("no redactor", read(CLAUDE, input, &closed())),
+            ] {
+                let chunks: Vec<&RenderedChunk> =
+                    out.turns.iter().flat_map(|t| &t.chunks).collect();
+                assert!(
+                    chunks.iter().any(|c| c.text.contains(whole.as_str())),
+                    "{case} ({mode}): kept with its lines: {chunks:#?}"
+                );
+                for c in &chunks {
+                    let sent = egress.apply(&c.text);
+                    assert_eq!(leak(&sent.text), None, "{case} ({mode}): {}", sent.text);
+                    assert!(
+                        c.text
+                            .lines()
+                            .all(|l| !l.starts_with('[') || TAGS.iter().any(|t| l.starts_with(t)))
+                    );
+                }
+                assert!(
+                    chunks.iter().any(|c| egress
+                        .apply(&c.text)
+                        .text
+                        .contains("[REDACTED:base64_block]")),
+                    "{case} ({mode})"
+                );
+            }
+            let out = read_redacted(CLAUDE, input, &closed(), &Redactor::builtin());
+            let chunks: Vec<&RenderedChunk> = out.turns.iter().flat_map(|t| &t.chunks).collect();
+            for c in &chunks {
+                assert_eq!(leak(&c.text), None, "{case} (redact): {}", c.text);
+            }
+            assert!(
+                chunks
+                    .iter()
+                    .any(|c| c.secrets.contains(&"base64_block".to_string())),
+                "{case} (redact): {chunks:#?}"
+            );
+        }
+        // Joined onto one line, as the line used to be, the body is a secret to no detector.
+        let joined = heredoc.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(Redactor::builtin().spans(&joined).is_empty(), "{joined}");
+        // A line with no secret is joined as before.
+        assert_eq!(
+            one_line(
+                "  ls -la\n  /tmp\t&& echo  done \n",
+                Redactor::builtin_shared()
+            )
+            .0,
+            "ls -la /tmp && echo done"
+        );
     }
 
     /// A secret too large for any chunk cannot be kept whole: it is left out whole (marker),

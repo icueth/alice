@@ -163,6 +163,9 @@ const KEY: &str = concat!("ts_", "live_secrets_at_rest_key_01");
 /// Storage keeps secrets; Jev judges and distils.
 const KEEPING: &str =
     "[privacy]\nredact = false\n\n[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\n";
+/// Storage redacts; Jev judges and distils.
+const REDACTING: &str =
+    "[privacy]\nredact = true\n\n[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\n";
 /// What the token's first characters leave when a cut falls just after them.
 const FRAGMENT: &str = concat!("gh", "p_");
 /// A JWT's header (`{"alg":"HS256"}`): what is left of a cut token.
@@ -248,10 +251,14 @@ struct Local {
 
 impl Local {
     fn start() -> Local {
+        Local::start_with(KEEPING)
+    }
+
+    fn start_with(config: &str) -> Local {
         let dir = tempfile::tempdir().unwrap();
         let home = AliceHome::new(dir.path().join("home"));
         std::fs::create_dir_all(home.root()).unwrap();
-        std::fs::write(home.config_file(), KEEPING).unwrap();
+        std::fs::write(home.config_file(), config).unwrap();
         let jev = Arc::new(JevRecorder::default());
         let embedded = Arc::new(Mutex::new(Vec::new()));
         let texts = embedded.clone();
@@ -906,4 +913,188 @@ async fn an_imported_secret_is_kept_as_written_and_never_reaches_the_cloud() {
         assert_eq!(leak(t), None, "an embedder input: {t}");
     }
     l.svc.shutdown();
+}
+
+// ---------------------------------------------------------------------------------------
+// Follow-up M1: the body of a private key with no `BEGIN` or `END` line is a secret by its
+// lines only (`base64_block`). Pasted into a field capture renders on one line (a command, a
+// subagent's prompt, a tool's input), a store that keeps secrets keeps it with its lines, a
+// store that redacts holds none of it, and in both no request to Jev (distillation, precise
+// recall) or to the remote embedder holds a piece of it. The tests assert on the recorded
+// request bytes.
+// ---------------------------------------------------------------------------------------
+
+/// A session whose agent called `name` with `input`.
+fn call_session(s: &str, name: &str, input: serde_json::Value) -> Vec<u8> {
+    let mut b = user(
+        &format!("{s}-p"),
+        json!("Set up the ops box's deploy key, please."),
+    );
+    b.extend(assistant(
+        &format!("{s}-a"),
+        json!([{"type": "tool_use", "id": format!("{s}-t"), "name": name, "input": input}]),
+    ));
+    b.extend(user(
+        &format!("{s}-r"),
+        json!([{"type": "tool_result", "tool_use_id": format!("{s}-t"), "content": "done"}]),
+    ));
+    b.extend(assistant(
+        &format!("{s}-c"),
+        json!([{"type": "text", "text": "We decided the ops box deploys with the key set up here."}]),
+    ));
+    b
+}
+
+/// Each one-line field with the key's body in it, in a session (and a project) of its own: the
+/// session, and what a chunk of a store that keeps secrets holds of it, whole and with its lines.
+fn one_line_sessions() -> Vec<(String, Vec<u8>, String)> {
+    let lines = context::pem_lines()[..4].to_vec();
+    let body = lines.join("\n");
+    let heredoc = format!("cat > /tmp/ops.key <<'EOF'\n{body}\nEOF");
+    let case = |s: &str, name: &str, input: serde_json::Value, whole: String| {
+        (s.to_string(), call_session(s, name, input), whole)
+    };
+    vec![
+        case(
+            "m1-command",
+            "Bash",
+            json!({"command": heredoc}),
+            format!("<<'EOF'\n{body}\nEOF"),
+        ),
+        // Over the 300-character line: the clip falls inside the body.
+        case(
+            "m1-clipped",
+            "Bash",
+            json!({"command": format!("set -euo pipefail\numask 077\n{heredoc}\nchmod 600 /tmp/ops.key")}),
+            format!("<<'EOF'\n{body}\n…"),
+        ),
+        case(
+            "m1-subagent",
+            "Task",
+            json!({"subagent_type": "ops", "prompt": format!("Install this key body:\n{body}\nThen restart the agent.")}),
+            format!("body:\n{body}\nThen"),
+        ),
+        // Rendered as JSON: its line breaks are escaped.
+        case(
+            "m1-input",
+            "mcp__vault__put",
+            json!({"path": "ops/key", "value": body}),
+            lines.join("\\n"),
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_body_in_a_one_line_field_is_kept_with_its_lines_and_never_reaches_the_cloud() {
+    let cases = one_line_sessions();
+    for (mode, config) in [("keep", KEEPING), ("redact", REDACTING)] {
+        let l = Local::start_with(config);
+        assert_eq!(l.svc.settings().privacy.redact, mode == "redact");
+        for (session, bytes, _) in &cases {
+            let answer = l
+                .svc
+                .capture_transcript(
+                    TranscriptQuery {
+                        agent: "claude-code".into(),
+                        session: session.clone(),
+                        offset: 0,
+                        event: "session-end".into(),
+                        cwd: Some(l.repo(session)),
+                        ..Default::default()
+                    },
+                    axum::body::Bytes::from(bytes.clone()),
+                )
+                .await
+                .unwrap()
+                .unwrap_or_else(|c| panic!("refused behind the cursor {c}"));
+            assert!(answer.turns_stored >= 1, "{session} ({mode})");
+        }
+        let db = l.db();
+        for (session, _, whole) in &cases {
+            let n: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM chunks WHERE instr(text, ?1) > 0",
+                    [whole],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if mode == "keep" {
+                assert!(n >= 1, "{session}: a chunk keeps the body with its lines");
+            } else {
+                assert_eq!(n, 0, "{session}: a store that redacts holds none of it");
+            }
+        }
+        let stored: Vec<String> = db
+            .prepare("SELECT text FROM chunks")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        if mode == "redact" {
+            for t in &stored {
+                assert_eq!(context::leak(t), None, "a stored chunk: {t}");
+            }
+        }
+        drop(db);
+        let sessions = cases.len() as i64;
+        until(
+            "every session is distilled and every chunk embedded",
+            || {
+                l.count("SELECT count(*) FROM capture_state WHERE distill_state = 'done'")
+                    >= sessions
+                    && l.count("SELECT count(*) FROM chunks WHERE embed_state <> 'done'") == 0
+                    && l.count("SELECT count(*) FROM memories WHERE embed_state <> 'done'") == 0
+            },
+        )
+        .await;
+        // Precise recall over the raw tier: each project's chunks go to Jev as results.
+        for (session, _, _) in &cases {
+            l.svc
+                .recall(RecallRequest {
+                    query: "the ops box's deploy key".into(),
+                    project: Some(session.clone()),
+                    include_raw: true,
+                    mode: Some(RecallMode::Precise),
+                    format: OutputFormat::Json,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let bodies = l.jev.bodies.lock().clone();
+        let embedded = l.embedded.lock().clone();
+        assert!(
+            bodies.iter().any(|b| b.contains("How well does result")),
+            "precise recall asked Jev ({mode})"
+        );
+        assert!(
+            bodies.iter().any(|b| b.contains("[REDACTED:base64_block]")),
+            "a Jev request carried the redacted body ({mode})"
+        );
+        assert!(
+            embedded
+                .iter()
+                .any(|t| t.contains("[REDACTED:base64_block]")),
+            "the embedder got the redacted body ({mode})"
+        );
+        for b in &bodies {
+            assert_eq!(context::leak(b), None, "a Jev request ({mode}): {b}");
+        }
+        for t in &embedded {
+            assert_eq!(context::leak(t), None, "an embedder input ({mode}): {t}");
+        }
+        let distilled: Vec<String> = l
+            .db()
+            .prepare("SELECT title || ' ' || body FROM memories")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for m in &distilled {
+            assert_eq!(context::leak(m), None, "a distilled memory ({mode}): {m}");
+        }
+        l.svc.shutdown();
+    }
 }

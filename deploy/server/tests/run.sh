@@ -59,7 +59,7 @@ if [ "${1:-}" = restart ] && [ -n "${LOCK_BIN_ON_RESTART:-}" ]; then chmod a-w "
 if [ "${1:-}" = restart ] && [ "${2:-}" = caddy ]; then
   mkdir -p "$ALICE_SERVER_ROOT/run/caddy"; : >"$ALICE_SERVER_ROOT/run/caddy/admin.sock"
 fi
-if [ "${1:-}" = enable ] && [ "${2:-}" = --now ]; then
+if [ "${1:-}" = enable ] && [ "${2:-}" = --now ] && [[ "${3:-}" == alice@* ]]; then
   n="${3#alice@}"
   mkdir -p "$ALICE_SERVER_ROOT/srv/alice/$n"
   [ -z "${NO_TOKEN:-}" ] && printf 'tok-%s-0123456789abcdef0123456789abcdef\n' "$n" >"$ALICE_SERVER_ROOT/srv/alice/$n/token"
@@ -230,6 +230,12 @@ add_creates_everything() {
   has "$u" 'IPAddressAllow=localhost'
   has "$u" 'IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10'
   has "$u" 'ExecStart=/usr/local/bin/alice daemon run --tenant'
+  # The daily prune of pre-migration copies, through the installed script.
+  has "$R/etc/systemd/system/alice-server-prune.service" 'ExecStart=/usr/local/sbin/alice-server prune'
+  has "$R/etc/systemd/system/alice-server-prune.timer" 'OnCalendar=daily'
+  has "$R/etc/systemd/system/alice-server-prune.timer" 'Persistent=true'
+  has "$R/calls.log" 'systemctl enable --now alice-server-prune.timer'
+  [ ! -e "$SRV/alice-server-prune.timer" ] || fail "the timer was taken for a tenant"
   local c="$R/etc/caddy/Caddyfile"
   has "$c" 'admin unix//run/caddy/admin.sock'
   local d="$R/etc/systemd/system/caddy.service.d/alice.conf"
@@ -586,6 +592,125 @@ remove_archives_then_deletes() {
   [ ! -e "$TENANTS/ann.env" ] || fail "env left behind"
   [ ! -e "$R/etc/caddy/alice.d/ann.caddy" ] || fail "snippet left behind"
   has "$R/calls.log" 'userdel alice-ann'
+  pass
+}
+
+# --- pre-migration copies: kept until a newer daily backup exists, and at most the newest per tenant ------------------
+backup_file() { # tenant file-name
+  mkdir -p "$SRV/$1/backups"
+  printf 'sqlite copy of %s\n' "$2" >"$SRV/$1/backups/$2"
+}
+gone() { [ ! -e "$SRV/$1/backups/$2" ] || fail "$1's $2 was kept: $OUT"; }
+kept() { [ -e "$SRV/$1/backups/$2" ] || fail "$1's $2 was removed: $OUT"; }
+
+prune_keeps_a_copy_only_until_a_newer_daily_backup() {
+  rm -rf -- "${SRV:?}/ann/backups" "${SRV:?}/bob/backups" "${SRV:?}/dave/backups"
+  # ann: a daily backup from 15 October, three migrations' copies, and files that are no pre-migration copy.
+  backup_file ann alice-20261015T020000Z.db
+  backup_file ann alice-pre-migration-v7-20261014T100000Z.db   # older than the daily backup
+  backup_file ann alice-pre-migration-v8-20261016T090000Z.db   # newer, but not the newest copy
+  backup_file ann alice-pre-migration-v9-20261016T120000Z.db   # the newest, newer than every daily backup
+  backup_file ann alice-before-restore-20261001T000000Z.db
+  backup_file ann alice-manual-20261001T000000Z.db
+  backup_file ann alice-pre-migration-vX-notes.db
+  # A daily backup being written (a temporary name) is no daily backup yet.
+  backup_file ann .alice-20261017T020000Z.db.tmp
+  # bob: his only copy is older than his newest daily backup.
+  backup_file bob alice-20261016T020000Z.db
+  backup_file bob alice-20261017T020000Z.db
+  backup_file bob alice-pre-migration-v9-20261016T120000Z.db
+  # dave: copies and no daily backup yet: only the newest stays.
+  backup_file dave alice-pre-migration-v8-20261016T090000Z.db
+  backup_file dave alice-pre-migration-v9-20261016T120000Z.db
+  : >"$R/calls.log"
+  : >"$R/flock.log"
+  run prune
+  [ "$RC" = 0 ] || fail "prune exited $RC: $OUT"
+  gone ann alice-pre-migration-v7-20261014T100000Z.db
+  gone ann alice-pre-migration-v8-20261016T090000Z.db
+  kept ann alice-pre-migration-v9-20261016T120000Z.db
+  kept ann alice-20261015T020000Z.db
+  kept ann alice-before-restore-20261001T000000Z.db
+  kept ann alice-manual-20261001T000000Z.db
+  kept ann alice-pre-migration-vX-notes.db
+  kept ann .alice-20261017T020000Z.db.tmp
+  gone bob alice-pre-migration-v9-20261016T120000Z.db
+  kept bob alice-20261016T020000Z.db
+  kept bob alice-20261017T020000Z.db
+  gone dave alice-pre-migration-v8-20261016T090000Z.db
+  kept dave alice-pre-migration-v9-20261016T120000Z.db
+  # What was removed, and why.
+  [ "$(count_in "removed ann's alice-pre-migration-v7-20261014T100000Z.db")" = 1 ] || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -F "removed ann's alice-pre-migration-v7-" | grep -qF 'a newer daily backup exists' || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -F "removed ann's alice-pre-migration-v8-" | grep -qF 'a newer pre-migration copy is kept' || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -F "removed bob's alice-pre-migration-v9-" | grep -qF 'a newer daily backup exists' || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -qF "removed dave's alice-pre-migration-v8-20261016T090000Z.db" || fail "$OUT"
+  [ "$(count_in 'removed ')" = 4 ] || fail "not four removals: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'pruned 4 pre-migration copies' || fail "$OUT"
+  # Each tenant's own user removes its files.
+  has "$R/calls.log" "sudo -u alice-ann rm -f -- $SRV/ann/backups/alice-pre-migration-v7-20261014T100000Z.db"
+  has "$R/calls.log" "sudo -u alice-bob rm -f -- $SRV/bob/backups/alice-pre-migration-v9-20261016T120000Z.db"
+  has "$R/flock.log" 'flock -s -n 9'
+  # Nothing more to do; then the next daily backup replaces ann's last copy.
+  run prune
+  [ "$RC" = 0 ] || fail "second prune exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'no pre-migration copy to prune' || fail "$OUT"
+  kept ann alice-pre-migration-v9-20261016T120000Z.db
+  backup_file ann alice-20261017T020000Z.db
+  run prune
+  gone ann alice-pre-migration-v9-20261016T120000Z.db
+  printf '%s\n' "$OUT" | grep -F "removed ann's alice-pre-migration-v9-" | grep -qF 'a newer daily backup exists' || fail "$OUT"
+  # A copy as new as the newest daily backup stays.
+  backup_file dave alice-20261016T120000Z.db
+  run prune
+  kept dave alice-pre-migration-v9-20261016T120000Z.db
+  pass
+}
+
+prune_skips_while_another_command_runs() {
+  backup_file ann alice-pre-migration-v10-20261017T080000Z.db
+  backup_file ann alice-pre-migration-v11-20261017T090000Z.db
+  FLOCK_BUSY=1 run prune
+  [ "$RC" = 0 ] || fail "a skipped prune failed the timer: $RC $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'skipped: another alice-server command is running' || fail "$OUT"
+  kept ann alice-pre-migration-v10-20261017T080000Z.db
+  run prune extra
+  [ "$RC" = 2 ] || fail "prune took an argument: $RC"
+  # A copy the tenant's user cannot remove is named, and the run fails (the timer shows it).
+  chmod a-w "$SRV/ann/backups"
+  run prune
+  chmod u+w "$SRV/ann/backups"
+  [ "$RC" != 0 ] || fail "prune succeeded though a copy could not be removed: $OUT"
+  printf '%s\n' "$OUT" | grep -qF "could not remove $SRV/ann/backups/alice-pre-migration-v10-20261017T080000Z.db" || fail "$OUT"
+  run prune
+  [ "$RC" = 0 ] || fail "prune exited $RC: $OUT"
+  gone ann alice-pre-migration-v10-20261017T080000Z.db
+  kept ann alice-pre-migration-v11-20261017T090000Z.db
+  pass
+}
+
+upgrade_prunes_at_its_end_and_installs_the_timer() {
+  rm -rf -- "${SRV:?}/ann/backups" "${R:?}/etc/systemd/system/alice-server-prune.timer"
+  backup_file ann alice-20261016T020000Z.db
+  backup_file ann alice-pre-migration-v8-20261015T090000Z.db
+  backup_file ann alice-pre-migration-v9-20261017T090000Z.db
+  # A failed upgrade prunes nothing: the copies are the way back.
+  PING_FAIL=1 run upgrade "$R/new-alice"
+  [ "$RC" != 0 ] || fail "upgrade succeeded with a failing ping"
+  kept ann alice-pre-migration-v8-20261015T090000Z.db
+  if printf '%s\n' "$OUT" | grep -qF pruned; then fail "a failed upgrade pruned: $OUT"; fi
+  : >"$R/calls.log"
+  run upgrade "$R/new-alice"
+  [ "$RC" = 0 ] || fail "upgrade exited $RC: $OUT"
+  gone ann alice-pre-migration-v8-20261015T090000Z.db
+  kept ann alice-pre-migration-v9-20261017T090000Z.db
+  printf '%s\n' "$OUT" | grep -qF "removed ann's alice-pre-migration-v8-20261015T090000Z.db" || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -qF 'pruned 1 pre-migration copy,' || fail "$OUT"
+  # After every tenant came back, and a server set up before the prune existed gets its timer.
+  [ "$(grep -n 'systemctl restart alice@ann' "$R/calls.log" | tail -n 1 | cut -d: -f1)" -lt \
+    "$(grep -n 'sudo -u alice-ann rm -f' "$R/calls.log" | head -n 1 | cut -d: -f1)" ] || fail "pruned before the restarts"
+  has "$R/etc/systemd/system/alice-server-prune.timer" 'OnCalendar=daily'
+  has "$R/calls.log" 'systemctl enable --now alice-server-prune.timer'
   pass
 }
 
@@ -1512,6 +1637,8 @@ for CURRENT in \
   adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back adopt_follows_the_tenants_secrets_pin \
   imports_and_other_commands_never_overlap \
   restarts_wait_for_a_daemon_import \
+  prune_keeps_a_copy_only_until_a_newer_daily_backup prune_skips_while_another_command_runs \
+  upgrade_prunes_at_its_end_and_installs_the_timer \
   dry_run_import_checks_the_disk_first \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
   build_release_links_the_pinned_runtime_and_lays_out_the_dist \

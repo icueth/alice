@@ -63,7 +63,7 @@ so the format is fixed:
 | Images, documents, audio | `[image]`, `[document]`, `[audio]`; the bytes are never stored |
 | Read, NotebookRead | `[tool Read] <path>`, without the file's content |
 | Edit, Write, MultiEdit, NotebookEdit | `[tool Edit] <path>`, without the content |
-| Bash | The command (at most 300 characters) and its output, trimmed |
+| Bash | The command on one line (at most 300 characters) and its output, trimmed. A secret written over several lines, such as a key's body in a heredoc, keeps its line breaks |
 | Grep, Glob, LS | The pattern and the first 300 characters of the result |
 | WebFetch, WebSearch | The URL or query and the first 500 characters of the result |
 | A subagent call (Task, Agent) | `[subagent <type>] <description>`, then its final report, at most 2,000 characters |
