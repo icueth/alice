@@ -266,10 +266,11 @@ impl From<&DistillSettings> for DistillConfig {
 }
 
 /// What orders a run's kept passages and a session's best set, by one key (spec §6.4; the
-/// controller's ruling P2, Task 12c): a handoff first; the main session before subagents; the p
-/// band (from 0.9, from 0.8, below); the kind (decision, bugfix, warning, fact, howto,
-/// preference); p; and last the memory's idempotency key, a hash of its source and passage, so
-/// the order never depends on when or in which run a passage came.
+/// controller's ruling P2, Task 12c, and round 2's (a), Task 12d): a handoff first; the p band
+/// (from 0.9, from 0.8, below); the main session before subagents, a tie-break inside the band;
+/// the kind (decision, bugfix, warning, fact, howto, preference); p; and last the memory's
+/// idempotency key, a hash of its source and passage, so the order never depends on when or in
+/// which run a passage came.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rank {
     pub kind: Kind,
@@ -287,8 +288,8 @@ impl Rank {
         let head = |r: &Rank| {
             (
                 r.kind != Kind::Handoff,
-                r.subagent,
                 band(r.p),
+                r.subagent,
                 kind_rank(r.kind),
             )
         };
@@ -3964,9 +3965,9 @@ mod tests {
         (ids, replaced)
     }
 
-    /// The controller's ruling P2 (Task 12c): kept passages rank by p bands. The handoff first;
-    /// the main session before subagents; then the band (p ≥ 0.9, ≥ 0.8, below); then the kind;
-    /// then p.
+    /// The controller's ruling P2 (Task 12c), with round 2's (a) (Task 12d): kept passages rank
+    /// by p bands. The handoff first; then the band (p ≥ 0.9, ≥ 0.8, below); then the main session
+    /// before subagents, a tie-break inside the band; then the kind; then p.
     #[test]
     fn kept_passages_rank_by_p_bands() {
         let one = DistillConfig {
@@ -4018,8 +4019,13 @@ mod tests {
         assert_eq!(sources(&mixed), [S::Conclusion, S::SubagentReport]);
         assert_eq!(
             pick(&mixed, &[("c1", "fact", 0.71), ("c2", "decision", 1.0)]),
-            [(Kind::Fact, 0.71)],
-            "the main session before subagents"
+            [(Kind::Decision, 1.0)],
+            "a subagent report in a higher band before the main session"
+        );
+        assert_eq!(
+            pick(&mixed, &[("c1", "fact", 0.91), ("c2", "decision", 0.99)]),
+            [(Kind::Fact, 0.91)],
+            "in one band, the main session before subagents"
         );
         // The same key orders a held memory.
         let a = kept_mem("a", Kind::Fact, 0.98, false).rank();
@@ -4027,6 +4033,32 @@ mod tests {
         assert_eq!(a.order(&b), Ordering::Less);
         let h = kept_mem("h", Kind::Handoff, 0.71, true).rank();
         assert_eq!(h.order(&a), Ordering::Less, "a handoff, even a subagent's");
+    }
+
+    /// Task 12d (a): a subagent report at 0.95 enters a set full of main-session memories in the
+    /// 0.8 band, in place of the weakest; a subagent decision at 0.89, in their band, does not (the
+    /// main session first inside the band, before the kind).
+    #[test]
+    fn a_subagent_report_in_a_higher_band_enters_a_full_set_of_main_memories() {
+        let s = caps(8, 4, 2);
+        let held: Vec<Held> = ["m1", "m2", "m3", "m4"]
+            .iter()
+            .zip([0.85, 0.86, 0.87, 0.88])
+            .map(|(n, p)| held_of(&kept_mem(n, Kind::Fact, p, false)))
+            .collect();
+        let report = kept_mem("r", Kind::Fact, 0.95, true);
+        assert_eq!(
+            place(&held, vec![report.clone()], &s),
+            [Placement {
+                memory: report,
+                replaces: Some("distill:m1".into()),
+            }]
+        );
+        let level = kept_mem("level", Kind::Decision, 0.89, true);
+        assert!(
+            place(&held, vec![level], &s).is_empty(),
+            "same band: main first"
+        );
     }
 
     /// The controller's ruling P1 (Task 12c): `max_per_session` is the size of the session's best
