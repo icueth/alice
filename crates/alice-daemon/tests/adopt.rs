@@ -287,6 +287,27 @@ async fn an_adopted_database_loses_the_machines_paths_and_is_redacted_with_the_t
     drop(source);
 }
 
+/// Owner's decision 2026-10-17: a tenant whose admin pinned `ALICE_PRIVACY_REDACT=false`
+/// (`alice-server secrets keep`, which `alice-server adopt` hands to `alice adopt`) keeps the
+/// person's secrets as written; the machine's paths are cleared all the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_that_keeps_secrets_adopts_them_as_written() {
+    let d = tempfile::tempdir().unwrap();
+    let (_source, checkout, backup) = person(d.path()).await;
+    let tenant = fresh_tenant(d.path(), "tenant");
+    let keep = vec![("ALICE_PRIVACY_REDACT".to_string(), "false".to_string())];
+    let r = adopt::adopt_with_env(&tenant, &backup, chrono::Utc::now(), keep).unwrap();
+    assert_eq!((r.memories, r.chunks), (3, 2), "{r:?}");
+    assert_eq!((r.redacted_memories, r.redacted_chunks), (0, 0), "{r:?}");
+    assert_eq!(r.duplicates_trashed, 0, "{r:?}");
+    let text = db_text(&tenant);
+    assert!(contains(&text, SECRET) && contains(&text, OTHER_SECRET));
+    assert!(
+        !contains(&text, &checkout.display().to_string()),
+        "paths cleared"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn adopt_refuses_a_tenant_that_holds_anything_and_leaves_it_as_it_was() {
     let d = tempfile::tempdir().unwrap();

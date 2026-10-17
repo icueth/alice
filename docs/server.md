@@ -16,7 +16,7 @@ Placeholders used below: `<host>` is the server's public name or address, `<name
 
 The server's admin can read every tenant's memory, token and Jev key. The admin owns the machine. What protects a person from the admin is what they choose not to put into Alice. Tenants cannot read each other: each has its own Unix user, a 0700 home directory, its own token and its own loopback port, and the service runs under systemd hardening.
 
-A tenant cannot reach the admin's network. The service unit allows only the public internet and localhost, and tenant mode refuses settings that point at private or loopback addresses. A tenant also cannot change the settings the admin owns: the Jev endpoint, model and daily budget (pinned in its tenant file, because the Jev key is the owner's), its data directory, its port, its backup location and rotation, its secrets backend (always the private file), and the redaction switch (always on).
+A tenant cannot reach the admin's network. The service unit allows only the public internet and localhost, and tenant mode refuses settings that point at private or loopback addresses. A tenant also cannot change the settings the admin owns: the Jev endpoint, model and daily budget (pinned in its tenant file, because the Jev key is the owner's), its data directory, its port, its backup location and rotation, its secrets backend (always the private file), and whether their store keeps secrets as written (pinned in its tenant file: [secrets](#secrets)).
 
 ## For the admin
 
@@ -76,6 +76,8 @@ alice-server jev-key set
 alice-server jev-key status
 alice-server distill on|off <name>|--all
 alice-server distill status
+alice-server secrets keep|redact <name>|--all
+alice-server secrets status
 alice-server cli <name> <alice arguments...>
 ```
 
@@ -102,7 +104,7 @@ alone, or to repair it (alice-server setup-line <name> prints it again):
 
 The token is shown once. Hand it to the person over a private channel, as a file named `alice-token`: [setup-server.md](setup-server.md) has their agent keep it in `~/.config/alice/token` (0600), where the MCP helper, the Codex wrapper and capture read it, so it never sits in an environment variable or a saved configuration. If the tenant already exists, `add` prints its URL (not the token) and stops. If anything fails, it undoes what it created.
 
-The tenant file holds no secret. It sets `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALICE_LOG=info`, `ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0` and `TZ`, the Jev pins below, and `ALICE_CAPTURE_RAW_RETENTION=180d`: captured transcripts (SP2 capture) age out after 180 days, while imported history and memories stay. The environment wins over the person's settings, so they cannot keep transcripts longer. To change one tenant's, edit that line, then `systemctl restart alice@<name>`; `upgrade` adds the line to tenants made before it and keeps one the admin changed.
+The tenant file holds no secret. It sets `ALICE_HOME`, `ALICE_SERVER_PORT`, `ALICE_LOG=info`, `ALICE_BACKUP_DAILY=2`, `ALICE_BACKUP_WEEKLY=0` and `TZ`, the Jev pins below, `ALICE_PRIVACY_REDACT` (whether the person's store keeps secrets as written: [secrets](#secrets)), and `ALICE_CAPTURE_RAW_RETENTION=180d`: captured transcripts (SP2 capture) age out after 180 days, while imported history and memories stay. The environment wins over the person's settings, so they cannot keep transcripts longer. To change one tenant's, edit that line, then `systemctl restart alice@<name>`; `upgrade` adds the line to tenants made before it and keeps one the admin changed.
 
 `TZ` is the person's time zone, `Asia/Bangkok` unless `--tz` names another IANA zone (it must exist under `/usr/share/zoneinfo`). The daemon runs in it, so an import reads MemPalace's local times with the offset of the person's own machine, as it would on their Mac; stored times stay UTC. Run `alice-server add <name> --tz <zone>` on an existing tenant to change its zone (it restarts that daemon). `upgrade` gives `TZ=Asia/Bangkok` to a tenant made before this line existed and keeps a zone set with `--tz`.
 
@@ -148,7 +150,7 @@ The script moves the folder into the tenant's `import-inbox/` (owned by the tena
 
 - A **real import consumes `<palace-dir>`**: the folder is moved, not copied. Keep your own copy if you need one.
 - A **dry run works on a copy** and keeps your folder. It reports what would be imported and changes nothing.
-- The importer always redacts secrets. Drawers that contain secrets are held back when the tenant's privacy mode blocks them, and the report lists them.
+- The importer follows the tenant's [secrets](#secrets) switch: a tenant that redacts has secrets removed (or, when its privacy mode blocks them, the drawers held back, and the report lists them); a tenant that keeps secrets stores them as written. Wing, room and project names are always redacted.
 - It refuses to start when twice the palace's size would leave less than 2 GB free.
 - The tenant daemon accepts a palace only from inside its own `import-inbox/`.
 - Import palaces one at a time, and only with the person's consent. The raw palace exists on the server only while the job runs.
@@ -171,7 +173,7 @@ A person can import their own MemPalace with `upload.sh` (see "A person imports 
 - The file must be a regular file you own (copy it into your home with `scp`), and the disk needs twice its size plus 2 GB free.
 - `adopt` stops the tenant, checks the file (SQLite's `integrity_check`, Alice's tables, and the same schema as the installed binary: an older one says "upgrade the source Alice first", a newer one "upgrade the server first"), keeps the tenant's own database as a before-restore backup in its backups folder, and puts the file in its place.
 - It clears what names the person's machine: project folders (`root_path`), project keys made from a folder path, and transcript paths (a hash and the file name stay). Projects keep their slugs and aliases, so `?project=<slug>` finds them.
-- It redacts every memory, raw chunk and history record again with the tenant's rules, which are always on, and drops the judge cache. A memory whose redacted text equals another one's is moved to the trash.
+- It redacts every memory, raw chunk and history record again with the tenant's rules, and drops the judge cache. A memory whose redacted text equals another one's is moved to the trash. A tenant that keeps secrets ([secrets](#secrets)) keeps the adopted ones as written: set the switch before you adopt.
 - Settings, secrets, the token and the Jev key stay the tenant's own: only the database is replaced. So do the person's cloud rules: the projects they kept from the cloud on their machine (their `privacy.cloud_denied_projects`, and repositories whose `.alice.toml` says `cloud_denied = true`) are not denied on the tenant unless you name them with `--cloud-denied`, which sets the tenant's list once it is up. The report's `projects_with_roots` lists the projects that had a working tree on the machine, the ones to ask about.
 - The tenant starts again and rebuilds its vector index from the stored embeddings (no re-embedding, unless the source used another model). If it does not come back, its own database is put back.
 
@@ -211,6 +213,28 @@ sudo alice-server distill status
 echo on | sudo tee /etc/alice/distill.default
 ```
 
+#### secrets
+
+Whether a person's own store keeps the credentials they share (passwords, tokens, connection strings) as written, so their agents can recall them later, or redacts them before storing. The owner's decision (2026-10-17): every person's store may keep them; the shared team store always redacts, because everyone reads it; and **anything sent to a cloud service is always redacted first**, whatever the store keeps: the Jev judge (precise recall included), distillation and a remote embedder never receive a secret.
+
+```
+sudo alice-server secrets keep <name>       # or --all (the team store is skipped)
+sudo alice-server secrets redact <name>     # or --all
+sudo alice-server secrets status
+```
+
+`keep` and `redact` pin `ALICE_PRIVACY_REDACT=false` or `=true` in the tenant file and restart that daemon (the pin is read at start). A tenant whose pin already says so is left alone, and the command refuses while an import runs on a daemon it would restart. The environment wins over the person's settings, and a tenant's `config.toml` can never turn redaction off, so only the admin changes it: a person's `config set privacy.redact false` is refused. `keep` is refused for the team store, and `keep --all` leaves it redacting. `status` shows the default for new tenants and each tenant's switch; a tenant file made before the pin existed shows `redact`.
+
+- **What changes.** Only new writes: remembered, updated, captured and imported text. Redaction is destructive: what was redacted before stays `[REDACTED:…]` and cannot be restored. After `redact`, what was kept stays in the store until the person deletes or edits it.
+- **Shared memories.** A `shared: true` memory is redacted before it leaves the person's daemon, whatever their switch, and the team store redacts whatever reaches it.
+- **The agent's instructions follow the switch.** A tenant that keeps secrets tells its agents (in the MCP instructions) that credentials may be stored with `remember` and must never go into `shared: true` memories; one that redacts tells them never to store secrets.
+
+**New tenants** follow `/etc/alice/secrets.default`: one line, `keep` or `redact`; without the file, `redact`. `add` refuses a file that holds anything else, before it creates anything, and gives the team store `redact` whatever the file says. Changing the file changes no existing tenant. To let every new person keep their credentials:
+
+```
+echo keep | sudo tee /etc/alice/secrets.default
+```
+
 #### cli
 
 `alice-server cli <name> <alice arguments...>` runs the `alice` command as the tenant's Unix user against that tenant's own daemon. Use it for a person's settings, or for a key of their own:
@@ -223,7 +247,7 @@ alice-server cli <name> config set-secret jev_api_key
 
 `config set-secret jev_api_key` reads the key from standard input. Run it as shown and paste the key when it asks, or pipe it in from a file or a secret manager. The script refuses a secret on the command line, because a command line is visible to other users in the process list and in shell history. Never type the key as an argument.
 
-Settings are TOML values or plain text, and they take effect at once. The daemon refuses a few settings in tenant mode (for example `privacy.redact = false`, or a private-network URL).
+Settings are TOML values or plain text, and they take effect at once. The daemon refuses a few settings in tenant mode (for example `privacy.redact = false`, which is the admin's [secrets](#secrets) switch, or a private-network URL).
 
 ### Shared team memory (admin)
 
@@ -237,7 +261,7 @@ This creates the store, prints its token once, and links every existing personal
 
 ### Privacy settings you control
 
-- **The server always redacts.** Text arrives inside TLS and is redacted on the server, with the tenant's rules, before anything is stored or logged. The redaction switch is on for every tenant and cannot be turned off.
+- **The server redacts unless the admin chose keep.** Text arrives inside TLS and is redacted on the server, with the tenant's rules, before anything is stored or logged, unless the admin set the tenant to keep secrets as written ([secrets](#secrets)). Either way, nothing sent to Jev or another cloud service carries a secret, and the team store always redacts.
 - **A repository's `.alice.toml` does not apply over direct MCP.** Nothing on the server reads the file, because the agent connects to the endpoint and the server never sees the repository.
 - **Per-project cloud denial is a tenant setting.** To keep a project away from cloud services such as Jev, add its slug to the tenant's `privacy.cloud_denied_projects` list:
 
@@ -374,7 +398,7 @@ A slug that matches no stored project makes a new, empty project of that name. M
 
 ### Privacy over direct MCP
 
-- The server redacts secrets in everything you send, whatever your settings say. Redaction cannot be turned off.
+- The server redacts secrets in everything you send, unless your admin set your tenant to keep them as written (`alice-server secrets keep <name>`; you cannot change it yourself). Then the credentials you share are stored and recalled as written, for your agents only: they never go into shared memories, and nothing sent to Jev or another cloud service carries them. Secrets redacted before the switch stay redacted.
 - **Your repository's `.alice.toml` does not apply.** The server never sees your repository. To keep a project away from cloud services such as Jev, ask your admin to add it to your `privacy.cloud_denied_projects`.
 - The admin can read your memory. Do not store what you would not show the admin.
 
@@ -386,7 +410,7 @@ If your admin created the team store, you can save a memory for the whole team. 
 
 In Thai: "บันทึกอันนี้ลงความจำส่วนกลางด้วย". The agent then writes the memory to the team store only; it does not keep a personal copy.
 
-- **Every team member can read it.** Do not share anything private.
+- **Every team member can read it.** Do not share anything private. Secrets in a shared memory are always redacted, even when your own store keeps them.
 - **Only the author or the admin can change it.** You can edit, archive, forget or undo only the shared memories you wrote. Anyone else gets "only the author or the admin can change a shared memory".
 - **Recall includes it.** `recall` and `context` also search the team memory for the same project and the team's global memories. Team hits show their author and have ids that start with `team:`.
 - **If the team store is down**, a shared write fails with a clear message and nothing is saved. A recall returns your personal results with a note that the team memory did not answer in time.
@@ -415,7 +439,7 @@ If you already run Alice on your Mac, your admin can move your database to your 
 4. Your admin runs `alice-server adopt <name> <file> --cloud-denied <your list>` on a fresh tenant and checks the report with you.
 5. Only after step 4, connect your machine to your tenant with [setup-server.md](setup-server.md) (a tenant that has captured anything is no longer fresh, and `adopt` refuses it). It stops the local Alice taking writes: it removes the local capture hooks (`alice hooks uninstall claude`, and `codex`; otherwise every session is captured twice and starts with two briefings), turns local distillation off (`alice config set distill.provider off`), and points the `alice` MCP entry at your tenant. Two stores that both take writes drift apart, and nothing merges them back. Keep the local home as a read-only fallback.
 
-The server clears your machine's folder paths from the projects and transcripts, and redacts everything again with its rules. Your Jev key is set on the tenant separately.
+The server clears your machine's folder paths from the projects and transcripts, and redacts everything again with its rules (unless your admin set your tenant to keep secrets: then what your Mac kept stays as written). Your Jev key is set on the tenant separately.
 
 ### A person imports their own MemPalace
 
@@ -452,7 +476,7 @@ It finds your palace itself (`palace_path` in `~/.mempalace/config.json`, else `
 
 **Limits.** The upload may be up to 4 GiB (the admin can change this), and what it unpacks to may not be more than 12 times its size or more than that limit. Only one import runs at a time for your tenant; a second attempt is refused until the first ends. Importing again is safe: drawers already imported are recognized and not added twice.
 
-**What is redacted.** The server redacts every text again with its own rules, exactly as `alice import mempalace` does: API keys, tokens, passwords and private keys are removed or, if your privacy mode blocks them, the drawer is held back. The report lists the held-back ones by kind of secret. The uploaded archive is deleted from the server as soon as it is unpacked, and the unpacked copy as soon as the import ends.
+**What is redacted.** The server redacts every text again with its own rules, exactly as `alice import mempalace` does: API keys, tokens, passwords and private keys are removed or, if your privacy mode blocks them, the drawer is held back. If your admin set your tenant to keep secrets, they are imported as written instead (names of wings and rooms are still redacted). The report lists the held-back ones by kind of secret. The uploaded archive is deleted from the server as soon as it is unpacked, and the unpacked copy as soon as the import ends.
 
 If you would rather not run anything, you can still give your palace folder to your admin, who runs `alice-server import` (see above).
 
@@ -525,7 +549,7 @@ When a Claude Code session starts (`source` `startup`, `clear` or `compact`; not
 
 It matches direct MCP:
 
-- The text arrives inside TLS, unredacted, and the tenant redacts it with its own rules (always on) before anything is stored or logged.
+- The text arrives inside TLS, unredacted, and the tenant redacts it with its own rules before anything is stored or logged, unless the admin set it to keep secrets ([secrets](#secrets)). Either way, distillation sends Jev only redacted text, and a distilled memory never holds a secret.
 - **A repository's `.alice.toml` is not mirrored.** The script reads two lines of it, at the git top level (else the session's folder), on the person's machine: `no_capture = true` (nothing of that session is sent, and the script's offset moves past those turns, so they are never sent later either) and `cloud_denied = true` (sent with `no_distill=1`: stored, never distilled). Only plain `key = true` lines are seen, not other TOML forms. A `.alice.toml` the script cannot read skips the event and keeps the offset (fail closed).
 - **The tenant's settings decide the rest:** `capture.excluded_projects` (never captured) and `privacy.cloud_denied_projects` (never sent to Jev), set with `alice-server cli <name> config set …`.
 - **Custom patterns and block mode from a repository's `.alice.toml` do not apply here.** They wait for a client that reads the repository on the person's machine (the deferred `alice remote`). The tenant's own `privacy.custom_patterns` apply.

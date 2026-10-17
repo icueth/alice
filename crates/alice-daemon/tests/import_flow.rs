@@ -1202,16 +1202,31 @@ async fn secrets_in_imported_history_never_reach_the_database_the_report_or_the_
     assert_eq!(f.tables_holding(SECRET).await, Vec::<String>::new());
 }
 
+/// Owner's decision 2026-10-17: storage follows `privacy.redact`. With it off the palace's
+/// secrets are imported as written (the person's store keeps credentials), the report says so,
+/// and names (a wing or room named like a key) are still redacted.
 #[tokio::test(flavor = "multi_thread")]
-async fn redaction_runs_even_when_the_privacy_setting_is_off_and_the_report_says_so() {
-    let f = Flow::with_specs(&secret_specs()).await;
+async fn with_redaction_off_secrets_are_imported_as_written_and_the_report_says_so() {
+    let plain = concat!("s", "k-", "abcdefghijklmnopqrstuvwx1234");
+    let mut specs = secret_specs();
+    specs.push(knowledge("k_room", "a note in a room", "pg-ai", plain));
+    let f = Flow::with_specs(&specs).await;
     f.patch("privacy.redact", serde_json::json!(false)).await;
     let st = f.run_import(f.request()).await;
     assert_eq!(st.state, ImportState::Done, "{:?}", st.error);
     let r = st.report.unwrap();
-    assert!(r.redaction_note.is_some());
-    assert_eq!(f.tables_holding(SECRET).await, Vec::<String>::new());
-    assert!(r.redacted_fields >= 4);
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let note = r.redaction_note.as_deref().unwrap_or_default();
+    assert!(note.contains("imported as written"), "{note}");
+    let held = f.tables_holding(SECRET).await;
+    assert!(
+        held.iter().any(|t| t == "chunks.text") && held.iter().any(|t| t == "memories.body"),
+        "kept as written: {held:?}"
+    );
+    assert_eq!(r.redacted_fields, 0);
+    // The room's name held a key: it is redacted wherever names go.
+    let json = serde_json::to_string(&r).unwrap();
+    assert!(!json.contains(plain), "a name in the report kept the key");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -5,7 +5,9 @@
 //! schema), the tenant must hold nothing yet, and then it goes in through `alice restore`'s staged,
 //! atomic swap: the tenant's own empty database is kept as a before-restore backup and the vector
 //! index is dropped (rebuilt at the next start from the stored embeddings). In one transaction the
-//! person's machine paths are then scrubbed and the tenant's redaction rules applied again; if that
+//! person's machine paths are then scrubbed and the tenant's redaction rules applied again (they
+//! follow its `privacy.redact`, the admin's pin: a tenant that keeps secrets keeps the adopted
+//! ones as written, owner's decision 2026-10-17); if that
 //! fails, the tenant's own database is put back, so an unscrubbed copy is never served. Settings,
 //! secrets and the token stay the tenant's own: only `alice.db` is replaced.
 //!
@@ -141,14 +143,26 @@ pub fn check_fresh(home: &AliceHome) -> Result<()> {
 }
 
 /// Adopt `path` into `home`'s tenant: see the module doc. The tenant's settings decide the
-/// redaction rules (always on, as on any tenant) and the backups directory.
+/// redaction rules (its `privacy.redact`, which `alice-server adopt` hands over as the tenant
+/// file's `ALICE_PRIVACY_REDACT`) and the backups directory.
 pub fn adopt(home: &AliceHome, path: &Path, now: DateTime<Utc>) -> Result<AdoptReport> {
+    adopt_with_env(home, path, now, crate::config::process_env())
+}
+
+/// [`adopt`] with the tenant's `ALICE_*` variables passed in (tests) rather than read from the
+/// process.
+pub fn adopt_with_env(
+    home: &AliceHome,
+    path: &Path,
+    now: DateTime<Utc>,
+    env: Vec<(String, String)>,
+) -> Result<AdoptReport> {
     let started = std::time::Instant::now();
     let untouched = |e: AliceError| AliceError::Other(format!("{UNTOUCHED} {e}"));
     let verified = check_source(path).map_err(untouched)?;
     check_fresh(home).map_err(untouched)?;
-    let settings = SettingsHandle::load_tenant(home);
-    let redactor = Redactors::new(settings.clone()).for_root_always_on(None);
+    let settings = SettingsHandle::load_with(home, env, true);
+    let redactor = Redactors::new(settings.clone()).for_root(None);
     let dir = backup::backup_dir(home, &settings.get().backup);
     // A swap that fails leaves `alice.db` as it was (restore's invariant).
     let swapped = restore::swap_verified(home, &dir, &verified, now).map_err(untouched)?;

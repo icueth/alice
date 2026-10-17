@@ -121,6 +121,7 @@ case "$*" in
       panic) echo "thread 'main' panicked at crates/alice-daemon/src/adopt.rs:300:9" >&2; exit 101 ;;
       notputback) echo "alice: [not put back] adopting failed (disk full), and the tenant's own database could not be put back" >&2; exit 1 ;;
     esac
+    echo "adopt ran with ALICE_PRIVACY_REDACT=${ALICE_PRIVACY_REDACT:-unset}" >>"$ALICE_SERVER_ROOT/calls.log"
     [ -f "${3:-}" ] && cp -- "$3" "$ALICE_SERVER_ROOT/adopted-copy"
     printf '{\n  "adopted_from": "%s",\n  "memories": 3,\n  "chunks": 2,\n  "paths_cleared": 3,\n  "redacted_memories": 2,\n  "saved_tenant_db_as": "alice-before-restore-20261016T070000Z.db"\n}\n' "${3:-}"
     ;;
@@ -221,6 +222,8 @@ add_creates_everything() {
   has "$e" 'ALICE_JUDGE_DAILY_BUDGET_USD=1.0'
   has "$e" 'ALICE_JUDGE_JEV_MODEL=jev-1.13.0'
   has "$e" 'ALICE_CAPTURE_RAW_RETENTION=180d'
+  # No /etc/alice/secrets.default: a new tenant redacts, pinned so a person's settings cannot loosen it.
+  has "$e" 'ALICE_PRIVACY_REDACT=true'
   hasnt "$e" 'tok-'
   local u="$R/etc/systemd/system/alice@.service"
   has "$u" 'MemoryMax=3G'
@@ -957,6 +960,21 @@ adopt_installs_and_reports() {
   pass
 }
 
+adopt_follows_the_tenants_secrets_pin() {
+  # `alice adopt` runs outside the daemon: it is handed the tenant's pin.
+  adopt ann "$ADOPT_FILE"
+  [ "$RC" = 0 ] || fail "adopt exited $RC: $OUT"
+  [ "$(grep 'adopt ran with' "$R/calls.log" | tail -n 1)" = "adopt ran with ALICE_PRIVACY_REDACT=true" ] || fail "not redacting"
+  run secrets keep ann
+  [ "$RC" = 0 ] || fail "secrets keep exited $RC: $OUT"
+  adopt ann "$ADOPT_FILE"
+  [ "$RC" = 0 ] || fail "adopt exited $RC: $OUT"
+  [ "$(grep 'adopt ran with' "$R/calls.log" | tail -n 1)" = "adopt ran with ALICE_PRIVACY_REDACT=false" ] || fail "the keep pin was not passed"
+  run secrets redact ann
+  [ "$RC" = 0 ] || fail "secrets redact exited $RC: $OUT"
+  pass
+}
+
 adopt_refuses_and_leaves_the_tenant_as_it_was() {
   local why starts
   for why in nonempty older putback damaged; do
@@ -1048,6 +1066,7 @@ add_team_writes_no_snippet() {
   [ "$RC" = 0 ] || fail "add --team exited $RC: $OUT"
   [ ! -e "$R/etc/caddy/alice.d/team.caddy" ] || fail "the team store got a Caddy snippet"
   has "$TENANTS/team.env" 'ALICE_DAEMON_ARGS=--team-store'
+  has "$TENANTS/team.env" 'ALICE_PRIVACY_REDACT=true'
   hasnt "$TENANTS/team.env" 'ALICE_TENANT_NAME'
   hasnt "$TENANTS/team.env" 'ALICE_TEAM_URL'
   # shellcheck disable=SC2016  # the literal text $ALICE_DAEMON_ARGS is what the unit must hold
@@ -1316,6 +1335,106 @@ distill_status_names_every_tenant_and_never_a_secret() {
   pass
 }
 
+SECRETS_DEFAULT="$R/etc/alice/secrets.default"
+pin_of() { sed -n 's/^ALICE_PRIVACY_REDACT=//p' "$TENANTS/$1.env"; }
+
+add_follows_the_secrets_default() {
+  printf 'keep\n' >"$SECRETS_DEFAULT"
+  run add seck
+  [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
+  [ "$(pin_of seck)" = false ] || fail "the default 'keep' did not reach a new tenant"
+  printf '%s\n' "$OUT" | grep -qF 'Secrets: kept as written' || fail "$OUT"
+  printf 'redact\n' >"$SECRETS_DEFAULT"
+  run add secr
+  [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
+  [ "$(pin_of secr)" = true ] || fail "the default 'redact' did not reach a new tenant"
+  if printf '%s\n' "$OUT" | grep -qF 'Secrets:'; then fail "a redacting tenant was announced as keeping: $OUT"; fi
+  # A default that is neither keep nor redact is refused before anything is created.
+  printf 'maybe\n' >"$SECRETS_DEFAULT"
+  run add secbad
+  [ "$RC" != 0 ] || fail "add accepted a bad default: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'must hold one line, keep or redact; nothing was created' || fail "$OUT"
+  if [ -e "$TENANTS/secbad.env" ] || [ -e "$SRV/secbad" ]; then fail "add created secbad anyway"; fi
+  rm -f -- "$SECRETS_DEFAULT"
+  run remove seck --yes
+  run remove secr --yes
+  pass
+}
+
+secrets_keep_and_redact_pin_one_or_every_tenant() {
+  local t restarts
+  restarts=$(grep -c 'systemctl restart alice@ann' "$R/calls.log" || true)
+  run secrets keep ann
+  [ "$RC" = 0 ] || fail "secrets keep ann exited $RC: $OUT"
+  [ "$(pin_of ann)" = false ] || fail "ann does not keep secrets"
+  [ "$(grep -c '^ALICE_PRIVACY_REDACT=' "$TENANTS/ann.env")" = 1 ] || fail "not exactly one pin"
+  [ "$(grep -c 'systemctl restart alice@ann' "$R/calls.log")" = "$((restarts + 1))" ] || fail "ann was not restarted once"
+  printf '%s\n' "$OUT" | grep -qF 'secrets kept as written for: ann' || fail "$OUT"
+  printf '%s\n' "$OUT" | grep -qF 'what was redacted before stays redacted' || fail "$OUT"
+  # Unchanged: no restart.
+  run secrets keep ann
+  [ "$RC" = 0 ] || fail "again exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -qF '(already: ann)' || fail "$OUT"
+  [ "$(grep -c 'systemctl restart alice@ann' "$R/calls.log")" = "$((restarts + 1))" ] || fail "an unchanged pin restarted ann"
+  # The team store always redacts.
+  run secrets keep team
+  [ "$RC" != 0 ] || fail "the team store was set to keep secrets"
+  printf '%s\n' "$OUT" | grep -qF 'everyone reads it, so it always redacts; nothing changed' || fail "$OUT"
+  [ "$(pin_of team)" = true ] || fail "team's pin changed"
+  run secrets keep --all
+  [ "$RC" = 0 ] || fail "secrets keep --all exited $RC: $OUT"
+  for t in $(tenant_names); do
+    if [ "$t" = team ]; then
+      [ "$(pin_of team)" = true ] || fail "keep --all reached the team store"
+    else
+      [ "$(pin_of "$t")" = false ] || fail "$t does not keep secrets"
+    fi
+  done
+  printf '%s\n' "$OUT" | grep -qF 'the team store (team) always redacts' || fail "$OUT"
+  # A running import is never cut off by the restart.
+  IMPORT_BUSY=ann run secrets redact ann
+  [ "$RC" != 0 ] || fail "the restart went ahead during an import"
+  printf '%s\n' "$OUT" | grep -qF 'an import is running on: ann' || fail "$OUT"
+  [ "$(pin_of ann)" = false ] || fail "the pin changed although nothing restarted"
+  # A daemon that does not come back is named.
+  PING_FAIL=7 run secrets redact ann
+  [ "$RC" != 0 ] || fail "a tenant that did not come back was not reported"
+  printf '%s\n' "$OUT" | grep -qF 'did not come back after the change' || fail "$OUT"
+  run secrets redact --all
+  [ "$RC" = 0 ] || fail "secrets redact --all exited $RC: $OUT"
+  for t in $(tenant_names); do [ "$(pin_of "$t")" = true ] || fail "$t does not redact"; done
+  printf '%s\n' "$OUT" | grep -qF 'New writes are redacted' || fail "$OUT"
+  run secrets keep nobody
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'no tenant named nobody'; then fail "accepted nobody: $OUT"; fi
+  run secrets keep
+  [ "$RC" = 2 ] || fail "secrets keep with no tenant exited $RC"
+  run secrets maybe ann
+  [ "$RC" = 2 ] || fail "secrets maybe exited $RC"
+  run secrets keep Bad_Name
+  [ "$RC" != 0 ] || fail "accepted a bad name"
+  pass
+}
+
+secrets_status_names_every_tenant() {
+  printf 'keep\n' >"$SECRETS_DEFAULT"
+  run secrets keep ann
+  # A tenant file from before the pin redacts: a person's config.toml can never turn redaction off.
+  grep -v '^ALICE_PRIVACY_REDACT=' "$TENANTS/bob.env" >"$T/bob.env" && cat "$T/bob.env" >"$TENANTS/bob.env"
+  run secrets status
+  [ "$RC" = 0 ] || fail "secrets status exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'secrets for new tenants: keep' || fail "no default line: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  ann +keep$' || fail "ann not shown keeping: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  bob +redact$' || fail "an unpinned tenant not shown redacting: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  team +redact \(the team store always redacts\)$' || fail "team not shown: $OUT"
+  printf 'sometimes\n' >"$SECRETS_DEFAULT"
+  run secrets status
+  printf '%s\n' "$OUT" | grep -qF 'secrets for new tenants: invalid' || fail "a bad default not named: $OUT"
+  rm -f -- "$SECRETS_DEFAULT"
+  run secrets redact ann
+  printf 'ALICE_PRIVACY_REDACT=true\n' >>"$TENANTS/bob.env"
+  pass
+}
+
 jev_key_refuses_an_empty_or_malformed_key() {
   local bad
   for bad in "" "has a space in it 0123456789" "short"; do
@@ -1356,8 +1475,12 @@ remove_team_unprovisions() {
 }
 
 provision_refuses_a_missing_team_token() {
+  # The deployment keeps secrets for new people; the team store redacts all the same.
+  printf 'keep\n' >"$SECRETS_DEFAULT"
   run add --team team
   [ "$RC" = 0 ] || fail "add --team exited $RC: $OUT"
+  [ "$(pin_of team)" = true ] || fail "the team store keeps secrets"
+  rm -f -- "$SECRETS_DEFAULT"
   : >"$SRV/team/token"
   run add ivy
   [ "$RC" != 0 ] || fail "add ivy succeeded with an empty team token"
@@ -1386,7 +1509,8 @@ for CURRENT in \
   upgrade_restores_the_library_when_the_binary_cannot_be_installed upgrade_names_what_it_could_not_put_back add_takes_a_time_zone \
   upgrade_adds_the_time_zone_to_older_tenants adopt_installs_and_reports adopt_refuses_and_leaves_the_tenant_as_it_was \
   adopt_refuses_bad_files_before_any_change adopt_rolls_back_when_the_tenant_does_not_come_back \
-  adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back imports_and_other_commands_never_overlap \
+  adopt_leaves_the_tenant_stopped_when_its_database_is_not_put_back adopt_follows_the_tenants_secrets_pin \
+  imports_and_other_commands_never_overlap \
   restarts_wait_for_a_daemon_import \
   dry_run_import_checks_the_disk_first \
   upgrade_is_also_the_first_install build_release_refuses_a_download_that_fails_its_checksum \
@@ -1397,6 +1521,7 @@ for CURRENT in \
   jev_key_rotation_replaces_it_everywhere jev_key_status_names_tenants_and_never_the_key \
   jev_key_refuses_an_empty_or_malformed_key add_follows_the_distill_default distill_turns_one_or_every_tenant_on_and_off \
   distill_status_names_every_tenant_and_never_a_secret \
+  add_follows_the_secrets_default secrets_keep_and_redact_pin_one_or_every_tenant secrets_status_names_every_tenant \
   remove_person_deletes_the_team_copy remove_team_unprovisions provision_refuses_a_missing_team_token \
   refuses_to_run_with_empty_roots remove_archives_then_deletes \
   add_prints_the_handover_and_the_setup_line setup_line_prints_it_again_without_a_token no_remote_set_line; do
