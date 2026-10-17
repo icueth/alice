@@ -271,14 +271,16 @@ distilled, newest first. Older ones, and sessions captured by a backfill, are di
   preference of yours (filed under `global`, unless it names this project: its name, its folder or a path in it), a
   convention of this project, a fact, a handoff, or is it already saved, ephemeral or unclear? A passage is kept when
   its best answer is a kind of knowledge with probability at least `distill.min_confidence` (default 0.7). What is kept
-  is ranked: a handoff first, your session before its subagents, then by Jev's confidence in bands (0.9 and above, 0.8
-  and above, below), then by kind (decision, bugfix, warning, fact, how-to, preference). At most `distill.max_per_run`
-  (default 8) are kept per run, at most one handoff, and at most `distill.max_per_subagent_run` (default 2) subagent
-  reports. A subagent's report is never the session's handoff.
-- **A session keeps its best.** `distill.max_per_session` (default 16) is the size of a session's best set, its runs
-  and its subagents together, subagent reports at most half of it. Every run is asked about, a full session's too, so a
-  better passage later in the session replaces the weakest one kept, once the judge has kept the new one (a
-  restatement the judge trashes as a duplicate replaces nothing); the replaced memory goes to the trash (by
+  is ranked: a handoff first, then by Jev's confidence in bands (0.9 and above, 0.8 and above, below), then your session
+  before its subagents within a band, then by kind (decision, bugfix, warning, fact, how-to, preference). At most
+  `distill.max_per_run` (default 8) are kept per run, at most one handoff, and at most `distill.max_per_subagent_run`
+  (default 2) subagent reports. A subagent's report is never the session's handoff.
+- **A session keeps its best.** A session's best set, its runs and its subagents together, holds
+  `distill.max_per_session` (default 16) memories for its first 100 turns and 8 more for each further 100 turns, up to
+  `distill.max_per_session_cap` (default 48); subagent reports take at most half of it. Every run is asked about, a
+  full session's too, so a better passage later in the session replaces the weakest one kept, once the judge has kept
+  the new one (a restatement the judge trashes as a duplicate replaces nothing; one the judge relates to a kept memory,
+  such as a newer value of it, replaces that memory first); the replaced memory goes to the trash (by
   `distill:cap`, and you can restore it like any other), and its passage stays in the raw capture. A handoff gets in
   in place of the weakest. The cap never replaces the session's handoff, nor a distilled memory that you or an agent
   edited, moved, restored, linked to or cited in a fact after it was distilled; those keep their slots. When no
@@ -358,7 +360,8 @@ provider = "off"            # "off" | "jev"
 # model                     # reserved; ignored with "jev" (judge.jev.model is used)
 min_confidence = 0.7        # 0.5-0.99
 max_per_run = 8             # 1-50
-max_per_session = 16        # 2-200: the size of a session's best set, its subagents included
+max_per_session = 16        # 2-200: the size of a session's best set for its first 100 turns, subagents included
+max_per_session_cap = 48    # max_per_session-400: the set grows by 8 per further 100 turns, up to this
 max_per_subagent_run = 2    # 0-50: subagent reports kept in one run
 idle_minutes = 15           # 1-1,440
 importance = 2              # 1-3
