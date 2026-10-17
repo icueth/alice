@@ -210,6 +210,17 @@ replace it; never add a second one. Do not change anything else in those files.
 <!-- <<< alice <<< -->
 ```
 
+The last line follows the person's choice about secrets. Run `alice config get privacy.redact`. If it prints `false`
+(they chose to keep the credentials they share, so their agents can recall them), write this line in its place:
+
+```markdown
+- Credentials and connection details the person shares may be stored with `remember` (kind `fact` or `howto`); they
+  stay private to this person — never put them in `shared: true` memories.
+```
+
+Alice's MCP instructions switch the same way. Whatever the setting, nothing Alice sends to Jev or another cloud service
+carries a secret. Secrets that were redacted before the setting changed stay redacted: redaction cannot be undone.
+
 ### Step 7: Retire MemPalace (optional)
 
 Check whether MemPalace is still wired in, without printing any file:

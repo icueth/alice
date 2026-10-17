@@ -961,6 +961,9 @@ async fn settings_flags(State(st): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "mcp.admin_tools": settings.mcp.admin_tools,
         "compat.mempalace": settings.compat.mempalace,
+        // Whether this store redacts what it stores (the team store always does): the setup
+        // guides write the matching secrets line into the agents' instructions.
+        "privacy.redact": settings.privacy.redact || st.svc.is_team_store(),
     }))
 }
 

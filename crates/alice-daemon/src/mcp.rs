@@ -37,14 +37,47 @@ use tokio_util::sync::CancellationToken;
 /// Not imported as `Result`: the rmcp handler macros expand to an unqualified `Result<_, McpError>`.
 type AliceResult<T> = alice_core::error::Result<T>;
 
-pub const INSTRUCTIONS: &str = "Alice is your long-term memory, shared with the user's other agents and sessions.\n\
+/// The instructions' lines that do not depend on the settings.
+macro_rules! instructions_head {
+    () => {
+        "Alice is your long-term memory, shared with the user's other agents and sessions.\n\
 - When you start work on a project, call `context` unless a memory briefing is already in the conversation.\n\
 - Before answering about past work, decisions, bugs or preferences, call `recall`.\n\
 - Call `remember` for decisions (with the reason), bug fixes (symptom, cause, fix), facts, how-tos, warnings and user preferences. One idea per memory; set `kind`.\n\
 - When a new memory replaces an old one, pass the old id in `supersedes`.\n\
 - Before ending a long task, `remember` a `handoff`: what is done, what is next, open questions.\n\
-- Use `assert_fact` and `query_facts` for stable relationships (X uses Y, service runs on host).\n\
-- Never store secrets.";
+- Use `assert_fact` and `query_facts` for stable relationships (X uses Y, service runs on host).\n"
+    };
+}
+
+/// The server's instructions to agents while the store redacts secrets (`privacy.redact`, the
+/// default).
+pub const INSTRUCTIONS: &str = concat!(instructions_head!(), "- Never store secrets.");
+
+/// The instructions while the person's store keeps secrets as written (`privacy.redact = false`;
+/// on a server tenant, the admin's `alice-server secrets keep`): credentials may be remembered
+/// for this person, never shared (owner's decision 2026-10-17).
+pub const INSTRUCTIONS_KEEPING_SECRETS: &str = concat!(
+    instructions_head!(),
+    "- Credentials and connection details the person shares may be stored with `remember` (kind `fact` or `howto`); they stay private to this person — never put them in `shared: true` memories."
+);
+
+/// The instructions for a store that keeps secrets as written (`keeps_secrets`) or redacts them.
+///
+/// ```
+/// use alice_daemon::mcp::{INSTRUCTIONS, instructions};
+///
+/// assert_eq!(instructions(false), INSTRUCTIONS);
+/// assert!(instructions(false).ends_with("- Never store secrets."));
+/// assert!(instructions(true).contains("never put them in `shared: true` memories"));
+/// ```
+pub fn instructions(keeps_secrets: bool) -> &'static str {
+    if keeps_secrets {
+        INSTRUCTIONS_KEEPING_SECRETS
+    } else {
+        INSTRUCTIONS
+    }
+}
 
 /// How long a read waits for a daemon that is starting.
 const READ_WAIT: Duration = Duration::from_secs(5);
@@ -180,6 +213,19 @@ impl Backend {
     }
     async fn compat_mempalace(&self) -> bool {
         self.switches().await.compat_mempalace
+    }
+    /// Whether the store behind this server keeps secrets as written: the effective
+    /// `privacy.redact` is off (never for the team store, which always redacts). `alice mcp`
+    /// reads it the way the daemon loads it (`config.toml` and the `ALICE_*` variables); a
+    /// configuration it cannot fully read counts as redacting.
+    fn keeps_secrets(&self) -> bool {
+        match self {
+            Backend::Local(s) => !s.is_team_store() && !s.settings().privacy.redact,
+            Backend::Remote(b) => {
+                let e = crate::config::load_effective(&b.home);
+                !e.degraded && !e.resolved.settings.privacy.redact
+            }
+        }
     }
     /// [`switches`](Self::switches) without waiting for an answer (`get_tool` is not async).
     fn switches_cached(&self) -> Switches {
@@ -865,7 +911,8 @@ impl ServerHandler for AliceMcp {
                 .build(),
         )
         .with_server_info(Implementation::new("alice", env!("CARGO_PKG_VERSION")))
-        .with_instructions(INSTRUCTIONS)
+        // The secrets line follows the store's own setting (owner's decision 2026-10-17).
+        .with_instructions(instructions(self.backend.keeps_secrets()))
     }
 
     async fn call_tool(

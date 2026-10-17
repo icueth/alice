@@ -261,6 +261,24 @@ change anything else in those files.
 <!-- <<< alice <<< -->
 ```
 
+The last line follows the admin's choice for this tenant (`alice-server secrets keep|redact`). Ask the tenant:
+
+```sh
+printf 'header = "Authorization: Bearer %s"\n' "$(cat ~/.config/alice/token)" \
+  | curl -q -fsS -K - "$(head -n 1 ~/.config/alice/url)/api/v1/settings/flags" | grep -c '"privacy.redact":false'
+```
+
+If it prints `1`, the tenant keeps the credentials the person shares, so their agents can recall them: write this line
+in place of the last one:
+
+```markdown
+- Credentials and connection details the person shares may be stored with `remember` (kind `fact` or `howto`); they
+  stay private to this person — never put them in `shared: true` memories.
+```
+
+Otherwise (`0`, or the command fails) keep the block as it is. The server's MCP instructions switch the same way.
+Either way the shared team memory always redacts, and nothing sent to Jev carries a secret.
+
 ### Step 6: Capture sessions automatically
 
 This saves every Claude Code and Codex session to the person's tenant as it happens (each finished turn, in the
