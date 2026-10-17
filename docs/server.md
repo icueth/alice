@@ -74,6 +74,8 @@ alice-server import <name> <palace-dir> [--dry-run]
 alice-server adopt <name> <backup-file>
 alice-server jev-key set
 alice-server jev-key status
+alice-server distill on|off <name>|--all
+alice-server distill status
 alice-server cli <name> <alice arguments...>
 ```
 
@@ -182,12 +184,30 @@ sudo alice-server jev-key set        # paste the key at the prompt (it is not sh
 sudo alice-server jev-key status
 ```
 
-`jev-key set` reads the key from the terminal with echo off, or from standard input; never from the command line or the environment. It keeps it in `/etc/alice/jev.key` (root's only, 0600) and gives it to every tenant, the team store included: into the tenant's own `secrets.toml` (0600, its user's), through its running daemon, with `judge.provider = jev` and `distill.provider = jev` (SP2: captured sessions are distilled into memories with the same key and budget). It takes effect at once; nothing restarts. `alice-server add` gives every new tenant the key. Run `jev-key set` again to rotate the key everywhere. `jev-key status` says whether a key is set and, for each tenant, whether it holds the server's key, another one or none. It never prints a key or part of one.
+`jev-key set` reads the key from the terminal with echo off, or from standard input; never from the command line or the environment. It keeps it in `/etc/alice/jev.key` (root's only, 0600) and gives it to every tenant, the team store included: into the tenant's own `secrets.toml` (0600, its user's), through its running daemon. It takes effect at once; nothing restarts. **It changes only the key**: a tenant's `judge.provider` and its distillation are its own settings, and neither `jev-key set` nor a rotation touches them. `alice-server add` gives every new tenant the key and `judge.provider = jev`. Run `jev-key set` again to rotate the key everywhere. `jev-key status` says whether a key is set and, for each tenant, whether it holds the server's key, another one or none. It never prints a key or part of one.
 
 **The key stays the owner's.** Each tenant file pins `ALICE_JUDGE_JEV_ENDPOINT` (Jev's own endpoint) and `ALICE_JUDGE_DAILY_BUDGET_USD`, and the environment wins over a person's settings: a person cannot send the shared key anywhere else or raise the budget, and their settings show the key as set, without any part of it. `upgrade` adds both lines to tenants made before them.
 
 **Budget.** Each tenant's judge budget is 1.00 USD a day by default. The deployment-wide ceiling is the number of tenants times that: with four people and the team store, 5.00 USD a day. To change one tenant's, edit `ALICE_JUDGE_DAILY_BUDGET_USD` in `/etc/alice/tenants/<name>.env`, then `systemctl restart alice@<name>`; `upgrade` keeps it. When a tenant reaches its budget, precise recall answers with the search order and says so.
 
+
+#### distill
+
+Distillation turns a tenant's captured sessions into a few short memories, with Jev and the shared key, inside the tenant's judge budget (SP2; see [Capture for team members](#capture-for-team-members)). It is a per-tenant choice:
+
+```
+sudo alice-server distill on <name>       # or --all
+sudo alice-server distill off <name>      # or --all
+sudo alice-server distill status
+```
+
+`on` and `off` set `distill.provider` (`jev` or `off`) through each tenant's running daemon, so it applies at once; a tenant whose daemon does not answer is named and the command fails (run it again). `on` says which tenants' judge is not `jev`: their distillation waits until it is. `status` lists every tenant with its distillation (`on`, `off`, or `unknown` when its daemon does not answer) and its judge, and the default for new tenants. It never shows a key.
+
+**New tenants** follow the deployment default in `/etc/alice/distill.default`: one line, `on` or `off`; without the file, `off`. `add` refuses a file that holds anything else, before it creates anything. Changing the file changes no existing tenant, and neither `jev-key set` nor `upgrade` ever changes a tenant's choice. To make new tenants start with distillation on:
+
+```
+echo on | sudo tee /etc/alice/distill.default
+```
 
 #### cli
 
@@ -531,7 +551,7 @@ As an estimate, carrying over the 16.8 KB per imported drawer (with its two back
 
 ### Distillation and the shared Jev key
 
-On this server Jev is on for everyone with the owner's one key (see [jev-key](#jev-key)), and distillation (`distill.provider = jev`) is on for every tenant. The open-source default is off: it is this deployment that turns it on. `alice-server jev-key set` sets it for every tenant beside `judge.provider = jev`, and `add` for a new tenant once the key is provisioned.
+On this server Jev is on for everyone with the owner's one key (see [jev-key](#jev-key)). Distillation (`distill.provider = jev`) is a per-tenant choice the admin makes with `alice-server distill on|off <name>|--all`, and new tenants follow `/etc/alice/distill.default` (see [distill](#distill)). The open-source default is off.
 
 - A person never sees or supplies the key. The setup line's summary says whether distillation is on (`distillation: on`), from the tenant's own setting.
 - **Spend is per tenant**, inside its judge budget (`ALICE_JUDGE_DAILY_BUDGET_USD`, 1.00 USD a day by default), of which distillation may use half (`distill.budget_share = 0.5`). **The deployment-wide ceiling** is the number of daemons times that budget: 5.00 USD a day with four people and the team store, of which distillation can be at most 4 × 0.50 = 2.00 USD (the team store captures nothing). Expected spend is far lower, about 0.001-0.003 USD per distilled session.
@@ -560,7 +580,7 @@ Capture needs these from `alice-server` (SP2 spec §9.5):
 |---|---|
 | Print the setup line | `alice-server add <name>` and `rotate <name>` print the setup line above; `alice-server setup-line <name>` prints it again |
 | Pin capture retention | `add` writes `ALICE_CAPTURE_RAW_RETENTION=180d` into the tenant's file, and `upgrade` adds it where unset |
-| Jev on with the shared key | Once `alice-server jev-key set` has provisioned the key, `add` sets `judge.provider = jev` and `distill.provider = jev` for the tenant |
+| Jev with the shared key | Once `alice-server jev-key set` has provisioned the key, `add` sets `judge.provider = jev` for the tenant, and `distill.provider` from `/etc/alice/distill.default` (`off` without it); `alice-server distill on\|off <name>\|--all` changes a tenant's distillation; `jev-key set` changes only the key |
 | Adoption | `alice-server adopt` moves a database whole, so its capture cursors and turn keys travel with it |
 
 ### Moving a local Alice that already captured
