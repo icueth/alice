@@ -285,9 +285,8 @@ distilled, newest first. Older ones, and sessions captured by a backfill, are di
   `distill:cap`, and you can restore it like any other), and its passage stays in the raw capture. A handoff takes no
   slot: the session keeps only its newest one (a newer handoff supersedes the older one), and it never pushes out a
   kept memory. The cap never replaces a distilled memory that you or an agent edited, moved, restored, linked to or
-  cited in a fact after it was distilled; those keep their slots. When no
-  memory that may go is weaker, the new passage is not stored. A distilled memory you saved again word for word is
-  yours: it leaves the set and frees its slot.
+  cited in a fact after it was distilled; those keep their slots. When no memory that may go is weaker, the new passage
+  is not stored. A distilled memory you saved again word for word is yours: it leaves the set and frees its slot.
 - **The memory.** The passage (at most 1,200 characters), titled with its first sentence, passing over `#` headings;
   when that is a table header, or 25 characters or fewer (a short heading or label), with the first sentence after it
   that says more (at most 80 characters). A title never holds a `[REDACTED:…]` marker (the first sentence without one is
@@ -306,10 +305,12 @@ machine-extracted: rely on it as you would on a note you did not write.
   memories, without a question.
 - **Your memories win.** A distilled memory never replaces one an agent or you wrote. When the judge finds that the two
   say the same thing, yours stays and the distilled one goes to the trash, whichever came first, even when the judge
-  is unsure; so does a distilled memory that only updates yours. When yours came later and updates or contradicts a
-  distilled memory, yours replaces it (the distilled one is superseded). None of this asks you anything. One that holds more than yours (more than twice the text, when the judge is not
-  sure, or a number yours does not state) is kept and linked to yours instead. A preference of yours filed under `global` is compared with the memories of the
-  session's project too, where your agent may have saved it (unless the cloud policy keeps that project at home).
+  is unsure; so does a distilled memory that only updates yours. A distilled one that holds more than yours (more than
+  twice the text, when the judge is not sure, or a number yours does not state) is kept and linked to yours instead.
+  When yours came later and updates or contradicts a distilled memory, yours replaces it (the distilled one is
+  superseded). None of this asks you anything. A preference of yours filed under `global` is compared with the
+  memories of the session's project too, where your agent may have saved it (unless the cloud policy keeps that
+  project at home).
 - **Hidden until judged.** Recall and the briefing skip a distilled memory until the judge has looked at it, so a near
   copy of something already saved never shows twice. `get_memory` by id still returns it.
 - **It stays out of the way.** Importance 2 keeps distilled memories out of the briefing's key memories, and below
