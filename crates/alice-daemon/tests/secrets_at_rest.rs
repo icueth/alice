@@ -791,3 +791,119 @@ async fn a_secret_across_any_capture_cut_is_kept_whole_and_never_reaches_the_clo
     l.assert_no_secret_left();
     l.svc.shutdown();
 }
+
+/// Brief item 4 (re-review N5): an imported secret is kept as written in a store that keeps
+/// secrets and never leaves for the cloud, including through a title cut from its text.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_imported_secret_is_kept_as_written_and_never_reaches_the_cloud() {
+    use alice_core::import::fixture::{DrawerSpec, build_sqlite_exact};
+    use alice_core::import::palace::DrawerMeta;
+    use context::*;
+    let l = Local::start();
+    let drawer = |id: &str, text: String| DrawerSpec {
+        id: id.into(),
+        text,
+        meta: DrawerMeta {
+            wing: "ops".into(),
+            room: "knowledge".into(),
+            added_by: Some("claude-code".into()),
+            filed_at: Some("2026-10-10T10:00:00".into()),
+            ..Default::default()
+        },
+    };
+    // The derived title's 80-character cut falls 8 characters into the URL's password; a
+    // password and a key in long bodies.
+    let head = "Ops box connection for the nightly jobs ";
+    let url_note = format!(
+        "{head}{} {} is what they use.\nRotated monthly.",
+        "x".repeat(80 - head.len() - 1 - "postgres://ops:".len() - 8),
+        url()
+    );
+    assert!(
+        url_note[..80].ends_with(&URL_PW[..8]),
+        "{}",
+        &url_note[..80]
+    );
+    let specs = vec![
+        drawer("k_url", url_note),
+        drawer(
+            "k_yaml",
+            format!("{}\n  {}\n  user: ops", words(1990), yaml()),
+        ),
+        drawer(
+            "k_pem",
+            format!("The ops box deploy key:\n{}\nKeep it.", pem("\n")),
+        ),
+    ];
+    let palace_dir = l.dir.path().join("palace");
+    std::fs::create_dir_all(&palace_dir).unwrap();
+    build_sqlite_exact(&palace_dir, &specs);
+    l.svc
+        .start_import(alice_core::import::ImportRequest {
+            palace: Some(palace_dir.display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    until("the import ends", || {
+        l.svc.import_status().state != alice_core::import::ImportState::Running
+    })
+    .await;
+    let st = l.svc.import_status();
+    let r = st.report.expect("the import reports");
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    for whole in [url(), yaml(), pem("\n")] {
+        assert_eq!(
+            l.db()
+                .query_row(
+                    "SELECT count(*) FROM memories WHERE instr(body, ?1) > 0",
+                    [&whole],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "imported as written"
+        );
+    }
+    let titles: Vec<String> = l
+        .db()
+        .prepare("SELECT title FROM memories")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for t in &titles {
+        assert_eq!(leak(t), None, "a title: {t}");
+    }
+    until("the imported memories are embedded", || {
+        l.count("SELECT count(*) FROM memories WHERE embed_state <> 'done'") == 0
+    })
+    .await;
+    l.svc
+        .recall(RecallRequest {
+            query: "ops box connection password deploy key".into(),
+            mode: Some(RecallMode::Precise),
+            format: OutputFormat::Json,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let bodies = l.jev.bodies.lock().clone();
+    assert!(
+        bodies.iter().any(|b| b.contains("How well does result")),
+        "precise recall asked Jev"
+    );
+    for b in &bodies {
+        assert_eq!(leak(b), None, "a Jev request: {b}");
+    }
+    let embedded = l.embedded.lock().clone();
+    assert!(
+        embedded
+            .iter()
+            .any(|t| t.contains("[REDACTED:pem_private_key]"))
+    );
+    for t in &embedded {
+        assert_eq!(leak(t), None, "an embedder input: {t}");
+    }
+    l.svc.shutdown();
+}
