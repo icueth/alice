@@ -1235,7 +1235,7 @@ add_follows_the_distill_default() {
   run add disbad
   [ "$RC" != 0 ] || fail "add accepted a bad default: $OUT"
   printf '%s\n' "$OUT" | grep -qF 'must hold one line, on or off; nothing was created' || fail "$OUT"
-  [ ! -e "$TENANTS/disbad.env" ] && [ ! -e "$SRV/disbad" ] || fail "add created disbad anyway"
+  if [ -e "$TENANTS/disbad.env" ] || [ -e "$SRV/disbad" ]; then fail "add created disbad anyway"; fi
   rm -f -- "$DISTILL_DEFAULT"
   run remove dison --yes
   run remove disoff --yes
