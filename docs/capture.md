@@ -276,11 +276,12 @@ distilled, newest first. Older ones, and sessions captured by a backfill, are di
   (`SessionEnd`, a compaction, or the 24-hour stale end); and at most `distill.max_per_subagent_run` (default 2)
   subagent reports per run, and half of `distill.max_per_session` per session. A subagent's report is never the
   session's handoff.
-- **The memory.** The passage (at most 1,200 characters), titled with its first sentence; when that is a heading or
-  table header of 25 characters or fewer, or one that is bare, with the first sentence after it (at most 80
-  characters). It gets a last line `Context: <your prompt's first sentence>` when it needs one to stand on its own.
-  Importance `distill.importance` (default 2), no topics, the session as author, and provenance links to the chunks it
-  came from. It is written through the normal `remember` path: redacted, deduplicated and judged.
+- **The memory.** The passage (at most 1,200 characters), titled with its first sentence, passing over `#` headings;
+  when that is a table header, or 25 characters or fewer (a short heading or label), with the first sentence after it
+  that says more (at most 80 characters). It gets a last line `Context: <your prompt's first sentence>` when it needs
+  one to stand on its own. Importance `distill.importance` (default 2), no topics, the session as author, and
+  provenance links to the chunks it came from. It is written through the normal `remember` path: redacted,
+  deduplicated and judged.
 
 ### `(auto)`, and why it never asks you
 

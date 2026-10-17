@@ -3861,7 +3861,7 @@ mod tests {
         }
     }
 
-    /// Task 12b: `distill.max_per_session` (16, 1 to 200) and `distill.max_per_subagent_run`
+    /// Task 12b: `distill.max_per_session` (16, 2 to 200) and `distill.max_per_subagent_run`
     /// (2, 0 to 50): defaults, ranges, the error that names the range, and the environment.
     #[test]
     fn distill_session_and_subagent_caps_have_defaults_and_ranges() {
