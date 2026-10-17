@@ -181,6 +181,16 @@ hooks_json() {
   sh "$DIR/alice-capture.sh" print-hooks-json "$1" </dev/null 2>/dev/null
 }
 
+# Whether config.toml ($1) has hooks of its own: a top-level `hooks` key, the one rule of
+# `alice hooks install codex` (agent_hooks.rs, check_codex_config). That is a `[hooks…]` or
+# `[[hooks…]]` table header, or a `hooks = …` / `hooks.… = …` key before the first header.
+# `[features] hooks = true` is not one (final review A-M7).
+codex_inline_hooks() {
+  ci_sp='[[:space:]]'
+  grep -Eq "^${ci_sp}*\\[\\[?${ci_sp}*[\"']?hooks[\"']?${ci_sp}*[].]" "$1" 2>/dev/null && return 0
+  sed -n "/^${ci_sp}*\\[/q;p" "$1" 2>/dev/null | grep -Eq "^${ci_sp}*[\"']?hooks[\"']?${ci_sp}*[.=]"
+}
+
 # Codex (spec section 5.4 step 8). hooks.json is written only when it does not exist, or is
 # still exactly the file this script wrote earlier (then it is updated in place); a file of the
 # person's own, or inline [hooks] tables in config.toml, are never edited: the entries are
@@ -202,7 +212,6 @@ codex_setup() {
       return 0
       ;;
   esac
-  cs_sp='[[:space:]]'
   cs_re='alice-capture\.sh.{1,3}hook codex'
   cs_write=
   cs_why=
@@ -218,7 +227,7 @@ codex_setup() {
     fi
   elif [ -e "$cs_file" ]; then
     cs_why="$cs_file exists and is not a file"
-  elif grep -Eq "^${cs_sp}*(\\[${cs_sp}*){0,2}[\"']?hooks[\"']?${cs_sp}*[].=]" "$cs_home/config.toml" 2>/dev/null; then
+  elif codex_inline_hooks "$cs_home/config.toml"; then
     cs_why="$cs_home/config.toml already has [hooks] tables, so hooks.json is not added beside them"
     if grep -Eq "$cs_re" "$cs_home/config.toml" 2>/dev/null; then cs_have=1; fi
   else

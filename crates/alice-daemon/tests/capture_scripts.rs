@@ -1129,7 +1129,9 @@ async fn a_codex_record_that_cannot_be_written_leaves_hooks_json_unwritten() {
 }
 
 /// Every TOML spelling of a `[hooks]` table keeps hooks.json from being written beside it
-/// (spec section 2.2: one format per layer); other keys and tables do not.
+/// (spec section 2.2: one format per layer); other keys and tables do not. The rule is
+/// `alice hooks install codex`'s: a top-level `hooks` key, so `[features] hooks = true` is none
+/// (final review A-M7).
 #[tokio::test(flavor = "multi_thread")]
 async fn setup_finds_every_toml_form_of_inline_hooks() {
     let s = Server::start(&["ann"]).await;
@@ -1139,7 +1141,7 @@ async fn setup_finds_every_toml_form_of_inline_hooks() {
     let hooks = env.codex_home.join("hooks.json");
     let copy = env.alice().join("codex-hooks.written");
     let config = env.codex_home.join("config.toml");
-    let forms: [(&str, bool); 15] = [
+    let forms: [(&str, bool); 19] = [
         ("[hooks]\n", true),
         ("[ hooks ]\n", true),
         ("  [hooks.Stop]\n", true),
@@ -1158,6 +1160,16 @@ async fn setup_finds_every_toml_form_of_inline_hooks() {
         ),
         ("model = \"hooks\"\n[hookstop]\n", false),
         ("", false),
+        ("[features]\nhooks = true\n", false),
+        ("[profiles.fast]\nhooks.Stop = []\n", false),
+        (
+            "[features]\n  hooks = true\n[mcp_servers.alice]\nhooks = 1\n",
+            false,
+        ),
+        (
+            "model = \"o3\"\nhooks.Stop = []\n[features]\nhooks = true\n",
+            true,
+        ),
     ];
     for (toml, inline) in forms {
         let _ = std::fs::remove_file(&hooks);

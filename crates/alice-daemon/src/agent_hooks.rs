@@ -886,8 +886,10 @@ fn program_exists(program: &str) -> bool {
         .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(p).is_file()))
 }
 
-/// Codex takes hooks from one format per layer: while its `config.toml` holds hooks of its own
-/// (`[hooks]` tables, `[[hooks.<Event>]]` arrays), no `hooks.json` is written beside them.
+/// Codex takes hooks from one format per layer: while its `config.toml` holds hooks of its own,
+/// a top-level `hooks` key (`[hooks]` tables, `[[hooks.<Event>]]` arrays, `hooks.<Event> = …`
+/// before the first table), no `hooks.json` is written beside them. `[features] hooks = true`
+/// is no such key. The tenant's `setup.sh` (`codex_inline_hooks`) keeps the same rule.
 fn check_codex_config(config: &Path, file: &Path) -> Result<()> {
     let text = match std::fs::read_to_string(config) {
         Ok(t) => t,
@@ -1726,10 +1728,11 @@ mod tests {
         write(&config, "model = \"o3\"\nkey = \"unfinished\n");
         let e = install(&t, false).unwrap_err().to_string();
         assert!(e.contains("line 2") && !e.contains("unfinished"), "{e}");
-        // Hooks of a table inside another one are not Codex's hooks layer.
+        // Hooks of a table inside another one are not Codex's hooks layer, nor is the
+        // `[features] hooks = true` switch (the tenant's setup.sh has the same rule).
         write(
             &config,
-            "model = \"o3\"\n[mcp_servers.alice]\ncommand = \"alice\"\nhooks = 1\n",
+            "model = \"o3\"\n[features]\nhooks = true\n[mcp_servers.alice]\ncommand = \"alice\"\nhooks = 1\n",
         );
         install(&t, false).unwrap();
         assert!(status(&t).unwrap().installed);
