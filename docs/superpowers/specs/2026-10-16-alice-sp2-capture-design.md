@@ -940,13 +940,16 @@ no lesson.
     newcomer itself, and with the share over it is a subagent report. A newcomer the judge trashes (a duplicate) evicts
     nothing, so no unique member is lost to a restatement; nor does one that superseded a member of its own session's
     set, whose slot it took. While a newcomer waits for the judge (`pending`, or `retry` in an outage) the set holds
-    it besides its size; a newcomer the judge gives up on is activated and evicts as a judged one does. So the set
-    keeps its size, and, but for the members the cap may not replace, it is the best `max_per_session` of all the
-    passages ever kept by the rank above, whatever their order (with the per-run caps as the only exception, since
-    they bound what one run brings). **Exceptions a person makes (review Minor 6):** an undo of a `distill:cap` trash
-    brings the member back, protected, past the size; a restore between the worker's read and the newcomer's
-    judgement can leave one more; and a lowered `max_per_session` never shrinks a set already held. Each newcomer
-    judged live evicts one member, so such a set stays past its size.
+    it besides its size; a newcomer the judge gives up on is activated and evicts as a judged one does, on either
+    give-up path (the worker's, after repeated failures on that one memory, and the bulk one after `MAX_ATTEMPTS`
+    counted failures, `RequeueJudgeRetries`; review 2, N1). Every op that settles a distilled newcomer carries the
+    distillation settings, and a debug build stops on one that does not (review 2, N2). So the set keeps its size, and,
+    but for the members the cap may not replace, it is the best `max_per_session` of all the passages ever kept by the
+    rank above, whatever their order (with the per-run caps as the only exception, since they bound what one run
+    brings). **Exceptions a person makes (review Minor 6):** an undo of a `distill:cap` trash brings the member back,
+    protected, past the size; a restore between the worker's read and the newcomer's judgement can leave one more; and a
+    lowered `max_per_session` never shrinks a set already held. Each newcomer judged live evicts one member, so such a
+    set stays past its size.
   - **What the cap never replaces (Task 12c addendum, pane 4).** `distill:cap` never trashes the session's handoff,
     nor a member a person or an agent touched since it was distilled. Such members still count toward the size (and a
     subagent one toward the share), but are never the one that goes; when every member is one of them, or none that

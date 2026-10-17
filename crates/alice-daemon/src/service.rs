@@ -9036,6 +9036,7 @@ mod tests {
             .submit(WriteOp::RequeueJudgeRetries {
                 max_attempts: crate::judge_worker::MAX_ATTEMPTS,
                 now: "9999-12-31T00:00:00.000Z".into(),
+                distill: Some(s.settings().distill.clone()),
             })
             .await
             .unwrap();

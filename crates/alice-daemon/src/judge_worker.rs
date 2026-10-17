@@ -149,6 +149,7 @@ fn run(cfg: JudgeWorkerConfig) {
             if let Err(e) = cfg.writer.submit_blocking(WriteOp::RequeueJudgeRetries {
                 max_attempts: MAX_ATTEMPTS,
                 now: now_rfc3339(),
+                distill: Some(cfg.settings.get().distill.clone()),
             }) {
                 tracing::warn!(error = %e, "queueing failed judgements again failed");
             }
@@ -1292,6 +1293,8 @@ mod tests {
                     stamp,
                     updated_at,
                     provider: "heuristic".into(),
+                    // As the worker sends it (review 2, N2).
+                    distill: Some(Default::default()),
                     ..Default::default()
                 }))
                 .unwrap();

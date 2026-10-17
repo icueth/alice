@@ -333,10 +333,13 @@ pub enum WriteOp {
     /// group, after which the memory is active. Ignored if the memory's text changed since it
     /// was judged, or if it is not waiting for the judge.
     ApplyJudgement(Judgement),
-    /// `retry` memories go back to `pending` (up to `max_attempts` in all); the rest give up.
+    /// `retry` memories go back to `pending` (up to `max_attempts` in all); the rest give up. A
+    /// distilled memory given up on settles live, so it evicts from its session's best set as a
+    /// judged one does (Task 12c review 2, N1), with the distillation settings `distill`.
     RequeueJudgeRetries {
         max_attempts: u32,
         now: String,
+        distill: Option<alice_core::settings::DistillSettings>,
     },
     TouchAccess(Vec<i64>),
     /// A change that is not to a memory or a fact (settings, secrets): one history row, and for
@@ -792,6 +795,32 @@ fn distilled_author(conn: &Connection, id: &str) -> Result<Option<(String, Strin
         )
         .optional()?
         .and_then(|(a, s)| a.zip(s)))
+}
+
+/// The distilled newcomer `id` settled live, judged or given up on: its session's best set keeps
+/// its size ([`evict_over_cap`]). `settings` come with the op. Without them eviction would be
+/// skipped in silence (Task 12c review 2, N2): a debug build stops, a release build warns and
+/// evicts nothing.
+fn settle_distilled(
+    conn: &Connection,
+    st: &mut State,
+    id: &str,
+    settings: Option<&alice_core::settings::DistillSettings>,
+) -> Result<()> {
+    debug_assert!(
+        settings.is_some(),
+        "a judgement of a distilled newcomer carries the distillation settings ({id})"
+    );
+    match settings {
+        Some(s) => evict_over_cap(conn, st, id, s),
+        None => {
+            tracing::warn!(
+                id,
+                "a distilled memory settled without the distillation settings: its session's best set may stay past its size"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// After the judgement of the distilled newcomer `id` left it live: when its session's best set
@@ -2080,8 +2109,16 @@ fn apply(
             WriteOutcome::Done
         }
         WriteOp::ApplyJudgement(j) => apply_judgement(conn, st, j)?,
-        WriteOp::RequeueJudgeRetries { max_attempts, now } => {
+        WriteOp::RequeueJudgeRetries {
+            max_attempts,
+            now,
+            distill,
+        } => {
+            let settling = judge_store::distilled_giving_up(conn, max_attempts)?;
             let (requeued, given_up) = judge_store::requeue_retries(conn, max_attempts, &now)?;
+            for id in &settling {
+                settle_distilled(conn, st, id, distill.as_ref())?;
+            }
             if requeued + given_up > 0 {
                 tracing::info!(requeued, given_up, "memories with a failed judgement");
             }
@@ -2559,12 +2596,15 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
         )?;
         // Judged live into its session's best set: the set keeps its size (Task 12c review I1,
         // option b). A newcomer the judge trashed, or that took a member's slot, evicts nothing.
-        if distilled_newcomer
-            && !trashed
-            && !took_a_slot
-            && let Some(settings) = &j.distill
-        {
-            evict_over_cap(conn, st, &j.id, settings)?;
+        if distilled_newcomer {
+            debug_assert!(
+                j.distill.is_some(),
+                "a judgement of a distilled newcomer carries the distillation settings ({})",
+                j.id
+            );
+            if !trashed && !took_a_slot {
+                settle_distilled(conn, st, &j.id, j.distill.as_ref())?;
+            }
         }
     }
     Ok(WriteOutcome::Done)
@@ -3054,6 +3094,8 @@ mod tests {
             stamp,
             updated_at,
             provider: "heuristic".into(),
+            // As the judge worker sends it (Task 12c review 2, N2).
+            distill: Some(Default::default()),
             ..Default::default()
         }))
         .unwrap();
@@ -5084,6 +5126,8 @@ mod tests {
             stamp: hash_of(f, id),
             updated_at: f.read("SELECT updated_at FROM memories WHERE id = ?1", [id]),
             provider: provider.into(),
+            // As the judge worker sends it (Task 12c review 2, N2).
+            distill: Some(Default::default()),
             ..Default::default()
         }
     }
@@ -5598,6 +5642,7 @@ mod tests {
         f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
             max_attempts: 2,
             now: "2099-01-01T00:00:00.000Z".into(),
+            distill: None,
         })
         .unwrap();
         assert_eq!(judge_state_of(&f, &id), ("pending".to_string(), 1));
@@ -5612,6 +5657,7 @@ mod tests {
         f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
             max_attempts: 2,
             now: "2099-01-01T00:00:00.000Z".into(),
+            distill: None,
         })
         .unwrap();
         assert_eq!(
@@ -6207,6 +6253,7 @@ mod tests {
         f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
             max_attempts: 1,
             now: alice_core::ids::now_rfc3339(),
+            distill: None,
         })
         .unwrap();
         assert_eq!(judge_state_of(&f, &id).0, "retry");
@@ -6214,6 +6261,7 @@ mod tests {
         f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
             max_attempts: 1,
             now: "2099-01-01T00:00:00.000Z".into(),
+            distill: None,
         })
         .unwrap();
         assert_eq!(judge_state_of(&f, &id).0, "pending");
@@ -7291,8 +7339,8 @@ mod tests {
     }
 
     /// The judge's verdict on memory `id`, applied as the judge worker applies it, with the
-    /// distillation settings `cap` (`max_per_session` 3 when `Some`).
-    fn verdict(f: &Fixture, id: &str, actions: Vec<JudgeAction>, retry: bool, cap: bool) {
+    /// distillation settings at `max_per_session = n`.
+    fn verdict(f: &Fixture, id: &str, actions: Vec<JudgeAction>, retry: bool, n: usize) {
         let seq: i64 = f.read("SELECT seq FROM memories WHERE id = ?1", [id]);
         let stamp: String = f.read("SELECT content_hash FROM memories WHERE id = ?1", [id]);
         let updated_at: String = f.read("SELECT updated_at FROM memories WHERE id = ?1", [id]);
@@ -7321,22 +7369,28 @@ mod tests {
             actions,
             retry,
             seen,
-            distill: cap.then(|| alice_core::settings::DistillSettings {
-                max_per_session: 3,
-                ..Default::default()
-            }),
+            distill: Some(cap_of(n)),
             ..Default::default()
         }))
         .unwrap();
     }
 
-    /// A distilled memory of session S1, judged live without a cap: a member of its best set.
+    /// The distillation settings with a best set of `n`.
+    fn cap_of(n: usize) -> alice_core::settings::DistillSettings {
+        alice_core::settings::DistillSettings {
+            max_per_session: n,
+            ..Default::default()
+        }
+    }
+
+    /// A distilled memory of session S1, judged live under a set large enough that nothing goes:
+    /// a member of its best set.
     fn member(f: &Fixture, text: &str, key: &str, kind: Kind, p: f64) -> String {
         let (id, _) = new_id(
             f.h.submit_blocking(distilled_op(text, key, kind, p, "S1"))
                 .unwrap(),
         );
-        verdict(f, &id, Vec::new(), false, false);
+        verdict(f, &id, Vec::new(), false, 200);
         id
     }
 
@@ -7403,7 +7457,7 @@ mod tests {
         let status =
             |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
         assert_eq!(cap_forgets(&f), 0, "written, nothing evicted");
-        verdict(&f, &new, Vec::new(), false, true);
+        verdict(&f, &new, Vec::new(), false, 3);
         assert_eq!(status(&weak), "trashed");
         for id in [&handoff, &edited, &new] {
             assert_ne!(status(id), "trashed");
@@ -7478,7 +7532,7 @@ mod tests {
                 p: 0.95,
             }],
             false,
-            true,
+            3,
         );
         let status =
             |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
@@ -7540,7 +7594,7 @@ mod tests {
                 p: 0.95,
             }],
             false,
-            true,
+            3,
         );
         let status =
             |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
@@ -7559,7 +7613,7 @@ mod tests {
             ))
             .unwrap(),
         );
-        verdict(&f, &theirs, Vec::new(), false, false);
+        verdict(&f, &theirs, Vec::new(), false, 200);
         let (next, _) = new_id(
             f.h.submit_blocking(distilled_op(
                 "The gate opens at dawn and closes at dusk",
@@ -7578,10 +7632,123 @@ mod tests {
                 p: 0.95,
             }],
             false,
-            true,
+            3,
         );
         assert_eq!(status(&weak), "trashed");
         assert_eq!(cap_forgets(&f), 1);
+    }
+
+    /// Task 12c review 2, N1: a distilled newcomer the judge gives up on in bulk
+    /// (`RequeueJudgeRetries`, after `max_attempts` counted failures) settles live, so it evicts
+    /// as a judged one does, in the same op: its session's set keeps its size.
+    #[test]
+    fn a_distilled_newcomer_the_judge_gives_up_on_evicts_too() {
+        let f = fixture();
+        let weak = member(
+            &f,
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.72,
+        );
+        member(
+            &f,
+            "The cache keeps its data in memory only",
+            "distill:y",
+            Kind::Fact,
+            0.9,
+        );
+        member(
+            &f,
+            "Invoices go out on Fridays",
+            "distill:z",
+            Kind::Fact,
+            0.85,
+        );
+        let (new, _) = new_id(
+            f.h.submit_blocking(distilled_op(
+                "The cache service listens on its own port",
+                "distill:new",
+                Kind::Fact,
+                0.95,
+                "S1",
+            ))
+            .unwrap(),
+        );
+        verdict(&f, &new, Vec::new(), true, 3);
+        assert_eq!(cap_forgets(&f), 0, "retry");
+        f.h.submit_blocking(WriteOp::RequeueJudgeRetries {
+            max_attempts: 1,
+            now: "2099-01-01T00:00:00.000Z".into(),
+            distill: Some(cap_of(3)),
+        })
+        .unwrap();
+        let (state, status): (String, String) = (
+            f.read("SELECT judge_state FROM memories WHERE id = ?1", [&new]),
+            f.read("SELECT status FROM memories WHERE id = ?1", [&new]),
+        );
+        assert_eq!((state.as_str(), status.as_str()), ("done", "active"));
+        let weak_status: String = f.read("SELECT status FROM memories WHERE id = ?1", [&weak]);
+        assert_eq!(weak_status, "trashed");
+        assert_eq!(cap_forgets(&f), 1);
+    }
+
+    /// Task 12c review 2, N2: a judgement of a distilled newcomer that does not carry the
+    /// distillation settings would skip eviction in silence; a debug build stops on it (a
+    /// release build warns). Applied on this thread: the writer's own would die with it.
+    #[test]
+    #[should_panic(expected = "carries the distillation settings")]
+    fn a_judgement_of_a_distilled_newcomer_needs_the_distillation_settings() {
+        let d = tempfile::tempdir().unwrap();
+        let conn = alice_core::store::open_writer(&d.path().join("a.db")).unwrap();
+        let mut st = State {
+            hlc: Hlc::new("test"),
+            matcher: None,
+            inserted: false,
+            reembed_target: None,
+            chunk_budget: INGEST_SLICE,
+            byte_budget: INGEST_SLICE_BYTES,
+            stream: Vec::new(),
+            redactors: Redactors::fixed(alice_core::settings::PrivacySettings::default()),
+            applied: Vec::new(),
+            commit_log: None,
+        };
+        let WriteOp::Distilled {
+            input,
+            project,
+            p,
+            subagent,
+        } = distilled_op(
+            "The queue drains every five minutes",
+            "distill:x",
+            Kind::Fact,
+            0.9,
+            "S1",
+        )
+        else {
+            unreachable!()
+        };
+        let (id, seq) = new_id(distilled(&conn, input, &project, p, subagent, &mut st).unwrap());
+        let (stamp, updated_at): (String, String) = conn
+            .query_row(
+                "SELECT content_hash, updated_at FROM memories WHERE id = ?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        apply_judgement(
+            &conn,
+            &mut st,
+            Judgement {
+                seq,
+                id,
+                stamp,
+                updated_at,
+                provider: "jev".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 
     /// Review I1, option b: a newcomer waiting for the judge (`pending`, or `retry` after an
@@ -7621,7 +7788,7 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(cap_forgets(&f), 0, "pending");
-        verdict(&f, &new, Vec::new(), true, true);
+        verdict(&f, &new, Vec::new(), true, 3);
         let state: String = f.read("SELECT judge_state FROM memories WHERE id = ?1", [&new]);
         assert_eq!(state, "retry");
         assert_eq!(cap_forgets(&f), 0, "retry");
