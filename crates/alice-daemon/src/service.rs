@@ -8842,7 +8842,8 @@ mod tests {
     }
 
     /// R19, and Task 11b: a distilled update of an agent's memory never supersedes it; it is a
-    /// near-copy of it and goes to the trash as its duplicate, with no review item.
+    /// near-copy of it and goes to the trash as its duplicate, with no review item, unless it
+    /// holds more (Task 12c: here a newer value), when it stays, linked `relates_to`.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_distilled_memory_never_supersedes_an_agent_memory() {
         let (d, s) = svc_with_jev(crate::judge_http::ScriptedJev::new(("updates", 0.95))).await;
@@ -8865,12 +8866,28 @@ mod tests {
         wait_settled(&s).await;
         let live = ("done".to_string(), "active".to_string());
         assert_eq!(state_of(&s, &mine).await, live, "the agent's memory stays");
+        // Task 12c's guard: a newer value (5433, which the agent's memory does not state) is
+        // never trashed as a duplicate; it stays, linked to the agent's memory.
+        assert_eq!(state_of(&s, &auto).await, live);
         assert_eq!(
-            state_of(&s, &auto).await,
+            links_from(&s, &auto).await,
+            [(mine.clone(), "relates_to".to_string())]
+        );
+        // Task 11b: a distilled update that states nothing new is the agent's memory's duplicate.
+        let same = remember_distilled(
+            &s,
+            "Staging Postgres listens on port 5432 for the app",
+            Kind::Fact,
+            &cwd,
+        )
+        .await;
+        wait_settled(&s).await;
+        assert_eq!(
+            state_of(&s, &same).await,
             ("done".to_string(), "trashed".to_string())
         );
         assert_eq!(
-            links_from(&s, &auto).await,
+            links_from(&s, &same).await,
             [(mine.clone(), "duplicate_of".to_string())]
         );
         assert!(s.reviews(ReviewQuery::default()).await.unwrap().is_empty());

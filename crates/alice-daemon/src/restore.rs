@@ -1197,6 +1197,9 @@ mod tests {
                  DROP TABLE IF EXISTS capture_state;
                  DROP TABLE IF EXISTS capture_turns;
                  DROP INDEX IF EXISTS sources_session;
+                 DROP INDEX IF EXISTS memories_distill_session;
+                 ALTER TABLE memories DROP COLUMN distill_p;
+                 ALTER TABLE memories DROP COLUMN distill_tier;
                  ALTER TABLE memories DROP COLUMN origin;
                  DELETE FROM schema_migrations WHERE version >= 3;",
             )

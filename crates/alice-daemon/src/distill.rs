@@ -22,20 +22,20 @@
 //!    - the breaker is open: `due` again at its time.
 //! 2. Each subagent by its own project's rules (the same three, without the switches): one
 //!    that is not allowed keeps its chunks and says why in its own state.
-//! 3. The session's caps (Task 12b, spec §6.4): what the session's earlier runs kept
-//!    ([`session_kept`]) sets this run's room under `distill.max_per_session` (one slot of it
-//!    kept for a handoff) and the subagents' share. A session with no room left sends nothing:
-//!    its cursors move to the end of what is written, and it is `done`. One with only the
-//!    handoff slot left asks about its handoff alone, in a run that closes the session.
-//! 4. The session's chunks from `distill_ord` on, and the allowed subagents' from theirs, about
+//! 3. The session's chunks from `distill_ord` on, and the allowed subagents' from theirs, about
 //!    two runs' worth and below each source's `next_ord`, with their turn starts (Task 12
 //!    supplement, items 1 and 11).
-//! 5. [`distill::prepare`] within the run's caps, one Jev request for every project the run
-//!    covers ([`Judge::ask_distill`], so at most one in flight), then [`distill::decide`].
-//! 6. Each kept passage written with [`write_memory`] in the project of the source it came from:
-//!    redacted with that project's rules, `origin = distill`, its chunks as provenance and an
-//!    idempotency key, so a repeated run (a crash before the cursor moved) stores nothing twice.
-//! 7. The cursors move to the end of the run; the source is `done`, or `due` again when more of
+//! 4. [`distill::prepare`] within the run's caps, one Jev request for every project the run
+//!    covers ([`Judge::ask_distill`], so at most one in flight), then [`distill::decide`]. A
+//!    session whose best set is full is asked as any other (Task 12c), within
+//!    `distill.budget_share`.
+//! 5. The kept passages fitted into the session's best set ([`distill::place`]: at most
+//!    `distill.max_per_session` live distilled memories, the best by rank; a better passage
+//!    replaces the weakest, trashed by `distill:cap`), then each written with [`write_memory`] in
+//!    the project of the source it came from: redacted with that project's rules,
+//!    `origin = distill`, its rank inputs, its chunks as provenance and an idempotency key, so a
+//!    repeated run (a crash before the cursor moved) stores nothing twice.
+//! 6. The cursors move to the end of the run; the source is `done`, or `due` again when more of
 //!    it is left.
 //!
 //! `Budget` waits for the next UTC day (`waiting_budget`) and `Denied` is `skipped_cloud`: both
@@ -51,7 +51,7 @@ use crate::redaction::Redactors;
 use crate::writer::{CaptureChange, ProjectChoice, WriteOp, WriteOutcome, WriterHandle};
 use alice_core::capture::AgentKind;
 use alice_core::distill::{
-    self, DistillConfig, DistilledMemory, RUN_MAX_CHARS, RunChunk, RunInput, SessionKept,
+    self, DistillConfig, DistilledMemory, RUN_MAX_CHARS, RunChunk, RunInput,
 };
 use alice_core::ids::now_rfc3339;
 use alice_core::judge::{Judge, JudgeError};
@@ -203,6 +203,10 @@ pub struct RunReport {
     pub duplicates: usize,
     /// Kept passages not stored because the privacy rules refused their text.
     pub refused: usize,
+    /// Memories of the session's best set that a stored one replaced (trashed by `distill:cap`).
+    pub replaced: usize,
+    /// Kept passages not stored because they did not outrank the full set's weakest.
+    pub capped: usize,
     /// When the run ended (RFC 3339).
     pub at: String,
 }
@@ -217,6 +221,8 @@ impl RunReport {
             stored: 0,
             duplicates: 0,
             refused: 0,
+            replaced: 0,
+            capped: 0,
             at: String::new(),
         }
     }
@@ -648,40 +654,7 @@ impl DistillCtl {
                 other => (other, None),
             }
         };
-        // The session's caps (Task 12b): what its earlier runs kept bounds this one. A session
-        // with no room left, its handoff slot held too, asks Jev nothing more: its cursors move
-        // to the end of what is written, and it is done. One with only the handoff slot left asks
-        // about its handoff alone, and only in a run that closes it (`Prepared::within`).
-        let kept = match self.ctx.readers.with(|c| session_kept(c, src)) {
-            Ok(k) => k,
-            Err(e) => return self.read_failed(src, report, &e),
-        };
-        let cfg = DistillConfig::for_session(&s.distill, kept);
-        if !cfg.keeps_any() {
-            if src.next_ord > src.distill_ord {
-                self.change(
-                    &src.source_id,
-                    CaptureChange::Distilled {
-                        distill_ord: src.next_ord,
-                    },
-                )?;
-            }
-            for (k, _) in &included {
-                self.change(
-                    &k.source_id,
-                    CaptureChange::Distilled {
-                        distill_ord: k.next_ord,
-                    },
-                )?;
-            }
-            tracing::info!(
-                uri = src.uri,
-                kept = kept.all,
-                "the session has used up its distill.max_per_session memories; the rest of it is not sent to Jev"
-            );
-            let (state, next) = rest(DistillState::Done);
-            return self.leave(src, report, state, next, 0);
-        }
+        let cfg = DistillConfig::from(&s.distill);
         let project_names = match self.ctx.readers.with(|c| project_names(c, &src.project_id)) {
             Ok(n) => n,
             Err(e) => return self.read_failed(src, report, &e),
@@ -776,15 +749,37 @@ impl DistillCtl {
                 }
             }
         };
-        for m in &memories {
+        // The session's best set (Task 12c): what is kept takes a free slot, or the place of a
+        // weaker held memory, or is not stored.
+        let placements = if memories.is_empty() {
+            Vec::new()
+        } else {
+            let held = match self
+                .ctx
+                .readers
+                .with(|c| store::session_held(c, &src.agent, &src.session_id))
+            {
+                Ok(h) => h,
+                Err(e) => return self.read_failed(src, report, &e),
+            };
+            let n = memories.len();
+            let placements = distill::place(&held, memories, &s.distill);
+            report.capped = n - placements.len();
+            placements
+        };
+        for pl in &placements {
+            let m = &pl.memory;
             // A passage of a subagent's chunks goes to that subagent's project, with its rules.
             let owner = m
                 .chunk_ids
                 .iter()
                 .find_map(|id| loaded.owner.get(id))
                 .map_or(src, |&i| &included[i].0);
-            match write_memory(&self.ctx, m, owner) {
-                Ok(InsertOutcome::New { .. }) => report.stored += 1,
+            match write_memory(&self.ctx, m, owner, pl.replaces.as_deref()) {
+                Ok(InsertOutcome::New { .. }) => {
+                    report.stored += 1;
+                    report.replaced += usize::from(pl.replaces.is_some());
+                }
                 Ok(InsertOutcome::Duplicate { .. }) => report.duplicates += 1,
                 // The rules refuse its text (block mode), or the store refuses it: this one
                 // passage is left out.
@@ -1315,12 +1310,15 @@ pub(crate) fn distilled_since(conn: &Connection, since: &str) -> Result<(u64, u6
 /// Writes one distilled memory (spec §6.5) on the calling thread: the title and body redacted
 /// with the rules of the source's project (a project whose rules cannot be read is screened
 /// closed), then `remember` with `origin = distill`, its chunks as provenance, its idempotency
-/// key, `distill.importance`, and the source's agent and session as the author, in the
-/// source's project (or `global` for a preference of the user's).
+/// key, `distill.importance`, its rank inputs, and the source's agent and session as the author,
+/// in the source's project (or `global` for a preference of the user's). When it takes the place
+/// of `replaces` in its session's best set, that memory is trashed by `distill:cap` in the same
+/// writer op (Task 12c).
 pub(crate) fn write_memory(
     ctx: &DistillCtx,
     m: &DistilledMemory,
     src: &CaptureState,
+    replaces: Option<&str>,
 ) -> Result<InsertOutcome> {
     let (slug, tree) = ctx.readers.with(|c| {
         let slug = projects::get_by_id(c, &src.project_id)?.slug;
@@ -1350,42 +1348,19 @@ pub(crate) fn write_memory(
         ..Default::default()
     };
     let project = ProjectChoice::Slug(if m.to_global { "global".into() } else { slug });
-    match ctx
-        .writer
-        .submit_blocking(WriteOp::Remember { input, project })?
-    {
+    match ctx.writer.submit_blocking(WriteOp::Distilled {
+        input,
+        project,
+        p: m.p,
+        subagent: m.subagent,
+        replaces: replaces.map(str::to_owned),
+    })? {
         WriteOutcome::Remembered(out, _) => Ok(out),
         other => Err(AliceError::Other(format!(
             "unexpected writer outcome {}",
             other.name()
         ))),
     }
-}
-
-/// What the session of `src` has kept so far (spec §6.4): its live (`origin = distill`, not
-/// trashed) memories, and of them those kept from a subagent report (their key starts with
-/// [`distill::SUBAGENT_KEY_PREFIX`]) and the handoffs. They are found by their author:
-/// [`write_memory`] sets it from the source, and a subagent's source carries its session's agent
-/// and id, so the session's memories are its subagents' too. Provenance would not do: raw
-/// retention deletes it with the chunks, which would give a capped session fresh room (Task 12b
-/// review, M3).
-fn session_kept(c: &Connection, src: &CaptureState) -> Result<SessionKept> {
-    let prefix = distill::SUBAGENT_KEY_PREFIX;
-    let (all, subagent, handoff): (i64, i64, i64) = c.query_row(
-        "SELECT count(*), coalesce(sum(substr(idempotency_key, 1, ?3) = ?4), 0),
-                coalesce(sum(kind = 'handoff'), 0)
-         FROM memories
-         WHERE origin = 'distill' AND status <> 'trashed'
-           AND author_agent = ?1 AND author_session = ?2",
-        rusqlite::params![src.agent, src.session_id, prefix.len() as i64, prefix],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
-    let n = |v: i64| usize::try_from(v).unwrap_or(0);
-    Ok(SessionKept {
-        all: n(all),
-        subagent: n(subagent),
-        handoff: n(handoff),
-    })
 }
 
 /// The other names of project `project_id` for distillation's routing guard (spec §6.5): its

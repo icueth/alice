@@ -223,6 +223,18 @@ pub enum WriteOp {
         input: NewMemoryInput,
         project: ProjectChoice,
     },
+    /// A distilled memory (SP2 spec §6.4, §6.5; Task 12c): `remember`, with its rank inputs (`p`,
+    /// and whether it is a subagent's report) stored, and when it takes the place of `replaces`
+    /// in its session's best set, that memory trashed in the same transaction (a
+    /// `memory.forget` by `distill:cap`, undoable like any trash). A duplicate (the passage was
+    /// stored already) replaces nothing, nor does a `replaces` that is no longer live.
+    Distilled {
+        input: NewMemoryInput,
+        project: ProjectChoice,
+        p: f64,
+        subagent: bool,
+        replaces: Option<String>,
+    },
     /// Validated as a whole before anything is written, then written `INGEST_SLICE` chunks per
     /// transaction. If a later slice fails, the earlier ones stay; ingest is incremental by `ord`,
     /// so retrying the same request completes it.
@@ -740,6 +752,45 @@ fn remember(
         }
     }
     Ok(WriteOutcome::Remembered(out, p))
+}
+
+/// The actor of a trash that makes room in a session's best set (Task 12c): `distill:cap`.
+const DISTILL_CAP: &str = "cap";
+
+/// A distilled memory (`WriteOp::Distilled`): [`remember`]; then, when it is new, its rank inputs,
+/// and the memory it replaces in its session's best set trashed by `distill:cap` if still live.
+fn distilled(
+    conn: &Connection,
+    input: NewMemoryInput,
+    project: &ProjectChoice,
+    p: f64,
+    subagent: bool,
+    replaces: Option<&str>,
+    st: &mut State,
+) -> Result<WriteOutcome> {
+    let out = remember(conn, input, project, st)?;
+    if let WriteOutcome::Remembered(InsertOutcome::New { id, .. }, _) = &out {
+        let tier = if subagent { "subagent" } else { "main" };
+        conn.execute(
+            "UPDATE memories SET distill_p = ?1, distill_tier = ?2 WHERE id = ?3",
+            rusqlite::params![p, tier, id],
+        )?;
+        if let Some(old) = replaces {
+            let status: Option<String> = conn
+                .query_row("SELECT status FROM memories WHERE id = ?1", [old], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if status.is_some_and(|s| s != "trashed" && s != "superseded") {
+                let forget = MemoryUpdate {
+                    action: UpdateAction::Forget,
+                    ..Default::default()
+                };
+                update(conn, old, &forget, &Actor::Distill(DISTILL_CAP.into()), st)?;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `update`: the change and its `memory.<action>` event, whose id it returns. A supersede also
@@ -1897,6 +1948,13 @@ fn apply(
 ) -> Result<Applied> {
     let outcome = match op {
         WriteOp::Remember { input, project } => remember(conn, input, &project, st)?,
+        WriteOp::Distilled {
+            input,
+            project,
+            p,
+            subagent,
+            replaces,
+        } => distilled(conn, input, &project, p, subagent, replaces.as_deref(), st)?,
         WriteOp::Ingest {
             project,
             source,
@@ -5338,6 +5396,7 @@ mod tests {
                 ]),
                 agreement: None,
                 existing_origin: Origin::Agent,
+                existing_body: String::new(),
             }],
             &alice_core::judge::pipeline::Thresholds {
                 auto: 0.85,
@@ -7158,6 +7217,135 @@ mod tests {
             [&plain],
         );
         assert_eq!(actor, "user");
+    }
+
+    /// Task 12c (spec §6.4): a distilled memory is written with its rank inputs and, when it takes
+    /// the place of a weaker one in its session's best set, that one is trashed in the same op:
+    /// a `memory.forget` by `distill:cap`, undoable like any trash. A duplicate replaces nothing,
+    /// and neither does a memory that is no longer live.
+    #[test]
+    fn a_distilled_memory_replaces_its_sessions_weakest_in_one_op() {
+        let f = fixture();
+        let distilled = |text: &str, key: &str, p: f64, subagent: bool, replaces: Option<&str>| {
+            WriteOp::Distilled {
+                input: NewMemoryInput {
+                    content: text.into(),
+                    kind: Some(Kind::Fact),
+                    idempotency_key: Some(key.into()),
+                    author: alice_core::model::Author {
+                        agent: Some(CAPTURE_AGENT.into()),
+                        session: Some("S1".into()),
+                        model: None,
+                    },
+                    origin: Origin::Distill,
+                    ..Default::default()
+                },
+                project: global(),
+                p,
+                subagent,
+                replaces: replaces.map(str::to_owned),
+            }
+        };
+        let (weak, _) = new_id(
+            f.h.submit_blocking(distilled(
+                "The cache keeps its data in memory only",
+                "distill:weak",
+                0.72,
+                true,
+                None,
+            ))
+            .unwrap(),
+        );
+        let (p, tier): (f64, String) = (
+            f.read("SELECT distill_p FROM memories WHERE id = ?1", [&weak]),
+            f.read("SELECT distill_tier FROM memories WHERE id = ?1", [&weak]),
+        );
+        assert_eq!((p, tier.as_str()), (0.72, "subagent"));
+        let (best, _) = new_id(
+            f.h.submit_blocking(distilled(
+                "The cache service listens on port 6380 and restarts nightly",
+                "distill:best",
+                0.97,
+                false,
+                Some(&weak),
+            ))
+            .unwrap(),
+        );
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        assert_eq!(status(&weak), "trashed");
+        assert_ne!(status(&best), "trashed");
+        let tier: String = f.read("SELECT distill_tier FROM memories WHERE id = ?1", [&best]);
+        assert_eq!(tier, "main");
+        let (event, actor): (String, String) = (
+            f.read(
+                "SELECT id FROM events WHERE action = 'memory.forget' AND target_id = ?1",
+                [&weak],
+            ),
+            f.read(
+                "SELECT actor FROM events WHERE action = 'memory.forget' AND target_id = ?1",
+                [&weak],
+            ),
+        );
+        assert_eq!(actor, "distill:cap", "the trash's reason");
+        // A duplicate of the best replaces nothing.
+        let (other, _) = new_id(
+            f.h.submit_blocking(distilled(
+                "Another fact entirely, about the queue",
+                "distill:other",
+                0.9,
+                false,
+                None,
+            ))
+            .unwrap(),
+        );
+        let again =
+            f.h.submit_blocking(distilled(
+                "The cache service listens on port 6380 and restarts nightly",
+                "distill:best",
+                0.97,
+                false,
+                Some(&other),
+            ))
+            .unwrap();
+        assert!(matches!(
+            again,
+            WriteOutcome::Remembered(InsertOutcome::Duplicate { .. }, _)
+        ));
+        assert_ne!(status(&other), "trashed");
+        // The trash is undone like any other.
+        f.h.submit_blocking(WriteOp::Undo {
+            event_id: event,
+            actor: Actor::User,
+        })
+        .unwrap();
+        assert_ne!(status(&weak), "trashed");
+        // A replaced memory that is no longer live is left as it is.
+        f.h.submit_blocking(WriteOp::Update {
+            id: weak.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Forget,
+                ..Default::default()
+            },
+            actor: Actor::User,
+        })
+        .unwrap();
+        let forgets = || -> i64 {
+            f.read(
+                "SELECT count(*) FROM events WHERE action = 'memory.forget' AND target_id = ?1",
+                [&weak],
+            )
+        };
+        let before = forgets();
+        f.h.submit_blocking(distilled(
+            "A third fact, about the backups",
+            "distill:third",
+            0.95,
+            false,
+            Some(&weak),
+        ))
+        .unwrap();
+        assert_eq!(forgets(), before);
     }
 
     /// SP2 spec §3.9 and R11: retention that deletes a capture source's last chunk keeps the

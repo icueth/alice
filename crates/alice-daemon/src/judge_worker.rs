@@ -578,10 +578,12 @@ pub fn judge_one(cfg: &JudgeWorkerConfig, item: &PendingJudgement) -> Result<Opt
         &mut outcome,
         &item.id,
     );
-    // A judge does not say how the memories it compared came to exist; the neighbours do.
+    // A judge does not say how the memories it compared came to exist, nor what they hold (for
+    // the "holds more" guard, Task 12c); the neighbours do.
     for r in &mut relations {
         if let Some(e) = existing.iter().find(|e| e.id == r.existing_id) {
             r.existing_origin = e.origin;
+            r.existing_body.clone_from(&e.body);
         }
     }
     // A heuristic that answers because the judge could not is only trusted to suggest.

@@ -270,12 +270,16 @@ distilled, newest first. Older ones, and sessions captured by a backfill, are di
 - **One request per run.** Jev gets one question per passage: does it hold a decision, a bugfix, a how-to, a warning, a
   preference of yours (filed under `global`, unless it names this project: its name, its folder or a path in it), a
   convention of this project, a fact, a handoff, or is it already saved, ephemeral or unclear? A passage is kept when
-  its best answer is a kind of knowledge with probability at least `distill.min_confidence` (default 0.7). At most
-  `distill.max_per_run` (default 8) are kept per run, and at most one handoff; at most `distill.max_per_session`
-  (default 16) per session, its runs and its subagents together, one of them kept for a handoff at the session's end
-  (`SessionEnd`, a compaction, or the 24-hour stale end); and at most `distill.max_per_subagent_run` (default 2)
-  subagent reports per run, and half of `distill.max_per_session` per session. A subagent's report is never the
-  session's handoff.
+  its best answer is a kind of knowledge with probability at least `distill.min_confidence` (default 0.7). What is kept
+  is ranked: a handoff first, your session before its subagents, then by Jev's confidence in bands (0.9 and above, 0.8
+  and above, below), then by kind (decision, bugfix, warning, fact, how-to, preference). At most `distill.max_per_run`
+  (default 8) are kept per run, at most one handoff, and at most `distill.max_per_subagent_run` (default 2) subagent
+  reports. A subagent's report is never the session's handoff.
+- **A session keeps its best.** `distill.max_per_session` (default 16) is the size of a session's best set, its runs
+  and its subagents together, subagent reports at most half of it. Every run is asked about, a full session's too, so a
+  better passage later in the session replaces the weakest one kept; the replaced memory goes to the trash (by
+  `distill:cap`, and you can restore it like any other), and its passage stays in the raw capture. A handoff always
+  gets in.
 - **The memory.** The passage (at most 1,200 characters), titled with its first sentence, passing over `#` headings;
   when that is a table header, or 25 characters or fewer (a short heading or label), with the first sentence after it
   that says more (at most 80 characters). It gets a last line `Context: <your prompt's first sentence>` when it needs
@@ -293,7 +297,8 @@ machine-extracted: rely on it as you would on a note you did not write.
   memories, without a question.
 - **Your memories win.** A distilled memory never replaces one an agent or you wrote. When the judge finds that the two
   say the same thing, yours stays and the distilled one goes to the trash, whichever came first; so does a distilled
-  memory that only updates yours. A preference of yours filed under `global` is compared with the memories of the
+  memory that only updates yours. One that holds more than yours (more than twice the text, when the judge is not
+  sure, or a number yours does not state) is kept and linked to yours instead. A preference of yours filed under `global` is compared with the memories of the
   session's project too, where your agent may have saved it (unless the cloud policy keeps that project at home).
 - **Hidden until judged.** Recall and the briefing skip a distilled memory until the judge has looked at it, so a near
   copy of something already saved never shows twice. `get_memory` by id still returns it.
@@ -348,7 +353,7 @@ provider = "off"            # "off" | "jev"
 # model                     # reserved; ignored with "jev" (judge.jev.model is used)
 min_confidence = 0.7        # 0.5-0.99
 max_per_run = 8             # 1-50
-max_per_session = 16        # 2-200: one session over all its runs, its subagents included
+max_per_session = 16        # 2-200: the size of a session's best set, its subagents included
 max_per_subagent_run = 2    # 0-50: subagent reports kept in one run
 idle_minutes = 15           # 1-1,440
 importance = 2              # 1-3

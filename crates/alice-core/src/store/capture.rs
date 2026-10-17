@@ -633,10 +633,152 @@ pub fn stale_open(conn: &Connection, before: &str, limit: usize) -> Result<Vec<S
         .collect::<std::result::Result<_, _>>()?)
 }
 
+/// The live distilled memories of one session (SP2 spec §6.4, Task 12c): those of `origin =
+/// distill` written as its agent and session, not trashed and not superseded (M1). Uses the
+/// partial index `memories_distill_session` (migration 0008).
+pub const SESSION_HELD: &str =
+    "SELECT id, kind, distill_p, distill_tier, coalesce(idempotency_key, '')
+     FROM memories
+     WHERE origin = 'distill' AND author_session = ?1 AND author_agent = ?2
+       AND status NOT IN ('trashed', 'superseded')
+     ORDER BY seq";
+
+/// The best set of the session `session` of `agent` as [`SESSION_HELD`] reads it. A memory of an
+/// unknown kind (a later build's) is left out.
+pub fn session_held(
+    conn: &Connection,
+    agent: &str,
+    session: &str,
+) -> Result<Vec<crate::distill::Held>> {
+    let mut stmt = conn.prepare_cached(SESSION_HELD)?;
+    let rows = stmt
+        .query_map(params![session, agent], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, kind, p, tier, key)| {
+            Some(crate::distill::Held {
+                id,
+                kind: crate::model::Kind::parse(&kind)?,
+                p,
+                subagent: tier.map(|t| t == "subagent"),
+                idempotency_key: key,
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::projects::GLOBAL_ID;
+
+    /// Task 12c: a session's best set is its live distilled memories, superseded ones left out
+    /// (M1), with their rank inputs (`NULL` before 0008); the query uses the partial index.
+    #[test]
+    fn a_sessions_best_set_is_its_live_distilled_memories() {
+        let (_d, c) = conn();
+        let add = |id: &str,
+                   kind: &str,
+                   status: &str,
+                   origin: &str,
+                   session: &str,
+                   p: Option<f64>,
+                   tier: Option<&str>| {
+            c.execute(
+                "INSERT INTO memories (id, project_id, kind, title, body, status, content_hash, created_at,
+                                       updated_at, hlc, origin, author_agent, author_session,
+                                       idempotency_key, distill_p, distill_tier)
+                 VALUES (?1, ?2, ?3, 't', 'b', ?4, ?1, '2026-10-17T00:00:00.000Z',
+                         '2026-10-17T00:00:00.000Z', 'h', ?5, 'claude-code', ?6, 'distill:' || ?1, ?7, ?8)",
+                params![id, GLOBAL_ID, kind, status, origin, session, p, tier],
+            )
+            .unwrap();
+        };
+        add(
+            "A",
+            "fact",
+            "active",
+            "distill",
+            "S1",
+            Some(0.95),
+            Some("main"),
+        );
+        add(
+            "B",
+            "decision",
+            "pending",
+            "distill",
+            "S1",
+            Some(0.81),
+            Some("subagent"),
+        );
+        add("C", "fact", "active", "distill", "S1", None, None);
+        add(
+            "T",
+            "fact",
+            "trashed",
+            "distill",
+            "S1",
+            Some(0.9),
+            Some("main"),
+        );
+        add(
+            "U",
+            "fact",
+            "superseded",
+            "distill",
+            "S1",
+            Some(0.9),
+            Some("main"),
+        );
+        add("G", "fact", "active", "agent", "S1", None, None);
+        add(
+            "O",
+            "fact",
+            "active",
+            "distill",
+            "S2",
+            Some(0.9),
+            Some("main"),
+        );
+        let held = session_held(&c, "claude-code", "S1").unwrap();
+        let got: Vec<(&str, Option<f64>, Option<bool>)> = held
+            .iter()
+            .map(|h| (h.id.as_str(), h.p, h.subagent))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("A", Some(0.95), Some(false)),
+                ("B", Some(0.81), Some(true)),
+                ("C", None, None)
+            ]
+        );
+        assert_eq!(held[1].kind, crate::model::Kind::Decision);
+        assert_eq!(held[0].idempotency_key, "distill:A");
+        assert!(session_held(&c, "codex", "S1").unwrap().is_empty());
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {SESSION_HELD}"))
+            .unwrap()
+            .query_map(params!["S1", "claude-code"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("USING INDEX memories_distill_session")),
+            "{plan:?}"
+        );
+    }
 
     fn conn() -> (tempfile::TempDir, Connection) {
         let d = tempfile::tempdir().unwrap();

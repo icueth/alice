@@ -60,6 +60,9 @@ struct DistillScript {
     /// `(phrase, relation)`: the judge's comparison of a new memory with an existing one that
     /// both hold `phrase` is answered with `relation` (all the probability on it).
     relations: Mutex<Vec<(&'static str, &'static str)>>,
+    /// `(phrase, p)`: the probability of the option for a passage that holds `phrase`, in place
+    /// of `top`.
+    p_of: Mutex<Vec<(&'static str, f64)>>,
 }
 
 fn is_distill_question(id: &str) -> bool {
@@ -79,6 +82,7 @@ impl DistillScript {
             bodies: Mutex::new(Vec::new()),
             top: Mutex::new(1.0),
             relations: Mutex::new(Vec::new()),
+            p_of: Mutex::new(Vec::new()),
         })
     }
 
@@ -208,7 +212,11 @@ impl JevTransport for DistillScript {
                     .map_or_else(|| options[0].clone(), str::to_string)
             };
             let top = if is_distill_question(qid) && choice != "ephemeral" {
-                *self.top.lock()
+                self.p_of
+                    .lock()
+                    .iter()
+                    .find(|(phrase, _)| text.contains(phrase))
+                    .map_or(*self.top.lock(), |(_, p)| *p)
             } else {
                 1.0
             };
@@ -2718,12 +2726,12 @@ fn words(seed: u64, n: usize) -> String {
         .join(" ")
 }
 
-/// Task 12b, the brief's flow: one session of three main runs and twelve subagent sources, every
-/// passage answered at p 0.95 as knowledge. `distill.max_per_subagent_run = 4` here, so the
-/// subagents' share of the session (8 of 16) is what stops them. The session keeps 15 in all (one
-/// slot of the 16 waits for a handoff that never comes: no run here closes the session), 8 of
-/// them from subagents; its third run still keeps main-session memories and asks nothing about
-/// the subagents' passages; and once it is capped, a further due-mark sends nothing.
+/// Task 12b's flow under Task 12c's best set: one session of three main runs and twelve
+/// subagent sources, every passage answered at p 0.95 as knowledge, with
+/// `distill.max_per_subagent_run = 4`. The session never holds more than 16, nor more than 8
+/// from subagents; a full session is still asked about every run, and its later runs keep
+/// main-session memories by replacing subagent ones (a main passage outranks any subagent
+/// report), each replaced one trashed by `distill:cap`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_long_session_with_many_subagents_keeps_at_most_its_cap() {
     let config =
@@ -2740,7 +2748,7 @@ async fn a_long_session_with_many_subagents_keeps_at_most_its_cap() {
     let mut main = Transcript::default();
     let mut sent = 0;
     let mut agents = 0;
-    // (main turns, subagents) per run; then a fourth due-mark after the cap.
+    // (main turns, subagents) per run; the fourth comes after the set is full.
     for (run, turns, subagents) in [(1u64, 3, 4), (2, 3, 4), (3, 4, 4), (4, 2, 1)] {
         for i in 0..turns {
             main.prompt(&format!("fl-p{run}-{i}"), &format!("Go on {run}.{i}."))
@@ -2779,97 +2787,80 @@ async fn a_long_session_with_many_subagents_keeps_at_most_its_cap() {
                 .await;
             assert!(a.turns_stored >= 1, "{a:?}");
         }
-        let calls = d.script.distill_calls();
         d.svc.capture_distill_now("fl1").await.unwrap();
         until("the run is over", || {
             let runs = d.svc.distill_runs();
             runs.len() as u64 == run && d.state(&uri("fl1")).state == "done"
         })
         .await;
+        assert_eq!(
+            d.script.distill_calls() as u64,
+            run,
+            "every run is asked about, a full session's too"
+        );
         let got = d.svc.distill_runs().last().cloned().unwrap();
-        let mems = d.distilled();
-        let sub_keys = mems
-            .iter()
-            .filter(|m| {
-                let key: String = d
-                    .db()
-                    .query_row(
-                        "SELECT idempotency_key FROM memories WHERE id = ?1",
-                        [&m.id],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                key.starts_with("distill:sub:")
-            })
-            .count();
-        let in_subagents = mems
-            .iter()
-            .filter(|m| {
-                d.db()
-                    .query_row(
-                        "SELECT count(*) FROM provenance p JOIN chunks ch ON ch.id = p.chunk_id
-                         JOIN capture_state s ON s.source_id = ch.source_id
-                         WHERE p.memory_id = ?1 AND s.parent_source_id IS NOT NULL",
-                        [&m.id],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .unwrap()
-                    > 0
-            })
-            .count();
-        assert_eq!(sub_keys, in_subagents, "run {run}: {mems:#?}");
-        let main_mems = mems.len() - in_subagents;
+        let live: Vec<Distilled> = d
+            .distilled()
+            .into_iter()
+            .filter(|m| m.status != "trashed" && m.status != "superseded")
+            .collect();
+        let key = |m: &Distilled| -> String {
+            d.db()
+                .query_row(
+                    "SELECT idempotency_key FROM memories WHERE id = ?1",
+                    [&m.id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let in_subagents = |m: &Distilled| -> bool {
+            d.db()
+                .query_row(
+                    "SELECT count(*) FROM provenance p JOIN chunks ch ON ch.id = p.chunk_id
+                     JOIN capture_state s ON s.source_id = ch.source_id
+                     WHERE p.memory_id = ?1 AND s.parent_source_id IS NOT NULL",
+                    [&m.id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+                > 0
+        };
+        let subs = live.iter().filter(|m| in_subagents(m)).count();
+        assert_eq!(
+            subs,
+            live.iter()
+                .filter(|m| key(m).starts_with("distill:sub:"))
+                .count(),
+            "run {run}"
+        );
+        let mains = live.len() - subs;
+        assert!(live.len() <= 16 && subs <= 8, "run {run}: {live:#?}");
+        let cap_trashed: i64 = d
+            .db()
+            .query_row(
+                "SELECT count(*) FROM events WHERE action = 'memory.forget' AND actor = 'distill:cap'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         match run {
-            1 => assert_eq!((got.stored, mems.len(), in_subagents), (7, 7, 4), "{got:?}"),
-            2 => assert_eq!(
-                (got.stored, mems.len(), in_subagents),
-                (7, 14, 8),
-                "{got:?}"
-            ),
+            1 => assert_eq!((live.len(), mains, subs), (7, 3, 4), "{got:?}"),
+            2 => assert_eq!((live.len(), mains, subs), (14, 6, 8), "{got:?}"),
             3 => {
-                assert_eq!(
-                    (got.stored, mems.len(), in_subagents),
-                    (1, 15, 8),
-                    "{got:?}"
-                );
-                assert_eq!(
-                    main_mems, 7,
-                    "the third run still keeps main-session memories"
-                );
+                assert_eq!((live.len(), mains), (16, 10), "{got:?}");
                 let asked = d.script.questions.lock().last().cloned().unwrap();
-                assert_eq!(asked.len(), 4, "the main passages only: {asked:#?}");
-                assert!(asked.iter().all(|q| !q.contains("Review finding")));
+                assert_eq!(asked.len(), 8, "the full session is asked about all of it");
             }
-            _ => {
-                assert_eq!(
-                    d.script.distill_calls(),
-                    calls,
-                    "a capped session sends nothing"
-                );
-                assert_eq!(
-                    (got.questions, got.stored, got.state.as_str()),
-                    (0, 0, "done")
-                );
-                assert_eq!((mems.len(), in_subagents), (15, 8));
-            }
+            _ => assert_eq!((live.len(), mains), (16, 12), "{got:?}"),
         }
-        assert!(
-            mems.iter()
-                .all(|m| m.status == "active" || m.judge_state != "done")
+        assert_eq!(
+            cap_trashed as usize,
+            d.distilled().len() - live.len(),
+            "every memory that left the set was trashed by distill:cap"
         );
     }
-    // The cursors moved over what the capped run did not ask about.
     let st = d.state(&uri("fl1"));
     assert_eq!(st.distill_ord, st.next_ord);
-    let last = d.state(&format!("{}:agent:ag{agents}", uri("fl1")));
-    assert_eq!(last.distill_ord, last.next_ord);
-    // A further due-mark: still nothing sent.
-    let calls = d.script.distill_calls();
-    d.svc.capture_distill_now("fl1").await.unwrap();
-    until("the fifth run is over", || d.svc.distill_runs().len() == 5).await;
-    settle().await;
-    assert_eq!(d.script.distill_calls(), calls);
-    assert_eq!(d.distilled().len(), 15);
     d.shutdown();
 }
 
@@ -2902,136 +2893,143 @@ fn last_distill_options(script: &DistillScript) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Task 12b review, M2 (the controller's ruling): one slot of `max_per_session` is kept for a
-/// handoff. A session whose other room is used up still gets its handoff at its close: one small
-/// request over the last two turns, `handoff` the only knowledge option. A second close, with
-/// the slot held, sends nothing, and the session never keeps more than its cap.
+/// Task 12c, the controller's ruling P1 and M1: `max_per_session` (4 here) is the size of the
+/// session's best set. A full session is still asked about each run; a better later passage
+/// replaces the weakest held memory (trashed by `distill:cap`); a worse one is not stored; the
+/// handoff of a compaction always enters; and a superseded memory holds no slot.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_capped_session_still_keeps_its_closing_handoff() {
+async fn a_full_session_keeps_its_best_memories() {
     let config =
         "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 4\n";
-    let d = Daemon::start(
+    let mut d = Daemon::start(
         Opts {
             config,
             ..Opts::jev()
         },
-        DistillScript::new(&[("Main fact", "fact"), ("Where things stand:", "handoff")]),
+        DistillScript::new(&[
+            ("Weak fact", "fact"),
+            ("Strong fact", "fact"),
+            ("Weaker fact", "fact"),
+            ("Extra fact", "fact"),
+            ("Where things stand:", "handoff"),
+        ]),
     );
+    *d.script.p_of.lock() = vec![
+        ("Weak fact", 0.75),
+        ("Strong fact", 0.95),
+        ("Weaker fact", 0.72),
+        ("Extra fact", 0.85),
+        ("Where things stand:", 0.71),
+    ];
     let mut t = Transcript::default();
-    for i in 0..4u64 {
-        t.prompt(&format!("ho-p{i}"), &format!("Go on {i}.")).reply(
-            &format!("ho-a{i}"),
-            &format!("Main fact {i}: {}.", words(300 + i, 18)),
-        );
-    }
-    d.send("shop", "ho1", &t, 0, "stop").await;
-    d.svc.capture_distill_now("ho1").await.unwrap();
-    until("the first run is over", || d.svc.distill_runs().len() == 1).await;
-    assert_eq!(d.distilled().len(), 3, "the fourth slot is the handoff's");
-
-    // The compaction: one small request for the handoff.
-    let off = t.len();
-    t.prompt("ho-p4", "Go on 4.")
-        .reply("ho-a4", &format!("Main fact 4: {}.", words(304, 18)))
-        .prompt("ho-p5", "Where are we?")
-        .reply("ho-a5", HANDOFF);
-    d.send("shop", "ho1", &t, off, "pre-compact").await;
-    until("the closing run is over", || {
-        d.svc.distill_runs().len() == 2
-    })
-    .await;
-    assert_eq!(d.script.distill_calls(), 2);
-    let options = last_distill_options(&d.script);
-    assert_eq!(options.len(), 2, "the last two turns");
-    for o in &options {
-        assert_eq!(o, &["already_saved", "ephemeral", "handoff", "unclear"]);
-    }
-    let mems = d.distilled();
-    assert_eq!(mems.len(), 4, "{mems:?}");
-    assert_eq!(mems.iter().filter(|m| m.kind == "handoff").count(), 1);
-    assert_eq!(d.state(&uri("ho1")).state, "done");
-
-    // The session ends: the slot is held, so nothing is sent.
-    let off = t.len();
-    t.prompt("ho-p6", "Go on 6.")
-        .reply("ho-a6", &format!("Main fact 6: {}.", words(306, 18)))
-        .prompt("ho-p7", "And now?")
-        .reply(
-            "ho-a7",
-            "Where things stand: the cache work is merged, and next we write the release notes.",
-        );
-    d.send("shop", "ho1", &t, off, "session-end").await;
-    until("the last run is over", || d.svc.distill_runs().len() == 3).await;
-    settle().await;
-    assert_eq!(
-        d.script.distill_calls(),
-        2,
-        "a capped close with its handoff sends nothing"
-    );
-    assert_eq!(d.distilled().len(), 4);
-    let st = d.state(&uri("ho1"));
-    assert_eq!((st.state.as_str(), st.distill_ord), ("done", st.next_ord));
-
-    // A session whose handoff came early (a compaction with room): the handoff holds the slot,
-    // and the other kinds still fill the rest, up to the cap and no further.
-    let mut t = Transcript::default();
-    for i in 0..2u64 {
-        t.prompt(&format!("hp-p{i}"), &format!("Go on {i}.")).reply(
-            &format!("hp-a{i}"),
-            &format!("Main fact 2.{i}: {}.", words(500 + i, 18)),
-        );
-    }
-    t.prompt("hp-p2", "Where are we?").reply(
-        "hp-a2",
-        "Where things stand: the parser work is merged, and next we profile the importer.",
-    );
-    d.send("shop", "ho2", &t, 0, "pre-compact").await;
-    until("the early compaction is distilled", || {
-        d.svc
-            .distill_runs()
-            .iter()
-            .filter(|r| r.uri == uri("ho2"))
-            .count()
-            == 1
-    })
-    .await;
-    let of_ho2 = |d: &Daemon| -> Vec<String> {
-        d.distilled()
-            .into_iter()
-            .filter(|m| m.session.as_deref() == Some("ho2"))
-            .map(|m| m.kind)
-            .collect()
+    let mut turn = 0u64;
+    let mut add = |t: &mut Transcript, what: &str| {
+        turn += 1;
+        t.prompt(&format!("bn-p{turn}"), &format!("Go on {turn}."))
+            .reply(
+                &format!("bn-a{turn}"),
+                &format!("{what} {turn}: {}.", words(700 + turn, 18)),
+            );
     };
-    assert_eq!(of_ho2(&d), ["fact", "fact", "handoff"]);
-    let off = t.len();
-    for i in 3..6u64 {
-        t.prompt(&format!("hp-p{i}"), &format!("Go on {i}.")).reply(
-            &format!("hp-a{i}"),
-            &format!("Main fact 2.{i}: {}.", words(500 + i, 18)),
-        );
+    // The live distilled memories, each named by the first two words of its body.
+    let live = |d: &Daemon| -> Vec<String> {
+        let mut n: Vec<String> = d
+            .distilled()
+            .into_iter()
+            .filter(|m| m.status != "trashed" && m.status != "superseded")
+            .map(|m| m.body.split(' ').take(2).collect::<Vec<_>>().join(" "))
+            .collect();
+        n.sort();
+        n
+    };
+    for _ in 0..4 {
+        add(&mut t, "Weak fact");
     }
-    d.send("shop", "ho2", &t, off, "stop").await;
-    d.svc.capture_distill_now("ho2").await.unwrap();
-    until("the second run is over", || {
-        d.svc
-            .distill_runs()
-            .iter()
-            .filter(|r| r.uri == uri("ho2"))
-            .count()
-            == 2
+    d.send("shop", "bn1", &t, 0, "stop").await;
+    d.svc.capture_distill_now("bn1").await.unwrap();
+    until("the first run is over", || d.svc.distill_runs().len() == 1).await;
+    assert_eq!(live(&d), ["Weak fact"; 4]);
+
+    // A full session is asked again: the better passages replace the weakest.
+    let off = t.len();
+    add(&mut t, "Strong fact");
+    add(&mut t, "Strong fact");
+    add(&mut t, "Weaker fact");
+    d.send("shop", "bn1", &t, off, "stop").await;
+    d.svc.capture_distill_now("bn1").await.unwrap();
+    until("the second run is over", || d.svc.distill_runs().len() == 2).await;
+    assert_eq!(d.script.distill_calls(), 2);
+    let run = d.svc.distill_runs()[1].clone();
+    assert_eq!((run.stored, run.replaced, run.capped), (2, 2, 1), "{run:?}");
+    assert_eq!(
+        live(&d),
+        ["Strong fact", "Strong fact", "Weak fact", "Weak fact"],
+        "the weaker one is not stored"
+    );
+    let trashed: Vec<(String, String)> = d
+        .db()
+        .prepare(
+            "SELECT m.status, e.actor FROM memories m JOIN events e ON e.target_id = m.id
+             WHERE m.origin = 'distill' AND e.action = 'memory.forget' ORDER BY m.seq",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        trashed,
+        [
+            ("trashed".to_string(), "distill:cap".to_string()),
+            ("trashed".to_string(), "distill:cap".to_string())
+        ]
+    );
+
+    // A compaction: its handoff always enters, and a better fact replaces the last weak one.
+    let off = t.len();
+    add(&mut t, "Extra fact");
+    t.prompt("bn-hp", "Where are we?").reply("bn-ha", HANDOFF);
+    d.send("shop", "bn1", &t, off, "pre-compact").await;
+    until("the closing run is over", || {
+        d.svc.distill_runs().len() == 3
     })
     .await;
     assert_eq!(
-        of_ho2(&d),
-        ["fact", "fact", "handoff", "fact"],
-        "one more fact fills the session's last other slot"
+        live(&d),
+        ["Extra fact", "Strong fact", "Strong fact", "Where things"]
+    );
+    assert!(
+        d.distilled()
+            .iter()
+            .any(|m| m.kind == "handoff" && m.status != "trashed")
+    );
+
+    // M1: a superseded memory holds no slot, so the next run adds without replacing.
+    d.restart_with(
+        "UPDATE memories SET status = 'superseded'
+           WHERE origin = 'distill' AND body LIKE 'Extra fact%'",
+    )
+    .await;
+    let off = t.len();
+    add(&mut t, "Weaker fact");
+    d.send("shop", "bn1", &t, off, "stop").await;
+    let calls = d.script.distill_calls();
+    d.svc.capture_distill_now("bn1").await.unwrap();
+    until("the last run is over", || d.svc.distill_runs().len() == 1).await;
+    assert_eq!(d.script.distill_calls(), calls + 1);
+    let run = d.svc.distill_runs()[0].clone();
+    assert_eq!((run.stored, run.replaced), (1, 0), "{run:?}");
+    assert_eq!(
+        live(&d),
+        ["Strong fact", "Strong fact", "Weaker fact", "Where things"]
     );
     d.shutdown();
 }
 
 /// Task 12b review, M3: a session's kept memories are counted by their author (the session and
 /// the agent, which a subagent's memories share with their session), not by provenance, so raw
-/// retention deleting the session's chunks does not give a capped session fresh room.
+/// retention deleting the session's chunks does not give a full session fresh room: its next
+/// run is asked about (Task 12c), and the set stays at its size.
 #[tokio::test(flavor = "multi_thread")]
 async fn raw_retention_does_not_reset_a_sessions_cap() {
     let config = "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 3\n\n[capture]\nraw_retention = \"30d\"\n";
@@ -3052,7 +3050,7 @@ async fn raw_retention_does_not_reset_a_sessions_cap() {
     d.send("shop", "rr1", &t, 0, "stop").await;
     d.svc.capture_distill_now("rr1").await.unwrap();
     until("the first run is over", || d.svc.distill_runs().len() == 1).await;
-    assert_eq!(d.distilled().len(), 2, "two, and the handoff's slot");
+    assert_eq!(d.distilled().len(), 3, "the set is full");
     // The session's chunks age out, and their provenance with them.
     d.restart_with(&format!(
         "UPDATE chunks SET created_at = '{0}'
@@ -3091,10 +3089,15 @@ async fn raw_retention_does_not_reset_a_sessions_cap() {
     settle().await;
     assert_eq!(
         d.script.distill_calls(),
-        calls,
-        "still capped: nothing is sent"
+        calls + 1,
+        "a full session is asked"
     );
-    assert_eq!(d.distilled().len(), 2);
+    let live = d
+        .distilled()
+        .into_iter()
+        .filter(|m| m.status != "trashed")
+        .count();
+    assert_eq!(live, 3, "still full, not refilled: {:?}", d.distilled());
     d.shutdown();
 }
 
@@ -3144,36 +3147,18 @@ async fn a_users_preference_that_names_the_repository_stays_in_it() {
     d.shutdown();
 }
 
-/// Task 12b review 2: the handoff-only request keeps `already_saved`, so a capped session whose
-/// last turns hold a handoff the agent already saved (`remember`) is offered it, and a distilled
-/// copy never takes the slot.
+/// Task 12b review 2: a closing run whose last turns hold a handoff the agent already saved
+/// (`remember`) offers `already_saved` beside `handoff`, and the distilled copy is not kept.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_remembered_handoff_is_not_distilled_again() {
-    let config =
-        "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 4\n";
     let d = Daemon::start(
-        Opts {
-            config,
-            ..Opts::jev()
-        },
+        Opts::jev(),
         DistillScript::new(&[
             ("Main fact", "fact"),
             ("Where things stand:", "already_saved"),
         ]),
     );
     let mut t = Transcript::default();
-    for i in 0..4u64 {
-        t.prompt(&format!("rh-p{i}"), &format!("Go on {i}.")).reply(
-            &format!("rh-a{i}"),
-            &format!("Main fact {i}: {}.", words(600 + i, 18)),
-        );
-    }
-    d.send("shop", "rh1", &t, 0, "stop").await;
-    d.svc.capture_distill_now("rh1").await.unwrap();
-    until("the first run is over", || d.svc.distill_runs().len() == 1).await;
-    assert_eq!(d.distilled().len(), 3);
-
-    let off = t.len();
     t.prompt("rh-p4", "Go on 4.")
         .reply("rh-a4", &format!("Main fact 4: {}.", words(604, 18)))
         .prompt("rh-p5", "Save where we are, please.")
@@ -3185,30 +3170,26 @@ async fn a_remembered_handoff_is_not_distilled_again() {
         )
         .tool_result("rh-r5", "toolu_rh5", "saved")
         .reply("rh-a5", HANDOFF);
-    d.send("shop", "rh1", &t, off, "pre-compact").await;
+    d.send("shop", "rh1", &t, 0, "pre-compact").await;
     until("the closing run is over", || {
-        d.svc.distill_runs().len() == 2
+        d.svc.distill_runs().len() == 1
     })
     .await;
-    assert_eq!(d.script.distill_calls(), 2);
+    assert_eq!(d.script.distill_calls(), 1);
+    let asked = d.script.questions();
     let options = last_distill_options(&d.script);
-    assert!(!options.is_empty());
-    for o in &options {
-        assert_eq!(o, &["already_saved", "ephemeral", "handoff", "unclear"]);
-    }
+    let handoff = asked
+        .iter()
+        .position(|q| q.contains("Where things stand:"))
+        .expect("the handoff passage was asked about");
     assert!(
-        d.script
-            .questions()
-            .iter()
-            .any(|q| q.contains("Where things stand:")),
-        "the handoff passage was asked about"
+        options.iter().any(|o| o.contains(&"handoff".to_string())
+            && o.contains(&"already_saved".to_string())),
+        "{options:?}"
     );
-    assert_eq!(
-        d.distilled().len(),
-        3,
-        "nothing is kept: {:?}",
-        d.distilled()
-    );
+    let _ = handoff;
+    let kinds: Vec<String> = d.distilled().into_iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, ["fact"], "the saved handoff is not kept again");
     assert_eq!(d.state(&uri("rh1")).state, "done");
     d.shutdown();
 }

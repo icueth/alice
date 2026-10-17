@@ -15,6 +15,9 @@
 //!   `cargo test -p alice-daemon --test distill_eval distill_eval_live -- --ignored --nocapture`.
 //!   With `ALICE_DISTILL_EVAL_DRY=1` nothing is sent: a scripted Jev answers, and the pipeline runs
 //!   twice and must send the same bodies both times. This is the free check before a live run.
+//! - `distill_eval_long_session_replay` and `distill_eval_long_session_live` (Task 12c): the
+//!   same two for the long-session set in `fixtures/distill/long/` (a session that fills its best
+//!   set), with its own `recorded.jsonl` and checks.
 //! - `distill_eval_flood_replay` and `distill_eval_flood_live` (Task 12b): the same two for the
 //!   flood set in `fixtures/distill/flood/` (twenty reviewer verdicts next to three lessons), with
 //!   its own `recorded.jsonl` and thresholds; Task 13's set and thresholds are not touched. Record
@@ -96,12 +99,19 @@ fn flood_dir() -> PathBuf {
     dir().join("flood")
 }
 
+/// The long-session set (Task 12c, review M4): one session long enough to fill its best set.
+fn long_dir() -> PathBuf {
+    dir().join("long")
+}
+
 // ---- The set ----
 
 #[derive(Debug, Clone)]
 struct Item {
     phrase: String,
     kinds: Vec<String>,
+    /// The long-session set (Task 12c): late in the session, after its best set first filled.
+    late: bool,
 }
 
 /// One `remember` call of the transcript.
@@ -192,6 +202,7 @@ fn load_set_in(dir: &Path) -> Vec<Session> {
                 .unwrap()
                 .iter()
                 .map(|i| Item {
+                    late: i["late"].as_bool().unwrap_or(false),
                     phrase: i["phrase"].as_str().unwrap().to_owned(),
                     kinds: i["kinds"]
                         .as_array()
@@ -578,6 +589,9 @@ struct Outcome {
     /// The cost ledger of the session's daemon: USD and calls (the judge's and distillation's).
     spend_usd: f64,
     calls: i64,
+    /// Distilled memories a better one replaced in the session's best set (trashed by
+    /// `distill:cap`, Task 12c).
+    cap_trashed: usize,
 }
 
 impl Outcome {
@@ -612,11 +626,12 @@ fn db(svc: &Service) -> rusqlite::Connection {
     alice_core::store::open_reader(&svc.home().db()).unwrap()
 }
 
-/// Memories the judge has not settled yet.
+/// Memories the judge has not settled yet. A trashed one is never judged (a distilled memory a
+/// better one replaced in its session's best set, Task 12c, may be trashed before its turn).
 fn unjudged(svc: &Service) -> i64 {
     db(svc)
         .query_row(
-            "SELECT count(*) FROM memories WHERE judge_state <> 'done'",
+            "SELECT count(*) FROM memories WHERE judge_state <> 'done' AND status <> 'trashed'",
             [],
             |r| r.get(0),
         )
@@ -817,6 +832,13 @@ async fn run_session(t: &Arc<EvalTransport>, s: &Session, key: &str, limit: Dura
         .filter(|r| r.uri == uri)
         .map(|r| r.questions)
         .sum();
+    let cap_trashed: i64 = c
+        .query_row(
+            "SELECT count(*) FROM events WHERE action = 'memory.forget' AND actor = 'distill:cap'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     drop(st);
     drop(c);
     let stop = svc.clone();
@@ -828,6 +850,7 @@ async fn run_session(t: &Arc<EvalTransport>, s: &Session, key: &str, limit: Dura
         questions,
         spend_usd,
         calls,
+        cap_trashed: usize::try_from(cap_trashed).unwrap_or(0),
     }
 }
 
@@ -1413,4 +1436,145 @@ async fn distill_eval_flood_live() {
         *t.spent.lock()
     );
     assert_flood(&set, &outcomes, &t);
+}
+
+// ---- The long-session set (Task 12c) ----
+
+/// The distillation questions of every answered request: one list of quoted passages per
+/// request.
+fn asked_passages(t: &EvalTransport) -> Vec<Vec<String>> {
+    t.answered
+        .lock()
+        .iter()
+        .filter_map(|(request, _)| serde_json::from_slice::<Value>(request).ok())
+        .map(|req| {
+            req["questions"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(qid, _)| is_distill_question(qid))
+                .map(|(_, q)| {
+                    quoted_passage(q["instructions"].as_str().unwrap_or_default()).to_owned()
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|q| !q.is_empty())
+        .collect()
+}
+
+/// The long-session set's checks (Task 12c, declared before any run; §11.3's set and thresholds
+/// are not touched): the session is asked about in every run (three); its best set never holds
+/// more than `distill.max_per_session` (16); the late compaction summary's sections are asked
+/// about. Its own figures are printed: kept, the late items kept, replaced (`distill:cap`), and
+/// the verdict or status lines kept.
+fn assert_long(set: &[Session], outcomes: &[Outcome], t: &EvalTransport) {
+    let (s, o) = (&set[0], &outcomes[0]);
+    let live: Vec<&Mem> = o.memories.iter().filter(|m| m.live()).collect();
+    let late: Vec<&Item> = s.items.iter().filter(|i| i.late).collect();
+    let late_kept = late
+        .iter()
+        .filter(|i| live.iter().any(|m| m.matches(i)))
+        .count();
+    let early_kept = s
+        .items
+        .iter()
+        .filter(|i| !i.late && live.iter().any(|m| m.matches(i)))
+        .count();
+    let verdicts_kept = live
+        .iter()
+        .filter(|m| s.verdicts.iter().any(|v| m.passage().contains(v.as_str())))
+        .count();
+    let requests = asked_passages(t);
+    println!(
+        "long session: {} requests, {} questions; kept {} (of {} distilled); late items kept {late_kept} of {}, early {early_kept} of {}; replaced (distill:cap) {}; verdicts kept {verdicts_kept} of {}",
+        requests.len(),
+        o.questions,
+        live.len(),
+        o.memories.len(),
+        late.len(),
+        s.items.len() - late.len(),
+        o.cap_trashed,
+        s.verdicts.len()
+    );
+    for m in &live {
+        println!("+ {} «{}»", m.kind, m.title);
+    }
+    assert_eq!(
+        requests.len(),
+        3,
+        "one request per run, a full session's too"
+    );
+    assert!(live.len() <= 16, "the best set's size: {}", live.len());
+    for phrase in [
+        "sends a comment line every 15 seconds so the proxy flushes",
+        "Weather alerts use the met office's warnings API, not scraping",
+        "writes a draft first and commits only on save",
+        "report their status over MQTT on topic cranes/<id>/status",
+    ] {
+        assert!(
+            requests.iter().flatten().any(|q| q.contains(phrase)),
+            "the late summary's section is asked about: {phrase}"
+        );
+    }
+}
+
+/// The long-session set replayed (Task 12c, review M4): a session long enough to fill its best
+/// set (three runs), with lasting knowledge early, in the middle and late (a late compaction
+/// summary), and status lines in between. Every request is answered from
+/// `fixtures/distill/long/recorded.jsonl`, and the set's checks run. Until the live run records
+/// the file, every request misses and the test fails on that alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn distill_eval_long_session_replay() {
+    let set = load_set_in(&long_dir());
+    let recorded = load_recorded_from(&long_dir().join("recorded.jsonl"));
+    let keys: HashSet<String> = recorded.keys().cloned().collect();
+    let t = EvalTransport::new(Mode::Replay(recorded));
+    let outcomes = run_all(&t, &set, FAKE_KEY, Duration::from_secs(60)).await;
+    t.check("after the long session");
+    let asked: HashSet<String> = t.hashes().into_iter().collect();
+    let mut unused: Vec<&String> = keys.difference(&asked).collect();
+    unused.sort();
+    assert!(
+        unused.is_empty(),
+        "recorded answers no request asked for, so the pipeline no longer sends what \
+         long/recorded.jsonl holds (record it again with the live run): {unused:?}"
+    );
+    assert_long(&set, &outcomes, &t);
+}
+
+/// The long-session set with the real Jev, once (Task 12c): it writes
+/// `fixtures/distill/long/recorded.jsonl` and stops once its spend passes $0.10, or
+/// `ALICE_DISTILL_EVAL_STOP_USD`:
+/// `cargo test -p alice-daemon --test distill_eval distill_eval_long_session_live -- --ignored --nocapture`.
+/// With `ALICE_DISTILL_EVAL_DRY=1`, the free dry check instead.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "network: the real Jev, with TYPESAFE_API_KEY; rewrites fixtures/distill/long/recorded.jsonl"]
+async fn distill_eval_long_session_live() {
+    let set = load_set_in(&long_dir());
+    if std::env::var_os(DRY_ENV).is_some() {
+        let (t, outcomes) = dry_run(&set).await;
+        assert_long(&set, &outcomes, &t);
+        return;
+    }
+    // Never printed: an unset or non-UTF-8 value names only the variable.
+    let key = std::env::var("TYPESAFE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .unwrap_or_else(|| panic!("set TYPESAFE_API_KEY (the key is never printed)"));
+    let t = EvalTransport::new(Mode::Live(ReqwestTransport::new().unwrap()));
+    let outcomes = {
+        let _recorder = Recorder {
+            t: t.clone(),
+            key: key.clone(),
+            path: long_dir().join("recorded.jsonl"),
+        };
+        run_all(&t, &set, &key, Duration::from_secs(300)).await
+    };
+    t.check("after the long session");
+    println!(
+        "Jev requests sent: {}; spend by Jev's usage ${:.4}",
+        t.latencies_ms.lock().len(),
+        *t.spent.lock()
+    );
+    assert_long(&set, &outcomes, &t);
 }
