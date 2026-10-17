@@ -806,8 +806,10 @@ A **run** covers the source's chunks from `distill_ord` on, plus the new chunks 
   that closes the trailing turn, or without one for a source it cannot read (no transcript path, or the file is gone),
   and on a server tenant the distill worker's. Any stale end makes the session due only when it, or a subagent of it,
   captured within the last 7 days plus the stale age (8 days by default; for a final pass, the session's last capture
-  before that pass counts). An older one waits for `alice capture distill`, so a long downtime, a restored backup,
-  turning distillation on or adopting a database makes no backlog (Task 11b and its review);
+  before that pass counts). An older one waits for `alice capture distill`, so a long downtime, turning distillation
+  on or adopting a database makes no backlog (Task 11b and its review). A restored backup makes almost none: a final
+  job of more than one pass (over 8 MiB unread), or a subagent whose own final pass captured first, can still mark an
+  old open session due, at most the sessions that were open in that backup;
 - a `PreCompact` arrived;
 - it has been quiet for `distill.idle_minutes` (default 15) and holds at least one undistilled complete turn; or
 - someone runs `alice capture distill <session>`.
@@ -1316,7 +1318,7 @@ SP2 needs these from `deploy/server/alice-server` (pane 3). SP2 does not edit th
 | Daemon down when a hook fires | The notify is spooled and the daemon is started detached. The hook exits 0 within its budget, and the drained notify triggers a pass from the cursor |
 | Daemon killed mid-pass | The cursor and turn keys commit with each turn's last slice. The next pass re-renders the open turn identically, and `(source, ord)` drops the repeats |
 | Transcript lags at `Stop` | 1.5 s settle (2 s in the tenant script). A message that still arrives late is captured at the next pass |
-| Agent crashes (no `SessionEnd`) | The sweep marks the source ended after 24 h and makes a final pass. A source it cannot read (no transcript path, or the file is gone) is ended without a final pass, as a server tenant's distill worker ends a source with no capture for 24 h. Any of these stale ends makes the session due for distillation when it captured within the last 7 days plus the stale age (8 days by default); an older one waits for `alice capture distill`, so a long downtime or a restored backup makes no backlog (Task 11b and its review) |
+| Agent crashes (no `SessionEnd`) | The sweep marks the source ended after 24 h and makes a final pass. A source it cannot read (no transcript path, or the file is gone) is ended without a final pass, as a server tenant's distill worker ends a source with no capture for 24 h. Any of these stale ends makes the session due for distillation when it captured within the last 7 days plus the stale age (8 days by default); an older one waits for `alice capture distill`, so a long downtime makes no backlog (Task 11b and its review). After a restored backup, a final job of more than one pass (over 8 MiB unread), or a subagent whose own final pass captured first, can still mark an old open session due, at most the sessions that were open in that backup |
 | Unknown or malformed line | Skipped and counted. A turn with only skipped lines leaves no chunk. `alice doctor` warns when a reader skipped a large share of a file (format drift) |
 | Line over 4 MiB | Skipped with a stub in its turn |
 | Transcript file replaced or truncated | The cursor resets to 0; turn dedupe skips stored turns |

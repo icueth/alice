@@ -3319,7 +3319,7 @@ async fn a_users_preference_the_agent_saved_in_the_project_is_trashed_as_its_dup
 }
 
 /// Task 11b (c), spec §6.2 and §10: a stale end makes the session due, as a session end does,
-/// when it captured within the last week before going stale. One captured 2 days ago is
+/// when it captured within the last 7 days plus the stale age. One captured 2 days ago is
 /// distilled as a closed session (its handoff is offered); one captured 30 days ago is ended but
 /// not marked, so turning capture or distillation on makes no backlog. The quiet trigger is held
 /// off (a year of quiet), so only the stale end can mark them. `tenant`: the distill worker's
