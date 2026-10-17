@@ -8,8 +8,10 @@
 //! stands in for the judge asked for, or answers because that judge failed, only suggests.
 //!
 //! A distilled newcomer (SP2 spec §6.6) never asks a person and never replaces an explicit
-//! memory: one it duplicates or updates is what it duplicates (Task 11b). An explicit newcomer
-//! replaces its older distilled duplicates. See `decide_distilled`.
+//! memory: one it duplicates or updates is what it duplicates (Task 11b). See
+//! `decide_distilled`. An explicit newcomer wins over its distilled matches without asking
+//! either (final review B-I1): it replaces a distilled duplicate and supersedes a distilled
+//! memory it updates or contradicts, in any band from the review threshold.
 
 use super::{JudgeMemory, Relation};
 use crate::model::Origin;
@@ -33,8 +35,9 @@ pub enum JudgeAction {
     /// A `relates_to` link: what a distilled newcomer gets where an explicit one would be asked
     /// whether it updates an older distilled memory (SP2 spec §6.6).
     RelatesTo { other: String, p: f64 },
-    /// The new memory, an explicit one, replaces its older `distilled` duplicate: the distilled
-    /// one is trashed and points to it (SP2 spec §6.6).
+    /// The new memory, an explicit one, replaces its older `distilled` duplicate (from the
+    /// review threshold): the distilled one is trashed and points to it, and nobody is asked
+    /// (SP2 spec §6.6; final review B-I1).
     ReplaceDistilled { distilled: String, p: f64 },
 }
 
@@ -73,18 +76,10 @@ fn merge_review(new_id: &str, survivor: &str, p: f64, provider: &str) -> NewRevi
     }
 }
 
-/// [`merge_review`] the other way round: the new (explicit) memory survives its older
-/// `distilled` duplicate.
-fn replace_review(new_id: &str, distilled: &str, p: f64, provider: &str) -> NewReview {
-    NewReview {
-        payload: serde_json::json!({"survivor": new_id, "others": [distilled], "p": p, "provider": provider}),
-        ..merge_review(new_id, distilled, p, provider)
-    }
-}
-
 /// What to do with `new` given how it relates to `relations` (decided by `provider`).
 /// With `review_only` nothing is applied: every result at or above the review threshold becomes
-/// a review item. A distilled newcomer follows [`decide_distilled`].
+/// a review item, but for a distilled match, which is never asked about (final review B-I1). A
+/// distilled newcomer follows [`decide_distilled`].
 pub fn decide(
     new: &JudgeMemory,
     relations: &[Relation],
@@ -104,12 +99,13 @@ pub fn decide(
             .map(|(_, p)| p)
     };
     let mut out = Decided::default();
+    let distilled = |r: &&Relation| r.existing_origin == Origin::Distill;
     // A confident duplicate settles it: the new memory goes to the trash and nothing else about
     // it matters. An explicit memory is never lost to a distilled copy, so only an explicit
     // older memory survives it.
     if let Some((r, p)) = relations
         .iter()
-        .filter(|r| r.existing_origin != Origin::Distill)
+        .filter(|r| !distilled(r))
         .filter_map(|r| confident(r).map(|p| (r, p)))
         .max_by(|a, b| a.1.total_cmp(&b.1))
     {
@@ -119,26 +115,34 @@ pub fn decide(
         });
         return out;
     }
-    // An older distilled duplicate is replaced by the new memory, which stays: the rest of its
-    // relations still count.
-    let mut replaced: Vec<&str> = Vec::new();
-    for r in relations
-        .iter()
-        .filter(|r| r.existing_origin == Origin::Distill)
-    {
-        if let Some(p) = confident(r) {
-            out.actions.push(JudgeAction::ReplaceDistilled {
-                distilled: r.existing_id.clone(),
-                p,
-            });
-            replaced.push(&r.existing_id);
-        }
-    }
-    for r in relations {
+    // Its distilled matches: the new memory, which stays, wins each one from the review
+    // threshold, whatever the band, and nobody is asked (SP2 spec §6.6, R19; final review
+    // B-I1). A duplicate goes to the trash as its duplicate; an update or a contradiction is
+    // superseded by it. The heuristic replaces the same text only and leaves the rest alone, and
+    // a stand-in decides nothing about them: the new memory is judged again (R2).
+    for r in relations.iter().filter(distilled) {
         let Some((kind, p)) = strongest(r) else {
             continue;
         };
-        if p < t.review || replaced.contains(&r.existing_id.as_str()) {
+        if p < t.review || review_only {
+            continue;
+        }
+        let distilled = r.existing_id.clone();
+        match kind {
+            "duplicate" if !heuristic || r.agreement == Some(true) => out
+                .actions
+                .push(JudgeAction::ReplaceDistilled { distilled, p }),
+            "updates" | "contradicts" if !heuristic => out
+                .actions
+                .push(JudgeAction::Supersedes { old: distilled, p }),
+            _ => {}
+        }
+    }
+    for r in relations.iter().filter(|r| !distilled(r)) {
+        let Some((kind, p)) = strongest(r) else {
+            continue;
+        };
+        if p < t.review {
             continue;
         }
         let old = r.existing_id.clone();
@@ -149,9 +153,6 @@ pub fn decide(
             "updates" => out
                 .reviews
                 .push(supersede_review(&new.id, &old, p, provider)),
-            "duplicate" if r.existing_origin == Origin::Distill => {
-                out.reviews.push(replace_review(&new.id, &old, p, provider))
-            }
             "duplicate" => out.reviews.push(merge_review(&new.id, &old, p, provider)),
             "contradicts" => {
                 if !review_only {
@@ -306,20 +307,20 @@ fn numbers(text: &str) -> std::collections::BTreeSet<String> {
 }
 
 /// The review item that asks about `action` instead of applying it (its target changed before
-/// it could be applied). A distilled newcomer's actions are never asked about (the writer drops
-/// them instead).
+/// it could be applied). A distilled newcomer's actions are never asked about, nor an explicit
+/// newcomer's on a distilled memory (final review B-I1): the writer drops them instead. A
+/// replacement is only ever of a distilled memory; for a supersede the writer checks.
 pub fn as_review(new_id: &str, action: &JudgeAction, provider: &str) -> Option<NewReview> {
     match action {
         JudgeAction::Supersedes { old, p } => Some(supersede_review(new_id, old, *p, provider)),
         JudgeAction::DuplicateOf { survivor, p } => {
             Some(merge_review(new_id, survivor, *p, provider))
         }
-        JudgeAction::ReplaceDistilled { distilled, p } => {
-            Some(replace_review(new_id, distilled, *p, provider))
-        }
         // `decide` already asked about the contradiction; a link between a distilled memory and
         // another is never asked about.
-        JudgeAction::Contradicts { .. } | JudgeAction::RelatesTo { .. } => None,
+        JudgeAction::ReplaceDistilled { .. }
+        | JudgeAction::Contradicts { .. }
+        | JudgeAction::RelatesTo { .. } => None,
     }
 }
 
@@ -937,47 +938,19 @@ mod tests {
                 p: 0.99
             }]
         );
-        // A middle-band duplicate is asked as today, with the explicit newcomer as the
-        // survivor; so is the heuristic's near twin and a stand-in's guess.
-        for (r, provider, review_only) in [
-            (
-                rel_distilled("D", &[("duplicate", 0.6), ("unrelated", 0.4)]),
+        // Its target edited before it is applied, a replacement is dropped, never asked about
+        // (final review B-I1); nor is a `relates_to` link.
+        assert!(
+            as_review(
+                "NEW",
+                &JudgeAction::ReplaceDistilled {
+                    distilled: "D".into(),
+                    p: 0.95,
+                },
                 "jev",
-                false,
-            ),
-            (
-                rel_distilled("D", &[("duplicate", 0.99), ("unrelated", 0.01)]),
-                "heuristic",
-                false,
-            ),
-            (exact.clone(), "heuristic", true),
-        ] {
-            let d = decide(&new(), std::slice::from_ref(&r), &T, provider, review_only);
-            assert!(d.actions.is_empty(), "{r:?}");
-            assert_eq!(d.reviews.len(), 1, "{r:?}");
-            let m = &d.reviews[0];
-            assert_eq!(m.kind, ReviewType::Merge);
-            assert_eq!(m.payload["survivor"], "NEW", "{r:?}");
-            assert_eq!(m.payload["others"], serde_json::json!(["D"]));
-            assert_eq!(m.dedupe_key.as_deref(), Some("merge:D:NEW"));
-        }
-        // Its target edited before it is applied, a replacement becomes the same question; a
-        // `relates_to` link is never asked about.
-        let m = as_review(
-            "NEW",
-            &JudgeAction::ReplaceDistilled {
-                distilled: "D".into(),
-                p: 0.95,
-            },
-            "jev",
-        )
-        .unwrap();
-        assert_eq!(m.kind, ReviewType::Merge);
-        assert_eq!(
-            (&m.payload["survivor"], &m.payload["others"]),
-            (&serde_json::json!("NEW"), &serde_json::json!(["D"]))
+            )
+            .is_none()
         );
-        assert_eq!(m.dedupe_key.as_deref(), Some("merge:D:NEW"));
         assert!(
             as_review(
                 "NEW",
@@ -989,6 +962,191 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Final review B-I1 (spec §6.6, R19): an explicit newcomer settles each distilled match at
+    /// the review threshold or above without asking anyone, whatever the band. It survives a
+    /// duplicate (trashed as its duplicate) and supersedes an update or a contradiction: the
+    /// explicit memory wins, and both never stay live. The heuristic replaces the same text
+    /// only and leaves the rest alone; a stand-in decides nothing about a distilled match (the
+    /// newcomer is judged again, R2). Its explicit matches are asked about as before.
+    #[test]
+    fn an_explicit_newcomer_settles_its_distilled_matches_without_asking() {
+        let replace = |p: f64| {
+            vec![JudgeAction::ReplaceDistilled {
+                distilled: "D".into(),
+                p,
+            }]
+        };
+        let supersede = |p: f64| vec![JudgeAction::Supersedes { old: "D".into(), p }];
+        let d_rel = |k: &str, p: f64| rel_distilled("D", &[(k, p), ("unrelated", 1.0 - p)]);
+        let exact = |k: &str, p: f64| Relation {
+            agreement: Some(true),
+            ..d_rel(k, p)
+        };
+        // (what, relation, provider, review_only, actions wanted)
+        type Case = (&'static str, Relation, &'static str, bool, Vec<JudgeAction>);
+        let cases: Vec<Case> = vec![
+            (
+                "duplicate >= auto",
+                d_rel("duplicate", 0.95),
+                "jev",
+                false,
+                replace(0.95),
+            ),
+            (
+                "duplicate between review and auto (Task 13's 0.6)",
+                d_rel("duplicate", 0.6),
+                "jev",
+                false,
+                replace(0.6),
+            ),
+            (
+                "duplicate at the review threshold exactly",
+                d_rel("duplicate", 0.5),
+                "jev",
+                false,
+                replace(0.5),
+            ),
+            (
+                "updates >= auto",
+                d_rel("updates", 0.9),
+                "jev",
+                false,
+                supersede(0.9),
+            ),
+            (
+                "updates between review and auto",
+                d_rel("updates", 0.6),
+                "jev",
+                false,
+                supersede(0.6),
+            ),
+            (
+                "contradicts between review and auto",
+                d_rel("contradicts", 0.6),
+                "jev",
+                false,
+                supersede(0.6),
+            ),
+            (
+                "contradicts >= auto",
+                d_rel("contradicts", 0.9),
+                "jev",
+                false,
+                supersede(0.9),
+            ),
+            (
+                "below the review threshold",
+                d_rel("duplicate", 0.4),
+                "jev",
+                false,
+                vec![],
+            ),
+            (
+                "the heuristic's same text",
+                exact("duplicate", 0.99),
+                "heuristic",
+                false,
+                replace(0.99),
+            ),
+            (
+                "the heuristic's near twin",
+                d_rel("duplicate", 0.99),
+                "heuristic",
+                false,
+                vec![],
+            ),
+            (
+                "the heuristic's update",
+                d_rel("updates", 0.9),
+                "heuristic",
+                false,
+                vec![],
+            ),
+            (
+                "the heuristic's contradiction",
+                d_rel("contradicts", 0.9),
+                "heuristic",
+                false,
+                vec![],
+            ),
+            (
+                "a stand-in's same text",
+                exact("duplicate", 0.99),
+                "heuristic",
+                true,
+                vec![],
+            ),
+            (
+                "a stand-in's near twin",
+                d_rel("duplicate", 0.7),
+                "heuristic",
+                true,
+                vec![],
+            ),
+            (
+                "a stand-in's contradiction",
+                d_rel("contradicts", 0.9),
+                "heuristic",
+                true,
+                vec![],
+            ),
+        ];
+        for (what, r, provider, review_only, want) in cases {
+            let d = decide(&new(), std::slice::from_ref(&r), &T, provider, review_only);
+            assert!(d.reviews.is_empty(), "{what}: {:?}", d.reviews);
+            assert_eq!(d.actions, want, "{what}");
+        }
+        // Beside an explicit match: the distilled one is settled, the explicit one asked about.
+        let d = decide(
+            &new(),
+            &[
+                d_rel("duplicate", 0.6),
+                rel("A", &[("duplicate", 0.6), ("unrelated", 0.4)]),
+            ],
+            &T,
+            "jev",
+            false,
+        );
+        assert_eq!(d.actions, replace(0.6));
+        assert_eq!(d.reviews.len(), 1, "{:?}", d.reviews);
+        assert_eq!(d.reviews[0].kind, ReviewType::Merge);
+        assert_eq!(d.reviews[0].payload["survivor"], "A");
+        // A stand-in still asks about the explicit match only.
+        let d = decide(
+            &new(),
+            &[
+                exact("duplicate", 0.99),
+                rel("A", &[("duplicate", 0.99), ("unrelated", 0.01)]),
+            ],
+            &T,
+            "heuristic",
+            true,
+        );
+        assert!(d.actions.is_empty(), "{:?}", d.actions);
+        assert_eq!(d.reviews.len(), 1, "{:?}", d.reviews);
+        assert_eq!(d.reviews[0].payload["survivor"], "A");
+        // A confident explicit duplicate settles the newcomer first: it goes, and its distilled
+        // match is left as it is (it was judged against that explicit memory when it came).
+        let d = decide(
+            &new(),
+            &[
+                d_rel("updates", 0.6),
+                rel("A", &[("duplicate", 0.95), ("unrelated", 0.05)]),
+            ],
+            &T,
+            "jev",
+            false,
+        );
+        assert_eq!(
+            d.actions,
+            vec![JudgeAction::DuplicateOf {
+                survivor: "A".into(),
+                p: 0.95
+            }]
+        );
+        assert!(d.reviews.is_empty());
     }
 
     /// The controller's ruling P3 (Task 12c): a distilled newcomer that holds more than its match

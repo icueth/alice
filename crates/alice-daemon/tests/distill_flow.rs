@@ -59,9 +59,9 @@ struct DistillScript {
     bodies: Mutex<Vec<String>>,
     /// The probability of a distillation answer's option (1.0); the rest goes to `ephemeral`.
     top: Mutex<f64>,
-    /// `(phrase, relation)`: the judge's comparison of a new memory with an existing one that
-    /// both hold `phrase` is answered with `relation` (all the probability on it).
-    relations: Mutex<Vec<(&'static str, &'static str)>>,
+    /// `(phrase, relation, p)`: the judge's comparison of a new memory with an existing one
+    /// that both hold `phrase` is answered with `relation` at `p`, the rest on `unrelated`.
+    relations: Mutex<Vec<(&'static str, &'static str, f64)>>,
     /// The judge's requests are answered with 503 (distillation's are not).
     judge_down: std::sync::atomic::AtomicBool,
     /// `(phrase, p)`: the probability of the option for a passage that holds `phrase`, in place
@@ -94,13 +94,19 @@ impl DistillScript {
     /// The judge compares a new memory with an existing one that both hold `phrase`: they are
     /// `relation` (`duplicate`, `updates`, `contradicts`).
     fn relate(&self, phrase: &'static str, relation: &'static str) {
-        self.relations.lock().push((phrase, relation));
+        self.relate_p(phrase, relation, 1.0);
     }
 
-    /// The scripted relation for the judge's question `qid` (`fwd_<k>` or `rev_<k>`) of a
-    /// comparison whose state is `state`: the one whose phrase both the new memory and existing
-    /// memory `k` hold, as the reversed question words it.
-    fn relation(&self, qid: &str, state: &str) -> Option<&'static str> {
+    /// [`DistillScript::relate`] at probability `p`, the rest on `unrelated` (a judge in the
+    /// band between `judge.review_threshold` and `judge.auto_apply_threshold`).
+    fn relate_p(&self, phrase: &'static str, relation: &'static str, p: f64) {
+        self.relations.lock().push((phrase, relation, p));
+    }
+
+    /// The scripted relation and its probability for the judge's question `qid` (`fwd_<k>` or
+    /// `rev_<k>`) of a comparison whose state is `state`: the one whose phrase both the new
+    /// memory and existing memory `k` hold, as the reversed question words it.
+    fn relation(&self, qid: &str, state: &str) -> Option<(&'static str, f64)> {
         let (k, reversed) = match (qid.strip_prefix("fwd_"), qid.strip_prefix("rev_")) {
             (Some(k), _) => (k, false),
             (_, Some(k)) => (k, true),
@@ -110,17 +116,20 @@ impl DistillScript {
         let new = blocks.next()?;
         let existing =
             blocks.find(|b| b.strip_prefix(k).is_some_and(|rest| rest.starts_with(" (")))?;
-        let relation = self
+        let (relation, p) = self
             .relations
             .lock()
             .iter()
-            .find(|(phrase, _)| new.contains(phrase) && existing.contains(phrase))
-            .map(|(_, r)| *r)?;
-        Some(if reversed && relation == "updates" {
-            "outdated_by"
-        } else {
-            relation
-        })
+            .find(|(phrase, _, _)| new.contains(phrase) && existing.contains(phrase))
+            .map(|(_, r, p)| (*r, *p))?;
+        Some((
+            if reversed && relation == "updates" {
+                "outdated_by"
+            } else {
+                relation
+            },
+            p,
+        ))
     }
 
     fn set_outage(&self, o: Outage) {
@@ -208,6 +217,8 @@ impl JevTransport for DistillScript {
             let options: Vec<String> = q["criteria"].as_object().unwrap().keys().cloned().collect();
             let offered = |o: &str| options.iter().any(|x| x == o);
             let text = q["instructions"].as_str().unwrap_or_default();
+            // The probability of a scripted relation (all of it unless the test says).
+            let mut related = None;
             let choice: String = if is_distill_question(qid) {
                 let want = self
                     .answers
@@ -215,10 +226,11 @@ impl JevTransport for DistillScript {
                     .find(|(phrase, _)| text.contains(phrase))
                     .map_or("ephemeral", |(_, o)| *o);
                 if offered(want) { want } else { "ephemeral" }.to_string()
-            } else if let Some(r) = self
+            } else if let Some((r, p)) = self
                 .relation(qid, req["state"].as_str().unwrap_or_default())
-                .filter(|r| offered(r))
+                .filter(|(r, _)| offered(r))
             {
+                related = Some(p);
                 r.to_string()
             } else {
                 // The judge's own questions: nothing to act on.
@@ -234,14 +246,20 @@ impl JevTransport for DistillScript {
                     .find(|(phrase, _)| text.contains(phrase))
                     .map_or(*self.top.lock(), |(_, p)| *p)
             } else {
-                1.0
+                related.unwrap_or(1.0)
+            };
+            // Where the rest of the probability goes.
+            let rest = if is_distill_question(qid) {
+                "ephemeral"
+            } else {
+                "unrelated"
             };
             let probs: serde_json::Map<String, serde_json::Value> = options
                 .iter()
                 .map(|o| {
                     let p = if *o == choice {
                         top
-                    } else if o == "ephemeral" {
+                    } else if o == rest {
                         1.0 - top
                     } else {
                         0.0
@@ -3867,6 +3885,99 @@ async fn a_users_preference_the_agent_saved_in_the_project_is_trashed_as_its_dup
             .unwrap();
         assert_eq!(&to, survivor, "{m:?}");
     }
+    let live: i64 = c
+        .query_row(
+            "SELECT count(*) FROM memories WHERE origin = 'agent' AND status = 'active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 2, "the agent's memories stay");
+    let reviews: i64 = c
+        .query_row("SELECT count(*) FROM review_items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(reviews, 0, "nothing is asked");
+    d.shutdown();
+}
+
+/// Final review B-I1 (spec §6.6, R19), the order §11.3's doubles never measure: a session is
+/// distilled first, and then the agent saves the same lessons in its own words. Jev, unsure,
+/// calls the agent's decision a duplicate of the distilled one at 0.6 and its bugfix an update
+/// of the distilled one at 0.7, both between `judge.review_threshold` and
+/// `judge.auto_apply_threshold`. The agent's memories win, and nobody is asked: the distilled
+/// decision goes to the trash as the agent's duplicate, the distilled bugfix is superseded by
+/// the agent's, and no review item is opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_memory_saved_after_distilling_wins_without_a_question() {
+    const PNPM: &str = "pnpm workspaces";
+    const CLOCK: &str = "clock mock";
+    let d = Daemon::start(Opts::jev(), DistillScript::new(ANSWERS));
+    d.script.relate_p(PNPM, "duplicate", 0.6);
+    d.script.relate_p(CLOCK, "updates", 0.7);
+    let t = decision_and_bugfix("xa1");
+    d.send("shop", "xa1", &t, 0, "session-end").await;
+    until("both distilled memories are judged", || {
+        d.distilled().len() == 2 && settled(&d)
+    })
+    .await;
+    assert!(d.distilled().iter().all(|m| m.status == "active"));
+
+    let mut saved = Vec::new();
+    for (title, content, kind) in [
+        (
+            "Use pnpm workspaces",
+            "The workspace uses pnpm workspaces for every package, since npm hoisting broke the lockfile.",
+            alice_core::model::Kind::Decision,
+        ),
+        (
+            "Reset the clock mock",
+            "The lease renewal test needs the clock mock reset in the shared setup hook, or its expiry check reads a stale time.",
+            alice_core::model::Kind::Bugfix,
+        ),
+    ] {
+        let m = d
+            .svc
+            .remember(RememberRequest {
+                content: content.into(),
+                title: Some(title.into()),
+                kind: Some(kind),
+                cwd: Some(d.repo("shop").to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        saved.push(m.id.expect("a new memory"));
+    }
+    let judged = |id: &str| -> bool {
+        d.db()
+            .query_row(
+                "SELECT judge_state = 'done' FROM memories WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    until("the agent's memories are judged", || {
+        saved.iter().all(|id| judged(id))
+    })
+    .await;
+
+    let c = d.db();
+    let link = |from: &str, to: &str, kind: &str| -> i64 {
+        c.query_row(
+            "SELECT count(*) FROM links WHERE from_id = ?1 AND to_id = ?2 AND type = ?3",
+            [from, to, kind],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let mems = d.distilled();
+    let decision = mems.iter().find(|m| m.body.contains(PNPM)).unwrap();
+    let bugfix = mems.iter().find(|m| m.body.contains(CLOCK)).unwrap();
+    assert_eq!(decision.status, "trashed", "{decision:?}");
+    assert_eq!(link(&decision.id, &saved[0], "duplicate_of"), 1);
+    assert_eq!(bugfix.status, "superseded", "{bugfix:?}");
+    assert_eq!(link(&saved[1], &bugfix.id, "supersedes"), 1);
     let live: i64 = c
         .query_row(
             "SELECT count(*) FROM memories WHERE origin = 'agent' AND status = 'active'",

@@ -303,8 +303,9 @@ machine-extracted: rely on it as you would on a note you did not write.
   as a duplicate; an uncertain update of another distilled memory, or a contradiction, becomes a link between the two
   memories, without a question.
 - **Your memories win.** A distilled memory never replaces one an agent or you wrote. When the judge finds that the two
-  say the same thing, yours stays and the distilled one goes to the trash, whichever came first; so does a distilled
-  memory that only updates yours. One that holds more than yours (more than twice the text, when the judge is not
+  say the same thing, yours stays and the distilled one goes to the trash, whichever came first, even when the judge
+  is unsure; so does a distilled memory that only updates yours. When yours came later and updates or contradicts a
+  distilled memory, yours replaces it (the distilled one is superseded). None of this asks you anything. One that holds more than yours (more than twice the text, when the judge is not
   sure, or a number yours does not state) is kept and linked to yours instead. A preference of yours filed under `global` is compared with the memories of the
   session's project too, where your agent may have saved it (unless the cloud policy keeps that project at home).
 - **Hidden until judged.** Recall and the briefing skip a distilled memory until the judge has looked at it, so a near

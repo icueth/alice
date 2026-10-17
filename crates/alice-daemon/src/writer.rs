@@ -2449,8 +2449,11 @@ fn apply_judgement(conn: &Connection, st: &mut State, j: Judgement) -> Result<Wr
         match target_state(conn, &j.seen, target)? {
             Target::Unchanged => {}
             Target::Edited => {
-                // Edited since it was judged: ask instead of acting (a distilled memory drops it).
+                // Edited since it was judged: ask instead of acting. A distilled newcomer drops
+                // it, and so does an explicit one acting on a distilled memory (final review
+                // B-I1): a distilled memory never asks a person.
                 if !distilled_newcomer
+                    && !is_distilled_id(conn, target)?
                     && let Some(r) = alice_core::judge::pipeline::as_review(&j.id, a, &j.provider)
                 {
                     reviews.push(r);
@@ -2625,6 +2628,18 @@ fn is_distilled(conn: &Connection, seq: i64) -> Result<bool> {
         .query_row(
             "SELECT origin = ?1 FROM memories WHERE seq = ?2",
             rusqlite::params![Origin::Distill.as_str(), seq],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// Whether the memory `id` was distilled from a captured session (SP2 spec §6.5).
+fn is_distilled_id(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT origin = ?1 FROM memories WHERE id = ?2",
+            rusqlite::params![Origin::Distill.as_str(), id],
             |r| r.get(0),
         )
         .optional()?
@@ -5292,76 +5307,75 @@ mod tests {
         assert_eq!(judge_state_of(&f, &auto).0, "done", "judged all the same");
     }
 
-    /// SP2 spec §6.6, R4: an explicit newcomer's replacement of a distilled duplicate that
-    /// changed after the judge read it is not applied; it becomes the merge question, with the
-    /// explicit newcomer as the survivor.
+    /// SP2 spec §6.6, R4, R19 (final review B-I1): an explicit newcomer's action on a distilled
+    /// match that changed after the judge read it (its replacement as a duplicate, or its
+    /// supersede) is not applied, and it is dropped: a distilled memory never costs a person a
+    /// question.
     #[test]
-    fn a_stale_distilled_duplicate_of_an_explicit_newcomer_is_asked_about() {
-        let f = fixture();
-        let (auto, auto_seq) = new_id(
-            f.h.submit_blocking(WriteOp::Remember {
-                input: NewMemoryInput {
-                    content: "Staging Postgres listens on port 5432".into(),
-                    origin: Origin::Distill,
+    fn a_stale_action_of_an_explicit_newcomer_on_a_distilled_match_is_dropped() {
+        for supersede in [false, true] {
+            let f = fixture();
+            let (auto, auto_seq) = new_id(
+                f.h.submit_blocking(WriteOp::Remember {
+                    input: NewMemoryInput {
+                        content: "Staging Postgres listens on port 5432".into(),
+                        origin: Origin::Distill,
+                        ..Default::default()
+                    },
+                    project: ProjectChoice::Slug("global".into()),
+                })
+                .unwrap(),
+            );
+            judged(&f, &auto, auto_seq);
+            let (mine, _) = new_id(
+                f.h.submit_blocking(remember("The staging Postgres server listens on 5432"))
+                    .unwrap(),
+            );
+            let auto_hash = hash_of(&f, &auto);
+            // The distilled memory is edited after the judge read it.
+            f.h.submit_blocking(WriteOp::Update {
+                id: auto.clone(),
+                update: MemoryUpdate {
+                    body: Some("Staging Postgres listens on port 6543".into()),
                     ..Default::default()
                 },
-                project: ProjectChoice::Slug("global".into()),
+                actor: Actor::User,
             })
-            .unwrap(),
-        );
-        judged(&f, &auto, auto_seq);
-        let (mine, _) = new_id(
-            f.h.submit_blocking(remember("The staging Postgres server listens on 5432"))
-                .unwrap(),
-        );
-        let auto_hash = hash_of(&f, &auto);
-        // The distilled memory is edited after the judge read it.
-        f.h.submit_blocking(WriteOp::Update {
-            id: auto.clone(),
-            update: MemoryUpdate {
-                body: Some("Staging Postgres listens on port 6543".into()),
-                ..Default::default()
-            },
-            actor: Actor::User,
-        })
-        .unwrap();
-        apply_j(
-            &f,
-            Judgement {
-                actions: vec![JudgeAction::ReplaceDistilled {
+            .unwrap();
+            let action = if supersede {
+                JudgeAction::Supersedes {
+                    old: auto.clone(),
+                    p: 0.6,
+                }
+            } else {
+                JudgeAction::ReplaceDistilled {
                     distilled: auto.clone(),
                     p: 0.95,
-                }],
-                seen: vec![(auto.clone(), auto_hash)],
-                ..judgement(&f, &mine, "jev")
-            },
-        );
-        assert_eq!(
-            status_of(&f, &auto),
-            "active",
-            "not merged on stale information"
-        );
-        let merged: i64 = f.read(
-            "SELECT count(*) FROM links WHERE type = 'duplicate_of' AND from_id = ?1",
-            [&auto],
-        );
-        assert_eq!(merged, 0);
-        assert_eq!(status_of(&f, &mine), "active");
-        let n: i64 = f.read("SELECT count(*) FROM review_items", []);
-        assert_eq!(n, 1);
-        let (kind, payload): (String, String) = {
-            let c = alice_core::store::open_reader(&f.db()).unwrap();
-            c.query_row(
-                "SELECT type, payload_json FROM review_items WHERE status = 'open'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap()
-        };
-        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(kind, "merge");
-        assert_eq!(payload["survivor"], mine.as_str(), "{payload}");
-        assert_eq!(payload["others"], serde_json::json!([auto]), "{payload}");
+                }
+            };
+            apply_j(
+                &f,
+                Judgement {
+                    actions: vec![action],
+                    seen: vec![(auto.clone(), auto_hash)],
+                    ..judgement(&f, &mine, "jev")
+                },
+            );
+            assert_eq!(
+                status_of(&f, &auto),
+                "active",
+                "not applied on stale information (supersede: {supersede})"
+            );
+            let linked: i64 = f.read(
+                "SELECT count(*) FROM links WHERE from_id = ?1 OR to_id = ?1",
+                [&auto],
+            );
+            assert_eq!(linked, 0, "supersede: {supersede}");
+            assert_eq!(status_of(&f, &mine), "active");
+            let n: i64 = f.read("SELECT count(*) FROM review_items", []);
+            assert_eq!(n, 0, "nobody is asked (supersede: {supersede})");
+            assert_eq!(judge_state_of(&f, &mine).0, "done");
+        }
     }
 
     #[test]

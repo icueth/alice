@@ -1095,7 +1095,23 @@ the guard.
 
 **An explicit memory beats a distilled one.** An agent's or person's newcomer that duplicates an **older distilled**
 memory survives, and the distilled one is trashed as its duplicate. This reverses today's "older survives" for that pair,
-so explicit memories are never lost to machine copies.
+so explicit memories are never lost to machine copies. **Nobody is asked about it (final review B-I1):** the explicit
+newcomer settles each distilled match from `judge.review_threshold` on, in any band, so the two never both stay live and
+the review inbox never gets a question about a machine copy (the order of §0.5's anti-goal: a session is distilled at a
+quiet pause, then the agent saves the same lesson in its own words):
+
+| Judge result for a distilled match | Today, for an explicit match | For the explicit newcomer's distilled match |
+|---|---|---|
+| duplicate ≥ review | ≥ auto: the newcomer is trashed; below: a `merge` review | the distilled one is trashed as the newcomer's duplicate |
+| updates ≥ review | ≥ auto: supersedes; below: a `supersede` review | the newcomer supersedes the distilled one |
+| contradicts ≥ review | link plus `contradiction` review | the newcomer supersedes the distilled one (the explicit memory is right) |
+| heuristic | the same text applies; near twins and updates are review items | the same text replaces it; anything else is left as it is |
+| heuristic stand-in (Jev unreachable) | review-only suggestions | nothing about a distilled match; the newcomer is judged again (R2) |
+
+A confident duplicate of an **explicit** older memory still settles the newcomer first (it goes to the trash, and its
+distilled matches are left as they are: each was judged against that explicit memory when it came). An action on a
+distilled match that changed after the judge read it is dropped, not asked about. Its explicit matches are asked about as
+before.
 
 **Maintenance and the briefing:**
 - `merge_suggestions` skips distilled memories, as it skips diaries.
@@ -1521,7 +1537,8 @@ hand-written ones). They cover:
 - `waiting_judge` when the judge is not Jev;
 - every row of §6.6's judge table;
 - a distilled memory hidden from recall and the briefing until its judge stage is over;
-- an explicit newcomer surviving over a distilled duplicate;
+- an explicit newcomer surviving over a distilled duplicate, and settling a distilled match in the middle band without a
+  review item, saved after the session was distilled (`distill_flow`, final review B-I1);
 - `merge_suggestions` skipping distilled memories;
 - the briefing's `(auto)` marks and section rules.
 
@@ -1612,7 +1629,7 @@ a caveat the results state, as `m2-jev.md` does.
 | R16 | **At most 40 candidates per request and `max_per_run` (8) kept**, by priority (summaries, conclusions, user statements, subagent reports). Task 12c: the kept are ranked handoff first, then the p band (≥ 0.9, ≥ 0.8, below), then main session before subagents inside the band (Task 12d), then decision, bugfix, warning, fact, howto, preference, then p; `max_per_session` (16) is the size of the session's best set (its room) over all its runs and subagents for its first 100 turns, 8 more per further 100 turns up to `max_per_session_cap` (48) (Task 12d), every run is asked, and a better passage replaces the weakest held one that may go once the judge finds it live (trashed by `distill:cap` in the judgement's op; never a handoff, nor a memory a person or an agent edited, linked or cited after it was distilled; a newcomer the judge trashes, or that supersedes a member, evicts nothing; one related to a member evicts that member first, Task 12d); `max_per_subagent_run` (2) subagent reports per run and half of the room per session; a `preference_user` passage that names the project (its slug, name, folder or a path in it) stays in the project instead of `global`; a title is the first sentence, passing over `#` headings, and only when that is a table header, or 25 characters or fewer (a short heading or label), the first sentence after it that says more, at most 80 characters (§6.4, §6.5) | Bounded cost and no floods; compaction summaries and turn conclusions carry most lasting knowledge | A very long quiet-free stretch loses its lowest-priority candidates. A full session costs a request every run (within `distill.budget_share`), and a kept passage that does not outrank the set's weakest that may go is not stored; a session whose set is all protected stores nothing more |
 | R17 | **Extractive distillation with `choice` questions only**, through the existing client | Jev has no text type; the client's cache, budget, redaction and gate are reused unchanged | Passages that need the conversation are dropped (lower recall); the eval measures it |
 | R18 | **A session already mined by MemPalace continues after the import's end time; the importer skips sessions SP2 holds** | MemPalace's chunks cannot be aligned with turns; a session must be held by one side | Sessions active during the cut-over may have a gap or overlap of a few minutes at the boundary |
-| R19 | **Distilled memories never open review items; an explicit memory beats a distilled duplicate; distilled ones never supersede explicit ones** | The review inbox is for what people and agents wrote; machine copies must never cost a person's attention or an explicit memory | An uncertain but real update of a distilled memory stays as two linked memories instead of a question; a distilled update of an explicit memory is trashed as its duplicate (Task 11b), and its passage stays in the raw capture, unless it holds more: more than twice its match's characters between the review and auto thresholds, or a number its match does not state at any probability, which keeps it, linked `relates_to` (Task 12c) |
+| R19 | **Distilled memories never open review items; an explicit memory beats a distilled duplicate (and supersedes a distilled memory it updates or contradicts, in any band from the review threshold, without a review item: final review B-I1); distilled ones never supersede explicit ones** | The review inbox is for what people and agents wrote; machine copies must never cost a person's attention or an explicit memory | An uncertain but real update of a distilled memory stays as two linked memories instead of a question; a distilled update of an explicit memory is trashed as its duplicate (Task 11b), and its passage stays in the raw capture, unless it holds more: more than twice its match's characters between the review and auto thresholds, or a number its match does not state at any probability, which keeps it, linked `relates_to` (Task 12c) |
 | R20 | **The installer keeps `settings.json` key order as far as practical**, chosen in the plan without changing JSON output elsewhere | A person's settings file should not be reshuffled; enabling `serde_json/preserve_order` workspace-wide would change other JSON output | If not practical, keys are re-serialised (a backup exists and the output says so) |
 | R21 | **Codex rollouts read tolerantly; `.zst` files skipped in v1** | The format is documented as unstable; a zstd dependency is not justified before it is seen in use | Compressed Codex sessions are not captured until a later version |
 | R22 | **No request compression for tenant uploads** | It needs a new dependency; the upload runs in the background | More upstream bandwidth for large transcripts |
