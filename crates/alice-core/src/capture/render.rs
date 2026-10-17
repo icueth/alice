@@ -9,9 +9,19 @@
 //! know a key by its prefix (`sk-`, `ghp_`) or by its `NAME=` context, so a key cut first would
 //! leave a fragment none of them knows. No cut falls inside a token-like run of characters
 //! either ([`is_token_char`]): a trim drops such a token whole, a chunk cut prefers a space.
+//!
+//! In every mode, and so in a store that keeps secrets as written (re-review N1), no trim, clip
+//! or cut falls inside a secret either: [`Cuts`] asks the detectors where each one is in the
+//! text being cut ([`Redactor::spans`], a match whole with the keyword, scheme or `BEGIN` line it
+//! needs) and moves the cut to the secret's edge. A secret a kept head or tail would end or start
+//! inside is kept whole on the kept side when that adds at most [`SPAN_KEEP_CHARS`], else left
+//! out whole; a chunk cut puts it whole at the start of the next chunk, and one longer than a
+//! chunk stays whole in a chunk over the limit. Every cloud request redacts the stored chunks
+//! one by one, so a secret whole in a chunk is a secret its detector finds there.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::Range;
 
 use serde_json::Value;
 
@@ -84,6 +94,10 @@ const SUBAGENT_REPORT_CHARS: usize = 2000;
 const TOOL_NAME_CHARS: usize = 64;
 /// A run of this many base64-like characters is binary data.
 const BASE64_RUN: usize = 200;
+/// A trim, clip or cut that falls inside a secret keeps it whole on the kept side when that
+/// keeps at most this many more characters (a 4096-bit RSA key is about 3,300); a longer one is
+/// left out whole.
+const SPAN_KEEP_CHARS: usize = 8_192;
 const BINARY_MARKER: &str = "[binary removed]";
 
 /// `text` cut to at most `keep` characters: the first 5/8 and the last 3/8, at character
@@ -101,15 +115,37 @@ const BINARY_MARKER: &str = "[binary removed]";
 /// assert!(!out.contains("0123456789"));
 /// assert!(out.starts_with("word word") && out.ends_with(" end"));
 /// ```
+///
+/// No cut falls inside a secret the built-in detectors find either ([`Cuts`]): one the head
+/// would end in or the tail would start in is kept whole.
+///
+/// ```
+/// use alice_core::capture::trim;
+///
+/// let url = concat!("DATABASE_URL=postgres://ops:Thai", "land-2026@db.internal:5432/app");
+/// let text = format!("{}{url}\n{}", "HOME=/home/user\n".repeat(80), "DEBUG=0\n".repeat(32));
+/// // The tail's start (the last 300 characters) falls inside its scheme: the URL is kept whole.
+/// assert!(trim(&text, 800).contains(url));
+/// ```
 pub fn trim(text: &str, keep: usize) -> String {
+    trim_with(text, keep, Redactor::builtin_shared())
+}
+
+/// [`trim`] with `det`'s detectors deciding where the secrets are.
+fn trim_with(text: &str, keep: usize, det: &Redactor) -> String {
     let total = text.chars().count();
     if total <= keep {
         return text.to_owned();
     }
+    let cuts = Cuts::new(text, det);
     let head_chars = keep * 5 / 8;
     let tail_chars = keep - head_chars;
-    let head_end = token_start(text, byte_of_char(text, head_chars));
-    let tail_start = token_end(text, byte_of_char(text, total - tail_chars));
+    let head_end = cuts.head_end(byte_of_char(text, head_chars));
+    let tail_start = cuts.tail_start(byte_of_char(text, total - tail_chars));
+    if head_end >= tail_start {
+        // The secrets kept whole on both sides meet: nothing is left to trim.
+        return text.to_owned();
+    }
     let trimmed = marker(text[head_end..tail_start].chars().count());
     [&text[..head_end], trimmed.as_str(), &text[tail_start..]]
         .into_iter()
@@ -118,19 +154,123 @@ pub fn trim(text: &str, keep: usize) -> String {
         .join("\n")
 }
 
-/// The first `keep` characters (never ending inside a token), and a marker when something was
-/// cut.
-fn head(text: &str, keep: usize) -> String {
+/// The first `keep` characters (never ending inside a token or a secret), and a marker when
+/// something was cut.
+fn head(text: &str, keep: usize, det: &Redactor) -> String {
     let total = text.chars().count();
     if total <= keep {
         return text.to_owned();
     }
-    let end = token_start(text, byte_of_char(text, keep));
+    let end = Cuts::new(text, det).head_end(byte_of_char(text, keep));
+    if end >= text.len() {
+        return text.to_owned();
+    }
     let trimmed = marker(total - text[..end].chars().count());
     if end == 0 {
         return trimmed;
     }
     format!("{}\n{trimmed}", &text[..end])
+}
+
+/// Where the secrets are in a text that is about to be trimmed, clipped or cut, and where a cut
+/// may fall: never inside a token-like run ([`is_token_char`]), never inside a secret
+/// ([`Redactor::spans`]), in every mode (re-review N1). In a store that redacts, the text holds
+/// markers by now and few spans; in one that keeps secrets as written it holds them all.
+pub(super) struct Cuts<'t> {
+    text: &'t str,
+    spans: Vec<Range<usize>>,
+}
+
+impl<'t> Cuts<'t> {
+    pub(super) fn new(text: &'t str, det: &Redactor) -> Self {
+        Self {
+            text,
+            spans: secret_spans(text, det),
+        }
+    }
+
+    /// The secret `at` (a byte offset on a character boundary) falls strictly inside.
+    fn inside(&self, at: usize) -> Option<&Range<usize>> {
+        self.spans.iter().find(|s| s.start < at && at < s.end)
+    }
+
+    /// The last offset at or before `at` that is inside neither a token nor a secret.
+    fn before(&self, mut at: usize) -> usize {
+        loop {
+            let t = token_start(self.text, at);
+            let next = self.inside(t).map_or(t, |s| s.start);
+            if next == at {
+                return at;
+            }
+            at = next;
+        }
+    }
+
+    /// The first offset at or after `at` that is inside neither a token nor a secret.
+    fn after(&self, mut at: usize) -> usize {
+        loop {
+            let t = token_end(self.text, at);
+            let next = self.inside(t).map_or(t, |s| s.end);
+            if next == at {
+                return at;
+            }
+            at = next;
+        }
+    }
+
+    fn chars(&self, from: usize, to: usize) -> usize {
+        self.text[from..to].chars().count()
+    }
+
+    /// Where a kept head that would end at `at` ends: before the token `at` falls in; past the
+    /// secret `at` falls in, kept whole, when that keeps at most [`SPAN_KEEP_CHARS`] more
+    /// characters, else before it.
+    pub(super) fn head_end(&self, at: usize) -> usize {
+        if self.inside(at).is_some() {
+            let past = self.after(at);
+            if self.chars(at, past) <= SPAN_KEEP_CHARS {
+                return past;
+            }
+        }
+        self.before(at)
+    }
+
+    /// Where a kept tail that would start at `at` starts: after the token `at` falls in; at the
+    /// start of the secret `at` falls in, kept whole, when that keeps at most
+    /// [`SPAN_KEEP_CHARS`] more characters, else after it.
+    pub(super) fn tail_start(&self, at: usize) -> usize {
+        if self.inside(at).is_some() {
+            let from = self.before(at);
+            if self.chars(from, at) <= SPAN_KEEP_CHARS {
+                return from;
+            }
+        }
+        self.after(at)
+    }
+
+    /// Where a text kept only up to `at` ends (a prompt's first sentence, a title's first line):
+    /// before the secret `at` falls in, never past it.
+    pub(super) fn end_before(&self, mut at: usize) -> usize {
+        while let Some(s) = self.inside(at) {
+            at = s.start;
+        }
+        at
+    }
+}
+
+/// The secrets `det` finds in `text` ([`Redactor::spans`]), without the white space a match
+/// may start or end with (the space before a `--password` flag): a cut there is no cut through
+/// a secret, and the line it starts after a chunk's tag still has a space in front.
+fn secret_spans(text: &str, det: &Redactor) -> Vec<Range<usize>> {
+    det.spans(text)
+        .into_iter()
+        .filter_map(|r| {
+            let piece = &text[r.clone()];
+            let start = r.start + (piece.len() - piece.trim_start().len());
+            let end = r.start + piece.trim_end().len();
+            (start < end).then_some(start..end)
+        })
+        .collect()
 }
 
 /// A character of a token-like run: a key, a hash, a path, base64. A cut never falls between two
@@ -174,6 +314,9 @@ fn token_end(text: &str, start: usize) -> usize {
 /// A-I1). Without a redactor ([`super::read`]) text passes unchanged.
 struct Scrub<'r> {
     redactor: Option<&'r Redactor>,
+    /// Where the secrets are, for every trim, clip and cut ([`Cuts`]): the redactor whether
+    /// or not it is switched on, else the built-in detectors.
+    det: &'r Redactor,
     found: Vec<String>,
 }
 
@@ -199,7 +342,7 @@ impl Scrub<'_> {
     /// A-M5), then clipped to `n` characters.
     fn line(&mut self, text: &str, n: usize) -> String {
         let text = self.text(text);
-        clip(&strip_binary(&text), n)
+        clip(&strip_binary(&text), n, self.det)
     }
 }
 
@@ -224,26 +367,31 @@ fn byte_of_char(text: &str, n: usize) -> usize {
     text.char_indices().nth(n).map_or(text.len(), |(i, _)| i)
 }
 
-/// At most `n` characters, with `…` when something was cut, never inside a token. Line breaks
-/// become spaces, so a title stays on one line.
-fn clip(text: &str, n: usize) -> String {
-    clip_with(text, n, true)
+/// At most `n` characters, with `…` when something was cut, never inside a token or a secret
+/// (one the cut falls inside is kept whole, see [`Cuts::head_end`]). Line breaks become spaces,
+/// so a title stays on one line.
+fn clip(text: &str, n: usize, det: &Redactor) -> String {
+    clip_with(text, n, Some(det))
 }
 
 /// [`clip`] for a tool's or a subagent type's name, which may be cut inside a token: a name is
 /// no secret, and most names are one token (`mcp__server__tool`).
 fn clip_name(text: &str, n: usize) -> String {
-    clip_with(text, n, false)
+    clip_with(text, n, None)
 }
 
-fn clip_with(text: &str, n: usize, whole_tokens: bool) -> String {
+/// `det`: cut at whole tokens and secrets; `None`: cut anywhere.
+fn clip_with(text: &str, n: usize, det: Option<&Redactor>) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= n {
         return one_line;
     }
     let mut end = byte_of_char(&one_line, n.saturating_sub(1));
-    if whole_tokens {
-        end = token_start(&one_line, end);
+    if let Some(det) = det {
+        end = Cuts::new(&one_line, det).head_end(end);
+        if end >= one_line.len() {
+            return one_line;
+        }
     }
     let mut out = one_line[..end].trim_end().to_owned();
     out.push('…');
@@ -285,7 +433,8 @@ pub(crate) fn records(
     opts: &ReadOptions,
     redactor: Option<&Redactor>,
 ) -> Vec<RenderedChunk> {
-    pack(&pieces(records, opts, redactor), opts.chunk_chars)
+    let det = redactor.unwrap_or_else(|| Redactor::builtin_shared());
+    pack(&pieces(records, opts, redactor, det), opts.chunk_chars, det)
 }
 
 /// One rendered block: a tag, its text, its record's time, and the detectors that fired on its
@@ -334,10 +483,16 @@ fn classify(name: &str) -> ToolKind {
     }
 }
 
-fn pieces(records: &[Record], opts: &ReadOptions, redactor: Option<&Redactor>) -> Vec<Piece> {
+fn pieces(
+    records: &[Record],
+    opts: &ReadOptions,
+    redactor: Option<&Redactor>,
+    det: &Redactor,
+) -> Vec<Piece> {
     let mut out: Vec<Piece> = Vec::new();
     let mut scrub = Scrub {
         redactor,
+        det,
         found: Vec::new(),
     };
     // Each `tool_use` id's kind (and a subagent's type), so a result renders as its tool's.
@@ -590,12 +745,18 @@ fn wrapper_lines(text: &str, scrub: &mut Scrub) -> Vec<(String, String)> {
             "command-args" => args = content.to_owned(),
             "local-command-stdout" | "bash-stdout" => {
                 if let Some(body) = clean(content, scrub) {
-                    out.push(("[result]".to_owned(), head(&body, TOOL_LINE_CHARS)));
+                    out.push((
+                        "[result]".to_owned(),
+                        head(&body, TOOL_LINE_CHARS, scrub.det),
+                    ));
                 }
             }
             "local-command-stderr" | "bash-stderr" => {
                 if let Some(body) = clean(content, scrub) {
-                    out.push(("[result error]".to_owned(), head(&body, TOOL_LINE_CHARS)));
+                    out.push((
+                        "[result error]".to_owned(),
+                        head(&body, TOOL_LINE_CHARS, scrub.det),
+                    ));
                 }
             }
             _ => {
@@ -646,11 +807,14 @@ fn tool_line(
         ToolKind::Dropped => return None,
         ToolKind::Memory => {
             let tool = clip_name(memory_tool(name).unwrap_or(name), TOOL_NAME_CHARS);
-            // The title when there is one, else the first line of the main text.
+            // The title when there is one, else the first line of the main text. The line's end
+            // is a cut too: one through a secret (a key's lines) ends the line before it.
             let title = input_str(input, &["title", "query", "content", "entry", "text", "id"])
                 .map(|t| scrub.text(t))
                 .unwrap_or_default();
-            let first_line = title.trim().lines().next().unwrap_or("");
+            let title = title.trim();
+            let line_end = title.find('\n').unwrap_or(title.len());
+            let first_line = &title[..Cuts::new(title, scrub.det).end_before(line_end)];
             (
                 format!("[tool alice {tool}]"),
                 scrub.line(first_line, MEMORY_TITLE_CHARS),
@@ -692,10 +856,11 @@ fn result_line(
         _ => {}
     }
     let body = clean(text, scrub);
+    let det = scrub.det;
     if is_error {
         let body = body.map_or_else(String::new, |b| match kind {
-            ToolKind::Unknown => cut_chars(&b, UNKNOWN_RESULT_CHARS),
-            _ => trim(&b, opts.tool_output_chars),
+            ToolKind::Unknown => cut_chars(&b, UNKNOWN_RESULT_CHARS, det),
+            _ => trim_with(&b, opts.tool_output_chars, det),
         });
         return Some(("[result error]".into(), body));
     }
@@ -703,22 +868,31 @@ fn result_line(
     Some(match kind {
         ToolKind::Subagent => (
             format!("[subagent {label}]"),
-            head(&body, SUBAGENT_REPORT_CHARS),
+            head(&body, SUBAGENT_REPORT_CHARS, det),
         ),
-        ToolKind::Search => ("[result]".into(), head(&body, SEARCH_RESULT_CHARS)),
-        ToolKind::Web => ("[result]".into(), head(&body, WEB_RESULT_CHARS)),
-        ToolKind::Unknown => ("[result]".into(), cut_chars(&body, UNKNOWN_RESULT_CHARS)),
-        _ => ("[result]".into(), trim(&body, opts.tool_output_chars)),
+        ToolKind::Search => ("[result]".into(), head(&body, SEARCH_RESULT_CHARS, det)),
+        ToolKind::Web => ("[result]".into(), head(&body, WEB_RESULT_CHARS, det)),
+        ToolKind::Unknown => (
+            "[result]".into(),
+            cut_chars(&body, UNKNOWN_RESULT_CHARS, det),
+        ),
+        _ => (
+            "[result]".into(),
+            trim_with(&body, opts.tool_output_chars, det),
+        ),
     })
 }
 
-/// At most `n` characters in all: the text, or its start (never ending inside a token) and `…`.
-/// Line breaks stay.
-fn cut_chars(text: &str, n: usize) -> String {
+/// At most `n` characters in all: the text, or its start (never ending inside a token or a
+/// secret) and `…`. Line breaks stay.
+fn cut_chars(text: &str, n: usize, det: &Redactor) -> String {
     if text.chars().count() <= n {
         return text.to_owned();
     }
-    let end = token_start(text, byte_of_char(text, n.saturating_sub(1)));
+    let end = Cuts::new(text, det).head_end(byte_of_char(text, n.saturating_sub(1)));
+    if end >= text.len() {
+        return text.to_owned();
+    }
     let mut out = text[..end].to_owned();
     out.push('…');
     out
@@ -769,7 +943,7 @@ impl Open {
 
 /// Packs blocks greedily into chunks of at most `chunk_chars` characters (and 32,768 bytes).
 /// A block that cannot fit a chunk of its own starts a fresh one and is cut into pieces.
-fn pack(pieces: &[Piece], chunk_chars: usize) -> Vec<RenderedChunk> {
+fn pack(pieces: &[Piece], chunk_chars: usize, det: &Redactor) -> Vec<RenderedChunk> {
     let cap = chunk_chars.max(MIN_CHUNK_CHARS);
     let mut chunks = Vec::new();
     let mut cur = Open::default();
@@ -797,7 +971,7 @@ fn pack(pieces: &[Piece], chunk_chars: usize) -> Vec<RenderedChunk> {
             continue;
         }
         flush(&mut cur, &mut chunks);
-        let parts = split_block(&piece.tag, &piece.body, cap);
+        let parts = split_block(&piece.tag, &piece.body, cap, det);
         let last = parts.len() - 1;
         for (i, part) in parts.iter().enumerate() {
             cur.push(part, part.chars().count(), piece);
@@ -811,22 +985,32 @@ fn pack(pieces: &[Piece], chunk_chars: usize) -> Vec<RenderedChunk> {
 }
 
 /// Cuts an oversized block into lines that fit: at paragraph ends, then sentence ends and line
-/// ends, else at the start of the token the limit falls in, never inside a token-like run. A
-/// token too long for any line is replaced by the trim marker first ([`drop_long_tokens`]). The
-/// first line is `tag text`; the others start `tag (cont.) `.
-fn split_block(tag: &str, body: &str, cap: usize) -> Vec<String> {
+/// ends, else at the start of the token the limit falls in, never inside a token-like run or a
+/// secret ([`Cuts`]). A token too long for any line, and a secret too large for any chunk, is
+/// replaced by the trim marker first ([`drop_long_tokens`]). A secret the limit falls inside
+/// starts the next line whole; one that starts a line and is longer than a line stays whole in
+/// it, over the limit (re-review N1: a private key is never split across chunks). The first line
+/// is `tag text`; the others start `tag (cont.) `.
+fn split_block(tag: &str, body: &str, cap: usize, det: &Redactor) -> Vec<String> {
     let mut parts = Vec::new();
-    let room = cap
-        .saturating_sub(format!("{tag} (cont.) ").chars().count())
-        .max(1);
-    let body = drop_long_tokens(body, room);
-    let mut rest = body.trim();
+    let longest = format!("{tag} (cont.) ");
+    let room = cap.saturating_sub(longest.chars().count()).max(1);
+    let body = drop_long_tokens(
+        body,
+        room,
+        MAX_CHUNK_BYTES.saturating_sub(longest.len()),
+        det,
+    );
+    let cuts = Cuts::new(&body, det);
+    let mut start = body.len() - body.trim_start().len();
+    let end = body.trim_end().len().max(start);
     let mut first = true;
     loop {
+        let rest = &body[start..end];
         let prefix = if first {
             format!("{tag} ")
         } else {
-            format!("{tag} (cont.) ")
+            longest.clone()
         };
         let max_chars = cap.saturating_sub(prefix.chars().count()).max(1);
         let max_bytes = MAX_CHUNK_BYTES.saturating_sub(prefix.len()).max(4);
@@ -835,11 +1019,12 @@ fn split_block(tag: &str, body: &str, cap: usize) -> Vec<String> {
             return parts;
         }
         let limit = prefix_len(rest, max_chars, max_bytes);
-        let cut = cut_point(rest, limit);
+        let cut = cut_point(&cuts, start, limit, max_bytes);
         parts.push(format!("{prefix}{}", rest[..cut].trim_end()));
-        rest = rest[cut..].trim_start();
+        let next = &rest[cut..];
+        start += cut + (next.len() - next.trim_start().len());
         first = false;
-        if rest.is_empty() {
+        if start >= end {
             return parts;
         }
     }
@@ -858,80 +1043,124 @@ fn prefix_len(text: &str, max_chars: usize, max_bytes: usize) -> usize {
     end.max(text.chars().next().map_or(0, char::len_utf8))
 }
 
-/// `body` with every token-like run ([`is_token_char`]) longer than `max` characters replaced by
-/// the trim marker. Such a run fits no line of a chunk, and the pieces of a cut one are text no
-/// detector knows: a store that keeps secrets as written holds keys whole (owner's decision
-/// 2026-10-17), and a key in two chunks would reach a cloud request as two fragments. A marker
-/// that would start a line gets one space in front, as any body line that would start with `[`.
-fn drop_long_tokens(body: &str, max: usize) -> Cow<'_, str> {
-    let mut out = String::new();
-    let mut copied = 0;
+/// `body` with every token-like run ([`is_token_char`]) longer than `max` characters, and every
+/// secret ([`Redactor::spans`]) longer than `max_bytes` bytes, replaced by the trim marker. Such
+/// a run fits no line of a chunk, such a secret no chunk, and the pieces of a cut one are text
+/// no detector knows: a store that keeps secrets as written holds keys whole (owner's decision
+/// 2026-10-17), and a key in two chunks would reach a cloud request as two fragments. A secret
+/// that holds part of a replaced run is replaced with it, whole. A marker that would start a
+/// line gets one space in front, as any body line that would start with `[`.
+fn drop_long_tokens<'b>(
+    body: &'b str,
+    max: usize,
+    max_bytes: usize,
+    det: &Redactor,
+) -> Cow<'b, str> {
+    let mut drop: Vec<Range<usize>> = Vec::new();
     let mut run: Option<(usize, usize)> = None;
-    let flush = |out: &mut String, copied: &mut usize, start: usize, end: usize, chars: usize| {
-        if chars > max {
-            out.push_str(&body[*copied..start]);
-            if start == 0 || body[..start].ends_with('\n') {
-                out.push(' ');
-            }
-            out.push_str(&marker(chars));
-            *copied = end;
-        }
-    };
     for (i, c) in body.char_indices() {
         match (&mut run, is_token_char(c)) {
             (Some((_, n)), true) => *n += 1,
             (None, true) => run = Some((i, 1)),
             (Some((start, n)), false) => {
-                flush(&mut out, &mut copied, *start, i, *n);
+                if *n > max {
+                    drop.push(*start..i);
+                }
                 run = None;
             }
             (None, false) => {}
         }
     }
-    if let Some((start, n)) = run {
-        flush(&mut out, &mut copied, start, body.len(), n);
+    if let Some((start, n)) = run
+        && n > max
+    {
+        drop.push(start..body.len());
     }
-    if copied == 0 && out.is_empty() {
+    let spans = secret_spans(body, det);
+    drop.extend(spans.iter().filter(|s| s.len() > max_bytes).cloned());
+    if drop.is_empty() {
         return Cow::Borrowed(body);
+    }
+    // A secret that a dropped range touches goes with it, whole.
+    let mut grown = true;
+    while grown {
+        grown = false;
+        for r in &mut drop {
+            for s in &spans {
+                if s.start < r.end && r.start < s.end && (s.start < r.start || s.end > r.end) {
+                    r.start = r.start.min(s.start);
+                    r.end = r.end.max(s.end);
+                    grown = true;
+                }
+            }
+        }
+    }
+    drop.sort_by_key(|r| r.start);
+    let mut out = String::with_capacity(body.len());
+    let mut copied = 0;
+    for r in drop {
+        if r.end <= copied {
+            continue;
+        }
+        let start = r.start.max(copied);
+        out.push_str(&body[copied..start]);
+        if start == 0 || body[..start].ends_with('\n') {
+            out.push(' ');
+        }
+        out.push_str(&marker(body[start..r.end].chars().count()));
+        copied = r.end;
     }
     out.push_str(&body[copied..]);
     Cow::Owned(out)
 }
 
-/// Where to cut `rest` within its first `limit` bytes (a block's next stretch, the window):
-/// after the window's last paragraph break, else after its last sentence end or line break,
-/// else at `limit`, moved back to the start of a token the cut would fall inside. A cut in the
-/// window's first quarter is not used, so a piece is never a sliver, unless the only cut that is
-/// not inside a token is there: a token is never cut (owner's decision 2026-10-17; a token
-/// longer than a whole line was replaced by the trim marker before, [`drop_long_tokens`]).
-fn cut_point(rest: &str, limit: usize) -> usize {
+/// Where to cut the text that starts at `from` in `cuts`' text within its first `limit` bytes
+/// (a block's next stretch, the window): after the window's last paragraph break, else after its
+/// last sentence end or line break, else at `limit`, moved back to the start of a token the cut
+/// would fall inside. No candidate falls inside a secret ([`Cuts`]). A cut in the window's
+/// first quarter is not used, so a piece is never a sliver, unless the only cut that is not
+/// inside a token or a secret is there: a token is never cut (owner's decision 2026-10-17; a
+/// token longer than a whole line was replaced by the trim marker before, [`drop_long_tokens`]),
+/// and neither is a secret: when the window ends inside one that starts in its first quarter,
+/// the piece runs on past the secret's end, over the limit, if it then fits `max_bytes`.
+fn cut_point(cuts: &Cuts, from: usize, limit: usize, max_bytes: usize) -> usize {
+    let rest = &cuts.text[from..];
     let window = &rest[..limit];
     let floor = window.len() / 4;
-    let paragraph = window.rfind("\n\n").map(|i| i + 2);
+    let free = |c: usize| cuts.inside(from + c).is_none();
+    let last = |pat: &str| {
+        window
+            .rmatch_indices(pat)
+            .map(|(i, m)| i + m.len())
+            .find(|&c| free(c))
+    };
+    let paragraph = last("\n\n");
     if let Some(cut) = paragraph.filter(|&c| c > floor) {
         return cut;
     }
-    let sentence = [
-        window.rfind(". ").map(|i| i + 2),
-        window.rfind("! ").map(|i| i + 2),
-        window.rfind("? ").map(|i| i + 2),
-        window.rfind('。').map(|i| i + '。'.len_utf8()),
-        window.rfind('\n').map(|i| i + 1),
-    ]
-    .into_iter()
-    .flatten()
-    .max();
-    let token = token_start(rest, limit);
-    sentence
+    let sentence = [last(". "), last("! "), last("? "), last("。"), last("\n")]
+        .into_iter()
+        .flatten()
+        .max();
+    let token = cuts.before(from + limit).saturating_sub(from);
+    if let Some(cut) = sentence
         .filter(|&c| c > floor)
         .or_else(|| Some(token).filter(|&c| c > floor))
-        .or_else(|| {
-            [paragraph, sentence, Some(token)]
-                .into_iter()
-                .flatten()
-                .filter(|&c| c > 0)
-                .max()
-        })
+    {
+        return cut;
+    }
+    // The window ends inside a secret that starts early in it: kept whole, over the limit.
+    if let Some(secret) = cuts.inside(from + limit) {
+        let past = cuts.after(secret.end) - from;
+        if past <= max_bytes {
+            return past;
+        }
+    }
+    [paragraph, sentence, Some(token)]
+        .into_iter()
+        .flatten()
+        .filter(|&c| c > 0)
+        .max()
         // Only a run longer than the window starts here, which `drop_long_tokens` removed.
         .unwrap_or(limit)
 }
@@ -1747,6 +1976,335 @@ mod tests {
         );
     }
 
+    /// Re-review N1: secrets whose detectors need context in another token or on another line
+    /// (a URL's scheme and user, a `password:` keyword, a private key's `BEGIN` line), built so
+    /// no scanner takes them for real ones.
+    mod context_secrets {
+        pub const URL_PW: &str = concat!("Rk4v", "-Thailand-2026");
+        pub const YAML_PW: &str = concat!("VGhh", "aWxhbmQtMjAyNi1zZWNyZXQ");
+
+        pub fn url() -> String {
+            format!("postgres://ops:{URL_PW}@db.internal:5432/app")
+        }
+
+        pub fn yaml() -> String {
+            format!("password: {YAML_PW}")
+        }
+
+        /// A 3,300-character RSA-shaped private key: 50 lines of 64 base64 characters and a
+        /// short last one, none repeated, between its `BEGIN` and `END` lines.
+        pub fn pem_lines() -> Vec<String> {
+            const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                B64[(x % 64) as usize] as char
+            };
+            let mut lines: Vec<String> =
+                (0..50).map(|_| (0..64).map(|_| next()).collect()).collect();
+            lines.push((0..40).map(|_| next()).collect::<String>() + "==");
+            lines
+        }
+
+        pub fn pem(sep: &str) -> String {
+            format!(
+                "{}{sep}{}{sep}{}",
+                concat!("-----BEGIN RSA PRIVATE ", "KEY-----"),
+                pem_lines().join(sep),
+                concat!("-----END RSA PRIVATE ", "KEY-----")
+            )
+        }
+
+        /// The first window of `n` characters of the secret `which` found in `text`.
+        pub fn leak(which: &str, text: &str, n: usize) -> Option<String> {
+            let pieces: Vec<String> = match which {
+                "url" => vec![URL_PW.to_string()],
+                "yaml" => vec![YAML_PW.to_string()],
+                _ => pem_lines(),
+            };
+            pieces.iter().find_map(|p| {
+                let chars: Vec<char> = p.chars().collect();
+                chars
+                    .windows(n.min(chars.len()))
+                    .map(|w| w.iter().collect::<String>())
+                    .find(|w| text.contains(w.as_str()))
+            })
+        }
+    }
+
+    /// `n` characters of `.env`-style lines, ending in a line break.
+    fn env_lines(n: usize) -> String {
+        let mut s = String::new();
+        while s.len() + 13 <= n {
+            s.push_str("LOG_LEVEL=ok\n");
+        }
+        if s.len() < n {
+            s.push_str(&"#".repeat(n - s.len() - 1));
+            s.push('\n');
+        }
+        s
+    }
+
+    /// `n` characters of words (no sentence end), ending in a space.
+    fn plain_words(n: usize) -> String {
+        let mut s = "deploy notes for the ops box ".repeat(n / 29 + 1);
+        s.truncate(n - 1);
+        s.push(' ');
+        s
+    }
+
+    /// One case: the transcript, the text the secret sits in as the cut sees it, and the
+    /// character offset in that text where the cut would fall without the secrets' rule.
+    struct Placement {
+        case: String,
+        which: &'static str,
+        input: Vec<u8>,
+        /// What a stored chunk holds of the secret, whole.
+        whole: String,
+        text: String,
+        cut: usize,
+    }
+
+    /// Every secret across every cut: the trim's head end (500) and tail start (the last 300),
+    /// a hard cut inside one long line, and a chunk's continuation in a block of several lines.
+    fn placements() -> Vec<Placement> {
+        use context_secrets::*;
+        let mut out = Vec::new();
+        let secrets: [(&'static str, String, String, usize); 3] = [
+            // (name, the line, the secret as written, an offset into the line the old rule
+            // splits at: inside `//ops`, inside the keyword, inside the key's 20th line)
+            (
+                "url",
+                format!("DATABASE_URL={}", url()),
+                url(),
+                13 + url().find("//ops").unwrap() + 1,
+            ),
+            ("yaml", format!("  {}", yaml()), yaml(), 2 + 3),
+            (
+                "pem",
+                pem("\n"),
+                pem("\n"),
+                pem("\n").find(&pem_lines()[20]).unwrap() + 10,
+            ),
+        ];
+        for (which, line, whole, c) in &secrets {
+            let whole_in = |w: &str| {
+                if *which == "url" {
+                    format!("postgres://ops:{URL_PW}@")
+                } else {
+                    w.to_string()
+                }
+            };
+            // The tail of the 800-character trim starts `c` characters into the line (into the
+            // key's 49th line for the private key, which is longer than the tail).
+            let c_tail = if *which == "pem" {
+                line.find(&pem_lines()[48]).unwrap() + 10
+            } else {
+                *c
+            };
+            let output = format!(
+                "{}{line}\n{}LAST=1",
+                env_lines(1000),
+                env_lines(300 + c_tail - line.len() - 7)
+            );
+            let text = output.clone();
+            out.push(Placement {
+                case: format!("{which}: trim tail"),
+                which,
+                input: bash_output(&output),
+                whole: whole_in(whole),
+                cut: text.chars().count() - 300,
+                text,
+            });
+            // The head (its first 500) ends `c` characters into the line (the key's 5th line
+            // for the private key).
+            let c_head = if *which == "pem" {
+                line.find(&pem_lines()[5]).unwrap() + 7
+            } else {
+                *c
+            };
+            let output = format!(
+                "{}{line}\n{}LAST=1",
+                env_lines(500 - c_head),
+                env_lines(1200)
+            );
+            out.push(Placement {
+                case: format!("{which}: trim head"),
+                which,
+                input: bash_output(&output),
+                whole: whole_in(whole),
+                cut: 500,
+                text: output,
+            });
+            // A hard cut: one long line, the limit (2,000 less the `[assistant] ` tag) falls
+            // `c` characters into the secret (written on one line).
+            let inline = if *which == "pem" {
+                pem(" ")
+            } else {
+                whole.to_string()
+            };
+            let ci = match *which {
+                "url" => url().find("//ops").unwrap() + 1,
+                "yaml" => "password: ".len(),
+                _ => inline.find(&pem_lines()[20]).unwrap() + 10,
+            };
+            let limit = 2000 - "[assistant] ".len();
+            let reply = format!("{}{inline} {}", plain_words(limit - ci), plain_words(1500));
+            out.push(Placement {
+                case: format!("{which}: hard cut"),
+                which,
+                input: block_input(&[("user", "Paste it."), ("assistant", &reply)]),
+                whole: whole_in(&inline),
+                cut: limit,
+                text: reply,
+            });
+            // A continuation: a prompt of several lines, a short first paragraph (under the
+            // floor), so the old cut took the window's last line break or token start.
+            let lead = "Here is what the ops box uses, keep it safe:\n";
+            let (prompt, cut) = if *which == "pem" {
+                (format!("{lead}{line}\n\nThanks."), 2000 - "[user] ".len())
+            } else {
+                let limit = 2000 - "[user] ".len();
+                let at = limit - lead.len() - ci;
+                (
+                    format!(
+                        "{lead}{}{inline} {}\nThanks.",
+                        plain_words(at),
+                        plain_words(1500)
+                    ),
+                    limit,
+                )
+            };
+            out.push(Placement {
+                case: format!("{which}: continuation"),
+                which,
+                input: block_input(&[("user", &prompt), ("assistant", "Noted.")]),
+                whole: whole_in(whole),
+                cut,
+                text: prompt,
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn a_secret_across_any_trim_or_cut_stays_whole_in_a_store_that_keeps_it() {
+        use crate::settings::PrivacySettings;
+        let keep = Redactor::new(&PrivacySettings {
+            redact: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let egress = Redactor::builtin().for_egress();
+        for p in placements() {
+            // The old rule cut here, inside the secret.
+            let at = byte_of_char(&p.text, p.cut);
+            assert!(
+                Redactor::builtin()
+                    .spans(&p.text)
+                    .iter()
+                    .any(|s| s.start < at && at < s.end),
+                "{}: the cut falls inside the secret",
+                p.case
+            );
+            for (mode, out) in [
+                ("keep", read_redacted(CLAUDE, &p.input, &closed(), &keep)),
+                ("no redactor", read(CLAUDE, &p.input, &closed())),
+            ] {
+                let chunks = &out.turns[0].chunks;
+                assert!(
+                    chunks.iter().any(|c| c.text.contains(&p.whole)),
+                    "{} ({mode}): kept whole and as written: {chunks:#?}",
+                    p.case
+                );
+                for c in chunks {
+                    let sent = egress.apply(&c.text).text;
+                    assert_eq!(
+                        context_secrets::leak(p.which, &sent, 8),
+                        None,
+                        "{} ({mode}): a cloud request would carry a piece: {sent}",
+                        p.case
+                    );
+                    assert!(
+                        c.text.len() <= MAX_CHUNK_BYTES,
+                        "{} ({mode}): a chunk fits the store",
+                        p.case
+                    );
+                }
+            }
+            // A store that redacts holds none of it.
+            let out = read_redacted(CLAUDE, &p.input, &closed(), &Redactor::builtin());
+            for c in &out.turns[0].chunks {
+                assert_eq!(
+                    context_secrets::leak(p.which, &c.text, 8),
+                    None,
+                    "{}",
+                    p.case
+                );
+            }
+        }
+    }
+
+    /// A secret too large for any chunk cannot be kept whole: it is left out whole (marker),
+    /// never cut. A private key with no `END` line spans its key lines, not the prose after
+    /// them, which is cut as usual.
+    #[test]
+    fn a_secret_larger_than_a_chunk_is_left_out_whole_and_an_open_key_ends_with_its_lines() {
+        use context_secrets::*;
+        let huge = format!(
+            "{}\n{}\n{}",
+            concat!("-----BEGIN RSA PRIVATE ", "KEY-----"),
+            (0..12)
+                .flat_map(|_| pem_lines())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            concat!("-----END RSA PRIVATE ", "KEY-----")
+        );
+        assert!(huge.len() > MAX_CHUNK_BYTES);
+        let input = block_input(&[
+            ("user", &format!("Key:\n{huge}\n\nThanks.")),
+            ("assistant", "Ok."),
+        ]);
+        let chunks = &read(CLAUDE, &input, &closed()).turns[0].chunks;
+        let all: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(leak("pem", &all, 16), None, "{all}");
+        assert!(all.contains(" characters trimmed …]") && all.contains("Thanks."));
+
+        let open = format!(
+            "{}\n{}\n\n{}",
+            concat!("-----BEGIN RSA PRIVATE ", "KEY-----"),
+            pem_lines().join("\n"),
+            "Then the notes go on. ".repeat(200)
+        );
+        let spans = Redactor::builtin().spans(&open);
+        assert_eq!(spans.len(), 1);
+        let span = &open[spans[0].clone()];
+        assert!(
+            span.ends_with(&pem_lines()[50]),
+            "the key lines only: {:?}",
+            &span[span.len().saturating_sub(120)..]
+        );
+        let input = block_input(&[("user", &open), ("assistant", "Ok.")]);
+        let chunks = &read(CLAUDE, &input, &closed()).turns[0].chunks;
+        assert!(chunks.len() >= 3, "{chunks:#?}");
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.text.contains(&pem_lines().join("\n")))
+        );
+        let egress = Redactor::builtin().for_egress();
+        for c in chunks {
+            assert_eq!(
+                leak("pem", &egress.apply(&c.text).text, 16),
+                None,
+                "{}",
+                c.text
+            );
+        }
+    }
+
     #[test]
     fn a_key_in_block_mode_marks_every_chunk_of_its_block() {
         use crate::settings::{PrivacySettings, RedactMode};
@@ -1814,23 +2372,25 @@ mod tests {
             "[… 1,234,567 characters trimmed …]"
         );
         // Heads, clips and cuts back off to the token's start.
+        let det = Redactor::builtin_shared();
         let line = format!("{} {token} tail", "word ".repeat(50));
-        assert!(kept_whole_or_not(&head(&line, 300)));
-        assert!(head(&line, 300).starts_with("word "));
-        assert!(kept_whole_or_not(&clip(&line, 300)));
-        assert!(clip(&line, 300).ends_with("word…"));
-        assert!(kept_whole_or_not(&cut_chars(&line, 300)));
-        assert_eq!(head(&token, 50), "[… 128 characters trimmed …]");
+        assert!(kept_whole_or_not(&head(&line, 300, det)));
+        assert!(head(&line, 300, det).starts_with("word "));
+        assert!(kept_whole_or_not(&clip(&line, 300, det)));
+        assert!(clip(&line, 300, det).ends_with("word…"));
+        assert!(kept_whole_or_not(&cut_chars(&line, 300, det)));
+        assert_eq!(head(&token, 50, det), "[… 128 characters trimmed …]");
         // A name is cut anywhere.
         assert_eq!(clip_name(&"n".repeat(70), 64).chars().count(), 64);
         // A chunk's hard cut moves back to the start of the token it falls inside.
+        let cut = |rest: &str, limit| cut_point(&Cuts::new(rest, det), 0, limit, MAX_CHUNK_BYTES);
         for sep in [" ", ":", "ก"] {
             let rest = format!("{}{sep}{token} more", "w".repeat(300));
             let at = 300 + sep.len();
-            assert_eq!(cut_point(&rest, at + 60), at, "{sep:?}");
-            assert_eq!(cut_point(&rest, at), at, "between two tokens: {sep:?}");
+            assert_eq!(cut(&rest, at + 60), at, "{sep:?}");
+            assert_eq!(cut(&rest, at), at, "between two tokens: {sep:?}");
         }
-        assert_eq!(cut_point(&"w".repeat(500), 400), 400, "one token: cut hard");
+        assert_eq!(cut(&"w".repeat(500), 400), 400, "one token: cut hard");
     }
 
     #[test]

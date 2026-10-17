@@ -337,7 +337,13 @@ fn read_with(
                     Some(r) => r.apply(&text).text,
                     None => text,
                 })
-                .and_then(|text| first_sentence(&text, PROMPT_CHARS)),
+                .and_then(|text| {
+                    first_sentence(
+                        &text,
+                        PROMPT_CHARS,
+                        redactor.unwrap_or_else(|| Redactor::builtin_shared()),
+                    )
+                }),
             chunks: render::turn(&turn, opts, redactor),
             start: turn.start as u64,
             key: turn.key,
@@ -352,8 +358,9 @@ fn read_with(
 }
 
 /// The text up to the first sentence end (`.`, `!` or `?` followed by a space or the end), the
-/// first line break, or `max_chars` characters, whichever comes first.
-fn first_sentence(text: &str, max_chars: usize) -> Option<String> {
+/// first line break, or `max_chars` characters, whichever comes first, moved back to before a
+/// secret ([`Redactor::spans`]) that end falls inside (re-review N2).
+fn first_sentence(text: &str, max_chars: usize, det: &Redactor) -> Option<String> {
     let text = text.trim();
     let mut end = text.len();
     let mut chars = text.char_indices().peekable();
@@ -371,6 +378,11 @@ fn first_sentence(text: &str, max_chars: usize) -> Option<String> {
             break;
         }
     }
+    let end = if end < text.len() {
+        render::Cuts::new(text, det).end_before(end)
+    } else {
+        end
+    };
     let sentence = text[..end].trim();
     (!sentence.is_empty()).then(|| sentence.to_owned())
 }

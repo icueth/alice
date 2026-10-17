@@ -497,3 +497,297 @@ async fn a_captured_secret_is_stored_as_written_and_distillation_never_sends_it(
     l.assert_no_secret_left();
     l.svc.shutdown();
 }
+
+// ---------------------------------------------------------------------------------------
+// Re-review N1: capture's trims and cuts in a store that keeps secrets as written. A secret
+// whose detector needs context in another token or on another line (a URL's scheme and user,
+// a `password:` keyword, a private key's `BEGIN` line) sits across each cut: the 500/300 trim
+// of a tool's output, a hard cut inside one long line, a chunk's continuation. The stored
+// chunks keep it whole and as written, and no request to Jev or to the remote embedder holds a
+// piece of it. The tests assert on the recorded request bytes.
+// ---------------------------------------------------------------------------------------
+
+mod context {
+    pub const URL_PW: &str = concat!("Rk4v", "-Thailand-2026");
+    pub const YAML_PW: &str = concat!("VGhh", "aWxhbmQtMjAyNi1zZWNyZXQ");
+
+    pub fn url() -> String {
+        format!("postgres://ops:{URL_PW}@db.internal:5432/app")
+    }
+
+    pub fn yaml() -> String {
+        format!("password: {YAML_PW}")
+    }
+
+    /// A 3,300-character RSA-shaped private key's lines, none repeated.
+    pub fn pem_lines() -> Vec<String> {
+        const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            B64[(x % 64) as usize] as char
+        };
+        let mut lines: Vec<String> = (0..50).map(|_| (0..64).map(|_| next()).collect()).collect();
+        lines.push((0..40).map(|_| next()).collect::<String>() + "==");
+        lines
+    }
+
+    pub fn pem(sep: &str) -> String {
+        format!(
+            "{}{sep}{}{sep}{}",
+            concat!("-----BEGIN RSA PRIVATE ", "KEY-----"),
+            pem_lines().join(sep),
+            concat!("-----END RSA PRIVATE ", "KEY-----")
+        )
+    }
+
+    /// The first piece of a secret found in `text`: 8 characters of a password, 16 of a key's
+    /// line.
+    pub fn leak(text: &str) -> Option<String> {
+        let windows = |p: &str, n: usize| -> Vec<String> {
+            let c: Vec<char> = p.chars().collect();
+            c.windows(n).map(|w| w.iter().collect()).collect()
+        };
+        windows(URL_PW, 8)
+            .into_iter()
+            .chain(windows(YAML_PW, 8))
+            .chain(pem_lines().iter().flat_map(|l| windows(l, 16)))
+            .find(|w| text.contains(w.as_str()))
+    }
+}
+
+/// `n` characters of `.env`-style lines, ending in a line break.
+fn env_lines(n: usize) -> String {
+    let mut s = String::new();
+    while s.len() + 13 <= n {
+        s.push_str("LOG_LEVEL=ok\n");
+    }
+    if s.len() < n {
+        s.push_str(&"#".repeat(n - s.len() - 1));
+        s.push('\n');
+    }
+    s
+}
+
+/// A transcript line.
+fn jl(v: serde_json::Value) -> Vec<u8> {
+    let mut b = serde_json::to_vec(&v).unwrap();
+    b.push(b'\n');
+    b
+}
+
+fn user(id: &str, content: serde_json::Value) -> Vec<u8> {
+    jl(
+        json!({"type": "user", "uuid": id, "timestamp": "2026-10-17T10:00:00.000Z",
+        "isSidechain": false, "message": {"role": "user", "content": content}}),
+    )
+}
+
+fn assistant(id: &str, content: serde_json::Value) -> Vec<u8> {
+    jl(
+        json!({"type": "assistant", "uuid": id, "timestamp": "2026-10-17T10:00:01.000Z",
+        "isSidechain": false, "message": {"id": format!("msg-{id}"), "type": "message",
+        "role": "assistant", "content": content, "stop_reason": "end_turn"}}),
+    )
+}
+
+/// A session whose agent ran `cat` and got `output`.
+fn tool_session(s: &str, output: &str) -> Vec<u8> {
+    let mut b = user(
+        &format!("{s}-p"),
+        json!("Show me the ops box's settings, please."),
+    );
+    b.extend(assistant(
+        &format!("{s}-a"),
+        json!([{"type": "tool_use", "id": format!("{s}-t"), "name": "Bash",
+                "input": {"command": "cat .env"}}]),
+    ));
+    b.extend(user(
+        &format!("{s}-r"),
+        json!([{"type": "tool_result", "tool_use_id": format!("{s}-t"), "content": output}]),
+    ));
+    b.extend(assistant(
+        &format!("{s}-c"),
+        json!([{"type": "text", "text": "Those are the ops box's settings."}]),
+    ));
+    b
+}
+
+/// A session of one prompt and one reply.
+fn talk_session(s: &str, prompt: &str, reply: &str) -> Vec<u8> {
+    let mut b = user(&format!("{s}-p"), json!(prompt));
+    b.extend(assistant(
+        &format!("{s}-a"),
+        json!([{"type": "text", "text": reply}]),
+    ));
+    b
+}
+
+/// Every secret across every cut, each in a session (and a project) of its own: the session,
+/// and what a stored chunk holds of the secret, whole.
+fn placements() -> Vec<(String, Vec<u8>, String)> {
+    use context::*;
+    let mut out = Vec::new();
+    let lead = "Here is what the ops box uses, keep it safe:\n";
+    for which in ["url", "yaml", "pem"] {
+        let (line, inline, whole) = match which {
+            "url" => (
+                format!("DATABASE_URL={}", url()),
+                url(),
+                format!("postgres://ops:{URL_PW}@"),
+            ),
+            "yaml" => (format!("  {}", yaml()), yaml(), yaml()),
+            _ => (pem("\n"), pem(" "), pem("\n")),
+        };
+        // Offsets the old rule split at: inside `//ops`, inside the keyword or after it, inside
+        // one of the key's lines.
+        let into = |text: &str, nth: usize| match which {
+            "url" => text.find("//ops").unwrap() + 1,
+            "yaml" => text.find("password").unwrap() + 3,
+            _ => text.find(&pem_lines()[nth]).unwrap() + 10,
+        };
+        let s = format!("{which}-tail");
+        // The tail (the last 300 of 800) starts inside the secret.
+        let c = into(&line, 48);
+        let output = format!(
+            "{}{line}\n{}LAST=1",
+            env_lines(1000),
+            env_lines(300 + c - line.len() - 7)
+        );
+        out.push((s.clone(), tool_session(&s, &output), whole.clone()));
+        // The head (the first 500) ends inside it.
+        let s = format!("{which}-head");
+        let output = format!(
+            "{}{line}\n{}LAST=1",
+            env_lines(500 - into(&line, 5)),
+            env_lines(1200)
+        );
+        out.push((s.clone(), tool_session(&s, &output), whole.clone()));
+        // A hard cut inside one long line: the limit (2,000 less the tag) falls inside it.
+        let s = format!("{which}-cut");
+        let ci = if which == "yaml" {
+            "password: ".len()
+        } else {
+            into(&inline, 20)
+        };
+        let limit = 2000 - "[assistant] ".len();
+        let reply = format!("{}{inline} {}", words(limit - ci), words(1500));
+        let whole_inline = if which == "pem" {
+            inline.clone()
+        } else {
+            whole.clone()
+        };
+        out.push((
+            s.clone(),
+            talk_session(&s, "Paste the ops box's settings.", &reply),
+            whole_inline,
+        ));
+        // A chunk's continuation, in a prompt of several lines whose first paragraph is short.
+        let s = format!("{which}-cont");
+        let prompt = if which == "pem" {
+            format!("{lead}{line}\n\nThanks.")
+        } else {
+            let limit = 2000 - "[user] ".len();
+            format!(
+                "{lead}{}{inline} {}\nThanks.",
+                words(limit - lead.len() - ci),
+                words(1500)
+            )
+        };
+        out.push((
+            s.clone(),
+            talk_session(&s, &prompt, "Noted."),
+            whole.clone(),
+        ));
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secret_across_any_capture_cut_is_kept_whole_and_never_reaches_the_cloud() {
+    let l = Local::start();
+    assert!(!l.svc.settings().privacy.redact);
+    let cases = placements();
+    for (session, bytes, _) in &cases {
+        let answer = l
+            .svc
+            .capture_transcript(
+                TranscriptQuery {
+                    agent: "claude-code".into(),
+                    session: session.clone(),
+                    offset: 0,
+                    event: "session-end".into(),
+                    cwd: Some(l.repo(session)),
+                    ..Default::default()
+                },
+                axum::body::Bytes::from(bytes.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap_or_else(|c| panic!("refused behind the cursor {c}"));
+        assert!(answer.turns_stored >= 1, "{session}");
+    }
+    // Stored whole and as written.
+    let db = l.db();
+    for (session, _, whole) in &cases {
+        let n: i64 = db
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE instr(text, ?1) > 0",
+                [whole],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(n >= 1, "{session}: a chunk keeps the secret whole");
+    }
+    drop(db);
+    let sessions = cases.len() as i64;
+    until(
+        "every session is distilled and every chunk embedded",
+        || {
+            l.count("SELECT count(*) FROM capture_state WHERE distill_state = 'done'") >= sessions
+                && l.count("SELECT count(*) FROM chunks WHERE embed_state <> 'done'") == 0
+                && l.count("SELECT count(*) FROM memories WHERE embed_state <> 'done'") == 0
+        },
+    )
+    .await;
+    // Precise recall over the raw tier: each project's chunks go to Jev as results.
+    for (session, _, _) in &cases {
+        l.svc
+            .recall(RecallRequest {
+                query: "what the ops box uses for its database password and key".into(),
+                project: Some(session.clone()),
+                include_raw: true,
+                mode: Some(RecallMode::Precise),
+                format: OutputFormat::Json,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let bodies = l.jev.bodies.lock().clone();
+    let embedded = l.embedded.lock().clone();
+    for marker in [
+        "[REDACTED:url_credentials]",
+        "[REDACTED:password_assignment]",
+        "[REDACTED:pem_private_key]",
+    ] {
+        assert!(
+            bodies.iter().any(|b| b.contains(marker)),
+            "a Jev request carried the redacted {marker}"
+        );
+        assert!(
+            embedded.iter().any(|t| t.contains(marker)),
+            "the embedder got the redacted {marker}"
+        );
+    }
+    for b in &bodies {
+        assert_eq!(context::leak(b), None, "a Jev request: {b}");
+    }
+    for t in &embedded {
+        assert_eq!(context::leak(t), None, "an embedder input: {t}");
+    }
+    l.assert_no_secret_left();
+    l.svc.shutdown();
+}
