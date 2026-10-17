@@ -280,8 +280,8 @@ from this evaluation's findings, not from tuning on this set.
   - `preference_user` is now "a preference of this person that holds in every project (tools, style, language)", and
     `preference_project` "a rule or convention for this repository only".
   - A cap per session (`distill.max_per_session`, 16) and a share for subagent runs (`distill.max_per_subagent_run`, 2).
-    Within those caps, passages rank by priority first (the main session before a subagent, then decision, bugfix,
-    warning, fact, howto, preference) and by p second. No session of this set reaches the caps.
+    Within those caps, passages rank by priority first (a handoff first, then the main session before a subagent,
+    then decision, bugfix, warning, fact, howto, preference) and by p second. No session of this set reaches the caps.
   - A title is taken from the passage's first sentence when the heading is bare, and compaction summaries in the real
     format are cut into their sections. Questions went from 226 to 220 (s04, s09, s16, s21 and s29).
 - **Task 11b** (the judge as the dedupe net): see "Doubles by cause" above. It also makes stale ends due, which this
