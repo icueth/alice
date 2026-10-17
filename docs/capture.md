@@ -262,7 +262,8 @@ distilled, newest first. Older ones, and sessions captured by a backfill, are di
 
 - **When.** A session is distilled when it ends (`SessionEnd`, or 24 hours without any event when it captured something
   in the last 8 days; an older one waits for you to ask), when it is compacted (`PreCompact`), when it has been quiet
-  for `distill.idle_minutes` (default 15), or when you run `alice capture distill <session-id>`.
+  for `distill.idle_minutes` (default 15), or when you run `alice capture distill <session-id>`. A session you resume
+  after it ended is open again from its first new turn: its quiet pauses do not count as ends, and its next end does.
 - **Extractive.** Jev answers choice questions only, so a distilled memory is **a passage of your session**, chosen and
   classified by Jev, never new text. Alice proposes up to 40 passages per run: compaction summaries first, then each
   turn's concluding text, then statements you made, then subagent reports. Passages that hold `[withheld:`, are mostly a
@@ -281,9 +282,10 @@ distilled, newest first. Older ones, and sessions captured by a backfill, are di
   full session's too, so a better passage later in the session replaces the weakest one kept, once the judge has kept
   the new one (a restatement the judge trashes as a duplicate replaces nothing; one the judge relates to a kept memory,
   such as a newer value of it, replaces that memory first); the replaced memory goes to the trash (by
-  `distill:cap`, and you can restore it like any other), and its passage stays in the raw capture. A handoff gets in
-  in place of the weakest. The cap never replaces the session's handoff, nor a distilled memory that you or an agent
-  edited, moved, restored, linked to or cited in a fact after it was distilled; those keep their slots. When no
+  `distill:cap`, and you can restore it like any other), and its passage stays in the raw capture. A handoff takes no
+  slot: the session keeps only its newest one (a newer handoff supersedes the older one), and it never pushes out a
+  kept memory. The cap never replaces a distilled memory that you or an agent edited, moved, restored, linked to or
+  cited in a fact after it was distilled; those keep their slots. When no
   memory that may go is weaker, the new passage is not stored. A distilled memory you saved again word for word is
   yours: it leaves the set and frees its slot.
 - **The memory.** The passage (at most 1,200 characters), titled with its first sentence, passing over `#` headings;

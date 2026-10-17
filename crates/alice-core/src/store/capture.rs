@@ -353,7 +353,7 @@ pub struct Progress<'a> {
     /// back; `byte_offset` is set as given.
     pub cursor: Option<(u64, i64)>,
     pub last_event: Option<&'a str>,
-    /// The session ended (never cleared here).
+    /// The session ended with this slice.
     pub ended: bool,
     /// The slice captured something (`last_capture_at` becomes now).
     pub captured: bool,
@@ -363,7 +363,10 @@ pub struct Progress<'a> {
 /// must not hand a later pass ords that are taken (their chunks would be dropped by `INSERT OR
 /// IGNORE` while their turn keys are recorded, and the turns lost). `byte_offset` is set as given,
 /// since a replaced file resets it on purpose (`set_file_key`), and a turn read again is skipped
-/// by its key.
+/// by its key. A slice that ends the session marks it `ended`; one that captured something
+/// without ending it clears `ended` (final review B-I2): a session resumed after its end (or its
+/// stale end) is open again, so its later quiet runs are not closing runs, and its next end, or
+/// stale end, closes it again. A slice that captured nothing leaves `ended` as it is.
 pub fn advance(conn: &Connection, source_id: &str, p: &Progress<'_>) -> Result<()> {
     let (byte_offset, next_ord) = match p.cursor {
         Some((b, o)) => (Some(offset(b)), Some(o)),
@@ -373,7 +376,8 @@ pub fn advance(conn: &Connection, source_id: &str, p: &Progress<'_>) -> Result<(
     conn.prepare_cached(
         "UPDATE capture_state SET byte_offset = COALESCE(?2, byte_offset),
             next_ord = MAX(next_ord, COALESCE(?3, next_ord)), last_event = COALESCE(?4, last_event),
-            last_capture_at = COALESCE(?5, last_capture_at), ended = MAX(ended, ?6)
+            last_capture_at = COALESCE(?5, last_capture_at),
+            ended = CASE WHEN ?6 THEN 1 WHEN ?5 IS NOT NULL THEN 0 ELSE ended END
          WHERE source_id = ?1",
     )?
     .execute(params![

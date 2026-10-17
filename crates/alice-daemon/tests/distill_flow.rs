@@ -1390,6 +1390,114 @@ async fn the_quiet_trigger_distills_an_open_session() {
     d.shutdown();
 }
 
+/// Final review B-I2: a session resumed after its end (`claude --resume` writes on in the same
+/// file) is open again, so its quiet pauses are not closing runs: no handoff is offered while it
+/// works, however its last reply reads. Its next end offers one again, and the session keeps
+/// that newest handoff only: the first one is superseded by it. Neither handoff takes the slot
+/// of a durable memory: the room of 2 holds both facts, and nothing is evicted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_session_keeps_one_handoff_and_every_fact() {
+    let config =
+        "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 2\n";
+    let d = Daemon::start(
+        Opts {
+            config,
+            idle: Some(Duration::from_millis(400)),
+            ..Opts::jev()
+        },
+        DistillScript::new(&[
+            ("Alpha note", "fact"),
+            ("Beta note", "fact"),
+            ("Where things stand:", "handoff"),
+        ]),
+    );
+    let handoffs = |d: &Daemon| -> Vec<(String, String)> {
+        d.distilled()
+            .into_iter()
+            .filter(|m| m.kind == "handoff")
+            .map(|m| (m.body, m.status))
+            .collect()
+    };
+    let mut t = Transcript::default();
+    t.prompt("rs-p1", "Where does the crane schedule live?")
+        .reply(
+            "rs-a1",
+            "Alpha note: the harbour crane schedule lives in the ops folder and changes every week.",
+        )
+        .prompt("rs-p2", "Where do we stand?")
+        .reply(
+            "rs-a2",
+            "Where things stand: the crane schedule is written down, and next we wire up the berth planner.",
+        );
+    d.send("shop", "rs1", &t, 0, "session-end").await;
+    until("the ended session is distilled and judged", || {
+        d.state(&uri("rs1")).state == "done" && d.distilled().len() == 2 && settled(&d)
+    })
+    .await;
+    assert!(d.state(&uri("rs1")).ended);
+    assert_eq!(handoffs(&d).len(), 1, "{:?}", d.distilled());
+
+    // Resumed: two quiet pauses whose last reply reads as a handoff.
+    for (step, fact) in [(3, true), (5, false)] {
+        let off = t.len();
+        let calls = d.script.distill_calls();
+        if fact {
+            t.prompt("rs-p3", "How does the berth planner work?").reply(
+                "rs-a3",
+                "Beta note: the berth planner reads the tide table from the shared drive before each shift.",
+            );
+        }
+        t.prompt(&format!("rs-p{}", step + 1), "Where do we stand now?")
+            .reply(
+                &format!("rs-a{}", step + 1),
+                &format!(
+                    "Where things stand: step {step} is done, and next we try the planner on the north quay."
+                ),
+            );
+        d.send("shop", "rs1", &t, off, "stop").await;
+        assert!(
+            !d.state(&uri("rs1")).ended,
+            "new turns after the end reopen the session"
+        );
+        until("the quiet pause is distilled and judged", || {
+            let st = d.state(&uri("rs1"));
+            d.script.distill_calls() > calls
+                && st.state == "done"
+                && st.distill_ord == st.next_ord
+                && settled(&d)
+        })
+        .await;
+        assert!(
+            last_distill_options(&d.script)
+                .iter()
+                .all(|o| !o.iter().any(|x| x == "handoff")),
+            "a quiet pause offers no handoff (step {step})"
+        );
+        assert_eq!(handoffs(&d).len(), 1, "step {step}: {:?}", d.distilled());
+    }
+
+    // Its next end offers one again: the newest replaces the first, and no fact leaves.
+    let off = t.len();
+    t.prompt("rs-p7", "Wrap up for today?").reply(
+        "rs-a7",
+        "Where things stand: the planner runs on the north quay, and next we add the south quay.",
+    );
+    d.send("shop", "rs1", &t, off, "session-end").await;
+    until("the second end is distilled and judged", || {
+        handoffs(&d).len() == 2 && settled(&d)
+    })
+    .await;
+    let h = handoffs(&d);
+    assert_eq!(h[0].1, "superseded", "{h:?}");
+    assert!(h[0].0.contains("crane schedule is written down"), "{h:?}");
+    assert_eq!(h[1].1, "active", "{h:?}");
+    assert!(h[1].0.contains("north quay, and next we add"), "{h:?}");
+    assert_eq!(status_of(&d, "Alpha note"), "active");
+    assert_eq!(status_of(&d, "Beta note"), "active");
+    assert_eq!(cap_trashes(&d), 0, "a handoff evicts no fact");
+    d.shutdown();
+}
+
 // ---- More of the behaviour ----
 
 /// Spec §6.2, §8.4: with `judge.provider = jev` and no key, the source waits for the judge and
@@ -2936,7 +3044,8 @@ fn last_distill_options(script: &DistillScript) -> Vec<Vec<String>> {
 /// Task 12c, the controller's ruling P1 and M1: `max_per_session` (4 here) is the size of the
 /// session's best set. A full session is still asked about each run; a better later passage
 /// replaces the weakest held memory (trashed by `distill:cap`); a worse one is not stored; the
-/// handoff of a compaction always enters; and a superseded memory holds no slot.
+/// handoff of a compaction always enters, outside the room (final review B-I2), so it replaces
+/// nothing; and a superseded memory holds no slot.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_session_keeps_its_best_memories() {
     let config =
@@ -3031,7 +3140,8 @@ async fn a_full_session_keeps_its_best_memories() {
         ]
     );
 
-    // A compaction: its handoff always enters, and a better fact replaces the last weak one.
+    // A compaction: its handoff always enters, beside the set (it replaces nothing), and a
+    // better fact replaces one of the weak ones.
     let off = t.len();
     add(&mut t, "Extra fact");
     t.prompt("bn-hp", "Where are we?").reply("bn-ha", HANDOFF);
@@ -3042,7 +3152,13 @@ async fn a_full_session_keeps_its_best_memories() {
     .await;
     assert_eq!(
         live(&d),
-        ["Extra fact", "Strong fact", "Strong fact", "Where things"]
+        [
+            "Extra fact",
+            "Strong fact",
+            "Strong fact",
+            "Weak fact",
+            "Where things"
+        ]
     );
     assert!(
         d.distilled()
@@ -3070,16 +3186,24 @@ async fn a_full_session_keeps_its_best_memories() {
     assert_eq!((run.stored, run.capped), (1, 0), "{run:?}");
     assert_eq!(
         live(&d),
-        ["Strong fact", "Strong fact", "Weaker fact", "Where things"]
+        [
+            "Strong fact",
+            "Strong fact",
+            "Weak fact",
+            "Weaker fact",
+            "Where things"
+        ]
     );
-    assert_eq!(cap_trashes(&d), 4, "nothing more was evicted");
+    assert_eq!(cap_trashes(&d), 3, "nothing more was evicted");
     d.shutdown();
 }
 
 /// The Task 12c addendum (pane 4): `distill:cap` never replaces a memory a person or an agent
-/// touched, nor the session's handoff; those still hold their slots. A memory an explicit exact
-/// copy promoted is no longer distilled: it holds no slot. When no member that may go is weaker
-/// (here: every one is protected), the newcomer is not stored, and the run's record counts it.
+/// touched; those still hold their slots. A memory an explicit exact copy promoted is no longer
+/// distilled: it holds no slot. When no member that may go is weaker (here: every one is
+/// protected), the newcomer is not stored, and the run's record counts it. A handoff is outside
+/// the room (final review B-I2): it enters the full set without replacing anything, and one the
+/// agent touched stays beside a newer one.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_cap_never_replaces_what_a_person_or_an_agent_touched() {
     let config =
@@ -3213,7 +3337,7 @@ async fn the_cap_never_replaces_what_a_person_or_an_agent_touched() {
     assert_ne!((origin.as_str(), status.as_str()), ("distill", "trashed"));
     assert_ne!(status, "trashed");
 
-    // A compaction: its handoff enters in place of a strong passage nobody touched.
+    // A compaction: its handoff enters beside the full set; no strong passage leaves.
     let off = t.len();
     t.prompt("pt-hp", "Where are we?").reply("pt-ha", HANDOFF);
     d.send("shop", "pt1", &t, off, "pre-compact").await;
@@ -3222,34 +3346,41 @@ async fn the_cap_never_replaces_what_a_person_or_an_agent_touched() {
     })
     .await;
     let held = live(&d);
-    assert_eq!(held.len(), 4);
+    assert_eq!(held.len(), 5);
     let handoff = held
         .iter()
         .find(|m| m.kind == "handoff")
         .unwrap()
         .id
         .clone();
-    let strong = held
+    let strong: Vec<String> = held
         .iter()
-        .find(|m| m.body.starts_with("Strong fact"))
-        .unwrap()
-        .id
-        .clone();
-    d.svc
-        .update(UpdateRequest {
-            id: strong.clone(),
-            update: MemoryUpdate {
-                action: UpdateAction::Edit,
-                title: Some("Strong fact, checked".into()),
-                ..Default::default()
-            },
-            author: agent(),
-        })
-        .await
-        .unwrap();
+        .filter(|m| m.body.starts_with("Strong fact"))
+        .map(|m| m.id.clone())
+        .collect();
+    assert_eq!(strong.len(), 2);
+    for (id, title) in [
+        (&strong[0], "Strong fact, checked"),
+        (&strong[1], "Strong fact, checked too"),
+        (&handoff, "Where things stand, checked"),
+    ] {
+        d.svc
+            .update(UpdateRequest {
+                id: id.clone(),
+                update: MemoryUpdate {
+                    action: UpdateAction::Edit,
+                    title: Some(title.into()),
+                    ..Default::default()
+                },
+                author: agent(),
+            })
+            .await
+            .unwrap();
+    }
+    until("the edits are judged", || settled(&d)).await;
 
-    // Every member is protected now: a later compaction's handoff does not replace the
-    // session's, and a better fact replaces nothing. Neither is stored; the run counts them.
+    // Every member is protected now: a better fact replaces nothing and is not stored (the run
+    // counts it). A later compaction's handoff is stored, and the one the agent touched stays.
     let trashed_before = d
         .distilled()
         .iter()
@@ -3265,9 +3396,23 @@ async fn the_cap_never_replaces_what_a_person_or_an_agent_touched() {
     until("the last run is over", || d.svc.distill_runs().len() == 4).await;
     let run = d.svc.distill_runs()[3].clone();
     assert!(run.questions > 0, "{run:?}");
-    assert_eq!((run.stored, run.capped), (0, 2), "{run:?}");
+    assert_eq!((run.stored, run.capped), (1, 1), "{run:?}");
+    until("the newer handoff is judged", || settled(&d)).await;
+    let newer = d
+        .distilled()
+        .into_iter()
+        .find(|m| m.body.starts_with("Where we are now"))
+        .unwrap()
+        .id;
     let mut after = ids(live(&d));
-    let mut want = vec![weak[0].id.clone(), weak[1].id.clone(), strong, handoff];
+    let mut want = vec![
+        weak[0].id.clone(),
+        weak[1].id.clone(),
+        strong[0].clone(),
+        strong[1].clone(),
+        handoff,
+        newer,
+    ];
     after.sort();
     want.sort();
     assert_eq!(after, want);

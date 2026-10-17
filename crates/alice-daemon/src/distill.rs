@@ -33,10 +33,11 @@
 //!    of live distilled memories, the best by rank; the room is [`distill::room`] of the
 //!    session's captured turns, `distill.max_per_session` for the first 100 and growing up to
 //!    `distill.max_per_session_cap`, Task 12d; a passage better than the weakest that may go is
-//!    stored, never in place of a handoff nor of a memory a person or an agent touched; with
-//!    none to outrank it is not stored, and the run counts it in `capped`), then each written
-//!    with [`write_memory`] in the project of the source it came from: redacted with that
-//!    project's rules, `origin = distill`, its rank inputs, its chunks as provenance and an
+//!    stored, never in place of a memory a person or an agent touched; with none to outrank it
+//!    is not stored, and the run counts it in `capped`; a handoff is outside the room, always
+//!    stored, and the writer keeps the session's newest one only, final review B-I2), then each
+//!    written with [`write_memory`] in the project of the source it came from: redacted with
+//!    that project's rules, `origin = distill`, its rank inputs, its chunks as provenance and an
 //!    idempotency key, so a repeated run (a crash before the cursor moved) stores nothing twice.
 //!    Nothing is evicted here: once the judge finds a newcomer live in a full set, the writer
 //!    trashes a member that may go, by `distill:cap` (Task 12c review I1, option b): one the
@@ -686,6 +687,8 @@ impl DistillCtl {
             uri: src.uri.clone(),
             project: slug.clone(),
             project_names,
+            // `ended` holds only until a resumed session stores a new turn (final review B-I2),
+            // so a resumed session's quiet runs are not closing runs.
             closes_session: !loaded.main_cut
                 && (src.ended
                     || matches!(
