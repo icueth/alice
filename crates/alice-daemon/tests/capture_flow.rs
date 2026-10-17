@@ -22,6 +22,13 @@ const GITHUB: &str = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
 const GITHUB_CORE: &str = "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
 const ANTHROPIC: &str = concat!("sk-", "ant-api03-abcdefghijklmnopqrstuvwxyz012345");
 const ANTHROPIC_CORE: &str = "abcdefghijklmnopqrstuvwxyz012345";
+/// An `sk-proj-` key: the prefix and 160 characters of a key's alphabet.
+const OPENAI: &str = concat!(
+    "sk-",
+    "proj-",
+    "jD4XP_qW9yLWXUgo5RApWBKupwr-wVenptzp2muJRWt1wEklnUn27KT1Al__tQLPxWrL_THZ-TGwJJW5",
+    "yJOclDANbMBP46nds-uyC48v0mOB-cSSZ5kCGF4Dl5zDSHwt8dZ8Ntu162u9_88Qt5B5kLC-tktu4xw9"
+);
 
 fn options(tenant: bool) -> ServiceOptions {
     ServiceOptions {
@@ -556,6 +563,59 @@ async fn the_server_redacts_and_never_reads_paths() {
                     p.display()
                 );
             }
+        }
+    }
+}
+
+/// Final review A-I1: an `OPENAI_API_KEY=sk-proj-…` line where the trim of a tool's output cuts
+/// (it keeps the first 500 and the last 300 characters) was stored as the key's rest, which no
+/// detector knows. The output is redacted whole before the trim, so no part of the key is
+/// stored: on a tenant (redacted) and on a local home in `block` mode (withheld).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_across_the_tool_output_trim_leaves_no_fragment() {
+    let assignment = format!("OPENAI_API_KEY={OPENAI}");
+    // The trim's tail starts 71 characters into the key's body; its head ends 70 into it.
+    let tail = format!(
+        "{}{assignment}\n{}LAST=1",
+        "HOME=/home/user\n".repeat(100),
+        "DEBUG=false\n".repeat(17)
+    );
+    let head = format!(
+        "{}PWD=/x\n{assignment}\n{}",
+        "HOME=/home/user\n".repeat(25),
+        "LANG=C.UTF-8\n".repeat(120)
+    );
+    let body = &OPENAI["sk-proj-".len()..];
+    let fragment = |text: &str| {
+        (0..=body.len() - 10)
+            .map(|i| &body[i..i + 10])
+            .find(|w| text.contains(w))
+            .map(str::to_owned)
+    };
+    let (_t, tenant) = tenant();
+    let home = home_with("[privacy]\nredact_mode = \"block\"\n");
+    let local = start_in(home.path(), false);
+    for (svc, marker) in [
+        (&tenant, "[REDACTED:openai_key]"),
+        (&local, "[withheld: openai_key]"),
+    ] {
+        for (case, output) in [("tail", &tail), ("head", &head)] {
+            let s = format!("key-{case}");
+            let mut t = Transcript::default();
+            t.prompt(&format!("{s}-p1"), "Show the environment.")
+                .tool_use(&format!("{s}-a1"), "tool-1", "cat .env")
+                .tool_result(&format!("{s}-r1"), "tool-1", output)
+                .reply(&format!("{s}-a2"), "Those are the variables.");
+            let a = send(svc, q(&s, 0, "stop"), &t.bytes).await;
+            assert_eq!(a.turns_stored, 1, "{marker} {case}");
+            let chunks = chunks_of(svc, &uri(&s));
+            for (_, text) in &chunks {
+                assert_eq!(fragment(text), None, "{marker} {case}: {text}");
+            }
+            assert!(
+                chunks.iter().any(|(_, t)| t.contains(marker)),
+                "{marker} {case}: {chunks:?}"
+            );
         }
     }
 }

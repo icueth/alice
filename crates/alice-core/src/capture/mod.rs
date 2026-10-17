@@ -17,6 +17,8 @@ pub use render::{MEMORY_TOOLS, TAGS, trim};
 
 use sha2::{Digest, Sha256};
 
+use crate::redact::Redactor;
+
 use record::{GroupOptions, Located, Record};
 
 /// A line longer than this is not parsed; it leaves `[record skipped: too large]` in its turn.
@@ -165,6 +167,10 @@ pub struct RenderedChunk {
     pub text: String,
     /// The time of the chunk's first timestamped record.
     pub authored_at: Option<String>,
+    /// The detectors that found a secret in the whole text of a block this chunk holds all or
+    /// part of, before it was trimmed or cut ([`read_redacted`]). The text holds their
+    /// `[REDACTED:…]` markers; in `block` mode the chunk is withheld. Empty from [`read`].
+    pub secrets: Vec<String>,
 }
 
 /// Line counts of one pass. `lines` counts every complete line.
@@ -205,7 +211,57 @@ pub fn turn_key(first_uuid: Option<&str>, timestamp: Option<&str>, first_text: &
 /// [`MAX_PASS_BYTES`] are read, and only complete lines (ending in `\n`) are used. The one
 /// exception is a Codex zstd rollout at the file start, which is consumed whole (see
 /// [`ReadOutcome::consumed`], which also states the limit of that skip).
+///
+/// The text is not redacted: what is stored is read with [`read_redacted`].
 pub fn read(agent: AgentKind, input: &[u8], opts: &ReadOptions) -> ReadOutcome {
+    read_with(agent, input, opts, None)
+}
+
+/// [`read`], with every kept text redacted by `redactor` whole, before anything trims, clips or
+/// cuts it (final review A-I1). A key cut first would leave a fragment that no detector knows:
+/// they know a key by its prefix (`sk-`) or by its `NAME=` context.
+///
+/// ```
+/// use alice_core::capture::{AgentKind, ReadOptions, read_redacted};
+/// use alice_core::redact::Redactor;
+///
+/// let key = concat!("sk-", "proj-", "jD4XP_qW9yLWXUgo5RApWBKupwr-wVenptzp2muJRWt1wEklnUn27KT1A");
+/// // 1,623 characters: the trim keeps the last 300, from the key's 21st character on.
+/// let output = format!(
+///     "{}OPENAI_API_KEY={key}\n{}LAST=1",
+///     "HOME=/home/user\n".repeat(80),
+///     "DEBUG=0\n".repeat(32)
+/// );
+/// let lines = [
+///     serde_json::json!({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Show the env."}}),
+///     serde_json::json!({"type": "assistant", "uuid": "a1", "message": {"id": "m1", "role": "assistant",
+///         "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "cat .env"}}]}}),
+///     serde_json::json!({"type": "user", "uuid": "r1", "message": {"role": "user",
+///         "content": [{"type": "tool_result", "tool_use_id": "t1", "content": output}]}}),
+/// ];
+/// let input: String = lines.iter().map(|l| format!("{l}\n")).collect();
+/// let opts = ReadOptions { close_trailing: true, force_close: true, ..ReadOptions::default() };
+/// let out = read_redacted(AgentKind::ClaudeCode, input.as_bytes(), &opts, &Redactor::builtin());
+/// let chunks = &out.turns[0].chunks;
+/// // The tail of the 800-character trim starts inside the key: its rest is not kept.
+/// assert!(chunks.iter().all(|c| !c.text.contains("wEklnUn27KT1A")));
+/// assert!(chunks.iter().any(|c| c.secrets == ["openai_key"]));
+/// ```
+pub fn read_redacted(
+    agent: AgentKind,
+    input: &[u8],
+    opts: &ReadOptions,
+    redactor: &Redactor,
+) -> ReadOutcome {
+    read_with(agent, input, opts, Some(redactor))
+}
+
+fn read_with(
+    agent: AgentKind,
+    input: &[u8],
+    opts: &ReadOptions,
+    redactor: Option<&Redactor>,
+) -> ReadOutcome {
     let mut out = ReadOutcome::default();
     let parse: fn(&[u8]) -> claude::LineResult = match agent {
         AgentKind::ClaudeCode => claude::parse_line,
@@ -277,13 +333,17 @@ pub fn read(agent: AgentKind, input: &[u8], opts: &ReadOptions) -> ReadOutcome {
                 .records
                 .first()
                 .and_then(Record::real_prompt)
+                .map(|text| match redactor {
+                    Some(r) => r.apply(&text).text,
+                    None => text,
+                })
                 .and_then(|text| first_sentence(&text, PROMPT_CHARS)),
-            chunks: render::turn(&turn, opts),
+            chunks: render::turn(&turn, opts, redactor),
             start: turn.start as u64,
             key: turn.key,
         })
         .collect();
-    out.tail = render::records(&grouped.tail, opts);
+    out.tail = render::records(&grouped.tail, opts, redactor);
     out.tail_key = grouped
         .tail
         .first()

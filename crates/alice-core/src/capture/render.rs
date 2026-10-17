@@ -3,7 +3,14 @@
 //! The format is a contract: the distiller parses chunks back by [`TAGS`]. Each block is a line
 //! that starts with its tag, and a block's text may run over several lines until the next tag.
 //! A chunk holds only those lines, never the original JSON.
+//!
+//! Secrets (final review A-I1): a pass that is stored renders with the project's redactor, and
+//! every kept text goes through it whole, before anything trims, clips or cuts it. The detectors
+//! know a key by its prefix (`sk-`, `ghp_`) or by its `NAME=` context, so a key cut first would
+//! leave a fragment none of them knows. No cut falls inside a token-like run of characters
+//! either ([`is_token_char`]): a trim drops such a token whole, a chunk cut prefers a space.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde_json::Value;
@@ -13,6 +20,7 @@ use super::record::{
     tag_content,
 };
 use super::{ReadOptions, RenderedChunk};
+use crate::redact::Redactor;
 
 /// The tags a block line starts with (spec §3.3). The distiller parses chunks by these, and no
 /// other line in a chunk starts with `[`:
@@ -78,9 +86,21 @@ const TOOL_NAME_CHARS: usize = 64;
 const BASE64_RUN: usize = 200;
 const BINARY_MARKER: &str = "[binary removed]";
 
-/// `text` cut to `keep` characters: the first 5/8 and the last 3/8, at character boundaries,
-/// with `[… n characters trimmed …]` between them (`n` grouped by thousands). Text of `keep`
-/// characters or fewer is returned unchanged.
+/// `text` cut to at most `keep` characters: the first 5/8 and the last 3/8, at character
+/// boundaries, with `[… n characters trimmed …]` between them (`n` grouped by thousands). A cut
+/// never falls inside a token-like run ([`is_token_char`]): the token is dropped whole, so the
+/// head can be shorter than 5/8 and the tail shorter than 3/8. Text of `keep` characters or
+/// fewer is returned unchanged.
+///
+/// ```
+/// use alice_core::capture::trim;
+///
+/// let text = format!("{} {} end", "word ".repeat(100), "0123456789abcdef".repeat(8));
+/// let out = trim(&text, 120);
+/// // The 128-character token straddles the tail's start: none of it is kept.
+/// assert!(!out.contains("0123456789"));
+/// assert!(out.starts_with("word word") && out.ends_with(" end"));
+/// ```
 pub fn trim(text: &str, keep: usize) -> String {
     let total = text.chars().count();
     if total <= keep {
@@ -88,27 +108,99 @@ pub fn trim(text: &str, keep: usize) -> String {
     }
     let head_chars = keep * 5 / 8;
     let tail_chars = keep - head_chars;
-    let head_end = byte_of_char(text, head_chars);
-    let tail_start = byte_of_char(text, total - tail_chars);
-    format!(
-        "{}\n{}\n{}",
-        &text[..head_end],
-        marker(total - head_chars - tail_chars),
-        &text[tail_start..]
-    )
+    let head_end = token_start(text, byte_of_char(text, head_chars));
+    let tail_start = token_end(text, byte_of_char(text, total - tail_chars));
+    let trimmed = marker(text[head_end..tail_start].chars().count());
+    [&text[..head_end], trimmed.as_str(), &text[tail_start..]]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// The first `keep` characters, and a marker when something was cut.
+/// The first `keep` characters (never ending inside a token), and a marker when something was
+/// cut.
 fn head(text: &str, keep: usize) -> String {
     let total = text.chars().count();
     if total <= keep {
         return text.to_owned();
     }
-    format!(
-        "{}\n{}",
-        &text[..byte_of_char(text, keep)],
-        marker(total - keep)
-    )
+    let end = token_start(text, byte_of_char(text, keep));
+    let trimmed = marker(total - text[..end].chars().count());
+    if end == 0 {
+        return trimmed;
+    }
+    format!("{}\n{trimmed}", &text[..end])
+}
+
+/// A character of a token-like run: a key, a hash, a path, base64. A cut never falls between two
+/// of them, so a kept piece never holds part of a token without the rest that a detector knows
+/// it by.
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '=')
+}
+
+/// Whether the byte offset `at` (a character boundary) falls inside a token-like run.
+fn inside_token(text: &str, at: usize) -> bool {
+    text[..at].chars().next_back().is_some_and(is_token_char)
+        && text[at..].chars().next().is_some_and(is_token_char)
+}
+
+/// `end` moved back to the start of the token-like run it falls inside.
+fn token_start(text: &str, end: usize) -> usize {
+    if !inside_token(text, end) {
+        return end;
+    }
+    text[..end]
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| !is_token_char(c))
+        .map_or(0, |(i, c)| i + c.len_utf8())
+}
+
+/// `start` moved forward to the end of the token-like run it falls inside.
+fn token_end(text: &str, start: usize) -> usize {
+    if !inside_token(text, start) {
+        return start;
+    }
+    text[start..]
+        .char_indices()
+        .find(|&(_, c)| !is_token_char(c))
+        .map_or(text.len(), |(i, _)| start + i)
+}
+
+/// The redactor a pass renders with, and the detectors that fired on the block being rendered.
+/// Every kept text goes through [`Scrub::text`] whole, before anything cuts it (final review
+/// A-I1). Without a redactor ([`super::read`]) text passes unchanged.
+struct Scrub<'r> {
+    redactor: Option<&'r Redactor>,
+    found: Vec<String>,
+}
+
+impl Scrub<'_> {
+    /// `text` with every secret replaced by its `[REDACTED:<detector>]` marker.
+    fn text<'t>(&mut self, text: &'t str) -> Cow<'t, str> {
+        let Some(r) = self.redactor else {
+            return Cow::Borrowed(text);
+        };
+        let out = r.apply(text);
+        if out.found.is_empty() {
+            return Cow::Borrowed(text);
+        }
+        for name in out.found {
+            if !self.found.contains(&name) {
+                self.found.push(name);
+            }
+        }
+        Cow::Owned(out.text)
+    }
+
+    /// A tool's input, a command or a title, on one line: redacted, binary removed (review
+    /// A-M5), then clipped to `n` characters.
+    fn line(&mut self, text: &str, n: usize) -> String {
+        let text = self.text(text);
+        clip(&strip_binary(&text), n)
+    }
 }
 
 fn marker(trimmed: usize) -> String {
@@ -132,14 +224,28 @@ fn byte_of_char(text: &str, n: usize) -> usize {
     text.char_indices().nth(n).map_or(text.len(), |(i, _)| i)
 }
 
-/// At most `n` characters, with `…` when something was cut. Line breaks become spaces, so a
-/// title stays on one line.
+/// At most `n` characters, with `…` when something was cut, never inside a token. Line breaks
+/// become spaces, so a title stays on one line.
 fn clip(text: &str, n: usize) -> String {
+    clip_with(text, n, true)
+}
+
+/// [`clip`] for a tool's or a subagent type's name, which may be cut inside a token: a name is
+/// no secret, and most names are one token (`mcp__server__tool`).
+fn clip_name(text: &str, n: usize) -> String {
+    clip_with(text, n, false)
+}
+
+fn clip_with(text: &str, n: usize, whole_tokens: bool) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= n {
         return one_line;
     }
-    let mut out: String = one_line.chars().take(n.saturating_sub(1)).collect();
+    let mut end = byte_of_char(&one_line, n.saturating_sub(1));
+    if whole_tokens {
+        end = token_start(&one_line, end);
+    }
+    let mut out = one_line[..end].trim_end().to_owned();
     out.push('…');
     out
 }
@@ -163,22 +269,32 @@ pub(crate) fn memory_tool(name: &str) -> Option<&str> {
         .then_some(tool)
 }
 
-/// Renders one turn into chunks.
-pub(crate) fn turn(raw: &RawTurn, opts: &ReadOptions) -> Vec<RenderedChunk> {
-    records(&raw.records, opts)
+/// Renders one turn into chunks, redacted with `redactor` when there is one.
+pub(crate) fn turn(
+    raw: &RawTurn,
+    opts: &ReadOptions,
+    redactor: Option<&Redactor>,
+) -> Vec<RenderedChunk> {
+    records(&raw.records, opts, redactor)
 }
 
 /// Renders records (a turn's, or a late tail) into chunks. The chunks depend only on the
-/// records and the options, so a re-render is byte-identical.
-pub(crate) fn records(records: &[Record], opts: &ReadOptions) -> Vec<RenderedChunk> {
-    pack(&pieces(records, opts), opts.chunk_chars)
+/// records, the options and the redactor, so a re-render is byte-identical.
+pub(crate) fn records(
+    records: &[Record],
+    opts: &ReadOptions,
+    redactor: Option<&Redactor>,
+) -> Vec<RenderedChunk> {
+    pack(&pieces(records, opts, redactor), opts.chunk_chars)
 }
 
-/// One rendered block: a tag, its text, and its record's time. The line is `tag text`.
+/// One rendered block: a tag, its text, its record's time, and the detectors that fired on its
+/// block's text (which holds their markers now). The line is `tag text`.
 struct Piece {
     tag: String,
     body: String,
     at: Option<String>,
+    secrets: Vec<String>,
 }
 
 /// What a tool's result is rendered as.
@@ -218,19 +334,16 @@ fn classify(name: &str) -> ToolKind {
     }
 }
 
-fn pieces(records: &[Record], opts: &ReadOptions) -> Vec<Piece> {
+fn pieces(records: &[Record], opts: &ReadOptions, redactor: Option<&Redactor>) -> Vec<Piece> {
     let mut out: Vec<Piece> = Vec::new();
+    let mut scrub = Scrub {
+        redactor,
+        found: Vec::new(),
+    };
     // Each `tool_use` id's kind (and a subagent's type), so a result renders as its tool's.
     let mut tools: HashMap<&str, (ToolKind, String)> = HashMap::new();
     for record in records {
         let at = record.timestamp.clone();
-        let mut push = |tag: String, body: String| {
-            out.push(Piece {
-                tag,
-                body: neutralise(&body),
-                at: at.clone(),
-            });
-        };
         // The block that owns a following image, document or audio block.
         let own_tag = match record.kind {
             RecordKind::Assistant => "[assistant]",
@@ -248,36 +361,33 @@ fn pieces(records: &[Record], opts: &ReadOptions) -> Vec<Piece> {
                 media_tag = own_tag;
                 quiet_media = false;
             }
+            let mut lines: Vec<(String, String)> = Vec::new();
             match block {
                 Block::Text(text) => match record.kind {
                     RecordKind::Assistant => {
-                        if let Some(body) = clean(text) {
-                            push("[assistant]".into(), body);
+                        if let Some(body) = clean(text, &mut scrub) {
+                            lines.push(("[assistant]".into(), body));
                         }
                     }
                     RecordKind::Summary => {
-                        if let Some(body) = clean(text) {
-                            push("[summary]".into(), body);
+                        if let Some(body) = clean(text, &mut scrub) {
+                            lines.push(("[summary]".into(), body));
                         }
                     }
-                    _ => {
-                        for (tag, body) in user_lines(text) {
-                            push(tag, body);
-                        }
-                    }
+                    _ => lines = user_lines(text, &mut scrub),
                 },
                 Block::Thinking(text) => {
-                    if let Some(body) = clean(text).filter(|_| opts.include_thinking) {
-                        push("[assistant]".into(), format!("(thinking) {body}"));
+                    if opts.include_thinking
+                        && let Some(body) = clean(text, &mut scrub)
+                    {
+                        lines.push(("[assistant]".into(), format!("(thinking) {body}")));
                     }
                 }
                 Block::ToolUse { id, name, input } => {
                     let kind = classify(name);
                     let label = subagent_type(input);
                     tools.insert(id.as_str(), (kind, label));
-                    if let Some((tag, body)) = tool_line(name, kind, input) {
-                        push(tag, body);
-                    }
+                    lines.extend(tool_line(name, kind, input, &mut scrub));
                 }
                 Block::ToolResult {
                     tool_use_id,
@@ -287,13 +397,11 @@ fn pieces(records: &[Record], opts: &ReadOptions) -> Vec<Piece> {
                     let (kind, label) = tools
                         .get(tool_use_id.as_str())
                         .map_or((ToolKind::Unknown, String::new()), |(k, l)| (*k, l.clone()));
-                    let line = result_line(kind, &label, text, *is_error, opts);
+                    let line = result_line(kind, &label, text, *is_error, opts, &mut scrub);
                     quiet_media = line.is_none()
                         || matches!(kind, ToolKind::Dropped | ToolKind::Memory | ToolKind::File);
                     media_tag = "[result]";
-                    if let Some((tag, body)) = line {
-                        push(tag, body);
-                    }
+                    lines.extend(line);
                 }
                 Block::Image | Block::Document | Block::Audio => {
                     if !quiet_media {
@@ -302,10 +410,23 @@ fn pieces(records: &[Record], opts: &ReadOptions) -> Vec<Piece> {
                             Block::Document => "[document]",
                             _ => "[audio]",
                         };
-                        push(media_tag.into(), what.into());
+                        lines.push((media_tag.into(), what.into()));
                     }
                 }
-                Block::TooLarge => push("[result]".into(), "[record skipped: too large]".into()),
+                Block::TooLarge => {
+                    lines.push(("[result]".into(), "[record skipped: too large]".into()));
+                }
+            }
+            // What the redactor found in this block goes with each of its lines, so `block`
+            // mode can withhold every chunk that holds part of it.
+            let secrets = std::mem::take(&mut scrub.found);
+            for (tag, body) in lines {
+                out.push(Piece {
+                    tag,
+                    body: neutralise(&body),
+                    at: at.clone(),
+                    secrets: secrets.clone(),
+                });
             }
         }
     }
@@ -314,7 +435,7 @@ fn pieces(records: &[Record], opts: &ReadOptions) -> Vec<Piece> {
 
 /// A subagent call's type, from its `subagent_type` input.
 fn subagent_type(input: &Value) -> String {
-    clip(
+    clip_name(
         input_str(input, &["subagent_type"]).unwrap_or("general-purpose"),
         TOOL_NAME_CHARS,
     )
@@ -336,9 +457,11 @@ fn neutralise(body: &str) -> String {
     out
 }
 
-/// The text of a block with binary removed, or `None` when nothing is left.
-fn clean(text: &str) -> Option<String> {
+/// The text of a block, redacted whole and with binary removed, or `None` when nothing is left.
+/// Anything that trims or cuts a block's text cuts this.
+fn clean(text: &str, scrub: &mut Scrub) -> Option<String> {
     let text = strip_system_reminders(text);
+    let text = scrub.text(&text);
     let text = strip_binary(&text);
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
@@ -406,7 +529,7 @@ const DROPPED_WRAPPERS: &[&str] = &["<command-message>", "<local-command-caveat>
 
 /// The lines a user text block renders as: the prompt, a command wrapper's parts, a task
 /// notification's summary. Reminders and briefings are gone.
-fn user_lines(text: &str) -> Vec<(String, String)> {
+fn user_lines(text: &str, scrub: &mut Scrub) -> Vec<(String, String)> {
     let stripped = strip_system_reminders(text);
     let text = stripped.trim();
     if text.is_empty() || text.starts_with(BRIEFING_PREFIX) || text.starts_with(INTERRUPT_PREFIX) {
@@ -414,7 +537,10 @@ fn user_lines(text: &str) -> Vec<(String, String)> {
     }
     if text.starts_with(TASK_NOTIFICATION) {
         return match tag_content(text, "summary").filter(|s| !s.is_empty()) {
-            Some(summary) => vec![("[user]".into(), format!("(task notification) {summary}"))],
+            Some(summary) => vec![(
+                "[user]".into(),
+                format!("(task notification) {}", scrub.text(&summary)),
+            )],
             None => Vec::new(),
         };
     }
@@ -423,17 +549,18 @@ fn user_lines(text: &str) -> Vec<(String, String)> {
         .any(|t| text.starts_with(&format!("<{t}>")))
         || DROPPED_WRAPPERS.iter().any(|t| text.starts_with(t));
     if !wrapped {
-        return clean(text)
+        return clean(text, scrub)
             .map(|body| ("[user]".to_owned(), body))
             .into_iter()
             .collect();
     }
-    wrapper_lines(text)
+    wrapper_lines(text, scrub)
 }
 
 /// Walks a wrapper message tag by tag. The command name keeps its arguments on one line; output
-/// is cut to 300 characters.
-fn wrapper_lines(text: &str) -> Vec<(String, String)> {
+/// is cut to 300 characters. Each part is redacted on its own, after the walk: a detector's
+/// match must not swallow a closing tag.
+fn wrapper_lines(text: &str, scrub: &mut Scrub) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let (mut name, mut args): (Option<String>, String) = (None, String::new());
     let mut rest = text;
@@ -462,18 +589,21 @@ fn wrapper_lines(text: &str) -> Vec<(String, String)> {
             "command-name" => name = Some(content.to_owned()),
             "command-args" => args = content.to_owned(),
             "local-command-stdout" | "bash-stdout" => {
-                if let Some(body) = clean(content) {
+                if let Some(body) = clean(content, scrub) {
                     out.push(("[result]".to_owned(), head(&body, TOOL_LINE_CHARS)));
                 }
             }
             "local-command-stderr" | "bash-stderr" => {
-                if let Some(body) = clean(content) {
+                if let Some(body) = clean(content, scrub) {
                     out.push(("[result error]".to_owned(), head(&body, TOOL_LINE_CHARS)));
                 }
             }
             _ => {
                 if !content.is_empty() {
-                    out.push(("[tool Bash]".to_owned(), clip(content, TOOL_LINE_CHARS)));
+                    out.push((
+                        "[tool Bash]".to_owned(),
+                        scrub.line(content, TOOL_LINE_CHARS),
+                    ));
                 }
             }
         }
@@ -485,7 +615,7 @@ fn wrapper_lines(text: &str) -> Vec<(String, String)> {
         } else {
             format!("{name} {args}")
         };
-        out.insert(0, ("[user]".to_owned(), clip(&line, TOOL_LINE_CHARS)));
+        out.insert(0, ("[user]".to_owned(), scrub.line(&line, TOOL_LINE_CHARS)));
     }
     out
 }
@@ -497,44 +627,49 @@ fn input_str<'a>(input: &'a Value, keys: &[&str]) -> Option<&'a str> {
         .filter(|s| !s.trim().is_empty())
 }
 
-/// A tool call's line, or `None` for a dropped tool.
-fn tool_line(name: &str, kind: ToolKind, input: &Value) -> Option<(String, String)> {
-    let shown = clip(name, TOOL_NAME_CHARS);
+/// A tool call's line, or `None` for a dropped tool. Every input text is redacted whole and
+/// has its binary removed before it is clipped.
+fn tool_line(
+    name: &str,
+    kind: ToolKind,
+    input: &Value,
+    scrub: &mut Scrub,
+) -> Option<(String, String)> {
+    let shown = clip_name(name, TOOL_NAME_CHARS);
     let tag = format!("[tool {shown}]");
-    let line = |keys: &[&str], limit: usize| {
+    let line = |scrub: &mut Scrub, keys: &[&str]| {
         input_str(input, keys)
-            .map(|s| clip(s, limit))
+            .map(|s| scrub.line(s, TOOL_LINE_CHARS))
             .unwrap_or_default()
     };
     Some(match kind {
         ToolKind::Dropped => return None,
         ToolKind::Memory => {
-            let tool = clip(memory_tool(name).unwrap_or(name), TOOL_NAME_CHARS);
+            let tool = clip_name(memory_tool(name).unwrap_or(name), TOOL_NAME_CHARS);
             // The title when there is one, else the first line of the main text.
-            let title = input_str(input, &["title", "query", "content", "entry", "text", "id"]);
-            let first_line = title.and_then(|t| t.trim().lines().next()).unwrap_or("");
+            let title = input_str(input, &["title", "query", "content", "entry", "text", "id"])
+                .map(|t| scrub.text(t))
+                .unwrap_or_default();
+            let first_line = title.trim().lines().next().unwrap_or("");
             (
                 format!("[tool alice {tool}]"),
-                clip(first_line, MEMORY_TITLE_CHARS),
+                scrub.line(first_line, MEMORY_TITLE_CHARS),
             )
         }
-        ToolKind::File => (
-            tag,
-            line(&["file_path", "notebook_path", "path"], TOOL_LINE_CHARS),
-        ),
-        ToolKind::Search => (tag, line(&["pattern", "path", "query"], TOOL_LINE_CHARS)),
-        ToolKind::Web => (tag, line(&["url", "query"], TOOL_LINE_CHARS)),
+        ToolKind::File => (tag, line(scrub, &["file_path", "notebook_path", "path"])),
+        ToolKind::Search => (tag, line(scrub, &["pattern", "path", "query"])),
+        ToolKind::Web => (tag, line(scrub, &["url", "query"])),
         ToolKind::Subagent => (
             format!("[subagent {}]", subagent_type(input)),
-            line(&["description", "prompt"], TOOL_LINE_CHARS),
+            line(scrub, &["description", "prompt"]),
         ),
         ToolKind::Other | ToolKind::Unknown => {
             if name == "Bash" {
-                (tag, line(&["command"], TOOL_LINE_CHARS))
+                (tag, line(scrub, &["command"]))
             } else if input.is_null() || input.as_object().is_some_and(|o| o.is_empty()) {
                 (tag, String::new())
             } else {
-                (tag, clip(&input.to_string(), TOOL_LINE_CHARS))
+                (tag, scrub.line(&input.to_string(), TOOL_LINE_CHARS))
             }
         }
     })
@@ -548,6 +683,7 @@ fn result_line(
     text: &str,
     is_error: bool,
     opts: &ReadOptions,
+    scrub: &mut Scrub,
 ) -> Option<(String, String)> {
     match kind {
         ToolKind::Dropped => return None,
@@ -555,7 +691,7 @@ fn result_line(
         ToolKind::File if !is_error => return None,
         _ => {}
     }
-    let body = clean(text);
+    let body = clean(text, scrub);
     if is_error {
         let body = body.map_or_else(String::new, |b| match kind {
             ToolKind::Unknown => cut_chars(&b, UNKNOWN_RESULT_CHARS),
@@ -576,12 +712,14 @@ fn result_line(
     })
 }
 
-/// At most `n` characters in all: the text, or its start and `…`. Line breaks stay.
+/// At most `n` characters in all: the text, or its start (never ending inside a token) and `…`.
+/// Line breaks stay.
 fn cut_chars(text: &str, n: usize) -> String {
     if text.chars().count() <= n {
         return text.to_owned();
     }
-    let mut out: String = text.chars().take(n.saturating_sub(1)).collect();
+    let end = token_start(text, byte_of_char(text, n.saturating_sub(1)));
+    let mut out = text[..end].to_owned();
     out.push('…');
     out
 }
@@ -606,10 +744,12 @@ struct Open {
     text: String,
     chars: usize,
     at: Option<String>,
+    secrets: Vec<String>,
 }
 
 impl Open {
-    fn push(&mut self, line: &str, chars: usize, at: &Option<String>) {
+    /// Adds `line`, all or part of `piece`.
+    fn push(&mut self, line: &str, chars: usize, piece: &Piece) {
         if !self.text.is_empty() {
             self.text.push('\n');
             self.chars += 1;
@@ -617,7 +757,12 @@ impl Open {
         self.text.push_str(line);
         self.chars += chars;
         if self.at.is_none() {
-            self.at.clone_from(at);
+            self.at.clone_from(&piece.at);
+        }
+        for name in &piece.secrets {
+            if !self.secrets.contains(name) {
+                self.secrets.push(name.clone());
+            }
         }
     }
 }
@@ -634,6 +779,7 @@ fn pack(pieces: &[Piece], chunk_chars: usize) -> Vec<RenderedChunk> {
             chunks.push(RenderedChunk {
                 text: open.text,
                 authored_at: open.at,
+                secrets: open.secrets,
             });
         }
     };
@@ -647,14 +793,14 @@ fn pack(pieces: &[Piece], chunk_chars: usize) -> Vec<RenderedChunk> {
             if !fits {
                 flush(&mut cur, &mut chunks);
             }
-            cur.push(&line, chars, &piece.at);
+            cur.push(&line, chars, piece);
             continue;
         }
         flush(&mut cur, &mut chunks);
         let parts = split_block(&piece.tag, &piece.body, cap);
         let last = parts.len() - 1;
         for (i, part) in parts.iter().enumerate() {
-            cur.push(part, part.chars().count(), &piece.at);
+            cur.push(part, part.chars().count(), piece);
             if i < last {
                 flush(&mut cur, &mut chunks);
             }
@@ -665,7 +811,8 @@ fn pack(pieces: &[Piece], chunk_chars: usize) -> Vec<RenderedChunk> {
 }
 
 /// Cuts an oversized block into lines that fit: at paragraph ends, then sentence ends and line
-/// ends, then hard. The first line is `tag text`; the others start `tag (cont.) `.
+/// ends, then hard, but not inside a token. The first line is `tag text`; the others start
+/// `tag (cont.) `.
 fn split_block(tag: &str, body: &str, cap: usize) -> Vec<String> {
     let mut parts = Vec::new();
     let mut rest = body.trim();
@@ -683,7 +830,7 @@ fn split_block(tag: &str, body: &str, cap: usize) -> Vec<String> {
             return parts;
         }
         let limit = prefix_len(rest, max_chars, max_bytes);
-        let cut = cut_point(&rest[..limit]);
+        let cut = cut_point(rest, limit);
         parts.push(format!("{prefix}{}", rest[..cut].trim_end()));
         rest = rest[cut..].trim_start();
         first = false;
@@ -706,10 +853,13 @@ fn prefix_len(text: &str, max_chars: usize, max_bytes: usize) -> usize {
     end.max(text.chars().next().map_or(0, char::len_utf8))
 }
 
-/// Where to cut `window` (a block's next stretch): after its last paragraph break, else after
-/// its last sentence end or line break, else at its end. A cut in the first quarter is not used,
-/// so a piece is never a sliver.
-fn cut_point(window: &str) -> usize {
+/// Where to cut `rest` within its first `limit` bytes (a block's next stretch, the window):
+/// after the window's last paragraph break, else after its last sentence end or line break,
+/// else at `limit`, moved back to the start of a token the cut would fall inside. A cut in the
+/// window's first quarter is not used, so a piece is never a sliver: a token longer than three
+/// quarters of a chunk is cut hard (its block was redacted whole before any cut).
+fn cut_point(rest: &str, limit: usize) -> usize {
+    let window = &rest[..limit];
     let floor = window.len() / 4;
     let paragraph = window.rfind("\n\n").map(|i| i + 2);
     if let Some(cut) = paragraph.filter(|&c| c > floor) {
@@ -725,12 +875,15 @@ fn cut_point(window: &str) -> usize {
     .into_iter()
     .flatten()
     .max();
-    sentence.filter(|&c| c > floor).unwrap_or(window.len())
+    sentence
+        .filter(|&c| c > floor)
+        .or_else(|| Some(token_start(rest, limit)).filter(|&c| c > floor))
+        .unwrap_or(limit)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{AgentKind, CapturedTurn, ReadOptions, read};
+    use super::super::{AgentKind, CapturedTurn, ReadOptions, read, read_redacted};
     use super::*;
 
     const TOOLS: &[u8] = include_bytes!("../../tests/fixtures/capture/claude/tools.jsonl");
@@ -916,8 +1069,9 @@ mod tests {
         assert!(!out.contains("Caveat: do not respond"));
         let stdout = lines_with(&out, "[result] output line.");
         assert_eq!(stdout.len(), 1);
-        assert_eq!(stdout[0].chars().count(), "[result] ".len() + 300);
-        assert!(out.contains("[… 115 characters trimmed …]"), "415 - 300");
+        // Character 300 falls inside a word (`o|utput`): the cut moves back to the word's start.
+        assert_eq!(stdout[0].chars().count(), "[result] ".len() + 299);
+        assert!(out.contains("[… 116 characters trimmed …]"), "415 - 299");
         // A task notification keeps its summary.
         assert!(out.contains("[user] (task notification) Background build finished"));
         assert!(!out.contains("<task-notification>") && !out.contains("<status>"));
@@ -969,8 +1123,8 @@ mod tests {
         assert_eq!(trim(&exact, 800), exact);
         assert_ne!(trim(&"é".repeat(801), 800), "é".repeat(801));
         // Thousands are grouped, and a zero budget keeps only the marker.
-        assert!(trim(&"x".repeat(1_234_567), 800).contains("[… 1,233,767 characters trimmed …]"));
-        assert!(trim("abc", 0).contains("[… 3 characters trimmed …]"));
+        assert!(trim(&"word ".repeat(250_000), 800).contains("[… 1,249,200 characters trimmed …]"));
+        assert_eq!(trim("abc", 0), "[… 3 characters trimmed …]");
     }
 
     fn block_input(blocks: &[(&str, &str)]) -> Vec<u8> {
@@ -1372,6 +1526,223 @@ mod tests {
         assert!(text.contains("[tool alice remember] First line of content"));
         assert!(!text.contains("second line"));
         assert!(text.contains("[tool alice mempalace_search] T"));
+    }
+
+    /// An `OPENAI_API_KEY=sk-proj-…`-shaped value: the prefix and 160 characters of a key's
+    /// alphabet (final review A-I1).
+    const KEY: &str = concat!(
+        "sk-",
+        "proj-",
+        "jD4XP_qW9yLWXUgo5RApWBKupwr-wVenptzp2muJRWt1wEklnUn27KT1Al__tQLPxWrL_THZ-TGwJJW5",
+        "yJOclDANbMBP46nds-uyC48v0mOB-cSSZ5kCGF4Dl5zDSHwt8dZ8Ntu162u9_88Qt5B5kLC-tktu4xw9"
+    );
+    const KEY_PREFIX: usize = "sk-proj-".len();
+
+    /// The first fragment of the key's body (after `sk-proj-`) of `n` characters found in
+    /// `text`.
+    fn key_fragment(text: &str, n: usize) -> Option<&'static str> {
+        let body = &KEY[KEY_PREFIX..];
+        (0..=body.len() - n)
+            .map(|i| &body[i..i + n])
+            .find(|w| text.contains(w))
+    }
+
+    /// Asserts that no chunk holds 10 or more characters of the key's body, and that the key
+    /// was redacted.
+    fn assert_no_key_fragment(chunks: &[RenderedChunk], case: &str) {
+        for c in chunks {
+            assert_eq!(key_fragment(&c.text, 10), None, "{case}: {}", c.text);
+        }
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.text.contains("[REDACTED:openai_key]")),
+            "{case}: the key is redacted, not dropped"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.secrets.contains(&"openai_key".to_string())),
+            "{case}"
+        );
+    }
+
+    /// A Bash call whose output is `output`, then a closing reply.
+    fn bash_output(output: &str) -> Vec<u8> {
+        let mut input = user_line(1, serde_json::json!("Show the environment."));
+        input.extend(assistant_blocks(
+            2,
+            serde_json::json!([{"type": "tool_use", "id": "t1", "name": "Bash",
+                                "input": {"command": "cat .env"}}]),
+        ));
+        input.extend(user_line(3, result_block("t1", output)));
+        input.extend(assistant_blocks(
+            4,
+            serde_json::json!([{"type": "text", "text": "Those are the variables."}]),
+        ));
+        input
+    }
+
+    #[test]
+    fn a_key_across_a_trim_or_cut_point_leaves_no_fragment() {
+        let r = Redactor::builtin();
+        let assignment = format!("OPENAI_API_KEY={KEY}");
+        let at = |text: &str| text.find(KEY).unwrap();
+
+        // The tail of the 800-character trim (its last 300) starts 71 characters into the key's
+        // body: 211 characters follow the key.
+        let tail = format!(
+            "{}{assignment}\n{}LAST=1",
+            "HOME=/home/user\n".repeat(100),
+            "DEBUG=false\n".repeat(17)
+        );
+        assert_eq!(tail.len() - 300, at(&tail) + KEY_PREFIX + 71);
+        // The head (its first 500) ends 70 characters into the key's body.
+        let head = format!(
+            "{}PWD=/x\n{assignment}\n{}",
+            "HOME=/home/user\n".repeat(25),
+            "LANG=C.UTF-8\n".repeat(120)
+        );
+        assert_eq!(at(&head) + KEY_PREFIX + 70, 500);
+        for (case, output) in [("tail", &tail), ("head", &head)] {
+            let out = read_redacted(CLAUDE, &bash_output(output), &closed(), &r);
+            assert_eq!(out.turns.len(), 1);
+            assert_no_key_fragment(&out.turns[0].chunks, case);
+            let text = out.turns[0].chunks[0].text.as_str();
+            assert!(text.contains(" characters trimmed …]"), "{case}: {text}");
+        }
+
+        // A hard cut through one long token with no space (and no base64 run, which would be
+        // binary): a 500-character chunk cuts the first piece at 488, 70 into the key's body.
+        let lead = format!("{}zOPENAI_API_KEY=", "z_".repeat(197));
+        let line = format!("{lead}{KEY}={}", "z_".repeat(500));
+        assert_eq!(lead.len() + KEY_PREFIX + 70, 500 - "[assistant] ".len());
+        let input = block_input(&[("user", "Paste it."), ("assistant", &line)]);
+        let opts = ReadOptions {
+            chunk_chars: 500,
+            ..closed()
+        };
+        let out = read_redacted(CLAUDE, &input, &opts, &r);
+        let chunks = &out.turns[0].chunks;
+        assert!(chunks.len() >= 3, "{chunks:?}");
+        assert_no_key_fragment(chunks, "hard cut");
+
+        // The order this replaces, each chunk redacted after the cut, kept the key's rest.
+        let late: Vec<String> = read(CLAUDE, &input, &opts).turns[0]
+            .chunks
+            .iter()
+            .map(|c| r.apply(&c.text).text)
+            .collect();
+        assert!(late.iter().any(|t| key_fragment(t, 10).is_some()));
+    }
+
+    #[test]
+    fn a_key_in_block_mode_marks_every_chunk_of_its_block() {
+        use crate::settings::{PrivacySettings, RedactMode};
+        let r = Redactor::new(&PrivacySettings {
+            redact_mode: RedactMode::Block,
+            ..Default::default()
+        })
+        .unwrap();
+        let words = "A plain sentence about the release plan. ".repeat(30);
+        let input = block_input(&[
+            ("user", &format!("Prompt one. {words}")),
+            ("assistant", &format!("{words} Use {KEY} for it. {words}")),
+            ("assistant", "A closing remark."),
+        ]);
+        let opts = ReadOptions {
+            chunk_chars: 1000,
+            ..closed()
+        };
+        let chunks = &read_redacted(CLAUDE, &input, &opts, &r).turns[0].chunks;
+        let marked: Vec<&RenderedChunk> = chunks.iter().filter(|c| !c.secrets.is_empty()).collect();
+        assert!(
+            marked.len() >= 2,
+            "the key's block spans chunks: {chunks:?}"
+        );
+        assert!(marked.iter().all(|c| c.secrets == ["openai_key"]));
+        assert!(marked.iter().all(|c| c.text.starts_with("[assistant]")));
+        assert!(
+            chunks
+                .iter()
+                .filter(|c| c.text.starts_with("[user]"))
+                .all(|c| c.secrets.is_empty()),
+            "the prompt's chunks are not marked"
+        );
+        for c in chunks {
+            assert_eq!(key_fragment(&c.text, 10), None);
+        }
+    }
+
+    #[test]
+    fn a_cut_never_falls_inside_a_token() {
+        // Hex no detector knows, 128 characters: it is kept whole or not at all.
+        let token = "0123456789abcdef".repeat(8);
+        let kept_whole_or_not = |out: &str| !out.contains(&token[..10]) || out.contains(&token);
+        // The trim's tail starts inside the token (1,029 of 1,000..1,128): the tail keeps what
+        // follows it, and the marker counts what was really cut.
+        let text = format!("{}{token} {}", "word ".repeat(200), "end ".repeat(50));
+        let out = trim(&text, 800);
+        assert!(!out.contains("0123456789"), "{out}");
+        assert!(
+            out.contains("\n[… 628 characters trimmed …]\n end end"),
+            "{out}"
+        );
+        // Its head ends inside the token (500 of 450..578): the head stops before it.
+        let text = format!("{}{token} {}", "word ".repeat(90), "end ".repeat(400));
+        let out = trim(&text, 800);
+        assert!(!out.contains("0123456789"), "{out}");
+        assert!(
+            out.starts_with(&format!("{}\n[… ", "word ".repeat(90))),
+            "{out}"
+        );
+        assert!(out.ends_with("end "));
+        // A text that is one token is dropped whole.
+        assert_eq!(
+            trim(&"x".repeat(1_234_567), 800),
+            "[… 1,234,567 characters trimmed …]"
+        );
+        // Heads, clips and cuts back off to the token's start.
+        let line = format!("{} {token} tail", "word ".repeat(50));
+        assert!(kept_whole_or_not(&head(&line, 300)));
+        assert!(head(&line, 300).starts_with("word "));
+        assert!(kept_whole_or_not(&clip(&line, 300)));
+        assert!(clip(&line, 300).ends_with("word…"));
+        assert!(kept_whole_or_not(&cut_chars(&line, 300)));
+        assert_eq!(head(&token, 50), "[… 128 characters trimmed …]");
+        // A name is cut anywhere.
+        assert_eq!(clip_name(&"n".repeat(70), 64).chars().count(), 64);
+        // A chunk's hard cut moves back to the start of the token it falls inside.
+        for sep in [" ", ":", "ก"] {
+            let rest = format!("{}{sep}{token} more", "w".repeat(300));
+            let at = 300 + sep.len();
+            assert_eq!(cut_point(&rest, at + 60), at, "{sep:?}");
+            assert_eq!(cut_point(&rest, at), at, "between two tokens: {sep:?}");
+        }
+        assert_eq!(cut_point(&"w".repeat(500), 400), 400, "one token: cut hard");
+    }
+
+    #[test]
+    fn tool_input_and_command_lines_lose_their_binary() {
+        let blob = "iVBORw0KGgoAAAANSUhEUgAA".repeat(12);
+        let mut input = user_line(1, serde_json::json!("Upload it."));
+        input.extend(assistant_blocks(
+            2,
+            serde_json::json!([
+                {"type": "tool_use", "id": "t1", "name": "mcp__files__upload",
+                 "input": {"name": "a.png", "data": blob}},
+                {"type": "tool_use", "id": "t2", "name": "Bash",
+                 "input": {"command": format!("echo {blob} | base64 -d")}},
+            ]),
+        ));
+        let text = render_all(&input, &closed());
+        assert!(!text.contains("iVBORw0KGgo"), "{text}");
+        assert!(
+            text.contains(
+                r#"[tool mcp__files__upload] {"data":"[binary removed]","name":"a.png"}"#
+            )
+        );
+        assert!(text.contains("[tool Bash] echo [binary removed] | base64 -d"));
     }
 
     #[test]

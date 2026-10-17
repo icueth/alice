@@ -409,9 +409,16 @@ impl CaptureCtl {
             close_trailing: input.close_trailing,
             force_close: input.force_close,
         };
+        // Final review A-I1: the reader redacts each block's whole text before it trims or cuts
+        // it, so the project, whose rules decide, is known before the read.
+        let owner = state.as_ref().map(|s| s.project_id.clone());
+        let identity = self
+            .readers
+            .with(|c| identity(c, owner.as_deref(), &input.project))?;
+        let redactor = self.redactors.for_root(identity.tree.as_ref());
         let bytes = &input.bytes[..input.bytes.len().min(MAX_PASS_BYTES)];
         report.bytes_read = bytes.len() as u64;
-        let out = capture::read(input.agent, bytes, &opts);
+        let out = capture::read_redacted(input.agent, bytes, &opts, &redactor);
         report.stats = out.stats;
         self.note_unknown(out.stats.unknown);
         if out.oversized_line {
@@ -420,10 +427,6 @@ impl CaptureCtl {
         }
         let done = offset_plus(input.offset, out.consumed)?;
 
-        let owner = state.as_ref().map(|s| s.project_id.clone());
-        let identity = self
-            .readers
-            .with(|c| identity(c, owner.as_deref(), &input.project))?;
         let verdict = verdict(&self.settings, input.agent, &identity);
         if input.subagent.is_some() && !settings.capture.include_subagents {
             report.dropped = Some("subagent capture is off");
@@ -592,7 +595,6 @@ impl CaptureCtl {
             report.turns_skipped += units.iter().filter(|u| u.turn && !u.imported).count() as u64;
             excluded_slices(&base, &input, units, done, next_ord)
         } else {
-            let redactor = self.redactors.for_root(identity.tree.as_ref());
             redact(&redactor, uri, &mut units);
             report.turns_stored = units.iter().filter(|u| u.turn && !u.imported).count() as u64;
             stored_slices(&base, &input, units, done, next_ord)
@@ -813,19 +815,28 @@ fn stored_slices(
     slices
 }
 
-/// Redacts every chunk with `r`, the chunks of a unit as consecutive pieces (a private key cut
-/// between chunks is redacted in each). In `block` mode a chunk with a secret is withheld whole.
+/// The second line of redaction. The reader redacted each block's whole text before cutting it
+/// (`chunk.secrets` names what it found); this redacts every chunk again with `r`, the chunks of
+/// a unit as consecutive pieces (a private key cut between chunks is redacted in each), which
+/// covers what the reader does not redact (a tool's name). In `block` mode a chunk that holds
+/// all or part of a block with a secret is withheld whole.
 fn redact(r: &Redactor, uri: &str, units: &mut [Unit]) {
     let (mut redacted, mut withheld) = (0usize, 0usize);
     for unit in units {
         let mut open = false;
         for chunk in &mut unit.chunks {
             let out = r.apply_piece(&chunk.text, &mut open);
-            if out.found.is_empty() {
+            let mut found = std::mem::take(&mut chunk.secrets);
+            for name in out.found {
+                if !found.contains(&name) {
+                    found.push(name);
+                }
+            }
+            if found.is_empty() {
                 continue;
             }
             if r.blocks() {
-                chunk.text = withheld_stub(r, &chunk.text, &out.found);
+                chunk.text = withheld_stub(r, &chunk.text, &found);
                 withheld += 1;
             } else {
                 chunk.text = fit(out.text);
@@ -2458,6 +2469,7 @@ mod tests {
                 .map(|&n| capture::RenderedChunk {
                     text: "x".repeat(n),
                     authored_at: None,
+                    secrets: Vec::new(),
                 })
                 .collect(),
             end,
