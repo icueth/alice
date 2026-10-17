@@ -139,7 +139,15 @@ case "$*" in
     echo "jev_api_key set (****${v: -4})"
     ;;
   "config set judge.provider jev") echo jev >"$ALICE_HOME/judge.provider" ;;
-  "config set distill.provider jev") echo jev >"$ALICE_HOME/distill.provider" ;;
+  "config set distill.provider "*|"config get distill.provider"|"config get judge.provider")
+    # CONFIG_FAIL: the tenants whose daemon does not answer.
+    case " ${CONFIG_FAIL:-} " in *" $(basename "$ALICE_HOME") "*) echo "alice: the daemon is not running" >&2; exit 1 ;; esac
+    case "$*" in
+      "config set distill.provider "*) echo "$4" >"$ALICE_HOME/distill.provider" ;;
+      "config get distill.provider") cat "$ALICE_HOME/distill.provider" 2>/dev/null || echo off ;;
+      *) cat "$ALICE_HOME/judge.provider" 2>/dev/null || echo heuristic ;;
+    esac
+    ;;
   "model fetch")
     if [ "${SELFTEST:-}" = fetchfail ]; then
       i=0; while [ "$i" -lt 2000 ]; do printf '\rmodel_quantized.onnx: %5.1f%%' "$i" >&2; i=$((i + 1)); done
@@ -1170,9 +1178,9 @@ key_nowhere_else() { # key
 has_key() { # tenant key
   [ "$(cat "$SRV/$1/secrets.toml" 2>/dev/null)" = "jev_api_key = \"$2\"" ] || fail "$1 does not hold the key"
   [ -n "$(find "$SRV/$1/secrets.toml" -perm 600)" ] || fail "$1's secrets.toml is not 0600"
-  [ "$(cat "$SRV/$1/judge.provider" 2>/dev/null)" = jev ] || fail "$1's judge is not jev"
-  [ "$(cat "$SRV/$1/distill.provider" 2>/dev/null)" = jev ] || fail "$1's distillation is not jev"
 }
+setting_of() { cat "$SRV/$1/$2" 2>/dev/null || echo unset; } # tenant judge.provider|distill.provider (the fake's files)
+DISTILL_DEFAULT="$R/etc/alice/distill.default"
 
 jev_key_set_reaches_every_tenant_and_nothing_else() {
   local t
@@ -1186,8 +1194,14 @@ jev_key_set_reaches_every_tenant_and_nothing_else() {
   has "$TENANTS/ann.env" 'ALICE_JUDGE_JEV_MODEL=jev-1.13.0'
   jev_set "$JEV_A"
   [ "$RC" = 0 ] || fail "jev-key set exited $RC: $OUT"
-  for t in $(tenant_names); do has_key "$t" "$JEV_A"; done
+  for t in $(tenant_names); do
+    has_key "$t" "$JEV_A"
+    # Only the key: no tenant's judge or distillation is set by it.
+    [ "$(setting_of "$t" judge.provider)" = unset ] || fail "jev-key set changed $t's judge"
+    [ "$(setting_of "$t" distill.provider)" = unset ] || fail "jev-key set changed $t's distillation"
+  done
   has_key team "$JEV_A"
+  printf '%s\n' "$OUT" | grep -qF 'Only the key changed' || fail "$OUT"
   [ "$(cat "$R/etc/alice/jev.key")" = "$JEV_A" ] || fail "the server's copy is wrong"
   [ -n "$(find "$R/etc/alice/jev.key" -perm 600)" ] || fail "jev.key is not 0600"
   key_nowhere_else "$JEV_A"
@@ -1195,19 +1209,51 @@ jev_key_set_reaches_every_tenant_and_nothing_else() {
 }
 
 jev_key_is_inherited_by_a_new_tenant() {
+  rm -f -- "$DISTILL_DEFAULT"
   run add jevp
   [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
   has_key jevp "$JEV_A"
+  [ "$(setting_of jevp judge.provider)" = jev ] || fail "a new tenant's judge is not jev"
+  # No default file: distillation stays off (nothing is set).
+  [ "$(setting_of jevp distill.provider)" = unset ] || fail "distillation was set without a default"
   key_nowhere_else "$JEV_A"
   run remove jevp --yes
   pass
 }
 
+add_follows_the_distill_default() {
+  printf 'on\n' >"$DISTILL_DEFAULT"
+  run add dison
+  [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
+  [ "$(setting_of dison distill.provider)" = jev ] || fail "the default 'on' did not reach a new tenant"
+  printf 'off\n' >"$DISTILL_DEFAULT"
+  run add disoff
+  [ "$RC" = 0 ] || fail "add exited $RC: $OUT"
+  [ "$(setting_of disoff distill.provider)" = unset ] || fail "the default 'off' turned something on"
+  # A default that is neither on nor off is refused before anything is created.
+  printf 'maybe\n' >"$DISTILL_DEFAULT"
+  run add disbad
+  [ "$RC" != 0 ] || fail "add accepted a bad default: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'must hold one line, on or off; nothing was created' || fail "$OUT"
+  [ ! -e "$TENANTS/disbad.env" ] && [ ! -e "$SRV/disbad" ] || fail "add created disbad anyway"
+  rm -f -- "$DISTILL_DEFAULT"
+  run remove dison --yes
+  run remove disoff --yes
+  pass
+}
+
 jev_key_rotation_replaces_it_everywhere() {
   local t
+  # An admin's per-tenant choices survive a rotation.
+  echo heuristic >"$SRV/ann/judge.provider"
+  echo jev >"$SRV/ann/distill.provider"
+  echo off >"$SRV/team/distill.provider"
   jev_set "$JEV_B"
   [ "$RC" = 0 ] || fail "rotation exited $RC: $OUT"
   for t in $(tenant_names); do has_key "$t" "$JEV_B"; done
+  [ "$(setting_of ann judge.provider)" = heuristic ] || fail "rotation changed ann's judge"
+  [ "$(setting_of ann distill.provider)" = jev ] || fail "rotation changed ann's distillation"
+  [ "$(setting_of team distill.provider)" = off ] || fail "rotation changed team's distillation"
   [ "$(cat "$R/etc/alice/jev.key")" = "$JEV_B" ] || fail "the server's copy was not rotated"
   key_nowhere_else "$JEV_B"
   pass
@@ -1222,6 +1268,51 @@ jev_key_status_names_tenants_and_never_the_key() {
   printf '%s\n' "$OUT" | grep -qE '^  ann +another key$' || fail "ann's other key not shown: $OUT"
   key_nowhere_else "$JEV_B"
   if printf '%s\n' "$OUT" | grep -qF 'someone-elses'; then fail "another key was printed"; fi
+  pass
+}
+
+distill_turns_one_or_every_tenant_on_and_off() {
+  local t
+  for t in $(tenant_names); do rm -f -- "$SRV/$t/distill.provider" "$SRV/$t/judge.provider"; done
+  run distill on ann
+  [ "$RC" = 0 ] || fail "distill on ann exited $RC: $OUT"
+  [ "$(setting_of ann distill.provider)" = jev ] || fail "ann's distillation is not on"
+  [ "$(setting_of team distill.provider)" = unset ] || fail "distill on ann touched team"
+  # ann's judge is not jev, so the command says its distillation waits.
+  printf '%s\n' "$OUT" | grep -qF 'their distillation waits until it is: ann' || fail "no waiting note: $OUT"
+  echo jev >"$SRV/ann/judge.provider"
+  run distill on ann
+  printf '%s\n' "$OUT" | grep -qF 'waits' && fail "a waiting note with the judge on jev: $OUT"
+  run distill off --all
+  [ "$RC" = 0 ] || fail "distill off --all exited $RC: $OUT"
+  for t in $(tenant_names); do [ "$(setting_of "$t" distill.provider)" = off ] || fail "$t's distillation is not off"; done
+  # A daemon that does not answer is named, and the command fails.
+  CONFIG_FAIL=team run distill on --all
+  [ "$RC" != 0 ] || fail "a tenant that did not take it was not reported"
+  printf '%s\n' "$OUT" | grep -qF 'did not take it (is their daemon running?): team' || fail "$OUT"
+  [ "$(setting_of ann distill.provider)" = jev ] || fail "the other tenants were not turned on"
+  run distill off --all
+  run distill on nobody
+  if [ "$RC" = 0 ] || ! printf '%s\n' "$OUT" | grep -qF 'no tenant named nobody'; then fail "accepted nobody: $OUT"; fi
+  run distill on
+  [ "$RC" = 2 ] || fail "distill on with no tenant exited $RC"
+  run distill maybe ann
+  [ "$RC" = 2 ] || fail "distill maybe exited $RC"
+  run distill on Bad_Name
+  [ "$RC" != 0 ] || fail "accepted a bad name"
+  pass
+}
+
+distill_status_names_every_tenant_and_never_a_secret() {
+  echo jev >"$SRV/ann/distill.provider"
+  printf 'on\n' >"$DISTILL_DEFAULT"
+  CONFIG_FAIL=team run distill status
+  [ "$RC" = 0 ] || fail "distill status exited $RC: $OUT"
+  printf '%s\n' "$OUT" | grep -qF 'distillation for new tenants: on' || fail "no default line: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  ann +on +judge jev$' || fail "ann not shown on: $OUT"
+  printf '%s\n' "$OUT" | grep -qE '^  team +unknown +judge unknown' || fail "team's silent daemon not shown: $OUT"
+  key_nowhere_else "$JEV_B"
+  rm -f -- "$DISTILL_DEFAULT" "$SRV/ann/distill.provider"
   pass
 }
 
@@ -1304,7 +1395,8 @@ for CURRENT in \
   rotate_team_rewrites_every_copy team_token_never_in_env_files list_marks_the_team_store adopt_refuses_the_team_store setup_line_refuses_the_team_store \
   jev_key_set_reaches_every_tenant_and_nothing_else jev_key_is_inherited_by_a_new_tenant \
   jev_key_rotation_replaces_it_everywhere jev_key_status_names_tenants_and_never_the_key \
-  jev_key_refuses_an_empty_or_malformed_key \
+  jev_key_refuses_an_empty_or_malformed_key add_follows_the_distill_default distill_turns_one_or_every_tenant_on_and_off \
+  distill_status_names_every_tenant_and_never_a_secret \
   remove_person_deletes_the_team_copy remove_team_unprovisions provision_refuses_a_missing_team_token \
   refuses_to_run_with_empty_roots remove_archives_then_deletes \
   add_prints_the_handover_and_the_setup_line setup_line_prints_it_again_without_a_token no_remote_set_line; do

@@ -27,6 +27,10 @@ JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone; JEV_MODEL=jev-1.13.0; JEV_BUD
 # Captured transcripts age out after this on a tenant (SP2 spec §3.9): pinned in the tenant file, so a person's own
 # settings cannot keep them longer. Change one tenant's in its tenant file, then restart it.
 CAPTURE_RETENTION=180d
+# Whether a NEW tenant's captured sessions are distilled into memories (by Jev, with the shared key): the deployment's
+# default, one line `on` or `off` (no file: off). `alice-server distill on|off` changes existing tenants; neither
+# `jev-key set` nor `upgrade` ever touches a tenant's choice.
+DISTILL_DEFAULT_FILE="$R/etc/alice/distill.default"
 BIN="$R/usr/local/bin/alice"; LOCK="$R/run/alice-server.lock"
 # The ONNX Runtime a server build links (deploy/server/build-release); the binary finds it through its rpath,
 # $ORIGIN/../lib/alice, so no unit or shell needs LD_LIBRARY_PATH.
@@ -82,8 +86,12 @@ usage: alice-server add <name> [--tz <IANA zone>]
            (a person's own Alice database, from `alice backup now` on their machine, onto their fresh tenant;
             --cloud-denied carries the projects they kept from the cloud there)
        alice-server jev-key set
-           (the owner's Jev key, pasted at the prompt or piped in, for every tenant and every new one)
+           (the owner's Jev key, pasted at the prompt or piped in, for every tenant and every new one; only the key:
+            a tenant's judge and distillation stay as they are)
        alice-server jev-key status
+       alice-server distill on|off <name>|--all
+           (Jev distillation of captured sessions, per tenant; new tenants follow /etc/alice/distill.default, on or off)
+       alice-server distill status
        alice-server cli <name> <alice arguments...>
 EOF
 }
@@ -476,6 +484,8 @@ cmd_add() { # name team(0|1) tz tz-given(0|1)
     # shellcheck disable=SC2046  # one name per word
     no_daemon_import $(personal_tenants)   # linking restarts every personal tenant
   fi
+  local distill
+  distill=$(distill_default) || die "$DISTILL_DEFAULT_FILE must hold one line, on or off; nothing was created"
   if tenant_exists "$name" && [ "$tz_given" = 1 ]; then
     no_daemon_import "$name"
     set_env_line "$name" TZ "$tz"
@@ -519,6 +529,10 @@ cmd_add() { # name team(0|1) tz tz-given(0|1)
   fi
   if [ -s "$JEV_KEY_FILE" ]; then
     give_jev_key "$name" "$(head -n 1 "$JEV_KEY_FILE")" || add_fail "$name" "could not give $name the server's Jev key"
+    as_tenant "$name" config set judge.provider jev >/dev/null 2>&1 || add_fail "$name" "could not set $name's judge to jev"
+  fi
+  if [ "$distill" = on ]; then
+    set_distill "$name" on || add_fail "$name" "could not turn on $name's distillation (the deployment default is on)"
   fi
   [ -s "$home/token" ] || add_fail "$name" "the daemon wrote no token"
   token=$(head -n 1 "$home/token")
@@ -914,12 +928,61 @@ read_key() {
   printf '%s' "$key"
 }
 
-# One tenant gets the key (through its running daemon, so it applies at once), the Jev judge and Jev distillation of
-# its captured sessions (SP2 spec §9.5).
+# One tenant gets the key, through its running daemon, so it applies at once. Only the key: its judge and its
+# distillation are its own settings (`add` sets the judge; `alice-server distill` the distillation).
 give_jev_key() { # name key
-  printf '%s\n' "$2" | as_tenant "$1" config set-secret "$JEV_SECRET" >/dev/null 2>&1 || return 1
-  as_tenant "$1" config set judge.provider jev >/dev/null 2>&1 || return 1
-  as_tenant "$1" config set distill.provider jev >/dev/null 2>&1 || return 1
+  printf '%s\n' "$2" | as_tenant "$1" config set-secret "$JEV_SECRET" >/dev/null 2>&1
+}
+
+# The deployment's default for new tenants, `on` or `off`; fails on anything else.
+distill_default() {
+  local v=off
+  if [ -e "$DISTILL_DEFAULT_FILE" ]; then v=$(head -n 1 "$DISTILL_DEFAULT_FILE" | tr -d '[:space:]'); fi
+  case "${v:-off}" in on|off) printf '%s' "${v:-off}" ;; *) return 1 ;; esac
+}
+
+set_distill() { # name on|off: through the tenant's running daemon, so it applies at once
+  local v=off
+  [ "$2" = on ] && v=jev
+  as_tenant "$1" config set distill.provider "$v" >/dev/null 2>&1
+}
+
+tenant_setting() { # name key: the value its daemon reports, or nothing when it does not answer (never fails)
+  as_tenant "$1" config get "$2" 2>/dev/null | tail -n 1 || true
+}
+
+cmd_distill() { # on|off <name>|--all
+  local mode=$1 target=$2 t list done="" failed="" waits=""
+  if [ "$target" = --all ]; then
+    list=$(all_tenants)
+  else
+    valid_name "$target"
+    need_tenant "$target"
+    list=$target
+  fi
+  for t in $list; do
+    if set_distill "$t" "$mode"; then
+      done="$done $t"
+      if [ "$mode" = on ] && [ "$(tenant_setting "$t" judge.provider)" != jev ]; then waits="$waits $t"; fi
+    else
+      failed="$failed $t"
+    fi
+  done
+  say "distillation $mode for:${done:- (none)}"
+  if [ -n "$waits" ]; then say "their judge is not jev, so their distillation waits until it is:$waits"; fi
+  if [ -n "$failed" ]; then die "these tenants did not take it (is their daemon running?):$failed; run the command again"; fi
+}
+
+cmd_distill_status() {
+  local t d j dflt
+  dflt=$(distill_default) || dflt="invalid ($DISTILL_DEFAULT_FILE must hold on or off)"
+  say "distillation for new tenants: $dflt ($DISTILL_DEFAULT_FILE)"
+  for t in $(all_tenants); do
+    d=$(tenant_setting "$t" distill.provider)
+    j=$(tenant_setting "$t" judge.provider)
+    case "$d" in jev) d=on ;; off) ;; *) d="unknown" ;; esac
+    printf '  %-16s %-8s judge %s\n' "$t" "$d" "${j:-unknown (the daemon did not answer)}"
+  done
 }
 
 cmd_jev_key_set() {
@@ -943,8 +1006,9 @@ cmd_jev_key_set() {
     t=$(basename "$f" .env)
     if give_jev_key "$t" "$key"; then done="$done $t"; else failed="$failed $t"; fi
   done
-  say "The Jev key is set, with judge.provider = jev and distill.provider = jev, for:${done:- (no tenant yet)}"
-  say "New tenants get it when they are added; run this again to rotate it everywhere."
+  say "The Jev key is set for:${done:- (no tenant yet)}"
+  say "Only the key changed: each tenant's judge and distillation stay as they were (alice-server distill status)."
+  say "New tenants get the key, and judge.provider = jev, when they are added; run this again to rotate it everywhere."
   if [ -n "$failed" ]; then die "these tenants did not take it (is their daemon running?):$failed; run jev-key set again"; fi
 }
 
@@ -1046,6 +1110,13 @@ main() {
       case "$2" in
         set) take_lock; cmd_jev_key_set ;;
         status) cmd_jev_key_status ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    distill)
+      case "${2:-}" in
+        status) [[ $# -eq 2 ]] || { usage; exit 2; }; cmd_distill_status ;;
+        on|off) [[ $# -eq 3 ]] || { usage; exit 2; }; take_lock; cmd_distill "$2" "$3" ;;
         *) usage; exit 2 ;;
       esac
       ;;
