@@ -71,7 +71,7 @@ alice-server setup-line <name>
 alice-server list
 alice-server upgrade <binary>
 alice-server import <name> <palace-dir> [--dry-run]
-alice-server adopt <name> <backup-file>
+alice-server adopt <name> <backup-file> [--cloud-denied <slug,slug...>]
 alice-server jev-key set
 alice-server jev-key status
 alice-server cli <name> <alice arguments...>

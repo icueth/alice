@@ -484,14 +484,15 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 2. คำสั่ง:
 
    ```
-   alice-server add <name> [--tz <zone>]   # สร้างผู้ใช้ใหม่ แสดง URL และ token ครั้งเดียว (เขตเวลา ค่าเริ่มต้น Asia/Bangkok ใช้ตอน import)
+   alice-server add <name> [--tz <zone>]   # สร้างผู้ใช้ใหม่ แสดง URL และ token ครั้งเดียว พร้อมบรรทัดตั้งค่าการเก็บ session (เขตเวลา ค่าเริ่มต้น Asia/Bangkok ใช้ตอน import)
    alice-server add --team team            # สร้างความจำส่วนกลาง (ไม่มี URL ของตัวเอง)
    alice-server remove <name> [--yes]      # เก็บ archive แล้วลบ
    alice-server rotate <name>              # ออก token ใหม่
+   alice-server setup-line <name>          # แสดงบรรทัดตั้งค่าการเก็บ session ของคนนั้นอีกครั้ง (ไม่มี token อยู่ในนั้น)
    alice-server list                       # รายชื่อ สถานะ พื้นที่ดิสก์
    alice-server upgrade <binary>           # อัปเกรดทุกคน ย้อนกลับเองถ้าไม่ขึ้น
    alice-server import <name> <palace-dir> [--dry-run]
-   alice-server adopt <name> <backup-file>  # ย้ายฐานข้อมูล Alice ในเครื่องของคนนั้น (จาก alice backup now) ขึ้น tenant ใหม่
+   alice-server adopt <name> <backup-file> [--cloud-denied <slug,slug...>]  # ย้ายฐานข้อมูล Alice ในเครื่องของคนนั้น (จาก alice backup now) ขึ้น tenant ใหม่
    alice-server cli <name> <คำสั่ง alice…>
    ```
 
@@ -529,7 +530,7 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 - **โมเดลตัดสิน (judge) กับความจำส่วนกลาง:** ในโหมด precise ความจำส่วนกลางจะถูกส่งให้ judge ของคุณให้คะแนนก็ต่อเมื่อนโยบาย cloud ของส่วนกลางสำหรับโปรเจกต์นั้น **และ** นโยบาย cloud ของคุณสำหรับโปรเจกต์นั้นอนุญาตทั้งคู่ ถ้าฝ่ายใดห้าม จะไม่ถูกส่งให้ judge เลย และจะแสดงต่อท้ายผลที่ให้คะแนนแล้ว
 - **Jev และการตั้งค่า:** ขอให้แอดมินรัน `alice-server cli` ให้ (ดูด้านบน) ส่ง key ผ่านช่องทางส่วนตัวเท่านั้น
 - **Import MemPalace:** อัปโหลดเองจากเครื่องของคุณด้วย `upload.sh` (ขั้นที่ 4 ของ setup-server.md) หรือส่งโฟลเดอร์ palace ให้แอดมินเป็นคนรัน `alice-server import`
-- **เก็บ session อัตโนมัติ:** รันบรรทัดเดียวที่แอดมินให้ `curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>` มันใช้ `~/.config/alice/token` และ `~/.config/alice/url` ที่มีอยู่แล้ว (ถ้ายังไม่มีจะถามหา token ครั้งเดียว) แล้วติดตั้งสคริปต์และ plugin ของ Claude Code (และ hook ของ Codex ถ้ามี Codex) สคริปต์ hook อัปเดตตัวเองจากเซิร์ฟเวอร์ Alice ของคุณวันละครั้งผ่าน https และอัปเดต `hooks.json` ของ plugin ให้ด้วยเมื่อมีการเปลี่ยน รันบรรทัดนี้ซ้ำเฉพาะเมื่อต้องซ่อมการติดตั้ง และรันอีกครั้งหนึ่งหลังอัปเดตเป็นรุ่นนี้ ดูสถานะด้วย `sh ~/.config/alice/alice-capture.sh status` และถอดออกด้วย `sh ~/.config/alice/alice-capture.sh uninstall` รายละเอียดอยู่ในหัวข้อ "Capture for team members" ของ [docs/server.md](docs/server.md#capture-for-team-members)
+- **เก็บ session อัตโนมัติ:** รันบรรทัดเดียวที่แอดมินให้ (แอดมินดูได้ด้วย `alice-server setup-line <name>`) `curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>` มันใช้ `~/.config/alice/token` และ `~/.config/alice/url` ที่มีอยู่แล้ว (ถ้ายังไม่มีจะถามหา token ครั้งเดียว) แล้วติดตั้งสคริปต์และ plugin ของ Claude Code (และ hook ของ Codex ถ้ามี Codex) สคริปต์ hook อัปเดตตัวเองจากเซิร์ฟเวอร์ Alice ของคุณวันละครั้งผ่าน https และอัปเดต `hooks.json` ของ plugin ให้ด้วยเมื่อมีการเปลี่ยน รันบรรทัดนี้ซ้ำเฉพาะเมื่อต้องซ่อมการติดตั้ง และรันอีกครั้งหนึ่งหลังอัปเดตเป็นรุ่นนี้ ดูสถานะด้วย `sh ~/.config/alice/alice-capture.sh status` และถอดออกด้วย `sh ~/.config/alice/alice-capture.sh uninstall` รายละเอียดอยู่ในหัวข้อ "Capture for team members" ของ [docs/server.md](docs/server.md#capture-for-team-members)
 - **แพลตฟอร์ม:** โปรแกรม `alice` ใช้ได้บน macOS และ Linux ส่วน Windows หรือเครื่องที่ไม่มีโปรแกรม ให้เชื่อม agent เข้ากับ MCP endpoint ของเซิร์ฟเวอร์
 
 ### ข้อควรรู้
