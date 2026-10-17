@@ -197,6 +197,53 @@ pub struct HookArgs {
     pub agent: String,
 }
 
+/// `alice hooks …` (SP2 spec §4.3).
+#[derive(Subcommand)]
+pub enum HooksCmd {
+    /// Add Alice's capture hooks to the agent's settings (Claude Code: settings.json; Codex:
+    /// hooks.json). Run it again to repair hooks of a moved alice.
+    Install(HooksArgs),
+    /// Remove exactly Alice's capture hooks.
+    Uninstall(HooksArgs),
+    /// Whether the hooks are installed, whether the alice they run exists, and the last capture.
+    Status(HooksStatusArgs),
+}
+
+#[derive(Args)]
+pub struct HooksArgs {
+    pub agent: HooksAgent,
+    /// The file to edit instead of the agent's own settings.json or hooks.json.
+    #[arg(long)]
+    pub settings: Option<std::path::PathBuf>,
+    /// Print the change; write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args)]
+pub struct HooksStatusArgs {
+    pub agent: HooksAgent,
+    /// The file to read instead of the agent's own settings.json or hooks.json.
+    #[arg(long)]
+    pub settings: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum HooksAgent {
+    /// Claude Code.
+    Claude,
+    Codex,
+}
+
+impl From<HooksAgent> for alice_daemon::agent_hooks::HookAgent {
+    fn from(a: HooksAgent) -> Self {
+        match a {
+            HooksAgent::Claude => Self::Claude,
+            HooksAgent::Codex => Self::Codex,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum ProjectsCmd {
     /// List projects (the default for `alice projects`).
@@ -402,6 +449,10 @@ pub enum CaptureCmd {
         /// The session id (or a capture source's id or uri, from `alice capture status`).
         session_id: String,
     },
+    /// Capture the transcripts already on disk (sessions from before the hooks): the daemon
+    /// reads each file's complete turns in the background and skips what is stored or was
+    /// imported from MemPalace. Backfilled sessions are not distilled unless --distill.
+    Backfill(crate::backfill::BackfillArgs),
 }
 
 #[derive(Subcommand)]
@@ -909,6 +960,8 @@ pub fn dispatch(command: Command, json: bool) -> Result<()> {
             crate::hook::run(a);
             Ok(())
         }
+        // No daemon: the agents' files are edited here, and `status` only asks one that runs.
+        Command::Hooks(c) => hooks_command(&home, c, json),
         other => rt()?.block_on(client_command(home, other, json)),
     }
 }
@@ -1228,6 +1281,7 @@ async fn client_command(home: AliceHome, command: Command, json: bool) -> Result
         Command::Capture(c) => capture(&home, c, json).await,
         Command::Daemon(DaemonCmd::Run { .. })
         | Command::Hook(_)
+        | Command::Hooks(_)
         | Command::Mcp
         | Command::Model(_)
         | Command::Bench(_)
@@ -1603,6 +1657,16 @@ async fn capture(home: &AliceHome, c: CaptureCmd, json: bool) -> Result<()> {
                     .map(|uri| format!("due for distillation: {uri}\n"))
                     .collect()
             })
+        }
+        CaptureCmd::Backfill(a) => {
+            // The files are found (and `--since` checked) before a daemon is started.
+            let plan = crate::backfill::plan(&a)?;
+            let r = if plan.is_empty() {
+                plan.into_report(a.distill)
+            } else {
+                crate::backfill::send(&client(home).await?, plan, a.distill).await?
+            };
+            print(json, &r, || r.text())
         }
     }
 }
@@ -2958,6 +3022,105 @@ fn plan_text(plan: &svcinst::InstallPlan, write: &str, run: &str) -> String {
         t.push_str(&format!("note: {n}\n"));
     }
     t
+}
+
+// ---------------------------------------------------------------------------- hooks
+
+/// `alice hooks install | uninstall | status <agent>`: Alice's capture hooks in the agent's own
+/// settings. Nothing starts a daemon; `status` asks one that runs for the last capture.
+fn hooks_command(home: &AliceHome, c: HooksCmd, json: bool) -> Result<()> {
+    use alice_daemon::agent_hooks::{self as ah, HookTarget};
+    let env = |k: &str| std::env::var_os(k);
+    match c {
+        HooksCmd::Install(a) => {
+            let t = HookTarget::locate(a.agent.into(), a.settings.as_deref(), &env)?;
+            let change = ah::install(&t, a.dry_run)?;
+            let undo = format!(
+                "alice hooks uninstall {}{}",
+                t.agent.name(),
+                a.settings
+                    .as_ref()
+                    .map(|_| format!(" --settings {}", ah::shell_quote(&t.file.to_string_lossy())))
+                    .unwrap_or_default()
+            );
+            let notes = ah::install_notes(t.agent);
+            print(
+                json,
+                &hooks_change_json(&t, &change, a.dry_run, &notes)?,
+                || ah::install_report(&t, &change, a.dry_run, &undo),
+            )
+        }
+        HooksCmd::Uninstall(a) => {
+            let t = HookTarget::locate(a.agent.into(), a.settings.as_deref(), &env)?;
+            let change = ah::uninstall(&t, a.dry_run)?;
+            print(
+                json,
+                &hooks_change_json(&t, &change, a.dry_run, &[])?,
+                || ah::uninstall_report(&t, &change, a.dry_run),
+            )
+        }
+        HooksCmd::Status(a) => {
+            let t = HookTarget::locate(a.agent.into(), a.settings.as_deref(), &env)?;
+            let s = ah::status(&t)?;
+            let health = rt()?.block_on(async {
+                match DaemonClient::try_existing(home).await {
+                    Some(c) => c.health().await.ok(),
+                    None => None,
+                }
+            });
+            let last = health
+                .as_ref()
+                .and_then(|h| h.capture.as_ref())
+                .and_then(|c| c.last_capture_at.clone());
+            let mut v = serde_json::to_value(&s)?;
+            v["agent"] = t.agent.name().into();
+            v["daemon_running"] = health.is_some().into();
+            v["last_capture_at"] = last.clone().into();
+            print(json, &v, || {
+                let mut out = format!("{} ({}): ", t.agent.label(), s.file.display());
+                let repair = format!("run `alice hooks install {}`", t.agent.name());
+                if s.installed {
+                    out.push_str("installed\n");
+                } else if s.events.is_empty() {
+                    out.push_str("not installed\n");
+                } else {
+                    out.push_str(&format!(
+                        "on {} of the 5 events only ({}); {repair}\n",
+                        s.events.len(),
+                        s.events.join(", ")
+                    ));
+                }
+                for b in &s.binaries {
+                    if s.missing.contains(b) {
+                        out.push_str(&format!("  runs {b}, which does not exist; {repair}\n"));
+                    } else {
+                        out.push_str(&format!("  runs {b}\n"));
+                    }
+                }
+                out.push_str(&match (&health, &last) {
+                    (None, _) => "  last capture: unknown (the daemon is not running)\n".into(),
+                    (Some(_), None) => "  last capture: none yet\n".into(),
+                    (Some(_), Some(at)) => format!("  last capture: {at}\n"),
+                });
+                out
+            })
+        }
+    }
+}
+
+/// An install's or an uninstall's `--json`: the change (never the file's text), its agent,
+/// whether it was a dry run, and what the person still has to do (`notes`).
+fn hooks_change_json(
+    t: &alice_daemon::agent_hooks::HookTarget,
+    change: &alice_daemon::agent_hooks::HookChange,
+    dry_run: bool,
+    notes: &[&str],
+) -> Result<serde_json::Value> {
+    let mut v = serde_json::to_value(change)?;
+    v["agent"] = t.agent.name().into();
+    v["dry_run"] = dry_run.into();
+    v["notes"] = notes.into();
+    Ok(v)
 }
 
 /// Ctrl-C as a thing to wait for. On Unix the handler is installed when it is created, so one

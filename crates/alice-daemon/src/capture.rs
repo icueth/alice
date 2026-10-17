@@ -10,8 +10,9 @@
 //! 2. reads complete turns with [`alice_core::capture::read`];
 //! 3. drops the turns whose key is stored already, in any source (spec §3.5), and applies the
 //!    MemPalace rule (spec §9.2): while the source holds no captured turn, a turn that started
-//!    at or before the end of an imported transcript of the session is held by the import, so
-//!    its key is recorded as skipped and the cursor moves past it;
+//!    at or before the end of an imported transcript of the session (for Codex, also one
+//!    imported under a rollout file's name) is held by the import, so its key is recorded as
+//!    skipped and the cursor moves past it;
 //! 4. asks the capture verdict for every identity of the source's project (slug, aliases,
 //!    display name): `Wait` stores nothing and keeps the cursor, `Excluded` records the keys and
 //!    moves the cursor, `Capture` goes on (plan decision P1);
@@ -145,6 +146,8 @@ pub struct PassReport {
     pub chunks_stored: u64,
     /// `bytes` are a whole pass without a line end: the caller skips that line.
     pub oversized_line: bool,
+    /// The pass ended the source (`input.end`, and the pass wrote): a session end landed.
+    pub ended: bool,
     pub stats: ReadStats,
     /// Writer operations sent (slices and state changes).
     pub writes: u64,
@@ -159,6 +162,7 @@ impl PassReport {
             turns_skipped: self.turns_skipped,
             chunks_stored: self.chunks_stored,
             oversized_line: self.oversized_line,
+            ended: self.ended,
         }
     }
 
@@ -460,8 +464,11 @@ impl CaptureCtl {
         // Spec §9.2: while the source holds no captured turn (its first capture may take several
         // uploads), an imported transcript of the session tells where capture continues.
         let imported_until = if state.as_ref().is_none_or(|s| s.next_ord == 0) {
+            let imported_as = imported_session(&input);
+            // A Codex rollout is imported under its file's stem, `rollout-<time>-<id>`.
+            let rollouts = input.agent == AgentKind::Codex && input.subagent.is_none();
             self.readers
-                .with(|c| store::imported_session_end(c, &input.session))?
+                .with(|c| store::imported_session_end(c, &imported_as, rollouts))?
                 .flatten()
                 .and_then(|end| parse_time(&end))
         } else {
@@ -517,6 +524,27 @@ impl CaptureCtl {
                 started_at: turn.started_at,
                 imported,
             });
+        }
+
+        // Review I1: a hook's pass that is about to store new turns in a source a backfill
+        // registered makes it a live session again (`claude --resume` and `codex resume` append
+        // to the same file). Its backfilled history, below its `next_ord` now, stays undistilled;
+        // what is captured from here on is distilled as any session's is. A sweep's or a
+        // backfill's pass may only be catching up on the backfilled file, so it never revives.
+        // Before the slices: a pass cut short then leaves nothing of the live part behind.
+        if let Some(st) = &state
+            && st.distill_state == store::DistillState::SkippedBackfill
+            && !matches!(input.event.as_str(), "backfill" | "sweep")
+            && !matches!(verdict, CaptureVerdict::Excluded(_))
+            && units.iter().any(|u| !u.imported)
+        {
+            self.writer.submit_blocking(WriteOp::CaptureStateUpdate {
+                source_id: st.source_id.clone(),
+                change: CaptureChange::LiveAfterBackfill {
+                    from_ord: st.next_ord,
+                },
+            })?;
+            report.writes += 1;
         }
 
         let base = self.base_slice(
@@ -595,6 +623,8 @@ impl CaptureCtl {
                 "another pass stored some of this pass's turns first"
             );
         }
+        // `needed` keeps a slice whenever `input.end`, and the last one carries `ended`.
+        report.ended = input.end;
         self.mark_due(&input, &report);
         report.next_offset = done;
         Ok(report)
@@ -662,6 +692,25 @@ impl CaptureCtl {
             ))),
         }
     }
+}
+
+/// The session id an imported copy of the pass's transcript carries (spec §9.2): M3 files a
+/// transcript under its file's stem. A main session's is its id (a Codex session's rollout is
+/// `rollout-<time>-<id>`, which the lookup also asks for). A Claude Code subagent's file
+/// is `<session>/subagents/agent-<id>.jsonl`, imported under its own stem, so a subagent asks
+/// for that (its local file's stem when there is one), never its main session's: the main
+/// transcript's import holds none of the subagent's turns (Task 18b).
+fn imported_session(input: &PassInput) -> String {
+    let Some(agent) = &input.subagent else {
+        return input.session.clone();
+    };
+    input
+        .init
+        .transcript_path
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("agent-{agent}"))
 }
 
 /// An RFC 3339 time (`Z` or an offset), compared as an instant; `None` when it does not parse.
@@ -938,12 +987,14 @@ impl CaptureCtl {
         *self.on_due.lock() = Some(hook);
     }
 
-    /// Spec §6.2: a pass for a session end or a compaction makes its (main) source due for
+    /// Spec §6.2: a pass for a session end or a compaction, or one that ends the source (the
+    /// sweep's final pass of a stale session, spec §10), makes its (main) source due for
     /// distillation, when distillation is on and the source holds chunks not distilled yet (its
     /// own, or a subagent's that is not skipped for its own project's rules). A source due
     /// already keeps its next try, and a backfilled one is distilled only when asked (`alice
-    /// capture distill`). The capture is written either way: a failure here is logged, and the
-    /// distill worker's quiet check finds the source later.
+    /// capture distill`), or once a hook's pass found it going on live (then from there; see
+    /// `pass`). The capture is written either way: a failure here is logged, and the distill
+    /// worker's quiet check finds the source later.
     ///
     /// Only the event's last pass marks it: the one that closes the trailing turn. A pass that
     /// leaves it open (a capped upload, `more=1`; a local pass short of the end of the file) is
@@ -951,7 +1002,7 @@ impl CaptureCtl {
     /// session for its end (and offer a handoff from the middle of it).
     fn mark_due(&self, input: &PassInput, report: &PassReport) {
         if input.subagent.is_some()
-            || !matches!(input.event.as_str(), "session-end" | "pre-compact")
+            || !(input.end || matches!(input.event.as_str(), "session-end" | "pre-compact"))
             || !(input.close_trailing || input.force_close)
             || self.settings.get().distill.provider == DistillProvider::Off
         {
@@ -1036,17 +1087,23 @@ fn distill_state(s: &Settings) -> &'static str {
     }
 }
 
-/// The capture line of the health; `None` while capture never ran.
+/// The capture line of the health; `None` while capture never ran. `rollouts`: what the local
+/// worker counted (zeros on a tenant).
 pub(crate) fn health(
     conn: &Connection,
     settings: &Settings,
     unrecognised_lines_7d: u64,
+    rollouts: LocalCaptureCounts,
 ) -> Result<Option<Box<CaptureHealth>>> {
     let count = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<u64> {
         Ok(conn.query_row(sql, p, |r| r.get::<_, i64>(0))? as u64)
     };
     let sources = count("SELECT count(*) FROM capture_state", &[])?;
-    if sources == 0 && unrecognised_lines_7d == 0 {
+    if sources == 0
+        && unrecognised_lines_7d == 0
+        && rollouts.rollouts_not_found == 0
+        && rollouts.rollouts_compressed == 0
+    {
         return Ok(None);
     }
     let since = (chrono::Utc::now() - chrono::Duration::hours(24))
@@ -1079,6 +1136,8 @@ pub(crate) fn health(
         distill_dropped_24h: 0,
         distill_warning: None,
         unrecognised_lines_7d,
+        rollouts_not_found: rollouts.rollouts_not_found,
+        rollouts_compressed: rollouts.rollouts_compressed,
     })))
 }
 
@@ -1241,9 +1300,13 @@ mod local {
         }
 
         /// Coalesces `newer`, a later notification of the same source: its event wins unless
-        /// this one ends the session, and closes, ends and waits only grow.
+        /// this one's ranks higher (`session-end`, then `pre-compact`, which mark the session due
+        /// for distillation) or `newer` is a backfill's (a hook's event marks a live session,
+        /// which a backfill must not register as backfilled), and closes, ends and waits only
+        /// grow.
         fn merge(&mut self, newer: Job) {
-            if !self.end || newer.end {
+            let backfill_over_hook = newer.event == "backfill" && self.event != "backfill";
+            if event_rank(&newer.event) >= event_rank(&self.event) && !backfill_over_hook {
                 self.event = newer.event;
             }
             self.close = self.close.max(newer.close);
@@ -1256,6 +1319,15 @@ mod local {
             if newer.cwd.is_some() {
                 self.cwd = newer.cwd;
             }
+        }
+    }
+
+    /// How much a coalesced job keeps an event: a session end, then a compaction, over the rest.
+    fn event_rank(event: &str) -> u8 {
+        match event {
+            "session-end" => 2,
+            "pre-compact" => 1,
+            _ => 0,
         }
     }
 
@@ -1533,15 +1605,10 @@ mod local {
             }
         }
 
-        /// The waiting job that is due first, if one is due.
+        /// The waiting job to run next, if one is due (see [`first_due`]).
         fn take_due(&self) -> Option<Job> {
-            let now = Instant::now();
             let mut pending = self.pending.lock();
-            let uri = pending
-                .iter()
-                .filter(|(_, j)| j.not_before <= now)
-                .min_by_key(|(_, j)| j.not_before)
-                .map(|(uri, _)| uri.clone())?;
+            let uri = first_due(&pending, Instant::now())?;
             pending.remove(&uri)
         }
 
@@ -1576,17 +1643,17 @@ mod local {
 
         /// Queues a pass of each open source whose transcript changed since its last pass, or
         /// whose idle time asks for a stronger close (a stale one always: its final pass ends
-        /// it). A source with no transcript path (an upload's) or whose file is gone is left
-        /// to its age (Task 12).
+        /// it). A source it cannot read has no final pass: one with no transcript path (an
+        /// upload on a local daemon), or whose file is gone or is no longer a regular file, is
+        /// ended once nothing was captured for `stale` (spec §9.4). Locally the sweep owns the
+        /// stale end; the distill worker's runs on server tenants only.
         fn sweep(&self, seen: &mut HashMap<String, Seen>) -> Result<()> {
             let open = self.readers.with(store::open_sources)?;
             let uris: HashSet<&str> = open.iter().map(|s| s.uri.as_str()).collect();
             seen.retain(|uri, _| uris.contains(uri.as_str()));
             let now = SystemTime::now();
+            let mut unreadable = Vec::new();
             for s in &open {
-                let Some(path) = s.transcript_path.as_deref() else {
-                    continue;
-                };
                 let Some(agent) = AgentKind::parse(&s.agent) else {
                     continue;
                 };
@@ -1597,12 +1664,23 @@ mod local {
                 {
                     continue;
                 }
-                let Ok(meta) = std::fs::metadata(path) else {
+                let Some(path) = s.transcript_path.as_deref() else {
+                    unreadable.push(s);
                     continue;
                 };
-                if !meta.is_file() {
-                    continue;
-                }
+                let meta = match std::fs::metadata(path) {
+                    Ok(m) if m.is_file() => m,
+                    Ok(_) => {
+                        unreadable.push(s);
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        unreadable.push(s);
+                        continue;
+                    }
+                    // Unreadable for another reason (permissions): tried again next sweep.
+                    Err(_) => continue,
+                };
                 let (len, mtime) = (meta.len(), meta.modified().ok());
                 let close = self.close_by_age(mtime, now);
                 let last = seen.get(&s.uri);
@@ -1623,6 +1701,45 @@ mod local {
                         not_before: Instant::now(),
                     });
                 }
+            }
+            if !unreadable.is_empty() {
+                self.end_unreadable(&unreadable, open.len(), seen)?;
+            }
+            Ok(())
+        }
+
+        /// Ends the sources in `unreadable` that captured nothing for `stale` (one that never
+        /// captured: registered before then), out of `open` open sources. There is nothing to
+        /// read, so there is no final pass; the cursor stays where it is.
+        fn end_unreadable(
+            &self,
+            unreadable: &[&store::CaptureState],
+            open: usize,
+            seen: &mut HashMap<String, Seen>,
+        ) -> Result<()> {
+            let stale = chrono::Duration::from_std(self.cfg.stale).unwrap_or(chrono::Duration::MAX);
+            let Some(before) = chrono::Utc::now().checked_sub_signed(stale) else {
+                return Ok(());
+            };
+            let before = before.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let stale: HashSet<String> = self
+                .readers
+                .with(|c| store::stale_open(c, &before, open.max(1)))?
+                .into_iter()
+                .collect();
+            for s in unreadable.iter().filter(|s| stale.contains(&s.source_id)) {
+                if self.stopping() {
+                    break;
+                }
+                self.writer.submit_blocking(WriteOp::CaptureStateUpdate {
+                    source_id: s.source_id.clone(),
+                    change: CaptureChange::Ended,
+                })?;
+                seen.remove(&s.uri);
+                tracing::info!(
+                    uri = s.uri,
+                    "a captured session with no transcript to read had no capture for a day; it is ended"
+                );
             }
             Ok(())
         }
@@ -1769,6 +1886,11 @@ mod local {
                     init: CaptureInit {
                         transcript_path: Some(path.to_string_lossy().into_owned()),
                         file_key: Some(key),
+                        // Spec §4.4: a source a backfill registers is not distilled unless asked.
+                        // A subagent's too: its chunks go with its session's run, and when the
+                        // session goes on live (review I1) only the live part is distilled; one
+                        // with no main source is then never distilled on its own (review M6).
+                        backfill: job.event == "backfill",
                         ..Default::default()
                     },
                     project: project.clone(),
@@ -1839,6 +1961,18 @@ mod local {
             }
             Ok(None)
         }
+    }
+
+    /// The uri of the job to run next at `now`: of the jobs due, a hook's or a sweep's before any
+    /// backfill's, then the one due first. A backfill of thousands of files queues them all at
+    /// once, with no settle delay, and a live session's capture must not wait until they are
+    /// read (review M2); the backfill goes on between the live passes.
+    fn first_due(pending: &HashMap<String, Job>, now: Instant) -> Option<String> {
+        pending
+            .iter()
+            .filter(|(_, j)| j.not_before <= now)
+            .min_by_key(|(_, j)| (j.event == "backfill", j.not_before))
+            .map(|(uri, _)| uri.clone())
     }
 
     /// Opens a transcript read-only; it must be a regular file. Non-blocking, so a FIFO named
@@ -2021,6 +2155,61 @@ mod local {
             assert!(job("backfill").by_age && job("sweep").by_age);
             let end = job("session-end");
             assert!(end.not_before > Instant::now(), "session-end settles too");
+        }
+
+        /// Review M2: a due hook's or sweep's job runs before every backfill job, even those
+        /// queued earlier; backfill jobs run oldest first; a job not due yet waits.
+        #[test]
+        fn live_jobs_go_before_a_backfill() {
+            let t0 = Instant::now();
+            let at = |session: &str, event: &str, ms: u64| {
+                let mut j = job(event);
+                j.session = session.into();
+                j.not_before = t0 + Duration::from_millis(ms);
+                (j.uri(), j)
+            };
+            let mut pending: HashMap<String, Job> = [
+                at("b1", "backfill", 0),
+                at("b2", "backfill", 5),
+                at("live", "stop", 20),
+                at("later", "stop", 500),
+            ]
+            .into_iter()
+            .collect();
+            let now = t0 + Duration::from_millis(30);
+            let mut order = Vec::new();
+            while let Some(uri) = first_due(&pending, now) {
+                order.push(pending.remove(&uri).unwrap().session);
+            }
+            assert_eq!(order, ["live", "b1", "b2"], "`later` is not due yet");
+            pending.extend([at("b3", "backfill", 0), at("sw", "sweep", 10)]);
+            assert_eq!(
+                first_due(&pending, now),
+                Some(AgentKind::ClaudeCode.source_uri("sw", None))
+            );
+        }
+
+        /// Merge fix round 1: events rank session-end > pre-compact > the others, so a compaction
+        /// coalesced with a later `stop` keeps its event, and with it its due-mark.
+        #[test]
+        fn a_compaction_coalesced_with_a_later_stop_keeps_its_event() {
+            let mut j = job("pre-compact");
+            j.merge(job("stop"));
+            j.merge(job("sweep"));
+            assert_eq!(
+                (j.event.as_str(), j.close),
+                ("pre-compact", Close::Trailing)
+            );
+            j.merge(job("session-end"));
+            assert_eq!(j.event, "session-end");
+            j.merge(job("pre-compact"));
+            assert_eq!(
+                j.event, "session-end",
+                "a later compaction never hides the end"
+            );
+            let mut k = job("stop");
+            k.merge(job("sweep"));
+            assert_eq!(k.event, "sweep", "between equals the newer still wins");
         }
 
         #[test]

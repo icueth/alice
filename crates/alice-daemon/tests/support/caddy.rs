@@ -20,6 +20,16 @@ use tokio_util::sync::CancellationToken;
 /// present, and the body.
 pub type Seen = (String, String, bool, Vec<u8>);
 
+/// What the emulator answers for `GET /api/v1/capture/hook.sh` in place of the tenant (the hook
+/// script's self-update tests): `status` and `body`, after holding the request `hold_ms` (longer
+/// than the client's limit makes a timeout).
+#[derive(Clone, Debug, Default)]
+pub struct ScriptAnswer {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub hold_ms: u64,
+}
+
 pub struct Tenant {
     pub name: String,
     pub home: AliceHome,
@@ -38,6 +48,8 @@ pub struct Server {
     stalled: Arc<AtomicBool>,
     /// Milliseconds every routed request waits before it is forwarded.
     request_delay_ms: Arc<AtomicU64>,
+    /// Served for `GET /api/v1/capture/hook.sh` instead of the tenant's script, while set.
+    hook_script: Arc<Mutex<Option<ScriptAnswer>>>,
     /// Milliseconds the team store waits before it answers `/api/v1/recall`.
     team_recall_delay_ms: Arc<AtomicU64>,
     stop: CancellationToken,
@@ -52,6 +64,7 @@ struct Front {
     paused: Arc<AtomicBool>,
     stalled: Arc<AtomicBool>,
     request_delay_ms: Arc<AtomicU64>,
+    hook_script: Arc<Mutex<Option<ScriptAnswer>>>,
 }
 
 /// The longest a stalled request is held (a test that forgets to release it still ends).
@@ -92,6 +105,18 @@ async fn front(State(f): State<Front>, req: Request, next: Next) -> Response {
     let delay = f.request_delay_ms.load(Ordering::SeqCst);
     if delay > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+    let script = f.hook_script.lock().clone();
+    if path == "/api/v1/capture/hook.sh"
+        && let Some(a) = script
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(a.hold_ms)).await;
+        return (
+            StatusCode::from_u16(a.status).unwrap(),
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            a.body,
+        )
+            .into_response();
     }
     let held = std::time::Instant::now();
     while f.stalled.load(Ordering::SeqCst) && held.elapsed() < STALL_CAP {
@@ -168,6 +193,7 @@ impl Server {
         let paused = Arc::new(AtomicBool::new(false));
         let stalled = Arc::new(AtomicBool::new(false));
         let request_delay_ms = Arc::new(AtomicU64::new(0));
+        let hook_script = Arc::new(Mutex::new(None));
         let mut app = Router::new();
         let mut tenants = Vec::new();
         let mut recorders = Vec::new();
@@ -254,6 +280,7 @@ impl Server {
                 paused: paused.clone(),
                 stalled: stalled.clone(),
                 request_delay_ms: request_delay_ms.clone(),
+                hook_script: hook_script.clone(),
             };
             app = app.nest(
                 &format!("/u/{name}"),
@@ -287,6 +314,7 @@ impl Server {
             paused,
             stalled,
             request_delay_ms,
+            hook_script,
             team_recall_delay_ms,
             stop,
             team_stop,
@@ -340,6 +368,12 @@ impl Server {
     /// as a slow link does: each client process then lives at least that long.
     pub fn delay_requests(&self, ms: u64) {
         self.request_delay_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// While `Some`, `GET /api/v1/capture/hook.sh` gets that answer instead of the tenant's own
+    /// script (every tenant); `None` serves the tenant's script again.
+    pub fn serve_hook_script(&self, answer: Option<ScriptAnswer>) {
+        *self.hook_script.lock() = answer;
     }
 }
 

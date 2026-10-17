@@ -3834,6 +3834,319 @@ fn restore_refuses_when_the_manager_cannot_be_asked_and_never_starts_a_stopped_u
     );
 }
 
+// ---------------------------------------------------- SP2 Task 18b: `alice capture backfill`
+
+/// A Claude Code transcript of `session` run in `cwd` (a subagent's file when `agent` is given):
+/// one finished turn naming `marker`, long enough for a subagent to be kept (over 200
+/// characters rendered).
+fn backfill_transcript(
+    session: &str,
+    cwd: &std::path::Path,
+    marker: &str,
+    agent: Option<&str>,
+) -> String {
+    let id = |what: &str| match agent {
+        Some(a) => format!("{session}-{a}-{what}"),
+        None => format!("{session}-{what}"),
+    };
+    let mut prompt = serde_json::json!({"type": "user", "uuid": id("p1"), "sessionId": session,
+        "cwd": cwd, "timestamp": "2026-10-10T01:00:00.000Z", "isSidechain": agent.is_some(),
+        "message": {"role": "user", "content": format!("Which lantern is {marker}?")}});
+    let mut reply = serde_json::json!({"type": "assistant", "uuid": id("a1"),
+        "parentUuid": id("p1"), "sessionId": session, "cwd": cwd,
+        "timestamp": "2026-10-10T01:00:01.000Z", "isSidechain": agent.is_some(),
+        "message": {"id": format!("msg-{}", id("a1")), "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": format!("The lantern is {marker}. ").repeat(12)}],
+            "stop_reason": "end_turn"}});
+    if let Some(a) = agent {
+        prompt["agentId"] = serde_json::json!(a);
+        reply["agentId"] = serde_json::json!(a);
+    }
+    format!("{prompt}\n{reply}\n")
+}
+
+/// Writes `text` to `path` (making its folders), modified `days` ago.
+fn write_aged(path: &std::path::Path, text: &str, days: u64) -> PathBuf {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(days * 24 * 3600))
+        .unwrap();
+    path.to_path_buf()
+}
+
+/// `uri -> (project, distill_state)` of the sessions `alice capture status` lists.
+fn captured(e: &Env) -> std::collections::BTreeMap<String, (String, String)> {
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    e.json(&["capture", "status"])["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|s| {
+            (
+                text(&s["uri"]),
+                (text(&s["project"]), text(&s["distill_state"])),
+            )
+        })
+        .collect()
+}
+
+/// The UTC date `days` ago, `YYYY-MM-DD`. `--since` reads a date from local midnight, which
+/// moves the boundary by less than a day.
+fn days_ago(days: u64) -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        - days * 86_400_000;
+    let at = alice_core::store::sources::normalise_authored(Some(&ms.to_string())).unwrap();
+    at[..10].to_string()
+}
+
+/// The lines of `out` that start with `queued `, without it.
+fn queued(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|l| l.strip_prefix("queued "))
+        .map(String::from)
+        .collect()
+}
+
+/// SP2 spec §4.4, Task 18b: `alice capture backfill claude --since <date>` queues the session
+/// files modified since the date, and their subagents' files, one notice each, and prints
+/// them. The daemon captures them under their working directory's project, and a source it
+/// registers this way (a subagent's too) is `skipped_backfill`: not distilled. Backfilling again with
+/// `--distill` stores nothing twice and marks the sessions due.
+#[test]
+fn backfill_queues_files_since_a_date_and_does_not_distill() {
+    let e = Env::new();
+    let dir = transcripts_dir(&e, &e.work);
+    let path = |name: &str| dir.join(name);
+    write_aged(
+        &path("s-old.jsonl"),
+        &backfill_transcript("s-old", &e.work, "oldquokka", None),
+        10,
+    );
+    let new1 = write_aged(
+        &path("s-new1.jsonl"),
+        &backfill_transcript("s-new1", &e.work, "newquokka", None),
+        3,
+    );
+    let new2 = write_aged(
+        &path("s-new2.jsonl"),
+        &backfill_transcript("s-new2", &e.work, "newerquokka", None),
+        2,
+    );
+    let sub = write_aged(
+        &path("s-new1/subagents/agent-k1.jsonl"),
+        &backfill_transcript("s-new1", &e.work, "subquokka", Some("k1")),
+        3,
+    );
+    let since = days_ago(5);
+    let out = e.ok(&["capture", "backfill", "claude", "--since", &since]);
+    assert_eq!(
+        queued(&out),
+        [&new1, &new2, &sub].map(|p| p.display().to_string()),
+        "the oldest first, subagents last: {out}"
+    );
+    assert!(
+        out.contains("3 files queued; skipped: 1 older than --since."),
+        "{out}"
+    );
+    assert!(out.contains("are not distilled"), "{out}");
+
+    let (main1, main2) = ("claude-code:session:s-new1", "claude-code:session:s-new2");
+    let sub1 = "claude-code:session:s-new1:agent:k1";
+    eventually(
+        || {
+            let c = captured(&e);
+            [main1, main2, sub1].iter().all(|u| c.contains_key(*u))
+        },
+        "the backfilled sessions captured",
+    );
+    let c = captured(&e);
+    let backfilled = ("work".to_string(), "skipped_backfill".to_string());
+    assert_eq!(c[main1], backfilled, "{c:?}");
+    assert_eq!(c[main2], backfilled, "{c:?}");
+    assert_eq!(
+        c[sub1].1, "skipped_backfill",
+        "a backfilled subagent too (review M6)"
+    );
+    assert!(!c.contains_key("claude-code:session:s-old"), "{c:?}");
+    eventually(
+        || !raw_hits(&e, "newerquokka").is_empty(),
+        "recall finds the backfilled text",
+    );
+    assert!(!raw_hits(&e, "subquokka").is_empty());
+    assert!(raw_hits(&e, "oldquokka").is_empty());
+
+    // `--distill` while distillation is off: the same files are queued again, nothing is
+    // stored twice, and nothing is marked due (review M1: marked now, the whole backfill would
+    // be distilled at once when it is turned on).
+    let backfill_distill = || {
+        e.ok(&[
+            "capture",
+            "backfill",
+            "claude",
+            "--since",
+            &since,
+            "--distill",
+        ])
+    };
+    let out = backfill_distill();
+    assert_eq!(queued(&out).len(), 3, "{out}");
+    assert!(!out.contains("due for distillation"), "{out}");
+    assert!(
+        out.contains("Distillation is off") && out.contains("backfill again with --distill"),
+        "{out}"
+    );
+    let c = captured(&e);
+    for uri in [main1, main2, sub1] {
+        assert_eq!(c[uri].1, "skipped_backfill", "{uri}: {c:?}");
+    }
+    assert_eq!(raw_hits(&e, "newerquokka").len(), 1, "stored once");
+
+    // With distillation on, `--distill` marks the sessions due. (The judge here is not Jev, so
+    // they then wait for it; nothing is sent anywhere.)
+    e.ok(&["config", "set", "distill.provider", "jev"]);
+    let out = backfill_distill();
+    for uri in [main1, main2] {
+        assert!(
+            out.contains(&format!("due for distillation: {uri}\n")),
+            "{out}"
+        );
+    }
+    assert!(!out.contains("Distillation is off"), "{out}");
+    let c = captured(&e);
+    for uri in [main1, main2] {
+        assert_ne!(c[uri].1, "skipped_backfill", "{uri}: {c:?}");
+    }
+    assert_eq!(raw_hits(&e, "newerquokka").len(), 1, "stored once");
+}
+
+/// `--project` keeps one project's sessions; Codex rollouts are found under CODEX_HOME and named
+/// by their session meta, a compressed one is counted and skipped; and a backfill is refused
+/// while capture, or the agent's capture, is off, since the daemon would record every turn as
+/// not captured.
+#[test]
+fn backfill_filters_by_project_reads_codex_and_refuses_while_capture_is_off() {
+    let e = Env::new();
+    let elsewhere = e.work.parent().unwrap().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let in_work = write_aged(
+        &transcripts_dir(&e, &e.work).join("p-work.jsonl"),
+        &backfill_transcript("p-work", &e.work, "workwombat", None),
+        2,
+    );
+    write_aged(
+        &transcripts_dir(&e, &elsewhere).join("p-else.jsonl"),
+        &backfill_transcript("p-else", &elsewhere, "elsewombat", None),
+        2,
+    );
+
+    e.ok(&["config", "set", "capture.enabled", "false"]);
+    let o = e.run(&["capture", "backfill", "claude"]);
+    assert!(!o.status.success(), "refused");
+    assert!(stderr(&o).contains("capture is off"), "{}", stderr(&o));
+    assert!(queued(&String::from_utf8_lossy(&o.stdout)).is_empty());
+    e.ok(&["config", "set", "capture.enabled", "true"]);
+    // The agent's own switch too (review M7).
+    e.ok(&["config", "set", "capture.claude_code", "false"]);
+    let o = e.run(&["capture", "backfill", "claude"]);
+    assert!(!o.status.success(), "refused");
+    assert!(
+        stderr(&o).contains("capture of claude-code is off (capture.claude_code = false)"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(queued(&String::from_utf8_lossy(&o.stdout)).is_empty());
+    e.ok(&["config", "set", "capture.claude_code", "true"]);
+    assert!(captured(&e).is_empty(), "nothing was queued");
+
+    let out = e.ok(&["capture", "backfill", "claude", "--project", "work"]);
+    assert_eq!(queued(&out), [in_work.display().to_string()], "{out}");
+    assert!(out.contains("skipped: 1 in other projects"), "{out}");
+    eventually(
+        || captured(&e).contains_key("claude-code:session:p-work"),
+        "the work session captured",
+    );
+    assert!(!captured(&e).contains_key("claude-code:session:p-else"));
+
+    // A Codex rollout, named by its session meta; a compressed one beside it.
+    let id = "0199e4c1-5b2a-7d10-8e3f-4a5b6c7d8e9f";
+    let line = |n: u64, kind: &str, payload: serde_json::Value| {
+        serde_json::json!({"timestamp": format!("2026-10-10T01:00:0{n}.000Z"), "ordinal": n,
+            "type": kind, "payload": payload})
+        .to_string()
+    };
+    let message = |role: &str, block: &str, kinds: &str, text: &str| {
+        serde_json::json!({"type": "message", "id": format!("m-{role}"), "role": role,
+            "content": [{"type": block, "text": text}],
+            "internal_chat_message_metadata_passthrough": {"content_item_kinds": [kinds]}})
+    };
+    let rollout = [
+        line(
+            0,
+            "session_meta",
+            serde_json::json!({"id": id, "session_id": id, "cwd": e.work}),
+        ),
+        line(
+            1,
+            "response_item",
+            message(
+                "user",
+                "input_text",
+                "user.text",
+                "Which wombat is codexwombat?",
+            ),
+        ),
+        line(
+            2,
+            "response_item",
+            message(
+                "assistant",
+                "output_text",
+                "unknown",
+                "The wombat is codexwombat.",
+            ),
+        ),
+    ]
+    .map(|l| format!("{l}\n"))
+    .concat();
+    let day = e.user_home.join(".codex/sessions/2026/10/10");
+    let r = write_aged(
+        &day.join(format!("rollout-2026-10-10T01-00-00-{id}.jsonl")),
+        &rollout,
+        2,
+    );
+    write_aged(
+        &day.join("rollout-2026-10-09T01-00-00-0199e4c1-0000-7000-8000-000000000000.jsonl.zst"),
+        "not read",
+        2,
+    );
+    let out = e.ok(&["capture", "backfill", "codex"]);
+    assert_eq!(queued(&out), [r.display().to_string()], "{out}");
+    assert!(
+        out.contains("skipped: 1 compressed (.zst) rollouts"),
+        "{out}"
+    );
+    let uri = format!("codex:session:{id}");
+    eventually(
+        || captured(&e).contains_key(&uri),
+        "the Codex session captured",
+    );
+    assert_eq!(
+        captured(&e)[&uri],
+        ("work".to_string(), "skipped_backfill".to_string())
+    );
+    eventually(
+        || !raw_hits(&e, "codexwombat").is_empty(),
+        "recall finds the Codex text",
+    );
+}
+
 // ------------------------------------------------------------------ SP2 Task 7: `alice hook`
 
 /// `alice hook <args>` with `input` on its stdin and `vars` set. The input is written from
@@ -4352,4 +4665,173 @@ fn hook_finishes_under_100ms() {
         briefed * 100 >= RUNS * 95,
         "the briefing arrived within the deadline in {briefed} of {RUNS} runs"
     );
+}
+
+// ---------------------------------------------------------- SP2 Task 8: `alice hooks`
+
+/// `alice hooks install | status | uninstall` for Claude Code and Codex, in the test's own
+/// HOME, CLAUDE_CONFIG_DIR and CODEX_HOME, with the `--json` shapes; and doctor's hooks line.
+#[test]
+fn alice_hooks_cli_round_trip() {
+    let e = Env::new();
+    let settings = e.claude_dir().join("settings.json");
+    let alice = std::fs::canonicalize(BIN).unwrap();
+    let out = e.ok(&["hooks", "install", "claude"]);
+    assert!(
+        out.contains(&settings.display().to_string())
+            && out.contains("To remove them: alice hooks uninstall claude"),
+        "{out}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    // The ALICE_HOME of the install (not the default) and this very program, quoted.
+    assert_eq!(
+        v["hooks"]["Stop"][0]["hooks"][0]["command"],
+        format!(
+            "ALICE_HOME='{}' '{}' hook stop --agent claude-code || true",
+            e.home.display(),
+            alice.display()
+        )
+    );
+    let s = e.json(&["hooks", "status", "claude"]);
+    assert_eq!(s["agent"], "claude", "{s}");
+    assert_eq!(s["file"], settings.display().to_string(), "{s}");
+    assert_eq!(
+        (&s["installed"], &s["binary_exists"]),
+        (&serde_json::json!(true), &serde_json::json!(true)),
+        "{s}"
+    );
+    assert_eq!(s["events"].as_array().unwrap().len(), 5, "{s}");
+    assert_eq!(s["binaries"][0], alice.display().to_string(), "{s}");
+    assert_eq!(s["missing"], serde_json::json!([]), "{s}");
+    // `hooks status` starts no daemon to learn the last capture.
+    assert_eq!(s["daemon_running"], false, "{s}");
+    assert!(s["last_capture_at"].is_null(), "{s}");
+    assert!(e.daemon_json().is_none());
+    // Again: nothing changes.
+    let again = e.json(&["hooks", "install", "claude"]);
+    assert_eq!(again["agent"], "claude");
+    assert_eq!(again["dry_run"], false);
+    assert_eq!(again["changed"], false, "{again}");
+    assert_eq!(again["removed"], 5);
+    assert_eq!(again["added"].as_array().unwrap().len(), 5);
+    assert!(again["backup"].is_null() && again["others"] == serde_json::json!([]));
+    assert!(
+        again.get("text").is_none(),
+        "the file is never printed: {again}"
+    );
+    assert_eq!(again["notes"], serde_json::json!([]), "{again}");
+    let before = std::fs::read(&settings).unwrap();
+    let dry = e.json(&["hooks", "uninstall", "claude", "--dry-run"]);
+    assert_eq!(
+        (&dry["dry_run"], &dry["changed"], &dry["removed"]),
+        (
+            &serde_json::json!(true),
+            &serde_json::json!(true),
+            &serde_json::json!(5)
+        ),
+        "{dry}"
+    );
+    assert_eq!(std::fs::read(&settings).unwrap(), before);
+    let gone = e.json(&["hooks", "uninstall", "claude"]);
+    assert_eq!(gone["removed"], 5, "{gone}");
+    let backup = std::path::PathBuf::from(gone["backup"].as_str().unwrap());
+    assert_eq!(std::fs::read(&backup).unwrap(), before);
+    let s = e.json(&["hooks", "status", "claude"]);
+    assert_eq!(s["installed"], false, "{s}");
+    assert_eq!(s["events"], serde_json::json!([]), "{s}");
+
+    // Codex: its hooks.json, SessionEnd at 3 s, and the trust step last.
+    let hooks_json = e.user_home.join(".codex/hooks.json");
+    let out = e.ok(&["hooks", "install", "codex"]);
+    assert!(
+        out.trim_end()
+            .ends_with("open /hooks in Codex once and trust the Alice entries."),
+        "{out}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks_json).unwrap()).unwrap();
+    assert_eq!(v["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+    assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["timeout"], 10);
+    assert!(
+        v["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" hook stop --agent codex || true")
+    );
+    // `--json` carries the trust step too.
+    let dry = e.json(&["hooks", "install", "codex", "--dry-run"]);
+    assert_eq!(
+        dry["notes"],
+        serde_json::json!([
+            "Codex runs a hook only after you trust it: open /hooks in Codex once and trust the Alice entries."
+        ]),
+        "{dry}"
+    );
+    let s = e.json(&["hooks", "status", "codex"]);
+    assert_eq!(
+        (&s["agent"], &s["installed"]),
+        (&serde_json::json!("codex"), &serde_json::json!(true)),
+        "{s}"
+    );
+    assert_eq!(s["file"], hooks_json.display().to_string());
+    // Codex's inline hooks in config.toml stop an install.
+    std::fs::write(e.user_home.join(".codex/config.toml"), "[hooks]\n").unwrap();
+    let o = e.run(&["hooks", "install", "codex"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("one format per layer"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::remove_file(e.user_home.join(".codex/config.toml")).unwrap();
+    assert_eq!(e.json(&["hooks", "uninstall", "codex"])["removed"], 5);
+
+    // `--settings` names another file.
+    let other = e.user_home.join("elsewhere/settings.json");
+    let other_arg = other.to_str().unwrap();
+    let own = std::fs::read(&settings).unwrap();
+    let out = e.ok(&["hooks", "install", "claude", "--settings", other_arg]);
+    assert!(
+        out.contains(&format!(
+            "To remove them: alice hooks uninstall claude --settings '{other_arg}'"
+        )),
+        "the undo names the file too: {out}"
+    );
+    assert!(other.exists());
+    assert_eq!(
+        std::fs::read(&settings).unwrap(),
+        own,
+        "Claude Code's own file is untouched"
+    );
+    let s = e.json(&["hooks", "status", "claude", "--settings", other_arg]);
+    assert_eq!(s["installed"], true, "{s}");
+
+    // A malformed file is refused with its name, and left as it is.
+    std::fs::write(&settings, "{\"model\": \"opus\",}").unwrap();
+    let o = e.run(&["hooks", "install", "claude"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains(&settings.display().to_string()),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        "{\"model\": \"opus\",}"
+    );
+
+    // Doctor reads the hooks Claude Code reads, and their program exists.
+    std::fs::remove_file(&settings).unwrap();
+    e.ok(&["hooks", "install", "claude"]);
+    let o = e.run(&["--json", "doctor"]);
+    let report: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let hooks = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "capture hooks")
+        .unwrap_or_else(|| panic!("{report}"));
+    assert_eq!(hooks["status"], "ok", "{hooks}");
+    assert_eq!(hooks["detail"], "installed for Claude Code", "{hooks}");
 }

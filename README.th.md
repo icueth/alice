@@ -29,7 +29,7 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
 ## จุดเด่น
 
 - **agent ไม่ต้องรอ memory อีก** มี daemon ตัวเดียวเป็นเจ้าของฐานข้อมูล การเขียนตอบกลับภายใน 50ms ส่วนงานหนักอย่าง embedding และการทำ index ทำเบื้องหลังทั้งหมด ถ้า daemon ไม่ได้รันหรือยังเปิดไม่เสร็จ การเขียนจะพักลงดิสก์ไว้ก่อน ข้อมูลไม่หาย
-- **ความรู้มาก่อน transcript ดิบเรียกเมื่อต้องการ** ข้อมูลมี 2 ชั้น ชั้นแรกคือ *memory* สั้นๆ ที่กลั่นแล้ว (decision, การแก้บั๊ก, fact, how-to, preference, warning, handoff) ซึ่งค้นหาเป็นค่าเริ่มต้น ชั้นที่สองคือ transcript ดิบที่เก็บไว้เป็นหลักฐาน ค้นเมื่อขอหรือเมื่อชั้นแรกมีผลไม่พอ *(การเก็บ transcript และกลั่นความรู้อัตโนมัติ: วางแผนไว้ใน SP2)*
+- **ความรู้มาก่อน transcript ดิบเรียกเมื่อต้องการ** ข้อมูลมี 2 ชั้น ชั้นแรกคือ *memory* สั้นๆ ที่กลั่นแล้ว (decision, การแก้บั๊ก, fact, how-to, preference, warning, handoff) ซึ่งค้นหาเป็นค่าเริ่มต้น ชั้นที่สองคือ transcript ดิบที่เก็บไว้เป็นหลักฐาน ค้นเมื่อขอหรือเมื่อชั้นแรกมีผลไม่พอ session ของ Claude Code และ Codex ถูกเก็บลงชั้นข้อมูลดิบให้เองระหว่างทำงาน และกลั่นเป็น memory ได้ ([เก็บ session อัตโนมัติ](#เก็บ-session-อัตโนมัติ))
 - **ค้นเข้าใจทั้งโค้ดและภาษาไทย** รวมการค้น 4 แบบ: vector หลายภาษา, BM25, trigram สำหรับภาษาที่ไม่เว้นวรรค (ไทย จีน ญี่ปุ่น) และการค้นที่เข้าใจชื่อในโค้ด (`HostLinkReconnect`, `writer_lease`, path ไฟล์) ผลค้นหาให้น้ำหนักกับโปรเจกต์ปัจจุบัน ความสดใหม่ ความสำคัญ และสถานะ
 - **ความจำแก้ตัวเองได้** memory ใหม่จะถูกเทียบกับของเดิมที่คล้ายกัน ข้อความที่เหมือนกันเป๊ะจะรวมเข้ากับอันเก่า ถ้าเปิด Judge จะให้ข้อมูลใหม่แทนที่ (supersede) ของเก่าได้ และเรื่องขัดแย้งจะเข้าคิว review (`alice review`) ทุกการเปลี่ยนแปลงถูกบันทึกไว้ (`alice history`) และ undo ได้ (`alice undo`)
 - **มี AI Judge ให้เลือกเปิด** ต่อกับ [TypeSafe Jev](https://typesafe.ai) เพื่อช่วยตัดสินใจ (กันซ้ำ, ระบุ kind, จัดเข้าโปรเจกต์, ให้คะแนนผลค้นหา) ด้วยความน่าจะเป็นที่เชื่อถือได้ ตั้งเกณฑ์ความมั่นใจได้ มี cache และมีงบรายวันที่ใช้เกินไม่ได้ ถ้าไม่เปิด Alice จะใช้กฎที่ทำงานในเครื่อง ซึ่งรวมเฉพาะข้อความที่เหมือนกันทุกตัวอักษร ส่วนที่เหลือทิ้งไว้ให้คุณตรวจ
@@ -38,7 +38,7 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
 - **Knowledge graph ที่รู้เรื่องเวลา** เก็บ entity และ relation พร้อมช่วงเวลาที่ข้อมูลยังเป็นจริง ถามย้อนเวลาได้ด้วย `as_of` และดูเป็น timeline ได้ มีพจนานุกรม predicate กันไม่ให้เกิด `has_bug` กับ `had_bug` ปนกัน
 - **เป็นส่วนตัวเป็นค่าเริ่มต้น** ข้อมูลอยู่ในเครื่อง และ server รับเฉพาะการเชื่อมต่อจากเครื่องตัวเอง โดยตรวจ token และ origin ทุกคำขอ secret ในข้อความ (API key, token, รหัสผ่าน, private key) ถูกตัดออกก่อนบันทึก เข้าคิว หรือส่งออกทุกครั้ง API key เก็บในไฟล์ส่วนตัว (`secrets.toml` สิทธิ์ 0600) และเลือกใช้ Keychain ของ OS แทนได้ โปรเจกต์ไหนจะห้ามส่งไปบริการ cloud ใดๆ ก็ได้
 - **ดูแลตัวเองได้** ตอน daemon ว่าง จะสำรองข้อมูลรายวันพร้อมหมุนเวียนไฟล์, ตรวจความสมบูรณ์, เก็บตามนโยบายการเก็บรักษา และล้างถังขยะ `alice doctor` บอกว่าอะไรผิดและควรทำอะไรต่อ `alice service install` ให้ daemon เริ่มเองตอน login และค่าตั้งเปลี่ยนแล้วมีผลทันทีโดยไม่ต้อง restart
-- **ไฟล์เดียวจบ** daemon, CLI และ MCP server (และ hook ใน SP2) อยู่ใน binary Rust ไฟล์เดียวที่มีตัวรัน embedding ในตัว ไม่ต้องมี Python env หรือ Docker ถ้าอยากใช้ embedding จากที่อื่น (Ollama, endpoint แบบ OpenAI, Voyage) ก็แค่ตั้งค่า
+- **ไฟล์เดียวจบ** daemon, CLI, MCP server และ hook ของ agent อยู่ใน binary Rust ไฟล์เดียวที่มีตัวรัน embedding ในตัว ไม่ต้องมี Python env หรือ Docker ถ้าอยากใช้ embedding จากที่อื่น (Ollama, endpoint แบบ OpenAI, Voyage) ก็แค่ตั้งค่า
 - **Git sync เป็นไฟล์ Markdown** *(วางแผนไว้ใน M4)* push/pull ความจำไปที่ git remote ไหนก็ได้ เก็บ memory ละหนึ่งไฟล์ Markdown เปิดอ่านบน GitHub ได้ เปิดใน Obsidian ได้ และ sync ข้ามเครื่องได้โดย merge ทีละ record ไฟล์ฐานข้อมูลไม่เคยถูกใส่ใน git
 - **UI สำหรับดู graph และจัดการข้อมูล** *(วางแผนไว้ใน SP3)* ดู graph ความจำ แก้ memory ตัดสินรายการใน review ตั้งค่าได้ทุกอย่าง และสั่ง git push/pull ได้จากเบราว์เซอร์หรือแอป desktop
 - **ย้ายมาจาก MemPalace ได้** import palace เดิมได้ครบทั้ง drawer, diary และ knowledge graph และยังเรียก tool ชื่อ `mempalace_*` ได้ผ่าน compatibility layer ที่เลือกเปิดได้ บน server ที่ใช้ร่วมกัน แต่ละคนอัปโหลด palace ของตัวเองได้ด้วยสคริปต์เดียว ([docs/server.md](docs/server.md#a-person-imports-their-own-mempalace))
@@ -65,12 +65,32 @@ Alice ออกแบบมาเพื่อการทำงานแบบ�
 | **Review** | เรื่องที่ระบบมั่นใจไม่พอจะตัดสินเอง จึงรอให้คนตัดสิน |
 | **Event** | การเปลี่ยนแปลงหนึ่งครั้งที่ถูกบันทึกไว้ (ใคร ทำอะไร ก่อนและหลัง) `alice undo` ย้อนกลับได้ |
 
+## เลือก: ในเครื่องหรือเซิร์ฟเวอร์
+
+Alice ทำงานได้ทั้งบนเครื่องของคุณเอง หรือเป็นพื้นที่ส่วนตัวของคุณ (tenant) บนเซิร์ฟเวอร์ที่ทีมใช้ร่วมกัน เลือกได้ตามสะดวก
+
+| | ในเครื่อง | tenant บนเซิร์ฟเวอร์ |
+|---|---|---|
+| ความจำอยู่ที่ไหน | `~/.alice` บนเครื่องของคุณ | daemon ของคุณเองบนเซิร์ฟเวอร์ Linux ของทีม ที่ `https://<host>/u/<name>` |
+| ต้องติดตั้งอะไร | binary `alice` ที่ build จาก source | ไม่มีอะไรหนัก: agent เชื่อมต่อผ่าน HTTPS และการเก็บ session ใช้แค่ `sh` กับ `curl` |
+| agent เชื่อมต่ออย่างไร | `alice mcp` (stdio) | MCP ผ่าน HTTPS พร้อม bearer token ของคุณ |
+| เก็บ session อัตโนมัติ | `alice hooks install claude` (หรือ `codex`) | รันบรรทัดเดียวที่แอดมินให้ |
+| ความเป็นส่วนตัว | ข้อความออกนอกเครื่องเฉพาะบริการ cloud ที่คุณเปิดเอง และ `.alice.toml` ของ repo มีผลเต็มที่ | เซิร์ฟเวอร์ปกปิด secret เสมอ แอดมินอ่านความจำของคุณได้ และ `.alice.toml` ไม่มีผลกับ MCP |
+| ความจำส่วนกลางของทีม | ไม่มี | มีให้เลือกใช้ |
+| แพลตฟอร์ม | macOS (Apple Silicon), Linux (glibc) | agent ใดก็ได้ที่ใช้ MCP ผ่าน HTTP ส่วนการเก็บ session ใช้ได้บน macOS และ Linux |
+| คู่มือติดตั้ง | [docs/setup-local.md](docs/setup-local.md) | [docs/setup-server.md](docs/setup-server.md) |
+
+<!-- TODO(confirm): `alice hooks` comes from Task 8 (commit 4eaa6a8 on feat/sp2-local-hooks), not yet merged into this
+branch; the same holds for its other mentions below. -->
+
+คู่มือติดตั้งทั้งสองเขียนไว้ให้ agent อ่านแล้วทำตาม: ส่งไฟล์ให้ Claude Code หรือ Codex (เช่น "อ่าน docs/setup-local.md แล้วทำตามทุกขั้นตอน") มันจะติดตั้งและเชื่อมต่อให้ครบ โดยถามคุณเฉพาะเรื่องที่ต้องตัดสินใจเอง (จะ import MemPalace ไหม จะเลิกใช้ MemPalace ไหม จะเปิดการกลั่นความรู้ไหม) จะเริ่มใช้ในเครื่องก่อนแล้วค่อยย้ายขึ้นเซิร์ฟเวอร์ทีหลังก็ได้ แอดมินย้ายฐานข้อมูลในเครื่องของคุณขึ้น tenant ให้ได้ ([docs/server.md](docs/server.md#moving-your-local-alice-to-the-server))
+
 ## ติดตั้งจาก source
 
 ต้องมี Rust 1.99 ขึ้นไป ([rustup](https://rustup.rs)) และ compiler C/C++ (Xcode Command Line Tools บน macOS, `build-essential` บน Debian/Ubuntu, MSVC Build Tools บน Windows)
 
 ```bash
-cargo install --git https://github.com/icueth/alice alice-memory
+cargo install --git https://github.com/icueth/alice alice-memory --locked
 alice model fetch      # ครั้งเดียวก่อนเริ่มใช้: ดาวน์โหลดโมเดล embedding (~136MB) ไว้ที่ ~/.alice/models
 ```
 
@@ -115,11 +135,11 @@ alice status                   # daemon, จำนวนข้อมูล, ค�
 alice doctor                   # ถ้ามีอะไรผิด จะบอกว่าผิดตรงไหนและควรทำอะไรต่อ
 ```
 
-โปรเจกต์ตรวจหาจาก directory ที่ทำงานอยู่ (git remote หรือชื่อ directory) memory ที่เขียนนอกโปรเจกต์ใดๆ จะเข้า `global` `alice import mempalace` ย้าย MemPalace เดิมเข้ามา ([รายละเอียด](#import-จาก-mempalace)) ที่วางแผนไว้: `alice setup` ต่อ agent ทุกตัวในเครื่องให้อัตโนมัติ (SP2) และ `alice ui` (SP3)
+โปรเจกต์ตรวจหาจาก directory ที่ทำงานอยู่ (git remote หรือชื่อ directory) memory ที่เขียนนอกโปรเจกต์ใดๆ จะเข้า `global` `alice import mempalace` ย้าย MemPalace เดิมเข้ามา ([รายละเอียด](#import-จาก-mempalace)) ถ้าอยากให้ agent ติดตั้งและเชื่อมต่อทุกอย่างให้ ส่งไฟล์ [docs/setup-local.md](docs/setup-local.md) ให้มันอ่าน ที่วางแผนไว้: `alice ui` (SP3)
 
 ## การเชื่อมต่อ agent
 
-ลงทะเบียน `alice mcp` เป็น MCP server แบบ stdio (ใน SP2 `alice setup` จะทำให้อัตโนมัติ) ตัว shim จะเปิด daemon ให้เองเมื่อจำเป็น และถ้า client ส่ง workspace root มา โปรเจกต์จะยึดตาม root นั้น ชื่อของ client จะถูกบันทึกเป็นผู้เขียนของทุกอย่างที่มันเขียน:
+ลงทะเบียน `alice mcp` เป็น MCP server แบบ stdio ([docs/setup-local.md](docs/setup-local.md) ให้ agent ทำแทนได้) ตัว shim จะเปิด daemon ให้เองเมื่อจำเป็น และถ้า client ส่ง workspace root มา โปรเจกต์จะยึดตาม root นั้น ชื่อของ client จะถูกบันทึกเป็นผู้เขียนของทุกอย่างที่มันเขียน:
 
 <details>
 <summary><b>Claude Code</b></summary>
@@ -179,6 +199,28 @@ agent ที่ใช้ MCP ไม่ได้ เรียกผ่าน CLI 
 
 server ส่งคำแนะนำการใช้งานให้ agent ด้วย มี prompt `recall` และ `remember-session` และ resource `memory://context` กับ `memory://m/{id}` ส่วนชุด tool สำหรับดูแลระบบ (`review_list`, `review_resolve`, `merge_memories`, `stats`) ปิดอยู่เป็นค่าเริ่มต้น เปิดได้ด้วย `alice config set mcp.admin_tools true` (stdio shim ถาม daemon ทุกครั้งที่แสดงรายการ tool จึงไม่ต้อง restart daemon แต่ agent ที่แสดงรายการ tool ไปแล้วจะเห็นใน session ถัดไป)
 
+## เก็บ session อัตโนมัติ
+
+Alice เก็บทุก session ของ Claude Code และ Codex ไว้ให้ระหว่างที่ทำงาน โดย agent ไม่ต้องทำอะไรเพิ่ม:
+
+```bash
+alice hooks install claude      # Claude Code: เพิ่ม hook 5 ตัวใน ~/.claude/settings.json (สำรองไฟล์เดิมไว้ hook อื่นอยู่ครบ)
+alice hooks install codex       # Codex: ~/.codex/hooks.json แล้ว trust hook ครั้งเดียวที่ /hooks ใน Codex
+alice capture status            # session ที่เก็บไว้ อ่านไปถึงไหนแล้ว และการกลั่นความรู้ไปถึงไหน
+alice recall --raw "error ตอน migrate เมื่อวาน"
+```
+
+- **ทุก turn เก็บครั้งเดียว** turn ที่จบแล้วถูกเก็บลงชั้นข้อมูลดิบ ในโปรเจกต์ของ session นั้น hook ที่ทำงานซ้ำ daemon ที่ล่มกลางทาง หรือ session ที่ resume/fork มา ไม่ทำให้ turn ไหนถูกเก็บซ้ำ ค้น transcript ได้ด้วย `recall --raw` (`include_raw`) และมันไม่ไปปนในผลค้นหาความรู้หรือใน briefing
+- **ตัดให้กระชับ ไม่เก็บทั้งก้อน** output ของ tool เก็บเฉพาะส่วนต้นกับส่วนท้าย ส่วนเนื้อหาไฟล์ที่ agent อ่านหรือแก้, รูปภาพ และผลของ tool ความจำ ไม่ถูกเก็บเลย ส่วน thinking จะเก็บก็ต่อเมื่อคุณเปิดเอง secret ถูกปกปิด (ในโหมด block chunk ที่มี secret จะถูกกันไว้ แต่การเก็บยังเดินต่อ)
+- **ไม่ขวางการทำงาน** `alice hook` มีงบเวลา 100ms exit 0 เสมอ และถ้า daemon ไม่ทำงานก็พักงานไว้ใน spool
+- **มี briefing ตอนเริ่ม** session ใหม่ของ Claude Code เริ่มด้วย briefing ของโปรเจกต์จาก `context` (ปิดได้ด้วย `capture.briefing = false`)
+- **คุณเลือกเองว่าจะเก็บอะไร** ใช้ `capture.excluded_projects`, ใส่ `no_capture = true` ใน `.alice.toml` ของ repo หรือปิดทั้งหมดด้วย `capture.enabled = false`
+- **กลั่นความรู้ถ้าต้องการ** เมื่อใช้ Judge แบบ Jev คำสั่ง `alice config set distill.provider jev` จะกลั่น session ที่จบแล้วเป็น memory สั้นๆ ไม่กี่อัน ติดป้าย `(auto)` และใช้งบได้แค่ส่วนหนึ่งของงบรายวันของ Judge ค่าเริ่มต้นคือปิด และมันไม่เคยถามอะไรคุณ
+- **session เก่าก็เก็บได้** `alice capture backfill claude --since 2026-09-01` เก็บ session ที่มีอยู่บนดิสก์แล้ว
+- **บน tenant ของเซิร์ฟเวอร์** รันบรรทัดเดียวที่แอดมินให้ก็ได้ผลแบบเดียวกัน โดยไม่ต้องมี binary ของ Alice ([docs/server.md](docs/server.md#capture-for-team-members))
+
+รายละเอียด ความเป็นส่วนตัว และค่าตั้งทั้งหมด: [docs/capture.md](docs/capture.md) (ภาษาอังกฤษ)
+
 ## CLI
 
 ```
@@ -206,6 +248,12 @@ alice daemon start | stop | status | logs | run
 alice token rotate [--show]
 alice service install | uninstall [--dry-run] [--target-dir d] | status
 alice mcp                      # MCP server แบบ stdio สำหรับ agent
+alice hook <session-start|stop|subagent-stop|pre-compact|session-end> [--agent claude-code|codex]
+                               # สิ่งที่ hook ของ agent เรียก (รับ JSON ของ hook ทาง stdin); exit 0 เสมอ
+alice hooks install | uninstall <claude|codex> [--settings <file>] [--dry-run]
+alice hooks status <claude|codex> [--settings <file>]
+alice capture status | distill <session-id>
+alice capture backfill <claude|codex> [--since YYYY-MM-DD] [--project <slug>] [--distill]
 alice model fetch | check      # check: โหลดโมเดลแล้วลองสร้าง embedding หนึ่งข้อความ (ไม่เปิด daemon)
 alice bench [--chunks n] [--memories n] [--samples n] [--real] [--dir d] [--out file.json]
 alice import mempalace [--palace dir] [--dry-run] [--since date] [--map-wing wing=project]...
@@ -215,7 +263,7 @@ alice import status
 
 `--action move` รับแค่ `--project` (flag อื่นจะถูกปฏิเสธ และ `--project` คู่กับ action อื่นก็ถูกปฏิเสธเช่นกัน) เหมือนการ merge project คือจะไม่ย้าย memory จาก project ที่ถูกกันไม่ให้ส่งขึ้น cloud ไปยัง project ที่ส่งได้ และจะตรวจข้อความกับกฎความเป็นส่วนตัวของ project ปลายทาง: โหมด `block` ปฏิเสธข้อความที่กฎนั้นจะเปลี่ยน ส่วนโหมดอื่นจะย้ายไปพร้อมข้อความที่ถูกปกปิดตามกฎนั้น
 
-ทุกคำสั่งใส่ `--json` ได้ (ยกเว้น `daemon logs`, `config edit` และ `model fetch` ที่ไม่พิมพ์เอกสาร JSON) ที่วางแผนไว้: `sync` (M4), `hook` (SP2), `ui` (SP3)
+ทุกคำสั่งใส่ `--json` ได้ (ยกเว้น `daemon logs`, `config edit`, `model fetch` และ `hook` ที่ไม่พิมพ์เอกสาร JSON) ที่วางแผนไว้: `sync` (M4), `ui` (SP3)
 
 ## การตั้งค่า
 
@@ -277,6 +325,7 @@ Environment variable:
 [privacy]
 block_secrets = true      # ปฏิเสธการเขียนในโปรเจกต์นี้ที่มี secret
 cloud_denied = true       # ห้ามส่งข้อความของโปรเจกต์นี้ไป Jev หรือ embedding provider ที่อยู่นอกเครื่อง
+no_capture = true         # ไม่เก็บ session ของ agent ใน repo นี้
 custom_patterns = [{ name = "internal_id", regex = "ID-[0-9]{8}" }]
 ```
 
@@ -495,6 +544,8 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 - **โมเดลตัดสิน (judge) กับความจำส่วนกลาง:** ในโหมด precise ความจำส่วนกลางจะถูกส่งให้ judge ของคุณให้คะแนนก็ต่อเมื่อนโยบาย cloud ของส่วนกลางสำหรับโปรเจกต์นั้น **และ** นโยบาย cloud ของคุณสำหรับโปรเจกต์นั้นอนุญาตทั้งคู่ ถ้าฝ่ายใดห้าม จะไม่ถูกส่งให้ judge เลย และจะแสดงต่อท้ายผลที่ให้คะแนนแล้ว
 - **Jev และการตั้งค่า:** ขอให้แอดมินรัน `alice-server cli` ให้ (ดูด้านบน) ส่ง key ผ่านช่องทางส่วนตัวเท่านั้น
 - **Import MemPalace:** ส่งโฟลเดอร์ palace ให้แอดมินเป็นคนรัน `alice-server import`
+- **ให้ agent ตั้งค่าให้:** ส่ง [docs/setup-server.md](docs/setup-server.md) ให้ Claude Code หรือ Codex แล้วมันจะเชื่อมต่อทุกอย่างให้ รวมถึงการเก็บ session อัตโนมัติ โดยไม่แสดง token บนจอ
+- **เก็บ session อัตโนมัติ:** รันบรรทัดเดียวที่แอดมินให้ `curl -fsSL https://<host>/u/<name>/api/v1/capture/setup.sh | sh -s -- https://<host>/u/<name>` มันใช้ `~/.config/alice/token` และ `~/.config/alice/url` ที่มีอยู่แล้ว (ถ้ายังไม่มีจะถามหา token ครั้งเดียว) แล้วติดตั้งสคริปต์และ plugin ของ Claude Code (และ hook ของ Codex ถ้ามี Codex) สคริปต์ไม่อัปเดตตัวเอง หลังแอดมินอัปเกรดเซิร์ฟเวอร์ให้รันบรรทัดเดิมซ้ำ ดูสถานะด้วย `sh ~/.config/alice/alice-capture.sh status` และถอดออกด้วย `sh ~/.config/alice/alice-capture.sh uninstall` รายละเอียดอยู่ในหัวข้อ "Capture for team members" ของ [docs/server.md](docs/server.md#capture-for-team-members)
 - **แพลตฟอร์ม:** โปรแกรม `alice` ใช้ได้บน macOS และ Linux ส่วน Windows หรือเครื่องที่ไม่มีโปรแกรม ให้เชื่อม agent เข้ากับ MCP endpoint ของเซิร์ฟเวอร์
 
 ### ข้อควรรู้
@@ -514,8 +565,10 @@ client อื่นให้ใช้ชื่อเดียวกันใน�
 | **SP1 · M2** | Judge (กฎในเครื่อง + Jev), คิว review, undo, ตัด secret, backup และ restore, maintenance, settings ที่มีผลทันที, doctor, service install, embedding provider ผ่าน HTTP, build บน Windows, เป้าหน่วยความจำ 800MB | เสร็จแล้ว (alpha) |
 | **SP1 · M3** | ตัว import จาก MemPalace และ compatibility layer | สร้างเสร็จแล้ว รอ review สุดท้าย (alpha) |
 | **SP1 · M4** | Git sync | วางแผนแล้ว |
-| **SP2** | เก็บและกลั่นความรู้อัตโนมัติ, `alice setup`, hook/plugin สำหรับทุก agent ที่รองรับ | วางแผนแล้ว |
+| **SP2** | เก็บ session ของ Claude Code และ Codex อัตโนมัติ (hook ในเครื่องและสคริปต์สำหรับ tenant บนเซิร์ฟเวอร์), กลั่นความรู้ด้วย Jev, การย้ายจาก MemPalace และ backfill, คู่มือติดตั้งที่ agent ทำตามได้ | กำลังทำ (alpha) |
 | **SP3** | Web UI (graph, จัดการ memory, review, settings, sync, สุขภาพระบบ) แล้วตามด้วยแอป desktop | วางแผนแล้ว |
+
+การเก็บ session ของ Cursor, Windsurf, OpenCode และ Gemini CLI จะตามมาภายหลัง สวิตช์ `capture.*` ของ agent เหล่านี้มีไว้แล้ว
 
 รายละเอียดการออกแบบ: [Alice Core design spec](docs/superpowers/specs/2026-10-13-alice-core-design.md) (ภาษาอังกฤษ)
 

@@ -7,8 +7,10 @@
 # It reuses ~/.config/alice/url and ~/.config/alice/token when they exist (the team's setup
 # document writes them) and asks for the token only when the file is missing or the server
 # refuses it. Then it installs the hook script (~/.config/alice/alice-capture.sh) and a small
-# Claude Code plugin from a local marketplace (~/.config/alice/claude-marketplace). Running it
-# again updates everything in place; `sh ~/.config/alice/alice-capture.sh uninstall` removes it.
+# Claude Code plugin from a local marketplace (~/.config/alice/claude-marketplace). The hook
+# script then updates itself from the tenant once a day, with the plugin's hooks.json when that
+# changes. Running this again repairs an install in place;
+# `sh ~/.config/alice/alice-capture.sh uninstall` removes it.
 # When `codex` is installed it also writes $CODEX_HOME/hooks.json (default ~/.codex/hooks.json)
 # if that file does not exist, and otherwise prints the entries to add; Codex runs a hook only
 # after the person trusts it in /hooks.
@@ -25,6 +27,7 @@ umask 077
 TMPD=
 TOKEN_TMP=
 HOOK_TMP=
+HOOK_WHY=
 ECHO_OFF=
 CODE=
 CHECK_ERR=
@@ -151,29 +154,31 @@ plugin_json() {
   printf '}\n'
 }
 
-# The hooks file for agent $1 (claude-code: the plugin's hooks.json; codex: $CODEX_HOME/hooks.json).
-hooks_json() {
-  # `|| true`: a missing script (after uninstall, or deleted by hand) must never fail a hook;
-  # dash exits 2 on a file it cannot open, and exit 2 from Stop blocks the agent.
-  hj_cmd='sh \"$HOME/.config/alice/alice-capture.sh\" hook '$1' || true'
-  printf '{\n'
-  if [ "$1" = claude-code ]; then
-    printf '  "description": "Alice capture: each event hands the new transcript bytes to a background upload; SessionStart prints the briefing.",\n'
+# Whether file $1 is a whole hook script: #!/bin/sh, its marker and version lines, `main "$@"`
+# last, and it parses (sh -n, and dash -n where dash exists). HOOK_WHY says what is wrong.
+check_hook() {
+  HOOK_WHY=
+  if [ "$(head -n 1 "$1")" != '#!/bin/sh' ]; then
+    HOOK_WHY="it does not start with #!/bin/sh"
+  elif ! sed -n 2p "$1" | grep -q '^# alice-capture-hook'; then
+    HOOK_WHY="it has no alice-capture-hook marker line"
+  elif ! head -n 5 "$1" | grep -q '^# alice-capture-version: [A-Za-z0-9._+-]'; then
+    HOOK_WHY="it has no version line"
+  elif [ "$(tail -n 1 "$1")" != 'main "$@"' ]; then
+    HOOK_WHY="it is cut short"
+  elif ! sh -n "$1" 2>/dev/null; then
+    HOOK_WHY="it fails sh -n"
+  elif command -v dash >/dev/null 2>&1 && ! dash -n "$1" 2>/dev/null; then
+    HOOK_WHY="it fails dash -n"
   fi
-  printf '  "hooks": {\n'
-  hj_sep=
-  for hj_event in SessionStart Stop SubagentStop PreCompact SessionEnd; do
-    hj_timeout=10
-    # Codex gives SessionEnd at most 3 s.
-    if [ "$1" = codex ] && [ "$hj_event" = SessionEnd ]; then hj_timeout=3; fi
-    printf '%s    "%s": [\n' "$hj_sep" "$hj_event"
-    printf '      { "hooks": [ { "type": "command", "command": "%s", "timeout": %s } ] }\n' "$hj_cmd" "$hj_timeout"
-    printf '    ]'
-    hj_sep=',
-'
-  done
-  printf '\n  }\n'
-  printf '}\n'
+  [ -z "$HOOK_WHY" ]
+}
+
+# The hooks file for agent $1 (claude-code: the plugin's hooks.json; codex: $CODEX_HOME/hooks.json),
+# as the installed hook script prints it: the script is the one place the hooks are written down,
+# and its daily update compares with the same text.
+hooks_json() {
+  sh "$DIR/alice-capture.sh" print-hooks-json "$1" </dev/null 2>/dev/null
 }
 
 # Codex (spec section 5.4 step 8). hooks.json is written only when it does not exist, or is
@@ -188,6 +193,15 @@ codex_setup() {
   cs_home="${CODEX_HOME:-$HOME/.codex}"
   cs_file="$cs_home/hooks.json"
   cs_new=$(hooks_json codex)
+  case $cs_new in
+    '{'*) ;;
+    *)
+      say ""
+      say "Codex: the hook script printed no hooks file, so nothing was written for Codex; run the command again."
+      cs_state="not written"
+      return 0
+      ;;
+  esac
   cs_sp='[[:space:]]'
   cs_re='alice-capture\.sh.{1,3}hook codex'
   cs_write=
@@ -341,18 +355,25 @@ main() {
   fi
   write_file "$DIR/capture.conf" "briefing=$briefing"
 
-  # 5. The hook script, from the tenant (public; no token needed).
+  # 5. The hook script, from the tenant (public; no token needed). It updates itself once a day
+  #    from now on (spec section 5.3 step 8), and this install counts as today's check.
   HOOK_TMP="$DIR/.alice-capture.sh.$$"
   curl -q -fsS --connect-timeout 5 --max-time 30 -o "$HOOK_TMP" "$url/api/v1/capture/hook.sh" 2>"$TMPD/curl.err" ||
     die "could not download the hook script from $url: $(head -n 1 "$TMPD/curl.err" 2>/dev/null)"
-  if ! head -n 1 "$HOOK_TMP" | grep -q '^#!/bin/sh' || ! sh -n "$HOOK_TMP" 2>/dev/null; then
-    die "what $url served as the hook script is not a shell script; check the address"
-  fi
+  check_hook "$HOOK_TMP" ||
+    die "what $url served as the hook script is not a whole Alice hook script ($HOOK_WHY); check the address"
   chmod 700 "$HOOK_TMP"
   mv -f "$HOOK_TMP" "$DIR/alice-capture.sh" || die "cannot install ~/.config/alice/alice-capture.sh"
   HOOK_TMP=
+  write_file "$DIR/update-checked" "$(date +%s)"
 
-  # 6. The local marketplace and its plugin, at the tenant's version.
+  # 6. The local marketplace and its plugin, at the tenant's version. Its hooks.json is what the
+  #    hook script prints.
+  hooks_claude=$(hooks_json claude-code)
+  case $hooks_claude in
+    '{'*) ;;
+    *) die "the hook script from $url printed no hooks.json for the plugin; check the address" ;;
+  esac
   version=$(curl -q -fsS --connect-timeout 5 --max-time 30 "$url/api/v1/ping" 2>/dev/null |
     sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([0-9A-Za-z.+-]*\)".*/\1/p' | head -n 1)
   [ -n "$version" ] || version=0.0.0
@@ -360,7 +381,7 @@ main() {
     die "cannot create $MP"
   write_file "$MP/.claude-plugin/marketplace.json" "$(marketplace_json)"
   write_file "$MP/alice-capture/.claude-plugin/plugin.json" "$(plugin_json)"
-  write_file "$MP/alice-capture/hooks/hooks.json" "$(hooks_json claude-code)"
+  write_file "$MP/alice-capture/hooks/hooks.json" "$hooks_claude"
 
   # 7. The plugin, through the claude command when it works.
   plugin=

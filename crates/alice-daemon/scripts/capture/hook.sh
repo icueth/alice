@@ -1,5 +1,21 @@
 #!/bin/sh
-# Alice capture hook for server tenants (SP2 spec section 5.3, section 5.7).
+# alice-capture-hook: the Alice capture hook for server tenants (SP2 spec section 5.3, section 5.7).
+# alice-capture-version: unstamped
+#
+# The tenant stamps the version line when it serves this script (a hash of its text). Once a day
+# a background worker fetches the tenant's copy over https:// and, when its version differs and it
+# passes the checks in verify_script, replaces this file with it (spec section 5.3 step 8).
+#
+# The contract across versions. After an update, a hook of the old version (a session started
+# before it) starts the new file's `run`, and a worker of the new version meets what the old one
+# left. So these stay compatible for at least one version: the `run` arguments, the state file's
+# format, the lock layout (state/<key>.lock/ with pid and at, state/update.lock/), the
+# update-checked record, and what `print-hooks-json` prints (the plugin's hooks.json and the Codex
+# one are compared with it byte for byte).
+#
+# Test-only switches (environment): ALICE_CAPTURE_TEST_UPDATE_HTTP=1 lets self-update use a
+# loopback http:// tenant; ALICE_CAPTURE_TEST_CLAUDE_LIMIT=<seconds> shortens the 120 s limit of
+# the background `claude plugin` calls.
 #
 # Claude Code runs it through the alice-capture plugin on five events:
 #   sh "$HOME/.config/alice/alice-capture.sh" hook claude-code
@@ -11,7 +27,11 @@
 # Subcommands:
 #   hook <agent>       the hook itself (reads stdin); <agent> is claude-code or codex
 #   run <agent> <event> <session> <path> <cwd> [<agent_id> <agent_path>]
-#                      the background worker (no secret among its arguments)
+#                      the background worker (no secret among its arguments); it also runs the
+#                      daily update check
+#   print-hooks-json <agent>
+#                      the hooks file setup.sh writes for <agent> (the plugin's hooks.json, or
+#                      $CODEX_HOME/hooks.json); the one place the hooks are written down
 #   status             what is set up, and whether the server accepts the token
 #   uninstall          removes the plugin and, after asking, the capture files
 #
@@ -23,13 +43,16 @@
 #                      was last there), and hold/stopped lines; its mtime is set back to 1971
 #                      while work is left, so a sweep sees the transcript as newer
 #   state/<key>.lock/  pid and at (refreshed every pass) of the worker sending that transcript
+#   state/update.lock/ pid and at of the worker running the update check
 #   capture.log        at most 256 KB; never the token, never transcript text
 #   paused-until       when the server refused the token: no upload before this time
+#   update-checked     when the last update check started (epoch seconds; setup writes it too)
+#   .alice-capture.sh.new.<pid>   a downloaded copy while it is checked (removed after)
 #
 # The token leaves the shell only as a curl config line on curl's stdin (curl -q -K -), written
 # by the printf builtin: never in argv, a URL, a child's environment, a log or an error.
-# POSIX sh; needs curl, sed, head, tail, wc, od, ls, sort, cmp, mkdir, mv and date; git and awk are
-# optional.
+# POSIX sh; needs curl, sed, head, tail, wc, od, ls, sort, cmp, cp, mkdir, mktemp, mv, find, touch
+# and date; git, awk and dash are optional.
 # Never run it with set -x: that would print the token.
 
 set -u
@@ -44,6 +67,11 @@ CONF="$DIR/capture.conf"
 PAUSED="$DIR/paused-until"
 TOKEN_FILE="$DIR/token"
 URL_FILE="$DIR/url"
+SCRIPT="$DIR/alice-capture.sh"
+MP="$DIR/claude-marketplace"
+CHECKED="$DIR/update-checked"
+UPDATE_EVERY=86400
+SCRIPT_MAX=1048576
 LOG_MAX=262144
 BODY_START=2097152
 BODY_MAX=8388608
@@ -59,12 +87,17 @@ hint=
 ph_top=
 tmpd=
 lockdir=
+upd_tmp=
 
 cleanup() {
   unlock
   if [ -n "$tmpd" ]; then
     rm -rf "$tmpd"
     tmpd=
+  fi
+  if [ -n "$upd_tmp" ]; then
+    rm -f "$upd_tmp"
+    upd_tmp=
   fi
 }
 trap cleanup EXIT
@@ -78,6 +111,20 @@ fsize() {
   fs_n=${fs_n##* }
   case $fs_n in '' | *[!0-9]*) fs_n=0 ;; esac
   printf '%s' "$fs_n"
+}
+
+# Whether $1 is an epoch in seconds that is safe for arithmetic: 1 to 11 digits, no leading 0
+# (dash aborts on a number it reads as octal, and on one too large).
+epoch_ok() {
+  case $1 in '' | 0* | *[!0-9]*) return 1 ;; esac
+  [ ${#1} -le 11 ]
+}
+
+# Whether $1 is a byte offset that is safe for arithmetic: 0, or 1 to 16 digits with no leading 0
+# (the server's offsets stop at 2^53).
+offset_ok() {
+  case $1 in 0) return 0 ;; '' | 0* | *[!0-9]*) return 1 ;; esac
+  [ ${#1} -le 16 ]
 }
 
 # One line in capture.log, which is kept under 256 KB. Never the token or transcript text.
@@ -168,7 +215,7 @@ load_credentials() {
 paused() {
   [ -f "$PAUSED" ] || return 1
   pu_until=$(head -n 1 "$PAUSED" 2>/dev/null)
-  case $pu_until in '' | *[!0-9]*) return 1 ;; esac
+  epoch_ok "$pu_until" || return 1
   [ "$(date +%s)" -lt "$pu_until" ]
 }
 
@@ -338,9 +385,10 @@ brief() {
 # ---- The background worker ----
 
 # Reads state file $1 into s_off s_path s_session s_sub s_cwd s_seen s_hold s_stopped (1 if
-# absent).
+# absent). A corrupt offset counts as 0 (the server then says where to resume) and a corrupt hold
+# as none; s_corrupt names what was dropped.
 read_state() {
-  s_off=0 s_path= s_session= s_sub= s_cwd= s_seen= s_hold= s_stopped=
+  s_off=0 s_path= s_session= s_sub= s_cwd= s_seen= s_hold= s_stopped= s_corrupt=
   [ -f "$1" ] || return 1
   rs_first=1
   while IFS= read -r rs_line || [ -n "$rs_line" ]; do
@@ -359,9 +407,9 @@ read_state() {
       "stopped "*) s_stopped=${rs_line#stopped } ;;
     esac
   done <"$1"
-  case $s_off in '' | *[!0-9]*) s_off=0 ;; esac
-  case $s_hold in *[!0-9]*) s_hold= ;; esac
-  case $s_seen in *[!0-9]*) s_seen= ;; esac
+  if ! offset_ok "$s_off"; then s_off=0 s_corrupt="its offset"; fi
+  if [ -n "$s_hold" ] && ! offset_ok "$s_hold"; then s_hold= s_corrupt="${s_corrupt:+$s_corrupt and }its hold"; fi
+  epoch_ok "$s_seen" || s_seen=
   return 0
 }
 
@@ -380,12 +428,14 @@ write_state() {
   } >"$1.tmp.$$" 2>/dev/null && mv -f "$1.tmp.$$" "$1"
 }
 
-# Whether lock directory $1 may be broken (we tried $2 times). Its holder refreshes `at` at
-# the start of every pass, and one pass (one upload) may take 5 + 300 s.
+# Whether lock directory $1 may be broken (we tried $2 times). Its holder writes `pid`, then `at`,
+# and refreshes `at` at the start of every pass; one pass (one upload) may take 5 + 300 s.
 # - A live holder (kill -0 on its pid) is never broken until its `at` is 900 s old, a guard
 #   against a pid reused by another process.
 # - A dead or unknown holder is broken once its `at` is 360 s old.
-# - A dead or unknown holder that never wrote `at` is broken after 5 tries.
+# - Without a usable `at` (a holder killed between mkdir and writing it, or inside unlock, or a
+#   full disk), the directory's own age stands in for it: more than 15 minutes for a live pid,
+#   more than 6 otherwise. A dead or unknown holder is also broken after 5 tries.
 lock_stale() {
   ls_at=$(cat "$1/at" 2>/dev/null)
   ls_pid=$(cat "$1/pid" 2>/dev/null)
@@ -394,12 +444,14 @@ lock_stale() {
     '' | *[!0-9]*) ;;
     *) if kill -0 "$ls_pid" 2>/dev/null; then ls_alive=1; fi ;;
   esac
-  case $ls_at in
-    '' | *[!0-9]*)
-      [ -z "$ls_alive" ] && [ "$2" -gt 5 ]
-      return
-      ;;
-  esac
+  if ! epoch_ok "$ls_at"; then
+    if [ -n "$ls_alive" ]; then
+      [ -n "$(find "$1" -prune -mmin +15 2>/dev/null)" ]
+    else
+      [ "$2" -gt 5 ] || [ -n "$(find "$1" -prune -mmin +6 2>/dev/null)" ]
+    fi
+    return
+  fi
   ls_age=$(($(date +%s) - ls_at))
   if [ -n "$ls_alive" ]; then
     [ "$ls_age" -gt 900 ]
@@ -413,6 +465,13 @@ lock_stale() {
 save_state() {
   own_lock || return 1
   write_state "$1"
+}
+
+# Writes the line $2 to file $1 in a lock directory: a temporary file beside it, then mv. So a
+# reader never sees `at` or `pid` empty (an empty `at` on an old directory would make a live lock
+# look abandoned), and the directory's mtime moves with every write.
+lock_put() {
+  { printf '%s\n' "$2" >"$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"; } 2>/dev/null || rm -f "$1.tmp.$$" 2>/dev/null
 }
 
 # Takes the lock of state key $1: a directory holding the owner's pid and `at`. A stale lock is
@@ -434,8 +493,8 @@ lock() {
     [ "$lk_tries" -le "$2" ] || return 1
     sleep 1
   done
-  printf '%s\n' "$$" >"$lk_dir/pid"
-  date +%s >"$lk_dir/at"
+  lock_put "$lk_dir/pid" "$$"
+  lock_put "$lk_dir/at" "$(date +%s)"
   lockdir=$lk_dir
   return 0
 }
@@ -448,14 +507,14 @@ own_lock() {
 # Shows life at the start of every pass; 1 when the lock is no longer ours.
 refresh_lock() {
   own_lock || return 1
-  date +%s >"$lockdir/at" 2>/dev/null
+  lock_put "$lockdir/at" "$(date +%s)"
   return 0
 }
 
 # Removes the lock only when this process owns it.
 unlock() {
   if own_lock; then
-    rm -f "$lockdir/at" "$lockdir/pid"
+    rm -f "$lockdir/at" "$lockdir/pid" "$lockdir"/*.tmp.* 2>/dev/null
     rmdir "$lockdir" 2>/dev/null
   fi
   lockdir=
@@ -516,6 +575,9 @@ capture_one() {
     return 0
   fi
   read_state "$co_st" || :
+  if [ -n "$s_corrupt" ]; then
+    log "session $3: the state file held a corrupt value ($s_corrupt); asking the server where to resume"
+  fi
   s_session=$3 s_sub=$4 s_path=$5 s_cwd=$6
   if [ -n "$s_stopped" ]; then
     unlock
@@ -566,8 +628,11 @@ capture_one() {
   co_cap=$BODY_START
   co_pending=
   co_lost=
+  co_ended=
+  co_empty_sent=
   while [ "$co_pass" -lt "$PASSES" ]; do
     co_pass=$((co_pass + 1))
+    co_empty=
     if ! refresh_lock; then
       co_lost=1
       break
@@ -577,14 +642,29 @@ capture_one() {
       log "session $3: the transcript is shorter than the stored offset; asking the server where to resume"
       s_off=0 s_hold=
     fi
-    [ "$s_off" -lt "$co_size" ] || break
+    if [ "$s_off" -ge "$co_size" ]; then
+      # SessionEnd with nothing left to send (a Stop sent the rest, or a 409 moved the offset to
+      # the end of the file): one empty upload at the offset, so the server still ends the
+      # session and marks it for distillation. Owed until the server accepts a session end in
+      # this call; sent at most once.
+      if [ "$co_event" = session-end ] && [ -z "$co_ended" ] && [ -z "$co_empty_sent" ] &&
+        [ "$s_off" -gt 0 ]; then
+        co_empty=1 co_empty_sent=1
+      else
+        break
+      fi
+    fi
     if [ -n "$s_hold" ] && [ "$co_size" -le "$s_hold" ] && [ -z "$co_bypass" ]; then
       break
     fi
     co_bypass=
-    { tail -c +$((s_off + 1)) "$s_path" | head -c "$co_cap" >"$tmpd/body"; } 2>/dev/null
+    if [ -n "$co_empty" ]; then
+      { : >"$tmpd/body"; } 2>/dev/null
+    else
+      { tail -c +$((s_off + 1)) "$s_path" | head -c "$co_cap" >"$tmpd/body"; } 2>/dev/null
+    fi
     co_n=$(fsize "$tmpd/body")
-    [ "$co_n" -gt 0 ] || break
+    [ "$co_n" -gt 0 ] || [ -n "$co_empty" ] || break
     co_q="agent=$(key_agent "$co_key")&session=$3&offset=$s_off&event=$co_event$co_flags"
     # A capped body (as long as the cap): the transcript may go on, so the server keeps the
     # body's last turn open.
@@ -595,6 +675,20 @@ capture_one() {
     co_next=$(sed -n 's/.*"next_offset"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$tmpd/answer" 2>/dev/null | head -n 1)
     case $co_code in
       200)
+        # The answer says whether this upload ended the session (a session end that landed).
+        co_end_note=
+        if grep -q '"ended"[[:space:]]*:[[:space:]]*true' "$tmpd/answer" 2>/dev/null; then
+          co_ended=1 co_end_note="; the server ended the session"
+        fi
+        if [ -n "$co_empty" ]; then
+          if [ -n "$co_end_note" ]; then
+            log "session $3: nothing new at the session end; the server ended the session at offset $s_off"
+          else
+            co_stored=$(sed -n 's/.*"turns_stored"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$tmpd/answer" 2>/dev/null | head -n 1)
+            log "session $3: the empty session end at offset $s_off came back with next_offset ${co_next:-none} and ${co_stored:-no} turns stored, and no end; the server did not end the session"
+          fi
+          break
+        fi
         if grep -q '"oversized_line"[[:space:]]*:[[:space:]]*true' "$tmpd/answer" 2>/dev/null; then
           # One line of more than 8 MiB: measure it with awk and skip it (the server counts a gap).
           if ! command -v awk >/dev/null 2>&1; then
@@ -646,7 +740,7 @@ capture_one() {
           log "session $3: the server answered an offset outside the upload ($co_next); stopping here"
           break
         fi
-        log "session $3: sent $co_n bytes from offset $s_off ($co_event); the server's cursor is at $co_next"
+        log "session $3: sent $co_n bytes from offset $s_off ($co_event); the server's cursor is at $co_next$co_end_note"
         s_off=$co_next s_hold= co_cap=$BODY_START
         save_state "$co_st" || {
           co_lost=1
@@ -760,6 +854,8 @@ run_main() {
   paused && return 0
   load_credentials || return 0
   mkdir -p "$STATE" 2>/dev/null || return 0
+  # Before the capture work, so a release whose capture path fails can still fetch its fix.
+  self_update
   # The transcript may lag the event that names it.
   if [ "$r_event" != session-start ]; then sleep 2; fi
   if [ "$r_agent" = codex ] && [ -z "$r_path" ]; then
@@ -777,6 +873,322 @@ run_main() {
   if [ "$r_event" = session-start ]; then
     sweep "$r_agent-$r_session"
   fi
+  return 0
+}
+
+# ---- Self-update (spec section 5.3 step 8) ----
+
+# The hooks file for agent $1: claude-code, the plugin's hooks.json; codex, $CODEX_HOME/hooks.json.
+# setup.sh writes what this prints, and the update check compares with it, so the installed script
+# is the one place the hooks are written down.
+print_hooks_json() {
+  case ${1:-} in claude-code | codex) ;; *) return 2 ;; esac
+  # `|| true`: a missing script (after uninstall, or deleted by hand) must never fail a hook;
+  # dash exits 2 on a file it cannot open, and exit 2 from Stop blocks the agent.
+  hj_cmd='sh \"$HOME/.config/alice/alice-capture.sh\" hook '$1' || true'
+  printf '{\n'
+  if [ "$1" = claude-code ]; then
+    printf '  "description": "Alice capture: each event hands the new transcript bytes to a background upload; SessionStart prints the briefing.",\n'
+  fi
+  printf '  "hooks": {\n'
+  hj_sep=
+  for hj_event in SessionStart Stop SubagentStop PreCompact SessionEnd; do
+    hj_timeout=10
+    # Codex gives SessionEnd at most 3 s.
+    if [ "$1" = codex ] && [ "$hj_event" = SessionEnd ]; then hj_timeout=3; fi
+    printf '%s    "%s": [\n' "$hj_sep" "$hj_event"
+    printf '      { "hooks": [ { "type": "command", "command": "%s", "timeout": %s } ] }\n' "$hj_cmd" "$hj_timeout"
+    printf '    ]'
+    hj_sep=',
+'
+  done
+  printf '\n  }\n'
+  printf '}\n'
+}
+
+# The version on the version line of script file $1 (empty when it has none).
+script_version() {
+  head -n 5 "$1" 2>/dev/null |
+    sed -n 's/^# alice-capture-version: \([A-Za-z0-9._+-]\{1,64\}\)$/\1/p' | head -n 1
+}
+
+# Whether the daily update check is due: no usable record of the last one (missing, or garbled:
+# a leading 0, more than 11 digits), a record a day old, or one in the future (the clock was set
+# back since).
+update_due() {
+  ud_at=$(head -n 1 "$CHECKED" 2>/dev/null)
+  epoch_ok "$ud_at" || return 0
+  ud_now=$(date +%s)
+  [ "$ud_at" -gt "$ud_now" ] || [ $((ud_now - ud_at)) -ge "$UPDATE_EVERY" ]
+}
+
+# Whether downloaded file $1 may replace the installed script. 1, with the reason in vs_why, when
+# it is empty, does not start with #!/bin/sh, lacks the marker or the version line, is cut short
+# (its last line is not `main "$@"`), fails sh -n (or dash -n where dash exists), or fails its
+# smoke run: `sh $1 print-hooks-json claude-code`, with the shell the hook uses, must exit 0
+# within 20 s and print JSON (a script that dies as it starts would stop capture and its own
+# updates for good).
+verify_script() {
+  vs_why=
+  if [ ! -s "$1" ]; then
+    vs_why="the download was empty"
+  elif [ "$(head -n 1 "$1")" != '#!/bin/sh' ]; then
+    vs_why="the download does not start with #!/bin/sh"
+  elif ! sed -n 2p "$1" | grep -q '^# alice-capture-hook'; then
+    vs_why="the download has no alice-capture-hook marker line"
+  elif [ -z "$(script_version "$1")" ]; then
+    vs_why="the download has no version line"
+  elif [ "$(tail -n 1 "$1")" != 'main "$@"' ]; then
+    vs_why="the download is cut short (it does not end with main)"
+  elif ! sh -n "$1" >/dev/null 2>&1; then
+    vs_why="the download fails sh -n"
+  elif command -v dash >/dev/null 2>&1 && ! dash -n "$1" >/dev/null 2>&1; then
+    vs_why="the download fails dash -n"
+  elif ! bounded 20 sh "$1" print-hooks-json claude-code >"$tmpd/smoke" 2>/dev/null ||
+    [ "$(head -c 1 "$tmpd/smoke")" != '{' ]; then
+    vs_why="the download fails its smoke run (print-hooks-json claude-code)"
+  fi
+  [ -z "$vs_why" ]
+}
+
+# Runs command "$2" ... in the background with stdin from /dev/null, and ends it after $1 seconds
+# (macOS has no timeout command): TERM, then KILL 2 s later when TERM did not end it (a script's
+# own TERM trap waits for its foreground command). Returns the command's status, which is not 0
+# once it was ended. Its stdout and stderr are bounded's own. A child the command started may
+# outlive a KILL.
+#
+# The watchdog is a subshell that sleeps one second at a time and writes each sleep's pid into a
+# sentinel file. The caller, once it has reaped the command, stops the watchdog with KILL (a
+# trapped TERM can be lost), kills its current sleep and removes the sentinel. The watchdog
+# signals the command only while the sentinel exists and the command is still there, so it never
+# signals a pid that was reaped and reused. When the caller is killed, the watchdog still ends the
+# command at the limit, then removes the sentinel and exits.
+bounded() {
+  bd_limit=$1
+  shift
+  bd_flag=$(mktemp "${TMPDIR:-/tmp}/alice-bounded.XXXXXX" 2>/dev/null) || bd_flag=
+  "$@" </dev/null &
+  bd_pid=$!
+  (
+    trap - EXIT HUP INT TERM
+    bd_n=0
+    while { [ -z "$bd_flag" ] || [ -f "$bd_flag" ]; } && kill -0 "$bd_pid" 2>/dev/null; do
+      if [ "$bd_n" -eq "$bd_limit" ]; then
+        kill -TERM "$bd_pid" 2>/dev/null
+      elif [ "$bd_n" -ge $((bd_limit + 2)) ]; then
+        kill -KILL "$bd_pid" 2>/dev/null
+        break
+      fi
+      sleep 1 &
+      if [ -n "$bd_flag" ]; then printf '%s\n' "$!" >"$bd_flag" 2>/dev/null; fi
+      wait "$!"
+      bd_n=$((bd_n + 1))
+    done
+    if [ -n "$bd_flag" ]; then rm -f "$bd_flag"; fi
+  ) </dev/null >/dev/null 2>&1 &
+  bd_dog=$!
+  wait "$bd_pid"
+  bd_rc=$?
+  kill -KILL "$bd_dog" 2>/dev/null
+  wait "$bd_dog" 2>/dev/null
+  if [ -n "$bd_flag" ]; then
+    bd_tick=$(cat "$bd_flag" 2>/dev/null)
+    case $bd_tick in '' | *[!0-9]*) ;; *) kill -KILL "$bd_tick" 2>/dev/null ;; esac
+    rm -f "$bd_flag"
+  fi
+  return "$bd_rc"
+}
+
+# Temporary files of an update (or a setup) that was killed: removed under the update lock once
+# they are more than 10 minutes old, so a run going on now keeps its own.
+clean_stale_temps() {
+  for ct_f in "$DIR"/.alice-capture.sh.new.* "$CHECKED".* "$MP"/alice-capture/hooks/hooks.json.tmp.* \
+    "$MP"/alice-capture/.claude-plugin/plugin.json.tmp.* "$MP"/.claude-plugin/marketplace.json.tmp.* \
+    "${CODEX_HOME:-$HOME/.codex}"/hooks.json.tmp.[0-9]* "$DIR"/codex-hooks.written.new; do
+    [ -f "$ct_f" ] || continue
+    if [ -n "$(find "$ct_f" -prune -mmin +10 2>/dev/null)" ]; then rm -f "$ct_f"; fi
+  done
+}
+
+# Rewrites file $1 with the bytes of file $2 (a temporary file beside it, then mv); 1, leaving $1
+# as it was, on failure.
+replace_file() {
+  if cp "$2" "$1.tmp.$$" 2>/dev/null && mv -f "$1.tmp.$$" "$1" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$1.tmp.$$" 2>/dev/null
+  return 1
+}
+
+# Sets the "version" of the plugin's JSON file $1 to $2 (a temporary file beside it, then mv).
+set_json_version() {
+  if sed 's/"version"[[:space:]]*:[[:space:]]*"[^"]*"/"version": "'"$2"'"/' "$1" >"$1.tmp.$$" 2>/dev/null &&
+    mv -f "$1.tmp.$$" "$1" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$1.tmp.$$" 2>/dev/null
+  return 1
+}
+
+# Writes to file $2 the hooks file the installed script prints for agent $1; 1, logged, when it
+# prints none.
+printed_hooks() {
+  if sh "$SCRIPT" print-hooks-json "$1" </dev/null >"$2" 2>/dev/null && [ "$(head -c 1 "$2")" = '{' ]; then
+    return 0
+  fi
+  log "the installed hook script printed no $1 hooks file; the hooks were left as they are"
+  return 1
+}
+
+# The plugin's hooks.json ($2) differs from $1, what the installed script prints. The plugin's
+# version moves first, to <its version>+<the script's version> (a Claude Code that runs plugins
+# from its cache copies a new version only), then hooks.json is rewritten, and `claude plugin` is
+# asked to reload it in the background (stdin /dev/null). Claude Code reads a local plugin's own
+# folder at the next session start anyway; when `claude` is missing or fails, one line says to run
+# the setup command again.
+sync_plugin() {
+  sp_json="$MP/alice-capture/.claude-plugin/plugin.json"
+  sp_v=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([0-9A-Za-z.+-]*\)".*/\1/p' "$sp_json" 2>/dev/null | head -n 1)
+  sp_v=${sp_v%%+*}
+  sp_v="${sp_v:-0.0.0}+$(script_version "$SCRIPT")"
+  case $sp_v in *+ | *[!0-9A-Za-z.+-]*) sp_v= ;; esac
+  if [ -z "$sp_v" ] || ! set_json_version "$sp_json" "$sp_v" ||
+    ! set_json_version "$MP/.claude-plugin/marketplace.json" "$sp_v" || ! replace_file "$2" "$1"; then
+    log "the plugin's hooks.json could not be brought up to date with the hook script; run the setup command again"
+    return 0
+  fi
+  log "the plugin's hooks.json changed with the hook script (plugin version $sp_v)"
+  if ! command -v claude >/dev/null 2>&1; then
+    log "the plugin's hooks.json changed, and there is no claude command to reload it with; run the setup command again (a new Claude Code session may load it anyway)"
+    return 0
+  fi
+  # From $HOME (a project's directory could change what `claude plugin` reads), without Claude
+  # Code's own self-update, and each call killed after 120 s.
+  (
+    trap - EXIT HUP INT TERM
+    cd "$HOME" 2>/dev/null || exit 0
+    sp_limit=${ALICE_CAPTURE_TEST_CLAUDE_LIMIT:-120}
+    case $sp_limit in '' | 0* | *[!0-9]* | ?????*) sp_limit=120 ;; esac
+    if bounded "$sp_limit" env DISABLE_AUTOUPDATER=1 claude plugin marketplace update alice-local >/dev/null 2>&1 &&
+      bounded "$sp_limit" env DISABLE_AUTOUPDATER=1 claude plugin update alice-capture@alice-local >/dev/null 2>&1; then
+      log "claude plugin took the new hooks.json; new Claude Code sessions load it"
+    else
+      log "the plugin's hooks.json changed, and claude plugin update failed or did not finish within $sp_limit s; run the setup command again so Claude Code loads the new hooks"
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+}
+
+# The Codex hooks.json ($2) is still the file setup wrote and differs from $1, what the installed
+# script prints: it is rewritten with its record, which is staged first, as setup does. Codex runs
+# changed hooks only after the person trusts them again.
+sync_codex() {
+  sc_rec="$DIR/codex-hooks.written"
+  if ! cp "$1" "$sc_rec.new" 2>/dev/null; then
+    rm -f "$sc_rec.new" 2>/dev/null
+    log "the Codex hooks were not updated: the record ~/.config/alice/codex-hooks.written could not be written; run the setup command again"
+    return 0
+  fi
+  if ! replace_file "$2" "$1"; then
+    rm -f "$sc_rec.new" 2>/dev/null
+    log "the Codex hooks were not updated: $2 could not be written; run the setup command again"
+    return 0
+  fi
+  if ! mv -f "$sc_rec.new" "$sc_rec" 2>/dev/null; then
+    rm -f "$sc_rec.new" 2>/dev/null
+    replace_file "$2" "$sc_rec" # back to the file the record names, so it stays setup's own
+    log "the Codex hooks were not updated: the record ~/.config/alice/codex-hooks.written could not be written; run the setup command again"
+    return 0
+  fi
+  log "updated $2 with the hook script; Codex runs the changed hooks only after you trust them again: open Codex, type /hooks and trust the Alice capture hooks"
+}
+
+# Brings the plugin's hooks.json, and the Codex hooks.json while it is still the file setup wrote,
+# to what the installed script prints. Each is rewritten only when it differs.
+sync_hooks() {
+  [ -f "$SCRIPT" ] && make_tmp || return 0
+  sh_hooks="$MP/alice-capture/hooks/hooks.json"
+  if [ -f "$sh_hooks" ] && printed_hooks claude-code "$tmpd/hooks-claude" &&
+    ! cmp -s "$tmpd/hooks-claude" "$sh_hooks"; then
+    sync_plugin "$tmpd/hooks-claude" "$sh_hooks"
+  fi
+  sh_codex="${CODEX_HOME:-$HOME/.codex}/hooks.json"
+  if [ -f "$DIR/codex-hooks.written" ] && [ -f "$sh_codex" ] && cmp -s "$sh_codex" "$DIR/codex-hooks.written" &&
+    printed_hooks codex "$tmpd/hooks-codex" && ! cmp -s "$tmpd/hooks-codex" "$sh_codex"; then
+    sync_codex "$tmpd/hooks-codex" "$sh_codex"
+  fi
+}
+
+# The daily update check, at the start of a background worker (never the hook itself, and before
+# the capture work), under the update lock. It fetches the tenant's hook script over https:// (a
+# public route: no token is sent) and, when its version differs from the installed one and it
+# passes verify_script, replaces the installed script: a temporary file beside it, 0700, then mv
+# (a running worker keeps reading the old file). Then the hooks files follow the installed
+# script. Any failure keeps the installed script byte for byte and logs one line, which never
+# holds the token or the script's text.
+self_update() {
+  [ -f "$SCRIPT" ] || return 0
+  update_due || return 0
+  lock update 0 || return 0
+  # Read again under the lock: another worker may have checked meanwhile.
+  if ! update_due; then
+    unlock
+    return 0
+  fi
+  # The record first: no fetch without it, or every event would fetch.
+  su_now=$(date +%s)
+  { printf '%s\n' "$su_now" >"$CHECKED.$$" && mv -f "$CHECKED.$$" "$CHECKED"; } 2>/dev/null
+  rm -f "$CHECKED.$$" 2>/dev/null
+  if [ "$(head -n 1 "$CHECKED" 2>/dev/null)" != "$su_now" ]; then
+    log "capture hook update check skipped: ~/.config/alice/update-checked cannot be written, and without it every event would check"
+    unlock
+    return 0
+  fi
+  clean_stale_temps
+  case $url in
+    https://*) ;;
+    *)
+      if [ "${ALICE_CAPTURE_TEST_UPDATE_HTTP:-}" != 1 ]; then
+        log "capture hook update skipped: it runs over https:// only, and ~/.config/alice/url is not https:// (asked again in a day)"
+        unlock
+        return 0
+      fi
+      ;;
+  esac
+  if ! make_tmp; then
+    unlock
+    return 0
+  fi
+  su_old=$(script_version "$SCRIPT")
+  upd_tmp="$DIR/.alice-capture.sh.new.$$"
+  rm -f "$upd_tmp"
+  su_code=$(curl -q -fsS --connect-timeout 5 --max-time 30 --max-filesize "$SCRIPT_MAX" -o "$upd_tmp" \
+    -w '%{http_code}' "$url/api/v1/capture/hook.sh" 2>/dev/null)
+  su_rc=$?
+  if [ "$su_rc" -ne 0 ]; then
+    log "capture hook update check failed (curl exit $su_rc, HTTP ${su_code:-000}); the installed script stays"
+  elif [ "$su_code" != 200 ]; then
+    log "capture hook update refused (HTTP $su_code, not 200); the installed script stays"
+  elif ! verify_script "$upd_tmp"; then
+    log "capture hook update refused (HTTP $su_code): $vs_why; the installed script stays"
+  else
+    su_new=$(script_version "$upd_tmp")
+    if [ "$su_new" = "$su_old" ]; then
+      :
+    elif [ ! -f "$SCRIPT" ]; then
+      log "capture hook update skipped: the hook script was removed meanwhile, and is not put back"
+    elif chmod 700 "$upd_tmp" 2>/dev/null && mv -f "$upd_tmp" "$SCRIPT" 2>/dev/null; then
+      upd_tmp=
+      log "capture hook updated ${su_old:-unversioned} $(printf '\342\206\222') $su_new"
+    else
+      log "capture hook update could not replace ~/.config/alice/alice-capture.sh; the installed script stays"
+    fi
+  fi
+  if [ -n "$upd_tmp" ]; then
+    rm -f "$upd_tmp"
+    upd_tmp=
+  fi
+  sync_hooks
+  unlock
   return 0
 }
 
@@ -833,6 +1245,20 @@ status_main() {
       000 | '') printf 'server: unreachable\n' ;;
       *) printf 'server: answered HTTP %s\n' "$st_code" ;;
     esac
+  fi
+  if [ -f "$SCRIPT" ]; then
+    st_v=$(script_version "$SCRIPT")
+    printf 'hook script: ~/.config/alice/alice-capture.sh (version %s; it updates itself from the server once a day' "${st_v:-unknown}"
+    st_at=$(head -n 1 "$CHECKED" 2>/dev/null)
+    if epoch_ok "$st_at"; then
+      st_h=$((($(date +%s) - st_at) / 3600))
+      if [ "$st_h" -lt 0 ]; then st_h=0; fi
+      printf '; last check %s h ago)\n' "$st_h"
+    else
+      printf ')\n'
+    fi
+  else
+    printf 'hook script: missing (~/.config/alice/alice-capture.sh); run the setup command\n'
   fi
   if briefing_on; then
     printf 'briefing: on (~/.config/alice/capture.conf)\n'
@@ -915,9 +1341,9 @@ uninstall_main() {
     fi
     rm -f "$DIR/codex-hooks.written"
   fi
-  if confirm "Delete the capture files (the hook script, state/, capture.conf, capture.log, paused-until)? The token and url files stay. [y/N] "; then
+  if confirm "Delete the capture files (the hook script, state/, capture.conf, capture.log, paused-until, update-checked)? The token and url files stay. [y/N] "; then
     rm -rf "${DIR:?}/state"
-    rm -f "$DIR/alice-capture.sh" "$CONF" "$LOG" "$PAUSED"
+    rm -f "$SCRIPT" "$CONF" "$LOG" "$PAUSED" "$CHECKED"
     printf 'Deleted the capture files. ~/.config/alice/token and url are kept: your MCP setup uses them.\n'
   else
     printf 'Kept the capture files in ~/.config/alice.\n'
@@ -936,6 +1362,11 @@ main() {
       shift
       run_main "$@"
       return 0
+      ;;
+    print-hooks-json)
+      shift
+      print_hooks_json "$@"
+      return
       ;;
     status) status_main ;;
     uninstall) uninstall_main ;;

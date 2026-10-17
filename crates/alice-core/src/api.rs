@@ -141,6 +141,10 @@ pub struct RelatedRef {
     pub title: String,
     /// How it is related: a link type or `entity:<name>`.
     pub via: String,
+    /// `distill` for a memory distilled from a captured session (the text format marks it
+    /// `(auto)`); absent for any other (SP2 spec §6.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -701,6 +705,14 @@ pub struct CaptureHealth {
     /// Transcript lines of a shape the reader did not recognise in the last 7 days (a hint that
     /// an agent's format changed). Counted in memory: it starts from zero with the daemon.
     pub unrecognised_lines_7d: u64,
+    /// Codex sessions whose hook gave no transcript path and whose rollout was not found
+    /// (spec §4.2), since the daemon started.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rollouts_not_found: u64,
+    /// Compressed Codex rollouts (`*.jsonl.zst`) skipped unread (spec §10), since the daemon
+    /// started.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rollouts_compressed: u64,
 }
 
 /// `GET /api/v1/capture/status`: the capture switch, distillation and the recent sessions.
@@ -820,6 +832,11 @@ pub struct TranscriptAnswer {
     pub chunks_stored: u64,
     /// The body is a whole pass without a line end: the client skips that line.
     pub oversized_line: bool,
+    /// This upload ended the session's source: a `session-end` whose pass wrote (the body's
+    /// last part, or an empty body at the cursor). `false` when the pass stopped before writing
+    /// (the project's rules wait, say), so the client knows the end did not land.
+    #[serde(default)]
+    pub ended: bool,
 }
 
 /// `POST /api/v1/capture/notify` (SP2 spec §4.1, §4.2): an agent hook fired, so the local

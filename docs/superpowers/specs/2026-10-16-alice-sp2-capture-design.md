@@ -582,8 +582,11 @@ Alternatives considered:
     `alice capture status`.
 - **Processing:** only complete lines in the body are consumed. A body of at least 8 MiB with no newline answers
   `{"oversized_line": true}`, and the client skips that line (§5.3).
-- **Answer:** `{"next_offset", "turns_stored", "turns_skipped", "chunks_stored"}`. `next_offset` stops at the start of
-  the first incomplete turn, unless `event=session-end`, which closes the trailing turn.
+- **Answer:** `{"next_offset", "turns_stored", "turns_skipped", "chunks_stored", "ended"}`. `next_offset` stops at the
+  start of the first incomplete turn, unless `event=session-end`, which closes the trailing turn. `ended` is `true` when
+  this upload ended the session's source: a `session-end` whose pass wrote (its last body, or an empty body at the
+  cursor). It is `false` when the pass stopped before writing (the rules wait, say), so the script never reports an end
+  that did not land (Task 15b).
 - **Pipeline:** the same core as locally (§3), with the bytes taken from the body and never from a path.
 - **Project:** the route sets the in-process `project_hint` from `project` before `Service::choose` runs. The wire
   `project_hint` stays cleared on every other route, as today. The capture route is a binary-less entry point like direct
@@ -595,8 +598,15 @@ Alternatives considered:
 ### 5.3 The hook script `alice-capture.sh`
 
 The hook script is POSIX `sh`, served by the daemon at `GET /api/v1/capture/hook.sh` and kept by setup as
-`~/.config/alice/alice-capture.sh` (0700). It needs `sh`, `curl`, `sed`, `head`, `tail`, `mkdir`, `mv` and `date`; `git`
-and `awk` are optional. The plugin's hook command is `sh "$HOME/.config/alice/alice-capture.sh" hook claude-code`.
+`~/.config/alice/alice-capture.sh` (0700). It needs `sh`, `curl`, `sed`, `head`, `tail`, `mkdir`, `mv` and `date`; `git`,
+`awk` and `dash` are optional. The plugin's hook command is `sh "$HOME/.config/alice/alice-capture.sh" hook claude-code
+|| true` (a missing script never fails a hook).
+
+Its first three lines are `#!/bin/sh`, a marker line `# alice-capture-hook: …` and a version line
+`# alice-capture-version: <v>`. The committed file says `unstamped`; the route serves it with `<v>` = the first 12 hex
+digits of the SHA-256 of the compiled-in text, so the version changes exactly when the script does. The script also
+prints the hooks files (`alice-capture.sh print-hooks-json claude-code|codex`): setup writes what it prints, and the
+self-update (step 8) compares with it, so the hooks are written down in one place.
 
 1. **Read the input.** Read stdin (at most 1 MiB). Extract `hook_event_name`, `session_id`, `transcript_path`, `cwd`,
    `agent_id` and `agent_transcript_path` with a JSON-string `sed` pattern that undoes `\\`, `\"` and `\/`. A value holding
@@ -605,7 +615,12 @@ and `awk` are optional. The plugin's hook command is `sh "$HOME/.config/alice/al
    token among them), started with `nohup sh … >/dev/null 2>&1 </dev/null &`. Then `exit 0`, except on `SessionStart`,
    which first prints the briefing (step 5, at most 2 s). The agent never waits on capture.
 3. **In the background:**
-   - Take a per-file lock, a `mkdir` lock that is broken when older than 120 s.
+   - Take a per-file lock, a `mkdir` lock holding the holder's `pid` and `at` (refreshed every pass). Both are written
+     through a temporary file and `mv`, so a reader never sees them empty, and each write moves the directory's mtime.
+     - A live holder is broken only when its `at` is 900 s old, a dead one at 360 s.
+     - Without a usable `at` (a holder killed between `mkdir` and writing it, or inside its unlock, or a full disk), the
+       directory's own age stands in: more than 15 minutes for a live pid, more than 6 otherwise.
+     - A dead or unknown holder without `at` is also broken after more than 5 tries (a hook waits up to 40 s).
    - Wait 2 s on stop-type events (the transcript may lag).
    - Read the stored offset from `~/.config/alice/state/<agent>-<session>[-<agent_id>].offset`.
    - Loop at most 16 times:
@@ -626,6 +641,62 @@ and `awk` are optional. The plugin's hook command is `sh "$HOME/.config/alice/al
      line `cloud_denied = true` sends `no_distill=1`.
    - If the file exists but cannot be read, the event is skipped (fail closed).
 7. **Log.** `~/.config/alice/capture.log`, kept under 256 KB, never holds the token or transcript text.
+8. **Self-update (Task 15b).** The script updates itself, so a fix reaches every machine without anyone re-running
+   setup.
+   - **When.** At the start of a background worker's run, before its capture work, so a release whose capture path
+     fails can still fetch its fix. Never in the hook itself, and at most once a day.
+     - `~/.config/alice/update-checked` records when the last check started. Setup writes it too, so its install counts
+       as that day's check.
+     - A record in the future, or a garbled one (a leading 0, more than 11 digits), counts as due.
+     - The check runs under a `mkdir` lock, `state/update.lock`, with the stale rules of step 3 (an `at`, else the
+       directory's age, so a lock left by a killed run never wedges the check), and reads the record again under it.
+       While another worker holds the lock, nothing is checked.
+     - It writes the record before fetching and reads it back. When the record cannot be written, nothing is fetched,
+       or every event would fetch.
+     - Under the lock it also removes temporary files a killed run left, once they are more than 10 minutes old.
+   - **The fetch.** `curl -q -fsS --connect-timeout 5 --max-time 30 --max-filesize 1048576` of
+     `<url>/api/v1/capture/hook.sh`, the person's own tenant. The route is public, so no token is sent.
+     - **`https://` only** (controller's ruling). With a loopback `http://` URL, capture works but the check is skipped,
+       with one log line a day. The test-only switch `ALICE_CAPTURE_TEST_UPDATE_HTTP=1` lets the tests use the
+       emulator.
+     - Any answer other than 200 is refused, and every refusal line names the HTTP status.
+   - **Deciding.** It replaces the script only when the served version line differs from the installed one.
+   - **Checks before replacing.** The download must:
+     - be non-empty, start with `#!/bin/sh`, and carry the marker and version lines;
+     - end with `main "$@"`, so a cut-short download is refused;
+     - pass `sh -n`, and `dash -n` where `dash` exists;
+     - pass a smoke run: `sh <download> print-hooks-json claude-code`, with the shell the hook uses, must exit 0 within
+       20 s and print JSON. A script that dies as it starts would stop capture and its own updates for good.
+
+     The 20 s (and the 120 s of the `claude` calls below) are enforced by a watchdog, since macOS has no `timeout`: TERM
+     at the limit, then KILL 2 s later when TERM did not end the command (a script's own TERM trap waits for its
+     foreground command). The watchdog sleeps one second at a time. The caller stops it with KILL and kills its sleep,
+     so none outlives the call, and it signals only while a sentinel file the caller removes exists, so never a reused
+     pid. A child the command started can outlive the KILL.
+   - **Replacing.** The download is a temporary file beside the script, `chmod 700`, then `mv`. A running worker keeps
+     reading the old file. The log says `capture hook updated <old> → <new>`. Any failure (curl, a check, the `mv`) keeps
+     the installed script byte for byte and logs one line. No log line holds the token or the script's text. A script
+     removed meanwhile (uninstall) is never put back.
+   - **The hooks files.** After the check, the plugin's `hooks.json` is compared with what the installed script prints,
+     and rewritten only when it differs. Then:
+     1. the plugin's version moves to `<its version>+<script version>` in `plugin.json` and `marketplace.json`, before
+        `hooks.json` is rewritten (atomically);
+     2. `claude plugin marketplace update alice-local` and `claude plugin update alice-capture@alice-local` run in the
+        background: from `$HOME`, with stdin from `/dev/null` and `DISABLE_AUTOUPDATER=1`, each killed after 120 s
+        (a watchdog subshell, since macOS has no `timeout`);
+     3. when `claude` is missing or those commands fail, one log line says to re-run the setup command.
+
+     Claude Code 2.1 reads a local-directory plugin from its own folder at each session start (checked under a throwaway
+     `HOME`). A Claude Code that runs plugins from its cache copies only a new version, which is why the version moves.
+     The Codex `hooks.json` follows only while it is still byte for byte the file setup wrote (`codex-hooks.written`). It
+     is rewritten with its record, and the log reminds the person to trust the hooks again in `/hooks`.
+   - **Across versions.** After an update, a hook of the old version starts the new file's `run`. So the `run`
+     arguments, the state file's format, the lock layout, the `update-checked` record and the `print-hooks-json` output
+     stay compatible for at least one version. The script's header says so.
+   - **Repair.** Re-running the setup command is still how to repair an install, for example one whose token was
+     refused or whose plugin files were removed. Local installs need none of this: the `alice` binary is the hook.
+   - **Future work.** The script is not signed yet. The server now delivers code to every machine daily, so signing is
+     planned: a key held off the server, and `ssh-keygen -Y verify` on the download before it may replace the script.
 
 ### 5.4 The setup command (the one copy-paste step)
 
@@ -651,10 +722,14 @@ no address, and they are in the public repository anyway. The setup script:
    file is reported, and the script asks once for a new one.
 4. **Writes `~/.config/alice/capture.conf`** (0600), which holds only non-secret options: `briefing=on`. The person may
    change it to `off`.
-5. **Installs** `alice-capture.sh` from `<url>/api/v1/capture/hook.sh`.
+5. **Installs** `alice-capture.sh` from `<url>/api/v1/capture/hook.sh`, after the checks of §5.3 step 8 (shebang,
+   marker and version lines, `main "$@"` last, `sh -n` and `dash -n`). It writes `update-checked`: this install is the
+   day's update check.
 6. **Writes the local marketplace** `~/.config/alice/claude-marketplace/`, containing
    `.claude-plugin/marketplace.json` (marketplace `alice-local`) and the plugin `alice-capture/`. The plugin holds
    `.claude-plugin/plugin.json`, at the tenant's version, and `hooks/hooks.json`, with the five events calling the script.
+   `hooks.json` is what `alice-capture.sh print-hooks-json claude-code` prints. The Codex file of step 8 is what
+   `print-hooks-json codex` prints.
 7. **Installs the plugin:** `claude plugin marketplace add ~/.config/alice/claude-marketplace`, then
    `claude plugin install alice-capture@alice-local --scope user`. If the `claude` command is missing or too old, it prints
    the two `/plugin` commands to type inside Claude Code instead.
@@ -662,11 +737,12 @@ no address, and they are in the public repository anyway. The setup script:
    If the file exists, it prints the entries to add. Either way it reminds the person to trust them in `/hooks`.
 9. **Prints** what it did, how to check (`sh ~/.config/alice/alice-capture.sh status`) and how to remove it.
 
-Re-running the command updates everything in place. `sh ~/.config/alice/alice-capture.sh uninstall`:
+The hook script then updates itself once a day, and the plugin's `hooks.json` with it (§5.3 step 8). Re-running the
+command is how to repair an install, and it updates everything in place. `sh ~/.config/alice/alice-capture.sh uninstall`:
 - uninstalls the plugin and removes the marketplace;
 - removes the Codex `hooks.json` only if it is still exactly the one setup wrote;
-- deletes the capture files after asking: the script, `state/`, `capture.conf`, `capture.log`, `paused-until` and the
-  marketplace. It never deletes `token` or `url`, which belong to the person's MCP setup.
+- deletes the capture files after asking: the script, `state/`, `capture.conf`, `capture.log`, `paused-until`,
+  `update-checked` and the marketplace. It never deletes `token` or `url`, which belong to the person's MCP setup.
 
 Whether `alice-server` prints each person's line is the server lane's call. `docs/server.md` documents the line either way.
 
@@ -1009,7 +1085,7 @@ All routes are behind the existing token, Host and Origin guard, except the two 
 | `GET /api/v1/capture/status` | Recent sessions (50), cursors, distill states and counters; also `{tenant: bool}`, which setup uses to check the token |
 | `POST /api/v1/capture/distill` | `{session_id}` or `{source_id}`, marks it due now |
 | `GET /api/v1/capture/briefing?project=…&source=…` | The SessionStart briefing as `text/plain` (≤ 10,000 characters); `204` when `capture.briefing` is off or `source` is `resume` or `fork`. The project resolves from `cwd` locally (the hook sends it as a query parameter) and from the hint on a tenant (§5.7) |
-| `GET /api/v1/capture/setup.sh`, `GET /api/v1/capture/hook.sh` | Public static scripts (`text/plain; charset=utf-8`, `Cache-Control: no-store`) |
+| `GET /api/v1/capture/setup.sh`, `GET /api/v1/capture/hook.sh` | Public static scripts (`text/plain; charset=utf-8`, `Cache-Control: no-store`); the hook script's version line is stamped with a hash of its text (§5.3) |
 
 - **The spool** gains `SpoolEntry::CaptureNotify`.
 - **No new MCP tool.** Transcripts are reached through `recall` with `include_raw`, as today.

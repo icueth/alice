@@ -160,9 +160,11 @@ impl Record {
     /// `timestamp` are looked up as plain `"key":"value"` text near both ends (best effort), so
     /// the stub can still key a head turn and date its chunk. When no uuid is found there
     /// (Claude Code writes it mid-line, between two copies of a large tool result), the stub
-    /// takes a stand-in made from the line's bytes ([`stand_in_uuid`]): each such line keys its
-    /// own turn or tail, and the same line read again keys the same. A shared fallback key would
-    /// make every later stub's tail look stored already.
+    /// takes a stand-in ([`stand_in_uuid`]): made from the `sourceToolAssistantUUID` at the
+    /// line's end when there is one, which a resumed or forked copy of the line keeps, else from
+    /// the line's bytes. Each such line keys its own turn or tail, and the same line read again
+    /// keys the same. A shared fallback key would make every later stub's tail look stored
+    /// already.
     pub fn too_large(line: &[u8]) -> Record {
         Record {
             uuid: scan_string_field(line, "uuid")
@@ -232,6 +234,12 @@ fn scan_string_field(line: &[u8], key: &str) -> Option<String> {
     let found = rfind(tail, needle)
         .map(|at| &tail[at + needle.len()..])
         .or_else(|| find(head, needle).map(|at| &head[at + needle.len()..]))?;
+    string_value(found)
+}
+
+/// The string value at the start of `found` (the bytes after `"key":"`), up to its closing
+/// quote. A value with an escape or over 128 bytes is not taken.
+fn string_value(found: &[u8]) -> Option<String> {
     let end = found.iter().position(|&b| b == b'"')?;
     let value = &found[..end];
     if value.is_empty() || value.len() > 128 || value.contains(&b'\\') {
@@ -240,19 +248,44 @@ fn scan_string_field(line: &[u8], key: &str) -> Option<String> {
     std::str::from_utf8(value).ok().map(str::to_owned)
 }
 
+/// The field of a Claude Code tool-result line that names the assistant record whose tool call
+/// it answers. Claude Code writes it at the line's end, and a resumed or forked session's copy
+/// of the line keeps it (its `sessionId`, also near the end, changes).
+const SOURCE_TOOL_ASSISTANT: &str = "sourceToolAssistantUUID";
+
 /// The stand-in uuid of a line too large to parse that shows none: `too-large-` and 32 hex
-/// digits of the SHA-256 of the line's length and its first and last `STUB_SCAN_BYTES` (the
-/// bytes the scan looked at). A valid id, so it is the stub's turn key.
+/// digits of a SHA-256. A valid id, so it is the stub's turn key.
+///
+/// - When the line's last `STUB_SCAN_BYTES` name a valid `sourceToolAssistantUUID` (the last
+///   one there, which is the line's own field rather than text inside its content), the hash
+///   is of that name: every copy of the line keys alike, so a resumed or forked session stores
+///   the line's tail once (Task 18b).
+/// - Otherwise it is of the line's length and its first and last `STUB_SCAN_BYTES` (the bytes
+///   the scan looked at).
 fn stand_in_uuid(line: &[u8]) -> String {
     let head = &line[..line.len().min(STUB_SCAN_BYTES)];
     let tail = &line[line.len().saturating_sub(STUB_SCAN_BYTES)..];
-    let mut bytes = Vec::with_capacity(8 + head.len() + tail.len());
-    bytes.extend((line.len() as u64).to_le_bytes());
-    bytes.extend(head);
-    bytes.extend(tail);
+    let bytes = match scan_tail_field(tail, SOURCE_TOOL_ASSISTANT).filter(|v| super::valid_id(v)) {
+        Some(source) => format!("{SOURCE_TOOL_ASSISTANT}\x1f{source}").into_bytes(),
+        None => {
+            let mut bytes = Vec::with_capacity(8 + head.len() + tail.len());
+            bytes.extend((line.len() as u64).to_le_bytes());
+            bytes.extend(head);
+            bytes.extend(tail);
+            bytes
+        }
+    };
     let mut hash = crate::normalize::sha256_hex(&bytes);
     hash.truncate(32);
     format!("too-large-{hash}")
+}
+
+/// `"key":"value"`, the last one in `tail`, as [`scan_string_field`] reads it, but never from
+/// the line's head.
+fn scan_tail_field(tail: &[u8], key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let needle = needle.as_bytes();
+    string_value(&tail[rfind(tail, needle)? + needle.len()..])
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -540,6 +573,63 @@ mod tests {
         let bare = |n| key(&vec![b'x'; n]);
         assert_ne!(bare(1000), bare(1001));
         assert_eq!(bare(1000), bare(1000));
+    }
+
+    /// Task 18b (6b review): a resumed or forked session copies an oversized tool-result line
+    /// under its own `sessionId`, which sits in the window the stand-in hashes. When the tail
+    /// window names the assistant record whose tool call this answers
+    /// (`sourceToolAssistantUUID`, the same in every copy), the stand-in is made from that, so
+    /// both copies key alike and the tail is stored once. A line without it keeps the byte hash.
+    #[test]
+    fn copies_of_an_oversized_tool_result_under_other_sessions_key_alike() {
+        let line = |session: &str, source: Option<&str>| {
+            let mut l =
+                format!(r#"{{"type":"user","sessionId":"{session}","message":{{"content":""#)
+                    .into_bytes();
+            l.extend(std::iter::repeat_n(b'x', 200_000));
+            l.extend(
+                br#""},"uuid":"u-mid","timestamp":"2026-10-14T09:00:00.000Z","toolUseResult":""#,
+            );
+            l.extend(std::iter::repeat_n(b'y', 100_000));
+            l.extend(format!(r#"","sessionId":"{session}""#).into_bytes());
+            if let Some(s) = source {
+                l.extend(format!(r#","sourceToolAssistantUUID":"{s}""#).into_bytes());
+            }
+            l.push(b'}');
+            l
+        };
+        let key = |l: &[u8]| Record::too_large(l).turn_key();
+        let assistant = "8c1e5a90-3f2b-4d7e-9a61-0b2c4d6e8f10";
+        let (a, b) = (line("s-1", Some(assistant)), line("s-2", Some(assistant)));
+        assert_ne!(a, b, "the copies differ in their session ids");
+        assert_eq!(key(&a), key(&b), "two copies of one line: one key");
+        assert!(key(&a).starts_with("too-large-") && key(&a).len() == 42);
+        assert!(super::super::valid_id(&key(&a)));
+        // Another tool call's result: another key.
+        let other = line("s-1", Some("0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b"));
+        assert_ne!(key(&a), key(&other));
+        // Without it, the stand-in is the byte hash, as before: the copies key apart.
+        let (c, d) = (line("s-1", None), line("s-2", None));
+        assert_ne!(key(&c), key(&d));
+        assert_ne!(key(&a), key(&c));
+        // Only the tail window counts: a name far from the end (inside the content) is not used.
+        let mut early = line("s-1", None);
+        early.splice(
+            40..40,
+            format!(r#""sourceToolAssistantUUID":"{assistant}","#).into_bytes(),
+        );
+        let mut early2 = line("s-2", None);
+        early2.splice(
+            40..40,
+            format!(r#""sourceToolAssistantUUID":"{assistant}","#).into_bytes(),
+        );
+        assert_ne!(key(&early), key(&early2), "a head-window name is not taken");
+        // A value that is no valid id is not taken either.
+        let (e, f) = (
+            line("s-1", Some("not an id!")),
+            line("s-2", Some("not an id!")),
+        );
+        assert_ne!(key(&e), key(&f));
     }
 
     #[test]

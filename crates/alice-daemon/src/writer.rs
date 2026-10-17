@@ -173,6 +173,10 @@ pub struct CaptureInit {
     pub file_key: Option<String>,
     /// The tenant client's flag. It only ever turns on.
     pub no_distill: bool,
+    /// A backfill registers the source (`alice capture backfill`, spec §4.4): a new source's
+    /// distillation starts `skipped_backfill`, a subagent's too. An existing source keeps its
+    /// state.
+    pub backfill: bool,
 }
 
 /// A change to a capture source's state (`WriteOp::CaptureStateUpdate`).
@@ -187,6 +191,12 @@ pub enum CaptureChange {
     /// Its chunks below `distill_ord` are distilled (it never moves back).
     Distilled {
         distill_ord: i64,
+    },
+    /// A source a backfill registered goes on live (`store::capture::revive_backfilled`): its
+    /// chunks below `from_ord` stay undistilled for good, and it is `idle` again. Only a
+    /// `skipped_backfill` source changes.
+    LiveAfterBackfill {
+        from_ord: i64,
     },
     Ended,
     /// A pass starts beyond the cursor (a tenant client sent from there, or the local worker
@@ -1761,6 +1771,11 @@ fn capture_slice(conn: &Connection, slice: Box<CaptureSlice>, st: &mut State) ->
             transcript_path: s.init.transcript_path.as_deref(),
             file_key: s.init.file_key.as_deref(),
             no_distill: s.init.no_distill,
+            distill_state: if s.init.backfill {
+                DistillState::SkippedBackfill
+            } else {
+                DistillState::Idle
+            },
         },
     )?;
     let (agent, stored_next): (String, i64) = conn.query_row(
@@ -1846,6 +1861,9 @@ fn capture_state_update(
         } => capture_store::set_distill(conn, source_id, *state, next_try_at.as_deref(), *attempts),
         CaptureChange::Distilled { distill_ord } => {
             capture_store::set_distilled(conn, source_id, *distill_ord)
+        }
+        CaptureChange::LiveAfterBackfill { from_ord } => {
+            capture_store::revive_backfilled(conn, source_id, *from_ord)
         }
         CaptureChange::Ended => capture_store::set_ended(conn, source_id),
         CaptureChange::Gap { byte_offset } => {
@@ -6672,6 +6690,7 @@ mod tests {
                 transcript_path: Some(format!("/tmp/t/{session}.jsonl")),
                 file_key: None,
                 no_distill: false,
+                backfill: false,
             },
             chunks: ords
                 .map(|i| ChunkInput {
