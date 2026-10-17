@@ -223,6 +223,11 @@ fn not_hex_only(v: &str) -> bool {
         .any(|c| !c.is_ascii_hexdigit() && !c.is_whitespace())
 }
 
+/// [`not_hex_only`] for lines joined by escaped line breaks (`\n` written as two characters).
+fn not_hex_only_escaped(v: &str) -> bool {
+    not_hex_only(&v.replace("\\r", "").replace("\\n", ""))
+}
+
 fn high_entropy(v: &str) -> bool {
     !v.starts_with("[REDACTED") && !code_like(v) && !path_like(v) && entropy(v) >= HIGH_ENTROPY
 }
@@ -254,6 +259,14 @@ fn builtin_detectors() -> Vec<Detector> {
             r"(?m)^(?:\[[^\]\n]+\] (?:\(cont\.\) )?)?((?:[ \t]*[A-Za-z0-9+/]{60,76}={0,2}[ \t]*\r?(?:\n|\z)){3,})",
             1,
             not_hex_only,
+        ),
+        // The same lines inside a JSON string, where each line break is the two characters
+        // `\n`: a key's body in a tool's input, which capture renders as JSON (follow-up M1).
+        d(
+            "base64_block",
+            r"(?:\A|\\[nr]|[^A-Za-z0-9+/=\\])((?:[A-Za-z0-9+/]{60,76}={0,2}(?:\\r)?\\n){2,}[A-Za-z0-9+/]{60,76}={0,2})(?:\\[nr]|[^A-Za-z0-9+/=]|\z)",
+            1,
+            not_hex_only_escaped,
         ),
         d(
             "jwt",
@@ -1045,6 +1058,9 @@ mod tests {
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
          e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
          e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "{\"sums\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\n\
+         e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\n\
+         e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}",
     ];
 
     /// A made-up PEM key of `lines` base64 lines of 64 characters, and those lines.
@@ -1193,6 +1209,50 @@ mod tests {
             assert_eq!(out.text, format!("{tag}[REDACTED:pem_private_key]"));
             assert!(open, "the key goes on");
         }
+    }
+
+    /// Follow-up M1: capture renders a tool's input as JSON, where a key's body has its line
+    /// breaks escaped (`\n`, two characters). It is caught there too, and the spans cover it.
+    #[test]
+    fn a_key_body_in_a_json_string_is_caught() {
+        let r = Redactor::builtin();
+        let (_, body) = fake_key(26);
+        for lines in [&body[3..6], &body[3..12]] {
+            for sep in ["\n", "\r\n"] {
+                let value = lines.join(sep);
+                for (content, kept) in [
+                    (
+                        format!("key:\n{value}\nEOF"),
+                        r#"key:\n[REDACTED:base64_block]\nEOF"#,
+                    ),
+                    (value.clone(), r#""[REDACTED:base64_block]""#),
+                ] {
+                    let json =
+                        serde_json::json!({"path": "/tmp/k", "content": content}).to_string();
+                    assert!(!json.contains('\n'), "{json}");
+                    assert!(
+                        Redactor::builtin_shared()
+                            .detectors
+                            .iter()
+                            .filter(|d| d.name == "base64_block")
+                            .take(1)
+                            .all(|d| d.re.find(&json).is_none()),
+                        "the line-anchored detector misses it: {json}"
+                    );
+                    let out = r.apply(&json);
+                    assert_eq!(out.found, ["base64_block"], "{json}");
+                    assert!(key_leaks(&out.text, lines).is_empty(), "{}", out.text);
+                    assert!(out.text.contains(kept), "{}", out.text);
+                    let spans = r.spans(&json);
+                    assert_eq!(spans.len(), 1, "{json}");
+                    let span = &json[spans[0].clone()];
+                    assert!(lines.iter().all(|l| span.contains(l.as_str())), "{span}");
+                }
+            }
+        }
+        // Two lines are not a block, in JSON either.
+        let two = serde_json::json!({"content": body[3..5].join("\n")}).to_string();
+        assert!(r.apply(&two).found.is_empty(), "{two}");
     }
 
     #[test]
