@@ -227,7 +227,9 @@ pub enum WriteOp {
     /// and whether it is a subagent's report) stored, and when it takes the place of `replaces`
     /// in its session's best set, that memory trashed in the same transaction (a
     /// `memory.forget` by `distill:cap`, undoable like any trash). A duplicate (the passage was
-    /// stored already) replaces nothing, nor does a `replaces` that is no longer live.
+    /// stored already) replaces nothing, nor does a `replaces` that is no longer in the set. A
+    /// `replaces` that became a handoff or protected since the set was read (the Task 12c
+    /// addendum) keeps its slot: nothing is written, and the outcome is `Done`.
     Distilled {
         input: NewMemoryInput,
         project: ProjectChoice,
@@ -758,7 +760,11 @@ fn remember(
 const DISTILL_CAP: &str = "cap";
 
 /// A distilled memory (`WriteOp::Distilled`): [`remember`]; then, when it is new, its rank inputs,
-/// and the memory it replaces in its session's best set trashed by `distill:cap` if still live.
+/// and the memory it replaces in its session's best set trashed by `distill:cap` if it is still a
+/// member that may go. The set is read again here, as the worker's read may be stale (the Task
+/// 12c addendum): a member that became one the cap never replaces keeps its slot, so nothing is
+/// written (`Done`); one that left the set (trashed, superseded, promoted by an explicit copy)
+/// left its slot free.
 fn distilled(
     conn: &Connection,
     input: NewMemoryInput,
@@ -768,6 +774,13 @@ fn distilled(
     replaces: Option<&str>,
     st: &mut State,
 ) -> Result<WriteOutcome> {
+    let replaced = match replaces {
+        Some(old) => match held_member(conn, old)? {
+            Some(h) if !h.replaceable() => return Ok(WriteOutcome::Done),
+            member => member.map(|h| h.id),
+        },
+        None => None,
+    };
     let out = remember(conn, input, project, st)?;
     if let WriteOutcome::Remembered(InsertOutcome::New { id, .. }, _) = &out {
         let tier = if subagent { "subagent" } else { "main" };
@@ -775,22 +788,35 @@ fn distilled(
             "UPDATE memories SET distill_p = ?1, distill_tier = ?2 WHERE id = ?3",
             rusqlite::params![p, tier, id],
         )?;
-        if let Some(old) = replaces {
-            let status: Option<String> = conn
-                .query_row("SELECT status FROM memories WHERE id = ?1", [old], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            if status.is_some_and(|s| s != "trashed" && s != "superseded") {
-                let forget = MemoryUpdate {
-                    action: UpdateAction::Forget,
-                    ..Default::default()
-                };
-                update(conn, old, &forget, &Actor::Distill(DISTILL_CAP.into()), st)?;
-            }
+        if let Some(old) = replaced {
+            let forget = MemoryUpdate {
+                action: UpdateAction::Forget,
+                ..Default::default()
+            };
+            update(conn, &old, &forget, &Actor::Distill(DISTILL_CAP.into()), st)?;
         }
     }
     Ok(out)
+}
+
+/// The memory `id` as a member of its session's best set (`store::capture::session_held`, by its
+/// own author), or `None` when it is not one (any more).
+fn held_member(conn: &Connection, id: &str) -> Result<Option<alice_core::distill::Held>> {
+    let author: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT author_agent, author_session FROM memories WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((Some(agent), Some(session))) = author else {
+        return Ok(None);
+    };
+    Ok(
+        alice_core::store::capture::session_held(conn, &agent, &session)?
+            .into_iter()
+            .find(|h| h.id == id),
+    )
 }
 
 /// `update`: the change and its `memory.<action>` event, whose id it returns. A supersede also
@@ -7217,6 +7243,137 @@ mod tests {
             [&plain],
         );
         assert_eq!(actor, "user");
+    }
+
+    /// The Task 12c addendum: the set the worker read may be stale by the time its op runs. A
+    /// memory that a person or an agent touched since, or a handoff, is never trashed by
+    /// `distill:cap`, and the newcomer that was to replace it is not stored either (its slot is
+    /// still taken). One an explicit copy promoted meanwhile is not a member any more: its slot
+    /// is free, so the newcomer is stored and the promoted memory is left as it is.
+    #[test]
+    fn a_distilled_memory_never_replaces_one_the_cap_may_not_replace() {
+        let f = fixture();
+        let input = |text: &str, key: &str, kind: Kind, origin: Origin| NewMemoryInput {
+            content: text.into(),
+            kind: Some(kind),
+            idempotency_key: Some(key.into()),
+            author: alice_core::model::Author {
+                agent: Some(CAPTURE_AGENT.into()),
+                session: Some("S1".into()),
+                model: None,
+            },
+            origin,
+            ..Default::default()
+        };
+        let distilled =
+            |text: &str, key: &str, kind: Kind, replaces: Option<&str>| WriteOp::Distilled {
+                input: input(text, key, kind, Origin::Distill),
+                project: global(),
+                p: 0.9,
+                subagent: false,
+                replaces: replaces.map(str::to_owned),
+            };
+        let status =
+            |id: &str| -> String { f.read("SELECT status FROM memories WHERE id = ?1", [id]) };
+        let stored = |key: &str| -> i64 {
+            f.read(
+                "SELECT count(*) FROM memories WHERE idempotency_key = ?1",
+                [key],
+            )
+        };
+        // Edited by an agent after it was distilled.
+        let (edited, _) = new_id(
+            f.h.submit_blocking(distilled(
+                "The cache keeps its data in memory only",
+                "distill:edited",
+                Kind::Fact,
+                None,
+            ))
+            .unwrap(),
+        );
+        f.h.submit_blocking(WriteOp::Update {
+            id: edited.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                title: Some("The cache is in memory".into()),
+                ..Default::default()
+            },
+            actor: Actor::Agent(CAPTURE_AGENT.into()),
+        })
+        .unwrap();
+        let out =
+            f.h.submit_blocking(distilled(
+                "The cache service listens on port 6380",
+                "distill:n1",
+                Kind::Fact,
+                Some(&edited),
+            ))
+            .unwrap();
+        assert!(matches!(out, WriteOutcome::Done), "{}", out.name());
+        assert_ne!(status(&edited), "trashed");
+        assert_eq!(stored("distill:n1"), 0, "the newcomer is not stored");
+        // The session's handoff.
+        let (handoff, _) = new_id(
+            f.h.submit_blocking(distilled(
+                "Where things stand: the cache is set up, next the restart",
+                "distill:handoff",
+                Kind::Handoff,
+                None,
+            ))
+            .unwrap(),
+        );
+        let out =
+            f.h.submit_blocking(distilled(
+                "Where things stand now: the restart moved to 04:00",
+                "distill:n2",
+                Kind::Handoff,
+                Some(&handoff),
+            ))
+            .unwrap();
+        assert!(matches!(out, WriteOutcome::Done), "{}", out.name());
+        assert_ne!(status(&handoff), "trashed");
+        assert_eq!(stored("distill:n2"), 0);
+        // Promoted by an explicit copy: no longer distilled, so its slot is free.
+        let (promoted, _) = new_id(
+            f.h.submit_blocking(distilled(
+                "The queue drains every five minutes",
+                "distill:promoted",
+                Kind::Fact,
+                None,
+            ))
+            .unwrap(),
+        );
+        f.h.submit_blocking(WriteOp::Remember {
+            input: NewMemoryInput {
+                idempotency_key: None,
+                ..input(
+                    "The queue drains every five minutes",
+                    "",
+                    Kind::Fact,
+                    Origin::Agent,
+                )
+            },
+            project: global(),
+        })
+        .unwrap();
+        let origin: String = f.read("SELECT origin FROM memories WHERE id = ?1", [&promoted]);
+        assert_eq!(origin, "agent");
+        let before = status(&promoted);
+        new_id(
+            f.h.submit_blocking(distilled(
+                "The queue service restarts on deploy",
+                "distill:n3",
+                Kind::Fact,
+                Some(&promoted),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(status(&promoted), before, "left as it is");
+        let forgets: i64 = f.read(
+            "SELECT count(*) FROM events WHERE action = 'memory.forget' AND actor = 'distill:cap'",
+            [],
+        );
+        assert_eq!(forgets, 0);
     }
 
     /// Task 12c (spec §6.4): a distilled memory is written with its rank inputs and, when it takes

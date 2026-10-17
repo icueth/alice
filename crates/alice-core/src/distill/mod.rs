@@ -321,9 +321,17 @@ pub struct Held {
     pub p: Option<f64>,
     pub subagent: Option<bool>,
     pub idempotency_key: String,
+    /// A person or an agent changed it, or links to it, since it was distilled: it is never
+    /// replaced (Task 12c addendum), though it counts toward the set's size.
+    pub protected: bool,
 }
 
 impl Held {
+    /// Whether `distill:cap` may replace it: not a handoff, and not protected.
+    pub fn replaceable(&self) -> bool {
+        !self.protected && self.kind != Kind::Handoff
+    }
+
     /// Its rank.
     pub fn rank(&self, s: &DistillSettings) -> Rank {
         Rank {
@@ -351,16 +359,21 @@ pub struct Placement {
 ///   nothing;
 /// - with room for it (a free slot, and for a subagent report a free share) is added;
 /// - otherwise replaces the weakest member it may replace, when it outranks it: any member, or
-///   with the subagents' share full and itself a subagent report, a subagent memory only;
-/// - otherwise is not stored.
+///   with the subagents' share full and itself a subagent report, a subagent memory only. A
+///   handoff and a [`Held::protected`] memory are never replaced (the Task 12c addendum), though
+///   they count toward the size and the share;
+/// - otherwise is not stored: every member it may replace is protected, or none is weaker.
 ///
-/// So the set never grows past its size, and it is the best `max_per_session` by [`Rank`] of all
-/// the passages ever kept, whatever their order. The placements come in `kept`'s order.
+/// So the set never grows past its size, and, but for the members it may not replace, it is the
+/// best `max_per_session` by [`Rank`] of all the passages ever kept, whatever their order. The
+/// placements come in `kept`'s order.
 pub fn place(held: &[Held], kept: Vec<DistilledMemory>, s: &DistillSettings) -> Vec<Placement> {
     struct Member {
         id: Option<String>,
         rank: Rank,
         subagent: bool,
+        /// Never replaced.
+        fixed: bool,
     }
     let share = s.max_per_session / 2;
     let mut set: Vec<Member> = held
@@ -369,6 +382,7 @@ pub fn place(held: &[Held], kept: Vec<DistilledMemory>, s: &DistillSettings) -> 
             id: Some(h.id.clone()),
             rank: h.rank(s),
             subagent: h.idempotency_key.starts_with(SUBAGENT_KEY_PREFIX),
+            fixed: !h.replaceable(),
         })
         .collect();
     let mut order: Vec<usize> = (0..kept.len()).collect();
@@ -383,11 +397,13 @@ pub fn place(held: &[Held], kept: Vec<DistilledMemory>, s: &DistillSettings) -> 
         }
         let subs = set.iter().filter(|x| x.subagent).count();
         let share_full = m.subagent && subs >= share;
+        let fixed = m.kind == Kind::Handoff;
         if set.len() < s.max_per_session && !share_full {
             set.push(Member {
                 id: None,
                 rank,
                 subagent: m.subagent,
+                fixed,
             });
             placed[i] = Some(None);
             continue;
@@ -395,19 +411,20 @@ pub fn place(held: &[Held], kept: Vec<DistilledMemory>, s: &DistillSettings) -> 
         let weakest = set
             .iter()
             .enumerate()
-            .filter(|(_, x)| !share_full || x.subagent)
+            .filter(|(_, x)| !x.fixed && (!share_full || x.subagent))
             .max_by(|(_, a), (_, b)| a.rank.order(&b.rank))
             .map(|(k, _)| k);
         if let Some(k) = weakest
             && rank.order(&set[k].rank) == Ordering::Less
         {
-            // Taken best first, a member of this run outranks every later one: the weakest is
-            // always a held memory.
+            // Taken best first, a member of this run outranks every later one: what it replaces
+            // is always a held memory.
             let out = set.swap_remove(k);
             set.push(Member {
                 id: None,
                 rank,
                 subagent: m.subagent,
+                fixed,
             });
             placed[i] = Some(out.id);
         }
@@ -3778,6 +3795,7 @@ mod tests {
             p: Some(m.p),
             subagent: Some(m.subagent),
             idempotency_key: m.idempotency_key.clone(),
+            protected: false,
         }
     }
 
@@ -4056,6 +4074,65 @@ mod tests {
         assert_eq!(ids, ["distill:d1", "distill:h1", "distill:h2"]);
     }
 
+    /// The Task 12c addendum: `distill:cap` never replaces the session's handoff, nor a protected
+    /// memory (one a person or an agent changed or links to). They still count toward the set's
+    /// size. When every member is protected, or none that may go is weaker, the newcomer is not
+    /// stored.
+    #[test]
+    fn the_cap_never_replaces_a_protected_memory() {
+        let s = caps(8, 3, 2);
+        let h = held_of(&kept_mem("h", Kind::Handoff, 0.71, false));
+        let protected = |m: DistilledMemory| Held {
+            protected: true,
+            ..held_of(&m)
+        };
+        let f1 = protected(kept_mem("f1", Kind::Fact, 0.72, false));
+        let f2 = held_of(&kept_mem("f2", Kind::Fact, 0.80, false));
+        let better = kept_mem("better", Kind::Fact, 0.95, false);
+        assert_eq!(
+            place(
+                &[h.clone(), f1.clone(), f2.clone()],
+                vec![better.clone()],
+                &s
+            ),
+            [Placement {
+                memory: better.clone(),
+                replaces: Some(f2.id.clone()),
+            }],
+            "the weakest that may go, not the protected weaker one"
+        );
+        // Two handoffs and a protected fact: nothing may go, so the newcomer is not stored.
+        let h2 = held_of(&kept_mem("h2", Kind::Handoff, 0.9, false));
+        assert!(
+            place(
+                &[h.clone(), h2.clone(), f1.clone()],
+                vec![better.clone()],
+                &s
+            )
+            .is_empty()
+        );
+        // A later handoff does not replace the session's handoff either, even a weaker one.
+        let later = kept_mem("later", Kind::Handoff, 0.95, false);
+        assert!(place(&[h.clone(), h2, f1.clone()], vec![later], &s).is_empty());
+        // A protected memory counts toward the size: with one free slot there is room for one.
+        let got = place(
+            &[h.clone(), f1.clone()],
+            vec![better.clone(), kept_mem("next", Kind::Fact, 0.9, false)],
+            &s,
+        );
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert_eq!(
+            (
+                got[0].memory.idempotency_key.as_str(),
+                got[0].replaces.as_deref()
+            ),
+            ("distill:better", None)
+        );
+        // None that may go is weaker.
+        let strong = held_of(&kept_mem("strong", Kind::Decision, 0.99, false));
+        assert!(place(&[h, f1, strong], vec![better], &s).is_empty());
+    }
+
     /// The brief: a memory distilled before migration 0008 has no stored rank inputs; it ranks
     /// as a main-session passage at `distill.min_confidence`.
     #[test]
@@ -4067,6 +4144,7 @@ mod tests {
             p: None,
             subagent: None,
             idempotency_key: "distill:old".into(),
+            protected: false,
         };
         assert_eq!(
             old.rank(&s),

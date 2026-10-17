@@ -31,7 +31,9 @@
 //!    `distill.budget_share`.
 //! 5. The kept passages fitted into the session's best set ([`distill::place`]: at most
 //!    `distill.max_per_session` live distilled memories, the best by rank; a better passage
-//!    replaces the weakest, trashed by `distill:cap`), then each written with [`write_memory`] in
+//!    replaces the weakest that may go, trashed by `distill:cap`, never a handoff nor a memory a
+//!    person or an agent touched; with none to replace it is not stored, and the run counts it
+//!    in `capped`), then each written with [`write_memory`] in
 //!    the project of the source it came from: redacted with that project's rules,
 //!    `origin = distill`, its rank inputs, its chunks as provenance and an idempotency key, so a
 //!    repeated run (a crash before the cursor moved) stores nothing twice.
@@ -205,7 +207,8 @@ pub struct RunReport {
     pub refused: usize,
     /// Memories of the session's best set that a stored one replaced (trashed by `distill:cap`).
     pub replaced: usize,
-    /// Kept passages not stored because they did not outrank the full set's weakest.
+    /// Kept passages not stored: the session's set is full, and every member they may replace is
+    /// protected (a handoff, or one a person or an agent touched) or none of them is weaker.
     pub capped: usize,
     /// When the run ended (RFC 3339).
     pub at: String,
@@ -765,6 +768,15 @@ impl DistillCtl {
             let n = memories.len();
             let placements = distill::place(&held, memories, &s.distill);
             report.capped = n - placements.len();
+            if report.capped > 0 {
+                tracing::info!(
+                    uri = src.uri,
+                    capped = report.capped,
+                    held = held.len(),
+                    protected = held.iter().filter(|h| !h.replaceable()).count(),
+                    "a session's set is full: kept passages that outrank no member it may replace are not stored"
+                );
+            }
             placements
         };
         for pl in &placements {
@@ -776,11 +788,20 @@ impl DistillCtl {
                 .find_map(|id| loaded.owner.get(id))
                 .map_or(src, |&i| &included[i].0);
             match write_memory(&self.ctx, m, owner, pl.replaces.as_deref()) {
-                Ok(InsertOutcome::New { .. }) => {
+                Ok(Some(InsertOutcome::New { .. })) => {
                     report.stored += 1;
                     report.replaced += usize::from(pl.replaces.is_some());
                 }
-                Ok(InsertOutcome::Duplicate { .. }) => report.duplicates += 1,
+                Ok(Some(InsertOutcome::Duplicate { .. })) => report.duplicates += 1,
+                // The member it was to replace was touched since the set was read: it keeps its
+                // slot, and this one is not stored.
+                Ok(None) => {
+                    report.capped += 1;
+                    tracing::info!(
+                        uri = src.uri,
+                        "a distilled passage was not stored: the member it was to replace is protected now"
+                    );
+                }
                 // The rules refuse its text (block mode), or the store refuses it: this one
                 // passage is left out.
                 Err(e @ (AliceError::Refused { .. } | AliceError::Invalid(_))) => {
@@ -1313,13 +1334,14 @@ pub(crate) fn distilled_since(conn: &Connection, since: &str) -> Result<(u64, u6
 /// key, `distill.importance`, its rank inputs, and the source's agent and session as the author,
 /// in the source's project (or `global` for a preference of the user's). When it takes the place
 /// of `replaces` in its session's best set, that memory is trashed by `distill:cap` in the same
-/// writer op (Task 12c).
+/// writer op (Task 12c). `None`: nothing was written, as `replaces` became a member the cap never
+/// replaces since the set was read (the Task 12c addendum).
 pub(crate) fn write_memory(
     ctx: &DistillCtx,
     m: &DistilledMemory,
     src: &CaptureState,
     replaces: Option<&str>,
-) -> Result<InsertOutcome> {
+) -> Result<Option<InsertOutcome>> {
     let (slug, tree) = ctx.readers.with(|c| {
         let slug = projects::get_by_id(c, &src.project_id)?.slug;
         let tree = projects::tree_of(c, &src.project_id);
@@ -1355,7 +1377,8 @@ pub(crate) fn write_memory(
         subagent: m.subagent,
         replaces: replaces.map(str::to_owned),
     })? {
-        WriteOutcome::Remembered(out, _) => Ok(out),
+        WriteOutcome::Remembered(out, _) => Ok(Some(out)),
+        WriteOutcome::Done => Ok(None),
         other => Err(AliceError::Other(format!(
             "unexpected writer outcome {}",
             other.name()

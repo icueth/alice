@@ -922,24 +922,42 @@ no lesson.
     a decision refined inside a session costs one slot, not two). They are found by their author: `write_memory` sets
     the author's agent and session from the source, and a subagent's source carries its session's agent and id, so the
     set holds the subagents' memories too, and raw retention, which deletes provenance with the chunks, cannot empty
-    it. The read uses the partial index `memories_distill_session` (migration 0008, §6.5).
+    it. The read uses the partial index `memories_distill_session` (migration 0008, §6.5). A memory that an explicit
+    exact copy promoted (§6.6) is no longer `origin = distill`: it is outside the set, neither counted nor replaceable.
   - **Every run is asked.** A session whose set is full is asked about every run, as any other, within
     `distill.budget_share`; compaction summaries are always asked (they lead the candidates, §6.3). Task 12b's "no Jev
     call once full" is gone: it kept a long session's first memories, never its best, and left its later compaction
     summaries unasked.
   - **Replacement.** A kept memory, taken best first, that the set holds already is written again (it comes back a
-    duplicate); with a free slot it is added; with the set full, it replaces the set's weakest live memory when it
-    outranks it. The replaced memory is trashed (a `memory.forget` by `distill:cap`, undoable like any trash; its
-    passage stays in the raw capture), and the new one is written, in one writer op. A kept memory that does not
-    outrank the weakest is not stored (the run report counts it `capped`). So the set never grows past its size, and
-    it is the best `max_per_session` of all the passages ever kept by the rank above, whatever their order (with the
-    per-run caps as the only exception, since they bound what one run brings).
+    duplicate); with a free slot it is added; with the set full, it replaces the set's weakest live memory that may go
+    when it outranks it. The replaced memory is trashed (a `memory.forget` by `distill:cap`, undoable like any trash;
+    its passage stays in the raw capture), and the new one is written, in one writer op. A kept memory that does not
+    outrank the weakest that may go, or finds none, is not stored (the run report counts it `capped`, and the worker
+    logs it). So the set never grows past its size, and, but for the members the cap may not replace, it is the best
+    `max_per_session` of all the passages ever kept by the rank above, whatever their order (with the per-run caps as
+    the only exception, since they bound what one run brings).
+  - **What the cap never replaces (Task 12c addendum, pane 4).** `distill:cap` never trashes the session's handoff,
+    nor a member a person or an agent touched since it was distilled. Such members still count toward the size (and a
+    subagent one toward the share), but are never the one that goes; when every member is one of them, or none that
+    may go is weaker, the newcomer is not stored. A member is touched (`store::capture::SESSION_HELD`) when:
+    - its history has an event on it by `user` or `agent:*`: an edit, move, archive, restore, undo, a merge into it,
+      or its use as the newer memory of a supersede. The events decide, not `updated_at`: the judge and distillation
+      move `updated_at` too, and it does not say who. The judge's, distillation's and maintenance's (`system`) events
+      protect nothing;
+    - a link points to it that the judge or distillation did not make (`links.created_by` not `judge:*` or
+      `distill:*`). A merge's `duplicate_of` link says `merge` whoever merged, so its `memory.merge_into` event's
+      actor decides instead;
+    - a fact cites it (`relations.source_memory_id`, which `assert_fact` sets for a person or an agent).
+    The writer reads the member again in the op that would trash it, as the worker's read may be stale: one touched
+    meanwhile keeps its slot, and nothing is written; one that left the set meanwhile (trashed, superseded, promoted)
+    left its slot free, so the newcomer is written and nothing is trashed. A protection lasts while its event is in
+    the history (`maintenance.events_days`, 365 by default, at least 30).
   - **The subagents' share.** Subagent reports (by the `distill:sub:` key) keep at most half of
     `distill.max_per_session`, rounded down (8 of 16), so the main session always has room. With the share full, a
     subagent report may replace only a subagent memory, even when the set has room.
-  - **The handoff.** It ranks first, so it always enters, replacing the weakest other memory when the set is full. A
-    later closing run's handoff enters too: "the latest handoff replaces the first" is for the backlog, so a session
-    can hold two. Task 12b's reserved handoff slot is gone: under replacement it would only keep one slot idle until a
+  - **The handoff.** It ranks first, so it enters, replacing the weakest memory that may go when the set is full; it
+    is not stored only when none may go (above). A later closing run's handoff enters too, but never in place of the
+    session's earlier handoff: "the latest handoff replaces the first" is for the backlog, so a session can hold two. Task 12b's reserved handoff slot is gone: under replacement it would only keep one slot idle until a
     handoff came, which then takes its place by replacement anyway.
   - **Memories distilled before 0008** have no stored rank inputs: they rank as main-session passages at
     `distill.min_confidence`.
@@ -1550,7 +1568,7 @@ a caveat the results state, as `m2-jev.md` does.
 | R13 | (Overruled by the controller.) **Tenants get the SessionStart briefing, bounded:** `curl --connect-timeout 1 --max-time 2`, plain stdout, nothing on any failure, exit 0; `capture.briefing` or `briefing=off` in `capture.conf` turns it off | The team uses only the server; without it they never get the briefing local users get | Up to 2 s at the start of a session when the server is slow or down |
 | R14 | **Distillation requires `judge.provider = jev`** | The judge is what removes duplicates of explicit memories; without it, near-copies would be stored or become review items | A person without the Jev judge gets raw capture only |
 | R15 | **`distill.provider` defaults to `off`** | Sending session text to a cloud model is opt-in in an open-source product; the owner turns it on in one command | New users get raw capture only until they opt in |
-| R16 | **At most 40 candidates per request and `max_per_run` (8) kept**, by priority (summaries, conclusions, user statements, subagent reports). Task 12c: the kept are ranked handoff first, then main session before subagents, then the p band (≥ 0.9, ≥ 0.8, below), then decision, bugfix, warning, fact, howto, preference, then p; `max_per_session` (16) is the size of the session's best set over all its runs and subagents, every run is asked, and a better passage replaces the weakest held one (trashed by `distill:cap`); `max_per_subagent_run` (2) subagent reports per run and half of `max_per_session` per session; a `preference_user` passage that names the project (its slug, name, folder or a path in it) stays in the project instead of `global`; a title is the first sentence, passing over `#` headings, and only when that is a table header, or 25 characters or fewer (a short heading or label), the first sentence after it that says more, at most 80 characters (§6.4, §6.5) | Bounded cost and no floods; compaction summaries and turn conclusions carry most lasting knowledge | A very long quiet-free stretch loses its lowest-priority candidates. A full session costs a request every run (within `distill.budget_share`), and a kept passage that does not outrank the set's weakest is not stored |
+| R16 | **At most 40 candidates per request and `max_per_run` (8) kept**, by priority (summaries, conclusions, user statements, subagent reports). Task 12c: the kept are ranked handoff first, then main session before subagents, then the p band (≥ 0.9, ≥ 0.8, below), then decision, bugfix, warning, fact, howto, preference, then p; `max_per_session` (16) is the size of the session's best set over all its runs and subagents, every run is asked, and a better passage replaces the weakest held one that may go (trashed by `distill:cap`; never a handoff, nor a memory a person or an agent edited, linked or cited after it was distilled); `max_per_subagent_run` (2) subagent reports per run and half of `max_per_session` per session; a `preference_user` passage that names the project (its slug, name, folder or a path in it) stays in the project instead of `global`; a title is the first sentence, passing over `#` headings, and only when that is a table header, or 25 characters or fewer (a short heading or label), the first sentence after it that says more, at most 80 characters (§6.4, §6.5) | Bounded cost and no floods; compaction summaries and turn conclusions carry most lasting knowledge | A very long quiet-free stretch loses its lowest-priority candidates. A full session costs a request every run (within `distill.budget_share`), and a kept passage that does not outrank the set's weakest that may go is not stored; a session whose set is all protected stores nothing more |
 | R17 | **Extractive distillation with `choice` questions only**, through the existing client | Jev has no text type; the client's cache, budget, redaction and gate are reused unchanged | Passages that need the conversation are dropped (lower recall); the eval measures it |
 | R18 | **A session already mined by MemPalace continues after the import's end time; the importer skips sessions SP2 holds** | MemPalace's chunks cannot be aligned with turns; a session must be held by one side | Sessions active during the cut-over may have a gap or overlap of a few minutes at the boundary |
 | R19 | **Distilled memories never open review items; an explicit memory beats a distilled duplicate; distilled ones never supersede explicit ones** | The review inbox is for what people and agents wrote; machine copies must never cost a person's attention or an explicit memory | An uncertain but real update of a distilled memory stays as two linked memories instead of a question; a distilled update of an explicit memory is trashed as its duplicate (Task 11b), and its passage stays in the raw capture, unless it holds more: more than twice its match's characters between the review and auto thresholds, or a number its match does not state at any probability, which keeps it, linked `relates_to` (Task 12c) |

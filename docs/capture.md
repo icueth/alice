@@ -278,8 +278,11 @@ distilled, newest first. Older ones, and sessions captured by a backfill, are di
 - **A session keeps its best.** `distill.max_per_session` (default 16) is the size of a session's best set, its runs
   and its subagents together, subagent reports at most half of it. Every run is asked about, a full session's too, so a
   better passage later in the session replaces the weakest one kept; the replaced memory goes to the trash (by
-  `distill:cap`, and you can restore it like any other), and its passage stays in the raw capture. A handoff always
-  gets in.
+  `distill:cap`, and you can restore it like any other), and its passage stays in the raw capture. A handoff gets in
+  in place of the weakest. The cap never replaces the session's handoff, nor a distilled memory that you or an agent
+  edited, moved, restored, linked to or cited in a fact after it was distilled; those keep their slots. When no
+  memory that may go is weaker, the new passage is not stored. A distilled memory you saved again word for word is
+  yours: it leaves the set and frees its slot.
 - **The memory.** The passage (at most 1,200 characters), titled with its first sentence, passing over `#` headings;
   when that is a table header, or 25 characters or fewer (a short heading or label), with the first sentence after it
   that says more (at most 80 characters). It gets a last line `Context: <your prompt's first sentence>` when it needs

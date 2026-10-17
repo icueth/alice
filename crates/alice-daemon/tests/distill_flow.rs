@@ -13,6 +13,8 @@
 use alice_core::api::*;
 use alice_core::embed::{Embedder, FakeEmbedder};
 use alice_core::judge::jev::{HttpReply, JevTransport, TransportError};
+use alice_core::model::Author;
+use alice_core::store::memories::{MemoryUpdate, UpdateAction};
 use alice_daemon::doctor::{Check, CheckStatus, daemon_checks};
 use alice_daemon::paths::AliceHome;
 use alice_daemon::service::{Service, ServiceOptions};
@@ -3022,6 +3024,202 @@ async fn a_full_session_keeps_its_best_memories() {
     assert_eq!(
         live(&d),
         ["Strong fact", "Strong fact", "Weaker fact", "Where things"]
+    );
+    d.shutdown();
+}
+
+/// The Task 12c addendum (pane 4): `distill:cap` never replaces a memory a person or an agent
+/// touched, nor the session's handoff; those still hold their slots. A memory an explicit exact
+/// copy promoted is no longer distilled: it holds no slot. When no member that may go is weaker
+/// (here: every one is protected), the newcomer is not stored, and the run's record counts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cap_never_replaces_what_a_person_or_an_agent_touched() {
+    let config =
+        "[judge]\nprovider = \"jev\"\n\n[distill]\nprovider = \"jev\"\nmax_per_session = 4\n";
+    let d = Daemon::start(
+        Opts {
+            config,
+            ..Opts::jev()
+        },
+        DistillScript::new(&[
+            ("Weak fact", "fact"),
+            ("Strong fact", "fact"),
+            ("Extra fact", "fact"),
+            ("Where things stand:", "handoff"),
+            ("Where we are now:", "handoff"),
+        ]),
+    );
+    *d.script.p_of.lock() = vec![
+        ("Weak fact", 0.72),
+        ("Strong fact", 0.95),
+        ("Extra fact", 0.99),
+        ("Where things stand:", 0.71),
+        ("Where we are now:", 0.95),
+    ];
+    let mut t = Transcript::default();
+    let mut turn = 0u64;
+    let mut add = |t: &mut Transcript, what: &str| {
+        turn += 1;
+        t.prompt(&format!("pt-p{turn}"), &format!("Go on {turn}."))
+            .reply(
+                &format!("pt-a{turn}"),
+                &format!("{what} {turn}: {}.", words(900 + turn, 18)),
+            );
+    };
+    let live = |d: &Daemon| -> Vec<Distilled> {
+        d.distilled()
+            .into_iter()
+            .filter(|m| m.status != "trashed" && m.status != "superseded")
+            .collect()
+    };
+    let agent = || Author {
+        agent: Some("claude-code".into()),
+        ..Default::default()
+    };
+    for _ in 0..4 {
+        add(&mut t, "Weak fact");
+    }
+    d.send("shop", "pt1", &t, 0, "stop").await;
+    d.svc.capture_distill_now("pt1").await.unwrap();
+    until("the first run is over", || d.svc.distill_runs().len() == 1).await;
+    let weak = live(&d);
+    assert_eq!(weak.len(), 4);
+
+    // The agent edits the first, cites the second as a fact's source, and saves the third again
+    // word for word (which makes it the agent's); the fourth is left alone.
+    d.svc
+        .update(UpdateRequest {
+            id: weak[0].id.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                title: Some("Weak fact, checked".into()),
+                ..Default::default()
+            },
+            author: agent(),
+        })
+        .await
+        .unwrap();
+    d.svc
+        .assert_fact(AssertFactRequest {
+            subject: "shop".into(),
+            predicate: "caches with".into(),
+            object: "redis".into(),
+            source_memory_id: Some(weak[1].id.clone()),
+            author: agent(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    d.svc
+        .remember(RememberRequest {
+            content: weak[2].body.clone(),
+            title: Some(weak[2].title.clone()),
+            kind: Some(alice_core::model::Kind::Fact),
+            cwd: Some(d.repo("shop").to_string_lossy().into_owned()),
+            author: agent(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let origin_of = |d: &Daemon, id: &str| -> (String, String) {
+        d.db()
+            .query_row(
+                "SELECT origin, status FROM memories WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_ne!(
+        origin_of(&d, &weak[2].id).0,
+        "distill",
+        "the copy promotes it"
+    );
+
+    // Three better passages: the promoted one left a free slot, and only the untouched one may
+    // make room; the third is not stored.
+    let off = t.len();
+    for _ in 0..3 {
+        add(&mut t, "Strong fact");
+    }
+    d.send("shop", "pt1", &t, off, "stop").await;
+    d.svc.capture_distill_now("pt1").await.unwrap();
+    until("the second run is over", || d.svc.distill_runs().len() == 2).await;
+    let run = d.svc.distill_runs()[1].clone();
+    assert_eq!((run.stored, run.replaced, run.capped), (2, 1, 1), "{run:?}");
+    let ids = |v: Vec<Distilled>| -> Vec<String> { v.into_iter().map(|m| m.id).collect() };
+    let now = ids(live(&d));
+    assert!(
+        now.contains(&weak[0].id) && now.contains(&weak[1].id),
+        "{now:?}"
+    );
+    assert!(!now.contains(&weak[3].id));
+    assert_eq!(origin_of(&d, &weak[3].id).1, "trashed");
+    let (origin, status) = origin_of(&d, &weak[2].id);
+    assert_ne!((origin.as_str(), status.as_str()), ("distill", "trashed"));
+    assert_ne!(status, "trashed");
+
+    // A compaction: its handoff enters in place of a strong passage nobody touched.
+    let off = t.len();
+    t.prompt("pt-hp", "Where are we?").reply("pt-ha", HANDOFF);
+    d.send("shop", "pt1", &t, off, "pre-compact").await;
+    until("the third run is over", || d.svc.distill_runs().len() == 3).await;
+    let held = live(&d);
+    assert_eq!(held.len(), 4);
+    let handoff = held
+        .iter()
+        .find(|m| m.kind == "handoff")
+        .unwrap()
+        .id
+        .clone();
+    let strong = held
+        .iter()
+        .find(|m| m.body.starts_with("Strong fact"))
+        .unwrap()
+        .id
+        .clone();
+    d.svc
+        .update(UpdateRequest {
+            id: strong.clone(),
+            update: MemoryUpdate {
+                action: UpdateAction::Edit,
+                title: Some("Strong fact, checked".into()),
+                ..Default::default()
+            },
+            author: agent(),
+        })
+        .await
+        .unwrap();
+
+    // Every member is protected now: a later compaction's handoff does not replace the
+    // session's, and a better fact replaces nothing. Neither is stored; the run counts them.
+    let trashed_before = d
+        .distilled()
+        .iter()
+        .filter(|m| m.status == "trashed")
+        .count();
+    let off = t.len();
+    add(&mut t, "Extra fact");
+    t.prompt("pt-hp2", "And now?").reply(
+        "pt-ha2",
+        "Where we are now: the redis cache is checked, and next we size its memory for the nightly load.",
+    );
+    d.send("shop", "pt1", &t, off, "pre-compact").await;
+    until("the last run is over", || d.svc.distill_runs().len() == 4).await;
+    let run = d.svc.distill_runs()[3].clone();
+    assert!(run.questions > 0, "{run:?}");
+    assert_eq!((run.stored, run.replaced, run.capped), (0, 0, 2), "{run:?}");
+    let mut after = ids(live(&d));
+    let mut want = vec![weak[0].id.clone(), weak[1].id.clone(), strong, handoff];
+    after.sort();
+    want.sort();
+    assert_eq!(after, want);
+    assert_eq!(
+        d.distilled()
+            .iter()
+            .filter(|m| m.status == "trashed")
+            .count(),
+        trashed_before
     );
     d.shutdown();
 }
