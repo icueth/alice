@@ -683,6 +683,14 @@ impl DistillCtl {
                 projects.push(kslug);
             }
         }
+        // Redacted whole, with every covered project's always-on rules, before `prepare` cuts
+        // excerpts and passages from them: a store that keeps secrets as written holds keys
+        // whole, and a cut through one would reach Jev as a fragment no detector knows (owner's
+        // decision 2026-10-17). Stored chunks stay as they are; the memories written from this
+        // run never hold a secret.
+        for c in &mut loaded.chunks {
+            c.text = judge.redact_for(&projects, &c.text);
+        }
         let input = RunInput {
             uri: src.uri.clone(),
             project: slug.clone(),

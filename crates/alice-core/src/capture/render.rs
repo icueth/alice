@@ -811,10 +811,15 @@ fn pack(pieces: &[Piece], chunk_chars: usize) -> Vec<RenderedChunk> {
 }
 
 /// Cuts an oversized block into lines that fit: at paragraph ends, then sentence ends and line
-/// ends, then hard, but not inside a token. The first line is `tag text`; the others start
-/// `tag (cont.) `.
+/// ends, else at the start of the token the limit falls in, never inside a token-like run. A
+/// token too long for any line is replaced by the trim marker first ([`drop_long_tokens`]). The
+/// first line is `tag text`; the others start `tag (cont.) `.
 fn split_block(tag: &str, body: &str, cap: usize) -> Vec<String> {
     let mut parts = Vec::new();
+    let room = cap
+        .saturating_sub(format!("{tag} (cont.) ").chars().count())
+        .max(1);
+    let body = drop_long_tokens(body, room);
     let mut rest = body.trim();
     let mut first = true;
     loop {
@@ -853,11 +858,52 @@ fn prefix_len(text: &str, max_chars: usize, max_bytes: usize) -> usize {
     end.max(text.chars().next().map_or(0, char::len_utf8))
 }
 
+/// `body` with every token-like run ([`is_token_char`]) longer than `max` characters replaced by
+/// the trim marker. Such a run fits no line of a chunk, and the pieces of a cut one are text no
+/// detector knows: a store that keeps secrets as written holds keys whole (owner's decision
+/// 2026-10-17), and a key in two chunks would reach a cloud request as two fragments. A marker
+/// that would start a line gets one space in front, as any body line that would start with `[`.
+fn drop_long_tokens(body: &str, max: usize) -> Cow<'_, str> {
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut run: Option<(usize, usize)> = None;
+    let flush = |out: &mut String, copied: &mut usize, start: usize, end: usize, chars: usize| {
+        if chars > max {
+            out.push_str(&body[*copied..start]);
+            if start == 0 || body[..start].ends_with('\n') {
+                out.push(' ');
+            }
+            out.push_str(&marker(chars));
+            *copied = end;
+        }
+    };
+    for (i, c) in body.char_indices() {
+        match (&mut run, is_token_char(c)) {
+            (Some((_, n)), true) => *n += 1,
+            (None, true) => run = Some((i, 1)),
+            (Some((start, n)), false) => {
+                flush(&mut out, &mut copied, *start, i, *n);
+                run = None;
+            }
+            (None, false) => {}
+        }
+    }
+    if let Some((start, n)) = run {
+        flush(&mut out, &mut copied, start, body.len(), n);
+    }
+    if copied == 0 && out.is_empty() {
+        return Cow::Borrowed(body);
+    }
+    out.push_str(&body[copied..]);
+    Cow::Owned(out)
+}
+
 /// Where to cut `rest` within its first `limit` bytes (a block's next stretch, the window):
 /// after the window's last paragraph break, else after its last sentence end or line break,
 /// else at `limit`, moved back to the start of a token the cut would fall inside. A cut in the
-/// window's first quarter is not used, so a piece is never a sliver: a token longer than three
-/// quarters of a chunk is cut hard (its block was redacted whole before any cut).
+/// window's first quarter is not used, so a piece is never a sliver, unless the only cut that is
+/// not inside a token is there: a token is never cut (owner's decision 2026-10-17; a token
+/// longer than a whole line was replaced by the trim marker before, [`drop_long_tokens`]).
 fn cut_point(rest: &str, limit: usize) -> usize {
     let window = &rest[..limit];
     let floor = window.len() / 4;
@@ -875,9 +921,18 @@ fn cut_point(rest: &str, limit: usize) -> usize {
     .into_iter()
     .flatten()
     .max();
+    let token = token_start(rest, limit);
     sentence
         .filter(|&c| c > floor)
-        .or_else(|| Some(token_start(rest, limit)).filter(|&c| c > floor))
+        .or_else(|| Some(token).filter(|&c| c > floor))
+        .or_else(|| {
+            [paragraph, sentence, Some(token)]
+                .into_iter()
+                .flatten()
+                .filter(|&c| c > 0)
+                .max()
+        })
+        // Only a run longer than the window starts here, which `drop_long_tokens` removed.
         .unwrap_or(limit)
 }
 
@@ -1218,6 +1273,53 @@ mod tests {
         let xs: usize = chunks.iter().map(|c| c.text.matches('x').count()).sum();
         assert_eq!(xs, 570);
         assert!(chunks[2].text.starts_with("[assistant] (cont.) "));
+    }
+
+    /// Owner's decision 2026-10-17: a store that keeps secrets renders without a redactor's
+    /// help, so no chunk cut may fall inside a token-like run. A token that straddles a cut
+    /// moves whole to the next piece, even when the piece before is short; one too long for any
+    /// line is replaced by the trim marker. Nothing else is lost.
+    #[test]
+    fn a_chunk_cut_never_splits_a_token() {
+        let opts = ReadOptions {
+            chunk_chars: 500,
+            ..closed()
+        };
+        let key = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        // A JWT-like token longer than three quarters of a chunk, after a little prose: the old
+        // rule cut it hard.
+        let long_token = format!("eyJ{}", "aB3-_x".repeat(75));
+        let body = format!(
+            "{} {key} {} then {long_token} and after it {} and finally {}",
+            "word ".repeat(95),
+            "more ".repeat(2),
+            "tail ".repeat(30),
+            "z-".repeat(450),
+        );
+        let input = block_input(&[("user", "Q."), ("assistant", &body)]);
+        let out = read(CLAUDE, &input, &opts);
+        let chunks = &out.turns[0].chunks;
+        assert!(chunks.iter().all(|c| c.text.chars().count() <= 500));
+        let tokens: Vec<&str> = chunks
+            .iter()
+            .flat_map(|c| c.text.split(|ch: char| !is_token_char(ch)))
+            .filter(|t| !t.is_empty())
+            .collect();
+        assert!(tokens.contains(&key), "the key is whole in one chunk");
+        assert!(
+            tokens.contains(&long_token.as_str()),
+            "the long token is whole"
+        );
+        for t in &tokens {
+            let piece_of = |whole: &str| *t != whole && t.len() >= 5 && whole.contains(t);
+            assert!(!piece_of(key), "a piece of the key: {t}");
+            assert!(!piece_of(&long_token), "a piece of the long token: {t}");
+        }
+        // 900 characters of one run fit no 500-character line: replaced, never cut.
+        assert!(!tokens.iter().any(|t| t.starts_with("z-z")), "{tokens:?}");
+        let all: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert!(all.contains("[… 900 characters trimmed …]"), "{all}");
+        assert!(all.contains("and finally"));
     }
 
     #[test]
@@ -1612,8 +1714,10 @@ mod tests {
             assert!(text.contains(" characters trimmed …]"), "{case}: {text}");
         }
 
-        // A hard cut through one long token with no space (and no base64 run, which would be
-        // binary): a 500-character chunk cuts the first piece at 488, 70 into the key's body.
+        // One long token with no space (and no base64 run, which would be binary), where the
+        // old rule cut hard at 488, 70 into the key's body. No cut falls inside a token any more
+        // (owner's decision 2026-10-17): redacted whole first, the run before the marker fits a
+        // line and the run after it, longer than any line, is replaced by the trim marker.
         let lead = format!("{}zOPENAI_API_KEY=", "z_".repeat(197));
         let line = format!("{lead}{KEY}={}", "z_".repeat(500));
         assert_eq!(lead.len() + KEY_PREFIX + 70, 500 - "[assistant] ".len());
@@ -1624,16 +1728,23 @@ mod tests {
         };
         let out = read_redacted(CLAUDE, &input, &opts, &r);
         let chunks = &out.turns[0].chunks;
-        assert!(chunks.len() >= 3, "{chunks:?}");
-        assert_no_key_fragment(chunks, "hard cut");
+        assert_no_key_fragment(chunks, "long token");
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.text.contains(" characters trimmed …]")),
+            "{chunks:?}"
+        );
 
-        // The order this replaces, each chunk redacted after the cut, kept the key's rest.
-        let late: Vec<String> = read(CLAUDE, &input, &opts).turns[0]
-            .chunks
-            .iter()
-            .map(|c| r.apply(&c.text).text)
-            .collect();
-        assert!(late.iter().any(|t| key_fragment(t, 10).is_some()));
+        // Without a redactor (a store that keeps secrets as written) the run is not cut either:
+        // longer than any line, it is replaced whole, so no chunk holds a piece of the key. (The
+        // old order, each chunk cut first, kept the key's rest in a chunk of its own.)
+        let kept = read(CLAUDE, &input, &opts).turns[0].chunks.clone();
+        assert!(
+            kept.iter()
+                .all(|c| key_fragment(&c.text, 10).is_none() && !c.text.contains(KEY)),
+            "{kept:?}"
+        );
     }
 
     #[test]

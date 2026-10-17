@@ -420,6 +420,16 @@ pub trait Judge: Send + Sync {
         self.grade_relevance(query_project, query, results)
     }
 
+    /// `text` as this judge would let it leave for `projects`: redacted with the always-on
+    /// rules of every one of them when the judge sends text away (Jev), as it is otherwise.
+    /// For a caller that cuts text before it asks (distillation's excerpts and passages): a
+    /// store that keeps secrets as written holds keys whole, and a key cut first would leave a
+    /// fragment no detector knows (owner's decision 2026-10-17). Redaction is idempotent, so
+    /// the request's own redaction changes nothing more.
+    fn redact_for(&self, _projects: &[&str], text: &str) -> String {
+        text.to_string()
+    }
+
     /// Distillation's way into a model judge (SP2 spec §6.4, §6.7): `questions` about `state`,
     /// a run of a session of `projects`, answered as one request. A judge that sends text away
     /// gates and redacts it as it does every call; it bills the call to distillation's own

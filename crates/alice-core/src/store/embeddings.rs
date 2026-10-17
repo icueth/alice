@@ -148,6 +148,23 @@ pub fn missing(
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// The title and body of memory `seq` while it still holds the text stamped `stamp`; `None` once
+/// it changed or is gone.
+pub fn memory_fields_if_current(
+    conn: &Connection,
+    seq: i64,
+    stamp: &str,
+) -> Result<Option<(String, String)>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT title, body FROM memories WHERE seq = ?1 AND content_hash = ?2",
+            params![seq, stamp],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+
 /// Store `model`'s vector if the row still holds the text stamped `stamp`; `embed_state` (which
 /// belongs to the active model) is not touched. Returns whether it applied.
 pub fn put_model_if_current(

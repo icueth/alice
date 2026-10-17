@@ -580,17 +580,8 @@ impl JevJudge {
     /// state, the instructions and the option descriptions are redacted with the rules of
     /// every one of those projects first.
     pub fn request_body(&self, projects: &[&str], state: &str, questions: &[Question]) -> Vec<u8> {
-        let redactors: Vec<Arc<Redactor>> = distinct(projects.iter().copied())
-            .into_iter()
-            .map(|p| self.policy.redactor(p))
-            .collect();
-        let redact = |text: &str| -> String {
-            let mut out = text.to_string();
-            for r in &redactors {
-                out = r.apply(&out).text;
-            }
-            out
-        };
+        let redactors = self.redactors_for(projects);
+        let redact = |text: &str| redact_with(&redactors, text);
         let state = redact(state);
         let questions: Vec<Question> = questions
             .iter()
@@ -1042,6 +1033,45 @@ impl JevJudge {
     }
 }
 
+/// `text` through every redactor of `redactors`, in turn.
+fn redact_with(redactors: &[Arc<Redactor>], text: &str) -> String {
+    let mut out = text.to_string();
+    for r in redactors {
+        out = r.apply(&out).text;
+    }
+    out
+}
+
+impl JevJudge {
+    /// The always-on redactors of every project in `projects`, the ones a request is redacted
+    /// with.
+    fn redactors_for(&self, projects: &[&str]) -> Vec<Arc<Redactor>> {
+        distinct(projects.iter().copied())
+            .into_iter()
+            .map(|p| self.policy.redactor(p))
+            .collect()
+    }
+
+    /// `m` as a request may show it: its title and body redacted for `projects` *before* a
+    /// memory block cuts them to 200 and `body_chars` characters (owner's decision 2026-10-17).
+    /// A store that keeps secrets as written holds them whole, and a cut through one would leave
+    /// a fragment no detector knows. A text short enough not to be cut is left as it is: the
+    /// whole request is redacted again in [`request_body`](Self::request_body), so a request's
+    /// bytes change only where a text that is cut held a secret.
+    fn screened(&self, projects: &[&str], m: &JudgeMemory, body_chars: usize) -> JudgeMemory {
+        let redactors = self.redactors_for(projects);
+        let cut = |text: &str, n: usize| text.chars().count() > n;
+        let mut out = m.clone();
+        if cut(&m.title, super::verbal::TITLE_CHARS) {
+            out.title = redact_with(&redactors, &m.title);
+        }
+        if cut(&m.body, body_chars) {
+            out.body = redact_with(&redactors, &m.body);
+        }
+        out
+    }
+}
+
 impl Judge for JevJudge {
     fn provider(&self) -> &str {
         "jev"
@@ -1058,6 +1088,10 @@ impl Judge for JevJudge {
             .as_ref()
             .filter(|(day, _)| *day == today)
             .map(|(_, msg)| msg.clone())
+    }
+
+    fn redact_for(&self, projects: &[&str], text: &str) -> String {
+        redact_with(&self.redactors_for(projects), text)
     }
 
     /// Refused: free text has no project, and "no project" would be taken for `global`, which
@@ -1107,6 +1141,15 @@ impl Judge for JevJudge {
             return Ok(Vec::new());
         }
         let now = self.now();
+        let projects = distinct(
+            std::iter::once(new.project.as_str())
+                .chain(existing.iter().map(|e| e.project.as_str())),
+        );
+        let new = &self.screened(&projects, new, super::verbal::BODY_CHARS);
+        let existing: Vec<JudgeMemory> = existing
+            .iter()
+            .map(|e| self.screened(&projects, e, super::verbal::BODY_CHARS))
+            .collect();
         let mut state = memory_block("New memory", new, now);
         let mut questions = Vec::new();
         for (n, e) in existing.iter().enumerate() {
@@ -1124,10 +1167,6 @@ impl Judge for JevJudge {
                 options: reverse_relation_choices(),
             });
         }
-        let projects = distinct(
-            std::iter::once(new.project.as_str())
-                .chain(existing.iter().map(|e| e.project.as_str())),
-        );
         let answers = self.ask(&projects, &state, &questions)?;
         Ok(existing
             .iter()
@@ -1168,11 +1207,9 @@ impl Judge for JevJudge {
     }
 
     fn classify_kind(&self, m: &JudgeMemory) -> JudgeResult<Distribution> {
-        self.classify_in(
-            &[m.project.as_str()],
-            &kind_state(m, self.now()),
-            &kind_choices(),
-        )
+        let projects = [m.project.as_str()];
+        let m = self.screened(&projects, m, super::verbal::BODY_CHARS);
+        self.classify_in(&projects, &kind_state(&m, self.now()), &kind_choices())
     }
 
     fn route_project(
@@ -1192,11 +1229,12 @@ impl Judge for JevJudge {
             .map(|p| Choice::new(&p.slug, &format!("{}: {}", p.name, p.hint)))
             .chain([Choice::new(UNSCOPED, "not about any one project")])
             .collect();
+        let m = self.screened(&covered, m, super::verbal::BODY_CHARS);
         self.classify_in(
             &covered,
             &format!(
                 "Which project does this memory belong to?\n\n{}",
-                memory_block("Memory", m, self.now())
+                memory_block("Memory", &m, self.now())
             ),
             &options,
         )
@@ -1265,6 +1303,9 @@ impl JevJudge {
             return Ok(Vec::new());
         }
         let now = self.now();
+        let projects = distinct(
+            std::iter::once(query_project).chain(results.iter().map(|r| r.project.as_str())),
+        );
         let mut state = format!("Query: {query}\n");
         let mut questions = Vec::new();
         for (i, r) in results.iter().enumerate() {
@@ -1277,7 +1318,7 @@ impl JevJudge {
             };
             state.push_str(&super::verbal::memory_block_bounded(
                 &format!("Result {k}"),
-                r,
+                &self.screened(&projects, r, bound),
                 now,
                 bound,
             ));
@@ -1287,9 +1328,6 @@ impl JevJudge {
                 options: relevance_choices(),
             });
         }
-        let projects = distinct(
-            std::iter::once(query_project).chain(results.iter().map(|r| r.project.as_str())),
-        );
         let answers = match budget {
             None => self.ask(&projects, &state, &questions)?,
             Some(b) => self.ask_with(&projects, &state, &questions, 0, b)?,
@@ -2070,6 +2108,60 @@ mod tests {
         assert!(
             sent.contains("[REDACTED:github_token]") && !sent.contains("ghp_"),
             "{sent}"
+        );
+    }
+
+    /// Owner's decision 2026-10-17: a store that keeps secrets as written hands the judge whole
+    /// keys. A key that straddles a memory block's cut (a title's 200 characters, a body's 700,
+    /// a raw chunk's 2,000 in precise recall) is redacted before the cut, so no fragment the
+    /// detectors no longer know reaches Jev; a text that is not cut is sent as before.
+    #[test]
+    fn a_key_across_a_blocks_cut_is_redacted_before_the_cut() {
+        let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+        let tail = &token[4..14];
+        let across =
+            |n: usize| format!("{}{token} and more words after it", "w".repeat(n - 6) + " ");
+        let sent = |s: &Scripted| {
+            s.calls
+                .lock()
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let s = Scripted::ok();
+        let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
+        let (mut new, existing) = scenarios::compare_case();
+        new.body = across(super::super::verbal::BODY_CHARS);
+        new.title = across(super::super::verbal::TITLE_CHARS);
+        let _ = j.compare(&new, &existing);
+        let mut kind = scenarios::kind_case();
+        kind.body = across(super::super::verbal::BODY_CHARS);
+        let _ = j.classify_kind(&kind);
+        let (query, mut results) = scenarios::relevance_case();
+        results[0].raw = true;
+        results[0].body = across(super::super::verbal::RAW_BODY_CHARS);
+        let _ = j.grade_relevance("alice", &query, &results);
+        let out = sent(&s);
+        assert_eq!(s.calls.lock().len(), 3, "three requests");
+        assert!(!out.contains("ghp_") && !out.contains(tail), "{out}");
+        // The markers are cut where the keys were.
+        assert!(out.contains("[REDA…"), "{out}");
+
+        // Clean text is cut exactly as before.
+        let s = Scripted::ok();
+        let j = judge(s.clone(), Arc::new(MemoryJevStore::default()), cfg());
+        let (mut new, existing) = scenarios::compare_case();
+        new.body = "plain words ".repeat(100);
+        let _ = j.compare(&new, &existing);
+        let expected =
+            crate::normalize::truncate_chars(&new.body, super::super::verbal::BODY_CHARS);
+        assert!(
+            s.calls.lock()[0]["state"]
+                .as_str()
+                .unwrap()
+                .contains(&expected),
+            "the cut of clean text did not change"
         );
     }
 
