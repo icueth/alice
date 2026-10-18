@@ -590,6 +590,10 @@ pub struct ServiceOptions {
     /// A transcript idle this long gets a final pass, and its source ends (an agent that
     /// crashed sends no `SessionEnd`).
     pub capture_stale: Duration,
+    /// A transcript holding bytes past its source's cursor (a turn no pass could close) that is
+    /// idle this long gets that final pass sooner, ended source or not: the session was left
+    /// mid-turn (the tenant script's 6-hour rule).
+    pub capture_abandoned: Duration,
     /// Tests only: the capture slice write after this many fails once, as a daemon killed
     /// between two slices of a pass would leave it.
     pub capture_fail_after_slices: Option<usize>,
@@ -636,6 +640,7 @@ impl Default for ServiceOptions {
             capture_sweep_every: Duration::from_secs(60),
             capture_quiet: Duration::from_secs(5 * 60),
             capture_stale: Duration::from_secs(24 * 3600),
+            capture_abandoned: crate::capture::ABANDONED,
             capture_fail_after_slices: None,
             codex_home: None,
         }
@@ -1534,6 +1539,7 @@ impl Service {
                     sweep_every: opts.capture_sweep_every,
                     quiet: opts.capture_quiet,
                     stale: opts.capture_stale,
+                    abandoned: opts.capture_abandoned,
                     codex_home: opts.codex_home.clone(),
                 },
             );
@@ -4715,6 +4721,7 @@ impl Service {
         let model_loaded = self.embedder().is_loaded();
         let memory_bytes = crate::doctor::self_memory_bytes();
         let unrecognised_lines = self.capture.unrecognised_lines_7d();
+        let bookkeeping_lines = self.capture.bookkeeping_lines_7d();
         let distill = self.distill.clone();
         let capture_counts = self.capture_counts();
         let capture_settings = self.settings();
@@ -4772,6 +4779,7 @@ impl Service {
                         c,
                         &capture_settings,
                         unrecognised_lines,
+                        bookkeeping_lines,
                         capture_counts,
                     )?,
                 )?,

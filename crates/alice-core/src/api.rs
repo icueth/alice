@@ -704,6 +704,11 @@ pub struct CaptureHealth {
     /// Transcript lines of a shape the reader did not recognise in the last 7 days (a hint that
     /// an agent's format changed). Counted in memory: it starts from zero with the daemon.
     pub unrecognised_lines_7d: u64,
+    /// Transcript lines of a type the reader does not know that carry no conversation key, in
+    /// the last 7 days: bookkeeping a newer agent build added, dropped and never counted in
+    /// `unrecognised_lines_7d`. Counted in memory, like it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bookkeeping_lines_7d: u64,
     /// Codex sessions whose hook gave no transcript path and whose rollout was not found
     /// (spec §4.2), since the daemon started.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -821,8 +826,8 @@ pub struct TranscriptAnswer {
     /// are fail-closed for now (the upload waits, nothing is stored or skipped), a new
     /// subagent's transcript is still too short to judge as a whole, or the body holds no
     /// complete turn. The client keeps that offset and does not send again until the file has
-    /// grown (its next hook event). An `oversized_line` answer equals it too, but there the
-    /// client skips the line.
+    /// grown (its next hook event), unless `waiting` says the rules wait. An `oversized_line`
+    /// answer equals it too, but there the client skips the line.
     pub next_offset: u64,
     pub turns_stored: u64,
     /// Turns that were stored already, or not stored by the rules (an excluded project, or a
@@ -836,6 +841,12 @@ pub struct TranscriptAnswer {
     /// (the project's rules wait, say), so the client knows the end did not land.
     #[serde(default)]
     pub ended: bool,
+    /// The project's capture rules are not known right now (they fail closed: a configuration
+    /// that does not load, or a change still settling), so nothing was taken in and nothing
+    /// ended. Send the same bytes again later, even when the file does not grow: a session end
+    /// that met this has not landed. Sent only when set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub waiting: bool,
 }
 
 /// `POST /api/v1/capture/notify` (SP2 spec §4.1, §4.2): an agent hook fired, so the local
