@@ -54,6 +54,11 @@ strsim = "0.11.1"
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 tar = { version = "0.4.46", default-features = false }
 
+# Debug and test builds keep line tables only (file and line in panics and backtraces), not full
+# debug info: a workspace build with full debug info is tens of GB, and one per worktree filled the disk.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 4
