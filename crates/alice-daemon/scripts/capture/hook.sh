@@ -357,11 +357,12 @@ hook_main() {
       fi
       ;;
   esac
-  # A subagent's own transcript is its own source; anything less is the main session's.
-  if [ "$h_event" != subagent-stop ] || ! valid_id "$h_sub" || [ "$h_agent" = codex ]; then
+  # A subagent's own transcript is its own source; anything less is the main session's. Codex
+  # names a sub-agent's own rollout the same way (its session_id is the parent's).
+  if [ "$h_event" != subagent-stop ] || ! valid_id "$h_sub"; then
     h_sub=
   fi
-  case $h_subpath in /*) ;; *) h_sub= ;; esac
+  case $h_subpath in /*.zst) h_sub= ;; /*) ;; *) h_sub= ;; esac
   if [ -f "$0" ]; then
     if [ -n "$h_sub" ]; then
       nohup sh "$0" run "$h_agent" "$h_event" "$h_session" "$h_path" "$h_cwd" "$h_sub" "$h_subpath" \
@@ -868,6 +869,40 @@ capture_one() {
   return 0
 }
 
+# The subagent transcripts Claude Code wrote for main session $1 (transcript $2, working
+# directory $3) that no state knows yet. A subagent killed in its first run (an app restart, a
+# limit hit) never sends SubagentStop, so its session's events find it. Each is sent as a sweep
+# sends a transcript, under the state key SubagentStop uses (a later SubagentStop goes on from
+# there, and nothing is stored twice), and then follows the rules of any state (the 6-hour
+# close among them). At most $dv_left uploads per event; the rest wait for a later one.
+discover() {
+  dv_dir=${2%.jsonl}/subagents
+  [ -d "$dv_dir" ] || return 0
+  for dv_f in "$dv_dir"/agent-*.jsonl; do
+    [ "$dv_left" -gt 0 ] || return 0
+    [ -f "$dv_f" ] || continue
+    dv_id=${dv_f##*/agent-}
+    dv_id=${dv_id%.jsonl}
+    valid_id "$dv_id" || continue
+    [ ! -f "$STATE/claude-code-$1-$dv_id.offset" ] || continue
+    capture_one "claude-code-$1-$dv_id" sweep "$1" "$dv_id" "$dv_f" "$3" 0
+    if [ -n "$co_sent" ]; then dv_left=$((dv_left - 1)); fi
+  done
+}
+
+# The SessionStart sweep's search for lost subagents: those of every main Claude Code session
+# that has a state.
+discover_all() {
+  for da_st in "$STATE"/claude-code-*.offset; do
+    [ "$dv_left" -gt 0 ] || return 0
+    [ -f "$da_st" ] || continue
+    read_state "$da_st" || continue
+    [ -z "$s_sub" ] && [ -z "$s_stopped" ] && valid_id "$s_session" || continue
+    [ -d "${s_path%.jsonl}/subagents" ] || continue
+    discover "$s_session" "$s_path" "$s_cwd"
+  done
+}
+
 # SessionStart: finish up to five other transcripts that grew while nothing sent them, or that
 # were left held for 6 hours.
 sweep() {
@@ -950,6 +985,13 @@ run_main() {
   fi
   if [ "$r_event" = session-start ]; then
     sweep "$r_agent-$r_session"
+  fi
+  # A main Claude Code session's event looks for its subagents that no state knows (the
+  # SessionStart sweep for every session's), at most SWEEP_MAX uploads.
+  dv_left=$SWEEP_MAX
+  if [ "$r_agent" = claude-code ] && [ -z "$r_sub" ] && [ -n "$r_path" ]; then
+    discover "$r_session" "$r_path" "$r_cwd"
+    if [ "$r_event" = session-start ]; then discover_all; fi
   fi
   return 0
 }

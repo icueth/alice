@@ -1781,6 +1781,233 @@ async fn a_sweep_does_not_pair_a_vanished_codex_rollout_with_another_file() {
     assert_eq!(env.offset(&format!("codex-{sid}")), Some(50));
 }
 
+// ---- Subagents found by their session (follow-up 2) ----
+
+/// The transcript of subagent `agent` of session `sess`, where Claude Code writes it:
+/// `<session transcript without .jsonl>/subagents/agent-<id>.jsonl`. Its one turn is complete
+/// and long enough to keep (over 200 characters), naming `marker`; with `held`, it ends instead on
+/// a tool call that never got its result.
+fn subagent_file(sess: &Session, agent: &str, marker: &str, held: bool) -> (PathBuf, Transcript) {
+    let path = sess
+        .path
+        .with_extension("")
+        .join(format!("subagents/agent-{agent}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut t = Transcript::subagent(agent);
+    let id = format!("{}-{agent}", sess.id);
+    t.prompt(
+        &format!("{id}-p"),
+        &format!(
+            "Survey {marker} and report. {}",
+            "Look at every module and its tests. ".repeat(6)
+        ),
+    );
+    if held {
+        t.line(json!({"type": "assistant", "uuid": format!("{id}-a"),
+            "message": {"id": format!("msg-{id}-a"), "role": "assistant", "content": [
+                {"type": "tool_use", "id": format!("toolu_{id}"), "name": "Bash",
+                 "input": {"command": format!("sleep {marker}")}}]}}));
+    } else {
+        t.reply(
+            &format!("{id}-a"),
+            &format!(
+                "Report on {marker}: {}",
+                "the module reads and renders turns. ".repeat(6)
+            ),
+        );
+    }
+    std::fs::write(&path, &t.bytes).unwrap();
+    (path, t)
+}
+
+fn sub_uri(session: &str, agent: &str) -> String {
+    format!("claude-code:session:{session}:agent:{agent}")
+}
+
+/// Follow-up 2: a subagent killed in its first run never sends SubagentStop. Its main session's
+/// next event finds its transcript: here the SessionStart sweep of a new session, after the
+/// killed session's last Stop. It is sent under the state key SubagentStop uses, so the
+/// SubagentStop that comes later (a resumed subagent) goes on from there and stores nothing
+/// twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subagent_killed_in_its_first_run_is_found_by_a_later_event() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    let mut main = Session::new(&env, "killed", &cwd);
+    main.turn(1, "the main session");
+    env.hook(&main.input("Stop"));
+    env.wait_idle();
+    // The subagent ran after that Stop and was killed: no SubagentStop, no main event either.
+    let (sub_path, mut sub) = subagent_file(&main, "agentk1", "subquokka", false);
+    let key = "claude-code-killed-agentk1";
+    assert!(!env.state_file(key).exists());
+
+    env.hook(&Session::new(&env, "killednext", &cwd).input("SessionStart"));
+    env.wait_idle();
+    assert!(env.state_file(key).exists(), "{}", env.log());
+    assert_eq!(turns_of(&t.home, &sub_uri("killed", "agentk1")), 1);
+    assert_eq!(env.offset(key), Some(sub.len()));
+    let ups: Vec<_> = uploads(&s, "killed")
+        .into_iter()
+        .filter(|q| q.get("subagent").map(String::as_str) == Some("agentk1"))
+        .collect();
+    assert_eq!(ups.len(), 1);
+    assert_eq!(ups[0]["event"], "sweep");
+
+    // It is resumed (SendMessage) and stops this time: only the new turn is stored.
+    sub.prompt("killed-agentk1-p2", "Now the second part.")
+        .reply(
+            "killed-agentk1-a2",
+            &format!(
+                "Second report: {}",
+                "the cursor moves turn by turn. ".repeat(6)
+            ),
+        );
+    std::fs::write(&sub_path, &sub.bytes).unwrap();
+    let mut stop = main.input("SubagentStop");
+    stop["agent_id"] = json!("agentk1");
+    stop["agent_type"] = json!("general-purpose");
+    stop["agent_transcript_path"] = json!(sub_path);
+    env.hook(&stop);
+    env.wait_idle();
+    assert_eq!(turns_of(&t.home, &sub_uri("killed", "agentk1")), 2);
+    assert_eq!(chunks_holding(&t.home, "Report on subquokka"), 1);
+    assert_eq!(env.offset(key), Some(sub.len()));
+}
+
+/// Follow-up 2: one event sends at most five subagents nobody knew of (the sweep's limit), and a
+/// session with more is finished by its later events. Its own Stop finds them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_with_many_lost_subagents_is_finished_over_several_events() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    let mut main = Session::new(&env, "many", &cwd);
+    main.turn(1, "the main session");
+    let ids: Vec<String> = (0..7).map(|i| format!("agentm{i}")).collect();
+    for id in &ids {
+        subagent_file(&main, id, &format!("{id}quokka"), false);
+    }
+    let found = || {
+        ids.iter()
+            .filter(|id| turns_of(&t.home, &sub_uri("many", id)) == 1)
+            .count()
+    };
+    env.hook(&main.input("Stop"));
+    env.wait_idle();
+    assert_eq!(found(), 5, "{}", env.log());
+    main.turn(2, "the main session goes on");
+    env.hook(&main.input("Stop"));
+    env.wait_idle();
+    assert_eq!(found(), 7, "{}", env.log());
+    // Nothing is sent again.
+    let before = uploads(&s, "many").len();
+    env.hook(&main.input("Stop"));
+    env.wait_idle();
+    assert_eq!(uploads(&s, "many").len(), before);
+}
+
+/// Follow-up 2: a found subagent follows the rules of any transcript. Found while the tenant's
+/// rules wait, it is held; the 6-hour close is sent and, while the rules still wait, not marked
+/// closed; once they are known, the next close takes its trailing turn and ends its source.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_found_subagent_waits_out_the_rules_and_is_closed_after_six_hours() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AliceHome::new(dir.path().join("ann"));
+    home.ensure_dirs().unwrap();
+    std::fs::write(home.config_file(), "[capture\nenabled = tru").unwrap();
+    let s = Server::start_on("ann", home.clone()).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    env.install(&s);
+    let cwd = env.root.join("work");
+    let mut main = Session::new(&env, "heldsub", &cwd);
+    main.turn(1, "the main session");
+    let (sub_path, sub) = subagent_file(&main, "agenth1", "heldsubquokka", true);
+    env.hook(&main.input("Stop"));
+    env.wait_idle();
+    let key = "claude-code-heldsub-agenth1";
+    assert_eq!(hold_of(&env, key), Some(sub.len()), "{}", env.log());
+    set_age(&sub_path, Duration::from_secs(7 * 3600));
+    let closes = || {
+        uploads(&s, "heldsub")
+            .into_iter()
+            .filter(|q| q.get("subagent").map(String::as_str) == Some("agenth1"))
+            .filter(|q| q["event"] == "session-end")
+            .count()
+    };
+    env.hook(&Session::new(&env, "heldsub2", &cwd).input("SessionStart"));
+    env.wait_idle();
+    assert_eq!(closes(), 1, "{}", env.log());
+    assert!(!read(&env.state_file(key)).contains("\nclosed "));
+
+    std::fs::write(home.config_file(), "[capture]\nenabled = true\n").unwrap();
+    let waited = Instant::now();
+    while t.svc.settings_handle().config_degraded() || t.svc.settings_handle().loosening_waiting() {
+        assert!(
+            waited.elapsed() < Duration::from_secs(30),
+            "the config never loaded"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    env.hook(&Session::new(&env, "heldsub3", &cwd).input("SessionStart"));
+    env.wait_idle();
+    assert_eq!(closes(), 2, "{}", env.log());
+    assert_eq!(turns_of(&t.home, &sub_uri("heldsub", "agenth1")), 1);
+    assert_eq!(chunks_holding(&t.home, "sleep heldsubquokka"), 1);
+    assert!(source_ended(&t.home, &sub_uri("heldsub", "agenth1")));
+    assert_eq!(hold_of(&env, key), None);
+}
+
+/// Follow-up 2: Codex writes each sub-agent's own rollout, and its SubagentStop hook names it
+/// (`agent_id`, `agent_transcript_path`; `session_id` is the parent's). The script now sends it
+/// as the sub-agent's own source, as for Claude Code, instead of sending the parent's rollout. A
+/// sub-agent id that is no valid id falls back to the parent, as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_subagent_stop_sends_the_subagents_own_rollout() {
+    let s = Server::start(&["ann"]).await;
+    let t = s.tenant("ann");
+    let env = Env::new();
+    write_mode(&env.bin.join("codex"), b"#!/bin/sh\nexit 0\n", 0o755);
+    env.install(&s);
+    let work = env.root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let parent = "019f0000-3333-7000-8000-000000000033";
+    let child = "019f0000-4444-7000-8000-000000000044";
+    let parent_path = env.write_rollout("2026/10/16", parent, &rollout(parent, &["parentquokka"]));
+    let long = format!(
+        "childquokka {}",
+        "the reviewer reads every hunk. ".repeat(8)
+    );
+    let child_path = env.write_rollout("2026/10/16", child, &rollout(child, &[long.as_str()]));
+    let mut input = codex_input(parent, json!(parent_path), &work, "SubagentStop");
+    input["agent_id"] = json!(child);
+    input["agent_type"] = json!("reviewer");
+    input["agent_transcript_path"] = json!(child_path);
+    env.codex_hook(&input);
+    env.wait_idle();
+    let child_uri = format!("codex:session:{parent}:agent:{child}");
+    assert_eq!(turns_of(&t.home, &child_uri), 1, "{}", env.log());
+    assert_eq!(chunks_holding(&t.home, "childquokka"), 1);
+    assert_eq!(
+        chunks_holding(&t.home, "parentquokka"),
+        0,
+        "the parent is not sent"
+    );
+    assert!(env.state_file(&format!("codex-{parent}-{child}")).exists());
+
+    // An id that is no valid id: the parent's rollout, as before.
+    input["agent_id"] = json!("/root/review w1");
+    env.codex_hook(&input);
+    env.wait_idle();
+    assert_eq!(chunks_holding(&t.home, "parentquokka"), 1);
+}
+
 // ---- The token ----
 
 /// What the `ps` sampler found.
