@@ -3249,6 +3249,101 @@ async fn an_ended_session_left_mid_turn_is_closed_after_six_hours() {
     }
 }
 
+/// An ended session (`session-end` of turn 1) whose transcript then gained a held turn, left
+/// alone for 7 hours: what the ended-source sweep closes. Its repository is `repo`.
+async fn ended_then_abandoned(svc: &Service, repo: &Path, path: &Path, id: &str) -> Transcript {
+    let mut t = Transcript::default();
+    t.turn(id, 1, &format!("{id} before the end"));
+    std::fs::write(path, &t.bytes).unwrap();
+    let before = passes(svc);
+    svc.capture_notify(CaptureNotify {
+        cwd: Some(repo.to_string_lossy().into_owned()),
+        ..notify(id, path, "session-end")
+    })
+    .await
+    .unwrap();
+    until("ended", || {
+        passes(svc) > before
+            && state_of(svc, &uri(id)).is_some_and(|s| s.ended && s.byte_offset == t.len())
+    })
+    .await;
+    t.prompt(&format!("{id}-p2"), "Run the migration.")
+        .tool_use(
+            &format!("{id}-a2"),
+            &format!("toolu_{id}"),
+            &format!("sleep {id}job"),
+        );
+    std::fs::write(path, &t.bytes).unwrap();
+    age(path, Duration::from_secs(7 * 3600));
+    t
+}
+
+/// Fix round 1, I2 (local): the ended-source close of a session whose project's rules wait (a
+/// broken `.alice.toml`) stores nothing and is tried again, a sweep period at a time, until the
+/// rules are known; then it takes the trailing turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ended_source_close_waits_for_the_rules_and_is_tried_again() {
+    let (d, svc) = local();
+    let repo = d.path().join("ended-wait-repo");
+    std::fs::create_dir(&repo).unwrap();
+    let path = d.path().join("ew.jsonl");
+    let t = ended_then_abandoned(&svc, &repo, &path, "ew").await;
+    std::fs::write(repo.join(".alice.toml"), "[privacy\nno_capture = tru").unwrap();
+    let before = passes(&svc);
+    until_within(
+        "the close's waiting passes",
+        Duration::from_secs(30),
+        || passes(&svc) >= before + 2,
+    )
+    .await;
+    assert_eq!(chunks_holding(&svc, "sleep ewjob"), 0);
+
+    std::fs::write(
+        repo.join(".alice.toml"),
+        "[privacy]\nblock_secrets = false\n",
+    )
+    .unwrap();
+    until_within(
+        "the close takes the turn once the rules are known",
+        Duration::from_secs(60),
+        || chunks_holding(&svc, "[tool Bash] sleep ewjob") == 1,
+    )
+    .await;
+    let row = state_of(&svc, &uri("ew")).unwrap();
+    assert!(row.ended);
+    assert_eq!(row.byte_offset, t.len());
+}
+
+/// Fix round 1, review M2: a close of an ended source counts as made only once its pass has run.
+/// One that could not read the transcript (here its permissions) is queued again by a later
+/// ended-source sweep, although the file did not change.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ended_source_close_whose_pass_failed_is_queued_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let (d, svc) = local();
+    let repo = d.path().join("ended-fail-repo");
+    std::fs::create_dir(&repo).unwrap();
+    let path = d.path().join("ef.jsonl");
+    ended_then_abandoned(&svc, &repo, &path, "ef").await;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&path).is_ok() {
+        eprintln!("skipped: this user reads a file of mode 000 (root)");
+        return;
+    }
+    // Two ended-source sweeps (every tenth sweep of 100 ms) meet the unreadable file.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(chunks_holding(&svc, "sleep efjob"), 0);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    until_within(
+        "a later ended-source sweep queues the close again",
+        Duration::from_secs(30),
+        || chunks_holding(&svc, "[tool Bash] sleep efjob") == 1,
+    )
+    .await;
+    assert!(state_of(&svc, &uri("ef")).unwrap().ended);
+}
+
 /// Stops `svc` (as a crash between two writes would leave it), runs `sql` on its database, and
 /// starts a local daemon again in `home`.
 async fn restart_local(svc: Arc<Service>, home: &Path, sql: &str) -> Arc<Service> {

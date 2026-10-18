@@ -1672,7 +1672,7 @@ mod local {
         fn run(&self) {
             crate::maintenance::lower_priority();
             let mut seen: HashMap<String, Seen> = HashMap::new();
-            let mut closed: HashMap<String, FileSeen> = HashMap::new();
+            let mut closes = Closes::default();
             let mut sweeps: u64 = 0;
             let mut next_sweep = Instant::now();
             while !self.stopping() {
@@ -1681,7 +1681,7 @@ mod local {
                         tracing::warn!(error = %e, "the capture sweep failed; it runs again later");
                     }
                     if sweeps.is_multiple_of(ENDED_EVERY)
-                        && let Err(e) = self.close_abandoned(&mut closed)
+                        && let Err(e) = self.close_abandoned(&mut closes)
                     {
                         tracing::warn!(error = %e, "the capture sweep of ended sessions failed; it runs again later");
                     }
@@ -1697,12 +1697,16 @@ mod local {
                     // retry, not every session's capture for the rest of the daemon's life.
                     let uri = job.uri();
                     let run = std::panic::AssertUnwindSafe(|| self.run_job(job, &mut seen));
-                    if std::panic::catch_unwind(run).is_err() {
-                        seen.remove(&uri);
-                        tracing::error!(
-                            uri,
-                            "a capture pass panicked; the next event or sweep tries it again"
-                        );
+                    match std::panic::catch_unwind(run) {
+                        Ok(outcome) => closes.ran(&uri, &outcome),
+                        Err(_) => {
+                            seen.remove(&uri);
+                            closes.ran(&uri, &Outcome::Retry);
+                            tracing::error!(
+                                uri,
+                                "a capture pass panicked; the next event or sweep tries it again"
+                            );
+                        }
                     }
                 }
                 let due = self.pending.lock().values().map(|j| j.not_before).min();
@@ -1834,14 +1838,16 @@ mod local {
         /// cursor and has not changed for `abandoned` (6 hours): a session resumed after its end
         /// and left mid-turn (a crash, a kill, a closed app). No event will bring its last turn,
         /// and the sweep looks at open sources only. The pass closes the trailing turn whatever
-        /// it waits for, as a session end does; the source stays ended. Once per hold: `closed`
-        /// keeps the transcript's size and time when its pass was queued, and the source is not
-        /// queued again while they stay (a line cut short stays past the cursor). It is kept in
-        /// memory, so a daemon start may pass such a source once more, which stores nothing new.
-        fn close_abandoned(&self, closed: &mut HashMap<String, FileSeen>) -> Result<()> {
+        /// it waits for, as a session end does; the source stays ended. Once per hold: a source
+        /// is not queued while its close waits or runs, nor again once that close's pass has run
+        /// while the transcript stays as the pass left it (a line cut short stays past the
+        /// cursor). A pass that did not run (the file could not be read, an error) leaves it to
+        /// a later sweep. `closes` is kept in memory, so a daemon start may pass such a source
+        /// once more, which stores nothing new.
+        fn close_abandoned(&self, closes: &mut Closes) -> Result<()> {
             let ended = self.readers.with(store::ended_sources)?;
             let uris: HashSet<&str> = ended.iter().map(|s| s.uri.as_str()).collect();
-            closed.retain(|uri, _| uris.contains(uri.as_str()));
+            closes.done.retain(|uri, _| uris.contains(uri.as_str()));
             let now = SystemTime::now();
             for s in &ended {
                 if self.stopping() {
@@ -1869,11 +1875,12 @@ mod local {
                 if !meta.is_file()
                     || file.len <= s.byte_offset
                     || self.close_by_age(file.mtime, now, true) != Close::Force
-                    || closed.get(&s.uri) == Some(&file)
+                    || closes.queued.contains(&s.uri)
+                    || closes.done.get(&s.uri) == Some(&file)
                 {
                     continue;
                 }
-                closed.insert(s.uri.clone(), file);
+                closes.queued.insert(s.uri.clone());
                 tracing::info!(
                     uri = s.uri,
                     "an ended session's transcript holds a turn no event brought, unchanged for 6 hours; its last turn is taken"
@@ -1943,21 +1950,24 @@ mod local {
             Ok(())
         }
 
-        fn run_job(&self, job: Job, seen: &mut HashMap<String, Seen>) {
+        fn run_job(&self, job: Job, seen: &mut HashMap<String, Seen>) -> Outcome {
             let uri = job.uri();
             let Some(path) = self.transcript(&job) else {
-                return;
+                return Outcome::Retry;
             };
             match self.passes(&uri, &job, &path) {
                 Ok(Outcome::Done(s)) => {
                     seen.insert(uri, s);
+                    Outcome::Done(s)
                 }
-                Ok(Outcome::Retry | Outcome::Requeued) => {
+                Ok(outcome) => {
                     seen.remove(&uri);
+                    outcome
                 }
                 Err(e) => {
                     seen.remove(&uri);
                     tracing::warn!(uri, error = %e, "a capture pass failed; the next event or sweep tries again");
+                    Outcome::Retry
                 }
             }
         }
@@ -2178,6 +2188,36 @@ mod local {
     struct FileSeen {
         len: u64,
         mtime: Option<SystemTime>,
+    }
+
+    /// The ended-source sweep's closes ([`CaptureWorker::close_abandoned`]).
+    #[derive(Default)]
+    struct Closes {
+        /// Sources whose close is queued, waiting (its rules), or running.
+        queued: HashSet<String>,
+        /// Sources whose close's pass ran, with the transcript as that pass left it.
+        done: HashMap<String, FileSeen>,
+    }
+
+    impl Closes {
+        /// A job of `uri` ended with `outcome`. A close that is back in the queue stays queued.
+        fn ran(&mut self, uri: &str, outcome: &Outcome) {
+            match outcome {
+                Outcome::Requeued => {}
+                Outcome::Done(s) => {
+                    if self.queued.remove(uri) {
+                        let file = FileSeen {
+                            len: s.len,
+                            mtime: s.mtime,
+                        };
+                        self.done.insert(uri.to_owned(), file);
+                    }
+                }
+                Outcome::Retry => {
+                    self.queued.remove(uri);
+                }
+            }
+        }
     }
 
     /// A sweep's pass of `s`, whose transcript is `path`: its close decided by the transcript's
