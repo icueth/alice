@@ -777,7 +777,9 @@ capture_one() {
           break
         fi
         if [ "$co_next" -eq "$s_off" ] && [ "$co_n" -ge "$co_cap" ] && [ "$co_cap" -lt "$BODY_MAX" ]; then
-          # A capped body held no whole turn (or no line end): twice the cap, same offset.
+          # A capped body held no whole turn (or no line end): twice the cap, same offset. Its
+          # answer says nothing of the turn, so it does not count as the close's.
+          co_answered=
           co_cap=$((co_cap * 2))
           if [ "$co_cap" -gt "$BODY_MAX" ]; then co_cap=$BODY_MAX; fi
           log "session $3: nothing complete in $co_n bytes from offset $s_off; sending up to $co_cap bytes"
@@ -856,8 +858,9 @@ capture_one() {
     { [ -z "$s_hold" ] || [ "$(fsize "$s_path")" -gt "$s_hold" ]; }; then
     co_pending=1 # out of passes with bytes left
   fi
-  # A close is sent once per hold: once the server answered it, a hold it leaves (it took nothing
-  # either, or refused it) is closed. Unanswered (the server down), or answered while the
+  # A close is sent once per hold: once the server answered its last body (a capped one that
+  # took nothing is not that), a hold it leaves (it took nothing either, or refused it) is
+  # closed. Unanswered (the server down, also after a capped body), or answered while the
   # server's rules wait (nothing taken, nothing ended), the next sweep sends it again.
   if [ -n "$co_close" ] && [ -n "$co_answered" ] && [ -z "$co_waiting" ]; then s_closed=$s_hold; fi
   if save_state "$co_st" && [ -n "$co_pending" ]; then mark_pending "$co_st"; fi
