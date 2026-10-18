@@ -2484,6 +2484,163 @@ async fn a_held_turn_over_the_first_cap_is_taken_by_a_close_and_by_session_end()
     }
 }
 
+/// A tenant stand-in that answers each transcript upload with the next of its scripted answers
+/// (`(status, body)`; 502 once they run out) and every other request with 204. It records the
+/// query and body length of each upload.
+struct MockTenant {
+    url: String,
+    answers: Arc<std::sync::Mutex<std::collections::VecDeque<(u16, String)>>>,
+    uploads: Arc<std::sync::Mutex<Vec<(String, usize)>>>,
+}
+
+impl MockTenant {
+    fn start() -> MockTenant {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/u/ann",
+            listener.local_addr().unwrap().port()
+        );
+        let answers: Arc<std::sync::Mutex<std::collections::VecDeque<(u16, String)>>> =
+            Arc::default();
+        let uploads: Arc<std::sync::Mutex<Vec<(String, usize)>>> = Arc::default();
+        let (a, u) = (answers.clone(), uploads.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    buf.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&buf).into_owned();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; length];
+                let _ = stream.read_exact(&mut body);
+                let target = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (code, text) = if target.contains("/api/v1/capture/transcript?") {
+                    u.lock().unwrap().push((target, length));
+                    a.lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or((502, String::new()))
+                } else {
+                    (204, String::new())
+                };
+                let reply = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                    text.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        MockTenant {
+            url,
+            answers,
+            uploads,
+        }
+    }
+
+    fn answer(&self, code: u16, next_offset: u64, ended: bool) {
+        let body = json!({"next_offset": next_offset, "turns_stored": u64::from(ended),
+            "turns_skipped": 0, "chunks_stored": u64::from(ended), "oversized_line": false,
+            "ended": ended});
+        self.answers
+            .lock()
+            .unwrap()
+            .push_back((code, body.to_string()));
+    }
+
+    /// `(offset, more, body length)` of every upload so far.
+    fn sent(&self) -> Vec<(u64, bool, usize)> {
+        self.uploads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(target, len)| {
+                let q: HashMap<String, String> =
+                    url::form_urlencoded::parse(target.split_once('?').unwrap().1.as_bytes())
+                        .into_owned()
+                        .collect();
+                assert_eq!(q["event"], "session-end", "{q:?}");
+                (q["offset"].parse().unwrap(), q.contains_key("more"), *len)
+            })
+            .collect()
+    }
+}
+
+/// Fix round 1, I1, against a tenant stand-in: a close of a held turn over 2 MiB counts as made
+/// only once the server answered the whole turn. Here the capped body takes nothing, as the
+/// server answers `more=1`, and the doubled body meets a server error: the hold stays unclosed,
+/// and the next sweep sends the close again, capped and doubled, until the server takes the turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_over_the_first_cap_is_closed_only_once_the_turn_is_taken() {
+    let s = Server::start(&["ann"]).await;
+    let env = Env::new();
+    env.install(&s);
+    let mock = MockTenant::start();
+    std::fs::write(env.alice().join("url"), format!("{}\n", mock.url)).unwrap();
+    let cwd = env.root.join("work");
+    let mut sess = Session::new(&env, "bigmock", &cwd);
+    sess.tr
+        .prompt("bigmock-p1", "Read the whole log.")
+        .reply("bigmock-a1", &"bigmock words ".repeat(170_000))
+        .line(json!({"type": "assistant", "uuid": "bigmock-a1b",
+            "message": {"id": "msg-bigmock-a1b", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_bigmock", "name": "Bash",
+                 "input": {"command": "sleep bigmock"}}]}}));
+    sess.flush();
+    let len = sess.tr.len();
+    assert!(len > 2 << 20 && len < 4 << 20);
+    std::fs::write(
+        env.state_file(&sess.key()),
+        format!(
+            "0 {}\nsession bigmock\ncwd {}\nhold {len}\n",
+            sess.path.display(),
+            cwd.display()
+        ),
+    )
+    .unwrap();
+    set_age(&sess.path, Duration::from_secs(7 * 3600));
+
+    mock.answer(200, 0, false); // the capped body: the turn stays open
+    mock.answer(502, 0, false); // the doubled body: a server error
+    env.hook(&Session::new(&env, "bigmock2", &cwd).input("SessionStart"));
+    env.wait_idle();
+    assert_eq!(
+        mock.sent(),
+        [(0, true, 2 << 20), (0, false, len as usize)],
+        "{}",
+        env.log()
+    );
+    let state = read(&env.state_file(&sess.key()));
+    assert!(!state.contains("\nclosed "), "{state}");
+    assert_eq!(hold_of(&env, &sess.key()), Some(len));
+
+    mock.answer(200, 0, false);
+    mock.answer(200, len, true); // the whole turn: taken, and the session ended
+    env.hook(&Session::new(&env, "bigmock3", &cwd).input("SessionStart"));
+    env.wait_idle();
+    assert_eq!(mock.sent().len(), 4, "{}", env.log());
+    assert_eq!(mock.sent()[3], (0, false, len as usize));
+    assert_eq!(env.offset(&sess.key()), Some(len));
+    assert_eq!(hold_of(&env, &sess.key()), None);
+
+    // Nothing is left to close: a later sweep sends nothing.
+    env.hook(&Session::new(&env, "bigmock4", &cwd).input("SessionStart"));
+    env.wait_idle();
+    assert_eq!(mock.sent().len(), 4, "{}", env.log());
+}
+
 /// Fix round 1, I2: a close the server answers while the tenant's capture rules wait (here its
 /// `config.toml` does not load: nothing is taken, nothing ends, and the answer says `waiting`) is
 /// not marked closed. Later sweeps send it again, and once the rules are known it is taken.
