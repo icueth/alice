@@ -51,6 +51,24 @@ no `type` field.
 Every `response_item` payload also carries `internal_chat_message_metadata_passthrough {turn_id, create_time?,
 content_item_kinds[]?}` (the key name is the one in the file); `turn_id` ties the item to the turn.
 
+### Newer builds (not in the fixture)
+
+A names-only scan of one person's rollouts of seven days (2026-10-18: 35 rollouts, 17,829 lines; type and field
+names and counts, no values) found two shapes this table lacks, 40 lines each, in multi-agent sessions:
+
+| line `type` | `payload.type` | payload fields | Alice |
+|---|---|---|---|
+| `inter_agent_communication_metadata` | none | `trigger_turn` | known, dropped (bookkeeping) |
+| `response_item` | `agent_message` | `id`, `author`, `recipient`, `content[]` (`{type: "input_text", text}`, and in 30 of 40 also `{type: "encrypted_content", encrypted_content}`), `internal_chat_message_metadata_passthrough` | not read yet: counted as unrecognised |
+
+`agent_message` carries text (a message between agents), so it is not bookkeeping; reading it needs a sampled
+fixture first.
+
+As for Claude Code, Alice drops a line of a top-level `type` it does not know as **bookkeeping**, counted apart
+and never as drift, when neither the line nor its `payload` has a `message`, `content`, `text` or `summary` key.
+With such a key, or with a `payload` that is not an object, the line counts as unrecognised. An unknown
+`payload.type` of a known line type (`response_item`, as `agent_message` is) always counts as unrecognised.
+
 ### `response_item.message` content blocks
 
 `content[]` blocks are `{type: "input_text", text}` for `user`/`developer` and `{type: "output_text", text}` for
@@ -125,7 +143,8 @@ payload `replacement_history` entries other than the ones kept.
 
 ## Parser checklist
 
-1. Check the envelope (`timestamp`, `type`, `ordinal`, `payload`); skip lines that do not parse.
+1. Check the envelope (`timestamp`, `type`, `ordinal`, `payload`); skip lines that do not parse. Tell an unknown
+   line `type` with no conversation key in it or its payload (bookkeeping) from one with such a key.
 2. Typed prompts: `event_msg` / `item_completed` / `UserMessage` (or `response_item.message` with `role: "user"` and
    `content_item_kinds` containing `user.text`). Assistant text: `AgentMessage` or `response_item.message` with
    `role: "assistant"`.

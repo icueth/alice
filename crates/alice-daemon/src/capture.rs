@@ -57,7 +57,7 @@ const SLICE_PAUSE: Duration = Duration::from_millis(2);
 const MIN_SUBAGENT_CHARS: usize = 200;
 /// Keys of turns that are not stored (an excluded project), per slice at most.
 const SKIPPED_KEYS_PER_SLICE: usize = 500;
-/// How many days of unrecognised-line counts are kept.
+/// How many days of line counts (unrecognised, bookkeeping) are kept.
 const UNKNOWN_DAYS: i64 = 7;
 /// The largest byte offset a transcript can have: 2^53, exact in every JSON client and far
 /// beyond any transcript. A larger offset is refused before anything is read, so no offset
@@ -254,9 +254,12 @@ pub struct CaptureCtl {
     /// One pass per source at a time (ruling 6): a source's slices are sent one at a time, each
     /// built from the state the one before left.
     locks: SourceLocks,
-    /// Unrecognised transcript lines per UTC day, the last [`UNKNOWN_DAYS`] days (in memory: a
-    /// format-drift hint that starts from zero with the daemon).
-    unknown: Mutex<VecDeque<(chrono::NaiveDate, u64)>>,
+    /// Unrecognised transcript lines (in memory: a format-drift hint that starts from zero with
+    /// the daemon).
+    unknown: DayCounts,
+    /// Bookkeeping lines: of a type the reader does not know, with no key conversation is kept
+    /// under ([`ReadStats::bookkeeping`]). Kept apart from `unknown`: they are no drift.
+    bookkeeping: DayCounts,
     /// Called when a pass makes its source due for distillation (wakes the distill worker).
     on_due: Mutex<Option<DueHook>>,
     /// The local worker's stale age (`LocalCaptureConfig::stale`), set when it is made: the
@@ -270,6 +273,41 @@ pub struct CaptureCtl {
 
 /// What [`CaptureCtl::set_on_due`] installs.
 pub type DueHook = Arc<dyn Fn() + Send + Sync>;
+
+/// A count per UTC day, the last [`UNKNOWN_DAYS`] days.
+#[derive(Default)]
+struct DayCounts(Mutex<VecDeque<(chrono::NaiveDate, u64)>>);
+
+impl DayCounts {
+    /// The sum over the last [`UNKNOWN_DAYS`] days.
+    fn last_days(&self) -> u64 {
+        let today = chrono::Utc::now().date_naive();
+        self.0
+            .lock()
+            .iter()
+            .filter(|(day, _)| (today - *day).num_days() < UNKNOWN_DAYS)
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    fn add(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let today = chrono::Utc::now().date_naive();
+        let mut days = self.0.lock();
+        match days.back_mut() {
+            Some((day, count)) if *day == today => *count += n,
+            _ => days.push_back((today, n)),
+        }
+        while days
+            .front()
+            .is_some_and(|(day, _)| (today - *day).num_days() >= UNKNOWN_DAYS)
+        {
+            days.pop_front();
+        }
+    }
+}
 
 /// A lock per source uri. An entry lives while a pass holds or waits for it.
 #[derive(Default)]
@@ -336,7 +374,8 @@ impl CaptureCtl {
             settings,
             redactors,
             locks: SourceLocks::default(),
-            unknown: Mutex::new(VecDeque::new()),
+            unknown: DayCounts::default(),
+            bookkeeping: DayCounts::default(),
             on_due: Mutex::new(None),
             sweep_stale: Mutex::new(None),
             fail_after_slices: Mutex::new(None),
@@ -357,31 +396,12 @@ impl CaptureCtl {
 
     /// Unrecognised transcript lines read in the last 7 days.
     pub fn unrecognised_lines_7d(&self) -> u64 {
-        let today = chrono::Utc::now().date_naive();
-        self.unknown
-            .lock()
-            .iter()
-            .filter(|(day, _)| (today - *day).num_days() < UNKNOWN_DAYS)
-            .map(|(_, n)| n)
-            .sum()
+        self.unknown.last_days()
     }
 
-    fn note_unknown(&self, n: u64) {
-        if n == 0 {
-            return;
-        }
-        let today = chrono::Utc::now().date_naive();
-        let mut days = self.unknown.lock();
-        match days.back_mut() {
-            Some((day, count)) if *day == today => *count += n,
-            _ => days.push_back((today, n)),
-        }
-        while days
-            .front()
-            .is_some_and(|(day, _)| (today - *day).num_days() >= UNKNOWN_DAYS)
-        {
-            days.pop_front();
-        }
+    /// Bookkeeping transcript lines read in the last 7 days ([`ReadStats::bookkeeping`]).
+    pub fn bookkeeping_lines_7d(&self) -> u64 {
+        self.bookkeeping.last_days()
     }
 
     fn pass(&self, uri: &str, input: PassInput) -> Result<PassReport> {
@@ -420,7 +440,8 @@ impl CaptureCtl {
         report.bytes_read = bytes.len() as u64;
         let out = capture::read_redacted(input.agent, bytes, &opts, &redactor);
         report.stats = out.stats;
-        self.note_unknown(out.stats.unknown);
+        self.unknown.add(out.stats.unknown);
+        self.bookkeeping.add(out.stats.bookkeeping);
         if out.oversized_line {
             report.oversized_line = true;
             return Ok(report);
@@ -1141,6 +1162,7 @@ pub(crate) fn health(
     conn: &Connection,
     settings: &Settings,
     unrecognised_lines_7d: u64,
+    bookkeeping_lines_7d: u64,
     rollouts: LocalCaptureCounts,
 ) -> Result<Option<Box<CaptureHealth>>> {
     let count = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<u64> {
@@ -1184,6 +1206,7 @@ pub(crate) fn health(
         distill_dropped_24h: 0,
         distill_warning: None,
         unrecognised_lines_7d,
+        bookkeeping_lines_7d,
         rollouts_not_found: rollouts.rollouts_not_found,
         rollouts_compressed: rollouts.rollouts_compressed,
     })))

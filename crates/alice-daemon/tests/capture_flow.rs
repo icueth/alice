@@ -359,6 +359,34 @@ async fn an_upload_captures_complete_turns_and_returns_the_cursor() {
     assert_eq!(chunks_holding(&svc, "test result: ok"), 1);
 }
 
+/// Follow-up (capture gaps): the health counts bookkeeping lines (a type the reader does not know,
+/// with no `message`, `content`, `text` or `summary` key) apart from unrecognised ones, which an
+/// unknown type with such a key still is. A known type of a newer build is neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_health_counts_bookkeeping_lines_apart_from_unrecognised_ones() {
+    let (_d, svc) = tenant();
+    let mut t = Transcript::default();
+    t.turn("bk", 1, "bookkeepingquokka");
+    for v in [
+        json!({"type": "brand-new-ledger", "sessionId": "bk", "entries": {"e": 1}}),
+        json!({"type": "brand-new-ledger", "sessionId": "bk", "entries": {"e": 2}}),
+        json!({"type": "brand-new-cursor", "sessionId": "bk", "title": "T"}),
+        json!({"type": "frame-link", "sessionId": "bk", "artifactCount": 1}),
+        json!({"type": "brand-new-note", "sessionId": "bk", "text": "Words."}),
+    ] {
+        t.line(v);
+    }
+    t.turn("bk", 2, "afterquokka");
+    let a = send(&svc, q("bk", 0, "stop"), &t.bytes).await;
+    assert_eq!((a.turns_stored, a.next_offset), (2, t.len()));
+    let h = svc.health().await.unwrap().capture.unwrap();
+    assert_eq!(
+        (h.unrecognised_lines_7d, h.bookkeeping_lines_7d),
+        (1, 3),
+        "{h:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lower_offset_gets_409_with_the_cursor() {
     let (_d, svc) = tenant();

@@ -72,6 +72,7 @@ so the format is fixed:
 | Other tools | The input as compact JSON (at most 300 characters) and the output, trimmed |
 | Long runs of base64-like text, or text that is mostly unprintable | `[binary removed]` |
 | Progress lines, file snapshots, titles, system lines, hook output | Dropped |
+| Bookkeeping lines of a type Alice does not know yet, holding none of `message`, `content`, `text`, `summary` | Dropped and counted apart (agents add such lines with new releases). A line of an unknown type that holds one of those keys is counted as unrecognised, and `alice doctor` warns |
 | A transcript line over 4 MiB | Skipped, leaving `[record skipped: too large]` in its turn |
 
 "Trimmed" means the head and the tail of the output, with a marker such as `[… 12,345 characters trimmed …]` between them.
@@ -568,6 +569,7 @@ daemon runs.
 | `capture` | sessions and chunks captured in the last 24 hours, and the last capture | nothing |
 | `capture` | nothing was captured for 7 days, with hooks installed | `alice hooks status claude` and `alice daemon logs`; start a new session |
 | `capture` | transcript lines of a shape Alice does not know were skipped | the agent's transcript format may have changed: update Alice |
+| `capture` (OK) | bookkeeping lines of the last 7 days were skipped (a type Alice does not know, holding no conversation) | nothing: agents add such lines with new releases |
 | `capture` | Codex sessions gave no transcript path and no rollout was found | start the daemon with the `CODEX_HOME` Codex uses |
 | `capture` | Codex rollouts are compressed (`.jsonl.zst`) | those sessions are not captured in this version |
 | `distill` | `off`, or `jev, N distilled today` | nothing |

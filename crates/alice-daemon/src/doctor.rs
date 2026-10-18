@@ -427,6 +427,14 @@ pub(crate) fn capture_check(
             c.rollouts_compressed
         )
     });
+    // An OK detail only, never a problem: lines of a type Alice does not know that carry no
+    // conversation are the bookkeeping agents add with every release.
+    let bookkeeping = (c.bookkeeping_lines_7d > 0).then(|| {
+        format!(
+            "{} bookkeeping lines of the last 7 days (a type Alice does not know, holding no conversation) were skipped",
+            c.bookkeeping_lines_7d
+        )
+    });
     Some(if problems.is_empty() {
         let last = c
             .last_capture_at
@@ -440,7 +448,7 @@ pub(crate) fn capture_check(
         check(
             "capture",
             CheckStatus::Ok,
-            [Some(detail), compressed]
+            [Some(detail), compressed, bookkeeping]
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>()
@@ -1332,5 +1340,44 @@ mod tests {
         // The counts are sent only when set: a daemon's health reads as before.
         let json = serde_json::to_string(&CaptureHealth::default()).unwrap();
         assert!(!json.contains("rollouts"), "{json}");
+    }
+
+    /// Bookkeeping lines (a type Alice does not know, with no key conversation is kept under) are
+    /// an OK detail of the capture line, never a problem: alone they never warn and ask for no
+    /// fix, and beside a problem they are not named.
+    #[test]
+    fn doctor_names_bookkeeping_lines_as_a_detail_never_a_problem() {
+        use alice_core::api::CaptureHealth;
+        let now = chrono::Utc::now();
+        let mut h = health();
+        h.capture = Some(Box::new(CaptureHealth {
+            last_capture_at: Some(now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            sessions_24h: 2,
+            chunks_24h: 9,
+            bookkeeping_lines_7d: 3575,
+            ..Default::default()
+        }));
+        let c = capture_check(&h, true, now).unwrap();
+        assert_eq!(c.status, CheckStatus::Ok, "{c:?}");
+        assert!(c.fix.is_none(), "{c:?}");
+        assert!(
+            c.detail.contains("2 sessions")
+                && c.detail
+                    .contains("3575 bookkeeping lines of the last 7 days"),
+            "{c:?}"
+        );
+        h.capture.as_mut().unwrap().unrecognised_lines_7d = 4;
+        let c = capture_check(&h, true, now).unwrap();
+        assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+        assert!(c.detail.contains("4 transcript lines"), "{c:?}");
+        assert!(
+            !c.detail.contains("bookkeeping") && !c.detail.contains("3575"),
+            "{c:?}"
+        );
+        // Sent only when set, and read as 0 from a daemon that does not send it.
+        let json = serde_json::to_string(&CaptureHealth::default()).unwrap();
+        assert!(!json.contains("bookkeeping"), "{json}");
+        let old: CaptureHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.bookkeeping_lines_7d, 0);
     }
 }

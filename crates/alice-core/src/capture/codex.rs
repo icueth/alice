@@ -10,8 +10,11 @@
 //! - `response_item` tool calls and their outputs, paired by `call_id`;
 //! - `compacted`: its `message` is a summary turn of its own. `replacement_history` replays
 //!   earlier lines and is never read again;
-//! - `event_msg`, `turn_context`, `world_state`, `token_usage_record` and `session_meta` are
-//!   known and carry no conversation text that `response_item` does not also hold.
+//! - `event_msg`, `turn_context`, `world_state`, `token_usage_record`, `session_meta` and
+//!   `inter_agent_communication_metadata` are known and carry no conversation text that
+//!   `response_item` does not also hold;
+//! - a line of another `type` is bookkeeping when neither it nor its payload has a key
+//!   conversation is kept under ([`LineResult::Bookkeeping`]), else `Unknown`.
 //!
 //! A rollout line has no uuid, so a turn is keyed by the hash of its time and first text
 //! ([`super::turn_key`] with `None`). Codex's shell is the custom tool `exec`, and `shell`,
@@ -21,7 +24,7 @@
 
 use serde_json::{Map, Value, json};
 
-use super::claude::LineResult;
+use super::claude::{LineResult, has_conversation_key};
 use super::record::{Block, Record, RecordKind};
 
 /// The first bytes of a zstd frame. A compressed rollout is counted, not read (spec R21).
@@ -61,7 +64,7 @@ pub(crate) fn parse_line(line: &[u8]) -> LineResult {
         return LineResult::Unknown;
     };
     let timestamp = string(&obj, "timestamp");
-    let payload = match obj.remove("payload") {
+    let mut payload = || match obj.remove("payload") {
         Some(Value::Object(payload)) => payload,
         _ => Map::new(),
     };
@@ -70,9 +73,27 @@ pub(crate) fn parse_line(line: &[u8]) -> LineResult {
         "session_meta" | "turn_context" | "world_state" | "token_usage_record" | "event_msg" => {
             LineResult::Record(skip(timestamp))
         }
-        "compacted" => compacted(timestamp, &payload),
-        "response_item" => response_item(timestamp, payload),
-        _ => LineResult::Unknown,
+        // Multi-agent bookkeeping beside an `agent_message` item (`trigger_turn`).
+        "inter_agent_communication_metadata" => LineResult::Record(skip(timestamp)),
+        "compacted" => compacted(timestamp, &payload()),
+        "response_item" => response_item(timestamp, payload()),
+        _ => unknown_line(&obj),
+    }
+}
+
+/// A line of a `type` the parser does not know: bookkeeping when neither it nor its payload has a
+/// key conversation is kept under, else `Unknown`. A payload that is not an object may be the
+/// text itself, so it counts as one.
+fn unknown_line(obj: &Map<String, Value>) -> LineResult {
+    let payload_talks = match obj.get("payload") {
+        None | Some(Value::Null) => false,
+        Some(Value::Object(payload)) => has_conversation_key(payload),
+        Some(_) => true,
+    };
+    if payload_talks || has_conversation_key(obj) {
+        LineResult::Unknown
+    } else {
+        LineResult::Bookkeeping
     }
 }
 
@@ -646,11 +667,61 @@ mod tests {
         assert_eq!(parse_line(b"[1]"), LineResult::Invalid);
         assert_eq!(parse_line(b"{}"), LineResult::Unknown);
         assert_eq!(
-            parse(json!({"type": "future", "payload": {}})),
+            parse(json!({"type": "future", "payload": {"content": []}})),
             LineResult::Unknown
         );
         assert_eq!(
             parse(item(json!({"type": "hologram"}))),
+            LineResult::Unknown
+        );
+    }
+
+    /// The multi-agent metadata line of newer builds (FORMAT.md "`type` / `payload` mapping"):
+    /// known, so dropped as a `Skip` record, not left to the bookkeeping rule.
+    #[test]
+    fn inter_agent_metadata_is_known() {
+        let r = record_of(
+            json!({"timestamp": "t", "type": "inter_agent_communication_metadata",
+                                 "ordinal": 3, "payload": {"trigger_turn": true}}),
+        );
+        assert_eq!(r.kind, RecordKind::Skip);
+        assert!(r.blocks.is_empty());
+    }
+
+    /// A line `type` the parser does not know is bookkeeping when neither the line nor its
+    /// payload has a key conversation is kept under (`message`, `content`, `text`, `summary`).
+    /// With one, or with a payload that is not an object (it may be the text), it stays
+    /// `Unknown`; so does an unknown `payload.type` of a known line type.
+    #[test]
+    fn an_unknown_line_type_without_conversation_keys_is_bookkeeping() {
+        let line = |payload: Value| {
+            parse(
+                json!({"timestamp": "t", "type": "future_ledger", "ordinal": 1,
+                         "payload": payload}),
+            )
+        };
+        assert_eq!(
+            line(json!({"thread_id": "x", "counts": {"a": 1}})),
+            LineResult::Bookkeeping
+        );
+        assert_eq!(line(json!({})), LineResult::Bookkeeping);
+        assert_eq!(
+            parse(json!({"timestamp": "t", "type": "future_ledger"})),
+            LineResult::Bookkeeping
+        );
+        for key in ["message", "content", "text", "summary"] {
+            assert_eq!(line(json!({key: "words"})), LineResult::Unknown, "{key}");
+            let mut top = json!({"timestamp": "t", "type": "future_ledger", "payload": {}});
+            top[key] = json!("words");
+            assert_eq!(parse(top), LineResult::Unknown, "top-level {key}");
+        }
+        assert_eq!(line(json!("words")), LineResult::Unknown);
+        assert_eq!(line(json!(["words"])), LineResult::Unknown);
+        assert_eq!(
+            parse(item(
+                json!({"type": "agent_message", "author": "a", "recipient": "b",
+                              "content": [{"type": "input_text", "text": "words"}]})
+            )),
             LineResult::Unknown
         );
     }

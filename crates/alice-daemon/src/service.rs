@@ -4715,6 +4715,7 @@ impl Service {
         let model_loaded = self.embedder().is_loaded();
         let memory_bytes = crate::doctor::self_memory_bytes();
         let unrecognised_lines = self.capture.unrecognised_lines_7d();
+        let bookkeeping_lines = self.capture.bookkeeping_lines_7d();
         let distill = self.distill.clone();
         let capture_counts = self.capture_counts();
         let capture_settings = self.settings();
@@ -4772,6 +4773,7 @@ impl Service {
                         c,
                         &capture_settings,
                         unrecognised_lines,
+                        bookkeeping_lines,
                         capture_counts,
                     )?,
                 )?,

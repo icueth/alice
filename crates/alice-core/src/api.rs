@@ -704,6 +704,11 @@ pub struct CaptureHealth {
     /// Transcript lines of a shape the reader did not recognise in the last 7 days (a hint that
     /// an agent's format changed). Counted in memory: it starts from zero with the daemon.
     pub unrecognised_lines_7d: u64,
+    /// Transcript lines of a type the reader does not know that carry no conversation key, in
+    /// the last 7 days: bookkeeping a newer agent build added, dropped and never counted in
+    /// `unrecognised_lines_7d`. Counted in memory, like it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bookkeeping_lines_7d: u64,
     /// Codex sessions whose hook gave no transcript path and whose rollout was not found
     /// (spec §4.2), since the daemon started.
     #[serde(default, skip_serializing_if = "is_zero")]

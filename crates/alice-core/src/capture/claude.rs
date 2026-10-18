@@ -2,7 +2,9 @@
 //!
 //! The format is undocumented and changes between versions, so a line is read as a
 //! `serde_json::Value`, never into derived structs: every field except `type` is optional, and a
-//! shape the parser does not know degrades to [`LineResult::Unknown`] instead of failing.
+//! shape the parser does not know degrades to [`LineResult::Unknown`] instead of failing. A line
+//! of a `type` it does not know that has no key conversation is kept under is
+//! [`LineResult::Bookkeeping`]: Claude Code adds such lines with most releases.
 
 use serde_json::{Map, Value};
 
@@ -17,6 +19,10 @@ pub(crate) enum LineResult {
     Drift(Record),
     /// A JSON object whose shape the parser does not recognise (counted, never fatal).
     Unknown,
+    /// A line of a `type` the parser does not know that has none of [`CONVERSATION_KEYS`]: the
+    /// bookkeeping a newer agent build added. Dropped, and counted apart from `Unknown`, so it
+    /// is never taken for format drift.
+    Bookkeeping,
     /// Not UTF-8, not JSON, or a JSON value that is not an object.
     Invalid,
 }
@@ -46,7 +52,28 @@ const DROPPED_TYPES: &[&str] = &[
     // Older builds (spec §2.1, §3.3): tool progress events and the session-title line.
     "progress",
     "summary",
+    // Newer builds (seen 2026-10): artifact pages linked to the session, and the ledgers of their
+    // comment watch and auto-replies.
+    "frame-link",
+    "artifact-comment-monitor",
+    "artifact-autoreact-ledger",
+    // Newer builds: remote-control bridge, cost counters and history-sync state.
+    "bridge-session",
+    "cost-state",
+    "history-suppression",
+    // Newer builds: a title or agent name the person set.
+    "custom-title",
+    "agent-name",
 ];
+
+/// The keys conversation is kept under. A line of a `type` the parser does not know is
+/// bookkeeping when it has none of them ([`LineResult::Bookkeeping`]), else format drift.
+const CONVERSATION_KEYS: &[&str] = &["message", "content", "text", "summary"];
+
+/// Whether `obj` has any of [`CONVERSATION_KEYS`] (whatever its value).
+pub(crate) fn has_conversation_key(obj: &Map<String, Value>) -> bool {
+    CONVERSATION_KEYS.iter().any(|k| obj.contains_key(*k))
+}
 
 /// Parses one line (without its `\n`).
 pub(crate) fn parse_line(line: &[u8]) -> LineResult {
@@ -67,7 +94,8 @@ pub(crate) fn parse_line(line: &[u8]) -> LineResult {
         // subtype are harness notices (spec §3.3: `system` lines are dropped).
         "system" => LineResult::Record(skip(&obj)),
         t if DROPPED_TYPES.contains(&t) => LineResult::Record(skip(&obj)),
-        _ => LineResult::Unknown,
+        _ if has_conversation_key(&obj) => LineResult::Unknown,
+        _ => LineResult::Bookkeeping,
     }
 }
 
@@ -410,7 +438,68 @@ mod tests {
             assert!(r.blocks.is_empty());
         }
         assert_eq!(
+            parse(json!({"type": "brand-new-type", "content": "Words."})),
+            LineResult::Unknown
+        );
+    }
+
+    /// The bookkeeping types of newer builds (FORMAT.md "Line types"; seen in one person's
+    /// transcripts of 2026-10): known, so dropped as a `Skip` record, not left to the bookkeeping
+    /// rule.
+    #[test]
+    fn newer_bookkeeping_types_are_known() {
+        for v in [
+            json!({"type": "frame-link", "sessionId": "s", "path": "/p", "frameUrl": "https://f",
+                   "title": "T", "artifactCount": 1, "timestamp": "2026-10-18T09:00:00.000Z"}),
+            json!({"type": "artifact-comment-monitor", "v": 1, "sessionId": "s",
+                   "artifacts": {"a1": {"state": "watching", "writtenAtMs": 1, "title": "T"}}}),
+            json!({"type": "artifact-autoreact-ledger", "v": 1, "sessionId": "s", "accountUuid": "u",
+                   "artifacts": {"a1": {"savedAt": 1, "stampHighWater": 2, "everBaselined": true,
+                                        "everHadThreads": false, "turnTimestamps": [], "threads": {}}}}),
+            json!({"type": "bridge-session", "sessionId": "s", "bridgeSessionId": "b",
+                   "lastSequenceNum": 3, "ownerAccountUuid": "u", "ownerOrganizationUuid": "o"}),
+            json!({"type": "cost-state", "sessionId": "s", "totalCostUSD": 0.5,
+                   "totalAPIDuration": 10, "modelUsage": {"m": {"inputTokens": 1}}}),
+            json!({"type": "history-suppression", "sessionId": "s", "cause": "c",
+                   "vetoedAgainstAccountUuid": "u", "ts": 1}),
+            json!({"type": "custom-title", "customTitle": "T", "sessionId": "s"}),
+            json!({"type": "agent-name", "agentName": "N", "sessionId": "s"}),
+        ] {
+            let r = record_of(v);
+            assert_eq!(r.kind, RecordKind::Skip);
+            assert!(r.blocks.is_empty());
+        }
+    }
+
+    /// A type the parser does not know is bookkeeping when it has none of the keys conversation is
+    /// kept under (`message`, `content`, `text`, `summary`); with any of them it stays `Unknown`,
+    /// format drift. A line without a string `type` is no type at all: `Unknown`.
+    #[test]
+    fn an_unknown_type_without_conversation_keys_is_bookkeeping() {
+        assert_eq!(
+            parse(
+                json!({"type": "brand-new-ledger", "sessionId": "s", "title": "T",
+                         "entries": {"e1": {"at": 1}}})
+            ),
+            LineResult::Bookkeeping
+        );
+        assert_eq!(
             parse(json!({"type": "brand-new-type"})),
+            LineResult::Bookkeeping
+        );
+        for key in ["message", "content", "text", "summary"] {
+            let mut v = json!({"type": "brand-new-type", "sessionId": "s"});
+            v[key] = json!(null);
+            assert_eq!(parse(v), LineResult::Unknown, "{key}");
+        }
+        assert_eq!(parse(json!({"sessionId": "s"})), LineResult::Unknown);
+        assert_eq!(
+            parse(json!({"type": 7, "sessionId": "s"})),
+            LineResult::Unknown
+        );
+        // A known type with no usable content is not bookkeeping either.
+        assert_eq!(
+            parse(json!({"type": "user", "uuid": "u"})),
             LineResult::Unknown
         );
     }

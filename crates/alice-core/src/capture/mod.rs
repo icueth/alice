@@ -177,10 +177,14 @@ pub struct RenderedChunk {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadStats {
     pub lines: u64,
-    /// JSON objects of a shape the reader does not recognise (an unknown `type`, or a
-    /// conversation line with no usable content). Known line types that carry no conversation
-    /// are not counted.
+    /// JSON objects of a shape the reader does not recognise (an unknown `type` with a key
+    /// conversation is kept under, or a conversation line with no usable content): format drift.
+    /// Known line types that carry no conversation are not counted, nor is `bookkeeping`.
     pub unknown: u64,
+    /// Lines of an unknown `type` with none of the keys conversation is kept under (`message`,
+    /// `content`, `text`, `summary`; for Codex, in the line or its payload): bookkeeping a newer
+    /// agent build added. Dropped, and never counted in `unknown`.
+    pub bookkeeping: u64,
     /// Lines that are not UTF-8, not JSON, or not a JSON object.
     pub invalid: u64,
     /// Lines over [`MAX_LINE_BYTES`].
@@ -305,6 +309,7 @@ fn read_with(
                 records.push(Located { start, record });
             }
             claude::LineResult::Unknown => out.stats.unknown += 1,
+            claude::LineResult::Bookkeeping => out.stats.bookkeeping += 1,
             claude::LineResult::Invalid => out.stats.invalid += 1,
         }
     }
@@ -864,9 +869,22 @@ mod tests {
         assert!(out.turns.is_empty() && out.tail.is_empty());
         assert_eq!(out.consumed, 0);
         assert!(out.stats.lines > 0);
+        // Every Claude line is of a type the Codex reader does not know: the ones that carry
+        // conversation are unknown to it (drift shows), the rest bookkeeping.
+        let talks = TURNS
+            .split(|&b| b == b'\n')
+            .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
+            .filter(|v| {
+                ["message", "content", "text", "summary"]
+                    .iter()
+                    .any(|k| v.get(k).is_some())
+            })
+            .count() as u64;
+        assert!(talks > 0);
         assert_eq!(
-            out.stats.unknown, out.stats.lines,
-            "every Claude line is unknown to the Codex reader: {:?}",
+            (out.stats.unknown, out.stats.unknown + out.stats.bookkeeping),
+            (talks, out.stats.lines),
+            "{:?}",
             out.stats
         );
     }
@@ -1043,6 +1061,45 @@ mod tests {
 
         let clean = read(CLAUDE, &prompt_line("p-1", "Go."), &opts(true, true));
         assert_eq!(clean.stats.unknown, 0);
+    }
+
+    /// A line of a type the reader does not know with no key conversation is kept under is
+    /// bookkeeping: counted in `stats.bookkeeping`, never in `stats.unknown` (the format-drift
+    /// count). One with such a key still counts as unknown. The same for both agents.
+    #[test]
+    fn bookkeeping_lines_count_apart_from_unknown_ones() {
+        let mut input = prompt_line("p-1", "Go.");
+        input.extend(line(
+            json!({"type": "brand-new-ledger", "sessionId": "s", "v": 1}),
+        ));
+        input.extend(line(
+            json!({"type": "brand-new-ledger", "sessionId": "s", "v": 2}),
+        ));
+        input.extend(line(json!({"type": "brand-new-note", "text": "Words."})));
+        let out = read(CLAUDE, &input, &opts(true, true));
+        assert_eq!(
+            (out.stats.lines, out.stats.unknown, out.stats.bookkeeping),
+            (4, 1, 2),
+            "{:?}",
+            out.stats
+        );
+        assert_eq!(turn_text(&out.turns[0]), "[user] Go.");
+
+        let mut input = codex_typed("2026-10-14T09:00:01.000Z", "Hello there.");
+        input.extend(line(
+            json!({"timestamp": "t", "type": "future_ledger", "payload": {"n": 1}}),
+        ));
+        input.extend(line(
+            json!({"timestamp": "t", "type": "future_note", "payload": {"text": "Words."}}),
+        ));
+        let out = read(CODEX, &input, &opts(true, true));
+        assert_eq!(
+            (out.stats.unknown, out.stats.bookkeeping),
+            (1, 1),
+            "{:?}",
+            out.stats
+        );
+        assert_eq!(turn_text(&out.turns[0]), "[user] Hello there.");
     }
 
     /// Reads `input` in passes ending at `cuts` and then at its end, the way the daemon does:
@@ -1425,7 +1482,7 @@ mod tests {
         let mut input = Vec::new();
         input.extend(codex_typed("2026-10-14T09:00:01.000Z", "Hello there."));
         for v in [
-            json!({"timestamp": "t", "type": "brand_new_line", "payload": {}}),
+            json!({"timestamp": "t", "type": "brand_new_line", "payload": {"message": "Words."}}),
             json!({"timestamp": "t", "type": "response_item", "payload": {"type": "hologram"}}),
             json!({"type": "response_item"}),
             json!({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": null}}),
