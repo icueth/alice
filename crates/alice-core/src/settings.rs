@@ -54,6 +54,9 @@ pub const NON_SETTING_ENV: &[&str] = &[
     // Server mode, shared team memory: the team store's loopback URL and this tenant's name.
     "ALICE_TEAM_URL",
     "ALICE_TENANT_NAME",
+    // Server mode: extra `alice daemon run` arguments from the tenant's systemd file
+    // (`--team-store` for the team store), expanded by the unit's ExecStart.
+    "ALICE_DAEMON_ARGS",
 ];
 
 /// The model the `local` embedding provider runs (`alice_embed::MODEL_ID`; `alice-core` does
@@ -3026,6 +3029,7 @@ mod tests {
             "ALICE_REMOTE_TOKEN",
             "ALICE_TEAM_URL",
             "ALICE_TENANT_NAME",
+            "ALICE_DAEMON_ARGS",
         ] {
             assert!(NON_SETTING_ENV.contains(&v), "{v}");
         }
@@ -3455,7 +3459,8 @@ mod tests {
             ("ALICE_HOME", "/tmp/x"),
             ("ALICE_LOG", "debug"),
             ("ALICE_EMBEDDER", "fake"),
-            ("TYPESAFE_API_KEY", typesafe_key), // not ALICE_*: never looked at
+            ("ALICE_DAEMON_ARGS", "--team-store"), // the team store's systemd file: not a setting
+            ("TYPESAFE_API_KEY", typesafe_key),    // not ALICE_*: never looked at
         ]);
         let r =
             resolve(None, &vars).expect("unknown variables never make the configuration invalid");
