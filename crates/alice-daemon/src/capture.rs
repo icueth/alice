@@ -470,12 +470,27 @@ impl CaptureCtl {
             report.verdict = Some(verdict);
             return Ok(report);
         }
-        if input.subagent.is_some() && state.is_none() && input.offset == 0 && out.consumed > 0 {
-            let chars: usize = out
+        // Spec §3.4: a subagent with nothing stored yet is judged whole, its open turn included
+        // (one found beside its session may come before its turn closes), so one whose whole
+        // rendering is under 200 characters is dropped before any source is registered for it.
+        if input.subagent.is_some() && state.is_none() && input.offset == 0 {
+            let forced;
+            let whole = if opts.force_close {
+                &out
+            } else {
+                let closed = ReadOptions {
+                    close_trailing: true,
+                    force_close: true,
+                    ..opts.clone()
+                };
+                forced = capture::read_redacted(input.agent, bytes, &closed, &redactor);
+                &forced
+            };
+            let chars: usize = whole
                 .turns
                 .iter()
                 .flat_map(|t| &t.chunks)
-                .chain(&out.tail)
+                .chain(&whole.tail)
                 .map(|c| c.text.chars().count())
                 .sum();
             if chars < MIN_SUBAGENT_CHARS {
@@ -1581,8 +1596,12 @@ mod local {
         starting: Mutex<HashMap<String, (Job, Instant)>>,
         /// Subagent transcripts the search beside a session looked at, by their source's uri,
         /// with the file as it was then: not looked at again while it stays so (one with a
-        /// source, or too short to keep, which never gets one). Kept for open sessions only.
+        /// source, or one whose pass ran, too short to keep, which never gets one). Kept for open
+        /// sessions only.
         discovered: Mutex<HashMap<String, FileSeen>>,
+        /// Subagents the search queued a pass for: the pass that ran (`Done`) adds its file to
+        /// `discovered`; one that could not run leaves it to a later round.
+        found: Mutex<HashSet<String>>,
         /// bounded(1): notifications that arrive together wake the thread once.
         wake_tx: crossbeam_channel::Sender<()>,
         wake_rx: crossbeam_channel::Receiver<()>,
@@ -1613,6 +1632,7 @@ mod local {
                 pending: Mutex::new(HashMap::new()),
                 starting: Mutex::new(HashMap::new()),
                 discovered: Mutex::new(HashMap::new()),
+                found: Mutex::new(HashSet::new()),
                 wake_tx,
                 wake_rx,
                 stop: AtomicBool::new(false),
@@ -1715,10 +1735,14 @@ mod local {
                     let uri = job.uri();
                     let run = std::panic::AssertUnwindSafe(|| self.run_job(job, &mut seen));
                     match std::panic::catch_unwind(run) {
-                        Ok(outcome) => closes.ran(&uri, &outcome),
+                        Ok(outcome) => {
+                            closes.ran(&uri, &outcome);
+                            self.found_ran(&uri, &outcome);
+                        }
                         Err(_) => {
                             seen.remove(&uri);
                             closes.ran(&uri, &Outcome::Retry);
+                            self.found_ran(&uri, &Outcome::Retry);
                             tracing::error!(
                                 uri,
                                 "a capture pass panicked; the next event or sweep tries it again"
@@ -1852,6 +1876,25 @@ mod local {
             Ok(())
         }
 
+        /// A job of `uri` ended with `outcome`: a pass the search queued that ran puts its file
+        /// in `discovered` (review M3), one back in the queue stays found, and one that could not
+        /// run is left to a later round.
+        fn found_ran(&self, uri: &str, outcome: &Outcome) {
+            if let Outcome::Requeued = outcome {
+                return;
+            }
+            if !self.found.lock().remove(uri) {
+                return;
+            }
+            if let Outcome::Done(s) = outcome {
+                let file = FileSeen {
+                    len: s.len,
+                    mtime: s.mtime,
+                };
+                self.discovered.lock().insert(uri.to_owned(), file);
+            }
+        }
+
         /// Starts a source for each subagent transcript Claude Code wrote beside session
         /// `session`'s (`<main without .jsonl>/subagents/agent-<id>.jsonl`) that has none yet: a
         /// subagent killed in its first run never sends SubagentStop (follow-up 2). Its job
@@ -1866,6 +1909,10 @@ mod local {
             project_id: &str,
             budget: &mut usize,
         ) -> Result<()> {
+            // Review M4: with subagent capture off, every such pass would only be dropped.
+            if !self.ctl.settings.get().capture.include_subagents {
+                return Ok(());
+            }
             let Ok(entries) = std::fs::read_dir(main.with_extension("").join("subagents")) else {
                 return Ok(());
             };
@@ -1897,10 +1944,11 @@ mod local {
                 {
                     continue;
                 }
-                self.discovered.lock().insert(uri.clone(), file);
                 if self.readers.with(|c| store::by_uri(c, &uri))?.is_some() {
+                    self.discovered.lock().insert(uri, file);
                     continue;
                 }
+                self.found.lock().insert(uri.clone());
                 if project.is_none() {
                     project = Some(
                         self.readers
